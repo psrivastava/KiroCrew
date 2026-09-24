@@ -209,8 +209,21 @@ raise SystemExit(1 if not decoder.authentic else 2)
       echo "    Its bytes are the pinned payload, so the bundle is shipped as-is." >&2
       ;;
     *)
-      echo "ERROR: bundled local voice runtime cannot load" >&2
-      exit 1
+      # CCrew opt-out: local voice/dictation is peripheral to a claude/codex
+      # UI skin. When CCREW_ALLOW_UNAUTH_VOICE=1, a decoder that fails the
+      # authenticity pin (e.g. an imageio-ffmpeg build whose hash is not in
+      # the pinned table on THIS machine) downgrades from a hard build failure
+      # to a warning: the app ships with local voice non-functional, every
+      # other feature intact. Default (unset) preserves the strict upstream
+      # gate. The runtime authenticity check in transcribe.py is untouched.
+      if [ "${CCREW_ALLOW_UNAUTH_VOICE:-0}" = "1" ]; then
+        echo "  ⚠ CCREW_ALLOW_UNAUTH_VOICE=1: shipping without a working local" >&2
+        echo "    voice decoder. Dictation will be unavailable in this build." >&2
+      else
+        echo "ERROR: bundled local voice runtime cannot load" >&2
+        echo "       (set CCREW_ALLOW_UNAUTH_VOICE=1 to ship without local voice)" >&2
+        exit 1
+      fi
       ;;
   esac
 }
