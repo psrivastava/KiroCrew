@@ -1265,7 +1265,7 @@ async def api_claude_session_overlay(request: web.Request) -> web.Response:
     sidecar keyed by the native UUID; nothing is written into ~/.claude. Returns
     the resulting entry.
     """
-    from kiro_crew.providers.claude_session_overlay import update_entry
+    from kiro_crew.providers.claude_session_overlay import OVERLAY_FIELDS, update_entry
 
     uuid = request.match_info.get("uuid", "")
     if not uuid:
@@ -1276,7 +1276,7 @@ async def api_claude_session_overlay(request: web.Request) -> web.Response:
         return web.json_response({"error": "invalid json"}, status=400)
     if not isinstance(body, dict):
         return web.json_response({"error": "body must be an object"}, status=400)
-    patch = {k: body[k] for k in ("title", "pinned", "tags", "color") if k in body}
+    patch = {k: body[k] for k in OVERLAY_FIELDS if k in body}
     entry = await asyncio.to_thread(update_entry, uuid, patch)
     return web.json_response({"uuid": uuid, "overlay": entry})
 
@@ -1342,6 +1342,38 @@ async def api_claude_session_open(request: web.Request) -> web.Response:
         cwd=cwd or "",
     )
     return web.json_response({"slot": slot, "uuid": uuid, "cwd": cwd})
+
+
+async def api_claude_session_delete(request: web.Request) -> web.Response:
+    """DELETE /api/claude-sessions/{uuid} — permanently delete a native session.
+
+    DESTRUCTIVE and distinct from archiving (which is the reversible overlay flag
+    set via PATCH ``archived``): this unlinks the native ``<uuid>.jsonl`` under
+    ``~/.claude`` — the very file a bare ``claude`` terminal reads — and drops the
+    CCrew overlay entry so no stale metadata lingers. The path is re-resolved
+    server-side from the UUID and containment-checked against the projects root,
+    so a crafted uuid cannot steer the unlink elsewhere. The frontend gates this
+    behind an explicit confirm.
+
+    Returns ``{uuid, deleted}`` where ``deleted`` is True when a file was removed,
+    False when none was found (an already-gone session is not an error).
+    """
+    from kiro_crew.providers.claude_session_overlay import forget_entry
+    from kiro_crew.providers.claude_sessions import delete_claude_session
+
+    uuid = request.match_info.get("uuid", "")
+    if not uuid:
+        return web.json_response({"error": "missing uuid"}, status=400)
+
+    def _delete() -> bool:
+        removed = delete_claude_session(uuid)
+        # Drop overlay metadata regardless — if the file is already gone, the
+        # sidecar entry for it should not survive either.
+        forget_entry(uuid)
+        return removed
+
+    deleted = await asyncio.to_thread(_delete)
+    return web.json_response({"uuid": uuid, "deleted": deleted})
 
 
 _SUMMARIZE_MAX_SESSIONS = 8  # bound cost/latency: only the top-N get an LLM pass

@@ -205,3 +205,64 @@ def list_claude_sessions(home: Path | None = None, limit: int = _SCAN_FILE_LIMIT
     # Newest first by mtime -- matches how the native list is ordered for recency.
     rows.sort(key=lambda r: r.get("mtime") or 0.0, reverse=True)
     return rows
+
+
+def find_claude_session_path(uuid: str, home: Path | None = None) -> Path | None:
+    """Resolve the native ``.jsonl`` for *uuid*, or None if not found.
+
+    Scans the projects store for ``<uuid>.jsonl`` and returns its path ONLY when
+    the resolved file lives under the projects root — a containment check that
+    rejects a hostile ``uuid`` carrying ``..`` or an absolute path before any
+    filesystem mutation touches it. The UUID is the stem the reader assigns
+    (``path.stem``), so a legitimate id is a bare filename with no separators.
+    """
+    if not uuid or "/" in uuid or "\\" in uuid or uuid in (".", ".."):
+        return None
+    root = claude_projects_root(home)
+    if not root.is_dir():
+        return None
+    try:
+        root_resolved = root.resolve()
+    except OSError:
+        return None
+    try:
+        project_dirs = sorted(root.iterdir())
+    except OSError:
+        return None
+    for proj in project_dirs:
+        if not proj.is_dir():
+            continue
+        candidate = proj / f"{uuid}.jsonl"
+        if not candidate.is_file():
+            continue
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            continue
+        # Containment: the resolved file must sit under the projects root, so a
+        # crafted uuid can never redirect the unlink outside the claude store.
+        if resolved == root_resolved or root_resolved in resolved.parents:
+            return resolved
+    return None
+
+
+def delete_claude_session(uuid: str, home: Path | None = None) -> bool:
+    """Permanently unlink the native claude ``.jsonl`` for *uuid*.
+
+    DESTRUCTIVE: this removes the user's own claude conversation from
+    ``~/.claude`` — the same file a bare ``claude`` terminal reads — so it is
+    gated behind an explicit confirm in the UI, unlike the reversible archive
+    overlay. Returns True if a file was unlinked, False if none was found (an
+    already-gone session is not an error). The path is re-resolved server-side
+    via :func:`find_claude_session_path`, never taken from the client, so the
+    unlink cannot be steered outside the projects root.
+    """
+    path = find_claude_session_path(uuid, home)
+    if path is None:
+        return False
+    try:
+        path.unlink()
+    except OSError:
+        logger.warning("failed to delete claude session %s", uuid, exc_info=True)
+        return False
+    return True

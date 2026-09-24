@@ -13,6 +13,12 @@ This is a pure OVERLAY: it is never written back into ``~/.claude`` (a bare
 deliberate), and it enriches the sidebar row without altering the conversation.
 The native transcript remains the source of truth for the session itself.
 
+There is deliberately NO "archived" flag. For a native claude session, "close"
+is a confirm-gated permanent delete of the native ``.jsonl`` (see
+``claude_sessions.delete_claude_session``), which also drops the overlay entry
+via ``forget_entry`` — there is no intermediate archived state, because a foreign
+claude transcript has no CCrew history lane to be archived into.
+
 Atomic tmp+rename write, mirroring session_map's durability pattern. Reads
 tolerate a missing/corrupt file by returning an empty overlay rather than
 raising — a lost overlay costs cosmetics, never a session.
@@ -32,6 +38,10 @@ from kiro_crew.config.paths import config_dir
 logger = logging.getLogger(__name__)
 
 OVERLAY_FILENAME = "claude_session_overlay.json"
+
+# The overlay fields a caller may set. Kept in one place so the endpoint filter,
+# the merge patch loop, and validation stay in agreement.
+OVERLAY_FIELDS = ("title", "pinned", "tags", "color")
 
 # Bounds so a hand-edited or hostile overlay cannot bloat a row or the file.
 _TITLE_MAX = 200
@@ -113,7 +123,7 @@ def update_entry(uuid: str, patch: dict[str, Any]) -> dict[str, Any]:
     data = load_overlay()
     current = dict(data.get(uuid, {}))
     for k, v in patch.items():
-        if k not in ("title", "pinned", "tags", "color"):
+        if k not in OVERLAY_FIELDS:
             continue
         if v is None or (isinstance(v, str) and not v.strip()) or v is False or v == []:
             current.pop(k, None)
@@ -128,6 +138,21 @@ def update_entry(uuid: str, patch: dict[str, Any]) -> dict[str, Any]:
         result = coerced
     _write_overlay(data)
     return result
+
+
+def forget_entry(uuid: str) -> bool:
+    """Drop the overlay entry for *uuid* entirely; return whether one existed.
+
+    Used when the native session is permanently deleted — the sidecar metadata
+    for a gone conversation must not linger and re-decorate a UUID the store
+    could theoretically reissue.
+    """
+    data = load_overlay()
+    if uuid not in data:
+        return False
+    data.pop(uuid, None)
+    _write_overlay(data)
+    return True
 
 
 def apply_overlay(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:

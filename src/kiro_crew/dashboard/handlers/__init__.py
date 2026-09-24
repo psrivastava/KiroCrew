@@ -441,6 +441,7 @@ from kiro_crew.dashboard.handlers.sessions import (  # noqa: E402, F401
     api_session_tool_policy,
     api_claude_session_overlay,
     api_claude_session_open,
+    api_claude_session_delete,
     api_claude_sessions,
     api_sessions,
     api_sessions_clear,
