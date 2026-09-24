@@ -4662,11 +4662,13 @@ export const api = {
   sessions: (limit = 30, offset = 0, preview = false, excludeOpen = false) => fetch('/api/sessions?limit=' + limit + '&offset=' + offset + (preview ? '&preview=1' : '') + (excludeOpen ? '&exclude_open=1' : '')).then(j),
   // CCrew: native Claude CLI sessions (from ~/.claude/projects), listed as a
   // separate sidebar group. Read-only; see providers/claude_sessions.py.
-  claudeSessions: (limit = 200) => fetch('/api/claude-sessions?limit=' + limit).then(j) as Promise<{ sessions: Array<{ session_id: string; key: string; title: string; cwd: string; first_timestamp: string | null; last_timestamp: string | null; mtime: number; source: string; path: string }>; total: number }>,
+  claudeSessions: (limit = 200) => fetch('/api/claude-sessions?limit=' + limit).then(j) as Promise<{ sessions: Array<{ session_id: string; key: string; title: string; cwd: string; first_timestamp: string | null; last_timestamp: string | null; mtime: number; source: string; path: string; pinned?: boolean; tags?: string[]; color?: string; cli_title?: string }>; total: number }>,
   claudeSessionOverlay: (uuid: string, patch: { title?: string; pinned?: boolean; tags?: string[]; color?: string }) =>
     fetch('/api/claude-sessions/' + encodeURIComponent(uuid), { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(patch) }).then(j) as Promise<{ uuid: string; overlay: Record<string, unknown> }>,
   claudeSessionOpen: (uuid: string, slot: string, cwd?: string) =>
     fetch('/api/claude-sessions/' + encodeURIComponent(uuid) + '/open', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ slot, cwd }) }).then(j) as Promise<{ slot: string; uuid: string; cwd: string }>,
+  claudeSessionDelete: (uuid: string) =>
+    fetch('/api/claude-sessions/' + encodeURIComponent(uuid), { method: 'DELETE' }).then(j) as Promise<{ uuid: string; deleted: boolean }>,
   sessionsSearch: (q: string, limit = 50) => fetch('/api/sessions/search?q=' + encodeURIComponent(q) + '&limit=' + limit).then(j),
   // Federated session search across the local gateway + every CONNECTED remote
   // instance (backend rank-interleaves; remote rows carry instance_id/_name).

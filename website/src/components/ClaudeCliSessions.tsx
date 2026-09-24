@@ -1,6 +1,6 @@
 import { useMemo, useState, useRef, useEffect } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { ChevronRight, Terminal, Pencil, Pin, Tag, Copy, FolderOpen, Palette } from 'lucide-react'
+import { ChevronRight, Terminal, Pencil, Pin, Tag, Copy, FolderOpen, Palette, Trash2 } from 'lucide-react'
 import { api } from '../api/client'
 import { i18nT } from '../i18n/t'
 import { useAppDispatch } from '../store'
@@ -20,10 +20,17 @@ import { createSlot, switchSlot } from '../store/chatSlice'
  * then share one transcript.
  *
  * Per-session metadata (rename, pin, tags, color) is a CCrew OVERLAY, never
- * written back into ~/.claude (a bare claude run has nowhere to read it). Codex
- * is intentionally excluded (its Amazon build keeps sessions in SQLite, unsafe
- * to mirror). No Close/Delete here: there is no CCrew transcript to archive, and
- * deleting the native .jsonl would destroy the user's own claude data.
+ * written back into ~/.claude (a bare claude run has nowhere to read it).
+ *
+ * Close vs delete: for a native claude session there is NO intermediate archive.
+ * A foreign .jsonl has no CCrew history lane to be archived into, so "close" IS
+ * a confirm-gated permanent delete — DELETE /api/claude-sessions/{uuid} unlinks
+ * the native .jsonl (the same file a bare claude terminal reads) and drops the
+ * overlay entry. The regular-session close (archive to CCrew history) does not
+ * apply here; the delete is gated behind an inline confirm because it destroys
+ * the user's own claude data.
+ *
+ * Codex is intentionally excluded (its Amazon build keeps sessions in SQLite).
  */
 
 interface ClaudeSessionRow {
@@ -58,6 +65,7 @@ export default function ClaudeCliSessions() {
   const [menu, setMenu] = useState<{ uuid: string; x: number; y: number } | null>(null)
   const [renaming, setRenaming] = useState<string | null>(null)
   const [renameText, setRenameText] = useState('')
+  const [confirmDelete, setConfirmDelete] = useState<string | null>(null)
   const [busy, setBusy] = useState<string | null>(null)
   const dispatch = useAppDispatch()
   const qc = useQueryClient()
@@ -73,9 +81,9 @@ export default function ClaudeCliSessions() {
   useEffect(() => {
     if (!menu) return
     const onDown = (e: MouseEvent) => {
-      if (menuRef.current && !menuRef.current.contains(e.target as Node)) setMenu(null)
+      if (menuRef.current && !menuRef.current.contains(e.target as Node)) { setMenu(null); setConfirmDelete(null) }
     }
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setMenu(null) }
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') { setMenu(null); setConfirmDelete(null) } }
     document.addEventListener('mousedown', onDown)
     document.addEventListener('keydown', onKey)
     return () => { document.removeEventListener('mousedown', onDown); document.removeEventListener('keydown', onKey) }
@@ -119,6 +127,13 @@ export default function ClaudeCliSessions() {
     try { await api.claudeSessionOverlay(uuid, patch) } finally { refresh() }
   }
 
+  async function deleteSession(uuid: string) {
+    setMenu(null)
+    setConfirmDelete(null)
+    setBusy(uuid)
+    try { await api.claudeSessionDelete(uuid) } finally { setBusy(null); refresh() }
+  }
+
   function startRename(row: ClaudeSessionRow) {
     setMenu(null)
     setRenaming(row.session_id)
@@ -159,7 +174,7 @@ export default function ClaudeCliSessions() {
                   tabIndex={0}
                   onClick={() => openSession(s)}
                   onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openSession(s) } }}
-                  onContextMenu={e => { e.preventDefault(); setMenu({ uuid: s.session_id, x: e.clientX, y: e.clientY }) }}
+                  onContextMenu={e => { e.preventDefault(); setConfirmDelete(null); setMenu({ uuid: s.session_id, x: e.clientX, y: e.clientY }) }}
                   className={`group px-2 py-1.5 rounded-md hover:bg-ok/8 cursor-pointer flex items-center gap-1.5 ${busy === s.session_id ? 'opacity-60' : ''}`}
                   title={s.session_id}
                 >
@@ -193,7 +208,7 @@ export default function ClaudeCliSessions() {
                     {s.tags && s.tags.length > 0 && (
                       <span className="flex flex-wrap gap-1 mt-0.5">
                         {s.tags.map(tag => (
-                          <span key={tag} className="text-[9px] px-1 rounded bg-accent/12 text-accent truncate max-w-[80px]">{tag}</span>
+                          <span key={tag} className="text-[10px] px-1 rounded bg-accent/12 text-accent truncate max-w-[80px]">{tag}</span>
                         ))}
                       </span>
                     )}
@@ -208,12 +223,13 @@ export default function ClaudeCliSessions() {
       {menu && (() => {
         const row = rows.find(r => r.session_id === menu.uuid)
         if (!row) return null
+        const isConfirming = confirmDelete === row.session_id
         return (
           <div
             ref={menuRef}
             role="menu"
-            className="fixed z-50 min-w-[180px] rounded-lg border border-border bg-bg-elevated shadow-lg py-1 text-[13px]"
-            style={{ left: Math.min(menu.x, window.innerWidth - 200), top: Math.min(menu.y, window.innerHeight - 260) }}
+            className="fixed z-50 min-w-[190px] rounded-lg border border-border bg-bg-elevated shadow-lg py-1 text-[13px]"
+            style={{ left: Math.min(menu.x, window.innerWidth - 210), top: Math.min(menu.y, window.innerHeight - 300) }}
           >
             <MenuItem icon={<FolderOpen className="lucide-inline" />} label={i18nT('components.claudeCliSessions.open')} onClick={() => { setMenu(null); openSession(row) }} />
             <MenuItem icon={<Pencil className="lucide-inline" />} label={i18nT('components.claudeCliSessions.rename')} onClick={() => startRename(row)} />
@@ -237,6 +253,38 @@ export default function ClaudeCliSessions() {
             <div className="my-1 border-t border-border" />
             <MenuItem icon={<Copy className="lucide-inline" />} label={i18nT('components.claudeCliSessions.copy_path')} onClick={() => { setMenu(null); navigator.clipboard?.writeText(row.cwd || '') }} />
             <MenuItem icon={<Tag className="lucide-inline" />} label={i18nT('components.claudeCliSessions.copy_id')} onClick={() => { setMenu(null); navigator.clipboard?.writeText(row.session_id) }} />
+            <div className="my-1 border-t border-border" />
+            {isConfirming ? (
+              <div className="px-3 py-1.5 flex flex-col gap-1.5">
+                <span className="text-[11px] text-muted leading-snug">{i18nT('components.claudeCliSessions.delete_confirm')}</span>
+                <div className="flex items-center gap-1.5">
+                  <button
+                    type="button"
+                    onClick={() => deleteSession(row.session_id)}
+                    className="flex-1 px-2 py-1 rounded bg-danger/15 text-danger hover:bg-danger/25 border-none cursor-pointer text-[12px] font-medium"
+                  >
+                    {i18nT('components.claudeCliSessions.delete_confirm_yes')}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setConfirmDelete(null)}
+                    className="flex-1 px-2 py-1 rounded bg-transparent text-muted hover:text-text border border-border cursor-pointer text-[12px]"
+                  >
+                    {i18nT('components.claudeCliSessions.cancel')}
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => setConfirmDelete(row.session_id)}
+                className="w-full flex items-center gap-2 px-3 py-1.5 text-left bg-transparent border-none cursor-pointer text-danger hover:bg-danger/8"
+              >
+                <span className="shrink-0" aria-hidden="true"><Trash2 className="lucide-inline" /></span>
+                <span className="truncate">{i18nT('components.claudeCliSessions.delete')}</span>
+              </button>
+            )}
           </div>
         )
       })()}

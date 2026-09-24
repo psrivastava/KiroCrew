@@ -8852,7 +8852,11 @@
       "no_color": "No color",
       "copy_path": "Copy working directory",
       "copy_id": "Copy session ID",
-      "set_color": "Set color {{color}}"
+      "set_color": "Set color {{color}}",
+      "delete": "Delete claude session…",
+      "delete_confirm": "Permanently delete this claude session? This unlinks the native .jsonl and cannot be undone.",
+      "delete_confirm_yes": "Delete",
+      "cancel": "Cancel"
     }
   },
   "hooks": {
