@@ -236,3 +236,48 @@ PATH="$HOME/.local/share/mise/installs/node/22.23.2/bin:$PATH" \
 # Backend tests for the CLI-session feature
 .venv/bin/python -m pytest test/test_claude_session*.py -q
 ```
+
+### 8.1 Build & share the desktop app package
+
+Full build → signed-free `.app` + distributable `.dmg`, then hand it to a
+teammate. Run from a terminal (NOT the sandboxed agent — electron-builder's
+node-module scan trips on the masked `~/.kiro/crew/scratch` path there):
+
+```bash
+cd /Users/srivpra/work/CCrew
+
+# 1. Build the package (host arch only; drop UNIVERSAL=0 for a universal build).
+#    CCREW=1 bakes the CCrew identity (name/home/port) into the packaged app.
+PATH="$HOME/.local/share/mise/installs/node/22.23.2/bin:$PATH" \
+  UNIVERSAL=0 CCREW=1 CCREW_ALLOW_UNAUTH_VOICE=1 bash packaging/build-desktop.sh
+
+# 2. Artifacts land here:
+ls -lh website/electron/dist/mac-arm64/
+#   CCrew.app                 ← drag to /Applications to run locally
+#   CCrew-0.8.0-arm64.dmg     ← the shareable installer
+#   CCrew-0.8.0-arm64.zip     ← alt archive (same app, zipped)
+```
+
+**Install locally** (recommended: `ditto`, not `cp -R`, to avoid a nested
+`.app`; overwrite any prior copy, then launch from `/Applications`):
+
+```bash
+osascript -e 'quit app "CCrew"' 2>/dev/null || true
+ditto "website/electron/dist/mac-arm64/CCrew.app" "/Applications/CCrew.app"
+open -a "CCrew"
+```
+
+**Share with a teammate** — send the `.dmg`. They double-click it and drag
+`CCrew.app` to `/Applications`. It is **not code-signed or notarized**
+(`CSC_IDENTITY_AUTO_DISCOVERY=false`, `notarize:false`), so on first launch macOS
+Gatekeeper blocks it; the recipient clears it once with either:
+
+```bash
+# after copying CCrew.app out of the DMG to /Applications:
+xattr -dr com.apple.quarantine "/Applications/CCrew.app"
+```
+
+or **System Settings → Privacy & Security → "Open Anyway"** on the first
+blocked launch. Because CCrew has its own bundle id (`com.ccrew.app`), name,
+data home (`~/.ccrew`) and port (5490), it installs and runs **side by side**
+with an installed KiroCrew — neither replaces the other.
