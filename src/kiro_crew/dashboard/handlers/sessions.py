@@ -1225,6 +1225,32 @@ async def api_sessions(request: web.Request) -> web.Response:
     )
 
 
+async def api_claude_sessions(request: web.Request) -> web.Response:
+    """GET /api/claude-sessions — list the Claude CLI's OWN native sessions.
+
+    Separate from ``/api/sessions`` (CCrew's own conversations) on purpose: this
+    reads the ``claude`` CLI's flat-JSONL store under ``~/.claude/projects`` so
+    the sidebar can show a distinct "Claude CLI" grouping. Additive endpoint —
+    it does not touch the native list — to keep upstream merges clean.
+
+    Query params:
+      - ``limit``: max sessions (default 200, capped at 2000)
+
+    Returns ``{sessions, total}``. Each row carries ``source="claude-cli"``, the
+    session UUID (``session_id``), a redacted ``title`` and ``cwd`` (the folder
+    grouping key), and timestamps. The scan is synchronous file IO, so it runs
+    off the event loop.
+    """
+    from kiro_crew.providers.claude_sessions import list_claude_sessions
+
+    try:
+        limit = min(int(request.query.get("limit", "200")), 2000)
+    except (TypeError, ValueError):
+        limit = 200
+    rows = await asyncio.to_thread(list_claude_sessions, None, limit)
+    return web.json_response({"sessions": rows, "total": len(rows)})
+
+
 _SUMMARIZE_MAX_SESSIONS = 8  # bound cost/latency: only the top-N get an LLM pass
 _SUMMARIZE_MODEL = "auto"  # inherit the governed default; a hardcoded id 400s where unavailable
 _SUMMARIZE_MSG_LIMIT = 12  # messages fed to the summarizer per session
