@@ -1455,6 +1455,15 @@ body::before{content:'';position:fixed;top:-50%;left:-50%;width:200%;height:200%
              radial-gradient(ellipse at 80% 20%,color-mix(in srgb,var(--accent) 3%,transparent) 0%,transparent 50%),
              radial-gradient(ellipse at 50% 80%,color-mix(in srgb,var(--accent) 3%,transparent) 0%,transparent 50%)}
 
+/* ── CCrew logo tint ──
+   The brand glyph ships as a raster logo.png (purple ghost). CCrew is a
+   distinct app, so its glyph is tinted lime-green to be visually
+   distinguishable at a glance from an installed KiroCrew. A hue-rotate
+   filter recolors the PNG in place -- no separate asset. ~110deg shifts the
+   ~260deg purple toward lime; saturate deepens it. Applied to the brand
+   glyph <img> in App.tsx (RailHeaderGlyph / MobileNavGlyph). */
+.ccrew-logo-tint{filter:hue-rotate(110deg) saturate(1.25)}
+
 /* ── App icons (two-color, theme-reactive) ──
    Idle: muted structure + accent detail. Lit (selected OR hovered inside a
    .group container): accent structure + text detail. Icons are inlined SVGs

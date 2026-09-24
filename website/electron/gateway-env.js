@@ -33,6 +33,12 @@ const GATEWAY_UTF8_ENV = Object.freeze({
 function buildGatewayEnvironment(baseEnv) {
   return {
     ...baseEnv,
+    // CCrew is the standalone (public) edition packaged as its own app. Force
+    // the profile so the bundled gateway composes cleanly even when the host
+    // environment carries an inherited KIROCREW_PROFILE=amazon/enterprise marker
+    // (from an installed KiroCrew) -- without this the boot fails closed. This is
+    // the desktop equivalent of what ccrew.sh does for the shell launch.
+    KIROCREW_PROFILE: "standalone",
     ...GATEWAY_UTF8_ENV,
   };
 }

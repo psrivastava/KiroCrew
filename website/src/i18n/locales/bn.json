@@ -8722,6 +8722,24 @@
       "label": "পরিবর্তনে পুনরায় চালু করা লাগে",
       "tooltip": "{{productName}} চলার সময় এই সেটিং পরিবর্তন করা যায় না। সংরক্ষিত মানটি রাখা হয় এবং {{productName}} পরের বার পুনরায় চালু হলে প্রয়োগ হবে (সেটিংস → সম্পর্কে, বা যে টার্মিনাল থেকে আপনি এটি চালু করেছেন)।",
       "schema_unavailable": "এই সেটিংয়ের জন্য পুনরায় চালু করা দরকার কি না তা পরীক্ষা করা যায়নি।"
+    },
+    "claudeCliSessions": {
+      "heading": "Claude CLI sessions",
+      "via_claude": "via Claude CLI",
+      "untitled": "Untitled session",
+      "unknown_dir": "Unknown directory",
+      "open": "Open",
+      "rename": "Rename",
+      "pin": "Pin",
+      "unpin": "Unpin",
+      "no_color": "No color",
+      "copy_path": "Copy working directory",
+      "copy_id": "Copy session ID",
+      "set_color": "Set color {{color}}",
+      "delete": "Delete claude session…",
+      "delete_confirm": "Permanently delete this claude session? This unlinks the native .jsonl and cannot be undone.",
+      "delete_confirm_yes": "Delete",
+      "cancel": "Cancel"
     }
   },
   "hooks": {

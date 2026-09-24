@@ -119,6 +119,7 @@ const VIDEO_ACCEPT = 'video/mp4,video/x-m4v,video/quicktime,video/webm'
 const FILE_ACCEPT = IMAGE_ACCEPT + ',' + VIDEO_ACCEPT + ',.txt,.text,.xwiki,.md,.json,.jsonl,.excalidraw,.har,.yaml,.yml,.xml,.drawio,.csv,.tsv,.log,.py,.js,.ts,.tsx,.jsx,.html,.css,.sh,.bash,.rb,.go,.rs,.java,.c,.cpp,.h,.hpp,.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.odt,.ods,.odp,.rtf,.zip,.tar,.gz'
 
 import ApprovalModePicker, { APPROVAL_MODE_ADJUSTED_LS_KEY } from './ApprovalModePicker'
+import BackendChip from './BackendChip'
 // Effort vocabulary lives in lib/effort.ts (mirrors backend effort.py).
 // Re-exported here for back-compat with existing `from './ChatInput'` imports.
 export {
@@ -4928,6 +4929,9 @@ function ChatInput({
               {!shelfCompact && <span className="truncate max-w-[160px]">{agentLabel ?? agentName}</span>}
             </button>
           )}
+          {/* CCrew: active ACP backend (Claude/Codex/Kiro), beside the agent
+              label since the backend is part of "which agent am I using". */}
+          <BackendChip compact={shelfCompact} />
           {onProjectClick && (
           /* Two sibling buttons inside one visual pill, NOT a nested button:
              the folder segment opens the project picker and the branch segment

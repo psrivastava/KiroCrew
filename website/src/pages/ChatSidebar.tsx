@@ -34,6 +34,7 @@ import { computeSiblingReorder } from '../utils/reorderFolders'
 import { computeRecentRank, recencyTintShadow, clampTintCount } from '../utils/recencyTint'
 import { computeActiveSubtree, folderIsHidden, folderOffersHide } from '../utils/folderVisibility'
 import { groupHistoryByFolder } from '../utils/groupHistoryByFolder'
+import ClaudeCliSessions from '../components/ClaudeCliSessions'
 import { highlightText } from '../utils/highlightText'
 import { boardCollapseKey, boardColumnFromDroppableId, loadBoardFolderCollapse, persistBoardOverride, persistClearFolderOverrides, clearFolderOverrides } from '../utils/boardFolderCollapse'
 import { slotChannelLabel, slotChannelNamespace } from '../utils/channelOrigin'
@@ -9207,6 +9208,10 @@ function ChatSidebar({
             compact={sidebarWidth < 220} />
         )}
       </AnimatePresence>
+
+      {/* CCrew: native Claude CLI sessions, grouped by working dir, below
+          C Crew's own sessions. Read-only listing from ~/.claude/projects. */}
+      <ClaudeCliSessions />
 
       {/* When expanded: doubles as the resize handle (accent on hover, drag to resize, dbl-click to collapse).
           When collapsed: just a static 1px divider between sessions and the Older Sessions footer. */}

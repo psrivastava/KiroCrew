@@ -8605,6 +8605,24 @@
       "label": "修改后需重启",
       "tooltip": "{{productName}} 运行期间无法更改此设置。已保存的值会保留，并在 {{productName}} 下次重启后应用（设置 → 关于，或启动它的终端）。",
       "schema_unavailable": "无法检查此设置是否需要重启。"
+    },
+    "claudeCliSessions": {
+      "heading": "Claude CLI sessions",
+      "via_claude": "via Claude CLI",
+      "untitled": "Untitled session",
+      "unknown_dir": "Unknown directory",
+      "open": "Open",
+      "rename": "Rename",
+      "pin": "Pin",
+      "unpin": "Unpin",
+      "no_color": "No color",
+      "copy_path": "Copy working directory",
+      "copy_id": "Copy session ID",
+      "set_color": "Set color {{color}}",
+      "delete": "Delete claude session…",
+      "delete_confirm": "Permanently delete this claude session? This unlinks the native .jsonl and cannot be undone.",
+      "delete_confirm_yes": "Delete",
+      "cancel": "Cancel"
     }
   },
   "hooks": {

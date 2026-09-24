@@ -8722,6 +8722,24 @@
       "label": "Änderungen erfordern Neustart",
       "tooltip": "Diese Einstellung kann sich nicht ändern, während {{productName}} läuft. Der gespeicherte Wert bleibt erhalten und gilt beim nächsten Neustart von {{productName}} (Einstellungen → Über, oder das Terminal, aus dem du es gestartet hast).",
       "schema_unavailable": "Es konnte nicht geprüft werden, ob diese Einstellung einen Neustart braucht."
+    },
+    "claudeCliSessions": {
+      "heading": "Claude CLI sessions",
+      "via_claude": "via Claude CLI",
+      "untitled": "Untitled session",
+      "unknown_dir": "Unknown directory",
+      "open": "Open",
+      "rename": "Rename",
+      "pin": "Pin",
+      "unpin": "Unpin",
+      "no_color": "No color",
+      "copy_path": "Copy working directory",
+      "copy_id": "Copy session ID",
+      "set_color": "Set color {{color}}",
+      "delete": "Delete claude session…",
+      "delete_confirm": "Permanently delete this claude session? This unlinks the native .jsonl and cannot be undone.",
+      "delete_confirm_yes": "Delete",
+      "cancel": "Cancel"
     }
   },
   "hooks": {

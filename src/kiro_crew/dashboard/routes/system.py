@@ -61,6 +61,10 @@ def register(app: web.Application) -> None:
     if _is_dev_env or env_flag_enabled("KIROCREW_DEV_MODE"):
         app.router.add_post("/api/update/simulate", handlers.api_update_simulate)
     app.router.add_get("/api/sessions", handlers.api_sessions)
+    app.router.add_get("/api/claude-sessions", handlers.api_claude_sessions)
+    app.router.add_patch("/api/claude-sessions/{uuid}", handlers.api_claude_session_overlay)
+    app.router.add_post("/api/claude-sessions/{uuid}/open", handlers.api_claude_session_open)
+    app.router.add_delete("/api/claude-sessions/{uuid}", handlers.api_claude_session_delete)
     app.router.add_delete("/api/sessions", handlers.api_sessions_clear)
     app.router.add_get("/api/sessions/memory", handlers.api_sessions_memory)
     app.router.add_get("/api/sessions/health", handlers.api_sessions_health)

@@ -8839,6 +8839,24 @@
       "label": "modifications : redémarrage requis",
       "tooltip": "Ce réglage ne peut pas changer pendant que {{productName}} est en cours d'exécution. La valeur enregistrée est conservée et s'applique au prochain redémarrage de {{productName}} (Réglages → À propos, ou le terminal depuis lequel vous l'avez lancé).",
       "schema_unavailable": "Impossible de vérifier si ce réglage nécessite un redémarrage."
+    },
+    "claudeCliSessions": {
+      "heading": "Claude CLI sessions",
+      "via_claude": "via Claude CLI",
+      "untitled": "Untitled session",
+      "unknown_dir": "Unknown directory",
+      "open": "Open",
+      "rename": "Rename",
+      "pin": "Pin",
+      "unpin": "Unpin",
+      "no_color": "No color",
+      "copy_path": "Copy working directory",
+      "copy_id": "Copy session ID",
+      "set_color": "Set color {{color}}",
+      "delete": "Delete claude session…",
+      "delete_confirm": "Permanently delete this claude session? This unlinks the native .jsonl and cannot be undone.",
+      "delete_confirm_yes": "Delete",
+      "cancel": "Cancel"
     }
   },
   "hooks": {
