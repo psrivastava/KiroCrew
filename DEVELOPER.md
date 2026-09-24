@@ -36,12 +36,48 @@
 | Profile | inherited | **forced** `standalone` (OSS fork has no enterprise companion; a non-standalone marker fails closed at boot) | `ccrew.sh` |
 | Data home | `~/.kiro/crew` | `~/.ccrew` (isolated sessions/config/memory) | `ccrew.sh` |
 | Port | 5476 | 5490 | `ccrew.sh` |
-| Desktop app | "Kiro Crew" | **"C Crew"**, appId `com.ccrew.app`, forces standalone in the packaged gateway, `CCREW_ALLOW_UNAUTH_VOICE=1` to pass the ffmpeg voice-decoder gate (irrelevant to a claude/codex skin) | `packaging/build-desktop.sh`, electron config |
-| Branding | "Kiro Crew" wordmark | **"C CREW"** wordmark via `dashboard.bot_name` in `~/.ccrew/config.json` (the `/api/branding` endpoint reads `dashboard.bot_name`, NOT `agent.bot_name`) | config only |
+| Desktop app | "Kiro Crew" | **"CCrew"** (spaceless — avoids the electron-builder `CFBundleName` helper-app pitfall), appId `com.ccrew.app`. Built with `CCREW=1` (see §2.1) which bakes its own identity so it runs side-by-side with an installed KiroCrew. `CCREW_ALLOW_UNAUTH_VOICE=1` passes the ffmpeg voice-decoder gate (irrelevant to a claude/codex skin) | `packaging/build-desktop.sh`, electron config |
+| Branding | "Kiro Crew" wordmark | **"CCREW"** wordmark (`bot_name` "CCrew", uppercased by the wordmark) via `dashboard.bot_name` in `~/.ccrew/config.json` (the `/api/branding` endpoint reads `dashboard.bot_name`, NOT `agent.bot_name`) | config only |
 
 CLI credentials (`~/.claude`, `~/.codex`, kiro-cli's) live **outside** the data
 home, so isolating `KIROCREW_HOME` does not re-prompt any login — both apps share
 the same CLI sign-ins.
+
+### 2.1 Desktop app identity (`CCREW=1`) — side-by-side coexistence
+
+The dev launcher `./ccrew.sh` sets `KIROCREW_HOME`/`KIROCREW_PORT` as env vars,
+but a **double-clicked `.app` inherits no shell env**. So the packaged CCrew app
+must carry its own identity, or macOS treats it as the installed KiroCrew and
+just fronts the running instance instead of launching (Electron keys
+`requestSingleInstanceLock()` + `userData` off `app.name`, so a shared name = a
+shared lock).
+
+`CCREW=1 bash packaging/build-desktop.sh` fixes this by baking a runtime marker
+into the packaged `app/package.json` (`electron-builder -c.extraMetadata.ccrew=true`).
+At boot, `website/electron/ccrew-identity.js` reads that marker (env
+`KIROCREW_CCREW=1` overrides it for a dev source run) and switches three axes so
+the two apps never collide:
+
+| Axis | KiroCrew | CCrew | Seam |
+|---|---|---|---|
+| `app.name` (→ lock + userData) | "Kiro Crew" | "CCrew" | `main.js` (`ccrewAppName()`) |
+| Default data home | `~/.kiro/crew` | `~/.ccrew` | `home-dir.js` (`canonicalHome`) |
+| Default gateway port | 5476 | 5490 | `main.js` (`resolvePort`) |
+| Windows AppUserModelID | `com.amazon.kiro.crew` | `com.ccrew.app` | `main.js` |
+
+An explicit `KIROCREW_HOME` override still wins over the CCrew default. A plain
+source run or a hypothetical upstream desktop build has neither the baked flag
+nor the env, so every KiroCrew default is untouched — the change is additive.
+
+**Python-package caveat (not fixed, by design):** the fork still declares its pip
+distribution as `name = "kirocrew"` (`pyproject.toml`), identical to upstream, so
+`pip install`-ing the fork into a **shared** environment evicts-and-replaces
+upstream KiroCrew ("Uninstalling kirocrew-0.8.0…"). This is harmless for the
+packaged app (its gateway installs into an **isolated** bundled venv under
+`backend-dist/`) and keeps the fork trivially mergeable. Always install the fork
+into its own venv; a full `ccrew` distribution rename is possible but
+merge-hostile and deferred.
+
 
 ---
 
@@ -169,6 +205,16 @@ suite (must stay all-locales-green).
   end-to-end "click a CLI row → attaches to the same claude conversation" needs a
   live `./ccrew.sh` turn to confirm.
 - **Phase 2 permission mapping:** Normal/Reads/Trust/YOLO → CLI, needs a live turn.
+- **Icon/favicon recolor:** the sidebar glyph is tinted in the DOM via CSS
+  `hue-rotate` (§3.1); the browser favicon (`/logo.png`) and desktop `.app`/Dock
+  icon (`icon.icns`) are raster assets that filter never reaches, so they stay
+  the upstream purple. Recoloring them is a raster edit (`scripts/ccrew-tint-icons.py`
+  applies the same matrix) pending a settled brand hue — `hue-rotate(110deg)`
+  resolves to orange-red, not the "lime" the CSS comment claims.
+
+**Resolved:** desktop app side-by-side coexistence with an installed KiroCrew —
+the `CCREW=1` identity flag (§2.1) gives the packaged app its own name/home/port,
+so double-clicking `CCrew.app` no longer fronts a running KiroCrew.
 
 ---
 
@@ -184,7 +230,7 @@ cd .. && rm -rf src/kiro_crew/static/dist && cp -R website/dist src/kiro_crew/st
 
 # Desktop .app + DMG (from a terminal; needs Node 22 on PATH)
 PATH="$HOME/.local/share/mise/installs/node/22.23.2/bin:$PATH" \
-  UNIVERSAL=0 CCREW_ALLOW_UNAUTH_VOICE=1 bash packaging/build-desktop.sh
+  UNIVERSAL=0 CCREW=1 CCREW_ALLOW_UNAUTH_VOICE=1 bash packaging/build-desktop.sh
 # → website/electron/dist/mac-arm64/
 
 # Backend tests for the CLI-session feature
