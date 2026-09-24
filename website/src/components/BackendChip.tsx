@@ -5,18 +5,19 @@ import { api } from '../api/client'
 import { i18nT } from '../i18n/t'
 
 /**
- * Composer-footer chip showing which ACP backend (Claude / Codex / Kiro CLI)
- * is driving sessions right now, and linking to the switcher.
+ * Composer-shelf chip showing which ACP backend (Claude / Codex / Kiro CLI) is
+ * driving sessions right now, sitting beside the agent-label button.
  *
  * CCrew is a UI skin over the claude & codex CLIs, so "which agent am I using?"
- * must be answerable at a glance. The chat UI already shows the agent-SPEC name
+ * must be answerable at a glance. The shelf already shows the agent-SPEC name
  * (often "default"), which is a different axis and never reflects the backend —
  * that gap is exactly what confused the operator. This chip reads the real
- * `agent.acp_backend` config value and names it.
+ * `agent.acp_backend` config value and names it, right next to that agent label.
  *
  * Clicking deep-links to Developer > Agent Backend (`?tab=agent-backend`), the
  * existing switcher, rather than duplicating its install-probe/switch logic
- * here. Additive component; it does not modify the approval picker beside it.
+ * here. Styled to match the sibling shelf buttons (borderless, transparent),
+ * with the accent reserved for an active CLI backend so it reads as "on".
  *
  * i18n: reuses the existing `agentBackendTab.agent_backend` label for the
  * tooltip/aria and shows the backend id (a proper noun — Claude/Codex/Kiro,
@@ -57,14 +58,12 @@ export default function BackendChip({ compact = false }: { compact?: boolean }) 
       onClick={() => navigate('/developer?tab=agent-backend')}
       title={`${tip}: ${label}`}
       aria-label={`${tip}: ${label}`}
-      className={`inline-flex items-center gap-1.5 rounded-lg border px-2 h-7 text-[12px] font-semibold cursor-pointer transition-colors ${
-        isCli
-          ? 'border-ok/45 text-ok bg-ok/10 hover:bg-ok/15'
-          : 'border-border text-muted hover:text-text hover:bg-accent/8'
+      className={`inline-flex items-center gap-1.5 h-7 min-w-0 text-[12px] px-2.5 rounded-md bg-transparent border-none cursor-pointer transition-colors hover:bg-[color-mix(in_srgb,var(--bg-elevated)_84%,var(--text))] ${
+        isCli ? 'text-ok hover:text-ok' : 'text-muted hover:text-text'
       }`}
       data-testid="composer-backend-chip"
     >
-      <Cpu className="lucide-inline" aria-hidden="true" />
+      <Cpu size={13} className="shrink-0 opacity-70" aria-hidden="true" />
       {!compact && <span className="truncate max-w-[90px]">{label}</span>}
     </button>
   )

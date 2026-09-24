@@ -4499,7 +4499,6 @@ function ChatInput({
                   />
                 </Suspense>
               )}
-              {!isMobile && <BackendChip />}
               {!isMobile && approvalMode && (
                 <ApprovalModePicker mode={approvalMode} slotKey={activeSlot || ''} openSignal={approvalPickerSignal} nudge={approvalNudgeActive} onNudgeDismiss={dismissApprovalNudge} onNudgeHide={hideApprovalNudge} />
               )}
@@ -4521,7 +4520,6 @@ function ChatInput({
                 <div aria-hidden="true" data-testid="control-row-cue-right" className="pointer-events-none absolute right-0 top-0 bottom-0 w-6 bg-gradient-to-l from-bg-elevated to-transparent" />
               )}
             </div>
-            {isMobile && <BackendChip compact />}
             {isMobile && approvalMode && (
               <ApprovalModePicker mode={approvalMode} slotKey={activeSlot || ''} compact openSignal={approvalPickerSignal} nudge={approvalNudgeActive} onNudgeDismiss={dismissApprovalNudge} onNudgeHide={hideApprovalNudge} />
             )}
@@ -4931,6 +4929,9 @@ function ChatInput({
               {!shelfCompact && <span className="truncate max-w-[160px]">{agentLabel ?? agentName}</span>}
             </button>
           )}
+          {/* CCrew: active ACP backend (Claude/Codex/Kiro), beside the agent
+              label since the backend is part of "which agent am I using". */}
+          <BackendChip compact={shelfCompact} />
           {onProjectClick && (
           /* Two sibling buttons inside one visual pill, NOT a nested button:
              the folder segment opens the project picker and the branch segment
