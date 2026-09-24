@@ -27,6 +27,10 @@ for (const [platform, inheritedEncoding] of [
 
     assert.deepStrictEqual(env, {
       PATH: inherited.PATH,
+      // CCrew forces the standalone profile so the bundled gateway composes even
+      // when an installed KiroCrew left KIROCREW_PROFILE=amazon in the inherited
+      // environment (buildGatewayEnvironment, gateway-env.js).
+      KIROCREW_PROFILE: "standalone",
       PYTHONUTF8: "1",
       PYTHONIOENCODING: "utf-8:backslashreplace",
     });
