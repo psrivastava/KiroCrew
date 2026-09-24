@@ -3368,6 +3368,12 @@
     },
     "modelDropdownList": {
       "auto_jev": "Auto (Jev)"
+    },
+    "claudeCliSessions": {
+      "heading": "Claude CLI sessions",
+      "via_claude": "via Claude CLI",
+      "untitled": "Untitled session",
+      "unknown_dir": "Unknown directory"
     }
   },
   "hooks": {

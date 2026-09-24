@@ -8956,6 +8956,12 @@
       "label": "изменения требуют перезапуска",
       "tooltip": "Этот параметр нельзя изменить, пока {{productName}} работает. Сохранённое значение остаётся и применится при следующем перезапуске {{productName}} (Настройки → О программе или терминал, из которого вы его запустили).",
       "schema_unavailable": "Не удалось проверить, требует ли этот параметр перезапуска."
+    },
+    "claudeCliSessions": {
+      "heading": "Claude CLI sessions",
+      "via_claude": "via Claude CLI",
+      "untitled": "Untitled session",
+      "unknown_dir": "Unknown directory"
     }
   },
   "hooks": {

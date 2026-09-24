@@ -8722,6 +8722,12 @@
       "label": "बदलाव के लिए पुनः आरंभ ज़रूरी",
       "tooltip": "{{productName}} चलते समय यह सेटिंग बदली नहीं जा सकती। सहेजा गया मान बना रहता है और {{productName}} के अगले पुनः आरंभ पर लागू होगा (सेटिंग्स → परिचय, या वह टर्मिनल जहाँ से तुमने इसे चलाया)।",
       "schema_unavailable": "यह जाँच नहीं हो सकी कि इस सेटिंग के लिए पुनः आरंभ आवश्यक है या नहीं।"
+    },
+    "claudeCliSessions": {
+      "heading": "Claude CLI sessions",
+      "via_claude": "via Claude CLI",
+      "untitled": "Untitled session",
+      "unknown_dir": "Unknown directory"
     }
   },
   "hooks": {

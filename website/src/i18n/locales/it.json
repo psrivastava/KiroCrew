@@ -8839,6 +8839,12 @@
       "label": "le modifiche richiedono un riavvio",
       "tooltip": "Questa impostazione non può cambiare mentre {{productName}} è in esecuzione. Il valore salvato viene conservato e applicato al prossimo riavvio di {{productName}} (Impostazioni → Informazioni, oppure il terminale da cui lo hai avviato).",
       "schema_unavailable": "Impossibile verificare se questa impostazione richiede un riavvio."
+    },
+    "claudeCliSessions": {
+      "heading": "Claude CLI sessions",
+      "via_claude": "via Claude CLI",
+      "untitled": "Untitled session",
+      "unknown_dir": "Unknown directory"
     }
   },
   "hooks": {

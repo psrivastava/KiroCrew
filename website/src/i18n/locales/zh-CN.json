@@ -8605,6 +8605,12 @@
       "label": "修改后需重启",
       "tooltip": "{{productName}} 运行期间无法更改此设置。已保存的值会保留，并在 {{productName}} 下次重启后应用（设置 → 关于，或启动它的终端）。",
       "schema_unavailable": "无法检查此设置是否需要重启。"
+    },
+    "claudeCliSessions": {
+      "heading": "Claude CLI sessions",
+      "via_claude": "via Claude CLI",
+      "untitled": "Untitled session",
+      "unknown_dir": "Unknown directory"
     }
   },
   "hooks": {

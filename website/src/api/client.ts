@@ -4660,6 +4660,9 @@ export const api = {
   // Older-sessions pane, which is the complement of the tab list above it.
   // Off by default: every other caller wants the full inventory.
   sessions: (limit = 30, offset = 0, preview = false, excludeOpen = false) => fetch('/api/sessions?limit=' + limit + '&offset=' + offset + (preview ? '&preview=1' : '') + (excludeOpen ? '&exclude_open=1' : '')).then(j),
+  // CCrew: native Claude CLI sessions (from ~/.claude/projects), listed as a
+  // separate sidebar group. Read-only; see providers/claude_sessions.py.
+  claudeSessions: (limit = 200) => fetch('/api/claude-sessions?limit=' + limit).then(j) as Promise<{ sessions: Array<{ session_id: string; key: string; title: string; cwd: string; first_timestamp: string | null; last_timestamp: string | null; mtime: number; source: string; path: string }>; total: number }>,
   sessionsSearch: (q: string, limit = 50) => fetch('/api/sessions/search?q=' + encodeURIComponent(q) + '&limit=' + limit).then(j),
   // Federated session search across the local gateway + every CONNECTED remote
   // instance (backend rank-interleaves; remote rows carry instance_id/_name).
