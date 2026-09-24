@@ -32,6 +32,7 @@ const { isLocalGatewayEnabled } = require("./local-gateway");
 const { seedRenamedStore } = require("./store-rename");
 const { resolveHome, secretCandidates } = require("./home-dir");
 const { identityFamily } = require("./instance-guard");
+const { isCCrew, ccrewAppName, CCREW_DEFAULT_PORT } = require("./ccrew-identity");
 const { initNativeLogging } = require("./native-logging");
 const { armCrashCollector, collectCrashReports } = require("./crash-collector");
 const { initGpuPolicy } = require("./disable-gpu");
@@ -149,6 +150,10 @@ function resolvePort() {
   }
 
   if (configuredPort) return configuredPort;
+  if (isCCrew()) {
+    glog("No usable dashboard.url port in the data home; CCrew default " + CCREW_DEFAULT_PORT);
+    return CCREW_DEFAULT_PORT;
+  }
   glog("No usable dashboard.url port in the data home, falling back to 5476");
   return 5476;
 }
@@ -160,16 +165,23 @@ if (migrateRemoteHostConfig(store, PORT)) {
   glog("Migrated legacy remoteHost to remoteHosts[" + PORT + "]");
 }
 
-app.name = identityFamily(app.getVersion()) === "nightly"
-  ? "Kiro Crew Nightly"
-  : "Kiro Crew";
+// CCrew is a separate side-by-side app: its own name keeps its
+// requestSingleInstanceLock() and userData independent of an installed KiroCrew,
+// so double-clicking CCrew.app never loses the lock to a running KiroCrew and
+// gets fronted instead of launching (see ccrew-identity.js).
+app.name = ccrewAppName()
+  ?? (identityFamily(app.getVersion()) === "nightly"
+    ? "Kiro Crew Nightly"
+    : "Kiro Crew");
 
 // Windows groups and pins the live window by this ID. Nightly must remain
 // side-by-side with stable, matching the packaged app IDs.
 if (process.platform === "win32") {
-  const appUserModelId = identityFamily(app.getVersion()) === "nightly"
-    ? "com.amazon.kiro.crew.nightly"
-    : "com.amazon.kiro.crew";
+  const appUserModelId = isCCrew()
+    ? "com.ccrew.app"
+    : identityFamily(app.getVersion()) === "nightly"
+      ? "com.amazon.kiro.crew.nightly"
+      : "com.amazon.kiro.crew";
   app.setAppUserModelId(appUserModelId);
 }
 

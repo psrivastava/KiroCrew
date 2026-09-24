@@ -19,8 +19,17 @@
 
 const nodeOs = require("os");
 const nodePath = require("path");
+const { isCCrew, CCREW_HOME_DIRNAME } = require("./ccrew-identity");
 
-function canonicalHome(os = nodeOs, path = nodePath) {
+function canonicalHome(os = nodeOs, path = nodePath, env = process.env) {
+  // The DEFAULT data home when no valid KIROCREW_HOME override is set. KiroCrew
+  // uses ~/.kiro/crew; the CCrew edition uses ~/.ccrew so the two apps never
+  // share config.json, .local_secret, or session history (see ccrew-identity.js).
+  // An explicit KIROCREW_HOME override still wins over both -- validOverride runs
+  // first in resolveHome/secretCandidates -- so this only picks the default.
+  if (isCCrew({ env })) {
+    return path.join(os.homedir(), CCREW_HOME_DIRNAME);
+  }
   return path.join(os.homedir(), ".kiro", "crew");
 }
 
@@ -57,7 +66,7 @@ function validOverride(env, os, path) {
  * @returns {string}
  */
 function resolveHome({ env = process.env, os = nodeOs, path = nodePath } = {}) {
-  return validOverride(env, os, path) || canonicalHome(os, path);
+  return validOverride(env, os, path) || canonicalHome(os, path, env);
 }
 
 /**
@@ -68,7 +77,7 @@ function resolveHome({ env = process.env, os = nodeOs, path = nodePath } = {}) {
  */
 function secretCandidates({ env = process.env, os = nodeOs, path = nodePath } = {}) {
   const override = validOverride(env, os, path);
-  const home = override || canonicalHome(os, path);
+  const home = override || canonicalHome(os, path, env);
   return [path.join(home, ".local_secret")];
 }
 

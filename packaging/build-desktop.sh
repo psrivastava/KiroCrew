@@ -118,6 +118,19 @@ case "$KC_VERSION" in
   *)           PRODUCT_NAME="KiroCrew" ;;
 esac
 
+# CCREW=1 builds the standalone CCrew edition as its own side-by-side app.
+# package.json's build block already carries the CCrew productName ("CCrew"),
+# bundle id (com.ccrew.app) and icons; this flag aligns the shell's runtime
+# identity with that packaging so the app is CCrew on all three axes macOS uses
+# to tell two apps apart -- name/lock, data home (~/.ccrew), port (5490):
+#   - PRODUCT_NAME here so the universal lipo post-gate finds "CCrew.app".
+#   - extraMetadata.ccrew=true bakes the runtime marker main.js reads to switch
+#     app.name/home/port (a double-clicked .app inherits no shell env, so the
+#     identity has to travel in the packaged app/package.json, not CCREW=1).
+if [ "${CCREW:-0}" = "1" ]; then
+  PRODUCT_NAME="CCrew"
+fi
+
 log() { printf '\n\033[1;36m▶ %s\033[0m\n' "$*"; }
 
 is_macos_intel_backend() {
@@ -903,6 +916,13 @@ log "Packaging desktop app (electron-builder, version: $KC_VERSION)…"
   if [ -f package-lock.json ]; then npm ci --no-audit --no-fund; else npm install --no-audit --no-fund; fi
 
   EB_ARGS=( "-c.extraMetadata.version=$KC_VERSION" )
+  if [ "${CCREW:-0}" = "1" ]; then
+    # Baked into the packaged app/package.json; ccrew-identity.js reads it at
+    # runtime to give the app its own name, data home (~/.ccrew) and port (5490),
+    # so CCrew.app never collides with an installed KiroCrew's single-instance
+    # lock. The productName/appId/icons already live in package.json's build block.
+    EB_ARGS+=( "-c.extraMetadata.ccrew=true" )
+  fi
   if [ "$PRODUCT_NAME" = "KiroCrew Nightly" ]; then
     # Same appId (com.amazon.kiro.crew) as production ON PURPOSE:
     # - Finder decides install-replace by FILENAME only, so the distinct

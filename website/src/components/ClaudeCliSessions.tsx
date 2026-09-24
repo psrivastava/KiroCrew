@@ -8,7 +8,7 @@ import { createSlot, switchSlot } from '../store/chatSlice'
 
 /**
  * Sidebar section listing the Claude Code CLI's OWN native sessions, grouped by
- * working directory, below C Crew's own sessions.
+ * working directory, below CCrew's own sessions.
  *
  * CCrew is a UI skin over the claude CLI, so a conversation started from a bare
  * terminal must be visible AND openable here. Rows come from

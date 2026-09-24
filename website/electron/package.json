@@ -28,7 +28,7 @@
   },
   "build": {
     "appId": "com.ccrew.app",
-    "productName": "C Crew",
+    "productName": "CCrew",
     "toolsets": {
       "appimage": "1.0.3"
     },
@@ -46,7 +46,7 @@
       "notarize": false,
       "x64ArchFiles": "{**/backend-dist/**,**/backend-dist/**/.*/**}",
       "extendInfo": {
-        "CFBundleDisplayName": "C Crew",
+        "CFBundleDisplayName": "CCrew",
         "NSMicrophoneUsageDescription": "Kiro Crew uses the microphone for voice input and dictation in chat. Audio is captured only while you hold or toggle the mic button.",
         "NSLocalNetworkUsageDescription": "Kiro Crew connects to devices on your local network so agent commands can reach your own servers, NAS, containers, and dev machines. Only the addresses a command names are contacted."
       }

@@ -9210,7 +9210,7 @@ function ChatSidebar({
       </AnimatePresence>
 
       {/* CCrew: native Claude CLI sessions, grouped by working dir, below
-          C Crew's own sessions. Read-only listing from ~/.claude/projects. */}
+          CCrew's own sessions. Read-only listing from ~/.claude/projects. */}
       <ClaudeCliSessions />
 
       {/* When expanded: doubles as the resize handle (accent on hover, drag to resize, dbl-click to collapse).
