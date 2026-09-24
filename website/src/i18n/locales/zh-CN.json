@@ -8610,7 +8610,15 @@
       "heading": "Claude CLI sessions",
       "via_claude": "via Claude CLI",
       "untitled": "Untitled session",
-      "unknown_dir": "Unknown directory"
+      "unknown_dir": "Unknown directory",
+      "open": "Open",
+      "rename": "Rename",
+      "pin": "Pin",
+      "unpin": "Unpin",
+      "no_color": "No color",
+      "copy_path": "Copy working directory",
+      "copy_id": "Copy session ID",
+      "set_color": "Set color {{color}}"
     }
   },
   "hooks": {
