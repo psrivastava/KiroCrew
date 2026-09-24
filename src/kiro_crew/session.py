@@ -2872,6 +2872,17 @@ class SessionManager:
 
     # ── Slack thread linking (persisted via SessionMap) ──
 
+    def remember_resume_sid(self, key: str, sid: str, *, provider: str = "", cwd: str = "") -> None:
+        """Pre-seed a session key's resume sid (+ provider/cwd) in the map.
+
+        Used to open a session that already exists in a backend's OWN store
+        (e.g. a native claude CLI session under ~/.claude) inside a fresh CCrew
+        slot: the next get_or_create for *key* reads this sid and issues
+        session/load, attaching to that same conversation. Thin wrapper over
+        SessionMap.set so callers do not reach into the private map.
+        """
+        self._session_map.set(key, sid, provider=provider, cwd=cwd)
+
     def set_slack_link(self, key: str, thread_ts: str, channel_id: str | None) -> None:
         """Link a session to a Slack thread. Persists to session map."""
         self._session_map.set_slack_link(key, thread_ts, channel_id)

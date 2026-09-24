@@ -1238,17 +1238,110 @@ async def api_claude_sessions(request: web.Request) -> web.Response:
 
     Returns ``{sessions, total}``. Each row carries ``source="claude-cli"``, the
     session UUID (``session_id``), a redacted ``title`` and ``cwd`` (the folder
-    grouping key), and timestamps. The scan is synchronous file IO, so it runs
-    off the event loop.
+    grouping key), timestamps, and the CCrew overlay metadata (``pinned``,
+    ``tags``, ``color``, and a custom ``title`` when set). The scan is synchronous
+    file IO, so it runs off the event loop.
     """
+    from kiro_crew.providers.claude_session_overlay import apply_overlay
     from kiro_crew.providers.claude_sessions import list_claude_sessions
 
     try:
         limit = min(int(request.query.get("limit", "200")), 2000)
     except (TypeError, ValueError):
         limit = 200
-    rows = await asyncio.to_thread(list_claude_sessions, None, limit)
+
+    def _read() -> list[dict]:
+        return apply_overlay(list_claude_sessions(None, limit))
+
+    rows = await asyncio.to_thread(_read)
     return web.json_response({"sessions": rows, "total": len(rows)})
+
+
+async def api_claude_session_overlay(request: web.Request) -> web.Response:
+    """PATCH /api/claude-sessions/{uuid} — set CCrew overlay metadata.
+
+    Body: any of ``title`` (str, ""=clear), ``pinned`` (bool), ``tags`` (str[]),
+    ``color`` (str, ""=clear). These are CCrew-side affordances stored in a
+    sidecar keyed by the native UUID; nothing is written into ~/.claude. Returns
+    the resulting entry.
+    """
+    from kiro_crew.providers.claude_session_overlay import update_entry
+
+    uuid = request.match_info.get("uuid", "")
+    if not uuid:
+        return web.json_response({"error": "missing uuid"}, status=400)
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid json"}, status=400)
+    if not isinstance(body, dict):
+        return web.json_response({"error": "body must be an object"}, status=400)
+    patch = {k: body[k] for k in ("title", "pinned", "tags", "color") if k in body}
+    entry = await asyncio.to_thread(update_entry, uuid, patch)
+    return web.json_response({"uuid": uuid, "overlay": entry})
+
+
+async def api_claude_session_open(request: web.Request) -> web.Response:
+    """POST /api/claude-sessions/{uuid}/open — attach a CCrew slot to a native claude session.
+
+    Seeds the resume session id of an EXISTING CCrew slot (the client creates a
+    fresh slot first, via the normal new-chat flow, with project=cwd) so the slot
+    resumes the native claude UUID: the next turn issues session/load and attaches
+    to the SAME claude conversation. The native .jsonl and the CCrew slot then
+    share one transcript — the round-trip that makes these rows first-class.
+
+    Body: ``slot`` (REQUIRED — the freshly created slot key to bind) and,
+    optionally, ``cwd`` (the session's working directory; looked up from the
+    session's own transcript when omitted). Returns ``{slot, uuid, cwd}``.
+    """
+    from kiro_crew.acp.types import PROVIDER_LABEL_CLAUDE
+    from kiro_crew.providers.claude_sessions import list_claude_sessions
+
+    state: DashboardState = request.app["state"]
+    uuid = request.match_info.get("uuid", "")
+    if not uuid:
+        return web.json_response({"error": "missing uuid"}, status=400)
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid json"}, status=400)
+    if not isinstance(body, dict):
+        return web.json_response({"error": "body must be an object"}, status=400)
+    slot = body.get("slot")
+    if not isinstance(slot, str) or not slot:
+        return web.json_response({"error": "missing slot"}, status=400)
+    cwd = body.get("cwd")
+
+    # Resolve the session's cwd from its own transcript when the client did not
+    # supply it — the resume must run claude in the SAME directory or the adapter
+    # loads a session whose files are elsewhere.
+    if not cwd:
+
+        def _find_cwd() -> str:
+            for r in list_claude_sessions(None, 2000):
+                if r.get("session_id") == uuid:
+                    return r.get("cwd") or ""
+            return ""
+
+        cwd = await asyncio.to_thread(_find_cwd)
+
+    pool = getattr(state, "sessions", None)
+    remember = getattr(pool, "remember_resume_sid", None)
+    if remember is None:
+        return web.json_response(
+            {"error": "resume seeding is not available on this build"}, status=501
+        )
+    # Seed the slot's resume sid = the native claude UUID, with its cwd and the
+    # claude provider label so a provider-switch check does not discard it. The
+    # next get_or_create for this slot issues session/load and attaches to the
+    # native conversation.
+    remember(
+        slot,
+        uuid,
+        provider=PROVIDER_LABEL_CLAUDE,
+        cwd=cwd or "",
+    )
+    return web.json_response({"slot": slot, "uuid": uuid, "cwd": cwd})
 
 
 _SUMMARIZE_MAX_SESSIONS = 8  # bound cost/latency: only the top-N get an LLM pass
