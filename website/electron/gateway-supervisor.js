@@ -808,6 +808,13 @@ function createGatewaySupervisor({
       windowsHide: true,
       env: buildGatewayEnvironment({
         ...cleanEnv,
+        // Hand the shell-resolved data home to the Python child. The bundled
+        // backend (config/paths.py) has no CCrew awareness, so without this it
+        // resolves the default ~/.kiro/crew and locks that gateway.lock --
+        // colliding with a running KiroCrew. KIROCREW_HOME (resolved above,
+        // ~/.ccrew for CCrew) makes the child use the same home the shell does,
+        // mirroring what ccrew.sh exports for the dev launch.
+        KIROCREW_HOME,
         ...(gatewayPath ? { PATH: gatewayPath.path } : {}),
         KIROCREW_PROJECT_DIR: IS_WIN
           ? resolveProjectDir()

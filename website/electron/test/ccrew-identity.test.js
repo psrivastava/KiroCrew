@@ -93,3 +93,68 @@ describe("CCrew constants", () => {
     assert.equal(CCREW_DEFAULT_PORT, 5490);
   });
 });
+
+const fs = require("fs");
+
+describe("main.js identity pinning (CCrew vs KiroCrew coexistence)", () => {
+  // Electron caches userData (and thus the single-instance lock key) on the
+  // FIRST app.getPath("userData") call, deriving the path from app.getName(),
+  // which reads the packaged package.json "name" (kirocrew-desktop) -- NOT
+  // CFBundleName. Assigning app.name later does NOT repoint an already-resolved
+  // userData path, so a late rename left CCrew sharing KiroCrew's
+  // kirocrew-desktop userData and losing the single-instance lock to a running
+  // KiroCrew (macOS fronted KiroCrew instead of opening CCrew).
+  //
+  // The fix pins BOTH the name (app.setName) and the userData path
+  // (app.setPath("userData", ...)) at the very top of main.js, before any other
+  // resolver runs. This test locks that ordering and the use of setPath, since
+  // setName alone cannot repoint an already-cached path. Line comments are
+  // stripped before searching so prose mentioning these calls cannot skew the
+  // positions.
+  it("pins CCrew name and userData path before the first app.getPath(\"userData\") call", () => {
+    const raw = fs.readFileSync(path.join(__dirname, "..", "main.js"), "utf8");
+    // Blank out // line comments (preserving length so indices still line up
+    // with the source) so a comment mentioning getPath("userData") cannot be
+    // mistaken for the real call site.
+    const code = raw.replace(/\/\/[^\n]*/g, (m) => " ".repeat(m.length));
+
+    const setNameIdx = code.indexOf("app.setName(");
+    const setUserDataIdx = code.indexOf('app.setPath(');
+    const firstUserDataGet = code.indexOf('app.getPath("userData")');
+
+    assert.ok(
+      setNameIdx !== -1,
+      "expected app.setName(...) pinning the CCrew name in main.js",
+    );
+    assert.ok(
+      setUserDataIdx !== -1,
+      'expected app.setPath("userData", ...) pinning the CCrew userData path in main.js',
+    );
+    assert.ok(
+      firstUserDataGet !== -1,
+      'expected an app.getPath("userData") call in main.js',
+    );
+
+    // The setPath("userData") pin, and the setName, must both precede the first
+    // app.getPath("userData") (the seedRenamedStore call) that Electron would
+    // otherwise cache under the default kirocrew-desktop name.
+    assert.ok(
+      setUserDataIdx < firstUserDataGet,
+      'app.setPath("userData", ...) must run BEFORE the first ' +
+        'app.getPath("userData") so CCrew keys off its own userData dir, not the ' +
+        "default kirocrew-desktop shared with a running KiroCrew",
+    );
+    assert.ok(
+      setNameIdx < firstUserDataGet,
+      "app.setName(...) must run before the first app.getPath(\"userData\")",
+    );
+
+    // Confirm the setPath pin actually targets the userData path (not some
+    // other Electron path), tolerating single- or multi-line formatting.
+    const pinTail = code.slice(setUserDataIdx, setUserDataIdx + 60);
+    assert.ok(
+      /app\.setPath\(\s*"userData"/.test(pinTail),
+      'the app.setPath(...) pin must target "userData"',
+    );
+  });
+});

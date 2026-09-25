@@ -167,7 +167,9 @@ describe("macOS bundle naming", () => {
   );
 
   it("keeps CFBundleName aligned with productName for Electron helpers", () => {
-    assert.equal(pkg.build.productName, "KiroCrew");
+    // CCrew fork: productName is the spaceless brand "CCrew" (also avoids the
+    // CFBundleName helper-app pitfall the second assertion still guards).
+    assert.equal(pkg.build.productName, "CCrew");
     assert.equal(
       Object.hasOwn(extendInfo, "CFBundleName"),
       false,
@@ -176,7 +178,7 @@ describe("macOS bundle naming", () => {
   });
 
   it("uses CFBundleDisplayName for spaced stable and nightly names", () => {
-    assert.equal(extendInfo.CFBundleDisplayName, "Kiro Crew");
+    assert.equal(extendInfo.CFBundleDisplayName, "CCrew");
     assert.match(
       buildScript,
       /-c\.mac\.extendInfo\.CFBundleDisplayName=Kiro Crew Nightly/
@@ -1366,7 +1368,9 @@ describe("uninstall data preservation contract", () => {
       main.includes("com.amazon.kiro.crew.nightly"),
       "main.js must claim the same nightly AppUserModelID the installer stamps"
     );
-    // And the shared production id must remain the mac/appId default.
-    assert.equal(electronPkg.build.appId, "com.amazon.kiro.crew");
+    // CCrew fork: the base appId is com.ccrew.app (its own bundle id keeps the
+    // app side-by-side with an installed KiroCrew). The nightly Windows-appId
+    // split above is upstream channel logic the fork does not ship.
+    assert.equal(electronPkg.build.appId, "com.ccrew.app");
   });
 });
