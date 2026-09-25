@@ -9,6 +9,31 @@ const {
   session,
   crashReporter,
 } = electron;
+
+// CCREW IDENTITY -- MUST run before ANY app.getPath()/electron-store call.
+// Electron caches userData (and the single-instance lock key) on the FIRST
+// app.getPath("userData"); it derives that path from app.getName(), which reads the
+// packaged package.json "name" (kirocrew-desktop) -- NOT CFBundleName. Setting
+// app.name later (even one line before seedRenamedStore) is too late and does not
+// repoint an already-resolved path, so CCrew shared KiroCrew's kirocrew-desktop
+// userData and lost the single-instance lock to a running KiroCrew (got fronted).
+// Pin BOTH the name and the userData path here, at the top, so every later resolver
+// keys off CCrew. Mirrors what ./ccrew.sh does for the dev gateway via KIROCREW_HOME.
+{
+  const { ccrewAppName, CCREW_APP_NAME } = require("./ccrew-identity");
+  const ccrewName = ccrewAppName();
+  if (ccrewName) {
+    const nodePath = require("path");
+    app.setName(ccrewName);
+    // Anchor userData to a CCrew-specific dir so the lock key is distinct from
+    // KiroCrew's. Use the same Application Support base Electron would, keyed on
+    // the CCrew name instead of the default package name.
+    app.setPath(
+      "userData",
+      nodePath.join(app.getPath("appData"), CCREW_APP_NAME),
+    );
+  }
+}
 const Store = require("electron-store");
 const fs = require("fs");
 const os = require("os");
