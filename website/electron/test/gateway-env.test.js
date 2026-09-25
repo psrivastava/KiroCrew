@@ -112,3 +112,35 @@ test("the one desktop gateway spawn uses the hardened environment builder", () =
       "through buildGatewayEnvironment",
   );
 });
+
+test("the spawned gateway inherits the shell-resolved data home (KIROCREW_HOME)", () => {
+  // The Electron shell resolves the data home (KIROCREW_HOME, ~/.ccrew for the
+  // CCrew edition) at gateway-supervisor.js:159. The bundled Python backend has
+  // NO CCrew awareness -- config/paths.py resolves the default ~/.kiro/crew
+  // unless KIROCREW_HOME is in its environment. So the shell MUST hand its
+  // resolved home to the child spawn env; without it the CCrew backend locks
+  // ~/.kiro/crew/gateway.lock and collides with a running KiroCrew.
+  const supervisor = fs.readFileSync(
+    path.join(__dirname, "..", "gateway-supervisor.js"),
+    "utf8",
+  );
+
+  // Isolate ONLY the child spawn's env object: from the single owned
+  // `spawn(spawnBin, spawnArgs,` boundary to the end of its buildGatewayEnvironment
+  // argument. Bounding to this block keeps the assertion from matching an
+  // unrelated KIROCREW_HOME elsewhere in the file (e.g. the cache-dir line).
+  const spawnIdx = supervisor.indexOf("spawn(spawnBin, spawnArgs,");
+  assert.ok(spawnIdx !== -1, "expected the owned gateway spawn boundary");
+  const envIdx = supervisor.indexOf("buildGatewayEnvironment({", spawnIdx);
+  assert.ok(envIdx !== -1, "spawn must build its env via buildGatewayEnvironment");
+  // The env object ends at the first `}),` after the builder call opens.
+  const closeIdx = supervisor.indexOf("}),", envIdx);
+  const envBlock = supervisor.slice(envIdx, closeIdx);
+
+  assert.match(
+    envBlock,
+    /(^|[\s{])KIROCREW_HOME\b/m,
+    "the gateway spawn env must set KIROCREW_HOME so the Python backend uses " +
+      "the same data home the shell resolved (~/.ccrew for CCrew), not its default",
+  );
+});
