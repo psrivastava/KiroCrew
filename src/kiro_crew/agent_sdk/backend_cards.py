@@ -298,7 +298,14 @@ USER_FACING_LINES: Tuple[_LineSpec, ...] = (
 #: of the four (the sandbox stand-down, and Crew handing over its credential)
 #: describe a boundary moving, and the sandbox one fails OPEN by design.
 SECURITY_LINES: Tuple[_LineSpec, ...] = (
-    _LineSpec(NOTE_CREW_SANDBOX_STANDS_DOWN, ("ACP_BACKENDS_INTERNAL_SANDBOX",)),
+    _LineSpec(
+        NOTE_CREW_SANDBOX_STANDS_DOWN,
+        # Two sets, same user-facing fact ("Crew's own sandbox stands down for
+        # this child"): kiro-cli delegates to its internal sandbox, and Claude
+        # Code carries its own non-nestable macOS seatbelt. ``_holds`` fires on
+        # membership in ANY set, so the note shows for both without a new string.
+        ("ACP_BACKENDS_INTERNAL_SANDBOX", "ACP_BACKENDS_SKIP_CREW_SEATBELT_MACOS"),
+    ),
     _LineSpec(NOTE_REFUSES_UNCLASSIFIED_TOOLS, ("ACP_BACKENDS_META_IDENTITY",)),
     _LineSpec(NOTE_HOST_CREDENTIAL_TO_CHILD, ("ACP_BACKENDS_HOST_AUTH_CALLBACK",)),
     _LineSpec(NOTE_POD_HOME_RELOCATED, ("ACP_BACKENDS_POD_HOME_REMAP",)),

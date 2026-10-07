@@ -10425,6 +10425,7 @@ def wrap_argv(
     extra_writable_dirs: tuple[str, ...] = (),
     extra_expose_files: tuple[str, ...] = (),
     is_kiro_cli: bool | None = None,
+    skip_crew_seatbelt_macos: bool = False,
     first_party_fixed_argv: bool = False,
 ) -> tuple[list[str], str | None]:
     """Wrap a command argv with OS-level sandbox if available.
@@ -10504,6 +10505,57 @@ def wrap_argv(
     # the carve-out condition can never disagree about the same host.
     governance_floor = _governance_sandbox_floor()
     mode = _clamp_sandbox_mode_to_floor(mode, governance_floor)
+
+    # Non-nestable-harness skip (macOS only): a harness carrying its OWN macOS
+    # ``sandbox-exec`` seatbelt (Claude Code, via ACP_BACKENDS_SKIP_CREW_SEATBELT_MACOS)
+    # cannot run inside Crew's seatbelt -- the kernel refuses a nested
+    # ``sandbox_apply`` with EPERM, which kills every turn before it reaches the
+    # model. So on darwin we skip Crew's seatbelt and let the harness's own
+    # sandbox own the isolation, applying only the env scrub. This is a
+    # DELIBERATE, deterministic decision made before backend detection -- never a
+    # reaction to a wrap failure -- and it holds EVEN WHEN ``extra_hidden_dirs``
+    # are present: unlike kiro delegation (which keeps the seatbelt to enforce
+    # the mask), re-applying a seatbelt here is the exact EPERM case. The
+    # credential mask is therefore NOT applied for this spawn; isolation of
+    # ~/.aws etc. rests on the harness's own sandbox. The skip is inert off
+    # darwin: Linux namespace isolation and the Windows no-backend policy below
+    # are unaffected (and the Windows no-backend exception stays Kiro-only).
+    # SEL-audited best-effort; unlike seatbelt delegation a failed audit must
+    # still skip (never fall back to the nesting seatbelt), so it degrades to
+    # env scrub rather than refusing.
+    if skip_crew_seatbelt_macos and sys.platform == "darwin":
+        try:
+            from kiro_crew.sel import sel
+
+            sel().log_tool_invocation(
+                session_key="sandbox",
+                agent="system",
+                source="sandbox.wrap_argv",
+                tool_name=_command_log_label(argv),
+                tool_kind="subprocess",
+                outcome="delegated",
+                resources=(
+                    "macOS seatbelt skip: harness carries its own non-nestable "
+                    "OS sandbox -> Crew seatbelt off, env scrub only, mask NOT "
+                    "applied (harness sandbox owns isolation)"
+                ),
+                critical=True,
+            )
+        except Exception as exc:
+            # A cron child on a dead filesystem still refuses (ENOSYS); every
+            # other audit failure must NOT fall back to seatbelt (the nesting
+            # EPERM) -- record loudly and proceed with env scrub only.
+            refuse_unaudited_on_dead_fs(exc, "macOS seatbelt-skip audit")
+            logger.warning(
+                "SECURITY: SEL audit failed for macOS seatbelt-skip; proceeding "
+                "with env scrub but no seatbelt (nesting would EPERM). Command: %s",
+                _command_log_label(argv),
+                exc_info=True,
+            )
+        unset_args = _sandbox_env_unset_args("standard", strip_python_env, forward_ssh_auth_sock)
+        if unset_args:
+            return [_pinned_env_bin(), *unset_args, *argv], None
+        return list(argv), None
 
     if mode == "off":
         # Fix #2: verify kiro-cli delegation before honoring "off". The
@@ -11151,6 +11203,7 @@ async def wrap_argv_async(
     extra_writable_dirs: tuple[str, ...] = (),
     extra_expose_files: tuple[str, ...] = (),
     is_kiro_cli: bool | None = None,
+    skip_crew_seatbelt_macos: bool = False,
     first_party_fixed_argv: bool = False,
     _prepare: Callable[..., tuple[list[str], str | None]] | None = None,
 ) -> tuple[list[str], str | None]:
@@ -11181,6 +11234,8 @@ async def wrap_argv_async(
         options["extra_expose_files"] = extra_expose_files
     if is_kiro_cli is not None:
         options["is_kiro_cli"] = is_kiro_cli
+    if skip_crew_seatbelt_macos:
+        options["skip_crew_seatbelt_macos"] = True
     if first_party_fixed_argv:
         options["first_party_fixed_argv"] = True
     prepare = functools.partial(wrap_argv if _prepare is None else _prepare, argv, **options)

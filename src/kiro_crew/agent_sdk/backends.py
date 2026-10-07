@@ -1110,6 +1110,31 @@ ACP_BACKENDS_INLINE_COMPACTION = frozenset(
 # Crew's layer for it would drop the compensating control for its passive reads.
 ACP_BACKENDS_INTERNAL_SANDBOX = frozenset({ACP_BACKEND_KIRO})
 
+# Backends that carry their OWN macOS OS sandbox which cannot nest inside Kiro
+# Crew's seatbelt (kernel EPERM on a nested ``sandbox-exec``), so on macOS Crew
+# skips its own seatbelt and lets the harness's sandbox own the isolation. This
+# is deliberately SEPARATE from ``ACP_BACKENDS_INTERNAL_SANDBOX`` (harness-parity
+# H6: one set per capability), and the separation is load-bearing. That set is
+# the kiro-cli flag: it also grants the Windows no-backend exception and its
+# macOS delegation is gated on kiro-cli's own ``settings.json`` sandbox key.
+# Neither applies here -- Claude Code is a Node adapter (claude-agent-acp)
+# spawning the compiled ``claude`` binary, which force-enables its own macOS
+# ``sandbox-exec`` seatbelt (Claude Code 2.1.29x+). Crew has no settings file to
+# read for it and must NOT grant it the Windows exception, so reusing the kiro
+# set would silently hand Claude a capability it never earned.
+#
+# The tradeoff this membership accepts, explicitly: skipping Crew's seatbelt
+# also drops Crew's credential mask (``extra_hidden_dirs``) for the spawn --
+# unlike the kiro delegation, the skip holds even when hidden dirs are present,
+# because the alternative is the nesting EPERM that kills every Claude turn.
+# Isolation of ``~/.aws`` etc. then rests on Claude Code's own sandbox. This is
+# the macOS-only answer; on Linux the namespace backend is unaffected and still
+# wraps the spawn, and on Windows the flag is inert (the no-backend policy owns
+# the decision). Only Claude qualifies; a harness with no real OS sandbox of its
+# own (opencode, pi, deepseek, codex-acp) must never be added -- doing so would
+# drop Crew's layer in favour of one that does not exist.
+ACP_BACKENDS_SKIP_CREW_SEATBELT_MACOS = frozenset({ACP_BACKEND_CLAUDE})
+
 # Backends whose pod-spawned child has its ambient ``HOME`` relocated onto the
 # pod's own tree, so the MCP OAuth grant artifacts the harness derives from
 # ``$HOME`` stay pod-scoped (``acp.client._apply_pod_home_remap``).

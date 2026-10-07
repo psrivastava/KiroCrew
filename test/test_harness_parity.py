@@ -45,6 +45,7 @@ from kiro_crew.acp.types import (
     ACP_BACKENDS_INTERNAL_SANDBOX,
     ACP_BACKENDS_KNOWN,
     ACP_BACKENDS_SESSION_SHARING,
+    ACP_BACKENDS_SKIP_CREW_SEATBELT_MACOS,
     ACP_BACKENDS_STEER,
     ACP_BACKENDS_STRUCTURED_REFUSAL,
     ACP_CLIENT_CAPABILITIES,
@@ -954,6 +955,28 @@ _RUNTIME_PATH_MODULES = (
     "src/kiro_crew/acp/runtime.py",
     "src/kiro_crew/acp/session_handle.py",
 )
+
+
+def test_skip_crew_seatbelt_macos_is_claude_only() -> None:
+    """The macOS seatbelt-skip set is its OWN capability, distinct from
+    ``ACP_BACKENDS_INTERNAL_SANDBOX`` (H6: one set per capability).
+
+    ``ACP_BACKENDS_INTERNAL_SANDBOX`` is the kiro-cli flag -- it also carries
+    the Windows no-backend exception and is gated on kiro-cli's own settings
+    file. Claude Code carries a real macOS ``sandbox-exec`` seatbelt that
+    cannot nest inside Crew's, so Crew skips its own layer on macOS ONLY, with
+    no Windows exception and no kiro settings read. Conflating the two would
+    silently grant Claude the Windows exception it has not earned.
+    """
+    assert ACP_BACKENDS_SKIP_CREW_SEATBELT_MACOS == frozenset({ACP_BACKEND_CLAUDE}), (
+        "the macOS seatbelt-skip set is Claude-only; a new member waives Crew's "
+        "own seatbelt (and its credential mask) for that harness on macOS"
+    )
+    # Kept a SEPARATE decision from the kiro internal-sandbox set: the two
+    # answer different questions and must never be reused for each other.
+    assert ACP_BACKEND_CLAUDE not in ACP_BACKENDS_INTERNAL_SANDBOX
+    assert ACP_BACKEND_KIRO not in ACP_BACKENDS_SKIP_CREW_SEATBELT_MACOS
+
 
 #: Backend-identity comparisons the runtime path is allowed to make, keyed by
 #: ``(module, enclosing function)``, with why a table cannot answer instead. A

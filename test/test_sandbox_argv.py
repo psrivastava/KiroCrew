@@ -3644,6 +3644,112 @@ class TestKiroInternalSandboxExclusion:
         assert any("delegating" in r.message for r in caplog.records)
 
 
+class TestSkipCrewSeatbeltMacos:
+    """A harness carrying its own non-nestable OS sandbox (Claude Code) skips
+    Kiro Crew's seatbelt on macOS via ``skip_crew_seatbelt_macos``.
+
+    Distinct from the kiro-cli internal-sandbox delegation: no kiro settings
+    file is consulted, no Windows no-backend exception is granted, and the
+    skip holds even when ``extra_hidden_dirs`` are present (the deliberate
+    credential-mask tradeoff -- the harness's own sandbox owns isolation).
+    """
+
+    def test_darwin_skip_returns_env_scrub_only(self, monkeypatch):
+        """darwin + skip flag -> no seatbelt wrap, env scrub applied, argv tail intact."""
+        monkeypatch.setattr("kiro_crew.sandbox.sys.platform", "darwin")
+        with (
+            patch("kiro_crew.sandbox.detect_backend") as mock_detect,
+            patch("kiro_crew.sel.sel", return_value=MagicMock()),
+        ):
+            argv, cleanup = wrap_argv(
+                ["/opt/homebrew/bin/claude-agent-acp", "--acp"],
+                mode="auto",
+                skip_crew_seatbelt_macos=True,
+            )
+        assert "sandbox-exec" not in argv
+        assert argv[-2:] == ["/opt/homebrew/bin/claude-agent-acp", "--acp"]
+        assert cleanup is None
+        # Decision is made before backend detection, same as kiro delegation.
+        mock_detect.assert_not_called()
+
+    def test_darwin_skip_holds_even_with_hidden_dirs(self, monkeypatch):
+        """The whole point: nesting is impossible, so hidden dirs must NOT drag
+        the spawn back onto Crew's seatbelt (that is the EPERM case)."""
+        monkeypatch.setattr("kiro_crew.sandbox.sys.platform", "darwin")
+        with (
+            patch("kiro_crew.sandbox.sandbox_exec_argv") as mock_seatbelt,
+            patch("kiro_crew.sel.sel", return_value=MagicMock()),
+        ):
+            argv, cleanup = wrap_argv(
+                ["/opt/homebrew/bin/claude-agent-acp", "--acp"],
+                mode="strict",
+                skip_crew_seatbelt_macos=True,
+                extra_hidden_dirs=("/Users/x/.aws",),
+            )
+        assert "sandbox-exec" not in argv
+        assert cleanup is None
+        mock_seatbelt.assert_not_called()
+
+    def test_darwin_skip_audit_failure_still_skips_no_seatbelt(self, monkeypatch):
+        """A non-nestable harness must NEVER fall back to seatbelt, even on SEL
+        failure -- that fallback is the exact nesting EPERM. Degrade to env
+        scrub (unconfined by Crew; the harness's own sandbox still runs)."""
+        monkeypatch.setattr("kiro_crew.sandbox.sys.platform", "darwin")
+        with (
+            patch("kiro_crew.sandbox.sandbox_exec_argv") as mock_seatbelt,
+            patch("kiro_crew.sel.sel", side_effect=RuntimeError("audit down")),
+        ):
+            argv, cleanup = wrap_argv(
+                ["/opt/homebrew/bin/claude-agent-acp", "--acp"],
+                mode="auto",
+                skip_crew_seatbelt_macos=True,
+            )
+        assert "sandbox-exec" not in argv
+        assert cleanup is None
+        mock_seatbelt.assert_not_called()
+
+    def test_linux_skip_flag_is_inert_backend_detection_still_runs(self, monkeypatch):
+        """The skip is macOS-only. Off darwin it returns early for NOTHING --
+        the darwin skip branch is the only early return it drives, so on Linux
+        the function proceeds to backend detection (which the darwin kiro/skip
+        early returns bypass). Asserting detect_backend runs proves the skip
+        branch did not fire -- Claude Code's macOS seatbelt is irrelevant to a
+        Linux spawn, which the namespace backend confines instead."""
+        monkeypatch.setattr("kiro_crew.sandbox.sys.platform", "linux")
+        with patch("kiro_crew.sandbox.detect_backend", return_value="none") as mock_detect:
+            # With no backend, Linux fail-closes -- which can only happen if the
+            # skip branch did NOT short-circuit to an env-scrub-only return. The
+            # raise IS the proof the macOS-only skip was inert here.
+            with pytest.raises(sandbox_mod.SandboxUnavailableError):
+                wrap_argv(
+                    ["/opt/homebrew/bin/claude-agent-acp", "--acp"],
+                    mode="auto",
+                    skip_crew_seatbelt_macos=True,
+                )
+        mock_detect.assert_called()
+
+    def test_windows_skip_flag_grants_no_backend_exception(self, monkeypatch):
+        """The skip must NOT grant the Windows no-backend exception that
+        ``is_kiro_cli is True`` grants -- that is reserved for official Kiro.
+        On Windows the skip is inert and the no-backend policy still owns the
+        decision (fail-closed), so no darwin-style env-scrub-only passthrough."""
+        monkeypatch.setattr("kiro_crew.sandbox.sys.platform", "win32")
+        with patch("kiro_crew.sandbox.detect_backend", return_value="none"):
+            try:
+                argv, _cleanup = wrap_argv(
+                    ["claude-agent-acp.exe", "--acp"],
+                    mode="auto",
+                    skip_crew_seatbelt_macos=True,
+                )
+            except Exception:
+                # A fail-closed raise is an acceptable Windows no-backend
+                # outcome; the skip flag did not short-circuit to a passthrough.
+                return
+            # If it returned, it is the Windows no-backend policy result, never
+            # the darwin env-scrub-only shape led by the pinned env bin + -u.
+            assert argv[:1] != [sandbox_mod._pinned_env_bin()]
+
+
 class TestMacOsNestingDetection:
     """macOS Seatbelt cannot nest, so a nesting EPERM is not a host verdict.
 
