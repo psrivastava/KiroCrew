@@ -117,6 +117,7 @@ from kiro_crew.acp.types import (
     ACP_BACKENDS_RESUME_WITHOUT_LOAD,
     ACP_BACKENDS_SEED_LOCAL_SETTINGS,
     ACP_BACKENDS_SESSION_MCP_ARRAY,
+    ACP_BACKENDS_SKIP_CREW_SEATBELT_MACOS,
     ACP_BACKENDS_STEER,
     ACP_BACKENDS_STRUCTURED_REFUSAL,
     ACP_CLIENT_CAPABILITIES,
@@ -7958,6 +7959,12 @@ class AcpClient:
             extra_private_dirs=scratch_window,
             extra_expose_files=adapter_expose,
             is_kiro_cli=delegate_internal_sandbox,
+            # A harness carrying its own non-nestable macOS seatbelt (Claude
+            # Code) must skip Crew's seatbelt on macOS -- nesting sandbox-exec
+            # EPERMs and kills every turn. Membership, never a negation
+            # (harness-parity H6/H7); its own set because the Windows exception
+            # and kiro-settings gate of ACP_BACKENDS_INTERNAL_SANDBOX do not apply.
+            skip_crew_seatbelt_macos=self.backend in ACP_BACKENDS_SKIP_CREW_SEATBELT_MACOS,
             _prepare=wrap_argv,
         )
         # Which isolation layer this spawn actually got, recorded HERE from the

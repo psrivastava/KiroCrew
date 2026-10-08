@@ -79,6 +79,45 @@ into its own venv; a full `ccrew` distribution rename is possible but
 merge-hostile and deferred.
 
 
+### 2.2 Claude backend: skip Crew's seatbelt on macOS (sandbox nesting)
+
+**Symptom:** every Claude turn failed with "connection failed — retry"; the
+gateway log showed `sandbox initialization failed: Operation not permitted` /
+`Failed to spawn child process (os error 22)`.
+
+**Root cause:** Claude Code 2.1.29x force-enables its OWN macOS `sandbox-exec`
+seatbelt around the process `claude-agent-acp` spawns. Crew ALSO wrapped that
+spawn in Crew's seatbelt, because the Claude backend was not treated as carrying
+its own OS sandbox. **macOS forbids nesting `sandbox-exec`** — the inner
+`sandbox_apply` returns EPERM (`os error 22`) — so the child died before the
+model. Reproduced directly: a trivial permissive `sandbox-exec` profile around
+`claude` EPERMs; bare `claude` runs fine.
+
+**Fix (PR #4):** on macOS, skip Crew's seatbelt for a harness that carries its
+own non-nestable OS sandbox, and let that sandbox own the isolation.
+
+| Seam | What it does |
+|---|---|
+| `ACP_BACKENDS_SKIP_CREW_SEATBELT_MACOS` | New capability set, `{claude}` only; `agent_sdk/backends.py`, re-exported via `acp_backends.py` + `acp/types.py` |
+| `wrap_argv` / `wrap_argv_async` | New `skip_crew_seatbelt_macos` param; a **darwin-only** branch env-scrubs and returns WITHOUT the seatbelt |
+| `acp/client.py` | Passes the flag by set membership at the Claude spawn |
+
+Deliberately a **separate** set from `ACP_BACKENDS_INTERNAL_SANDBOX` (harness-
+parity H6, one set per capability): that set carries the Windows no-backend
+exception and is gated on kiro-cli's own `settings.json` sandbox key — neither
+applies to Claude, and reusing it would silently grant Claude the Windows
+exception it never earned.
+
+**Tradeoff (accepted):** skipping Crew's seatbelt also drops Crew's credential
+mask (`extra_hidden_dirs`) for that spawn — the skip holds even WITH hidden dirs,
+because re-applying a seatbelt is the exact nesting EPERM, and a failed SEL audit
+degrades to env-scrub rather than falling back to the seatbelt. Isolation of
+`~/.aws` etc. then rests on Claude Code's own sandbox. The backend card states
+this via the existing "Crew sandbox stands down" note (no new i18n key).
+
+Inert off macOS: Linux namespace isolation and the Windows no-backend policy are
+unchanged.
+
 ---
 
 ## 3. UI features added
@@ -196,6 +235,18 @@ suite (must stay all-locales-green).
   session logic there rather than surgically editing the ~9600-line `ChatSidebar`.
 - **Never delete native `~/.claude` files except through the confirm-gated
   delete endpoint**, which re-resolves the path server-side.
+- **Never wrap a harness that carries its own OS sandbox in Crew's seatbelt on
+  macOS** — nesting `sandbox-exec` fails EPERM (§2.2). "Carries its own OS
+  sandbox" is a distinct capability (`ACP_BACKENDS_SKIP_CREW_SEATBELT_MACOS`),
+  NOT the kiro-cli flag `ACP_BACKENDS_INTERNAL_SANDBOX` (which also grants a
+  Windows no-backend exception). Add a new harness to the skip set only after
+  confirming it really runs its own OS-level sandbox.
+- **Electron identity must be pinned before the FIRST `app.getPath("userData")`.**
+  `app.name` resolves + caches userData and the single-instance lock key on first
+  read, deriving the name from the packaged `package.json` `name`
+  (`kirocrew-desktop`), NOT `CFBundleName`. Setting `app.name` later cannot
+  repoint it. `main.js` calls `app.setName()` + `app.setPath("userData", …)` at
+  the very top; keep any new path/identity resolver below that pin.
 
 ---
 
@@ -212,9 +263,16 @@ suite (must stay all-locales-green).
   applies the same matrix) pending a settled brand hue — `hue-rotate(110deg)`
   resolves to orange-red, not the "lime" the CSS comment claims.
 
-**Resolved:** desktop app side-by-side coexistence with an installed KiroCrew —
-the `CCREW=1` identity flag (§2.1) gives the packaged app its own name/home/port,
-so double-clicking `CCrew.app` no longer fronts a running KiroCrew.
+**Resolved:**
+- Desktop app side-by-side coexistence with an installed KiroCrew (PR #3, live-
+  verified). The `CCREW=1` identity flag (§2.1) gives the packaged app its own
+  name/home/port — but the load-bearing fix was pinning `app.setName()` +
+  `app.setPath("userData", <appData>/CCrew)` at the TOP of `main.js`, before the
+  first `app.getPath("userData")` caches the lock/userData under the shared
+  `kirocrew-desktop` name (see §6). Double-clicking `CCrew.app` no longer fronts a
+  running KiroCrew.
+- Claude backend "connection failed — retry" on macOS (PR #4, live-verified) — the
+  sandbox-nesting fix in §2.2.
 
 ---
 

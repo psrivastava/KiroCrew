@@ -46,6 +46,7 @@ import pytest
 from kiro_crew.agent_sdk import backend_cards as cards_mod
 from kiro_crew.agent_sdk import backends as sdk_backends
 from kiro_crew.agent_sdk.backends import (
+    ACP_BACKEND_CLAUDE,
     ACP_BACKEND_DEEPSEEK,
     ACP_BACKEND_GOOSE,
     ACP_BACKEND_KAS,
@@ -416,16 +417,17 @@ def test_the_ungatable_harness_is_named_as_not_offered_and_says_why() -> None:
 def test_security_notes_are_stated_only_when_they_hold() -> None:
     """A caveat is raised or absent, never raised-and-negated.
 
-    Crew's seatbelt stands down for kiro-cli and for nothing else, so exactly one
-    card carries that note. A note on every card, negated, would be a line nobody
-    reads.
+    Crew's seatbelt stands down for exactly the harnesses that carry their own
+    OS sandbox it would otherwise nest inside -- kiro-cli (internal sandbox
+    delegation) and Claude Code (its own non-nestable macOS seatbelt) -- and for
+    nothing else. A note on every card, negated, would be a line nobody reads.
     """
-    carrying = [
+    carrying = {
         card.backend
         for card in _every_card()
         if cards_mod.NOTE_CREW_SANDBOX_STANDS_DOWN in card.security_notes
-    ]
-    assert carrying == [ACP_BACKEND_KIRO]
+    }
+    assert carrying == {ACP_BACKEND_KIRO, ACP_BACKEND_CLAUDE}
     kas = cards_mod.card_for(ACP_BACKEND_KAS)
     assert cards_mod.NOTE_HOST_CREDENTIAL_TO_CHILD in kas.security_notes
     assert cards_mod.NOTE_OWN_CREDENTIAL_STORE not in kas.operator_notes
