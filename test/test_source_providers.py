@@ -18,6 +18,7 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from kiro_crew import github_runner
 from kiro_crew.dashboard.handlers import source_providers as source
+from kiro_crew.dashboard.source_providers import github as github_source
 from kiro_crew.sandbox import spawn_shim_argv
 
 
@@ -92,88 +93,143 @@ def test_github_check_active_status_is_pending_even_with_success_conclusion() ->
     assert check["bucket"] == "pending"
 
 
-def test_github_checks_keep_only_the_latest_run_per_check() -> None:
-    """One head sha can carry several runs of the same check (two dispatches of
-    the same workflow), which inflated every count the panel reported."""
-    rollup = [
-        {
-            "name": "GPT Review",
-            "workflowName": "GPT Review",
-            "status": "COMPLETED",
-            "conclusion": "CANCELLED",
-            "startedAt": "2026-07-28T21:17:23Z",
-            "completedAt": "2026-07-28T21:18:00Z",
-        },
-        {
-            "name": "GPT Review",
-            "workflowName": "GPT Review",
-            "status": "COMPLETED",
-            "conclusion": "FAILURE",
-            "startedAt": "2026-07-28T21:20:44Z",
-            "completedAt": "2026-07-28T21:25:00Z",
-        },
-        {
-            "name": "GPT Review",
-            "workflowName": "GPT Review",
-            "status": "COMPLETED",
-            "conclusion": "SUCCESS",
-            "startedAt": "2026-07-28T21:43:12Z",
-            "completedAt": "2026-07-28T21:47:00Z",
-        },
-    ]
-
-    checks = source._github_checks(rollup)
-
-    assert [(check["name"], check["conclusion"]) for check in checks] == [("GPT Review", "SUCCESS")]
+def _run_row(
+    name: str,
+    *,
+    run: int,
+    conclusion: str,
+    run_conclusion: str,
+    status: str = "COMPLETED",
+    definition: int = 1,
+    event: str = "pull_request",
+    workflow: str = "CI",
+) -> dict:
+    """One check-run row in the flat shape `_github_rollup_read` hands the collapse."""
+    return {
+        "__typename": "CheckRun",
+        "name": name,
+        "status": status,
+        "conclusion": conclusion,
+        "workflowName": workflow,
+        "workflowRunId": run,
+        "workflowRunEvent": event,
+        "workflowDefinitionId": definition,
+        "workflowRunConclusion": run_conclusion,
+    }
 
 
-def test_github_checks_superseded_cancellation_does_not_paint_ci_red() -> None:
+def test_github_checks_drop_a_row_its_cancelled_run_left_behind() -> None:
     """A concurrency-group cancellation whose replacement run passed must not
-    roll up to `failed` — that red survived every refresh, because the stale row
-    is still genuinely in the provider payload."""
+    roll up to `failed` -- the stale row is still genuinely in the payload."""
     rollup = [
-        {
-            "name": "Review",
-            "workflowName": "Review",
-            "status": "COMPLETED",
-            "conclusion": "CANCELLED",
-            "startedAt": "2026-07-28T20:56:29Z",
-            "completedAt": "2026-07-28T20:57:00Z",
-        },
-        {
-            "name": "Review",
-            "workflowName": "Review",
-            "status": "COMPLETED",
-            "conclusion": "SUCCESS",
-            "startedAt": "2026-07-28T20:58:05Z",
-            "completedAt": "2026-07-28T21:00:24Z",
-        },
-    ]
-
-    buckets = [check["bucket"] for check in source._github_checks(rollup)]
-
-    assert buckets == ["passed"]
-    assert source._rollup_ci(buckets) == "passed"
-
-
-def test_github_checks_queued_rerun_outranks_the_run_it_supersedes() -> None:
-    """GitHub leaves `startedAt` null while a check-run is QUEUED. Ranking that
-    row below the completed run it replaces would show a stale pass."""
-    rollup = [
-        {
-            "name": "CI",
-            "workflowName": "CI",
-            "status": "COMPLETED",
-            "conclusion": "SUCCESS",
-            "startedAt": "2026-07-28T20:00:00Z",
-            "completedAt": "2026-07-28T20:05:00Z",
-        },
-        {"name": "CI", "workflowName": "CI", "status": "QUEUED", "conclusion": None},
+        _run_row("Review", run=10, conclusion="CANCELLED", run_conclusion="CANCELLED"),
+        _run_row("Review", run=11, conclusion="SUCCESS", run_conclusion="SUCCESS"),
     ]
 
     checks = source._github_checks(rollup)
 
-    assert [check["bucket"] for check in checks] == ["pending"]
+    assert [check["bucket"] for check in checks] == ["passed"]
+    assert source._rollup_ci([check["bucket"] for check in checks]) == "passed"
+
+
+def test_github_checks_keep_a_failure_from_an_older_run() -> None:
+    """A newer run id proves only that a run started later, not that it replaced
+    the older one; an older run that FAILED is a live verdict and stays."""
+    rollup = [
+        _run_row("Review", run=10, conclusion="FAILURE", run_conclusion="FAILURE"),
+        _run_row("Review", run=11, conclusion="SUCCESS", run_conclusion="SUCCESS"),
+    ]
+
+    checks = source._github_checks(rollup)
+
+    assert [check["conclusion"] for check in checks] == ["FAILURE", "SUCCESS"]
+    assert source._rollup_ci([check["bucket"] for check in checks]) == "failed"
+
+
+@pytest.mark.parametrize("failure_first", [True, False])
+def test_github_checks_keep_both_rows_of_one_run(failure_first: bool) -> None:
+    """A workflow can publish a check run under its own job's display name, so
+    two rows of ONE run are both live. Both arrival orders: under a last-wins
+    rule one order passes for the wrong reason."""
+    failure = _run_row("Fork PR Description", run=5, conclusion="FAILURE", run_conclusion="FAILURE")
+    success = _run_row("Fork PR Description", run=5, conclusion="SUCCESS", run_conclusion="FAILURE")
+    rollup = [failure, success] if failure_first else [success, failure]
+
+    checks = source._github_checks(rollup)
+
+    assert len(checks) == 2
+    assert source._rollup_ci([check["bucket"] for check in checks]) == "failed"
+
+
+def test_github_checks_do_not_group_two_workflow_files_sharing_one_name() -> None:
+    """Two workflow files may carry one `name:`; the identity is the workflow
+    DEFINITION, so one file's newer run cannot displace the other's rows."""
+    rollup = [
+        _run_row("Lint", run=10, conclusion="CANCELLED", run_conclusion="CANCELLED", definition=1),
+        _run_row("Lint", run=11, conclusion="SUCCESS", run_conclusion="SUCCESS", definition=2),
+    ]
+
+    checks = source._github_checks(rollup)
+
+    assert len(checks) == 2
+    assert source._rollup_ci([check["bucket"] for check in checks]) == "failed"
+
+
+def test_github_checks_do_not_group_runs_of_different_events() -> None:
+    """One file on `push` and `pull_request` runs twice for one commit; those are
+    concurrent dispatches, not an attempt and its replacement."""
+    rollup = [
+        _run_row("CI", run=10, conclusion="CANCELLED", run_conclusion="CANCELLED", event="push"),
+        _run_row("CI", run=11, conclusion="SUCCESS", run_conclusion="SUCCESS"),
+    ]
+
+    assert len(source._github_checks(rollup)) == 2
+
+
+def test_github_checks_keep_a_cancelled_row_of_a_live_run() -> None:
+    """A row reaches CANCELLED inside a live run too (fail-fast, a failed
+    `needs`); only a run that was itself cancelled proves displacement."""
+    rollup = [
+        _run_row("CI", run=10, conclusion="CANCELLED", run_conclusion="FAILURE"),
+        _run_row("CI", run=11, conclusion="SUCCESS", run_conclusion="SUCCESS"),
+    ]
+
+    assert len(source._github_checks(rollup)) == 2
+
+
+def test_github_checks_keep_a_cancelled_newest_run() -> None:
+    """Dropping the newest run's cancellation would revive the verdict it replaced."""
+    rollup = [
+        _run_row("CI", run=10, conclusion="SUCCESS", run_conclusion="SUCCESS"),
+        _run_row("CI", run=11, conclusion="CANCELLED", run_conclusion="CANCELLED"),
+    ]
+
+    assert [check["conclusion"] for check in source._github_checks(rollup)] == [
+        "SUCCESS",
+        "CANCELLED",
+    ]
+
+
+def test_github_checks_keep_rows_without_a_run_identity() -> None:
+    """A row the host did not identify takes no part in the collapse."""
+    rollup = [
+        {"name": "Review", "workflowName": "Review", "status": "COMPLETED", "conclusion": c}
+        for c in ("CANCELLED", "SUCCESS")
+    ]
+
+    assert len(source._github_checks(rollup)) == 2
+
+
+def test_github_checks_queued_rerun_keeps_the_glyph_pending() -> None:
+    """A queued re-run is live; the panel must not read green over it."""
+    rollup = [
+        _run_row("CI", run=10, conclusion="SUCCESS", run_conclusion="SUCCESS"),
+        _run_row("CI", run=11, conclusion="", run_conclusion="", status="QUEUED"),
+    ]
+
+    checks = source._github_checks(rollup)
+
+    assert source._rollup_ci([check["bucket"] for check in checks]) == "running"
 
 
 def test_github_checks_do_not_collapse_across_publishers() -> None:
@@ -319,21 +375,16 @@ def test_github_checks_never_collapse_workflowless_check_runs() -> None:
     assert source._rollup_ci([check["bucket"] for check in checks]) == "failed"
 
 
-def test_github_checks_preserve_first_appearance_order() -> None:
-    """A re-run replaces a row in place instead of reshuffling the list."""
+def test_github_checks_preserve_input_order() -> None:
+    """Collapsing removes rows; it never reshuffles the ones it keeps."""
     rollup = [
-        {"name": "A", "workflowName": "W", "status": "COMPLETED", "conclusion": "SUCCESS"},
-        {"name": "B", "workflowName": "W", "status": "COMPLETED", "conclusion": "SUCCESS"},
-        {
-            "name": "A",
-            "workflowName": "W",
-            "status": "COMPLETED",
-            "conclusion": "FAILURE",
-            "startedAt": "2026-07-28T21:00:00Z",
-        },
+        _run_row("A", run=10, conclusion="CANCELLED", run_conclusion="CANCELLED"),
+        _run_row("B", run=10, conclusion="CANCELLED", run_conclusion="CANCELLED"),
+        _run_row("C", run=11, conclusion="SUCCESS", run_conclusion="SUCCESS"),
+        _run_row("A", run=11, conclusion="SUCCESS", run_conclusion="SUCCESS"),
     ]
 
-    assert [check["name"] for check in source._github_checks(rollup)] == ["A", "B"]
+    assert [check["name"] for check in source._github_checks(rollup)] == ["B", "C", "A"]
 
 
 def test_safe_error_redacts_credentials_and_exfiltration_urls() -> None:
@@ -644,7 +695,6 @@ def test_provider_executable_rejects_binary_owned_by_another_user(
     foreign_stat = github_runner.os.stat_result([*list(real_stat)[:4], 4242, *list(real_stat)[5:]])
     monkeypatch.delenv("KIROCREW_PROVIDER_BIN_STRICT", raising=False)
     monkeypatch.setattr(github_runner, "agent_writable_roots", lambda: ())
-    monkeypatch.setattr(github_runner, "path_parents", lambda _path: [])
     monkeypatch.setattr(github_runner.Path, "stat", lambda _path: foreign_stat)
 
     with pytest.raises(ValueError, match="owned by another user"):
@@ -671,7 +721,7 @@ def test_provider_executable_rejects_world_writable_parent(monkeypatch, tmp_path
     parent.chmod(0o777)
     monkeypatch.delenv("KIROCREW_PROVIDER_BIN_STRICT", raising=False)
     monkeypatch.setattr(github_runner, "agent_writable_roots", lambda: ())
-    monkeypatch.setattr(github_runner, "path_parents", lambda _path: [parent])
+    _trust_ancestors_above(monkeypatch, tmp_path)
 
     with pytest.raises(ValueError, match="executable parent is world-writable"):
         source._validate_provider_executable(str(executable))
@@ -692,7 +742,7 @@ def test_provider_executable_tolerates_a_sticky_world_writable_parent(
     parent.chmod(0o1777)
     monkeypatch.delenv("KIROCREW_PROVIDER_BIN_STRICT", raising=False)
     monkeypatch.setattr(github_runner, "agent_writable_roots", lambda: ())
-    monkeypatch.setattr(github_runner, "path_parents", lambda _path: [parent])
+    _trust_ancestors_above(monkeypatch, tmp_path)
 
     assert source._validate_provider_executable(str(executable)) == str(executable.resolve())
 
@@ -718,12 +768,114 @@ def test_provider_executable_strict_mode_rejects_untrusted_ancestor(
         return real_stat(path)
 
     monkeypatch.setenv("KIROCREW_PROVIDER_BIN_STRICT", "1")
-    monkeypatch.setattr(github_runner, "path_parents", lambda _path: [parent])
+    monkeypatch.setattr(
+        github_runner.platform_compat,
+        "traversed_components",
+        lambda _path: [parent, executable.resolve()],
+    )
     monkeypatch.setattr(github_runner.Path, "stat", fake_stat)
     monkeypatch.setattr(github_runner.os, "access", lambda _path, mode: mode == github_runner.os.X_OK)
 
     with pytest.raises(ValueError, match="executable parent is not root-owned"):
         source._validate_provider_executable(str(executable))
+
+
+def test_provider_executable_relaxed_mode_declines_a_writable_hop_in_the_middle_of_a_chain(
+    monkeypatch, tmp_path
+) -> None:
+    """``trusted/gh -> writable/hop -> trusted/real-gh``: the hop's directory decides.
+
+    Both ENDPOINTS' directory chains are tight, so two lexical chains over the
+    endpoints (the resolved path's parents, the original's parents) never name
+    ``writable`` and accept the chain end to end. The component walk reads
+    ``writable`` to follow the hop, so it is checked like any other parent.
+    """
+    trusted = tmp_path / "trusted"
+    trusted.mkdir()
+    writable = tmp_path / "writable"
+    writable.mkdir()
+    target = trusted / "real-gh"
+    target.write_text("#!/bin/sh\nexit 0\n")
+    target.chmod(0o755)
+    middle = writable / "hop"
+    middle.symlink_to(target)
+    entry = trusted / "gh"
+    entry.symlink_to(middle)
+    writable.chmod(0o777)
+    monkeypatch.delenv("KIROCREW_PROVIDER_BIN_STRICT", raising=False)
+    monkeypatch.setattr(github_runner, "agent_writable_roots", lambda: ())
+    _trust_ancestors_above(monkeypatch, tmp_path)
+
+    with pytest.raises(ValueError, match="executable parent is world-writable"):
+        github_runner.validate_provider_executable(str(entry))
+
+
+def test_provider_executable_relaxed_mode_declines_a_writable_ancestor_of_a_symlinked_component(
+    monkeypatch, tmp_path
+) -> None:
+    """``prefix/bin -> holder/bin``: the target's own parent ``holder`` is checked.
+
+    The resolved path's own lexical chain names ``holder``, so this pins a
+    refusal the component walk must keep rather than a gap it closes.
+    """
+    prefix = tmp_path / "prefix"
+    prefix.mkdir()
+    holder = tmp_path / "holder"
+    holder.mkdir()
+    real_bin = holder / "bin"
+    real_bin.mkdir()
+    leaf = real_bin / "gh"
+    leaf.write_text("#!/bin/sh\nexit 0\n")
+    leaf.chmod(0o755)
+    (prefix / "bin").symlink_to(real_bin)
+    holder.chmod(0o777)
+    monkeypatch.delenv("KIROCREW_PROVIDER_BIN_STRICT", raising=False)
+    monkeypatch.setattr(github_runner, "agent_writable_roots", lambda: ())
+    _trust_ancestors_above(monkeypatch, tmp_path)
+
+    with pytest.raises(ValueError, match="executable parent is world-writable"):
+        github_runner.validate_provider_executable(str(prefix / "bin" / "gh"))
+
+
+@pytest.mark.skipif(not _tmp_owner_ok, reason="temp dir not owned by root or current user")
+def test_provider_executable_relaxed_mode_still_accepts_a_chain_through_tight_directories(
+    monkeypatch, tmp_path
+) -> None:
+    """The widening is strictly a widening: the same hop chain through directories
+    that pass the policy is accepted, so an ordinary symlinked install (Homebrew's
+    ``bin/gh -> ../Cellar/...``, a ``/usr/local/bin`` link into ``/opt``) gains no
+    new refusal."""
+    trusted = tmp_path / "trusted"
+    trusted.mkdir()
+    hops = tmp_path / "hops"
+    hops.mkdir()
+    target = trusted / "real-gh"
+    target.write_text("#!/bin/sh\nexit 0\n")
+    target.chmod(0o755)
+    middle = hops / "hop"
+    middle.symlink_to(target)
+    entry = trusted / "gh"
+    entry.symlink_to(middle)
+    monkeypatch.delenv("KIROCREW_PROVIDER_BIN_STRICT", raising=False)
+    monkeypatch.setattr(github_runner, "agent_writable_roots", lambda: ())
+    _trust_ancestors_above(monkeypatch, tmp_path)
+
+    assert github_runner.validate_provider_executable(str(entry)) == str(target.resolve())
+
+
+def test_provider_executable_refuses_a_chain_the_walk_cannot_enumerate(
+    monkeypatch, tmp_path
+) -> None:
+    """A walk that answers ``None`` is a refusal, never a shorter parent list."""
+    executable = tmp_path / "gh"
+    executable.write_text("#!/bin/sh\nexit 0\n")
+    executable.chmod(0o755)
+    monkeypatch.delenv("KIROCREW_PROVIDER_BIN_STRICT", raising=False)
+    monkeypatch.setattr(github_runner, "agent_writable_roots", lambda: ())
+    monkeypatch.setattr(github_runner.platform_compat, "traversed_components", lambda _path: None)
+
+    with pytest.raises(ValueError, match="executable hierarchy is not accessible"):
+        github_runner.validate_provider_executable(str(executable))
 
 
 def test_redact_provider_data_recurses_through_external_strings() -> None:
@@ -2081,6 +2233,33 @@ def test_parse_source_url_rejects_untrusted_shapes(url: str) -> None:
         source.parse_source_url(url)
 
 
+def _rollup_reply(rows: list[dict], head: str = "abc123") -> dict:
+    """A one-page `gh api graphql` rollup reply carrying *rows* at *head*."""
+    nodes = [
+        {"__typename": "StatusContext" if "context" in row else "CheckRun", **row} for row in rows
+    ]
+    contexts = {
+        "totalCount": len(nodes),
+        "pageInfo": {"hasNextPage": False, "endCursor": None},
+        "nodes": nodes,
+    }
+    commit = {"oid": head, "statusCheckRollup": {"contexts": contexts}}
+    pull = {"headRefOid": head, "commits": {"nodes": [{"commit": commit}]}}
+    return {"data": {"repository": {"pullRequest": pull}}}
+
+
+def _suite(run: int, run_conclusion: str, *, definition: int = 1, event: str = "pull_request"):
+    """The check-suite edge GitHub nests a check run's workflow-run identity under."""
+    return {
+        "conclusion": run_conclusion,
+        "workflowRun": {
+            "databaseId": run,
+            "event": event,
+            "workflow": {"databaseId": definition, "name": "Review"},
+        },
+    }
+
+
 @pytest.mark.asyncio
 async def test_fetch_github_normalizes_commits_checks_comments_and_files(monkeypatch) -> None:
     limits: dict[str, int | None] = {}
@@ -2147,6 +2326,8 @@ async def test_fetch_github_normalizes_commits_checks_comments_and_files(monkeyp
                     "line": 9,
                 }
             ]
+        if "statusCheckRollup" in command:
+            return _rollup_reply([{"name": "test", "status": "COMPLETED", "conclusion": "SUCCESS"}])
         if "graphql" in command:
             return {
                 "data": {
@@ -2209,8 +2390,12 @@ async def test_fetch_github_normalizes_commits_checks_comments_and_files(monkeyp
         == source._DISCUSSION_OUTPUT_BYTES
     )
     assert (
-        next(limit for command, limit in limits.items() if "graphql" in command)
+        next(limit for command, limit in limits.items() if "reviewThreads" in command)
         == source._DISCUSSION_OUTPUT_BYTES
+    )
+    assert (
+        next(limit for command, limit in limits.items() if "statusCheckRollup" in command)
+        == source._CHECKS_OUTPUT_BYTES
     )
 
 
@@ -2233,10 +2418,12 @@ async def test_fetch_github_marks_failed_secondary_endpoints_partial(
         should_fail = (
             (failed_endpoint == "files" and "/files?" in command)
             or (failed_endpoint == "comments" and "/comments?" in command)
-            or (failed_endpoint == "threads" and "graphql" in command)
+            or (failed_endpoint == "threads" and "reviewThreads" in command)
         )
         if should_fail:
             raise source.SourceProviderError("secondary request failed")
+        if "statusCheckRollup" in command:
+            return _rollup_reply([])
         return {} if "graphql" in command else []
 
     monkeypatch.setattr(source, "_run_json", fake_run)
@@ -2261,12 +2448,7 @@ async def test_fetch_github_reads_rollup_outside_the_core_field_set(monkeypatch)
         command = " ".join(argv)
         commands.append((command, kwargs.get("max_output_bytes")))
         if "statusCheckRollup" in command:
-            return {
-                "statusCheckRollup": [
-                    {"name": "test", "status": "COMPLETED", "conclusion": "SUCCESS"}
-                ],
-                "headRefOid": "abc123",
-            }
+            return _rollup_reply([{"name": "test", "status": "COMPLETED", "conclusion": "SUCCESS"}])
         if "pr view" in command:
             return {"number": 12, "title": "Split", "state": "OPEN", "headRefOid": "abc123"}
         return {} if "graphql" in command else []
@@ -2286,7 +2468,8 @@ async def test_fetch_github_reads_rollup_outside_the_core_field_set(monkeypatch)
         (command, limit) for command, limit in commands if "statusCheckRollup" in command
     ]
     assert len(rollup_reads) == 1
-    assert rollup_reads[0][0].endswith("statusCheckRollup,headRefOid")
+    assert rollup_reads[0][0].startswith("gh api graphql -f query=")
+    assert rollup_reads[0][0].endswith("-f o=acme -f r=repo -F n=12")
     assert rollup_reads[0][1] == source._CHECKS_OUTPUT_BYTES
     assert data["checks"][0]["bucket"] == "passed"
     assert "checks" not in data["partialSections"]
@@ -2330,12 +2513,10 @@ async def test_fetch_github_discards_rollup_from_a_different_head(monkeypatch) -
     async def fake_run(*argv: str, **_kwargs: int):
         command = " ".join(argv)
         if "statusCheckRollup" in command:
-            return {
-                "statusCheckRollup": [
-                    {"name": "test", "status": "COMPLETED", "conclusion": "SUCCESS"}
-                ],
-                "headRefOid": "pushed-after-core-read",
-            }
+            return _rollup_reply(
+                [{"name": "test", "status": "COMPLETED", "conclusion": "SUCCESS"}],
+                head="pushed-after-core-read",
+            )
         if "pr view" in command:
             return {"number": 12, "state": "OPEN", "headRefOid": "abc123"}
         return {} if "graphql" in command else []
@@ -2571,24 +2752,22 @@ async def test_fetch_github_checks_collapses_superseded_runs(monkeypatch) -> Non
     resurrect the inflated counts and the superseded failure it just fixed."""
 
     async def fake_run(*_argv: str, **_kwargs: int):
-        return {
-            "statusCheckRollup": [
+        return _rollup_reply(
+            [
                 {
                     "name": "Review",
-                    "workflowName": "Review",
                     "status": "COMPLETED",
                     "conclusion": "CANCELLED",
-                    "startedAt": "2026-07-28T20:56:29Z",
+                    "checkSuite": _suite(10, "CANCELLED"),
                 },
                 {
                     "name": "Review",
-                    "workflowName": "Review",
                     "status": "COMPLETED",
                     "conclusion": "SUCCESS",
-                    "startedAt": "2026-07-28T20:58:05Z",
+                    "checkSuite": _suite(11, "SUCCESS"),
                 },
             ]
-        }
+        )
 
     monkeypatch.setattr(source, "_run_json", fake_run)
 
@@ -2596,34 +2775,107 @@ async def test_fetch_github_checks_collapses_superseded_runs(monkeypatch) -> Non
         source.parse_source_url("https://github.com/acme/repo/pull/12")
     )
 
+    assert [(check["workflow"], check["bucket"]) for check in checks] == [("Review", "passed")]
+
+
+@pytest.mark.asyncio
+async def test_fetch_github_checks_keeps_both_rows_of_one_run(monkeypatch) -> None:
+    """Measured shape: a workflow publishing a check run under its own job's
+    display name leaves two rows of ONE run, SUCCESS and FAILURE. The read must
+    keep both whichever arrives first, or the glyph reads green over red."""
+    failure = {
+        "name": "Fork PR Description",
+        "status": "COMPLETED",
+        "conclusion": "FAILURE",
+        "checkSuite": _suite(7, "FAILURE"),
+    }
+    success = {**failure, "conclusion": "SUCCESS"}
+    for rows in ([failure, success], [success, failure]):
+
+        async def fake_run(*_argv: str, _rows: list = rows, **_kwargs: int):
+            return _rollup_reply(_rows)
+
+        monkeypatch.setattr(source, "_run_json", fake_run)
+
+        checks = await source._fetch_github_checks(
+            source.parse_source_url("https://github.com/acme/repo/pull/12")
+        )
+
+        assert source._rollup_ci([check["bucket"] for check in checks]) == "failed"
+
+
+@pytest.mark.asyncio
+async def test_github_rollup_read_follows_pages_and_refuses_a_moved_head(monkeypatch) -> None:
+    """Pages are joined before the collapse (a successor can sit on a later page),
+    and a page naming another head discards the whole read."""
+    first = _rollup_reply(
+        [
+            {
+                "name": "Review",
+                "status": "COMPLETED",
+                "conclusion": "CANCELLED",
+                "checkSuite": _suite(10, "CANCELLED"),
+            }
+        ]
+    )
+    contexts = first["data"]["repository"]["pullRequest"]["commits"]["nodes"][0]["commit"][
+        "statusCheckRollup"
+    ]["contexts"]
+    contexts["pageInfo"] = {"hasNextPage": True, "endCursor": "CUR1"}
+    second_rows = [
+        {
+            "name": "Review",
+            "status": "COMPLETED",
+            "conclusion": "SUCCESS",
+            "checkSuite": _suite(11, "SUCCESS"),
+        }
+    ]
+    commands: list[str] = []
+    second_head = "abc123"
+
+    async def fake_run(*argv: str, **_kwargs: int):
+        command = " ".join(argv)
+        commands.append(command)
+        return _rollup_reply(second_rows, head=second_head) if "c=CUR1" in command else first
+
+    monkeypatch.setattr(source, "_run_json", fake_run)
+    ref = source.parse_source_url("https://github.com/acme/repo/pull/12")
+
+    checks, head = await source._github_rollup_read(ref)
+
+    assert head == "abc123"
+    assert len(commands) == 2
     assert [check["bucket"] for check in checks] == ["passed"]
+
+    second_head = "pushed-mid-read"
+    with pytest.raises(source.SourceProviderError):
+        await source._github_rollup_read(ref)
 
 
 @pytest.mark.asyncio
 async def test_github_check_status_collapses_superseded_runs(monkeypatch) -> None:
-    """The chip glyph reads the same latest-run-per-check collapse the panel
-    does, so a superseded CANCELLED row cannot leave the sidebar red."""
+    """The chip glyph reads the same collapse the panel does, so a superseded
+    CANCELLED row cannot leave the sidebar red."""
 
-    async def fake_run(*_argv: str, **_kwargs: int):
-        return {
-            "state": "OPEN",
-            "statusCheckRollup": [
-                {
-                    "name": "Review",
-                    "workflowName": "Review",
-                    "status": "COMPLETED",
-                    "conclusion": "CANCELLED",
-                    "startedAt": "2026-07-28T20:56:29Z",
-                },
-                {
-                    "name": "Review",
-                    "workflowName": "Review",
-                    "status": "COMPLETED",
-                    "conclusion": "SUCCESS",
-                    "startedAt": "2026-07-28T20:58:05Z",
-                },
-            ],
-        }
+    async def fake_run(*argv: str, **_kwargs: int):
+        if "statusCheckRollup" in " ".join(argv):
+            return _rollup_reply(
+                [
+                    {
+                        "name": "Review",
+                        "status": "COMPLETED",
+                        "conclusion": "CANCELLED",
+                        "checkSuite": _suite(10, "CANCELLED"),
+                    },
+                    {
+                        "name": "Review",
+                        "status": "COMPLETED",
+                        "conclusion": "SUCCESS",
+                        "checkSuite": _suite(11, "SUCCESS"),
+                    },
+                ]
+            )
+        return {"state": "OPEN"}
 
     monkeypatch.setattr(source, "_run_json", fake_run)
 
@@ -2640,7 +2892,7 @@ async def test_github_check_status_carries_settled_merge_state(monkeypatch) -> N
     async def fake_run(*argv: str, **_kwargs: int):
         command = " ".join(argv)
         if "statusCheckRollup" in command:
-            return {"statusCheckRollup": [], "headRefOid": "abc123"}
+            return _rollup_reply([])
         assert "mergeable,mergeStateStatus" in command
         return {"state": "OPEN", "mergeable": "CONFLICTING", "mergeStateStatus": "DIRTY"}
 
@@ -2658,7 +2910,9 @@ async def test_github_check_status_omits_unsettled_merge_state(
 ) -> None:
     """"Still computing" must not overwrite the answer the full payload has."""
 
-    async def fake_run(*_argv: str, **_kwargs: int):
+    async def fake_run(*argv: str, **_kwargs: int):
+        if "statusCheckRollup" in " ".join(argv):
+            return _rollup_reply([])
         return {"state": "OPEN", "mergeable": raw_mergeable, "mergeStateStatus": "UNKNOWN"}
 
     monkeypatch.setattr(source, "_run_json", fake_run)
@@ -2701,12 +2955,10 @@ async def test_github_check_status_marks_stale_rollup_unavailable(monkeypatch) -
     async def fake_run(*argv: str, **_kwargs: int):
         command = " ".join(argv)
         if "statusCheckRollup" in command:
-            return {
-                "statusCheckRollup": [
-                    {"name": "test", "status": "COMPLETED", "conclusion": "SUCCESS"}
-                ],
-                "headRefOid": "pushed-after-core-read",
-            }
+            return _rollup_reply(
+                [{"name": "test", "status": "COMPLETED", "conclusion": "SUCCESS"}],
+                head="pushed-after-core-read",
+            )
         return {"state": "OPEN", "headRefOid": "abc123"}
 
     monkeypatch.setattr(source, "_run_json", fake_run)
@@ -2726,7 +2978,7 @@ async def test_github_check_status_still_fails_when_core_read_fails(monkeypatch)
     async def fake_run(*argv: str, **_kwargs: int):
         command = " ".join(argv)
         if "statusCheckRollup" in command:
-            return {"statusCheckRollup": [], "headRefOid": "abc123"}
+            return _rollup_reply([])
         raise source.SourceProviderError("core read failed")
 
     monkeypatch.setattr(source, "_run_json", fake_run)
@@ -3843,11 +4095,9 @@ async def test_fetch_github_checks_uses_one_call_without_rewriting_cache(monkeyp
     source._CACHE[url] = (1.0, 21, {"provider": "github", "checks": []})
     cached = source._CACHE[url]
     run = AsyncMock(
-        return_value={
-            "statusCheckRollup": [
-                {"name": "test", "status": "IN_PROGRESS", "conclusion": "SUCCESS"}
-            ]
-        }
+        return_value=_rollup_reply(
+            [{"name": "test", "status": "IN_PROGRESS", "conclusion": "SUCCESS"}]
+        )
     )
     monkeypatch.setattr(source, "_run_json", run)
 
@@ -3855,11 +4105,16 @@ async def test_fetch_github_checks_uses_one_call_without_rewriting_cache(monkeyp
 
     run.assert_awaited_once_with(
         "gh",
-        "pr",
-        "view",
-        url,
-        "--json",
-        "statusCheckRollup,headRefOid",
+        "api",
+        "graphql",
+        "-f",
+        f"query={github_source._GITHUB_ROLLUP_QUERY}",
+        "-f",
+        "o=acme",
+        "-f",
+        "r=repo",
+        "-F",
+        "n=12",
         max_output_bytes=source._CHECKS_OUTPUT_BYTES,
     )
     assert checks[0]["bucket"] == "pending"
@@ -4420,6 +4675,34 @@ async def test_provider_error_is_not_marked_retryable(monkeypatch) -> None:
         )
         assert response.status == 503
         assert (await response.json())["code"] == "provider_error"
+
+
+@pytest.mark.asyncio
+async def test_provider_error_ships_its_login_command_as_a_field(monkeypatch) -> None:
+    """A self-managed GitLab remedy reaches the client structurally, not as prose to parse."""
+    _reset_direct_fetch_state()
+    command = "glab auth login --hostname git.example.com"
+    monkeypatch.setattr(
+        source,
+        "fetch_pull_request",
+        AsyncMock(side_effect=source.SourceProviderError("glab: 401", login_command=command)),
+    )
+    async with TestClient(TestServer(_app())) as client:
+        response = await client.post(
+            "/api/source/pull-request", json={"url": "https://github.com/acme/repo/pull/9"}
+        )
+        assert response.status == 503
+        assert (await response.json())["loginCommand"] == command
+
+    _reset_direct_fetch_state()
+    monkeypatch.setattr(
+        source, "fetch_pull_request", AsyncMock(side_effect=source.SourceProviderError("gh: 404"))
+    )
+    async with TestClient(TestServer(_app())) as client:
+        response = await client.post(
+            "/api/source/pull-request", json={"url": "https://github.com/acme/repo/pull/9"}
+        )
+        assert "loginCommand" not in await response.json()
 
 
 @pytest.mark.asyncio
@@ -5724,7 +6007,7 @@ async def test_local_token_uses_local_owner_subject_without_configured_owner(mon
 
 @pytest.mark.parametrize("subject", ["local-app", "local-startup"])
 @pytest.mark.asyncio
-async def test_local_dashboard_subjects_can_read_without_configured_owner(
+async def test_local_dashboard_subjects_can_act_without_configured_owner(
     monkeypatch, subject
 ) -> None:
     pull = {"url": "https://github.com/acme/repo/pull/12", "checks": []}
@@ -5750,11 +6033,14 @@ async def test_local_dashboard_subjects_can_read_without_configured_owner(
         assert await detail_response.json() == pull
         assert checks_response.status == 200
         assert await checks_response.json() == {"checks": []}
-        assert resolve_response.status == 403
+        # The mutation passes on the same identity the reads did: with no owner
+        # configured, a signed machine-local subject IS the owner.
+        assert resolve_response.status == 200
+        assert (await resolve_response.json())["resolved"] is True
 
     fetch_pull.assert_awaited_once_with(pull["url"], refresh=False)
     fetch_checks.assert_awaited_once_with(pull["url"])
-    resolve.assert_not_awaited()
+    resolve.assert_awaited_once_with(pull["url"], "PRRT_thread1")
 
     request = _ResolveRequest()
     request.app["state"].owner_id = ""
@@ -5854,27 +6140,30 @@ async def test_read_handler_denies_non_local_subject_when_no_owner(
 
 
 @pytest.mark.asyncio
-async def test_resolve_handler_denies_local_token_when_no_owner(
-    monkeypatch, _mock_source_sel
-) -> None:
-    """The local no-owner fallback is scoped to reads: the resolve *mutation*
-    stays owner-only, so a local-app token with no owner still fails closed —
-    but the refusal names the remedy with a machine-readable code, because this
-    caller class saw live buttons whose reads already succeeded."""
-    resolve = AsyncMock()
+async def test_resolve_handler_allows_local_token_when_no_owner(monkeypatch) -> None:
+    """The resolve mutation runs for a signed local subject with no owner, and
+    the audit records it as completed under that subject rather than denied."""
+    resolve = AsyncMock(return_value=None)
+    audit = MagicMock()
     monkeypatch.setattr(source, "resolve_pull_request_thread", resolve)
+    monkeypatch.setattr(source, "_sel", lambda: audit)
 
     async with TestClient(TestServer(_app(owner_id="", user="local-app", app_name=""))) as client:
         response = await client.post(
             "/api/source/pull-request/resolve",
             json={"url": "https://github.com/acme/repo/pull/1", "threadId": "PRRT_1"},
         )
-        assert response.status == 403
-        body = await response.json()
-        assert body["code"] == source.OWNER_NOT_CONFIGURED_CODE
-        assert "Owner Slack member ID" in body["error"]
+        assert response.status == 200
+        assert (await response.json())["resolved"] is True
 
-    resolve.assert_not_awaited()
+    resolve.assert_awaited_once_with("https://github.com/acme/repo/pull/1", "PRRT_1")
+    audit.log_api_access.assert_called_once_with(
+        caller="local-app",
+        operation="source.pull_request.resolve",
+        outcome="completed",
+        source="dashboard",
+        error="",
+    )
 
 
 @pytest.mark.parametrize(
@@ -6129,23 +6418,24 @@ async def test_resolve_handler_audits_provider_failure_without_provider_text(mon
         ("/api/source/pull-request/ready", "mark_pull_request_ready"),
     ],
 )
-async def test_action_handlers_deny_local_token_when_no_owner(
+async def test_action_handlers_allow_local_token_when_no_owner(
     monkeypatch, _mock_source_sel, path: str, action_name: str
 ) -> None:
-    """The local no-owner fallback is scoped to reads: these mutations stay
-    owner-only, so a local-app token with no owner still fails closed — with
-    the coded, actionable body reserved for signed local dashboard sessions."""
-    action = AsyncMock()
+    """A signed machine-local subject is the owner when none is configured.
+
+    The negative control is
+    ``test_no_owner_mutation_denies_non_local_subjects``: the allowance is the
+    local dashboard identity, not the absence of an owner.
+    """
+    action = AsyncMock(return_value=None)
     monkeypatch.setattr(source, action_name, action)
 
     async with TestClient(TestServer(_app(owner_id="", user="local-app", app_name=""))) as client:
         response = await client.post(path, json={"url": "https://github.com/acme/repo/pull/1"})
-        assert response.status == 403
-        body = await response.json()
-        assert body["code"] == source.OWNER_NOT_CONFIGURED_CODE
-        assert "Owner Slack member ID" in body["error"]
+        assert response.status == 200
 
-    action.assert_not_awaited()
+    # Auto-merge carries the consent flag, ready does not; both must have run.
+    assert action.await_args.args == ("https://github.com/acme/repo/pull/1",)
 
 
 @pytest.mark.asyncio
@@ -6160,12 +6450,14 @@ async def test_action_handlers_deny_local_token_when_no_owner(
         {"owner_id": "", "user": "", "app_name": ""},
     ],
 )
-async def test_no_owner_mutation_code_reserved_for_signed_local_subjects(
+async def test_no_owner_mutation_denies_non_local_subjects(
     monkeypatch, _mock_source_sel, app_kwargs: dict
 ) -> None:
-    """The ``owner_not_configured`` discriminator is scoped exactly like
-    ``stale_owner_session_response``: every caller that is not a signed
-    machine-local dashboard session keeps the generic body."""
+    """The no-owner allowance is the signed machine-local dashboard identity.
+
+    Every other caller keeps the generic forbidden body, which is also what
+    stops the response from disclosing the install's owner state.
+    """
     action = AsyncMock()
     monkeypatch.setattr(source, "enable_pull_request_auto_merge", action)
 
@@ -7017,17 +7309,6 @@ async def test_reply_raises_on_a_graphql_refusal(monkeypatch) -> None:
     with pytest.raises(source.SourceProviderError, match="could not post the reply"):
         await source.reply_to_review_thread(
             "https://github.com/acme/repo/pull/12", "PRRT_1", "Agreed")
-
-
-@pytest.mark.asyncio
-async def test_reply_is_refused_on_gitlab(monkeypatch) -> None:
-    run = AsyncMock()
-    monkeypatch.setattr(source, "_run_json", run)
-    monkeypatch.setattr(source, "_allowed_gitlab_hosts", lambda: {"gitlab.com"})
-    with pytest.raises(ValueError, match="only supported on GitHub"):
-        await source.reply_to_review_thread(
-            "https://gitlab.com/acme/repo/-/merge_requests/12", "abc123", "hi")
-    run.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -9157,7 +9438,7 @@ class TestAdfToMarkdown:
         """`_URL_RE` stops at `)`, so a paren in the path puts the whole query
         outside every exfiltration check. The href is scanned paren-encoded and
         the link is dropped rather than emitted partly redacted."""
-        blob = "Xk7Qm2Rt9Wz4Yb6Nc1Vf8Hj3Lp5Sd0Ag7Ke4Ou2"
+        blob = "Xk7Qm2Rt9Wz4Yb6Nc1Vf8Hj3Lp5Sd0Ag7Ke4Ou2B"
         href = f"https://evil.example.com/a)b?data={blob}"
         adf = self._doc(
             self._para(self._text("click", [{"type": "link", "attrs": {"href": href}}]))
@@ -9244,7 +9525,7 @@ class TestAdfToMarkdown:
         conventional unless something checks it, so the node types and attribute
         names are read back OUT of the module and every combination is tried:
         a type added later is covered without anyone remembering this test."""
-        src = inspect.getsource(source)
+        src = inspect.getsource(inspect.getmodule(source._adf_to_markdown))
         body = src[src.index("def _adf_block_to_markdown") : src.index("def _adf_plain_text")]
         attr_names = set(re.findall(r'attrs\.get\("([a-zA-Z]+)"\)', body))
         node_types = set(source._ADF_BLOCK_TYPES) | set(
@@ -9420,7 +9701,7 @@ class TestAdfToMarkdown:
         so a space does not end the URL there. All ten characters are therefore
         sealed on this path -- each one measured as leaking before.
         """
-        blob = "Xk7Qm2Rt9Wz4Yb6Nc1Vf8Hj3Lp5Sd0Ag7Ke4Ou2"
+        blob = "Xk7Qm2Rt9Wz4Yb6Nc1Vf8Hj3Lp5Sd0Ag7Ke4Ou2B"
         for ch in (")", "'", '"', ">", " ", "\t", "\n", "\r", "\v", "\f"):
             href = f"https://evil.example.com/a{ch}b?data={blob}"
             adf = self._doc(
@@ -9546,7 +9827,7 @@ class TestAdfToMarkdown:
         mention label, an inline card and a media URL each still leaked a
         high-entropy query -- measured one by one. All of them now go through the
         one redaction primitive."""
-        blob = "Xk7Qm2Rt9Wz4Yb6Nc1Vf8Hj3Lp5Sd0Ag7Ke4Ou2"
+        blob = "Xk7Qm2Rt9Wz4Yb6Nc1Vf8Hj3Lp5Sd0Ag7Ke4Ou2B"
         url = f"https://evil.example.com/a)b?data={blob}"
         sites = {
             "expand title": self._doc(
@@ -9588,7 +9869,7 @@ class TestAdfToMarkdown:
         renderer: bare text `https://host/a)b?data=<blob>` becomes an anchor whose
         href carries the paren AND the whole query, so the truncated scan has to
         be corrected here or a fetchable address reaches the panel."""
-        blob = "Xk7Qm2Rt9Wz4Yb6Nc1Vf8Hj3Lp5Sd0Ag7Ke4Ou2"
+        blob = "Xk7Qm2Rt9Wz4Yb6Nc1Vf8Hj3Lp5Sd0Ag7Ke4Ou2B"
         text = f"look at https://evil.example.com/a)b?data={blob} please"
         rendered = source._adf_to_markdown(self._doc(self._para(self._text(text))))
         assert blob not in rendered
@@ -9609,7 +9890,7 @@ class TestAdfToMarkdown:
         Credentials are still covered: the payload-level pass is token-shaped, so
         it catches `ghp_...` inside a code block regardless of any URL truncation.
         """
-        blob = "Xk7Qm2Rt9Wz4Yb6Nc1Vf8Hj3Lp5Sd0Ag7Ke4Ou2"
+        blob = "Xk7Qm2Rt9Wz4Yb6Nc1Vf8Hj3Lp5Sd0Ag7Ke4Ou2B"
         url = f"https://api.example.com/v1)x?token={blob}"
         adf = self._doc(
             {"type": "codeBlock", "content": [{"type": "text", "text": f"curl {url}"}]}
@@ -9633,7 +9914,7 @@ class TestAdfToMarkdown:
         """
         head = "ghp_Ab3Df6Hj9Kl2Np5Qr8Tv"
         tail = "Wx4Yz7Bc0Ef3"
-        blob = "Xk7Qm2Rt9Wz4Yb6Nc1Vf8Hj3Lp5Sd0Ag7Ke4Ou2"
+        blob = "Xk7Qm2Rt9Wz4Yb6Nc1Vf8Hj3Lp5Sd0Ag7Ke4Ou2B"
         for url in (
             "https://ex.com/a.png",
             # Fails the destination scan (whitespace is encoded there), so the

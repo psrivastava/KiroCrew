@@ -91,7 +91,7 @@ def agents_dir(tmp_path, monkeypatch):
     monkeypatch.setattr(
         session_mcp,
         "managed_mcp_spec_entry",
-        lambda name: dict(managed[name]) if name in managed else None,
+        lambda name, **kwargs: dict(managed[name]) if name in managed else None,
     )
     monkeypatch.setattr(session_mcp, "_mcp_registry_mode", lambda: False)
     return d
@@ -959,9 +959,9 @@ class TestTheSessionArraySeam:
         real = session_mcp._agent_spec_and_snapshot_for
         calls: list[object] = []
 
-        def counting(agent, work_dir=None):
+        def counting(agent, work_dir=None, **kwargs):
             calls.append(agent)
-            return real(agent, work_dir)
+            return real(agent, work_dir, **kwargs)
 
         monkeypatch.setattr(session_mcp, "_agent_spec_and_snapshot_for", counting)
         params = CodexMirror().session_params("kirocrew", session_key="k", channel_id="c")
@@ -981,8 +981,8 @@ class TestTheSessionArraySeam:
         real = session_mcp._agent_spec_and_snapshot_for
         seen = {"n": 0}
 
-        def drifting(agent, work_dir=None):
-            spec, snapshot = real(agent, work_dir)
+        def drifting(agent, work_dir=None, **kwargs):
+            spec, snapshot = real(agent, work_dir, **kwargs)
             seen["n"] += 1
             if seen["n"] >= 2 and isinstance(spec, dict):
                 spec["mcpServers"]["narrowed"]["disabledTools"] = ["x"]
@@ -1493,7 +1493,11 @@ class TestSpecDisabledToolRefusal:
         assert builds == 2, "a site that answers a permission request was added or removed"
         for site in ("_dispatch_events", "_handle_permission"):
             body = inspect.getsource(getattr(client_mod.AcpClient, site))
-            assert "_build_permission_event(" in body and "_deny_spec_disabled_tool(" in body, site
+            assert (
+                "_build_permission_event(" in body
+                and "_deny_spec_disabled_tool(" in body
+                and "_deny_zero_tools(" in body
+            ), site
         # And the two other loops answer ONLY through _handle_permission.
         assert source.count("await self._handle_permission(msg)") == 2
 
@@ -1573,10 +1577,14 @@ def drive(element):
             if isinstance(msg.get("id"), int):
                 got[msg["id"]] = msg
         if 2 in got and "result" in got[2]:
-            # The child MCP server is launched and queried after session/new answers.
+            # The child MCP server is launched and tools/list is queried after session/new answers.
             for _ in range(120):
-                if os.path.exists(report):
-                    break
+                try:
+                    with open(report) as f:
+                        if "tools/list" in json.load(f).get("methods", []):
+                            break
+                except (OSError, ValueError):
+                    pass
                 time.sleep(0.25)
         return got.get(1) or {}, got.get(2) or {}
     finally:
@@ -1848,13 +1856,27 @@ def test_the_driver_runner_reaps_descendants_on_the_timeout_path():
 
     Asserted on the GRANDCHILD, because a parent-only kill is the bug -- the parent
     dies either way.
+
+    The grandchild is known here only as a NUMBER the driver printed, and by the
+    time this process reads it the driver's group has been SIGKILLed: on the
+    passing path init has already collected the grandchild and the kernel is free
+    to hand its number to a stranger. So the driver reports the grandchild's
+    start-time identity alongside the pid, read through the repo's own helper at
+    the one moment the pid is provably ours, and "gone" below means "no process
+    with THAT identity" -- a reissued number is a stranger, neither a leak nor a
+    kill target. The failure-path kill is pinned to the same identity.
     """
-    parent = r"""
-import subprocess, sys, time
-g = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)"])
-print(g.pid, flush=True)
-time.sleep(300)
-"""
+    from kiro_crew import platform_compat
+
+    src_root = Path(platform_compat.__file__).resolve().parents[1]
+    parent = (
+        "import subprocess, sys, time\n"
+        f"sys.path.insert(0, {str(src_root)!r})\n"
+        "from kiro_crew.platform_compat import get_process_start_id\n"
+        'g = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)"])\n'
+        "print(g.pid, get_process_start_id(g.pid) or '', flush=True)\n"
+        "time.sleep(300)\n"
+    )
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as w:
         script = Path(w) / "parent.py"
         script.write_text(parent, encoding="utf-8")
@@ -1862,18 +1884,30 @@ time.sleep(300)
         result = _run_driver_reaping_group([sys.executable, str(script)], timeout=5, cwd=w)
         # The bound is the control here, and the reap must not add a long second wait.
         assert time.monotonic() - started < 90
-        grandchild = int((result.stdout or "").strip().splitlines()[0])
+        reported = (result.stdout or "").strip().splitlines()[0].split()
+        grandchild = int(reported[0])
+        assert len(reported) == 2, (
+            f"the driver could not read the start-time identity of grandchild "
+            f"{grandchild}, so neither the liveness check nor the failure-path kill "
+            "below could be pinned to the process it spawned"
+        )
+        grandchild_identity = reported[1]
 
+    # Liveness through the repo's own identity helper (AGENTS.md "Cross-platform"):
+    # a raw ``os.kill(pid, 0)`` is a POSIX idiom that TERMINATES the target on
+    # Windows, the sweep's caller filter recognises only the sanctioned helpers,
+    # and a bare existence probe cannot tell our reaped grandchild's reissued
+    # number from the grandchild itself.
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
-        try:
-            os.kill(grandchild, 0)
-        except OSError:
+        if platform_compat.get_process_start_id(grandchild) != grandchild_identity:
             break
         time.sleep(0.2)
     else:  # pragma: no cover - the failure this test exists to catch
         try:
-            os.kill(grandchild, 9)
+            platform_compat.kill_pid_pinned(
+                grandchild, grandchild_identity, platform_compat.SIGKILL
+            )
         except OSError:
             pass
         pytest.fail(
@@ -2226,6 +2260,205 @@ def test_real_codex_acp_session_close_evicts():
         assert m["fresh_after"], "session/new failed after the closes\n" + context
 
 
+_DEPTH_DRIVER = r"""
+import json, os, queue, subprocess, sys, threading, time
+
+root, entry, node, src_root, max_depth = sys.argv[1:6]
+max_depth = int(max_depth)
+sys.path.insert(0, src_root)
+from kiro_crew.acp.runtime import _iter_descendant_pids
+
+work = os.path.join(root, "work")
+env = dict(os.environ)
+env["CODEX_HOME"] = os.path.join(root, "codex_home")
+env["NO_BROWSER"] = "1"
+
+
+def reap(p):
+    for step in (p.terminate, p.kill):
+        try:
+            step()
+            p.communicate(timeout=15)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+        except Exception:
+            return
+
+
+def pump(stream, q):
+    for line in stream:
+        q.put(line)
+    q.put(None)
+
+
+def cmdline(pid):
+    try:
+        with open("/proc/%d/cmdline" % pid, "rb") as fh:
+            raw = fh.read()
+    except OSError:
+        return None
+    return [tok.decode("utf-8", "replace") for tok in raw.split(b"\0") if tok]
+
+
+p = subprocess.Popen(
+    [node, entry], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+    stderr=subprocess.DEVNULL, cwd=work, env=env, text=True, bufsize=1,
+)
+q = queue.Queue()
+threading.Thread(target=pump, args=(p.stdout, q), daemon=True).start()
+next_id = [0]
+
+
+def call(method, params):
+    next_id[0] += 1
+    rid = next_id[0]
+    p.stdin.write(json.dumps({"jsonrpc": "2.0", "id": rid, "method": method, "params": params}) + "\n")
+    p.stdin.flush()
+    deadline = time.time() + 60
+    while True:
+        budget = deadline - time.time()
+        if budget <= 0:
+            return {"_timeout": True}
+        try:
+            line = q.get(timeout=budget)
+        except queue.Empty:
+            return {"_timeout": True}
+        if line is None:
+            return {"_eof": True}
+        try:
+            msg = json.loads(line)
+        except ValueError:
+            continue
+        if msg.get("id") == rid:
+            return msg
+
+
+out = {}
+try:
+    call("initialize", {"protocolVersion": 1, "clientCapabilities": {"fs": {}}})
+    new = call("session/new", {"cwd": work, "mcpServers": []})
+    out["new_error"] = new.get("error")
+    # The runtime's own bounded walk, one generation at a time: a pid's depth is the
+    # first bound it appears under, so the generation the constant names is measured
+    # by the same reader the recycle guard uses, not by a second tree walker.
+    depth_of = {}
+    for depth in range(max_depth + 1):
+        for pid in _iter_descendant_pids(p.pid, depth):
+            depth_of.setdefault(pid, depth)
+    cmdlines = {str(pid): cmdline(pid) for pid in depth_of}
+    hits = [pid for pid, argv in ((int(k), v) for k, v in cmdlines.items()) if argv and "app-server" in argv]
+    out["depth_pids"] = sorted(depth_of, key=depth_of.get)
+    out["app_server_found"] = bool(hits)
+    out["app_server_depth"] = depth_of[hits[0]] if hits else None
+    out["cmdlines"] = cmdlines
+finally:
+    reap(p)
+print(json.dumps(out))
+"""
+
+
+@pytest.mark.real_adapter
+def test_real_codex_acp_app_server_sits_at_core_rss_depth():
+    """ANTI-DRIFT GUARD for ``CodexHarness.CORE_RSS_DEPTH``.
+
+    The core-scope recycle guard measures RSS over ``CORE_RSS_DEPTH`` generations
+    below the adapter and holds that against ``CORE_RSS_CEILING_MB``. The scope
+    rests on one structural fact about the installed adapter: ``codex app-server``
+    is a DIRECT child of the Node process, one generation down, before any sandbox
+    wrapper. Every existing pin on the constant is static -- the contract test checks
+    it travels with its ceiling, the harness test checks the wrapper arithmetic, the
+    runtime test checks the depth is consumed -- so an adapter release that inserts a
+    launcher generation would move app-server OUT of the measured scope with nothing
+    red to say so: the probe would sum a flat ~100 MB of adapter forever, the
+    ceiling would never trip, and a genuine app-server leak would be invisible.
+    This is where that goes red.
+
+    Two claims:
+
+    1. ``codex app-server`` is reachable within ``CORE_RSS_DEPTH`` of the spawned
+       pid, walked by ``_iter_descendant_pids`` -- the reader the recycle guard
+       itself uses, so the test measures the guard's own scope and not a proxy.
+       That reader is the kernel's ``/proc`` child lists, so the pin is a Linux
+       fact and is gated on Linux the way the adapter itself is gated: through
+       ``require_real_adapter``, which skips a local run elsewhere and FAILS a
+       lane that declared the pin must run (``KIROCREW_E2E_REQUIRE=1``). A
+       ``skipif`` would restore the silence that gate exists to remove.
+    2. It sits at exactly ``CORE_RSS_DEPTH``. A plain spawn has
+       ``wrapper_generations=0``, so ``rss_depth == CORE_RSS_DEPTH`` and the constant
+       IS the generation; a refused ``session/new`` fails rather than skips, because
+       a silent skip is how a ratchet goes quiet.
+
+    The constant is asserted, not resolved from the live tree: a wrong constant must
+    fail here, not be quietly replaced by a runtime observation of a third-party
+    process tree. ``session/new`` is sent so the walk happens after app-server has
+    answered a request, not merely been forked. Same credential arrangement as the
+    sibling live tests: a fabricated key in a throwaway ``CODEX_HOME`` gets past the
+    auth check that fires before ``session/new``; nothing performs a model call.
+    """
+    _require_codex_acp(with_node=True)
+    require_real_adapter(
+        sys.platform == "linux",
+        what="the Linux /proc process tree the recycle guard's reader walks",
+        install="run the real-adapter lane on a Linux host",
+    )
+    src_root = Path(acp_runtime.__file__).resolve().parents[2]
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as w:
+        root = Path(w)
+        (root / "work").mkdir()
+        (root / "codex_home").mkdir()
+        (root / "codex_home" / "auth.json").write_text(
+            json.dumps({"OPENAI_API_KEY": "sk-not-a-real-key-" + "0" * 24}), encoding="utf-8"
+        )
+        driver = root / "drive_depth.py"
+        driver.write_text(_DEPTH_DRIVER, encoding="utf-8")
+        result = _run_driver_reaping_group(
+            [
+                sys.executable,
+                str(driver),
+                str(root),
+                str(_ENTRY),
+                shutil.which("node") or "node",
+                str(src_root),
+                str(CodexHarness.CORE_RSS_DEPTH),
+            ],
+            timeout=300,
+            cwd=root / "work",
+        )
+        context = (
+            f"driver exit: {result.returncode}\n"
+            f"stdout: {result.stdout[-3000:]}\nstderr: {result.stderr[-3000:]}"
+        )
+        try:
+            m = json.loads(result.stdout.strip().splitlines()[-1])
+        except (ValueError, IndexError):
+            pytest.fail("the codex-acp depth driver produced no measurement\n" + context)
+
+        # A refused credential is adapter drift, not "nothing to measure": the
+        # fabricated key exists to get past the auth check, and a ratchet that
+        # skipped here would go quiet on exactly the release this guard is for.
+        assert m.get("new_error") is None, (
+            f"session/new was refused ({m.get('new_error')!r}); the fabricated-credential "
+            "arrangement no longer reaches app-server -- re-measure before trusting the "
+            "depth pin\n" + context
+        )
+        assert "depth_pids" in m, "the process tree was not walked\n" + context
+
+        # 1. within scope.
+        assert m["app_server_found"] is True, (
+            f"no `codex app-server` within CORE_RSS_DEPTH={CodexHarness.CORE_RSS_DEPTH} of "
+            "the adapter; the core-scope recycle guard is measuring the wrong processes\n" + context
+        )
+        # 2. exactly the generation the constant names, compared against the
+        # constant itself so an edit to CORE_RSS_DEPTH that the tree does not
+        # justify goes red here.
+        assert m["app_server_depth"] == CodexHarness.CORE_RSS_DEPTH, (
+            f"`codex app-server` sits at depth {m['app_server_depth']}, not "
+            f"CORE_RSS_DEPTH={CodexHarness.CORE_RSS_DEPTH}; re-measure the constant against "
+            "this adapter release\n" + context
+        )
+
+
 @pytest.mark.real_adapter
 def test_the_installed_adapter_still_builds_the_frames_the_refusal_reads():
     """The frame VOCABULARY the deny channel keys on, pinned against the adapter.
@@ -2258,7 +2491,7 @@ def test_the_installed_adapter_still_builds_the_frames_the_refusal_reads():
         )
 
 
-def test_the_real_adapter_guard_is_reachable_at_all():
+def test_the_real_adapter_guard_is_reachable_at_all(monkeypatch):
     """A skip-only guard is a guard nobody notices has stopped running.
 
     This does not assert the adapter is installed -- most runners have none, and
@@ -2266,12 +2499,28 @@ def test_the_real_adapter_guard_is_reachable_at_all():
     instead. It asserts the RESOLVER the guard
     reads is the spawn's own, so a rename there cannot turn the guard permanently
     green without anyone seeing it.
+
+    The ladder's one spawn is ``mise which <adapter>`` through ``_mise_which``. That
+    seam is pinned to a recording fake: a real ``mise`` is a version manager that
+    may fetch toolchains, and it is a host program this test is not about. What the
+    fake records -- that the ladder asked mise for THIS adapter's binary -- is the
+    "spawn's own resolver" fact the test exists to pin.
     """
-    from kiro_crew.acp.client import _resolve_codex_acp_bin
+    from kiro_crew.acp import client as client_mod
+    from kiro_crew.acp.client import CODEX_ACP_BIN, _resolve_codex_acp_bin
+
+    asked: list[str] = []
+
+    def fake_mise_which(tool: str) -> str | None:
+        asked.append(tool)
+        return None
+
+    monkeypatch.setattr(client_mod, "_mise_which", fake_mise_which)
 
     argv, search = _resolve_codex_acp_bin()
     assert argv is None or isinstance(argv, list)
     assert isinstance(search, str)
+    assert asked == [CODEX_ACP_BIN]
     assert os.environ.get("CODEX_ACP_BIN") is None or _ENTRY is not None
 
 
@@ -3073,3 +3322,67 @@ def test_real_codex_acp_load_after_close_restores():
             "session/load succeeded after session/delete, so delete no longer disposes "
             "the thread and release has no verb that does\n" + context
         )
+
+
+def test_granted_dashboard_is_rebuilt_and_bound(agents_dir, monkeypatch):
+    _write_spec(
+        agents_dir,
+        servers={"kirocrew-dashboard": {"command": "/untrusted", "args": []}},
+        tools=["@kirocrew-dashboard"],
+    )
+    original = session_mcp.managed_mcp_spec_entry
+
+    def managed(name, **kwargs):
+        if name == "kirocrew-dashboard":
+            return {"command": "/opt/kirocrew", "args": ["mcp-dashboard"]}
+        return original(name)
+
+    monkeypatch.setattr(session_mcp, "managed_mcp_spec_entry", managed)
+    projection = codex_projection(
+        "kirocrew", session_key="dashboard:owner", session_token="issued-token"
+    )
+    dashboard = _by_name(projection.params["mcpServers"])["kirocrew-dashboard"]
+    assert dashboard["command"] == "/opt/kirocrew"
+    assert dashboard["args"] == ["mcp-dashboard"]
+    assert _env(dashboard)["KIROCREW_SESSION_KEY"] == "dashboard:owner"
+    assert "issued-token" in _env(dashboard).values()
+
+
+@pytest.mark.parametrize("restricted", [False, True])
+def test_dashboard_broker_mount_keeps_spec_restrictions(agents_dir, restricted):
+    entry = {"command": "/unused"}
+    if restricted:
+        entry["disabledTools"] = ["session_send"]
+    _write_spec(agents_dir, servers={"kirocrew-dashboard": entry}, tools=["@kirocrew-dashboard"])
+    projected = codex_projection(
+        "kirocrew",
+        stub_server_names=("kirocrew-dashboard",),
+        stub_elements=[_stub("kirocrew-dashboard")],
+    )
+    assert ("kirocrew-dashboard" in _by_name(projected.params["mcpServers"])) is not restricted
+
+
+@pytest.mark.parametrize(
+    "tools,entry",
+    [
+        ([], {"command": "/unused"}),
+        (["@kirocrew-dashboard"], {"command": "/unused", "disabled": True}),
+    ],
+)
+def test_dashboard_grant_is_not_created_by_identity(agents_dir, tools, entry):
+    _write_spec(agents_dir, servers={"kirocrew-dashboard": entry}, tools=tools)
+    projected = codex_projection(
+        "kirocrew",
+        session_key="dashboard:owner",
+        session_token="owner-token",
+        stub_server_names=("kirocrew-dashboard",),
+        stub_elements=[_stub("kirocrew-dashboard")],
+    )
+    assert "kirocrew-dashboard" not in _by_name(projected.params["mcpServers"])
+
+
+@pytest.mark.parametrize("ambient", [None, "false"])
+def test_codex_session_mount_outranks_unbound_global_config(ambient):
+    env = {} if ambient is None else {"DISABLE_MCP_CONFIG_FILTERING": ambient}
+    CodexHarness().apply_spawn_env(env)
+    assert env["DISABLE_MCP_CONFIG_FILTERING"] == "true"

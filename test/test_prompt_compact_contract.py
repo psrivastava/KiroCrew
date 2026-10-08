@@ -1,8 +1,8 @@
 """Compact shipped prompts retain standalone operational contracts.
 
 Text guards cannot prove model compliance. They protect the instructions most
-likely to disappear during compression; the worked plan also uses the real
-parser, and the size ceiling applies to each selectable prompt independently.
+likely to disappear during compression, and the size ceiling applies to each
+selectable prompt independently.
 """
 
 from __future__ import annotations
@@ -12,19 +12,29 @@ from pathlib import Path
 
 import pytest
 
+from kiro_crew.context_assembly.sections import computer_use_block
+
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG = ROOT / "src" / "kiro_crew" / "config"
 # Absolute UTF-8 source-byte budgets, not token counts or live git baselines.
 # A maintainer may raise a budget in a reviewed change when a new rule earns
 # its space. Preserve the operational clauses below rather than cutting them
 # to fit; their tests, not a size limit, check the retained text contracts.
-# The execution section includes reason evidence and the capability-dependent
-# parent-work boundary without removing Autopilot's approval/stage contracts.
-PROMPT_BYTE_CEILINGS = {"prompt.md": 40_725, "prompt-orchestrator.md": 23_448}
+# Measured on the prompt with its Computer Use slot filled by the full section,
+# so the section's bytes still count against the budget after moving into
+# `context_assembly/sections.py`. The `{{MAX_SUBAGENTS}}` and `{{WIDGET_BLOCK}}`
+# slots are still counted as their raw tokens.
+PROMPT_BYTE_CEILINGS = {"prompt.md": 40_725}
+_COMPUTER_USE_TOKEN = "{{COMPUTER_USE_BLOCK}}"
 
 
 def _read(name: str = "prompt.md") -> str:
     return (CONFIG / name).read_text(encoding="utf-8")
+
+
+def _resolved(name: str = "prompt.md", *, mounted: bool = True) -> str:
+    """The prompt with its Computer Use slot filled as a session gets it."""
+    return _read(name).replace(_COMPUTER_USE_TOKEN, computer_use_block(mounted))
 
 
 def _section(text: str, heading: str) -> str:
@@ -42,8 +52,9 @@ def _require(text: str, *patterns: str) -> None:
 @pytest.mark.parametrize("name", PROMPT_BYTE_CEILINGS)
 def test_each_selected_prompt_stays_under_its_byte_ceiling(name: str) -> None:
     # Normalize checkout line endings so Windows measures the same shipped text.
-    size = len(_read(name).encode("utf-8"))
+    size = len(_resolved(name, mounted=True).encode("utf-8"))
     assert size <= PROMPT_BYTE_CEILINGS[name], (name, size, PROMPT_BYTE_CEILINGS[name])
+    assert len(_resolved(name, mounted=False).encode("utf-8")) < size
 
 
 @pytest.mark.parametrize("name", PROMPT_BYTE_CEILINGS)
@@ -51,6 +62,7 @@ def test_template_slots_remain_complete_and_unique(name: str) -> None:
     text = _read(name)
     assert re.findall(r"\{\{([A-Z_]+)\}\}", text) == [
         "MAX_SUBAGENTS",
+        "COMPUTER_USE_BLOCK",
         "WIDGET_BLOCK",
     ]
     assert text.count("{bot_name}") == 1
@@ -76,34 +88,49 @@ def test_each_prompt_keeps_its_own_output_and_host_boundaries(name: str) -> None
         assert command in rules
 
 
-def test_solo_spawn_prohibition_survives_prompt_compaction() -> None:
-    """A compaction once dropped the explicit prohibition and left only a weak
-    "unless context isolation is needed", which made context isolation the
-    universal excuse for handing a whole task to one sub-agent. The licensing
-    vocabulary here must stay the closed one ``solo_spawn.py`` enforces, or the
-    prompt invites a spawn the gate refuses."""
-    for name in ("prompt.md", "prompt-orchestrator.md"):
+def test_single_task_default_survives_prompt_compaction() -> None:
+    """A compaction once dropped the explicit "one task stays in the parent"
+    rule and left abstract value language plus a five-reason vocabulary. The
+    model read the vocabulary as a menu of passing tokens and spawned one child
+    per task. The concrete default, the fan-out threshold and the yield rule
+    must survive every rewrite, and no reason vocabulary may come back."""
+    for name in ("prompt.md",):
         text = _read(name)
-        section = (
-            _section(text, "### Subagent Orchestration")
-            if name == "prompt.md"
-            else _section(text, "### Step 2: Execute")
-        )
+        section = _section(text, "### Subagent Orchestration")
         _require(
             section,
-            r"Never forward the entire request to one equivalent worker merely to wait and relay",
-            r"Do focused work directly by default",
-            r"Do not invent tasks or switch models",
-            r"parent_parallel",
-            r"solo_details",
-            r"Only when its receipt confirms support.*one minute.*END YOUR TURN",
-            r"Blocking.*cannot support.*parent_parallel",
-            r"Yielding is not completion",
-            r"Await all batch outcomes",
-            r"bulk_data",
-            r"fresh_context",
+            r"END YOUR TURN",
+            r"still-running result",
+            r"receipt says parent work is supported.*at most one minute",
         )
-        assert "context isolation" not in section.lower(), (name, "retired licence returned")
+        if name == "prompt.md":
+            _require(
+                section,
+                r"Do the task yourself by default",
+                r"TWO OR MORE independent tasks",
+                r"flood your context with bulk output",
+                r"Never hand the whole request to one worker just to wait",
+                r"ONE `spawn_run\(tasks=\[…\]\)` batch",
+                r"Wait for the whole batch before spawning again",
+            )
+        else:
+            _require(
+                section,
+                r"single indivisible unit stays in the parent",
+                r"at least two independent tasks",
+                r"Wait for all .*results before synthesizing",
+            )
+        for retired in (
+            "solo_reason",
+            "solo_details",
+            "parent_parallel",
+            "Solo reasons",
+            "two workstreams",
+            "Parent + one child",
+            "Parent+child",
+            "context isolation",
+        ):
+            assert retired.lower() not in section.lower(), (name, retired)
 
 
 def test_cron_modes_and_session_ownership_remain_explicit() -> None:
@@ -160,8 +187,11 @@ def test_monitor_modes_have_distinct_stop_paths_and_real_exit_conditions() -> No
         r"typed provider facts.*whole objective.*lifecycle.*checks.*mergeability.*review decision.*review threads",
         r"only for unsupported targets.*evidence the structured provider cannot see",
         r"final report or notification.*finite legacy path with `gate=false`",
-        r"positive runtime/turn/token/provider-error budgets",
-        r"Token caps depend on reported usage.*token_usage_known.*hard fallbacks",
+        r"positive runtime/token/provider-error budgets",
+        r"`max_agent_turns` also accepts 0.*no wake ceiling",
+        r"Token caps depend on reported usage.*token_usage_known",
+        r"runtime cap is the hard fallback that always applies",
+        r"completed-turn cap is a fallback only when you name a positive value",
         r"positive `max_cycles` and `max_runtime_secs`; never use zero",
         r"REQUESTED and END YOUR TURN.*after the turn.*cannot prove arming",
         r"On a later turn verify session-bound state",
@@ -228,7 +258,8 @@ def test_browser_keeps_all_four_approval_groups_and_ownership_controls() -> None
 
 
 def test_computer_use_keeps_opt_in_and_cursor_password_refusals() -> None:
-    desktop = _section(_read(), "## Computer Use (native desktop apps)")
+    # The section a session gets while its spec mounts `kirocrew-computer`.
+    desktop = _section(_resolved(mounted=True), "## Computer Use (native desktop apps)")
     _require(
         desktop,
         r"opt-in and off by default",
@@ -239,49 +270,19 @@ def test_computer_use_keeps_opt_in_and_cursor_password_refusals() -> None:
         r'click_method: "global".*ask for it BY NAME.*auto.*never picks it',
         r"Password fields.*<secure>.*never captured",
         r"own dashboard is refused, for reading as well as typing",
+        r"If no `computer_\*` tool is in your tool list.*turned off after this\s+session",
     )
 
 
-def test_orchestrator_example_round_trips_through_real_plan_parser() -> None:
-    from kiro_crew.context_management import extract_plan_metadata, validate_plan_format
-
-    plans = [
-        block
-        for block in re.findall(
-            r"^```[^\n]*\n(.*?)^```[ \t]*$", _read("prompt-orchestrator.md"), re.S | re.M
-        )
-        if block.startswith("📋 Plan for:")
-    ]
-    assert len(plans) == 1
-    plan = plans[0]
-    assert validate_plan_format(plan) == (True, True, [])
-    titles, goal, tasks = extract_plan_metadata(plan)
-    assert goal and all(tasks) and titles[-1] == "Verification"
-    assert plan.splitlines()[-1] == "[OPTION: Go | Go All | Cancel]"
-    assert plan.count("[OPTION:") == 1 and "[OPTIONS:" not in plan
-    assert not validate_plan_format(plan.replace("Stage 2:", "Stage 9:"))[1]
-    assert not validate_plan_format(plan.replace("[OPTION:", "[OPTIONS:"))[1]
-
-
-def test_orchestrator_keeps_approval_scope_budgets_and_direct_work_exceptions() -> None:
-    text = _read("prompt-orchestrator.md")
+def test_computer_use_pointer_names_the_setting_and_the_skill() -> None:
+    # The same slot while the spec withholds the server: no tool instructions,
+    # but a user asking for a desktop app is still pointed at the setting.
+    desktop = _section(_resolved(mounted=False), "## Computer Use (native desktop apps)")
     _require(
-        text,
-        r"explicit plan request ALWAYS wins.*any language",
-        r"plan only when ALL hold.*dependent phases.*multiple files/systems.*checkpoints",
-        r"Go.*next stage.*pause for approval",
-        r"Go All.*all remaining stages.*Stops on failure",
-        r"Cancel.*abort the plan",
-        r"once approved.*do not re-plan",
-        r"END YOUR TURN immediately.*no tools.*until the user's Go / Go All",
-        r"Do focused work directly by default",
-        r"Solo reasons:.*parent_parallel.*bulk_data.*fresh_context.*specialist.*user_requested",
-        r"never dispatch work needing a still-running result",
-        r"stage_timeout_seconds.*turn may START.*rather than hard-bounding",
-        r"HALF that budget, capped at fifteen minutes",
-        r"Max 3 rounds per stage.*checkpoint.*ask the user",
-        r"3 failed attempts.*ask for guidance",
-        r"Destructive/irreversible.*not already sanctioned",
-        r"conflicting subagent results with no safe default",
-        r"Do not invent new business requirements",
+        desktop,
+        r"Not available in this session.*no `computer_\*` tools are mounted",
+        r"point them to Settings → Computer Use",
+        r"tools are in your tool list anyway.*read the `computer-use` skill",
     )
+    for tool in ("computer_get_state", "computer_click", "computer_launch_app"):
+        assert tool not in desktop

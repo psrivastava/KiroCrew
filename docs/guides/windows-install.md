@@ -1,15 +1,15 @@
 # Installing & Testing Kiro Crew on Windows
 
-Kiro Crew runs **natively on Windows** as a Python **source install**.
-The cross-platform process / signal / file-lock / metrics behavior is routed
-through `kiro_crew.platform_compat`, so macOS + Linux behavior is unchanged and
-the same code path also runs on Windows.
+Kiro Crew runs **natively on Windows** through the desktop installer or a
+supported Python **source install**. The cross-platform process / signal /
+file-lock / metrics behavior is routed through `kiro_crew.platform_compat`, so
+macOS + Linux behavior is unchanged and the same code path also runs on Windows.
 
-Existing Memory V1 members remain usable on native Windows. New members require
-private Memory V2, so creation and explicit V1-to-V2 setup refuse before writing
-private files on a native Windows gateway. Use a WSL/Linux gateway with Crew's
-namespace sandbox and a supported member backend for those operations. Viewing
-and managing an already-owned V2 store remains available from the owner dashboard.
+Existing Memory V1 members remain usable on native Windows. New Crew Members
+automatically receive private Memory V2 stores there as on the other supported
+platforms; provisioning uses owner-only NTFS permissions, and SQLite's native
+file handles provide the Windows protection where POSIX uses a shared store-use
+lock.
 
 ## Desktop installer
 
@@ -133,19 +133,19 @@ Current status:
   of the signed/read-only app tree. The Windows caches are **unchecked**-hash,
   not checked. Both modes ignore mtime, which is the property that survives
   extraction restamping the sources, but a checked-hash pyc makes the loader read
-  and hash each `.py` in *addition* to reading the `.pyc` — measured at 43.55 MB
-  and 1639 extra cold file opens per boot, a median 12.5 s on a cold file cache.
+  and hash each `.py` in *addition* to reading the `.pyc`, which costs many
+  extra cold file opens and seconds of boot time on a cold file cache.
   The macOS whole-tree caches remain checked-hash: a separate mechanism that does
   not show this cost. The loading screen retains its extended
   Windows handoff window as a slow-machine fallback; a child exit or spawn error
   still fails immediately and includes the launch-log cause.
   `.github/scripts/test-windows-installer.ps1` starts the just-installed
   bundled interpreter against an isolated data home and requires `/api/ready`
-  within 30 seconds, covering both the packaged caches and the full gateway
+  within 50 seconds, covering both the packaged caches and the full gateway
   handoff. **This runs on every qualifying PR.** `build.yml`'s installer job
   bundles a real python-build-standalone runtime carrying the wheel `build-wheel`
   produced, so the script's gateway leg has an interpreter to start and the job
-  no longer passes `-SkipGatewayValidation`. `KIROCREW_KIRO_BIN` points at the
+  runs without `-SkipGatewayValidation`. `KIROCREW_KIRO_BIN` points at the
   fake ACP backend inside that same payload, so readiness needs no model and no
   sign-in. The job also enforces the native installer's performance ceiling
   against a real payload rather than a stub, and its install-location contract.
@@ -188,7 +188,7 @@ The source install below remains the fully supported path.
 | **Git for Windows** | clone the repo | https://git-scm.com/download/win |
 | **kiro-cli** | the default agent backend (ACP); install and sign in separately | https://kiro.dev/cli/ |
 | **Python 3.12-3.13** | the venv runtime. `python_requires` is `>=3.12` and 3.13 is in the supported range, but **3.12 is the tested Windows runtime** (it is what the Windows CI shard runs, and numpy 1.x ships no 3.13 Windows wheel) | https://python.org (install user-scoped), or `winget install Python.Python.3.12` |
-| **Node.js** (optional) | builds the full React dashboard; without it the gateway serves the prebuilt bundle | `winget install OpenJS.NodeJS.LTS` |
+| **Node.js 22.12+** | required by `make.ps1 build` to build and stage the React dashboard; installed desktop/wheel artifacts already contain the bundle | `winget install OpenJS.NodeJS.LTS` |
 
 No admin is required — everything installs user-scoped under `%USERPROFILE%`.
 
@@ -233,7 +233,6 @@ The equivalent by hand, if you would rather not use the driver:
 ```powershell
 # Build the frontend first (optional but recommended) so the dashboard is bundled:
 #   cd website; npm install; npm run build; cd ..
-#   Copy-Item -Recurse website\dist src\kiro_crew\static\dist
 
 py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
@@ -242,6 +241,8 @@ python -m pip install --upgrade pip
 # (setup.cfg already declares tzdata under a platform_system == "Windows" marker,
 #  so a plain `pip install -e .` pulls it in on Windows.)
 pip install -e ".[voice]"
+# Then stage the build as the served dashboard (a junction to website\dist):
+python -m kiro_crew.frontend stage .
 ```
 
 Then:
@@ -332,7 +333,7 @@ while the other 503s. Concretely:
   Python runtime variables before every delegated spawn.
 - **`agent.sandbox` explicitly `"off"`** (isolation deferred to kiro-cli's own
   internal sandbox): all of them run, and none of them need the opt-in. Note that
-  an explicit `"off"` now logs a one-time `SECURITY` warning where no OS-level
+  an explicit `"off"` logs a one-time `SECURITY` warning where no OS-level
   isolation ends up active.
 
 ## Per-feature status on Windows
@@ -343,13 +344,14 @@ while the other 503s. Concretely:
 | Project skills (`<project>/.kiro/skills`) | not yet — Python on Windows does not expose handle-relative directory traversal that can reject every reparse point before resolving it. Catalog, consent and loading fail closed before canonicalizing the project path, preventing a raced junction to a UNC share from initiating SMB authentication. Global and installed skills continue to work. |
 | Theme-pack install, detail, assets, overlays, topbars, and removal | works — opened pack files are contained with `GetFinalPathNameByHandleW`; descriptor resolution fails closed instead of trusting a pathname-only check |
 | LLM cron jobs (the `message` kind) | works |
-| Script cron jobs | run unconfined under this platform's default (declare `sandbox_allow_unsandboxed_exec=false` to refuse them) — they run through `wrap_argv`, which permits them on Windows because no backend is installable. With that opt-out declared the job fails with a message naming the setting (it no longer raises an uncaught error) |
-| Command cron jobs (`sh -c "…"`) | not supported on Windows — the stored command is vetted under POSIX-sh semantics, and Windows ships no shell whose language matches: cmd.exe is not POSIX at all, and Git-for-Windows's `sh.exe` is bash and performs brace expansion that hides `cat ~/.a{w,w}s/credentials` from the vet. The job fails-closed with an explanation. Use a **script cron** or an LLM `message` cron on this platform |
+| Script cron jobs | run unconfined under this platform's default (declare `sandbox_allow_unsandboxed_exec=false` to refuse them) — they run through `wrap_argv`, which permits them on Windows because no backend is installable. With that opt-out declared the job fails with a message naming the setting |
+| Command cron jobs (`sh -c "…"`) | not supported on Windows — the stored command is vetted under POSIX-sh semantics, and Windows ships no shell whose language matches: cmd.exe is not POSIX at all, and Git-for-Windows's `sh.exe` is bash. Routing a string vetted for one language through a shell that widens it is the hazard, so the resolver refuses rather than picking a shell. (Brace expansion is refused separately, at storage time and on every fire; the refusal here rests on the shell language being wider than the one the vet was written against.) The job fails-closed with an explanation. Use a **script cron** or an LLM `message` cron on this platform |
 | Script hooks (Settings → Hooks) | run unconfined under this platform's default (declare `sandbox_allow_unsandboxed_exec=false` to refuse them) (like script crons — the hook command routes through `wrap_argv`, which permits them on Windows because no backend is installable; with that opt-out declared the hook returns that message as its `error`). They run in **cmd.exe** language: a hook `command` runs as `%ComSpec% /c "<command>"`, so read the context env vars as `%KIROCREW_HOOK_EVENT%` / `%KIROCREW_HOOK_CONTEXT%` (not `$VAR`), and group arguments with double quotes only (cmd.exe gives `'…'` no meaning). The line reaches cmd.exe verbatim, so a quoted interpreter path with a space works. A hook authored on macOS/Linux is not portable and must be rewritten |
-| Pull-request source drawer provider fetch/check/resolve | not yet — and for a different reason than it used to be. The provider-CLI **trust** check now works here (see Issue Radar below), but the drawer does not share Issue Radar's spawn: it keeps its own async, sandbox-routed one (`source_providers._run_json`), which refuses on Windows because no OS sandbox backend exists. So the blocker is the sandbox, not the binary check |
+| Pull-request source drawer provider fetch/check/resolve | runs unconfined under this platform's default (declare `sandbox_allow_unsandboxed_exec=false` to refuse it), like script crons and hooks. The drawer keeps its own async, sandbox-routed spawn (`source_providers.runner._run_json`); Windows has no OS sandbox backend, so it reaches the same no-backend policy, and `sandbox_allow_unsandboxed_exec` resolves true on win32. With that opt-out declared, `sandboxed_spawn_argv` refuses with a message naming the setting. The provider-CLI **trust** check applies here too (see Issue Radar below), and the allowlisted executable, env allowlist, output cap, timeout and audit still bound every call |
 | Issue Radar | works — its `gh` spawn is not sandbox-routed, so the trust check is the only gate, and that is answered by reading the binary's Windows ACL (`kiro_crew.windows_acl`) in place of the POSIX `st_uid` + write-bit walk, which reports nothing on this platform. Refused when any principal outside `{you, SYSTEM, Administrators, TrustedInstaller}` can replace the binary or a parent directory, or when the security descriptor is unreadable. An **elevated** gateway (the built-in `Administrator` account, or a "Run as administrator" launch) is not refused for being elevated: Windows has no OS sandbox in this codebase, so the agent's shell already holds the gateway's full token and a refusal would remove the feature without removing any exposure — the same ACL walk applies, keyed on the gateway user's SID. GitHub only on this platform unless `glab` is installed. **If a `gh` you trust is refused**, the override variables (`KIROCREW_ISSUE_RADAR_GH`, `KIROCREW_GH_BIN`) re-enter the same check rather than bypassing it, so the recourse is to install `gh` somewhere only you and the system can write — a per-user `%LOCALAPPDATA%` install is accepted — or to file an issue quoting the refusal, which names the offending principal or the ACE type it could not evaluate |
 | Spec Builder | works, except **Duplicate** — crash-safe copy publication pins a staging directory and uses the platform's atomic no-replace rename (`renameat2(RENAME_NOREPLACE)` on Linux, `renameatx_np(RENAME_EXCL)` on macOS). Windows provides neither that native contract nor CPython's directory-descriptor operations, so the backend reports the capability as unavailable and the dashboard omits Duplicate instead of falling back to a check-then-rename race or a junction-prone path write. Approval, per-task runs, labels, archive/restore, chat, and whole-plan execution work normally |
-| Code Review Sage | not yet — the provider-CLI trust check now passes, but its review worker hands the session `python3 sage_lib/…` commands and `python3` is not an interpreter on Windows (the name resolves to the Microsoft Store app-execution alias, or to nothing). It refuses with that reason rather than starting a review that produces no result |
+| Code Review Sage | not yet — the provider-CLI trust check passes, but its review worker hands the session `python3 sage_lib/…` commands and `python3` is not an interpreter on Windows (the name resolves to the Microsoft Store app-execution alias, or to nothing). It refuses with that reason rather than starting a review that produces no result |
+| Dashboard terminal tab title | not on Windows — the tab keeps its default title. The live label (the running command, else the cwd basename) reads the foreground process group with POSIX `tcgetpgrp` and the shell's cwd from `/proc` (or `lsof`), and ConPTY offers neither, so `_session_title` and `_session_cwd` in `dashboard/handlers/terminal.py` return nothing here. The same cwd probe also feeds path completion, which has no cwd here, and the path on terminal output handed to chat, which falls back to the directory the terminal started in rather than the one you `cd` to. Command completion does not run here either: its probe in `dashboard/terminal_commands.py` is POSIX-only. The terminal session itself is unaffected |
 | Browser automation (`playwright-cli`) | works (`npm install -g @playwright/cli@latest`, needs Node.js 20 or newer) |
 | `kirocrew pod` (isolated worktree test gateways) | works, through **Task Scheduler**, unelevated. A pod is a per-user disposable gateway, so `sc.exe` is the wrong tool twice over (it needs `SeCreateServiceNamePrivilege` and installs a machine-wide LocalSystem service); `schtasks.exe` creates a task in your own namespace with no elevation, matching `systemd --user` and launchd's `gui/<uid>`. A task carries no environment block, so the action is a generated `.cmd` wrapper under `KIROCREW_POD_ENV_DIR` that pins the pod plane and re-enters `kirocrew pod _run <name>` — a plane path containing a double quote or a newline is refused at `pod up`, since cmd.exe cannot quote it. The memory and fork-bomb ceiling IS enforced here, by a Job object attached to the gateway while it is still suspended (the same `resource_limits` config and the same seam the agent-subprocess path uses), but it is not parity with the Linux cgroup: the process bound counts processes where `TasksMax` counts threads, and there is no CPU cap. Two limits remain, neither of them silent: **no restart on crash** (Task Scheduler retries a failed *start*, not a non-zero exit, so a crashed pod stays down; the wrapper records the boot's exit code and `pod ls` / `pod up` read it as the crash signal), and **`pod api` refuses** because its authenticated request travels over the pod's private AF_UNIX dashboard socket with no TCP fallback and CPython here has no `AF_UNIX` — use `pod token` plus your own client against the loopback port. `pod up/down/ls/status/token/url/logs/prune/provision/scenarios` all work. Two Windows-specific mechanics worth knowing: `schtasks` output is **localized**, so the backend never parses it (liveness, the pid and the last result come from files the supervised process itself writes, and `schtasks` is used only where its exit code is the answer), and Windows has no `exec`, so the gateway is supervised as the wrapper's child with its pid plus creation-time identity recorded — that is what keeps `port_owner`'s ownership proof honest here. If `pod up` reports that your user cannot create a scheduled task, that is Group Policy, a disabled `Schedule` service, or a principal without `TASK_CREATE`; there is no non-admin workaround |
 | Vector memory / embeddings | works — embeddings run **in-process** through the vendored llama-cpp-python (`_vendor/llama_cpp_libs/win_amd64`), which loads the Qwen3-Embedding-0.6B GGUF from `~/.kiro/crew/models`. No remote endpoint, no Docker and no Ollama server is involved on any platform |
@@ -375,8 +377,7 @@ routes to `os.chmod(..., 0o600)` on POSIX and, on Windows, builds the descriptor
 in-process through `advapi32` (`SetNamedSecurityInfoW` with
 `PROTECTED_DACL_SECURITY_INFORMATION`, the equivalent of
 `icacls /inheritance:r /grant:r "*S-1-3-4:F"`). It is a direct API call rather
-than a subprocess -- measured 0.24 ms against 313 ms for the equivalent `icacls`
-invocation -- so it is safe to call on the gateway's event loop. Failure is
+than a subprocess, far cheaper than spawning `icacls`, so it is safe to call on the gateway's event loop. Failure is
 fail-loud (raises `OSError`) so the
 security-warning handlers in each caller fire — a naive `if IS_POSIX: os.chmod`
 guard would silently no-op on Windows, leaving secrets group/world-readable
@@ -444,8 +445,8 @@ state, so a read-only filesystem must not take init down.
 > direction is right — the home also holds the security policy, sessions and
 > lessons, all private on the same boundary — but it is wider than memory and it
 > is the only place in the tree that does it today. `memory.py`'s FTS index
-> (`memory_index.db`) and its sidecars carry the same secrets and are **not** yet
-> covered by the per-file pass.
+> (`memory_index.db`) and its sidecars carry the same secrets; `memory.py` runs
+> an owner-only pass on them in `MemoryStore._restrict_index_files`.
 
 ## File locking on Windows
 
@@ -539,17 +540,20 @@ On Linux, `sandbox.cgroup_scope_argv` bounds an agent subprocess and every
 descendant it spawns as one cgroup: `TasksMax` is the fork-bomb ceiling and
 `MemoryMax` the RSS-balloon ceiling. There is no systemd on Windows, so that
 wrapper returns argv unchanged and logs a one-time loud
-`SECURITY: cgroup v2 scope enforcement unavailable (not Linux)` — which meant the
-agent and every MCP server it spawned ran with **no fork-bomb and no memory
-ceiling at all**, a warning at boot rather than an enforced limit.
+`SECURITY: cgroup v2 scope enforcement unavailable (not Linux)`. On its own that
+would leave the agent and every MCP server it spawned with **no fork-bomb and no
+memory ceiling at all**, a warning at boot rather than an enforced limit.
 
 A **Job object** is the native equivalent: limits apply to every process in the
 job, and a member's descendants join automatically.
 `platform_compat.apply_job_limits` sets `ActiveProcessLimit` against the same
 budget as `TasksMax` and `JobMemoryLimit` against `MemoryMax`, and
 `sandbox.apply_windows_resource_ceiling` reads the **same** `resource_limits`
-config as the cgroup path, so one operator setting governs both platforms. The
-memory limits are equivalent; the process limits are not one-for-one, because
+config as the cgroup path, but the Job object enforces only two of its keys:
+`max_processes` and `max_memory_mb`. The others — `cpu_weight`,
+`max_cpu_percent`, `max_cpu_seconds`, `max_open_files`, `max_total_memory_mb`
+and `max_total_processes` — are accepted but inert on Windows, and the gateway
+logs one warning naming each one that is set. The memory limits are equivalent; the process limits are not one-for-one, because
 `TasksMax` counts every thread while `ActiveProcessLimit` counts processes — the
 same number is therefore a looser bound here, though it still bounds a fork
 bomb. The memory default is derived from `GlobalMemoryStatusEx` rather than the
@@ -626,8 +630,7 @@ Structure pins a brand-new pair of type objects on every call. The affected
 helpers are all polled — the dashboard's system-metrics endpoint, the RSS-recycle
 watchdog, the process-tree walk behind `kill_process_tree`, the MCP pipe's
 per-connection peer check, and the per-spawn Job object ceiling — so the gateway
-grew unboundedly on Windows alone (measured at ~8 KiB per `proc_rss_bytes` call,
-~15 MiB per 2,000 calls, never reclaimed). POSIX is unaffected because those
+would grow without bound on Windows alone, never reclaimed. POSIX is unaffected because those
 branches read `/proc`, `sysctl` or `resource` instead of calling Win32.
 
 Taking `ctypes.POINTER()` is what pins the type, so a struct that is only ever
@@ -638,12 +641,11 @@ POSIX fleet too, where the Windows branches never execute.
 
 ## The RSS-recycle ceiling measures real trees on Windows
 
-`session.watchdog_rss_max_mb` (default 1536 MiB; `0` disables) recycles a
+`session.watchdog_rss_max_mb` (default `0`, off) recycles a
 non-busy session whose process tree exceeds the ceiling. Its measurement is
-`/proc`-based, so `get_session_rss_mb` measured every tree as 0 MiB on Windows:
-the ceiling an operator had configured could never be reached and no session was
-ever recycled — a silent no-op rather than a visible failure. It now delegates
-there to `platform_compat.proc_rss_tree_mb_for_pid`.
+`/proc`-based on POSIX. On Windows `get_session_rss_mb` delegates to
+`platform_compat.proc_rss_tree_mb_for_pid`; a `/proc` read there would measure
+every tree as 0 MiB, so the ceiling could never be reached.
 
 That helper, **not** a Toolhelp parent->child walk, is the only safe route.
 `th32ParentProcessID` is never cleared when a parent exits and Windows recycles
@@ -653,8 +655,8 @@ validates every parent->child edge against exact creation/exit times across two
 snapshots, and treats an unreadable tree as `None` → 0 MiB so the ceiling never
 fires on a guess. The cost is one enumeration per candidate instead of the single
 shared `/proc` scan the POSIX sweep does per tick; `_build_child_map` therefore
-deliberately has no Windows branch. macOS still has no ctypes-only per-pid RSS
-path and keeps returning 0.
+deliberately has no Windows branch. macOS sums each process's footprint over
+libproc's live child lists (`platform_compat.darwin_footprint_tree_mb`).
 
 ## Directory links on Windows
 
@@ -684,13 +686,108 @@ stay Windows-skipped in `test/windows-expected-failures.txt`.
   relaunches itself once with software rendering
   (`--in-process-gpu --use-angle=swiftshader`) when the GPU process dies
   before the dashboard has loaded, and keeps that choice for the installed
-  version under `gpuSoftwareFallback` in `%APPDATA%\KiroCrew\config.json`; a
+  version under `gpuSoftwareFallback` in `%APPDATA%\kirocrew-desktop\config.json`; a
   new version tries hardware rendering again once. The launch log then reads
   `gpu: software rendering ACTIVE`. `--no-sandbox` is never applied: if the
   relaunched app still cannot start, every Chromium child is being blocked
   (typically an endpoint-security DLL injected into every process), which is a
   different failure and needs a process exclusion for the app, not a rendering
   switch.
+- **A gray/blank window that exits, while `kirocrew gateway` plus a browser
+  work fine** — that "different failure" above, seen from the other side:
+  Chromium cannot start a sandboxed child process on this device at all, so the
+  software-rendering relaunch does not help, because rendering is not what is
+  failing.
+
+  `gateway-launch.log` (in `%APPDATA%\kirocrew-desktop\logs\`; a nightly install
+  uses `kirocrew-desktop-nightly`) shows `renderer died` lines up to the reload
+  limit. The exit code they carry is commonly `-2147483645`, which
+  `chromium.log` beside it echoes as `exit_code=-2147483645`; that value is
+  `0x80000003` (`STATUS_BREAKPOINT`) in hex, and Event Viewer may show it as
+  unsigned `2147483651`. A different code does not rule this failure out — the
+  launch check below settles it, not the number. It is not a graphics fault and
+  not a shortcut or gateway problem: it is usually software that injects a DLL
+  into every process (endpoint security, or a display driver such as
+  DisplayLink), which the sandbox then refuses to admit.
+
+  The same exit code also appears when a renderer loads and *later* crashes,
+  which is an ordinary V8 abort and unrelated. What separates them is that this
+  failure never renders anything, not even the brief boot splash: a window that
+  showed the splash or the dashboard before dying is the V8 case, not this one,
+  and the launch check below does not rescue it either.
+
+  **First, confirm the sandbox is the failing component:** launch once with
+  `--no-sandbox`. If the dashboard loads, continue below. If it still fails the
+  sandbox is *not* the cause — try `KIROCREW_DISABLE_GPU=1` for a failing
+  GPU/rendering path, then a reinstall for a damaged install; an
+  endpoint-security exclusion cannot fix either. Do not keep `--no-sandbox`
+  either way: it removes renderer, GPU and utility isolation for every child
+  process, and it is a diagnostic rather than a setting.
+
+  <details>
+  <summary>How to pass a flag or set the variable on Windows</summary>
+
+  **Fully exit Kiro Crew first.** This step is not optional: the app is
+  single-instance, and a second launch hands its arguments to the instance
+  already running and then exits, so the flag is silently ignored while the
+  broken window still appears. Close it from the tray icon, then confirm no
+  `KiroCrew.exe` remains in Task Manager > Details.
+
+  **A one-off launch with a flag** — open Command Prompt and run the executable
+  with the flag, so nothing about the installed shortcut changes. To get the
+  exact path for *your* install, right-click the Start-menu entry and choose
+  **Open file location**, then copy the target; a nightly or side-by-side build
+  has a different product name, so do not assume the one below. On a normal
+  stable per-user install (`perMachine: false`, no choice of directory) it is:
+
+  ```
+  "%LOCALAPPDATA%\Programs\KiroCrew\KiroCrew.exe" --no-sandbox
+  ```
+
+  **A one-off launch with the variable**, in the same Command Prompt window, so
+  it applies to that launch only:
+
+  ```
+  set KIROCREW_DISABLE_GPU=1
+  "%LOCALAPPDATA%\Programs\KiroCrew\KiroCrew.exe"
+  ```
+
+  To keep `KIROCREW_DISABLE_GPU` for a host that genuinely has no usable GPU,
+  make it durable with `setx KIROCREW_DISABLE_GPU 1` (no elevation needed; it
+  applies to new processes, so restart the app) or through **System Properties >
+  Environment Variables**. Do **not** make `--no-sandbox` durable this way —
+  editing the shortcut's Target keeps an isolation downgrade in place
+  permanently: the installer preserves an existing shortcut on every update,
+  arguments included, so the edit outlives each new version until you undo it
+  by hand.
+
+  </details>
+
+  **The fix is a process exclusion for the Kiro Crew executable** in the
+  endpoint security product managing the device. That addresses the cause and
+  leaves the sandbox intact. To identify what to exclude, open Event Viewer >
+  Windows Logs > Application and read the faulting module name in the
+  `AppCrash` entry for the child process that died. Microsoft Edge uses the same
+  Chromium sandbox, so if Edge renders normally the sandbox itself works on that
+  device and the difference is that Edge is already excluded.
+
+  **There is deliberately no supported way to make the sandbox opt-out
+  durable.** A persistent switch would let anything running as the user disable
+  process isolation invisibly, and the narrower Chromium hardening switches are
+  not a usable substitute: their names are version-specific and silently ignored
+  when wrong, and the most-cited one
+  (`--disable-features=RendererCodeIntegrity`) has been a no-op since Chromium
+  118 even though the Chrome enterprise *policy* of the same name still works.
+
+  If instead the symptom is the agent's **`git`/`cr` commands** being killed
+  ("A process was blocked because malicious behavior was detected") while the
+  app window itself is fine, that is a different case: read the detection entry
+  in your security console to find the exact image path and detection id, then
+  ask whoever administers endpoint security to scope an exception to that pair.
+  The spawn mechanism described in
+  [endpoint-security-blocking-spawned-tools.md](endpoint-security-blocking-spawned-tools.md)
+  is macOS/Linux-specific, so use that guide's "durable fix" steps for scoping
+  the exception, not its explanation of the cause.
 - **Desktop gateway recovery refuses to force-stop the port** - the Electron
   launcher uses `netstat -ano` to identify the listener, PowerShell
   (`Get-CimInstance`) with a WMIC fallback to read its command line, and
@@ -727,9 +824,11 @@ stay Windows-skipped in `test/windows-expected-failures.txt`.
   defensive second signal. If it still finds nothing while the dashboard answers,
   locate the PID by hand with `netstat -ano | findstr :5476` and stop it with
   `taskkill /F /PID <pid>`.
-- **Web terminal / interactive SSO login panels** — unavailable on Windows
-  (they need `pty`/`fork`/`termios`); they return a clear "not supported on
-  Windows" response instead of crashing.
+- **Interactive SSO login panels** — unavailable on Windows (they need
+  `pty`/`fork`/`termios`); they return a clear "not supported on Windows"
+  response instead of crashing. The web terminal itself works here on a
+  ConPTY shell; only its tab title, completions and the live cwd handed to chat are POSIX-only (see
+  the per-feature table).
 
 ## Related
 

@@ -10,7 +10,10 @@ The generated default configuration is `~/.kiro/agents/kirocrew.json`. Its shipp
 - Built-in tools: shell, file, code-search, web, introspection, session, reporting, and tool-search tools.
 - `allowedTools` grants for selected safe tools and Kiro Crew MCP operations.
 - MCP servers: `kirocrew-cron` and `kirocrew-core`; `kirocrew-computer` is emitted only when computer use is enabled and supported on the current platform.
-- A `postToolUse` audit hook for shell calls.
+- A `postToolUse` audit hook for shell calls. It appends each command to
+  `audit.log` under the data home (`~/.kiro/crew` or `KIROCREW_HOME`); the gateway
+  (and a standalone `kirocrew chat`, at its start) rotates that file at 8 MiB,
+  keeping one previous generation as `audit.log.1`.
 
 ## Switching Agents
 
@@ -24,9 +27,9 @@ The generated default configuration is `~/.kiro/agents/kirocrew.json`. Its shipp
 ### Per-Thread (Slack)
 
 ```
-!ta set code-reviewer    # this thread uses code-reviewer
+!ta code-reviewer        # this thread uses code-reviewer
 !ta off                  # remove thread override
-!ta status               # show current thread agent
+!ta                      # show current thread agent
 ```
 
 ### Per-Tab (Dashboard)
@@ -45,7 +48,7 @@ Kiro Crew owns and rewrites a fixed set of specs; [agent-spec-fields.md](agent-s
 
 ## Custom Agents
 
-Custom agents are JSON or markdown files in `~/.kiro/agents/` (or a project's `.kiro/agents/`). They define their own system prompt, tools, MCP servers, and permissions. To create, edit or delete your own templates in the app, open **Agent Capabilities → Agent templates**: it lists every installed template by origin, edits the ones you own (description, model, prompt, tools, skills), duplicates a package or built-in template into one you own, and refuses to delete a template while a crewmate, the default agent, a schedule, a chat folder's default agent, a webhook token or a private copy still uses it — the refusal lists them. Deleting on disk also works: remove the file from `~/.kiro/agents/`. A crew still bound to a deleted name does not break: kiro-cli cannot resolve the missing spec and falls back to the default agent spec for that session, so the crew keeps running — with the default prompt and tools instead of the deleted template's. Check a template's bindings and repoint them before removing the file so no crew silently changes behavior.
+Custom agents are JSON or markdown files in `~/.kiro/agents/` (or a project's `.kiro/agents/`). They define their own system prompt, tools, MCP servers, and permissions. To create, edit or delete your own custom agents in the app, open **Customize → Custom agents**: it lists every installed custom agent by origin, edits the ones you own (description, model, prompt, tools, skills), duplicates a package or built-in one into one you own, and refuses to delete a custom agent while a crewmate, the default agent, a schedule, a chat folder's default agent, a webhook token or a private copy still uses it — the refusal lists them. Deleting on disk also works: remove the file from `~/.kiro/agents/`. A crew still bound to a deleted name does not break: kiro-cli cannot resolve the missing spec and falls back to the default agent spec for that session, so the crew keeps running — with the default prompt and tools instead of the deleted template's. Check a template's bindings and repoint them before removing the file so no crew silently changes behavior.
 
 ```json
 {
@@ -76,7 +79,7 @@ You review code changes. Keep every answer short.
 
 Rules that decide whether a `.md` file is an agent:
 
-- It must open with `---` on the first line and close the frontmatter with a line that is exactly `---`. A markdown file without that fence (a `README.md`, notes) is not an agent and is never listed.
+- It must open with `---` on the first line and close the frontmatter with a line that is exactly `---`. A markdown file without that fence (a `README.md`, notes) is not an agent and is never listed. A file that HAS the fence but fails to parse is not skipped: it announced itself as a spec, so it stays an unreadable spec and is reported as one.
 - The frontmatter must be a YAML mapping. Nested fields (`mcpServers`, `permissions`) work as in JSON.
 - The body is the prompt. A frontmatter `prompt` field is used only when the body is empty.
 - `<name>.json` and `<name>.md` side by side is the same agent twice. In Kiro Crew the JSON file wins and the markdown file is not read; the gateway log warns which file is shadowed. kiro-cli v3's own on-disk loader resolves the pair the other way round (checked against the loader bundled with kiro-cli 2.21.4: it reads files in name order and the later `.md` overwrites), so keep one file per name to get the same agent everywhere. If you kept a JSON copy as a workaround, delete one of the two.
@@ -94,11 +97,11 @@ What differs from a JSON agent:
 
 ## Managing Agents
 
-**Agent Capabilities → Agents** shows your agents; select one and open its **Template** pane to see its definition — model, system prompt, skills, tools, and MCP servers. Drop a new JSON or markdown file into `~/.kiro/agents/` and it appears automatically. `/agents` redirects to Agent Capabilities.
+**Customize → Crewmates** shows your crewmates; select one and open its **Built from** pane to see its definition — model, system prompt, skills, tools, and MCP servers. Drop a new JSON or markdown file into `~/.kiro/agents/` and it appears automatically. `/agents` redirects to Customize.
 
 ## Mapping Skills to an Agent
 
-Each agent template can be given its own set of [skills](skills.md). Open **Agent Capabilities → Agents**, select an agent, open its **Template** pane, and use the **Skills** section to add or remove them. Every edit saves immediately.
+Each agent template can be given its own set of [skills](skills.md). Open **Customize → Crewmates**, select a crewmate, open its **Built from** pane, and use the **Skills** section to add or remove them. Every edit saves immediately.
 
 Under the hood a mapped skill is a `skill://` entry in the agent's `resources`, so kiro-cli loads it natively when the agent starts:
 
@@ -107,7 +110,7 @@ Under the hood a mapped skill is a `skill://` entry in the agent's `resources`, 
   "name": "code-reviewer",
   "resources": [
     "file://.kiro/steering/**/*.md",
-    "skill://~/.kiro/skills/prepare-pr/SKILL.md"
+    "skill://~/.kiro/skills/kirocrew-prepare-pr/SKILL.md"
   ]
 }
 ```
@@ -123,6 +126,12 @@ Resolution rules:
 
 `file://` resources (steering globs) are never touched by the editor, and hand-authored `skill://` entries the editor cannot express — wildcards like `skill://~/.kiro/skills/*/SKILL.md`, or paths outside the known skill roots — are listed read-only and preserved across edits.
 
+What the Skills section shows:
+
+- When two installed package skills share a name, each chip and picker row adds a **Located in …** line naming that copy's directory, so you can tell which copy is mapped.
+- A mapped non-package skill with no installed copy shows as a warning chip, with a count under the list telling you to remove it and pick a replacement.
+- If the skill catalog cannot be read, the section shows **Could not load the skill catalog.** and **Add skill** is disabled.
+
 ## Agent Config Files
 
 | File | Purpose |
@@ -130,7 +139,7 @@ Resolution rules:
 | `src/kiro_crew/config/defaults.json` | Shipped base configuration. A development project can override it with `agents/defaults.json`. |
 | `src/kiro_crew/config/prompt.md` | Shipped system prompt. A development project can override it with `agents/prompt.md`. |
 | `~/.kiro/crew/agent.json` | Optional user overrides merged on top of defaults. |
-| `~/.kiro/crew/prompt.md` | Optional user prompt override, which takes priority over the shipped prompt. |
+| `~/.kiro/crew/prompt.md` | Optional user prompt override, which takes priority over the shipped prompt. It must be UTF-8: a file that is unreadable, misencoded (for example UTF-16 from PowerShell redirection) or refused falls back to the shipped prompt with a gateway WARNING. |
 | `~/.kiro/agents/kirocrew.json` | Installed generated agent configuration. |
 
 ## Reinstalling Agent Config

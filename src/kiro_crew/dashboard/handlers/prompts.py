@@ -45,7 +45,12 @@ from kiro_crew.skill_trust import (
     list_trusted_projects,
     revoke_project_trust,
 )
-from kiro_crew.skills import PROJECT_SKILL_BODY_CAP, PendingApprovalRefused
+from kiro_crew.skills import (
+    PROJECT_SKILL_BODY_CAP,
+    SKILL_READ_CAPACITY,
+    PendingApprovalRefused,
+    SkillReadRefusal,
+)
 from kiro_crew.validation import MAX_SKILL_KEY_CHARS
 
 from ._shared import (
@@ -82,6 +87,12 @@ _CODE_SLOT_NOT_FOUND = "slot_not_found"
 # the Skills tab can tell the user WHY the click did nothing instead of
 # swallowing one shapeless conflict answer.
 _CODE_PENDING_SKILL_NOT_FOUND = "pending_skill_not_found"
+# The detail read refused a candidate that is STILL STAGED. A distinct code because
+# the list applies none of the read's refusals, so that row remains: answering the
+# same `not_found` as a deleted candidate tells the user it was approved or dismissed
+# elsewhere while it sits in front of them, and leaves the one action that does apply
+# (dismiss it) looking like the wrong one.
+_CODE_PENDING_SKILL_UNREADABLE = "pending_skill_unreadable"
 _CODE_LIVE_SKILL_EXISTS = "live_skill_exists"
 _CODE_SCRIPT_VALIDATION_FAILED = "script_validation_failed"
 _CODE_PENDING_APPROVAL_REFUSED = "pending_approval_refused"
@@ -101,10 +112,10 @@ def _deny_non_owner_skill_operation(request: web.Request, operation: str) -> web
     """Restrict owner-only skill state to the configured dashboard owner.
 
     Covers the project-skill consent endpoints and every mutating skill
-    handler: CRUD writes, pending approve/dismiss/dismiss-all, pin, and
-    inject-on-trigger. Skill content is injected into agent context, so any
-    skill mutation is an instruction-injection surface: only the dashboard
-    owner may perform it.
+    handler: CRUD writes, pending approve/dismiss/dismiss-all, pin,
+    inject-on-trigger, and the registry install in ``discover.py``. Skill
+    content is injected into agent context, so any skill mutation is an
+    instruction-injection surface: only the dashboard owner may perform it.
     ``is_owner_dashboard_request`` already refuses app tokens (any non-empty
     app identity) and non-owner dashboard subjects, and both outcomes are
     SEL-audited here.
@@ -2273,12 +2284,26 @@ async def api_skills(request: web.Request) -> web.Response:
                 status=400,
             )
         try:
-            limit = max(1, min(50, int(params.get("limit", "20"))))
             offset = max(0, int(params.get("offset", "0")))
+            # A read pages in LINES and only when asked: the whole-or-refuse contract
+            # holds for a call that names neither parameter, and ``limit`` here is
+            # lines rather than the result count search and list bound at 50.
+            paging = action == "read" and ("offset" in params or "limit" in params)
+            page_limit = max(1, int(params["limit"])) if paging and "limit" in params else None
+            # The caller may SHRINK the capacity to what its own response framing
+            # leaves for the body; the ceiling itself is not the caller's to move.
+            capacity = max(
+                1, min(SKILL_READ_CAPACITY, int(params.get("capacity", SKILL_READ_CAPACITY)))
+            )
+            limit = 1 if action == "read" else max(1, min(50, int(params.get("limit", "20"))))
         except (ValueError, TypeError, OverflowError):
             return web.json_response(
                 {"error": "Invalid search limit.", "code": "invalid_limit"}, status=400
             )
+        # The skill_search tool reads through POST. The GET read stays for
+        # compatibility, and its reader may be a script or a person, so it
+        # does not count as a model load.
+        model_read = request.method == "POST"
 
         def search():
             slot = _named_slot(state, session_key)
@@ -2290,16 +2315,38 @@ async def api_skills(request: web.Request) -> web.Response:
                     agent = active
             only = session_skill_globs(session_key, agent, project_dir=project_dir)
             if action == "read":
-                body = skills.read_scoped_skill(key, only=only, project_dir=project_dir)
-                return {
-                    "matches": (
-                        [{"key": key, "name": key, "description": "", "content": body}]
-                        if body is not None
-                        else []
-                    ),
-                    "next_offset": None,
+                outcome = skills.read_scoped_skill_page(
+                    key,
+                    only=only,
+                    project_dir=project_dir,
+                    offset=offset if paging else None,
+                    limit=page_limit,
+                    capacity=capacity,
+                )
+                if isinstance(outcome, SkillReadRefusal):
+                    return {"matches": [], "next_offset": None, "refusal": outcome._asdict()}
+                if model_read and offset == 0:
+                    # An exact read hands the model the body it asked for, the
+                    # same delivery a `$name` token credits. A paged read is one
+                    # load, so only the page that starts at the body's first
+                    # line credits it. Search and list rows are candidates, not
+                    # a chosen load, so they credit nothing, even a confined
+                    # project row that carries its body.
+                    skills.credit_skill_reads([key])
+                match: dict[str, Any] = {
+                    "key": key,
+                    "name": key,
+                    "description": "",
+                    "content": outcome.content,
                 }
-            matches = skills.search_skills(
+                if paging:
+                    match["page"] = {
+                        field: value
+                        for field, value in outcome._asdict().items()
+                        if field != "content"
+                    }
+                return {"matches": [match], "next_offset": None}
+            report = skills.search_skills_report(
                 query,
                 limit=limit + 1,
                 project_dir=project_dir,
@@ -2307,6 +2354,7 @@ async def api_skills(request: web.Request) -> web.Response:
                 offset=offset,
                 browse=action == "list",
             )
+            matches = report.matches
             next_offset = offset + limit if len(matches) > limit else None
             matches = matches[:limit]
             result = []
@@ -2326,7 +2374,7 @@ async def api_skills(request: web.Request) -> web.Response:
             return {
                 "matches": result,
                 "next_offset": next_offset,
-                "incomplete": bool(getattr(skills, "search_incomplete", False)),
+                "incomplete": report.incomplete,
             }
 
         try:
@@ -2720,7 +2768,30 @@ async def api_skill_pending_detail(request: web.Request) -> web.Response:
         metadata={"slug": slug},
     )
     if detail is None:
-        return web.json_response({"error": "not found"}, status=404)
+        # Two situations, two codes. The pinned read refuses a candidate whose tree is
+        # not plain files and directories, and `list_pending_skills` applies none of
+        # those refusals -- so that candidate's ROW REMAINS while this answers 404. One
+        # shared code would have the panel tell the user it was approved or dismissed
+        # elsewhere, which is false and points them away from the one action that does
+        # apply. The probe is by name and runs only after the read already refused, so
+        # losing its race changes the MESSAGE and never grants a read.
+        staged = await asyncio.get_running_loop().run_in_executor(
+            discovery_executor(), skills.pending_candidate_is_staged, slug
+        )
+        if staged:
+            return web.json_response(
+                {
+                    "error": (
+                        "this candidate is still pending, but its files are not a plain "
+                        "directory, so it cannot be read safely"
+                    ),
+                    "code": _CODE_PENDING_SKILL_UNREADABLE,
+                },
+                status=404,
+            )
+        return web.json_response(
+            {"error": "not found", "code": _CODE_PENDING_SKILL_NOT_FOUND}, status=404
+        )
     # Update candidates carry an approval PREVIEW so the UI can show exactly what
     # approving would change: the target's current live body, the proposed
     # post-approval content, and a unified diff between them (computed
@@ -2937,11 +3008,11 @@ async def api_skill_pending_dismiss(request: web.Request) -> web.Response:
 async def api_skills_pending_dismiss_all(request: web.Request) -> web.Response:
     """POST /api/skills/-/pending/-/dismiss-all — dismiss pending candidates.
 
-    Accepts an optional JSON body ``{"slugs": ["slug1", ...]}``.  When present,
-    only those slugs are dismissed (the client passes the set it displayed to the
+    Requires a JSON body ``{"slugs": ["slug1", ...]}`` with a non-empty array.
+    Only those slugs are dismissed (the client passes the set it displayed to the
     user, so a candidate staged *after* the confirmation dialog is never silently
-    deleted).  When the body is absent or ``slugs`` is empty, ALL pending
-    candidates are dismissed (back-compat / fallback).
+    deleted). When the body is absent or ``slugs`` is missing or empty, the route
+    returns 400 ``slugs_required`` and dismisses nothing.
     """
     denied = _deny_non_owner_skill_operation(request, "skill_pending_dismiss_all")
     if denied is not None:
@@ -3379,6 +3450,12 @@ async def api_skills_create(request: web.Request) -> web.Response:
     if not safe_name:
         return web.json_response(
             {"error": "invalid skill name", "code": "invalid_name"}, status=400
+        )
+    # Sanitizing imposes no length bound, so bound it here — on the WHOLE name,
+    # since nesting (``a/b/c``) blows PATH_MAX or mkdir's recursion on short segments.
+    if len(safe_name.encode("utf-8")) > MAX_PROMPT_NAME_BYTES:
+        return web.json_response(
+            {"error": "skill name is too long", "code": "name_too_long"}, status=400
         )
     # Refuse creating into the open-standard read-only territories. Checked on
     # the SANITISED name because that is what create_skill would write (e.g.

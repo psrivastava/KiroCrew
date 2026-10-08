@@ -1890,11 +1890,10 @@ class TestTheActionHeaderIsRedacted:
         """Why the two halves are redacted SEPARATELY rather than as one joined string.
 
         ``render_tree`` appends its screenshot note AFTER its own redaction pass, on
-        purpose: the per-user temp dir macOS hands a process contains a long random
-        segment that ``redact_credentials``' bare-secret-key heuristic matches, so a
-        pass over the joined text would replace every screenshot path with a
-        placeholder and the channel would silently never work (verified live; see
-        ``render._render_image_note``).
+        purpose: the spool path must reach the model byte-exact, and
+        ``redact_credentials``' bare-secret-key heuristic reads a path as one
+        base64-alphabet run, so a pass over the joined text would expose every
+        screenshot path to it (see ``render._render_image_note``).
 
         So the fix redacts the HEADER only and leaves the already-redacted body
         untouched. Asserted structurally, because the behavioural shape is not
@@ -2472,6 +2471,8 @@ class TestUnresolvedKeysAreNeverDeclared:
                     {
                         "has_session_header": "X-Session-Key" in self.headers,
                         "session_header": self.headers.get("X-Session-Key"),
+                        "has_token_header": "X-Session-Token" in self.headers,
+                        "token_header": self.headers.get("X-Session-Token"),
                         "body": json.loads(raw),
                     }
                 )
@@ -2525,6 +2526,35 @@ class TestUnresolvedKeysAreNeverDeclared:
         hit = self._invoke_through(monkeypatch, "dashboard:main")
         assert hit["session_header"] == "dashboard:main"
         assert hit["body"]["session_key"] == "dashboard:main"
+
+    def test_a_declared_key_carries_its_session_token(self, monkeypatch):
+        """HEADLINE: the token travels WITH the key, at the wire.
+
+        On a pid hosting several sessions the peer check cannot tell which of them
+        holds the socket from kernel credentials, so it requires a token naming
+        exactly the declared key and refuses the declaration otherwise. Without
+        this header every computer-use call on a shared runtime is refused -- the
+        founder's included, which worked before that demand existed. Asserted on a
+        real listener so a refactor that rebuilds the header dict cannot drop it
+        silently, which is how it was missing in the first place.
+        """
+        monkeypatch.setattr(
+            mcp_computer, "_session_token_header", lambda: {"X-Session-Token": "a-signed-token"}
+        )
+        hit = self._invoke_through(monkeypatch, "dashboard:main")
+        assert hit["session_header"] == "dashboard:main"
+        assert hit["token_header"] == "a-signed-token"
+
+    def test_an_undeclared_key_sends_no_token_either(self, monkeypatch):
+        """The converse: the token is an attestation OF a declaration, so it must
+        not travel alone. Sending one where no key is claimed would offer the
+        gateway an identity the caller deliberately withheld."""
+        monkeypatch.setattr(
+            mcp_computer, "_session_token_header", lambda: {"X-Session-Token": "a-signed-token"}
+        )
+        hit = self._invoke_through(monkeypatch, mcp_computer._unresolved_session_key())
+        assert hit["has_session_header"] is False, hit
+        assert hit["has_token_header"] is False, hit
 
     def test_the_call_path_routes_an_unresolved_identity_without_a_header(
         self, keystone: Path, monkeypatch

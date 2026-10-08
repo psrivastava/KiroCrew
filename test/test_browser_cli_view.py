@@ -11,6 +11,7 @@ import socket
 import threading
 import time
 from collections.abc import Iterator
+from types import SimpleNamespace
 
 import pytest
 
@@ -22,7 +23,11 @@ _REAL_PROCESS_OWNS_LOOPBACK_LISTENER = platform_compat.process_owns_loopback_lis
 
 
 class FakeProc:
-    """Stand-in for the supervised child; never touches a real process."""
+    """Stand-in for the supervised child; never touches a real process.
+
+    It also stands in for the ``_Child`` record ``_spawn`` returns (``proc``
+    is itself, ``binding`` its spawn proof), so prover tests hand it in directly.
+    """
 
     def __init__(self, alive: bool = True, pid: int = 424242, stdout: bytes = b"") -> None:
         self.pid = pid
@@ -38,7 +43,9 @@ class FakeProc:
             platform_compat.ProcessIdentitySource.ATOMIC,
         )
         setattr(proof, "cli_version", "0.1.99")
-        setattr(self, "_kirocrew_browser_view_binding", proof)
+        self.proc = self
+        self.binding = proof
+        self.owner_identity: object = None
 
     def poll(self) -> int | None:
         return None if self._alive else self.returncode
@@ -76,11 +83,10 @@ class _FakeClock:
 def reset_state(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[int]]:
     """Clear the module singleton and neutralize real process signalling."""
     signalled: list[int] = []
-    monkeypatch.setattr(mod, "_proc", None)
-    monkeypatch.setattr(mod, "_info", None)
+    monkeypatch.setattr(mod, "_child", None)
     monkeypatch.setattr(mod, "_relay", None)
-    monkeypatch.setattr(mod, "_child_port", None)
     monkeypatch.setattr(mod, "_last_reason", None)
+    monkeypatch.setattr(mod, "_proof_cache", None, raising=False)
     monkeypatch.setattr(mod, "_listener_lookup_self_test_cache", None, raising=False)
     monkeypatch.setattr(
         mod,
@@ -115,10 +121,8 @@ def reset_state(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[int]]:
         lambda pid, sig=platform_compat.SIGTERM: signalled.append(pid) or True,
     )
     yield signalled
-    mod._proc = None
-    mod._info = None
+    mod._child = None
     mod._relay = None
-    mod._child_port = None
     mod._last_reason = None
 
 
@@ -179,10 +183,632 @@ def _stub_port_owner(
     )
 
 
+def _child_record(proc: FakeProc, port: int | None) -> mod._Child:
+    """The record ``ensure_running`` installs once it adopts *proc* on *port*."""
+    info = mod.ShowInfo(f"http://127.0.0.1:{port}", port) if port is not None else None
+    return mod._Child(proc=proc, binding=proc.binding, child_port=port, info=info)
+
+
+def _recorded_proc() -> FakeProc | None:
+    return mod._child.proc if mod._child is not None else None
+
+
+def _recorded_info() -> mod.ShowInfo | None:
+    return mod._child.info if mod._child is not None else None
+
+
+def _recorded_child_port() -> int | None:
+    return mod._child.child_port if mod._child is not None else None
+
+
 def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))
         return int(s.getsockname()[1])
+
+
+def _record_relay_target(
+    monkeypatch: pytest.MonkeyPatch,
+    proc: FakeProc,
+    port: int,
+    token: str = "relay-capability",
+) -> None:
+    monkeypatch.setattr(mod, "_child", _child_record(proc, port))
+    monkeypatch.setattr(mod, "_relay_token", token)
+
+
+def test_relay_target_invalidates_token_when_child_is_dead(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proc = FakeProc(alive=False)
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as squatter:
+        squatter.bind((mod.LOOPBACK_HOST, 0))
+        squatter.listen()
+        port = int(squatter.getsockname()[1])
+        _record_relay_target(monkeypatch, proc, port)
+
+        assert mod.relay_target() is None
+        assert mod._relay_token is None
+        assert _recorded_info() is None
+        assert _recorded_child_port() is None
+        # The same live listener cannot inherit the dead child's capability.
+        assert mod.relay_target() is None
+
+
+def test_relay_target_preserves_state_when_ownership_is_inconclusive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proc = FakeProc()
+    port = 45613
+    _record_relay_target(monkeypatch, proc, port)
+    monkeypatch.setattr(mod, "_root_process_identity_matches", lambda child, phase: None)
+    monkeypatch.setattr(
+        mod,
+        "_verify_child_listener",
+        lambda *args, **kwargs: pytest.fail("inconclusive root identity must stop the proof"),
+    )
+
+    assert mod.relay_target() is None
+    assert _recorded_proc() is proc
+    assert _recorded_info() == mod.ShowInfo("http://127.0.0.1:45613", port)
+    assert _recorded_child_port() == port
+    assert mod._relay_token == "relay-capability"
+
+
+def test_relay_target_returns_pair_when_current_ownership_is_proven(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proc = FakeProc()
+    port = 45613
+    _record_relay_target(monkeypatch, proc, port)
+    monkeypatch.setattr(mod, "_root_process_identity_matches", lambda child, phase: True)
+    monkeypatch.setattr(
+        mod,
+        "_verify_child_listener",
+        lambda child, child_port, *, allow_report, proof_not_before=None: (True, False),
+    )
+    monkeypatch.setattr(
+        mod,
+        "_healthy",
+        lambda child_port: pytest.fail("relay target lookup must not make an HTTP health probe"),
+    )
+
+    assert mod.relay_target() == (port, "relay-capability")
+
+
+def test_relay_authorize_never_probes_for_a_mismatched_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The pre-auth cost finding: the constant-time token comparison comes
+    # FIRST, so an unauthenticated bad-token flood can never buy the OS-level
+    # process/listener probes (which run under the supervisor lock and would
+    # serialize gateway work).
+    proc = FakeProc()
+    port = 45613
+    _record_relay_target(monkeypatch, proc, port)
+    monkeypatch.setattr(
+        mod,
+        "_root_process_identity_matches",
+        lambda child, phase: pytest.fail("ownership probe ran before token validation"),
+    )
+    monkeypatch.setattr(
+        mod,
+        "_verify_child_listener",
+        lambda *args, **kwargs: pytest.fail("listener probe ran before token validation"),
+    )
+
+    assert mod.relay_authorize("WRONG-token") == ("token_mismatch", None)
+    # A mismatch is not an ownership failure: recorded state survives intact.
+    assert _recorded_proc() is proc
+    assert mod._relay_token == "relay-capability"
+    assert _recorded_child_port() == port
+
+
+def test_relay_authorize_answers_view_down_without_probing_when_nothing_recorded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(mod, "_child", None)
+    monkeypatch.setattr(mod, "_relay_token", None)
+    monkeypatch.setattr(
+        mod,
+        "_root_process_identity_matches",
+        lambda child, phase: pytest.fail("ownership probe ran with nothing recorded"),
+    )
+
+    assert mod.relay_authorize("anything") == ("view_down", None)
+
+
+def test_relay_authorize_refuses_as_busy_instead_of_parking_on_a_held_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The availability finding: ensure_running holds the supervisor lock
+    # across its startup poll (up to 30s). Invalid candidates never reach the
+    # lock at all (see the instant-refusal test below), so the bound protects
+    # the callers who remain: even the RIGHT token must be refused within the
+    # bound — never parked on the shared pool — while a start holds the lock,
+    # because the instance that minted that token is being replaced.
+    proc = FakeProc()
+    port = 45613
+    _record_relay_target(monkeypatch, proc, port)
+    monkeypatch.setattr(mod, "_AUTHORIZE_ACQUIRE_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(
+        mod,
+        "_root_process_identity_matches",
+        lambda child, phase: pytest.fail("ownership probe ran for a busy refusal"),
+    )
+    monkeypatch.setattr(
+        mod,
+        "_verify_child_listener",
+        lambda *args, **kwargs: pytest.fail("listener probe ran for a busy refusal"),
+    )
+
+    assert mod._lock.acquire()
+    try:
+        started = time.monotonic()
+        # Even the RIGHT token is refused while the lock is held: a start in
+        # progress is replacing the instance the token belongs to.
+        outcome = mod.relay_authorize("relay-capability")
+        elapsed = time.monotonic() - started
+    finally:
+        mod._lock.release()
+
+    assert outcome == ("busy", None)
+    assert elapsed < 1.0
+    # Busy is a wait verdict, not a proof: recorded state survives intact.
+    assert _recorded_proc() is proc
+    assert mod._relay_token == "relay-capability"
+    assert _recorded_child_port() == port
+
+
+def test_relay_authorize_returns_port_and_probes_after_token_match(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proc = FakeProc()
+    port = 45613
+    probed: list[str] = []
+    _record_relay_target(monkeypatch, proc, port)
+
+    def _identity(child: object, phase: str) -> bool:
+        probed.append("identity")
+        return True
+
+    def _listener(
+        child: object,
+        child_port: int,
+        *,
+        allow_report: bool,
+        proof_not_before: float | None = None,
+    ) -> tuple[bool, bool]:
+        probed.append("listener")
+        return True, False
+
+    monkeypatch.setattr(mod, "_root_process_identity_matches", _identity)
+    monkeypatch.setattr(mod, "_verify_child_listener", _listener)
+    monkeypatch.setattr(
+        mod,
+        "_healthy",
+        lambda child_port: pytest.fail("relay authorization must not make an HTTP health probe"),
+    )
+
+    assert mod.relay_authorize("relay-capability") == ("ok", port)
+    # The proof DID run — for the token holder, and only after the match.
+    assert probed == ["identity", "listener"]
+
+
+def test_relay_authorize_matched_token_dead_child_tears_down_and_invalidates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Same payoff as relay_target's teardown, reached through the authorize
+    # path: a matched token whose child died definitively kills the recorded
+    # state and the token itself before a squatter can inherit the port.
+    proc = FakeProc(alive=False)
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as squatter:
+        squatter.bind((mod.LOOPBACK_HOST, 0))
+        squatter.listen()
+        port = int(squatter.getsockname()[1])
+        _record_relay_target(monkeypatch, proc, port)
+
+        assert mod.relay_authorize("relay-capability") == ("ownership_unproven", None)
+        assert mod._relay_token is None
+        assert _recorded_info() is None
+        assert _recorded_child_port() is None
+        # The invalidated capability now compares against nothing: the same
+        # token answers view_down, and the squatter never becomes reachable.
+        assert mod.relay_authorize("relay-capability") == ("view_down", None)
+
+
+def test_relay_authorize_matched_token_inconclusive_preserves_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proc = FakeProc()
+    port = 45613
+    _record_relay_target(monkeypatch, proc, port)
+    monkeypatch.setattr(mod, "_root_process_identity_matches", lambda child, phase: None)
+    monkeypatch.setattr(
+        mod,
+        "_verify_child_listener",
+        lambda *args, **kwargs: pytest.fail("inconclusive root identity must stop the proof"),
+    )
+
+    assert mod.relay_authorize("relay-capability") == ("ownership_unproven", None)
+    # Withheld, not destroyed: a later request may retry once the proof can
+    # complete.
+    assert _recorded_proc() is proc
+    assert mod._relay_token == "relay-capability"
+    assert _recorded_child_port() == port
+
+
+def test_relay_authorize_refuses_invalid_candidates_instantly_while_lock_held(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The pre-auth executor-exhaustion finding: the earlier design compared
+    # the token UNDER the lock, so every bad-token request arriving during a
+    # start window still parked on the bounded acquire — a flood multiplied
+    # that bound into exhaustion of the shared thread pool. The lock-free
+    # pre-check refuses an invalid candidate without touching the lock: held
+    # or not, it answers immediately.
+    proc = FakeProc()
+    port = 45613
+    _record_relay_target(monkeypatch, proc, port)
+    # Deliberately NOT shortened: the refusal must not depend on the bound.
+    assert mod._AUTHORIZE_ACQUIRE_TIMEOUT_S >= 1.0
+    monkeypatch.setattr(
+        mod,
+        "_root_process_identity_matches",
+        lambda child, phase: pytest.fail("ownership probe ran for an invalid candidate"),
+    )
+
+    assert mod._lock.acquire()
+    try:
+        started = time.monotonic()
+        mismatch = mod.relay_authorize("WRONG-token")
+        monkeypatch.setattr(mod, "_relay_token", None)
+        down = mod.relay_authorize("anything")
+        elapsed = time.monotonic() - started
+    finally:
+        mod._lock.release()
+
+    assert mismatch == ("token_mismatch", None)
+    # The first-start window (nothing recorded yet) is the likeliest flood
+    # target, and it answers just as instantly.
+    assert down == ("view_down", None)
+    # No bounded wait was paid for either: the pool thread frees immediately.
+    assert elapsed < 0.5
+
+
+def test_relay_authorize_runs_ownership_probes_outside_the_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The serialization finding: the probes spawn ps/lsof and cost tens of
+    # milliseconds, and running them under the supervisor lock queued every
+    # concurrent asset fetch behind one request's probes (and behind the
+    # status poll's own hold). They must run with the lock RELEASED, on a
+    # snapshot taken under one hold.
+    proc = FakeProc()
+    port = 45613
+    _record_relay_target(monkeypatch, proc, port)
+
+    def _identity(child: object, phase: str) -> bool:
+        if not mod._lock.acquire(blocking=False):
+            pytest.fail("root-identity probe ran under the supervisor lock")
+        mod._lock.release()
+        return True
+
+    def _listener(
+        child: object,
+        child_port: int,
+        *,
+        allow_report: bool,
+        proof_not_before: float | None = None,
+    ) -> tuple[bool, bool]:
+        if not mod._lock.acquire(blocking=False):
+            pytest.fail("listener probe ran under the supervisor lock")
+        mod._lock.release()
+        return True, False
+
+    monkeypatch.setattr(mod, "_root_process_identity_matches", _identity)
+    monkeypatch.setattr(mod, "_verify_child_listener", _listener)
+
+    assert mod.relay_authorize("relay-capability") == ("ok", port)
+    # relay_target shares the helper and the contract: same probes, same
+    # lock-free execution, one consistent snapshot.
+    assert mod.relay_target() == (port, "relay-capability")
+
+
+def test_relay_authorize_definitive_failure_spares_a_replaced_instance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The proofs run outside the lock on a snapshot, so by the time one
+    # fails definitively a stop/start cycle may have recorded a NEW child.
+    # Tearing down blindly would kill the new instance's target on the
+    # strength of the old one's corpse: the teardown re-checks under the
+    # lock that the state still describes the instance that failed.
+    old = FakeProc()
+    port = 45613
+    _record_relay_target(monkeypatch, old, port)
+    replacement = FakeProc()
+
+    def _identity(child: object, phase: str) -> bool:
+        # A restart completes while the old snapshot's proof is in flight.
+        mod._child = _child_record(replacement, port + 1)
+        mod._relay_token = "fresh-capability"
+        return False
+
+    monkeypatch.setattr(mod, "_root_process_identity_matches", _identity)
+
+    assert mod.relay_authorize("relay-capability") == ("ownership_unproven", None)
+    # The replacement instance's recorded target survives intact.
+    assert _recorded_proc() is replacement
+    assert mod._relay_token == "fresh-capability"
+    assert _recorded_child_port() == port + 1
+
+
+def test_concurrent_provers_are_serialized_and_share_one_proof(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The per-proc identity-proof slot protocol (record→take, cleared on
+    # entry) tolerates exactly one prover at a time. Two provers must
+    # serialize on the gate, and the one that waited must consume the
+    # leader's cached verdict instead of proving again.
+    proc = FakeProc()
+    port = 45613
+    entered = threading.Event()
+    release = threading.Event()
+    runs: list[str] = []
+    inside = threading.Lock()
+
+    def _gated(child: object, child_port: int, *, allow_report: bool) -> tuple[bool | None, bool]:
+        assert inside.acquire(blocking=False), "two provers ran concurrently"
+        try:
+            runs.append("proof")
+            entered.set()
+            assert release.wait(timeout=5)
+            return True, False
+        finally:
+            inside.release()
+
+    monkeypatch.setattr(mod, "_verify_child_listener_gated", _gated)
+    results: list[tuple[bool | None, bool]] = []
+
+    def _call() -> None:
+        results.append(mod._verify_child_listener(proc, port, allow_report=False))
+
+    leader = threading.Thread(target=_call)
+    waiter = threading.Thread(target=_call)
+    leader.start()
+    assert entered.wait(timeout=5)
+    waiter.start()
+    # The waiter must park at the gate while the leader is mid-proof.
+    waiter.join(timeout=0.2)
+    assert waiter.is_alive(), "second prover was not serialized behind the gate"
+    assert runs == ["proof"]
+    release.set()
+    leader.join(timeout=5)
+    waiter.join(timeout=5)
+    assert not leader.is_alive() and not waiter.is_alive()
+    # Single-flight: the waiter consumed the leader's verdict from the cache.
+    assert results == [(True, False), (True, False)]
+    assert runs == ["proof"]
+
+
+def test_concurrent_relay_authorize_never_clobbers_the_proof_slot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The regression Opus named: parallel relay requests through the REAL
+    # record→take slot protocol. Un-serialized, one prover's clearing take
+    # lands inside another's record→take window — a live child reads as a
+    # definitive FALSE and the view is torn down mid-load. Serialized and
+    # cached, every concurrent request authorizes and state survives.
+    proc = FakeProc()
+    port = 45613
+    _record_relay_target(monkeypatch, proc, port)
+    _stub_port_owner(monkeypatch, listener_pids=(proc.pid,))
+
+    results: list[tuple[str, int | None]] = []
+    lock = threading.Lock()
+
+    def _call() -> None:
+        outcome = mod.relay_authorize("relay-capability")
+        with lock:
+            results.append(outcome)
+
+    threads = [threading.Thread(target=_call) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+    assert results == [("ok", port)] * 8
+    # No clobber-induced teardown: the recorded target and token survive.
+    assert _recorded_proc() is proc
+    assert mod._relay_token == "relay-capability"
+    assert _recorded_child_port() == port
+
+
+def test_listener_verdicts_are_cached_within_ttl_then_reproved(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proc = FakeProc()
+    port = 45613
+    clock = _FakeClock()
+    monkeypatch.setattr(mod, "time", clock)
+    runs: list[float] = []
+
+    def _gated(child: object, child_port: int, *, allow_report: bool) -> tuple[bool | None, bool]:
+        runs.append(clock.now)
+        return True, False
+
+    monkeypatch.setattr(mod, "_verify_child_listener_gated", _gated)
+
+    assert mod._verify_child_listener(proc, port, allow_report=False) == (True, False)
+    assert mod._verify_child_listener(proc, port, allow_report=False) == (True, False)
+    assert len(runs) == 1  # second call consumed the cached verdict
+    clock.now += mod._PROOF_CACHE_TTL_S + 0.1
+    assert mod._verify_child_listener(proc, port, allow_report=False) == (True, False)
+    assert len(runs) == 2  # TTL expired — proved afresh
+
+
+def test_proof_not_before_fence_refuses_older_cached_verdicts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The post-connect re-proof's bracketing invariant: a proof started
+    # before the connect can never vouch for it, however fresh the TTL says
+    # it is. Only a proof started strictly after the fence is consumable.
+    proc = FakeProc()
+    port = 45613
+    clock = _FakeClock()
+    monkeypatch.setattr(mod, "time", clock)
+    runs: list[float] = []
+
+    def _gated(child: object, child_port: int, *, allow_report: bool) -> tuple[bool | None, bool]:
+        runs.append(clock.now)
+        return True, False
+
+    monkeypatch.setattr(mod, "_verify_child_listener_gated", _gated)
+
+    assert mod._verify_child_listener(proc, port, allow_report=False) == (True, False)
+    assert runs == [0.0]  # cache warmed at t=0
+    clock.now = 0.1
+    verdict = mod._verify_child_listener(proc, port, allow_report=False, proof_not_before=0.05)
+    assert verdict == (True, False)
+    assert runs == [0.0, 0.1]  # t=0 proof predates the fence — proved afresh
+    verdict = mod._verify_child_listener(proc, port, allow_report=False, proof_not_before=0.05)
+    assert verdict == (True, False)
+    assert runs == [0.0, 0.1]  # t=0.1 proof started after the fence — consumed
+
+
+def test_fence_refuses_a_proof_started_on_the_fence_instant(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The coarse-clock case, exactly as Windows produces it: monotonic ticks
+    # at ~15.6ms (GetTickCount64 under Python 3.12), so a proof's start and a
+    # later caller's fence land on the SAME clock reading even though the
+    # fence is physically later. Equality must refuse — the proof's evidence
+    # may predate the fence within the tick — and the caller re-proves.
+    # Deterministic distillation of the status-poll re-probe tests that fail
+    # on Windows when equality serves (shard-5:
+    # test_two_status_calls_run_one_self_test_after_the_target_probe,
+    # test_status_does_not_report_a_squatter_as_running).
+    proc = FakeProc()
+    port = 45613
+    clock = _FakeClock()
+    clock.now = 1.0
+    monkeypatch.setattr(mod, "time", clock)
+    runs: list[float] = []
+
+    def _gated(child: object, child_port: int, *, allow_report: bool) -> tuple[bool | None, bool]:
+        runs.append(clock.now)
+        return True, False
+
+    monkeypatch.setattr(mod, "_verify_child_listener_gated", _gated)
+
+    assert mod._verify_child_listener(proc, port, allow_report=False) == (True, False)
+    assert runs == [1.0]  # cache warmed: start stamp == 1.0
+    # Fence captured on the same tick as the cached proof's start.
+    verdict = mod._verify_child_listener(proc, port, allow_report=False, proof_not_before=1.0)
+    assert verdict == (True, False)
+    assert runs == [1.0, 1.0]  # equality refused the cache — proved afresh
+
+
+def test_fence_refuses_a_proof_that_started_before_it_but_completed_after(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The cache stamp is the proof's START, captured before any evidence
+    # gathering: a proof whose ps/lsof evidence predates the fence must not
+    # satisfy the fence merely by COMPLETING after it. Here the proof runs
+    # from t=1.0 to t=2.0 and the fence is captured mid-proof at t=1.5: the
+    # cached verdict carries stamp 1.0, is refused, and one fresh proof runs
+    # — refusal never loops, because the fresh proof satisfies the caller's
+    # fence by program order (the fence is captured before the call begins).
+    proc = FakeProc()
+    port = 45613
+    clock = _FakeClock()
+    clock.now = 1.0
+    monkeypatch.setattr(mod, "time", clock)
+    runs: list[float] = []
+
+    def _gated(child: object, child_port: int, *, allow_report: bool) -> tuple[bool | None, bool]:
+        runs.append(clock.now)
+        clock.now += 1.0  # evidence gathering spans a full unit of time
+        return True, False
+
+    monkeypatch.setattr(mod, "_verify_child_listener_gated", _gated)
+
+    assert mod._verify_child_listener(proc, port, allow_report=False) == (True, False)
+    assert runs == [1.0]  # proof ran t=1.0→2.0; stamp must be the START
+    # A connect completed at t=1.5, mid-proof; its re-proof fence is 1.5.
+    verdict = mod._verify_child_listener(proc, port, allow_report=False, proof_not_before=1.5)
+    assert verdict == (True, False)
+    # The t=1.0-started proof is refused despite completing at 2.0 > 1.5;
+    # exactly one fresh proof runs (starting t=2.0, satisfying the fence).
+    assert runs == [1.0, 2.0]
+
+
+def test_report_eligible_proofs_bypass_the_verdict_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # allow_report=True is the startup-adoption path: a stdout-report pass is
+    # startup-only evidence, so those proofs neither write the cache nor
+    # consume another proof's verdict.
+    proc = FakeProc()
+    port = 45613
+    runs: list[bool] = []
+
+    def _gated(child: object, child_port: int, *, allow_report: bool) -> tuple[bool | None, bool]:
+        runs.append(allow_report)
+        return True, allow_report
+
+    monkeypatch.setattr(mod, "_verify_child_listener_gated", _gated)
+
+    assert mod._verify_child_listener(proc, port, allow_report=True) == (True, True)
+    assert runs == [True]
+    # Had the report-eligible run written the cache, this would consume it.
+    assert mod._verify_child_listener(proc, port, allow_report=False) == (True, False)
+    assert runs == [True, False]
+    # And a report-eligible run never consumes the non-report verdict.
+    assert mod._verify_child_listener(proc, port, allow_report=True) == (True, True)
+    assert runs == [True, False, True]
+
+
+def test_relay_authorize_forwards_the_proof_fence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proc = FakeProc()
+    port = 45613
+    _record_relay_target(monkeypatch, proc, port)
+    fences: list[float | None] = []
+
+    def _proof(child: object, child_port: int, *, proof_not_before: float | None = None) -> bool:
+        fences.append(proof_not_before)
+        return True
+
+    monkeypatch.setattr(mod, "_relay_ownership_proof_for", _proof)
+
+    assert mod.relay_authorize("relay-capability", proof_not_before=123.4) == ("ok", port)
+    assert fences == [123.4]
+
+
+def test_status_then_relay_target_share_one_proof_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The Opus finding's second half: the 5s status payload ran the proof
+    # TWICE per poll — once under status()'s lock, once in relay_target().
+    # The verdict cache collapses the pair into one proof run.
+    proc = FakeProc()
+    port = 45613
+    _record_relay_target(monkeypatch, proc, port)
+    monkeypatch.setattr(mod, "cli_path", lambda: "/n/pw")
+    monkeypatch.setattr(mod, "_healthy", lambda child_port: True)
+    runs: list[str] = []
+
+    def _gated(child: object, child_port: int, *, allow_report: bool) -> tuple[bool | None, bool]:
+        runs.append("proof")
+        return True, False
+
+    monkeypatch.setattr(mod, "_verify_child_listener_gated", _gated)
+
+    assert mod.status()["status"] == "running"
+    assert mod.relay_target() == (port, "relay-capability")
+    assert runs == ["proof"]
 
 
 class _RedirectHandler(http.server.BaseHTTPRequestHandler):
@@ -317,9 +943,41 @@ def test_free_port_is_bindable_loopback() -> None:
         s.bind(("127.0.0.1", port))
 
 
-def test_free_port_is_not_hardcoded() -> None:
-    """A fixed port would collide with whatever else the operator runs."""
-    assert mod._free_port() != mod._free_port()
+def test_free_port_is_not_hardcoded(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A fixed port would collide with whatever else the operator runs.
+
+    So every number must be the kernel's: each call binds port 0 on loopback and
+    returns the port the kernel answered for that bind. That is asserted on the binds
+    and their answers, over two calls so a cached first answer fails too. The two
+    numbers are never compared: once the first socket is closed the kernel may legally
+    hand back the same port.
+    """
+    binds: list[object] = []
+    answers: list[int] = []
+
+    class _RecordingSocket(socket.socket):
+        def bind(self, address: object) -> None:
+            binds.append(address)
+            super().bind(address)
+
+        def getsockname(self) -> object:
+            name = super().getsockname()
+            answers.append(name[1])
+            return name
+
+    # The module's own ``socket`` binding, so the stdlib module stays untouched.
+    monkeypatch.setattr(
+        mod,
+        "socket",
+        SimpleNamespace(
+            socket=_RecordingSocket, AF_INET=socket.AF_INET, SOCK_STREAM=socket.SOCK_STREAM
+        ),
+    )
+
+    first, second = mod._free_port(), mod._free_port()
+
+    assert binds == [(mod.LOOPBACK_HOST, 0)] * 2, "a call did not leave the port to the kernel"
+    assert answers == [first, second], "a returned port is not the kernel's answer to that call"
 
 
 def test_ensure_running_returns_none_without_the_cli(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -629,8 +1287,7 @@ def test_ensure_running_falls_back_to_ephemeral_when_unpinned(
     monkeypatch.setattr(mod, "_spawn", lambda cli, port: spawns.append(port) or FakeProc())
 
     for unset in (None, 0):
-        mod._proc = None
-        mod._info = None
+        mod._child = None
         info = mod.ensure_running(port=unset)
         assert info is not None and info.port == 51515, unset
 
@@ -702,7 +1359,7 @@ def test_ensure_running_replaces_a_dead_process(monkeypatch: pytest.MonkeyPatch)
     monkeypatch.setattr(mod, "_spawn", lambda cli, port: spawns.append(port) or FakeProc())
 
     mod.ensure_running()
-    mod._proc = FakeProc(alive=False)
+    mod._child = _child_record(FakeProc(alive=False), None)
 
     assert mod.ensure_running() is not None
     assert len(spawns) == 2
@@ -851,7 +1508,7 @@ def test_stop_reaps_child_even_when_kill_command_fails(
     mod.stop()
 
     assert 888 in reset_state
-    assert mod._proc is None
+    assert _recorded_proc() is None
 
 
 def test_status_unavailable_without_the_cli(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -904,16 +1561,14 @@ def test_structurally_blind_status_without_start_allowance_names_the_tool(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     proc = FakeProc(pid=4242)
-    mod._proc = proc
-    mod._info = mod.ShowInfo("http://127.0.0.1:45613", 45613)
-    mod._child_port = 45613
+    mod._child = _child_record(proc, 45613)
     monkeypatch.setattr(mod, "cli_path", lambda: "/n/pw")
     monkeypatch.setattr(mod, "_healthy", lambda port: True)
     monkeypatch.setattr(platform_compat, "listening_pid_tool", lambda: "lsof")
     monkeypatch.setattr(
         mod,
         "_verify_child_listener",
-        lambda child, port, allow_report: (None, False),
+        lambda child, port, allow_report, proof_not_before=None: (None, False),
     )
     monkeypatch.setattr(mod, "_structurally_blind_listener_attribution", lambda: True)
 
@@ -928,16 +1583,14 @@ def test_structurally_blind_status_without_start_allowance_names_the_tool(
         "listener ownership cannot be re-proved on this host: "
         "GetExtendedTcpTable is absent or cannot attribute processes",
     ]
-    assert mod._proc is proc
+    assert _recorded_proc() is proc
 
 
 def test_capable_host_rechecks_owner_on_every_status(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     proc = FakeProc(pid=4242)
-    mod._proc = proc
-    mod._info = mod.ShowInfo("http://127.0.0.1:45613", 45613)
-    mod._child_port = 45613
+    mod._child = _child_record(proc, 45613)
     checks: list[tuple[FakeProc, int, bool]] = []
     monkeypatch.setattr(mod, "cli_path", lambda: "/n/pw")
     monkeypatch.setattr(mod, "_healthy", lambda port: True)
@@ -945,8 +1598,8 @@ def test_capable_host_rechecks_owner_on_every_status(
     monkeypatch.setattr(
         mod,
         "_verify_child_listener",
-        lambda child, port, allow_report: (
-            checks.append((child, port, allow_report)) or False,
+        lambda child, port, allow_report, proof_not_before=None: (
+            checks.append((child.proc, port, allow_report)) or False,
             False,
         ),
     )
@@ -1009,7 +1662,7 @@ def test_posix_fallback_identity_rechecks_with_its_capture_source(
     proc = FakeProc(pid=10)
     root_lstart = "Mon Jan  1 00:00:00 2024"
     child_lstart = "Mon Jan  1 00:00:01 2024"
-    proof = getattr(proc, "_kirocrew_browser_view_binding")
+    proof = proc.binding
     proof.root_identity = platform_compat.ProcessDescendantIdentity(
         proc.pid,
         0,
@@ -1097,13 +1750,11 @@ def test_owner_disappearing_during_identity_walk_is_inconclusive_and_not_reaped(
         return verdict
 
     monkeypatch.setattr(mod, "_port_owner", _record_port_owner)
-    mod._proc = proc
-    mod._info = mod.ShowInfo("http://127.0.0.1:45613", 45613)
-    mod._child_port = 45613
+    mod._child = _child_record(proc, 45613)
 
     assert mod.ensure_running() is None
     assert verdicts == [mod._OWNER_UNPROVEN]
-    assert mod._proc is proc
+    assert _recorded_proc() is proc
     assert reset_state == []
 
 
@@ -1490,9 +2141,7 @@ def test_two_status_calls_run_one_self_test_after_the_target_probe(
             pass
 
     proc = FakeProc(pid=4242)
-    monkeypatch.setattr(mod, "_proc", proc)
-    monkeypatch.setattr(mod, "_info", mod.ShowInfo(f"http://127.0.0.1:{child_port}", child_port))
-    monkeypatch.setattr(mod, "_child_port", child_port)
+    monkeypatch.setattr(mod, "_child", _child_record(proc, child_port))
     monkeypatch.setattr(
         mod,
         "_structurally_blind_listener_attribution",
@@ -1603,17 +2252,14 @@ def test_blind_lookup_squatter_is_not_adopted_without_child_binding_proof(
         lambda pid, port: None,
         raising=False,
     )
-    monkeypatch.setattr(platform_compat, "listening_pid_tool_available", lambda: True)
-    monkeypatch.setattr(platform_compat, "find_port_listeners", lambda port: [])
-    monkeypatch.setattr(
-        platform_compat,
-        "probe_port_listeners",
-        lambda port: ([], True),
-        raising=False,
-    )
+    # The shared stub, not a hand-rolled copy of its three listener pins: the copy
+    # dropped ``process_descendant_identities``, so every one of the 120 readiness
+    # rounds ran two real ``ps`` snapshots against pid 4242 -- a host process this
+    # test does not own -- and the fake-clock loop took 20 real seconds.
+    _stub_port_owner(monkeypatch, listener_pids=())
 
     assert mod.ensure_running() is None
-    assert mod._info is None
+    assert _recorded_info() is None
     assert proc.pid in reset_state
     assert mod.status()["url"] is None
 
@@ -1641,14 +2287,7 @@ def test_blind_lookup_adopts_real_child_after_recognized_binding_report(
         lambda pid, port: None,
         raising=False,
     )
-    monkeypatch.setattr(platform_compat, "listening_pid_tool_available", lambda: True)
-    monkeypatch.setattr(platform_compat, "find_port_listeners", lambda port: [])
-    monkeypatch.setattr(
-        platform_compat,
-        "probe_port_listeners",
-        lambda port: ([], True),
-        raising=False,
-    )
+    _stub_port_owner(monkeypatch, listener_pids=())
 
     with caplog.at_level("WARNING"):
         info = mod.ensure_running()
@@ -1794,8 +2433,8 @@ def test_ensure_running_refuses_a_squatter_on_the_child_port(
     )
 
     assert mod.ensure_running() is None
-    assert mod._info is None
-    assert mod._child_port is None
+    assert _recorded_info() is None
+    assert _recorded_child_port() is None
     # The child we spawned is reaped rather than left holding nothing.
     assert proc.pid in reset_state
     status = mod.status()
@@ -1813,7 +2452,7 @@ def test_ensure_running_adopts_a_proven_child(monkeypatch: pytest.MonkeyPatch) -
     info = mod.ensure_running()
 
     assert info is not None
-    assert mod._child_port == info.port
+    assert _recorded_child_port() == info.port
 
 
 def test_ensure_running_adopts_when_tool_absent_but_child_reports_binding(
@@ -2034,15 +2673,13 @@ def test_recycled_descendant_identity_is_inconclusive_around_listener_probe(
         return pid == 9931
 
     monkeypatch.setattr(platform_compat, "process_owns_loopback_listener", _owns_listener)
-    mod._proc = proc
-    mod._info = mod.ShowInfo("http://127.0.0.1:45613", 45613)
-    mod._child_port = 45613
+    mod._child = _child_record(proc, 45613)
     monkeypatch.setattr(mod, "cli_path", lambda: None)
 
     with caplog.at_level("DEBUG"):
         assert mod.ensure_running() is None
 
-    assert mod._proc is proc
+    assert _recorded_proc() is proc
     assert reset_state == []
     assert any(
         "enumerated=(pid=9931, ppid=4242, start='old'), "
@@ -2128,15 +2765,15 @@ def test_root_identity_inconclusive_preserves_but_mismatch_reaps(
         "reason": mod._OWNERSHIP_REASON,
     }
     assert mod.ensure_running() is None
-    assert mod._proc is spawned[0]
-    assert mod._info == first
+    assert _recorded_proc() is spawned[0]
+    assert _recorded_info() == first
     assert reset_state == []
 
     starts[4242] = "recycled"
 
     assert mod.ensure_running() is not None
     assert [child.pid for child in spawned] == [4242, 4343]
-    assert mod._proc is spawned[1]
+    assert _recorded_proc() is spawned[1]
     assert reset_state == [4242]
 
 
@@ -2144,7 +2781,7 @@ def test_blind_port_zero_banner_authorizes_the_resolved_startup_port(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     proc = FakeProc(pid=4242)
-    proof = getattr(proc, "_kirocrew_browser_view_binding")
+    proof = proc.binding
     proof.record(42963)
     monkeypatch.setattr(platform_compat, "IS_WINDOWS", False)
     monkeypatch.setattr(platform_compat, "IS_LINUX", False)
@@ -2171,7 +2808,7 @@ def test_blind_port_zero_banner_authorizes_the_resolved_startup_port(
     assert proof.port == 0
     assert proof.reported_port() == 42963
     assert info == mod.ShowInfo("http://127.0.0.1:42963", 42963)
-    assert mod._proc is proc
+    assert _recorded_proc() is proc
 
 
 def test_structurally_blind_start_publishes_once_then_withholds_a_squatter(
@@ -2205,7 +2842,11 @@ def test_structurally_blind_start_publishes_once_then_withholds_a_squatter(
     )
 
     def _listener_verdict(
-        child: FakeProc, port: int, *, allow_report: bool
+        child: FakeProc,
+        port: int,
+        *,
+        allow_report: bool,
+        proof_not_before: float | None = None,
     ) -> tuple[bool | None, bool]:
         if allow_report and listener_owner["pid"] == child.pid:
             return True, True
@@ -2226,8 +2867,8 @@ def test_structurally_blind_start_publishes_once_then_withholds_a_squatter(
     }
     assert mod.ensure_running() is None
     assert spawn_ports == [0]
-    assert mod._proc is proc
-    assert mod._info == first
+    assert _recorded_proc() is proc
+    assert _recorded_info() == first
     assert reset_state == []
 
 
@@ -2287,8 +2928,8 @@ def test_structurally_blind_dead_child_respawns_from_a_fresh_report(
     }
     assert spawn_ports == [0, 0]
     assert [child.pid for child in spawned] == [4242, 4343]
-    assert mod._proc is spawned[1]
-    assert mod._info == second
+    assert _recorded_proc() is spawned[1]
+    assert _recorded_info() == second
     assert reset_state == [4242]
 
 
@@ -2308,9 +2949,9 @@ def test_replacement_spawn_invalidates_listener_self_test_cache(
     )
 
     assert mod.ensure_running() is not None
-    assert mod._proc is not None
-    mod._proc._alive = False
-    mod._proc.returncode = 1
+    assert _recorded_proc() is not None
+    _recorded_proc()._alive = False
+    _recorded_proc().returncode = 1
     assert mod.ensure_running() is not None
 
     assert invalidations == [None, None]
@@ -2346,7 +2987,7 @@ def test_transient_listener_probe_failure_still_degrades_without_reaping(
         "lsof at /usr/sbin/lsof did not attribute the gateway's own control "
         "listener; check its permissions/namespace"
     )
-    assert mod._proc is proc
+    assert _recorded_proc() is proc
     assert spawned == [proc]
     assert reset_state == []
 
@@ -2449,8 +3090,9 @@ def test_spawn_captures_root_start_identity(
     monkeypatch.setattr(platform_compat, "_process_lstart", _lstart)
     monkeypatch.setattr(mod, "_start_daemon_thread", lambda thread: True)
 
-    assert mod._spawn(["/n/pw"], 45613) is proc
-    proof = getattr(proc, "_kirocrew_browser_view_binding")
+    child = mod._spawn(["/n/pw"], 45613)
+    assert child is not None and child.proc is proc
+    proof = child.binding
     assert proof.root_identity == platform_compat.ProcessDescendantIdentity(
         proc.pid,
         0,
@@ -2461,7 +3103,7 @@ def test_spawn_captures_root_start_identity(
 
     source_reads.clear()
 
-    assert mod._root_process_identity_matches(proc, "test") is True
+    assert mod._root_process_identity_matches(child, "test") is True
     assert source_reads == expected_recheck_reads
 
 
@@ -2825,7 +3467,7 @@ def test_stop_clears_the_recorded_child_port(monkeypatch: pytest.MonkeyPatch) ->
 
     mod.stop()
 
-    assert mod._child_port is None
+    assert _recorded_child_port() is None
 
 
 @pytest.mark.parametrize(
@@ -2880,7 +3522,7 @@ def test_show_child_registers_in_the_gateway_owned_session_registry(
     proc = mod._spawn(["/n/pw"], 7777)
 
     assert proc is not None
-    proof = getattr(proc, "_kirocrew_browser_view_binding")
+    proof = proc.binding
     assert proof.reported.wait(timeout=1)
     assert proof.port == 7777
     assert proof.root_identity.source is expected_source

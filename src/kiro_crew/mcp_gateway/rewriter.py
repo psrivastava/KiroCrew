@@ -30,7 +30,6 @@ import contextlib
 import hashlib
 import json
 import logging
-import ntpath
 import os
 import re
 import shlex
@@ -47,7 +46,12 @@ from kiro_crew import __version__, platform_compat
 from kiro_crew.agent_spec_format import iter_agent_spec_files
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.paths import config_dir
-from kiro_crew.env import mcp_search_path, spec_path_key
+from kiro_crew.env import mcp_search_path, resolved_command_casing, spec_path_key
+from kiro_crew.mcp_cleanup import (
+    KIROCREW_BIN_MCP_SERVERS,
+    mcp_entry_is_muted,
+    mcp_entry_is_registry_governed,
+)
 from kiro_crew.mcp_gateway import STUB_MODULE
 from kiro_crew.mcp_gateway.hashing import (
     STUB_FLAGS_FLAG,
@@ -57,10 +61,18 @@ from kiro_crew.mcp_gateway.hashing import (
     hash_command,
     is_secret_env_key,
 )
+from kiro_crew.mcp_gateway.launch_approval import (
+    LaunchApprovals,
+    env_fingerprint,
+    filter_target_env,
+    launch_fingerprint,
+)
 from kiro_crew.mcp_gateway.manager import is_credential_env_key
+from kiro_crew.mcp_gateway.read_limits import config_read_buffer_limit
 from kiro_crew.mcp_utils import mcp_server_alias
 from kiro_crew.sandbox import scrub_agent_denied_env
 from kiro_crew.security import is_sensitive_path
+from kiro_crew.user_json import loads_user_json
 
 logger = logging.getLogger(__name__)
 
@@ -119,7 +131,18 @@ _FINGERPRINT_NAME = ".rewrite-fingerprint"
 # Windows (8.3 short form when the interpreter path carries a metacharacter),
 # and kept overlays must fingerprint that derived spelling to avoid launching
 # through cmd.exe with a quote-stripped interpreter path.
-_FINGERPRINT_SCHEMA = 7
+# 8: a registry-governed or muted entry passes through unwrapped instead of
+# becoming a broker stub. The inputs are unchanged for such an entry, so a kept
+# overlay keeps a stub whose name ``session_servers.injection_server_names``
+# still collects -- launching, at session level, the very server the marker
+# hands to the administrator's catalog and the mute silences. The output shape
+# for identical inputs is what changed, which is exactly what this knob rejects.
+# 9: a reserved kirocrew-* entry launches the managed invocation, not the
+# spec's command (``_repair_control_plane_entry``). That invocation is an input
+# the spec files cannot see -- it moves on every upgrade and on a relocated
+# install -- so it is fingerprinted as ``managed_control_plane`` below, and the
+# bump regenerates every kept overlay whose stub still hashes the spec's command.
+_FINGERPRINT_SCHEMA = 9
 
 
 @dataclass
@@ -201,38 +224,6 @@ _TARGET_ARGS_FLAG_LEGACY = "--target-args"
 #: Aliased from the package constant so the launch line and the cmdline
 #: fingerprint the Sessions surface counts stubs by cannot drift apart.
 _STUB_MODULE = STUB_MODULE
-
-
-def _target_command_casing(path: str | None) -> str:
-    """Restore a PATH-resolved Windows basename without resolving aliases.
-
-    ``which`` can synthesize ``.EXE`` from PATHEXT. Looking up the matching
-    parent-directory entry repairs that spelling while retaining the lexical
-    parent route and a file symlink's own name. POSIX paths stay untouched.
-    """
-    if not path:
-        return ""
-    if not platform_compat.IS_WINDOWS:
-        return path
-    parent, name = os.path.split(path)
-    if not name:
-        return path
-    folded = ntpath.normcase(name)
-    matches: list[str] = []
-    try:
-        with os.scandir(parent or os.curdir) as entries:
-            for entry in entries:
-                if entry.name == name:
-                    return path
-                if ntpath.normcase(entry.name) == folded:
-                    matches.append(entry.name)
-    except OSError:
-        return path
-    # A case-sensitive Windows directory may legally contain ambiguous names.
-    # Never turn the requested launcher into a different directory entry.
-    if len(matches) != 1:
-        return path
-    return path[: -len(name)] + matches[0]
 
 
 # cmd.exe metacharacters. kiro-cli launches MCP entries on Windows through
@@ -355,12 +346,218 @@ def _resolve_target_command(
     # augmented host PATH. It also degrades a non-string PATH and dedups, so one
     # malformed hand-edited spec cannot abort the rewrite pass.
     search_path = mcp_search_path(env_path)
-    resolved = _target_command_casing(shutil.which(target_command, path=search_path))
+    resolved = resolved_command_casing(shutil.which(target_command, path=search_path))
     if notes is not None:
         notes.which_results[
             f"{target_command}{_WHICH_KEY_SEP}{search_path}"
         ] = resolved
     return resolved
+
+
+def _spec_args(entry: Mapping[str, Any]) -> list[str]:
+    """An entry's ``args`` as strings, iterating only a list or tuple.
+
+    Agent JSON is hand-editable, so ``"args": 8080`` or ``"args": "--flag"`` is
+    an easy thing to write; a comprehension over it raises ``TypeError`` out of
+    ``_rewrite_single_spec`` and aborts the rewrite pass for EVERY agent, leaving
+    the broker unstarted (the same class ``_hashable_args`` and ``_normalized_env``
+    guard against). A non-sequence reads as no args.
+    """
+    raw = entry.get("args")
+    return [str(a) for a in raw] if isinstance(raw, (list, tuple)) else []
+
+
+def _managed_invocation(name: str) -> dict[str, Any] | None:
+    """The command/args Kiro Crew itself would launch *name* with, or ``None``.
+
+    ``include_opt_in`` because the question here is what a granted reserved
+    name IS, not whether a rebuild would grant it -- the spec already did.
+    """
+    # Function-local on purpose, not a circular import: ``gatewayd`` imports
+    # this module at boot and deliberately keeps ``kiro_crew.agent`` OFF the
+    # daemon's boot path (see ``CONTROL_PLANE_BACKENDS`` there, read from the
+    # ``mcp_cleanup`` leaf for exactly this reason, and the same lazy import in
+    # ``gatewayd._spawns_own_control_plane``). A top-level import here would
+    # put it back. Runs once per reserved entry per rewrite pass, not per spawn.
+    from kiro_crew.agent import managed_mcp_spec_entry
+
+    try:
+        return managed_mcp_spec_entry(name, include_opt_in=True)
+    except Exception:  # pragma: no cover - defensive; the callee already catches
+        logger.debug("rewriter: managed invocation for %r unavailable", name, exc_info=True)
+        return None
+
+
+def _managed_control_plane_signature(stub_set: Collection[str]) -> dict[str, list[Any]]:
+    """``{name: [command, args]}`` for every stubbed reserved name that resolves.
+
+    The fingerprint input behind schema 9: what ``_repair_control_plane_entry``
+    launches, per name, so a moved managed binary regenerates the overlays.
+    """
+    out: dict[str, list[Any]] = {}
+    for name in sorted(KIROCREW_BIN_MCP_SERVERS):
+        if name not in stub_set:
+            continue
+        managed = _managed_invocation(name)
+        if isinstance(managed, dict) and managed.get("command"):
+            out[name] = [str(managed["command"]), _spec_args(managed)]
+    return out
+
+
+def _repair_control_plane_entry(
+    name: str, entry: dict[str, Any], agent_name: str
+) -> dict[str, Any]:
+    """Re-derive a reserved ``kirocrew-*`` entry's launch from the managed source.
+
+    A spec's ``command`` for one of Kiro Crew's own servers cannot be authored
+    correctly by hand: the managed path embeds the data home and the installed
+    version (Toolbox: ``~/.toolbox/tools/kirocrew/<ver>/bin/kirocrew``; macOS
+    payload: ``.../backend-dist/kirocrew-backend-<arch>/bin/kirocrew``), so the
+    only hand-writable spelling is the bare launcher ``kirocrew``. That
+    resolves through the shared Toolbox dispatcher (``toolbox-exec``), a
+    different file from the versioned binary, and
+    ``gatewayd._spawns_own_control_plane`` -- which compares the spawned
+    binary by realpath against exactly this managed entry -- then denies the
+    session token: every ``kirocrew-core`` / ``kirocrew-cron`` tool answers
+    ``identity_unattested`` while the server LOOKS mounted. A
+    spec pinned to a versioned path fails the same way one upgrade later, when
+    that binary is reaped.
+
+    So a reserved name never launches what the spec says; it launches what the
+    managed source of truth says, the way ``agent._enforce_managed_mcp_ownership``
+    rewrites the disk entry and the codex/opencode projections REPLACE theirs.
+    This weakens nothing downstream: the daemon's gate still runs on the
+    command about to be exec'd, which is now the one it was written to accept,
+    and a spec that named a THIRD-PARTY binary under a reserved name gets our
+    binary, not the token for theirs. The grant itself stays the spec's: an
+    entry the spec does not carry is not conjured here, and the restriction
+    fields it declares (``_RESERVED_ENTRY_SPEC_KEYS``) carry over. The launch is
+    the managed declaration's, a spec ``autoApprove`` is dropped (kiro-cli
+    honours it before Kiro Crew's PreToolUse gate runs), and the declared
+    ``env`` is held to the managed-entry ownership rule
+    (:func:`_owned_control_plane_env`) before the forwarding rules see it,
+    exactly as the disk and ACP consumers of this population do.
+
+    ``None`` from the managed source (name not managed, ``spec_gate`` closed,
+    invocation unresolvable) leaves the entry as declared; the daemon's gate
+    then rules on it as before.
+    """
+    if name not in KIROCREW_BIN_MCP_SERVERS:
+        return entry
+    managed = _managed_invocation(name)
+    if not isinstance(managed, dict) or not managed.get("command"):
+        return entry
+    declared_cmd = str(entry.get("command", ""))
+    declared_args = _spec_args(entry)
+    managed_cmd = str(managed["command"])
+    managed_args = _spec_args(managed)
+    if declared_cmd != managed_cmd or declared_args != managed_args:
+        # The declared ``args`` never reach the log: a spec may carry a token in
+        # them, and this warning persists in the gateway's log. The command and
+        # the argument COUNT are enough to find the entry; the managed
+        # invocation is ours, so it is safe to print in full.
+        logger.warning(
+            "rewriter: agent %r declares reserved server %r as command %s with %d "
+            "argument(s); launching the managed invocation %s instead so the daemon "
+            "can attest it (a hand-authored command for a kirocrew-* server cannot "
+            "match the installed binary across users or upgrades)",
+            agent_name,
+            name,
+            repr(declared_cmd) if declared_cmd else "<none>",
+            len(declared_args),
+            shlex.join([managed_cmd, *managed_args]),
+        )
+    # Composed from the managed source OUTWARD, never by copying the spec and
+    # swapping two keys. Three rounds of review found spec-controlled fields
+    # riding into our binary through that copy (a launcher-choosing ``env``, a
+    # ``KIROCREW_*`` override, an ``autoApprove`` that kiro-cli honours before
+    # Kiro Crew's PreToolUse gate ever runs), one field per round. The class is
+    # the copy, so this is the disk writer's shape instead
+    # (``agent._enforce_managed_mcp_ownership``): the launch is ours; the
+    # restriction fields kiro-cli reads for the spec's grant carry over
+    # (``_RESERVED_ENTRY_SPEC_KEYS``); ``env`` is held to the ownership rule;
+    # ``autoApprove`` is dropped and named -- a hand-written grant on a reserved
+    # name would approve our tools inside kiro-cli and skip the governance gate,
+    # and no managed declaration carries one to apply instead; every other key
+    # is dropped and named.
+    repaired: dict[str, Any] = {"command": managed_cmd, "args": managed_args}
+    for key in _RESERVED_ENTRY_SPEC_KEYS:
+        if key in entry:
+            repaired[key] = entry[key]
+    declared_env = entry.get("env")
+    if isinstance(declared_env, dict) and declared_env:
+        owned_env = _owned_control_plane_env(declared_env, name=name, agent_name=agent_name)
+        if owned_env:
+            repaired["env"] = owned_env
+    for dropped in sorted(set(entry) - set(repaired) - {"env", "autoApprove", "poolable"}):
+        logger.warning(
+            "rewriter: dropping %r from reserved server %r (agent %r): a managed entry"
+            " carries only the launch, the restriction fields and an owned env",
+            dropped,
+            name,
+            agent_name,
+        )
+    if "autoApprove" in entry:
+        logger.warning(
+            "rewriter: reserved server %r (agent %r) declares autoApprove; kiro-cli would"
+            " honour it ahead of the PreToolUse gate, so the spec's is not applied",
+            name,
+            agent_name,
+        )
+    return repaired if repaired != entry else entry
+
+
+#: Spec fields a repaired reserved entry keeps from the SPEC: they narrow the
+#: grant kiro-cli applies (mute, per-tool disable, timeout) and, being the
+#: spec's, cannot widen what our binary does. ``command``/``args`` are the
+#: managed declaration's, ``autoApprove`` is dropped; ``env`` goes through
+#: :func:`_owned_control_plane_env`. Mirrors the allow-list half of
+#: ``agent._MANAGED_MCP_ENTRY_KEYS``; a key absent here is dropped, not carried.
+_RESERVED_ENTRY_SPEC_KEYS: tuple[str, ...] = ("type", "timeout", "disabled", "disabledTools")
+
+
+def _owned_control_plane_env(
+    declared: dict[str, Any], *, name: str, agent_name: str
+) -> dict[str, str]:
+    """A reserved name's declared ``env``, held to the managed-entry ownership rule.
+
+    The launch is ours, so the environment that launch receives answers to the
+    same rule the other two consumers of this population apply --
+    ``agent._enforce_managed_mcp_ownership`` for the disk entry and
+    ``acp.session_mcp._managed_element_env`` for the ACP element -- in the same
+    order: ``sanitize_spec_env`` drops the loader channels and Kiro Crew's own
+    reserved namespace (a spec-declared ``KIROCREW_APPROVAL_MODE=auto`` would
+    otherwise reach a tokened control plane and let its subagents skip
+    approval), then the home-deriving and launcher-exec classes go. What
+    survives is the ordinary variable an operator may legitimately declare;
+    the managed env itself is the daemon's own and needs no pin here.
+    """
+    from kiro_crew import agent as agent_mod
+    from kiro_crew.env import sanitize_spec_env
+
+    # ``declared.items()`` as-is: ``sanitize_spec_env`` validates key and value
+    # types itself, and stringifying first would turn a malformed value (a dict,
+    # ``None``) into a live variable instead of a dropped one.
+    env = sanitize_spec_env(declared.items())
+    for key in [k for k in env if k.upper() in agent_mod._HOME_DERIVING_ENV_KEYS]:
+        env.pop(key, None)
+        logger.warning(
+            "rewriter: dropping %r from reserved server %r (agent %r): it would move the"
+            " data home this control plane shares with the gateway",
+            key,
+            name,
+            agent_name,
+        )
+    for key in [k for k in env if k.upper() in agent_mod._LAUNCHER_EXEC_ENV_KEYS]:
+        env.pop(key, None)
+        logger.warning(
+            "rewriter: dropping %r from reserved server %r (agent %r): it would choose what"
+            " this control plane executes rather than configure it",
+            key,
+            name,
+            agent_name,
+        )
+    return env
 
 
 def _normalized_env(entry: dict[str, Any], *, context: str = "") -> dict[str, Any]:
@@ -463,6 +660,7 @@ def _expand_env_placeholders(
     *,
     notes: _RewritePassNotes | None = None,
     source: Mapping[str, str] | None = None,
+    server: str | None = None,
 ) -> str:
     """Resolve ``${VAR}`` / ``${env:VAR}`` from *source* (default: the filtered
     :func:`_placeholder_source_env` view), leaving an unresolved reference as a
@@ -488,6 +686,13 @@ def _expand_env_placeholders(
                     "variable; left as a literal",
                     name,
                 )
+            else:
+                logger.warning(
+                    "declared env placeholder %r for MCP server %r is unset; "
+                    "left as a literal",
+                    name,
+                    server,
+                )
             return f"${{{name}}}"
         return resolved
 
@@ -495,7 +700,10 @@ def _expand_env_placeholders(
 
 
 def _expand_env_map(
-    env_pairs: dict[str, Any], *, notes: _RewritePassNotes | None = None
+    env_pairs: dict[str, Any],
+    *,
+    notes: _RewritePassNotes | None = None,
+    server: str | None = None,
 ) -> dict[str, Any]:
     """Expand placeholders in string values only; non-str values pass through
     (both readers ``str()``-coerce them identically, keeping the PoolKey hash
@@ -503,7 +711,7 @@ def _expand_env_map(
     source = _placeholder_source_env()
     return {
         k: (
-            _expand_env_placeholders(v, notes=notes, source=source)
+            _expand_env_placeholders(v, notes=notes, source=source, server=server)
             if isinstance(v, str)
             else v
         )
@@ -577,6 +785,7 @@ def _build_stub_entry(
     poolable: bool = False,
     identity_keys: Collection[str] = (),
     notes: _RewritePassNotes | None = None,
+    read_buffer_limit: int = 0,
 ) -> dict[str, Any]:
     """Return the rewritten ``mcpServers[name]`` entry.
 
@@ -593,7 +802,7 @@ def _build_stub_entry(
     env separately through its flags so the gateway can hash the
     post-substitution env into the PoolKey.
     """
-    target_args: list[str] = [str(a) for a in original.get("args", []) or []]
+    target_args: list[str] = _spec_args(original)
     auto_approve: list[str] = list(original.get("autoApprove", []) or [])
 
     stub_args: list[str] = [
@@ -606,6 +815,18 @@ def _build_stub_entry(
         "--work-dir", str(work_dir),
         "--approval-mode", approval_mode,
         "--socket", str(socket_path),
+        # The per-stream read ceiling. A stub that reads it off argv never
+        # imports the config package, which is roughly 140 modules in a process
+        # that exists once per session per MCP server. Carried like the other
+        # config-derived values above (socket, approval mode, sandbox mode).
+        #
+        # Resolved ONCE per rewrite by the caller and passed in, not read here:
+        # this value is baked into the overlay, so it is an input to
+        # ``_rewrite_inputs_fingerprint`` as well, and the two must be the same
+        # number. Reading config per entry would also let one pass write two
+        # ceilings if the file changed under it, and the daemon sizes its own
+        # reader from a single answer.
+        "--read-limit", str(read_buffer_limit),
     ]
     if poolable:
         stub_args.append("--poolable")
@@ -648,6 +869,16 @@ def _build_stub_entry(
         # 'foo_bar' still collides. The shared helper appends a digest of the RAW
         # components, which is injective, and gatewayd's reader recomputes that
         # same helper — so writer and reader can never disagree on the name.
+        #
+        # ONE FILE PER (agent, server) DECLARATION, which is what makes the
+        # file safe to hand to a connection-private backend: this file holds the
+        # declaration's full env, rotating secrets included, and two agents
+        # declaring one server with different secrets must never land on one
+        # name. Naming it after a hash that EXCLUDES those secrets would do
+        # exactly that, because ``effective_env_hash`` drops every
+        # ``AWS_SECRET``/``AWS_SESSION``/``OAUTH`` key: both agents would write
+        # one file, the second write would win, and the first agent's private
+        # backend would be spawned with the second agent's credentials.
         env_file = env_dir / env_sidecar_name(agent_name, server_name)
         # One publish path: always staged, and whoever owns the ledger commits.
         # A caller that passed none is not deferring, so a local ledger is
@@ -684,7 +915,8 @@ def _build_stub_entry(
                     # is spawned from this sidecar, not by kiro-cli.
                     fh.write(
                         json.dumps(
-                            _expand_env_map(env_pairs, notes=notes), sort_keys=True
+                            _expand_env_map(env_pairs, notes=notes, server=server_name),
+                            sort_keys=True,
                         )
                     )
                 # Staged, not published: the rewrite pass commits after this
@@ -845,12 +1077,19 @@ def _rewrite_single_spec(
     pooling_enabled: bool = True,
     forward_env: bool = False,
     identity_keys: Collection[str] = (),
+    read_buffer_limit: int = 0,
     inject_servers: dict[str, Any] | None = None,
     target_env: dict[str, str] | None = None,
     sidecars_written: _SidecarLedger | None = None,
     notes: _RewritePassNotes | None = None,
+    approvals: LaunchApprovals | None = None,
 ) -> tuple[dict[str, Any], int]:
     """Return ``(new_spec, wrapped_count)``. Idempotent.
+
+    ``approvals`` enforces content approval (see
+    :mod:`kiro_crew.mcp_gateway.launch_approval`): a stubbed entry is wrapped
+    only when its resolved launch is approved for its name, and an entry that
+    arrives already wrapped is re-derived rather than trusted.
 
     ``inject_servers`` is a mapping of ``{name: raw_entry}`` of poolable
     servers sourced from the global ``settings/mcp.json`` that must be made
@@ -888,6 +1127,12 @@ def _rewrite_single_spec(
             # Leave unchanged — these bind to KIROCREW_SESSION_KEY.
             new_servers[name] = entry
             continue
+        if approvals is not None and (
+            entry.get(_WRAPPER_MARKER) is True or entry.get(_WRAPPER_MARKER_LEGACY) is True
+        ):
+            # The marker is spec text, so it cannot vouch for the target it
+            # names. Re-derive the plain entry and let the checks below decide.
+            entry = _unwrapped_from_prewrapped(entry)
         if entry.get(_WRAPPER_MARKER) is True or entry.get(_WRAPPER_MARKER_LEGACY) is True:
             # Already wrapped (idempotency). Upgrade to new marker on re-emit.
             upgraded = dict(entry)
@@ -900,9 +1145,25 @@ def _rewrite_single_spec(
             # HTTP/SSE MCP entries — already shareable by nature, skip.
             new_servers[name] = entry
             continue
-        if entry.get("disabled") is True:
-            # Honour the user's mute: a server explicitly disabled in the agent
-            # spec must never be wrapped into a live pooling stub.
+        if mcp_entry_is_registry_governed(entry):
+            # A registry-governed entry defers its launch to the administrator's
+            # catalog, so there is nothing here to pool. Wrapping it produced a
+            # stub the catalog overrides anyway (in registry mode it resolves the
+            # entry by map key and supplies its own command) or that the client
+            # drops outright (outside registry mode the marked entry is the one
+            # dropped) -- while making the name a "stubbed name" the session
+            # projections subtract, so the server reached a session as a live
+            # local process with the marker governing nothing. Pass it through so
+            # the client's own filter decides, like the mute below.
+            new_servers[name] = {k: v for k, v in entry.items() if k != "poolable"}
+            continue
+        if mcp_entry_is_muted(entry):
+            # Honour the user's mute: a server disabled in the agent spec must
+            # never be wrapped into a live pooling stub. Read fail-closed, so a
+            # non-boolean ``disabled`` mutes too -- reading only a literal ``True``
+            # wrapped such an entry, and a wrapped name is subtracted from the
+            # session projections as a broker stub before their own mute check
+            # runs, which mounted the server the spec had silenced.
             # _build_stub_entry returns a fixed shape and would DROP ``disabled``,
             # silently re-enabling the muted server in the overlay. Pass the
             # entry through unchanged (minus the internal ``poolable`` hint) so
@@ -927,6 +1188,11 @@ def _rewrite_single_spec(
         if name not in stub_servers:
             new_servers[name] = {k: v for k, v in entry.items() if k != "poolable"}
             continue
+        # A reserved kirocrew-* name launches the managed invocation, whatever
+        # the spec spelled -- before resolution, so the target the stub hashes,
+        # the target env the daemon spawns and the gate's expectation are one
+        # value. See ``_repair_control_plane_entry``.
+        entry = _repair_control_plane_entry(name, entry, agent_name)
         entry_env = _normalized_env(
             entry, context=f"server {name!r} for agent {agent_name!r}"
         )
@@ -980,6 +1246,16 @@ def _rewrite_single_spec(
             )
             new_servers[name] = {k: v for k, v in entry.items() if k != "poolable"}
             continue
+        if not _admit_launch(
+            approvals,
+            name=name,
+            agent_name=agent_name,
+            entry=entry,
+            resolved_cmd=resolved_cmd,
+            entry_env=entry_env,
+        ):
+            new_servers[name] = {k: v for k, v in entry.items() if k != "poolable"}
+            continue
         new_servers[name] = _build_stub_entry(
             stubs_dir=stubs_dir,
             server_name=name,
@@ -996,6 +1272,7 @@ def _rewrite_single_spec(
             # per-server decision, so there is nothing further to consult here.
             poolable=pooling_enabled,
             identity_keys=identity_keys,
+            read_buffer_limit=read_buffer_limit,
             notes=notes,
         )
         wrapped += 1
@@ -1088,6 +1365,17 @@ def _rewrite_single_spec(
             new_servers[alias] = {k: v for k, v in entry.items() if k != "poolable"}
             seen_targets.add(inject_sig)
             continue
+        if not _admit_launch(
+            approvals,
+            name=alias,
+            agent_name=agent_name,
+            entry=entry,
+            resolved_cmd=resolved_cmd,
+            entry_env=entry_env,
+        ):
+            # Not injected at all: kiro-cli's own merge of the real settings
+            # file still gives the session this server, launched in-sandbox.
+            continue
         new_servers[alias] = _build_stub_entry(
             stubs_dir=stubs_dir,
             server_name=alias,
@@ -1102,6 +1390,7 @@ def _rewrite_single_spec(
             sidecars_written=sidecars_written,
             poolable=pooling_enabled,
             identity_keys=identity_keys,
+            read_buffer_limit=read_buffer_limit,
             notes=notes,
         )
         wrapped += 1
@@ -1149,10 +1438,16 @@ def _injectable_settings_servers(
     for name, entry in servers.items():
         if not isinstance(entry, dict):
             continue
-        if entry.get("disabled") is True:
-            # Honour the user's mute: a server explicitly disabled in
-            # settings/mcp.json must never be injected as a live stub (which
-            # would silently re-enable it in every agent overlay).
+        if mcp_entry_is_registry_governed(entry):
+            # Never inject a catalog-governed server as a live stub, for the
+            # reason the wrap guard states -- and here it would enter EVERY
+            # agent's overlay at once.
+            continue
+        if mcp_entry_is_muted(entry):
+            # Honour the user's mute: a server disabled in settings/mcp.json must
+            # never be injected as a live stub (which would silently re-enable it
+            # in every agent overlay). Fail-closed like the wrap guard above: the
+            # two decide the same thing about the same field.
             continue
         if name in UNPOOLABLE_SERVERS:
             continue
@@ -1167,6 +1462,11 @@ def _injectable_settings_servers(
             # Not stubbed: leave it to kiro-cli's own merge of the real
             # settings file, so the session launches it directly.
             continue
+        # Same repair as the per-agent site: a reserved kirocrew-* name declared
+        # here launches the managed invocation too, so the settings source and
+        # the agent-spec source of one control plane cannot diverge (the ACP
+        # projection already repairs both).
+        entry = _repair_control_plane_entry(name, entry, "settings/mcp.json")
         entry_env = _normalized_env(entry, context=f"settings server {name!r}")
         if not _resolve_target_command(str(entry.get("command", "")), entry_env, notes):
             # Settings edition of the unresolvable-command guard: an
@@ -1336,7 +1636,7 @@ def _kept_artifacts_vouched(
     for key, recorded in which_probes.items():
         bare, _, search_path = key.partition(_WHICH_KEY_SEP)
         try:
-            current = _target_command_casing(shutil.which(bare, path=search_path))
+            current = resolved_command_casing(shutil.which(bare, path=search_path))
         except OSError:
             return False
         if current != recorded:
@@ -1440,6 +1740,7 @@ def _rewrite_inputs_fingerprint(
     pooling_enabled: bool,
     forward_env: bool,
     identity_keys: Collection[str],
+    read_buffer_limit: int,
 ) -> dict[str, Any]:
     """Return a JSON-serializable snapshot of every input that can change
     :func:`rewrite_agents`'s output.
@@ -1481,6 +1782,9 @@ def _rewrite_inputs_fingerprint(
       unrelated input changed, and until then the stub would keep hashing the old
       set while gatewayd hashed the new one — the coherence gate would refuse to
       forward, so the feature would silently not work.
+    * ``read_buffer_limit`` — the per-stream read ceiling stamped into every
+      stub's ``--read-limit``, for the same reason as ``pool_identity_env``:
+      a kept overlay would keep launching stubs with the old ceiling.
     * ``schema`` / ``package`` — invalidate on rewriter logic changes.
     """
     sources: dict[str, list[Any] | None] = {
@@ -1497,6 +1801,12 @@ def _rewrite_inputs_fingerprint(
         "path_augment": mcp_search_path(""),
         "forward_declared_env": bool(forward_env),
         "pool_identity_env": sorted(frozenset(identity_keys)),
+        # Written onto every stub's argv as ``--read-limit``, so raising
+        # ``mcp_gateway.read_buffer_limit_bytes`` has to regenerate the overlays.
+        # Without it a kept overlay keeps handing stubs the previous ceiling and
+        # the new setting silently does nothing until some unrelated input
+        # changes -- the same failure mode ``pool_identity_env`` above records.
+        "read_buffer_limit": int(read_buffer_limit),
         "source_dir": str(source_dir),
         "overlay_dir": str(overlay_dir),
         "socket_path": str(socket_path),
@@ -1505,6 +1815,11 @@ def _rewrite_inputs_fingerprint(
         "approval_mode": approval_mode,
         "stub_servers": sorted(stub_set),
         "pooling_enabled": bool(pooling_enabled),
+        # The launch a stubbed reserved name is rewritten TO (schema 9). A
+        # kirocrew upgrade moves it while every spec file stays byte-identical;
+        # ``package`` catches the version bump, this catches a same-version
+        # relocation (a reinstall to another prefix, a payload moved) as well.
+        "managed_control_plane": _managed_control_plane_signature(stub_set),
         "sources": sources,
         "settings": _stat_sig(settings_path),
     }
@@ -1601,7 +1916,7 @@ def _cached_rewrite_result(
     for key, recorded in stored["which"].items():
         bare, _, search_path = key.partition(_WHICH_KEY_SEP)
         try:
-            current = _target_command_casing(shutil.which(bare, path=search_path))
+            current = resolved_command_casing(shutil.which(bare, path=search_path))
         except OSError:
             return None
         if current != recorded:
@@ -1822,6 +2137,7 @@ def rewrite_agents(
     approval_mode: str = "interactive",
     stub_servers: frozenset[str] | None = None,
     pooling_enabled: bool = True,
+    approvals: LaunchApprovals | None = None,
 ) -> tuple[dict[str, int], dict[str, str]]:
     """Populate ``overlay_dir`` with rewritten copies of ``source_dir/*.json``.
 
@@ -1857,6 +2173,12 @@ def rewrite_agents(
             the stub set: when ``False`` no stub is marked shareable, so each
             connection gets its own backend while the stubs stay in place — the
             state that lets a stubbed server render UI without co-tenancy.
+        approvals: The operator's approved launch fingerprints
+            (:mod:`kiro_crew.mcp_gateway.launch_approval`). When given, only an
+            approved launch is wrapped, a cache-served result that names an
+            unapproved target is discarded for a full pass, and the object
+            records what the pass captured and refused for the caller to
+            persist. ``None`` enforces nothing.
 
     Returns:
         A ``(results, target_env)`` tuple:
@@ -1926,6 +2248,12 @@ def rewrite_agents(
     # the fingerprint, handed to every consumer in it. gatewayd re-reads the same
     # helper at spawn rather than taking the stub's word for it.
     identity_keys = pool_identity_env_keys()
+    # And for the read ceiling: ONE resolved value per pass, recorded in the
+    # fingerprint and written onto every stub's argv. Resolving it per entry
+    # would let a config edit mid-pass write two different ceilings, and leaving
+    # it out of the fingerprint would let a kept overlay keep launching stubs
+    # with the previous one after the operator raised the key.
+    read_buffer_limit = config_read_buffer_limit()
     current_inputs = _rewrite_inputs_fingerprint(
         source_dir=source_dir,
         settings_path=kiro_settings_json,
@@ -1938,7 +2266,10 @@ def rewrite_agents(
         pooling_enabled=pooling_enabled,
         forward_env=forward_env,
         identity_keys=identity_keys,
+        read_buffer_limit=read_buffer_limit,
     )
+    if approvals is not None:
+        current_inputs["launch_approvals"] = approvals.digest()
     stored = _load_fingerprint(fingerprint_path)
     # One call covers both paths below (cache hit returns early; the full
     # rewrite continues): re-tighten the leftover legacy settings overlay's
@@ -1948,8 +2279,31 @@ def rewrite_agents(
         cached = _cached_rewrite_result(
             stored, overlay_dir=overlay_dir, stubs_dir=stubs_dir
         )
+        if cached is not None and approvals is not None:
+            # The overlays and sidecars behind the cache are files an agent can
+            # edit along with the fingerprint that vouches for them, so the
+            # cached targets are held to the same approval as a fresh pass.
+            _kept, dropped = filter_target_env(cached[1], approvals)
+            if dropped:
+                logger.warning(
+                    "mcp launch approvals: %d cached overlay target(s) are not "
+                    "approved; regenerating the overlays",
+                    len(dropped),
+                )
+                # Reset the whole refusal state this abandoned attempt left
+                # behind, not the reasons alone: a stem still held in
+                # ``refused_commands`` or ``incomplete_identities`` makes
+                # ``refused_identities`` answer ``None`` for the full pass below,
+                # and that record is stored without an ``expected_launch`` --
+                # a server the operator can see refused and cannot approve.
+                approvals.refused.clear()
+                approvals.refused_commands.clear()
+                approvals.incomplete_identities.clear()
+                cached = None
         if cached is not None:
             return cached
+    if approvals is not None:
+        approvals.full_pass = True
 
     written: set[str] = set()
     written_sidecars = _SidecarLedger()
@@ -1976,7 +2330,7 @@ def rewrite_agents(
     settings_read_transient = False
     if kiro_settings_json.is_file():
         try:
-            loaded = json.loads(kiro_settings_json.read_text(encoding="utf-8"))
+            loaded = loads_user_json(kiro_settings_json.read_text(encoding="utf-8"))
             if isinstance(loaded, dict):
                 settings_poolable = _injectable_settings_servers(
                     loaded, stub_set,
@@ -2205,10 +2559,12 @@ def rewrite_agents(
                 pooling_enabled=pooling_enabled,
                 forward_env=forward_env,
                 identity_keys=identity_keys,
+                read_buffer_limit=read_buffer_limit,
                 inject_servers=settings_poolable,
                 target_env=target_env,
                 sidecars_written=written_sidecars,
                 notes=notes,
+                approvals=approvals,
             )
             _collect_target_env(new_spec.get("mcpServers", {}), target_env)
             target = overlay_dir / overlay_name
@@ -2257,6 +2613,18 @@ def rewrite_agents(
         written.add(overlay_name)
         if wrapped:
             results[overlay_name] = wrapped
+
+    if approvals is not None and notes.sidecar_write_failed:
+        approvals.rebind_incomplete = True
+
+    if approvals is not None and transient_keep:
+        # A kept overlay's launches were never admitted this pass -- the keep
+        # paths above skip the spec read, or abandon the agent after it -- so
+        # the approval snapshot's live set is missing them. Say so, or a
+        # ``${VAR}`` rebind by another agent declaring the same command would
+        # retire the kept agent's own approved pair as unseen, and its kept
+        # sidecar would fail the approval check at spawn time.
+        approvals.live_incomplete = True
 
     # Prune stale overlay entries (user deleted or renamed an agent). The
     # keep-set answers "does this overlay's source still exist and did we
@@ -2416,6 +2784,136 @@ def rewrite_agents(
     return results, target_env
 
 
+def _wrapped_target(entry: Mapping[str, Any]) -> tuple[str, list[str]] | None:
+    """The ``(target command, target args)`` a wrapped stub entry launches, or ``None``.
+
+    Same splice and precedence as the stub's parser, so this reads exactly what
+    the stub would hand gatewayd -- and a plain-flag overlay identically.
+    """
+    args = expand_stub_flags(entry.get("args", []) or [])
+    target_cmd: str | None = None
+    target_args_b64: str | None = None
+    target_args_legacy = ""
+    target_args_sep = _TARGET_ARGS_SEP
+    i = 0
+    while i < len(args):
+        token = str(args[i])
+        flag, equals, value = token.partition("=")
+        if flag in {
+            "--target-command", _TARGET_ARGS_FLAG,
+            _TARGET_ARGS_FLAG_LEGACY, "--target-args-sep",
+        }:
+            if not equals:
+                if i + 1 >= len(args):
+                    break
+                i += 1
+                value = str(args[i])
+            if flag == "--target-command":
+                target_cmd = value
+            elif flag == _TARGET_ARGS_FLAG:
+                target_args_b64 = value
+            elif flag == _TARGET_ARGS_FLAG_LEGACY:
+                target_args_legacy = value
+            else:
+                target_args_sep = value
+        i += 1
+    if not target_cmd:
+        return None
+    if target_args_b64 is not None:
+        raw_target_args = decode_target_args(target_args_b64)
+    else:
+        raw_target_args = (
+            target_args_legacy.split(target_args_sep) if target_args_legacy else []
+        )
+    return target_cmd, raw_target_args
+
+
+def _is_managed_launch(name: str, entry: Mapping[str, Any]) -> bool:
+    """Whether *entry* is the managed invocation of a reserved ``kirocrew-*`` name.
+
+    Such a launch is derived by :func:`_repair_control_plane_entry` from Kiro
+    Crew's own install, not from anything agent-writable, so it needs no
+    operator approval of its content.
+    """
+    if name not in KIROCREW_BIN_MCP_SERVERS:
+        return False
+    managed = _managed_invocation(name)
+    if not isinstance(managed, dict) or not managed.get("command"):
+        return False
+    return str(entry.get("command", "")) == str(managed["command"]) and _spec_args(
+        entry
+    ) == _spec_args(managed)
+
+
+def _unwrapped_from_prewrapped(entry: Mapping[str, Any]) -> dict[str, Any]:
+    """Re-derive a plain entry from one that arrived already carrying the wrapper.
+
+    The marker is an input the spec author controls, so it proves nothing: the
+    target it names goes back through the ordinary stub decision instead of
+    being trusted. Its declared env is not recovered -- the ``--env-file`` path
+    is spec-chosen too, and reading it would copy an arbitrary file into a
+    sidecar. An entry whose target cannot be read loses the marker and is left
+    for the session to launch.
+    """
+    kept = {
+        k: v
+        for k, v in entry.items()
+        if k not in ("command", "args", "env", "poolable", _WRAPPER_MARKER, _WRAPPER_MARKER_LEGACY)
+    }
+    try:
+        target = _wrapped_target(entry)
+    except ValueError:
+        target = None
+    if target is None:
+        return {k: v for k, v in entry.items() if k not in (_WRAPPER_MARKER, _WRAPPER_MARKER_LEGACY)}
+    command, args = target
+    kept["command"] = command
+    kept["args"] = list(args)
+    return kept
+
+
+def _admit_launch(
+    approvals: LaunchApprovals | None,
+    *,
+    name: str,
+    agent_name: str,
+    entry: Mapping[str, Any],
+    resolved_cmd: str,
+    entry_env: dict[str, Any],
+) -> bool:
+    """Whether a stubbed entry may be wrapped, i.e. launched by gatewayd outside the sandbox.
+
+    ``approvals`` of ``None`` is a caller that enforces nothing (tests and
+    tools that only render overlays). Otherwise the launch's content must be
+    approved for this server name; a refusal leaves the entry unwrapped, so the
+    session launches it inside its own sandbox.
+    """
+    if approvals is None:
+        return True
+    target_args = _spec_args(entry)
+    fingerprint = launch_fingerprint(resolved_cmd, target_args, entry_env)
+    derived_env_hash = env_fingerprint(_expand_env_map(entry_env))
+    if not approvals.admit(
+        name,
+        fingerprint,
+        managed=_is_managed_launch(name, entry),
+        launch=(resolved_cmd, target_args),
+        # The declared text, not the expansion: placeholders stay unexpanded so a
+        # host secret behind ``${VAR}`` is never rendered on the dashboard.
+        env=entry_env,
+        derived_env_hash=derived_env_hash,
+    ):
+        # Names only: the args and env may carry tokens.
+        logger.warning(
+            "mcp launch approvals: stubbed server %r (agent %r) resolves to a launch "
+            "the operator has not approved; leaving it unwrapped so the session "
+            "launches it inside its sandbox. Re-approve it from the MCP page.",
+            name, agent_name,
+        )
+        return False
+    return True
+
+
 def _collect_target_env(
     mcp_servers: dict[str, Any],
     target_env: dict[str, str],
@@ -2443,44 +2941,9 @@ def _collect_target_env(
         ):
             continue
         env_key = "KIROCREW_MCP_TARGET_" + server_name.replace("-", "_").upper()
-        # Same splice as the stub's parser, so both sides read the flags an
-        # envelope carries -- and a plain-flag overlay -- identically.
-        args = expand_stub_flags(entry.get("args", []) or [])
-        target_cmd: str | None = None
-        target_args_b64: str | None = None
-        target_args_legacy = ""
-        target_args_sep = _TARGET_ARGS_SEP
-        i = 0
-        while i < len(args):
-            token = str(args[i])
-            flag, equals, value = token.partition("=")
-            if flag in {
-                "--target-command", _TARGET_ARGS_FLAG,
-                _TARGET_ARGS_FLAG_LEGACY, "--target-args-sep",
-            }:
-                if not equals:
-                    if i + 1 >= len(args):
-                        break
-                    i += 1
-                    value = str(args[i])
-                if flag == "--target-command":
-                    target_cmd = value
-                elif flag == _TARGET_ARGS_FLAG:
-                    target_args_b64 = value
-                elif flag == _TARGET_ARGS_FLAG_LEGACY:
-                    target_args_legacy = value
-                else:
-                    target_args_sep = value
-            i += 1
-        if target_cmd:
-            # Same precedence and decode as the stub: both sides must hash
-            # identical argv for daemon target lookup to find the backend.
-            if target_args_b64 is not None:
-                raw_target_args = decode_target_args(target_args_b64)
-            else:
-                raw_target_args = (
-                    target_args_legacy.split(target_args_sep) if target_args_legacy else []
-                )
+        target = _wrapped_target(entry)
+        if target is not None:
+            target_cmd, raw_target_args = target
             # This is a matched quote/split codec, never a shell command.
             spec = " ".join(shlex.quote(p) for p in [target_cmd, *raw_target_args])
             # Bare server-name key: first-wins fallback. Two DISTINCT server
@@ -2572,19 +3035,33 @@ def env_sidecar_name(agent_name: str, server_name: str) -> str:
     NUL-delimited RAW components restores injectivity, so distinct
     ``(agent, server)`` pairs can never share a file.
 
+    THE AGENT STAYS IN THE NAME EVEN THOUGH IT IS NOT A POOL DIMENSION, and the
+    two facts do not conflict. This file carries one declaration's FULL env,
+    rotating secrets included, and it is read back unfiltered for a
+    connection-private backend. The pool dimension available instead,
+    ``effective_env_hash``, deliberately EXCLUDES every
+    ``AWS_SECRET``/``AWS_SESSION``/``OAUTH`` key, so two agents declaring one
+    server with the same non-secret env and different credentials hash equal:
+    naming the file after that hash would put both declarations on one name,
+    the second write would win, and the first agent's private backend would be
+    handed the second agent's credentials. One name per declaration makes that
+    substitution unrepresentable. Pool identity is unaffected either way --
+    nothing here reaches :class:`~kiro_crew.mcp_gateway.pool.PoolKey`, so two
+    agents declaring a server identically still share one backend and simply
+    read their own byte-identical copy of this file.
+
     Single source of truth for the naming rule: the rewriter writes the sidecar
-    and ``gatewayd`` reads it back by recomputing this name from the PoolKey's
-    ``agent_name``/``server_name``, so a change here moves both ends at once.
-    Sidecars written under an older naming scheme are pruned as stale by
-    ``rewrite_agents`` (it deletes any ``env/*.json`` it did not just write).
+    and ``gatewayd`` reads it back by recomputing this name from the agent its
+    Register frame named plus the PoolKey's ``server_name``, so a change here
+    moves both ends at once. Sidecars written under an older naming scheme are
+    pruned as stale by ``rewrite_agents`` (it deletes any ``env/*.json`` it did
+    not just write).
     """
 
     def _san(s: str) -> str:
         return "".join(c if (c.isalnum() or c in "_-") else "_" for c in s)
 
-    digest = hashlib.sha256(
-        f"{agent_name}\0{server_name}".encode("utf-8")
-    ).hexdigest()[:12]
+    digest = hashlib.sha256(f"{agent_name}\0{server_name}".encode("utf-8")).hexdigest()[:12]
     return f"{_san(agent_name)}.{_san(server_name)}.{digest}.json"
 
 

@@ -12,9 +12,11 @@ These pin two properties of the config-loader decoupling refactor:
 
 from __future__ import annotations
 
+import errno
 import logging
 import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -48,6 +50,23 @@ class TestConfigDir:
         result = paths.config_dir()
         assert result == home.resolve()
         assert result.is_dir()
+
+    def test_the_home_is_created_with_no_mode_argument_on_windows(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A ``0o700`` mkdir is a protected DACL on Windows; POSIX gets owner-only."""
+        seen: list[int] = []
+        real_mkdir = Path.mkdir
+
+        def recording_mkdir(self: Path, mode: int = 0o777, **kwargs: object) -> None:
+            seen.append(mode)
+            real_mkdir(self, mode, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(Path, "mkdir", recording_mkdir)
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "fresh-home"))
+        paths.config_dir()
+
+        assert seen == [0o777 if sys.platform == "win32" else 0o700]
 
     def test_kirocrew_home_system_dir_is_ignored(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -86,6 +105,151 @@ class TestLedgerRoot:
         assert restricted == [], "the owner-only callback would chmod the link target"
         assert list(target.iterdir()) == [], "the linked target was modified"
         assert any("Refusing crew log root" in record.message for record in caplog.records)
+
+
+def _eperm(path: Path) -> PermissionError:
+    return PermissionError(errno.EPERM, "Operation not permitted", str(path))
+
+
+def _raising(exc: BaseException) -> Callable[[Path], None]:
+    def restrict(_directory: Path) -> None:
+        raise exc
+
+    return restrict
+
+
+class TestCannotRestrictWarnings:
+    """A tightening the OS refuses is reported as a warning, with a traceback only
+    when the error is one nobody expected. ``EPERM`` is expected on macOS, where a
+    kernel-protected provenance attribute denies ``chmod`` and ``stat`` on the data
+    home even to its owner, so a healthy startup must not print a traceback for it.
+    On Linux the same errno is a chown-fixable ownership problem, so it keeps one.
+    """
+
+    @staticmethod
+    def _cannot_restrict_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+        return [r for r in caplog.records if r.message.startswith("Cannot restrict")]
+
+    def test_log_root_eperm_on_macos_is_a_single_line_warning(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        monkeypatch.setattr(sys, "platform", "darwin")
+        home = tmp_path / "home"
+        home.mkdir()
+        root = home / "crew-log"
+
+        with caplog.at_level(logging.WARNING, logger=paths.__name__):
+            paths._ensure_crew_log_root(home, _raising(_eperm(root)))
+
+        (record,) = self._cannot_restrict_records(caplog)
+        assert record.levelno == logging.WARNING
+        assert record.exc_info is None, "an expected EPERM must not carry a traceback"
+        assert "Traceback" not in caplog.text
+        assert str(root) in record.message, "the warning names the path it could not tighten"
+        assert "Operation not permitted" in record.message
+        assert "provenance" in record.message and "chown" in record.message
+        assert "continues" in record.message
+
+    @pytest.mark.parametrize(
+        ("platform", "exc"),
+        [
+            pytest.param(
+                "darwin", OSError(errno.EROFS, "Read-only file system"), id="other-oserror"
+            ),
+            pytest.param("darwin", RuntimeError("no resolver"), id="runtime-error"),
+            pytest.param("linux", _eperm(Path("crew-log")), id="eperm-on-linux"),
+        ],
+    )
+    def test_log_root_other_errors_keep_the_traceback(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        platform: str,
+        exc: BaseException,
+    ) -> None:
+        monkeypatch.setattr(sys, "platform", platform)
+        home = tmp_path / "home"
+        home.mkdir()
+
+        with caplog.at_level(logging.WARNING, logger=paths.__name__):
+            paths._ensure_crew_log_root(home, _raising(exc))
+
+        (record,) = self._cannot_restrict_records(caplog)
+        assert record.exc_info is not None, "an unexpected error keeps its traceback"
+        assert record.exc_info[1] is exc
+        assert "Traceback" in caplog.text
+        assert "provenance" not in record.message
+
+    @staticmethod
+    def _refuse_only_the_home(
+        monkeypatch: pytest.MonkeyPatch, home: Path, exc: BaseException
+    ) -> list[Path]:
+        from kiro_crew import platform_compat
+
+        real = platform_compat.restrict_dir_to_owner
+        refused: list[Path] = []
+
+        def restrict(directory: Path) -> None:
+            if directory == home:
+                refused.append(directory)
+                raise exc
+            real(directory)
+
+        monkeypatch.setattr(platform_compat, "restrict_dir_to_owner", restrict)
+        monkeypatch.setattr(paths, "config_dir", lambda: home)
+        return refused
+
+    def test_data_home_eperm_on_macos_is_a_single_line_warning(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        monkeypatch.setattr(sys, "platform", "darwin")
+        home = tmp_path / "home"
+        home.mkdir()
+        refused = self._refuse_only_the_home(monkeypatch, home, _eperm(home))
+
+        with caplog.at_level(logging.WARNING, logger=paths.__name__):
+            assert paths.ensure_data_home() == home
+
+        assert refused == [home], "the test did not exercise the failing branch"
+        (record,) = self._cannot_restrict_records(caplog)
+        assert record.exc_info is None, "an expected EPERM must not carry a traceback"
+        assert "Traceback" not in caplog.text
+        assert str(home) in record.message, "the warning names the path it could not tighten"
+        assert "provenance" in record.message and "chown" in record.message
+        assert "continues" in record.message
+        assert (home / "crew-log").is_dir(), "the crew log root is still established"
+
+    @pytest.mark.parametrize(
+        ("platform", "exc"),
+        [
+            pytest.param(
+                "darwin", OSError(errno.EROFS, "Read-only file system"), id="other-oserror"
+            ),
+            pytest.param("linux", _eperm(Path("home")), id="eperm-on-linux"),
+        ],
+    )
+    def test_data_home_other_errors_keep_the_traceback(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        platform: str,
+        exc: BaseException,
+    ) -> None:
+        monkeypatch.setattr(sys, "platform", platform)
+        home = tmp_path / "home"
+        home.mkdir()
+        refused = self._refuse_only_the_home(monkeypatch, home, exc)
+
+        with caplog.at_level(logging.WARNING, logger=paths.__name__):
+            assert paths.ensure_data_home() == home
+
+        assert refused == [home], "the test did not exercise the failing branch"
+        (record,) = self._cannot_restrict_records(caplog)
+        assert record.exc_info is not None, "an unexpected error keeps its traceback"
+        assert record.exc_info[1] is exc
+        assert "Traceback" in caplog.text
 
 
 class TestConfigPackageDir:

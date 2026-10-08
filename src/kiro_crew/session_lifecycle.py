@@ -15,12 +15,23 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable, MutableMapping, Sequence
 from concurrent.futures import Executor
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
+from kiro_crew.kiro_prerequisite import (
+    identity_park_grace_remaining,
+    identity_stamp_mismatch,
+    mark_identity_parked,
+    spawn_identity_of,
+    spawned_under,
+)
+from kiro_crew.messaging import turn_ceiling
 from kiro_crew.messaging.link import canonical_key
+from kiro_crew.messaging.queue_drain import entry_channel, wake_other_drains
 from kiro_crew.metrics.sessions import (
     END_REASON_DESTROYED,
     END_REASON_DISCARDED,
@@ -32,6 +43,9 @@ from kiro_crew.metrics.sessions import (
     record_session_ended,
     record_sessions_ended,
 )
+from kiro_crew.process_identity import ProcessHandle, process_handle_of
+from kiro_crew.session_pool import pool_kiro_agent
+from kiro_crew.start_priority import PrioritySemaphore
 
 CancelOutcome = Literal["acked", "timeout", "no_turn", "error"]
 
@@ -48,7 +62,430 @@ _END_REASON_SID_RETAINED = "destroyed_sid_retained"
 #: Not a real key, and never logged as one: it only has to be non-None so the claim
 #: is withheld, because an unreadable map is not evidence of revocation.
 _SID_RETENTION_UNKNOWN = "<unreadable session map>"
-StopOutcome = Literal["soft", "hard", "idle"]
+#: ``compacting`` is the one outcome that changed nothing: a cooperative Stop
+#: arrived while the session's own ``/compact`` turn held it, and cancelling that
+#: turn would fail the compaction and recycle the session. The
+#: caller tells the user, and the compaction finishes or times out on its own.
+#: A ``force`` stop is never answered this way -- it is the user's escape hatch.
+StopOutcome = Literal["soft", "hard", "idle", "compacting"]
+
+#: What a channel says for the ``compacting`` outcome. One string, so every
+#: surface that declines the Stop declines it in the same words.
+STOP_DECLINED_COMPACTING_TEXT = (
+    "⏳ Compacting context — nothing was stopped. The compaction finishes on its own; "
+    "a message sent now runs once it has. Send stop again within a minute to force it, "
+    "which restarts the session (the agent keeps only a recent excerpt of the conversation)."
+)
+
+#: How long after a declined stop a repeat counts as the second press and forces.
+#: ONE constant for every surface: the dashboard's escalation gate
+#: (``slot_projection.stop_declined_armed``) imports it from here, and the
+#: composer's "click again" hint mirrors the same number.
+STOP_DECLINED_ESCALATION_SECS = 60.0
+
+#: Count bound on live decline markers. A marker lives for one window and is
+#: swept on every write, so the bound is only reached by that many DISTINCT
+#: (session, presser) pairs declined inside one minute. Past it the oldest marker
+#: is dropped and the drop is counted and logged: that presser's repeat is
+#: declined once more rather than forcing, which is the safe side.
+STOP_DECLINED_MARKERS_MAX = 256
+#: Retained-string bound on each half of a marker's key. Both halves are
+#: externally derived (a session key from a route, a presser from a sender id).
+#: A longer one is refused at the point of retention, not truncated: a truncated
+#: key could collide two pressers, which is the sharing this keying exists to
+#: prevent. The refusal is counted and logged like an overflow.
+STOP_DECLINED_KEY_MAX_CHARS = 512
+
+_logger = logging.getLogger(__name__)
+
+#: Live decline markers, oldest first: ``(session key, presser)`` -> monotonic time
+#: of the decline. Keyed by the PRESSER as well as the session because one session
+#: key is shared by every member of a group route and, under
+#: ``dm_scope = "unified"``, by every allow-listed person's DM: a marker keyed by
+#: session alone lets one person's declined Stop arm the next person's press as
+#: the FORCE that resets the session under both of them. Module level so every
+#: channel dispatcher shares one record through the two functions below, exactly
+#: as they share the probe.
+_stop_declined_markers: OrderedDict[tuple[str, str], float] = OrderedDict()
+#: Markers refused or evicted since import, so the overflow is said out loud.
+_stop_declined_dropped = 0
+
+
+def _stop_declined_key(key: str, presser: str) -> tuple[str, str] | None:
+    """The marker key for *key* pressed by *presser*, or None past the string bound."""
+    if len(key) > STOP_DECLINED_KEY_MAX_CHARS or len(presser) > STOP_DECLINED_KEY_MAX_CHARS:
+        return None
+    return (key, presser)
+
+
+def _count_stop_declined_drop(reason: str, key: str, presser: str) -> None:
+    global _stop_declined_dropped
+    _stop_declined_dropped += 1
+    _logger.warning(
+        "stop-declined marker %s (session=%.64s presser=%.64s); %d dropped so far, "
+        "cap %d markers / %d chars per key",
+        reason,
+        key,
+        presser,
+        _stop_declined_dropped,
+        STOP_DECLINED_MARKERS_MAX,
+        STOP_DECLINED_KEY_MAX_CHARS,
+    )
+
+
+def note_stop_declined(key: str, presser: str, *, now: float | None = None) -> None:
+    """Record that *presser*'s stop on *key* was just declined for compaction.
+
+    *presser* is REQUIRED, with no default, for the reason ``stop_running_turn``'s
+    ``owner`` is: a channel wired up later cannot inherit a session-wide marker by
+    leaving it out. A channel that genuinely cannot name its presser passes ``""``,
+    which arms a marker only that same anonymous route can consume.
+    """
+    current = time.monotonic() if now is None else now
+    marker = _stop_declined_key(key, presser)
+    if marker is None:
+        _count_stop_declined_drop("refused: key past the string bound", key, presser)
+        return
+    for stale in [
+        m
+        for m, at in _stop_declined_markers.items()
+        if current - at >= STOP_DECLINED_ESCALATION_SECS
+    ]:
+        del _stop_declined_markers[stale]
+    _stop_declined_markers.pop(marker, None)
+    _stop_declined_markers[marker] = current
+    while len(_stop_declined_markers) > STOP_DECLINED_MARKERS_MAX:
+        evicted, _ = _stop_declined_markers.popitem(last=False)
+        _count_stop_declined_drop("evicted: past the count bound", *evicted)
+
+
+async def decline_stop(
+    key: str, presser: str, deliver: Callable[[], Awaitable[bool]], *, now: float | None = None
+) -> bool:
+    """Tell *presser* their stop was declined, and only then arm their escalation.
+
+    The marker this writes is what turns the SAME presser's next press inside
+    the window into a hard reset that pops the session and trims the
+    conversation to an excerpt. The only thing that makes that press informed is
+    the sentence *deliver* carries, so the send goes first and the marker is
+    written after it returns. A transport that could not reach the presser
+    therefore arms nothing, and their retry -- which a missing acknowledgement
+    makes MORE likely, not less, since a person who saw no answer presses again
+    within seconds -- is a first press again and is declined again.
+
+    *deliver* must report delivery EXPLICITLY: only ``True`` arms the marker.
+    Nothing else does, ``None`` included, because that is the value a transport
+    whose send swallows its own error returns when the send did not land -- and
+    reading an unknown value as success is the one mistake here that costs the
+    user their conversation. A send that raises propagates exactly as the bare
+    send did. Returns whether the escalation is armed.
+    """
+    if await deliver() is not True:
+        return False
+    note_stop_declined(key, presser, now=now)
+    return True
+
+
+def clear_stop_declined(key: str, *, fold: Callable[[str], str] | None = None) -> int:
+    """Drop every decline marker on *key*; returns how many.
+
+    Called when the compaction that declined them ENDS (``_set_compacting`` off):
+    a marker is a memory of one refusal, and the next compaction on the key,
+    even one starting inside the window, owes its own first refusal. Without
+    this a person declined on compaction A could hard-reset compaction B with
+    what reads to them as a first press. *fold* is the manager's key fold: a
+    channel presses with its own spelling of the key, which the probe folds onto
+    the live one, so a marker is this compaction's when its key folds to *key*.
+    """
+    same = (lambda k: k == key) if fold is None else (lambda k: k == key or fold(k) == key)
+    stale = [m for m in _stop_declined_markers if same(m[0])]
+    for m in stale:
+        del _stop_declined_markers[m]
+    return len(stale)
+
+
+def consume_stop_declined(key: str, presser: str, *, now: float | None = None) -> bool:
+    """Whether *presser*'s fresh decline on *key* arms THIS stop as the forcing press.
+
+    Only the presser who was declined can spend the marker. Consumes it either
+    way: a stale one is dropped, a fresh one is spent by the press it armed.
+    """
+    marker = _stop_declined_key(key, presser)
+    if marker is None:
+        return False
+    at = _stop_declined_markers.pop(marker, None)
+    if at is None:
+        return False
+    current = time.monotonic() if now is None else now
+    return current - at < STOP_DECLINED_ESCALATION_SECS
+
+
+async def force_stop_keeping_others(
+    sessions: Any, key: str, owned_by: Callable[[dict], bool]
+) -> bool:
+    """A channel's forced stop on *key* that drops ONLY the presser's queued work.
+
+    The forced stop hard-resets the session, and ``reset`` pops the ``_Session``
+    with its queue and unlinks every queued attachment -- ``preserve_queue`` only
+    skips ``stop_turn``'s own clear, it cannot save what the pop discards. On a
+    key several people share (a group route, ``dm_scope = "unified"``) that is
+    other people's unanswered messages. So the queue is DETACHED before the stop
+    (``detach_queue``, files kept), the presser's entries are dropped from the
+    handles after it (``clear_queue(only=...)`` unlinks their files whether or
+    not a session holds the key), and the rest are handed to the successor the
+    hard stop respawns: ``get_or_create`` claims that successor (or builds it),
+    ``restore_queue`` puts them at its head, ``release`` lets its drain run, and
+    ``wake_other_drains`` starts the channels those entries belong to
+    (``hand_queue_to_successor``). If no successor starts, the kept entries are
+    parked, files intact, for the hard stop's own respawn retry. Returns whether
+    the running turn was ended.
+    """
+    taken = tuple(sessions.detach_queue(key))
+    try:
+        ended = (await sessions.stop_turn(key, force=True, preserve_queue=True)) == "hard"
+    except BaseException:
+        # A reset that raised after popping the session leaves no queue for the
+        # restore to land on; those entries are then parked for the next start
+        # rather than lost in a local that is about to unwind.
+        if _has_session(sessions, key):
+            sessions.restore_queue(key, taken)
+        elif taken:
+            _park_queue(sessions, key, taken)
+        raise
+    mine = tuple(e for e in taken if owned_by(e[2]))
+    others = tuple(e for e in taken if not owned_by(e[2]))
+    if mine:
+        sessions.clear_queue(key, only=mine)
+    if others or _parked_for(sessions, key):
+        # ``others`` from the detach, plus anything ``stop_turn`` parked from a
+        # message admitted after the detach, both go to the successor now.
+        await hand_queue_to_successor(sessions, key, others)
+    return ended
+
+
+#: Count bound on queue entries parked for ONE key whose successor could not
+#: start, and on the parked entries across ALL keys. Past either the OLDEST
+#: parked entry (of that key, or of the whole store) is dropped, its files
+#: unlinked, and the drop is counted and logged: parking is a retry buffer for a
+#: failed start, not a second queue. The keys are bounded by the same string
+#: bound as the decline markers (``STOP_DECLINED_KEY_MAX_CHARS``); a key past it
+#: is refused, not truncated, and its entries dropped with their files unlinked.
+#: Each entry's own fields are bounded too, at the point of retention: a message
+#: id past ``PARKED_ENTRY_TS_MAX_CHARS``, a text past
+#: ``PARKED_ENTRY_TEXT_MAX_CHARS`` or kwargs whose repr is past
+#: ``PARKED_ENTRY_KWARGS_MAX_CHARS`` refuse the entry (files unlinked, counted,
+#: logged) rather than retain an externally sized payload for the store's life.
+PARKED_QUEUE_MAX = 64
+PARKED_QUEUE_TOTAL_MAX = 256
+PARKED_ENTRY_TEXT_MAX_CHARS = 64 * 1024
+PARKED_ENTRY_KWARGS_MAX_CHARS = 16 * 1024
+#: The entry's message id (a Slack ts, a Telegram message id): a short token on
+#: every channel, so the bound is generous and a value past it is a malformed entry.
+PARKED_ENTRY_TS_MAX_CHARS = 256
+
+#: Queue entries a forced stop kept but could not hand to a successor because
+#: none would start (a provider failing to spawn). Retained rather than dropped:
+#: they are other people's unanswered messages and their staged attachments.
+#: Oldest key first. Drained onto the key's queue by the next
+#: ``hand_queue_to_successor`` for the key, and by the hard stop's own respawn
+#: path calling it, so a start that later succeeds delivers them.
+_parked_queue: OrderedDict[str, list[Any]] = OrderedDict()
+#: Entries refused or evicted since import, so the overflow is said out loud.
+_parked_dropped = 0
+
+
+def _parked_total() -> int:
+    return sum(len(v) for v in _parked_queue.values())
+
+
+def _drop_parked(sessions: Any, key: str, entry: Any, reason: str) -> None:
+    global _parked_dropped
+    _parked_dropped += 1
+    sessions.clear_queue(key, only=(entry,))  # unlinks the handle's files
+    _logger.warning(
+        "parked queue entry for %.64s dropped (%s); %d dropped so far, caps %d/key %d total",
+        key,
+        reason,
+        _parked_dropped,
+        PARKED_QUEUE_MAX,
+        PARKED_QUEUE_TOTAL_MAX,
+    )
+
+
+def _has_session(sessions: Any, key: str) -> bool:
+    probe = getattr(sessions, "has_session", None)
+    try:
+        return bool(probe(key)) if callable(probe) else False
+    except Exception:
+        return False
+
+
+def _entry_within_bounds(entry: Any) -> bool:
+    try:
+        ts, text, kwargs = entry
+    except (TypeError, ValueError):
+        return False
+    if len(str(ts)) > PARKED_ENTRY_TS_MAX_CHARS:
+        return False
+    if len(str(text)) > PARKED_ENTRY_TEXT_MAX_CHARS:
+        return False
+    try:
+        return len(repr(kwargs)) <= PARKED_ENTRY_KWARGS_MAX_CHARS
+    except Exception:
+        return False
+
+
+def _park_queue(sessions: Any, key: str, entries: tuple[Any, ...]) -> None:
+    # Under the REGISTRY key: adoption happens where a session is registered,
+    # which is under the folded spelling, whatever spelling the channel passed.
+    key = _folded(sessions, key)
+    if len(key) > STOP_DECLINED_KEY_MAX_CHARS:
+        for entry in entries:
+            _drop_parked(sessions, key, entry, "refused: key past the string bound")
+        return
+    admitted = []
+    for entry in entries:
+        if _entry_within_bounds(entry):
+            admitted.append(entry)
+        else:
+            _drop_parked(sessions, key, entry, "refused: entry past the field bounds")
+    if not admitted:
+        return
+    parked = _parked_queue.setdefault(key, [])
+    _parked_queue.move_to_end(key)
+    parked.extend(admitted)
+    while len(parked) > PARKED_QUEUE_MAX:
+        _drop_parked(sessions, key, parked.pop(0), "evicted: past the per-key bound")
+    while _parked_total() > PARKED_QUEUE_TOTAL_MAX:
+        oldest_key = next(iter(_parked_queue))
+        oldest = _parked_queue[oldest_key]
+        _drop_parked(sessions, oldest_key, oldest.pop(0), "evicted: past the total bound")
+        if not oldest:
+            del _parked_queue[oldest_key]
+
+
+def _folded(sessions: Any, key: str) -> str:
+    """*key* under the registry's spelling, or unchanged when *sessions* cannot fold."""
+    fold = getattr(sessions, "_fold_key", None)
+    if callable(fold):
+        try:
+            folded = fold(key)
+        except Exception:
+            folded = None
+        if isinstance(folded, str) and folded:
+            return folded
+    return key
+
+
+def _parked_for(sessions: Any, key: str) -> bool:
+    return bool(_parked_queue.get(_folded(sessions, key)))
+
+
+def take_parked_queue(key: str) -> tuple[Any, ...]:
+    """Remove and return the entries parked for *key* (empty when none)."""
+    return tuple(_parked_queue.pop(key, ()))
+
+
+def adopt_parked_queue(session: Any, key: str) -> int:
+    """Move *key*'s parked entries onto a just-registered *session*'s queue head.
+
+    Called by the allocation layer at the moment it registers a session under
+    *key*, so ANY start that succeeds -- the hard stop's eager respawn, or the
+    next ordinary allocation after that respawn failed too -- delivers what a
+    forced stop parked. Returns how many entries moved.
+    """
+    parked = take_parked_queue(key)
+    if not parked:
+        return 0
+    session.queue.extendleft(reversed(parked))
+    return len(parked)
+
+
+def allocation_identity(owner: Any, key: str, session: Any) -> dict[str, Any]:
+    """The ``get_or_create`` arguments that rebuild *session*'s identity for *key*.
+
+    Shared by the reset successor and the compaction restart
+    (``session_compaction._restart_held``) so the two cannot drift: agent,
+    approval policy, cwd, bound channel, the model the allocation selected and
+    the crew member. A caller's ``extra_env`` is not recorded on a session, so
+    it cannot be carried.
+    """
+    return {
+        "agent": getattr(session, "agent", "") or None,
+        "approval_policy": getattr(session, "approval_policy", ""),
+        "cwd": getattr(session.provider, "cwd", None) or None,
+        "channel_id": owner.get_channel(key) or None,
+        "model": getattr(session, "requested_model", "") or None,
+        "crew_agent": getattr(session, "capability_member", "") or None,
+    }
+
+
+async def hand_queue_to_successor(sessions: Any, key: str, entries: tuple[Any, ...]) -> bool:
+    """Put *entries* (plus anything already parked for *key*) at the head of the
+    key's successor queue and wake their channels. Returns whether they landed.
+
+    ``get_or_create`` claims the successor or builds it; on a failed build the
+    entries are PARKED, files kept, and the next registration under this key --
+    the hard stop's eager respawn, or any later ordinary allocation -- adopts
+    them (``adopt_parked_queue``). Nothing is unlinked on failure: these are
+    other people's unanswered messages.
+    """
+    pending = tuple(entries)
+    if not pending and not _parked_for(sessions, key):
+        return True
+    try:
+        await sessions.get_or_create(key)
+    except BaseException as exc:
+        # ``BaseException``: a cancellation of the calling task lands here too,
+        # and the entries are other people's messages either way -- parked, then
+        # the cancellation is re-raised so the caller still unwinds.
+        if pending:
+            _park_queue(sessions, key, pending)
+        _logger.warning(
+            "no successor for %s yet: %d queue entr(y/ies) parked for its next start",
+            key,
+            len(pending),
+            exc_info=True,
+        )
+        if not isinstance(exc, Exception):
+            raise
+        return False
+    # ``get_or_create`` adopted whatever was parked, at registration or claim;
+    # the new entries go ahead of it, as they were queued first, and the release
+    # wakes the adopted entries' drains. The restored entries' drains are woken
+    # here, after the release, as ``wake_other_drains`` requires.
+    try:
+        sessions.restore_queue(key, pending)
+    finally:
+        sessions.release(key)
+    channels = [entry_channel(e[2]) for e in pending]
+    if any(channels):
+        await wake_other_drains(waker="", session_key=key, channels=channels)
+    return True
+
+
+def compaction_in_flight(sessions: Any, key: str) -> bool:
+    """Whether an automatic compaction holds the session a Stop would cancel.
+
+    The ONE probe a stop path runs BEFORE its side effects (the Stop record, a
+    queue clear, a pending-file unlink), because ``stop_turn`` declining after
+    them leaves a Stop that ended nothing having destroyed queued work. Callers:
+    the dashboard stop and interrupt routes, Slack (events, handler,
+    interactions), the shared ``messaging.commands.stop_running_turn`` (Discord,
+    Telegram, Teams), the Webex, WeCom and Weixin dispatchers, WhatsApp, and Spec
+    Builder's Pause. Fail-soft
+    to False and ``is True`` rather than truthiness: a manager double without the
+    method, or one answering a truthy Mock, keeps the ordinary stop path.
+    """
+    probe = getattr(sessions, "is_compacting", None)
+    if not callable(probe):
+        return False
+    try:
+        return probe(key) is True
+    except Exception:
+        return False
+
+
 ProviderFactory = Callable[..., Any]
 _ANY_SESSION = object()
 
@@ -85,6 +522,8 @@ class _ChildTeardownHandler(Protocol):
 class _SessionEntry(Protocol):
     provider: Any
     semaphore: asyncio.BoundedSemaphore
+    queue: Any
+    cancelled: set[str]
     first_turn: object
     provider_switch_replay: bool
     retire_on_identity_change: bool
@@ -116,6 +555,8 @@ class _SessionMapPort(Protocol):
 class _BackgroundRuntime(Protocol):
     def has_active_or_initializing_sessions(self) -> bool: ...
 
+    def is_alive(self) -> bool: ...
+
     async def kill(self, expected: bool = False, reason: str = "") -> None: ...
 
 
@@ -128,7 +569,7 @@ class SessionLifecycleOwner(Protocol):
     _lock: asyncio.Lock
     _closing: bool
     _update_pause_owned: bool
-    _start_sem: asyncio.Semaphore
+    _start_sem: PrioritySemaphore
     _starting_pids: set[int]
 
     _pool_fill_lock: asyncio.Lock
@@ -150,6 +591,7 @@ class SessionLifecycleOwner(Protocol):
     _draining_bg_runtimes: list[_BackgroundRuntime]
     _subagent_runtimes: MutableMapping[str, _BackgroundRuntime]
     _subagent_runtime_locks: MutableMapping[str, asyncio.Lock]
+    _draining_subagent_runtimes: list[_BackgroundRuntime]
 
     _session_map: _SessionMapPort
 
@@ -167,7 +609,7 @@ class SessionLifecycleOwner(Protocol):
 
     def _is_continuable_key(self, key: str) -> bool: ...
 
-    def clear_queue(self, key: str) -> None: ...
+    def clear_queue(self, key: str, owned_by: Callable[[dict], bool] | None = None) -> None: ...
 
     def release(self, key: str) -> None: ...
 
@@ -177,17 +619,23 @@ class SessionLifecycleOwner(Protocol):
 
     async def _retire_stale_backend_bg_runtime(self) -> None: ...
 
-    async def release_subagent_runtime(self, parent_session_key: str) -> None: ...
+    async def release_subagent_runtime(
+        self, parent_session_key: str, *, expected: Any = None
+    ) -> bool: ...
 
     async def _retire_kiro_warm_pool(self) -> bool: ...
 
     def _mark_identity_epoch(self) -> None: ...
 
-    async def _retire_kiro_subagent_runtimes(self) -> bool: ...
+    async def _retire_kiro_subagent_runtimes(self, *, live: str = "") -> bool: ...
 
-    async def _retire_kiro_bg_runtime(self) -> bool: ...
+    async def _retire_kiro_bg_runtime(self, *, live: str = "") -> bool: ...
 
     async def _reap_drained_bg_runtimes_locked(self) -> None: ...
+
+    async def _detach_bg_runtime_locked(
+        self, runtime: _BackgroundRuntime, cause: str, *, park_only: bool = False
+    ) -> None: ...
 
     async def drain_active_turns(self, timeout: float | None = None) -> int: ...
 
@@ -215,13 +663,14 @@ class SessionLifecycleConstants:
     """Patch-sensitive policy values resolved as one call-time snapshot."""
 
     max_pool: int
-    max_concurrent_cold_starts: int
     background_key: str
     stateless_prefixes: tuple[str, ...]
     close_all_concurrency: int
     drain_active_turns_timeout_secs: float
     unbind_reason_session_destroyed: str
     first_turn_nothing_armed: object
+    first_turn_fresh: object
+    first_turn_resumed: object
     provider_label_claude: str
 
 
@@ -232,7 +681,7 @@ class SessionLifecycleDeps:
     The facade should pass forwarding callables, rather than captured module
     globals, for every patch-sensitive dependency.  That keeps patches such as
     ``kiro_crew.session.build_provider_factory`` and
-    ``kiro_crew.session.schedule_abort`` effective after service construction.
+    ``kiro_crew.session.schedule_abort_for`` effective after service construction.
     """
 
     logger: logging.Logger
@@ -253,8 +702,28 @@ class SessionLifecycleDeps:
     provider_has_unfinished_turn: Callable[[Any], bool]
     provider_uses_kiro_identity_store: Callable[[Any], bool]
     get_audit_logger: Callable[[], Any]
-    schedule_abort: Callable[..., None]
+    #: Abort push addressed by the opaque target a provider mints, never by a pid.
+    schedule_runtime_abort: Callable[..., None]
     monotonic: Callable[[], float]
+
+
+@dataclass(frozen=True, slots=True)
+class TornDown:
+    """One teardown in flight under a key: the session its ``reset`` popped, and the process it named AT THE POP.
+
+    ``handle`` is read off the session in the same lock hold as the pop
+    (:func:`kiro_crew.process_identity.process_handle_of`) and never again: the
+    teardown's own awaits can clear the provider's recorded pid while the process
+    is still standing -- the ACP client's reset clears it after a kill it could not
+    confirm, then hangs on the transport -- so a reader that re-read the session
+    later found no pid, named no process, and recorded a run ``reaped`` over a
+    live one. Immutable, so the identity the pop captured is the identity the
+    reader kills on. ``session`` is kept for identity: a reader that ends the key
+    counts the sessions it has answered by ``is``.
+    """
+
+    session: _SessionEntry
+    handle: ProcessHandle
 
 
 @dataclass(slots=True)
@@ -266,7 +735,32 @@ class SessionLifecycleState:
     # while the sweep runs and cleared only by the sweep that completes it, so an
     # outstanding change stays its own trigger for the next turn.
     identity_sweep_fingerprint: str = ""
+    # What the LAST sweep could not finish, one short label each (a session key,
+    # tagged when it is a busy or channel-member holder, or the runtime that
+    # stayed up). Empty after a complete sweep. Read by the caller's warning so
+    # an incomplete sweep names what it is waiting on.
+    identity_sweep_waiting_on: tuple[str, ...] = ()
     recycling: dict[str, _SessionEntry] = field(default_factory=dict)
+    # Folded key -> the session ``reset`` popped under it, for exactly the life of
+    # that teardown. ``reset`` pops the session out of the live map under the
+    # registry lock BEFORE the awaits that can hang (the end record, the unlink,
+    # the child probes, the provider shutdown), so from the pop to the end of the
+    # teardown the map does not name the process the teardown holds. A reader
+    # that must still reach it -- the cron reaper, killing a run whose OWN finally
+    # reset popped the session and then hung, the ordinary shape of a run that
+    # hangs in its teardown -- reads it here through
+    # :meth:`SessionLifecycleService.tearing_down`. Recorded in the same lock
+    # hold as the pop and released when the teardown ends however it ends
+    # (return, a raised shutdown error, a cancellation landing on the hung
+    # shutdown), by the :class:`_TeardownScope` the facade opens around every
+    # ``reset``. One entry per teardown in flight under the key, in pop order:
+    # a successor whose own reset popped it and hung beside the first teardown
+    # is a process the reader must reach too -- see the scope. Each entry is a
+    # :class:`TornDown`: the session AND the process handle read off it at the
+    # pop, because the teardown's own awaits clear the provider's pid while the
+    # process can still be standing, and a reader that re-read the session then
+    # named no process at all.
+    tearing_down: dict[str, list[TornDown]] = field(default_factory=dict)
     suppress_replay: set[str] = field(default_factory=set)
     origin_links: dict[str, Any] = field(default_factory=dict)
     on_recycled: _RecycleCallback | None = None
@@ -325,6 +819,90 @@ class _ReplayGap:
     closed: asyncio.Event = field(default_factory=asyncio.Event)
 
 
+class _TeardownScope:
+    """One ``reset`` call's hold on the ``tearing_down`` entry it records at its pop.
+
+    The facade opens a scope around every ``reset`` and hands it in; ``reset``
+    records the session it pops into the scope in the same lock hold as the pop,
+    and the scope's exit releases the entry. The release is the scope's and not a
+    ``finally`` inside ``reset`` because the pop sits under the registry lock at
+    the top of a teardown whose awaits span the rest of that method: the hold has
+    to outlive every one of them, which a caller-side ``with`` does without
+    re-indenting the teardown. A ``reset`` called with no scope records nothing.
+
+    Every teardown in flight under a key holds its own entry. A key has one live
+    session to pop at a time, but teardowns overlap: a cold start can register a
+    successor under the key while the first teardown still hangs, and that
+    successor's own reset can pop it and hang as well. A reader ending the key
+    (the cron reaper) must reach BOTH processes -- retaining the first popper
+    alone hid a hung successor behind a record that said ``reaped`` -- so each
+    scope records the session its reset popped beside the others under the key,
+    in pop order, and removes exactly that entry, by identity, when its teardown
+    ends -- return, raise or cancellation alike. Bounded by construction: an
+    entry lives exactly as long as the reset coroutine that recorded it, which
+    already holds that session, so the table adds a reference to each teardown in
+    flight and never a lifetime; a cap would only recreate the invisibility.
+
+    The scope also answers a question the table cannot: which session did THIS
+    reset pop? A caller that resets a key and then has to kill what the reset
+    could not stop (the cron reaper, when its own reset times out) cannot learn
+    that from a snapshot taken before the reset -- a cold start can register a
+    new session under the key between the snapshot and the pop, and it is that
+    session the reset pops and then hangs on. So a caller-supplied ``on_pop``
+    runs in the same lock hold as the pop, for every pop, so whatever it reads
+    off the session (a process handle) is read atomically with the pop and
+    before any await that could lose it. The table's own entry reads the same
+    handle at the same instant (:class:`TornDown`), for the readers that did
+    not open this scope: the run's own finally reset, and a successor's, are
+    teardowns the cron reaper never started and can reach only through the
+    table -- and only on the handle captured before their awaits cleared the
+    pid.
+    """
+
+    __slots__ = ("_table", "_key", "_session", "_on_pop")
+
+    def __init__(
+        self,
+        table: dict[str, list[TornDown]],
+        on_pop: Callable[[_SessionEntry], None] | None = None,
+    ) -> None:
+        self._table = table
+        self._key: str | None = None
+        self._session: _SessionEntry | None = None
+        self._on_pop = on_pop
+
+    def note_pop(self, key: str, session: _SessionEntry) -> None:
+        """Record the session ``reset`` is popping under *key*, in the same lock hold as the pop."""
+        self.retain(key, session)
+        if self._on_pop is not None:
+            self._on_pop(session)
+
+    def retain(self, key: str, session: _SessionEntry) -> None:
+        """Record *session*, with the process handle it names right now, among the teardowns under *key*."""
+        entries = self._table.setdefault(key, [])
+        if not any(entry.session is session for entry in entries):
+            entries.append(TornDown(session, process_handle_of(session)))
+        self._key = key
+        self._session = session
+
+    def release(self) -> None:
+        """Drop the entry this scope recorded; the entries other scopes hold are left alone."""
+        if self._key is not None:
+            entries = self._table.get(self._key)
+            if entries is not None:
+                entries[:] = [entry for entry in entries if entry.session is not self._session]
+                if not entries:
+                    del self._table[self._key]
+        self._key = None
+        self._session = None
+
+    def __enter__(self) -> "_TeardownScope":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.release()
+
+
 def _turn_in_flight(session: Any, *, refuse_only_on_active_turn: bool = False) -> bool:
     """Whether *session* is busy, as this caller's ``skip_if_busy`` means it.
 
@@ -374,6 +952,33 @@ class SessionLifecycleService:
     @_identity_sweep_lock.setter
     def _identity_sweep_lock(self, lock: asyncio.Lock) -> None:
         self.state.identity_sweep_lock = lock
+
+    def teardown_scope(
+        self, on_pop: Callable[[_SessionEntry], None] | None = None
+    ) -> _TeardownScope:
+        """A hold on the ``tearing_down`` entry the ``reset`` it is handed to records.
+
+        Opened by the facade around every ``reset`` (``with``), so the entry is
+        released when the teardown ends however it ends; see :class:`_TeardownScope`.
+        A caller that must know exactly which session its reset popped -- and read
+        something off it atomically with the pop -- opens the scope itself, passes
+        ``on_pop`` and hands the scope to ``reset``.
+        """
+        return _TeardownScope(self.state.tearing_down, on_pop)
+
+    def tearing_down(self, key: str) -> list[TornDown]:
+        """Every teardown in flight under *key*, in pop order: the popped session with the process handle read at its pop.
+
+        The live map stops naming a session at the pop, before the teardown's
+        awaits; a reader that must still reach those sessions' processes (the
+        cron reaper, after a run's own finally reset popped the session and hung
+        -- and after a successor's reset popped it and hung too) reads them here
+        for exactly the life of each teardown, and kills on the entry's
+        ``handle`` -- the identity captured at the pop -- never on a re-read of
+        the session, whose pid the hung teardown may since have cleared. Empty
+        when none is in flight. A fresh list: the table's own is not handed out.
+        """
+        return list(self.state.tearing_down.get(self._owner._fold_key(key), ()))
 
     def stop_generation(self, key: str) -> int:
         """How many Stop requests have been recorded for *key*.
@@ -621,11 +1226,7 @@ class SessionLifecycleService:
                 # OLD pool size and agent, and the TTL was never re-adopted by
                 # any path. Same clamp as WarmSessionPool._state_from_owner.
                 owner._pool_size = min(constants.max_pool, max(0, cfg.session.pool_size))
-                owner._pool_agent = cfg.session.pool_agent or getattr(
-                    cfg.agent,
-                    "default_agent",
-                    "",
-                )
+                owner._pool_agent = pool_kiro_agent(cfg)
                 owner._pool_ttl_secs = max(0, cfg.session.pool_ttl_secs)
                 owner._pool_cwd = pool_cwd
                 while not owner._warm_pool.empty():
@@ -671,11 +1272,7 @@ class SessionLifecycleService:
                 # handler that loads a disk-edited pool_ttl_secs must not evict
                 # the warm pool at the stale TTL until the watcher's next cycle.
                 owner._pool_size = min(constants.max_pool, max(0, cfg.session.pool_size))
-                owner._pool_agent = cfg.session.pool_agent or getattr(
-                    cfg.agent,
-                    "default_agent",
-                    "",
-                )
+                owner._pool_agent = pool_kiro_agent(cfg)
                 owner._pool_ttl_secs = max(0, cfg.session.pool_ttl_secs)
                 owner._pool_cwd = pool_cwd
                 while not owner._warm_pool.empty():
@@ -730,6 +1327,7 @@ class SessionLifecycleService:
         refuse_only_on_active_turn: bool = False,
         clear_conversation: bool = False,
         ends_conversation: bool = False,
+        scope: _TeardownScope | None = None,
     ) -> bool:
         """Kill a live session while preserving the exact reset semantics.
 
@@ -741,6 +1339,14 @@ class SessionLifecycleService:
         re-prompt. Those must NOT stop this parent's sub-agent runs: the child has a
         conversation to deliver into and is bounded by its own run timeout, so stopping it
         would discard live work belonging to a conversation that is coming back.
+
+        ``scope`` is the caller's hold on the ``tearing_down`` entry this reset records
+        at its pop (:class:`_TeardownScope`): the popped session stays readable through
+        :meth:`tearing_down` until the scope is released, which the facade does when this
+        call ends however it ends. Without a scope nothing is recorded, and the popped
+        session is unreachable from the pop on -- a reader that arrives after it (the
+        cron reaper, when the run's own finally reset popped the session and hung)
+        then has no handle to the process this teardown holds.
 
         ``ends_conversation=True`` says the caller is ending the conversation, not
         recycling it, and then this parent's runs are stopped like any other parent end.
@@ -800,6 +1406,19 @@ class SessionLifecycleService:
                     injecting = True
                 if injecting:
                     return False
+            # Recorded in the same lock hold as the pop and before it (``current`` is
+            # what the pop removes: no await separates the two reads): from the pop
+            # to the end of this method the live map does not name this session,
+            # and every await below (the end record, the unlink, the child probes,
+            # the provider shutdown) is where a teardown hangs. The scope keeps the
+            # popped session readable through ``tearing_down`` for exactly the life
+            # of this call -- the facade releases it when this method ends, however
+            # it ends -- and tells the caller which session THIS reset popped: its
+            # ``on_pop(session)`` hook, run here so a caller's read of the
+            # session is atomic with the pop. One entry per teardown in flight
+            # under the key, in pop order; no scope, no record.
+            if scope is not None and current is not None:
+                scope.note_pop(key, current)
             session = owner._sessions.pop(key, None)
             # Snapshotted in the SAME lock hold as the pop, and only when the caller says
             # the conversation is ending: every await below is a window a cold start can
@@ -834,6 +1453,13 @@ class SessionLifecycleService:
                 self._suppress_replay.discard(key)
             owner._compact_pending_verdict.pop(key, None)
             self._origin_links.pop(key, None)
+            # Same lock hold as the pop, so a successor that registers in any of
+            # the awaits below already finds these entries parked and adopts them.
+            rescued = (
+                self._park_reset_queue(key, session)
+                if session is not None and not ends_conversation
+                else 0
+            )
             if session is not None:
                 # Order matters: the holder is recorded BEFORE its waiters are
                 # woken, so the successor a woken waiter creates is already
@@ -971,11 +1597,45 @@ class SessionLifecycleService:
                 await owner.release_subagent_runtime(key)
             except Exception:
                 logger.debug("Reset %s: subagent runtime cleanup failed", key, exc_info=True)
+        if rescued and session is not None:
+            # Nothing else starts a successor for a key whose turn just failed: the
+            # next message might never come, and the end-of-turn drain of the failed
+            # turn finds no live session. The respawn registers one, which adopts
+            # the parked entries, and its release wakes their channels' drains.
+            # It starts under the popped session's own identity: a later claim
+            # takes a live session as-is, so a default-agent successor would run
+            # every follow-up, and every message after them, as the wrong agent.
+            task = asyncio.create_task(
+                self._respawn_as(key, allocation_identity(owner, key, session))
+            )
+            owner._background_tasks.add(task)
+            task.add_done_callback(owner._background_tasks.discard)
         if shutdown_error is not None:
             # The caller still sees what went wrong; it just sees it after this parent's
             # children have been dealt with rather than instead of that.
             raise shutdown_error
         return session is not None
+
+    def _park_reset_queue(self, key: str, session: _SessionEntry) -> int:
+        """Park the popped *session*'s live queue entries for the key's successor.
+
+        A recycling reset ends a process, not a conversation, and the queue holds
+        follow-ups people sent while the turn ran: acknowledged messages nobody
+        asked to drop. Entries a mid-turn cancel marked in ``cancelled`` stay on
+        the popped queue, so the teardown's unlink removes their files as before.
+        Parking is bounded (``PARKED_QUEUE_MAX``); what does not fit is dropped,
+        counted and logged by ``_park_queue``. Returns how many were parked.
+        """
+        cancelled = session.cancelled
+        kept = tuple(entry for entry in session.queue if entry[0] not in cancelled)
+        if not kept:
+            return 0
+        wanted = {id(entry) for entry in kept}
+        remaining = [entry for entry in session.queue if id(entry) not in wanted]
+        session.queue.clear()
+        session.queue.extend(remaining)
+        _park_queue(self._owner, key, kept)
+        return len(kept)
 
     def set_recycle_callback(self, cb: _RecycleCallback | None) -> None:
         """Register the watchdog recycle notification callback."""
@@ -1129,9 +1789,34 @@ class SessionLifecycleService:
                 "Parent end: cancelling sub-agents %s failed", list(agent_ids)
             )
 
+    def _release_turn_ceiling(self, folded: str, requested: str) -> None:
+        """Forget a channel conversation's turn-ceiling latch, beside the other
+        per-key state a reset verb forgets.
+
+        A channel conversation that reached its turn ceiling is latched under its
+        key, and the key survives every one of these verbs -- channel linkage is
+        retained by design. The refusal text tells the user to reset the
+        conversation, so each verb the product calls a reset has to be what
+        clears it: otherwise the only thing that releases a latched conversation
+        is a gateway restart and the notice names a remedy that does nothing.
+        Slack's ``!agent default`` answers "Reset to default agent" and reaches
+        ``remove``, so a reset on one verb and not another is the same trap with a
+        different spelling.
+
+        BOTH spellings, because the ceiling counts under the key the CHANNEL holds
+        while ``_fold_key`` resolves an alias onto the live key, so the two can
+        differ and clearing only the folded one would leave the latch standing
+        under the channel's own spelling.
+        """
+        ceiling = turn_ceiling.shared_ceiling()
+        ceiling.reset(folded)
+        if requested != folded:
+            ceiling.reset(requested)
+
     async def remove(self, key: str) -> None:
         """Shut down a session while preserving its session-map entry."""
         owner = self._owner
+        requested_key = key
         key = owner._fold_key(key)
         async with owner._lock:
             session = owner._sessions.pop(key, None)
@@ -1148,6 +1833,7 @@ class SessionLifecycleService:
             self.state.stop_requests.pop(key, None)
             self._discard_replay_gap(key)
             self.state.orphaned_holders.pop(key, None)
+            self._release_turn_ceiling(key, requested_key)
             if session is not None:
                 # Same tick as the pop: see reset for why recording after the
                 # teardown awaits would consume a successor's start.
@@ -1174,6 +1860,106 @@ class SessionLifecycleService:
             await owner.release_subagent_runtime(key)
             self._deps.logger.info("Removed session (map preserved): %s", key)
 
+    async def flag_identity_stamp_mismatches(self, live: str) -> list[str]:
+        """Mark sessions -- and retire idle companion runtimes -- whose child
+        PROVABLY spawned under a different account.
+
+        The consumer of the spawn-identity stamp
+        (``kiro_prerequisite.stamp_spawn_identity``): each kiro-backed provider
+        records the account the store held as its process started, and this
+        compares those records against *live* -- the fresh fingerprint the turn
+        gate just read. A mismatch means the child authenticated as an account
+        other than the one the store currently names, even when the baseline and the interim
+        latch both compare equal because no read ever observed the interim
+        (the A->B->A round trip a gateway-wide baseline is inherently blind
+        to).
+
+        Flag-only for sessions: it sets the existing ``retire_on_identity_change``
+        eviction flag -- the next acquire on that key reports the session
+        invalid and the stale-provider path recycles it -- and never touches
+        the sweep baseline, and never records anything sticky. That is the
+        loop guard: a wrong observation
+        here costs one targeted recycle of one session, not a
+        retire-until-complete sweep, and on a healthy host every stamp equals
+        *live* so this is a no-op per turn. Sessions with no stamp are skipped
+        (``identity_stamp_mismatch`` refuses them), keeping every unstamped
+        child on the pre-stamping protections rather than guessing.
+
+        Companion runtimes are not sessions: the background runtime and the
+        per-parent subagent runtimes hold their own kiro-backed processes,
+        carry the same spawn stamp, and never appear in ``owner._sessions``,
+        so the session scan cannot reach them. They have no per-session
+        eviction flag either, so a PROVEN mismatch retires an idle one through
+        the sweep's own idle-runtime reapers, narrowed by a predicate -- this
+        gate never calls ``release_subagent_runtime`` itself, keeping those
+        reapers the module's only such path outside the paired parent-end
+        sites. A busy runtime is never killed mid-turn (killing live
+        work is the defect this change exists to remove); instead the reapers
+        DISPLACE it out of the claimable slot -- popped from the registry (or
+        the ``_bg`` slot) and parked on a drain list -- so a new acquisition
+        spawns a replacement under the live account rather than demuxing
+        fresh sessions onto the wrong-account process, and the parked
+        runtime is killed by a later pass once its in-flight work drains.
+        """
+
+        if not live:
+            return []
+        owner = self._owner
+        flagged: list[str] = []
+        async with owner._lock:
+            for key, sess in owner._sessions.items():
+                if sess.retire_on_identity_change:
+                    continue
+                provider = sess.provider
+                if not self._deps.provider_uses_kiro_identity_store(provider):
+                    continue
+                if identity_stamp_mismatch(spawn_identity_of(provider), live):
+                    sess.retire_on_identity_change = True
+                    flagged.append(key)
+        # Drop the durable resume pointer for every flagged key, mirroring
+        # the sweep's clear_sid over its invalidated keys. Without this, the
+        # eviction that recycles the flagged session leaves the old sid in
+        # the map: get_or_create's re-entry reads it as resume_sid and the
+        # replacement child -- authenticated under the CURRENT account --
+        # issues session/load on the FLAGGED account's conversation, whose
+        # signed thinking blocks its provider then rejects wholesale. And
+        # close_all skips retire-flagged sessions by design, so the stale
+        # pointer would survive a gateway restart too. Outside owner._lock:
+        # clear_sid persists to disk, and the worst interleaving (a successor
+        # publishing its fresh sid between the flag and this clear) costs one
+        # lost resume pointer, never a wrong-account load. Session keys only:
+        # the runtime pseudo-keys appended below name processes, not map rows.
+        for key in flagged:
+            owner._session_map.clear_sid(key)
+        # Companion runtimes, via the dedicated idle-runtime reapers rather
+        # than releasing here: those reapers are the module's only
+        # retirement path outside the paired parent-end sites, so the
+        # parent-end ratchet stays a single-exemption contract. The predicate
+        # narrows their reap to PROVEN wrong-account runtimes; busy runtimes
+        # are skipped inside the reapers exactly as the sweep skips them.
+
+        def _mismatched(runtime: object) -> bool:
+            return identity_stamp_mismatch(getattr(runtime, "spawn_identity", ""), live)
+
+        retired: list[str] = []
+        await self._retire_kiro_subagent_runtimes(should_retire=_mismatched, retired=retired)
+        flagged.extend(f"subagent-runtime:{parent_key}" for parent_key in retired)
+        bg_retired: list[str] = []
+        await self._retire_kiro_bg_runtime(
+            should_retire=_mismatched,
+            retired=bg_retired,
+            reason="spawn identity mismatch retirement",
+        )
+        flagged.extend(bg_retired)
+        if flagged:
+            self._deps.logger.info(
+                "Flagged %d holder(s) whose child spawned under a different "
+                "account than the live one: %s",
+                len(flagged),
+                ", ".join(sorted(flagged)),
+            )
+        return flagged
+
     async def retire_kiro_identity_sessions(self, fingerprint: str = "") -> tuple[list[str], bool]:
         """Retire idle Kiro-backed processes after an identity-store change.
 
@@ -1186,18 +1972,21 @@ class SessionLifecycleService:
         *fingerprint* is the live identity the caller observed. It keys the
         generation fence below, so a retry for the same pending change skips
         successors that already restarted under the new account, while a sweep
-        under a different fingerprint captures afresh. Empty means the store
-        could not be read; see the comment at the fence.
+        under a different fingerprint captures afresh. It is also the spare
+        test: a holder whose spawn-identity stamp EQUALS it provably
+        authenticated as the live account and is left alone -- neither retired
+        nor counted against completeness -- because retiring it buys nothing
+        and costs its in-flight children (see the loop). Empty means the store
+        could not be read: nothing is spared (and see the comment at the fence).
         """
         owner = self._owner
         logger = self._deps.logger
-        constants = self._deps.constants()
         doomed: list[tuple[str, Any]] = []
         teardown_children_by_key: dict[str, tuple[str, ...]] = {}
         skipped = False
-        # One sweep at a time. Two peers draining permits one-by-one could each
-        # hold a partial barrier forever, preventing both finally blocks from
-        # restoring cold-start capacity.
+        waiting_on: list[str] = []
+        # One sweep at a time: the drain below is not re-entrant (a second
+        # concurrent drain raises), so a peer sweep waits here for this one.
         async with self._identity_sweep_lock:
             # Before the barrier, and before any key becomes claimable: every
             # provider already queued in the warm pool authenticated as the
@@ -1207,11 +1996,10 @@ class SessionLifecycleService:
             # while ``_retire_kiro_warm_pool`` (which must run outside the
             # barrier -- see ``mark_identity_epoch``) is still pending.
             owner._mark_identity_epoch()
-            held = 0
-            try:
-                for _ in range(constants.max_concurrent_cold_starts):
-                    await owner._start_sem.acquire()
-                    held += 1
+            # The barrier: every cold-start permit, collected ahead of both start
+            # priorities (``PrioritySemaphore.drain``), so a stream of person-started
+            # cold starts cannot keep taking the permits this sweep waits for.
+            async with owner._start_sem.drain():
                 async with owner._lock:
                     # An outstanding sweep is its own retirement trigger, so the
                     # pending fingerprint is recorded before anything is retired
@@ -1223,27 +2011,47 @@ class SessionLifecycleService:
                     # Selection and unregistering share one lock hold so a
                     # chosen idle object cannot start a turn before its pop.
                     #
-                    # Every session backed by the Kiro identity store is retired,
-                    # with no attempt to spare one that registered after the
-                    # pending change. Telling a new-account successor from an
-                    # old-account holder needs the identity each session
-                    # authenticated under, and registration order does not carry
-                    # it: a cold start that began before the switch registers
-                    # after it, so an order-based test hands the old account a
-                    # session it was asked to retire. Retiring one extra idle
-                    # session costs a fresh native conversation; sparing the
-                    # wrong one is the signature rejection this sweep exists to
-                    # prevent.
+                    # Telling a new-account successor from an old-account holder
+                    # needs the identity each session authenticated under, and
+                    # registration order does not carry it: a cold start that
+                    # began before the switch registers after it. The spawn
+                    # stamp does carry it, so a session whose stamp EQUALS the
+                    # live fingerprint is spared -- not retired, not flagged,
+                    # and not counted against completeness -- while an
+                    # unstamped or differently-stamped one is retired as before.
+                    #
+                    # The spare is what lets a sweep on a busy host FINISH. Its
+                    # completeness is what advances the baseline and clears the
+                    # pending fingerprint; without the spare it required every
+                    # kiro-backed session to be idle at once, which a gateway
+                    # with a dozen live chats never is, so every turn re-swept,
+                    # recycled every idle session -- and a parent that ended
+                    # its turn with ``spawn_run`` children still running IS
+                    # idle by the semaphore test, so its retirement cancelled
+                    # them ("provider shutdown") on every turn any chat took.
+                    # A retired live-account session also costs a fresh native
+                    # conversation for nothing. The spare needs exact equality
+                    # (``spawned_under``); sparing the wrong one is the
+                    # signature rejection this sweep exists to prevent, and an
+                    # unstamped child keeps the pre-stamping treatment.
                     retired_keys: list[str] = []
                     invalidated_keys: list[str] = []
                     for key in list(owner._sessions):
                         sess = owner._sessions[key]
                         if not self._deps.provider_uses_kiro_identity_store(sess.provider):
                             continue
+                        if spawned_under(sess.provider, fingerprint):
+                            continue
                         if sess.semaphore.locked():
                             sess.retire_on_identity_change = True
                             invalidated_keys.append(key)
                             skipped = True
+                            holder = (
+                                "channel member"
+                                if getattr(sess, "lifecycle_lease", False)
+                                else "busy"
+                            )
+                            waiting_on.append(f"{key} ({holder})")
                             continue
                         del owner._sessions[key]
                         owner._advance_session_generation(key)
@@ -1284,9 +2092,6 @@ class SessionLifecycleService:
                 # disk and must not run under the registry lock.
                 for key in invalidated_keys:
                     owner._session_map.clear_sid(key)
-            finally:
-                for _ in range(held):
-                    owner._start_sem.release()
 
         retired: list[str] = []
         for key, provider in doomed:
@@ -1311,19 +2116,26 @@ class SessionLifecycleService:
                     exc_info=True,
                 )
                 skipped = True
+                waiting_on.append(f"{key} (shutdown failed)")
 
         # Warm-pool policy remains owned by the pool service; route through the
         # facade to retain direct manager monkeypatches and its fill-lock policy.
         if not await owner._retire_kiro_warm_pool():
             skipped = True
-        if not await owner._retire_kiro_subagent_runtimes():
+            waiting_on.append("warm pool")
+        # Same spare for the companion runtimes: one that provably spawned
+        # under the live account is neither reaped nor a reason to re-sweep.
+        if not await owner._retire_kiro_subagent_runtimes(live=fingerprint):
             skipped = True
-        if not await owner._retire_kiro_bg_runtime():
+            waiting_on.append("sub-agent runtimes")
+        if not await owner._retire_kiro_bg_runtime(live=fingerprint):
             skipped = True
+            waiting_on.append("background runtime")
         if owner._starting_pids:
             # With every cold-start permit held above, residue here means a
             # producer bypassed the barrier; fail toward another sweep.
             skipped = True
+            waiting_on.append("cold starts in flight")
         complete = not skipped
         if complete:
             # Only the sweep that OWNS the pending fingerprint may retire it. The
@@ -1337,22 +2149,151 @@ class SessionLifecycleService:
                 self.state.identity_sweep_fingerprint = ""
             else:
                 complete = False
+                waiting_on.append("a newer identity change")
+        self.state.identity_sweep_waiting_on = tuple(waiting_on)
         return retired, complete
 
-    async def _retire_kiro_subagent_runtimes(self) -> bool:
-        """Retire idle Kiro-backed companion runtimes."""
+    async def _retire_kiro_subagent_runtimes(
+        self,
+        should_retire: Callable[[object], bool] | None = None,
+        retired: list[str] | None = None,
+        *,
+        live: str = "",
+    ) -> bool:
+        """Retire idle Kiro-backed companion runtimes.
+
+        This method is the module's ONLY companion-runtime retirement path
+        outside the paired parent-end sites: it reaps exclusively IDLE
+        runtimes, so it has no running child to end (the fact its ratchet
+        exemption in ``test_every_parent_end_release_site_ends_its_children``
+        rests on). Callers that need a narrower reap -- the spawn-identity
+        stamp gate retires only PROVEN wrong-account runtimes -- pass
+        ``should_retire`` rather than calling ``release_subagent_runtime``
+        themselves, which would widen that exemption.
+
+        ``should_retire`` filters which idle runtimes are reaped (``None``
+        retires every kiro-backed one -- identity-sweep semantics). The
+        sweep-quiescence post-conditions (spawn locks held, runtimes still
+        registered) only apply to the unfiltered sweep, since under a filter
+        the surviving runtimes are the expected outcome, not incompleteness.
+        ``retired`` collects the parent keys actually released. ``live`` is
+        the unfiltered sweep's spare: a REGISTERED runtime whose spawn stamp
+        equals it (``spawned_under``) provably authenticated as the live
+        account, so it is neither released nor counted by the post-conditions
+        -- the same spare the session loop applies, without which a sweep on a
+        host with any subagent in flight could never complete. Ignored under
+        a filter, and not consulted by the parked-runtime reaper that runs
+        first in the body: a parked runtime is a proven wrong-account holder
+        and still drains. The release itself is pinned to the runtime this
+        pass looked at (``expected=``): the sweep waits for the per-parent
+        lock behind any respawn in flight, and that respawn installs a
+        live-stamped replacement under the same key before letting go, which
+        a pop by key alone would kill. A skipped release leaves the
+        replacement to the post-condition, which spares it if live-stamped.
+
+        Under a filter, a runtime the predicate proves wrong-account is
+        DISPLACED rather than killed, busy and idle alike: popped from the
+        claimable registry (its per-parent spawn lock is dropped with it, so
+        a waiter retries against the live map and spawns a replacement under
+        the live account) and parked on ``_draining_subagent_runtimes`` until
+        its in-flight work finishes. Leaving it registered is one hole this
+        closes -- the registry is what ``get_subagent_runtime`` hands to NEW
+        demuxed sessions, so "busy, catch it later" kept the wrong-account
+        process claimable for the whole drain. Killing an IDLE-looking one on
+        the same pass is the other: the busy probe races a claim that was
+        handed the runtime but has not yet opened its init scope, so the kill
+        is always deferred to the drain reap at the top of this method, which
+        fires only on a later pass, only once the park grace has elapsed, and
+        only when the runtime still has no active or initializing sessions
+        (probes fail toward busy, preserving work). The unfiltered sweep
+        keeps its skip-busy contract untouched: its completeness signal is
+        what drives retries, and its busy sessions are already flagged for
+        next-turn retirement.
+        """
         owner = self._owner
         logger = self._deps.logger
         complete = True
+        # Reap parked displaced runtimes whose work has drained. Runs on
+        # every caller (the per-turn gate and the sweep), mirroring the bg
+        # drain reap at the top of _retire_kiro_bg_runtime. A runtime the
+        # spawn-identity gate parked keeps a kill grace on top of the busy
+        # probe: the probe can read a just-claimed runtime as idle for the
+        # sub-second stretch before the claim opens its init scope, and the
+        # grace outlasts that window (see identity_park_grace_remaining).
+        now = self._deps.monotonic()
+        # Iterate a snapshot but REMOVE entries individually: the kill below
+        # awaits, and a concurrent turn can park a new displaced runtime on
+        # the list during that suspension. Rebuilding the list from this
+        # snapshot would overwrite that park -- a live child already popped
+        # from _subagent_runtimes, referenced nowhere, invisible to close_all
+        # and the PID shield alike. Removing only what this pass actually
+        # killed leaves concurrent parks untouched.
+        for parked in list(owner._draining_subagent_runtimes):
+            if identity_park_grace_remaining(parked, now) > 0.0:
+                continue
+            try:
+                busy = parked.is_alive() and parked.has_active_or_initializing_sessions()
+            except Exception:
+                busy = True  # fail toward preserving work
+            if busy:
+                continue
+            try:
+                await parked.kill(expected=True, reason="drained identity displacement teardown")
+                logger.info("Reaped a drained displaced subagent runtime")
+            except Exception:
+                logger.warning(
+                    "Failed to reap a drained displaced subagent runtime; will retry",
+                    exc_info=True,
+                )
+                continue
+            try:
+                owner._draining_subagent_runtimes.remove(parked)
+            except ValueError:
+                pass
         for parent_key in list(owner._subagent_runtimes):
             runtime = owner._subagent_runtimes.get(parent_key)
             if runtime is None or not self._deps.provider_uses_kiro_identity_store(runtime):
+                continue
+            if should_retire is None and spawned_under(runtime, live):
+                continue
+            if should_retire is not None:
+                if not should_retire(runtime):
+                    continue
+                # Proven wrong-account: make it unclaimable NOW and drain it
+                # in the park -- busy or idle alike. Killing on the same pass
+                # that proved the mismatch is the race this closes: the idle
+                # probe can read a runtime just handed to a new claim as idle
+                # until the claim opens its init scope, so the kill always
+                # waits for a LATER pass (plus the park grace) rather than
+                # trusting one probe. Pop under the per-parent lock so an
+                # in-flight get_subagent_runtime waiter re-checks the
+                # canonical map instead of racing the displacement (mirrors
+                # release_subagent_runtime's dance, minus the kill).
+                lock = owner._subagent_runtime_locks.get(parent_key)
+                if lock is not None:
+                    async with lock:
+                        displaced = owner._subagent_runtimes.pop(parent_key, None)
+                        owner._subagent_runtime_locks.pop(parent_key, None)
+                else:
+                    displaced = owner._subagent_runtimes.pop(parent_key, None)
+                if displaced is not None:
+                    mark_identity_parked(displaced, now)
+                    owner._draining_subagent_runtimes.append(displaced)
+                    if retired is not None:
+                        retired.append(parent_key)
+                    logger.info(
+                        "Parked the subagent runtime for %s to drain — "
+                        "spawn identity mismatch displacement",
+                        parent_key,
+                    )
                 continue
             if runtime.has_active_or_initializing_sessions():
                 complete = False
                 continue
             try:
-                await owner.release_subagent_runtime(parent_key)
+                released = await owner.release_subagent_runtime(parent_key, expected=runtime)
+                if released and retired is not None:
+                    retired.append(parent_key)
             except Exception:
                 logger.warning(
                     "Failed to retire subagent runtime for %s after an identity change",
@@ -1360,34 +2301,86 @@ class SessionLifecycleService:
                     exc_info=True,
                 )
                 complete = False
-        if any(lock.locked() for lock in owner._subagent_runtime_locks.values()):
-            complete = False
-        # This post-condition catches a runtime installed after the snapshot but
-        # before its per-parent spawn lock was released.
-        if any(
-            runtime is not None and self._deps.provider_uses_kiro_identity_store(runtime)
-            for runtime in list(owner._subagent_runtimes.values())
-        ):
-            complete = False
+        if should_retire is None:
+            if any(lock.locked() for lock in owner._subagent_runtime_locks.values()):
+                complete = False
+            # This post-condition catches a runtime installed after the snapshot but
+            # before its per-parent spawn lock was released. A spared
+            # live-account runtime is the expected survivor, not a leftover.
+            if any(
+                runtime is not None
+                and self._deps.provider_uses_kiro_identity_store(runtime)
+                and not spawned_under(runtime, live)
+                for runtime in list(owner._subagent_runtimes.values())
+            ):
+                complete = False
+            # A parked displaced runtime is still a live process authenticated
+            # under the old account; the sweep is not done until it drains.
+            if any(
+                self._deps.provider_uses_kiro_identity_store(runtime)
+                and not spawned_under(runtime, live)
+                for runtime in owner._draining_subagent_runtimes
+            ):
+                complete = False
         return complete
 
-    async def _retire_kiro_bg_runtime(self) -> bool:
-        """Retire the idle Kiro-backed background runtime and drained holders."""
+    async def _retire_kiro_bg_runtime(
+        self,
+        should_retire: Callable[[object], bool] | None = None,
+        retired: list[str] | None = None,
+        reason: str = "deliberate logout teardown",
+        *,
+        live: str = "",
+    ) -> bool:
+        """Retire the idle Kiro-backed background runtime and drained holders.
+
+        ``should_retire`` filters the reap the same way as
+        :meth:`_retire_kiro_subagent_runtimes` (``None`` retires
+        unconditionally -- identity-sweep semantics); ``retired`` collects
+        ``"background-runtime"`` when the kill lands; ``reason`` labels the
+        kill for the process record; ``live`` is the unfiltered sweep's spare
+        (``spawned_under``), as on the companion reaper.
+        """
         owner = self._owner
         logger = self._deps.logger
         async with owner._bg_runtime_lock:
             await owner._reap_drained_bg_runtimes_locked()
             complete = not any(
                 self._deps.provider_uses_kiro_identity_store(runtime)
+                and not spawned_under(runtime, live)
                 for runtime in owner._draining_bg_runtimes
             )
             runtime = owner._bg_runtime
             if runtime is None or not self._deps.provider_uses_kiro_identity_store(runtime):
                 return complete
+            if should_retire is None and spawned_under(runtime, live):
+                return complete
+            if should_retire is not None and not should_retire(runtime):
+                return complete
+            if should_retire is not None:
+                # Proven wrong-account: free the slot NOW so the next
+                # acquisition spawns under the live account, and park the
+                # runtime on the existing drain list -- busy or idle alike.
+                # Skipping a busy one is the hole this closes (``_bg_runtime``
+                # is the claimable slot, so "busy, catch it later" kept the
+                # wrong-account process serving NEW background sessions for
+                # the whole drain), and killing an idle-looking one on this
+                # same pass is the race it avoids: the busy probe can read a
+                # runtime just handed to a ``get_bg_session`` claim as idle
+                # until the claim opens its init scope, so the kill is
+                # deferred to the drain reap, which fires on a later pass
+                # once the park grace has elapsed.
+                mark_identity_parked(runtime, self._deps.monotonic())
+                await owner._detach_bg_runtime_locked(
+                    runtime, "spawn identity mismatch displacement", park_only=True
+                )
+                if retired is not None:
+                    retired.append("background-runtime")
+                return False
             if runtime.has_active_or_initializing_sessions():
                 return False
             try:
-                await runtime.kill(expected=True, reason="deliberate logout teardown")
+                await runtime.kill(expected=True, reason=reason)
             except Exception:
                 logger.warning(
                     "Failed to retire the background runtime after an identity change",
@@ -1397,6 +2390,8 @@ class SessionLifecycleService:
             # Clear only after kill succeeds; otherwise retain the live-process
             # reference for the next retirement attempt.
             owner._bg_runtime = None
+            if retired is not None:
+                retired.append("background-runtime")
             logger.info("Retired the background runtime started under the previous account")
             return complete
 
@@ -1404,6 +2399,7 @@ class SessionLifecycleService:
         """Remove a speculative session only while its first turn is unclaimed."""
         owner = self._owner
         constants = self._deps.constants()
+        requested_key = key
         key = owner._fold_key(key)
         async with owner._lock:
             session = owner._sessions.get(key)
@@ -1427,6 +2423,7 @@ class SessionLifecycleService:
             self.state.stop_requests.pop(key, None)
             self._discard_replay_gap(key)
             self.state.orphaned_holders.pop(key, None)
+            self._release_turn_ceiling(key, requested_key)
             # Same tick as the removal: see reset.
             await record_session_ended(key, end_reason=END_REASON_UNCLAIMED)
         await asyncio.to_thread(self._deps.get_unlink_session_queue(), session)
@@ -1455,6 +2452,7 @@ class SessionLifecycleService:
         """Destroy *key* only while every synchronous under-lock guard allows it."""
         owner = self._owner
         constants = self._deps.constants()
+        requested_key = key
         async with owner._lock:
             key = owner._fold_key(key)
             if expect_generation is not _ANY_SESSION and owner._has_allocation_reservation(key):
@@ -1492,6 +2490,7 @@ class SessionLifecycleService:
             self.state.stop_requests.pop(key, None)
             self._discard_replay_gap(key)
             self.state.orphaned_holders.pop(key, None)
+            self._release_turn_ceiling(key, requested_key)
             # Ordinary permanent destroy starts a new conversation on reuse and
             # therefore clears the old threshold. History deletion can race a
             # same-key transcript claim in another process, so its explicit
@@ -1644,6 +2643,7 @@ class SessionLifecycleService:
         turn needs to create and map a new session under the same key.
         """
         owner = self._owner
+        requested_key = key
         key = owner._fold_key(key)
         async with owner._lock:
             current = owner._sessions.get(key)
@@ -1660,6 +2660,7 @@ class SessionLifecycleService:
             owner._advance_session_generation(key)
             owner._compact_cooldown_until.pop(key, None)
             owner._compact_pending_verdict.pop(key, None)
+            self._release_turn_ceiling(key, requested_key)
             # Store replay suppression atomically with the pop. Origin-link
             # state intentionally survives this operation.
             if replay:
@@ -1824,6 +2825,15 @@ class SessionLifecycleService:
                     key,
                     exc_info=True,
                 )
+        # Parked displaced runtimes are live processes outside the registry;
+        # shutdown ends them like every other holder.
+        parked_doomed = list(owner._draining_subagent_runtimes)
+        owner._draining_subagent_runtimes[:] = []
+        for parked in parked_doomed:
+            try:
+                await parked.kill(expected=True, reason="graceful shutdown")
+            except Exception:
+                logger.debug("close_all: displaced subagent runtime cleanup failed", exc_info=True)
 
         # Drain queued warm providers. This intentionally does not call the
         # public pool drain helper, whose informational log is not present on
@@ -1975,6 +2985,14 @@ class SessionLifecycleService:
         logger = self._deps.logger
         key = owner._fold_key(key)
         session = owner._sessions.get(key)
+        # BEFORE the Stop is recorded: a Stop this method declines is not a Stop
+        # the turn saw, and recording it would make the compaction path below
+        # read its own later failure as user-cancelled. ``getattr`` because the
+        # owner protocol does not declare the compacting set; a double without it
+        # keeps the old behaviour.
+        if not force and session is not None and key in getattr(owner, "_compacting", ()):
+            logger.info("stop_turn outcome=compacting session=%s (cooperative stop declined)", key)
+            return "compacting"
         # Record the Stop against the session key before anything is awaited:
         # the runner's end-of-turn gates may run as soon as the provider's
         # cancel lands, and `prev_turn_cancelled` (set only after the ack) is
@@ -2021,6 +3039,16 @@ class SessionLifecycleService:
 
         # Abort pooled gateway work before killing the owning provider.
         await owner._send_abort_for_session(key, session)
+        if preserve_queue:
+            # ``reset`` pops the session and unlinks whatever its queue still
+            # holds. A caller that asked to keep the queue has usually detached
+            # it already, but an entry admitted between that detach and this
+            # line sits on the session now: parked here, so the successor
+            # handoff (``hand_queue_to_successor``) delivers it too.
+            late = tuple(session.queue)
+            if late:
+                session.queue.clear()
+                _park_queue(owner, key, late)
         await owner.reset(key)
         elapsed = self._deps.monotonic() - t0
         logger.info(
@@ -2041,55 +3069,91 @@ class SessionLifecycleService:
         return "hard"
 
     async def _send_abort_for_session(self, key: str, session: Any) -> None:
-        """Best-effort gateway abort for a session's runtime process."""
+        """Best-effort gateway abort for the runtime serving ``key``.
+
+        The provider answers with an opaque target or with ``None``, and this
+        layer never opens it. Holding one already means the address is complete
+        and routable, so there is nothing here to validate and no pid to read:
+        the runtime is one process that may serve several sessions, and a session
+        able to name that process could attribute it to itself.
+        """
         logger = self._deps.logger
         try:
-            pid, socket_path = session.provider.runtime_info()
+            target = session.provider.runtime_abort_target()
 
-            if pid is None:
-                client = getattr(session.provider, "_client", None)
-                pid = getattr(client, "_pid", None) if client else None
-            if socket_path is None:
-                client = getattr(session.provider, "_client", None)
-                socket_path = getattr(client, "_mcp_gateway_socket", None) if client else None
-
-            if isinstance(pid, int) and pid > 1 and socket_path:
+            if target is not None:
                 # Audit at the decision point: downstream logging happens only
-                # if the fire-and-forget gateway abort eventually succeeds.
+                # if the fire-and-forget gateway abort eventually succeeds. The
+                # target names itself, so the record says which runtime was asked
+                # without this layer deriving it.
                 try:
                     self._deps.get_audit_logger().log_api_access(
                         caller="session",
                         operation="mcp-gateway.abort-initiated",
                         outcome="initiated",
                         source="session",
-                        resources=f"pid={pid} session={key}",
+                        resources=f"{target.audit_label} session={key}",
                         error="reason=hard-stop",
                     )
                 except Exception:  # pragma: no cover - audit cannot block kill
                     logger.debug("SEL audit for abort initiation failed", exc_info=True)
-                self._deps.schedule_abort(
-                    socket_path,
-                    [pid],
+                self._deps.schedule_runtime_abort(
+                    target,
                     reason=f"hard-stop session={key}",
                 )
             else:
                 logger.warning(
-                    "abort-push skipped for %s: no runtime pid/socket resolved "
-                    "(pid=%r socket=%r) — in-flight tool calls will not be cancelled",
+                    "abort-push skipped for %s: the provider named no reachable "
+                    "runtime — in-flight tool calls will not be cancelled",
                     key,
-                    pid,
-                    socket_path,
                 )
         except Exception:
             logger.debug("_send_abort_for_session failed for %s", key, exc_info=True)
 
     async def _eager_respawn(self, key: str) -> None:
-        """Respawn after hard kill and release its acquired turn semaphore."""
+        """Respawn after hard kill and release its acquired turn semaphore.
+
+        A start that succeeds here also delivers what a forced channel stop parked:
+        ``get_or_create`` adopts it at registration or claim, and the ``release``
+        wakes the adopted entries' channel drains.
+        """
         try:
             await self._owner.get_or_create(key)
             self._owner.release(key)
         except Exception:
             self._deps.logger.debug("Eager respawn failed for %s", key, exc_info=True)
+
+    async def _respawn_as(self, key: str, identity: dict[str, Any]) -> None:
+        """Start a successor for *key* under *identity* and release its lease.
+
+        The reset's counterpart of :meth:`_eager_respawn`: registration adopts the
+        entries the reset parked, and the release wakes their channels' drains.
+        The successor's first-turn observation belongs to the first queued turn,
+        not to this call: a non-speculative creator registers its session with
+        nothing armed and keeps the observation for itself, so it is re-armed
+        here from the flags the start returned. A failed native resume then
+        still reads as a fresh start and the queued turn replays the history.
+        """
+        owner = self._owner
+        try:
+            provider, is_new, resumed = await owner.get_or_create(key, **identity)
+        except Exception:
+            self._deps.logger.debug("Reset respawn failed for %s", key, exc_info=True)
+            return
+        try:
+            live = owner._sessions.get(key)
+            constants = self._deps.constants()
+            if (
+                is_new
+                and live is not None
+                and live.provider is provider
+                and live.first_turn is constants.first_turn_nothing_armed
+            ):
+                live.first_turn = (
+                    constants.first_turn_resumed if resumed else constants.first_turn_fresh
+                )
+        finally:
+            owner.release(key)
 
     async def drain_all_providers(self) -> list[Any]:
         """Pop every registered session and return its providers.

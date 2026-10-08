@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
-import re
+import json
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -30,6 +30,7 @@ from kiro_crew.dashboard import session_control as sc
 from kiro_crew.dashboard import stop_retry
 from kiro_crew.dashboard.chat_utils import slot_history_key
 from kiro_crew.dashboard.handlers import session_control as handlers_sc
+from kiro_crew.validation import MAX_SHORT_STRING
 
 # The autouse fixture below replaces ``sc.session_control_enabled`` so every
 # other test runs in the shipped (enabled) state without reading config. Keep a
@@ -256,29 +257,6 @@ def test_app_scoped_target_is_not_addressable(tmp_path):
             state, caller_session_key=_key(caller), target="chat-app", operation="read"
         )
     assert "app-scoped" in exc.value.message
-
-
-def test_between_plan_stages_the_target_still_reports_running(tmp_path):
-    """An orchestrator between stages is busy, and `read` must say so.
-
-    `slot.running` is derived from the task, and each stage's `_run_chat` closes
-    its own turn — so between stages it reads False while the plan is very much
-    alive. A poller following the documented "send, then read until not running"
-    loop would stop here and miss every later stage.
-
-    Mutation guard: reporting `slot.running` alone returns False.
-    """
-    state = _make_state(tmp_path)
-    caller = _slot(state, "chat-1")
-    target = _peer_target(state, "chat-2", caller)
-    target.messages.append({"role": "assistant", "content": "stage one done"})
-    # Between stages: no task in flight, but the plan is still orchestrating.
-    target.task = None
-    target._in_stage_execution = True
-
-    out = sc.read_messages(state, caller_session_key=_key(caller), target="chat-2")
-
-    assert out["running"] is True, "a mid-plan target must not look idle"
 
 
 @pytest.mark.asyncio
@@ -853,6 +831,39 @@ class TestTheRoutesRequireTheInternalSecret:
         assert created is not None, "the route reported a target it did not create"
         assert created.title == "worker"
 
+    def test_create_route_forwards_the_model(self, tmp_path):
+        """A route dropping model pins nothing while handler tests stay green."""
+        req = self._request(tmp_path, internal=True, path="/api/session-control/create")
+
+        async def _json():
+            return {"title": "worker", "model": "claude-sonnet-4.6"}
+
+        req.json = _json
+        resp = asyncio.run(handlers_sc.api_session_control_create(req))
+
+        assert resp.status == 200
+        payload = self._body(resp)
+        assert payload["model"] == "claude-sonnet-4.6"
+        created = req.app["state"].get_slot(payload["target"])
+        assert created is not None
+        assert created.model == "claude-sonnet-4.6"
+
+    def test_create_route_refuses_a_bad_charset_model(self, tmp_path):
+        """The route runs no schema, so create's own model bound must surface as a refusal."""
+        req = self._request(tmp_path, internal=True, path="/api/session-control/create")
+        before = req.app["state"].live_slot_count()
+
+        async def _json():
+            return {"title": "worker", "model": "bad id"}
+
+        req.json = _json
+        resp = asyncio.run(handlers_sc.api_session_control_create(req))
+
+        assert resp.status != 200
+        assert resp.status < 500, "a refusal must not render as a server error"
+        assert self._body(resp)["code"] == "model_rejected"
+        assert req.app["state"].live_slot_count() == before
+
     def test_create_renders_a_refusal_as_its_status_not_a_500(self, tmp_path, monkeypatch):
         """A SessionControlError from create must come back as its own refusal."""
         req = self._request(tmp_path, internal=True, path="/api/session-control/create")
@@ -956,6 +967,23 @@ class TestTheRoutesRequireTheInternalSecret:
         assert resp.status == 500
         assert self._body(resp)["code"] == "history_save_failed"
 
+    @pytest.mark.parametrize("code", ["reopen_failed", "reopen_rollback_failed"])
+    def test_revive_keeps_its_503_instead_of_degrading_to_400(self, tmp_path, monkeypatch, code):
+        """`revive_session` promises 503 for a reopen write that could not land and
+        for a refused resume whose closed marker could not be confirmed restored;
+        the route must forward that status, since 400 would tell the caller it
+        sent a bad request when the remedy is to retry or re-close."""
+        req = self._request(tmp_path, internal=True, path="/api/session-control/revive")
+
+        async def _boom(*_a, **_kw):
+            raise sc.SessionControlError("try again", status=503, code=code)
+
+        monkeypatch.setattr(sc, "revive_session", _boom)
+        resp = asyncio.run(handlers_sc.api_session_control_revive(req))
+
+        assert resp.status == 503
+        assert self._body(resp)["code"] == code
+
     def test_send_without_the_secret_is_forbidden(self, tmp_path):
         req = self._request(tmp_path, internal=False, path="/api/session-control/send")
         resp = asyncio.run(handlers_sc.api_session_control_send(req))
@@ -1050,7 +1078,22 @@ class TestTheRoutesRequireTheInternalSecret:
 # ── The config switch ────────────────────────────────────────────────────────
 
 
-def test_the_switch_is_on_by_default_and_an_explicit_false_still_disables():
+_ABSENT = object()
+
+
+@pytest.mark.parametrize(
+    ("stored", "expected"),
+    [
+        pytest.param(_ABSENT, True, id="absent-the-mount-is-the-grant"),
+        pytest.param(True, True, id="explicit-true"),
+        pytest.param(False, False, id="explicit-false-withdraws"),
+        pytest.param("false", False, id="quoted-false-withdraws"),
+        pytest.param(0, False, id="number-withdraws"),
+    ],
+)
+def test_the_switch_is_on_by_default_and_an_explicit_false_still_disables(
+    tmp_path, monkeypatch, stored, expected
+):
     """``agent.session_control`` defaults ON; the agent config is the real grant.
 
     Who may reach a peer session is decided by the AGENT CONFIG, not by this
@@ -1061,46 +1104,44 @@ def test_the_switch_is_on_by_default_and_an_explicit_false_still_disables():
 
     What the switch is still for is a single withdrawal: an operator who wants it
     gone from every agent at once, without editing each spec. So the one direction
-    that must keep working is an EXPLICIT ``false``:
+    that must keep working is an EXPLICIT opt-out, including the quoted ``"false"``
+    an editor that quotes values writes: ``bool("false")`` is ``True``, so a plain
+    coercion would keep cross-session control on while the operator believes it off.
 
-    * **Absent.** Both the ``.get`` default and the dataclass field default are
-      ``True``, so a mounted server works with nothing else written down.
-    * **Malformed.** ``bool("false")`` is ``True``, so a plain coercion loads a
-      quoted opt-out as ENABLED and a user who wrote it in an editor that quotes
-      values would keep cross-session control on while believing it off.
-      ``_safe_bool`` accepts only a real bool.
-
-    Asserted on the source rather than through ``KiroCrewConfig.load()``:
-    ``load()`` merges the real data home's ``config.local.json`` and serves a
-    fingerprint-cached dict, so a per-field assertion through it depends on the
-    developer's own config rather than on the payload under test. The parse is
-    one inline expression with no seam to call directly, so the wiring itself is
-    what gets pinned.
+    Driven through the load pipeline over a document in ``tmp_path``: the document
+    read normalizes a present non-bool to the safe ``False``, and the build reads
+    an absent key as the field default.
     """
-    src = Path(loader.__file__).read_text(encoding="utf-8")
-    parse = re.search(r"^\s*session_control=(.+)$", src, re.MULTILINE)
-    assert parse is not None, "the session_control parse line is gone"
-    wiring = parse.group(1).strip().rstrip(",")
-    assert wiring.startswith(
-        "_safe_bool("
-    ), f"session_control must be parsed through _safe_bool, got: {wiring}"
-    assert (
-        '"session_control", True' in wiring
-    ), f"an absent setting must read as ENABLED -- the mount is the grant, got: {wiring}"
-    # The field default is the second absent path: it is what a config object
-    # built without going through the loader resolves to, and it must agree with
-    # the loader or the answer depends on which path produced the config.
-    assert loader.AgentConfig().session_control is True, (
-        "the dataclass default must also be True, or a config built outside the "
-        "loader disables a capability the agent's own spec was given"
-    )
-    # An explicit opt-out is the direction that still has to hold, including the
-    # quoted form `_safe_bool` exists for.
-    assert loader._safe_bool(False, True) is False
-    assert loader._safe_bool("false", True) is True, (
-        "a quoted value is not a bool, so it falls back rather than being coerced "
-        "-- the operator who means it writes a real false"
-    )
+    path = tmp_path / "config.json"
+    agent = {} if stored is _ABSENT else {"session_control": stored}
+    path.write_text(json.dumps({"agent": agent}), encoding="utf-8")
+    monkeypatch.setattr(loader, "config_path", lambda: path)
+    monkeypatch.setattr(loader, "config_local_path", lambda: tmp_path / "config.local.json")
+    monkeypatch.setattr(loader, "config_dir", lambda: tmp_path)
+
+    cfg = loader.build_config(loader.read_config_document())
+
+    assert cfg.agent.session_control is expected
+
+
+def test_the_switch_defaults_on_wherever_a_config_is_built_without_the_key(tmp_path):
+    """A config built with no file, or from a value that is not a real bool, is ON.
+
+    The no-config build takes the field default. A value that reaches the build
+    without being a real bool (the document read normally repairs it first) reads
+    as that default rather than through truthiness; a real ``false`` withdraws.
+    """
+
+    def document(data, loaded=True):
+        return loader.ConfigDocument(
+            ticket=0, path=tmp_path / "config.json", data=data, loaded=loaded, content_digest=None
+        )
+
+    assert loader.build_config(document({}, loaded=False)).agent.session_control is True
+    none = loader.build_config(document({"agent": {"session_control": None}}))
+    assert none.agent.session_control is True
+    off = loader.build_config(document({"agent": {"session_control": False}}))
+    assert off.agent.session_control is False
 
 
 def test_a_config_read_that_raises_disables_the_feature(monkeypatch):
@@ -2546,43 +2587,6 @@ async def test_a_requeued_steer_with_no_recorded_admission_carries_no_baseline(t
 
 
 @pytest.mark.asyncio
-async def test_an_inter_stage_send_queues_instead_of_racing_the_plan(tmp_path):
-    """Between a plan's stages the target is busy even though `running` says no.
-
-    Each stage's `_run_chat` closes its own turn, so `slot.running` reads False in
-    the gap while the plan is still live. Handing the prompt to a gate that read
-    `running` alone started a SECOND turn racing the plan, with no recovery once two
-    turns own the same slot. Every producer that must not do that reads
-    `slot.running or slot._in_stage_execution`, and `enqueue_or_run_prompt` -- the
-    admission point this path delivers through -- now does too, so this path needs no
-    branch of its own.
-
-    Mutation guard: drop `or self._in_stage_execution` from the gate in
-    `state.enqueue_or_run_prompt` and this starts a turn.
-    """
-    state = _make_state(tmp_path)
-    caller = _slot(state, "chat-1")
-    target = _peer_target(state, "chat-2", caller)
-    # The inter-stage shape exactly: no task in flight, plan still executing.
-    target.task = None
-    target._in_stage_execution = True
-
-    out = await sc.send_to_target(
-        state,
-        caller_session_key=_key(caller),
-        target="chat-2",
-        message="do not race the plan",
-    )
-
-    assert out["started"] is False, "a mid-plan send must not start a turn"
-    assert target.task is None, "and must not have created one"
-    entry = next(q for q in target._queue if q["content"].endswith("do not race the plan"))
-    assert sc.QUEUED_CONTAINMENT_META_KEY in (
-        entry.get("meta") or {}
-    ), "the held prompt still carries its admission stamp for the drain"
-
-
-@pytest.mark.asyncio
 async def test_a_changed_audience_withholds_the_cross_surface_reply(tmp_path, monkeypatch):
     """The stop cannot outrun the turn, so the fence is what actually holds.
 
@@ -2704,13 +2708,26 @@ async def test_the_reply_leg_consults_the_fence_before_publishing(tmp_path):
         "one channel-neutral call site only; a second would need its own fence "
         f"check: {deliver_calls}"
     )
-    # EVERY cross-surface publication asks, not just the channel-neutral leg: Slack
-    # is an audience too, and it resolves its thread owner live. Four sites -- the
-    # channel-neutral reply, the Slack reply, the mid-turn tool stream, and the
-    # teardown's final task append, which would otherwise publish a title whose
-    # in-progress append was withheld.
+    # The channel-neutral leg judges the fence INSIDE the delivery, on the one
+    # binding read it resolves its target from (`publication_withheld`), so its call
+    # site hands the slot over instead of asking first -- asked first, the decision
+    # and the delivery would be two reads with the off-loop mirror-link writer free
+    # to retarget between them.
+    assert "slot=slot" in deliver_calls[0], deliver_calls[0]
+    # EVERY other cross-surface publication asks: Slack is an audience too, and it
+    # resolves its thread owner live. Three sites -- the Slack reply, the mid-turn
+    # tool stream, and the teardown's final task append, which would otherwise
+    # publish a title whose in-progress append was withheld.
     asks = src.count("cross_surface_withheld(state, slot)")
-    assert asks == 4, f"expected four fenced publication sites, found {asks}"
+    assert asks == 3, f"expected three fenced Slack publication sites, found {asks}"
+    # Each Slack site publishes to the thread it cached at turn start, not to the
+    # live binding, so each ALSO judges that destination as the room it is
+    # (`slack_publication_withheld`): a thread unlinked mid-turn is in neither side
+    # of the live comparison, yet the cached destination still receives the reply.
+    destination_asks = src.count("not slack_publication_withheld(")
+    assert (
+        destination_asks == 3
+    ), f"expected three destination-judged Slack sites, found {destination_asks}"
 
 
 @pytest.mark.asyncio
@@ -2801,7 +2818,7 @@ def test_send_to_a_remote_bound_target_is_refused_not_run_locally(tmp_path, monk
                 state, caller_session_key=_key(caller), target="chat-2", message="do it there"
             )
         )
-    assert err.value.code == "remote_target_unsupported"
+    assert err.value.code == "relay_archive_read_only"
     # Refused before dispatch: no local turn ran and nothing was queued.
     assert ran == {}
     assert target._queue == []
@@ -3500,6 +3517,55 @@ def test_create_files_the_slot_at_birth(tmp_path):
     )
 
 
+def test_create_inherits_the_folders_project_dir(tmp_path):
+    """A dispatched session filed in a project folder runs in that project."""
+    state = _make_state(tmp_path)
+    caller = _slot(state, "chat-1")
+    folder_project = tmp_path / "folder-project"
+    folder_project.mkdir()
+    _folder(
+        state,
+        "fold00000002",
+        "Project",
+        project_dir=str(folder_project),
+    )
+
+    created = asyncio.run(
+        sc.create_session(state, caller_session_key=_key(caller), folder_id="fold00000002")
+    )
+
+    child = state.get_slot(created["target"])
+    assert child is not None
+    assert child.workspace == caller.workspace
+    assert child.project == str(folder_project.resolve())
+    written = state.conversation_log.get_metadata(slot_history_key(child))
+    assert written.get("project") == str(folder_project.resolve())
+
+
+def test_create_inherits_an_ancestor_folders_project_dir(tmp_path):
+    """Project inheritance follows the same nearest-ancestor rule as dashboard creation."""
+    state = _make_state(tmp_path)
+    caller = _slot(state, "chat-1")
+    folder_project = tmp_path / "ancestor-project"
+    folder_project.mkdir()
+    _folder(
+        state,
+        "fold00000003",
+        "Project",
+        project_dir=str(folder_project),
+    )
+    child_folder = _folder(state, "fold00000004", "Worker")
+    child_folder["parent_id"] = "fold00000003"
+
+    created = asyncio.run(
+        sc.create_session(state, caller_session_key=_key(caller), folder_id="fold00000004")
+    )
+
+    child = state.get_slot(created["target"])
+    assert child is not None
+    assert child.project == str(folder_project.resolve())
+
+
 def test_create_refuses_an_unknown_folder(tmp_path):
     """An unresolvable folder refuses the WHOLE create, allocating nothing.
 
@@ -3517,6 +3583,103 @@ def test_create_refuses_an_unknown_folder(tmp_path):
         )
 
     assert exc.value.code == "folder_not_found"
+    assert state.live_slot_count() == before, "a refused create must not leave a slot behind"
+
+
+def test_create_pins_the_requested_model_at_birth(tmp_path):
+    """A named model is pinned on the slot AND rides the birth metadata.
+
+    Same disk argument as the folder: an idle newborn's birth line is its only
+    durable record, so a model set only in memory would come back as the default
+    after a restart. The pick-generation bump is what makes it an explicit
+    choice the fallback restore probe will not override.
+    """
+    state = _make_state(tmp_path)
+    caller = _slot(state, "chat-1")
+
+    created = asyncio.run(
+        sc.create_session(state, caller_session_key=_key(caller), model="claude-sonnet-4.6")
+    )
+
+    child = state.get_slot(created["target"])
+    assert child is not None
+    assert child.model == "claude-sonnet-4.6"
+    assert child._model_pick_gen == 1
+    assert created["model"] == "claude-sonnet-4.6"
+    written = state.conversation_log.get_metadata(slot_history_key(child))
+    assert written.get("model") == "claude-sonnet-4.6"
+
+
+def test_create_without_a_model_leaves_the_default(tmp_path):
+    """Omitting `model` changes nothing: no pin, no metadata key, no pick bump."""
+    state = _make_state(tmp_path)
+    caller = _slot(state, "chat-1")
+
+    created = asyncio.run(sc.create_session(state, caller_session_key=_key(caller)))
+
+    child = state.get_slot(created["target"])
+    assert child is not None
+    assert child.model == ""
+    assert child._model_pick_gen == 0
+    assert "model" not in created
+    assert "model" not in state.conversation_log.get_metadata(slot_history_key(child))
+
+
+def test_create_refuses_a_model_the_picker_refuses(tmp_path, monkeypatch):
+    """The picker's own guard decides, and a refusal allocates nothing."""
+    import kiro_crew.dashboard.chat_handlers as ch
+
+    monkeypatch.setattr(
+        ch, "_model_rejected_reason", lambda name, provider=None: f"{name} is display-only"
+    )
+    state = _make_state(tmp_path)
+    caller = _slot(state, "chat-1")
+    before = state.live_slot_count()
+
+    with pytest.raises(sc.SessionControlError) as exc:
+        asyncio.run(sc.create_session(state, caller_session_key=_key(caller), model="fable-5-1m"))
+
+    assert exc.value.code == "model_rejected"
+    assert state.live_slot_count() == before, "a refused create must not leave a slot behind"
+
+
+def test_create_refuses_a_credential_shaped_model(tmp_path):
+    credential_shaped_id = "AKIA" + "Q" * 16
+    assert sc.redact(credential_shaped_id) != credential_shaped_id
+    state = _make_state(tmp_path)
+    caller = _slot(state, "chat-1")
+    before = state.live_slot_count()
+
+    with pytest.raises(sc.SessionControlError) as exc:
+        asyncio.run(
+            sc.create_session(
+                state,
+                caller_session_key=_key(caller),
+                model=credential_shaped_id,
+            )
+        )
+
+    assert exc.value.code == "model_rejected"
+    assert credential_shaped_id not in exc.value.message
+    assert state.live_slot_count() == before, "a refused create must not leave a slot behind"
+
+
+@pytest.mark.parametrize(
+    "bad_model",
+    ["x y", "a" * (MAX_SHORT_STRING + 1)],
+    ids=["bad-charset", "over-length"],
+)
+def test_create_refuses_an_unbounded_or_bad_charset_model(tmp_path, bad_model):
+    """The HTTP route does not run SESSION_CREATE_SCHEMA, so create bounds model itself."""
+    state = _make_state(tmp_path)
+    caller = _slot(state, "chat-1")
+    before = state.live_slot_count()
+
+    with pytest.raises(sc.SessionControlError) as exc:
+        asyncio.run(sc.create_session(state, caller_session_key=_key(caller), model=bad_model))
+
+    assert exc.value.code == "model_rejected"
+    assert bad_model not in exc.value.message
     assert state.live_slot_count() == before, "a refused create must not leave a slot behind"
 
 
@@ -3686,13 +3849,13 @@ def test_metadata_mutations_on_an_empty_newborn_survive_a_restart(tmp_path):
     # The user tags, pins, mode-switches, and binds it before any message lands.
     child.tags = ["tag00000001"]
     child.pinned = True
-    child.mode = "orchestrator"
+    child.mode = "design-critique"
     child._artifact = "my-artifact"
     asyncio.run(save_slot_off_loop(state, child, force=True))
     meta = state.conversation_log.get_metadata(slot_history_key(child))
     assert meta.get("tags") == ["tag00000001"], "an acknowledged tag must reach disk"
     assert meta.get("pinned") is True, "an acknowledged pin must reach disk"
-    assert meta.get("mode") == "orchestrator", "an acknowledged mode switch must reach disk"
+    assert meta.get("mode") == "design-critique", "an acknowledged mode switch must reach disk"
     assert meta.get("artifact") == "my-artifact", "an acknowledged binding must reach disk"
     assert meta.get("folder_id") == "fold00000001", "the merge must not drop the birth filing"
 
@@ -3734,7 +3897,7 @@ def test_the_empty_window_merge_mirrors_the_full_saves_slot_owned_fields(tmp_pat
 
     child.tags = ["tag00000001"]
     child.pinned = True
-    child.mode = "orchestrator"
+    child.mode = "design-critique"
     child._artifact = "my-artifact"
     child.reasoning_effort = "high"
     child.color_index = 3
@@ -3756,19 +3919,11 @@ def test_the_empty_window_merge_mirrors_the_full_saves_slot_owned_fields(tmp_pat
         "app",
         "forked_from",
         "linked_session_key",
-        # The remote-execution binding, written all-three-or-none by both the
-        # full save and the merge. A plain local newborn carries none of it; the
-        # bound case is covered by
-        # test_remote_crew_execution.py::test_the_empty_window_merge_persists_a_complete_binding.
+        # The relay-archive binding, written all-three-or-none by both the
+        # full save and the merge. A plain local newborn carries none of it.
         "executor",
         "instance_id",
         "remote_slot",
-        # In-flight relay marker: written ONLY while a relay is running and
-        # omitted once the turn ends (absence = "not in flight"), so a plain
-        # newborn never carries it. Its clear-on-completion behaviour is covered by
-        # test_remote_crew_execution.py::
-        # test_the_marker_is_cleared_on_disk_when_a_relay_completes.
-        "relay_in_flight",
         # Written only for a NON-DEFAULT memory store, because absence is what
         # means "the global store" -- so a newborn on the default store must NOT
         # carry it, and writing "default" here would make a session that predates
@@ -3852,11 +4007,11 @@ def test_the_empty_window_merge_reads_slot_state_at_write_time(tmp_path):
 
     real = state.conversation_log.update_metadata_if
 
-    def _mutate_then_write(key, fields, guard):
+    def _mutate_then_write(key, fields, guard, **kwargs):
         # Simulates a concurrent pin committing between this save's call and
         # its locked write: the merge must pick up the NEW value.
         child.pinned = True
-        return real(key, fields, guard)
+        return real(key, fields, guard, **kwargs)
 
     child.pinned = False
     with patch.object(state.conversation_log, "update_metadata_if", _mutate_then_write):
@@ -3911,7 +4066,7 @@ def test_an_unreadable_record_fails_the_empty_window_merge_loudly(tmp_path):
     )
     child = state.get_slot(created["target"])
 
-    def _unreadable(key, fields, guard):
+    def _unreadable(key, fields, guard, **_kwargs):
         # Mirrors update_metadata_if's fail-closed path: guard NOT invoked.
         return False
 
@@ -3984,25 +4139,98 @@ def test_the_empty_window_merge_cannot_resurrect_a_deleted_session(tmp_path):
     assert not path.exists(), "the merge must not resurrect a deleted session file"
 
 
-def test_every_session_control_refusal_is_audited_as_failed():
+#: One valid call per kirocrew-dashboard tool, for the refusal-audit sweep below.
+_DASHBOARD_TOOL_CALLS = {
+    "chat_folder_tree": {},
+    "chat_folder_create": {"name": "New"},
+    "chat_folder_move": {"folder": "Travel", "new_parent": "kirocrew"},
+    "chat_folder_update": {"folder": "Travel", "name": "Trips"},
+    "chat_folder_move_session": {"session": "chat-3", "folder": "Travel"},
+    "chat_folder_delete": {"folder": "Travel"},
+    "chat_folder_file_self": {"folder": "Travel"},
+    "chat_tag_list": {},
+    "chat_tag_create": {"name": "urgent"},
+    "chat_tag_update": {"tag": "todo", "name": "later"},
+    "chat_tag_assign": {"session": "chat-3", "add": ["todo"]},
+    "chat_session_pin": {"session": "chat-3", "pinned": True},
+    "chat_tag_column_list": {},
+    "chat_tag_column_create": {"name": "Urgent", "tag": "todo"},
+    "chat_tag_column_move": {"column": "Todo", "after": "Live"},
+    "session_create": {},
+    "session_fork": {},
+    "session_stop": {"target": "chat-2"},
+    "session_end_wait": {"target": "chat-2"},
+    "session_set_model": {"target": "chat-2", "model": "sonnet"},
+    "session_reload": {"target": "chat-2"},
+    "session_close": {"target": "chat-2"},
+    "session_revive": {"target": "chat-2"},
+    "session_send": {"target": "chat-2", "message": "hi"},
+    "session_broadcast": {"message": "hi", "mode": "queue"},
+    "session_status": {},
+    "session_adopt": {"target": "chat-2"},
+    "session_release": {"target": "chat-2"},
+    "session_read_message": {"target": "chat-2"},
+    "session_summary": {"target": "chat-2"},
+}
+
+
+@pytest.mark.parametrize("refusal", ["route", "identity"])
+def test_every_session_control_refusal_is_audited_as_failed(monkeypatch, refusal):
     """A refused tool call must not be recorded as a completed one.
 
     `call_tool_with_logging` classifies by prefix -- `outcome="failed"` only when
     the result starts with "Error:". A refusal without it lands in the audit as a
     successful invocation, which inverts the record for exactly the calls a
-    reviewer would go looking for. Derived from the source so a new refusal that
-    forgets the prefix fails here.
+    reviewer would go looking for. Swept over every `kirocrew-dashboard` tool, the
+    session-control verbs included, for both ways one is refused: every route
+    answers a refusal, or the caller cannot be verified. The tool list is checked
+    against the server's rows, so a new tool must be added here to pass.
+
+    Mutation guard: a refusal reply opening with a cross mark instead of "Error:"
+    is recorded `completed` and fails here.
+    """
+    from kiro_crew import mcp_shared
+    from kiro_crew.mcp_dashboard import SESSION_CONTROL_TOOLS, TABLE
+    from kiro_crew.mcp_tools.dashboard_client import InMemoryDashboardClient
+    from kiro_crew.mcp_tools.table import Caller, ToolContext
+
+    assert set(_DASHBOARD_TOOL_CALLS) == set(TABLE.names())
+    assert set(SESSION_CONTROL_TOOLS) <= set(_DASHBOARD_TOOL_CALLS)
+    rows: list[dict] = []
+    monkeypatch.setattr(
+        mcp_shared, "sel", lambda: SimpleNamespace(log_tool_invocation=lambda **r: rows.append(r))
+    )
+    caller = (
+        Caller.strict("dashboard:chat-1")
+        if refusal == "route"
+        else Caller.unverified("dashboard:chat-1")
+    )
+    refused = {"error": "refused", "code": "x"}
+    for tool, args in _DASHBOARD_TOOL_CALLS.items():
+        dash = InMemoryDashboardClient(
+            {
+                f"{method} /api/{{route}}": refused
+                for method in ("GET", "POST", "PATCH", "PUT", "DELETE")
+            }
+        )
+        out = TABLE.call(tool, dict(args), ToolContext(dash, caller))
+        assert out.startswith("Error:"), (tool, out)
+        assert rows[-1]["tool_name"] == tool and rows[-1]["outcome"] == "failed", (tool, out)
+
+
+def test_no_dashboard_refusal_opens_with_a_cross_mark():
+    """The sweep above reaches each tool's FIRST refusal; deeper branches need this.
+
+    A refusal deeper in a body (one route answering after another refused) has
+    no fixture-free behavioural reach, so its prefix is held by the text: a
+    return whose string opens with the cross mark is audited as completed.
     """
     import re
     from pathlib import Path
 
     src = Path(sc.__file__).parent.parent / "mcp_dashboard.py"
-    body = src.read_text(encoding="utf-8")
-
-    # The dispatch's own refusal returns: a return whose string opens with the
-    # cross mark is a refusal that will be audited as completed.
-    bare = re.findall(r"return[^\n]*\\u274c[^\n]*", body)
-    assert not bare, f"session-control refusals not prefixed with 'Error:': {bare}"
+    bare = re.findall(r"return[^\n]*\\u274c[^\n]*", src.read_text(encoding="utf-8"))
+    assert not bare, f"dashboard refusals not prefixed with 'Error:': {bare}"
 
 
 def _agent_resolves(monkeypatch, workspace: str) -> None:
@@ -4187,7 +4415,7 @@ def test_a_mirror_link_landing_during_the_await_still_refuses(tmp_path, monkeypa
     """Eligibility decided before a suspension point says nothing at allocation time.
 
     The project directory is resolved in a worker thread, so the coroutine suspends
-    between the caller gate and the allocation. `_has_channel_mirror` reads the live
+    between the caller gate and the allocation. The caller gate reads the live
     session store, and a dashboard-born session can be given an outbound mirror link
     at any moment -- so a link registered inside that window would otherwise let a
     now-channel-backed caller publish a persistent session outside its containment.
@@ -4198,14 +4426,12 @@ def test_a_mirror_link_landing_during_the_await_still_refuses(tmp_path, monkeypa
     state = _make_state(tmp_path)
     caller = _slot(state, "chat-1")
     before = set(state._slots)
-    mirrored = {"now": False}
-
-    monkeypatch.setattr(sc, "_has_channel_mirror", lambda _state, _slot: mirrored["now"])
 
     def _resolve_then_mirror(_workspace):
         # Stand in for the interleaving: the mirror link lands while the project
-        # directory is still being resolved off-loop.
-        mirrored["now"] = True
+        # directory is still being resolved off-loop -- in the store the gate's
+        # re-assert reads, so it is the row that read sees.
+        state.sessions.set_mirror_link(_key(caller), "C0FFEE", "1758.0003")
         return str(tmp_path)
 
     monkeypatch.setattr(sc, "default_project_dir", _resolve_then_mirror)
@@ -5029,6 +5255,11 @@ def test_session_control_is_not_imported_on_the_gateway_boot_path():
     from kiro_crew.dashboard import server as dashboard_server
 
     src = Path(dashboard_server.__file__).read_text(encoding="utf-8")
+    # The server_runtime owners server.py composes load with it, so their module-level
+    # imports are on the same boot path.
+    owners = sorted((Path(dashboard_server.__file__).parent / "server_runtime").glob("[!_]*.py"))
+    assert owners, "expected the server_runtime owners beside server.py"
+    src += "".join(path.read_text(encoding="utf-8") for path in owners)
     for line in src.splitlines():
         if line.startswith("from kiro_crew.dashboard.handlers import"):
             assert "session_control" not in line, (
@@ -5615,16 +5846,14 @@ def test_the_post_rpc_regate_warms_the_config_first():
 async def test_the_inter_stage_append_persists_before_returning_success(tmp_path):
     """An acknowledged prompt must not live only in memory.
 
-    A mid-plan send queues the prompt and the function then returns a success
-    receipt. Until the plan's drain reaches it the queue is its only record, so a
+    A send to a busy target queues the prompt and the function then returns a
+    success receipt. Until the drain reaches it the queue is its only record, so a
     restart inside the ordinary flush interval loses a message the sender was told had
     landed. Every other producer that appends and reports success writes immediately.
 
-    Asserted on BEHAVIOUR, not on the order of two lines in this module's source: the
-    append and the write both moved into `state.enqueue_or_run_prompt` when the
-    inter-stage branch here was deleted in favour of the central gate, and a
-    source-text pin would have reported that as a lost guarantee rather than a moved
-    one. What the sender is owed is the write, wherever it is started from.
+    Asserted on BEHAVIOUR, not on the order of two lines in this module's source:
+    the append and the write both live in `state.enqueue_or_run_prompt`. What the
+    sender is owed is the write, wherever it is started from.
 
     Mutation guard: remove the `start_queue_persist` call from
     `enqueue_or_run_prompt`'s queue branch and no write starts here.
@@ -5632,9 +5861,8 @@ async def test_the_inter_stage_append_persists_before_returning_success(tmp_path
     state = _make_state(tmp_path)
     caller = _slot(state, "chat-1")
     target = _peer_target(state, "chat-2", caller)
-    # The inter-stage shape exactly: no task in flight, plan still executing.
-    target.task = None
-    target._in_stage_execution = True
+    # A turn still in flight on the target, so the send queues.
+    target.task = MagicMock(done=MagicMock(return_value=False))
     flushed: list = []
     state.flush_slot_now = lambda slot: flushed.append(slot)
 

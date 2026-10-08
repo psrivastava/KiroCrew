@@ -564,12 +564,16 @@ class TestStreamLifecycle:
     def _require_amazon_transcribe(self):
         pytest.importorskip("amazon_transcribe")
 
-    def _install_stubs(self, monkeypatch, *, fail_start=False, language_code="auto"):
+    def _install_stubs(
+        self, monkeypatch, *, fail_start=False, language_code="auto", vocabulary="", start_exc=None
+    ):
         from amazon_transcribe.handlers import TranscriptResultStreamHandler
 
         monkeypatch.setattr(
             "kiro_crew.dashboard.stt_stream.KiroCrewConfig.load",
-            classmethod(lambda cls: _cfg(language_code=language_code)),
+            classmethod(
+                lambda cls: _cfg(language_code=language_code, transcribe_vocabulary=vocabulary)
+            ),
         )
         monkeypatch.setattr("kiro_crew.dashboard.stt_stream.check_origin", lambda r, require: True)
 
@@ -582,7 +586,9 @@ class TestStreamLifecycle:
         stream.output_stream = MagicMock()
 
         client = MagicMock()
-        if fail_start:
+        if start_exc is not None:
+            client.start_stream_transcription = AsyncMock(side_effect=start_exc)
+        elif fail_start:
             client.start_stream_transcription = AsyncMock(side_effect=RuntimeError("start failed"))
         else:
             client.start_stream_transcription = AsyncMock(return_value=stream)
@@ -633,7 +639,172 @@ class TestStreamLifecycle:
             ws = await client.ws_connect("/api/ws/stt")
             msg = await ws.receive_json()
             assert msg["type"] == "error"
+            assert msg["code"] == "stt_session_failed"
             await ws.close()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("vocabulary", "expected"), [("team-terms", "team-terms"), ("", None)])
+    async def test_the_configured_vocabulary_rides_on_the_stream(
+        self, monkeypatch, vocabulary, expected
+    ):
+        """None, not ``""``, when unset: the SDK omits the header only for None, and an
+        empty name breaks the API's minimum length of 1."""
+        transcribe_client, _ = self._install_stubs(monkeypatch, vocabulary=vocabulary)
+        async with TestClient(TestServer(_make_app())) as client:
+            ws = await client.ws_connect("/api/ws/stt")
+            assert (await ws.receive_json()) == {"type": "ready"}
+            await ws.send_str('{"type":"stop"}')
+            await ws.close()
+        kwargs = transcribe_client.start_stream_transcription.call_args.kwargs
+        assert kwargs["vocabulary_name"] == expected
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("vocabulary", "service_message", "expected_code"),
+        [
+            # The refusal this code exists for: retrying cannot help, Settings can.
+            # This is the text Amazon Transcribe returned live (us-east-1) when
+            # start_stream_transcription named a vocabulary that does not exist.
+            (
+                "team-terms",
+                "The specified vocabulary doesn't exist. Check the name and try your "
+                "request again.",
+                "stt_transcribe_vocabulary_rejected",
+            ),
+            # Live text (us-east-1) for a vocabulary still PENDING.
+            (
+                "team-terms",
+                "The specified vocabulary isn't ready for use. Try your request again later.",
+                "stt_transcribe_vocabulary_rejected",
+            ),
+            # Live text (us-east-1) for a READY en-US vocabulary on a fr-FR stream.
+            (
+                "team-terms",
+                "Language used in the vocabulary doesn't match the specified language "
+                "code. Correct language code and try again.",
+                "stt_transcribe_vocabulary_rejected",
+            ),
+            # A bad request about something else is not blamed on the vocabulary.
+            (
+                "team-terms",
+                "The language code you specified isn't supported.",
+                "stt_session_failed",
+            ),
+            # With no vocabulary configured, it cannot be the vocabulary.
+            ("", "The requested vocabulary couldn't be found.", "stt_session_failed"),
+        ],
+    )
+    async def test_a_vocabulary_refusal_has_its_own_code(
+        self, monkeypatch, vocabulary, service_message, expected_code
+    ):
+        from amazon_transcribe.exceptions import BadRequestException
+
+        self._install_stubs(
+            monkeypatch, vocabulary=vocabulary, start_exc=BadRequestException(service_message)
+        )
+        outcomes: list[str] = []
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.stt_stream._emit_end_audit",
+            lambda caller, *, outcome: outcomes.append(outcome),
+        )
+        async with TestClient(TestServer(_make_app())) as client:
+            ws = await client.ws_connect("/api/ws/stt")
+            msg = await ws.receive_json()
+            assert msg["type"] == "error"
+            assert msg["code"] == expected_code
+            await ws.close()
+        for _ in range(int(_AUDIT_WAIT_TIMEOUT_SECS / 0.02)):
+            if outcomes:
+                break
+            await asyncio.sleep(0.02)
+        assert outcomes == ["error"]
+
+    def test_only_the_service_refusal_counts_as_a_vocabulary_rejection(self):
+        """A transport failure whose text happens to say "vocabulary" is not the
+        service refusing it, and with no vocabulary configured nothing is."""
+        from amazon_transcribe.exceptions import BadRequestException
+
+        from kiro_crew.dashboard import stt_stream
+
+        refusal = BadRequestException("The requested vocabulary couldn't be found.")
+        assert stt_stream._vocabulary_rejected(refusal, "team-terms") is True
+        assert stt_stream._vocabulary_rejected(RuntimeError("vocabulary"), "team-terms") is False
+        assert stt_stream._vocabulary_rejected(refusal, "") is False
+
+    @pytest.mark.asyncio
+    async def test_access_denied_at_start_has_its_own_code(self, monkeypatch):
+        """AWS's authorization refusal reaches the browser as its own code.
+
+        Every retry is refused the same way, so the generic session failure, whose
+        remedy is to record again, leaves the user stuck. The English stays fixed
+        text: AWS's own message names the caller's ARN.
+        """
+        from amazon_transcribe.exceptions import UnknownServiceException
+
+        denied = UnknownServiceException(
+            403,
+            "AccessDeniedException",
+            "User: arn:aws:sts::111122223333:assumed-role/Test/session is not authorized "
+            "to perform: transcribe:StartStreamTranscription",
+        )
+        self._install_stubs(monkeypatch, start_exc=denied)
+        async with TestClient(TestServer(_make_app())) as client:
+            ws = await client.ws_connect("/api/ws/stt")
+            msg = await ws.receive_json()
+            assert msg == {
+                "type": "error",
+                "message": "AWS denied access to transcribe:StartStreamTranscription",
+                "code": "stt_aws_access_denied",
+            }
+            await ws.close()
+
+    def test_other_start_failures_keep_the_generic_code(self):
+        """Only the authorization refusal is told apart, not every 403 or SDK error.
+
+        An expired or invalid token is a 403 too, but the consent gate's identity
+        probe reports it on the next attempt, and a token IAM has not propagated yet
+        works seconds later, so "record again" is the right advice for both.
+        """
+        from amazon_transcribe.exceptions import BadRequestException, UnknownServiceException
+
+        from kiro_crew.dashboard import stt_stream
+
+        for exc in (
+            UnknownServiceException(403, "UnrecognizedClientException", "token is invalid"),
+            UnknownServiceException(500, "InternalFailure", "try again"),
+            BadRequestException("unsupported language"),
+            RuntimeError("No AWS credentials found for profile 'test'"),
+        ):
+            assert stt_stream._transcribe_start_failure(exc) == (
+                "failed to start transcription",
+                stt_stream._CODE_SESSION_FAILED,
+            ), exc
+
+    def test_access_denied_as_the_sdk_parses_it_keeps_its_code(self):
+        """AWS's refusal goes through the SDK's own error parser, not a hand-built exception.
+
+        The parser turns the response's ``x-amzn-errortype`` header into the exception
+        the stream start raises. If a release models ``AccessDeniedException`` as a
+        class of its own, this test fails, rather than users silently getting the
+        generic "record again" advice.
+        """
+        from amazon_transcribe.deserialize import TranscribeStreamingResponseParser
+
+        from kiro_crew.dashboard import stt_stream
+
+        response = SimpleNamespace(
+            status_code=403,
+            headers={"x-amzn-errortype": "AccessDeniedException:"},
+        )
+        body = (
+            b'{"Message": "User: arn:aws:sts::111122223333:assumed-role/Test/session is not '
+            b'authorized to perform: transcribe:StartStreamTranscription"}'
+        )
+        exc = TranscribeStreamingResponseParser().parse_exception(response, body)
+        assert stt_stream._transcribe_start_failure(exc) == (
+            "AWS denied access to transcribe:StartStreamTranscription",
+            stt_stream._CODE_AWS_ACCESS_DENIED,
+        ), f"the SDK raises {type(exc).__name__} for AccessDeniedException"
 
     @pytest.mark.asyncio
     async def test_start_failure_emits_sel_end_audit(self, monkeypatch):
@@ -1891,11 +2062,26 @@ class TestLocalStreamingSession:
         is the signal that the load is under way, so it must arrive BEFORE ``ready``.
         """
         self._install(monkeypatch, _FakeLocalSession(pending=None, pending_load=True))
+        from kiro_crew.dashboard import stt_stream
+
         async with TestClient(TestServer(_make_app())) as client:
             ws = await client.ws_connect("/api/ws/stt")
             first = await ws.receive_json()
             assert first["type"] == "status"
             assert first["stage"] == stt.STAGE_PREPARING
+            # The deadline belongs to the side that owns the wait, so the frame
+            # states it rather than leaving the client to pick one. A client
+            # number shorter than this abandons a load still running here and
+            # discards audio the next frame would have transcribed.
+            assert (
+                first["prepare_timeout_ms"]
+                == (stt_stream._MAX_MODEL_PREPARE_SECS + stt_stream._LOCAL_FINAL_WIRE_GRACE_SECS)
+                * 1000
+            )
+            # Strictly longer than this server's own ceiling: the timeout must be
+            # reached HERE first, where the reason is known and goes out as a
+            # coded error, instead of at a client that can only guess.
+            assert first["prepare_timeout_ms"] > stt_stream._MAX_MODEL_PREPARE_SECS * 1000
             assert (await ws.receive_json())["type"] == "ready"
             await ws.send_str('{"type":"stop"}')
             await ws.close()
@@ -1982,6 +2168,131 @@ class TestLocalStreamingSession:
         assert counts == sorted(counts) and len(set(counts)) == len(counts), counts
         assert all(frame["stage"] == "downloading" for frame in sent), sent
         assert all(frame["total_bytes"] == model.size_bytes for frame in sent), sent
+        # Every announcing frame carries the deadline, not just the first one: a
+        # client that joins mid-transfer hears one of these as its FIRST word on
+        # the subject, and a frame without the figure leaves it holding a budget
+        # this side never agreed to.
+        expected_ms = (
+            stt_stream._MAX_MODEL_PREPARE_SECS + stt_stream._LOCAL_FINAL_WIRE_GRACE_SECS
+        ) * 1000
+        assert all(frame["prepare_timeout_ms"] == expected_ms for frame in sent), sent
+
+    @pytest.mark.asyncio
+    async def test_a_load_that_starts_after_the_pre_check_is_still_announced(self, monkeypatch):
+        """An eviction between the pre-check and the load must not silence the wait.
+
+        ``pending_load`` is read without a lock before ``prepare`` starts, so a model
+        resident at that instant can be gone by the time the load looks for it. With
+        ``stt.idle_evict_secs`` at 0 -- legal, and documented in ``stt.limits`` as the
+        right setting on a memory-constrained host -- a model becomes evictable the
+        moment a decode finishes, and ``maybe_evict`` is called from the decode
+        completion paths, not only from the periodic sweep. So the pre-check's answer
+        can flip for an ordinary reason rather than an exotic one.
+
+        Unannounced, the client holds its released utterance on the SHORT budget and
+        discards it at sixty seconds while this side is still building the context.
+        The announce is therefore owed late, and this pins that it arrives.
+        """
+        from kiro_crew.dashboard import stt_stream
+
+        released = asyncio.Event()
+
+        class _Store:
+            @property
+            def status(self):
+                # Not a transfer: this is the load half of the wait, the branch
+                # that carries no byte count. Counting the spins HERE, not in
+                # `pending_load`, so releasing `prepare` does not depend on the
+                # announce being asked for -- otherwise removing the announce would
+                # hang this test instead of failing its assertion.
+                reads["store"] += 1
+                if reads["store"] >= 3:
+                    released.set()
+                return {"step": "loading", "downloaded_bytes": 0, "total_bytes": 0}
+
+        monkeypatch.setattr(stt, "model_store", lambda: _Store())
+        monkeypatch.setattr(stt_stream, "_MODEL_PROGRESS_INTERVAL_SECS", 0)
+
+        sent: list[dict] = []
+
+        async def _send(frame):
+            sent.append(frame)
+            return True
+
+        # False at the pre-check, true afterwards: the eviction the pre-check could
+        # not see.
+        reads = {"store": 0, "load": 0}
+
+        def _pending_load():
+            reads["load"] += 1
+            return reads["load"] >= 2
+
+        async def _prepare():
+            await released.wait()
+            return []
+
+        assert _pending_load() is False, "pre-check must see the model resident"
+        task = asyncio.create_task(_prepare())
+        relayed = await asyncio.wait_for(
+            stt_stream._relay_download_progress(task, _send, _pending_load, False),
+            timeout=_AUDIT_WAIT_TIMEOUT_SECS,
+        )
+        assert relayed == []
+
+        preparing = [f for f in sent if f.get("stage") == stt.STAGE_PREPARING]
+        assert len(preparing) == 1, sent
+        assert (
+            preparing[0]["prepare_timeout_ms"]
+            == (stt_stream._MAX_MODEL_PREPARE_SECS + stt_stream._LOCAL_FINAL_WIRE_GRACE_SECS) * 1000
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_wait_with_nothing_loading_announces_nothing(self, monkeypatch):
+        """A socket with no load under way keeps the short budget.
+
+        The announce is what switches the client from the sixty-second budget to the
+        long one, so announcing whenever this branch is reached would hand a backend
+        that is doing nothing -- and a socket that is simply dead -- the whole prepare
+        budget. The gate is ``pending_load`` being true, not merely arriving here.
+        """
+        from kiro_crew.dashboard import stt_stream
+
+        released = asyncio.Event()
+        reads = {"store": 0}
+
+        class _Store:
+            @property
+            def status(self):
+                # The loop's own read, so the spin count is independent of whether
+                # the announce is asked for at all.
+                reads["store"] += 1
+                if reads["store"] >= 5:
+                    released.set()
+                return {"step": "loading", "downloaded_bytes": 0, "total_bytes": 0}
+
+        monkeypatch.setattr(stt, "model_store", lambda: _Store())
+        monkeypatch.setattr(stt_stream, "_MODEL_PROGRESS_INTERVAL_SECS", 0)
+
+        sent: list[dict] = []
+
+        async def _send(frame):
+            sent.append(frame)
+            return True
+
+        async def _prepare():
+            await released.wait()
+            return []
+
+        task = asyncio.create_task(_prepare())
+        relayed = await asyncio.wait_for(
+            stt_stream._relay_download_progress(task, _send, lambda: False, False),
+            timeout=_AUDIT_WAIT_TIMEOUT_SECS,
+        )
+        assert relayed == []
+        # Several spins really happened, so "nothing was sent" is an observation
+        # rather than a race this test won.
+        assert reads["store"] >= 5, reads
+        assert sent == [], sent
 
     @pytest.mark.asyncio
     async def test_a_failed_progress_send_stops_reporting_not_the_transfer(self, monkeypatch):

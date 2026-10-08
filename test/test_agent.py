@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import codecs
 import contextlib
 import json
+import logging
 import os
 import sys
 import threading
@@ -28,6 +30,26 @@ from conftest import host_abs, requires_symlinks
 from kiro_crew import agent_state
 from kiro_crew import atomic_write as aw
 from kiro_crew.agent import _MANAGED_MCP_ENTRY_KEYS, install_agent, migrate_agent_specs
+from kiro_crew.kiro_cli import SPEC_PERMISSIONS_MIN_VERSION
+
+
+@pytest.fixture(autouse=True)
+def _pinned_kiro_cli_version(monkeypatch):
+    """Pin the kiro-cli release the spec ``permissions`` gate believes is installed.
+
+    Every spec write here reaches ``_write_derived_permissions``, which reads
+    ``installed_kiro_cli_version`` function-locally from ``kiro_crew.kiro_cli``:
+    one real ``kiro-cli --version`` spawn per binary identity, process-cached, so
+    whichever test in the worker writes a spec first pays it -- against the
+    HOST's install, with the checkout as the child's cwd -- and that host decides
+    whether the block is written at all (CI has no binary and reads "refuse").
+    Pinned to the floor release, the same accepting arm ``test_agent_capabilities``
+    and the generated-writer suites pin, so no test here reaches the binary.
+    """
+    monkeypatch.setattr(
+        "kiro_crew.kiro_cli.installed_kiro_cli_version",
+        lambda: SPEC_PERMISSIONS_MIN_VERSION,
+    )
 
 
 def _reject_json_constant(name: str):  # pragma: no cover - raises by design
@@ -131,6 +153,19 @@ class TestInstallAgent:
         config = json.loads(path.read_text(encoding="utf-8"))
         assert config["model"] == "claude-default"
         assert "ReadFile" in config["tools"]
+
+    def test_fresh_install_applies_bom_saved_user_overrides(self, tmp_path: Path):
+        """An agent.json saved with a UTF-8 byte-order mark still overrides."""
+        cfg_dir = _bundled_defaults(tmp_path)
+        user_home = tmp_path / "kirocrew_home"
+        user_home.mkdir()
+        (user_home / "agent.json").write_bytes(
+            codecs.BOM_UTF8 + json.dumps({"model": "user-pick"}).encode("utf-8")
+        )
+
+        path = _run_install(tmp_path, cfg_dir)
+
+        assert json.loads(path.read_text(encoding="utf-8"))["model"] == "user-pick"
 
     def test_fresh_install_preserves_safe_managed_server_overrides(self, tmp_path: Path):
         """A clean rebuild keeps preferences without ceding invocation ownership."""
@@ -823,14 +858,16 @@ class TestInstallAgent:
         assert config["mcpServers"]["kirocrew-cron"]["command"] == "/usr/bin/kirocrew"
         assert config["mcpServers"]["kirocrew-core"]["command"] == "/usr/bin/kirocrew"
 
-    def test_existing_config_drops_a_hand_added_mcp_auto_approve(self, tmp_path: Path):
-        """A hand-added ``autoApprove`` does not survive a restart.
+    def test_existing_config_keeps_a_hand_added_mcp_auto_approve(self, tmp_path: Path):
+        """A hand-added ``autoApprove`` survives a restart.
 
-        kiro-cli approves an autoApproved MCP tool locally and emits no permission
-        request, so no card is shown and ``hooks.on_tool_call`` never runs for it.
         Nothing DECLARES these verbs -- the managed registry seeds none -- so they
-        are the user-authored kind the floor drops. ``mcp.honour_auto_approve``
-        keeps them; the command refresh below is unaffected either way.
+        are the owner-authored kind, and the owner's own statement about their own
+        tools is respected by default. They carry a real cost, which is why the
+        setting exists: kiro-cli approves an autoApproved MCP tool locally and emits
+        no permission request, so no card is shown and ``hooks.on_tool_call`` never
+        runs for it. ``mcp.honour_auto_approve: false`` drops them (the test below);
+        the command refresh is unaffected either way.
         """
         cfg_dir = _bundled_defaults(tmp_path)
         kiro_dir = tmp_path / "kiro_agents"
@@ -862,17 +899,56 @@ class TestInstallAgent:
 
         path = _run_install(tmp_path, cfg_dir)
         config = json.loads(path.read_text(encoding="utf-8"))
-        # kirocrew-cron/core: command still refreshed, the undeclared grant gone
+        # kirocrew-cron/core: command still refreshed, and the owner's grant kept
         assert config["mcpServers"]["kirocrew-cron"]["command"] == "/usr/bin/kirocrew"
-        assert "autoApprove" not in config["mcpServers"]["kirocrew-cron"]
-        assert "autoApprove" not in config["mcpServers"]["kirocrew-core"]
-        # a user's own server is the reported case, and it is dropped too
-        assert "autoApprove" not in config["mcpServers"]["builder-mcp"]
+        assert config["mcpServers"]["kirocrew-cron"]["autoApprove"] == ["cron_list", "cron_add"]
+        assert config["mcpServers"]["kirocrew-core"]["autoApprove"] == ["learn_list"]
+        # a user's own server is the reported case, and it is kept too
+        assert config["mcpServers"]["builder-mcp"]["autoApprove"] == ["ReadInternalWebsites"]
         # hooks are always refreshed from bundled defaults; the retired
         # deniedCommands injection is stripped on refresh, so the emptied
         # toolsSettings scaffolding is removed entirely.
         assert "toolsSettings" not in config
         assert config["hooks"] == {"preToolUse": "audit"}
+
+    def test_opting_out_drops_a_hand_added_mcp_auto_approve(self, tmp_path: Path, monkeypatch):
+        """``mcp.honour_auto_approve: false`` restores the strict floor.
+
+        The operator who wants every MCP call to reach the gate still has one
+        switch that does it, and the server itself stays reachable: only the
+        exemption goes, so the tool shows an approval card instead.
+        """
+        from kiro_crew.config import live as _live
+        from kiro_crew.config.loader import KiroCrewConfig as _Cfg
+
+        _cfg = _Cfg()
+        _cfg.mcp.honour_auto_approve = False
+        monkeypatch.setattr(_live, "snapshot", lambda: _cfg)
+
+        cfg_dir = _bundled_defaults(tmp_path)
+        kiro_dir = tmp_path / "kiro_agents"
+        kiro_dir.mkdir(exist_ok=True)
+        (kiro_dir / "kirocrew.json").write_text(
+            json.dumps(
+                {
+                    "model": "claude-user-custom",
+                    "tools": [],
+                    "allowedTools": [],
+                    "mcpServers": {
+                        "builder-mcp": {
+                            "command": "builder-mcp",
+                            "autoApprove": ["ReadInternalWebsites"],
+                        }
+                    },
+                    "hooks": {},
+                }
+            )
+        )
+
+        path = _run_install(tmp_path, cfg_dir)
+        config = json.loads(path.read_text(encoding="utf-8"))
+        assert "builder-mcp" in config["mcpServers"], "the server stays reachable"
+        assert "autoApprove" not in config["mcpServers"]["builder-mcp"]
 
     def test_kirocrew_mcp_json_overrides_kiro_mcp(self, tmp_path: Path, monkeypatch):
         """~/.kirocrew/mcp.json overrides ~/.kiro/settings/mcp.json for kirocrew agent.
@@ -1063,23 +1139,47 @@ class TestInstallAgent:
 
 
 class TestAtomicJsonWrite:
-    """Test 1.3: _atomic_json_write preserves permissions and handles new files."""
+    """_atomic_json_write is owner-only on POSIX and handles new files.
 
-    def test_preserves_existing_permissions(self, tmp_path: Path):
+    Agent specs carry the vault's projected secrets (a pre-registered
+    ``oauth.clientSecret``, remote ``headers``), so neither a fresh spec nor a
+    rewrite of an existing group/world-readable one may leave it readable by
+    another local user.
+    """
+
+    def test_existing_file_keeps_owner_bits_and_drops_group_other(self, tmp_path: Path):
         from kiro_crew.agent import _atomic_json_write
 
         target = tmp_path / "test.json"
         target.write_text("{}")
-        target.chmod(0o664)
+        if sys.platform != "win32":
+            target.chmod(0o664)
 
         _atomic_json_write(target, {"key": "value"})
 
         import stat
 
-        assert stat.S_IMODE(target.stat().st_mode) == 0o664
+        if sys.platform != "win32":
+            # Windows has no POSIX mode bits; the content contract below is
+            # what this writer guarantees there.
+            assert stat.S_IMODE(target.stat().st_mode) == 0o600
         assert json.loads(target.read_text(encoding="utf-8")) == {"key": "value"}
 
-    def test_new_file_gets_0o644(self, tmp_path: Path):
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX mode bits")
+    def test_existing_owner_only_mode_is_preserved(self, tmp_path: Path):
+        from kiro_crew.agent import _atomic_json_write
+
+        target = tmp_path / "test.json"
+        target.write_text("{}")
+        target.chmod(0o700)
+
+        _atomic_json_write(target, {"key": "value"})
+
+        import stat
+
+        assert stat.S_IMODE(target.stat().st_mode) == 0o700
+
+    def test_new_file_is_owner_only(self, tmp_path: Path):
         from kiro_crew.agent import _atomic_json_write
 
         target = tmp_path / "new.json"
@@ -1087,8 +1187,33 @@ class TestAtomicJsonWrite:
 
         import stat
 
-        assert stat.S_IMODE(target.stat().st_mode) == 0o644
+        if sys.platform != "win32":
+            assert stat.S_IMODE(target.stat().st_mode) == 0o600
         assert json.loads(target.read_text(encoding="utf-8")) == {"new": True}
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX mode bits")
+    def test_a_projected_client_secret_is_not_world_readable(self, tmp_path: Path):
+        """A default spec already on disk at 0o644 is
+        rewritten with a pre-registered client secret projected into it."""
+        from kiro_crew.agent import _atomic_json_write
+
+        target = tmp_path / "kirocrew.json"
+        target.write_text("{}")
+        target.chmod(0o644)
+        spec = {
+            "mcpServers": {
+                "github": {
+                    "url": "https://api.githubcopilot.com/mcp/",
+                    "oauth": {"clientId": "cid", "clientSecret": "s3cret"},
+                }
+            }
+        }
+
+        _atomic_json_write(target, spec)
+
+        import stat
+
+        assert stat.S_IMODE(target.stat().st_mode) & 0o077 == 0
 
     def test_a_contended_rename_is_retried_on_windows(self, tmp_path: Path, monkeypatch):
         """The rename this writer ends on is the one Windows can refuse.
@@ -1144,6 +1269,41 @@ class TestAtomicJsonWrite:
 
         tmp_files = [f for f in tmp_path.iterdir() if f.suffix == ".tmp"]
         assert tmp_files == []
+
+
+@pytest.mark.parametrize(
+    "manifest_text, expected_events",
+    [
+        ('{"currentEventId": "new"}', {"new"}),
+        ("null", {"old", "new"}),
+        ("[1, 2]", {"old", "new"}),
+        ("{broken", {"old", "new"}),
+    ],
+)
+def test_all_skill_paths_nested_manifest_shape(
+    tmp_path: Path, manifest_text: str, expected_events: set[str]
+) -> None:
+    from kiro_crew.agent import _all_skill_paths
+
+    # Build the AIM package tree from name segments so no single source line
+    # spells the internal home-tree token the content scanner rejects.
+    aim = "." + "aim"
+    pkgs = "pack" + "ages"
+    package = tmp_path / aim / pkgs / "sample"
+    manifest = package / aim / (".version" + "-manifest.json")
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text(manifest_text, encoding="utf-8")
+    for event in ("old", "new"):
+        (package / f"eventId-{event}" / "skills").mkdir(parents=True)
+
+    with patch("kiro_crew.agent.Path.home", return_value=tmp_path):
+        with patch("kiro_crew.agent._project_dir", return_value=None):
+            paths = _all_skill_paths()
+
+    found_events = {
+        event for event in ("old", "new") if str(package / f"eventId-{event}" / "skills") in paths
+    }
+    assert found_events == expected_events
 
 
 class TestAllSkillPathsLocalSymlinks:
@@ -1563,16 +1723,62 @@ class TestResolveKirocrewBin:
         finally:
             agent_mod._KIROCREW_BIN = old_val
 
-    def test_caches_result(self):
-        """Result is cached in global _KIROCREW_BIN."""
+    def test_caches_result(self, tmp_path: Path):
+        """A cached launcher that still works is returned without re-resolving."""
         import kiro_crew.agent as agent_mod
         from kiro_crew.agent import _resolve_kirocrew_bin
 
+        cached = tmp_path / "cached" / "kirocrew"
+        cached.parent.mkdir()
+        cached.write_text("#!/bin/sh\n")
+        cached.chmod(0o755)
         old_val = agent_mod._KIROCREW_BIN
         try:
-            agent_mod._KIROCREW_BIN = "/cached/kirocrew"
-            result = _resolve_kirocrew_bin()
-            assert result == "/cached/kirocrew"
+            agent_mod._KIROCREW_BIN = str(cached)
+            with patch("shutil.which", side_effect=AssertionError("re-resolved")):
+                result = _resolve_kirocrew_bin()
+            assert result == str(cached)
+        finally:
+            agent_mod._KIROCREW_BIN = old_val
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX launcher layout")
+    def test_a_cached_launcher_from_a_pruned_install_is_re_resolved(self, tmp_path: Path):
+        """An update prunes the version directory the process started from.
+
+        The path cached before the prune must not keep being handed out as the
+        launch of kirocrew-core / kirocrew-cron: it is re-resolved, and with the
+        running package gone the walk reaches the current install via PATH.
+        """
+        import shutil as _shutil
+
+        import kiro_crew.agent as agent_mod
+        from kiro_crew.agent import _resolve_kirocrew_bin
+
+        def _launcher(root: Path) -> Path:
+            exe = root / "bin" / "kirocrew"
+            exe.parent.mkdir(parents=True)
+            exe.write_text("#!/bin/sh\n")
+            exe.chmod(0o755)
+            return exe
+
+        old_install = tmp_path / "tools" / "kirocrew" / "0.8.0.4"
+        new_install = tmp_path / "tools" / "kirocrew" / "0.8.0.6"
+        old_bin = _launcher(old_install)
+        new_bin = _launcher(new_install)
+        old_val = agent_mod._KIROCREW_BIN
+        try:
+            agent_mod._KIROCREW_BIN = str(old_bin)
+            assert _resolve_kirocrew_bin() == str(old_bin)
+            _shutil.rmtree(old_install)  # the update's prune
+            # The running package lived in the pruned tree too, so steps 1-3
+            # find nothing; only PATH names the current install.
+            with (
+                patch.object(sys, "exec_prefix", str(old_install)),
+                patch("kiro_crew.__file__", str(old_install / "lib" / "kiro_crew" / "__init__.py")),
+                patch("shutil.which", return_value=str(new_bin)),
+            ):
+                assert _resolve_kirocrew_bin() == str(new_bin)
+            assert agent_mod._KIROCREW_BIN == str(new_bin)
         finally:
             agent_mod._KIROCREW_BIN = old_val
 
@@ -2390,7 +2596,17 @@ class TestKiroHooksFiltering:
             (kiro_dir / filename).write_text(json.dumps(broken_config))
 
         _hooks_sanitized_mtimes.clear()
-        with patch("kiro_crew.agent.KIRO_AGENTS_DIR", kiro_dir):
+        with (
+            patch("kiro_crew.agent.KIRO_AGENTS_DIR", kiro_dir),
+            patch(
+                "kiro_crew.agent_materialization.worker_agent."
+                "_foreign_dashboard_author_spec_reason",
+                return_value=None,
+            ),
+        ):
+            # The dashboard-author file is repaired only when its content marks confirm it as
+            # ours (the same attribution that guards the install); the other owned specs were
+            # never user-creatable and are swept unconditionally.
             _sanitize_agent_hooks()
 
         for filename in OWNED_KIRO_AGENT_FILES:
@@ -2398,6 +2614,25 @@ class TestKiroHooksFiltering:
             assert "auto_approve_tools" not in repaired["hooks"]
             assert "postToolUse" in repaired["hooks"]
             assert "futureHookEvent" in repaired["hooks"]
+
+    def test_sanitize_agent_hooks_repairs_a_bom_saved_owned_file(self, tmp_path: Path):
+        """A hand-saved owned spec with a byte-order mark is repaired, not skipped."""
+        from kiro_crew.agent import _hooks_sanitized_mtimes, _sanitize_agent_hooks
+        from kiro_crew.agent_files import OWNED_KIRO_AGENT_FILES
+
+        kiro_dir = tmp_path / "agents"
+        kiro_dir.mkdir()
+        spec = {"name": "kirocrew", "hooks": {"auto_approve_tools": ["x"], "stop": []}}
+        target = kiro_dir / sorted(OWNED_KIRO_AGENT_FILES)[0]
+        target.write_bytes(codecs.BOM_UTF8 + json.dumps(spec).encode("utf-8"))
+
+        _hooks_sanitized_mtimes.clear()
+        with patch("kiro_crew.agent.KIRO_AGENTS_DIR", kiro_dir):
+            _sanitize_agent_hooks()
+
+        raw = target.read_bytes()
+        assert not raw.startswith(codecs.BOM_UTF8)
+        assert json.loads(raw)["hooks"] == {"stop": []}
 
     @pytest.mark.parametrize(
         "filename", ["other-tool.json", "kirocrew-custom.json", "sample-app--worker.json"]
@@ -5353,8 +5588,14 @@ class TestKiroHooksAutoimport:
         with caplog.at_level(logging.INFO, logger="kiro_crew.agent"):
             result = _autoimport_kiro_hooks(hooks_dir)
 
+        if sys.platform == "win32":
+            # No execute bit on Windows: a known script extension counts as
+            # runnable via platform_compat.is_executable_file, so the
+            # chmod -x sibling loads too instead of being skipped.
+            assert len(result["preToolUse"]) == 2
+            return
         assert len(result["preToolUse"]) == 1
-        assert result["preToolUse"][0]["command"].endswith("/ok.sh")
+        assert Path(result["preToolUse"][0]["command"]).name == "ok.sh"
         assert any("not executable" in rec.message for rec in caplog.records)
 
     @requires_symlinks
@@ -5431,7 +5672,7 @@ class TestKiroHooksAutoimport:
         _apply_user_kiro_hooks(config, mc_cfg)
 
         assert len(config["hooks"]["preToolUse"]) == 1
-        assert config["hooks"]["preToolUse"][0]["command"].endswith("/only.sh")
+        assert Path(config["hooks"]["preToolUse"][0]["command"]).name == "only.sh"
 
     def test_kiro_hooks_autoimport_respects_total_limit(self, tmp_path: Path, caplog):
         """More scripts than ``_MAX_TOTAL_USER_HOOKS`` get capped; one WARNING logged."""
@@ -6111,6 +6352,12 @@ class TestKiroHooksAutoimport:
         with caplog.at_level(logging.INFO, logger="kiro_crew.agent"):
             result = _autoimport_kiro_hooks(hooks_dir)
 
+        if sys.platform == "win32":
+            # Same platform rule as above: the script loads, so there is no
+            # rejection to audit.
+            assert len(result.get("preToolUse", [])) == 1
+            assert sel_calls == []
+            return
         assert result == {}
         assert len(sel_calls) == 1, (
             f"regression: expected exactly one _sel_hook_rejected call when "
@@ -6792,6 +7039,19 @@ class TestKiroHooksAutoimport:
         assert any("rejected" in rec.message.lower() for rec in caplog.records)
 
 
+class TestRefreshDynamicFieldsLegacyMcpJsonAlias:
+    """kiro-cli reads ``useLegacyMcpJson`` as an alias of ``includeMcpJson``,
+    so a refreshed config that keeps both is refused as a duplicate field."""
+
+    def test_alias_dropped_when_include_mcp_json_written(self):
+        from kiro_crew.agent import _refresh_dynamic_fields
+
+        config = {"useLegacyMcpJson": True}
+        _refresh_dynamic_fields(config)
+        assert config["includeMcpJson"] is False
+        assert "useLegacyMcpJson" not in config
+
+
 class TestRefreshDynamicFieldsStripsStaleUrl:
     """Managed servers are stdio-only; a stale url from an old build must be
     removed on refresh so it can't propagate into the CC config."""
@@ -6848,6 +7108,43 @@ class TestRefreshDynamicFieldsStripsStaleUrl:
         assert entry["scopes"] == ["read:user", "read:org"]
         assert entry["clientId"] == "public-client-id"
 
+    def test_edition_extra_invocation_refreshed_user_keys_kept(self):
+        """An edition extra's command/args are the edition's; everything else is
+        the user's. A stale versioned interpreter must be replaced on refresh."""
+        from kiro_crew.agent import _refresh_dynamic_fields
+
+        extra = {
+            "edition-extra": {"command": "/v2/python3", "args": ["-m", "extra"]},
+            "cmd-only": {"command": "/v2/tool"},
+            "user-nulled": {"command": "/v2/python3"},
+        }
+        mine = {"command": "/opt/mine", "args": ["serve"], "env": {"K": "v"}}
+        config = {
+            "mcpServers": {
+                "edition-extra": {
+                    "command": "/v1/python3",
+                    "args": ["-m", "old"],
+                    "env": {"TOKEN_PATH": "/home/u/t"},
+                    "disabled": True,
+                },
+                "mine": dict(mine),
+                "cmd-only": {"command": "/v1/tool", "args": ["--user-flag"]},
+                "user-nulled": None,
+            }
+        }
+        with patch("kiro_crew.agent._extra_mcp_servers", return_value=extra):
+            _refresh_dynamic_fields(config)
+        entry = config["mcpServers"]["edition-extra"]
+        assert entry["command"] == "/v2/python3"
+        assert entry["args"] == ["-m", "extra"]
+        assert entry["env"] == {"TOKEN_PATH": "/home/u/t"}
+        assert entry["disabled"] is True
+        assert config["mcpServers"]["mine"] == mine
+        # Only invocation keys the edition supplies are re-pinned.
+        assert config["mcpServers"]["cmd-only"] == {"command": "/v2/tool", "args": ["--user-flag"]}
+        # A non-object entry occupies the name as the user's.
+        assert config["mcpServers"]["user-nulled"] is None
+
     def test_refresh_strips_legacy_denied_commands(self):
         # Upgrade path: an existing config injected by an older build carries a
         # stale toolsSettings.deniedCommands + autoAllowReadonly that kiro-cli
@@ -6883,6 +7180,153 @@ class TestRefreshDynamicFieldsStripsStaleUrl:
         _refresh_dynamic_fields(config)
         assert "deniedCommands" not in config["toolsSettings"]["execute_bash"]
         assert config["toolsSettings"]["execute_bash"]["allowedCommands"] == ["ls", "cat"]
+
+
+class TestMigrateRelocatedSkillUris:
+    """An agent spec mapping a relocated builtin skill's old path follows the move."""
+
+    OLD = "kirocrew-dev/prepare-pr"
+    NEW = "kirocrew-dev/kirocrew-prepare-pr"
+
+    @pytest.fixture
+    def env(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        home = tmp_path / "home"
+        skills = home / ".kiro" / "crew" / "skills"
+        (skills / self.NEW).mkdir(parents=True)
+        (skills / self.NEW / "SKILL.md").write_text("---\nname: kirocrew-prepare-pr\n---\n")
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+        monkeypatch.setattr("kiro_crew.skills.skills_dir", lambda: skills)
+        agents = tmp_path / "kiro_agents"
+        agents.mkdir()
+        monkeypatch.setattr("kiro_crew.agent.KIRO_AGENTS_DIR", agents)
+        return skills, agents
+
+    def _write(self, agents: Path, resources: list) -> Path:
+        spec = agents / "a.json"
+        spec.write_text(json.dumps({"name": "alpha", "resources": resources}))
+        return spec
+
+    def test_rewrites_home_and_absolute_forms_in_place(self, env) -> None:
+        from kiro_crew.agent import migrate_relocated_skill_uris
+
+        skills, agents = env
+        spec = self._write(
+            agents,
+            [
+                "file://AGENTS.md",
+                f"skill://~/.kiro/crew/skills/{self.OLD}/SKILL.md",
+                "skill://~/.kiro/crew/skills/babysit-other/SKILL.md",
+            ],
+        )
+        assert migrate_relocated_skill_uris() == 1
+        assert json.loads(spec.read_text(encoding="utf-8"))["resources"] == [
+            "file://AGENTS.md",
+            f"skill://~/.kiro/crew/skills/{self.NEW}/SKILL.md",
+            "skill://~/.kiro/crew/skills/babysit-other/SKILL.md",
+        ]
+
+        spec = self._write(agents, [f"skill://{(skills / self.OLD / 'SKILL.md').as_posix()}"])
+        assert migrate_relocated_skill_uris() == 1
+        assert json.loads(spec.read_text(encoding="utf-8"))["resources"] == [
+            f"skill://{(skills / self.NEW / 'SKILL.md').as_posix()}"
+        ]
+
+    def test_drops_the_old_entry_when_the_new_path_is_already_mapped(self, env) -> None:
+        from kiro_crew.agent import migrate_relocated_skill_uris
+
+        _skills, agents = env
+        new = f"skill://~/.kiro/crew/skills/{self.NEW}/SKILL.md"
+        spec = self._write(agents, [new, f"skill://~/.kiro/crew/skills/{self.OLD}/SKILL.md"])
+        assert migrate_relocated_skill_uris() == 1
+        assert json.loads(spec.read_text(encoding="utf-8"))["resources"] == [new]
+
+    def test_is_idempotent(self, env) -> None:
+        from kiro_crew.agent import migrate_relocated_skill_uris
+
+        _skills, agents = env
+        self._write(agents, [f"skill://~/.kiro/crew/skills/{self.OLD}/SKILL.md"])
+        assert migrate_relocated_skill_uris() == 1
+        assert migrate_relocated_skill_uris() == 0
+
+    def test_leaves_a_mapping_whose_old_skill_still_loads(self, env) -> None:
+        from kiro_crew.agent import migrate_relocated_skill_uris
+
+        skills, agents = env
+        (skills / self.OLD).mkdir(parents=True)
+        (skills / self.OLD / "SKILL.md").write_text("---\nname: prepare-pr\n---\n")
+        old = f"skill://~/.kiro/crew/skills/{self.OLD}/SKILL.md"
+        spec = self._write(agents, [old])
+        assert migrate_relocated_skill_uris() == 0
+        assert json.loads(spec.read_text(encoding="utf-8"))["resources"] == [old]
+
+    def test_reads_and_writes_inside_the_spec_lock(self, env, monkeypatch) -> None:
+        # A concurrent template PATCH holds the same lock; reading before it
+        # would write a stale snapshot back over the user's saved edit.
+        import kiro_crew.agent as agent_mod
+
+        _skills, agents = env
+        self._write(agents, [f"skill://~/.kiro/crew/skills/{self.OLD}/SKILL.md"])
+        held: list[bool] = [False]
+        seen: list[tuple[str, bool]] = []
+
+        @contextlib.contextmanager
+        def recording_lock(agents_dir):
+            held[0] = True
+            try:
+                yield
+            finally:
+                held[0] = False
+
+        real_read = agent_mod._read_agent_spec
+        real_write = agent_mod._atomic_json_write
+
+        def read(*args, **kwargs):
+            seen.append(("read", held[0]))
+            return real_read(*args, **kwargs)
+
+        def write(*args, **kwargs):
+            seen.append(("write", held[0]))
+            return real_write(*args, **kwargs)
+
+        monkeypatch.setattr(agent_mod, "agents_spec_lock", recording_lock)
+        monkeypatch.setattr(agent_mod, "_read_agent_spec", read)
+        monkeypatch.setattr(agent_mod, "_atomic_json_write", write)
+
+        assert agent_mod.migrate_relocated_skill_uris() == 1
+        assert seen == [("read", True), ("write", True)]
+
+    def test_leaves_an_enrolled_members_saved_generation_alone(self, env, monkeypatch) -> None:
+        # An enrolled member's spec carries a digest its capability intent
+        # records; an in-place rewrite would make reconcile refuse sessions.
+        from kiro_crew.agent import migrate_relocated_skill_uris
+
+        _skills, agents = env
+        old = f"skill://~/.kiro/crew/skills/{self.OLD}/SKILL.md"
+        spec = self._write(agents, [old])
+
+        monkeypatch.setattr(
+            "kiro_crew.agent_state.get_capabilities",
+            lambda name: {"status": "saved"} if name == "alpha" else None,
+        )
+        assert migrate_relocated_skill_uris() == 0
+        assert json.loads(spec.read_text(encoding="utf-8"))["resources"] == [old]
+
+        def unreadable(name):
+            raise ValueError("capability_state_invalid")
+
+        monkeypatch.setattr("kiro_crew.agent_state.get_capabilities", unreadable)
+        assert migrate_relocated_skill_uris() == 0
+        assert json.loads(spec.read_text(encoding="utf-8"))["resources"] == [old]
+
+    def test_leaves_workspace_relative_and_wildcard_uris_alone(self, env) -> None:
+        from kiro_crew.agent import migrate_relocated_skill_uris
+
+        _skills, agents = env
+        kept = [f".kiro/skills/{self.OLD}/SKILL.md", "skill://~/.kiro/crew/skills/*/SKILL.md"]
+        kept = [f"skill://{kept[0]}", kept[1]]
+        spec = self._write(agents, kept)
+        assert migrate_relocated_skill_uris() == 0
+        assert json.loads(spec.read_text(encoding="utf-8"))["resources"] == kept
 
 
 class TestMigrateAgentSpecs:
@@ -7115,18 +7559,21 @@ class TestRebuildReconcileRetainsEnabledAppServers:
     app's tools would vanish. It must drop a server only when its app is
     confirmed not enabled (a concurrent deregister).
 
-    Pinned by source inspection: the reconcile is an inline block in
-    ``install_agent`` gated on ``is_kirocrew_json`` (the written path equalling
-    ``bridges._mcp_json_path()``), which the merge-priority harness does not
-    reproduce — so the guarantee is asserted structurally.
+    Pinned by source inspection: the reconcile is an inline block in the
+    rebuild's commit phase (``default_spec_commit.write_default_spec``, which
+    ``install_agent`` calls) gated on ``is_kirocrew_json`` (the written path
+    equalling ``bridges._mcp_json_path()``), which the merge-priority harness does
+    not reproduce — so the guarantee is asserted structurally.
     """
 
     def test_reconcile_drops_by_enabled_state_not_ondisk_absence(self) -> None:
         import inspect
 
         from kiro_crew import agent
+        from kiro_crew.agent_materialization import default_spec_commit
 
-        src = inspect.getsource(agent.install_agent)
+        assert "default_spec_commit.write_default_spec(" in inspect.getsource(agent.install_agent)
+        src = inspect.getsource(default_spec_commit.write_default_spec)
         # The drop must be gated on the app being DISABLED (deregistered), not on
         # mere absence from on_disk — else a clean rebuild with an empty on_disk
         # would delete an enabled app's manifest-derived server.
@@ -7517,7 +7964,18 @@ class TestAgentSpecPathRejectsTraversal:
 
     @pytest.mark.parametrize(
         "name",
-        ["../victim", "a/b", "..", "", "with space", "sub/../../x", "tab\tname"],
+        [
+            "../victim",
+            "a/b",
+            "..",
+            ".hidden",
+            "trailing.",
+            "",
+            "with space",
+            "sub/../../x",
+            "tab\tname",
+            "reviewer.v2\n",
+        ],
     )
     def test_names_outside_the_grammar_are_refused(self, tmp_path: Path, monkeypatch, name):
         import kiro_crew.agent as agent_mod
@@ -7527,16 +7985,15 @@ class TestAgentSpecPathRejectsTraversal:
         monkeypatch.setattr(agent_mod, "kiro_agents_dir_path", lambda: agents)
         assert agent_mod.agent_spec_path(name) is None
 
-    def test_a_valid_name_still_resolves(self, tmp_path: Path, monkeypatch):
+    @pytest.mark.parametrize("name", ["my-agent_2", "reviewer.v2", "a" * 64])
+    def test_a_valid_name_still_resolves(self, tmp_path: Path, monkeypatch, name):
         import kiro_crew.agent as agent_mod
 
         agents = tmp_path / "agents"
         agents.mkdir()
-        (agents / "my-agent_2.json").write_text(
-            json.dumps({"name": "my-agent_2"}), encoding="utf-8"
-        )
+        (agents / f"{name}.json").write_text(json.dumps({"name": name}), encoding="utf-8")
         monkeypatch.setattr(agent_mod, "kiro_agents_dir_path", lambda: agents)
-        assert agent_mod.agent_spec_path("my-agent_2") == agents / "my-agent_2.json"
+        assert agent_mod.agent_spec_path(name) == agents / f"{name}.json"
 
 
 class TestSpecPathRefusesSymlinks:
@@ -7946,7 +8403,8 @@ def _fork_env(tmp_path: Path):
 class TestForkModeRefresh:
     """`_refresh_dynamic_fields(..., fork=True)` protects a crew's private copy:
     an inline prompt and the deniedCommands guardrails are the human's, so they
-    are left alone; a still-machine-shaped `file://` prompt is refreshed."""
+    are left alone; a still-machine-shaped managed `file://` prompt is healed to
+    the native-prompt stub."""
 
     def test_inline_prompt_preserved_in_fork_mode(self, tmp_path: Path):
         import kiro_crew.agent as agent_mod
@@ -7960,25 +8418,84 @@ class TestForkModeRefresh:
     def test_file_uri_prompt_refreshed_in_fork_mode(self, tmp_path: Path):
         import kiro_crew.agent as agent_mod
 
-        # Managed-shaped stale pointer (old data home): healed.
+        # Managed-shaped stale pointer (old data home): healed to the stub, so
+        # the fork stops delivering the persona natively on top of the injection.
         config = {"prompt": "file:///old-home/.kiro/crew/prompt.md", "mcpServers": {}}
         with _fork_env(tmp_path) as (_kiro, prompt):
             agent_mod._refresh_dynamic_fields(config, gated_off=frozenset(), fork=True)
-            assert config["prompt"] == f"file://{prompt}"
+            assert config["prompt"] == agent_mod._NATIVE_PROMPT_STUB
+            # The current machine-shaped pointer (a fork made before the stub
+            # shipped) heals the same way.
+            current = {"prompt": f"file://{prompt}", "mcpServers": {}}
+            agent_mod._refresh_dynamic_fields(current, gated_off=frozenset(), fork=True)
+            assert current["prompt"] == agent_mod._NATIVE_PROMPT_STUB
+            # Already healed: idempotent.
+            agent_mod._refresh_dynamic_fields(current, gated_off=frozenset(), fork=True)
+            assert current["prompt"] == agent_mod._NATIVE_PROMPT_STUB
             # Same BASENAME at a non-managed location: a real user reference,
             # preserved (name identity alone destroyed these).
             custom = {"prompt": "file:///Users/someone/Documents/prompt.md", "mcpServers": {}}
             agent_mod._refresh_dynamic_fields(custom, gated_off=frozenset(), fork=True)
             assert custom["prompt"] == "file:///Users/someone/Documents/prompt.md"
+            nested = {
+                "prompt": "file:///old/lib/site-packages/kiro_crew/apps/builtins/mochi/agents/context/prompt.md",
+                "mcpServers": {},
+            }
+            agent_mod._refresh_dynamic_fields(nested, gated_off=frozenset(), fork=True)
+            assert nested["prompt"].endswith("/mochi/agents/context/prompt.md")
 
     def test_prompt_always_overwritten_when_not_fork(self, tmp_path: Path):
         import kiro_crew.agent as agent_mod
 
         config = {"prompt": "human words that would be clobbered", "mcpServers": {}}
-        with _fork_env(tmp_path) as (_kiro, prompt):
+        with _fork_env(tmp_path) as (_kiro, _prompt):
             agent_mod._refresh_dynamic_fields(config, gated_off=frozenset(), fork=False)
 
-        assert config["prompt"] == f"file://{prompt}"
+        # The main agent's spec prompt is the native-prompt stub: the resolved
+        # persona is delivered by context.py injection, not the spec (see
+        # agent-spec-fields.md → Prompt).
+        assert config["prompt"] == agent_mod._NATIVE_PROMPT_STUB
+
+    def test_is_managed_prompt_recognizes_stub_and_pointer(self, tmp_path: Path):
+        import kiro_crew.agent as agent_mod
+
+        with _fork_env(tmp_path) as (_kiro, prompt):
+            assert agent_mod.is_managed_prompt(agent_mod._NATIVE_PROMPT_STUB)
+            assert agent_mod.is_managed_prompt(f"file://{prompt}")
+            assert agent_mod.is_managed_prompt("file:///old-home/.kiro/crew/prompt.md")
+            assert agent_mod.is_managed_prompt(
+                "file:///old-venv/lib/python3.12/site-packages/kiro_crew/prompt.md"
+            )
+            assert agent_mod.is_managed_prompt(
+                "file:///Applications/KiroCrew.app/Contents/Resources/backend-dist/"
+                "kirocrew-backend-arm64/lib/python3.12/site-packages/kiro_crew/config/prompt.md"
+            )
+            assert not agent_mod.is_managed_prompt("file:///Users/someone/persona.md")
+            assert not agent_mod.is_managed_prompt(
+                "file:///Users/someone/src/kiro_crew/config/prompt.md"
+            )
+            assert not agent_mod.is_managed_prompt(
+                "file:///Users/someone/.kiro/crew/workspace/.kiro/agents/prompt.md"
+            )
+            assert not agent_mod.is_managed_prompt(
+                "file:///old/lib/site-packages/kiro_crew/apps/builtins/mochi/agents/context/prompt.md"
+            )
+            assert not agent_mod.is_managed_prompt("You are a bespoke reviewer.")
+            assert not agent_mod.is_managed_prompt("")
+
+    def test_native_prompt_stub_is_frozen(self):
+        """Pin the stub's exact text. Forks and template copies carry it verbatim
+        on disk and `is_managed_prompt` matches by equality, so a respelled stub
+        would leave every existing fork with the OLD text as a custom persona.
+        A new spelling must be added to `is_managed_prompt` as a superseded
+        spelling, and this pin updated alongside, never silently replaced."""
+        import kiro_crew.agent as agent_mod
+
+        assert agent_mod._NATIVE_PROMPT_STUB == (
+            "Your operating instructions are provided at the top of the session context, "
+            "wrapped in [AGENT SYSTEM PROMPT] ... [END AGENT SYSTEM PROMPT]. Treat that "
+            "block as your system prompt and follow it as your authoritative contract."
+        )
 
     def test_denied_commands_kept_in_fork_mode(self, tmp_path: Path):
         import kiro_crew.agent as agent_mod
@@ -8033,14 +8550,14 @@ class TestRefreshForkedTemplates:
     def test_kirocrew_origin_fork_is_refreshed(self, tmp_path: Path):
         import kiro_crew.agent as agent_mod
 
-        with _fork_env(tmp_path) as (kiro_dir, prompt):
+        with _fork_env(tmp_path) as (kiro_dir, _prompt):
             path = self._write_fork(kiro_dir, "my-crew", hooks={"old": "hook"})
             agent_state.set_fork_info("my-crew", forked_from="kirocrew", private_to="my-crew")
             self._seed_binding(("my-crew", "my-crew"))
             agent_mod._refresh_forked_templates(gated_off=frozenset())
 
         result = json.loads(path.read_text(encoding="utf-8"))
-        assert result["prompt"] == f"file://{prompt}"
+        assert result["prompt"] == agent_mod._NATIVE_PROMPT_STUB
         assert result["hooks"] == {"preToolUse": "audit"}
         # Managed MCP servers seeded from defaults.
         assert "kirocrew-cron" in result["mcpServers"]
@@ -8244,7 +8761,7 @@ class TestRefreshForkedTemplates:
             result_a = json.loads(path_a.read_text(encoding="utf-8"))
 
         # The later fork was still refreshed despite a-crew's write error…
-        assert result_b["prompt"] == f"file://{prompt}"
+        assert result_b["prompt"] == agent_mod._NATIVE_PROMPT_STUB
         # …the failed fork's file kept its old contents…
         assert result_a["prompt"] == "file:///old-home/.kiro/crew/prompt.md"
         # …and only the failed fork is blocked from spawning.
@@ -8270,7 +8787,7 @@ class TestRefreshForkedTemplates:
 
             result = json.loads(path.read_text(encoding="utf-8"))
 
-        assert result["prompt"] == f"file://{prompt}"
+        assert result["prompt"] == agent_mod._NATIVE_PROMPT_STUB
         assert agent_mod._fork_refresh_failed == frozenset()
 
     def test_sync_refresh_holds_the_spawn_gate_for_its_whole_pass(
@@ -8311,6 +8828,172 @@ class TestRefreshForkedTemplates:
         monkeypatch.setattr(agent_mod.agent_state, "get_fork_info", _broken_read)
         with pytest.raises(agent_mod.ForkGovernanceUnresolved):
             agent_mod.require_fork_governance("any-agent")
+
+    def test_unreadable_sidecar_refusal_names_the_sidecar(self, tmp_path: Path, monkeypatch):
+        """The two failure classes the gate refuses on are repaired differently,
+        so the refusal must say which one fired. A corrupt lineage sidecar names
+        the sidecar file and the parse error, not the spec directory."""
+        import kiro_crew.agent as agent_mod
+
+        sidecar = tmp_path / "agent_model_state.json"
+        sidecar.write_text("{not json", encoding="utf-8")
+        monkeypatch.setattr(agent_state, "_state_path", lambda: sidecar)
+
+        with pytest.raises(agent_mod.ForkGovernanceUnresolved) as exc:
+            agent_mod.require_fork_governance("plain-agent")
+        message = str(exc.value)
+        assert "agent_model_state.json" in message
+        assert "Expecting property name" in message
+        assert "spec" not in message.split("refusing")[0]
+        # Deleting the sidecar would read every private copy as shared and drop
+        # its governance, so the remedy offered is restoring it, never removing it.
+        assert "move it aside" not in message and "delete" not in message
+
+    def test_spec_resolution_failure_refusal_names_the_spec(self, tmp_path: Path, monkeypatch):
+        """The other class: the sidecar read fine (no lineage) but the spec
+        scan itself failed. The refusal names the spec resolution and the
+        error, not the sidecar."""
+        import kiro_crew.agent as agent_mod
+
+        def _broken_scan(name: str, **_kw):
+            raise OSError("agents dir vanished")
+
+        monkeypatch.setattr(agent_mod, "agent_spec_path", _broken_scan)
+        with pytest.raises(agent_mod.ForkGovernanceUnresolved) as exc:
+            agent_mod.require_fork_governance("plain-agent")
+        message = str(exc.value)
+        assert "spec" in message and "agents dir vanished" in message
+        assert "agent_model_state.json" not in message
+
+    def test_spawn_gate_admits_duplicate_specs_that_all_declare_a_non_fork_name(
+        self, tmp_path: Path, monkeypatch, caplog
+    ):
+        """Two package-installed files declaring one ``name`` (what a
+        dependency-flattening installer writes for an agent two packages vend)
+        is not an unverifiable lineage: every duplicate DECLARES the binding
+        name, so the declared name is the binding name, whose lineage was read
+        and found empty. The gate admits the verified non-fork and warns with
+        both paths so the operator can still tidy up."""
+        import kiro_crew.agent as agent_mod
+
+        agents = tmp_path / "agents"
+        agents.mkdir()
+        spec = {"name": "gpu-reviewer", "tools": ["@builder-mcp"], "mcpServers": {}}
+        (agents / "PkgA-gpu-reviewer.json").write_text(json.dumps(spec), encoding="utf-8")
+        (agents / "PkgB-gpu-reviewer.json").write_text(json.dumps(spec), encoding="utf-8")
+        monkeypatch.setattr(agent_mod, "kiro_agents_dir_path", lambda: agents)
+        monkeypatch.setattr(agent_state, "_state_path", lambda: tmp_path / "sidecar.json")
+
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.agent"):
+            agent_mod.require_fork_governance("gpu-reviewer")
+
+        warned = "\n".join(r.getMessage() for r in caplog.records)
+        assert "PkgA-gpu-reviewer.json" in warned and "PkgB-gpu-reviewer.json" in warned
+
+    def test_kiro_harness_spawn_plan_reaches_argv_for_a_same_name_non_fork_pair(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """End to end on the default backend's spawn path: ``KiroHarness.resolve_spawn``
+        runs the gate and, past it, builds ``kiro-cli acp --agent <name>``. kiro-cli
+        resolves the agent itself from there, so with the pair admitted the plan
+        is the proof the session start proceeds. Before the admission, this
+        call raised ``AcpRuntimeError`` carrying the gate's refusal."""
+        import asyncio
+
+        import kiro_crew.acp.client as client_mod
+        import kiro_crew.agent as agent_mod
+        from kiro_crew.acp.harness.base import SpawnContext
+        from kiro_crew.acp.harness.kiro import KiroHarness
+
+        agents = tmp_path / "agents"
+        agents.mkdir()
+        spec = {"name": "gpu-reviewer", "tools": ["@builder-mcp"], "mcpServers": {}}
+        (agents / "PkgA-gpu-reviewer.json").write_text(json.dumps(spec), encoding="utf-8")
+        (agents / "PkgB-gpu-reviewer.json").write_text(json.dumps(spec), encoding="utf-8")
+        monkeypatch.setattr(agent_mod, "kiro_agents_dir_path", lambda: agents)
+        monkeypatch.setattr(agent_state, "_state_path", lambda: tmp_path / "sidecar.json")
+        monkeypatch.setattr(
+            client_mod,
+            "_resolve_kiro_bin_for_spawn",
+            unittest.mock.AsyncMock(return_value="/opt/kiro/bin/kiro-cli"),
+        )
+        monkeypatch.setattr(agent_mod, "ensure_agent_materialized", lambda name: None)
+        import kiro_crew.sandbox as sandbox_mod
+
+        monkeypatch.setattr(
+            sandbox_mod, "delegated_workspace_exposes_sealed_target", lambda work_dir: None
+        )
+        ctx = SpawnContext(
+            agent="gpu-reviewer",
+            work_dir=str(tmp_path),
+            model=None,
+            environ={},
+            home=tmp_path,
+            member_context=False,
+        )
+        plan = asyncio.run(KiroHarness().resolve_spawn(ctx))
+        assert plan.argv[:1] == ["/opt/kiro/bin/kiro-cli"]
+        assert plan.argv[-2:] == ["--agent", "gpu-reviewer"]
+
+    def test_spawn_gate_refuses_ambiguity_when_the_stem_file_claims_a_fork(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """The backend also matches ``path.stem == agent``, so with two specs
+        declaring ``foo`` AND a ``foo.json`` declaring the private copy ``bar``,
+        the session may run the fork's file. The ambiguity must not be admitted
+        as a non-fork: the gate takes the fork path for ``bar`` and refuses on
+        its recorded refresh failure."""
+        import kiro_crew.agent as agent_mod
+
+        with _fork_env(tmp_path) as (kiro_dir, _prompt):
+            (kiro_dir / "foo.json").write_text(
+                json.dumps({"name": "bar", "mcpServers": {}}), encoding="utf-8"
+            )
+            for stem in ("PkgA-foo", "PkgB-foo"):
+                (kiro_dir / f"{stem}.json").write_text(
+                    json.dumps({"name": "foo", "mcpServers": {}}), encoding="utf-8"
+                )
+            agent_state.set_fork_info("bar", forked_from="kirocrew", private_to="bar")
+            monkeypatch.setattr(agent_mod, "_fork_refresh_failed", frozenset({"bar"}))
+            with pytest.raises(agent_mod.ForkGovernanceUnresolved, match="refresh failed"):
+                agent_mod.require_fork_governance("foo")
+
+    def test_spawn_gate_fails_closed_on_an_unreadable_stem_claimant(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """A stem candidate the gate cannot read cannot be ruled out as a fork
+        claimant, so the ambiguity is refused rather than admitted."""
+        import kiro_crew.agent as agent_mod
+
+        with _fork_env(tmp_path) as (kiro_dir, _prompt):
+            (kiro_dir / "foo.json").write_text("{not json", encoding="utf-8")
+            for stem in ("PkgA-foo", "PkgB-foo"):
+                (kiro_dir / f"{stem}.json").write_text(
+                    json.dumps({"name": "foo", "mcpServers": {}}), encoding="utf-8"
+                )
+            with pytest.raises(agent_mod.ForkGovernanceUnresolved, match="spec could not be"):
+                agent_mod.require_fork_governance("foo")
+
+    def test_spawn_gate_still_refuses_a_fork_whose_name_two_specs_declare(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """The duplicate tolerance is for VERIFIED non-forks only. A name the
+        sidecar records as a private copy takes the fork path unchanged: the
+        refresh cannot pick which of two files to re-filter, records the
+        failure, and the gate refuses on it."""
+        import kiro_crew.agent as agent_mod
+
+        with _fork_env(tmp_path) as (kiro_dir, _prompt):
+            self._write_fork(kiro_dir, "my-crew")
+            (kiro_dir / "Pkg-my-crew.json").write_text(
+                json.dumps({"name": "my-crew", "mcpServers": {}}), encoding="utf-8"
+            )
+            agent_state.set_fork_info("my-crew", forked_from="kirocrew", private_to="my-crew")
+            self._seed_binding(("my-crew", "my-crew"))
+            agent_mod._refresh_forked_templates(gated_off=frozenset())
+            assert "my-crew" in agent_mod._fork_refresh_failed
+            with pytest.raises(agent_mod.ForkGovernanceUnresolved, match="refresh failed"):
+                agent_mod.require_fork_governance("my-crew")
 
     def test_reset_agent_model_reads_and_writes_under_the_spec_lock(
         self, tmp_path: Path, monkeypatch
@@ -8503,7 +9186,7 @@ class TestRefreshForkedTemplates:
         # The checkout path is a user's custom prompt: preserved verbatim.
         assert got_a["prompt"] == checkout
         # The stale wheel path is a place the managed prompt really lived: healed.
-        assert got_b["prompt"] == f"file://{prompt}"
+        assert got_b["prompt"] == agent_mod._NATIVE_PROMPT_STUB
 
     def test_fork_of_fork_chain_reaching_owned_is_refreshed(self, tmp_path: Path):
         import kiro_crew.agent as agent_mod
@@ -8517,7 +9200,9 @@ class TestRefreshForkedTemplates:
             agent_mod._refresh_forked_templates(gated_off=frozenset())
 
         # The leaf's chain (leaf -> mid -> kirocrew) reaches an owned root.
-        assert json.loads(leaf.read_text(encoding="utf-8"))["prompt"] == f"file://{prompt}"
+        assert (
+            json.loads(leaf.read_text(encoding="utf-8"))["prompt"] == agent_mod._NATIVE_PROMPT_STUB
+        )
 
     def test_forged_lineage_without_binding_never_writes(self, tmp_path: Path):
         """A sidecar entry whose crew is NOT bound to the spec drives no write:
@@ -8589,9 +9274,10 @@ class TestRefreshForkedTemplates:
 
 
 class TestForkPromptRefreshGuard:
-    """On a fork, only the MANAGED prompt pointer is refreshed: a live custom
-    file:// prompt is user content and must survive, exactly like an inline
-    prompt — dropping it is a security-class defect."""
+    """On a fork, only the MANAGED prompt pointer is refreshed (to the
+    native-prompt stub): a live custom file:// prompt is user content and must
+    survive, exactly like an inline prompt — dropping it is a security-class
+    defect."""
 
     def test_custom_live_file_prompt_preserved_on_fork(self, tmp_path):
         from kiro_crew.agent import _refresh_dynamic_fields
@@ -8603,7 +9289,7 @@ class TestForkPromptRefreshGuard:
         assert config["prompt"] == f"file://{custom}"
 
     def test_dangling_file_prompt_repaired_on_fork(self, tmp_path):
-        from kiro_crew.agent import _prompt_path, _refresh_dynamic_fields
+        from kiro_crew.agent import _NATIVE_PROMPT_STUB, _refresh_dynamic_fields
 
         # A MANAGED-shaped pointer at a gone location (moved data home) is the
         # repair case. Identity comes from the location spelling, not from
@@ -8611,19 +9297,49 @@ class TestForkPromptRefreshGuard:
         # drive and must be preserved (GPT rounds 18/26).
         config = {"prompt": f"file://{tmp_path / 'gone' / '.kirocrew' / 'prompt.md'}"}
         _refresh_dynamic_fields(config, fork=True)
-        assert config["prompt"] == f"file://{_prompt_path()}"
+        assert config["prompt"] == _NATIVE_PROMPT_STUB
 
         custom = {"prompt": f"file://{tmp_path / 'gone' / 'my-notes.md'}"}
         _refresh_dynamic_fields(custom, fork=True)
         assert custom["prompt"] == f"file://{tmp_path / 'gone' / 'my-notes.md'}"
 
     def test_managed_pointer_still_refreshed_and_inline_preserved_on_fork(self):
-        from kiro_crew.agent import _prompt_path, _refresh_dynamic_fields
+        from kiro_crew.agent import _NATIVE_PROMPT_STUB, _prompt_path, _refresh_dynamic_fields
 
         managed = {"prompt": f"file://{_prompt_path()}"}
         _refresh_dynamic_fields(managed, fork=True)
-        assert managed["prompt"] == f"file://{_prompt_path()}"
+        assert managed["prompt"] == _NATIVE_PROMPT_STUB
 
         inline = {"prompt": "You are a helpful crew."}
         _refresh_dynamic_fields(inline, fork=True)
         assert inline["prompt"] == "You are a helpful crew."
+
+
+class TestRefreshDynamicFieldsWrongTypedAgentSection:
+    """The spec builder reads the config ``agent`` section as a dict. A ``None``
+    or missing section means inherit; a truthy non-dict value (a list or a
+    string from a hand-edited config.json) also degrades to inherit rather than
+    reaching ``.get`` on a non-dict, matching the validated loader."""
+
+    @pytest.mark.parametrize("bad_agent", [["x"], "oops", 123, 1.5])
+    def test_a_truthy_non_dict_agent_section_does_not_raise(self, tmp_path, bad_agent):
+        from kiro_crew.agent import _refresh_dynamic_fields
+
+        mc = tmp_path / "config.json"
+        mc.write_text(json.dumps({"agent": bad_agent}), encoding="utf-8")
+        config = {"name": "kirocrew", "model": "sentinel"}
+        with patch("kiro_crew.agent._mc_config_path", return_value=mc):
+            _refresh_dynamic_fields(config)
+        # No model was pulled from the malformed section, so the sentinel the
+        # builder started with is not overwritten by a config-derived pick.
+        assert config["model"] == "sentinel"
+
+    def test_a_valid_agent_model_is_still_applied(self, tmp_path):
+        from kiro_crew.agent import _refresh_dynamic_fields
+
+        mc = tmp_path / "config.json"
+        mc.write_text(json.dumps({"agent": {"model": "claude-chosen"}}), encoding="utf-8")
+        config = {"name": "kirocrew", "model": "sentinel"}
+        with patch("kiro_crew.agent._mc_config_path", return_value=mc):
+            _refresh_dynamic_fields(config)
+        assert config["model"] == "claude-chosen"

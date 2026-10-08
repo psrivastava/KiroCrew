@@ -22,7 +22,7 @@ import inspect
 import logging
 from typing import Awaitable, Callable
 
-from kiro_crew.agent_discovery import list_agents
+from kiro_crew.agent_discovery import is_internal_agent_spec, list_agents
 from kiro_crew.sel import sel
 
 logger = logging.getLogger(__name__)
@@ -172,7 +172,13 @@ def build_spawn_impl(subagents: object) -> SpawnImpl:
             # approval_mode="auto", a full-privilege escalation from the app's own
             # restricted background agent.
             prefix = f"{app}--"
-            known = {a.name for a in agents if a.filename.startswith(prefix)}
+            # Kiro Crew's own generated specs are never an app's agent, even when
+            # derived from one (``<app>--<agent>--readonly`` shares the prefix).
+            known = {
+                a.name
+                for a in agents
+                if a.filename.startswith(prefix) and not is_internal_agent_spec(a)
+            }
         except Exception as exc:  # noqa: BLE001 — cannot confirm → refuse
             reason = f"cannot verify agent {agent!r} for app {app!r}: {exc}"
             _audit_spawn_denied(app, agent, reason)
@@ -222,13 +228,22 @@ def build_done_probe(subagents: object) -> DoneProbe:
     """Adapt a live ``SubagentManager`` to :data:`DoneProbe`.
 
     An id the manager does not track reads as done: the reaper prunes
-    records, and "gone" must never hold a caller's serial lock open.
+    records, and "gone" must never hold a caller's serial lock open. The one
+    exception is a spawn accepted behind the concurrency / adaptive cap: it has
+    no ``_agents`` entry yet (``get`` misses) but is real pending work, so
+    reading it as done would clear the guard and let the caller queue a
+    duplicate of work that has not run. ``is_queued`` names that window.
     """
 
     def _probe(spawn_id: str) -> bool:
         if subagents is None or not spawn_id:
             return True
         info = subagents.get(spawn_id)  # type: ignore[attr-defined]
-        return info is None or bool(getattr(info, "done", False))
+        if info is not None:
+            return bool(getattr(info, "done", False))
+        is_queued = getattr(subagents, "is_queued", None)
+        if callable(is_queued) and is_queued(spawn_id):
+            return False  # accepted, not started: pending work holds the guard
+        return True
 
     return _probe

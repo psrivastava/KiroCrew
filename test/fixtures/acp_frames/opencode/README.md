@@ -1,6 +1,6 @@
 # OpenCode frame corpus
 
-Five files, all live. Read `../README.md` first for what a fixture is and what
+Six files, all live. Read `../README.md` first for what a fixture is and what
 the corpus does and does not prove.
 
 | File | Provenance | Frame classes it carries |
@@ -23,7 +23,7 @@ model emitted around the tool call are omitted for length, and the fixture's own
 The permission frame is the one the enforcement story rests on. Kiro Crew's tool
 gate runs only when a harness sends `session/request_permission` for a tool call,
 and OpenCode sends it only while its own `permission` setting says to ask. The
-session's read-back (`AcpClient._verify_opencode_routing`) proves that setting is in
+session's read-back (`acp.harness.opencode._verify_opencode_routing`) proves that setting is in
 force; it cannot prove the harness then asks. `permission-request-live.jsonl` is that
 second half, observed: with `permission: ask` resolved, OpenCode emitted
 `session/request_permission` before running `bash`, waited for the client's
@@ -63,12 +63,11 @@ That spelling resolved to no directive tool at all before the fix:
 `mcp__<server>__<tool>` (Claude), and `match_tool` splits only on a run of two or
 more underscores -- so every #755 tool answered and none applied.
 
-Two things it does *not* pin. Crew does not itself send this backend an MCP array
-today (`agent-host-contract.md` §5), so the element here is the capture harness's,
-not shipping code's -- what is observed is how OpenCode NAMES a mounted Crew server,
-which is the premise the fix rests on. And it was observed on 1.18.30 only; the
-naming rule is `sanitize(server) + "_" + sanitize(tool)` in that release's bundle,
-and nothing in this repository pins it across upgrades.
+The capture pins how OpenCode names a mounted Crew server. Shipping code now
+sends this backend its MCP array through `ACP_BACKENDS_SESSION_MCP_ARRAY`, using
+the same element shape; `agent-host-contract.md` §5 describes that production
+path. The remaining boundary is version-specific: this naming rule was observed
+on 1.18.30, and nothing in this repository pins it across adapter upgrades.
 
 ## What the compaction capture establishes
 
@@ -102,6 +101,7 @@ a summary of the dropped turns. That series is recorded in the pull request that
 added this file rather than here, because it is six turns of filler text and carries
 no frame class this corpus needs.
 
-pi and goose have no such capture and are therefore in neither set, even though
-their adapter and harness source both say they compact inline. See
+goose joined both sets on its own capture (`../goose/compact-live.jsonl`). pi has no
+such capture and is therefore in neither set, even though its adapter source says it
+compacts inline. See
 `ACP_BACKENDS_COMPACT` for why source is not the bar this set holds its members to.

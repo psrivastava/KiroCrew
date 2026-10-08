@@ -33,7 +33,7 @@ from kiro_crew.gateway_lock import LockHolder, LockProbeError
 from kiro_crew.platform.update_layout import InstallLayout
 from kiro_crew.service import linux as svc_linux
 from kiro_crew.service import macos as svc_macos
-from kiro_crew.service.common import Platform
+from kiro_crew.service.common import Platform, RestartReport
 
 
 class _SelRecorder:
@@ -160,7 +160,7 @@ class TestTokenRefusal:
 
         monkeypatch.setattr(cli_server, "run_preflight_checks", lambda: None)
         monkeypatch.setattr(cli_server, "resolve_client_port", lambda _port: 5476)
-        monkeypatch.setattr(cli_server, "read_local_secret", lambda _port: "s3cr3t")
+        monkeypatch.setattr(cli_server, "read_local_secret", lambda _port, **_kw: "s3cr3t")
         monkeypatch.setattr(cli_server, "loopback_urlopen", refused)
         with pytest.raises(SystemExit) as exc:
             cli_server._token(argparse.Namespace(ttl="1h", port=None))
@@ -175,7 +175,7 @@ class TestTokenRefusal:
 
         monkeypatch.setattr(cli_server, "run_preflight_checks", lambda: None)
         monkeypatch.setattr(cli_server, "resolve_client_port", lambda _port: 5476)
-        monkeypatch.setattr(cli_server, "read_local_secret", lambda _port: "s3cr3t")
+        monkeypatch.setattr(cli_server, "read_local_secret", lambda _port, **_kw: "s3cr3t")
         monkeypatch.setattr(cli_server, "loopback_urlopen", boom)
         with pytest.raises(SystemExit) as exc:
             cli_server._token(argparse.Namespace(ttl="1h", port=None))
@@ -194,11 +194,11 @@ class TestLogout:
     @pytest.fixture
     def secret_home(self, monkeypatch, tmp_path):
         (tmp_path / ".local_secret").write_text("s3cr3t\n", encoding="utf-8", newline="\n")
-        monkeypatch.setattr(cli_server, "read_local_secret", lambda _port: "s3cr3t")
+        monkeypatch.setattr(cli_server, "read_local_secret", lambda _port, **_kw: "s3cr3t")
         return tmp_path
 
     def test_missing_secret_reports_gateway_down(self, monkeypatch, tmp_path, capsys) -> None:
-        monkeypatch.setattr(cli_server, "read_local_secret", lambda _port: "")
+        monkeypatch.setattr(cli_server, "read_local_secret", lambda _port, **_kw: "")
         with pytest.raises(SystemExit) as exc:
             cli_server._logout(5476)
         assert exc.value.code == 1
@@ -468,7 +468,9 @@ class TestRestartIndeterminateLock:
         self, monkeypatch, sel_rec, capsys
     ) -> None:
         monkeypatch.setattr(cli_server, "resolve_client_port", lambda p: 5476)
-        monkeypatch.setattr(cli_server.service_controller, "restart_service", lambda: False)
+        monkeypatch.setattr(
+            cli_server.service_controller, "restart_service", lambda: RestartReport()
+        )
         monkeypatch.setattr(cli_server.service_controller, "is_service_active", lambda: False)
         monkeypatch.setattr(platform_compat, "find_listening_pids", lambda port: [])
         monkeypatch.setattr(platform_compat, "listening_pid_tool_available", lambda: True)
@@ -665,6 +667,11 @@ class _ExecCalled(Exception):
         self.argv = argv
 
 
+# One journal ENTRY as `journalctl -o short` prints it: a timestamp first. The
+# probes below answer this where they mean "the journal has rows".
+_ENTRY_LINE = "Sep 26 03:00:00 host kirocrew[4242]: gateway listening\n"
+
+
 @pytest.fixture
 def fake_execvp(monkeypatch):
     def _execvp(file, argv):
@@ -689,7 +696,7 @@ class TestLogsCmdSystemd:
         monkeypatch.setattr(
             subprocess,
             "run",
-            lambda *a, **k: subprocess.CompletedProcess(a[0], 0, "-- Logs begin --\n", ""),
+            lambda *a, **k: subprocess.CompletedProcess(a[0], 0, _ENTRY_LINE, ""),
         )
         with pytest.raises(_ExecCalled) as exc:
             cli_server._logs_cmd(argparse.Namespace(follow=True, lines=42))
@@ -729,6 +736,50 @@ class TestLogsCmdSystemd:
         assert exc.value.argv[-1] == "-f"
         assert "--no-pager" in exc.value.argv
 
+    def test_rows_are_execed_unprivileged_even_with_the_access_hint_on_stderr(
+        self, monkeypatch, sel_rec, fake_execvp
+    ) -> None:
+        """An operator outside `adm` / `systemd-journal` reading a unit that runs
+        `User=<them>`: journalctl prints the access hint on stderr because the
+        SYSTEM journal files are EACCES, yet still prints the unit's own rows
+        from the ACL-readable `user-<uid>.journal`. Rows are rows — the hint
+        alone must not push this user to a sudo prompt (or, with no TTY, an
+        "Insufficient permissions" exit) for logs it can already read."""
+        hint = (
+            "Hint: You are currently not seeing messages from other users and the system.\n"
+            "      Users in groups 'adm', 'systemd-journal' can see all messages.\n"
+            "      Pass -q to turn off this notice.\n"
+        )
+        monkeypatch.setattr(
+            subprocess,
+            "run",
+            lambda *a, **k: subprocess.CompletedProcess(a[0], 0, _ENTRY_LINE, hint),
+        )
+        monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: False))
+        with pytest.raises(_ExecCalled) as exc:
+            cli_server._logs_cmd(argparse.Namespace(follow=False, lines=3))
+        assert exc.value.file == "journalctl"
+        assert "sudo" not in exc.value.argv
+
+    def test_a_notice_with_the_access_hint_is_execed_as_the_base_did(
+        self, monkeypatch, sel_rec, fake_execvp
+    ) -> None:
+        """The base pin, kept: the sudo rung is for a probe that printed NOTHING.
+        A probe that printed `-- No entries --` (with journalctl's access hint
+        on stderr) is exec'd unprivileged and shows that notice plus the hint,
+        which is what the base showed such a user; the hint is not read."""
+        hint = "Hint: You are currently not seeing messages from other users and the system.\n"
+        monkeypatch.setattr(
+            subprocess,
+            "run",
+            lambda *a, **k: subprocess.CompletedProcess(a[0], 0, "-- No entries --\n", hint),
+        )
+        monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: True))
+        with pytest.raises(_ExecCalled) as exc:
+            cli_server._logs_cmd(argparse.Namespace(follow=False, lines=3))
+        assert exc.value.file == "journalctl"
+        assert "sudo" not in exc.value.argv
+
     def test_missing_unit_falls_through_to_the_plain_log_file(
         self, monkeypatch, tmp_path, sel_rec, fake_execvp
     ) -> None:
@@ -737,14 +788,140 @@ class TestLogsCmdSystemd:
         log.write_text("hi\n", encoding="utf-8", newline="\n")
         monkeypatch.setattr(cli_server, "config_dir", lambda: tmp_path)
 
-        def unreachable(*a, **k):  # pragma: no cover - proves no journal probe
-            raise AssertionError("journalctl must not be probed without an installed unit")
+        def only_the_user_scope_query(argv, *a, **k):
+            # No system unit: the one spawn allowed is the user-scope
+            # `systemctl --user show` that asks whether THAT scope has the unit
+            # (answer: no). journalctl must not be probed without an installed
+            # unit in either scope.
+            if list(argv)[:3] == ["systemctl", "--user", "show"]:
+                return subprocess.CompletedProcess(argv, 0, "LoadState=not-found\n", "")
+            raise AssertionError(f"unexpected spawn without an installed unit: {argv}")
 
-        monkeypatch.setattr(subprocess, "run", unreachable)
+        monkeypatch.setattr(subprocess, "run", only_the_user_scope_query)
         with pytest.raises(_ExecCalled) as exc:
             cli_server._logs_cmd(argparse.Namespace(follow=False, lines=3))
         assert exc.value.file == "tail"
         assert exc.value.argv == ["tail", "-n", "3", str(log)]
+
+
+class TestLogsCmdUserScope:
+    """A gateway running as the per-user unit (the SELinux remedy) has its logs in
+    the USER journal, which `journalctl --user` reads without privilege."""
+
+    @pytest.fixture(autouse=True)
+    def _user_unit_only(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(cli_server, "current_platform", lambda: Platform.SYSTEMD)
+        monkeypatch.setattr(svc_linux, "UNIT_PATH", tmp_path / "absent.service")
+        monkeypatch.setattr(svc_linux, "user_unit_installed", lambda: True)
+
+    def test_user_journal_is_execed_when_only_the_user_unit_exists(
+        self, monkeypatch, sel_rec, fake_execvp
+    ) -> None:
+        probes: list[list[str]] = []
+
+        def probe(argv, *a, **k):
+            probes.append(list(argv))
+            return subprocess.CompletedProcess(argv, 0, _ENTRY_LINE, "")
+
+        monkeypatch.setattr(subprocess, "run", probe)
+        with pytest.raises(_ExecCalled) as exc:
+            cli_server._logs_cmd(argparse.Namespace(follow=True, lines=42))
+        assert exc.value.file == "journalctl"
+        assert exc.value.argv[:2] == ["journalctl", "--user"]
+        assert "-u" in exc.value.argv and "kirocrew.service" in exc.value.argv
+        assert "42" in exc.value.argv
+        assert exc.value.argv[-1] == "-f"
+        assert probes == [
+            [
+                "journalctl",
+                "--user",
+                "--quiet",
+                "-u",
+                "kirocrew.service",
+                "-n",
+                "1",
+                "--no-pager",
+            ]
+        ]
+        assert sel_rec.operations == ["logs"]
+
+    def test_an_empty_user_journal_saying_no_entries_still_falls_through(
+        self, monkeypatch, tmp_path, sel_rec, fake_execvp
+    ) -> None:
+        """A journal with no matching entries answers `-- No entries --` on STDOUT
+        with exit 0 (real journalctl, systemd 252) — which is not a row. The probe
+        asks quietly, so the notice is suppressed and the log file is tailed
+        instead of exec-ing a journal that would show nothing."""
+        log = tmp_path / "gateway.log"
+        log.write_text("hi\n", encoding="utf-8", newline="\n")
+        monkeypatch.setattr(cli_server, "config_dir", lambda: tmp_path)
+        probes: list[list[str]] = []
+
+        def journalctl(argv, *a, **k):
+            probes.append(list(argv))
+            quiet = "--quiet" in argv or "-q" in argv
+            return subprocess.CompletedProcess(argv, 0, "" if quiet else "-- No entries --\n", "")
+
+        monkeypatch.setattr(subprocess, "run", journalctl)
+        monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: True))
+        with pytest.raises(_ExecCalled) as exc:
+            cli_server._logs_cmd(argparse.Namespace(follow=False, lines=3))
+        assert exc.value.file == "tail"
+        assert exc.value.argv == ["tail", "-n", "3", str(log)]
+        assert probes and all("--user" in p for p in probes), probes
+
+    def test_an_empty_user_journal_falls_through_to_the_log_file_without_sudo(
+        self, monkeypatch, tmp_path, sel_rec, fake_execvp
+    ) -> None:
+        # The user journal never needs sudo, so an empty probe is not a
+        # permission problem to escalate past: the file is the next source.
+        log = tmp_path / "gateway.log"
+        log.write_text("hi\n", encoding="utf-8", newline="\n")
+        monkeypatch.setattr(cli_server, "config_dir", lambda: tmp_path)
+        monkeypatch.setattr(
+            subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a[0], 1, "", "")
+        )
+        monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: True))
+        with pytest.raises(_ExecCalled) as exc:
+            cli_server._logs_cmd(argparse.Namespace(follow=False, lines=3))
+        assert exc.value.file == "tail"
+        assert exc.value.argv == ["tail", "-n", "3", str(log)]
+
+    def test_a_running_user_unit_wins_over_a_leftover_system_unit_file(
+        self, monkeypatch, tmp_path, sel_rec, fake_execvp
+    ) -> None:
+        """Both scopes have a unit (a stopped system unit from an earlier install,
+        the gateway running as the user unit): the journal shown is the running
+        unit's, not the dead one's."""
+        unit = tmp_path / "kirocrew.service"
+        unit.write_text("[Unit]\n", encoding="utf-8", newline="\n")
+        monkeypatch.setattr(svc_linux, "UNIT_PATH", unit)
+        monkeypatch.setattr(svc_linux, "user_unit_active", lambda: True)
+        monkeypatch.setattr(
+            subprocess,
+            "run",
+            lambda *a, **k: subprocess.CompletedProcess(a[0], 0, _ENTRY_LINE, ""),
+        )
+        with pytest.raises(_ExecCalled) as exc:
+            cli_server._logs_cmd(argparse.Namespace(follow=False, lines=7))
+        assert exc.value.argv[:2] == ["journalctl", "--user"]
+
+    def test_an_inactive_user_unit_leaves_the_system_journal_first(
+        self, monkeypatch, tmp_path, sel_rec, fake_execvp
+    ) -> None:
+        unit = tmp_path / "kirocrew.service"
+        unit.write_text("[Unit]\n", encoding="utf-8", newline="\n")
+        monkeypatch.setattr(svc_linux, "UNIT_PATH", unit)
+        monkeypatch.setattr(svc_linux, "user_unit_active", lambda: False)
+        monkeypatch.setattr(
+            subprocess,
+            "run",
+            lambda *a, **k: subprocess.CompletedProcess(a[0], 0, _ENTRY_LINE, ""),
+        )
+        with pytest.raises(_ExecCalled) as exc:
+            cli_server._logs_cmd(argparse.Namespace(follow=False, lines=7))
+        assert exc.value.argv[0] == "journalctl"
+        assert "--user" not in exc.value.argv
 
 
 class TestLogsCmdOtherSources:
@@ -891,6 +1068,17 @@ class TestGateway:
             asyncio.run(cli_server._gateway(no_dashboard=False))
         assert any("dist/ not found" in r.message for r in caplog.records)
         assert "kw" in captured
+
+    def test_the_dist_is_resolved_off_the_event_loop(self, gw, monkeypatch) -> None:
+        """An edition start waits for the staging lock; on the loop thread that wait is skipped."""
+        from kiro_crew.atomic_write import on_event_loop
+
+        seen: list[bool] = []
+        monkeypatch.setattr(
+            cli_server, "ensure_dev_dist_symlink", lambda: seen.append(on_event_loop()) or None
+        )
+        asyncio.run(cli_server._gateway(no_dashboard=False))
+        assert seen == [False]
 
     def test_slack_only_skips_the_dist_check(self, gw, monkeypatch) -> None:
         captured, _ = gw
@@ -1090,6 +1278,30 @@ class TestRunTask:
             inst.kwargs.get("install_builtins") is False and inst.builtins_synced
             for inst in created
         )
+
+    def test_consolidator_gets_the_configured_migrated_flag(
+        self, taskrunner_env, tmp_path, monkeypatch
+    ) -> None:
+        # The live config watcher only fires on change, so the boot value
+        # must reach the consolidator, or markdown memory is rewritten on a
+        # migrated install.
+        from kiro_crew.config import KiroCrewConfig
+
+        cfg = KiroCrewConfig()
+        cfg.memory.migrated = True
+        monkeypatch.setattr(KiroCrewConfig, "load", classmethod(lambda cls: cfg))
+        seen: list[dict] = []
+        monkeypatch.setattr(
+            cli_server, "HistoryConsolidator", lambda **kw: seen.append(kw) or object()
+        )
+        taskrunner_env["install_runner"](_Result("completed"))
+        args = argparse.Namespace(
+            spec=str(_spec(tmp_path)), no_test=True, fresh=False, timeout=90, name=""
+        )
+        asyncio.run(cli_server._run_task(args))
+        assert [kw.get("migrated") for kw in seen] == [True]
+        # A migrated consolidator writes only to the vector store, so it must get one.
+        assert seen[0].get("vector_store") is taskrunner_env["vector"]
 
     def test_failed_builtin_sync_does_not_gate_the_task(
         self, taskrunner_env, tmp_path, monkeypatch
@@ -1361,6 +1573,11 @@ def git_checkout(monkeypatch, tmp_path):
     # empty answer — read as "cannot be shown to serve this checkout" and refused.
     # dep_sync's own tests own that guard's behaviour.
     monkeypatch.setattr(cli_server.dep_sync, "venv_not_mapped_to", lambda origin, repo: None)
+    # The post-update gateway poke reaches a loopback socket that does not exist
+    # under test; neutralize it here so the branch-coverage tests stay hermetic.
+    # Its own success/best-effort contract is asserted directly in
+    # TestUpdateGatewayPoke.
+    monkeypatch.setattr(cli_server, "_revalidate_gateway_update_check", lambda: None)
     return proj
 
 
@@ -1634,6 +1851,104 @@ class TestUpdateGitPath:
         assert "Kiro Crew updated!" in out
         assert "Agent config refresh failed" in out
 
+    def test_success_pokes_the_running_gateway_to_revalidate(
+        self, monkeypatch, git_checkout, capsys
+    ) -> None:
+        """A completed git update reconciles the running gateway's badge.
+
+        The fixture neutralizes the poke by default; this row restores a spy so
+        the success path is shown to reach it.
+        """
+        monkeypatch.setattr(subprocess, "run", _GitStub())
+        poked: list[bool] = []
+        monkeypatch.setattr(
+            cli_server, "_revalidate_gateway_update_check", lambda: poked.append(True)
+        )
+        cli_server._update()
+        assert "Kiro Crew updated!" in capsys.readouterr().out
+        assert poked == [True], "the completed update never poked the gateway"
+
+
+class TestUpdateGatewayPoke:
+    """``_revalidate_gateway_update_check`` — best-effort, never fatal.
+
+    The update has already succeeded by the time this runs, so every branch here
+    proves the same contract from a different angle: it may print, but it must
+    never raise and never change the exit code.
+    """
+
+    def test_success_reports_the_refresh(self, monkeypatch, capsys) -> None:
+        monkeypatch.setattr(cli_server, "resolve_client_port", lambda _p: 8674)
+        monkeypatch.setattr(cli_server, "_gateway_owns_port", lambda port: True)
+        monkeypatch.setattr(cli_server, "read_local_secret", lambda port, dial_host: "s3cret")
+
+        class _Resp:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        captured: dict = {}
+
+        def _urlopen(req, timeout=0):
+            captured["url"] = req.full_url
+            captured["method"] = req.get_method()
+            captured["secret"] = req.headers.get("X-local-secret")
+            return _Resp()
+
+        monkeypatch.setattr(cli_server, "loopback_urlopen", _urlopen)
+        cli_server._revalidate_gateway_update_check()
+        assert "Update badge refreshed" in capsys.readouterr().out
+        # Pin the wire contract: dropping the secret header or retargeting the
+        # URL/method must fail this test, not slip through green.
+        assert captured["url"] == "http://127.0.0.1:8674/api/update/revalidate"
+        assert captured["method"] == "POST"
+        assert captured["secret"] == "s3cret"
+
+    def test_unowned_port_sends_no_secret(self, monkeypatch, capsys) -> None:
+        """A port this gateway does not own must never receive the local secret.
+
+        Guards the escalation where a co-resident listener on a stale configured
+        port would otherwise be handed the shared secret the real gateway accepts.
+        """
+        monkeypatch.setattr(cli_server, "resolve_client_port", lambda _p: 8674)
+        monkeypatch.setattr(cli_server, "_gateway_owns_port", lambda port: False)
+        reached: list[str] = []
+        monkeypatch.setattr(
+            cli_server,
+            "read_local_secret",
+            lambda port, dial_host: reached.append("read") or "s3cret",
+        )
+        monkeypatch.setattr(cli_server, "loopback_urlopen", lambda *a, **k: reached.append("send"))
+        cli_server._revalidate_gateway_update_check()  # must not raise
+        assert reached == [], "read or sent the secret to a port the gateway does not own"
+
+    def test_no_gateway_running_is_silent_success(self, monkeypatch, capsys) -> None:
+        """No secret means no gateway to reach; the next boot re-checks anyway."""
+        monkeypatch.setattr(cli_server, "resolve_client_port", lambda _p: 8674)
+        monkeypatch.setattr(cli_server, "_gateway_owns_port", lambda port: True)
+        monkeypatch.setattr(cli_server, "read_local_secret", lambda port, dial_host: "")
+        called: list[bool] = []
+        monkeypatch.setattr(cli_server, "loopback_urlopen", lambda *a, **k: called.append(True))
+        cli_server._revalidate_gateway_update_check()  # must not raise
+        assert called == [], "attempted a call with no secret to authenticate it"
+
+    def test_transport_failure_is_swallowed(self, monkeypatch, capsys) -> None:
+        """A gateway that refuses the connection must not fail the update."""
+        monkeypatch.setattr(cli_server, "resolve_client_port", lambda _p: 8674)
+        monkeypatch.setattr(cli_server, "_gateway_owns_port", lambda port: True)
+        monkeypatch.setattr(cli_server, "read_local_secret", lambda port, dial_host: "s3cret")
+
+        def _boom(req, timeout=0):
+            raise urllib.error.URLError("connection refused")
+
+        monkeypatch.setattr(cli_server, "loopback_urlopen", _boom)
+        cli_server._revalidate_gateway_update_check()  # must not raise
+        assert "reconciles on next check" in capsys.readouterr().out
+
 
 class TestUpdateSubprocessHardening:
     """The six ``subprocess.run`` calls in ``_update()``.
@@ -1880,12 +2195,59 @@ class TestUpdateWheelFeedValidation:
         assert exc.value.code == 1
         assert "Feed channel mismatch" in capsys.readouterr().out
 
+    def test_a_non_string_version_is_refused(self, wheel_feed, capsys) -> None:
+        wheel_feed(
+            b'{"schema": "kirocrew-cli-artifact-manifest-v1", "channel": "stable", '
+            b'"version": 999}'
+        )
+        with pytest.raises(SystemExit) as exc:
+            cli_server._update_wheel(_LAYOUT)
+        assert exc.value.code == 1
+        assert "No version in release feed" in capsys.readouterr().out
+
     def test_missing_version_is_refused(self, wheel_feed, capsys) -> None:
         wheel_feed(b'{"schema": "kirocrew-cli-artifact-manifest-v1", "channel": "stable"}')
         with pytest.raises(SystemExit) as exc:
             cli_server._update_wheel(_LAYOUT)
         assert exc.value.code == 1
         assert "No version in release feed" in capsys.readouterr().out
+
+
+class _FakeInstaller:
+    """A ``subprocess.Popen`` stand-in for the CLI's installer spawn.
+
+    ``pid`` is above every platform's ``pid_max`` (see
+    ``test_update_provider._UNALLOCATABLE_PID``), so a stop path that reached
+    the real kill helpers could not signal a live process.
+    """
+
+    pid = 99_999_999_999
+
+    def __init__(self, argv, *, returncode: int = 0, wait_raises=None, **kwargs) -> None:
+        self.argv = list(argv)
+        self.kwargs = kwargs
+        self._returncode = returncode
+        self._wait_raises = wait_raises
+
+    def wait(self, timeout=None):
+        if self._wait_raises is not None:
+            raise self._wait_raises
+        return self._returncode
+
+    def poll(self):
+        return self._returncode
+
+
+def _installer(monkeypatch, **behaviour) -> list[_FakeInstaller]:
+    spawned: list[_FakeInstaller] = []
+
+    def _popen(argv, **kwargs):
+        proc = _FakeInstaller(argv, **behaviour, **kwargs)
+        spawned.append(proc)
+        return proc
+
+    monkeypatch.setattr(subprocess, "Popen", _popen)
+    return spawned
 
 
 class TestUpdateWheelInstaller:
@@ -1898,6 +2260,16 @@ class TestUpdateWheelInstaller:
             b'"channel": "stable", "version": "999.0.0"}'
         )
         monkeypatch.setattr(sys, "platform", "linux")
+        # These tests exercise the installer re-run, which is the path a pipx
+        # install takes. A plain-pip install refuses before it (covered in
+        # test_update_wheel_dispatch.py), so pin the pipx shape here.
+        from kiro_crew.platform import wheel_apply, wheel_engine
+
+        monkeypatch.setattr(wheel_engine, "running_from_managed_venv", lambda: False)
+        monkeypatch.setattr(wheel_engine, "running_from_pipx", lambda: True)
+        # The host's real AppArmor state is never read; a test that needs the
+        # re-attach branch sets it itself.
+        monkeypatch.setattr(wheel_apply, "userns_reattach_needed", lambda _version: False)
 
     def test_windows_refuses_the_posix_installer(self, monkeypatch, capsys) -> None:
         monkeypatch.setattr(sys, "platform", "win32")
@@ -1912,7 +2284,7 @@ class TestUpdateWheelInstaller:
         def boom(*a, **k):
             raise FileNotFoundError("sh")
 
-        monkeypatch.setattr(subprocess, "run", boom)
+        monkeypatch.setattr(subprocess, "Popen", boom)
         with pytest.raises(SystemExit) as exc:
             cli_server._update_wheel(_LAYOUT)
         assert exc.value.code == 1
@@ -1921,19 +2293,72 @@ class TestUpdateWheelInstaller:
         assert "cli.sh | sh" in out
 
     def test_installer_timeout_prints_the_manual_command(self, monkeypatch, capsys) -> None:
-        def boom(*a, **k):
-            raise subprocess.TimeoutExpired(cmd="sh", timeout=300)
-
-        monkeypatch.setattr(subprocess, "run", boom)
+        spawned = _installer(
+            monkeypatch, wait_raises=subprocess.TimeoutExpired(cmd="sh", timeout=300)
+        )
+        stops: list[tuple] = []
+        monkeypatch.setattr(
+            cli_server.platform_compat,
+            "terminate_and_reap_sync",
+            lambda proc, **kw: stops.append((proc, kw)),
+        )
         with pytest.raises(SystemExit) as exc:
             cli_server._update_wheel(_LAYOUT)
         assert exc.value.code == 1
         assert "timed out" in capsys.readouterr().out
+        # Stopped gracefully (SIGTERM + rollback grace), never killed outright.
+        assert [proc for proc, _ in stops] == spawned
+        assert stops[0][1]["grace"] > 0
+
+    def test_installer_runs_in_its_own_session(self, monkeypatch) -> None:
+        # One group to stop, never the CLI's own.
+        spawned = _installer(monkeypatch)
+        cli_server._update_wheel(_LAYOUT)
+        assert spawned[0].argv[:2] == ["sh", "-c"]
+        assert spawned[0].kwargs.get("start_new_session") is True
+
+    def test_ctrl_c_stops_the_installer_gracefully(self, monkeypatch) -> None:
+        # The installer is outside the terminal's foreground group, so Ctrl-C
+        # reaches only the CLI, which must pass the stop on.
+        spawned = _installer(monkeypatch, wait_raises=KeyboardInterrupt())
+        stops: list = []
+        monkeypatch.setattr(
+            cli_server.platform_compat,
+            "terminate_and_reap_sync",
+            lambda proc, **kw: stops.append(proc),
+        )
+        with pytest.raises(SystemExit) as exc:
+            cli_server._update_wheel(_LAYOUT)
+        assert exc.value.code == 130
+        assert stops == spawned
+
+    @pytest.mark.parametrize(
+        ("wait_raises", "code", "shown"),
+        [
+            (subprocess.TimeoutExpired(cmd="sh", timeout=300), 1, "Try running manually"),
+            (KeyboardInterrupt(), 130, "Stopping the installer"),
+        ],
+    )
+    def test_a_second_ctrl_c_during_the_stop_still_exits_cleanly(
+        self, monkeypatch, capsys, wait_raises, code, shown
+    ) -> None:
+        # terminate_and_reap_sync re-raises a Ctrl-C it absorbed mid-stop; the
+        # arm must still reach its own exit code, not a traceback.
+        _installer(monkeypatch, wait_raises=wait_raises)
+
+        def stop_then_reraise(proc, **kw):
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(
+            cli_server.platform_compat, "terminate_and_reap_sync", stop_then_reraise
+        )
+        with pytest.raises(SystemExit) as exc:
+            cli_server._update_wheel(_LAYOUT)
+        assert exc.value.code == code
+        assert shown in capsys.readouterr().out
 
     def test_installer_nonzero_exit_is_surfaced(self, monkeypatch, capsys) -> None:
-        monkeypatch.setattr(
-            subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a[0], 17)
-        )
+        _installer(monkeypatch, returncode=17)
         with pytest.raises(SystemExit) as exc:
             cli_server._update_wheel(_LAYOUT)
         assert exc.value.code == 1
@@ -2000,19 +2425,156 @@ class TestUpdateWheelInstaller:
         assert "No space left on device" in out
         assert "was not modified" in out
 
+    def test_shadow_success_snapshots_before_promotion_and_names_the_profile_remedy(
+        self, monkeypatch, capsys
+    ) -> None:
+        """The managed venv takes the shared path: the memory snapshot runs as the
+        engine's last step before promotion, and a promotion that moves the launcher
+        a userns AppArmor profile applies to prints how to re-attach it."""
+        from kiro_crew.platform import wheel_apply, wheel_engine
+
+        monkeypatch.setattr(wheel_engine, "running_from_managed_venv", lambda: True)
+        monkeypatch.setattr(wheel_apply, "userns_reattach_needed", lambda _version: True)
+        monkeypatch.setattr(wheel_apply, "snapshot_memory_before_update", lambda: (3, ""))
+        early = []
+        monkeypatch.setattr(cli_server, "_snapshot_memory_or_exit", lambda: early.append(True))
+        seen: dict[str, object] = {}
+
+        def _apply(**kw):
+            seen.update(kw)
+            kw["before_promote"]()
+            return Path("/x/crew-venv-999.0.0")
+
+        monkeypatch.setattr(wheel_engine, "apply_wheel_update", _apply)
+        cli_server._update_wheel(_LAYOUT)
+        out = capsys.readouterr().out
+        assert early == [], "the snapshot is the engine's step, not a separate one"
+        assert "Memory snapshot: 3 store(s) copied" in out
+        assert "kirocrew service install" in out
+        # Said after the update finished: it is installed, and only the re-attach is left.
+        assert "999.0.0 is installed" in out
+        assert "Run `kirocrew update`" not in out
+
+    def test_a_feed_version_outside_the_release_grammar_is_an_update_failure(
+        self, wheel_feed, monkeypatch, capsys, tmp_path
+    ) -> None:
+        """An unsigned feed version that cannot name a tree is refused by the REAL
+        engine as an update failure: an exit, never a traceback, nothing built."""
+        from kiro_crew.platform import wheel_engine
+
+        wheel_feed(
+            b'{"schema": "kirocrew-cli-artifact-manifest-v1", '
+            b'"channel": "stable", "version": "999/0"}'
+        )
+        layout = wheel_engine.ManagedVenvLayout(
+            legacy=tmp_path / "crew-venv", stable_link=tmp_path / "crew-venv-current"
+        )
+        monkeypatch.setattr(wheel_engine, "running_from_managed_venv", lambda: True)
+        monkeypatch.setattr(wheel_engine, "managed_venv_layout", lambda: layout)
+        monkeypatch.setattr(wheel_engine, "hold_update_lock", lambda: -1)
+        monkeypatch.setattr(wheel_engine, "release_update_lock", lambda _fd: None)
+        with pytest.raises(SystemExit) as exc:
+            cli_server._update_wheel(_LAYOUT)
+        assert exc.value.code == 1
+        out = capsys.readouterr().out
+        assert "fails validation" in out
+        assert "was not modified" in out
+        assert list(tmp_path.iterdir()) == []
+
+    def test_a_reattach_probe_that_refuses_the_version_is_an_update_failure(
+        self, monkeypatch, capsys
+    ) -> None:
+        """The AppArmor probe names the promoted tree too, so it runs inside the
+        failure handling rather than ahead of it."""
+        from kiro_crew.platform import wheel_apply, wheel_engine
+
+        monkeypatch.setattr(wheel_engine, "running_from_managed_venv", lambda: True)
+
+        def _refuse(_version: str) -> bool:
+            raise wheel_engine.WheelUpdateError("release version '999/0' fails validation")
+
+        monkeypatch.setattr(wheel_apply, "userns_reattach_needed", _refuse)
+        monkeypatch.setattr(
+            wheel_engine,
+            "apply_wheel_update",
+            lambda **kw: pytest.fail("nothing is applied after a refusal"),
+        )
+        with pytest.raises(SystemExit) as exc:
+            cli_server._update_wheel(_LAYOUT)
+        assert exc.value.code == 1
+        assert "fails validation" in capsys.readouterr().out
+
+    @pytest.mark.parametrize(
+        ("exc_name", "message"),
+        [
+            ("WheelUpdateBusy", "another kirocrew update is already in progress"),
+            ("WheelUpdateSnapshotFailed", "Pre-update memory snapshot failed: 1 store(s)"),
+        ],
+    )
+    def test_shadow_refusals_never_offer_the_installer_rerun(
+        self, monkeypatch, capsys, exc_name, message
+    ) -> None:
+        """The installer re-run would race the other update's promotion (busy), or
+        perform exactly the un-copied update the snapshot refusal stops."""
+        from kiro_crew.platform import wheel_engine
+
+        monkeypatch.setattr(wheel_engine, "running_from_managed_venv", lambda: True)
+
+        def _refuse(**kw):
+            raise getattr(wheel_engine, exc_name)(message)
+
+        monkeypatch.setattr(wheel_engine, "apply_wheel_update", _refuse)
+        with pytest.raises(SystemExit) as exc:
+            cli_server._update_wheel(_LAYOUT)
+        assert exc.value.code == 1
+        out = capsys.readouterr().out
+        assert message in out
+        assert "re-running the installer" not in out
+
+    def test_an_incompatible_release_names_the_installer_rerun(self, monkeypatch, capsys) -> None:
+        """Only the installer moves an install onto a Python the release accepts."""
+        from kiro_crew.platform import wheel_engine
+
+        monkeypatch.setattr(wheel_engine, "running_from_managed_venv", lambda: True)
+
+        def _refuse(**kw):
+            raise wheel_engine.WheelUpdateIncompatible(
+                "kirocrew 999.0.0 requires Python >= 3.99", version="999.0.0", sha256="a" * 64
+            )
+
+        monkeypatch.setattr(wheel_engine, "apply_wheel_update", _refuse)
+        with pytest.raises(SystemExit) as exc:
+            cli_server._update_wheel(_LAYOUT)
+        assert exc.value.code == 1
+        out = capsys.readouterr().out
+        assert "requires Python >= 3.99" in out
+        assert "re-run the installer" in out.lower() and "cli.sh | sh" in out
+        assert "was not modified" not in out
+
+    def test_shadow_children_get_this_shells_environment_and_memory_is_checked_first(
+        self, monkeypatch, capsys
+    ) -> None:
+        from kiro_crew.platform import wheel_apply, wheel_engine
+
+        monkeypatch.setattr(wheel_engine, "running_from_managed_venv", lambda: True)
+        seen: dict[str, object] = {}
+
+        def _apply(**kw):
+            seen.update(kw)
+            return Path("/x/crew-venv-999.0.0")
+
+        monkeypatch.setattr(wheel_engine, "apply_wheel_update", _apply)
+        cli_server._update_wheel(_LAYOUT)
+        assert seen["trusted_env"] is False, "a toolchain on the operator's PATH reaches pip"
+        assert seen["preflight"] is wheel_apply.check_memory_ready
+
     def test_success_reports_the_new_version_and_restart_hint(self, monkeypatch, capsys) -> None:
-        seen: list[list[str]] = []
-
-        def _run(argv, **kw):
-            seen.append(list(argv))
-            return subprocess.CompletedProcess(argv, 0)
-
-        monkeypatch.setattr(subprocess, "run", _run)
+        spawned = _installer(monkeypatch)
         cli_server._update_wheel(_LAYOUT)
         out = capsys.readouterr().out
         assert "updated to 999.0.0" in out
         assert "kirocrew restart" in out
-        assert seen[0][:2] == ["sh", "-c"]
+        assert spawned[0].argv[:2] == ["sh", "-c"]
 
     def test_unparseable_remote_version_updates_anyway(
         self, monkeypatch, wheel_feed, capsys
@@ -2022,7 +2584,7 @@ class TestUpdateWheelInstaller:
             b'{"schema": "kirocrew-cli-artifact-manifest-v1", '
             b'"channel": "stable", "version": "not-a-version"}'
         )
-        monkeypatch.setattr(subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a[0], 0))
+        _installer(monkeypatch)
         cli_server._update_wheel(_LAYOUT)
         out = capsys.readouterr().out
         assert "Could not compare versions" in out

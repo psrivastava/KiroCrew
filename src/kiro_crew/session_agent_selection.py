@@ -8,10 +8,16 @@ import uuid
 from dataclasses import replace as dataclass_replace
 from typing import Any
 
-from kiro_crew.config.loader import ResolvedBindings, resolve_agent_bindings
+from kiro_crew.agent_spec_format import NATIVE_SKILL_ALIAS_PREFIX
+from kiro_crew.config.loader import (
+    ResolvedBindings,
+    dispatch_kiro_agent,
+    resolve_agent_bindings,
+)
 from kiro_crew.execution_context import (
     ExecutionContext,
     MemoryStoreRef,
+    adopt_removed_synced_crewmate,
     bind_session_execution,
     member_config_for_id,
     read_session_execution,
@@ -44,6 +50,31 @@ def session_agent_selection_kind(session_key: str, agent_name: str) -> str:
     )
 
 
+def _source_of_view(name: str) -> str:
+    """The agent a stored skill-view name was built from, or *name* unchanged.
+
+    A conversation recorded while the native skill projection was on can hold a
+    generated ``kirocrew-skill-view-<digest>`` name as its agent. That name is a
+    file the projection wrote, and a boot drain or an operator may have removed
+    it since, so resolving it by name finds nothing and the turn is refused.
+    The projection records which agent each view was built from (its ownership
+    sidecar, or the view ledger), and :func:`source_agent_name` reads that record
+    even after the view file is gone. A view nothing records stays as it is, so
+    it resolves to nothing and is refused rather than guessed.
+
+    Blocking: it may read one sidecar. Every caller of
+    :func:`resolve_session_agent_bindings` runs it off the event loop.
+    """
+    if not name.startswith(NATIVE_SKILL_ALIAS_PREFIX):
+        return name
+    # Deferred: the driver module pulls in the ACP stack, which a plain agent
+    # name never needs.
+    from kiro_crew.agent_sdk.drivers import acp as acp_driver
+
+    source = acp_driver.skill_view_source_agent(name)
+    return name if source is None else source
+
+
 def resolve_session_agent_bindings(
     resolver, config, session_key: str, agent_name: str | None, *project_dir
 ) -> ResolvedBindings:
@@ -58,6 +89,12 @@ def resolve_session_agent_bindings(
                 selected = execution.selection_name or execution.member_id
         else:
             selected = execution.selection_name or execution.template_id
+    selected = _source_of_view(selected)
+    if execution is not None:
+        # The decoder already re-reads a record bound to a pruned synced
+        # crewmate as its template; answering against the CALLER's config
+        # snapshot keeps this resolve consistent with the config it is given.
+        execution = adopt_removed_synced_crewmate(execution, config)
     try:
         bindings = resolver(
             config,
@@ -74,7 +111,13 @@ def resolve_session_agent_bindings(
         raise UnknownMemoryStore("Conversation agent selection is unavailable") from exc
     if execution is not None:
         bindings.memory_store_name = execution.store.store_id
-        bindings.kiro_agent = execution.template_id
+        # Both recorded kinds can need a skill-view repair. Only a MEMBER's
+        # template id came from a crewmate row that may hold a package filename;
+        # a template id is already the provider selection and must stay exact.
+        kiro_agent = _source_of_view(execution.template_id)
+        if execution.selection_kind == "member":
+            kiro_agent = dispatch_kiro_agent(kiro_agent)
+        bindings.kiro_agent = kiro_agent
         bindings.execution_context = execution
     bindings.selection_revision = _revision(execution)
     return bindings
@@ -93,10 +136,18 @@ def record_provider_agent_switch(config, session_key, prior_agent, new_agent, pr
             template_id=selected.kiro_agent,
             selection_name=new_agent if prior.member_id is None else prior.selection_name,
         )
-    return record_agent_selection(session_key, new_agent, selected)
+    # Carrying the owner over means carrying it out of the session's OWN record,
+    # which the session can rewrite, so this publication must not vouch for it.
+    # Without `vouch`, a caller that forges its record to name a peer's store and
+    # then triggers a template switch gets that store vouched here, and the
+    # own-store admission's two independent sources become one it controls. With no
+    # prior there is nothing carried and the store is the resolved one, so it stands.
+    return record_agent_selection(session_key, new_agent, selected, vouch=prior is None)
 
 
-def record_agent_selection(session_key, agent_name, bindings, *, replace=False, memory_mode=None):
+def record_agent_selection(
+    session_key, agent_name, bindings, *, replace=False, memory_mode=None, vouch=False
+):
     kind = getattr(bindings, "selection_kind", "")
     selected = agent_name or bindings.resolved_alias
     if kind not in ("member", "template") or not selected or not bindings.requested_resolved:
@@ -123,7 +174,10 @@ def record_agent_selection(session_key, agent_name, bindings, *, replace=False, 
             )
         else:
             if prior and prior.member_id:
+                # Same carried owner as the provider-switch path above, same reason
+                # not to vouch for it.
                 execution = dataclass_replace(prior, template_id=bindings.kiro_agent)
+                vouch = False
             else:
                 execution = ExecutionContext(
                     None,
@@ -137,10 +191,26 @@ def record_agent_selection(session_key, agent_name, bindings, *, replace=False, 
     if memory_mode is not None:
         execution = execution.with_mode(memory_mode)
     if prior == execution and not replace:
+        # Nothing to publish, and deliberately nothing vouched either. A session's
+        # own-store authority is held only in this process, so a restart drops it
+        # while the durable record survives -- and re-establishing it HERE cannot be
+        # done safely, because every value reachable on this path resolves through
+        # something the session itself can influence. The record is written by the
+        # session. The slot's store is rehydrated from that record. `execution` is
+        # built from it on the provider-switch path. And config is looked up by the
+        # record's own ``member_id`` a few lines above, so a config re-read agrees
+        # with a forged record by construction instead of checking it.
+        #
+        # A restart therefore drops the own-store admission until the owner
+        # re-selects the agent, which binds afresh through the durable path. That is
+        # the fail-closed direction, and a regression test pins the refusal so it is
+        # a stated property rather than something rediscovered later.
         return None
     execution = dataclass_replace(execution, selection_revision=uuid.uuid4().hex)
     # The comparison above is backed by the session record CAS during publication.
-    bind_session_execution(session_key, execution, replace_existing=True, expected=prior)
+    bind_session_execution(
+        session_key, execution, replace_existing=True, expected=prior, vouch=vouch
+    )
     bindings.execution_context = execution
     return prior.to_record() if prior else None, execution.to_record()
 

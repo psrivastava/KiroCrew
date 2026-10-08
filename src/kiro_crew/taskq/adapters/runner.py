@@ -272,6 +272,11 @@ class RunnerLane:
         self._waiters: deque[tuple[asyncio.Future[None], str, frozenset[str]]] = deque()
         self._name = name
         self._granted = 0
+        #: Rows that reached a committed ``done`` terminal write, the lane's
+        #: COMPLETIONS. A grant is not one -- ``_granted`` counts admissions,
+        #: including the ones that fail, cancel or recover -- so the adaptive
+        #: controller earns an increase on this counter, never on grants.
+        self._settled_ok = 0
         #: Row id -> slots it holds. Only non-empty ids are tracked, and the map
         #: is cleared whenever the lane empties, so a slot released without its
         #: id leaves no phantom holder behind: a phantom would refuse a
@@ -323,6 +328,23 @@ class RunnerLane:
         return len(self._waiters)
 
     @property
+    def settled_ok(self) -> int:
+        """Cumulative rows that reached a committed ``done`` terminal write."""
+        return self._settled_ok
+
+    def note_done(self) -> None:
+        """Record one committed ``done`` terminal write. Called by
+        :meth:`Admitted._settle_apply`, the single in-memory settle choke point,
+        so a fail, cancel or recovery -- none of which pass ``done`` with a
+        committed write -- is never counted a completion. A write the store
+        could not take and the admission later replays
+        (:meth:`RunnerAdmission.flush_pending_finish`) is not counted here: its
+        slot is already freed and its window long past, so crediting it late
+        would attribute a completion to the wrong window -- the adaptive track
+        tolerates the missing evidence rather than mis-timing it."""
+        self._settled_ok += 1
+
+    @property
     def holders(self) -> frozenset[str]:
         """Ids of the rows holding a slot right now."""
         return frozenset(self._holders)
@@ -341,6 +363,7 @@ class RunnerLane:
             "ceiling": self.ceiling,
             "mode": self.mode,
             "granted": self._granted,
+            "settled_ok": self._settled_ok,
         }
 
     def _take(self, task_id: str) -> None:
@@ -664,9 +687,20 @@ class Admitted:
 
     def _settle_apply(self, state: str, ok: bool) -> bool:
         self._settled = True
+        # Captured BEFORE release_slot() clears it: a lane completion counts only
+        # for a handle that metered a lane slot. A claim_only container row holds
+        # no slot (_slot_held=False from construction) and executes nothing
+        # itself -- its steps are what the lane meters -- so it must not credit a
+        # completion no slot produced.
+        was_lane_metered = self._slot_held
         self.release_slot()
         if ok:
             self._state = state
+            if state == DONE and was_lane_metered:
+                # The lane's completion signal for the adaptive controller: a
+                # grant that reached a committed ``done``. Recorded here, the
+                # single settle choke point, so fail/cancel/recovery never count.
+                self.admission.lane.note_done()
         if self.task_id not in self.admission._pending_finish:
             self.admission.forget(self.task_id)
         return ok
@@ -1045,6 +1079,39 @@ class RunnerAdmission:
 
     # -- admit ---------------------------------------------------------------
 
+    def _pressure_refusal(self) -> Any:
+        """The memory-pressure verdict when it refuses an admission now, else None.
+
+        Only reads the check; :meth:`_defer_for_pressure` acts on a refusal, so
+        a caller holding a lane slot can give it back in between.
+        """
+        if self._pressure is None:
+            return None
+        decision = self._pressure()
+        if getattr(decision, "admitted", True):
+            return None
+        return decision
+
+    async def _defer_for_pressure(
+        self, store: TaskStore | None, task_id: str, decision: Any
+    ) -> None:
+        """Defer *task_id* once on a refusing *decision*: count it, mark the row
+        and sleep the admit wait, so the caller loops back to its own top."""
+        self._deferred += 1
+        reason = str(getattr(decision, "reason", "") or "memory pressure")
+        if store is not None:
+            try:
+                await self._db(
+                    store.defer,
+                    task_id,
+                    wait=self._admit_wait,
+                    reason=reason,
+                )
+            except TaskStoreUnavailable:
+                logger.debug("taskq runner: defer of %s failed", task_id, exc_info=True)
+        logger.info("taskq runner: %s deferred (%s)", task_id, reason)
+        await self._sleep(min(self._admit_wait, _MAX_ADMIT_SLEEP_SECS))
+
     async def admit(
         self,
         task_id: str,
@@ -1095,28 +1162,13 @@ class RunnerAdmission:
             while True:
                 if store is not None:
                     await self._db(self._raise_if_ended, store, task_id)
-                if self._pressure is not None:
-                    decision = self._pressure()
-                    if not getattr(decision, "admitted", True):
-                        self._deferred += 1
-                        reason = str(getattr(decision, "reason", "") or "memory pressure")
-                        if store is not None:
-                            try:
-                                await self._db(
-                                    store.defer,
-                                    task_id,
-                                    self.now() + self._admit_wait,
-                                    reason=reason,
-                                )
-                            except TaskStoreUnavailable:
-                                logger.debug(
-                                    "taskq runner: defer of %s failed", task_id, exc_info=True
-                                )
-                        logger.info("taskq runner: %s deferred (%s)", task_id, reason)
-                        await self._sleep(min(self._admit_wait, _MAX_ADMIT_SLEEP_SECS))
-                        continue
+                refusal = self._pressure_refusal()
+                if refusal is not None:
+                    await self._defer_for_pressure(store, task_id, refusal)
+                    continue
                 ancestors: frozenset[str] = frozenset()
-                if store is not None and self.lane.saturated:
+                parks = self.lane.saturated
+                if store is not None and parks:
                     ancestors = await self._db(self._ancestor_ids, store, task_id)
                 try:
                     await self.lane.acquire(task_id, ancestors=ancestors)
@@ -1132,6 +1184,18 @@ class RunnerAdmission:
                     self.forget(task_id)
                     raise
                 slot_held = True
+                # The lane does not pause on memory (the execution cap reads
+                # work evidence only), so a step that parked behind a full lane
+                # is granted whatever memory reads at the grant, and the check
+                # above predates the wait. Re-check it, and give the slot back
+                # BEFORE deferring while the host is still under pressure: the
+                # deferral sleeps, and a slot held through it blocks the lane.
+                refusal = self._pressure_refusal() if parks else None
+                if refusal is not None:
+                    self.lane.release(task_id)
+                    slot_held = False
+                    await self._defer_for_pressure(store, task_id, refusal)
+                    continue
                 if store is None:
                     slot_held = False  # the handle owns the slot from here
                     return Admitted(

@@ -2,13 +2,19 @@
 
 Third-party account connections: the provider registry and its tiers, the mint
 endpoints a card drives, where credential custody sits, warm prewarming, owner-only
-disconnect, and the two launch-gate rungs. The subsystem is
+disconnect, the automated L0/L1 gates, and the manual L2 gate. The subsystem is
 `src/kiro_crew/connections/` (`registry.py`, `mint.py`, `warm.py`, `status.py`,
-`ownership.py`, `tool_aliases.py`, `alias_record.py`, `l0_probe.py`, `l0_drift.py`,
-`l0_record.py`, `l1_smoke.py`, `tool_test.py`), plus
-`dashboard/handlers/connections.py` and `website/src/pages/connections/`.
+`ownership.py`, `oauth_clients.py`, `tool_aliases.py`, `alias_record.py`,
+`l0_probe.py`, `l0_drift.py`, `l0_record.py`, `l1_smoke.py`, `tool_test.py`, `warm_runtime/`, and
+`control_plane/`), plus `dashboard/handlers/connections.py` and
+`website/src/pages/connections/`.
 
-The `src/kiro_crew/connections/vendors/zoom/` subtree is a separate connector-campaign slice with its own owning spec — [connector-zoom.md](connector-zoom.md) (`W11-A` Zoom contract semantics) — not this subsystem's OAuth-grant plumbing.
+The `control_plane/` and `vendors/` subtrees are connector-campaign slices rather
+than this subsystem's OAuth-grant plumbing. Their current contracts include the
+[capability-manifest](connector-capability-manifest.md),
+[conformance](connector-conformance.md), [GitHub](connector-github.md),
+[Microsoft Graph](microsoft-graph-runtime.md), and [Zoom](connector-zoom.md)
+specs.
 
 **Kiro Crew never holds a connection's credential.** kiro-cli owns the OAuth chain
 end to end; Kiro Crew observes grant presence by `stat`, and every rule below follows
@@ -24,7 +30,11 @@ grant still lives with kiro-cli and nothing here reads it. Kiro Crew keeps the
 secret in the encrypted vault (`CONNECTIONS_<SLUG>_CLIENT_SECRET`) as the source
 of truth and writes it into the emitted agent spec as `oauth.clientSecret` only
 because that file is the one thing kiro-cli reads — **the same footing the
-existing `headers` secrets have: vault is truth, the spec is a projection.** See
+existing `headers` secrets have: vault is truth, the spec is a projection.** The
+projection is owner-only on POSIX: every agent-spec write lands at `0o600` (an
+existing file keeps its owner bits and loses group/other), so the plaintext is
+never readable by another local user. Moving the secret off disk entirely needs a
+kiro-cli runtime secret channel and is tracked in #10702. See
 "Pre-registered OAuth clients" below.
 
 ## Status and cancel
@@ -111,7 +121,7 @@ inventing a label locally would put an unverified identity on the card.
 ### The mint contract is preserved, not replaced
 
 `POST /api/connections/mint` and `GET /api/connections/mint?slug=…` keep their
-existing contract exactly: the POST reserves a row and returns
+existing contract, with one additive optional field: the POST reserves a row and returns
 `{ok, slug, state, token}`, the GET is the card's authoritative feed for a
 card-initiated mint (`idle|minting|waiting|granted|failed|expired`, with
 `oauth_url` only while `waiting`), and the frontend keeps polling it at its own
@@ -122,7 +132,9 @@ that dedicated process, protected PID, and ephemeral spec, then creates one
 fresh dedicated attempt with a new provider OAuth state. The retry keeps the
 caller's row token, so the initiating tab continues to own the result. A second
 rejection is terminal and surfaces the existing `failed` / `mint_url_rejected`
-state; no other failure class retries. Warm URLs pass the same credential gate
+state; no other failure class retries. Beside `reason: mint_url_rejected` the GET
+may carry an optional `rejected_endpoint`, present only when the rejected endpoint
+can be named; the naming rules are in [security](security.md). Warm URLs pass the same credential gate
 before they become adoptable. A rejected warm claim is released, so a later
 Connect follows the cold path and reaches this single retry owner rather than
 carrying a second policy in the warm engine or dashboard handler.
@@ -278,6 +290,8 @@ The gateway imports the dashboard handlers package at boot, and the mint engine
 drags in the ACP client, the credential predicate and the PID registry;
 `test_the_handlers_package_does_not_import_the_mint_engine` enforces that in a
 subprocess, so hoisting either import to module scope turns the suite red.
+`test_no_boot_path_module_loads_any_warm_or_mint_module` probes the same boot imports by
+module prefix, so a `warm_runtime` owner reached without its facade is caught too.
 
 ## Minting and the warm table
 
@@ -285,13 +299,31 @@ Cold mint (`kiro_crew.connections.mint`) spawns one kiro-cli process per provide
 approval URL: ~7.5s per card. `kiro_crew.connections.warm` serves the whole gallery from one
 process, and every rule below answers an observed failure.
 
-**Placement.** Warm engine code remains in `src/kiro_crew/connections/warm.py`; the dashboard
-handler adds only endpoint wiring -- `expire_dead_mints` on the status path,
-`mintable_providers` plus `warm_mint_all` on the premint path, and `adopt_shared_mint` on the
-mint path. The dashboard server registers two lifecycle hooks in both full and headless modes:
-a tracked startup task that scavenges dead private generations off-loop without delaying the
-listener bind, and a cleanup hook that retires the live runtime. Those hooks import the warm
-module lazily, so importing the server alone still does not construct or spawn the engine.
+**Placement.** `src/kiro_crew/connections/warm.py` is the warm engine's one import and patch
+surface, and it composes three private owners under `kiro_crew.connections.warm_runtime`; the
+dashboard handler adds only endpoint wiring -- `expire_dead_mints` on the status path,
+`_audited_mintable_providers` plus `warm_mint_all` on the premint path, and `adopt_shared_mint`
+on the mint path. The dashboard server registers two lifecycle hooks in both full and headless
+modes: a tracked startup task that scavenges dead private generations off-loop without delaying
+the listener bind, and a cleanup hook that retires the live runtime. Those hooks import the warm
+module lazily, so importing the server alone still does not construct or spawn the engine, and
+no boot-path module loads a `warm_runtime` owner either.
+
+| Owner | Holds | Why there |
+|---|---|---|
+| `src/kiro_crew/connections/warm_runtime/spec_plan.py` | `_WarmSpecPlan`; the reuse rules `_plan_is_servable` and `_resident_roster_is_asked_for`; per-provider entry derivation (`_registry_server_entry`, `_operator_oauth_client`, `_auth_shape`, `_warm_mintable_entry`); `_wanted_aliases` | rules over registry and configured entries; `_operator_oauth_client` reads config, env and the vault on every call, so callers reach it only from sync helpers behind `asyncio.to_thread` |
+| `src/kiro_crew/connections/warm_runtime/start_identity.py` | `_process_identity_live` and the start-identity helpers it compares with | the tri-state PID-reuse verdict both generation readers act on |
+| `src/kiro_crew/connections/warm_runtime/shared_rows.py` | the two-axis predicates (`_warm_table_row`, the counts built on it, `_mint_is_cold_held`, `_mint_is_adopted`); the atomic `_claim_shared_mints`, `_dispose_displaced_rows` and `_release_shared_claims` | one claim transaction over the cold engine's table, bound from `mint` exactly as the facade binds it |
+| `src/kiro_crew/connections/warm.py` | the public API; every patch seam; the provider scan; `_warm_spec_plan`; spec ownership (sentinel, judge, gated writer); the generation-directory lifecycle and its owner marker; `_WarmMintRuntime`; adoption, absorb, expiry, drain, reaper and re-arms | pinned to the file by the link-screen baseline, the agent-spec call-site ratchet, the session-registry gate and the security spec's citation of `warm._credential_bearing_slugs`, or a caller of a seam patched on this module |
+
+`warm.py` re-exports every owner name as the same object, and no owner imports the facade,
+`kiro_crew.acp` or `kiro_crew.providers` at module scope. One facade name is reached at call
+time: `shared_rows` disposes a row through `warm._dispose_mint`, the binding the warm engine's
+callers substitute. `test/test_connections_warm_mint_composition_contract.py` pins all four
+properties. The cold engine stays whole in `mint.py`: every rule there either reads the
+module-level table and seams its callers substitute on `mint`, or is held in the file by the
+agent-spec call-site ratchet and the agent-SDK boundary baseline, so an owner split out of it
+would only forward.
 
 ### The handoff: how a premint reaches the click it was minted for
 
@@ -424,7 +456,9 @@ Every flow reads the user's config, a private generation tree, the old global ag
 or kiro-cli's OAuth cache, any of which can sit on a network mount where a stat is unbounded, so
 all of that work lives in SYNCHRONOUS helpers and a coroutine reaches them through
 `asyncio.to_thread` -- enforced by a fixed-point drift guard in `test/test_connections_warm.py`
-that reuses the mint engine's own primitive sets so the two cannot drift apart. What the guard
+that reuses the mint engine's own primitive sets so the two cannot drift apart. It reads
+`warm.py` and every `warm_runtime` owner as one call graph, so a coroutine that moves into an
+owner still owes the invariant and a helper the facade re-exports still counts. What the guard
 pins today is the exact set of helpers doing filesystem work, so the lifecycle slice can neither
 call one from a coroutine nor quietly drop the filesystem work the guard's coverage rests on
 without failing it.
@@ -526,8 +560,8 @@ that mutation's settlement, guarded only by `except Exception`, is the recurring
 class here: a `CancelledError` inherits from `BaseException` and walks straight past
 such a guard, leaving rows nothing withdraws, parked processes with no sweeper, forked
 children, orphan specs, registered sessions with live loopback callback servers, or
-generations with no reference left anywhere. Every mutation window in `warm.py` is
-written to that rule.
+generations with no reference left anywhere. Every mutation window in `warm.py` and its
+`warm_runtime` owners is written to that rule.
 
 
 ## Disconnect
@@ -672,7 +706,7 @@ removes both entries — leaving the credential behind. So a configured row whos
 with provenance. A row the census does *not* carry still votes, so a source the
 census misses can never lose a real sharer.
 
-Residuals, stated rather than papered over: the handler awaits `cancel_mint`first, so a wedged teardown can keep a Disconnect busy for its shutdown timeout
+Residuals, stated rather than papered over: the handler awaits `cancel_mint` first, so a wedged teardown can keep a Disconnect busy for its shutdown timeout
 (firing it as a task would let a grant arrive after the user disowned the
 connection); the census reads the per-project `.kiro/agents` dirs of every OPEN
 chat slot as well as the user-level one, so a project with no open slot is still
@@ -786,7 +820,7 @@ shipped with the tiers note. Test is not broken today; it performs a real probe,
 just a shallower one than its name suggests. Splitting it keeps the
 security-relevant fix from waiting on the expensive one.
 
-## Launch gates: L0 and L1
+## Launch gates: automated L0/L1 and manual L2
 
 A visible Connect card is a promise the flow works; each rung of the launch
 ladder asserts something the rung below structurally cannot:
@@ -897,7 +931,7 @@ governed, audited agent path.
 
 ### Running it by hand
 
-`python3 -m kiro_crew.connections.l1_smoke --report /tmp/l1.json` (under a
+`python3 -m kiro_crew.connections.l1_smoke --report connections-l1-report.json` (under a
 pipx/venv install, use that environment's interpreter). `--min-exercised 1`
 reproduces the lane's gate; `--concurrency`/`--timeout` are in `--help`.
 
@@ -939,6 +973,7 @@ mounts or gates on it.
 | Postman | developer-tools | 2 | yes / yes | installs `/minimal` (no delete tools); no scope picker | gated | manual launch-gate check |
 | Neon | developer-tools | 2 | yes / yes | installs `?readonly=true` | gated | manual launch-gate check |
 | Prisma | developer-tools | 2 | yes / yes | none (only `workspace:admin`) | gated | manual launch-gate check |
+| Todoist | project-management | 2 | yes / yes | none — the server lists only `data:read_write`; the entry adds `data:delete` and leaves out `project:delete` | gated | manual launch-gate check, including two sessions held past the one-hour token expiry (refresh tokens rotate on every use) |
 
 Tier is provider *categorization* (see the tiers note above), never mint
 latency: tier 3 means the vendor gates clients by allowlist or waitlist, so
@@ -1069,7 +1104,7 @@ presented at the token endpoint) and `redirectUri` (pins the loopback host, port
 and path). `agent._apply_operator_oauth_client` writes the three at agent-spec
 emission for a server whose name is the provider slug **and** whose URL is the
 registry `mcp_url` (`provider_for_server` — name alone would land an operator's
-client on a hand-authored stranger); `warm._registry_server_entry` does the same
+client on a hand-authored stranger); `warm_runtime.spec_plan._registry_server_entry` does the same
 for the premint path and answers `None` for an unconfigured provider so nothing
 warms against a vendor that will only say "unknown client". The mint spec copies
 the emitted entry verbatim, so the cold path inherits it.

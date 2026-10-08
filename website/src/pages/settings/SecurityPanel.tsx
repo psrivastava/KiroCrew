@@ -1,15 +1,20 @@
 import React, { useEffect, useMemo, useState } from 'react'
+import { Link } from 'react-router-dom'
+import { Trans } from 'react-i18next'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { ShieldCheck, ShieldAlert, Lock, Eye, EyeOff, FileWarning, Terminal, Globe, Fingerprint, KeyRound, ScanLine, Layers, AlertTriangle, CheckCircle2, Circle, Clock, ExternalLink, ChevronRight, ChevronDown, Plus, Trash2, Gavel, Building2, Gauge, ToggleRight, MessageSquare, ListChecks, Boxes, BookOpen, Network, Copy, Check, Package } from 'lucide-react'
+import { ShieldCheck, ShieldAlert, Lock, Eye, EyeOff, FileWarning, Terminal, Globe, Fingerprint, KeyRound, ScanLine, Layers, AlertTriangle, CheckCircle2, Circle, Clock, ExternalLink, ChevronRight, ChevronDown, Plus, Trash2, Gavel, Building2, Gauge, ToggleRight, MessageSquare, ListChecks, Boxes, BookOpen, Network, Copy, Check, Package, GitBranch } from 'lucide-react'
 import { useAppDispatch, useAppSelector } from '../../store'
 import { setYoloDuration } from '../../store/dashboardSlice'
 import { SettingsSubNav } from '../../components/SettingsSubNav'
+import { retryPolicy } from '../../api/queryClient'
+import { STALE_OWNER_SESSION_CODE } from '../../api/staleOwnerSignal'
+import { purgeDocumentBodiesForRedactionChange } from '../../hooks/usePanelTabs'
 import { useImeGuard } from '../../hooks/useImeGuard'
-import { Badge, Btn, Input, Toggle, Checkbox } from '../../components/ui'
+import { Badge, Btn, Input, Toggle, Checkbox, SkeletonToggleRow } from '../../components/ui'
 import { SettingsSection, SettingsCard, SettingsToggle } from '../../components/settings'
 import Modal from '../../components/Modal'
 import InfoTip from '../../components/InfoTip'
-import { api, ApiError, type DeniedCommandsData, type DeniedCommandRule, type DeniedUserRule, type ArmedFileDeliveryConsent, type FileDeliveryConsentStatus, type GovernanceDistributionData, type GovernancePolicyData, type GovernanceScope, type GovernanceScopeDetail, type SecurityPostureData, type TailnetStatusData, type TrustedAppsData } from '../../api/client'
+import { api, ApiError, type DeniedCommandsData, type DeniedCommandRule, type DeniedUserRule, type ArmedFileDeliveryConsent, type CredentialRedactionState, type FileDeliveryConsentStatus, type GovernanceDistributionData, type GovernancePolicyData, type GovernanceScope, type GovernanceScopeDetail, type SecurityPostureData, type TailnetStatusData, type TrustedAppsData, type TrustedRegistriesData, type TrustedRegistryRow } from '../../api/client'
 import { PostureDisclosureRow, CODE_BASE as POSTURE_CODE_BASE } from './PostureDisclosure'
 import { MobileLoginCard } from './MobileLoginCard'
 
@@ -854,6 +859,167 @@ function YoloDurationCard() {
       {save.isError && (
         <ErrorNotice variant="inline" className="mt-1.5" message={i18nT('pages.settings.securityPanel.failed_to_save_yolo_duration')} askAgent />
       )}
+    </SettingsCard>
+  )
+}
+
+/* ── Credential redaction switch ─────────────────────────────────────────────
+ *
+ * A VIEW over the switch the `/api/security/credential-redaction` endpoints own.
+ * ON by default: every output surface runs the credential scrubber over what the
+ * agent produced. The owner turns it OFF when the scrubber is swallowing a value
+ * they legitimately need to read back (a one-time approval link's `?token=`, a
+ * blob they generated on purpose). Exfiltration-URL redaction and every
+ * request-blocking gate stay on regardless; the card says so, because a toggle
+ * labelled "redaction" that silently left half of it on would misdescribe what
+ * the owner just did.
+ *
+ * A FAILED READ renders NO switch. Rendering the default (ON) for a state we
+ * could not read would show a reassuring position that may be wrong, and the
+ * reassuring direction is the dangerous one.
+ */
+/** The owner gate refusing the viewer: a 403 that is NOT the token-auth
+ *  middleware's own re-auth denial (`X-Auth-Required`, a mid-session cookie
+ *  lapse the transport refreshes silently -- that one must stay a retryable
+ *  read), or the backend's `stale_session_reauth` code (a session that predates
+ *  the owner claim). Neither is a transient, so neither gets a retry or a Retry
+ *  button; `FilePathMenu` draws the same 403-vs-authRequired line. */
+function isOwnerGateRefusal(error: unknown): boolean {
+  if (!(error instanceof ApiError)) return false
+  if (error.status === 403 && !error.authRequired) return true
+  try {
+    const code = (JSON.parse(error.body || '{}') as { code?: unknown }).code
+    return code === STALE_OWNER_SESSION_CODE
+  } catch { return false }
+}
+
+function CredentialRedactionCard() {
+  const qc = useQueryClient()
+  const { data, isLoading, isError, error, isFetching, refetch } = useQuery<CredentialRedactionState>({
+    queryKey: ['credential-redaction'],
+    queryFn: api.credentialRedaction,
+    // An owner-gated refusal is a fact about the viewer, not a transient:
+    // retrying would only write a second audited refusal for the same open
+    // (see `isOwnerGateRefusal` for what counts; a re-auth 403 does not).
+    retry: (count, error) => !isOwnerGateRefusal(error) && retryPolicy(count, error),
+  })
+  const set = useMutation({
+    mutationFn: (enabled: boolean) => api.setCredentialRedaction(enabled),
+    onSuccess: state => {
+      qc.setQueryData(['credential-redaction'], state)
+      // DROP every file body THIS document holds (react-query bodies and open
+      // tab bodies -- see `purgeDocumentBodiesForRedactionChange`) on a write
+      // the server ACCEPTED. A refused write (403 stale session, 503 audit
+      // unavailable) moved nothing, so nothing is dropped for it. Other open
+      // dashboard documents purge on the `credential_redaction_changed` push.
+      purgeDocumentBodiesForRedactionChange(qc)
+    },
+    // Re-read on EVERY settlement, failure included: a PUT whose write landed
+    // but whose response was lost would otherwise leave the card showing the
+    // position from before the click while the switch is already in force.
+    onSettled: () => void qc.invalidateQueries({ queryKey: ['credential-redaction'] }),
+  })
+  // Same rule as the consent card: react-query RETAINS the last good `data`
+  // across a rejected refetch, so `isError` -- not `data === undefined` -- is
+  // the whole test for "unreadable".
+  const view = isError ? undefined : data
+  const ownerGateRefused = isError && isOwnerGateRefusal(error)
+  const busy = isLoading || set.isPending
+
+  return (
+    <SettingsCard>
+      {/* No card title: the section heading above already reads "Credential
+          redaction", and a third identical label stacked inside it read as
+          noise to the blind UX reader. The toggle label names the effect. */}
+      {/* The one task this card exists for is the read-back recipe, so it is a
+          numbered list the reader can follow, not a clause in a paragraph. */}
+      <div className="text-[12px] text-muted mb-2 leading-relaxed">
+        <p className="m-0">{i18nT('pages.settings.securityPanel.credential_redaction_desc_intro')}</p>
+        {/* The recipe names "the switch below"; a viewer the owner gate refuses
+            has no switch, so the steps are not shown to them. */}
+        {!ownerGateRefused && (
+          <ol className="my-1.5 pl-5 list-decimal space-y-0.5">
+            <li>{i18nT('pages.settings.securityPanel.credential_redaction_step_write')}</li>
+            <li>{i18nT('pages.settings.securityPanel.credential_redaction_step_off')}</li>
+            <li>{i18nT('pages.settings.securityPanel.credential_redaction_step_open')}</li>
+            <li>{i18nT('pages.settings.securityPanel.credential_redaction_step_on')}</li>
+          </ol>
+        )}
+        <p className="m-0">{i18nT('pages.settings.securityPanel.credential_redaction_desc_tail')}</p>
+      </div>
+      {isLoading ? (
+        // The read is in flight: show the shape of the control, so a slow
+        // connection never renders a setting that appears to have no control.
+        <div data-testid="credential-redaction-loading" aria-busy="true">
+          <SkeletonToggleRow />
+        </div>
+      ) : view ? (
+        <div data-testid="credential-redaction-row" className="flex flex-col gap-1.5 border border-border rounded-md px-3 py-2">
+          <SettingsToggle
+            label={i18nT('pages.settings.securityPanel.credential_redaction_toggle')}
+            description={i18nT('pages.settings.securityPanel.credential_redaction_toggle_help')}
+            checked={view.enabled}
+            disabled={busy}
+            onChange={enabled => set.mutate(enabled)}
+          />
+          {!view.enabled && (
+            <div data-testid="credential-redaction-off-notice" className="flex items-start gap-2 text-[11px] text-warn leading-relaxed">
+              <AlertTriangle size={13} className="shrink-0 mt-px" />
+              <span>
+                {i18nT('pages.settings.securityPanel.credential_redaction_off_notice')}
+                {view.changed_at && (
+                  <> {i18nT('pages.settings.securityPanel.credential_redaction_off_since', { time: fmtDateTime(view.changed_at) })}</>
+                )}
+              </span>
+            </div>
+          )}
+          {/* A rejected PUT is an error the agent can usually fix (an owner-gate
+              refusal, a keystone write failure), so the hand-off is on; nothing
+              on this card is destroyed by navigating away. */}
+          {set.isError && (
+            <ErrorNotice
+              variant="inline"
+              className="mt-1"
+              message={i18nT('pages.settings.securityPanel.credential_redaction_write_failed', { state: i18nT(view.enabled ? 'pages.settings.securityPanel.credential_redaction_still_on' : 'pages.settings.securityPanel.credential_redaction_still_off') })}
+              askAgent
+              askAgentLabel={i18nT('pages.settings.securityPanel.credential_redaction_ask_agent')}
+              testId="credential-redaction-write-failed"
+            />
+          )}
+        </div>
+      ) : ownerGateRefused ? (
+        // A non-owner: not a failure to recover from, a fact about the viewer.
+        // No Retry (it can never succeed and each click would write another
+        // audited refusal). The hand-off stays, as every ErrorNotice's does: the
+        // agent cannot make the viewer the owner, but it can say who is and
+        // what the viewer's session is, which is the next thing they need.
+        <ErrorNotice
+          variant="inline"
+          message={i18nT('pages.settings.securityPanel.credential_redaction_owner_only')}
+          askAgent
+          askAgentLabel={i18nT('pages.settings.securityPanel.credential_redaction_ask_agent')}
+          testId="credential-redaction-owner-only"
+        />
+      ) : isError ? (
+        // With the read failed there is no switch to move, so the notice carries
+        // the only recovery that does not mean reloading the page: the query's
+        // own retry (same shape as the crewmates config error). Block variant:
+        // the inline one renders no footer.
+        <ErrorNotice
+          message={i18nT('pages.settings.securityPanel.credential_redaction_read_failed')}
+          askAgent
+          // The shared control's bare "Ask the agent" reads as a guess on an
+          // error box (open a chat? file a report? let it change something?);
+          // the label says what the click does.
+          askAgentLabel={i18nT('pages.settings.securityPanel.credential_redaction_ask_agent')}
+          testId="credential-redaction-read-failed"
+          footer={
+            <Btn onClick={() => { void refetch() }} disabled={isFetching} data-testid="credential-redaction-retry">
+              {i18nT('pages.settings.securityPanel.credential_redaction_retry')}
+            </Btn>
+          }
+        />
+      ) : null}
     </SettingsCard>
   )
 }
@@ -1734,7 +1900,8 @@ function GovernancePolicyViewer() {
                 inert here. Rendered so a reader auditing a profile file can
                 account for every key it declares, not just the ones this build
                 enforces. Reachable even with no policy and no host profile: the
-                payload aggregates EVERY loaded profile (see client.ts), so the
+                payload aggregates EVERY loaded profile (see
+                `unknown_profile_scopes` in api/client/security.ts), so the
                 no-policy branch above yields to this block when rows exist. */}
             {unknownScopeRows.length > 0 && (
               <div className="border-t border-border pt-2 mt-2">
@@ -2641,6 +2808,319 @@ function ThirdPartyAppsCard() {
   )
 }
 
+/** Whether a registry trust change failed because the trust file is damaged. */
+function isRegistryTrustCorrupt(err: unknown): boolean {
+  if (!(err instanceof ApiError)) return false
+  try {
+    return (JSON.parse(err.body || '{}') as { code?: unknown }).code === 'corrupt'
+  } catch {
+    return false
+  }
+}
+
+/**
+ * The operator-facing reason a registry TRUST change failed, in user vocabulary.
+ *
+ * The coded refusals here are not "request failed": `corrupt` means the trust
+ * file is damaged and must be fixed or deleted by hand, `not_served` means the
+ * registry is dropped by the merge so a grant would do nothing until it is
+ * renamed in the registries editor, and `unknown_registry` means the registry was
+ * removed from Apps while the card was open. Rendering the raw backend
+ * `detail` for either would bury the one thing the operator can act on, so those
+ * codes map to the card's own copy; every other error falls through to
+ * `trustFailureMessage` (backend detail, then the mapped status message).
+ */
+export function registryTrustFailureMessage(err: unknown): string {
+  if (err instanceof ApiError) {
+    try {
+      const code = (JSON.parse(err.body || '{}') as { code?: unknown }).code
+      if (code === 'corrupt') return i18nT('pages.settings.securityPanel.trustedRegistries.corrupt_notice', { path: 'registry_trust.json' })
+      if (code === 'not_served') return i18nT('pages.settings.securityPanel.trustedRegistries.not_served')
+      if (code === 'unknown_registry') return i18nT('pages.settings.securityPanel.trustedRegistries.unknown_registry')
+    } catch {
+      // not JSON — fall through to the generic detail message
+    }
+  }
+  return trustFailureMessage(err)
+}
+
+/* ── Registry git-identity trust ── */
+
+/** Which registries may clone the repositories they list with the operator's own
+ *  git identity.
+ *
+ *  A hand-added registry clones WITHOUT credentials by default, so an app kept in
+ *  a private repository shows no art and cannot be installed. Granting trust
+ *  hands that registry the operator's ssh keys for the repositories it names —
+ *  and the registry's authors, not the operator, choose what those are. That is
+ *  the asymmetry the confirm exists to state: granting widens what someone else
+ *  decides, so it is confirmed; revoking narrows it, so it applies at once.
+ *
+ *  Build-pinned registries never appear: the build trusts them already, so a row
+ *  for one would offer a decision that is not the operator's to make. */
+function TrustedRegistriesCard() {
+  const qc = useQueryClient()
+  const { data: trRaw, isError: trError, isFetching, refetch } = useQuery<TrustedRegistriesData>({
+    queryKey: ['trusted-registries'],
+    queryFn: api.listTrustedRegistries,
+  })
+  // Normalize at the fetch boundary, for the reason ThirdPartyAppsCard does: a
+  // response shape that drops the list would otherwise reach `.map` and take the
+  // WHOLE Security page down rather than this one card.
+  const registries = useMemo(
+    () => (Array.isArray(trRaw?.registries) ? trRaw.registries : undefined),
+    [trRaw],
+  )
+  // A FAILED read, not a slow one: no actionable control, and say so.
+  const unavailable = trError === true
+  // The trust file is damaged: the runtime already fails closed (every row
+  // untrusted), so render a notice rather than a healthy-looking all-untrusted
+  // list.
+  const corrupt = trRaw?.corrupt === true
+
+  // The registry awaiting its grant confirm. Null when no modal is open.
+  const [confirm, setConfirm] = useState<TrustedRegistryRow | null>(null)
+  const [changeError, setChangeError] = useState<string | null>(null)
+
+  const applyRegistrySnapshot = (snap: TrustedRegistriesData) => {
+    qc.setQueryData(['trusted-registries'], snap)
+    // Trust decides whether a private repository can be cloned at all, so the
+    // App Store's own rows (art, installability) change underneath us.
+    qc.invalidateQueries({ queryKey: ['apps'] })
+    // RegistryManager's ['registries'] list caches trust: "owner" for 30s; left
+    // stale it echoes the pre-revoke tier back into PUT /api/apps/registries,
+    // which denies the whole save. Refetch it so the manager sees the new tier.
+    qc.invalidateQueries({ queryKey: ['registries'] })
+  }
+  // Every mutation's onError ALSO invalidates ['trusted-registries']: a refused
+  // write means the store's real state may differ from what the card last drew
+  // (a keystone that became corrupt surfaces the corrupt notice
+  // immediately, not after a manual reload), and the error copy is translated
+  // into user vocabulary for the coded refusals rather than shown as raw detail.
+  const onMutationError = (err: unknown) => {
+    // A damaged file is already explained by the card's own notice, which the
+    // refetch below renders with the file's full path; a second copy here would
+    // show the same problem twice.
+    setChangeError(isRegistryTrustCorrupt(err) ? null : registryTrustFailureMessage(err))
+    qc.invalidateQueries({ queryKey: ['trusted-registries'] })
+  }
+  const grant = useMutation({
+    mutationFn: (repo: string) => api.grantTrustedRegistry(repo),
+    onSuccess: snap => {
+      setChangeError(null)
+      applyRegistrySnapshot(snap)
+    },
+    onError: onMutationError,
+  })
+  const revoke = useMutation({
+    mutationFn: (repo: string) => api.revokeTrustedRegistry(repo),
+    onSuccess: snap => {
+      setChangeError(null)
+      applyRegistrySnapshot(snap)
+    },
+    onError: onMutationError,
+  })
+
+  const runConfirm = () => {
+    if (!confirm) return
+    grant.mutate(confirm.repo)
+    setConfirm(null)
+  }
+
+  return (
+    <>
+      <SettingsCard>
+        <div className="text-[12px] text-muted mb-1 leading-relaxed">
+          {i18nT('pages.settings.securityPanel.trustedRegistries.description')}
+        </div>
+        <div className="text-[12px] text-muted py-1 leading-relaxed">
+          {i18nT('pages.settings.securityPanel.trustedRegistries.pinned_note')}
+        </div>
+
+        {/* The trust file is damaged: no registry is trusted until the operator
+            fixes or deletes it. No product writer produces a damaged file, so
+            there is no in-app repair. */}
+        {corrupt && (
+          // Hand-off on: there is no draft on this card to protect, and the agent
+          // can help the operator find and read the file (it cannot write it).
+          <ErrorNotice
+            className="mt-1"
+            message={i18nT('pages.settings.securityPanel.trustedRegistries.corrupt_notice', {
+              path: trRaw?.corrupt_path || 'registry_trust.json',
+            })}
+            askAgent
+          />
+        )}
+
+        {unavailable && (
+          // Read failure on a card whose only controls are buttons — nothing to
+          // lose → hand-off on. A Retry footer refetches the query rather than
+          // forcing a page reload: the read can fail transiently (a slow keystone
+          // read), and there is no other way to recover the list in place. Block
+          // variant: the inline notice renders no footer.
+          <ErrorNotice
+            className="mt-1"
+            message={i18nT('pages.settings.securityPanel.trustedRegistries.unavailable')}
+            askAgent
+            footer={
+              <Btn onClick={() => { void refetch() }} disabled={isFetching} data-testid="trusted-registries-retry">
+                {i18nT('pages.settings.securityPanel.trustedRegistries.retry')}
+              </Btn>
+            }
+          />
+        )}
+
+        {!unavailable && registries && (registries.length === 0 ? (
+          <div className="text-[12px] text-muted py-2 leading-relaxed border-t border-border mt-1 pt-2">
+            {/* The empty state points at where a registry is added — the App
+                Store's Apps page, which hosts the registry-sources manager — so
+                it is not a dead end. One key carrying the whole sentence with a
+                <store> run pins every locale to its own clause order. The tag is
+                deliberately NOT <link>: that is an HTML void element, so the
+                Trans parser would drop the link text inside it. */}
+            <Trans
+              i18nKey="pages.settings.securityPanel.trustedRegistries.empty"
+              components={{ store: <Link to="/apps" className="text-accent hover:underline" /> }}
+            />
+          </div>
+        ) : (
+          <div className="divide-y divide-border border-t border-border mt-1">
+            {registries.map(row => (
+              <div
+                key={`${row.repo}#${row.name}`}
+                data-testid={`trusted-registry-${row.repo}#${row.name}`}
+                className="flex items-center gap-2.5 py-2"
+              >
+                <GitBranch size={14} className="lucide-inline shrink-0 text-muted" />
+                <div className="flex-1 min-w-0">
+                  <div className="text-[13px] text-text truncate">{row.name}</div>
+                  {/* One key carrying both facts rather than two adjacent calls:
+                      a sentence assembled from several keys pins every target
+                      language to English clause order. */}
+                  <div className="text-[11px] text-muted font-mono truncate">
+                    {/* The repository path, not just the host: two registries on
+                        one forge must read differently before Remove trust. An
+                        orphan grant has no branch, so it shows the path alone. */}
+                    {row.branch
+                      ? i18nT('pages.settings.securityPanel.trustedRegistries.row_meta', {
+                          host: row.repo.replace(/^[a-z][a-z0-9+.-]*:\/\//i, '') || row.host,
+                          branch: row.branch,
+                        })
+                      : row.repo.replace(/^[a-z][a-z0-9+.-]*:\/\//i, '') || row.host}
+                  </div>
+                  {/* A row the merge drops is served by neither claimant, so its
+                      apps are never listed and it can never badge Trusted — say
+                      so plainly. `not_served_reason` distinguishes a build-pinned
+                      name contest from an orphan grant whose config row was
+                      removed by hand; a missing/unknown reason falls back to the
+                      generic note. */}
+                  {row.served === false && (
+                    <div className="text-[11px] text-muted leading-relaxed">
+                      {row.not_served_reason === 'pinned_name' ? (
+                        // The fix is a rename in the registries editor, so link it.
+                        <Trans
+                          i18nKey="pages.settings.securityPanel.trustedRegistries.not_served_pinned_name"
+                          components={{ apps: <Link to="/apps" className="text-accent hover:underline" /> }}
+                        />
+                      ) : (
+                        i18nT(
+                          row.not_served_reason === 'not_configured'
+                            ? 'pages.settings.securityPanel.trustedRegistries.not_served_not_configured'
+                            : 'pages.settings.securityPanel.trustedRegistries.not_served'
+                        )
+                      )}
+                    </div>
+                  )}
+                </div>
+                {/* The same badge the registries editor uses for a trusted source:
+                    a state the operator chose, not a warning. */}
+                {row.trusted && (
+                  <Badge variant="aim">
+                    {i18nT('pages.settings.securityPanel.trustedRegistries.trusted_badge')}
+                  </Badge>
+                )}
+                {/* Revoke renders whenever a stored grant exists for the row —
+                    served or not — so a grant that went dormant because the merge
+                    dropped the row (an operator added a same-name registry) can
+                    still be cleared; leaving it would re-arm the moment the
+                    collision resolves. Grant renders only on a SERVED, ungranted
+                    row with no trust block: elsewhere a Grant would be invisible
+                    (the snapshot reads it not-trusted, the button never flips) and
+                    the backend refuses it — so the row shows no control and is
+                    fixed by renaming/removing it in the registries editor (the
+                    note above says so). */}
+                {/* A damaged trust file refuses every grant and revoke, so no
+                    control is offered until it is fixed. */}
+                {corrupt ? null : row.granted ? (
+                  // Removing trust narrows what the registry may do, so it is the
+                  // safe action and carries no danger styling.
+                  <Btn disabled={revoke.isPending} onClick={() => revoke.mutate(row.repo)}>
+                    {i18nT('pages.settings.securityPanel.trustedRegistries.revoke')}
+                  </Btn>
+                ) : row.served !== false ? (
+                  <Btn disabled={grant.isPending} onClick={() => setConfirm(row)}>
+                    {i18nT('pages.settings.securityPanel.trustedRegistries.grant')}
+                  </Btn>
+                ) : null}
+              </div>
+            ))}
+          </div>
+        ))}
+
+        {changeError && (
+          <ErrorNotice
+            className="mt-2"
+            message={i18nT('pages.settings.securityPanel.trustedRegistries.change_failed', { detail: changeError })}
+            askAgent
+            onDismiss={() => setChangeError(null)}
+          />
+        )}
+      </SettingsCard>
+
+      {/* ── Confirm modal (hand one registry the operator's git identity) ── */}
+      <Modal
+        open={confirm !== null}
+        onClose={() => setConfirm(null)}
+        title={confirm
+          ? i18nT('pages.settings.securityPanel.trustedRegistries.grant_confirm_title', { name: confirm.name })
+          : ''}
+        maxWidth={480}
+        footer={
+          <>
+            <Btn onClick={() => setConfirm(null)}>{i18nT('pages.settings.securityPanel.cancel')}</Btn>
+            <Btn danger onClick={runConfirm}>
+              {i18nT('pages.settings.securityPanel.trustedRegistries.grant_confirm_ok')}
+            </Btn>
+          </>
+        }
+      >
+        <div className="flex items-start gap-3">
+          <AlertTriangle size={18} className="text-warn shrink-0 mt-0.5" />
+          <div className="min-w-0 text-[13px] text-text leading-relaxed">
+            {/* The display name is index content the registry's author controls,
+                so the dialog also states the URL the grant is keyed on — the one
+                the operator typed into config — where a planted name cannot
+                impersonate another registry. */}
+            <div className="text-[12px] mb-2">
+              {confirm ? (
+                <Trans
+                  i18nKey="pages.settings.securityPanel.trustedRegistries.grant_confirm_repo"
+                  values={{ repo: confirm.repo }}
+                  components={{ url: <span className="font-mono [overflow-wrap:anywhere]" /> }}
+                />
+              ) : null}
+            </div>
+            {confirm
+              ? i18nT('pages.settings.securityPanel.trustedRegistries.grant_confirm_body', { name: confirm.name })
+              : ''}
+          </div>
+        </div>
+      </Modal>
+
+    </>
+  )
+}
+
 /* ── Defense-in-depth section ── */
 function LayersSection() {
   return (
@@ -2654,6 +3134,65 @@ function LayersSection() {
         </div>
       </SettingsCard>
     </SettingsSection>
+  )
+}
+
+/* ── Redaction: hosts allowed long queries, per workspace ── */
+export function RedactionAllowedHostsCard() {
+  const queryClient = useQueryClient()
+  const { data, isLoading, error } = useQuery({
+    queryKey: ['redaction-allowed-hosts'],
+    queryFn: () => api.redactionAllowedHosts(),
+  })
+  const revoke = useMutation({
+    mutationFn: ({ workspace, host }: { workspace: string; host: string }) => api.redactionRevokeHost(workspace, host),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['redaction-allowed-hosts'] }),
+  })
+  const rows = Object.entries(data?.workspaces ?? {}).flatMap(([workspace, hosts]) => hosts.map(host => ({ workspace, host })))
+  return (
+    <SettingsCard>
+      <div className="mb-3 text-[12px] leading-relaxed text-muted" data-testid="redaction-settings-note">
+        {i18nT('pages.settings.securityPanel.redaction_always_on')}
+      </div>
+      <ErrorNotice
+        variant="inline"
+        askAgent
+        message={error ? i18nT('pages.settings.securityPanel.redaction_load_failed') : null}
+      />
+      <ErrorNotice
+        variant="inline"
+        askAgent
+        message={revoke.isError ? i18nT('pages.settings.securityPanel.redaction_revoke_failed') : null}
+        onDismiss={() => revoke.reset()}
+      />
+      {!isLoading && !error && rows.length === 0 && (
+        <div className="text-[12px] text-muted" data-testid="redaction-allowed-empty">
+          {i18nT('pages.settings.securityPanel.redaction_no_allowed_hosts')}
+        </div>
+      )}
+      {rows.length > 0 && (
+        <div className="divide-y divide-border" data-testid="redaction-allowed-list">
+          {rows.map(({ workspace, host }) => (
+            <div key={`${workspace}\u0000${host}`} className="flex items-center justify-between gap-3 py-2">
+              <div className="min-w-0">
+                <div className="truncate font-mono text-[13px] text-text">{host}</div>
+                <div className="text-[11px] text-muted">
+                  {i18nT('pages.settings.securityPanel.redaction_workspace', { workspace })}
+                </div>
+              </div>
+              <Btn
+                danger
+                disabled={revoke.isPending}
+                onClick={() => revoke.mutate({ workspace, host })}
+                data-testid="redaction-revoke"
+              >
+                {i18nT('pages.settings.securityPanel.redaction_revoke')}
+              </Btn>
+            </div>
+          ))}
+        </div>
+      )}
+    </SettingsCard>
   )
 }
 
@@ -2687,7 +3226,7 @@ function DocsSection() {
  * The rail states which is which before any row is read, and the two large
  * tables (137 rules, ~20 governed scopes) get a pane instead of a fold.
  */
-type SecuritySectionKey = 'posture' | 'approval' | 'rules' | 'tailnet' | 'apps' | 'delivery' | 'layers' | 'governance' | 'docs'
+type SecuritySectionKey = 'posture' | 'approval' | 'rules' | 'tailnet' | 'apps' | 'registries' | 'redaction' | 'delivery' | 'layers' | 'governance' | 'docs'
 type SecuritySectionGroup = 'status' | 'yours' | 'enforced' | 'reference'
 
 interface SecuritySectionDef {
@@ -2702,6 +3241,14 @@ interface SecuritySectionDef {
  * are the same words by construction, so they cannot drift, and translators are
  * not asked to name the same section twice.
  *
+ * The one deliberate exception is `registries`: the rail is an 11px line that
+ * wraps on the longest names, so it keeps the short `…section_title_rail`
+ * ("Registry trust"), while the pane's `SettingsSection` uses the descriptive
+ * `…section_title` ("Registries trusted with your Git credentials") — a
+ * first-time reader has to be told WHOSE credentials are at stake, and that
+ * sentence does not fit the rail. The two keys live under the same
+ * `trustedRegistries` block so a translator still names the section once.
+ *
  * Keys, not copy, and indexed inline at the `i18nT()` call for the reason given
  * on `FEATURE_LABEL_KEY`: a module-scope `i18nT()` would freeze the boot
  * language, and a key the i18n lint cannot resolve statically is a key it cannot
@@ -2713,6 +3260,8 @@ export const SECTION_LABEL_KEY: Record<SecuritySectionKey, string> = {
   rules: 'pages.settings.securityPanel.denied_commands',
   tailnet: 'pages.settings.securityPanel.tailnet_section',
   apps: 'pages.settings.securityPanel.third_party_apps_section',
+  registries: 'pages.settings.securityPanel.trustedRegistries.section_title_rail',
+  redaction: 'pages.settings.securityPanel.redaction_section',
   delivery: 'pages.settings.securityPanel.file_delivery_section',
   layers: 'pages.settings.securityPanel.defense_in_depth_architecture',
   governance: 'pages.settings.securityPanel.governance_policy',
@@ -2735,6 +3284,8 @@ const SECURITY_SECTIONS: readonly SecuritySectionDef[] = [
   { key: 'rules', icon: <Terminal size={15} />, group: 'yours' },
   { key: 'tailnet', icon: <Network size={15} />, group: 'yours' },
   { key: 'apps', icon: <Boxes size={15} />, group: 'yours' },
+  { key: 'registries', icon: <GitBranch size={15} />, group: 'yours' },
+  { key: 'redaction', icon: <EyeOff size={15} />, group: 'yours' },
   { key: 'delivery', icon: <FileWarning size={15} />, group: 'yours' },
   { key: 'layers', icon: <Layers size={15} />, group: 'enforced' },
   { key: 'governance', icon: <Gavel size={15} />, group: 'enforced' },
@@ -2779,6 +3330,20 @@ function fmtRailExpiry(expiry: Date, now: Date = new Date()): string {
 /** Security tab. `basePath` opts the section sub-nav into path navigation
  *  (`${basePath}/security/<section>`); omitted, the historical ?sub= /
  *  ?section= query behavior is unchanged. Passed by the Settings host. */
+/** Settings -> Security -> Redaction: the file-view switch above the allowed link hosts. */
+export function RedactionSection() {
+  return (
+    <>
+      <SettingsSection title={i18nT('pages.settings.securityPanel.credential_redaction_section')}>
+        <CredentialRedactionCard />
+      </SettingsSection>
+      <SettingsSection title={i18nT('pages.settings.securityPanel.redaction_allowed_hosts_section')}>
+        <RedactionAllowedHostsCard />
+      </SettingsSection>
+    </>
+  )
+}
+
 export function SecurityPanel({ basePath }: { basePath?: string } = {}) {
   // Held HERE, not in the rules pane: picking another rail section unmounts that
   // pane, and a half-typed deny pattern living in its local state would be
@@ -2820,6 +3385,13 @@ export function SecurityPanel({ basePath }: { basePath?: string } = {}) {
   // and it belongs to `SettingsSubNav` for every panel at once rather than to this
   // row: doing it here alone would also break SECTION_LABEL_KEY's rule that a rail
   // label REUSES its section's heading key.
+  //
+  // The credential-redaction row follows the same decision, for the same reason:
+  // a summary there was measured at +4 `fragment/multi-unit` findings on this
+  // surface and failed `[vs-base]`. A rail-level read would also hit the
+  // owner-gated GET for every allow-listed non-owner who merely opens Security,
+  // writing an audited refusal per mount. The OFF state is one click away, where
+  // the card shows it with a warning and the time it was turned off.
 
   const summaryFor = (key: SecuritySectionKey): string | undefined => {
     switch (key) {
@@ -2877,29 +3449,12 @@ export function SecurityPanel({ basePath }: { basePath?: string } = {}) {
     }
   })
 
-  const banner = (
-    // ── Data Classification Warning ──
-    // In the SubNav banner slot on purpose: it is an instruction about what to
-    // type into the product, not a section of the security model, and a notice
-    // you can navigate away from is a notice most readers never see.
-    <div className="mb-5 bg-bg-elevated border rounded-lg p-4 flex items-start gap-3 animate-rise" style={{ borderColor: 'color-mix(in srgb, var(--warn) 45%, transparent)' }}>
-      <AlertTriangle size={18} className="text-warn shrink-0 mt-0.5" />
-      <div>
-        <div className="text-[13px] font-semibold text-text-strong">{i18nT('pages.settings.securityPanel.data_classification_notice')}</div>
-        <div className="text-[12px] text-muted mt-1 leading-relaxed">
-          {i18nT('pages.settings.securityPanel.do_not_enter_highly_sensitive_or_restricted_data')}
-        </div>
-      </div>
-    </div>
-  )
-
   return (
     <SettingsSubNav
       items={items}
       railWidth={248}
       listLabel={i18nT('pages.settings.securityPanel.security_sections')}
       backLabel={i18nT('settings.tabs.security.label')}
-      banner={banner}
       basePath={basePath}
     >
       {active => {
@@ -2923,6 +3478,12 @@ export function SecurityPanel({ basePath }: { basePath?: string } = {}) {
                 <ThirdPartyAppsCard />
               </SettingsSection>
             )}
+            {key === 'registries' && (
+              <SettingsSection title={i18nT('pages.settings.securityPanel.trustedRegistries.section_title')}>
+                <TrustedRegistriesCard />
+              </SettingsSection>
+            )}
+            {key === 'redaction' && <RedactionSection />}
             {key === 'delivery' && (
               <SettingsSection title={i18nT('pages.settings.securityPanel.file_delivery_section')}>
                 <FileDeliveryConsentCard />

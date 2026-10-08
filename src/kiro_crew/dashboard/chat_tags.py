@@ -18,22 +18,32 @@ import math
 import re
 import uuid
 import weakref
-from typing import Any, Callable, TypeVar
+from typing import Any
 
 from aiohttp import web
 
 from kiro_crew.dashboard.chat_persistence import save_slot_off_loop
 from kiro_crew.dashboard.chat_tag_grants import (
+    GrantsSnapshot,
+    capture_grants_snapshot,
     has_grant_row,
     is_grantable_tag_id,
     mint_grant,
     refresh_cache,
     resolve_grant,
+    resolve_grant_record,
     revoke_grant,
+    store_write_blocked,
 )
 from kiro_crew.dashboard.chat_utils import slot_history_key
-from kiro_crew.dashboard.create_rate_limit import TAG_CREATE, allow_create
-from kiro_crew.dashboard.handlers._shared import read_bounded_json
+from kiro_crew.dashboard.create_rate_limit import TAG_COLUMN_CREATE, TAG_CREATE, allow_create
+from kiro_crew.dashboard.handlers._shared import _owner_denial_response, read_bounded_json
+from kiro_crew.dashboard.handlers.source_providers import is_owner_dashboard_request
+from kiro_crew.dashboard.slot_ownership import (
+    audit_app_slot_denial,
+    deny_app_slot_access,
+    slot_not_found,
+)
 from kiro_crew.dashboard.state import DashboardState, mint_tags_revision
 from kiro_crew.dashboard.token_auth import (
     MEMBER_CHAT_PRINCIPAL_KEY,
@@ -63,8 +73,6 @@ _VALID_SOURCES = {"tags", "state"}
 # and render an eternally-empty column: the lanes are exhaustive and mutually
 # exclusive by construction, and a card that matched nothing would vanish.
 _VALID_STATE_KEYS = {"needs_approval", "waiting", "working", "idle"}
-
-_T = TypeVar("_T")
 
 # Valid values for a tag's optional ``agent`` policy field.
 _AGENT_TAG_POLICIES: frozenset[str] = frozenset({"add-remove", "add-only", "none"})
@@ -96,6 +104,151 @@ def agent_tag_policy(tag: dict[str, Any]) -> str:
     context injection so the policy lives in one place.
     """
     return agent_tag_grant(tag)[0]
+
+
+def agent_tag_change_refusal(
+    added: list[dict[str, Any]],
+    removed: list[dict[str, Any]],
+    result: list[dict[str, Any]],
+    snapshot: GrantsSnapshot,
+) -> tuple[str, str] | None:
+    """Grants-policy verdict for a non-person caller's tag diff, or ``None``.
+
+    The protected-store authority the ``chat_tag`` directive enforces, expressed
+    over the DIFF so the wholesale list replace at
+    ``PUT /api/chat/slots/{slot}/tags`` is held to it. Every policy decision is
+    read from ONE atomic ``snapshot`` of the grants cache
+    (:func:`~kiro_crew.dashboard.chat_tag_grants.capture_grants_snapshot`) —
+    both health axes and the rows come from the same installed cache state, so a
+    concurrent refresh cannot swap the cache between a health check and a row
+    lookup (the stale-health window). The protected ROW is the source of truth
+    for both policy and status; a tag dict's own agent-writable ``status`` field
+    (in ``tags.json``) is consulted ONLY to recognise a rowless tag CLAIMING to
+    be a status tag, which is never trusted as a grant — only ever a reason to
+    REFUSE.
+
+    Health, two cases:
+
+    * If the store is WRITE-BLOCKED (unreadable or gone), nothing can be
+      verified at all, so the whole change fails closed ``tag_grants_unavailable``.
+    * If grants are merely REDUCED (a boot quarantine that has since reseeded
+      and verified: the default states are row-backed again, but the operator's
+      custom reservations were discarded), a tag that is ROWLESS might be a lost
+      reservation rather than an ordinary label — the two are indistinguishable
+      now. So a rowless tag fails closed ``tag_grants_unavailable`` while
+      ``grants_reduced`` holds, but a ROW-BACKED tag (a reseeded default state)
+      resolves normally and stays assignable. Recovery is owner adoption.
+
+    What a non-person caller is otherwise refused is a RESERVATION the store
+    actually records — a protected grant row. A healthy-store rowless tag is an
+    ordinary label (apps self-organise their own sessions with these), not
+    something the person reserved, so it is not gated; the row is what makes a
+    tag the person's:
+
+    * an ADDED row-backed tag needs ``add-only`` or ``add-remove`` — a row-backed
+      ``none`` tag is a state the person reserved for themselves
+      (``tag_policy_denied``);
+    * a REMOVED row-backed tag needs ``add-remove`` — row-backed ``add-only`` and
+      ``none`` both forbid an agent from stripping it (``tag_policy_denied``);
+    * an ADDED or REMOVED tag whose agent-writable vocabulary bit says "status"
+      but which has NO protected row (an upgraded install's custom status tag,
+      or one caught between a revoke and its re-mint) has an UNKNOWN identity,
+      not a plain label: it is refused ``status_identity_unprotected`` rather
+      than stacking (on add) or silently dropping (on remove) a workflow state
+      the store cannot vouch for.
+
+    Workflow-state exclusivity: workflow states are mutually exclusive and
+    ``set_state`` is the only verb that strips peers. This route strips nothing
+    of its own, so a change THIS diff makes that leaves the result carrying more
+    than one status tag is refused ``status_tag_requires_set_state`` — the agent
+    must drive a workflow state through ``chat_tag`` ``set_state``. A status tag
+    here is any tag that is a row-backed status OR carries the vocabulary status
+    bit, so a rowless status cannot slip the count. The refusal fires ONLY when
+    the offending status tag was ADDED by this diff: the person (never gated) may
+    leave a session carrying two status tags, and a later agent write that
+    touches neither must not be blamed for that pre-existing state. Swapping one
+    status tag for another (its peer in ``removed``) is permitted; stacking a
+    second is not.
+
+    Returns the FIRST ``(code, tag_id)`` refusal (so one bad id in a multi-tag
+    change leaves the whole write unapplied), or ``None`` when every change is
+    permitted. Pure: it reads only ``snapshot`` and the resolved diff.
+    """
+    if snapshot.write_blocked() is not None:
+        # Store unreadable or gone: nothing can be verified. Fail closed for the
+        # whole change rather than treat a reserved tag as rowless. The error id
+        # is empty — the refusal is about the store, not one tag.
+        return ("tag_grants_unavailable", "")
+    # Grants reduced by a boot quarantine (even one that has since reseeded and
+    # verified): a rowless tag may be a lost reservation, indistinguishable from
+    # an ordinary label, so rowless tags are failed closed below while this
+    # holds. Row-backed tags still resolve, so a reseeded default state stays
+    # usable.
+    grants_reduced = snapshot.grants_reduced() is not None
+
+    def _rowless_refusal(tag: dict[str, Any], tag_id: str) -> tuple[str, str] | None:
+        # Shared verdict for a tag with no protected row, used on both add and
+        # remove. A rowless vocabulary-status tag is always refused (its
+        # identity is unknown); otherwise a rowless tag is an ordinary label and
+        # passes, EXCEPT while grants are reduced, when it might be a lost
+        # reservation and so fails closed.
+        if tag.get("status") is True:
+            return ("status_identity_unprotected", tag_id)
+        if grants_reduced:
+            return ("tag_grants_unavailable", tag_id)
+        return None
+
+    def _is_status(tag: dict[str, Any]) -> bool:
+        # A workflow state for exclusivity purposes is a tag that is EITHER a
+        # row-backed status OR carries the vocabulary ``status`` bit with no
+        # protected row. The second case is agent-forgeable, which is why it is
+        # never a GRANT — but it is still a reason to treat the tag as a state
+        # here, so a rowless status cannot be stacked past the exclusivity check.
+        _, row_status = snapshot.grant(str(tag.get("id") or ""))
+        return row_status or tag.get("status") is True
+
+    for tag in added:
+        tag_id = str(tag.get("id") or "")
+        if not snapshot.has_row(tag_id):
+            # Rowless: a vocabulary-status tag is refused outright (adding it
+            # would stack a workflow state the peer-strip cannot later remove,
+            # wedging ``set_state``); an ordinary label passes unless grants are
+            # reduced, when it might be a lost reservation. Checked BEFORE the
+            # policy branch, which only applies to row-backed tags.
+            rowless = _rowless_refusal(tag, tag_id)
+            if rowless is not None:
+                return rowless
+            continue
+        if snapshot.grant(tag_id)[0] not in ("add-only", "add-remove"):
+            return ("tag_policy_denied", tag_id)
+    for tag in removed:
+        tag_id = str(tag.get("id") or "")
+        if not snapshot.has_row(tag_id):
+            # Rowless: a vocabulary-status tag is refused (stripping it would
+            # silently drop a workflow state the store cannot vouch for); an
+            # ordinary label is strippable unless grants are reduced, when it
+            # might be a lost reservation.
+            rowless = _rowless_refusal(tag, tag_id)
+            if rowless is not None:
+                return rowless
+            continue
+        if snapshot.grant(tag_id)[0] != "add-remove":
+            return ("tag_policy_denied", tag_id)
+    # Mutual exclusivity: at most one workflow-state tag may survive. Fire ONLY
+    # when THIS diff raised the status count — the person (ungated) can leave a
+    # session carrying two status tags, and a later agent write that touches
+    # neither (even a pure remove of its own label) must not be blamed for that
+    # pre-existing state. So the offender must be a status tag the diff ADDED.
+    result_status = [t for t in result if _is_status(t)]
+    if len(result_status) > 1:
+        added_ids = {str(t.get("id") or "") for t in added}
+        offender = next(
+            (str(t.get("id") or "") for t in result_status if str(t.get("id") or "") in added_ids),
+            "",
+        )
+        if offender:
+            return ("status_tag_requires_set_state", offender)
+    return None
 
 
 def resolve_board_tags(
@@ -210,30 +363,6 @@ def _tags_write_lock(state: Any) -> LoopBoundLock:
 tags_write_lock = _tags_write_lock
 
 
-async def _mutate_tags_locked(state: DashboardState, mutate: Callable[[], _T]) -> _T:
-    """Serialize a tag mutation + persistence under a shared async lock.
-
-    ``mutate`` is a sync callable that modifies ``state._tags`` in place and
-    returns a result. After it runs, an immutable snapshot is atomically written
-    to disk inside a worker thread (mirrors DashboardState._atomic_write_json).
-    The lock is NON-REENTRANT — callers must never nest.
-
-    Raises on persist failure (caller must catch to surface HTTP 5xx).
-    The in-memory state is rolled back to the pre-mutate snapshot on failure.
-    """
-    async with _tags_write_lock(state):
-        pre_snapshot = [dict(t) for t in state._tags]
-        result = mutate()
-        snapshot = [dict(t) for t in state._tags]
-        try:
-            await asyncio.to_thread(_write_tags_snapshot, state, snapshot)
-        except Exception:
-            # Roll back to pre-mutate state.
-            state._tags = pre_snapshot
-            raise
-        return result
-
-
 def _write_tags_snapshot(state: DashboardState, snapshot: list[dict]) -> None:
     """Persist a pre-captured tag snapshot (runs in worker thread).
 
@@ -241,6 +370,49 @@ def _write_tags_snapshot(state: DashboardState, snapshot: list[dict]) -> None:
     through ``kiro_crew.dashboard.state.config_dir`` exactly like
     ``save_tags`` (and stays patchable in tests)."""
     state.save_tags_snapshot(snapshot)
+
+
+async def _reconcile_failed_tag_create(
+    state: DashboardState,
+    generated_tag: dict[str, Any],
+    *,
+    identity_was_minted: bool,
+) -> dict[str, Any] | None:
+    """Reconcile an ambiguous vocabulary write while the caller holds the tag lock."""
+    tag_id = str(generated_tag["id"])
+    durable = await asyncio.to_thread(state.read_durable_tags_snapshot)
+    if durable is None:
+        logger.warning(
+            "tag create: durable vocabulary unreadable after write failure; "
+            "withdrawing unconfirmed tag %s",
+            tag_id,
+        )
+        # A 5xx response must not leave the unconfirmed vocabulary row or its
+        # protected identity live in this process. If the write actually
+        # committed, a later successful reload can recover the durable row; it
+        # remains rowless and therefore cannot authorize an agent meanwhile.
+        state._tags = [row for row in state._tags if row.get("id") != tag_id]
+    elif durable.present:
+        state._tags = durable.tags
+        state._unparsed_tag_entries = durable.unparsed
+        state._tags_authoritative = True
+        committed = next((row for row in durable.tags if row.get("id") == tag_id), None)
+        if committed is not None:
+            logger.warning(
+                "tag create: vocabulary write reported failure after commit for %s", tag_id
+            )
+            return committed
+    else:
+        state._tags = [row for row in state._tags if row.get("id") != tag_id]
+
+    if identity_was_minted:
+        try:
+            await asyncio.to_thread(revoke_grant, tag_id)
+        except Exception:
+            logger.warning(
+                "tag create: orphan identity revoke failed for %s", tag_id, exc_info=True
+            )
+    return None
 
 
 async def persist_tags_snapshot_unlocked(state: DashboardState) -> None:
@@ -298,12 +470,25 @@ def create_tag_definition(
     return tag
 
 
+class TagGrantStoreBlocked(RuntimeError):
+    """An owner-browser create refused because the grant store's write gate is closed.
+
+    Typed so the route can record the refusal on the SEL as a ``denied``
+    permission decision, distinct from a failed write (``error``).
+    """
+
+    def __init__(self, blocked: str) -> None:
+        super().__init__(f"agent-tag grant store unavailable: {blocked}")
+        self.blocked = blocked
+
+
 async def create_tag_definition_off_loop(
     state: DashboardState,
     name: str,
     color: str | None = None,
     *,
     status: bool = False,
+    record_protected_identity: bool,
 ) -> dict:
     """Async wrapper: creates a tag definition under the shared write lock.
 
@@ -311,6 +496,11 @@ async def create_tag_definition_off_loop(
     concurrent callers creating the same missing tag name produce exactly one
     definition. The sync fsync write runs in a worker thread while the lock is
     held.
+
+    ``record_protected_identity`` is true only after the HTTP route has
+    positively verified an owner-dashboard browser request. Internal MCP
+    creation still persists the vocabulary row, but it cannot mint the
+    protected identity or default policy that the same agent would consume.
 
     Raises on persist failure so the caller can surface HTTP 5xx.
     """
@@ -323,46 +513,47 @@ async def create_tag_definition_off_loop(
         )
         if existing:
             return existing
+        if record_protected_identity:
+            # Same write gate as PATCH and adoption: mint only into a store
+            # that currently verifies. ``mint_grant`` alone refuses a present
+            # but unverifiable store, yet it recreates a MISSING one from an
+            # empty document, which after a failed quarantine reseed would
+            # write an owner row into a store with no trusted defaults.
+            await asyncio.to_thread(refresh_cache)
+            blocked = store_write_blocked()
+            if blocked is not None:
+                logger.warning("tag create: permission data unavailable (%s)", blocked)
+                raise TagGrantStoreBlocked(blocked)
         tag = create_tag_definition(state, name, color, status=status)
-        if status:
-            # Out-of-the-box board behavior: a workflow-state tag created
-            # through an authenticated surface is agent-drivable. The grant is
-            # minted HERE — the sole write path an agent cannot reach — never
-            # derived from the tag's own (agent-writable) fields.
+        if record_protected_identity:
+            # Only a positively verified owner-dashboard browser create records
+            # protected provenance. A plain label's ``none`` row records identity
+            # without granting authority; a workflow state keeps the shipped
+            # ``add-remove`` default. An internal MCP create deliberately skips
+            # this block, so its vocabulary row remains rowless until owner
+            # adoption.
             #
-            # ORDERING (crash atomicity): the grant is minted BEFORE the
-            # vocabulary commit. A crash between the two writes then leaves an
-            # orphan GRANT ROW for an id no vocabulary entry references —
-            # inert: the resolver only consults rows for ids the slot carries,
-            # and a later create of that same id re-mints over it — where the
-            # reverse order
-            # leaves a durable status tag with no authorization row, which
-            # reads as non-status and lets two exclusive workflow states
-            # persist. A mint failure aborts before anything is durable.
+            # ORDERING (crash atomicity): the row is minted BEFORE the vocabulary
+            # commit. A crash between the writes leaves an inert orphan row for an
+            # id no vocabulary entry references, while the reverse order leaves a
+            # durable tag that cannot prove its dashboard origin. A mint failure
+            # aborts before anything is durable.
+            policy = "add-remove" if status else "none"
             try:
-                await asyncio.to_thread(
-                    mint_grant, str(tag["id"]), policy="add-remove", status=True
-                )
+                await asyncio.to_thread(mint_grant, str(tag["id"]), policy=policy, status=status)
             except Exception:
-                logger.warning("agent-tag grant mint failed for %s", tag["id"], exc_info=True)
+                logger.warning("agent-tag identity mint failed for %s", tag["id"], exc_info=True)
                 state._tags = [t for t in state._tags if t.get("id") != tag["id"]]
                 raise
         snapshot = [dict(t) for t in state._tags]
         try:
             await asyncio.to_thread(_write_tags_snapshot, state, snapshot)
         except Exception:
-            # Roll back the in-memory mutation AND unwind the just-minted
-            # grant, so the failed create leaves neither store changed.
-            state._tags = [t for t in state._tags if t.get("id") != tag["id"]]
-            if status:
-                try:
-                    await asyncio.to_thread(revoke_grant, str(tag["id"]))
-                except Exception:
-                    logger.warning(
-                        "tag create: grant unwind failed for %s (orphan row is "
-                        "inert and pruned on next load)",
-                        tag["id"],
-                    )
+            committed = await _reconcile_failed_tag_create(
+                state, tag, identity_was_minted=record_protected_identity
+            )
+            if committed is not None:
+                return committed
             raise
         return tag
 
@@ -387,10 +578,31 @@ def _order_key(row: dict) -> int:
 # ── Tag vocabulary ─────────────────────────────────────────────────────────
 
 
+def _project_agent_tag(tag: dict[str, Any], degraded: str | None) -> dict[str, Any]:
+    """Copy one vocabulary row and attach protected-store policy metadata."""
+    row = dict(tag)
+    raw_id = tag.get("id")
+    tag_id = raw_id if isinstance(raw_id, str) else ""
+    policy, _status, provenanced = resolve_grant_record(tag_id)
+    row["agent"] = policy
+    row["agent_provenanced"] = provenanced
+    row["agent_store_degraded"] = degraded is not None
+    return row
+
+
 async def api_chat_tags(request: web.Request) -> web.Response:
-    """GET /api/chat/tags — list all tag definitions."""
+    """GET /api/chat/tags — list definitions with protected policy metadata.
+
+    ``agent_store_degraded`` carries the boolean WRITE gate, not the applier's
+    reduced-grants signal: the dashboard disables every policy control and
+    the owner's adopt action while it is true, and adoption is the recovery a
+    boot quarantine points at, so a verified reseed must read as healthy here.
+    """
     state: DashboardState = request.app["state"]
-    return web.json_response(sorted(state._tags, key=_order_key))
+    await asyncio.to_thread(refresh_cache)
+    degraded = store_write_blocked()
+    rows = [_project_agent_tag(tag, degraded) for tag in sorted(state._tags, key=_order_key)]
+    return web.json_response(rows)
 
 
 def _refuse_vocabulary_write(
@@ -411,6 +623,12 @@ def _refuse_vocabulary_write(
     -- rather than only where a tool layer chooses to restate it. The
     unattributable-caller refusal (:func:`token_auth.refuse_unattributable_caller`)
     runs first, for the reason its docstring gives.
+
+    The board's column layout (``/api/chat/tag-columns``) is the same kind of
+    shared, ownerless state -- a column an app coined would sit in the person's
+    board with nothing to tell it apart -- so its four write handlers (create,
+    update, delete, reorder) apply this refusal too, and the
+    ``chat_tag_column_*`` MCP tools rely on it.
 
     Returns the refusal response, or ``None`` when the write may proceed.
     """
@@ -495,20 +713,225 @@ async def api_chat_tag_create(request: web.Request) -> web.Response:
     if not isinstance(status_raw, bool):
         return web.json_response({"error": "invalid status", "code": "invalid_status"}, status=400)
     status = status_raw
+    record_protected_identity = rl_source == "dashboard" and is_owner_dashboard_request(request)
     try:
-        tag = await create_tag_definition_off_loop(state, name, color, status=status)
-    except Exception:
+        tag = await create_tag_definition_off_loop(
+            state,
+            name,
+            color,
+            status=status,
+            record_protected_identity=record_protected_identity,
+        )
+    except Exception as exc:
         logger.warning("tag create failed to persist: %s", name)
+        # A closed grant-store write gate is a refused permission decision; any
+        # other failure is an errored write. Both reach the SEL like the
+        # sibling PATCH and adoption refusals.
+        if isinstance(exc, TagGrantStoreBlocked):
+            outcome, reason = "denied", f"grant store {exc.blocked}"
+        else:
+            outcome, reason = "error", "persist failed"
+        sel().log_api_access(
+            caller=rl_caller,
+            operation="chat.tag_create",
+            outcome=outcome,
+            source=rl_source,
+            error=reason,
+        )
         return web.json_response({"error": "persist failed", "code": "persist_failed"}, status=500)
     state.push_slots_update()
     sel().log_api_access(
-        caller="dashboard",
+        caller=rl_caller,
         operation="chat.tag_create",
         outcome="allowed",
-        source="dashboard",
+        source=rl_source,
         resources=str(tag["id"]),
     )
     return web.json_response(tag, status=201)
+
+
+async def api_chat_tag_adopt(request: web.Request) -> web.Response:
+    """POST /api/chat/tags/{id}/adopt — record protected identity only."""
+    state: DashboardState = request.app["state"]
+    tid = request.match_info["id"]
+    source, caller = request_origin(request, what="tag adoption", log=logger)
+    member_principal = str(request.get(MEMBER_CHAT_PRINCIPAL_KEY) or "")
+
+    if (
+        source != "dashboard"
+        or member_principal.startswith("member:")
+        or not is_owner_dashboard_request(request)
+    ):
+        sel().log_api_access(
+            caller=caller,
+            operation="chat.tag_adopt",
+            outcome="denied",
+            source="owner_only",
+            resources=tid,
+            error="tag adoption requires the dashboard owner",
+        )
+        # The shared owner-gate tail: a signed pre-owner session gets the
+        # 401 re-sign-in relabel instead of a dead-end 403.
+        return _owner_denial_response(
+            request,
+            "Only the dashboard owner can allow agents to use this tag.",
+            "owner_required",
+        )
+
+    def _audit_refused(reason: str, outcome: str = "denied") -> None:
+        # Every adoption outcome is a decision over agent authority, so each
+        # refusal and failure past the owner check leaves an SEL record too.
+        sel().log_api_access(
+            caller=caller,
+            operation="chat.tag_adopt",
+            outcome=outcome,
+            source="dashboard",
+            resources=tid,
+            error=reason,
+        )
+
+    body, body_err = await read_bounded_json(request)
+    if body_err is not None:
+        _audit_refused("unreadable request body")
+        return body_err
+    assert body is not None
+    if set(body) != {"status"}:
+        _audit_refused("request carries fields other than status")
+        return web.json_response(
+            {
+                "error": "This action accepts only the tag's current status.",
+                "code": "invalid_adoption",
+            },
+            status=400,
+        )
+    status = body["status"]
+    if not isinstance(status, bool):
+        _audit_refused("status is not a boolean")
+        return web.json_response(
+            {"error": "Tag status must be true or false.", "code": "invalid_status"},
+            status=400,
+        )
+    if not is_grantable_tag_id(tid):
+        _audit_refused("tag id is not grantable")
+        return web.json_response(
+            {
+                "error": "This tag cannot be enabled for agents.",
+                "code": "tag_id_not_grantable",
+            },
+            status=400,
+        )
+
+    async with _tags_write_lock(state):
+        tag = _tag_by_id(state, tid)
+        if tag is None:
+            _audit_refused("tag not found")
+            return web.json_response({"error": "Tag not found.", "code": "not_found"}, status=404)
+        current_status = tag.get("status", False)
+        # A legacy row can carry a non-boolean status that PATCH refuses to
+        # touch until the tag is adopted; the owner's explicit boolean here is
+        # its correction, so adoption normalizes it instead of refusing.
+        normalize_status = not isinstance(current_status, bool)
+        if not normalize_status and current_status is not status:
+            _audit_refused("tag status changed since it was shown")
+            return web.json_response(
+                {
+                    "error": "The tag changed. Review it and try adoption again.",
+                    "code": "tag_changed",
+                },
+                status=409,
+            )
+
+        await asyncio.to_thread(refresh_cache)
+        degraded = store_write_blocked()
+        if degraded is not None:
+            logger.warning("tag adoption: permission data unavailable (%s) for %s", degraded, tid)
+            _audit_refused(f"grant store {degraded}")
+            return web.json_response(
+                {
+                    "error": "Agent permissions cannot be changed right now.",
+                    "code": "persist_failed",
+                },
+                status=500,
+            )
+        if normalize_status:
+            # The vocabulary write goes FIRST, before any identity exists: the
+            # owner's explicit boolean corrects a legacy non-boolean status and
+            # grants nothing on its own. If it fails, nothing protected was
+            # written, so the 5xx leaves the tag rowless with its adopt action.
+            # If the mint below then fails, the tag is a rowless legacy tag with
+            # a valid boolean status, which adoption handles on retry.
+            pre_snapshot = [dict(t) for t in state._tags]
+            tag["status"] = status
+            try:
+                await asyncio.to_thread(_write_tags_snapshot, state, [dict(t) for t in state._tags])
+            except Exception:
+                state._tags = pre_snapshot
+                logger.warning("tag adoption: status normalization failed for %s", tid)
+                _audit_refused("status normalization failed", outcome="error")
+                return web.json_response(
+                    {
+                        "error": "Agents could not be enabled for this tag.",
+                        "code": "persist_failed",
+                    },
+                    status=500,
+                )
+
+        _policy, _recorded_status, row_exists = resolve_grant_record(tid)
+        if not row_exists:
+            try:
+                await asyncio.to_thread(mint_grant, tid, policy="none", status=status)
+            except Exception:
+                await asyncio.to_thread(refresh_cache)
+                policy, recorded_status, row_exists = resolve_grant_record(tid)
+                committed = (
+                    store_write_blocked() is None
+                    and row_exists
+                    and (policy, recorded_status) == ("none", status)
+                )
+                if not committed:
+                    logger.warning("tag adoption: identity mint failed for %s", tid, exc_info=True)
+                    _audit_refused("identity mint failed", outcome="error")
+                    return web.json_response(
+                        {
+                            "error": "Agents could not be enabled for this tag.",
+                            "code": "persist_failed",
+                        },
+                        status=500,
+                    )
+
+        response_row = _project_agent_tag(tag, None)
+
+    sel().log_api_access(
+        caller=caller,
+        operation="chat.tag_adopt",
+        outcome="allowed",
+        source="dashboard",
+        resources=tid,
+    )
+    return web.json_response(response_row)
+
+
+def _audit_tag_update_denied(
+    request: web.Request, tid: str, reason: str, *, outcome: str = "denied"
+) -> None:
+    """Record a refused or failed status/policy PATCH on the SEL.
+
+    The provenance and grant-store refusals are permission decisions over agent
+    authority, reached by every rowless legacy tag, and a failed grant write is
+    an outcome of one, so each leaves the same audit trail as an allowed update
+    (``outcome="error"`` for a failed write). ``request_origin`` supplies the
+    interface ``source`` and the validated caller (browser or a named MCP
+    component).
+    """
+    source, caller = request_origin(request, what="tag update", log=logger)
+    sel().log_api_access(
+        caller=caller,
+        operation="chat.tag_update",
+        outcome=outcome,
+        source=source,
+        resources=tid,
+        error=reason,
+    )
 
 
 async def api_chat_tag_update(request: web.Request) -> web.Response:
@@ -590,136 +1013,81 @@ async def api_chat_tag_update(request: web.Request) -> web.Response:
             tag["status"] = body["status"]
 
         # ── Grant transition (protected store) ──────────────────────────────
-        # Derived from the PATCH intent: an explicit ``agent`` value wins;
-        # otherwise a ``status`` flip KEEPS the policy already recorded in the
-        # protected store, and only a tag with no protected record at all takes
-        # the out-of-the-box default (``add-remove``, the same one the create
-        # path mints). A status-inclusive PATCH that re-sends a tag's fields
-        # without ``agent`` — the ordinary form-edit shape — must therefore
-        # never widen a human-only ``none`` row into agent write.
-        # ``agent: "none"`` MINTS a policy-none row rather than revoking, so a
-        # human-only workflow state keeps its recorded STATUS bit (revoking
-        # would let set_state persist two exclusive states);
-        # revocation is reserved for status REMOVAL (and tag deletion).
-        # Ordering is fail-closed by construction: the OLD row is revoked
-        # before the vocabulary persist (a store failure aborts the PATCH),
-        # and the replacement row is minted after it — with a mint failure
-        # surfaced as HTTP 500, never swallowed, so a narrowing PATCH
-        # (add-remove -> add-only) can never report success while the broader
-        # authority silently survives. Between revoke and mint
-        # the tag resolves to ("none", False): closed, never open.
+        # An explicit ``agent`` value wins. Otherwise enabling status preserves
+        # the existing policy, while disabling status resets policy to ``none``.
+        # Every transition requires a healthy identity row, so a rowless legacy or
+        # hand-planted tag stays human-only until the dashboard owner explicitly
+        # adopts it. ``agent: "none"`` and status removal keep the row;
+        # revocation is reserved for deletion.
         #
-        # ``prev`` is read first: it decides the status-flip policy, and it is
-        # also the restore point — a failure after the up-front revoke must put
-        # the prior grant back rather than leave it permanently revoked.
+        # ``prev_grant`` is captured from one immutable snapshot before any
+        # write. It supplies both the inherited policy and the compensation
+        # value if a later durable step fails.
         prev_grant: tuple[str, bool] = ("none", False)
         prev_row_exists = False
+        grant_store_problem: str | None = None
         if "agent" in body or "status" in body:
             await asyncio.to_thread(refresh_cache)
-            prev_grant = resolve_grant(tid)
-            prev_row_exists = has_grant_row(tid)
+            prev_policy, prev_status, prev_row_exists = resolve_grant_record(tid)
+            prev_grant = (prev_policy, prev_status)
+            grant_store_problem = store_write_blocked()
         grant_mint: str | None = None
-        grant_revoke = False
         if "agent" in body:
             grant_mint = body["agent"]
         elif "status" in body:
-            if body["status"]:
-                grant_mint = prev_grant[0] if prev_row_exists else "add-remove"
-            else:
-                grant_revoke = True
-        if grant_mint is not None and not is_grantable_tag_id(tid):
-            # The id is not one the dashboard ever minted (12 hex chars) and not
-            # a built-in default, so it was hand-written into agent-writable
-            # tags.json. The human approving this PATCH sees the tag's NAME, not
-            # its id -- and the id is what the trusted [BOARD] rail carries.
-            # Refuse the mint outright: a grant is the one thing that lets a tag
-            # onto that rail, so a planted id never acquires one. Recovery is to
-            # recreate the tag from the dashboard, which mints a real id.
+            grant_mint = prev_grant[0] if body["status"] else "none"
+        if grant_mint is not None and (
+            not is_grantable_tag_id(tid) or (grant_store_problem is None and not prev_row_exists)
+        ):
+            # Closed syntax constrains the trusted rail but does not prove who
+            # created an id. A grammar-valid row in agent-writable tags.json is
+            # still untrusted until dashboard create records protected identity.
             state._tags = pre_snapshot
+            _audit_tag_update_denied(request, tid, "tag has no protected identity")
             return web.json_response(
                 {
-                    "error": "this tag id was not created by the dashboard; "
-                    "recreate the tag to grant it",
+                    # Name the tag manager's own adoption control
+                    # (``components.tagManagerList.adopt_tag``) so the reason
+                    # points at a button that exists.
+                    "error": "This tag is not set up for agents yet. "
+                    "Choose Set up agent permissions first.",
                     "code": "tag_id_not_grantable",
                 },
                 status=400,
             )
-
-        # The status bit recorded with a mint comes from the validated PATCH
-        # body when supplied, otherwise from the EXISTING protected grant —
-        # NEVER from agent-writable tags.json, whose ``status`` field an agent
-        # can set to launder workflow-state authority through an agent-policy
-        # PATCH.
-        if grant_mint is not None and "status" not in body and not prev_row_exists:
-            # No protected status record exists to inherit from (an upgraded
-            # store, or a tag never minted — distinct from a minted none-row,
-            # which IS a record and carries its bit). Defaulting either way is
-            # wrong: True would launder workflow-state authority from
-            # agent-writable tags.json; False silently strips a status tag's
-            # identity, letting ``add`` bypass exclusive-peer stripping so two
-            # workflow states persist. Push the decision to the
-            # authenticated caller: the PATCH must say which it is.
+        if grant_mint is not None and grant_store_problem is not None:
             state._tags = pre_snapshot
+            logger.warning("tag update: grant store %s for %s", grant_store_problem, tid)
+            _audit_tag_update_denied(request, tid, f"grant store {grant_store_problem}")
             return web.json_response(
-                {
-                    "error": "this tag has no protected status record; "
-                    "include an explicit 'status' in the update",
-                    "code": "status_required",
-                },
-                status=400,
+                {"error": "persist failed", "code": "persist_failed"}, status=500
             )
+
+        # The status bit comes from validated PATCH input when present and from
+        # the protected row otherwise, never from agent-writable tags.json.
         mint_status = bool(body["status"]) if "status" in body else prev_grant[1]
 
         async def _restore_prev_grant() -> None:
-            # Best-effort compensation: put the pre-PATCH grant state back after a
-            # downstream failure. ONLY when this PATCH touched the grant store:
-            # a metadata-only PATCH (name/colour/order) never captured the prior
-            # row, so "no prior row" would be a fiction here and acting on it
-            # would revoke the tag's real grant behind a 500. Keyed on row
-            # EXISTENCE, not the resolved tuple — a minted ("none", False) row is
-            # protected state (it carries the status-identity bit) and skipping
-            # its restoration would delete it. A tag that had NO row gets none
-            # back: the identity-preserving downgrade row minted for the write
-            # window must not outlive a PATCH that reported failure.
-            if grant_mint is None and not grant_revoke:
+            # Best-effort compensation restores the pre-PATCH row after a
+            # downstream failure. Every transition requires an existing row,
+            # including a policy-none identity row.
+            if grant_mint is None:
                 return
             try:
-                if prev_row_exists:
-                    await asyncio.to_thread(
-                        mint_grant, tid, policy=prev_grant[0], status=prev_grant[1]
-                    )
-                else:
-                    await asyncio.to_thread(revoke_grant, tid)
+                await asyncio.to_thread(mint_grant, tid, policy=prev_grant[0], status=prev_grant[1])
             except Exception:
                 logger.warning("tag update: grant restore failed for %s", tid, exc_info=True)
 
-        if grant_revoke:
-            # A revoke IS the operation: do it before the vocabulary commit so a
-            # store failure after that commit leaves the tag closed, not
-            # stale-open.
-            try:
-                await asyncio.to_thread(revoke_grant, tid)
-            except Exception:
-                state._tags = pre_snapshot
-                logger.warning("tag update: grant revoke failed for %s", tid, exc_info=True)
-                return web.json_response(
-                    {"error": "persist failed", "code": "persist_failed"}, status=500
-                )
-        elif grant_mint is not None:
-            # A mint is a two-store transition, and a process kill between the
-            # two writes is an ordinary event. Fail closed on AUTHORITY but keep
-            # IDENTITY: downgrade the row to ``("none", <status>)`` before the
-            # vocabulary commit. A crash anywhere in the window then leaves a
-            # row that grants nothing and still says whether the tag is a
-            # workflow state, so the applier keeps enforcing exclusivity
-            # instead of reading the tag as a plain label. The final
-            # ``mint_grant`` below is an upsert on the same id, so no revoke is
-            # ever needed on this path.
+        if grant_mint is not None:
+            # A process kill between the two stores must fail closed on
+            # authority while retaining identity. Downgrade before committing
+            # the vocabulary; the final mint is an upsert on the same row.
             try:
                 await asyncio.to_thread(mint_grant, tid, policy="none", status=mint_status)
             except Exception:
                 state._tags = pre_snapshot
                 logger.warning("tag update: grant downgrade failed for %s", tid, exc_info=True)
+                _audit_tag_update_denied(request, tid, "grant downgrade failed", outcome="error")
                 return web.json_response(
                     {"error": "persist failed", "code": "persist_failed"}, status=500
                 )
@@ -731,6 +1099,8 @@ async def api_chat_tag_update(request: web.Request) -> web.Response:
             state._tags = pre_snapshot
             await _restore_prev_grant()
             logger.warning("tag update failed to persist: %s", tid)
+            if grant_mint is not None:
+                _audit_tag_update_denied(request, tid, "vocabulary persist failed", outcome="error")
             return web.json_response(
                 {"error": "persist failed", "code": "persist_failed"}, status=500
             )
@@ -738,25 +1108,34 @@ async def api_chat_tag_update(request: web.Request) -> web.Response:
             try:
                 await asyncio.to_thread(mint_grant, tid, policy=grant_mint, status=mint_status)
             except Exception:
-                # A failed PATCH must be a no-op on BOTH stores: put the prior
-                # grant back AND roll the vocabulary back
-                # to the pre-PATCH snapshot in memory and on disk — without
-                # the disk write the 500 would leave the rename/status change
-                # durable while reporting failure. The
-                # rollback write is best-effort: if it also fails, memory is
-                # rolled back and the periodic persist reconverges the file.
-                await _restore_prev_grant()
-                state._tags = pre_snapshot
-                try:
-                    await asyncio.to_thread(
-                        _write_tags_snapshot, state, [dict(t) for t in pre_snapshot]
-                    )
-                except Exception:
-                    logger.warning("tag update: vocab rollback persist failed for %s", tid)
-                logger.warning("tag update: grant mint failed for %s", tid, exc_info=True)
-                return web.json_response(
-                    {"error": "persist failed", "code": "persist_failed"}, status=500
+                # A writer can commit before surfacing a late I/O error. Resolve
+                # the durable row before compensating: restoring the prior row
+                # here would discard a replacement that already committed.
+                await asyncio.to_thread(refresh_cache)
+                committed_policy, committed_status, committed_row = resolve_grant_record(tid)
+                mint_committed = (
+                    store_write_blocked() is None
+                    and committed_row
+                    and (committed_policy, committed_status) == (grant_mint, mint_status)
                 )
+                if mint_committed:
+                    logger.warning(
+                        "tag update: grant mint reported failure after commit for %s", tid
+                    )
+                else:
+                    await _restore_prev_grant()
+                    state._tags = pre_snapshot
+                    try:
+                        await asyncio.to_thread(
+                            _write_tags_snapshot, state, [dict(t) for t in pre_snapshot]
+                        )
+                    except Exception:
+                        logger.warning("tag update: vocab rollback persist failed for %s", tid)
+                    logger.warning("tag update: grant mint failed for %s", tid, exc_info=True)
+                    _audit_tag_update_denied(request, tid, "grant mint failed", outcome="error")
+                    return web.json_response(
+                        {"error": "persist failed", "code": "persist_failed"}, status=500
+                    )
         updated = tag
 
     state.push_slots_update()
@@ -978,20 +1357,8 @@ async def api_chat_slot_tags(request: web.Request) -> web.Response:
     if refused is not None:
         return refused
     request_app = effective_request_app(state, request)
-    if request_app and getattr(slot, "_app", "") != request_app:
-        sel().log_api_access(
-            caller=request_app,
-            operation="chat.slot_tags",
-            outcome="denied",
-            source="app_isolation",
-            resources=f"slot={slot.key}",
-            error=(
-                "app cannot access unscoped slots"
-                if not getattr(slot, "_app", "")
-                else "app does not own this slot"
-            ),
-        )
-        return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
+    if (denied := deny_app_slot_access(request_app, slot, slot.key, "chat.slot_tags")) is not None:
+        return denied
     # Capture the transcript key the lookup above just covered, BEFORE the
     # body-parse and lock awaits: ``linked_session_key`` is rebound on
     # already-live slots with no ``running`` gate (cron completions, workflow
@@ -1006,15 +1373,10 @@ async def api_chat_slot_tags(request: web.Request) -> web.Response:
     # carry an app's tags into a conversation it cannot be shown to own. Same
     # indistinguishable 404, for the same reason.
     if not app_owns_transcript(state._slots, request_app, authorized_history_key):
-        sel().log_api_access(
-            caller=request_app,
-            operation="chat.slot_tags",
-            outcome="denied",
-            source="app_isolation",
-            resources=f"slot={slot.key}",
-            error="app does not own this slot's transcript",
+        audit_app_slot_denial(
+            request_app, "chat.slot_tags", slot.key, "app does not own this slot's transcript"
         )
-        return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
+        return slot_not_found()
     body, body_err = await read_bounded_json(request)
     if body_err is not None:
         return body_err
@@ -1037,6 +1399,49 @@ async def api_chat_slot_tags(request: web.Request) -> web.Response:
             status=400,
         )
     base_tags_revision: str | None = raw_base or None
+
+    # The agent tag-grants policy applies to every NON-PERSON caller: the
+    # browser is the person, who may set or strip any tag — the whole grants
+    # store exists to constrain what an AGENT may do to a session's tags, not
+    # the owner. ``chat_tag`` ``set_state`` enforces it, and this
+    # wholesale-replace route (which ``chat_tag_assign`` reaches) must too, or
+    # the policy is bypassable here. Deny-by-default on identity: an agent is
+    # gated unless POSITIVELY confirmed to be the person. Three non-person
+    # signals, any one of which gates — the transport alone is not enough,
+    # because an app token declaring ``/api/chat/*`` reaches this route over the
+    # browser transport with NO ``X-Internal-Secret`` yet is still an agent:
+    #   * ``request_origin`` source != ``"dashboard"`` — the internal-secret
+    #     (managed MCP) transport, whose secret the token-auth middleware has
+    #     already verified;
+    #   * a resolved app claim (``effective_request_app`` / ``request_app``) —
+    #     an app token acting as a non-person principal;
+    #   * an admitted crew-member principal (``member:<store>``).
+    origin_source, origin_caller = request_origin(request, what="slot tags", log=logger)
+    member_principal = str(request.get(MEMBER_CHAT_PRINCIPAL_KEY) or "")
+    is_internal_caller = (
+        origin_source != "dashboard" or bool(request_app) or member_principal.startswith("member:")
+    )
+    # These three are the non-person principal representations the auth layer
+    # produces for this route: the internal-secret transport, a resolved app
+    # claim, and an admitted member principal. The gate decides "person" by
+    # their ABSENCE. The mint path's positive predicate
+    # (``is_owner_dashboard_request``) is deliberately NOT used here: it also
+    # requires an owner ``user`` claim, which only becomes reliably present once
+    # ``KIROCREW_OWNER_ID`` is configured, so keying the gate on it would GATE
+    # THE PERSON on a no-owner / local install — a regression with no security
+    # value, since the person is who the store exists to leave unconstrained.
+    # The enumeration is the accepted contract, matching the three
+    # representations the sibling ``member_slot_write_refused`` and
+    # app-isolation fences key on; it is guarded by convention plus the
+    # co-located pin test ``test_non_person_signal_enumeration_each_leg_gates``,
+    # NOT by an automatic tripwire — a NEW principal representation added to the
+    # auth layer must be added to this enumeration (and that test) deliberately.
+    # Pull the grants store read+parse off the event loop ONCE, BEFORE the lock,
+    # so the atomic snapshot captured in-lock below serves the installed
+    # in-memory cache (the snapshot is cache-only and touches no filesystem).
+    # Only agent callers consult it, so skip the thread hop for the browser.
+    if is_internal_caller:
+        await asyncio.to_thread(refresh_cache)
 
     async with _tags_write_lock(state):
         valid_ids = {t.get("id") for t in state._tags}
@@ -1091,6 +1496,74 @@ async def api_chat_slot_tags(request: web.Request) -> web.Response:
                 },
                 status=409,
             )
+        # Agent tag-grants policy for non-person callers. The requested list is
+        # a wholesale replace, so the add/remove the caller is asking for is the
+        # DIFF against the slot's CURRENT tags — read FRESH inside the lock, the
+        # same discipline the rest of this write span uses, so a concurrent
+        # change cannot make us gate a stale delta. The person (browser) is
+        # never gated; it reached ``is_internal_caller`` False and skips this
+        # entirely. ONE atomic grants snapshot (store health + rows together)
+        # is captured here and threaded through the gate, so a concurrent cache
+        # refresh cannot swap the store's health out from under a row lookup.
+        if is_internal_caller:
+            snapshot = await asyncio.to_thread(capture_grants_snapshot)
+            current_ids = list(getattr(slot, "tags", None) or [])
+            by_id = {
+                t.get("id"): t
+                for t in state._tags
+                if isinstance(t, dict) and isinstance(t.get("id"), str)
+            }
+            current_set = set(current_ids)
+            new_set = set(new_tags)
+            # Fail closed on a REMOVAL we cannot resolve. An id on the slot that
+            # is being dropped (in current, not in new) but is absent from the
+            # live vocabulary cannot be checked for a reservation — and when the
+            # vocabulary is NON-AUTHORITATIVE (``tags.json`` was unreadable at
+            # boot, so ``state._tags`` is empty while protected rows persist), a
+            # tag the owner reserved sits exactly here: on the slot, out of
+            # ``by_id``. ``new_tags`` is already filtered to the (empty)
+            # vocabulary so the tag can never be re-listed, and a diff built only
+            # from ``by_id`` would silently omit the removal and persist it with
+            # no grants check. Refuse rather than strip a reservation we cannot
+            # see. When the vocabulary IS authoritative, an absent current id is
+            # a dangling reference to a deleted tag — benign to drop.
+            vocab_authoritative = getattr(state, "_tags_authoritative", True)
+            if not vocab_authoritative:
+                unresolved_removed = [i for i in current_ids if i not in new_set and i not in by_id]
+                if unresolved_removed:
+                    sel().log_api_access(
+                        caller=request_app or member_principal or origin_caller,
+                        operation="chat.slot_tags",
+                        outcome="denied",
+                        source="app_isolation",
+                        resources=f"slot={slot.key} tag={unresolved_removed[0]}",
+                        error="tag_grants_unavailable",
+                    )
+                    return web.json_response(
+                        {
+                            "error": f"tag_grants_unavailable:{unresolved_removed[0]}",
+                            "code": "tag_grants_unavailable",
+                        },
+                        status=403,
+                    )
+            added = [by_id[i] for i in new_tags if i not in current_set and i in by_id]
+            removed = [by_id[i] for i in current_ids if i not in new_set and i in by_id]
+            result = [by_id[i] for i in new_tags if i in by_id]
+            refusal = agent_tag_change_refusal(added, removed, result, snapshot)
+            if refusal is not None:
+                code, tag_id = refusal
+                sel().log_api_access(
+                    caller=request_app or member_principal or origin_caller,
+                    operation="chat.slot_tags",
+                    outcome="denied",
+                    source="app_isolation",
+                    resources=f"slot={slot.key}" + (f" tag={tag_id}" if tag_id else ""),
+                    error=code,
+                )
+                return web.json_response(
+                    {"error": f"{code}:{tag_id}" if tag_id else code, "code": code},
+                    status=403,
+                )
         prior_tags = slot.tags
         prior_tags_revision = slot.tags_revision
         slot.tags = new_tags
@@ -1269,9 +1742,41 @@ def _state_lane_owner(
     return None
 
 
+def _tag_column_twin(state: DashboardState, column: dict) -> dict | None:
+    """The existing tag column that shows exactly what *column* would.
+
+    Same name (case-insensitive), tag list, mode and ``include_untagged``: a
+    column that also shows untagged sessions is a different view, so it is not
+    a twin. ``tag_columns.json`` is loaded verbatim, so a persisted ``tag_ids``
+    that is not a list is simply not a match rather than an error.
+    """
+    want_name = str(column.get("name") or "").strip().lower()
+    want_ids = list(column.get("tag_ids") or [])
+    for col in state._tag_boards:
+        if col.get("source", "tags") != "tags":
+            continue
+        if str(col.get("name") or "").strip().lower() != want_name:
+            continue
+        have_ids = col.get("tag_ids")
+        if not isinstance(have_ids, list) or have_ids != want_ids:
+            continue
+        if str(col.get("mode") or "any") != str(column.get("mode") or "any"):
+            continue
+        if bool(col.get("include_untagged")) != bool(column.get("include_untagged")):
+            continue
+        return col
+    return None
+
+
 async def api_chat_tag_column_create(request: web.Request) -> web.Response:
     """POST /api/chat/tag-columns — append a new sidebar column."""
     state: DashboardState = request.app["state"]
+    refused = _refuse_vocabulary_write(state, request, "chat.tag_column_create")
+    if refused is not None:
+        return refused
+    # The create budget is charged further down, only on an actual append, so
+    # an ``ensure`` retry that finds its twin (or an existing lane) costs nothing.
+    rl_source, rl_caller = request_origin(request, what="tag column write", log=logger)
     body, body_err = await read_bounded_json(request)
     if body_err is not None:
         return body_err
@@ -1292,13 +1797,48 @@ async def api_chat_tag_column_create(request: web.Request) -> web.Response:
             if owner is not None:
                 existing = dict(owner)
                 sel().log_api_access(
-                    caller="dashboard",
+                    caller=rl_caller,
                     operation="chat.tag_column_create",
                     outcome="allowed",
-                    source="dashboard",
+                    source=rl_source,
                     resources=f"{existing.get('id')} (existing lane {column['state_key']})",
                 )
                 return web.json_response(existing, status=200)
+        elif body.get("ensure") is True and column["name"]:
+            # Opt-in ENSURE for a named tag column, decided under the lock for
+            # the reason the lane branch above is: a client-side "does it
+            # exist" check reads a list that can be stale, so two agents
+            # retrying the same create would both append. The board UI never
+            # sends ``ensure`` (it adds unnamed columns on purpose), so its
+            # append-always behaviour is unchanged.
+            match = _tag_column_twin(state, column)
+            if match is not None:
+                sel().log_api_access(
+                    caller=rl_caller,
+                    operation="chat.tag_column_create",
+                    outcome="allowed",
+                    source=rl_source,
+                    resources=f"{match.get('id')} (existing column)",
+                )
+                return web.json_response(dict(match), status=200)
+        # The same per-caller create budget as a tag: the board is as shared and
+        # as unbounded as the vocabulary, and the browser is exempt for the same
+        # reason (a person clicking is not the loop this bounds).
+        if rl_source != "dashboard" and not allow_create(TAG_COLUMN_CREATE, rl_caller):
+            sel().log_api_access(
+                caller=rl_caller,
+                operation="chat.tag_column_create",
+                outcome="denied",
+                source=rl_source,
+                error="create rate limited",
+            )
+            return web.json_response(
+                {
+                    "error": "too many board columns created recently; retry shortly",
+                    "code": "create_rate_limited",
+                },
+                status=429,
+            )
         column["id"] = uuid.uuid4().hex[:12]
         state._tag_boards.append(column)
         boards_snap = [dict(c) for c in state._tag_boards]
@@ -1311,10 +1851,10 @@ async def api_chat_tag_column_create(request: web.Request) -> web.Response:
                 {"error": "persist failed", "code": "persist_failed"}, status=500
             )
     sel().log_api_access(
-        caller="dashboard",
+        caller=rl_caller,
         operation="chat.tag_column_create",
         outcome="allowed",
-        source="dashboard",
+        source=rl_source,
         resources=str(column["id"]),
     )
     return web.json_response(column, status=201)
@@ -1323,6 +1863,10 @@ async def api_chat_tag_column_create(request: web.Request) -> web.Response:
 async def api_chat_tag_column_update(request: web.Request) -> web.Response:
     """PATCH /api/chat/tag-columns/{id} — rename / retag / reorder."""
     state: DashboardState = request.app["state"]
+    refused = _refuse_vocabulary_write(state, request, "chat.tag_column_update")
+    if refused is not None:
+        return refused
+    rl_source, rl_caller = request_origin(request, what="tag column write", log=logger)
     cid = request.match_info["id"]
     column = next((c for c in state._tag_boards if c.get("id") == cid), None)
     if not column:
@@ -1348,10 +1892,10 @@ async def api_chat_tag_column_update(request: web.Request) -> web.Response:
             owner = _state_lane_owner(state, merged["state_key"], exclude_id=cid)
             if owner is not None:
                 sel().log_api_access(
-                    caller="dashboard",
+                    caller=rl_caller,
                     operation="chat.tag_column_update",
                     outcome="rejected",
-                    source="dashboard",
+                    source=rl_source,
                     resources=cid,
                     error=f"lane {merged['state_key']} already exists",
                 )
@@ -1371,10 +1915,10 @@ async def api_chat_tag_column_update(request: web.Request) -> web.Response:
                 {"error": "persist failed", "code": "persist_failed"}, status=500
             )
     sel().log_api_access(
-        caller="dashboard",
+        caller=rl_caller,
         operation="chat.tag_column_update",
         outcome="allowed",
-        source="dashboard",
+        source=rl_source,
         resources=cid,
     )
     return web.json_response(column)
@@ -1383,6 +1927,10 @@ async def api_chat_tag_column_update(request: web.Request) -> web.Response:
 async def api_chat_tag_column_delete(request: web.Request) -> web.Response:
     """DELETE /api/chat/tag-columns/{id} — remove a column."""
     state: DashboardState = request.app["state"]
+    refused = _refuse_vocabulary_write(state, request, "chat.tag_column_delete")
+    if refused is not None:
+        return refused
+    rl_source, rl_caller = request_origin(request, what="tag column write", log=logger)
     cid = request.match_info["id"]
     if not any(c.get("id") == cid for c in state._tag_boards):
         return web.json_response({"error": "not found", "code": "not_found"}, status=404)
@@ -1402,10 +1950,10 @@ async def api_chat_tag_column_delete(request: web.Request) -> web.Response:
                 {"error": "persist failed", "code": "persist_failed"}, status=500
             )
     sel().log_api_access(
-        caller="dashboard",
+        caller=rl_caller,
         operation="chat.tag_column_delete",
         outcome="allowed",
-        source="dashboard",
+        source=rl_source,
         resources=cid,
     )
     return web.json_response({"ok": True})
@@ -1414,6 +1962,10 @@ async def api_chat_tag_column_delete(request: web.Request) -> web.Response:
 async def api_chat_tag_columns_reorder(request: web.Request) -> web.Response:
     """PUT /api/chat/tag-columns/order — reorder columns by id list."""
     state: DashboardState = request.app["state"]
+    refused = _refuse_vocabulary_write(state, request, "chat.tag_columns_reorder")
+    if refused is not None:
+        return refused
+    rl_source, rl_caller = request_origin(request, what="tag column write", log=logger)
     body, body_err = await read_bounded_json(request)
     if body_err is not None:
         return body_err
@@ -1423,7 +1975,26 @@ async def api_chat_tag_columns_reorder(request: web.Request) -> web.Response:
         return web.json_response(
             {"error": "ids must be an array", "code": "ids_not_array"}, status=400
         )
+    base_ids = body.get("base_ids")
+    if base_ids is not None and not isinstance(base_ids, list):
+        return web.json_response(
+            {"error": "base_ids must be an array", "code": "ids_not_array"}, status=400
+        )
     async with _tags_write_lock(state):
+        if base_ids is not None:
+            # Optional compare-and-set: a caller that composed ``ids`` from a read
+            # names the order it read, so a reorder the person made in between is
+            # refused rather than overwritten by a stale full list. The board UI
+            # sends no ``base_ids`` and keeps its last-write-wins drag behaviour.
+            current = [str(c.get("id")) for c in sorted(state._tag_boards, key=_order_key)]
+            if [str(x) for x in base_ids] != current:
+                return web.json_response(
+                    {
+                        "error": "the column order changed since it was read",
+                        "code": "stale_base",
+                    },
+                    status=409,
+                )
         original_order = [(col.get("id"), col.get("order", 0)) for col in state._tag_boards]
         order_map = {str(cid): i for i, cid in enumerate(ids)}
         # Push columns not present in the reorder payload past the explicit
@@ -1453,10 +2024,10 @@ async def api_chat_tag_columns_reorder(request: web.Request) -> web.Response:
                 {"error": "persist failed", "code": "persist_failed"}, status=500
             )
     sel().log_api_access(
-        caller="dashboard",
+        caller=rl_caller,
         operation="chat.tag_columns_reorder",
         outcome="allowed",
-        source="dashboard",
+        source=rl_source,
         resources=",".join(str(x) for x in ids[:10]),
     )
     return web.json_response({"ok": True})

@@ -199,6 +199,36 @@ describe('ArtifactDetailPage companion chat', () => {
     await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-new'))
   })
 
+  it('picks the most recent by INSTANT, not by timestamp text', async () => {
+    // The test above cannot catch the defect this pins: both its stamps are
+    // `…Z`, so text order and instant order agree and either implementation
+    // passes. `last_activity_ts` is forwarded verbatim from the transcript row
+    // that produced it, and the backend states those rows do NOT share one
+    // format (`history.transcript_sort_key`). Two aware stamps written under
+    // different offsets are enough to separate the two orderings: `09:00+08:00`
+    // is 01:00Z and `02:30+00:00` is 02:30Z, so the LATER session carries the
+    // SMALLER string and a text compare resumes the stale conversation.
+    //
+    // Both values carry an offset, so they resolve to the same two instants on
+    // any runner — this does not depend on the host timezone.
+    const EARLIER = '2026-09-14T09:00:00+08:00'
+    const LATER = '2026-09-14T02:30:00+00:00'
+    expect(EARLIER.localeCompare(LATER)).toBeGreaterThan(0)
+    expect(Date.parse(EARLIER)).toBeLessThan(Date.parse(LATER))
+
+    const store = createTestStore()
+    seedSlots(store, [
+      mkSlot({ key: 'chat-stale', artifact: 'cr-queue', last_activity_ts: EARLIER }),
+      mkSlot({ key: 'chat-live', artifact: 'cr-queue', last_activity_ts: LATER }),
+    ])
+    renderPage(false, store)
+    await waitForLoaded()
+    fireEvent.click(screen.getByLabelText('Toggle agent chat'))
+    await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-live'))
+    // Resumed, not replaced: a wrong pick that also created would hide itself.
+    expect(vi.mocked(api).createChatSlot).not.toHaveBeenCalled()
+  })
+
   // ── panel state machine ─────────────────────────────────────────────────────
 
   it('toggles the chat panel closed on a second click, keeping the session', async () => {
@@ -307,6 +337,20 @@ describe('ArtifactDetailPage companion chat', () => {
     await waitFor(() => expect(order).toEqual(['delete', 'create']))
     // Optimistic prune, or the resolver keeps picking the archived slot.
     expect(store.getState().dashboard.slots.some(s => s.key === 'chat-bound')).toBe(false)
+  })
+
+  it('holds the archived row out of a straggler frame that predates the pop (#11255)', async () => {
+    const store = createTestStore()
+    seedSlots(store, [mkSlot({ key: 'chat-bound', artifact: 'cr-queue' })])
+    renderPage(false, store)
+    await waitForLoaded()
+    fireEvent.click(screen.getByLabelText('Toggle agent chat'))
+    await waitFor(() => expect(screen.getByTestId('chat-page')).toBeInTheDocument())
+    fireEvent.click(screen.getByLabelText('New chat'))
+    await waitFor(() => expect(vi.mocked(api).createChatSlot).toHaveBeenCalledTimes(1))
+    expect(store.getState().dashboard.closingSlots['chat-bound']).toBeDefined()
+    seedSlots(store, [mkSlot({ key: 'chat-bound', artifact: 'cr-queue' }), mkSlot({ key: 'slot-new', artifact: 'cr-queue' })])
+    expect(store.getState().dashboard.slots.map(s => s.key)).toEqual(['slot-new'])
   })
 
   it('archives EVERY slot bound to the slug, not just the resolved winner', async () => {

@@ -60,9 +60,9 @@ class TestFargateLane:
             "image": "public.ecr.aws/example/kirocrew-crew-base@sha256:" + "b" * 64,
             "secrets": [
                 [
-                    "kirocrew/crew/demo/KIRO_API_KEY",
+                    "kirocrew/crew/demo/KIRO_IDENTITY",
                     "arn:aws:secretsmanager:us-east-1:123456789012:"
-                    "secret:kirocrew/crew/demo/KIRO_API_KEY-AbCdEf",
+                    "secret:kirocrew/crew/demo/KIRO_IDENTITY-AbCdEf",
                 ]
             ],
             "cpu_architecture": "X86_64",
@@ -100,6 +100,31 @@ class TestFargateLane:
         assert spec.placement.security_groups == tuple(block["security_groups"])
         assert spec.image == block["image"]
         assert spec.cpu_architecture == block["cpu_architecture"]
+
+    def test_the_configured_internal_only_claim_reaches_the_engine(self, monkeypatch, tmp_path):
+        """The wiring for the one field that LOOSENS a posture.
+
+        Asserted on the engine the provider BUILT, for the reason the bound's test gives:
+        a ``FargateConfig`` holding the right value proves nothing about a launch, and
+        this test would pass with the wiring deleted. The spec is the only place the
+        file's claim can change what a task gets.
+
+        Both directions, because the safe one is the one a deletion produces. A test that
+        only checked the claimed case would pass if the field were hardcoded true, which
+        is the failure that hands every lane an unsandboxed worker.
+        """
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+        from kiro_crew.config.loader import config_dir
+
+        self._write_config(config_dir(), {**self._complete_block(), "internal_only": True})
+        engine = DefaultRemoteProvisionerProvider().engine_for(FARGATE_PROVISIONER_ID)
+        assert engine._require_spec().internal_only is True
+
+        block = self._complete_block()
+        assert "internal_only" not in block, "the fixture must not claim it"
+        self._write_config(config_dir(), block)
+        engine = DefaultRemoteProvisionerProvider().engine_for(FARGATE_PROVISIONER_ID)
+        assert engine._require_spec().internal_only is False
 
     def test_the_configured_bound_reaches_the_engine(self, monkeypatch, tmp_path):
         """The wiring, which is the whole point: a number in the file bounds a launch.
@@ -361,14 +386,14 @@ class TestTheConfirmationReachesTheEngine:
     def _block() -> dict:
         arn = (
             "arn:aws:secretsmanager:us-east-1:123456789012:secret:"
-            "kirocrew/crew/demo/KIRO_API_KEY-abcdef"
+            "kirocrew/crew/demo/KIRO_IDENTITY-abcdef"
         )
         return {
             "cluster": "kirocrew-crew-prod",
             "subnets": ["subnet-a"],
             "security_groups": ["sg-1"],
             "image": "public.ecr.aws/example/kirocrew-crew-base@sha256:" + "a" * 64,
-            "secrets": [["kirocrew/crew/demo/KIRO_API_KEY", arn]],
+            "secrets": [["kirocrew/crew/demo/KIRO_IDENTITY", arn]],
             "cpu_architecture": "X86_64",
         }
 
@@ -446,14 +471,14 @@ class TestTheOperatorCanReadTheRecipientBeforeConfirming:
     def _block() -> dict:
         arn = (
             "arn:aws:secretsmanager:us-east-1:123456789012:secret:"
-            "kirocrew/crew/demo/KIRO_API_KEY-abcdef"
+            "kirocrew/crew/demo/KIRO_IDENTITY-abcdef"
         )
         return {
             "cluster": "kirocrew-crew-prod",
             "subnets": ["subnet-a"],
             "security_groups": ["sg-1"],
             "image": "public.ecr.aws/example/kirocrew-crew-base@sha256:" + "a" * 64,
-            "secrets": [["kirocrew/crew/demo/KIRO_API_KEY", arn]],
+            "secrets": [["kirocrew/crew/demo/KIRO_IDENTITY", arn]],
             "cpu_architecture": "X86_64",
         }
 
@@ -637,9 +662,9 @@ class TestTheAliasRefusalSitsWhereTheFileIsConsumed:
                         "image": "public.ecr.aws/x/base@sha256:" + "a" * 64,
                         "secrets": [
                             [
-                                "kirocrew/crew/demo/KIRO_API_KEY",
+                                "kirocrew/crew/demo/KIRO_IDENTITY",
                                 "arn:aws:secretsmanager:us-east-1:123456789012:secret:"
-                                "kirocrew/crew/demo/KIRO_API_KEY-abcdef",
+                                "kirocrew/crew/demo/KIRO_IDENTITY-abcdef",
                             ]
                         ],
                         "cpu_architecture": "X86_64",

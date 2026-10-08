@@ -11,9 +11,25 @@ from __future__ import annotations
 
 import contextlib
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
+from kiro_crew.dashboard.channel_handoff import (
+    HANDOFF_QUEUED,
+    HANDOFF_REFUSED,
+    HANDOFF_STEERED,
+    QUEUED_BY_CLOSE,
+    RAN_ON_SUCCESSOR,
+    REFUSED_ATTACHMENTS,
+    REFUSED_IDLE,
+    REFUSED_MOVED,
+    REFUSED_NO_SLOT,
+    REFUSED_QUEUE_FULL,
+    REFUSED_UNSAVED_CLOSE,
+    ResumedBusyOutcome,
+)
+from kiro_crew.messaging.session_resume import RoutingDecision
 from kiro_crew.teams.client import TeamsInbound
 from kiro_crew.teams.commands import COMMAND_SPEC, build_help_text, parse_command
 from kiro_crew.teams.transport_dispatch import (
@@ -54,7 +70,7 @@ class _Client:
 
     async def update_message(self, conversation_id, activity_id, content, service_url):
         self.updates.append((activity_id, content))
-        return True
+        return getattr(self, "update_ok", True)
 
     async def send_typing(self, conversation_id, service_url) -> None:
         return None
@@ -119,7 +135,7 @@ class _Sessions:
         queue = self.queues.get(key) or []
         return queue.pop(0) if queue else None
 
-    def clear_queue(self, key) -> None:
+    def clear_queue(self, key, owned_by=None) -> None:
         self.cleared.append(key)
         self.queues.pop(key, None)
 
@@ -246,6 +262,21 @@ class TestQueueReceipt:
 
         assert any("Cancelled" in body for _, body in client.updates)
 
+    @pytest.mark.asyncio
+    async def test_the_surface_reports_whether_the_edit_landed(self) -> None:
+        """The registry can only keep a refused transition retryable if the surface
+        reports the refusal -- a wrapper that swallows the client's answer makes an
+        unlanded edit indistinguishable from a durable record."""
+        sessions = _Sessions(_Provider())
+        client = _Client()
+        d = _dispatcher(sessions, client)
+        surface = d._receipt_surface(_inbound("x"))
+
+        client.update_ok = True
+        assert await surface.edit_receipt("m1", "body") is True
+        client.update_ok = False
+        assert await surface.edit_receipt("m1", "body") is False
+
 
 class TestCommandVocabulary:
     def test_every_spec_alias_parses_to_its_canonical_name(self) -> None:
@@ -293,6 +324,47 @@ class TestDrain:
         await d._drain_queue(key, _inbound("x"))
 
         assert turns == ["first\n\nsecond"], "the burst must collapse, order preserved"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("queued_person", "opener_person", "expected"),
+        [
+            # A person's queued message drains FOREGROUND whoever opened the turn.
+            (True, False, "fg"),
+            # A gateway-built inbound that reached the queue stays BACKGROUND, even
+            # behind a person's turn.
+            (False, True, "bg"),
+        ],
+    )
+    async def test_a_drained_turn_takes_the_queued_entrys_own_person_flag(
+        self, monkeypatch, queued_person, opener_person, expected
+    ) -> None:
+        """The replay is built ON the finished turn's inbound, so the opener's flag is
+        the wrong source both ways: the entry records its own at enqueue time."""
+        from dataclasses import replace
+
+        from kiro_crew.start_priority import StartPriority
+
+        priorities: list[StartPriority] = []
+
+        async def _fake_drive(turn, **kw):
+            priorities.append(turn.start_priority)
+
+        monkeypatch.setattr("kiro_crew.teams.transport_dispatch.drive_turn", _fake_drive)
+        monkeypatch.setattr(
+            "kiro_crew.teams.transport_dispatch.inbound_permitted",
+            lambda _c: _true(),
+        )
+        sessions = _Sessions(_Provider())
+        d = _dispatcher(sessions, _Client())
+        key = d._session_key(_EMAIL)
+        queued = replace(_inbound("queued"), person_origin=queued_person)
+        assert await d._enqueue_with_receipt(key, queued, "queued")
+        sessions._busy = False
+
+        await d._drain_queue(key, replace(_inbound("opener"), person_origin=opener_person))
+
+        assert priorities == [StartPriority(expected)]
 
     @pytest.mark.asyncio
     async def test_the_drained_turn_does_not_nest_another_drain(self, monkeypatch) -> None:
@@ -671,7 +743,7 @@ class TestTeamsSharesTheQueueWithOtherTransports:
         mine = self._from(_EMAIL, "CONV", "act-1")
         deferred: list[int] = []
 
-        async def _flip(session_key, surface, answered, n=0):
+        async def _flip(session_key, surface, answered, n=0, *, owner):
             deferred.append(n)
 
         monkeypatch.setattr(d._queue, "flip_answering_locked", _flip)
@@ -700,7 +772,7 @@ class TestTeamsSharesTheQueueWithOtherTransports:
         theirs = self._from("other@example.com", "CONV2", "act-2", "theirs")
         deferred: list[int] = []
 
-        async def _flip(session_key, surface, answered, n=0):
+        async def _flip(session_key, surface, answered, n=0, *, owner):
             deferred.append(n)
 
         monkeypatch.setattr(d._queue, "flip_answering_locked", _flip)
@@ -731,3 +803,161 @@ class _AddressedClient(_Client):
 
 async def _true() -> bool:
     return True
+
+
+class TestABusyResumedSession:
+    """The dashboard holds the resumed session's turn: the message goes to the slot's
+    own machinery, never to this channel's queue (base queued it THERE, to be replayed
+    into the native session by a later Teams turn), and the conversation is told."""
+
+    @staticmethod
+    def _resumed(d: TeamsDispatcher) -> None:
+        d._session_resume.route = AsyncMock(  # type: ignore[method-assign]
+            return_value=RoutingDecision(resumed_key="dashboard:chat-1")
+        )
+
+    @staticmethod
+    def _hand_off(monkeypatch, outcome, handed: list | None = None) -> None:
+        from kiro_crew.dashboard import channel_handoff
+
+        async def _hand(state, session_key, text, *, mode, has_attachments, **recipient):
+            if handed is not None:
+                handed.append((session_key, text, mode, has_attachments, recipient))
+            return outcome
+
+        monkeypatch.setattr(channel_handoff, "hand_to_resumed_slot", _hand)
+
+    @pytest.mark.asyncio
+    async def test_a_running_dashboard_turn_takes_the_message_instead(self, monkeypatch) -> None:
+        sessions = _Sessions(_Provider())
+        client = _Client()
+        d = _dispatcher(sessions, client)
+        self._resumed(d)
+        handed: list = []
+        self._hand_off(monkeypatch, ResumedBusyOutcome(HANDOFF_QUEUED), handed)
+
+        await d.handle_message(_inbound("and the weather?"))
+
+        assert handed == [
+            (
+                "dashboard:chat-1",
+                "and the weather?",
+                "steer",
+                False,
+                {"channel_type": "teams", "conversation_id": "CONV", "principal": _EMAIL},
+            )
+        ]
+        assert sessions.queues == {}
+        assert any("Queued for that session" in body for _, body, _ in client.sent)
+
+    @pytest.mark.asyncio
+    async def test_a_queued_command_reaches_the_hand_off_as_its_bare_words(
+        self, monkeypatch
+    ) -> None:
+        """``/queue /clear`` loses its directive before the hand-off, so the words
+        "/clear" alone reach the slot's queue -- where the hand-off stamps them as turn
+        content (``channel_handoff._queue_arm``), never as the dashboard command."""
+        sessions = _Sessions(_Provider())
+        client = _Client()
+        d = _dispatcher(sessions, client)
+        self._resumed(d)
+        handed: list = []
+        self._hand_off(monkeypatch, ResumedBusyOutcome(HANDOFF_QUEUED), handed)
+
+        await d.handle_message(_inbound("/queue /clear"))
+
+        assert [(h[1], h[2]) for h in handed] == [("/clear", "queue")]
+        assert sessions.queues == {}
+
+    @pytest.mark.parametrize(
+        ("outcome", "told"),
+        [
+            (ResumedBusyOutcome(HANDOFF_STEERED), "Steering that session"),
+            (ResumedBusyOutcome(HANDOFF_QUEUED), "Queued for that session"),
+            (
+                ResumedBusyOutcome(HANDOFF_QUEUED, QUEUED_BY_CLOSE),
+                "closed while your message was in flight",
+            ),
+            (ResumedBusyOutcome(HANDOFF_QUEUED, RAN_ON_SUCCESSOR), "Delivered to that session"),
+            (ResumedBusyOutcome(HANDOFF_REFUSED, REFUSED_QUEUE_FULL), "queue is full"),
+            (ResumedBusyOutcome(HANDOFF_REFUSED, REFUSED_ATTACHMENTS), "attachments cannot wait"),
+            (
+                ResumedBusyOutcome(HANDOFF_REFUSED, REFUSED_MOVED),
+                "changed while your message was in flight",
+            ),
+            (
+                ResumedBusyOutcome(HANDOFF_REFUSED, REFUSED_UNSAVED_CLOSE),
+                "had not been saved with it yet",
+            ),
+        ],
+        ids=lambda v: v if isinstance(v, str) else f"{v.kind}:{v.reason or '-'}",
+    )
+    @pytest.mark.asyncio
+    async def test_every_hand_off_outcome_is_told_to_the_conversation(
+        self, monkeypatch, outcome: ResumedBusyOutcome, told: str
+    ) -> None:
+        sessions = _Sessions(_Provider())
+        client = _Client()
+        d = _dispatcher(sessions, client)
+        self._resumed(d)
+        self._hand_off(monkeypatch, outcome)
+
+        await d.handle_message(_inbound("and the weather?"))
+
+        assert [body for _, body, _ in client.sent if told in body], client.sent
+        assert sessions.queues == {}
+
+    @pytest.mark.parametrize("reason", [REFUSED_IDLE, REFUSED_NO_SLOT])
+    @pytest.mark.asyncio
+    async def test_no_dashboard_turn_to_join_takes_the_channels_own_busy_path(
+        self, monkeypatch, reason: str
+    ) -> None:
+        """No dashboard turn is in progress to join -- an idle slot, or no open tab at
+        all -- because the turn ended in the window or Teams's own turn holds the
+        lease: the message takes the channel's busy path -- fresh turn, steer, or a
+        queued receipt that Teams's drain replays into the resumed key -- as it did
+        before the hand-off, never a refusal."""
+        sessions = _Sessions(_Provider())
+        client = _Client()
+        d = _dispatcher(sessions, client)
+        self._resumed(d)
+        self._hand_off(monkeypatch, ResumedBusyOutcome(HANDOFF_REFUSED, reason))
+        d._handle_busy = AsyncMock()  # type: ignore[method-assign]
+
+        await d.handle_message(_inbound("and the weather?"))
+
+        d._handle_busy.assert_awaited_once()
+        inbound, session_key, text, override_mode = d._handle_busy.await_args.args
+        assert (session_key, text, override_mode) == ("dashboard:chat-1", "and the weather?", None)
+        assert not any("busy with a turn started elsewhere" in body for _, body, _ in client.sent)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("reason", [REFUSED_IDLE, REFUSED_NO_SLOT])
+    async def test_a_fresh_turn_after_the_window_stays_in_the_captured_session(
+        self, monkeypatch, reason: str
+    ) -> None:
+        """The lease freed in the window AND the binding changed there too (activities
+        are concurrent tasks and ``/unlink`` is resume-exempt): the fresh turn runs
+        under the key resolved at admission, with the binding resolved exactly once,
+        never rerouted into the native session by a second ``handle_message``."""
+        sessions = _Sessions(_Provider())
+        client = _Client()
+        d = _dispatcher(sessions, client)
+        self._resumed(d)
+        route = d._session_resume.route
+
+        async def _hand(*a, **k) -> ResumedBusyOutcome:
+            sessions._busy = False  # the turn ended while the hand-off was scheduled
+            route.return_value = RoutingDecision()  # a concurrent /unlink landed
+            return ResumedBusyOutcome(HANDOFF_REFUSED, reason)
+
+        from kiro_crew.dashboard import channel_handoff
+
+        monkeypatch.setattr(channel_handoff, "hand_to_resumed_slot", _hand)
+        d._run_turn = AsyncMock()  # type: ignore[method-assign]
+
+        await d.handle_message(_inbound("and the weather?"))
+
+        d._run_turn.assert_awaited_once()
+        assert d._run_turn.await_args.kwargs["resumed_key"] == "dashboard:chat-1"
+        route.assert_awaited_once()

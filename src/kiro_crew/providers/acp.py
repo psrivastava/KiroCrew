@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import logging
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import aclosing
 from pathlib import Path
-from typing import Any
+from typing import Any, AsyncContextManager
 
 from kiro_crew import model_scope
 from kiro_crew.acp.client import (
@@ -19,12 +20,19 @@ from kiro_crew.acp.client import (
     AcpError,
     _is_config_value_rejection,
     advertised_model_ids,
+    catalog_row_would_drop,
     model_is_unusable,
-    resolve_pin_spelling,
+    resolve_pin_spelling_on,
     sandbox_init_failure_for_runtime,
 )
+from kiro_crew.acp.mcp_session_report import sanitize_sink_text
 from kiro_crew.acp.runtime import AcpRuntime, AcpRuntimeError
-from kiro_crew.acp.session_handle import AcpSessionHandle
+from kiro_crew.acp.session_handle import (
+    _READ_PATH_PROBE_DEADLINE_SECS,
+    _READ_PATH_REPROBE_MIN_INTERVAL_SECS,
+    AcpSessionHandle,
+    EntitlementRevalidating,
+)
 from kiro_crew.acp.session_provider import AcpSessionProvider
 from kiro_crew.acp.types import (
     ACP_BACKEND_CODEX,
@@ -37,6 +45,7 @@ from kiro_crew.acp.types import (
     ACP_BACKENDS_ACP_RUNTIME,
     ACP_BACKENDS_COMPACT,
     ACP_BACKENDS_CONTEXT_RECYCLE,
+    ACP_BACKENDS_EFFORT_FROM_ADVERTISED_OPTION,
     ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION,
 )
 from kiro_crew.acp.types import (
@@ -56,6 +65,7 @@ from kiro_crew.acp.types import (
     STOP_REASON_CANCELLED,
     STOP_REASON_END_TURN,
     effort_config_option_id,
+    effort_config_option_value,
 )
 from kiro_crew.acp_backends import POLICY_ID_BY_BACKEND
 from kiro_crew.agent_sdk import host_auth
@@ -68,6 +78,7 @@ from kiro_crew.agent_sdk.tool_search import (
     ToolSearchSettings,
     clamp_min_pct,
     clamp_min_tokens,
+    resume_takes_tool_search_replay,
 )
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.paths import kiro_sessions_dir
@@ -80,6 +91,7 @@ from kiro_crew.effort import (
 )
 from kiro_crew.mcp_hot_reload import mcp_hot_reload_supported, parse_kiro_cli_version
 from kiro_crew.messaging.link import telemetry_channel_of
+from kiro_crew.platform_compat import pid_exists
 from kiro_crew.providers.base import (
     CancelOutcome,
     LLMEvent,
@@ -89,6 +101,7 @@ from kiro_crew.providers.base import (
 )
 from kiro_crew.providers.cleanup import _is_safe_path
 from kiro_crew.recovery.ladder import InfraError
+from kiro_crew.session_work_dir import mark_run_dir, reclaim_session_work_dir
 from kiro_crew.workspace_cli_settings import (
     CLI_SETTINGS_LOCK_ACTION_TIMEOUT_SECS,
     CLI_SETTINGS_LOCK_TIMEOUT_SECS,
@@ -96,6 +109,14 @@ from kiro_crew.workspace_cli_settings import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+#: Decoding for the workspace ``cli.json``. The file can be a person's own
+#: workspace settings, and Windows editors save UTF-8 with a byte-order mark,
+#: which ``json.loads`` refuses on decoded text. A refused file reads as empty
+#: here, and the overlay writers then replace it with only Kiro Crew's keys, so
+#: every reader drops one leading mark. Writers emit plain UTF-8.
+_CLI_JSON_ENCODING = "utf-8-sig"
 
 
 def _write_cli_overlay(
@@ -108,8 +129,23 @@ def _write_cli_overlay(
     """Write a workspace cli.json overlay so kiro-cli applies effort at spawn.
 
     Path: ``<work_dir>/.kiro/settings/cli.json``. Workspace settings override
-    the global ``~/.kiro/settings/cli.json`` so this only affects the slot's
-    own session. Merge-safe and idempotent — safe to call before every spawn.
+    the global ``~/.kiro/settings/cli.json``, so nothing here touches the user's
+    global kiro settings. The overlay's scope is that WORK DIRECTORY, not a
+    session: every session served by one runtime shares the work dir, so the
+    file is shared by all of them, and kiro-cli reads it only at spawn. A write
+    therefore reaches no session that is already running -- it lands on the next
+    respawn, and then for every session that respawn serves. Merge-safe and
+    idempotent — safe to call before every spawn.
+
+    Its unit of state is therefore ``(work_dir, model)`` and never
+    ``(session, model)``: two sessions on one runtime running the same model have
+    one entry between them, and the last write is the one a respawn reads.
+    Nothing reaches this writer except :class:`AcpProvider`, which is the object
+    that spawns the runtime and so always owns it, which is why a live effort
+    change is pushed to the running session separately
+    (:meth:`AcpProvider.change_effort`) rather than through this file. A session
+    that joins a runtime it did not spawn has no path here at all today; if one
+    is added, it needs to say that its write cannot reach the running process.
 
     The effort sub-key is family-specific (``effort_settings_key``): Claude
     models use ``output_config``, GPT models use ``reasoning`` — kiro-cli
@@ -121,7 +157,11 @@ def _write_cli_overlay(
     """
     with workspace_cli_settings_lock(work_dir, timeout=timeout) as cli_json:
         try:
-            existing = json.loads(cli_json.read_text(encoding="utf-8")) if cli_json.exists() else {}
+            existing = (
+                json.loads(cli_json.read_text(encoding=_CLI_JSON_ENCODING))
+                if cli_json.exists()
+                else {}
+            )
         except (json.JSONDecodeError, OSError):
             existing = {}
         if not isinstance(existing, dict):
@@ -168,10 +208,12 @@ def _write_tool_search_overlay(
 ) -> None:
     """Write kiro Tool Search settings into the workspace cli.json overlay.
 
-    Path: ``<work_dir>/.kiro/settings/cli.json`` — the SAME per-session overlay
-    used for effort. Workspace settings override the global
-    ``~/.kiro/settings/cli.json`` so this only affects this slot's own kiro-cli
-    session and never mutates the user's global kiro settings.
+    Path: ``<work_dir>/.kiro/settings/cli.json`` — the SAME overlay used for
+    effort, with the same scope: the work directory, which every session on a
+    runtime shares, read by kiro-cli only at spawn (see
+    :func:`_write_cli_overlay`). Workspace settings override the global
+    ``~/.kiro/settings/cli.json``, so this never mutates the user's global kiro
+    settings.
 
     This file is the kiro-cli (Rust engine) channel only. KAS never opens it: its
     Tool Search setting rides the ACP ``initialize`` request instead (see
@@ -205,7 +247,11 @@ def _write_tool_search_overlay(
     """
     with workspace_cli_settings_lock(work_dir) as cli_json:
         try:
-            existing = json.loads(cli_json.read_text(encoding="utf-8")) if cli_json.exists() else {}
+            existing = (
+                json.loads(cli_json.read_text(encoding=_CLI_JSON_ENCODING))
+                if cli_json.exists()
+                else {}
+            )
         except (json.JSONDecodeError, OSError):
             existing = {}
         if not isinstance(existing, dict):
@@ -249,7 +295,7 @@ def _clear_cli_overlay_effort(work_dir: Path, model: str) -> bool:
             if not cli_json.exists():
                 return True
             try:
-                data = json.loads(cli_json.read_text(encoding="utf-8"))
+                data = json.loads(cli_json.read_text(encoding=_CLI_JSON_ENCODING))
             except json.JSONDecodeError:
                 # A malformed file names no effort for any model, and
                 # ``_read_cli_overlay`` reads it as ``{}`` too, so a respawn
@@ -299,7 +345,7 @@ def _read_cli_overlay(work_dir: Path) -> dict[str, str]:
     if not cli_json.exists():
         return {}
     try:
-        data = json.loads(cli_json.read_text(encoding="utf-8"))
+        data = json.loads(cli_json.read_text(encoding=_CLI_JSON_ENCODING))
     except (json.JSONDecodeError, OSError):
         return {}
     if not isinstance(data, dict):
@@ -330,6 +376,9 @@ def _read_cli_overlay(work_dir: Path) -> dict[str, str]:
 # so the new gateway resumes LOSSLESSLY. If the lock never clears we fall back
 # to a fresh session + KiroCrew history replay (see _start_kiro_runtime_impl).
 _RESUME_MAX_ATTEMPTS = 4  # total session/load attempts before fresh fallback
+# Bound on the setup failure's own text in the failed-setup warning: enough for
+# an RPC error's message, short enough that one line stays one line.
+_SETUP_FAILURE_LOG_CAP = 300
 _RESUME_BACKOFF_BASE_S = 1.0  # backoff = base * 2**attempt → 1s, 2s, 4s between attempts
 # Substrings (matched case-insensitively) of a session/load error that name a
 # TRANSIENT native-lock condition — one that clears once the previous holder
@@ -351,6 +400,32 @@ _RESUME_TRANSIENT_LOCK_MARKERS: tuple[str, ...] = (
     "active in another process",
     "re-read lock file",
 )
+
+
+def _unlink_dead_session_lock(session_id: str) -> bool:
+    """Remove ``<sid>.lock`` when the PID it names is dead; True when removed.
+
+    kiro-cli writes ``{"pid": N, "started_at": ...}`` and deletes it only on a
+    clean exit, so a SIGKILLed holder leaves a lock that refuses every later
+    session/load. A live holder (including one we may not signal) or a lock we
+    cannot read or parse is left alone.
+    """
+    sessions_dir = kiro_sessions_dir()
+    lock = sessions_dir / f"{session_id}.lock"
+    if not session_id or not _is_safe_path(lock, sessions_dir):
+        return False
+    try:
+        pid = json.loads(lock.read_text(encoding="utf-8"))["pid"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+    if type(pid) is not int or pid <= 0 or pid_exists(pid):
+        return False
+    try:
+        lock.unlink()
+    except OSError:
+        return False
+    logger.warning("Removed stale kiro session lock %s (holder PID %d is dead)", lock, pid)
+    return True
 
 
 def _is_transient_resume_lock_error(exc: BaseException) -> bool:
@@ -383,6 +458,10 @@ class AcpProvider(LLMProvider):
         crew_agent: str | None = None,
         member_context: bool = False,
         memory_mode: str = "persistent",
+        shared_scratch: Path | None = None,
+        on_gate_acquired: Callable[..., None] | None = None,
+        on_gate_queued: Callable[..., None] | None = None,
+        disposable_work_dir: bool = False,
     ) -> None:
         # An unrecognized backend would pass every ``_is_<backend>`` check and
         # spawn kiro-cli, so a typo'd config would drive the wrong agent with no
@@ -406,11 +485,38 @@ class AcpProvider(LLMProvider):
             # kiro-cli path — fully inert; a companion-registered backend threads
             # it.
             "permission_mode": permission_mode,
+            # The parent session tree's work directory for a dedicated subagent
+            # process; None for a session that starts its own tree.
+            "shared_scratch": shared_scratch,
         }
         if agent:
             kwargs["agent"] = agent
         self.member_context = member_context
         self.memory_mode = memory_mode
+        # Kept on the provider, not only on the placeholder client: on the kiro
+        # path ``_start_kiro_runtime_impl`` replaces that client with an
+        # ``AcpRuntime`` it constructs itself, and a dedicated subagent's
+        # inherited work directory has to reach THAT process.
+        self._shared_scratch: Path | None = shared_scratch
+        # Start-queue exit/entry callbacks, forwarded to BOTH ``runtime.spawn`` calls
+        # (the first spawn and the resume-died respawn: the cold-start admission)
+        # and to ``runtime.create_session`` on the fresh-session path
+        # (``session/load`` takes no gate permit). A dedicated subagent pauses its
+        # start clock while queued at each, as a session-shared one does at the
+        # gate in ``_create_shared_session``: a wait for a permit is admission's
+        # cost, not this start's. None -- every non-subagent session -- is inert.
+        self._on_gate_acquired: Callable[..., None] | None = on_gate_acquired
+        self._on_gate_queued: Callable[..., None] | None = on_gate_queued
+        # Whether ``work_dir`` was DERIVED for a one-run session (a subagent, a
+        # stateless cron run) and is this provider's to reclaim at shutdown. An
+        # explicit caller cwd is never marked, whatever key the session has; and
+        # marking only authorizes removing Crew's own residue, never a file the
+        # run wrote (session_work_dir.reclaim_session_work_dir).
+        self._disposable_work_dir: bool = bool(disposable_work_dir)
+        # Installed by the session registry when this provider is registered.
+        # The context manager retains the registry lock from the final ownership
+        # decision through the filesystem reclaim, closing the successor race.
+        self._work_dir_claim_probe: Callable[[], AsyncContextManager[bool]] | None = None
         self._client = AcpClient(**kwargs)
         # Consumer opt-in for the low-fidelity child permission downgrade
         # (see child_fidelity_aware property). Set by fidelity-aware
@@ -480,6 +586,17 @@ class AcpProvider(LLMProvider):
         return self._client
 
     @property
+    def work_scratch_dir(self) -> Path | None:
+        """The session tree's ``$KIROCREW_SCRATCH`` directory (H14 capability).
+
+        Read off whichever process serves this session -- the placeholder
+        ``AcpClient`` before start, the ``AcpSessionProvider`` the kiro path
+        swaps in after -- so the answer is the directory the live process
+        actually exposes, never the one it was asked for.
+        """
+        return self._client.work_scratch_dir
+
+    @property
     def child_fidelity_aware(self) -> bool:
         """See AcpSessionHandle.child_fidelity_aware.
 
@@ -501,6 +618,26 @@ class AcpProvider(LLMProvider):
                 inner.child_fidelity_aware = bool(value)
             except Exception:  # pragma: no cover - read-only shapes
                 pass
+
+    @property
+    def model_pin_refused(self) -> str:
+        """The pinned model the adapter refused at startup, or ``""``.
+
+        Both client shapes carry the field: a raw ``AcpClient`` sets it in its
+        startup model push, and an ``AcpSessionProvider`` delegates to its
+        handle's ``set_model``.
+        """
+        value = self._client.model_pin_refused
+        return value if isinstance(value, str) else ""
+
+    @property
+    def model_pin_partial(self) -> str:
+        """The bare model a ``<model>[<effort>]`` pin landed as, or ``""``.
+
+        Set when the base model applied but its effort half did not.
+        """
+        value = self._client.model_pin_partial
+        return value if isinstance(value, str) else ""
 
     @property
     def served_model(self) -> str:
@@ -546,10 +683,19 @@ class AcpProvider(LLMProvider):
         """Working directory this provider operates in.
 
         Overrides the ``LLMProvider`` default ("") so session_map can persist
-        the real workspace path for both ACP backends. The work_dir lives on
-        the underlying client (``self._client._work_dir``), not the provider.
+        the real workspace path for both ACP backends. The wrapper is what every
+        caller holds -- ``SessionMap.set(..., cwd=provider.cwd)``, reuse
+        validation, the transport dispatchers -- so it must forward the SAME
+        session-bound directory the inner provider now reports, not the shared
+        runtime's own. After startup ``self._client`` is an
+        ``AcpSessionProvider`` whose ``cwd`` reads the handle's bound dir (a
+        shared runtime carries sessions opened against different projects);
+        answering with ``self._client._work_dir`` here would report the
+        runtime's workspace and evict a live session on reuse validation. Before
+        startup / on the claude seam ``self._client`` is a raw ``AcpClient``
+        with no ``cwd``, so the fallback reads its ``_work_dir``.
         """
-        return str(self._client._work_dir)
+        return str(getattr(self._client, "cwd", "") or self._client._work_dir)
 
     @property
     def is_claude_backend(self) -> bool:
@@ -580,6 +726,22 @@ class AcpProvider(LLMProvider):
         backend after this provider was constructed.
         """
         return capabilities_for(self._client.backend)
+
+    @property
+    def kas_auto_approved_capabilities(self) -> frozenset[str] | None:
+        """What this session's registered agent batch auto-approves, or ``None``.
+
+        Only a wire-registered host (KAS) has a batch; see
+        ``AcpSessionHandle.kas_auto_approved``.
+        """
+        value = getattr(self._client, "kas_auto_approved_capabilities", None)
+        return value if isinstance(value, frozenset) else None
+
+    @property
+    def kas_projected_agent(self) -> str:
+        """The agent this session's registered batch was built for, or ``""``."""
+        value = getattr(self._client, "kas_projected_agent", "")
+        return value if isinstance(value, str) else ""
 
     @property
     def is_codex_backend(self) -> bool:
@@ -938,17 +1100,32 @@ class AcpProvider(LLMProvider):
                                        genuine failure only wastes time).
         * runtime dies mid-retry   → return ``None`` (caller's respawn handles it).
         """
+
+        async def load() -> AcpSessionHandle:
+            return await runtime.load_session(
+                session_file,
+                resume_sid,
+                cwd=work_dir,
+                agent=agent or None,
+                member_session_key=member_session_key,
+                session_key=session_key,
+                channel_id=channel_id,
+            )
+
+        swept = False
         for attempt in range(_RESUME_MAX_ATTEMPTS):
             try:
-                handle = await runtime.load_session(
-                    session_file,
-                    resume_sid,
-                    cwd=work_dir,
-                    agent=agent or None,
-                    member_session_key=member_session_key,
-                    session_key=session_key,
-                    channel_id=channel_id,
-                )
+                try:
+                    handle = await load()
+                except Exception as exc:
+                    # A holder that died uncleanly keeps its lock forever, so
+                    # waiting cannot clear it: remove it and retry once, now.
+                    if swept or "active in another process" not in str(exc).lower():
+                        raise
+                    swept = True
+                    if not _unlink_dead_session_lock(resume_sid):
+                        raise
+                    handle = await load()
                 if attempt:
                     logger.info(
                         "Resume of kiro session %s recovered on attempt %d/%d "
@@ -1024,7 +1201,9 @@ class AcpProvider(LLMProvider):
         # fresh native session rebuilds that registry, while
         # ``_history_replay_needed`` preserves the Kiro Crew conversation. Linked
         # Slack and other channel dispatchers keep native resume until they own
-        # the same replay-lease contract end to end.
+        # the same replay-lease contract end to end. The decision itself is
+        # ``agent_sdk.tool_search.resume_takes_tool_search_replay``, shared with
+        # the resume prefetch (the dashboard may not import this layer).
         resume_sid = (
             getattr(self._client, "_resume_session_id", "")
             if self.memory_mode == "persistent"
@@ -1032,13 +1211,11 @@ class AcpProvider(LLMProvider):
         )
         session_key = getattr(self._client, "_session_key", None)
         channel_id = getattr(self._client, "_channel_id", None)
-        if (
-            resume_sid
-            and self._tool_search is True
-            and self._client.backend == ACP_BACKEND_KIRO
-            and not channel_id
-            and telemetry_channel_of(session_key if isinstance(session_key, str) else None)
-            == "dashboard"
+        if resume_sid and resume_takes_tool_search_replay(
+            tool_search=self._tool_search,
+            backend=self._client.backend,
+            channel_id=channel_id,
+            session_key=session_key,
         ):
             logger.info(
                 "Tool Search is enabled; replacing native session/load for %s "
@@ -1056,6 +1233,16 @@ class AcpProvider(LLMProvider):
         # would silently run on the agent's default.
         configured_model = getattr(self._client, "_model", "") or ""
 
+        # A restart replaces the process serving this session: the tree that
+        # process exposed (read off it, the way parent_work_scratch_dir reads
+        # it) is what the replacement joins, so the session's staged work and
+        # its children's windows survive the restart. A root's first start has
+        # nothing to read and starts its own tree.
+        if self._shared_scratch is None:
+            previous_tree = getattr(self._client, "work_scratch_dir", None)
+            if isinstance(previous_tree, Path):
+                self._shared_scratch = previous_tree
+
         runtime = AcpRuntime(
             work_dir=work_dir,
             agent=agent or "kirocrew",
@@ -1068,10 +1255,21 @@ class AcpProvider(LLMProvider):
             tool_search=self._tool_search_settings(),
             member_context=self.member_context,
             memory_mode=self.memory_mode,
+            # A dedicated subagent's inherited work directory (agent_scratch):
+            # this runtime, not the placeholder client, is the process the
+            # subagent runs in, so the second window has to be mounted HERE.
+            shared_scratch=self._shared_scratch,
         )
+        # One priority for both start queues this path enters, set by the session
+        # layer for this start (rule: ``kiro_crew.start_priority``).
+        start_priority = self.start_priority
         _t_spawn = time.monotonic()
         try:
-            await runtime.spawn()
+            await runtime.spawn(
+                start_priority=start_priority,
+                on_gate_queued=self._on_gate_queued,
+                on_gate_acquired=self._on_gate_acquired,
+            )
         except AcpRuntimeError as exc:
             # An OS sandbox that refused to build this child is checked FIRST and
             # on all three of this module's startup paths: it is the narrower
@@ -1210,9 +1408,16 @@ class AcpProvider(LLMProvider):
                         tool_search=self._tool_search_settings(),
                         member_context=self.member_context,
                         memory_mode=self.memory_mode,
+                        # The dead runtime's tree, for the same reason a restart
+                        # joins it (above): its sessions' work is there.
+                        shared_scratch=self._shared_scratch or runtime.work_scratch_dir,
                     )
                     try:
-                        await runtime.spawn()
+                        await runtime.spawn(
+                            start_priority=start_priority,
+                            on_gate_queued=self._on_gate_queued,
+                            on_gate_acquired=self._on_gate_acquired,
+                        )
                     except AcpRuntimeError as exc:
                         sandbox_failure = await sandbox_init_failure_for_runtime(runtime)
                         if sandbox_failure is not None:
@@ -1231,6 +1436,9 @@ class AcpProvider(LLMProvider):
                         memory_mode=self.memory_mode,
                         session_key=self._owning_session_key(),
                         channel_id=self._owning_channel_id() or "",
+                        on_gate_acquired=self._on_gate_acquired,
+                        on_gate_queued=self._on_gate_queued,
+                        start_priority=start_priority,
                     )
                 except AcpRuntimeError as exc:
                     sandbox_failure = await sandbox_init_failure_for_runtime(runtime)
@@ -1283,12 +1491,50 @@ class AcpProvider(LLMProvider):
                         _namespace,
                     )
                 elif model_is_unusable(configured_model, _advertised):
-                    # A literal miss can be a stale `<namespace>::` qualifier on
-                    # a model the backend fully serves: resolve to the
-                    # advertised spelling and send THAT — same fold the display
-                    # verdict uses, so chip and wire agree. A pin absent under
-                    # either spelling still takes the withhold.
-                    _send_model = resolve_pin_spelling(configured_model, _advertised)
+                    # A literal miss can be a stale `<namespace>::` qualifier on a
+                    # model the backend fully serves: resolve to the advertised
+                    # spelling and send THAT — same fold the display verdict uses,
+                    # so chip and wire agree. It can also be a BARE pin on a harness
+                    # that advertises only ``<model>[<effort>]`` rows while its
+                    # ``model`` option takes the bare id, and the backend-aware
+                    # resolver answers that with the model the operator pinned,
+                    # leaving the adapter to own the effort. Try the fold FIRST,
+                    # against the snapshot we already have: a qualifier-only miss
+                    # resolves here with no wire traffic and must not pay a
+                    # throwaway session/new on every cold start.
+                    _send_model = resolve_pin_spelling_on(
+                        configured_model, _advertised, backend=self._client.backend
+                    )
+                    if not _send_model:
+                        # The fold found nothing, so this looks like a genuine
+                        # miss — but the snapshot was captured seconds ago at
+                        # session/new, always inside the startup race window where
+                        # an entitlement lookup racing a token refresh answers the
+                        # free-tier default. Withholding an entitled pin on that
+                        # unconfirmed answer drops the user's model for the whole
+                        # session with no retry, so revalidate ONCE against the
+                        # live backend and re-run both checks. A failed probe
+                        # leaves _advertised as it was (fail open: no evidence
+                        # never widens or narrows entitlement).
+                        try:
+                            # force=True: this is a one-shot per cold start
+                            # deciding whether to DROP a configured pin, not a
+                            # burst, so it must earn a fresh probe rather than
+                            # honour a recent no-evidence failure replay.
+                            _advertised = (
+                                advertised_model_ids(
+                                    await handle.refresh_available_models(force=True)
+                                )
+                                or _advertised
+                            )
+                        except Exception:
+                            pass
+                        if model_is_unusable(configured_model, _advertised):
+                            _send_model = resolve_pin_spelling_on(
+                                configured_model, _advertised, backend=self._client.backend
+                            )
+                        else:
+                            _send_model = configured_model
                 if not _send_model and not _foreign_scope:
                     logger.warning(
                         "Configured model %s is not available to this account; "
@@ -1332,10 +1578,34 @@ class AcpProvider(LLMProvider):
             if self._child_fidelity_aware:
                 provider.child_fidelity_aware = True
             self._client = provider  # type: ignore[assignment]
-        except BaseException:
+            # The tree this session ACTUALLY has, read off the live process:
+            # the runtime drops an inherited window that was swept and falls
+            # back to its own directory, so the value handed in at
+            # construction can name a directory that is gone. A restart that
+            # re-sent it would drop it again and start a third tree, losing
+            # what this runtime staged; recording the live answer makes the
+            # next spawn join THIS directory instead.
+            live_tree = runtime.work_scratch_dir
+            if isinstance(live_tree, Path):
+                self._shared_scratch = live_tree
+        except BaseException as setup_exc:
             # No provider owns the runtime yet — kill it so a failed session
             # setup doesn't leak an orphaned kiro-cli process. Best-effort:
             # the cleanup kill must not mask the original exception.
+            if isinstance(setup_exc, Exception):
+                # Named here, before the cleanup, because the kill's own lines
+                # (its attribution, and on Windows a tree still draining) are
+                # otherwise the only trace a repeating setup failure leaves at
+                # the gateway's WARNING level. A cancellation is not a failure.
+                # The text can be backend-authored (an RPC error frame), so it is
+                # redacted and folded to one printable, bounded line: a newline or
+                # an escape sequence in it must not forge or recolor a log line.
+                logger.warning(
+                    "Kiro session setup failed on runtime PID %s (%s: %s); killing the runtime",
+                    runtime.pid,
+                    type(setup_exc).__name__,
+                    sanitize_sink_text(str(setup_exc), _SETUP_FAILURE_LOG_CAP),
+                )
             try:
                 await runtime.kill(expected=True, reason="failed session setup cleanup")
             except Exception:
@@ -1360,6 +1630,84 @@ class AcpProvider(LLMProvider):
         """
         return self._client.available_models()
 
+    async def maybe_refresh_available_models(self, catalog_ids: list[str]) -> list[dict[str, str]]:
+        """Revalidate the advertised-model snapshot on the picker read path.
+
+        The dashboard model list (`/api/models`) narrows the catalog through this
+        provider's snapshot. `self._client` becomes an `AcpSessionProvider` (an
+        `LLMProvider`) on the kiro shared-runtime path, which carries the
+        read-path revalidation; forward to it (propagating its contract: the read
+        deadline raises
+        :class:`~kiro_crew.acp.session_handle.EntitlementRevalidating` while the
+        probe keeps running, and a probe FAILURE returns the current snapshot,
+        fail open).
+
+        On the DEDICATED transport `self._client` stays a plain kiro `AcpClient`
+        whose snapshot is the one unconfirmed `session/new` answer a startup race
+        can leave at the free tier -- the same defect on the same transport. When
+        that snapshot would actually drop a catalog row (the picker's own verdict,
+        :func:`catalog_row_would_drop`), it is re-asked through the client's
+        :meth:`~kiro_crew.acp.client.AcpClient.refresh_available_models`, which
+        asks on a throwaway probe process of its own -- never this session's stream,
+        so a read during a streaming turn races nothing (a probe
+        -confirmed list inside the probe TTL is not re-probed; a failed probe keeps
+        the snapshot). A snapshot that drops nothing, a pre-startup placeholder
+        client and a non-kiro direct client are returned unchanged, so this can
+        never worsen the picker.
+        """
+        if isinstance(self._client, LLMProvider):
+            return await self._client.maybe_refresh_available_models(catalog_ids)
+        snapshot = self.available_models()
+        client = self._client
+        if not (
+            isinstance(client, AcpClient)
+            and getattr(client, "_is_kiro", False)
+            and getattr(client, "_session_id", "")
+        ):
+            return snapshot
+        advertised = advertised_model_ids(snapshot)
+        if not any(catalog_row_would_drop(cid, advertised) for cid in catalog_ids):
+            return snapshot
+        # A recorded `_picker_probe_at` rate-limits the next poll regardless of
+        # whether the last probe CONFIRMED: a failed probe never sets
+        # `_available_models_probe_confirmed`, so keying the gate on that flag (as
+        # the shared read path can, because its runtime single-flight probe TTL
+        # bounds the burst) would leave an unconfirmed narrow snapshot cold-spawning
+        # a fresh probe process on every 8s poll -- a self-sustaining kiro-cli +
+        # MCP-fleet spawn loop. The dedicated transport has no such runtime TTL
+        # backstop, so the interval alone must bound it. Skip the interval entirely
+        # while a probe is already in flight: returning the snapshot here would
+        # serve the stale list as a live 200 while its own refresh is still landing,
+        # so the corrected list this in-flight probe is fetching would never reach
+        # the picker -- fall through and await that same shielded probe.
+        now = time.monotonic()
+        last = getattr(self, "_picker_probe_at", 0.0)
+        inflight = getattr(client, "_entitlement_probe_inflight", None)
+        probe_in_flight = inflight is not None and not inflight.done()
+        recently_probed = last > 0.0 and now - last < _READ_PATH_REPROBE_MIN_INTERVAL_SECS
+        if not probe_in_flight and recently_probed:
+            return snapshot
+        self._picker_probe_at = now
+        try:
+            # The client owns the probe's single-flight, so shielding the await
+            # leaves that one probe RUNNING (it lands and cleans up its throwaway
+            # session); we just stop waiting past the deadline. Without this a
+            # stalled probe would hold a picker poll or a pin-save for the probe's
+            # full init+session timeout (~270s). On a miss, signal revalidation in
+            # flight (the endpoint serves its degraded response and the frontend
+            # keeps its last-good list and polls again) rather than returning the
+            # un-revalidated snapshot as a live answer.
+            fresh = await asyncio.wait_for(
+                asyncio.shield(client.refresh_available_models()),
+                timeout=_READ_PATH_PROBE_DEADLINE_SECS,
+            )
+        except (TimeoutError, asyncio.TimeoutError):
+            raise EntitlementRevalidating from None
+        except Exception:
+            logger.debug("dedicated-transport picker revalidation failed", exc_info=True)
+            return snapshot
+        return fresh or snapshot
+
     def mcp_session_report(self) -> SessionMcpReport:
         """This session's MCP registration report, kept on the inner client.
 
@@ -1379,12 +1727,39 @@ class AcpProvider(LLMProvider):
 
     # ── Reasoning-effort control ─────────────────────────────────────
 
-    def supports_effort(self) -> bool:
-        """True when the current model accepts a reasoning-effort level.
+    def _advertised_effort_levels(self) -> list[str] | None:
+        """The vocabulary this harness is the authority on, or None.
 
-        Drives the dashboard effort dropdown: shown only when the active
-        model is effort-capable (Opus/Sonnet), for both ACP backends.
+        A member of ``ACP_BACKENDS_EFFORT_FROM_ADVERTISED_OPTION`` advertises its
+        effort option per SESSION rather than per model, so the option it served
+        on ``session/new`` answers both which levels exist and whether any do.
+        ``None`` -- every other harness -- means the model registry answers, which
+        is right where the level rides the model.
         """
+        if self._client.backend not in ACP_BACKENDS_EFFORT_FROM_ADVERTISED_OPTION:
+            return None
+        return self._client.get_valid_effort_levels()
+
+    def supports_effort(self) -> bool:
+        """True when this session accepts a reasoning-effort level.
+
+        Drives the dashboard effort dropdown, and the single answer the three
+        effort verbs below read -- a second copy of this question is how one of
+        them comes to offer a control the others refuse.
+
+        WHICH fact answers is per harness. Where the level rides the MODEL --
+        kiro-cli refuses it per model, claude-agent-acp rebuilds the option from
+        the model's ``supportedEffortLevels`` -- the registry answers. Where the
+        harness advertises the option per SESSION
+        (``ACP_BACKENDS_EFFORT_FROM_ADVERTISED_OPTION``) the option answers,
+        because the registry carries no entry for the operator's own model ids and
+        its name heuristic recognises none of them, so it reports "no effort" for
+        every ordinary session on such a harness and the control never appears.
+        """
+        if self._client.backend in ACP_BACKENDS_EFFORT_FROM_ADVERTISED_OPTION:
+            return self._client.supports_config_option(
+                effort_config_option_id(self._client.backend)
+            )
         return model_supports_effort(self._client._model)
 
     def _resolve_effort(self) -> str | None:
@@ -1400,10 +1775,17 @@ class AcpProvider(LLMProvider):
         ``change_effort`` writes the override under the same recorded spelling
         this reads, so the override path matches by construction.
         """
+        # The fold the WRITE path takes, handed in so it runs BEFORE the
+        # advertised-list check rather than after it. ``change_effort`` admits any
+        # level the dynamic validation set knows, so a stored ``max`` on a harness
+        # whose ceiling is ``xhigh`` is this harness's ``xhigh`` -- and a filter
+        # that ran first would drop the very level the live push applied.
         return resolve_effort_for_model(
             self._client._model,
             slot_overrides=self._effort_per_model,
             defaults=self._effort_defaults,
+            levels=self._advertised_effort_levels(),
+            normalize=functools.partial(effort_config_option_value, self._client.backend),
         )
 
     def _apply_effort_overlay(self, *, timeout: float = CLI_SETTINGS_LOCK_TIMEOUT_SECS) -> bool:
@@ -1501,12 +1883,18 @@ class AcpProvider(LLMProvider):
         adapter-behaviour notes below are what that channel does in practice.
 
         WHICH option id carries the effort is resolved per backend through
-        ``effort_config_option_id``: claude-agent-acp spells it ``effort`` and
-        codex-acp spells it ``reasoning_effort``. Naming one spelling here writes
-        an id the other adapter does not know, which comes back as "unknown
-        config option" -- and the branch below reads that as "no effort selector"
-        and skips, so the session keeps whatever effort it already had while the
-        dashboard reports the level the user picked.
+        ``effort_config_option_id``: claude-agent-acp spells it ``effort``,
+        codex-acp ``reasoning_effort`` and pi-acp ``thought_level``. Naming one
+        spelling here writes an id the other adapters do not know, which comes
+        back as "unknown config option" -- and the branch below reads that as "no
+        effort selector" and skips, so the session keeps whatever effort it
+        already had while the dashboard reports the level the user picked.
+
+        WHICH value carries the level is resolved the same way, through
+        ``effort_config_option_value``, and before the descent rather than by it:
+        a harness whose vocabulary omits one of Crew's levels is a declared fact,
+        and the descent recovers from an omission only when the refusal arrives in
+        a shape ``_is_config_value_rejection`` recognises for that adapter.
 
         claude-agent-acp validates the value against the *current model's*
         ``supportedEffortLevels`` and throws ``Invalid value for config option
@@ -1531,19 +1919,31 @@ class AcpProvider(LLMProvider):
         if not self._client.supports_config_option(effort_option):
             logger.debug("adapter exposes no %r config option; skipping effort push", effort_option)
             return
+        # The harness's own spelling of the level, resolved BEFORE the write for
+        # the reason ``effort_config_option_value`` gives: a vocabulary that omits
+        # one of Crew's levels is a declared fact, and the descent below can only
+        # recover from it when the refusal shape is one this tree recognises.
+        target = effort_config_option_value(self._client.backend, level)
+        if target != level:
+            logger.info(
+                "effort %r spelled %r on backend %s",
+                level,
+                target,
+                self._client.backend,
+            )
         # Descend from the requested level through lower levels (e.g.
         # max → xhigh → high). Never escalate above what was asked.
         try:
-            start = EFFORT_LEVELS.index(level)
+            start = EFFORT_LEVELS.index(target)
         except ValueError:
-            await self._client.set_config_option(effort_option, level)
+            await self._client.set_config_option(effort_option, target)
             return
         ladder = [lvl for lvl in reversed(EFFORT_LEVELS[: start + 1])]
         last_exc: Exception | None = None
         for candidate in ladder:
             try:
                 await self._client.set_config_option(effort_option, candidate)
-                if candidate != level:
+                if candidate != target:
                     logger.info(
                         "CC effort %r unsupported by model %s — applied %r instead",
                         level,
@@ -1577,8 +1977,12 @@ class AcpProvider(LLMProvider):
         so has no effort channel at all.
         """
         model = self._client._model
-        if not model_supports_effort(model):
-            logger.info("change_effort skipped — model %s does not support effort", model)
+        if not self.supports_effort():
+            logger.info(
+                "change_effort skipped — no effort level applies to this session (backend=%s model=%s)",
+                self._client.backend,
+                model,
+            )
             return False
         via_config_option = self._client.backend in ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION
         via_slash_command = self._client.backend in ACP_BACKENDS_KIRO_SLASH_COMMANDS
@@ -1658,7 +2062,7 @@ class AcpProvider(LLMProvider):
                         )
             else:
                 self._effort_per_model[model] = _prev
-                if not self._apply_effort_overlay():
+                if not await asyncio.to_thread(self._apply_effort_overlay):
                     # Same divergence the branch above guards: the file keeps the
                     # level the live push never applied and construction re-seeds
                     # from it, so the map follows the file rather than reporting
@@ -1686,6 +2090,47 @@ class AcpProvider(LLMProvider):
         )
         return True
 
+    async def reapply_live_effort(self, level: str) -> bool:
+        """Re-apply *level* (empty: the resolved default) to the model just switched to.
+
+        An in-place switch never respawns, so without this the new model runs at its
+        own default. False asks the caller for a reset; errors propagate.
+        """
+        if not self.supports_effort():
+            # No effort selector on this model: the level stays persisted for a
+            # capable one, the same "persisted no-op" the effort endpoint applies.
+            return True
+        if level:
+            return bool(await self.change_effort(level))
+        # No override: re-resolve so a workspace default reaches the new model. A
+        # False here only means there was no default to push, so nothing is stale.
+        await self.clear_effort()
+        return True
+
+    async def set_model(self, model: str) -> None:
+        """Switch the live session's model, then re-apply the slot's effort to it.
+
+        The effort goes last so it wins over a ``<model>[<effort>]`` pick's own
+        level. The target's own override applies as ``reapply_live_effort`` does;
+        without one, the level of the model left is pushed live but never stored.
+        """
+        overrides = self._effort_per_model
+        carried = overrides.get(self._client._model, "")
+        await self._client.set_model(model)
+        try:
+            own = overrides.get(self._client._model) or overrides.get(model, "")
+            if own or not carried:
+                await self.reapply_live_effort(own)
+            elif self.supports_effort():
+                # Live only: persisting it would overwrite the target's stored state.
+                if self._client.backend in ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION:
+                    await self._set_effort_config_option(carried)
+                elif self._client.backend in ACP_BACKENDS_KIRO_SLASH_COMMANDS:
+                    await self._client.send_command("/effort", args={"level": carried})
+        except Exception:
+            # The model DID switch; failing here would make a fallback walk skip it.
+            logger.warning("Effort re-apply after set_model(%s) failed", model, exc_info=True)
+
     async def clear_effort(self) -> bool | None:
         """Clear the slot's effort override for the current model.
 
@@ -1708,7 +2153,7 @@ class AcpProvider(LLMProvider):
         resets nothing.
         """
         model = self._client._model
-        if not model_supports_effort(model):
+        if not self.supports_effort():
             return False
         cleared = self._effort_per_model.pop(model, None)
         if self._client.backend not in ACP_BACKENDS_KIRO_SLASH_COMMANDS:
@@ -1771,10 +2216,20 @@ class AcpProvider(LLMProvider):
         if self.memory_mode != "persistent":
             self._client._resume_session_id = ""
         self.essential_delivery.invalidate()
+        if self._disposable_work_dir:
+            # The ONE place the directory's provenance is written: before any
+            # writer puts a file in it, on every (re)start, idempotent. The
+            # sweep reclaims only a directory that carries this mark and names a
+            # dead predecessor of this data home (session_work_dir); the shutdown
+            # reclaim below keys on the flag and on the mark naming this process.
+            await asyncio.to_thread(mark_run_dir, Path(self._client._work_dir))
         # Re-apply the overlay on every (re)start to cover resume / model swap.
         # (no-op for claude backend — that path applies effort live below.)
-        self._apply_effort_overlay()
-        self._apply_tool_search_overlay()
+        # Off the loop: the cli.json lock is shared with sibling threads and
+        # processes, and an acquire on the loop thread makes one attempt and
+        # never waits, so a brief overlap would refuse the write.
+        await asyncio.to_thread(self._apply_effort_overlay)
+        await asyncio.to_thread(self._apply_tool_search_overlay)
 
         if self.is_acp_runtime_backend:
             # ── Kiro unified path: AcpRuntime + AcpSessionHandle ──
@@ -1840,6 +2295,74 @@ class AcpProvider(LLMProvider):
         finally:
             if self.memory_mode != "persistent" and session_id:
                 await self.cleanup_session(session_id)
+            if self._disposable_work_dir:
+                await self._reclaim_work_dir()
+
+    def set_work_dir_claim_probe(
+        self,
+        probe: Callable[[], AsyncContextManager[bool]],
+    ) -> None:
+        """Install the registry claim that guards the final reclaim decision."""
+        self._work_dir_claim_probe = probe
+
+    def disown_work_dir(self) -> None:
+        """Drop this provider's claim on its derived work directory.
+
+        The factory flag says the directory was derived from a one-run KEY; it
+        cannot say whether this instance is the one the registry kept for that
+        key. When two providers for the same key race and one is discarded, or a
+        recycled session's successor is already registered, the discarded
+        provider and the live one share the directory, so the registry tells the
+        discarded one to leave it -- the live sibling reclaims it at its own
+        shutdown. A marker nonce could not carry this: whichever instance wrote
+        the marker can be the one torn down while the other lives.
+        """
+        self._disposable_work_dir = False
+
+    async def _reclaim_work_dir(self) -> None:
+        """Remove this run's derived work dir only after its tree and claim end.
+
+        Shutdown can retain PID tracking when a root or descendant survives, so
+        its return alone is not proof that no process still uses this directory
+        as its cwd. The registry claim is the other half: it holds the registry
+        lock from the final no-successor decision through the off-loop reclaim,
+        so a new holder cannot register in between. If cancellation arrives
+        during that reclaim, shutdown waits for its worker before releasing the
+        claim, then propagates the cancellation. An absent, denied, or broken
+        claim fails closed and leaves the directory for the sweep. The reclaim
+        itself accepts a missing marker (the flag is its provenance) and, when a
+        marker is present, requires it to name this data home and this process
+        exactly; nothing about another process is probed.
+        """
+        if getattr(self._client, "process_tree_confirmed_dead", None) is not True:
+            logger.debug("retaining run work dir until its process tree is confirmed dead")
+            return
+        claim_probe = self._work_dir_claim_probe
+        if claim_probe is None:
+            logger.debug("retaining run work dir because no registry claim probe is installed")
+            return
+        work_dir = Path(self._client._work_dir)
+        try:
+            async with claim_probe() as claimed:
+                if not claimed:
+                    logger.debug("retaining claimed run work dir %s", work_dir)
+                    return
+                reclaim = asyncio.ensure_future(
+                    asyncio.to_thread(reclaim_session_work_dir, work_dir)
+                )
+                try:
+                    removed = await asyncio.shield(reclaim)
+                except asyncio.CancelledError:
+                    try:
+                        await reclaim
+                    except BaseException:
+                        pass
+                    raise
+        except Exception:
+            logger.debug("work dir reclaim failed for %s", work_dir, exc_info=True)
+            return
+        if removed:
+            logger.debug("reclaimed run work dir %s", work_dir)
 
     @staticmethod
     def _to_llm_event(e: Any) -> LLMEvent:
@@ -1862,6 +2385,9 @@ class AcpProvider(LLMProvider):
             tool_output=e.tool_output,
             tool_output_digest=e.tool_output_digest,
             tool_output_bytes=e.tool_output_bytes,
+            # The fingerprints the credential card traces a source by. Dropping
+            # them leaves every credential in the reply with no source.
+            tool_output_credentials=e.tool_output_credentials,
             tool_final=e.tool_final,
             # Dropping this clears the task panel and records an empty plan/updated.
             todo=e.todo,
@@ -1883,6 +2409,9 @@ class AcpProvider(LLMProvider):
             # half (child_mcp_identity_trusted) for every crossing event.
             raw_params_trusted=e.raw_params_trusted,
             shell_classified=e.shell_classified,
+            # Dropping this would let a KAS spawn reach the prompt unvetted
+            # against the spawn policy on this surface.
+            spawn_target=e.spawn_target,
             tool_identity_trusted=e.tool_identity_trusted,
             mcp_identity_trusted=e.mcp_identity_trusted,
             server_name=e.server_name,
@@ -1901,6 +2430,9 @@ class AcpProvider(LLMProvider):
             runtime_global=e.runtime_global,
             sub_session_id=e.sub_session_id,
             is_shell=e.is_shell,
+            # The harness's own tool id for a permission request. Dropping it
+            # leaves every KAS call unnamed, so no tool-scoped spec hook fires.
+            harness_tool_id=e.harness_tool_id,
             # Canonical, non-model-authored tool identity (_meta.kiro). The
             # session-directive forgery gate in chat_runner keys on THESE, so
             # dropping them here silently discards every session-bound tool's
@@ -1932,20 +2464,30 @@ class AcpProvider(LLMProvider):
         return {}
 
     @property
+    def member_dispatch_mounted(self) -> bool | None:
+        # Both transports answer from the composition that built THIS session's
+        # array: the shared runtime records it on the handle, the direct client
+        # on itself.
+        if isinstance(self._client, (AcpSessionProvider, AcpClient)):
+            return self._client.member_dispatch_mounted
+        return None
+
+    @property
     def native_steering(self) -> bool:
         # Kiro ACP manual/fileMatch support depends on version and engine;
         # the fallback keeps those guides reachable without a false capability.
         return self._client.backend == ACP_BACKEND_KAS
 
-    async def stream(self, message: str) -> AsyncIterator[LLMEvent]:
+    async def stream(self, message: str, *, allow_image: bool = True) -> AsyncIterator[LLMEvent]:
         # The direct client can respawn in ensure_ready; resolve that BEFORE
         # comparing receipts so a recycled conversation receives the full text.
         if isinstance(self._client, AcpClient):
             await self._client.ensure_ready()
+        send = self._client.stream_events
+        if not allow_image:
+            send = functools.partial(send, allow_image=False)
         async with aclosing(
-            self.essential_delivery.stream(
-                message, self._client.stream_events, lambda: self.context_incarnation
-            )
+            self.essential_delivery.stream(message, send, lambda: self.context_incarnation)
         ) as events:
             async for e in events:
                 yield self._to_llm_event(e)
@@ -1977,8 +2519,8 @@ class AcpProvider(LLMProvider):
             async for e in events:
                 yield self._to_llm_event(e)
 
-    async def approve_tool(self, request_id: str | int, *, always: bool = False) -> None:
-        await self._client.approve_tool(request_id, always=always)
+    async def approve_tool(self, request_id: str | int, *, always: bool = False) -> bool:
+        return await self._client.approve_tool(request_id, always=always)
 
     async def reject_tool(self, request_id: str | int) -> None:
         await self._client.reject_tool(request_id)
@@ -2079,8 +2621,21 @@ class AcpProvider(LLMProvider):
 
     async def steer(self, message: str) -> bool:
         """Delegate a mid-turn steer to the inner client (kiro-cli
-        ``_session/steer``). Fire-and-forget; returns False if not steerable."""
+        ``_session/steer``). Fire-and-forget; returns False if not steerable.
+
+        Refused (False, so the caller queues) when the inner session can lose a
+        delivered steer to a later denied approval: this wrapper is what the
+        messaging channels, Side Chat and ``spawn_steer`` steer, and only the
+        dashboard composer steers such a session. See
+        :attr:`steer_needs_loss_recovery`."""
+        if self.steer_needs_loss_recovery:
+            return False
         return await self._client.steer(message)
+
+    @property
+    def steer_needs_loss_recovery(self) -> bool:
+        """True when the inner session can lose a steer it reported delivered."""
+        return self._client.steer_needs_loss_recovery is True
 
     @property
     def last_steer_monotonic(self) -> float:
@@ -2089,8 +2644,18 @@ class AcpProvider(LLMProvider):
 
     @property
     def supports_steer(self) -> bool:
-        """True when the inner client supports mid-turn steer."""
-        return bool(getattr(self._client, "supports_steer", False))
+        """True when the inner client supports mid-turn steer through this wrapper.
+
+        False for a session that can lose a delivered steer (codex): only the
+        dashboard composer, which steers the inner client directly, steers it."""
+        return bool(getattr(self._client, "supports_steer", False)) and (
+            not self.steer_needs_loss_recovery
+        )
+
+    @property
+    def supports_refusal_steer(self) -> bool:
+        """True when the inner client can steer a deny notice into a refused turn."""
+        return bool(getattr(self._client, "supports_refusal_steer", False))
 
     def _inline_turn_finished_cleanly(self) -> bool:
         """Whether the last turn reached its own end boundary uncancelled.
@@ -2142,12 +2707,13 @@ class AcpProvider(LLMProvider):
             # over by the time anyone reaches this method. claude-agent-acp
             # compacts natively in-prompt; opencode serves ``/compact`` out of
             # its prompt handler
-            # (``test/fixtures/acp_frames/opencode/compact-live.jsonl``). Neither
-            # emits a compaction status, so the queue wait below has nothing to
-            # receive and would spend the whole ``COMPACT_WAIT_TIMEOUT_SECS``
-            # proving it. The set has exactly those two members -- pi and goose
-            # look the same in their own source and are absent for want of a
-            # driven capture, which is recorded on ``ACP_BACKENDS_COMPACT``.
+            # (``test/fixtures/acp_frames/opencode/compact-live.jsonl``), and goose
+            # does the same (``test/fixtures/acp_frames/goose/compact-live.jsonl``).
+            # None of them emits a compaction status, so the queue wait below has
+            # nothing to receive and would spend the whole
+            # ``COMPACT_WAIT_TIMEOUT_SECS`` proving it. pi looks the same in its own
+            # source and is absent for want of a driven capture, which is recorded
+            # on ``ACP_BACKENDS_COMPACT``.
             #
             # HERE rather than in ``compact()``, because this is the one method
             # BOTH routes to a compaction reach. ``compact()`` covers the
@@ -2177,15 +2743,27 @@ class AcpProvider(LLMProvider):
         await self._client.new_conversation()  # type: ignore[attr-defined]
 
     def is_alive(self) -> bool:
+        """Whether the shared client is responsive.
+
+        PROCESS-level, like every liveness answer on this provider: the client is
+        one kiro-cli process that may host several ACP sessions, so co-tenants
+        cannot be told apart here. Read it as "the process serving me is up", not
+        as "my session is usable".
+        """
         return self._client.is_responsive()
 
     def is_process_alive(self) -> bool:
-        """True if the underlying OS process has not exited (ignores I/O staleness)."""
+        """True if the runtime process has not exited (ignores I/O staleness).
+
+        Process-level by name as well as by behaviour, and shared by every session
+        the client hosts. Do not read it as "my session is usable" -- see
+        :meth:`is_alive`.
+        """
         return self._client.is_process_alive()
 
     @property
     def process_instance(self) -> str:
-        """Per-spawn identity of the client's current child process (see base).
+        """Per-spawn identity of the client's current runtime process (see base).
 
         A direct read on purpose: a `getattr` hedge would convert a future
         wiring break into "no banner is ever live", indistinguishable from
@@ -2196,6 +2774,12 @@ class AcpProvider(LLMProvider):
     def has_active_turn(self) -> bool:
         """True if a prompt is in flight (and not yet cancelled) on the client."""
         return bool(self._client) and self._client.has_active_turn()
+
+    def background_launch(self) -> tuple[float, str] | None:
+        """The client's newest background launch, or ``None`` (see base)."""
+        if not self._client:
+            return None
+        return self._client.background_launch()
 
     def has_unfinished_turn(self) -> bool:
         """True if the client reports a native turn that has NOT reached its
@@ -2222,7 +2806,11 @@ class AcpProvider(LLMProvider):
 
     @property
     def exit_code(self) -> int | None:
-        """Process exit code, or None if still running."""
+        """The runtime process's exit code, or None if still running.
+
+        One code per process, so every session the client hosted reads the same
+        one: it explains a runtime's death, never one session's stop.
+        """
         return self._client.exit_code
 
     @property
@@ -2248,13 +2836,12 @@ class AcpProvider(LLMProvider):
         return err if isinstance(err, InfraError) else None
 
     def touch_activity(self) -> None:
-        self._client.touch_activity()
+        """Refresh the CLIENT's activity clock.
 
-    def runtime_info(self) -> tuple[int | None, str | None]:
-        """Return (runtime_pid, gateway_socket_path) for abort propagation."""
-        pid = getattr(self._client, "_pid", None)
-        socket_path = getattr(self._client, "_mcp_gateway_socket", None)
-        return (pid, socket_path)
+        PROCESS-level: the stamp lives on the shared client, so this marks every
+        session on that process active, not just this one.
+        """
+        self._client.touch_activity()
 
     @property
     def session_id(self) -> str:

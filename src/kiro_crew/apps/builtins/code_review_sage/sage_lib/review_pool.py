@@ -38,7 +38,7 @@ import os
 import sys
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Callable, Iterator, Optional
+from typing import Any, Callable, Iterator, Optional
 
 # The app root holds ``sage_lib/``; put it on sys.path so ``from sage_lib import store``
 # resolves on import (mirrors the sys.path setup in sibling ``review_driver.py``).
@@ -56,8 +56,21 @@ try:
         STOP_REASON_STALE_RECOVER,
         STOP_REASON_TOOL_STALL,
     )
+    from kiro_crew.permission_floor import OUTCOME_REJECTED_TRANSPORT_FLOOR, refusal_for
 except ImportError:  # pragma: no cover - standalone / test fallback
     AcpRuntime = None  # type: ignore[assignment,misc]
+    OUTCOME_REJECTED_TRANSPORT_FLOOR = "rejected_transport_floor"
+
+    def refusal_for(
+        event: Any,
+        *,
+        session_key: str = "",
+        agent: str = "",
+        app: str = "",
+        security_only: bool = True,
+    ) -> str | None:
+        return "Blocked: the tool security gate could not be consulted"
+
     EVENT_TEXT_CHUNK = "text_chunk"  # type: ignore[assignment]
     EVENT_TOOL_CALL = "tool_call"  # type: ignore[assignment]
     EVENT_PERMISSION_REQUEST = "permission_request"  # type: ignore[assignment]
@@ -172,11 +185,13 @@ def sandbox_unavailable_message(exc: BaseException | None = None) -> str:
 
     Windows gets its own wording because the cause there is structural rather
     than a misconfiguration: Kiro Crew has no native Windows sandbox backend at
-    all (macOS uses Seatbelt, Linux uses user namespaces), so the only confined
-    path is kiro-cli's own internal sandbox taking the spawn. When that
-    delegation does not apply, the spawn fail-closes — which is correct, and is
-    why this names the one config key that changes the answer instead of leaving
-    the user with a bare exception or an empty review.
+    all (macOS uses Seatbelt, Linux uses user namespaces). An undeclared
+    ``agent.sandbox_allow_unsandboxed_exec`` already resolves true on Windows
+    (``config.loader.unsandboxed_exec_platform_default``), so reaching this
+    refusal there means the key was declared false or a governance
+    ``sandbox.min_level`` floor requires a sandbox. The spawn fail-closes, which
+    is correct; the message names both causes instead of leaving the user with a
+    bare exception or an empty review.
     """
     detail = str(exc).strip() if exc is not None else ""
     if _is_windows():
@@ -186,9 +201,10 @@ def sandbox_unavailable_message(exc: BaseException | None = None) -> str:
             "(Seatbelt) and Linux (user namespaces) only, so a review is confined "
             "on Windows solely when kiro-cli's own internal sandbox takes the "
             "spawn — and it is refused rather than run unaudited when that does "
-            "not apply. To allow an unsandboxed review worker explicitly, set "
-            "agent.sandbox_allow_unsandboxed_exec=true in ~/.kiro/crew/config.json "
-            "and restart the gateway. Everything that does not spawn a reviewer "
+            "not apply. On Windows an unsandboxed worker is allowed by default, so "
+            "this refusal means agent.sandbox_allow_unsandboxed_exec is set to "
+            "false in config, or a governance sandbox.min_level floor requires a "
+            "sandbox. Everything that does not spawn a reviewer "
             "still works: adding repositories, listing and opening pull requests, "
             "reading past reports, and publishing an already-staged draft review."
         )
@@ -372,16 +388,15 @@ def _write_effort_overlay(work_dir: str, model: str, effort: str = REVIEW_EFFORT
     bad overlay write never breaks a review)."""
     try:
         with workspace_cli_settings_lock(Path(work_dir)) as cli_json:
-            try:
-                existing = (
-                    json.loads(cli_json.read_text(encoding="utf-8"))
-                    if cli_json.exists()
-                    else {}
-                )
-            except (json.JSONDecodeError, OSError):
-                existing = {}
-            if not isinstance(existing, dict):
-                existing = {}
+            # Through `read_json_nolink`, not `read_text`: `cli.json` sits under
+            # the review worker's own `work_dir`, and the settings lock verifies
+            # the LOCK file, never this one. A plain read dereferences a link
+            # planted at this name, and the merged document is published straight
+            # back under it -- so the read is the leg that would copy a foreign
+            # document's bytes into a file the next worker loads as its settings.
+            # Missing, a plant, oversize and a non-object all arrive as None and
+            # mean "no overlay yet", which is what an empty file means here too.
+            existing = store.read_json_nolink(cli_json, cli_json.parent) or {}
             defaults = existing.get("chat.modelDefaults")
             if not isinstance(defaults, dict):
                 defaults = {}
@@ -395,7 +410,15 @@ def _write_effort_overlay(work_dir: str, model: str, effort: str = REVIEW_EFFORT
             model_cfg["output_config"] = output_cfg
             defaults[model] = model_cfg
             existing["chat.modelDefaults"] = defaults
-            cli_json.write_text(json.dumps(existing, indent=2), encoding="utf-8")
+            # Not `write_text`: that follows a link at the final name and
+            # TRUNCATES what it points at, and `work_dir` is the review worker's
+            # own cwd -- the one tree a prompt-injected worker can plant in. The
+            # shared helper refuses a linked PARENT and stages the write, then
+            # renames over the final name -- so a link sitting at that name is
+            # REPLACED by a real file rather than written through, and the file it
+            # pointed at keeps its bytes. A reader never sees a half-written
+            # overlay either, because the rename publishes it whole.
+            store.atomic_write_text(cli_json, json.dumps(existing, indent=2))
     except Exception:
         logger.debug("could not write review effort overlay (work_dir=%s)", work_dir, exc_info=True)
 
@@ -626,14 +649,33 @@ class ReviewPool:
                             # requires every permission decision to emit an SEL event, and
                             # the EVENT_TOOL_CALL audit carries no decision/request id.
                             req_id = getattr(ev, "request_id", "")
+                            reason = await asyncio.to_thread(
+                                refusal_for,
+                                ev,
+                                session_key=getattr(handle, "session_id", "") or "",
+                                agent=self._agent,
+                                app="code-review-sage",
+                                security_only=False,
+                            )
+                            if reason is not None:
+                                await self._audit_tool(
+                                    handle,
+                                    ev,
+                                    request_id=req_id,
+                                    outcome="rejected_hook_deny",
+                                )
+                                await handle.reject_tool(req_id)
+                                continue
                             try:
-                                await handle.approve_tool(req_id)
+                                approval_sent = await handle.approve_tool(req_id)
                             except Exception:
                                 logger.debug("tool approve failed", exc_info=True)
                             else:
                                 await self._audit_tool(
                                     handle, ev, request_id=req_id,
-                                    outcome="auto_approved")
+                                    outcome=("auto_approved"
+                                             if approval_sent is not False
+                                             else OUTCOME_REJECTED_TRANSPORT_FLOOR))
                         elif kind == EVENT_COMPLETE:
                             stop_reason = getattr(ev, "stop_reason", "") or ""
                             break

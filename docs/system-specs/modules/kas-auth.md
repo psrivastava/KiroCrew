@@ -3,23 +3,33 @@
 > Status: implemented and wired to the KAS relay. The auth subsystem lives under
 > `src/kiro_crew/auth/` with unit tests. Its runtime consumer is
 > `src/kiro_crew/acp/kas_host_auth.py`: when the vault holds an identity, the KAS
-> backend spawns `kiro-cli acp --agent-engine v3` WITHOUT `--auth-method cli`, so the
-> engine's `_kiro/auth/getAccessToken` request reaches Kiro Crew, and `AcpRuntime`
-> answers it from `KasAuthProvider.get_access_token_callback()`. With no identity
-> stored the spawn keeps `--auth-method cli` and kiro-cli owns login exactly as
-> before. kiro-cli remains the ACP service either way; Crew never spawns the KAS
+> backend spawns the relay in `acp --agent-engine v3` mode WITHOUT `--auth-method
+> cli`, so the engine's `_kiro/auth/getAccessToken` request reaches Kiro Crew, and
+> `AcpRuntime` answers it from `KasAuthProvider.get_access_token_callback()`. That
+> spawn enters through `kiro-cli-chat` when one sits beside the resolved `kiro-cli`
+> (`kiro_cli.chat_sibling`, consulted by `acp/harness/kas.py` on the Crew-owned
+> branch only, never for an explicit `KIROCREW_KIRO_BIN`, never on Windows whose one
+> `kiro-cli.exe` is the chat-cli crate itself): the POSIX `kiro-cli` is the q_cli launcher, and it checks its OWN
+> sign-in before exec'ing `kiro-cli-chat` for `acp` regardless of `--auth-method`, so
+> through it a Crew-owned spawn on a host where kiro-cli is signed out -- the host
+> this mode exists for -- exits `You are not logged in` before the engine ever asks
+> Crew (measured on kiro-cli 2.25.0; `kiro-cli-chat acp --agent-engine v3` starts KAS
+> in `--auth=acp-callback` and the turn completes). With no identity stored the spawn
+> keeps `--auth-method cli` through the launcher and kiro-cli owns login exactly as
+> before, an API-key sign-in included: that cli-owned relay is handed `KIRO_API_KEY`
+> like the kiro backend, while a Crew-owned relay has it stripped because the engine
+> prefers an environment key over the callback (`KasHarness.apply_spawn_env`,
+> `cli_owned_auth`). kiro-cli remains the ACP service either way; Crew never spawns the KAS
 > bundle itself.
 
 ## Why this exists
 
-In the kiro-cli runtime, Kiro Crew never held Kiro credentials of its own: every ACP
-backend delegated auth to the `kiro-cli` process it spawned, and the KAS bridge
-obtained tokens by calling back into `kiro-cli chat _ get-kas-token`. In **KAS mode
-there is no kiro-cli**, so Kiro Crew must perform the entire Kiro OIDC lifecycle
-itself: interactive login, token refresh, secure storage, and identity
-classification — then feed the result to the embedded KAS engine.
-
-This is the last dependency severed when moving from "spawn kiro-cli" to "embed KAS".
+In the kiro-cli runtime, Kiro Crew holds no Kiro credentials of its own: every ACP
+backend delegates auth to the `kiro-cli` process it spawns. In **KAS mode** kiro-cli
+stays the ACP relay, but it does not own the credential: the engine asks the host
+for a token with `_kiro/auth/getAccessToken`, and Kiro Crew answers it from
+`acp/kas_host_auth.py`. So Kiro Crew performs the entire Kiro OIDC lifecycle itself:
+interactive login, token refresh, secure storage, and identity classification.
 
 ## Scope
 
@@ -35,7 +45,9 @@ Confirmed against `@kiro/agent` source (`packages/kiro-agent/src/server/`). KAS
 consumes a token through one of two injection points; both take the same logical
 contract:
 
-1. **Library injection (preferred, in-process KAS).** `KiroAgentOptions.authProvider`
+1. **Library injection (in-process KAS; unbuilt design).** Kiro Crew does not run KAS
+   in-process today, so this point is not wired; it records the contract a future
+   in-process host would meet. `KiroAgentOptions.authProvider`
    is a required constructor field of type `IAuthProvider`
    (`src/index.ts` exports `IAuthProvider`). Interface:
 
@@ -54,7 +66,8 @@ contract:
    header middleware `addKiroAuthHeaders`). Our implementation SHOULD implement it too,
    so the full request path is exercised.
 
-2. **acp-callback.** KAS calls back `_kiro/auth/getAccessToken` (empty request body).
+2. **acp-callback (the shipped path).** KAS, behind the kiro-cli relay, calls back
+   `_kiro/auth/getAccessToken` (empty request body).
    Response shape (`packages/acp-type-covenant/capabilities/auth/get-access-token.ts`):
 
    ```ts
@@ -155,8 +168,8 @@ driving Kiro's own portal/service exactly as the CLI does. This works only as lo
 Kiro's server keeps accepting the `kirocli` portal contract and the allowlisted ports.
 
 Endpoints (host: `https://prod.us-east-1.auth.desktop.kiro.dev`, portal:
-`https://app.kiro.dev`; both overridable — `KIRO_AUTH_PORTAL_URL`, setting
-`ApiKiroAuthService`):
+`https://app.kiro.dev`; both overridable — `KIRO_AUTH_SERVICE_URL` for the service,
+`KIRO_AUTH_PORTAL_URL` for the portal):
 
 - **Loopback:** open
   `GET {portal}/signin?state=…&code_challenge=…&code_challenge_method=S256&redirect_uri=http://localhost:<port>&redirect_from=kirocli`;
@@ -247,10 +260,11 @@ Error split at the store API: an unknown identity kind raises `ValueError` (HTTP
 400 at the API layer); a vault read/write failure raises `TokenStoreError` (coded
 HTTP 500) — a logout that could not remove the credential never reports success.
 
-Three-source priority when multiple credentials exist (from kiro-cli `auth/mod.rs`):
-**External IdP > Builder ID > Social**, then `KIRO_API_KEY` env as final fallback.
+Priority when multiple credentials exist (`store._PRIORITY`, mirroring kiro-cli
+`auth/mod.rs`): **External IdP > Builder ID > Identity Center > Social**, then
+`KIRO_API_KEY` env as final fallback.
 
-## Module shape (proposed)
+## Module shape
 
 New subsystem `src/kiro_crew/auth/` (implemented):
 
@@ -260,7 +274,8 @@ auth/
   provider.py        # KasAuthProvider: implements the IAuthProvider contract
   bridge.py          # KAS seam: acp-callback handler + IAuthProvider-shaped mapping
   refresh.py         # per-identity refresh + cross-process single-flight lock
-  store.py           # 0600 token file store, three-source priority resolver
+  store.py           # SecretVault adapter (kas/.vault) + identity priority resolver
+  service.py         # KasLoginService: begin/poll/cancel/logout state machine for the API
   shape.py           # install-shape detection -> transport selection
   login/
     endpoints.py     # endpoint constants (mirror consts.rs; env-overridable)
@@ -268,11 +283,12 @@ auth/
     device.py        # social device-code flow (no callback)
     builder_id.py    # AWS SSO-OIDC RegisterClient + device-code
     external_idp.py  # customer IdP authorization-code
+    control_plane.py # ListAvailableProfiles: resolves the profile ARN for IdC sign-in
 ```
 
 Wiring: the KAS bridge answers `_kiro/auth/getAccessToken` (acp-callback) from
-`KasAuthProvider`, or hands `KasAuthProvider` directly to `KiroAgentOptions.authProvider`
-when KAS runs in-process. Refresh tokens never leave Kiro Crew; KAS only ever sees an
+`KasAuthProvider`. Handing `KasAuthProvider` to `KiroAgentOptions.authProvider` for an
+in-process KAS is unbuilt design. Refresh tokens never leave Kiro Crew; KAS only ever sees an
 access token.
 
 ## Security invariants
@@ -306,12 +322,12 @@ access token.
 
 - Live-endpoint validation of Builder ID / IdC / External IdP (only social device flow
   is proven against the real service).
-- The loopback flow's dashboard driver is not built yet: `portal.py` ships the URL/
-  port/exchange primitives **and** the callback listener (`wait_for_callback`), but no
-  `/api/kas-login` endpoint starts the loopback flow — only the device-code flow has
-  begin/poll routes. A desktop (loopback-transport) sign-in therefore has no server
-  entry point yet; the chooser must force device transport, or a begin-loopback route
-  must land, before the loopback path is wired into the app root.
+- The loopback flow has a dashboard driver: `POST /api/kas-login/loopback`
+  (`api_kas_login_begin_loopback`) starts the PKCE loopback sign-in and returns the
+  portal URL plus the polling handle. A coded 409 `loopback_unavailable` (the install
+  shape does not support loopback, or every allowlisted port is busy) sends the client
+  to the device flow. `POST /api/kas-login/cancel` abandons a pending sign-in and
+  releases the loopback callback port at once instead of at its deadline.
 - Wiring `KasAuthProvider` to the running engine is done through the kiro-cli relay
   (`acp/kas_host_auth.py` + the `_kiro/auth/getAccessToken` handler on
   `AcpRuntime`'s reader loop). Verified end-to-end against a real kiro-cli release
@@ -324,7 +340,7 @@ access token.
   Kiro Crew"`, the engine does not wedge — `initialize` and `session/new` still
   complete, it re-asks on each attempt, and `session/prompt` fails `-32000` with its
   own "not signed in … Please sign in and retry" (`ModelRegistryUnauthenticatedError`
-  / `TokenExpiredError`), which `acp/client.py`'s auth-failure vocabulary now
+  / `TokenExpiredError`), which `acp/transport_errors.py`'s auth-failure vocabulary now
   recognizes so the dashboard renders the sign-in prompt rather than a raw error.
 - A Crew sign-out deletes the vault entry under the identity's refresh lock and
   retires running identity-store processes (`dashboard/handlers/kas_login.py`), so
@@ -346,29 +362,35 @@ access token.
   gap to close but a behaviour deliberately not built (see #9772); the
   pre-existing "expired access token with no refresh token" case, which the probe
   already treats as no usable identity, is left as it is and not extended.
-- The product entry point for the flow is the **Kiro sign-in card** on Developer >
-  Agent Backend (`website/src/pages/developer/KiroSignInCard.tsx`), rendered by
-  `AgentBackendTab` under the backend switch and only while KAS is a backend that
-  switch offers -- the stored identity is consumed by the KAS relay alone, so a
-  build or policy that cannot select KAS has nothing to sign in for. The card
-  embeds the same views `KasLoginGate` renders (`KasLoginEmbedded`, card chrome
-  instead of the scrim + aside door) and adds a signed-in summary (provider,
+- The product entry point for the flow is the **Kiro sign-in** section on Settings >
+  Agent Harness (`website/src/pages/developer/KiroSignInCard.tsx`, `compact`
+  form), rendered by `AgentBackendTab` INSIDE the KAS row's detail and only while
+  KAS is a backend that switch offers -- the stored identity is consumed by the
+  KAS relay alone, so a build or policy that cannot select KAS has nothing to
+  sign in for, and a row that is not KAS has no use for it. The section embeds
+  the same views `KasLoginGate` renders (`KasLoginEmbedded`, card chrome instead
+  of the scrim + aside door; in that chrome the four provider choices are
+  outlined and sit in a two-column grid, none accent-filled, because the detail's
+  own primary button is "Use {{name}}", from
+  `components.kiroPrerequisiteGate.use_agent`) and adds a signed-in summary (provider,
   expiry, renewability -- never a token) with sign-out and sign-in-again. It is
   reachable from the chat error row an `AcpAuthRequired` turn produces
   (`chat_utils.AUTH_REQUIRED_KIND` → "Sign in to Kiro", navigating to
-  `KIRO_SIGN_IN_PATH` = `/developer?tab=agent-backend&highlight=key:kiro-sign-in`
+  `KIRO_SIGN_IN_PATH` = `/settings/agent?highlight=key:kiro-sign-in`
   with the colon percent-encoded, from `pages/developer/kiroSignInLink.ts`,
-  whose `highlight` rings the card through `useSettingHighlight`, which the
-  Developer page mounts for exactly this link) and from the KAS remedy
+  whose `highlight` rings the card through the `useSettingHighlight` hook
+  SettingsPage mounts; the card's older home, `/developer?tab=agent-backend`,
+  is forwarded there by DeveloperPage with the `highlight` kept) and from the KAS remedy
   strings in `agent_sdk/host_auth.py`. Its intro sentence names the backend
   ("Used only by the KAS (kiro-agent) backend") and says Kiro CLI keeps its own
   kiro-cli login, because the card sits under a switch that also lists Kiro
   CLI. It is deliberately NOT on Settings > Overview and not indexed into
-  Settings search: KAS is a Developer Mode preview, and a provider chooser on
-  the landing page read as a required step to every user, first-run installs
-  included. Overview carries only a one-line signpost to the card
-  (`KiroSignInMovedPointer`), rendered while `agent.acp_backend` is `kas`, for
-  the users who read token expiry there. The `/developer` route is always mounted;
-  only its sidebar entry is behind Developer Mode, which a user running KAS
-  turned on to select it. `KasLoginGate` itself is still not mounted at the app
+  Settings search: a provider chooser on the landing page read as a required
+  step to every user, first-run installs included. Overview carries only a
+  one-line signpost to the card (`KiroSignInMovedPointer`), rendered while
+  `agent.acp_backend` is `kas`, for the users who read token expiry there. The
+  switch and card moved from the Developer page (whose sidebar entry is behind
+  Developer Mode) to Settings once first-run setup began offering agents other
+  than Kiro CLI, so a user who set up with one of those can switch agents later
+  without turning on Developer Mode. `KasLoginGate` itself is still not mounted at the app
   root; the full-screen form stays available for that.

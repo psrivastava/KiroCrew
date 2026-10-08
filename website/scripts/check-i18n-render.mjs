@@ -80,6 +80,7 @@ import { browserBundle } from './lib/render-scan.mjs'
 import {
   SETTLE_POLL_MS,
   SETTLE_TIMEOUT_MS,
+  createInflightUrls,
   createSettleTracker,
 } from './lib/render-settle.mjs'
 import {
@@ -879,6 +880,8 @@ async function main() {
  */
 async function sweep(browser, dist, { scanScript, dnt, surfaces, locales, label }) {
   const { srv, base } = await serveDist(dist)
+  /** The only origin a capture may load from; see the context route below. */
+  const servedOrigin = new URL(base).origin
   /** @type {Array<{surface: string, locale: string, viewport: string, finding: object}>} */
   const all = []
   /**
@@ -915,6 +918,22 @@ async function sweep(browser, dist, { scanScript, dnt, surfaces, locales, label 
           // this gate reports would otherwise be a race.
           reducedMotion: 'reduce',
         })
+        // Nothing a capture waits on may live off the loopback origin it is served
+        // from. index.html requests the webfont stylesheet from fonts.googleapis.com
+        // on every navigation (routing turns the HTTP cache off, so none of them is
+        // a cache hit), and the quiet wait counts that request like any other: one
+        // slow third-party answer would hold a surface past SETTLE_TIMEOUT_MS and
+        // fail the run for nothing in its diff. The stylesheet is answered empty, so
+        // every capture in both sweeps measures the same fallback face instead of
+        // whichever face arrived in time; any other off-origin request is refused
+        // and settles at once as `requestfailed`. The quiet wait still counts every
+        // request, so a loopback request that never answers still fails by name.
+        await context.route(
+          url => /^https?:$/.test(url.protocol) && url.origin !== servedOrigin,
+          route => (new URL(route.request().url()).hostname === 'fonts.googleapis.com'
+            ? route.fulfill({ status: 200, contentType: 'text/css', body: '' })
+            : route.abort('blockedbyclient')),
+        )
         await context.addInitScript(code => {
           localStorage.setItem('mc-lang', code)
           localStorage.setItem('mc-onboarded', '1')
@@ -934,11 +953,17 @@ async function sweep(browser, dist, { scanScript, dnt, surfaces, locales, label 
         // Cumulative counters, deliberately never reset per surface. A request that
         // outlives the surface that started it still settles, so the difference
         // stays honest across the loop; resetting would strand those stragglers and
-        // leave the count permanently short.
-        const net = { started: 0, settled: 0, get inflight() { return this.started - this.settled } }
-        page.on('request', () => { net.started += 1 })
-        page.on('requestfinished', () => { net.settled += 1 })
-        page.on('requestfailed', () => { net.settled += 1 })
+        // leave the count permanently short. `open` names the requests still in
+        // flight so a timeout can say WHICH one it was waiting on, not just how
+        // many -- the diagnostic the quiet-wait failure needs to be actionable.
+        const open = createInflightUrls()
+        const net = {
+          started: 0, settled: 0, open,
+          get inflight() { return this.started - this.settled },
+        }
+        page.on('request', request => { net.started += 1; open.start(request) })
+        page.on('requestfinished', request => { net.settled += 1; open.finish(request) })
+        page.on('requestfailed', request => { net.settled += 1; open.finish(request) })
         await stubDashboardApi(page, {
           theme: 'dark',
           extra: (path, route) => FIXTURE_OVERRIDES(locale.code, path, route),
@@ -988,10 +1013,10 @@ async function sweep(browser, dist, { scanScript, dnt, surfaces, locales, label 
           // than it did before.
           await waitForSurfaceQuiet(page, net, surface, label)
           // Every width this gate reports is a text measurement, and text measures
-          // differently in the fallback face than in the real one. Scanning before
-          // the webfonts land made the layout bucket differ by 2 between identical
-          // runs (artifacts.layout 4 vs 2), which would have made the whole gate
-          // flaky rather than wrong. Two rAF ticks after that let the resulting
+          // differently while a face is still loading than once it has. The remote
+          // webfont never loads here (the context route answers its stylesheet
+          // empty), but the faces index.css declares itself still load on first
+          // use, so wait for them. Two rAF ticks after that let the resulting
           // reflow finish before anything is read.
           await page.evaluate(() => document.fonts.ready)
           await page.evaluate(() => new Promise(r => requestAnimationFrame(
@@ -1082,8 +1107,13 @@ async function waitForSurfaceQuiet(page, net, surface, label) {
     await page.waitForTimeout(SETTLE_POLL_MS)
   }
   const seen = tracker.last || { chars: 0, nodes: 0 }
+  const stuck = net.open ? net.open.urls() : []
+  const stuckLine = stuck.length
+    ? `\n    Still in flight: ${stuck.join(', ')}.`
+    : ''
   die(`[${label}] ${surface.url} never went quiet in ${SETTLE_TIMEOUT_MS}ms `
-    + `(${net.inflight} request(s) in flight, ${seen.chars} chars, ${seen.nodes} nodes). `
+    + `(${net.inflight} request(s) in flight, ${seen.chars} chars, ${seen.nodes} nodes).`
+    + stuckLine + ' '
     + 'A surface that keeps changing cannot be compared against a second sweep. Give it a '
     + 'deterministic fixture in FIXTURE_OVERRIDES, or drop it from lib/i18n-surfaces.mjs '
     + 'with a comment saying why.')

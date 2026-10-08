@@ -28,22 +28,33 @@ import { commandFolderName, fileSessionInCommandFolder } from './sessionFolder'
 import type { ChatFolderRow } from './sessionFolder'
 import type { ChatFolder } from '../../types'
 import { appNavTargets } from '../../appNav'
-import { useAppDispatch, useAppSelector } from '../../store'
+import { useAppDispatch, useAppSelector, useAppStore } from '../../store'
 import { createSlot, setPendingInput, switchSlot, requestFolderReveal } from '../../store/chatSlice'
+import { focusComposerForOpenedSession } from '../../pages/chat/composerFocus'
 import { findReport } from '../../utils/errorReport'
 import { errMessage } from '../../utils/thunkError'
 import ErrorNotice from '../../components/ErrorNotice'
 import { Highlighted } from '../../components/commandPalette/Highlighted'
 import { SETTINGS_REGISTRY } from '../../components/commandPalette/settingsRegistry.gen'
-import { localizedSettingLabel } from '../../components/commandPalette/settingsSearchCore'
+import { localizedSettingLabel, scoreSettingEntry, settingEntryOffered } from '../../components/commandPalette/settingsSearchCore'
+import { useSettingsSearchGovernance } from '../../components/commandPalette/useSettingsSearchGovernance'
 import { settingsRoute } from '../../components/commandPalette/settingsRoute'
+import type { SettingEntry } from '../../components/commandPalette/settingsTypes'
 import { settingsSubtitle } from '../../components/commandPalette/settingsTabLabel'
 import { usePaletteActions } from '../../components/commandPalette/paletteActions'
 import { appIcon } from '../../components/commandPalette/providers/appsProvider'
-import { sessionStatus, useRecentsProvider } from '../../components/commandPalette/providers/recentsProvider'
+import {
+  isEmptyNewSlot,
+  recencyEpoch,
+  sessionStatus,
+  useRecentsProvider,
+} from '../../components/commandPalette/providers/recentsProvider'
 import { createArtifactsProvider } from '../../components/commandPalette/providers/artifactsProvider'
 import type { ArtifactsResponse } from '../../components/commandPalette/providers/artifactsProvider'
 import { createFoldersProvider, FOLDERS_STALE_MS } from './foldersProvider'
+import { createMatesProvider, matesIcon, mateRoute } from './matesProvider'
+import type { KiroCrewAgent } from '../../components/AgentSelector'
+import { useFolderSortRead, type FolderSortConfigBody } from '../../hooks/useFolderSortMode'
 import { useSessionsProvider } from '../../components/commandPalette/providers/sessionsProvider'
 import type { Result } from '../../components/commandPalette/types'
 import { resolveCopyTarget, type CopyableRow } from '../../components/commandPalette/copyTarget'
@@ -57,8 +68,8 @@ import { useTheme } from '../../hooks/useTheme'
 import { i18nT } from '../../i18n/t'
 import { useLanguage } from '../../i18n/LanguageProvider'
 
-import { loadUsage, recordUse, type UsageMap } from './frecency'
-import { rankRootRows, type RankedRow, type RootGroup, type RootRow, type RootRowKind, type RowStatus } from './rootIndex'
+import { SETTING_ROW_PREFIX, loadUsage, recordUse, type UsageMap } from './frecency'
+import { rankRootRows, type OwnMatch, type RankedRow, type RootGroup, type RootRow, type RootRowKind, type RowStatus } from './rootIndex'
 import {
   argumentIsValid,
   contributedCommands,
@@ -66,6 +77,8 @@ import {
   type ContributedCommand,
 } from './contributedCommands'
 import { useImeGuard } from '../../hooks/useImeGuard'
+import { usePreviewFlag } from '../../hooks/usePreviewFlag'
+import { PREVIEW_CREW } from '../../utils/previewFlags'
 
 /**
  * Command Bar — the ⌘K launcher.
@@ -86,7 +99,7 @@ import { useImeGuard } from '../../hooks/useImeGuard'
  */
 
 /** Scoped views the bar can enter. Each one owns its own engine. */
-type Scope = null | 'sessions' | 'artifacts' | 'folders'
+type Scope = null | 'sessions' | 'artifacts' | 'folders' | 'mates'
 
 const SESSIONS_MIN_CHARS = 2
 /**
@@ -110,12 +123,60 @@ const ARTIFACTS_MIN_CHARS = 2
  * and the listing state is a shortcut to something recent, not an inventory.
  */
 const ARTIFACTS_ROW_LIMIT = 12
+/**
+ * How long the crewmate roster stays fresh inside one visit.
+ *
+ * The same 15s the views above use, deliberately rather than something longer. The
+ * argument for longer was that this corpus changes on a human timescale -- a crew is
+ * added from the Crewmates page, not by an agent's turn -- but that gets the one case
+ * that matters backwards: the human who just added a crew is the human now waiting
+ * for it to appear, and a window sized to "nobody is watching" is longest exactly
+ * when somebody is. Matching every sibling view also removes a special case with no
+ * reader behind it.
+ *
+ * The fields that DO change per turn -- whether a mate is working -- are not in this
+ * payload at all; they come from the live slot frames, which are never cached.
+ */
+const MATES_STALE_MS = 15_000
 const DEBOUNCE_MS = 150
+
+/**
+ * Sessions the root lifts into its `recent` group.
+ *
+ * Three, because the value of this group is that the reader does not have to READ
+ * it — at three rows the one they want is recognised at a glance and reached with
+ * one arrow key, and the group costs the commands below it almost nothing. Sized to
+ * the glance, not to the corpus: a fourth row buys a little more coverage and takes
+ * the "no reading required" property with it, and the whole corpus is one row below
+ * under Search Sessions.
+ */
+const RECENT_SESSION_ROWS = 3
+
+/**
+ * A settings row's matcher: the settings scorer decides whether and how well it
+ * matches, and its tier says which field to draw the hit on.
+ */
+function settingRowMatch(query: string, entry: SettingEntry): OwnMatch | null {
+  const hit = scoreSettingEntry(query, entry)
+  if (!hit) return null
+  if (hit.tier === 'label') return { score: hit.score, indices: hit.indices, field: 'title' }
+  return {
+    score: hit.score, indices: [], field: hit.matchedKeyword ? 'keyword' : 'subtitle',
+    matchedKeyword: hit.matchedKeyword, discounted: hit.tier === 'corpus',
+  }
+}
 
 function groupLabel(group: RootGroup): string {
   switch (group) {
     case 'attention':
       return i18nT('apps.commandBar.group_attention')
+    case 'recent':
+      // Its own header key beside `group_attention`, not the recents listing's bare
+      // "Recent" (which `group_recent` already carries for the artifacts view): these
+      // rows are the same session objects as "New Session" and "Search Sessions"
+      // beside them, and a header naming the group ("Recent sessions") says so, where
+      // a lone adjective borrowed from another surface reads as a different thing.
+      return i18nT('apps.commandBar.group_recent_sessions')
     case 'commands':
       return i18nT('apps.commandBar.group_commands')
     case 'apps':
@@ -136,8 +197,25 @@ function groupLabel(group: RootGroup): string {
  * section exists — and a "Session" kind was considered for this surface once
  * before and dropped.
  */
-function kindLabel(row: { kind: RootRowKind; group: RootGroup; appLabel?: string }): string | null {
+function kindLabel(
+  row: { kind: RootRowKind; group: RootGroup; appLabel?: string },
+  queryActive = false,
+): string | null {
+  // An attention row's column carries its LIVE STATE, which is both more useful than
+  // a kind word and the reason that section exists. It is never empty: a row reaches
+  // this group only because its status is a pill, so the renderer always has one to
+  // show and never falls through to this label.
   if (row.group === 'attention') return null
+  // A recent row is named by its own group header and its session glyph, and its
+  // right-hand column belongs to whatever the session is DOING. Labelling it
+  // "Command" would be both wrong and the widest thing on the row.
+  //
+  // Under a QUERY there is no header (the list is one ranked block, so it carries
+  // none), and an idle session has no live state either — which left the row as a
+  // glyph and a title while every row beside it still showed its word. So the group's
+  // own name stands in, in the column that is empty anyway. The idle page is
+  // unchanged: the header above the row says this there.
+  if (row.group === 'recent') return queryActive ? groupLabel('recent') : null
   if (row.kind === 'view') return i18nT('apps.commandBar.kind.view')
   if (row.group === 'apps') return i18nT('apps.commandBar.kind.app')
   if (row.group === 'settings') return i18nT('apps.commandBar.kind.setting')
@@ -170,6 +248,8 @@ function rootRowCopyable(row: RootRow): CopyableRow {
 function groupIcon(group: RootGroup) {
   switch (group) {
     case 'attention':
+      return <MessageSquare size={14} className="lucide-inline" />
+    case 'recent':
       return <MessageSquare size={14} className="lucide-inline" />
     case 'commands':
       return <Terminal size={14} className="lucide-inline" />
@@ -262,6 +342,14 @@ type Slot =
    * them can disagree about which corpus the Enter reaches.
    */
   | { key: string; tag: 'fallback-folders' }
+  /**
+   * Carry the typed text into the crewmates view.
+   *
+   * Its own tag for the reason the two above give: the footer's action name, the
+   * rendered row and the activation all switch on the tag, so none of them can
+   * disagree about which corpus the Enter reaches.
+   */
+  | { key: string; tag: 'fallback-mates' }
   /** Hand the typed text to an agent — the active session, or a new one. */
   | { key: string; tag: 'ask' }
   /** The dead end's way out: the corpora this surface does not reach. */
@@ -272,6 +360,8 @@ type Slot =
   | { key: string; tag: 'retry-artifacts' }
   /** Re-run a folder listing that failed. */
   | { key: string; tag: 'retry-folders' }
+  /** Re-run a crewmate listing that failed. */
+  | { key: string; tag: 'retry-mates' }
   /** Drop the query and fall back to the recent sessions listing. */
   | { key: string; tag: 'clear-query' }
   /**
@@ -283,6 +373,23 @@ type Slot =
    * and `actionLabel` is pure over the slot precisely so it cannot.
    */
   | { key: string; tag: 'clear-query-folders' }
+  /**
+   * Drop the query and fall back to the whole crew roster.
+   *
+   * Separate from the two above for the reason they are separate from each other:
+   * the destination is named in the row's own words, and `actionLabel` is pure over
+   * the slot precisely so it cannot read the live scope to pick between them.
+   */
+  | { key: string; tag: 'clear-query-mates' }
+  /**
+   * The reader has NO crew: say so, and go make one.
+   *
+   * A row rather than the centred empty-state sentence this replaces, because that
+   * sentence named the Crewmates page and gave no way to reach it -- "nothing looks
+   * like a link". The empty state of a view whose whole subject is a collection the
+   * reader creates is the one place an action belongs most.
+   */
+  | { key: string; tag: 'open-crewmates' }
 
 /**
  * What Enter on this slot will do, named for the footer.
@@ -318,6 +425,11 @@ function actionLabel(slot: Slot): string {
       // the rows that approve or merge.
       if (slot.row.providerId === 'artifacts') return i18nT('apps.commandBar.action_open_artifact')
       if (slot.row.providerId === 'folders') return i18nT('apps.commandBar.action_open')
+      // Named for the DESTINATION, not the object: Enter lands on the mate's own chat
+      // thread, and a bare "Open" would leave a reader guessing between that and a
+      // settings page for the crew. The verb is deliberately not "Run" — that is this
+      // footer's strongest word, reserved for the rows that approve or merge.
+      if (slot.row.providerId === 'mates') return i18nT('apps.commandBar.action_open_mate')
       return i18nT('apps.commandBar.action_open_session')
     case 'fallback':
       return i18nT('apps.commandBar.action_search_sessions')
@@ -325,6 +437,8 @@ function actionLabel(slot: Slot): string {
       return i18nT('apps.commandBar.action_search_artifacts')
     case 'fallback-folders':
       return i18nT('apps.commandBar.action_search_folders')
+    case 'fallback-mates':
+      return i18nT('apps.commandBar.action_search_mates')
     case 'ask':
       return i18nT('apps.commandBar.action_ask')
     case 'recovery':
@@ -332,11 +446,18 @@ function actionLabel(slot: Slot): string {
     case 'retry':
     case 'retry-artifacts':
     case 'retry-folders':
+    case 'retry-mates':
       return i18nT('apps.commandBar.retry')
     case 'clear-query':
       return i18nT('apps.commandBar.action_show_recent')
     case 'clear-query-folders':
       return i18nT('apps.commandBar.action_show_all_folders')
+    case 'clear-query-mates':
+      return i18nT('apps.commandBar.action_show_all_mates')
+    case 'open-crewmates':
+      // Names the DESTINATION, not the bare verb. "Open" on the one row a crew-less
+      // reader ever sees does not say open what.
+      return i18nT('apps.commandBar.action_open_crewmates')
   }
 }
 
@@ -347,9 +468,18 @@ function actionLabel(slot: Slot): string {
  * them by (the recents listing separates live sessions from history). The synthetic
  * slots — fallback, recovery, retry — head on nothing: they are one-offs at the
  * bottom of the list, and a header over a single row is noise.
+ *
+ * `queryActive` turns the root's headers OFF, because under a query the root is one
+ * list ranked by match, not blocks filed by group — so a group can appear, be left,
+ * and appear again, and a header per transition would print "Commands" twice with an
+ * app between them and describe nothing. Each row still names its own kind in its
+ * right-hand column, which is where a ranked list carries that fact. View slots keep
+ * their headers either way: an engine's grouping is a fact about its results, not a
+ * filing order the query just replaced.
  */
-function headerOf(slot: Slot, prev?: Slot): string | null {
+function headerOf(slot: Slot, prev?: Slot, queryActive = false): string | null {
   if (slot.tag === 'root') {
+    if (queryActive) return null
     if (prev?.tag === 'root' && prev.row.group === slot.row.group) return null
     return groupLabel(slot.row.group)
   }
@@ -444,6 +574,20 @@ export default function CommandBarOverlay({
   onClose: () => void
 }) {
   const ime = useImeGuard()
+  /**
+   * Whether the Crewmates preview is on for this reader.
+   *
+   * This bar is an INGRESS to `/members`, and that page is registered with
+   * `previewFlag: PREVIEW_CREW` — so every other door to it applies this gate, and a
+   * surface that did not would advertise a page the operator has not opted into. The
+   * app ships `defaultEnabled: true`, so without this a default install shows
+   * `Search Crewmates` in the root, carries a typed query into it, and lets Enter
+   * reach `/members` while the page itself is supposed to be invisible.
+   *
+   * It gates all THREE rows this feature adds — the view row, the fallback row and the
+   * empty-state row — because each one is independently reachable.
+   */
+  const crewPreview = usePreviewFlag(PREVIEW_CREW)
   const vv = useVisualViewport()
   const inputRef = useRef<HTMLInputElement | null>(null)
   const dialogRef = useRef<HTMLDivElement | null>(null)
@@ -475,7 +619,31 @@ export default function CommandBarOverlay({
   const [previewClipped, setPreviewClipped] = useState(false)
 
   const [selected, setSelected] = useState(0)
+  /**
+   * A keyboard Enter that landed in the debounce window, held until the rows answer
+   * the query it was pressed against -- and no later one.
+   *
+   * A scoped view ranks from the DEBOUNCED query, so for one interval after a
+   * keystroke its rows answer the previous one. An Enter then names a row built from
+   * the old query, and this latch is the launcher's primary gesture -- type a name,
+   * confirm it -- waiting for the rows to catch up rather than being eaten. The latch
+   * remembers the exact query the reader confirmed and the row they had selected: it
+   * fires once, on the live rows, only when the live query is still that query, the
+   * selection is still that row, and the top of the list is a settled result. Any
+   * further input, any selection move, a pointer activation, Escape, leaving the
+   * scope, or closing the bar drops it instead -- a latch that outlived the reader's
+   * confirmation would open a query they never confirmed, or a row they moved off of.
+   * A read that fails with no cached rows leaves a retry row at the top, which is not
+   * a result, so the latch drops on that dead end; a refetch that fails while the
+   * confirmed query's rows are still cached fires those rows -- they answer the query
+   * the reader confirmed, exactly as a fresh Enter would. `null` when no Enter is
+   * pending.
+   */
+  const [pendingEnter, setPendingEnter] = useState<{ query: string; index: number; key: string } | null>(null)
   const [usage, setUsage] = useState<UsageMap>(() => loadUsage())
+  // The rows every other settings search withholds, withheld here too, from
+  // cached answers only: the root issues no request.
+  const settingsGovernance = useSettingsSearchGovernance({ fetch: false })
   const [actionError, setActionError] = useState<string | null>(null)
   /**
    * What the last copy did, held until the reader moves.
@@ -525,6 +693,11 @@ export default function CommandBarOverlay({
   const { resolved } = useLanguage()
   const { cycle: cycleTheme } = useTheme()
   const dispatch = useAppDispatch()
+  // A store HANDLE for the session rows' post-switch focus: by the time a
+  // `switchSlot` settles this bar has closed, so only the store can still say
+  // which slot is active. Read, never subscribed -- the selectors below are the
+  // subscriptions.
+  const store = useAppStore()
   // Live session state, read straight from the store the dashboard already keeps
   // current over its socket. This is what lets the root LEAD with the sessions that
   // owe the user something without issuing a request: the facts are already here,
@@ -580,6 +753,23 @@ export default function CommandBarOverlay({
   const chatFoldersRef = useRef<unknown>(chatFolders)
   chatFoldersRef.current = chatFolders
   const queryClient = useQueryClient()
+
+  // The person's folder sort mode (`dashboard.folder_sort`), read the same way as the
+  // two entries above — a SUBSCRIBER to the shared `['kirocrewConfig']` key, never a
+  // fetch: the shell's own read of that key holds the entry from boot and the
+  // WebSocket invalidates it on a config change, so fetching here would be the
+  // request-on-open this surface exists to avoid, for a value that is already in the
+  // cache. Read through the sidebar hook's own derivation, so the Folders view
+  // below lists in the order the sidebar draws — and says the same failed read the
+  // sidebar says, above its list, when there is no body to draw from (there is no
+  // sidebar on this surface to say it). A body on hand is drawn and acted on,
+  // whatever the shell's last refetch did.
+  const kirocrewConfigQuery = useQuery<FolderSortConfigBody>({
+    queryKey: ['kirocrewConfig'],
+    queryFn: () => api.kirocrewConfig(),
+    enabled: false,
+  })
+  const { mode: folderSortMode, error: folderSortError } = useFolderSortRead(kirocrewConfigQuery)
 
   /**
    * The artifacts view's engine.
@@ -655,8 +845,83 @@ export default function CommandBarOverlay({
           dispatch(requestFolderReveal(folderId))
           navigate('/chat')
         },
+        // The sidebar's own mode, so the listing is the sidebar's order and not a
+        // second one. A dep of the memo: a mode switch rebuilds the engine, and the
+        // scope query below keys on the mode too, so the switch is never served from
+        // a 15-second-stale list in the old order.
+        mode: folderSortMode,
       }),
-    [dispatch, navigate, queryClient],
+    [dispatch, navigate, queryClient, folderSortMode],
+  )
+
+  /**
+   * Which crewmates are working, keyed by crew NAME.
+   *
+   * Derived from the same live slot frames the attention group above reads, so the
+   * running indicator costs this surface no request and cannot disagree with what the
+   * Crewmates page shows — that page reads `running || subagents_running` off these
+   * same frames.
+   *
+   * Keyed on `agent` rather than on the slot key, and that is sound because a member
+   * slot is BORN with its crew pinned: the thread route sets `slot.agent` to the
+   * member's exact name and refuses a slot whose agent is anything else. The slot key
+   * would need the member's persisted `member_id` to reconstruct, which the catalog
+   * rows do not carry.
+   *
+   * A mate with several member slots is working if ANY of them is, which is the
+   * question the reader is asking: whether interrupting would land on a busy agent.
+   */
+  const runningMates = useMemo(() => {
+    const byName = new Set<string>()
+    for (const slot of liveSlots) {
+      if (slot.mode !== 'member') continue
+      if (!(slot.running || slot.subagents_running)) continue
+      if (slot.agent) byName.add(slot.agent)
+    }
+    return byName
+  }, [liveSlots])
+
+  /**
+   * The crewmates view's engine — this app's own roster corpus
+   * (`./matesProvider`), wired to THIS surface's seams.
+   *
+   * Inert on construction, like the three engines above: `fetchQuery` runs from
+   * `search()`, and the only call site is gated on the mates scope. That gating is
+   * what keeps the root request-free, and it matters more here than for folders —
+   * the catalog is not seeded into the cache by any WebSocket push, so there is no
+   * warm-cache path to fall back on and an ungated read would be a real request on
+   * every open.
+   */
+  const mates = useMemo(
+    () =>
+      createMatesProvider({
+        fetchMates: async () => {
+          const body = await queryClient.fetchQuery<{ agents?: KiroCrewAgent[] }>({
+            // The SHARED key `NewCrewmateDialog` already uses for this exact read --
+            // the sessionless `api.agentCatalog()`, whose answer is the GLOBAL roster.
+            // A second key of this surface's own would be two caches of one response:
+            // the dialog opens, fetches, and closes; the bar then refetches the same
+            // bytes. (`['agents-installed']` is a DIFFERENT endpoint, `GET /api/agents`,
+            // so it is not the one to join.)
+            //
+            // Sessionless on purpose: a session key would add whichever chat's project
+            // templates are in scope, and this surface fires from anywhere in the
+            // dashboard, so the crew a reader can reach must not depend on which pane
+            // they last touched.
+            queryKey: ['agents-catalog', 'global'],
+            queryFn: () => api.agentCatalog(),
+            staleTime: MATES_STALE_MS,
+          })
+          // The key is shared, so what comes back is whatever the last writer put
+          // there. A non-array reaches `.filter` in the provider and throws in render,
+          // which would take the whole launcher down over a payload only this view
+          // needs.
+          return Array.isArray(body?.agents) ? body.agents : []
+        },
+        openMate: name => navigate(mateRoute(name)),
+        isRunning: name => runningMates.has(name),
+      }),
+    [navigate, queryClient, runningMates],
   )
 
   useEffect(() => {
@@ -755,9 +1020,11 @@ export default function CommandBarOverlay({
     // the user to ignore it, and the whole value is that its presence means
     // something. A running session is not waiting on anyone and stays in the
     // sessions view where it belongs.
+    const lifted = new Set<string>()
     for (const slot of liveSlots) {
       const st = sessionStatus(slot, unreadSlots, slotStatusDetail[slot.key], simplifiedToolNames)
       if (st.style !== 'pill' || !st.label || !st.colorVar) continue
+      lifted.add(slot.key)
       rows.push({
         id: `attention:${slot.key}`,
         title: slot.title || slot.key,
@@ -768,11 +1035,62 @@ export default function CommandBarOverlay({
         // Same activation the sidebar and the recents listing use, so a session
         // opened from here lands exactly where it lands from anywhere else.
         run: async () => {
-          dispatch(switchSlot({ key: slot.key, announceOnMissing: true }))
+          // Not awaited: the bar closes once this promise settles, and a session
+          // open closes it at once -- a failed switch is explained by the pane's
+          // own notice, not by keeping the bar up. The switch is handed on so the
+          // composer is focused only once it has landed (#15732): `pending` enters
+          // the slot synchronously, and a caret placed before the gateway answers
+          // would file the keystrokes typed meanwhile under a slot a 404 then evicts.
+          const switched = dispatch(switchSlot({ key: slot.key, announceOnMissing: true })).unwrap()
           navigate('/chat')
+          focusComposerForOpenedSession(switched, slot.key, store)
         },
       })
     }
+    // Then the sessions the reader was last in.
+    //
+    // This is the one thing the surface is opened for most and the one thing it used
+    // to answer worst: switching back to yesterday's conversation meant entering the
+    // sessions view and typing a name the reader had to remember. The facts are in
+    // the same live store the block above reads, so the root pays no request for
+    // them — which is the property that decides WHERE this can live. The full corpus
+    // stays behind Search Sessions; this is the shortcut, not the index.
+    //
+    // Empty untitled slots are excluded: switching into a blank chat is what the New
+    // Session command is for, and one of those rows is indistinguishable from
+    // another. A slot already lifted into `attention` is excluded too — it is on
+    // screen, above this, carrying more information than a second copy would.
+    const recentSlots = liveSlots
+      .filter(slot => !lifted.has(slot.key) && !isEmptyNewSlot(slot))
+      .sort((a, b) => recencyEpoch(b) - recencyEpoch(a))
+      .slice(0, RECENT_SESSION_ROWS)
+    recentSlots.forEach(slot => {
+      const st = sessionStatus(slot, unreadSlots, slotStatusDetail[slot.key], simplifiedToolNames)
+      rows.push({
+        id: `recent:${slot.key}`,
+        title: slot.title || slot.key,
+        group: 'recent',
+        kind: 'invoke',
+        icon: <MessageSquare size={14} className="lucide-inline" />,
+        // Running state only, and never a pill: a pill means the session is waiting
+        // on the reader, and every session that is has already been lifted into the
+        // block above. Two treatments of "needs me" on one page is how the signal
+        // stops meaning anything.
+        status:
+          st.style === 'dot' && st.label && st.colorVar
+            ? { colorVar: st.colorVar, label: st.label, detail: st.detail, pulse: st.pulse }
+            : undefined,
+        // Pushed in recency order — recentSlots is sorted newest-first — which is the
+        // order the root's idle-ordered `recent` group keeps, so the row needs no
+        // sort key of its own.
+        run: async () => {
+          // See the attention row above (#15732).
+          const switched = dispatch(switchSlot({ key: slot.key, announceOnMissing: true })).unwrap()
+          navigate('/chat')
+          focusComposerForOpenedSession(switched, slot.key, store)
+        },
+      })
+    })
     rows.push(
       {
         id: 'command:new-session',
@@ -857,6 +1175,36 @@ export default function CommandBarOverlay({
         keywords: ['sidebar', 'tree', 'group'],
       },
     )
+    // The crew, reached the way the three corpora above are: ONE row that opens a
+    // view. A roster is small enough that flattening it into the first page looks
+    // tempting, and `matesProvider` records why it is not — the catalog behind it is a
+    // FETCH, so a root group would either issue a request on every open of this bar or
+    // show an empty Crewmates group on a cold install.
+    //
+    // Behind the PREVIEW GATE, because this row is an INGRESS to `/members` and that
+    // page is registered with `previewFlag: PREVIEW_CREW`. Every other door to it
+    // applies the same gate; a launcher row that did not would advertise a page the
+    // operator has not opted into, and this app ships `defaultEnabled: true`, so it
+    // would do so on a default install.
+    if (crewPreview) {
+      rows.push({
+        id: 'command:search-mates',
+        title: i18nT('apps.commandBar.cmd_search_mates'),
+        // "Crewmate" is this product's word, the way "artifact" is: a reader who has
+        // not opened the Crewmates page has no reason to know that the agents they
+        // talk to have their own durable threads. The subtitle names what the view
+        // gets them instead of restating the category.
+        subtitle: i18nT('apps.commandBar.cmd_search_mates_sub'),
+        group: 'commands',
+        kind: 'view',
+        view: 'mates',
+        icon: matesIcon(),
+        // The words a reader who has not learned "crewmate" would reach for. `agent`
+        // earns its place above all of them: it is what the rest of the product calls
+        // the thing answering them.
+        keywords: ['crew', 'agent', 'member', 'mate', 'teammate', 'roster'],
+      })
+    }
     // Commands contributed by installed apps. This is the seam that lets a row live
     // outside this repository: the app declares the row and what it does, and the
     // host renders and runs it. Nothing app-authored executes here.
@@ -878,6 +1226,10 @@ export default function CommandBarOverlay({
         // Leaving this to the manifest would mean asking every app author to
         // volunteer their row out of the first page, which none would.
         idleDemote: cmd.argument !== null,
+        // What the group's cap counts -- see `RootRow.contributed`. This is the one
+        // place a row enters the `commands` group from outside the product, so it is
+        // the one place the flag is set.
+        contributed: true,
         appLabel: cmd.appLabel,
       })
     }
@@ -897,8 +1249,12 @@ export default function CommandBarOverlay({
       })
     }
     for (const entry of SETTINGS_REGISTRY) {
+      if (!settingEntryOffered(entry, settingsGovernance)) continue
       rows.push({
-        id: `setting:${entry.id}`,
+        id: `${SETTING_ROW_PREFIX}${entry.id}`,
+        // Matched as the other settings searches match it: label, synonyms, then
+        // a description or tab that contains the query.
+        match: query => settingRowMatch(query, entry),
         // The shared resolver, not a bare labelKey lookup: resolving the key
         // alone drops the fan-out suffix ("Bot Token (Discord)" → "Bot
         // Token"), rendering per-channel rows as indistinguishable titles.
@@ -915,7 +1271,7 @@ export default function CommandBarOverlay({
     // the tree without remounting it, which does not recompute a memo. Omitting it
     // would freeze these rows in whichever language the surface first resolved.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [apps, commandById, cycleTheme, dispatch, liveSlots, navigate, resolved, simplifiedToolNames, slotStatusDetail, unreadSlots])
+  }, [apps, commandById, crewPreview, cycleTheme, dispatch, liveSlots, navigate, resolved, settingsGovernance, simplifiedToolNames, slotStatusDetail, store, unreadSlots])
 
   // The root ranks from the LIVE query, not the debounced one. Ranking is pure and
   // local, so there is nothing to throttle, and debouncing it would let a fast Enter
@@ -1038,11 +1394,130 @@ export default function CommandBarOverlay({
     error: foldersSearchError,
     refetch: refetchFolders,
   } = useQuery({
-    queryKey: ['command-bar', 'folders', folderQuery],
+    // Nested UNDER the corpus key, like the artifacts view above, because these rows
+    // are DERIVED from `['chat-folders']` and every folder write ends in
+    // `invalidateQueries({ queryKey: ['chat-folders'] })` (the create, delete and
+    // update mutations in `pages/chat-sidebar/folders.ts`). React-Query matches that by key PREFIX, so a key outside
+    // the corpus namespace is a cache no folder write can reach — and this view is
+    // unmounted whenever the bar is closed, so its one chance to re-derive is the
+    // remount, which refetches nothing that is still fresh. A folder deleted in that
+    // window would otherwise stay listed and selectable for the whole `staleTime`,
+    // pointing its reveal at an id the sidebar does not hold.
+    //
+    // The sort mode stays part of the identity: the same query in a different mode is
+    // a different list, and without it a switch made in the sidebar would be served
+    // from the previous order for the rest of the stale window.
+    queryKey: ['chat-folders', 'command-bar', 'view', folderSortMode, folderQuery],
     queryFn: () => Promise.resolve(folders.search(folderQuery)) as Promise<Result[]>,
     enabled: scope === 'folders',
     staleTime: 15_000,
   })
+
+  /**
+   * Crewmates view — ONE engine for both of its states, like the artifacts and
+   * folders views and for the same reason: the provider answers an empty query with
+   * the whole roster, so the listing the view lands on and the filtered list a query
+   * produces are the same call with a different argument.
+   *
+   * No minimum query length. The corpus is in hand once the catalog resolves, so one
+   * character costs a local filter rather than a round trip — and a floor of two
+   * would put the shortest crew names out of reach of their own first letter.
+   *
+   * No row cap either: the roster is the reader's own crew, not a corpus that grows
+   * on its own, which is the argument the folders view makes about the sidebar tree.
+   *
+   * The running set is part of the KEY, not just a dependency of the engine memo.
+   * These rows carry each mate's running state, read at the moment the provider
+   * builds them — and rebuilding the engine does not re-run a resolved query, because
+   * the key is what decides that. Without this the first frame to arrive after the
+   * view opened would leave a "Working…" dot on a mate that had since finished, and a
+   * mate that had just started would render idle.
+   *
+   * A SORTED name list rather than a count or a hash: two mates swapping which of
+   * them is working leaves the count identical, and that is precisely the change that
+   * has to reach the screen. Frames that change nothing about the roster's running
+   * set — a token tick, another surface's slot — produce the same string and cost
+   * nothing. The catalog fetch stays cached under its own key (MATES_STALE_MS), so a re-derivation
+   * is a local re-map, not a request.
+   */
+  const mateQuery = scope === 'mates' ? debounced.trim() : ''
+  const runningMatesKey = useMemo(() => [...runningMates].sort().join('\u0000'), [runningMates])
+  const {
+    data: mateRows,
+    isFetching: matesFetching,
+    isError: matesError,
+    error: matesSearchError,
+    refetch: refetchMates,
+  } = useQuery({
+    queryKey: ['command-bar', 'mates', mateQuery, runningMatesKey],
+    queryFn: () => mates.search(mateQuery) as Promise<Result[]>,
+    enabled: scope === 'mates',
+    staleTime: 15_000,
+    // The rows the reader is LOOKING AT, held across the key change the running set
+    // causes. This view is the only one whose key moves on an event the reader did
+    // not cause: a member slot finishing anywhere in the dashboard mints a new key,
+    // and without this `mateRows` goes undefined, the list blanks to placeholders,
+    // and the selection clamp below (`selected >= rowCount`) pulls the reader's
+    // keyboard selection back to row 0 mid-typing. The re-derivation is a local
+    // re-map off a cached catalog, so the stale frame it shows lasts an instant.
+    //
+    // HELD ONLY ACROSS THE RUNNING SET, never across the query. `prev => prev` held
+    // them across both, and the second one is the defect the hold was never meant to
+    // cover: once the catalog is past its stale window, the post-debounce key change
+    // starts a real request, and rows answering the PREVIOUS words stayed on screen --
+    // and actionable -- for as long as it took. Dropping them there is what the view
+    // already does in every other state where it has no answer yet: it shows the
+    // loading rows and Enter has nothing to act on.
+    placeholderData: (prev, prevQuery) =>
+      prevQuery?.queryKey?.[2] === mateQuery ? prev : undefined,
+  })
+
+  /**
+   * WHAT THE RESULT ROWS ON SCREEN ANSWER, as a value the activation path can compare
+   * against what the reader has actually typed.
+   *
+   * Every scoped view ranks from the DEBOUNCED query, because every one of them hits
+   * the network; the root ranks from the live query and needs none of this. So for one
+   * debounce interval after a keystroke, the rows in all four views answer the previous
+   * query — and an Enter in that window acts on the row that was selected against it.
+   * Typing `onc` and pressing Enter immediately opened `accountant`.
+   *
+   * The comparison is between what the view WOULD ask for the live query and what it
+   * DID ask, rather than between the two query strings, because a keystroke that does
+   * not change the request must not block anything. Sessions and artifacts only search
+   * above a floor, so below it every query asks for the same listing: on the string
+   * comparison, a one-character query in the artifacts view would have frozen Enter on
+   * a listing that was the correct answer to it.
+   *
+   * ONE derivation for all four views. The first spelling of this guard read
+   * `scope === 'mates'`, which fixed the view I was building and left the same defect
+   * in its three siblings — a symptom-level fix, correctly refused as such.
+   */
+  const askedFor = useCallback(
+    (q: string): string => {
+      switch (scope) {
+        // Below the floor the view shows recent sessions, which are the same rows for
+        // every sub-floor query, so they answer all of them.
+        case 'sessions':
+          return q.length >= SESSIONS_MIN_CHARS ? q : ''
+        case 'artifacts':
+          return q.length >= ARTIFACTS_MIN_CHARS ? q : ''
+        default:
+          return q
+      }
+    },
+    [scope],
+  )
+
+  /**
+   * Whether the rows on screen are the rows for what the reader has typed.
+   *
+   * ONE condition, and only because the crewmates view's `placeholderData` above no
+   * longer holds rows across a change of the query. Held-over rows that answer the same
+   * words as the live query are not stale in the sense this guards: what moved was a
+   * working dot, not what the row opens.
+   */
+  const rowsAnswerTheQuery = askedFor(debounced.trim()) === askedFor(query.trim())
 
   const use = useCallback((id: string) => setUsage(prev => recordUse(id, Date.now(), prev)), [])
 
@@ -1299,6 +1774,31 @@ export default function CommandBarOverlay({
       }
       return out
     }
+    if (scope === 'mates') {
+      const out: Slot[] = (mateRows ?? []).map(row => ({ key: row.id, tag: 'result' as const, row }))
+      // The same two dead ends the views above have, told apart the same way. The
+      // retry matters more here than anywhere else in this file: the catalog fetch is
+      // the one this surface has no warm-cache path for, and `useAgents` records what
+      // a swallowed failure on this exact endpoint cost — a failed load and a
+      // one-crew install rendered identically, through six triage passes.
+      if (matesError) {
+        out.push({ key: 'slot:retry', tag: 'retry-mates' })
+      } else if (!matesFetching && out.length === 0 && mateQuery) {
+        out.push({ key: 'slot:clear-query', tag: 'clear-query-mates' })
+      } else if (crewPreview && !matesFetching && out.length === 0 && mateRows !== undefined) {
+        // NO CREW AT ALL, and the reader is one keystroke from fixing that. A centred
+        // sentence naming the Crewmates page was the dead end here: a reader reported
+        // that "nothing looks like a link", so the one thing they came to do had no
+        // affordance. As a ROW it carries both halves the way `clear-query-mates` does
+        // -- what is true, and what Enter does about it -- and the keyboard can reach it
+        // without leaving the list.
+        //
+        // Gated on `mateRows !== undefined` so a cold fetch renders the skeleton rather
+        // than briefly claiming the reader has no crew.
+        out.push({ key: 'slot:open-crewmates', tag: 'open-crewmates' })
+      }
+      return out
+    }
     const out: Slot[] = ranked.map(row => ({ key: row.id, tag: 'root' as const, row }))
     if (query.trim().length > 0) {
       // The agent goes FIRST among the tail rows. Every other surface in this
@@ -1320,6 +1820,15 @@ export default function CommandBarOverlay({
       // of the three because a typed word is a session title or an artifact name far
       // more often than a folder name.
       out.push({ key: 'slot:fallback-folders', tag: 'fallback-folders' })
+      // And the same way out for the crew, for the same reason: the root holds ONE row
+      // per corpus, so a typed crew name reaches nothing until the reader thinks to
+      // enter the view first and retype it. Last of the four, because a typed word is
+      // a session title or an artifact name far more often than it is a crew's name —
+      // and a crew name that IS typed is often distinctive enough to have already
+      // matched the view row's own keywords above.
+      // Behind the same preview gate as the view row: this row is a second, independent
+      // way for a typed query to reach `/members`.
+      if (crewPreview) out.push({ key: 'slot:fallback-mates', tag: 'fallback-mates' })
       // The recovery row exists for the dead end — a typed query that matched
       // nothing — not for every keystroke. Riding the fallback's own condition put a
       // row about switching the feature off under every successful search, and
@@ -1327,7 +1836,7 @@ export default function CommandBarOverlay({
       if (ranked.length === 0) out.push({ key: 'slot:recovery', tag: 'recovery' })
     }
     return out
-  }, [argCommand, isError, isFetching, query, ranked, recentRows, scope, scopedResults, searchArmed, artifactSlotRows, artifactsError, artifactsFetching, artifactsQuery, folderQuery, folderRows, foldersError, foldersFetching])
+  }, [argCommand, crewPreview, isError, isFetching, query, ranked, recentRows, scope, scopedResults, searchArmed, artifactSlotRows, artifactsError, artifactsFetching, artifactsQuery, folderQuery, folderRows, foldersError, foldersFetching, mateQuery, mateRows, matesError, matesFetching])
 
   const rowCount = slots.length
   /**
@@ -1342,16 +1851,71 @@ export default function CommandBarOverlay({
     rowCount === 0 &&
     ((scope === 'sessions' && (isFetching || (listingArmed && recentRows === undefined))) ||
       (scope === 'artifacts' && (artifactsFetching || artifactRows === undefined)) ||
-      (scope === 'folders' && (foldersFetching || folderRows === undefined)))
+      (scope === 'folders' && (foldersFetching || folderRows === undefined)) ||
+      (scope === 'mates' && (matesFetching || mateRows === undefined)))
+
+  /**
+   * The scoped read for the LIVE query is still in flight.
+   *
+   * Distinct from {@link scopeLoading}, which is about an empty list: this is true even
+   * while rows for the previous query are still on screen, which is the one frame a
+   * latched Enter must not fire on — the debounced query may already match what was
+   * typed while the rows answering it have not landed yet.
+   */
+  const scopeFetching =
+    (scope === 'sessions' && isFetching) ||
+    (scope === 'artifacts' && artifactsFetching) ||
+    (scope === 'folders' && foldersFetching) ||
+    (scope === 'mates' && matesFetching)
 
   useEffect(() => {
     if (selected >= rowCount) setSelected(Math.max(0, rowCount - 1))
   }, [rowCount, selected])
 
+  /**
+   * Activate the row at `index`.
+   *
+   * `via` says WHICH GESTURE asked, because one of the guards below is true of only one
+   * of them. A pointer names its own target: the reader pressed the row they could read,
+   * and that row opens what it says even if the list is about to be replaced. A keyboard
+   * Enter names an INDEX, and an index means a different row the moment the rows change
+   * under it -- which is the whole hazard the stale-row guard exists for.
+   */
   const activateIndex = useCallback(
-    (index: number) => {
+    (index: number, via: 'key' | 'pointer') => {
       const slot = slots[index]
       if (!slot) return
+      // STALE ROWS MUST NOT ACT, whatever they are -- see `rowsAnswerTheQuery`.
+      //
+      // Above the switch rather than inside `case 'result':`, because the rows a scoped
+      // view synthesizes are built from the same debounced query its results are, and
+      // two of them do something WORSE than opening the wrong thing. `clear-query*`
+      // wipes the query; `open-crewmates` navigates and closes the bar. Both sit at a
+      // zero-result dead end, which is exactly where a reader types another character,
+      // so a guard that covered results only discarded the text they had just typed --
+      // and the stale row's own label still showed the old query, so nothing warned
+      // them. The `root` has no scope, so this is inert there, which is correct: it
+      // ranks from the live query and has nothing stale to act on.
+      //
+      // The window does not EAT the Enter, it holds it: a keyboard confirm in here is
+      // latched and fired once the rows answer the query it was pressed against (see
+      // `pendingEnter` and the effect that drains it). The confirmed query and the
+      // selected row are captured here, so a later keystroke or arrow does not ride
+      // the same latch into a row the reader never confirmed. An arrowed row's own
+      // stable key is captured alongside its index, because a cached new query can
+      // swap its rows in under the same index with no empty frame, and the drain fires
+      // a non-top row only while its key still matches rather than whatever now sits at
+      // that number.
+      // Type-then-Enter is the
+      // launcher's primary gesture, and dropping it left a fast typist pressing Enter
+      // at a silent bar. A POINTER is never latched -- a click names the row it is on,
+      // which opens what it says -- and it also drops any armed latch, so a click that
+      // enters a scope without closing the bar cannot leave a keyboard confirm behind.
+      if (via === 'pointer') setPendingEnter(null)
+      if (via === 'key' && scope && !rowsAnswerTheQuery) {
+        setPendingEnter({ query: query.trim(), index, key: slot.key })
+        return
+      }
       switch (slot.tag) {
         case 'root':
           activateRoot(slot.row)
@@ -1368,6 +1932,9 @@ export default function CommandBarOverlay({
           return
         case 'fallback-folders':
           enterScope('folders', query)
+          return
+        case 'fallback-mates':
+          enterScope('mates', query)
           return
         case 'ask': {
           // Stops at a FILLED composer rather than sending: the user wrote this
@@ -1395,8 +1962,17 @@ export default function CommandBarOverlay({
         case 'retry-folders':
           void refetchFolders()
           return
+        case 'retry-mates':
+          void refetchMates()
+          return
+        case 'open-crewmates':
+          // The page where a crewmate is made. No `?member=`: there is none to open.
+          navigate('/members')
+          onClose()
+          return
         case 'clear-query':
         case 'clear-query-folders':
+        case 'clear-query-mates':
           // Emptying the query is what re-arms the listing; the debounced copy has to
           // go with it or the view stays on the failed search for one more tick.
           setQuery('')
@@ -1406,8 +1982,79 @@ export default function CommandBarOverlay({
           return
       }
     },
-    [activateRoot, enterScope, navigate, onClose, pendingRow, query, refetchArtifacts, refetchFolders, refetchSessions, seedNewSession, slots],
+    [activateRoot, enterScope, navigate, onClose, pendingRow, query, refetchArtifacts, refetchFolders, refetchMates, refetchSessions, rowsAnswerTheQuery, scope, seedNewSession, slots],
   )
+
+  /**
+   * Fire a latched Enter once the rows answer the confirmed query, or drop it.
+   *
+   * The latch is set when a keyboard Enter lands in the debounce window (above), and
+   * it carries the query the reader confirmed and the row they had selected. It drains
+   * here rather than in the key handler because the thing it waits for -- the rows
+   * catching up -- is an async settle, not a keystroke.
+   *
+   * It fires only when all of these still hold; otherwise it is dropped:
+   *  - the reader has not typed on: the live query still equals the confirmed one.
+   *    Typing another character confirms a different query, which this latch never
+   *    stood for, so it is dropped rather than committed.
+   *  - the selection has not moved: an arrow or a hover that moved `selected` after
+   *    the Enter means the reader is aiming elsewhere, so the stale row is not fired.
+   *  - the row at that index is still the one the reader confirmed, for a NON-top
+   *    selection: row 0 is the primary gesture (open the best match for the typed
+   *    query) and fires the live top row, but an arrowed row carries the key it was
+   *    picked at, so a cached new query that swaps rows under the old indices drops
+   *    the latch rather than open a stranger at that number.
+   *  - the view has settled on rows that answer that query, and the selected row is a
+   *    RESULT. A no-match drop row, an empty-roster row, or a failed-read retry wipes
+   *    the query or navigates away, which is not what a reader who typed a name and
+   *    pressed Enter asked for; the latch drops. Visible-stable, per the one
+   *    constraint the reporter named.
+   */
+  useEffect(() => {
+    if (!pendingEnter) return
+    if (!scope) {
+      setPendingEnter(null)
+      return
+    }
+    // The reader typed on, or moved the selection: the live gesture differs from the
+    // one that was confirmed.
+    if (query.trim() !== pendingEnter.query || selected !== pendingEnter.index) {
+      setPendingEnter(null)
+      return
+    }
+    // Still settling, or the rows still answer an older query: hold.
+    if (scopeLoading || scopeFetching || !rowsAnswerTheQuery) return
+    const row = slots[pendingEnter.index]
+    if (row?.tag !== 'result') {
+      // Settled on a dead end: nothing the gesture meant to open.
+      setPendingEnter(null)
+      return
+    }
+    // Row 0 is the primary gesture — "open the best match for what I typed" — so it
+    // fires the live top row even though its content swapped to answer the new query.
+    // A NON-top index means the reader arrowed onto one specific row, so the row now
+    // at that index must still be the one they picked: a cached new query swaps rows
+    // under the old indices with no empty frame, and firing a changed row there opens
+    // a stranger, the wrong-row hazard this latch exists to close.
+    if (pendingEnter.index !== 0 && row.key !== pendingEnter.key) {
+      setPendingEnter(null)
+      return
+    }
+    setPendingEnter(null)
+    activateIndex(pendingEnter.index, 'key')
+  }, [pendingEnter, scope, query, selected, scopeLoading, scopeFetching, rowsAnswerTheQuery, slots, activateIndex])
+
+  /**
+   * Drop the latch the moment the reader leaves the window any other way.
+   *
+   * Escape out of the scope and Backspace out of it both land on `scope === null`;
+   * closing the bar flips `open`. The drain effect above already refuses to fire
+   * without a scope, but clearing here as well keeps a stale latch from riding a
+   * reopen into the next visit.
+   */
+  useEffect(() => {
+    if (!open || !scope) setPendingEnter(null)
+  }, [open, scope])
 
   /**
    * Put the selected row's address on the clipboard.
@@ -1576,7 +2223,7 @@ export default function CommandBarOverlay({
           submitArgument()
           return
         }
-        activateIndex(selected)
+        activateIndex(selected, 'key')
       } else if (
         (e.metaKey || e.ctrlKey) &&
         !e.altKey &&
@@ -1639,7 +2286,9 @@ export default function CommandBarOverlay({
         ? i18nT('apps.commandBar.cmd_search_artifacts')
         : scope === 'folders'
           ? i18nT('apps.commandBar.cmd_search_folders')
-          : ''
+          : scope === 'mates'
+            ? i18nT('apps.commandBar.cmd_search_mates')
+            : ''
   /**
    * The failure this change is responsible for, and the only one that gets a notice.
    *
@@ -1649,6 +2298,7 @@ export default function CommandBarOverlay({
    */
   const artifactsFailed = scope === 'artifacts' && !!artifactsError
   const foldersFailed = scope === 'folders' && !!foldersError
+  const matesFailed = scope === 'mates' && !!matesError
   const searchError =
     scope === 'sessions'
       ? sessionsSearchError
@@ -1656,7 +2306,9 @@ export default function CommandBarOverlay({
         ? artifactsSearchError
         : scope === 'folders'
           ? foldersSearchError
-          : undefined
+          : scope === 'mates'
+            ? matesSearchError
+            : undefined
   /**
    * What the failure SAYS, for the scope this change adds.
    *
@@ -1678,7 +2330,7 @@ export default function CommandBarOverlay({
    */
   const searchFailedText = artifactsFailed
     ? i18nT('apps.commandBar.artifact_search_failed')
-    : foldersFailed
+    : foldersFailed || matesFailed
       ? i18nT('apps.commandBar.search_failed')
       : ''
   /**
@@ -1735,7 +2387,9 @@ export default function CommandBarOverlay({
               {row.status ? (
                 statusAccessory(row.status)
               ) : (
-                <span className="shrink-0 text-[11px] text-muted">{kindLabel(row)}</span>
+                <span className="shrink-0 text-[11px] text-muted">
+                  {kindLabel(row, query.trim().length > 0)}
+                </span>
               )}
             </>
           ),
@@ -1824,6 +2478,20 @@ export default function CommandBarOverlay({
           arrow: true,
           dim: true,
         }
+      case 'fallback-mates':
+        // Named with the query, dim and arrowed like the three rows above it. No
+        // subtitle, and for a different reason than the folders row: the view row this
+        // leads to carries the gloss, and when the typed word matches both ("crew",
+        // "agent") the two rows are on screen together — which is exactly where the
+        // artifacts pair learned that one shared subtitle makes them read as
+        // duplicates. This row names the text it carries; the view row describes the
+        // corpus.
+        return {
+          icon: matesIcon(),
+          title: i18nT('apps.commandBar.fallback_mates', { query }),
+          arrow: true,
+          dim: true,
+        }
       case 'recovery':
         // Naming the corpora this surface does NOT reach -- at the moment the user is
         // looking for them -- is what keeps a typed knowledge or skill name from being
@@ -1873,6 +2541,14 @@ export default function CommandBarOverlay({
           icon: <RotateCcw size={14} className="lucide-inline" />,
           title: i18nT('apps.commandBar.retry'),
         }
+      case 'retry-mates':
+        // Plain Retry, like the two rows above: WHAT failed is said by the
+        // `ErrorNotice` over the list, which is where an error surfaced to the user
+        // belongs (AUTOSDE `errors-use-error-notice`).
+        return {
+          icon: <RotateCcw size={14} className="lucide-inline" />,
+          title: i18nT('apps.commandBar.retry'),
+        }
       case 'retry':
         return {
           icon: <RotateCcw size={14} className="lucide-inline" />,
@@ -1898,6 +2574,31 @@ export default function CommandBarOverlay({
           icon: <Folder size={14} className="lucide-inline" />,
           title: i18nT('apps.commandBar.no_match_show_all_folders', { query: folderQuery }),
           dim: true,
+        }
+      case 'clear-query-mates':
+        // The same row again, with the crew glyph: what it returns to is the whole
+        // roster, which has no recency for a clock to stand for either.
+        return {
+          icon: matesIcon(),
+          title: i18nT('apps.commandBar.no_match_show_all_mates', { query: mateQuery }),
+          dim: true,
+        }
+      case 'open-crewmates':
+        // Both halves in one row: there is no crew, and Enter goes where one is made.
+        // Arrowed like every other row that leaves this surface, and WRAPPED, because
+        // this one is a sentence and a sentence truncated mid-clause loses the half
+        // that explains it.
+        // Its own string, ending in what ENTER does -- the same shape
+        // `no_match_show_all_mates` uses. The notice copy it replaced named an errand
+        // somewhere else ("Add one on the Crewmates page") and said nothing about this
+        // keystroke, so a crew-less reader -- the only audience this state has -- read it
+        // as text and went hunting by hand.
+        return {
+          icon: matesIcon(),
+          title: i18nT('apps.commandBar.no_mates_yet_open'),
+          arrow: true,
+          dim: true,
+          wrap: true,
         }
     }
   }
@@ -2050,9 +2751,11 @@ export default function CommandBarOverlay({
                   ? i18nT('apps.commandBar.placeholder_artifacts')
                   : scope === 'folders'
                     ? i18nT('apps.commandBar.placeholder_folders')
-                    : scope
-                      ? i18nT('apps.commandBar.placeholder_sessions')
-                      : i18nT('apps.commandBar.placeholder')
+                    : scope === 'mates'
+                      ? i18nT('apps.commandBar.placeholder_mates')
+                      : scope
+                        ? i18nT('apps.commandBar.placeholder_sessions')
+                        : i18nT('apps.commandBar.placeholder')
             }
             aria-label={i18nT('apps.commandBar.title')}
             // Selection stays on the input and is announced through
@@ -2092,20 +2795,56 @@ export default function CommandBarOverlay({
           </div>
         )}
 
-        {/* ARTIFACTS AND FOLDERS: the sessions scope keeps the failure row it
-            already had.
+        {/* ARTIFACTS, FOLDERS AND CREWMATES: the sessions scope keeps the failure row
+            it already had.
+            The crewmates scope needs this MORE than the two beside it, and leaving it
+            out was a real hole: its retry row deliberately carries no text because
+            this notice is what names the failure, so without the disjunct a catalog
+            rejection rendered one bare `Retry` and nothing else -- `findReport` never
+            resolved, the endpoint, status and backend `code` were dropped, and a
+            failed read was indistinguishable from a crew-less install. That is the
+            exact pair of states `useAgents` records six triage passes being lost to.
             No hand-off: the combobox query is unsaved local state, and the
             hand-off navigation would unmount the command bar and discard it.
             Keep the notice outside the listbox so ErrorNotice can never put an
             interactive control inside an option; Retry remains a separate option
             on the combobox's Arrow/Enter path. */}
-        {(artifactsFailed || foldersFailed) && (
+        {(artifactsFailed || foldersFailed || matesFailed) && (
           <div className="px-3 py-2 border-b border-border">
             <ErrorNotice
               message={searchFailedText}
               report={findReport(errMessage(searchError))}
               variant="inline"
             />
+          </div>
+        )}
+
+        {/* FOLDERS: the shared settings read the order comes from has FAILED with no
+            body to draw from, so the list below is the stored order whatever mode
+            the person chose — said here the way the sidebar says it over its own
+            tree (there is no sidebar on this surface), because a list drawn silently
+            in the wrong order is the dead end, not the failure. The raw server
+            string is the message so the notice's journal lookup still finds the
+            endpoint and status -- under the title, smaller, because "config store"
+            and "gateway" are the detail, not the lead; the plain line under it says
+            what the list is showing (a picker: "listed", not the sidebar's
+            "arrangement"), that nothing is asked of the reader (the shell's read
+            retries on its own), and where the hand-off lives, since this notice has
+            none: the query typed into the bar is unsaved and the navigation would
+            take it along. */}
+        {scope === 'folders' && folderSortError && (
+          <div className="px-3 py-2 border-b border-border">
+            <ErrorNotice
+              variant="inline"
+              className="flex-wrap"
+              title={i18nT('pages.chatSidebar.folder_order_unavailable')}
+              message={folderSortError}
+              messagePlacement="below"
+              testId="command-bar-folder-order-unavailable"
+            />
+            <p className="mt-0.5 text-[11px] text-muted" data-testid="command-bar-folder-order-unavailable-detail">
+              {i18nT('pages.chatSidebar.folder_order_unavailable_detail_picker_ask')}
+            </p>
           </div>
         )}
 
@@ -2213,6 +2952,12 @@ export default function CommandBarOverlay({
               // The folders view reaches it the same way and for the same reason, so
               // it gets the same treatment: a reader with no folders is told they
               // have none, not that no sessions matched.
+              //
+              // The crewmates view has NO branch here, deliberately. Every empty case it
+              // can reach pushes a ROW instead — `open-crewmates` for no crew,
+              // `clear-query-mates` for a query that matched nothing, `retry-mates` for a
+              // failed read — so this centred notice is unreachable for that scope, and a
+              // branch for it would be a sentence with no affordance that nothing renders.
               <div role="status" className="px-3 py-6 text-center text-[12px] text-muted">
                 {scope === 'artifacts'
                   ? i18nT('apps.commandBar.no_artifacts_yet')
@@ -2225,7 +2970,7 @@ export default function CommandBarOverlay({
             )
           ) : (
             slots.map((slot, i) => {
-              const header = headerOf(slot, slots[i - 1])
+              const header = headerOf(slot, slots[i - 1], query.trim().length > 0)
               return (
                 <div key={slot.key}>
                   {header && (
@@ -2238,7 +2983,7 @@ export default function CommandBarOverlay({
                     role="option"
                     tabIndex={-1}
                     aria-selected={selected === i}
-                    onMouseDown={() => activateIndex(i)}
+                    onMouseDown={() => activateIndex(i, 'pointer')}
                     onMouseEnter={() => setSelected(i)}
                     className={`flex items-center gap-2.5 px-3 py-2 cursor-pointer text-[13px] ${
                       selected === i ? 'bg-bg-hover text-text' : 'text-text'

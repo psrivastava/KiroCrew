@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import errno
 import json
 import os
 import sys
@@ -14,13 +15,18 @@ from kiro_crew import beacon
 from kiro_crew.config import KiroCrewConfig
 from kiro_crew.config.loader import (
     ConfigReadError,
+    ConfigWriteRefused,
     _subtract_overlay,
     config_local_path,
     config_path,
+    read_config_text,
     update_config_locked,
+    workspace_dir_from_entry,
 )
+from kiro_crew.config.sections import _migrate_workspaces
 from kiro_crew.config.superseded_defaults import (
     acked_superseded,
+    adopt_coerced_keys,
     adopted_superseded,
     adoption_summary,
     coerced_value_drift,
@@ -39,9 +45,93 @@ if TYPE_CHECKING:
 
 _MISSING = object()
 
+#: How the OS sandbox refuses a write to a sealed config file: Seatbelt answers
+#: ``EPERM``, and a Linux read-only file bind answers ``EROFS`` for an in-place write
+#: and ``EBUSY`` for the rename ``atomic_write`` publishes with.
+_SEALED_CONFIG_ERRNOS = frozenset({errno.EPERM, errno.EACCES, errno.EROFS, errno.EBUSY})
+
+
+def _names_sealed_config(exc: OSError) -> bool:
+    """Whether *exc* was raised against ``config.json`` or ``config.local.json``.
+
+    The publishing ``os.replace(tmp, path)`` reports the temp as ``filename`` and the
+    destination as ``filename2``; an in-place ``open(path, "w")`` reports only
+    ``filename``. Either way the sealed file is one of the two. A failure that names
+    neither -- ``config edit``'s ``execvp`` of an editor, a temp the data home itself
+    refused -- is the caller's to report as what it is.
+    """
+    sealed = {os.path.realpath(p) for p in (config_path(), config_local_path())}
+    for name in (exc.filename, exc.filename2):
+        if isinstance(name, (str, bytes, os.PathLike)):
+            if os.path.realpath(os.fsdecode(name)) in sealed:
+                return True
+    return False
+
+
+def _sandboxed_config_write_hint(exc: OSError) -> str | None:
+    """The operator-facing reason a config write failed inside the agent sandbox.
+
+    ``config.json`` and ``config.local.json`` are read-only to every sandboxed process
+    (``sandbox._CREW_READONLY_LEAVES``) because they carry the switches that loosen
+    confinement. Without this the refusal surfaces as a bare errno, which reads like a
+    broken install. Decided from the failure itself -- a denial errno against one of
+    the two sealed files -- and not from ``KIROCREW_SANDBOX_ACTIVE``: ``cli.main()``
+    pops that marker before dispatch so an inherited value can never buy a sandbox
+    bypass, which means it is never set by the time this runs. ``None`` for any other
+    failure, so the caller's own error path still reports a genuinely read-only or
+    full data home, or an editor the sandbox would not exec.
+    """
+    if exc.errno not in _SEALED_CONFIG_ERRNOS:
+        return None
+    if not _names_sealed_config(exc):
+        return None
+    return (
+        "❌ The config file was not written. Inside the agent sandbox config.json and "
+        "config.local.json are read-only, so an agent cannot change the settings that "
+        "confine it: change the setting in the dashboard (Settings), or run this command "
+        "from your own terminal. Outside the sandbox, check the file's permissions."
+    )
+
+
+def _refuse_missing_workspace_dirs(data: dict, current: dict) -> dict:
+    """Refuse a new or changed ``workspaces`` entry whose ``dir`` is not an existing directory.
+
+    Same stance as ``workspace update``. The base dir is exempt: it is made on first use.
+    """
+    workspaces = data.get("workspaces")
+    if not isinstance(workspaces, dict):
+        return data
+    on_disk = current.get("workspaces")
+    old = _migrate_workspaces(on_disk) if isinstance(on_disk, dict) else {}
+    base = workspace_dir_from_entry(None)
+    for name, entry in _migrate_workspaces(workspaces).items():
+        if name in old and old[name].dir == entry.dir:
+            continue  # an unchanged binding is not this write's to judge
+        try:
+            path = workspace_dir_from_entry(entry)
+            usable = isinstance(entry.dir, str) and (path == base or path.is_dir())
+        except (RuntimeError, OSError, TypeError, ValueError):  # unknown ``~user``, bad type
+            usable = False
+        if not usable:
+            raise ConfigWriteRefused(
+                f"workspace {name!r}: dir {entry.dir!r} is not an existing directory"
+            )
+    return data
+
 
 def _config_cmd(args: argparse.Namespace) -> None:
     """Get or set config values."""
+    try:
+        _run_config_cmd(args)
+    except OSError as exc:
+        hint = _sandboxed_config_write_hint(exc)
+        if hint is None:
+            raise
+        print(hint, file=sys.stderr)
+        sys.exit(1)
+
+
+def _run_config_cmd(args: argparse.Namespace) -> None:
     action = getattr(args, "config_action", None)
     if action == "get":
 
@@ -90,7 +180,19 @@ def _config_cmd(args: argparse.Namespace) -> None:
                     file=sys.stderr,
                 )
                 sys.exit(1)
-            update_config_locked(config_path(), mutate=lambda _: data, on_corrupt="reset")
+            try:
+                update_config_locked(
+                    config_path(),
+                    mutate=lambda cur: _refuse_missing_workspace_dirs(data, cur),
+                    on_corrupt="reset",
+                )
+            except ConfigWriteRefused as e:
+                # Third writer behind the publish floor, same report as the keyed
+                # paths: nothing was written. The message names an env-var key
+                # (never its value) or a workspace and its dir. Anchored on the file,
+                # since there is no single key to name.
+                print(f"❌ {fp}: {e}", file=sys.stderr)
+                sys.exit(1)
             sel().log_api_access(
                 caller="cli",
                 operation="config_set_file",
@@ -108,7 +210,31 @@ def _config_cmd(args: argparse.Namespace) -> None:
                 print("       kirocrew config set --local <key> <value>", file=sys.stderr)
                 print("       kirocrew config set --file <path.json>", file=sys.stderr)
                 sys.exit(1)
-            parsed = _parse_value(value)
+            # A list-typed key takes a list or is refused: the generic parser
+            # answers an unparsable word with the STRING itself, and a string
+            # stored under a list key is replaced by the default at load.
+            parsed: object
+            try:
+                if _is_list_key(key):
+                    parsed = _parse_list_value(key, value)
+                else:
+                    parsed = _parse_value(value)
+            except ValueError as list_error:
+                print(f"❌ {key}: {list_error}", file=sys.stderr)
+                sys.exit(1)
+            # A declared enum is checked on EVERY write, stored or not, and what is
+            # written is the enum's own spelling. The type check below runs only on
+            # a first write, because a stored value's type stands in for the
+            # declaration; an enum has no such stand-in, and the load path's answer
+            # to a value outside it is to degrade the setting with a WARNING nobody
+            # reads. `stt.provider off` was accepted this way while `off` did not
+            # exist, and the loader turned it into the one provider the user was
+            # trying to escape (kirodotdev/KiroCrew#13179).
+            try:
+                parsed = _declared_enum_value(key, parsed)
+            except ValueError as enum_error:
+                print(f"❌ {key}: {enum_error}", file=sys.stderr)
+                sys.exit(1)
             # Fourth write path to telemetry.beacon_enabled, after the dashboard
             # PATCH and `telemetry enable`. Gated here too, and BEFORE the
             # local/base split so it covers both: `--local` writes the overlay,
@@ -177,9 +303,15 @@ def _config_cmd(args: argparse.Namespace) -> None:
                     _dict_set_create(_existing, key, parsed)
                     return _existing
 
-                update_config_locked(
-                    p, mutate=_mutate_local_overlay, stamp_meta=False, on_corrupt="reset"
-                )
+                try:
+                    update_config_locked(
+                        p, mutate=_mutate_local_overlay, stamp_meta=False, on_corrupt="reset"
+                    )
+                except ConfigWriteRefused as e:
+                    # The publish floor refused the document before writing it; the
+                    # message names the offending env-var key and never its value.
+                    print(f"❌ {key}: {e}", file=sys.stderr)
+                    sys.exit(1)
 
                 sel().log_api_access(
                     caller="cli",
@@ -215,7 +347,7 @@ def _config_cmd(args: argparse.Namespace) -> None:
                     lp = config_local_path()
                     if lp.is_file():
                         try:
-                            raw_local = json.loads(lp.read_text(encoding="utf-8"))
+                            raw_local = json.loads(read_config_text(lp))
                             if isinstance(raw_local, dict):
                                 return _subtract_overlay(existing, raw_local)
                         except (json.JSONDecodeError, OSError):
@@ -229,6 +361,11 @@ def _config_cmd(args: argparse.Namespace) -> None:
                         f"❌ Cannot set key in a corrupt config.json: {e}",
                         file=sys.stderr,
                     )
+                    sys.exit(1)
+                except ConfigWriteRefused as e:
+                    # Same shape as the corrupt-file refusal: nothing was written, and
+                    # the message names the offending env-var key, never its value.
+                    print(f"❌ {key}: {e}", file=sys.stderr)
                     sys.exit(1)
                 sel().log_api_access(
                     caller="cli",
@@ -299,7 +436,7 @@ def _defaults_cmd(args: argparse.Namespace) -> None:
         _print_adopted()
     path = config_path()
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        raw = json.loads(read_config_text(path))
     except FileNotFoundError:
         print("✅ No config.json yet — the current defaults already apply.")
         return
@@ -369,6 +506,7 @@ def _defaults_cmd(args: argparse.Namespace) -> None:
 
     if getattr(args, "adopt", False):
         removed: list[str] = []
+        rewritten: dict[str, str] = {}
         coerced_keys = [c.dotted_key for c, _ in coerced]
 
         def _mutate(existing: dict) -> dict:
@@ -379,12 +517,20 @@ def _defaults_cmd(args: argparse.Namespace) -> None:
                 for e in superseded_default_drift(existing, acked={})
                 if e.dotted_key in keys
             ]
-            fresh += [
-                c.dotted_key
-                for c, _ in coerced_value_drift(existing)
-                if c.dotted_key in coerced_keys
-            ]
             removed.extend(drop_drifted_keys(existing, fresh))
+            # A coerced key is not dropped but REWRITTEN as what the loader resolves
+            # it to (or dropped only when that is the default), so adopting never
+            # moves the effective setting: an unknown speech provider that runs as
+            # `off` stays `off`, rather than becoming the default `local` that the
+            # user may have been trying to escape.
+            live_coerced = [
+                (c, v) for c, v in coerced_value_drift(existing) if c.dotted_key in coerced_keys
+            ]
+            for c, v in live_coerced:
+                value = c.adopted_value(v)
+                if value is not None:
+                    rewritten[c.dotted_key] = value
+            removed.extend(adopt_coerced_keys(existing, live_coerced))
             return existing
 
         try:
@@ -395,7 +541,10 @@ def _defaults_cmd(args: argparse.Namespace) -> None:
         except OSError as e:
             # A read-only or full data home, or a refused link: report it and stop,
             # rather than letting the CLI die on a traceback.
-            print(f"❌ Could not write {config_path()}: {e}", file=sys.stderr)
+            print(
+                _sandboxed_config_write_hint(e) or f"❌ Could not write {config_path()}: {e}",
+                file=sys.stderr,
+            )
             sys.exit(1)
         # An adopted key no longer stores the acked value, so its ack is dead
         # bookkeeping; dropping it keeps a later deliberate choice reportable.
@@ -416,14 +565,28 @@ def _defaults_cmd(args: argparse.Namespace) -> None:
         # false. Report what actually happened instead.
         overridden = _overlay_keys(removed)
         for key in removed:
-            if key in overridden:
+            if key in rewritten:
+                print(f"✅ {key} set to {rewritten[key]!r} — what the stored value already ran as")
+            elif key in overridden:
                 print(f"✅ {key} removed from config.json — config.local.json still overrides it")
             else:
                 print(f"✅ {key} removed — the current default now applies")
         if not removed:
             print("Nothing removed — the stored values changed since they were listed.")
-        else:
-            print("\nRestart the gateway for a running instance to pick this up.")
+        # The schema's restart=True mark is the one statement of which fields a
+        # running gateway cannot adopt, so the restart hint names exactly those keys
+        # -- and only where the effective value moved: an overlay-shadowed key runs
+        # the same value after the edit as before it.
+        # Imported here: the schema builds the full registry at import time, which
+        # the listing and --keep paths never need.
+        from kiro_crew.config.schema import requires_restart
+
+        restart_bound = [key for key in removed if key not in overridden and requires_restart(key)]
+        if restart_bound:
+            print(
+                "\nRestart the gateway for a running instance to pick up: "
+                + ", ".join(restart_bound)
+            )
         return
 
     if keeping:
@@ -445,8 +608,13 @@ def _defaults_cmd(args: argparse.Namespace) -> None:
             source="cli",
             resources=",".join(recorded),
         )
+        notes = {e.dotted_key: e.note for e in drifted if e.note}
         for key in recorded:
             print(f"✅ {key} recorded as intentional — no longer reported")
+            if key in notes:
+                # Said again at the moment of affirming: the note is a fact the
+                # choice to keep depends on, and this is the last line they read.
+                print(f"   Note: {notes[key]}.")
         print("\nChanging one of these values later reports it again.")
         return
 
@@ -487,7 +655,7 @@ def _overlay_keys(dotted_keys: list[str]) -> set[str]:
     if not p.is_file():
         return set()
     try:
-        raw = json.loads(p.read_text(encoding="utf-8"))
+        raw = json.loads(read_config_text(p))
     except (OSError, ValueError):
         # ValueError covers malformed JSON and invalid UTF-8 alike; either way the
         # overlay is treated as carrying nothing.
@@ -582,6 +750,57 @@ _DECLARED_VALUE_TYPES: dict[str, tuple[type, ...]] = {
 }
 
 
+def _declared_enum_value(key: str, value: object) -> object:
+    """*value* as the enum for *key* spells it, or *value* itself when *key* has no enum.
+
+    Raises ``ValueError`` with the message to print when *value* is outside the
+    enum. Unlike :func:`_declared_type_error` this runs on every write, stored or
+    not, because the load path degrades an out-of-enum value rather than rejecting
+    it -- so the write is the last point at which the mistake is still attributable
+    to the command that made it. A key that declares no enum, or is not declared at
+    all, keeps the behaviour it had.
+
+    Spelling is the one leniency, and the CANONICAL spelling is what comes back:
+    the loader normalizes case on some enum keys (``agent.log_level`` is
+    upper-cased, ``agent.yolo_duration`` lower-cased and stripped) but matches
+    others exactly, so writing the user's spelling would admit ``Local`` here and
+    have the loader degrade it there -- the write-then-degrade gap this check
+    exists to close. Writing the enum's own spelling closes it for every key at
+    once. A value the loader would degrade is exactly what this check refuses.
+    """
+    entry = _declared_entry(key)
+    if entry is None or not entry.enum_values:
+        return value
+    if value in entry.enum_values:
+        return value
+    if isinstance(value, str):
+        if key == "stt.model":
+            resolved = _stt_model_canonical(value)
+            if resolved is not None:
+                return resolved
+        folded = value.strip().casefold()
+        for candidate in entry.enum_values:
+            if isinstance(candidate, str) and candidate.casefold() == folded:
+                return candidate
+    allowed = ", ".join(str(v) for v in entry.enum_values)
+    raise ValueError(f"{value!r} is not one of the selectable values: {allowed}")
+
+
+def _stt_model_canonical(value: str) -> str | None:
+    """The catalog row a stored ``stt.model`` spelling selects, or ``None``.
+
+    ``stt.model`` is the one enum whose list holds CANONICAL rows while its
+    loader also accepts aliases onto them. The write admits the alias and stores
+    the row it names, the same way the dashboard's STT PUT does through
+    ``stt_models.canonical_name`` -- a bare membership test would refuse
+    ``stt.model turbo`` that the loader resolves to ``large-v3-turbo`` on every
+    load. A second such key would earn a table; one does not.
+    """
+    from kiro_crew.stt import models as stt_models
+
+    return stt_models.canonical_name(value)
+
+
 def _declared_type_error(entry: ConfigEntry, value: object) -> str | None:
     """Why *value* does not fit *entry*'s declared type, or None when it fits.
 
@@ -607,6 +826,78 @@ def _declared_type_error(entry: ConfigEntry, value: object) -> str | None:
     if not isinstance(value, expected):
         return f"expected {entry.type}, got {type(value).__name__}"
     return None
+
+
+def _is_list_key(key: str) -> bool:
+    """True when *key* is declared ``array`` in the registry.
+
+    The declaration is the authority (a wildcard path such as
+    ``telegram.accounts.*.allowed_user_ids`` matches segment by segment). A key the
+    registry does not know returns False: the base write path refuses an unknown
+    key outright before this is consulted, so there is no reachable undeclared key
+    for the loader-reset harm to apply to.
+    """
+    from kiro_crew.config.schema import SCHEMA_REGISTRY
+
+    parts = key.split(".")
+    for entry in SCHEMA_REGISTRY:
+        e_parts = entry.path.split(".")
+        if len(e_parts) == len(parts) and all(
+            e == "*" or e == p for e, p in zip(e_parts, parts, strict=True)
+        ):
+            return entry.type == "array"
+    return False
+
+
+def _parse_list_value(key: str, raw: str) -> list:
+    """Parse *raw* as the value of the list-typed *key*, or raise ``ValueError``.
+
+    Only a JSON array is accepted. The case that matters is the array whose quotes
+    a shell removed (Windows PowerShell 5.1 delivers ``'["a","b"]'`` as ``[a,b]``):
+    it is not JSON, so the scalar parser stored it as a string and the loader then
+    dropped the whole field back to its default, un-trusting whatever the list
+    held. No other spelling is guessed at: a list field's item type (``list[int]``
+    for a Telegram user id, ``list[str]`` for a Slack one) is not known here, and a
+    wrongly typed list is dropped the same way.
+    """
+    text = raw.strip()
+    try:
+        loaded = json.loads(text)
+    except ValueError:
+        raise ValueError(f"expected a JSON array, got {raw!r}\n" + _list_hint(key)) from None
+    if isinstance(loaded, list):
+        return loaded
+    raise ValueError(
+        f"expected a JSON array, got a JSON {type(loaded).__name__}\n" + _list_hint(key)
+    )
+
+
+def _list_hint(key: str) -> str:
+    """The retry lines for a refused list value: the forms that survive PowerShell.
+
+    Both the example items (``["a","b"]``) and the key are rendered so that nothing
+    the caller typed can break out of the retry line: the hint is printed for a
+    human or an agent to paste into a shell, so a shell metacharacter in either
+    would let the pasted command run something else. The items are a STATIC
+    example; the key is shown verbatim only when it is a plain config dot-path
+    (the only shape a real key has) and is replaced by a ``<key>`` placeholder
+    otherwise, so a wildcard segment carrying ``;`` or a quote never reaches the
+    shell. The task is to demonstrate the quoting that survives each shell, which
+    a safe key and fixed items do.
+    """
+    as_json = '["a","b"]'
+    escaped = as_json.replace('"', '\\"')
+    safe_chars = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.*-")
+    safe_key = key if key and set(key) <= safe_chars else "<key>"
+    prefix = f"kirocrew config set {safe_key}"
+    return "\n".join(
+        [
+            "   Nothing was written. A shell may have stripped the quotes of a JSON array",
+            "   (Windows PowerShell 5.1 does), leaving [a,b], which is not JSON. Retry with:",
+            f"     PowerShell 7.3+, sh:    {prefix} '{as_json}'",
+            f"     Windows PowerShell 5.1: {prefix} '{escaped}'",
+        ]
+    )
 
 
 def _parse_value(raw: str) -> object:

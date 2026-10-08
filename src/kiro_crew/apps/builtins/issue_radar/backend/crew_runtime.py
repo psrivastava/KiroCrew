@@ -49,7 +49,7 @@ from typing import Any
 from kiro_crew.apps import teardown
 from kiro_crew.apps.manager import is_app_enabled
 from kiro_crew.apps.teardown import register_slot_close_hook, register_slot_close_undo_hook
-from kiro_crew.atomic_write import atomic_write
+from kiro_crew.atomic_write import atomic_write, read_json_or
 from kiro_crew.dashboard.chat_persistence import rehydrate_slot_from_history_async
 from kiro_crew.dashboard.chat_runner import _run_chat
 from kiro_crew.dashboard.chat_utils import slot_history_key
@@ -250,7 +250,8 @@ def never_block(labels: Sequence[str] = (), terms: Mapping[str, str] | None = No
         f"Never write any label other than {allowed}. "
         "Never push to main or whichever branch this repo defaults to, and never "
         f"merge a {vocab['change_request_short']} yourself. Never edit another crew's "
-        "claim comment. Never hold uncommitted changes in two worktrees. Never end a "
+        "claim comment, except appending a takeover to proved-dead claims. Never hold "
+        "uncommitted changes in two worktrees. Never end a "
         "turn without writing the ledger. Never put an absolute path, a host name or "
         "anything else about this machine into a progress line — progress lines go "
         "public. Never report a gate as passing when you have not seen its exit code."
@@ -1562,10 +1563,7 @@ def read_signals(owner: str, repo: str, root: Path | None = None) -> dict[str, A
     path = signals_path(owner, repo, root)
     if not path.is_file():
         return {}
-    try:
-        doc = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
+    doc = read_json_or(path, None, logger=logger, what="issue signals")
     if not isinstance(doc, dict) or doc.get("schema") != SIGNALS_SCHEMA:
         # A schema mismatch is a cache miss here, exactly as it is for the issue
         # caches: the next sweep re-seeds and reports nothing, which loses at most

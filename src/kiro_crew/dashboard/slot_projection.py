@@ -2,34 +2,71 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import time
+from collections import deque
+from collections.abc import Callable, Sequence
 from typing import Any
+
+from kiro_crew.safety_override import safety_override, yolo_policy_permits
+from kiro_crew.session_lifecycle import STOP_DECLINED_ESCALATION_SECS
+
+
+def _history_stem(slot: Any) -> str:
+    """The Older sessions key for *slot*: its transcript key folded to a filename stem.
+
+    ``slot_history_key`` names the transcript (``dashboard:<slot>``, the live
+    channel key, or the channel stem of an unbound channel-born slot) and
+    ``_safe_key`` folds it to the stem the history list lists it under, so the
+    two spellings of one session can never disagree.
+    """
+    # Imported here: chat_utils imports state, which imports this module.
+    from kiro_crew.dashboard.chat_utils import slot_history_key
+    from kiro_crew.history import _safe_key
+
+    return _safe_key(slot_history_key(slot))
+
+
+def stop_declined_armed(slot: Any, now: float | None = None) -> bool:
+    """Whether a recent declined Stop makes the next press a force stop.
+
+    The window is ``session_lifecycle.STOP_DECLINED_ESCALATION_SECS``, the same
+    one the channels' second-press hatch uses: long enough for a human to read
+    the card and decide, short enough that a press an hour later is a fresh
+    first press.
+    """
+    at = float(getattr(slot, "_stop_declined_at", 0.0) or 0.0)
+    if at <= 0.0:
+        return False
+    current = time.monotonic() if now is None else now
+    return current - at < STOP_DECLINED_ESCALATION_SECS
 
 
 def resolved_row_identity(slot: Any) -> str:
-    """The identity the sidebar renders this slot under.
+    """The identity the sidebar renders this slot under: its own local key.
 
-    A purely local session is its own key. A remote-bound one -- minted through
-    ``create_peer_slot`` or adopted from a peer row -- is ``<instance_id>:<peer_key>``,
-    the same identity the peer row carries before anything is bound to it.
-
-    That equality is the whole point. The sidebar keys rows on this value (React
-    key, ``layoutId``, ``data-session-row``, the hover-hold seats), so a binding
-    that preserves it re-renders ONE row where a fresh key would mount a second
-    element beside the row the user clicked and leave the browser to notice they
-    are the same conversation.
-
-    The invariant that buys, and the trap in it: for a remote-bound session this
-    identity is NOT the local slot key, and never becomes it. Read ``key`` when you
-    need the local slot -- switching sessions, loading a transcript, addressing the
-    slot on the wire. Splitting this string to recover that key yields the PEER's
-    key, which is routable only inside a request sent back through that instance.
+    A relay archive is a local row too, so it never shares an identity with the
+    peer crew's own row for the same conversation.
     """
-    instance_id = getattr(slot, "instance_id", "") or ""
-    remote_slot = getattr(slot, "remote_slot", "") or ""
-    if getattr(slot, "is_remote", False) and instance_id and remote_slot:
-        return f"{instance_id}:{remote_slot}"
     return str(getattr(slot, "key", "") or "")
+
+
+def live_trust_scope(slot: Any) -> str:
+    """The slot's ``SafetyOverride`` scoped-grant key while that grant is live, else "".
+
+    Display only. It answers whether the scope the slot carries still has time on
+    it, through ``scope_remaining_secs`` -- a pure read -- because this runs on
+    every slots poll and must never expire a grant or write a SEL record. It
+    applies the same policy mask ``is_scope_active`` applies first, so a grant
+    the approval ceiling denies never shows as Trust. The approval paths decide
+    through ``is_scope_active``; nothing reads this value back into ``_trust`` or
+    into a stored approval policy.
+    """
+    scope = str(getattr(slot, "_trust_scope", "") or "")
+    if not scope:
+        return ""
+    if not yolo_policy_permits():
+        return ""
+    return scope if safety_override().scope_remaining_secs(scope) > 0 else ""
 
 
 class SlotProjection:
@@ -54,10 +91,38 @@ class SlotProjection:
             source_link_path_markers,
             source_ref_label,
         )
+        from kiro_crew.dashboard.source_providers.contract import source_ref_identity_key
+        from kiro_crew.dashboard.source_providers.links import iter_source_url_candidates
+
+        # Identities the user has explicitly unlinked from this session. The set
+        # is keyed on the serialized identity, so a dismissed change stays gone
+        # no matter which URL shape re-mentions it. Snapshotting it as a frozenset
+        # keeps the loop's membership test cheap and immune to a concurrent mutate.
+        # Read defensively: this scanner is a staticmethod designed to run against
+        # a bare ``object.__new__``-built slot that supplies only the fields the
+        # walk reaches, so a slot that never ran ``__init__`` (and thus has no
+        # dismissed set) must read as "nothing dismissed" rather than raise.
+        dismissed = frozenset(getattr(slot, "_dismissed_source_links", ()) or ())
+        # Keys added under an in-flight (uncommitted) unlink transaction are NOT
+        # yet suppressed: publishing them here would let a concurrent broadcast
+        # show a chip removed before its guarded write commits (and possibly
+        # rolled back). Subtract them so the chip stays visible until commit.
+        # Read defensively for the same bare-slot reason as ``dismissed`` above.
+        _txn_pending = frozenset(getattr(slot, "_dismissed_txn_pending", ()) or ())
+        if _txn_pending:
+            dismissed = dismissed - _txn_pending
 
         # The allowlist generation belongs in the cache key: a cold self-managed
-        # GitLab miss must be retried after the allowlist finishes loading.
-        cache_key = (slot._source_links_revision, gitlab_hosts_generation())
+        # GitLab miss must be retried after the allowlist finishes loading. The
+        # dismissed-set revision belongs there too: unlinking a chip bumps it via
+        # ``invalidate_source_links``, but a set that gained and then lost the
+        # same key across two edits would leave the revision unmoved, so its
+        # current contents are folded in directly rather than trusting the count.
+        cache_key = (
+            slot._source_links_revision,
+            gitlab_hosts_generation(),
+            hash(dismissed),
+        )
         if slot._source_links_cache and slot._source_links_cache[0] == cache_key:
             return slot._source_links_cache[1]
 
@@ -65,7 +130,6 @@ class SlotProjection:
         # registered provider's own path marker is honoured by the pre-parse
         # filter instead of being dropped before ``parse_source_url`` sees it.
         path_markers = source_link_path_markers()
-        stop_chars = set(" \t\n<>()[]{}\"'")
         # Keyed on the ref's identity, not on ``ref.url``: a registered
         # provider whose URL grammar accepts more than one shape for the same
         # change (e.g. an optional revision pin kept in the canonical URL)
@@ -87,21 +151,23 @@ class SlotProjection:
             if not isinstance(content, str) or "https://" not in content:
                 continue
 
-            # Bound each candidate by the next occurrence.  Without that bound,
-            # repeated ``https://`` prefixes make the backwards scan quadratic.
-            search_end = len(content)
-            while len(found) < max_links and parse_budget > 0:
-                idx = content.rfind("https://", 0, search_end)
-                if idx == -1:
+            # ``iter_source_url_candidates`` is the shared token grammar (the
+            # unlink-authorization predicate ``_ChatSlot.mentions_source_identity``
+            # walks the same one, so the two cannot drift). It yields front to
+            # back; we need newest-first (reversed) to keep this scanner's "newest
+            # mention wins" contract -- combined with the outer
+            # ``reversed(messages)`` walk, the first writer into ``found`` is the
+            # most recent mention, so the chip links to the newest URL. Collect
+            # into a ``deque(maxlen=parse_budget)`` rather than an unbounded
+            # ``list``: at most ``parse_budget`` candidates are ever resident, so
+            # a message dense in marker-carrying URLs cannot allocate an unbounded
+            # candidate list before the budget check stops the scan. maxlen keeps
+            # the LAST budget candidates (the message tail = its most recent
+            # content), and reversing them yields newest-first within the cap.
+            recent = deque(iter_source_url_candidates(content, path_markers), maxlen=parse_budget)
+            for candidate in reversed(recent):
+                if len(found) >= max_links or parse_budget <= 0:
                     break
-                token_limit = search_end
-                search_end = idx
-                end = idx
-                while end < token_limit and content[end] not in stop_chars:
-                    end += 1
-                candidate = content[idx:end].rstrip(".,!?;:*_~`")
-                if not any(marker in candidate for marker in path_markers):
-                    continue
                 parse_budget -= 1
                 try:
                     ref = parse_source_url(candidate)
@@ -109,6 +175,13 @@ class SlotProjection:
                     continue
                 identity = ref.identity
                 if identity in found:
+                    continue
+                # Budget is already charged above, so an unlinked chip costs the
+                # same parse work it did before dismissal -- cost accounting is
+                # unchanged, only the surfaced result set shrinks. Keyed on the
+                # serialized identity so the suppression matches the object, not
+                # the particular URL that re-mentioned it.
+                if source_ref_identity_key(identity) in dismissed:
                     continue
                 # First writer wins, and because the walk is backwards the
                 # first writer IS the most recent mention -- so the newest
@@ -120,6 +193,13 @@ class SlotProjection:
                     "url": ref.url,
                     "kind": ref.kind,
                     "label": source_ref_label(ref),
+                    # The serialized identity travels to the client so an unlink
+                    # affordance can name this exact object back to the DELETE
+                    # endpoint without the client having to re-parse the URL. It
+                    # is the SAME key the dismissed-set filter above tests, so a
+                    # round-trip through the wire cannot drift from what the
+                    # backend suppresses.
+                    "identity": source_ref_identity_key(identity),
                 }
 
         links = list(found.values())
@@ -133,6 +213,7 @@ class SlotProjection:
         include_check_status: bool,
         source_links: list[dict],
         prompt_roles: frozenset[str],
+        transient_roles: frozenset[str],
         redact: Callable[[str], str],
         parse_options: Callable[[str], list[str]],
         strip_options: Callable[[str], str],
@@ -144,11 +225,33 @@ class SlotProjection:
         resolve_effective_agent: Callable[[str, str | None], str],
         budget_source_links: Callable[[list[dict]], list[dict]],
         project_source_links: Callable[[list[dict], bool], list[dict]],
+        coordinator_pending: Sequence[dict] = (),
     ) -> dict:
-        """Serialize the ordered public slot summary without owning slot state."""
-        last_ts = slot.messages[-1].get("ts", "") if slot.messages else ""
+        """Serialize the ordered public slot summary without owning slot state.
+
+        ``coordinator_pending`` is the list of live ``ApprovalCoordinator``
+        records whose ``slot`` is this slot -- a sub-agent spawn gate or a tool
+        approval raised inside a running sub-agent. Their futures live on the
+        state-level registry, not on ``slot._approval_futures``, so without this
+        input the slot reads as idle while its owner is parked on an approval.
+        Oldest first; the projection reads only the first one for the card.
+        """
+        # The newest DURABLE row: a transient row (the turn-end ``done`` row
+        # among them) is never persisted, so a slot rebuilt from disk after a
+        # gateway restart lacks it. Projecting from one would move ``last_ts``
+        # backwards across the restart, and the dashboard stores ``last_ts`` as
+        # the unread watermark it can only clear with a covering ``last_ts``.
+        last_ts = next(
+            (
+                message.get("ts", "")
+                for message in reversed(slot.messages)
+                if message.get("role") not in transient_roles
+            ),
+            "",
+        )
         last_msg = ""
         has_options = False
+        options_ts = ""
         options: list[str] = []
         prompt_preview = ""
         last_conv_role = ""
@@ -174,6 +277,7 @@ class SlotProjection:
                             options = parse_options(text)
                             has_options = bool(options)
                             if has_options:
+                                options_ts = str(message.get("ts") or "")
                                 stripped = redact(strip_options(text))
                                 prompt_preview = (
                                     stripped[:240] + "…" if len(stripped) > 240 else stripped
@@ -186,7 +290,8 @@ class SlotProjection:
             if found_conv and last_msg and last_activity_ts:
                 break
 
-        pending_approval = any(not future.done() for future in slot._approval_futures.values())
+        slot_pending = any(not future.done() for future in slot._approval_futures.values())
+        pending_approval = slot_pending or bool(coordinator_pending)
         last_turn_ts = last_ts
         if slot.turn_running:
             prompt_ts = next(
@@ -213,20 +318,59 @@ class SlotProjection:
         interrupted = not slot.turn_running and is_turn_interrupted(slot.messages)
 
         pending_approval_info: dict[str, str] | None = None
-        if pending_approval:
+        if slot_pending:
+            # The transcript row is consulted only for a SLOT-registry future:
+            # a coordinator approval writes no row, and a stale unresolved row
+            # from an earlier turn must not describe it.
             for message in reversed(slot.messages):
                 if message.get("role") != "permission":
                     continue
                 meta = parse_cls_meta(message.get("cls") or "") or {}
                 if meta.get("resolved"):
                     continue
+                request_id = meta.get("approval_id", meta.get("request_id", ""))
+                if not isinstance(request_id, str):
+                    continue
+                future = slot._approval_futures.get(request_id)
+                if future is None or future.done():
+                    continue
+                request_mid = slot.approval_instance(request_id, message)
+                if not request_mid:
+                    continue
                 pending_approval_info = {
+                    "origin": "native",
                     "tool": redact(message.get("content") or ""),
                     "tool_input": redact(meta.get("tool_input", "")),
                     "tool_kind": redact(meta.get("tool_kind", "")),
-                    "request_id": redact(meta.get("approval_id", meta.get("request_id", ""))),
+                    "request_id": redact(request_id),
+                    "request_mid": request_mid,
                 }
+                if meta.get("tool_purpose"):
+                    pending_approval_info["tool_purpose"] = redact(meta["tool_purpose"])
                 break
+        if pending_approval_info is None and coordinator_pending:
+            # No unresolved permission row supplied the card: the pending
+            # approval is a coordinator one, whose record never reaches the
+            # transcript. Its fields were redacted at registration; the redact
+            # here keeps this branch on the same wire contract as the row above.
+            record = coordinator_pending[0]
+            approval_id = str(record.get("id") or "")
+            pending_approval_info = {
+                "origin": "coordinator",
+                "tool": redact(str(record.get("tool") or "")),
+                "tool_input": redact(str(record.get("tool_input") or "")),
+                "tool_kind": "spawn" if approval_id.startswith("spawn:") else "",
+                "request_id": redact(approval_id),
+            }
+            if record.get("tool_purpose"):
+                # Import after state initialization: chat_utils itself imports state.
+                from kiro_crew.dashboard.chat_utils import _MAX_TOOL_PURPOSE, _redact_tool_field
+
+                # Redact the full source before the display cap. Native metadata
+                # is already capped upstream; recapping would split its notice.
+                pending_approval_info["tool_purpose"] = _redact_tool_field(
+                    redact(str(record["tool_purpose"])), limit=_MAX_TOOL_PURPOSE
+                )
 
         return {
             "key": slot.key,
@@ -260,31 +404,27 @@ class SlotProjection:
             "surface": slot.mode,
             "workspace": slot.workspace,
             "project": slot.project,
-            # Remote-execution binding. Shipped on every slot (not just remote
-            # ones) so the frontend can branch on a field that is always
-            # present: an absent key and "runs locally" would be the same
-            # reading, and a stale client would then render a peer session as
-            # local. The binding's third field, `remote_slot`, is still NOT
-            # projected: it is the PEER's slot key, routable only inside a
-            # request sent back through that instance, and shipping a routable
-            # peer key to a browser buys nothing.
-            #
-            # What the browser does need from it is the row's IDENTITY, so that
-            # is projected instead, already resolved. A remote-bound session --
-            # minted through `create_peer_slot` or adopted from a peer row --
-            # identifies as `<instance_id>:<peer_key>`, which is exactly the
-            # identity the peer row carried before it was bound. Same identity
-            # before and after means the sidebar re-renders ONE row rather than
-            # replacing the row the user clicked with a sibling, and it means a
-            # log line, a `data-session-row` selector and a trace all stay
-            # continuous across the adopt instead of splitting in two.
+            # Relay-archive marker. Shipped on every slot so the frontend can
+            # branch on a field that is always present: an absent key and "runs
+            # locally" would be the same reading. The binding's third field,
+            # `remote_slot`, is NOT projected: it is the PEER's slot key, and
+            # shipping it to a browser buys nothing.
             "executor": slot.executor,
             "instance_id": slot.instance_id,
             "row_identity": resolved_row_identity(slot),
             "artifact": slot._artifact,
             "messages": len(slot.messages),
             "running": slot.turn_running,
-            "orchestrating": slot._in_stage_execution,
+            # An automatic compaction in flight on this session. Separate from
+            # `running` because it is NOT a dashboard turn: the composer reads
+            # idle while it holds the session, which without this field looks
+            # like a stall worth pressing Stop on.
+            "compacting": bool(getattr(slot, "_compacting", False)),
+            # A cooperative Stop was declined moments ago (the session was
+            # compacting) and the next press escalates to a force stop. Read
+            # with the same window the stop route uses, so the button's hint and
+            # the backend's answer cannot disagree.
+            "stop_declined": stop_declined_armed(slot),
             "queue_depth": slot.queue_depth,
             "stopping": slot._stopping,
             "pending_approval": pending_approval,
@@ -311,9 +451,11 @@ class SlotProjection:
             # look like it had confirmed a server the session never mounted.
             "mcp_report": slot.mcp_report_payload(),
             "has_options": has_options,
+            "options_ts": options_ts,
             "options": [redact(option) for option in options],
             "prompt_preview": prompt_preview,
             "trust": slot._trust,
+            "trust_scope": live_trust_scope(slot),
             "trust_reads": slot._trust_reads,
             "trusted_patterns_count": len(slot._trusted_patterns),
             "slack_linked": slot._slack_linked,
@@ -331,6 +473,12 @@ class SlotProjection:
             "memory_mode": slot.memory_mode,
             "forked_from": slot.forked_from,
             "linked_session_key": slot.linked_session_key,
+            # The transcript filename stem this slot's history lives under: the
+            # same key the Older sessions list gives this session, so a client
+            # that reopens a closed slot sends it verbatim and never derives it.
+            # Resolved by ``slot_history_key``, which knows the channel-origin
+            # provenance a client cannot read from the slot name.
+            "history_key": _history_stem(slot),
             "app": slot._app,
             "origin": slot._origin,
             # Creator attribution: the slot key of the session that asked for
@@ -341,4 +489,13 @@ class SlotProjection:
             # ``slots`` frames on it. A member caller is ownership-fenced to the
             # slots it created (``authorize_target``), so created == driven.
             "created_by": getattr(slot, "_created_by", ""),
+            # Whether THIS gateway process stamped ``created_by`` at mint, as
+            # opposed to rehydrating it from the transcript. The field above is
+            # restored from a metadata line an agent's file tools can edit, so on
+            # its own it is a claim; this says whether it is the gateway's own
+            # witness. Carried onto the row because the one reader that DECIDES
+            # on it -- the sidebar's lineage join -- gets rows and no slots, and
+            # a join that trusted the claim alone would nest a session under
+            # whoever a transcript happened to name.
+            "lineage_minted": bool(getattr(slot, "_lineage_minted", False)),
         }

@@ -28,6 +28,25 @@ from kiro_crew.platform.governance import parse_policy
 from kiro_crew.security.exfil import EXFILTRATION_REDACTION_TAG_PREFIX
 from kiro_crew.security.redaction import REDACTED_CREDENTIAL_TAG
 
+#: How long these tests let one member assignment run, and how long they wait for
+#: it. Both are LOST-RUN guards: no test that uses them is about how long an
+#: assignment takes (the deadline tests pass ``timeout_s`` themselves). The work is
+#: config loads, sqlite commits and fsyncs, ~0.3s on a quiet host and 18-31s per
+#: test call on a Windows CI shard whose four workers ran this file together, so a
+#: budget sized near the work measures the runner's disk instead of the property.
+#: The wait plus a slow ``ensure_team`` stays under ``--timeout=120``, so a run that
+#: is really stuck fails at this wait, by name, rather than taking its worker down.
+_MEMBER_BUDGET_SECS = 45
+_MEMBER_WAIT_SECS = 60
+
+
+async def _run_member(runner, prompt, **kwargs):
+    """Run one assignment off the loop, bounded only against a lost run."""
+    return await asyncio.wait_for(
+        asyncio.to_thread(runner.run, prompt, timeout_s=_MEMBER_BUDGET_SECS, **kwargs),
+        timeout=_MEMBER_WAIT_SECS,
+    )
+
 
 @pytest.fixture(autouse=True)
 def _isolated_app_data_home(tmp_path, monkeypatch):
@@ -119,12 +138,18 @@ def test_deleted_member_is_not_replaced_by_a_fresh_identity():
 
 @pytest.mark.asyncio
 async def test_installed_members_are_visible_in_the_roster():
+    from aiohttp import web
     from aiohttp.test_utils import make_mocked_request
 
     from kiro_crew.dashboard.handlers.members import api_members
 
     identities = await asyncio.to_thread(crew.ensure_team)
-    response = await api_members(make_mocked_request("GET", "/api/members"))
+    app = web.Application()
+    app["state"] = SimpleNamespace(owner_id="", _slots={}, conversation_log=None)
+    request = make_mocked_request("GET", "/api/members", app=app)
+    request["app"] = ""
+    request["user"] = "local-app"
+    response = await api_members(request)
     assert isinstance(response.body, bytes)
     rows = {row["name"]: row for row in json.loads(response.body)["members"]}
     for role, spec in crew.ROLES.items():
@@ -222,9 +247,7 @@ async def test_generated_prompt_is_redacted_only_in_transcript(tmp_path):
     exfil_url = "https://collector.invalid/collect?data=" + "A" * 250
     prompt = f"Investigate this candidate.\naws_secret_access_key={secret}\n{exfil_url}"
 
-    result = await asyncio.wait_for(
-        asyncio.to_thread(runner.run, prompt, cwd=str(tmp_path), timeout_s=5), timeout=10
-    )
+    result = await _run_member(runner, prompt, cwd=str(tmp_path))
 
     assert result.ok
     assert sessions.providers[0].prompts == [f"{identities['implementation']}\n{prompt}"]
@@ -259,10 +282,7 @@ async def test_member_result_redaction_preserves_raw_return(tmp_path, output):
     runtime = crew.GatewayRuntime(sessions, Context(), asyncio.get_running_loop())
     runner = CrewRunner(runtime, identities, on_activity=activity.append).for_role("implementation")
 
-    result = await asyncio.wait_for(
-        asyncio.to_thread(runner.run, "Inspect candidate", cwd=str(tmp_path), timeout_s=5),
-        timeout=10,
-    )
+    result = await _run_member(runner, "Inspect candidate", cwd=str(tmp_path))
 
     key = sessions.acquired[0][0]
     transcript = await asyncio.to_thread(ConversationLog()._path(key).read_text, encoding="utf-8")
@@ -307,10 +327,7 @@ async def test_member_result_redactor_failure_withholds_output_and_releases(tmp_
     runtime = crew.GatewayRuntime(sessions, Context(), asyncio.get_running_loop())
     runner = CrewRunner(runtime, identities, on_activity=activity.append).for_role("implementation")
 
-    result = await asyncio.wait_for(
-        asyncio.to_thread(runner.run, "Inspect candidate", cwd=str(tmp_path), timeout_s=5),
-        timeout=10,
-    )
+    result = await _run_member(runner, "Inspect candidate", cwd=str(tmp_path))
 
     assert not result.ok
     assert result.error == "PlatformCompositionError: redaction unavailable"
@@ -665,11 +682,8 @@ async def test_kindless_native_edit_honors_filesystem_write_ceiling(tmp_path, wi
         identities,
         on_activity=activity.append,
     ).for_role("implementation")
-    result = await asyncio.wait_for(
-        asyncio.to_thread(
-            runner.run, "Create the repair", cwd=str(tmp_path), allowed_tools=["Edit"], timeout_s=5
-        ),
-        timeout=10,
+    result = await _run_member(
+        runner, "Create the repair", cwd=str(tmp_path), allowed_tools=["Edit"]
     )
 
     assert result.ok, result.error
@@ -832,9 +846,7 @@ async def _run_shadow_assignment(cwd=None, role="discovery"):
     runner = CrewRunner(
         crew.GatewayRuntime(sessions, Context(), asyncio.get_running_loop()), identities
     ).for_role(role)
-    result = await asyncio.wait_for(
-        asyncio.to_thread(runner.run, "Inspect the candidate", cwd=cwd, timeout_s=5), timeout=10
-    )
+    result = await _run_member(runner, "Inspect the candidate", cwd=cwd)
     return result, sessions
 
 
@@ -1024,3 +1036,124 @@ async def test_project_shadow_checks_provider_default_cwd(tmp_path, monkeypatch,
     else:
         assert result.ok, result.error
         assert sessions.acquired[0][1]["cwd"] == str(expected)
+
+
+class _GovernedProvider(Provider):
+    """A provider whose one request is judged by the platform governance gate."""
+
+    def __init__(self):
+        super().__init__()
+        self.approved = []
+        self.rejected = []
+
+    async def stream(self, prompt):
+        from kiro_crew.acp.types import EVENT_COMPLETE, EVENT_PERMISSION_REQUEST, AcpEvent
+
+        yield AcpEvent(
+            kind=EVENT_PERMISSION_REQUEST,
+            tool_call_id="call-1",
+            request_id="request-1",
+            tool_kind="read",
+            raw_tool_params={"path": "notes.md"},
+        )
+        yield AcpEvent(kind=EVENT_COMPLETE)
+
+    async def approve_tool(self, rid, **kwargs):
+        self.approved.append(rid)
+
+    async def reject_tool(self, rid):
+        self.rejected.append(rid)
+
+
+async def _run_governed_assignment(identities, monkeypatch, *, denied_agent):
+    """Run one discovery assignment under a gate that denies only ``denied_agent``."""
+    judged = []
+
+    def gate(ev, *, session_key, agent, tool_kind=None):
+        judged.append(agent)
+        return "alias profile forbids this" if agent == denied_agent else ""
+
+    monkeypatch.setattr(agent_runner, "_governance_denial", gate)
+    sessions = Sessions(_GovernedProvider)
+    runner = CrewRunner(
+        crew.GatewayRuntime(sessions, Context(), asyncio.get_running_loop()), identities
+    ).for_role("discovery")
+    result = await asyncio.wait_for(asyncio.to_thread(runner.run, "Read the notes"), timeout=10)
+    assert result.ok
+    return judged, sessions
+
+
+@pytest.mark.asyncio
+async def test_renamed_member_is_governed_under_its_alias_not_its_template(tmp_path, monkeypatch):
+    identities = await asyncio.to_thread(crew.ensure_team)
+    template = crew.ROLES["discovery"].template
+
+    def rename(data):
+        data["agents"]["my-scout"] = data["agents"].pop(crew.ROLES["discovery"].name)
+        return data
+
+    await asyncio.to_thread(update_config_locked, mutate=rename)
+
+    # A profile that denies the ALIAS refuses the request even though the template is allowed.
+    judged, sessions = await _run_governed_assignment(
+        identities, monkeypatch, denied_agent="my-scout"
+    )
+    assert judged == ["my-scout"]
+    assert sessions.providers[0].rejected == ["request-1"]
+    assert sessions.providers[0].approved == []
+    # Provider allocation still selects the shared template; the alias rides as crew_agent.
+    assert sessions.acquired[0][1]["agent"] == template
+    assert sessions.acquired[0][1]["crew_agent"] == "my-scout"
+
+    # A profile that denies only the TEMPLATE does not reach a renamed member.
+    judged, sessions = await _run_governed_assignment(
+        identities, monkeypatch, denied_agent=template
+    )
+    assert judged == ["my-scout"]
+    assert sessions.providers[0].approved == ["request-1"]
+    assert sessions.providers[0].rejected == []
+
+
+@pytest.mark.asyncio
+async def test_unrenamed_member_governance_is_unchanged(monkeypatch):
+    identities = await asyncio.to_thread(crew.ensure_team)
+    template = crew.ROLES["discovery"].template
+
+    judged, sessions = await _run_governed_assignment(
+        identities, monkeypatch, denied_agent=template
+    )
+    assert judged == [template]
+    assert sessions.providers[0].rejected == ["request-1"]
+
+    judged, sessions = await _run_governed_assignment(
+        identities, monkeypatch, denied_agent="some-other-member"
+    )
+    assert judged == [template]
+    assert sessions.providers[0].approved == ["request-1"]
+
+
+@pytest.mark.asyncio
+async def test_session_runner_default_governs_under_its_agent_name(monkeypatch):
+    """Direct ``SessionAgentRunner`` users (no alias) keep judging under ``agent_name``."""
+    judged = []
+
+    def gate(ev, *, session_key, agent, tool_kind=None):
+        judged.append(agent)
+        return ""
+
+    monkeypatch.setattr(agent_runner, "_governance_denial", gate)
+    provider = _GovernedProvider()
+    runner = agent_runner.SessionAgentRunner(agent_name="auto-improvement-scout")
+    result = await runner._run_async(
+        "Read the notes",
+        factory=None,
+        provider=provider,
+        session_key="s1",
+        cwd=None,
+        append_system=None,
+        timeout_s=5,
+        t0=time.monotonic(),
+    )
+    assert result.ok
+    assert judged == ["auto-improvement-scout"]
+    assert provider.approved == ["request-1"]

@@ -1,5 +1,6 @@
 """V2 keeps actual essential sources complete through every provider lifecycle."""
 
+import gc
 import json
 import os
 import threading
@@ -9,8 +10,11 @@ from unittest.mock import Mock
 
 import pytest
 
-from conftest import requires_symlinks
+from conftest import make_dir_link, requires_symlinks
 from kiro_crew import context as context_module
+from kiro_crew import member_essential_context as _mec
+from kiro_crew import pinned_fs
+from kiro_crew.agent_sdk.provider_identity import PROVIDER_ACP, PROVIDER_CLAUDE_CODE
 from kiro_crew.config.loader import KiroCrewAgentConfig, KiroCrewConfig
 from kiro_crew.context import CONTEXT_GROUP_LESSONS, ContextBuilder
 from kiro_crew.learn import LessonStore
@@ -24,6 +28,30 @@ from kiro_crew.memory_stores import (
     provision_member_memory,
 )
 from kiro_crew.skills import SkillsLoader
+
+
+@pytest.fixture(autouse=True)
+def _close_skills_loaders(close_skills_loaders):
+    """The ``env`` fixture builds a ``SkillsLoader`` it never closes: close it (rootdir conftest)."""
+
+
+@pytest.fixture
+def cyclic_gc_quiesced():
+    """Keep a cyclic-GC pass (and any finalizer it runs) out of a deep JSON parse.
+
+    A recursion-limit fixture drives the parser to the bottom of the stack; a
+    collection firing there could run an inherited finalizer with no stack
+    left. Drain first, disable for the parse, then restore and drain again.
+    """
+    gc.collect()
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        yield
+    finally:
+        if was_enabled:
+            gc.enable()
+        gc.collect()
 
 
 @pytest.fixture
@@ -173,12 +201,22 @@ def test_tail_and_updated_soul_survive_small_ordinary_context_budget(env):
     env.forbidden.assert_not_called()
 
 
-def test_oversized_essential_refuses_with_source_name_instead_of_partial_prompt(env):
+def test_oversized_guide_is_left_out_by_name_instead_of_refusing_the_turn(env):
+    """An over-budget guide drops out whole and is named; the turn still runs.
+
+    This replaced ``test_oversized_essential_refuses_with_source_name_instead_of_
+    partial_prompt``: the source is still named and never cut mid-body, but the
+    member's core keeps working instead of every turn refusing.
+    """
     (env.project / "AGENTS.md").write_text("x" * 64_001, encoding="utf-8")
-    with pytest.raises(MemberEssentialContextError, match="AGENTS.md"):
-        env.builder.build_message(
-            "Continue", False, memory_store=env.store, member=env.member, project=str(env.project)
-        )
+    message, _ = env.builder.build_message(
+        "Continue", False, memory_store=env.store, member=env.member, project=str(env.project)
+    )
+    assert "x" * 1_000 not in message
+    assert "[Essential source: essential-context#omitted]" in message
+    assert f"{env.project / 'AGENTS.md'} (64,001 characters)" in message
+    assert "Bound Soul: preserve the user's voice." in message
+    assert "Preference anchor: 请保留中文原文。" in message
 
 
 @pytest.mark.asyncio
@@ -383,6 +421,341 @@ def test_execution_namespace_controls_member_prompt_identity(env, entrypoint, se
         assert "Do not publish drafts." not in prompt
         assert "Preference anchor" not in prompt
         assert execution.store.store_id == "default"
+    env.forbidden.assert_not_called()
+
+
+def _delegate_expectations(prompt: str, store: str, *, template_instructions: bool = True) -> None:
+    """The subset a member turn with the desk WITHHELD receives.
+
+    Shared by the template-selected delegate and the member selection off its
+    desk (a plain chat on the alias, a cron or channel turn): the two arms of
+    ``_desk_withheld``, one section shape.
+
+    Identity, `[PERMANENT RULES]`, the store's anchors and the selected template's
+    own instructions stay; the desk protocol and the briefing do not, in any of
+    their spellings (the full layer, the platform placeholder, the scope
+    placeholder), and neither does the rules header's reference to a protocol
+    that is not there.
+    """
+    assert "You are writer." in prompt
+    assert "A careful bilingual writer" in prompt
+    assert "[PERMANENT RULES" in prompt
+    assert "Do not publish drafts." in prompt
+    assert "Preference anchor" in prompt
+    if template_instructions:
+        assert "Execution task instructions." in prompt
+    assert "[HOW YOU WORK]" not in prompt
+    assert "Front desk vs workshop" not in prompt
+    assert "[CURRENT ASSIGNMENT" not in prompt
+    assert "working protocol above" not in prompt
+    assert prompt.count("[V2 ESSENTIAL CONTEXT") == 1
+    assert store in prompt or "memory_recall" in prompt
+
+
+def _template_delegate(config):
+    """The execution both delegate paths mint for a member caller naming a template.
+
+    `session_create(agent=<template>)` and the subagent admission gate agree on it:
+    the member's store and id stay, the selection namespace is the template's.
+    """
+    from dataclasses import replace
+
+    from kiro_crew.execution_context import resolve_member_execution
+
+    return replace(
+        resolve_member_execution(config, "writer"),
+        selection_kind="template",
+        selection_name="task-template",
+        template_id="task-template",
+    )
+
+
+@pytest.mark.parametrize(
+    "fresh, options",
+    [
+        (True, {}),
+        (False, {}),
+        (False, {"needs_reinjection": True}),
+        (True, {"resumed": True}),
+        (True, {"minimal_context": True}),
+    ],
+)
+def test_template_selected_delegate_keeps_identity_and_rules_but_not_the_desk_protocol(
+    env, fresh, options
+):
+    """The member's store under a selected template is the member's DELEGATE.
+
+    It reads and writes the member's memory, so it is that member and runs under
+    that member's rules; it was picked to do the work, so the desk protocol whose
+    second item hands substantial work to a separate session -- and the working
+    briefing that protocol maintains -- are withheld on every lifecycle the
+    envelope is rebuilt for.
+    """
+    delegate = _template_delegate(KiroCrewConfig.load())
+    prompt, _ = env.builder.build_message(
+        "Do the task",
+        fresh,
+        "dashboard:delegate",
+        execution_context=delegate,
+        agent="task-template",
+        project=str(env.project),
+        **options,
+    )
+    _delegate_expectations(prompt, env.store)
+    assert delegate.store.store_id == env.store
+    env.forbidden.assert_not_called()
+
+
+def test_template_selected_delegate_session_start_withholds_the_desk_protocol(env):
+    prompt = env.builder.build_session_context(
+        execution_context=_template_delegate(KiroCrewConfig.load()),
+        agent="task-template",
+        project=str(env.project),
+    )
+    _delegate_expectations(prompt, env.store)
+    env.forbidden.assert_not_called()
+
+
+@pytest.mark.parametrize("entrypoint", ["message", "session"])
+def test_member_at_its_desk_gets_its_whole_desk(env, entrypoint):
+    """The counterpart: a member turn the caller names as the DESK keeps all four
+    layers, protocol included. ``member=`` is what the dashboard passes for a
+    ``mode == "member"`` slot -- the pinned DM thread."""
+    from kiro_crew.execution_context import resolve_member_execution
+
+    execution = resolve_member_execution(KiroCrewConfig.load(), "writer")
+    options = dict(execution_context=execution, project=str(env.project), member="writer")
+    if entrypoint == "message":
+        prompt, _ = env.builder.build_message("Continue", True, **options)
+    else:
+        prompt = env.builder.build_session_context(**options)
+    assert "You are writer." in prompt
+    assert "This DM thread is your durable working relationship" in prompt
+    assert "[HOW YOU WORK]" in prompt
+    assert "Front desk vs workshop" in prompt
+    assert "[PERMANENT RULES" in prompt
+    assert "working protocol above included" in prompt
+    assert "[CURRENT ASSIGNMENT" in prompt
+    env.forbidden.assert_not_called()
+
+
+@pytest.mark.parametrize("entrypoint", ["message", "session"])
+@pytest.mark.parametrize(
+    "fresh, options",
+    [
+        (True, {}),
+        (False, {}),
+        (False, {"needs_reinjection": True}),
+        (True, {"resumed": True}),
+        (True, {"minimal_context": True}),
+    ],
+)
+def test_member_selected_off_its_desk_keeps_identity_and_rules_but_not_the_desk(
+    env, entrypoint, fresh, options
+):
+    """A member SELECTION with no desk argument is not the member's desk.
+
+    An ordinary dashboard chat that resolved to a crew alias -- every plain chat
+    lands on the stock ``default`` alias this way -- a cron turn or a channel turn
+    carries the member's record and therefore its identity, rules and memory, but
+    no caller named it as the member's DM thread. It gets exactly what a delegate
+    gets: identity and `[PERMANENT RULES]`, no `[HOW YOU WORK]`, no briefing (so
+    nothing tells it to rewrite the briefing file), and no sentence describing a
+    DM thread it is not in. Pinned on every lifecycle the section is rebuilt for
+    and on both entry points.
+    """
+    from kiro_crew.execution_context import resolve_member_execution
+
+    execution = resolve_member_execution(KiroCrewConfig.load(), "writer")
+    base = dict(execution_context=execution, project=str(env.project))
+    if entrypoint == "message":
+        prompt, _ = env.builder.build_message(
+            "Continue", fresh, "dashboard:chat-1-123", **base, **options
+        )
+    else:
+        if not fresh:
+            pytest.skip("build_session_context is the session-start entry point")
+        prompt = env.builder.build_session_context(**base, **options)
+    _delegate_expectations(prompt, env.store, template_instructions=False)
+    assert "This DM thread is your durable working relationship" not in prompt
+    env.forbidden.assert_not_called()
+
+
+def test_a_delegate_with_memory_withheld_gets_no_layer_four_placeholder_either(env):
+    """The scope notice explains a member's missing layer 4; a delegate has none.
+
+    With the memory group withheld, the member AT ITS DESK is told why its
+    briefing is missing and not to fill the gap; the delegate on the same store
+    keeps identity and rules and gets no `[CURRENT ASSIGNMENT` line of any kind.
+    """
+    from kiro_crew.context import CONTEXT_GROUP_PROJECT
+    from kiro_crew.execution_context import resolve_member_execution
+
+    config = KiroCrewConfig.load()
+    options = dict(project=str(env.project), context_groups=frozenset({CONTEXT_GROUP_PROJECT}))
+    member_prompt, _ = env.builder.build_message(
+        "Continue",
+        True,
+        execution_context=resolve_member_execution(config, "writer"),
+        member="writer",
+        **options,
+    )
+    assert "withheld by this turn's memory/privacy scope]" in member_prompt
+    delegate_prompt, _ = env.builder.build_message(
+        "Do the task",
+        True,
+        execution_context=_template_delegate(config),
+        agent="task-template",
+        **options,
+    )
+    assert "You are writer." in delegate_prompt
+    assert "[PERMANENT RULES" in delegate_prompt
+    assert "[CURRENT ASSIGNMENT" not in delegate_prompt
+    assert "[HOW YOU WORK]" not in delegate_prompt
+    env.forbidden.assert_not_called()
+
+
+def test_spawn_agent_delegate_of_a_member_is_the_same_delegate(env):
+    """`spawn_run(agent=<template>)` from a member parent mints the same record
+    shape the session arm does, so the sub-agent's prompt withholds the same
+    layers -- one predicate, both delegate paths."""
+    from unittest.mock import MagicMock
+
+    from kiro_crew.execution_context import resolve_member_execution
+    from kiro_crew.subagent import SubagentManager
+
+    config = KiroCrewConfig.load()
+    parent = resolve_member_execution(config, "writer")
+    manager = SubagentManager(sessions=MagicMock(), ctx_builder=MagicMock())
+    admitted = manager._admission.resolve_spawn_execution(
+        parent_session_key="dashboard:writer", agent="task-template", _record=parent
+    )
+    assert admitted.selection_kind == "template"
+    assert admitted.member_id == parent.member_id
+    assert admitted.store == parent.store
+    prompt, _ = env.builder.build_message(
+        "Do the task",
+        True,
+        "subagent:delegate",
+        execution_context=admitted,
+        agent="task-template",
+        project=str(env.project),
+    )
+    _delegate_expectations(prompt, env.store)
+    env.forbidden.assert_not_called()
+
+
+def test_a_member_with_no_persisted_id_keeps_its_rules_when_session_create_names_a_template(
+    env,
+):
+    """The record shape the split cannot express, on the `session_create` arm.
+
+    A member whose record predates persisted identity is named by `selection_kind
+    == "member"` and `selection_name` alone. Rewriting those to the template's
+    namespace would leave a record ContextBuilder attributes to no member -- no
+    identity and, the part that matters, no `[PERMANENT RULES]`. The arm keeps the
+    selection and changes only the template (the record
+    `test_explicit_template_child_of_a_member_with_no_persisted_id_keeps_its_selection`
+    pins through the arm itself), so the child stays that member with its rules.
+    It does NOT keep the desk: no caller names a delegate as the member's
+    DM thread, so the surface half of ``_desk_withheld`` withholds the protocol
+    and the briefing without the record having to say "this member, under that
+    template".
+    """
+    from dataclasses import replace
+
+    from kiro_crew.execution_context import ExecutionContext, MemoryStoreRef
+
+    config = KiroCrewConfig.load()
+    config.agents["scribe"] = KiroCrewAgentConfig(
+        kiro_agent="critic-runtime", description="A scribe with no persisted identity"
+    )
+    config.save()
+    write_member_rules(slug_for_name("scribe"), member="scribe", text="Scribe: keep every draft.")
+    legacy = ExecutionContext(
+        None, MemoryStoreRef("default"), "member", "critic-runtime", selection_name="scribe"
+    )
+    child = replace(legacy, template_id="task-template")
+    prompt, _ = env.builder.build_message(
+        "Do the task",
+        True,
+        "session_create:delegate",
+        execution_context=child,
+        agent="task-template",
+        project=str(env.project),
+    )
+    assert "You are scribe." in prompt
+    assert "A scribe with no persisted identity" in prompt
+    assert "[PERMANENT RULES" in prompt
+    assert "Scribe: keep every draft." in prompt
+    assert "Execution task instructions." in prompt
+    assert "[HOW YOU WORK]" not in prompt
+    assert "[CURRENT ASSIGNMENT" not in prompt
+    assert "This DM thread" not in prompt
+    env.forbidden.assert_not_called()
+
+
+def test_a_member_with_no_persisted_id_spawns_a_plain_template_child(env):
+    """The spawn gate's `agent=` child of such a member is a template run.
+
+    `with_template` flips the selection namespace for every record, and a member
+    with no persisted id has no identity field to survive that, so its
+    `spawn_run(agent=...)` child is a plain template run on the parent's store
+    with no member section -- neither the desk protocol nor the rules (the record
+    cannot say "this member, under that template"; a record-shape change for the
+    memory model). A continuation of
+    that child is a template turn: `run.py` takes the kind from the record, the
+    member refresh is skipped, the spawn template is kept, and no member is
+    looked up, so a renamed alias is not an error.
+    """
+    from unittest.mock import MagicMock
+
+    from kiro_crew.execution_context import ExecutionContext, MemoryStoreRef
+    from kiro_crew.subagent import SubagentManager
+
+    config = KiroCrewConfig.load()
+    config.agents["scribe"] = KiroCrewAgentConfig(
+        kiro_agent="critic-runtime", description="A scribe with no persisted identity"
+    )
+    config.save()
+    write_member_rules(slug_for_name("scribe"), member="scribe", text="Scribe: keep every draft.")
+    legacy = ExecutionContext(
+        None, MemoryStoreRef("default"), "member", "critic-runtime", selection_name="scribe"
+    )
+    manager = SubagentManager(sessions=MagicMock(), ctx_builder=MagicMock())
+    child = manager._admission.resolve_spawn_execution(
+        parent_session_key="dashboard:scribe", agent="task-template", _record=legacy
+    )
+    assert (child.member_id, child.selection_kind, child.selection_name) == (
+        None,
+        "template",
+        "task-template",
+    )
+    assert child.template_id == "task-template"
+    assert child.store == legacy.store
+    prompt, _ = env.builder.build_message(
+        "Do the task",
+        True,
+        "subagent:delegate",
+        execution_context=child,
+        agent="task-template",
+        project=str(env.project),
+    )
+    assert "Execution task instructions." in prompt
+    assert "You are scribe." not in prompt
+    assert "[PERMANENT RULES" not in prompt
+    assert "[HOW YOU WORK]" not in prompt
+    continued = manager._admission.resolve_spawn_execution(
+        conversation_key="subagent:child", _record=child
+    )
+    assert continued.template_id == "task-template"
+    assert continued == child
+    config.agents["scribe-renamed"] = config.agents.pop("scribe")
+    config.save()
+    renamed = manager._admission.resolve_spawn_execution(
+        conversation_key="subagent:child", _record=child
+    )
+    assert renamed == child
     env.forbidden.assert_not_called()
 
 
@@ -737,6 +1110,47 @@ def test_absolute_resource_outside_a_linked_root_is_still_refused(env, tmp_path)
         essentials._resource_paths([f"file://{outside}"], linked_root, linked_root)
 
 
+def test_absolute_resource_in_link_spelling_admits_under_a_resolved_root(env, tmp_path):
+    """A link-spelled declaration must resolve against a realpath-spelled root.
+
+    The reverse of the installer case: a project root is stored resolved while
+    the template records the resource through the ``$HOME`` link, so neither
+    spelling of the root is a lexical prefix of the declaration.
+    """
+    from kiro_crew import member_essential_context as essentials
+
+    linked_root = tmp_path / "linked-root"
+    make_dir_link(linked_root, env.project)
+    real_root = Path(os.path.realpath(str(linked_root)))
+    declared = linked_root / "declared-guide.md"
+    paths = essentials._resource_paths([f"file://{declared}"], real_root, real_root)
+    assert paths, "a link-spelled resource under the resolved root was refused"
+    match, root = paths[0]
+    assert "Declared guide" in essentials._read(match, root)
+
+
+def test_link_spelled_resource_still_refuses_outside_and_links_below_root(env, tmp_path):
+    """Matching the root's link spelling admits neither a sibling nor a link below it."""
+    from kiro_crew import member_essential_context as essentials
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "guide.md").write_text("OUTSIDE_SECRET", encoding="utf-8")
+
+    linked_root = tmp_path / "linked-root"
+    make_dir_link(linked_root, env.project)
+    real_root = Path(os.path.realpath(str(linked_root)))
+    with pytest.raises(MemberEssentialContextError, match="outside"):
+        essentials._resource_paths([f"file://{outside / 'guide.md'}"], real_root, real_root)
+    make_dir_link(env.project / "escape", outside)
+    paths = essentials._resource_paths(
+        [f"file://{linked_root / 'escape' / 'guide.md'}"], real_root, real_root
+    )
+    with pytest.raises(MemberEssentialContextError, match="outside"):
+        for match, root in paths:
+            essentials._read(match, root)
+
+
 def test_owner_cleared_empty_anchors_are_valid_but_missing_source_refuses(env):
     env.memory._preferences_file.write_text("", encoding="utf-8")
     env.memory._projects_file.write_text("", encoding="utf-8")
@@ -788,6 +1202,160 @@ def test_glob_leaf_link_cannot_silently_drop_a_declared_guide(env):
         )
 
 
+def _link_global_steering(env, tmp_path) -> Path:
+    """Make ``~/.kiro/steering/context/style.md`` a link into an outside repo."""
+    repo = tmp_path / "steering-repo"
+    repo.mkdir()
+    (repo / "style.md").write_text("LINKED_STEERING_BODY", encoding="utf-8")
+    context = Path.home() / ".kiro" / "steering" / "context"
+    context.mkdir(parents=True, exist_ok=True)
+    (Path.home() / ".kiro" / "steering" / "plain.md").write_text(
+        "PLAIN_STEERING_BODY", encoding="utf-8"
+    )
+    link = context / "style.md"
+    link.symlink_to(repo / "style.md")
+    return link
+
+
+@requires_symlinks
+def test_linked_global_steering_file_is_named_instead_of_refusing_the_turn(env, tmp_path):
+    """A steering link left out of the snapshot does not stop the member.
+
+    Global steering is read because it exists, like a project's ``AGENTS.md``,
+    so a link there is left out unread and named in-band; the regular steering
+    file beside it still loads.
+    """
+    link = _link_global_steering(env, tmp_path)
+    message = _member_message(env)
+    assert "LINKED_STEERING_BODY" not in message
+    assert "PLAIN_STEERING_BODY" in message
+    assert f"[Essential source: {_mec.ESSENTIAL_LINKED_SKIP_SOURCE}]" in message
+    assert str(link) in message
+    # kiro-cli may load the link natively, so the note must not tell the model to
+    # disregard it or ask the user to restructure a working setup.
+    assert "may still load linked steering natively" in message
+    note = _mec._skipped_linked_note([link])
+    assert note is not None and "Do not assume" not in note[1]
+
+
+@requires_symlinks
+def test_linked_global_steering_directory_is_named_not_enumerated(env, tmp_path):
+    repo = tmp_path / "steering-repo"
+    repo.mkdir()
+    (repo / "inner.md").write_text("LINKED_DIR_BODY", encoding="utf-8")
+    steering = Path.home() / ".kiro" / "steering"
+    steering.mkdir(parents=True, exist_ok=True)
+    make_dir_link(steering / "shared", repo)
+    message = _member_message(env)
+    assert "LINKED_DIR_BODY" not in message
+    assert str(steering / "shared") in message
+
+
+@requires_symlinks
+def test_linked_non_steering_entry_is_not_named(env, tmp_path):
+    """A link the glob would never have read (not ``*.md``) is not reported."""
+    steering = Path.home() / ".kiro" / "steering"
+    steering.mkdir(parents=True, exist_ok=True)
+    target = tmp_path / "notes.txt"
+    target.write_text("NOT_STEERING", encoding="utf-8")
+    (steering / "README.txt").symlink_to(target)
+    linked: list[Path] = []
+    _mec._matches(Path.home(), ".kiro/steering/**/*.md", linked=linked)
+    assert linked == []
+
+
+@requires_symlinks
+def test_linked_steering_entry_is_screened_before_its_target_is_probed(env, tmp_path, monkeypatch):
+    """A link whose target the path gate refuses is named without a following probe.
+
+    ``entry.is_dir()`` follows the link; on Windows a UNC target would be an
+    outbound SMB probe, so the gate must run first and short-circuit it.
+    """
+    from kiro_crew import member_essential_context as mec
+
+    steering = Path.home() / ".kiro" / "steering"
+    steering.mkdir(parents=True, exist_ok=True)
+    target = tmp_path / "remote-share"
+    target.mkdir()
+    link = steering / "shared"
+    link.symlink_to(target, target_is_directory=True)
+    real_validate = mec.validate_file_path
+    monkeypatch.setattr(
+        mec,
+        "validate_file_path",
+        lambda p, *a, **k: None if Path(p) == link else real_validate(p, *a, **k),
+    )
+    probed: list[str] = []
+    real_is_dir = os.DirEntry.is_dir
+
+    def _spy(entry, *, follow_symlinks=True):
+        if follow_symlinks and Path(entry.path) == link:
+            probed.append(entry.path)
+        return real_is_dir(entry, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(mec.os, "scandir", _wrap_scandir(os.scandir, _spy))
+    linked: list[Path] = []
+    mec._matches(Path.home(), ".kiro/steering/**/*.md", linked=linked)
+    assert linked == [link]
+    assert probed == []
+
+
+def _wrap_scandir(real_scandir, is_dir):
+    """``os.scandir`` whose entries route ``is_dir`` through *is_dir*."""
+
+    class _Entry:
+        def __init__(self, entry):
+            self._entry = entry
+            self.name = entry.name
+            self.path = entry.path
+
+        def is_dir(self, *, follow_symlinks=True):
+            return is_dir(self._entry, follow_symlinks=follow_symlinks)
+
+        def __getattr__(self, attr):
+            return getattr(self._entry, attr)
+
+    class _Iter:
+        """Usable as a context manager and as a plain iterator, like ``os.scandir``."""
+
+        def __init__(self, path):
+            self._it = real_scandir(path)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self._it.close()
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            return _Entry(next(self._it))
+
+        def close(self):
+            self._it.close()
+
+    return _Iter
+
+
+@requires_symlinks
+def test_kiro_launch_documents_leaves_a_linked_global_steering_file_out(env, tmp_path):
+    """The spawn-time native list must not refuse the session start either."""
+    link = _link_global_steering(env, tmp_path)
+    sources = dict(_mec.kiro_launch_documents("writer-template", str(env.project)))
+    assert str(link) not in sources
+    assert "PLAIN_STEERING_BODY" in sources.values()
+
+
+@requires_symlinks
+def test_declared_glob_still_refuses_a_linked_steering_file(env, tmp_path):
+    """Only the implicit scan skips links; a template that declares them still refuses."""
+    _link_global_steering(env, tmp_path)
+    with pytest.raises(MemberEssentialContextError, match="linked document"):
+        _mec._matches(Path.home(), ".kiro/steering/**/*.md")
+
+
 @pytest.mark.parametrize("field, value", [("prompt", 42), ("resources", "file://guide.md")])
 def test_malformed_declared_template_fields_refuse_explicitly(env, field, value):
     spec = env.project / ".kiro" / "agents" / "writer-template.json"
@@ -799,7 +1367,6 @@ def test_malformed_declared_template_fields_refuse_explicitly(env, field, value)
 
 
 def test_linked_directory_is_refused_before_enumerating_outside_sources(env, tmp_path):
-    from conftest import make_dir_link
 
     target = tmp_path / "other-project"
     target.mkdir()
@@ -850,6 +1417,7 @@ def test_refused_workspace_root_is_never_resolved(env, monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize("source", ["package", "development", "user-override"])
+@pytest.mark.parametrize("spec_uses_stub", [False, True], ids=["file-pointer", "native-stub"])
 @pytest.mark.parametrize(
     "fresh, options",
     [
@@ -861,7 +1429,7 @@ def test_refused_workspace_root_is_never_resolved(env, monkeypatch, tmp_path):
     ],
 )
 def test_inherited_product_prompt_uses_session_start_not_essentials(
-    env, tmp_path, monkeypatch, source, fresh, options
+    env, tmp_path, monkeypatch, source, spec_uses_stub, fresh, options
 ):
     from kiro_crew import agent
     from kiro_crew.config import config_dir
@@ -880,8 +1448,9 @@ def test_inherited_product_prompt_uses_session_start_not_essentials(
     prompt_path.write_text("PRODUCT_PROMPT_AT_SESSION_START", encoding="utf-8")
     assert agent._prompt_path() == prompt_path
     spec = env.project / ".kiro" / "agents" / "writer-template.json"
+    spec_prompt = agent._NATIVE_PROMPT_STUB if spec_uses_stub else f"file://{prompt_path}"
     spec.write_text(
-        json.dumps({"name": "writer-template", "prompt": f"file://{prompt_path}"}),
+        json.dumps({"name": "writer-template", "prompt": spec_prompt}),
         encoding="utf-8",
     )
 
@@ -900,6 +1469,70 @@ def test_inherited_product_prompt_uses_session_start_not_essentials(
     assert f"[Essential source: {prompt_path}]" not in message
     if fresh and not options.get("resumed"):
         assert message.count("PRODUCT_PROMPT_AT_SESSION_START") == 1
+    if spec_uses_stub:
+        # Essentials sanitise the stub's [AGENT SYSTEM PROMPT] markers, so a
+        # byte-exact match would miss a leak; assert on its marker-free tail.
+        assert "follow it as your authoritative contract" not in message
+    env.forbidden.assert_not_called()
+
+
+def test_managed_stub_reaches_owner_session_start(env, tmp_path, monkeypatch):
+    """A private-owner fork whose spec carries the native stub resolves to the
+    product contract at session start via the owner-template load, not the stub
+    text (see agent-spec-fields.md → Prompt)."""
+    from kiro_crew import agent
+
+    package = tmp_path / "installed-package" / "config"
+    monkeypatch.setattr(agent, "_BUNDLED_CFG_DIR", package)
+    monkeypatch.setattr(agent, "_project_dir", lambda: None)
+    prompt_path = package / "prompt.md"
+    prompt_path.parent.mkdir(parents=True, exist_ok=True)
+    prompt_path.write_text("PRODUCT_PROMPT_AT_SESSION_START", encoding="utf-8")
+    assert agent._prompt_path() == prompt_path
+    spec = env.project / ".kiro" / "agents" / "writer-template.json"
+    spec.write_text(
+        json.dumps({"name": "writer-template", "prompt": agent._NATIVE_PROMPT_STUB}),
+        encoding="utf-8",
+    )
+
+    # agent="writer-template" == the member's own template, so the owner-template
+    # session-start load (context._load_agent_prompt) runs — not the direct read.
+    message, _ = env.builder.build_message(
+        "Continue",
+        True,
+        agent="writer-template",
+        memory_store=env.store,
+        member=env.member,
+        project=str(env.project),
+    )
+
+    assert message.count("PRODUCT_PROMPT_AT_SESSION_START") == 1
+    assert "follow it as your authoritative contract" not in message
+    env.forbidden.assert_not_called()
+
+
+def test_stale_installed_product_prompt_uses_current_session_start(env, tmp_path, monkeypatch):
+    """A prior bundled gateway's URI remains managed after its install changes."""
+    from kiro_crew import agent
+
+    package = tmp_path / "current-package" / "config"
+    monkeypatch.setattr(agent, "_BUNDLED_CFG_DIR", package)
+    monkeypatch.setattr(agent, "_project_dir", lambda: None)
+    package.mkdir(parents=True)
+    (package / "prompt.md").write_text("CURRENT_PRODUCT_PROMPT", encoding="utf-8")
+    stale = (
+        "file:///Applications/KiroCrew.app/Contents/Resources/backend-dist/"
+        "kirocrew-backend-arm64/lib/python3.12/site-packages/kiro_crew/config/prompt.md"
+    )
+    spec = env.project / ".kiro" / "agents" / "writer-template.json"
+    spec.write_text(json.dumps({"name": "writer-template", "prompt": stale}), encoding="utf-8")
+
+    message, _ = env.builder.build_message(
+        "Continue", True, memory_store=env.store, member=env.member, project=str(env.project)
+    )
+
+    assert message.count("CURRENT_PRODUCT_PROMPT") == 1
+    assert stale not in message
     env.forbidden.assert_not_called()
 
 
@@ -1103,6 +1736,161 @@ def test_workspace_glob_excludes_managed_subtrees_before_scanning(env, monkeypat
     assert "WORKSPACE_CHILD_GUIDE" in message
     assert "MANAGED_CONTENT_MUST_NOT_LOAD" not in message
     assert "You are writer." in message
+    # The prune stays; it names only a prefix collision, never the real store.
+    note_label = "[Essential source: essential-context#managed-skipped:writer-template]"
+    if leaf == "memory_index":
+        assert note_label in message
+        assert str(managed) in message
+    else:
+        assert note_label not in message
+        assert str(managed) not in message
+
+
+def test_plain_workspace_glob_over_real_managed_store_adds_no_note(env, caplog):
+    """A broad glob walking past the workspace's own memory/lessons store is
+    routine: no note, no warning, only a debug line."""
+    from kiro_crew.config import config_dir
+    from kiro_crew.member_essential_context import (
+        ESSENTIAL_MANAGED_SKIP_SOURCE,
+        documents_for_member,
+    )
+
+    project = config_dir() / "workspace"
+    for name in ("memory", "lessons", ".lessons"):
+        (project / name).mkdir(parents=True, exist_ok=True)
+        (project / name / "AGENTS.md").write_text("MANAGED", encoding="utf-8")
+    for name in ("memory.db", "memory.db-wal", "memory_index.db-shm", "lessons.jsonl"):
+        (project / name).write_text("", encoding="utf-8")
+    (project / "guides").mkdir(exist_ok=True)
+    (project / "guides" / "AGENTS.md").write_text("WORKSPACE_CHILD_GUIDE", encoding="utf-8")
+    agents = project / ".kiro" / "agents"
+    agents.mkdir(parents=True, exist_ok=True)
+    _write_template(agents, "writer-template", ["file://*/AGENTS.md", "file://*", "file://**/*.md"])
+    with caplog.at_level("DEBUG", logger="kiro_crew.member_essential_context"):
+        documents = documents_for_member("writer-template", str(project))
+    assert not any(s.startswith(ESSENTIAL_MANAGED_SKIP_SOURCE) for s, _ in documents)
+    assert "WORKSPACE_CHILD_GUIDE" in "\n".join(body for _, body in documents)
+    assert not [r for r in caplog.records if r.levelname == "WARNING"]
+    assert any("pruned" in r.getMessage() for r in caplog.records if r.levelname == "DEBUG")
+
+
+def _write_template(agents: Path, name: str, resources: list[str]) -> None:
+    (agents / f"{name}.json").write_text(
+        json.dumps({"name": name, "resources": resources}), encoding="utf-8"
+    )
+
+
+def test_two_templates_skipping_different_entries_still_build(env):
+    """An owner and an execution template whose globs skip different
+    prefix-colliding entries each get their own note, so merging them
+    does not trip the changed-during-preparation guard."""
+    from kiro_crew.config import config_dir
+
+    project = config_dir() / "workspace"
+    project.mkdir(parents=True, exist_ok=True)
+    (project / "memory-notes.md").write_text("PREFIX_A", encoding="utf-8")
+    (project / "lessons-notes.md").write_text("PREFIX_B", encoding="utf-8")
+    agents = project / ".kiro" / "agents"
+    agents.mkdir(parents=True, exist_ok=True)
+    _write_template(agents, "writer-template", ["file://memory*.md"])
+    _write_template(agents, "runner-template", ["file://lessons*.md"])
+    message = env.builder._build_v2_essentials(
+        env.store,
+        member=env.member,
+        project=str(project),
+        execution_template="runner-template",
+    )
+    assert "essential-context#managed-skipped:writer-template" in message
+    assert "essential-context#managed-skipped:runner-template" in message
+    assert str(project / "memory-notes.md") in message
+    assert str(project / "lessons-notes.md") in message
+    assert "PREFIX_A" not in message
+    assert "PREFIX_B" not in message
+
+
+def test_native_reads_carry_no_skip_note(env):
+    """The note is not a host-native source: a native-only read and the
+    launch documents leave it out, so wire dedup cannot strip its body."""
+    from kiro_crew.config import config_dir
+    from kiro_crew.member_essential_context import (
+        ESSENTIAL_MANAGED_SKIP_SOURCE,
+        documents_for_member,
+        kiro_launch_documents,
+    )
+
+    project = config_dir() / "workspace"
+    project.mkdir(parents=True, exist_ok=True)
+    (project / "memory-notes.md").write_text("PREFIX_A", encoding="utf-8")
+    agents = project / ".kiro" / "agents"
+    agents.mkdir(parents=True, exist_ok=True)
+    _write_template(agents, "writer-template", ["file://*.md"])
+    for documents in (
+        documents_for_member("writer-template", str(project), native_only=True),
+        kiro_launch_documents("writer-template", str(project)),
+    ):
+        assert not any(s.startswith(ESSENTIAL_MANAGED_SKIP_SOURCE) for s, _ in documents)
+    full = dict(documents_for_member("writer-template", str(project)))
+    assert f"{ESSENTIAL_MANAGED_SKIP_SOURCE}:writer-template" in full
+
+
+def test_workspace_glob_names_each_prefix_colliding_entry_it_skips(env, caplog):
+    from kiro_crew.config import config_dir
+    from kiro_crew.member_essential_context import (
+        ESSENTIAL_MANAGED_SKIP_SOURCE,
+        documents_for_member,
+    )
+
+    project = config_dir() / "workspace"
+    project.mkdir(parents=True, exist_ok=True)
+    (project / "memory-notes").mkdir()
+    (project / "memory-notes" / "guide.md").write_text("PREFIX_DIR_CONTENT", encoding="utf-8")
+    (project / "lessons-archive.md").write_text("PREFIX_FILE_CONTENT", encoding="utf-8")
+    (project / "plain.md").write_text("PLAIN_GUIDE", encoding="utf-8")
+    agents = project / ".kiro" / "agents"
+    agents.mkdir(parents=True, exist_ok=True)
+    (agents / "writer-template.json").write_text(
+        json.dumps({"name": "writer-template", "resources": ["file://*.md", "file://*/guide.md"]}),
+        encoding="utf-8",
+    )
+    core: set[str] = set()
+    with caplog.at_level("WARNING", logger="kiro_crew.member_essential_context"):
+        documents = documents_for_member("writer-template", str(project), core_sources_out=core)
+    bodies = dict(documents)
+    joined = "\n".join(bodies.values())
+    assert "PLAIN_GUIDE" in joined
+    assert "PREFIX_DIR_CONTENT" not in joined
+    assert "PREFIX_FILE_CONTENT" not in joined
+    note = bodies[f"{ESSENTIAL_MANAGED_SKIP_SOURCE}:writer-template"]
+    assert "entries matched a declared resource pattern" in note
+    assert str(project / "memory-notes") in note
+    assert str(project / "lessons-archive.md") in note
+    # A size-limited envelope must not drop the note silently.
+    assert f"{ESSENTIAL_MANAGED_SKIP_SOURCE}:writer-template" in core
+    logged = [r.getMessage() for r in caplog.records]
+    assert any("memory-notes" in line for line in logged)
+    assert any("lessons-archive.md" in line for line in logged)
+
+
+def test_workspace_glob_without_prefix_collision_adds_no_skip_note(env):
+    from kiro_crew.config import config_dir
+    from kiro_crew.member_essential_context import (
+        ESSENTIAL_MANAGED_SKIP_SOURCE,
+        documents_for_member,
+    )
+
+    project = config_dir() / "workspace"
+    project.mkdir(parents=True, exist_ok=True)
+    (project / "plain.md").write_text("PLAIN_GUIDE", encoding="utf-8")
+    # A managed-named file the pattern could never return is not reported.
+    (project / "memory_index.db").write_text("", encoding="utf-8")
+    agents = project / ".kiro" / "agents"
+    agents.mkdir(parents=True, exist_ok=True)
+    (agents / "writer-template.json").write_text(
+        json.dumps({"name": "writer-template", "resources": ["file://*/AGENTS.md"]}),
+        encoding="utf-8",
+    )
+    documents = documents_for_member("writer-template", str(project))
+    assert not any(s.startswith(ESSENTIAL_MANAGED_SKIP_SOURCE) for s, _ in documents)
 
 
 @pytest.mark.parametrize("resource", ["memory/AGENTS.md", "memory/*.md", "memory/**/AGENTS.md"])
@@ -1181,3 +1969,704 @@ def test_document_cap_still_bounds_declared_file_resources(env):
         projected_resource_documents(
             {"id": "writer-template", "resources": resources}, str(env.project)
         )
+
+
+def test_object_form_declaration_reaches_the_launch_document_path(env):
+    """The launch path, not just the helper, has to admit an object declaration.
+
+    kiro-cli documents no string form for a knowledge base, so a member bound to
+    such a template could not start: the launch-document build refused the spec
+    before the child process existed.
+    """
+    from kiro_crew.member_essential_context import kiro_launch_documents
+
+    resources = [
+        "file://declared-guide.md",
+        {
+            "type": "knowledgeBase",
+            "source": "file://kb",
+            "name": "ProjectDocs",
+            "indexType": "best",
+            "include": ["**/*.md"],
+            "autoUpdate": True,
+        },
+    ]
+    (env.project / ".kiro" / "agents" / "writer-template.json").write_text(
+        json.dumps({"name": "writer-template", "resources": resources}),
+        encoding="utf-8",
+    )
+    documents = kiro_launch_documents("writer-template", str(env.project))
+    assert "Declared guide: examples must be reproducible." in [body for _, body in documents]
+
+
+def test_object_form_declaration_is_admitted_and_read_by_nobody(env):
+    """Admitting the entry must not turn its source into an essential document.
+
+    No path is derived from the entry, so a readable directory of markdown
+    behind ``source`` contributes no text.
+    """
+    from kiro_crew.member_essential_context import (
+        documents_for_member,
+        projected_resource_documents,
+    )
+
+    source_dir = env.project / "kb"
+    source_dir.mkdir()
+    (source_dir / "inside.md").write_text("KB_SOURCE_BODY", encoding="utf-8")
+    resources = [
+        "file://declared-guide.md",
+        {"type": "knowledgeBase", "source": "file://kb", "name": "ProjectDocs"},
+    ]
+    (env.project / ".kiro" / "agents" / "writer-template.json").write_text(
+        json.dumps({"name": "writer-template", "resources": resources}),
+        encoding="utf-8",
+    )
+    bodies = [body for _, body in documents_for_member("writer-template", str(env.project))]
+    assert "Declared guide: examples must be reproducible." in bodies
+    assert not any("KB_SOURCE_BODY" in body for body in bodies)
+
+    projected = projected_resource_documents(
+        {"id": "writer-template", "resources": resources}, str(env.project)
+    )
+    assert list(projected.values()) == ["Declared guide: examples must be reproducible."]
+
+
+def test_object_form_source_cannot_widen_the_admitted_roots(env):
+    """A source outside every admitted root is still not a location this reads.
+
+    A ``file://`` declaration that escaped its root would be refused by ``_read``;
+    an object declaration is never resolved at all. Spelled without ``name`` and
+    also declared alone, so admission depends neither on an optional key nor on
+    a ``file://`` sibling.
+    """
+    from kiro_crew.member_essential_context import (
+        documents_for_member,
+        kiro_launch_documents,
+        projected_resource_documents,
+    )
+
+    outside = env.project.parent / "outside-kb"
+    outside.mkdir()
+    (outside / "secret.md").write_text("OUTSIDE_ROOT_BODY", encoding="utf-8")
+    nameless = {"type": "knowledgeBase", "source": f"file://{outside}"}
+    resources = ["file://declared-guide.md", nameless]
+    (env.project / ".kiro" / "agents" / "writer-template.json").write_text(
+        json.dumps({"name": "writer-template", "resources": resources}),
+        encoding="utf-8",
+    )
+    bodies = [body for _, body in documents_for_member("writer-template", str(env.project))]
+    assert "Declared guide: examples must be reproducible." in bodies
+    assert not any("OUTSIDE_ROOT_BODY" in body for body in bodies)
+
+    (env.project / ".kiro" / "agents" / "writer-template.json").write_text(
+        json.dumps({"name": "writer-template", "resources": [nameless]}),
+        encoding="utf-8",
+    )
+    launched = kiro_launch_documents("writer-template", str(env.project))
+    assert not any("OUTSIDE_ROOT_BODY" in body for _, body in launched)
+    assert (
+        projected_resource_documents(
+            {"id": "writer-template", "resources": [nameless]}, str(env.project)
+        )
+        == {}
+    )
+
+
+def test_object_form_declarations_do_not_spend_the_document_budget(env):
+    """An entry nothing reads cannot exhaust the budget for entries that are read."""
+    from kiro_crew.member_essential_context import documents_for_member
+
+    knowledge_bases = [
+        {"type": "knowledgeBase", "source": f"file://kb-{index}", "name": f"kb-{index}"}
+        for index in range(70)
+    ]
+    resources = ["file://declared-guide.md", *knowledge_bases]
+    (env.project / ".kiro" / "agents" / "writer-template.json").write_text(
+        json.dumps({"name": "writer-template", "resources": resources}),
+        encoding="utf-8",
+    )
+    documents = documents_for_member("writer-template", str(env.project))
+    assert "Declared guide: examples must be reproducible." in [body for _, body in documents]
+
+
+@pytest.mark.parametrize("malformed", [42, ["file://nested.md"], None])
+def test_resources_still_refuse_an_entry_that_is_neither_uri_nor_object(env, malformed):
+    """Admitting the object form is not the same as admitting anything.
+
+    kiro-cli refuses the same shapes (``resource must be a string (file:// or
+    skill://) or an object``). Asserted on the refusal, not its wording.
+    """
+    from kiro_crew.member_essential_context import (
+        documents_for_member,
+        projected_resource_documents,
+    )
+
+    resources = ["file://declared-guide.md", malformed]
+    (env.project / ".kiro" / "agents" / "writer-template.json").write_text(
+        json.dumps({"name": "writer-template", "resources": resources}),
+        encoding="utf-8",
+    )
+    with pytest.raises(MemberEssentialContextError):
+        documents_for_member("writer-template", str(env.project))
+    with pytest.raises(MemberEssentialContextError):
+        projected_resource_documents(
+            {"id": "writer-template", "resources": resources}, str(env.project)
+        )
+
+
+_OPERATOR_RULE = "Operator rule: ask before every comment."
+_INHERITED_PROJECT_GUIDES = (
+    "Project rules: run the review checks.",
+    "Always guide: explain assumptions.",
+)
+
+
+@pytest.fixture
+def operator_steering(env):
+    """One global steering file, the operator's own rule the member may not want."""
+    steering = Path.home() / ".kiro" / "steering"
+    steering.mkdir(parents=True, exist_ok=True)
+    (steering / "operator.md").write_text(_OPERATOR_RULE, encoding="utf-8")
+    return env
+
+
+def _write_kiro_settings(kiro_dir: Path, values: dict) -> None:
+    path = kiro_dir / "settings" / "cli.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(values), encoding="utf-8")
+
+
+def _snapshot_bodies(env, provider_type: str = PROVIDER_ACP) -> str:
+    """The member's essential envelope as a session served by *provider_type* builds it.
+
+    The builder is where the harness is known, so it is the builder that decides
+    whether kiro-cli's opt-out applies; :func:`documents_for_member` only takes
+    that verdict. kiro-cli is the default because it is the harness the setting
+    belongs to.
+    """
+    return env.builder._build_v2_essentials(
+        env.store, member=env.member, project=str(env.project), provider_type=provider_type
+    )
+
+
+def test_workspace_opt_out_keeps_only_what_the_template_declares(operator_steering):
+    """kiro-cli gives an opted-out custom agent only its declared resources.
+
+    The snapshot is what the member works from, so it must not hand back the
+    operator's global steering, AGENTS.md or undeclared workspace steering.
+    """
+    env = operator_steering
+    assert _OPERATOR_RULE in _snapshot_bodies(env)
+
+    _write_kiro_settings(env.project / ".kiro", {"chat.disableInheritingDefaultResources": True})
+    bodies = _snapshot_bodies(env)
+    assert _OPERATOR_RULE not in bodies
+    for guide in _INHERITED_PROJECT_GUIDES:
+        assert guide not in bodies
+    assert "Declared guide: examples must be reproducible." in bodies
+    assert "Bound Soul: preserve the user's voice." in bodies
+    assert "Project Soul: write with empathy." in bodies
+
+
+def test_opt_out_still_loads_steering_the_template_declares(operator_steering):
+    env = operator_steering
+    (env.project / ".kiro" / "agents" / "writer-template.json").write_text(
+        json.dumps({"name": "writer-template", "resources": ["file://.kiro/steering/**/*.md"]}),
+        encoding="utf-8",
+    )
+    _write_kiro_settings(env.project / ".kiro", {"chat.disableInheritingDefaultResources": True})
+    bodies = _snapshot_bodies(env)
+    assert "Always guide: explain assumptions." in bodies
+    assert _OPERATOR_RULE not in bodies
+
+
+@pytest.mark.parametrize(
+    ("source", "global_opt_out", "expected"),
+    [
+        ("local", False, True),
+        ("local", True, True),
+        ("global", False, True),
+        ("global", True, False),
+    ],
+)
+def test_crew_overlay_is_not_read_as_an_opt_out(
+    operator_steering, source, global_opt_out, expected
+):
+    """The projection pins the native key to true and records the real choice beside it."""
+    env = operator_steering
+    _write_kiro_settings(
+        env.project / ".kiro",
+        {
+            "chat.disableInheritingDefaultResources": True,
+            "kirocrew.skillDiscovery.inheritFiles": True,
+            "kirocrew.skillDiscovery.inheritSource": source,
+        },
+    )
+    if global_opt_out:
+        _write_kiro_settings(
+            Path.home() / ".kiro", {"chat.disableInheritingDefaultResources": True}
+        )
+    assert (_OPERATOR_RULE in _snapshot_bodies(env)) is expected
+
+
+@pytest.mark.parametrize(("workspace_value", "expected"), [(None, False), (False, True)])
+def test_global_opt_out_applies_unless_the_workspace_overrides_it(
+    operator_steering, workspace_value, expected
+):
+    env = operator_steering
+    _write_kiro_settings(Path.home() / ".kiro", {"chat.disableInheritingDefaultResources": True})
+    if workspace_value is not None:
+        _write_kiro_settings(
+            env.project / ".kiro", {"chat.disableInheritingDefaultResources": workspace_value}
+        )
+    assert (_OPERATOR_RULE in _snapshot_bodies(env)) is expected
+
+
+@pytest.mark.parametrize("value", ["true", 1])
+def test_only_the_literal_true_opts_out(operator_steering, value):
+    env = operator_steering
+    _write_kiro_settings(env.project / ".kiro", {"chat.disableInheritingDefaultResources": value})
+    assert _OPERATOR_RULE in _snapshot_bodies(env)
+
+
+@pytest.mark.parametrize(
+    "contents",
+    ["{not json", "[" * 100_000 + "]" * 100_000],
+    ids=["malformed", "deeply-nested"],
+)
+def test_unreadable_settings_keep_inherited_guides(operator_steering, contents, cyclic_gc_quiesced):
+    env = operator_steering
+    settings = env.project / ".kiro" / "settings" / "cli.json"
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    settings.write_text(contents, encoding="utf-8")
+    assert _OPERATOR_RULE in _snapshot_bodies(env)
+
+
+@requires_symlinks
+def test_cyclic_kiro_home_keeps_inherited_guides(operator_steering, monkeypatch):
+    env = operator_steering
+    loop = env.project.parent / "kiro-home-loop"
+    os.symlink(loop, loop)
+    monkeypatch.setenv("KIRO_HOME", str(loop))
+
+    from kiro_crew.acp import skill_projection
+
+    assert skill_projection.inherits_default_resources(env.project) is True
+    assert _OPERATOR_RULE in _snapshot_bodies(env)
+
+
+def test_launch_documents_follow_the_workspace_opt_out(operator_steering):
+    from kiro_crew.member_essential_context import kiro_launch_documents
+
+    env = operator_steering
+
+    def launched() -> list[str]:
+        return [body for _, body in kiro_launch_documents("writer-template", str(env.project))]
+
+    assert _OPERATOR_RULE in launched()
+    _write_kiro_settings(env.project / ".kiro", {"chat.disableInheritingDefaultResources": True})
+    bodies = launched()
+    assert _OPERATOR_RULE not in bodies
+    assert "Project rules: run the review checks." not in bodies
+    assert "Declared guide: examples must be reproducible." in bodies
+
+
+def _envelope_with_folder_steering_trees(env, provider_type: str = PROVIDER_ACP) -> str:
+    """A member turn in a folder that declares both ``.kiro/steering`` trees."""
+    message, _ = env.builder.build_message(
+        "Continue",
+        True,
+        "dashboard:member",
+        memory_store=env.store,
+        member=env.member,
+        project=str(env.project),
+        provider_type=provider_type,
+        steering_dirs=(
+            str(env.project / ".kiro" / "steering"),
+            str(Path.home() / ".kiro" / "steering"),
+        ),
+    )
+    env.forbidden.assert_not_called()
+    return message
+
+
+_OTHER_HARNESSES = pytest.mark.parametrize(
+    "provider_type", [PROVIDER_CLAUDE_CODE, "codex", "acme-config-authored-harness"]
+)
+
+
+@_OTHER_HARNESSES
+def test_opt_out_binds_only_a_session_kiro_cli_serves(operator_steering, provider_type):
+    """``chat.disableInheritingDefaultResources`` is kiro-cli's setting.
+
+    On any other harness the member keeps the operator's global steering,
+    ``AGENTS.md`` and the project's always steering: the setting changes what a
+    member loads only on a session kiro-cli serves.
+    """
+    env = operator_steering
+    _write_kiro_settings(env.project / ".kiro", {"chat.disableInheritingDefaultResources": True})
+    assert _OPERATOR_RULE not in _snapshot_bodies(env)
+    bodies = _snapshot_bodies(env, provider_type=provider_type)
+    assert _OPERATOR_RULE in bodies
+    for guide in _INHERITED_PROJECT_GUIDES:
+        assert guide in bodies
+
+
+def _count_setting_reads(monkeypatch) -> list[object]:
+    """Record every call of the one settings reader behind the verdict."""
+    from kiro_crew.agent_sdk.drivers import acp as acp_driver
+
+    reads: list[object] = []
+    real = acp_driver.inherits_default_resources
+
+    def counted(work_dir):
+        reads.append(work_dir)
+        return real(work_dir)
+
+    monkeypatch.setattr(acp_driver, "inherits_default_resources", counted)
+    return reads
+
+
+def test_profile_validation_measures_inheriting_envelope_without_reading_setting(
+    operator_steering, monkeypatch
+):
+    """Validation measures the largest envelope, independent of the current harness."""
+    env = operator_steering
+    _write_kiro_settings(env.project / ".kiro", {"chat.disableInheritingDefaultResources": True})
+    reads = _count_setting_reads(monkeypatch)
+
+    validation = env.builder._build_v2_essentials(
+        env.store,
+        member=env.member,
+        project=str(env.project),
+        profile_overrides={"preferences.md": "Candidate preference."},
+    )
+
+    assert "Candidate preference." in validation
+    assert _OPERATOR_RULE in validation
+    for guide in _INHERITED_PROJECT_GUIDES:
+        assert guide in validation
+    assert reads == []
+
+    normal_turn = _snapshot_bodies(env)
+    assert _OPERATOR_RULE not in normal_turn
+    for guide in _INHERITED_PROJECT_GUIDES:
+        assert guide not in normal_turn
+    assert len(reads) == 1
+
+
+def test_documents_for_member_takes_the_verdict_and_never_reads_the_setting(
+    operator_steering, monkeypatch
+):
+    """The snapshot reader is a consumer: without the caller's verdict it inherits."""
+    from kiro_crew.member_essential_context import documents_for_member
+
+    env = operator_steering
+    _write_kiro_settings(env.project / ".kiro", {"chat.disableInheritingDefaultResources": True})
+    reads = _count_setting_reads(monkeypatch)
+    bodies = [body for _, body in documents_for_member("writer-template", str(env.project))]
+    assert _OPERATOR_RULE in bodies
+    opted_out = [
+        body
+        for _, body in documents_for_member(
+            "writer-template", str(env.project), inherits_default_resources=False
+        )
+    ]
+    assert _OPERATOR_RULE not in opted_out
+    assert reads == []
+
+
+_needs_pinned_walk = pytest.mark.skipif(
+    not pinned_fs.supports_pinned_tree_walk(),
+    reason="folder steering refuses to walk by name on this platform",
+)
+
+
+def _declare_project_steering_in_template(env) -> None:
+    path = env.project / ".kiro" / "agents" / "writer-template.json"
+    spec = json.loads(path.read_text(encoding="utf-8"))
+    spec["resources"].append("file://.kiro/steering/**/*.md")
+    path.write_text(json.dumps(spec), encoding="utf-8")
+
+
+@_needs_pinned_walk
+def test_folder_declared_steering_trees_reach_an_opted_out_member_once(operator_steering):
+    """The snapshot skips the trees, so the folder dedup must not skip them too.
+
+    Otherwise an always-inclusion document under a declared root reaches the
+    member zero times: the snapshot leaves it to kiro-cli, which the workspace
+    told not to load it, and the folder section assumes the snapshot sent it.
+    """
+    env = operator_steering
+    _declare_project_steering_in_template(env)
+    _write_kiro_settings(env.project / ".kiro", {"chat.disableInheritingDefaultResources": True})
+    message = _envelope_with_folder_steering_trees(env)
+    assert message.count(_OPERATOR_RULE) == 1
+    assert message.count("Always guide: explain assumptions.") == 1
+    # AGENTS.md is a kiro-cli default resource, not a steering document, so the
+    # folder does not carry it back in.
+    assert "Project rules: run the review checks." not in message
+    assert "MANUAL_SECRET" not in message
+
+
+@_needs_pinned_walk
+def test_opted_out_folder_dedup_does_not_resolve_source_labels(operator_steering, monkeypatch):
+    """Canonical dedup does not re-resolve the collector's emitted labels."""
+    from kiro_crew import member_essential_context as essential_context
+
+    env = operator_steering
+    _declare_project_steering_in_template(env)
+    _write_kiro_settings(env.project / ".kiro", {"chat.disableInheritingDefaultResources": True})
+
+    snapshot_sources: set[str] = set()
+    folder_sources: set[str] = set()
+    dedup_started = False
+    resolved_labels: list[str] = []
+    real_documents_for_member = essential_context.documents_for_member
+    real_collect_folder_steering = context_module.collect_folder_steering
+    real_realpath = os.path.realpath
+
+    def recording_documents_for_member(*args, **kwargs):
+        result = real_documents_for_member(*args, **kwargs)
+        snapshot_sources.update(source for source, _body in result)
+        return result
+
+    def recording_collect_folder_steering(*args, **kwargs):
+        nonlocal dedup_started
+        result = real_collect_folder_steering(*args, **kwargs)
+        folder_sources.update(source for source, _body in result.documents)
+        dedup_started = True
+        return result
+
+    def recording_realpath(path, *args, **kwargs):
+        spelling = str(path)
+        if dedup_started and spelling in snapshot_sources | folder_sources:
+            resolved_labels.append(spelling)
+        return real_realpath(path, *args, **kwargs)
+
+    monkeypatch.setattr(essential_context, "documents_for_member", recording_documents_for_member)
+    monkeypatch.setattr(
+        context_module, "collect_folder_steering", recording_collect_folder_steering
+    )
+    monkeypatch.setattr(os.path, "realpath", recording_realpath)
+
+    message = _envelope_with_folder_steering_trees(env)
+
+    assert message.count("Always guide: explain assumptions.") == 1
+    assert resolved_labels == []
+
+
+@_needs_pinned_walk
+@pytest.mark.parametrize(
+    ("template_name", "folder_name"),
+    [
+        ("a\ufffdb.md", "a\nb.md"),
+        ("a\nb.md", "a\ufffdb.md"),
+    ],
+    ids=["template-replacement", "template-newline"],
+)
+def test_opted_out_folder_dedup_keeps_distinct_fold_colliding_sources(
+    operator_steering, template_name, folder_name
+):
+    """Distinct canonical files survive even when their rendered labels collide."""
+    env = operator_steering
+    steering = env.project / ".kiro" / "steering"
+    template_body = "Template-only folded-label guide."
+    folder_body = "Folder-only folded-label guide."
+    (steering / template_name).write_text(template_body, encoding="utf-8")
+    (steering / folder_name).write_text(folder_body, encoding="utf-8")
+    spec_path = env.project / ".kiro" / "agents" / "writer-template.json"
+    spec = json.loads(spec_path.read_text(encoding="utf-8"))
+    spec["resources"].append(f"file://.kiro/steering/{template_name}")
+    spec_path.write_text(json.dumps(spec), encoding="utf-8")
+    _write_kiro_settings(env.project / ".kiro", {"chat.disableInheritingDefaultResources": True})
+
+    message = _envelope_with_folder_steering_trees(env)
+
+    assert message.count(template_body) == 1
+    assert message.count(folder_body) == 1
+
+
+@_needs_pinned_walk
+def test_opted_out_folder_dedup_matches_control_folded_source_label(operator_steering):
+    """A control character folded out of a folder label does not duplicate its body."""
+    env = operator_steering
+    folded = env.project / ".kiro" / "steering" / "folded\nname.md"
+    folded.write_text("Folded label guide: keep one copy.", encoding="utf-8")
+    _declare_project_steering_in_template(env)
+    _write_kiro_settings(env.project / ".kiro", {"chat.disableInheritingDefaultResources": True})
+
+    message = _envelope_with_folder_steering_trees(env)
+
+    assert message.count("Folded label guide: keep one copy.") == 1
+
+
+@_needs_pinned_walk
+def test_folder_declared_steering_trees_reach_an_inheriting_member_once(operator_steering):
+    env = operator_steering
+    _declare_project_steering_in_template(env)
+    message = _envelope_with_folder_steering_trees(env)
+    assert message.count(_OPERATOR_RULE) == 1
+    assert message.count("Always guide: explain assumptions.") == 1
+    assert message.count("Project rules: run the review checks.") == 1
+
+
+@_needs_pinned_walk
+@_OTHER_HARNESSES
+def test_folder_declared_steering_trees_reach_an_opted_out_member_once_on_another_harness(
+    operator_steering, provider_type
+):
+    """The opted-out workspace is irrelevant off kiro-cli: the snapshot delivers
+    the trees, so the folder skips them and each guide arrives exactly once."""
+    env = operator_steering
+    _declare_project_steering_in_template(env)
+    _write_kiro_settings(env.project / ".kiro", {"chat.disableInheritingDefaultResources": True})
+    message = _envelope_with_folder_steering_trees(env, provider_type=provider_type)
+    assert message.count(_OPERATOR_RULE) == 1
+    assert message.count("Always guide: explain assumptions.") == 1
+    assert message.count("Project rules: run the review checks.") == 1
+    assert "MANUAL_SECRET" not in message
+
+
+@_needs_pinned_walk
+@pytest.mark.parametrize("opted_out", [False, True])
+def test_a_kiro_member_turn_reads_the_setting_exactly_once(
+    operator_steering, monkeypatch, opted_out
+):
+    """One verdict per turn feeds the snapshot and the folder dedup alike."""
+    env = operator_steering
+    _declare_project_steering_in_template(env)
+    if opted_out:
+        _write_kiro_settings(
+            env.project / ".kiro", {"chat.disableInheritingDefaultResources": True}
+        )
+    reads = _count_setting_reads(monkeypatch)
+    message = _envelope_with_folder_steering_trees(env)
+    assert message.count(_OPERATOR_RULE) == 1
+    assert len(reads) == 1
+
+
+@_needs_pinned_walk
+@_OTHER_HARNESSES
+def test_another_harness_never_reads_the_setting(operator_steering, monkeypatch, provider_type):
+    env = operator_steering
+    _declare_project_steering_in_template(env)
+    _write_kiro_settings(env.project / ".kiro", {"chat.disableInheritingDefaultResources": True})
+    reads = _count_setting_reads(monkeypatch)
+    _envelope_with_folder_steering_trees(env, provider_type=provider_type)
+    assert reads == []
+
+
+def _declare_resources(env, names: list[str]) -> None:
+    spec = env.project / ".kiro" / "agents" / "writer-template.json"
+    data = json.loads(spec.read_text(encoding="utf-8"))
+    data["resources"] = [f"file://{name}" for name in names]
+    spec.write_text(json.dumps(data), encoding="utf-8")
+
+
+def _member_message(env) -> str:
+    message, _ = env.builder.build_message(
+        "Continue", False, memory_store=env.store, member=env.member, project=str(env.project)
+    )
+    return message
+
+
+def _envelope(message: str) -> str:
+    start = message.index("[V2 ESSENTIAL CONTEXT")
+    end = message.index("[END V2 ESSENTIAL CONTEXT]\n\n", start)
+    return message[start : end + len("[END V2 ESSENTIAL CONTEXT]\n\n")]
+
+
+def test_over_budget_declared_resources_leave_out_the_tail_and_the_turn_runs(env, caplog):
+    """The reported shape: an agent spec whose ``resources`` grew past the envelope.
+
+    Guides leave from the tail of declaration order, whole, only as many as needed;
+    every one left out is named with its size in one in-band notice; the member's
+    core (persona prompt, SOUL.md, profile anchors, recall note) is all still there;
+    the result fits the envelope; and the drop is logged at warning.
+    """
+    names = [f"context/g{i}.md" for i in range(4)]
+    (env.project / "context").mkdir()
+    for i, name in enumerate(names):
+        (env.project / name).write_text(f"GUIDE_{i}_HEAD\n" + "y" * 25_000, encoding="utf-8")
+    _declare_resources(env, names)
+    with caplog.at_level("WARNING"):
+        message = _member_message(env)
+    assert "GUIDE_0_HEAD" in message and "GUIDE_1_HEAD" in message
+    assert "GUIDE_2_HEAD" not in message and "GUIDE_3_HEAD" not in message
+    assert "[Essential source: essential-context#omitted]" in message
+    for name in names[2:]:
+        assert f"{env.project / name} (25,013 characters)" in message
+    for name in names[:2]:
+        assert f"{env.project / name} (25,013 characters)" not in message
+    for core in (
+        "Bound Soul: preserve the user's voice.",
+        "Project Soul: write with empathy.",
+        "Preference anchor: 请保留中文原文。",
+        "Project anchor: the launch guide is authoritative.",
+        "memory_recall",
+    ):
+        assert core in message
+    assert len(_envelope(message)) <= 64_000
+    warned = [r for r in caplog.records if r.levelname == "WARNING" and "g2.md" in r.getMessage()]
+    assert len(warned) == 1 and "g3.md" in warned[0].getMessage()
+
+
+def test_a_fitting_envelope_carries_no_omission_notice(env):
+    assert "essential-context#omitted" not in _member_message(env)
+
+
+@pytest.mark.parametrize("core", ["prompt", "SOUL.md"])
+def test_an_over_budget_core_still_refuses_with_the_source_named(env, core):
+    if core == "prompt":
+        spec = env.project / ".kiro" / "agents" / "writer-template.json"
+        data = json.loads(spec.read_text(encoding="utf-8"))
+        data["prompt"] = "p" * 64_001
+        spec.write_text(json.dumps(data), encoding="utf-8")
+        named = "writer-template.json#prompt"
+    else:
+        (env.project / "SOUL.md").write_text("s" * 64_001, encoding="utf-8")
+        named = "SOUL.md"
+    with pytest.raises(MemberEssentialContextError, match="exceeds 64000") as raised:
+        _member_message(env)
+    assert named in str(raised.value)
+
+
+def test_a_refused_declared_source_still_refuses_when_the_envelope_is_over_budget(env):
+    """Budget fitting never turns a source the reader refuses into an omission."""
+    (env.project / "AGENTS.md").write_text("x" * 64_001, encoding="utf-8")
+    (env.project / "declared-guide.md").unlink()
+    with pytest.raises(MemberEssentialContextError, match="declared-guide"):
+        _member_message(env)
+
+
+def test_guides_whose_names_do_not_fit_are_counted_by_the_short_notice():
+    """When the core leaves no room to list every left-out guide, they are counted."""
+    from kiro_crew.context_assembly.member import _fit_member_guides_into_envelope
+
+    guides = [(f"/project/context/{'n' * 200}-{i}.md", "g") for i in range(40)]
+    core = ("template#prompt", "c" * 63_200)
+    fitted, left_out = _fit_member_guides_into_envelope(
+        [core, *guides], frozenset(source for source, _ in guides), identity="I", owner="w"
+    )
+    assert left_out == 40
+    assert fitted[0] == core and len(fitted) == 2
+    source, notice = fitted[1]
+    assert source == "essential-context#omitted"
+    assert "40 guide document(s)" in notice and "nnnn" not in notice
+    big_core = ("template#prompt", "c" * 64_000)
+    documents = [big_core, *guides]
+    assert _fit_member_guides_into_envelope(
+        documents, frozenset(source for source, _ in guides), identity="I", owner="w"
+    ) == (documents, 0)
+
+
+def test_a_guide_too_large_to_fit_does_not_take_the_smaller_guides_after_it_out(env):
+    """Only the guides that cannot fit are left out; later small ones are given back."""
+    (env.project / "AGENTS.md").write_text("x" * 64_001, encoding="utf-8")
+    message = _member_message(env)
+    assert f"{env.project / 'AGENTS.md'} (64,001 characters)" in message
+    assert "1 guide document(s)" in message
+    assert "Declared guide: examples must be reproducible." in message
+    assert "Always guide: explain assumptions." in message
+    assert len(_envelope(message)) <= 64_000

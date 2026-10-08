@@ -15,6 +15,7 @@ from dashboard_owner_helpers import as_owner
 from test_members_dm_thread import _make_members_app
 
 from kiro_crew.agent_discovery import AgentInfo
+from kiro_crew.config import live
 from kiro_crew.config.loader import KiroCrewAgentConfig, KiroCrewConfig, resolve_agent_bindings
 from kiro_crew.context import ContextBuilder
 from kiro_crew.dashboard import chat_handlers, chat_runner
@@ -74,6 +75,102 @@ def test_global_session_binding_matches_equivalent_alias(monkeypatch):
     assert stored.memory_store_name == "default"
     assert stored.execution_context is captured
     assert not stored.same_dispatch_binding(replace(requested, memory_store_name="other-store"))
+
+
+@pytest.fixture
+def pruned_marker(monkeypatch):
+    monkeypatch.setattr(
+        "kiro_crew.crewmate_prune_migration.removed_crewmate_names",
+        lambda: frozenset({"synced-agent"}),
+    )
+
+
+def _pruned_crewmate_record(execution_context, *, store="default", member_id=None):
+    return execution_context.ExecutionContext(
+        member_id,
+        execution_context.MemoryStoreRef(store, member_id),
+        "member",
+        "synced-agent",
+        selection_name="synced-agent",
+    )
+
+
+def test_resume_after_crewmate_prune_resolves_installed_agent(monkeypatch, pruned_marker):
+    """A chat bound to a sync-generated crewmate stays resumable after the prune.
+
+    The startup prune deletes the crewmate's ``config.agents`` row but leaves the
+    agent installed. The chat's record still says ``member``, and a member
+    selection never takes the installed-agent lookup, so without the fallback
+    every resumed turn is refused with "Crew Member ... is unavailable".
+    """
+    from kiro_crew import execution_context, session_agent_selection
+
+    cfg = KiroCrewConfig()
+    cfg.agents = {"kirocrew": KiroCrewAgentConfig(kiro_agent="kirocrew")}
+    cfg.default_agent = "kirocrew"
+    record = _pruned_crewmate_record(execution_context)
+    monkeypatch.setattr(session_agent_selection, "read_session_execution", lambda _: record)
+    monkeypatch.setattr(
+        "kiro_crew.config.loader._materialized_kiro_agent",
+        lambda name, project_dir=None: name if name == "synced-agent" else "",
+    )
+
+    bindings = resolve_session_agent_bindings(
+        resolve_agent_bindings, cfg, "dashboard:pruned", "synced-agent"
+    )
+
+    assert bindings.requested_resolved
+    assert bindings.kiro_agent == "synced-agent"
+    assert bindings.memory_store_name == "default"
+    assert bindings.selection_kind == "template"
+    assert bindings.execution_context == replace(record, selection_kind="template")
+
+
+@pytest.mark.parametrize(
+    "store, member_id",
+    [("private-store", None), ("member-store", "member-1")],
+)
+def test_resume_after_crewmate_prune_keeps_refusing_owned_members(
+    monkeypatch, pruned_marker, store, member_id
+):
+    """Only the identity-less, Global-store shape the prune removes falls back."""
+    from kiro_crew import execution_context, session_agent_selection
+
+    cfg = KiroCrewConfig()
+    cfg.agents = {"kirocrew": KiroCrewAgentConfig(kiro_agent="kirocrew")}
+    cfg.default_agent = "kirocrew"
+    record = _pruned_crewmate_record(execution_context, store=store, member_id=member_id)
+    monkeypatch.setattr(session_agent_selection, "read_session_execution", lambda _: record)
+    monkeypatch.setattr(
+        "kiro_crew.config.loader._materialized_kiro_agent",
+        lambda name, project_dir=None: name if name == "synced-agent" else "",
+    )
+
+    bindings = resolve_session_agent_bindings(
+        resolve_agent_bindings, cfg, "dashboard:owned", "synced-agent"
+    )
+
+    assert not bindings.requested_resolved
+
+
+def test_resume_after_crewmate_prune_refuses_uninstalled_agent(monkeypatch, pruned_marker):
+    """The fallback reaches only an agent that is still installed."""
+    from kiro_crew import execution_context, session_agent_selection
+
+    cfg = KiroCrewConfig()
+    cfg.agents = {"kirocrew": KiroCrewAgentConfig(kiro_agent="kirocrew")}
+    cfg.default_agent = "kirocrew"
+    record = _pruned_crewmate_record(execution_context)
+    monkeypatch.setattr(session_agent_selection, "read_session_execution", lambda _: record)
+    monkeypatch.setattr(
+        "kiro_crew.config.loader._materialized_kiro_agent", lambda name, project_dir=None: ""
+    )
+
+    bindings = resolve_session_agent_bindings(
+        resolve_agent_bindings, cfg, "dashboard:gone", "synced-agent"
+    )
+
+    assert not bindings.requested_resolved
 
 
 def _turn_state(tmp_path, monkeypatch):
@@ -615,7 +712,10 @@ async def test_owner_reselection_cannot_promote_existing_template_context_to_mem
         response = await client.post(
             "/api/chat/slots/template-chat/agent", json={"agent": TEMPLATE}
         )
-        assert response.status == 503, await response.text()
+        # A refusal by policy, not a store fault: the conversation already has
+        # template context, so choosing member memory needs a new conversation.
+        assert response.status == 409, await response.text()
+        assert (await response.json())["code"] == "member_memory_requires_new_conversation"
     assert read_session_execution(key) == previous
     assert session_agent_selection_kind(key, TEMPLATE) == "template"
     assert read_private_session_store(key) is None
@@ -741,6 +841,11 @@ async def test_cancelled_prewarm_cannot_overwrite_owner_pick(tmp_path, monkeypat
         # provider work is outside this cancelled-publication assertion.
         monkeypatch.setattr(chat_runner, "_eager_spawn", AsyncMock())
         monkeypatch.setattr(chat_handlers, "schedule_eager_spawn", chat_runner.schedule_eager_spawn)
+        # The real scheduler reads the flag from the config watcher's snapshot,
+        # which the suite leaves unbuilt; adopt one carrying the default.
+        _snapshot_cfg = KiroCrewConfig()
+        _snapshot_cfg.session.eager_spawn = True
+        live.watch().prime(_snapshot_cfg)
         async with TestClient(TestServer(as_owner(_make_app_with_agent_routes(state)))) as client:
             response = await client.post(
                 "/api/chat/slots/template-chat/agent", json={"agent": later_agent}
@@ -1851,9 +1956,21 @@ async def test_prewarmed_session_is_kept_when_the_chat_is_not_provably_empty(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["incognito", "temporary"])
-async def test_restricted_member_selection_and_turn_never_persist_transcript(
+async def test_restricted_member_session_persists_transcript_but_no_owner_record(
     tmp_path, monkeypatch, mode
 ):
+    """A restricted member chat keeps its transcript and survives a restart.
+
+    The line records the restricted mode and the member's name, and NO memory
+    store: with no execution carrier written for a restricted session, a store
+    name would read back as a legacy owner claim and the restart would refuse
+    the chat as a member record with no identity. Left out, the restart reads
+    the session as unbound and the next turn re-selects the member from
+    ``agent`` under the retained mode -- the same live-only carrier the session
+    ran under before the restart.
+    """
+    from kiro_crew.dashboard.chat_persistence import restore_recent_sessions
+    from kiro_crew.execution_context import _LIVE_EXECUTIONS, _live_key
     from kiro_crew.history import ConversationLog
 
     cfg = KiroCrewConfig.load()
@@ -1861,6 +1978,8 @@ async def test_restricted_member_selection_and_turn_never_persist_transcript(
     member_store = provision_member_memory(cfg, "writer")
     cfg.save()
     state = _turn_state(tmp_path, monkeypatch)
+    # One log for the slot save and the execution reads, as in the gateway.
+    state.conversation_log = ConversationLog()
     slot = state.get_or_create_slot("restricted", agent="default", memory_mode=mode)
     state.sessions.reset = AsyncMock(return_value=True)
     async with TestClient(TestServer(as_owner(_make_app_with_agent_routes(state)))) as client:
@@ -1874,7 +1993,33 @@ async def test_restricted_member_selection_and_turn_never_persist_transcript(
     await asyncio.wait_for(chat_runner._run_chat(state, slot, "restricted body sentinel"), 10)
     await asyncio.wait_for(drain_background_tasks(state), 10)
     state.sessions.get_or_create.assert_awaited_once()
-    assert not state.conversation_log.has_log(key)
-    assert not ConversationLog().has_log(key)
     if mode == "temporary":
         state.context_builder.ensure_store.assert_not_awaited()
+
+    body = state.conversation_log._path(key).read_text(encoding="utf-8")
+    assert "restricted body sentinel" in body
+    meta = state.conversation_log.get_metadata(key)
+    assert meta.get("memory_mode") == mode
+    assert meta.get("agent") == "writer"
+    assert meta.get("agent_kind") == "member"
+    assert "memory_store" not in meta
+    assert "execution_context" not in meta
+
+    # Restart: the live carrier is gone and only the record remains.
+    _LIVE_EXECUTIONS.pop(_live_key(key), None)
+    assert read_session_execution(key) is None
+    restarted = _turn_state(tmp_path, monkeypatch)
+    restarted.conversation_log = ConversationLog()
+    assert restore_recent_sessions(restarted, window_minutes=0) >= 1
+    restored = restarted._slots["restricted"]
+    assert restored.memory_mode == mode
+    assert key in restarted._restricted_keys
+    assert [m["content"] for m in restored.messages][:1] == ["restricted body sentinel"]
+    restarted.sessions.reset = AsyncMock(return_value=True)
+    await asyncio.wait_for(chat_runner._run_chat(restarted, restored, "second sentinel"), 10)
+    await asyncio.wait_for(drain_background_tasks(restarted), 10)
+    rebound = read_session_execution(key)
+    assert rebound is not None
+    assert rebound.memory_mode == mode
+    assert rebound.store.store_id == member_store
+    assert "memory_store" not in restarted.conversation_log.get_metadata(key)

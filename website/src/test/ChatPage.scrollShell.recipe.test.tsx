@@ -4,7 +4,7 @@
 // that move: these tests describe reality, not intention, and editing them in
 // the migration PR is itself a review red flag.
 //
-// Asserted against SOURCE TEXT (the fadeClearance suite's technique) because
+// Asserted against SOURCE TEXT (the dockClearance suite's technique) because
 // most of the shell's load-bearing contracts are invisible to jsdom: it has no
 // layout engine, so `overscrollBehavior`, `scrollbarGutter`, gradient
 // geometry, and element ORDER inside the scroller can only be pinned where
@@ -77,11 +77,12 @@ describe('scroll shell: the scroller element contract', () => {
     expect(scroller()).toContain('flex: 1,')
   })
 
-  it('carries the second half of the fade-band clearance as px padding', () => {
+  it('carries the floating dock clearance as host-owned padding', () => {
     // Pairs with TRANSCRIPT_TAIL_SPACER_PX; unlike the tail spacer it also
-    // applies to a transcript too short to scroll (fadeClearance pins the sum).
-    // HOST-owned geometry: the page supplies it, wherever the scroller lives.
-    expect(SRC).toContain('paddingBottom: 16')
+    // applies to a transcript too short to scroll (dockClearance pins the
+    // wiring). HOST-owned geometry: the page supplies it, wherever the scroller
+    // lives, as the dock's measured height plus a px constant.
+    expect(SRC).toContain('paddingBottom: dockH + DOCK_CLEARANCE_PX')
   })
 
   it('pins overflow-x so one over-wide child cannot give the list a horizontal scrollbar', () => {
@@ -124,7 +125,7 @@ describe('scroll shell: element order inside the scroller', () => {
       '<div className="h-16" />',
       'ref={virt.topSentinelRef}',
       'data-testid="older-messages-loading"',
-      'height: virt.offsetBefore',
+      'height: Math.round(virt.offsetBefore)',
       'height: virt.offsetAfter',
       'ref={virt.bottomSentinelRef}',
     ]
@@ -153,7 +154,12 @@ describe('scroll shell: element order inside the scroller', () => {
     // They also carry the skeleton class and the transcript's own column
     // width: an unmounted region rendered as a blank void reads as content
     // that vanished rather than content not yet drawn.
-    expect(SHELL).toContain("<div aria-hidden className=\"vc-spacer-skeleton mx-auto w-full\" style={{ height: virt.offsetBefore, maxWidth: 'var(--mc-content-width, 900px)', overflowAnchor: 'none' }} />")
+    // The top spacer renders at a whole pixel: Chromium's scroll anchoring
+    // moves scrollTop only by whole pixels, so a fractional re-price above a
+    // reader sitting still (the measure farm's sweep) would shift the text by
+    // the remainder. Below the reader nothing on screen moves, so the bottom
+    // one stays exact.
+    expect(SHELL).toContain("<div aria-hidden className=\"vc-spacer-skeleton mx-auto w-full\" style={{ height: Math.round(virt.offsetBefore), maxWidth: 'var(--mc-content-width, 900px)', overflowAnchor: 'none' }} />")
     expect(SHELL).toContain("<div aria-hidden className=\"vc-spacer-skeleton mx-auto w-full\" style={{ height: virt.offsetAfter, maxWidth: 'var(--mc-content-width, 900px)', overflowAnchor: 'none' }} />")
   })
 
@@ -211,7 +217,7 @@ describe('scroll shell: extraction wiring (the seams the split created)', () => 
   // accepts a shell that ignores a prop — but the transcript then breaks at
   // runtime (no rows, no follow, no paging). The pins make every seam a test.
   it('shell renders all three slots in skeleton order and spreads host geometry', () => {
-    const shellOrder = ['{aboveRows}', 'height: virt.offsetBefore', '{children}', 'height: virt.offsetAfter', '{belowRows}']
+    const shellOrder = ['{aboveRows}', 'height: Math.round(virt.offsetBefore)', '{children}', 'height: virt.offsetAfter', '{belowRows}']
     let cursor = -1
     for (const a of shellOrder) {
       const idx = SHELL.indexOf(a, cursor + 1)
@@ -230,7 +236,7 @@ describe('scroll shell: extraction wiring (the seams the split created)', () => 
   it('page threads the controller wiring onto the shell call', () => {
     // The import IS the extraction: its deletion is the "silently undone"
     // mutation, and a collection failure alone names no pin.
-    expect(SRC).toContain("import TranscriptScrollShell from './chat/TranscriptScrollShell'")
+    expect(SRC).toContain("import TranscriptScrollShell, { useTranscriptWidth } from './chat/TranscriptScrollShell'")
     expect(SRC).toContain('scrollerRef={scrollerRef}')
     expect(SRC).toContain('virt={virt}')
     // Two consumers thread loadingOlder (the pinned-banner row props and the
@@ -240,12 +246,20 @@ describe('scroll shell: extraction wiring (the seams the split created)', () => 
   })
 })
 
-describe('scroll shell: bottom mask and jump pill', () => {
-  it('keeps the measured-mask recipe (geometry itself is pinned by fadeClearance)', () => {
-    expect(SHELL).toContain('className="bg-gradient-to-t from-bg from-[62%] to-transparent pointer-events-none relative z-[1]"')
-    // Decorative: the mask must never be announced by a screen reader.
-    const mask = between('{/* Transcript bottom mask', '<div className="relative">')
-    expect(mask).toContain('aria-hidden')
+describe('scroll shell: floating dock and jump pill', () => {
+  it('follows the scroller with the floating dock root (geometry itself is pinned by dockClearance)', () => {
+    // The dock is the next positioned sibling after the scroller: that DOM order,
+    // not a z-index, is what paints it over the transcript.
+    const shellEnd = SRC.indexOf('<TranscriptScrollShell')
+    const dock = SRC.indexOf('data-testid="composer-dock-root"')
+    expect(shellEnd).toBeGreaterThan(0)
+    expect(dock).toBeGreaterThan(shellEnd)
+    // No bottom fade under the floating dock: the transcript reads through the
+    // glass. Scoped to the page — the shared <EdgeFade side="bottom"> in
+    // ChatScrollChrome stays for its other consumers (ChatPane).
+    const page = readFileSync(resolve(__dirname, '../pages/ChatPage.tsx'), 'utf8')
+    expect(page).not.toContain('<EdgeFade side="bottom"')
+    expect(page).not.toContain('bg-gradient-to-t from-bg')
   })
 
   it('mounts the shared jump pill: visible only away from the bottom of a non-empty transcript, jump = forced pin through the single scroll controller', () => {

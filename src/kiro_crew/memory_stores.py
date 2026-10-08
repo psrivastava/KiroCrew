@@ -30,6 +30,8 @@ from contextlib import contextmanager
 from functools import wraps
 from pathlib import Path
 
+from kiro_crew import crew_teams
+
 logger = logging.getLogger(__name__)
 
 #: Directory under the data home holding one subdirectory per NAMED store. The
@@ -811,9 +813,10 @@ def _allocate_member_id(config, member: str, *, refuse_damaged: bool = True) -> 
     """A member id for *member* that no agent or store in *config* already holds.
 
     The slug of the display name, with a random suffix only on collision. Deleted
-    members retain their stores, so a retired store's ``owner_member_id`` reserves
-    the slug too: captured work must never resolve to a newly created member that
-    happens to share the name.
+    members retain their stores and DM bindings, so those identities reserve the
+    slug too. A live legacy agent with no ``member_id`` reserves its name-derived
+    slug until it is provisioned. Captured work and an existing legacy member must
+    never resolve to a newly created member that happens to share the name.
 
     ``refuse_damaged`` decides what a non-string identity elsewhere in the config
     means. Creating a member refuses outright, because a config that cannot be
@@ -824,16 +827,51 @@ def _allocate_member_id(config, member: str, *, refuse_damaged: bool = True) -> 
     failure the upgrade exists to end. The damaged record is still refused on its
     own behalf, by the candidate scan that rejects it.
     """
-    from kiro_crew.members import slug_for_name
+    from kiro_crew.members import MemberSlugError, dm_binding_path, read_dm_binding, slug_for_name
+
+    def dm_slug_is_reserved(identity: str) -> bool:
+        """Keep a retained DM binding from resolving to a new member."""
+        try:
+            dm_binding_path(identity).lstat()
+        except FileNotFoundError:
+            return False
+        except (MemberSlugError, OSError, RuntimeError) as exc:
+            if refuse_damaged:
+                raise UnknownMemoryStore(
+                    "Member DM binding state is unreadable; allocation refused"
+                ) from exc
+            return False
+        binding = read_dm_binding(identity)
+        # Only the upgrade (``refuse_damaged=False``) may claim a binding that
+        # names *member*: the migrating agent is live and already owns its
+        # thread. Every create path adds a NEW agent, so a same-name binding
+        # there belongs to a deleted predecessor whose thread must not be
+        # inherited by its namesake. A binding the upgrade cannot READ is the
+        # migrating agent's own too: a legacy agent already derives this slug
+        # at runtime, so re-slugging it would orphan its rules, activity and
+        # thread while protecting nothing -- the same call the lstat OSError
+        # branch above makes. A create still reserves an unreadable binding.
+        if not refuse_damaged and (binding is None or binding["member"] == member):
+            return False
+        return True
 
     base = slug_for_name(member)
-    identities = [getattr(item, "member_id", "") for item in config.agents.values()]
+    identities = []
+    for name, item in config.agents.items():
+        member_id = getattr(item, "member_id", "")
+        identities.append(member_id)
+        if name != member and member_id == "":
+            # Legacy agents predate durable ids. Their display-name slug is
+            # nevertheless live ownership, even before any DM binding exists.
+            legacy_slug = slug_for_name(name)
+            if refuse_damaged or legacy_slug != base:
+                identities.append(legacy_slug)
     identities.extend(item.owner_member_id for item in config.memory_stores.values())
     if refuse_damaged and any(not isinstance(identity, str) for identity in identities):
         raise UnknownMemoryStore("Configured member identity must be a string; allocation refused")
     existing = {identity for identity in identities if isinstance(identity, str)}
     member_id = base
-    while member_id in existing:
+    while member_id in existing or dm_slug_is_reserved(member_id):
         member_id = f"{base[:48]}-{uuid.uuid4().hex[:12]}"
     return member_id
 
@@ -912,8 +950,7 @@ def _legacy_member_database_identity(path: Path, store: str, alias: str) -> str:
     or restored into the wrong store directory carries the stamps of where it
     came from, which is what makes the misplacement detectable here.
     """
-    import sqlite3
-
+    from kiro_crew._sqlite_compat import sqlite3
     from kiro_crew.memory_schema import MEMBER_DATABASE_FORMAT, STORE_NAME_META_KEY
 
     _require_private_member_database(path)
@@ -1076,9 +1113,8 @@ def _complete_legacy_member_database(path: Path, *, member_id: str, store: str) 
     ``member_database`` row is inserted when absent. One transaction, so a crash
     leaves either the old file or the finished one.
     """
-    import sqlite3
-
     from kiro_crew import memory_record_metadata as record_meta
+    from kiro_crew._sqlite_compat import sqlite3
     from kiro_crew.memory_schema import (
         CREW_SCHEMA_VERSION,
         LINEAGE_CREW,
@@ -1144,6 +1180,29 @@ def _complete_legacy_member_database(path: Path, *, member_id: str, store: str) 
             raise
     finally:
         db.close()
+
+
+def complete_legacy_member_directory(directory: Path, *, member_id: str, store: str) -> None:
+    """Finish an older member directory in place: its database identity, then its documents.
+
+    Idempotent, so a caller that is interrupted repeats it. Shared by the
+    start-of-process store upgrade and by restoring a snapshot that layout wrote.
+    """
+    from kiro_crew import platform_compat
+    from kiro_crew.atomic_write import atomic_write
+    from kiro_crew.memory import PREFERENCES_FILE, PROJECTS_FILE
+    from kiro_crew.vector_memory import read_member_database_identity
+
+    database = directory / MEMORY_DB_FILE
+    _complete_legacy_member_database(database, member_id=member_id, store=store)
+    if read_member_database_identity(database) != (member_id, store):
+        raise UnknownMemoryStore("the completed database does not read back its identity")
+    manual = directory / "memory"
+    platform_compat.make_owner_only_dir(manual)
+    if not (manual / PREFERENCES_FILE).exists():
+        atomic_write(manual / PREFERENCES_FILE, "# Member Preferences\n", fsync=True)
+    if not (manual / PROJECTS_FILE).exists():
+        atomic_write(manual / PROJECTS_FILE, "# Member Projects\n", fsync=True)
 
 
 def _publish_legacy_member_identity(alias: str, store: str, member_id: str) -> None:
@@ -1223,11 +1282,6 @@ def migrate_legacy_member_stores(config) -> list[str]:
     are logged once with the reason and :data:`LEGACY_MEMBER_STORE_REMEDY`, and
     the second run over a repaired install finds nothing to do.
     """
-    from kiro_crew import platform_compat
-    from kiro_crew.atomic_write import atomic_write
-    from kiro_crew.memory import PREFERENCES_FILE, PROJECTS_FILE
-    from kiro_crew.vector_memory import read_member_database_identity
-
     repaired: list[str] = []
     with memory_store_namespace_lock():
         for name, (alias, existing_id, reason) in _legacy_member_store_candidates(config).items():
@@ -1242,19 +1296,9 @@ def migrate_legacy_member_stores(config) -> list[str]:
                 continue
             try:
                 member_id = existing_id or _allocate_member_id(config, alias, refuse_damaged=False)
-                directory = _named_store_dir(name)
-                database = directory / MEMORY_DB_FILE
-                _complete_legacy_member_database(database, member_id=member_id, store=name)
-                if read_member_database_identity(database) != (member_id, name):
-                    raise UnknownMemoryStore(
-                        "the completed database does not read back its identity"
-                    )
-                manual = directory / "memory"
-                platform_compat.make_owner_only_dir(manual)
-                if not (manual / PREFERENCES_FILE).exists():
-                    atomic_write(manual / PREFERENCES_FILE, "# Member Preferences\n", fsync=True)
-                if not (manual / PROJECTS_FILE).exists():
-                    atomic_write(manual / PROJECTS_FILE, "# Member Projects\n", fsync=True)
+                complete_legacy_member_directory(
+                    _named_store_dir(name), member_id=member_id, store=name
+                )
                 _publish_legacy_member_identity(alias, name, member_id)
             except Exception:
                 logger.warning(
@@ -1439,6 +1483,14 @@ def persist_member_config(
     function has failed; it can neither replace the winner nor adopt another
     store.
 
+    A CREATE also purges the new name from any crew team a deleted crew left
+    it on (``crew_teams.release_for_create``), INSIDE the locked mutation,
+    after the concurrency checks and immediately before the record is written,
+    so the purge and the registration are one critical section on EVERY create
+    path -- the dashboard, the CLI and an app's ``ensure_team`` alike, none can
+    opt out. A purge that cannot be made (``crew_teams.TeamsUnavailable``)
+    aborts the write and propagates.
+
     Updates may name only the fields the caller actually changed, preserving
     concurrent edits to other fields. None retains full-record publication;
     creation always publishes the full record. A new binding must be included.
@@ -1526,6 +1578,8 @@ def persist_member_config(
             ):
                 raise UnknownMemoryStore(f"memory store {store!r} ownership changed concurrently")
             stores[store] = {**(existing or {}), **store_record}
+        if create:
+            crew_teams.release_for_create(member)
         agents[member] = {**(current or {}), **agent_record}
         return data
 

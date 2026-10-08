@@ -1,8 +1,8 @@
 """The knowledge store's orphan sweep runs after the bind, not inside ``__init__``.
 
 Boot cost is the reason: the orphan sweep is writer-locked and data-scaled,
-and the constructor runs on the event-loop thread before the socket binds
-(``setup_knowledge_routes`` reads the lazy store at route registration). A
+and the constructor runs on the boot path before the socket binds
+(``start_dashboard`` builds the lazy store just before route registration). A
 sweep inside ``_migrate()`` would, on a large store, stall boot long enough for
 the runtime's timeouts to kill the gateway. These tests pin four
 properties: construction does not sweep, ``reclaim_orphans`` does the
@@ -266,7 +266,11 @@ class TestReclaimOrphansStillSweeps:
                 sweeper.join(5)
         assert read_result and read_result[0] is not None
         assert not _source_exists(path, "orphan")
-        s.close()
+        # The sweep ran on its own thread and opened its own connection; ``close()``
+        # is per-thread and would leave that one (``k.db`` + ``-wal`` + ``-shm``)
+        # open until the cyclic collector ran. Same seam in every test below that
+        # hands the store to another thread.
+        s._close_all_for_tests()
 
 
 class _QuiescentStore:
@@ -338,7 +342,10 @@ class TestGatewayKick:
         source = inspect.getsource(srv.start_dashboard)
         kick = "_kick_knowledge_orphan_reclaim(state)"
         assert kick in source
-        assert source.index("_start_site(site, port)") < source.index(kick)
+        # The serving step: the pre-reserved socket is handed to SockSite and
+        # listen()ed inside start_dashboard (the reservation itself binds
+        # earlier, deliberately — see _reserve_dashboard_port).
+        assert source.index("await site.start()") < source.index(kick)
         assert "_kick_knowledge_orphan_reclaim" not in inspect.getsource(KnowledgeStore.__init__)
 
 
@@ -431,7 +438,7 @@ class TestSweepWaitsForIngestion:
         finally:
             if sweeper is not None:
                 sweeper.join(5)
-            store.close()
+            store._close_all_for_tests()
 
     def test_an_ingest_starting_while_the_sweep_holds_the_window_waits(self, tmp_path):
         store = KnowledgeStore(str(tmp_path / "k.db"))
@@ -452,7 +459,7 @@ class TestSweepWaitsForIngestion:
         finally:
             if ingester is not None:
                 ingester.join(5)
-            store.close()
+            store._close_all_for_tests()
 
     def test_bounded_wait_skips_and_logs_when_ingestion_never_drains(self, tmp_path, caplog):
         path = str(tmp_path / "k.db")
@@ -468,7 +475,7 @@ class TestSweepWaitsForIngestion:
             assert _source_exists(path, "orphan"), "a skipped sweep still deleted rows"
             assert any("maintenance skipped" in r.message for r in caplog.records)
         finally:
-            store.close()
+            store._close_all_for_tests()
 
     def test_pre_boot_orphan_is_reclaimed_when_nothing_is_ingesting(self, tmp_path):
         path = str(tmp_path / "k.db")
@@ -478,7 +485,7 @@ class TestSweepWaitsForIngestion:
             _kick_worker(store)()
             assert not _source_exists(path, "orphan")
         finally:
-            store.close()
+            store._close_all_for_tests()
 
     @pytest.mark.parametrize(
         "status", ["pending", "pending_confirmation", "syncing", "active", "paused"]
@@ -501,7 +508,7 @@ class TestSweepWaitsForIngestion:
             assert _source_exists(path, fresh)
             assert not _source_exists(path, "done")
         finally:
-            store.close()
+            store._close_all_for_tests()
 
     @pytest.mark.parametrize("status", ["synced", "error", "missing"])
     def test_a_finished_itemless_source_is_reclaimed(self, tmp_path, status):
@@ -512,7 +519,7 @@ class TestSweepWaitsForIngestion:
             _kick_worker(store)()
             assert not _source_exists(path, "done")
         finally:
-            store.close()
+            store._close_all_for_tests()
 
     def test_sweep_deletes_in_short_writer_transactions(self, tmp_path):
         """A knowledge write issued on the event loop while the sweep runs waits
@@ -555,7 +562,7 @@ class TestSweepWaitsForIngestion:
             assert _source_exists(path, artifact)
             assert not _source_exists(path, "done")
         finally:
-            store.close()
+            store._close_all_for_tests()
 
     def test_ingest_file_holds_the_gate_for_its_whole_run(self, tmp_path):
         """The pipeline's public entry brackets the whole ingest: while it is
@@ -614,7 +621,7 @@ class TestSweepWaitsForIngestion:
             elapsed = asyncio.run(scenario())
             assert elapsed < 0.5, f"nested hold waited {elapsed:.2f}s behind the window"
         finally:
-            store.close()
+            store._close_all_for_tests()
 
     def test_public_ingestion_in_flight_holds_the_gate_across_a_caller_span(self, tmp_path):
         """A caller that looks up a source and ingests into it later holds
@@ -644,7 +651,7 @@ class TestSweepWaitsForIngestion:
             with store.maintenance_window(timeout=0.05) as quiescent:
                 assert quiescent is True, "the gate stayed held after the caller returned"
         finally:
-            store.close()
+            store._close_all_for_tests()
 
 
 class TestWatcherReReadsUnderTheGate:
@@ -686,7 +693,7 @@ class TestWatcherReReadsUnderTheGate:
             pipeline.ingest_file.assert_not_awaited()
             assert store.db.execute("SELECT COUNT(*) FROM items").fetchone()[0] == 0
         finally:
-            store.close()
+            store._close_all_for_tests()
 
 
 class TestHandoffJoinsTheHoldersAdmission:
@@ -733,7 +740,7 @@ class TestHandoffJoinsTheHoldersAdmission:
             assert elapsed < 2.0, f"hand-off waited {elapsed:.2f}s behind the window"
             assert window_result == [True], "the window did not get its turn after the holds"
         finally:
-            store.close()
+            store._close_all_for_tests()
 
     def test_the_admission_covers_only_the_first_hold(self, tmp_path):
         """The task's later, separate holds wait like any other entrant."""
@@ -752,4 +759,4 @@ class TestHandoffJoinsTheHoldersAdmission:
         try:
             assert asyncio.run(scenario()) is False
         finally:
-            store.close()
+            store._close_all_for_tests()

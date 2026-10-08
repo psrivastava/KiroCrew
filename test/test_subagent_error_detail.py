@@ -13,9 +13,9 @@ import sqlite3
 import pytest
 
 from kiro_crew.dashboard.chat_runner import _MAX_NATIVE_CARD_ERROR, _clip_card_error
+from kiro_crew.process_identity import MAX_ERROR_DETAIL_LEN
 from kiro_crew.subagent import (
     _MAX_ERROR_CHAIN,
-    _MAX_ERROR_DETAIL_LEN,
     SubagentInfo,
     SubagentManager,
     _describe_exception,
@@ -82,8 +82,8 @@ class TestDescribeException:
         assert _describe_exception(RuntimeError()) == "RuntimeError"
 
     def test_output_is_bounded(self):
-        rendered = _describe_exception(ValueError("x" * (_MAX_ERROR_DETAIL_LEN * 3)))
-        assert len(rendered) == _MAX_ERROR_DETAIL_LEN
+        rendered = _describe_exception(ValueError("x" * (MAX_ERROR_DETAIL_LEN * 3)))
+        assert len(rendered) == MAX_ERROR_DETAIL_LEN
 
     def test_chain_is_capped(self):
         exc = ValueError("link0")
@@ -132,11 +132,11 @@ class TestTombstoneCarriesTheReason:
 
         create_agent_folder("longone", task="t")
         info = SubagentInfo(id="longone", task="t")
-        info.error = "E" * (_MAX_ERROR_DETAIL_LEN * 3)
+        info.error = "E" * (MAX_ERROR_DETAIL_LEN * 3)
 
         SubagentManager._write_tombstone(info, "error")
 
-        assert len(self._tombstone(agent_root, "longone")["detail"]) == _MAX_ERROR_DETAIL_LEN
+        assert len(self._tombstone(agent_root, "longone")["detail"]) == MAX_ERROR_DETAIL_LEN
 
 
 class TestTombstoneResolvesRecoveryAction:
@@ -151,14 +151,30 @@ class TestTombstoneResolvesRecoveryAction:
         return tomb["recovery_action"]
 
     def test_a_retrievable_result_makes_recovery_a_read(self, agent_root):
-        from kiro_crew.subagent_persistence import create_agent_folder
+        from kiro_crew.subagent_persistence import create_agent_folder, update_state
 
         create_agent_folder("withresult", task="t")
         (agent_root / "withresult" / "result.txt").write_text("the answer", encoding="utf-8")
+        # The run records the complete flag at its complete event; the
+        # tombstone writer trusts that record, not the file alone.
+        update_state("withresult", result_complete=True)
 
         SubagentManager._write_tombstone(SubagentInfo(id="withresult", task="t"), "error")
 
         assert self._recovery(agent_root, "withresult") == "result_available"
+
+    def test_a_result_without_the_complete_flag_is_a_fragment(self, agent_root):
+        """A non-empty file without the flag is an opening sentence, not an answer."""
+        from kiro_crew.subagent_persistence import create_agent_folder
+
+        create_agent_folder("fragmented", task="t")
+        (agent_root / "fragmented" / "result.txt").write_text(
+            "an opening sentence", encoding="utf-8"
+        )
+
+        SubagentManager._write_tombstone(SubagentInfo(id="fragmented", task="t"), "error")
+
+        assert self._recovery(agent_root, "fragmented") == "partial_result"
 
     def test_no_result_still_owes_the_user_a_notification(self, agent_root):
         from kiro_crew.subagent_persistence import create_agent_folder

@@ -22,7 +22,6 @@ import pytest
 from kiro_crew import autonudge_authz
 from kiro_crew.autonudge import MonitorUpdateConflict
 from kiro_crew.autonudge_authz import (
-    MAX_RUNTIME_SECS_CEILING,
     authorize_and_add_nudge,
     authorize_and_update_nudge,
     normalize_banner,
@@ -133,11 +132,35 @@ async def test_update_rejects_runtime_budget_over_the_ceiling(audits: list[dict]
     loop, error, status = await authorize_and_update_nudge(
         svc=svc,
         loop_id="l1",
-        max_runtime_secs=MAX_RUNTIME_SECS_CEILING + 1,
+        max_runtime_secs=604_801,
         source="dashboard",
     )
-    assert loop is None and status == 400 and "7 days" in error
+    assert loop is None and status == 400 and "604800" in error
     assert svc.updated == []  # never applied
+
+
+@pytest.mark.asyncio
+async def test_update_accepts_a_whole_number_float_budget_as_an_int(audits: list[dict]) -> None:
+    """``3600.0`` is how a JSON body may spell an integer; the store receives an int."""
+    svc = RecordingSvc()
+    await authorize_and_update_nudge(
+        svc=svc, loop_id="l1", max_runtime_secs=3600.0, source="dashboard"
+    )
+    assert len(svc.updated) == 1
+    budget = svc.updated[0]["max_runtime_secs"]
+    assert budget == 3600 and type(budget) is int
+
+
+@pytest.mark.asyncio
+async def test_update_forwards_fresh_run_and_leaves_it_off_by_default(audits: list[dict]) -> None:
+    """The resume flag reaches the service exactly as the caller stated it: the
+    dashboard route passes True, the ``monitor_update`` applier passes nothing."""
+    svc = RecordingSvc()
+    await authorize_and_update_nudge(svc=svc, loop_id="l1", active=True, source="dashboard")
+    await authorize_and_update_nudge(
+        svc=svc, loop_id="l1", active=True, fresh_run=True, source="dashboard"
+    )
+    assert [u["fresh_run"] for u in svc.updated] == [False, True]
 
 
 @pytest.mark.asyncio
@@ -271,8 +294,28 @@ async def test_add_rejects_a_non_integer_runtime_budget(audits: list[dict]) -> N
         max_runtime_secs="not-a-number",  # type: ignore[arg-type]
         source="dashboard",
     )
-    assert loop is None and status == 400 and error == "max_runtime_secs must be an integer"
+    assert (
+        loop is None
+        and status == 400
+        and error == "max_runtime_secs must be an integer between 0 and 604800 (7 days)"
+    )
     assert svc.added == []
+
+
+@pytest.mark.asyncio
+async def test_add_accepts_a_whole_number_float_budget_as_an_int(audits: list[dict]) -> None:
+    svc = RecordingSvc()
+    loop, error, status = await authorize_and_add_nudge(
+        svc=svc,
+        state=_state(slots={"chat-1-1": SimpleNamespace(workspace="default", is_closing=False)}),
+        slot_key="chat-1-1",
+        message="watch",
+        max_runtime_secs=3600.0,  # type: ignore[arg-type]
+        source="dashboard",
+    )
+    assert error is None and status == 200
+    budget = svc.added[0]["max_runtime_secs"]
+    assert budget == 3600 and type(budget) is int
 
 
 @pytest.mark.asyncio
@@ -553,6 +596,51 @@ async def test_add_defaults_the_sentinel_for_a_channel_loop(
 
 
 @pytest.mark.asyncio
+async def test_a_new_goal_after_a_stop_file_finish_is_not_killed_by_the_stale_file(
+    audits: list[dict], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The stop file finishes a loop and is left on disk; the record is kept, not
+    removed. The per-slot sentinel path is the same for the next goal on that
+    slot, so the person's sequence -- Clear, then set a new goal -- must not
+    end on the new loop's first tick. The arm chokepoint unlinks the stale
+    file before the new loop exists, which is what this pins end to end."""
+    from kiro_crew.autonudge import STOP_SENTINEL_REASON, AutoNudgeService
+
+    sentinel = tmp_path / ".stop-chat-1-1"
+    monkeypatch.setattr(
+        autonudge_authz, "resolve_stop_sentinel", lambda key, *a, **kw: str(sentinel)
+    )
+    svc = AutoNudgeService(base_dir=tmp_path / "home")
+    await svc.start()
+    state = _state(slots={"chat-1-1": SimpleNamespace(workspace="default", is_closing=False)})
+    try:
+        first, error, status = await authorize_and_add_nudge(
+            svc=svc, state=state, slot_key="chat-1-1", message="first goal", source="dashboard"
+        )
+        assert error is None and status == 200 and first is not None
+        assert first.stop_sentinel_path == str(sentinel)
+        sentinel.write_text("goal met", encoding="utf-8")
+        svc._cancel_timer(first.id)
+        await svc._timer(first, delay=0)
+        kept = svc.get_by_slot("chat-1-1")
+        assert kept is not None and kept.stopped_reason == STOP_SENTINEL_REASON
+        assert sentinel.exists()
+        # The person clears the finished goal, then sets the next one.
+        assert await svc.remove(first.id, stop_reason="dashboard_delete")
+        second, error, status = await authorize_and_add_nudge(
+            svc=svc, state=state, slot_key="chat-1-1", message="second goal", source="dashboard"
+        )
+        assert error is None and status == 200 and second is not None
+        assert not sentinel.exists(), "the stale stop file is gone before the new loop exists"
+        svc._cancel_timer(second.id)
+        await svc._timer(second, delay=0)
+        live = svc.get_by_slot("chat-1-1")
+        assert live is not None and live.id == second.id and live.active
+    finally:
+        svc.stop()
+
+
+@pytest.mark.asyncio
 async def test_add_audits_then_reraises_a_service_failure(audits: list[dict]) -> None:
     svc = RecordingSvc(add_error=OSError("store wedged"))
     with pytest.raises(OSError, match="store wedged"):
@@ -595,6 +683,35 @@ async def test_add_monitor_returns_conflict_when_a_wake_is_inflight(
 
     assert loop is None and status == 409
     assert error == "existing monitor wake is in flight"
+    assert [event["outcome"] for event in audits] == ["invoked", "denied"]
+
+
+@pytest.mark.asyncio
+async def test_update_monitor_bound_failure_is_an_audited_client_error(
+    audits: list[dict],
+) -> None:
+    """The store re-checks the effective runtime budget against the ceiling on
+    every structured update; its refusal reaches the caller as a 400 quoting
+    the range, matching the legacy update path."""
+
+    class BoundedSvc:
+        def get_by_id(self, _loop_id: str) -> None:
+            return None
+
+        async def update_monitor(self, *_args: Any, **_kwargs: Any) -> Any:
+            raise ValueError("max_runtime_secs must be an integer between 1 and 3600 (1 hour)")
+
+    loop, error, status = await autonudge_authz.authorize_and_update_monitor(
+        svc=BoundedSvc(),
+        state=_state(slots={"chat-1-1": SimpleNamespace(mode="", memory_mode="persistent")}),
+        loop_id="monitor-1",
+        session_key="chat-1-1",
+        patch={"cadence_secs": 600},
+        source="dashboard",
+    )
+
+    assert loop is None and status == 400
+    assert error == "max_runtime_secs must be an integer between 1 and 3600 (1 hour)"
     assert [event["outcome"] for event in audits] == ["invoked", "denied"]
 
 

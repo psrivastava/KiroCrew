@@ -28,6 +28,7 @@ _ensure_ssl_certs()
 import argparse
 import asyncio
 import atexit
+import errno
 import faulthandler
 import importlib
 import importlib.machinery
@@ -51,16 +52,24 @@ from kiro_crew.config.loader import (
     build_provider_factory,
 )
 from kiro_crew.config.paths import _default_home, _legacy_home
-from kiro_crew.constants import BANNER, MIN_NODE_MAJOR, env_flag_enabled
+from kiro_crew.constants import (
+    BANNER,
+    MIN_NODE_VERSION,
+    env_flag_enabled,
+    node_too_old_message,
+    node_version_meets_floor,
+    parse_node_version,
+)
 from kiro_crew.crash_guard import install as _install_crash_guard
 from kiro_crew.env import git_build_info
-from kiro_crew.gateway_lock import GatewayLock, GatewayLockError
+from kiro_crew.gateway_lock import LIVE_HOLDER_EXIT_CODE, GatewayLock, GatewayLockError
 from kiro_crew.history import ConversationLog, HistoryConsolidator
 from kiro_crew.knowledge import store as knowledge_store
 from kiro_crew.knowledge.dedup import dedup_sweep
 from kiro_crew.knowledge.store import KnowledgeStore
 from kiro_crew.log_redaction import install_log_redaction
 from kiro_crew.memory import MemoryStore
+from kiro_crew.owner_only_files import owner_only_opener
 from kiro_crew.platform import (
     PlatformCompositionError,
     boot_platform,
@@ -134,7 +143,7 @@ def _child_argv() -> "list[str]":
     exe = _resolve_kirocrew_bin()
     if exe != "kirocrew":  # a resolved, validated absolute path
         return [exe, *sys.argv[1:]]
-    return platform_compat.isolated_python_argv("-m", "kiro_crew", *sys.argv[1:])
+    return platform_compat.isolated_python_argv("-P", "-m", "kiro_crew", *sys.argv[1:])
 
 
 def _refuse_unjailed(command: str, reason: str) -> NoReturn:
@@ -306,7 +315,13 @@ def _ensure_node(proj_dir: str = "") -> bool:
 
 
 def _node_ok() -> bool:
-    """Check if node >= MIN_NODE_MAJOR is available."""
+    """Check that a node of the supported MAJOR is on PATH.
+
+    The answer gates the ensure-node repair at gateway boot and stays major-only,
+    so the full floor adds no boot-time install. A node of that major but below
+    the full ``MIN_NODE_VERSION`` still passes and logs a warning naming the exact
+    required version and how to update.
+    """
     node = shutil.which("node")
     if not node:
         return False
@@ -326,8 +341,12 @@ def _node_ok() -> bool:
             text=True,
             timeout=5,
         )
-        major = int(node_ver.stdout.strip().lstrip("v").split(".")[0])
-        return major >= MIN_NODE_MAJOR
+        version = parse_node_version(node_ver.stdout)
+        if version is None:
+            return False
+        if not node_version_meets_floor(version, MIN_NODE_VERSION):
+            logging.getLogger(__name__).warning(node_too_old_message(version, MIN_NODE_VERSION))
+        return version[0] >= MIN_NODE_VERSION[0]
     except Exception:
         return False
 
@@ -604,6 +623,29 @@ def _diagnostic_port(gw_kwargs: dict) -> int | None:
         return None
 
 
+def _diagnostic_bind_address() -> str | None:
+    """The address this gateway is configured to bind, for lock-refusal diagnosis.
+
+    The lock's serving-holder predicate (``gateway_lock.GatewayLock._serving_verdict``)
+    probes a holder of the port for HTTP at THIS address, never at one it
+    guesses. Resolved by the gateway's own resolver,
+    ``dashboard.urls.bind_address_for``: a valid ``KIROCREW_BIND`` is the bind
+    whatever ``local_only`` says, and the two fallbacks that flag chooses between
+    (loopback, the v4 wildcard) are probed at the same loopback address, so
+    ``local_only=True`` loses nothing. ``None`` only when the resolver itself
+    cannot be reached -- diagnosis only, never a reason to break the refusal
+    path it decorates; the lock then probes loopback.
+    """
+    try:
+        # Deferred import, for the same reason as ``_diagnostic_port``: importing
+        # ``dashboard.urls`` executes ``dashboard/__init__``.
+        from kiro_crew.dashboard.urls import bind_address_for
+
+        return bind_address_for(local_only=True)
+    except Exception:
+        return None
+
+
 def _knowledge_stats(args) -> None:
     """``kirocrew knowledge stats [--json]`` -- read-only counts, no repair verb."""
 
@@ -810,10 +852,21 @@ def _consolidate_cmd(args) -> None:
                     print(f"  {key}: no unconsolidated messages, skipping")
                     continue
                 print(f"  {key}: consolidating {count} messages...")
-                if await consolidator.consolidate_now(key):
-                    print(f"  {key}: done ✓")
-                else:
+                if not await consolidator.consolidate_now(key):
                     print(f"  {key}: skipped (consolidation retry backoff)")
+                    continue
+                # consolidate_now drains the tail over as many bounded passes as
+                # it takes, but it can stop short — a backoff armed part-way
+                # through, or a span it could not advance over. Report what the
+                # transcript says rather than the call's success flag: this
+                # process exits here, with no idle sweep behind it to finish a
+                # remainder, so a bare "done" would be the last word on messages
+                # nothing has read.
+                left = conv_log.unconsolidated_count(key)
+                if left:
+                    print(f"  {key}: partially consolidated, {left} message(s) remain")
+                else:
+                    print(f"  {key}: done ✓")
             except Exception:
                 logger.debug("consolidate (or SEL) failed for %s", key, exc_info=True)
 
@@ -871,7 +924,9 @@ def _redirect_fds_to(path: Path, fds: tuple[int, ...] = (1, 2)) -> None:
     except OSError:
         pass  # a broken std stream must not abort gateway boot
     try:
-        raw_fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        # 0o600: this is gateway.log, which is owner-only like the rest of the data
+        # home (kiro_crew.owner_only_files). Only applies when this creates it.
+        raw_fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     except OSError:
         return
     try:
@@ -884,7 +939,37 @@ def _redirect_fds_to(path: Path, fds: tuple[int, ...] = (1, 2)) -> None:
         os.close(raw_fd)
 
 
-class _FdTrackingRotatingFileHandler(RotatingFileHandler):
+# errnos that will not clear by retrying: the log file cannot be reopened.
+_LOG_FATAL_ERRNOS = frozenset({errno.ENOSYS, errno.EPERM, errno.EACCES, errno.EROFS})
+# Consecutive OSErrors (any errno) after which file logging stops anyway.
+_LOG_ERROR_STREAK_LIMIT = 3
+
+
+class _OwnerOnlyRotatingFileHandler(RotatingFileHandler):
+    """RotatingFileHandler whose log files are created ``0600``.
+
+    The stdlib opens the log with the builtin ``open``, so ``gateway.log`` -- and
+    the fresh file every rollover creates -- would come out at the umask default
+    (``0644``), readable by any local account that can reach the data home. The
+    log carries prompts, tool calls and paths, so it follows the data home's
+    owner-only policy. Only the creation mode changes; an existing file keeps its
+    mode (the startup sweep tightens one an older version created).
+    """
+
+    def _open(self):  # type: ignore[no-untyped-def]
+        # The stdlib's own handle on ``open`` (it survives interpreter teardown),
+        # read through getattr because typeshed does not declare it.
+        open_func = getattr(self, "_builtin_open", open)
+        return open_func(
+            self.baseFilename,
+            self.mode,
+            encoding=self.encoding,
+            errors=self.errors,
+            opener=owner_only_opener,
+        )
+
+
+class _FdTrackingRotatingFileHandler(_OwnerOnlyRotatingFileHandler):
     """RotatingFileHandler that re-points raw fds 1/2 after each rollover.
 
     In detached mode ``_redirect_fds_to`` aims the process's raw
@@ -895,7 +980,50 @@ class _FdTrackingRotatingFileHandler(RotatingFileHandler):
     stderr disappears from every retained log. Re-pointing the fds at the
     freshly created ``gateway.log`` inside ``doRollover`` keeps raw-write
     capture continuous across the file's whole retention lifecycle.
+
+    If the reopen inside a rollover fails, the fds stay on the RENAMED file
+    and the stdlib ``handleError`` would print a traceback there for every
+    later record, escaping the size cap. So an OSError streak prints only its
+    first traceback, and while no file is open a non-retryable errno (or a
+    long streak) stops file logging: emit becomes a no-op and fds 1/2 move to
+    ``os.devnull``.
     """
+
+    _error_streak = 0
+    _stopped = False
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if self._stopped:
+            return
+        streak = self._error_streak
+        super().emit(record)
+        if self._error_streak == streak:
+            self._error_streak = 0  # this record was written: streak over
+
+    def handleError(self, record: logging.LogRecord) -> None:
+        exc = sys.exc_info()[1]
+        if not isinstance(exc, OSError):
+            super().handleError(record)
+            return
+        self._error_streak += 1
+        if self._error_streak == 1:
+            super().handleError(record)  # one traceback per streak, not per record
+        # Stop only when no file is open (a rollover could not reopen it): a
+        # write error on the live, still-rotated file may clear by itself.
+        if self.stream is None and (
+            exc.errno in _LOG_FATAL_ERRNOS or self._error_streak >= _LOG_ERROR_STREAK_LIMIT
+        ):
+            self._stop_file_logging(exc)
+
+    def _stop_file_logging(self, exc: OSError) -> None:
+        self._stopped = True
+        line = f"file logging to {self.baseFilename} stopped ({exc!r}); records are dropped\n"
+        try:
+            sys.stderr.write(line)  # same stream the stdlib traceback went to
+            sys.stderr.flush()
+        except (AttributeError, OSError, ValueError):  # None, broken or closed
+            pass  # nowhere left to report to; the devnull re-point still matters
+        _redirect_fds_to(Path(os.devnull))
 
     def doRollover(self) -> None:
         super().doRollover()
@@ -1021,6 +1149,11 @@ def _setup_cli_logging(command: str | None, verbose: int) -> None:
     Short-lived commands attach the file handler synchronously — they run no
     event loop, and several exec-over-self (skipping atexit), where a queued
     tail would be lost. See the inline comment at the attach site.
+
+    In every shape the ``kiro_crew`` logger is the SINGLE level gate: the file
+    handler and the queue handler carry no level of their own, so a runtime
+    ``agent.log_level`` change (``handlers/updates.py::apply_log_level``) that
+    moves the logger reaches ``gateway.log`` with nothing else to update.
     """
     if verbose >= 2:
         level = logging.DEBUG
@@ -1080,13 +1213,40 @@ def _setup_cli_logging(command: str | None, verbose: int) -> None:
     # renames gateway.log, and without re-pointing, the redirected raw fds
     # would follow the renamed inode through .1 → .2 → .3 → unlink, losing
     # later raw stderr from all retained logs.
-    handler_cls = _FdTrackingRotatingFileHandler if detached else RotatingFileHandler
-    fh = handler_cls(log_file, maxBytes=2 * 1024 * 1024, backupCount=3, encoding="utf-8")
-    # In detached mode the handler also serves the root logger: cap its level
-    # at WARNING so third-party WARNINGs keep flowing even when kiro_crew's
-    # own configured level is stricter (kiro_crew records below `level` are
-    # already filtered at the kiro_crew logger, so this cannot over-log).
-    fh.setLevel(min(level, logging.WARNING) if detached else level)
+    handler_cls = _FdTrackingRotatingFileHandler if detached else _OwnerOnlyRotatingFileHandler
+    # Seatbelt/sandbox children (e.g. ``kirocrew mcp-core`` under a sandboxed
+    # agent profile) inherit a deny on ``gateway.log``. For those, opening the
+    # file handler must not abort the process: the console handler
+    # ``basicConfig`` installed above still carries every record, so the
+    # warning lands somewhere a human reads and the MCP handshake proceeds.
+    #
+    # A DETACHED process is the opposite case and must still fail loudly: no
+    # console handler was installed (the branch above skips ``basicConfig`` to
+    # avoid double-writing into the log stderr already points at), so
+    # soft-failing here would boot a long-lived gateway with no persistent log
+    # AND no destination for the warning saying so. Let the OSError propagate.
+    try:
+        fh = handler_cls(log_file, maxBytes=2 * 1024 * 1024, backupCount=3, encoding="utf-8")
+    except OSError as exc:
+        if detached:
+            raise
+        logging.getLogger("kiro_crew").warning(
+            "persistent log file %s unavailable (%s); continuing with console logging only",
+            log_file,
+            exc,
+        )
+        # Install redaction BEFORE returning: long-lived commands still emit
+        # Bearer/JWT-bearing records to the console, and the normal
+        # install_log_redaction call below is skipped by this early return.
+        if command in _LONG_LIVED_COMMANDS:
+            install_log_redaction([])
+        return
+    # No level on the handler: every record that can reach it is already gated
+    # by a logger level -- kiro_crew records by the kiro_crew logger set above,
+    # third-party records (root attach, detached mode) by the root logger's
+    # WARNING. The logger level is the one level a runtime agent.log_level
+    # change moves, so keeping the handler at NOTSET is what lets a raised
+    # level reach gateway.log without a restart.
     fh.setFormatter(
         logging.Formatter(
             "%(asctime)s %(levelname)s %(name)s [PID %(process)d]: %(message)s",
@@ -1127,11 +1287,13 @@ def _setup_cli_logging(command: str | None, verbose: int) -> None:
             for stale in [h for h in lgr.handlers if isinstance(h, _CliLogQueueHandler)]:
                 lgr.removeHandler(stale)  # re-entrant call: orphaned producer
         log_queue: "queue.SimpleQueue[logging.LogRecord]" = queue.SimpleQueue()
+        # No level on the queue handler either, and no handler-level re-check at
+        # dequeue: the loggers decide what enters the queue, and everything that
+        # enters is written. A level here would be a second copy of `level` that
+        # the runtime applier does not move; a re-check at dequeue would judge
+        # records already queued by a level set after they were logged.
         queue_handler = _CliLogQueueHandler(log_queue)
-        # Gate at the producer: records the file handler would drop must not
-        # transit the queue at all.
-        queue_handler.setLevel(fh.level)
-        _LOG_QUEUE_LISTENER = QueueListener(log_queue, fh, respect_handler_level=True)
+        _LOG_QUEUE_LISTENER = QueueListener(log_queue, fh)
         _LOG_QUEUE_LISTENER.start()
         atexit.register(_stop_log_queue_listener)
         target_logger.addHandler(queue_handler)
@@ -1505,20 +1667,129 @@ Examples:
     )
     cron_sub = cron_parser.add_subparsers(dest="cron_action")
     cron_sub.add_parser("list", help="List cron jobs")
-    cron_add = cron_sub.add_parser("add", help="Add a cron job")
+    cron_add = cron_sub.add_parser(
+        "add",
+        help="Add a cron job",
+        description="Add a cron job. The job is persisted in one locked write and its id is "
+        "printed on stdout; any refusal exits non-zero (2 for an argparse usage error such "
+        "as two mutually exclusive flags, 1 for every refusal the command itself raises: "
+        "a missing schedule, a validation, security or store refusal), so an installer "
+        "can register a job headlessly and detect a refused one.",
+        epilog="""
+Examples:
+  kirocrew cron add "standup" "post the standup" --cron "0 9 * * MON-FRI" --timezone Europe/Paris
+  kirocrew cron add "version-check" "" --every 3600 --script ~/.kiro/crew/crons/check.py:run \\
+      --no-persistent-session --minimal-context
+  kirocrew cron add "disk" "" --every 600 --command "df -h /" --timeout 30 --timeout-secs 60
+  kirocrew cron add "reminder" "call the vet" --at "tomorrow 9am"
+""",
+        formatter_class=_fmt,
+    )
     cron_add.add_argument("name", help="Job name")
-    cron_add.add_argument("message", help="Message to send to agent")
-    cron_add.add_argument("--every", type=int, help="Interval in seconds")
     cron_add.add_argument(
+        "message",
+        help="Message to send to the agent. For a --script job this is ctx.message; "
+        "for a --command job it is recorded but not used.",
+    )
+    cron_add_schedule = cron_add.add_mutually_exclusive_group()
+    cron_add_schedule.add_argument("--every", type=int, help="Interval in seconds")
+    cron_add_schedule.add_argument(
         "--cron", dest="cron_expr", help='Cron expression (e.g. "0 9 * * MON-FRI")'
     )
-    cron_add.add_argument("--channel", help="Slack channel ID to post results to")
+    cron_add_schedule.add_argument(
+        "--at",
+        dest="at",
+        help="One-shot: fire once at this time and then delete the job. A Unix timestamp, "
+        "or a time string ('5pm', 'in 30 minutes', 'tomorrow 9am', '2026-10-01 09:00') "
+        "read in --timezone, or in the configured timezone when --timezone is omitted.",
+    )
     cron_add.add_argument(
+        "--timezone",
+        dest="timezone",
+        default="",
+        help="IANA timezone the job's wall clock is read in (e.g. America/New_York): the "
+        "--cron expression's fields, or an --at time string such as '9am'. Defaults to the "
+        "configured timezone; refused with --every (an interval has no wall clock).",
+    )
+    cron_add.add_argument("--channel", help="Slack channel ID to post results to")
+    # One job KIND per job. A script or command job never launches an agent,
+    # so --agent alongside either would be dead configuration; argparse refuses
+    # the pair up front instead of persisting a field nothing reads.
+    cron_add_kind = cron_add.add_mutually_exclusive_group()
+    cron_add_kind.add_argument(
         "--agent",
         dest="agent",
         default="",
         help="Agent name for this job (e.g. 'customer360-code-agent'). "
         "Empty or omitted uses the default kirocrew agent.",
+    )
+    cron_add_kind.add_argument(
+        "--script",
+        dest="script",
+        default="",
+        metavar="FILE.py:FUNC",
+        help="Zero-token job: run this Python function instead of prompting an agent. "
+        "The file must ALREADY be under ~/.kiro/crew/crons/ (this command registers, "
+        "it does not copy) and is security-scanned before the job is stored.",
+    )
+    cron_add_kind.add_argument(
+        "--command",
+        # NOT dest="command": that is the top-level subcommand's dest, and a
+        # subparser default silently overwrites the parent's parsed value (the
+        # same trap --no-jail documents above) -- `kirocrew cron add` would then
+        # dispatch as command="" and print the top-level help.
+        dest="shell_command",
+        default="",
+        metavar="SHELL",
+        help="Zero-token job: run this shell command (sh -c, sandboxed) instead of "
+        "prompting an agent. Vetted by the same deny-list as the bash tool.",
+    )
+    cron_add.add_argument(
+        "--timeout",
+        type=int,
+        dest="timeout",
+        default=None,
+        help="Subprocess timeout in seconds for a --script/--command job "
+        "(0..3600; omit for the store's per-kind default)",
+    )
+    cron_add.add_argument(
+        "--timeout-secs",
+        type=int,
+        dest="timeout_secs",
+        default=None,
+        help="Per-wake execution budget in seconds (1..86400, default 1800). For a "
+        "--script/--command job it must cover the subprocess timeout -- --timeout, or "
+        "the store's per-kind default when --timeout is omitted -- plus 5s cleanup.",
+    )
+    cron_add.add_argument(
+        "--model",
+        dest="model",
+        default="",
+        help="Model id for the agent wake (as advertised by kiro-cli --list-models)",
+    )
+    cron_add.add_argument(
+        "--persistent-session",
+        dest="persistent_session",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Resume one long-lived session across wakes (default on). Pass "
+        "--no-persistent-session for a --script/--command job: it has no conversation "
+        "to resume.",
+    )
+    cron_add.add_argument(
+        "--minimal-context",
+        dest="minimal_context",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Wake with a ~200-token context instead of the full memory/lessons/steering "
+        "load (default off). Recommended for a --script/--command job.",
+    )
+    cron_add.add_argument(
+        "--hide-in-chat",
+        dest="hide_in_chat",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Keep the job's wakes out of the chat sidebar",
     )
     cron_add.add_argument(
         "--silent",
@@ -1677,6 +1948,14 @@ Examples:
         help="Directory to write the snapshot into (default: the data home's snapshots dir)",
     )
     snap_parser.add_argument("--keep", type=int, default=7, help="Keep N most recent snapshots")
+    snap_parser.add_argument(
+        "--strict",
+        action="store_true",
+        help=(
+            "Exit 3 instead of 0 when the bundle was written but omits entries it was "
+            "asked to carry (see MANIFEST.json 'skipped'). The bundle is kept."
+        ),
+    )
     snap_parser.add_argument(
         "--list", action="store_true", dest="list_snapshots", help="List existing snapshots"
     )
@@ -1912,6 +2191,20 @@ Examples:
     )
     pod_up.add_argument("--ttl", default="2h", help="Token TTL (default: 2h)")
     pod_up.add_argument(
+        "--no-token",
+        dest="no_token",
+        action="store_true",
+        help=(
+            "Boot the pod but do NOT mint a dashboard token: `token` in the "
+            "--json handle is empty and no /api/token/local call is made. The "
+            "gateway's agent pod surface uses this so it can mint in-process "
+            "instead (see agent_pod_api); a sandboxed `pod up` child is in its "
+            "own user namespace and the pod refuses to certify it as the local "
+            "owner. A human running `pod up` should omit this and let the CLI "
+            "mint, then `pod token` to re-mint."
+        ),
+    )
+    pod_up.add_argument(
         "--seed",
         default="",
         help=(
@@ -2133,6 +2426,16 @@ Examples:
             "systemd/launchd service short-circuit and SIGTERMs the gateway "
             "bound to that port — use this for parallel dev gateways on a "
             "non-default port."
+        ),
+    )
+    stop_parser.add_argument(
+        "--expect-pid",
+        type=int,
+        default=None,
+        help=(
+            "Stop only if this pid is the sole listener on --port AND holds this "
+            "home's gateway.lock; otherwise refuse and signal nothing. For callers "
+            "that already identified the gateway they mean to stop."
         ),
     )
 
@@ -2737,7 +3040,12 @@ Examples:
     agent_sub = agent_parser.add_subparsers(dest="agent_action")
     agent_sub.add_parser("list", help="List Kiro Crew agents")
     agent_create = agent_sub.add_parser("create", help="Create a Kiro Crew agent")
-    agent_create.add_argument("--name", required=True, help="Agent name")
+    agent_create.add_argument(
+        "--name",
+        required=True,
+        help="Agent id, or any name: shown as typed, stored under a URL-safe id",
+    )
+    agent_create.add_argument("--display-name", default="", help="Label the dashboard shows")
     agent_create.add_argument("--kiro-agent", default="kirocrew", help="Kiro agent name")
     agent_create.add_argument("--workspace", default="default", help="Workspace name")
     agent_create.add_argument(
@@ -2898,7 +3206,8 @@ Examples:
   kirocrew config defaults --adopt      # Take the current defaults for all of them
   kirocrew config defaults --keep session.autocompact_pct   # Affirm one as intentional
 
-The dashboard port is set with the KIROCREW_PORT env var, not a config key.
+The dashboard port comes from the port in dashboard.url; the KIROCREW_PORT
+env var overrides it.
 """,
         formatter_class=_fmt,
     )
@@ -2912,7 +3221,7 @@ The dashboard port is set with the KIROCREW_PORT env var, not a config key.
     cfg_set.add_argument(
         "--local",
         action="store_true",
-        help="Save to config.local.json (persists across upgrades)",
+        help="Save to config.local.json, the overlay whose values win over config.json",
     )
     cfg_sub.add_parser("edit", help="Open config in $EDITOR")
     cfg_defaults = cfg_sub.add_parser(
@@ -2942,6 +3251,15 @@ The dashboard port is set with the KIROCREW_PORT env var, not a config key.
     cli_help.hide_internal_commands(sub)
 
     args = parser.parse_args()
+
+    # MCP servers and CLI commands hold their managed-venv tree for the process
+    # lifetime, so another process's update cannot prune it underneath them.
+    # The gateway takes the same hold off-loop AFTER readiness, before updates;
+    # even the no-op stat must stay off its boot path.
+    if args.command != "gateway":
+        from kiro_crew.platform.tree_liveness import hold_running_tree_lock
+
+        hold_running_tree_lock()
 
     # Direct agent-bearing CLI commands do not construct the long-lived
     # prerequisite service. Pin an explicit override before the jail gate or
@@ -3076,6 +3394,15 @@ The dashboard port is set with the KIROCREW_PORT env var, not a config key.
     if args.command == "chat":
         _run_chat(args.message, args.model, agent=getattr(args, "agent", None))
     elif args.command == "gateway":
+        # The gateway's status lines are plain print() calls. Off a terminal
+        # (systemd journal, launchd file, the Desktop supervisor's log fd, a
+        # detached gateway's own gateway.log) CPython block-buffers stdout, so
+        # they surface at exit, stamped with the stop time, or never after a
+        # kill or an in-app os.execv. One reconfigure here, before the first
+        # status print, covers every launcher; a terminal is already
+        # line-buffered and is left alone. Gateway-only: no other subcommand
+        # is long-lived under a service manager.
+        platform_compat.ensure_line_buffered_stdout()
         # Seam-supplied pre-launch checks (CPP IdentityProvider seam). Runs
         # HERE in the gateway dispatch — not in boot_platform (which runs for
         # every subcommand incl. the mcp-core/mcp-cron stdio servers, where an
@@ -3097,6 +3424,16 @@ The dashboard port is set with the KIROCREW_PORT env var, not a config key.
         # keys off to decide whether to arm itself (see start_dashboard). Cheap
         # and gateway-only — other CLI subcommands are short-lived and skip it.
         faulthandler.enable()
+        # An in-app restart reaches this image through os.execv, and execve
+        # preserves ITIMER_REAL while resetting a caught SIGALRM to its default
+        # disposition: the predecessor cancels its stall alarm before it execs,
+        # and this clears any deadline that still arrived -- one this image
+        # never armed -- before boot spends the seconds the watchdog is not yet
+        # running. Only while SIGALRM is at its default disposition, the same
+        # ownership rule the watchdog applies when it arms.
+        from kiro_crew.dashboard.loop_watchdog import disarm_inherited_alarm
+
+        disarm_inherited_alarm()
         # Install crash breadcrumbs (atexit + excepthook) before asyncio.run
         # so any fatal exception writes to crash.log.
         # The asyncio loop handler is installed later inside run().
@@ -3123,10 +3460,19 @@ The dashboard port is set with the KIROCREW_PORT env var, not a config key.
         # passed for diagnosis only: on refusal it lets the error say whether the
         # holder is answering on that port or is a wedged orphan squatting on it.
         try:
-            _gw_lock = GatewayLock(config_dir(), port=_diagnostic_port(gw_kwargs)).acquire()
+            _gw_lock = GatewayLock(
+                config_dir(),
+                port=_diagnostic_port(gw_kwargs),
+                bind_address=_diagnostic_bind_address(),
+            ).acquire()
         except GatewayLockError as exc:
             print(f"👻 {exc}", file=sys.stderr)
-            sys.exit(1)
+            # A live holder is a sibling gateway already serving this home, so
+            # retrying can only meet the same refusal: exit the code the systemd
+            # unit's RestartPreventExitStatus= names (service/linux.py) and let
+            # the supervisor stand down. Every other refusal is one a later
+            # attempt may find cleared, so it keeps the restartable exit 1.
+            sys.exit(LIVE_HOLDER_EXIT_CODE if exc.live_holder else 1)
         try:
             asyncio.run(_gateway(**gw_kwargs))
         finally:
@@ -3286,7 +3632,7 @@ The dashboard port is set with the KIROCREW_PORT env var, not a config key.
     elif args.command == "stop":
         from kiro_crew.cli_server import _stop
 
-        _stop(args.port)
+        _stop(args.port, expect_pid=args.expect_pid)
     elif args.command == "restart":
         from kiro_crew.cli_server import _restart
 

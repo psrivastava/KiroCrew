@@ -79,6 +79,8 @@ from kiro_crew import platform_compat
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.paths import config_dir
 from kiro_crew.executors import subprocess_executor
+from kiro_crew.owner_only_files import ensure_directory, owner_only_opener_for
+from kiro_crew.security import redact
 
 # service.* is import-safe on every platform (it only touches launchctl/systemctl
 # when called) and never imports apps.*, so there is no cycle to dodge here.
@@ -307,7 +309,10 @@ class SystemdBackend:
              "systemctl", "--user", "restart", self._unit()],
             timeout=10,
         )
-        return (rc == 0, "" if rc == 0 else (stderr.strip()[:200] or "systemd-run failed"))
+        # Redact the FULL stream, then keep the TAIL (the tool prints its error
+        # last); bounding before redaction can leave an unmatched secret fragment.
+        reason = redact(stderr.strip())[-200:] or "systemd-run failed"
+        return (rc == 0, "" if rc == 0 else reason)
 
     def plan(self, worktree: Path, kcbin: Path) -> dict:
         return {
@@ -344,7 +349,7 @@ class SystemdBackend:
             ["systemctl", "--user", "daemon-reload"], timeout=10
         )
         if rc != 0:
-            return False, "reload_failed", (stderr.strip()[:200] or "daemon-reload failed")
+            return False, "reload_failed", (redact(stderr.strip())[-200:] or "daemon-reload failed")
         return True, "", ""
 
     async def reload(self) -> None:
@@ -527,7 +532,8 @@ class LaunchdBackend:
         rc, _out, stderr = await self._run(
             ["launchctl", "kill", "TERM", self.target()], timeout=10
         )
-        return (rc == 0, "" if rc == 0 else (stderr.strip()[:200] or "launchctl kill failed"))
+        reason = redact(stderr.strip())[-200:] or "launchctl kill failed"
+        return (rc == 0, "" if rc == 0 else reason)
 
     # -- staging --
     def plan(self, worktree: Path, kcbin: Path) -> dict:
@@ -683,8 +689,11 @@ def default_detached_spawn(argv: list[str]) -> None:
     stdout: "IO[str] | int"
     try:
         log_path = config_dir() / "gateway.log"
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        stdout = open(log_path, "a", encoding="utf-8")  # noqa: SIM115 — closed below
+        ensure_directory(log_path.parent)
+        # 0600 if this creates it: the same file the gateway's own handler writes.
+        stdout = open(  # noqa: SIM115 — closed below
+            log_path, "a", encoding="utf-8", opener=owner_only_opener_for(log_path)
+        )
     except OSError:
         stdout = subprocess.DEVNULL
     # argv is a validated launcher + fixed arguments (never LLM- or

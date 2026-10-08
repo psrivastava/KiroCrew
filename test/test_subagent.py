@@ -45,6 +45,9 @@ def _mock_sessions() -> MagicMock:
     sessions.record_success = MagicMock()
     sessions.get_agent = MagicMock(return_value="")
     sessions.get_agent_selection = MagicMock(return_value=("template", ""))
+    # A real, empty map: the teardown paths read it once before their reset,
+    # and a miss (no live session, nothing to kill) is what these tests mean.
+    sessions._sessions = {}
     return sessions
 
 
@@ -243,7 +246,7 @@ class TestSpawnWithoutApprovalCallback:
         # The queued member carries the REAL id it will run under, not a
         # throwaway sentinel — spawn_run prints this id and the UI resolves the
         # wave by it, so it must match the agent that eventually starts.
-        assert re.fullmatch(r"[0-9a-f]{8}", second.id)
+        assert re.fullmatch(r"[0-9a-f]{16}", second.id)
         assert manager._queue[0]["_preassigned_id"] == second.id
         assert first.queued is False
 
@@ -275,6 +278,70 @@ class TestSpawnWithoutApprovalCallback:
         assert manager.queued_count_for("cron:j1") == 1
         assert manager.has_pending_work_for("cron:j1") is True
         assert manager.queued_count_for("cron:other") == 0
+
+    @pytest.mark.asyncio
+    async def test_is_queued_names_pending_spawns_and_the_dispatch_window(self) -> None:
+        """``is_queued`` is the serial-guard done-probe's queue check: it names
+        a fresh ``_queue`` entry and the pop-to-claim window the pump tracks in
+        ``_dispatch_window_ids``, skips a ``_resume_id`` re-entry (its real row is
+        in ``_agents``) and an id-less row, and does not claim a started run."""
+        manager = SubagentManager(
+            sessions=_mock_sessions(),
+            ctx_builder=_mock_ctx_builder(),
+            max_concurrent=1,
+            on_spawn_approval=AsyncMock(return_value=True),
+        )
+        with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"):
+            manager.spawn("task one", parent_session_key="dashboard:tab")
+            queued = manager.spawn("task two", parent_session_key="dashboard:tab")
+
+        assert queued is not None and queued.queued is True
+        assert manager.is_queued(queued.id) is True  # waiting in _queue
+        assert manager.is_queued("ffffffffffffffff") is False  # unknown id
+        # A started run (one with an _agents row) is not "queued".
+        for started_id in list(manager._agents):
+            assert manager.is_queued(started_id) is False
+
+        # A resume re-entry and an id-less row are not fresh queued spawns.
+        manager._queue.append({"_resume_id": "abc", "_preassigned_id": "abc"})
+        manager._queue.append({"_preassigned_id": "", "parent_session_key": "dashboard:tab"})
+        assert manager.is_queued("abc") is False
+        assert manager.is_queued("") is False
+
+        # The pump's pop-to-claim window: the row left _queue but is held in
+        # _dispatch_window_ids; is_queued still names it so the guard holds.
+        params = next(p for p in list(manager._queue) if p.get("_preassigned_id") == queued.id)
+        manager._queue.remove(params)
+        manager._dispatch_window_ids.add(queued.id)
+        assert manager.is_queued(queued.id) is True
+
+    def test_unmark_dispatching_keeps_the_window_for_a_retained_claim(self) -> None:
+        """``_unmark_dispatching`` drops the depth-count id mark unconditionally
+        but keeps the queryability window (``_dispatch_window_ids``) for a
+        retained claim -- the contract BOTH the inner per-row finally and the
+        outer drain-pass sweep rely on, so a claim retained across a pass is not
+        erased by that same pass's cleanup (GPT F1)."""
+        manager = SubagentManager(
+            sessions=_mock_sessions(),
+            ctx_builder=_mock_ctx_builder(),
+            max_concurrent=1,
+        )
+        pump = manager._admission
+        params = {"_preassigned_id": "held", "parent_session_key": "dashboard:tab"}
+        manager._dispatching_ids.add("held")
+        manager._dispatch_window_ids.add("held")
+
+        # retained=True: the slot leaves the depth count but the row stays
+        # queryable, so the done-probe keeps the serial guard.
+        pump._unmark_dispatching(params, retained=True)
+        assert "held" not in manager._dispatching_ids
+        assert "held" in manager._dispatch_window_ids
+        assert manager.is_queued("held") is True
+
+        # retained=False (the settled path): both marks go.
+        pump._unmark_dispatching(params, retained=False)
+        assert "held" not in manager._dispatch_window_ids
+        assert manager.is_queued("held") is False
 
 
 class TestSpawnWithApprovalCallback:
@@ -722,12 +789,16 @@ class TestSubagentReaper:
             patch("kiro_crew.subagent.Stats"),
             patch("kiro_crew.subagent.sel"),
             patch("kiro_crew.subagent._RESET_TIMEOUT", 0.1),
-            patch.object(manager, "_sigkill_session", new_callable=AsyncMock) as mock_kill,
+            patch.object(manager, "_sigkill_session", AsyncMock(return_value=None)) as mock_kill,
         ):
             await manager._force_reap("hang0001", info, _TIMEOUT_SECS + 60)
 
         assert info.done is True
-        mock_kill.assert_awaited_once_with("subagent:hang0001")
+        # No session was live before the reset, so the kill is handed no handle.
+        # ``popped`` is the session the reset actually popped, forwarded so the kill
+        # can release that session's own lease even when the reset was cancelled
+        # before ``provider.shutdown()`` and the torn-down table has unwound.
+        mock_kill.assert_awaited_once_with("subagent:hang0001", None, popped=[])
 
     @pytest.mark.asyncio
     async def test_run_finally_timeout_on_reset(self) -> None:
@@ -756,7 +827,7 @@ class TestSubagentReaper:
             patch("kiro_crew.subagent.Stats"),
             patch("kiro_crew.subagent.sel"),
             patch("kiro_crew.subagent._RESET_TIMEOUT", 0.1),
-            patch.object(manager, "_sigkill_session", new_callable=AsyncMock),
+            patch.object(manager, "_sigkill_session", AsyncMock(return_value=None)),
         ):
             await manager._run(info)
 
@@ -1012,9 +1083,12 @@ class TestFireEvent:
     async def test_subagent_done_event_fires_after_completion(self) -> None:
         """subagent_done event fires in finally block before on_done."""
         events: list[str] = []
+        done_payloads: list[dict[str, object]] = []
 
         async def track_event(etype: str, info: object, extra: dict) -> None:
             events.append(etype)
+            if etype == "subagent_done":
+                done_payloads.append(extra)
 
         on_done = AsyncMock(side_effect=lambda *a: events.append("on_done"))
 
@@ -1036,6 +1110,31 @@ class TestFireEvent:
         assert events.index("subagent_spawn") < events.index("subagent_done")
         # subagent_done WS event must fire BEFORE on_done (stream_and_collect)
         assert events.index("subagent_done") < events.index("on_done")
+        assert done_payloads[0]["credits"] == 0.0
+        assert done_payloads[0]["elapsed"] == info.elapsed
+
+
+@pytest.mark.parametrize(
+    ("credits", "elapsed", "expected"),
+    [
+        (0, 12.5, "13s"),
+        (0.25, 12.5, "0.25 credits · 13s"),
+        (9.99, 12.5, "9.99 credits · 13s"),
+        (10, 12.5, "10.0 credits · 13s"),
+        (12.5, 12.5, "12.5 credits · 13s"),
+        (0.25, 65, "0.25 credits · 1m 5s"),
+        (0.25, 59.5, "0.25 credits · 1m 0s"),
+        (0.25, 119.6, "0.25 credits · 2m 0s"),
+        (None, 12.5, ""),
+        (-1, 12.5, ""),
+        (float("nan"), 12.5, ""),
+        (10**400, 12.5, ""),
+    ],
+)
+def test_format_subagent_usage_omits_unreported_credits(credits, elapsed, expected):
+    from kiro_crew.subagent import format_subagent_usage
+
+    assert format_subagent_usage(credits, elapsed) == expected
 
 
 class TestCancelSubagent:
@@ -1679,8 +1778,8 @@ class TestSpawnMemoryGuard:
         assert call_kwargs["outcome"] == "deferred_low_memory"
         assert call_kwargs["metadata"]["available_gb"] == 2.5
 
-    def test_spawn_refused_low_memory(self):
-        """Without a store, spawn() returns an error SubagentInfo."""
+    def test_spawn_queued_low_memory_without_a_store(self):
+        """Without a store, spawn() still queues: the in-memory window holds it."""
         from unittest.mock import MagicMock, patch
 
         mgr = self._mgr()
@@ -1698,12 +1797,16 @@ class TestSpawnMemoryGuard:
             info = mgr.spawn(task="test task", parent_session_key="sess-1")
 
         assert info is not None
-        assert info.done is True
-        assert "2.5" in info.error
-        assert "4" in info.error
+        assert info.done is False and info.queued is True and info.error == ""
+        assert info.queued_reason == "low_memory"
+        assert "2.5 GB available" in info.queued_reason_detail
+        assert "need 5.0 GB" in info.queued_reason_detail  # the 4.0 floor plus this start
+        assert "1.00 GB for this start" in info.queued_reason_detail
+        assert [p["_preassigned_id"] for p in mgr._queue] == [info.id]
+        assert info.id not in mgr._agents and mgr._running_count == 0
         mock_sel.return_value.log_tool_invocation.assert_called_once()
         call_kwargs = mock_sel.return_value.log_tool_invocation.call_args[1]
-        assert call_kwargs["outcome"] == "refused_low_memory"
+        assert call_kwargs["outcome"] == "deferred_low_memory"
 
 
 class TestSpawnEmptyTaskGuard:
@@ -2007,6 +2110,82 @@ class TestSubagentPostToolUseHook:
         assert info.done is True
 
 
+class TestSubagentParallelToolAttribution:
+    """The run loop keeps a slow parallel call judged after a fast one returns."""
+
+    @pytest.mark.asyncio
+    async def test_a_wait_stays_judged_after_a_parallel_write_returns(self) -> None:
+        """Wire-level shape of the reported stall: a write and a ``wait`` in one
+        turn, the write's completed result first. The wait must remain the
+        reaper's in-flight call, and a call the previous turn left open must be
+        gone by the time the new prompt streams."""
+        from kiro_crew.providers.base import (
+            EVENT_TOOL_CALL,
+            EVENT_TOOL_RESULT,
+            LLMEvent,
+        )
+        from kiro_crew.subagent import SubagentInfo, SubagentManager
+
+        info = SubagentInfo(
+            execution_context=execution_for_store(""),
+            id="t05",
+            task="test",
+            parent_session_key="slack:C:T",
+        )
+        info._active_tool_calls["stale-1"] = MagicMock()
+        seen: dict[str, object] = {}
+
+        async def _stream(*_a, **_kw):  # type: ignore[no-untyped-def]
+            seen["stale_at_prompt"] = "stale-1" in info._active_tool_calls
+            yield LLMEvent(
+                kind=EVENT_TOOL_CALL,
+                title="Waiting for CI",
+                tool_call_id="wait-1",
+                tool_input='{"seconds": 1800, "reason": "ci"}',
+                tool_name="wait",
+                mcp_server_name="kirocrew-core",
+                mcp_identity_trusted=True,
+            )
+            yield LLMEvent(
+                kind=EVENT_TOOL_CALL,
+                title="Editing PLAN-a.md",
+                tool_call_id="write-1",
+                tool_input='{"path": "PLAN-a.md"}',
+                tool_kind="edit",
+            )
+            yield LLMEvent(
+                kind=EVENT_TOOL_RESULT,
+                tool_call_id="write-1",
+                tool_output="ok",
+                tool_final=True,
+                tool_status="completed",
+            )
+            seen["judged"] = info._inflight_tool
+
+        sessions = _mock_sessions()
+        provider = AsyncMock()
+        provider.start = AsyncMock()
+        provider.shutdown = AsyncMock()
+        provider.context_usage_pct = lambda: 0.0
+        provider.stream = MagicMock(side_effect=lambda *a, **kw: _stream())
+        sessions.get_or_create = AsyncMock(return_value=(provider, True, False))
+
+        ctx = _mock_ctx_builder_auto_spawn()
+        ctx.hooks.auto_approve_subagent_tools = True
+        manager = SubagentManager(sessions=sessions, ctx_builder=ctx)
+        manager.hook_store = MagicMock()
+        manager.hook_store.fire = AsyncMock()
+        manager._log_spawned(info)
+
+        with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"):
+            await manager._run_inner(info, "subagent:t05")
+
+        assert seen["stale_at_prompt"] is False
+        judged = seen["judged"]
+        assert judged is not None, "the write's result emptied the in-flight slot"
+        assert judged.is_trusted_wait()
+
+
 class TestCompletionKeepHelper:
     """Tests for the apply_completion_keep helper in context_management."""
 
@@ -2165,6 +2344,311 @@ class TestSubagentUsageRow:
         assert kwargs["agent"] == "researcher"
         assert kwargs["context_used"] == 999
         assert kwargs["context_window"] == 200000
+        assert info.credits == pytest.approx(0.5)
+
+    @pytest.mark.asyncio
+    async def test_failed_attempt_preserves_reported_credits(self) -> None:
+        """A failed turn has no completion event, but may already be billed."""
+        from kiro_crew.acp.types import AcpPromptStats
+        from kiro_crew.subagent import SubagentInfo
+
+        provider = MagicMock()
+        provider.context_usage_pct = lambda: 0.0
+        provider.last_prompt_stats = AcpPromptStats()
+
+        async def _failed_stream(*_a: object, **_k: object):  # type: ignore[no-untyped-def]
+            provider.last_prompt_stats = AcpPromptStats(credits=0.75)
+            raise RuntimeError("backend failed")
+            yield  # noqa: unreachable — makes this an async generator
+
+        provider.stream = MagicMock(side_effect=lambda *a, **kw: _failed_stream())
+        sessions = _mock_sessions()
+        sessions.get_or_create = AsyncMock(return_value=(provider, True, False))
+        manager = SubagentManager(
+            sessions=sessions,
+            ctx_builder=_mock_ctx_builder_auto_spawn(),
+        )
+        info = SubagentInfo(
+            id="usage03",
+            task="fail after billing",
+            execution_context=execution_for_store(""),
+        )
+        manager._log_spawned(info)
+
+        with pytest.raises(RuntimeError, match="backend failed"):
+            await manager._run_inner(info, "subagent:usage03")
+
+        assert info.credits == pytest.approx(0.75)
+
+    def test_credit_accounting_uses_shared_billing_walk_and_turn_usage(self) -> None:
+        from kiro_crew.acp.types import AcpEvent, AcpPromptStats, TurnUsage
+        from kiro_crew.providers.base import EVENT_COMPLETE
+        from kiro_crew.subagent import SubagentInfo, _RunCreditAccounting
+
+        runner = MagicMock(spec=[])
+        runner.last_prompt_stats = AcpPromptStats()
+        provider = MagicMock(spec=[])
+        provider._handle = runner
+        info = SubagentInfo(id="usage-wrapper", task="account wrapped usage")
+        accounting = _RunCreditAccounting(info)
+
+        accounting.begin(provider)
+        runner.last_prompt_stats = AcpPromptStats(
+            credits=0.75,
+            input_tokens=10,
+            output_tokens=20,
+            cache_read_tokens=3,
+            cache_write_tokens=4,
+            cost_usd=0.01,
+        )
+        accounting.settle()
+
+        accounting.begin(provider)
+        accounting.settle(
+            AcpEvent(
+                kind=EVENT_COMPLETE,
+                usage=TurnUsage(credits=0.5, input_tokens=2, cost_usd=0.02),
+            )
+        )
+
+        assert info.credits == pytest.approx(1.25)
+        assert accounting.total.input_tokens == 12
+        assert accounting.total.output_tokens == 20
+        assert accounting.total.cache_read_tokens == 3
+        assert accounting.total.cache_creation_tokens == 4
+        assert accounting.total.cost_usd == pytest.approx(0.03)
+
+    @pytest.mark.parametrize("credits", [True, -1.0, float("nan"), float("inf")])
+    def test_credit_accounting_rejects_invalid_provider_credits(self, credits: object) -> None:
+        from kiro_crew.acp.types import AcpEvent, TurnUsage
+        from kiro_crew.providers.base import EVENT_COMPLETE
+        from kiro_crew.subagent import SubagentInfo, _RunCreditAccounting
+
+        info = SubagentInfo(id="usage-invalid", task="reject invalid credits", credits=0.75)
+        accounting = _RunCreditAccounting(info)
+        accounting.begin(MagicMock())
+        accounting.settle(AcpEvent(kind=EVENT_COMPLETE, usage=TurnUsage(credits=credits)))
+
+        assert info.credits == pytest.approx(0.75)
+        assert accounting.total.credits == pytest.approx(0.75)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("interruption_site", ["stream", "consumer"])
+    async def test_cancel_preserves_active_attempt_credits(self, interruption_site) -> None:
+        from kiro_crew.acp.types import AcpEvent, AcpPromptStats
+        from kiro_crew.providers.base import EVENT_TEXT_CHUNK
+        from kiro_crew.subagent import SubagentInfo
+
+        entered = asyncio.Event()
+        blocked = asyncio.Event()
+        provider = MagicMock()
+        provider.context_usage_pct = lambda: 0.0
+        provider.last_prompt_stats = AcpPromptStats(credits=9.0)
+
+        async def stream(*args, **kwargs):
+            provider.last_prompt_stats = AcpPromptStats(credits=0.75)
+            if interruption_site == "stream":
+                entered.set()
+                await blocked.wait()
+            yield AcpEvent(kind=EVENT_TEXT_CHUNK, text="partial")
+
+        async def on_event(kind, info, extra):
+            if kind == "subagent_chunk":
+                entered.set()
+                await blocked.wait()
+
+        stream_iter = stream()
+        provider.stream = MagicMock(return_value=stream_iter)
+        sessions = _mock_sessions()
+        sessions.get_or_create = AsyncMock(return_value=(provider, True, False))
+        manager = SubagentManager(sessions=sessions, ctx_builder=_mock_ctx_builder_auto_spawn())
+        info = SubagentInfo(
+            id="usagecancel",
+            task="cancel after billing",
+            execution_context=execution_for_store(""),
+        )
+        manager._log_spawned(info)
+
+        with patch.object(manager, "_fire_event", side_effect=on_event):
+            task = asyncio.create_task(manager._run_inner(info, "subagent:usagecancel"))
+            try:
+                await asyncio.wait_for(entered.wait(), timeout=5)
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+                assert info.credits == pytest.approx(0.75)
+            finally:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+                await stream_iter.aclose()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("ending", "expected"),
+        [("complete", 1.25), ("no_complete", 1.5), ("cancel", 1.5), ("stale", 0.75)],
+    )
+    async def test_retry_credits_settle_each_attempt_once(self, ending, expected) -> None:
+        from kiro_crew.acp.types import AcpEvent, AcpPromptStats, TurnUsage
+        from kiro_crew.providers.base import EVENT_COMPLETE
+        from kiro_crew.subagent import SubagentInfo
+
+        class TransientError(Exception):
+            transient = True
+
+        provider = MagicMock()
+        provider.context_usage_pct = lambda: 0.0
+        provider.last_prompt_stats = AcpPromptStats(credits=9.0)
+        attempts = []
+
+        async def stream():
+            if len(attempts) == 1:
+                provider.last_prompt_stats = AcpPromptStats(credits=0.75)
+                raise TransientError("retry this attempt")
+            if ending == "stale":
+                raise RuntimeError("failed before the next prompt started")
+            provider.last_prompt_stats = AcpPromptStats(credits=0.75)
+            if ending == "cancel":
+                raise asyncio.CancelledError
+            if ending == "complete":
+                yield AcpEvent(kind=EVENT_COMPLETE, usage=TurnUsage(credits=0.5))
+
+        def start_stream(*args, **kwargs):
+            attempt = stream()
+            attempts.append(attempt)
+            return attempt
+
+        provider.stream = start_stream
+        sessions = _mock_sessions()
+        sessions.get_or_create = AsyncMock(return_value=(provider, True, False))
+        manager = SubagentManager(sessions=sessions, ctx_builder=_mock_ctx_builder_auto_spawn())
+        info = SubagentInfo(
+            id="usageretry",
+            task="retry after billing",
+            execution_context=execution_for_store(""),
+        )
+        manager._log_spawned(info)
+        with patch("kiro_crew.subagent.transient_retry_delay", return_value=0.0):
+            try:
+                if ending == "cancel":
+                    with pytest.raises(asyncio.CancelledError):
+                        await manager._run_inner(info, "subagent:usageretry")
+                elif ending == "stale":
+                    with pytest.raises(RuntimeError, match="failed before"):
+                        await manager._run_inner(info, "subagent:usageretry")
+                else:
+                    await manager._run_inner(info, "subagent:usageretry")
+                assert len(attempts) == 2
+                assert info.credits == pytest.approx(expected)
+            finally:
+                for attempt in attempts:
+                    await attempt.aclose()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("recovery", ["infra", "stop"])
+    @pytest.mark.parametrize("ending", ["complete", "refused", "cancel"])
+    async def test_recovery_settles_withheld_usage_before_readmission(
+        self, recovery, ending
+    ) -> None:
+        from kiro_crew.acp.types import AcpEvent, AcpPromptStats, TurnUsage
+        from kiro_crew.providers.base import EVENT_COMPLETE
+        from kiro_crew.recovery.ladder import InfraError
+        from kiro_crew.subagent import SubagentInfo
+
+        provider = MagicMock()
+        provider.context_usage_pct = lambda: 0.0
+        # This provider reports usage only on completion; cached stats are stale.
+        provider.last_prompt_stats = AcpPromptStats(credits=9.0)
+        attempts: list[str] = []
+
+        async def stream(*args, **kwargs):
+            attempts.append(args[0])
+            first = len(attempts) == 1
+            provider.last_infra_error = (
+                InfraError("capacity") if first and recovery == "infra" else None
+            )
+            yield AcpEvent(
+                kind=EVENT_COMPLETE,
+                stop_reason="error: tool stall" if first and recovery == "stop" else "end_turn",
+                usage=TurnUsage(credits=0.75 if first else 0.5),
+            )
+
+        provider.stream = stream
+        sessions = _mock_sessions()
+        sessions.get_or_create = AsyncMock(return_value=(provider, True, False))
+        manager = SubagentManager(sessions=sessions, ctx_builder=_mock_ctx_builder_auto_spawn())
+        info = SubagentInfo(
+            id="usagerecovery",
+            task="recover billed turn",
+            execution_context=execution_for_store(""),
+        )
+        manager._log_spawned(info)
+        credits_at_readmission: list[float] = []
+
+        async def readmit(*args):
+            credits_at_readmission.append(info.credits)
+            if ending == "cancel":
+                raise asyncio.CancelledError
+            return None if ending == "refused" else "continue the interrupted work"
+
+        method = "_yield_for_infra_retry" if recovery == "infra" else "_yield_for_stop_recovery"
+        with patch.object(manager, method, side_effect=readmit):
+            if ending == "cancel":
+                with pytest.raises(asyncio.CancelledError):
+                    await manager._run_inner(info, "subagent:usagerecovery")
+            else:
+                await manager._run_inner(info, "subagent:usagerecovery")
+
+        assert credits_at_readmission == [0.75]
+        assert len(attempts) == (2 if ending == "complete" else 1)
+        assert info.credits == pytest.approx(1.25 if ending == "complete" else 0.75)
+
+    @pytest.mark.asyncio
+    async def test_turn_limit_preserves_credits_before_tombstoning(self) -> None:
+        from kiro_crew.acp.types import AcpEvent, AcpPromptStats
+        from kiro_crew.hooks import TOOL_DENY, ToolHookResult
+        from kiro_crew.providers.base import EVENT_PERMISSION_REQUEST
+        from kiro_crew.subagent import SubagentInfo
+
+        info = SubagentInfo(
+            id="usagelimit",
+            task="limited run",
+            max_turns=1,
+            execution_context=execution_for_store(""),
+        )
+        provider = MagicMock()
+        provider.context_usage_pct = lambda: 0.0
+        provider.last_prompt_stats = AcpPromptStats()
+
+        async def stream():
+            provider.last_prompt_stats = AcpPromptStats(credits=0.75)
+            for request_id in range(info.max_turns + 1):
+                yield AcpEvent(kind=EVENT_PERMISSION_REQUEST, request_id=request_id, title="read")
+
+        stream_iter = stream()
+        provider.stream = MagicMock(return_value=stream_iter)
+        sessions = _mock_sessions()
+        sessions.get_or_create = AsyncMock(return_value=(provider, True, False))
+        ctx = _mock_ctx_builder_auto_spawn()
+        ctx.hooks.on_tool_call.return_value = ToolHookResult(action=TOOL_DENY)
+        manager = SubagentManager(sessions=sessions, ctx_builder=ctx)
+        manager._log_spawned(info)
+        tombstone_credits = []
+        provider.reject_tool = AsyncMock()
+        with (
+            patch.object(
+                manager,
+                "_write_tombstone",
+                side_effect=lambda run, cause: tombstone_credits.append(run.credits),
+            ),
+        ):
+            try:
+                await manager._run_inner(info, "subagent:usagelimit")
+                assert info.error == "turn_limit:1"
+                assert info.credits == pytest.approx(0.75)
+                assert tombstone_credits == [0.75]
+            finally:
+                await stream_iter.aclose()
+                await asyncio.get_running_loop().shutdown_asyncgens()
 
     @pytest.mark.asyncio
     async def test_shared_runtime_agent_does_not_override_spawn_agent(self) -> None:

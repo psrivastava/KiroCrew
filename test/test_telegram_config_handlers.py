@@ -203,24 +203,24 @@ def test_legacy_purge_is_persisted_before_env_write(tmp_path: Path, monkeypatch)
     bot_token removal) must land BEFORE the .env update. A crash between the
     two must never leave .env cleared while the legacy fallback survives to
     resurrect the revoked credential on restart."""
-    import kiro_crew.agent as agent_mod
     import kiro_crew.dashboard.handlers.messaging as mod
 
     _accept_token(monkeypatch, mod)
     order: list[str] = []
-    real_json_write = agent_mod._atomic_json_write
+    real_json_write = loader.write_config_atomically
     real_env_write = mod._write_env_updates
 
-    def _spy_json_write(path, data):
+    def _spy_json_write(path, data, **kw):
         order.append("config")
-        return real_json_write(path, data)
+        return real_json_write(path, data, **kw)
 
     def _spy_env_write(updates):
         order.append("env")
         return real_env_write(updates)
 
-    # The handler imports _atomic_json_write from kiro_crew.agent at call time.
-    monkeypatch.setattr(agent_mod, "_atomic_json_write", _spy_json_write)
+    # The save writes through ``update_config_locked``, whose file write is the
+    # loader's ``write_config_atomically``.
+    monkeypatch.setattr(loader, "write_config_atomically", _spy_json_write)
     monkeypatch.setattr(mod, "_write_env_updates", _spy_env_write)
 
     env = tmp_path / ".env"
@@ -407,3 +407,19 @@ def test_save_rejects_garbage_forum_chat_ids(tmp_path: Path, monkeypatch) -> Non
     status_body, _ = _client_put(mod, monkeypatch, tmp_path, {"allowed_forum_chat_ids": "-100"})
     assert status_body[0] == 400
     assert "must be a list" in status_body[1]["error"]
+
+
+def test_save_survives_wrong_typed_stored_allow_list(tmp_path: Path, monkeypatch) -> None:
+    """A hand-edited non-list ``allowed_user_ids`` in config.json degrades to
+    empty, so ``list(tg_cfg.get(...))`` is not called on a non-iterable and the
+    save still applies."""
+    import kiro_crew.dashboard.handlers.messaging as mod
+
+    _accept_token(monkeypatch, mod)
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps({"telegram": {"allowed_user_ids": 123}}), encoding="utf-8")
+    status_body, _ = _client_put(mod, monkeypatch, tmp_path, {"allowed_user_ids": ["555"]})
+    status, _ = status_body
+    assert status == 200
+    saved = json.loads(cfg.read_text(encoding="utf-8"))
+    assert saved["telegram"]["allowed_user_ids"] == [555]

@@ -32,6 +32,9 @@ const storeState: {
 vi.mock('../../store', () => ({
   useAppDispatch: () => dispatch,
   useAppSelector: (fn: (s: unknown) => unknown) => fn(storeState),
+  // The session rows read the active slot through a store HANDLE once their
+  // switch settles; the same fixture state answers that read.
+  useAppStore: () => ({ getState: () => storeState }),
 }))
 vi.mock('../../store/chatSlice', () => ({
   createSlot: (arg: unknown) => ({ type: 'createSlot', arg }),
@@ -58,6 +61,14 @@ vi.mock('../../components/commandPalette/providers/recentsProvider', async impor
   ...(await importOriginal<typeof import('../../components/commandPalette/providers/recentsProvider')>()),
   useRecentsProvider: () => ({ search: recentsSearch }),
 }))
+// Passed through, and watched: a settings row must be scored by the scorer the
+// other settings searches share, not by the bar's own field matcher.
+const scoreSettingEntry = vi.hoisted(() => ({ spy: null as null | ReturnType<typeof vi.fn> }))
+vi.mock('../../components/commandPalette/settingsSearchCore', async importOriginal => {
+  const real = await importOriginal<typeof import('../../components/commandPalette/settingsSearchCore')>()
+  scoreSettingEntry.spy = vi.fn(real.scoreSettingEntry)
+  return { ...real, scoreSettingEntry: (...args: Parameters<typeof real.scoreSettingEntry>) => scoreSettingEntry.spy!(...args) }
+})
 vi.mock('../../hooks/useVisualViewport', () => ({ useVisualViewport: () => ({ height: 800 }) }))
 vi.mock('../../hooks/useDialogFocusTrap', () => ({ useDialogFocusTrap: () => {} }))
 const cycleTheme = vi.fn()
@@ -108,6 +119,11 @@ function mountControllable(onClose = vi.fn()) {
 
 const rowByText = (text: string) =>
   screen.getByText(text).closest('[role="option"]') as HTMLElement
+
+/** Mirrors the overlay's own query debounce (CommandBarOverlay.tsx DEBOUNCE_MS).
+ *  The latch-close/pointer tests advance a fake clock by this to settle the
+ *  debounced refetch deterministically instead of waiting on wall-clock time. */
+const DEBOUNCE_MS = 150
 
 /** The title the overlay renders for a settings entry — the shared resolver
  *  (localized + fan-out suffix), same as the component. */
@@ -193,6 +209,41 @@ describe('CommandBarOverlay rows', () => {
       expect(screen.getByText(s)).toBeTruthy()
     }
     expect(settingsTabLabel('computer-use')).not.toBe('computer-use')
+  })
+
+  it('withholds the settings rows the other searches withhold', () => {
+    // A browser window: About draws the gateway's switch and no app updater, so a
+    // row for the app switch would land on a tab with nothing to flash.
+    mount()
+    fireEvent.change(screen.getByRole('combobox'), { target: { value: 'automatic' } })
+    const options = screen.getAllByRole('option').map(o => o.textContent ?? '')
+    expect(options.some(o => o.includes('Update the gateway automatically'))).toBe(true)
+    expect(options.some(o => o.includes('Install app updates automatically'))).toBe(false)
+  })
+
+  it('finds a settings row by the synonyms the other searches use', () => {
+    // "auto-update" is in neither switch's label; it is the name both shipped under.
+    mount()
+    fireEvent.change(screen.getByRole('combobox'), { target: { value: 'auto-update' } })
+    const option = screen.getAllByRole('option').find(o => o.textContent?.includes('Update the gateway automatically'))
+    // The synonym that matched is drawn on the row, since neither its title nor
+    // its subtitle carries the word.
+    expect(option).toHaveTextContent('auto-update')
+  })
+
+  it('marks a settings row matched by its description in its subtitle', () => {
+    // In the description only: "Enterprise Grid org or workspace IDs to allow (starts with E or T). ..."
+    mount()
+    fireEvent.change(screen.getByRole('combobox'), { target: { value: 'starts with E or T' } })
+    const option = screen.getAllByRole('option').find(o => o.textContent?.includes('Allowed enterprise orgs'))!
+    expect(option.querySelector('strong')?.textContent).toBe('starts with E or T')
+  })
+
+  it('scores settings rows with the scorer the other settings searches share', () => {
+    mount()
+    scoreSettingEntry.spy!.mockClear()
+    fireEvent.change(screen.getByRole('combobox'), { target: { value: 'automatic' } })
+    expect(scoreSettingEntry.spy).toHaveBeenCalledWith('automatic', expect.objectContaining({ id: 'about.update-the-gateway-automatically' }))
   })
 
   it('navigates and closes on a settings row', () => {
@@ -467,6 +518,265 @@ describe('CommandBarOverlay rows', () => {
     await waitFor(() => expect(sessionSearch.mock.calls.length).toBeGreaterThan(before))
   })
 
+  const hit = (title: string, onActivate: () => void) => ({
+    id: `sessions:${title}`,
+    providerId: 'sessions',
+    title,
+    icon: null,
+    score: 1,
+    indices: [],
+    onActivate,
+  })
+
+  it('latches an Enter pressed in the debounce window and fires it on the live rows', async () => {
+    // Every scoped view ranks from the DEBOUNCED query, so for one debounce interval
+    // after a keystroke its rows answer the previous query. An Enter in that window
+    // must never open the row selected against the OLD query, and must not be dropped:
+    // it is held and fired once the rows answer what the reader typed. Reported in the
+    // crewmates view; the latch is on the activation path all four views share.
+    const openAlpha = vi.fn()
+    const openBeta = vi.fn()
+    sessionSearch.mockResolvedValue([hit('Alpha planning', openAlpha)])
+    mount()
+    const input = screen.getByRole('combobox')
+    fireEvent.mouseDown(rowByText('Search Sessions'))
+    fireEvent.change(input, { target: { value: 'alpha' } })
+    expect(await screen.findByText('Alpha planning')).toBeTruthy()
+    sessionSearch.mockResolvedValue([hit('Beta review', openBeta)])
+    fireEvent.change(input, { target: { value: 'beta' } })
+    // No debounce tick yet: the row on screen still answers `alpha`.
+    fireEvent.keyDown(input, { key: 'Enter' })
+    // The stale row is never opened, not even for the instant before the rows catch up.
+    expect(openAlpha).not.toHaveBeenCalled()
+    // Once the rows answer `beta`, the LATCHED Enter fires on its own — no second press.
+    await waitFor(() => expect(openBeta).toHaveBeenCalled())
+    expect(openAlpha).not.toHaveBeenCalled()
+  })
+
+  it('drops the latch on Escape rather than firing it late', async () => {
+    const openAlpha = vi.fn()
+    const openBeta = vi.fn()
+    sessionSearch.mockResolvedValue([hit('Alpha planning', openAlpha)])
+    mount()
+    const input = screen.getByRole('combobox')
+    fireEvent.mouseDown(rowByText('Search Sessions'))
+    fireEvent.change(input, { target: { value: 'alpha' } })
+    expect(await screen.findByText('Alpha planning')).toBeTruthy()
+    sessionSearch.mockResolvedValue([hit('Beta review', openBeta)])
+    fireEvent.change(input, { target: { value: 'beta' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    // Escape steps out of the scope and must take the pending Enter with it.
+    fireEvent.keyDown(screen.getByRole('dialog'), { key: 'Escape' })
+    // Let the debounce and any refetch settle: a surviving latch would fire here.
+    await waitFor(() => expect(screen.queryByText('Alpha planning')).toBeNull())
+    expect(openBeta).not.toHaveBeenCalled()
+    expect(openAlpha).not.toHaveBeenCalled()
+  })
+
+  it('drops the latch when the reader leaves the scope', async () => {
+    const openAlpha = vi.fn()
+    const openBeta = vi.fn()
+    sessionSearch.mockResolvedValue([hit('Alpha planning', openAlpha)])
+    mount()
+    const input = screen.getByRole('combobox')
+    fireEvent.mouseDown(rowByText('Search Sessions'))
+    fireEvent.change(input, { target: { value: 'alpha' } })
+    expect(await screen.findByText('Alpha planning')).toBeTruthy()
+    sessionSearch.mockResolvedValue([hit('Beta review', openBeta)])
+    fireEvent.change(input, { target: { value: 'beta' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    // Empty the field, then Backspace leaves the scope — the latch must not survive it.
+    fireEvent.change(input, { target: { value: '' } })
+    fireEvent.keyDown(input, { key: 'Backspace' })
+    await waitFor(() => expect(screen.queryByText('Search Sessions')).not.toBeNull())
+    expect(openBeta).not.toHaveBeenCalled()
+    expect(openAlpha).not.toHaveBeenCalled()
+  })
+
+  it('drops the latch when the bar closes', async () => {
+    const openAlpha = vi.fn()
+    const openBeta = vi.fn()
+    sessionSearch.mockResolvedValue([hit('Alpha planning', openAlpha)])
+    const ctl = mountControllable()
+    const input = screen.getByRole('combobox')
+    fireEvent.mouseDown(rowByText('Search Sessions'))
+    fireEvent.change(input, { target: { value: 'alpha' } })
+    expect(await screen.findByText('Alpha planning')).toBeTruthy()
+    sessionSearch.mockResolvedValue([hit('Beta review', openBeta)])
+    fireEvent.change(input, { target: { value: 'beta' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    // The bar closes under the pending Enter — reopening must not replay it. The debounce
+    // is the overlay's own setTimeout (DEBOUNCE_MS), so a fake clock drives it exactly:
+    // `shouldAdvanceTime` keeps real microtasks/`findBy*` flushing while advancing the
+    // timer deterministically settles the `beta` query — the window in which a latch that
+    // survived the close would wrongly fire on reopen, with no arbitrary wall-clock wait.
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    try {
+      act(() => ctl.rerender(false))
+      act(() => ctl.rerender(true))
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(DEBOUNCE_MS * 2)
+      })
+    } finally {
+      vi.useRealTimers()
+    }
+    expect(openBeta).not.toHaveBeenCalled()
+    expect(openAlpha).not.toHaveBeenCalled()
+  })
+
+  it('drops the latch when the catch-up fetch fails onto a retry dead end', async () => {
+    // The query the Enter is pressed against resolves to an error with no cached rows,
+    // so slot 0 is the synthesized `retry` row, not a result. The latch must drop on
+    // that dead end rather than fire it: firing the retry row would re-run the search,
+    // so the test counts search invocations — a latch that wrongly fired the dead end
+    // would drive a THIRD call, which makes this able to fail (it does not just rely on
+    // there being nothing to open).
+    const openAlpha = vi.fn()
+    sessionSearch.mockResolvedValueOnce([hit('Alpha planning', openAlpha)])
+    mount()
+    const input = screen.getByRole('combobox')
+    fireEvent.mouseDown(rowByText('Search Sessions'))
+    fireEvent.change(input, { target: { value: 'alpha' } })
+    expect(await screen.findByText('Alpha planning')).toBeTruthy()
+    const callsBeforeEnter = sessionSearch.mock.calls.length
+    // The query the Enter is pressed against fails: the on-screen `alpha` row is stale,
+    // and the failing `beta` key has no cached rows, so slot 0 becomes the retry row.
+    sessionSearch.mockRejectedValue(new Error('gateway down'))
+    fireEvent.change(input, { target: { value: 'beta' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    // The failure row appears; the latch must drop rather than fire on the dead end.
+    await screen.findByText('Search failed')
+    await act(async () => {
+      await new Promise(r => setTimeout(r, 0))
+    })
+    // Never opened the stale `alpha` row, and never fired the retry row (which would
+    // have re-run the search beyond the renders the user's own typing drove).
+    expect(openAlpha).not.toHaveBeenCalled()
+    expect(sessionSearch.mock.calls.length).toBe(callsBeforeEnter + 1)
+  })
+
+  it('drops the latch when the reader keeps typing after the Enter', async () => {
+    // 'onc' settles, then 'once' + Enter in the window confirms `once`; a further
+    // keystroke to `oncex` means the reader never confirmed what the rows now answer.
+    // A latch that committed whatever was typed next would open a query never
+    // confirmed, so a further keystroke drops it.
+    const openOncex = vi.fn()
+    sessionSearch.mockResolvedValue([hit('Onc result', () => {})])
+    mount()
+    const input = screen.getByRole('combobox')
+    fireEvent.mouseDown(rowByText('Search Sessions'))
+    fireEvent.change(input, { target: { value: 'onc' } })
+    expect(await screen.findByText('Onc result')).toBeTruthy()
+    sessionSearch.mockResolvedValue([hit('Oncex result', openOncex)])
+    // Enter lands in the window (rows still answer `onc`); then the reader types on.
+    fireEvent.change(input, { target: { value: 'once' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    fireEvent.change(input, { target: { value: 'oncex' } })
+    // Rows settle on `oncex`; the never-confirmed `oncex` row is not opened.
+    expect(await screen.findByText('Oncex result')).toBeTruthy()
+    await new Promise(r => setTimeout(r, 50))
+    expect(openOncex).not.toHaveBeenCalled()
+  })
+
+  it('drops the latch when the selection moves after the Enter', async () => {
+    // ArrowDown after a latched Enter aims at a different row. Firing row 0 regardless
+    // would open something the reader just moved off of, so a moved selection drops it.
+    const openTop = vi.fn()
+    const openSecond = vi.fn()
+    sessionSearch.mockResolvedValue([hit('Top one', () => {}), hit('Top two', () => {})])
+    mount()
+    const input = screen.getByRole('combobox')
+    fireEvent.mouseDown(rowByText('Search Sessions'))
+    fireEvent.change(input, { target: { value: 'top' } })
+    expect(await screen.findByText('Top one')).toBeTruthy()
+    sessionSearch.mockResolvedValue([
+      hit('Fresh top', openTop),
+      hit('Fresh second', openSecond),
+    ])
+    fireEvent.change(input, { target: { value: 'fresh' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    // Move the selection off row 0 while the latch is armed.
+    fireEvent.keyDown(input, { key: 'ArrowDown' })
+    // Rows settle; the latch dropped, so neither row opens from the stale Enter.
+    expect(await screen.findByText('Fresh top')).toBeTruthy()
+    await new Promise(r => setTimeout(r, 50))
+    expect(openTop).not.toHaveBeenCalled()
+    expect(openSecond).not.toHaveBeenCalled()
+  })
+
+  it('drops the latch when a pointer activation keeps the bar open', async () => {
+    // A click acts on the row it is on, immediately. A latch left armed by a prior
+    // keyboard Enter would then fire a SECOND time once the rows caught up, so a
+    // pointer activation drops any pending Enter.
+    const openStale = vi.fn()
+    const openFresh = vi.fn()
+    sessionSearch.mockResolvedValue([hit('Stale row', openStale)])
+    mount()
+    const input = screen.getByRole('combobox')
+    fireEvent.mouseDown(rowByText('Search Sessions'))
+    fireEvent.change(input, { target: { value: 'stale' } })
+    expect(await screen.findByText('Stale row')).toBeTruthy()
+    sessionSearch.mockResolvedValue([hit('Fresh row', openFresh)])
+    fireEvent.change(input, { target: { value: 'fresh' } })
+    // Enter in the window arms the latch; then a click lands on the row still on
+    // screen, before the debounce settles.
+    fireEvent.keyDown(input, { key: 'Enter' })
+    fireEvent.mouseDown(rowByText('Stale row'))
+    // The click opened the row it was on, exactly once.
+    expect(openStale).toHaveBeenCalledTimes(1)
+    // Rows catch up to `fresh`: a surviving latch would fire openFresh here. The debounce
+    // is the overlay's own setTimeout (DEBOUNCE_MS), so advancing a fake clock settles the
+    // `fresh` refetch deterministically — `shouldAdvanceTime` keeps the microtask flush the
+    // flow needs — and that advance is the window in which a dropped-clear mutation would
+    // wrongly fire, with no arbitrary wall-clock wait.
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    try {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(DEBOUNCE_MS * 2)
+      })
+    } finally {
+      vi.useRealTimers()
+    }
+    expect(openFresh).not.toHaveBeenCalled()
+    expect(openStale).toHaveBeenCalledTimes(1)
+  })
+
+  it('drops the latch when the row under the captured index is a different row', async () => {
+    // The reader arrows off row 0 onto a lower row, then presses Enter in the window.
+    // If the new query is already cached its rows swap in under the same indices with
+    // no empty frame, so the index still points somewhere — at a row the reader never
+    // had highlighted. Firing it opens a stranger, the wrong-row hazard this latch
+    // exists to close, so a changed row identity at that index drops the latch.
+    const openA1 = vi.fn()
+    const openA2 = vi.fn()
+    const openB1 = vi.fn()
+    const openB2 = vi.fn()
+    // Settle `beta` first so its rows are cached and swap in without a fetch frame.
+    sessionSearch.mockResolvedValue([hit('B one', openB1), hit('B two', openB2)])
+    mount()
+    const input = screen.getByRole('combobox')
+    fireEvent.mouseDown(rowByText('Search Sessions'))
+    fireEvent.change(input, { target: { value: 'beta' } })
+    expect(await screen.findByText('B two')).toBeTruthy()
+    // Now settle `alpha`: the on-screen list is [A one, A two].
+    sessionSearch.mockResolvedValue([hit('A one', openA1), hit('A two', openA2)])
+    fireEvent.change(input, { target: { value: 'alpha' } })
+    expect(await screen.findByText('A two')).toBeTruthy()
+    // Type `beta` (its key is cached) and arrow onto the stale `A two` at index 1,
+    // then press Enter while the list still shows the alpha rows.
+    fireEvent.change(input, { target: { value: 'beta' } })
+    fireEvent.keyDown(input, { key: 'ArrowDown' })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    // Rows swap to [B one, B two]; the row now at index 1 is `B two`, which the reader
+    // never selected. The latch must drop rather than open it.
+    expect(await screen.findByText('B two')).toBeTruthy()
+    await new Promise(r => setTimeout(r, 50))
+    expect(openB2).not.toHaveBeenCalled()
+    expect(openB1).not.toHaveBeenCalled()
+    expect(openA1).not.toHaveBeenCalled()
+    expect(openA2).not.toHaveBeenCalled()
+  })
+
   it('leaves the sessions failure a row, with none of the artifacts scope notice', async () => {
     // Guard on a deliberate boundary. The artifacts scope renders its failure through
     // ErrorNotice above the list, and it would have been easy to reach that surface for
@@ -603,6 +913,9 @@ describe('CommandBarOverlay rows', () => {
     // The column carries live state INSTEAD of a static kind word.
     expect(rows[0].textContent).not.toContain('Command')
     // Activating one switches to it, the same way every other surface opens a session.
+    // The row unwraps the dispatch (the composer is focused once the switch lands),
+    // so the mock answers with the thunk's shape.
+    resolvingDispatch()
     fireEvent.mouseDown(rows[0])
     expect(dispatch).toHaveBeenCalledWith({ type: 'switchSlot', key: 'slot-a', announceOnMissing: true })
   })
@@ -610,16 +923,93 @@ describe('CommandBarOverlay rows', () => {
   it('shows no attention section when nothing is waiting on the user', () => {
     // A section that is always present is a section the user learns to skip; the whole
     // value of this one is that its presence means something. A RUNNING session is not
-    // waiting on anyone, so it must not be lifted here either.
+    // waiting on anyone, so it must not be lifted here either — it belongs to the
+    // recent group below, which is a switch list and makes no claim on the reader.
     storeState.dashboard.slots = [
       { key: 'slot-c', title: 'Refactor the parser', running: true, messages: 9 },
       { key: 'slot-d', title: 'Idle thread', messages: 3 },
     ]
     mount()
     expect(screen.queryByText('Needs You')).toBeNull()
-    expect(screen.queryByText('Refactor the parser')).toBeNull()
-    // The commands are back at the top where they were.
-    expect(screen.getAllByRole('option')[0].textContent).toMatch(/New Session|Search Sessions|Toggle Theme/)
+    expect(screen.queryByText('Approve')).toBeNull()
+    expect(screen.queryByText('Answer')).toBeNull()
+    expect(rowByText('Refactor the parser')).toBeTruthy()
+  })
+
+  it('offers the sessions the reader was last in, newest first, above the commands', () => {
+    // The most common reason this surface is opened: get me back to what I was doing.
+    // It used to mean entering the sessions view and typing a name from memory, so the
+    // answer the store already held cost two steps and a recall.
+    storeState.dashboard.slots = [
+      { key: 'slot-old', title: 'Last week thread', messages: 3, last_activity_ts: 1_000 },
+      { key: 'slot-new', title: 'This morning thread', messages: 5, last_activity_ts: 3_000 },
+      { key: 'slot-mid', title: 'Yesterday thread', messages: 2, last_activity_ts: 2_000 },
+    ]
+    mount()
+    const rows = screen.getAllByRole('option')
+    expect(screen.getByText('Recent sessions')).toBeTruthy()
+    // Order is the claim — recency, not the alphabet and not the frecency store.
+    expect(rows[0].textContent).toContain('This morning thread')
+    expect(rows[1].textContent).toContain('Yesterday thread')
+    expect(rows[2].textContent).toContain('Last week thread')
+    // Ahead of the commands, which keep their own block underneath.
+    expect(rows[3].textContent).toMatch(/New Session|Search Sessions|Toggle Theme/)
+    // A session row carries no static kind word; its column is for live state.
+    expect(rows[0].textContent).not.toContain('Command')
+    // Activating one switches to it, the same way every other surface opens a session.
+    resolvingDispatch()
+    fireEvent.mouseDown(rows[0])
+    expect(dispatch).toHaveBeenCalledWith({
+      type: 'switchSlot',
+      key: 'slot-new',
+      announceOnMissing: true,
+    })
+  })
+
+  it('caps the recent group at three, leaving the rest to the sessions view', () => {
+    // The group's value is that it needs no reading. A fourth row buys a little more
+    // coverage and spends that property, and the whole corpus is one row below.
+    storeState.dashboard.slots = Array.from({ length: 7 }, (_, i) => ({
+      key: `slot-${i}`,
+      title: `Thread ${i}`,
+      messages: 2,
+      last_activity_ts: 1_000 - i,
+    }))
+    mount()
+    const titles = screen.getAllByRole('option').map(r => r.textContent ?? '')
+    expect(titles.filter(t => /Thread \d/.test(t))).toHaveLength(3)
+    expect(titles[0]).toContain('Thread 0')
+    expect(screen.queryByText('Thread 3')).toBeNull()
+    expect(rowByText('Search Sessions')).toBeTruthy()
+  })
+
+  it('keeps a session out of the recent group when it is already in the one above', () => {
+    // A session waiting on the reader is on screen with its pill. A second, quieter
+    // copy of it three rows down adds nothing and makes the page look longer than the
+    // number of sessions it is actually about.
+    storeState.dashboard.slots = [
+      { key: 'slot-a', title: 'Deploy the pricing service', pending_approval: true, messages: 4, last_activity_ts: 3_000 },
+      { key: 'slot-b', title: 'Idle thread', messages: 2, last_activity_ts: 1_000 },
+    ]
+    mount()
+    expect(screen.getAllByText('Deploy the pricing service')).toHaveLength(1)
+    expect(rowByText('Idle thread')).toBeTruthy()
+  })
+
+  it('leaves an empty untitled session out of the recent group', () => {
+    // Switching into a blank chat is what New Session is for, and one blank row is
+    // indistinguishable from another — so they would fill the group with rows that
+    // cannot be told apart.
+    storeState.dashboard.slots = [
+      { key: 'slot-blank', title: 'New Session…', messages: 0, last_activity_ts: 9_000 },
+      { key: 'slot-real', title: 'Real thread', messages: 4, last_activity_ts: 1_000 },
+    ]
+    mount()
+    const rows = screen.getAllByRole('option')
+    expect(rows[0].textContent).toContain('Real thread')
+    // The New Session COMMAND is still there; what is absent is a session row for the
+    // blank slot, which would be a second row reading the same way.
+    expect(screen.getAllByText(/New Session/)).toHaveLength(1)
   })
 
   it('always gives the typed text a way to reach an agent', async () => {
@@ -1603,5 +1993,135 @@ describe('CommandBarOverlay contributed commands', () => {
     await Promise.resolve()
     expect(dispatch).not.toHaveBeenCalledWith({ type: 'setPendingInput', text: expect.anything() })
     expect(navigate).not.toHaveBeenCalledWith('/chat?autoSend=1')
+  })
+})
+
+/**
+ * What the root list looks like once the reader has typed.
+ *
+ * Group order is the idle page's filing order — the product decision about what a
+ * launcher OPENS on. A query is a different question, so these pin the two halves:
+ * a typed query is one list ranked by match, and the section headers that name the
+ * blocks go with the blocks.
+ */
+describe('CommandBarOverlay root ordering under a query', () => {
+  beforeEach(() => {
+    dispatch.mockReset()
+    navigate.mockReset()
+    sessionSearch.mockReset()
+    sessionSearch.mockResolvedValue([])
+    recentsSearch.mockReset()
+    recentsSearch.mockResolvedValue([])
+    enterInsertOrNewSession.mockReset()
+    newSessionWithToken.mockReset()
+    storeState.dashboard = { slots: [], unreadSlots: [] }
+    storeState.chat = { slotStatusDetail: {}, activeSlot: null }
+    window.localStorage.clear()
+    vi.spyOn(console, 'warn').mockImplementation(() => {})
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  /** The app the reader is typing toward, as the apps API returns it. */
+  const DEV_FLEET = {
+    name: 'dev-fleet',
+    displayName: 'Dev Fleet',
+    enabled: true,
+    origin: 'registry',
+    manifest: { ui: { pages: [{ label: 'Dev Fleet', route: '/apps/dev-fleet' }] } },
+  }
+
+  /** A DIFFERENT app, contributing the command that used to outrank it. */
+  const PR_BULK_OPS = {
+    name: 'pr-bulk-ops',
+    displayName: 'PR Bulk Ops',
+    enabled: true,
+    origin: 'registry',
+    manifest: {
+      contributes: {
+        commands: [
+          {
+            id: 'approve-merge-all',
+            title: 'Approve and merge all PRs',
+            subtitle:
+              'Merge every ready pull request behind a link, approving first where allowed',
+            prompt: 'Approve and merge every ready pull request.',
+          },
+        ],
+      },
+    },
+  }
+
+  function mountWith(apps: unknown[]) {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    client.setQueryData(['apps'], apps)
+    render(
+      <QueryClientProvider client={client}>
+        <CommandBarOverlay open onClose={vi.fn()} />
+      </QueryClientProvider>,
+    )
+  }
+
+  /** The section headers the list is rendering, top to bottom. */
+  const renderedHeaders = () =>
+    Array.from(document.querySelectorAll('div.uppercase.tracking-wide.text-muted')).map(
+      el => el.textContent ?? '',
+    )
+
+  const rowIndex = (re: RegExp) =>
+    screen.getAllByRole('option').findIndex(el => re.test(el.textContent ?? ''))
+
+  it('puts the app the reader is spelling out above a command that only matched its subtitle', () => {
+    // The reported bug. `dev fle` scores the Dev Fleet app 216 and this contributed
+    // command 60 — the command's own title does not match at all, only its subtitle —
+    // and the command was still shown first, because `commands` files before `apps`.
+    mountWith([DEV_FLEET, PR_BULK_OPS])
+    fireEvent.change(screen.getByRole('combobox'), { target: { value: 'dev fle' } })
+    const app = rowIndex(/Dev Fleet/)
+    const command = rowIndex(/Approve and merge all PRs/)
+    // Both rows are on screen: the command still matches, it just ranks below.
+    expect(app).toBeGreaterThanOrEqual(0)
+    expect(command).toBeGreaterThan(app)
+  })
+
+  it('names a recent session in its own column once the headers are gone', () => {
+    // The headers are what named a recent row, and `kindLabel` deliberately returns
+    // nothing for one (its column belongs to live state). An IDLE session has no live
+    // state either, so under a query the row would be a glyph and a title while every
+    // row beside it still showed its word. The group's own name stands in there.
+    storeState.dashboard = {
+      slots: [{ key: 'chat-7', title: 'Fleet notes', messages: 4, running: false }],
+      unreadSlots: [],
+    }
+    mountWith([DEV_FLEET, PR_BULK_OPS])
+    const input = screen.getByRole('combobox')
+    // Idle page: the header above the row says it, so the column stays empty.
+    const idleRow = screen.getAllByRole('option').find(el => /Fleet notes/.test(el.textContent ?? ''))
+    expect(idleRow).toBeTruthy()
+    expect(renderedHeaders()).toContain('Recent sessions')
+    expect(idleRow?.textContent).not.toContain('Recent sessions')
+    // Under a query the header is gone and the row carries the name instead.
+    fireEvent.change(input, { target: { value: 'fleet' } })
+    expect(renderedHeaders()).toEqual([])
+    const queriedRow = screen
+      .getAllByRole('option')
+      .find(el => /Fleet notes/.test(el.textContent ?? ''))
+    expect(queriedRow).toBeTruthy()
+    expect(queriedRow?.textContent).toContain('Recent sessions')
+  })
+
+  it('drops the group headers while a query ranks the list, and restores them when it clears', () => {
+    mountWith([DEV_FLEET, PR_BULK_OPS])
+    const input = screen.getByRole('combobox')
+    expect(renderedHeaders()).toContain('Commands')
+    fireEvent.change(input, { target: { value: 'dev fle' } })
+    // One ranked list: a group can now appear, be left and appear again, so a header
+    // per transition would print the same word twice over rows it does not describe.
+    expect(renderedHeaders()).toEqual([])
+    // The headers belong to the idle page, so clearing the query brings them back.
+    fireEvent.change(input, { target: { value: '' } })
+    expect(renderedHeaders()).toContain('Commands')
   })
 })

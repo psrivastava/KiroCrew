@@ -1,23 +1,38 @@
 # Dashboard iframe hosts — which one to use
 
-The dashboard embeds third-party content in **four** different iframe hosts. They look interchangeable and are not: each one picked a different `sandbox` for a different trust level, and two of them make *opposite* assumptions about whether the frame is allowed to talk back.
+This note covers five core interactive iframe hosts. The dashboard also has
+static renderers and app-specific frames, so this list is not exhaustive. These
+five look interchangeable and are not: each has a different sandbox posture
+(including no `sandbox` on remote-instance panes), and two make *opposite*
+assumptions about whether the frame may talk back.
 
 Pick a host from this table. **Do not widen an existing host's sandbox to make it fit a new use** — that is the failure mode this document exists to prevent.
 
 | Host | `sandbox` | Content it is for | Frame → host messages |
 |---|---|---|---|
-| `WebPreviewPanel.tsx` (the **Browser** tab) | `allow-scripts allow-same-origin allow-forms allow-popups allow-modals allow-downloads` | A URL selected in the preview panel | none |
-| `WidgetFrame.tsx` (`<mcwidget>`, artifacts) | `allow-scripts allow-popups allow-popups-to-escape-sandbox` | **LLM-emitted HTML** | **Defended against.** A malicious emitted `<script>` can `postMessage`, so the host treats inbound messages as hostile |
+| `WebPreviewPanel.tsx` (the **Browser** tab) | `allow-scripts allow-same-origin allow-forms allow-popups allow-modals allow-downloads` | An explicitly loaded loopback preview or the loopback Playwright CLI dashboard; Electron browsing can use a native Chromium view instead. The relayed browser view, served on the dashboard's own origin, uses `VIEW_SANDBOX` instead: the same flags without `allow-same-origin` | none |
+| `WidgetFrame.tsx` (`<mcwidget>`, artifacts) | `allow-scripts allow-popups allow-popups-to-escape-sandbox` | **LLM-emitted HTML**. `buildSrcdoc` injects a click-time shim that gives bare absolute `http(s)` links `target=_blank rel=noopener noreferrer`; hosts whose sandbox withholds popups (`CrewWebview.tsx`, the mochi `WidgetFrame.tsx`) pass `rewriteBareLinks: false` | **Defended against.** A malicious emitted `<script>` can `postMessage`, so the host treats inbound messages as hostile |
 | `McpAppFrame.tsx` (the **App** tab) | `allow-scripts allow-forms` | **MCP-server-supplied HTML** (`srcDoc`) | **Required and trusted-by-capability.** SEP-1865 JSON-RPC bridge; the host holds a `callback_secret` |
-| `InstancesViewport.tsx` | (remote Kiro Crew instances) | another instance's dashboard | n/a |
+| `InstancesViewport.tsx` | none | another instance's dashboard | n/a |
+| `TaskDashboardFrame.tsx` (**Dynamic Dashboard**) | empty sandbox | Sanitized task-specific HTML/CSS/SVG artifacts; no model scripts or outbound links | none; answers and approvals use separate native controls |
 
 ## The two axes
 
 Trust level and connectedness are **independent**, which is why no host can be reused for another's job:
 
-- `WebPreviewPanel` is the **most** privileged (`allow-same-origin` — it can reach dashboard origin) because it loads a URL selected in the preview panel. Never put server-supplied or model-supplied HTML in it.
+- `WebPreviewPanel` has the most permissive iframe sandbox. `allow-same-origin`
+  preserves the loaded page's real origin; it does not bypass the browser's
+  same-origin policy. The host isolates a preview target that would otherwise
+  match the dashboard origin, and external browsing uses the native or
+  Playwright-dashboard transport instead. Never put server-supplied or
+  model-supplied `srcDoc` HTML in this host.
 - `McpAppFrame` is the **least** privileged (no `allow-same-origin`, no popups) *and* the **most** connected. It is the only host with a live bidirectional bridge, and it is null-origin precisely because it must be. Note this is a deliberate divergence from SEP-1865, which mandates a two-frame *sandbox proxy* whose outer frame carries `allow-same-origin`; the trade and what it costs an app are documented in [MCP Apps](../../src/kiro_crew/docs/mcp-apps.md#deviations-from-sep-1865). Do not "fix" the sandbox attribute to match the spec without reading that section.
 - `WidgetFrame` is closest to `McpAppFrame` on content, but is built on the opposite bridge assumption. Reusing it for an MCP App would mean adopting a host that is designed to distrust exactly the messages the App protocol needs.
+- `InstancesViewport` deliberately has no `sandbox` attribute: it embeds an
+  authenticated remote Kiro Crew dashboard rather than emitted `srcDoc`.
+  Browser origin isolation and the instance connection boundary, not iframe
+  sandbox flags, separate it from the local dashboard. Do not reuse that
+  posture for untrusted HTML.
 
 ## The rule that constrains all of them: an iframe cannot be moved
 
@@ -58,4 +73,4 @@ Tab kinds live in `website/src/hooks/usePanelTabs.ts` (`ViewKind` / `TabKind`), 
 - **Tab switch is safe only for non-category bodies.** Terminal, document, artifact, folder, and App bodies are kept mounted and hidden via `display` in `SidePanel.tsx`, so switching those tabs does not tear down a frame. Category views are unmounted when inactive.
 - **Category views unmount on switch** (`if (!isActive) return null`), so a stateful frame must not be registered as a category view.
 
-Auto-opening a tab is a solved pattern: dispatch `openActivityPanel()` then call `tabsCtlRef.current.openView(<kind>)` — see the web-preview path in `website/src/pages/ChatPage.tsx`.
+Auto-opening a tab is a solved pattern: dispatch `openActivityPanel()` then call `tabsCtlRef.current.openView(<kind>)` — see the web-preview path in `website/src/pages/chat/page/eventBridges.ts` (`useChatEventBridges`).

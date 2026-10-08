@@ -43,7 +43,8 @@ _TO_DICT_KEYS = (
     "artifact",
     "messages",
     "running",
-    "orchestrating",
+    "compacting",
+    "stop_declined",
     "queue_depth",
     "stopping",
     "pending_approval",
@@ -63,9 +64,11 @@ _TO_DICT_KEYS = (
     "todo",
     "mcp_report",
     "has_options",
+    "options_ts",
     "options",
     "prompt_preview",
     "trust",
+    "trust_scope",
     "trust_reads",
     "trusted_patterns_count",
     "slack_linked",
@@ -83,9 +86,11 @@ _TO_DICT_KEYS = (
     "memory_mode",
     "forked_from",
     "linked_session_key",
+    "history_key",
     "app",
     "origin",
     "created_by",
+    "lineage_minted",
 )
 
 

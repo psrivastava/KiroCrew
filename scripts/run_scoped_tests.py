@@ -3,7 +3,7 @@
 
 What this buys
 --------------
-The ``prepare-pr`` loop runs its gate up to ten times per PR, and the full local
+The ``kirocrew-prepare-pr`` loop runs its gate up to ten times per PR, and the full local
 suites are enormous: 62,108 collected backend tests (collection alone takes ~100s
 before a single test runs) and ~1,444 frontend spec files. CI runs the touched
 surface's full suite on ``refs/pull/<N>/merge`` regardless of what ran here, and
@@ -254,8 +254,18 @@ def _tree_files(root: Path, rel_roots: tuple[str, ...], name_re: re.Pattern[str]
     return tuple(sorted(out))
 
 
-@functools.lru_cache(maxsize=None)
 def _read_text(root: Path, rel: str) -> str:
+    """One test file's text, read for the scan that asked and then dropped.
+
+    Deliberately NOT memoised, unlike `_tree_files` above. `_referencing_tests`
+    reads each file exactly once per `related_targets` call, so a cache buys the
+    gate nothing; what it cost was the whole test tree resident for the life of
+    the process -- ~3,200 files, ~100 MB of `str` -- for a 0.4 s re-read. In the
+    gate process that is wasted memory; imported into a pytest worker (as
+    `test_local_gate.py` does) it was a +190 MiB high-water mark that outlived
+    the test. The self-test's dozen `related_targets` calls pay the re-read; the
+    regex scan they also repeat costs more than the read does.
+    """
     try:
         return (root / rel).read_text(encoding="utf-8", errors="replace")
     except OSError:
@@ -1107,9 +1117,9 @@ def _self_test() -> int:
     check("python tokens carry the stem", "session" in py_tokens)
     check("python tokens carry the dotted path", "kiro_crew.session" in py_tokens)
     check("python tokens carry the repo path", "src/kiro_crew/session.py" in py_tokens)
-    md_tokens = reference_tokens("src/kiro_crew/builtin_skills/kirocrew-dev/prepare-pr/SKILL.md")
+    md_tokens = reference_tokens("src/kiro_crew/builtin_skills/kirocrew-dev/kirocrew-prepare-pr/SKILL.md")
     check("a non-python file does not contribute a bare basename", "SKILL.md" not in md_tokens)
-    check("a non-python file contributes its last two components", "prepare-pr/SKILL.md" in md_tokens)
+    check("a non-python file contributes its last two components", "kirocrew-prepare-pr/SKILL.md" in md_tokens)
     check(
         "a bare stem is word-bounded, not a substring",
         not _reference_matcher({"session"}).search("sessions_view"),

@@ -38,6 +38,7 @@ from kiro_crew.autonudge import (
 )
 from kiro_crew.autonudge_selfarm import forget_self_arm, record_self_arm
 from kiro_crew.config.loader import workspace_dir_for
+from kiro_crew.monitoring.limits import validate_runtime_secs
 from kiro_crew.monitoring.models import (
     MAX_MONITOR_WAKE_INSTRUCTIONS_CHARS,
     MONITOR_STATE_VERSION,
@@ -203,6 +204,13 @@ async def authorize_and_update_monitor(
         error = str(exc)
         await _audit("denied", error)
         return None, error, 409
+    except ValueError as exc:
+        # The store's own bounds (the runtime ceiling checked against a budget
+        # the patch supplies, an unknown budget field) are a client error with
+        # the refusing range in its text, matching the legacy update path.
+        error = str(exc)
+        await _audit("denied", error)
+        return None, error, 400
     if loop is None:
         error = "structured monitor not found or already terminal"
         await _audit("denied", error)
@@ -424,13 +432,6 @@ def resolve_stop_sentinel(slot_key: str, workspace: str = "default") -> str:
     return str(ws_dir / f".stop-{safe_key}")
 
 
-# Wall-clock budget ceiling (7 days), the single authoritative bound. The
-# MONITOR_*_SCHEMA FieldSpecs mirror it for the MCP tools; enforcing it here
-# too covers the REST and workflow paths, which do not pass through those
-# schemas — without this bound REST accepts 604801 unchanged.
-MAX_RUNTIME_SECS_CEILING = 604800
-
-
 def normalize_banner(
     banner: Any, *, absent_ok: bool, truncate: bool = False
 ) -> tuple[str, str | None]:
@@ -579,13 +580,26 @@ async def authorize_and_update_nudge(
     idle_secs: Any = None,
     max_cycles: Any = None,
     active: Any = None,
+    fresh_run: bool = False,
     max_runtime_secs: Any = None,
     banner: Any = None,
+    judge: Any = None,
+    #: The subject to start observing, or ``None`` to leave the loop's own alone. There is
+    #: no clear spelling, for the reason the tool surface gives: a loop that silently lost
+    #: its watch through a metadata edit would look armed and observe nothing.
+    watch: Any = None,
     expect_fingerprint: Any = None,
     source: str,
     caller: str = "",
 ) -> tuple[Any | None, str | None, int]:
     """Validate + audit + apply a loop update; return ``(loop, error, status)``.
+
+    ``fresh_run`` is the caller's statement that a revival here is the user's
+    own resume (the dashboard route passes it); the service then resets only the
+    counter behind a spent bound -- a spent cycle cap zeroes the count, a spent
+    time budget re-anchors the clock -- and keeps the rest, so a paused loop
+    resumes from its breakpoint. The ``monitor_update`` applier leaves it unset,
+    so an agent raising its own bound buys the increment it asked for.
 
     The update-side twin of :func:`authorize_and_add_nudge`, and for the same
     reason it lives here rather than in the HTTP handler: ``message`` is the
@@ -629,7 +643,7 @@ async def authorize_and_update_nudge(
 
     if svc is None:
         _audit("error", "autonudge disabled")
-        return None, "auto-nudge disabled (KIROCREW_AUTONUDGE not set)", 503
+        return None, "auto-nudge disabled (KIROCREW_AUTONUDGE is 0/false/no)", 503
     if not loop_id:
         return _deny("loop_id required", 400)
     # ONE read serving BOTH consumers below. Called directly, NOT behind a ``hasattr``
@@ -717,13 +731,13 @@ async def authorize_and_update_nudge(
                 return _deny(f"{_name} must be a whole number", 400)
         idle_secs = None if idle_secs is None else int(idle_secs)
         max_cycles = None if max_cycles is None else int(max_cycles)
-        max_runtime_secs = None if max_runtime_secs is None else int(max_runtime_secs)
     except (TypeError, ValueError, OverflowError):
         return _deny("idle_secs, max_cycles and max_runtime_secs must be integers", 400)
-    if max_runtime_secs is not None and not (0 <= max_runtime_secs <= MAX_RUNTIME_SECS_CEILING):
-        return _deny(
-            f"max_runtime_secs must be between 0 and {MAX_RUNTIME_SECS_CEILING} (7 days)", 400
-        )
+    if max_runtime_secs is not None:
+        try:
+            max_runtime_secs = validate_runtime_secs(max_runtime_secs, allow_unbounded=True)
+        except ValueError as exc:
+            return _deny(str(exc), 400)
     # ``active`` must be a real boolean. bool("false") is True, so accepting a
     # JSON string would turn an explicit pause request into a RESUME — the
     # opposite of what the caller asked for on a loop that runs tools
@@ -749,6 +763,7 @@ async def authorize_and_update_nudge(
                         ("max_runtime_secs", max_runtime_secs),
                         ("active", active),
                         ("banner", banner),
+                        ("watch", watch),
                     )
                     if v is not None
                 ),
@@ -768,8 +783,11 @@ async def authorize_and_update_nudge(
             idle_secs=idle_secs,
             max_cycles=max_cycles,
             active=active,
+            fresh_run=fresh_run,
             max_runtime_secs=max_runtime_secs,
             banner=banner,
+            judge=judge,
+            watch=watch,
             expect_fingerprint=expect_fingerprint,
         )
     except AutoNudgeStaleBaseline:
@@ -782,6 +800,8 @@ async def authorize_and_update_nudge(
             "and choose.",
             409,
         )
+    except ValueError as exc:
+        return _deny(str(exc), 400)
     except Exception as exc:  # noqa: BLE001 - audit the failure, then propagate
         _audit("error", f"svc.update failed: {type(exc).__name__}")
         raise
@@ -809,6 +829,17 @@ async def authorize_and_add_nudge(
     # a message that merely mentions one PR throttles those and can deactivate them
     # outright. The monitor_start surfaces pass ``gate=True`` themselves.
     gate: bool = False,
+    #: The wake judge's brief, passed through to the loop record unchanged. This
+    #: chokepoint owns the banner cap and both redaction passes, but not this: the
+    #: brief is bounded by ``validate_judge_spec`` at the tool surface the owner
+    #: typed it at, which is where a refusal can name a field they can fix.
+    judge: dict | None = None,
+    #: The subject to observe, for the one subject an instruction cannot name. Passed
+    #: straight through to the service, which owns both what it means and the fold that
+    #: makes a named watch gate on its own. Bounded at the tool surface by the schema's
+    #: allowed set, for the reason the judge brief is bounded there: a refusal should name
+    #: a field the caller can fix.
+    watch: str = "",
     monitor: MonitorState | None = None,
     replace_existing: bool = True,
     # Opt-in for the session-directive re-arm path ONLY: with
@@ -830,6 +861,9 @@ async def authorize_and_add_nudge(
     initiator_slot_key: str = "",
     creation_surface: MonitorCreationSurface = MonitorCreationSurface.DASHBOARD,
     grant_owner_provider_credentials: bool = False,
+    #: Arm the gateway's default conductor patrol (``NudgeLoop.default_patrol``):
+    #: set by ``conductor_patrol`` alone, and only on a prompt loop.
+    default_patrol: bool = False,
 ) -> tuple[Any | None, str | None, int]:
     """Validate + authorize + arm a nudge loop; return ``(loop, error, status)``.
 
@@ -890,7 +924,7 @@ async def authorize_and_add_nudge(
 
     if svc is None:
         _audit("error", "autonudge disabled")
-        return None, "auto-nudge disabled (KIROCREW_AUTONUDGE not set)", 503
+        return None, "auto-nudge disabled (KIROCREW_AUTONUDGE is 0/false/no)", 503
     monitor_wake_instructions = ""
     if monitor is not None:
         monitor_wake_instructions = monitor.wake_instructions
@@ -910,13 +944,9 @@ async def authorize_and_add_nudge(
     if not slot_key or not message:
         return _deny("session_key (or slot_key) and message required", 400)
     try:
-        _budget = int(max_runtime_secs)
-    except (TypeError, ValueError, OverflowError):
-        return _deny("max_runtime_secs must be an integer", 400)
-    if not (0 <= _budget <= MAX_RUNTIME_SECS_CEILING):
-        return _deny(
-            f"max_runtime_secs must be between 0 and {MAX_RUNTIME_SECS_CEILING} (7 days)", 400
-        )
+        max_runtime_secs = validate_runtime_secs(max_runtime_secs, allow_unbounded=True)
+    except ValueError as exc:
+        return _deny(str(exc), 400)
     # Decidable from the ARGUMENTS alone (slot_key is in hand here), so it sits
     # with the other cheap shape guards rather than beside the banner
     # normalization further down: reaching that point first requires passing
@@ -1073,7 +1103,19 @@ async def authorize_and_add_nudge(
         get_by_slot = getattr(svc, "get_by_slot", None)
         existing = get_by_slot(slot_key) if callable(get_by_slot) else None
         existing_monitor = getattr(existing, "monitor", None)
-        if isinstance(existing_monitor, MonitorState) and existing_monitor.wake_in_flight:
+        # The service lets a non-default arm replace an ACTIVE default patrol even
+        # mid-wake (``mutations._add_unserialized``); refusing here first would
+        # turn that replacement back into a 409.
+        displaces_default = bool(
+            getattr(existing, "default_patrol", False) is True
+            and getattr(existing, "active", False)
+            and not default_patrol
+        )
+        if (
+            isinstance(existing_monitor, MonitorState)
+            and existing_monitor.wake_in_flight
+            and not displaces_default
+        ):
             return _deny(
                 "existing monitor cannot be replaced while a wake is in flight",
                 409,
@@ -1259,6 +1301,15 @@ async def authorize_and_add_nudge(
             }
             if not replace_existing:
                 add_kwargs["replace_existing"] = False
+            if judge:
+                # Only when there IS one, so a caller that armed no judge produces the
+                # same call it produced before this field existed.
+                add_kwargs["judge"] = dict(judge)
+            if watch:
+                # Conditional for the reason ``judge`` is: the contract tests compare
+                # this dict by equality, so a caller that named no watch must produce
+                # the kwargs it produced before the field existed.
+                add_kwargs["watch"] = watch
             if replace_stopped:
                 add_kwargs["replace_stopped"] = True
             if self_armed:
@@ -1267,6 +1318,10 @@ async def authorize_and_add_nudge(
                 add_kwargs["self_armed"] = True
             if reserved_loop_id is not None:
                 add_kwargs["loop_id"] = reserved_loop_id
+            if default_patrol:
+                # Conditional, like ``self_armed``: the contract tests compare this
+                # dict by equality, so every other caller's kwargs stay as they were.
+                add_kwargs["default_patrol"] = True
             loop = await svc.add(
                 **add_kwargs,
             )

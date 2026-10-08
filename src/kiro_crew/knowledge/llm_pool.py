@@ -4,6 +4,7 @@ Provider-agnostic bounded pool of long-lived workers (CC or ACP).
 Knowledge extraction and URL fetch use separate instances of this pool so their
 workload policies and session state remain isolated.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -13,18 +14,32 @@ import os
 import shutil
 import time
 from abc import ABC, abstractmethod
-from typing import Optional
+from typing import Any, Optional
 
 from kiro_crew import platform_compat
-from kiro_crew.agent_sdk.backends import effort_config_option_id
+from kiro_crew.agent_sdk.backends import (
+    ACP_BACKEND_KIRO,
+    POLICY_ID_BY_BACKEND,
+    Routing,
+    effort_config_option_id,
+    effort_config_option_value,
+    resolve_selected_backend,
+    routing_for,
+)
 from kiro_crew.agent_sdk.capabilities import capabilities_for
 from kiro_crew.agent_sdk.provider_identity import is_claude_code
 from kiro_crew.config import live
+from kiro_crew.config.loader import read_config_text
 from kiro_crew.config.paths import config_dir
-from kiro_crew.effort import EFFORT_LEVELS, is_valid_effort
+from kiro_crew.effort import (
+    EFFORT_LEVELS,
+    is_valid_effort,
+)
+from kiro_crew.json_line import parse_json_object_line
 from kiro_crew.sandbox import (
     cgroup_scope_argv,
     create_subprocess_limited,
+    scrub_agent_subprocess_env,
     wrap_argv,
     wrap_argv_async,
 )
@@ -45,13 +60,19 @@ except ImportError:
 try:
     from kiro_crew.session_pid import register_protected_pid, unregister_protected_pid
 except Exception:  # pragma: no cover - standalone / test fallback
+
     def register_protected_pid(pid: int) -> None:  # type: ignore[misc]
         return None
 
     def unregister_protected_pid(pid: int) -> None:  # type: ignore[misc]
         return None
 
+
 logger = logging.getLogger(__name__)
+
+# Backends ``_get_acp_backend`` already warned about; workers respawn often, so
+# the fallback is logged once per backend per process.
+_WARNED_UNSAFE_BACKENDS: set = set()
 
 DEFAULT_POOL_SIZE = 3
 DEFAULT_TIMEOUT = 60.0
@@ -103,7 +124,7 @@ def _read_config() -> dict:
     try:
         config_path = config_dir() / "config.json"
         if config_path.exists():
-            data = json.loads(config_path.read_text())
+            data = json.loads(read_config_text(config_path))
             if isinstance(data, dict):
                 # Coerce nested sections to dicts so the pure parsers' chained
                 # ``.get(...).get(...)`` never hits a hand-edited leaf value
@@ -160,6 +181,51 @@ def _get_sandbox_mode(config: Optional[dict] = None) -> str:
     return "auto"  # present but malformed -> fail secure, never silently unsandboxed
 
 
+def _get_acp_backend(config: Optional[dict] = None) -> str:
+    """Configured ``agent.acp_backend``, through the one selection gate (H3),
+    then narrowed to a backend this pool's zero-tool workers can trust.
+
+    This pool's workers run a spec carrying ``"tools": []``, meant as a total
+    ban, and construct their own ``AcpClient`` directly (not through a provider
+    that already routes by backend). Two capability questions decide whether a
+    resolved backend is safe to hand it, asked rather than enumerated so a
+    backend that later earns both answers needs no change here:
+    ``SessionCapabilities.honors_zero_tool_ban`` (kiro-cli/KAS natively, plus
+    opencode/goose via ``AcpClient._deny_zero_tools``; not claude, whose routing
+    is unenforced so an inherited pre-approval can skip the permission request;
+    not codex, whose sessions run on ``AcpRuntime`` with no such refusal; not
+    pi/deepseek, which have no mirror at all) and ``.acp_client_spawnable`` (not
+    kas/codex, which need ``AcpRuntime`` and have no arm in ``AcpClient._spawn``).
+
+    The pool reads raw ``config.json``, which never passed the loader's
+    normalizer, so an unselectable or malformed value degrades to Kiro here --
+    and so does a resolved value that fails either capability check above.
+    """
+    data = _read_config() if config is None else config
+    resolved = resolve_selected_backend(_section(data, "agent").get("acp_backend"))
+    if not capabilities_for(resolved).honors_zero_tool_ban:
+        if resolved not in _WARNED_UNSAFE_BACKENDS:
+            _WARNED_UNSAFE_BACKENDS.add(resolved)
+            logger.warning(
+                "Knowledge pool: configured acp_backend=%s does not honor a zero-tool "
+                "spec (honors_zero_tool_ban is False); falling back to %s",
+                resolved,
+                ACP_BACKEND_KIRO,
+            )
+        return ACP_BACKEND_KIRO
+    if not capabilities_for(resolved).acp_client_spawnable:
+        if resolved not in _WARNED_UNSAFE_BACKENDS:
+            _WARNED_UNSAFE_BACKENDS.add(resolved)
+            logger.warning(
+                "Knowledge pool: configured acp_backend=%s is not acp_client_spawnable; "
+                "falling back to %s",
+                resolved,
+                ACP_BACKEND_KIRO,
+            )
+        return ACP_BACKEND_KIRO
+    return resolved
+
+
 def _get_idle_ttl(config: Optional[dict] = None) -> float:
     """Seconds the pool may sit fully idle before scaling to zero.
 
@@ -168,14 +234,48 @@ def _get_idle_ttl(config: Optional[dict] = None) -> float:
     value falls back to the default rather than silently disabling the reaper.
     """
     data = _read_config() if config is None else config
-    value = _section(data, "knowledge").get(
-        "pool_idle_ttl_secs", DEFAULT_IDLE_TTL_SECS
-    )
+    value = _section(data, "knowledge").get("pool_idle_ttl_secs", DEFAULT_IDLE_TTL_SECS)
     if isinstance(value, bool):
         return DEFAULT_IDLE_TTL_SECS
     if isinstance(value, (int, float)) and value >= 0:
         return float(value)
     return DEFAULT_IDLE_TTL_SECS
+
+
+def _get_workload_effort(
+    config: dict,
+    key: str,
+    fallback: str,
+) -> Optional[str]:
+    """Resolve a pool's effort: explicit key → fallback.
+
+    Resolution chain for the extraction pool (``key`` is
+    ``"extraction_effort"``):
+
+    1. the explicit ``knowledge.<key>`` pin — an operator's deliberate choice;
+    2. *fallback* — ``DEFAULT_EXTRACTION_EFFORT`` (the pre-config hard
+       default, kept as last resort); pass ``""`` to end on the provider/model
+       default instead.
+
+    The chain deliberately has NO role-policy leg: extraction effort is a
+    Knowledge policy, independent of ``agent.role_efforts.background`` (which
+    controls other background workers) — an unset key keeps the historical
+    always-``high`` behavior rather than silently following a role change.
+    A key present but invalid or typed-wrong also lands on *fallback* (the
+    pre-config default), and logs — nothing silently changes cost.
+    Pure: never raises, works on a raw (possibly hand-edited) config dict.
+    """
+    section = _section(config, "knowledge")
+    raw = section.get(key)
+    if isinstance(raw, str) and is_valid_effort(raw):
+        return raw
+    if raw not in (None, ""):
+        logger.warning(
+            "Ignoring invalid knowledge.%s: %r; using the default instead",
+            key,
+            raw,
+        )
+    return fallback if (isinstance(fallback, str) and is_valid_effort(fallback)) else None
 
 
 def _get_pool_size(config: Optional[dict] = None) -> int:
@@ -184,9 +284,7 @@ def _get_pool_size(config: Optional[dict] = None) -> int:
     Reads ``knowledge.extraction_pool_size`` (default 3, clamped 1–10).
     """
     data = _read_config() if config is None else config
-    value = _section(data, "knowledge").get(
-        "extraction_pool_size", DEFAULT_POOL_SIZE
-    )
+    value = _section(data, "knowledge").get("extraction_pool_size", DEFAULT_POOL_SIZE)
     if isinstance(value, bool):
         return DEFAULT_POOL_SIZE
     if isinstance(value, int) and 1 <= value <= 10:
@@ -207,8 +305,7 @@ def _normalize_effort(value: object) -> Optional[str]:
 def _select_effort_level(requested: str, supported: list[str]) -> Optional[str]:
     """Select the highest advertised effort no higher than ``requested``."""
     supported_levels = {
-        level for level in supported
-        if isinstance(level, str) and is_valid_effort(level)
+        level for level in supported if isinstance(level, str) and is_valid_effort(level)
     }
     if not supported_levels:
         # An advertised option without a usable level is treated like a lazy
@@ -216,7 +313,8 @@ def _select_effort_level(requested: str, supported: list[str]) -> Optional[str]:
         return requested
     requested_index = EFFORT_LEVELS.index(requested)
     eligible = [
-        level for level in EFFORT_LEVELS
+        level
+        for level in EFFORT_LEVELS
         if level in supported_levels and EFFORT_LEVELS.index(level) <= requested_index
     ]
     return eligible[-1] if eligible else None
@@ -273,11 +371,13 @@ class AcpWorker(Worker):
         *,
         sandbox_mode: Optional[str] = None,
         effort: Optional[str] = None,
+        acp_backend: Optional[str] = None,
     ) -> None:
         self._client: Optional[AcpClient] = None
         # Pre-resolved by the caller (off the event loop). ``None`` -> resolve
         # lazily in ``start`` (direct construction outside the pool / tests).
         self._sandbox_mode = sandbox_mode
+        self._acp_backend = acp_backend
         self._effort = _normalize_effort(effort)
         self._effective_effort: Optional[str] = None
         # PID currently shielded from the gateway orphan sweep (see module note).
@@ -308,12 +408,75 @@ class AcpWorker(Worker):
             if self._sandbox_mode is not None
             else await asyncio.to_thread(_get_sandbox_mode)
         )
-        logger.info("AcpWorker: starting with agent=%s", AGENT_NAME)
-        self._client = AcpClient(
-            agent=AGENT_NAME, sandbox_mode=sandbox_mode, audit_source="subagent"
+        acp_backend = (
+            self._acp_backend
+            if self._acp_backend is not None
+            else await asyncio.to_thread(_get_acp_backend)
         )
-        self._effective_effort = None
-        await self._client.ensure_ready()
+        logger.info(
+            "AcpWorker: starting with agent=%s backend=%s",
+            AGENT_NAME,
+            POLICY_ID_BY_BACKEND.get(acp_backend, acp_backend),
+        )
+        self._client, authored_before_spawn = await self._spawn_client(acp_backend, sandbox_mode)
+        # A zero-tool spec must be CONFIRMED, not assumed. A backend that is not
+        # routed through Routing.AGENT_SPEC relies on the mirror's consumed
+        # projection (spec_zero_tools). If the spec was missing, malformed, or
+        # shadowed by a project-level spec, that signal is false and every native
+        # tool request would auto-approve, so this worker restarts on Kiro before
+        # any prompt is sent.
+        if not (routing_for(acp_backend) is Routing.AGENT_SPEC or self._client.spec_zero_tools):
+            logger.warning(
+                "AcpWorker: backend=%s session did not confirm the zero-tool spec "
+                '("tools": [] missing, malformed, or shadowed); restarting worker on %s',
+                POLICY_ID_BY_BACKEND.get(acp_backend, acp_backend),
+                ACP_BACKEND_KIRO,
+            )
+            try:
+                await self._client.shutdown()
+            except Exception:
+                logger.debug("AcpWorker: unsafe-backend client shutdown failed", exc_info=True)
+            acp_backend = ACP_BACKEND_KIRO
+            self._acp_backend = ACP_BACKEND_KIRO
+            self._client, authored_before_spawn = await self._spawn_client(
+                acp_backend, sandbox_mode
+            )
+        # A backend routed through Routing.AGENT_SPEC (kiro) enforces "tools": []
+        # natively but has no mirror, so spec_zero_tools cannot confirm it. The
+        # harness resolves --agent against <cwd>/.kiro/agents before the global
+        # directory, and this pool's cwd is a workspace under the data home, so a
+        # project-level spec of the same name that carries tools would shadow the
+        # installed one and auto-approve them for untrusted document text. The
+        # projected view the harness consumed through --agent is the authority
+        # when one exists: it is prepared before the spawn and never re-read, so a
+        # later spec edit cannot change the answer. Without one (the rollback
+        # switch, or an alias that could not be taken) the harness loads the named
+        # spec itself, so the authored spec is read before the spawn and again
+        # after start, and both reads must declare an empty list. A worker that
+        # cannot confirm the ban does not start: Kiro is the last fallback.
+        if routing_for(acp_backend) is Routing.AGENT_SPEC and not (
+            await asyncio.to_thread(
+                self._client.effective_spec_declares_zero_tools,
+                authored_before_spawn=authored_before_spawn,
+            )
+        ):
+            logger.warning(
+                'AcpWorker: agent=%s backend=%s spec does not declare "tools": []; '
+                "refusing to start the worker",
+                AGENT_NAME,
+                POLICY_ID_BY_BACKEND.get(acp_backend, acp_backend),
+            )
+            try:
+                await self._client.shutdown()
+            except Exception:
+                logger.debug("AcpWorker: unconfirmed-spec client shutdown failed", exc_info=True)
+            self._client = None
+            raise RuntimeError(
+                f"knowledge agent {AGENT_NAME!r} could not be confirmed to declare a "
+                "zero-tool spec (a project-level spec may shadow the installed one, "
+                "or the spec could not be read); refusing to run the knowledge pool "
+                "without a confirmed tool ban"
+            )
         await self._apply_effort()
         # Shield the live worker PID from the periodic orphan sweep for as long
         # as it runs. Paired with unregister in shutdown() and on respawn above.
@@ -323,24 +486,57 @@ class AcpWorker(Worker):
             register_protected_pid(pid)
         else:
             self._protected_pid = None
-        logger.info("AcpWorker: ready (agent=%s, pid=%s)", AGENT_NAME, getattr(self._client, '_pid', 'unknown'))
+        logger.info(
+            "AcpWorker: ready (agent=%s, pid=%s)",
+            AGENT_NAME,
+            getattr(self._client, "_pid", "unknown"),
+        )
+
+    async def _spawn_client(self, acp_backend: str, sandbox_mode: str) -> tuple[AcpClient, bool]:
+        """Build the client for *acp_backend*, bring it up, and return it with the pre-spawn read.
+
+        The client is stored as ``self._client`` before ``ensure_ready`` so a failed
+        start still leaves it reachable. For a backend routed through
+        ``Routing.AGENT_SPEC`` the authored spec is read BEFORE this client's
+        ``ensure_ready`` spawns the harness, and the result is returned so the
+        post-start confirmation can require both reads to agree when no projection
+        was prepared. Any other backend returns False.
+        """
+        client = AcpClient(
+            agent=AGENT_NAME,
+            sandbox_mode=sandbox_mode,
+            acp_backend=acp_backend,
+            audit_source="subagent",
+        )
+        self._client = client
+        self._effective_effort = None
+        authored_before_spawn = False
+        if routing_for(acp_backend) is Routing.AGENT_SPEC:
+            authored_before_spawn = await asyncio.to_thread(
+                client.authored_spec_declares_zero_tools
+            )
+        await client.ensure_ready()
+        return client, authored_before_spawn
 
     async def _apply_effort(self) -> None:
         """Apply the requested effort without breaking provider-default fallback.
 
-        Which channel carries the change is a CAPABILITY question --
-        ``SessionCapabilities.effort_via_config_option`` -- asked off the client's
-        own public ``backend`` string. It replaced a read of the private
-        ``AcpClient._is_claude``, which was both the sharpest boundary violation in
-        the tree (application code reaching an underscore attribute of the ACP
-        client) and an identity branch: it sent every non-claude harness down the
-        ``/effort`` slash command, including one that has no such command.
+        Which channel carries the change is a CAPABILITY question, asked off the
+        client's own public ``backend`` string rather than an identity. Three
+        outcomes follow: ``SessionCapabilities.effort_via_config_option`` sends
+        ``session/set_config_option``, ``SessionCapabilities.effort_via_slash_command``
+        sends the kiro-native ``/effort`` command, and a backend answering neither has
+        no channel for the change, so the worker logs that the provider default
+        applies and sends nothing.
 
-        This pool constructs its client with the DEFAULT backend and never passes
-        ``acp_backend``, so the answer here is the kiro one and both spellings
-        agree on it; ``test_agent_sdk_capabilities`` pins that, so a future pool
-        that does select a backend gets the capability answer rather than an
-        identity guess.
+        This pool's ``acp_backend`` is restricted by ``_get_acp_backend`` to a
+        backend that answers both ``honors_zero_tool_ban`` and
+        ``acp_client_spawnable`` True, and those do NOT all answer these capabilities
+        the same way -- kiro takes the slash command, opencode and goose take
+        neither -- which is exactly why they are asked here instead of an identity.
+        ``test_agent_sdk_capabilities`` pins every member's answers, so a backend
+        that later qualifies with different answers is caught there, not assumed to
+        inherit an existing member's.
         """
         client = self._client
         requested = self._effort
@@ -349,6 +545,13 @@ class AcpWorker(Worker):
         try:
             backend = getattr(client, "backend", "")
             via_config_option = capabilities_for(backend).effort_via_config_option
+            if not via_config_option and not capabilities_for(backend).effort_via_slash_command:
+                logger.warning(
+                    "AcpWorker: effort=%s unsupported on backend=%s; using provider default",
+                    requested,
+                    POLICY_ID_BY_BACKEND.get(backend, backend),
+                )
+                return
             # Resolved per backend, like every other effort site: writing the
             # wrong spelling draws "unknown config option", and the except
             # below turns that into "using provider default" without saying
@@ -360,14 +563,19 @@ class AcpWorker(Worker):
                     requested,
                 )
                 return
+            # The harness's own spelling first, then the advertised fold: the
+            # table answers a level this harness does not HAVE, and
+            # ``_select_effort_level`` answers one the current model will not
+            # take. Both are asked here so this site writes the same value as
+            # the three other effort writers.
+            requested = effort_config_option_value(backend, requested)
             supported = client.get_valid_effort_levels()
             if not isinstance(supported, list):
                 supported = []
             effective = _select_effort_level(requested, supported)
             if effective is None:
                 logger.warning(
-                    "AcpWorker: no supported effort at or below %s; "
-                    "using provider default",
+                    "AcpWorker: no supported effort at or below %s; " "using provider default",
                     requested,
                 )
                 return
@@ -394,7 +602,14 @@ class AcpWorker(Worker):
         if self._client is None or not self._client.is_ready:
             await self.start()
         assert self._client is not None
-        return await self._client.send_message(prompt, timeout=timeout)
+        try:
+            return await self._client.send_message(prompt, timeout=timeout)
+        except Exception:
+            # A timed-out turn is still running in the child, so a reused client
+            # answers "Prompt already in progress". Prompts are self-contained,
+            # so drop the client on any failure and let acquire respawn it.
+            await self.shutdown()
+            raise
 
     async def shutdown(self) -> None:
         if self._protected_pid is not None:
@@ -434,14 +649,45 @@ class AcpWorker(Worker):
         self.calls_since_reset = 0
 
 
+#: Longest stream-json line :class:`CCWorker` reads; the ACP transports' ceiling
+#: (``acp.transport_framing._STDOUT_BUFFER_LIMIT``, pinned equal by a test so
+#: this module stays importable without the ACP client).
+STDOUT_LINE_LIMIT = 10 * 1024 * 1024
+
+
+class CCWorkerReplyError(RuntimeError):
+    """The CLI answered this message with an error result."""
+
+
+def _text_blocks(container: Any) -> list[str]:
+    """The ``text`` of each text block in ``container["content"]``, skipping bad shapes."""
+    content = container.get("content") if isinstance(container, dict) else None
+    if not isinstance(content, list):
+        return []
+    return [
+        block["text"]
+        for block in content
+        if isinstance(block, dict)
+        and block.get("type") == "text"
+        and isinstance(block.get("text"), str)
+    ]
+
+
 class CCWorker(Worker):
     """Long-lived external agent CLI subprocess using stream-json I/O."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, sandbox_mode: Optional[str] = None) -> None:
         self._proc: Optional[asyncio.subprocess.Process] = None
         self._reader_task: Optional[asyncio.Task] = None  # type: ignore[type-arg]
         self._event_queue: asyncio.Queue[Optional[dict]] = asyncio.Queue()
         self._claude_bin: Optional[str] = None
+        # The operator's ``agent.sandbox`` tier, pre-resolved by the pool off
+        # the event loop -- the same argument, from the same reader
+        # (``_get_sandbox_mode``), that ``AcpWorker`` takes. Every agent child
+        # answers to the one configured tier, so this worker must receive it
+        # rather than take ``wrap_argv``'s own default. ``None`` -> resolve
+        # lazily in ``_spawn`` (direct construction outside the pool / tests).
+        self._sandbox_mode = sandbox_mode
 
     async def start(self) -> None:
         self._claude_bin = shutil.which("claude")
@@ -457,15 +703,29 @@ class CCWorker(Worker):
             except asyncio.CancelledError:
                 pass
             self._reader_task = None
+        try:
+            await self._spawn_process()
+        except BaseException:
+            # The old reader is gone, so the old process can deliver nothing
+            # any more: retire it, and the worker reads dead until a spawn
+            # succeeds instead of being handed out to a caller it cannot answer.
+            await self.shutdown()
+            raise
+
+    async def _spawn_process(self) -> None:
         assert self._claude_bin is not None
         cmd = [
             self._claude_bin,
             "-p",
             "--verbose",
-            "--model", "haiku",
-            "--input-format", "stream-json",
-            "--output-format", "stream-json",
-            "--permission-mode", "bypassPermissions",
+            "--model",
+            "haiku",
+            "--input-format",
+            "stream-json",
+            "--output-format",
+            "stream-json",
+            "--permission-mode",
+            "bypassPermissions",
         ]
         # Optional URL-fetch tool. Empty by default (no built-in remote fetch on a
         # vanilla machine). Users can opt in by setting KIROCREW_KNOWLEDGE_FETCH_TOOLS
@@ -473,14 +733,37 @@ class CCWorker(Worker):
         fetch_tools = os.environ.get("KIROCREW_KNOWLEDGE_FETCH_TOOLS", "").strip()
         if fetch_tools:
             cmd += ["--allowedTools", fetch_tools]
+        # Resolved per spawn into a LOCAL, never stored: ``_spawn`` also serves
+        # the respawn paths (``send_message``'s recovery, ``reset_conversation``),
+        # so a stored value would pin every later worker process to the tier read
+        # at the first one. Same expression, same reader, same reason as
+        # ``AcpWorker.start``.
+        sandbox_mode = (
+            self._sandbox_mode
+            if self._sandbox_mode is not None
+            else await asyncio.to_thread(_get_sandbox_mode)
+        )
+        # ``strip_python_env`` for the same reason every other agent spawn
+        # passes it: this is a FOREIGN runtime, and any Python it reaches for
+        # must not inherit Kiro Crew's interpreter paths.
         wrapped = cgroup_scope_argv(
-            (await wrap_argv_async(cmd, _prepare=wrap_argv))[0]
+            (
+                await wrap_argv_async(
+                    cmd,
+                    mode=sandbox_mode,
+                    strip_python_env=True,
+                    _prepare=wrap_argv,
+                )
+            )[0]
         )  # cgroup DoS ceiling
         self._proc = await create_subprocess_limited(
             *wrapped,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+            # Nothing reads it, and an unread pipe both holds what the CLI
+            # writes (up to twice the raised ``limit`` below, per worker) and
+            # stalls the CLI once it fills.
+            stderr=asyncio.subprocess.DEVNULL,
             # Own process group, so the worker's descendants are reachable as a tree.
             # `claude -p` forks helpers (see spine/agent_runner.py's _terminate_group),
             # and without this the child lands in the gateway's OWN group -- which is
@@ -496,26 +779,44 @@ class CCWorker(Worker):
             # mypy's Popen overload resolution on the build fleet.
             start_new_session=platform_compat.IS_POSIX,
             creationflags=platform_compat.CREATE_NEW_PROCESS_GROUP,
+            # The agent enforcement point, passed exactly as the agent-CLI
+            # spawns in ``dashboard/handlers/sessions.py`` pass it. This worker
+            # runs with its permission prompts disabled and its inputs are
+            # knowledge documents, so gateway-owned credentials must not be
+            # readable inside it. The tier does not cover this: no tier below
+            # ``strict`` scrubs the agent-denied keys, so the parent side is
+            # where they are removed.
+            env=scrub_agent_subprocess_env(),
+            # A stream-json line carries a whole event, a fetched page echoed
+            # back in a tool_result included; asyncio's 64 KiB default would
+            # refuse it. Same ceiling as the ACP transports. stdout is the only
+            # pipe, so it is the only reader this limit sizes.
+            limit=STDOUT_LINE_LIMIT,
         )
         self._event_queue = asyncio.Queue()
         self._reader_task = asyncio.create_task(self._stdout_reader())
 
     async def _stdout_reader(self) -> None:
-        """Background task: read NDJSON lines from stdout into event queue."""
+        """Background task: read NDJSON lines from stdout into event queue.
+
+        A line that is not a JSON object, or is over :data:`STDOUT_LINE_LIMIT`,
+        is dropped and the read goes on; the reader ends only with the stream.
+        """
         assert self._proc is not None and self._proc.stdout is not None
         try:
             while True:
-                line = await self._proc.stdout.readline()
+                try:
+                    line = await self._proc.stdout.readline()
+                except ValueError:
+                    # Over the limit: asyncio has discarded what it buffered,
+                    # and the rest of that line arrives as one more line that
+                    # does not parse.
+                    continue
                 if not line:
                     break
-                text = line.decode().strip()
-                if not text:
-                    continue
-                try:
-                    event = json.loads(text)
+                event = parse_json_object_line(line)
+                if event is not None:
                     await self._event_queue.put(event)
-                except json.JSONDecodeError:
-                    continue
         except Exception:
             pass
         finally:
@@ -526,21 +827,44 @@ class CCWorker(Worker):
             await self._spawn()
         assert self._proc is not None and self._proc.stdin is not None
 
-        msg = json.dumps({
-            "type": "user",
-            "message": {"role": "user", "content": prompt}
-        })
-        self._proc.stdin.write((msg + "\n").encode())
-        await self._proc.stdin.drain()
+        stdin = self._proc.stdin
+        msg = json.dumps({"type": "user", "message": {"role": "user", "content": prompt}})
 
+        async def _deliver_and_collect() -> str:
+            stdin.write((msg + "\n").encode())
+            await stdin.drain()
+            return await self._collect_response()
+
+        # The queue may hold only this prompt's events, so the worker survives
+        # a message only when its result event was consumed. Anything else (a
+        # timeout, a dead reader, a reply that broke off, a cancelled caller)
+        # leaves the rest of THIS reply queued, and the next prompt would read
+        # it as its own: retire the process instead. The write and its drain
+        # sit inside the same guard and the same timeout, because a prompt
+        # over the pipe's high-water mark is already delivered while drain()
+        # waits for the CLI to read it.
+        settled = False
         try:
-            return await asyncio.wait_for(self._collect_response(), timeout=timeout)
-        except asyncio.TimeoutError:
-            await self.shutdown()
+            reply = await asyncio.wait_for(_deliver_and_collect(), timeout=timeout)
+            settled = True
+            return reply
+        except CCWorkerReplyError:
+            settled = True  # the error result is the result event
             raise
+        finally:
+            if not settled:
+                await self.shutdown()
 
     async def _collect_response(self) -> str:
-        """Collect text from events until a result event arrives."""
+        """Collect text from events until a result event arrives.
+
+        A value of the wrong type is skipped at its own level. The real CLI's
+        ``result`` is the final answer, a string, and is the reply whenever it
+        is non-empty: the assistant turns before it may be narration around a
+        tool call. The assistant text is joined only when the result carries
+        no text of its own. A result with ``is_error: true`` fails this
+        message.
+        """
         text_parts: list[str] = []
         while True:
             event = await self._event_queue.get()
@@ -550,31 +874,44 @@ class CCWorker(Worker):
             event_type = event.get("type", "")
 
             if event_type == "assistant":
-                for block in event.get("message", {}).get("content", []):
-                    if block.get("type") == "text":
-                        text_parts.append(block.get("text", ""))
+                text_parts.extend(_text_blocks(event.get("message")))
 
             elif event_type == "result":
-                for block in event.get("result", {}).get("content", []):
-                    if block.get("type") == "text":
-                        text_parts.append(block.get("text", ""))
+                result = event.get("result")
+                if event.get("is_error") is True:
+                    detail = result if isinstance(result, str) else event.get("subtype", "")
+                    raise CCWorkerReplyError(f"CLI reported an error result: {str(detail)[:500]}")
+                if isinstance(result, str):
+                    if result:
+                        return result
+                else:
+                    text_parts.extend(_text_blocks(result))
                 break
 
         return "".join(text_parts)
 
     async def shutdown(self) -> None:
-        if self._reader_task is not None:
-            self._reader_task.cancel()
-            self._reader_task = None
-        if self._proc is not None:
+        # Both handles are dropped before the first await, so the worker reads
+        # dead from here on even when the reap itself is interrupted.
+        reader, self._reader_task = self._reader_task, None
+        proc, self._proc = self._proc, None
+        if reader is not None:
+            reader.cancel()
+        if proc is not None:
             try:
-                await platform_compat.kill_and_reap(self._proc)
+                await platform_compat.kill_and_reap(proc)
             except Exception:
                 logger.debug("CCWorker shutdown error", exc_info=True)
-            self._proc = None
 
     def is_alive(self) -> bool:
-        return self._proc is not None and self._proc.returncode is None
+        # A reader that ended leaves nothing to deliver a reply, even while the
+        # process itself is still running.
+        reader = self._reader_task
+        return (
+            self._proc is not None
+            and self._proc.returncode is None
+            and (reader is None or not reader.done())
+        )
 
     async def reset_conversation(self) -> None:
         """Respawn the CLI subprocess, discarding the accumulated transcript.
@@ -607,28 +944,29 @@ class LLMPool:
         pool_size: int = DEFAULT_POOL_SIZE,
         *,
         effort: Optional[str] = None,
-        use_config_pool_size: bool = True,
-        track_config_pool_size: Optional[bool] = None,
+        effort_key: Optional[str] = None,
+        fallback_effort: str = "",
+        config_pool_size_key: Optional[str] = None,
     ):
         self._pool_size = pool_size
         self._effort = _normalize_effort(effort)
-        self._use_config_pool_size = use_config_pool_size
-        # Whether a LATER write to knowledge.extraction_pool_size retargets this
-        # pool. Separate from use_config_pool_size, which only governs the read
-        # inside start(): a caller that seeds pool_size from that key itself (the
-        # extraction pool) disables the start() read yet still wants to follow the
-        # key, while a caller with a fixed width (the URL-fetch pool, size 1) must
-        # not be resized by an unrelated setting. Defaults to following whenever
-        # start() would have read the key.
-        self._track_config_pool_size = (
-            use_config_pool_size if track_config_pool_size is None else track_config_pool_size
-        )
+        # Workload-bound effort resolution: when ``effort_key`` is set, the
+        # effort is re-resolved from the config read in ``start()`` (explicit
+        # key → ``fallback_effort``), so the pool follows the operator's
+        # config; a direct ``effort=`` arg is the pre-resolved
+        # override for tests / pure construction.
+        self._effort_key = effort_key
+        self._fallback_effort = fallback_effort
+        # Config keys override ``pool_size`` ONLY for the workload that owns
+        # them: extraction binds ``config_pool_size_key="extraction_pool_size"``
+        # while the fetch pool passes nothing, so knowledge.extraction_pool_size
+        # cannot silently resize it (or the auto_research pool).
+        self._config_pool_size_key = config_pool_size_key
         self._semaphore = asyncio.Semaphore(pool_size)
         self._workers: list[Worker] = []
         self._available: asyncio.Queue[int] = asyncio.Queue()
         self._started = False
         self._provider_type: str = ""
-        self._sandbox_mode: str = "auto"
         self._config: dict = {}
         self._start_lock = asyncio.Lock()
         # Idle-TTL scale-to-zero (see DEFAULT_IDLE_TTL_SECS). Set from config in
@@ -698,7 +1036,7 @@ class LLMPool:
         async with self._start_lock:
             self._config = config
             self._idle_ttl = _get_idle_ttl(config)
-            if self._track_config_pool_size:
+            if self._config_pool_size_key is not None:
                 self._pool_size = _get_pool_size(config)
             if not self._started:
                 # The semaphore was sized at construction. A pool that has not
@@ -731,20 +1069,19 @@ class LLMPool:
             # Read config once, off the event loop, and reuse for every worker.
             config = await asyncio.to_thread(_read_config)
             self._provider_type = _get_provider_type(config)
-            self._sandbox_mode = _get_sandbox_mode(config)
-            # Allow config to override pool size (knowledge.extraction_pool_size).
-            # Only applies when the key is explicitly set in config (not the
-            # fallback default), so callers that pass a specific pool_size to the
-            # constructor are not overridden.
-            configured_size = _get_pool_size(config)
-            explicit = "extraction_pool_size" in (_section(
-                config, "knowledge") if config else {})
-            if (
-                self._use_config_pool_size
-                and explicit
-                and configured_size != self._pool_size
-            ):
-                self._pool_size = configured_size
+            # A workload-specific config key (knowledge.extraction_pool_size)
+            # overrides the constructor size ONLY when the pool declares that
+            # key and the operator has explicitly set it in config.
+            if self._config_pool_size_key is not None:
+                configured_size = _get_pool_size(config)
+                explicit = self._config_pool_size_key in _section(config, "knowledge")
+                if explicit and configured_size != self._pool_size:
+                    self._pool_size = configured_size
+            # Workload-bound effort: resolve from the config already in hand.
+            if self._effort_key is not None:
+                self._effort = _normalize_effort(
+                    _get_workload_effort(config, self._effort_key, self._fallback_effort)
+                )
             # The permit count is derived from the width the workers are spawned
             # at below, whichever path set it (constructor, config override, or a
             # tracked reload before this start), so the two cannot disagree.
@@ -773,17 +1110,32 @@ class LLMPool:
                 self._reaper_task = asyncio.create_task(self._idle_reaper())
             logger.info(
                 "LLMPool started: %d workers, provider=%s",
-                self._pool_size, self._provider_type,
+                self._pool_size,
+                self._provider_type,
             )
 
     async def _create_worker(self) -> Worker:
-        """Create and start a new worker based on provider type."""
+        """Create and start a new worker based on provider type.
+
+        The tier is read HERE, per construction, rather than taken from the
+        value ``start`` resolved. A pool outlives many workers -- the idle
+        reaper scales it to zero and ``acquire`` builds it back up, and a
+        worker that dies is replaced -- so a value stored at start became the
+        tier for every worker the pool ever built, and the operator's later
+        ``agent.sandbox`` edit reached none of them. The config subscription
+        does not cover this: it watches the two pool-size keys only.
+
+        Off the loop because the read stats and may re-parse ``config.json``,
+        the same reason ``start`` offloads its own read.
+        """
+        sandbox_mode = await asyncio.to_thread(_get_sandbox_mode)
         if is_claude_code(self._provider_type):
-            worker: Worker = CCWorker()
+            worker: Worker = CCWorker(sandbox_mode=sandbox_mode)
         else:
             worker = AcpWorker(
-                sandbox_mode=self._sandbox_mode,
+                sandbox_mode=sandbox_mode,
                 effort=self._effort,
+                acp_backend=await asyncio.to_thread(_get_acp_backend),
             )
         await worker.start()
         return worker
@@ -925,7 +1277,8 @@ class LLMPool:
             self._reaping_workers = None
         logger.info(
             "LLMPool: scaled to zero after %.0fs idle (%d workers freed)",
-            self._idle_ttl, len(workers),
+            self._idle_ttl,
+            len(workers),
         )
         return True
 
@@ -970,8 +1323,9 @@ class LLMPool:
             await worker.reset_conversation()
         except Exception:
             logger.warning(
-                "LLMPool: worker %d conversation reset failed; will be replaced on "
-                "next acquire", idx, exc_info=True,
+                "LLMPool: worker %d conversation reset failed; will be replaced on " "next acquire",
+                idx,
+                exc_info=True,
             )
 
     async def send_batch(self, prompts: list[str], timeout: float = DEFAULT_TIMEOUT) -> list[str]:

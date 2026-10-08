@@ -23,20 +23,21 @@ Paths below are relative to `src/kiro_crew/`.
 | Memory paths and dir names | `memory.py` | `WORKSPACE_DIR_NAME`, `MEMORY_DIR_NAME`, `HISTORY_DIR_NAME`, `PREFERENCES_FILE`, `PROJECTS_FILE`, `INDEX_DB_FILE` (the FTS index *name* only — which directory a given store's index sits in is store policy, owned by `memory_stores.memory_index_path_for`). |
 | Named memory stores | `memory_stores.py` | `MEMORY_STORES_DIR_NAME`, `DEFAULT_MEMORY_STORE`, `MEMORY_DB_FILE` (the vector-store filename, which `vector_memory._DB_FILE` aliases rather than restating), `MEMORY_STORE_NAME_MAX`, `_STORE_NAME_RE`, `_WINDOWS_RESERVED_BASENAMES`; the tree's host-local entries `MEMBER_API_KEY_FILE`, `MEMBER_BACKUPS_DIR_NAME`, `EXECUTION_LOGS_DIR_NAME`, `STORE_BACKUP_DIR_NAME` (which `memory_backup.BACKUP_DIR_NAME` aliases), and the layout predicates `is_host_local_store_state` / `named_store_product_file` the snapshot and export read. A stdlib-only LEAF module, so `security.py` can build its sensitive-path fence from `MEMORY_STORES_DIR_NAME` without a cycle. |
 | Lesson limits | `learn.py` | `_LESSONS_FILE`, `_MAX_LESSONS_TOTAL` (prune oldest past the total). |
-| Cron limits | `cron.py` | `_CRONS_FILE`, `_STORE_VERSION`, `_MIN_INTERVAL_SECS`, `_JOB_TIMEOUT_SECS`, `_TIMER_POLL_SECS`, `_AUTO_PAUSE_THRESHOLD`, the reaper intervals, the skip-date horizon, the store file-lock timeouts, and the hourly/daily jitter caps. |
-| Session and transcript limits | `history.py` | `SESSIONS_DIR_NAME`, `ARCHIVE_RETENTION_DAYS`, the JSONL rotation pair `_SESSION_MAX_BYTES` (2 MB) / `_SESSION_KEEP_LINES`, the file-lock timeouts, and the search caps (`SEARCH_MIN_CHARS`, `_SEARCH_SCAN_WINDOW`, `_TITLE_BOOST`). |
-| Context budgets | `context.py` | `_CONTEXT_BUDGET_BASE` plus one `_budget(fraction)` cap per block (history, preferences, projects, lessons, semantic, episodic, skills, steering, compressed history, preamble headroom). Budgets are expressed as FRACTIONS of the base, so read them there rather than quoting a byte figure. |
+| Cron limits | `cron_service/store.py`, `fields.py`, `model.py`, `schedule.py`; the reaper intervals in `cron.py` | `_CRONS_FILE`, `_STORE_VERSION`, `_MIN_INTERVAL_SECS`, `_JOB_TIMEOUT_SECS`, `_TIMER_POLL_SECS`, `_AUTO_PAUSE_THRESHOLD`, the reaper intervals, the skip-date horizon, the store file-lock timeouts, and the hourly/daily jitter caps and the jitter wait's wall-clock slice. |
+| Session and transcript limits | `history.py` | `SESSIONS_DIR_NAME`, `ARCHIVE_RETENTION_DAYS`, the JSONL rotation pair `_SESSION_MAX_BYTES` (10 MB) / `_SESSION_KEEP_LINES`, the file-lock timeouts, and the search caps (`SEARCH_MIN_CHARS`, `_SEARCH_SCAN_WINDOW`, `_TITLE_BOOST`). |
+| Context budgets | `context_assembly/budget.py` | `_CONTEXT_BUDGET_BASE` plus one `_budget(fraction)` cap per block (history, preferences, projects, lessons, semantic, episodic, skills, steering, compressed history, preamble headroom). Budgets are expressed as FRACTIONS of the base, so read them there rather than quoting a byte figure. |
 | Task states | `task.py` | The `TaskState` enum, the `_TERMINAL` set, and the `_TRANSITIONS` map that defines the legal state machine. |
 | Heartbeat intervals | `heartbeat.py` | `_DEFAULT_INTERVAL`, `_FTS_REBUILD_TICKS`, `_PRUNE_TICKS`, `HEARTBEAT_TASK_TIMEOUT_SECS`, `HEARTBEAT_FILE`. |
 | Subagent limits | `subagent.py` | `_MAX_CONCURRENT`, `_TIMEOUT_SECS`, `_TURN_LIMIT`, `_MAX_DONE_RESULT_LEN`, `_STARTUP_TIMEOUT_SECS`, `INJECTION_TIMEOUT`, the reaper/stall intervals. |
 | Slot state caps | `dashboard/state.py` | `_MAX_SLOT_MESSAGES`, `_MAX_PERSISTED_NOTIFICATIONS`, `_MAX_SOURCE_LINKS_PER_SLOT`, `_MAX_PENDING_CONTEXT`, `NATIVE_SUBAGENT_DONE_RESULT_CAP`, `_QUESTION_TIMEOUT_MAX`. |
-| Injected-message envelope prefixes | `dashboard/state.py` | `CRON_NOTIFY_PREFIX` / `CRON_NOTIFY_END` / `CRON_NOTIFY_RE`, `SUBAGENT_COMPLETION_PREFIX`, `SUBAGENT_SYNTHESIS_PREFIX`, and every `*_RECOVERY_PREFIX` marker — `test_recovery_card_prefixes.py` is the cross-language drift guard that keys on that suffix. All in one place so the frontend has one list to mirror. See [injected-messages](injected-messages.md). |
+| Injected-message envelope prefixes | `constants.py`, `dashboard/state.py` | `constants.py` owns `SUBAGENT_COMPLETION_PREFIX` / `SUBAGENT_BATCH_COMPLETION_PREFIX`; `dashboard/state.py` owns the cron, monitor, synthesis, and `*_RECOVERY_PREFIX` markers and aggregates `SUBAGENT_COMPLETION_PREFIXES`. See [injected-messages](injected-messages.md). |
 | Usage cache TTLs | `dashboard/handlers/usage.py` | `_CACHE_TTL`, `_TOKEN_CACHE_TTL`, `_CONTEXT_CACHE_TTL`, `_TOKEN_HISTORY_DAYS`, `_CONTEXT_TOP_SESSIONS`. |
 | Webhook hook limits | `dashboard/handlers/hooks.py` | `_HOOK_MAX_CONCURRENT` (semaphore-backed, 429 past it), `_HOOK_MESSAGE_MAX_LEN`, `_HOOK_TIMEOUT_DEFAULT` / `_HOOK_TIMEOUT_MAX` (both prime, to avoid a thundering herd with cron intervals). |
 | Embed cache | `embeddings.py` | `_EMBED_CACHE_MAX` (128 entries, keyed by text plus model id; the comment there carries the memory arithmetic). |
 | Bytecode-cache GC limits | `pycache_gc.py` | `PYCACHE_MAX_AGE_DAYS`, `PYCACHE_MAX_TOTAL_BYTES`, `PYCACHE_GC_INTERVAL_SECS` (the `<data home>/cache/pycache` TTL, size cap, and periodic-sweep cadence). |
+| Shell audit log cap | `shell_audit_log.py` | `SHELL_AUDIT_LOG_NAME`, `SHELL_AUDIT_LOG_MAX_BYTES` (the file the bundled `postToolUse` hook appends to, and the size at which the session cleanup loop rotates it aside to one `.1` generation). |
 | Slack UX strings and pacing | `slack/handler.py` | `_THINKING`, `_CURSOR`, `_NO_RESPONSE`, `_STATUS_WORKING`, `_TRUNCATION_MARKER`, plus `_EDIT_INTERVAL`, `_APPROVAL_TIMEOUT`, `_SLACK_SECTION_TEXT_LIMIT`, the stall thresholds and the phase debounce. |
-| Cross-cutting shared constants | `constants.py` | `KIROCREW_SPAWNED_ENV`, `ENV_TRUTHY`, `CHAT_TURN_TIMEOUT`, `COMPACT_WAIT_TIMEOUT_SECS` (one budget, shared by manual and automatic compaction), the `[OPTIONS:]` parse regexes, `DATA_WARNING`, `BANNER`, `MAX_BANNER_CHARS` and `ARTIFACT_MAX_CONTENT_BYTES` (bounds `validation.py` — a leaf — must read without importing the service module that enforces them; `artifacts.MAX_CONTENT_BYTES` re-exports the latter). |
+| Cross-cutting shared constants | `constants.py` | `KIROCREW_SPAWNED_ENV`, `ENV_TRUTHY`, `CHAT_TURN_TIMEOUT`, `COMPACT_WAIT_TIMEOUT_SECS` (one budget, shared by manual and automatic compaction; `session.compact_wait_secs` raises it for both, resolved for every caller by `SessionManager.compact_wait_budget_secs()`), the `[OPTIONS:]` parse regexes, `BANNER`, `MAX_BANNER_CHARS` and `ARTIFACT_MAX_CONTENT_BYTES` (bounds `validation.py` — a leaf — must read without importing the service module that enforces them; `artifacts.MAX_CONTENT_BYTES` re-exports the latter). |
 | Gateway shutdown budget | `gateway_shutdown_budget.py` | Gateway cooperative timeout, service-manager signal margin, and the derived systemd/launchd stop deadline. |
 | Process-wide shutdown signal | `__init__.py` | `shutdown_event`. Background loops `await shutdown_event.wait()` with a timeout instead of a plain `asyncio.sleep`, so they wake instantly on Ctrl-C. |
 | Base agent config | `config/defaults.json` | `tools`, `allowedTools`, `resources`, `hooks`, model. Packaged as package data, so editing it needs no code change. |
@@ -55,7 +56,7 @@ Other style rules:
 | Module-global asyncio primitives | Never a bare `asyncio.Lock()`/`Event()`/`Queue()` at module scope — it binds to the import-time (or first-use) loop and raises `RuntimeError` from any other loop (Python 3.10+). Use `kiro_crew.loop_lock.LoopBoundLock` for locks, or create the primitive inside the coroutine. CI enforces this (`loop-bound-locks` gate). |
 | Dataclasses | `@dataclass` for data containers |
 | Product name | The product is **Kiro Crew**: two words, a space, capital `K`. Identifiers keep the spelling their own system gave them (the `kirodotdev/KiroCrew` repo slug, `KiroCrew.dmg` artifacts, the `KiroCrew Nightly` OS identifier, the `kirocrew` CLI, `KIROCREW_*` env vars, `kiro_crew` imports). CI gates the lines a change ADDS, so an existing spelling nearby does not exempt a new one; run `BRAND_BASE_REF=origin/main python3 scripts/check_brand_name.py` before pushing. |
-| Errors | Custom exceptions in `acp/client.py`; return error strings at tool boundaries. See [error-handling](error-handling.md). |
+| Errors | ACP exceptions live in `acp/transport_errors.py` (re-exported by `acp/client.py`), `acp/session_handle.py`, and `acp/runtime.py`; return error strings at tool boundaries. See [error-handling](error-handling.md). |
 
 ## Comments explain the WHY
 
@@ -96,6 +97,10 @@ hotspot of every cleanup PR. The legacy markers the tree still carries are not
 tracked; a marker can re-enter only on an added line, which is what the gate
 judges. Without the env the script prints whole-tree counts and does not enforce.
 
+The rule applies to every comment. The gate enforces it only on added lines of
+`.py` files under `src/kiro_crew` and `test`; comments elsewhere (`website/`, the
+Electron shell, workflow files) are held to the rule by review.
+
 ```bash
 COMMENT_HISTORY_BASE_REF=origin/main python3 scripts/check_comment_history.py
 ```
@@ -119,7 +124,9 @@ CI's job (`local-gate.py --full` exists for a human who wants it locally).
 any enforcement, so a repo-wide run reformats ~95,800 lines. Those files are
 recorded in `.github/black-baseline.txt` and exempted; every other file must be
 clean, and a file that *becomes* clean must be pruned from the list, so it only
-ever shrinks. Format what you touched with
+ever shrinks. Prune with `python3 scripts/check_black_formatting.py
+--update-baseline`; it refuses unless the installed black equals the
+`pyproject.toml` pin (`black==26.3.1`). The read-only check does not need the pin. Format what you touched with
 `black --target-version py310 <paths>`, never the whole tree.
 
 **On macOS, run `mypy --platform linux src/kiro_crew`.** CI type-checks on Linux, and
@@ -170,6 +177,15 @@ import the package write `encoding="utf-8", errors="replace"` inline. A child
 that genuinely writes in the console encoding (`ps`, `systeminfo`, user shells)
 keeps locale decoding and says so with an inline `# subprocess-encoding: locale`
 marker — an audit trail, not an escape hatch.
+
+PowerShell is the one console-encoding child whose emit side we *can* pin, the
+same move as `PYTHONIOENCODING` for a Python child: prefix the command with
+`[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false);` and then
+`**UTF8_TEXT` is correct rather than forbidden, because the encoding is now
+known. Pinning only this end raises `UnicodeDecodeError` on a legacy code page,
+and leaving both ends on the code page silently best-fits an unrepresentable
+character away. Use the BOM-less `UTF8Encoding` spelling so no host prepends a
+byte-order mark to the first field.
 
 ## Frontend
 

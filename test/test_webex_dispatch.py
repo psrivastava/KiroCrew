@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import contextmanager
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest import mock
 
@@ -15,6 +16,7 @@ from kiro_crew.messaging.link import ChannelLink
 from kiro_crew.messaging.queue_drain import tag_entry
 from kiro_crew.session_allocation import SessionClosingError
 from kiro_crew.webex import cards
+from kiro_crew.webex import client as webex_client
 from kiro_crew.webex import transport_dispatch as webex_dispatch
 from kiro_crew.webex.client import WebexInbound
 from kiro_crew.webex.commands import (
@@ -106,7 +108,7 @@ class FakeSessions:
         self.begin_turns = 0
         self.reserved_generations: set[str] = set()
 
-    async def get_or_create(self, key, *, agent, channel_id):
+    async def get_or_create(self, key, *, agent=None, channel_id=None, start_priority=None):
         self.last_agent = agent
         if self._raise is not None:
             raise self._raise
@@ -173,9 +175,17 @@ class FakeSessions:
     def dequeue(self, key):
         return self.queued.pop(0) if self.queued else None
 
-    def clear_queue(self, key) -> None:
+    def clear_queue(self, key, owned_by=None, *, only=None) -> None:
         self.cleared.append(key)
         self.queued.clear()
+
+    def detach_queue(self, key):
+        taken = tuple(self.queued)
+        self.queued.clear()
+        return taken
+
+    def restore_queue(self, key, entries) -> None:
+        self.queued[:0] = list(entries)
 
     # -- origin / mirror binding (drive_turn binds on every turn) --
     def set_origin_link(self, key, link) -> None:
@@ -208,6 +218,10 @@ class FakeSessions:
     def batched_save(self):
         self.batched += 1
         yield
+
+    def compact_wait_budget_secs(self) -> float:
+        """The real manager's resolved ``session.compact_wait_secs`` (unset: 300 s)."""
+        return 300.0
 
 
 class _GateResult:
@@ -249,7 +263,7 @@ class FakeClient:
 
     async def edit_message(self, message_id: str, room_id: str, markdown: str) -> bool:
         self.edits.append((message_id, room_id, markdown))
-        return True
+        return getattr(self, "edit_ok", True)
 
     async def delete_message(self, message_id: str) -> None:
         self.deleted.append(message_id)
@@ -376,7 +390,7 @@ def _entry(
         "webex_room_type": room_type,
         **extra,
     }
-    return (ts, text, tag_entry(kwargs, "webex"))
+    return (ts, text, tag_entry(kwargs, "webex", ""))
 
 
 # ------------------------------------------------------------------
@@ -896,6 +910,159 @@ class TestStop:
         assert "🛑 Stopped." in client.sent[-1][1]
 
     @pytest.mark.asyncio
+    async def test_a_decline_webex_could_not_post_leaves_the_next_press_a_first_press(
+        self,
+    ) -> None:
+        """``_reply`` hands back the id of what it posted, and ``None`` when there
+        was nothing to post with. A member who saw no answer presses again within
+        seconds, and that press must be declined again, never a silent reset."""
+        from kiro_crew import session_lifecycle as sl
+
+        sl._stop_declined_markers.clear()
+        provider = FakeProvider([])
+        sessions = FakeSessions(provider)
+        sessions._busy = True
+        sessions.is_compacting = lambda key: True
+        forced: list[dict] = []
+
+        async def stop_turn(key, **kw):
+            forced.append(kw)
+            return "hard"
+
+        sessions.stop_turn = stop_turn
+        client = FakeClient()
+        d = _dispatcher(sessions, FakeCtx(), client)
+        posted = d._reply
+        down = True
+
+        async def _flaky(inbound, text, **kw):
+            if down:
+                return None
+            return await posted(inbound, text, **kw)
+
+        d._reply = _flaky  # type: ignore[method-assign]
+        await d.handle_message(_inbound("/stop"))
+        assert sl._stop_declined_markers == {}, "an undelivered warning arms nothing"
+        down = False
+        await d.handle_message(_inbound("/stop"))
+        assert forced == [], "no force on a press the member was never warned about"
+        assert "nothing was stopped" in client.sent[-1][1]
+        sl._stop_declined_markers.clear()
+
+    @pytest.mark.asyncio
+    async def test_stop_is_declined_while_the_session_compacts(self) -> None:
+        """An automatic compaction holds the session: nothing is cancelled, nothing
+        is cleared, and the caller is told nothing was stopped."""
+        provider = FakeProvider([])
+        sessions = FakeSessions(provider)
+        sessions._busy = True
+        sessions.queued = [("1", "queued", {})]
+        sessions.is_compacting = lambda key: True
+        client = FakeClient()
+        d = _dispatcher(sessions, FakeCtx(), client)
+
+        await d.handle_message(_inbound("/stop"))
+
+        assert provider.cancelled == []
+        assert sessions.cleared == []
+        assert "nothing was stopped" in client.sent[-1][1]
+
+    @pytest.mark.asyncio
+    async def test_another_members_declined_stop_does_not_force_mine(self) -> None:
+        """A group space shares one session key. The decline marker belongs to the
+        member who was declined, so the next member's first press stays a first
+        press, and the declined member's own repeat is the one that forces."""
+        from kiro_crew import session_lifecycle as sl
+
+        sl._stop_declined_markers.clear()
+        provider = FakeProvider([])
+        sessions = FakeSessions(provider)
+        sessions._busy = True
+        sessions.is_compacting = lambda key: True
+        forced: list[dict] = []
+
+        async def stop_turn(key, **kw):
+            forced.append(kw)
+            return "hard"
+
+        sessions.stop_turn = stop_turn
+        client = FakeClient()
+        d = _dispatcher(sessions, FakeCtx(), client)
+
+        def group(email: str) -> WebexInbound:
+            return WebexInbound(person_email=email, room_id="ROOM", text="/stop", room_type="group")
+
+        await d.handle_message(group("alice@example.com"))
+        await d.handle_message(group("bob@example.com"))
+        assert forced == [], "bob's first press is a first press"
+        assert all("nothing was stopped" in m for (_, m) in client.sent[-2:])
+        await d.handle_message(group("alice@example.com"))
+        assert forced == [{"force": True, "preserve_queue": True}]
+        sl._stop_declined_markers.clear()
+
+    @pytest.mark.asyncio
+    async def test_the_forced_stop_keeps_other_members_queued_work(self) -> None:
+        """The reset is this member's; the queue is the whole space's. The queue is
+        detached before the hard stop, this member's entries are dropped from the
+        handles, and the other members' are handed to the successor."""
+        from kiro_crew import session_lifecycle as sl
+        from kiro_crew.messaging.queue_drain import QUEUED_OWNER_KEY
+        from kiro_crew.webex.transport_dispatch import _entry_owner
+
+        sl._stop_declined_markers.clear()
+        provider = FakeProvider([])
+        sessions = FakeSessions(provider)
+        sessions._busy = True
+        sessions.is_compacting = lambda key: True
+        mine = _entry_owner(_inbound("/stop"))
+        own = ("1", "mine", {QUEUED_OWNER_KEY: mine})
+        theirs = ("2", "theirs", {QUEUED_OWNER_KEY: "someone-else"})
+        sessions.queued = [own, theirs]
+        calls: list[dict] = []
+        only_cleared: list = []
+        restored: list = []
+
+        async def stop_turn(key, **kw):
+            calls.append(kw)
+            sessions.queued.clear()  # the hard reset pops the session and its queue
+            return "hard"
+
+        def detach_queue(key):
+            taken = tuple(sessions.queued)
+            sessions.queued.clear()
+            return taken
+
+        owner_clears: list = []
+
+        def clear_queue(key, owned_by=None, *, only=None):
+            if only is not None:
+                only_cleared.extend(only)
+            else:
+                owner_clears.append(owned_by)
+
+        def restore_queue(key, entries):
+            restored.extend(entries)
+            sessions.queued[:0] = list(entries)
+
+        sessions.stop_turn = stop_turn
+        sessions.detach_queue = detach_queue
+        sessions.clear_queue = clear_queue
+        sessions.restore_queue = restore_queue
+        client = FakeClient()
+        d = _dispatcher(sessions, FakeCtx(), client)
+
+        await d.handle_message(_inbound("/stop"))
+        await d.handle_message(_inbound("/stop"))
+        assert calls == [{"force": True, "preserve_queue": True}]
+        assert only_cleared == [own], "only this member's entry dropped"
+        assert owner_clears == [], "no second owner-scoped clear after the force"
+        assert restored == [theirs], "the other member's entry reached the successor"
+        assert sessions.queued == [theirs]
+        assert sessions.released[-1] == d._session_key(_EMAIL)
+        assert "🛑 Stopped." in client.sent[-1][1]
+        sl._stop_declined_markers.clear()
+
+    @pytest.mark.asyncio
     async def test_stop_with_nothing_running_still_clears(self) -> None:
         sessions = FakeSessions(FakeProvider([]))  # not busy
         client = FakeClient()
@@ -1281,7 +1448,89 @@ class TestApprovals:
 # ------------------------------------------------------------------
 
 
+class TestAReceiptAddressNamesTheThreadItLivesIn:
+    """Two threads of one room share a session key, so the ADDRESS must part them.
+
+    A group space routes as ``space:{room_id}``, so every thread in it lands on one
+    queue entry and one bubble. The bubble hangs under the thread its first send
+    threaded into, and it may only ever show what arrived there -- a room-only
+    address answers "same conversation" for a sibling thread and renders that
+    thread's text where the other thread's readers are.
+    """
+
+    def _surface(self, *, parent: str, email: str = _EMAIL, threaded: bool = True):
+        cfg = _cfg_queue()
+        cfg.webex.reply_in_thread = threaded
+        d = _dispatcher(FakeSessions(FakeProvider([])), FakeCtx(), FakeClient(), cfg=cfg)
+        return d._receipt_surface(
+            WebexInbound(
+                person_email=email, room_id="ROOM", text="x", room_type="group", parent_id=parent
+            )
+        )
+
+    def test_two_threads_of_one_room_are_two_addresses(self) -> None:
+        """The fixed disclosure: thread B must not be addressed to thread A's bubble."""
+        a = self._surface(parent="THREAD_A")
+        b = self._surface(parent="THREAD_B")
+        assert a.address_key != b.address_key
+
+    def test_one_thread_is_one_address_for_every_member(self) -> None:
+        """Still SHARED within a thread, which is the whole point of a space bubble.
+
+        A second member's mid-turn message must keep updating the one bubble, so the
+        address may not narrow to the sender.
+        """
+        mine = self._surface(parent="THREAD_A")
+        theirs = self._surface(parent="THREAD_A", email="other@example.com")
+        assert mine.address_key == theirs.address_key
+        assert mine.address_key
+
+    def test_the_room_root_is_a_named_address_not_an_unknown_one(self) -> None:
+        """A receipt outside any thread still needs an address, or no bubble opens.
+
+        ``receipt_address_key`` reads an empty part as UNKNOWN and returns ``""``, and
+        a surface with no address opens nothing -- so the root case would have lost
+        its receipts entirely rather than merely sharing one.
+        """
+        root = self._surface(parent="")
+        assert root.address_key
+        assert root.address_key != self._surface(parent="THREAD_A").address_key
+
+    def test_without_threaded_replies_the_whole_room_is_one_address(self) -> None:
+        """With ``reply_in_thread`` off every send lands in the room root.
+
+        The address tracks where the bubble actually IS, so two threads then share
+        one address -- the same place their receipts share.
+        """
+        a = self._surface(parent="THREAD_A", threaded=False)
+        b = self._surface(parent="THREAD_B", threaded=False)
+        assert a.address_key == b.address_key
+        assert a.address_key == self._surface(parent="", threaded=False).address_key
+
+    def test_the_root_stand_in_cannot_be_mistaken_for_a_thread(self) -> None:
+        """A real thread root is an opaque base64 id, which has no colon in it."""
+        assert webex_dispatch._ROOT_THREAD
+        assert ":" in webex_dispatch._ROOT_THREAD
+        real = webex_client.hydra_id("2f1e6d5c-4b3a-2918-0706-f5e4d3c2b1a0")
+        assert ":" not in real
+        assert self._surface(parent=real).address_key != self._surface(parent="").address_key
+
+
 class TestQueueAndDrain:
+    @pytest.mark.asyncio
+    async def test_the_surface_reports_whether_the_edit_landed(self) -> None:
+        """Webex documents a per-message edit cap, so a refusal here is ordinary. The
+        registry can only keep such a transition retryable if the wrapper reports it
+        rather than swallowing the client's answer."""
+        client = FakeClient()
+        d = _dispatcher(FakeSessions(FakeProvider([])), FakeCtx(), client, cfg=_cfg_queue())
+        surface = d._receipt_surface(_inbound("x"))
+
+        client.edit_ok = True
+        assert await surface.edit_receipt("m1", "body") is True
+        client.edit_ok = False
+        assert await surface.edit_receipt("m1", "body") is False
+
     @pytest.mark.asyncio
     async def test_queue_mode_enqueues_with_a_receipt(self) -> None:
         provider = FakeProvider([])
@@ -1421,6 +1670,42 @@ class TestQueueAndDrain:
 
         assert turns[0] == "t-a\n\nt-a2"
         assert turns[1] == "t-b"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("queued_person", "opener_person", "expected"),
+        [
+            # A person's queued message drains FOREGROUND whoever opened the turn.
+            (True, False, "fg"),
+            # A gateway-built wake that reached the queue stays BACKGROUND, even
+            # behind a person's turn.
+            (False, True, "bg"),
+        ],
+    )
+    async def test_a_drained_turn_takes_the_queued_entrys_own_person_flag(
+        self, queued_person, opener_person, expected
+    ) -> None:
+        """The replay is built ON the finished turn's inbound, so the opener's flag is
+        the wrong source both ways: the entry records its own at enqueue time."""
+        from kiro_crew.start_priority import StartPriority
+
+        provider = FakeProvider([AcpEvent(kind=EVENT_COMPLETE)])
+        sessions = FakeSessions(provider)
+        sessions._busy = True
+        d = _dispatcher(sessions, FakeCtx(), FakeClient())
+        queued = replace(_inbound("queued"), person_origin=queued_person)
+        assert await d._enqueue_with_receipt(d._session_key(_EMAIL), "queued", queued)
+        sessions._busy = False
+        priorities: list[StartPriority] = []
+
+        async def _capture(turn, *, sessions, ctx_builder):
+            priorities.append(turn.start_priority)
+
+        opener = replace(_inbound("opener"), person_origin=opener_person)
+        with mock.patch("kiro_crew.webex.transport_dispatch.drive_turn", _capture):
+            await d._drain_queue(d._session_key(_EMAIL), opener)
+
+        assert priorities == [StartPriority(expected)]
 
     @pytest.mark.asyncio
     async def test_an_empty_queue_drains_to_nothing(self) -> None:
@@ -2775,6 +3060,130 @@ class TestMidTurnAttachments:
         ], "each room answered in arrival order, and A's second message did not jump B"
 
 
+class TestAPartialDrainInASharedSpace:
+    """Two members of one space, one bubble, and a drain that answers ONE of them.
+
+    ``_route_of`` maps a space to ``space:{room_id}``, so both members share a session
+    key AND a receipt address: their messages are listed on the single bubble, and the
+    drain still collapses only the entries whose sender matches. So the drain that
+    answers the first member meets a bubble that is still listing the second member's
+    queued message -- and that entry is the only handle it has. Retiring it flipped the
+    bubble to "Now answering (1)" over a list of two, erasing an acknowledgement for a
+    message that was still queued, and the second member's own drain then found no entry
+    and recorded them nowhere at all.
+
+    Driven through the real producer and the real pump rather than the registry alone,
+    because the halves live in two modules: which entries collapse is decided here in the
+    transport, and what the bubble does about the remainder is decided in
+    ``messaging/queue_receipt.py``.
+    """
+
+    OTHER = "other@example.com"
+
+    def _dispatcher_and_key(self, client: FakeClient, sessions: FakeSessions):
+        cfg = _cfg_group()
+        cfg.messaging.queue_mode = "queue"
+        cfg.webex.allowed_emails = [_EMAIL, self.OTHER]
+        d = _dispatcher(sessions, FakeCtx(), client, cfg=cfg)
+        return d, d._session_key(webex_dispatch._route_of(_space(email=_EMAIL)))
+
+    @staticmethod
+    def _receipt_bodies(client: FakeClient) -> list[str]:
+        """Every body the receipt bubble was rewritten to, in order."""
+        return [body for _mid, _room, body in client.edits]
+
+    @pytest.mark.asyncio
+    async def test_the_bubble_keeps_the_second_members_line_and_its_handle(self) -> None:
+        client, sessions = FakeClient(), FakeSessions(FakeProvider([]))
+        d, key = self._dispatcher_and_key(client, sessions)
+        sessions._busy = True
+        await d._enqueue_with_receipt(key, "kyle asked", _space("kyle asked", email=_EMAIL))
+        await d._enqueue_with_receipt(key, "other asked", _space("other asked", email=self.OTHER))
+        sessions._busy = False
+        seen: list[tuple[str, str]] = []
+
+        async def _replay(self, inbound, *, interpret_commands=True, drain=True):
+            seen.append((inbound.person_email, inbound.text))
+
+        with mock.patch.object(type(d), "handle_message", _replay):
+            await d._drain_queue(key, _space("kyle asked", email=_EMAIL))
+
+        bodies = self._receipt_bodies(client)
+        assert seen == [(_EMAIL, "kyle asked"), (self.OTHER, "other asked")]
+        # One bubble for the space, never a second one opened beside a stale one.
+        assert len([body for _room, body in client.sent if "Queued" in body]) == 1
+        # The partial drain re-rendered it as STILL QUEUED over what is still queued.
+        partial = bodies[1]
+        assert "Queued (1)" in partial and "other asked" in partial
+        assert "kyle asked" not in partial, "the answered line left the queued list"
+        # The second member's own drain then flips it, and that is the only record.
+        answering = [body for body in bodies if "Now answering" in body]
+        assert answering == [bodies[-1]]
+        assert "other asked" in answering[0] and "kyle asked" not in answering[0]
+        assert not d._queue.has_receipt(key), "nothing is left queued, so the key is released"
+
+    @pytest.mark.asyncio
+    async def test_the_second_member_is_recorded_exactly_once(self) -> None:
+        """No duplicate record, and no record naming the wrong member's text.
+
+        The failure this pins is subtler than a missing record: a retained entry that a
+        later transition mis-reads writes the record TWICE, or writes the first member's
+        text into the record the second member reads.
+        """
+        client, sessions = FakeClient(), FakeSessions(FakeProvider([]))
+        d, key = self._dispatcher_and_key(client, sessions)
+        sessions._busy = True
+        await d._enqueue_with_receipt(key, "kyle asked", _space("kyle asked", email=_EMAIL))
+        await d._enqueue_with_receipt(key, "other asked", _space("other asked", email=self.OTHER))
+        sessions._busy = False
+
+        async def _replay(self, inbound, *, interpret_commands=True, drain=True):
+            return None
+
+        with mock.patch.object(type(d), "handle_message", _replay):
+            await d._drain_queue(key, _space("kyle asked", email=_EMAIL))
+
+        posted = [body for _room, body in client.sent]
+        bodies = self._receipt_bodies(client)
+        assert sum("Now answering" in body for body in bodies) == 1
+        assert not any(
+            "Now answering" in body for body in posted
+        ), "the bubble was editable throughout, so no record needed posting beside it"
+        assert (
+            sum(body.count("other asked") for body in bodies) == 3
+        ), "listed on the grow, on the partial re-render, and on its own record"
+
+    @pytest.mark.asyncio
+    async def test_a_second_thread_in_the_space_does_not_hold_this_bubble(self) -> None:
+        """The other side: a line at another ADDRESS was never rendered here.
+
+        With ``reply_in_thread`` on, two threads of one space are two receipt addresses
+        while still sharing the session key. The sibling thread's line is recorded on the
+        entry but shown on no bubble, so it is owed nothing by this one -- which must
+        therefore retire normally rather than waiting for a message it never listed.
+        """
+        client, sessions = FakeClient(), FakeSessions(FakeProvider([]))
+        d, key = self._dispatcher_and_key(client, sessions)
+        sessions._busy = True
+        here = _space("kyle asked", email=_EMAIL)
+        sibling = replace(_space("other asked", email=self.OTHER), parent_id="THREAD_B")
+        await d._enqueue_with_receipt(key, "kyle asked", here)
+        await d._enqueue_with_receipt(key, "other asked", sibling)
+        sessions._busy = False
+
+        async def _replay(self, inbound, *, interpret_commands=True, drain=True):
+            return None
+
+        with mock.patch.object(type(d), "handle_message", _replay):
+            await d._drain_queue(key, here)
+
+        bodies = self._receipt_bodies(client)
+        assert any("Now answering" in body and "kyle asked" in body for body in bodies)
+        assert all(
+            "other asked" not in body for body in bodies
+        ), "a sibling thread's text is never rendered on this thread's bubble"
+
+
 class TestWebexSharesTheQueueWithOtherTransports:
     """This channel is not alone on its queue, and a foreign entry must not be answered.
 
@@ -2950,6 +3359,7 @@ class TestWebexSharesTheQueueWithOtherTransports:
                 "webex_room_type": "direct",
             },
             "webex",
+            "",
         )
 
         with pytest.raises(KeyError) as caught:
@@ -2964,7 +3374,7 @@ class TestWebexSharesTheQueueWithOtherTransports:
         sessions.queued = [_entry("1", "mine"), self._foreign()]
         deferred: list[int] = []
 
-        async def _flip(session_key, surface, answered, n=0):
+        async def _flip(session_key, surface, answered, n=0, *, owner):
             deferred.append(n)
 
         async def _replay(self, inbound, *, interpret_commands=True, drain=True):
@@ -2992,7 +3402,7 @@ class TestWebexSharesTheQueueWithOtherTransports:
         ]
         deferred: list[int] = []
 
-        async def _flip(session_key, surface, answered, n=0):
+        async def _flip(session_key, surface, answered, n=0, *, owner):
             deferred.append(n)
 
         async def _replay(self, inbound, *, interpret_commands=True, drain=True):

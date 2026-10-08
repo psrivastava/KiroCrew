@@ -304,8 +304,8 @@ describe('ToolCallLine inline expansion', () => {
     })
     renderWithProviders(<ToolCallLine message={toolMsg()} running={false} />, { store })
     fireEvent.click(screen.getByRole('button', { name: /Show details/i }))
-    expect(screen.queryByRole('button', { name: 'Input' })).toBeNull()
-    expect(screen.queryByRole('button', { name: 'Output' })).toBeNull()
+    expect(screen.queryByRole('radio', { name: 'Input' })).toBeNull()
+    expect(screen.queryByRole('radio', { name: 'Output' })).toBeNull()
     // The section is still named, so the user knows which half they are reading.
     expect(screen.getByText('Output')).toBeTruthy()
     expect(screen.getByText('only-output')).toBeTruthy()
@@ -368,7 +368,7 @@ describe('ToolCallLine inline expansion', () => {
     // Default segment is Output → output content visible
     expect(await screen.findByText(/127\.0\.0\.1 localhost/)).toBeTruthy()
     // Input segment exists and is enabled (data is available)
-    const inputBtn = screen.getByRole('button', { name: 'Input' })
+    const inputBtn = screen.getByRole('radio', { name: 'Input' })
     expect(inputBtn.hasAttribute('disabled')).toBe(false)
     fireEvent.click(inputBtn)
     // AnimatePresence mode="wait" sequences the exit→enter, so wait for the
@@ -812,6 +812,66 @@ describe('ToolCallLine auto-denied detection', () => {
     // The localized lead is present, so the reader is told what happened in their
     // own language even when the detail is a raw pattern.
     expect(screen.getByText(/blocked the call|blocked by security policy/i)).toBeTruthy()
+    expect(screen.queryByText('User denied tool execution')).toBeFalsy()
+  })
+
+  // The gate-crash refusal (`hooks.py` GATE_CRASH_REASON) deliberately has no
+  // "Blocked by security policy:" marker: it says that NO policy rule fired and
+  // the user did nothing. The panel must show that sentence, not a localized
+  // lead that asserts the opposite with the disclaimer missing.
+  it('shows the gate-crash reason itself, not a "blocked by security policy" lead', () => {
+    const pill = toolMsg({ meta: { tool_call_id: 'tc_crash' } })
+    const denySibling: ChatMessage = {
+      role: 'tool',
+      content:
+        '🚫 Running: ls — Blocked: the safety check crashed while judging this call ' +
+        '(SystemError), so the call was refused and nothing ran. This is a Kiro Crew ' +
+        'bug, not a policy rule and not a user action.',
+      cls: 'msg msg-tool',
+      meta: { tool_call_id: 'tc_crash' },
+    }
+    const store = createTestStore({
+      chat: {
+        messages: [pill, denySibling],
+        toolLog: [{ type: 'tool', text: 'ls', tool_call_id: 'tc_crash', output: 'User denied tool execution', ts: 1 }],
+        slotRunning: false,
+      } as unknown as ChatState,
+    })
+    const { container } = renderWithProviders(<ToolCallLine message={pill} running={false} />, { store })
+    // Still the amber auto-denied tone: the host refused the call.
+    expect(container.querySelector('.text-warn')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: /show details/i }))
+    expect(screen.getByText(/safety check crashed/)).toBeTruthy()
+    expect(screen.getByText(/not a policy rule and not a user action/)).toBeTruthy()
+    // An error surface: ErrorNotice, with the agent hand-off.
+    expect(screen.getByTestId('gate-crash-notice')).toBeTruthy()
+    // No claim that a policy rule fired, and none of kiro-cli's boilerplate.
+    expect(screen.queryByText(/blocked by security policy/i)).toBeFalsy()
+    expect(screen.queryByText('User denied tool execution')).toBeFalsy()
+  })
+
+  // A hook-blocked row carries neither the marker nor a host sentence; its
+  // panel keeps the localized line alone, exactly as before this change.
+  it('keeps the localized line alone for a hook-blocked row with no reason', () => {
+    const pill = toolMsg({ meta: { tool_call_id: 'tc_hook' } })
+    const denySibling: ChatMessage = {
+      role: 'tool',
+      content: '🚫 shell (hook blocked)',
+      cls: 'msg msg-tool',
+      meta: { tool_call_id: 'tc_hook' },
+    }
+    const store = createTestStore({
+      chat: {
+        messages: [pill, denySibling],
+        toolLog: [{ type: 'tool', text: 'ls', tool_call_id: 'tc_hook', output: 'User denied tool execution', ts: 1 }],
+        slotRunning: false,
+      } as unknown as ChatState,
+    })
+    const { container } = renderWithProviders(<ToolCallLine message={pill} running={false} />, { store })
+    expect(container.querySelector('.text-warn')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: /show details/i }))
+    expect(screen.getByText(/blocked the call|blocked by security policy/i)).toBeTruthy()
+    expect(screen.queryByText(/hook blocked/)).toBeFalsy()
     expect(screen.queryByText('User denied tool execution')).toBeFalsy()
   })
 

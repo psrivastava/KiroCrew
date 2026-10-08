@@ -1,6 +1,6 @@
 # MCP gateway backend replacement (validating a process swapped under a live session)
 
-A client freezes its MCP tool set when the session is created and never re-reads it. The gateway, meanwhile, can swap the PROCESS behind that session: when a shared backend dies mid-call, `gatewayd._respawn_backend_for_stub` spawns a fresh one, replays the captured `initialize`, and re-binds the stub so the transport never breaks and the session keeps its server.
+A client freezes its MCP tool set when the session is created and never re-reads it. The gateway, meanwhile, can swap the PROCESS behind that session: when a shared backend dies mid-call, `mcp_gateway/daemon/replacement.py::_respawn_backend_for_stub` spawns a fresh one, replays the captured `initialize`, and re-binds the stub so the transport never breaks and the session keeps its server.
 
 That recovery is worth keeping. What it must not do is adopt a replacement that publishes something else. A server upgraded in place — or an `npx`/`uvx`-style launcher resolving to a different build — can answer with the same `protocolVersion`, `capabilities` and `serverInfo` while renaming a tool, changing an argument's type, or making a field required. `initialize` metadata does not describe a tool set, so a handshake that replays identically is not evidence that a pending call is still a valid call.
 
@@ -80,7 +80,7 @@ Both outcomes are SEL-audited as `mcp-gateway.respawn-toolset`, `denied` on a re
 
 ## Scope
 
-This covers the daemon's transparent respawn, the path that previously compared nothing. The stub's reconnect after a broker restart (`stub.StubSession`) refuses a daemon generation whose replayed `initialize` result differs, but that check cannot see a tool set: the stub holds no listing, and acquiring one would need a synthetic `tools/list` from the stub process. Extending the reconnect to compare through `tool_surface` is the remaining increment.
+This covers the daemon's transparent respawn. The stub's reconnect after a broker restart (`stub.StubSession`) refuses a daemon generation whose replayed `initialize` result differs, but that check cannot see a tool set: the stub holds no listing, and acquiring one would need a synthetic `tools/list` from the stub process. Extending the reconnect to compare through `tool_surface` is the remaining increment.
 
 ## Tests
 

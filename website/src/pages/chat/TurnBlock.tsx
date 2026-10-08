@@ -11,6 +11,8 @@ import { isSpawnRunTool } from './SubagentRunCard'
 import { isWorkflowCompletionMessage } from './WorkflowCompletionCard'
 import { isSubagentCompletionMessage } from './subagentCompletion'
 import { isReasoningBurst } from './groupDisplayItems'
+import { isSystemNoticeRow } from './CompactionCard'
+import { parseRecoveryMessage } from './RecoveryCard'
 import { isDiffToolMessage } from './toolDiff'
 import { findOptionMarkers, stripOptionMarkers } from '../../app-sdk/protocol/optionMarker'
 import { hasKeepVisibleMarker } from '../../app-sdk/protocol/keepVisibleMarker'
@@ -64,8 +66,14 @@ const isConclusion = (it: TurnItem) => it.kind === 'single' && (it.msg.role === 
  * "Always visible" items — must render inline regardless of TurnBlock collapse state.
  * mcp_oauth: user must always see the Authorize button to act on it.
  * error: errors should never be hidden behind a "Worked through N steps" toggle.
+ * mcp_app inject: an embedded app's ui/message delivery is the USER'S OWN action
+ * (an Acknowledge click, a form submit) landing in the transcript — folding it
+ * into the steps pane hides the record of what they did behind a toggle.
  */
-const isAlwaysVisible = (it: TurnItem) => it.kind === 'single' && (it.msg.role === 'mcp_oauth' || it.msg.role === 'error')
+const isAlwaysVisible = (it: TurnItem) => it.kind === 'single' && (
+  it.msg.role === 'mcp_oauth' || it.msg.role === 'error' ||
+  (it.msg.role === 'inject' && it.msg.meta?.injectKind === 'mcp_app')
+)
 
 /**
  * Assistant text containing render-significant payloads must stay visible
@@ -140,9 +148,12 @@ const isCrewReply = (it: TurnItem) =>
  *  ([OPTIONS:] marker), a keep-visible-marked deliverable (#7948), a legacy
  *  crew-mode answer, a role that must surface inline (mcp_oauth, error), a
  *  workflow_run / spawn_run / workflow-completion / sub-agent-completion card,
- *  or an MCP App-bearing tool call (interactive iframe anchored to the row).
+ *  an MCP App-bearing tool call (interactive iframe anchored to the row), or a
+ *  row the caller pins (`pinnedRows`, see findAnsweredRefusalRows).
  *  All bypass the collapse pane. */
-const isVisibleInline = (it: TurnItem, appToolCallIds: ReadonlySet<string>) =>
+const NO_PINNED_ROWS: ReadonlySet<TurnItem> = new Set()
+const isVisibleInline = (it: TurnItem, appToolCallIds: ReadonlySet<string>, pinnedRows = NO_PINNED_ROWS) =>
+  pinnedRows.has(it) ||
   isRenderable(it) || isHandBack(it) || isKeepVisible(it) || isAlwaysVisible(it) || isCrewReply(it) ||
   isWorkflowRunItem(it) || isSpawnRunItem(it) ||
   isSubagentCompletionItem(it) ||
@@ -166,11 +177,11 @@ type Seg =
  * `idx` is the item's index in the caller's list, offset by `offset` when the
  * caller passes a slice.
  */
-function splitSegments(items: TurnItem[], appToolCallIds: ReadonlySet<string>, offset = 0): Seg[] {
+function splitSegments(items: TurnItem[], appToolCallIds: ReadonlySet<string>, offset = 0, pinnedRows = NO_PINNED_ROWS): Seg[] {
   const segs: Seg[] = []
   for (let i = 0; i < items.length; i++) {
     const it = items[i]
-    if (isVisibleInline(it, appToolCallIds)) {
+    if (isVisibleInline(it, appToolCallIds, pinnedRows)) {
       segs.push({ type: 'visible', it, idx: offset + i })
     } else {
       const last = segs[segs.length - 1]
@@ -197,22 +208,43 @@ function substantiveLength(text: string): number {
 /**
  * Find the index of a turn's conclusion item: the last `isConclusion` item that
  * is substantive (>= 50 chars), falling back to the last `isConclusion` item of
- * any length, else -1. Shared by the auto-expand decision and the render split
- * so the "what's the always-visible conclusion vs collapsed reasoning" answer
- * can't drift between them (a mismatch wrongly expands reasoning above a visible
- * match and pushes it down).
+ * any length, else -1. System notice rows (a watchdog recycle, a compaction)
+ * never qualify: they trail the answer and must not displace it. Shared by the
+ * auto-expand decision and the render split so the "what's the always-visible
+ * conclusion vs collapsed reasoning" answer can't drift between them (a
+ * mismatch wrongly expands reasoning above a visible match and pushes it down).
  */
 function findConclusionIdx(items: TurnItem[]): number {
   let conclusionIdx = -1
   let fallbackIdx = -1
   for (let i = items.length - 1; i >= 0; i--) {
     const it = items[i]
-    if (isConclusion(it)) {
+    if (isConclusion(it) && !(it.kind === 'single' && isSystemNoticeRow(it.msg))) {
       if (fallbackIdx === -1) fallbackIdx = i
       if (it.kind === 'single' && substantiveLength(it.msg.content) >= 50) { conclusionIdx = i; break }
     }
   }
   return conclusionIdx === -1 ? fallbackIdx : conclusionIdx
+}
+
+/**
+ * A tool-refusal recovery card whose dispatch ended on a substantive message,
+ * plus that message. The gateway queues the recovery after the dispatch ends,
+ * so the reply to it becomes the turn's conclusion and would fold a message the
+ * user has already read. Text followed by a tool call is working narration and
+ * still folds; other recovery kinds resume an interrupted dispatch.
+ */
+function findAnsweredRefusalRows(items: TurnItem[]): ReadonlySet<TurnItem> {
+  const rows = new Set<TurnItem>()
+  items.forEach((it, i) => {
+    const prev = items[i - 1]
+    if (it.kind === 'single' && it.msg.role === 'inject' && parseRecoveryMessage(it.msg.content)?.kind === 'refusal' &&
+        prev?.kind === 'single' && isConclusion(prev) && substantiveLength(prev.msg.content) >= 50) {
+      rows.add(prev)
+      rows.add(it)
+    }
+  })
+  return rows
 }
 
 /**
@@ -352,6 +384,7 @@ function TurnBlock({ turn, renderItem, collapseAll = false, appToolCallIds = EMP
   // turn.items, so a running turn shows one live reasoning line and a settled
   // turn shows one collapsed "Thought process" instead of a per-burst wall.
   const items = useMemo(() => mergeTurnThinking(turn.items), [turn.items])
+  const answeredRefusalRows = useMemo(() => findAnsweredRefusalRows(items), [items])
   // One React key per row of `items`, by message identity (see the block
   // comment above); `rowKey(i)` indexes THIS list, so every render path below
   // must pass the item's position in `items`, never a segment index.
@@ -384,8 +417,9 @@ function TurnBlock({ turn, renderItem, collapseAll = false, appToolCallIds = EMP
     const conclusionIdx = turn.interim ? -1 : findConclusionIdx(items)
     const beforeItems = turn.interim ? items : (conclusionIdx > 0 ? items.slice(0, conclusionIdx) : [])
     // Only the non-visible-inline pre-conclusion items are actually collapsed.
-    return beforeItems.some(it => !isVisibleInline(it, appToolCallIds) && msgIdxs(it).includes(currentMessageIdx))
-  }, [items, term, currentMessageIdx, collapseAll, appToolCallIds, turn.interim])
+    const pinnedRows = turn.interim ? NO_PINNED_ROWS : answeredRefusalRows
+    return beforeItems.some(it => !isVisibleInline(it, appToolCallIds, pinnedRows) && msgIdxs(it).includes(currentMessageIdx))
+  }, [items, term, currentMessageIdx, collapseAll, appToolCallIds, turn.interim, answeredRefusalRows])
   // Revealing a search match must win over the current disclosure state, and it
   // has to travel the SAME channel the host owns, or a controlled row would
   // stay collapsed and hide the <mark>. Held in a ref so an inline parent
@@ -454,7 +488,7 @@ function TurnBlock({ turn, renderItem, collapseAll = false, appToolCallIds = EMP
     // Split pre-conclusion items into ordered segments (see splitSegments):
     // visible items render in place; collapsed runs hide behind the reasoning
     // toggle.
-    const segs = splitSegments(beforeItems, appToolCallIds)
+    const segs = splitSegments(beforeItems, appToolCallIds, 0, answeredRefusalRows)
     const stepCount = countCollapsedSteps(segs)
 
     if (!turn.complete || stepCount === 0) {
@@ -543,8 +577,11 @@ function TurnBlock({ turn, renderItem, collapseAll = false, appToolCallIds = EMP
 function CollapseToggle({ expanded, onToggle, label }: { expanded: boolean; onToggle: () => void; label: string }) {
   return (
     <div className="px-4 py-0 mx-auto w-full" style={{ maxWidth: 'var(--mc-content-width, 900px)' }}>
-      <button className="flex items-center gap-2 text-[12px] leading-5 text-muted/60 hover:text-muted cursor-pointer bg-transparent border-none py-1 transition-colors" onClick={onToggle}>
-        <ChevronRight size={12} className={`transition-transform duration-150 ${expanded ? 'rotate-90' : ''}`} />
+      {/* The visible label IS the accessible name ("Worked through 2 steps" folded,
+          "Hide reasoning" open), so no aria-label; aria-expanded carries the state,
+          which a rotated chevron alone never announces. */}
+      <button aria-expanded={expanded} className="flex items-center gap-2 text-[12px] leading-5 text-muted/60 hover:text-muted cursor-pointer bg-transparent border-none py-1 transition-colors" onClick={onToggle}>
+        <ChevronRight size={12} aria-hidden="true" className={`transition-transform duration-150 ${expanded ? 'rotate-90' : ''}`} />
         {label}
       </button>
     </div>

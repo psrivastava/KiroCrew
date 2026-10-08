@@ -47,6 +47,7 @@ from kiro_crew.acp.types import (
     ACP_BACKENDS_SESSION_SHARING,
     ACP_BACKENDS_SKIP_CREW_SEATBELT_MACOS,
     ACP_BACKENDS_STEER,
+    ACP_BACKENDS_STEERING_REQUEST,
     ACP_BACKENDS_STRUCTURED_REFUSAL,
     ACP_CLIENT_CAPABILITIES,
     KAS_CLIENT_CAPABILITIES,
@@ -342,26 +343,55 @@ def test_steer_capability_declares_its_stamp() -> None:
     assert len(checked) >= 2, f"expected at least 2 steer-capable providers, saw {checked}"
 
 
-def test_is_kiro_cli_is_positive() -> None:
+def test_is_kiro_cli_is_positive(tmp_path) -> None:
     """H7: the sandbox-delegation flag is membership at every spawn site.
 
     This is the one identity test that fails OPEN. ``wrap_argv`` treats it as
     "this harness carries its own internal sandbox, which cannot nest inside
     ours, so skip ours" — granted to a harness without one, it leaves the agent
     process unconfined. A negative form grants it to every future harness.
+
+    Asked of the launch itself rather than of its spelling: every known host is
+    launched through the driver that serves it -- each per-session host on
+    ``AcpClient``, and every host the shared runtime serves on ``AcpRuntime`` --
+    with the pod-bundle step that decides the flag left real, and the flag the
+    sandbox wrap receives must be exactly membership.
     """
-    for spawn in (acp_runtime.AcpRuntime.spawn, acp_client.AcpClient.ensure_ready):
-        source = inspect.getsource(spawn)
-        for line in source.splitlines():
-            if "is_kiro_cli=" not in line:
-                continue
-            value = line.split("is_kiro_cli=", 1)[1]
-            assert (
-                "not " not in value and "!=" not in value
-            ), f"{spawn.__qualname__} derives is_kiro_cli from a negation: {line.strip()}"
-            assert "ACP_BACKENDS_INTERNAL_SANDBOX" in value or value.strip().startswith(
-                ("True", "False")
-            ), f"{spawn.__qualname__} must use membership or a literal: {line.strip()}"
+    from unittest.mock import AsyncMock, patch
+
+    import acp_launch_capture as capture_mod
+
+    from kiro_crew.acp_backends import ACP_BACKENDS_ACP_RUNTIME, ACP_BACKENDS_KNOWN
+
+    client_hosts = ACP_BACKENDS_KNOWN - capture_mod.RUNTIME_ONLY_BACKENDS
+    launches = [(acp_client, backend) for backend in sorted(client_hosts)]
+    launches += [(acp_runtime, backend) for backend in sorted(ACP_BACKENDS_ACP_RUNTIME)]
+    for driver, backend in launches:
+        flags: list[object] = []
+
+        async def _wrap(argv, _flags=flags, **kwargs):
+            _flags.append(kwargs["is_kiro_cli"])
+            return list(argv), None
+
+        patches = (
+            patch.object(driver, "apply_pod_bundle_spawn", new=acp_client.apply_pod_bundle_spawn),
+            patch.object(driver, "wrap_argv_async", side_effect=_wrap),
+            patch.object(
+                acp_client,
+                "_resolve_kiro_bin_for_spawn",
+                new=AsyncMock(return_value=capture_mod._KIRO_BIN),
+            ),
+        )
+        where = tmp_path / driver.__name__ / (backend or "kiro")
+        if driver is acp_runtime:
+            capture_mod._capture_runtime_served(
+                backend, where, capture_mod.fixed_parent_env(), patches
+            )
+        else:
+            capture_mod.capture(backend, where, extra_patches=patches)
+        assert flags == [
+            backend in ACP_BACKENDS_INTERNAL_SANDBOX
+        ], f"{driver.__name__} launched {backend or 'kiro'!r} with is_kiro_cli={flags}"
 
     assert ACP_BACKENDS_INTERNAL_SANDBOX == frozenset({ACP_BACKEND_KIRO}), (
         "only kiro-cli ships an internal OS sandbox; adding a member here waives "
@@ -726,8 +756,11 @@ def test_codex_resolves_its_own_adapter_and_declares_its_own_handshake() -> None
     # And the client core carries neither the constant nor a row for codex.
     assert not hasattr(acp_client, "PROTOCOL_VERSION_CODEX")
     assert ACP_BACKEND_CODEX not in acp_client._PROTOCOL_VERSION_BY_BACKEND
-    assert "_PROTOCOL_VERSION_BY_BACKEND" in inspect.getsource(
+    assert "self._initialize_params()" in inspect.getsource(
         acp_client.AcpClient._initialize_session
+    )
+    assert "_PROTOCOL_VERSION_BY_BACKEND" in inspect.getsource(
+        acp_client.AcpClient._initialize_params
     )
 
 
@@ -984,6 +1017,12 @@ def test_skip_crew_seatbelt_macos_is_claude_only() -> None:
 #: :func:`test_every_runtime_path_identity_test_is_declared`.
 _DECLARED_IDENTITY_TESTS: dict[tuple[str, str], str] = {
     (
+        "src/kiro_crew/acp/session_handle.py",
+        "_build_permission_event",
+    ): "``_meta.kiro.consent`` on a permission request is KAS's own vocabulary (toolId "
+    "plus consent capability). No other harness sends it, and reading it elsewhere would "
+    "mint a non-shell verdict from a shape that backend never promised.",
+    (
         "src/kiro_crew/acp/runtime.py",
         "_spawn_admitted",
     ): "Only native Kiro loads the alias agent files and workspace resource-inheritance "
@@ -1050,12 +1089,19 @@ _SELECT_ONLY_SESSION_RESP = {
 
 @pytest.mark.parametrize("backend", sorted(ACP_BACKENDS_KNOWN))
 def test_steer_advertisement_matches_the_steer_table(backend):
-    """H6: the handle advertises steer iff the host is in ``ACP_BACKENDS_STEER``.
+    """H6: the handle advertises steer iff the host is in a steer table.
+
+    User steer reads ``ACP_BACKENDS_STEER`` or ``ACP_BACKENDS_STEERING_REQUEST``;
+    a deny notice reads ``ACP_BACKENDS_STEER`` alone.
 
     Ran for every known backend, which is the point: this answer was a literal
     ``True`` for years and was honest only while ``AcpRuntime`` served one host.
     """
-    assert _handle_for(backend).supports_steer is (backend in ACP_BACKENDS_STEER)
+    handle = _handle_for(backend)
+    assert handle.supports_steer is (
+        backend in ACP_BACKENDS_STEER or backend in ACP_BACKENDS_STEERING_REQUEST
+    )
+    assert handle.supports_refusal_steer is (backend in ACP_BACKENDS_STEER)
 
 
 @pytest.mark.parametrize("backend", sorted(ACP_BACKENDS_KNOWN))

@@ -21,8 +21,10 @@ import { isNotFoundError } from '../api/apiError'
 import { PageHeader, Card, CardTitle, Badge, Btn } from '../components/ui'
 import SessionApprovalModes from '../components/appstore/SessionApprovalModes'
 import AppIcon from '../components/AppIcon'
-import TrustAppModal, { APP_EXECUTION_DENIED, isTrustDeniedError, useTrustGate } from '../components/appstore/TrustAppModal'
-import { isRegistrySourced, sanitizeStargazersCount, type RegistryApp } from '../components/appstore/types'
+import TrustAppModal, {
+  APP_EXECUTION_DENIED, DESKTOP_BUILD_STEP_UNSUPPORTED, isTrustDeniedError, useTrustGate,
+} from '../components/appstore/TrustAppModal'
+import { isRegistrySourced, normalizeRegistryApp, type RegistryApp } from '../components/appstore/types'
 import AppSource from '../components/appstore/AppSource'
 import { recordEvent } from '../rum'
 import { useTheme } from '../hooks/useTheme'
@@ -131,6 +133,10 @@ interface RegistryEntry extends Partial<AppInfo> {
   name: string
   updateAvailable?: boolean
 }
+
+/** A registry entry after `normalizeRegistryApp`: its display fields are always
+ *  strings (fallbacks filled) and its star count is sanitized. */
+type NormalizedRegistryEntry = RegistryEntry & Pick<AppInfo, 'displayName' | 'description' | 'version' | 'author'>
 
 interface AppManifest {
   displayName?: string
@@ -620,8 +626,33 @@ export default function AppDetailPage() {
   const [installLog, setInstallLog] = useState('')
   const [showInstallLog, setShowInstallLog] = useState(false)
   const [installDone, setInstallDone] = useState(false)
+  /**
+   * Dismiss for the permanent desktop refusal's banner: one event, one control.
+   * The refusal renders the banner AND the install-log panel whose header states
+   * the same outcome, so clearing the banner alone would leave "Install failed"
+   * on screen beside a re-enabled Install -- or, once `error` is empty, flip the
+   * panel's header to "Install complete" over a log that ends in a refusal.
+   * Dropping the panel with the banner leaves the page as it was before the
+   * attempt, which is what a retry starts from.
+   */
+  const dismissRefusal = useCallback(() => {
+    setError('')
+    setShowInstallLog(false)
+  }, [])
   const installLogRef = useRef<HTMLPreElement>(null)
   const installAbortRef = useRef<AbortController | null>(null)
+  /**
+   * The last install failure as reported: its message, for the trust retry to
+   * throw, and the machine `code` the stream's `done` payload carried beside it.
+   *
+   * A REF, not state: the retry closure reads it immediately after `runInstall()`
+   * returns, and a state update is not visible in that same tick. The message is
+   * the string `reportInstallFailure` journaled, so the consent modal's
+   * `ErrorNotice` recovers the endpoint and the install log tail from the same
+   * key it renders; the code rides on the thrown error so the modal can tell a
+   * permanent refusal from a failure worth retrying.
+   */
+  const installFailureRef = useRef<{ message: string; code: string }>({ message: '', code: '' })
   const [clientInstall, setClientInstall] = useState<{ shell?: string; postInstall?: string } | null>(null)
   const [copied, setCopied] = useState(false)
   const [serverHostname, setServerHostname] = useState('')
@@ -664,14 +695,18 @@ export default function AppDetailPage() {
    *  agent hand-off on the failure notice would carry only the one-line message.
    *  The log is read from the rendered <pre> (the accumulated state, not a stale
    *  closure); `recordError` redacts and caps it. The message string is the
-   *  journal key, so it must be exactly what `setError` shows. */
-  const reportInstallFailure = useCallback((message: string, source: 'api' | 'system') => {
+   *  journal key, so it must be exactly what `setError` shows. `code` is the
+   *  `done` payload's machine code, when it carried one, journaled so a client
+   *  can act on the failure instead of matching its prose. */
+  const reportInstallFailure = useCallback((message: string, source: 'api' | 'system', code = '') => {
     recordError({
       source,
       message,
+      code: code || undefined,
       endpoint: '/api/apps/registry/install-stream',
       detail: installLogRef.current?.textContent || undefined,
     })
+    installFailureRef.current = { message, code }
     setError(message)
   }, [])
 
@@ -700,11 +735,24 @@ export default function AppDetailPage() {
       // failure here is held rather than swallowed: an INSTALLED app can still
       // render from its manifest, but the reader is told the catalog was not
       // reachable; an app that is not installed cannot be resolved without it.
-      let registryList: RegistryEntry[] = []
+      //
+      // Rows are normalized ONCE here, at the fetch site, by the same
+      // `normalizeRegistryApp` the browse list uses -- so every branch below
+      // reads coerced display fields and a sanitized star count instead of
+      // re-defending them field by field. The RAW rows are kept beside them for
+      // one reader only: `mergeBuiltinRow` is row-first, and normalize fills a
+      // missing `displayName` with the slug, which would then beat the
+      // manifest's own name. The merge already accepts a loose row and fills
+      // its own gaps, so it is handed the row as the server sent it.
+      let rawRegistryList: RegistryEntry[] = []
+      let registryList: NormalizedRegistryEntry[] = []
       let sideFailure: unknown = null
       try {
         const registryData = await api.listRegistry()
-        registryList = (registryData.apps || []) as RegistryEntry[]
+        rawRegistryList = (registryData.apps || []) as RegistryEntry[]
+        registryList = rawRegistryList.map(
+          (r) => normalizeRegistryApp(r as RegistryApp) as NormalizedRegistryEntry,
+        )
       } catch (e: unknown) {
         sideFailure = e
       }
@@ -717,6 +765,7 @@ export default function AppDetailPage() {
         sideFailure ??= e
       }
       const registryEntry = registryList.find((r) => r.name === name)
+      const rawRegistryEntry = rawRegistryList.find((r) => r.name === name)
 
       if (installed) {
         const m = installed.manifest || {}
@@ -727,9 +776,9 @@ export default function AppDetailPage() {
         // "Kiro Crew · Developer Tools" in the list and "kirocrew · Productivity"
         // one click later. The catalog is the store's inventory on both surfaces
         // or on neither.
-        if (registryEntry && isBuiltinServerRow(registryEntry)) {
+        if (rawRegistryEntry && registryEntry && isBuiltinServerRow(registryEntry)) {
           setApp({
-            ...mergeBuiltinRow(registryEntry, { ...m, version: installed.version }),
+            ...mergeBuiltinRow(rawRegistryEntry, { ...m, version: installed.version }),
             name: installed.name,
             installed: true,
             installedVersion: installed.version,
@@ -854,7 +903,7 @@ export default function AppDetailPage() {
             // fallback identifier is a separate decision from resolving art.
             repo: registryEntry?.repo || '',
             trustRepository: installed.trustRepository,
-            stargazersCount: sanitizeStargazersCount(registryEntry?.stargazersCount),
+            stargazersCount: registryEntry?.stargazersCount,
             installed: true,
             installedVersion: installed.version,
             enabled: installed.enabled,
@@ -871,19 +920,9 @@ export default function AppDetailPage() {
         }
       } else if (registryEntry) {
         setApp({
+          // Already normalized at the fetch site: display fields are strings
+          // with their fallbacks filled and the star count is sanitized.
           ...registryEntry,
-          // Required AppInfo fields — registry entries normally carry these, but
-          // fall back so the object always satisfies AppInfo.
-          name: registryEntry.name,
-          displayName: registryEntry.displayName || registryEntry.name,
-          description: registryEntry.description || '',
-          version: registryEntry.version || '0.0.0',
-          author: registryEntry.author || '',
-          // The spread above copies the RAW listRegistry payload, which never
-          // went through normalizeRegistryApp — sanitize the display-only star
-          // count explicitly so a hostile/older gateway cannot render NaN/-1
-          // or a layout-breaking 1e308 here (the list path is already covered).
-          stargazersCount: sanitizeStargazersCount(registryEntry.stargazersCount),
           // Preserve install status from registry (set by detectInstalled)
           installed: registryEntry.installed ?? false,
           platform: registryEntry.platform,
@@ -955,6 +994,9 @@ export default function AppDetailPage() {
     setInstallDone(false)
     setShowInstallLog(true)
     clearError()
+    // Drop the previous attempt's reason: a retry that fails for a new cause (or
+    // is aborted, which has none) must never show the first attempt's.
+    installFailureRef.current = { message: '', code: '' }
     setClientInstall(null)
     installAbortRef.current?.abort()
     const controller = new AbortController()
@@ -1005,7 +1047,7 @@ export default function AppDetailPage() {
         await load()
         window.dispatchEvent(new Event('mc:apps-changed'))
       } else {
-        reportInstallFailure(result.error || i18nT('pages.appDetailPage.install_failed'), 'system')
+        reportInstallFailure(result.error || i18nT('pages.appDetailPage.install_failed'), 'system', result.code || '')
         return 'failed'
       }
     } catch (e: unknown) {
@@ -1078,7 +1120,19 @@ export default function AppDetailPage() {
         // silent no-op.
         const outcome = await runInstall()
         if (outcome === 'trust-required') throw new Error(APP_EXECUTION_DENIED)
-        if (outcome !== 'done') throw new Error(i18nT('pages.appDetailPage.install_failed'))
+        // The server's own sentence, so the modal can show WHY instead of only
+        // the generic copy, with the machine code beside it so the modal can tell
+        // a permanent refusal from a failure worth retrying (`errorCode` reads a
+        // direct `code` property). `installFailureRef` holds what
+        // `reportInstallFailure` journaled; an abort reports nothing, so it falls
+        // back to the generic string rather than reusing a stale reason.
+        if (outcome !== 'done') {
+          const { message, code } = installFailureRef.current
+          throw Object.assign(
+            new Error(message || i18nT('pages.appDetailPage.install_failed')),
+            code ? { code } : {},
+          )
+        }
       },
     )
   }
@@ -1265,6 +1319,45 @@ export default function AppDetailPage() {
   // mixed array that the resolver correctly rejects.
   const useCases = appUseCases(app)
   const configuration = appConfiguration(app)
+  // The journal entry behind the current error, when there is one: its `code` is
+  // the `done` payload's machine code, journaled by `reportInstallFailure`, and
+  // it selects the error box's copy below. Looked up by the message, which is
+  // the journal key, so a later unrelated `setError` never inherits an install
+  // failure's code.
+  const errorReport = error ? findReport(error) : undefined
+  // The desktop build-step refusal is permanent for this app as it is: the
+  // Install / Update buttons below are disabled while its banner is up, because
+  // pressing them runs the same clone and build into the same refusal. The
+  // banner's dismiss clears `error`, which is how a retry is reached once the
+  // app's author has shipped the packages. The disabled buttons SAY so: a
+  // reader who met the banner's label alone could not tell what dismissing a
+  // notice had to do with being allowed to install again, so the causality is
+  // stated at the point of action too -- a `title` on the button they are
+  // actually looking at.
+  const installRefusedForGood = Boolean(error) && errorReport?.code === DESKTOP_BUILD_STEP_UNSUPPORTED
+  // The verb follows the action the user pressed: on an INSTALLED app the button
+  // beside "Installed version" is Update, and a banner saying "can't be
+  // installed" with a dismiss that "re-enables Install" would describe a button
+  // that is not there. Every key is resolved as a LITERAL (`check-i18n-keys.mjs`
+  // verifies only a key it can read at the `i18nT()` call site), and the page
+  // help sentence carries the shared explanation in `{{help}}` either way.
+  const refusalHelp = i18nT('components.appstore.trustAppModal.failed_desktop_unsupported_help')
+  const refusalCopy = !installRefusedForGood
+    ? undefined
+    : app.installed
+      ? {
+        title: i18nT('pages.appDetailPage.update_desktop_unsupported'),
+        message: i18nT('pages.appDetailPage.update_desktop_unsupported_help', { help: refusalHelp }),
+        dismiss: i18nT('pages.appDetailPage.dismiss_to_update_again'),
+        disabledTitle: i18nT('pages.appDetailPage.dismiss_notice_to_update_again'),
+      }
+      : {
+        title: i18nT('pages.appDetailPage.install_desktop_unsupported'),
+        message: i18nT('pages.appDetailPage.install_desktop_unsupported_help', { help: refusalHelp }),
+        dismiss: i18nT('pages.appDetailPage.dismiss_to_install_again'),
+        disabledTitle: i18nT('pages.appDetailPage.dismiss_notice_to_install_again'),
+      }
+  const installDisabledTitle = refusalCopy?.disabledTitle
 
   return (
     <>
@@ -1308,8 +1401,41 @@ export default function AppDetailPage() {
             backend failure, so it renders the prose — better than swallowing
             it — plus the agent hand-off, since raw backend prose is otherwise
             a dead end. The page holds no draft (every action commits on
-            click), so the hand-off is safe. */}
-        <ErrorNotice message={error} askAgent onDismiss={clearError} className="mb-4 animate-rise" />
+            click), so the hand-off is safe.
+
+            One recognized case: the desktop build-step refusal. An app that is
+            ALREADY trusted never opens the consent modal, so its refusal lands
+            here, and the raw sentence alone is developer vocabulary with no hint
+            that retrying is futile. The journal carries the `done` payload's code
+            beside the message (`reportInstallFailure`), so the code the modal
+            keys its copy on is read here too. One verb on both surfaces: the
+            refusal is the install's (the build step runs at install and nowhere
+            else, so the untrusted path reaches the modal's copy from this same
+            Install button), and a reader who meets the modal's sentence and then
+            this banner behind it must not have to wonder whether installing and
+            turning on are two steps. The plain sentence beneath is shared, with
+            this page's own trailing sentence naming the way back to a retry: the
+            banner's dismiss is that way, so the control carries a visible label
+            saying so instead of the icon-only ✕ -- nothing else on the page
+            re-enables Install. The server's own sentence is NOT repeated here:
+            the install-log panel beneath shows it verbatim as the streamed
+            refusal line, and the agent hand-off carries it through the report,
+            so the banner says the refusal once in plain words rather than three
+            times in three registers. */}
+        {refusalCopy ? (
+          <ErrorNotice
+            title={refusalCopy.title}
+            message={refusalCopy.message}
+            report={errorReport}
+            askAgent
+            onDismiss={dismissRefusal}
+            dismissLabel={refusalCopy.dismiss}
+            dismissLabelVisible
+            className="mb-4 animate-rise"
+          />
+        ) : (
+          <ErrorNotice message={error} askAgent onDismiss={clearError} className="mb-4 animate-rise" />
+        )}
 
         {/* Third-party execution-trust consent. Opened when an enable OR a
             registry install is refused with code `app_execution_denied`, instead
@@ -1318,6 +1444,8 @@ export default function AppDetailPage() {
           app={trust.target}
           pending={trust.pending}
           failed={trust.failed}
+          detail={trust.detail}
+          detailCode={trust.detailCode}
           granted={trust.granted}
           onCancel={trust.cancel}
           onConfirm={trust.confirm}
@@ -1405,7 +1533,7 @@ export default function AppDetailPage() {
             {/* Actions */}
             <div className="flex items-center gap-2 flex-wrap">
               {!app.installed && !clientInstall && (
-                <Btn primary onClick={handleInstall} disabled={actionLoading === 'install'}>
+                <Btn primary onClick={handleInstall} disabled={actionLoading === 'install' || installRefusedForGood} title={installDisabledTitle}>
                   {actionLoading === 'install' ? <><Loader2 size={14} className="animate-spin" /> {i18nT('pages.appDetailPage.installing')}</> : <><Download size={14} /> {i18nT('pages.appDetailPage.install')}</>}
                 </Btn>
               )}
@@ -1441,7 +1569,7 @@ export default function AppDetailPage() {
               {app.installed && isSelfManaged && !isBuiltin && (
                 <>
                   <div className="text-[13px] text-ok flex items-center gap-1.5"><Check size={14} /> {i18nT('pages.appDetailPage.installed_version', { version: app.installedVersion })}</div>
-                  {app.updateAvailable && <Btn onClick={handleInstall} disabled={actionLoading === 'install'} className="!bg-[var(--info)] !text-white hover:!opacity-80">{actionLoading === 'install' ? <><Loader2 size={14} className="animate-spin" /> {i18nT('pages.appDetailPage.updating')}</> : <><ArrowUp size={14} /> {i18nT('pages.appDetailPage.update')}</>}</Btn>}
+                  {app.updateAvailable && <Btn onClick={handleInstall} disabled={actionLoading === 'install' || installRefusedForGood} title={installDisabledTitle} className="!bg-[var(--info)] !text-white hover:!opacity-80">{actionLoading === 'install' ? <><Loader2 size={14} className="animate-spin" /> {i18nT('pages.appDetailPage.updating')}</> : <><ArrowUp size={14} /> {i18nT('pages.appDetailPage.update')}</>}</Btn>}
                   {canUninstall && <Btn danger onClick={() => handleAction('uninstall')} disabled={actionLoading === 'uninstall'} title={i18nT('pages.appDetailPage.removes_kirocrew_metadata_only_the_app_itself_is')}><Trash2 size={14} /> {i18nT('pages.appDetailPage.uninstall')}</Btn>}
                 </>
               )}
@@ -1475,7 +1603,7 @@ export default function AppDetailPage() {
                   )}
                     </>
                   )}
-                  {canUpdate && app.updateAvailable && <Btn onClick={handleInstall} disabled={actionLoading === 'install'} className="!bg-[var(--info)] !text-white hover:!opacity-80">{actionLoading === 'install' ? <><Loader2 size={14} className="animate-spin" /> {i18nT('pages.appDetailPage.updating')}</> : <><ArrowUp size={14} /> {i18nT('pages.appDetailPage.update')}</>}</Btn>}
+                  {canUpdate && app.updateAvailable && <Btn onClick={handleInstall} disabled={actionLoading === 'install' || installRefusedForGood} title={installDisabledTitle} className="!bg-[var(--info)] !text-white hover:!opacity-80">{actionLoading === 'install' ? <><Loader2 size={14} className="animate-spin" /> {i18nT('pages.appDetailPage.updating')}</> : <><ArrowUp size={14} /> {i18nT('pages.appDetailPage.update')}</>}</Btn>}
                   {canUpdate && !app.updateAvailable && <Btn onClick={() => handleAction('update')} disabled={actionLoading === 'update'} title={i18nT('pages.appDetailPage.sync_app_from_its_source_directory')}><RefreshCw size={14} /> {i18nT('pages.appDetailPage.sync')}</Btn>}
                   {canUninstall && <Btn danger onClick={() => handleAction('uninstall')} disabled={actionLoading === 'uninstall'}><Trash2 size={14} /> {i18nT('pages.appDetailPage.uninstall')}</Btn>}
                 </>
@@ -1491,7 +1619,7 @@ export default function AppDetailPage() {
               <div className="flex items-center gap-2">
                 {!installDone && <Loader2 size={14} className="animate-spin text-accent" />}
                 {installDone && !error && <Check size={14} className="text-ok" />}
-                {installDone && error ? (
+                {installDone && error && !installRefusedForGood ? (
                   /* The failure headline is the shared surface, not a bespoke
                      "Fix with AI" button. The hand-off resolves the journal entry
                      `reportInstallFailure` wrote for this exact message, so it
@@ -1505,13 +1633,30 @@ export default function AppDetailPage() {
                     askAgent
                   />
                 ) : (
+                  /* Under the permanent desktop refusal's banner the row is a
+                     plain title naming what the panel is -- the log -- not the
+                     outcome: the banner already carries the explanation, the
+                     agent hand-off and the one dismiss, and a second red notice
+                     with its own copies of both left a reader unable to tell why
+                     there were two or which dismiss clears what. The log stays
+                     reachable beneath it. The title takes the verb of the path
+                     the banner took (Update on an installed app), so the panel
+                     under an update-verbed banner is not named for an install. */
                   <CardTitle>
-                    {!installDone ? i18nT('pages.appDetailPage.installing') : i18nT('pages.appDetailPage.install_complete')}
+                    {!installDone
+                      ? i18nT('pages.appDetailPage.installing')
+                      : error
+                        ? app.installed
+                          ? i18nT('pages.appDetailPage.update_log')
+                          : i18nT('pages.appDetailPage.install_log')
+                        : i18nT('pages.appDetailPage.install_complete')}
                   </CardTitle>
                 )}
               </div>
               <div className="flex items-center gap-2">
-                {installDone && (
+                {/* One dismiss while the refusal banner is up -- the banner's,
+                    which drops this panel too. */}
+                {installDone && !installRefusedForGood && (
                   <button className="text-muted hover:text-text transition-colors p-1" onClick={() => setShowInstallLog(false)} aria-label={i18nT('pages.appDetailPage.close')}>
                     <X size={14} />
                   </button>
@@ -1521,7 +1666,7 @@ export default function AppDetailPage() {
             <pre
               ref={installLogRef}
               className="bg-bg border border-border rounded-lg p-3 text-[12px] text-muted whitespace-pre-wrap font-mono max-h-64 overflow-y-auto"
-            >{installLog || i18nT('pages.appDetailPage.starting_install')}</pre>
+            >{installLog || (installDone ? '' : i18nT('pages.appDetailPage.starting_install'))}</pre>
           </Card>
         )}
 
@@ -1549,7 +1694,7 @@ export default function AppDetailPage() {
                 <div className="relative group/cmd">
                   <pre className="bg-bg border border-border rounded-lg p-3 pr-10 text-[13px] font-mono text-text overflow-x-auto whitespace-pre-wrap break-all">{resolvedShell}</pre>
                   <button
-                    className="absolute top-2 right-2 p-1.5 rounded-md bg-bg-elevated border border-border text-muted hover:text-text hover:border-accent/40 transition-all opacity-0 group-hover/cmd:opacity-100"
+                    className="absolute top-2 right-2 p-1.5 rounded-md bg-bg-elevated border border-border text-muted hover:text-text hover:border-accent/40 transition-all opacity-0 group-hover/cmd:opacity-100 [@media(hover:none)]:opacity-100"
                     aria-label={i18nT('pages.appDetailPage.copy_command')}
                     onClick={async () => {
                       // Gate the confirmation on the boolean: a tick over an

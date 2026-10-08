@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import re
+import time
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -11,6 +14,7 @@ import pytest
 from conftest import MockSlackClient
 from kiro_crew.context import ContextBuilder
 from kiro_crew.hooks import HOOK_REPLY, AutoReplyHook, HookManager, HooksConfig
+from kiro_crew.messaging import auto_title
 from kiro_crew.providers.base import LLMEvent
 from kiro_crew.slack.format import CONTINUATION, SLACK_MSG_LIMIT, split_message
 from kiro_crew.slack.handler import (
@@ -29,6 +33,12 @@ from kiro_crew.slack.handler import (
     set_owner_id,
 )
 
+#: These tests exercise the SLACK side (thread renaming), not the record
+#: pin, so they pass the value production supplies when there is nothing to
+#: pin. ``maybe_auto_title`` requires it, which is what stops a call site
+#: from reading the record inside the task and reopening the window.
+_PRESENT_PIN = auto_title.RecordPin(auto_title.RECORD_PRESENT, "")
+
 
 @pytest.fixture(autouse=True)
 def _clean_approval_state():
@@ -40,6 +50,58 @@ def _clean_approval_state():
     _pending_approvals.clear()
     _trusted_sessions.clear()
     _thread_agents.clear()
+
+
+#: Lost-run ceiling for a wait on something the turn under test does by itself
+#: (post and register an approval prompt, park on a gap, finish after a click).
+#: Timed wait by wait: at most 0.04 s at ``-n 4`` on a loaded 32-CPU host, and at
+#: most 3.6 s when every executor hop is delayed by 1.2 s (a starved-runner model;
+#: the turn makes three hops before its prompt). 60 s is over ten times that and
+#: half the module's ``--timeout=120``: only a turn that never gets there reaches it.
+_LOST_RUN_SECS = 60.0
+
+
+async def _within_lost_run(awaitable, what: str):
+    """Await *awaitable* under ``_LOST_RUN_SECS``; on expiry fail naming *what*.
+
+    A bare ``wait_for`` raises an empty ``TimeoutError``. This one says what never
+    finished, the ceiling and the elapsed time. A ``TimeoutError`` the awaited code
+    raises on its own, before the ceiling, propagates unchanged.
+    """
+    started = time.monotonic()
+    try:
+        return await asyncio.wait_for(awaitable, _LOST_RUN_SECS)
+    except asyncio.TimeoutError:
+        elapsed = time.monotonic() - started
+        # A loop timer can fire up to one clock tick early (15.6 ms on Windows 3.12).
+        if elapsed < _LOST_RUN_SECS - 1.0:
+            raise
+        pytest.fail(
+            f"{what} did not finish within the {_LOST_RUN_SECS:.0f}s lost-run ceiling "
+            f"({elapsed:.1f}s elapsed)"
+        )
+
+
+async def _approval_prompt_ts(slack, channel: str = "C1") -> str:
+    """The ts of the first approval prompt once the turn has posted AND registered it.
+
+    A click that lands between the post and ``_request_approval``'s registration
+    answers "no pending approval" and leaves the turn parked on its 120 s approval
+    budget. So this waits for the registration, which is the state a click needs,
+    and fails by name when it never comes instead of falling through silently.
+    """
+    started = time.monotonic()
+    while True:
+        posted = [a for a in slack.actions if a[0] == "blocks"]
+        if posted and f"{channel}:{posted[0][1]['ts']}" in _pending_approvals:
+            return posted[0][1]["ts"]
+        elapsed = time.monotonic() - started
+        if elapsed > _LOST_RUN_SECS:
+            pytest.fail(
+                f"no approval prompt was registered within the {_LOST_RUN_SECS:.0f}s "
+                f"lost-run ceiling ({elapsed:.1f}s elapsed); actions={slack.actions}"
+            )
+        await asyncio.sleep(0.01)
 
 
 class FakeProvider:
@@ -84,7 +146,7 @@ class FakeSessionManager:
         self._is_new = True
         self.removed: list[str] = []
 
-    async def get_or_create(self, key, agent=None, channel_id=None):
+    async def get_or_create(self, key, agent=None, channel_id=None, start_priority=None):
         self.keys_seen.append(key)
         self.last_agent = agent
         self.last_channel_id = channel_id
@@ -168,7 +230,7 @@ class FakeSessionManager:
     def dequeue(self, key):
         return None
 
-    def clear_queue(self, key):
+    def clear_queue(self, key, owned_by=None):
         pass
 
     # Interface parity with the real SessionManager's user-Stop record: a
@@ -200,6 +262,10 @@ class FakeSessionManager:
         elif outcome == "hard" and on_hard:
             await on_hard()
         return outcome
+
+    def compact_wait_budget_secs(self) -> float:
+        """The real manager's resolved ``session.compact_wait_secs`` (unset: 300 s)."""
+        return 300.0
 
 
 class TestHandleMessage:
@@ -754,7 +820,7 @@ class TestHandleMessage:
     @pytest.mark.asyncio
     async def test_session_create_failure_does_not_raise_unbound_client(self):
         class _FailingSessions(FakeSessionManager):
-            async def get_or_create(self, key, agent=None, channel_id=None):
+            async def get_or_create(self, key, agent=None, channel_id=None, start_priority=None):
                 raise ConnectionResetError("Connection lost")
 
         slack = MockSlackClient()
@@ -912,22 +978,25 @@ class TestToolApproval:
         sessions = FakeSessionManager(provider)
 
         async def _click_approve():
-            for _ in range(200):
-                await asyncio.sleep(0.01)
-                blocks_actions = [a for a in slack.actions if a[0] == "blocks"]
-                if blocks_actions:
-                    await asyncio.sleep(0.15)
-                    approval_ts = blocks_actions[0][1]["ts"]
-                    await handle_interaction("C1", approval_ts, "approve_tool", user_id="U1")
-                    gate.set()
-                    return
+            approval_ts = await _approval_prompt_ts(slack)
+            await handle_interaction("C1", approval_ts, "approve_tool", user_id="U1")
             gate.set()
 
-        await asyncio.gather(
-            handle_message(
-                slack, sessions, "C1", "write it", None, "msg1", "U1", approval_mode="interactive"
+        await _within_lost_run(
+            asyncio.gather(
+                handle_message(
+                    slack,
+                    sessions,
+                    "C1",
+                    "write it",
+                    None,
+                    "msg1",
+                    "U1",
+                    approval_mode="interactive",
+                ),
+                _click_approve(),
             ),
-            _click_approve(),
+            "the turn and its click",
         )
 
         blocks_actions = [a for a in slack.actions if a[0] == "blocks"]
@@ -964,22 +1033,25 @@ class TestToolApproval:
         sessions = FakeSessionManager(provider)
 
         async def _click_reject():
-            for _ in range(200):
-                await asyncio.sleep(0.01)
-                blocks_actions = [a for a in slack.actions if a[0] == "blocks"]
-                if blocks_actions:
-                    await asyncio.sleep(0.15)
-                    approval_ts = blocks_actions[0][1]["ts"]
-                    await handle_interaction("C1", approval_ts, "reject_tool", user_id="U1")
-                    gate.set()
-                    return
+            approval_ts = await _approval_prompt_ts(slack)
+            await handle_interaction("C1", approval_ts, "reject_tool", user_id="U1")
             gate.set()
 
-        await asyncio.gather(
-            handle_message(
-                slack, sessions, "C1", "delete it", None, "msg1", "U1", approval_mode="interactive"
+        await _within_lost_run(
+            asyncio.gather(
+                handle_message(
+                    slack,
+                    sessions,
+                    "C1",
+                    "delete it",
+                    None,
+                    "msg1",
+                    "U1",
+                    approval_mode="interactive",
+                ),
+                _click_reject(),
             ),
-            _click_reject(),
+            "the turn and its click",
         )
 
         assert "req-99" in provider.rejected
@@ -1010,20 +1082,24 @@ class TestToolApproval:
         sessions = FakeSessionManager(provider)
 
         async def _click_approve():
-            for _ in range(200):
-                await asyncio.sleep(0.01)
-                blocks_actions = [a for a in slack.actions if a[0] == "blocks"]
-                if blocks_actions:
-                    await asyncio.sleep(0.15)
-                    approval_ts = blocks_actions[0][1]["ts"]
-                    await handle_interaction("C1", approval_ts, "approve_tool", user_id="U1")
-                    return
+            approval_ts = await _approval_prompt_ts(slack)
+            await handle_interaction("C1", approval_ts, "approve_tool", user_id="U1")
 
-        await asyncio.gather(
-            handle_message(
-                slack, sessions, "C1", "read it", None, "msg1", "U1", approval_mode="interactive"
+        await _within_lost_run(
+            asyncio.gather(
+                handle_message(
+                    slack,
+                    sessions,
+                    "C1",
+                    "read it",
+                    None,
+                    "msg1",
+                    "U1",
+                    approval_mode="interactive",
+                ),
+                _click_approve(),
             ),
-            _click_approve(),
+            "the turn and its click",
         )
 
         assert 42 in provider.approved
@@ -1054,22 +1130,25 @@ class TestToolApproval:
         sessions = FakeSessionManager(provider)
 
         async def _click_approve():
-            for _ in range(200):
-                await asyncio.sleep(0.01)
-                blocks_actions = [a for a in slack.actions if a[0] == "blocks"]
-                if blocks_actions:
-                    await asyncio.sleep(0.15)
-                    approval_ts = blocks_actions[0][1]["ts"]
-                    await handle_interaction("C1", approval_ts, "approve_tool", user_id="U1")
-                    gate.set()
-                    return
+            approval_ts = await _approval_prompt_ts(slack)
+            await handle_interaction("C1", approval_ts, "approve_tool", user_id="U1")
             gate.set()
 
-        await asyncio.gather(
-            handle_message(
-                slack, sessions, "C1", "run it", None, "msg1", "U1", approval_mode="interactive"
+        await _within_lost_run(
+            asyncio.gather(
+                handle_message(
+                    slack,
+                    sessions,
+                    "C1",
+                    "run it",
+                    None,
+                    "msg1",
+                    "U1",
+                    approval_mode="interactive",
+                ),
+                _click_approve(),
             ),
-            _click_approve(),
+            "the turn and its click",
         )
 
         blocks_actions = [a for a in slack.actions if a[0] == "blocks"]
@@ -1260,8 +1339,13 @@ class TestToolApproval:
 
         # handle_message swallows the error internally (generic except), so we
         # don't assert a raise here — we assert the permission was answered.
-        await handle_message(
-            slack, sessions, "D1", "run it", None, "msg1", "U1", approval_mode="interactive"
+        # Bounded: a turn that reached the prompt instead would park on the 120 s
+        # approval budget and only answer when that expired.
+        await _within_lost_run(
+            handle_message(
+                slack, sessions, "D1", "run it", None, "msg1", "U1", approval_mode="interactive"
+            ),
+            "the turn whose stream prep failed",
         )
 
         assert 7 in provider.rejected, (
@@ -1301,18 +1385,17 @@ class TestAllowedUsers:
         sessions = FakeSessionManager(provider)
 
         async def _click():
-            for _ in range(200):
-                await asyncio.sleep(0.01)
-                blocks = [a for a in slack.actions if a[0] == "blocks"]
-                if blocks:
-                    await handle_interaction("C1", blocks[0][1]["ts"], "approve_tool", user_id="U1")
-                    return
+            approval_ts = await _approval_prompt_ts(slack)
+            await handle_interaction("C1", approval_ts, "approve_tool", user_id="U1")
 
-        await asyncio.gather(
-            handle_message(
-                slack, sessions, "C1", "go", None, "msg1", "U1", approval_mode="interactive"
+        await _within_lost_run(
+            asyncio.gather(
+                handle_message(
+                    slack, sessions, "C1", "go", None, "msg1", "U1", approval_mode="interactive"
+                ),
+                _click(),
             ),
-            _click(),
+            "the turn and its click",
         )
         assert "req-1" in provider.approved
 
@@ -1342,31 +1425,25 @@ class TestAllowedUsers:
         provider = GatedProvider()
         sessions = FakeSessionManager(provider)
 
-        async def _click_as_intruder():
-            for _ in range(200):
-                await asyncio.sleep(0.01)
-                blocks = [a for a in slack.actions if a[0] == "blocks"]
-                if blocks:
-                    # U999 is not in allowed set — should be rejected
-                    await handle_interaction(
-                        "C1", blocks[0][1]["ts"], "approve_tool", user_id="U999"
-                    )
-                    gate.set()
-                    return
-            gate.set()
-
         task = asyncio.ensure_future(
             handle_message(
                 slack, sessions, "C1", "go", None, "msg2", "U1", approval_mode="interactive"
             )
         )
-        await _click_as_intruder()
-        assert "req-2" not in provider.approved
-        task.cancel()
         try:
-            await task
-        except asyncio.CancelledError:
-            pass
+            # The intruder clicks a prompt that is live and registered, so a
+            # refusal is the gate's verdict and not a click that arrived early.
+            approval_ts = await _approval_prompt_ts(slack)
+            # U999 is not in allowed set — should be rejected
+            await handle_interaction("C1", approval_ts, "approve_tool", user_id="U999")
+            gate.set()
+            assert "req-2" not in provider.approved
+            # Still the turn's: the refused click claimed nothing.
+            assert f"C1:{approval_ts}" in _pending_approvals
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await _within_lost_run(task, "the cancelled turn")
 
     @pytest.mark.asyncio
     async def test_empty_allowed_users_rejects_all(self):
@@ -1396,20 +1473,24 @@ class TestAllowedUsers:
         sessions = FakeSessionManager(provider)
 
         async def _click():
-            for _ in range(200):
-                await asyncio.sleep(0.01)
-                blocks = [a for a in slack.actions if a[0] == "blocks"]
-                if blocks:
-                    await handle_interaction(
-                        "C1", blocks[0][1]["ts"], "approve_tool", user_id="W1234"
-                    )
-                    return
+            approval_ts = await _approval_prompt_ts(slack)
+            await handle_interaction("C1", approval_ts, "approve_tool", user_id="W1234")
 
-        await asyncio.gather(
-            handle_message(
-                slack, sessions, "C1", "go", None, "msg3", "U1234", approval_mode="interactive"
+        await _within_lost_run(
+            asyncio.gather(
+                handle_message(
+                    slack,
+                    sessions,
+                    "C1",
+                    "go",
+                    None,
+                    "msg3",
+                    "U1234",
+                    approval_mode="interactive",
+                ),
+                _click(),
             ),
-            _click(),
+            "the turn and its click",
         )
         assert "req-4" in provider.approved
 
@@ -2286,7 +2367,16 @@ class TestAutoTitleSlack:
         sessions = FakeSessionManager()
         sessions._provider = FakeProvider([LLMEvent(kind="text_chunk", text="ETL Debug Session")])
         _mark_titled("sk1")
-        await _maybe_auto_title_slack(slack, sessions, "C1", "sk1", None, "help me", "sure")
+        await _maybe_auto_title_slack(
+            slack,
+            sessions,
+            "C1",
+            "sk1",
+            None,
+            "help me",
+            "sure",
+            pin=_PRESENT_PIN,
+        )
         title_actions = [a for a in slack.actions if a[0] == "set_thread_title"]
         assert len(title_actions) == 1
         assert title_actions[0][1]["title"] == "ETL Debug Session"
@@ -2306,7 +2396,7 @@ class TestAutoTitleSlack:
         from kiro_crew.slack.handler import _mark_titled, _maybe_auto_title_slack, _titled_threads
 
         class ExplodingSessionManager(FakeSessionManager):
-            async def get_or_create(self, key, agent=None, channel_id=None):
+            async def get_or_create(self, key, agent=None, channel_id=None, start_priority=None):
                 raise RuntimeError("bound to a different event loop")
 
         slack = MockSlackClient()
@@ -2317,7 +2407,14 @@ class TestAutoTitleSlack:
         # logger that emits nothing passes vacuously (its sibling below did).
         with caplog.at_level(logging.WARNING, logger="kiro_crew.messaging.auto_title"):
             await _maybe_auto_title_slack(
-                slack, ExplodingSessionManager(), "C1", "sk-err", None, "help", "sure"
+                slack,
+                ExplodingSessionManager(),
+                "C1",
+                "sk-err",
+                None,
+                "help",
+                "sure",
+                pin=_PRESENT_PIN,
             )
 
         warnings = [
@@ -2343,14 +2440,21 @@ class TestAutoTitleSlack:
         from kiro_crew.slack.handler import _mark_titled, _maybe_auto_title_slack, _titled_threads
 
         class TimingOutSessionManager(FakeSessionManager):
-            async def get_or_create(self, key, agent=None, channel_id=None):
+            async def get_or_create(self, key, agent=None, channel_id=None, start_priority=None):
                 raise asyncio.TimeoutError()
 
         slack = MockSlackClient()
         _mark_titled("sk-slow")
         with caplog.at_level(logging.DEBUG, logger="kiro_crew.messaging.auto_title"):
             await _maybe_auto_title_slack(
-                slack, TimingOutSessionManager(), "C1", "sk-slow", None, "help", "sure"
+                slack,
+                TimingOutSessionManager(),
+                "C1",
+                "sk-slow",
+                None,
+                "help",
+                "sure",
+                pin=_PRESENT_PIN,
             )
 
         assert not [
@@ -2372,7 +2476,16 @@ class TestAutoTitleSlack:
         sessions = FakeSessionManager()
         sessions._provider = FakeProvider([LLMEvent(kind="text_chunk", text="SKIP")])
         _mark_titled("sk2")
-        await _maybe_auto_title_slack(slack, sessions, "C1", "sk2", None, "hi", "hello")
+        await _maybe_auto_title_slack(
+            slack,
+            sessions,
+            "C1",
+            "sk2",
+            None,
+            "hi",
+            "hello",
+            pin=_PRESENT_PIN,
+        )
         title_actions = [a for a in slack.actions if a[0] == "set_thread_title"]
         assert len(title_actions) == 0
         assert "sk2" not in _titled_threads
@@ -2386,7 +2499,16 @@ class TestAutoTitleSlack:
         sessions = FakeSessionManager()
         sessions._provider = None  # will cause AttributeError
         _mark_titled("sk3")
-        await _maybe_auto_title_slack(slack, sessions, "C1", "sk3", None, "test", "test")
+        await _maybe_auto_title_slack(
+            slack,
+            sessions,
+            "C1",
+            "sk3",
+            None,
+            "test",
+            "test",
+            pin=_PRESENT_PIN,
+        )
         assert "sk3" not in _titled_threads
 
     @pytest.mark.asyncio
@@ -2406,6 +2528,7 @@ class TestAutoTitleSlack:
             None,
             'parse this: {"key": "value"}',
             "sure, here's the parsed output",
+            pin=_PRESENT_PIN,
         )
         title_actions = [a for a in slack.actions if a[0] == "set_thread_title"]
         assert len(title_actions) == 1
@@ -3422,10 +3545,12 @@ class TestTransientCompactionRetry:
             def __init__(self, provider):
                 super().__init__(provider)
                 self.gap = asyncio.Event()
+                self.parked = asyncio.Event()
                 self.waited: list[str] = []
 
             async def await_replay_gap(self, key):
                 self.waited.append(key)
+                self.parked.set()
                 await self.gap.wait()
 
         slack = MockSlackClient()
@@ -3449,18 +3574,20 @@ class TestTransientCompactionRetry:
                 conversation_log=log,
             )
         )
-        # The turn parks on the gap (real thread hops precede the hook check).
-        for _ in range(200):
-            if sessions.waited:
-                break
-            await asyncio.sleep(0.01)
+        # The turn parks on the gap (real thread hops precede the hook check),
+        # so wait for the park itself rather than for a guessed number of polls.
+        try:
+            await _within_lost_run(sessions.parked.wait(), "the park on the replay gap")
+        finally:
+            if not sessions.parked.is_set():
+                task.cancel()
         assert sessions.waited == ["thread1"]
         assert any("canned answer" in t for t in _visible_texts(slack)), "the reply posts at once"
         assert log.append.call_count == 0, "the record must wait for the replay to settle"
         assert not task.done()
 
         sessions.gap.set()
-        await asyncio.wait_for(task, 5)
+        await _within_lost_run(task, "the turn after the gap closed")
         user_rows = [c for c in log.append.call_args_list if c.args[1] == "user"]
         assert len(user_rows) == 1, log.append.call_args_list
         assert sessions.keys_seen == [], "a hook reply acquires no session"
@@ -3511,13 +3638,23 @@ class TestTransientCompactionRetry:
         posted above where its answer would have gone must not stay behind, and
         its reaction ladder / stall watchdog must be finalized before the nested
         call takes over the Slack message."""
+        import dataclasses
+
+        from kiro_crew.config.loader import KiroCrewConfig
+
+        _real_cfg = KiroCrewConfig.load()
+        # The real ``agent`` section, not a stub of it: ``handler._get_default_agent``
+        # reads ``load().agent.default_agent`` and caches it in a module global, so a
+        # config object carrying only ``slack`` raises unless some earlier test in the
+        # same process happened to warm that cache first.
         monkeypatch.setattr(
             "kiro_crew.slack.handler.KiroCrewConfig.load",
-            lambda: type(
-                "_Cfg",
-                (),
-                {"slack": type("_S", (), {"show_thinking": True, "reactions_enabled": False})()},
-            )(),
+            lambda: dataclasses.replace(
+                _real_cfg,
+                slack=dataclasses.replace(
+                    _real_cfg.slack, show_thinking=True, reactions_enabled=False
+                ),
+            ),
         )
         slack = MockSlackClient()
         provider = _SequencedProvider(
@@ -3823,46 +3960,60 @@ class TestStopReasonCancelled:
         assert "partial output here" in all_text
 
 
+def _handler_clock(monkeypatch, monotonic) -> None:
+    """Give the handler and its composed owners *monotonic*, and nothing else.
+
+    ``handler.time`` IS the stdlib ``time`` module, so patching an attribute on it
+    rebinds ``time.monotonic`` for the whole worker: asyncio's loop clock and every
+    other thread read the fake too, and a frozen fake strands every timer the turn
+    awaits. The owners read ``time`` from the handler's globals
+    (``handler_runtime.compose``), so rebinding that NAME reaches each elapsed-time
+    read the turn makes while the rest of the process keeps the real clock.
+    """
+    from kiro_crew.slack import handler
+
+    monkeypatch.setattr(handler, "time", SimpleNamespace(monotonic=monotonic))
+
+
+class _HandlerAsyncio:
+    """``asyncio`` as the handler's namespace sees it, with *overrides* swapped in.
+
+    Same reason as :func:`_handler_clock`: ``monkeypatch.setattr(asyncio, ...)``
+    would replace the attribute for every coroutine in the worker.
+    """
+
+    def __init__(self, **overrides):
+        self.__dict__.update(overrides)
+
+    def __getattr__(self, name):
+        return getattr(asyncio, name)
+
+
+def _completed_tasks(slack) -> list[dict]:
+    """The ``complete`` task cards a turn appended, in order."""
+    return [
+        a[1] for a in slack.actions if a[0] == "append_task" and a[1].get("status") == "complete"
+    ]
+
+
 class TestToolElapsedTimer:
     """Tests for tool elapsed time display on task cards."""
 
     @pytest.mark.asyncio
     async def test_tool_completion_shows_elapsed_time(self, monkeypatch):
         """Tool taking >1s shows elapsed time in completion card at end of stream."""
-        from kiro_crew.slack import handler
-
         slack = MockSlackClient()
         slack._stream_enabled = True
 
-        # Track timer start to simulate elapsed time
-        timer_start = [None]  # Use list to allow mutation in closure
-
-        original_monotonic = handler.time.monotonic
+        # Every handler clock read is 5.5 s after the previous one, so the
+        # completion (read after the tool's timer start) is at least 5.5 s.
+        calls = [0]
 
         def fake_monotonic():
-            now = original_monotonic()
-            # Return actual time, but track when the timer was started
-            if timer_start[0] is None:
-                return now
-            # After timer starts, add simulated elapsed time
-            return timer_start[0] + 5.5  # 5.5 seconds "elapsed"
+            calls[0] += 1
+            return 1_000.0 + calls[0] * 5.5
 
-        original_start_timer = None
-
-        def patched_start_timer():
-            # When timer starts, record the current time
-            timer_start[0] = original_monotonic()
-            # Actually set _tool_start_time in handler
-            handler.time.monotonic = lambda: timer_start[0]  # Time when started
-            original_start_timer()
-            # Then switch to returning elapsed time
-            handler.time.monotonic = lambda: timer_start[0] + 5.5
-
-        # This approach is too complex. Let's just verify the code path exists
-        # by checking that elapsed time IS passed to append_task when conditions are met.
-        # The actual unit test of elapsed formatting would be better as a direct unit test.
-
-        monkeypatch.setattr(handler.time, "monotonic", fake_monotonic)
+        _handler_clock(monkeypatch, fake_monotonic)
         provider = FakeProvider(
             [
                 LLMEvent(kind="tool_call", title="Read File", tool_kind="read"),
@@ -3872,24 +4023,20 @@ class TestToolElapsedTimer:
         sessions = FakeSessionManager(provider)
         await handle_message(slack, sessions, "C1", "read it", None, "msg1", "U1")
 
-        # For now, just verify that append_task is called for tool completion
-        task_appends = [a for a in slack.actions if a[0] == "append_task"]
-        complete_tasks = [t for t in task_appends if t[1].get("status") == "complete"]
-        assert len(complete_tasks) >= 1, f"No complete tasks found. task_appends={task_appends}"
-        # The details field exists (may or may not have elapsed time depending on timing)
-        assert all("details" in t[1] for t in complete_tasks)
+        complete_tasks = _completed_tasks(slack)
+        assert complete_tasks, f"No complete tasks found. actions={slack.actions}"
+        titles = [str(t.get("title", "")) for t in complete_tasks]
+        assert any(re.search(r"⏱ \d+(\.\d+)?s", t) for t in titles), titles
+        assert all("⏱" not in str(t.get("details", "")) for t in complete_tasks)
 
     @pytest.mark.asyncio
     async def test_fast_tool_no_elapsed_time(self, monkeypatch):
         """Tool taking <1s shows no elapsed time."""
-        from kiro_crew.slack import handler
-
         slack = MockSlackClient()
         slack._stream_enabled = True
 
-        # All monotonic calls return the same time (0 elapsed)
-        base_time = handler.time.monotonic()
-        monkeypatch.setattr(handler.time, "monotonic", lambda: base_time)
+        # Every handler clock read returns the same instant (0 elapsed).
+        _handler_clock(monkeypatch, lambda: 1_000.0)
 
         provider = FakeProvider(
             [
@@ -3900,13 +4047,13 @@ class TestToolElapsedTimer:
         sessions = FakeSessionManager(provider)
         await handle_message(slack, sessions, "C1", "read it", None, "msg1", "U1")
 
-        # Fast tool completion should not show timer
-        task_appends = [a for a in slack.actions if a[0] == "append_task"]
-        complete_tasks = [t for t in task_appends if t[1].get("status") == "complete"]
+        # Elapsed time is written into the completion card's TITLE, so that is
+        # where a fast tool must show none.
+        complete_tasks = _completed_tasks(slack)
+        assert complete_tasks, f"No complete tasks found. actions={slack.actions}"
         for t in complete_tasks:
-            details = str(t[1].get("details", ""))
-            # With 0 elapsed time, no timer should be shown
-            assert "⏱" not in details
+            assert "⏱" not in str(t.get("title", "")), t
+            assert "⏱" not in str(t.get("details", "")), t
 
     @pytest.mark.asyncio
     async def test_tool_timer_cancelled_on_completion(self):
@@ -3932,8 +4079,6 @@ class TestToolElapsedTimer:
     @pytest.mark.asyncio
     async def test_elapsed_time_shows_minutes_format(self, monkeypatch):
         """Tool taking >60s shows minutes+seconds format."""
-        from kiro_crew.slack import handler
-
         slack = MockSlackClient()
         slack._stream_enabled = True
 
@@ -3946,13 +4091,12 @@ class TestToolElapsedTimer:
         # broke whenever a pytest-split shard boundary landed inside this
         # class.)
         calls = [0]
-        base = handler.time.monotonic()
 
         def fake_monotonic():
             calls[0] += 1
-            return base + calls[0] * 75.5
+            return 1_000.0 + calls[0] * 75.5
 
-        monkeypatch.setattr(handler.time, "monotonic", fake_monotonic)
+        _handler_clock(monkeypatch, fake_monotonic)
         provider = FakeProvider(
             [
                 LLMEvent(kind="tool_call", title="Read File", tool_kind="read"),
@@ -3995,19 +4139,18 @@ class TestToolElapsedTimer:
                 raise asyncio.CancelledError()
             await real_sleep(0)
 
-        monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+        monkeypatch.setattr(handler, "asyncio", _HandlerAsyncio(sleep=fake_sleep))
 
         call_count = [0]
-        base = handler.time.monotonic()
 
         def fake_monotonic():
             call_count[0] += 1
             # Simulate 45 seconds elapsed when updater checks
             if call_count[0] <= 2:
-                return base
-            return base + 45
+                return 1_000.0
+            return 1_045.0
 
-        monkeypatch.setattr(handler.time, "monotonic", fake_monotonic)
+        _handler_clock(monkeypatch, fake_monotonic)
         provider = FakeProvider(
             [
                 LLMEvent(kind="tool_call", title="Read File", tool_kind="read"),
@@ -4024,13 +4167,10 @@ class TestToolElapsedTimer:
     async def test_tool_transition_completion_shows_elapsed_in_title(self, monkeypatch):
         """When a new tool starts, the previous tool's task card is marked
         complete with elapsed time in the TITLE (not details)."""
-        from kiro_crew.slack import handler
-
         slack = MockSlackClient()
         slack._stream_enabled = True
 
         calls = [0]
-        base = handler.time.monotonic()
 
         def fake_monotonic():
             calls[0] += 1
@@ -4038,9 +4178,9 @@ class TestToolElapsedTimer:
             # after the first tool's timer start, so elapsed >= one 42s step.
             # (A fixed call-count threshold was order-dependent — see
             # test_elapsed_time_shows_minutes_format.)
-            return base + calls[0] * 42.0
+            return 1_000.0 + calls[0] * 42.0
 
-        monkeypatch.setattr(handler.time, "monotonic", fake_monotonic)
+        _handler_clock(monkeypatch, fake_monotonic)
         provider = FakeProvider(
             [
                 LLMEvent(kind="tool_call", title="Read File", tool_kind="read"),
@@ -4219,6 +4359,36 @@ class _ApprovingProvider:
 
     async def approve_tool(self, request_id: str) -> None:
         self.approved.append(request_id)
+
+
+class _FloorRefusingProvider:
+    """approve_tool answers False: the transport's gate refused the call."""
+
+    def __init__(self) -> None:
+        self.approved: list[str] = []
+
+    async def approve_tool(self, request_id: str) -> bool:
+        self.approved.append(request_id)
+        return False
+
+
+class TestSlackApproveTransportFloor:
+    @pytest.mark.asyncio
+    async def test_approve_click_refused_by_floor_returns_reject(self):
+        """The card must not be relabelled as approved when approve_tool refused."""
+        from kiro_crew.slack.handler import _ACTION_REJECT, _OUTCOME_REJECTED, _PendingApproval
+
+        set_owner_id("U1")
+        set_allowed_users({"U1"})
+        prov = _FloorRefusingProvider()
+        pending = _PendingApproval(prov, "req-floor", session_key="chat-floor")
+        _pending_approvals["C1:tsf"] = pending
+
+        result = await handle_interaction("C1", "tsf", "approve_tool", user_id="U1")
+
+        assert result == _ACTION_REJECT
+        assert prov.approved == ["req-floor"]
+        assert pending.future.result() == _OUTCOME_REJECTED
 
 
 class TestSlackTrustSubagentPropagation:

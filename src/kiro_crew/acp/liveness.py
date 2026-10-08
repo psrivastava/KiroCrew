@@ -11,7 +11,9 @@ deaths and never on healthy work.
 
 Policy (enforced by the caller in ``session_handle._dispatch_events``):
 
-- ``WORKING``     -> never act (log once per interval at most).
+- ``WORKING``     -> never act (log once per interval at most), except an
+  opaque MCP tool's ``mcp subtree active`` reading, which the tool branch
+  bounds by ``watchdog.tool_stall_hard_cap_secs``.
 - ``DEAD``        -> act immediately: recovery lands seconds after actual death
                      instead of at a blanket 90s/600s timeout.
 - ``STUCK_INPUT`` -> act immediately, with a cause the recovery nudge can name
@@ -37,7 +39,10 @@ macOS, no new dependencies):
 - **MCP ``wait`` tool**: declared-duration contract — WORKING until the parsed
   ``seconds`` (+ slack) elapse, then UNKNOWN.
 - **Other MCP tools**: sample the descendant tree's CPU/IO movement across
-  successive checks; moving -> WORKING, flat -> UNKNOWN.
+  successive checks; moving -> WORKING, flat -> UNKNOWN. A flat tree in which a
+  tool-side process holds an established TCP connection carries the
+  :data:`EVIDENCE_REMOTE_FLAT` tag (a tool blocked on its own remote call), read
+  from ``/proc`` on Linux and from libproc's socket fd info on macOS.
 - **Model-wait (no tool in flight)**: sample the tree's IO/CPU counters across
   checks (token/keepalive receipt moves them) and its established TCP sockets.
   Flat counters with NO established backend socket is the done-but-lost-frame
@@ -54,8 +59,9 @@ cmdline the SAME matching rules run against, and ``PROC_PIDTASKINFO`` sums the
 subtree's CPU time. That gives macOS the shell-child match / exit detection /
 absence narrowing and the MCP-subtree movement probe, with movement being
 CPU-only (the evidence string says so — there is no per-process IO counter to
-read). What has no libproc equivalent stays exactly as absent: no socket
-evidence (so a flat model wait is UNKNOWN, never DEAD, and never tagged
+read). libproc's socket fd info feeds only the tool-side ``remote_flat``
+scan. What has no libproc equivalent stays exactly as absent: no model-wait
+socket evidence (so a flat model wait is UNKNOWN, never DEAD, and never tagged
 ``established_flat``), no wchan / blocked-fd evidence (so STUCK_INPUT is never
 claimed — a live tracked child whose subtree is flat is UNKNOWN tagged
 ``platform_limited`` instead of WORKING, so it is bounded rather than deferred
@@ -103,8 +109,23 @@ flat on macOS/Windows is classified as waiting for input at the (narrowed)
 budget rather than as an opaque stall.
 
 Attribution on a shared runtime: each handle probes only ITS OWN runtime pid,
-and the cmdline match keys shell evidence to THIS session's in-flight command.
-Where attribution is impossible the verdict degrades to UNKNOWN.
+but a runtime can host several sessions, and then that pid's process tree is not
+one session's. Which probes survive that is not uniform, so it is stated per
+probe rather than claimed for the module:
+
+- the cmdline match keys shell evidence to THIS session's in-flight command, so
+  the shell branch attributes;
+- the movement and socket probes read the WHOLE tree, so a co-tenant's build
+  reads as this session's progress and a co-tenant's backend connection
+  suppresses this session's wedge signature. Both of those err toward
+  forbearance, which costs detection latency and no work;
+- the one reading that is acted on at once, the model-wait DEAD, is therefore
+  gated on declared tenancy: with co-tenants it degrades to UNKNOWN tagged
+  :data:`EVIDENCE_SHARED_TREE` and the caller's stale window governs instead.
+  Pass ``tenancy`` to declare it; a caller that declares nothing gets the
+  historical single-tenant reading.
+
+Where attribution is impossible the verdict degrades to UNKNOWN, never to a kill.
 
 Unit-testable against a fake ``/proc`` tree via the ``proc_root`` ctor arg and
 an injectable ``now`` clock.
@@ -124,6 +145,12 @@ from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Protocol
 
 from kiro_crew import platform_compat
+from kiro_crew.constants import WAIT_TOOL_MAX_SECS
+from kiro_crew.platform_compat import (  # noqa: F401 - re-exported for existing importers
+    boottime_now,
+    process_start_boot_secs,
+)
+from kiro_crew.session_directive import CORE_MCP_SERVER
 
 logger = logging.getLogger(__name__)
 
@@ -155,6 +182,32 @@ EVIDENCE_ESTABLISHED_FLAT = "established_flat"
 # only shortens a non-lethal cancel, never skips straight to one.
 EVIDENCE_SHELL_CHILD_ABSENT = "shell_child_absent"
 
+# Evidence prefix for a verdict the oracle declined to sharpen into DEAD because
+# the runtime hosts MORE THAN ONE session, so the evidence for it is not
+# attributable to the session that asked.
+#
+# The model-wait wedge signature (flat counters, no established backend socket)
+# is read over the runtime's WHOLE process tree. On a runtime with one tenant
+# that tree IS that session, so the signature names it. With two tenants the
+# same reading names neither: it says "nothing on this process is talking to a
+# backend", and which tenant lost its frame — or whether any did — is a question
+# the counters cannot answer. DEAD is the one verdict the caller acts on
+# immediately (``session_handle`` cancels the turn on the spot instead of at the
+# stale window), so an unattributable DEAD spends another session's in-flight
+# turn to recover a guess.
+#
+# The same reasoning already sits at the CONSUMER in
+# ``subagent_manager.monitoring``, which drops a DEAD outright while
+# ``_session_sharing`` is set. Putting it in the oracle is what lets the other
+# consumers inherit it: the verdict is unsound at the point the evidence is
+# gathered, not at each place it is read.
+#
+# Degrades to UNKNOWN rather than WORKING: a shared tree is a reason not to
+# trust the fast path, never a reason to defer indefinitely. The caller's
+# ordinary stale window still bounds it, so a genuine wedge is still recovered —
+# at the window instead of at once.
+EVIDENCE_SHARED_TREE = "shared_tree"
+
 # Evidence for a movement probe that stored a BASELINE and has nothing to
 # compare it against yet. Structurally non-informative: it says "ask me again",
 # never "this process is idle". A caller whose non-WORKING branch destroys work
@@ -178,6 +231,46 @@ EVIDENCE_SAMPLING = "sampling"
 # degradation must be visible in the evidence, the metric bucket and the spec —
 # a silent plain UNKNOWN would hide which platform limit produced it.
 EVIDENCE_PLATFORM_LIMITED = "platform_limited"
+
+# Evidence prefix for an opaque MCP tool whose subtree is genuinely flat (a
+# real two-sample delta, not the baseline tick) while a process on the TOOL
+# side of the tree — anything below the kiro-cli runtime itself — holds an
+# established TCP connection to a non-loopback peer. That is the shape of a
+# tool blocked on its own remote call: the MCP server sits in ``recv`` with
+# zero CPU and zero bytes,
+# which is also exactly what a remote call with no client timeout looks like
+# when the peer never answers. The caller narrows the UNKNOWN window on this
+# tag to ``watchdog.remote_flat_probe_secs``, and only once the tree has also
+# shown no movement at any probe for that long, so a slow stream that moves
+# bytes now and then is never cut off between two quiet samples.
+#
+# Deliberately distinct from :data:`EVIDENCE_ESTABLISHED_FLAT`, which is keyed
+# on kiro-cli's OWN backend connection and a model-wrapping tool name. The
+# runtime's own sockets never count here, and neither do those of the
+# sandbox launcher's direct child (the real kiro-cli under the Linux namespace
+# sandbox), so kiro-cli's model connection cannot pass for a tool's remote
+# call. Because the scan reads the whole tree, the tag also needs a declared
+# tenancy of exactly one session (see :data:`EVIDENCE_SHARED_TREE`): on a
+# shared runtime the socket may be a co-tenant's. Where no socket view exists
+# (Windows, a tree that cannot be read) the tag is never set and the
+# build-scale window holds.
+EVIDENCE_REMOTE_FLAT = "remote_flat"
+
+# Evidence prefix for an opaque MCP tool whose runtime subtree moved. It is the
+# weakest WORKING there is: the movement may belong to any process in the tree,
+# such as a sibling MCP server polling in the background, so it cannot tell a
+# live tool from one whose result frame was lost. The tool branch therefore
+# bounds this one WORKING reading (see ``session_handle._dispatch_events``)
+# while every other WORKING keeps deferring.
+EVIDENCE_MCP_SUBTREE_ACTIVE = "mcp subtree active"
+
+# kirocrew-core tools that ping ``/api/session-keepalive`` for their whole run
+# and can read ``mcp subtree active``: ``mcp_tools/spawn.py``
+# ``spawn_sub_agents``, bounded by its own collection timeout, so the tool
+# branch never cuts it off on the opaque-MCP bound. The core ``wait`` pings too
+# but never reaches that reading (``wait_tool_verdict`` answers first), so it
+# is not listed. Matched on the adapter identity, never on the title.
+_KEEPALIVE_TOOL_NAMES: frozenset[str] = frozenset({"spawn_sub_agents"})
 
 # Tool names that are known to wrap a model call (e.g. kiro-cli's use_subagent
 # which starts a sub-agent turn inside the current tool call). The
@@ -205,6 +298,16 @@ _MODEL_WRAPPING_TOOLS: frozenset[str] = frozenset({"use_subagent"})
 CHILD_EXIT_GRACE_SECS = 15.0
 # Declared-duration slack for the MCP wait tool: WORKING until seconds + this.
 WAIT_TOOL_SLACK_SECS = 120.0
+# No declared duration vouches for a session past ``WAIT_TOOL_MAX_SECS``
+# (imported from ``constants``), the one bound the wait tool's schema and handler
+# both clamp to.
+# The wait tool's name on ``CORE_MCP_SERVER``, as the adapter identity reports it.
+_WAIT_TOOL_NAME = "wait"
+# Separator in a server-qualified MCP tool name: kiro-cli may report
+# ``<server>___<tool>`` and the canonical prefix form is ``mcp__<server>__<tool>``.
+# Mirrors ``session_directive._MCP_SEPARATOR_RE``: a run of two or more
+# underscores, so a single-underscore name such as ``do_wait`` stays distinct.
+_MCP_SEPARATOR_RE = re.compile(r"_{2,}")
 # Minimum cmdline fragment length for a definite shell-child match.
 _MIN_MATCH_FRAGMENT = 8
 # How much a process may predate its tool's dispatch and still count as started
@@ -295,6 +398,26 @@ def iter_descendants(proc_root: str, pid: int) -> list[int]:
     return order
 
 
+def direct_children(proc_root: str, pid: int) -> list[int]:
+    """*pid*'s direct children from ``/proc/<pid>/task/<tid>/children``.
+
+    Empty both for a childless process and for an unreadable interface; the one
+    caller only uses it to widen an exclusion, where either reading is safe.
+    """
+    children: list[int] = []
+    try:
+        tids = os.listdir(f"{proc_root}/{pid}/task")
+    except OSError:
+        return children
+    for tid in tids:
+        for tok in (_read_text(f"{proc_root}/{pid}/task/{tid}/children") or "").split():
+            try:
+                children.append(int(tok))
+            except ValueError:
+                continue
+    return children
+
+
 def children_interface_readable(proc_root: str, pid: int) -> bool:
     """Whether *pid*'s child list can be read at all.
 
@@ -369,6 +492,30 @@ def fd_target(proc_root: str, pid: int, fd: int) -> str:
         return ""
 
 
+def pipe_writer_pid(proc_root: str, pids: list[int], target: str, reader: int) -> int | None:
+    """A pid in *pids* other than *reader* holding pipe *target* open for writing.
+
+    Reads ``/proc/<pid>/fd`` links and the ``flags`` line of ``fdinfo``
+    (``O_WRONLY`` / ``O_RDWR``). None when no such holder is found.
+    """
+    for p in pids:
+        if p == reader:
+            continue
+        try:
+            fds = os.listdir(f"{proc_root}/{p}/fd")
+        except OSError:
+            continue
+        for fd in fds:
+            if not fd.isdigit() or fd_target(proc_root, p, int(fd)) != target:
+                continue
+            m = re.search(
+                r"^flags:\s*([0-7]+)$", _read_text(f"{proc_root}/{p}/fdinfo/{fd}") or "", re.M
+            )
+            if m and int(m.group(1), 8) & 3:
+                return p
+    return None
+
+
 def socket_inodes(proc_root: str, pid: int) -> set[str]:
     """Socket inode numbers held open by *pid* (from ``/proc/<pid>/fd``)."""
     inodes: set[str] = set()
@@ -404,35 +551,42 @@ def established_inodes(proc_root: str, pid: int) -> set[str]:
     return inodes
 
 
-def boottime_now() -> float | None:
-    """Now, on the clock this host dates process starts against.
+def _is_loopback_hex(addr: str) -> bool:
+    """Whether a ``/proc/net/tcp{,6}`` address column names a loopback peer.
 
-    Linux: ``CLOCK_BOOTTIME`` counts time spent suspended, exactly as
-    ``/proc/uptime`` and the ``starttime`` field of ``/proc/<pid>/stat`` do.
-    ``time.monotonic()`` (``CLOCK_MONOTONIC``) does not, so the two MUST NOT be
-    mixed in one comparison: after a suspend of S seconds, a boot-clock age minus
-    a monotonic stamp places a process S seconds EARLIER than it really started,
-    which is how a live shell child comes to look like it predates its own
-    dispatch.
-
-    macOS: ``libproc`` reports a process's start as an absolute wall-clock
-    instant (``pbi_start_tvsec``), so the stamp is ``time.time()`` — the same
-    clock, suspend included. That clock can STEP (NTP correction after a VM
-    resume, an admin reset), and a backward step between the stamp and the
-    runtime's fork dates a live child before its own dispatch. The oracle pairs
-    this stamp with :func:`steady_now` and refuses to attribute by start time
-    once the two disagree (see :meth:`LivenessOracle._started_after_dispatch`);
-    the stamp alone cannot tell a step from a slow spawn.
-
-    Returns None where no such clock is available, which every caller must read
-    as "cannot attribute" rather than as a time.
+    IPv4 is one little-endian word, so the first octet is the LAST byte
+    (``0100007F`` is 127.0.0.1). IPv6 is four little-endian words: ``::1`` is
+    ``...01000000`` and a v4-mapped ``::ffff:127.x`` ends in a word whose last
+    byte is ``7F``.
     """
-    try:
-        return time.clock_gettime(time.CLOCK_BOOTTIME)
-    except (AttributeError, OSError):  # pragma: no cover - platform dependent
-        if sys.platform == "darwin":
-            return time.time()
-        return None
+    host = addr.split(":", 1)[0].upper()
+    if len(host) == 8:
+        return host.endswith("7F")
+    if len(host) == 32:
+        if host == "00000000000000000000000001000000":
+            return True
+        return host[:24] == "0000000000000000FFFF0000" and host.endswith("7F")
+    return False
+
+
+def remote_established_inodes(proc_root: str, pid: int) -> set[str]:
+    """Inodes of ESTABLISHED TCP sockets whose peer is not loopback.
+
+    Same source as :func:`established_inodes`. A loopback peer is a local
+    service, most often Kiro Crew's own gateway, which the in-tree MCP servers
+    reach over ``127.0.0.1`` and which a long-blocking tool such as
+    ``spawn_sub_agents`` legitimately waits on for its whole run.
+    """
+    inodes: set[str] = set()
+    for name in ("tcp", "tcp6"):
+        raw = _read_text(f"{proc_root}/{pid}/net/{name}")
+        if not raw:
+            continue
+        for line in raw.splitlines()[1:]:
+            parts = line.split()
+            if len(parts) > 9 and parts[3] == "01" and not _is_loopback_hex(parts[2]):
+                inodes.add(parts[9])
+    return inodes
 
 
 def steady_now() -> float | None:
@@ -452,23 +606,6 @@ def steady_now() -> float | None:
         return time.clock_gettime(time.CLOCK_MONOTONIC)
     except (AttributeError, OSError):  # pragma: no cover - platform dependent
         return None
-
-
-def process_start_boot_secs(starttime_ticks: float) -> float | None:
-    """A process's ``starttime`` ticks as seconds on the :func:`boottime_now` clock.
-
-    None when the tick rate cannot be read — including on a platform with no
-    ``os.sysconf`` at all (Windows raises AttributeError, not OSError), where
-    there is no ``/proc`` to date processes against either. Callers read None as
-    "cannot attribute", never as a time.
-    """
-    try:
-        hz = os.sysconf("SC_CLK_TCK")
-    except (AttributeError, OSError, ValueError):
-        return None
-    if hz <= 0:  # pragma: no cover - defensive
-        return None
-    return starttime_ticks / hz
 
 
 # ── Darwin process backend (a host without procfs) ──
@@ -508,6 +645,9 @@ class DarwinProcessBackend(Protocol):
     process, or answers None for one that is gone, a zombie, or unreadable —
     the shapes the ``/proc`` walk skips as ``stat is None or state == "Z"``.
     ``cpu_nanos`` is the process's total CPU time, None when unreadable.
+    ``established_tcp`` counts the process's ESTABLISHED TCP sockets to a
+    non-loopback peer, None when unreadable. It is optional: the oracle reads a backend without it as having
+    no socket view, so the socket-keyed tag is simply never set.
     """
 
     def descendants(self, root_pid: int) -> list[int] | None: ...
@@ -515,6 +655,8 @@ class DarwinProcessBackend(Protocol):
     def row(self, pid: int) -> ProcessRow | None: ...
 
     def cpu_nanos(self, pid: int) -> int | None: ...
+
+    def established_tcp(self, pid: int) -> int | None: ...
 
 
 class LibprocBackend:
@@ -564,6 +706,9 @@ class LibprocBackend:
     def cpu_nanos(self, pid: int) -> int | None:
         return platform_compat.proc_cpu_nanos_for_pid(pid)
 
+    def established_tcp(self, pid: int) -> int | None:
+        return platform_compat.darwin_established_tcp_count(pid)
+
 
 def select_darwin_backend(proc_root: str) -> DarwinProcessBackend | None:
     """The backend an oracle uses for *proc_root*, or None to walk ``/proc``.
@@ -587,14 +732,15 @@ def match_fragment(command: str) -> str:
     usually the command text itself (possibly JSON-wrapped). kiro-cli runs
     shell tools via ``bash -c <command>``, so the child's cmdline contains the
     command text near-verbatim; a long contiguous fragment is a strong match
-    key. Redaction markers and shell metacharacters split the text into
-    fragments; the longest one wins. Returns "" when nothing distinctive
-    survives (caller degrades to the weaker program-name match).
+    key. The fragment is cut from the decoded command text
+    (:func:`_command_text`): in the JSON rendering every newline is the two
+    characters ``\\n``, so a fragment cut there straddles the escape and is
+    not a substring of the real cmdline, and a multi-line command would match
+    only on its first line. Redaction markers and shell metacharacters split
+    the text into fragments; the longest one wins. Returns "" when nothing
+    distinctive survives (caller degrades to the weaker program-name match).
     """
-    text = command or ""
-    m = re.search(r"[\"']command[\"']\s*:\s*\"((?:[^\"\\]|\\.)*)\"", text)
-    if m:
-        text = m.group(1)
+    text = _command_text(command)
     # Split on redaction markers and quoting/control chars that differ between
     # the cached rendering and the real argv.
     fragments = re.split(r"\*{3,}|\[REDACTED[^\]]*\]|[\"'\\\n\r]", text)
@@ -625,14 +771,17 @@ def parse_wait_seconds(command: str) -> int | None:
         return None
 
 
-def is_wait_tool(title: str) -> bool:
-    """True when a tool title names the kirocrew-core ``wait`` tool.
+def wait_tool_verdict(tool: ToolCallState, now: float) -> tuple[str, str] | None:
+    """The oracle's wait-tool verdict, selected by *tool*'s adapter identity.
 
-    Titles vary by transport ("wait", "kirocrew-core___wait", "wait (mcp)");
-    match on the last alphanumeric token equalling "wait".
+    Returns ``None`` unless :meth:`ToolCallState.is_trusted_wait` holds, so the
+    caller applies its other evidence; otherwise
+    :meth:`ToolCallState.declared_wait_verdict`. The model-authored title never
+    selects the contract.
     """
-    tokens = re.split(r"[^a-zA-Z0-9]+", (title or "").strip().lower())
-    return "wait" in [t for t in tokens if t]
+    if not tool.is_trusted_wait():
+        return None
+    return tool.declared_wait_verdict(now)
 
 
 # ── Interactive-command classification (tool layer, pre-dispatch) ──
@@ -728,14 +877,27 @@ _CONFIRM_TABLE: dict[str, tuple[frozenset[str], tuple[str, ...], str]] = {
     "yarn": (frozenset({"init", "create"}), ("-y", "--yes"), "yarn init -y …"),
 }
 # Credential / terminal prompts: program -> (flags that make it non-interactive, hint).
+#
+# ``BatchMode`` is recognised but not proposed: once case is folded it contains a
+# permission verb, so a proposed ``ssh -o BatchMode=yes … /usr/…`` is refused by
+# the permission deny rows. ssh_config(5) says BatchMode disables password prompts
+# and host key confirmation, and the hint proposes options aimed at the same
+# prompts. They are proposed, not trusted: BatchMode alone still counts as proof
+# of no prompt, because a FIDO/sk key PIN or an encrypted key's passphrase may
+# still be asked for under the proposed options.
+_SSH_BATCH_FLAGS = ("-o BatchMode=yes", "-oBatchMode=yes")
+_SSH_NONINTERACTIVE_OPTIONS = (
+    "-o StrictHostKeyChecking=yes -o NumberOfPasswordPrompts=0 "
+    "-o PasswordAuthentication=no -o KbdInteractiveAuthentication=no"
+)
 _PROMPT_TABLE: dict[str, tuple[tuple[str, ...], str]] = {
     "sudo": (
         ("-n", "--non-interactive", "-S", "--stdin"),
         "sudo -n … (fails instead of prompting)",
     ),
-    "ssh": (("-o BatchMode=yes", "-oBatchMode=yes"), "ssh -o BatchMode=yes …"),
-    "scp": (("-o BatchMode=yes", "-oBatchMode=yes", "-B"), "scp -B …"),
-    "sftp": (("-o BatchMode=yes", "-oBatchMode=yes", "-b"), "sftp -b <batchfile> …"),
+    "ssh": (_SSH_BATCH_FLAGS, f"ssh {_SSH_NONINTERACTIVE_OPTIONS} …"),
+    "scp": ((*_SSH_BATCH_FLAGS, "-B"), "scp -B …"),
+    "sftp": ((*_SSH_BATCH_FLAGS, "-b"), "sftp -b <batchfile> …"),
     "gpg": (("--batch",), "gpg --batch …"),
     "passwd": ((), "passwd cannot run non-interactively under the tool"),
     "su": ((), "su cannot run non-interactively under the tool"),
@@ -949,7 +1111,8 @@ def _classify_segment(segment: str, *, last: bool) -> InteractiveClassification:
             return NOT_INTERACTIVE
         # ``ssh host <remote command>`` is still prompt-shaped without
         # BatchMode: the risk is the host-key / password prompt, not the
-        # remote work, and only BatchMode removes it.
+        # remote work. The proposed options are NOT treated as proof, so the
+        # classifier stays on the safe side for the prompts they may miss.
         return InteractiveClassification(
             INTERACTIVE_PROMPT,
             program,
@@ -1046,6 +1209,11 @@ class ToolCallState:
     # attribution: the narrowing applies ONLY when this matches a known
     # model-wrapping tool (see ``_MODEL_WRAPPING_TOOLS``).
     tool_name: str = ""
+    # Trusted MCP server from the adapter identity channel, set only when the
+    # tool_call frame's identity is provenance-verified
+    # (``AcpEvent.mcp_identity_trusted``); empty otherwise (fail-closed). Read by
+    # :meth:`is_trusted_wait`.
+    mcp_server_name: str = ""
     # Pre-dispatch verdict of :func:`classify_interactive_command` for a shell
     # tool (one of the ``INTERACTIVE_*`` classes; ``none`` for a non-shell tool
     # or an unmatched command). The oracle itself does not read it — it is
@@ -1053,6 +1221,223 @@ class ToolCallState:
     # classification see the same value the dispatch computed, and so a
     # detached consult never re-derives it from a different command string.
     interactive_risk: str = INTERACTIVE_NONE
+
+    def is_trusted_wait(self) -> bool:
+        """True when the adapter-authored identity names the kirocrew-core ``wait``.
+
+        Keys on ``mcp_server_name`` + ``tool_name``, never on ``title``, which is
+        model-authored prose. ``mcp_server_name`` is set only from a
+        provenance-verified identity channel, so an unverified call fails closed.
+        A server-qualified ``tool_name`` resolves to its last segment, the same
+        normalization ``session_directive.match_tool`` applies to this field; the
+        server itself is still authenticated by ``mcp_server_name`` alone.
+        """
+        if self.is_shell or self.mcp_server_name != CORE_MCP_SERVER:
+            return False
+        return _MCP_SEPARATOR_RE.split(self.tool_name)[-1] == _WAIT_TOOL_NAME
+
+    def is_trusted_keepalive_tool(self) -> bool:
+        """True when the adapter-authored identity names a kirocrew-core tool
+        that pings ``/api/session-keepalive`` while it runs.
+
+        Same identity rule as :meth:`is_trusted_wait`: ``mcp_server_name`` must
+        be the provenance-verified core server, and the title is never read.
+        """
+        if self.is_shell or self.mcp_server_name != CORE_MCP_SERVER:
+            return False
+        return _MCP_SEPARATOR_RE.split(self.tool_name)[-1] in _KEEPALIVE_TOOL_NAMES
+
+    def declared_wait_verdict(self, now: float) -> tuple[str, str]:
+        """Declared-duration contract for the kirocrew-core ``wait`` tool.
+
+        The session is WORKING by definition until the declared sleep plus
+        :data:`WAIT_TOOL_SLACK_SECS` elapses. The verdict reads only this call's
+        own input and dispatch instant, never a process tree, so it is
+        attributable to one session even on a shared runtime. *now* is on the
+        same monotonic clock as ``dispatch_ts``. A declared duration above
+        :data:`WAIT_TOOL_MAX_SECS` counts as that maximum, since the tool never
+        accepts a longer one. The caller decides that this is a wait call.
+        """
+        secs = parse_wait_seconds(self.command)
+        if secs is None:
+            return VERDICT_UNKNOWN, "wait tool without parseable seconds"
+        secs = min(secs, WAIT_TOOL_MAX_SECS)
+        elapsed = now - self.dispatch_ts
+        if elapsed < secs + WAIT_TOOL_SLACK_SECS:
+            return VERDICT_WORKING, f"wait tool declared {secs}s ({elapsed:.0f}s elapsed)"
+        return VERDICT_UNKNOWN, f"wait tool declared {secs}s elapsed"
+
+
+class InFlightToolTracker:
+    """The in-flight tool hand-off rule, shared by the two agent loops.
+
+    Both :class:`~kiro_crew.acp.session_handle.AcpSessionHandle` (the main
+    agent's watchdog) and ``SubagentInfo`` (the sub-agent reaper) have to answer
+    the same question — *which tool call is the one a stall verdict should be
+    read against right now* — and each would otherwise answer it with its own
+    copy of the rule. Two copies drift: one keyed the judged call to a single
+    slot that any result emptied, the other tracked calls by toolCallId. One
+    implementation keeps both honest.
+
+    The rule, in one place:
+
+    * **dispatch** stores a call by its id and makes it the judged call. A call
+      with no id (a backend that omits one) still becomes the judged call but is
+      not stored — a terminal frame for it can only be matched by id, so storing
+      it under ``""`` would let the next id-less dispatch overwrite a live entry.
+    * **a terminal result** for a stored call drops it; when it was the judged
+      call, the judged call moves to the NEWEST remaining dispatch (insertion
+      order is dispatch order), or clears when none remain. A non-terminal
+      (progress) frame changes nothing — the call is still running.
+    * **prompt start** clears everything: a new turn judges nothing until it
+      dispatches.
+
+    Every operation returns whether the JUDGED call changed, because that is the
+    signal both callers act on: the liveness oracle's evidence baseline is keyed
+    to the judged command, so when the judged call changes the caller must retire
+    the oracle (``AcpSessionHandle._retire_liveness_state`` /
+    ``SubagentInfo``'s ``_stall_oracle.fresh()`` + ``_stall_gen`` bump) so a walk
+    still running against the previous command cannot write into the next one's
+    baseline. The retirement itself stays with each caller — one swaps a bound
+    oracle and releases a consult future, the other bumps a generation counter —
+    because that machinery is not shared; only the hand-off decision is.
+
+    The sub-agent uses this in its degenerate single-call shape: a native child's
+    tool call is judged on arrival (so a stall is attributed to the child's own
+    command) but its result frame never reaches the sub-agent's loop, so the
+    stored entry is simply overwritten by the next dispatch rather than popped by
+    a terminal — exactly what a single live slot does. Storing by id costs it
+    nothing (its runtime emits at most one in-flight call at a time) and keeps the
+    one rule honest for the main agent's genuinely-parallel calls.
+
+    ``acp.client`` keeps its own plain ``set`` of call ids for the tool-stall
+    timer and does NOT use this: that set only answers "is any call still open",
+    never "which call is judged", so this tracker would be apparatus it has no
+    buyer for.
+
+    The ``aux`` payload travels beside each :class:`ToolCallState` untouched: the
+    main agent carries the shell call's pre-dispatch interactive classification
+    there, and the sub-agent carries ``None``. The tracker never reads it.
+    """
+
+    __slots__ = ("_calls", "_current_id", "_idless")
+
+    def __init__(self) -> None:
+        # Insertion order IS dispatch order, so the newest remaining call is
+        # ``next(reversed(...))`` — the main agent's parallel calls can finish in
+        # any order and the judged call must fall back to the most recent one
+        # still open, not the oldest.
+        self._calls: dict[str, tuple[ToolCallState, object]] = {}
+        self._current_id: str = ""
+        # An id-less dispatch (a backend that omits a toolCallId, or a sub-agent
+        # native-child call that will never get a terminal frame here) is the
+        # judged call but is held HERE, not in ``_calls`` — it has no stable key
+        # to pop by, so keeping it out of the running set means ``active_calls``
+        # and ``any_active`` reflect only genuinely poppable calls, and the next
+        # dispatch simply overwrites this slot. ``_current_id == ""`` with a
+        # non-None ``_idless`` is exactly the id-less-judged state.
+        self._idless: tuple[ToolCallState, object] | None = None
+
+    @property
+    def current(self) -> ToolCallState | None:
+        """The :class:`ToolCallState` a stall verdict is read against, or None."""
+        if self._current_id:
+            entry = self._calls.get(self._current_id)
+            return entry[0] if entry is not None else None
+        return self._idless[0] if self._idless is not None else None
+
+    @property
+    def current_aux(self) -> object:
+        """The aux payload beside the judged call (``None`` when none)."""
+        if self._current_id:
+            entry = self._calls.get(self._current_id)
+            return entry[1] if entry is not None else None
+        return self._idless[1] if self._idless is not None else None
+
+    @property
+    def current_id(self) -> str:
+        """The judged call's toolCallId (``""`` when none or id-less)."""
+        return self._current_id
+
+    @property
+    def any_active(self) -> bool:
+        """Whether any dispatched call is still open.
+
+        Counts only genuinely stored (poppable) calls — an id-less judged call
+        is never handed the slot by a sibling's result, so it does not keep the
+        running set 'active'.
+        """
+        return bool(self._calls)
+
+    @property
+    def active_calls(self) -> dict[str, tuple[ToolCallState, object]]:
+        """The live ``{toolCallId: (state, aux)}`` map, read-only by convention.
+
+        Backs ``AcpSessionHandle._active_tool_calls`` so the few call sites and
+        tests that read it (membership, newest-remaining, the stored aux) keep
+        working. An id-less judged call is NOT in this map (it has no key).
+        Callers must not mutate it directly — the hand-off goes through
+        :meth:`dispatch` / :meth:`result` / :meth:`clear`.
+        """
+        return self._calls
+
+    def dispatch(self, call_id: str, state: ToolCallState, aux: object = None) -> bool:
+        """Record *state* under *call_id* and make it the judged call.
+
+        A falsy *call_id* is judged but not stored (see the class docstring):
+        it takes the id-less slot, which the next dispatch overwrites and which
+        never appears in ``active_calls``. Returns True — a dispatch always
+        changes the judged call.
+        """
+        self._current_id = call_id or ""
+        if call_id:
+            self._idless = None
+            self._calls[call_id] = (state, aux)
+        else:
+            self._idless = (state, aux)
+        return True
+
+    def result(self, call_id: str, *, terminal: bool) -> bool:
+        """Apply a tool result for *call_id*.
+
+        A non-*terminal* (progress) frame is a no-op and returns False — the call
+        is still running. A terminal frame drops the stored call; when it was the
+        judged one the judged call moves to the newest remaining dispatch, or
+        clears. A terminal frame for a call not in the running set (a sibling
+        already gone, or a native child whose result never reached here) leaves
+        a stored judged call untouched, but DOES move the slot off an id-less
+        judged call — the sub-agent's own next result is how a finished native
+        child stops being judged. Returns whether the judged call changed.
+        """
+        if not terminal:
+            return False
+        existed = (call_id or "") in self._calls
+        self._calls.pop(call_id or "", None)
+        if self._current_id:
+            # A stored call is judged.
+            if (call_id or "") != self._current_id:
+                # A sibling finished; the judged call is untouched.
+                return False
+            self._current_id = next(reversed(self._calls)) if self._calls else ""
+            return True
+        # An id-less call is judged (``_current_id == ""``). Any terminal result
+        # this agent sees (its own next completed call) hands the slot to the
+        # newest call still running, or clears it — a finished native child must
+        # not stay judged for the rest of the prompt.
+        if self._idless is None and not existed:
+            return False
+        self._idless = None
+        if self._calls:
+            self._current_id = next(reversed(self._calls))
+        return True
+
+    def clear(self) -> bool:
+        """Drop every call (prompt start). Returns whether a judged call existed."""
+        had = bool(self._current_id) or bool(self._calls) or self._idless is not None
+        self._calls.clear()
+        self._current_id = ""
+        self._idless = None
+        return had
 
 
 class LivenessOracle:
@@ -1080,6 +1465,8 @@ class LivenessOracle:
         darwin_backend: DarwinProcessBackend | None = None,
         wall_now=time.time,
         steady_now_fn=steady_now,
+        tenancy: Callable[[], int | None] | None = None,
+        socket_tenancy: Callable[[], int | None] | None = None,
     ) -> None:
         self._proc = str(proc_root)
         self._now = now
@@ -1097,6 +1484,22 @@ class LivenessOracle:
         )
         self._tracked_child: int | None = None
         self._child_gone_ts: float | None = None
+        # How many sessions the probed runtime hosts, asked at verdict time
+        # because a runtime gains and loses tenants while a turn runs. Only the
+        # DEAD branch of the model wait reads it — see
+        # :data:`EVIDENCE_SHARED_TREE` for why that branch and not the others.
+        #
+        # ``None`` means the caller declares NOTHING, and the module then reads
+        # the tree as one session's, which is the 1:1 premise this refactor is
+        # removing. It is the default so that a caller which has not been taught
+        # about tenancy keeps today's verdicts exactly; a caller whose runtime
+        # CAN host a second session is the one that must pass this.
+        self._tenancy = tenancy
+        # How many sessions the probed runtime hosts, read ONLY by the
+        # tool-side socket scan behind the opt-in ``remote_flat`` tag. Kept apart
+        # from ``tenancy`` so declaring it leaves the model-wait DEAD reading as
+        # it was. ``None`` here means "not declared", which keeps the tag off.
+        self._socket_tenancy = socket_tenancy
         # sample key -> (ts, counter). Keys: "io", "cpu".
         self._samples: dict[str, tuple[float, int]] = {}
 
@@ -1134,6 +1537,8 @@ class LivenessOracle:
             darwin_backend=self._darwin,
             wall_now=self._wall_now,
             steady_now_fn=self._steady_now,
+            tenancy=self._tenancy,
+            socket_tenancy=self._socket_tenancy,
         )
 
     # ── Public checks ──
@@ -1170,16 +1575,9 @@ class LivenessOracle:
         if not runtime_pid:
             return VERDICT_UNKNOWN, "no runtime pid"
 
-        # Declared-duration contract for the kirocrew-core wait tool: the
-        # session is WORKING by definition until the declared sleep elapses.
-        if not tool.is_shell and is_wait_tool(tool.title):
-            secs = parse_wait_seconds(tool.command)
-            if secs is not None:
-                elapsed = self._now() - tool.dispatch_ts
-                if elapsed < secs + WAIT_TOOL_SLACK_SECS:
-                    return VERDICT_WORKING, f"wait tool declared {secs}s ({elapsed:.0f}s elapsed)"
-                return VERDICT_UNKNOWN, f"wait tool declared {secs}s elapsed"
-            return VERDICT_UNKNOWN, "wait tool without parseable seconds"
+        wait = wait_tool_verdict(tool, self._now())
+        if wait is not None:
+            return wait
 
         if tool.is_shell:
             return self._check_shell_child(runtime_pid, tool)
@@ -1188,7 +1586,7 @@ class LivenessOracle:
         # tree (which contains the serving MCP server process) reads WORKING.
         moved, evidence = self._tree_movement(runtime_pid)
         if moved:
-            return VERDICT_WORKING, f"mcp subtree active ({evidence})"
+            return VERDICT_WORKING, f"{EVIDENCE_MCP_SUBTREE_ACTIVE} ({evidence})"
         if evidence == "no readable counters" and not self._tree_observable():
             # No tree at all on this platform: the flat reading is absence of
             # evidence, and the caller's budget is the only bound. Tagged so
@@ -1208,8 +1606,9 @@ class LivenessOracle:
         # action. Deliberately NARROWER than the model-wait branch's full-tree
         # ``_any_established``: here the descendants include the tool's own
         # workers, and an MCP server blocked on ITS remote socket (a long
-        # remote call, zero CPU/IO while in recv) must keep the full tool
-        # windows — only kiro-cli's own backend connection is LLM-wait
+        # remote call, zero CPU/IO while in recv) is not a model wait: it is
+        # the remote_flat shape handled below, never this tag. Only
+        # kiro-cli's own backend connection is LLM-wait
         # evidence. Shell-child evidence never reaches this branch (it returns
         # from _check_shell_child above), and a flat subtree without the
         # runtime-held socket keeps the plain evidence. Under the OS sandbox
@@ -1234,7 +1633,82 @@ class LivenessOracle:
                     VERDICT_UNKNOWN,
                     f"{EVIDENCE_ESTABLISHED_FLAT}: mcp subtree flat ({evidence})",
                 )
+        if (
+            evidence
+            not in (
+                EVIDENCE_SAMPLING,
+                "no readable counters",
+            )
+            and self._tree_is_this_sessions()
+        ):
+            holder = self._tool_side_established(runtime_pid)
+            if holder is not None:
+                return (
+                    VERDICT_UNKNOWN,
+                    f"{EVIDENCE_REMOTE_FLAT}: mcp subtree flat, pid {holder} holds an "
+                    f"established TCP connection ({evidence})",
+                )
         return VERDICT_UNKNOWN, f"mcp subtree flat ({evidence})"
+
+    def _tree_is_this_sessions(self) -> bool:
+        """Whether the runtime's tree is DECLARED to hold this session alone.
+
+        The tool-side socket scan reads the whole tree, and the narrowing it
+        feeds is the one that cancels sooner. With a co-tenant (another chat, or
+        a subagent riding this runtime) the socket may be the co-tenant's call,
+        so the tag needs a declared ``socket_tenancy`` of exactly 1. Undeclared,
+        unreadable, raising or above 1 all keep the full window.
+        """
+        if self._socket_tenancy is None:
+            return False
+        try:
+            count = self._socket_tenancy()
+        except Exception:
+            logger.debug("liveness: socket tenancy probe failed", exc_info=True)
+            return False
+        return isinstance(count, int) and count == 1
+
+    def _tool_side_established(self, runtime_pid: int) -> int | None:
+        """A tool-side pid holding an ESTABLISHED TCP socket, or None.
+
+            Only a connection to a NON-loopback peer counts: a loopback peer is a
+        local service (Kiro Crew's gateway above all), not a remote call.
+
+        "Tool side" is the runtime's tree minus the runtime process itself. On
+            ``/proc`` a root that holds no socket at all is read as the namespace
+            sandbox's launcher parent, and its direct children (the real kiro-cli)
+            are excluded too, so kiro-cli's own model connection never counts. A
+            non-sandboxed kiro-cli that happens to hold no socket then excludes its
+            MCP servers as well — the direction that keeps the full window.
+
+            On darwin the runtime pid IS kiro-cli (``sandbox-exec`` execs in place),
+            so only the root is excluded. A backend without ``established_tcp``, and
+            a host with neither backend (Windows), answer None.
+        """
+        if self._darwin is not None:
+            probe = getattr(self._darwin, "established_tcp", None)
+            if probe is None:
+                return None
+            descendants = self._darwin.descendants(runtime_pid)
+            if not descendants:
+                return None
+            for pid in descendants:
+                count = probe(pid)
+                if count:
+                    return pid
+            return None
+        if not os.path.isdir(self._proc):
+            return None
+        excluded = {runtime_pid}
+        if not socket_inodes(self._proc, runtime_pid):
+            excluded.update(direct_children(self._proc, runtime_pid))
+        for pid in iter_descendants(self._proc, runtime_pid):
+            if pid in excluded:
+                continue
+            held = socket_inodes(self._proc, pid)
+            if held and held & remote_established_inodes(self._proc, pid):
+                return pid
+        return None
 
     def _check_shell_child(self, runtime_pid: int, tool: ToolCallState) -> tuple[str, str]:
         if self._darwin is not None:
@@ -1537,6 +2011,12 @@ class LivenessOracle:
             if target.startswith(("/dev/tty", "/dev/pts")) or (
                 fd == 0 and target.startswith("pipe:")
             ):
+                # A live writer in the subtree (``producer | consumer``) means this
+                # reader waits on a producer; keep scanning (the producer may be on a
+                # tty). No procfs: keep the old verdict.
+                if target.startswith("pipe:") and os.path.isdir(self._proc):
+                    if pipe_writer_pid(self._proc, subtree, target, p) is not None:
+                        continue
                 blocked = (p, target)
                 break
         if blocked is None:
@@ -1574,7 +2054,42 @@ class LivenessOracle:
         established = self._any_established(runtime_pid)
         if established:
             return VERDICT_UNKNOWN, f"{EVIDENCE_ESTABLISHED_FLAT}: {evidence}"
+        sharing = self._shared_tree_reason()
+        if sharing:
+            return VERDICT_UNKNOWN, f"{EVIDENCE_SHARED_TREE}: {sharing} ({evidence})"
         return VERDICT_DEAD, f"no established backend socket and flat counters ({evidence})"
+
+    def _shared_tree_reason(self) -> str:
+        """Why tree-wide evidence is not this session's, or "" when it is.
+
+        Asked immediately before the one verdict that is acted on at once. Three
+        answers, and only the first clears the fast path:
+
+        - a declared tenancy of 1 — the tree is this session's, evidence
+          attributable, "" ;
+        - a declared tenancy above 1 — co-tenants, so the reading names no
+          session in particular;
+        - a probe that cannot answer (it raised, or returned a non-count) —
+          ABSENT evidence, which is not a declaration of exclusivity. An
+          exception here means the runtime is being torn down or swapped under
+          the probe, which is the least safe moment to authorise an immediate
+          cancel, so it reads the same as sharing.
+
+        No probe at all is the caller declaring nothing, which keeps the module's
+        historical 1:1 reading — see the ``tenancy`` note in ``__init__``.
+        """
+        if self._tenancy is None:
+            return ""
+        try:
+            count = self._tenancy()
+        except Exception:
+            logger.debug("liveness: tenancy probe failed", exc_info=True)
+            return "tenancy unreadable"
+        if not isinstance(count, int) or count < 1:
+            return "tenancy unreadable"
+        if count == 1:
+            return ""
+        return f"{count} sessions on this runtime"
 
     def _portable_model_wait(self, runtime_pid: int) -> tuple[str, str]:
         """Model-wait verdict from platform-neutral evidence.

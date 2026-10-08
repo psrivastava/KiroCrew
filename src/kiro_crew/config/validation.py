@@ -34,6 +34,8 @@ import copy
 import logging
 import threading
 
+from kiro_crew.config.fields import _coerce_bool
+
 # Top-level config.json sections a BUILTIN APP owns and reads from the file
 # directly, with no modelled field in this core. Not in _KNOWN_CONFIG_SECTIONS
 # (no dataclass parses them) and not in CONFIG_RESERVED_TOP_KEYS (they must
@@ -49,6 +51,35 @@ import threading
 #     manages; read by apps/builtins/dev_fleet/repository.py::_load_dev_fleet_cfg
 #     and prescribed by the dashboard's "no checkout found" banner.
 _APP_OWNED_TOP_KEYS: frozenset = frozenset({"dev_fleet"})
+
+# Top-level config.json sections THIS CORE itself writes and reads, but does not
+# model as a dataclass field. The settings UI persists them into config.json and
+# a core module reads them back on startup -- so, exactly like the keys save()
+# stamps (CONFIG_RESERVED_TOP_KEYS), the product wrote them itself and warning
+# "unrecognized" about them is a false positive. They differ from the reserved
+# keys in that they carry live operator settings that must survive save(): the
+# loader captures them into _extra_sections and re-emits them via to_dict(), so
+# they are NOT reserved (reserved keys are dropped on save). They differ from
+# _APP_OWNED_TOP_KEYS only in who owns the reader -- core here, a builtin app
+# there -- which is why they are a separate set and the "second member becomes a
+# registration mechanism" note on the app-owned set does not govern this one:
+# a core-owned section has no manifest to declare itself through.
+# Excluded only in the shape the reader keeps -- a JSON object -- so a scalar
+# written by hand keeps the one warning that says it is being ignored.
+#   * voice_reply -- the dashboard/Slack voice settings block. Written by
+#     slack/interactions.py (``data.setdefault("voice_reply", {})``) and
+#     dashboard/chat_voice.py (persisted with json.dump), and read back on
+#     startup by slack/handler_runtime/voice.py::load_voice_reply_config
+#     (``cfg.raw.get("voice_reply")``), and also by
+#     telegram/transport_dispatch.py (``raw.get("voice_reply")``). No
+#     SCHEMA_REGISTRY entry.
+#   * connections -- the Connections block. The Settings "OAuth Apps" form
+#     writes ``connections.oauth_clients.<slug>.client_id``
+#     (dashboard/handlers/connections.py::_write_oauth_client), read back by
+#     connections/oauth_clients.py::_config_client_id; the
+#     ``connections.tool_aliases`` gate is read by
+#     agent_materialization/mcp_aliases.py. No SCHEMA_REGISTRY entry.
+_CORE_OWNED_TOP_KEYS: frozenset = frozenset({"voice_reply", "connections"})
 
 try:
     import jsonschema
@@ -200,6 +231,15 @@ def _actual_type_name(value: object) -> str:
 #:   unreadable section so the loader records its degradation and the creation
 #:   guard refuses instead of treating the operator's setting as absent.
 #:
+#: * ``workspaces``: the table names WHERE the Global V1 memory workspaces
+#:   live, some possibly at absolute directories outside the data home, and the
+#:   folder-steering memory-store fence is built from it. Repairing a malformed
+#:   table to ``{}`` reads as "no workspaces configured", and a fence built
+#:   from that covers only the default directory -- so a steering root that
+#:   contains an operator's external workspace would be admitted and read.
+#:   Preserved, the loader records ``DEGRADED_WORKSPACES`` and the fence
+#:   refuses every root until the table is readable again.
+#:
 #: Exact-match only: this is a per-path judgment, not a subtree rule. The
 #: registry is only half of a fix — a preserved value changes nothing unless
 #: the loader RECORDS the degradation and a gate reads
@@ -212,8 +252,15 @@ _FAIL_CLOSED_PATHS = frozenset(
         "dashboard",
         "dashboard.tailscale",
         "memory",
+        "workspaces",
     }
 )
+
+
+def _is_flat_workspace_string(dot_path: str, value: object) -> bool:
+    """Whether *value* is the flat ``workspaces.<name>: "<dir>"`` form."""
+    parts = dot_path.split(".")
+    return len(parts) == 2 and parts[0] == "workspaces" and isinstance(value, str)
 
 
 def _apply_field_default(data: dict, dot_path: str) -> bool:
@@ -314,8 +361,9 @@ class ConfigCache:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        # (fingerprint, deep-copyable validated data dict, opaque sidecar)
-        self._entry: tuple[tuple, dict, dict] | None = None
+        # (fingerprint, deep-copyable validated data dict, opaque sidecar,
+        #  digest of the bytes that read parsed)
+        self._entry: tuple[tuple, dict, dict, str | None] | None = None
         # Monotonic invalidation token. A loader captures this before disk I/O;
         # clear() advances it so that reader cannot publish a pre-write snapshot
         # afterward even when a coarse filesystem reports the same fingerprint.
@@ -339,8 +387,8 @@ class ConfigCache:
                 return copy.deepcopy(self._entry[1])
         return None
 
-    def get_with_sidecar(self, fingerprint: tuple) -> tuple[dict, dict] | None:
-        """Return deep copies of ``(data, sidecar)`` from ONE lock hold, else None.
+    def get_with_sidecar(self, fingerprint: tuple) -> tuple[dict, dict, str | None] | None:
+        """Return ``(data, sidecar, content_digest)`` from ONE lock hold, else None.
 
         The sidecar carries facts about the SAME read that the merged dict cannot
         express — today, the pre-overlay base values the loader needs to round-trip
@@ -351,10 +399,23 @@ class ConfigCache:
         loader would then capture from as if no overlay existed, deleting shadowed
         base keys on the next save. There is deliberately no separate sidecar
         accessor: the lock makes the pair all-or-nothing.
+
+        ``content_digest`` is the third fact about that one read and leaves under the
+        same hold for the same reason: it says WHICH BYTES this entry was parsed
+        from, which the fingerprint cannot. A fingerprint is stat metadata, so a
+        replacement landing the same byte count can present an identical one, and a
+        caller would then pair this entry's data with a digest of different bytes.
+        ``None`` means the storing caller named none -- it did no disk read, or could
+        not read the files whole -- so a caller needing provenance must treat it as
+        unknown rather than as a match.
         """
         with self._lock:
             if self._entry is not None and self._entry[0] == fingerprint:
-                return copy.deepcopy(self._entry[1]), copy.deepcopy(self._entry[2])
+                return (
+                    copy.deepcopy(self._entry[1]),
+                    copy.deepcopy(self._entry[2]),
+                    self._entry[3],
+                )
         return None
 
     def store(
@@ -364,6 +425,7 @@ class ConfigCache:
         sidecar: dict | None = None,
         *,
         expected_generation: int | None = None,
+        content_digest: str | None = None,
     ) -> bool:
         """Cache *data* when no invalidation occurred since its disk read began.
 
@@ -374,6 +436,11 @@ class ConfigCache:
         closes that gap. ``clear()`` advances the token, and a reader holding an
         older token is refused rather than restoring stale data after the clear.
 
+        *content_digest* is the digest of the bytes this *data* was parsed from, so
+        the entry can answer which content it represents rather than only which stat
+        signature it was filed under. A caller that read no bytes has none to give
+        and passes nothing, which records the provenance as unknown.
+
         Returns whether the value was stored. Callers that do not perform disk
         I/O may omit *expected_generation* and retain the original unconditional
         cache-insertion behavior.
@@ -381,7 +448,12 @@ class ConfigCache:
         with self._lock:
             if expected_generation is not None and expected_generation != self._generation:
                 return False
-            self._entry = (fingerprint, copy.deepcopy(data), copy.deepcopy(sidecar or {}))
+            self._entry = (
+                fingerprint,
+                copy.deepcopy(data),
+                copy.deepcopy(sidecar or {}),
+                content_digest,
+            )
             return True
 
     def clear(self) -> None:
@@ -424,17 +496,22 @@ def validate_config_data(data: dict) -> dict:
     # config's *sections*, so the keys save() stamps itself are not in it and
     # must be excluded — otherwise every load of a config Kiro Crew has ever
     # saved warns about Kiro Crew's own bookkeeping. A section a builtin app owns
-    # and reads from the file directly (_APP_OWNED_TOP_KEYS) is not in the
-    # registry either, and is excluded for the same reason: the product told the
-    # operator to write it. Excluded only in the shape the app reads -- a JSON
-    # object. The app's reader keeps only a dict (repository.py
-    # ``isinstance(raw.get("dev_fleet"), dict)``) and silently falls back to
-    # discovery on anything else, so a scalar ``dev_fleet: "/opt/kc"`` would
+    # and reads from the file directly (_APP_OWNED_TOP_KEYS), or that this core
+    # writes and reads without a dataclass model (_CORE_OWNED_TOP_KEYS), is not
+    # in the registry either and is excluded for the same reason: the product
+    # told the operator to write it, or wrote it itself. Excluded only in the
+    # shape the reader keeps -- a JSON object. A reader keeps only a dict and
+    # silently falls back on anything else, so a scalar written by hand would
     # otherwise lose the one warning that tells the operator it is being ignored.
     known_top_keys = {e.path for e in SCHEMA_REGISTRY if "." not in e.path and e.path != "*"}
     app_owned_sections = {k for k in _APP_OWNED_TOP_KEYS if isinstance(data.get(k), dict)}
+    core_owned_sections = {k for k in _CORE_OWNED_TOP_KEYS if isinstance(data.get(k), dict)}
     unknown = sorted(
-        set(data.keys()) - known_top_keys - CONFIG_RESERVED_TOP_KEYS - app_owned_sections
+        set(data.keys())
+        - known_top_keys
+        - CONFIG_RESERVED_TOP_KEYS
+        - app_owned_sections
+        - core_owned_sections
     )
     if unknown:
         logger.warning("Config: unrecognized top-level keys: %s", ", ".join(unknown))
@@ -468,6 +545,24 @@ def validate_config_data(data: dict) -> dict:
     agent = data.get("agent")
     if isinstance(agent, dict) and isinstance(agent.get("log_level"), str):
         agent["log_level"] = agent["log_level"].upper()
+
+    # 3b. ``auto_update`` decides whether an unattended installer runs, and its
+    # two wrong answers are not symmetric, so a type mismatch must not be
+    # "repaired" to this field's True default: a hand-edited ``"false"`` (or a
+    # ``0``) would then install on a host whose owner wrote the opposite. A
+    # recognized spelling becomes its bool here, before the type check sees it,
+    # and anything else unreadable becomes False. The loader applies the same
+    # rule (``fields._coerce_bool``) for a host without ``jsonschema``.
+    if "auto_update" in data and not isinstance(data["auto_update"], bool):
+        data["auto_update"] = _coerce_bool(data["auto_update"], False)
+
+    # 3c. A retired verbosity level is renamed, not rejected: the enum check
+    # would otherwise delete it and drop the user back to the verbose default.
+    dashboard = data.get("dashboard")
+    if isinstance(dashboard, dict) and "verbosity" in dashboard:
+        from kiro_crew.config.sections import normalize_verbosity
+
+        dashboard["verbosity"] = normalize_verbosity(dashboard["verbosity"])
 
     # 3a. Resolve the STT provider and model through the loader's own degradation
     # rules before the enum check can discard them. Both fields accept values that
@@ -523,6 +618,11 @@ def validate_config_data(data: dict) -> dict:
                     "using default" if removed else "value kept (validated by its consumer)",
                 )
             elif err.validator == "type":
+                if _is_flat_workspace_string(dot_path, value):
+                    # The loader migrates this form to {"dir": ...} and writes
+                    # it back, so the string stays for it to read.
+                    logger.info("Config: flat workspace string at '%s' is migrated", dot_path)
+                    continue
                 expected = err.schema.get("type", "unknown")
                 actual = _actual_type_name(value)
                 removed = _apply_field_default(data, dot_path)

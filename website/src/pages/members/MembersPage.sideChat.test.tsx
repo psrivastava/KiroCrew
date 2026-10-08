@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { PREVIEW_DASHBOARD } from '../../utils/previewFlags'
 import { screen, fireEvent, waitFor, act } from '@testing-library/react'
 import { renderWithProviders } from '../../test/helpers'
 import { __resetPanelTabs } from '../../hooks/usePanelTabs'
@@ -15,11 +16,14 @@ import { __resetPanelTabs } from '../../hooks/usePanelTabs'
 vi.mock('../../api/client', () => ({
   api: {
     members: vi.fn(),
+    // The roster's team grouping reads the team list; "no teams" keeps the
+    // list flat, which is the shape every case here was written against.
+    teams: { list: vi.fn(() => Promise.resolve({ teams: [] })) },
     memberThread: vi.fn(),
     memberActivity: vi.fn(() => Promise.resolve({ slug: '', member: '', capped: false, entries: [] })),
-    crons: vi.fn(() => Promise.resolve({ jobs: [] })),
-    webhooks: vi.fn(() => Promise.resolve({ tokens: [] })),
-    defaultAgent: vi.fn(() => Promise.resolve({ default_agent: '' })),
+    memberBriefing: vi.fn(() => Promise.resolve({ slug: '', member: '', supported: true, text: '', updated_ts: null, redacted: false, truncated: false })),
+    sessionCrewLogProjections: vi.fn(() => Promise.resolve({ folds: {}, resolved: true, writesDrained: true })),
+    memberPanel: vi.fn(() => Promise.resolve({ panel: null, html: null })),
     autonudgeList: vi.fn(() => Promise.resolve({ enabled: true, loops: [] })),
   },
 }))
@@ -72,7 +76,7 @@ import { api } from '../../api/client'
 import MembersPage from './MembersPage'
 
 const WIDE_WINDOW = 1440
-const NARROW_WINDOW = 1000
+const NARROW_WINDOW = 700
 function setWindowWidth(px: number) {
   Object.defineProperty(window, 'innerWidth', { value: px, configurable: true, writable: true })
 }
@@ -102,6 +106,8 @@ beforeEach(() => {
   vi.clearAllMocks()
   verdicts.length = 0
   localStorage.clear()
+  // The Dashboard tab is a Feature Preview; these cases pin the strip with it on.
+  localStorage.setItem(PREVIEW_DASHBOARD, '1')
   __resetPanelTabs()
   setWindowWidth(WIDE_WINDOW)
 })
@@ -114,7 +120,7 @@ describe('MembersPage Side Chat in the side panel (selection Ask)', () => {
 
   it('Ask opens the Side tab in the docked panel, bound to the MEMBER slot, and reports the Ask as done', async () => {
     await openThread()
-    await screen.findByTestId('member-crew-summary')
+    await screen.findByTestId('member-dashboard')
     expect(tabLabels()).not.toContain('Side Chat')
 
     act(() => { fireEvent.click(screen.getByRole('button', { name: 'stub-ask' })) })
@@ -128,7 +134,7 @@ describe('MembersPage Side Chat in the side panel (selection Ask)', () => {
 
   it('Side Chat is offered from the + menu too: its draft lives in the chat-core store, so the panel unmounting the body loses nothing', async () => {
     await openThread()
-    await screen.findByTestId('member-crew-summary')
+    await screen.findByTestId('member-dashboard')
     fireEvent.pointerDown(
       screen.getByRole('button', { name: 'Open side panel tab' }),
       { button: 0, ctrlKey: false, pointerType: 'mouse' },
@@ -141,7 +147,7 @@ describe('MembersPage Side Chat in the side panel (selection Ask)', () => {
     setWindowWidth(NARROW_WINDOW)
     await openThread()
     // Overlay closed by default — the panel is not on screen.
-    expect(screen.queryByTestId('member-crew-summary')).toBeNull()
+    expect(screen.queryByTestId('member-dashboard')).toBeNull()
     act(() => { fireEvent.click(screen.getByRole('button', { name: 'stub-ask' })) })
     expect(verdicts).toEqual([true])
     const overlay = await screen.findByTestId('member-side-panel')
@@ -198,9 +204,9 @@ describe('MembersPage Side Chat in the side panel (selection Ask)', () => {
     // The collision surfaces as its own notice; no pane, so no Ask …
     await screen.findByTestId('member-thread-collision')
     expect(screen.queryByTestId('chat-pane-stub')).toBeNull()
-    // … and the strip is the slot-free bucket: only the Crew summary, no Side
-    // Chat on the roster's unconfirmed `member-other` key.
-    await waitFor(() => expect(tabLabels()).toEqual(['Crew summary']))
+    // … and the strip is the slot-free bucket: Dashboard only. Side Chat
+    // remains dynamic and requires a confirmed member thread.
+    await waitFor(() => expect(tabLabels()).toEqual(['Dashboard']))
     expect(screen.queryByTestId('side-chat-stub')).toBeNull()
   })
 })

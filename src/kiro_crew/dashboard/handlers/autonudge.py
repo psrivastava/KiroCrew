@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 from dataclasses import asdict, fields
 from typing import Any
@@ -30,6 +31,7 @@ from kiro_crew.dashboard.handlers.source_providers import (
     stale_owner_session_response,
 )
 from kiro_crew.dashboard.state import DashboardState
+from kiro_crew.monitoring.limits import runtime_ceiling_secs, validate_runtime_secs
 from kiro_crew.monitoring.models import (
     DEFAULT_MONITOR_AGENT_TURNS,
     DEFAULT_MONITOR_CADENCE_SECS,
@@ -39,7 +41,6 @@ from kiro_crew.monitoring.models import (
     MAX_MONITOR_AGENT_TURNS,
     MAX_MONITOR_CADENCE_SECS,
     MAX_MONITOR_PROVIDER_ERRORS,
-    MAX_MONITOR_RUNTIME_SECS,
     MAX_MONITOR_TOKENS,
     MAX_MONITOR_WAKE_INSTRUCTIONS_CHARS,
     MIN_MONITOR_CADENCE_SECS,
@@ -58,6 +59,7 @@ from kiro_crew.monitoring.registry import (
 from kiro_crew.platform import redact_via_context
 from kiro_crew.sel import sel
 from kiro_crew.session_ledger import ledger_key, render_snapshot
+from kiro_crew.validation import ValidationError, validate_judge_spec
 
 logger = logging.getLogger(__name__)
 
@@ -117,6 +119,20 @@ def _redact_monitor_value(value: Any) -> Any:
 
 def _serialize(loop: Any) -> dict[str, Any]:
     payload = asdict(loop)
+    # Read positions, dropped on EVERY projection rather than only the structured
+    # one. A cursor is bookkeeping with no surface: it says nothing a reader could
+    # act on, and it names each watched target, so publishing it discloses the
+    # subject list without any reader being better off. ``asdict`` copies whatever
+    # the dataclass holds, so a judge field joins these reads by existing -- which
+    # is how this one did -- and the drop has to be here rather than in the
+    # structured-monitor filter, which a plain loop never reaches.
+    payload.pop("judge_cursors", None)
+    payload.pop("judge_recent_verdicts", None)
+    # Same class as a cursor, and dropped everywhere for the same reason: the
+    # baseline names the identifiers of the remarks the loop has already been shown,
+    # which is the watched subject's discussion by another name. No surface renders
+    # it, so no reader is worse off without it.
+    payload.pop("judge_pr_seen", None)
     if loop.monitor is None:
         # Legacy clients predate structured monitors and require their exact shape.
         payload.pop("monitor", None)
@@ -189,6 +205,42 @@ _MONITOR_WITHHELD_LEGACY_FIELDS = frozenset(
         "max_cycles",
         "cycle_count",
         "last_fire_ts",
+        # The wake judge's own state. Withheld from a STRUCTURED monitor's legacy
+        # projection, and each for its own reason rather than as a block. A plain
+        # loop -- which is where a judge actually lives -- does not pass through
+        # this filter at all: it goes through ``_serialize``, which publishes
+        # ``judge``, ``judge_quiet_streak`` and ``judge_last_verdict`` and drops
+        # only ``judge_cursors``. That asymmetry is deliberate and was ruled on: the
+        # popover has to render the brief and the last reading for the owner, and the
+        # brief is the owner's own sentences about their own loop. A structured
+        # monitor is held to the stricter line because its record is owner-scoped
+        # everywhere else it is published.
+        #
+        # * ``judge`` is the owner's brief, carrying their ``wake_when`` /
+        #   ``quiet_when`` prose. Withheld HERE because a structured monitor's
+        #   subject is exactly what this route may not disclose.
+        # * ``judge_cursors`` is bookkeeping with no surface, and it names every
+        #   watched target: withheld on every projection, not just this one.
+        # * ``judge_pr_seen`` is the same: a digest plus the ids of the remarks the
+        #   loop was already shown, which names the subject's discussion. Also
+        #   withheld on every projection.
+        # * ``judge_quiet_streak`` and ``judge_last_verdict`` are the automation's
+        #   own accounting, the same class as ``cycle_count``. The verdict is
+        #   text-free by construction -- an outcome, an item COUNT and a timestamp --
+        #   so it can be published without carrying anything the judge read.
+        # * ``judge_wake_pending`` is a bare boolean -- one owed turn, or none -- and
+        #   names nothing at all. Withheld anyway, for the reason ``judge_quiet_streak``
+        #   is: this route holds a structured monitor to the stricter line, and the
+        #   plain loop that has a popover to render gets it from ``_serialize``.
+        # * ``judge_recent_verdicts`` is the automation's own calibration accounting,
+        #   like ``judge_quiet_streak``, and no surface renders it.
+        "judge",
+        "judge_cursors",
+        "judge_pr_seen",
+        "judge_quiet_streak",
+        "judge_last_verdict",
+        "judge_wake_pending",
+        "judge_recent_verdicts",
     }
 )
 
@@ -294,6 +346,9 @@ def _autonudge_loop_reading(loop: Any) -> dict[str, Any]:
         "created_ts": loop.created_ts,
         "next_due_ts": loop.next_due_ts,
         "stopped_reason": loop.stopped_reason,
+        # Active but holding: a cycle's approval went unanswered and it fires
+        # nothing until a person answers one, sends a message or fires it.
+        "paused_for_approval": bool(loop.approval_stalled) and not is_structured_monitor_loop(loop),
         "has_banner": bool(loop.banner),
     }
 
@@ -379,7 +434,12 @@ async def _require_monitor_internal(request: web.Request) -> web.Response | None
 
 def _bounded_int(body: dict[str, Any], name: str, default: int, minimum: int, maximum: int) -> int:
     raw = body.get(name, default)
-    if isinstance(raw, bool) or not isinstance(raw, int) or not minimum <= raw <= maximum:
+    # A whole-number float (``60.0``, as a JSON body may spell an integer) is
+    # taken as the integer; a bool, a fractional float and a non-finite float
+    # are refused, the same rule ``validate_runtime_secs`` applies.
+    if type(raw) is float and raw.is_integer():
+        raw = int(raw)
+    if type(raw) is not int or not minimum <= raw <= maximum:
         raise ValueError(f"{name} must be an integer between {minimum} and {maximum}")
     return raw
 
@@ -435,6 +495,10 @@ def _monitor_config(
             f"wake_instructions must be a string of at most "
             f"{MAX_MONITOR_WAKE_INSTRUCTIONS_CHARS} characters"
         )
+    # The operator ceiling bounds only a budget the caller SUPPLIED. The shipped
+    # default is itself capped to the ceiling, so a request that omits the field
+    # is accepted under any ceiling instead of failing on a number nobody sent.
+    runtime_ceiling = runtime_ceiling_secs()
     return MonitorState(
         kind=kind,
         target=target,
@@ -451,15 +515,18 @@ def _monitor_config(
             max_runtime_secs=_bounded_int(
                 body,
                 "max_runtime_secs",
-                DEFAULT_MONITOR_RUNTIME_SECS,
+                min(DEFAULT_MONITOR_RUNTIME_SECS, runtime_ceiling),
                 1,
-                MAX_MONITOR_RUNTIME_SECS,
+                runtime_ceiling,
             ),
+            # Floor 0, not 1: zero is this budget's unlimited sentinel, and
+            # ``_bounded_int`` reads the body by key rather than by truthiness, so
+            # an explicit 0 survives instead of collapsing to the default.
             max_agent_turns=_bounded_int(
                 body,
                 "max_agent_turns",
                 DEFAULT_MONITOR_AGENT_TURNS,
-                1,
+                0,
                 MAX_MONITOR_AGENT_TURNS,
             ),
             max_tokens=_bounded_int(
@@ -603,6 +670,12 @@ async def api_monitor_slot_get(request: web.Request) -> web.Response:
                 if loop is not None and is_structured_monitor_loop(loop)
                 else None
             ),
+            # The LIVE operator ceiling (``monitoring.max_runtime_secs``), so the
+            # popover can bound its runtime input where the create/update
+            # handlers will actually accept it. The static contract carries only
+            # the absolute maximum any install may configure; a form validated
+            # against the contract alone can only fail as a post-submit 400.
+            "max_runtime_ceiling_secs": runtime_ceiling_secs(),
         }
     )
 
@@ -676,7 +749,6 @@ async def api_monitor_update(request: web.Request) -> web.Response:
             "target": body.get("target", current.target),
             "objective": body.get("objective", current.objective),
             "cadence_secs": body.get("cadence_secs", current.cadence_secs),
-            "max_runtime_secs": body.get("max_runtime_secs", current.budgets.max_runtime_secs),
             "max_agent_turns": body.get("max_agent_turns", current.budgets.max_agent_turns),
             "max_tokens": body.get("max_tokens", current.budgets.max_tokens),
             "max_provider_errors": body.get(
@@ -684,6 +756,11 @@ async def api_monitor_update(request: web.Request) -> web.Response:
             ),
             "wake_instructions": body.get("wake_instructions", current.wake_instructions),
         }
+        # Only a supplied budget is re-checked against the ceiling. The stored
+        # one is not merged in: it was accepted when written and is validated
+        # again only when it is next written.
+        if "max_runtime_secs" in body:
+            merged["max_runtime_secs"] = body["max_runtime_secs"]
         gitlab_hosts = await ensure_gitlab_hosts_loaded()
         config = _monitor_config(
             merged,
@@ -811,22 +888,37 @@ async def api_monitor_restart(request: web.Request) -> web.Response:
     if monitor.outcome is None:
         return _monitor_error("only terminal monitors can restart", "monitor_not_terminal")
     state: DashboardState = request.app["state"]
-    restarted, error, status = await authorize_and_add_nudge(
-        svc=svc,
-        state=state,
-        slot_key=loop.slot_key,
-        message=monitor.wake_instructions or "structured monitor",
-        idle_secs=monitor.cadence_secs,
-        max_cycles=0,
-        max_runtime_secs=monitor.budgets.max_runtime_secs,
-        source="dashboard",
-        caller=request.remote or "",
-        monitor=monitor,
-        expected_existing_monitor_id=loop.id,
-        expected_existing_config_generation=monitor.config_generation,
-        creation_surface=monitor.creation_surface,
-        grant_owner_provider_credentials=True,
+    # The stored budget was validated against the ceiling in force when the
+    # record was armed; a lowered ceiling must not turn the restart into a
+    # refusal naming a number the user never typed. The clamp lands on the
+    # record itself: the store re-validates ``budgets.max_runtime_secs`` on
+    # add, so a monitor forwarded with its stored budget would still be refused.
+    restart_runtime_secs = min(monitor.budgets.max_runtime_secs, runtime_ceiling_secs())
+    restart_monitor = dataclasses.replace(
+        monitor,
+        budgets=dataclasses.replace(monitor.budgets, max_runtime_secs=restart_runtime_secs),
     )
+    try:
+        restarted, error, status = await authorize_and_add_nudge(
+            svc=svc,
+            state=state,
+            slot_key=loop.slot_key,
+            message=monitor.wake_instructions or "structured monitor",
+            idle_secs=monitor.cadence_secs,
+            max_cycles=0,
+            max_runtime_secs=restart_runtime_secs,
+            source="dashboard",
+            caller=request.remote or "",
+            monitor=restart_monitor,
+            expected_existing_monitor_id=loop.id,
+            expected_existing_config_generation=monitor.config_generation,
+            creation_surface=monitor.creation_surface,
+            grant_owner_provider_credentials=True,
+        )
+    except ValueError as exc:
+        # The authorizer audits the failed add before re-raising; the store's
+        # bound refusal is a client-side condition, answered with its range.
+        return _monitor_error(str(exc), "monitor_restart_denied", status=400)
     if error is not None:
         return _monitor_error(error, "monitor_restart_denied", status=status)
     return web.json_response({"ok": True, "monitor": _serialize_monitor(restarted)})
@@ -846,11 +938,16 @@ async def api_autonudge_start(request: web.Request) -> web.Response:
     instead of ``message``; the model still receives ``message`` in full every
     cycle. Omitting it keeps the row exactly as it has always been.
     """
+    # Same owner gate as every ``api_monitor_*`` route: a loop's message becomes
+    # the owner session's next turn, so arming one is an owner decision.
+    denied = await _require_monitor_owner(request, "autonudge_start")
+    if denied is not None:
+        return denied
     svc = _autonudge_get()
     if svc is None:
         return web.json_response(
             {
-                "error": "auto-nudge disabled (KIROCREW_AUTONUDGE not set)",
+                "error": "auto-nudge disabled (KIROCREW_AUTONUDGE is 0/false/no)",
                 "code": "autonudge_disabled",
             },
             status=503,
@@ -878,11 +975,18 @@ async def api_autonudge_start(request: web.Request) -> web.Response:
                 )
         idle_secs = int(body.get("idle_secs", 60))
         max_cycles = int(body.get("max_cycles", 0))
-        max_runtime_secs = int(body.get("max_runtime_secs", 0))
     except (TypeError, ValueError, OverflowError):
         return web.json_response(
             {"error": "idle_secs, max_cycles and max_runtime_secs must be integers"}, status=400
         )
+    # Bound-checked separately so an out-of-range integer is answered with the
+    # range that refused it, not with the type message above.
+    try:
+        max_runtime_secs = validate_runtime_secs(
+            body.get("max_runtime_secs", 0), allow_unbounded=True
+        )
+    except ValueError as exc:
+        return web.json_response({"error": str(exc), "code": "invalid_runtime_budget"}, status=400)
     # The gating opt-out has to exist HERE too, not only on the MCP tool: this is
     # ABSENT MEANS UNGATED on this route, unlike the monitor_start tool. This is a
     # GENERIC arming route: its only caller is the goal popover, where a person
@@ -901,6 +1005,22 @@ async def api_autonudge_start(request: web.Request) -> web.Response:
             {"error": "gate must be a boolean", "code": "not_a_boolean"}, status=400
         )
     gate = False if raw_gate is None else raw_gate
+    # Validated HERE, not at the chokepoint. `authorize_and_add_nudge` takes the
+    # brief through unchanged and says so: it owns the banner cap and the redaction
+    # passes but deliberately not this, because a refusal has to name the field the
+    # owner can fix and only the surface they typed it at can do that. This route is
+    # such a surface, so it runs the same `validate_judge_spec` the monitor_start
+    # tool runs rather than forwarding an unchecked object -- an unvalidated brief
+    # reaching the loop record would be the way around that bound.
+    #
+    # And it is ACCEPTED rather than refused, because silently dropping it is the one
+    # outcome that leaves a caller believing a judge is armed when none is.
+    try:
+        judge_spec = validate_judge_spec(body.get("judge"))
+    except ValidationError as exc:
+        return web.json_response(
+            {"error": f"{exc.field}: {exc.message}", "code": "invalid_judge_spec"}, status=400
+        )
     loop, error, status = await authorize_and_add_nudge(
         svc=svc,
         state=state,
@@ -914,6 +1034,7 @@ async def api_autonudge_start(request: web.Request) -> web.Response:
         # and the channel refusal, so a non-string is a 400 from there rather
         # than a silent str() here that would persist "None" as a banner.
         banner=body.get("banner"),
+        judge=judge_spec,
         source="dashboard",
         caller=request.remote or "",
         gate=gate,
@@ -937,6 +1058,9 @@ async def api_autonudge_update(request: web.Request) -> web.Response:
     its docstring for why those live in the transport-agnostic module and not
     here.
     """
+    denied = await _require_monitor_owner(request, "autonudge_update")
+    if denied is not None:
+        return denied
     svc = _autonudge_get()
     if svc is None:
         return web.json_response(
@@ -965,6 +1089,14 @@ async def api_autonudge_update(request: web.Request) -> web.Response:
         idle_secs=body.get("idle_secs"),
         max_cycles=body.get("max_cycles"),
         active=body.get("active"),
+        # This route is the user's own press (the goal popover's Play), so a
+        # revival through it is a resume: the service resets only the counter
+        # behind a spent bound (a spent cycle cap zeroes the count, a spent time
+        # budget re-anchors the clock, read from the stored stop reason and the
+        # bounds at the press) and keeps the rest, so the loop resumes from its
+        # breakpoint; a save on a running loop carries ``active: true`` too and
+        # the flag is inert there.
+        fresh_run=True,
         max_runtime_secs=body.get("max_runtime_secs"),
         banner=body.get("banner"),
         source="dashboard",
@@ -1055,7 +1187,11 @@ async def api_autonudge_delete(request: web.Request) -> web.Response:
         if error is not None:
             return _monitor_error(error, "monitor_stop_denied", status=status)
         return web.json_response({"ok": True})
-    await svc.remove(loop_id)
+    # The structured branch above gates itself; this is the legacy row's gate.
+    denied = await _require_monitor_owner(request, "autonudge_delete")
+    if denied is not None:
+        return denied
+    await svc.remove(loop_id, stop_reason="dashboard_delete")
     sel().log_tool_invocation(
         session_key=existing.slot_key if existing else "",
         source="dashboard",
@@ -1090,12 +1226,10 @@ async def api_autonudge_fire(request: web.Request) -> web.Response:
       product decision — the fire path this route arms already made it, with its
       reason written down at the site: queueing "would stack identical 3KB+
       nudges and blow up the context window" (``_fire_dashboard_nudge``). The
-      predicate is the repository's canonical one, ``slot.running or
-      slot._in_stage_execution``, read here exactly as the cron-injection
-      handler reads it (``handlers/messaging.py``) — ``slot.running`` alone is
-      False between the stages of a multi-stage plan, so it would let this land
-      a concurrent turn on top of the plan. Note the two consumers of that
-      predicate diverge deliberately: the cron path QUEUES, this one REFUSES,
+      predicate is the repository's canonical one, ``slot.running``, read here
+      exactly as the cron-injection handler reads it
+      (``handlers/messaging.py``). Note the two consumers of that predicate
+      diverge deliberately: the cron path QUEUES, this one REFUSES,
       and the nudge path's stated reason is the one that applies here.
 
       This check is an AFFORDANCE, not a guarantee: a turn that starts between
@@ -1139,6 +1273,9 @@ async def api_autonudge_fire(request: web.Request) -> web.Response:
     structural rather than a habit: a guard added later cannot silently skip the
     record, because there is no un-audited way out.
     """
+    denied = await _require_monitor_owner(request, "autonudge_fire")
+    if denied is not None:
+        return denied
     # Read before the service check so the audit helpers can name the subject
     # even on the disabled path. Pure ``match_info`` read; no service needed.
     loop_id = request.match_info["loop_id"]
@@ -1223,7 +1360,7 @@ async def api_autonudge_fire(request: web.Request) -> web.Response:
         )
     state: DashboardState = request.app["state"]
     slot = state.get_slot(existing.slot_key)
-    if slot is not None and (slot.running or slot._in_stage_execution):
+    if slot is not None and slot.running:
         # Names the OUTCOME and the NEXT STEP, not just the condition. "a turn is
         # in flight" leaves a reader unable to tell a refusal from a delay, and
         # the distinction is the whole point here: the press was refused, not
@@ -1248,6 +1385,24 @@ async def api_autonudge_fire(request: web.Request) -> web.Response:
                 "error": "audit log unavailable: the nudge was NOT sent, "
                 "so fix the audit store and press again",
                 "code": "audit_unavailable",
+            },
+            status=503,
+        )
+    # A person pressed fire: that ends an approval hold first, or the armed tick
+    # would find the loop still paused and the press would do nothing. Unarmed,
+    # because fire_now arms the tick itself.
+    try:
+        await svc.release_approval_hold(existing.slot_key, why="fired by hand", arm=False)
+    except Exception:
+        # The hold stays as the store has it, so a fire now would only hold
+        # again: refuse it out loud rather than report a press that did nothing.
+        logger.warning("autonudge: releasing the approval hold failed", exc_info=True)
+        await _audit("denied", existing.slot_key, "approval_hold_release_failed")
+        return web.json_response(
+            {
+                "error": "nudge not sent: the loop is paused for approval and could "
+                "not be resumed, so press again",
+                "code": "approval_hold_release_failed",
             },
             status=503,
         )

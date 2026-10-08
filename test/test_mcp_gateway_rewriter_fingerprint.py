@@ -50,6 +50,8 @@ def test_rewrite_agents_signature_is_pinned_to_fingerprint_inputs() -> None:
         "approval_mode",
         "stub_servers",
         "pooling_enabled",
+        # Fingerprinted through ``LaunchApprovals.digest``.
+        "approvals",
     }
 
 
@@ -633,6 +635,27 @@ def test_pre_cmd_safe_schema_forces_regeneration(
     _mk_tree(tmp_path)
     with monkeypatch.context() as patch:
         patch.setattr(rewriter, "_FINGERPRINT_SCHEMA", 6)
+        _rewrite(tmp_path)
+    before = rewrite_counter["n"]
+    _rewrite(tmp_path)
+    assert rewrite_counter["n"] == before + 2
+
+
+def test_pre_governed_passthrough_schema_forces_regeneration(
+    tmp_path: Path, rewrite_counter: dict[str, int], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A schema 7 overlay can hold a stub for a server that must not be pooled.
+
+    A registry-governed or muted entry passes through unwrapped, and its inputs
+    are identical either way -- so the stat fingerprint alone sees no change and
+    a kept overlay keeps a stub whose name ``injection_server_names`` collects.
+    That stub launches the server at session level: for a marked entry, one whose
+    launch belongs to the administrator's catalog; for a muted one, the server the
+    user silenced. The schema is what rejects such an overlay on upgrade.
+    """
+    _mk_tree(tmp_path)
+    with monkeypatch.context() as patch:
+        patch.setattr(rewriter, "_FINGERPRINT_SCHEMA", 7)
         _rewrite(tmp_path)
     before = rewrite_counter["n"]
     _rewrite(tmp_path)
@@ -2085,6 +2108,8 @@ def test_a_failed_overlay_write_leaves_the_previous_generations_sidecar(
     kept = json.loads((tmp_path / "mcp-gateway" / "agents" / "agent-1.json").read_text())
     kept_flags = expand_stub_flags(kept["mcpServers"]["srv"]["args"])
     assert "--env-file" in kept_flags, "premise: the kept overlay names a sidecar"
+    kept_env_file = Path(kept_flags[kept_flags.index("--env-file") + 1])
+    assert kept_env_file == victim_sidecar, "the kept overlay moved off its own sidecar"
     assert (
         json.loads(victim_sidecar.read_text())["K"] == "old"
     ), "the kept overlay's old args now launch against the new generation's env"

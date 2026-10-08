@@ -92,10 +92,18 @@ function mount(
   return { ...utils, onSave, onCancel }
 }
 
-const openReactions = () => fireEvent.click(screen.getByRole('button', { name: 'Reactions' }))
-const openPicture = () => fireEvent.click(screen.getByRole('button', { name: 'Picture' }))
-const openLibrary = () => fireEvent.click(screen.getByRole('button', { name: 'Library' }))
-const openFace = () => fireEvent.click(screen.getByRole('button', { name: 'Ghost face' }))
+const openPicture = () => fireEvent.click(screen.getByRole('radio', { name: 'Picture' }))
+const openLibrary = () => fireEvent.click(screen.getByRole('radio', { name: 'Library' }))
+const openFace = () => fireEvent.click(screen.getByRole('radio', { name: 'Ghost face' }))
+/** Reactions is a decoration of the ghost FACE tier, so its tab is only in the
+ *  strip while Face is selected. The builder now opens on the Icon tier for a
+ *  crew with no override, so reach Reactions the way a user does: select Ghost
+ *  face first, then Reactions. (A no-op when Face is already current.) */
+const openReactions = () => {
+  const face = screen.queryByRole('radio', { name: 'Ghost face' })
+  if (face) fireEvent.click(face)
+  fireEvent.click(screen.getByRole('radio', { name: 'Reactions' }))
+}
 const apply = () => fireEvent.click(screen.getByTestId('avatar-builder-save'))
 const lastSaved = (onSave: ReturnType<typeof vi.fn>) =>
   onSave.mock.calls.at(-1)?.[0] as CrewAvatarOverride | null
@@ -258,7 +266,7 @@ describe('CrewAvatarBuilder — Reactions pane', () => {
 
   it('offers no Reactions tab on a picture — it is static and silent', () => {
     mount({ kind: 'image', v: 2 })
-    expect(screen.queryByRole('button', { name: 'Reactions' })).toBeNull()
+    expect(screen.queryByRole('radio', { name: 'Reactions' })).toBeNull()
   })
 
   it('a picture Apply carries the picture and no reaction key', async () => {

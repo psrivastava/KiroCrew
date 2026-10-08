@@ -45,9 +45,11 @@ from kiro_crew.config.loader import (
     config_dir,
     config_local_path,
     config_path,
+    read_config_text,
     update_config_locked,
 )
 from kiro_crew.loop_lock import LoopBoundLock
+from kiro_crew.owner_only_files import ensure_directory
 from kiro_crew.pinned_fs import supports_pinned_walk
 from kiro_crew.platform import current_context, safe_context_call
 from kiro_crew.platform_compat import is_link_or_junction
@@ -77,7 +79,7 @@ def app_dir(name: str) -> Path:
 def app_data_dir(name: str) -> Path:
     """Return the app-scoped data directory: ``~/.kiro/crew/apps/{name}/data/``."""
     d = app_dir(name) / "data"
-    d.mkdir(parents=True, exist_ok=True)
+    ensure_directory(d)  # 0700 in the data home, apps/ and apps/<name>/ included
     return d
 
 
@@ -461,6 +463,112 @@ def _is_generated_deps_artifact_name(n: str) -> bool:
     )
 
 
+class InstalledTreeRefused(Exception):
+    """The tree a copy produced is one the install turns away.
+
+    Raised by :func:`copy_app_tree_as_installed` on the preview copy the desktop
+    gate judges, where :func:`install_app` / :func:`update_app` return the same
+    refusal on their own copy -- the one predicate asked in both places
+    (:func:`gateway_data_dir_obstruction`), so a preview never admits a tree the
+    install refuses. Not an :class:`OSError`: the copy succeeded, the layout is the
+    app author's to fix, and a retry cannot change it.
+    """
+
+
+def gateway_data_dir_obstruction(root: Path) -> str:
+    """Why :func:`app_data_dir` could not stand in *root*, or ``""`` when it can.
+
+    The gateway's per-app data directory is ``<app dir>/data``, created with
+    ``mkdir(exist_ok=True)`` once the install is otherwise complete, and MOVED --
+    aside before every update's copy and back after it, to ``.<name>-data-tmp``
+    beside the app directory -- so the runtime's question is two questions: can
+    ``mkdir`` stand there, and can the gateway relocate what stands there and
+    put it back whole. A real directory answers both. A link answers neither
+    safely: ``mkdir`` may follow one that resolves to a directory, but the move
+    relocates the LINK, and a relative link moved out of its tree dangles -- the
+    directory it named stays inside the tree the update retires and is deleted
+    with it, silently, on the update's own success path. So a link at ``data`` is
+    refused whatever it resolves to, and so is anything else that is not a
+    directory: a regular file, a dangling link, a link to a file. Asked of the
+    copied tree AFTER the gateway's own part (a preserved ``data/`` put back over
+    the copy) and BEFORE the installed record is written, so a source shipping
+    such an entry is refused whole instead of leaving ``installed.json`` behind a
+    raise; asked of the preview copy by :func:`copy_app_tree_as_installed`, so
+    the desktop gate refuses the same tree before any transaction touches the app
+    directory; and asked by :func:`install_app` of an app directory ALREADY
+    standing at its destination with no installed record -- a prior default
+    uninstall's leftover, or an orphaned partial copy -- BEFORE its transaction
+    opens, so a pre-existing link or file at ``data`` is refused instead of being
+    unlinked by the orphan cleanup that clears such a directory before the copy
+    (the same refusal :func:`update_app` and :func:`uninstall_app` make of that
+    shape before they mutate anything); and asked by :func:`update_app` of the
+    INSTALLED tree in its preflight, BEFORE its transaction opens, so an installed
+    ``data`` that is a link or a file -- from before the refusal, or made by the
+    app's own runtime -- is refused with the old tree and record untouched instead
+    of being skipped by the move-aside and deleted with the retired tree on the
+    update's success path. The sentence names the obstruction: it is
+    the only explanation the install log, the ``AppResult`` and the audit record
+    carry.
+    """
+    data = root / "data"
+    if not os.path.lexists(data):
+        return ""
+    if is_link_or_junction(data):
+        shape = "link"
+    else:
+        try:
+            if data.is_dir():
+                return ""
+        except OSError:
+            pass  # exists, and cannot be followed to a directory: not one
+        shape = "file"
+    return (
+        f"`data` in the app tree is a {shape}; Kiro Crew creates the app's data "
+        "directory at that path and cannot install beside it."
+    )
+
+
+def _owned_data_dir(path: Path) -> bool:
+    """A directory the gateway can move aside and put back: a real one, not a link.
+
+    The shape :func:`install_app` and :func:`update_app` preserve across the copy
+    and :func:`preserved_data_awaits` predicts. ``is_dir`` alone follows a link
+    and would call a relative link a directory, then the move would relocate the
+    link out of its tree and lose what it named (see
+    :func:`gateway_data_dir_obstruction`). ``is_symlink`` alone misses a Windows
+    directory junction, which the move would relocate the same way while the
+    tree it names is retired with the old app files, so the link test is
+    :func:`~kiro_crew.platform_compat.is_link_or_junction`, the one the rest of
+    this module uses for that distinction.
+    """
+    return path.is_dir() and not is_link_or_junction(path)
+
+
+def _temp_data_name_obstruction(tmp_data: Path) -> str:
+    """Why the shared ``.<name>-data-tmp`` name cannot hold the preserved ``data/``,
+    or ``""`` when it can.
+
+    :func:`install_app` and :func:`update_app` move the app's ``data/`` to that
+    name beside the app directory while they replace the app files, and put it
+    back afterwards; the name is shared with the uninstall so a copy a crashed
+    sibling stranded there is reclaimable by whichever lifecycle runs next. It is
+    reclaimable only when what stands there is a real directory the gateway made.
+    Anything else at the name was planted by something else, and moving onto it
+    is not a move aside: ``shutil.move`` onto a directory LINK deposits ``data/``
+    inside the link's target, and the restore would then rename the link -- not
+    the data -- back into the app directory, stranding or deleting what was
+    preserved. So a link or a file at the name is refused before anything moves,
+    and the sentence names it.
+    """
+    if not os.path.lexists(tmp_data) or _owned_data_dir(tmp_data):
+        return ""
+    shape = "link" if is_link_or_junction(tmp_data) else "file"
+    return (
+        f"{tmp_data} is a {shape}; Kiro Crew keeps the app's data directory at that "
+        f"name while it replaces the app files and cannot use it -- remove it first"
+    )
+
+
 def _copy_app_tree(source: Path, dest: Path) -> None:
     """Copy an app source tree for install/update.
 
@@ -545,6 +653,69 @@ def _copy_app_tree(source: Path, dest: Path) -> None:
             os.symlink(
                 os.path.relpath(os.path.join(dest, rel_to_src), os.path.dirname(p)), p
             )
+
+
+def preserved_data_awaits(name: str) -> bool:
+    """Whether an install of *name* will restore a preserved ``data/`` over the copy.
+
+    :func:`install_app` and :func:`update_app` move an existing ``data/`` aside
+    before the copy and put it back afterwards, replacing whatever the source
+    shipped under that name: the installed app's own directory on an update, one
+    a default uninstall left behind, or the ``.{name}-data-tmp`` copy a crashed
+    sibling operation stranded (restored the same way). With none of those on
+    disk -- a first install -- the source's ``data/`` is what the runtime meets.
+    A LINK at either name is not a preserved directory: the install refuses one
+    before its record (:func:`gateway_data_dir_obstruction`) and the update
+    refuses to move one (:func:`_owned_data_dir`), so nothing of the gateway's is
+    put back over the copy for it.
+    """
+    dest = app_dir(name)
+    return _owned_data_dir(dest / "data") or _owned_data_dir(dest.parent / f".{name}-data-tmp")
+
+
+def copy_app_tree_as_installed(source: Path, dest: Path, *, data_preserved: bool) -> None:
+    """Produce, at *dest*, the tree an install of *source* leaves for the runtime.
+
+    The copy is :func:`_copy_app_tree` itself -- the same call :func:`install_app`
+    and :func:`update_app` make, so whatever it drops, omits, preserves or rewrites
+    (ignored names at any depth, escaping links, in-tree links kept as links,
+    absolute in-tree links rewritten) is not predicted here but produced. Then the
+    gateway's own part is applied the way the runtime will meet it: ``.app_secret``
+    is removed on every install -- :func:`install_app` and :func:`update_app`
+    remove the copied entry, unfollowed, before writing the gateway's own file or
+    moving the preserved one back (:func:`_remove_any_shape`, the call made here
+    too) -- and ``data`` is removed when *data_preserved* says the install will
+    put a preserved directory back over the copied one
+    (:func:`preserved_data_awaits`), and kept otherwise -- a first install carries
+    the source's ``data/`` as itself, so an entry point under it is the source's
+    there and only stops being so on the first update, which this same gate then
+    refuses. Both removals are made by the direct path the install itself uses
+    (``dest / ".app_secret"``, ``dest / "data"``), so the filesystem answers the one
+    question the install's own removal and :func:`app_data_dir`'s ``mkdir`` put to
+    it: where names fold case (APFS, NTFS) that path IS a shipped ``Data/``, which
+    goes here as the install removes it there; where they do not (a Linux desktop)
+    ``Data/`` is the app's own directory, carried as itself by the install and by
+    this copy alike. Nothing is probed or listed -- a preview that read the tree by
+    any rule other than the install's could only disagree with it. Then the one
+    question the install asks of its own copy before writing the record is asked
+    of this one: a root ``data`` entry left standing that is not a directory
+    (:func:`gateway_data_dir_obstruction`) raises :class:`InstalledTreeRefused`
+    with the install's own refusal, so the gate never admits a tree the install
+    turns away -- and the refusal lands before any transaction touches the app
+    directory, not after ``installed.json`` is written.
+
+    The install-time desktop gate judges this tree instead of the checkout, so a
+    layout the copy does not carry into the app directory is missing here exactly
+    as it will be missing there. Blocking filesystem work: callers on the event
+    loop run it off-loop, as they do the copy.
+    """
+    _copy_app_tree(source, dest)
+    _remove_any_shape(dest / ".app_secret")
+    if data_preserved:
+        _remove_any_shape(dest / "data")
+    refusal = gateway_data_dir_obstruction(dest)
+    if refusal:
+        raise InstalledTreeRefused(refusal)
 
 
 # Per-app lifecycle locks, shared by every async entry point (registry
@@ -733,12 +904,28 @@ def install_app(
     # crashed sibling operation is reclaimable by whichever lifecycle runs next.
     tmp_data = dest.parent / f".{name}-data-tmp"
 
+    # BEFORE anything moves: the temp name must be free or hold the gateway's own
+    # stale copy. A link or a file planted there is refused whole -- moving
+    # `data/` onto a directory link would deposit it inside the link's target and
+    # the restore would rename the link, not the data (see
+    # _temp_data_name_obstruction). Nothing has been touched yet.
+    tmp_obstruction = _temp_data_name_obstruction(tmp_data)
+    if tmp_obstruction:
+        sel().log_api_access(
+            caller="app_install",
+            operation="data_tmp_name",
+            outcome="rejected",
+            resources=f"name={name!r}",
+            error=tmp_obstruction,
+        )
+        return AppResult(ok=False, name=name, error=tmp_obstruction)
+
     # Clean stale tmp from a previous failed install/uninstall.
     # Only remove tmp_data if the original data/ also exists (proving tmp is
     # truly stale). If data/ is gone, tmp_data may be the sole surviving copy.
     try:
-        if tmp_data.is_dir():
-            if existing_data and existing_data.is_dir():
+        if _owned_data_dir(tmp_data):
+            if existing_data and _owned_data_dir(existing_data):
                 shutil.rmtree(str(tmp_data))
     except OSError as cleanup_exc:
         logger.error(
@@ -760,10 +947,31 @@ def install_app(
             error=f"cannot clean stale temp dir {tmp_data}: {cleanup_exc}",
         )
 
+    # BEFORE the transaction opens, the same question the copied tree and the
+    # preview answer, asked of an app directory already standing at `dest` with
+    # no record (a prior default uninstall's leftover, or an orphaned partial
+    # copy): a `data` there that is a link or a file is not an owned directory,
+    # so the move-aside below would skip it and the orphan cleanup would unlink
+    # it -- a pre-existing entry gone with no refusal, no log line and no error,
+    # where update_app and uninstall_app refuse the identical shape before they
+    # mutate anything. Refused here with the predicate's own sentence, and
+    # nothing has been touched yet.
+    if dest.exists():
+        refusal = gateway_data_dir_obstruction(dest)
+        if refusal:
+            sel().log_api_access(
+                caller="app_install",
+                operation="install",
+                outcome="failed",
+                resources=f"name={name!r}",
+                error=refusal,
+            )
+            return AppResult(ok=False, name=name, error=refusal)
+
     try:
-        if existing_data and existing_data.is_dir():
+        if existing_data and _owned_data_dir(existing_data):
             shutil.move(str(existing_data), str(tmp_data))
-        elif tmp_data.is_dir():
+        elif _owned_data_dir(tmp_data):
             # tmp_data is the sole surviving copy from a prior crash —
             # keep it intact; it will be restored after copytree.
             pass
@@ -775,20 +983,55 @@ def install_app(
             logger.warning("Removing orphaned partial install at %s", dest)
             shutil.rmtree(dest)
         _copy_app_tree(source, dest)
+        # The gateway's own root entries -- ``.app_secret`` and, when a preserved
+        # directory is put back below, ``data`` -- are never the source's: a
+        # source entry so named reaches the app directory verbatim only when the
+        # gateway has nothing of its own to put there. ``.app_secret`` goes first, and goes
+        # WITHOUT being followed: the copy keeps an in-tree link as a link, and
+        # write_app_secret below opens the path it is given, so a shipped
+        # ``.app_secret -> ui/leak.js`` would otherwise have the secret written
+        # into a file the unauthenticated UI route serves. This is the removal
+        # the install-time preview (copy_app_tree_as_installed) applies, so the
+        # gate's judgment and the install agree on what stands here.
+        _remove_any_shape(dest / ".app_secret")
 
-        # Restore preserved data/ (overwrite empty data/ from source package)
-        if tmp_data.is_dir():
+        # Restore preserved data/ over whatever the source shipped under that
+        # name (an empty data/ from the package, a file, a link) -- the same
+        # link-safe removal update_app makes, so a shipped link is unlinked,
+        # never traversed, and never left for the move to fail on.
+        if _owned_data_dir(tmp_data):
             restored = dest / "data"
-            if restored.exists():
-                shutil.rmtree(restored)
+            _remove_any_shape(restored)
             shutil.move(str(tmp_data), str(restored))
+        # What now stands at `data` is what app_data_dir() below will meet: the
+        # preserved directory just put back, the source's own `data/` on a first
+        # install, or nothing. Anything else there -- a shipped FILE, a dangling
+        # link -- is a name its mkdir cannot stand beside, so it is refused HERE,
+        # before installed.json exists, instead of raising after the record is
+        # written and leaving a half-installed app behind. The preview copy the
+        # desktop gate judges asks the same predicate (copy_app_tree_as_installed).
+        refusal = gateway_data_dir_obstruction(dest)
+        if refusal:
+            raise InstalledTreeRefused(refusal)
+    except InstalledTreeRefused as exc:
+        # Nothing preserved is inside `dest`: a restored `data/` IS a directory,
+        # so the refusal only fires where none was put back.
+        shutil.rmtree(dest, ignore_errors=True)
+        sel().log_api_access(
+            caller="app_install",
+            operation="install",
+            outcome="failed",
+            resources=f"name={name!r}",
+            error=str(exc),
+        )
+        return AppResult(ok=False, name=name, error=str(exc))
     except (OSError, shutil.Error, ValueError) as exc:
         # Clean up partial install first
         if dest.exists():
             shutil.rmtree(dest, ignore_errors=True)
         # Restore preserved data to the clean dest
         try:
-            if tmp_data.is_dir():
+            if _owned_data_dir(tmp_data):
                 dest.mkdir(parents=True, exist_ok=True)
                 shutil.move(str(tmp_data), str(dest / "data"))
         except OSError as restore_exc:
@@ -972,14 +1215,54 @@ def update_app(
     preserved_data = False
     preserved_secret = False
 
+    # BEFORE the transaction opens: what stands at `data` must be something the
+    # gateway can move aside and put back whole -- a real directory. A LINK is
+    # not: the move below relocates the link itself to `.{name}-data-tmp` beside
+    # the app directory, where a relative target does not resolve, so nothing
+    # would be put back and the directory it named would be retired -- and
+    # deleted -- with the old tree on this function's own success path. A FILE
+    # is not either: `_owned_data_dir` is false for it, so the move skips it, the
+    # old tree carrying it is retired, the post-copy ask below inspects only the
+    # NEW tree, and the file is deleted with the retired tree while app_data_dir
+    # creates an empty directory in its place -- silently, with ok=True. The
+    # install refuses to create either shape (gateway_data_dir_obstruction); one
+    # that predates the refusal, or that the app's own runtime made, is refused
+    # here by that same predicate -- the one question every entry point asks
+    # before it mutates -- whole, with the old tree and record untouched. The
+    # predicate counts a Windows directory junction as a link, as the rest of
+    # this module does.
+    refusal = gateway_data_dir_obstruction(dest)
+    if refusal:
+        sel().log_api_access(
+            caller="app_update",
+            operation="update",
+            outcome="failed",
+            resources=f"name={name!r}",
+            error=refusal,
+        )
+        return AppResult(ok=False, name=name, error=refusal)
+
+    # BEFORE the transaction opens, too: the temp name must be free or the
+    # gateway's own stale copy (see _temp_data_name_obstruction and install_app).
+    tmp_obstruction = _temp_data_name_obstruction(tmp_data)
+    if tmp_obstruction:
+        sel().log_api_access(
+            caller="app_update",
+            operation="data_tmp_name",
+            outcome="rejected",
+            resources=f"name={name!r}",
+            error=tmp_obstruction,
+        )
+        return AppResult(ok=False, name=name, error=tmp_obstruction)
+
     # Clean up stale tmp files from a previous failed update
-    if tmp_data.is_dir() and data_dir.is_dir():
+    if _owned_data_dir(tmp_data) and _owned_data_dir(data_dir):
         shutil.rmtree(str(tmp_data))
     if tmp_secret.is_file() and secret_file.is_file():
         tmp_secret.unlink()
 
     try:
-        if data_dir.is_dir():
+        if _owned_data_dir(data_dir):
             shutil.move(str(data_dir), str(tmp_data))
             preserved_data = True
         if secret_file.is_file():
@@ -990,30 +1273,38 @@ def update_app(
         # durable. Source-owned installed.json never reaches the live tree.
         os.replace(dest, retired)
         _copy_app_tree(source, dest)
+        # ``.app_secret`` is the gateway's whether or not one is preserved: the
+        # copied entry goes, unfollowed, before the preserved file moves back
+        # (see install_app; the same removal the preview copy applies).
+        _remove_any_shape(dest / ".app_secret")
 
-        if tmp_data.is_dir():
+        if _owned_data_dir(tmp_data):
             restored = dest / "data"
-            if restored.exists():
-                _remove_any_shape(restored)
+            _remove_any_shape(restored)
             shutil.move(str(tmp_data), str(restored))
         if tmp_secret.is_file():
-            restored_secret = dest / ".app_secret"
-            _remove_any_shape(restored_secret)
-            shutil.move(str(tmp_secret), str(restored_secret))
+            shutil.move(str(tmp_secret), str(dest / ".app_secret"))
+        # Before the record: a root `data` that is not a directory (nothing
+        # preserved was put back over it) would fail app_data_dir() below, after
+        # the new metadata was durable -- refused here instead, and the rollback
+        # restores the old tree and record (see install_app).
+        refusal = gateway_data_dir_obstruction(dest)
+        if refusal:
+            raise InstalledTreeRefused(refusal)
         _write_installed(name, meta)
-    except (OSError, shutil.Error, ValueError) as exc:
+    except (OSError, shutil.Error, ValueError, InstalledTreeRefused) as exc:
         rollback_error = ""
         try:
             if retired.is_dir():
                 restored_data = dest / "data"
                 restored_secret = dest / ".app_secret"
-                if preserved_data and not tmp_data.is_dir() and restored_data.is_dir():
+                if preserved_data and not _owned_data_dir(tmp_data) and restored_data.is_dir():
                     shutil.move(str(restored_data), str(tmp_data))
                 if preserved_secret and not tmp_secret.is_file() and restored_secret.is_file():
                     shutil.move(str(restored_secret), str(tmp_secret))
                 _remove_any_shape(dest)
                 os.replace(retired, dest)
-            if tmp_data.is_dir():
+            if _owned_data_dir(tmp_data):
                 restored = dest / "data"
                 _remove_any_shape(restored)
                 shutil.move(str(tmp_data), str(restored))
@@ -1092,19 +1383,23 @@ def _remove_any_shape(path: Path) -> None:
         path.unlink(missing_ok=True)
 
 
-def uninstall_app(name: str, *, keep_data: bool = True) -> AppResult:
+def uninstall_app(name: str, *, keep_data: bool = True, retired_builtin: bool = False) -> AppResult:
     """Uninstall an app while preserving its ``data/`` directory by default.
 
     Passing ``keep_data=False`` is the explicit purge action. Resource
     deregistration should be done before calling this.
-    Built-in apps cannot be uninstalled — only disabled.
+    Built-in apps stay locked unless explicitly cleaning up an eligible retired builtin.
     """
     if not _check_path_safety(name):
         return AppResult(ok=False, name=name, error=f"unsafe app name: {name!r}")
     meta = _read_installed(name)
     if not meta:
         return AppResult(ok=False, name=name, error=f"app {name!r} is not installed")
-    if meta.lifecycle == "locked":
+    if retired_builtin and not migrated_builtin_cleanup_applies(name):
+        return AppResult(
+            ok=False, name=name, error="not a migrated builtin", error_code="not_orphaned"
+        )
+    if meta.lifecycle == "locked" and not retired_builtin:
         return AppResult(
             ok=False,
             name=name,
@@ -1151,11 +1446,16 @@ def uninstall_app(name: str, *, keep_data: bool = True) -> AppResult:
             error_code="trust_grant_not_removed",
         )
 
+    from kiro_crew.apps.backend import _pinned_ancestors  # deferred: see below
+
     quarantined: list[tuple[Path, Path]] = []
     _data_pin = None
     _deps_lock: contextlib.ExitStack | None = None
     try:
         if keep_data:
+            # ONE string for the pin below and every path-based step after it,
+            # or verify() guards a path the renames and deletes do not use.
+            dest = _pinned_ancestors(dest)
             data = dest / "data"
             # Move data to temp, remove app dir, move data back
             tmp_data = dest.parent / f".{name}-data-tmp"
@@ -1211,15 +1511,11 @@ def uninstall_app(name: str, *, keep_data: bool = True) -> AppResult:
                     ".kirocrew-deps.lock" if _data_pin.fd is not None
                     else str(data / ".kirocrew-deps.lock")
                 )
-                # Match the provisioner's creator election: uninstall can race
+                # Same creator election as the provisioner: uninstall can race
                 # its first open before either caller holds the dependency lock.
-                try:
-                    _lfd = os.open(
-                        _lock_name, _lflags | os.O_CREAT | os.O_EXCL, 0o644,
-                        dir_fd=_data_pin.fd,
-                    )
-                except FileExistsError:
-                    _lfd = os.open(_lock_name, _lflags, dir_fd=_data_pin.fd)
+                _lfd = platform_compat.open_create_or_existing(
+                    _lock_name, _lflags, 0o600, dir_fd=_data_pin.fd,
+                )
                 _deps_lock = contextlib.ExitStack()
                 _lf = _deps_lock.enter_context(os.fdopen(_lfd, "r+"))
                 _deps_lock.enter_context(platform_compat.file_lock(_lf.fileno(), exclusive=True))
@@ -1487,6 +1783,9 @@ def uninstall_app(name: str, *, keep_data: bool = True) -> AppResult:
         remove_dev_app(name)
     except Exception:
         logger.debug("dev-mode cleanup on uninstall of %r failed", name, exc_info=True)
+    # The orphan set may have named this app; a successor installed under the
+    # same name must not inherit its stale `orphaned` flag.
+    invalidate_orphan_cache()
     return AppResult(ok=True, name=name, message=f"uninstalled {name}{residual}")
 
 
@@ -1513,7 +1812,7 @@ def trust_grant_removal_blocked(name: str) -> str | None:
     local = config_local_path()
     if local.is_file():
         try:
-            raw_local = json.loads(local.read_text(encoding="utf-8"))
+            raw_local = json.loads(read_config_text(local))
         except (OSError, UnicodeError, json.JSONDecodeError):
             raw_local = {}  # the loader ignores an unreadable overlay, so do we
         agent_local = raw_local.get("agent") if isinstance(raw_local, dict) else None
@@ -1527,7 +1826,7 @@ def trust_grant_removal_blocked(name: str) -> str | None:
     path = config_path()
     if path.is_file():
         try:
-            json.loads(path.read_text(encoding="utf-8"))
+            json.loads(read_config_text(path))
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
             # Report rather than stay silent: a quiet bail here is precisely the
             # "uninstalled but still trusted" state the caller must not reach. The
@@ -1570,7 +1869,7 @@ def _drop_trust_grant(name: str) -> None:
     if not path.is_file():
         return
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        raw = json.loads(read_config_text(path))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         # RAISE rather than return: a silent bail here is precisely the
         # "uninstalled but still trusted" state the caller must not reach. The
@@ -1680,7 +1979,7 @@ def _has_trust_grant(name: str) -> bool:
     if not path.is_file():
         return False
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        raw = json.loads(read_config_text(path))
     except (OSError, UnicodeError, json.JSONDecodeError):
         return False
     if not isinstance(raw, dict):
@@ -1698,7 +1997,7 @@ def _trust_grant_repository(name: str) -> str:
     if not path.is_file():
         return ""
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        raw = json.loads(read_config_text(path))
     except (OSError, UnicodeError, json.JSONDecodeError):
         return ""
     agent_raw = raw.get("agent") if isinstance(raw, dict) else None
@@ -1715,7 +2014,7 @@ def _trust_grant_local(name: str) -> bool:
     if not path.is_file():
         return False
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        raw = json.loads(read_config_text(path))
     except (OSError, UnicodeError, json.JSONDecodeError):
         return False
     agent_raw = raw.get("agent") if isinstance(raw, dict) else None
@@ -2303,6 +2602,24 @@ def is_app_enabled(name: str) -> bool:
     """
     meta = _read_installed(name)
     return bool(meta and meta.enabled)
+
+
+# The builtin that owns the Task Runner page. Its routes are host-owned, so the
+# start paths read this app's switch themselves (see ``app_disabled``).
+TASK_RUNNER_APP = "projects"
+TASK_RUNNER_DISABLED_MESSAGE = "Task Runner is disabled. Enable it in Library to start tasks."
+
+
+def app_disabled(name: str) -> bool:
+    """True only when the app is installed and switched off.
+
+    Not ``not is_app_enabled(name)``: that is also True when no record exists,
+    and a host-owned surface (Task Runner on a headless host or in tests) runs
+    without one. Only an explicit ``enabled: false`` reads as disabled here.
+    Read-only, like :func:`is_app_enabled`.
+    """
+    meta = _read_installed(name)
+    return meta is not None and not meta.enabled
 
 
 def set_app_source(name: str, source: str) -> bool:
@@ -3353,7 +3670,7 @@ def register_builtin_apps() -> int:
         existing = _read_installed(name)
 
         dest = app_dir(name)
-        dest.mkdir(parents=True, exist_ok=True)
+        ensure_directory(dest)  # apps/<name>/ is born 0700 in the data home
 
         # A pre-existing entry this function did not write belongs to the USER:
         # they installed an app that happens to share this builtin's name. Taking
@@ -3473,6 +3790,14 @@ def register_builtin_apps() -> int:
 _orphaned_builtins_cache: set[str] | None = None
 
 
+def shipped_builtin_names() -> set[str]:
+    """The three sources ``register_builtin_apps`` registers from, screened by the
+    same ``_validate_builtin_app`` it skips on. Wider sets belong to their callers.
+    """
+    candidates = list(_BUILTIN_APPS) + discover_builtin_apps() + _edition_builtin_apps()
+    return {app["name"] for app in candidates if not _validate_builtin_app(app)}
+
+
 def detect_orphaned_builtins(*, force_refresh: bool = False) -> set[str]:
     """Return set of orphaned builtin app names.
 
@@ -3521,6 +3846,30 @@ def invalidate_orphan_cache() -> None:
 # ---------------------------------------------------------------------------
 # Migration cleanup
 # ---------------------------------------------------------------------------
+
+
+def migrated_builtin_cleanup_applies(name: str) -> bool:
+    """Whether a safe builtin-owned record qualifies for migration teardown and removal.
+
+    An app directory that is a symlink or junction is ineligible, and so is anything
+    at ``data`` that is not a real directory (:func:`gateway_data_dir_obstruction`):
+    the teardown keeps only a directory there, so it would delete anything else.
+    """
+    from kiro_crew.apps.builtins import _MIGRATED_BUILTINS
+
+    if not _check_path_safety(name):
+        return False
+    path = app_dir(name)
+    if path.is_symlink() or is_link_or_junction(path):
+        return False
+    if gateway_data_dir_obstruction(path):
+        return False
+    meta = _read_installed(name)
+    return bool(
+        meta
+        and meta.origin == "builtin"
+        and (name in _MIGRATED_BUILTINS or name in detect_orphaned_builtins(force_refresh=True))
+    )
 
 
 def cleanup_migrated_builtin(name: str) -> AppResult:

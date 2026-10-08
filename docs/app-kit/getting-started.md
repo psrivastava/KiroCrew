@@ -1,19 +1,25 @@
-# Getting Started with KiroCrew Apps
+# Getting Started with Kiro Crew Apps
 
-Build, install, and run your first KiroCrew app in 5 minutes.
+Build, install, and run your first Kiro Crew app in 5 minutes.
 
 ## Prerequisites
 
-- KiroCrew installed and running (`kirocrew gateway`)
-- Node.js 22+ (24 LTS recommended) (for apps with UI)
+- Kiro Crew installed and running (`kirocrew gateway`)
+- Node.js 22.12+ (24 LTS recommended) (for apps with UI)
 
 ## 1. Create an App Directory
 
-Create a new directory with an `app.json` manifest:
+Use the CLI scaffold so the manifest, opaque 512×512 placeholder icon, agent,
+skill, and UI build files agree with the current schema:
+
+```bash
+kirocrew app init my-dashboard --ui
+```
 
 ```
 my-dashboard/
 ├── app.json                 ← App manifest (required)
+├── assets/icon.png          ← Replace the generated store icon before publishing
 ├── agents/
 │   └── sample-agent.json    ← Agent definition
 ├── skills/
@@ -33,13 +39,18 @@ my-dashboard/
 
 Every app needs an `app.json`. See [Manifest Reference](manifest-reference.md) for all fields.
 
+The scaffold writes no `permissions` block. Add the one below: the sample page
+calls `api.get('/api/status')` and listens for `notification` events, and the
+SDK rejects a path or event the manifest does not declare.
+
 ```json
 {
   "name": "my-dashboard",
   "version": "0.1.0",
   "displayName": "My Dashboard",
-  "description": "A KiroCrew app: My Dashboard",
+  "description": "A Kiro Crew app: My Dashboard",
   "author": "yourname",
+  "iconPath": "assets/icon.png",
   "agents": ["agents/sample-agent.json"],
   "skills": ["skills/sample-skill"],
   "ui": {
@@ -51,6 +62,10 @@ Every app needs an `app.json`. See [Manifest Reference](manifest-reference.md) f
         "icon": "Package"
       }
     ]
+  },
+  "permissions": {
+    "api": ["/api/status"],
+    "events": ["notification"]
   }
 }
 ```
@@ -132,34 +147,40 @@ This produces `dist/index.mjs` — the ESM bundle loaded by the dashboard.
 
 ## 4. Install and Enable
 
-Install via the KiroCrew dashboard REST API or the App Store UI:
+Install and enable with the CLI:
 
 ```bash
-# Via curl (REST API)
-curl -X POST http://localhost:5476/api/apps/install \
-  -H 'Content-Type: application/json' \
-  -d '{"source": "/path/to/my-dashboard"}'
-
-curl -X POST http://localhost:5476/api/apps/my-dashboard/enable
+kirocrew app install /absolute/path/to/my-dashboard
 ```
 
-Or open the KiroCrew dashboard → App Store → install from local path.
+Before you enable it, trust the app. Enable refuses every app that is not
+built in, even one that ships only an agent and a skill, until the operator
+trusts it in Settings → Security → Trusted apps. That setting grants this app
+(`agent.apps_trusted`) or all third-party apps (`agent.apps_allow_third_party`
+set to `true`). See
+[Publishing Guide](publishing-guide.md#third-party-executable-code-is-off-by-default).
 
-Your app now appears in the KiroCrew dashboard sidebar.
+```bash
+kirocrew app enable my-dashboard
+```
+
+The REST routes require dashboard or app authentication, so do not replace these
+commands with a bare `curl`. You can also open the Kiro Crew dashboard → App Store
+and install from a local path. The enabled app then appears in the sidebar.
 
 ## 5. Iterate
 
 During development:
 
-1. Edit `ui/src/App.tsx`
-2. Run `cd ui && npm run build`
-3. Update the installed app:
-   ```bash
-   curl -X POST http://localhost:5476/api/apps/my-dashboard/update
-   ```
-4. Refresh the dashboard — changes are live
+1. Edit `ui/src/App.tsx`.
+2. Run `cd ui && npm run build`.
+3. Use the installed app's **Update** action in the authenticated App Store UI.
+4. Refresh the dashboard.
 
-Agent and skill changes take effect on the next agent invocation (no rebuild needed).
+For UI live reload, follow [App Dev Mode](api-reference.md#app-dev-mode-live-reload).
+Agent and skill changes take effect on the next agent invocation (no UI rebuild needed),
+but the installed copy still has to be updated unless the relevant source directory
+is linked through the documented dev-mode workflow.
 
 ## App SDK Hooks
 
@@ -171,7 +192,7 @@ Available in `@kirocrew/app-sdk`:
 | `useAppEvents(event, cb)` | Subscribe to real-time WebSocket events |
 | `useTheme()` | Reactive theme (mode, accent, colorTheme) |
 | `useAppInfo()` | App metadata (name, version, permissions, `active`) |
-| `useNavigate()` | Navigate to KiroCrew routes |
+| `useNavigate()` | Navigate to Kiro Crew routes |
 | `useNotify()` | Show toast notifications |
 | `useNavBadge()` | Update sidebar badge count |
 | `useChatLauncher()` | Open a new chat or target `slotKey`; set `autoSend: false` for an unsent draft |
@@ -201,15 +222,9 @@ Also in `@kirocrew/app-sdk`, for an app that renders agent messages itself. An a
 choices and steer acknowledgements inline in its prose (`[OPTIONS: a | b]`,
 `[STEERING steer-<id>: …]`); these parse them out so your UI can show buttons instead of raw syntax.
 
-| Export | Purpose |
-|--------|---------|
-| `parseOptions(content)` | Split the prose from the choices offered with it |
-| `deriveFollowUpOptions(messages, isStreaming)` | The choices that still apply to the conversation |
-| `extractSteeringAcks(content)` | Pull the steer acknowledgement out of the text |
-| `stripPartialOptionMarker(text)` | Hide a marker that is still arriving mid-stream |
-
-Types: `ParsedOptions`, `FollowUpDerivation`, `ChatMessage`. React-free, so it also works in a worker
-or a test. Worked examples: [api-reference.md](api-reference.md#chat-marker-protocol).
+The functions and types are listed in
+[api-reference.md](api-reference.md#chat-marker-protocol), with worked examples. The
+module is React-free, so it also works in a worker or a test.
 
 To render a transcript rather than parse one, `ChatMessageList` draws it and its row
 **registry** lets you add a row type or replace one without forking the list — including the
@@ -249,13 +264,42 @@ For Python app hooks with an existing cron grant, use
 `update_job` and `update_job_async` reject `enabled` and `user_paused` arguments;
 use the toggle methods instead. Foreign and missing job IDs are refused.
 
+The `add_job*` methods accept `approval_mode`, `timeout_secs` and `timeout` at
+create time. Pass `approval_mode="auto"` for an unattended agent job: the
+default, `""`, is hook-based approval, so every tool call in the job's session
+waits on a prompt nobody is present to answer. Set it on the create call rather
+than in a follow-up `update_job` — the job is live from its first save, so a
+second write leaves a window in which a due-scan can run it under the wrong
+mode, and `add_job_if_absent_async` returns `None` once the name exists, which
+skips that follow-up on every registration after the first. `timeout_secs` is
+the per-wake execution budget (1..86400 seconds, default 1800) and `timeout`
+bounds only a script or command subprocess (default 30s for a script, 300s for
+a command). On a script or command job set the pair together: the create path
+refuses a wake budget that cannot cover the subprocess timeout plus cleanup,
+because a shorter budget cancels the executor future while the subprocess keeps
+running and the next wake launches a duplicate.
+
 ## Shared React Query
 
 Externalize `@tanstack/react-query` when bundling your app. The dashboard import
-map resolves that specifier to the host's module instance, so hooks such as
-`useQuery`, `useMutation` and `useQueryClient` use the dashboard's existing
-provider. Do not bundle a second copy of React Query. Use `useAppApi()` inside
-query and mutation functions to retain scoped transport and host session binding.
+map resolves that specifier to the host's module instance, so `useQuery`,
+`useMutation` and `useQueryClient` work with no provider of your own. Do not
+bundle a second copy of React Query. Use `useAppApi()` inside query and mutation
+functions to retain scoped transport and host session binding.
+
+The module is shared; the cache is not. `useQueryClient()` returns a client the
+host creates for your app, so your keys, `clear()` and `invalidateQueries()` reach
+only your app's cache, and dashboard keys are neither readable nor writable from
+your bundle. That client is kept per app AND per host session for as long as the
+dashboard page lives, so returning to your page under the same host surface reuses
+the same cache rather than a fresh one. Your app mounted in two places bound to
+different sessions -- its own page and a chat side panel, or two panels -- gets one
+cache each, so a key you write in one never answers a read in the other. An
+individual query inside it still expires on React Query's own `gcTime` once
+nothing observes it, which is the default five minutes unless your query sets a
+longer one; the dashboard's thirty-minute app retention window is registered for
+builtin pages only. Dashboard data is available through `useAppApi()` under the
+paths your `app.json` declares.
 
 ## Permissions
 
@@ -287,45 +331,13 @@ undeclared paths throws an error.
 
 ## Python Client
 
-For Python apps, CLI tools, or services that need to talk to KiroCrew Gateway:
-
-```bash
-pip install kirocrew-client
-```
-
-```python
-import asyncio
-from kirocrew_client import KiroCrewClient
-
-async def main():
-    async with KiroCrewClient(app_name="my-tool") as mc:
-        # Check connectivity
-        ok = await mc.ping()
-        print(f"Gateway reachable: {ok}")
-
-        # Dispatch an agent
-        task_id = await mc.dispatch_agent_async("my-agent", "Analyze ticket T-123")
-        result = await mc.get_task_result(task_id)
-        print(f"Result: {result}")
-
-        # Manage crons
-        await mc.add_cron("refresh", message="Check for updates", every=3600)
-        crons = await mc.list_crons()
-
-        # Inject silent context (for background info)
-        await mc.inject_context("slot-id", "PR #456 was approved", source="watch")
-
-asyncio.run(main())
-```
-
-The `kirocrew-client` package is async (uses `aiohttp`) and standalone — no
-dependency on the KiroCrew main package. It covers the full Gateway API surface.
-
-See [API Reference](api-reference.md) for the full method list.
+Python apps, CLI tools and services use the source-only `kirocrew-client`
+package from a Kiro Crew checkout. Install steps, the constructor and the full
+method table are in [API Reference](api-reference.md#python-client).
 
 ## Publishing Your App
 
 Once your app works locally, publish it to the App Store registry so other
-KiroCrew users can install it with one click.
+Kiro Crew users can install it with one click.
 
 See [Publishing Guide](publishing-guide.md) for the full workflow.

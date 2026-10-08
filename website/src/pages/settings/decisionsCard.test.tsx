@@ -54,14 +54,23 @@ const pointsOf = (
   toolArgs = false,
   compaction = false,
   memoryText = false,
+  judgeProvider = 'auto',
+  nudgeEvidence = false,
 ) => {
   const granted: Record<string, boolean> = {
     tool_args: toolArgs,
     compaction,
     memory_text: memoryText,
+    nudge_evidence: nudgeEvidence,
   }
   const status = (scope: string | null) =>
     !enabled ? 'off' : scope && !granted[scope] ? 'needs_scope' : 'active'
+  // The gate's own resolution, not a second reading of the switch: `auto` picks Jev
+  // when Jev is ARMED -- consent plus this point's scope -- and the small model
+  // otherwise, so a pinned lane is honoured and `auto` follows the grant.
+  const jevArmed = enabled && nudgeEvidence
+  const judgeLane =
+    judgeProvider === 'jev' ? 'jev' : judgeProvider === 'llm' ? 'llm' : jevArmed ? 'jev' : 'llm'
   return [
     { id: 'skills.select', needs_scope: null, status: status(null) },
     { id: 'tool.risk', needs_scope: 'tool_args', status: status('tool_args') },
@@ -69,6 +78,20 @@ const pointsOf = (
     { id: 'model.route', needs_scope: null, status: status(null) },
     { id: 'compaction.keep', needs_scope: 'compaction', status: status('compaction') },
     { id: 'memory.recall', needs_scope: 'memory_text', status: status('memory_text') },
+    // The judge, whose row the gateway resolves from the LANE as well as the keystone.
+    // Its small-model lane needs neither the endpoint consent nor a scope, so that lane
+    // reports active with the switch off. The Jev lane sends this point's own evidence,
+    // so it runs only on the `nudge_evidence` scope, and `auto` resolves the same way
+    // the gate's own resolver does -- against whether Jev is ARMED, which is consent
+    // plus that grant. Present here because this fixture stands in for the gateway's
+    // `DECISION_POINT_NAMES` projection, and a fixture that omits a shipped point lets
+    // its row and its switch go untested -- which is how the missing switch reached QA.
+    {
+      id: 'nudge.wake',
+      needs_scope: 'nudge_evidence',
+      lane: judgeLane,
+      status: judgeLane === 'jev' ? status('nudge_evidence') : 'active',
+    },
   ]
 }
 
@@ -88,11 +111,14 @@ const consentOf = (enabled: boolean, overrides: Partial<DecisionsConsentData> = 
   compaction: false,
   // And the recalled-memory scope, false on the same terms.
   memory_text: false,
+  // The wake judge's evidence scope, false on the same terms.
+  nudge_evidence: false,
   points: pointsOf(
     enabled,
     overrides.tool_args === true,
     overrides.compaction === true,
     overrides.memory_text === true,
+    overrides.nudge_evidence === true,
   ),
   ...overrides,
 })
@@ -111,6 +137,7 @@ const SCOPE_POINT: Record<string, string> = {
   tool_args: 'Risky tool-call notes',
   compaction: 'Which tool calls a compaction would keep (measured only)',
   memory_text: 'Which recalled memories reach the prompt',
+  nudge_evidence: 'Quiet check-ins: wake or skip',
 }
 
 /** The accessible name of each scope's consent switch, as the card labels it. */
@@ -119,7 +146,10 @@ const SCOPE_SWITCH: Record<string, string> = {
   compaction: 'Also send the conversation and tool-call inputs so Jev can score compaction',
   memory_text:
     'Also send snippets of recalled memories so Jev can drop the ones that do not help',
+  nudge_evidence: 'Also send what a watching loop has found so Jev can skip a turn',
 }
+
+type ScopeName = 'tool_args' | 'compaction' | 'memory_text' | 'nudge_evidence'
 
 /**
  * Open the panel that owns a scope and hand back its switch.
@@ -129,7 +159,7 @@ const SCOPE_SWITCH: Record<string, string> = {
  * That is the shape itself, not an accident of it: the switch is the OK for THAT
  * point, and drawing it beside the main switch is what made it ambiguous.
  */
-async function openScope(scope: 'tool_args' | 'compaction' | 'memory_text') {
+async function openScope(scope: ScopeName) {
   await waitFor(() => {
     expect(pointRow(SCOPE_POINT[scope])).toBeInTheDocument()
   })
@@ -146,7 +176,7 @@ async function openScope(scope: 'tool_args' | 'compaction' | 'memory_text') {
  * one. A test asserting absence without opening the panel passes on a card that
  * offers the switch with consent withheld.
  */
-async function scopeSwitchOnPanel(scope: 'tool_args' | 'compaction' | 'memory_text') {
+async function scopeSwitchOnPanel(scope: ScopeName) {
   await waitFor(() => {
     expect(pointRow(SCOPE_POINT[scope])).toBeInTheDocument()
   })
@@ -184,6 +214,9 @@ function stubGateway(
   // and never holds the credential. Stubbed in every case so no test reaches the
   // network for a field most of them do not open.
   vi.spyOn(api, 'secretsList').mockResolvedValue({ names: [] } as never)
+  // The provider picker's own read answers "no such route" unless a case stubs a
+  // provider, so the cases below see the card as an older gateway draws it.
+  vi.spyOn(api, 'getDecisionsProvider').mockRejectedValue(Object.assign(new Error('not found'), { status: 404 }))
   if (consent instanceof Error) {
     vi.spyOn(api, 'getDecisionsConsent').mockRejectedValue(consent)
   } else {
@@ -346,8 +379,11 @@ describe('Decisions (Jev) preview card', () => {
     })
     decisionsSwitch().click()
     await waitFor(() => {
-      expect(screen.getByText(/could not save this setting/i)).toBeInTheDocument()
+      expect(screen.getByText(/could not save this change/i)).toBeInTheDocument()
     })
+    // The same notice serves the tier pickers, the history number box and the key
+    // field, none of which is a switch, so its words name no control.
+    expect(screen.getByTestId('decisions-save-error').textContent ?? '').not.toMatch(/switch/i)
     // The switch shows the keystone's value, not the click's, so a refused write
     // cannot leave the card claiming the preview is on.
     expect(decisionsSwitch().getAttribute('aria-checked')).toBe('false')
@@ -360,7 +396,7 @@ describe('Decisions (Jev) preview card', () => {
     stubGateway(notFound(), { telemetry: {} })
     renderSection()
     await waitFor(() => {
-      expect(screen.getByText(/leave this machine.*sent over the internet/i)).toBeInTheDocument()
+      expect(screen.getByText(/sent over the internet to Jev/i)).toBeInTheDocument()
     })
   })
 
@@ -373,7 +409,75 @@ describe('Decisions (Jev) preview card', () => {
     await waitFor(() => {
       expect(screen.getByText(/sent over the internet to Jev/i)).toBeInTheDocument()
     })
-    expect(screen.getByText(/falls back to the same rule/i)).toBeInTheDocument()
+    expect(screen.getByText(/the built-in rule decides instead/i)).toBeInTheDocument()
+  })
+
+  it('holds the switch and says why while no decision model is chosen', async () => {
+    stubGateway({ enabled: false })
+    vi.spyOn(api, 'system').mockResolvedValue({ mem_total_gb: 16 } as never)
+    vi.spyOn(api, 'getDecisionsProvider').mockResolvedValue({
+      presets: [], active: 'none', loopback: false, configured_endpoint: 'none',
+    } as never)
+    renderSection()
+    await waitFor(() => {
+      expect(screen.getByText(/No decision model is chosen\. Pick one below/)).toBeInTheDocument()
+    })
+    expect(screen.queryByText(/sent over the internet to Jev/i)).toBeNull()
+    expect(screen.queryByText(/^Sent to/)).toBeNull()
+    expect(decisionsSwitch().getAttribute('aria-disabled')).toBe('true')
+  })
+
+  it('keeps a standing consent revocable after switching to no model', async () => {
+    stubGateway({ enabled: true })
+    vi.spyOn(api, 'system').mockResolvedValue({ mem_total_gb: 16 } as never)
+    vi.spyOn(api, 'getDecisionsProvider').mockResolvedValue({
+      presets: [], active: 'none', loopback: false, configured_endpoint: 'none',
+    } as never)
+    renderSection()
+    await waitFor(() => {
+      expect(screen.getByText(/No decision model is chosen\. Pick one below/)).toBeInTheDocument()
+    })
+    expect(decisionsSwitch().getAttribute('aria-disabled')).not.toBe('true')
+  })
+
+  it('says the text stays on this machine while a local preset answers', async () => {
+    // Any address on this machine -- a preset or a hand-written loopback address --
+    // makes "over the internet" false. Only a remote address keeps that sentence.
+    stubGateway({ enabled: true })
+    const preset = {
+      id: 'laya', name: 'Laya', model: 'english', default_port: 8104, jev_relative_pct: 67,
+      hard_relative_pct: 47, peak_ram_gb: 6, recommended_total_ram_gb: 24, p50_secs: 0.17,
+      p95_secs: 0.51, timeout_ms: 2000, download_bytes: 846207419,
+    }
+    const provider = (active: string, loopback = true) => ({
+      presets: [preset], active, loopback,
+      configured_endpoint: loopback ? 'http://127.0.0.1:8104/v1/systemone' : 'https://proxy.example/v1/systemone',
+    })
+    vi.spyOn(api, 'system').mockResolvedValue({ mem_total_gb: 16 } as never)
+    const read = vi.spyOn(api, 'getDecisionsProvider').mockResolvedValue(provider('laya'))
+    renderSection()
+    await waitFor(() => {
+      expect(screen.getByText(/sent to the model server at the address below, on this machine/i)).toBeInTheDocument()
+    })
+    expect(screen.queryByText(/sent over the internet to Jev/i)).toBeNull()
+    expect(screen.queryByText(/no Jev API key is sent to it/i)).toBeNull()
+
+    cleanup()
+    read.mockResolvedValue(provider('custom'))
+    renderSection()
+    await waitFor(() => {
+      expect(screen.getByText(/sent to the model server at the address below, on this machine/i)).toBeInTheDocument()
+    })
+    expect(screen.queryByText(/sent over the internet to Jev/i)).toBeNull()
+    // A hand-written loopback address gets no key; the card says so, not only the log.
+    expect(screen.getByText(/no Jev API key is sent to it/i)).toBeInTheDocument()
+
+    cleanup()
+    read.mockResolvedValue(provider('custom', false))
+    renderSection()
+    await waitFor(() => {
+      expect(screen.getByText(/sent over the internet to Jev/i)).toBeInTheDocument()
+    })
   })
 
   it('lists one row per point the GATEWAY projects, never a list of its own', async () => {
@@ -391,6 +495,7 @@ describe('Decisions (Jev) preview card', () => {
       expect.stringContaining("Model for the turn's difficulty"),
       expect.stringContaining('Which tool calls a compaction would keep'),
       expect.stringContaining('Which recalled memories reach the prompt'),
+      expect.stringContaining('Quiet check-ins: wake or skip'),
     ])
     expect(screen.getByText(/what Jev decides while this is on/i)).toBeInTheDocument()
   })
@@ -409,6 +514,37 @@ describe('Decisions (Jev) preview card', () => {
     })
   })
 
+  it('links to the Releases page when the gateway lists no points', async () => {
+    // An older gateway projects no rows. The notice tells the reader to update, so
+    // the place it names is a link there, not plain text.
+    stubGateway(consentOf(true, { points: [] }))
+    renderSection()
+    await waitFor(() => {
+      expect(screen.getByText(/does not list what Jev decides yet/i)).toBeInTheDocument()
+    })
+    const link = screen.getByRole('link', { name: 'Settings › Releases' })
+    expect(link.getAttribute('href')).toBe('/settings/releases')
+  })
+
+  it('says where Auto (Jev) is chosen for the model.route point', async () => {
+    stubGateway({ enabled: true })
+    renderSection()
+    await waitFor(() => {
+      expect(pointRow("Model for the turn's difficulty")).toBeInTheDocument()
+    })
+    openPoint("Model for the turn's difficulty")
+    // The panel sits behind the lazy `DecisionsPointPanel` boundary, so its chunk
+    // may still be loading on a cold run: give it an explicit deadline.
+    await waitFor(
+      () => {
+        expect(screen.getByRole('tabpanel').textContent ?? '').toContain(
+          "whose own model picker shows Auto (Jev)",
+        )
+      },
+      { timeout: 5000 },
+    )
+  })
+
   it('carries the status as the EFFECTIVE answer, with its own word for a missing scope', async () => {
     stubGateway({ enabled: true })
     renderSection()
@@ -425,7 +561,7 @@ describe('Decisions (Jev) preview card', () => {
     expect(pointRow('Risky tool-call notes').getAttribute('aria-current')).toBeNull()
   })
 
-  it('says every point is off while consent is off, and still lists them all', async () => {
+  it('says every point but the judge is off while consent is off, and lists them all', async () => {
     stubGateway({ enabled: false })
     renderSection()
     await waitFor(() => {
@@ -435,6 +571,16 @@ describe('Decisions (Jev) preview card', () => {
     // way to read about what consenting would turn on.
     expect(screen.getAllByRole('tab')).toHaveLength(pointsOf(false).length)
     for (const row of screen.getAllByRole('tab')) {
+      // The judge is the ONE exception, and it is the reason this lane exists: with no
+      // consent recorded the default provider resolves to the small model, which sends
+      // nothing to the endpoint this switch governs, so that point does run here. A
+      // row claiming otherwise would tell a keyless owner their judge is off while it
+      // is answering.
+      if (row.textContent?.includes('Quiet check-ins')) {
+        expect(row.getAttribute('aria-current')).toBe('true')
+        expect(row.textContent).toContain('Judged by the small model')
+        continue
+      }
       expect(row.getAttribute('aria-current')).toBeNull()
       expect(row.textContent).toContain('Off')
     }
@@ -483,8 +629,8 @@ describe('Decisions (Jev) preview card', () => {
 
     // End and Home are the ends of the PROJECTED list, whatever the gateway sent.
     fireEvent.keyDown(pointRow('Automatic skill choice'), { key: 'End' })
-    await waitFor(() => expect(panel()).toContain('memory.recall'))
-    fireEvent.keyDown(pointRow('Which recalled memories reach the prompt'), {
+    await waitFor(() => expect(panel()).toContain('nudge.wake'))
+    fireEvent.keyDown(pointRow('Quiet check-ins: wake or skip'), {
       key: 'Home',
     })
     await waitFor(() => expect(panel()).toContain('skills.select'))
@@ -557,6 +703,89 @@ describe('Decisions (Jev) preview card', () => {
     expect(screen.getByRole('tabpanel').textContent).toContain("Keep the session's own model")
   })
 
+  it('names the lane on the judge row rather than the generic active word', async () => {
+    // Under the list's "while this is on" heading, a row reading the generic active
+    // word with the switch OFF is a contradiction, and it implies the endpoint is
+    // being used right now. The small-model lane sends nothing there, so the chip has
+    // to say which judge answers.
+    stubGateway(
+      { enabled: false, points: pointsOf(false, false, false, false, 'llm') },
+      { decisions: { bucket: 100, nudge_wake: { provider: 'llm', llm_model: '' } } },
+    )
+    renderSection()
+    await waitFor(() => {
+      expect(pointRow('Quiet check-ins: wake or skip')).toBeInTheDocument()
+    })
+    expect(screen.getByText('Judged by the small model')).toBeInTheDocument()
+  })
+
+  it('keeps the generic active word when Jev is the lane that would answer', async () => {
+    // The contradiction exists only for the small-model lane. With the switch on and
+    // the address in force, Jev is what decides and the heading is accurate, so the row
+    // must not claim a small-model judge.
+    stubGateway(
+      { enabled: true, permits: true, points: pointsOf(true, true, true, true, 'jev') },
+      { decisions: { bucket: 100, nudge_wake: { provider: 'jev', llm_model: '' } } },
+    )
+    renderSection()
+    await waitFor(() => {
+      expect(pointRow('Quiet check-ins: wake or skip')).toBeInTheDocument()
+    })
+    expect(screen.queryByText('Judged by the small model')).not.toBeInTheDocument()
+  })
+
+  it('offers nudge.wake its provider and model pickers, reachable with consent off', async () => {
+    // Consent OFF and the small model chosen: the state the lane exists for. Every
+    // other point's controls are withheld here, so this also pins that the judge's two
+    // are deliberately not gated on the switch.
+    stubGateway(
+      { enabled: false, points: pointsOf(false, false, false, false, 'llm') },
+      { decisions: { bucket: 100, nudge_wake: { provider: 'llm', llm_model: '' } } },
+    )
+    renderSection()
+    await waitFor(() => {
+      expect(pointRow('Quiet check-ins: wake or skip')).toBeInTheDocument()
+    })
+    openPoint('Quiet check-ins: wake or skip')
+    await waitFor(() => {
+      expect(screen.getByText('Which judge answers')).toBeInTheDocument()
+    })
+    expect(screen.getByText('Model for the small-model judge')).toBeInTheDocument()
+    const panelText = screen.getByRole('tabpanel').textContent ?? ''
+    // The chosen provider reads as the small model, and the model reads as INHERIT --
+    // no model id is named for the reader, for the same reason a tier names none.
+    expect(panelText).toContain('The small model \u2014 stays with your current provider')
+    // The judge's INHERIT names the JUDGE agent's model, not the session's: an empty
+    // `llm_model` resolves the judge agent's own, a different model from the one an
+    // unpinned tier keeps.
+    expect(panelText).toContain("Keep the judge agent's own model")
+    // The card's own frame speaks for the Jev endpoint: its heading says "while this is
+    // on" and its intro says nothing is sent while it is off. Both are beside the point
+    // on this lane, so the panel states which lane answers and where the evidence goes.
+    expect(panelText).toContain('switch above does not govern it')
+  })
+
+  it('leaves the lane note out when Jev is the lane that would answer', async () => {
+    // The note answers a question only the small-model lane raises. On the Jev lane the
+    // card's frame IS the whole story, and a second line there would contradict nothing
+    // and explain nothing.
+    stubGateway(
+      { enabled: true, points: pointsOf(true, false, false, false, 'jev') },
+      { decisions: { bucket: 100, nudge_wake: { provider: 'jev', llm_model: '' } } },
+    )
+    renderSection()
+    await waitFor(() => {
+      expect(pointRow('Quiet check-ins: wake or skip')).toBeInTheDocument()
+    })
+    openPoint('Quiet check-ins: wake or skip')
+    await waitFor(() => {
+      expect(screen.getByText('Which judge answers')).toBeInTheDocument()
+    })
+    expect(screen.getByRole('tabpanel').textContent ?? '').not.toContain(
+      'switch above does not govern it',
+    )
+  })
+
   it('fades the egress note only when the gateway cannot run this at all', async () => {
     stubGateway(notFound(), { decisions: { preview: true } })
     renderSection()
@@ -567,7 +796,7 @@ describe('Decisions (Jev) preview card', () => {
     // the rest of the card instead of shouting beside a switch that cannot move.
     // Same opacity as the disabled row: a muted colour alone still reads darker
     // than a row at 40%, which is the fade "just missing".
-    expect(screen.getByText(/leave this machine/i).className).toContain('opacity-40')
+    expect(screen.getByText(/sent over the internet to Jev/i).className).toContain('opacity-40')
     // And the notice says WHERE to act, not just that something must be updated.
     expect(screen.getByText(/Settings › Releases/)).toBeInTheDocument()
   })
@@ -1161,7 +1390,7 @@ describe('Decisions (Jev) preview card', () => {
       // A sibling card proves the section rendered, so an absent switch is the
       // gate and not a failed render.
       await waitFor(() => {
-        expect(screen.getByRole('switch', { name: /Crew Members/i })).toBeInTheDocument()
+        expect(screen.getByRole('switch', { name: /Crewmates/i })).toBeInTheDocument()
       })
       expect(screen.queryByRole('switch', { name: 'Decisions (Jev)' })).toBeNull()
       // Not merely hidden: nothing about the feature is on screen to act on.
@@ -1174,7 +1403,7 @@ describe('Decisions (Jev) preview card', () => {
       stubGateway({ enabled: true }, { decisions: { bucket: 100 } }, {})
       renderSection()
       await waitFor(() => {
-        expect(screen.getByRole('switch', { name: /Crew Members/i })).toBeInTheDocument()
+        expect(screen.getByRole('switch', { name: /Crewmates/i })).toBeInTheDocument()
       })
       expect(screen.queryByRole('switch', { name: 'Decisions (Jev)' })).toBeNull()
     })
@@ -1206,7 +1435,7 @@ describe('Decisions (Jev) preview card', () => {
       vi.spyOn(api, 'dashboardConfig').mockReturnValue(new Promise(() => {}) as never)
       renderSection()
       await waitFor(() => {
-        expect(screen.getByRole('switch', { name: /Crew Members/i })).toBeInTheDocument()
+        expect(screen.getByRole('switch', { name: /Crewmates/i })).toBeInTheDocument()
       })
       expect(screen.queryByRole('switch', { name: 'Decisions (Jev)' })).toBeNull()
       expect(screen.queryByText(/could not read the settings/i)).toBeNull()
@@ -1510,15 +1739,18 @@ describe('the recalled-memory scope switch', () => {
     expect(body).toContain('Passwords and keys are replaced')
   })
 
-  it('names recalled-memory snippets in the egress note, above either switch', async () => {
+  it('defers recalled-memory snippets to their own switch in the egress note', async () => {
     // The note is what a reader consents to, and it is drawn whether or not the
-    // scope switches are. Naming only messages and skills would understate it.
+    // scope switches are. It names what the main switch sends and says every other
+    // category, recalled-memory snippets included, waits for a switch of its own.
     stubGateway({ enabled: false })
     renderSection()
     await waitFor(() => {
-      expect(screen.getByText(/leave this machine/i)).toBeInTheDocument()
+      expect(screen.getByText(/sent over the internet to Jev/i)).toBeInTheDocument()
     })
-    expect(screen.getByText(/snippets of the memories recalled/i)).toBeInTheDocument()
+    const note = screen.getByText(/sent over the internet to Jev/i).textContent ?? ''
+    expect(note).toMatch(/your messages and your skills' names and descriptions/)
+    expect(note).toMatch(/Every other kind of data has its own switch below and stays off/)
   })
 })
 
@@ -1660,31 +1892,30 @@ describe('a refused scope write says so', () => {
     expect(row.textContent).not.toContain('Switched on')
   })
 
-  it('counts the note\'s promised categories against the points that declare a scope', async () => {
-    // The note said "Two further categories" while three scopes existed, because the
-    // widest one landed between the two the copy knew about. Asserted as a RELATIONSHIP
-    // against the DATA, not against switches on screen: one point's panel renders at a
-    // time, so counting rendered switches would pin a card shape instead of the
-    // invariant. The number in the sentence and the number of points that declare a
-    // scope have to move together, which holds whatever the card looks like.
+  it('defers every further category to its own switch without naming a count', async () => {
+    // The note once said "Two further categories" while three scopes existed: a
+    // count in the copy goes stale the moment a scope lands. The note now names no
+    // number and no list, and points at the per-scope switches, which are the source
+    // of truth; each scope's switch names its own category.
     stubGateway({ enabled: true })
     renderSection()
     await waitFor(() => {
-      expect(screen.getByText(/leave this machine/i)).toBeInTheDocument()
+      expect(screen.getByText(/sent over the internet to Jev/i)).toBeInTheDocument()
     })
-    const scoped = pointsOf(true).filter(row => row.needs_scope !== null)
-    const COUNT_WORD: Record<number, string> = {
-      1: 'One further category',
-      2: 'Two further categories',
-      3: 'Three further categories',
-      4: 'Four further categories',
+    const note = screen.getByText(/sent over the internet to Jev/i).textContent ?? ''
+    expect(note).toMatch(/own switch below/)
+    expect(note).not.toMatch(/\b(one|two|three|four|five) further/i)
+    // The promise is "each category has its own switch", so every point that declares
+    // a scope is pinned by name, and each one's panel must draw that switch. A scope
+    // added, dropped or left without its switch fails here.
+    const scoped = pointsOf(true)
+      .filter(row => row.needs_scope !== null)
+      .map(row => row.needs_scope)
+      .sort()
+    expect(scoped).toEqual(['compaction', 'memory_text', 'nudge_evidence', 'tool_args'])
+    for (const scope of scoped as ScopeName[]) {
+      expect(await openScope(scope)).toBeInTheDocument()
     }
-    const note = screen.getByText(/leave this machine/i).textContent ?? ''
-    expect(note).toContain(COUNT_WORD[scoped.length])
-    // And one clause per category, so the count is not satisfied by a bare number.
-    expect(note).toContain('the name and arguments of your tool calls')
-    expect(note).toContain('the conversation and tool-call inputs')
-    expect(note).toContain('short snippets of the memories recalled')
   })
 
   it('says WHICH switch could not be saved', async () => {
@@ -1734,5 +1965,50 @@ describe('a refused scope write says so', () => {
     // One notice, and it names the scope that failed and not the one beside it.
     expect(screen.getByTestId('decisions-save-error').textContent).toContain('Also send snippets of recalled memories')
     expect(screen.getByTestId('decisions-save-error').textContent).not.toContain('Also send tool-call arguments')
+  })
+})
+
+
+describe("the wake judge's point on the card", () => {
+  /* QA armed a loop against a gateway reporting `needs_scope=nudge_evidence
+   * status=off` and saw a panel with no switch at all, so the scope could not be
+   * granted from the dashboard and the feature was unreachable end to end. The
+   * switch is drawn generically from the row's own `needs_scope`, so what these
+   * assert is that every piece that lookup needs is registered: the scope's label,
+   * its description, its granted position, and the point's plain-words name.
+   */
+
+  it('draws the nudge_evidence switch on the nudge.wake panel', async () => {
+    stubGateway(consentOf(true))
+    renderSection()
+    const toggle = await openScope('nudge_evidence')
+    expect(toggle).toBeInTheDocument()
+    // Consent is on but this scope is withheld, which is the state an install that
+    // consented before the scope existed is in.
+    expect(toggle.getAttribute('aria-checked')).toBe('false')
+  })
+
+  it('shows the switch already on when the scope is granted', async () => {
+    stubGateway(consentOf(true, { nudge_evidence: true }))
+    renderSection()
+    const toggle = await openScope('nudge_evidence')
+    expect(toggle.getAttribute('aria-checked')).toBe('true')
+  })
+
+  it('names the point in plain words rather than as a raw id', async () => {
+    stubGateway(consentOf(true))
+    renderSection()
+    await waitFor(() => {
+      expect(pointRow(SCOPE_POINT.nudge_evidence)).toBeInTheDocument()
+    })
+    // The fallback is `POINT_NAME[id] ?? id`, so an unregistered point renders its
+    // internal identifier to every visitor, every visit.
+    expect(screen.queryByRole('tab', { name: /^nudge\.wake$/ })).not.toBeInTheDocument()
+  })
+
+  it('withholds the switch entirely while Decisions consent is off', async () => {
+    stubGateway(consentOf(false))
+    renderSection()
+    expect(await scopeSwitchOnPanel('nudge_evidence')).toBeNull()
   })
 })

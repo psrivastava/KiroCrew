@@ -5,8 +5,10 @@ Crew desktop app — the class of server you reach over `https://`, whose tools
 you unlock by signing in through a browser, as opposed to a **local stdio**
 server you launch with a `command`. The worked example is Miro's remote MCP
 ([`https://mcp.miro.com/`](https://mcp.miro.com/)), the flow that motivated this
-guide, but the same steps apply to any OAuth-backed remote server (Linear,
-Notion, Atlassian, a self-hosted OIDC-fronted service, …).
+guide. Miro is now also a curated **Connections** provider, so the built-in card
+or MCP-table **Sign in** action is the shortest path; the manual flow below
+remains useful for a custom Miro entry and applies to any OAuth-backed remote
+server (Linear, Notion, Atlassian, a self-hosted OIDC-fronted service, …).
 
 The short version is five moves, and every one of them has a trap that reads
 like a dead end:
@@ -14,7 +16,9 @@ like a dead end:
 1. Add the server to the **agent's own** config, not just the Kiro global.
 2. Mount it by adding its `@ref` to `tools`.
 3. Start a session — nothing useful is *printed*.
-4. Click **Authorize** on the banner Kiro Crew raises in chat.
+4. For a custom server, click **Authorize** on the banner Kiro Crew raises in
+   chat. For a curated provider such as Miro, use its Connections card or the
+   MCP table's **Sign in** action instead.
 5. Complete the browser flow, then **drain the warm pool** and start a fresh
    session — a new chat alone can reuse a pre-authentication process.
 
@@ -149,22 +153,27 @@ provider (`dashboard/chat_runner._emit_mcp_oauth_request`, rendered by
 flushed into the transcript at session init, so the banner also appears on a
 fresh session with nothing typed.
 
-**For a server like Miro, the chat banner is the only place you can start the
-sign-in** — and that is the case this guide is about. Two dashboard surfaces
-offer the same action, but both are limited to **curated Connections
-providers**, i.e. the providers listed in `connections/registry.json`:
+**For a user-added or self-hosted server that does not match a curated
+Connections provider, the chat banner is the only place you can start the
+sign-in** — and that is the manual case this guide is about. Curated providers
+have two additional dashboard surfaces. Miro is present in
+`connections/registry.json`, so it qualifies when the Connections UI is
+unlocked:
 
-- The **MCP** table's per-row **Sign in** control (`McpRowSignIn`) renders only
-  when the row resolves to a registry provider *and* the Connections UI is
-  unlocked. Minting is deliberately fenced to registry providers; arbitrary URLs
-  are never minted. A user-added or self-hosted row — Miro included — instead
-  gets a sentence linking you to chat, which is the accurate routing.
+- The **MCP** table's per-row **Sign in** control (`McpRowSignIn`) renders when
+  the row resolves to a registry provider and the Connections UI is unlocked.
+  It uses the same headless mint, authorization, and paste-back relay as the
+  Connections card. A user-added or self-hosted row that does not resolve to a
+  provider instead gets a sentence linking to chat; arbitrary URLs are never
+  minted from this surface.
 - A Connections provider card drives its own consent flow; a banner for one of
   those is tagged so chat does not repeat a prompt the card already shows.
 
-So there is no authorization URL to hunt for and copy out of a status panel —
-clicking **Authorize** in chat *is* step 4. On success the banner flips in place
-to `miro authenticated.`.
+So there is no authorization URL to hunt for and copy out of a status panel.
+For the manual flow, clicking **Authorize** in chat *is* step 4; for curated
+Miro, use **Connect** or **Sign in** and follow the authorization link shown on
+that surface. On success the chat banner, when used, flips in place to
+`miro authenticated.`.
 
 What "signed in" eventually looks like is visible in the dashboard MCP /
 Integrations panel, whose probe renders one of three badges for a remote server
@@ -236,10 +245,11 @@ code-owned — read its current contents from
 providers' MCP authorization servers plus the classic web-OAuth hosts.
 **Miro is in it** (`mcp.miro.com` + `/authorize`), so the public Miro MCP
 server needs no entry of your own; a host outside that set whose consent URL
-exceeds the query-length heuristic fails closed instead. The chat banner that
-reports the rejection (`dashboard/chat_runner.py`) names the remedy inline,
-because the fix is agent-fenced with no dashboard writer and that banner is the
-only place a user learns it exists.
+exceeds the query-length heuristic fails closed instead. The fix is
+agent-fenced with no dashboard writer, so two surfaces name it: the chat banner
+that reports the rejection (`dashboard/chat_runner.py`) names the remedy inline,
+and the Connections card names the refused endpoint, shows the remedy line and
+links to this section.
 
 The remedy is the operator keystone **`oauth_endpoints.json`**, which extends
 the recognized set without weakening the gate. Create or edit it in the Kiro
@@ -276,9 +286,10 @@ unconditionally.
 
 - **Fail-soft.** A missing, unreadable, corrupt, or non-object file yields the
   **empty** extension set. A mangled file never widens trust.
-- **Agent-fenced keystone.** The file sits on Kiro Crew's protected keystone
-  set: the agent can neither read nor write it, so a prompt-injected agent
-  cannot author its own trust widening. The operator **hand-edits it
+- **Agent-fenced keystone.** The file is an OS read-only keystone leaf: the
+  agent cannot write it in any sandbox mode, so a prompt-injected agent cannot
+  author its own trust widening. Kiro Crew's tool gate also refuses the agent's
+  reads of it; that read refusal rests on the tool gate, not on the OS layer. The operator **hand-edits it
   out-of-band** — there is deliberately no dashboard writer.
 - **No restart needed.** The loader is keyed on the file's stat (path, mtime,
   size), so a hand-edit takes effect on the **next check** with no gateway
@@ -291,9 +302,11 @@ RFC 9728 protected-resource document — the same route the code-owned pairs wer
 derived from. Neither the rejected banner nor the log echoes the URL that was
 refused (logging a URL that tripped the credential scanner would defeat the
 scanner), so there is nothing to copy out of Kiro Crew here.
-**Miro's exact authorize
-host and path are not verified in this repo** — do not copy a guessed value;
-read the real one and enter it exactly (the `path` comparison is byte-exact).
+**Miro's exact authorization endpoint is verified in this repo** as
+[`https://mcp.miro.com/authorize`](https://mcp.miro.com/authorize) and is
+already in the code-owned set, so do not add an operator override for it. For
+another provider, obtain the actual host and path from its advertised metadata
+and enter them exactly; the `path` comparison is byte-exact.
 
 ## Static header vs OAuth (and scopes)
 
@@ -397,17 +410,16 @@ refresh token on disk, so a later reconnect silently resumes the old grant
 Kiro Crew **stats these files for presence** (`mcp_grant.grant_presence`) to
 render the "Signed in" badge, but **nothing in that module opens a token file**
 (`mcp_grant.py`): it reads no token value. So Kiro Crew can report neither the
-**granted scope** nor the **expiry** of a Miro token. The curated-provider
-reconnect short-circuit is bound to the providers listed in
-`connections/registry.json`, and **Miro is not one of them**, so Kiro Crew
-observes nothing about Miro's token reuse.
+**effective granted scope** nor the **expiry** of a Miro token. Miro is a
+curated provider in `connections/registry.json`, so it participates in the
+Connections mint, reconnect, and ownership lifecycle; that still does not make
+the token bytes or their live validity visible to Kiro Crew.
 
-> **UNVERIFIED.** Miro's exact authorization host and path, the scopes it
-> grants, and its token expiry are **not** verified in this repo, and no
-> specific value for them is stated above. Confirm them on a machine running
-> the desktop app: connect [`https://mcp.miro.com/`](https://mcp.miro.com/),
-> then `stat ~/.aws/sso/cache/` for the `sha256(origin+path)` pair and read
-> `.registration.json`'s `scopes` and `.token.json`'s `expires_in`.
+> **UNVERIFIED.** Miro's effective granted scopes, token expiry, and exact
+> consent-screen layout are not measured by this repo. The authorization server,
+> DCR/PKCE support, registry entry, and authorization endpoint are verified; use
+> the provider's consent page and revocation UI as the source of truth for a
+> particular grant.
 
 ## Related
 

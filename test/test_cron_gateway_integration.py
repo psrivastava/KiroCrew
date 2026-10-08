@@ -204,7 +204,7 @@ class TestScriptExecution:
     async def test_skip_defers_strike_reset_to_execute(self):
         # The Skip branch must NOT reset the counter or lift auto-pause itself:
         # that is record_success's job, reached only through
-        # CronScheduler._execute, whose reset is guarded by the _cancelled_jobs
+        # CronScheduler._execute, whose reset is guarded by the cancel markers
         # cancel-race check. An unguarded reset in this branch would clear the
         # pause and re-enable a job cancelled mid-tick, so the callback layer
         # leaves the bookkeeping untouched and defers to _execute. (The guarded
@@ -1012,11 +1012,14 @@ def _make_gw_for_llm():
     return gw
 
 
-async def _run_llm_callback(gw, job, *, get_or_create_side_effect=None):
+async def _run_llm_callback(gw, job, *, get_or_create_side_effect=None, fires=1):
     """Run the cron callback for an LLM-based job through _init_cron.
 
     get_or_create_side_effect: if provided, set as the side_effect on
     sessions.get_or_create (for simulating model errors / fallback).
+    fires: how many times to run the ONE callback the gateway built, as one
+    gateway process fires a job on successive schedule slots; the last result
+    is returned.
     """
     captured_cb = None
 
@@ -1050,7 +1053,8 @@ async def _run_llm_callback(gw, job, *, get_or_create_side_effect=None):
         mock_cron_cls.create = AsyncMock(side_effect=capture_cron)
         await gw._init_cron()
         assert captured_cb is not None
-        result = await captured_cb(job)
+        for _ in range(fires):
+            result = await captured_cb(job)
         return result, _stream_mock
 
 
@@ -1108,6 +1112,141 @@ class TestLlmCronAdmission:
         assert job.last_result == ""
         assert job.consecutive_failures == 2
         stream.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("legacy_agent", ["alice", "named-template"])
+    async def test_an_upgraded_member_schedule_naming_an_agent_fires(
+        self, monkeypatch, tmp_path, legacy_agent
+    ):
+        """The upgrade's capture and the old build's session record agree at dispatch.
+
+        0.7.0-insider.1 to .5 fired a member schedule once and left
+        ``{memory_store, agent: <member selector>}`` under ``cron:<id>``. The
+        start-of-process capture keeps the ``agent_id`` the schedule named, and
+        the single-agent fire then binds that capture under the same stable key
+        with ``replace_existing`` False -- which refused the record until the
+        capture reconciled it. Driven through the real callback: the fire runs,
+        dispatches the named agent, and the record carries the capture.
+        """
+        import json
+        import os
+        from pathlib import Path
+        from types import SimpleNamespace
+
+        from kiro_crew import execution_context
+        from kiro_crew.config import loader
+        from kiro_crew.config.sections import KiroCrewAgentConfig, MemoryStoreConfig
+        from kiro_crew.cron_service.identity import migrate_legacy_member_schedules
+        from kiro_crew.cron_service.store import _job_from_record
+        from kiro_crew.history import ConversationLog
+        from kiro_crew.vector_memory import create_member_database
+
+        home = Path(os.environ["KIROCREW_HOME"])
+        db = home / "memory_stores" / "member-alice" / "memory.db"
+        db.parent.mkdir(parents=True, exist_ok=True)
+        create_member_database(db, member_id="id-alice", store_id="member-alice")
+        cfg = SimpleNamespace(
+            agents={
+                "alice": KiroCrewAgentConfig(
+                    member_id="id-alice", memory_store="member-alice", kiro_agent="shared"
+                )
+            },
+            memory_stores={
+                "member-alice": MemoryStoreConfig(
+                    owner_member="alice", owner_member_id="id-alice", memory_version=2
+                )
+            },
+        )
+        loader._invalidate_config_cache()
+        monkeypatch.setattr(loader.KiroCrewConfig, "load", classmethod(lambda cls: cfg))
+        execution_context._LIVE_EXECUTIONS.clear()
+
+        store_dir = tmp_path / "cron-store"
+        store_dir.mkdir()
+        record = {
+            "id": "lj1",
+            "name": "llm-job",
+            "message": "Run daily check",
+            "schedule": {"kind": "every", "every_secs": 3600},
+            "agent_id": "named-template",
+            "member_id": "alice",
+            "memory_store": "member-alice",
+        }
+        (store_dir / "crons.json").write_text(
+            json.dumps({"version": 2, "jobs": [record]}), encoding="utf-8"
+        )
+        ConversationLog().update_metadata(
+            "cron:lj1", {"memory_store": "member-alice", "agent": legacy_agent}
+        )
+
+        assert migrate_legacy_member_schedules(store_dir) == ["lj1"]
+        saved = json.loads((store_dir / "crons.json").read_text(encoding="utf-8"))["jobs"][0]
+        job = _job_from_record(saved)
+        assert job.agent_id == "named-template"
+        assert job.persistent_session is True
+
+        gw = _make_gw_for_llm()
+        result, stream = await _run_llm_callback(gw, job, fires=2)
+
+        assert result == "Agent response here"
+        assert job.last_status != "error", job.last_error
+        assert job.consecutive_failures == 0
+        assert stream.await_count == 2
+        dispatched = [c.kwargs.get("agent") for c in gw.sessions.get_or_create.call_args_list]
+        assert dispatched == ["named-template", "named-template"]
+        recorded = execution_context.read_session_execution("cron:lj1", required=True)
+        assert recorded.template_id == "named-template"
+        assert recorded.member_id == "id-alice"
+        assert recorded.store.store_id == "member-alice"
+
+    @pytest.mark.asyncio
+    async def test_a_refused_legacy_member_schedule_is_an_ordinary_failed_run(
+        self, monkeypatch, tmp_path
+    ):
+        """A pre-identity schedule refused before dispatch fails like any other refusal.
+
+        The gateway gives ``LegacyScheduleRefused`` no handling of its own: nothing
+        is dispatched, no alert is sent, no runtime marker is set, and the raise
+        reaches the scheduler, whose catch records an ordinary failed run whose
+        error text is the ``memory_unavailable:`` refusal naming the repair.
+        """
+        from kiro_crew import cron
+        from kiro_crew.cron_service.identity import LegacyScheduleRefused
+
+        def refuse(job, **_kwargs):
+            raise LegacyScheduleRefused("its store's member was deleted", "delete this schedule")
+
+        monkeypatch.setattr(cron, "resolve_cron_memory", refuse)
+        gw = _make_gw_for_llm()
+        job = _make_llm_job(member_id="alice", memory_store="member-alice")
+        with pytest.raises(LegacyScheduleRefused, match="delete this schedule"):
+            await _run_llm_callback(gw, job)
+        gw.sessions.get_or_create.assert_not_awaited()
+        gw.dashboard_state.notify.assert_not_called()
+        assert job.run_never_started is False
+        assert job.fire_time_denied is False
+
+        async def refusing_callback(job):
+            raise LegacyScheduleRefused("its store's member was deleted", "delete this schedule")
+
+        svc = cron.CronService(base_dir=tmp_path, on_job=refusing_callback)
+        await svc._execute(job)
+        assert job.last_status == "error"
+        assert job.last_error.startswith("memory_unavailable:")
+        assert "delete this schedule" in job.last_error
+
+    @pytest.mark.asyncio
+    async def test_other_refusals_before_dispatch_still_raise(self, monkeypatch):
+        from kiro_crew import cron
+
+        def refuse(job, **_kwargs):
+            raise ValueError("memory_unavailable: schedule has no canonical execution context")
+
+        monkeypatch.setattr(cron, "resolve_cron_memory", refuse)
+        gw = _make_gw_for_llm()
+        with pytest.raises(ValueError, match="no canonical execution context"):
+            await _run_llm_callback(gw, _make_llm_job(member_id="deleted"))
+        gw.dashboard_state.notify.assert_not_called()
 
 
 class TestModelFallback:
@@ -1574,7 +1713,7 @@ class TestCronUsageRow:
 def test_shutdown_cancel_keeps_the_last_completed_result(tmp_path) -> None:
     """A shutdown cancel must not wipe the previous run's result.
 
-    stop() cancels the in-flight task but never adds the job to _cancelled_jobs,
+    stop() cancels the in-flight task but never adds the job to the cancel markers,
     so the funnel's result-less clear would otherwise run on every gateway stop
     and persist an empty result over the last completed run's output.
     """
@@ -1598,7 +1737,8 @@ def test_shutdown_cancel_keeps_the_last_completed_result(tmp_path) -> None:
         svc._jobs = [job]
         svc._save()
         with patch.object(svc, "_execute", side_effect=_hang):
-            task = asyncio.create_task(svc._run_job_isolated(job))
+            claim = svc._claim_run(job.id, "scheduled")
+            task = asyncio.create_task(svc._run_job_isolated(job, claim))
             await asyncio.sleep(0.05)
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -1809,7 +1949,7 @@ class TestCronPoolQueueWait:
 
             ran = threading.Event()
 
-            async def _execute(_job):
+            async def _execute(_job, _meta=None):
                 return await ex.run_in_cron_pool(ran.set, timeout=30, queue_timeout=60)
 
             svc._execute = _execute  # type: ignore[method-assign]
@@ -1841,7 +1981,7 @@ class TestCronPoolQueueWait:
         )
         job.timeout_secs = 2
 
-        async def _slow(_job):
+        async def _slow(_job, _meta=None):
             await asyncio.sleep(30)
 
         svc._execute = _slow  # type: ignore[method-assign]
@@ -1935,10 +2075,13 @@ class TestCronPoolQueueWait:
         import time as _time
         from unittest.mock import AsyncMock as _AsyncMock
 
+        from kiro_crew.cron import _RunClaim
+
         never = asyncio.get_running_loop().create_future()  # a task that is not done
         holder = asyncio.ensure_future(asyncio.wait_for(never, timeout=30))
-        svc._job_start_times[job.id] = _time.time() - elapsed_secs
-        svc._running_tasks[job.id] = holder
+        svc._claims[job.id] = _RunClaim(
+            trigger="scheduled", claimed_at=_time.time() - elapsed_secs, task=holder
+        )
         svc._jobs = [job]
         reaped = _AsyncMock()
         svc._force_reap = reaped  # type: ignore[method-assign]
@@ -2833,3 +2976,602 @@ class TestACancellationAtTheClaimAwaitKeepsItsOneShot:
 
         await asyncio.to_thread(svc._merge_job_result, created)
         assert any(j.id == created.id for j in svc.list_jobs()), "a denied one-shot was consumed"
+
+
+class TestCronDefaultAgent:
+    """The configured default agent must reach dispatch for an agent-less cron.
+
+    Regression cover for a silent-no-op class rather than for one bug site.
+    ``_cron_callback`` captures its selectors up front -- "captured selectors,
+    never the scheduler's mutable job" -- and every downstream consumer reads
+    the resulting ``cron_agent``, never ``job.agent_id`` again. A default
+    resolved anywhere BELOW that capture therefore reaches nothing: no error,
+    no conflict, no failing assertion elsewhere, just a cron quietly running
+    as AcpClient's ``CLIENT_NAME`` floor with none of the default agent's MCP
+    servers. These assert on the ``agent`` kwarg ``get_or_create`` actually
+    receives, which is the only place the difference is observable.
+    """
+
+    @staticmethod
+    def _dispatched_agent(gw):
+        return gw.sessions.get_or_create.call_args_list[0].kwargs["agent"]
+
+    @pytest.mark.asyncio
+    async def test_agentless_job_runs_the_configured_default(self):
+        gw = _make_gw_for_llm()
+        gw._cfg.agent.default_agent = "configured-default"
+        job = _make_llm_job(agent_id="")
+
+        result, _ = await _run_llm_callback(gw, job)
+
+        assert self._dispatched_agent(gw) == "configured-default"
+        assert result == "Agent response here"
+
+    @pytest.mark.asyncio
+    async def test_explicit_agent_id_is_not_overridden(self):
+        gw = _make_gw_for_llm()
+        gw._cfg.agent.default_agent = "configured-default"
+        job = _make_llm_job(agent_id="pinned-agent")
+
+        await _run_llm_callback(gw, job)
+
+        assert self._dispatched_agent(gw) == "pinned-agent"
+
+    @pytest.mark.asyncio
+    async def test_whitespace_agent_id_is_treated_as_absent(self):
+        gw = _make_gw_for_llm()
+        gw._cfg.agent.default_agent = "configured-default"
+        job = _make_llm_job(agent_id="   ")
+
+        await _run_llm_callback(gw, job)
+
+        assert self._dispatched_agent(gw) == "configured-default"
+
+    @pytest.mark.asyncio
+    async def test_no_configured_default_keeps_the_client_name_floor(self):
+        gw = _make_gw_for_llm()
+        gw._cfg.agent.default_agent = ""
+        job = _make_llm_job(agent_id="")
+
+        await _run_llm_callback(gw, job)
+
+        assert self._dispatched_agent(gw) == "kirocrew"
+
+    @pytest.mark.asyncio
+    async def test_non_str_configured_default_degrades_to_the_floor(self):
+        """A non-str configured default must not reach ``template_id``.
+
+        ``ExecutionContext.__post_init__`` requires a str template_id, so an
+        unset (or, here, mocked) config attribute that is merely truthy and
+        ``.strip()``-able would abort the whole dispatch with "missing
+        execution template" instead of degrading to the floor.
+        """
+        gw = _make_gw_for_llm()
+        # _make_gw_for_llm leaves _cfg a MagicMock, so .default_agent is a
+        # MagicMock: truthy and .strip()-able, but not a str.
+        assert not isinstance(gw._cfg.agent.default_agent, str)
+        job = _make_llm_job(agent_id="")
+
+        result, _ = await _run_llm_callback(gw, job)
+
+        assert self._dispatched_agent(gw) == "kirocrew"
+        assert result == "Agent response here"
+
+    @pytest.mark.asyncio
+    async def test_a_retained_session_under_another_agent_defers_the_fire(self):
+        """A live session built for the PREVIOUS default must not be reused.
+
+        The window this closes exists only because of this change. The cron key
+        is the stable ``cron:{job.id}``, and the run's ``finally`` DEFERS the
+        session reset while sub-agents are pending or an injection is in
+        flight, so the session outlives its fire. ``get_or_create`` then claims
+        that live session by key and returns ``session.provider`` without ever
+        comparing the ``agent`` kwarg, so the next fire builds the NEW default's
+        context and runs it on the OLD default's process -- keeping MCP servers
+        and a workspace the operator has just narrowed away. Before this
+        change an agent-less cron dispatched the constant floor on every fire,
+        so no two fires could differ and the window was unreachable.
+
+        Deferring is the only safe branch: a retained session implies pending
+        sub-agent work (the no-pending case already reset in the prior fire's
+        ``finally``), so resetting here would destroy work in flight. The
+        retention is temporary by construction -- ``_subagent_done`` resets once
+        the last one lands, and the reaper still targets the key if that hangs.
+        """
+        gw = _make_gw_for_llm()
+        gw._cfg.agent.default_agent = "configured-default"
+        gw.sessions._get_session_agent = MagicMock(return_value="previous-default")
+        job = _make_llm_job(agent_id="")
+
+        result, stream = await _run_llm_callback(gw, job)
+
+        assert gw.sessions.get_or_create.call_args_list == []
+        stream.assert_not_awaited()
+        assert result is None
+        # The retention marker, not a failure: a deferred fire must not count
+        # toward auto-pause, and must not consume a delete_after_run job.
+        assert job.run_never_started is True
+        assert job.last_status == "error"
+        assert "previous-default" in (job.last_error or "")
+
+    @pytest.mark.asyncio
+    async def test_a_retained_session_under_the_same_agent_still_fires(self):
+        """Same agent both fires: nothing to protect, so nothing is deferred."""
+        gw = _make_gw_for_llm()
+        gw._cfg.agent.default_agent = "configured-default"
+        gw.sessions._get_session_agent = MagicMock(return_value="configured-default")
+        job = _make_llm_job(agent_id="")
+
+        result, _ = await _run_llm_callback(gw, job)
+
+        assert self._dispatched_agent(gw) == "configured-default"
+        assert result == "Agent response here"
+        assert job.run_never_started is False
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_live_agent_does_not_defer_the_fire(self):
+        """No readable agent is NOT evidence of a mismatch.
+
+        The guard fires on positive evidence only. A manager that does not
+        expose the reader, or answers something that is not a non-empty ``str``,
+        leaves the dispatch exactly as it was before this guard existed --
+        because deferring on an unreadable answer would stall every agent-less
+        cron on such a host forever, which is a far worse failure than the
+        capability widening being closed here.
+        """
+        gw = _make_gw_for_llm()
+        gw._cfg.agent.default_agent = "configured-default"
+        # A bare MagicMock attribute: truthy, != the dispatched name, not a str.
+        assert not isinstance(gw.sessions._get_session_agent("cron:x"), str)
+        job = _make_llm_job(agent_id="")
+
+        result, _ = await _run_llm_callback(gw, job)
+
+        assert self._dispatched_agent(gw) == "configured-default"
+        assert result == "Agent response here"
+
+    @pytest.mark.asyncio
+    async def test_a_pinned_agent_defers_past_a_session_retained_under_another(self):
+        """A job pinning its own agent can change it through ``cron update``.
+
+        The update re-points the captured template, so the next fire may
+        dispatch a different name while the previous fire's session is still
+        retained for pending sub-agents. That fire is deferred, exactly as for a
+        changed default, rather than run on the previous agent's process.
+        """
+        gw = _make_gw_for_llm()
+        gw._cfg.agent.default_agent = "configured-default"
+        gw.sessions._get_session_agent = MagicMock(return_value="previous-agent")
+        job = _make_llm_job(agent_id="pinned-agent")
+
+        result, stream = await _run_llm_callback(gw, job)
+
+        assert gw.sessions.get_or_create.call_args_list == []
+        stream.assert_not_awaited()
+        assert result is None
+        assert job.run_never_started is True
+        assert "previous-agent" in (job.last_error or "")
+
+    @pytest.mark.asyncio
+    async def test_a_pinned_agent_fires_past_a_session_retained_under_the_same(self):
+        gw = _make_gw_for_llm()
+        gw.sessions._get_session_agent = MagicMock(return_value="pinned-agent")
+        job = _make_llm_job(agent_id="pinned-agent")
+
+        result, _ = await _run_llm_callback(gw, job)
+
+        assert self._dispatched_agent(gw) == "pinned-agent"
+        assert result == "Agent response here"
+        assert job.run_never_started is False
+
+    @pytest.mark.asyncio
+    async def test_a_dispatching_sequence_keeps_its_own_agents(self):
+        gw = _make_gw_for_llm()
+        gw._cfg.agent.default_agent = "configured-default"
+        job = _make_llm_job(agent_id="", agent_sequence=["seq-a", "seq-b"])
+
+        await _run_llm_callback(gw, job)
+
+        dispatched = [c.kwargs.get("agent") for c in gw.sessions.get_or_create.call_args_list]
+        assert "configured-default" not in dispatched
+
+    @pytest.mark.asyncio
+    async def test_the_shared_job_record_is_never_mutated(self):
+        """The scheduler hands the callback its LIVE stored CronJob.
+
+        CronService passes the object straight out of ``self._jobs``
+        (``await self._on_job(job)``) and ``_save()`` reserialises ``self._jobs``
+        wholesale, so writing a resolved default onto ``job.agent_id`` would pin
+        an agent-less cron to a concrete agent name in ``crons.json`` on its
+        first completed run -- the job would silently stop tracking
+        ``agent.default_agent``, and an operator who later changed the default
+        would keep running the old agent. The default must therefore reach
+        dispatch without the stored record changing at all.
+        """
+        gw = _make_gw_for_llm()
+        gw._cfg.agent.default_agent = "configured-default"
+        job = _make_llm_job(agent_id="")
+
+        await _run_llm_callback(gw, job)
+
+        assert self._dispatched_agent(gw) == "configured-default"
+        assert job.agent_id == "", "the stored CronJob must not carry the resolved default"
+
+    @pytest.mark.asyncio
+    async def test_a_dormant_lone_sequence_still_gets_the_default(self):
+        """A one-entry sequence is dormant (agent_sequence_dispatches is False).
+
+        Dispatch falls through to agent_id, so the default still applies --
+        gating on a bare ``job.agent_sequence`` would deny it here.
+        """
+        gw = _make_gw_for_llm()
+        gw._cfg.agent.default_agent = "configured-default"
+        job = _make_llm_job(agent_id="", agent_sequence=["lonely"])
+
+        await _run_llm_callback(gw, job)
+
+        assert self._dispatched_agent(gw) == "configured-default"
+
+    @pytest.mark.asyncio
+    async def test_default_agent_does_not_enter_the_captured_execution(self, monkeypatch):
+        """The resolved default must reach dispatch WITHOUT entering the bind.
+
+        ``persistent_session`` defaults True, so ``build_cron_session_context``
+        returns the stable key ``cron:{job.id}`` and every later fire re-binds
+        it. ``bind_session_execution`` is called positionally, so
+        ``replace_existing`` is False, and it raises "session already belongs to
+        another execution" whenever the candidate differs from what is already
+        recorded. A pre-migration job that has already run therefore has
+        ``template_id="kirocrew"`` on record; folding the configured default into
+        the captured identity changes that field and makes every subsequent fire
+        raise before ``get_or_create`` -- a non-transient error nothing in the
+        callback catches, so the job records a failure per fire and auto-pauses.
+
+        The default belongs on the dispatched agent, which no durable record
+        compares. This asserts both halves at once: dispatch sees the default,
+        the bind does not.
+        """
+        from kiro_crew import execution_context
+
+        gw = _make_gw_for_llm()
+        gw._cfg.agent.default_agent = "configured-default"
+        job = _make_llm_job(agent_id="")
+
+        bound = []
+        original = execution_context.bind_session_execution
+
+        def bind(key, execution):
+            bound.append(execution)
+            return original(key, execution)
+
+        monkeypatch.setattr(execution_context, "bind_session_execution", bind)
+        await _run_llm_callback(gw, job)
+
+        assert self._dispatched_agent(gw) == "configured-default"
+        assert bound, "bind_session_execution was never called"
+        assert bound[0].template_id == "kirocrew", (
+            "the configured default leaked into the captured execution identity; "
+            "a second fire on the stable cron: key would raise "
+            "'session already belongs to another execution'"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_captured_non_floor_template_keeps_its_own_agent(self):
+        """A record carrying a REAL captured template must not be re-pointed.
+
+        A schedule created from a template chat with no ``agent`` argument names
+        its template ONLY in ``execution_context.template_id`` -- ``agent_id``
+        stays empty. ``bind_cron_memory``
+        (``cron_service/identity.py:143-152``) captures the CREATOR session's
+        execution, whose ``template_id`` names the template, and overwrites it
+        only ``if job.agent_id``. An agent_id-only gate therefore reads
+        such a job as agent-less, and an ungated override would replace the
+        captured template with the configured default on every fire while the
+        captured execution and memory store stayed the original template's, and
+        ``dispatched_agents_from_disk`` -- the delete guard's single walk of the
+        dispatch-mirroring rule -- still reported the old agent. That is the same
+        silent wrong-agent class this change removes, reintroduced on the other
+        arm, so the override is gated on the resolved agent still being the floor.
+        """
+        from kiro_crew.execution_context import ExecutionContext, MemoryStoreRef
+
+        captured = ExecutionContext(None, MemoryStoreRef("default"), "template", "researcher")
+        gw = _make_gw_for_llm()
+        gw._cfg.agent.default_agent = "configured-default"
+        job = _make_llm_job(agent_id="", execution_context=captured.to_record())
+
+        await _run_llm_callback(gw, job)
+
+        assert self._dispatched_agent(gw) == "researcher"
+
+    @pytest.mark.asyncio
+    async def test_a_captured_floor_template_still_gets_the_default(self):
+        """The post-migration case this change exists for.
+
+        Every record created since the execution-context migration carries an
+        ``execution_context``, so gating the resolution inside the legacy arm
+        would reach only pre-migration jobs. An agent-less job whose captured
+        ``template_id`` is itself the bare ``"kirocrew"`` floor is the reported
+        symptom, and it must still pick the configured default up at dispatch.
+        """
+        from kiro_crew.execution_context import ExecutionContext, MemoryStoreRef
+
+        captured = ExecutionContext(None, MemoryStoreRef("default"), "template", "kirocrew")
+        gw = _make_gw_for_llm()
+        gw._cfg.agent.default_agent = "configured-default"
+        job = _make_llm_job(agent_id="", execution_context=captured.to_record())
+
+        await _run_llm_callback(gw, job)
+
+        assert self._dispatched_agent(gw) == "configured-default"
+
+    @pytest.mark.asyncio
+    async def test_a_member_capture_spelling_the_floor_keeps_its_own_agent(self):
+        """A member execution is a real selection even when it spells the floor.
+
+        ``resolve_member_execution`` sets ``template_id`` to
+        ``agent.kiro_agent or "kirocrew"``, so a member whose agent names no
+        ``kiro_agent`` captures the floor spelling while ``agent_id`` stays
+        empty -- and a floor-only gate reads that as "selected nothing".
+        Substituting there would have ``build_message`` inject the substituted
+        template's system prompt and documents into THAT member's envelope while
+        ``_resolve_cron_agent`` still dispatches the member's own
+        ``kiro_agent``, and would attribute the usage row to the substituted
+        name. Requiring ``member_id`` to be unset narrows the override to a
+        capture that really did select nothing.
+        """
+        from kiro_crew.execution_context import ExecutionContext, MemoryStoreRef
+
+        captured = ExecutionContext(
+            "alice", MemoryStoreRef("alice-store", "alice"), "member", "kirocrew"
+        )
+        gw = _make_gw_for_llm()
+        gw._cfg.agent.default_agent = "configured-default"
+        job = _make_llm_job(agent_id="", execution_context=captured.to_record())
+
+        await _run_llm_callback(gw, job)
+
+        assert self._dispatched_agent(gw) != "configured-default"
+
+    @pytest.mark.asyncio
+    async def test_a_legacy_member_with_no_member_id_keeps_its_own_agent(self):
+        """``member_id`` alone does not identify a member capture.
+
+        A member predating the identity migration persists no ``member_id``:
+        ``with_template`` states the admitting rule outright -- such a record
+        "is named by ``selection_kind == 'member'`` and ``selection_name``
+        alone" -- and ``__post_init__`` accepts ``member_id=None`` on a store
+        that also carries none. Pair that with an agent naming no
+        ``kiro_agent``, so ``template_id`` spells the ``"kirocrew"`` floor, and
+        a ``member_id``-only gate reads a real member selection as "selected
+        nothing" and substitutes the configured default -- injecting that
+        template's system prompt and documents into the member's envelope and
+        attributing the usage row to it. ``selection_kind`` is the namespace
+        itself and ``__post_init__`` constrains it to "member" or "template",
+        so testing it covers the persisted and unpersisted member alike.
+        """
+        from kiro_crew.execution_context import ExecutionContext, MemoryStoreRef
+
+        captured = ExecutionContext(
+            None, MemoryStoreRef("legacy-global-store"), "member", "kirocrew"
+        )
+        assert captured.member_id is None, "the legacy shape under test"
+        gw = _make_gw_for_llm()
+        gw._cfg.agent.default_agent = "configured-default"
+        job = _make_llm_job(agent_id="", execution_context=captured.to_record())
+
+        await _run_llm_callback(gw, job)
+
+        assert self._dispatched_agent(gw) != "configured-default"
+
+    @pytest.mark.asyncio
+    async def test_an_unmigrated_member_schedule_keeps_its_own_agent(self):
+        """A pre-migration member cron carries its membership on the JOB, not the capture.
+
+        The two gates above read ``cron_execution``, and on the arm where
+        ``job.execution_context`` is ``None`` that object is RECONSTRUCTED rather
+        than loaded: ``resolve_legacy_execution`` calls ``execution_for_store``,
+        which for a V1 store returns
+        ``ExecutionContext(None, MemoryStoreRef(name), "template", template_id)``
+        -- hardcoding a null ``member_id`` and the ``"template"`` namespace no
+        matter what the schedule selected. So a member cron that predates the
+        execution-context migration passes BOTH capture gates while
+        ``job.member_id`` still names the member, and ``resolve_cron_memory``
+        deliberately keeps exactly that record dispatching instead of raising
+        ("Older V1 schedules may still carry the historical member selector
+        beside their explicit legacy store"), so the arm stays live -- nothing
+        backfills ``execution_context`` on load.
+
+        Substituting there runs the configured default template against that
+        member's own silo: ``build_message`` injects the substituted template's
+        system prompt and documents into the member's envelope, and the usage row
+        is attributed to it. The capture cannot answer "did this schedule select
+        a member?" on this arm, so the job record has to be asked as well.
+        """
+        gw = _make_gw_for_llm()
+        gw._cfg.agent.default_agent = "configured-default"
+        job = _make_llm_job(agent_id="", member_id="alice", memory_store="default")
+        assert job.execution_context is None, "the unmigrated shape under test"
+
+        await _run_llm_callback(gw, job)
+
+        assert self._dispatched_agent(gw) != "configured-default"
+
+    @pytest.mark.asyncio
+    async def test_a_default_declaring_a_spawn_allowlist_keeps_the_floor(self, monkeypatch):
+        """A restricted default cannot be dispatched while the capture names the floor.
+
+        The substitution reaches the dispatched ``agent=`` only, while
+        ``bind_session_execution`` publishes the UNSUBSTITUTED capture under
+        ``cron:{job.id}`` -- deliberately, because that binder is called
+        positionally (``replace_existing=False``) and refuses a candidate
+        differing from what a prior fire recorded. Both spawn entry points derive
+        the parent's declaration from that record alone:
+        ``read_session_execution(parent)`` ->
+        ``parent_spawn_allowlists(parent_execution.template_id)``
+        (``dashboard/handlers/messaging.py``, and the off-loop twin in
+        ``subagent.py``). For the floor spelling that resolves to ``()``, which
+        ``_vet_parent_available_agents`` admits as "no declaration to honour" --
+        so a ``toolsSettings.subagent.availableAgents`` declaration on the
+        substituted template is never consulted and a child it forbids starts.
+
+        Honouring it instead would mean a new non-durable parent execution read by
+        the spawn gate, in two files this change does not touch; narrowing the
+        substitution is the fix that stays inside it. The declined job keeps the
+        pre-change floor, so nothing an operator has today regresses.
+        """
+        from kiro_crew import subagent as _subagent
+
+        monkeypatch.setattr(
+            _subagent, "parent_spawn_allowlists", lambda template: (("only-this-child",),)
+        )
+        gw = _make_gw_for_llm()
+        gw._cfg.agent.default_agent = "configured-default"
+        job = _make_llm_job(agent_id="")
+
+        await _run_llm_callback(gw, job)
+
+        assert self._dispatched_agent(gw) != "configured-default"
+
+    @pytest.mark.asyncio
+    async def test_an_unknown_spawn_allowlist_keeps_the_floor(self, monkeypatch):
+        """``None`` is the reader's UNKNOWN and must DECLINE -- deny by default.
+
+        An earlier revision substituted on ``None``, reasoning that the spawn gate
+        would refuse anyway because it asks about the capture's floor spelling.
+        That premise is FALSE: ``agent.py`` generates and installs
+        ``kirocrew.json`` into the agents directory and ``config/defaults.json``
+        declares ``"name": "kirocrew"``, so a readable spec DOES declare the floor
+        name. ``parent_spawn_allowlists`` only answers ``None`` when *no* readable
+        spec declares the name while some file could not be read -- so for the
+        floor it returns ``()``, "no declaration to honour", and the gate ADMITS.
+        A child the substituted default's ``availableAgents`` forbids would start.
+
+        ``None`` arises when the hardened reader refused a spec file in the
+        shared, user-writable agents dir -- which is where a restrictive
+        declaration could be hiding. A falsy value must not silently skip an
+        authorization check.
+        """
+        from kiro_crew import subagent as _subagent
+
+        monkeypatch.setattr(_subagent, "parent_spawn_allowlists", lambda template: None)
+        gw = _make_gw_for_llm()
+        gw._cfg.agent.default_agent = "configured-default"
+        job = _make_llm_job(agent_id="")
+
+        await _run_llm_callback(gw, job)
+
+        assert self._dispatched_agent(gw) != "configured-default"
+
+    @pytest.mark.asyncio
+    async def test_a_cleared_default_still_defers_a_session_held_by_the_old_one(self):
+        """The window is an AGENT-LESS JOB, not "this fire substituted".
+
+        Gating the guard on ``_default_substituted`` failed open in exactly the
+        case it was written for. Fire N substitutes ``researcher`` and its
+        ``finally`` defers the reset because sub-agents are pending; the operator
+        then CLEARS ``agent.default_agent``; fire N+1 resolves an empty default,
+        so the five-gate ``if`` is false and the flag stays ``False``. The guard
+        block was skipped entirely, and the claim path took its
+        ``existing is not None and not recycling`` arm -- returning
+        ``session.provider`` without comparing the ``agent`` kwarg -- so the fire
+        built the FLOOR's context and ran it on the process still holding
+        ``researcher``'s MCP servers, workspace and pinned model. Exactly the harm
+        the guard exists to prevent, in the one direction the flag excluded.
+
+        Any other reason for declining the substitution reaches the same hole --
+        the default's spec gaining an ``availableAgents`` list between fires, for
+        instance. So the guard keys on the agent-less predicate itself.
+        """
+        gw = _make_gw_for_llm()
+        gw._cfg.agent.default_agent = ""  # the operator cleared it between fires
+        gw.sessions._get_session_agent = MagicMock(return_value="researcher")
+        job = _make_llm_job(agent_id="")
+
+        result, stream = await _run_llm_callback(gw, job)
+
+        assert gw.sessions.get_or_create.call_args_list == []
+        stream.assert_not_awaited()
+        assert result is None
+        assert job.run_never_started is True
+        assert "researcher" in (job.last_error or "")
+
+    @pytest.mark.asyncio
+    async def test_the_live_config_default_outranks_the_boot_snapshot(self, monkeypatch):
+        """``agent.default_agent`` is adopted live, so a boot-only read goes stale.
+
+        The field carries no ``restart=True`` mark, so the config watcher applies
+        a dashboard/CLI change without a gateway restart, while ``self._cfg`` is
+        rebuilt only by unrelated MCP handlers. Reading the boot snapshot would
+        keep dispatching the ``"kirocrew"`` floor after an operator sets a
+        default -- the very symptom this change exists to remove.
+        """
+        import copy
+
+        from kiro_crew.config import live
+
+        gw = _make_gw_for_llm()
+        gw._cfg.agent.default_agent = "stale-boot-default"
+        live_cfg = copy.copy(gw._cfg)
+        live_cfg.agent = copy.copy(gw._cfg.agent)
+        live_cfg.agent.default_agent = "live-default"
+        monkeypatch.setattr(live, "snapshot", lambda: live_cfg)
+        job = _make_llm_job(agent_id="")
+
+        await _run_llm_callback(gw, job)
+
+        assert self._dispatched_agent(gw) == "live-default"
+
+    @pytest.mark.asyncio
+    async def test_a_default_naming_a_crew_alias_does_not_inherit_that_crew(self, monkeypatch):
+        """The configured default is a TEMPLATE name, so the alias collapse must not claim it.
+
+        ``_resolve_cron_agent`` collapses any name that merely keys ``cfg.agents``
+        into a crew alias and returns it as ``crew_agent``, which
+        ``resolve_crew_identity`` honours verbatim -- binding that crew's
+        workspace, its pinned model and its capability MCP servers.
+        ``agent.default_agent`` is a free-form str in the TEMPLATE namespace with
+        no alias validation (the alias-namespaced default is a different field,
+        guarded by ``default_agent_not_alias``), so an operator naming a crew
+        member there is ordinary input rather than an extreme one. Collapsing it
+        would widen an agent-less cron's capabilities and identity with no signal
+        above DEBUG, so the substituted default must dispatch as the template it
+        was configured as and bind no crew.
+        """
+        import copy
+
+        from kiro_crew.config import live, loader
+
+        gw = _make_gw_for_llm()
+        live_cfg = copy.copy(gw._cfg)
+        live_cfg.agent = copy.copy(gw._cfg.agent)
+        live_cfg.agent.default_agent = "shared-name"
+        # Real containers, so nothing short-circuits the collapse before the
+        # template-namespace gate: a MagicMock ``agents`` answers ``in`` with
+        # False and would make this test pass with the gate removed.
+        crew_entry = MagicMock()
+        crew_entry.workspace = "crew-ws"
+        live_cfg.agents = {"shared-name": crew_entry}
+        live_cfg.workspaces = {"crew-ws": MagicMock()}
+        monkeypatch.setattr(live, "snapshot", lambda: live_cfg)
+        crew_bindings = MagicMock()
+        crew_bindings.kiro_agent = "kirocrew"
+        monkeypatch.setattr(loader, "resolve_agent_bindings", lambda *a, **k: crew_bindings)
+        monkeypatch.setattr(loader, "workspace_dir_from_entry", lambda *a, **k: "/tmp/crew-ws")
+        job = _make_llm_job(agent_id="")
+
+        await _run_llm_callback(gw, job)
+
+        kwargs = gw.sessions.get_or_create.call_args_list[0].kwargs
+        # Dispatched as the template it was configured as, not as the crew's
+        # collapsed ``kiro_agent`` ...
+        assert kwargs["agent"] == "shared-name"
+        # ... and the EXPLICIT no-crew spelling, not merely a falsy one.
+        # ``resolve_crew_identity`` returns an explicit ``crew_agent`` verbatim
+        # including ``""``, but treats ``None`` as "apply the crew-namespace
+        # fallback" and reselects any ``agent`` that keys ``config.agents`` -- so
+        # asserting only falsiness would pass on a ``None`` that still inherits
+        # the colliding crew's identity, workspace and capability MCP servers.
+        assert kwargs["crew_agent"] == ""
+        # ... with no crew workspace bound off the collision.
+        assert kwargs["cwd"] is None

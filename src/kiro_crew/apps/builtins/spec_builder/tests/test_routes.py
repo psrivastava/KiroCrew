@@ -38,7 +38,9 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from kiro_crew.apps.builtins.spec_builder import backend as backend_package
-from kiro_crew.apps.builtins.spec_builder.backend.handlers import _ClientClaim
+from kiro_crew.apps.builtins.spec_builder.backend.orchestration.request_identity import (
+    _ClientClaim,
+)
 from kiro_crew.apps.builtins.spec_builder.tests.routes_facade import (
     BACKEND_MODULES,
     backend_namespace,
@@ -173,10 +175,23 @@ def _never_touch_the_real_state(monkeypatch, tmp_path):
 _REAL_STATE_DIR: Path | None = None
 
 
+#: The local bootstrap subject the dashboard owner gate accepts when no owner is
+#: configured. Execute, handoff and stop are owner-gated, so the default caller
+#: is the owner; a test that wants a non-owner builds its own middleware.
+_OWNER_USER = "local-app"
+
+
+class _NoConfiguredOwner:
+    """The standalone-local state shape: no owner configured yet."""
+
+    owner_id = ""
+
+
 @web.middleware
 async def _auth_mw(request, handler):
-    """Inject a middleware-set user (mirrors the gateway's auth middleware)."""
-    request["user"] = "tester"
+    """Inject the owner's claims (mirrors the gateway's auth middleware)."""
+    request["user"] = _OWNER_USER
+    request["app"] = ""
     return await handler(request)
 
 
@@ -3561,7 +3576,7 @@ async def test_abort_cleanup_spares_a_replacement_nudge_loop(monkeypatch):
         def get_by_slot(self, key):
             return _Loop()
 
-        async def remove(self, loop_id):
+        async def remove(self, loop_id, *, stop_reason=""):
             removed.append(loop_id)
 
     monkeypatch.setattr(routes, "_autonudge_instance", lambda: _Svc())
@@ -3788,7 +3803,7 @@ async def test_pinned_halt_spares_a_replacement_loop_and_slot(tmp_path, monkeypa
         def get_by_slot(self, key):
             return _Loop()
 
-        async def remove(self, loop_id):
+        async def remove(self, loop_id, *, stop_reason=""):
             removed.append(loop_id)
 
     monkeypatch.setattr(routes, "_autonudge_instance", lambda: _Svc())
@@ -4095,7 +4110,7 @@ async def test_handoff_unwinds_when_the_index_commit_raises(tmp_path, monkeypatc
             self.armed = True
             return _Loop()
 
-        async def remove(self, loop_id):
+        async def remove(self, loop_id, *, stop_reason=""):
             self.armed = False
             removed.append(loop_id)
 
@@ -4260,7 +4275,7 @@ async def test_failed_handoff_keeps_a_pre_existing_conversation(tmp_path, monkey
             self.armed = True
             return _Loop()
 
-        async def remove(self, loop_id):
+        async def remove(self, loop_id, *, stop_reason=""):
             self.armed = False
 
     monkeypatch.setattr(routes, "_autonudge_instance", lambda: _Svc())
@@ -5645,7 +5660,7 @@ async def test_second_handoff_is_refused_while_executing(tmp_path, monkeypatch):
         def get_by_slot(self, key):
             return None
 
-        async def remove(self, loop_id):
+        async def remove(self, loop_id, *, stop_reason=""):
             pass
 
     # The autonudge service must be available: it is checked before the claim (it
@@ -5805,7 +5820,7 @@ async def test_authorization_failure_reverts_the_recorded_execution_state(tmp_pa
         def get_by_slot(self, key):
             return None
 
-        async def remove(self, loop_id):
+        async def remove(self, loop_id, *, stop_reason=""):
             pass
 
     monkeypatch.setattr(routes, "_autonudge_instance", lambda: _Svc())
@@ -5884,7 +5899,7 @@ async def test_deletion_during_authorization_removes_the_armed_loop(tmp_path, mo
         def get_by_slot(self, key):
             return _Loop() if self.armed and key == captured_slot_key else None
 
-        async def remove(self, loop_id):
+        async def remove(self, loop_id, *, stop_reason=""):
             self.armed = False
             removed.append(loop_id)
 
@@ -6146,23 +6161,51 @@ def test_concurrent_tombstone_writes_do_not_lose_deletions(tmp_path, monkeypatch
     pre-existing list, so the second write dropped the first spec's tombstone --
     and that spec was rediscovered and reappeared after the user deleted it.
 
-    Interleaves the transactions deliberately: each writer is parked between its
-    read and its write, which is exactly the window the lock has to close."""
+    Interleaves the transactions deliberately: the first writer is parked between its
+    read and its write, which is exactly the window the lock has to close, and is
+    released only once the second writer has made its next move. Under the lock that
+    move is waiting to acquire it; under the reported race it is a second read of the
+    same list. The parked writer is never released by a timeout: a three-party barrier
+    here could only fill under the race, so the fixed code paid the full 10-second
+    timeout on every run and the test told the two outcomes apart by elapsed time."""
     _redirect_state(monkeypatch, tmp_path)
     routes._remember_deleted("/p/keep-me")
 
     real_load = routes._load_deleted
-    parked = threading.Barrier(3, timeout=10)
+    real_lock = routes._INDEX_LOCK
+    first_parked = threading.Event()
+    second_moved = threading.Event()
+    release = threading.Event()
+    reads: list[str] = []
+    attempts: list[str] = []
+    bookkeeping = threading.Lock()
+
+    class _WatchedLock:
+        """The real lock, reporting the second writer's arrival at it."""
+
+        def __enter__(self):
+            with bookkeeping:
+                attempts.append(threading.current_thread().name)
+                if len(attempts) == 2:
+                    second_moved.set()
+            return real_lock.__enter__()
+
+        def __exit__(self, *exc):
+            return real_lock.__exit__(*exc)
 
     def _slow_load():
         current = real_load()
-        # Every writer waits here until both have read, then they race to write.
-        try:
-            parked.wait()
-        except threading.BrokenBarrierError:
-            pass
+        with bookkeeping:
+            reads.append(threading.current_thread().name)
+            first = len(reads) == 1
+            if not first:
+                second_moved.set()
+        if first:
+            first_parked.set()
+            release.wait(timeout=10)
         return current
 
+    monkeypatch.setattr(routes, "_INDEX_LOCK", _WatchedLock())
     monkeypatch.setattr(routes, "_load_deleted", _slow_load)
 
     threads = [
@@ -6171,12 +6214,19 @@ def test_concurrent_tombstone_writes_do_not_lose_deletions(tmp_path, monkeypatch
     for t in threads:
         t.start()
     try:
-        parked.wait()
-    except threading.BrokenBarrierError:
-        pass
+        assert first_parked.wait(timeout=10), "no writer reached its read"
+        assert second_moved.wait(timeout=10), "the second writer neither read nor reached the lock"
+        # Decide before releasing, so the verdict is about the parked window.
+        reads_while_parked = list(reads)
+    finally:
+        release.set()
+        for t in threads:
+            t.join(timeout=10)
     for t in threads:
-        t.join(timeout=10)
         assert not t.is_alive(), "a tombstone write deadlocked"
+    assert (
+        len(reads_while_parked) == 1
+    ), "the second writer read while the first was parked before its write"
 
     monkeypatch.setattr(routes, "_load_deleted", real_load)
     recorded = routes._load_deleted()
@@ -8431,7 +8481,7 @@ async def test_approve_records_the_version_and_the_user(tmp_path, monkeypatch):
         await client.close()
 
     stored = routes._load_index()["live"]["approvals"]["requirements"]
-    assert stored["hash"] == digest and stored["user"] == "tester" and stored["at"] > 0
+    assert stored["hash"] == digest and stored["user"] == _OWNER_USER and stored["at"] > 0
     assert detail["approvals"]["requirements"]["stale"] is False
 
 
@@ -9080,31 +9130,6 @@ async def test_task_final_snapshot_serializes_delete_reservation(tmp_path, monke
 
     assert task_response.status == 200 and delete_response.status == 200
     assert order == ["dispatch-task", "reserve-delete"]
-
-
-@pytest.mark.asyncio
-async def test_task_run_refuses_between_orchestration_stages(tmp_path, monkeypatch):
-    """A staged plan owns the slot even when no individual turn task is live."""
-    client = _make_client(monkeypatch, tmp_path)
-    _seed_spec(tmp_path, files={"tasks.md": "- [ ] add the tests\n"})
-    state, slots = _state_for("live")
-    slots[routes._slot_key("live")]._in_stage_execution = True
-    sent: list[str] = []
-    monkeypatch.setattr(routes, "_dispatch_turn", lambda *_args: sent.append("sent"))
-
-    client.app["state"] = state
-    await client.start_server()
-    try:
-        resp = await client.post(
-            f"{_BASE}/specs/live/task",
-            json={**_spec_identity(), "index": 0, "hash": routes._sha256_text("add the tests")},
-        )
-        body = await resp.json()
-    finally:
-        await client.close()
-
-    assert resp.status == 409 and body["code"] == "agent_running"
-    assert sent == []
 
 
 async def _always_executing(name, meta, slot):
@@ -14232,12 +14257,13 @@ async def test_create_cleanup_removes_a_fully_orphaned_execution_loop(tmp_path, 
         def get_by_slot(self, key):
             return loop if key == orphan_slot and not removed else None
 
-        async def deactivate_and_wait(self, loop_id):
+        async def deactivate_and_wait(self, loop_id, *, stopped_reason=None):
             assert loop_id == loop.id
+            stop_reasons.append(stopped_reason)
             loop.active = False
             return True
 
-        async def remove(self, loop_id):
+        async def remove(self, loop_id, *, stop_reason=""):
             removed.append(loop_id)
             loop.active = False
 
@@ -14247,6 +14273,7 @@ async def test_create_cleanup_removes_a_fully_orphaned_execution_loop(tmp_path, 
         state.slot = None
         return True
 
+    stop_reasons: list[str | None] = []
     service = _Svc()
     monkeypatch.setattr(routes, "_autonudge_instance", lambda: service)
     monkeypatch.setattr(routes, "_AutoNudgeService", _maintenance_loader(service))
@@ -14257,6 +14284,7 @@ async def test_create_cleanup_removes_a_fully_orphaned_execution_loop(tmp_path, 
     assert await routes._remove_orphaned_executions(state) == {orphan_slot}
 
     assert removed == [loop.id]
+    assert stop_reasons == ["orphaned_worker"]
     assert torn_down == [orphan_slot_state]
     token = routes._reserve_pending_dispatch("/new/spec", "spec-builder-n-deadbeef", "n")
     assert token
@@ -14299,13 +14327,13 @@ async def test_create_cleanup_rechecks_a_slot_materialized_while_its_loop_quiesc
         def get_by_slot(self, key):
             return loop if key == orphan_slot else None
 
-        async def deactivate_and_wait(self, loop_id):
+        async def deactivate_and_wait(self, loop_id, *, stopped_reason=None):
             assert loop_id == loop.id
             loop.active = False
             state.slot = published
             return True
 
-        async def remove(self, loop_id):
+        async def remove(self, loop_id, *, stop_reason=""):
             assert loop_id == loop.id
 
     async def _teardown(_state, _name, *, only_slot, require_archive):
@@ -14352,12 +14380,12 @@ async def test_create_cleanup_keeps_a_quiesced_loop_until_worker_archive_succeed
         def get_by_slot(self, key):
             return loop if key == orphan_slot else None
 
-        async def deactivate_and_wait(self, loop_id):
+        async def deactivate_and_wait(self, loop_id, *, stopped_reason=None):
             assert loop_id == loop.id
             loop.active = False
             return True
 
-        async def remove(self, loop_id):
+        async def remove(self, loop_id, *, stop_reason=""):
             removed.append(loop_id)
 
     async def _failed_archive(*_args, **_kwargs):
@@ -14400,12 +14428,12 @@ async def test_create_cleanup_loads_durable_loops_when_autonudge_is_disabled(tmp
         def get_by_slot(self, key):
             return loop if key == orphan_slot else None
 
-        async def deactivate_and_wait(self, loop_id):
+        async def deactivate_and_wait(self, loop_id, *, stopped_reason=None):
             assert loop_id == loop.id
             loop.active = False
             return True
 
-        async def remove(self, loop_id):
+        async def remove(self, loop_id, *, stop_reason=""):
             removed.append(loop_id)
 
     offline = _OfflineSvc()
@@ -14878,6 +14906,7 @@ async def test_stale_stop_does_not_revoke_the_current_creation_claim(tmp_path, m
         halted.append("halted")
 
     monkeypatch.setattr(routes, "_halt_execution", _halt)
+    client.app["state"] = _NoConfiguredOwner()
     await client.start_server()
     try:
         response = await client.post(
@@ -15167,6 +15196,7 @@ async def test_teardown_targets_an_idle_published_autonudge_after_identity_rewri
         stop_sentinel_path=Path(spec_dir) / "STOP",
     )
     removed: list[str] = []
+    reasons: list[str] = []
 
     class _Svc:
         def list_all(self):
@@ -15175,8 +15205,9 @@ async def test_teardown_targets_an_idle_published_autonudge_after_identity_rewri
         def get_by_slot(self, key):
             return loop if key == old_slot_key and loop.active else None
 
-        async def remove(self, loop_id):
+        async def remove(self, loop_id, *, stop_reason=""):
             removed.append(loop_id)
+            reasons.append(stop_reason)
             loop.active = False
 
     class _State:
@@ -15226,6 +15257,7 @@ async def test_teardown_targets_an_idle_published_autonudge_after_identity_rewri
 
     assert response.status == 200, payload
     assert removed == [loop.id]
+    assert reasons == ["spec_stopped" if operation == "stop" else "spec_deleted"]
     assert loop.active is False
     if operation == "delete":
         assert old_slot_key not in routes._OBSERVED_SPEC_DIRS
@@ -15265,7 +15297,7 @@ async def test_stop_arriving_during_authorization_unwinds_before_dispatch(tmp_pa
         def get_by_slot(self, _key):
             return loop if loop.active else None
 
-        async def remove(self, loop_id):
+        async def remove(self, loop_id, *, stop_reason=""):
             removed.append(loop_id)
             loop.active = False
 
@@ -15497,7 +15529,7 @@ async def test_an_alias_mid_turn_blocks_a_handoff(tmp_path, monkeypatch):
 
     released: list = []
 
-    async def _remove(_slot_key, *, only_loop_id=None):
+    async def _remove(_slot_key, *, only_loop_id=None, stop_reason=""):
         released.append(only_loop_id)
 
     monkeypatch.setattr(routes, "_remove_nudge_loop_for_slot", _remove)
@@ -15547,7 +15579,7 @@ async def test_a_completed_alias_turn_during_authorization_blocks_a_handoff(tmp_
     monkeypatch.setattr(routes, "_dispatch_turn", lambda *a, **k: dispatched.append(a[2]))
     released: list[str] = []
 
-    async def _remove(_slot_key, *, only_loop_id=None):
+    async def _remove(_slot_key, *, only_loop_id=None, stop_reason=""):
         released.append(only_loop_id)
 
     monkeypatch.setattr(routes, "_remove_nudge_loop_for_slot", _remove)
@@ -15590,7 +15622,7 @@ async def test_handoff_refuses_when_its_own_slot_starts_during_authorization(tmp
     monkeypatch.setattr(routes, "_dispatch_turn", lambda *a, **k: dispatched.append(a[2]))
     released: list[str] = []
 
-    async def _remove(_slot_key, *, only_loop_id=None):
+    async def _remove(_slot_key, *, only_loop_id=None, stop_reason=""):
         released.append(only_loop_id)
 
     monkeypatch.setattr(routes, "_remove_nudge_loop_for_slot", _remove)
@@ -15638,7 +15670,7 @@ async def test_handoff_refuses_when_its_own_slot_starts_during_the_final_repin(
     monkeypatch.setattr(routes, "_dispatch_turn", lambda *a, **k: dispatched.append(a[2]))
     released: list[str] = []
 
-    async def _remove(_slot_key, *, only_loop_id=None):
+    async def _remove(_slot_key, *, only_loop_id=None, stop_reason=""):
         released.append(only_loop_id)
 
     monkeypatch.setattr(routes, "_remove_nudge_loop_for_slot", _remove)
@@ -17097,3 +17129,168 @@ async def test_create_refuses_an_unreadable_ledger_before_inserting(
     assert body["code"] == "decision_record_unreadable"
     assert routes._load_index() == {}
     assert dispatched == []
+
+
+# ── owner gate on execute / handoff / stop ───────────────────────────────────
+
+_GATE_OWNER = "owner-subject"
+_GATE_NON_OWNER = "allowlisted-messaging-user"
+
+
+class _ConfiguredOwnerState:
+    """A state with a configured owner, so a different subject is a non-owner."""
+
+    owner_id = _GATE_OWNER
+
+    def get_or_create_slot(self, name, app=""):
+        raise AssertionError("an owner-gated route acquired a worker slot")
+
+    def get_slot(self, key):
+        return None
+
+
+def _claims_mw(user: str, app_claim: str):
+    @web.middleware
+    async def _mw(request, handler):
+        request["user"] = user
+        request["app"] = app_claim
+        return await handler(request)
+
+    return _mw
+
+
+def _gated_client(monkeypatch, tmp_path, user: str, app_claim: str) -> TestClient:
+    _redirect_state(monkeypatch, tmp_path)
+    app = web.Application(middlewares=[_claims_mw(user, app_claim)])
+    routes.register_routes(app)
+    app["state"] = _ConfiguredOwnerState()
+    return TestClient(TestServer(app))
+
+
+def _gated_spec(tmp_path) -> Path:
+    spec_dir = tmp_path / "wd" / ".kiro" / "specs" / "s"
+    spec_dir.mkdir(parents=True)
+    (spec_dir / "tasks.md").write_text("- [ ] task")
+    routes._save_index(
+        {
+            "s": {
+                "spec_dir": str(spec_dir),
+                "working_dir": str(tmp_path / "wd"),
+                "slot_key": "spec-builder-s",
+            }
+        }
+    )
+    return spec_dir
+
+
+def _record_side_effects(monkeypatch) -> list[str]:
+    effects: list[str] = []
+
+    def _sync(label):
+        def _spy(*_a, **_k):
+            effects.append(label)
+            return (False, "")
+
+        return _spy
+
+    def _async(label):
+        async def _spy(*_a, **_k):
+            effects.append(label)
+            return None, "recorded by test", 403
+
+        return _spy
+
+    monkeypatch.setattr(routes, "_prepare_handoff", _sync("prepare_handoff"))
+    monkeypatch.setattr(routes, "_autonudge_instance", lambda: object())
+    monkeypatch.setattr(routes, "authorize_and_add_nudge", _async("arm"))
+    monkeypatch.setattr(routes, "_dispatch_turn", _sync("dispatch"))
+    monkeypatch.setattr(routes, "_halt_execution", _async("halt"))
+    monkeypatch.setattr(routes, "_remove_nudge_loop_for_slot", _async("remove_loop"))
+    monkeypatch.setattr(routes, "_halt_active_turn", _async("halt_turn"))
+    return effects
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("verb", ["execute", "handoff"])
+async def test_non_owner_dashboard_subject_cannot_execute_or_handoff(verb, tmp_path, monkeypatch):
+    """An allow-listed non-owner holds a dashboard credential with an empty app
+    claim. Arming the run's loop makes its message the owner session's next turn,
+    so it gets the owner gate's 403 before anything -- including the STOP-sentinel
+    clear in _prepare_handoff -- runs."""
+    client = _gated_client(monkeypatch, tmp_path, _GATE_NON_OWNER, "")
+    spec_dir = _gated_spec(tmp_path)
+    effects = _record_side_effects(monkeypatch)
+
+    await client.start_server()
+    try:
+        resp = await client.post(
+            f"{_BASE}/specs/s/{verb}",
+            json={"spec_dir": str(spec_dir), "slot_key": "spec-builder-s"},
+        )
+        body = await resp.json()
+    finally:
+        await client.close()
+
+    assert (resp.status, body.get("code")) == (403, "owner_only"), (resp.status, body)
+    assert effects == [], f"a non-owner {verb} reached {effects}"
+
+
+@pytest.mark.asyncio
+async def test_non_owner_dashboard_subject_cannot_stop_spec_execution(tmp_path, monkeypatch):
+    """Stop removes the owner session's loop, the partner of arming it, so a
+    non-owner is refused before any halt, loop removal or STOP write."""
+    client = _gated_client(monkeypatch, tmp_path, _GATE_NON_OWNER, "")
+    spec_dir = _gated_spec(tmp_path)
+    effects = _record_side_effects(monkeypatch)
+
+    await client.start_server()
+    try:
+        resp = await client.post(
+            f"{_BASE}/specs/s/stop",
+            json={"spec_dir": str(spec_dir), "slot_key": "spec-builder-s"},
+        )
+        body = await resp.json()
+    finally:
+        await client.close()
+
+    assert (resp.status, body.get("code")) == (403, "owner_only"), (resp.status, body)
+    assert effects == [], f"a non-owner stop reached {effects}"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("verb", ["execute", "handoff", "stop"])
+async def test_spec_app_token_cannot_execute_handoff_or_stop(verb, tmp_path, monkeypatch):
+    """The same refusal POST /api/autonudge gives an app token: even this app's
+    own token carries the owner's subject but is not the owner's dashboard."""
+    client = _gated_client(monkeypatch, tmp_path, _GATE_OWNER, "spec-builder")
+    spec_dir = _gated_spec(tmp_path)
+    effects = _record_side_effects(monkeypatch)
+
+    await client.start_server()
+    try:
+        resp = await client.post(
+            f"{_BASE}/specs/s/{verb}",
+            json={"spec_dir": str(spec_dir), "slot_key": "spec-builder-s"},
+        )
+        body = await resp.json()
+    finally:
+        await client.close()
+
+    assert (resp.status, body.get("code")) == (403, "owner_only"), (resp.status, body)
+    assert effects == [], f"an app token {verb} reached {effects}"
+
+
+@pytest.mark.asyncio
+async def test_non_owner_keeps_the_ungated_spec_routes(tmp_path, monkeypatch):
+    """Only execute, handoff and stop take the owner gate; listing specs keeps
+    its current callers."""
+    client = _gated_client(monkeypatch, tmp_path, _GATE_NON_OWNER, "")
+    _gated_spec(tmp_path)
+
+    await client.start_server()
+    try:
+        resp = await client.get(f"{_BASE}/specs")
+    finally:
+        await client.close()
+
+    assert resp.status == 200, resp.status

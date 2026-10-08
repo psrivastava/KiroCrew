@@ -11,7 +11,7 @@ install (see Managed compiler), so `pip install kirocrew` does not ship a
 broken-by-default editor. Compiler output is parsed into a clickable
 diagnostics list that jumps the editor to the offending line. A paper can be
 cloned from any git remote and committed/pulled/pushed from the toolbar. The
-co-author panel is a real KiroCrew chat session scoped to the paper, so the agent
+co-author panel is a real Kiro Crew chat session scoped to the paper, so the agent
 edits the LaTeX while the user watches the PDF update.
 
 Ported from a standalone app by **tricatte**; see
@@ -21,10 +21,11 @@ changed.
 ## Routes
 
 All routes live under `/api/apps/papyrus/` and are registered by
-`apps/builtins/papyrus/backend/routes.py:register_routes`. Every handler is
-wrapped in `_require_enabled` (403 while the app is disabled) — pinned by
-`test_routes.py::TestRouteRegistration`, since routes are registered once at
-gateway startup and an unwrapped one would answer regardless of the opt-in.
+`src/kiro_crew/apps/builtins/papyrus/backend/routes.py:register_routes`. Every handler is
+wrapped in `_require_enabled`, which answers 403 `app_disabled` while the app is disabled
+and then 403 `owner_only` to anyone but the dashboard owner (see Caller authorization) —
+pinned by `test/test_papyrus_routes.py::TestRouteRegistration`, since routes are registered
+once at gateway startup and an unwrapped one would answer regardless of the opt-in.
 
 | Method | Path | Purpose |
 |--------|------|---------|
@@ -34,7 +35,7 @@ gateway startup and an unwrapped one would answer regardless of the opt-in.
 | POST | `/projects` | Create a paper from the standard `article` template (or a supplied `template`) |
 | POST | `/projects/clone` | Shallow-clone a git remote as a paper. A repo with no `.tex` is rejected **and removed**, so the name is not held hostage by an unopenable project |
 | GET | `/project` | Resolved main document + file list + PDF presence |
-| DELETE | `/project` | Delete a paper and its tree. **500 `project_delete_incomplete`** when the tree survives the removal — the old `ignore_errors` path answered `ok: true` over a partial delete, so the name stayed taken with no explanation |
+| DELETE | `/project` | Delete a paper and its tree. **500 `project_delete_incomplete`** when the tree survives the removal, rather than answering `ok: true` over a partial delete that leaves the name taken with no explanation |
 | GET | `/files` | The paper's file list |
 | GET | `/file` | Read one file as UTF-8 text |
 | PUT | `/file` | Save one file (atomic, `newline=""`) |
@@ -55,7 +56,8 @@ All data under `app_data_dir("papyrus")` (typically
 `~/.kiro/crew/apps/papyrus/data/`):
 
 ```
-vendor/tectonic/tectonic    # the managed compiler (see Managed compiler)
+vendor/tectonic/tectonic      # managed compiler on POSIX (see Managed compiler)
+vendor/tectonic/tectonic.exe  # managed compiler on Windows
 projects/<name>/
   main.tex                  # or whatever .papyrus.json names
   references.bib
@@ -69,9 +71,33 @@ as **one slug segment** (`PROJECT_NAME_RE`), so it can never contribute a path
 separator, a `..`, a drive letter, or a leading dash that a later `git`/`pdflatex`
 argv could read as an option. Normalization never launders a traversal into an
 accepted name — pinned by
-`test_store.py::TestSafeProjectDir::test_normalize_does_not_make_a_traversal_safe`.
+`test/test_papyrus_store.py::TestSafeProjectDir::test_normalize_does_not_make_a_traversal_safe`.
 
 ## Security model
+
+### Caller authorization (owner only)
+
+Every route, reads included, is for the dashboard owner alone. The papers are the
+owner's private drafts, and the git routes run with the owner's own git credentials, so
+a caller who can reach any one route can read, overwrite or publish the owner's work.
+
+`_require_enabled` runs two checks in order. A disabled app answers 403 `app_disabled`
+to everyone. Then `require_owner_dashboard_request` (`dashboard/handlers/_shared.py`)
+lets only the owner through and answers everyone else with 403 `owner_only`, writing a
+SEL denial record named `papyrus.<route>`. The same wrapper covers all 19 routes, so a
+route added to `register_routes` cannot skip the gate.
+
+| Caller | Result |
+|--------|--------|
+| Dashboard owner (session cookie, `app == ""`) | allowed |
+| Non-owner dashboard subject | 403 `owner_only` |
+| Any app token, Papyrus's own included | 403 `owner_only` |
+| Internal caller with no app claim | 403 `owner_only` |
+
+App tokens are refused because nothing calls these routes with one: the page
+(`website/src/apps/papyrus/api.ts`) fetches with the owner's session cookie, and the
+co-author agent edits the project with its own file tools (see Skill). Pinned by
+`test/test_papyrus_routes.py::TestOwnerGate`.
 
 ### Path containment (`store.py` is the gate)
 
@@ -80,25 +106,25 @@ external compiler, so two functions own every filesystem decision:
 
 - **`safe_project_dir(name)`** — the name must match `PROJECT_NAME_RE`; a
   **symlink OR Windows junction at the project entry is refused outright** (like
-  `_config_path`: this is a directory KiroCrew creates, so a link there is
+  `_config_path`: this is a directory Kiro Crew creates, so a link there is
   illegitimate wherever it points); and the resolved directory must be a **strict
   child** of `projects_dir()`.
 
   Junctions matter because `is_symlink()` does not report them — they are reparse
   points — and they are the link type a Windows user can create WITHOUT elevation.
-  A symlink-only guard was therefore bypassable on exactly the platform this app
-  now supports. `store.is_reparse_link` is the shared answer (used here and by
+  A symlink-only guard would therefore be bypassable on exactly the platform this
+  app supports. `store.is_reparse_link` is the shared answer (used here and by
   `gitops`'s attributes guard) so the two cannot drift on which link types they
   cover; `os.path.isjunction` is 3.12+ and always `False` off Windows, resolved
   once via `getattr` the same way `apps/manager.py` does.
 
-  The strictness is load-bearing. The check previously read
-  `resolved != base_resolved and base_resolved not in resolved.parents`, and
-  `projects/<name> -> .` satisfied the first disjunct exactly — resolving the
-  "project" to the projects ROOT. Every other paper then counted as a child, so
-  `safe_child` accepted `other-paper/main.tex` as an in-project path (cross-project
-  read **and** write), and `DELETE /project` ran `rmtree` on the projects root,
-  destroying every paper. `projects_dir` itself is never a project, so nothing
+  The strictness is load-bearing. A check of the form
+  `resolved != base_resolved and base_resolved not in resolved.parents` would let
+  `projects/<name> -> .` satisfy the first disjunct exactly, resolving the
+  "project" to the projects ROOT. Every other paper would then count as a child, so
+  `safe_child` would accept `other-paper/main.tex` as an in-project path
+  (cross-project read **and** write), and `DELETE /project` would run `rmtree` on
+  the projects root, destroying every paper. `projects_dir` itself is never a project, so nothing
   legitimate needed the equality case.
 - **`safe_child(project, relative)`** — rejects empty/over-long paths, absolute
   POSIX **and** Windows/UNC paths, **backslashes anywhere** (a separator on
@@ -144,7 +170,7 @@ The per-project config arrives **inside a cloned repository**, so it is untruste
 input. `get_main_file` re-validates the configured value through `safe_child` on
 **every read** and ignores it on failure — without that, a hostile repo naming
 `../../etc/passwd.tex` would pivot through the PDF-serving route. Pinned by
-`test_store.py::TestMainFile`.
+`test/test_papyrus_store.py::TestMainFile`.
 
 ### The compiler is never given shell escape
 
@@ -154,14 +180,14 @@ and a `.tex` here is untrusted by construction (the agent writes it; a cloned re
 supplies it wholesale). Tectonic keeps shell escape off unless `-Z shell-escape`
 is passed, and we never pass it. The document is passed after `--` so a
 dash-leading filename cannot become an option. Pinned by
-`test_papyrus_latex.py::TestCompilerArgv`.
+`test/test_papyrus_latex.py::TestCompilerArgv`.
 
 ### Spawn discipline
 
 Every compiler and git invocation routes through
 `sandbox.sandboxed_spawn_argv` (OS-level sandbox + credential-scrubbed env) and
-carries `sandbox.resource_limit_preexec()`, so a runaway macro expansion or a
-hostile repo hook hits a kernel ceiling rather than the host's memory. The
+spawns through `sandbox.create_subprocess_limited`, so a runaway macro expansion
+or a hostile repo hook hits a kernel ceiling rather than the host's memory. The
 environment handed to a LaTeX child is `apps.registry.minimal_env` plus only the
 TeX-specific variables (`TEXMFHOME`, `TEXINPUTS`, …) — never the gateway's own,
 so Slack/AWS credentials cannot reach a child running untrusted document content.
@@ -174,17 +200,17 @@ The PDF is content the agent or a cloned repo produced, so
 `GET /pdf` responds with `Content-Disposition: inline`,
 `Content-Security-Policy: sandbox; default-src 'none'; object-src 'none'`,
 `X-Content-Type-Options: nosniff` and `Cache-Control: no-store`. It therefore
-cannot script the dashboard's origin. Pinned by `test_routes.py::TestPdf`.
+cannot script the dashboard's origin. Pinned by `test/test_papyrus_routes.py::TestPdf`.
 
 That **per-response** header is the containment, and it does not depend on which
 element embeds the document — which matters, because the pane embeds the PDF in an
 **`<iframe>`, not an `<object>`**. The dashboard's own base CSP
-(`dashboard/server.py`) sets `object-src 'none'`, so Chromium and Firefox refused
-the plugin document and the app's headline feature rendered its
-"cannot display a PDF inline" fallback; it went unnoticed because WebKit does not
-enforce the directive for this case, so it worked in Safari. `frame-src 'self'`
-already permits a same-origin frame, so no CSP was widened. The download
-affordance is now persistent chrome rather than replaced content, since an
+(`dashboard/server.py`) sets `object-src 'none'`, so Chromium and Firefox refuse
+an `<object>` plugin document and would render the "cannot display a PDF inline"
+fallback; WebKit does not enforce the directive for this case, which hides the
+failure in Safari. `frame-src 'self'` permits a same-origin frame, so no CSP is
+widened. The download affordance is persistent chrome rather than replaced
+content, since an
 `<iframe>` has no fallback children. Pinned by
 `website/src/test/PapyrusPdfPreview.test.tsx`.
 
@@ -216,8 +242,8 @@ app was a stdlib `ThreadingHTTPServer` on its own port using blocking
   shape;
 - the compiler download itself runs on a daemon thread, not the loop and not a
   pooled executor (see Managed compiler). Pinned by
-  `test_papyrus_tectonic.py::TestEventLoopDiscipline` and
-  `test_routes.py::TestProvisionCompiler::test_the_handler_never_blocks_the_event_loop`.
+  `test/test_papyrus_tectonic.py::TestEventLoopDiscipline` and
+  `test/test_papyrus_routes.py::TestProvisionCompiler::test_the_handler_never_blocks_the_event_loop`.
 
 ### Offloading the gate without weakening it
 
@@ -229,9 +255,9 @@ Two rules hold:
   filesystem work that validation permits into ONE sync closure behind a single
   `asyncio.to_thread`. Splitting them across two hops would put an `await` between
   the check and the use, letting another request interleave — so grouping makes the
-  check/use window strictly *narrower* than it was when the gate ran inline. `GET
-  /pdf` gains the most: the `is_file()` probe and the `read_bytes()` that follows it
-  are now in one closure instead of two hops.
+  check/use window strictly *narrower* than running the gate inline. In `GET
+  /pdf` the `is_file()` probe and the `read_bytes()` that follows it share one
+  closure.
 - **Validation-only hop where grouping is impossible.** `POST /projects/clone`,
   `POST /compile` and the four `git` routes cannot group, because the "use" is an
   `await` on a subprocess that needs the validated path. They take one hop for the
@@ -245,7 +271,7 @@ subclasses none of `ValueError` / `OSError` / `FileExistsError` / `store.PathRej
 cannot be swallowed into a 500. That is asserted, not assumed
 (`TestHttpExceptionsAreNotSwallowed`).
 
-Pinned by `test_papyrus_routes.py::TestNoBlockingCallsOnTheLoop`, an **AST** walk
+Pinned by `test/test_papyrus_routes.py::TestNoBlockingCallsOnTheLoop`, an **AST** walk
 over every `async def` in `routes.py` that fails if one *calls* a known-blocking
 helper (naming it as an `asyncio.to_thread` argument is allowed, and a nested sync
 closure is skipped because that is what the worker runs). A new handler that
@@ -265,7 +291,7 @@ a refused name never reaches `gitops` or the compiler.
    process-wide, including the negative result, so a successful provision MUST call
    `reset_compiler_cache()` or the stale "no compiler" answer sticks (it does, from
    the provisioning job's completion). Pinned by
-   `test_papyrus_tectonic.py::TestResolutionOrder`.
+   `test/test_papyrus_tectonic.py::TestResolutionOrder`.
 3. Extend `BSTINPUTS`/`BIBINPUTS` with **every** project subdirectory holding a
    `.bst`/`.bib`. Conference templates stash `acl_natbib.bst` under
    `templates/<conf>/`, and without this bibtex fails with "I couldn't open style
@@ -278,7 +304,10 @@ a refused name never reaches `gitops` or the compiler.
 5. Without a bibliography, re-run once if the log says "Rerun to get…" — how a
    table of contents or a `\ref` settles. Not retried when the pass **failed**: a
    failing pass that also asks to rerun is broken, not merely unsettled.
-6. `ok` requires exit 0 **and** a PDF on disk — `pdflatex` can exit 0 having
+6. Both compilers write output in the project root, including when the main
+   document is in a subdirectory. Tectonic receives `--outdir` explicitly so
+   compilation and the PDF-serving path resolve the same file.
+7. `ok` requires exit 0 **and** a PDF on disk — `pdflatex` can exit 0 having
    produced nothing usable.
 
 ### Log parsing
@@ -296,7 +325,7 @@ a refused name never reaches `gitops` or the compiler.
 is bounded to the text before the next `^!`; without that bound the second error
 inherits the first's line and the editor jumps somewhere wrong while looking
 authoritative. Carried over from upstream and pinned by
-`test_papyrus_latex.py::test_two_bangs_do_not_share_a_line`.
+`test/test_papyrus_latex.py::test_two_bangs_do_not_share_a_line`.
 
 ## Managed compiler
 
@@ -382,10 +411,10 @@ empty names. Beyond names:
   device/FIFO members have no business in a compiler tarball. Ownership is dropped
   and the mode normalized, so **setuid can never survive extraction**. The check
   runs as stdlib's own `filter=` callable so it happens INSIDE `extractall` with no
-  TOCTOU gap; on **Python 3.10**, which this project still supports and where
-  `filter="data"` does not exist, the same callable is applied to every member and
-  the extraction restricted to the validated list (the `TypeError` fallback shape
-  `snapshot.py` already uses). Both legs are tested.
+  TOCTOU gap. A retained compatibility fallback applies the same callable to every
+  member and restricts extraction to the validated list if `tarfile.extractall`
+  rejects `filter=`. The project requires Python 3.12, and the fallback stays
+  tested so it cannot silently rot.
 - **zip**: `ZipFile` has no filter hook, so validation is explicit and runs over
   the whole `infolist` **before any member is written** — a hostile archive lands
   nothing at all. A Unix `S_IFLNK` mode smuggled in `external_attr` (zip's only way
@@ -399,7 +428,7 @@ empty names. Beyond names:
 - Both cap a member at `_MAX_MEMBER_BYTES` (256MB), bounding a decompression bomb
   even though the digest pin already means the archive can only be the named one.
 
-Pinned by `test_papyrus_tectonic.py::TestSafeTarExtraction` / `TestSafeZipExtraction`,
+Pinned by `test/test_papyrus_tectonic.py::TestSafeTarExtraction` / `TestSafeZipExtraction`,
 including that a refused archive leaves the destination empty and writes nothing
 outside it.
 
@@ -442,7 +471,7 @@ half-written file can never read as a usable compiler.
   exactly as it was. **If the stash pop itself conflicts the stash is deliberately
   KEPT** and reported (409) — silently discarding the user's edits to let the
   operation "succeed" is the worse outcome. Pinned by
-  `test_papyrus_gitops.py::test_a_failed_pop_keeps_the_stash`.
+  `test/test_papyrus_gitops.py::TestPull::test_a_failed_pop_keeps_the_stash`.
 
   **Every** post-stash failure path restores the stash, including the ones that
   raise from inside `_git` rather than returning a non-zero code — a pull that
@@ -451,7 +480,7 @@ half-written file can never read as a usable compiler.
   user would be handed an apparently-clean tree with their work parked in an
   unannounced `papyrus-pull-autostash` stash — indistinguishable from "my edits
   vanished". The recovery pop is best-effort and never masks the original error.
-  Pinned by `test_papyrus_gitops.py::TestPull::test_a_raising_pull_still_restores_the_stash`
+  Pinned by `test/test_papyrus_gitops.py::TestPull::test_a_raising_pull_still_restores_the_stash`
   and `::test_a_failed_recovery_pop_does_not_mask_the_pull_error`.
 - **Push** — auth failures are classified across transports (`_AUTH_MARKERS`) and
   surface as **401**, so the UI can say "log in" rather than "something broke".
@@ -496,7 +525,7 @@ cannot reach:
   `attributes -> /dev/null` made the pin unobservable AND unwritable (silently
   inert forever), and `attributes -> <any file>` turned a `GET /git` status poll
   into an arbitrary-file append that also read the victim's contents back. Both
-  **All three** of `.git`, `.git/info` and `.git/info/attributes` are now refused
+  **All three** of `.git`, `.git/info` and `.git/info/attributes` are refused
   if any is a link — symlink **or Windows junction**, via the shared
   `store.is_reparse_link`. Each segment needs its own check for a different reason:
   `mkdir(exist_ok=True)` is a no-op on a directory link, so `info` would silently
@@ -504,7 +533,7 @@ cannot reach:
   indirection — point it at another repository and `info`/`attributes` are
   legitimate non-links *inside that repo*, so both inner checks pass while a status
   poll rewrites a different repository's attributes, outside the project entirely.
-  The rule holds for every segment KiroCrew traverses by name, not just the leaf.
+  The rule holds for every segment Kiro Crew traverses by name, not just the leaf.
 - **The rewrite preserves the existing mode.** `atomic_write` renames a fresh temp
   file into place, so without carrying the mode across, a user who had tightened
   `.git/info/attributes` to 0600 would find it 0644 after any status poll — a
@@ -538,9 +567,20 @@ Two views behind one route:
 - **No paper open** → `ProjectList`, which carries the standard page layout
   (`PageHeader` + `px-6 pb-8 overflow-y-auto flex-1 min-h-0` + a `StatCard` row +
   `Card`/`CardTitle`/`InfoTip` sections + a `table-striped` table + `EmptyState`).
-- **A paper open** → a full-bleed split workspace (file tree, Monaco, diagnostics
+- **A paper open** → a full-bleed split workspace (file tree, Pierre, diagnostics
   | PDF | optional co-author panel) with its own toolbar. A paper and its PDF need
   the whole viewport, which is why the editor is not inside the page container.
+
+  On a desktop viewport the tree, PDF and co-author columns are drag-resizable
+  (`useColumnResize` + `ResizeHandle`) and their widths persist in
+  `localStorage`; the editor takes what is left. The tree also collapses to a
+  narrow rail, and that collapsed flag persists. The PDF column is capped at
+  `PDF_MAX_VIEWPORT_SHARE` (half the viewport), and the co-author panel's ceiling
+  yields to the tree and PDF so the editor keeps at least `MIN_EDITOR_WIDTH`
+  (280px). Whether the co-author panel is open persists too (`CHAT_OPEN_KEY`),
+  read and written only on a desktop viewport: on a narrow viewport the panel
+  covers the pane, so it opens closed and closing it there does not rewrite the
+  desktop layout.
 
 Dependency decisions, both deliberate:
 
@@ -558,11 +598,11 @@ Dependency decisions, both deliberate:
   plus a worker chunk and a hand-written text layer to reproduce what Chrome,
   Firefox, Safari and Edge all do natively (selection, find-in-page, zoom,
   thumbnails, print). This repo has no PDF renderer today and adding one to
-  reimplement a built-in viewer is not a trade worth making. `<object>` (not
-  `<iframe>`) so `onError`/fallback content can offer a download when a browser
-  genuinely cannot render inline. The URL carries a version counter, because the
-  same-URL document would otherwise be served from the in-page cache and a
-  recompile would appear to do nothing.
+  reimplement a built-in viewer is not a trade worth making. The pane uses an
+  `<iframe>`, not an `<object>`, because the dashboard CSP sets `object-src 'none'`;
+  a persistent download link below the frame is the viewer-less-browser fallback.
+  The URL carries a version counter, because the same-URL document would otherwise
+  be served from the in-page cache and a recompile would appear to do nothing.
 
 ### Leaving a file always flushes it
 
@@ -596,7 +636,7 @@ Other conventions: React Query owns all server state; the only local state is th
 editor buffer and which pane is open. Framer Motion animates the diagnostics
 drawer and the chat panel. Lucide icons only, zero emoji. Rows are `<Clickable>`;
 icon-only buttons carry `aria-label`. Every user-facing string is a
-`apps.papyrus.*` catalog key in all 11 locales.
+`apps.papyrus.*` catalog key in all 12 user-selectable locales (and the dev-only pseudolocale).
 
 ### Co-author session
 
@@ -644,73 +684,64 @@ copy is what actually reaches users.
 
 ## Platform
 
-`app.json` declares `platform.os: ["macos", "linux", "windows"]`. Windows was
-added after the port; what it took, and what it did NOT, is worth recording
-because the guess ("Windows means work in `tectonic.py`") was wrong in both
-directions.
+`app.json` declares `platform.os: ["macos", "linux", "windows"]`. The Windows
+support does not live in `tectonic.py`. The managed compiler already handles
+Windows (a pinned `x86_64-pc-windows-msvc` asset, the `.zip` extraction leg,
+`tectonic.exe`, `chmod` via `platform_compat.chmod_safe`), and process handling
+throughout uses no bare `fcntl`/`os.killpg`/`signal.SIGKILL`:
+`start_new_session=IS_POSIX` + `creationflags=CREATE_NEW_PROCESS_GROUP`, and
+kills via `platform_compat.kill_process_tree_async`.
 
-**Already correct at merge:** the managed compiler (a pinned
-`x86_64-pc-windows-msvc` asset, the `.zip` extraction leg, `tectonic.exe`,
-`chmod` via `platform_compat.chmod_safe`), and process handling throughout —
-no bare `fcntl`/`os.killpg`/`signal.SIGKILL`, `start_new_session=IS_POSIX`
-+ `creationflags=CREATE_NEW_PROCESS_GROUP`, and kills via
-`platform_compat.kill_process_tree_async`.
-
-**What actually had to change, none of it in `tectonic.py`:**
+The Windows-specific contract lives in these places:
 
 - **The sandbox chokepoint.** Windows has no sandbox backend (user namespaces are
   Linux, `sandbox-exec` is macOS), so `wrap_argv` fail-closes with
-  `SandboxUnavailableError` — and both spawn sites called
-  `sandboxed_spawn_argv` OUTSIDE their `try`, so it escaped as an unhandled 500
-  on **every** compile, clone, commit, push and pull. The refusal is now
-  translated, not bypassed: `latex` returns `CompileResult.sandbox_error` →
-  422 `compiler_sandbox_unavailable`, and `gitops` raises
-  `GitSandboxUnavailable` (a `GitError` subclass, so existing handlers keep
+  `SandboxUnavailableError`. Both spawn sites translate that refusal instead of
+  letting it escape as an unhandled 500: `latex` returns
+  `CompileResult.sandbox_error` → 422 `compiler_sandbox_unavailable`, and `gitops`
+  raises `GitSandboxUnavailable` (a `GitError` subclass, so existing handlers keep
   working) → 422 `git_sandbox_unavailable`. Both carry the sandbox layer's own
   remedy text, which names the `agent.sandbox_allow_unsandboxed_exec` setting that
   `docs/guides/windows-install.md` documents for this host. On Windows these 422s
   are reached only where that key is declared `false` or a governance
-  `sandbox.min_level` floor is pinned, since the platform default permits the spawn. Bypassing the wrap was
-  rejected: `strict` mode is what stops `\input{../../.aws/credentials}` from
-  typesetting the operator's keys into the PDF, and `gitops` runs `standard`
-  precisely so an SSH push can see the key.
-- **`minimal_env`'s allowlist** (`apps/registry.py`) needed two fixes, and this one
-  fails early and opaquely rather than loudly: a Windows child without `SystemRoot`
-  usually dies before `main()` (DLL/crypto init resolves through it), and one
-  without `USERPROFILE` cannot resolve `TEXMFHOME`.
-  1. The list was POSIX-only. The Windows location hints are now allowlisted
-     alongside the POSIX ones (same set and reason as
-     `kiro_prerequisite._SAFE_ENV_KEYS`).
-  2. The match was case-SENSITIVE, which made (1) inert on the platform it was for:
-     Windows env names are case-insensitive and `os.environ` upper-cases keys, so
-     `items()` yields `SYSTEMROOT` while the list held the documented `SystemRoot`.
-     The comparison now folds **on Windows only** — POSIX keeps `PATH` and `Path`
-     distinct, where a fold would admit a lookalike.
+  `sandbox.min_level` floor is pinned, since the platform default permits the
+  spawn. The wrap is never bypassed: `strict` mode is what stops
+  `\input{../../.aws/credentials}` from typesetting the operator's keys into the
+  PDF, and `gitops` runs `standard` precisely so an SSH push can see the key.
+- **`minimal_env`'s allowlist** (`apps/registry_pipeline/subprocess_env.py`). A
+  missing key here fails early and opaquely rather than loudly: a Windows child
+  without `SystemRoot` usually dies before `main()` (DLL/crypto init resolves
+  through it), and one without `USERPROFILE` cannot resolve `TEXMFHOME`.
+  1. The Windows location hints are allowlisted alongside the POSIX ones in
+     `subprocess_env._SAFE_ENV_KEYS`, matched through
+     `platform_compat.env_key_allowed`.
+  2. The match folds case **on Windows only**. Windows env names are
+     case-insensitive and `os.environ` upper-cases keys, so `items()` yields
+     `SYSTEMROOT` while the list holds the documented `SystemRoot`; a
+     case-sensitive match would make (1) inert there. POSIX keeps `PATH` and
+     `Path` distinct, where a fold would admit a lookalike.
 
-  The fold widens case, never the key set: the credential-scrub property is
-  unchanged, and `TestMinimalEnvHonorsWindowsCaseInsensitivity` pins all three
-  properties.
-- **`os.pathsep`** for `BSTINPUTS`/`BIBINPUTS`. A hardcoded `":"` was both the
-  wrong delimiter on Windows and a splitter of `C:\proj\bib` into two useless
-  fragments — reproducing the "I couldn't open style file" failure that env var
+  The fold widens case, never the key set: the credential-scrub property holds,
+  and `TestMinimalEnvHonorsWindowsCaseInsensitivity` pins all three properties.
+- **`os.pathsep`** for `BSTINPUTS`/`BIBINPUTS`. A hardcoded `":"` would be the
+  wrong delimiter on Windows and would split `C:\proj\bib` into two useless
+  fragments, reproducing the "I couldn't open style file" failure that env var
   exists to prevent.
 - **`platform_compat.rmtree_force`** for every tree that may hold a git checkout.
   Git writes loose objects read-only, and Windows checks the read-only ATTRIBUTE
   on the file being deleted (POSIX consults the parent directory), so
-  `rmtree(..., ignore_errors=True)` silently left `.git/objects` behind while the
-  handler answered `ok: true` — the project name stayed taken and the next create
-  answered 409. Delete now reports `project_delete_incomplete` if the tree
-  survives.
-- **`PlatformConfig`** (`apps/manifest.py`) had no `windows` row in
-  `_OS_TO_PLATFORM`/`_PLATFORM_TO_OS`, so `"windows"` was not expressible in ANY
-  manifest — a declaring app silently matched nothing — and `current_os()`
-  returned the raw `"win32"`. The default stays `["macos", "linux"]`: an app opts
-  in by naming `windows`.
-- **21 `os.symlink` tests** across `test_papyrus_store.py` /
-  `test_papyrus_latex.py` gained the file's existing
-  `skipif(sys.platform == "win32")` guard — symlink creation needs privilege on
+  `rmtree(..., ignore_errors=True)` would silently leave `.git/objects` behind
+  while the handler answered `ok: true`, keeping the project name taken. Delete
+  reports `project_delete_incomplete` if the tree survives.
+- **`PlatformConfig`** (`apps/manifest.py`) carries a `windows` row in
+  `_OS_TO_PLATFORM`/`_PLATFORM_TO_OS`, so `"windows"` is expressible in a
+  manifest and `current_os()` maps `"win32"` to it. The default stays
+  `["macos", "linux"]`: an app opts in by naming `windows`.
+- **`os.symlink` tests** in `test/test_papyrus_store.py` /
+  `test/test_papyrus_latex.py` carry the file's
+  `skipif(sys.platform == "win32")` guard: symlink creation needs privilege on
   Windows, and no papyrus entry exists in `conftest`'s `collect_ignore` or
-  `windows-expected-failures.txt`, so the Windows shard ran them unguarded.
+  `windows-expected-failures.txt`.
 
 Windows-on-ARM remains unsupported by the managed compiler (no upstream asset);
 that host reports `supported: false` and keeps the manual install path.
@@ -733,7 +764,7 @@ that host reports `supported: false` and keeps the manual install path.
 | `.../builtin_skills/papyrus-diagnose-compilation/SKILL.md` | Locate and fix a build failure (error→cause table) |
 | `website/src/apps/papyrus/PapyrusPage.tsx` | Route entry; project list vs. workspace |
 | `website/src/apps/papyrus/ProjectList.tsx` | Landing view (standard page layout) |
-| `website/src/apps/papyrus/PapyrusEditor.tsx` | Monaco source pane + marker push |
+| `website/src/apps/papyrus/PapyrusEditor.tsx` | Pierre source pane + marker push |
 | `website/src/apps/papyrus/PdfPreview.tsx` | Native PDF viewer pane |
 | `website/src/apps/papyrus/FileTree.tsx` | Collapsible source tree |
 | `website/src/apps/papyrus/DiagnosticsList.tsx` | Clickable compiler messages |
@@ -749,23 +780,28 @@ that host reports `supported: false` and keeps the manual install path.
 |------|--------|
 | `test/test_papyrus_store.py` | Traversal/symlink/backslash/NUL defenses, project-name slug rule, **the `.git` refusal (any depth, any case) and the symlinked-project-entry refusal incl. the self-referential `-> .` case**, untrusted `.papyrus.json`, main-document discovery, bounded walk, file I/O |
 | `test/test_papyrus_latex.py` | Log parsing (incl. the two-bangs rule), the `-no-shell-escape` invariant, the pass sequence, timeout kill, compiler discovery + cache, env minimalism (incl. the Windows location hints, and that widening the allowlist admitted no secrets), the platform `os.pathsep` for `BSTINPUTS`, and that a sandbox refusal is reported rather than bypassed |
-| `test/test_papyrus_gitops.py` | URL allowlist + `--` placement, autostash flows incl. the kept stash and the raising-pull restore, auth classification, sandbox/preexec routing, tree-kill, the repo-config denylist against real git, **that the attributes pin ends up LAST even when pre-seeded and is never written through a symlink**, and that a sandbox refusal becomes `GitSandboxUnavailable` |
+| `test/test_papyrus_gitops.py` | URL allowlist + `--` placement, autostash flows incl. the kept stash and the raising-pull restore, auth classification, sandbox/resource-limit-wrapper routing, tree-kill, the repo-config denylist against real git, **that the attributes pin ends up LAST even when pre-seeded and is never written through a symlink**, and that a sandbox refusal becomes `GitSandboxUnavailable` |
 | `test/test_papyrus_routes.py` | The `_require_enabled` gate on every registered route, name/path authorization, response contracts, PDF security headers, git status mapping, the provisioning endpoint (202/idempotent/unsupported/one-job) and its off-loop discipline |
-| `test/test_papyrus_tectonic.py` | Platform→asset mapping incl. the arch-naming splits, digest-shape and mismatch/tamper refusal, tar **and** zip traversal + symlink + setuid + bomb refusal, the Python-3.10 no-`filter` leg, atomic install + exec bit, unsupported-platform degradation, no partial install after a failure, that a user's own `pdflatex` still wins, cache reset after install, and daemon-thread/off-loop discipline |
+| `test/test_papyrus_tectonic.py` | Platform→asset mapping incl. the arch-naming splits, digest-shape and mismatch/tamper refusal, tar **and** zip traversal + symlink + setuid + bomb refusal, the no-`filter` compatibility leg, atomic install + exec bit, unsupported-platform degradation, no partial install after a failure, that a user's own `pdflatex` still wins, cache reset after install, and daemon-thread/off-loop discipline |
 | `website/src/test/PapyrusLib.test.ts` | Tree building/flattening, artifact filter, word count, slot persistence + pruning |
 | `website/src/test/PapyrusDiagnostics.test.tsx` | Click/Enter-to-jump, non-interactive line-less rows, collapsed hints, no emoji |
 | `website/src/test/PapyrusCloseProject.test.tsx` | Leaving the workspace flushes a dirty buffer, stays put when the flush fails, and writes nothing when clean |
 | `website/src/test/PapyrusPdfPreview.test.tsx` | The preview embeds an `<iframe>` and never `<object>`/`<embed>` (the `object-src 'none'` block), the `key={src}` remount that makes a recompile visible, the persistent download affordance, and the pre-compile empty state |
+| `website/src/test/PapyrusEditorSeed.test.tsx` | Pierre document reseeding after an async file load while preserving the caret across local edits |
+| `website/src/test/PapyrusPageCoverage.test.tsx` | Compile, git, file-tree, and co-author workspace flows beyond the leave/flush guards |
+| `website/src/apps/papyrus/CoAuthorPanel.cov80.test.tsx` | Co-author body states, header actions, and slot switching across project changes |
+| `website/src/apps/papyrus/FileTree.cov80.test.tsx` | Artifact filtering, file glyphs, directory collapse, main-file protection, and the empty state |
 
-The backend tests live in the repo-level `test/` tree, not an in-package
-`tests/`: `setup.cfg` sets `testpaths = test transfer`, so a test under
-`src/kiro_crew/apps/builtins/...` is never collected by CI.
+The backend tests live in the repo-level `test/` tree by convention. `setup.cfg`
+sets `testpaths = test src/kiro_crew/apps/builtins`, so an in-package test under
+`src/kiro_crew/apps/builtins/...` is also collected.
 
-Every backend test mocks its subprocesses — no `pdflatex`, `bibtex` or `git` is
-ever invoked, so the suite runs on a host with no TeX installation.
+Compiler subprocesses are mocked, so no `pdflatex` or `bibtex` is invoked and the
+suite runs on a host with no TeX installation. Several repo-config security tests use
+real `git` when it is available and skip otherwise.
 
 **No test reaches the network.** Every compiler download is mocked at the
-`urllib.request` opener, and `test_papyrus_tectonic.py` sets
+`urllib.request` opener, and `test/test_papyrus_tectonic.py` sets
 `KIROCREW_PAPYRUS_SKIP_TECTONIC_DOWNLOAD=1` for the whole module as a second belt,
 so even a test that slipped past its mock is refused before a socket opens rather
 than pulling 22MB in CI.

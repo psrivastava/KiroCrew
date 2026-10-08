@@ -1,6 +1,6 @@
-# API Reference — KiroCrew Gateway API & Client
+# API Reference — Kiro Crew Gateway API & Client
 
-Reference for the KiroCrew Gateway HTTP and WebSocket APIs, and how apps consume
+Reference for the Kiro Crew Gateway HTTP and WebSocket APIs, and how apps consume
 them.
 
 How you talk to the Gateway depends on where your code runs:
@@ -10,7 +10,7 @@ How you talk to the Gateway depends on where your code runs:
   the dashboard host provides it at runtime through its import map (the bare
   specifier `@kirocrew/app-sdk` resolves to the host's vendored copy via
   `window.__kirocrew_modules`). See
-  [getting-started.md](getting-started.md) and the [App SDK Hooks](#app-sdk-hooks)
+  [getting-started.md](getting-started.md) and the [App SDK Hooks](#app-sdk-hooks-dashboard-ui)
   section below.
 - **Python apps / external CLI tools / services** — use the standalone
   `kirocrew-client` package, carried in this repository under
@@ -18,7 +18,7 @@ How you talk to the Gateway depends on where your code runs:
   the Kiro Crew main package, but it is not published to PyPI — use it from a source
   checkout. See the [Python Client](#python-client) section.
 - **Node.js / Electron apps** — call the Gateway REST/WS endpoints directly via
-  `fetch()` / a WebSocket. The full endpoint list is in
+  `fetch()` / a WebSocket. Selected endpoint paths are in
   [Gateway REST API Endpoints](#gateway-rest-api-endpoints).
 
 There is no published TypeScript gateway-client npm package, and none is planned
@@ -78,8 +78,8 @@ controlled by `RequestInit.redirect` (default `follow`); use `redirect: 'error'`
 when the call must not follow redirects. Redirect targets are not rechecked by
 this client.
 
-HTTP failures remain `Error` objects with the message `API <status>: <body>` and
-now also carry `name: 'AppApiError'`, numeric `status` and string `body`. Import
+HTTP failures are `Error` objects with the message `API <status>: <body>`. They
+also carry `name: 'AppApiError'`, numeric `status` and string `body`. Import
 `AppApiError` as a **type**, not a runtime constructor. The body is unparsed, so
 parse it only when the endpoint promises JSON (for example, a conflict response).
 Network, abort and successful-response JSON parsing failures retain their original
@@ -115,6 +115,17 @@ The composer accepts multiple lines. `Enter` sends the draft, `Shift+Enter`
 inserts a line break, and an Enter used to commit an input method editor (IME)
 candidate does not send. The box grows with the draft up to 240 pixels, then
 keeps its height and scrolls vertically.
+
+A host that boxes the embed at a fixed height passes `composerMaxHeight` (in
+pixels) to lower that cap, so a long draft cannot take most of the box from the
+transcript. The resting (empty) size of the composer is unchanged; only the cap
+moves. Omitted, the 240-pixel default applies.
+
+```tsx
+<div style={{ height: 420 }}>
+  <ChatEmbed slotKey="coder-abc123" composerMaxHeight={160} />
+</div>
+```
 
 ## Native Chat Panel
 
@@ -227,8 +238,8 @@ marker — the exact failure the module exists to prevent. Apps get functions; t
 | `deriveFollowUpOptions(messages, isStreaming)` | function | the choices that still apply to the conversation |
 | `extractSteeringAcks(content)` | function | pull `[STEERING …]` out, returning `{ cleaned, acks }` |
 | `stripPartialOptionMarker(text)` | function | hide a half-streamed marker |
-| `ParsedOptions` | type | `{ text, options, multi, isPlan }` |
-| `FollowUpDerivation` | type | `{ followUpOptions, followUpIsPlan }` |
+| `ParsedOptions` | type | `{ text, options, multi }` |
+| `FollowUpDerivation` | type | `{ followUpOptions, followUpSourceKey }`; `followUpSourceKey` names the row the options came from, or `null` when none are on offer |
 | `ChatMessage` | type | the message shape `deriveFollowUpOptions` consumes |
 
 The module must stay free of React and of anything under `pages/` or `components/`: a parser that
@@ -344,16 +355,24 @@ The `Returns` column describes the response shape. It is not a TypeScript type:
 no TypeScript client ships, so `SlotInfo`, `GatewayStatus`, `SystemInfo` and
 their siblings are response-shape names rather than importable types.
 
-When `app_name` is set and no explicit auth is provided, the client auto-reads
-the app secret from `~/.kiro/crew/apps/{name}/.app_secret` and exchanges it
-for a short-lived token via `POST /api/apps/{name}/token`.
+When `app_name` is set and no explicit auth is provided, the Python client reads
+the app secret from `~/.kiro/crew/apps/{name}/.app_secret`. For a remote Gateway,
+call `await client.authenticate()` before the first request; the context manager
+does not exchange the secret automatically. The same exchange refreshes a token
+after a 401/403 response.
+
+The Gateway names its authentication cookie from the Host header it receives,
+falling back to its own listen port. The Python client normally derives that name
+from `base_url`. For a port-less URL or a reverse proxy that strips or rewrites
+Host, pass `cookie_port=<gateway listen port>` to `KiroCrewClient`; the override
+applies to both HTTP requests and WebSocket handshakes created by `create_ws()`.
 
 ### Authentication
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `authenticate()` | `boolean` | Exchange app secret for token (auto-called if appName set) |
-| `setToken(token)` | `void` | Manually set auth token on both HTTP and WS clients |
+| `authenticate()` | `boolean` | Exchange the app secret for a token; call explicitly before the first remote request |
+| `setToken(token)` | `void` | Conceptual token assignment; the Python client accepts `token=` in its constructor |
 
 ### Connection
 
@@ -386,14 +405,25 @@ for a short-lived token via `POST /api/apps/{name}/token`.
 | `onToolCall(cb)` | `() => void` | Receive tool call events |
 | `onConnectionChange(cb)` | `() => void` | Connection state changes |
 | `onRaw(cb)` | `() => void` | All parsed WebSocket events |
-| `onRawMessage(cb)` | `() => void` | All raw WebSocket messages |
 
 All `on*` methods return an unsubscribe function.
 
-WebSocket event types: `chat_chunk`, `chat_done`, `chat_message`, `chat_error`,
-`tool_call`, `notification`, `slots`, `slot_title`, `dashboard`, `log`, `refresh`,
-`approval`, `subagent_done`, `task_update`, `task_complete`, `proactive_notification`,
-`app_reload`, `error`.
+The Python client's `on_slot(slot_id, event_type, callback)` dispatches by
+`data.slot` for ordinary slot-bound frames. `slot_title` and `session_summary`
+instead carry the slot identifier as `data.key`; slot-scoped listeners handle
+both wire shapes.
+
+WebSocket event types include `chat_chunk`, `chat_thinking`, `chat_status`,
+`chat_message`, `chat_done`, `tool_call`, `tool_result`, `notification`, `slots`,
+`slot_title`, `dashboard`, `log`, `refresh`, `approval`, `approval_resolved` and
+`subagent_done`. `src/kiro_crew/dashboard/ws_event_scope.py` owns the full set of
+emitted types and how each is scoped to an app; read it rather than this list
+when you need every type.
+
+The app `slots` event (`mc:app:slots`) fires after the dashboard applies each
+`slots` or `slot_patch` frame. Its `detail` is `null`: the event says the slot
+list changed, not what it now holds. Re-read slots through your own scoped
+client when it fires.
 
 ### Subagents
 
@@ -415,14 +445,20 @@ WebSocket event types: `chat_chunk`, `chat_done`, `chat_message`, `chat_error`,
 | `pauseCron(id)` | `—` (no body) | Pause without deleting |
 | `resumeCron(id)` | `—` (no body) | Resume a paused job |
 
+**Ownership for app tokens.** `POST /api/crons` from an app token stamps the
+job's `created_by` as `app:<name>` from the token. An app token may update,
+delete, enable, run, cancel or acknowledge only jobs that carry its own stamp.
+Any other id, foreign or missing, answers 403 `owner_only`. A job without an
+app stamp is owner-only. An acknowledgement's `ts` must name a cron
+notification of that same job.
+
 #### Watching something without paying for a model call (`kiro_crew.irq`)
 
-> **Provisional surface.** `kiro_crew.irq` has exactly one probe today
-> (`pr_watch`). The ~15 sibling pollers this abstraction was derived from
-> cannot migrate onto it yet, so a second real consumer has not yet tested the
-> contract. Treat the shapes below as subject to change until one has: build on
-> them, but expect `Observation` / `Tick` to gain fields, and pin the Kiro Crew
-> version your app was tested against.
+> **Provisional surface.** `kiro_crew.irq` has two in-tree probes: `gh_pr`
+> (`PrWatchProbe`) and `work_ledger` (`WorkLedgerProbe`). Script crons and the
+> in-process autonudge loop both drive it. Treat the shapes below as subject
+> to change: build on them, but expect `Observation` / `Tick` to gain fields,
+> and pin the Kiro Crew version your app was tested against.
 
 An app that needs to keep an eye on an external thing — a deploy, a ticket, a
 queue depth — should not schedule an **agent** cron to go look. That spends a
@@ -482,11 +518,20 @@ def watch(ctx):                                   # cron entry point
     run(ctx, DeployProbe())
 ```
 
-Register it with `addCron(name, { script: "<crons dir>/your_probe.py:watch",
-every: 300, timeout: 120, message: JSON.stringify({ env: "prod" }) })`. Cron
-scripts must live under the config directory's `crons/`, and the cron must be
-armed **from the session that should receive the wake** — the cron system
-captures the calling session at creation time.
+Register it as a **script** cron. Two paths create one:
+
+- From an app hook, call `ctx.cron.add_job(name, message, every_secs=300,
+  script="your_probe.py:watch")` (or `add_job_async` on the event loop). A
+  relative script path resolves against your app's own bundle.
+- From the session that should receive the wake, use the `cron_add` MCP tool
+  with its `script` and `timeout` arguments. The script must live under the
+  config directory's `crons/`. The cron system captures the calling session at
+  creation time, which is why this call must come from that session.
+
+Pass the probe's settings as the cron `message`, for example
+`json.dumps({"env": "prod"})`. Do not use `addCron` / `POST /api/crons` for
+this: that route reads neither `script` nor `timeout`, so it creates an
+**agent** cron that pays a model turn on every tick.
 
 Rules:
 
@@ -500,8 +545,7 @@ Rules:
   are no resets, so a re-triggered subject inherits the previous run's masks.
 - Filter out conditions the operator already knows about (a check red on the
   base branch, a known-degraded dependency) in your own `observe()` — do not
-  return them. An earlier revision carried an `expected=True` flag for this; it
-  was removed because nothing read the state it recorded.
+  return them. There is no flag that marks an observation as expected.
 - Keep `observe()` to one bounded call. This half must stay fast and cheap.
 - `coalesce_secs=0` turns coalescing off — pass it to `run()`, or return it from
   your probe's `tuning()` when it should come from the cron message. Do that when
@@ -574,8 +618,12 @@ It is not checked against a vocabulary — a spelling of your own is kept, becau
 rewriting it would record something other than what happened. It is redacted and
 length-clipped like `resources` and `error`, so a credential that reaches it by
 accident is not written; that is a no-op for any real outcome value. This log is
-append-only and readable over `/api/sel/events`, so nothing put in it can be taken
-back — don't route free-form remote output through these fields.
+append-only and readable by the dashboard OWNER over `/api/sel/events` — that
+endpoint is owner-gated, so no non-owner dashboard user reads it. In-process app
+code is NOT isolated from it, though: as the next paragraph says, hook code runs
+inside the gateway and can reach the log directly, so treat anything you write
+here as readable by a co-resident app. Nothing put in it can be taken back:
+don't route free-form remote output through these fields.
 
 There is no `caller=` argument. Attribution is minted from your app name
 (`app:<name>`, the same tag `ctx.cron` uses for ownership), so there is no
@@ -585,6 +633,83 @@ the log directly, so treat `app:<name>` as "which app said this", not as proof.
 `operation` is namespaced the same way, so two apps cannot collide on a bare
 `"publish"`. No permission gates it: an app cannot obtain anything with it, only
 state what it did.
+
+### Durable Jobs (`ctx.job`)
+
+Present when the manifest declares `permissions.jobs`, and `None` otherwise.
+Register a runner per job kind in `on_startup`, then start runs by kind:
+
+```python
+ctx.job.register("export", run_export, cancellable=True)
+
+run_id = ctx.job.start("export", dedupe_key=doc_id, params={"doc": doc_id})
+# or: run_id = await ctx.job.start_async("export", dedupe_key=..., params=...)
+
+
+def run_export(handle):
+    doc = handle.params.get("doc", "")
+    ...
+```
+
+`start(kind, *, dedupe_key="", params=None)` returns the run id. A second start
+with the same kind and `dedupe_key` while a run is in flight adopts that run
+instead of starting another. The adopted run keeps the first caller's `params`;
+a later caller's `params` are not merged in.
+
+`params` names the work for the runner. It is a flat map of string keys to
+string values: at most 16 entries, each key 1 to 64 characters, each value at
+most 512 characters. A map that breaks these bounds is refused with an error,
+not trimmed. A value that looks like a credential is refused too, because the
+run record is durable; `params` is not a way to pass a runner a secret.
+
+The runner reads `handle.params`, which returns a fresh copy on each read.
+Editing that copy changes nothing on the record.
+
+`params` and `dedupe_key` are never served in the run view the `_jobs/*` routes
+return. Only the SDK call takes `params`: the HTTP start route
+(`POST /api/apps/{app}/_jobs/{kind}/start`) accepts a `dedupe_key` and no
+parameters.
+
+### Gateway Application (`ctx.http_app`)
+
+The gateway's own aiohttp `Application`, for background work that must be anchored
+on it — a poller that has to read the same dashboard state your request handlers
+read, and stash its running service where those handlers look it up.
+
+```python
+async def on_startup(ctx):
+    if ctx.http_app is None:
+        ctx.health.mark_degraded("poller not started: no gateway application on this host")
+        return
+    await start_my_poller(ctx.http_app)
+
+
+async def on_shutdown(ctx):
+    if ctx.http_app is None:
+        return
+    await stop_my_poller(ctx.http_app)
+```
+
+Present **only if your manifest declares a `routes` hook**, and `None` otherwise.
+That gate is not a permission you can ask for: an app with routes is dispatched the
+real `web.Request`, so `request.app` is already this exact object and the field adds
+no reach. An app with lifecycle hooks and no routes has no request path either, so
+handing it the Application would be a genuinely new grant.
+
+Read it with `getattr(ctx, "http_app", None)` if your app must also run on a gateway
+older than this field, and **report the gap** — `ctx.health.mark_degraded` with the
+user-visible consequence — rather than returning quietly. Background work that
+silently never starts is indistinguishable from having nothing to do.
+
+Your `on_startup` and `on_shutdown` contexts are built by different code paths and
+are guaranteed to agree about this field, so work you start with it can always be
+stopped with it. That holds across a version bump too: teardown reuses the answer
+recorded when the app was enabled, so dropping your `routes` hook in a later release
+does not strand the work an earlier one started — your `on_shutdown` still receives
+the Application it was given. The same rule runs the other way, so adding a `routes`
+hook does not hand the object to a teardown whose startup never held it. Declare
+`on_shutdown` whenever you declare `on_startup`: anything you spawn outlives the
+startup call, and teardown is the only thing that stops it.
 
 ### Lessons
 
@@ -606,11 +731,21 @@ state what it did.
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `approveAction(slotId, taskId)` | `—` (no body) | Approve a pending tool action |
+| `approveAction(slotId, taskId, pattern?)` | `—` (no body) | Approve a pending tool action; command/base trust requires the pending card pattern |
 | `rejectAction(slotId, taskId)` | `—` (no body) | Reject a pending tool action |
-| `resolveApproval(approvalId, approved)` | `—` (no body) | Resolve an approval by ID |
-| `getApprovalMode()` | `'auto'` \| `'interactive'` | Get current approval mode |
-| `setApprovalMode(mode)` | `—` (no body) | Set approval mode |
+| `resolveApproval(approvalId, action, slotId?, pattern?)` | `—` (no body) | Resolve an approval by ID; `trust_command` and `trust_base` require `pattern` |
+| `getApprovalMode()` | `'auto'` \| `'interactive'` | Read the config setting `agent.approval_mode` from `GET /api/config/kirocrew` |
+| `setApprovalMode(mode)` | `—` (no body) | Set the chat trust mode (`normal`, `trust_reads`, `trust`, `yolo`) through `POST /api/chat/mode`; a different setting from `agent.approval_mode` |
+
+**Ownership for app callers** (a dashboard caller is unrestricted). The rule follows the request's app claim: an app token, and also an agent running in one of your app's sessions, whose internal calls carry your app's identity.
+- `POST /api/approvals/{id}/{action}` needs `permissions.sessionApproval`, exactly like `POST /api/chat/slots/{slot}/approve`: without it both answer 403 `session_approval_not_granted` to an app-token caller, even for your own slots. An agent running in your app's sessions (its cron job or subagent, calling over the internal secret) is exempt from that grant on both routes alike, and is still limited to the slots your app owns. With the grant, the id resolves a request on a slot you own or on a local user session. Request ids can recur across sessions, so an id pending on more than one session you may control is refused; name the session with the slot route instead (`resolveApproval(id, action, slotId)`). A background approval (cron, autonudge, subagent, task runner) is never resolvable by an app.
+- `GET /api/approvals` lists only what the app could resolve. The list carries background approvals only, so for an app it is always empty. Read a slot's pending requests from its history instead.
+- `GET /api/sessions`, `GET /api/sessions/search`, `GET /api/sessions/{key}`, `DELETE /api/sessions/{key}` and `POST /api/sessions/summarize` reach only transcripts that record the calling app as their owner. `total` counts only those, search ranks only those, and summarize skips any other key as if it were missing (so `list_sessions` with `summarize` from your app's agent returns summaries for your transcripts only). A delete is also refused when a live slot holding the transcript belongs to someone else.
+- `DELETE /api/sessions` (bulk clear) and `GET /api/sessions/clearable/count` act on every closed transcript at once, so an app is always refused them.
+- A new slot can only be opened on a fresh name or on a transcript your app already owns. `POST /api/chat/slots` with a `name`, `POST /api/chat` that would create its slot, and `POST /api/chat/slots/{slot}/resume` answer 404 for a transcript that belongs to someone else.
+- Apart from the missing-grant 403, every refusal returns the same body as a missing target, `{"error": "not found", "code": "slot_not_found"}`. The reason is recorded in the security-event log, and so is every access the ownership rule allows.
+- `GET /api/sessions/{key}` can answer 503 `session_busy` when the transcript is being written at that moment. Retry it.
+- Not narrowed yet: `/api/sessions/{id}/agents*`, `POST /api/sessions/restart`, and `/api/sessions/usage`, `/health` and `/memory`. Narrowing them to the app's own sessions is planned, so do not build on reaching other sessions there.
 
 ### Models
 
@@ -626,17 +761,10 @@ state what it did.
 | `listMcpServers()` | `McpServerInfo[]` | List registered MCP servers |
 | `registerMcpServer(def)` | `—` (no body) | Register an MCP server (requires name + command) |
 | `removeMcpServer(name)` | `—` (no body) | Remove an MCP server |
-| `registerAppMcp(name, entry)` | `—` (no body) | Write MCP entry to `~/.kiro/crew/mcp.json` (Node.js only) |
-| `unregisterAppMcp(name)` | `—` (no body) | Remove MCP entry from `~/.kiro/crew/mcp.json` (Node.js only) |
 
-### Agent & Skill Installation (Node.js only)
-
-| Method | Returns | Description |
-|--------|---------|-------------|
-| `installAgentConfig(name, config)` | `void` | Install agent JSON to `~/.kiro/agents/` (merges mcpServers) |
-| `removeAgentConfig(name)` | `void` | Remove agent config |
-| `installSkill(name, srcDir)` | `void` | Copy skill directory to `~/.kiro/crew/skills/` |
-| `removeSkill(name)` | `void` | Remove skill directory |
+Apps declare their agents, skills and `mcpServers` in `app.json`, and
+`kirocrew app install` installs them. For an ad-hoc MCP server, use
+`registerMcpServer`.
 
 ### Agent Runtime
 
@@ -674,7 +802,7 @@ Silent background context for LLM — content appears in the next user-initiated
 | Method | Returns | Description |
 |--------|---------|-------------|
 | `injectContext(slotId, content, options?)` | `—` (no body) | Inject context (null slotId = buffer locally) |
-| `flushPendingContext(slotId)` | `—` (no body) | Flush buffered entries to a slot |
+| `flushPendingContext(slotId)` | `number` | Flush buffered entries to a slot; returns the count the full queue refused and dropped. A `context_not_queued` entry is dropped (not re-buffered) so it never blocks later sends; a transient failure is re-buffered and raised |
 | `setDefaultSlot(slotId)` | `void` | Auto-flush pending context on sendMessage |
 | `pendingContextCount` | `number` | Number of buffered context entries |
 
@@ -690,33 +818,41 @@ Options: `{ source?: string, ephemeral?: boolean, maxAge?: number }`
 - Owning the slot is not sufficient: an app is refused when the slot's session is linked elsewhere — a cron result or workflow injection holding that binding — because both writes land in the linked session, so slot ownership alone would otherwise reach a conversation the app has no claim on.
 - Every refusal returns the same body as a genuinely missing slot, so no response an unauthorized caller can reach distinguishes "not yours" from "does not exist". The specific reason is recorded in the security-event log instead.
 
+**Full queue (429 `context_not_queued`).** A slot holds at most 50 pending context entries (held notes' context halves count against that ceiling). When a `/context` POST would exceed the ceiling it is refused with `429` and body `{ error, code: "context_not_queued" }`; expired entries are reclaimed first, so a live entry the caller already holds a 200 for is never evicted to make room. The refusal is **not transient in the Retry-After sense**: only a user-initiated turn drains the queue, so a tight retry loop cannot clear it. The queue is drained on the next turn; retry the inject after a turn, or let a turn consume the backlog. (The per-source cap is separate: it answers `429 context_not_queued`'s sibling `capacity_reached` and only bounds one `source` bucket.) The shipped Python client surfaces this as the non-retried `CONTEXT_NOT_QUEUED` error code rather than `RATE_LIMITED`, and `flush_pending_context` drops a refused entry instead of blocking later sends — see the Python client section below.
+
 ### Notes
 
 `POST /api/chat/slots/{slot}/note` drops a short declarative line into a chat that is both visible in the transcript immediately and known to the agent on the user's next message — without firing an LLM turn. Context injection alone is silent; a transcript append alone is invisible to the model, because a live provider forwards only the new user message. The note endpoint does both writes against one slot.
 
-Body: `{ content, source?, maxAge?, ephemeral? }`. A note always does both writes -- there is no visible-only or context-only mode. The visible line is appended as `role: "inject"` with `cls: "reconcile-note"`, and its content is redacted (credentials, exfiltration URLs) before it reaches the transcript. `maxAge` defaults to 24h for the context half when the key is omitted, so a note nobody follows up on expires instead of attaching to an unrelated message later. An explicit null means no expiry, the same as it does on `/context` — the two endpoints share the field and do not give it opposite meanings. The same `source`/`maxAge`/`content` constraints above apply.
+Body: `{ content, source?, maxAge?, ephemeral? }`. A note always does both writes -- there is no visible-only or context-only mode. The visible line is appended as `role: "inject"` with `cls: "reconcile-note"`, and its content is redacted (credentials, exfiltration URLs) before it reaches the transcript. The bubble's author pill comes from the authenticated app identity, never from the body's `source`. A dashboard user's note has no pill, and neither does a note from an app whose name is over 64 characters or contains a control character. The body's `source` is only the label of the context frame. `maxAge` defaults to 24h for the context half when the key is omitted, so a note nobody follows up on expires instead of attaching to an unrelated message later. An explicit null means no expiry, the same as it does on `/context` — the two endpoints share the field and do not give it opposite meanings. The same `source`/`maxAge`/`content` constraints above apply.
 
-Returns `{ ok, appended, visibleDeferred, deliveryConditional, contextSkipped, pending }`. When the source's per-source context cap is full the request is **not** rejected: the visible line is still written and `contextSkipped` is true, because the cap protects the context queue rather than the transcript. If a turn is already running the note is held until that turn ends -- `appended` is false and `visibleDeferred` is true -- so that it lands on the next turn rather than the one it was written during. Ordering is preserved, and `deliveryConditional` is true whenever a note is held -- because a hold is delivered only if the slot still routes to the SAME session when the turn ends. An unbound slot can acquire a foreign binding while the note waits (a cron result or workflow injection claims an empty `linked_session_key` with no running gate), and both the transcript path and the next turn's session resolve that binding at flush time rather than at the POST. When that happens BOTH halves of the note are dropped rather than retargeted, because writing them would surface content authorized for one conversation inside another; the drop is recorded in the security-event log. So a 200 with `visibleDeferred: true` promises ordering against the running turn, not that the note will certainly be written. `pending` counts held entries as well as queued ones.
+Returns `{ ok, appended, visibleDeferred, deliveryConditional, contextSkipped, pending }`. `contextSkipped` is true whenever the context half is refused but the visible line is still written: either the source's per-source context cap is full, **or** the whole 50-entry pending-context queue has no seat. The request is **not** rejected in either case, because the caps protect the context queue rather than the transcript. The full-queue refusal is checked at admission on both arms — an immediate note (`append_pending_context` returns false) and a note held during a running turn (`has_pending_context_seat()` is false) — so a held note never acknowledges a context half the turn-end flush would then drop. If a turn is already running the note is held until that turn ends -- `appended` is false and `visibleDeferred` is true -- so that it lands on the next turn rather than the one it was written during. Ordering is preserved, and `deliveryConditional` is true whenever a note is held -- because a hold is delivered only if the slot still routes to the SAME session when the turn ends. An unbound slot can acquire a foreign binding while the note waits (a cron result or workflow injection claims an empty `linked_session_key` with no running gate), and both the transcript path and the next turn's session resolve that binding at flush time rather than at the POST. When that happens BOTH halves of the note are dropped rather than retargeted, because writing them would surface content authorized for one conversation inside another; the drop is recorded in the security-event log. So a 200 with `visibleDeferred: true` promises ordering against the running turn, not that the note will certainly be written. `pending` counts held entries as well as queued ones.
 
-**A 200 for a held note is a durable acknowledgement — for a slot that has a durable identity.** The hold is persisted verbatim (both halves, the silent context included) into the slot's own session metadata *before* the 200 is returned, replayed into the hold by both slot-restore paths after a gateway restart, and retired by the save that commits the delivered rows -- so a note accepted with `visibleDeferred: true` survives a restart and is delivered, unaltered, on the first turn after it. Two edges keep the original gateway-lifetime meaning instead: a memory-only deployment (no conversation log at all), and a slot that has never been persisted (no metadata line to attach the hold to -- such a tab does not itself survive a restart, so there is no restored slot the note could outlive). Do **not** re-post a held note after a restart; the restored hold delivers it, and a re-post would put the same line in the transcript twice. Three boundary refusals protect that promise: a note posted during a running turn is capped at 4,000 characters (`413`, code `deferred_note_too_large` -- shorten it or wait for the turn to end), a slot whose durable hold is full answers `429 deferred_notes_full` until its rows are saved, and a slot that is rebound to another session while the hold is persisting answers the endpoint's uniform `404` -- the note was neither delivered nor made durable (a note the turn-end flush drops at that same rebind seam takes this `404` too; the 200 stands only when the note observably exists in a delivered row or the durable hold). The one retry-the-same-request signal is a `503` with code `deferred_note_persist_failed`, which means the durable write itself failed and the note was **not** accepted. The queued context of an *immediate* (non-held) note still behaves exactly as `/context`'s queue always has -- in memory, for this gateway lifetime. Note the retention consequence of durability: a HELD note's context half -- the trusted-caller channel, which is deliberately not redacted -- now lives on disk in the session metadata until delivery or retirement, where an immediate note's context only ever lived in memory.
+**A 200 for a held note is a durable acknowledgement — for a slot that has a durable identity.** The hold is persisted verbatim (both halves, the silent context included) into the slot's own session metadata *before* the 200 is returned, replayed into the hold by both slot-restore paths after a gateway restart, and retired by the save that commits the delivered rows -- so a note accepted with `visibleDeferred: true` survives a restart and is delivered, unaltered, on the first turn after it. Two edges keep the original gateway-lifetime meaning instead: a memory-only deployment (no conversation log at all), and a slot that has never been persisted (no metadata line to attach the hold to -- such a tab does not itself survive a restart, so there is no restored slot the note could outlive). Do **not** re-post a held note after a restart; the restored hold delivers it, and a re-post would put the same line in the transcript twice. Three boundary refusals protect that promise: a note posted during a running turn is capped at 4,000 characters (`413`, code `deferred_note_too_large` -- shorten it or wait for the turn to end), a slot whose durable hold is full answers `429 deferred_notes_full` until its rows are saved, and a slot that is rebound to another session while the hold is persisting answers the endpoint's uniform `404` -- the note was neither delivered nor made durable (a note the turn-end flush drops at that same rebind seam takes this `404` too; the 200 stands only when the note observably exists in a delivered row or the durable hold). The one retry-the-same-request signal is a `503` with code `deferred_note_persist_failed`, which means the durable write itself failed and the note was **not** accepted. The queued context of an *immediate* (non-held) note still behaves exactly as `/context`'s queue always has -- in memory, for this gateway lifetime. Note the retention consequence of durability: a HELD note's context half -- the trusted-caller channel, which is deliberately not redacted -- lives on disk in the session metadata until delivery or retirement, while an immediate note's context lives only in memory.
 
 ### Proxy Authentication (Server-side)
 
-Verify that an incoming request was signed by the KiroCrew gateway reverse proxy. Use in app backends to authenticate proxied requests.
+Verify that an incoming request was signed by the Kiro Crew Gateway reverse proxy.
+Use these main-package helpers in Python app backends:
 
 | Function | Returns | Description |
 |----------|---------|-------------|
-
-Options: `{ secret?: string, maxAgeSecs?: number }`
+| `raw_request_target(request)` | `str` | Preserve the raw percent-encoded path and query that the Gateway signed |
+| `proxy_secret()` | `str` | Read the injected `KIROCREW_PROXY_SECRET`, or an empty string |
+| `verify_proxy_request(header, *, method, target, body, secret=None, now=None)` | `bool` | Verify the body-bound HMAC and fixed ±60-second freshness window; fail closed on malformed input |
 
 ---
 
 ## Python Client
 
 Standalone async client using `aiohttp`, carried in this repository under
-`packages/kirocrew-client-py/`. It is not published to PyPI, so use it from a
-source checkout rather than by installing it. It covers part of the Gateway API
+`packages/kirocrew-client-py/`. It is not published to PyPI or included in the
+main wheel. Install it from a source checkout; it covers part of the Gateway API
 surface documented above.
+
+```bash
+python -m pip install -e /path/to/KiroCrew/packages/kirocrew-client-py
+```
 
 ```python
 from kirocrew_client import KiroCrewClient
@@ -730,16 +866,42 @@ async with KiroCrewClient(app_name="my-app") as mc:
 
 ```python
 KiroCrewClient(
+    *,                        # every argument is keyword-only
     base_url="",              # default: http://localhost:{KIROCREW_PORT or 5476}
     token="",                 # optional for localhost
-    app_name="",              # for app-scoped storage & auto-auth
+    app_name="",              # app-scoped storage and secret lookup
     timeout=30,               # request timeout seconds
     max_retries=3,            # retry count
     retry_base_delay=1.0,     # base delay for backoff
     message_length_limit=40000,
     on_auth_expired=None,     # async callback returning new token
+    cookie_port=None,         # gateway listen port for the auth cookie name
 )
 ```
+
+With `app_name` set and no `token` or `on_auth_expired`, the client reads the
+app secret from `$KIROCREW_HOME/apps/{name}/.app_secret` (`KIROCREW_HOME`
+defaults to `~/.kiro/crew`).
+
+For a remote Gateway, pass `token=...` or call `await client.authenticate()`
+after entering the context. Local loopback requests need no token. Setting
+`app_name` alone only locates the app secret; it does not authenticate during
+`__aenter__`.
+
+Token authentication uses the Gateway's port-scoped `mc_token_<port>` cookie. If
+`base_url` omits the port, the client uses the scheme default (443 for HTTPS/WSS,
+80 for HTTP/WS). A Gateway receiving a Host header without a port instead keys
+the cookie to its own listen port, so a port-less URL matches only when the
+Gateway listens on the scheme-default port. Pass an explicit port when it listens
+elsewhere, including behind a reverse proxy that removes the port from Host.
+
+Core requests retry 429 responses for every HTTP method, with one carve-out: a
+`429` carrying code `context_not_queued` (a full pending-context queue) is **not**
+retried — only a turn drains that queue, so backoff cannot clear it — and surfaces
+as the `CONTEXT_NOT_QUEUED` error code. They retry 5xx responses and
+transport failures only for `GET`, `PUT`, and `DELETE`; `POST` and `PATCH` are not replayed
+when the server may already have applied them. A 401/403 refusal may still refresh authentication
+and replay once because the Gateway rejected the request before applying it.
 
 ### Method Reference
 
@@ -749,10 +911,14 @@ column is the shipped Python method, in `snake_case` per Python convention.
 Rows marked *not implemented* are Gateway endpoints the shipped Python client
 does not wrap yet. Call those endpoints directly with `aiohttp` (or any HTTP
 client) using the paths in
-[Gateway REST API Endpoints](#gateway-rest-api-endpoints). The client also ships
-no WebSocket surface, so the `connect` / `disconnect` / `on*` handlers in
-[WebSocket Events](#websocket-events) are endpoint documentation for a raw
-WebSocket connection rather than client methods.
+[Gateway REST API Endpoints](#gateway-rest-api-endpoints).
+
+`create_ws()` returns a `WsClient` bound to `/api/ws` with this client's auth
+cookie. Its listeners (`on(type, cb)`, `on_slot(slot, type, cb)`, `on_raw`, and
+`on_connection_change`) each return an unsubscribe function;
+`connect()` starts a background reconnect loop with exponential backoff and
+`disconnect()` stops it for good. When the client can refresh its token, it
+does so before each reconnect.
 
 | API surface | Python |
 |-----------|--------|
@@ -762,107 +928,65 @@ WebSocket connection rather than client methods.
 | `createSlot(name, agent?)` | `create_slot(name, agent="")` |
 | `listSlots()` | `list_slots()` |
 | `deleteSlot(id)` | `delete_slot(id)` |
-| `getSlotHistory(id, limit?)` | *not implemented — call the endpoint* |
+| `getSlotHistory(id, limit?)` | `get_slot_history(id, limit=50)` |
 | `sendMessage(id, msg)` | `send_message(id, msg)` |
+| `streamChat(id, msg)` | `stream_chat(id, msg)` → async iterator of chunk dicts; an SSE response ends only at `[DONE]` (transport failure or earlier clean close raises `NETWORK_ERROR` without retry), while a successful JSON queue, steer, or orchestrator-control receipt is yielded once and ends the iterator |
+| `stopSlot(id, force?)` | `stop_slot(id, force=False)` |
+| `editResend(id, content, opts)` | `edit_resend(id, content, *, index=None, ts=None)` |
 | `spawn(task, agent?)` | `spawn(task, agent="")` |
 | `spawnMany(tasks, agents?)` | `spawn_many(tasks, agents=None)` |
-| `listSubagents()` | `list_subagents()` |
+| `listSubagents()` | `list_subagents()` (reads `agents`) |
 | `getSubagentStatus(id)` | `get_subagent_status(id)` |
 | `addCron(name, opts)` | `add_cron(name, **opts)` |
-| `listCrons()` | `list_crons()` |
-| `updateCron(id, opts)` | `update_cron(id, **opts)` |
+| `listCrons()` | `list_crons()` (reads `jobs`) |
+| `updateCron(id, opts)` | `update_cron(id, **opts)` (`PATCH`) |
 | `removeCron(id)` | `remove_cron(id)` |
 | `pauseCron(id)` | `pause_cron(id)` |
 | `resumeCron(id)` | `resume_cron(id)` |
 | `addLesson(rule, cat, scope?)` | `add_lesson(rule, cat, scope="")` |
-| `listLessons()` | `list_lessons()` |
+| `listLessons()` | `list_lessons()` (reads `lessons`) |
 | `removeLesson(query)` | `remove_lesson(query)` |
 | `sendNotification(text, opts?)` | `send_notification(text, **opts)` |
-| `listNotifications()` | *not implemented — call the endpoint* |
-| `ackNotifications()` | *not implemented — call the endpoint* |
-| `approveAction(slot, task)` | *not implemented — call the endpoint* |
-| `rejectAction(slot, task)` | *not implemented — call the endpoint* |
-| `resolveApproval(id, ok)` | *not implemented — call the endpoint* |
-| `getApprovalMode()` | *not implemented — call the endpoint* |
-| `setApprovalMode(mode)` | *not implemented — call the endpoint* |
-| `listModels()` | *not implemented — call the endpoint* |
-| `setSlotModel(slot, model)` | *not implemented — call the endpoint* |
-| `getGatewayConfig(key)` | *not implemented — call the endpoint* |
-| `setGatewayConfig(key, val)` | *not implemented — call the endpoint* |
-| `listMcpServers()` | `list_mcp_servers()` |
+| `listNotifications()` | `list_notifications()` → `{notifications, unread}` |
+| `ackNotifications()` | `ack_notification(ts)` / `ack_all_notifications()` |
+| `approveAction(slot, task, pattern?)` | `resolve_approval(request_id, "approved", slot_id=slot, pattern=pattern)`; command/base trust passes the pending card pattern |
+| `rejectAction(slot, task)` | `resolve_approval(request_id, "rejected", slot_id=slot)` |
+| `resolveApproval(id, action, slot?, pattern?)` | `resolve_approval(id, action="approve", slot_id="", pattern="")`; `approve`/`approved` and `reject`/`rejected` are aliases; without a slot, accepted actions are `approve`, `reject`, `reject_once`; with a slot, accepted actions are `approved`, `rejected`, `trust`, `trust_reads`, `trust_command`, `trust_base`, `yolo`; command/base trust requires `pattern` |
+| `listApprovals()` | `list_approvals()`; pending background approvals only (cron, autonudge, subagent, task runner), never a slot's own tool prompts; empty for an app token |
+| `getApprovalMode()` | `get_gateway_config("kirocrew")`, then read `agent.approval_mode` |
+| `setApprovalMode(mode)` | `set_approval_mode(mode, slot_id="")`; accepted modes are `normal`, `trust_reads`, `trust`, `yolo`; `normal`, `trust_reads`, and `trust` may target one slot, while `yolo` is process-global and rejects `slot_id` |
+| `listModels()` | `list_models()` |
+| `setSlotModel(slot, model)` | `set_slot_model(slot, model)` |
+| `getGatewayConfig(key)` | `get_gateway_config(key)`; `key` is one of `GATEWAY_CONFIG_KEYS` (`kirocrew`, `stt`, `theme`, `default-agent`) |
+| `setGatewayConfig(key, val)` | `set_gateway_config(key, val)` (`PUT`, same keys) |
+| `listMcpServers()` | `list_mcp_servers()` (`GET /api/mcp`) |
 | `registerMcpServer(def)` | `register_mcp_server(name, cmd, args?, env?)` |
 | `removeMcpServer(name)` | `remove_mcp_server(name)` |
-| `registerAppMcp(name, entry)` | *not implemented — call the endpoint* |
-| `unregisterAppMcp(name)` | *not implemented — call the endpoint* |
-| `installAgentConfig(name, cfg)` | *not implemented — call the endpoint* |
-| `removeAgentConfig(name)` | *not implemented — call the endpoint* |
-| `installSkill(name, dir)` | *not implemented — call the endpoint* |
-| `removeSkill(name)` | *not implemented — call the endpoint* |
 | `dispatchAgent(agent, prompt)` | `dispatch_agent(agent, prompt)` |
 | `dispatchAgentAsync(agent, prompt)` | `dispatch_agent_async(agent, prompt)` |
 | `getTaskResult(id)` | `get_task_result(id)` |
 | `getAppDataDir()` | `get_app_data_dir()` → `Path` |
 | `getAppConfig()` | `get_app_config()` |
 | `setAppConfig(cfg)` | `set_app_config(cfg)` |
-| `memorySearch(q, topK?)` | `memory_search(q, top_k=8)` |
+| `memorySearch(q, topK?)` | `memory_search(q, top_k=8)` (sent as `limit`, capped at 50) |
+| `transcribe(audio)` | `transcribe(audio_bytes, *, filename=, content_type=)` → text; transport failures raise `NETWORK_ERROR` without retry |
+| `connect()` / `on*` | `create_ws()` → `WsClient` (see above) |
 | `injectContext(slot, content, opts?)` | `inject_context(slot, content, *, source?, ephemeral?, max_age?)` |
 | `flushPendingContext(slot)` | `flush_pending_context(slot)` |
 | `setDefaultSlot(slot)` | `set_default_slot(slot)` |
 
-**Proxy Authentication (standalone functions):**
-
-| API surface | Python |
-|-----------|--------|
-
----
-
-## AppManifest
-
-Validate and serialize app.json manifests, via the `kirocrew-client` package.
-
-```python
-from kirocrew_client import AppManifest
-
-m = AppManifest.from_dict({"name": "my-app", "version": "1.0.0", ...})
-errors = m.validate()   # list[str] — empty if valid
-data = m.to_dict()
-```
-
-## AppLifecycle
-
-Manage app installation via the Gateway REST API.
-
-```python
-from kirocrew_client import KiroCrewClient, AppLifecycle
-
-async with KiroCrewClient() as mc:
-    lifecycle = AppLifecycle(mc)
-    await lifecycle.install("/path/to/my-app")
-    await lifecycle.enable("my-app")
-    await lifecycle.disable("my-app")
-    await lifecycle.uninstall("my-app")
-    apps = await lifecycle.list()
-```
-
-## GatewayManager
-
-Manage the KiroCrew Gateway process (start, stop, health check).
-
-```python
-from kirocrew_client import GatewayManager
-
-gm = GatewayManager(port=5476)
-await gm.start()
-healthy = await gm.is_healthy()
-await gm.stop()
-```
+The standalone package exports `KiroCrewClient`, `KiroCrewError`, `ErrorCode`,
+`WsClient`, `WsEvent` and `GATEWAY_CONFIG_KEYS`. It does not export
+`AppManifest`, `AppLifecycle`, `GatewayManager` or proxy-auth helpers. Validate
+manifests through the main package's install path, manage the Gateway with the `kirocrew` CLI, and use
+`kiro_crew.apps.proxy_auth` only from a backend that can import the main package.
 
 ---
 
 ## Error Handling
 
 All `kirocrew-client` errors are `KiroCrewError` instances with `code`,
-`message`, `status`, `body`.
+`status` and `body` attributes. The message is `str(e)`.
 
 | Code | Trigger | Retried? |
 |------|---------|----------|
@@ -871,9 +995,10 @@ All `kirocrew-client` errors are `KiroCrewError` instances with `code`,
 | `VALIDATION_ERROR` | Invalid input | No |
 | `NOT_FOUND` | 404 response | No |
 | `RATE_LIMITED` | 429 response | Yes (Retry-After or backoff) |
-| `SERVER_ERROR` | 5xx response | Yes (exponential backoff) |
-| `NETWORK_ERROR` | Timeout or connection failure | Yes (exponential backoff) |
-| `WS_DISCONNECTED` | WebSocket not connected | No |
+| `CONTEXT_NOT_QUEUED` | 429 with code `context_not_queued` (pending-context queue full) | No (only a turn drains the queue) |
+| `SERVER_ERROR` | 5xx response | `GET`/`PUT`/`DELETE`: yes; `POST`/`PATCH`: no |
+| `NETWORK_ERROR` | Timeout, connection failure, or truncated chat stream | Core `GET`/`PUT`/`DELETE`: yes; core `POST`/`PATCH`, `stream_chat`, and `transcribe`: no |
+| `WS_DISCONNECTED` | Reserved enum value; `WsClient` reconnects on its own and does not raise it | No |
 
 ```python
 from kirocrew_client import KiroCrewError
@@ -881,15 +1006,40 @@ from kirocrew_client import KiroCrewError
 try:
     await mc.send_message("slot-1", "hello")
 except KiroCrewError as e:
-    print(e.code, e.message, e.status)
+    print(e.code, str(e), e.status)
 ```
 
 ---
 
 ## Gateway REST API Endpoints
 
-The `useAppApi()` hook and the `kirocrew-client` package wrap these Gateway
-endpoints. Apps can also call them directly via `fetch()`.
+The `useAppApi()` hook can call declared paths, while the source-only Python
+client wraps the subset named below. These API routes require the appropriate
+dashboard, app, or internal credential; a bare `curl` request is not authenticated.
+
+### Core endpoints used by the Python client
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/status` | Gateway status and connectivity check |
+| GET | `/api/system` | System metrics |
+| GET/POST | `/api/chat/slots` | List or create chat slots |
+| GET/DELETE | `/api/chat/slots/{slot}` | Read slot detail/history or delete a slot |
+| POST | `/api/chat` | Send a chat turn |
+| GET/POST | `/api/spawn` | List or start subagents |
+| GET | `/api/spawn/{agent_id}` | Read subagent status |
+| GET/POST | `/api/crons` | List or create cron jobs |
+| PATCH/DELETE | `/api/crons/{job_id}` | Update or delete a cron job |
+| POST | `/api/crons/{job_id}/enable` | Pause or resume a cron job |
+| POST | `/api/crons/{job_id}/run` | Run a cron job now |
+| POST | `/api/crons/{job_id}/cancel` | Cancel a running cron job |
+| POST | `/api/crons/{job_id}/ack` | Acknowledge a cron job's notification |
+| GET/POST/DELETE | `/api/lessons` | List, add, or remove lessons |
+| POST | `/api/send-message` | Send a notification/message |
+| GET | `/api/mcp` | List MCP server configuration |
+| PUT/DELETE | `/api/mcp/servers/{name}` | Register or remove an MCP server |
+| GET | `/api/memory/episodic/search` | Search memory |
+| POST | `/api/chat/slots/{slot}/context` | Inject silent context |
 
 ### App Management
 
@@ -898,20 +1048,26 @@ endpoints. Apps can also call them directly via `fetch()`.
 | GET | `/api/apps` | List all installed apps |
 | GET | `/api/apps/registry` | List available apps from registry |
 | GET | `/api/apps/blob?repo=&path=&ref=` | Proxy images from a registry app's git repo |
-| POST | `/api/apps/install` | Install from local path |
-| POST | `/api/apps/register` | Register a self-managed app |
-| POST | `/api/apps/registry/install` | Install from registry |
+| POST | `/api/apps/install` | Install from local path (owner only) |
+| POST | `/api/apps/register` | Register a self-managed app (owner only) |
+| POST | `/api/apps/registry/install` | Install from registry (owner only) |
+| POST | `/api/apps/registry/install-stream` | Install from registry with an SSE progress stream (owner only) |
 | GET | `/api/apps/{name}` | Get app details |
 | GET | `/api/apps/{name}/manifest` | Get app manifest |
-| GET/PUT | `/api/apps/{name}/config` | Read/write app config |
-| POST | `/api/apps/{name}/update` | Update installed app |
-| POST | `/api/apps/{name}/uninstall` | Uninstall app |
-| POST | `/api/apps/{name}/enable` | Enable app |
-| POST | `/api/apps/{name}/disable` | Disable app |
+| GET/PUT | `/api/apps/{name}/config` | Read/write app config (PUT from a dashboard subject: owner only) |
+| POST | `/api/apps/{name}/update` | Update installed app (owner only) |
+| POST | `/api/apps/{name}/uninstall` | Uninstall app (owner only) |
+| POST | `/api/apps/{name}/enable` | Enable app (owner only) |
+| POST | `/api/apps/{name}/disable` | Disable app (owner only) |
 | POST | `/api/apps/{name}/dev` | Toggle dev mode (live reload) — body `{"enabled": bool}` |
-| POST | `/api/apps/{name}/open` | Launch app via openCommand |
+| POST | `/api/apps/{name}/open` | Launch app via openCommand (owner only) |
 | GET | `/apps/{name}/ui/{path}` | Serve app UI bundle files |
-| * | `/apps/{name}/api/{path}` | Reverse proxy to app backend (HMAC-signed) |
+| * | `/apps/{name}/api/{path}` | Reverse proxy to app backend (HMAC-signed). An ordinary response is bounded at 30s total. A `text/event-stream` response has no total, but must emit an event or a `:` comment at least every 60s, or it is cut |
+
+"Owner only" routes answer 403 `owner_only` to a dashboard subject that is not
+the owner, and to every app token, including an app calling its own
+`/api/apps/<self>/...` path. A config `PUT` from an app token is scoped by the
+token's own app permissions instead.
 
 ### Reverse Proxy Authentication
 
@@ -954,6 +1110,59 @@ the value in the `X-KiroCrew-Proxy` header (constant-time), rejecting stale time
 > constant-time compare and the ±60s freshness window. A gateway that signs body-bound
 > HMACs fails verification against any verifier that omits the body hash, so a
 > backend that implements the HMAC itself has to be updated in lockstep with the gateway.
+
+### Backend Environment Variables
+
+The gateway spawns each `backend.entryPoint` app as a sandboxed child and injects a fixed,
+generic set of environment variables. No app-specific variables are ever injected.
+
+| Variable | Always set | Meaning |
+|---|---|---|
+| `PORT` | yes | The loopback port your backend must bind (`127.0.0.1:$PORT`). |
+| `KIROCREW_APP_NAME` | yes | This app's installed name. |
+| `KIROCREW_HOME` | yes | The gateway's resolved data home, so the backend reads the same app tree. |
+| `KIROCREW_GATEWAY_ORIGIN` | only with bound-port evidence | The gateway's own origin, `http://<bound host>:<bound port>`, for calling back to the gateway (for example `POST /api/notifications/push`). It is set ONLY from the address the gateway ACTUALLY bound: its exported `KIROCREW_BOUND_PORT` (required to be numeric and in `1..65535`), with the host `127.0.0.1` for loopback and wildcard binds and `[::1]` for an IPv6-loopback bind. A gateway bound to one specific interface omits the variable entirely: backend callbacks carry no `Origin` header, which the gateway's CSRF barrier trusts only from a loopback peer, so a specific-interface origin would have every mutating callback refused. It is never your app's `PORT`, an inherited `KIROCREW_PORT`, a config value, a default, or a request-derived value, so a child can never be pointed at a sibling gateway. Without loopback bound-address evidence the variable is omitted entirely (see below). |
+| `KIROCREW_PROXY_SECRET` | only if a secret exists | The per-app secret used to verify the `X-KiroCrew-Proxy` header (see above). |
+| `KIROCREW_SPAWNED` | yes | `1`: a Kiro Crew gateway spawned this process. |
+| `KIROCREW_SPAWN_INSTANCE` | yes | An id unique to this spawn. |
+| `KIROCREW_GATEWAY_ORIGIN_PROOF` | only if a secret exists and the origin is set | `HMAC-SHA256(app_secret, KIROCREW_GATEWAY_ORIGIN)`, hex. Recompute it with your secret to confirm the injected origin was minted by this gateway, rather than an inherited or spoofed env value. Omitted whenever the origin is omitted (nothing to prove) or no secret exists (nothing to key it with). |
+
+Security and lifecycle:
+
+- When a backend's leader exits and leaves its process group behind, the gateway
+  reaps that group by signalling only the members that carry both
+  `KIROCREW_SPAWNED` and this spawn's `KIROCREW_SPAWN_INSTANCE`. A child process
+  your backend starts must inherit both and stay in the backend's session group,
+  or it is not reaped.
+- The per-app secret lives on disk at `<KIROCREW_HOME>/apps/<name>/.app_secret`, written
+  owner-only `0600` (owner-only DACL on Windows) by the gateway.
+- If no `.app_secret` exists, the gateway injects neither the secret nor anything derived from
+  it (including the proof); a secret-less backend is otherwise unchanged.
+- `KIROCREW_GATEWAY_ORIGIN` is fail-closed: it is present only when the gateway has real
+  evidence of the port it bound. A gateway that has not exported a valid `KIROCREW_BOUND_PORT`
+  hands the backend no origin, so a backend that needs a callback base stays dormant rather
+  than trusting a guessed address.
+- The origin and its proof are recomputed on every spawn, so a gateway restarted on a
+  different bound port hands the backend the current origin. That freshness guarantee is
+  scoped to SPAWNED instances: an externally managed backend the gateway ADOPTS (already
+  healthy on its port) keeps the environment of the generation that started it, so its
+  origin can be stale. A backend that keeps a long-lived callback base should treat
+  persistent push failures as a stale origin and restart to pick up the current one.
+- The proof is a SPAWN-TIME attestation, not a liveness or freshness signal: it says the
+  origin value in your environment was planted by a gateway holding your `.app_secret`
+  when your process started. Because the secret persists across gateway generations, a
+  stale origin (the adopted case above) still carries a valid proof — verifying the proof
+  tells you the origin was not planted by a secret-less spawner, and nothing about whether
+  that gateway is still the one serving. Do not use it as origin-trust for a long-lived
+  process; use the push-failure/restart guidance above for that.
+
+Using the origin for notifications:
+
+An entryPoint backend that declares `notifications.channels` in `app.json` pushes with
+`POST {KIROCREW_GATEWAY_ORIGIN}/api/notifications/push`, authenticating with its app secret
+(see App Notifications). Verify `KIROCREW_GATEWAY_ORIGIN_PROOF` before you trust the origin as
+your callback base. If `KIROCREW_GATEWAY_ORIGIN` is unset the gateway did not publish a
+bound-port origin, so the backend has no callback base and should not push.
 
 ## App Dev Mode (live reload)
 

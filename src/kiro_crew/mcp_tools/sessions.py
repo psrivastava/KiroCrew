@@ -22,7 +22,7 @@ from typing import Any
 
 from kiro_crew import mcp_core
 from kiro_crew.context import RECALL_ROLES
-from kiro_crew.history import ConversationLog
+from kiro_crew.history import ConversationLog, TranscriptBusy, TranscriptWithheld
 from kiro_crew.validation import (
     GET_CHAT_SESSION_SCHEMA,
     LIST_SESSIONS_SCHEMA,
@@ -116,8 +116,8 @@ def schemas() -> list[dict[str, Any]]:
             "description": (
                 "List your recent conversation sessions in this workspace so you "
                 "can see the work in flight and what you've been doing — titles, "
-                "owning agent, message volume, and last-activity time, newest "
-                "first. Use this when the user asks 'what are you working on?', "
+                "owning agent, approximate message volume, and created time, "
+                "ordered by newest activity first. Use this when the user asks 'what are you working on?', "
                 "'what sessions are open?', 'what have we been doing?', or when you "
                 "need a bird's-eye view of your own workspace before acting. This "
                 "is a READ — it never modifies memory or history. It complements "
@@ -214,7 +214,14 @@ def search_chat_history(name: str, args: dict[str, Any]) -> str:
         if before_epoch is not None and modified >= before_epoch:
             continue
 
-        snippet = mcp_core._extract_history_snippet(cl.read_messages(key), query)
+        # Through the derivation seam: the line checked above is a snapshot, and
+        # a writer can tighten it before the rows are read; the seam validates
+        # the line with the rows under one lock and refuses them together.
+        try:
+            rows_for_snippet = cl.derive_messages(key)
+        except TranscriptWithheld:
+            continue
+        snippet = mcp_core._extract_history_snippet(rows_for_snippet, query)
         results.append(
             {
                 "session_key": key,
@@ -338,7 +345,29 @@ def get_chat_session(name: str, args: dict[str, Any]) -> str:
     # from RECALL_ROLES, so passing no roles at all would not be equivalent --
     # recent() treats a falsy roles as "no filter" and would admit internal
     # rows here.
-    messages = cl.recent(key, max_messages=max_messages, roles=RECALL_ROLES)
+    # Through the derivation seam: the line checked above is a snapshot, and a
+    # writer can tighten it before the rows are read; the seam validates the
+    # line with the rows under one lock. Same refusal as above.
+    try:
+        messages = cl.derive_recent(key, max_messages=max_messages, roles=RECALL_ROLES)
+    except TranscriptBusy:
+        # The seam could not take the transcript lock in time (its own save, a
+        # cron append, a second gateway). Not private -- say retry, not refused.
+        mcp_core.sel().log_tool_invocation(
+            session_key=session_key,
+            source="mcp",
+            tool_name="get_chat_session",
+            outcome="busy",
+        )
+        return "That conversation is being written right now; try again in a moment."
+    except TranscriptWithheld:
+        mcp_core.sel().log_tool_invocation(
+            session_key=session_key,
+            source="mcp",
+            tool_name="get_chat_session",
+            outcome="refused_incognito",
+        )
+        return "That conversation is private (incognito/temporary) and cannot be read."
     if not messages:
         mcp_core.sel().log_tool_invocation(
             session_key=session_key,

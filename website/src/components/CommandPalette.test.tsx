@@ -34,7 +34,7 @@ const H = vi.hoisted(() => {
     chat: {
       slotStatusDetail: {} as Record<
         string,
-        { kind: string; text: string; ts: number; toolName?: string }
+        { kind: string; purpose?: string; label?: string; ts: number; toolName?: string }
       >,
     },
   }
@@ -442,8 +442,67 @@ describe('CommandPalette — render', () => {
     expect(H.recentsProvider.search).toHaveBeenCalledTimes(1)
 
     H.storeState.chat.slotStatusDetail = {
-      'chat-1': { kind: 'tool', text: 'Running: read /workspace/src/app.ts', ts: 1 },
+      'chat-1': { kind: 'tool', purpose: 'Running: read /workspace/src/app.ts', ts: 1 },
     }
+    rerender(<CommandPalette open onClose={vi.fn()} />)
+
+    await waitFor(() => expect(H.recentsProvider.search).toHaveBeenCalledTimes(2))
+  })
+
+  it('refreshes recents when only the status string changes under a stable kind and ts', async () => {
+    // The live fingerprint has to read the field each phase actually carries: a
+    // tool phase's `purpose`, any other phase's `label`. A refinement that
+    // rewrites the purpose (same kind, same tick) must still re-run the search.
+    H.storeState.dashboard.slots = [
+      { key: 'chat-1', title: 'Live session', running: true, messages: 2 },
+    ]
+    H.storeState.chat.slotStatusDetail = {
+      'chat-1': { kind: 'tool', purpose: 'Terminal', ts: 1 },
+    }
+    const { rerender } = render(<CommandPalette open onClose={vi.fn()} />, { wrapper })
+    await screen.findByText('Recent Session')
+    expect(H.recentsProvider.search).toHaveBeenCalledTimes(1)
+
+    H.storeState.chat.slotStatusDetail = {
+      'chat-1': { kind: 'tool', purpose: 'List the temp dir', ts: 1 },
+    }
+    rerender(<CommandPalette open onClose={vi.fn()} />)
+    await waitFor(() => expect(H.recentsProvider.search).toHaveBeenCalledTimes(2))
+
+    H.storeState.chat.slotStatusDetail = {
+      'chat-1': { kind: 'thinking', label: 'Compacting…', ts: 1 },
+    }
+    rerender(<CommandPalette open onClose={vi.fn()} />)
+    await waitFor(() => expect(H.recentsProvider.search).toHaveBeenCalledTimes(3))
+
+    H.storeState.chat.slotStatusDetail = {
+      'chat-1': { kind: 'thinking', ts: 1 },
+    }
+    rerender(<CommandPalette open onClose={vi.fn()} />)
+    await waitFor(() => expect(H.recentsProvider.search).toHaveBeenCalledTimes(4))
+  })
+
+  it('refreshes recents when last_ts advances beyond a nonempty activity timestamp', async () => {
+    H.storeState.dashboard.slots = [
+      {
+        key: 'chat-1',
+        title: 'Live session',
+        running: false,
+        messages: 2,
+        last_activity_ts: '2026-07-19T10:00:00Z',
+        last_ts: '2026-07-21T10:00:00Z',
+      },
+    ]
+    const { rerender } = render(<CommandPalette open onClose={vi.fn()} />, { wrapper })
+    await screen.findByText('Recent Session')
+    expect(H.recentsProvider.search).toHaveBeenCalledTimes(1)
+
+    H.storeState.dashboard.slots = [
+      {
+        ...H.storeState.dashboard.slots[0],
+        last_ts: '2026-07-22T10:00:00Z',
+      },
+    ]
     rerender(<CommandPalette open onClose={vi.fn()} />)
 
     await waitFor(() => expect(H.recentsProvider.search).toHaveBeenCalledTimes(2))
@@ -457,7 +516,7 @@ describe('CommandPalette — render', () => {
       { key: 'chat-1', title: 'Live session', running: true, messages: 2 },
     ]
     H.storeState.chat.slotStatusDetail = {
-      'chat-1': { kind: 'tool', text: 'Reading the app entrypoint', ts: 1 },
+      'chat-1': { kind: 'tool', purpose: 'Reading the app entrypoint', ts: 1 },
     }
     const { rerender } = render(<CommandPalette open onClose={vi.fn()} />, { wrapper })
     await screen.findByText('Recent Session')
@@ -1077,5 +1136,74 @@ describe('CommandPalette — sub-threshold min-query empty state (issue #1830)',
 
     expect(await screen.findByText('No matches', {}, { timeout: 2000 })).toBeInTheDocument()
     expect(screen.queryByText(KEEP_TYPING)).toBeNull()
+  })
+})
+
+/**
+ * Dismissing the palette gives focus back to whatever held it when
+ * the palette opened (falling back to the chat composer when that element is
+ * gone). Choosing a row does NOT restore: the chosen action owns focus.
+ */
+describe('CommandPalette — focus restore on close', () => {
+  function outside(tag: 'button' | 'textarea', attrs: Record<string, string> = {}) {
+    const el = document.createElement(tag)
+    for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, v)
+    document.body.appendChild(el)
+    return el
+  }
+  afterEach(() => {
+    document.body.querySelectorAll('[data-test-outside]').forEach(el => el.remove())
+  })
+
+  it('refocuses the element that was focused before the palette opened', async () => {
+    const prev = outside('button', { 'data-test-outside': '' })
+    prev.focus()
+    const { rerender } = render(<CommandPalette open onClose={vi.fn()} />, { wrapper })
+    await screen.findByText('Recent Session')
+    // The palette's input takes focus on the next frame.
+    await waitFor(() => expect(document.activeElement).toBe(document.querySelector('input')))
+
+    rerender(<CommandPalette open={false} onClose={vi.fn()} />)
+
+    expect(document.activeElement).toBe(prev)
+  })
+
+  it('falls back to the chat composer when the previous element is gone', async () => {
+    const composer = outside('textarea', { 'data-test-outside': '', 'data-composer-input': '' })
+    const prev = outside('button', { 'data-test-outside': '' })
+    prev.focus()
+    const { rerender } = render(<CommandPalette open onClose={vi.fn()} />, { wrapper })
+    await screen.findByText('Recent Session')
+    prev.remove()
+
+    rerender(<CommandPalette open={false} onClose={vi.fn()} />)
+
+    expect(document.activeElement).toBe(composer)
+  })
+
+  it('leaves focus alone when nothing was focused before opening', async () => {
+    const composer = outside('textarea', { 'data-test-outside': '', 'data-composer-input': '' })
+    ;(document.activeElement as HTMLElement | null)?.blur()
+    const { rerender } = render(<CommandPalette open onClose={vi.fn()} />, { wrapper })
+    await screen.findByText('Recent Session')
+
+    rerender(<CommandPalette open={false} onClose={vi.fn()} />)
+
+    expect(document.activeElement).not.toBe(composer)
+  })
+
+  it('does not restore after a row is chosen (its action owns focus)', async () => {
+    const prev = outside('button', { 'data-test-outside': '' })
+    prev.focus()
+    const onClose = vi.fn()
+    const { rerender } = render(<CommandPalette open onClose={onClose} />, { wrapper })
+    await screen.findByText('Recent Session')
+    await waitFor(() => expect(document.activeElement).toBe(document.querySelector('input')))
+
+    act(() => H.nav.current?.onChoose?.(0, false))
+    expect(onClose).toHaveBeenCalledTimes(1)
+    rerender(<CommandPalette open={false} onClose={onClose} />)
+
+    expect(document.activeElement).not.toBe(prev)
   })
 })

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { selectContinuable, selectTurnInterrupted } from '../store/chatSlice'
+import reducer, { appendMessage, confirmOptimisticSend, selectContinuable, selectTurnInterrupted } from '../store/chatSlice'
 import { slotIsRemoteBound } from '../store/dashboardSlice'
 import type { ChatMessage } from '../types'
 
@@ -21,7 +21,7 @@ import type { ChatMessage } from '../types'
 const msg = (role: string, content = 'x', meta?: Record<string, unknown>): ChatMessage =>
   ({ role, content, cls: '', ...(meta ? { meta } : {}) }) as ChatMessage
 
-const state = (over: Partial<{ messages: ChatMessage[]; slotRunning: boolean; slotStopping: boolean; pendingTurnSlot: string | null }> = {}, slots: Array<{ key: string; orchestrating?: boolean; subagents_running?: boolean; executor?: 'local' | 'remote' }> = []) =>
+const state = (over: Partial<{ messages: ChatMessage[]; slotRunning: boolean; slotStopping: boolean; pendingTurnSlot: string | null }> = {}, slots: Array<{ key: string; subagents_running?: boolean; executor?: 'local' | 'remote' }> = []) =>
   ({
     chat: {
       messages: [],
@@ -142,31 +142,24 @@ describe('selectContinuable', () => {
     expect(selectContinuable(state({ messages: [msg('user')], pendingTurnSlot: 'slot-1' }))).toBe(false)
   })
 
-  it('is false while an autopilot plan is mid-flight', () => {
-    // A plan reads `running` False BETWEEN stages, so `running` alone would offer
-    // Continue on a slot the server refuses with `slot_orchestrating`.
-    expect(selectContinuable(state({ messages: [msg('user')] }, [{ key: 'slot-1', orchestrating: true }]))).toBe(false)
-  })
-
   it('is false while a subagent is still running on the slot', () => {
     expect(selectContinuable(state({ messages: [msg('user')] }, [{ key: 'slot-1', subagents_running: true }]))).toBe(false)
   })
 
-  it('is unaffected by another slot orchestrating', () => {
-    expect(selectContinuable(state({ messages: [msg('user')] }, [{ key: 'other', orchestrating: true }]))).toBe(true)
+  it('is unaffected by a subagent running on another slot', () => {
+    expect(selectContinuable(state({ messages: [msg('user')] }, [{ key: 'other', subagents_running: true }]))).toBe(true)
   })
 
   it('is false on a crew-bound slot — the server refuses Continue there', () => {
-    // `remote_bound_refusal` answers 409 `remote_action_unsupported` for
+    // `relay_archive_refusal` answers 409 `relay_archive_read_only` for
     // `executor == "remote"`, so an offer here is a button that cannot work.
     expect(selectContinuable(state({ messages: [msg('user')] }, [{ key: 'slot-1', executor: 'remote' }]))).toBe(false)
   })
 
   it('is false on a crew-bound slot whose relayed turn died mid-stream', () => {
-    // The reported shape, and the reason the guard is not merely defensive:
-    // `relay_remote_turn`'s failure path appends this trailing `error` row, so
-    // without the guard a dropped tunnel leaves the composer offering a
-    // guaranteed-409 Resume. `selectTurnInterrupted` still reads it as
+    // An archive whose last relayed turn died ends on this trailing `error`
+    // row, so without the guard the composer would offer a guaranteed-409
+    // Resume. `selectTurnInterrupted` still reads it as
     // interrupted — that half is true and unchanged; only availability moves.
     const bound = state({ messages: [
       msg('user', 'what shall we do?'),
@@ -363,10 +356,80 @@ describe('selectTurnInterrupted', () => {
     }
   })
 
-  it('reads past an injected recovery row to the real floor beneath it', () => {
+  it('reads an injected recovery row as a turn opener', () => {
     expect(selectTurnInterrupted(state({
-      messages: [msg('user'), msg('inject', '[Continue — requested by the user]\nresume')],
+      messages: [msg('user'), msg('inject', '[Continue — requested by the user]\nresume', { injectKind: 'recovery' })],
     }))).toBe(true)
+  })
+
+  it('does not let an older Stop mask a newer interrupted inject turn', () => {
+    for (const injectKind of ['cron', 'recovery', 'user_replay', 'synthesis']) {
+      expect(selectTurnInterrupted(state({
+        messages: [
+          msg('user', 'first'),
+          msg('system', 'Stopped', { kind: 'stop_event' }),
+          msg('inject', 'continue queued work', { injectKind }),
+          msg('tool', 'read complete'),
+        ],
+      }))).toBe(true)
+    }
+  })
+
+  it('treats an answered dispatching inject as finished', () => {
+    expect(selectTurnInterrupted(state({
+      messages: [msg('user'), msg('inject', 'go on', { injectKind: 'user_replay' }), msg('assistant', 'done')],
+    }))).toBe(false)
+  })
+
+  it('looks through an untagged inject (note, hook halt, refusal notice) to the real floor', () => {
+    // These rows dispatch nothing, so a trailing one is not an unanswered turn
+    // and a deliberately halted run must not offer Resume.
+    for (const meta of [undefined, { noteSession: 'dashboard:front' }, { injectKind: 'unknown' }, { injectKind: 7 }]) {
+      expect(selectTurnInterrupted(state({
+        messages: [msg('user', 'first'), msg('assistant', 'answered'), msg('inject', 'halted', meta)],
+      }))).toBe(false)
+      expect(selectTurnInterrupted(state({
+        messages: [msg('user', 'first'), msg('inject', 'halted', meta)],
+      }))).toBe(true)
+    }
+  })
+
+  // The composer mints its bubble with `meta.optimistic`, and only the send's
+  // own receipt or a correlated echo clears it. Until one does, nothing proves
+  // the server ever received the text, so no turn was opened and none was
+  // interrupted: a Resume offered here posts a bare continue against a
+  // transcript that never held this message, and the agent answers the
+  // request before it. The flag is client-minted and never sent, so the
+  // backend mirror `is_turn_interrupted` never sees a row carrying it and
+  // needs no matching branch.
+  it('is false while the trailing user row is an unconfirmed optimistic send', () => {
+    expect(selectTurnInterrupted(state({
+      messages: [msg('user', 'first'), msg('assistant', 'answered'), msg('user', 'did this arrive?', { optimistic: true, sendId: 's-1' })],
+    }))).toBe(false)
+    expect(selectTurnInterrupted(state({
+      messages: [msg('user', 'did this arrive?', { optimistic: true, sendId: 's-1' })],
+    }))).toBe(false)
+  })
+
+  it('does not let a send-failure error row behind the unconfirmed send read as an interruption', () => {
+    // A `transport-error` appends its error row after the bubble and leaves the
+    // bubble standing; the error is about the send, not about a reply that died.
+    expect(selectTurnInterrupted(state({
+      messages: [msg('user', 'first'), msg('assistant', 'answered'), msg('user', 'did this arrive?', { optimistic: true, sendId: 's-1' }), msg('error', 'Connection error')],
+    }))).toBe(false)
+  })
+
+  it('reads the same row as an interrupted turn once confirmOptimisticSend clears the flag', () => {
+    // The receipt path of a delivered send: the flag goes, the row is the
+    // server's, and an unanswered one is an interruption exactly as before.
+    let chat = { ...reducer(undefined, { type: '@@INIT' }), activeSlot: 'slot-1' }
+    chat = reducer(chat, appendMessage({ role: 'user', content: 'did this arrive?', cls: '', meta: { sendId: 's-1' } }))
+    expect(chat.messages[0].meta?.optimistic).toBe(true)
+    expect(selectTurnInterrupted({ chat, dashboard: { slots: [] } } as never)).toBe(false)
+
+    chat = reducer(chat, confirmOptimisticSend({ slot: 'slot-1', sendId: 's-1' }))
+    expect(chat.messages[0].meta?.optimistic).toBeUndefined()
+    expect(selectTurnInterrupted({ chat, dashboard: { slots: [] } } as never)).toBe(true)
   })
 })
 
@@ -374,7 +437,7 @@ describe('selectTurnInterrupted', () => {
  * The shared crew-bound predicate. `selectContinuable` (above) and ChatPage's
  * regenerate / edit-resend gates both route through this ONE spelling, so the
  * two client surfaces cannot drift from each other or from the server's
- * `remote_bound_refusal`. The `selectContinuable` cases above already exercise
+ * `relay_archive_refusal`. The `selectContinuable` cases above already exercise
  * it end-to-end (executor: 'remote' -> not continuable); these pin the predicate
  * itself, including the keying that a slot-object test could otherwise leave
  * ambiguous.

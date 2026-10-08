@@ -21,13 +21,18 @@ from kiro_crew.config.loader import (
     config_path,
     update_config_locked,
 )
-from kiro_crew.constants import BANNER, DATA_WARNING
+from kiro_crew.config.paths import data_home
+from kiro_crew.constants import BANNER
 from kiro_crew.hooks import (
     TOOL_DENY,
     HookManager,
     hooks_config_from_config_dict,
     mcp_identity_ref,
     target_paths,
+)
+from kiro_crew.permission_floor import (
+    OUTCOME_PENDING_APPROVAL,
+    OUTCOME_REJECTED_TRANSPORT_FLOOR,
 )
 from kiro_crew.providers.base import (
     EVENT_COMPLETE,
@@ -39,6 +44,8 @@ from kiro_crew.providers.base import (
 from kiro_crew.sandbox import SandboxCeilingUnsealable
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
+from kiro_crew.shell_audit_log import rotate_shell_audit_log
+from kiro_crew.start_priority import StartPriority
 from kiro_crew.terminal_safe import safe_terminal_line
 
 logger = logging.getLogger(__name__)
@@ -280,6 +287,8 @@ async def _chat(message: str | None, model: str | None, agent: str | None = None
     provider: LLMProvider = build_provider_factory(cfg)(
         _CLI_SESSION_KEY, agent=agent_name, channel_id=channel_id
     )
+    # The person at the terminal waits on every start (kiro_crew.start_priority).
+    provider.start_priority = StartPriority.FOREGROUND
     # This consumer implements the low-fidelity child downgrade, so opt in:
     # without this the handle-level fail-close gate rejects every low-fidelity
     # child permission request before it reaches `_answer_permission`, audited
@@ -297,6 +306,21 @@ async def _chat(message: str | None, model: str | None, agent: str | None = None
     # Built once per process, not per request: a permission request must not
     # depend on a config read succeeding while the turn is parked.
     gate = _build_tool_gate(agent_name or "")
+    # The bundled ``postToolUse`` hook appends every ``execute_bash`` call to
+    # ``<data home>/audit.log`` from inside kiro-cli, whichever process launched
+    # it, and the sweep that bounds that file runs on the gateway's cleanup loop
+    # (``SessionCleanup``), which this process never starts. An install that
+    # only ever runs ``kirocrew chat`` would therefore never rotate the file, so
+    # the same sweep runs here once, before the backend that will append is
+    # spawned: the live file is bounded on entry to every chat session and
+    # overshoots the cap by at most one session's shell activity. The data home
+    # is resolved in this process with ``data_home()``, the resolve-only helper:
+    # it honours the ``KIROCREW_HOME`` override the hook's own path expansion
+    # reads and runs no start-of-process maintenance, which has no place on the
+    # event loop. Blocking filesystem work over an agent-writable tree, so it
+    # runs on a worker thread; the sweep never raises by contract, and a file
+    # under the cap costs one ``stat`` and creates nothing.
+    await asyncio.to_thread(rotate_shell_audit_log, data_home())
     # A permission prompt cancelled at the terminal raises through the turn by
     # design (the request is deliberately left unanswered, see
     # `_answer_permission`), so the teardown belongs in `finally` rather than on
@@ -847,6 +871,7 @@ async def _answer_permission(
             mcp_server_name=event.mcp_server_name,
             mcp_tool_name=event.tool_name,
             mcp_identity_trusted=event.mcp_identity_trusted,
+            spawn_target=event.spawn_target,
         )
     except Exception:
         logger.warning("CLI permission gate failed; refusing the request", exc_info=True)
@@ -885,9 +910,15 @@ async def _answer_permission(
         await provider.reject_tool(event.request_id)
         try:
             safe_title = _for_consent(title, stream=sys.stderr)
+            # Name what actually failed. A request whose kind reads as a command
+            # claimed one; a request with no classification at all claimed
+            # nothing, and saying it did sends the reader after the wrong defect.
+            if is_shell_kind(_kind_text(event)):
+                what = "claims to run a command, but its command could not be verified"
+            else:
+                what = "could not be identified as a known tool call, so it cannot be verified"
             _print_permission_notice(
-                f"\nDenied automatically: {safe_title} claims to run a command, "
-                "but its command could not be verified.\n"
+                f"\nDenied automatically: {safe_title} {what}.\n"
                 "   Ask the agent to retry the tool call."
             )
         except Exception:
@@ -991,7 +1022,7 @@ async def _answer_permission(
         # best-effort by necessity -- the writer that just failed is the only one
         # available -- so it is attempted and its own failure only logged.
         try:
-            await _audit_off_loop(gate, event, "allowed", critical=True)
+            await _audit_off_loop(gate, event, OUTCOME_PENDING_APPROVAL, critical=True)
         except Exception:
             logger.warning("SEL audit unwritable; refusing the approved call", exc_info=True)
             await _audit_refusal(gate, event, error=_UNAUDITABLE_CODE)
@@ -1006,7 +1037,9 @@ async def _answer_permission(
             except Exception:
                 logger.warning("Could not prepare the CLI audit-denial notice", exc_info=True)
             return
-        await provider.approve_tool(event.request_id)
+        approval_sent = await provider.approve_tool(event.request_id)
+        outcome = OUTCOME_REJECTED_TRANSPORT_FLOOR if approval_sent is False else "allowed"
+        await _audit_off_loop(gate, event, outcome)
     else:
         # Deliberately NOT critical, and the asymmetry is the point: this call is
         # already being refused, so a lost record cannot authorize anything. Making
@@ -1062,7 +1095,6 @@ async def _interactive(
 ) -> None:
     """REPL loop — read user input, stream responses, auto-compact at configured threshold."""
     print(BANNER)
-    print(DATA_WARNING)
     print()
 
     print("Type your message (Ctrl+D or 'exit' to quit)\n")

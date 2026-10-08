@@ -265,7 +265,7 @@ describe('ChatInput paste: showFullPastes', () => {
       <ChatInput value="" onChange={onChange} onSend={vi.fn()} onPasteBlocksChange={onPasteBlocksChange} />,
     )
     pasteText(screen.getByRole('textbox'), big)
-    expect(onChange).toHaveBeenCalledWith('[ Paste #1 · 4 lines ]')
+    expect(onChange).toHaveBeenCalledWith(expect.stringMatching(/^\[ Paste #1(?:\u2063[\u200b\u200c]+\u2063)? · 4 lines \]$/))
     expect(onPasteBlocksChange).toHaveBeenCalledWith([expect.objectContaining({ seq: 1, lines: 4, content: big })])
   })
 
@@ -293,6 +293,34 @@ describe('ChatInput paste: showFullPastes', () => {
     // preventDefault, or the paste becomes a silent no-op.
     expect(onChange).not.toHaveBeenCalled()
     expect(onPasteBlocksChange).not.toHaveBeenCalled()
+  })
+})
+
+describe('ChatInput paste: raw-paste chord', () => {
+  const big = `${'x'.repeat(250)}\nsecond\nthird\nfourth`
+  const chordThenPaste = (init: KeyboardEventInit) => {
+    const onPasteBlocksChange = vi.fn()
+    renderWithProviders(
+      <ChatInput value="" onChange={vi.fn()} onSend={vi.fn()} onPasteBlocksChange={onPasteBlocksChange} />,
+    )
+    const textarea = screen.getByRole('textbox')
+    fireEvent.keyDown(textarea, init)
+    fireEvent.paste(textarea, { clipboardData: { types: ['text/plain'], items: [], getData: () => big } })
+    return onPasteBlocksChange
+  }
+
+  it.each([
+    ['Ctrl+Shift+V', { key: 'V', code: 'KeyV', ctrlKey: true, shiftKey: true }],
+    ['Cmd+Option+Shift+V', { key: '◊', code: 'KeyV', metaKey: true, altKey: true, shiftKey: true }],
+  ])('keeps a large paste after %s out of a chip', (_chord, init) => {
+    expect(chordThenPaste(init)).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ['Cmd+Option+V', { key: '√', code: 'KeyV', metaKey: true, altKey: true }],
+    ['Ctrl+Alt+Shift+V', { key: 'V', code: 'KeyV', ctrlKey: true, altKey: true, shiftKey: true }],
+  ])('still collapses a large paste after %s', (_chord, init) => {
+    expect(chordThenPaste(init)).toHaveBeenCalledWith([expect.objectContaining({ seq: 1, lines: 4, content: big })])
   })
 })
 

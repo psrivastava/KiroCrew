@@ -5,7 +5,7 @@ import { useQuickSearchShortcut } from '../../hooks/useQuickSearchShortcut'
 import { usePanelToggleShortcuts } from '../../hooks/usePanelToggleShortcuts'
 import { useGlobalHotkey } from '../../hooks/useGlobalHotkey'
 import { formatChordKeys, type QuickSearchMode } from '../../lib/quickSearchShortcut'
-import { PANEL_TOGGLE_IDS, PANEL_TOGGLES_SKIPPING_SHELL } from '../../lib/panelToggleShortcuts'
+import { PANEL_TOGGLE_IDS, PANEL_TOGGLES_SKIPPING_SHELL, TERMINAL_PANEL_TOGGLE_IDS } from '../../lib/panelToggleShortcuts'
 import { useTerminalEnabled } from '../../utils/terminalRegistry'
 import { Btn } from '../../components/ui'
 
@@ -73,7 +73,7 @@ function PanelToggleConfig() {
   const terminalEnabled = useTerminalEnabled()
   return (
     <>
-      {PANEL_TOGGLE_IDS.filter(id => id !== 'terminal' || terminalEnabled).map(id => {
+      {PANEL_TOGGLE_IDS.filter(id => !TERMINAL_PANEL_TOGGLE_IDS.has(id) || terminalEnabled).map(id => {
         const chord = bindings[id]
         const recording = recordingId === id
         const caps = chord ? formatChordKeys(chord) : []
@@ -150,7 +150,7 @@ export function ShortcutsPanel() {
         {IS_MAC && (
           <SettingsToggle
             label={i18nT('pages.settings.shortcutsPanel.use_ctrl_not_option_for_chat_1_9')}
-            description={i18nT('pages.settings.shortcutsPanel.bind_chat_tab_switching_to_ctrl_digit_instead_of')}
+            hint={i18nT('pages.settings.shortcutsPanel.bind_chat_tab_switching_to_ctrl_digit_instead_of')}
             checked={macCtrl}
             onChange={toggleMacCtrl}
           />

@@ -89,16 +89,108 @@ export interface RosterQuery {
   source: MemberSourceFilter
   status: ReadonlySet<MemberStatusFilter>
   sort: MemberSort
+  /** The default crew's name (top-level `default_agent`). It is listed whatever
+   *  its record says — see `listedByDefault`. `''` while unknown; `null` when
+   *  the lookup FAILED, which turns the hide rule off so the default crew is
+   *  never hidden by a read error. */
+  defaultAgent: string | null
+  /** The crewmate open in the thread, if any. It stays listed while open, so a
+   *  hidden row the user reached through the search does not vanish from the
+   *  roster under its own chat when the search is cleared. */
+  chosen?: string
 }
 
-interface RosterRowLike { name: string; starred?: boolean; source?: unknown; last_active_ts?: number }
+interface RosterRowLike {
+  name: string; display_name?: string; starred?: boolean; source?: unknown; last_active_ts?: number
+  last_chat_ts?: number
+  dashboard_created?: unknown; has_dm_message?: unknown; last_message?: unknown
+}
 
-/** Most-recently-active first (like any IM member list); never-talked members
- *  fall to the bottom alphabetically. `name` is a plain locale-aware sort. */
+/** What the roster row RENDERS as its title: the display label when set, the
+ *  name otherwise. Sort and search go through the same accessor so the list
+ *  the user reads is the list these functions order and narrow. */
+function rowLabel(m: RosterRowLike): string {
+  return m.display_name?.trim() || m.name
+}
+
+/** The search box's match: a case-insensitive substring of the name or of
+ *  the displayed label. One function so the hide rule below and the narrowing
+ *  agree on what "the search reaches" means. */
+function matchesSearch(m: RosterRowLike, needle: string): boolean {
+  return m.name.toLowerCase().includes(needle) || rowLabel(m).toLowerCase().includes(needle)
+}
+
+/** Whether the roster lists a row WITHOUT being asked for it: only a crew the
+ *  user has actually chatted with (`last_chat_ts`, recorded server-side when
+ *  the person sends it a message in its DM or in a normal chat), or one the
+ *  user starred. A crew that only ran in the background -- a cron, a wake, a
+ *  sub-agent, a dispatched worker -- or that an app drove is hidden until the
+ *  search reaches it, the default crew included.
+ *
+ *  A row from an older gateway carries no `last_chat_ts`, and keeps that
+ *  gateway's rule (DM thread holds a message, created on the dashboard, the
+ *  default crew): hiding on an absent field would blank the roster on a
+ *  mixed-version deploy. `defaultAgent === null` (the lookup failed) lists
+ *  every such row, since that rule cannot tell which row it must never hide. */
+export function listedByDefault(m: RosterRowLike, defaultAgent: string | null): boolean {
+  if (m.starred === true) return true
+  if (typeof m.last_chat_ts === 'number') return m.last_chat_ts > 0
+  if (defaultAgent === null) return true
+  if (defaultAgent !== '' && m.name === defaultAgent) return true
+  if (m.dashboard_created === undefined && m.has_dm_message === undefined) return true
+  return (
+    m.has_dm_message === true ||
+    m.dashboard_created === true ||
+    (typeof m.last_message === 'string' && m.last_message.trim() !== '')
+  )
+}
+
+/** Whether the roster shows this row for `query`, before the star / origin /
+ *  status filters: listed by default, or reached by a typed search. With a
+ *  search typed the search decides alone — a hidden row it reaches shows, a
+ *  listed row it misses does not. */
+export function rosterShows(
+  m: RosterRowLike,
+  query: Pick<RosterQuery, 'search' | 'defaultAgent' | 'chosen'>,
+): boolean {
+  const q = query.search.trim().toLowerCase()
+  if (q) return matchesSearch(m, q)
+  return listedByDefault(m, query.defaultAgent) || (!!query.chosen && m.name === query.chosen)
+}
+
+/** The rows the roster is ABOUT for `query`: every row listed by default plus
+ *  any hidden row the typed search reaches. This is the population the header
+ *  count, the "N of M" and the filter menu's tallies read, so a count never
+ *  includes a row the user cannot get to -- and, as before, the search itself
+ *  never SHRINKS the count (it is transient, not a filter), it can only add the
+ *  hidden rows it surfaces. */
+export function rosterPopulation<M extends RosterRowLike>(
+  members: readonly M[],
+  query: Pick<RosterQuery, 'search' | 'defaultAgent' | 'chosen'>,
+): M[] {
+  const q = query.search.trim().toLowerCase()
+  return members.filter(
+    (m) =>
+      listedByDefault(m, query.defaultAgent) ||
+      (!!query.chosen && m.name === query.chosen) ||
+      (q !== '' && matchesSearch(m, q)),
+  )
+}
+
+/** A row's place in the Recent order: the user's own last message
+ *  (`last_chat_ts`), never a background turn. An older gateway's row, which
+ *  has no such field, falls back to its `last_active_ts`. */
+export function chatRecency(m: RosterRowLike): number {
+  return (typeof m.last_chat_ts === 'number' ? m.last_chat_ts : m.last_active_ts) ?? 0
+}
+
+/** Most-recently-CHATTED first (like any IM member list); never-chatted
+ *  members fall to the bottom alphabetically. `name` is a plain locale-aware
+ *  sort over the DISPLAYED label, since that is the text the user scans. */
 export function sortRoster<M extends RosterRowLike>(members: readonly M[], sort: MemberSort): M[] {
   const out = [...members]
-  if (sort === 'name') return out.sort((a, b) => compareText(a.name, b.name))
-  return out.sort((a, b) => (b.last_active_ts ?? 0) - (a.last_active_ts ?? 0) || compareText(a.name, b.name))
+  if (sort === 'name') return out.sort((a, b) => compareText(rowLabel(a), rowLabel(b)))
+  return out.sort((a, b) => chatRecency(b) - chatRecency(a) || compareText(rowLabel(a), rowLabel(b)))
 }
 
 /** True when `query` narrows the roster by something other than the typed
@@ -111,19 +203,19 @@ export function queryNarrows(query: RosterQuery): boolean {
  *  dimensions, OR inside the status set), keeping the order it came in. The
  *  page feeds this its committed display order (sorted once per membership
  *  and per chosen sort with `sortRoster`), so a refetch that advances a
- *  `last_active_ts` never re-sorts rows under the cursor. */
+ *  `last_active_ts` never re-sorts rows under the cursor. Rows the roster
+ *  does not show for this query (`rosterShows`) are out before any filter. */
 export function narrowRoster<M extends RosterRowLike>(
   ordered: readonly M[],
   query: Omit<RosterQuery, 'sort'>,
   signalsOf: (m: M) => MemberSignals,
 ): M[] {
-  const q = query.search.trim().toLowerCase()
   return ordered.filter(
     (m) =>
+      rosterShows(m, query) &&
       (!query.starredOnly || !!m.starred) &&
       matchesSource(m, query.source) &&
-      (query.status.size === 0 || matchesStatus(signalsOf(m), query.status)) &&
-      (!q || m.name.toLowerCase().includes(q)),
+      (query.status.size === 0 || matchesStatus(signalsOf(m), query.status)),
   )
 }
 

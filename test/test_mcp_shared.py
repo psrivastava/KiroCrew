@@ -10,9 +10,20 @@ import sys
 from unittest.mock import patch
 
 import pytest
+from stray_line_helpers import STRAY_LINES, too_deep_to_decode
 
 import kiro_crew.mcp_shared as mcp_shared
-from kiro_crew.mcp_shared import _read_message, respond
+from kiro_crew.mcp_shared import SKIP, _read_message, respond
+
+
+@pytest.fixture(autouse=True)
+def _framing_undetected(monkeypatch):
+    """Every test starts on a stream whose framing is not yet detected.
+
+    Through ``monkeypatch`` so a test that fails mid-way, or a loop thread that
+    detected a framing, cannot leak it into the next test.
+    """
+    monkeypatch.setattr(mcp_shared, "_framing", None)
 
 
 def _make_stdin(data: bytes):
@@ -60,15 +71,12 @@ class _ShortReadStdin:
 
 
 class TestReadMessageContentLength:
-    def setup_method(self):
-        mcp_shared._use_content_length = False
-
     def test_reads_content_length_message(self):
         msg = {"jsonrpc": "2.0", "method": "initialize", "id": 1}
         stdin = _make_stdin(_content_length_frame(msg))
         result = _read_message(stdin)
         assert result == msg
-        assert mcp_shared._use_content_length is True
+        assert mcp_shared._framing == "content-length"
 
     def test_reads_multibyte_utf8(self):
         msg = {
@@ -89,15 +97,14 @@ class TestReadMessageContentLength:
         assert _read_message(stdin) == msg1
         assert _read_message(stdin) == msg2
 
-    def test_malformed_length_continues(self):
-        """Malformed Content-Length skips to next message, flag stays False."""
+    def test_malformed_length_ends_the_stream_and_picks_no_framing(self):
+        """The body behind a length nobody can read cannot be delimited, so the
+        stream ends rather than read later frames joined to it."""
         bad = b"Content-Length: abc\r\n\r\n"
-        good_msg = {"jsonrpc": "2.0", "id": 2}
-        data = bad + json.dumps(good_msg).encode("utf-8") + b"\n"
+        data = bad + json.dumps({"jsonrpc": "2.0", "id": 2}).encode("utf-8") + b"\n"
         stdin = _make_stdin(data)
-        result = _read_message(stdin)
-        assert result == good_msg
-        assert mcp_shared._use_content_length is False
+        assert _read_message(stdin) is None
+        assert mcp_shared._framing != "content-length"
 
     def test_invalid_json_in_content_length_frame_continues(self):
         """Invalid JSON body with correct Content-Length skips to next message."""
@@ -105,8 +112,8 @@ class TestReadMessageContentLength:
         good_msg = {"jsonrpc": "2.0", "id": 3}
         good = json.dumps(good_msg).encode("utf-8") + b"\n"
         stdin = _make_stdin(bad + good)
-        result = _read_message(stdin)
-        assert result == good_msg
+        assert _read_message(stdin) is SKIP
+        assert _read_message(stdin) == good_msg
 
     def test_true_truncation_continues(self):
         """Content-Length larger than available body consumes remaining bytes, skips to next."""
@@ -153,24 +160,116 @@ class TestReadMessageContentLength:
         result = _read_message(stdin)
         assert result is None  # incomplete body discarded, never partially parsed
 
+    @pytest.mark.parametrize("stray", sorted(STRAY_LINES))
+    def test_a_body_that_is_not_an_object_is_one_skipped_frame(self, stray):
+        body = STRAY_LINES[stray]().rstrip(b"\n")
+        framed = f"Content-Length: {len(body)}\r\n\r\n".encode("ascii") + body
+        good = {"jsonrpc": "2.0", "id": 2, "method": "ping"}
+        stdin = _make_stdin(framed + _content_length_frame(good))
+        assert _read_message(stdin) is SKIP
+        assert _read_message(stdin) == good
+
+    def test_an_unparseable_body_is_answered_under_its_recovered_id(self, monkeypatch):
+        answered: list = []
+        monkeypatch.setattr(mcp_shared, "respond", lambda *a, **k: answered.append((a, k)))
+        body = b'{"jsonrpc":"2.0","id":7,"method":"tools/list","params":{"s":"\xff"}}'
+        framed = f"Content-Length: {len(body)}\r\n\r\n".encode("ascii") + body
+        good = {"jsonrpc": "2.0", "id": 2, "method": "ping"}
+        stdin = _make_stdin(framed + _content_length_frame(good))
+        assert _read_message(stdin) is SKIP
+        assert _read_message(stdin) == good
+        [(args, kwargs)] = answered
+        assert args[0] == 7 and kwargs["error"]["code"] == mcp_shared.JSONRPC_PARSE_ERROR
+
+    @pytest.mark.parametrize(
+        "big",
+        [
+            {"jsonrpc": "2.0", "id": 1, "method": "ping", "params": {"pad": "x" * 64}},
+            # The MCP TypeScript SDK writes the id last.
+            {
+                "method": "ping",
+                "params": {"pad": "x" * 64, "id": "nested"},
+                "jsonrpc": "2.0",
+                "id": 1,
+            },
+        ],
+        ids=["id-first", "id-last"],
+    )
+    def test_a_body_over_the_cap_is_drained_and_answered(self, monkeypatch, big):
+        """Drained in bounded reads, never held whole, and answered with the id it
+        carries at its top level: dropped silently, its caller waited forever."""
+        answered: list = []
+        monkeypatch.setattr(mcp_shared, "respond", lambda *a, **k: answered.append((a, k)))
+        monkeypatch.setattr(mcp_shared, "MAX_CONTENT_LENGTH_BYTES", 60)
+        monkeypatch.setattr(mcp_shared, "_DRAIN_CHUNK_BYTES", 5)
+        # Long enough for the top-level ``method`` member, which marks a request.
+        monkeypatch.setattr(mcp_shared, "ID_PROBE_BYTES", 48)
+        good = {"jsonrpc": "2.0", "id": 2, "method": "ping"}
+        stdin = _make_stdin(_content_length_frame(big) + _content_length_frame(good))
+        assert _read_message(stdin) is SKIP
+        assert _read_message(stdin) == good
+        [(args, kwargs)] = answered
+        assert args[0] == 1
+        assert kwargs["error"]["code"] == mcp_shared.JSONRPC_INVALID_REQUEST
+
+    def test_the_body_cap_is_the_gateways_read_limit(self):
+        """The constant's comment says so; a copy could drift without a test."""
+        from kiro_crew.mcp_gateway import pool
+
+        assert mcp_shared.MAX_CONTENT_LENGTH_BYTES == pool._DEFAULT_READ_BUFFER_LIMIT
+
+    @pytest.mark.parametrize("length", [10**20, 2**62], ids=["over-ssize", "2**62"])
+    def test_a_length_past_any_drainable_size_ends_the_stream_loudly(self, length, caplog):
+        """Draining to it would swallow every later request, and one
+        ``raw.read`` of it raises OverflowError or MemoryError."""
+        later = _content_length_frame({"jsonrpc": "2.0", "id": 2, "method": "ping"})
+        stdin = _make_stdin(f"Content-Length: {length}\r\n\r\n".encode("ascii") + later)
+        with caplog.at_level("ERROR", logger=mcp_shared.__name__):
+            assert _read_message(stdin) is None
+        assert any("framing is lost" in r.getMessage() for r in caplog.records)
+
+    @pytest.mark.parametrize(
+        "header",
+        [
+            b"Content-Length: abc",
+            b"Content-Length: -5",
+            b"Content-Length: \xff",
+            b"Content-Length: " + b"9" * 5000,
+        ],
+        ids=["word", "negative", "undecodable", "over-digit-limit"],
+    )
+    def test_an_unreadable_length_on_a_framed_stream_ends_it_loudly(
+        self, header, monkeypatch, caplog
+    ):
+        """A body follows the header, and with no length it cannot be delimited:
+        every later frame would be read joined to it and answered as unparseable."""
+        answered: list = []
+        monkeypatch.setattr(mcp_shared, "respond", lambda *a, **k: answered.append((a, k)))
+        first = {"jsonrpc": "2.0", "id": 1, "method": "ping"}
+        body = json.dumps({"jsonrpc": "2.0", "id": 2, "method": "ping"}).encode("utf-8")
+        later = _content_length_frame({"jsonrpc": "2.0", "id": 3, "method": "ping"})
+        stdin = _make_stdin(_content_length_frame(first) + header + b"\r\n\r\n" + body + later)
+        assert _read_message(stdin) == first
+        with caplog.at_level("ERROR", logger=mcp_shared.__name__):
+            assert _read_message(stdin) is None
+        assert any("framing is lost" in r.getMessage() for r in caplog.records)
+        assert answered == []
+
 
 class TestReadMessageBareJson:
-    def setup_method(self):
-        mcp_shared._use_content_length = False
-
     def test_reads_bare_json(self):
         msg = {"jsonrpc": "2.0", "method": "initialize", "id": 1}
         stdin = _make_stdin(json.dumps(msg).encode("utf-8") + b"\n")
         result = _read_message(stdin)
         assert result == msg
-        assert mcp_shared._use_content_length is False
+        assert mcp_shared._framing != "content-length"
 
     def test_skips_invalid_json(self):
         good_msg = {"jsonrpc": "2.0", "id": 1}
         data = b"not json\n" + json.dumps(good_msg).encode("utf-8") + b"\n"
         stdin = _make_stdin(data)
-        result = _read_message(stdin)
-        assert result == good_msg
+        assert _read_message(stdin) is SKIP
+        assert _read_message(stdin) == good_msg
 
     def test_eof_returns_none(self):
         stdin = _make_stdin(b"")
@@ -180,13 +279,87 @@ class TestReadMessageBareJson:
         msg = {"jsonrpc": "2.0", "id": 1}
         data = b"\n\n" + json.dumps(msg).encode("utf-8") + b"\n"
         stdin = _make_stdin(data)
+        assert _read_message(stdin) is SKIP
+        assert _read_message(stdin) is SKIP
         assert _read_message(stdin) == msg
+
+    @pytest.mark.parametrize("stray", sorted(STRAY_LINES))
+    def test_a_stray_line_is_one_skipped_frame_not_eof(self, stray):
+        """``None`` is EOF to both loop call sites, so a ``null`` line returned
+        as ``None`` would end the server, as would any raise here."""
+        msg = {"jsonrpc": "2.0", "id": 1, "method": "ping"}
+        stdin = _make_stdin(STRAY_LINES[stray]() + json.dumps(msg).encode("utf-8") + b"\n")
+        assert _read_message(stdin) is SKIP
+        assert _read_message(stdin) == msg
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            b'{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"n":' + b"9" * 5000 + b"}}\n",
+            b'{"jsonrpc":"2.0","id":7,"method":"tools/list","params":{"s":"\xff"}}\n',
+            b'{"method":"tools/list","params":{"s":"\xff"},"jsonrpc":"2.0","id":7}\n',
+        ],
+        ids=["over-digit-limit", "undecodable", "undecodable-id-last"],
+    )
+    def test_an_unparseable_request_is_answered_under_its_recovered_id(self, monkeypatch, line):
+        """Answered, so its caller does not wait for its own timeout while pings
+        are still answered and nothing sees the server as wedged."""
+        answered: list = []
+        monkeypatch.setattr(mcp_shared, "respond", lambda *a, **k: answered.append((a, k)))
+        stdin = _make_stdin(line + b'{"jsonrpc":"2.0","id":2,"method":"ping"}\n')
+        assert _read_message(stdin) is SKIP
+        assert _read_message(stdin) == {"jsonrpc": "2.0", "id": 2, "method": "ping"}
+        [(args, kwargs)] = answered
+        assert args[0] == 7
+        assert kwargs["error"]["code"] == mcp_shared.JSONRPC_PARSE_ERROR
+
+    def test_an_unparseable_request_too_deep_to_decode_is_answered(self, monkeypatch):
+        answered: list = []
+        monkeypatch.setattr(mcp_shared, "respond", lambda *a, **k: answered.append((a, k)))
+        line = (
+            '{"jsonrpc":"2.0","id":7,"method":"tools/call","params":' + too_deep_to_decode() + "}\n"
+        ).encode()
+        assert _read_message(_make_stdin(line)) is SKIP
+        assert [a[0] for a, _ in answered] == [7]
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            b"not json\n",
+            b'{"method":"log","params":{"id":99,"s":"\xff"}}\n',
+            # A response: its id is the client's own, never this server's to answer.
+            b'{"jsonrpc":"2.0","id":3,"result":{"s":"\xff"}}\n',
+            b'{"jsonrpc":"2.0","id":3,"error":{"code":1,"message":"\xff"}}\n',
+        ],
+        ids=["log-line", "nested-id-only", "response", "error-response"],
+    )
+    def test_a_line_that_is_not_a_request_with_an_id_is_dropped_unanswered(self, monkeypatch, line):
+        answered: list = []
+        monkeypatch.setattr(mcp_shared, "respond", lambda *a, **k: answered.append((a, k)))
+        assert _read_message(_make_stdin(line)) is SKIP
+        assert answered == []
+
+    def test_a_header_shaped_line_on_a_bare_stream_is_noise(self):
+        """Honouring it would read the requests behind it as a body."""
+        first = {"jsonrpc": "2.0", "id": 1, "method": "ping"}
+        second = {"jsonrpc": "2.0", "id": 2, "method": "ping"}
+        data = b"".join(
+            [
+                json.dumps(first).encode("utf-8") + b"\n",
+                b"Content-Length: 40\r\n",
+                b"\r\n",
+                json.dumps(second).encode("utf-8") + b"\n",
+            ]
+        )
+        stdin = _make_stdin(data)
+        assert _read_message(stdin) == first
+        assert _read_message(stdin) is SKIP
+        assert _read_message(stdin) is SKIP  # the blank separator line
+        assert _read_message(stdin) == second
+        assert mcp_shared._framing != "content-length"
 
 
 class TestRespondFraming:
-    def setup_method(self):
-        mcp_shared._use_content_length = False
-
     def test_respond_bare_json(self):
         out = io.StringIO()
         with patch("sys.stdout", out):
@@ -198,8 +371,8 @@ class TestRespondFraming:
         assert parsed["id"] == 1
         assert parsed["result"] == {"ok": True}
 
-    def test_respond_content_length(self):
-        mcp_shared._use_content_length = True
+    def test_respond_content_length(self, monkeypatch):
+        monkeypatch.setattr(mcp_shared, "_framing", "content-length")
         out = io.BytesIO()
         with patch("sys.stdout") as mock_stdout:
             mock_stdout.buffer = out
@@ -232,11 +405,9 @@ class TestRespondStdoutFdSnapshot:
     """
 
     def setup_method(self):
-        mcp_shared._use_content_length = False
         mcp_shared.release_stdout_fd()
 
     def teardown_method(self):
-        mcp_shared._use_content_length = False
         mcp_shared.release_stdout_fd()
 
     @staticmethod
@@ -333,8 +504,8 @@ class TestRespondStdoutFdSnapshot:
         assert parsed["id"] == 1
         assert parsed["result"] == {"ok": True}
 
-    def test_response_survives_dup2_devnull_content_length(self):
-        mcp_shared._use_content_length = True
+    def test_response_survives_dup2_devnull_content_length(self, monkeypatch):
+        monkeypatch.setattr(mcp_shared, "_framing", "content-length")
         read_fd, restore = self._redirect_stdout_to_pipe()
         try:
             with self._stdout_on_fd1():
@@ -505,9 +676,7 @@ class TestRespondStdoutFdSnapshot:
     def test_run_loop_releases_fd_on_exit(self):
         """``run_mcp_stdio_loop`` must not leak the dup across invocations."""
         with patch.object(mcp_shared, "_read_message", lambda _stdin: None):
-            mcp_shared.run_mcp_stdio_loop(
-                "test-server", "0.1.0", lambda: [], lambda _n, _a: "ok"
-            )
+            mcp_shared.run_mcp_stdio_loop("test-server", "0.1.0", lambda: [], lambda _n, _a: "ok")
         assert mcp_shared._stdout_fd is None
 
 
@@ -688,8 +857,9 @@ class _LoopHarness:
     resolution are stubbed out so the loop needs no gateway environment.
     """
 
-    def __init__(self, monkeypatch, call_tool_fn, loop_kwargs: dict | None = None,
-                 list_tools_fn=None):
+    def __init__(
+        self, monkeypatch, call_tool_fn, loop_kwargs: dict | None = None, list_tools_fn=None
+    ):
         import os
         import sys
         import threading
@@ -720,7 +890,26 @@ class _LoopHarness:
         self.responses.append((req_id, result, error))
 
     def send(self, msg: dict) -> None:
-        self._os.write(self._wfd, (json.dumps(msg) + "\n").encode("utf-8"))
+        self.send_raw((json.dumps(msg) + "\n").encode("utf-8"))
+
+    def send_raw(self, data: bytes, timeout: float = 5.0) -> None:
+        """Write *data* from a helper thread, joined with a bound.
+
+        A write larger than the pipe buffer (about 4 KiB on Windows) blocks
+        until the loop reads it, so a loop that died would hang the test here;
+        the bound turns that into a failure that names the cause.
+        """
+        import threading
+
+        def _write_all() -> None:
+            view = memoryview(data)
+            while view:
+                view = view[self._os.write(self._wfd, view) :]
+
+        writer = threading.Thread(target=_write_all, daemon=True)
+        writer.start()
+        writer.join(timeout)
+        assert not writer.is_alive(), "the loop stopped reading stdin"
 
     def wait_for(self, predicate, timeout: float = 5.0) -> bool:
         import time
@@ -767,9 +956,6 @@ def _slow_then_echo():
     reason="worker-thread + select() interleave is POSIX-only",
 )
 class TestStdioLoopBusyQueue:
-    def setup_method(self):
-        mcp_shared._use_content_length = False
-
     def test_tools_call_while_busy_is_queued_and_answered_fifo(self, monkeypatch):
         import time
 
@@ -844,9 +1030,7 @@ class TestStdioLoopBusyQueue:
                 for call in harness.sel_mock.log_tool_invocation.call_args_list
             )
             release.set()
-            assert harness.wait_for(
-                lambda: {401, 402} <= {r[0] for r in harness.responses}
-            )
+            assert harness.wait_for(lambda: {401, 402} <= {r[0] for r in harness.responses})
         finally:
             release.set()
             harness.close()
@@ -861,6 +1045,292 @@ class TestStdioLoopBusyQueue:
             assert harness.wait_for(lambda: any(r[0] == 599 for r in harness.responses))
             release.set()
             assert harness.wait_for(lambda: any(r[0] == 501 for r in harness.responses))
+        finally:
+            release.set()
+            harness.close()
+
+
+class _ReadSpy:
+    """Wraps ``_read_message`` and records what each call returned.
+
+    The interleaving handshake for the busy-loop tests: a test waits until the
+    loop has CONSUMED the frame it sent before it lets the tool finish, so the
+    frame is read on the busy path rather than wherever timing puts it.
+    """
+
+    def __init__(self, monkeypatch) -> None:
+        import threading
+
+        self.returned: list = []
+        self._lock = threading.Lock()
+        real = mcp_shared._read_message
+
+        def _spy(stdin):
+            value = real(stdin)
+            with self._lock:
+                self.returned.append(value)
+            return value
+
+        monkeypatch.setattr(mcp_shared, "_read_message", _spy)
+
+    def saw(self, predicate) -> bool:
+        with self._lock:
+            return any(predicate(v) for v in self.returned)
+
+
+_PING = {"jsonrpc": "2.0", "id": 7, "method": "ping"}
+
+
+def _answered(harness, req_id):
+    return lambda: any(r[0] == req_id for r in harness.responses)
+
+
+def _assert_one_refusal_audited(harness) -> None:
+    refusals = [
+        c
+        for c in harness.sel_mock.log_api_access.mock_calls
+        if c.kwargs.get("operation") == "tool_call.invalid_params"
+    ]
+    assert len(refusals) == 1
+    assert refusals[0].kwargs["outcome"] == "rejected"
+
+
+class TestStdioLoopStrayFrames:
+    """One frame the loop cannot use costs that frame, never the server process."""
+
+    @pytest.mark.parametrize("stray", sorted(STRAY_LINES))
+    def test_the_idle_loop_answers_the_next_request(self, monkeypatch, stray):
+        harness = _LoopHarness(monkeypatch, lambda name, args: "ok")
+        try:
+            harness.send_raw(STRAY_LINES[stray]())
+            harness.send(_PING)
+            assert harness.wait_for(_answered(harness, 7))
+        finally:
+            harness.close()
+
+    def test_a_cancel_with_non_object_params_is_ignored(self, monkeypatch):
+        harness = _LoopHarness(monkeypatch, lambda name, args: "ok")
+        try:
+            harness.send({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": [1]})
+            harness.send(_PING)
+            assert harness.wait_for(_answered(harness, 7))
+        finally:
+            harness.close()
+
+    @pytest.mark.parametrize(
+        "policy",
+        [
+            mcp_shared.ToolPolicy(frozenset(), ""),
+            mcp_shared.ToolPolicy(frozenset({"echo"}), ""),
+            mcp_shared.ToolPolicy(frozenset(), "resolution_failed"),
+        ],
+        ids=["empty", "excluded", "unresolved"],
+    )
+    @pytest.mark.parametrize(
+        "params",
+        [[1], "x", None, {}, {"name": ""}, {"name": ["echo"]}, {"name": {"n": 1}}, {"name": 5}],
+        ids=[
+            "list-params",
+            "string-params",
+            "null-params",
+            "no-name",
+            "empty-name",
+            "list-name",
+            "dict-name",
+            "int-name",
+        ],
+    )
+    def test_a_tools_call_without_an_object_params_and_string_name_is_invalid_params(
+        self, monkeypatch, policy, params
+    ):
+        """Answered ``-32602`` before the policy check: never dispatched, never
+        audited as a call to a tool with no usable name, and audited as the
+        refusal it is."""
+        ran: list = []
+        harness = _LoopHarness(monkeypatch, lambda name, args: ran.append(name) or "ok")
+        monkeypatch.setattr(mcp_shared, "_resolve_tool_policy", lambda *a, **k: policy)
+        try:
+            harness.send({"jsonrpc": "2.0", "id": 9, "method": "tools/call", "params": params})
+            harness.send(_PING)
+            assert harness.wait_for(_answered(harness, 7))
+            reply = next(r for r in harness.responses if r[0] == 9)
+            assert reply[2] is not None and reply[2]["code"] == mcp_shared.JSONRPC_INVALID_PARAMS
+            assert ran == []
+            assert not harness.sel_mock.log_tool_invocation.called
+            _assert_one_refusal_audited(harness)
+        finally:
+            harness.close()
+
+    def test_an_envelope_error_on_a_request_is_answered(self, monkeypatch):
+        """Answered, so the caller (the gateway's pending table) does not wait
+        for the stub to detach or the hard ceiling."""
+        harness = _LoopHarness(monkeypatch, lambda name, args: "ok")
+        try:
+            harness.send({"jsonrpc": "2.0", "id": 5, "method": 7})
+            harness.send({"jsonrpc": "1.0", "id": 6, "method": "ping"})
+            harness.send(_PING)
+            assert harness.wait_for(_answered(harness, 7))
+            codes = {r[0]: r[2] and r[2]["code"] for r in harness.responses}
+            assert codes[5] == codes[6] == mcp_shared.JSONRPC_INVALID_REQUEST
+        finally:
+            harness.close()
+
+    @pytest.mark.skipif(
+        not platform_compat.IS_POSIX,
+        reason="worker-thread + select() interleave is POSIX-only",
+    )
+    def test_a_worker_that_cannot_start_costs_that_call(self, monkeypatch):
+        """``Thread.start`` raises at the scope's task ceiling. Nothing holds the
+        unstarted thread afterwards: joining it raises, and would end the server
+        for every session sharing it."""
+        import threading
+
+        harness = _LoopHarness(monkeypatch, lambda name, args: "ok")
+        real = threading.Thread
+
+        class _NoWorker(real):  # type: ignore[misc, valid-type]
+            def start(self) -> None:
+                if getattr(self, "_target", None).__name__ == "_run_tool":
+                    raise RuntimeError("can't start new thread")
+                super().start()
+
+        monkeypatch.setattr(threading, "Thread", _NoWorker)
+        try:
+            harness.send(_tools_call(301, "echo"))
+            harness.send(_PING)
+            assert harness.wait_for(_answered(harness, 7))
+            reply = next(r for r in harness.responses if r[0] == 301)
+            assert reply[2]["code"] == mcp_shared.JSONRPC_INTERNAL_ERROR
+            # The refused start is still an audited invocation decision.
+            assert [
+                (c.kwargs["request_id"], c.kwargs["tool_name"])
+                for c in harness.sel_mock.log_tool_invocation.call_args_list
+                if c.kwargs.get("outcome") == "failed"
+            ] == [("301", "echo")]
+        finally:
+            monkeypatch.setattr(threading, "Thread", real)
+            harness.close()
+
+    def test_a_dispatch_that_raises_is_answered_internal_error(self, monkeypatch):
+        def _boom():
+            raise RuntimeError("listing failed")
+
+        harness = _LoopHarness(monkeypatch, lambda name, args: "ok", list_tools_fn=_boom)
+        try:
+            harness.send({"jsonrpc": "2.0", "id": 3, "method": "tools/list"})
+            harness.send(_PING)
+            assert harness.wait_for(_answered(harness, 7))
+            reply = next(r for r in harness.responses if r[0] == 3)
+            assert reply[2] == {
+                "code": mcp_shared.JSONRPC_INTERNAL_ERROR,
+                "message": "Internal error",
+            }
+        finally:
+            harness.close()
+
+    @pytest.mark.skipif(
+        not platform_compat.IS_POSIX,
+        reason="worker-thread + select() interleave is POSIX-only",
+    )
+    @pytest.mark.parametrize("stray", ["undecodable", "null", "list"])
+    def test_a_finished_tool_is_answered_after_a_stray_frame_with_nothing_after_it(
+        self, monkeypatch, stray
+    ):
+        """The busy loop gets back to the worker after each dropped frame. Had it
+        skipped internally, it would sit in ``readline`` until the client wrote
+        again -- with no heartbeat, forever -- holding the result back."""
+        spy = _ReadSpy(monkeypatch)
+        call_tool, started, release = _slow_then_echo()
+        harness = _LoopHarness(monkeypatch, call_tool)
+        try:
+            harness.send(_tools_call(301, "slow"))
+            assert started.wait(timeout=5.0)
+            harness.send_raw(STRAY_LINES[stray]())
+            assert harness.wait_for(lambda: spy.saw(lambda v: v is SKIP))
+            release.set()
+            assert harness.wait_for(_answered(harness, 301))
+            harness.send(_PING)
+            assert harness.wait_for(_answered(harness, 7))
+        finally:
+            release.set()
+            harness.close()
+
+    @pytest.mark.skipif(
+        not platform_compat.IS_POSIX,
+        reason="worker-thread + select() interleave is POSIX-only",
+    )
+    @pytest.mark.parametrize(
+        "before", ["stray", "request"], ids=["after-a-stray-line", "after-a-request"]
+    )
+    def test_a_busy_loop_reads_a_frame_already_buffered(self, monkeypatch, before):
+        """``select`` polls the descriptor and cannot see what the reader already
+        buffered: a ping that comes in the same write as the line before it is
+        answered without waiting for the client's next write or the tool."""
+        call_tool, started, release = _slow_then_echo()
+        harness = _LoopHarness(monkeypatch, call_tool)
+        first = b"null\n" if before == "stray" else (json.dumps(_PING) + "\n").encode()
+        second = {"jsonrpc": "2.0", "id": 8, "method": "ping"}
+        try:
+            harness.send(_tools_call(301, "slow"))
+            assert started.wait(timeout=5.0)
+            harness.send_raw(first + (json.dumps(second) + "\n").encode())
+            assert harness.wait_for(_answered(harness, 8)), "the buffered ping was stranded"
+            assert not _answered(harness, 301)(), "answered only because the tool finished"
+        finally:
+            release.set()
+            harness.close()
+
+    @pytest.mark.skipif(
+        not platform_compat.IS_POSIX,
+        reason="worker-thread + select() interleave is POSIX-only",
+    )
+    def test_a_busy_tools_call_without_a_usable_name_is_refused_not_queued(self, monkeypatch):
+        """The busy path refuses it exactly as the idle one, so it is never
+        queued, busy-rejected, or audited as a call to a tool named by whatever
+        it sent."""
+        call_tool, started, release = _slow_then_echo()
+        harness = _LoopHarness(monkeypatch, call_tool)
+        try:
+            harness.send(_tools_call(301, "slow"))
+            assert started.wait(timeout=5.0)
+            harness.send(
+                {"jsonrpc": "2.0", "id": 9, "method": "tools/call", "params": {"name": [1]}}
+            )
+            assert harness.wait_for(_answered(harness, 9))
+            reply = next(r for r in harness.responses if r[0] == 9)
+            assert reply[2]["code"] == mcp_shared.JSONRPC_INVALID_PARAMS
+            assert not _answered(harness, 301)()
+            _assert_one_refusal_audited(harness)
+            release.set()
+            assert harness.wait_for(_answered(harness, 301))
+            names = [c.kwargs["tool_name"] for c in harness.sel_mock.log_tool_invocation.mock_calls]
+            assert [1] not in names
+        finally:
+            release.set()
+            harness.close()
+
+    @pytest.mark.skipif(
+        not platform_compat.IS_POSIX,
+        reason="worker-thread + select() interleave is POSIX-only",
+    )
+    def test_a_busy_cancel_with_non_object_params_cancels_nothing(self, monkeypatch):
+        spy = _ReadSpy(monkeypatch)
+        call_tool, started, release = _slow_then_echo()
+        harness = _LoopHarness(monkeypatch, call_tool)
+        try:
+            harness.send(_tools_call(301, "slow"))
+            assert started.wait(timeout=5.0)
+            harness.send({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": [301]})
+            assert harness.wait_for(
+                lambda: spy.saw(
+                    lambda v: isinstance(v, dict) and v.get("method") == "notifications/cancelled"
+                )
+            )
+            release.set()
+            # Delivered: a list ``params`` names no request, so 301 is not cancelled.
+            assert harness.wait_for(_answered(harness, 301))
+            harness.send(_PING)
+            assert harness.wait_for(_answered(harness, 7))
         finally:
             release.set()
             harness.close()
@@ -893,9 +1363,6 @@ def _tools_call_with_tenant(req_id, tool_name: str, nonce: str) -> dict:
 
 
 class TestStdioLoopCallerIdentity:
-    def setup_method(self):
-        mcp_shared._use_content_length = False
-
     def test_tool_policy_uses_only_the_current_request_identity(self, monkeypatch):
         from kiro_crew.mcp_caller import CallerContext, build_caller_meta
 
@@ -988,13 +1455,191 @@ class TestStdioLoopCallerIdentity:
             assert "carried no session token" in body
             assert "agents directory" not in body
             assert "Retry shortly" not in body
-            assert harness.wait_for(
-                lambda: harness.sel_mock.log_tool_invocation.call_count >= 1
-            )
+            assert harness.wait_for(lambda: harness.sel_mock.log_tool_invocation.call_count >= 1)
             kw = harness.sel_mock.log_tool_invocation.call_args.kwargs
             assert kw["outcome"] == "rejected_policy_unresolved"
             assert kw["session_key"] == "dashboard:chat-11"
             assert kw["error"] == "managedToolPolicy.unresolved:identity_unattested"
+            # A gateway-stamped caller is a server the gateway spawned; the
+            # external-client explanation is not for it, so its text is unchanged.
+            assert mcp_shared.external_client_identity_note() not in body
+        finally:
+            harness.close()
+
+    def test_identity_unattestable_refuses_without_claiming_a_gateway_read(self, monkeypatch):
+        """A key resolved from a lenient source with no attestation fails closed.
+
+        The resolver skips the futile dial and returns ``identity_unattestable``, so
+        ``tools/call`` refuses (a key resolved, so an operator exclusion may exist)
+        but the text does not claim a gateway read that never happened.
+        """
+        ran = []
+        harness = _LoopHarness(monkeypatch, lambda n, a: ran.append(n) or "ok")
+        monkeypatch.setattr(
+            mcp_shared,
+            "_resolve_tool_policy",
+            lambda *a, **k: mcp_shared.ToolPolicy(frozenset(), "identity_unattestable"),
+        )
+        try:
+            harness.send(_tools_call_with_caller(53, "echo", "dashboard:chat-13"))
+            assert harness.wait_for(lambda: len(harness.responses) >= 1)
+            assert ran == []
+            body = json.dumps(harness.responses[0][1])
+            assert "identity_unattestable" in body
+            assert "could not prove which session it acts for" in body
+            assert "the gateway refused the tool-policy read" not in body
+            assert harness.wait_for(lambda: harness.sel_mock.log_tool_invocation.call_count >= 1)
+            kw = harness.sel_mock.log_tool_invocation.call_args.kwargs
+            assert kw["outcome"] == "rejected_policy_unresolved"
+            assert kw["session_key"] == "dashboard:chat-13"
+            assert kw["error"] == "managedToolPolicy.unresolved:identity_unattestable"
+        finally:
+            harness.close()
+
+    def test_identity_unattested_explains_an_externally_spawned_server(self, monkeypatch):
+        """The editor-config report: ``KIROCREW_SESSION_KEY`` copied into an
+        editor's own MCP config, no token, no launcher pid, no gateway caller. The
+        decision is the same refusal; the text gains the one explanation the
+        reader can act on, shared verbatim with the strict-identity refusals."""
+        ran = []
+        harness = _LoopHarness(monkeypatch, lambda n, a: ran.append(n) or "ok")
+        monkeypatch.setattr(
+            mcp_shared,
+            "_resolve_tool_policy",
+            lambda *a, **k: mcp_shared.ToolPolicy(frozenset(), "identity_unattested"),
+        )
+        monkeypatch.delenv("KIROCREW_STUB_SESSION_TOKEN", raising=False)
+        monkeypatch.delenv("KIROCREW_HOST_PID", raising=False)
+        monkeypatch.setenv("KIROCREW_SESSION_KEY", "dashboard:chat-copied-by-hand")
+        try:
+            harness.send(_tools_call(54, "echo"))
+            assert harness.wait_for(lambda: len(harness.responses) >= 1)
+            assert ran == []
+            body = harness.responses[0][1]["content"][0]["text"]
+            assert "identity_unattested" in body
+            assert "could not prove which session it acts for" in body
+            assert body.endswith(mcp_shared.external_client_identity_note("test-server"))
+            assert harness.wait_for(lambda: harness.sel_mock.log_tool_invocation.call_count >= 1)
+            kw = harness.sel_mock.log_tool_invocation.call_args.kwargs
+            assert kw["outcome"] == "rejected_policy_unresolved"
+            assert kw["session_key"] == "dashboard:chat-copied-by-hand"
+        finally:
+            harness.close()
+
+    def test_identity_unattested_without_a_caller_keeps_its_text_for_a_spawned_server(
+        self, monkeypatch
+    ):
+        """No gateway caller but a token on the element: the non-pooled stdio
+        topology the gateway itself spawns. Its failure is the trust root, not an
+        editor config, so the note stays off and the wording is what it was."""
+        harness = _LoopHarness(monkeypatch, lambda n, a: "ok")
+        monkeypatch.setattr(
+            mcp_shared,
+            "_resolve_tool_policy",
+            lambda *a, **k: mcp_shared.ToolPolicy(frozenset(), "identity_unattested"),
+        )
+        monkeypatch.setenv("KIROCREW_STUB_SESSION_TOKEN", "tok")
+        monkeypatch.delenv("KIROCREW_HOST_PID", raising=False)
+        monkeypatch.setenv("KIROCREW_SESSION_KEY", "dashboard:chat-12")
+        try:
+            harness.send(_tools_call(55, "echo"))
+            assert harness.wait_for(lambda: len(harness.responses) >= 1)
+            body = harness.responses[0][1]["content"][0]["text"]
+            assert "identity_unattested" in body
+            assert body.endswith("operator's exclusion list.")
+            assert mcp_shared.external_client_identity_note("test-server") not in body
+        finally:
+            harness.close()
+
+    def test_identity_unattested_quotes_the_daemons_denial_when_the_frame_carries_it(
+        self, monkeypatch
+    ):
+        """The Toolbox-shim report: the one accurate diagnosis ("spawned X is not the spec's Y")
+        lived only in gatewayd's stdout, so the refusal steered operators at the
+        token and the spec instead. When the caller block carries the daemon's
+        ``identityDenial``, the refusal says it; without it, the text is unchanged
+        (the previous test)."""
+        from kiro_crew.mcp_caller import CallerContext, build_caller_meta
+
+        harness = _LoopHarness(monkeypatch, lambda n, a: "ok")
+        monkeypatch.setattr(
+            mcp_shared,
+            "_resolve_tool_policy",
+            lambda *a, **k: mcp_shared.ToolPolicy(frozenset(), "identity_unattested"),
+        )
+        reason = "spawned '/opt/local/bin/kirocrew' is not the spec's '/tb/0.7.0.8/bin/kirocrew'"
+        try:
+            msg = _tools_call(52, "echo")
+            msg["params"]["_meta"] = build_caller_meta(
+                CallerContext(
+                    session_key="dashboard:chat-69", from_gateway=True, identity_denial=reason
+                )
+            )
+            harness.send(msg)
+            assert harness.wait_for(lambda: len(harness.responses) >= 1)
+            body = json.dumps(harness.responses[0][1])
+            assert "identity_unattested" in body
+            assert "spawned this server without a token because" in body
+            assert "/opt/local/bin/kirocrew" in body
+            assert "/tb/0.7.0.8/bin/kirocrew" in body
+        finally:
+            harness.close()
+
+    def test_the_quoted_denial_is_defanged_like_every_other_echoed_error(self, monkeypatch):
+        """The reason quotes the spec's ``command``/``args`` verbatim, and this early
+        refusal answers through ``_tool_response`` without the tool path's scrubber,
+        so a directive sentinel smuggled into a spec's ``args`` must not reach the
+        consumer intact."""
+        from kiro_crew.mcp_caller import CallerContext, build_caller_meta
+        from kiro_crew.session_directive import SENTINEL
+
+        harness = _LoopHarness(monkeypatch, lambda n, a: "ok")
+        monkeypatch.setattr(
+            mcp_shared,
+            "_resolve_tool_policy",
+            lambda *a, **k: mcp_shared.ToolPolicy(frozenset(), "identity_unattested"),
+        )
+        reason = f"spawned '/opt/x' is not the spec's '{SENTINEL}{{\"k\":1}}'"
+        try:
+            msg = _tools_call(53, "echo")
+            msg["params"]["_meta"] = build_caller_meta(
+                CallerContext(
+                    session_key="dashboard:chat-69", from_gateway=True, identity_denial=reason
+                )
+            )
+            harness.send(msg)
+            assert harness.wait_for(lambda: len(harness.responses) >= 1)
+            body = json.dumps(harness.responses[0][1])
+            assert "spawned this server without a token because" in body
+            assert SENTINEL not in body, "the sentinel must be defanged, not forwarded"
+        finally:
+            harness.close()
+
+    def test_the_quoted_denial_is_credential_redacted(self, monkeypatch):
+        """A denial reason that carries a token (a hand-authored reserved entry
+        whose argv the gate quoted) must not hand that token to the session."""
+        from kiro_crew.mcp_caller import CallerContext, build_caller_meta
+
+        harness = _LoopHarness(monkeypatch, lambda n, a: "ok")
+        monkeypatch.setattr(
+            mcp_shared,
+            "_resolve_tool_policy",
+            lambda *a, **k: mcp_shared.ToolPolicy(frozenset(), "identity_unattested"),
+        )
+        token = "ghp_1234567890abcdefghijklmnopqrstuvwxyzAB"
+        reason = f"args ['mcp-core', '--token', '{token}'] differ from spec ['mcp-core']"
+        try:
+            msg = _tools_call(54, "echo")
+            msg["params"]["_meta"] = build_caller_meta(
+                CallerContext(
+                    session_key="dashboard:chat-69", from_gateway=True, identity_denial=reason
+                )
+            )
+            harness.send(msg)
+            assert harness.wait_for(lambda: len(harness.responses) >= 1)
+            body = json.dumps(harness.responses[0][1])
+            assert "spawned this server without a token because" in body
+            assert token not in body, "the credential must be redacted, not forwarded"
         finally:
             harness.close()
 
@@ -1037,16 +1682,12 @@ class TestStdioLoopCallerIdentity:
         # Without the advertisement gatewayd treats the backend as
         # single-session and never injects the caller block, which would make
         # the whole per-call identity path dead code.
-        harness = _LoopHarness(
-            monkeypatch, lambda n, a: "ok", {"advertise_caller_identity": True}
-        )
+        harness = _LoopHarness(monkeypatch, lambda n, a: "ok", {"advertise_caller_identity": True})
         try:
             harness.send(_initialize(1))
             assert harness.wait_for(lambda: len(harness.responses) >= 1)
             caps = harness.responses[0][1]["capabilities"]
-            assert caps["experimental"] == {
-                "kirocrew.caller-identity": {"schemaVersion": 1}
-            }
+            assert caps["experimental"] == {"kirocrew.caller-identity": {"schemaVersion": 1}}
         finally:
             harness.close()
 
@@ -1138,13 +1779,13 @@ class TestStdioLoopCallerIdentity:
         # present.
         harness = _LoopHarness(monkeypatch, lambda n, a: "ok")
         monkeypatch.setattr(
-            mcp_shared, "_resolve_tool_policy", lambda *a, **k: mcp_shared.ToolPolicy(frozenset({"blocked"}), "")
+            mcp_shared,
+            "_resolve_tool_policy",
+            lambda *a, **k: mcp_shared.ToolPolicy(frozenset({"blocked"}), ""),
         )
         try:
             harness.send(_tools_call_with_caller(21, "blocked", "dashboard:chat-9"))
-            assert harness.wait_for(
-                lambda: harness.sel_mock.log_tool_invocation.call_count >= 1
-            )
+            assert harness.wait_for(lambda: harness.sel_mock.log_tool_invocation.call_count >= 1)
             kw = harness.sel_mock.log_tool_invocation.call_args.kwargs
             assert kw["outcome"] == "rejected_excluded"
             assert kw["session_key"] == "dashboard:chat-9"
@@ -1174,25 +1815,143 @@ class TestStdioLoopCallerIdentity:
             assert "tool policy could not be read" in body
             assert "policy_unreadable" in body
             # And it is attributable: the audit names the caller and the path.
-            assert harness.wait_for(
-                lambda: harness.sel_mock.log_tool_invocation.call_count >= 1
-            )
+            assert harness.wait_for(lambda: harness.sel_mock.log_tool_invocation.call_count >= 1)
             kw = harness.sel_mock.log_tool_invocation.call_args.kwargs
             assert kw["outcome"] == "rejected_policy_unresolved"
             assert kw["session_key"] == "dashboard:chat-7"
             assert kw["error"] == "managedToolPolicy.unresolved:policy_unreadable"
+            # Regression pin: with no reason from the gateway the text is the
+            # historical wording, so a client on an older gateway reads exactly
+            # what it read before.
+            assert "fix or remove the unreadable spec in the agents directory" in body
+            assert "Gateway reason:" not in body
         finally:
             harness.close()
 
-    def test_no_usable_answer_does_not_refuse_the_call(self, monkeypatch):
-        """``resolution_failed`` stays permissive, against the security argument.
+    def test_the_unreadable_policy_refusal_rules_out_a_connection_problem(self, monkeypatch):
+        """``policy_unreadable`` is an answer from the gateway, so its text says so.
 
-        On the argument it should refuse: an exclusion may exist and the process
-        holding it cannot answer. That was implemented and measured, and the
-        repository's real-MCP end-to-end lane will not run a legitimate first tool
-        call under it. In this deployment an ordinary call reaches this arm, so
-        refusing costs every caller their tools rather than costing an attacker
-        one. Kept permissive and audited until the gateway can say why.
+        It shares its symptom -- every call refused -- with an unreachable
+        gateway, and an operator who reads it as an outage restarts healthy
+        processes while the spec stays broken. The text therefore rules out
+        reachability, and names every condition the endpoint answers this code
+        for (an unreadable or unparseable spec, a duplicate name, a wrong-shape
+        ``managedToolPolicy``) rather than only the parse.
+        """
+        harness = _LoopHarness(monkeypatch, lambda n, a: "ok")
+        monkeypatch.setattr(
+            mcp_shared,
+            "_resolve_tool_policy",
+            lambda *a, **k: mcp_shared.ToolPolicy(frozenset(), "policy_unreadable"),
+        )
+        try:
+            harness.send(_tools_call_with_caller(45, "echo", "dashboard:chat-7"))
+            assert harness.wait_for(lambda: len(harness.responses) >= 1)
+            body = json.dumps(harness.responses[0][1])
+            assert "the gateway answered" in body
+            assert "This is not a connection problem" in body
+            assert "a restart will not clear it" in body
+            assert "two specs declare the same name" in body
+            assert "could not be read or parsed" in body
+            assert "managedToolPolicy has the wrong shape" in body
+        finally:
+            harness.close()
+
+    def test_unresolved_policy_refusal_names_the_file_the_gateway_named(self, monkeypatch):
+        """The gateway's ``reason`` reaches the caller, defanged and redacted.
+
+        The 409 body names the unreadable file and what to do; that is the one
+        piece of information the operator needs, and a refusal without it
+        sends them to validate every file by hand. The reason interpolates a
+        FILENAME from a user-writable
+        directory, so it goes through the same two scrubbers the
+        ``identity_unattested`` arm applies to its denial text -- the directive
+        defang and the credential redaction -- and is bounded, because this
+        early refusal does not pass through the tool path's scrubbers.
+        """
+        ran = []
+        harness = _LoopHarness(monkeypatch, lambda n, a: ran.append(n) or "ok")
+        reason = (
+            "agent spec 'broken.json' in the agents directory could not be read "
+            "(not valid JSON), so the policy for 'default' is unknown. "
+            "Move or fix 'broken.json' in the agents directory; no restart needed."
+        )
+        monkeypatch.setattr(
+            mcp_shared,
+            "_resolve_tool_policy",
+            lambda *a, **k: mcp_shared.ToolPolicy(frozenset(), "policy_unreadable", reason),
+        )
+        try:
+            harness.send(_tools_call_with_caller(42, "echo", "dashboard:chat-7"))
+            assert harness.wait_for(lambda: len(harness.responses) >= 1)
+            assert ran == []
+            body = json.dumps(harness.responses[0][1])
+            assert "policy_unreadable" in body
+            assert "'broken.json'" in body
+            assert "not valid JSON" in body
+            assert "no restart needed" in body
+        finally:
+            harness.close()
+
+    def test_the_gateway_reason_is_defanged_and_bounded(self, monkeypatch):
+        """A filename can carry the directive sentinel or a token; neither survives."""
+        from kiro_crew import session_directive
+
+        harness = _LoopHarness(monkeypatch, lambda n, a: "ok")
+        sentinel = session_directive.SENTINEL
+        secret = "ghp_" + "A" * 36
+        reason = f"agent spec {sentinel + 'x.json'!r} could not be read {secret} " + "y" * 5000
+        monkeypatch.setattr(
+            mcp_shared,
+            "_resolve_tool_policy",
+            lambda *a, **k: mcp_shared.ToolPolicy(frozenset(), "policy_unreadable", reason),
+        )
+        try:
+            harness.send(_tools_call_with_caller(43, "echo", "dashboard:chat-7"))
+            assert harness.wait_for(lambda: len(harness.responses) >= 1)
+            body = json.dumps(harness.responses[0][1])
+            assert sentinel not in body
+            assert secret not in body
+            assert len(body) < 2000, "the gateway reason was not bounded"
+        finally:
+            harness.close()
+
+    def test_a_secret_straddling_the_detail_cap_leaves_no_fragment(self, monkeypatch):
+        """Redaction runs over the WHOLE reason; the cap trims what it returns.
+
+        Cut first and a token that straddles the cap loses its tail, the
+        fragment fails to match the redactor's pattern, and the head of the
+        secret is echoed. So the cap is applied to the redacted text, and the
+        prefix of a token that would have been cut is never in the response.
+        """
+        harness = _LoopHarness(monkeypatch, lambda n, a: "ok")
+        cap = mcp_shared._POLICY_DETAIL_MAX_CHARS
+        secret = "ghp_" + "B" * 36
+        # The token begins 10 characters before the cap, so a cut-first
+        # implementation keeps ``ghp_BBBBBB`` and drops the rest.
+        reason = "x" * (cap - 10) + secret + " tail"
+        monkeypatch.setattr(
+            mcp_shared,
+            "_resolve_tool_policy",
+            lambda *a, **k: mcp_shared.ToolPolicy(frozenset(), "policy_unreadable", reason),
+        )
+        try:
+            harness.send(_tools_call_with_caller(44, "echo", "dashboard:chat-7"))
+            assert harness.wait_for(lambda: len(harness.responses) >= 1)
+            body = json.dumps(harness.responses[0][1])
+            assert "ghp_B" not in body, "a fragment of the secret survived the cut"
+        finally:
+            harness.close()
+
+    def test_no_usable_answer_refuses_the_call(self, monkeypatch):
+        """``resolution_failed`` refuses, because the exclusion set is unknown.
+
+        Nothing came back, or a ``5xx`` said the gateway is broken, or the resolve
+        raised. Every ``4xx`` returns before that arm, so this reason means the
+        policy could not be READ -- an operator exclusion may exist while the
+        process holding it cannot answer for it. Serving the empty set as a
+        permission is what would let an excluded tool run, so the call is refused
+        and the refusal names the same condition the audit trail does.
         """
         ran = []
         harness = _LoopHarness(monkeypatch, lambda n, a: ran.append(n) or "ok")
@@ -1204,12 +1963,64 @@ class TestStdioLoopCallerIdentity:
         try:
             harness.send(_tools_call_with_caller(53, "echo", "dashboard:chat-13"))
             assert harness.wait_for(lambda: len(harness.responses) >= 1)
-            assert ran == ["echo"]
+            assert ran == []
+            _body = json.dumps(harness.responses[0][1])
+            assert "is unavailable" in _body
+            assert "resolution_failed" in _body
             ops = [
-                c.kwargs.get("operation")
-                for c in harness.sel_mock.log_api_access.call_args_list
+                c.kwargs.get("operation") for c in harness.sel_mock.log_api_access.call_args_list
             ]
-            assert "tool_policy.unenforced_call" in ops
+            assert "tool_policy.unenforced_call" not in ops
+        finally:
+            harness.close()
+
+    def test_the_unreachable_gateway_refusal_names_a_retry_not_a_spec_edit(self, monkeypatch):
+        """The refusal has to diagnose the condition it actually hit.
+
+        ``policy_unreadable`` means the gateway read a spec and could not use it,
+        so its text sends the caller to the agents directory. ``resolution_failed``
+        means the gateway was never reached: no spec is implicated, and that same
+        text would have the caller edit healthy files to fix an outage, leaving the
+        edit as the real defect. The condition clears on its own, so the remedy is
+        a retry.
+        """
+        harness = _LoopHarness(monkeypatch, lambda n, a: "ok")
+        monkeypatch.setattr(
+            mcp_shared,
+            "_resolve_tool_policy",
+            lambda *a, **k: mcp_shared.ToolPolicy(frozenset(), "resolution_failed"),
+        )
+        try:
+            harness.send(_tools_call_with_caller(56, "echo", "dashboard:chat-16"))
+            assert harness.wait_for(lambda: len(harness.responses) >= 1)
+            body = json.dumps(harness.responses[0][1])
+            assert "could not reach the gateway" in body
+            assert "retry" in body
+            assert "agents directory" not in body
+            assert "could not parse" not in body
+        finally:
+            harness.close()
+
+    def test_an_excluded_tool_stays_excluded_when_the_gateway_cannot_answer(self, monkeypatch):
+        """The defect this guards: a real exclusion going unenforced.
+
+        The named tool is genuinely excluded for this session, and the resolver
+        cannot reach the gateway to say so. The exclusion set therefore arrives
+        empty with ``resolution_failed``, which is indistinguishable by value
+        alone from an operator who excluded nothing. The reason is what keeps them
+        apart, so the excluded tool must not execute.
+        """
+        ran = []
+        harness = _LoopHarness(monkeypatch, lambda n, a: ran.append(n) or "ok")
+        monkeypatch.setattr(
+            mcp_shared,
+            "_resolve_tool_policy",
+            lambda *a, **k: mcp_shared.ToolPolicy(frozenset(), "resolution_failed"),
+        )
+        try:
+            harness.send(_tools_call_with_caller(55, "blocked", "dashboard:chat-15"))
+            assert harness.wait_for(lambda: len(harness.responses) >= 1)
+            assert ran == []
         finally:
             harness.close()
 
@@ -1234,8 +2045,7 @@ class TestStdioLoopCallerIdentity:
             assert harness.wait_for(lambda: len(harness.responses) >= 1)
             assert ran == ["echo"]
             ops = [
-                c.kwargs.get("operation")
-                for c in harness.sel_mock.log_api_access.call_args_list
+                c.kwargs.get("operation") for c in harness.sel_mock.log_api_access.call_args_list
             ]
             assert "tool_policy.unenforced_call" in ops
         finally:
@@ -1260,8 +2070,7 @@ class TestStdioLoopCallerIdentity:
             assert harness.wait_for(lambda: len(harness.responses) >= 1)
             assert ran == ["echo"]
             ops = [
-                c.kwargs.get("operation")
-                for c in harness.sel_mock.log_api_access.call_args_list
+                c.kwargs.get("operation") for c in harness.sel_mock.log_api_access.call_args_list
             ]
             assert "tool_policy.unenforced_call" in ops
         finally:
@@ -1291,25 +2100,20 @@ class TestStdioLoopCallerIdentity:
         # failure would hide them for the session's whole life. Listing is not
         # the enforcement point; the call path above is.
         tools = [{"name": "echo"}, {"name": "blocked"}]
-        harness = _LoopHarness(
-            monkeypatch, lambda n, a: "ok", list_tools_fn=lambda: list(tools)
-        )
+        harness = _LoopHarness(monkeypatch, lambda n, a: "ok", list_tools_fn=lambda: list(tools))
         monkeypatch.setattr(
             mcp_shared,
             "_resolve_tool_policy",
             lambda *a, **k: mcp_shared.ToolPolicy(frozenset(), "no_session_key"),
         )
         try:
-            harness.send(
-                {"jsonrpc": "2.0", "id": 42, "method": "tools/list", "params": {}}
-            )
+            harness.send({"jsonrpc": "2.0", "id": 42, "method": "tools/list", "params": {}})
             assert harness.wait_for(lambda: len(harness.responses) >= 1)
             listed = [t["name"] for t in harness.responses[0][1]["tools"]]
             assert listed == ["echo", "blocked"]
             # The widened listing window is recorded, so it is attributable.
             ops = [
-                c.kwargs.get("operation")
-                for c in harness.sel_mock.log_api_access.call_args_list
+                c.kwargs.get("operation") for c in harness.sel_mock.log_api_access.call_args_list
             ]
             assert "tool_policy.unfiltered_listing" in ops
         finally:
@@ -1342,9 +2146,7 @@ class TestStdioLoopCallerIdentity:
         try:
             harness.send(_tools_call_with_caller(31, "echo", "dashboard:chat-5"))
             assert harness.wait_for(lambda: len(harness.responses) >= 1)
-            assert harness.wait_for(
-                lambda: harness.sel_mock.log_tool_invocation.call_count >= 1
-            )
+            assert harness.wait_for(lambda: harness.sel_mock.log_tool_invocation.call_count >= 1)
             kw = harness.sel_mock.log_tool_invocation.call_args.kwargs
             assert kw["outcome"] == "failed"
             assert kw["session_key"] == "dashboard:chat-5"
@@ -1379,11 +2181,9 @@ class TestPerSessionToolPolicy:
             return io.BytesIO(b'{"exclude":["blocked"]}')
 
         monkeypatch.setattr(mcp_shared, "loopback_urlopen", policy)
-        monkeypatch.setattr(mcp_shared, "read_local_secret", lambda _port: "internal")
+        monkeypatch.setattr(mcp_shared, "read_local_secret", lambda _port, **_kw: "internal")
         monkeypatch.setattr(mcp_shared, "resolve_client_port_src", lambda port: (5476, "config"))
-        assert mcp_shared._resolve_tool_policy("dashboard:alice").excluded == {
-            "blocked"
-        }
+        assert mcp_shared._resolve_tool_policy("dashboard:alice").excluded == {"blocked"}
         assert mcp_shared._resolve_tool_policy("dashboard:global").excluded == {"blocked"}
         assert requests[0]["X-session-key"] == "dashboard:alice"
         assert "X-member-session-proof" not in requests[0]
@@ -1427,3 +2227,240 @@ class TestPerSessionToolPolicy:
         n = len(calls)
         assert mcp_shared._resolve_tool_policy("dashboard:chat-1").excluded == {"tool_a"}
         assert len(calls) == n
+
+
+@pytest.mark.skipif(
+    not platform_compat.IS_POSIX,
+    reason="worker-thread + select() interleave is POSIX-only",
+)
+class TestStdioLoopExitsWhenItsInstallIsPruned:
+    """A backend whose install an update removed must be replaced, not limp on.
+
+    Lazy imports fail there with ``No module named 'kiro_crew.<x>'`` (seen live
+    on ``kirocrew-core``: every ``monitor_*`` and ``session_ledger_record`` call)
+    and keep failing until the process is gone. The loop answers the call with a
+    retryable refusal, answers anything queued behind it, never runs the tool,
+    and exits non-zero so the pool respawns it from the current install.
+    """
+
+    def setup_method(self):
+        mcp_shared._use_content_length = False
+
+    def test_a_call_after_the_prune_is_refused_and_the_process_exits(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        import shutil as _shutil
+
+        from kiro_crew import install_liveness
+
+        package = tmp_path / "0.8.0.4" / "kiro_crew"
+        package.mkdir(parents=True)
+        (package / "__init__.py").write_text("")
+        monkeypatch.setattr(install_liveness, "_PACKAGE_ROOT", package)
+        monkeypatch.setenv(
+            install_liveness.POOLED_BACKEND_ENV, install_liveness.POOLED_BACKEND_VALUE
+        )
+        monkeypatch.setenv(install_liveness.POOLED_RESPAWN_COMMAND_ENV, sys.executable)
+        exits: list = []
+        monkeypatch.setattr(mcp_shared.sys, "exit", exits.append)
+
+        calls: list[str] = []
+
+        def call_tool(name, args):
+            calls.append(name)
+            return f"done:{name}"
+
+        harness = _LoopHarness(monkeypatch, call_tool)
+        try:
+            harness.send(_tools_call(1, "before"))
+            assert harness.wait_for(lambda: len(harness.responses) == 1)
+            _shutil.rmtree(package.parent)  # the update's prune
+            harness.send(_tools_call(2, "monitor_start"))
+            assert harness.wait_for(lambda: len(harness.responses) == 2)
+            harness._thread.join(timeout=5.0)
+            assert not harness._thread.is_alive(), "the loop kept serving a pruned install"
+        finally:
+            harness.close()
+
+        assert calls == ["before"], "a tool ran from the pruned install"
+        req_id, result, error = harness.responses[1]
+        assert req_id == 2 and result is None
+        assert error["code"] == -32000 and "retry" in error["message"]
+        assert exits == [install_liveness.INSTALL_PRUNED_EXIT_CODE]
+
+    def test_calls_queued_behind_the_prune_are_answered_too(self, monkeypatch, tmp_path) -> None:
+        """The loop exits on the first refused call; anything already queued
+        behind it must get the same retryable answer, not silence."""
+        import shutil as _shutil
+        import time
+
+        from kiro_crew import install_liveness
+
+        package = tmp_path / "0.8.0.4" / "kiro_crew"
+        package.mkdir(parents=True)
+        (package / "__init__.py").write_text("")
+        monkeypatch.setattr(install_liveness, "_PACKAGE_ROOT", package)
+        monkeypatch.setenv(
+            install_liveness.POOLED_BACKEND_ENV, install_liveness.POOLED_BACKEND_VALUE
+        )
+        monkeypatch.setenv(install_liveness.POOLED_RESPAWN_COMMAND_ENV, sys.executable)
+        monkeypatch.setattr(mcp_shared.sys, "exit", lambda _code: None)
+        call_tool, started, release = _slow_then_echo()
+        harness = _LoopHarness(monkeypatch, call_tool)
+        try:
+            harness.send(_tools_call(1, "slow"))
+            assert started.wait(timeout=5.0)
+            # One frame per read so the busy loop's select() sees each and
+            # moves it into the pending queue (two frames in one write land in
+            # the text buffer together, where select() cannot see the second).
+            harness.send(_tools_call(2, "queued-a"))
+            time.sleep(0.3)
+            harness.send(_tools_call(3, "queued-b"))
+            time.sleep(0.3)
+            harness.send(_tools_call(4, "queued-c"))
+            time.sleep(0.3)
+            # Cancelled while it waited: must get no response, as on the
+            # ordinary dispatch path.
+            harness.send(
+                {"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 4}}
+            )
+            time.sleep(0.3)
+            _shutil.rmtree(package.parent)
+            release.set()
+            assert harness.wait_for(lambda: len(harness.responses) == 3), harness.responses
+            harness._thread.join(timeout=5.0)
+        finally:
+            harness.close()
+        by_id = {r[0]: r for r in harness.responses}
+        assert sorted(by_id) == [1, 2, 3], "a cancelled queued call was answered"
+        assert by_id[1][2] is None  # in flight before the prune: delivered
+        assert by_id[2][2]["code"] == -32000
+        assert by_id[3][2]["code"] == -32000
+
+        def _audited(outcome: str) -> list:
+            return sorted(
+                (c.kwargs["request_id"], c.kwargs["tool_name"])
+                for c in harness.sel_mock.log_tool_invocation.call_args_list
+                if c.kwargs.get("outcome") == outcome
+            )
+
+        # Every refusal is its own audited invocation decision, queued or not.
+        assert _audited("rejected_install_pruned") == [("2", "queued-a"), ("3", "queued-b")]
+        assert _audited("cancelled") == [("4", "queued-c")]
+
+    def test_an_intact_install_keeps_serving(self, monkeypatch, tmp_path) -> None:
+        from kiro_crew import install_liveness
+
+        package = tmp_path / "kiro_crew"
+        package.mkdir()
+        (package / "__init__.py").write_text("")
+        monkeypatch.setattr(install_liveness, "_PACKAGE_ROOT", package)
+        monkeypatch.setenv(
+            install_liveness.POOLED_BACKEND_ENV, install_liveness.POOLED_BACKEND_VALUE
+        )
+        monkeypatch.setenv(install_liveness.POOLED_RESPAWN_COMMAND_ENV, sys.executable)
+        exits: list = []
+        monkeypatch.setattr(mcp_shared.sys, "exit", exits.append)
+        harness = _LoopHarness(monkeypatch, lambda n, a: f"done:{n}")
+        try:
+            harness.send(_tools_call(1, "a"))
+            harness.send(_tools_call(2, "b"))
+            assert harness.wait_for(lambda: len(harness.responses) == 2)
+        finally:
+            harness.close()
+        assert [r[2] for r in harness.responses] == [None, None]
+        assert exits == []
+
+    def test_a_directly_launched_server_refuses_but_keeps_its_transport(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """Without the pool there is no respawner: exiting would leave the
+        session with no kirocrew-core/kirocrew-cron tools at all. The server
+        stays up and refuses every call with the restart that recovers it."""
+        import shutil as _shutil
+
+        from kiro_crew import install_liveness
+
+        package = tmp_path / "0.8.0.4" / "kiro_crew"
+        package.mkdir(parents=True)
+        (package / "__init__.py").write_text("")
+        monkeypatch.setattr(install_liveness, "_PACKAGE_ROOT", package)
+        monkeypatch.delenv(install_liveness.POOLED_BACKEND_ENV, raising=False)
+        exits: list = []
+        monkeypatch.setattr(mcp_shared.sys, "exit", exits.append)
+        calls: list[str] = []
+
+        def call_tool(name, args):
+            calls.append(name)
+            return f"done:{name}"
+
+        harness = _LoopHarness(monkeypatch, call_tool)
+        try:
+            harness.send(_tools_call(1, "before"))
+            assert harness.wait_for(lambda: len(harness.responses) == 1)
+            _shutil.rmtree(package.parent)
+            harness.send(_tools_call(2, "monitor_start"))
+            harness.send(_tools_call(3, "cron_list"))
+            assert harness.wait_for(lambda: len(harness.responses) == 3), harness.responses
+            assert harness._thread.is_alive(), "a directly launched server exited"
+        finally:
+            harness.close()
+
+        assert calls == ["before"], "a tool ran from the pruned install"
+        for req_id, result, error in harness.responses[1:]:
+            assert result is None
+            assert error["code"] == -32000 and "restart" in error["message"]
+        assert exits == []
+        audited = sorted(
+            c.kwargs["request_id"]
+            for c in harness.sel_mock.log_tool_invocation.call_args_list
+            if c.kwargs.get("outcome") == "rejected_install_pruned"
+        )
+        assert audited == ["2", "3"]
+
+    def test_a_pooled_server_whose_respawn_launcher_was_pruned_keeps_its_transport(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """The pool respawns from the command it spawned this backend with, and
+        that launcher can sit inside the pruned tree. Exiting then gets no
+        replacement, so the server must stay up and refuse like a direct one."""
+        import shutil as _shutil
+
+        from kiro_crew import install_liveness
+
+        package = tmp_path / "0.8.0.4" / "kiro_crew"
+        package.mkdir(parents=True)
+        (package / "__init__.py").write_text("")
+        launcher = tmp_path / "0.8.0.4" / "bin" / "kirocrew"
+        launcher.parent.mkdir(parents=True)
+        launcher.write_text("#!/bin/sh\n")
+        launcher.chmod(0o755)
+        monkeypatch.setattr(install_liveness, "_PACKAGE_ROOT", package)
+        monkeypatch.setenv(
+            install_liveness.POOLED_BACKEND_ENV, install_liveness.POOLED_BACKEND_VALUE
+        )
+        monkeypatch.setenv(install_liveness.POOLED_RESPAWN_COMMAND_ENV, str(launcher))
+        exits: list = []
+        monkeypatch.setattr(mcp_shared.sys, "exit", exits.append)
+        calls: list[str] = []
+
+        def call_tool(name, args):
+            calls.append(name)
+            return f"done:{name}"
+
+        harness = _LoopHarness(monkeypatch, call_tool)
+        try:
+            harness.send(_tools_call(1, "before"))
+            assert harness.wait_for(lambda: len(harness.responses) == 1)
+            _shutil.rmtree(package.parent)  # takes the launcher with it
+            harness.send(_tools_call(2, "monitor_start"))
+            assert harness.wait_for(lambda: len(harness.responses) == 2), harness.responses
+            assert harness._thread.is_alive(), "exited with no working respawn"
+        finally:
+            harness.close()
+
+        assert calls == ["before"], "a tool ran from the pruned install"
+        _req_id, result, error = harness.responses[1]
+        assert result is None
+        assert error["code"] == -32000 and "restart" in error["message"]
+        assert exits == []

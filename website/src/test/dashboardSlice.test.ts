@@ -17,6 +17,7 @@ import reducer, {
   sseSubagentStatus,
   sseSubagentText,
   patchSlotLink,
+  dropSlotLinks,
 } from '../store/dashboardSlice'
 import type { StatusData, ChatSlot } from '../types'
 
@@ -347,7 +348,7 @@ describe('dashboardSlice', () => {
   })
 
   describe('selectUnreadByMode', () => {
-    // The bigger surface-level coverage (orchestrator-leaks-into-Chat
+    // The bigger surface-level coverage (cross-surface-leaks-into-Chat
     // regression, orphan-key fallback, appOnly visibility) lives in
     // src/test/surfaces.test.tsx where the registry under test is.
     // Here we pin the underlying factory's contract: surface-key resolution
@@ -358,23 +359,30 @@ describe('dashboardSlice', () => {
     it('honors slot.surface over slot.mode when both are present', () => {
       // Forward-compat: backend now emits an explicit `surface` field that
       // mirrors `mode` today but is allowed to diverge later. A slot whose
-      // `mode === ''` but `surface === 'orchestrator'` counts toward the
-      // unified chat badge (both '' and 'orchestrator' are chat-like).
-      const slot: ChatSlot = { key: 'orch-1', title: 'O', messages: 0, running: false, mode: '', surface: 'orchestrator' }
-      const state = buildState([slot], ['orch-1'])
-      // Unified: chat badge includes orchestrator slots
-      expect(selectUnreadByMode('')(state)).toBe(1)
-      expect(selectUnreadByMode('orchestrator')(state)).toBe(1)
+      // `mode === ''` but `surface === 'dashboard'` belongs to the dashboard
+      // surface, not the chat badge.
+      const slot: ChatSlot = { key: 'dash-1', title: 'D', messages: 0, running: false, mode: '', surface: 'dashboard' }
+      const state = buildState([slot], ['dash-1'])
+      expect(selectUnreadByMode('')(state)).toBe(0)
+      expect(selectUnreadByMode('dashboard')(state)).toBe(1)
     })
 
     it('falls back to slot.mode when slot.surface is absent (back-compat)', () => {
       // Older backend payloads without a `surface` field must still route
       // via `mode` so a `surface`-aware client doesn't require a coupled deploy.
-      const slot: ChatSlot = { key: 'orch-1', title: 'O', messages: 0, running: false, mode: 'orchestrator' }
-      const state = buildState([slot], ['orch-1'])
-      // Unified: chat badge includes orchestrator slots
-      expect(selectUnreadByMode('')(state)).toBe(1)
-      expect(selectUnreadByMode('orchestrator')(state)).toBe(1)
+      const slot: ChatSlot = { key: 'dash-1', title: 'D', messages: 0, running: false, mode: 'dashboard' }
+      const state = buildState([slot], ['dash-1'])
+      expect(selectUnreadByMode('')(state)).toBe(0)
+      expect(selectUnreadByMode('dashboard')(state)).toBe(1)
+    })
+
+    it('counts a legacy Autopilot slot toward the chat badge', () => {
+      // A slot still persisted under the retired 'orchestrator' mode renders
+      // as an ordinary chat, so its unread belongs to the chat surface ('').
+      const bySurface: ChatSlot = { key: 'legacy-1', title: 'L', messages: 0, running: false, mode: '', surface: 'orchestrator' }
+      const byMode: ChatSlot = { key: 'legacy-2', title: 'L', messages: 0, running: false, mode: 'orchestrator' }
+      const state = buildState([bySurface, byMode], ['legacy-1', 'legacy-2'])
+      expect(selectUnreadByMode('')(state)).toBe(2)
     })
 
     it('returns the same selector instance on repeated calls (memoization)', () => {
@@ -382,7 +390,7 @@ describe('dashboardSlice', () => {
       // selectAllSurfacesAttention) call this on every render — recreating
       // the selector would defeat both useAppSelector's referential-equality
       // fast path and reselect's input-equality memoization.
-      expect(selectUnreadByMode('orchestrator')).toBe(selectUnreadByMode('orchestrator'))
+      expect(selectUnreadByMode('dashboard')).toBe(selectUnreadByMode('dashboard'))
     })
   })
 
@@ -513,6 +521,76 @@ describe('dashboardSlice', () => {
         key: 'chat-1', channel: 'discord', patch: { paused: true },
       }))
       expect(rows(state)[0].paused).toBe(true)
+    })
+  })
+
+  describe('dropSlotLinks removes the rows of ONE binding in place', () => {
+    const twoDiscordRows = (): ChatSlot => ({
+      key: 'chat-1',
+      title: 'Chat 1',
+      messages: 1,
+      running: false,
+      pending_approval: false,
+      waiting_for_input: false,
+      last_activity_ts: undefined,
+      slack_linked: true,
+      slack_channel: 'C-1',
+      slack_thread_ts: '1.2',
+      links: [
+        { channel: 'discord', label: 'Discord', target: 'dm-1', binding: 'b-o', direction: 'origin', live: true, paused: false },
+        { channel: 'discord', label: 'Discord', target: 'chan-2', binding: 'b-a', direction: 'both', live: true, paused: true },
+        { channel: 'telegram', label: 'Telegram', target: 'tg-1', binding: 'b-t', direction: 'out', live: true, paused: false },
+        { channel: 'slack', label: 'Slack', target: 'C-1', binding: 'b-s', direction: 'out', live: true, paused: false },
+      ],
+    })
+    const rows = (s: ReturnType<typeof reducer>) => s.slots[0].links!
+
+    // The Unlink action's write: the named binding is gone server-side, the
+    // origin row (the conversation the session was born in) is not a binding
+    // anyone severed, and every other row is untouched.
+    it('drops the rows carrying the named binding and keeps the origin row', () => {
+      let state = reducer(initial, sseSlots([twoDiscordRows()]))
+      state = reducer(state, dropSlotLinks({ key: 'chat-1', channel: 'discord', binding: 'b-a' }))
+      expect(rows(state).map(l => `${l.channel}:${l.direction}`)).toEqual([
+        'discord:origin', 'telegram:out', 'slack:out',
+      ])
+    })
+
+    it('leaves a same-channel row with a DIFFERENT binding alone', () => {
+      // The race the token exists for: Unlink A, another tab links B on the same
+      // channel before A's response lands, B's slots push arrives first. The
+      // server deleted exactly A, so a completion keyed on the channel would
+      // erase B — a binding the server still holds — and the tab would read as
+      // disconnected. Keyed on the binding, B stays and nothing is stamped.
+      let state = reducer(initial, sseSlots([twoDiscordRows()]))
+      const before = state
+      state = reducer(state, dropSlotLinks({ key: 'chat-1', channel: 'discord', binding: 'b-gone' }))
+      expect(rows(state)).toHaveLength(4)
+      expect(state.slots).toEqual(before.slots)
+    })
+
+    it('clears the Slack fields only with the Slack thread row it matched', () => {
+      let state = reducer(initial, sseSlots([twoDiscordRows()]))
+      // A stale token for the thread: no row matches, the fields stay.
+      state = reducer(state, dropSlotLinks({ key: 'chat-1', channel: 'slack', binding: 'b-stale' }))
+      expect(state.slots[0].slack_linked).toBe(true)
+      expect(state.slots[0].slack_channel).toBe('C-1')
+      expect(rows(state)).toHaveLength(4)
+      // The current token: the row goes and the fields go with it, one write.
+      state = reducer(state, dropSlotLinks({ key: 'chat-1', channel: 'slack', binding: 'b-s' }))
+      expect(rows(state).map(l => l.channel)).toEqual(['discord', 'discord', 'telegram'])
+      expect(state.slots[0].slack_linked).toBe(false)
+      expect(state.slots[0].slack_channel).toBeUndefined()
+      expect(state.slots[0].slack_thread_ts).toBeUndefined()
+    })
+
+    it('is a no-op for a channel with no rows and for an unknown slot', () => {
+      let state = reducer(initial, sseSlots([twoDiscordRows()]))
+      const before = state
+      state = reducer(state, dropSlotLinks({ key: 'chat-1', channel: 'imessage', binding: 'b-a' }))
+      expect(rows(state)).toHaveLength(4)
+      state = reducer(state, dropSlotLinks({ key: 'chat-404', channel: 'discord', binding: 'b-a' }))
+      expect(state.slots).toEqual(before.slots)
     })
   })
 })

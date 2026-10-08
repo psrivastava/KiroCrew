@@ -29,6 +29,8 @@ from kiro_crew.taskq.reconcile import reconcile_on_boot
 from kiro_crew.taskq.store import TaskStore, TaskStoreUnavailable
 from kiro_crew.taskq.waits import WaitLedger, WaitRecord
 
+_RUNNER_LOGGER = "kiro_crew.taskq.adapters.runner"
+
 
 class _Sleeps:
     """Records requested sleeps; advances the fake clock instead of waiting."""
@@ -129,6 +131,105 @@ def test_runner_lane_fixed_mode_pins_the_bound() -> None:
     assert aimd.effective == 2
     aimd.set_effective_cap(1)
     assert aimd.effective == 1
+
+
+@pytest.mark.asyncio
+async def test_lane_settled_ok_counts_a_committed_done_not_a_grant(
+    store: TaskStore, clock: Clock
+) -> None:
+    """``settled_ok`` is the adaptive controller's completion signal: a grant
+    is not one, and only a committed ``done`` -- not a fail or a cancel --
+    advances it."""
+    adm, _ = _admission(store, clock, cap=4)
+    assert adm.lane.settled_ok == 0
+
+    done_row = adm.accept(kind=m.KIND_WORKFLOW_AGENT, task_id="workflow:r:agent1")
+    assert done_row is not None
+    done = await adm.admit(done_row.id, lane="sess")
+    assert adm.lane.stats()["granted"] == 1
+    assert adm.lane.settled_ok == 0  # a grant is not a completion
+    done.done()
+    assert adm.lane.settled_ok == 1
+
+    failed_row = adm.accept(kind=m.KIND_WORKFLOW_AGENT, task_id="workflow:r:agent2")
+    assert failed_row is not None
+    failed = await adm.admit(failed_row.id, lane="sess")
+    failed.fail("boom")
+    assert adm.lane.settled_ok == 1  # a failure does not count
+
+    cancel_row = adm.accept(kind=m.KIND_WORKFLOW_AGENT, task_id="workflow:r:agent3")
+    assert cancel_row is not None
+    cancelled = await adm.admit(cancel_row.id, lane="sess")
+    cancelled.cancel("stop")
+    assert adm.lane.settled_ok == 1  # a cancel does not count
+
+
+@pytest.mark.asyncio
+async def test_lane_settled_ok_ignores_a_claim_only_container_row(
+    store: TaskStore, clock: Clock
+) -> None:
+    """A TaskRunner run row is claimed WITHOUT a lane slot (``claim_only``): it
+    groups its steps but executes nothing itself, and the steps are what the
+    lane meters. Its committed ``done`` must NOT advance ``settled_ok`` -- else
+    every TaskRunner run would credit a completion no lane slot produced,
+    double-counting against the steps that already did (Opus finding)."""
+    adm, _ = _admission(store, clock, cap=4)
+
+    # A slot-backed step completes -> counts.
+    step_row = adm.accept(kind=m.KIND_TASKRUNNER_STEP, task_id="taskrunner:r:step1")
+    assert step_row is not None
+    step = await adm.admit(step_row.id, lane="sess")
+    assert step.slot_held is True
+    step.done()
+    assert adm.lane.settled_ok == 1
+
+    # The container run row holds no lane slot -> its done credits nothing.
+    container_row = adm.accept(kind=m.KIND_TASKRUNNER_STEP, task_id="taskrunner:r:container")
+    assert container_row is not None
+    container = adm.claim_only(container_row.id)
+    assert container is not None
+    assert container.slot_held is False  # no slot was ever metered
+    assert container.done() is True  # the row still reaches a committed done
+    assert adm.lane.settled_ok == 1  # unchanged: no slot, no completion
+
+
+@pytest.mark.asyncio
+async def test_lane_settled_ok_counts_a_committed_done_from_done_async(
+    store: TaskStore, clock: Clock
+) -> None:
+    """``done_async`` -- the event-loop settle path -- counts a committed
+    ``done`` the same as the sync ``done``."""
+    adm, _ = _admission(store, clock, cap=4)
+    row = adm.accept(kind=m.KIND_WORKFLOW_AGENT, task_id="workflow:r:async1")
+    assert row is not None
+    handle = await adm.admit(row.id, lane="sess")
+    assert adm.lane.settled_ok == 0  # a grant is not a completion
+    assert await handle.done_async() is True
+    assert adm.lane.settled_ok == 1
+
+
+@pytest.mark.asyncio
+async def test_lane_settled_ok_does_not_count_a_deferred_done(
+    store: TaskStore, clock: Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ``done`` whose terminal write the store could not take is deferred to
+    the admission's durable retry and returns ``ok=False``: the slot is already
+    freed and the window long past, so crediting it late would mis-time it.
+    ``settled_ok`` stays put; a later replay through ``flush_pending_finish``
+    writes the row without re-entering the settle choke point, so it is never
+    counted."""
+    adm, _ = _admission(store, clock, cap=4)
+    row = adm.accept(kind=m.KIND_WORKFLOW_AGENT, task_id="workflow:r:deferred1")
+    assert row is not None
+    handle = await adm.admit(row.id, lane="sess")
+
+    def _unavailable(*_a: object, **_k: object) -> bool:
+        raise TaskStoreUnavailable("disk full")
+
+    monkeypatch.setattr(store, "finish", _unavailable)
+    assert handle.done() is False  # the write was deferred, not committed
+    assert adm.lane.settled_ok == 0  # a deferred done is not counted
+    assert row.id in adm._pending_finish  # it is queued for durable retry
 
 
 @pytest.mark.asyncio
@@ -552,6 +653,95 @@ async def test_admit_defers_on_memory_pressure_instead_of_refusing(
 
 
 @pytest.mark.asyncio
+async def test_a_step_granted_after_a_lane_wait_rechecks_memory_pressure(
+    store: TaskStore, clock: Clock
+) -> None:
+    """The lane does not pause on memory, so a step parked behind a full lane
+    must not start on a grant that lands while the host is critical: the
+    check it passed before parking is stale by then."""
+    verdicts = iter(
+        [
+            SimpleNamespace(admitted=True, reason=""),  # a, lane free
+            SimpleNamespace(admitted=True, reason=""),  # b, before it parks
+            SimpleNamespace(admitted=False, reason="memory critical"),  # b, at its grant
+            SimpleNamespace(admitted=True, reason=""),  # b, after the deferral
+        ]
+    )
+    adm, sleeps = _admission(
+        store, clock, cap=1, pressure=lambda: next(verdicts), admit_wait_secs=5.0
+    )
+    a = adm.accept(kind=m.KIND_TASKRUNNER_STEP, task_id="taskrunner:r:task1")
+    b = adm.accept(kind=m.KIND_TASKRUNNER_STEP, task_id="taskrunner:r:task2")
+    ha = await adm.admit(a.id)
+    waiter = asyncio.create_task(adm.admit(b.id))
+    for _ in range(500):  # b's store reads hop off the loop before it parks
+        if adm.lane.waiting == 1:
+            break
+        await asyncio.sleep(0.01)
+    assert adm.lane.waiting == 1
+    ha.done()  # the grant reaches b while memory is critical
+    hb = await asyncio.wait_for(waiter, 5)
+    assert hb.state == m.STARTING
+    kinds = [k for k, _ in _events(store, b.id)]
+    assert kinds[:3] == ["accepted", "deferred", "claimed"]
+    assert sleeps.calls == [5.0]
+    assert adm.deferred_count == 1
+    assert adm.lane.running == 1
+    hb.done()
+    assert adm.lane.running == 0
+
+
+@pytest.mark.asyncio
+async def test_a_step_refused_at_its_grant_gives_the_slot_back_before_deferring(
+    store: TaskStore, clock: Clock
+) -> None:
+    """The grant-time deferral sleeps up to the admit wait; a slot held through
+    that sleep blocks every other step on the lane for nothing. The slot must
+    already be back when the deferral's sleep starts."""
+    verdicts = iter(
+        [
+            SimpleNamespace(admitted=True, reason=""),  # a, lane free
+            SimpleNamespace(admitted=True, reason=""),  # b, before it parks
+            SimpleNamespace(admitted=False, reason="memory critical"),  # b, at its grant
+            SimpleNamespace(admitted=True, reason=""),  # b, after the deferral
+        ]
+    )
+    lane = r.RunnerLane(1, mode=r.MODE_AIMD)
+    inside_sleep: list[tuple[int, bool]] = []
+    sleeps = _Sleeps(clock)
+
+    async def _sleep(secs: float) -> None:
+        inside_sleep.append((lane.running, "taskrunner:r:task2" in lane.holders))
+        await sleeps(secs)
+
+    adm = r.RunnerAdmission(
+        store,
+        lane=lane,
+        clock=clock,
+        sleep=_sleep,
+        pressure=lambda: next(verdicts),
+        admit_wait_secs=5.0,
+    )
+    a = adm.accept(kind=m.KIND_TASKRUNNER_STEP, task_id="taskrunner:r:task1")
+    b = adm.accept(kind=m.KIND_TASKRUNNER_STEP, task_id="taskrunner:r:task2")
+    ha = await adm.admit(a.id)
+    waiter = asyncio.create_task(adm.admit(b.id))
+    for _ in range(500):  # b's store reads hop off the loop before it parks
+        if lane.waiting == 1:
+            break
+        await asyncio.sleep(0.01)
+    assert lane.waiting == 1
+    ha.done()  # the grant reaches b while memory is critical
+    hb = await asyncio.wait_for(waiter, 5)
+    assert sleeps.calls == [5.0]
+    assert inside_sleep == [(0, False)]
+    assert adm.deferred_count == 1
+    assert [k for k, _ in _events(store, b.id)][:3] == ["accepted", "deferred", "claimed"]
+    hb.done()
+    assert lane.running == 0
+
+
+@pytest.mark.asyncio
 async def test_admit_raises_when_the_row_was_cancelled_while_waiting(
     store: TaskStore, clock: Clock
 ) -> None:
@@ -863,7 +1053,7 @@ def test_a_refused_container_start_reports_the_state_the_requeue_read_back(
         adm, _ = _admission(store, clock)
         rec = adm.accept(kind=m.KIND_TASKRUNNER_STEP, task_id="taskrunner:r")
         assert rec is not None
-        with caplog.at_level(logging.WARNING, logger="kiro_crew.taskq.adapters.runner"):
+        with caplog.at_level(logging.WARNING, logger=_RUNNER_LOGGER):
             assert adm.claim_only(rec.id) is None
         assert any(
             "taskrunner:r took no container handle; the row is queued" in message
@@ -1379,7 +1569,21 @@ def _claimed_unstarted(store: TaskStore, task_id: str = "taskrunner:r:task1") ->
 
 
 def _one_warning(caplog: pytest.LogCaptureFixture) -> str:
-    said = [rec.getMessage() for rec in caplog.records if rec.levelno >= logging.WARNING]
+    """The single WARNING the runner adapter emitted -- and only the adapter's.
+
+    ``caplog`` captures the ROOT logger, so a WARNING from any other module that
+    happens to fire during this test lands in ``caplog.records`` too: a
+    maintenance sweep an earlier test's ``SessionManager`` handed to the shared
+    executor thread finishes minutes later, in whichever test is running then.
+    Counting unfiltered records made this helper assert on that thread's timing.
+    The callers already scope ``caplog.at_level(..., logger=_RUNNER_LOGGER)``; the
+    count is scoped to the same logger.
+    """
+    said = [
+        rec.getMessage()
+        for rec in caplog.records
+        if rec.name == _RUNNER_LOGGER and rec.levelno >= logging.WARNING
+    ]
     assert len(said) == 1, said
     return said[0]
 
@@ -1413,7 +1617,7 @@ def test_a_locked_read_after_the_requeue_is_the_stores_typed_error(
 
         store.transition = _commit_then_let_the_rival_in  # type: ignore[method-assign]
         try:
-            with caplog.at_level(logging.WARNING, logger="kiro_crew.taskq.adapters.runner"):
+            with caplog.at_level(logging.WARNING, logger=_RUNNER_LOGGER):
                 assert r.RunnerAdmission._requeue_unstarted(store, task_id, generation) is None
         finally:
             store.transition = committing  # type: ignore[method-assign]
@@ -1441,7 +1645,7 @@ def test_a_locked_requeue_answers_the_same_none_over_a_row_that_stayed_admitted(
         rival.execute("BEGIN EXCLUSIVE")
         rival.execute("UPDATE tasks SET updated_at=1 WHERE id=?", (task_id,))
         try:
-            with caplog.at_level(logging.WARNING, logger="kiro_crew.taskq.adapters.runner"):
+            with caplog.at_level(logging.WARNING, logger=_RUNNER_LOGGER):
                 assert r.RunnerAdmission._requeue_unstarted(store, task_id, generation) is None
         finally:
             rival.execute("ROLLBACK")

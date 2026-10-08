@@ -1,5 +1,7 @@
 # Design Document: Subagent Session Cleanup
 
+Status: implemented in `src/kiro_crew/session_allocation.py`, `src/kiro_crew/subagent_persistence.py`, and provider cleanup hooks. The ClaudeCodeProvider and Bedrock sections describe providers that are not shipped; ACP is the only provider. The shipped `_is_safe_path` (`src/kiro_crew/providers/cleanup.py`) refuses the root directory itself.
+
 ## Overview
 
 This feature adds a provider-agnostic session file cleanup mechanism to the KiroCrew gateway. Each LLM provider backend stores session data differently on disk — the ACP provider uses `~/.kiro/sessions/cli/{session_id}.json` and `{session_id}.jsonl` files, while the removed standalone provider and Bedrock had different (or no) persistence. The cleanup mechanism integrates with the existing subagent lifecycle at three points: normal completion, reaper force-kill, and tombstone pruning.
@@ -210,11 +212,11 @@ A shared helper to validate paths before deletion:
 
 ```python
 def _is_safe_path(target: Path, expected_root: Path) -> bool:
-    """Validate target is under expected_root (no traversal)."""
+    """Validate target is strictly under expected_root (no traversal, never the root)."""
     try:
         resolved = target.resolve()
         root = expected_root.resolve()
-        return resolved == root or str(resolved).startswith(str(root) + os.sep)
+        return str(resolved).startswith(str(root) + os.sep)
     except (OSError, ValueError):
         return False
 ```

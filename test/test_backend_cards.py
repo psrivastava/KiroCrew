@@ -48,7 +48,6 @@ from kiro_crew.agent_sdk import backends as sdk_backends
 from kiro_crew.agent_sdk.backends import (
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_DEEPSEEK,
-    ACP_BACKEND_GOOSE,
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
     ACP_BACKEND_OPENCODE,
@@ -399,18 +398,18 @@ def test_the_only_where_it_lives_line_left_is_the_credential_store() -> None:
         assert name in cards_mod.OFF_CARD_SETS, name
 
 
-def test_the_ungatable_harness_is_named_as_not_offered_and_says_why() -> None:
-    """Known, not selectable, and the card carries the reason as data.
+def test_every_known_harness_is_offered_and_carries_its_routing() -> None:
+    """Known, selectable, and the card carries the routing as data.
 
-    deepseek is in ``ACP_BACKENDS_KNOWN`` so a governance rule can name it, and
-    outside the selectable baseline because nothing establishes that its tool
-    calls reach the host gate. Those are the two fields the panel needs to show a
-    row for it and say why it cannot be picked -- with no prose written per
-    harness anywhere.
+    deepseek was the one harness this test existed for: in ``ACP_BACKENDS_KNOWN`` so
+    a governance rule could name it, and outside the selectable baseline because
+    nothing established that its tool calls reach the host gate. Its gate plugin
+    closes the second half, so the row is now offered and its routing is what the
+    panel shows -- still with no prose written per harness anywhere.
     """
     card = cards_mod.card_for(ACP_BACKEND_DEEPSEEK)
-    assert card.offered_by_build is False
-    assert card.tool_approval == Routing.UNVERIFIED.value
+    assert card.offered_by_build is True
+    assert card.tool_approval == Routing.VERIFIED_GATE_EXTENSION.value
     assert ACP_BACKEND_DEEPSEEK in sdk_backends.ACP_BACKENDS_KNOWN
 
 
@@ -582,11 +581,11 @@ def test_no_declared_unmeasured_entry_names_a_member() -> None:
 
 
 def test_the_compact_capture_gap_is_the_only_unmeasured_thing_on_any_card() -> None:
-    """The two cells, named, and every other cell on every card measured.
+    """The one cell, named, and every other cell on every card measured.
 
-    pi and goose both dispatch ``/compact`` before a model turn in their own source
-    and neither has been driven, which ``ACP_BACKENDS_COMPACT`` records as
-    "unclassified". A plain cross means something else: deepseek has no compaction on
+    pi dispatches ``/compact`` before a model turn in its own source and has not
+    been driven, which ``ACP_BACKENDS_COMPACT`` records as "unclassified". goose was
+    driven, so its cell is measured. A plain cross means something else: deepseek has no compaction on
     its ACP surface at all -- in the set's own words it emits no
     ``available_commands_update`` and answers ``session/load`` with "Method not
     found". Those two answers are not the same answer, and this test is where the
@@ -600,7 +599,6 @@ def test_the_compact_capture_gap_is_the_only_unmeasured_thing_on_any_card() -> N
     }
     assert unmeasured == {
         (ACP_BACKEND_PI, cards_mod.LINE_MANUAL_COMPACT),
-        (ACP_BACKEND_GOOSE, cards_mod.LINE_MANUAL_COMPACT),
     }
     # The harness with no compaction surface keeps the cross: its answer is known.
     deepseek = cards_mod.card_for(ACP_BACKEND_DEEPSEEK)

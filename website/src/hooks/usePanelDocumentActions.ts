@@ -2,10 +2,11 @@ import { useCallback } from 'react'
 import type { QueryClient } from '@tanstack/react-query'
 
 import { api } from '../api/client'
+import { noteStaleOwnerResponse } from '../api/staleOwnerSignal'
 import { clearInlineDraft, getInlineDraft, type usePanelTabs } from './usePanelTabs'
 import { i18nT } from '../i18n/t'
 import type { Artifact } from '../types'
-import { fetchFileRead, fileReadQueryKey, FILE_READ_STALE_MS } from '../utils/fileReadQuery'
+import { fetchFileRead, fileReadQueryKey, FILE_READ_STALE_MS, isPartialRead } from '../utils/fileReadQuery'
 import { errMessage } from '../utils/thunkError'
 import { optsForReplace } from '../pages/chat/replaceGuard'
 
@@ -45,17 +46,23 @@ export function usePanelDocumentActions({ tabsCtl, slotRef, queryClient, showAct
   // placeholder tab; any other failure is REPORTED rather than shown as the
   // file's text. Bypassed entirely when the IntelliJ plugin handles file opens
   // — the user wanted IDE-native, not in-dashboard.
-  const openFile = useCallback(async (filePath: string, opts?: { replaceId?: string; line?: number; endLine?: number; diffMode?: boolean; canReplace?: () => boolean }) => {
-    try { window.dispatchEvent(new CustomEvent('kirocrew-file-open', { detail: { path: filePath } })) } catch { /* ignore */ }
+  const openFile = useCallback(async (filePath: string, opts?: { replaceId?: string; line?: number; endLine?: number; diffMode?: boolean; canReplace?: () => boolean; slot?: string | null }) => {
+    try { window.dispatchEvent(new CustomEvent('kirocrew-file-open', { detail: { path: filePath } })) } catch { /* the IDE bridge is optional; the dashboard path below still runs */ }
     if ((window as unknown as { __kirocrewPluginHandlesFiles?: boolean }).__kirocrewPluginHandlesFiles) return
     // Capture the slot BEFORE awaiting the read — the same discipline as
     // `saveFile`. `tabsCtl` was bound at the click, so the tab lands in the
     // INITIATING slot's bucket; stamping it with whatever slot is active once
     // the read resolves would route its comment submissions to a chat the user
-    // switched to mid-load.
-    const slot = slotRef.current ?? null
+    // switched to mid-load. In split view every pane shares ONE host opener but
+    // has its OWN slot, so a pane passes `opts.slot` to stamp the tab with the
+    // slot that owns the transcript the file was opened FROM, not whichever
+    // pane the host currently treats as active (#9487 / #9921). An `undefined`
+    // override falls back to the ref, keeping the single-chat and member-DM
+    // hosts byte-for-byte unchanged; an explicit `null` is a deliberate
+    // "no slot" and is honoured.
+    const slot = opts?.slot !== undefined ? opts.slot : (slotRef.current ?? null)
     try {
-      const [{ text, ok, status, binary }] = await Promise.all([
+      const [read] = await Promise.all([
         queryClient.fetchQuery({
           queryKey: fileReadQueryKey(filePath),
           // The shared fetch carries the backend's binary verdict with the text
@@ -69,6 +76,7 @@ export function usePanelDocumentActions({ tabsCtl, slotRef, queryClient, showAct
           queryFn: () => api.fileDiff(filePath),
         }),
       ])
+      const { text, ok, status, binary } = read
       if (!ok && status !== 404) {
         // Read failure — nothing in the viewer to lose, so the notice hands off.
         showActionError(i18nT('pages.chatPage.could_not_read_file_reason', { path: filePath, reason: i18nT('pages.chatPage.http_status', { status }) }))
@@ -76,8 +84,11 @@ export function usePanelDocumentActions({ tabsCtl, slotRef, queryClient, showAct
       }
       // A 404 is a real answer about the file (it is not on disk), so the
       // panel shows that placeholder. Any other failure was reported above.
+      // The read's partial verdicts travel with its text: this is the seed
+      // read that fills the tab before any panel mounts, so a verdict left
+      // behind here would be lost to the panel for good.
       const body = ok ? text : i18nT('pages.chatPage.file_not_found_on_disk_it_may_have_been_moved_or')
-      tabsCtl.openFile(filePath, body, slot, { ...optsForReplace(opts), binary: ok && binary })
+      tabsCtl.openFile(filePath, body, slot, { ...optsForReplace(opts), binary: ok && binary, partial: ok && isPartialRead(read) })
       onOpened?.()
     } catch (e) {
       // The read itself threw (network, aborted). Reported above the composer
@@ -107,7 +118,14 @@ export function usePanelDocumentActions({ tabsCtl, slotRef, queryClient, showAct
           // Re-run the involvement scan so the row moves sections live.
           queryClient.invalidateQueries({ queryKey: ['session-artifact-records', slot] })
         })
-        .catch(() => { /* best-effort breadcrumb */ })
+        .catch((e) => {
+          // An incognito slot answers 403 by design; anything else -- an
+          // auth-required 403 included -- is a real failure that leaves the
+          // session's artifact list stale.
+          const r = e as { status?: unknown; authRequired?: unknown; edgeChallenge?: unknown } | null
+          if (r?.status === 403 && !r.authRequired && !r.edgeChallenge) return
+          showActionError(i18nT('pages.chatPage.artifact_reference_failed_reason', { reason: errMessage(e) || i18nT('pages.chatPage.unknown_error') }))
+        })
     }
     // Seed the tab from the artifact list cache when it is already warm so the
     // body paints immediately; ArtifactPanel's own query is authoritative and
@@ -126,7 +144,7 @@ export function usePanelDocumentActions({ tabsCtl, slotRef, queryClient, showAct
     } catch { /* fall through — the panel's own query renders the error state */ }
     tabsCtl.openArtifact({ slug, kind }, content, slot)
     onOpened?.()
-  }, [queryClient, tabsCtl, slotRef, onOpened])
+  }, [queryClient, tabsCtl, slotRef, showActionError, onOpened])
 
   const saveFile = useCallback(async (filePath: string, content: string) => {
     // Capture the slot BEFORE awaiting: if the user switches chats mid-save, the
@@ -138,7 +156,14 @@ export function usePanelDocumentActions({ tabsCtl, slotRef, queryClient, showAct
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ path: filePath, content }),
     })
-    if (!res.ok) throw new Error(`Save failed: ${res.status}`)
+    if (!res.ok) {
+      // An owner-gated direct fetch: a session minted before the owner was
+      // configured is denied `401 stale_session_reauth`, which `j` would turn
+      // into the re-auth prompt. Raise it here too, then fail the save as usual
+      // so the editor keeps its unsaved buffer.
+      if (res.status === 401) noteStaleOwnerResponse(res.status, await res.text().catch(() => ''))
+      throw new Error(`Save failed: ${res.status}`)
+    }
     // The saved bytes become the tab's dirty baseline, so a later re-open of
     // the same path refreshes the buffer instead of (needlessly) preserving it
     // as if it still held unsaved work. Best-effort: a tab that is not open

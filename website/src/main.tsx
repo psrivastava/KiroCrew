@@ -20,10 +20,11 @@ import { RouteHistoryTracker } from './components/NavHistoryArrows'
 import { initRum } from './rum'
 import { isEmbeddedPane } from './lib/embedded'
 // i18n must initialize before the first render — a component rendering ahead of
-// init would emit its bare translation key instead of text. The `/all` entry is
-// what registers every language; plain `./i18n` is English-only, so importing it
-// here would render English for every user whatever language they picked.
-import { initI18n } from './i18n/all'
+// init would emit its bare translation key instead of text. The `/lazy` entry
+// fetches a non-English catalog on demand; plain `./i18n` has no loader, so
+// importing it here would render English for every user whatever they picked.
+import { ensureCatalog, i18next, initI18n, isCatalogChunkError } from './i18n/lazy'
+import { DEFAULT_LANGUAGE } from './i18n/languages'
 import { LanguageProvider } from './i18n/LanguageProvider'
 import App from './App'
 import { queryClient } from './api/queryClient'
@@ -31,6 +32,7 @@ import ErrorBoundary from './components/ErrorBoundary'
 import DashboardBootstrap from './components/DashboardBootstrap'
 import { installPageZoomSuppression } from './utils/pageZoom'
 import { installStaleShellHeal } from './lib/staleShellHeal'
+import { captureSafeReload, reloadKeepingSafe } from './lib/safeReload'
 import {
   hasUnreconciledKeys,
   hydrateUiPrefs,
@@ -42,6 +44,7 @@ import 'katex/dist/katex.min.css'
 import './index.css'
 import './styles/cli-mode.css'
 import './styles/message-font-size.css'
+import './styles/crew-notes.css'
 // Register shared modules for federated app bundles (must be before any app loads)
 import './app-sdk/shared-modules'
 
@@ -52,6 +55,22 @@ initRum(__APP_VERSION__)
 // the very first paint is already in the right language; LanguageProvider then
 // reconciles against the server-authoritative config value.
 initI18n()
+// The active language's catalog is its own chunk. Fetch it now, in parallel with
+// the rest of boot, and hold the first render until it settles (see boot()).
+// `ensureCatalog` bounds that wait, so a stalled chunk renders English rather
+// than leaving #root empty. English resolves immediately.
+//
+// `initI18n()` has already set the stored language, so when the fetch fails the
+// store holds English under a non-English `i18next.language`. Resolving to
+// English before the first render keeps the two in agreement: the page renders
+// English and says so. LanguageProvider's mount effect then asks for the stored
+// language again through `changeLanguage`, which retries the fetch and switches
+// only if it succeeds. Never rejects, so boot() needs no failure branch.
+const catalogReady = ensureCatalog(i18next.language).then(async (loaded) => {
+  if (!loaded && i18next.language !== DEFAULT_LANGUAGE) {
+    await i18next.changeLanguage(DEFAULT_LANGUAGE)
+  }
+})
 
 // Page zoom is off on touch: the shell is an application, not a document. The
 // viewport meta and the root `touch-action` cover Blink/Gecko; this covers
@@ -60,6 +79,9 @@ initI18n()
 installPageZoomSuppression()
 // Detect and break out of a stale service-worker shell (see the module doc).
 installStaleShellHeal()
+// A crash-recovery reload must not reopen the chat that crashed it. Read (and
+// strip) `?safe=1` before the router sees the URL. See lib/safeReload.ts.
+captureSafeReload()
 
 // Auto-recover from stale lazy-chunk errors after a frontend rebuild.
 // Vite fires `vite:preloadError` on window when a dynamic import() of a
@@ -70,6 +92,10 @@ installStaleShellHeal()
 // Guarded by a short-lived sessionStorage timestamp so a genuinely-missing
 // chunk (persistent 404) can't trigger an infinite reload loop.
 window.addEventListener('vite:preloadError', (event) => {
+  // Chromium and Firefox include the failed import URL in the Error message.
+  // Suppress only known catalog chunks; URL-less errors keep the normal reload path.
+  const preloadError = (event as Event & { payload?: unknown }).payload
+  if (isCatalogChunkError(preloadError)) return
   const AT_KEY = 'vite-preload-reloaded-at'
   const N_KEY = 'vite-preload-reload-count'
   const COOLDOWN_MS = 10_000
@@ -97,7 +123,8 @@ window.addEventListener('vite:preloadError', (event) => {
   if (!persisted) return
   // Prevent Vite from throwing the unhandled preload error before we reload.
   event.preventDefault()
-  window.location.reload()
+  // Keep a crash-recovery load safe across this reload (see lib/safeReload.ts).
+  reloadKeepingSafe()
 })
 
 // Accessibility: runtime DOM scanning in dev mode (logs violations to console)
@@ -250,15 +277,19 @@ announceBoot('entry')
 
 // (See the block above announceBoot for why the first-time boot may reload.)
 function boot(startSync: boolean): void {
-  announceBoot('render')
-  createRoot(document.getElementById('root')!).render(appTree)
-  if (startSync) startUiPrefsSync()
+  // catalogReady never rejects: a failed catalog fetch renders English (see its
+  // definition for how the language is reconciled first).
+  void catalogReady.then(() => {
+    announceBoot('render')
+    createRoot(document.getElementById('root')!).render(appTree)
+    if (startSync) startUiPrefsSync()
+  })
 }
 
 if (needsHydrate()) {
   void hydrateUiPrefs().then(
     (restored) => {
-      if (restored > 0) window.location.reload()
+      if (restored > 0) reloadKeepingSafe()
       else boot(!needsHydrate())
     },
     () => boot(false),
@@ -274,7 +305,7 @@ if (needsHydrate()) {
   // Runs once per allowlist growth, not per boot: success records the roster.
   void reconcileNewDurableKeys().then(
     (restored) => {
-      if (restored > 0) window.location.reload()
+      if (restored > 0) reloadKeepingSafe()
       else boot(restored === 0)
     },
     () => boot(false),

@@ -10,7 +10,7 @@ remaining seventeen had to follow it.
 The prose is kept and keeps its meaning — demoted to advisory, not removed — so
 a client that only reads ``error`` is unaffected. This is backend-only because
 all three frontend callers of ``forkChatSlot`` (``useSessionActions.ts``,
-``SessionGridView.tsx``, ``chatSlice.ts``) branch on ``ok``/``key`` and none
+``SessionGridView.tsx``, ``store/chat/lifecycle.ts``) branch on ``ok``/``key`` and none
 declares an ``onError`` or reads ``res.error`` at all.
 
 **The one refusal that must NOT become distinguishable.** ``api_chat_slot_fork``
@@ -69,10 +69,13 @@ def test_the_ratchet_can_actually_fail() -> None:
     is no ``slot_not_persistent`` site: an incognito or temporary session forks
     and the child inherits its mode. The one memory-mode refusal in the module is
     ``fork_source_memory_mode_invalid``, for a parent whose persisted mode is
-    outside the allowlist.
+    outside the allowlist. The two app-isolation refusals answer through
+    `slot_ownership.deny_app_slot_access`, the shared per-slot decision, which
+    returns ``slot_not_found`` by construction, so the scan finds those two
+    sites in that module rather than here.
     """
     coded = [f for f in _findings() if f.bucket == "compliant"]
-    assert len(coded) == 27, f"scanner reached {len(coded)} coded sites, expected 27"
+    assert len(coded) == 25, f"scanner reached {len(coded)} coded sites, expected 25"
     assert all(f.code_value for f in coded)
 
 

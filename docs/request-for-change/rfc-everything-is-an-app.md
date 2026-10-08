@@ -1,10 +1,10 @@
 ---
 title: Everything is an App — the core/app boundary and what makes a surface replaceable
-status: draft
+status: partial
 author: zezhexu
 created: 2026-08-18
-last-audited: 2026-08-18
-audited-at: e6b06685e
+last-audited: 2026-09-22
+audited-at: 80bd0a81f
 doc-pr:
 implementation-prs: []
 tracking-issues: []
@@ -13,7 +13,12 @@ superseded-by: []
 ---
 # RFC: Everything is an App — the core/app boundary and what makes a surface replaceable
 
-- Status: draft — nothing implemented. Every phase is a proposal.
+- Status: partial — Phase 0's app boundary is implemented in
+  [`../architecture/overview.md`](../architecture/overview.md), and Tenet 8 in
+  [`../../TENETS.md`](../../TENETS.md) points to it. The dead-field ratchet and
+  Phases 1–3 remain unimplemented: `jobFamilies` is still only
+  parsed/serialized, and `registerOverviewStatCards` still exists with no stock
+  registrants.
 - Author: zezhexu
 - Created: 2026-08-18
 - Measured at: `e6b06685e`. Code line numbers below were verified against that
@@ -71,7 +76,7 @@ every group. Measured at `e6b06685e`, the situation is worse than "hard to
 customize":
 
 - **There is no overview surface.** `/overview` is a redirect to
-  `/settings?tab=overview` (`website/src/App.tsx:2712`). Overview is a settings
+  `/settings?tab=overview` (the `/overview` route in `website/src/App.tsx`). Overview is a settings
   tab reached through `website/src/pages/settings/OverviewPanel.tsx:1-4`.
 - **It is one fixed layout for everyone.** The six stat tiles are a hardcoded
   literal with no conditional (`website/src/pages/OverviewPage.tsx:193-198`).
@@ -411,7 +416,7 @@ than a failed install. Phase 2 changes where the overview renders and must keep
 One gap is worth naming because this RFC makes it load-bearing: the compatibility
 contract is one-directional. `minKiroCrewVersion` is a floor an app declares about
 the gateway, checked only at install and update (`apps/manager.py:281`,
-`apps/routes.py:503`, `apps/registry.py:4053`) and never at enable or boot, and it
+`apps/routes.py:503`, `install_from_registry` (`apps/registry_pipeline/install.py`)) and never at enable or boot, and it
 fails **open** on a malformed value (`apps/version.py:32-33`). The platform
 declares no version for its own app-facing surface, so withdrawing a seam carries
 no signal in the other direction. Phase 1 removes seams. If that ordering feels

@@ -8,8 +8,8 @@ goes through this module rather than a bare ``glob("*.json")`` -- a scan that
 sees only one form lists an agent kiro-cli would run, or projects onto KAS an
 agent that is not there.
 
-This is a leaf module on purpose: it imports nothing from ``kiro_crew``, so the
-config loader, the MCP gateway rewriter and the discovery cache can all reach it
+This is a leaf module on purpose: it imports nothing from ``kiro_crew`` except
+the leaf :mod:`kiro_crew.user_json`, so the config loader, the MCP gateway rewriter and the discovery cache can all reach it
 without an import cycle. It parses bytes it is handed and never opens a file --
 the hardened read (size cap, sensitive-symlink refusal) stays with the caller.
 
@@ -32,7 +32,7 @@ body text and configuration never leaks into the prompt.
 
 from __future__ import annotations
 
-import json
+import codecs
 import math
 import re
 from pathlib import Path
@@ -40,12 +40,24 @@ from typing import Any
 
 import yaml  # type: ignore[import-untyped]
 
+from kiro_crew.user_json import loads_user_json
+
 #: Suffixes an agents directory entry may carry, lower-case. ``.json`` is the
 #: kiro-cli form; ``.md`` is the markdown form.
 JSON_SUFFIX = ".json"
 MARKDOWN_SUFFIX = ".md"
 AGENT_SPEC_SUFFIXES: tuple[str, ...] = (JSON_SUFFIX, MARKDOWN_SUFFIX)
 NATIVE_SKILL_ALIAS_PREFIX = "kirocrew-skill-view-"
+
+#: The ``kirocrew-skill-view-*`` alias count at or above which the projection
+#: stops minting new views and falls back to the authored agent, and which the
+#: doctor's backlog warning flags. It lives here, in the leaf that owns the
+#: alias prefix, so the ACP projection and the doctor (via ``cli_doctor``) share
+#: one number without the doctor importing the ACP layer -- the agent-SDK import
+#: boundary (``.github/agent-sdk-boundary-baseline.txt``) is shrink-only, and the
+#: doctor is a baselined consumer. See
+#: :data:`kiro_crew.acp.skill_projection.SKILL_VIEW_PROJECTION_CEILING`.
+SKILL_VIEW_PROJECTION_CEILING = 2000
 
 _FRONTMATTER_CLOSE_RE = re.compile(r"^---[ \t]*\r?$", re.MULTILINE)
 
@@ -149,6 +161,20 @@ def is_agent_spec_name(name: str) -> bool:
     return spec_suffix(name) is not None
 
 
+def is_native_skill_alias_name(name: str) -> bool:
+    """Whether a directory entry name is a managed skill-view alias.
+
+    The one predicate behind every walk that leaves the aliases out: the roster
+    (:func:`iter_agent_spec_files`) and the stat-only fingerprints the discovery
+    caches revalidate on (``agent_discovery._iter_spec_entries``). An alias is a
+    projection of a spec the roster already lists, so a fingerprint that counted
+    it would move on writes the roster cannot see and would cost one ``stat``
+    per alias per call. The prefix holds no dot, so the test on the full name is
+    the test on the stem.
+    """
+    return name.startswith(NATIVE_SKILL_ALIAS_PREFIX)
+
+
 def is_markdown_spec(path: str | Path) -> bool:
     """Whether *path* is the markdown form."""
     return spec_suffix(path) == MARKDOWN_SUFFIX
@@ -201,7 +227,7 @@ def iter_agent_spec_files(directory: Path, *, ordered: bool = True) -> list[Path
     that scan on the event loop and stop at the first hit.
     """
     live, _shadowed = _split_spec_files(directory)
-    live = [path for path in live if not path.stem.startswith(NATIVE_SKILL_ALIAS_PREFIX)]
+    live = [path for path in live if not is_native_skill_alias_name(path.name)]
     return sorted(live) if ordered else live
 
 
@@ -223,6 +249,48 @@ def agent_spec_candidates(directory: Path, name: str) -> list[Path]:
     return [directory / f"{name}{suffix}" for suffix in AGENT_SPEC_SUFFIXES]
 
 
+def opens_frontmatter_fence(text: str) -> bool:
+    """Whether *text* opens with a frontmatter fence: BOM aside, a ``---`` line.
+
+    The rule that separates a markdown SPEC from a plain markdown document (a
+    README, a shared prompt fragment) in an agents directory. It is only the
+    OPENING test: a document whose fence opens and never closes announced
+    itself as a spec, and :func:`split_markdown_spec` still refuses to split it.
+    """
+    if text.startswith("\ufeff"):
+        text = text[1:]
+    return text.startswith(("---\n", "---\r\n"))
+
+
+def markdown_head_is_fenceless(head: bytes, *, complete: bool) -> bool:
+    """Whether the first bytes of a markdown file PROVE it has no opening fence.
+
+    *head* is the file's first bytes and *complete* says whether they are the
+    whole file. ``True`` only when the head decodes as the UTF-8 that
+    :func:`parse_agent_spec_bytes` reads every spec as and the decoded text
+    does not open with a fence (:func:`opens_frontmatter_fence`). Everything
+    else is ``False``, because a caller asks this to decide whether a file its
+    strict reader refused may be SKIPPED as not-a-spec, and a head that cannot
+    be judged is unknown, not ignorable:
+
+    * bytes that are not UTF-8 -- a UTF-16 or UTF-32 BOM (``0xFF``/``0xFE`` are
+      never UTF-8 bytes), a Latin-1 byte, a file that ends inside a multibyte
+      sequence: the parser could not decode it either, so nothing here can say
+      what fence test it would have applied;
+    * a NUL character, which no markdown document carries.
+
+    A multibyte character cut at the end of an incomplete head is held back,
+    not raised: the head is decoded with ``final=complete``.
+    """
+    try:
+        text = codecs.getincrementaldecoder("utf-8")().decode(head, final=complete)
+    except UnicodeDecodeError:
+        return False
+    if "\x00" in text:
+        return False
+    return not opens_frontmatter_fence(text)
+
+
 def split_markdown_spec(text: str) -> tuple[str, str] | None:
     """Split a markdown spec into ``(frontmatter_yaml, body)``.
 
@@ -231,10 +299,10 @@ def split_markdown_spec(text: str) -> tuple[str, str] | None:
     be listed as one. A fence with no closing line is also ``None``: the whole
     file would otherwise parse as YAML and a prompt would be mistaken for config.
     """
+    if not opens_frontmatter_fence(text):
+        return None
     if text.startswith("\ufeff"):
         text = text[1:]
-    if not (text.startswith("---\n") or text.startswith("---\r\n")):
-        return None
     first_newline = text.index("\n")
     close = _FRONTMATTER_CLOSE_RE.search(text, first_newline + 1)
     if close is None:
@@ -326,7 +394,7 @@ def parse_agent_spec_text(text: str, path: str | Path) -> Any:
     """
     if is_markdown_spec(path):
         return parse_markdown_spec(text)
-    return json.loads(text)
+    return loads_user_json(text)
 
 
 def parse_agent_spec_bytes(raw: bytes, path: str | Path) -> Any:

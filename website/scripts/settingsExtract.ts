@@ -3,8 +3,9 @@
  *
  * Parses `src/pages/settings/*.tsx` for JSX usages of settings primitives
  * (SettingsToggle, SettingsSelect, SettingsMultiSelect, SettingsInput,
- * SettingsStepper, SettingsButtonGroup) and extracts label + description +
- * primitive type.
+ * SettingsStepper, SettingsButtonGroup) and extracts label + description (the
+ * `hint` tip text first, then the description, when a row carries both; the tip
+ * alone when a row has no description) + primitive type.
  *
  * A label/description is read from EITHER form:
  *   - a string literal          `label="Zoom Level"`
@@ -110,6 +111,10 @@ export const PANEL_TAB_MAP: Record<string, PanelTarget> = {
   'VoicePanel.tsx': 'voice',
   'DisplayPanel.tsx': 'display',
   'BrowserPanel.tsx': 'browser',
+  // The Browser tab's managed-browser and existing-browser sections, mounted by
+  // BrowserPanel. Mapped with it so a control either one gains stays indexed.
+  'ManagedBrowsersSection.tsx': 'browser',
+  'ConnectBrowserSection.tsx': 'browser',
   'ComputerUsePanel.tsx': 'computer-use',
   'InstancesPanel.tsx': 'instances',
   'SecurityPanel.tsx': 'security',
@@ -155,6 +160,10 @@ export const PANEL_TAB_MAP: Record<string, PanelTarget> = {
   // search cannot find is the coverage gap settingsCoverage.test.ts exists to
   // close — and the hit reaches the labelled opt-in switch, not the page.
   'FeaturePreviewsSection.tsx': 'developer',
+  // The Crewmates section DeveloperPanel mounts under Feature Previews: the
+  // server-side crewmate switches (reply threads today). Same tab, so a
+  // SettingRef to `dashboard.crewmate_threads` deep-links to the row.
+  'CrewmatesSection.tsx': 'developer',
   // The Decisions (Jev) card, which FeaturePreviewsSection mounts. Its own file
   // because it is a list and a detail rather than one row, and mapped here for the
   // reason the section above is: a control on a Settings pane that search cannot
@@ -178,7 +187,16 @@ export const PANEL_TAB_MAP: Record<string, PanelTarget> = {
   // renders InstancesPanel.tsx's AddInstanceForm — both files map to the same
   // tab so a primitive added to either lands on the right deep link.
   'RemoteCrewPanel.tsx': 'instances',
+  // Mounted from outside pages/settings, so each is also a root in panelRoots:
+  // ImportPanel mounts PortabilityTab, FeaturePreviewsSection the gateway-wide
+  // automatic-cards switch.
+  'PortabilityTab.tsx': 'imports',
+  'AutomaticCardSetting.tsx': 'developer',
 }
+
+/** Panels whose controls sit in `case '<sub>':` pages of a SettingsSubNav;
+ *  each entry gets `params.sub` from the case it is rendered under. */
+const SUBNAV_CASE_PANELS = new Set(['ChatPanel.tsx', 'DisplayPanel.tsx', 'NotificationsPanel.tsx'])
 
 /** Map component name → our type enum. */
 const PRIMITIVE_MAP: Record<string, SettingPrimitiveType> = {
@@ -364,12 +382,26 @@ export function extractFromSource(
         continue
       }
       const labelKey = extractTranslationKeyProp(props, 'label')
-      const description = extractStringProp(props, 'description')
+      // A row's help may sit on the always-visible `description`, behind the
+      // `hint` tip, or on both; each is text a palette search should match on,
+      // so a row keeping both indexes both. The tip states what the row is and
+      // the visible description states the consequence, so the tip goes first:
+      // definition-then-consequence reads as prose in the palette subtitle. The
+      // tip stands in alone when the row keeps nothing permanently visible.
+      const description = [extractStringProp(props, 'hint'), extractStringProp(props, 'description')]
+        .filter((s): s is string => s !== undefined)
+        .join(' ')
       const configKey = extractStringProp(props, 'configKey')
       const settingId = extractStringProp(props, 'settingId')
+      // A rail-hosting panel renders each page in a `case '<key>':` block;
+      // search must open that page or the highlight finds nothing.
+      const caseKey = SUBNAV_CASE_PANELS.has(path.basename(fileName))
+        ? [...source.slice(0, tagStartMatch.index).matchAll(/\bcase '([a-z0-9-]+)':/g)].pop()?.[1]
+        : undefined
       for (const target of targets) {
         const tab = typeof target === 'string' ? target : target.tab
-        const params = typeof target === 'string' ? undefined : target.params
+        const targetParams = typeof target === 'string' ? undefined : target.params
+        const params = caseKey ? { ...targetParams, sub: caseKey } : targetParams
         const suffix = typeof target === 'string' ? undefined : target.labelSuffix
         // Suffix only labelKey entries: highlighting resolves labelKey to the
         // rendered (un-suffixed) label, so DOM lookup still works. A literal
@@ -397,18 +429,38 @@ export function extractFromSource(
   return { entries, skipped }
 }
 
+/** A directory of panel files, or one `file` in `dir` that a panel mounts. */
+export interface ExtractRoot { dir: string; file?: string }
+
+/** Every place panel source lives, given website/src. A settings panel that
+ *  mounts a component from another pages/ directory adds it here, so the
+ *  registry and the coverage gate both scan it. */
+export function panelRoots(srcDir: string): ExtractRoot[] {
+  return [
+    { dir: path.join(srcDir, 'pages', 'settings') },
+    { dir: path.join(srcDir, 'pages', 'overview'), file: 'PortabilityTab.tsx' },
+    { dir: path.join(srcDir, 'pages', 'chat', 'command-center'), file: 'AutomaticCardSetting.tsx' },
+  ]
+}
+
+/** The panel files under `roots`, as full paths. A directory's files are
+ *  sorted so dedup suffix assignment is deterministic cross-platform
+ *  (readdirSync order is OS-dependent). */
+export function rootFiles(roots: ExtractRoot[]): string[] {
+  return roots.flatMap(({ dir, file }) =>
+    (file ? [file] : fs.readdirSync(dir).filter(f => f.endsWith('.tsx')).sort()).map(f => path.join(dir, f)),
+  )
+}
+
 /**
- * Extract settings from all panel files in the given directory.
- * Files are sorted alphabetically before processing so dedup suffix assignment
- * is deterministic cross-platform (Fix #3: readdirSync order is OS-dependent).
+ * Extract settings from all panel files under the given roots.
  */
-export function extractAll(settingsDir: string): { entries: SettingEntry[]; skipped: number } {
-  const files = fs.readdirSync(settingsDir).filter(f => f.endsWith('.tsx')).sort()
+export function extractAll(roots: ExtractRoot[]): { entries: SettingEntry[]; skipped: number } {
   let allEntries: SettingEntry[] = []
   let totalSkipped = 0
 
-  for (const file of files) {
-    const source = fs.readFileSync(path.join(settingsDir, file), 'utf-8')
+  for (const file of rootFiles(roots)) {
+    const source = fs.readFileSync(file, 'utf-8')
     const { entries, skipped } = extractFromSource(source, file)
     allEntries = allEntries.concat(entries)
     totalSkipped += skipped

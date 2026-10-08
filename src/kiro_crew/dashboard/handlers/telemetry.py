@@ -64,10 +64,12 @@ _STARTUP_METRIC = "kirocrew.session.startup.duration"
 # emitter naming the instrument differently is a silently empty panel.
 _TURN_METRIC = TURN_METRIC
 # The turn's two billing histograms. Claimed BY NAME below, ahead of the generic
-# histogram branch, because that branch reports every statistic under `*_ms`
-# keys: a credit or a dollar amount arriving there would be rendered as a
-# millisecond duration on the Telemetry page. They are reported inside the turn
-# block under unit-neutral keys instead, each carrying its own `unit`.
+# histogram branch, because they are reported inside the turn block with their
+# own attribution split, which the generic branch has no shape for. Their unit is
+# handled the same way every non-duration histogram's is: unit-neutral keys, each
+# carrying its own `unit`, never the `*_ms` keys the duration family uses. The
+# generic branch resolves which of its own names need that from
+# `_non_ms_histogram_units()`.
 _TURN_CREDITS_METRIC = TURN_CREDITS_METRIC
 _TURN_COST_METRIC = TURN_COST_METRIC
 # The end-to-end startup point. The claude path emits no ``phase`` attribute at
@@ -129,6 +131,34 @@ def _lifetime_total_gauge_names() -> "frozenset[str]":
 
         _lifetime_total_gauges = frozenset(_process + _inventory)
     return _lifetime_total_gauges
+
+
+# Same first-use deferral, same reason: resolved inside the per-request path so
+# importing this module on the boot path does not pull the instrument modules in.
+_non_ms_units: "dict[str, str] | None" = None
+
+
+def _non_ms_histogram_units() -> "dict[str, str]":
+    """Generic-surface histograms that are NOT milliseconds, and their units.
+
+    ``_Hist.stats()`` names every field ``*_ms``, which is correct for the
+    duration family and a unit lie for anything else: a resident set reported as
+    ``p50_ms`` is rendered with a millisecond suffix by the frontend. The two
+    turn billing histograms avoid this by being claimed by name ahead of the
+    generic branch; a sampled histogram has no dedicated block to be claimed
+    into, so the generic branch reads this mapping and reports those under
+    unit-neutral keys instead.
+
+    The mapping lives with the emitter rather than here, for the reason the
+    lifetime-total roster does: the module that declares an instrument is the one
+    that knows what its reading means, so no unit is re-spelled by a reader.
+    """
+    global _non_ms_units
+    if _non_ms_units is None:
+        from kiro_crew.metrics.events import NON_MS_HISTOGRAM_UNITS
+
+        _non_ms_units = dict(NON_MS_HISTOGRAM_UNITS)
+    return _non_ms_units
 
 
 # Only terminal-fault outcomes count toward fault_rate. The two watchdog
@@ -848,12 +878,17 @@ def _other_series(
     this list renders the same order on every request.
     """
     out: list[dict[str, Any]] = []
+    non_ms = _non_ms_histogram_units()
     for name in sorted(other_hist):
-        s = other_hist[name].stats()
+        unit = non_ms.get(name)
+        s = _amount_stats(other_hist[name], unit) if unit else other_hist[name].stats()
         s.update({"name": name, "kind": "histogram"})
         splits = other_split.get(name)
         if splits:
-            s["splits"] = {sig: splits[sig].stats() for sig in sorted(splits)}
+            s["splits"] = {
+                sig: (_amount_stats(splits[sig], unit) if unit else splits[sig].stats())
+                for sig in sorted(splits)
+            }
         out.append(s)
     for name in sorted(other_ctr):
         rec = other_ctr[name]
@@ -1033,8 +1068,9 @@ def _aggregate(shard_paths: list[Path]) -> dict[str, Any]:
     # stream.
     other_cum: dict[str, dict[tuple[str, str, str], list[tuple[int, float]]]] = {}
     turn = _Hist()
-    # The turn's billed amount, kept OUT of other_hist so it is never reported
-    # under `*_ms` keys. Exactly one of the two is populated on a given host —
+    # The turn's billed amount, claimed by name so it is reported inside the turn
+    # block with its per-model attribution split, which the generic surface has no
+    # shape for. Exactly one of the two is populated on a given host —
     # the acp backend bills credits, claude_code bills dollars — so the other
     # reports an empty stat block, which reads as "this host does not bill here"
     # rather than as a measured zero.
@@ -1313,11 +1349,16 @@ async def api_context_trace(request: web.Request) -> web.Response:
     this per-session, per-turn half deliberately does not — see
     :func:`kiro_crew.dashboard.handlers.usage.context_trace`.
 
-    Independent of the telemetry main switch: the usage rows this reads are
-    always written, so the trace works with OTEL collection off.
+    Independent of the telemetry main switch — OTEL collection being off does not
+    affect it. It DOES depend on the crew log, which is the source it reads: the
+    composer's ``context/composed`` entry is written only while the crew log records,
+    so a session run with ``KIROCREW_CREW_LOG`` switched off has nothing for this
+    route to return and the panel is empty for it. That is the one switch this
+    endpoint is not independent of, and it is named here rather than left for a
+    reader to discover from an empty chart.
 
     Dashboard-only. Unlike ``/api/usage/turns`` this reader has no row-ownership
-    model, and its rows carry the turn's billing — so an app caller is refused
+    model — so an app caller is refused
     outright (deny-by-default, App Kit §5.2) rather than handed an arbitrary
     slot's data. The 404 is indistinguishable from an unknown route on purpose,
     and the refusal is SEL-audited like every app-caller decision.
@@ -1526,27 +1567,14 @@ async def _with_conversation_titles(request: web.Request, cost: dict[str, Any]) 
 def _telemetry_overlay_pins(leaf: str) -> bool:
     """Return whether ``config.local.json`` sets ``telemetry.<leaf>``.
 
-    That overlay deep-merges OVER ``config.json`` at load, and the Settings
-    toggles write the BASE file — so an entry here makes a switch snap back to
-    the overlay's value after a successful write. Reporting it lets the panel say
-    why instead of looking broken. Best-effort: an unreadable or malformed
-    overlay is reported as "not pinned" rather than raising, since this is a
-    diagnostic (the effective value the handler reports is still authoritative).
-
-    Shared by both telemetry switches: the shadowing mechanism is the overlay,
-    not the key, so a second copy per key would be two things to keep in sync.
+    Thin spelling of ``config.loader.overlay_pins`` for this section, so both
+    telemetry switches name their own key rather than a path. Why the flag
+    exists, and the best-effort rule, live with that helper: the shadowing
+    mechanism is the overlay, not the key, so one reader owns the file.
     """
-    from kiro_crew.config.loader import config_local_path
+    from kiro_crew.config.loader import overlay_pins
 
-    try:
-        path = config_local_path()
-        if not path.exists():
-            return False
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return False
-    section = data.get("telemetry") if isinstance(data, dict) else None
-    return isinstance(section, dict) and leaf in section
+    return overlay_pins("telemetry", leaf)
 
 
 async def api_beacon_status(request: web.Request) -> web.Response:

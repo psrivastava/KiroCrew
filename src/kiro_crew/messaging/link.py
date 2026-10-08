@@ -10,10 +10,11 @@ Stdlib-only; imported by ``session_map`` (no import cycle).
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 # ``SLACK_NAMESPACE`` and ``CHANNEL_SESSION_NAMESPACES`` are RE-EXPORTED from
@@ -97,6 +98,14 @@ def channel_namespace_of(key: str) -> str:
 #: Non-channel session-key prefixes that still deserve their own telemetry label.
 #: Kept in sync with the prefixes ``SessionManager`` mints; anything absent here
 #: folds into ``"other"`` so an unrecognised key can never mint a metric series.
+#:
+#: ADDING A NAMESPACE: this tuple bounds telemetry label cardinality and nothing more,
+#: so being absent from it is not a bug on its own — ``wf-unpooled``, ``wf-worker`` and
+#: ``wf-scope`` are all live session keys that are not listed here. But a namespace whose
+#: transcripts reach disk also needs classifying at
+#: ``dashboard/handlers/sessions.py::_MACHINE_NAMESPACES``, which decides whether the
+#: Older-sessions pane presents it as a conversation. Unclassified means VISIBLE there,
+#: so a new machine namespace silently repopulates that pane until it is added.
 _TELEMETRY_LOCAL_PREFIXES: tuple[tuple[str, str], ...] = (
     ("dashboard", "dashboard"),
     ("cron", "cron"),
@@ -104,6 +113,10 @@ _TELEMETRY_LOCAL_PREFIXES: tuple[tuple[str, str], ...] = (
     ("taskrunner", "taskrunner"),
     ("secretary", "secretary"),
     ("side", "side"),
+    # A reply thread on a crewmate chat message (``dashboard/chat_threads.py``),
+    # keyed ``thread:<slot>:<mid>``. Its own label, as ``side`` has, so thread
+    # turns never fold into ``other``.
+    ("thread", "thread"),
     ("wf-pool", "workflow_pool"),
     ("wf-author", "workflow_author"),
     # A workflow STAGE's own session (``wf:<run_id>:<n>``, built by
@@ -193,18 +206,75 @@ class ChannelLink:
 
     Distinct from the dashboard->Slack *mirror* binding, which stays behind
     ``SessionMap.get/set_slack_link`` and is NOT modeled here (guardrail G3).
+
+    ``principal`` is the platform user id of the peer this conversation was
+    authorized FOR, recorded by the writer that authorized it -- the dashboard's
+    mirror-link handler, which resolves a ``user:<id>`` target into this very
+    conversation, and a Discord ``!sessions`` pick, whose press arrives in the
+    peer's own DM. ``None`` is "the writer could not name one" (an origin bind, a
+    thread or room target), never an authorization of nobody. It exists for the
+    per-send recipient check: a transport whose conversation id is unrelated to
+    its roster identity (a Discord DM channel id against a user snowflake) can
+    reach its roster only through a principal, and a dashboard-born session key
+    names no peer to supply one.
+
+    A HINT on its own, and an admission once signed. The session map this rides
+    in is writable by in-sandbox code, so the per-send recipient check hands a
+    principal to the roster only when ``admission`` -- a MAC the gateway alone can
+    mint over this session and this whole location, see
+    :mod:`kiro_crew.mirror_admission` -- verifies for the row; a rewritten, moved
+    or unsigned row is refused. The transport's own record of the conversation
+    (``MessagingTransport.direct_peer_of``), when it has one, must agree as well.
+
+    Both fields are excluded from equality on purpose. A link's identity is its
+    LOCATION -- ``find_mirror_sessions``, the occupancy check and the binding
+    nonce all match a binding by value -- and the principal describes who that
+    location was admitted for, not where it is. Two links to one conversation are
+    the same binding whether or not one of them recorded the peer. A rollback's
+    OWNERSHIP guard is the one comparison that must not stop at the location: it
+    asks whether the row it is about to undo is still the very row this
+    transaction wrote, and a newer row at the same location carrying a refreshed
+    admission (a re-link after a key rotation) is deliberate state, not its own
+    work. Those guards use :meth:`same_row`, which compares the whole stored row.
     """
 
     channel_type: str
     channel_id: str | None = None
     thread_id: str | None = None
+    principal: str | None = field(default=None, compare=False)
+    admission: str | None = field(default=None, compare=False, repr=False)
+
+    def same_row(self, other: object) -> bool:
+        """Whole-row identity: the location AND the recorded peer AND its admission.
+
+        For a rollback's ownership guard ("undo only what is still my own write").
+        Location equality (``==``) deliberately ignores ``principal`` and
+        ``admission`` so occupancy and nonce checks treat two links to one
+        conversation as one binding; an ownership guard that stopped there would
+        accept a newer same-location row with a different admission as its own,
+        clear it, and put an obsolete row back in its place.
+        """
+        return (
+            isinstance(other, ChannelLink)
+            and self == other
+            and self.principal == other.principal
+            and self.admission == other.admission
+        )
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        d: dict[str, Any] = {
             "channel_type": self.channel_type,
             "channel_id": self.channel_id,
             "thread_id": self.thread_id,
         }
+        # Emitted only when recorded, so a link that names no peer serializes
+        # exactly as one always has and a stored row is not rewritten for it. An
+        # admission is only ever meaningful beside the peer it admits.
+        if self.principal:
+            d["principal"] = self.principal
+            if self.admission:
+                d["admission"] = self.admission
+        return d
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "ChannelLink":
@@ -212,12 +282,64 @@ class ChannelLink:
             channel_type=d.get("channel_type", ""),
             channel_id=d.get("channel_id"),
             thread_id=d.get("thread_id"),
+            principal=d.get("principal") or None,
+            admission=d.get("admission") or None,
         )
 
 
 def session_key(channel_type: str, conversation_id: str) -> str:
     """Build a namespaced session key, e.g. ``slack:123.456``."""
     return f"{channel_type}:{conversation_id}"
+
+
+_CHANNEL_ID_PREFIX_RE = re.compile(r"^([a-z][a-z0-9_-]*):(.*)$", re.IGNORECASE)
+
+
+def split_namespaced_channel_id(channel_id: str | None) -> tuple[str, str] | None:
+    """Return ``(channel_type, target)`` for a ``<type>:<target>`` id, else None."""
+    if not channel_id:
+        return None
+    match = _CHANNEL_ID_PREFIX_RE.match(channel_id)
+    if not match:
+        return None
+    return match.group(1).lower(), match.group(2)
+
+
+def binding_token(link: ChannelLink, nonce: str = "") -> str:
+    """The opaque identity of one binding, as the dashboard's slots row carries it.
+
+    A digest over the WHOLE binding -- channel type, the full conversation id,
+    the thread id, and the binding's own persisted *nonce* -- so two threads in
+    one Slack channel, or two channels that share a redacted six-character
+    tail, are told apart, and so are two bindings to the SAME target made at
+    different times. The slots projection mints it beside the row's redacted
+    display tail; an unlink names it, and ``SessionMap.clear_mirror_link_if`` /
+    ``clear_slack_link_if`` recompute it from the binding they hold and clear
+    only on equality -- so a row drawn from a binding that has since been
+    replaced never matches the replacement. The nonce is what makes that hold
+    when the replacement is byte-identical: ``SessionMap`` mints one whenever a
+    binding is created or its target changes and drops it with the binding, so
+    unlink -> reconnect the same target yields a new token and a delayed unlink
+    naming the old row is refused instead of deleting the new binding. A binding
+    written before nonces existed has none, and its token digests the
+    coordinates alone as it always did -- the binding that REPLACES it carries a
+    nonce, which is all the guard needs. The channel id is normalized the way
+    the row is -- a ``<type>:`` namespace matching the channel type is stripped
+    -- so a Discord id stored namespaced and a bare one yield the same token.
+    Opaque on purpose: the raw id and the nonce never reach the browser, and
+    the digest is neither. Lives here, below the map, because the map is what
+    compares it.
+    """
+    channel_type = (link.channel_type or "").lower()
+    channel_id = link.channel_id or ""
+    nested = split_namespaced_channel_id(channel_id)
+    if nested and nested[0] == channel_type:
+        channel_id = nested[1]
+    parts = ["kirocrew-link-binding", channel_type, channel_id, link.thread_id or ""]
+    if nonce:
+        parts.append(nonce)
+    material = "\0".join(parts)
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
 
 
 # ── Unbind reasons: why an inbound resume binding was lost ───────────────────
@@ -616,24 +738,6 @@ def rebind_conversation_location(
     )
 
 
-def _is_unrouted_slack_placeholder(link: ChannelLink) -> bool:
-    """True for a Slack link that names no thread, i.e. one nobody chose.
-
-    ``set_channel`` writes the conversation's namespaced bucket
-    (``discord:<id>``) into the legacy ``slack_channel_id`` field, and
-    :meth:`SessionMap.get_mirror_link` synthesizes a Slack ``ChannelLink`` from
-    that field whenever no explicit ``mirror`` row exists — so the first turn of
-    a new channel session reads back a Slack link it never asked for.
-
-    A threadless Slack row is not a routable mirror: an empty ``thread_ts`` is
-    Slack's own clear sentinel and never enters ``_thread_to_session``, so
-    nothing can be delivered through it. A real Slack mirror always names its
-    thread, which is why the thread — not the channel type — is what separates
-    bookkeeping from a binding.
-    """
-    return link.channel_type == SLACK_NAMESPACE and not link.thread_id
-
-
 def bind_origin_mirror(sessions: Any, *, key: str, location: ChannelLink) -> bool:
     """Bind the conversation a session is being READ in as its own outbound mirror.
 
@@ -656,10 +760,10 @@ def bind_origin_mirror(sessions: Any, *, key: str, location: ChannelLink) -> boo
     left alone — whichever conversation and whichever CHANNEL it names. The
     dashboard can point a session's mirror at any surface, so a channel
     conversation whose owner aimed it elsewhere keeps that target; overwriting it
-    would silently redirect their replies into this chat. The one exception is the
-    unrouted Slack placeholder (:func:`_is_unrouted_slack_placeholder`) — the
-    first turn of a new channel session always reads one back, and it is
-    bookkeeping surfacing through the synthesis path rather than a choice.
+    would silently redirect their replies into this chat. The threadless Slack row
+    the first turn's ``set_channel`` leaves in the legacy field is not a binding
+    and never reads back as one: ``SessionMap.get_mirror_link`` filters it at the
+    source, so this reader sees ``None`` for a conversation nobody has bound.
 
     Honours the persisted opt-out the in-channel unlink writes: without it, "off"
     would last exactly until the user's next message, because an entry with no
@@ -704,8 +808,7 @@ def bind_origin_mirror(sessions: Any, *, key: str, location: ChannelLink) -> boo
         return False
     if sessions.mirror_opt_out(key):
         return False
-    existing = sessions.get_mirror_link(key)
-    if existing is not None and not _is_unrouted_slack_placeholder(existing):
+    if sessions.get_mirror_link(key) is not None:
         return False
     try:
         sessions.set_mirror_link(key, location)

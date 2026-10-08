@@ -42,6 +42,7 @@ from kiro_crew.acp.types import (
     ACP_BACKEND_CODEX,
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
+    ACP_BACKENDS_KNOWN,
     ACP_BACKENDS_SPEC_SERVERS_OFF_WIRE,
 )
 from kiro_crew.agent_sdk import mcp_refs as mcp_refs_mod
@@ -261,11 +262,12 @@ class TestResolution:
         assert unresolved_server_refs(spec, _wire("pooled"), backend=ACP_BACKEND_CLAUDE) == []
 
     def test_a_spec_server_the_projection_dropped_is_reported(self):
-        """Declared, referenced, and still absent from the session.
+        """Declared, referenced, and still missing from Crew's projection.
 
         A registry-marked entry, or one with neither ``command`` nor ``url``, is
         dropped by the translation -- so the spec's own ``mcpServers`` proves
-        nothing about what the session receives on a backend that reads no spec.
+        nothing about what Crew's projection delivers on a backend that reads no
+        spec.
         """
         spec = {
             "tools": ["@marked", "@ok"],
@@ -355,6 +357,45 @@ class TestTheWarning:
                 spec, [], backend=ACP_BACKEND_CODEX, agent="a", gateway_enabled=True
             )
         assert "mcp_gateway=on" in caplog.records[-1].getMessage()
+
+    @pytest.mark.parametrize("backend", sorted(ACP_BACKENDS_KNOWN), ids=lambda b: b or "kiro")
+    def test_the_verdict_claims_only_what_the_wire_proves_on_every_backend(self, backend, caplog):
+        """No backend's array is provably the session's whole MCP surface.
+
+        Claude Code loads its own user- and project-scope ``mcpServers`` and its
+        plugins beside the array Crew sends; codex-acp merges Crew's array on top of
+        what its own ``config.toml`` declares; kiro-cli loads the global
+        ``settings/mcp.json`` into every agent by default (a spec may opt out with
+        ``includeMcpJson: false``). On any of
+        them a ref nothing of Crew's satisfies can still be served by a same-named
+        server the harness mounted itself -- and the detector, which reads the wire
+        (or the spec) alone by design, cannot tell the two apart. So the line says
+        the harness may mount such a server and never asserts the tools absent.
+        Pinned as the full line, on every known backend, so a backend-shaped branch
+        cannot creep back in -- and the leading clause claims only Crew's
+        projection, not what the session receives, which is the very thing the
+        verdict says the line cannot know.
+        """
+        spec = {"tools": ["@glean", "@kirocrew-core"], "mcpServers": {"other": _CORE}}
+        with caplog.at_level(logging.WARNING, logger=mcp_ref_guard.__name__):
+            found = warn_unresolved_server_refs(
+                spec, [], backend=backend, agent="kirocrew", gateway_enabled=False
+            )
+        assert found == ["@glean", "@kirocrew-core"]
+        text = caplog.records[-1].getMessage()
+        assert text == (
+            "agent-spec tool refs name no MCP server in Crew's projection for this "
+            f"session: backend={backend!r} agent='kirocrew' unresolved=@glean, "
+            "@kirocrew-core mcp_gateway=off. Crew's projection delivers none of those "
+            "servers; the harness may mount a same-named server from its own "
+            "configuration, so a listed ref may still be served and this line cannot "
+            "tell which. The harness still works. A backend that reads no agent file "
+            "needs a mirror (src/kiro_crew/providers/mirrors/) to project the spec "
+            "onto its session/new mcpServers array."
+        )
+        assert "absent from the session" not in text
+        assert "nothing else to say so" not in text
+        assert "this session receives" not in text
 
     def test_a_healthy_spec_logs_nothing(self, caplog):
         spec = {"tools": ["@srv"], "mcpServers": {"srv": {"command": "/bin/srv"}}}
@@ -660,7 +701,7 @@ class TestTheCompositionPath:
         return wire
 
     def _codex_wire(self, tmp_path) -> tuple[list[dict[str, Any]], McpSessionReport]:
-        """The array a codex session receives, plus the report the guard wrote into.
+        """The array Crew sends a codex session, plus the report the guard wrote into.
 
         codex is served by AcpRuntime, so its array is composed by the mirror
         (:func:`codex_projection`, the producer) and then narrowed by the host
@@ -700,10 +741,11 @@ class TestTheCompositionPath:
         The refs the mirror projects resolve, so the guard is silent about them.
         What it still reports is what the mirror deliberately WITHHOLDS: an
         identity-bound Crew server reaches codex from the spec unreplaced and would
-        answer ``not_bound`` to every call, so it is not mounted -- and this guard's
-        own sentence is then exactly right, the tools are absent from the session.
-        Two lines, two jobs: the mirror logs WHY it withheld, and this one records
-        that the spec asked for it.
+        answer ``not_bound`` to every call, so it is not mounted. Two lines, two
+        jobs: the mirror logs WHY it withheld, and this one records that the spec
+        asked for it -- with the hedged verdict every backend gets, since a same-named
+        server from the operator's own ``config.toml`` is the one thing the wire
+        cannot rule out.
 
         Driven through the runtime-path composition (:meth:`_codex_wire`), because
         that is where a codex array is built. The claim under test is unchanged by
@@ -843,7 +885,7 @@ class TestTheCallSitesAreWired:
         """
         lines = inspect.getsource(client_mod).splitlines()
         handoffs = [i for i, ln in enumerate(lines) if "self._begin_session_report(" in ln]
-        assert len(handoffs) == 2, "a session-establishment path was added or removed"
+        assert len(handoffs) == 3, "a session-establishment handoff was added or removed"
         for i in handoffs:
             roster = lines[i].split("_begin_session_report(", 1)[1]
             # The next statement, skipping the comments that explain the pairing.
@@ -916,7 +958,7 @@ class TestTheRuntimeCallSitesAreWired:
                 }
             return {}
 
-        async def _send_request(method, params):
+        async def _send_request(method, params, **_kw):
             return 999
 
         async def _wait_for_response(_self, req_id, timeout=None):
@@ -1124,21 +1166,49 @@ class TestTheSpawnHopCarriesTheSnapshot:
         assert (tmp_path / "ok").is_dir()
         assert ok._mcp_ref_spec is None
 
-    def test_the_detector_adds_no_await_to_the_construction_path(self):
+    def test_the_detector_adds_no_await_to_the_construction_path(self, tmp_path):
         """The snapshot is never awaited on its own -- only inside the mkdir hop.
 
         Pinned as the absence of a separate hop rather than as a total await count,
         so an unrelated await added to ``_spawn`` later cannot fail this for the
         wrong reason. What must stay true is narrow: the detector's read reaches
         the executor ONLY as a passenger of the hop ``_spawn`` already had, which
-        is what keeps it off kiro-cli's suspension-point budget (H13).
+        is what keeps it off kiro-cli's suspension-point budget (H13). Read off a
+        real kiro-cli launch: every function the spawn hands a worker thread is
+        recorded, and the workspace hop is among them exactly once while the
+        detector's own read is never one of them.
         """
-        spawn = inspect.getsource(AcpClient._spawn)
-        assert "await asyncio.to_thread(self._prepare_spawn_workspace)" in spawn
-        assert "_read_mcp_ref_spec" not in spawn
-        assert "_mcp_ref_spec" not in spawn
+        import asyncio
+        import functools
+        from unittest.mock import patch
+
+        import acp_launch_capture as capture_mod
+
+        from kiro_crew.acp_backends import ACP_BACKEND_KIRO
+
+        hops: list[str] = []
+        real_to_thread = asyncio.to_thread
+
+        def _name(fn) -> str:
+            while isinstance(fn, functools.partial):
+                fn = fn.func
+            if hasattr(fn, "_extract_mock_name"):
+                return fn._extract_mock_name()
+            return getattr(fn, "__name__", repr(fn))
+
+        async def _recording_to_thread(fn, /, *args, **kwargs):
+            hops.append(_name(fn))
+            return await real_to_thread(fn, *args, **kwargs)
+
+        capture_mod.capture(
+            ACP_BACKEND_KIRO,
+            tmp_path,
+            extra_patches=(patch("asyncio.to_thread", _recording_to_thread),),
+        )
+        assert hops.count("_prepare_spawn_workspace") == 1, hops
+        assert not [hop for hop in hops if "mcp_ref" in hop], hops
 
         # ...and the fold itself is not split back apart: one hop, both halves.
         hop = inspect.getsource(AcpClient._prepare_spawn_workspace)
-        assert "self._work_dir.mkdir(" in hop
+        assert "ensure_directory(self._work_dir)" in hop
         assert "self._mcp_ref_spec = self._read_mcp_ref_spec()" in hop

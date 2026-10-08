@@ -23,6 +23,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import make_mocked_request
+from off_loop_helpers import off_loop
 
 from kiro_crew import crew_log as lg
 from kiro_crew.crew_log import CrewLog, Ref
@@ -316,6 +317,41 @@ async def test_a_read_addressed_by_slot_key_folds_that_slot_s_unit():
 
 
 @pytest.mark.asyncio
+async def test_the_projection_routes_refuse_a_slot_keyed_fold_its_owner_serves(monkeypatch):
+    """A slot-keyed fold its OWNER serves (the radar fold: its owner orders the slot's
+    units by what the crew recorded and pins the live unit last) is refused by both
+    projection routes the way an unregistered name is, so a client cannot be handed a
+    part of the record as the whole. The slot-keyed fold this route DOES serve, and
+    the per-unit folds, still answer."""
+    handle = _log()
+    _opened(handle)
+    assert crew_log.OWNER_SERVED_SLOT_PROJECTION == "radar"
+    assert crew_log.OWNER_SERVED_SLOT_PROJECTION in crew_log.SLOT_PROJECTION_NAMES
+    assert crew_log.SLOT_PROJECTION_NAMES != (crew_log.OWNER_SERVED_SLOT_PROJECTION,)
+    for name in (crew_log.OWNER_SERVED_SLOT_PROJECTION,):
+        response = await routes.api_session_crew_log_projection(
+            _request_with_sessions("fold", "chat-7", {"chat-7": SESSION}, name=name)
+        )
+        assert response.status == 400
+        assert _body(response)["code"] == "unknown_projection"
+        _flag_on(monkeypatch)
+        request = _internal_request(
+            f"/api/crew-log/units/{SESSION}/projection/{name}",
+            slots={"chat-owner": _Slot(restricted=False)},
+            match={"unit": SESSION, "name": name},
+        )
+        unit_route = await routes.api_crew_log_unit_projection(request)
+        assert unit_route.status == 400
+        assert json.loads(unit_route.text)["code"] == "unknown_projection"
+    # The slot-keyed fold this route serves, and a per-unit fold, still answer.
+    for name in ("ledger", "status"):
+        fold = await routes.api_session_crew_log_projection(
+            _request_with_sessions("fold", "chat-7", {"chat-7": SESSION}, name=name)
+        )
+        assert fold.status == 200, name
+
+
+@pytest.mark.asyncio
 async def test_the_batch_read_answers_every_fold_from_one_resolution():
     """Every fold, resolved once and folded once, so they cannot disagree.
 
@@ -338,6 +374,10 @@ async def test_the_batch_read_answers_every_fold_from_one_resolution():
     # Every fold came from the same read, so none of them can be ahead of the file
     # the others were folded from.
     assert {fold["seq"] for fold in body["projections"].values()} <= {0, handle.last_seq}
+    # The unit the folds came from, so the panel can refuse a pushed frame from another
+    # unit, and each fold's revision, so it can order a push against this baseline.
+    assert body["unit"] == SESSION
+    assert body["projections"]["status"]["revision"] > 0
 
 
 @pytest.mark.asyncio
@@ -504,6 +544,50 @@ async def test_the_batch_read_reports_whether_the_writer_owed_anything():
     # The folds are still served: a read that could not confirm the drain is worth
     # less than one that could, and far more than no answer at all.
     assert set(raced["projections"]) == set(crew_log.PROJECTION_NAMES)
+
+
+@pytest.mark.asyncio
+async def test_the_fold_read_says_whether_the_gateway_is_recording(monkeypatch):
+    """An empty fold cannot say why, so the read names the flag state beside it."""
+    handle = _log()
+    _opened(handle)
+    monkeypatch.delenv("KIROCREW_CREW_LOG", raising=False)
+    on = _body(
+        await routes.api_session_crew_log_projections(_request_with_sessions("folds", SESSION, {}))
+    )
+    assert on["recording"] is True
+    assert "flag_value" not in on
+    assert "env_file" not in on
+    monkeypatch.setenv("KIROCREW_CREW_LOG", "off")
+    off = _body(
+        await routes.api_session_crew_log_projections(_request_with_sessions("folds", SESSION, {}))
+    )
+    assert off["recording"] is False
+    assert off["flag_value"] == "off"
+    assert off["flag_recognised"] is True
+    from kiro_crew.constants import env_file_display
+
+    assert off["env_file"] == env_file_display()
+
+
+@pytest.mark.asyncio
+async def test_the_fold_read_quotes_only_the_flag_value_that_switched_recording_off(
+    monkeypatch,
+):
+    """The panel names the typo; nothing else from the environment is sent."""
+    handle = _log()
+    _opened(handle)
+    monkeypatch.setenv("KIROCREW_CREW_LOG", " fasle\x1b[31m" + "x" * 80 + " ")
+    monkeypatch.setenv("KIROCREW_TEST_SECRET_NEIGHBOUR", "do-not-send")
+    off = _body(
+        await routes.api_session_crew_log_projections(_request_with_sessions("folds", SESSION, {}))
+    )
+    assert off["recording"] is False
+    assert off["flag_value"].startswith("fasle[31m")
+    assert len(off["flag_value"]) == 40
+    assert "\x1b" not in off["flag_value"]
+    assert off["flag_recognised"] is False
+    assert "do-not-send" not in json.dumps(off)
 
 
 @pytest.mark.asyncio
@@ -692,12 +776,12 @@ async def test_a_page_past_its_ref_budget_says_how_many_it_left():
 async def test_each_projection_is_served_with_the_seq_it_folded_through(name):
     handle = _log()
     _opened(handle)
-    _turn(handle, 1)
+    off_loop(_turn, handle, 1)
     body = _body(await routes.api_session_crew_log_projection(_projection_request(name)))
     assert body["name"] == name
     assert body["seq"] == handle.last_seq
     assert body["session_id"] == SESSION
-    assert body["value"] == crew_log.read_projection(SESSION, name).value
+    assert body["value"] == off_loop(crew_log.read_projection, SESSION, name).value
 
 
 @pytest.mark.asyncio
@@ -770,6 +854,16 @@ class _Sockets:
         self.frames.append((frame, data))
 
 
+def _frames(state: _Sockets, name: str) -> list[dict]:
+    return [data for frame, data in state.frames if frame == name]
+
+
+async def _pass(publisher: routes.CrewLogPublisher, *sessions: str) -> None:
+    """One flush pass over *sessions*, the way a coalesced growth runs."""
+    publisher._dirty.update(sessions)
+    await publisher._flush()
+
+
 @pytest.mark.asyncio
 async def test_a_growth_pushes_one_frame_per_projection():
     handle = _log()
@@ -778,13 +872,81 @@ async def test_a_growth_pushes_one_frame_per_projection():
     state = _Sockets()
     publisher = routes.CrewLogPublisher(state)
     publisher.bind(asyncio.get_running_loop())
-    await publisher._publish(SESSION)
+    assert await publisher._publish(SESSION)
     assert {frame for frame, _ in state.frames} == {routes.FRAME}
-    assert {data["name"] for _, data in state.frames} == set(crew_log.PROJECTION_NAMES)
-    for _, data in state.frames:
+    assert {data["name"] for data in _frames(state, routes.FRAME)} == set(crew_log.PROJECTION_NAMES)
+    for data in _frames(state, routes.FRAME):
         assert data["session_id"] == SESSION
         assert data["seq"] == handle.last_seq
         assert "value" in data
+
+
+@pytest.mark.asyncio
+async def test_a_growth_names_the_slot_to_reread_and_carries_nothing_else():
+    """Slot folds are read through the route; the push only says which slot moved."""
+    handle = _log(slot="dashboard:conductor")
+    _opened(handle, slot="dashboard:conductor")
+    state = _Sockets()
+    publisher = routes.CrewLogPublisher(state)
+    publisher.bind(asyncio.get_running_loop())
+    await _pass(publisher, SESSION)
+    assert _frames(state, routes.SLOT_FRAME) == [{"slot": "dashboard:conductor"}]
+    state.frames.clear()
+    _turn(handle, 1)
+    with patch.object(crew_log, "slot_of_session", side_effect=AssertionError("re-read")):
+        await _pass(publisher, SESSION)
+    assert _frames(state, routes.SLOT_FRAME) == [{"slot": "dashboard:conductor"}]
+    state.frames.clear()
+    await _pass(publisher, SESSION)
+    assert state.frames == []
+
+
+@pytest.mark.asyncio
+async def test_one_pass_sends_one_slot_frame_per_slot():
+    for unit in ("s-a", "s-b"):
+        _opened(_log(unit, slot="dashboard:team"), slot="dashboard:team")
+    _opened(_log("s-c", slot="dashboard:other"), slot="dashboard:other")
+    state = _Sockets()
+    publisher = routes.CrewLogPublisher(state)
+    publisher.bind(asyncio.get_running_loop())
+    await _pass(publisher, "s-a", "s-b", "s-c")
+    assert sorted(data["slot"] for data in _frames(state, routes.SLOT_FRAME)) == [
+        "dashboard:other",
+        "dashboard:team",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_the_slot_owner_cache_is_bounded(monkeypatch):
+    monkeypatch.setattr(routes, "MAX_CACHED_SLOT_OWNERS", 2)
+    state = _Sockets()
+    publisher = routes.CrewLogPublisher(state)
+    publisher.bind(asyncio.get_running_loop())
+    for index in range(3):
+        unit = f"s-owner{index}"
+        _opened(_log(unit, slot=f"dashboard:{index}"), slot=f"dashboard:{index}")
+        await _pass(publisher, unit)
+    assert list(publisher._slot_owners) == ["s-owner1", "s-owner2"]
+    assert [data["slot"] for data in _frames(state, routes.SLOT_FRAME)] == [
+        "dashboard:0",
+        "dashboard:1",
+        "dashboard:2",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_an_unprovable_slot_sends_no_slot_frame_and_is_asked_again():
+    handle = _log()
+    _opened(handle)
+    state = _Sockets()
+    publisher = routes.CrewLogPublisher(state)
+    publisher.bind(asyncio.get_running_loop())
+    with patch.object(crew_log, "slot_of_session", return_value="") as probe:
+        await _pass(publisher, SESSION)
+        _turn(handle, 1)
+        await _pass(publisher, SESSION)
+    assert probe.call_count == 2
+    assert _frames(state, routes.SLOT_FRAME) == []
 
 
 @pytest.mark.asyncio
@@ -837,7 +999,7 @@ async def test_the_publisher_caches_a_bounded_number_of_sessions():
         unit = f"s-many{index}"
         _opened(_log(unit))
         await publisher._publish(unit)
-    assert len(publisher._bundles) == routes.MAX_CACHED_SESSIONS
+    assert len(publisher._sent) == routes.MAX_CACHED_SESSIONS
 
 
 @pytest.mark.asyncio
@@ -852,7 +1014,7 @@ async def test_a_fold_refusal_does_not_stop_the_other_sessions():
     publisher.bind(asyncio.get_running_loop())
     publisher._dirty.update({"s-good", "s-broken"})
     await publisher._flush()
-    assert {data["session_id"] for _, data in state.frames} == {"s-good"}
+    assert {data["session_id"] for data in _frames(state, routes.FRAME)} == {"s-good"}
 
 
 def test_notify_from_a_writer_thread_does_no_work_of_its_own():
@@ -886,6 +1048,45 @@ async def test_installing_the_publisher_registers_exactly_one_growth_listener(mo
             again = routes.install_crew_log_publisher(_Sockets())
         assert again is first
         assert len(crew_log_emit._growth_listeners) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_reinstall_swaps_the_bus_subscriptions_rather_than_doubling_them(monkeypatch):
+    """The publisher keeps its two scoped disposers, so a re-install replaces the pair."""
+    from kiro_crew.crew_log import bus as crew_log_bus
+    from kiro_crew.crew_log import emit as crew_log_emit
+
+    monkeypatch.setenv(routes.CREW_LOG_ENV, "1")
+    crew_log_bus.reset_for_tests()
+    try:
+        with (
+            patch.object(routes, "_publisher", None),
+            patch.object(crew_log_emit, "_growth_listeners", []),
+        ):
+            first = routes.install_crew_log_publisher(_Sockets())
+            assert first is not None
+            assert crew_log_bus.subscriber_count(crew_log_bus.FOLD_ADVANCED) == 2
+            with patch.object(routes, "_publisher", first):
+                routes.install_crew_log_publisher(_Sockets())
+            assert crew_log_bus.subscriber_count(crew_log_bus.FOLD_ADVANCED) == 2
+
+            slot_calls: list = []
+            session_calls: list = []
+            monkeypatch.setattr(first, "on_slot_fold", slot_calls.append)
+            monkeypatch.setattr(first, "on_session_fold", session_calls.append)
+            first.subscribe_bus()
+            slot_event = crew_log_bus.FoldAdvanced("slot", "dashboard:1", "work", 1, {}, 1)
+            session_event = crew_log_bus.FoldAdvanced("session", "s-1", "status", 1, {}, 1)
+            crew_log_bus.publish(crew_log_bus.FOLD_ADVANCED, slot_event)
+            crew_log_bus.publish(crew_log_bus.FOLD_ADVANCED, session_event)
+            assert slot_calls == [slot_event]
+            assert session_calls == [session_event]
+
+            first.unsubscribe_bus()
+            first.unsubscribe_bus()
+            assert crew_log_bus.subscriber_count(crew_log_bus.FOLD_ADVANCED) == 0
+    finally:
+        crew_log_bus.reset_for_tests()
 
 
 def test_the_frame_keeps_the_name_the_rfc_gives_it():
@@ -1010,23 +1211,20 @@ async def test_a_recreated_log_at_the_same_seq_still_pushes_its_new_values():
     publisher = routes.CrewLogPublisher(state)
     publisher.bind(asyncio.get_running_loop())
     await publisher._publish(SESSION)
-    before = publisher._bundles[SESSION]
     state.frames.clear()
 
-    # Same session id, a DIFFERENT file, folded to the same terminal seq. Handing
-    # the publisher that cached bundle is the recreated-log shape without touching
-    # the filesystem, so it behaves the same on every platform.
-    other = _log("s-recreated-src")
-    _opened(other)
-    _turn(other, 1)
-    fresh = crew_log.fold_session("s-recreated-src", crew_log.PROJECTION_NAMES)
-    assert fresh.last_seq == before.last_seq  # seq-only check would suppress
-    assert fresh.origin != before.origin
-    publisher._bundles[SESSION] = crew_log.SessionProjections(
-        session_id=SESSION,
-        last_seq=fresh.last_seq,
-        checkpoints=fresh.checkpoints,
-        origin="a-retired-file",
+    # Same session id, the warm memo now holding a bundle whose ORIGIN names a retired
+    # file at the same terminal seq: the recreated-log shape without touching the
+    # filesystem, so it behaves the same on every platform.
+    key = (str(crew_log.data_home()), SESSION)
+    held = crew_log._session_memos[key]
+    crew_log._session_memos[key] = held._replace(
+        bundle=crew_log.SessionProjections(
+            session_id=SESSION,
+            last_seq=held.bundle.last_seq,
+            checkpoints=held.bundle.checkpoints,
+            origin="a-retired-file",
+        )
     )
 
     await publisher._publish(SESSION)
@@ -1063,18 +1261,20 @@ async def test_rebinding_clears_scheduling_flags_left_on_the_retired_loop():
     Left set, ``_scheduled`` makes a growth believe a pass is already coming and
     ``_flushing`` makes the runner yield to a pass that does not exist, so the
     publisher would go quiet permanently after a restart. The dirty set is kept:
-    those sessions did grow and the next pass folds them forward.
+    those sessions did grow, and a pass for them is armed on the loop now serving.
     """
     publisher = routes.CrewLogPublisher(_Sockets())
     publisher.bind(asyncio.get_running_loop())
     publisher._scheduled = True
     publisher._flushing = True
+    publisher._sessions_armed = True
     publisher._dirty.add(SESSION)
 
     publisher.bind(asyncio.get_running_loop(), _Sockets())
 
-    assert publisher._scheduled is False
     assert publisher._flushing is False
+    assert publisher._sessions_armed is False, "nothing is held, so no window is armed"
+    assert publisher._scheduled is True, "the kept dirty set gets a pass on this loop"
     assert publisher._dirty == {SESSION}
 
 
@@ -1092,13 +1292,13 @@ def test_the_flag_name_matches_the_emitters_own_constant():
 
 @pytest.mark.asyncio
 async def test_installing_with_the_flag_off_builds_nothing(monkeypatch):
-    """A launch without the flag must not pay for the subsystem it will not use.
+    """A launch with the flag off must not pay for the subsystem it will not use.
 
     The installer runs on the gateway's boot path. With the crew log off it returns
     without importing the emitter and without constructing a publisher, so a
     disabled launch does no optional work and registers no listener.
     """
-    monkeypatch.delenv(routes.CREW_LOG_ENV, raising=False)
+    monkeypatch.setenv(routes.CREW_LOG_ENV, "0")
     monkeypatch.setattr(routes, "_publisher", None)
     from kiro_crew.crew_log import emit as crew_log_emit
 
@@ -1198,24 +1398,74 @@ def test_the_caller_name_is_pinned_to_the_mcp_servers_own(monkeypatch):
 
 
 def test_the_enable_hint_names_the_real_flag():
-    assert routes.CREW_LOG_ENV in routes.CREW_LOG_ENABLE_HINT
+    assert routes.CREW_LOG_ENV in routes.crew_log_enable_hint()
 
 
-def test_the_enable_hint_names_the_live_data_home_not_the_legacy_one():
+def test_the_enable_hint_says_to_unset_the_flag_not_to_set_it():
+    """The log is on by default, so the only way to be off is a falsy value."""
+    assert "unset" in routes.crew_log_enable_hint()
+    assert f"{routes.CREW_LOG_ENV}=1" not in routes.crew_log_enable_hint()
+
+
+def test_the_enable_hint_names_the_env_file_the_gateway_reads(monkeypatch, tmp_path):
     """An agent is told to edit this file, so naming the wrong one wastes the turn.
 
-    The live credentials file is ``~/.kiro/crew/.env`` (``config/loader.py``'s own
-    header, and ``config_dir()`` under the default home). ``~/.kirocrew/.env`` is a
-    legacy location that ``sandbox.py`` keeps only to fence a leftover copy;
-    nothing reads configuration from it. A hint naming it sends the reader to an
+    The file read is ``config.loader.env_path()``, which follows ``KIROCREW_HOME``; a
+    hint that hardcodes the default home sends an operator with another home to an
     inert file, and the flag appears not to work.
-
-    Not compared against ``config_dir()``: the suite's isolation fixture overrides
-    the home, so that call answers a ``tmp_path`` here and would pass on either
-    string.
     """
-    assert ".kiro/crew/.env" in routes.CREW_LOG_ENABLE_HINT
-    assert ".kirocrew/" not in routes.CREW_LOG_ENABLE_HINT
+    from kiro_crew.config.loader import env_path
+
+    home = tmp_path / "elsewhere"
+    monkeypatch.setenv("KIROCREW_HOME", str(home))
+    hint = routes.crew_log_enable_hint()
+    assert str(env_path()).startswith(str(home))
+    assert (
+        str(env_path()) in hint or ("~/" + env_path().relative_to(Path.home()).as_posix()) in hint
+    )
+    assert "~/.kiro/crew/.env" not in hint
+
+
+def test_the_session_ledger_refusal_names_the_env_file_the_gateway_reads(monkeypatch, tmp_path):
+    from kiro_crew import session_ledger
+    from kiro_crew.constants import env_file_display
+
+    monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "elsewhere"))
+    monkeypatch.setenv("KIROCREW_CREW_LOG", "0")
+    with pytest.raises(session_ledger.LedgerUnavailable) as caught:
+        session_ledger._require_crew_log("s-any")
+    assert env_file_display() in str(caught.value)
+    assert "~/.kiro/crew/.env" not in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    "refusal",
+    [
+        "work_ledger",
+        "crew_store",
+        "mcp_ledger",
+    ],
+)
+def test_every_crew_log_off_refusal_names_the_env_file_the_gateway_reads(
+    monkeypatch, tmp_path, refusal
+):
+    """The same file, spelled once, in every place that tells an operator to edit it."""
+    import inspect
+
+    from kiro_crew import session_ledger
+    from kiro_crew.apps.builtins.issue_radar.backend import crew_store
+    from kiro_crew.dashboard.handlers import work_ledger
+    from kiro_crew.mcp_tools import ledger as mcp_ledger
+
+    module = {
+        "session_ledger": session_ledger,
+        "work_ledger": work_ledger,
+        "crew_store": crew_store,
+        "mcp_ledger": mcp_ledger,
+    }[refusal]
+    source = inspect.getsource(module)
+    assert "~/.kiro/crew/.env" not in source
+    assert "env_file_display()" in source
 
 
 def test_the_page_reader_is_the_one_shared_implementation():
@@ -1231,13 +1481,22 @@ def test_the_page_reader_is_the_one_shared_implementation():
 
 def test_a_read_with_the_flag_off_says_how_to_switch_it_on(monkeypatch):
     """MUTATION-SENSITIVE: the agent learns the flag state from THIS refusal."""
-    monkeypatch.delenv(routes.CREW_LOG_ENV, raising=False)
+    monkeypatch.setenv(routes.CREW_LOG_ENV, "0")
     request = _internal_request("/api/crew-log/sessions")
     response = asyncio.run(routes.api_crew_log_sessions(request))
     assert response.status == 422
     body = json.loads(response.text)
     assert body["code"] == "crew_log_disabled"
     assert routes.CREW_LOG_ENV in body["error"]
+
+
+def test_a_read_with_the_flag_unset_is_not_refused(monkeypatch):
+    """The crew log is on by default, so an install that never set the flag reads."""
+    monkeypatch.delenv(routes.CREW_LOG_ENV, raising=False)
+    request = _internal_request("/api/crew-log/sessions")
+    response = asyncio.run(routes.api_crew_log_sessions(request))
+    assert response.status != 422
+    assert json.loads(response.text).get("code") != "crew_log_disabled"
 
 
 #: A conductor, its child and its grandchild, plus a session in another tree. The
@@ -2412,39 +2671,252 @@ class TestTheGrantIsRecheckedAfterTheRead:
 
         This route set grows, and a route added without the re-check reads correctly
         in review -- the defect is an ABSENT line, which no assertion about the
-        current routes can see. So the rule is asserted over the module's own source:
-        an agent-door handler that suspends to build a payload must pass through
-        ``_stale_grant_refusal`` before returning it -- the unit routes because the
-        target's class can move while the entries are read, and the listing because its
-        rows were gathered under a scope wider than the caller now holds.
+        current routes can see. So the rule is asserted over the module's own source,
+        and it is asserted as a shape a new route cannot get wrong rather than as a
+        line each route must remember: the re-check has exactly ONE caller, which is
+        the helper that offloads, and the gate and that helper are the only places an
+        agent-door route is allowed to suspend. A route that wants to build a payload
+        off the loop therefore has one way in, and that way re-checks the grant before
+        the route's own shaping ever runs.
         """
         import ast
         import inspect
 
         tree = ast.parse(inspect.getsource(routes))
-        gated = []
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.AsyncFunctionDef):
-                continue
-            called = {
-                n.func.id
-                for n in ast.walk(node)
-                if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
-            }
-            if "_authorize_crew_log_read" not in called:
-                continue
-            body = ast.dump(node)
-            if "to_thread" not in body:
-                # The resolve route answers from memory, so its gate's own check
-                # is already the last read of live state before it returns.
-                continue
-            gated.append(node.name)
-            assert "_stale_grant_refusal" in called, (
-                f"{node.name} suspends after authorizing but never re-checks the "
-                "grant; a caller can acquire a channel link while it reads"
+        functions = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef))
+        ]
+
+        def _calls(node):
+            # Both spellings count. A bare ``_authorize_crew_log_read(...)`` and an
+            # attribute form such as ``self._authorize_crew_log_read(...)`` name the
+            # same gate, and detection is the permissive direction here: a route whose
+            # gate call goes unrecognised is not treated as a door at all, so none of
+            # the suspension rules below ever reach it. Matching the attribute tail as
+            # well keeps that escape shut.
+            names = set()
+            for n in ast.walk(node):
+                if not isinstance(n, ast.Call):
+                    continue
+                if isinstance(n.func, ast.Name):
+                    names.add(n.func.id)
+                elif isinstance(n.func, ast.Attribute):
+                    names.add(n.func.attr)
+            return names
+
+        # Suspension has three spellings -- ``await``, ``async with``, ``async for``
+        # -- and a route that reaches storage through any of them can answer under a
+        # grant taken before the read. Naming the storage calls to look for would
+        # cover whichever ones are spelled today and miss ``run_in_executor``, an
+        # awaited storage coroutine, or a gather. So the rule is stated from the other
+        # side: these are the only two suspension points a door route may hold, and
+        # anything else that suspends is named back. A route that genuinely needs a
+        # third has to say so here, which is the point at which somebody decides
+        # whether it owes a re-check.
+        allowed_awaits = {"_authorize_crew_log_read", "_offload_then_recheck"}
+        # The set holds bare names only, so an attribute-form await -- ``self.gate()``,
+        # ``mod._offload_then_recheck()`` -- is named back rather than admitted. That is
+        # the fail-closed direction on purpose: the ``ast.unparse`` branch below is there
+        # to print an offender readably, not to widen what passes. A door route that
+        # wants an attribute form spells its bare name here and says why.
+
+        def _suspends_outside(node):
+            offenders = []
+            for n in ast.walk(node):
+                if isinstance(n, (ast.AsyncWith, ast.AsyncFor)):
+                    offenders.append(type(n).__name__)
+                    continue
+                if not isinstance(n, ast.Await):
+                    continue
+                awaited = n.value
+                name = ""
+                if isinstance(awaited, ast.Call):
+                    if isinstance(awaited.func, ast.Name):
+                        name = awaited.func.id
+                    else:
+                        name = ast.unparse(awaited.func)
+                if name not in allowed_awaits:
+                    offenders.append(name or ast.unparse(awaited))
+            return offenders
+
+        rechecking = sorted(f.name for f in functions if "_stale_grant_refusal" in _calls(f))
+        assert rechecking == ["_offload_then_recheck"], (
+            "the re-check is reachable from more than one place, so a route can call "
+            f"it out of order or not at all: {rechecking}"
+        )
+
+        doors = [f for f in functions if "_authorize_crew_log_read" in _calls(f)]
+        for door in doors:
+            outside = _suspends_outside(door)
+            assert not outside, (
+                f"{door.name} suspends at {outside}, outside the gate and the helper, "
+                "so it can answer under a grant taken before the read; offload through "
+                "_offload_then_recheck"
             )
-        # A control: an empty set would satisfy the loop above silently.
-        assert len(gated) == 3, f"expected three offloading routes, found {gated}"
+        folded = sorted(f.name for f in doors if "_offload_then_recheck" in _calls(f))
+        # A control: an empty door set would satisfy the loop above silently.
+        assert folded == [
+            "api_crew_log_sessions",
+            "api_crew_log_unit_page",
+            "api_crew_log_unit_projection",
+        ], f"the agent door's offloading routes are not the three expected: {folded}"
+
+        # A second control with a predictable answer: resolve is an agent-door route
+        # that answers from memory, so it owes no re-check and is admitted by all
+        # three rules above while appearing in none of them.
+        resolve = [f for f in doors if f.name == "api_crew_log_resolve"]
+        assert len(resolve) == 1, "resolve is no longer an agent-door route"
+        assert "_offload_then_recheck" not in _calls(resolve[0])
+        assert "_stale_grant_refusal" not in _calls(resolve[0])
+        assert _suspends_outside(resolve[0]) == []
+
+
+class TestTheOffloadHelperOwnsTheOrder:
+    """The three steps after the gate live in one helper, so the helper is pinned.
+
+    The route cases above prove the sequence end to end. These prove the helper
+    itself, and two of the steps it owns have no other cover: the mapping of a
+    storage refusal to a response, and the rule that the route's own shaping runs
+    only after the re-check has held.
+    """
+
+    def _request(self) -> object:
+        _dispatch_tree()
+        return _as_conductor(f"/api/crew-log/units/{CHILD_UNIT}/page", match={"unit": CHILD_UNIT})
+
+    @pytest.mark.parametrize(
+        ("code", "status", "reported"),
+        [
+            ("invalid_id", 400, "invalid_id"),
+            ("unknown_entry_type", 409, "unknown_entry_type"),
+            ("no_ledger", 422, "no_ledger"),
+            ("", 422, "crew_log_error"),
+        ],
+    )
+    def test_a_storage_refusal_reaches_the_caller_with_a_code_it_can_act_on(
+        self, monkeypatch, code, status, reported
+    ):
+        """MUTATION-SENSITIVE: the refusal is mapped, not raised and not flattened.
+
+        A read can refuse for reasons the caller can do something about -- a
+        malformed unit id is the caller's to fix, a log holding a line this build
+        does not parse is the deployment's -- so each keeps its own status and its
+        own code. Dropping the mapping turns all four into a 500 with no code.
+        """
+        _flag_on(monkeypatch)
+        from kiro_crew.crew_log.errors import CrewLogError
+
+        shaped: list = []
+
+        def _work():
+            raise CrewLogError("the store refused", code=code)
+
+        def _respond(payload):
+            shaped.append(payload)
+            return web.json_response({"shaped": True})
+
+        response = asyncio.run(
+            routes._offload_then_recheck(
+                self._request(), "session_crew_log.read", _work, _respond, unit=CHILD_UNIT
+            )
+        )
+        assert response.status == status
+        body = json.loads(response.text)
+        assert body["code"] == reported
+        assert body["error"] == "the store refused"
+        assert shaped == [], "the route shaped an answer for a read that produced none"
+
+    def test_the_shaping_never_runs_when_the_grant_was_withdrawn(self, monkeypatch):
+        """MUTATION-SENSITIVE: the re-check precedes the shaping, not just the return.
+
+        A helper that shaped first and returned the refusal afterwards would answer
+        correctly and still be wrong: the shaping is the ROUTE's, and running it on a
+        payload the caller may not have means route code has already touched content
+        the withdrawn grant does not cover. So the assertion is that it is not called
+        at all, which no assertion about the response can make.
+        """
+        _flag_on(monkeypatch)
+        read: list = []
+        shaped: list = []
+        refusal = web.json_response({"error": "withdrawn"}, status=403)
+
+        async def _withdrawn(request, operation, *, unit="", listing=False):
+            return refusal
+
+        monkeypatch.setattr(routes, "_stale_grant_refusal", _withdrawn)
+
+        def _work():
+            read.append(1)
+            return {"exists": True}
+
+        def _respond(payload):
+            shaped.append(payload)
+            return web.json_response({"shaped": True})
+
+        response = asyncio.run(
+            routes._offload_then_recheck(
+                self._request(), "session_crew_log.read", _work, _respond, unit=CHILD_UNIT
+            )
+        )
+        assert response is refusal
+        assert read == [1], "the payload was never built, so the order was not exercised"
+        assert shaped == [], "the route's shaping ran under a withdrawn grant"
+
+    def test_the_shaping_receives_the_payload_the_read_produced(self, monkeypatch):
+        """The other half of the order: once the grant holds, the route shapes it.
+
+        Paired with the case above so that "never shapes" cannot pass both. The
+        payload is handed over untouched, which is what lets a route keep a 404 for
+        an absent log and a wrapper key for a fold.
+        """
+        _flag_on(monkeypatch)
+
+        async def _holds(request, operation, *, unit="", listing=False):
+            return None
+
+        monkeypatch.setattr(routes, "_stale_grant_refusal", _holds)
+        payload = {"exists": True, "entries": []}
+        shaped: list = []
+
+        def _respond(seen):
+            shaped.append(seen)
+            return web.json_response({"shaped": True})
+
+        response = asyncio.run(
+            routes._offload_then_recheck(
+                self._request(),
+                "session_crew_log.read",
+                lambda: payload,
+                _respond,
+                unit=CHILD_UNIT,
+            )
+        )
+        assert shaped == [payload]
+        assert shaped[0] is payload
+        assert json.loads(response.text) == {"shaped": True}
+
+    def test_a_route_reaches_the_mapping_for_its_own_read(self, monkeypatch):
+        """The page route answers a storage refusal, not a 500.
+
+        The cases above pin the helper; this pins that a route is wired to it, so a
+        route that stopped offloading through it would not keep this cover.
+        """
+        _flag_on(monkeypatch)
+        _dispatch_tree()
+        from kiro_crew.crew_log.errors import CrewLogError
+
+        def _refusing(*args, **kwargs):
+            raise CrewLogError("bad unit id", code="invalid_id")
+
+        monkeypatch.setattr(routes, "_read_page", _refusing)
+        request = _as_conductor(
+            f"/api/crew-log/units/{CHILD_UNIT}/page", match={"unit": CHILD_UNIT}
+        )
+        response = asyncio.run(routes.api_crew_log_unit_page(request))
+        assert response.status == 400
+        assert json.loads(response.text)["code"] == "invalid_id"
 
 
 class TestTheListingCarriesTheSameScope:
@@ -3599,3 +4071,70 @@ class TestTheListingCarriesTheWorkspaceBoundary:
         assert (
             "changed workspace while this listing was built" in json.loads(response.text)["error"]
         )
+
+
+# --- the work fold on the two projection routes ------------------------------
+
+
+@pytest.mark.asyncio
+async def test_the_session_route_serves_the_work_fold_through_the_slot():
+    """`GET .../projection/work` on a session resolves the slot its unit's header
+    names and folds every unit of that slot -- the same path `ledger` takes."""
+    handle = CrewLog.create(
+        lg.KIND_SESSION, "s-conductor", owner="raymond", agent="kirocrew", slot="chat-9"
+    )
+    handle.append(
+        "work/recorded",
+        {
+            "slot": "chat-9",
+            "actor": "conductor",
+            "by": "chat-9",
+            "action": "goal",
+            "goal": "ship it",
+            "round": 1,
+            "depth": 0,
+            "event": "goal set",
+            "event_kind": "decision",
+        },
+        src="gateway",
+    )
+    fold = await routes.api_session_crew_log_projection(
+        _request_with_sessions("fold", "chat-9", {"chat-9": "s-conductor"}, name="work")
+    )
+    assert fold.status == 200, fold.text
+    body = _body(fold)
+    assert body["value"]["conductor"]["goal"] == "ship it"
+    assert body["value"]["conductor"]["entries"] == 1
+
+
+def test_the_unit_route_refuses_a_slot_keyed_fold(monkeypatch):
+    _flag_on(monkeypatch)
+    _opened(_log())
+    request = _internal_request(
+        f"/api/crew-log/units/{SESSION}/projection/work",
+        match={"unit": SESSION, "name": "work"},
+    )
+    response = asyncio.run(routes.api_crew_log_unit_projection(request))
+    assert response.status == 400
+    assert json.loads(response.text)["code"] == "slot_projection"
+
+
+def test_the_publisher_is_installed_after_the_listener_binds():
+    """Installing it imports and builds the publisher, so it stays off the boot path.
+
+    ``no-new-work-on-gateway-boot-path``: everything before ``_start_site`` is paid by
+    every launch, and the crew log is on by default. ``start_dashboard`` binds with
+    ``await site.start()`` on its pre-reserved socket.
+    """
+    import inspect
+
+    from kiro_crew.dashboard import server
+
+    source = inspect.getsource(server.start_dashboard)
+    # The boot phases it calls before the bind live in its server_runtime owners.
+    owners = sorted((Path(server.__file__).parent / "server_runtime").glob("[!_]*.py"))
+    assert owners, "expected the server_runtime owners beside server.py"
+    phases = "".join(path.read_text(encoding="utf-8") for path in owners)
+    bind = source.index("await site.start()")
+    assert (source + phases).count("install_crew_log_publisher(") == 1
+    assert source.index("install_crew_log_publisher(") > bind

@@ -55,10 +55,11 @@ import logging
 import os
 import shutil
 import time
+import traceback
 import weakref
 from collections import deque
 from collections.abc import Callable, Collection, Iterator
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
@@ -107,6 +108,7 @@ from kiro_crew.jsonl_util import (
     bounded_raw_records,
     strict_raw_records,
 )
+from kiro_crew.owner_only_files import owner_only_opener
 from kiro_crew.platform_compat import file_lock, restrict_dir_to_owner
 from kiro_crew.session_ledger import _store_name, is_link, resolved_within, unlink_lock_in_hold
 
@@ -279,17 +281,34 @@ def crew_log_path(kind: str, unit_id: str) -> Path:
     return crew_log_dir(kind, unit_id) / LOG_FILE
 
 
+def _numbered_segment_seq(name: str) -> int | None:
+    """The number in a ``log.<n>.jsonl`` name, or ``None`` for any other name.
+
+    Only the canonical spelling ``str(n)`` counts: ASCII digits, no leading
+    zero. ``str.isdigit`` also accepts a superscript, which ``int`` cannot
+    parse, so a stray ``log.².jsonl`` would raise out of every read of the
+    unit. ``int`` does accept Arabic-Indic digits and a leading zero, so
+    ``log.١٢.jsonl`` or ``log.05.jsonl`` would pass for a real segment and
+    break the seq continuity check. All three are stray files, not segments.
+    """
+    prefix = f"{_SEGMENT_STEM}."
+    if not name.startswith(prefix) or not name.endswith(_SEGMENT_SUFFIX):
+        return None
+    middle = name[len(prefix) : -len(_SEGMENT_SUFFIX)]
+    if not (middle.isascii() and middle.isdecimal()):
+        return None
+    number = int(middle)
+    return number if str(number) == middle else None
+
+
 def _segment_first_seq(path: Path) -> int | None:
     """The first seq declared by a canonical segment filename, or ``None``."""
     if path.name == LOG_FILE:
         return 1
-    prefix = f"{_SEGMENT_STEM}."
-    if not path.name.startswith(prefix) or not path.name.endswith(_SEGMENT_SUFFIX):
+    first = _numbered_segment_seq(path.name)
+    if first is None or first <= 1:
         return None
-    middle = path.name[len(prefix) : -len(_SEGMENT_SUFFIX)]
-    if not middle.isdigit() or int(middle) <= 1:
-        return None
-    return int(middle)
+    return first
 
 
 def segment_paths(kind: str, unit_id: str) -> list[Path]:
@@ -354,18 +373,61 @@ REMOVE_REMOVED = "removed"
 #: A writer owns the unit -- another process, or another handle in this one. The
 #: unit is LIVE, so it is skipped; a later pass gets it once its writer is gone.
 REMOVE_OWNED = "owned"
-#: There was nothing to remove: no directory, or one that no id addresses.
+#: There was nothing to remove: no directory, or one that no id addresses. PROVEN
+#: absence -- a caller may act on the unit's name being free, because nothing here
+#: stands in for a directory this function declined to look inside.
 REMOVE_ABSENT = "absent"
+#: The unit's own name is a LINK, so nothing was removed and nothing was inspected.
+#: Separate from ``absent`` because the two invite opposite actions: absence says the
+#: name is free, while this says a directory exists and reaching it means following a
+#: link into a unit that is very likely another member's live one. A caller acting on
+#: this as absence does its own cleanup at the RESOLVED path and corrupts that unit;
+#: what the condition actually needs is a person to remove the link.
+REMOVE_LINKED = "linked"
 #: Something in the unit survived. Reported, never counted as removed, and the
 #: unit is left identifiable so the next pass can aim at it again.
 REMOVE_FAILED = "failed"
 
 
-def remove_unit(kind: str, unit_id: str, *, guard: "Callable[[Path], bool]") -> str:
+def _run_in_hold(action: "Callable[[], bool]", kind: str, unit_id: str) -> bool:
+    """Run a caller's companion cleanup and report whether it finished.
+
+    The answer decides whether the removal proceeds, so a failure is NOT swallowed.
+    A caller passes a companion because something outside the unit belongs to the
+    same deletion, and the gate that stops it being read again can live INSIDE the
+    unit -- so a companion left behind while the unit goes is worse than nothing
+    removed at all: the surviving data becomes readable again with its gate gone.
+    Reporting the failure is what lets the caller keep both.
+
+    An exception is the same answer as a refusal, and its traceback is rendered to
+    text rather than attached as ``exc_info``: the action is the CALLER's callable,
+    so the retained frames would be ones this package cannot vet.
+    """
+    try:
+        return bool(action())
+    except Exception:
+        log_exception_text(
+            logger,
+            logging.WARNING,
+            "crew log retention: companion cleanup for %s log %r failed",
+            kind,
+            unit_id,
+        )
+        return False
+
+
+def remove_unit(
+    kind: str,
+    unit_id: str,
+    *,
+    guard: "Callable[[Path], bool]",
+    in_hold: "Callable[[], bool] | None" = None,
+) -> str:
     """Remove one unit's crew log entirely. Returns one of the ``REMOVE_*`` statuses.
 
     The ONE spelling of deletion in this package, called by the retention sweep
-    and by the permanent-delete funnel alike, for the reason the work crew log's
+    and by each permanent-delete funnel that reaches it -- a session's, and the
+    dashboard's crew-member route -- for the reason the work crew log's
     ``purge_matching`` docstring gives: two callers deleting the same tree two
     ways is two chances to get the order wrong, and the order is the whole
     correctness argument.
@@ -391,6 +453,25 @@ def remove_unit(kind: str, unit_id: str, *, guard: "Callable[[Path], bool]") -> 
     than a filter the caller applies first, and why there is no default that
     skips the re-decision. A caller whose precondition is not a property of the
     file passes ``lambda _dir: True`` and says at the call site what does decide.
+
+    **A caller with a companion file OUTSIDE the unit passes ``in_hold``, and it
+    runs while this lease is still held, BEFORE anything here is destroyed.** Some of
+    a unit's meaning lives outside its directory -- a member's pre-log activity source
+    is the case -- and a caller that removed such a file after this function RETURNED
+    would do it in the window between the release here and its own next line, where
+    another PROCESS can create the unit afresh and fold that source back in. The lease
+    is taken ``sole`` and so cannot be shared, which is why the caller cannot simply
+    hold it itself; a hook inside the hold closes that window without a second
+    spelling of deletion. Optional, so a caller with nothing outside the unit passes
+    nothing and is unaffected.
+
+    It runs FIRST, and a false answer stops the removal with ``failed`` and nothing
+    here touched. The gate that stops such a companion being read again can live
+    inside THIS unit -- a fold marker does -- so a unit destroyed while its companion
+    survives is not a partial success but an armed one: the survivor becomes readable
+    again with its gate gone, and nothing revisits the unit to notice. In this order a
+    refusal leaves both in place and both still gated, and the unit stays
+    identifiable for a later pass to aim at again.
 
     **Then order, with IDENTITY LAST.** Segments carry the header, so they are the
     history and they go first; the per-append lock file next; then any other
@@ -429,6 +510,12 @@ def remove_unit(kind: str, unit_id: str, *, guard: "Callable[[Path], bool]") -> 
     # so this and the ``crew_log_dir`` below read the same directory: a linked kind
     # root would otherwise be refused only on the second read, after this one had
     # already followed it.
+    #
+    # Answered as its OWN status rather than as absence. Absence says the name is
+    # free, and a caller acting on that does its own cleanup at the resolved path --
+    # which is where this link points, so it would reach into a unit that is very
+    # likely another member's live one. The two conditions invite opposite actions,
+    # so they cannot share a value.
     named = _checked_crew_log_root(kind) / _store_name(unit_id)
     if is_link(named):
         logger.warning(
@@ -436,7 +523,7 @@ def remove_unit(kind: str, unit_id: str, *, guard: "Callable[[Path], bool]") -> 
             kind,
             unit_id,
         )
-        return REMOVE_ABSENT
+        return REMOVE_LINKED
     directory = crew_log_dir(kind, unit_id)
     if not directory.is_dir():
         return REMOVE_ABSENT
@@ -459,7 +546,24 @@ def remove_unit(kind: str, unit_id: str, *, guard: "Callable[[Path], bool]") -> 
             # between the decision and this hold. Not a failure: nothing was
             # removed and nothing was written.
             return REMOVE_OWNED
-        failures, history_gone = _remove_unit_contents(directory)
+        if in_hold is not None and not _run_in_hold(in_hold, kind, unit_id):
+            # FIRST, and the removal stops here when it refuses. The caller's
+            # companion sits outside the unit while the gate that stops it being
+            # read again can sit inside -- so destroying this unit before the
+            # companion is gone is what arms that gate against a survivor. Taken in
+            # this order a refusal costs nothing: both are still here, both are
+            # still gated, and the unit stays identifiable for the next pass.
+            logger.warning(
+                "crew log retention: %s log %r not removed; its companion would not go",
+                kind,
+                unit_id,
+            )
+            return REMOVE_FAILED
+        # With this process's eager folder held between batches, so no fold has one of
+        # these files open: Windows refuses to unlink a file any handle holds, and a fold
+        # reads segments without the lease this removal holds.
+        with _eager_folder_paused():
+            failures, history_gone = _remove_unit_contents(directory)
         if failures:
             # Say WHICH of the two failures this is. Segments go first, so a
             # failure after some of them went is a PARTIAL removal -- that
@@ -474,13 +578,75 @@ def remove_unit(kind: str, unit_id: str, *, guard: "Callable[[Path], bool]") -> 
                     history_gone,
                     failures,
                 )
+                if kind == KIND_SESSION:
+                    # Some of this unit's history is gone, which is why the in-memory
+                    # edge is suspect -- but "some" is not "the opening record", and the
+                    # two ways it can be wrong call for different answers. The disk
+                    # decides, by the same reading a fresh scan of this unit would make.
+                    # Same import-here reason as the removed path below.
+                    from kiro_crew.crew_log.session_tree import opened_record
+                    from kiro_crew.crew_log.session_tree_projection import (
+                        forget_unit,
+                        reconcile_unit_edge,
+                        retract_unit_parent,
+                    )
+
+                    surviving = None
+                    try:
+                        ordered = segment_paths(kind, unit_id)
+                        if ordered:
+                            header, entry, _announced = read_head(ordered[0])
+                            surviving = opened_record(directory, header, entry)
+                    except OSError:
+                        # Cannot read it, so cannot prove anything survives. Treated as
+                        # gone, which is the conservative direction: a dropped edge
+                        # comes back on the next seed, a kept one that names nothing
+                        # readable stays wrong until the process restarts.
+                        surviving = None
+                    if surviving is None:
+                        # Nothing here still yields a record at all.
+                        forget_unit(unit_id)
+                    else:
+                        if surviving.parent_slot is None:
+                            # The CREATING segment went while later ones survive, so a
+                            # scan now contributes this slot with NO parent. Dropping the
+                            # whole record instead would orphan this unit's CHILDREN,
+                            # which cite its slot: a slot with no record reads as a
+                            # creator that never existed, rather than one whose own
+                            # creator is unknown.
+                            retract_unit_parent(unit_id)
+                        # The citation above is only the FIRST segment's contribution. A
+                        # decision is appended later, so it can be in any segment and is
+                        # therefore losable by this same pass whether or not the creating
+                        # one survived -- which is why this is not inside the arm above.
+                        # Re-read from what is left, because nothing else will: a
+                        # decision is otherwise only re-derived by a cold rebuild, and
+                        # until then the tree would assert a takeover with a deleted
+                        # segment behind it and checkpoint that claim.
+                        reconcile_unit_edge(unit_id, surviving.slot)
             else:
                 logger.warning(
                     "crew log retention: %s log %r not removed; its history is intact",
                     kind,
                     unit_id,
                 )
+            if history_gone and in_hold is not None:
+                # The companion is already gone -- it ran before any of this -- so a
+                # partial removal strands nothing. Recorded because the two facts
+                # read together: this unit's history is gone AND so is the companion
+                # whose gate lived here, which is why nothing revisiting it can
+                # re-import anything.
+                logger.debug(
+                    "crew log retention: %s log %r partly removed with its companion "
+                    "already gone",
+                    kind,
+                    unit_id,
+                )
             return REMOVE_FAILED
+        # Before the identity unlink below, not after: while the lease FILE exists it
+        # names the inode whose lock proves ownership, and once it is gone a second
+        # remover can lock a fresh one -- which would put another process inside the
+        # hold this removal, and the companion step it already ran, were given alone.
         lease_gone = unlink_lock_in_hold(lease_path)
     finally:
         release_lease(lease_key)
@@ -498,7 +664,303 @@ def remove_unit(kind: str, unit_id: str, *, guard: "Callable[[Path], bool]") -> 
         # Every file this owns is gone. A directory that will not go is residue,
         # not retained history, so the removal still counts -- but say so.
         logger.debug("crew log retention: %s log %r directory not removed", kind, unit_id)
+    if kind == KIND_SESSION:
+        # The session tree projection holds this unit's lineage edge in memory, and
+        # the disk it was folded from has stopped holding it. Dropped HERE, at the one
+        # point the removal is established, rather than in the sweep: ``remove_unit``
+        # is also reached by a direct delete, and a projection updated only by the
+        # retention pass would keep serving an edge into a unit that is gone.
+        #
+        # Deliberately after the ``rmdir``, which is allowed to fail: what makes the
+        # record wrong is that the unit's SEGMENTS are gone, and an empty directory
+        # left standing is residue that answers no record either way. Imported here
+        # because the projection imports this module for the root and the replay.
+        from kiro_crew.crew_log.session_tree_projection import forget_unit
+
+        forget_unit(unit_id)
     return REMOVE_REMOVED
+
+
+#: A file inside a unit directory that keeps the unit out of retention. The session
+#: trash writes it when a restore that failed could not stage a unit it had already put
+#: back: the unit is then live while the rest of its session is still in the trash, and
+#: the sweep must not expire a unit whose session the user can still restore. Only the
+#: trash removes it, when that session is restored or its batch is emptied.
+TRASH_HOLD_FILE = ".trash-hold"
+
+
+def _write_hold(directory: Path) -> None:
+    """Create *directory*'s hold mark and make it durable. Raises ``OSError`` if it is not.
+
+    The mark is created without following a link, then the file and its directory are
+    synced, so a power loss cannot come back to a unit the sweep reads as unheld.
+    """
+    flags = os.O_WRONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(directory / TRASH_HOLD_FILE, flags, 0o600)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    _sync_hold_dir(directory)
+
+
+def _sync_hold_dir(directory: Path) -> None:
+    """Sync the directory entry of a new hold mark."""
+    from kiro_crew.atomic_write import fsync_dir
+
+    fsync_dir(directory)
+
+
+def hold_unit(kind: str, unit_id: str) -> bool:
+    """Keep *unit_id* out of retention until :func:`release_unit_hold`. False when not held.
+
+    The unit is already live, so there is nothing to withhold when the mark cannot be
+    made durable: a mark that exists is still what the sweep reads, and the failed
+    sync is logged. False only when no mark could be created at all.
+    """
+    require_kind(kind)
+    try:
+        named = _checked_crew_log_root(kind) / _store_name(unit_id)
+        if is_link(named):
+            return False
+        directory = crew_log_dir(kind, unit_id)
+        if not directory.is_dir():
+            return False
+    except (CrewLogError, OSError):
+        log_exception_text(
+            logger, logging.ERROR, "crew log trash: could not hold %s log %r", kind, unit_id
+        )
+        return False
+    try:
+        _write_hold(directory)
+    except OSError:
+        if not _is_held(directory):
+            log_exception_text(
+                logger, logging.ERROR, "crew log trash: could not hold %s log %r", kind, unit_id
+            )
+            return False
+        log_exception_text(
+            logger, logging.WARNING, "crew log trash: could not sync the hold on %r", unit_id
+        )
+    return True
+
+
+def hold_staged_unit(staged: Path) -> bool:
+    """Mark a unit still in the trash as held, so it is held the moment it is published.
+
+    A restore publishes a session's units before its transcript, and a sweep running in
+    between would otherwise read a closed, expired unit and delete it while the rest of
+    the session is still coming back. The mark rides the rename into the live tree, and
+    it is durable before this answers True, so the caller publishes only a unit whose
+    hold survives a power loss. False when the staged directory is not a real directory
+    under the trash root, or when the mark could not be made durable.
+    """
+    trash = crew_log_trash_root()
+    try:
+        if is_link(trash) or is_link(staged) or not staged.is_relative_to(trash):
+            return False
+        if not staged.is_dir():
+            return False
+        _write_hold(staged)
+    except OSError:
+        log_exception_text(
+            logger, logging.WARNING, "crew log trash: could not hold staged %s", staged.name
+        )
+        return False
+    return True
+
+
+def release_unit_hold(kind: str, unit_id: str) -> None:
+    """Let *unit_id* age out again; a unit with no hold is left as it is."""
+    require_kind(kind)
+    try:
+        named = _checked_crew_log_root(kind) / _store_name(unit_id)
+        if is_link(named):
+            return
+        (crew_log_dir(kind, unit_id) / TRASH_HOLD_FILE).unlink()
+    except FileNotFoundError:
+        return
+    except (CrewLogError, OSError):
+        log_exception_text(
+            logger, logging.WARNING, "crew log trash: could not release the hold on %r", unit_id
+        )
+
+
+def is_trash_held(directory: Path) -> bool:
+    """Whether the unit in *directory* belongs to a session still in the trash."""
+    return _is_held(directory)
+
+
+def _is_held(directory: Path) -> bool:
+    """Whether *directory* carries a trash hold; an unreadable answer counts as held."""
+    try:
+        (directory / TRASH_HOLD_FILE).lstat()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def crew_log_trash_root() -> Path:
+    """Where session trash stages crew logs: ``<data home>/crew-log/trash``.
+
+    Inside the crew-log tree rather than beside the transcripts in the session trash,
+    because that tree is the one the sandbox hides from agents. A staged crew log is
+    later RESTORED into the live tree, so a copy an agent could edit while it waits
+    would be a way to write entries the gateway then reads as its own.
+    """
+    return data_home() / _ROOT_LEAF / "trash"
+
+
+#: Whether a unit directory can be renamed while this process holds its lease. POSIX
+#: renames a directory whatever is open inside it; Windows refuses a directory holding
+#: an open handle, and the held lease IS one. See :func:`stage_unit`.
+_RENAME_UNDER_LEASE = os.name != "nt"
+
+
+def _sync_down(top: Path, leaf: Path) -> None:
+    """Sync *leaf* and every directory above it up to *top*, so a new name survives a crash."""
+    from kiro_crew.atomic_write import fsync_dir
+
+    level = leaf
+    while True:
+        fsync_dir(level)
+        if level == top or top not in level.parents:
+            return
+        level = level.parent
+
+
+def _durable_rename(source: Path, destination: Path) -> bool:
+    """Rename *source* to *destination* and make both names durable. False when it did not.
+
+    The rename alone is not a move a caller may build on: a power loss before the
+    two parent directories are synced can come back to the unit under neither name,
+    or under both. The destination's own chain is synced BEFORE the rename, so the
+    directory it lands in exists on disk first; both parents are synced after it. A
+    sync that fails after the rename puts the unit back and syncs that too, so a False
+    answer means the unit is where it started. If even the rollback cannot be synced,
+    a power loss may still recover the unit under *destination*; that is logged, and it
+    loses nothing -- a crew log left in the trash with no manifest entry is kept there
+    by the session trash, which refuses to delete staging its manifest does not list.
+    """
+    top = data_home() / _ROOT_LEAF
+    _mkdir_private(destination.parent)
+    _sync_down(top, destination.parent)
+    os.rename(source, destination)
+    try:
+        _sync_down(top, destination.parent)
+        _sync_down(top, source.parent)
+    except OSError:
+        log_exception_text(
+            logger, logging.WARNING, "crew log: could not sync the move of %s", source.name
+        )
+        try:
+            os.rename(destination, source)
+        except OSError:
+            log_exception_text(
+                logger, logging.ERROR, "crew log: %s is at %s and not synced", source, destination
+            )
+            return True
+        try:
+            _sync_down(top, source.parent)
+            _sync_down(top, destination.parent)
+        except OSError:
+            log_exception_text(
+                logger,
+                logging.ERROR,
+                "crew log: %s was put back at %s but that is not synced; after a power "
+                "loss it may be found at %s instead",
+                source.name,
+                source,
+                destination,
+            )
+        return False
+    return True
+
+
+def stage_unit(kind: str, unit_id: str, destination: Path) -> str:
+    """Move one unit's directory to *destination*, under its lease. A ``REMOVE_*`` status.
+
+    The session trash's counterpart of :func:`remove_unit`: the same sole lease stands
+    between the move and a live writer, so a unit some process is appending to answers
+    ``owned`` and stays where it is. ``removed`` means the unit left the live tree and
+    both names are on disk. *destination* must not exist; it is created under
+    :func:`crew_log_trash_root`.
+
+    On Windows the lease is released before the rename rather than held across it,
+    because Windows refuses to rename a directory that holds an open handle and the
+    lease is one. That refusal is what stands in for the hold: a writer that takes the
+    lease in the gap has its lease file open inside the directory, so the rename fails
+    and the unit stays, exactly as ``owned`` would have left it.
+    """
+    require_kind(kind)
+    named = _checked_crew_log_root(kind) / _store_name(unit_id)
+    if is_link(named):
+        return REMOVE_ABSENT
+    directory = crew_log_dir(kind, unit_id)
+    if not directory.is_dir():
+        return REMOVE_ABSENT
+    trash = crew_log_trash_root()
+    if is_link(trash) or not destination.is_relative_to(trash):
+        raise CrewLogError(
+            f"refusing to stage a crew log outside {trash}: {destination}", code=CODE_BAD_ROOT
+        )
+    try:
+        lease_key = acquire_lease(directory / LEASE_FILE, kind=kind, unit_id=unit_id, sole=True)
+    except CrewLogError as exc:
+        if exc.code == CODE_ALREADY_OWNED:
+            return REMOVE_OWNED
+        raise
+    except OSError:
+        log_exception_text(
+            logger, logging.WARNING, "crew log trash: cannot lease %s log %r", kind, unit_id
+        )
+        return REMOVE_FAILED
+    held = True
+    try:
+        if not _RENAME_UNDER_LEASE:
+            release_lease(lease_key)
+            held = False
+        moved = _durable_rename(directory, destination)
+    except OSError:
+        log_exception_text(
+            logger, logging.WARNING, "crew log trash: could not stage %s log %r", kind, unit_id
+        )
+        return REMOVE_FAILED
+    finally:
+        if held:
+            release_lease(lease_key)
+    # The session-tree projection keeps this unit's record: a staged unit comes back on
+    # restore, and nothing re-derives a record for an unchanged root. A reader that
+    # meets the unit while it is staged gets ``gone``, as it would for a removed one.
+    return REMOVE_REMOVED if moved else REMOVE_FAILED
+
+
+def restore_staged_unit(kind: str, staged: Path) -> "str | None":
+    """Put a unit :func:`stage_unit` moved back into the live tree; its id, or None.
+
+    The unit's own header decides where it goes: its id must fold to the staged
+    directory's name, the same proof :func:`unit_header_slot` requires. An occupied
+    destination is left alone -- a unit recreated since is newer than this copy. The
+    move is synced like the stage (:func:`_durable_rename`).
+    """
+    require_kind(kind)
+    header = None if is_link(staged) else _proved_header(staged)
+    if header is None:
+        return None
+    root = _checked_crew_log_root(kind)
+    target = root / staged.name
+    if is_link(target) or target.exists():
+        return None
+    try:
+        moved = _durable_rename(staged, target)
+    except OSError:
+        log_exception_text(
+            logger, logging.WARNING, "crew log trash: could not restore %s", staged.name
+        )
+        return None
+    return str(header["id"]) if moved else None
 
 
 def _unit_header_object(kind: str, unit_id: str) -> "dict[str, Any] | None":
@@ -580,6 +1042,21 @@ def unit_header_slot(kind: str, unit_id: str) -> "str | None":
     return slot if isinstance(slot, str) and slot else None
 
 
+def unprovable_session_units() -> int:
+    """How many session-kind units under the root have a header that cannot be proved.
+
+    A slot-keyed fold reaches its units through their headers, so a unit this
+    cannot read is a unit no fold will see; a caller that must know its fold was
+    complete asks this first.
+    """
+    try:
+        root = _checked_crew_log_root(KIND_SESSION)
+        names = sorted(child.name for child in root.iterdir())
+    except (CrewLogError, OSError):
+        return 0
+    return sum(1 for name in names if _proved_header(root / name) is None)
+
+
 #: The cached slot map, the root identity it was built from, and the children that
 #: scan could NOT prove. Replaced WHOLE, so a reader loads one reference and sees
 #: either the old triple or the new one; two threads racing rebuild it twice, which
@@ -609,7 +1086,7 @@ def _slot_root_fingerprint(root: Path, names: "list[str]") -> "tuple[Any, ...]":
     return (str(root), stat.st_dev, stat.st_ino, stat.st_mtime_ns, tuple(names))
 
 
-def session_units_for_slot(slot: str) -> "tuple[str, ...]":
+def session_units_for_slot(slot: str, *, strict: bool = False) -> "tuple[str, ...]":
     """Every session crew log whose HEADER names *slot*, oldest unit first.
 
     The slot-keyed read path. A slot owns one ACP session id AT A TIME rather than
@@ -620,6 +1097,14 @@ def session_units_for_slot(slot: str) -> "tuple[str, ...]":
     rewritten, and inside the fenced tree, so it does not move when a mapping does.
     A unit whose header cannot be PROVED to be its own is left out rather than
     attributed to a slot it may not belong to (see :func:`_proved_header`).
+
+    *strict* is for a caller that VALIDATES against the listing rather than reading
+    it, and it refuses on both ways the listing can come back incomplete: a scan that
+    could not be made at all, and a child that cannot be proved while already holding
+    entries (:func:`_unproven_holding_content`). Without it a read takes the shorter
+    listing, which is the right answer for a read -- it says nothing false about what
+    it could see -- and the wrong one for a write, which would validate against a
+    record missing whatever that unit recorded.
 
     Ordered by the header's ``createdAt``, then by unit id so a tie is stable.
     That is the order the units were opened in, and therefore the order their
@@ -632,16 +1117,42 @@ def session_units_for_slot(slot: str) -> "tuple[str, ...]":
     """
     if not slot:
         return ()
+    return session_units_by_slot(strict=strict).get(slot, ())
+
+
+def session_units_by_slot(*, strict: bool = False) -> "dict[str, tuple[str, ...]]":
+    """Every session crew log with a provable slot-naming header, grouped by slot.
+
+    The index :func:`session_units_for_slot` looks one slot up in; a caller that
+    must look ACROSS slots (a rebuild searching every other slot's units for entries
+    naming its board) reads the whole map once instead of scanning per slot. Same
+    order within a slot, same cache, same treatment of unprovable children.
+
+    *strict* carries the validating caller's contract down to the scan that decides
+    it, because the refusal belongs where the incompleteness is seen rather than
+    where the listing is used. It means the same thing either way in: a scan that
+    could not be made at all, and a child that cannot be proved while already
+    holding entries, are both refused instead of being answered with a listing that
+    is quietly short.
+    """
     global _slot_index
     try:
         root = _checked_crew_log_root(KIND_SESSION)
         names = sorted(child.name for child in root.iterdir())
     except (CrewLogError, OSError):
-        return ()
+        # No store, or one that could not be scanned. A read takes the empty listing;
+        # a caller that would VALIDATE against the listing passes ``strict`` and gets
+        # the failure instead, because an empty listing taken for a scan that failed
+        # would let it validate against a record that is not there.
+        if strict:
+            raise
+        return {}
     fingerprint = _slot_root_fingerprint(root, names)
     cached = _slot_index
     if cached is not None and cached[0] == fingerprint and not _any_now_provable(root, cached[2]):
-        return cached[1].get(slot, ())
+        if strict:
+            _refuse_unprovable_unit(root, cached[2])
+        return cached[1]
     rows: "dict[str, list[tuple[int, str]]]" = {}
     unproven: list[str] = []
     for name in names:
@@ -673,7 +1184,57 @@ def session_units_for_slot(slot: str) -> "tuple[str, ...]":
         rows.setdefault(unit_slot, []).append((order, unit_id))
     by_slot = {key: tuple(unit for _order, unit in sorted(found)) for key, found in rows.items()}
     _slot_index = (fingerprint, by_slot, tuple(unproven))
-    return by_slot.get(slot, ())
+    if strict:
+        _refuse_unprovable_unit(root, tuple(unproven))
+    return by_slot
+
+
+def _unproven_holding_content(root: Path, unproven: "tuple[str, ...]") -> "str | None":
+    """The first child that cannot be proved AND already holds log content.
+
+    What the strict listing needs beyond the scan. A child ``_proved_header`` could
+    not prove is one of two different things, and only one of them is safe to leave
+    out of the listing:
+
+    * ``create`` has made the directory and not yet published the header. It holds no
+      entries at all, so a listing without it is missing nothing that could be folded.
+    * an established unit whose header will not read right now -- a transient
+      ``OSError``, a link at the name, a segment that will not parse. It may hold any
+      number of entries, so a caller that VALIDATES against the listing (the crew
+      ledger's one-editor rule) would pass against a record missing them.
+
+    "Holds content" is the same test ``create`` itself applies: the header is
+    published atomically, so a partial one never reaches the name, and a zero-byte
+    file "carries no header and no entries". A directory that will not answer at all
+    is reported rather than guessed about -- whether it holds entries is exactly what
+    could not be established.
+    """
+    for name in unproven:
+        directory = root / name
+        if is_link(directory):
+            return name
+        try:
+            segments = [
+                child for child in directory.iterdir() if _segment_first_seq(child) is not None
+            ]
+        except OSError:
+            return name
+        if any(_has_content(segment) for segment in segments):
+            return name
+    return None
+
+
+def _refuse_unprovable_unit(root: Path, unproven: "tuple[str, ...]") -> None:
+    """Raise when a strict listing cannot account for a child that holds entries."""
+    blocked = _unproven_holding_content(root, unproven)
+    if blocked is None:
+        return
+    raise CrewLogError(
+        f"session crew log {blocked!r} holds entries its header cannot prove, "
+        "so the listing is incomplete",
+        code=CODE_BAD_HEADER,
+        field="id",
+    )
 
 
 def _any_now_provable(root: Path, unproven: "tuple[str, ...]") -> bool:
@@ -786,6 +1347,34 @@ def oldest_segment(directory: Path) -> Path | None:
         return None
     found.sort(key=lambda pair: pair[0])
     return found[0][1]
+
+
+def newest_segment(directory: Path) -> Path | None:
+    """The surviving segment of *directory* with the HIGHEST first seq, or ``None``.
+
+    Where a unit's history ENDS today, which is the half :func:`oldest_segment`
+    cannot answer: a decision recorded after the session opened lands at the end of
+    the newest segment, not behind the header of the oldest one.
+
+    No name shortcut. ``log.jsonl`` is the oldest segment while it survives, so the
+    newest is only knowable from the listing -- and a unit that has never been
+    rotated has exactly one segment, which the listing finds in the same call.
+
+    Raises what the listing raises. ``None`` therefore means one thing -- no surviving
+    segment -- rather than standing for an unreadable directory as well, which is the
+    distinction the tree-edge caller decides on: a unit whose listing failed has not
+    told anyone it records no decision, and reported as though it had, its stale
+    checkpoint edge survives as the tree's answer.
+    """
+    found = [
+        (first, child)
+        for child in directory.iterdir()
+        if (first := _segment_first_seq(child)) is not None
+    ]
+    if not found:
+        return None
+    found.sort(key=lambda pair: pair[0])
+    return found[-1][1]
 
 
 def read_head(path: Path) -> "tuple[dict[str, Any] | None, Entry | None, bool]":
@@ -913,6 +1502,76 @@ def unit_ids(kind: str) -> list[str]:
     return sorted(out)
 
 
+def unit_opened_previous(kind: str, unit_id: str) -> "str | None":
+    """The predecessor id *unit_id*'s own ``session/opened`` records, or None.
+
+    The DURABLE half of the supersede edge. The emitter writes ``previous.sid`` on
+    the opening entry and never rewrites it, so this answers "which crew log was
+    this slot writing before" from the file rather than from a process's memory --
+    which is what a caller recovering after a crash has and a caller reading its
+    own live state does not need.
+
+    Reads the OLDEST segment's SECOND line, which is where ``session/opened`` is:
+    the header is line 1 and the opening entry is appended immediately after it, so
+    this is O(1) whatever the crew log has grown to. A rotated log keeps its opening
+    entry in the first segment, which is why the segments are ordered rather than
+    the newest one read.
+
+    None is "cannot prove", never "there is no predecessor", exactly as in
+    :func:`_unit_header_object` and for the same reason: the refusals are a
+    directory that is a link, a header that does not fold back to the directory
+    holding it, no second line yet, a line that does not parse, a second line that
+    is not a ``session/opened``, and a ``previous`` that is absent or not shaped as
+    an object carrying a non-empty string ``sid``. A caller acting on this value
+    must treat None as "no recovery available here" rather than as a statement that
+    the crew log stands alone.
+
+    Read-only: it takes no lease and writes nothing, so it cannot disturb a crew log
+    another process is appending to.
+    """
+    require_kind(kind)
+    try:
+        named = _checked_crew_log_root(kind) / _store_name(unit_id)
+        if is_link(named):
+            return None
+        directory = crew_log_dir(kind, unit_id)
+        if is_link(directory):
+            return None
+        segments = [
+            (first, child)
+            for child in directory.iterdir()
+            if (first := _segment_first_seq(child)) is not None
+        ]
+    except (CrewLogError, OSError):
+        return None
+    if not segments:
+        return None
+    segments.sort(key=lambda pair: pair[0])
+    try:
+        header, entry, _has_line = read_head(segments[0][1])
+    except OSError:
+        return None
+    if header is None or entry is None:
+        return None
+    own_id = header.get("id")
+    if not isinstance(own_id, str) or not own_id or _store_name(own_id) != directory.name:
+        return None
+    if entry.type != "session/opened":
+        return None
+    previous = entry.data.get("previous")
+    if not isinstance(previous, dict):
+        return None
+    sid = previous.get("sid")
+    return sid if isinstance(sid, str) and sid else None
+
+
+def _eager_folder_paused() -> "AbstractContextManager[bool]":
+    """:func:`eager.paused`, imported late: the eager folder imports this module."""
+    from kiro_crew.crew_log import eager
+
+    return eager.paused()
+
+
 def _remove_unit_contents(directory: Path) -> "tuple[int, int]":
     """Delete everything in *directory* except the lease. ``(failures, history_gone)``.
 
@@ -976,12 +1635,10 @@ def _is_segment_name(name: str) -> bool:
     predicate only decides what goes FIRST, so a stray numbered file is better
     grouped with the segments than left to the tail of the pass -- it is history
     by shape, and the ordering exists so the identity files outlive the history.
+    The number itself must still be spelled as a reader parses it, so a name a
+    reader ignores as a stray (``log.².jsonl``, ``log.05.jsonl``) is not history.
     """
-    if name == LOG_FILE:
-        return True
-    if not (name.startswith(f"{_SEGMENT_STEM}.") and name.endswith(_SEGMENT_SUFFIX)):
-        return False
-    return name[len(_SEGMENT_STEM) + 1 : -len(_SEGMENT_SUFFIX)].isdigit()
+    return name == LOG_FILE or _numbered_segment_seq(name) is not None
 
 
 # --------------------------------------------------------------------------- #
@@ -1053,9 +1710,12 @@ def sweep_expired(retention_days: int, *, now: float | None = None) -> "tuple[in
     crew log already written, permanently, since nothing else collects them.
 
     Crew logs are out of scope and are never scanned: this walks
-    ``crew-log/sessions`` alone. They have no writer yet, and no ``session/closed``
-    to age from, so a rule invented for them now would be a guess applied to
-    files nothing produces.
+    ``crew-log/sessions`` alone. A crew's log IS written -- the crew emitter
+    appends a dispatch and the reports that answer it -- and it is still not aged
+    here, because nothing in that file says when its history stops being wanted. A
+    session's does: ``session/closed`` names the moment the unit's life ended. A
+    crew outlives every item it dispatched, so ageing one needs a rule of its own
+    rather than a session's lifecycle applied to a unit that has none.
 
     A unit is collectable only when its own log PROVES the session is finished:
     the newest lifecycle entry is a ``session/closed`` whose reason is one of
@@ -1143,6 +1803,8 @@ def _expired_unit_id(directory: Path, cutoff_ms: int) -> "str | None":
       resolves it, and it is accepted only if it folds BACK to this directory's
       own name. A directory no id addresses is not removed, because the removal
       would be aimed by id and would resolve somewhere else.
+    * **A trash hold** (:data:`TRASH_HOLD_FILE`). The unit is live while the rest of
+      its session waits in the trash, so the user can still restore it whole.
     * **A torn tail.** Unterminated trailing bytes are what
       ``open(repair=True)`` truncates, and the sweep cannot tell a dead writer's
       crash artifact from an append that has not yet reached its fsync -- the
@@ -1186,7 +1848,7 @@ def _expired_unit_id(directory: Path, cutoff_ms: int) -> "str | None":
         ]
     except OSError:
         return None
-    if not segments:
+    if not segments or _is_held(directory):
         return None
     segments.sort(key=lambda pair: pair[0])
     oldest = segments[0][1]
@@ -1238,11 +1900,208 @@ def _last_lifecycle_entry(tail: _Tail) -> "Entry | None":
     close would call a session that is running right now expired and delete a
     live conversation's log.
 
+    :data:`_LIFECYCLE_TYPES` holds those two types and no others, and nothing that
+    moves a session in the TREE belongs in it: this answer authorizes a DELETION,
+    so a type added here makes a unit whose newest such entry is not a close
+    immortal in retention. The tree's own types are read by
+    :func:`read_last_tree_edge`, which shares the window walk below and keeps its
+    own set.
+    """
+    return _last_entry_of_types(tail, _LIFECYCLE_TYPES)
+
+
+#: The two entry types that move a session in the TREE, read from a unit's tail.
+#: Deliberately NOT in :data:`_LIFECYCLE_TYPES`: that set decides open versus
+#: closed and therefore authorizes retention's delete, so an adoption sitting at
+#: the end of a log would keep that log forever.
+_TREE_EDGE_TYPES = frozenset({"session/adopted", "session/released"})
+
+
+def read_last_tree_edge(segment: Path) -> "Entry | None":
+    """The newest tree-edge entry in *segment*'s tail window, or ``None``.
+
+    An adoption or a release lands after the session opened, so a reader of a
+    unit's HEAD cannot see it. This is the counterpart read, and it is the same
+    bounded window retention already reads -- one open, at most ``_TAIL_WINDOW``
+    bytes, no walk of the file.
+
+    BOUNDED, and that bound is why this is not the whole answer: only entries written
+    AFTER a decision can push it out of the window, and a session that keeps working
+    keeps appending. :func:`find_last_tree_edge` is the complete read a cold rebuild
+    needs; this one is the cheap first look it starts from, and the one a warm scan of a
+    live unit uses because a live unit's decision is at its end.
+
+    Raises whatever the read raises, like :func:`read_head`: a caller distinguishes
+    "this unit has no decision" from "its bytes were not seen", and only the first
+    is something to cache.
+    """
+    tail = _scan_tail(segment)
+    if tail.empty:
+        return None
+    return _last_entry_of_types(tail, _TREE_EDGE_TYPES)
+
+
+def tree_edge_scan_identity(directory: Path) -> "tuple[int, int, int, int] | None":
+    """What must be unchanged for an earlier COMPLETE tree-edge read of this unit to
+    still be its answer, or ``None`` when the unit has no segments.
+
+    :func:`find_last_tree_edge` is the only honest read for a rebuild and it is
+    proportional to the unit's whole log, because a unit that records no decision is
+    only proved to record none by reading all of it. Paying that on every process start
+    for every unit is what this exists to avoid: the verdict is a pure function of the
+    bytes, so it can be cached across boots as long as something can say the bytes are
+    the same ones.
+
+    Four numbers, each closing a different way the answer could go stale:
+
+    * the directory's own mtime, which moves when a segment is ADDED or REMOVED -- a
+      rotation, or retention taking the oldest;
+    * the number of segments, because two changes inside one mtime granularity can leave
+      the directory looking untouched while its contents are not;
+    * the newest segment's size and mtime, which move on an APPEND -- the one change that
+      does not touch the directory at all, and the one that can add a decision.
+
+    Deliberately NOT a content hash: this runs per unit on a boot path, and the whole
+    point is to be cheaper than reading the bytes. It is a staleness check, not proof of
+    identity -- so it is used only to skip re-deriving a NEGATIVE verdict, where being
+    wrong costs a decision that is re-read on the next change, and never to admit an edge
+    that no read produced.
+
+    Raises what the stats raise. A caller that cannot get an identity must do the read.
+    """
+    newest: tuple[int, Path] | None = None
+    count = 0
+    for child in directory.iterdir():
+        first = _segment_first_seq(child)
+        if first is None:
+            continue
+        count += 1
+        if newest is None or first > newest[0]:
+            newest = (first, child)
+    if newest is None:
+        return None
+    stat = newest[1].stat()
+    return (directory.stat().st_mtime_ns, count, stat.st_size, stat.st_mtime_ns)
+
+
+def find_last_tree_edge(directory: Path) -> "Entry | None":
+    """The newest tree-edge entry in the WHOLE of *directory*'s surviving log, or
+    ``None``.
+
+    What a cold rebuild needs, and the reason it cannot use the tail window alone: a
+    decision is silently lost when the log grew past that window after it was written,
+    and the consequence of losing one is not a missing edge but a WRONG one -- the
+    sidebar restores the creating edge and shows a session under a parent that gave it
+    up, with nothing to correct it. A bounded read is the right cost for a live unit and
+    the wrong answer for a rebuild that has no checkpoint to fall back on.
+
+    Segments are searched NEWEST FIRST, and the first one that answers wins: a decision
+    in a newer segment supersedes anything an older one holds, so the walk stops at the
+    first hit rather than reading the rest. A unit that has never rotated therefore
+    costs exactly what the tail read costs, which is the ordinary case; a rotated unit
+    costs one read per segment until its newest decision is found, and a unit that
+    records none costs one read per segment once.
+
+    Inside a segment the search is still the windowed one for the LAST window, then the
+    whole file when the window did not reach its start -- so a decision anywhere in a
+    rotated log is found, and the common case pays the cheap read first.
+
+    Raises what the reads raise, for the reason :func:`read_head` does: "no decision"
+    and "the bytes were not seen" are different answers and only the first may be
+    cached. Narrowed to ``OSError`` and ``ValueError``, which is what every caller here
+    guards -- a reader exception outside those two would escape all of them and reach
+    the projection's boot guard, which seeds no records at all and then refuses lineage
+    for the rest of the process.
+    """
+    # NOT guarded. A listing that fails has not established that this unit records no
+    # decision -- it has established nothing -- and the difference matters because both
+    # callers CACHE the answer: the projection's seed would install the creating edge for
+    # a session that was moved, and the scanner would store that as its verdict for the
+    # segment's whole stat identity, so one moment's fault becomes the tree's standing
+    # answer. Each caller already catches ``OSError`` and marks its scan incomplete,
+    # which is the honest reading and the one the docstring above promises.
+    found = [
+        (first, child)
+        for child in directory.iterdir()
+        if (first := _segment_first_seq(child)) is not None
+    ]
+    if not found:
+        return None
+    found.sort(key=lambda pair: pair[0], reverse=True)
+    for _first, segment in found:
+        entry = read_last_tree_edge(segment)
+        if entry is not None:
+            return entry
+        # The window did not answer. When it did not reach the start of the file there
+        # are earlier lines in THIS segment it never saw, so they are read before moving
+        # on to an older segment -- otherwise a decision in the middle of a busy log is
+        # exactly what goes missing.
+        entry = _scan_whole_for_types(segment, _TREE_EDGE_TYPES)
+        if entry is not None:
+            return entry
+    return None
+
+
+def _scan_whole_for_types(segment: Path, types: "frozenset[str]") -> "Entry | None":
+    """The newest entry of *types* anywhere in *segment*, or ``None``.
+
+    Only reached when the bounded window did not answer and could not prove it saw the
+    whole file. It streams the records rather than holding the file, and keeps the last
+    match instead of stopping at the first: the newest one is the answer, and a forward
+    stream meets it last.
+
+    Raises what the stat and the read raise, as ``OSError`` or ``ValueError`` and nothing
+    else -- byte damage from the framing reader is converted below, because the callers
+    that guard this one guard exactly those two. ``None`` therefore means the file holds
+    no such entry, never that it could not be looked at -- the distinction the tree-edge
+    caller turns into a CACHED verdict, which nothing afterwards re-reads or corrects.
+    The ``open`` below already propagates, so guarding only the stat made one function
+    answer two different ways about the same file.
+    """
+    size = segment.stat().st_size
+    if size == 0:
+        return None
+    if size <= _TAIL_WINDOW:
+        # The window already covered this whole file, so there is nothing new to read.
+        return None
+    newest: Entry | None = None
+    with open(segment, "rb") as handle:
+        try:
+            for raw in strict_raw_records(handle, segment, cap=MAX_ENTRY_BYTES):
+                parsed = _parses_to_object(raw.strip())
+                if parsed is None:
+                    continue
+                entry = Entry.from_dict(parsed)
+                if entry is not None and entry.type in types:
+                    newest = entry
+        except UnreadableRecord as exc:
+            # Byte damage -- an over-cap record is the reachable case, and the framing
+            # reader ABORTS on it, so everything after it in this file is unseen.
+            # Reported as a failed READ rather than returned as ``newest``, because the
+            # unseen part is where a later decision would be: answering with the newest
+            # readable one would be a WRONG edge served as complete, which is the whole
+            # failure this function exists to prevent.
+            #
+            # Converted to ``ValueError`` rather than propagated as-is. Every caller of
+            # this file's tree-edge reads guards ``(OSError, ValueError)`` and turns a
+            # raise into "incomplete"; ``UnreadableRecord`` is neither, so it escaped all
+            # of them into the projection's own boot guard, which marks the projection
+            # seeded with no records at all and refuses lineage for the process lifetime.
+            # One conversion here, rather than a class added to three separate tuples
+            # that would then have to stay in step.
+            raise ValueError(f"crew log segment {segment.name} holds an unreadable record") from exc
+    return newest
+
+
+def _last_entry_of_types(tail: _Tail, types: "frozenset[str]") -> "Entry | None":
+    """The newest entry in *tail*'s window whose type is in *types*.
+
     Searched from the END, so a file with many turns costs one comparison per
-    trailing entry rather than a parse of the whole window. Entries that are
-    neither -- a turn, a tool, an in-flight closer landing after a teardown -- are
-    skipped: they say nothing about which state the unit is in, and the emitter
-    writes them after a close by design.
+    trailing entry rather than a parse of the whole window. Entries outside *types*
+    are skipped, and each caller brings its own set: the question "is this unit
+    closed" and the question "where does this slot hang" are answered from the same
+    bytes and must not share a vocabulary, because the first one authorizes a
+    delete.
 
     Reuses the window the tail scan already read, so this costs no second read.
     """
@@ -1258,7 +2117,7 @@ def _last_lifecycle_entry(tail: _Tail) -> "Entry | None":
         if parsed is None:
             continue
         entry = Entry.from_dict(parsed)
-        if entry is not None and entry.type in _LIFECYCLE_TYPES:
+        if entry is not None and entry.type in types:
             return entry
     return None
 
@@ -1436,8 +2295,34 @@ def _has_content(path: Path) -> bool:
         return False
 
 
-def _iter_entries(path: Path) -> Iterator[Entry]:
+class _Bounded:
+    """A binary reader that stops at byte *end* of *source*.
+
+    What :func:`_iter_entries` reads through when a caller fixed the end under the
+    append lock: bytes past it may be an append whose fsync has not returned, and a
+    line read from them can be truncated away a moment later. Only the two calls the
+    record framer makes are offered, so a new one fails loudly rather than reading
+    past the end.
+    """
+
+    def __init__(self, source: Any, end: int) -> None:
+        self._source = source
+        self._end = end
+
+    def tell(self) -> int:
+        return int(self._source.tell())
+
+    def readline(self, size: int = -1) -> bytes:
+        left = self._end - self.tell()
+        if left <= 0:
+            return b""
+        return bytes(self._source.readline(left if size < 0 else min(size, left)))
+
+
+def _iter_entries(path: Path, end: int | None = None) -> Iterator[Entry]:
     """Every parseable entry in *path*, oldest first, header excluded.
+
+    *end*, when given, is the byte offset the read stops at (see :class:`_Bounded`).
 
     A malformed interior line is SKIPPED, not raised on: the log is append-only
     and one damaged line must not hide the history in front of it. The file is
@@ -1460,7 +2345,8 @@ def _iter_entries(path: Path) -> Iterator[Entry]:
     produced: it is damage, and the skip posture already applies to damage.
     """
     try:
-        with open(path, "rb") as source:
+        with open(path, "rb") as raw_source:
+            source: Any = raw_source if end is None else _Bounded(raw_source, end)
             for index, raw in enumerate(
                 bounded_raw_records(source, path, cap=MAX_ENTRY_BYTES, label="crew log")
             ):
@@ -1605,6 +2491,13 @@ class CrewLog:
         "_last_seq",
         "_needs_newline",
         "_lease_key",
+        # The ``weakref.finalize`` that releases this handle's lease when the
+        # object is dropped. Held so :meth:`release_ownership` can run it
+        # DETERMINISTICALLY -- dropping the last reference frees the lease only
+        # once the cyclic collector runs the finalizer, and a caller retiring
+        # this handle (a test boundary, a cache eviction) cannot wait for a GC
+        # pass it does not control. See :meth:`_adopt_lease`.
+        "_lease_finalizer",
         # Weak-referenceable so this handle being dropped is what releases its
         # write ownership. See :meth:`_claim`.
         "__weakref__",
@@ -1628,6 +2521,7 @@ class CrewLog:
         self._last_seq = last_seq
         self._needs_newline = needs_newline
         self._lease_key: str | None = None
+        self._lease_finalizer: "weakref.finalize | None" = None
         if lease_key is not None:
             # A reference already taken on this handle's behalf -- the repair an
             # ``open`` ran before the instance existed. Adopting it here is what
@@ -1749,7 +2643,7 @@ class CrewLog:
         and a retry succeeds instead of being refused by the fragment.
 
         ``repair`` is what closes an INTERRUPTED TURN, and it is opt-in because
-        the two callers of ``open`` want opposite things. A RESUME -- the gateway
+        the callers of ``open`` want opposite things. A RESUME -- the gateway
         finding a session log whose writer is gone -- wants the open turn
         closed, and passes ``repair=True``. A live writer RECONNECTING to its own
         crew log must not: its turn is still running, and closing it would append a
@@ -1757,10 +2651,13 @@ class CrewLog:
         writing, so the record would claim an outcome the turn never had. A
         reconnect happens for reasons that have nothing to do with the writer's
         health -- a handle evicted from a bounded cache is enough -- so repair
-        cannot be inferred from the fact that an ``open`` is happening at all. See
-        :func:`_close_interrupted_tail`; the torn-tail truncation below is
-        unconditional because trailing bytes that are not a complete line are not
-        a record, so nothing can be reading them.
+        cannot be inferred from the fact that an ``open`` is happening at all. The
+        third caller is a SUPERSEDE, which wants the same thing a resume wants but
+        for a store that is not its own, and reaches it through
+        :meth:`repair_interrupted_turn` rather than this flag so it can report how
+        many closers landed. See :func:`_close_interrupted_tail`; the torn-tail
+        truncation below is unconditional because trailing bytes that are not a
+        complete line are not a record, so nothing can be reading them.
         """
         kind = require_kind(kind)
         # The NEWEST segment is the one a writer appends to, and with nothing
@@ -1778,18 +2675,13 @@ class CrewLog:
             )
         path = segments[-1]
         header_path = segments[0]
-        with _open_lock(_lock_path(kind, unit_id)):
-            tail = _scan_tail(path)
-            if tail.torn_offset is not None:
-                dropped = path.stat().st_size - tail.torn_offset
-                _truncate(path, tail.torn_offset)
-                logger.warning(
-                    "dropped %d torn trailing byte(s) from %s crew log %r",
-                    dropped,
-                    kind,
-                    unit_id,
-                )
-            raw = _read_header_line(header_path)
+        # Under the lock, always: an append holds it from its write through its fsync
+        # and any rollback, so a tail read under it sees only lines the writer has made
+        # durable or has already taken back. A read without it can land between the
+        # flush and a failed fsync and hand a fold a line that is truncated a moment
+        # later. The same pass drops a torn tail.
+        tail = cls._settle_tail(kind, unit_id, path)
+        raw = _read_header_line(header_path)
         parsed = None if not raw else _parses_to_object(raw)
         if parsed is None:
             raise CrewLogError(
@@ -1826,14 +2718,35 @@ class CrewLog:
             lease_key=lease_key,
         )
 
+    @staticmethod
+    def _settle_tail(kind: str, unit_id: str, path: Path) -> _Tail:
+        """Re-read *path*'s tail under the lock, dropping torn trailing bytes."""
+        with _open_lock(_lock_path(kind, unit_id)):
+            tail = _scan_tail(path)
+            if tail.torn_offset is not None:
+                dropped = path.stat().st_size - tail.torn_offset
+                _truncate(path, tail.torn_offset)
+                logger.warning(
+                    "dropped %d torn trailing byte(s) from %s crew log %r",
+                    dropped,
+                    kind,
+                    unit_id,
+                )
+        return tail
+
     def repair_interrupted_turn(self, *, child_gone: "Callable[[str], bool] | None" = None) -> int:
         """Close an open turn on this crew log. Returns how many closers landed.
 
         The method form of ``open(repair=True)``, for a caller that already holds
-        a handle. Same rule: only a resume calls it, never a live writer. And the
+        a handle. Two callers reach it: a RESUME, and a SUPERSEDE closing the tail
+        of the store its slot was writing before. Same rule for both, and it is
+        about the WRITER rather than about which caller asks -- never call this for
+        a turn that is still running, whoever is asking. And the
         same ``child_gone`` meaning: without a predicate an unmatched
         ``subagent/spawned`` is left open, because nothing else can rule out a live
-        child that is still about to report its own outcome.
+        child that is still about to report its own outcome. A supersede passes
+        none, because the children it would be answering for were dispatched by a
+        session that is gone.
         """
         # The closers are appends, so this takes write ownership exactly as one
         # does, and is refused the same way when another process holds the log.
@@ -1892,7 +2805,36 @@ class CrewLog:
         that is about to append.
         """
         self._lease_key = key
-        weakref.finalize(self, release_lease, key)
+        self._lease_finalizer = weakref.finalize(self, release_lease, key)
+
+    def release_ownership(self) -> None:
+        """Release this handle's write lease NOW, without waiting for a GC pass.
+
+        Dropping the last reference to a handle frees its lease through the
+        ``weakref.finalize`` :meth:`_adopt_lease` armed -- but only once the
+        cyclic collector RUNS that finalizer, and a handle reachable only through
+        a reference cycle (the member event-log service holds one: its projection
+        registry keeps a bound method back to it) is never freed by refcount, so
+        the release waits for a generational GC pass. That wait is invisible on
+        POSIX -- an advisory lock on a torn-down directory harms nothing and the
+        next acquire against a fresh path just works -- but on Windows the still-open
+        descriptor keeps a mandatory lock on the file and pins its directory open,
+        so the directory cannot be removed and a later write under the same
+        inherited process fails. A caller retiring this handle deterministically
+        (a test boundary, a cache eviction that is not GC-driven) runs the
+        finalizer itself instead.
+
+        ``weakref.finalize`` is idempotent and atomic: calling the finalizer here
+        runs ``release_lease`` exactly once and marks it dead, so the later GC-time
+        call it would have made is a no-op. Safe to call more than once and safe on
+        a handle that never took a lease (a pure reader), where there is nothing to
+        run.
+        """
+        finalizer = self._lease_finalizer
+        if finalizer is not None:
+            finalizer()
+        self._lease_finalizer = None
+        self._lease_key = None
 
     # -- write -------------------------------------------------------------- #
 
@@ -1918,6 +2860,77 @@ class CrewLog:
         the one that knows whether the entry is a sample or a fact -- which is
         why it lives on the append and not on the read.
         """
+        entry = self._append(
+            type,
+            data,
+            src=src,
+            thread=thread,
+            ref=ref,
+            ignorable=ignorable,
+            max_tail_seq=None,
+        )
+        assert entry is not None  # no seq bound, so nothing can decline
+        return entry
+
+    def append_if(
+        self,
+        type: str,
+        data: dict[str, Any],
+        *,
+        src: str,
+        max_tail_seq: int,
+        thread: int | None = None,
+        ref: Ref | dict[str, Any] | None = None,
+        ignorable: bool = False,
+    ) -> Entry | None:
+        """:meth:`append`, written only while the file's tail is still *max_tail_seq*.
+
+        The tail is read AFTER write ownership and the per-append lock are both held,
+        and the entry is written only when that tail is at or below *max_tail_seq*.
+        Returning ``None`` means it declined: no entry was appended. The file is not
+        guaranteed byte-identical across a decline, because the tail read happens
+        first and a torn trailing record is repaired as soon as it is seen -- that
+        repair is the store's, owed to the file rather than to this append, and it is
+        the one change a decline can leave behind.
+
+        This exists because a decision made BEFORE the append is not ordered against
+        another PROCESS. The log has more than one writer, so an entry committed
+        between a caller's decision and its own write lands FIRST and the caller's
+        entry lands after it -- and for a last-wins projection that ordering is the
+        whole outcome, so a decision that was true when it was made is applied to a
+        state that has since moved. The caller cannot close that window from outside:
+        every check it makes is still outside the ownership that decides the order.
+        *max_tail_seq* is the seq the caller's decision was made against, and
+        comparing it here is what proves nothing was committed in between.
+
+        A seq rather than a callback, deliberately: an int cannot parse the file or
+        write to it, so a caller cannot turn this hold -- which refuses every other
+        process's append to the unit while it lasts -- into a long one. A caller that
+        needs to read the log to decide does so BEFORE calling, and passes the tail
+        that read reached.
+        """
+        return self._append(
+            type,
+            data,
+            src=src,
+            thread=thread,
+            ref=ref,
+            ignorable=ignorable,
+            max_tail_seq=max_tail_seq,
+        )
+
+    def _append(
+        self,
+        type: str,
+        data: dict[str, Any],
+        *,
+        src: str,
+        thread: int | None,
+        ref: Ref | dict[str, Any] | None,
+        ignorable: bool,
+        max_tail_seq: int | None,
+    ) -> Entry | None:
+        """The one append body, shared so the two entry points cannot drift apart."""
         require_data(data)
         check_ownership(self._kind, type, src)
         validate_data(self._kind, type, data)
@@ -1953,6 +2966,13 @@ class CrewLog:
                     code=CODE_BAD_THREAD,
                     field="thread",
                 )
+            # Compared against the tail just read, under the ownership that decides
+            # this entry's order, and before any byte is written -- so a decline
+            # appends nothing. It is not the same as a format refusal above: those
+            # happen before the tail is read, while the torn-tail repair just above
+            # is unconditional, so a decline can still leave that repair behind.
+            if max_tail_seq is not None and tail.last_seq > max_tail_seq:
+                return None
             entry = Entry(
                 type=type,
                 seq=tail.last_seq + 1,
@@ -2115,7 +3135,9 @@ class CrewLog:
                         if hashed == records:
                             return (digest.hexdigest(), hashed)
         except Exception:
-            logger.debug("crew log raw prefix for %s could not be read", self._id, exc_info=True)
+            log_exception_text(
+                logger, logging.DEBUG, "crew log raw prefix for %s could not be read", self._id
+            )
         return (digest.hexdigest(), hashed)
 
     def raw_records_through(self, seq: int) -> int | None:
@@ -2170,8 +3192,8 @@ class CrewLog:
                             # is not in this log and no count describes it.
                             return None
         except Exception:
-            logger.debug(
-                "crew log prefix boundary for %s could not be read", self._id, exc_info=True
+            log_exception_text(
+                logger, logging.DEBUG, "crew log prefix boundary for %s could not be read", self._id
             )
             return None
         return None
@@ -2253,6 +3275,14 @@ class CrewLog:
                 continue
             yield entry
 
+    def _durable_end(self, path: Path) -> int:
+        """*path*'s size measured under the append lock: the end no append is still writing."""
+        with _open_lock(_lock_path(self._kind, self._id)):
+            try:
+                return path.stat().st_size
+            except FileNotFoundError:
+                return 0
+
     def _iter_segments(self) -> Iterator[Entry]:
         """Every entry of every segment, oldest first, refusing bad provenance.
 
@@ -2269,7 +3299,15 @@ class CrewLog:
         segment is invisible unless the boundary is checked.
         """
         expected = 0
-        for index, path in enumerate(segment_paths(self._kind, self._id)):
+        paths = segment_paths(self._kind, self._id)
+        # The newest segment is the one a writer appends to, so its end is measured
+        # under the append lock before anything is read. An append holds that lock
+        # from its write through its fsync and any rollback, so the size seen under it
+        # covers only lines the writer has made durable; bytes past it are an append
+        # still in flight, and a reader that yields them can hand a fold an entry the
+        # durable log never keeps. Older segments take no more appends.
+        newest_end = self._durable_end(paths[-1]) if paths else None
+        for index, path in enumerate(paths):
             raw_header = _read_header_line(path)
             parsed_header = None if not raw_header else _parses_to_object(raw_header)
             try:
@@ -2303,7 +3341,8 @@ class CrewLog:
                 )
 
             at_boundary = bool(index) and expected > 0
-            for entry in _iter_entries(path):
+            end = newest_end if index == len(paths) - 1 else None
+            for entry in _iter_entries(path, end):
                 if at_boundary and entry.seq != expected:
                     raise CrewLogError(
                         f"segment {path.name} starts at seq {entry.seq}, but the "
@@ -2490,6 +3529,21 @@ class CrewLog:
 _restrict_failed: set[str] = set()
 
 
+def log_exception_text(log: logging.Logger, level: int, msg: str, *args: object) -> None:
+    """Log the active exception with its traceback RENDERED to text, never as ``exc_info``.
+
+    Every caller sits in a frame that holds a ``CrewLog`` handle (a method's ``self``, a
+    local ``handle``), and a handle's write lease is released by a finalizer when the
+    handle is dropped. An ``exc_info`` triple on the record keeps the traceback, the
+    traceback keeps that frame, and a handler that keeps records (a ``MemoryHandler``, a
+    test harness) then keeps the handle -- and its lease -- for as long as it keeps the
+    record. A string keeps nothing; the render is skipped when the level is off.
+    """
+    if not log.isEnabledFor(level):
+        return
+    log.log(level, msg + "\n%s", *args, traceback.format_exc().rstrip())
+
+
 def _mkdir_private(directory: Path) -> None:
     """Create *directory* and its parents owner-only.
 
@@ -2523,10 +3577,11 @@ def _mkdir_private(directory: Path) -> None:
         key = str(directory)
         if key not in _restrict_failed:
             _restrict_failed.add(key)
-            logger.warning(
+            log_exception_text(
+                logger,
+                logging.WARNING,
                 "Cannot restrict %s to owner-only; it may be readable by other users",
                 directory,
-                exc_info=True,
             )
 
 
@@ -2592,7 +3647,7 @@ def _write_then_sync(path: Path, blob: bytes) -> None:
     holding the session's append lock, so no other handle can have appended between
     this write and its rollback -- the bytes removed can only be this call's own.
     """
-    with open(path, "ab") as handle:
+    with open(path, "ab", opener=owner_only_opener) as handle:  # conversation bodies: 0600
         before = handle.tell()
         try:
             handle.write(blob)

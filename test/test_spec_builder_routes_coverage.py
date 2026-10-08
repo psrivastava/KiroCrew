@@ -1459,8 +1459,8 @@ class TestRemoveNudgeLoop:
     async def test_an_unpinned_removal_takes_whatever_loop_is_there(self):
         patcher = _autonudge(SimpleNamespace(id="loop-7"))
         with patcher:
-            await r._remove_nudge_loop("demo")
-        patcher.svc.remove.assert_awaited_once_with("loop-7")  # type: ignore[attr-defined]
+            await r._remove_nudge_loop("demo", stop_reason="spec_deleted")
+        patcher.svc.remove.assert_awaited_once_with("loop-7", stop_reason="spec_deleted")  # type: ignore[attr-defined]
 
     @pytest.mark.asyncio
     async def test_a_pin_that_does_not_match_the_live_loop_removes_nothing(self):
@@ -2635,6 +2635,11 @@ def _readable_payload():
     return payload
 
 
+#: The local bootstrap subject the dashboard owner gate accepts when no owner is
+#: configured; execute, handoff and stop are owner-gated.
+_OWNER_USER = "local-app"
+
+
 def _mk(
     method: str,
     path: str,
@@ -2653,7 +2658,8 @@ def _mk(
         kwargs["payload"] = _readable_payload()
     req = make_mocked_request(method, full, **kwargs)  # type: ignore[arg-type]
     if authed:
-        req["user"] = "test-user"
+        req["user"] = _OWNER_USER
+        req["app"] = ""
     if body is not ...:
         if body is None:
             req.json = mock.AsyncMock(side_effect=ValueError("bad json"))  # type: ignore
@@ -3930,7 +3936,7 @@ class TestHandleHandoff:
         assert kwargs["max_cycles"] == r._EXEC_MAX_CYCLES
         assert kwargs["stop_sentinel_path"] == "/spec/STOP"
         assert kwargs["source"] == "app:spec-builder"
-        assert kwargs["caller"] == "test-user"
+        assert kwargs["caller"] == _OWNER_USER
         stored = r._load_index()["demo"]
         assert stored["status"] == "executing"
         # The pre-arm exemption ends once the reconciler can see the loop.

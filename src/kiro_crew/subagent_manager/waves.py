@@ -9,13 +9,14 @@ from ._component import ManagerComponent
 if TYPE_CHECKING:
     from ..subagent import (
         _RESET_TIMEOUT,
+        SubagentDelivery,
         SubagentInfo,
         asyncio,
         logger,
         mark_delivered,
         sel,
+        settle_delivered_batch,
         time,
-        uuid,
     )
 
 
@@ -153,7 +154,7 @@ class WaveDigestCoordinator(ManagerComponent):
         except Exception:
             logger.debug("SEL audit failed for lost submission", exc_info=True)
         info = SubagentInfo(
-            id=uuid.uuid4().hex[:8],
+            id=self._manager._mint_agent_id(),
             task="(submission lost before spawn)",
             agent="",
             parent_session_key=parent_session_key,
@@ -360,7 +361,7 @@ class WaveDigestCoordinator(ManagerComponent):
         if not batch_id or self._manager._on_done is None:
             return
         info = SubagentInfo(
-            id=uuid.uuid4().hex[:8],
+            id=self._manager._mint_agent_id(),
             task=f"(wave digest flush — results held {int(held_secs)}s)",
             parent_session_key=parent_session_key,
             done=True,
@@ -401,9 +402,28 @@ class WaveDigestCoordinator(ManagerComponent):
                 "Digest hold flush announce failed for wave %s", info.batch_id, exc_info=True
             )
             return
-        self._manager._settle_digest_holds(info)
+        await self._manager._settle_digest_holds(info)
 
-    async def settle_queued_delivery_impl(self, agent_ids: list[str]) -> None:
+    def _settle_owed_reports(
+        self, deliveries: list[SubagentDelivery], *, delivered: bool = True
+    ) -> list[SubagentDelivery]:
+        """Detach every memory-wait expiry from *deliveries*, clearing its owed
+        report only when the digest or queued announce carrying it was
+        *delivered*.
+
+        A delivered expiry is owed no report any more. One whose carrier the
+        gateway gave up on (``_report_undelivered``) keeps its mark, so the next
+        start replays it. Either way it has no run folder, so it is left out of
+        the tombstones; the rest are returned for them.
+        """
+        owed = [delivery.agent_id for delivery in deliveries if delivery.report_owed]
+        if not owed:
+            return deliveries
+        if delivered:
+            self._manager._admission.taskq_clear_owed_reports(owed)
+        return [delivery for delivery in deliveries if not delivery.report_owed]
+
+    async def settle_queued_delivery_impl(self, deliveries: list[SubagentDelivery]) -> None:
         """Write the ``delivered`` tombstones for completions consumed from a queue.
 
         The queued-injection path deliberately leaves a completion
@@ -425,9 +445,11 @@ class WaveDigestCoordinator(ManagerComponent):
         live child. No gate entry means teardown has finished (or never started).
 
         The tombstone write itself is offloaded: it fsyncs, and this runs on the
-        gateway event loop.
+        gateway event loop. A memory-wait expiry's debt writes no tombstone; it
+        clears the store's owed report (:meth:`_settle_owed_reports`).
         """
-        for agent_id in agent_ids:
+        for delivery in self._settle_owed_reports(deliveries):
+            agent_id = delivery.agent_id
             gate = self._manager._teardown_gates.get(agent_id)
             if gate is not None and not gate.is_set():
                 try:
@@ -439,13 +461,18 @@ class WaveDigestCoordinator(ManagerComponent):
                         agent_id,
                     )
             try:
-                await asyncio.to_thread(mark_delivered, agent_id)
+                await asyncio.to_thread(
+                    mark_delivered,
+                    agent_id,
+                    elapsed=delivery.elapsed,
+                    credits=delivery.credits,
+                )
             except Exception:
                 logger.debug(
                     "Failed to mark drained subagent %s delivered", agent_id, exc_info=True
                 )
 
-    def _settle_digest_holds_impl(self, info: SubagentInfo) -> None:
+    async def _settle_digest_holds_impl(self, info: SubagentInfo) -> None:
         """Settle delivery tombstones for wave members whose injection was
         held for this member's digest. Called ONLY after ``_on_done`` returned
         without raising — and it is a real settle only for the routes where
@@ -459,14 +486,42 @@ class WaveDigestCoordinator(ManagerComponent):
 
         The ids are taken off ``info`` BEFORE settling, so a re-entry cannot
         write a second tombstone and a route that detached them first leaves
-        this a no-op.
+        this a no-op. That detachment is irrevocable, which is what decides the
+        shape below: the whole batch is handed to ONE worker operation rather
+        than awaited per id. A per-id await is a cancellation point, and
+        ``CancelledError`` is not an ``Exception``, so a shutdown or a dashboard
+        cancel landing mid-batch would discard the remaining ids with nothing
+        left holding them -- and a ``delivered`` tombstone is the marker that
+        EXCLUDES a folder from restart reconciliation, so each unwritten one
+        replays as a duplicate completion. Handed over as a unit, the worker
+        finishes every write whether or not the waiter is still waiting.
 
         A failing tombstone write is logged and skipped, never raised: one
         unwritable run folder must not strand the rest of the chunk.
         """
-        ids, info._digest_settle_ids = info._digest_settle_ids, []
-        for _hid in ids:
-            try:
-                mark_delivered(_hid)
-            except Exception:
-                logger.debug("Failed to settle held subagent %s", _hid, exc_info=True)
+        deliveries, info._digest_settle_deliveries = info._digest_settle_deliveries, []
+        # ``_on_done`` also returns normally when the gateway gave up on the
+        # digest's channel or cron injection, so the held expiries it carried
+        # stay owed for the replay.
+        deliveries = self._settle_owed_reports(deliveries, delivered=not info._report_undelivered)
+        if not deliveries:
+            return
+        try:
+            # Off the loop: the tombstone write reads the existing file to
+            # preserve a recorded terminal outcome, and both callers of this
+            # settlement are coroutines. The swap above precedes the single
+            # await, so the re-entry guard still holds across the suspension.
+            #
+            # Handed over as ONE batch rather than awaited per delivery: the swap
+            # detaches them from ``info`` irrevocably, a per-delivery await makes
+            # every one after the first a cancellation point, and
+            # ``CancelledError`` is not an ``Exception`` -- so a shutdown landing
+            # mid-batch would discard the rest with nothing holding them, and each
+            # unwritten tombstone is a folder restart reconciliation admits, i.e. a
+            # duplicate completion. The batch carries each delivery's own elapsed
+            # and credits, so the tombstone still records the run's terminal usage.
+            await asyncio.to_thread(
+                settle_delivered_batch, tuple(deliveries), writer=mark_delivered
+            )
+        except Exception:
+            logger.debug("Failed to settle held subagents %s", deliveries, exc_info=True)

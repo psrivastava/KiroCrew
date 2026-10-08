@@ -11,9 +11,9 @@ end-to-end subsystem (install pipeline, validation, routes, security model).
 ## The rule for contributors
 
 **Pack manifest versioning:** every `theme.json` MUST declare
-`"formatVersion": 1` (integer). KiroCrew rejects packs with a missing value or
+`"formatVersion": 1` (integer). Kiro Crew rejects packs with a missing value or
 an unknown major with an explicit "this pack requires a newer version of
-KiroCrew" error. Author against the current major; breaking manifest changes
+Kiro Crew" error. Author against the current major; breaking manifest changes
 bump it.
 
 **Every new UI element MUST be themable at least at the color layer.** Style it
@@ -71,15 +71,50 @@ surface that sits directly on the page and has no `border`, `ring`, or `shadow`
 paints nothing visible there — it "works" in every other theme and ships invisible
 in that one, with no gate failing. The rule for a new component: a `bg-card` box on
 `--bg` gets a `border-border`, a `ring-1 ring-border`, or a `shadow-*`, the way the
-top-bar search field and the settings cards already do. The three surfaces that
-deliberately stay borderless (the user bubble, the two top-bar capsules) are
-handled by kiro-light-scoped hooks in `index.css`, and
+settings cards already do. The one surface that deliberately stays borderless (the
+user bubble) is handled by a kiro-light-scoped hook in `index.css`, and
 `src/test/kiroLightShellHooks.test.ts` pins that list; a new borderless card is a
-fourth hook there, not an unmarked exception. The inverse holds too: a `bg-bg`
+second hook there, not an unmarked exception. A Liquid Glass pane (`components/Glass.tsx`,
+below) is not one: the top bar's search trigger, readout capsule and Request a Feature
+pill are glass, and the material draws its own lit edge on every canvas. The inverse
+holds too: a `bg-bg`
 well nested inside a `bg-card` container is the same pair of values seen from the
 other side, so a code or output block that relies on the well being darker than its
 card gets the same `border-border` — and a `hover:bg-card` on a row that sits on
 the page is not a hover at all in this theme; hover states use `bg-bg-hover`.
+
+**Polarity-fixed variables are not roles.** A few `index.css` variables are read
+from `data-mode` (the polarity `useTheme` paints), not from the theme, and a pack
+cannot override them: `--glass-tint`, `--glass-band`,
+`--glass-edge` and `--glass-hairline` — the fill, the top/bottom light bands, the
+side-line / in-pane-divider hairline, and the half-pixel dark sliver outside each
+lit band (none has a focus form: a pane looks the same whether or not a control
+inside it has focus) that
+the Liquid Glass surfaces (the composer dock and everything in it, the mobile
+Settings search capsule, the session list's and the crew roster's search field,
+the top bar's search trigger, readout capsule and Request a Feature pill)
+lay over their blurred backdrop (the pane draws no ring:
+lit top and bottom, a line down each side). The tint is a ladder of five
+thicknesses, `--glass-tint-ultrathin` / `-thin` / `-regular` / `-thick` /
+`-ultrathick`, each a polarity-fixed `rgba()`: a pane picks one with the
+`thickness` prop on `components/Glass.tsx`, which puts `glass-<step>` on the
+host, and that class sets `--glass-tint` (what the primitive paints) and
+`--glass-tint-step` (the step's plain tint). Blur moves with it (2 / 4 / 8 / 14 /
+28px, owned by `Glass.tsx`), so a thickness is one material step, never a blur or
+an alpha chosen at a call site; `thin` is the default and the pre-ladder recipe.
+The colours are tuned so a pane over the plain page keeps one overall colour
+across the ladder (light `#f8f8f8` over white): the tint whitens as the alpha
+rises. The hue modifiers `glass-accent` / `glass-warn` / `glass-danger` /
+`glass-hover` / `glass-faded` (the picked chip, the incognito chip, the offline
+readout capsule, a hovered pane, a receding row) mix into `--glass-tint-step` on
+the host, so they land on the pane's own thickness and follow the polarity too.
+And
+the `--tile-*` set behind the Settings section icons. They are fixed on purpose —
+the glass must read as a lit pane on any light palette and as smoked glass on any
+dark one, and a section's tile is an identity mark that must look the same in
+every theme — the same reasoning as the neutral `glass-shadow` rest shadow. Adding one
+of these takes a `:root` line plus a `[data-mode="light"]` line and no allowlist
+work; adding a color a pack should be able to change takes the role path below.
 
 ## Adding a new color role
 
@@ -96,7 +131,7 @@ Both sides are checked from Python: in `test/test_theme_css_security.py`,
 `TestAllowlistParity` parses `ALLOWED_CSS_VARS` out of `themeCss.ts` and
 asserts set equality with the backend `_THEME_CSS_VARS_SET`;
 `TestCssVarsSetSync` asserts the required roles and the shadow roles are in the
-backend set and that an unknown name is not, and `TestThemeVarsFilter` asserts the
+backend set and that an unknown name is not, and `TestStripToAllowedVars` asserts the
 filter keeps known keys, drops unknown ones, and drops unsafe values. The CSS
 parsers on the two sides are pinned against each other by a shared fixture,
 `test/fixtures/theme_css_corpus.json`: `test/test_theme_install.py`
@@ -146,13 +181,10 @@ that mode actually renders. Where a mode NAME travels beside the palette, keep
 both in one memoized value so they cannot be read independently
 (`McpAppFrame`'s `themeSnapshot`).
 
-Six sites still key on the three-dep spelling and are **not** fixed here — find
-them with `grep -rn '\[theme, colorTheme, themeVersion\]' src/`, which lists
-`components/WidgetFrame.tsx`, `components/ArtifactBody.tsx`,
-`components/library/ArtifactThumbs.tsx`, `pages/ArtifactDetailPage.tsx` and
-`pages/RemoteArtifactDetailPage.tsx`, plus `hooks/useSessionPalette.ts` (a
-`useLayoutEffect` on `[themeMode, colorTheme, themeVersion]`, same ordering). A
-grep rather than line numbers on purpose: a cited line goes stale silently, and
+Some sites still key on the three-dep spelling and are **not** fixed here — find
+them with `grep -rn '\[theme, colorTheme, themeVersion\]' src/`, plus
+`hooks/useSessionPalette.ts`, which spells it `[themeMode, colorTheme, themeVersion]`
+(a `useLayoutEffect`, same ordering). A grep rather than a list on purpose: a cited line goes stale silently, and
 the dep array IS the defect, so the pattern is the honest locator. Each takes an
 extra early read that the `themeVersion` re-read then corrects, and none pairs a
 mode name into a wire payload, so the residue is a transient frame rather than a
@@ -220,7 +252,7 @@ The backend serves only validated files from the installed pack, and the label i
 trimmed to 48 printable characters. When an asset or label is absent, the shell
 falls back independently to its configured Kiro Crew branding. Compiled edition
 branding registered through `registerThemeBranding()` has precedence over an
-installed pack.
+installed pack. `useShellBranding` in `src/shell/branding.ts` owns that order.
 
 ## Fonts
 
@@ -247,11 +279,13 @@ Settings → Display → **Font Family** reads through them:
 | Sans | the pack's `sans` face, else Kiro Crew's own proportional stack |
 | Mono | the pack's `mono` face, else Kiro Crew's own monospace stack |
 | System | the OS face — no token, so a pack cannot reach the body font here |
+| OpenDyslexic | the bundled OpenDyslexic stack — no token, so a pack cannot take this accessibility choice away; it supplies its own monospace face too |
+| Custom | the family the user types (`resolveCustomFontFamily`), bypassing the pack's sans token |
 
 `--mono` reads the mono token too, so code blocks, inline code and diffs follow a
 pack's monospace face without the user having to switch the whole UI to
-monospace. That applies under every option, System included — System governs the
-body font, not the code font. The terminal is separate: it reads its family from a
+monospace. That applies under every option except OpenDyslexic, System included —
+System governs the body font, not the code font. The terminal is separate: it reads its family from a
 Settings field, not from CSS, so a pack never changes it.
 
 **`overrides.css` must not declare a font.** Declaring `--font-body`, `--mono`,
@@ -273,8 +307,8 @@ what to change.
 
 An L1 pack's `overrides.css` may only target the surfaces below. This is the list
 that the source comments citing this file point at, and it is the runtime
-boundary, not a style suggestion: `_scopeOverridesCss` in
-`src/hooks/useTheme.tsx` DROPS every rule whose selector group does not pass, so a
+boundary, not a style suggestion: `scopeOverridesCss` in
+`src/hooks/themeCss.ts` DROPS every rule whose selector group does not pass, so a
 rule aimed at anything else never reaches the document.
 
 **Six class hooks** (`_ALLOWED_CLASSES`):
@@ -283,10 +317,10 @@ rule aimed at anything else never reaches the document.
 |---|---|
 | `topbar` | the header shell (`App.tsx`) |
 | `sidebar` | the conversation-list cards: the chat session list (`ChatSidebar.tsx`) and the Crew Members roster (`members/MembersPage.tsx`), both via `LIST_SHELL_CLS` in `components/listShell.ts` |
-| `chat-container` | the chat scroll region (`ChatPane.tsx`, `ChatPage.tsx`) |
+| `chat-container` | the chat scroll region (`pages/chat/TranscriptScrollShell.tsx`) |
 | `message-bubble` | a user or assistant turn (`chat/UserMessage.tsx`, `chat/AssistantMessage.tsx`) |
 | `input-area` | the composer (`ChatInput.tsx`) |
-| `code-block` | a rendered fenced block (`CodeBlock.tsx`, `MonacoCodeBlock.tsx`) |
+| `code-block` | a rendered fenced block (`CodeBlock.tsx`) |
 
 Do not rename or drop one of these classes when refactoring the component that
 carries it. There is no compiler reference to break, so the only signal is a
@@ -395,9 +429,11 @@ from your pool (never repeating the set it replaces or the other layer). Supply 
 least 4; more gives more variety. You inherit the cross-fade, the cascade timing
 and the reduced-motion handling for free.
 
-**`loader`** replaces the whole indicator with your component: a mascot
-animation, a progress bar, a canvas, anything. It renders with no wrapper beyond
-the footer's padding, so it owns its size, layout and motion. Keep it small (the
+**`loader`** fills the indicator's artwork slot with your component: a mascot
+animation, a progress bar, a canvas, anything. `ChatFooter` renders it inside its
+`role="status"` wrapper, followed by the localized "Thinking" label, which is
+screen-reader-only while the art paints and becomes visible when the art fails or the
+loader throws. Your component owns its size, layout and motion. Keep it small (the
 band is ~32px tall), mark it `aria-hidden` (it is decorative), and honour
 `prefers-reduced-motion` yourself.
 

@@ -21,6 +21,7 @@ import ChatMessageList, { type VirtualTranscriptHandle } from './ChatMessageList
 import ErrorNotice from '../components/ErrorNotice'
 import { JumpToBottomButton } from './ChatScrollChrome'
 import FollowUpBar from '../components/FollowUpBar'
+import ChatFooter from '../pages/chat/ChatFooter'
 import { deriveFollowUpOptions } from './protocol'
 import { useComposerDraft } from './useComposerDraft'
 import { useAppApi } from './index'
@@ -67,6 +68,16 @@ export interface ChatEmbedProps {
    * fixed offset that breaks whenever the composer's height changes.
    */
   aboveComposer?: ReactNode
+  /**
+   * Cap for the composer's auto-grow, in px. The textarea grows with the draft
+   * up to this height, then keeps it and scrolls. Defaults to the shared
+   * `useComposerDraft` cap (240px), which suits a full-height page but not a
+   * host that boxes the embed at a fixed height: there a maxed-out draft takes
+   * most of the box and the transcript above it is squeezed to a few lines. A
+   * fixed-height host passes a proportion of its own box here; the resting
+   * (empty) size is unaffected. Omitted, behaviour is unchanged.
+   */
+  composerMaxHeight?: number
 }
 
 /** Stable empty transcript. A fresh `[]` fallback would be a new identity on every
@@ -89,8 +100,24 @@ interface ChatSlotData {
 export const EMBED_PAGE_LIMIT = 200
 /** The handler clamps `limit` here; a wider ask is silently this. */
 export const EMBED_PAGE_LIMIT_MAX = 500
+/** Poll cadence while the slot runs (see the query's `refetchInterval`). */
+const RUNNING_POLL_MS = 1000
+/** How long a streaming reply must stay unchanged before the working indicator
+ *  takes over from the reply's own caret. The tail only grows once per poll,
+ *  so the window spans two polls: one slow read must not flash the indicator
+ *  under a reply that is still arriving. */
+export const EMBED_STREAM_IDLE_MS = RUNNING_POLL_MS * 2 + 500
 
-function ChatEmbed({ slotKey, agent, placeholder, frameless, startAtBottom, onSend, aboveComposer }: ChatEmbedProps) {
+function ChatEmbed({
+  slotKey,
+  agent,
+  placeholder,
+  frameless,
+  startAtBottom,
+  onSend,
+  aboveComposer,
+  composerMaxHeight,
+}: ChatEmbedProps) {
   const api = useAppApi()
   const lastHashRef = useRef('')
   // The transcript is ChatMessageList's virtualized mount: it owns the scroller
@@ -135,7 +162,7 @@ function ChatEmbed({ slotKey, agent, placeholder, frameless, startAtBottom, onSe
       prevQuery && (prevQuery.queryKey as unknown[])[1] === slotKey ? prev : undefined,
     refetchInterval: (query) => {
       const running = query.state.data?.running ?? false
-      return running ? 1000 : 5000
+      return running ? RUNNING_POLL_MS : 5000
     },
   })
 
@@ -170,30 +197,7 @@ function ChatEmbed({ slotKey, agent, placeholder, frameless, startAtBottom, onSe
   /** Derived from the same helper the main chat and side panel use, so "options only
    *  after the answer settles" and "a later user message clears them" behave identically
    *  here too — an agent's follow-up choices should never be silently dropped just
-   *  because the surface embedding them is thinner.
-   *
-   *  `followUpIsPlan` is DELIBERATELY dropped here (#6057): this embed is not a
-   *  plan-capable host, so a plan-shaped chip stays on the composer-draft path
-   *  instead of dispatching POST /api/chat/slots/{slot}/plan-action. Why that is
-   *  a recorded exclusion rather than a live mis-dispatch:
-   *  - The slot-detail payload this embed polls carries no `mode` field, so the
-   *    embed structurally lacks the orchestrator-mode gate the dispatch path
-   *    requires (ChatPane/ChatPage read the slot record's mode before
-   *    dispatching; there is no equivalent source here).
-   *  - Exposure is narrow: `api_chat_slot_detail` runs
-   *    `_deny_cross_app_slot_access`, so an app-token embed 404s on any foreign
-   *    or unscoped slot. That proves "not another surface's slot", not "never a
-   *    plan-bearing slot" — an app could create and embed its own
-   *    orchestrator-mode slot, which is exactly why the missing mode field
-   *    above, not the ownership guard, carries the exclusion.
-   *  - On hosts that DO dispatch, the `isPlanAction` allowlist keeps
-   *    non-protocol plan-shaped labels on the composer path; this file never
-   *    consults it because it never dispatches.
-   *  SideChat makes the same exclusion, silently — it also destructures only
-   *  `followUpOptions`, with no record there. If dashboard-token embeds ever
-   *  need working plan chips, the parity option is wiring `usePlanActionMutation`
-   *  plus a mode source into this file — a product decision, not an oversight.
-   *  Pinned by the plan-exclusion test in src/test/ChatEmbed.test.tsx. */
+   *  because the surface embedding them is thinner. */
   const { followUpOptions } = useMemo(
     () => deriveFollowUpOptions(messages, running),
     [messages, running]
@@ -203,7 +207,7 @@ function ChatEmbed({ slotKey, agent, placeholder, frameless, startAtBottom, onSe
    *  see useComposerDraft's own docs. Picking a follow-up option edits the draft
    *  (matching every other surface) instead of sending immediately. */
   const { draft, setDraft, textareaRef, picked, toggleOption, composition, submitOnEnter } =
-    useComposerDraft({ followUpOptions })
+    useComposerDraft({ followUpOptions, maxHeight: composerMaxHeight })
 
   // startAtBottom follow is owned by the virtualizer behind ChatMessageList.
   // Non-startAtBottom embeds keep the message-arrival smooth scroll: it fires
@@ -357,6 +361,20 @@ function ChatEmbed({ slotKey, agent, placeholder, frameless, startAtBottom, onSe
           ) : messages.length === 0 && !running ? (
             <div className="text-center text-muted text-[13px] py-10">{i18nT('appSdk.chatEmbed.session_ready_type_a_message_to_start')}</div>
           ) : undefined,
+          // The main chat's working indicator (ChatFooter, shared with ChatPage
+          // and ChatPane), after the last row, so a running turn reads as "the
+          // reply is coming" where the reply will land. The poll carries no
+          // stop or compaction state, so only the plain running branch applies.
+          belowRows: (
+            <ChatFooter
+              running={running}
+              stopping={false}
+              state={running ? 'streaming' : ''}
+              lastRole={tail?.role ?? ''}
+              streamTick={tail?.role === 'streaming' ? (tail.content?.length ?? 0) : 0}
+              streamIdleMs={EMBED_STREAM_IDLE_MS}
+            />
+          ),
         }}
       />
 
@@ -385,7 +403,7 @@ function ChatEmbed({ slotKey, agent, placeholder, frameless, startAtBottom, onSe
           rows={1}
           {...composition}
           aria-label={i18nT('appSdk.chatEmbed.chat_message')}
-          className="flex-1 min-w-0 min-h-[38px] resize-none overflow-y-auto px-3 py-2 text-sm bg-bg-elevated border border-border rounded-md text-text outline-hidden focus-visible:border-accent transition-colors"
+          className="flex-1 min-w-0 min-h-[38px] resize-none overflow-y-auto px-3 py-2 mc-message-font-text bg-bg-elevated border border-border rounded-md text-text outline-hidden focus-visible:border-accent transition-colors"
           value={draft}
           onChange={e => setDraft(e.target.value)}
           onKeyDown={e => submitOnEnter(e, () => send())}

@@ -23,7 +23,7 @@ import pytest
 
 from conftest import absent_sysconf
 from kiro_crew import subagent as sa
-from kiro_crew.subagent import SubagentInfo, SubagentManager
+from kiro_crew.subagent import SubagentDelivery, SubagentInfo, SubagentManager
 
 # ── Fixtures / builders ───────────────────────────────────────────────────
 
@@ -391,6 +391,10 @@ class TestCgroupAvailable:
         v2 = PurePosixPath("/sys/fs/cgroup")
         v1 = PurePosixPath("/sys/fs/cgroup/memory")
         monkeypatch.setattr(sa, "_cgroup_memory_roots", lambda: [(v2, v2, True), (v1, v1, False)])
+        # These cases fabricate only the limit/usage files; the page-cache read
+        # goes through ``open`` and would otherwise see the runner's real
+        # /sys/fs/cgroup/memory.stat.
+        monkeypatch.setattr(sa, "_read_inactive_file_bytes", lambda directory, v2: 0)
 
     def _reader(self, values: dict[str, int | None]):
         return lambda path: values.get(path)
@@ -693,46 +697,6 @@ class TestCompletionKeepSetter:
         assert (mgr._completion_keep, mgr._completion_keep_chars) == ("tail", 1234)
 
 
-class TestApprovalLogging:
-    @pytest.mark.asyncio
-    async def test_approve_logs_auto_when_reason_present(self) -> None:
-        client = AsyncMock()
-        event = SimpleNamespace(title="read", tool_kind="fs")
-        with patch.object(sa, "sel") as sel_mock:
-            await SubagentManager._approve_and_log(
-                client, "req-1", "subagent:a1", event, metadata={"reason": "allowlisted"}
-            )
-        client.approve_tool.assert_awaited_once_with("req-1")
-        assert sel_mock().log_tool_invocation.call_args.kwargs["outcome"] == "auto_approved"
-
-    @pytest.mark.asyncio
-    async def test_approve_logs_plain_without_reason(self) -> None:
-        client = AsyncMock()
-        event = SimpleNamespace(title="read", tool_kind="fs")
-        with patch.object(sa, "sel") as sel_mock:
-            await SubagentManager._approve_and_log(client, 2, "subagent:a1", event)
-        assert sel_mock().log_tool_invocation.call_args.kwargs["outcome"] == "approved"
-
-    @pytest.mark.asyncio
-    async def test_reject_logs_denied_with_error(self) -> None:
-        client = AsyncMock()
-        event = SimpleNamespace(title="write", tool_kind="fs")
-        with patch.object(sa, "sel") as sel_mock:
-            await SubagentManager._reject_and_log(
-                client, 3, "subagent:a1", event, error="policy denied"
-            )
-        client.reject_tool.assert_awaited_once_with(3)
-        assert sel_mock().log_tool_invocation.call_args.kwargs["outcome"] == "denied"
-
-    @pytest.mark.asyncio
-    async def test_reject_logs_rejected_without_error(self) -> None:
-        client = AsyncMock()
-        event = SimpleNamespace(title="write", tool_kind="fs")
-        with patch.object(sa, "sel") as sel_mock:
-            await SubagentManager._reject_and_log(client, 4, "subagent:a1", event)
-        assert sel_mock().log_tool_invocation.call_args.kwargs["outcome"] == "rejected"
-
-
 # ── Manager: orphan / pid helpers ─────────────────────────────────────────
 
 
@@ -754,13 +718,15 @@ class TestPidHelpers:
         with patch.object(os, "stat", return_value=SimpleNamespace(st_ctime=500.0)):
             assert SubagentManager._is_orphan_process(4242, 100.0) is False
 
-    def test_kill_orphan_swallows_missing_process(self) -> None:
+    @pytest.mark.asyncio
+    async def test_kill_orphan_swallows_missing_process(self) -> None:
         with patch.object(sa.platform_compat, "kill_pid", side_effect=ProcessLookupError):
-            SubagentManager._kill_orphan_pid(4242)  # must not raise
+            await SubagentManager._kill_orphan_pid(4242)  # must not raise
 
-    def test_kill_orphan_calls_platform_kill(self) -> None:
+    @pytest.mark.asyncio
+    async def test_kill_orphan_calls_platform_kill(self) -> None:
         with patch.object(sa.platform_compat, "kill_pid") as kill:
-            SubagentManager._kill_orphan_pid(4242)
+            await SubagentManager._kill_orphan_pid(4242)
         assert kill.call_args[0][0] == 4242
 
 
@@ -961,7 +927,7 @@ class TestRecordCost:
         info.peak_cpu_cores = 0.75
         with patch.object(sa, "append_cost_sample") as append:
             mgr._record_cost(info)
-        append.assert_called_once_with("scout", 1.5, 0.75)
+        append.assert_called_once_with("scout", 1.5, 0.75, shared=False, settled_gb=0.0)
 
     def test_store_failure_is_swallowed(self) -> None:
         mgr = _manager()
@@ -1105,12 +1071,20 @@ class TestReadSurfaces:
         sampled.last_rss_gb = 0.5
         sampled.peak_rss_gb = 0.75
         sampled.last_cpu_cores = 1.234
-        mgr._agents.update({"fresh": fresh, "sampled": sampled})
+        sampled._rss_samples = 1
+        # A respawned run: the peak survives from the dead process, but THIS
+        # process has not been measured yet, so it must render as unmeasured
+        # rather than as "0 MB resident".
+        respawned = _info("respawned", parent_session_key="dash:1")
+        respawned.peak_rss_gb = 0.75
+        mgr._agents.update({"fresh": fresh, "sampled": sampled, "respawned": respawned})
         rows = {r["id"]: r for r in mgr.task_memory_rows()}
         assert rows["fresh"]["sampled"] is False
         assert rows["sampled"]["sampled"] is True
         assert rows["sampled"]["rss_mb"] == pytest.approx(512.0)
         assert rows["sampled"]["cpu_cores"] == pytest.approx(1.23)
+        assert rows["respawned"]["sampled"] is False
+        assert rows["respawned"]["rss_mb"] == 0.0
 
     def test_task_memory_rows_carry_proc_and_stub_counts(self) -> None:
         """The regression this fixes: the fields were absent, so the Sessions
@@ -1132,6 +1106,21 @@ class TestReadSurfaces:
         mgr._agents["done"] = _info("done", done=True)
         mgr._agents["queued"] = _info("queued", queued=True)
         assert mgr.task_memory_rows() == []
+
+    def test_task_memory_rows_carry_the_key_a_child_names_as_parent(self) -> None:
+        """The System Sessions table nests a nested run under its parent
+        task by matching the child's ``parent`` to this key. A continued run
+        keeps ``subagent:<original>``, so the key is NOT always ``subagent:<id>``."""
+        mgr = _manager()
+        mgr._agents["fresh"] = _info("fresh", parent_session_key="dash:1")
+        mgr._agents["cont"] = _info(
+            "cont", parent_session_key="dash:1", conversation_key="subagent:orig"
+        )
+        mgr._agents["kid"] = _info("kid", parent_session_key="subagent:orig")
+        rows = {r["id"]: r for r in mgr.task_memory_rows()}
+        assert rows["fresh"]["session_key"] == "subagent:fresh"
+        assert rows["cont"]["session_key"] == "subagent:orig"
+        assert rows["kid"]["parent"] == rows["cont"]["session_key"]
 
     def test_task_memory_rows_redact_before_truncate(self) -> None:
         """A credential straddling the 80-char cut must not leak a fragment.
@@ -1189,7 +1178,7 @@ class TestReadSurfaces:
         mgr._report_tasks = {report}
         mgr._followup_watchers = {"run": followup}
         mgr._reconcile_task = reconcile
-        mgr._abandoned_state_writers = {"state-writer"}
+        mgr._abandoned_state_writers = {"state-writer": {report}}
         try:
             # queue + recovery + report + follow-up + reconciliation + writer
             assert mgr.pending_work_count == 6
@@ -1366,7 +1355,8 @@ class TestNotifyInjectionFailed:
         """Skipping the delivery also releases what the run was holding.
 
         Leaving ``_digest_held_at`` set would let the next expiry sweep arm the flush
-        this run's own suppression exists to prevent, and leaving ``_digest_settle_ids``
+        this run's own suppression exists to prevent, and leaving
+        ``_digest_settle_deliveries``
         on the record would leave its held siblings with an ungated delivery. The
         siblings are marked, not tombstoned: their results never reached a parent, so
         orphan reconciliation must still be able to find them.
@@ -1375,7 +1365,10 @@ class TestNotifyInjectionFailed:
         info = _info(parent_session_key="dash:1")
         info.done = False
         info._digest_held_at = 1.0
-        info._digest_settle_ids = ["sib-1", "sib-2"]
+        info._digest_settle_deliveries = [
+            SubagentDelivery("sib-1", 1.0, 0.1),
+            SubagentDelivery("sib-2", 2.0, 0.2),
+        ]
         mgr._agents[info.id] = info
         mgr._teardown_cancelled_ids.add(info.id)
 
@@ -1387,7 +1380,7 @@ class TestNotifyInjectionFailed:
         )
 
         assert info._digest_held_at == 0.0
-        assert info._digest_settle_ids == []
+        assert info._digest_settle_deliveries == []
         assert "sib-1" in mgr._teardown_cancelled_ids
         assert "sib-2" in mgr._teardown_cancelled_ids
         mgr._on_done.assert_not_awaited()
@@ -1558,11 +1551,12 @@ class TestNotifyInjectionFailed:
 class TestInjectionNoticeOutcome:
     """The pure helper maps a terminal record to a truthful outcome line."""
 
-    def test_completed_keeps_the_finished_copy(self) -> None:
+    def test_completed_states_the_outcome_without_a_mechanism(self) -> None:
         info = _info(done=True, result="ok")
-        assert sa._injection_notice_outcome(info) == (
-            "The agent finished but result delivery timed out."
-        )
+        line = sa._injection_notice_outcome(info)
+        assert line == "The agent finished, but its result could not be delivered."
+        # The cause belongs to ``reason``, printed on the line above this one.
+        assert "timed out" not in line
 
     def test_failed_run_does_not_claim_finished(self) -> None:
         info = _info(done=True, error="Timed out after 30 minutes", _exec_started=123.0)
@@ -1611,6 +1605,79 @@ class TestInjectionNoticeOutcome:
         assert sa._injection_notice_outcome(info) == (
             "The agent failed before a result could be delivered."
         )
+
+
+class TestInjectionNoticeDoesNotContradictItsReason:
+    """A completed run's outcome line must not name a mechanism.
+
+    ``notify_injection_failed`` prints ``reason`` one line above the outcome
+    line, and most of its callers pass something that is not a timeout:
+    ``slack/gateway.py`` sends "provider dead after prompt-busy retries",
+    "ACP process died", a raw ``str(exception)`` from a failed injection turn,
+    and the last injection-failure reason after the attempt cap. A completed
+    branch that asserts "delivery timed out" contradicts every one of them, in
+    a message whose reader is the LLM deciding what to do next.
+    """
+
+    #: The reasons the four non-timeout call sites actually pass, verbatim.
+    NON_TIMEOUT_REASONS = [
+        "provider dead after prompt-busy retries",
+        "ACP process died",
+        "AcpError: stream closed while waiting for result",
+        "no active session for parent",
+    ]
+
+    async def _notice_for(self, info: SubagentInfo, reason: str) -> str:
+        seen: list[dict] = []
+
+        async def _on_event(_etype: str, _info: SubagentInfo, extra: dict) -> None:
+            seen.append(extra)
+
+        mgr = _manager(on_event=_on_event)
+        with patch("kiro_crew.dashboard.chat_utils.dashboard_slot_key", return_value="slot-1"):
+            mgr.notify_injection_failed(info, reason=reason)
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert seen, "expected a subagent_injection_failed event"
+        return str(seen[0]["failure_msg"])
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("reason", NON_TIMEOUT_REASONS)
+    async def test_a_non_timeout_reason_is_not_overridden_by_the_outcome_line(
+        self, reason: str
+    ) -> None:
+        info = _info(parent_session_key="dash:1", done=True, result="ok", _exec_started=123.0)
+        msg = await self._notice_for(info, reason)
+        assert reason in msg, "the caller's reason must still be shown"
+        assert (
+            "timed out" not in msg
+        ), f"the notice says the delivery timed out while its own reason says {reason!r}"
+        assert "The agent finished, but its result could not be delivered." in msg
+
+    @pytest.mark.asyncio
+    async def test_a_real_timeout_still_reads_as_one(self) -> None:
+        """Neutral copy loses nothing: the timeout callers say so in ``reason``."""
+        info = _info(parent_session_key="dash:1", done=True, result="ok", _exec_started=123.0)
+        msg = await self._notice_for(info, "injection timed out after 300s")
+        assert "injection timed out after 300s" in msg
+        assert "The agent finished, but its result could not be delivered." in msg
+
+    @pytest.mark.asyncio
+    async def test_the_result_recovery_hint_still_agrees_with_the_line(self) -> None:
+        """ "could not be delivered" must not read as "there is nothing to read":
+        when a result file exists the notice still points at it."""
+        info = _info(
+            parent_session_key="dash:1",
+            done=True,
+            result="ok",
+            result_path="/tmp/subagent-result.txt",
+            _exec_started=123.0,
+        )
+        with patch("os.path.getsize", return_value=42):
+            msg = await self._notice_for(info, "ACP process died")
+        assert "The agent finished, but its result could not be delivered." in msg
+        assert "/tmp/subagent-result.txt" in msg
+        assert "Use the read tool" in msg
 
 
 class TestNotifyInjectionFailedOutcomeCopy:
@@ -1667,7 +1734,7 @@ class TestNotifyInjectionFailedOutcomeCopy:
         assert "finished" not in msg
 
     @pytest.mark.asyncio
-    async def test_post_run_delivery_timeout_keeps_existing_copy_and_hint(
+    async def test_post_run_delivery_failure_keeps_the_completed_copy_and_hint(
         self, tmp_path: Path
     ) -> None:
         result = tmp_path / "result.txt"
@@ -1676,7 +1743,7 @@ class TestNotifyInjectionFailedOutcomeCopy:
             parent_session_key="dash:1", done=True, result="hello", result_path=str(result)
         )
         msg = await self._notice_for(info)
-        assert "The agent finished but result delivery timed out." in msg
+        assert "The agent finished, but its result could not be delivered." in msg
         assert "Result saved at" in msg
 
 
@@ -1830,21 +1897,24 @@ class TestReleaseConversation:
 
 
 class TestSweepConversations:
-    def test_fresh_conversation_kept(self) -> None:
+    @pytest.mark.asyncio
+    async def test_fresh_conversation_kept(self) -> None:
         mgr = _manager()
         mgr._conversations["subagent:c1"] = 1000.0
-        mgr._sweep_conversations(now=1001.0)
+        await mgr._sweep_conversations_async(now=1001.0)
         assert "subagent:c1" in mgr._conversations
 
-    def test_busy_conversation_refreshed_not_released(self) -> None:
+    @pytest.mark.asyncio
+    async def test_busy_conversation_refreshed_not_released(self) -> None:
         mgr = _manager()
         mgr._conversations["subagent:c1"] = 0.0
         mgr._agents["c1"] = _info("c1")
         now = float(sa._CONVERSATION_TTL_SECS * 3)
-        mgr._sweep_conversations(now=now)
+        await mgr._sweep_conversations_async(now=now)
         assert mgr._conversations["subagent:c1"] == now
 
-    def test_expired_conversation_released(self) -> None:
+    @pytest.mark.asyncio
+    async def test_expired_conversation_released(self) -> None:
         mgr = _manager()
         mgr._conversations["subagent:c1"] = 0.0
         mgr._sessions.forget_conversation.return_value = "sid-1"
@@ -1852,7 +1922,7 @@ class TestSweepConversations:
             patch.object(sa, "update_state"),
             patch.object(sa, "_cleanup_session_files_sync"),
         ):
-            mgr._sweep_conversations(now=float(sa._CONVERSATION_TTL_SECS * 3))
+            await mgr._sweep_conversations_async(now=float(sa._CONVERSATION_TTL_SECS * 3))
         assert "subagent:c1" not in mgr._conversations
 
 
@@ -2122,29 +2192,33 @@ class TestAnnounceDigestFlush:
     async def test_settles_holds_after_clean_handoff(self) -> None:
         mgr = _manager(on_done=AsyncMock())
         info = _info(batch_id="w1")
-        info._digest_settle_ids = ["m1", "m2"]
+        info._digest_settle_deliveries = [
+            SubagentDelivery("m1", 1.0, 0.1),
+            SubagentDelivery("m2", 2.0, 0.2),
+        ]
         with patch.object(sa, "mark_delivered") as mark:
             await mgr._announce_digest_flush(info)
         assert [c[0][0] for c in mark.call_args_list] == ["m1", "m2"]
-        assert info._digest_settle_ids == []
+        assert info._digest_settle_deliveries == []
 
     @pytest.mark.asyncio
     async def test_routing_failure_leaves_holds_unsettled(self) -> None:
         mgr = _manager(on_done=AsyncMock(side_effect=RuntimeError("route down")))
         info = _info(batch_id="w1")
-        info._digest_settle_ids = ["m1"]
+        info._digest_settle_deliveries = [SubagentDelivery("m1", 1.0, 0.1)]
         with patch.object(sa, "mark_delivered") as mark:
             await mgr._announce_digest_flush(info)
         mark.assert_not_called()
-        assert info._digest_settle_ids == ["m1"]
+        assert [d.agent_id for d in info._digest_settle_deliveries] == ["m1"]
 
-    def test_settle_swallows_tombstone_failure(self) -> None:
+    @pytest.mark.asyncio
+    async def test_settle_swallows_tombstone_failure(self) -> None:
         mgr = _manager()
         info = _info()
-        info._digest_settle_ids = ["m1"]
+        info._digest_settle_deliveries = [SubagentDelivery("m1", 1.0, 0.1)]
         with patch.object(sa, "mark_delivered", side_effect=OSError):
-            mgr._settle_digest_holds(info)
-        assert info._digest_settle_ids == []
+            await mgr._settle_digest_holds(info)
+        assert info._digest_settle_deliveries == []
 
 
 class TestAnnounceRejection:

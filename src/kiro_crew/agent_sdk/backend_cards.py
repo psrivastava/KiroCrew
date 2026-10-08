@@ -1,6 +1,6 @@
 """What each harness can do, projected from the memberships it already declared.
 
-The Developer > Agent Backend switch asks one question this module answers: what
+The Settings > Agent Harness switch asks one question this module answers: what
 does an operator lose or gain by picking this harness rather than that one? Every
 answer here is a PROJECTION over :mod:`kiro_crew.agent_sdk.backends` -- the
 capability sets, :data:`~kiro_crew.agent_sdk.backends.ACP_BACKEND_ROUTING`, and
@@ -17,9 +17,10 @@ projection, and a ``frozenset`` is why they are only two: it carries one bit -- 
 or out -- so nothing about a non-member is legible in the source data, and three
 reasons a reader wants told apart collapse into one absence: cannot do it, does it
 differently, and nobody has measured it. ``ACP_BACKENDS_MEMBER_DISPATCH`` shows the
-collapse: codex is a non-member because, in the set's own words, "what is missing is
-a DECISION, not a mechanism", opencode is a non-member on the same words, and KAS is
-a member on a captured mount.
+collapse: pi is a non-member because a mount there is INERT (the array is accepted
+and never forwarded), deepseek is a non-member on H6 -- it has the mount and, since
+Crew's gate plugin, an enforced routing, but no member-dispatch decision has been
+taken for that harness -- and KAS is a member on a captured mount.
 
 The third level is NOT derived from the sets, because it is not in them. It is
 :data:`DECLARED_UNMEASURED`, a per-harness per-line table carrying a reason per
@@ -28,9 +29,9 @@ deliberate exception to the rule the rest of the file keeps, taken for the one f
 the rule cannot reach: "nobody has driven this yet" is a statement about Crew's own
 EVIDENCE rather than about the harness, it exists today only as prose in a set's
 comment, and no bit anywhere carries it. So the alternative to declaring it is not
-deriving it: it is a two-level card, where ``ACP_BACKENDS_COMPACT`` excludes pi and
-goose for want of a driven capture ("both are unclassified", in the set's own words)
-and that exclusion wears the same mark as a harness with no compaction surface at
+deriving it: it is a two-level card, where ``ACP_BACKENDS_COMPACT`` excludes pi for
+want of a driven capture ("pi is unclassified", in the set's own words) and that
+exclusion wears the same mark as a harness with no compaction surface at
 all. Those two answers are not one answer, and a reader of two levels cannot see
 which cell a measurement would pay for.
 
@@ -41,9 +42,10 @@ projection exists to remove:
   says the gap is evidence. ``test_backend_cards`` reads that comment and fails an
   entry the vocabulary does not support, so the table cannot drift away from the
   prose and the threshold is a gate rather than a convention to remember;
-* "a decision is missing" is not this state. codex and opencode have no member
-  dispatch because nobody decided to mount session control into their threads, so
-  the feature does not work today and NOT AVAILABLE is the true mark. Unmeasured is
+* "a decision is missing" is not this state. deepseek has no member dispatch because
+  no decision has mounted Crew's control plane into it -- H6 carries nothing over
+  from codex's or opencode's -- so the feature does not work there today and
+  NOT AVAILABLE is the true mark. Unmeasured is
   for a line whose answer is unknown, never for one whose answer is no;
 * an entry may not contradict the projection. A member has demonstrated the
   capability, so :func:`_card_lines` applies an entry only to a line that is already
@@ -269,7 +271,10 @@ USER_FACING_LINES: Tuple[_LineSpec, ...] = (
     _LineSpec(LINE_MEMBER_SAVED_AGENT, ("ACP_BACKENDS_MEMBER_CAPABILITIES",)),
     _LineSpec(LINE_SIDE_CHAT_TOOLS, ("ACP_BACKENDS_SIDE_READONLY",)),
     _LineSpec(LINE_SUBAGENT_CONTINUATION, ("ACP_BACKENDS_SESSION_SHARING",)),
-    _LineSpec(LINE_MID_TURN_STEER, ("ACP_BACKENDS_STEER",)),
+    # Two verbs carry a user's mid-turn message: kiro-cli's ``_session/steer`` and
+    # codex-acp's ``_session/steering``. A user asks "can I add to a running turn?",
+    # and either verb answers yes, so the line is their union.
+    _LineSpec(LINE_MID_TURN_STEER, ("ACP_BACKENDS_STEER", "ACP_BACKENDS_STEERING_REQUEST")),
     _LineSpec(LINE_MANUAL_COMPACT, ("ACP_BACKENDS_COMPACT",)),
     # Effort travels down one of two channels, and neither set alone answers the
     # question a user asks. The config-option members advertise an ``effort``
@@ -330,6 +335,49 @@ OPERATOR_LINES: Tuple[_LineSpec, ...] = (
 #: DEFECT rather than an absent feature, and a card that listed defect classes in
 #: front of someone choosing a harness would be worse than one line shorter.
 OFF_CARD_SETS: Mapping[str, str] = {
+    "ACP_BACKENDS_SERIAL_SESSION_STARTS": (
+        "which backend's process answers session starts and mode switches one at a "
+        "time. It decides only what a timed-out start's error says about the "
+        "requests ahead of it; every request is sent the same way on every harness, "
+        "so a reader choosing a harness loses nothing. A wrong membership makes that "
+        "error claim a queue that was not there, or omit one that was, which is a "
+        "defect"
+    ),
+    "ACP_BACKENDS_INDEPENDENT_SETUP": (
+        "whether first-run setup may proceed without Kiro CLI. The onboarding gate "
+        "already presents this choice before a session or Settings card exists; a "
+        "wrong membership would send someone through a setup path that cannot work"
+    ),
+    "ACP_BACKENDS_MEMBER_PANEL": (
+        "whether a member DM session may mount its own webview. Its membership is the "
+        "same as ACP_BACKENDS_MEMBER_DISPATCH's, and the member-thread-tools line "
+        "already answers for that one, so a card line here would repeat a claim the "
+        "reader has read one line earlier and tell them nothing a harness differs on. "
+        "The set exists so the DECISION is opted into per capability (harness-parity "
+        "H6) rather than inherited from session control; if the two memberships ever "
+        "diverge, that divergence is what earns a line"
+    ),
+    "ACP_BACKENDS_HOOKS_LIST": (
+        "which backend's agent may ask its client for the hooks matching a trigger, and "
+        "have the client run one. Nothing a reader choosing a harness can act on: Crew "
+        "does not announce the capability that makes an agent use the channel, so a "
+        "member asks nothing and a non-member loses nothing. A wrong membership would "
+        "answer a backend that never defined the channel, which is a defect rather "
+        "than a shortfall"
+    ),
+    "ACP_BACKENDS_OPEN_EXTERNAL_URL": (
+        "which backend's engine sends an MCP sign-in link to its client instead of "
+        "running the OAuth flow itself. Both paths end at the same Authorize banner, "
+        "so a reader choosing a harness loses nothing; a wrong membership would answer "
+        "a request the backend never sends, or leave a KAS server unable to sign in, "
+        "which is a defect"
+    ),
+    "ACP_BACKENDS_CREW_FIRES_SPEC_HOOKS": (
+        "who runs the agent spec's own hooks: the harness, or Crew's turn loop for a "
+        "harness that never receives them. The hooks run either way, so a reader "
+        "choosing a harness loses nothing; a wrong membership runs every hook twice "
+        "or not at all, which is a defect"
+    ),
     "ACP_BACKENDS_HARNESS_OWNED_SESSIONS": (
         "whose disk the transcript sits on. Crew holds a non-member's transcript under "
         "its own sessions tree and a reopened chat restores from there, so the "
@@ -379,6 +427,16 @@ OFF_CARD_SETS: Mapping[str, str] = {
         "either direction -- claiming it leaves the context unbounded, withholding "
         "it recycles a session that did not need it -- and neither is an absent "
         "feature a card could mark"
+    ),
+    "ACP_BACKENDS_EFFORT_FROM_ADVERTISED_OPTION": (
+        "which fact answers whether a session takes an effort level -- the option the "
+        "harness advertised, or Crew's model registry. The card already reports whether "
+        "effort can be changed on this harness at all, which is the part a reader "
+        "choosing one acts on, and both states of THIS set are correct behaviour for the "
+        "harness they describe. A wrong membership is a defect in either direction: "
+        "asking the registry about a harness whose model ids it does not carry hides a "
+        "control that works, and asking the option on a harness whose level rides the "
+        "model offers one the model will refuse"
     ),
     "ACP_BACKENDS_SEED_LOCAL_SETTINGS": (
         "whether a settings file is re-seeded on a model switch. Invisible when "
@@ -431,6 +489,24 @@ OFF_CARD_SETS: Mapping[str, str] = {
         "way -- a project agent running the user-level agent's servers, or a "
         "member's servers dropping out of pool and caller-identity attribution "
         "while the operator has the gateway switched on"
+    ),
+    "ACP_BACKENDS_ACP_CLIENT_SPAWNABLE": (
+        "which spawn path a pool that builds AcpClient itself may use for this "
+        "backend, rather than AcpRuntime. A session starts either way when the "
+        "caller asks the right path; a wrong membership is a spawn under the "
+        "WRONG IDENTITY -- kas or codex under a bare kiro-cli spawn -- which is a "
+        "defect, not an absent feature a reader choosing a harness acts on"
+    ),
+    "ACP_BACKENDS_HONOR_ZERO_TOOL_BAN": (
+        "whether an agent spec's `\"tools\": []` holds against this backend's "
+        "NATIVE tools too, or only narrows the MCP allowlist. Read by the "
+        "knowledge/research pool to pick a backend it can trust with a zero-tool "
+        "worker. `tool_approval` already reports the reader-facing half -- whether "
+        "and how this harness is made to ask before it runs a tool at all -- so a "
+        "reader choosing a harness for that reason has already seen it; this set "
+        "answers a narrower question the pool asks about, and a wrong membership "
+        "admits a backend whose native tools stay live under a spec that meant to "
+        "deny them, which is a defect"
     ),
     "ACP_BACKENDS_MCP_CONFIG_HOT_RELOAD": (
         "whether a freshly installed MCP server reaches a RUNNING session. The one "
@@ -489,14 +565,13 @@ class UnmeasuredLine:
 #: string so a literal id is illegible, and a renamed constant raises here instead of
 #: quietly reading as a harness nobody has.
 #:
-#: Both entries rest on the same words in ``ACP_BACKENDS_COMPACT``: pi and goose each
-#: dispatch ``/compact`` before any model turn in their own source, neither could be
-#: driven where that was written (pi answers ``Authentication required``, goose
-#: ``Failed to resolve provider: GOOSE_PROVIDER``), and the set asks for the bar
-#: opencode met -- a live session whose ``usage_update.used`` was seen to fall. Until
-#: then Crew declines their ``/compact`` with ``COMPACT_ARM_UNCLASSIFIED``, which
-#: promises nothing, and this is the card saying the same thing rather than reporting
-#: a limit of the harness.
+#: The one entry rests on words in ``ACP_BACKENDS_COMPACT``: pi dispatches
+#: ``/compact`` before any model turn in its own source, it could not be driven where
+#: that was written (it answers ``Authentication required``), and the set asks for the
+#: bar opencode and goose met -- a live session whose ``usage_update.used`` was seen to
+#: fall. Until then Crew declines its ``/compact`` with ``COMPACT_ARM_UNCLASSIFIED``,
+#: which promises nothing, and this is the card saying the same thing rather than
+#: reporting a limit of the harness.
 #:
 #: USER-FACING lines only, which is not an omission: the security and operator notes
 #: are stated only when they HOLD, so an unmeasured one is already absent rather than
@@ -511,17 +586,6 @@ DECLARED_UNMEASURED: Mapping[Tuple[str, str], UnmeasuredLine] = {
             "driven capture of is the context actually shrinking, and it could not be "
             "driven where the set was written -- it answers Authentication required. "
             "Until then it is unclassified"
-        ),
-    ),
-    ("ACP_BACKEND_GOOSE", LINE_MANUAL_COMPACT): UnmeasuredLine(
-        reason=REASON_NO_DRIVEN_CAPTURE,
-        declared_by="ACP_BACKENDS_COMPACT",
-        citation=(
-            "goose 1.50.1 routes /compact through Agent::reply -> execute_command -> "
-            'handle_compact_command and its own command_starts_turn("/compact") is '
-            "false, so the source says inline. It has no driven capture either, and "
-            "could not be driven where the set was written -- it answers Failed to "
-            "resolve provider: GOOSE_PROVIDER. Until then it is unclassified"
         ),
     ),
 }

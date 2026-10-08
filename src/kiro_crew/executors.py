@@ -76,6 +76,8 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Awaitable, Callable, TypeVar
 
+from kiro_crew.subprocess_pool import SubprocessPoolExecutor
+
 logger = logging.getLogger(__name__)
 
 _T = TypeVar("_T")
@@ -94,6 +96,7 @@ __all__ = [
     "path_probe_executor",
     "path_transfer_executor",
     "crew_log_executor",
+    "memory_preparation_executor",
     "governance_executor",
     "cron_gate_executor",
     "CronGateTimeout",
@@ -272,53 +275,27 @@ _MAX_STT_WORKERS = 2
 # side of an ``ssh host 'cd /home/...'`` command that never existed locally).
 # The caller bounds its wait and REFUSES the path on timeout (fail-closed --
 # a lexical-only fallback would let a symlink into a credential store ride a
-# stall; only a resolution that FAILS with OSError keeps the lexical forms);
-# the wait does NOT free the worker, so this is its OWN pool: a wedged
-# resolution can only ever starve other path resolution, never the sweeps or
-# the default executor's DNS.
+# stall; only a resolution that FAILS with OSError keeps the lexical forms).
 #
-# Sized like ``mc-pathprobe`` below, and for the same reason: the number is a
-# ceiling on how many resolutions can be WEDGED at once, not on ordinary
-# throughput.  It is 2, justified by "healthy resolution is microseconds, so
-# sustained queueing means the filesystem is wedged".  That premise holds on the
-# host it was written for and does NOT hold on every host.  It fails for the ANCHOR
-# REBUILD, which performs ~130 ``realpath`` calls behind a cache whose expiry
-# tracks the rebuild's own measured cost
-# (``security.paths._home_targets_ttl``), so ordinary tool traffic re-pays it in
-# proportion to what it costs rather than every 100ms. And it fails under
-# sustained GIL contention, where a
-# rebuild costing 0.9ms on an idle interpreter was measured at 873ms with one
-# CPU-bound sibling thread and 4.0s with four -- none of which is filesystem
-# latency.  Where both hold at once the pool sits at its ``wedged >= 2`` floor in
-# steady state and refuses every path under every prefix while the mount is
-# perfectly healthy.  That is why the number is now an operator knob rather than a
-# constant: the premise is a property of the host, not of the code.
+# The work runs in CHILD INTERPRETERS (``kiro_crew.subprocess_pool``), not on
+# threads, and the caller's own thread does the round trip.  A thread pool could
+# bound the wait but not the cost: ``realpath`` is pure Python and reacquires the
+# GIL twice per path component, so beside CPU-bound sibling threads a rebuild
+# costing 0.9ms idle measured 873ms with one contender and 4.0s with four -- none
+# of it filesystem latency -- and a thread wedged in the kernel could never be
+# reclaimed, so each stall pinned a worker for good.  A child pays one GIL handoff
+# for the whole answer and is KILLED at the deadline, so a timed-out resolution
+# costs one respawn (~11ms), never a pinned worker.  Measurements and the
+# reasoning are in ``subprocess_pool/executor.py``.
 #
-# The cap still bites under plain concurrency (simultaneous cron fires submitting
-# at once); a queued resolution that never starts is cancelled on timeout and
-# refused for that call alone, charging no prefix cooldown (see
-# ``security.paths._run_resolution_bounded``).
-#
-# The DEFAULT stays 2, which is the right number for the premise it was written
-# for: a host where healthy resolution really is microseconds, where sustained
-# queueing is evidence of a wedged mount and a low ceiling is what makes the wedge
-# signal meaningful. Raising it for everyone would make ordinary contention
-# indistinguishable from a dead mount on exactly those hosts.
-#
-# An operator whose gateway resolves under sustained GIL contention -- many
-# concurrent sessions, an anchor rebuild whose own contended cost is what its cache
-# expiry is now a multiple of -- raises it for THEIR box instead. Read once at
-# import, because the pool
-# is a module-level singleton; an unparseable or out-of-range value keeps the
-# default rather than failing the import, since a gateway that will not start is a
-# worse outcome than one resolving with the shipped ceiling.
-#
-# The floor is 2, not 1, and the reason is the leave-one-free guard in
-# ``security.paths._run_resolution_bounded``: a prefix with a stall on record is
-# refused before submission once ``W - 1`` workers are pinned, so that its re-probe
-# cannot take the last free worker.  With ``W = 1`` that test is ``wedged >= 0``,
-# true with nothing pinned at all, and since only a resolution that RUNS can clear
-# a prefix's record, one transient stall would refuse that prefix until restart.
+# The knob sizes the number of children.  One sustains ~45k resolutions/s, so the
+# second buys wedge isolation rather than throughput: while one child is stuck on
+# a dead mount (until the deadline reclaims it), the other keeps serving every
+# healthy prefix.  The DEFAULT stays 2 and the floor is 2 for that reason; the
+# resolver is the caller that cannot accept a single child.  Read once at import,
+# because the pool is a module-level singleton; an unparseable or out-of-range
+# value keeps the default rather than failing the import, since a gateway that
+# will not start is a worse outcome than one resolving with the shipped size.
 _PATH_RESOLVE_WORKERS_ENV = "KIROCREW_PATH_RESOLVE_WORKERS"
 _PATH_RESOLVE_WORKERS_DEFAULT = 2
 _PATH_RESOLVE_WORKERS_MIN = 2
@@ -390,11 +367,17 @@ _MAX_PATH_TRANSFER_WORKERS = 8
 # threads under, and the lock would serialize those writes without restoring
 # their order. Appends are small and fsync-bound, so one worker is also enough.
 _MAX_CREW_LOG_WORKERS = 1
+# ONE worker, and the count is the contract: ``wheel_apply.run_wheel_apply``
+# admits one managed-venv apply per process (a second answers busy before it is
+# submitted), and that apply holds the layout's exclusive update lock for its
+# whole run. Busy from ANOTHER process is the lock's answer, not this pool's.
+_MAX_UPDATE_WORKERS = 1
 
 _lock = threading.Lock()
 _pool: ThreadPoolExecutor | None = None
 _subprocess_pool: ThreadPoolExecutor | None = None
 _kiro_spawn_pool: ThreadPoolExecutor | None = None
+_mcp_probe_pool: ThreadPoolExecutor | None = None
 _cron_pool: ThreadPoolExecutor | None = None
 _discovery_pool: ThreadPoolExecutor | None = None
 _embed_pool: ThreadPoolExecutor | None = None
@@ -403,10 +386,11 @@ _image_pool: ThreadPoolExecutor | None = None
 _stt_pool: ThreadPoolExecutor | None = None
 _governance_pool: ThreadPoolExecutor | None = None
 _cron_gate_pool: ThreadPoolExecutor | None = None
-_path_resolve_pool: ThreadPoolExecutor | None = None
+_path_resolve_pool: SubprocessPoolExecutor | None = None
 _path_probe_pool: ThreadPoolExecutor | None = None
 _path_transfer_pool: ThreadPoolExecutor | None = None
 _crew_log_pool: ThreadPoolExecutor | None = None
+_update_pool: ThreadPoolExecutor | None = None
 
 
 def configure_default_executor() -> None:
@@ -503,6 +487,19 @@ def kiro_spawn_executor() -> ThreadPoolExecutor:
     return _kiro_spawn_pool
 
 
+def mcp_probe_executor() -> ThreadPoolExecutor:
+    """Local MCP probe pool: one private event loop per worker, 5 = PROBE_MAX_CONCURRENCY."""
+    global _mcp_probe_pool
+    if _mcp_probe_pool is None:
+        with _lock:
+            if _mcp_probe_pool is None:
+                _mcp_probe_pool = ThreadPoolExecutor(
+                    max_workers=5, thread_name_prefix="mc-mcpprobe"
+                )
+                atexit.register(shutdown_maintenance_executor)
+    return _mcp_probe_pool
+
+
 def cron_executor() -> ThreadPoolExecutor:
     """Return the process-wide cron execution thread pool, creating it on first use.
 
@@ -587,27 +584,28 @@ def stt_executor() -> ThreadPoolExecutor:
     return _stt_pool
 
 
-def path_resolve_executor() -> ThreadPoolExecutor:
+def path_resolve_executor() -> SubprocessPoolExecutor:
     """Return the process-wide sensitive-path symlink-resolution pool, creating it on first use.
 
-    Threads are named ``mc-pathres``.  Serves ``security._candidate_forms``, whose
-    ``os.path.realpath`` / ``Path.resolve`` on an agent-supplied path token used
-    to run inline on the event loop and could block in the kernel for as long as
-    a stalled automount did.  The caller bounds its wait
-    (``security._PATH_RESOLVE_TIMEOUT_SECS``) and refuses the path on timeout
-    (fail-closed; only a resolution that FAILS keeps the lexical forms); the
-    wait releases the CALLER, never the thread, which is why this
-    work gets a pool it can only starve for itself -- on
-    :func:`subprocess_executor` a wedged ``lstat`` would consume one of the PTY
-    teardown workers, and on the default executor it would starve the loop's own
-    DNS resolution.
+    A :class:`SubprocessPoolExecutor` whose children run
+    ``security/_child_realpath.py``; its fallback threads are named ``mc-pathres``.
+    Serves ``security._candidate_forms`` and the anchor rebuild, whose
+    ``os.path.realpath`` / ``Path.resolve`` would otherwise run on the event loop
+    and block in the kernel for as long as a stalled automount did, or on a thread
+    pool whose GIL handoffs are the budget's real cost under load.  The caller
+    reaches a child with ``call_op`` from its OWN thread and bounds the
+    wait (``security._PATH_RESOLVE_TIMEOUT_SECS``); a child that misses the
+    deadline is killed and respawned, and the path is refused (fail-closed; only a
+    resolution that FAILS keeps the lexical forms).  Its own pool rather than
+    :func:`subprocess_executor` so a wedged mount can only ever cost path
+    resolution, never PTY teardown or the loop's DNS.
     """
     global _path_resolve_pool
     if _path_resolve_pool is None:
         with _lock:
             if _path_resolve_pool is None:
-                _path_resolve_pool = ThreadPoolExecutor(
-                    max_workers=_MAX_PATH_RESOLVE_WORKERS,
+                _path_resolve_pool = SubprocessPoolExecutor(
+                    workers=_MAX_PATH_RESOLVE_WORKERS,
                     thread_name_prefix="mc-pathres",
                 )
                 atexit.register(shutdown_maintenance_executor)
@@ -687,6 +685,47 @@ def crew_log_executor() -> ThreadPoolExecutor:
                 )
                 atexit.register(shutdown_maintenance_executor)
     return _crew_log_pool
+
+
+def memory_preparation_executor() -> ThreadPoolExecutor:
+    """Return a NEW one-worker pool for one gateway's memory preparation pass.
+
+    Threads are named ``mc-memprep``. The caller owns the pool and shuts it
+    down once its one job has been submitted and awaited.
+
+    Memory preparation is the barrier that keeps chat admission closed after a
+    restart, and its work is short (about 1.5s on a large store). On the loop's
+    default executor that job waits behind every other boot task queued there
+    -- MCP probes, remote reconnects, app loading -- so admission stayed closed
+    for minutes of queueing. Its own thread starts it at once.
+
+    A fresh pool per pass rather than a process-wide singleton: a stopped
+    pass's worker cannot be cancelled and may still hold its thread, and a
+    shared single slot would queue the next gateway's pass behind it, which is
+    the same wait in a new place.
+    """
+    return ThreadPoolExecutor(max_workers=1, thread_name_prefix="mc-memprep")
+
+
+def update_executor() -> ThreadPoolExecutor:
+    """Return the process-wide pool the managed-venv shadow apply runs on.
+
+    Threads are named ``mc-update``, and there is exactly ONE
+    (:data:`_MAX_UPDATE_WORKERS`). An apply downloads a wheel and builds a full
+    venv, which takes minutes, and a started ``run_in_executor`` future cannot
+    be cancelled, so on the loop's default executor it would hold a worker the
+    loop's own DNS resolution needs for that whole time.
+    """
+    global _update_pool
+    if _update_pool is None:
+        with _lock:
+            if _update_pool is None:
+                _update_pool = ThreadPoolExecutor(
+                    max_workers=_MAX_UPDATE_WORKERS,
+                    thread_name_prefix="mc-update",
+                )
+                atexit.register(shutdown_maintenance_executor)
+    return _update_pool
 
 
 def embed_executor() -> ThreadPoolExecutor:
@@ -1109,11 +1148,12 @@ def shutdown_maintenance_executor() -> None:
     global _pool, _subprocess_pool, _cron_pool, _discovery_pool, _embed_pool, _recall_pool
     global _governance_pool, _image_pool, _cron_gate_pool, _stt_pool, _path_resolve_pool
     global _path_probe_pool, _path_transfer_pool
-    global _crew_log_pool, _kiro_spawn_pool
+    global _crew_log_pool, _kiro_spawn_pool, _mcp_probe_pool, _update_pool
     with _lock:
         pool, _pool = _pool, None
         subprocess_pool, _subprocess_pool = _subprocess_pool, None
         kiro_spawn_pool, _kiro_spawn_pool = _kiro_spawn_pool, None
+        mcp_probe_pool, _mcp_probe_pool = _mcp_probe_pool, None
         cron_pool, _cron_pool = _cron_pool, None
         discovery_pool, _discovery_pool = _discovery_pool, None
         embed_pool, _embed_pool = _embed_pool, None
@@ -1126,12 +1166,15 @@ def shutdown_maintenance_executor() -> None:
         path_probe_pool, _path_probe_pool = _path_probe_pool, None
         path_transfer_pool, _path_transfer_pool = _path_transfer_pool, None
         crew_log_pool, _crew_log_pool = _crew_log_pool, None
+        update_pool, _update_pool = _update_pool, None
     if pool is not None:
         pool.shutdown(wait=False, cancel_futures=True)
     if subprocess_pool is not None:
         subprocess_pool.shutdown(wait=False, cancel_futures=True)
     if kiro_spawn_pool is not None:
         kiro_spawn_pool.shutdown(wait=False, cancel_futures=True)
+    if mcp_probe_pool is not None:
+        mcp_probe_pool.shutdown(wait=False, cancel_futures=True)
     if cron_pool is not None:
         cron_pool.shutdown(wait=False, cancel_futures=True)
     if discovery_pool is not None:
@@ -1156,3 +1199,5 @@ def shutdown_maintenance_executor() -> None:
         path_transfer_pool.shutdown(wait=False, cancel_futures=True)
     if crew_log_pool is not None:
         crew_log_pool.shutdown(wait=False, cancel_futures=True)
+    if update_pool is not None:
+        update_pool.shutdown(wait=False, cancel_futures=True)

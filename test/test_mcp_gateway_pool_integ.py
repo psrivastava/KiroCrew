@@ -39,11 +39,13 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 from fake_pool_mcp_server import recorded
 
+from kiro_crew import code_fingerprint as cf
 from kiro_crew import platform_compat as pc
 from kiro_crew.mcp_gateway import gatewayd as gw
 from kiro_crew.mcp_gateway import transport
@@ -55,6 +57,27 @@ _FAKE_SERVER = Path(__file__).with_name("fake_pool_mcp_server.py")
 #: named-pipe round trip is far slower than a unix socket, and a flaky timeout
 #: here would read as "pooling broke".
 _REPLY_TIMEOUT = 60.0
+
+
+@pytest.fixture(autouse=True)
+def _no_git_fingerprint(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """``run_gatewayd`` warms ``code_fingerprint()`` in-process without a git spawn.
+
+    The daemon these tests drive calls ``warm_code_fingerprint()`` at start, and
+    the cached fingerprint is of ``_PACKAGE_ROOT`` -- THIS checkout -- so a cold
+    read runs ``git -C <checkout> rev-parse HEAD`` and ``git diff HEAD`` on the
+    developer's own repository with the worker's cwd inherited; which test pays
+    depends on run order. Nothing here reads the value (the stubs' target is the
+    fake server, not a Kiro Crew subcommand, so no stub folds it into its pool
+    key), so the trusted-git resolver is pinned to "absent" -- the product's own
+    no-spawn arm, the mtime rule -- exactly as ``test_mcp_gateway_daemon_lifecycle.py``
+    does. The cache is cleared on both sides so the pinned value neither reuses
+    a real one nor leaks to a module that must match a child daemon's.
+    """
+    monkeypatch.setattr(cf, "trusted_git_bin", lambda: None)
+    cf.code_fingerprint.cache_clear()
+    yield
+    cf.code_fingerprint.cache_clear()
 
 
 def _endpoint_dir() -> str | None:
@@ -91,6 +114,7 @@ async def _spawn_stub(
     home: Path,
     poolable: bool = True,
     session_key: str = "",
+    env_json: str = "",
 ) -> asyncio.subprocess.Process:
     """Launch a REAL stub process, exactly as the rewriter's overlay would.
 
@@ -101,6 +125,10 @@ async def _spawn_stub(
     ``session_key`` is what the stub puts in its Register frame, and therefore
     what gatewayd injects as the caller block. Empty means the stub registers
     without an identity -- a state gatewayd handles by forwarding ``caller=None``.
+
+    ``env_json`` is the server's declared env, which the stub folds into
+    ``effective_env_hash``. It is how a test varies a REAL pool dimension when
+    the resolver hands every key the same target.
     """
     env = {**_clean_env(), "KIROCREW_HOME": str(home)}
     if session_key:
@@ -119,6 +147,7 @@ async def _spawn_stub(
         "--socket", str(socket_path),
         "--sandbox-mode", "off",
         "--approval-mode", "auto",
+        *(["--env-json", env_json] if env_json else []),
         *(["--poolable"] if poolable else []),
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
@@ -470,20 +499,52 @@ async def test_real_stubs_sharing_a_key_share_one_backend(tmp_path: Path, short_
             f"a stub degraded to per-session exec: {fallback.read_text()}"
         )
 
-        # --- a different agent must NOT share it --------------------------
+        # --- a different agent SHARES it ----------------------------------
+        # Measured on real processes: the agent name never reaches the backend,
+        # so a second agent declaring this server identically has asked for the
+        # process that is already running.
+        # On a live host this is worth up to five duplicate backends per common
+        # server. Everything that DOES change the process -- command, env, work
+        # dir, binary -- is its own PoolKey dimension and still partitions,
+        # which the declared-env control at the end of this test measures.
         other = await _spawn_stub(
             socket_path=sock, server="fake", agent="other-agent",
             work_dir=work_dir, home=home,
         )
         procs.append(other)
         reply = await _drive_initialize(other, req_id=99)
-        assert "result" in reply, f"partition stub got no result: {reply}"
+        assert "result" in reply, f"second-agent stub got no result: {reply}"
+
+        assert _launch_count(launch_log) == 1, (
+            f"a stub under a different agent produced "
+            f"{_launch_count(launch_log)} backends total, expected 1 — the "
+            "agent is partitioning the pool again, so two agents with identical "
+            "server config each burn their own MCP server process."
+        )
+        assert not fallback.exists(), (
+            f"the second agent's stub degraded to per-session exec: "
+            f"{fallback.read_text()}"
+        )
+
+        # --- negative control: a real difference still partitions ----------
+        # Without this, the assertion above would also pass if the key had
+        # stopped partitioning at all. A declared env is the cheapest real
+        # dimension to vary here: the resolver hands every key the same target,
+        # so ``effective_env_hash`` is the only thing that can differ.
+        partitioned = await _spawn_stub(
+            socket_path=sock, server="fake", agent="probe",
+            work_dir=work_dir, home=home,
+            env_json=json.dumps({"DECLARED": "different"}),
+        )
+        procs.append(partitioned)
+        reply = await _drive_initialize(partitioned, req_id=100)
+        assert "result" in reply, f"declared-env stub got no result: {reply}"
 
         assert _launch_count(launch_log) == 2, (
-            f"a stub under a different agent produced "
-            f"{_launch_count(launch_log)} backends total, expected 2 — PoolKey "
-            "is not partitioning by agent, so two agents would share one MCP "
-            "server process and its state."
+            f"a stub declaring different env produced "
+            f"{_launch_count(launch_log)} backends total, expected 2 — the key "
+            "has stopped partitioning on execution shape, which would make the "
+            "sharing assertion above meaningless."
         )
     finally:
         await _reap(procs)
@@ -537,6 +598,7 @@ async def test_real_stubs_without_poolable_get_their_own_backend(
         )
     )
     procs: list[asyncio.subprocess.Process] = []
+    backend_pids: list[int] = []
     try:
         for _ in range(100):
             if transport.endpoint_exists(sock):
@@ -566,6 +628,10 @@ async def test_real_stubs_without_poolable_get_their_own_backend(
             f"through the gateway, so it has no callback address: "
             f"{fallback.read_text()}"
         )
+        # The fake server records under ``<log>.d/<pid>.txt``, so the file names
+        # are the backend pids the daemon is answerable for.
+        backend_pids = [int(p.stem) for p in Path(f"{launch_log}.d").iterdir()]
+        assert len(backend_pids) == 3
     finally:
         await _reap(procs)
         stop.set()
@@ -573,6 +639,19 @@ async def test_real_stubs_without_poolable_get_their_own_backend(
             await asyncio.wait_for(daemon, timeout=30)
         except asyncio.TimeoutError:  # pragma: no cover - daemon shutdown hang
             daemon.cancel()
+    # A private backend's reap belongs to the pool, and ``shutdown_all`` joins it:
+    # by the time ``run_gatewayd`` has returned every one of them has been
+    # terminated AND waited for. The inline ``await orphan.shutdown()`` this
+    # replaced was cancelled by the daemon's own teardown after
+    # ``release_exclusive`` had already dropped the backend from the exclusive
+    # map, so the child was outside ``shutdown_all`` and outlived the daemon --
+    # a zombie or a live process here, and its pipe transports still finalizing
+    # after the test's loop closed.
+    survivors = [pid for pid in backend_pids if pc.pid_exists(pid)]
+    assert not survivors, (
+        f"private backends {survivors} outlived run_gatewayd: their reap was not "
+        "joined by shutdown_all"
+    )
 
 
 def _windows_collect_ignore() -> list[str]:

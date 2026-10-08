@@ -3,7 +3,8 @@
 # shapes (LLMEvent and the EVENT_* constants), so watching only `acp` would let
 # a consumer look migrated while still reading the backend's own types.
 #
-# The gate requires every OTHER file under src/ to be clean and none of these
+# The gate requires every OTHER file under src/ -- outside the exempt
+# agent_sdk/, acp/ and providers/ trees -- to be clean and none of these
 # counts to grow, so the list can shrink but never grow.
 #
 # It is a floor, not a countdown to zero. Most of these consumers are expected
@@ -33,12 +34,11 @@
 1 src/kiro_crew/cli_setup.py
 1 src/kiro_crew/config/loader.py
 1 src/kiro_crew/connections/mint.py
-1 src/kiro_crew/cron.py
 3 src/kiro_crew/dashboard/chat_handlers.py
 3 src/kiro_crew/dashboard/chat_runner.py
 1 src/kiro_crew/dashboard/chat_summary.py
 1 src/kiro_crew/dashboard/chat_utils.py
-2 src/kiro_crew/dashboard/handlers/agents.py
+1 src/kiro_crew/dashboard/handlers/agents.py
 2 src/kiro_crew/dashboard/handlers/core.py
 1 src/kiro_crew/dashboard/handlers/hooks.py
 1 src/kiro_crew/dashboard/handlers/optimizer.py
@@ -71,7 +71,6 @@
 3 src/kiro_crew/slack/handler.py
 1 src/kiro_crew/slack/transport_dispatch.py
 7 src/kiro_crew/subagent.py
-1 src/kiro_crew/subagent_manager/terminal.py
 2 src/kiro_crew/subagent_persistence.py
 2 src/kiro_crew/task_executor.py
 1 src/kiro_crew/task_planner.py

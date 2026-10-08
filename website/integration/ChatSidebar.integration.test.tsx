@@ -38,12 +38,12 @@ describe('ChatSidebar Folder Grouping', () => {
     mockConfirm.mockReturnValue(true)
     // Hermetic focus baseline. api/client.ts shows a session-expired banner on an
     // unhandled auth 403 and its token input grabs focus on a rAF (client.ts
-    // ~L137). That module state latches across tests in the same file, so a
-    // later rename/create test's rAF flush lets the banner steal focus from the
-    // just-opened input → blur → commit → unmount, a jsdom-only focus-theft the
-    // real browser never hits. Stub the auth endpoints so the banner never
-    // shows, reset the module's latch + remove any stray banner, and clear any
-    // bled-in focus before each test.
+    // `showSessionExpiredBanner`). That module state latches across tests in
+    // the same file, so a later rename/create test's rAF flush lets the banner
+    // steal focus from the just-opened input → blur → commit → unmount, a
+    // jsdom-only focus-theft the real browser never hits. Stub the auth
+    // endpoints so the banner never shows, reset the module's latch + remove
+    // any stray banner, and clear any bled-in focus before each test.
     server.use(
       http.post('/api/auth/refresh', () => HttpResponse.json({ ok: true })),
       http.get('/api/auth/me', () => HttpResponse.json({ ok: true })),
@@ -90,12 +90,12 @@ describe('ChatSidebar Folder Grouping', () => {
     expect(screen.queryByText('UNGROUPED')).not.toBeInTheDocument()
   })
 
-  it('labels the primary create action New chat', () => {
+  it('shortens the primary create action label to New', () => {
     renderWithProviders(<ChatSidebar {...defaultProps} />)
     const createButton = screen.getByRole('button', { name: 'New chat session' })
-    // Anchored, not a substring: the point of the key swap is that the visible
-    // label reads as a whole action, so a longer label must fail here too.
-    expect(createButton).toHaveTextContent(/^New chat$/)
+    // Anchored, not a substring: the header shows the short form recorded in
+    // docs/decisions, so the longer caret-row label must fail here too.
+    expect(createButton).toHaveTextContent(/^New$/)
   })
 
   it('shows provider logos on pull request chips', async () => {
@@ -710,7 +710,7 @@ describe('ChatSidebar Cleanup', () => {
     expect(sessionRow.getAttribute('data-state')).toBe('open')
   })
 
-  it('clicking Duplicate button calls fork endpoint and switches slot', async () => {
+  it('clicking Fork chat button calls fork endpoint and switches slot', async () => {
     server.use(
       http.post('/api/chat/slots/:slot/fork', ({ params }) => {
         return HttpResponse.json({ ok: true, key: `${params.slot}-fork` })
@@ -718,7 +718,7 @@ describe('ChatSidebar Cleanup', () => {
     )
     const { store } = renderWithProviders(<ChatSidebar {...defaultProps} />)
     await screen.findByText('Pipeline debug')
-    const dupBtn = screen.getAllByLabelText('Duplicate')[0]
+    const dupBtn = screen.getAllByLabelText('Fork chat')[0]
     fireEvent.click(dupBtn)
     await waitFor(() => {
       expect(store.getState().chat.activeSlot).toBe('slot-1-fork')
@@ -731,7 +731,7 @@ describe('ChatSidebar Cleanup', () => {
     )
     renderWithProviders(<ChatSidebar {...defaultProps} />)
     await screen.findByText('Pipeline debug')
-    const dupBtn = screen.getAllByLabelText('Duplicate')[0]
+    const dupBtn = screen.getAllByLabelText('Fork chat')[0]
     fireEvent.click(dupBtn)
     // UI remains intact — sessions still rendered
     await waitFor(() => {

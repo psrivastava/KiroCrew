@@ -3062,13 +3062,28 @@ class TestAllowedToolsIsReDerivedWhenTheCeilingTightens:
     short-circuits inside the harness and never reaches Kiro Crew's own PreToolUse gate.
     """
 
+    @pytest.fixture(autouse=True)
+    def _no_hold_carried_in(self, monkeypatch):
+        """``prime_ceiling_projection`` seeds nothing while the last real rebuild left a
+        conductor spec unwritten; these tests pin the seeded baseline, so a hold a test
+        elsewhere in this process left behind must not reach them."""
+        from kiro_crew import agent as agent_mod
+
+        monkeypatch.setattr(agent_mod, "_conductor_spec_held", False, raising=False)
+
     @staticmethod
     def _hook(monkeypatch):
         from kiro_crew import agent as agent_mod
 
         rebuilds: list[int] = []
-        monkeypatch.setattr(agent_mod, "rebuild_agent_config", lambda **kw: rebuilds.append(1))
+
+        def fake_reporting(**kw):
+            rebuilds.append(1)
+            return Path("/shared/agents/kirocrew.json"), True
+
+        monkeypatch.setattr(agent_mod, "rebuild_agent_config_reporting", fake_reporting)
         monkeypatch.setattr(agent_mod, "_projected_ceiling_generation", None, raising=False)
+        monkeypatch.setattr(agent_mod, "_pending_projection_warned_generation", None, raising=False)
         return agent_mod, rebuilds
 
     def test_a_seeded_baseline_rebuilds_nothing_until_the_ceiling_moves(self, monkeypatch):
@@ -3116,8 +3131,9 @@ class TestAllowedToolsIsReDerivedWhenTheCeilingTightens:
             attempts.append(1)
             if len(attempts) == 1:
                 raise OSError("could not write the agent config")
+            return Path("/shared/agents/kirocrew.json"), True
 
-        monkeypatch.setattr(agent_mod, "rebuild_agent_config", flaky)
+        monkeypatch.setattr(agent_mod, "rebuild_agent_config_reporting", flaky)
         monkeypatch.setattr(agent_mod, "_projected_ceiling_generation", None, raising=False)
         agent_mod.prime_ceiling_projection()
         install_ceiling(governance.parse_policy(_doc("tightened")))
@@ -3131,6 +3147,86 @@ class TestAllowedToolsIsReDerivedWhenTheCeilingTightens:
         # And once it succeeds, it stops.
         agent_mod.reproject_for_ceiling_change()
         assert len(attempts) == 2
+
+    def test_a_declined_shared_home_holds_the_memo(self, monkeypatch, install_ceiling, caplog):
+        """A REFUSED rebuild is not a successful one, and the memo must not say it was.
+
+        ``rebuild_agent_config_reporting`` reports the shared-home refusal as
+        ``wrote=False`` from the SAME evaluation that gated the write, so
+        without this arm the hook would mark the moved generation synchronised
+        while the on-disk ``allowedTools`` were never narrowed — stale entries
+        then auto-approve tools the ceiling forbids, short-circuiting inside
+        the harness before PreToolUse. The projection must instead stay
+        pending and apply the moment the refusal clears. The pending state
+        warns ONCE per generation, not on every confirming poll.
+        """
+        import logging
+
+        from kiro_crew import agent as agent_mod
+
+        rebuilds: list[int] = []
+        declined = {"value": True}
+
+        def fake_reporting(**kw):
+            if declined["value"]:
+                return Path("/shared/agents/kirocrew.json"), False
+            rebuilds.append(1)
+            return Path("/shared/agents/kirocrew.json"), True
+
+        monkeypatch.setattr(agent_mod, "rebuild_agent_config_reporting", fake_reporting)
+        monkeypatch.setattr(agent_mod, "_projected_ceiling_generation", None, raising=False)
+        monkeypatch.setattr(agent_mod, "_pending_projection_warned_generation", None, raising=False)
+        agent_mod.prime_ceiling_projection()
+        install_ceiling(governance.parse_policy(_doc("tightened")))
+
+        # While declined: the rebuild refuses and the memo stays behind, and
+        # the pending state warns once for the generation, not per poll.
+        with caplog.at_level(logging.WARNING, logger=agent_mod.logger.name):
+            agent_mod.reproject_for_ceiling_change()
+            agent_mod.reproject_for_ceiling_change()
+        assert rebuilds == [], "a declined instance must not commit the shared rewrite"
+        pending_warnings = [r for r in caplog.records if "is pending" in r.getMessage()]
+        assert len(pending_warnings) == 1, "the pending warning must fire once per generation"
+
+        # The refusal clears (e.g. the stale shared spec was removed): the
+        # pending generation is projected rather than lost.
+        declined["value"] = False
+        agent_mod.reproject_for_ceiling_change()
+        assert rebuilds == [1], "the pending generation must be projected once writable"
+
+        # And once projected, it stops.
+        agent_mod.reproject_for_ceiling_change()
+        assert rebuilds == [1]
+
+    def test_the_hook_never_probes_the_guard_before_the_rebuild(self, monkeypatch, install_ceiling):
+        """The refusal verdict comes from inside the rebuild, never a pre-probe.
+
+        A guard probe followed by the rebuild leaves a window: a concurrent
+        default-home boot rewrites the specs between the two reads, the
+        rebuild's own check refuses, and a memo advanced on the stale probe
+        records a projection that never landed — permanently retaining stale
+        forbidden auto-approvals. The hook must consult only the rebuild's own
+        verdict.
+        """
+        from kiro_crew import agent as agent_mod
+
+        def no_probe(**kw):
+            raise AssertionError("reproject pre-probed the guard: probe/rebuild race reopened")
+
+        monkeypatch.setattr(agent_mod, "_decline_shared_agent_home", no_probe)
+        monkeypatch.setattr(
+            agent_mod,
+            "rebuild_agent_config_reporting",
+            lambda **kw: (Path("/shared/agents/kirocrew.json"), False),
+        )
+        monkeypatch.setattr(agent_mod, "_projected_ceiling_generation", None, raising=False)
+        install_ceiling(governance.parse_policy(_doc("tightened")))
+
+        # An unseeded baseline always attempts the rebuild; the refused verdict
+        # must come back from the rebuild itself (no_probe proves no pre-probe
+        # ran) and the memo must stay behind.
+        agent_mod.reproject_for_ceiling_change()
+        assert agent_mod._projected_ceiling_generation is None, "memo advanced on a refusal"
 
     def test_an_unseeded_baseline_rebuilds_rather_than_skipping(self, monkeypatch):
         """The safe direction if some other entry point starts the poller: a redundant
@@ -3212,6 +3308,16 @@ class TestMalformedInputIsRefusedNotCrashedOn:
         with pytest.raises(PlatformCompositionError) as caught:
             governance.PolicyDistribution.from_dict({"source": source})
         assert "distribution.source" in str(caught.value)
+
+    def test_a_declared_source_must_be_valid_utf8_text(self):
+        """A lone JSON surrogate must fail at composition, before cache provenance hashes it."""
+        policy = json.loads(r'{"source": "https://h/p\udc80"}')
+
+        with pytest.raises(
+            PlatformCompositionError,
+            match="distribution.source is not valid UTF-8 text",
+        ):
+            governance.PolicyDistribution.from_dict(policy)
 
     def test_the_sanitiser_survives_a_malformed_source(self):
         """This one matters most: a sanitiser that crashes on a malformed source takes the
@@ -4122,10 +4228,10 @@ class TestAnExposedCacheIsStillReadOnly:
     def _pinned_ssh_probe(self, monkeypatch):
         """Answer the launcher's ``ssh -V`` probe in-process.
 
-        ``_build_launcher_script`` consults ``_ssh_supports_accept_new`` for the
+        A namespace plan consults ``_ssh_supports_accept_new`` for the
         ``StrictHostKeyChecking`` flag, and the real probe spawns the host's
         ``ssh``. It is memoised, so it fires in whichever test on the worker
-        first builds a launcher — these tests read the mount lists, not the ssh
+        first builds a plan — these tests read the mount lists, not the ssh
         flag, so the seam is pinned rather than left to find the host binary.
         """
         from kiro_crew import sandbox
@@ -4142,31 +4248,52 @@ class TestAnExposedCacheIsStillReadOnly:
         from kiro_crew import sandbox
 
         cache = self._cache_path()
-        script = sandbox._build_launcher_script("standard", extra_visible_dirs=(cache,))
-        readonly = json.loads(script.split("READONLY_DIRS = ", 1)[1].split("\n", 1)[0])
-        hidden = json.loads(script.split("SENSITIVE_DIRS = ", 1)[1].split("\n", 1)[0])
+        plan = sandbox._spawn_plan("namespace", "standard", extra_visible_dirs=(cache,))
 
-        assert cache in readonly, "an exposed cache must be bound read-only, not merely unhidden"
-        assert cache not in hidden, "it also has to be READABLE — that is why it was exposed"
+        assert (
+            cache in plan.readonly
+        ), "an exposed cache must be bound read-only, not merely unhidden"
+        assert (
+            cache not in plan.sensitive_dirs
+        ), "it also has to be READABLE — that is why it was exposed"
 
-    def test_the_seal_is_a_remount_because_ms_rdonly_is_ignored_on_a_bind(self):
-        """Both mount calls are load-bearing: the bind alone grants write."""
-        from kiro_crew import sandbox
+    @pytest.mark.skipif(
+        not sys.platform.startswith("linux"), reason="the namespace launcher is Linux-only"
+    )
+    def test_the_seal_is_a_remount_because_ms_rdonly_is_ignored_on_a_bind(self, tmp_path):
+        """Both mount calls are load-bearing: the bind alone grants write.
 
-        script = sandbox._build_launcher_script(
-            "standard", extra_visible_dirs=(self._cache_path(),)
-        )
-        loop = script.split("for d in READONLY_DIRS:", 1)[1].split("\n\n", 1)[0]
+        The launcher program's seal stage runs over a read-only entry with a stand-in
+        libc: it binds the path over itself, then remounts that bind ``MS_RDONLY``,
+        and a refusal of EITHER mount refuses the spawn rather than running unsealed.
+        """
+        from test_sandbox_launcher_program import RecordingLibc, launch, payload, refusal
 
-        assert "_MS_REMOUNT | _MS_BIND | _MS_RDONLY" in loop
-        assert loop.count("_mount_or_die(") == 2
+        from kiro_crew import sandbox_launcher_program as program
+
+        cache = tmp_path / pd.CACHE_DIR_LEAF
+        cache.mkdir()
+        libc = RecordingLibc()
+        program.seal_readonly(launch(tmp_path, payload(readonly_dirs=[str(cache)]), libc=libc))
+
+        assert [call.target_path for call in libc.calls] == [str(cache), str(cache)]
+        bind, remount = (call.flags for call in libc.calls)
+        assert bind == program._MS_BIND
+        sealed = program._MS_REMOUNT | program._MS_BIND | program._MS_RDONLY
+        assert remount & sealed == sealed
+
+        for fail_at, step in ((1, "exposing"), (2, "sealing")):
+            failing = RecordingLibc(fail_at=fail_at)
+            run = launch(tmp_path, payload(readonly_dirs=[str(cache)]), libc=failing)
+            message = refusal(program.seal_readonly, run)
+            assert message is not None, f"a refused {step} mount let the spawn run"
+            assert message.startswith(f"sandbox: BLOCKED -- {step} read-only path {cache} failed")
 
     def test_an_unexposed_cache_gets_no_read_only_rule(self):
         """The ordinary spawn hides it; only the protected runtime parent is read-only."""
         from kiro_crew import sandbox
 
-        script = sandbox._build_launcher_script("standard")
-        readonly = json.loads(script.split("READONLY_DIRS = ", 1)[1].split("\n", 1)[0])
+        readonly = sandbox._spawn_plan("namespace", "standard").readonly
         assert set(readonly) >= set(sandbox._voice_runtime_parent_paths())
         assert self._cache_path() not in readonly
 
@@ -4191,8 +4318,7 @@ class TestAnExposedCacheIsStillReadOnly:
         profile = sandbox._build_seatbelt_profile("strict", extra_visible_dirs=(aws,))
         assert f'(deny file-write* (subpath "{aws}"))' not in profile
 
-        script = sandbox._build_launcher_script("strict", extra_visible_dirs=(aws,))
-        readonly = json.loads(script.split("READONLY_DIRS = ", 1)[1].split("\n", 1)[0])
+        readonly = sandbox._spawn_plan("namespace", "strict", extra_visible_dirs=(aws,)).readonly
         assert set(readonly) >= set(sandbox._voice_runtime_parent_paths())
         assert aws not in readonly
 

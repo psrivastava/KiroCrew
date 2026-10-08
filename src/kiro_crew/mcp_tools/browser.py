@@ -108,12 +108,12 @@ _LOOPBACK_HOST_NAMES = {"localhost", "ip6-localhost", "ip6-loopback"}
 def _navigate_target_is_public(url: str) -> bool:
     """True iff ``url`` is an ordinary public http(s) page.
 
-    Mirrors the playwright-cli path's gate (``chat_runner._is_remote_navigable_host``):
-    the built-in Electron panel accepts ANY http(s) URL, so without this a
+    The built-in Electron panel accepts ANY http(s) URL, so without this a
     ``navigate`` op could drive a loopback control plane (this dashboard
-    included) or the ``169.254.169.254`` metadata endpoint -- an SSRF the CLI
-    path holds behind interactive approval. Kept LOCAL (not imported from the
-    dashboard) so the ``kirocrew-core`` shim stays free of dashboard deps.
+    included) or the ``169.254.169.254`` metadata endpoint -- an SSRF the
+    playwright-cli path holds behind the ordinary shell approval ladder. Kept
+    LOCAL (not imported from the dashboard) so the ``kirocrew-core`` shim stays
+    free of dashboard deps.
 
     ``is_global`` subsumes loopback/link-local/private/CGNAT/reserved in one
     predicate, applied to the address and any embedded IPv4 (``ipv4_mapped`` /
@@ -252,6 +252,14 @@ def _post_command(
     session key) goes in the ``X-Session-Key`` HEADER, which the strict route's
     AF_UNIX peer check compares against the HMAC-signed session the caller
     resolves to; a bare header would be a 403.
+
+    The per-session token goes WITH it, and the pair must not be separated. On a
+    pid hosting several sessions the kernel's proof of the PROCESS cannot say
+    which of them holds this socket, so the peer check requires a token naming
+    exactly the declared key there and refuses the declaration otherwise. The two
+    agree by construction, because on such a pid the ladder resolves the key from
+    that very token. On a 1:1 install the helper contributes no header at all, so
+    the request is byte-identical to before.
     """
     body = json.dumps(
         {"session_key": bus_key, "op": op, "args": args, "timeout_ms": timeout_ms}
@@ -263,6 +271,7 @@ def _post_command(
             "Content-Type": "application/json",
             "X-Internal-Secret": mcp_core._internal_secret(),
             "X-Session-Key": session_header,
+            **mcp_core._session_token_header(),
         },
         method="POST",
     )
@@ -357,7 +366,7 @@ def browser(name: str, args: dict[str, Any]) -> str:
     # loopback/private/link-local target could drive a local control plane (this
     # dashboard included) or the cloud-metadata endpoint. Only public http(s) is
     # auto-driven here; route non-public targets through playwright-cli, whose
-    # path prompts for the required approval (matching the CLI gate).
+    # commands go through the ordinary shell approval ladder.
     if op == "navigate":
         url = op_args.get("url")
         if not isinstance(url, str) or not _navigate_target_is_public(url):

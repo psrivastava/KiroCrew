@@ -47,17 +47,20 @@ export function handoffErrorToAgent({
   report,
   message,
   hard = false,
+  leaveGranted = false,
   onHandoff,
 }: {
   report?: ErrorReport
   message?: string
   hard?: boolean
+  /** The caller's own leave gate already asked the page and it agreed — see `sendErrorToChat`. */
+  leaveGranted?: boolean
   onHandoff?: () => void
 }): boolean {
   const resolved: ErrorReport | { message: string } | null =
     report ?? findReport(message) ?? (message ? { message } : null)
   if (!resolved) return false
-  if (!sendErrorToChat(askAgentPrompt(resolved), { hard })) return false
+  if (!sendErrorToChat(askAgentPrompt(resolved), { hard, leaveGranted })) return false
   try { onHandoff?.() } catch { /* dismissal is cosmetic; never throw here */ }
   return true
 }
@@ -69,6 +72,7 @@ export default function AskAgentButton({
   hard = false,
   onHandoff,
   label,
+  gate,
   className = '',
   tone = 'danger',
 }: {
@@ -99,6 +103,22 @@ export default function AskAgentButton({
    * indistinguishable. Pass a full localized label, not a fragment to append.
    */
   label?: string
+  /**
+   * Runs the hand-off through the caller's own gate — `useGuardedLeave`'s
+   * `leave`, for a fallback rendered somewhere that HAS one in scope (the
+   * notification sheet's). The hand-off navigates away from the page on
+   * screen, and this button is hook-free by design, so it cannot ask that page
+   * itself. The gate receives the hand-off as `proceed` and decides whether it
+   * runs; a veto leaves the surface exactly as it was — nothing staged, nothing
+   * moved. Without a gate the hand-off runs directly.
+   *
+   * The gate IS the leave ask: once it has run `proceed`, the hand-off skips the
+   * installed navigator's own guard (`leaveGranted`). Both read the same
+   * `useMayLeaveForNavigation` channel, so asking twice posed one discard
+   * question two times, and a "keep my draft" on the second cancelled a hand-off
+   * the first had already accepted.
+   */
+  gate?: (proceed: () => void) => void
   className?: string
   /**
    * Link tint. `danger` (default) for placement inside an error surface;
@@ -118,7 +138,11 @@ export default function AskAgentButton({
   if (!report && !message) return null
 
   const onClick = () => {
-    handoffErrorToAgent({ report, message, hard, onHandoff })
+    // The gate goes in FRONT of the whole hand-off, staging included: a vetoed
+    // hand-off that had already queued its prompt would deliver it to the next
+    // chat the user opens, long after the crash it describes.
+    if (gate) gate(() => { handoffErrorToAgent({ report, message, hard, leaveGranted: true, onHandoff }) })
+    else handoffErrorToAgent({ report, message, hard, onHandoff })
   }
 
   const base = 'inline-flex items-center gap-1 shrink-0 cursor-pointer transition-colors'

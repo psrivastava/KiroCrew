@@ -40,6 +40,7 @@ const os = require("os");
 const path = require("path");
 
 const { findConfiguredDashboardPort } = require("./data-home");
+const { defaultedPort } = require("./gateway-auth-hint");
 const {
   classifyBundleLocation,
   containingDirForBundle,
@@ -48,16 +49,18 @@ const {
 } = require("./bundle-location");
 const { DEFAULT_REMOTE_BIN } = require("./remote-token");
 const {
-  migrateRemoteHostConfig,
-  remoteHostPort,
-  getRemoteHostConfig,
+  fallbackLocalPort,
   isSelectablePort,
+  legacyMigrationPort,
+  migrateRemoteHostConfig,
+  selectLaunchPort,
 } = require("./host-config");
 const { isLocalGatewayEnabled } = require("./local-gateway");
 const { seedRenamedStore } = require("./store-rename");
 const { resolveHome, secretCandidates } = require("./home-dir");
 const { identityFamily } = require("./instance-guard");
 const { isCCrew, ccrewAppName, CCREW_DEFAULT_PORT } = require("./ccrew-identity");
+const { describeSingletonLock } = require("./singleton-lock");
 const { initNativeLogging } = require("./native-logging");
 const { armCrashCollector, collectCrashReports } = require("./crash-collector");
 const { initGpuPolicy } = require("./disable-gpu");
@@ -67,6 +70,7 @@ const { exitImmersiveModes } = require("./blocking-prompt");
 const { createMetricsRecorder } = require("./perf-metrics");
 const { initMochi, shutdownMochi } = require("./mochi/index");
 const { borrowSessionToken } = require("./mochi-session-token");
+const { clearCacheOnUpgrade } = require("./upgrade-cache");
 const {
   initCrewCompanion,
   shutdownCrewCompanion,
@@ -134,61 +138,59 @@ const store = new Store({
 
 const KIROCREW_HOME = resolveHome();
 
-function resolvePort() {
+// dashboard.url in the resolved data home is the backend source of truth.
+const CONFIGURED_PORT = findConfiguredDashboardPort(fs, path, [KIROCREW_HOME]);
+
+// Resolved above the migration because both readers need it: an explicit
+// override is the port this launch binds, so it is also the port a legacy crew
+// has to be keyed under. 0 means absent or unusable.
+const ENV_PORT = (() => {
   const raw = process.env.KIROCREW_PORT;
-  if (raw) {
-    const parsed = parseInt(raw, 10);
-    if (isNaN(parsed) || parsed < 1 || parsed > 65535) {
-      console.warn('Invalid KIROCREW_PORT="' + raw + '", falling back to 5476');
-      return 5476;
-    }
-    return parsed;
-  }
+  if (!raw) return 0;
+  const parsed = parseInt(raw, 10);
+  // isSelectablePort, not just a range check: an override short-circuits
+  // selection, so a port selection would REFUSE reaches the launch through here
+  // untouched. Port 80 is refused because the shell's own URL loses it --
+  // `new URL("http://localhost:80").port` is "" -- so every per-port lookup
+  // misses, `isGatewayLocalForWindow` reads a tunnelled crew as local, and the
+  // idle heartbeat sends `X-Internal-Secret` to it. Guarding only the selection
+  // path left this route open: `legacyMigrationPort` then keyed a `remoteHosts`
+  // entry under 80 as well, which is the miss that makes the crew read as local.
+  if (isSelectablePort(parsed)) return parsed;
+  // An unusable value counts as absent rather than as a request for the product
+  // default, so every launch with no usable port of its own takes the same
+  // decision through selection. The warning stays, because the value was given
+  // and ignored.
+  console.warn('Invalid KIROCREW_PORT="' + raw + '", choosing a port as if it were unset');
+  return 0;
+})();
 
-  // dashboard.url in the resolved data home is the backend source of truth.
-  const configuredPort = findConfiguredDashboardPort(fs, path, [KIROCREW_HOME]);
+// Ahead of port selection, because selection is the reader that has to see the
+// crew. A legacy `remoteHost` carries no port of its own, so until it is folded
+// into `remoteHosts` there is no configured crew for selection to weigh, and the
+// launch decides as though the machine had none -- which is the shadowing this
+// whole path exists to prevent.
+if (migrateRemoteHostConfig(store, legacyMigrationPort({
+  envPort: ENV_PORT,
+  configuredPort: CONFIGURED_PORT,
+}))) {
+  glog("Migrated legacy remoteHost into remoteHosts before selecting a port");
+}
 
-  // With "Run a local gateway" off, a dashboard.url naming a port that has no
-  // remote host of its own records a backend which will not run here: nothing
-  // binds it and there is no host to mint a token from. A machine switched from
-  // local to remote-only keeps exactly that record, so honouring it would
-  // rebuild the dead end the opt-out is meant to avoid. A dashboard.url that
-  // DOES name a configured crew still wins -- that is the user choosing between
-  // crews rather than a leftover.
-  if (!isLocalGatewayEnabled(store)) {
-    if (
-      configuredPort
-      && isSelectablePort(configuredPort)
-      && getRemoteHostConfig(store, configuredPort)?.host
-    ) {
-      return configuredPort;
-    }
-    const remotePort = remoteHostPort(store);
-    if (remotePort) {
-      glog(
-        "Local gateway is off; targeting the configured remote crew on port " + remotePort,
-      );
-      return remotePort;
-    }
-    // No crew is configured, so there is no better target than the local
-    // record: naming the port the user configured beats naming the default.
-  }
-
-  if (configuredPort) return configuredPort;
-  if (isCCrew()) {
-    glog("No usable dashboard.url port in the data home; CCrew default " + CCREW_DEFAULT_PORT);
-    return CCREW_DEFAULT_PORT;
-  }
-  glog("No usable dashboard.url port in the data home, falling back to 5476");
-  return 5476;
+function resolvePort() {
+  if (ENV_PORT) return ENV_PORT;
+  return selectLaunchPort({
+    store,
+    configuredPort: CONFIGURED_PORT,
+    localGatewayEnabled: isLocalGatewayEnabled(store),
+    log: glog,
+    // CCrew runs beside KiroCrew, so its fallback is its own port (ccrew-identity.js).
+    ...(isCCrew() ? { defaultPort: CCREW_DEFAULT_PORT } : {}),
+  });
 }
 
 const PORT = resolvePort();
 const BACKEND_URL = "http://localhost:" + PORT;
-
-if (migrateRemoteHostConfig(store, PORT)) {
-  glog("Migrated legacy remoteHost to remoteHosts[" + PORT + "]");
-}
 
 // CCrew is a separate side-by-side app: its own name keeps its
 // requestSingleInstanceLock() and userData independent of an installed KiroCrew,
@@ -325,6 +327,12 @@ const requestQuit = () => {
 // Only the lock winner may arm native logging. A rejected second instance must
 // not rotate chromium.log out from under the primary process.
 if (!app.requestSingleInstanceLock()) {
+  const userDataDir = app.getPath("userData");
+  glog(
+    "single-instance lock held by another process; exiting. If no Kiro Crew window is open, "
+      + "a crash may have left a stale SingletonLock in " + userDataDir + ". "
+      + describeSingletonLock({ userDataDir }),
+  );
   app.exit(0);
 } else {
   // Record the moment this build became able to collect crashes, BEFORE the
@@ -418,6 +426,17 @@ const gateway = createGatewaySupervisor({
   warn: gwarn,
   error: gerror,
   logPath: gatewayLogPath,
+  // The port a successor re-exec'd from the error dialog will select. That
+  // successor starts with the local-gateway setting on, which is why the
+  // setting is named here rather than read: the store write that turns it on
+  // and this prediction describe the same next process. Running the same pure
+  // function that successor will run is what keeps the two answers identical.
+  // The port the successor will BIND, which is a different question from the
+  // port this launch targets: selection names a crew's port so a live tunnel
+  // there is adopted, and a new gateway must not bind that same port. This
+  // process pins the answer into the successor's environment, so the port it
+  // watches is the port the successor takes.
+  predictLocalPort: () => fallbackLocalPort(store, glog),
 });
 
 windows = createWindowLifecycle({
@@ -427,11 +446,12 @@ windows = createWindowLifecycle({
   port: PORT,
   glog,
   readInternalSecret,
-  fetchLocalToken: (...args) => gateway.fetchLocalToken(...args),
+  mintLocalToken: (...args) => gateway.mintLocalToken(...args),
   fetchRemoteToken: (...args) => gateway.fetchRemoteToken(...args),
   isQuitting: () => isQuitting,
   requestQuit,
   connectWindow: (...args) => gateway.connect(...args),
+  syncTunnel: () => gateway.syncTunnel(),
 });
 
 const ipcRegistrar = createIpcRegistrar({
@@ -520,10 +540,17 @@ async function offerRelocationIfUnupdatable() {
 async function fetchMochiGatewayAuth(backendUrl = BACKEND_URL) {
   // Keep the dashboard established credential order: local secret, explicit
   // SSH host, then a token borrowed from the already-authenticated session.
-  const localValue = await gateway.fetchLocalToken(backendUrl);
+  // Every credential here is delivered to `backendUrl` as written, which is what
+  // keeps the shell on one origin and its renderer on one storage bucket. What
+  // makes that address safe for a locally minted token is the mint's own refusal:
+  // `localhost` names both loopback families, so mintLocalToken() produces
+  // nothing unless this gateway holds every family that host resolves to.
+  const localValue = await gateway.mintLocalToken(backendUrl);
   if (localValue) return { value: localValue, viaCookie: false };
-  const { token: remoteValue } = await gateway.fetchRemoteToken(new URL(backendUrl).port);
-  if (remoteValue) return { value: remoteValue, viaCookie: false };
+  const { token: remoteValue } = await gateway.fetchRemoteToken(defaultedPort(backendUrl));
+  if (remoteValue) {
+    return { value: remoteValue, viaCookie: false };
+  }
   const borrowed = await borrowSessionToken({
     electronSession: session.defaultSession,
     backendUrl,
@@ -552,6 +579,17 @@ app.whenReady().then(async () => {
   // The crash reporter and the keep-alive safety net above are armed; from
   // here on an exception is recovered, not fatal.
   releaseEarlyBootGuard();
+
+  // A managed SSH forward does not survive sleep; reopen it on wake. A no-op
+  // unless this launch is keeping one.
+  try {
+    electron.powerMonitor.on("resume", () => {
+      glog("power: resumed from sleep");
+      gateway.reopenTunnel();
+    });
+  } catch (error) {
+    glog("power: could not watch for resume: " + (error && error.message));
+  }
 
   const frameDecision = windows.platform.linuxFrameDecision;
   if (frameDecision) {
@@ -594,6 +632,18 @@ app.whenReady().then(async () => {
 
   await gateway.start();
   await gateway.connect(mainWindow);
+  // The gateway now answers and the dashboard is loading. After an upgrade, drop
+  // the old build's cached copies and connect again: a fresh navigation replaces
+  // the pending one, where a reload would replay the uncommitted splash.
+  const cleared = await clearCacheOnUpgrade({
+    session: session.defaultSession,
+    store,
+    appVersion: app.getVersion(),
+    probe: () => fetch(BACKEND_URL + "/api/health", { signal: AbortSignal.timeout(2000) })
+      .then((response) => (response.ok ? response.json() : null)).catch(() => null),
+    log: glog,
+  });
+  if (cleared && !mainWindow.isDestroyed()) await gateway.connect(mainWindow);
 
   // Optional companion surfaces start only after the primary gateway handoff.
   // Both are best-effort and must never block an otherwise usable dashboard.
@@ -606,7 +656,7 @@ app.whenReady().then(async () => {
   try {
     initCrewCompanion({
       backendUrl: BACKEND_URL,
-      fetchLocalToken: (...args) => gateway.fetchLocalToken(...args),
+      mintLocalToken: (...args) => gateway.mintLocalToken(...args),
       glog,
       getDashboardWindow: () => windows.focusedDashboardWindow() || null,
     });

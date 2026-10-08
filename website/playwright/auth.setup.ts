@@ -42,12 +42,16 @@ setup('authenticate', async ({ page }) => {
       expect(response.ok(), await response.text()).toBeTruthy()
     }
   }
-  // Dismiss the first-run theme-onboarding overlay. App.tsx gates the "Choose
+  // Dismiss the first-run theme-onboarding overlay. shell/boot/firstRun.tsx gates the "Choose
   // your look" modal on the `mc-onboarded` localStorage flag; a fresh browser
   // context has no flag, so the modal would overlay the shell and intercept
   // every spec's interactions. Persisting it into storageState here lets all
   // test projects inherit it (the ephemeral gateway port makes a committed
   // state.json localStorage entry useless across runs, so it must be set live).
   await page.evaluate(() => window.localStorage.setItem('mc-onboarded', '1'))
+  // Same for the Meet CrewMates chapter: it opens by itself on the first
+  // Crewmates page visit to a workspace that has not seen it, and would cover
+  // every /members spec. `mc-crewmates-onboarded` is its render cache.
+  await page.evaluate(() => window.localStorage.setItem('mc-crewmates-onboarded', '1'))
   await page.context().storageState({ path: STATE_PATH })
 })

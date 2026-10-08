@@ -1,12 +1,12 @@
 ---
 title: Arrival provenance filing — file every arriving session under Imported / from <sender>
-status: accepted
+status: implemented
 author: chenmingwei23
 created: 2026-09-20
 last-audited: 2026-09-20
 audited-at: f31f25a8a2
 doc-pr:
-implementation-prs: []
+implementation-prs: [12196]
 tracking-issues: [11468]
 supersedes: []
 superseded-by: []
@@ -14,11 +14,11 @@ superseded-by: []
 
 # RFC: Arrival provenance filing — file every arriving session under Imported / from &lt;sender&gt;
 
-- Status: accepted — the decision record for a **changed default** on an
-  existing route, merged ahead of the implementation because the First
-  Principles lane reads it off the base branch. Every "exists today" claim below
-  was checked at `f31f25a8a2` (main, 2026-09-19); citations name symbols, not
-  line numbers.
+- Status: implemented in `src/kiro_crew/dashboard/arrival_folders.py` and
+  `src/kiro_crew/dashboard/session_transfer.py`. This remains the decision
+  record for the **changed default** on an existing route; every historical
+  "exists today" claim below was checked at `f31f25a8a2` (main, 2026-09-19),
+  and citations name symbols rather than line numbers.
 - Author: chenmingwei23
 - Tracking issue: [#11468](https://github.com/kirodotdev/KiroCrew/issues/11468)
 - Related: [rfc-crew-projects.md](rfc-crew-projects.md) (folders as the sidebar's
@@ -159,6 +159,11 @@ them.
    failure — lands the session unfiled. It must never fail an import that works
    today: the session and its transcript are the payload, and the grouping is
    convenience.
+
+The shipped mechanics behind these constraints — rollback of folders a failed
+import created, the `arrival_adopted` marker, and the deferred unhide of an adopted
+hidden folder — are owned by
+[instances.md §14.5a](../system-specs/modules/instances.md#145a-arrival-one-route-one-set-of-rules).
 
 ## 6. Alternatives measured against
 

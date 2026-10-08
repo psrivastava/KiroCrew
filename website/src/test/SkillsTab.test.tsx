@@ -960,7 +960,11 @@ describe('SkillsTab update/delete failure surfacing', () => {
       // Back is the editor's only other exit on a phone; taking it mid-save
       // would unmount the pane that renders the save's failure. (While the
       // save is in flight the button reads its pending label.)
-      fireEvent.click(screen.getByRole('button', { name: 'Skills' }))
+      const back = screen.getByRole('button', { name: 'Skills' })
+      // It must also read as unavailable, not look live and do nothing.
+      expect(back).toBeDisabled()
+      expect(back).toHaveAttribute('aria-disabled', 'true')
+      fireEvent.click(back)
       expect(screen.getByText('Saving…')).toBeInTheDocument()
     } finally {
       isMobileMock.value = false
@@ -1245,6 +1249,47 @@ describe('SkillsTab update/delete failure surfacing', () => {
       const fresh = await screen.findByTestId('skill-delete-failure')
       expect(within(fresh).queryByText('Ask the agent')).toBeInTheDocument()
       confirmSpy.mockRestore()
+    } finally {
+      isMobileMock.value = false
+    }
+  })
+
+  it('surfaces a save failure on the list when a viewport crossing hides the editor mid-save', async () => {
+    // Desktop, detail never explicitly opened: the editor shows only because
+    // the viewport is wide. Crossing to a phone mid-save hides it (the edit
+    // session stays latched), so the PUT's later rejection must report on
+    // the list instead of vanishing.
+    try {
+      mockApi.skills.mockResolvedValue(SKILL)
+      let rejectUpdate: (e: Error) => void = () => {}
+      mockApi.updateSkill.mockImplementation(() => new Promise((_, rej) => { rejectUpdate = rej }))
+
+      renderWithQuery()
+      const editBtn = await screen.findByText('Edit')
+      await waitFor(() => expect(editBtn).not.toBeDisabled())
+      fireEvent.click(editBtn)
+      fireEvent.click(await screen.findByText('Save'))
+      await waitFor(() => expect(mockApi.updateSkill).toHaveBeenCalled())
+
+      // Cross to a phone; a state-bearing interaction re-renders the tab.
+      isMobileMock.value = true
+      fireEvent.change(screen.getByPlaceholderText(/filter skills/i), { target: { value: 'f' } })
+      await waitFor(() => expect(screen.queryByText('Saving…')).not.toBeInTheDocument())
+
+      await act(async () => { rejectUpdate(new Error('disk full')) })
+      const notice = await screen.findByTestId('skill-update-failure-list')
+      expect(notice.textContent).toMatch(/disk full/)
+
+      // A row tap reopens the latched editor, which shows the failure inline.
+      fireEvent.click(screen.getByText('fragile'))
+      await screen.findByTestId('skill-update-failure')
+      expect(screen.queryByTestId('skill-update-failure-list')).not.toBeInTheDocument()
+
+      // Back to the list: dismiss retires it.
+      fireEvent.click(screen.getByRole('button', { name: 'Skills' }))
+      const again = await screen.findByTestId('skill-update-failure-list')
+      fireEvent.click(within(again).getByLabelText('Dismiss'))
+      await waitFor(() => expect(screen.queryByTestId('skill-update-failure-list')).not.toBeInTheDocument())
     } finally {
       isMobileMock.value = false
     }

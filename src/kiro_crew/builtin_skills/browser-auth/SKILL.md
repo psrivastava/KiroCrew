@@ -36,8 +36,14 @@ it:
 <https://chromewebstore.google.com/detail/playwright-extension/mmlmfjhmonkocbjadbfplnigmagldckm>
 
 The extension holds the `debugger` permission, which is what lets a command drive a
-tab the user is already logged into. Headless browsing needs none of this, so a
-missing extension costs attach mode only.
+tab the user is already logged into. A managed browser the CLI downloads needs none
+of this, so a missing extension costs attach mode only.
+
+**The browser must run on the gateway's machine.** The CLI reaches the extension
+through a relay on the machine it runs on. A user viewing a remote gateway from a
+laptop who installs the extension in the laptop's browser has not made that browser
+reachable; say so rather than retrying. Having the extension installed, or a token
+saved in Settings, is not proof that a browser is connected.
 
 **A failure to reach the relay endpoint means the extension is absent or disabled,
 not that the command was wrong.** Say so and point the user at the link rather than
@@ -72,6 +78,41 @@ The extension and CLI pair through a relay. An optional token in
 **Settings → Browser** removes the human approval click during attach; the same
 panel installs the CLI. Attach uses the user's real logins without cookie handling.
 
+**A token changed AFTER your process started breaks attach.** Your shell carries
+the value injected when your process started, so editing it in the extension alone
+leaves the two disagreeing:
+
+```
+Playwright extension did not connect within 30s after opening the connect page.
+Make sure the extension is installed in the Chrome profile "Default" and
+PLAYWRIGHT_MCP_EXTENSION_TOKEN matches its token.
+```
+
+That names a mismatch, not a missing extension, so the extension link is the wrong
+answer. Either drop the stale variable for the attach command alone, which puts the
+approval back in the browser, or have the user paste the extension's current token
+into **Settings → Browser** and continue in a new session: saving re-publishes it
+to processes started afterwards, while a session already running keeps the value
+it started with. Restarting the gateway alone re-reads the OLD stored token.
+
+For the first option:
+
+```bash
+env -u PLAYWRIGHT_MCP_EXTENSION_TOKEN playwright-cli attach --extension=chrome
+```
+
+Use that form on `attach` only. Do not carry it forward in a shell variable for
+later commands: attach already bound the session, so everything after it is a plain
+`playwright-cli` call, and a command whose text manipulates a `*_TOKEN` variable can
+be refused by the shell policy floor as credential access.
+
+**Attach gives you ONE tab: the one the extension was activated on.** `tab-list` is
+not a view of the browser. A page the user already has open — the one they are
+looking at, already logged in — is unreachable until they click the extension icon
+while on it. Tabs you create with `tab-new` are drivable, but a later re-attach
+drops them from the list. When the user already has the page open, ask for that
+click instead of opening your own second copy.
+
 Never `close` an attached session: it closes the windows the user is working in.
 To release the session when you are finished, use `playwright-cli detach`, which
 leaves their window untouched.
@@ -92,13 +133,13 @@ prompt: those are the user's to complete, and working around them is not on the
 table. When they confirm they are in:
 
 ```bash
-playwright-cli state-save ~/.kiro/crew/browser-state/example.json
+playwright-cli state-save "${KIROCREW_HOME:-$HOME/.kiro/crew}/browser-state/example.json"
 ```
 
 **Replay it later.**
 
 ```bash
-playwright-cli state-load ~/.kiro/crew/browser-state/example.json
+playwright-cli state-load "${KIROCREW_HOME:-$HOME/.kiro/crew}/browser-state/example.json"
 playwright-cli goto https://internal.example.com/dashboard
 ```
 
@@ -114,6 +155,51 @@ same for origin storage. Reach for these when a whole-state round trip is heavie
 than the task needs, or when diagnosing which cookie a site is actually missing:
 `cookie-list` after a failed load tells you whether the context carried anything
 at all.
+
+## A session can die mid-flow
+
+A login can expire between two of your own commands, and the failure does not
+arrive as a login page.
+
+**A page still on screen is not proof the session is alive.** A single-page app
+that already loaded keeps rendering after its cookie expires; only the next
+request redirects. A screenshot of the working page — yours or the user's — proves
+nothing about the session, and reading one as reassurance is how a dead session
+gets misdiagnosed as a driver bug.
+
+**Probe, do not infer.** Before a long authenticated flow, and again on the first
+ambiguous failure, make one request and read where it landed. **Probe in a new tab**,
+because in attach mode `goto` navigates the tab you are on, and the first ambiguous
+failure usually arrives mid-flow, with the form the user cares about in that tab:
+
+```bash
+playwright-cli tab-new https://internal.example.com/dashboard   # a known gated page
+playwright-cli tab-select <index of the tab you were working in>
+```
+
+The printed `Page URL` is the whole verdict: the target means the session is live,
+an identity-provider host means it is dead. One request, no screenshot. Reach for a
+same-tab `goto` only when you know that tab holds nothing you would lose.
+
+**A click that times out on stability can be an auth failure.** On a page that
+syncs in the background, an expired session makes those requests fail and the UI
+re-render, so the element never settles:
+
+```
+TimeoutError: Timeout 5000ms exceeded.
+  - locator resolved to <button ...>
+  - attempting click action
+    - waiting for element to be visible, enabled and stable
+```
+
+`locator resolved` means your ref was right. Run the probe above and
+`playwright-cli console` before touching selectors — re-picking refs against a dead
+session burns rounds and moves nothing.
+
+**Checkpoint a long flow.** In a form or wizard of more than a few steps, record
+which page you are on and what you entered as you go. Some apps save server side
+and some do not; if the session dies at step 30, you want to resume rather than
+rediscover what you already did.
 
 ## When a load lands on the login page anyway
 

@@ -600,7 +600,7 @@ class TestARefusedOverlapIsNotPersistedAsASuccessfulRun:
     the auto-pause budget. So a dispatch branch that merely returns ``None``
     without setting ``last_status`` persists a run that never happened. The
     ``cancelled`` branch escapes this only via ``_execute``'s separate
-    ``self._cancelled_jobs`` membership check, which a refused overlap is not in.
+    check of the run claim's ``cancelled`` flag, which a refused overlap never sets.
 
     These tests assert the disposition the starvation and fire-time-denial paths
     already use: ``last_status="error"`` (skips the success branch) plus
@@ -1076,6 +1076,15 @@ class TestACancelDuringTheShellProbeIsNotLost:
 
         return (
             _prepared(),
+            # The probe's verdict caches are module globals the whole xdist worker
+            # shares, and any earlier test that ran the REAL probe (a command cron
+            # under the real sandbox, say) leaves `/bin/sh` decided in them. A decided
+            # shell is never probed again, so the blip below would never happen and
+            # the cancel would have nowhere to land -- the assertion would then fail
+            # for the ORDER the tests ran in, not for the defect it pins. Fresh
+            # containers make this test's probe the first one its caches have seen.
+            patch.object(cron, "_POSIX_STRICT_CACHE", {}),
+            patch.object(cron, "_BRACE_OFF_SHELLS", {}),
             patch.object(cron, "_resolve_command_shell", wraps=cron._resolve_command_shell),
             patch.object(cron, "wrap_argv", side_effect=lambda argv, **k: (list(argv), None)),
             patch.object(cron, "cgroup_scope_argv", side_effect=lambda a: list(a)),

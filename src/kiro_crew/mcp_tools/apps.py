@@ -24,6 +24,7 @@ from urllib.parse import quote
 from kiro_crew import mcp_core
 from kiro_crew.platform import redact_via_context as redact
 from kiro_crew.validation import (
+    _ISSUE_RADAR_CREW_CLEARABLE_FIELDS,
     _ISSUE_RADAR_CREW_EVENT_KINDS,
     _ISSUE_RADAR_CREW_PHASES,
     _ISSUE_RADAR_CREW_SKIP_SCOPES,
@@ -48,7 +49,12 @@ def schemas() -> list[dict[str, Any]]:
                 "This is the ONLY way to persist findings: a raw HTTP PUT to the "
                 "same endpoint has no credential and is refused with 403. Local "
                 "triage state only — nothing is written to GitHub or GitLab. "
-                "Merges into any existing record, so a partial update is fine."
+                "Pass provider, host and kind with owner, repo and number: "
+                "together they pick which record is written. Within one "
+                "investigation run a write merges into the existing record, so a "
+                "partial update is fine; the first findings written after the "
+                "item's session changed (e.g. Start over) replace the previous "
+                "run's findings."
             ),
             "inputSchema": {
                 "type": "object",
@@ -59,7 +65,7 @@ def schemas() -> list[dict[str, Any]]:
                     "provider": {
                         "type": "string",
                         "enum": ["github", "gitlab"],
-                        "description": "Forge the repo lives on (default github)",
+                        "description": "Forge the repo lives on",
                     },
                     "host": {
                         "type": "string",
@@ -94,7 +100,7 @@ def schemas() -> list[dict[str, Any]]:
                     "next_action": {"type": "string", "description": "Recommended next action"},
                     "summary": {"type": "string", "description": "One-paragraph summary"},
                 },
-                "required": ["owner", "repo", "number"],
+                "required": ["owner", "repo", "number", "provider", "host", "kind"],
             },
         },
         {
@@ -151,6 +157,69 @@ def schemas() -> list[dict[str, Any]]:
                     },
                 },
                 "required": ["method", "path"],
+            },
+        },
+        {
+            "name": "design_tweak_update_thread",
+            "description": (
+                "Report progress on one Design Tweak comment thread, so its dot "
+                "in the live preview updates as you apply the batched edits. "
+                "This is the ONLY way an agent session can update a thread: the "
+                "raw `POST /thread` the skill once documented needs a dashboard "
+                "credential the session does not hold (the credential-exfil "
+                "safety floor blocks minting one), so it 403s and the dots never "
+                "change. The MCP server process holds the credential and you "
+                "never see one. Pass `request_id` (the request's id) and usually "
+                "`comment_id` (the `cid` of the specific comment you are working) "
+                "so the note lands on that comment's bubble; omit `comment_id` "
+                "only for a note that spans the whole batch. Post a short `text` "
+                "note when you start a comment and at each meaningful step; when "
+                "that comment is finished, send `status='done'` so its dot turns "
+                "green. `status` accepts only `done` — the tool reports forward "
+                "progress and exposes no destructive thread action (it cannot "
+                "clear or dismiss a request). `text` or `status` is required. "
+                "Never write the request file yourself; progress is reported "
+                "ONLY through this tool."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "request_id": {
+                        "type": "string",
+                        "description": (
+                            "The request's id (the `id` the request file is "
+                            "keyed by). Matches `^[A-Za-z0-9._-]+$`."
+                        ),
+                    },
+                    "comment_id": {
+                        "type": "string",
+                        "description": (
+                            "The `cid` of the specific comment to report against, "
+                            "so the note lands on that comment's bubble. Omit for "
+                            "a request-level note that spans the whole batch "
+                            "(e.g. 'rebuilding, one moment'). Matches "
+                            "`^[A-Za-z0-9._-]+$`."
+                        ),
+                    },
+                    "text": {
+                        "type": "string",
+                        "description": (
+                            "A single short progress line, e.g. 'Editing "
+                            "styles.css — uppercasing .section-title'. Required "
+                            "unless `status` is given."
+                        ),
+                    },
+                    "status": {
+                        "type": "string",
+                        "enum": ["done"],
+                        "description": (
+                            "Set `done` to mark the comment finished so its dot "
+                            "turns green. Only `done` is accepted. Required "
+                            "unless `text` is given."
+                        ),
+                    },
+                },
+                "required": ["request_id"],
             },
         },
         {
@@ -223,7 +292,8 @@ def schemas() -> list[dict[str, Any]]:
                 "health probe answers. Use it to check a pod you started is still "
                 "serving before driving it, and to tell 'my request failed' apart "
                 "from 'the pod is not running'. A `health` of 200/401/403 means "
-                "something is answering on that port; 0 means nothing is."
+                "this pod is up; 0 means nothing answers on that port; -2 means "
+                "another process answers on that port, so this pod is not up."
             ),
             "inputSchema": {
                 "type": "object",
@@ -303,11 +373,12 @@ def schemas() -> list[dict[str, Any]]:
                 "number for a cycle you did no work in. That writes one "
                 "crew-level line and no work item, so it also takes none of the "
                 "work-item fields. "
-                "WARNING — `event` and `why` BECOME PUBLIC: they are rendered into "
-                "your claim comment on the forge as well as on your crew page. "
-                "Never "
+                "WARNING — `event` BECOMES PUBLIC: it is rendered into your claim "
+                "comment on the forge as well as on your crew page. `why` is not "
+                "posted to the forge, but it shows on your crew page and, for a "
+                "skip, in the skip index every crew on this repo reads. Never "
                 "put an absolute path, a host name or anything else about the "
-                "machine you run on in them; worktree paths belong in "
+                "machine you run on in either; worktree paths belong in "
                 "`worktree`, which stays local. "
                 "This is the ONLY write path: a raw HTTP PUT to the same "
                 "endpoint has no credential and is refused with 403."
@@ -400,6 +471,20 @@ def schemas() -> list[dict[str, Any]]:
                         "type": "array",
                         "items": {"type": "string"},
                         "description": "Labels you applied, so a hand-back removes exactly those",
+                    },
+                    "clear": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "enum": sorted(_ISSUE_RADAR_CREW_CLEARABLE_FIELDS),
+                        },
+                        "description": (
+                            "Fields to EMPTY, by name — the only way to erase one, since "
+                            "an omitted field is left as stored. `pr_number` once the "
+                            "pull request is closed, `claim_comment_id` once the claim "
+                            "comment is gone, `next` when there is no next step. A field "
+                            "both cleared and set in the same call keeps the set value"
+                        ),
                     },
                     "event": {
                         "type": "string",
@@ -536,6 +621,60 @@ def ops_mission_control_api(name: str, args: dict[str, Any]) -> str:
             "call (e.g. query filters) to see the rest."
         )
     return _omc_text
+
+
+# The one Design Tweak route the agent reaches, under the gateway's dashboard
+# app reverse proxy (``/apps/{name}/api/{path}`` → the app's own backend
+# process; NOT ``/api/apps/...``, which carries only the gateway's own app
+# management routes). The gateway admits exactly this path to internal-secret
+# callers (``_MIXED_INTERNAL_API_PATHS`` in dashboard/server.py); every other
+# app route stays dashboard-only.
+_DESIGN_TWEAK_THREAD_URL = "/apps/design-tweak/api/thread"
+
+
+def design_tweak_update_thread(name: str, args: dict[str, Any]) -> str:
+    """Append progress to one Design Tweak comment thread via the app proxy.
+
+    The schema (``DESIGN_TWEAK_UPDATE_THREAD_SCHEMA``) bounds the field types,
+    lengths, and the ``status`` value set; the backend's ``_h_thread`` is the
+    single authority for the id grammar and the ``text or status`` rule (this
+    handler does not restate either). The handler needs no caller identity, so
+    it does NOT touch the session resolver.
+    """
+    _dt_request_id = args["request_id"]
+    _dt_comment_id = args.get("comment_id") or ""
+    _dt_text = args.get("text") or ""
+    _dt_status = args.get("status") or ""
+
+    # The agent-authored note is passed through unchanged: the backend's
+    # ``_redact_incoming_thread_text`` runs on EVERY ``/thread`` write (the only
+    # route this tool posts to), so a credential or exfil URL in it is scrubbed
+    # before it persists. Redacting here too would be a second copy of that one
+    # enforcement point. The response IS redacted below, since that path echoes
+    # app state the backend's inbound scrub never touched.
+    _dt_body: dict[str, Any] = {"role": "agent"}
+    if _dt_text:
+        _dt_body["text"] = _dt_text
+    if _dt_status:
+        _dt_body["status"] = _dt_status
+
+    # ids are value-position only, but URL-quote them anyway so a '.' or '-'
+    # edge case cannot alter the query.
+    _dt_url = f"{_DESIGN_TWEAK_THREAD_URL}?id={quote(_dt_request_id, safe='')}"
+    if _dt_comment_id:
+        _dt_url += f"&cid={quote(_dt_comment_id, safe='')}"
+
+    _dt_resp = mcp_core._post(_dt_url, _dt_body)
+    # Redact on the way OUT: the response echoes the thread, whose entries carry
+    # text from prior turns and the app's own state.
+    _dt_text_out = redact(json.dumps(_dt_resp, ensure_ascii=False, default=str))
+    _dt_cap = 20_000
+    if len(_dt_text_out) > _dt_cap:
+        _dt_text_out = (
+            _dt_text_out[:_dt_cap]
+            + f"\n… truncated ({len(_dt_text_out)} chars total)."
+        )
+    return _dt_text_out
 
 
 _POD_API_BASE = "/api/apps/dev-fleet/pod"
@@ -734,6 +873,13 @@ def issue_radar_crew_record(name: str, args: dict[str, Any]) -> str:
         _cw_body["labels_applied"] = [
             redact(s) for s in (args.get("labels_applied") or []) if s
         ]
+    # Names, forwarded as names: the route turns each into an explicit null in the
+    # work-item patch, which is how a field is emptied. Every field above is gated
+    # on truthiness, so this list is the ONLY way a clear reaches the ledger.
+    if "clear" in args:
+        _cw_body["clear"] = [
+            s for s in (args.get("clear") or []) if isinstance(s, str) and s
+        ]
     # The flat ci_* args are re-assembled into the store's `ci_state` dict
     # (crew_store merges it key-by-key). `ci_state` the ARG is the forge's
     # verdict word and becomes the dict's `state`; an int reading of 0 is
@@ -815,6 +961,7 @@ def issue_radar_crew_record(name: str, args: dict[str, Any]) -> str:
 HANDLERS: dict[str, Callable[[str, dict[str, Any]], str]] = {
     "issue_radar_record_investigation": issue_radar_record_investigation,
     "ops_mission_control_api": ops_mission_control_api,
+    "design_tweak_update_thread": design_tweak_update_thread,
     "pod_up": pod_up,
     "pod_down": pod_down,
     "pod_status": pod_status,

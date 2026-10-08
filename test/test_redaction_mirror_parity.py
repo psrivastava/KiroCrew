@@ -63,7 +63,7 @@ BACKEND_PKG = ROOT / "src" / "kiro_crew" / "security"
 # guard can point at the enforcing site while the sweep stays package-wide.
 BACKEND_EXFIL = BACKEND_PKG / "exfil.py"
 PREPARE_PR = (
-    ROOT / "src" / "kiro_crew" / "builtin_skills" / "kirocrew-dev" / "prepare-pr" / "scripts" / "pr_findings.py"
+    ROOT / "src" / "kiro_crew" / "builtin_skills" / "kirocrew-dev" / "kirocrew-prepare-pr" / "scripts" / "pr_findings.py"
 )
 FRONTEND = ROOT / "website" / "src" / "utils" / "sanitize.ts"
 TOKEN_MINT = ROOT / "src" / "kiro_crew" / "instances" / "token_mint.py"
@@ -157,6 +157,24 @@ class TestMirrorsMatchTheBackend:
             f"sanitize.ts no longer carries the JWS/JWE alternative from security.py "
             f"verbatim.\nexpected: {three_segment}"
         )
+
+
+class TestBase64BlobMirror:
+    """The base64-blob signal is spelled identically on both halves.
+
+    ``=`` is trailing padding only and counts toward the 40 chars. A drift on one
+    half would redact a ``name=<id>`` link on one surface and not the other, or
+    let a padded 40-char blob through on one of them.
+    """
+
+    SPELLING = r"[A-Za-z0-9+/]{40,}={0,2}|[A-Za-z0-9+/]{39}=|[A-Za-z0-9+/]{38}=="
+
+    def test_backend_carries_the_spelling(self) -> None:
+        assert f'r"{self.SPELLING}"' in BACKEND_EXFIL.read_text(encoding="utf-8")
+
+    def test_frontend_carries_the_spelling(self) -> None:
+        text = FRONTEND.read_text(encoding="utf-8")
+        assert f"const EXFIL_B64_RE = /{self.SPELLING}/i" in text
 
 
 class TestDeliberateNonMirrors:

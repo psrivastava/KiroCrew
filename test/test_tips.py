@@ -8,6 +8,7 @@ import json
 import os
 import random
 import re
+import sys
 import time
 from pathlib import Path
 from unittest.mock import patch
@@ -835,14 +836,27 @@ class TestStateFilePermissions:
             _save_state(TipsState(tips=[{"id": "x", "why": "references user projects"}]))
             st_file = tmp_path / "tips_state.json"
             assert st_file.is_file()
+            if sys.platform == "win32":
+                # No POSIX bits on Windows; the DACL half is covered by
+                # test_lockdown_precedes_content. The write itself must land.
+                assert json.loads(st_file.read_text())["tips"][0]["id"] == "x"
+                return
             assert (st_file.stat().st_mode & 0o777) == 0o600
 
     def test_existing_world_readable_file_corrected_on_rewrite(self, tmp_path: Path) -> None:
         with patch.dict(os.environ, {"KIROCREW_HOME": str(tmp_path)}):
             st_file = tmp_path / "tips_state.json"
             st_file.write_text("{}")
-            st_file.chmod(0o644)
+            if sys.platform != "win32":
+                st_file.chmod(0o644)
             _save_state(TipsState())
+            if sys.platform == "win32":
+                # No POSIX bits on Windows, so assert the rewrite actually
+                # landed instead: the seeded "{}" has no keys, so a skipped
+                # rewrite would leave "pool_id" absent and this would fail.
+                written = json.loads(st_file.read_text())
+                assert "pool_id" in written
+                return
             assert (st_file.stat().st_mode & 0o777) == 0o600
 
     def test_lockdown_precedes_content(self, tmp_path: Path, monkeypatch) -> None:
@@ -1994,6 +2008,18 @@ class TestCuratedTips:
                 f"{tip['id']} highlights {anchor!r}, which lives on the "
                 f"{entry['tab']!r} tab, not {route_tab!r}"
             )
+            # A control on a sub-navigated tab (Settings -> Chat pages) is only
+            # mounted when the route carries the page segment; without it the
+            # tab opens on its default page and the highlight misses.
+            sub = (entry.get("params") or {}).get("sub")
+            if sub:
+                segments = route_path.split("/")
+                route_sub = segments[3] if len(segments) > 3 else None
+                assert route_sub == sub, (
+                    f"{tip['id']} highlights {anchor!r}, which lives on the "
+                    f"{sub!r} page of the {entry['tab']!r} tab, but its route "
+                    f"{route!r} opens {route_sub!r}"
+                )
 
     @pytest.mark.asyncio
     async def test_curated_action_survives_serve(self, tmp_path: Path) -> None:

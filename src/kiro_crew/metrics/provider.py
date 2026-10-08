@@ -40,6 +40,7 @@ import threading
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple, Optional
+from urllib.parse import urlsplit
 
 from kiro_crew import __version__, beacon
 from kiro_crew.config.loader import KiroCrewConfig
@@ -265,8 +266,9 @@ _SESSION_BUCKETS_MS: list[float] = [
 # default 10s-ceiling boundaries. `test/metrics/test_provider_bucket_views.py`
 # fails when a histogram metric name in the source has no entry here — add the
 # instrument to this map when you add the metric. All values are ms — the
-# dashboard's generic aggregation reports every histogram under *_ms keys, so
-# a non-ms instrument would surface 1000x off there. A histogram that is NOT a
+# dashboard's generic aggregation reports a histogram under *_ms keys unless its
+# emitting module declares a non-millisecond unit for it, so a non-ms instrument
+# registered here would surface 1000x off there. A histogram that is NOT a
 # duration therefore belongs in `_HISTOGRAM_BUCKETS_BY_UNIT` below, whose
 # instruments the dashboard reads under unit-neutral keys instead.
 _HISTOGRAM_BUCKETS_MS: dict[str, list[float]] = {
@@ -306,6 +308,18 @@ _HISTOGRAM_BUCKETS_MS: dict[str, list[float]] = {
     # seconds.
     "kirocrew.embed.queue_wait": _FAST_BUCKETS_MS,
     "kirocrew.embed.inference": _FAST_BUCKETS_MS,
+    # Event-loop lag per adaptive-controller sample. Healthy is sub-millisecond
+    # to a few ms; a stall that trips the controller is 250ms to seconds, and
+    # _FAST_BUCKETS_MS (0.5ms..60s) resolves both ends.
+    "kirocrew.loop.lag_ms": _FAST_BUCKETS_MS,
+    # Observed round-trip of an escalated liveness probe the daemon ANSWERED.
+    # Its range is 0-20s: the fast 2s ping missed first, but that miss can be an
+    # instant connect refusal rather than a 2s timeout, so a local escalated
+    # round-trip can answer well under 2s, while a saturated one runs up to the
+    # _LIVENESS_ESCALATED_TIMEOUT_SECS (20s) cap. _FAST_BUCKETS_MS (0.5ms..60s)
+    # keeps resolution across that whole span and leaves headroom above the cap
+    # rather than flooring the tail into +Inf.
+    "kirocrew.mcp_gateway.liveness.escalated_latency_ms": _FAST_BUCKETS_MS,
 }
 
 # Per-turn billed amount. Calibrated against 17,240 real per-turn credit rows
@@ -334,11 +348,47 @@ _USD_BUCKETS: list[float] = [
     0.5, 1, 2.5, 5, 10, 25, 50, 100,
 ]
 
+# Resident set of one kirocrew process, in BYTES because that is the unit the
+# reader returns and converting at the emitter would make the boundary array and
+# the instrument disagree. Base-2 bounds so each one is a recognisable memory
+# size rather than a rounded decade.
+#
+# Density sits between 256 MiB and 4 GiB: that is where a gateway and a
+# tool-heavy agent process actually live, and it is the region where the answer
+# to "is the fleet near its memory ceiling" changes. The bottom bound is below
+# any Python process that has finished importing, and the top is well above the
+# largest process seen, because a sample outside the explicit range has its
+# percentile floored or capped at the nearest bound (the overflow artifact
+# `_HISTOGRAM_BUCKETS_MS` documents) and host memory is not ours to hold still.
+_RSS_BUCKETS_BYTES: list[float] = [
+    32 * 1024**2, 64 * 1024**2, 128 * 1024**2, 192 * 1024**2,
+    256 * 1024**2, 384 * 1024**2, 512 * 1024**2, 768 * 1024**2,
+    1024**3, 1536 * 1024**2, 2 * 1024**3, 3 * 1024**3,
+    4 * 1024**3, 6 * 1024**3, 8 * 1024**3, 16 * 1024**3,
+]
+
+# Share of the whole machine burned by one process: a dimensionless ratio where
+# 1.0 is every logical core saturated.
+#
+# Dense at the BOTTOM, which is the opposite of the amount arrays above and is
+# the whole point. A CPython process is mostly one runnable thread, so on a
+# 32-core host a fully busy process measures about 0.03 — put another way, the
+# entire interesting range on a large host sits inside what a linear array would
+# call its first bucket. Bounds above 1.0 are kept because
+# :func:`process_gauges.cpu_utilization` deliberately does not clamp: nothing
+# samples the clock and the kernel's accounting at the same instant, so a
+# saturated process can measure marginally over 1.0, and a bound above it keeps
+# that readable as "pegged" instead of silently capping the top percentile.
+_CPU_RATIO_BUCKETS: list[float] = [
+    0.001, 0.0025, 0.005, 0.01, 0.02, 0.04, 0.06, 0.08,
+    0.1, 0.15, 0.25, 0.4, 0.6, 0.8, 1.0, 1.25,
+]
+
 # Non-duration histograms: instrument name -> boundaries, in the instrument's
 # OWN unit. A SEPARATE map from _HISTOGRAM_BUCKETS_MS on purpose — that map's
 # contract is "all values are ms", which the dashboard's generic aggregation
-# relies on when it reports every histogram under `*_ms` keys, and adding a
-# credit or a dollar amount to it would make both the contract and the reported
+# relies on when it reports a histogram under `*_ms` keys by default, and adding
+# a credit or a dollar amount to it would make both the contract and the reported
 # key a lie. `test_provider_bucket_views.py` guards the split in both
 # directions off the emitted `unit=`, NOT off the name suffix: nothing here is a
 # millisecond instrument, nothing there is anything else, and every histogram
@@ -346,12 +396,20 @@ _USD_BUCKETS: list[float] = [
 # be the wrong test — `kirocrew.embed.queue_wait` and `.inference` above are ms
 # and do not carry it, which is the whole reason the guard reads units.
 #
-# The dashboard reads these two under unit-neutral keys (see
-# `handlers/telemetry.py`'s turn block), which is what keeps them out of the
-# `*_ms` surface.
+# The dashboard reads every entry here under unit-neutral keys rather than
+# `*_ms` ones. It resolves which names those are from the emitting module's own
+# unit declaration (`events.NON_MS_HISTOGRAM_UNITS`, merged in
+# `handlers/telemetry.py` the same way lifetime-total gauge names are), so a new
+# entry below is not silently reported as a duration.
 _HISTOGRAM_BUCKETS_BY_UNIT: dict[str, list[float]] = {
     "kirocrew.turn.credits": _CREDIT_BUCKETS,
     "kirocrew.turn.cost_usd": _USD_BUCKETS,
+    # Sampled at the adaptive controller's existing tick. A gauge of the same
+    # quantity ships beside each of these; the histogram exists because a gauge
+    # merged across instances keeps only min, max and mean, so a fleet-wide
+    # percentile is not recoverable from it at any storage layer.
+    "kirocrew.process.memory.rss_sampled": _RSS_BUCKETS_BYTES,
+    "kirocrew.process.cpu.utilization": _CPU_RATIO_BUCKETS,
 }
 
 
@@ -381,8 +439,8 @@ _provider: Optional["_MeterProviderT"] = None
 # counter and histogram, so the recheck is rate-limited: at most one re-resolve
 # per _CONSENT_RECHECK_SECS. That bounds how long an out-of-band change goes
 # unnoticed without charging the hot path, which sees only a monotonic compare.
-# A caller that must not wait (the dashboard's own PATCH route) calls shutdown()
-# instead and gets the rebuild on the very next metric.
+# A config write inside the gateway does not wait: the config-watcher applier
+# (``watch_config``) calls shutdown() and the next metric rebuilds.
 _CONSENT_RECHECK_SECS = 30.0
 # Consent the live recorder was built with, and when it was last verified.
 # ``None`` means "no live recorder", so the next call builds rather than compares.
@@ -852,6 +910,25 @@ def _otlp_destinations(cfg: "TelemetryConfig") -> "tuple[OtlpDestination, ...]":
     return _filter_metric_destinations(supplied)
 
 
+_FOREIGN_SIGNAL_ROUTES = (("/v1/traces", "traces"), ("/v1/logs", "logs"))
+
+
+def _foreign_signal_route(endpoint: str) -> Optional[str]:
+    """Name the non-metrics OTLP signal *endpoint*'s path addresses, else None.
+
+    Matches the standard OTLP/HTTP signal suffixes on the URL PATH only, so a
+    host name or query string containing ``traces`` is never mistaken for one.
+    """
+    try:
+        path = urlsplit(str(endpoint).strip()).path.rstrip("/").lower()
+    except ValueError:
+        return None
+    for suffix, signal in _FOREIGN_SIGNAL_ROUTES:
+        if path.endswith(suffix):
+            return signal
+    return None
+
+
 def _build_otlp_reader(dest: "OtlpDestination", cfg: object) -> Optional["_ReaderT"]:
     """Build one OTLP/HTTP metric reader for *dest*, or None when unavailable.
 
@@ -876,6 +953,21 @@ def _build_otlp_reader(dest: "OtlpDestination", cfg: object) -> Optional["_Reade
     (:func:`kiro_crew.metrics.temporality.otlp_preference`).
     """
     endpoint = dest.endpoint
+    # This core emits the metrics signal only. An endpoint whose path is another
+    # signal's OTLP route (a tracing backend's /v1/traces, e.g. Langfuse) would
+    # otherwise fail silently: the collector rejects every metric batch and no
+    # trace ever arrives, which reads as broken rather than unsupported. Warn
+    # once, by destination NAME (the URL can carry credentials), and keep the
+    # reader -- the operator's configuration is not overridden.
+    foreign = _foreign_signal_route(endpoint)
+    if foreign is not None:
+        logger.warning(
+            "OTLP destination %r points at an OTLP %s route, but Kiro Crew exports "
+            "metrics only (no %s); use the collector's /v1/metrics URL",
+            dest.name,
+            foreign,
+            foreign,
+        )
     # Callable directly (not only via _build_recorder), so make sure the lazily
     # imported SDK symbols this needs are bound.
     if not _load_otel():
@@ -1051,12 +1143,13 @@ def get_recorder() -> MetricsRecorder:
 
     The recheck is eventual by design — up to ``_CONSENT_RECHECK_SECS`` — so the
     extra thread hop changes nothing an observer can distinguish. A caller that
-    changed the setting itself calls ``shutdown()`` to skip the wait.
+    changed the setting in-process reaches ``shutdown()`` through the config
+    watcher (``watch_config``) and skips the wait.
     """
     global _recorder, _initialized, _built_consent
     # Snapshot into a local: the guard below spans a Python call, so re-reading the
     # global to return it would race a concurrent shutdown() — which the config
-    # route runs on an asyncio.to_thread worker — and hand back None from a
+    # watcher runs on an asyncio.to_thread worker — and hand back None from a
     # non-Optional signature.
     rec = _recorder
     if _initialized and rec is not None and not _consent_recheck_due():
@@ -1158,7 +1251,7 @@ def shutdown() -> None:
     without waiting out the recheck window.
 
     The flush runs on the CALLER's thread (so process teardown and the config
-    route — which calls this via ``asyncio.to_thread`` — both get a completed
+    watcher — which calls this via ``asyncio.to_thread`` — both get a completed
     flush) but NOT under ``_lock``: holding it across the flush would stall any
     concurrent ``get_recorder()`` on the event loop for the whole 30s deadline.
     """

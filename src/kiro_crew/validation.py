@@ -25,6 +25,14 @@ from dataclasses import dataclass, field
 from pathlib import PureWindowsPath
 from typing import Any
 
+# The artifact tag rule lives with the store's other field grammar and is read
+# here so the tool gate and the store cannot disagree about a tag. Import-safe:
+# ``artifact_store.rules`` loads the record dataclasses and the slug hash
+# fallback, never ``kiro_crew.artifacts`` (the service module whose import from
+# here would close the ``artifacts -> hooks -> webhooks -> validation`` cycle).
+from kiro_crew.artifact_store.rules import MAX_TAG_LEN as ARTIFACT_TAG_MAX
+from kiro_crew.artifact_store.rules import normalize_tag as _normalize_artifact_tag
+
 # Computer-use tool names and their argument bounds. Safe to import at module
 # scope: ``computer_use.types`` is deliberately dependency-free (it imports
 # nothing from ``kiro_crew`` and never touches ctypes), so there is no cycle and
@@ -32,12 +40,19 @@ from typing import Any
 # reads as "the computer-use vocabulary" rather than bare names.
 from kiro_crew.computer_use import types as _cu_types
 from kiro_crew.config.sections import SUBAGENT_MAX_TURNS_CEILING
+
+# ``MAX_SHORT_STRING`` is re-exported, not just used: it is part of this
+# module's surface and 15 other modules read it from here. It is DEFINED in
+# ``constants`` so ``execution_context`` can have it without this module's
+# import graph -- see the comment at its definition.
 from kiro_crew.constants import (
     ARTIFACT_MAX_CONTENT_BYTES,
     AWS_PROFILE_NAME_RE,
     CHANNEL_OWNER_DM_NAMESPACES,
     MAX_BANNER_CHARS,
+    MAX_SHORT_STRING,
     SLACK_NAMESPACE,
+    WAIT_TOOL_MAX_SECS,
     WINDOWS_DEVICE_STEMS,
 )
 
@@ -47,11 +62,11 @@ from kiro_crew.constants import (
 # ``model_registry`` (stdlib-only), so no cycle back into validation.
 from kiro_crew.effort import EFFORT_VALUES
 from kiro_crew.lesson_validation import LESSON_APPLIES_VALUES
+from kiro_crew.monitoring.limits import MAX_RUNTIME_CEILING_SECS, validate_runtime_secs
 from kiro_crew.monitoring.models import (
     MAX_MONITOR_AGENT_TURNS,
     MAX_MONITOR_CADENCE_SECS,
     MAX_MONITOR_PROVIDER_ERRORS,
-    MAX_MONITOR_RUNTIME_SECS,
     MAX_MONITOR_STOP_REASON_CHARS,
     MAX_MONITOR_TOKENS,
     MAX_MONITOR_WAKE_INSTRUCTIONS_CHARS,
@@ -62,16 +77,74 @@ from kiro_crew.monitoring.registry import (
     publicly_armable_objectives,
 )
 from kiro_crew.project_scope import SCOPE_FRAGMENT_RE
-from kiro_crew.solo_spawn import SOLO_SPAWN_REASONS
+from kiro_crew.work_vocab import WORK_ITEM_STATES, WORK_VERDICTS, WORK_WORKER_STATUSES
 
 # ── Constants ──
 
 # Max lengths for string inputs
 MAX_TOOL_NAME_LEN = 256
-MAX_SHORT_STRING = 500  # names, IDs, categories
 MAX_SKILL_KEY_CHARS = 32768  # nested catalog keys, transported in JSON for exact reads
 MAX_MEDIUM_STRING = 5_000  # messages, rules
 MAX_LONG_STRING = 50_000  # task specs, inline content
+# How many sessions one broadcast may reach. A fan-out bound, not a taste
+# judgement: every delivery runs the full ``send_to_target`` path -- a gate, an
+# audit write, and for a steer an RPC that suspends -- so an unbounded audience is
+# a way to occupy the event loop for as long as the caller likes.
+#
+# The VALUE is tied to ``dashboard.state.MAX_SLOTS_PER_CREATOR`` (50) and must
+# never fall below it. The broadcast's DEFAULT audience is "every live session
+# this caller created" (``broadcast_audience``), and that set is bounded by the
+# per-creator slot cap and by nothing else -- so a cap under it makes the
+# documented default path refuse itself with ``too_many_targets`` as soon as a
+# conductor holds more workers than the cap, which is a refusal the caller cannot
+# act on: it did not name those targets, the fence did. Sitting at the per-creator
+# cap makes the default audience structurally unable to exceed this bound instead
+# of merely unlikely to.
+#
+# It is a literal rather than an import because ``kiro_crew.dashboard.state``
+# imports this module (a derived value here would be a cycle), so the relation is
+# held by a test instead: ``test_session_broadcast.py`` asserts
+# ``MAX_BROADCAST_TARGETS >= MAX_SLOTS_PER_CREATOR``. Raise that cap and the test
+# names this line; lower this one and it names it too. Note the second consumer of
+# this number: ``mcp_dashboard`` sizes its one HTTP request as
+# ``cap * BROADCAST_TARGET_ALLOWANCE_SECS + BROADCAST_RESPONSE_MARGIN_SECS``, so
+# the worst-case broadcast request budget moves with it (50 -> 260s).
+#
+# It lives HERE, with the other input bounds, because the argument schema and the
+# verb must refuse at the same number: two literals would let one layer enforce a
+# stale cap while the other's refusal code and documentation named a different one.
+MAX_BROADCAST_TARGETS = 50
+
+# Maximum session-status rows retained for a caller. Unlike the live-slot cap,
+# this bounds the durable transcript roster left by sessions that were created
+# and closed, so one long-running conductor cannot grow a model-visible reply
+# without limit. Applied where source rows and response rows are retained.
+MAX_SESSION_STATUS_ROWS = 256
+
+# Maximum characters retained from one session-status title. Transcript metadata
+# is editable by an agent's own file tools, so this bounds attacker-controlled
+# text before it enters a retained roster row and, later, a model's context.
+MAX_SESSION_STATUS_TITLE_CHARS = 500
+
+# Seconds ONE broadcast delivery may take before the loop stops waiting for it and
+# moves to the next target. Enforced per delivery, never over the fan-out: the
+# bound exists so a single unresponsive session cannot starve the ones behind it,
+# and a shared budget the early targets could spend would do exactly that.
+#
+# It lives beside the cap because the two bound the same fan-out from opposite
+# ends and BOTH layers read it: the backend enforces it per delivery, and the MCP
+# client multiplies it by the cap to size its one HTTP request. A client budget
+# below the enforced bound would let a full audience expire the request and
+# discard the per-target report the verb exists to produce, so the two must move
+# together -- which is what one name guarantees and two literals only hope for.
+BROADCAST_TARGET_ALLOWANCE_SECS = 5.0
+
+# Seconds the one broadcast request allows beyond the backend's worst-case
+# delivery time. This covers the per-target gate and audit work, the broadcast's
+# own audit write, and the HTTP response itself. It is an allowance, not a value
+# derived from measurement: the client budget must EXCEED the sequential delivery
+# bound, never merely equal it, so the per-target report still reaches the caller.
+BROADCAST_RESPONSE_MARGIN_SECS = 10.0
 # Longest backend-authored ACP session id Kiro Crew RETAINS in a store of its
 # own: the native-child rosters and a created slot's frozen creator id (held in
 # memory only, never written to the transcript), and through it the crew log's
@@ -166,13 +239,53 @@ LESSON_LIST_OFFSET_MAX = 100_000_000
 # Allowed cron schedule kinds
 ALLOWED_SCHEDULE_KINDS = frozenset({"every", "cron", "at"})
 
-# Allowed hook events
+# Every event a script hook may be authored against: the five the gateway fires,
+# plus the six a Kiro Agent session owns, which are stored and fired by no event
+# (``hooks.HOOK_EVENTS_KAS_ONLY``, whose header says which of the six a Kiro
+# Agent even asks for and why Test still runs one). Spelled
+# out rather than imported from ``kiro_crew.hooks``, which imports this module --
+# ``test_hook_validation_parity`` pins the two sets equal, so a member added
+# there and forgotten here fails a test instead of silently refusing the new
+# event at the create and update schemas.
 ALLOWED_HOOK_EVENTS = frozenset(
-    {"AgentSpawn", "UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop"}
+    {
+        "AgentSpawn",
+        "UserPromptSubmit",
+        "PreToolUse",
+        "PostToolUse",
+        "Stop",
+        "PreTaskExecution",
+        "PostTaskExecution",
+        "FileCreated",
+        "FileEdited",
+        "FileDeleted",
+        "UserTriggered",
+    }
 )
 
-# Valid agent name pattern (alphanumeric, hyphens, underscores)
-_AGENT_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,62}[a-zA-Z0-9]$|^[a-zA-Z0-9]$")
+_AGENT_NAME_RE = re.compile(r"^(?:[a-zA-Z0-9][a-zA-Z0-9_-]{0,62}[a-zA-Z0-9]|[a-zA-Z0-9])\Z")
+
+TEMPLATE_NAME_RE = re.compile(r"^(?:[A-Za-z0-9][A-Za-z0-9_.-]{0,61}[A-Za-z0-9]|[A-Za-z0-9])\Z")
+
+#: The union of the two identifier grammars, as one pattern for ``FieldSpec``:
+#: a tool argument that names a registered agent SPEC (``spawn_run(agent=...)``,
+#: ``cron_add(agent=...)``) admits a published dotted template exactly as the
+#: read-side resolvers do. Crew MEMBERS are not named through these fields --
+#: ``crew`` / ``member_id`` carry them, unpatterned -- so this stays an
+#: identifier grammar. Keep in step with :func:`is_registered_agent_name`.
+REGISTERED_AGENT_NAME_RE = re.compile(
+    r"^(?:[a-zA-Z0-9][a-zA-Z0-9_-]{0,62}[a-zA-Z0-9]"
+    r"|[A-Za-z0-9][A-Za-z0-9_.-]{0,61}[A-Za-z0-9]"
+    r"|[a-zA-Z0-9])\Z"
+)
+
+
+def is_registered_agent_name(value: object) -> bool:
+    """Return whether *value* can name a registered agent spec."""
+    return isinstance(value, str) and bool(
+        _AGENT_NAME_RE.fullmatch(value) or TEMPLATE_NAME_RE.fullmatch(value)
+    )
+
 
 # Artifact slug grammar — mirrors kiro_crew.artifacts._SLUG_RE (kept here so
 # consumers outside the store module share one public definition). Used to
@@ -362,6 +475,32 @@ class ValidationError(Exception):
 #: short so it costs almost none of the field's budget.
 _CLAMP_NOTE = " [... truncated, dropped {n} chars]"
 
+#: Reads :data:`_CLAMP_NOTE` back off a clamped value. Derived FROM that constant
+#: rather than spelled a second time, so the stamp and its reader cannot drift
+#: apart when the wording changes.
+_CLAMP_NOTE_RE = re.compile(re.escape(_CLAMP_NOTE).replace(r"\{n\}", r"(\d+)") + r"\Z")
+
+
+def clamp_report(value: str) -> tuple[int, int] | None:
+    """For a value stamped by :func:`clamp_to_max_len`, return ``(before, kept)``.
+
+    ``None`` when the value carries no stamp, which is the common case. ``before``
+    is the length the clamp saw and ``kept`` the length of the caller's own text
+    that survived, excluding the stamp itself — the two numbers a caller needs to
+    be told what happened to its field in the same round-trip that accepted it.
+
+    Reading the stamp back is what lets a tool whose reply does NOT echo the
+    applied value still report the cut (see ``mcp_work.work_report``). A caller
+    whose own text happens to end in the stamp's exact shape would be described
+    as clamped when it was not; the cost is one inaccurate advisory line, which
+    is why no decision is keyed off this.
+    """
+    match = _CLAMP_NOTE_RE.search(value)
+    if not match:
+        return None
+    kept = len(value) - (match.end() - match.start())
+    return kept + int(match.group(1)), kept
+
 
 @dataclass
 class FieldSpec:
@@ -376,10 +515,14 @@ class FieldSpec:
     allowed: frozenset[str] | None = None  # enum allow-list
     pattern: re.Pattern[str] | None = None  # regex pattern
     default: Any = None
-    item_type: type | None = None  # type: ignore[valid-type]  # for list fields: expected type of each element
+    item_type: type | tuple[type, ...] | None = None  # type: ignore[valid-type]  # for list fields: expected type(s) of each element
     item_max_len: int = 0  # for list fields: max length of each string element
     item_pattern: re.Pattern[str] | None = None  # for list fields: regex for each string element
     max_items: int = 0  # for list fields: max number of items (0 = no limit)
+    # For list fields whose items may be objects: the ToolSchema each dict item
+    # is validated against (unknown keys refused, like a top-level call). Only
+    # consulted when ``item_type`` admits ``dict``.
+    item_schema: Any = None
     # Opt-in, and DELIBERATELY narrow: when a string field is over ``max_len``,
     # truncate it to the cap instead of rejecting the whole call. For a field
     # whose only job is to EXPLAIN a request — ``autonudge_stop`` /
@@ -494,10 +637,20 @@ def validate_field(value: Any, spec: FieldSpec) -> Any:
         if spec.item_type:
             for i, item in enumerate(value):
                 if not isinstance(item, spec.item_type):
+                    item_types: tuple[type, ...] = (
+                        spec.item_type if isinstance(spec.item_type, tuple) else (spec.item_type,)
+                    )
+                    expected = " or ".join(t.__name__ for t in item_types)
                     raise ValidationError(
                         spec.name,
-                        f"item[{i}]: expected {spec.item_type.__name__}, got {type(item).__name__}",
+                        f"item[{i}]: expected {expected}, got {type(item).__name__}",
                     )
+                if isinstance(item, dict) and spec.item_schema is not None:
+                    try:
+                        value[i] = validate_tool_args(item, spec.item_schema)
+                    except ValidationError as exc:
+                        raise ValidationError(f"{spec.name}[{i}].{exc.field}", exc.message) from exc
+                    continue
                 if isinstance(item, str):
                     item = sanitize_string(item)
                     value[i] = item
@@ -957,14 +1110,7 @@ def strip_hidden_unicode(text: str) -> str:
     # Testing against the raw input let a stripped character vouch for a mark
     # (``AKIA<ZWSP><ZWJ>IOSF…``: the ZWSP is removed, but the ZWJ saw it as a
     # non-ASCII neighbour and stayed, leaving the credential unredactable).
-    kept: list[str] = []
-    for ch in text:
-        if (
-            ch in _ALLOWED_CONTROL
-            or ch in _ALLOWED_FORMAT
-            or unicodedata.category(ch) not in _HIDDEN_CATEGORIES
-        ):
-            kept.append(ch)
+    kept = _drop_hidden_except_marks(text)
     # Pass 2: a shaping mark survives only if the nearest surviving
     # NON-MARK character on one side is non-ASCII. Skipping over adjacent
     # marks is what stops a run of them from vouching for each other —
@@ -989,16 +1135,60 @@ def strip_hidden_unicode(text: str) -> str:
     return "".join(out)
 
 
+def _drop_hidden_except_marks(text: str) -> list[str]:
+    """Drop every hidden character except the shaping marks in ``_ALLOWED_FORMAT``."""
+    return [
+        ch
+        for ch in text
+        if ch in _ALLOWED_CONTROL
+        or ch in _ALLOWED_FORMAT
+        or unicodedata.category(ch) not in _HIDDEN_CATEGORIES
+    ]
+
+
 def normalize_unicode(text: str) -> str:
     """NFC-normalize Unicode text to canonical form."""
     return unicodedata.normalize("NFC", text)
 
 
 def sanitize_string(text: str) -> str:
-    """Full sanitization pipeline: normalize → strip hidden chars → strip edges."""
-    text = normalize_unicode(text)
-    text = strip_hidden_unicode(text)
-    return text.strip()
+    """Full sanitization pipeline: drop hidden → normalize → strip hidden → trim edges.
+
+    Dropping hidden characters first lets combining marks compose across a
+    removed character. The shaping marks are judged only after NFC, because
+    NFC changes their neighbours (``e`` + U+0301 becomes non-ASCII ``é``, and
+    U+212A KELVIN SIGN becomes ASCII ``K``).
+    """
+    text = normalize_unicode("".join(_drop_hidden_except_marks(text)))
+    return _trim_edges(strip_hidden_unicode(text))
+
+
+def _trim_edges(text: str) -> str:
+    """Trim edge whitespace and the shaping marks it would strand, in one pass.
+
+    A shaping mark in an edge run survives only when it touches the kept text
+    and that text's edge character is non-ASCII. Trimming whitespace alone can
+    leave a mark beside ASCII only, which the next ``sanitize_string`` call
+    would then remove.
+    """
+
+    def trimmable(ch: str) -> bool:
+        return ch.isspace() or ch in _ALLOWED_FORMAT
+
+    start, end = 0, len(text)
+    while start < end and trimmable(text[start]):
+        start += 1
+    while end > start and trimmable(text[end - 1]):
+        end -= 1
+    if start == end:
+        return ""
+    if not text[start].isascii():
+        while start > 0 and text[start - 1] in _ALLOWED_FORMAT:
+            start -= 1
+    if not text[end - 1].isascii():
+        while end < len(text) and text[end] in _ALLOWED_FORMAT:
+            end += 1
+    return text[start:end]
 
 
 def sanitize_json_values(value: Any) -> Any:
@@ -1043,42 +1233,107 @@ def sanitize_response(text: str, max_len: int = MAX_RESPONSE_LEN) -> str:
 # ── JSON-RPC Envelope Validation ──
 
 
+#: JSON-RPC 2.0 reserved error codes for a request that cannot be served: a
+#: frame that does not parse, a malformed envelope, params a method cannot
+#: take, and a server-side fault. Here, beside the envelope validator, so a
+#: stdio MCP server can answer with them without importing the ACP layer.
+JSONRPC_PARSE_ERROR = -32700
+JSONRPC_INVALID_REQUEST = -32600
+JSONRPC_INVALID_PARAMS = -32602
+JSONRPC_INTERNAL_ERROR = -32603
+
+
+class JsonRpcEnvelopeError(ValidationError):
+    """A JSON-RPC request envelope that cannot be served, with what answers it.
+
+    ``req_id`` is the request's own id (``None`` for a notification, which is
+    never answered); ``invalid_params`` tells a ``params`` that is not an
+    object (JSON-RPC ``-32602``) from a malformed envelope (``-32600``).
+    """
+
+    def __init__(
+        self, field: str, message: str, *, req_id: Any, method: Any, invalid_params: bool
+    ) -> None:
+        super().__init__(field, message)
+        self.req_id = req_id
+        self.method = method
+        self.invalid_params = invalid_params
+
+
 def validate_jsonrpc_request(req: dict[str, Any]) -> tuple[str, Any, dict[str, Any]]:
     """Validate a JSON-RPC 2.0 request envelope.
 
-    Returns (method, id, params). Raises ValidationError on invalid structure.
+    Returns (method, id, params). Raises ValidationError on invalid structure:
+    :class:`JsonRpcEnvelopeError` for an object envelope, carrying the id the
+    refusal is owed to. Absent or ``null`` params read as ``{}``; params of any
+    other non-object type are refused rather than read as ``{}``, so a request
+    that names no usable arguments is answered as such instead of served as
+    one that sent none.
     """
     if not isinstance(req, dict):
         raise ValidationError("request", "must be a JSON object")
-    if req.get("jsonrpc") not in ("2.0", None):
-        raise ValidationError("jsonrpc", "must be '2.0'")
-
-    method = req.get("method")
-    if method is not None and not isinstance(method, str):
-        raise ValidationError("method", "must be a string")
-
     req_id = req.get("id")
-    params = req.get("params", {})
-    if not isinstance(params, dict):
+    method = req.get("method")
+    if req.get("jsonrpc") not in ("2.0", None):
+        raise JsonRpcEnvelopeError(
+            "jsonrpc", "must be '2.0'", req_id=req_id, method=method, invalid_params=False
+        )
+
+    if method is not None and not isinstance(method, str):
+        raise JsonRpcEnvelopeError(
+            "method", "must be a string", req_id=req_id, method=method, invalid_params=False
+        )
+
+    params = req.get("params")
+    if params is None:
         params = {}
+    elif not isinstance(params, dict):
+        raise JsonRpcEnvelopeError(
+            "params",
+            f"must be an object, not {type(params).__name__}",
+            req_id=req_id,
+            method=method,
+            invalid_params=True,
+        )
 
     return method or "", req_id, params
 
 
 # ── Tool Schemas (MCP Core) ──
 
+#: One ``spawn_run`` ``tasks[]`` entry in object form. A string
+#: entry is the plain prompt; an object entry carries the prompt plus the
+#: per-task overrides that win over the call's batch-wide value. Kept to the
+#: fields a caller varies across one wave in practice (model, effort); a
+#: per-task template is ``agents``. The rest stay batch-wide and can join this
+#: object later without changing the shape again.
+SPAWN_RUN_TASK_ITEM_SCHEMA = ToolSchema(
+    tool_name="spawn_run.tasks[]",
+    fields=[
+        FieldSpec("task", str, required=True, max_len=MAX_MEDIUM_STRING),
+        FieldSpec("model", str, max_len=MAX_SHORT_STRING, pattern=_MODEL_NAME_RE),
+        FieldSpec("reasoning_effort", str, allowed=EFFORT_VALUES),
+    ],
+)
+
 SPAWN_RUN_SCHEMA = ToolSchema(
     tool_name="spawn_run",
     fields=[
         FieldSpec("task", str, max_len=MAX_MEDIUM_STRING),
-        FieldSpec("tasks", list, item_type=str, item_max_len=MAX_MEDIUM_STRING),
-        FieldSpec("agent", str, max_len=MAX_SHORT_STRING, pattern=_AGENT_NAME_RE),
+        FieldSpec(
+            "tasks",
+            list,
+            item_type=(str, dict),
+            item_max_len=MAX_MEDIUM_STRING,
+            item_schema=SPAWN_RUN_TASK_ITEM_SCHEMA,
+        ),
+        FieldSpec("agent", str, max_len=MAX_SHORT_STRING, pattern=REGISTERED_AGENT_NAME_RE),
         FieldSpec(
             "agents",
             list,
             item_type=str,
             item_max_len=MAX_SHORT_STRING,
-            item_pattern=_AGENT_NAME_RE,
+            item_pattern=REGISTERED_AGENT_NAME_RE,
         ),
         # 0 = "not set" → falls through to config default via `0 or config_value`.
         # Bounded by the same ceiling the config loader clamps
@@ -1100,11 +1355,10 @@ SPAWN_RUN_SCHEMA = ToolSchema(
         # persists (hibernated on disk) after completion, and spawn_continue
         # can dispatch follow-up turns into it with full prior context.
         FieldSpec("keep", bool),
-        # Why ONE task is being spawned alone. Closed vocabulary from
-        # ``solo_spawn.SOLO_SPAWN_REASONS``; ``""`` is "not given". The gate
-        # that requires it lives in ``mcp_tools.spawn`` (task count) and
-        # ``handlers.messaging.api_spawn`` (roster check); this only bounds it.
-        FieldSpec("solo_reason", str, allowed=SOLO_SPAWN_REASONS),
+        # Legacy solo-spawn fields: unadvertised and ignored, but accepted
+        # so a skill or workflow that still sends them is not refused as
+        # "unknown field".
+        FieldSpec("solo_reason", str, max_len=MAX_SHORT_STRING),
         FieldSpec("solo_details", str, max_len=MAX_MEDIUM_STRING),
         # Switchable context groups the sub-agent inherits. Explicit
         # ``default=True`` rather than the implicit ``None``: the semantic
@@ -1138,7 +1392,7 @@ SPAWN_CONTINUE_SCHEMA = ToolSchema(
     fields=[
         FieldSpec("conversation", str, required=True, max_len=MAX_SHORT_STRING),
         FieldSpec("task", str, required=True, max_len=MAX_MEDIUM_STRING),
-        FieldSpec("agent", str, max_len=MAX_SHORT_STRING, pattern=_AGENT_NAME_RE),
+        FieldSpec("agent", str, max_len=MAX_SHORT_STRING, pattern=REGISTERED_AGENT_NAME_RE),
         FieldSpec("max_turns", int, min_val=0, max_val=SUBAGENT_MAX_TURNS_CEILING),
         FieldSpec("model", str, max_len=MAX_SHORT_STRING, pattern=_MODEL_NAME_RE),
     ],
@@ -1172,9 +1426,8 @@ SPAWN_SUB_AGENTS_SCHEMA = ToolSchema(
         FieldSpec("include_memory", bool, default=True),
         FieldSpec("include_lessons", bool, default=True),
         FieldSpec("include_project", bool, default=True),
-        # Same solo-spawn reason as spawn_run: required when ``agents`` holds
-        # exactly one entry that names no agent_or_mode.
-        FieldSpec("solo_reason", str, allowed=SOLO_SPAWN_REASONS),
+        # Retired solo-spawn gate fields, accepted and ignored as on spawn_run.
+        FieldSpec("solo_reason", str, max_len=MAX_SHORT_STRING),
         FieldSpec("solo_details", str, max_len=MAX_MEDIUM_STRING),
     ],
 )
@@ -1272,7 +1525,8 @@ SPAWN_STATUS_SCHEMA = ToolSchema(
     tool_name="spawn_status",
     fields=[
         FieldSpec("agent_id", str, required=True, max_len=64),
-        # Paged / filtered reads of the retained transcript (line-oriented).
+        # Paged / filtered reads of a running partial or retained full transcript
+        # (line-oriented in both states).
         FieldSpec("offset", int, min_val=0, max_val=100_000_000),
         FieldSpec("limit", int, min_val=0, max_val=2000),
         FieldSpec("grep", str, max_len=500),
@@ -1313,8 +1567,38 @@ AUTONUDGE_STOP_SCHEMA = ToolSchema(
     ],
 )
 
+
+def _validate_monitor_runtime(args: dict[str, Any]) -> None:
+    value = args.get("max_runtime_secs")
+    if value is not None:
+        try:
+            args["max_runtime_secs"] = validate_runtime_secs(value)
+        except ValueError as exc:
+            raise ValidationError("max_runtime_secs", str(exc)) from exc
+
+
+#: The one value ``watch`` accepts, as a LITERAL. Spelled here rather than imported from
+#: :mod:`kiro_crew.probes` for the reason that package spells its own kinds as literals:
+#: this module is imported by every MCP surface and ``probes`` pulls in a probe
+#: implementation, so the schema must not drag the observation layer along to validate a
+#: string. ``test_both_monitor_schemas_accept_the_work_ledger_watch`` pins it equal to
+#: ``probes.WORK_LEDGER``.
+#:
+#: CLOSED to one value on purpose. ``watch`` exists for the one subject an instruction
+#: cannot name -- a session's own key is not in its own prose -- and ``gh-pr`` is already
+#: inferred from the message, so accepting it here would offer a second spelling of the
+#: default. A caller naming anything else is refused rather than given an ordinary timer.
+_WATCH_WORK_LEDGER = "work-ledger"
+
+#: Shared by both monitor schemas, so the arm and the revision cannot drift on what the
+#: field accepts. Optional: absent means "infer the subject from the message", which is
+#: every caller written before this field existed.
+_MONITOR_WATCH_FIELD = FieldSpec("watch", str, allowed=frozenset({_WATCH_WORK_LEDGER}))
+
+
 MONITOR_WATCH_SCHEMA = ToolSchema(
     tool_name="monitor_watch",
+    custom_validator=_validate_monitor_runtime,
     fields=[
         FieldSpec("kind", str, required=True, allowed=publicly_armable_kinds()),
         FieldSpec("target", str, required=True, max_len=MAX_SHORT_STRING),
@@ -1325,8 +1609,9 @@ MONITOR_WATCH_SCHEMA = ToolSchema(
             min_val=MIN_MONITOR_CADENCE_SECS,
             max_val=MAX_MONITOR_CADENCE_SECS,
         ),
-        FieldSpec("max_runtime_secs", int, min_val=1, max_val=MAX_MONITOR_RUNTIME_SECS),
-        FieldSpec("max_agent_turns", int, min_val=1, max_val=MAX_MONITOR_AGENT_TURNS),
+        FieldSpec("max_runtime_secs", (int, float), min_val=1, max_val=MAX_RUNTIME_CEILING_SECS),
+        # Floor 0, not 1: zero is the unlimited sentinel for this one budget.
+        FieldSpec("max_agent_turns", int, min_val=0, max_val=MAX_MONITOR_AGENT_TURNS),
         FieldSpec("max_tokens", int, min_val=1, max_val=MAX_MONITOR_TOKENS),
         FieldSpec("max_provider_errors", int, min_val=1, max_val=MAX_MONITOR_PROVIDER_ERRORS),
         FieldSpec("wake_instructions", str, max_len=MAX_MONITOR_WAKE_INSTRUCTIONS_CHARS),
@@ -1345,16 +1630,16 @@ MONITOR_STOP_SCHEMA = ToolSchema(
 # monitor_start creates an AutoNudge loop bound to the calling session (the
 # agent-facing "babysit this PR" primitive). message caps match the REST
 # endpoint's 8000-char limit; interval bounds mirror autonudge's
-# _MIN_IDLE_SECS/_MAX_IDLE_SECS clamp. Both caps must be positive; the 7-day
-# runtime ceiling keeps a typo like 6e9 from arming an effectively unbounded
-# loop while still covering week-long babysits.
+# _MIN_IDLE_SECS/_MAX_IDLE_SECS clamp. The custom validator applies the
+# operator's finite runtime ceiling at call time.
 MONITOR_START_SCHEMA = ToolSchema(
     tool_name="monitor_start",
+    custom_validator=_validate_monitor_runtime,
     fields=[
         FieldSpec("message", str, required=True, max_len=8000),
         FieldSpec("interval_secs", int, min_val=15, max_val=86400),
         FieldSpec("max_cycles", int, min_val=1, max_val=1000),
-        FieldSpec("max_runtime_secs", int, min_val=1, max_val=604800),
+        FieldSpec("max_runtime_secs", (int, float), min_val=1, max_val=MAX_RUNTIME_CEILING_SECS),
         # Opt-OUT of observation gating. Absent means gated, matching the tool's
         # default, so a caller written before this field existed keeps the
         # default behaviour rather than silently escaping it.
@@ -1364,8 +1649,113 @@ MONITOR_START_SCHEMA = ToolSchema(
         # redaction, which is the one that governs what gets stored, because
         # redaction can grow the string.
         FieldSpec("banner", str, max_len=MAX_BANNER_CHARS),
+        # The wake judge's brief. A shape check only at this layer: the inner bounds
+        # live in validate_judge_spec, which the arm path applies, for the reason the
+        # banner cap is re-checked there -- what gets STORED is what needs bounding.
+        # Accepted and stored even when the judge's consent scope is off, so an armed
+        # loop survives the switch being granted later.
+        #
+        # ``bool`` is admitted because ``judge: false`` is the opt-out: a gated loop
+        # that names no brief is screened under the default, so refusing the judge
+        # needs a spelling of its own. Only ``false`` survives validate_judge_spec.
+        FieldSpec("judge", (dict, bool)),
+        # The SUBJECT, for the one subject a message cannot name. Accepted because
+        # the whole chain carries it: the payload, the applier and the authz forward
+        # all pass it through, so a request naming it is never silently discarded.
+        _MONITOR_WATCH_FIELD,
     ],
 )
+
+#: Bounds for one wake-judge brief. These govern what gets STORED on the loop and
+#: therefore what leaves the machine on every tick, which is why they live beside the
+#: schema rather than only inside the point: the schema's ``dict`` check says the
+#: field is an object, and this says the object is small.
+MAX_JUDGE_TARGETS = 8
+MAX_JUDGE_TARGET_CHARS = 200
+MAX_JUDGE_CRITERION_CHARS = 500
+#: The only keys a brief may carry. Closed, and an unknown key is REFUSED rather
+#: than dropped: a misspelled ``wake_when`` that silently vanished would leave the
+#: owner believing they had armed a criterion the judge never received.
+JUDGE_SPEC_KEYS = frozenset({"targets", "wake_when", "quiet_when"})
+
+#: The normalised form of ``judge: false``. A RESERVED key, deliberately absent from
+#: :data:`JUDGE_SPEC_KEYS`, so the only spelling a caller has for the opt-out is the
+#: boolean: an owner writing ``{"off": true}`` by hand is refused as an unknown key
+#: rather than given a second way to say the same thing. The persisted loader keeps
+#: the key, because it has to reload what this function stored.
+JUDGE_OFF_KEY = "off"
+
+
+def judge_is_off(spec: object) -> bool:
+    """Whether *spec* is the stored opt-out rather than a brief. Never raises."""
+    return isinstance(spec, dict) and spec.get(JUDGE_OFF_KEY) is True
+
+
+def validate_judge_spec(raw: object) -> dict[str, object]:
+    """One wake-judge brief, normalised and bounded, or raise :class:`ValidationError`.
+
+    ``{}`` for an absent brief. An empty object is legal and means "no criteria of my
+    own": a gated loop carrying one is screened under the DEFAULT brief, so an empty
+    object is not how the judge is taken off. ``judge: false`` is -- it normalises to
+    the reserved :data:`JUDGE_OFF_KEY` marker, which the tick reads as an explicit
+    bypass.
+
+    Targets are bounded and de-duplicated but NOT resolved here -- whether a
+    ``chat-*`` key names a readable session is an authorization question, answered
+    per tick by the creator-only read, and a target that refuses is dropped then.
+    Checking it at arm time would only tell the owner what was true at arm time.
+    """
+    if raw is None:
+        return {}
+    if raw is False:
+        return {JUDGE_OFF_KEY: True}
+    if raw is True:
+        # Refused rather than read as "use the default", because the default already
+        # applies to every gated loop that names no brief. Accepting it would give one
+        # meaning two spellings, and the owner who typed it is more likely to have
+        # meant the opt-out.
+        raise ValidationError(
+            "judge", "use false to bypass the judge; the default brief needs no argument"
+        )
+    if not isinstance(raw, dict):
+        raise ValidationError("judge", "must be an object or false")
+    unknown = sorted(set(raw) - JUDGE_SPEC_KEYS)
+    if unknown:
+        raise ValidationError("judge", f"unknown key(s): {', '.join(unknown)}")
+    out: dict[str, object] = {}
+    targets = raw.get("targets")
+    if targets is not None:
+        if not isinstance(targets, (list, tuple)):
+            raise ValidationError("judge.targets", "must be a list")
+        if len(targets) > MAX_JUDGE_TARGETS:
+            raise ValidationError("judge.targets", f"at most {MAX_JUDGE_TARGETS} targets")
+        cleaned: list[str] = []
+        for item in targets:
+            if not isinstance(item, str):
+                raise ValidationError("judge.targets", "every target must be a string")
+            value = item.strip()
+            if not value:
+                continue
+            if len(value) > MAX_JUDGE_TARGET_CHARS:
+                raise ValidationError(
+                    "judge.targets", f"a target may not exceed {MAX_JUDGE_TARGET_CHARS} chars"
+                )
+            if value not in cleaned:
+                cleaned.append(value)
+        out["targets"] = cleaned
+    for key in ("wake_when", "quiet_when"):
+        criterion = raw.get(key)
+        if criterion is None:
+            continue
+        if not isinstance(criterion, str):
+            raise ValidationError(f"judge.{key}", "must be a string")
+        if len(criterion) > MAX_JUDGE_CRITERION_CHARS:
+            raise ValidationError(
+                f"judge.{key}", f"may not exceed {MAX_JUDGE_CRITERION_CHARS} chars"
+            )
+        out[key] = criterion
+    return out
+
 
 # monitor_update revises the loop already bound to the calling session. Every
 # field is optional (a no-field call is a no-op the handler rejects), and the
@@ -1373,20 +1763,33 @@ MONITOR_START_SCHEMA = ToolSchema(
 # that monitor_start would have refused to create.
 MONITOR_UPDATE_SCHEMA = ToolSchema(
     tool_name="monitor_update",
+    custom_validator=_validate_monitor_runtime,
     fields=[
         FieldSpec("message", str, max_len=8000),
         FieldSpec("interval_secs", int, min_val=15, max_val=86400),
         FieldSpec("max_cycles", int, min_val=1, max_val=1000),
-        FieldSpec("max_runtime_secs", int, min_val=1, max_val=604800),
+        FieldSpec("max_runtime_secs", (int, float), min_val=1, max_val=MAX_RUNTIME_CEILING_SECS),
         FieldSpec("target", str, max_len=MAX_SHORT_STRING),
         FieldSpec("objective", str, allowed=publicly_armable_objectives()),
-        FieldSpec("max_agent_turns", int, min_val=1, max_val=MAX_MONITOR_AGENT_TURNS),
+        # Floor 0, not 1: zero is the unlimited sentinel for this one budget.
+        FieldSpec("max_agent_turns", int, min_val=0, max_val=MAX_MONITOR_AGENT_TURNS),
         FieldSpec("max_tokens", int, min_val=1, max_val=MAX_MONITOR_TOKENS),
         FieldSpec("max_provider_errors", int, min_val=1, max_val=MAX_MONITOR_PROVIDER_ERRORS),
         FieldSpec("wake_instructions", str, max_len=MAX_MONITOR_WAKE_INSTRUCTIONS_CHARS),
         # Same bound as the arm side, for the reason the comment above gives: a
         # loop must not be updatable into a state monitor_start would refuse.
         FieldSpec("banner", str, max_len=MAX_BANNER_CHARS),
+        # Same shape check as the arm side, and the same reason: revising a loop must
+        # not be a way to store a judge brief arming would have refused. ``judge:
+        # false`` is what takes the judge off a live loop; an empty object only drops
+        # the owner's own criteria, and a gated loop then runs under the default.
+        FieldSpec("judge", (dict, bool)),
+        # Same field as the arm side, for the reason the comment at the top of this
+        # schema gives: a loop must not be updatable into a state monitor_start would
+        # have refused. On this side it also ARMS a watch on a loop that has none, which
+        # is the only way a conductor that armed a plain timer reaches the gate without
+        # tearing its loop down and losing its cycle count.
+        _MONITOR_WATCH_FIELD,
     ],
 )
 
@@ -1496,10 +1899,12 @@ KIRO_CLI_LOGS_SCHEMA = ToolSchema(
     ],
 )
 
-# Absolute filesystem path. Empty string is allowed (clears the project) —
-# the validator skips the pattern check on empty values, so the regex only
-# needs to cover the non-empty case.
-_ABSOLUTE_PATH_RE = re.compile(r"^/")
+# Absolute filesystem path: POSIX "/x" and the Windows drive root "C:\x" /
+# "C:/x". Root PREFIX only, so a POSIX body may carry ":" and drive-relative
+# "C:foo" is refused. Two-backslash roots stay out: "\\host\share" resolves by
+# contacting the named host, and "\\?\D:\" carries a prefix the sensitive-path
+# fence does not fold -- see the PR. An empty string (clear) skips this check.
+_ABSOLUTE_PATH_RE = re.compile(r"^(?:/|[A-Za-z]:[\\/])")
 
 # 4096 = Linux PATH_MAX. The gateway endpoint enforces realpath and
 # sensitive-path checks; this schema is the MCP-layer shape gate.
@@ -1744,9 +2149,12 @@ WORKFLOW_RERUN_SCHEMA = ToolSchema(
     ],
 )
 
-# Artifact tools — slug pattern matches kiro_crew.artifacts._SLUG_RE.
+# Artifact tools — slug pattern matches kiro_crew.artifacts._SLUG_RE. The tag
+# rule is NOT a pattern: a tag is Unicode letters, marks and digits, which are
+# general categories ``re`` cannot spell, so the artifact schemas below carry
+# only the tag count and length caps as fields and check each tag's characters
+# in ``_validate_artifact_tags`` through the store's own ``normalize_tag``.
 _ARTIFACT_SLUG_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,78}[a-z0-9])?$")
-_ARTIFACT_TAG_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_:.-]{0,63}$")
 _ARTIFACT_KIND_RE = re.compile(r"^(widget|html|markdown|svg|json|text|image|webapp)$")
 
 # Model identifiers passed to kiro-cli ``--model`` (AcpRuntime). First char
@@ -1764,8 +2172,33 @@ ARTIFACT_CONTENT_MAX = ARTIFACT_MAX_CONTENT_BYTES
 ARTIFACT_WEBAPP_METADATA_MAX_BYTES = 16_384
 
 
+def _validate_artifact_tags(cleaned: dict) -> None:
+    """Hold every tag argument to the store's tag rule and answer with its reason.
+
+    Runs after the field pass, so each item is already NFC-normalized, stripped
+    of hidden characters and bounded by the schema's caps; what is left to check
+    is the character rule, which is a category test no ``FieldSpec`` pattern can
+    express. The store applies the same rule on write; checking here means the
+    tool reports the offending tag and why, instead of a store error.
+    """
+    tags = cleaned.get("tags")
+    if isinstance(tags, list):
+        for i, item in enumerate(tags):
+            try:
+                _normalize_artifact_tag(item)
+            except ValueError as exc:
+                raise ValidationError("tags", f"item[{i}]: {exc}") from None
+    tag = cleaned.get("tag")
+    if isinstance(tag, str) and tag:
+        try:
+            _normalize_artifact_tag(tag)
+        except ValueError as exc:
+            raise ValidationError("tag", str(exc)) from None
+
+
 def _validate_artifact_save(cleaned: dict) -> None:
-    """Reject an oversized or structurally invalid webapp_metadata blob before disk write."""
+    """Reject a malformed tag, then an oversized or structurally invalid webapp_metadata blob."""
+    _validate_artifact_tags(cleaned)
     am = cleaned.get("webapp_metadata")
     if am is None:
         return
@@ -1949,8 +2382,7 @@ ARTIFACT_SAVE_SCHEMA = ToolSchema(
             "tags",
             list,
             item_type=str,
-            item_max_len=64,
-            item_pattern=_ARTIFACT_TAG_RE,
+            item_max_len=ARTIFACT_TAG_MAX,
             max_items=16,
         ),
         FieldSpec("folder", str, max_len=4096),
@@ -1978,8 +2410,7 @@ ARTIFACT_UPDATE_SCHEMA = ToolSchema(
             "tags",
             list,
             item_type=str,
-            item_max_len=64,
-            item_pattern=_ARTIFACT_TAG_RE,
+            item_max_len=ARTIFACT_TAG_MAX,
             max_items=16,
         ),
         FieldSpec("webapp_metadata", dict),
@@ -1994,9 +2425,10 @@ ARTIFACT_DELETE_SCHEMA = ToolSchema(
 )
 
 ARTIFACT_LIST_SCHEMA = ToolSchema(
+    custom_validator=_validate_artifact_tags,
     tool_name="artifact_list",
     fields=[
-        FieldSpec("tag", str, max_len=64, pattern=_ARTIFACT_TAG_RE),
+        FieldSpec("tag", str, max_len=ARTIFACT_TAG_MAX),
         FieldSpec("kind", str, max_len=20, pattern=_ARTIFACT_KIND_RE),
         FieldSpec("q", str, max_len=200),
     ],
@@ -2035,6 +2467,7 @@ ARTIFACT_GET_COMMENTS_SCHEMA = ToolSchema(
     tool_name="artifact_get_comments",
     fields=[
         FieldSpec("slug", str, required=True, max_len=80, pattern=_ARTIFACT_SLUG_RE),
+        FieldSpec("exclude_resolved", bool),
     ],
 )
 
@@ -2155,6 +2588,19 @@ CHAT_FOLDER_MOVE_SCHEMA = ToolSchema(
     ],
 )
 
+CHAT_FOLDER_UPDATE_SCHEMA = ToolSchema(
+    tool_name="chat_folder_update",
+    fields=[
+        FieldSpec("folder", str, required=True, max_len=_ARTIFACT_FOLDER_REF_MAX),
+        FieldSpec("name", str, max_len=_ARTIFACT_FOLDER_NAME_MAX),
+        # One emoji grapheme or "" to clear; the endpoint's ``_is_single_emoji``
+        # is the authority, so only the length is bounded here (it caps at 16).
+        FieldSpec("icon", str, max_len=16),
+        # A palette value or "" to clear; the endpoint's allowlist decides.
+        FieldSpec("color", str, max_len=16),
+    ],
+)
+
 CHAT_FOLDER_MOVE_SESSION_SCHEMA = ToolSchema(
     tool_name="chat_folder_move_session",
     fields=[
@@ -2162,6 +2608,13 @@ CHAT_FOLDER_MOVE_SESSION_SCHEMA = ToolSchema(
         # exact session title — none share a charset, so only bound the length.
         FieldSpec("session", str, required=True, max_len=512),
         FieldSpec("folder", str, max_len=_ARTIFACT_FOLDER_REF_MAX),
+    ],
+)
+
+CHAT_FOLDER_DELETE_SCHEMA = ToolSchema(
+    tool_name="chat_folder_delete",
+    fields=[
+        FieldSpec("folder", str, required=True, max_len=_ARTIFACT_FOLDER_REF_MAX),
     ],
 )
 
@@ -2228,6 +2681,40 @@ CHAT_TAG_ASSIGN_SCHEMA = ToolSchema(
             item_max_len=_CHAT_TAG_REF_MAX,
             max_items=_CHAT_TAG_MAX_ITEMS,
         ),
+    ],
+)
+
+CHAT_SESSION_PIN_SCHEMA = ToolSchema(
+    tool_name="chat_session_pin",
+    fields=[
+        # Same session-reference shape as ``chat_folder_move_session.session``.
+        FieldSpec("session", str, required=True, max_len=512),
+        # A real JSON boolean: the string "false" is truthy, so a coerced value
+        # would pin a session the caller asked to unpin.
+        FieldSpec("pinned", bool, required=True),
+    ],
+)
+
+# Board columns (``/api/chat/tag-columns``). A column name is stored as
+# ``name[:60]`` (``chat_tags._NAME_MAX``), the same cap as a tag name, and a
+# column reference is a 12-hex id or the column's exact name.
+CHAT_TAG_COLUMN_LIST_SCHEMA = ToolSchema(tool_name="chat_tag_column_list", fields=[])
+
+CHAT_TAG_COLUMN_CREATE_SCHEMA = ToolSchema(
+    tool_name="chat_tag_column_create",
+    fields=[
+        FieldSpec("name", str, required=True, max_len=_CHAT_TAG_NAME_MAX),
+        FieldSpec("tag", str, required=True, max_len=_CHAT_TAG_REF_MAX),
+    ],
+)
+
+CHAT_TAG_COLUMN_MOVE_SCHEMA = ToolSchema(
+    tool_name="chat_tag_column_move",
+    fields=[
+        # The handler requires exactly one of ``before`` / ``after``.
+        FieldSpec("column", str, required=True, max_len=_CHAT_TAG_REF_MAX),
+        FieldSpec("before", str, max_len=_CHAT_TAG_REF_MAX),
+        FieldSpec("after", str, max_len=_CHAT_TAG_REF_MAX),
     ],
 )
 
@@ -2328,6 +2815,53 @@ OPS_MISSION_CONTROL_API_SCHEMA = ToolSchema(
         FieldSpec("body_json", str, max_len=_OMC_MAX_BODY, default=""),
     ],
     custom_validator=_validate_omc_api,
+)
+
+# ── Tool Schema (Design Tweak app) ──
+#
+# ``design_tweak_update_thread`` is the agent's ONLY credentialed path to the
+# Design Tweak app's ``POST /thread`` route (same pattern as
+# ``ops_mission_control_api`` and ``issue_radar_record_investigation``: the MCP
+# server process holds the internal secret; the agent never sees a credential).
+# The app hands the agent batched click-anchored comments to apply, but the
+# agent cannot update the preview's thread bubbles — posting to ``/thread``
+# needs the dashboard credential an agent session is deliberately denied — so
+# it reported progress inline in chat and the dots never changed.
+#
+# Both ids are value-position only: the schema URL-quotes them with
+# ``safe=''`` so neither can carry a '/', '?' or '#' that would rewrite the
+# single ``/thread`` route, and the backend's own ``_ID_RE``
+# (``^[A-Za-z0-9._-]+$``) is the authority that rejects a malformed id. The
+# tool boundary therefore bounds only length, not grammar. ``status`` is
+# restricted to the one FORWARD-progress value ``done`` — the agent may mark a
+# comment it finished, but the tool exposes no destructive thread action
+# (``/clear`` archives a request and removes its pins, and is NOT reachable
+# here). The ``text or status`` rule is likewise the backend's
+# (``_h_thread``): an empty call is refused there, so it is not restated here.
+# The one thread status the tool may set: forward progress only. The backend's
+# full set is ``new | sent | done`` (COMMENT_STATUSES); ``new``/``sent`` are
+# the app's own lifecycle, not something an agent reports, so the scoped tool
+# admits only ``done``.
+_DESIGN_TWEAK_ALLOWED_STATUSES = frozenset({"done"})
+# Bounds one progress note. The backend caps a thread at MAX_THREAD_ENTRIES
+# short lines; 2 KiB is well above one legitimate note and keeps an unbounded
+# string from being carried further.
+_DESIGN_TWEAK_MAX_TEXT = 2_048
+
+
+DESIGN_TWEAK_UPDATE_THREAD_SCHEMA = ToolSchema(
+    tool_name="design_tweak_update_thread",
+    fields=[
+        FieldSpec(
+            "request_id",
+            str,
+            required=True,
+            max_len=200,
+        ),
+        FieldSpec("comment_id", str, max_len=200, default=""),
+        FieldSpec("text", str, max_len=_DESIGN_TWEAK_MAX_TEXT, default=""),
+        FieldSpec("status", str, allowed=_DESIGN_TWEAK_ALLOWED_STATUSES, default=""),
+    ],
 )
 
 # Dev Fleet pod lifecycle (agent surface). A pod name is a git worktree basename,
@@ -2474,6 +3008,25 @@ _ISSUE_RADAR_CREW_SKIP_SCOPES = frozenset(
     }
 )
 
+#: Work-item fields the record tool may EMPTY through its ``clear`` list. Spelled
+#: out so the tool schema advertises them as an enum; pinned against the entry
+#: type's ``RADAR_CLEARABLE_FIELDS`` by test, so the two cannot drift.
+_ISSUE_RADAR_CREW_CLEARABLE_FIELDS = frozenset(
+    {
+        "decision",
+        "why",
+        "next",
+        "worktree",
+        "branch",
+        "base_sha",
+        "pr_number",
+        "claim_comment_id",
+        "ci_state",
+        "labels_applied",
+        "outcome",
+    }
+)
+
 # Abbreviated-or-full git object name. Bounds ``base_sha`` to something that can
 # actually be handed to git on a resume; a resumed turn checks out from this
 # value, so an arbitrary 5k string here is a resume that fails much later.
@@ -2515,9 +3068,11 @@ ISSUE_RADAR_CREW_READ_SCHEMA = ToolSchema(
 ISSUE_RADAR_CREW_RECORD_SCHEMA = ToolSchema(
     tool_name="issue_radar_crew_record",
     fields=[
-        # Bounds the number that becomes the work item's FILENAME
-        # (``crews/<crew_id>/<n>.json``) — same ENAMETOOLONG rationale as the
-        # investigation record, hence the same constant.
+        # Bounds the number the work item is KEYED by: a JSON int on one
+        # ``radar/recorded`` crew log entry and the string key the fold files the
+        # item under. The bound guards a key rather than a path, and keeps the
+        # same constant as the investigation record so a number a crew records is
+        # one every other Issue Radar surface can also hold.
         #
         # NOT required. A crew that swept its queue and took nothing has no issue
         # to name, and requiring one here left it recording the cycle against an
@@ -2526,7 +3081,7 @@ ISSUE_RADAR_CREW_RECORD_SCHEMA = ToolSchema(
         # ``sweep`` is valid ONLY without one — is enforced on the write route and
         # in the store, because it is a relation between two fields and this
         # schema validates them one at a time. Keeping the bound here still
-        # matters: when a number IS sent it is the filename.
+        # matters: when a number IS sent it is the item's key.
         FieldSpec("number", int, min_val=1, max_val=_ISSUE_RADAR_MAX_ITEM_NUMBER),
         FieldSpec("phase", str, max_len=32, allowed=_ISSUE_RADAR_CREW_PHASES),
         # Bounded but deliberately NOT ``allowed=``, unlike ``phase`` beside it.
@@ -2540,7 +3095,7 @@ ISSUE_RADAR_CREW_RECORD_SCHEMA = ToolSchema(
         # an enum in the tool schema, so the model is told what to pick.
         FieldSpec("skip_scope", str, max_len=32),
         # ``outcome`` is a bounded free string, NOT an enum: the store keeps it
-        # as free text (``crew_store.upsert_work_item``) and no vocabulary is
+        # as free text (``crew_store.commit_work_progress``) and no vocabulary is
         # defined anywhere in the app, so an allowlist invented here would
         # reject a legitimate terminal outcome and lose it.
         FieldSpec("outcome", str, max_len=MAX_SHORT_STRING),
@@ -2578,6 +3133,10 @@ ISSUE_RADAR_CREW_RECORD_SCHEMA = ToolSchema(
             item_max_len=MAX_SHORT_STRING,
             max_items=20,
         ),
+        # Names of work-item fields this update empties. The route checks each name
+        # against the store's clearable list and refuses an unknown one; this bound
+        # only keeps the list from being a payload.
+        FieldSpec("clear", list, item_type=str, item_max_len=32, max_items=16),
         # One public progress line. Short by design: it is rendered as a list
         # item inside the claim comment's <details> block, not as a report.
         FieldSpec("event", str, max_len=MAX_SHORT_STRING),
@@ -2606,7 +3165,7 @@ CRON_ADD_SCHEMA = ToolSchema(
         FieldSpec("at", (int, float), min_val=0, max_val=4102444800),  # up to 2100
         FieldSpec("delay", (int, float), min_val=1, max_val=86400 * 30),  # 1s to 30 days
         FieldSpec("at_time", str, max_len=100),
-        FieldSpec("agent", str, max_len=MAX_SHORT_STRING, pattern=_AGENT_NAME_RE),
+        FieldSpec("agent", str, max_len=MAX_SHORT_STRING, pattern=REGISTERED_AGENT_NAME_RE),
         FieldSpec("member_id", str, max_len=MAX_SHORT_STRING),
         FieldSpec("model", str, max_len=MAX_SHORT_STRING, pattern=_MODEL_NAME_RE),
         FieldSpec("silent", bool),
@@ -2734,14 +3293,39 @@ def _validate_hook_has_action(args: dict) -> None:
 
 
 def _validate_hook_create(args: dict) -> None:
-    """Validate a hook at creation time: action + regex syntax."""
+    """Validate a hook at creation time: action + regex syntax + no null enable."""
     _validate_hook_has_action(args)
     _validate_hook_regex(args)
+    _reject_null_enabled(args)
 
 
 def _validate_hook_update(args: dict) -> None:
     """Validate a hook at update time: regex syntax (action already checked by store)."""
     _validate_hook_regex(args)
+    _reject_null_enabled(args)
+
+
+def _reject_null_enabled(args: dict) -> None:
+    """Refuse an explicit ``"enabled": null``, on create and on update alike.
+
+    ``validate_field`` answers ``spec.default`` for a ``None`` value BEFORE the type
+    check, so a field with no default answers ``None`` -- and the KEY's presence puts
+    that ``None`` into the cleaned dict. Downstream, ``data.get("enabled", True)``
+    keeps it and the store's own event-aware default is skipped because the key IS
+    present, so the hook persists with ``enabled`` neither true nor false. Every
+    reader treats it as off: ``fire`` skips the hook and the row renders dimmed.
+
+    Refused rather than coerced, because both coercions lie about what was asked
+    for. Reading it as ``True`` invents a request to enable; reading it as omitted
+    discards a key the caller deliberately sent. A 400 naming the field is the only
+    answer that does not decide for them.
+
+    Both hook validators call this: the same shape is reachable through the update
+    schema, whose ``enabled`` has never carried a default, so fixing only the create
+    path would leave the identical corruption one endpoint away.
+    """
+    if "enabled" in args and args["enabled"] is None:
+        raise ValidationError("enabled", "expected bool, got null")
 
 
 def _validate_hook_regex(args: dict) -> None:
@@ -2771,7 +3355,15 @@ HOOK_CREATE_SCHEMA = ToolSchema(
         ),
         FieldSpec("skills", list, default=[], item_type=str, item_max_len=100),
         FieldSpec("timeout", int, min_val=1, max_val=300, default=30),
-        FieldSpec("enabled", bool, default=True),
+        # NO default, deliberately: `validate_tool_args` INJECTS a non-``None``
+        # default for an omitted field, and the store decides a hook's initial
+        # ``enabled`` from whether the caller named it -- a trigger no event fires
+        # is stored off unless the caller explicitly asked for on. A ``True`` here
+        # fabricates that explicit request on every create, which is the one input
+        # that made the store's rule unreachable on the dashboard's own path.
+        # ``ScriptHook.from_dict`` still defaults an absent value to True, so a
+        # hook on a live event is unaffected.
+        FieldSpec("enabled", bool),
     ],
     custom_validator=_validate_hook_create,
 )
@@ -2953,6 +3545,11 @@ SEND_MESSAGE_SCHEMA = ToolSchema(
         FieldSpec("unfurl_media", bool),
         FieldSpec("thread_ts", str, max_len=30, pattern=re.compile(r"^\d+\.\d+$")),
         FieldSpec("reply_broadcast", bool),
+        # Opt-in "Open session" deep-link button on the Slack leg. Declared here
+        # because ``validate_tool_args`` rejects any field the descriptor
+        # advertises but the schema does not declare; the gateway builds the URL
+        # server-side, so nothing but this flag crosses the wire.
+        FieldSpec("include_session_link", bool),
         # Must accept every value ``mcp_tools.messaging._SESSION_TARGETS``
         # advertises: this pattern runs BEFORE the handler, so a value missing
         # here is rejected as malformed even though the tool's own enum offers
@@ -3011,7 +3608,7 @@ READ_SLACK_PROFILE_SCHEMA = ToolSchema(
 WAIT_SCHEMA = ToolSchema(
     tool_name="wait",
     fields=[
-        FieldSpec("seconds", int, required=True, min_val=60, max_val=1800),
+        FieldSpec("seconds", int, required=True, min_val=60, max_val=WAIT_TOOL_MAX_SECS),
         FieldSpec("reason", str, required=True, max_len=MAX_SHORT_STRING),
     ],
 )
@@ -3138,6 +3735,33 @@ SESSION_CREATE_SCHEMA = ToolSchema(
         # folder reference; the two readings share no charset, so only the
         # length is checked here.
         FieldSpec("folder", str, required=False, default="", max_len=_ARTIFACT_FOLDER_REF_MAX),
+        # Model the new session starts on, the same field ``spawn_run.model``
+        # takes and under the same charset: the id is persisted to the metadata
+        # line and later handed to the backend, so arbitrary strings stay out.
+        FieldSpec(
+            "model",
+            str,
+            required=False,
+            default="",
+            max_len=MAX_SHORT_STRING,
+            pattern=_MODEL_NAME_RE,
+        ),
+    ],
+)
+
+SESSION_FORK_SCHEMA = ToolSchema(
+    tool_name="session_fork",
+    fields=[
+        # The session to copy from: a slot key, transcript stem or exact unique
+        # title, the same three forms every ``target`` resolves. Empty means the
+        # caller's own session.
+        FieldSpec("source", str, required=False, default="", max_len=MAX_SHORT_STRING),
+        FieldSpec("title", str, required=False, default="", max_len=200),
+        FieldSpec("folder", str, required=False, default="", max_len=_ARTIFACT_FOLDER_REF_MAX),
+        # The fork point, as ``chat_fork`` counts it: an index into the source's
+        # visible (user/assistant) rows, inclusive. Bounded above only by the
+        # transcript, which the fork core checks against the corpus it reads.
+        FieldSpec("at_message_index", int, required=False, min_val=0),
     ],
 )
 
@@ -3148,10 +3772,45 @@ SESSION_STOP_SCHEMA = ToolSchema(
     ],
 )
 
+SESSION_END_WAIT_SCHEMA = ToolSchema(
+    tool_name="session_end_wait",
+    fields=[
+        FieldSpec("target", str, required=True, max_len=MAX_SHORT_STRING),
+    ],
+)
+
+SESSION_SET_MODEL_SCHEMA = ToolSchema(
+    tool_name="session_set_model",
+    fields=[
+        FieldSpec("target", str, required=True, max_len=MAX_SHORT_STRING),
+        FieldSpec("model", str, required=True, max_len=MAX_SHORT_STRING),
+    ],
+)
+
+SESSION_RELOAD_SCHEMA = ToolSchema(
+    tool_name="session_reload",
+    fields=[
+        FieldSpec("target", str, required=True, max_len=MAX_SHORT_STRING),
+    ],
+)
+
 SESSION_CLOSE_SCHEMA = ToolSchema(
     tool_name="session_close",
     fields=[
         FieldSpec("target", str, required=True, max_len=MAX_SHORT_STRING),
+    ],
+)
+
+SESSION_REVIVE_SCHEMA = ToolSchema(
+    tool_name="session_revive",
+    fields=[
+        FieldSpec("target", str, required=True, max_len=MAX_SHORT_STRING),
+        # Same folder reference ``session_create.folder`` takes. The folder is
+        # resolved and checked BEFORE anything is revived, so an unknown or
+        # deleted folder refuses with nothing done; a revive-then-move pair
+        # would leave the session revived and unfiled when the move refused.
+        # Filing itself runs after the revive has committed and is best-effort.
+        FieldSpec("folder", str, required=False, default="", max_len=_ARTIFACT_FOLDER_REF_MAX),
     ],
 )
 
@@ -3169,12 +3828,68 @@ SESSION_SEND_SCHEMA = ToolSchema(
     ],
 )
 
+SESSION_BROADCAST_SCHEMA = ToolSchema(
+    tool_name="session_broadcast",
+    fields=[
+        FieldSpec("message", str, required=True, max_len=MAX_LONG_STRING),
+        # REQUIRED and enumerated, with no default. The two modes are different
+        # instructions, not a setting with a safe side: a caller that meant "tell
+        # them when they next come up for air" must not interrupt eight turns
+        # because it omitted a field, and one that meant "stop, now" must not have
+        # its urgency silently downgraded to the queue. So the caller states which.
+        FieldSpec(
+            "mode",
+            str,
+            required=True,
+            allowed=frozenset({"queue", "steer"}),
+            max_len=MAX_SHORT_STRING,
+        ),
+        # Omitted means every session this caller created. Bounded to the same
+        # number the API enforces, so an oversized list is refused at the schema
+        # with the field named rather than after a round trip.
+        FieldSpec(
+            "targets",
+            list,
+            required=False,
+            item_type=str,
+            item_max_len=MAX_SHORT_STRING,
+            max_items=MAX_BROADCAST_TARGETS,
+        ),
+    ],
+)
+
+SESSION_STATUS_SCHEMA = ToolSchema(
+    tool_name="session_status",
+    fields=[],
+)
+
+SESSION_ADOPT_SCHEMA = ToolSchema(
+    tool_name="session_adopt",
+    fields=[
+        FieldSpec("target", str, required=True, max_len=MAX_SHORT_STRING),
+    ],
+)
+
+SESSION_RELEASE_SCHEMA = ToolSchema(
+    tool_name="session_release",
+    fields=[
+        FieldSpec("target", str, required=True, max_len=MAX_SHORT_STRING),
+    ],
+)
+
 SESSION_READ_MESSAGE_SCHEMA = ToolSchema(
     tool_name="session_read_message",
     fields=[
         FieldSpec("target", str, required=True, max_len=MAX_SHORT_STRING),
         FieldSpec("limit", int, required=False, min_val=1, max_val=100, default=20),
         FieldSpec("since", int, required=False, min_val=0),
+    ],
+)
+
+SESSION_SUMMARY_SCHEMA = ToolSchema(
+    tool_name="session_summary",
+    fields=[
+        FieldSpec("target", str, required=True, max_len=MAX_SHORT_STRING),
     ],
 )
 
@@ -3256,6 +3971,7 @@ MCP_CORE_SCHEMAS: dict[str, ToolSchema] = {
     "deploy_artifact": DEPLOY_ARTIFACT_SCHEMA,
     "issue_radar_record_investigation": ISSUE_RADAR_RECORD_INVESTIGATION_SCHEMA,
     "ops_mission_control_api": OPS_MISSION_CONTROL_API_SCHEMA,
+    "design_tweak_update_thread": DESIGN_TWEAK_UPDATE_THREAD_SCHEMA,
     "pod_up": POD_UP_SCHEMA,
     "pod_down": POD_DOWN_SCHEMA,
     "pod_status": POD_STATUS_SCHEMA,
@@ -3279,7 +3995,7 @@ MCP_CRON_SCHEMAS: dict[str, ToolSchema] = {
             FieldSpec("message", str, max_len=MAX_CRON_MESSAGE),
             FieldSpec("cron_expr", str, max_len=100),
             FieldSpec("every", int, min_val=60, max_val=86400 * 30),
-            FieldSpec("agent", str, max_len=MAX_SHORT_STRING, pattern=_AGENT_NAME_RE),
+            FieldSpec("agent", str, max_len=MAX_SHORT_STRING, pattern=REGISTERED_AGENT_NAME_RE),
             FieldSpec("model", str, max_len=MAX_SHORT_STRING, pattern=_MODEL_NAME_RE),
             FieldSpec("channel", str, max_len=CHANNEL_MAX_LEN, pattern=CHANNEL_ID_RE),
             FieldSpec("thread_ts", str, max_len=30, pattern=re.compile(r"^\d+\.\d+$")),
@@ -3414,19 +4130,35 @@ def _cu_coord_field(name: str, *, required: bool = False) -> FieldSpec:
 # its args passed through raw.
 MCP_DASHBOARD_SCHEMAS: dict[str, ToolSchema] = {
     "session_create": SESSION_CREATE_SCHEMA,
+    "session_fork": SESSION_FORK_SCHEMA,
     "session_stop": SESSION_STOP_SCHEMA,
+    "session_end_wait": SESSION_END_WAIT_SCHEMA,
+    "session_set_model": SESSION_SET_MODEL_SCHEMA,
+    "session_reload": SESSION_RELOAD_SCHEMA,
     "session_close": SESSION_CLOSE_SCHEMA,
+    "session_revive": SESSION_REVIVE_SCHEMA,
     "session_send": SESSION_SEND_SCHEMA,
+    "session_broadcast": SESSION_BROADCAST_SCHEMA,
+    "session_status": SESSION_STATUS_SCHEMA,
+    "session_adopt": SESSION_ADOPT_SCHEMA,
+    "session_release": SESSION_RELEASE_SCHEMA,
     "session_read_message": SESSION_READ_MESSAGE_SCHEMA,
+    "session_summary": SESSION_SUMMARY_SCHEMA,
     "chat_folder_tree": CHAT_FOLDER_TREE_SCHEMA,
     "chat_folder_create": CHAT_FOLDER_CREATE_SCHEMA,
     "chat_folder_move": CHAT_FOLDER_MOVE_SCHEMA,
+    "chat_folder_update": CHAT_FOLDER_UPDATE_SCHEMA,
     "chat_folder_move_session": CHAT_FOLDER_MOVE_SESSION_SCHEMA,
+    "chat_folder_delete": CHAT_FOLDER_DELETE_SCHEMA,
     "chat_folder_file_self": CHAT_FOLDER_FILE_SELF_SCHEMA,
     "chat_tag_list": CHAT_TAG_LIST_SCHEMA,
     "chat_tag_create": CHAT_TAG_CREATE_SCHEMA,
     "chat_tag_update": CHAT_TAG_UPDATE_SCHEMA,
     "chat_tag_assign": CHAT_TAG_ASSIGN_SCHEMA,
+    "chat_session_pin": CHAT_SESSION_PIN_SCHEMA,
+    "chat_tag_column_list": CHAT_TAG_COLUMN_LIST_SCHEMA,
+    "chat_tag_column_create": CHAT_TAG_COLUMN_CREATE_SCHEMA,
+    "chat_tag_column_move": CHAT_TAG_COLUMN_MOVE_SCHEMA,
 }
 
 # ── Tool Schemas (MCP crew log — server ``kirocrew-crew-log``) ──
@@ -3476,7 +4208,12 @@ CREW_LOG_PROJECTION_SCHEMA = ToolSchema(
             "name",
             str,
             required=True,
-            allowed=frozenset({"status", "usage", "timeline", "tools", "approvals"}),
+            # Must hold every name the tool ADVERTISES in its ``inputSchema`` enum, which is
+            # ``mcp_crew_log.PROJECTION_NAMES``. Spelled literally rather than imported
+            # because that module imports this one, and the two are pinned together by
+            # ``test_the_projection_schema_accepts_every_advertised_fold`` so a fold added to
+            # one and not the other fails CI instead of advertising a name this refuses.
+            allowed=frozenset({"status", "usage", "timeline", "tools", "approvals", "subagents"}),
         ),
     ],
 )
@@ -3602,9 +4339,9 @@ MCP_DEBUG_SCHEMAS: dict[str, ToolSchema] = {
 # a worker cannot write a conductor-owned field because no parameter carries one,
 # which is a stronger guarantee than an allowlist that must be kept correct as
 # fields are added.
-_WORK_STATUSES = frozenset({"progress", "done", "blocked", "question"})
-_WORK_VERDICTS = frozenset({"pass", "fail", "pending", "refused", "error"})
-_WORK_ITEM_STATES = frozenset({"open", "accepted", "rejected", "abandoned"})
+_WORK_STATUSES = frozenset(WORK_WORKER_STATUSES)
+_WORK_VERDICTS = frozenset(WORK_VERDICTS)
+_WORK_ITEM_STATES = frozenset(WORK_ITEM_STATES)
 #: A superset of the store's six conductor actions: ``accept`` promotes a worker's
 #: claimed ``pr`` into ``acceptance`` and is served by its own store function.
 _WORK_RECORD_ACTIONS = frozenset({"create", "bind", "decide", "verdict", "close", "goal", "accept"})
@@ -3615,18 +4352,40 @@ WORK_REPORT_SCHEMA = ToolSchema(
     tool_name="work_report",
     fields=[
         FieldSpec("status", str, required=True, allowed=_WORK_STATUSES),
-        # NOT ``clamp_to_max``: a truncated summary the worker believes landed
-        # whole is a silent data loss the worker cannot detect, and the conductor
-        # reads this field to decide. Refusing names the cap so the worker retries
-        # with a shorter one.
-        FieldSpec("summary", str, required=True, max_len=500),
+        # ``clamp_to_max``: the only caller is a model composing prose, which
+        # cannot measure the field before it calls, so a refusal here is
+        # discovered only by violating it and costs a whole round-trip to resend.
+        # Clamping is safe for the same reason it is on ``monitor_stop``'s
+        # ``reason``: the cut is not silent. ``clamp_to_max_len`` stamps the
+        # stored value, so the conductor reads a summary that announces its own
+        # truncation, and ``mcp_work.work_report`` reads the stamp back with
+        # ``clamp_report`` to tell the worker in the reply. Both halves are
+        # required: the stamp alone leaves the worker told only "Recorded.",
+        # which is a silent loss it cannot detect.
+        FieldSpec("summary", str, required=True, max_len=500, clamp_to_max=True),
         FieldSpec("artifacts", dict),
         FieldSpec("pr", int, min_val=1, max_val=1_000_000_000),
     ],
     custom_validator=lambda cleaned: _validate_work_artifacts(cleaned.get("artifacts")),
 )
 
-WORK_LEDGER_READ_SCHEMA = ToolSchema(tool_name="work_ledger_read")
+#: Every parameter of ``work_ledger_read`` narrows or shapes the read; none is
+#: required, and with none the whole board comes back as it always has. The
+#: ``events`` ceiling restates the route's own tail cap (``_MAX_EVENT_TAIL`` in
+#: ``dashboard/handlers/work_ledger.py``), pinned together by its tests.
+WORK_LEDGER_READ_SCHEMA = ToolSchema(
+    tool_name="work_ledger_read",
+    fields=[
+        FieldSpec("events", int, min_val=0, max_val=20),
+        FieldSpec("item_id", str, max_len=16, pattern=re.compile(r"^it_[0-9a-f]{8}$")),
+        FieldSpec("state", str, allowed=_WORK_ITEM_STATES),
+        # Long enough for an offset-carrying ISO-8601 stamp with microseconds;
+        # whether it PARSES is the route's check, with the store's own reader.
+        FieldSpec("since", str, max_len=40),
+        FieldSpec("compact", bool),
+    ],
+)
+WORK_LEDGER_REBUILD_SCHEMA = ToolSchema(tool_name="work_ledger_rebuild")
 
 WORK_LEDGER_RECORD_SCHEMA = ToolSchema(
     tool_name="work_ledger_record",
@@ -3678,6 +4437,7 @@ MCP_WORK_SCHEMAS: dict[str, ToolSchema] = {
     "work_report": WORK_REPORT_SCHEMA,
     "work_ledger_read": WORK_LEDGER_READ_SCHEMA,
     "work_ledger_record": WORK_LEDGER_RECORD_SCHEMA,
+    "work_ledger_rebuild": WORK_LEDGER_REBUILD_SCHEMA,
 }
 
 
@@ -3702,9 +4462,88 @@ PANEL_PUBLISH_SCHEMA = ToolSchema(
 # would pass it through unvalidated.
 PANEL_TEMPLATES_SCHEMA = ToolSchema(tool_name="panel_templates")
 
+#: Empty and registered, for ``PANEL_TEMPLATES_SCHEMA``'s reason: the tool takes no
+#: arguments, and an empty registered schema REJECTS an unexpected one where no
+#: schema at all would pass it through unvalidated.
+DASHBOARD_FIELDS_SCHEMA = ToolSchema(tool_name="dashboard_fields")
+
+DASHBOARD_WRITE_SCHEMA = ToolSchema(
+    tool_name="dashboard_write",
+    fields=[
+        FieldSpec("field", str, required=True, max_len=64),
+        # EVERY JSON SCALAR AND CONTAINER, spelled out, because the field's type is
+        # the MANIFEST's to declare and not this schema's. A schema that pinned one
+        # type would either contradict the manifest or restate it, and a value may
+        # be a number, a phrase, a boolean, a list or an object depending on which
+        # field it is.
+        #
+        # ``bool`` is listed FIRST and separately from the rest for a reason that
+        # bit once already: a bare ``object`` here rejects ``True``, so a crewmate
+        # writing into a ``boolean`` field was refused by the schema -- with a
+        # message about an expected object, which is neither the real problem nor
+        # something the agent could act on. ``dashboard_agentic.check_write`` is
+        # the one place that knows what each field wants, and it refuses with a
+        # code the mistake book can group and teach; this schema's only job is to
+        # reject an unexpected ARGUMENT.
+        FieldSpec("value", (bool, int, float, str, list, dict), required=True),
+    ],
+)
+
+DASHBOARD_TEMPLATES_SCHEMA = ToolSchema(
+    tool_name="dashboard_templates",
+    fields=[
+        # Optional, and the absence is a real case rather than a default: no query
+        # means "list them all", which is what an agent asks for when the person has
+        # not said what they want to see yet.
+        FieldSpec("query", str, max_len=200),
+    ],
+)
+
+DASHBOARD_PREVIEW_SCHEMA = ToolSchema(
+    tool_name="dashboard_preview",
+    fields=[
+        # ``template_id`` is the only argument this tool acts on, and it is NOT marked
+        # required: a missing one is refused by the tool with the sentence that names
+        # what to call instead, where a schema refusal would name only the field.
+        FieldSpec("template_id", str, max_len=64),
+        # ``manifest`` and ``html`` are still ACCEPTED here, and refused one layer up.
+        # A page the caller wrote cannot be previewed or adopted -- see
+        # ``instance.AUTHORED_PAGE_REFUSAL`` -- and dropping these two specs would make
+        # that refusal read "unknown field", which tells a caller to try a different
+        # spelling rather than that the whole capability is a later change. The caps
+        # bound what reaches the refusal; ``html`` matches the store's own
+        # ``MAX_INSTANCE_HTML_BYTES`` ceiling spelled in characters.
+        FieldSpec("manifest", dict),
+        FieldSpec("html", str, max_len=64 * 1024),
+    ],
+)
+
+#: Empty and registered, for ``PANEL_TEMPLATES_SCHEMA``'s reason -- and here the
+#: emptiness is also the safety property the tool advertises: apply installs the page
+#: that was STAGED, so an accepted argument would be a way to make the thing applied
+#: differ from the thing the person looked at.
+DASHBOARD_APPLY_SCHEMA = ToolSchema(tool_name="dashboard_apply")
+
+DASHBOARD_ROLLBACK_SCHEMA = ToolSchema(
+    tool_name="dashboard_rollback",
+    fields=[
+        # No upper bound: the ceiling is whatever version this instance has reached,
+        # which this schema cannot know. The store refuses a version above the current
+        # one with a sentence naming the current one, which is the number the caller
+        # needs; a fixed maximum here would refuse with a limit that means nothing.
+        FieldSpec("to_version", int, required=True, min_val=1),
+    ],
+)
+
 MCP_PANEL_SCHEMAS: dict[str, ToolSchema] = {
     "panel_publish": PANEL_PUBLISH_SCHEMA,
     "panel_templates": PANEL_TEMPLATES_SCHEMA,
+    "dashboard_fields": DASHBOARD_FIELDS_SCHEMA,
+    "dashboard_write": DASHBOARD_WRITE_SCHEMA,
+    "dashboard_templates": DASHBOARD_TEMPLATES_SCHEMA,
+    "dashboard_preview": DASHBOARD_PREVIEW_SCHEMA,
+    "dashboard_apply": DASHBOARD_APPLY_SCHEMA,
+    "dashboard_rollback": DASHBOARD_ROLLBACK_SCHEMA,
 }
 
 MCP_COMPUTER_SCHEMAS: dict[str, ToolSchema] = {

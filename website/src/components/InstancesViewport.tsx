@@ -34,17 +34,33 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { AlertTriangle, Loader2, RefreshCw } from 'lucide-react'
 import { Trans } from 'react-i18next'
-import { api } from '../api/client'
+import { api, type InstanceView } from '../api/client'
+import {
+  CHAINED_CREW_MESSAGE,
+  CHAINED_CREW_REFUSED_MESSAGE,
+  chainAdoptionPlan,
+  chainRefusalCode,
+  readChainedCrewNotice,
+} from '../lib/chainAnnounce'
+import { tokenTtlTotalSeconds } from '../lib/tokenTtl'
 import { WARM_SET_CAP_AUTO_CEILING } from '../utils/remoteCrew'
 import { SettingsLink } from './SettingsLink'
 import { useAppDispatch, useAppSelector, useAppStore } from '../store'
 import { clearPaneReady, removeWarm, setActiveId, setPaneReady, setUnread, setWarm } from '../store/instancesSlice'
-import InstanceTabBar, { visibleInstanceTabs, useCrewPins, toggleCrewPin, useCrewSwitcherStableOrder, setStableOrder } from './InstanceTabBar'
-import { parseLoopbackOriginPort, resolveTunnelOrigin } from '../lib/tunnelOrigin'
+import InstanceTabBar, { visibleInstanceTabs, chainRows, useCrewPins, toggleCrewPin, useCrewSwitcherStableOrder, setStableOrder } from './InstanceTabBar'
+import { isEmbeddableLoopbackOrigin, parseLoopbackOriginPort, resolveTunnelOrigin } from '../lib/tunnelOrigin'
+import {
+  CURSOR_AWAY_CANCEL_TYPE,
+  CURSOR_AWAY_RESULT_TYPE,
+  CURSOR_AWAY_VERSION,
+  CURSOR_AWAY_WATCH_TYPE,
+  watchCursorAwayNative,
+} from '../lib/cursorAway'
+import { NATIVE_NOTIFY_TYPE, parseNativeNotifyEnvelope, postRelayedNativeNotification } from '../lib/nativeNotify'
 import { frameDocumentState, paneLog, safePaneUrl } from '../lib/paneLog'
 import { clearPaneHttpCache, paneOriginFor } from '../lib/paneCache'
 import { connectInstanceInto } from '../lib/connectInstance'
-import { LINUX_CAPTION_CONTROLS_WIDTH, TRAFFIC_LIGHT_INSET_PX, WIN_CAPTION_OVERLAY_WIDTH, WIN_CAPTION_RESERVE_PX } from '../lib/electron'
+import { LINUX_CAPTION_CONTROLS_WIDTH, TRAFFIC_LIGHT_INSET_PX, WIN_CAPTION_OVERLAY_WIDTH } from '../lib/electron'
 import { isEmbeddedPane } from '../lib/embedded'
 import ErrorNotice from './ErrorNotice'
 import { errMessage } from '../utils/thunkError'
@@ -97,13 +113,6 @@ const AUTO_WARM_STAGGER_MS = 1_500
 // leave the very loop this cap exists to bound running unbounded.
 const MAX_REACTIVE_REMINTS = 3
 
-/** Parse a ``<int>[hm]`` TTL (e.g. "20h", "30m") to seconds; 0 if unparseable. */
-function ttlToSeconds(ttl: string): number {
-  const m = /^(\d+)([hm])$/.exec(ttl || '')
-  if (!m) return 0
-  const n = Number(m[1])
-  return m[2] === 'h' ? n * 3600 : n * 60
-}
 
 export default function InstancesViewport({ macInset = false }: { macInset?: boolean } = {}) {
   // Windows counterpart of `macInset`: the caption overlay is a shell property,
@@ -117,7 +126,14 @@ export default function InstancesViewport({ macInset = false }: { macInset?: boo
   const stripInsetStyle = macInset || winInset
     ? {
         ...(macInset ? { paddingLeft: TRAFFIC_LIGHT_INSET_PX } : null),
-        ...(winInset ? { paddingRight: WIN_CAPTION_RESERVE_PX } : null),
+        // Read the live, zoom-aware reserve the main process sets on <html>
+        // (--mc-win-caption-reserve). :root defaults that property to the
+        // static 142px in index.css, so a bare reference is first-paint-safe
+        // without an inline comma fallback here — and a comma fallback would
+        // not round-trip through happy-dom's CSSOM in tests. A fixed px here
+        // would drift from the zoom-aware header reserve the main process
+        // maintains.
+        ...(winInset ? { paddingRight: 'var(--mc-win-caption-reserve)' } : null),
       }
     : undefined
   const dispatch = useAppDispatch()
@@ -181,6 +197,19 @@ export default function InstancesViewport({ macInset = false }: { macInset?: boo
   // a peeked header (the tab bar lives on it), so the traffic lights stayed
   // visible over the new pane until its own next hover cycle re-posted.
   const paneChromeRef = useRef<Record<string, boolean>>({})
+  // The off-window cursor watch this frame is running FOR a pane (see the
+  // mc-cursor-away-watch handler), or null. At most one: the main process polls
+  // once per window, and only the active pane may hold it.
+  const paneCursorWatchRef = useRef<{ paneId: string; watchId: string; stop: () => void } | null>(null)
+  const stopPaneCursorWatch = useCallback(() => {
+    const live = paneCursorWatchRef.current
+    if (!live) return
+    paneCursorWatchRef.current = null
+    live.stop()
+  }, [])
+  // A pane switch (or unmount) orphans the outgoing pane's watch: its reveal is
+  // no longer on screen, and nothing should keep polling for it.
+  useEffect(() => stopPaneCursorWatch, [activeId, stopPaneCursorWatch])
   const refreshingRef = useRef<Set<string>>(new Set())
   const lastRefreshRef = useRef<Map<string, number>>(new Map())
   // Reactive (mc-auth-expired) re-mints answered per pane since its last Retry
@@ -216,7 +245,7 @@ export default function InstancesViewport({ macInset = false }: { macInset?: boo
   // recorded its readiness, so the pane can stop re-announcing without mistaking
   // an ordinary model broadcast for an ack — see EmbeddedHostBridge.
   const postAckToRef = useRef<(id: string) => void>(() => {})
-  const instancesRef = useRef<Array<{ id: string }>>([])
+  const instancesRef = useRef<InstanceView[]>([])
 
   // Whether `refreshToken` would actually mint for this id right now: no mint
   // already in flight, and outside the rate window. Split out of refreshToken so
@@ -256,6 +285,123 @@ export default function InstancesViewport({ macInset = false }: { macInset?: boo
       }
     },
     [dispatch, canRefreshNow],
+  )
+
+  // Adopt a crew a pane just connected, as a top-level tab of ours.
+  //
+  // `parentId` is the pane's own instance id here, established by its ORIGIN
+  // resolving to a warm tunnel port — not by anything in the payload. Everything
+  // in `raw` came from frame code, so it is shape-checked before it is used and
+  // then handed to the gateway, which owns the two decisions that matter: whether
+  // the chain is too deep, and whether it closes a loop back onto us.
+  //
+  // Idempotent by (parent, the parent's id for the crew): a pane re-announces on
+  // every reconnect, and its loopback port changes each time. An existing row is
+  // re-pointed at the new port rather than duplicated, which is also what repairs
+  // a chain after the pane's own gateway restarts.
+  const adoptChainedCrew = useCallback(
+    async (parentId: string, raw: unknown) => {
+      // Every field came from frame code. The SENDER is trusted (its origin
+      // resolved to a warm pane above); the PAYLOAD is not, and the rules live in
+      // `readChainedCrewNotice` so they can be tested without a host.
+      const notice = readChainedCrewNotice(raw)
+      if (!notice) return
+      const { id: remoteId, name, sshHost: host, remotePort, port } = notice
+      // Keyed on the PARENT's id for the crew, not on its host string: one machine
+      // answers to many spellings, so a host key both misses a re-announce that
+      // spells it differently and collides across two crews on one machine.
+      const existing = instancesRef.current.find(
+        i => i.via_instance_id === parentId && i.via_remote_id === remoteId,
+      )
+      try {
+        if (existing) {
+          const plan = chainAdoptionPlan(existing.via_remote_port, port)
+          if (plan.repoint) {
+            // Drop the warm entry BEFORE the PATCH, not after. It names the OLD hop
+            // port and a token minted for it; the PATCH tears the tunnel down and
+            // the reconnect below allocates a FRESH port, so an entry left in place
+            // is a dead port paired with a live credential. Nothing repairs it on
+            // its own either -- auto-warm skips any id that is already warm -- so
+            // the pane would keep dialling the old port until the user pressed
+            // Retry. Removing it first means no reader can observe the stale pair.
+            dispatch(removeWarm(existing.id))
+            await api.updateInstance(existing.id, { via_remote_port: port })
+            paneLog('chain-repointed', { id: existing.id, parentId, port })
+          }
+          // Through `connectInstanceInto`, never bare `api.connectInstance`: this is
+          // the canonical warm-writer, and it is what rewrites warm[id] from the
+          // authenticated response, so the new port and the token minted for it
+          // arrive as one pair. Calling the api directly here discarded the status,
+          // which is how the stale pair survived a repoint in the first place.
+          if (plan.connect) await connectInstanceInto(dispatch, existing.id, 'auto-connect')
+        } else {
+          const added = await api.addInstance({
+            name,
+            ssh_host: host,
+            // A crew's own gateway port is a record, not a dial target from here.
+            // An out-of-range value is dropped rather than refused: the row is
+            // still usable without it, and the hop port is what we forward to.
+            ...(Number.isInteger(remotePort) && remotePort >= 1 && remotePort <= 65535
+              ? { remote_port: remotePort }
+              : {}),
+            via_instance_id: parentId,
+            via_remote_port: port,
+            via_remote_id: remoteId,
+          })
+          paneLog('chain-added', { id: added.id, parentId, port })
+          // Connect it. A row alone does NOT become a tab: `visibleInstanceTabs`
+          // admits a crew only once it is connected, warm, or carries the sticky
+          // connect intent a connect sets — so adopting without this leaves the
+          // promised top-level tab missing and the crew reachable only from the
+          // Remote Crew list. The announcing pane's user connected it there; this
+          // is the same intent arriving here.
+          await api.connectInstance(added.id)
+        }
+        void queryClient.invalidateQueries({ queryKey: ['instances'] })
+      } catch (err) {
+        const reason = (err as Error)?.message || ''
+        // One refusal is not a failure: `chain_duplicate` says this crew is
+        // ALREADY on the record here, which is what a stale read above produces
+        // -- the list is refreshed only after the add and the connect it
+        // triggers, so a second announcement inside that window asks for a crew
+        // it cannot yet see. Refresh and say nothing: the crew is present, and
+        // relaying a refusal would report a problem the user does not have.
+        if (chainRefusalCode(err) === 'chain_duplicate') {
+          paneLog('chain-already-present', { parentId, port })
+          void queryClient.invalidateQueries({ queryKey: ['instances'] })
+          return
+        }
+        // Every other refusal IS the user's business, and the pane is where they
+        // acted: its Remote Crew panel already shows the gateway's reason for the
+        // connect it made, and this is the other half of that sentence. Only we
+        // hold the reason -- the depth cap and the cycle guard are OUR gateway's
+        // decisions, taken against a registry the pane never sees -- so a refusal
+        // we keep to ourselves reads to the user as a crew that connected and
+        // then silently failed to appear.
+        paneLog('chain-refused', { parentId, port, error: reason || 'unknown' })
+        const el = iframeRefs.current.get(parentId)
+        const w = warmRef.current[parentId]
+        if (el?.contentWindow && w) {
+          // Addressed to the pane's exact loopback origin, never '*': the same
+          // rule every other downward post here follows.
+          const origin = `${window.location.protocol}//${window.location.hostname}:${w.port}`
+          try {
+            el.contentWindow.postMessage(
+              {
+                type: CHAINED_CREW_REFUSED_MESSAGE,
+                v: 1,
+                id: remoteId,
+                reason,
+              },
+              origin,
+            )
+          } catch {
+            /* frame mid-navigation: the panel keeps the connect it already reported */
+          }
+        }
+      }
+    },
+    [queryClient, dispatch],
   )
 
   // Pre-mint + warm one connected instance without surfacing it. Cheap when the
@@ -355,6 +501,27 @@ export default function InstancesViewport({ macInset = false }: { macInset?: boo
         const count = Number(data.count)
         if (!Number.isFinite(count) || count < 0) return
         dispatch(setUnread({ id, count }))
+      } else if (data.type === NATIVE_NOTIFY_TYPE) {
+        // A pane wants an OS banner it cannot post itself: `notifications` is a
+        // main-frame-only permission (permission-handler.js) and a browser tab
+        // denies it to a cross-origin iframe too. This frame holds the grant, so
+        // it posts on the pane's behalf. The SENDER is already trusted -- its
+        // origin resolved to a currently-warm tunnel port above -- and the pane
+        // has already applied its own mute / hidden / silent rules, so the only
+        // checks here are shape (every field the exact expected type, bounded)
+        // and this frame's own permission. The title is prefixed with the
+        // instance's name and the tag namespaced per instance id so several
+        // crews' notes stay distinguishable and never collapse onto one.
+        const note = parseNativeNotifyEnvelope(data)
+        if (!note) return
+        const name = instancesRef.current.find(i => i.id === id)?.name || id
+        // Clicking the banner brings the named crew forward, not whichever tab
+        // happened to be active; the id is a warm instance, so the switch is
+        // the same one the inline switcher would honour.
+        postRelayedNativeNotification(name, id, note, () => {
+          window.focus()
+          dispatch(setActiveId(id))
+        })
       } else if (data.type === 'mc-auth-expired') {
         // Reactive recovery: the embedded dashboard reported an expired session.
         // Force a fresh mint and reload its iframe rather than letting it show
@@ -406,6 +573,18 @@ export default function InstancesViewport({ macInset = false }: { macInset?: boo
         ) {
           dispatch(setActiveId(target))
         }
+      } else if (data.type === CHAINED_CREW_MESSAGE) {
+        // A pane connected a crew of its own. Its gateway is a crew of OURS, so
+        // that further crew is reachable from here only by riding the hop we
+        // already hold to the pane — and we never see the pane's registry, which
+        // is why it has to tell us.
+        //
+        // The SENDER is already trusted: its origin resolved to a currently-warm
+        // tunnel port above, and `id` is that pane's instance id here, which is
+        // the parent of the chain. The PAYLOAD is not trusted — shape-checked
+        // here, and the gateway then applies the depth cap and the cycle guard,
+        // which are the decisions no frame may make.
+        void adoptChainedCrew(id, data)
       } else if (data.type === 'mc-set-crew-pin') {
         // A pin was toggled inside an embedded pane. It has no access to the
         // parent's preference store from its own iframe realm, so it relays the
@@ -445,6 +624,40 @@ export default function InstancesViewport({ macInset = false }: { macInset?: boo
           paneChromeRef.current[id] = on
           if (id === activeIdRef.current) setFocusChromeVisible(on)
         }
+      } else if (data.type === CURSOR_AWAY_WATCH_TYPE) {
+        // A pane's focus-mode reveal wants to know how far the cursor travels
+        // off-window. It has no preload to ask the main process itself, so this
+        // frame watches on its behalf. Same rule as mc-focus-chrome: only the
+        // pane the user is looking at may arm it — a background pane gets no
+        // answer. The frame check pins the requester to that pane's own iframe,
+        // which is also where the answer goes. A host with no bridge (a browser)
+        // stays silent the same way.
+        const watchId = (data as { id?: unknown }).id
+        if (typeof watchId !== 'string' || !watchId || watchId.length > 64) return
+        if (data.v !== CURSOR_AWAY_VERSION || id !== activeIdRef.current) return
+        const frame = iframeRefs.current.get(id)?.contentWindow
+        if (!frame || e.source !== frame) return
+        // One watch per window: the main process polls once per window, so a
+        // newer request supersedes whatever was pending.
+        stopPaneCursorWatch()
+        const origin = e.origin
+        const reply = (msg: Record<string, unknown>) => {
+          try {
+            frame.postMessage({ v: CURSOR_AWAY_VERSION, id: watchId, ...msg }, origin)
+          } catch {
+            /* frame mid-navigation — nothing left to answer */
+          }
+        }
+        const stop = watchCursorAwayNative(away => {
+          if (paneCursorWatchRef.current?.watchId === watchId) paneCursorWatchRef.current = null
+          reply({ type: CURSOR_AWAY_RESULT_TYPE, away })
+        })
+        if (!stop) return
+        paneCursorWatchRef.current = { paneId: id, watchId, stop }
+      } else if (data.type === CURSOR_AWAY_CANCEL_TYPE) {
+        const watchId = (data as { id?: unknown }).id
+        const live = paneCursorWatchRef.current
+        if (live && live.paneId === id && live.watchId === watchId) stopPaneCursorWatch()
       } else if (data.type === 'mc-embedded-boot') {
         // The pane's bundle EXECUTED (posted from main.tsx before React renders,
         // see EmbeddedHostBridge for the ready half). This line splits the one
@@ -517,7 +730,7 @@ export default function InstancesViewport({ macInset = false }: { macInset?: boo
     }
     window.addEventListener('message', onMessage)
     return () => window.removeEventListener('message', onMessage)
-  }, [dispatch, refreshToken, canRefreshNow, currentPortToId])
+  }, [dispatch, refreshToken, canRefreshNow, currentPortToId, stopPaneCursorWatch, adoptChainedCrew])
 
   // Proactive refresh: when an embedded token passes REFRESH_AT_ELAPSED_FRAC of
   // its TTL, re-mint and reload that iframe ahead of the cap. Skips the active
@@ -531,7 +744,7 @@ export default function InstancesViewport({ macInset = false }: { macInset?: boo
       if (!warm[id] || id === activeId) continue
       if (inst.status?.state !== 'connected') continue
       const remaining = inst.status?.token_ttl_remaining
-      const total = ttlToSeconds(inst.ttl)
+      const total = tokenTtlTotalSeconds(inst.status, inst.ttl)
       if (typeof remaining !== 'number' || total <= 0) continue
       if (remaining > total * (1 - REFRESH_AT_ELAPSED_FRAC)) continue
       void refreshToken(id)
@@ -579,10 +792,10 @@ export default function InstancesViewport({ macInset = false }: { macInset?: boo
   // lights and drag strips out from under a header the user can see. A
   // focus-mode-aware pane's first report corrects the brief lights-flash; a
   // non-conforming pane keeps working chrome forever. Switching to LOCAL is
-  // covered by App.tsx's own writer (gated on activeInstanceId === null).
+  // covered by shell/focus/focusChrome.ts's own writer (gated on activeInstanceId === null).
   useEffect(() => {
     // Only while focus mode is ON: off, chrome is unconditionally visible and
-    // owned by the surfaces themselves (and the local writer in App.tsx).
+    // owned by the surfaces themselves (and the local writer in shell/focus/focusChrome.ts).
     if (activeId === null || !focusMode) return
     setFocusChromeVisible(paneChromeRef.current[activeId] ?? true)
   }, [activeId, focusMode])
@@ -591,6 +804,16 @@ export default function InstancesViewport({ macInset = false }: { macInset?: boo
   const activeWarmPort = activeWarmConn?.port
   const activeReady = activeId ? !!ready[activeId] : true
   const activeSeq = activeId ? reloadSeq[activeId] || 0 : 0
+  // The dashboard's own origin cannot embed a loopback pane: the server's CSP
+  // `frame-src` permits only a specific loopback (protocol, host) set, so a
+  // dashboard served on an HTTPS reverse proxy, a tunnel origin, an [::1]
+  // address, or an https `*.localhost` host (none of which the CSP admits) has
+  // the browser refuse the frame before any gateway check runs. Detected up
+  // front from the parent's own protocol+hostname so the watchdog never arms
+  // and the render shows an honest card instead of mounting a doomed iframe and
+  // waiting out the 15s timeout only to assert "the tunnel looks connected" —
+  // which no gateway check contradicts.
+  const nonLoopbackOrigin = !isEmbeddableLoopbackOrigin(window.location.protocol, window.location.hostname)
   // The watchdog's countdown is anchored to the identity of the LOAD — (id, port,
   // reloadSeq) — and NOT to the iframe src. A token re-mint also changes the src,
   // but the token is deliberately ABSENT from the deps below, so a re-mint neither
@@ -607,6 +830,11 @@ export default function InstancesViewport({ macInset = false }: { macInset?: boo
   // `!activeReady`.
   useEffect(() => {
     if (!activeId || activeWarmPort === undefined || activeReady) return
+    // A non-loopback dashboard origin can never embed the pane (CSP frame-src),
+    // and no iframe is mounted for it, so there is nothing to time out: arming
+    // the watchdog would only journal a load-timeout for a frame that does not
+    // exist. The honest card is shown instead.
+    if (nonLoopbackOrigin) return
     const id = activeId
     const port = activeWarmPort
     // The countdown STARTING is journaled too, not only its expiry. A pane that
@@ -629,7 +857,7 @@ export default function InstancesViewport({ macInset = false }: { macInset?: boo
       })
     }, PANE_LOAD_TIMEOUT_MS)
     return () => window.clearTimeout(t)
-  }, [activeId, activeWarmPort, activeSeq, activeReady])
+  }, [activeId, activeWarmPort, activeSeq, activeReady, nonLoopbackOrigin])
 
   // See iframeRefCallbacks: the callback is created once per id and reused
   // across renders, so React invokes it only on a real attach/detach. It reads
@@ -797,6 +1025,13 @@ export default function InstancesViewport({ macInset = false }: { macInset?: boo
     autoWarmTimersRef.current = candidates.map((inst, i) =>
       window.setTimeout(() => {
         if (warmRef.current[inst.id]) {
+          // This point-in-time guard catches a pane already warmed by the time
+          // the timer fires; it cannot catch an auto-warm racing a still-settling
+          // auto-connect on the same load. That residual race is handled at the
+          // reducer: `connectInstanceInto` writes the warm entry with
+          // `keepTokenIfPortUnchanged`, so a second warm path on an unchanged
+          // port keeps the mounted token rather than reloading the pane. Keep the
+          // fix there, not here.
           paneLog('auto-warm-skipped', { id: inst.id, index: i, alreadyWarm: true })
           return
         }
@@ -810,11 +1045,15 @@ export default function InstancesViewport({ macInset = false }: { macInset?: boo
   const srcFor = useCallback(
     (id: string) => {
       const w = warm[id]
-      // Use the parent dashboard's OWN hostname (not a hardcoded 127.0.0.1) so the iframe
-      // is ALWAYS same-site with the parent. Otherwise SameSite=Lax auth cookies are
-      // withheld on the iframe's subrequests (e.g. parent on localhost + iframe on
-      // 127.0.0.1 = cross-site -> 403 storm). The hostname resolves to the same loopback
-      // the SSH forward binds (127.0.0.1), since the dashboard itself is reached via it.
+      // Use the parent dashboard's OWN hostname (not a hardcoded 127.0.0.1) so
+      // the iframe is same-site with the parent, so SameSite=Lax auth cookies
+      // ride the iframe's subrequests. The scheme stays http: the gateway binds
+      // plain http on the SSH-forwarded loopback port, and http://127.0.0.1 /
+      // http://localhost are trustworthy origins the browser exempts from
+      // mixed-content blocking even under an https parent — minting the parent's
+      // https here would instead fail the TLS handshake against the plain-http
+      // forwarded port and never load. Non-loopback origins never reach here:
+      // the pane is not mounted for them (see nonLoopbackOrigin).
       return w ? `http://${window.location.hostname}:${w.port}/?token=${encodeURIComponent(w.token)}` : ''
     },
     [warm],
@@ -826,19 +1065,31 @@ export default function InstancesViewport({ macInset = false }: { macInset?: boo
   const buildModelFor = useCallback(
     (id: string) => {
       const insts = instancesQuery.data?.instances ?? []
-      const tabs = visibleInstanceTabs(insts, warm).map(i => ({
-        id: i.id,
-        name: i.name,
-        sshHost: i.ssh_host,
-        state: i.status?.state,
-        unread: unread[i.id] || 0,
-      }))
+      // Ordered as a tree, exactly as the local bar orders it, so a pane's own
+      // switcher shows the same shape the window's does. A pane cannot derive
+      // this: it never sees the host's registry.
+      const tabs = chainRows(visibleInstanceTabs(insts, warm)).map(
+        ({ inst: i, depth, parentName, reachable, brokenAt }) => ({
+          id: i.id,
+          name: i.name,
+          sshHost: i.ssh_host,
+          state: i.status?.state,
+          unread: unread[i.id] || 0,
+          depth,
+          reachable,
+          pathName: parentName
+            ? i18nT('components.instanceTabBar.chain_via', { via: parentName, name: i.name })
+            : '',
+          pathParent: parentName,
+          brokenAt,
+        }),
+      )
       const selfInst = insts.find(i => i.id === id)
       const self = selfInst
         ? {
             state: selfInst.status?.state,
             ttlRemaining: selfInst.status?.token_ttl_remaining,
-            ttlTotal: ttlToSeconds(selfInst.ttl),
+            ttlTotal: tokenTtlTotalSeconds(selfInst.status, selfInst.ttl),
           }
         : null
       return {
@@ -925,6 +1176,16 @@ export default function InstancesViewport({ macInset = false }: { macInset?: boo
   // Watchdog verdict for the active pane: only meaningful while it has still
   // not announced readiness (a late `mc-embedded-ready` clears the alarm).
   const activeTimedOut = activeId !== null && !!timedOut[activeId] && !activeReady
+  // A non-loopback origin with a remote tab active takes the dedicated card
+  // (below) rather than the loading/error panel, and suppresses the iframe
+  // mount entirely so the watchdog never arms. `nonLoopbackOrigin` is computed
+  // once above (near the watchdog effect).
+  const showNonLoopbackCard = nonLoopbackOrigin && activeId !== null
+  // `showPanel`/`showLoading` keep the plain derivation the gates below read —
+  // the empty-warm early return and the `showLoading` overlay both depend on
+  // `showPanel`, so the card must not zero it. The card instead wins at render
+  // time: its JSX branch fires on `showNonLoopbackCard`, and the two overlay
+  // branches carry `&& !showNonLoopbackCard` so neither paints over it.
   const showPanel = activeId !== null && (!warm[activeId] || !activeLive || activeTimedOut)
   // Loading overlay: the active pane is warm and the backend says connected,
   // but the embedded SPA hasn't announced readiness yet. Without this the
@@ -967,7 +1228,7 @@ export default function InstancesViewport({ macInset = false }: { macInset?: boo
         : '',
     }))
   }, [showPanel, activeId, activeTimedOut, instancesQuery.data])
-  if (embedded || (warmIds.length === 0 && !showPanel)) return null
+  if (embedded || (warmIds.length === 0 && !showPanel && !showNonLoopbackCard)) return null
 
   const nameFor = (id: string) =>
     instancesQuery.data?.instances.find(i => i.id === id)?.name || id
@@ -985,12 +1246,42 @@ export default function InstancesViewport({ macInset = false }: { macInset?: boo
     : ''
   const panelError = connectFailure || activeInst?.status?.error || activeInst?.status?.diagnosis?.reason || ''
 
+  // Draggable title-bar strip for the loading/error overlays. On frameless
+  // macOS the window is dragged SOLELY by `-webkit-app-region: drag`
+  // host-drag-strips (the per-pane strips above are gated off once an overlay
+  // is up), and each overlay's opaque `bg-bg` cover plus the still-mounted
+  // iframe otherwise leave the top band with no draggable region — so the
+  // window can't be moved while a pane is connecting or shows a connection
+  // error. Mirror the per-pane strips: lay one across the top of each overlay,
+  // clipped clear of the Windows/Linux caption controls at the right edge (a
+  // drag strip over Close would drag the window instead of clicking it). The
+  // injected `button/a/[role=button]/[tabindex] { -webkit-app-region: no-drag }`
+  // rule keeps the InstanceTabBar switcher, the Retry button, the ErrorNotice
+  // and the SettingsLink clickable under the strip. Computed once and reused in
+  // both overlays below. Precedent: App.tsx's `focus-mac-drag-strip`.
+  const overlayDragStrip = isElectron
+    ? (() => {
+        const rightBound = isWinElectron
+          ? Math.max(0, window.innerWidth - WIN_CAPTION_OVERLAY_WIDTH)
+          : isLinuxFramelessElectron
+            ? Math.max(0, window.innerWidth - LINUX_CAPTION_CONTROLS_WIDTH)
+            : Number.POSITIVE_INFINITY
+        const width = Math.min(window.innerWidth, rightBound)
+        if (width < 1) return null
+        return <div aria-hidden data-testid="overlay-drag-strip" className="host-drag-strip" style={{ left: 0, width }} />
+      })()
+    : null
+
   return (
     <div
       className="absolute inset-0 bg-bg"
       style={{ display: activeId === null ? 'none' : 'block', zIndex: 1 }}
     >
-      {warmIds.map(id => (
+      {/* On a non-loopback origin the browser refuses the pane frame, so mount
+          no iframe at all: a doomed frame would only arm the 15s watchdog and
+          end at a "tunnel looks connected" error. The honest card below says
+          what to do instead. */}
+      {!nonLoopbackOrigin && warmIds.map(id => (
         // eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions -- onLoad is a document-load lifecycle hook: it posts the model handshake once the pane's document exists. Not a user interaction, and nothing here needs a keyboard path — the pane's own SPA owns focus once loaded.
         <iframe
           // reloadSeq in the key forces a remount (= reload) on Retry even when
@@ -1089,8 +1380,33 @@ export default function InstancesViewport({ macInset = false }: { macInset?: boo
           if (width < 1) return null
           return <div key={`drag-${i}`} aria-hidden className="host-drag-strip" style={{ left, width }} />
         })}
-      {showLoading && activeId && (
+      {showNonLoopbackCard && activeId && (
         <div className="absolute inset-0 flex flex-col bg-bg">
+          {overlayDragStrip}
+          {/* Escape hatch, same as the panels below: while a remote tab is
+              active the local header is display:none, so this strip is the only
+              way back to Local or another instance. */}
+          <InstanceTabBar
+            variant="strip"
+            style={stripInsetStyle}
+          />
+          <div className="flex-1 flex items-center justify-center p-6">
+            <div className="max-w-md w-full flex flex-col items-center gap-3 text-center">
+              <AlertTriangle size={28} className="text-[var(--danger)]" />
+              <div className="text-sm font-medium text-text">{nameFor(activeId)}</div>
+              <div className="text-xs text-muted">
+                {i18nT('components.instancesViewport.pane_needs_loopback_origin')}
+              </div>
+              <div className="text-xs text-muted">
+                {i18nT('components.instancesViewport.pane_needs_loopback_origin_how')}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+      {showLoading && !showNonLoopbackCard && activeId && (
+        <div className="absolute inset-0 flex flex-col bg-bg">
+          {overlayDragStrip}
           {/* Same escape hatch as the error panel: while this overlay is up the
               only other switcher lives inside the still-loading iframe, so the
               strip is the user's sole way to reach Local or another instance. */}
@@ -1107,8 +1423,9 @@ export default function InstancesViewport({ macInset = false }: { macInset?: boo
           </div>
         </div>
       )}
-      {showPanel && activeId && (
+      {showPanel && !showNonLoopbackCard && activeId && (
         <div className="absolute inset-0 flex flex-col bg-bg">
+          {overlayDragStrip}
           {/* Escape hatch. While a remote
               tab is active the local header — and with it the only top-level
               InstanceTabBar — is display:none, and the embedded switcher lives

@@ -20,7 +20,7 @@ from collections import OrderedDict
 from collections.abc import Callable, Iterable
 from functools import partial
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Sequence, cast
 
 from aiohttp import web
 
@@ -81,8 +81,10 @@ from kiro_crew.dashboard.token_secret import (  # noqa: F401  # re-exports
 from kiro_crew.executors import subprocess_executor
 from kiro_crew.mcp_gateway.socketsec import PeerCredResult, check_peer_is_self, get_peer_pid
 from kiro_crew.messaging.link import is_channel_session_key
-from kiro_crew.peer_resolve import resolve_peer_identity
+from kiro_crew.peer_resolve import resolve_peer_tenancy
+from kiro_crew.runtime_ownership import session_keys_bound_to_pid
 from kiro_crew.sel import sel as _sel_fn
+from kiro_crew.session_token_sig import verify_session_token
 
 
 def internal_path_matches(path: str, entries: Iterable[str]) -> bool:
@@ -91,10 +93,6 @@ def internal_path_matches(path: str, entries: Iterable[str]) -> bool:
 
 
 logger = logging.getLogger(__name__)
-
-# Alias of bump_revocation_gen: callers elsewhere import the private name
-# from this module.
-_bump_revocation_gen = bump_revocation_gen
 
 
 # -- Per-session access-cookie revocation -------------------------------------
@@ -439,6 +437,14 @@ _state: TokenStateManager = TokenStateManager(max_concurrent_nonces=MAX_CONCURRE
 # so artifact and widget frames load a real document instead. See
 # dashboard/handlers/sandbox_doc.py for the full security model.
 # Same exposure class as /assets/: static non-secret files.
+# /browser-view/ is the same-origin relay for the Playwright CLI browser view:
+# auth is the per-instance capability token embedded in the path, minted by
+# the view supervisor and disclosed only through the cookie-authed, owner-gated
+# /api/browser/view payload (the panel frames the relay in an opaque-origin
+# sandbox that carries no cookies, exactly like /artifact-app/ above). The
+# relay constant-time-compares the token BEFORE running its per-request
+# ownership probes and answers a uniform 404 without it. See
+# dashboard/handlers/browser_view_relay.py for the full security model.
 _BYPASS_PREFIXES = (
     "/assets/",
     "/static/",
@@ -446,12 +452,20 @@ _BYPASS_PREFIXES = (
     "/vendor/",
     "/artifact-app/",
     "/sandbox-doc/",
+    "/browser-view/",
 )
 _BYPASS_EXACT = {
     "/logo.png",
     # Alias of /logo.png for clients that hardcode the favicon path instead of
     # parsing <link rel="icon"> — same handler, same static-asset exposure.
     "/favicon.ico",
+    # The bare relay path (no trailing slash, so the /browser-view/ prefix
+    # above misses it). It is a registered relay route carrying no token
+    # segment, and the relay's contract is a UNIFORM 404 for every tokenless
+    # or wrong-token request — without this entry the middleware answers 403
+    # first, handing an unauthenticated prober a response that distinguishes
+    # the bare path from the tokened misses.
+    "/browser-view",
     "/manifest.json",
     "/sw.js",
     "/pcm-worklet.js",
@@ -525,9 +539,19 @@ AGENT_HOOK_PATH = "/api/hooks/agent"
 #: is the only method whose handler carries its own credential check.
 _SELF_AUTH_WEBHOOK_METHODS = frozenset({"POST"})
 
+#: The CLI's post-update badge-revalidate route. `kirocrew update` (git checkout)
+#: POSTs here over loopback holding the local secret in X-Local-Secret and no
+#: dashboard token, exactly like /api/logout and /api/token/local; the handler
+#: (api_update_revalidate) re-checks BOTH loopback origin and the secret itself
+#: before touching the cache. Scoped to POST — the only method routed and the
+#: only one the handler's self-auth covers — so a future collision on this path
+#: under another method stays on the ordinary token gate.
+UPDATE_REVALIDATE_PATH = "/api/update/revalidate"
+
 _BYPASS_EXACT_METHODS: dict[str, frozenset[str]] = {
     AGENT_HOOK_PATH: _SELF_AUTH_WEBHOOK_METHODS,
     TEAMS_WEBHOOK_PATH: _SELF_AUTH_WEBHOOK_METHODS,
+    UPDATE_REVALIDATE_PATH: _SELF_AUTH_WEBHOOK_METHODS,
 }
 
 # Exact-path exemptions from the CSRF **Origin** check, path -> allowed methods.
@@ -620,6 +644,12 @@ SPA_FALLBACK_EXCLUDED_PREFIXES = (
     # 200 and render nothing, and a future non-/api GET registered beside it in
     # routes/realtime.py would inherit the same silent fallback.
     "/feature-videos/",
+    # The browser-view relay (handlers/browser_view_relay.py). A data route
+    # authenticated by its own capability path token: its handler must always
+    # answer — the uniform 404 without the token, the proxied view with it —
+    # never the SPA shell, which would render the dashboard inside the
+    # Browser panel's own frame.
+    "/browser-view",
 )
 
 # App window entries (`/app-windows/<app>/<name>.html`) are their own Vite bundles, served
@@ -745,8 +775,8 @@ _403_HTML = (
     "<script>"
     "function go(){{var v=document.getElementById('u').value.trim();if(!v)return;"
     "var t;try{{var u=new URL(v);t=u.searchParams.get('token')}}"
-    "catch(_){{t=v}}if(t){{window.location.href="
-    "window.location.protocol+'//'+window.location.host+'?token='+encodeURIComponent(t)}}"
+    "catch(_){{t=v}}if(t){{var d=new URL(window.location.href);"
+    "d.searchParams.set('token',t);window.location.href=d.toString()}}"
     "else{{document.getElementById('e').style.display='block'}}}}"
     "document.getElementById('u').addEventListener('keydown',"
     "function(e){{if(e.key==='Enter')go()}});"
@@ -795,6 +825,17 @@ def _token_pin_key(token: str) -> str:
 
 def _sign(payload: bytes) -> str:
     return _b64url_encode(hmac.new(_get_secret(), payload, hashlib.sha256).digest())
+
+
+def _ct_eq(a: str, b: str) -> bool:
+    """Constant-time str equality that answers False, never raises, for non-ASCII.
+
+    ``hmac.compare_digest`` raises ``TypeError`` on a str with a non-ASCII
+    character, which turned a forged credential into a 500 instead of a denial.
+    """
+    return hmac.compare_digest(
+        a.encode("utf-8", "surrogatepass"), b.encode("utf-8", "surrogatepass")
+    )
 
 
 def generate_token(
@@ -918,7 +959,7 @@ def validate_token(token: str, *, use_session_exp: bool = False) -> tuple[bool, 
     except Exception:
         return False, "", "invalid encoding"
     expected = _sign(payload_bytes)
-    if not hmac.compare_digest(sig, expected):
+    if not _ct_eq(sig, expected):
         return False, "", "invalid signature"
     try:
         data = json.loads(payload_bytes)
@@ -1208,7 +1249,7 @@ def validate_app_secret(app_name: str, provided_secret: str) -> bool:
         return False
     if not stored or not provided_secret:
         return False
-    return hmac.compare_digest(stored, provided_secret)
+    return _ct_eq(stored, provided_secret)
 
 
 def write_app_secret(app_name: str, secret: str) -> None:
@@ -1217,9 +1258,10 @@ def write_app_secret(app_name: str, secret: str) -> None:
     Creates the directory if needed and sets file mode to 0o600.
     """
     from kiro_crew.config.loader import config_dir
+    from kiro_crew.owner_only_files import mkdirs_owner_only
 
     secret_dir = config_dir() / "apps" / app_name
-    secret_dir.mkdir(parents=True, exist_ok=True)
+    mkdirs_owner_only(secret_dir)  # apps/ and apps/<name>/ are born 0700
     secret_path = secret_dir / ".app_secret"
     # os.O_TRUNC truncates any pre-existing file BEFORE the DACL tightens,
     # then restrict_to_owner locks it down while it is still empty, then we
@@ -1673,6 +1715,114 @@ def _unix_request_socket(request: web.Request) -> Any:
         return None
 
 
+def _live_session_keys_on_chain(request: web.Request, chain: Sequence[int]) -> frozenset[str]:
+    """WHICH sessions the LIVE session manager reports on *chain*'s nearest hit.
+
+    The keys, not a count. The manager already holds them, and a count throws
+    away the one fact that decides whether a declared key belongs here at all:
+    an arm that learns "one session lives on this pid" and not "which" has to
+    accept whatever key it is handed.
+
+    The published mapping is the same answer written to disk, and disk is not a
+    trustworthy place to ask this question: the pair sits in the data-home root,
+    which is writable inside the agent sandbox, so a co-tenant can simply UNLINK
+    it. Absence then reads as "nothing resolved", which is the permissive arm --
+    a plain unlink would otherwise buy the attacker the attestation-free path
+    that publishing the roster exists to close. Per-turn republication bounds
+    that window but does not close it, because the deleter picks its moment.
+
+    So for the case where nothing resolved on disk, the manager is asked
+    directly. It answers from memory, in this same process, about runtimes it
+    owns, and an agent cannot edit it. The chain is walked peer-first for the
+    same reason the disk walk is: the peer is an MCP server whose kiro-cli
+    ANCESTOR is the pid sessions are keyed by.
+
+    Returns an EMPTY set when the manager knows none of these pids, which is the
+    ordinary answer for the callers the permissive arm exists for -- a cron
+    script, a warm-pool runtime before claim, a pooled backend outside this
+    manager. Empty is therefore "no evidence", never "not shared", and the caller
+    treats it as such. Every failure path answers empty for the same reason: a
+    probe that could not ask must not become a verdict.
+
+    The set is NOT a closed account of the pid's tenancy. A ``spawn_run`` shared
+    subagent's session lives on its parent's ``_shared_provider`` and is never
+    registered with the manager, so its key can be missing from a set that names
+    its parent. That is why a declared key absent from a NON-EMPTY set takes the
+    attestation arm rather than a flat denial: absent-from-roster and
+    not-a-tenant are different facts, and only a token tells them apart.
+    """
+    try:
+        sessions = request.app["state"].sessions
+        rows = sessions.runtime_pids()
+    except Exception:
+        # No manager reachable from this request (a unit test's bare app, a
+        # non-dashboard host). No evidence, not a verdict.
+        return frozenset()
+    try:
+        on_pid: dict[int, set[str]] = {}
+        for row in rows:
+            # Sessions only. The snapshot also appends one row per companion
+            # RUNTIME whose key is display text, and a subagent runtime often
+            # repeats the pid of a session it serves -- counting those would
+            # report two sessions for a pid hosting one. Same filter, and same
+            # reason, as the publisher's.
+            if "sid" not in row:
+                continue
+            pid, key = row.get("pid"), row.get("key")
+            if isinstance(pid, int) and isinstance(key, str) and key:
+                on_pid.setdefault(pid, set()).add(key)
+        for pid in chain:
+            if pid in on_pid:
+                return frozenset(on_pid[pid])
+    except Exception:
+        return frozenset()
+    return frozenset()
+
+
+def _bound_session_keys_on_chain(chain: Sequence[int]) -> frozenset[str]:
+    """WHICH sessions the OWNERSHIP TABLES place on *chain*'s nearest hit.
+
+    A token proves which session a caller IS. It does not prove that session is
+    on the process the call arrived from, and those are different facts: the token
+    is a bearer credential sitting in the runtime's environment, so a same-uid
+    co-tenant that can read ``/proc/<pid>/environ`` can present a sibling's token
+    and satisfy the name check with it. What it cannot do is put that sibling onto
+    a process the gateway never placed it on. So the declared key is additionally
+    required to hold a LIVE entry in one of the two tables for this pid -- the
+    lease table for a session that owns its runtime, the tenancy table for a
+    sharing sub-agent or task run that does not.
+
+    Both halves are needed and :func:`session_keys_bound_to_pid` unions them: a
+    sub-agent holds no lease, and a chat session holds no tenancy.
+
+    The chain is walked peer-first, exactly as the disk walk and the live-manager
+    reader walk it, and the NEAREST pid either table knows anything about decides.
+    The peer is an MCP stub whose kiro-cli ANCESTOR is the process sessions are
+    placed on, so the answer is never on the peer pid itself.
+
+    Returns an EMPTY set when no pid on the chain appears in either table, which
+    is not a verdict and must not be read as one. The tables describe runtimes
+    THIS gateway placed sessions on; a warm-pool runtime before its claim, a
+    pooled MCP backend, a cron script and anything belonging to another install
+    are all absent from them while being entirely legitimate. Every failure path
+    answers empty for the same reason a probe that could not ask must not become a
+    verdict.
+    """
+    try:
+        for pid in chain:
+            if not isinstance(pid, int):
+                continue
+            bound = session_keys_bound_to_pid(pid)
+            if bound:
+                return bound
+    except Exception:
+        # The tables failing to answer is an "unresolvable" outcome, never a
+        # denial -- the same rule the resolver failure above follows.
+        logger.debug("ownership tables unreadable while verifying a peer", exc_info=True)
+        return frozenset()
+    return frozenset()
+
+
 async def _verify_unix_peer(
     request: web.Request, sock: Any, path: str
 ) -> web.StreamResponse | None:
@@ -1685,15 +1835,35 @@ async def _verify_unix_peer(
     * peer uid positively ≠ ours (``MISMATCH``) → deny. Cannot normally
       happen (the socket sits in the 0700 data home), so a hit means the
       directory gate failed — exactly when denying matters most.
-    * peer resolved to a session key that DIFFERS from the declared header →
+    * the declared key is one of the sessions the peer's process is attested to
+      host → proceed with ``request["peer_verified"] = True``. On a 1:1 runtime
+      that is the pid's single mapped key, and the kernel's process attestation
+      settles it: one session lives there, so there is no other identity the
+      caller could be mistaken for.
+    * on a SHARED runtime the pid names several sessions, and membership is
+      necessary but NOT sufficient. The mapping's MAC stops an agent ADDING
+      itself to a pid's membership, but every co-tenant can READ the list, so
+      one of them could declare a sibling's recorded key — and the key admitted
+      here is what ``derive_caller_app`` derives app confinement from. So a
+      shared pid additionally requires an ``X-Session-Token`` that verifies to
+      the declared key: it is MAC'd under the agent-unreadable SEL trust root,
+      names ONE session, and every caller that declares a key already sends it.
+      Admitted here the call is SEL-recorded rather than debug-logged, because
+      this is the arm where a cross-session declaration would have landed.
+      The token is required on EVERY shared-pid arm, including the one whose
+      roster the mapping file's size bound truncated: truncation is a normal
+      publisher outcome, so a roster short of the declared key withholds
+      membership evidence without withdrawing the demand for attestation.
+    * the peer's full membership is known and the declared key is NOT in it →
       deny 403 + SEL ``dashboard.peer-identity-mismatch`` (the impersonation
       this check exists to close: a same-uid process declaring another
       session's identity).
-    * peer resolved to the SAME key → proceed with
-      ``request["peer_verified"] = True``.
-    * anything unresolvable (no peer pid mechanism, no ``session_pid_<pid>``
-      file in the ancestry — warm-pool runtimes before claim, cron scripts,
-      pooled MCP backends) → proceed under today's semantics: no new denial.
+    * anything that leaves the pid's tenancy unknown ALTOGETHER → proceed under
+      today's semantics: no new denial. No peer pid mechanism, no
+      ``session_pid_<pid>`` file in the ancestry (warm-pool runtimes before
+      claim, cron scripts, pooled MCP backends), or a pid proven recycled.
+      A truncated roster is NOT one of these: it carries positive evidence of
+      sharing, so it takes the token arm above.
 
     Returns a deny response, or ``None`` to proceed. The /proc ancestry walk
     is blocking I/O and runs on the subprocess executor (mirroring gatewayd's
@@ -1735,26 +1905,253 @@ async def _verify_unix_peer(
         # signed_only: authorization decisions must not trust the bare
         # same-uid-writable .txt mapping — require the HMAC sidecar (pid
         # bound into the MAC, keyed by the agent-unreadable SEL trust root),
-        # or the walk yields "" and this check degrades to status quo.
-        peer_key, _chain = await asyncio.get_running_loop().run_in_executor(
+        # or the walk yields nothing and this check degrades to status quo.
+        # That covers the tenant list too: without the MAC an agent could add
+        # its declared key to a pid's membership and be admitted by it.
+        tenancy = await asyncio.get_running_loop().run_in_executor(
             subprocess_executor(),
-            partial(resolve_peer_identity, peer_pid, signed_only=True),
+            partial(resolve_peer_tenancy, peer_pid, signed_only=True),
         )
     except Exception:
         # Resolution machinery failing is an "unresolvable" outcome, not a
         # denial — the change must never be weaker OR stricter than intended.
         logger.debug("unix peer identity resolution failed", exc_info=True)
         return None
-    if not peer_key:
+
+    async def _attest_shared(shape: str, *, hosts: int | None) -> web.StreamResponse | None:
+        """Admit *declared* on a shared pid only against its per-session token.
+
+        The one place a shared-runtime declaration is decided, because every
+        arm that reaches a shared pid owes the same attestation: membership is
+        NECESSARY but not SUFFICIENT when the roster enumerates the key, and it
+        is not even available when the size bound truncated the roster. Both
+        arms hold the same two facts — the pid hosts several sessions, and the
+        kernel cannot say which one holds this socket — so both need the token,
+        which is MAC'd under the agent-unreadable SEL trust root and names ONE
+        session.
+
+        *shape* describes the roster the decision was made against and is
+        recorded on both outcomes, so an investigation can tell a declaration
+        checked against a full membership from one checked against a short one.
+
+        Two things are asked, because a token answers only one of them. It proves
+        WHICH session the caller is; it does not prove that session is on the
+        process this call arrived from, and it cannot, because it is a bearer
+        credential living in the runtime's environment where a same-uid co-tenant
+        reading ``/proc/<pid>/environ`` can lift it. So the declared key must ALSO
+        hold a live entry in one of the two ownership tables for this pid --
+        :func:`_bound_session_keys_on_chain` -- and a declaration the tables place
+        elsewhere is refused ``peer_session_unbound``. Stolen-token reach shrinks
+        from "any session whose env is readable" to "a session this process
+        actually hosts", which is the set the roster already admits. Tables that
+        cannot speak about the pid answer empty and change nothing.
+
+        *hosts* is the tenancy the denial was actually decided against, or
+        ``None`` on the one arm that measured no count at all. It is
+        keyword-only with NO default on purpose: a default resolves to
+        ``tenancy.tenant_count``, which is ``0`` on every arm reached without a
+        resolved mapping, so a denial taken BECAUSE the live manager reported
+        several sessions would record ``hosts 0 sessions`` — a trail
+        contradicting the decision it explains and indistinguishable from a pid
+        that genuinely hosts none. An unmeasured tenancy therefore carries its
+        own wording rather than a zero, and a new arm cannot inherit a silent
+        count.
+
+        Returns a deny response, or ``None`` having marked the request verified.
+        """
+        attested = await asyncio.get_running_loop().run_in_executor(
+            subprocess_executor(),
+            partial(verify_session_token, request.headers.get("X-Session-Token", "")),
+        )
+        if attested != declared:
+            # Three states, not two: a measured count, and a tenancy nothing
+            # measured — which must NOT arrive as the zero that reads as "hosts
+            # none".
+            tenancy_note = (
+                f"hosts {hosts} sessions" if hosts is not None else "tenancy not measured"
+            )
+            _sel_fn().log_api_access(
+                caller=declared,
+                operation="dashboard.peer-identity-unattested",
+                outcome="denied",
+                source="token_auth",
+                resources=path,
+                error=(
+                    f"peer_pid={peer_pid} {tenancy_note} ({shape}); "
+                    "the declared X-Session-Key needs a per-session token naming it"
+                ),
+            )
+            _log_auth(
+                request,
+                "internal",
+                "denied",
+                f"co-tenant declaration unattested (peer_pid={peer_pid})",
+            )
+            return _deny(request, "Forbidden", "peer_session_unattested")
+        bound = _bound_session_keys_on_chain(tenancy.chain)
+        if bound and declared not in bound:
+            # The token named this session, and the gateway's own tables say this
+            # session is not on this process. A token is a BEARER credential in
+            # the runtime's environment, so the actor that can read a sibling's
+            # env can present its token and pass the name check above -- which is
+            # exactly the gap this arm closes. It cannot also make the gateway
+            # place that sibling on a process it was never placed on, and the
+            # tables are in this process's memory rather than in a file the
+            # sandbox can write.
+            #
+            # A non-empty set is the whole precondition. Empty means the tables
+            # cannot speak about the pid, which is no evidence and takes the arm
+            # below unchanged; only a set that names OTHER sessions and not this
+            # one is positive evidence that the declaration does not belong here.
+            _sel_fn().log_api_access(
+                caller=declared,
+                operation="dashboard.peer-session-unbound",
+                outcome="denied",
+                source="token_auth",
+                resources=path,
+                error=(
+                    f"peer_pid={peer_pid} ({shape}); the token names this session but "
+                    f"neither ownership table places it on this process "
+                    f"({len(bound)} bound there)"
+                ),
+            )
+            _log_auth(
+                request,
+                "internal",
+                "denied",
+                f"declared session is not bound to this process (peer_pid={peer_pid})",
+            )
+            return _deny(request, "Forbidden", "peer_session_unbound")
+        # Recorded, not debug-logged: this is the arm where a cross-session
+        # declaration would have succeeded, so it is the one an investigation
+        # needs a trail for. The 1:1 arm stays at debug because a pid hosting
+        # one session has no other identity to be mistaken for.
+        _sel_fn().log_api_access(
+            caller=declared,
+            operation="dashboard.peer-identity-co-tenant",
+            outcome="allowed",
+            source="token_auth",
+            resources=path,
+            # The roster judged AND whether the tables confirmed the binding, so
+            # the trail separates an admission that passed both checks from one
+            # the tables could not speak about -- which is the difference between
+            # the hardened path and the one that fell open.
+            error=f"{shape}; binding={'confirmed' if bound else 'no evidence'}",
+        )
+        request["peer_verified"] = True
         return None
-    if peer_key != declared:
+
+    if not tenancy.admits(declared):
+        if not tenancy.membership_complete:
+            if tenancy.shared:
+                # Two different unknowns reach this arm, and ``shared`` is the
+                # positive evidence that separates them. Here the pid IS known
+                # to host several sessions and only the roster is short, so the
+                # declared key's absence is not grounds to deny — but it is not
+                # licence to proceed on the caller's word either, which is the
+                # weakest point of the whole check: truncation is a normal
+                # publisher outcome under the size bound, so a caller that can
+                # overflow the roster would otherwise skip attestation
+                # altogether. The token does not depend on the roster, so it
+                # still decides.
+                return await _attest_shared(
+                    "roster truncated by the size bound",
+                    hosts=tenancy.tenant_count,
+                )
+            if tenancy.unverifiable:
+                # A mapping EXISTS on this ancestry and would not VERIFY, which
+                # is not the same as none existing. The pair is replaced in two
+                # steps -- `.txt` then `.sig` -- so a body-changing
+                # republication is briefly visible as a MAC mismatch, and a
+                # tenancy-changing claim is exactly when the body changes. Left
+                # on the arm below, that window is a bypass rather than a
+                # degradation: a co-tenant can read both files, watch `.txt`
+                # move ahead of `.sig`, and drive its declaration into the gap
+                # to skip an attestation the resolved mapping would have
+                # demanded. There is no roster to check a declaration against
+                # here, so the token is the whole decision -- and the caller
+                # that legitimately owns the declared key holds one, while a
+                # sibling reading that key out of the roster does not.
+                #
+                # This is the MAC mismatch ALONE. A proven recycle verifies, so
+                # it is attested knowledge that the pid moved on rather than
+                # ambiguity about who is calling, and the sweep leaves one for
+                # every live recycled pid -- demanding a token there would deny
+                # the tokenless callers the arm below exists for. The CLIENT-side
+                # walk in `mcp_caller` keeps the wider set on purpose: it reads
+                # without requiring a signature, so a recycled-looking file
+                # there may simply have been planted, and what it withholds is
+                # the caller's own name rather than someone else's access.
+                # No count reaches this arm: the mapping that would carry one is
+                # the very thing that would not verify, so the record says the
+                # tenancy was not measured rather than reporting none.
+                return await _attest_shared("mapping present but unverifiable", hosts=None)
+            live_keys = _live_session_keys_on_chain(request, tenancy.chain)
+            live_sessions = len(live_keys)
+            if live_sessions == 1 and declared in live_keys:
+                # The manager names exactly one session on this ancestry and it
+                # IS the declared key, so the manager itself attests the 1:1
+                # identity the missing mapping would have carried. Nothing is
+                # taken on the caller's word: the key came from the manager's
+                # own memory, which an agent cannot edit. Admitted without a
+                # token for the same reason a 1:1 roster is -- one session lives
+                # there, so there is no other identity to be mistaken for.
+                logger.debug(
+                    "unix peer identity verified from the live manager for %s (peer_pid=%d)",
+                    path,
+                    peer_pid,
+                )
+                request["peer_verified"] = True
+                return None
+            if live_sessions == 1:
+                # One session, and it is NOT the declared key. A COUNT cannot see
+                # this: one reads as "1:1, no other identity to be mistaken for",
+                # so the declared key is taken on the caller's word -- which is
+                # exactly what a plain unlink buys, because an agent that deletes
+                # its own mapping has already read the roster and knows a sibling
+                # key to name.
+                #
+                # Attestation rather than denial, because the set is not a closed
+                # account of the tenancy: a `spawn_run` shared subagent's session
+                # is never registered with the manager, so a legitimate caller's
+                # key can be absent from a set that names its parent. Denying on
+                # absence would 403 exactly that caller in the window this arm
+                # exists for. A token names ONE session under the agent-unreadable
+                # trust root, so the legitimate holder passes and the unlinker --
+                # which has the sibling key but not its token -- does not.
+                return await _attest_shared(
+                    "mapping absent, manager hosts a different session", hosts=live_sessions
+                )
+            if live_sessions > 1:
+                # Nothing resolved ON DISK, but the live session manager says
+                # this ancestry hosts several sessions. Disk absence is not
+                # evidence of anything here: the pair sits in the data-home
+                # root, which is writable inside the agent sandbox, so reaching
+                # this arm costs a co-tenant one unlink -- and the roster it read
+                # before deleting tells it which sibling key to declare.
+                # Per-turn republication bounds that window without closing it,
+                # because the deleter picks its moment. The manager answers from
+                # memory in this process about runtimes it owns, so it is the one
+                # account of the pid's tenancy an agent cannot edit, and where it
+                # says several the token decides exactly as it would have from a
+                # readable mapping.
+                return await _attest_shared(
+                    "mapping absent, manager reports several", hosts=live_sessions
+                )
+            # Nothing resolved at all: no mapping in the ancestry, and the manager
+            # knows of no sharing either. Absence is not evidence, and with no
+            # positive evidence of sharing to attest against this stays the
+            # unresolvable arm and today's semantics hold -- a warm-pool runtime
+            # before claim, a cron script, a pooled MCP backend outside this
+            # manager.
+            return None
         _sel_fn().log_api_access(
             caller=declared,
             operation="dashboard.peer-identity-mismatch",
             outcome="denied",
             source="token_auth",
             resources=path,
-            error=f"peer_pid={peer_pid} resolved session differs from declared X-Session-Key",
+            error=f"peer_pid={peer_pid} hosts no session matching the declared X-Session-Key",
         )
         _log_auth(
             request,
@@ -1763,6 +2160,19 @@ async def _verify_unix_peer(
             f"peer identity mismatch (peer_pid={peer_pid})",
         )
         return _deny(request, "Forbidden", "peer_session_mismatch")
+    if tenancy.shared:
+        # Membership is NECESSARY but not SUFFICIENT here. The tenant list is
+        # MAC-covered, so it cannot be forged — but it is published in a file
+        # the agent can READ, and every session on the pid shares that file, so
+        # one co-tenant can read a sibling's key and declare it. The kernel
+        # attests the PROCESS; on a shared runtime that does not pick out which
+        # of its sessions is speaking on this socket, and the key admitted here
+        # is the same one ``derive_caller_app`` derives app confinement from.
+        #
+        # On a 1:1 pid the mapping's single key already identifies the only
+        # possible speaker, so that path stays exactly as it was and needs no
+        # token.
+        return await _attest_shared("roster complete", hosts=tenancy.tenant_count)
     # Positive kernel attestation. Debug-level on purpose — this fires on
     # every internal call from a claimed session; the SEL trail records the
     # deny arm, which is the permission decision that changes anything.
@@ -2581,7 +2991,7 @@ def token_auth_middleware(
                     )
                     _log_auth(request, "internal", "denied", "no internal secret configured")
                     return _deny(request, "Forbidden")
-                if hmac.compare_digest(internal_secret, _provided_secret):
+                if _ct_eq(internal_secret, _provided_secret):
                     _sel = _sel_fn()
                     _sel.log_api_access(
                         caller=_caller,
@@ -2703,16 +3113,27 @@ def token_auth_middleware(
             _scope_deny = _enforce_app_scope(request, _app, path)
             if _scope_deny is not None:
                 return _scope_deny
-            _sel = _sel_fn()
-            _sel.log_api_access(
-                caller=_caller,
-                operation="internal_auth",
-                outcome="granted",
-                source="token_auth",
-                resources=path,
-                error="cookie auth (no secret header)",
-            )
-            _log_auth(request, "internal", "granted", f"cookie auth for {_uid}")
+            # A dashboard-user cookie poll on a mixed-internal path is the same
+            # request the ``_log_auth`` row below already audits (operation
+            # ``dashboard.token_auth``), so emitting an ``internal_auth`` row
+            # here too double-logs one request — the signal the high-frequency
+            # ``/api/workflows/runs`` poll dominates. The ``_log_auth`` row
+            # carries the daemon-verified caller (``_audit_uid`` — the peer
+            # login when a peer resolved, else the token subject), so the single
+            # surviving row names the identity the suppressed row would have.
+            # An app token is a distinct security decision (its scoped reach onto
+            # a mixed route), so it keeps the per-layer ``source=token_auth`` row.
+            if _app:
+                _sel = _sel_fn()
+                _sel.log_api_access(
+                    caller=_caller,
+                    operation="internal_auth",
+                    outcome="granted",
+                    source="token_auth",
+                    resources=path,
+                    error="cookie auth (no secret header)",
+                )
+            _log_auth(request, _audit_uid(_uid), "granted", f"cookie auth for {_uid}")
             return await handler(request)  # type: ignore[operator]
         elif _matches_internal:
             if _matches_mixed:
@@ -2724,7 +3145,7 @@ def token_auth_middleware(
                 # If X-Internal-Secret header is present, validate it first
                 # (defense-in-depth: wrong secret = deny, even with valid cookie)
                 if "X-Internal-Secret" in request.headers:
-                    if not internal_secret or not hmac.compare_digest(
+                    if not internal_secret or not _ct_eq(
                         internal_secret, request.headers["X-Internal-Secret"]
                     ):
                         # Same fingerprint detail and code as the loopback arm
@@ -2785,17 +3206,25 @@ def token_auth_middleware(
                 _scope_deny = _enforce_app_scope(request, _app, path)
                 if _scope_deny is not None:
                     return _scope_deny
-                _sel = _sel_fn()
-                _sel.log_api_access(
-                    caller=_caller,
-                    operation="internal_auth",
-                    outcome="granted",
-                    source="token_auth",
-                    resources=path,
-                    error="mixed non-loopback cookie auth",
-                )
+                # Same dedup as the loopback mixed branch above: the dashboard
+                # user's grant is already audited by ``_log_auth``, whose row
+                # carries the daemon-verified caller (``_audit_uid``); only an
+                # app token's scoped grant keeps the ``source=token_auth`` row.
+                if _app:
+                    _sel = _sel_fn()
+                    _sel.log_api_access(
+                        caller=_caller,
+                        operation="internal_auth",
+                        outcome="granted",
+                        source="token_auth",
+                        resources=path,
+                        error="mixed non-loopback cookie auth",
+                    )
                 _log_auth(
-                    request, "internal", "granted", f"mixed non-loopback cookie auth for {_uid}"
+                    request,
+                    _audit_uid(_uid),
+                    "granted",
+                    f"mixed non-loopback cookie auth for {_uid}",
                 )
                 return await handler(request)  # type: ignore[operator]
             else:
@@ -3356,7 +3785,8 @@ def _credential_fingerprint(value: str) -> str:
     """
     if not value:
         return "absent"
-    return f"{hashlib.sha256(value.encode()).hexdigest()[:8]}/len={len(value)}"
+    digest = hashlib.sha256(value.encode("utf-8", "surrogatepass")).hexdigest()[:8]
+    return f"{digest}/len={len(value)}"
 
 
 def _credential_mismatch_detail(expected: str, provided: str) -> str:

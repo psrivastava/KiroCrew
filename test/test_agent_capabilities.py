@@ -15,6 +15,35 @@ from kiro_crew.agent_capabilities import (
     validate_request,
 )
 from kiro_crew.config import loader
+from kiro_crew.kiro_cli import SPEC_PERMISSIONS_MIN_VERSION
+
+#: A release that accepts a spec ``permissions`` block, and one that refuses it,
+#: expressed against the floor so raising it cannot strand these tests.
+_ACCEPTS = SPEC_PERMISSIONS_MIN_VERSION
+_REFUSES = (SPEC_PERMISSIONS_MIN_VERSION[0], SPEC_PERMISSIONS_MIN_VERSION[1] - 1, 0)
+
+
+def _pin_spec_permissions_cli(monkeypatch, which):
+    """Pin what the shared writer gate believes the installed kiro-cli is.
+
+    Same helper the five generated writers' suites use: the gate reads
+    ``installed_kiro_cli_version`` function-locally from ``kiro_crew.kiro_cli``,
+    so the patch lands there. ``which`` is ``"accepts"``, ``"refuses"`` or
+    ``"unknown"``. A developer box below the floor -- or with no resolvable
+    binary at all -- would otherwise decide these assertions.
+    """
+    version = {"accepts": _ACCEPTS, "refuses": _REFUSES, "unknown": None}[which]
+    monkeypatch.setattr("kiro_crew.kiro_cli.installed_kiro_cli_version", lambda: version)
+
+
+@pytest.fixture(autouse=True)
+def _accepting_kiro_cli(monkeypatch):
+    """Every other test in this module predates the gate and assumes it passes.
+
+    The two tests that exercise the gate itself re-pin a refusing and an unknown
+    release over this default.
+    """
+    _pin_spec_permissions_cli(monkeypatch, "accepts")
 
 
 @pytest.fixture
@@ -95,6 +124,23 @@ def test_enrollment_is_explicit_and_keeps_other_bindings(editor):
     assert prepared["revision"]
 
 
+def test_a_dotted_parent_template_can_be_enrolled(editor):
+    service, home, specs, parent = editor
+    parent["name"] = "reviewer.v2"
+    (specs / "parent.json").unlink()
+    (specs / "reviewer.v2.json").write_text(json.dumps(parent), encoding="utf-8")
+    config = json.loads((home / "config.json").read_text())
+    config["agents"]["A"]["kiro_agent"] = "reviewer.v2"
+    (home / "config.json").write_text(json.dumps(config), encoding="utf-8")
+    loader._invalidate_config_cache()
+
+    result = save(service, enroll=True)
+
+    assert result["runtime"]["status"] == "pending"
+    assert result["template"]["name"] == "reviewer.v2"
+    assert spec_for(home, specs)["tools"] == ["read"]
+
+
 def test_whole_transport_replacement_and_custom_resources_survive(editor):
     service, home, specs, _ = editor
     save(
@@ -171,6 +217,24 @@ def test_stale_preview_parent_and_request_rejected(editor):
     with pytest.raises(CapabilityError, match="stale_preview"):
         service.put("A", {**body, "preview_token": preview["preview_token"]})
     assert len(list(specs.glob("*.json"))) == 1
+
+
+@pytest.mark.parametrize("codepoint", [0x00E9, 0x63D0, 0x1F600, 0xDCFF])
+def test_a_non_ascii_preview_token_is_refused_not_raised(editor, codepoint):
+    """A non-ASCII token must be refused like any other stale one.
+
+    ``hmac.compare_digest`` rejects a ``str`` holding a non-ASCII character by
+    raising ``TypeError``. The token travels in the request body, and the
+    handler catches only ``CapabilityError`` and ``(OSError, ValueError)``, so a
+    raise escapes as a 500 instead of the ``stale_preview`` refusal that a wrong
+    ASCII token produces. Code points are built rather than written literally
+    because ``0xDCFF`` is a lone surrogate, which cannot appear in source.
+    """
+    service, home, specs, parent = editor
+    body = {"revision": service.get("A")["revision"], "enroll": True}
+    service.preview("A", body)
+    with pytest.raises(CapabilityError, match="stale_preview"):
+        service.put("A", {**body, "preview_token": chr(codepoint)})
 
 
 @pytest.mark.parametrize(
@@ -3356,3 +3420,103 @@ async def test_legacy_patch_checks_fresh_declared_identity_before_bookkeeping(
     assert changed_snapshot is not None
     assert await asyncio.to_thread(_capability_data_snapshot, home) == changed_snapshot
     assert refreshes == []
+
+
+@pytest.mark.parametrize("release", ["accepts", "refuses", "unknown"])
+def test_a_fork_writes_permissions_only_where_the_installed_cli_accepts_them(
+    editor, monkeypatch, release
+):
+    """The fork funnel is a generated-spec writer and shares the one version gate.
+
+    kiro-cli validates agent specs with serde ``deny_unknown_fields``, so a
+    release below ``SPEC_PERMISSIONS_MIN_VERSION`` -- or one whose version
+    cannot be established -- refuses the WHOLE file this path publishes and
+    drops every Crew MCP server with it, falling back to broader default
+    grants. The grant list itself is never withheld: it is the ceiling, not
+    the optional relay.
+    """
+    from kiro_crew.agent_sdk.drivers.acp import derived_agent_permissions
+
+    service, home, specs, parent = editor
+    parent["permissions"] = derived_agent_permissions(parent["allowedTools"], "parent")
+    (specs / "parent.json").write_text(json.dumps(parent), encoding="utf-8")
+    _pin_spec_permissions_cli(monkeypatch, release)
+
+    save(
+        service,
+        [{"section": "allowedTools", "id": "@search", "action": "set", "value": True}],
+        enroll=True,
+    )
+
+    spec = spec_for(home, specs)
+    assert spec["allowedTools"] == ["@search"], "the grant list is never withheld"
+    if release == "accepts":
+        assert spec["permissions"] == derived_agent_permissions(["@search"], spec["name"])
+    else:
+        assert "permissions" not in spec, f"a {release} CLI must get no block"
+
+
+@pytest.mark.parametrize("release", ["refuses", "unknown"])
+def test_a_hand_edited_block_still_blocks_a_fork_on_a_refusing_cli(editor, monkeypatch, release):
+    """Two questions, one call site -- and only the second one is the CLI's.
+
+    Whether the source block was hand-edited away from its derivation is a
+    governance question about the template, answered the same way whatever
+    binary happens to be installed. Withholding the OUTPUT field must not
+    quietly withdraw that review.
+    """
+    service, home, specs, parent = editor
+    save(
+        service,
+        [{"section": "prompt", "id": "prompt", "action": "set", "value": "mine"}],
+        enroll=True,
+    )
+    target = json.loads((home / "config.json").read_text())["agents"]["A"]["kiro_agent"]
+    parent["permissions"] = {"rules": [{"capability": "fsWrite", "effect": "allow"}]}
+    (specs / "parent.json").write_text(json.dumps(parent), encoding="utf-8")
+    _pin_spec_permissions_cli(monkeypatch, release)
+
+    with pytest.raises(CapabilityError, match="alternate_permissions_require_review"):
+        service.reset("A", target)
+    assert spec_for(home, specs)["prompt"] == "mine"
+
+
+def test_parent_is_owned_confirmation_gates_the_dashboard_author_stem(tmp_path, monkeypatch):
+    """F3 (fail-safe): a global owned-filename parent reads as owned -- except the
+    dashboard-author stem, which was a user-creatable template name before it became owned.
+    For that stem the owned classification holds ONLY when the on-disk spec POSITIVELY
+    confirms as this installer's own -- its bytes reproduce the installer-recorded ownership
+    digest. A pre-existing user template at the stem -- no recorded digest, or an
+    absent/unreadable file -- is NOT an owned parent, so a capability save does not refresh
+    its inherited guards away."""
+    from kiro_crew import agent_capabilities as cap
+    from kiro_crew import agent_state
+
+    parent = tmp_path / "kirocrew-dashboard-author.json"
+    snap = {"parent": {"scope": "global", "path": str(parent)}}
+
+    # Another owned name is owned.
+    other = {"parent": {"scope": "global", "path": str(tmp_path / "kirocrew.json")}}
+    assert cap._parent_is_owned(other) is True
+    # A non-global parent is never owned.
+    assert cap._parent_is_owned({"parent": {"scope": "project", "path": str(parent)}}) is False
+    # A global parent NOT in the owned set is not owned.
+    unowned = {"parent": {"scope": "global", "path": str(tmp_path / "my-template.json")}}
+    assert cap._parent_is_owned(unowned) is False
+
+    # Dashboard-author stem, ABSENT file -> not confirmed -> NOT owned (fail-safe).
+    assert cap._parent_is_owned(snap) is False
+    # A file at the stem with NO recorded ownership digest -> not confirmed -> NOT owned.
+    managed = {"name": "kirocrew-dashboard-author", "mcpServers": {"kirocrew-core": {}}}
+    parent.write_text(json.dumps(managed, indent=2) + "\n", encoding="utf-8")
+    assert cap._parent_is_owned(snap) is False
+    # Record the ownership digest of these exact bytes -> reproduces it -> owned.
+    agent_state.set_managed_digest("kirocrew-dashboard-author", agent_state.spec_digest(managed))
+    assert cap._parent_is_owned(snap) is True
+
+
+def cap_agent_state_for(cap):
+    """`_parent_is_owned` imports agent_state locally; patch the module object itself."""
+    from kiro_crew import agent_state
+
+    return agent_state

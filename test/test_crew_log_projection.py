@@ -9,7 +9,9 @@ batch implementation would be free to break.
 
 from __future__ import annotations
 
+import copy
 import json
+import math
 import os
 from dataclasses import replace
 from typing import Any
@@ -85,8 +87,8 @@ def _tool(
 # --- writing a fixture that has to be LONG --------------------------------- #
 #
 # A bound in this module is a bound on retained state, so reaching one costs as
-# many entries as the bound itself, and ``FOLD_CHUNK_ENTRIES`` is 1024 -- 2049
-# entries to cross it twice. One ``append`` per entry is one cross-process lock,
+# many entries as the bound itself, and the largest fixture here runs past 2048
+# entries. One ``append`` per entry is one cross-process lock,
 # one tail scan and one ``os.fsync`` EACH, which measures 76-90 ms per entry on
 # the Windows CI runner: that puts a 2049-entry fixture at 156-185 s against a
 # 180 s per-test cap. A breach there does not fail one test. Windows has no
@@ -147,6 +149,16 @@ def _turn_items(
             "cache_read": 5,
             "cache_write": 1,
         }
+        # The provider's occupancy reading. Present on the MEASURED closer only, which
+        # is what carries it in production -- and load-bearing for
+        # ``test_a_fold_never_reaches_into_the_state_it_was_handed``: ``usage`` stamps
+        # this reading onto the context rows its ``context/composed`` already
+        # appended, and those row dicts are SHARED with an earlier snapshot by
+        # ``_usage_copy``. Without a closer that carries occupancy, the copier's miss
+        # is invisible -- the fold produces the right value while editing a caller's
+        # state, and nothing raises. A composition must precede this entry in the same
+        # turn for the stamp to have a row to reach (see ``_busy_log``).
+        done["context"] = {"used": 4_200, "window": 200_000}
     return [
         {"type": "turn/started", "data": start},
         {"type": "step/started", "data": {"turn": turn, "step": 1}},
@@ -268,6 +280,90 @@ def test_incremental_matches_from_scratch_at_every_split(name):
         resumed = crew_log.advance(first, entries[cut:])
         assert crew_log.projection_of(resumed).value == whole, f"{name} disagrees at cut {cut}"
         assert resumed.last_seq == (entries[-1].seq if entries else 0)
+
+
+@pytest.mark.parametrize("name", crew_log.SESSION_FOLD_NAMES)
+def test_the_kernel_definition_folds_to_what_advance_folds(name):
+    """The wrapper the kernel drives and the ``advance`` surface reach one value.
+
+    ``advance`` deep-copies once and steps the whole span; the kernel drives one entry
+    at a time through a copy the fold declared. Two ways of arriving at the same fold,
+    so they are pinned against each other -- a copier or an ``affects`` set that was
+    wrong would show up here as a different number.
+    """
+    entries = _entries(_busy_log())
+    definition = crew_log._SessionFold(crew_log._FOLDS[name])
+    state = definition.init()
+    for entry in entries:
+        state = definition.apply(state, entry)
+
+    assert definition.view(state) == crew_log.fold(name, entries)
+    # The version the kernel is handed is THIS fold's, not the module maximum: a bump
+    # to one fold must retire that fold's savepoints and leave the others standing, and
+    # comparing against the maximum here would pass while the wrapper published the
+    # wrong number for every fold below it.
+    assert definition.state_version == crew_log.fold_state_version(name)
+
+
+@pytest.mark.parametrize("name", crew_log.SESSION_FOLD_NAMES)
+def test_a_fold_never_reaches_into_the_state_it_was_handed(name):
+    """MUTATION-SENSITIVE: ``apply`` copies before it steps, so its input is intact.
+
+    This is what keeps each fold's declared ``copy_state`` honest. A copier that misses
+    a nested container still produces the RIGHT value -- the step edits the object it
+    meant to edit -- but it edits the caller's state along with it, and a caller holding
+    an earlier bundle would then watch its value move underneath it. Nothing raises
+    either way, so this test is the only thing that catches the miss.
+
+    Checked at every position, because the container a copier misses often does not
+    exist until the fold has something in it: ``tools`` has no per-name row to share
+    until a tool has been called.
+    """
+    entries = _entries(_busy_log())
+    definition = crew_log._SessionFold(crew_log._FOLDS[name])
+    state = definition.init()
+    for entry in entries:
+        before = copy.deepcopy(state)
+        grown = definition.apply(state, entry)
+        assert state == before, f"{name} edited the state it was handed at seq {entry.seq}"
+        state = grown
+
+
+@pytest.mark.parametrize("name", crew_log.SESSION_FOLD_NAMES)
+def test_an_entry_a_fold_declares_untouched_really_moves_nothing(name):
+    """MUTATION-SENSITIVE: ``affects`` may be wider than the truth, never narrower.
+
+    Returning the state unchanged is how ``apply`` tells the kernel this entry moved
+    nothing, and the kernel believes it: a type wrongly left out of ``affects`` drops a
+    real change and serves a stale value for as long as the fold sits there. So for
+    every entry the wrapper skipped, the step is run on a copy to prove it would indeed
+    have changed nothing.
+
+    The opposite error is not a bug and is not asserted against: a type wrongly
+    INCLUDED costs a copy, and a spurious frame to a client watching the change feed.
+    """
+    entries = _entries(_busy_log())
+    fold_spec = crew_log._FOLDS[name]
+    definition = crew_log._SessionFold(fold_spec)
+    state = definition.init()
+    skipped = 0
+    for entry in entries:
+        grown = definition.apply(state, entry)
+        if grown is state:
+            skipped += 1
+            probe = fold_spec.copied(state)
+            fold_spec.step(probe, entry)
+            assert probe == state, (
+                f"{name} treats {entry.type} as untouched, but its step moves the "
+                f"state at seq {entry.seq}"
+            )
+        state = grown
+    # Only a NARROWED set can skip anything. ``status`` and ``class`` declare the whole
+    # vocabulary -- ``KNOWN_TYPES`` -- because every entry moves them, and that is a
+    # statement about them rather than a set left undeclared: a fold whose ``affects`` is
+    # the vocabulary skips nothing, and there is nothing for it to prove here.
+    if fold_spec.affects is not None and fold_spec.affects != crew_log.KNOWN_TYPES:
+        assert skipped > 0, f"{name} declares a narrowed type set but skipped nothing"
 
 
 @pytest.mark.parametrize("name", crew_log.PROJECTION_NAMES)
@@ -423,6 +519,69 @@ def test_usage_sums_every_token_dimension_and_its_total():
     }
 
 
+def test_usage_does_not_count_an_all_zero_tokens_block_as_reported():
+    """A block of four zeros is an absence written as a block.
+
+    Logs on disk carry it on every turn whose provider sent no counts, so the fold --
+    not only the writer -- has to know that a completed turn cannot have cost zero
+    tokens. The credits beside it were genuinely billed and stay counted, which is
+    the difference a reader sees: a real bill beside ``tokens_reported: 0``, and the
+    panel dashes the tokens instead of printing a measured ``0``.
+    """
+    handle = _log()
+    _opened(handle)
+    for turn in range(1, 5):
+        _turn(
+            handle,
+            turn,
+            credits=0.3725,
+            tokens={"input": 0, "output": 0, "cache_read": 0, "cache_write": 0},
+        )
+    value = crew_log.fold_usage(_entries(handle))
+    assert value["turns"]["completed"] == 4
+    assert value["turns"]["credits_reported"] == 4
+    assert value["credits"] == 1.49
+    assert value["turns"]["tokens_reported"] == 0
+    assert value["tokens"]["total"] == 0
+
+
+def test_usage_counts_a_block_reported_once_any_dimension_is_above_zero():
+    """One measured dimension is a report; the rule is not "input above zero"."""
+    handle = _log()
+    _opened(handle)
+    _turn(handle, 1, tokens={"input": 0, "output": 0, "cache_read": 7, "cache_write": 0})
+    _turn(handle, 2, tokens={"input": 0, "output": 0, "cache_read": 0, "cache_write": 0})
+    _turn(handle, 3, tokens={"input": 5, "output": 1, "cache_read": 0, "cache_write": 0})
+    value = crew_log.fold_usage(_entries(handle))
+    assert value["turns"]["completed"] == 3
+    assert value["turns"]["tokens_reported"] == 2
+    assert value["tokens"]["total"] == 13
+    assert value["by_model"]["opus"] == {
+        "turns": 3,
+        "credits": 1.5,
+        "credits_reported": 3,
+        "tokens": 13,
+    }
+
+
+def test_usage_still_counts_a_recorded_zero_credit_charge_as_reported():
+    """Pins what the token rule deliberately leaves alone.
+
+    ``credits: 0.0`` on a closer is counted as a report, and the fold keeps doing so:
+    the writer omits an unbilled charge, but a zero already on disk cannot be told
+    from a turn a provider genuinely billed at nothing, and ``_bill_credits`` lets a
+    zero through on purpose. Tokens are different -- a completed turn cannot cost
+    zero of them -- which is why only ``tokens_reported`` carries the rule.
+    """
+    handle = _log()
+    _opened(handle)
+    _turn(handle, 1, credits=0.0)
+    value = crew_log.fold_usage(_entries(handle))
+    assert value["turns"]["credits_reported"] == 1
+    assert value["credits_by_source"]["turn"]["reported"] == 1
+    assert value["credits"] == 0.0
+
+
 def test_usage_bills_injected_context_per_source():
     handle = _log()
     _opened(handle)
@@ -456,6 +615,563 @@ def test_usage_bills_injected_context_per_source():
     assert context["estimated_turns"] == 1
     assert context["by_source"]["memory"] == {"blocks": 2, "tokens": 25, "chars": 100}
     assert context["by_source"]["system"] == {"blocks": 1, "tokens": 25, "chars": 100}
+    assert context["sources_omitted"] == 0
+
+
+def test_usage_counts_the_sources_a_row_leaves_out():
+    """A row past the per-turn source cap says so, and keeps adding to labels it holds.
+
+    Two NEW labels past the cap are left out and counted. A label the row already
+    holds, arriving again at the cap, still adds to that label rather than being
+    dropped, so a kept figure is never cut short.
+    """
+    limit = crew_log.CONTEXT_SOURCES_PER_TURN_LIMIT
+    sources = [{"kind": f"src{i}", "chars": 1, "tokens": 0} for i in range(limit + 2)]
+    sources.append({"kind": "src0", "chars": 5, "tokens": 0})
+    handle = _log()
+    _opened(handle)
+    handle.append(
+        "context/composed",
+        {"turn": 1, "sources": sources, "chars": limit + 7, "tokens": 0, "tokens_estimated": True},
+        src=GATEWAY,
+    )
+    context = crew_log.fold_usage(_entries(handle))["context"]
+    (row,) = context["turns"]
+    assert len(row["sources"]) == limit
+    assert row["sources"]["src0"] == 6
+    assert context["sources_omitted"] == 2
+
+
+def test_usage_a_retry_attempts_reading_does_not_stamp_the_first_attempts_rows():
+    """MUTATION-SENSITIVE: a rerun of one turn ordinal is a separate attempt.
+
+    A regenerate or rewind reruns a turn the ordinal already names, so one ordinal can
+    carry two attempts, each with its own compositions and its own closer. Matching a
+    reading to rows by TURN NUMBER alone conflates them: attempt 2's closer walking the
+    tail back would reach attempt 1's rows -- same ordinal -- and stamp them with
+    attempt 2's occupancy. It bites hardest when attempt 1 reported NO occupancy, so
+    its rows are unstamped and nothing else marks them closed. Each closer sealing its
+    own run is what keeps the two apart, whether or not attempt 1 measured anything.
+    """
+
+    def _completed(reading: dict[str, int] | None) -> dict[str, Any]:
+        done: dict[str, Any] = {
+            "turn": 1,
+            "stop_reason": "end_turn",
+            "depth": 0,
+            "duration_ms": 100,
+            "model": "opus",
+            "provider": "kiro",
+            "credits": 0.1,
+            "tokens": {"input": 1, "output": 1, "cache_read": 0, "cache_write": 0},
+        }
+        if reading is not None:
+            done["context"] = reading
+        return done
+
+    def _composed(kind: str, chars: int) -> dict[str, Any]:
+        return {
+            "turn": 1,
+            "sources": [{"kind": kind, "chars": chars, "tokens": chars // 4}],
+            "chars": chars,
+            "tokens": chars // 4,
+            "tokens_estimated": True,
+        }
+
+    handle = _log()
+    _opened(handle)
+    # Attempt 1 at ordinal 1 composes, then completes WITHOUT an occupancy reading.
+    handle.append("context/composed", _composed("memory", 40), src=GATEWAY)
+    handle.append("turn/completed", _completed(None), src=GATEWAY)
+    # Attempt 2 reruns ordinal 1, composes fresh rows, and completes WITH a reading.
+    handle.append("context/composed", _composed("system", 90), src=GATEWAY)
+    handle.append(
+        "turn/started", {"turn": 1, "actor": "user", "depth": 0, "attempt": 2}, src=GATEWAY
+    )
+    handle.append("turn/completed", _completed({"used": 8_000, "window": 200_000}), src=GATEWAY)
+    turns = crew_log.fold_usage(_entries(handle))["context"]["turns"]
+    # Attempt 1's row keeps NO reading; only attempt 2's row carries the 8_000. The
+    # reading did not walk back across the attempt boundary onto the earlier run.
+    assert [("used" in row) for row in turns] == [False, True]
+    assert [row.get("used") for row in turns] == [None, 8_000]
+
+
+def test_usage_each_attempt_of_one_turn_keeps_its_own_reading():
+    """MUTATION-SENSITIVE: two attempts that BOTH measured keep their own readings.
+
+    When each attempt reports occupancy the seal still matters: attempt 2's closer
+    must not overwrite attempt 1's already-stamped reading, and attempt 1's must not be
+    left for attempt 2 to claim.
+    """
+    handle = _log()
+    _opened(handle)
+    handle.append(
+        "context/composed",
+        {
+            "turn": 1,
+            "sources": [{"kind": "memory", "chars": 40, "tokens": 10}],
+            "chars": 40,
+            "tokens": 10,
+            "tokens_estimated": True,
+        },
+        src=GATEWAY,
+    )
+    _turn(handle, 1)  # the helper's closer carries a used=4_200 reading
+    handle.append(
+        "context/composed",
+        {
+            "turn": 1,
+            "sources": [{"kind": "system", "chars": 90, "tokens": 22}],
+            "chars": 90,
+            "tokens": 22,
+            "tokens_estimated": True,
+        },
+        src=GATEWAY,
+    )
+    handle.append(
+        "turn/started", {"turn": 1, "actor": "user", "depth": 0, "attempt": 2}, src=GATEWAY
+    )
+    handle.append(
+        "turn/completed",
+        {
+            "turn": 1,
+            "stop_reason": "end_turn",
+            "depth": 0,
+            "duration_ms": 100,
+            "model": "opus",
+            "provider": "kiro",
+            "credits": 0.1,
+            "tokens": {"input": 1, "output": 1, "cache_read": 0, "cache_write": 0},
+            "context": {"used": 8_000, "window": 200_000},
+        },
+        src=GATEWAY,
+    )
+    turns = crew_log.fold_usage(_entries(handle))["context"]["turns"]
+    assert [row.get("used") for row in turns] == [4_200, 8_000]
+
+
+def test_usage_snapshot_row_is_not_stamped_by_a_later_completion():
+    """MUTATION-SENSITIVE: a copied snapshot's rows are independent of the base's.
+
+    The ``turn/completed`` closer stamps the provider's occupancy reading onto the
+    rows of the turn it closes, AFTER those rows were appended. ``copy_state`` ships a
+    snapshot of the fold to socket owners, so if that snapshot shared the row objects
+    a later completion would stamp a reading into a snapshot a reader is still holding
+    -- an occupancy from a turn the snapshot was taken BEFORE. The copy must be deep
+    enough at the row level that the base can be stamped without touching it.
+    """
+    from kiro_crew.crew_log.schema import Entry
+
+    state = crew_log._usage_start()
+    crew_log._usage_step(
+        state,
+        Entry(
+            seq=1,
+            time=1000,
+            type="request/configured",
+            src=GATEWAY,
+            data={"turn": 1, "context_window": 200_000},
+        ),
+    )
+    crew_log._usage_step(
+        state,
+        Entry(
+            seq=2,
+            time=1001,
+            type="context/composed",
+            src=GATEWAY,
+            data={"turn": 1, "sources": [{"kind": "memory", "chars": 40}], "chars": 40},
+        ),
+    )
+    snapshot = crew_log._usage_copy(state)
+    assert "used" not in snapshot["context_turns"][0]
+    # The turn now closes with a reading. It must land on the base state's row only.
+    crew_log._usage_step(
+        state,
+        Entry(
+            seq=3,
+            time=1002,
+            type="turn/completed",
+            src=GATEWAY,
+            data={"turn": 1, "context": {"used": 9_000, "window": 200_000}},
+        ),
+    )
+    assert state["context_turns"][0]["used"] == 9_000
+    assert "used" not in snapshot["context_turns"][0]
+
+
+def test_usage_the_ordinal_memo_stays_bounded_over_a_long_session():
+    """MUTATION-SENSITIVE: the (unit, turn) memo must not grow without bound.
+
+    The memo lets a rewound turn reuse its ordinal, but it is checkpointed state, so it
+    is capped at ``CONTEXT_ORDINAL_MEMO_LIMIT`` keys and evicts oldest-first. Driving
+    more distinct turns than the cap must leave it at the cap, never larger -- while the
+    counter keeps advancing so each new turn still gets its true session-global ordinal
+    (the cap bounds the memory, not the numbering).
+    """
+    state = crew_log._usage_start()
+    limit = crew_log.CONTEXT_ORDINAL_MEMO_LIMIT
+    overflow = limit + 50
+    for turn in range(1, overflow + 1):
+        ordinal = crew_log._count_turn_ordinal(state, "acp-1", turn)
+        # Each distinct turn advances the counter, so its ordinal is its true position.
+        assert ordinal == turn
+    keys = state["context_turn_keys"]
+    # The memo never exceeds its cap, no matter how many turns passed through it.
+    assert keys.count(",") - 1 == limit
+    # The retained keys are the MOST RECENT ones; the oldest turns were evicted.
+    assert f",acp-1:{overflow}," in keys
+    assert f",acp-1:{overflow - limit + 1}," in keys
+    assert f",acp-1:{overflow - limit}," not in keys
+    # Retained turns at both ends still read back their own ordinal after eviction,
+    # and reading one back does not advance the counter.
+    assert crew_log._count_turn_ordinal(state, "acp-1", overflow) == overflow
+    assert crew_log._count_turn_ordinal(state, "acp-1", overflow - limit + 1) == (
+        overflow - limit + 1
+    )
+    assert state["context_turns_seq"] == overflow
+
+
+def test_usage_a_rewind_past_400_turns_keeps_the_turns_ordinal():
+    """MUTATION-SENSITIVE: a rewind deep into a long session reuses the turn's ordinal.
+
+    ``chat_rewind`` can re-run any user message in the slot's live list, which holds far
+    more than the fold's 200 rows. The memo once kept 400 keys, so rewinding to a turn
+    older than that counted it again: its label and every later ordinal moved up by one,
+    for good. A rewind to turn 10 after 1,000 turns must read ordinal 10 and advance
+    nothing.
+    """
+    state = crew_log._usage_start()
+    for turn in range(1, 1_001):
+        crew_log._count_turn_ordinal(state, 7, turn)
+    assert crew_log._count_turn_ordinal(state, 7, 10) == 10
+    assert state["context_turns_seq"] == 1_000
+    # The next NEW turn still takes the next ordinal.
+    assert crew_log._count_turn_ordinal(state, 7, 1_001) == 1_001
+    # The same turn number in another unit is a different turn.
+    assert crew_log._count_turn_ordinal(state, 8, 10) == 1_002
+
+
+def test_usage_a_regenerate_after_a_reattach_keeps_the_turns_ordinal():
+    """MUTATION-SENSITIVE: a re-attachment is the same unit, so its key space continues.
+
+    A gateway restart re-attaches to the same crew log and writes another
+    ``session/opened`` with ``resumed`` true. The conversation and its turn numbers are
+    the same unit's, so a regenerate of turn 1 after it is still turn 1: it must read
+    back ordinal 1 and count no extra turn. Keyed by the per-attachment counter, the
+    regenerate missed its key and took ordinal 2.
+    """
+
+    def _composed(turn: int) -> dict[str, Any]:
+        return {
+            "turn": turn,
+            "sources": [{"kind": "memory", "chars": 40, "tokens": 10}],
+            "chars": 40,
+            "tokens": 10,
+            "tokens_estimated": True,
+        }
+
+    def _completed(turn: int) -> dict[str, Any]:
+        return {
+            "turn": turn,
+            "stop_reason": "end_turn",
+            "depth": 0,
+            "duration_ms": 100,
+            "model": "opus",
+            "provider": "kiro",
+            "credits": 0.1,
+            "tokens": {"input": 1, "output": 1, "cache_read": 0, "cache_write": 0},
+        }
+
+    handle = _log()
+    _opened(handle)
+    handle.append("context/composed", _composed(1), src=GATEWAY)
+    handle.append("turn/completed", _completed(1), src=GATEWAY)
+    # The gateway process died and a new one re-attached to the same crew log.
+    _opened(handle, resumed=True)
+    handle.append(
+        "turn/started", {"turn": 1, "actor": "user", "depth": 0, "attempt": 2}, src=GATEWAY
+    )
+    handle.append("context/composed", _composed(1), src=GATEWAY)
+    handle.append("turn/completed", _completed(1), src=GATEWAY)
+    handle.append("context/composed", _composed(2), src=GATEWAY)
+
+    state = crew_log._usage_start()
+    for entry in _entries(handle):
+        crew_log._usage_step(state, entry)
+    assert [row["ordinal"] for row in state["context_turns"]] == [1, 1, 2]
+    assert state["context_turns_seq"] == 2
+
+
+def test_usage_the_ordinal_memo_covers_the_rewindable_range():
+    """The memo bound is the slot's live message cap, the range a rewind can reach.
+
+    ``crew_log`` cannot import the dashboard, so the figure is restated there and pinned
+    here: if the live cap grows, a rewind could again reach a turn the memo evicted.
+    """
+    from kiro_crew.dashboard import state as dashboard_state
+
+    assert crew_log.CONTEXT_ORDINAL_MEMO_LIMIT == dashboard_state._MAX_SLOT_MESSAGES
+
+
+def test_usage_an_interrupted_units_open_row_is_not_stamped_by_the_next_unit():
+    """MUTATION-SENSITIVE: the seal alone cannot close the unit boundary.
+
+    A slot's window merges every UNIT it ran under and turn ordinals restart in each
+    one, so a matching ordinal is not proof a row belongs to the turn now closing. The
+    ``_closed`` seal tells two FINISHED runs of one ordinal apart, because each closer
+    marks its own tail run. It cannot see a unit cut off mid-turn: that unit composed a
+    row and then died, so no closer ever sealed it, and the next unit's turn 1 walks
+    straight onto it and stamps an unmeasured turn with its own reading.
+    """
+    handle_a = _log("unit-a")
+    _opened(handle_a)
+    handle_a.append(
+        "context/composed",
+        {
+            "turn": 1,
+            "sources": [{"kind": "memory", "chars": 400, "tokens": 100}],
+            "chars": 400,
+            "tokens": 100,
+            "tokens_estimated": True,
+        },
+        src=GATEWAY,
+    )
+    # No closer: the gateway died mid-turn, so nothing seals that row.
+    handle_b = _log("unit-b")
+    _opened(handle_b)
+    handle_b.append(
+        "context/composed",
+        {
+            "turn": 1,
+            "sources": [{"kind": "memory", "chars": 800, "tokens": 200}],
+            "chars": 800,
+            "tokens": 200,
+            "tokens_estimated": True,
+        },
+        src=GATEWAY,
+    )
+    handle_b.append(
+        "turn/completed",
+        {
+            "turn": 1,
+            "stop_reason": "end_turn",
+            "depth": 0,
+            "duration_ms": 100,
+            "model": "opus",
+            "provider": "kiro",
+            "credits": 0.1,
+            "tokens": {"input": 1, "output": 1, "cache_read": 0, "cache_write": 0},
+            "context": {"used": 90_000, "window": 200_000},
+        },
+        src=GATEWAY,
+    )
+    turns = crew_log.fold_slot("usage", ["unit-a", "unit-b"], slot="dashboard:1").value["context"][
+        "turns"
+    ]
+    assert [row.get("used") for row in turns] == [None, 90_000]
+    # The counter is the fold's own bookkeeping and never reaches a reader.
+    assert all("unit" not in row for row in turns)
+
+
+def test_usage_bills_every_source_that_spends_and_says_which_spent_what():
+    """A session's bill is its turns PLUS its children PLUS its helpers.
+
+    A total that billed turns alone would read a session that spent most of its
+    budget on subagents as cheap, and would fold none of the credits
+    ``background/completed`` carries. The split beside the total is what keeps the
+    total readable: one number cannot say whether the spend was the user's turns or
+    a wave of children.
+    """
+    handle = _log()
+    _opened(handle)
+    _turn(handle, 1, credits=2.0)
+    handle.append("subagent/spawned", {"turn": 1, "agent_id": "sub-1"}, src=GATEWAY)
+    handle.append("subagent/completed", {"agent_id": "sub-1", "ms": 7, "credits": 1.0}, src=GATEWAY)
+    handle.append(
+        "background/completed", {"kind": "title", "model": "haiku", "credits": 0.5}, src=GATEWAY
+    )
+
+    value = crew_log.fold_usage(_entries(handle))
+
+    assert value["credits"] == 3.5
+    assert value["credits_by_source"] == {
+        "turn": {"credits": 2.0, "reported": 1},
+        "subagent": {"credits": 1.0, "reported": 1},
+        "background": {"credits": 0.5, "reported": 1},
+    }
+    # The turn-scoped count still answers for turns alone: it is what tells a reader
+    # how many of the session's turns the turn bucket covers.
+    assert value["turns"]["credits_reported"] == 1
+
+
+def test_usage_bills_a_child_that_failed_against_the_subagent_bucket():
+    """A run the user stopped still billed for the turns it attempted."""
+    handle = _log()
+    _opened(handle)
+    handle.append("subagent/spawned", {"turn": 1, "agent_id": "sub-1"}, src=GATEWAY)
+    handle.append(
+        "subagent/failed",
+        {"agent_id": "sub-1", "outcome": "stopped", "ms": 3, "credits": 0.75},
+        src=GATEWAY,
+    )
+
+    value = crew_log.fold_usage(_entries(handle))
+
+    assert value["credits"] == 0.75
+    assert value["credits_by_source"]["subagent"] == {"credits": 0.75, "reported": 1}
+
+
+#: Every charge shape the fold refuses, and why each one is not a measurement of
+#: spend. They are one list because they are one rule: a charge is billed only when
+#: it is a real number this fold can add to a running total and defend afterwards.
+#: ``nan`` and the infinities cannot be added -- every later sum is non-finite too,
+#: ``round`` keeps it so, and the savepoint persists it, so the total is poisoned for
+#: the life of the unit. A negative can be added, and that is the problem: it REDUCES
+#: a total, so a session reads as having spent less than it did, and no later entry
+#: corrects it. ``json`` round-trips all five without complaint.
+_UNUSABLE_CHARGES = [float("nan"), float("inf"), float("-inf"), -0.5, -1.0e9]
+
+
+@pytest.mark.parametrize("source", ["subagent/completed", "subagent/failed"])
+@pytest.mark.parametrize("bad", _UNUSABLE_CHARGES)
+def test_usage_refuses_an_unusable_credit_charge_from_a_child(bad, source):
+    handle = _log()
+    _opened(handle)
+    _turn(handle, 1, credits=2.0)
+    handle.append("subagent/spawned", {"turn": 1, "agent_id": "sub-1"}, src=GATEWAY)
+    handle.append(source, {"agent_id": "sub-1", "credits": bad}, src=GATEWAY)
+
+    value = crew_log.fold_usage(_entries(handle))
+
+    assert value["credits"] == 2.0
+    assert value["credits_by_source"]["subagent"] == {"credits": 0.0, "reported": 0}
+
+
+@pytest.mark.parametrize("bad", _UNUSABLE_CHARGES)
+def test_usage_refuses_an_unusable_credit_charge_from_a_background_helper(bad):
+    handle = _log()
+    _opened(handle)
+    _turn(handle, 1, credits=2.0)
+    handle.append("background/completed", {"kind": "title", "credits": bad}, src=GATEWAY)
+
+    value = crew_log.fold_usage(_entries(handle))
+
+    assert value["credits"] == 2.0
+    assert value["credits_by_source"]["background"] == {"credits": 0.0, "reported": 0}
+
+
+@pytest.mark.parametrize("bad", _UNUSABLE_CHARGES)
+def test_usage_refuses_an_unusable_credit_charge_from_a_turn(bad):
+    """One rule for all three spenders, including the one that predates the buckets.
+
+    The turn path is where a charge has always been read, so leaving it out would
+    make the rule depend on which spender wrote the line -- and the poisoned total it
+    produces is the same total.
+    """
+    handle = _log()
+    _opened(handle)
+    _turn(handle, 1, credits=2.0)
+    _turn(handle, 2, credits=bad)
+
+    value = crew_log.fold_usage(_entries(handle))
+
+    assert value["credits"] == 2.0
+    assert value["credits_by_source"]["turn"] == {"credits": 2.0, "reported": 1}
+    assert value["turns"]["credits_reported"] == 1
+    assert value["by_model"]["opus"]["credits"] == 2.0
+
+
+def test_usage_survives_a_charge_too_large_to_be_a_float():
+    """A JSON integer is unbounded, so a charge can be unrepresentable, not just wrong.
+
+    ``float()`` raises ``OverflowError`` on a 400-digit int, and nothing between
+    ``_usage_step`` and ``fold_session`` catches it, so the whole fold would fail on
+    one bad entry rather than skipping it. The fold's contract is that a line it
+    cannot interpret costs that line, never the projection.
+    """
+    handle = _log()
+    _opened(handle)
+    _turn(handle, 1, credits=2.0)
+    handle.append("subagent/spawned", {"turn": 1, "agent_id": "sub-1"}, src=GATEWAY)
+    handle.append("subagent/completed", {"agent_id": "sub-1", "credits": 10**400}, src=GATEWAY)
+
+    value = crew_log.fold_usage(_entries(handle))
+
+    assert value["credits"] == 2.0
+    assert value["credits_by_source"]["subagent"] == {"credits": 0.0, "reported": 0}
+
+
+def test_usage_refuses_a_charge_that_would_overflow_the_running_total():
+    """Two charges that are each finite can still sum to infinity.
+
+    This is the case an input check cannot see: both values pass every test that
+    looks at them alone. Only the RESULT of the addition is wrong, and once it is
+    stored the savepoint keeps it, so the invariant has to be checked after the add
+    rather than before it.
+    """
+    handle = _log()
+    _opened(handle)
+    _turn(handle, 1, credits=1.0e308)
+    handle.append("subagent/spawned", {"turn": 1, "agent_id": "sub-1"}, src=GATEWAY)
+    handle.append("subagent/completed", {"agent_id": "sub-1", "credits": 1.0e308}, src=GATEWAY)
+
+    value = crew_log.fold_usage(_entries(handle))
+
+    assert math.isfinite(value["credits"])
+    assert value["credits"] == 1.0e308
+    assert value["credits_by_source"]["turn"] == {"credits": 1.0e308, "reported": 1}
+    assert value["credits_by_source"]["subagent"] == {"credits": 0.0, "reported": 0}
+    assert math.isfinite(value["by_model"]["opus"]["credits"])
+
+
+def test_usage_counts_a_charge_of_exactly_zero_as_measured():
+    """Zero is the one falsy charge that IS a measurement, so it stays counted.
+
+    A provider that reports ``0.0`` explicitly measured zero, which is a different
+    fact from a closer that reported nothing -- and ``reported`` is the field that
+    tells those two apart. The refusals above are values that cannot be summed or
+    that move a total the wrong way; zero is neither.
+    """
+    handle = _log()
+    _opened(handle)
+    _turn(handle, 1, credits=0.0)
+
+    value = crew_log.fold_usage(_entries(handle))
+
+    assert value["credits"] == 0.0
+    assert value["credits_by_source"]["turn"] == {"credits": 0.0, "reported": 1}
+
+
+def test_usage_does_not_read_an_unmetered_child_as_a_free_one():
+    """A closer with no ``credits`` key measured nothing, which is not zero."""
+    handle = _log()
+    _opened(handle)
+    handle.append("subagent/spawned", {"turn": 1, "agent_id": "sub-1"}, src=GATEWAY)
+    handle.append("subagent/completed", {"agent_id": "sub-1", "ms": 7}, src=GATEWAY)
+
+    value = crew_log.fold_usage(_entries(handle))
+
+    assert value["credits"] == 0.0
+    assert value["credits_by_source"]["subagent"] == {"credits": 0.0, "reported": 0}
+
+
+def test_timeline_keeps_a_child_run_duration():
+    """``ms`` is what subagent and step entries call their measured duration.
+
+    ``duration_ms`` is the turn entry's spelling, so a copied-key list carrying only
+    that one keeps a child's run time out of the timeline entirely.
+    """
+    handle = _log()
+    _opened(handle)
+    handle.append("subagent/spawned", {"turn": 1, "agent_id": "sub-1"}, src=GATEWAY)
+    handle.append("subagent/completed", {"agent_id": "sub-1", "ms": 7, "credits": 1.0}, src=GATEWAY)
+
+    moments = crew_log.fold_timeline(_entries(handle))["moments"]
+    closer = [m for m in moments if m["type"] == "subagent/completed"]
+    assert len(closer) == 1
+    assert closer[0]["ms"] == 7
+    assert closer[0]["credits"] == 1.0
 
 
 def test_usage_splits_cost_by_model():
@@ -533,6 +1249,56 @@ def test_timeline_moments_are_oldest_first_and_carry_their_seq():
         "turn/started",
         "turn/completed",
     ]
+
+
+def test_timeline_folds_one_session_unaffected_by_the_single_unit_guard():
+    """The reachable path -- one session's log -- renders every moment as before.
+
+    One session holds exactly one succession unit, so a seq that only ever climbs is
+    the normal case the guard leaves untouched.
+    """
+    handle = _log()
+    _opened(handle)
+    _turn(handle, 1)
+    _turn(handle, 2)
+    value = crew_log.fold_timeline(_entries(handle))
+    assert [moment["type"] for moment in value["moments"]] == [
+        "session/opened",
+        "turn/started",
+        "turn/completed",
+        "turn/started",
+        "turn/completed",
+    ]
+    seqs = [moment["seq"] for moment in value["moments"]]
+    assert seqs == sorted(seqs)
+    assert value["first_seq"] == seqs[0]
+    assert value["last_seq"] == seqs[-1]
+
+
+def test_timeline_refuses_rows_from_a_second_succession_unit():
+    """A slot-wide fold of two units crosses a seq restart, and the guard names it.
+
+    ``fold_slot_checkpoint`` folds the units a slot ran under back to back, re-basing
+    the seq per unit so the second starts at 1 again. Nothing reads ``timeline`` over a
+    slot today; this pins that the day one does, it fails loudly at the unit boundary
+    rather than concatenating two units into one timestamp-scrambled timeline.
+    """
+    first = _log("u-first", slot="chat-tl")
+    _opened(first)
+    _turn(first, 1)
+    second = _log("u-second", slot="chat-tl")
+    _opened(second)
+    _turn(second, 1)
+
+    # One unit folds cleanly, the hazard is only the join of a second.
+    one = crew_log.fold_slot_checkpoint("timeline", ["u-first"], slot="chat-tl")
+    one_seqs = [moment["seq"] for moment in one.state["moments"]]
+    assert one_seqs == sorted(one_seqs) and len(one_seqs) == 3
+
+    with pytest.raises(crew_log.CrewLogError) as excinfo:
+        crew_log.fold_slot_checkpoint("timeline", ["u-first", "u-second"], slot="chat-tl")
+    assert excinfo.value.field == "seq"
+    assert "one succession unit" in str(excinfo.value)
 
 
 # --- tools ----------------------------------------------------------------
@@ -1360,39 +2126,61 @@ def test_a_log_recreated_under_a_held_handle_is_folded_again_rather_than_spliced
 # --------------------------------------------------------------------------- #
 
 
-def test_a_cold_fold_crossing_the_chunk_boundary_matches_the_whole_file(monkeypatch):
-    """Folding a span in chunks is the same value as folding it whole.
+def test_a_cold_fold_streams_the_log_rather_than_holding_it(monkeypatch):
+    """A long cold fold holds ONE entry at a time, and the value is unaffected.
 
-    ``fold_session`` reads the log one bounded chunk at a time so a cold fold of a
-    long log does not hold the whole thing in memory. That is only safe if the
-    chunk boundary is invisible in the result, so this drives a log well past
-    ``FOLD_CHUNK_ENTRIES``, compares against the from-scratch fold, AND counts the
-    passes -- otherwise the test would still pass if the chunking were removed.
+    ``fold_session`` hands the projection kernel the log as a stream and the kernel
+    folds each entry through every unit as it arrives, so what a cold fold of a long
+    log holds is one entry rather than the file. That is only safe if consuming it
+    piecemeal is invisible in the result, so this drives a log past two thousand
+    entries, compares against the from-scratch fold, AND checks the interleaving --
+    otherwise the test would still pass if the whole log were materialized first.
+
+    The interleaving is the part worth pinning: at the moment of the Nth fold step,
+    exactly N entries have come out of the reader. A pass that read the file into a
+    list would have every entry out before the first step.
     """
     handle = _log()
     _opened(handle)
-    # Two entries per tool, so this clears the chunk boundary several times over.
+    # Two entries per tool, so this clears two thousand entries several hundred over.
     items: list[dict[str, Any]] = []
-    for index in range(crew_log.FOLD_CHUNK_ENTRIES):
+    for index in range(1024):
         items.extend(_tool_items(1, f"c{index}", "fs_read"))
     _append_grouped(handle, items)
-    assert handle.last_seq > crew_log.FOLD_CHUNK_ENTRIES
+    assert handle.last_seq > 2048
 
-    passes = []
-    real_advance_all = crew_log._advance_all
-
-    def counting(checkpoints, chunk):
-        passes.append(len(chunk))
-        return real_advance_all(checkpoints, chunk)
-
-    monkeypatch.setattr(crew_log, "_advance_all", counting)
-    chunked = crew_log.fold_session(SESSION, ("tools",)).projection("tools").value
+    # Folded before the instruments go in, so its own read is not counted.
     whole = crew_log.fold_tools(_entries(handle))
-    assert chunked == whole
-    assert chunked["calls"] == crew_log.FOLD_CHUNK_ENTRIES
-    # More than one pass, and no pass bigger than the chunk bound.
-    assert len(passes) > 1
-    assert max(passes) <= crew_log.FOLD_CHUNK_ENTRIES
+
+    yielded = [0]
+    real_iter_from = CrewLog.iter_from
+
+    def counted_iter_from(self, from_seq, **kwargs):
+        for entry in real_iter_from(self, from_seq, **kwargs):
+            yielded[0] += 1
+            yield entry
+
+    interleaving: list[tuple[int, int]] = []
+    real_apply = crew_log._SessionFold.apply
+
+    def counted_apply(self, state, entry):
+        interleaving.append((yielded[0], len(interleaving) + 1))
+        return real_apply(self, state, entry)
+
+    monkeypatch.setattr(CrewLog, "iter_from", counted_iter_from)
+    monkeypatch.setattr(crew_log._SessionFold, "apply", counted_apply)
+
+    streamed = crew_log.fold_session(SESSION, ("tools",)).projection("tools").value
+
+    assert streamed == whole
+    assert streamed["calls"] == 1024
+    assert len(interleaving) > 2048, "the whole log was folded"
+    assert [out for out, _ in interleaving] == [
+        step for _, step in interleaving
+    ], "the reader ran ahead of the fold, so entries were held rather than streamed"
+    assert [out for out, _ in interleaving] == [
+        step for _, step in interleaving
+    ], "the reader ran ahead of the fold, so entries were held rather than streamed"
 
 
 def test_a_grouped_fixture_is_the_log_one_append_at_a_time_writes(monkeypatch):
@@ -2118,3 +2906,106 @@ def test_a_resume_cannot_widen_a_class_the_log_already_moved_away_from():
     value = crew_log.fold("class", _entries(handle))
     assert value["channel"] is True
     assert value["complete"] is True
+
+
+def test_usage_units_order_by_succession_not_wall_clock(monkeypatch):
+    """MUTATION-SENSITIVE: a clock rollback must not invert two units of one slot.
+
+    Unit ``b`` REPLACED unit ``a`` (its ``session/opened`` names ``a`` as its
+    predecessor), so ``b`` is the newer unit and its rows must fold LAST -- the fold
+    applies a later unit over an earlier one. But the clock stepped backward before
+    ``b`` was created, so ``b``'s header ``createdAt`` (100) is SMALLER than ``a``'s
+    (200). A wall-clock sort would put ``b`` first, land its rows at the front of the
+    per-turn window, and the front-trim would evict the newest unit's rows. Ordering
+    by the durable ``previous_sid`` succession chain keeps ``b`` last regardless.
+    """
+    created = {"a": 200, "b": 100}
+    previous = {"a": None, "b": "a"}
+    monkeypatch.setattr(crew_log, "session_units_for_slot", lambda slot: ("a", "b"))
+    monkeypatch.setattr(crew_log, "unit_header_created_at", lambda kind, uid: created.get(uid))
+    monkeypatch.setattr(crew_log, "unit_opened_previous", lambda kind, uid: previous.get(uid))
+    assert crew_log.units_in_succession("chat-1") == ("a", "b")
+
+
+def test_usage_units_keep_disconnected_chains_contiguous(monkeypatch):
+    """Two UNRELATED chains fold each as a contiguous run, ordered by root createdAt.
+
+    A slot can hold two chains the ``previous_sid`` links never relate -- a session
+    recreated after its predecessor's log was pruned, two logs whose link was never
+    written. Chain B is b0->b1->b2 (three deep); chain A is a0->a1 (two deep) and its
+    root was created FIRST. Ordering by depth alone would interleave them
+    (a0,b0,a1,b1,b2) and split each chain's predecessor edges apart. The order must be
+    chain-contiguous -- A's whole run then B's whole run -- with the runs ordered by
+    their roots' ``createdAt``, so every ``previous_sid`` edge stays adjacent.
+    """
+    # a-root created before b-root; within each chain the header clock is irrelevant.
+    created = {"a0": 100, "a1": 500, "b0": 200, "b1": 50, "b2": 300}
+    previous = {"a0": None, "a1": "a0", "b0": None, "b1": "b0", "b2": "b1"}
+    # Store listing order deliberately interleaves the two chains, to prove the resolver
+    # regroups them rather than trusting the listing.
+    monkeypatch.setattr(
+        crew_log, "session_units_for_slot", lambda slot: ("a0", "b0", "a1", "b1", "b2")
+    )
+    monkeypatch.setattr(crew_log, "unit_header_created_at", lambda kind, uid: created.get(uid))
+    monkeypatch.setattr(crew_log, "unit_opened_previous", lambda kind, uid: previous.get(uid))
+    # A's run (root createdAt 100) precedes B's run (root createdAt 200); each run is
+    # predecessor-first and unbroken.
+    assert crew_log.units_in_succession("chat-1") == ("a0", "a1", "b0", "b1", "b2")
+
+
+def test_usage_units_unrelated_roots_without_a_clock_keep_store_order(monkeypatch):
+    """Two unrelated roots with no readable createdAt keep their store listing order.
+
+    Neither unit names the other, and the header clock is unreadable for both, so the
+    chain has nothing to say and neither does the clock. The resolver must fall back to
+    the store's own listing order (the creation order it established), NOT an arbitrary
+    id order that could sort a retired unit's rows ahead of a live one's.
+    """
+    monkeypatch.setattr(crew_log, "session_units_for_slot", lambda slot: ("older", "newer"))
+    monkeypatch.setattr(crew_log, "unit_header_created_at", lambda kind, uid: None)
+    monkeypatch.setattr(crew_log, "unit_opened_previous", lambda kind, uid: None)
+    assert crew_log.units_in_succession("chat-1") == ("older", "newer")
+
+
+def test_usage_units_single_unit_skips_the_chain_read(monkeypatch):
+    """One unit has nothing to reorder, so the predecessor read is not even paid."""
+    monkeypatch.setattr(crew_log, "session_units_for_slot", lambda slot: ("only",))
+
+    def _boom(*_a, **_k):
+        raise AssertionError("unit_opened_previous must not be read for a single unit")
+
+    monkeypatch.setattr(crew_log, "unit_opened_previous", _boom)
+    assert crew_log.units_in_succession("chat-1") == ("only",)
+
+
+def test_usage_fold_uses_the_succession_order(monkeypatch):
+    """The usage fold's unit resolver routes through the durable-succession helper."""
+    monkeypatch.setattr(crew_log, "units_in_succession", lambda slot: ("x", "y"))
+    assert crew_log._slot_units_for_fold("chat-1", "usage") == ("x", "y")
+
+
+def test_agentic_fold_uses_the_succession_order(monkeypatch):
+    """The agentic fold's unit resolver routes through the durable-succession helper.
+
+    This fold keeps the LATEST value per field, so whichever unit is folded last wins
+    each cell. Under the header clock a backward step between two units of one slot
+    sorts the retired unit last, and its stale value would overwrite one the live
+    session wrote and the write path accepted -- silently, because both are well-formed.
+    """
+    monkeypatch.setattr(crew_log, "units_in_succession", lambda slot: ("x", "y"))
+    assert crew_log._slot_units_for_fold("chat-1", crew_log.DASHBOARD_FOLD_NAME) == ("x", "y")
+
+
+def test_agentic_fold_does_not_fall_through_to_the_header_clock(monkeypatch):
+    """The header fallthrough must not be what answers for this fold.
+
+    Asserted by making the fallthrough the ONLY thing that could answer: if the
+    resolver reached ``session_units_for_slot`` for the agentic fold it would return
+    the clock order below, which is the inversion the succession read exists to undo.
+    """
+    monkeypatch.setattr(crew_log, "session_units_for_slot", lambda slot: ("retired", "live"))
+    monkeypatch.setattr(crew_log, "units_in_succession", lambda slot: ("live", "retired"))
+    assert crew_log._slot_units_for_fold("chat-1", crew_log.DASHBOARD_FOLD_NAME) == (
+        "live",
+        "retired",
+    )

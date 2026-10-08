@@ -76,6 +76,22 @@ export interface StatusData {
   update_managed_by?: string
   update_can_arm?: boolean
   /**
+   * What an available update leads to on this install: `install` (with the
+   * auto-update switch on), `notify` (the switch cannot install here),
+   * `mandatory` (a policy floor installs it regardless), or `unknown` before
+   * the gateway first derives it. The update loop acts on the same answer.
+   */
+  update_auto_effect?: 'install' | 'notify' | 'mandatory' | 'unknown'
+  /**
+   * Whether the desktop app bundles and launches this gateway, from the baked
+   * packaging stamp. Independent of `update_managed_by`, which reads `command`
+   * on that same bundle when a policy `updates` provider is configured. There,
+   * `update_auto_effect` reports the PROVIDER's answer, since the provider is
+   * what this gateway's loop runs; without one it reports `notify`, the app's
+   * own updater owning the update.
+   */
+  update_bundled_by_app?: boolean
+  /**
    * Commit distance from a git checkout's upstream, both directions. Diverged
    * (both > 0) reports `update_available: false` exactly like a current
    * checkout — the destructive apply paths must never be offered local
@@ -229,6 +245,8 @@ export interface UpdateCheckResult {
   remediation?: { kind?: string; message?: string; command?: string } | null
   current_version?: string
   auto_update?: boolean
+  /** Whether config.local.json sets `auto_update`, so the switch cannot change it. */
+  overlay_override?: boolean
   minimum_version_enforced?: string
   update_required?: boolean
   /** Legacy alias some older payloads carried; `latest_version` is authoritative. */
@@ -586,6 +604,10 @@ export interface Skill {
    *  its figure historical. `null`/absent means no ledger entry, which is NOT
    *  the same as zero (an entry can also age out of the window). */
   deliveries?: number | null
+  /** Unix time (seconds) of the latest delivery; `null`/absent exactly when
+   *  `deliveries` is. Drives the Skills list's "last used" text and its
+   *  Recently used sort. */
+  last_used_at?: number | null
   /** False when the SKILL.md lives outside the directory Kiro Crew owns (e.g. a
    *  `skills.extra_paths` entry). Such a skill is listed but not ours to rewrite,
    *  so the injection toggle must not be offered — the endpoint refuses it. */
@@ -830,6 +852,11 @@ export interface McpScopePresence {
   [scope: string]: boolean
 }
 
+export interface McpTempRefusal {
+  key: string; path: string
+  cause: 'sealed' | 'unclassifiable' | 'check-failed'
+}
+
 export interface McpServer {
   name: string; command: string; args?: string[]
   url?: string
@@ -852,12 +879,31 @@ export interface McpServer {
    *  alongside `authChallenge`; absent is "unknown", which is why the sign-in
    *  wording is gated on an explicit `false`. */
   authGrantPresent?: boolean
+  /** Spec-declared temp keys the probe refused (path already redacted); the
+   *  probe ran with the managed temp instead. Absent when nothing was refused. */
+  tempRefusals?: McpTempRefusal[]
   /** Optional status-enrichment fields supplied by newer runtimes. */
   accountLabel?: string
   connectedSince?: string
   /** True when the entry lives in KiroCrew's own mcp.json — the scope the
    *  Edit JSON action reads and writes (consent-disabled rows included). */
   kirocrewManaged?: boolean
+  /** Which config switched the row off, from the backend — never inferred from
+   *  `enabled` + `kirocrewManaged`. `kirocrew`: a disable in Kiro Crew's own
+   *  store, which the Kiro Crew scope badge + Apply lifts (the consent step).
+   *  `shared`: a disable in a config this panel does not write for enable (the
+   *  shared Kiro MCP config the IDE edits, or a provider global), so the row is
+   *  inert here; a row disabled in both reads `shared`. `null` when enabled. */
+  disabledIn?: 'shared' | 'kirocrew' | null
+  /** The file to edit to re-enable a `shared` row, home collapsed to `~`, when
+   *  the backend can name it; `null` when it cannot. */
+  disabledInFile?: string | null
+  /** WHY the row is off, when the switch is not the honest story: `invalid`
+   *  means the config's `disabled` is not a boolean (`"false"`, `1`, `null`) and
+   *  the backend read it fail-closed -- an invalid value never launches a
+   *  server -- so the fix is to repair the value where it sits, not to flip a
+   *  switch. `null` when enabled or when some config really says `true`. */
+  disabledReason?: 'invalid' | null
   /** Consecutive failed probes on record. Absent means none — a healthy server
    *  carries neither this nor `quarantined`. */
   probeFailures?: number
@@ -892,6 +938,9 @@ export interface TodoTask {
   text: string
   /** kiro-cli's todo model is a plain boolean — there is no in-progress state. */
   completed: boolean
+  /** True while a person's click holds this row's state and the agent has not
+   * yet confirmed it in its own list. Absent on rows the agent itself set. */
+  person?: boolean
 }
 
 /**
@@ -951,7 +1000,17 @@ export interface McpSessionReport {
 export interface SessionLink {
   channel: string
   label: string
+  /** Redacted display tail of the conversation id — never the id, never a key. */
   target: string
+  /**
+   * Opaque identity of the whole binding (channel, full conversation id, thread),
+   * minted server-side. An unlink names it, and the server refuses a row whose
+   * binding has since been replaced — `target` alone cannot tell a Slack thread
+   * from its same-channel replacement. Optional for the same reason as `paused`:
+   * a cached `slots` payload from before this field shipped has none, and a
+   * row sent without it is refused as stale rather than unlinking anything.
+   */
+  binding?: string
   /**
    * `origin` — the conversation the session started on.
    * `out`    — dashboard replies are mirrored there (one-way, from `!link`).
@@ -964,6 +1023,21 @@ export interface SessionLink {
    * `channel` alone does not identify a row; pair it with origin-ness.
    */
   direction: 'origin' | 'out' | 'both'
+  /**
+   * Messages sent in that conversation land in THIS session. The server's
+   * statement of inbound routing, per row, because it is not readable from the
+   * other fields: a Slack thread is `out` (Slack routes replies through its own
+   * thread index, not the mirror's inbound marker) yet a reply there resumes
+   * this session; a `both` mirror routes inbound by that marker; a one-way
+   * `out` mirror only receives replies; the conversation a session was born in
+   * is where its turns come from. What a sever destroys differs between a row
+   * that drives the session and one that does not, so the menu's sub-lines
+   * read this rather than inferring it from `direction` or the channel name —
+   * the inference is wrong for a paused Slack row. Optional for the same
+   * reason as `binding`: a cached `slots` payload from before this field
+   * shipped has none, and such a row reads as not driving until the next push.
+   */
+  drives_session?: boolean
   live: boolean
   /**
    * The user disconnected this channel: turn output stops flowing there, but the
@@ -1081,9 +1155,12 @@ export interface ChatSlot {
   row_identity?: string
   /** Provider session identity when it differs from the dashboard slot key. */
   linked_session_key?: string
+  /** The transcript filename stem the server resolved for this slot: the key the
+   *  Older sessions list gives the same session, sent verbatim to reopen it. */
+  history_key?: string
   /** Prompts held for a later turn on this slot. */
   queue_depth?: number
-  key: string; title?: string; messages: number; running: boolean; stopping?: boolean; pending_approval?: boolean; created?: string; last_ts?: string; last_turn_ts?: string; last_message?: string; agent?: string; model?: string; reasoning_effort?: string; mode?: string; surface?: string; workspace?: string; trust?: boolean; trust_reads?: boolean; folder_id?: string; pinned?: boolean; tags?: string[]; tags_revision?: string; links?: SessionLink[]; slack_linked?: boolean; slack_channel?: string; slack_thread_ts?: string; color_index?: number | null; color_hex?: string | null; memory_mode?: 'persistent' | 'incognito' | 'temporary'; project?: string; forked_from?: string | null; source_links?: { provider: SourceProviderId; number: number; url: string; label?: string; repo?: string; ci?: 'running' | 'passed' | 'failed' | null; state?: 'open' | 'draft' | 'merged' | 'closed'; mergeable?: string; mergeStateStatus?: string; kind?: 'change' | 'issue' }[]; source_links_total?: number
+  key: string; title?: string; messages: number; running: boolean; stopping?: boolean; pending_approval?: boolean; created?: string; last_ts?: string; last_turn_ts?: string; last_message?: string; agent?: string; model?: string; reasoning_effort?: string; mode?: string; surface?: string; workspace?: string; trust?: boolean; trust_scope?: string; trust_reads?: boolean; folder_id?: string; pinned?: boolean; tags?: string[]; tags_revision?: string; links?: SessionLink[]; slack_linked?: boolean; slack_channel?: string; slack_thread_ts?: string; color_index?: number | null; color_hex?: string | null; memory_mode?: 'persistent' | 'incognito' | 'temporary'; project?: string; forked_from?: string | null; source_links?: { provider: SourceProviderId; number: number; url: string; label?: string; repo?: string; ci?: 'running' | 'passed' | 'failed' | null; state?: 'open' | 'draft' | 'merged' | 'closed'; mergeable?: string; mergeStateStatus?: string; kind?: 'change' | 'issue'; identity?: string }[]; source_links_total?: number
   /** Provenance bucket from the backend `SlotOrigin` ("user" | "app" | "cron"
    * | "system"; absent/"" for untagged background slots). The session-pulse
    * survey shows only on a "user" slot, so an imported Slack thread, a
@@ -1096,6 +1173,24 @@ export interface ChatSlot {
    * DM thread to the worker sessions it drives — the Crew Members drawer
    * filters the live slots on it. */
   created_by?: string
+  /** Whether THIS gateway process stamped `created_by` at mint, rather than
+   * rehydrating it from the transcript. `created_by` is restored from a metadata
+   * line an agent's file tools can edit, so on its own it is a claim; this says
+   * whether it is the gateway's own witness. `_attach_slot_parents` requires it
+   * before nesting a row that has no session-tree node yet — a child between
+   * `session_create` and its first turn, which has no crew log to fold. */
+  lineage_minted?: boolean
+  /** The session tree's parent edge for this slot, attached to every row by
+   * `_attach_slot_parents`: `{slot, key}`, or null when this slot has no parent.
+   * `slot` is the parent's own citation and `key` names the parent's row IN THIS
+   * payload (bare slot key), or null when the parent is not running or sits on a
+   * cycle.
+   *
+   * Distinct from `created_by`, and both are needed to know whether a slot is a
+   * root: `created_by` is the birth-time edge, written once, while this one
+   * carries the edge an adopt or release moves later. An adopted session has an
+   * empty `created_by` and a parent here. */
+  parent?: { slot: string; key: string | null } | null
   /** Artifact companion binding: slug of the artifact this slot is a companion
    * chat for. Set at slot create and persisted in the history meta line, so the
    * binding survives a gateway restart and a History-page resume. */
@@ -1103,7 +1198,12 @@ export interface ChatSlot {
   /** Metadata for kind="webapp" artifacts (deploy state, architecture, costs). */
   webapp_metadata?: WebAppMetadata
   // Board fields
-  has_options?: boolean; options?: string[]; pending_approval_info?: PendingApproval | null; last_activity_ts?: string; waiting_for_input?: boolean; prompt_preview?: string; subagents_running?: boolean; orchestrating?: boolean
+  has_options?: boolean; options_ts?: string; options?: string[]; pending_approval_info?: PendingApproval | null; last_activity_ts?: string; waiting_for_input?: boolean; prompt_preview?: string; subagents_running?: boolean
+  /** The sub-agent queued depth the gateway last published for this session —
+   * the same value as its newest `subagent_queued` frame. Read only to
+   * reconcile `chat.subagentQueued` on a `slots` push; absent from a
+   * `slot_patch` and from an older gateway. */
+  subagents_queued?: number
   /** An unanswered question card the turn is parked on, so the row would
    * otherwise read "Thinking…" with nothing able to advance it. Narrower than
    * `waiting_for_input` (true of every finished turn, and therefore no signal)
@@ -1116,6 +1216,14 @@ export interface ChatSlot {
   interrupted?: boolean
   // Soft-stop state machine
   stop_state?: 'idle' | 'soft_pending' | 'killing'
+  /** An automatic context compaction holds the session right now. Not a turn,
+   * so `running` stays false while it runs, which is exactly what made it look
+   * like a stall worth pressing Stop on (#14841). The composer shows it and
+   * the Stop button becomes a warning while it is set. */
+  compacting?: boolean
+  /** A cooperative Stop was declined moments ago (compaction); the next press
+   * escalates to the force stop. Read from the same window the backend uses. */
+  stop_declined?: boolean
   /** In-flight `wait` tool sleep, absent when nothing is sleeping. `deadline_ts`
    * is absolute seconds on the BACKEND clock (Date.now() / 1000 territory), so
    * the transcript can count down against it and survive a page reload;
@@ -1288,15 +1396,35 @@ export interface PullRequestSource {
 
 export interface ChatFolder {
   id: string; name: string; collapsed?: boolean; order: number; parent_id?: string; color?: string; icon?: string; default_agent?: string; project_dir?: string; hidden?: boolean; history_count?: number
+  /** Epoch seconds the folder was created, written by every folder creator since
+   *  the sidebar's `created` sort existed. Absent on a row from before that; such
+   *  a row sorts as older than every stamped one. Read only through
+   *  `folderComparator('created')`, which mirrors the Python reader. */
+  created_at?: number
   /** Tag ids (from the tag vocabulary) copied onto every NEW chat filed into
    *  this folder. Absent = no tags, mirroring the optional `color`. */
   tags?: string[]
+  /** Extra steering directories loaded, in addition to the global and project
+   *  steering, for every chat whose folder is in this folder's subtree.
+   *  ACCUMULATIVE up the parent_id chain (unlike `project_dir`, which is
+   *  nearest-wins). Absent = none, mirroring the optional `tags`. */
+  steering_dirs?: string[]
+  /** Principal that owns the folder: an app's name, `member:<store>` for a
+   *  crew member, absent/empty for the person. Folder steering from an
+   *  ancestor owned by ANOTHER principal is never delivered to this folder's
+   *  chats, so the inherited list filters on it. */
+  owner_app?: string
   /** Channel namespace when this folder was created by per-channel session filing (e.g. 'discord'). */
   channel?: string
 }
 
+export type AgentTagPolicy = 'none' | 'add-only' | 'add-remove'
+
 export interface ChatTag {
   id: string; name: string; color: string; order: number; status?: boolean
+  agent?: AgentTagPolicy
+  agent_provenanced?: boolean
+  agent_store_degraded?: boolean
 }
 
 export type TagColumnMode = 'any' | 'all' | 'none'
@@ -1323,7 +1451,7 @@ export interface ChatMessage {
   /** Structured metadata for role-specific data (e.g. tool_input for permission messages). */
   meta?: Record<string, unknown>
   /** Regenerated variants of an assistant message (most recent last). */
-  variants?: { content: string; ts?: string }[]
+  variants?: { content: string; ts?: string; blocked_links?: unknown; redactions?: unknown }[]
   /** Which variant index is currently active. */
   variant_idx?: number
   /** Counter for consecutive identical tool message deduplication. */
@@ -1375,7 +1503,7 @@ export interface SubagentActivity {
   childSession?: string
   status: 'pending' | 'running' | 'tool' | 'done' | 'error' | 'stopped'
   streaming: string; lastTool: string
-  startedAt: number; elapsed: number; error?: string
+  startedAt: number; elapsed: number; credits?: number; error?: string
   /** True when `startedAt` was ASSUMED rather than observed, which is the case
    *  for an entry minted by `upsertSlotSub` from an incremental frame: that frame
    *  carries no start time, so the entry records its arrival instant. The agent
@@ -1407,12 +1535,25 @@ export interface SubagentActivity {
   result?: string
 }
 
+/** Where `clampToolOutput` (wire.ts in store/chat) removed the middle of a tool
+ *  payload: the stored string is `head + '\n' + tail`, `at` is the offset of
+ *  the tail (right after that newline) and `count` is how many characters were
+ *  dropped between the two. Renderers put the localized marker there at view
+ *  time, so the store never holds a rendered string and the marker follows a
+ *  later language switch. */
+export interface ToolPayloadCut {
+  at: number
+  count: number
+}
+
 export interface ToolActivity {
   type: string
   text: string          // tool name (or approval / activity label)
   purpose?: string      // tool purpose
   input?: string        // tool input (commands, file content, etc.)
   output?: string       // tool output (stdout, results, etc.)
+  input_cut?: ToolPayloadCut   // set only when `input` was clamped
+  output_cut?: ToolPayloadCut  // set only when `output` was clamped
   ts: number
   execution_started_at?: number // when execution began (after approval); survives remount
   auto?: boolean        // auto-approved tool call
@@ -1464,6 +1605,9 @@ export interface NotificationChannel {
 }
 
 export interface PendingApproval {
+  origin?: 'native' | 'coordinator'
+  request_mid?: string
+  tool_purpose?: string
   tool: string
   tool_input: string
   tool_kind: string

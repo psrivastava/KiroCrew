@@ -23,7 +23,7 @@ import pytest
 from aiohttp import web
 
 from kiro_crew import platform_compat
-from kiro_crew.apps.builtins.code_review_sage.tests.fixtures import SYMLINKS_OK
+from kiro_crew.apps.builtins.code_review_sage.tests.fixtures import SYMLINKS_OK, OwnerRequest
 
 _APP_ROOT = Path(__file__).resolve().parent.parent
 _ROUTES = _APP_ROOT / "backend" / "routes.py"
@@ -488,7 +488,7 @@ class TestHandlers(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(rv["effort"] == "" or rv["effort"] in _rp.VALID_EFFORTS)
 
     async def test_review_rejects_empty_input(self):
-        class _Req:
+        class _Req(OwnerRequest):
             async def json(self):
                 return {}
         resp = await self.mod._handle_review(_Req())
@@ -501,7 +501,7 @@ class TestHandlers(unittest.IsolatedAsyncioTestCase):
 
         _url = "https://github.com/kirodotdev/KiroCrew/pull/20"
 
-        class _Req:
+        class _Req(OwnerRequest):
             async def json(self):
                 return {"links": _url}
         resp = await self.mod._handle_review(_Req())
@@ -1343,6 +1343,111 @@ class TestOrphanReapDoesNotBlockStartup(unittest.IsolatedAsyncioTestCase):
             self.routes.register_routes(app)
             for hook in app.on_startup:
                 await hook(app)   # must not raise
+
+
+class TestLayoutPassDoesNotBlockStartup(unittest.IsolatedAsyncioTestCase):
+    """The layout self-heal must run off the event loop.
+
+    Same shape as the reap above, and the same reason: `register_routes` is sync
+    and `start_dashboard` is a coroutine, so its body executes ON the loop.
+    `ensure_layout` walks each of nine directories' ancestor chain to refuse a
+    planted link before creating it, so on a network-homed or stalled data
+    directory that is a synchronous filesystem walk holding the loop.
+
+    The ordering the UI depends on survives because aiohttp runs `on_startup`
+    before the site accepts a connection, so no request can observe a missing
+    `resolved_paths`.
+    """
+
+    def setUp(self):
+        self.routes = _load_routes_module()
+
+    def test_register_routes_does_not_build_the_layout_inline(self):
+        app = web.Application()
+        called = []
+
+        def _ensure() -> None:
+            called.append("built")
+
+        with unittest.mock.patch.object(
+                self.routes.store, "ensure_layout", _ensure):
+            self.routes.register_routes(app)
+        self.assertEqual(called, [], "the layout pass must not run during registration")
+        # Deferred, not dropped.
+        self.assertIn(
+            "_ensure_layout_on_startup",
+            {getattr(h, "__name__", "") for h in app.on_startup},
+            "no layout startup hook was registered")
+
+    async def test_the_startup_hook_builds_the_layout_off_the_loop(self):
+        app = web.Application()
+        threads = []
+
+        def _ensure() -> None:
+            threads.append(threading.current_thread().name)
+
+        with unittest.mock.patch.object(
+                self.routes.store, "ensure_layout", _ensure):
+            self.routes.register_routes(app)
+            for hook in app.on_startup:
+                await hook(app)
+
+        self.assertEqual(len(threads), 1, "the layout pass ran once")
+        self.assertNotEqual(
+            threads[0], threading.current_thread().name,
+            "the layout pass must run on a worker thread, not the loop thread")
+
+    async def test_a_failing_layout_never_breaks_startup(self):
+        app = web.Application()
+
+        def _boom() -> None:
+            raise OSError("read-only filesystem")
+
+        with unittest.mock.patch.object(
+                self.routes.store, "ensure_layout", _boom):
+            self.routes.register_routes(app)
+            for hook in app.on_startup:
+                await hook(app)   # must not raise
+
+        self.assertTrue(
+            [r for r in app.router.routes() if r.resource is not None],
+            "the routes are registered even when the layout pass fails")
+
+
+class TestTheRunRegistryRefusesAPlantedLink(unittest.TestCase):
+    """The registry's DIRECTORY, not just its guarded write.
+
+    `_write_runs` publishes through the shared link-refusing helper, but it has
+    to create the directory first, and a bare `mkdir(parents=True)` creates
+    THROUGH a link it meets -- so by the time the write's own refusal runs, the
+    tree already exists where the planter wants it. The review worker shares this
+    directory and is prompt-injectable, which is why the order matters here.
+    """
+
+    def setUp(self):
+        self.routes = _load_routes_module()
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def test_a_link_above_the_registry_takes_no_bytes(self):
+        impostor = self.tmp / "impostor"
+        impostor.mkdir()
+        planted = self.tmp / "data"
+        try:
+            planted.symlink_to(impostor)
+        except (OSError, NotImplementedError):
+            self.skipTest("planting the attack needs symlink creation")
+        target = planted / "runs" / "runs.json"
+
+        with unittest.mock.patch.object(
+                self.routes, "_runs_file", lambda: target), \
+                unittest.mock.patch(
+                    "kiro_crew.config.paths.data_home", lambda: str(self.tmp)):
+            with self.assertRaises(OSError):
+                self.routes._write_runs("[]")
+
+        self.assertEqual(list(impostor.iterdir()), [],
+                         "the tree was built inside the link's target")
 
 
 class TestAdoptionRequiresAnExactChangeIdentity:
@@ -2193,12 +2298,15 @@ class TestConsolidationCannotResurrectADeletedNamespace(unittest.IsolatedAsyncio
                          "a delete must not be refused after pruning the active list")
 
     async def _delete(self, ns):
-        req = unittest.mock.MagicMock()
-        req.method = "DELETE"
-        req.json = unittest.mock.AsyncMock(return_value={"name": ns})
-        req.query = {}
-        req.match_info = {}
-        return await self.mod._handle_namespaces(req)
+        class _DeleteReq(OwnerRequest):
+            method = "DELETE"
+            query: dict = {}
+            match_info: dict = {}
+
+            async def json(self):
+                return {"name": ns}
+
+        return await self.mod._handle_namespaces(_DeleteReq())
 
 
 class TestPhase1ValuesMustBeStrings(unittest.TestCase):
@@ -2669,8 +2777,9 @@ class _FakeState:
         return value
 
 
-class _Req:
+class _Req(OwnerRequest):
     def __init__(self, body=None, query=None):
+        super().__init__()
         self._body = body or {}
         self.query = query or {}
 

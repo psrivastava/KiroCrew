@@ -26,8 +26,10 @@ const HOOKS: Record<string, { file: string[]; carries: RegExp }> = {
   // the members roster mount (pinned below) — one string, two cards.
   'sidebar-inner': { file: ['components', 'listShell.ts'], carries: /export const LIST_SHELL_CLS = 'sidebar sidebar-inner / },
   'user-bubble': { file: ['pages', 'chat', 'UserMessage.tsx'], carries: /'user-bubble bg-card text-card-fg'/ },
-  'tb-capsule': { file: ['App.tsx'], carries: /className={`tb-capsule / },
-  'feedback-pill': { file: ['components', 'FeedbackPill.tsx'], carries: /className="feedback-pill / },
+  // `.tb-capsule` and `.feedback-pill` are no longer kiro-light hooks: both
+  // pills are Liquid Glass panes (components/Glass.tsx) that draw their own
+  // edge on every canvas, so the inset ring rule that once gave them one on
+  // the white chrome is gone.
 }
 
 /**
@@ -74,10 +76,14 @@ describe('kiro-light shell hooks', () => {
 
   it('the user bubble tint is scoped to the non-steer branch only', () => {
     // The steer bubble keeps bg-accent-subtle; tinting it too would erase the
-    // one cue that distinguishes a steer from an ordinary turn.
+    // one cue that distinguishes a steer from an ordinary turn. Both non-steer
+    // tones (#17839: the crewmate chat's accent fill and the default) keep the
+    // hook leading, so the kiro-light tint rule still selects the default one
+    // and the accent rules (keyed on `.user-bubble.user-bubble-accent`) win
+    // over it on the other.
     const src = read('pages', 'chat', 'UserMessage.tsx')
     expect(src, KEEP_HOOK('user-bubble', ['pages', 'chat', 'UserMessage.tsx'])).toMatch(
-      /isSteer \? 'bg-accent-subtle text-text' : 'user-bubble bg-card text-card-fg'/,
+      /isSteer \? 'bg-accent-subtle text-text' : tone === 'accent' \? 'user-bubble user-bubble-accent bg-accent text-accent-fg' : 'user-bubble bg-card text-card-fg'/,
     )
   })
 
@@ -94,15 +100,12 @@ describe('kiro-light shell hooks', () => {
     // the other or the swap becomes visible.
     const src = read('pages', 'chat', 'PinnedPrompt.tsx')
     expect(src, KEEP_HOOK('user-bubble', ['pages', 'chat', 'PinnedPrompt.tsx'])).toMatch(
-      /className="user-bubble flex items-start gap-2 rounded-xl bg-card text-card-fg ring-1 /,
+      /className="user-bubble flex items-stretch gap-2 overflow-hidden rounded-xl bg-card text-card-fg ring-1 /,
     )
   })
 
   it('kiro-light gives the borderless bg-card surfaces an edge the white canvas would otherwise erase', () => {
     expect(css).toMatch(/\[data-theme="kiro-light"\] \.user-bubble\{background-color:var\(--bg-hover\)\}/)
-    expect(css).toMatch(
-      /\[data-theme="kiro-light"\] \.tb-capsule,\[data-theme="kiro-light"\] \.feedback-pill\{box-shadow:inset 0 0 0 1px var\(--border\)\}/,
-    )
     expect(css).toMatch(
       /\[data-theme="kiro-light"\] \.focus-chrome-rail,\[data-theme="kiro-light"\] \.sidebar-inner\{background-color:var\(--panel\)\}/,
     )

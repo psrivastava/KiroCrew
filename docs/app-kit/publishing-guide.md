@@ -18,7 +18,7 @@ kirocrew app init my-app --ui --backend --cron
 ```
 
 `app.json` at the app root is the single source of truth for identity,
-resources, and the store listing. The registry entry (section 8) carries almost
+resources, and the store listing. The registry entry (section 10) carries almost
 nothing, so bumping a version or rewriting a description means editing only your
 own repo.
 
@@ -91,6 +91,9 @@ and any path segment starting with a dot.
 
 Path form depends on distribution: a registry app uses a repo-relative path
 (rewritten to a blob-proxy URL), while a built-in uses an absolute served URL.
+Write every path relative to the directory `app.json` lives in — for a registry
+entry with a `subdirectory`, the store joins that prefix before it builds the
+blob URL, so `ui/icons/app.png` is fetched as `apps/<name>/ui/icons/app.png`.
 
 | Field | Rendered where | Aspect |
 |-------|----------------|--------|
@@ -120,6 +123,19 @@ a missing or broken hero degrades instead of leaving a blank panel. The detail
 page sizes its container to whichever ratio it resolved, so a 16:9 hero used as
 a banner is not cropped.
 
+**Commit store art as plain bytes, not Git LFS pointers.** The pre-install
+store-art fetch (the owner-tier prewarm that renders icons and screenshots before
+an app is installed) checks the repository out into a throwaway directory with
+the operator's global and system git config masked, so no filter driver -- Git LFS
+included -- can run a program on the operator's machine while reading untrusted
+art. An LFS-tracked icon or screenshot therefore arrives at the prewarm as its
+pointer file, which is not an image, and is recorded as unobtainable (the card
+falls back to the name-seeded gradient). Keep art as plain committed files under
+the size caps: an art file over 8 MiB is never served, so its card falls back to
+the gradient, and an owner-tier row prewarms only the first 12 paths of each
+screenshots field. This limitation applies only to pre-install store art: the install
+and update paths are not masked and check out LFS content as usual.
+
 ## 5. Setup and lifecycle scripts
 
 ```json
@@ -147,7 +163,9 @@ Execution model:
 - Every script is wrapped as `/bin/bash -c "set -euo pipefail\n<script>"`, so an
   unset variable or any failing command in a pipeline aborts the script. Write
   scripts assuming bash, and prefer `bash script.sh` over `source script.sh` so
-  the intent is explicit.
+  the intent is explicit. Native Windows hosts without `/bin/bash` report the
+  lifecycle hook as failed; avoid these hooks or document that prerequisite for
+  an app that claims Windows support.
 - Scripts run sandboxed with a minimal environment (no gateway secrets) plus
   `NONINTERACTIVE=1`, with `cwd` set to the app directory, under a cgroup
   ceiling, in their own process group so a timeout kills the whole tree. They
@@ -243,8 +261,9 @@ named entries.
 | `requiresDesktopApp` | `false` | The app's UI needs the Electron shell (native always-on-top windows, global shortcuts, tray). A UX gate only: the browser marker is client-side and spoofable, so nothing security-relevant may depend on it. |
 
 With `installMode: "client"` on an incompatible platform, the store shows the
-copy-paste instruction panel instead of running an install, and the app
-registers itself on first launch via `POST /api/apps/register`. On a compatible
+copy-paste instruction panel instead of running an install, and the app is
+registered on first launch via `POST /api/apps/register`, which requires the
+dashboard owner's identity (see section 12, "Self-managed install"). On a compatible
 platform the normal clone-and-install path runs.
 
 An `installMode: "client"` app's `onEnable` script is treated as **advisory**: it
@@ -260,12 +279,12 @@ unreachable on exactly the hosts that need it to explain how to get the desktop 
 # Build the UI bundle if the app has one
 cd my-app/ui && npm install && npm run build && cd ..
 
-curl -X POST http://localhost:5476/api/apps/install \
-  -H 'Content-Type: application/json' \
-  -d '{"source": "./my-app"}'
-
-curl -X POST http://localhost:5476/api/apps/my-app/enable
+kirocrew app install /absolute/path/to/my-app
+kirocrew app enable my-app
 ```
+
+The REST routes require dashboard or app authentication; a bare `curl` request
+is not an equivalent local-install command.
 
 The dashboard's Sources menu on the Apps page can install from a local path too.
 
@@ -277,22 +296,12 @@ Verify:
 4. If it ships agents, ask one to do something from chat.
 5. If it ships crons, confirm they appear on the Schedule page.
 
-Debug:
+Debug the installed record with `kirocrew app info my-app`; the install command
+reports manifest validation errors directly and names the offending field.
 
-```bash
-curl http://localhost:5476/api/apps | python3 -m json.tool
-curl http://localhost:5476/api/apps/my-app/manifest | python3 -m json.tool
-```
-
-Manifest validation errors are returned by the install call itself, so a
-rejected install names the offending field.
-
-Iterate:
-
-```bash
-cd ui && npm run build && cd ..
-curl -X POST http://localhost:5476/api/apps/my-app/update
-```
+To iterate, rebuild the UI and use the installed app's **Update** action in the
+authenticated App Store UI. The update REST route is available to authenticated
+clients, but not to a bare `curl` request.
 
 For a tighter loop, turn on dev mode (`kirocrew app dev my-app`, or `POST
 /api/apps/my-app/dev`): UI files are then served with `Cache-Control: no-store`
@@ -391,7 +400,8 @@ an author can do.)
 **The bundled seed** (`src/kiro_crew/apps/app-registry.json` in the Kiro Crew
 repo) is the catalog's offline snapshot, not the listing surface: it is what a
 client falls back to when the catalog host is unreachable. Entries here ride the
-Kiro Crew release train. A catalog row for the same repository supersedes the
+Kiro Crew release train: a seed change follows the normal contribution flow and
+ships with the next release. A catalog row for the same repository supersedes the
 seed row, so the seed needs touching only when offline availability matters.
 
 The seed (and any federated registry index) uses this row shape:
@@ -412,17 +422,11 @@ The seed (and any federated registry index) uses this row shape:
 | `gitUrl` | yes | Any git-cloneable URL (`https://github.com/...`, `git@host:...`). The legacy `repo` field is still read and used as the clone target when no `gitUrl` is present. |
 | `repo` | | Repo identifier the blob proxy uses to serve committed images. |
 | `branch` | | Branch to read and clone. Defaults to `main`. For an entry cloning the registry repo itself (the monorepo layout), the registry's **configured** branch overrides this declaration — the index was read from that branch, so a divergent declaration names a state that does not exist there; the divergence is warning-logged. Entries cloning a different repository keep their declared branch. |
-| `subdirectory` | | Path within the repo holding `app.json`, for a monorepo layout. Treated as untrusted: it is joined with symlink-resolving containment and rejected if it escapes the clone root. |
+| `subdirectory` | | Path within the repo holding `app.json`, for a monorepo layout. Treated as untrusted: it is joined with symlink-resolving containment and rejected if it escapes the clone root. The store also joins it into every art path the manifest declares (`iconPath`, `heroImage*`, `screenshots*`) when it builds blob-proxy URLs, so those paths stay relative to the app directory. |
 | `resources` | | `"gateway"` (default) or `"app"`: who registers agents, skills, MCP servers, and crons. |
 | `lifecycle` | | `"gateway"` (default), `"app"`, or `"locked"`: who owns updates and uninstall. |
-| `detectInstalled` | | Shell command that exits 0 when the app is already present on the machine (for self-managed apps). It runs sandboxed with a 5s timeout. |
+| `detectInstalled` | | Shell command that exits 0 when the app is already present on the machine (for self-managed apps). It runs in the strict sandbox with a 5s timeout and a credential-free environment: only location hints (`HOME`, `PATH`, `USER`, `LOGNAME`, `SHELL`, `TERM`, `TMPDIR`, locale, and their Windows equivalents) plus git prompt and config suppression. Toolchain variables and git/SSH identity are absent, and stderr is discarded. |
 | `featured` | | Curator flag for the Discover editorial layer. `true` marks the app featured; a number both marks it and orders the slots (lower first). It lives on the registry entry, not in `app.json`, and is honored only for core-registry entries: a `featured` flag from an external registry is ignored, so adding a registry cannot seize the spotlight. With nothing flagged, the store falls back to a deterministic pick (apps with hero art first, then verified publishers, then name). |
-
-To reach the official store, open an **App Store listing request** issue with the
-[listing request template](https://github.com/kirodotdev/KiroCrew/issues/new?template=app-store-listing.yml)
-— that is the reachable path for an outside author, since the catalog repository
-is not publicly writable. A seed change in the Kiro Crew repo, by contrast,
-follows the normal contribution flow and ships with the next release.
 
 ## 11. Federated external registries
 
@@ -473,8 +477,36 @@ apps/
 
 With this layout the store lists, installs, and renders icons/screenshots for
 those apps using the owner's credentials. Apps in separate repos on the same
-private forge do not benefit from the carve-out: they fail to clone, and their
-icons and screenshots fall back to the name-seeded gradient.
+private forge do not benefit from the carve-out: under the default `index` tier
+they fail to clone, and their icons and screenshots fall back to the name-seeded
+gradient.
+
+**Owner-tier registries** lift that for the multi-repo layout too. A registry is
+owner-tier when the build pins it with `trust: "owner"`, or when the operator
+grants it in the dashboard, which records the configured row's repository in the
+keystone `registry_trust.json`. The tier never comes from `config.json`. When
+such a registry's index is fetched fresh, the store fetches
+each listed app's `app.json` and declared images once with the owner's
+credentials and caches them where the icon/screenshot proxy reads, so the apps
+render fully before install. Only the fresh index drives this — never a cached
+row — and nothing from the clone runs.
+
+**Owner-tier art needs an unambiguous `repo` key across ALL your registries.**
+The prewarm clones an owner-tier row with owner credentials only when exactly one
+configured source could be claiming that `repo` key — the same single-owner rule
+the icon/screenshot proxy enforces, so cached bytes can never be served to a
+request that reaches the same key through a different registry. It reads this from
+each OTHER registry's on-disk index cache, and it fails closed: a sibling
+registry whose index cache is **absent or unreadable** — one that has not fetched
+yet on a fresh gateway, or whose cache the periodic GC has reclaimed — counts as a
+possible claimant of every key, so until that sibling fetches, every owner-tier
+row is treated as ambiguous and left cold (its card shows the name-seeded gradient
+rather than its real art). Operators see one `store art prewarm: skipping <app>
+(repo key provenance ambiguous across configured sources)` warning per skipped row.
+The art warms itself on the next fresh index run once every configured registry
+has a readable cache; if it stays cold, check that each sibling registry is
+reachable and refreshing (`POST /api/apps/registries/refresh`) rather than failing
+to fetch.
 
 **Keep the configured URL byte-identical.** Because the carve-out is exact
 string equality, editing the registry `repo` between otherwise-equivalent forms
@@ -508,8 +540,13 @@ The store's Install button (`POST /api/apps/registry/install`, or the SSE varian
    not clone a branch**: it fetches exactly the commit the published catalog
    pins and hard-fails on any mismatch, never reuses a pre-existing checkout
    (the old one is set aside and restored if the install fails), and clones
-   credential-free.
-5. Run `setup.onInstall` (300s).
+   credential-free. On the desktop app the bundled interpreter cannot be
+   installed into, so this step refuses a Python build, except for the
+   `requirements.txt` waiver described under "The one desktop exception" in the
+   [manifest reference](manifest-reference.md) (`backend.hooks` section).
+5. Run `setup.onInstall` (300s). On the desktop app a final desktop-gate pass
+   then re-checks the checkout as the script left it, and a refusal fails the
+   install.
 6. Resolve declared dependencies.
 7. For a gateway-managed app: copy into `~/.kiro/crew/apps/{name}/`, register
    resources, and start the backend. For `resources: "app"`: pre-register from
@@ -522,8 +559,9 @@ finish inside its timeout.
 
 ### Self-managed install
 
-An app with its own installer (an Electron build, a native binary) registers
-itself at runtime:
+An app with its own installer (an Electron build, a native binary) is registered
+at runtime with `POST /api/apps/register`. The call requires the dashboard
+owner's identity: an app token or any non-owner subject gets `403 owner_only`.
 
 ```
 POST /api/apps/register
@@ -561,9 +599,11 @@ installed one.
 - `minKiroCrewVersion` is checked on install and update; too-old gateways get a
   clear error telling the user to update Kiro Crew first.
 - Users update from the store or via `POST /api/apps/{name}/update`. For a
-  registry-sourced app this re-clones, rebuilds, re-runs `onInstall`, and swaps
-  resources only after the fresh install has succeeded, so a failed update leaves
-  the working version registered.
+  registry-sourced app the update runs its preflight, stops the backend and
+  deregisters the app's resources, then re-clones, rebuilds, and re-runs
+  `onInstall`. If that install fails, the old version is restored: an enabled app
+  is re-registered and restarted, while a disabled app stays stopped and
+  unregistered.
 
 ## 14. Review checklist
 
@@ -572,7 +612,7 @@ installed one.
 - [ ] No `..` or absolute paths in `agents`, `skills`, `sops`, `ui.entry`,
       `ui.pages[].entryPoint`, `backend.entryPoint`
 - [ ] `permissions` are minimal, and each one is actually used
-- [ ] Icon committed, square, 256x256 or larger
+- [ ] Icon committed, square, opaque, and 512x512
 - [ ] At least one screenshot and one hero image committed
 - [ ] `description` is plain text and reads well truncated to two lines
 - [ ] `tags` are lowercase and land the app in the right category

@@ -8,13 +8,16 @@ import os
 import shutil
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 from aiohttp import web
 
+from kiro_crew import platform_compat
 from kiro_crew.apps.builtins.design_critique import register_routes
 from kiro_crew.apps.builtins.design_critique.backend import routes
+from kiro_crew.testing.links import make_dir_link as _make_dir_link
 
 
 def test_register_routes_mounts_the_three_endpoints() -> None:
@@ -145,10 +148,20 @@ def test_credential_dirs_are_refused() -> None:
     assert not routes._is_sensitive_dir(Path("/Users/x/Developer/myapp"))
 
 
-class _Req:
-    """Minimal stand-in exposing the one method the handler awaits."""
+_OWNER = "owner-user"
+
+
+class _Req(dict):
+    """Minimal stand-in for an owner's dashboard request.
+
+    Carries the signed claims the owner gate reads (``user``, an empty ``app``)
+    and the ``state.owner_id`` it compares them to, plus the one method the
+    handler awaits.
+    """
 
     def __init__(self, payload: object) -> None:
+        super().__init__(user=_OWNER, app="")
+        self.app = {"state": SimpleNamespace(owner_id=_OWNER)}
         self._payload = payload
 
     async def json(self) -> object:
@@ -1204,6 +1217,47 @@ def test_served_signature_ignores_what_the_server_will_not_serve(tmp_path) -> No
     _bump(outside / "extra.js")
     behind = routes._served_signature(build)
     assert behind is not None and behind.digest == sig.digest
+
+
+def test_served_signature_refuses_a_junctioned_directory(tmp_path) -> None:
+    # capture-build.mjs's Dirent test reports a junction as a symbolic link, so it
+    # walks nothing behind one and the preview server serves nothing from it. The
+    # token has to agree, and `os.path.islink` cannot make it agree: it calls a
+    # junction a plain directory, so the walk descended and signed bytes that are
+    # not served. Windows is the only platform with junctions and the only one where
+    # the symlink test above can be skipped for want of a privilege.
+    build = tmp_path / "dist"
+    _build_tree(build)
+    sig = routes._served_signature(build)
+    assert sig is not None
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "extra.js").write_text("x", encoding="utf-8")
+    _make_dir_link(build / "vendor", outside)
+
+    # Guard the guard: on Windows the link must really be the shape `os.path.islink`
+    # misreads. Without this the test could pass on a plain directory and prove
+    # nothing about the fix.
+    if platform_compat.IS_WINDOWS:
+        assert not os.path.islink(build / "vendor")
+        assert os.path.isdir(build / "vendor")
+    assert platform_compat.is_link_or_junction(build / "vendor")
+
+    # Only the DIGEST can hold still across the link's creation: that writes a new
+    # entry into dist/, and newest_mtime_ns reads directory mtimes on purpose.
+    linked = routes._served_signature(build)
+    assert linked is not None and linked.digest == sig.digest
+
+    # A change BEHIND the link moves neither field. Rewriting a file leaves its
+    # parent directory's mtime alone, so newest_mtime_ns is pinned exactly here —
+    # it feeds the discover-time mid-capture check, which an unserved tree must not
+    # be able to trip.
+    (outside / "extra.js").write_text("changed-and-longer", encoding="utf-8")
+    _bump(outside / "extra.js")
+    behind = routes._served_signature(build)
+    assert behind is not None and behind.digest == sig.digest
+    assert behind.newest_mtime_ns == linked.newest_mtime_ns
 
 
 def test_probe_build_dir_rejects_a_path_outside_the_project(tmp_path) -> None:

@@ -70,7 +70,7 @@ def _make_mock_sessions() -> MagicMock:
     sessions.close_all = AsyncMock()
 
     async def _open_task_session(
-        _parent_key, session_key, *, agent=None, cwd=None, approval_policy=""
+        _parent_key, session_key, *, agent=None, cwd=None, approval_policy="", start_priority=None
     ):
         # Fake: the run-scoped shared runtime is mocked away; forward to whatever
         # get_or_create is set to (preserves per-step key/call assertions).
@@ -1942,6 +1942,109 @@ class TestCheckpointResume:
 
 class TestSessionRecovery:
     @pytest.mark.asyncio
+    async def test_ambiguous_delivery_death_steers_retry_to_resume_not_restart(
+        self, tmp_path: Path
+    ) -> None:
+        """A drain-stall death carries ambiguous_delivery: the buffered step prompt
+        may already have run, so the retry must resume from current state instead
+        of re-stating the task verbatim (which would re-run its tools)."""
+        from kiro_crew.acp.client import AcpProcessDied
+        from kiro_crew.providers.base import LLMEvent
+
+        sessions = _make_mock_sessions()
+        prompts: list[str] = []
+        call_count = 0
+
+        provider = MagicMock()
+
+        async def _ambiguous_then_succeed(msg: str):
+            nonlocal call_count
+            call_count += 1
+            prompts.append(msg)
+            if call_count == 1:
+                raise AcpProcessDied("stdin stalled", ambiguous_delivery=True)
+            yield LLMEvent(kind="text_chunk", text="Resumed!")
+            yield LLMEvent(kind="complete")
+
+        provider.stream = _ambiguous_then_succeed
+        provider.approve_tool = AsyncMock()
+        provider.context_usage_pct = MagicMock(return_value=0.0)
+        sessions.get_or_create = AsyncMock(return_value=(provider, True, False))
+
+        async def _on_notify(title: str, body: str, task_id: str = "") -> None:
+            pass
+
+        runner = TaskRunner(
+            sessions=sessions, auto_test=False, on_notify=_on_notify, work_dir=tmp_path
+        )
+        run = TaskRun(spec_path=str(tmp_path / "t.md"), spec_content="s", status="running")
+        step = Step(index=1, title="Create the user table", description="run the migration")
+        run.tasks = [step]
+
+        success = await runner._execute_single_task(run, step)
+
+        assert success
+        assert step.status == StepStatus.PASSED
+        sessions.reset.assert_called()
+        # The retry prompt (second stream call) steers to resume from current
+        # state, not re-run the step. (A later verification turn may also stream.)
+        assert len(prompts) >= 2
+        retry_prompt = prompts[1].lower()
+        assert "do not restart" in retry_prompt
+        assert "already have started" in retry_prompt or "already started" in retry_prompt
+        assert step.resume_hint == "", "a normally completed attempt clears the hint"
+
+    @pytest.mark.asyncio
+    async def test_resume_hint_survives_a_failure_before_delivery(self, tmp_path: Path) -> None:
+        """The hint must clear only AFTER the hint-bearing prompt is delivered: if a
+        later turn fails before it streams, the next retry must still carry the
+        resume hint rather than fall back to a verbatim replay."""
+        from kiro_crew.acp.client import AcpProcessDied
+        from kiro_crew.providers.base import LLMEvent
+
+        sessions = _make_mock_sessions()
+        prompts: list[str] = []
+        call_count = 0
+
+        provider = MagicMock()
+
+        async def _ambiguous_then_fail_then_succeed(msg: str):
+            nonlocal call_count
+            call_count += 1
+            prompts.append(msg)
+            if call_count == 1:
+                raise AcpProcessDied("stdin stalled", ambiguous_delivery=True)
+            if call_count == 2:
+                # A plain (non-ambiguous) failure BEFORE any output is streamed:
+                # the hint must still be set for the next retry.
+                raise RuntimeError("transient failure before delivery")
+                yield  # pragma: no cover - unreachable, makes this an async gen
+            yield LLMEvent(kind="text_chunk", text="Resumed!")
+            yield LLMEvent(kind="complete")
+
+        provider.stream = _ambiguous_then_fail_then_succeed
+        provider.approve_tool = AsyncMock()
+        provider.context_usage_pct = MagicMock(return_value=0.0)
+        sessions.get_or_create = AsyncMock(return_value=(provider, True, False))
+
+        async def _on_notify(title: str, body: str, task_id: str = "") -> None:
+            pass
+
+        runner = TaskRunner(
+            sessions=sessions, auto_test=False, on_notify=_on_notify, work_dir=tmp_path
+        )
+        run = TaskRun(spec_path=str(tmp_path / "t.md"), spec_content="s", status="running")
+        step = Step(index=1, title="Create the user table", description="run the migration")
+        run.tasks = [step]
+
+        await runner._execute_single_task(run, step)
+
+        # The 3rd attempt's prompt still carries the resume hint, because the 2nd
+        # attempt raised before delivery and the hint was NOT cleared at render.
+        assert len(prompts) >= 3
+        assert "do not restart" in prompts[2].lower()
+
+    @pytest.mark.asyncio
     async def test_process_died_recovers(self, tmp_path: Path) -> None:
         """AcpProcessDied → recovers and completes step."""
         from kiro_crew.acp.client import AcpProcessDied
@@ -2025,9 +2128,13 @@ class TestSessionRecovery:
         # Step should report 3 attempts (logic only)
         assert step.attempts == 3
 
+    @pytest.mark.parametrize("ambiguous", [False, True])
     @pytest.mark.asyncio
-    async def test_process_died_exceeds_budget(self, tmp_path: Path) -> None:
-        """AcpProcessDied > _MAX_RECOVERIES → step fails."""
+    async def test_process_died_exceeds_budget(self, tmp_path: Path, ambiguous: bool) -> None:
+        """AcpProcessDied > _MAX_RECOVERIES → step fails. A give-up after an
+        ambiguous death KEEPS the resume hint: a Resume or retry restarts the
+        step at attempt 1 in the same work dir, where its prompt may already
+        have run, so the restarted prompt still opens with "do not restart"."""
         from kiro_crew.acp.client import AcpProcessDied
 
         sessions = _make_mock_sessions()
@@ -2035,7 +2142,7 @@ class TestSessionRecovery:
         fail_provider = MagicMock()
 
         async def _always_die(msg: str):
-            raise AcpProcessDied("Process exited")
+            raise AcpProcessDied("Process exited", ambiguous_delivery=ambiguous)
             yield  # type: ignore[misc]  # pragma: no cover
 
         fail_provider.stream = _always_die
@@ -2054,6 +2161,96 @@ class TestSessionRecovery:
         assert not success
         assert step.status == StepStatus.FAILED
         assert "Process died" in step.error
+        restarted = await runner._build_task_prompt(run, step, attempt=1)
+        assert ("## Resume (do not restart)" in restarted) is ambiguous
+
+    @pytest.mark.asyncio
+    async def test_a_loop_detected_give_up_keeps_the_resume_hint(self, tmp_path: Path) -> None:
+        """Only a normally completed attempt clears the hint, so a step that
+        dies ambiguously and then fails on a repeated error still carries it."""
+        from kiro_crew.acp.client import AcpProcessDied
+
+        sessions = _make_mock_sessions()
+        provider = MagicMock()
+        calls = 0
+
+        async def _die_then_repeat(msg: str):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise AcpProcessDied("stdin stalled", ambiguous_delivery=True)
+            raise RuntimeError("the same failure")
+            yield  # type: ignore[misc]  # pragma: no cover
+
+        provider.stream = _die_then_repeat
+        provider.approve_tool = AsyncMock()
+        provider.context_usage_pct = MagicMock(return_value=0.0)
+        sessions.get_or_create = AsyncMock(return_value=(provider, True, False))
+
+        runner = TaskRunner(sessions=sessions, auto_test=False, work_dir=tmp_path)
+        run = TaskRun(spec_path=str(tmp_path / "t.md"), spec_content="s", status="running")
+        step = Step(index=1, title="Tag the release", description="desc")
+        run.tasks = [step]
+
+        assert not await runner._execute_single_task(run, step)
+        assert step.status == StepStatus.FAILED
+        assert "do not restart" in step.resume_hint.lower()
+
+    @pytest.mark.asyncio
+    async def test_a_death_after_output_and_a_tool_call_resumes_the_retry(
+        self, tmp_path: Path
+    ) -> None:
+        """A plain death after the attempt streamed text and called a tool keeps
+        the attempt number, so the "continue" error text never renders; the
+        retry must still open by inspecting state instead of restating a step
+        whose tool (a push) may already have run."""
+        from kiro_crew.acp.client import AcpProcessDied
+        from kiro_crew.providers.base import LLMEvent
+
+        sessions = _make_mock_sessions()
+        prompts: list[str] = []
+        provider = _make_mock_provider("pushed")
+
+        async def _emit_then_die_then_succeed(msg: str):
+            prompts.append(msg)
+            if len(prompts) == 1:
+                yield LLMEvent(kind="text_chunk", text="Pushing now.")
+                yield LLMEvent(kind="tool_call", title="git push origin main")
+                raise AcpProcessDied("Process exited during prompt")
+            yield LLMEvent(kind="text_chunk", text="Done.")
+            yield LLMEvent(kind="complete")
+
+        provider.stream = _emit_then_die_then_succeed
+        sessions.get_or_create = AsyncMock(return_value=(provider, True, False))
+
+        runner = TaskRunner(sessions=sessions, auto_test=False, work_dir=tmp_path)
+        run = TaskRun(spec_path=str(tmp_path / "t.md"), spec_content="s", status="running")
+        step = Step(index=1, title="Push the branch", description="git push")
+        run.tasks = [step]
+
+        assert await runner._execute_single_task(run, step)
+        assert "## Resume (do not restart)" not in prompts[0]
+        assert "## Resume (do not restart)" in prompts[1]
+        assert step.resume_hint == "", "a normally completed attempt clears the hint"
+
+    @pytest.mark.asyncio
+    async def test_a_replan_after_a_possibly_run_step_says_so(self, tmp_path: Path) -> None:
+        """The automatic replan after a give-up sees the resume hint, so the new
+        tasks do not restate possibly-executed work as fresh."""
+        from kiro_crew.task_models import RESUME_HINT
+
+        runner = TaskRunner(sessions=_make_mock_sessions(), auto_test=False, work_dir=tmp_path)
+        runner._decompose = AsyncMock(return_value=[])
+        run = TaskRun(spec_path=str(tmp_path / "t.md"), spec_content="s", status="running")
+        step = Step(index=1, title="Tag the release", description="desc")
+        step.status = StepStatus.FAILED
+        step.error = "Process died 3 times — giving up"
+        step.resume_hint = RESUME_HINT
+        run.tasks = [step]
+
+        assert await runner._try_replan(run, step) is False
+        spec = runner._decompose.await_args.args[0]
+        assert "may already have run" in spec
 
     @pytest.mark.asyncio
     async def test_session_reset_between_retries(self, tmp_path: Path) -> None:
@@ -2997,8 +3194,8 @@ class TestSelfReview:
         assert len(run.memory.blockers) == 1
 
     @pytest.mark.asyncio
-    async def testself_review_exception_passes(self, tmp_path: Path) -> None:
-        """Self-review exception → doesn't block step."""
+    async def testself_review_exception_fails_closed(self, tmp_path: Path) -> None:
+        """Self-review exception → the step is not verified, so it does not pass."""
         sessions = _make_mock_sessions()
         sessions.get_or_create = AsyncMock(side_effect=RuntimeError("boom"))
 
@@ -3008,7 +3205,88 @@ class TestSelfReview:
         run.tasks = [step]
 
         result = await runner.self_review(run, step)
-        assert result is True  # graceful fallback
+        assert result is False
+        assert step.error.startswith("Self-review could not verify the step")
+
+    @pytest.mark.asyncio
+    async def testself_review_no_diff_on_a_git_run_is_unverified(self, tmp_path: Path) -> None:
+        """A git run whose step left no diff has nothing to review: not passed."""
+        sessions = _make_mock_sessions()
+        runner = TaskRunner(sessions=sessions, auto_test=False, work_dir=tmp_path)
+        run = TaskRun(spec_path=str(tmp_path / "t.md"), spec_content="s")
+        run.branch_name = "task/x"
+        step = Step(index=1, title="Push", description="push the branch")
+        run.tasks = [step]
+
+        judge = AsyncMock(return_value={"ok": True})
+        with (
+            patch("kiro_crew.task_executor.git_coord.get_step_diff", AsyncMock(return_value="")),
+            patch("kiro_crew.task_executor.stream_and_collect_json", judge),
+        ):
+            result = await runner.self_review(run, step)
+
+        assert result is False
+        assert "no diff" in step.error
+        judge.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def testself_review_no_diff_after_a_failed_commit_asks_the_reviewer(
+        self, tmp_path: Path
+    ) -> None:
+        """A failed commit (non-fatal) explains the missing diff, so review still runs."""
+        from kiro_crew.task_executor import self_review
+
+        sessions = _make_mock_sessions()
+        sessions.get_or_create = AsyncMock(return_value=(MagicMock(), True, False))
+        run = TaskRun(spec_path=str(tmp_path / "t.md"), spec_content="s")
+        run.branch_name = "task/x"
+        step = Step(index=1, title="Code", description="d")
+        run.tasks = [step]
+
+        with (
+            patch("kiro_crew.task_executor.git_coord.get_step_diff", AsyncMock(return_value="")),
+            patch("kiro_crew.task_executor.stream_and_collect_json", return_value={"ok": True}),
+        ):
+            assert await self_review(run, step, sessions, "", commit_failed=True) is True
+
+    @pytest.mark.asyncio
+    async def testself_review_no_diff_without_git_still_asks_the_reviewer(
+        self, tmp_path: Path
+    ) -> None:
+        sessions = _make_mock_sessions()
+        runner = TaskRunner(sessions=sessions, auto_test=False, work_dir=tmp_path)
+        run = TaskRun(spec_path=str(tmp_path / "t.md"), spec_content="s")
+        step = Step(index=1, title="Research", description="d")
+        run.tasks = [step]
+        sessions.get_or_create = AsyncMock(return_value=(MagicMock(), True, False))
+
+        with patch("kiro_crew.task_executor.stream_and_collect_json", return_value={"ok": True}):
+            assert await runner.self_review(run, step) is True
+
+    @pytest.mark.asyncio
+    async def test_an_unverified_review_fails_the_step_without_a_rerun(
+        self, tmp_path: Path
+    ) -> None:
+        sessions = _make_mock_sessions()
+        sessions.get_or_create = AsyncMock(return_value=(_make_mock_provider("done"), True, False))
+        runner = TaskRunner(sessions=sessions, auto_test=False, work_dir=tmp_path)
+        run = TaskRun(spec_path=str(tmp_path / "t.md"), spec_content="s", status="running")
+        step = Step(index=1, title="Push", description="d")
+        run.tasks = [step]
+
+        async def _unverified(r, s, sessions, agent, session_key="", *, ctx=None):
+            s.error = "Self-review could not verify the step: the review itself failed"
+            return False
+
+        with (
+            patch("kiro_crew.task_executor.self_review", side_effect=_unverified),
+            patch("kiro_crew.task_executor.execute_task", AsyncMock(return_value=True)) as ex,
+        ):
+            success = await runner._execute_single_task(run, step, "key")
+
+        assert success is False
+        assert step.status == StepStatus.FAILED
+        assert ex.await_count == 1
 
 
 # ── Phase 12.2: Approval Gates ──
@@ -4805,6 +5083,170 @@ class TestGitCoord:
 
         await git_coord.revert_step(run)  # should not raise
 
+    @pytest.mark.asyncio
+    async def test_revert_success_pops_one_and_reverts_worktree(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        """Baseline unchanged: a successful reset reverts the tree, pops exactly
+        one commit hash, and emits no log line at default (non-debug) levels."""
+        import logging
+
+        from kiro_crew import git_coord
+
+        work_dir = tmp_path / "repo"
+        work_dir.mkdir()
+        await git_coord._git(str(work_dir), "init")
+        tracked = work_dir / "tracked.txt"
+        tracked.write_text("v1")
+        await git_coord._git(str(work_dir), "add", "-A")
+        await git_coord._git(str(work_dir), "commit", "-m", "init")
+
+        run = TaskRun(spec_path="/t.md", spec_content="s")
+        run.task_id = "revert_ok"
+        run.work_dir = str(work_dir)
+        await git_coord.init_workspace(run)
+
+        # Commit a second version of the tracked file through commit_step.
+        (Path(run.work_dir) / "tracked.txt").write_text("v2")
+        step = Step(index=1, title="change", description="d")
+        sha = await git_coord.commit_step(run, step)
+        assert sha
+        assert run.commit_hashes == [sha]
+        assert (Path(run.work_dir) / "tracked.txt").read_text() == "v2"
+
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.git_coord"):
+            await git_coord.revert_step(run)
+
+        assert run.commit_hashes == []  # exactly one popped
+        assert (Path(run.work_dir) / "tracked.txt").read_text() == "v1"  # reverted
+        assert caplog.records == []  # silent at default levels
+
+        await git_coord.finalize(run)
+
+    @pytest.mark.asyncio
+    async def test_revert_retries_a_windows_sharing_violation_then_succeeds(
+        self, monkeypatch, caplog
+    ) -> None:
+        """On Windows a held-handle unlink failure is transient; revert_step
+        retries the bounded window and, once the handle clears, pops normally."""
+        import logging
+
+        from kiro_crew import git_coord
+
+        monkeypatch.setattr(git_coord.platform_compat, "IS_WINDOWS", True)
+        monkeypatch.setattr(git_coord.asyncio, "sleep", AsyncMock())  # no real delay
+
+        calls = {"n": 0}
+
+        async def _flaky_git(work_dir, *args):
+            if args[:2] == ("reset", "--hard"):
+                calls["n"] += 1
+                if calls["n"] < 3:
+                    raise RuntimeError(
+                        "git reset --hard HEAD~1 failed: error: unable to unlink old "
+                        "'tracked.txt': Invalid argument\nfatal: Could not reset index "
+                        "file to revision 'HEAD~1'."
+                    )
+                return ""
+            return ""
+
+        monkeypatch.setattr(git_coord, "_git", _flaky_git)
+
+        run = TaskRun(spec_path="/t.md", spec_content="s")
+        run.git_enabled = True
+        run.work_dir = "/w"
+        run.commit_hashes = ["aaa", "bbb"]
+
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.git_coord"):
+            await git_coord.revert_step(run)
+
+        assert calls["n"] == 3  # two contended attempts, third succeeds
+        assert run.commit_hashes == ["aaa"]  # exactly one popped after success
+        # No WARNING because the revert ultimately succeeded.
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+    @pytest.mark.asyncio
+    async def test_revert_exhausts_retries_warns_and_does_not_pop(
+        self, monkeypatch, caplog
+    ) -> None:
+        """A sharing violation that never clears: after the bounded retries the
+        failure surfaces at WARNING and commit_hashes is left untouched so it
+        stays consistent with the un-reverted worktree."""
+        import logging
+
+        from kiro_crew import git_coord
+
+        monkeypatch.setattr(git_coord.platform_compat, "IS_WINDOWS", True)
+        monkeypatch.setattr(git_coord.asyncio, "sleep", AsyncMock())
+
+        calls = {"n": 0}
+
+        async def _always_locked(work_dir, *args):
+            if args[:2] == ("reset", "--hard"):
+                calls["n"] += 1
+                raise RuntimeError(
+                    "git reset --hard HEAD~1 failed: error: unable to unlink old "
+                    "'tracked.txt': Invalid argument"
+                )
+            return ""
+
+        monkeypatch.setattr(git_coord, "_git", _always_locked)
+
+        run = TaskRun(spec_path="/t.md", spec_content="s")
+        run.git_enabled = True
+        run.work_dir = "/w"
+        run.commit_hashes = ["aaa", "bbb"]
+
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.git_coord"):
+            await git_coord.revert_step(run)
+
+        assert calls["n"] == git_coord._REVERT_MAX_ATTEMPTS  # tried the whole budget
+        assert run.commit_hashes == ["aaa", "bbb"]  # NOT popped — stays consistent
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert len(warnings) == 1
+        assert "git revert failed" in warnings[0].getMessage()
+
+    @pytest.mark.asyncio
+    async def test_revert_non_sharing_violation_failure_warns_without_retry(
+        self, monkeypatch, caplog
+    ) -> None:
+        """A failure that is not a transient Windows sharing violation (e.g. on
+        POSIX, or an unrelated git error) is NOT retried into a false success:
+        it surfaces at WARNING on the first attempt and does not pop."""
+        import logging
+
+        from kiro_crew import git_coord
+
+        # POSIX: a reset failure is a genuine fault — no retry window.
+        monkeypatch.setattr(git_coord.platform_compat, "IS_WINDOWS", False)
+        sleep_mock = AsyncMock()
+        monkeypatch.setattr(git_coord.asyncio, "sleep", sleep_mock)
+
+        calls = {"n": 0}
+
+        async def _hard_fail(work_dir, *args):
+            if args[:2] == ("reset", "--hard"):
+                calls["n"] += 1
+                raise RuntimeError("git reset --hard HEAD~1 failed: fatal: bad revision")
+            return ""
+
+        monkeypatch.setattr(git_coord, "_git", _hard_fail)
+
+        run = TaskRun(spec_path="/t.md", spec_content="s")
+        run.git_enabled = True
+        run.work_dir = "/w"
+        run.commit_hashes = ["aaa"]
+
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.git_coord"):
+            await git_coord.revert_step(run)
+
+        assert calls["n"] == 1  # no retry
+        sleep_mock.assert_not_awaited()
+        assert run.commit_hashes == ["aaa"]  # not popped
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert len(warnings) == 1
+        assert "git revert failed" in warnings[0].getMessage()
+
 
 class TestTaskNaming:
     """Tests for the task naming feature."""
@@ -4964,13 +5406,13 @@ class TestWorkspaceDirValidation:
 
 
 class TestMaxParallelStepsClamp:
-    """`compute_max_subagents` is the host-safe ceiling; a positive
+    """`compute_memory_sized_parallel_cap` is the host-safe ceiling; a positive
     `max_parallel_steps` may only lower it, never raise it above the ceiling."""
 
     def _cap(self, value):
         sessions = _make_mock_sessions()
         # Pin the computed host-safe ceiling to a known value (9).
-        with patch("kiro_crew.taskrunner.compute_max_subagents", return_value=9):
+        with patch("kiro_crew.taskrunner.compute_memory_sized_parallel_cap", return_value=9):
             runner = TaskRunner(sessions=sessions, auto_test=False, max_parallel_steps=value)
         return runner._max_parallel_steps
 
@@ -4990,7 +5432,10 @@ class TestMaxParallelStepsClamp:
 
     def test_compute_failure_falls_back_to_legacy_default(self):
         sessions = _make_mock_sessions()
-        with patch("kiro_crew.taskrunner.compute_max_subagents", side_effect=RuntimeError("boom")):
+        with patch(
+            "kiro_crew.taskrunner.compute_memory_sized_parallel_cap",
+            side_effect=RuntimeError("boom"),
+        ):
             runner = TaskRunner(sessions=sessions, auto_test=False, max_parallel_steps=0)
         # Falls back to _MAX_PARALLEL_TASKS (3) when the ceiling can't be computed.
         assert runner._max_parallel_steps == 3
@@ -5049,7 +5494,9 @@ class TestSemaphoreParallelScheduling:
         assertion would then hold even if the knob were ignored entirely, so
         without this the test proves nothing.
         """
-        monkeypatch.setattr("kiro_crew.taskrunner.compute_max_subagents", lambda _cfg: 64)
+        monkeypatch.setattr(
+            "kiro_crew.taskrunner.compute_memory_sized_parallel_cap", lambda _cfg: 64
+        )
         sessions = _make_mock_sessions()
         runner = TaskRunner(
             sessions=sessions, auto_test=False, work_dir=tmp_path, max_parallel_steps=3
@@ -5073,7 +5520,9 @@ class TestSemaphoreParallelScheduling:
         to isolate the knob. This one pins it BELOW the knob to prove the OOM
         guard still wins — the property those tests deliberately stop covering.
         """
-        monkeypatch.setattr("kiro_crew.taskrunner.compute_max_subagents", lambda _cfg: 2)
+        monkeypatch.setattr(
+            "kiro_crew.taskrunner.compute_memory_sized_parallel_cap", lambda _cfg: 2
+        )
         runner = TaskRunner(
             sessions=_make_mock_sessions(),
             auto_test=False,
@@ -5095,7 +5544,9 @@ class TestSemaphoreParallelScheduling:
         ceiling's own authority is covered by
         ``test_host_ceiling_still_caps_the_knob``.
         """
-        monkeypatch.setattr("kiro_crew.taskrunner.compute_max_subagents", lambda _cfg: 64)
+        monkeypatch.setattr(
+            "kiro_crew.taskrunner.compute_memory_sized_parallel_cap", lambda _cfg: 64
+        )
         sessions = _make_mock_sessions()
         runner = TaskRunner(
             sessions=sessions, auto_test=False, work_dir=tmp_path, max_parallel_steps=6

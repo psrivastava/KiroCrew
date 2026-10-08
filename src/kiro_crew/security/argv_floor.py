@@ -44,13 +44,15 @@ from __future__ import annotations
 
 import fnmatch
 import ipaddress
+import logging
 import os
 import re
 import socket
 import sys
 import threading
 import time
-from typing import TYPE_CHECKING, NamedTuple
+from collections.abc import Iterator
+from typing import NamedTuple
 
 # fcntl/struct drive the Linux per-interface address sweep in
 # _resolve_own_host_names_into_cache.  They are imported here at module scope to
@@ -76,10 +78,18 @@ from .host_addresses import (  # noqa: F401  (parser re-imported as a test entry
     _parse_netlink_addr_dump,
     _windows_interface_addresses,
 )
+from .hosts_file import (  # noqa: F401  (re-bound here: the seam tests monkeypatch)
+    _decoded_chunks,
+    _hosts_content_digest,
+    _hosts_content_digest_enabled,
+    _HostsFileTooLarge,
+    _HostsFileUnreadable,
+    _parse_hosts_chunks,
+)
 from .inline_payload import (
     _INLINE_DYNAMIC_EXEC_RE,
     _decoded_b64_literal_sources,
-    _inline_payload_reaches_cli,
+    _has_self_importing_inline_program,
 )
 from .shell_normalizer import (
     _AMBIGUOUS_EXPANSION_RE,
@@ -99,20 +109,16 @@ from .shell_normalizer import (
     _dequote_token,
     _ends_argv,
     _glob_could_expand_to,
-    _here_string_payload,
-    _heredoc_marker,
     _is_mint_verb,
     _is_self_program,
     _iter_shell_chars,
     _matching_close_paren,
     _nested_shell_payloads,
-    _operand_span_end,
     _program_basename,
     _push_option_matches,
     _push_token_redirection,
     _push_token_shell_read,
     _redirect_consumes_next,
-    _redirect_glue_point,
     _resolve_param_defaults,
     _shell_join_continuations,
     _shell_payload_walk,
@@ -126,9 +132,7 @@ from .shell_normalizer import (
 )
 from .vocabulary import _KILL_BY_NAME_PROGRAMS, _SELF_FILE_DELIVERY_VERBS, _SELF_NAME_RE
 
-if TYPE_CHECKING:
-    from collections.abc import Iterator
-
+logger = logging.getLogger(__name__)
 
 # ── Git publish detection (verb-anchored) ──
 # ``git push`` must be blocked, but ``push`` appearing anywhere in arbitrary
@@ -330,394 +334,6 @@ def _shell_payload_sources(text_lower: str) -> "list[str]":
     return [source for source, _tokens in _shell_payload_walk(text_lower)]
 
 
-def _stdin_redirect_carriers(tokens: list[str], start: int, stop: int) -> "Iterator[str]":
-    """Program text from the stdin REDIRECTIONS in ``tokens[start:stop]``.
-
-    One walk over a token run, yielding whatever each stdin redirection puts on this
-    interpreter's stdin.  The redirection families, from the shell grammar:
-
-    * ``<<TAG`` / ``<<-TAG`` -- a heredoc; the BODY up to the matching tag is the program.
-      An unterminated one runs to the end of the run, which over-yields, not under.
-    * ``<<<WORD`` -- a here-string; the WORD itself is the program.
-    * ``<WORD`` -- a file whose CONTENT is the program.
-    * ``< <(cmd)`` -- process substitution; the command text is visible and spans tokens
-      up to its closing paren, so it is yielded as a run.
-    * ``<&N`` -- an fd dup, which carries no text at all; a documented residual.
-
-    Walked as a RUN rather than "everything after the interpreter" because a
-    redirection may appear ANYWHERE in a simple command -- BEFORE the program name
-    (``<<'PY' python -``), after it, and GLUED TO IT with no space
-    (``python3<<<'…'``, ``python3<prog.py``), all of which are ordinary bash reaching
-    the same mint.  A token that carries a redirect
-    after some other text is therefore classified from its first ``<`` onward: the
-    text before it is the program name or an earlier operand, and the shell reads the
-    rest as the redirection.
-
-    The left-hand run is not split on a newline, so an earlier command's own stdin
-    redirect is yielded too -- the same deliberate over-block the pipe producer has,
-    and for the same reason.
-
-    A heredoc's body ends at the LAST token equal to its tag, not the first.  Bash
-    closes a heredoc only on a line that holds the delimiter ALONE, and line structure
-    does not survive tokenizing -- so a body line that merely CONTAINS the word
-    (``# EOF``, an ordinary Python comment) produced a token equal to the tag and closed
-    the body early, leaving the real payload after it unscanned.
-    The last occurrence is the delimiter that actually ends it; taking it
-    over-yields only when the tag word recurs in a LATER command, which is the safe
-    direction.
-    """
-    run = tokens[start:stop]
-    idx = 0
-    while idx < len(run):
-        raw = run[idx].strip(_SHELL_WRAPPER_CHARS)
-        if "<" in raw and not raw.startswith("<"):
-            # A redirect GLUED to a preceding word: the shell reads everything from the
-            # first `<` as the redirection, so classify that suffix. Without this the
-            # interpreter's own token was excluded from the walk and
-            # `python3<<<'import kiro_crew'` -- one word, no space -- was never scanned.
-            raw = raw[raw.index("<") :]
-        here = _here_string_payload(raw)
-        if here is not None:
-            # Checked before the heredoc branch, which would otherwise read `<<<payload`
-            # as a tag and drop the payload.
-            idx += 1
-            if not here:  # a bare `<<<` puts its word next
-                if idx >= len(run):
-                    return
-                here = run[idx].strip(_SHELL_WRAPPER_CHARS)
-                yield run[idx]
-                idx += 1
-            else:
-                yield here
-            end = _operand_span_end(run, idx, here)
-            yield from run[idx:end]
-            idx = end
-            continue
-        marker = _heredoc_marker(raw)
-        if marker is not None:
-            # Checked before the plain-redirect branch below, which would otherwise read
-            # the first `<` of `<<` as a stdin redirect.
-            idx += 1
-            if not marker:  # a bare `<<` splits its tag into the next token
-                if idx >= len(run):
-                    return
-                marker = run[idx].strip(_SHELL_WRAPPER_CHARS)
-                idx += 1
-            end = len(run)
-            for j in range(len(run) - 1, idx - 1, -1):
-                if run[j].strip(_SHELL_WRAPPER_CHARS) == marker:
-                    end = j
-                    break
-            yield from run[idx:end]
-            idx = end + 1
-            continue
-        if "<" in raw:
-            target = raw.rsplit("<", 1)[1]
-            if target.startswith("&"):
-                idx += 1  # `<&N` fd dup: nothing on the command line to match
-                continue
-            idx += 1
-            if not target:
-                if idx >= len(run):
-                    return
-                target = run[idx].strip(_SHELL_WRAPPER_CHARS)
-                yield run[idx]
-                idx += 1
-            else:
-                yield target
-            end = _operand_span_end(run, idx, target)
-            yield from run[idx:end]
-            idx = end
-            continue
-        idx += 1
-
-
-def _stdin_program_text(tokens: list[str], i: int) -> "Iterator[str]":
-    """The tokens that can carry the PROGRAM a stdin-reading ``python`` will run.
-
-    ``tokens[i]`` is an interpreter that reads its program from stdin.  The shell can
-    fill that stdin from exactly two families, and this yields those and nothing else:
-
-    * a stdin REDIRECTION -- heredoc body, here-string word, redirected file or process
-      substitution -- anywhere in the command: before the program name, after it, or
-      glued to it (:func:`_stdin_redirect_carriers`).  Walked over the WHOLE frame in ONE
-      pass, not per side of the interpreter: a marker and its body can straddle the
-      program name (``<<EOF python - … EOF``), and splitting the walk lost that
-      association entirely.  Only REDIRECT OPERANDS are
-      yielded, so a neighbouring command's ordinary argument is still never program text;
-    * a PIPE PRODUCER -- the tokens left of this interpreter, when a pipe feeds it.
-      The pipe is NOT reliably its own token: the tokenizer splits on whitespace only,
-      so ``echo '…'|python -`` glues the operator into a neighbouring word and
-      ``_program_basename`` resolves the program from the LAST control-operator
-      segment.  So the pipe is detected as a CHARACTER anywhere left of, or glued
-      into, the interpreter token, and that token's own leading segment is producer
-      text.  Requiring a standalone ``|`` token would miss all four no-space spellings
-      and let the producer's payload through.
-
-    Both families over-yield on the left: any pipe, or any earlier command's own stdin
-    redirect, qualifies.  That is the safe direction -- a missed carrier is a bypass,
-    an extra token is only a visible refusal (pinned by a test).
-
-    Everything else in the frame is another command's argv.  Scanning THAT is the
-    defect: a frame is not split on a newline, so an unrelated neighbour that
-    merely names this package in a FILE PATH (``isort src/kiro_crew/mcp_core.py``
-    followed by any ``python - <<'PY' … PY``) makes a harmless heredoc read as a
-    credential mint -- with no ``token`` word anywhere in the command.
-
-    Yields lazily so the caller's ``any()`` short-circuits: the cost stays O(frame)
-    per interpreter token, the same bound the frame-wide scan had.
-    """
-    # A PIPE PRODUCER writes this interpreter's stdin, so its argv IS program text.
-    glued_head, pipe_glued, _ = tokens[i].strip(_SHELL_WRAPPER_CHARS).rpartition("|")
-    if pipe_glued or any("|" in t for t in tokens[:i]):
-        yield from tokens[:i]
-        if pipe_glued:
-            yield glued_head
-    yield from _stdin_redirect_carriers(tokens, 0, len(tokens))
-
-
-def _has_self_importing_inline_program(
-    tokens: list[str], i: int, decoded_literals: "tuple[tuple[str, str], ...]" = ()
-) -> bool:
-    """True if ``tokens[i]`` is an interpreter given a ``-c`` payload that imports this package.
-
-    Separate from ``_is_self_module_invocation`` because the two answer different questions.
-    That one asks "does this argv run our code?", which admits ``-m`` and ``-c`` alike and is
-    the right input to a verb-gated decision. This one asks "is the code inline?", which is the
-    case where the verb gate cannot hold: an inline payload can append to ``sys.argv``, call
-    ``main(['token'])``, or reach the token-minting function directly, so no argv word has to
-    say ``token``.
-
-    Only the interpreter's own inline-program operand counts — the separate (``-c PAYLOAD``)
-    and attached (``-cPAYLOAD``) spellings. A later positional that happens to mention the
-    import name is data for whatever the payload does with it, not code we are about to run.
-
-    The STDIN forms are the same escape without an operand: ``python -`` (and a bare ``python``
-    with no script) read the program from stdin, so a ``python - <<'PY' … PY`` heredoc or an
-    ``echo '…' | python -`` pipe reaches the CLI with the payload nowhere in argv. When that
-    program text is visible on the command line, matching the import is the same fail-closed
-    decision as for ``-c`` — but it is matched only in the tokens that actually CARRY that
-    program (see :func:`_stdin_program_text`), not anywhere in the frame. When it is NOT
-    visible (a bare ``python -`` fed by an unseen producer) there is nothing to match and the
-    gate cannot see it; that residual is noted, not silently claimed as covered.
-    """
-    if not _PYTHON_PROGRAM_RE.match(_shell_normalizer._program_basename(tokens[i])):
-        return False
-    later_tokens = tokens[i + 1 :]
-    glued = tokens[i].strip(_SHELL_WRAPPER_CHARS)
-    if "<" in glued:
-        # A redirect GLUED to the program name is still this command's redirect, and the
-        # detector only ever saw the tokens AFTER the interpreter -- so `python<<EOF … EOF`
-        # had no marker in view and its body read as a script path. Hand the suffix over as
-        # its own token.
-        later_tokens = [glued[glued.index("<") :], *later_tokens]
-    # STDIN program: the text is not an operand of this interpreter — the shell fills stdin from
-    # a heredoc body, a redirected file, or a pipe producer — so the search space is those
-    # carriers rather than this position's operands. `_python_reads_stdin` is precise so this
-    # does not fire for `python script.py`, `python -c …`, or `python -m …`.
-    if _python_reads_stdin(later_tokens):
-        # The carriers arrive whitespace-split -- a heredoc body is one word per token --
-        # so a statement spanning several words (``from kiro_crew.x import generate_token``)
-        # is only legible with the carrier tokens read together.  Joined with a NEWLINE:
-        # the one joiner under which an import statement is still seen at a statement
-        # start while a path inside a string never becomes one.  Only LEADING wrappers
-        # come off, for the reason the ``-c`` payload below states in full.
-        program = "\n".join(t.lstrip(_SHELL_WRAPPER_CHARS) for t in _stdin_program_text(tokens, i))
-        if program and _inline_payload_reaches_cli(program, decoded_literals):
-            return True
-    expect_payload = False
-    skip_next = False
-    for later in later_tokens:
-        # The PAYLOAD is matched RAW, not through `_normalize_operand`. That helper truncates at
-        # the first control operator, which is correct for an operand the shell will split — but
-        # a `-c` payload is a quoted program, so its `;` is Python, not a command separator.
-        # Normalising `"import sys; ...; from kiro_crew.cli import main; main()"` down to
-        # `import sys` hid the import entirely and let the bypass through.  Only LEADING
-        # wrapper characters come off: a payload's own closing quote and paren are its
-        # last characters, and stripping them leaves the final string literal
-        # unterminated, so ``__import__('kiro_' 'crew.cli')`` reads as ``'kiro_' 'crew.cli``
-        # and the fold that joins the two pieces never fires.
-        raw = later.lstrip(_SHELL_WRAPPER_CHARS)
-        if expect_payload:
-            if _inline_payload_reaches_cli(raw, decoded_literals):
-                return True
-            expect_payload = False
-            continue
-        # The FLAG itself is a plain token, so it is safe (and more accurate) to normalise.
-        stripped = _shell_normalizer._normalize_operand(later).strip("\"'")
-        if skip_next:
-            skip_next = False
-            continue  # value consumed by an operand-taking flag (`-X dev`)
-        if stripped in _PYTHON_INLINE_PROGRAM_FLAGS:
-            expect_payload = True
-            continue
-        if len(raw) > 2 and raw[:2] in _PYTHON_INLINE_PROGRAM_FLAGS:
-            if _inline_payload_reaches_cli(raw, decoded_literals):
-                return True
-        if stripped in _PYTHON_OPERAND_FLAGS:
-            skip_next = True
-            continue
-        if len(stripped) > 2 and stripped[:2] in _PYTHON_OPERAND_FLAGS:
-            continue  # attached operand, e.g. `-Xdev`
-        # Only interpreter flags precede a `-c` operand. The first token that is neither a flag
-        # nor a flag's operand is the interpreter's own positional (a script path or `-`), and
-        # nothing after it is a `-c` payload — so stop, rather than scan the rest of the frame.
-        # Without this bail the loop was O(tokens) for EACH python token, i.e. O(n²) on a
-        # `python open python open …` spam input, which the ReDoS-resistance test caught.
-        if not stripped.startswith("-"):
-            break
-    return False
-
-
-def _python_reads_stdin(later_tokens: list[str]) -> bool:
-    """True if this ``python`` invocation runs its PROGRAM from stdin (a script/module does not).
-
-    CPython reads its program from stdin for a bare interpreter (no positional) or an explicit
-    ``-`` argument; ``-c CODE``, ``-m MOD``, and ``FILE`` all supply the program elsewhere.
-    Walks the argument stream the way ``_is_self_module_invocation`` does so the corner cases
-    line up: an operand-taking flag consumes its value (``-X dev`` — ``dev`` is not a script),
-    a heredoc (the ``<<TAG`` marker, its BODY and the closing tag) is not an argument, and a
-    pipe/redirect token ends this command's own arguments.
-
-    The heredoc structure is read off the RAW token via :func:`_heredoc_marker`, because
-    ``_normalize_operand`` strips a redirection to the empty string — which would leave the
-    heredoc branch here unreachable and have ``python << 'PY' … PY`` (no ``-``) report FALSE,
-    reading the first word of the BODY as a script path.  A redirect OPERAND is consumed
-    through :func:`_operand_span_end` for the same reason the carrier scan uses it: a
-    substitution operand is one shell WORD over several tokens, and skipping only the first
-    leaves ``python <<< $(printf …)`` reading ``%s`` as a script path.  The two
-    functions share that helper so the detector and the carrier scope agree on where
-    an operand ends.
-    """
-    skip_next = False
-    heredoc_tag: str | None = None
-    expect_tag = False
-    idx = 0
-    while idx < len(later_tokens):
-        tok = later_tokens[idx]
-        idx += 1
-        raw = tok.strip(_SHELL_WRAPPER_CHARS)
-        if heredoc_tag is not None:
-            # The body is program text on stdin, not an argument, and its CLOSING TAG
-            # ends this command: the tokenizer drops the newline that follows, so
-            # whatever comes after the tag belongs to the NEXT command. Reading it as
-            # this interpreter's positional made `python <<PY … PY; echo ok` report
-            # "runs a script named echo" and skipped the whole branch, so the heredoc's
-            # payload went unscanned. The heredoc has
-            # already supplied the program, so the answer here is simply True.
-            if raw == heredoc_tag:
-                return True
-            continue
-        if expect_tag:
-            expect_tag = False
-            heredoc_tag = raw
-            continue
-        here = _here_string_payload(raw)
-        if here is not None:
-            # A here-string supplies the program on stdin exactly as a heredoc does; its
-            # operand is a redirect word, never this interpreter's positional -- and the
-            # WHOLE operand, which a substitution spreads over several tokens.
-            if not here:  # a bare `<<<` puts its word in the next token
-                if idx >= len(later_tokens):
-                    break
-                here = later_tokens[idx].strip(_SHELL_WRAPPER_CHARS)
-                idx += 1
-            idx = _operand_span_end(later_tokens, idx, here)
-            continue
-        marker = _heredoc_marker(raw)
-        if marker is not None:
-            if marker:
-                heredoc_tag = marker
-            else:
-                expect_tag = True  # a bare `<<` splits its tag into the next token
-            continue
-        # Scanned on a form that keeps the SUBSTITUTION delimiters. `raw` has had
-        # `_SHELL_WRAPPER_CHARS` stripped, and those include `(` and `)` -- so the word
-        # `2>$(` (the tokenizer splits on the space inside `$( (true); printf x)`) arrived
-        # here as `2>$`, with the opener gone. The scan then saw an ordinary one-character
-        # target, never entered a substitution, and the tail of the substitution was read
-        # as a script path, putting the stdin program back out of view. Quotes still come
-        # off, since a quoted redirect is still a redirect.
-        redirect_word = tok.strip("\"'")
-        glue = _redirect_glue_point(redirect_word)
-        if glue is not None:
-            # The redirect rides on the back of another word (`-u>`). Split it and let the
-            # loop read both halves, so the part BEFORE the redirect is classified by the
-            # same flag/positional branches as any other word -- `-u` continues the scan,
-            # `script.py` ends it. Once per word, since neither half can split again.
-            later_tokens = [
-                *later_tokens[:idx],
-                redirect_word[:glue],
-                redirect_word[glue:],
-                *later_tokens[idx:],
-            ]
-            continue
-        redirect = _shell_normalizer._output_redirect_scan(redirect_word)
-        if redirect is not None:
-            # An OUTPUT redirect and its target are not this command's arguments and say
-            # nothing about where the program comes from, so the walk steps over both and
-            # keeps looking, as for a stdin redirect. Falling through read the leftover
-            # digits of `2>&1` as a script path, so `python 2>&1 <<< '<program>'` went unscanned.
-            redirect_target, position = redirect
-            # A chain of output redirects glued into ONE word (`>a>a>a...`) is walked
-            # here, in place, to stay linear in the word length on a floor that runs
-            # for every command.
-            while position < len(redirect_word):
-                further = _shell_normalizer._output_redirect_scan(redirect_word, position)
-                if further is None:
-                    break
-                redirect_target, position = further
-            remainder = redirect_word[position:]
-            if remainder:
-                # What is left starts with a STDIN operator (`2>/dev/null<<EOF`), which
-                # the branches above know how to read. Hand it back as its own token --
-                # once per word, not once per operator -- because swallowing it loses the
-                # heredoc and with it the program on stdin.
-                later_tokens = [*later_tokens[:idx], remainder, *later_tokens[idx:]]
-            elif not redirect_target:
-                if idx >= len(later_tokens):
-                    break
-                redirect_target = later_tokens[idx].strip(_SHELL_WRAPPER_CHARS)
-                idx += 1
-            if redirect_target:
-                idx = _operand_span_end(later_tokens, idx, redirect_target)
-            continue
-        if "<" in raw:
-            # A stdin REDIRECT and its operand are not this command's arguments either,
-            # and the redirect is what supplies the program: `python < prog.py` reads its
-            # program from that file. The earlier walk stopped at the redirect and then
-            # read the operand as a script path, so `python3 < $(printf …)` answered False.
-            target = raw[raw.index("<") :].rsplit("<", 1)[1]
-            if not target:
-                if idx >= len(later_tokens):
-                    break
-                target = later_tokens[idx].strip(_SHELL_WRAPPER_CHARS)
-                idx += 1
-            idx = _operand_span_end(later_tokens, idx, target)
-            continue
-        norm = _shell_normalizer._normalize_operand(tok).strip("\"'")
-        if skip_next:
-            skip_next = False
-            continue  # value consumed by an operand-taking flag (`-X dev`)
-        if not norm:
-            continue
-        if norm.startswith("<") or norm.startswith("|"):
-            break  # a redirect/pipe boundary ends this command's argument list
-        if norm == "-":
-            return True
-        if norm in _PYTHON_INLINE_PROGRAM_FLAGS or norm.startswith("-m") or norm.startswith("-c"):
-            return False  # `-c`/`-m` supply the program, not stdin
-        if norm in _PYTHON_OPERAND_FLAGS:
-            skip_next = True
-            continue
-        if len(norm) > 2 and norm[:2] in _PYTHON_OPERAND_FLAGS:
-            continue  # attached operand, e.g. `-Xdev`
-        if norm.startswith("-"):
-            continue  # an ordinary interpreter flag
-        return False  # a positional that is not `-` is a script path
-    return True  # nothing but flags → bare interpreter reads stdin
-
-
 # ── Self-protection floor short-circuit (perf) ──
 # The floor predicates below re-tokenize the command and descend every nested
 # shell payload (`_self_token_frames`), which is where the cost of the deny
@@ -831,6 +447,13 @@ def _is_credential_mint(text_lower: str, *, raw_text: "str | None" = None) -> bo
     decoded_literals = _decoded_b64_literal_sources(submitted)
     for tokens in _self_token_frames(text_lower):
         programs = _argv_programs(tokens)
+        # The command-level half of ``_data_consumer_exempt`` reads only *tokens*, so its
+        # answer is the same for every token in this frame.  Held here and computed at
+        # most once per FRAME rather than once per trigger token: that half contains an
+        # O(len(tokens)) sweep, so re-asking it per trigger token makes the floor
+        # quadratic in the trigger count.  ``None`` until the first trigger token needs
+        # it, so a frame carrying none pays nothing.
+        disqualified: "bool | None" = None
         for i, token in enumerate(tokens):
             # AN INLINE PROGRAM THAT NAMES THE MINT SURFACE IS DENIED WITHOUT NEEDING THE VERB
             # AS AN ARGV WORD, and it is checked FIRST because it does not depend on the
@@ -852,7 +475,9 @@ def _is_credential_mint(text_lower: str, *, raw_text: "str | None" = None) -> bo
                 continue
             # The name is an ARGUMENT of a command that treats arguments as data
             # (``echo <name> <verb>`` prints two words) -- a mention, not a mint.
-            if _data_consumer_exempt(i, token, programs, tokens):
+            if disqualified is None:
+                disqualified = _shell_normalizer._data_consumer_command_disqualified(tokens)
+            if _data_consumer_exempt(i, token, programs, tokens, command_disqualified=disqualified):
                 continue
             # A program token ending with an operator (``kirocrew;``) is NOT skipped: the
             # quotes are already off these tokens, so ``'/tmp/kirocrew;' token`` (a symlink
@@ -1241,11 +866,15 @@ def _is_self_kill(text_lower: str) -> bool:
         return False
     for tokens in _self_token_frames(text_lower):
         programs = _argv_programs(tokens)
+        # Once per FRAME, not once per trigger token: see ``_is_credential_mint``.
+        disqualified: "bool | None" = None
         for i, token in enumerate(tokens):
             if not _is_kill_by_name_program(token):
                 continue
             # ``echo pkill kirocrew`` prints two words; it does not kill anything.
-            if _data_consumer_exempt(i, token, programs, tokens):
+            if disqualified is None:
+                disqualified = _shell_normalizer._data_consumer_command_disqualified(tokens)
+            if _data_consumer_exempt(i, token, programs, tokens, command_disqualified=disqualified):
                 continue
             # A program token ending with an operator (``pkill;``) is NOT skipped: the
             # quotes are already off, so ``'pkill;' -f kirocrew`` (a symlink literally so
@@ -1526,12 +1155,23 @@ def _matches_self_subcommand(text_lower: str, spec: "tuple[object, ...]") -> boo
         programs = _argv_programs(tokens)
         # Once per FRAME, not once per token, to keep the floor linear in token count.
         scan = _self_module_flag_scan(tokens)
+        # Same reason, for the command-level half of ``_data_consumer_exempt``: see
+        # ``_is_credential_mint``.
+        disqualified: "bool | None" = None
         for i in range(len(tokens)):
             prog_idx = _self_program_index(tokens, i, scan)
             if prog_idx is None:
                 continue
             # ``echo kirocrew restart`` / ``echo python -m kiro_crew restart`` print words.
-            if _data_consumer_exempt(prog_idx, tokens[prog_idx], programs, tokens):
+            if disqualified is None:
+                disqualified = _shell_normalizer._data_consumer_command_disqualified(tokens)
+            if _data_consumer_exempt(
+                prog_idx,
+                tokens[prog_idx],
+                programs,
+                tokens,
+                command_disqualified=disqualified,
+            ):
                 continue
             if _operands_lead_with(_self_cli_operands(tokens, prog_idx), spec):
                 return True
@@ -1778,68 +1418,307 @@ def _hosts_file_paths() -> "tuple[str, ...]":
 # falls through to the async DNS revalidation path, whose resolver reads the
 # real (untruncated) hosts database.
 _HOSTS_FILE_READ_CAP = 4 * 1024 * 1024
+# Characters read per chunk of that bounded read (GIL hold per chunk).  A
+# file no larger than one chunk is also small enough for the gate path to
+# parse in the same call on a miss: a typical file in well under a
+# millisecond, one at the cap in a few.
+_HOSTS_FILE_READ_CHUNK = 64 * 1024
 
 
-# path -> ((mtime, size, published), {name -> maps-to-local}) — reparsed when
-# the file changes or netlink publication flips.  Unlocked by design: a racing
-# double-parse writes the same value; the dict swap is atomic under the GIL.
-_HOSTS_FILE_CACHE: "dict[str, tuple[tuple[float, int, bool], dict[str, bool]]]" = {}
+# path -> (key, {name -> maps-to-local}), key = (mtime, ctime, size, content
+# digest or None, published, own set).  Background threads parse
+# (``_warm_hosts_file_cache``).  On a miss the gate path parses in the
+# same call only a file no larger than one read chunk; a larger file
+# answers pending and schedules one warm thread.
+# A changed file, publication or own-address set is a new key, so an own
+# address learned later re-marks an alias.  Two threads
+# (the enrichment worker and the on-demand warm) may parse at once without a
+# lock: each publishes a complete table in one dict assignment, and only for
+# the key it was judged by, so the worst case is a duplicated parse (last
+# write wins), never a half-built or stale table.
+_HostsKey = tuple[float, float, int, "bytes | None", bool, frozenset[str]]
+_HOSTS_FILE_CACHE: "dict[str, tuple[_HostsKey, dict[str, bool]]]" = {}
+# Single-flight latch for the on-demand warm the gate path schedules.
+_HOSTS_WARM_LOCK = threading.Lock()
+_HOSTS_WARM_IN_FLIGHT = False
 
 
-def _hosts_file_verdict(host: str) -> "bool | None":
-    """Hosts-file verdict: True local, False remote, None absent/deferred.
+def _read_hosts_bytes(path: str, limit: int, *, strict: bool) -> bytes:
+    """At most *limit* bytes of *path*, read one chunk at a time.
 
-    This is the round-18 attack vector itself — a hosts-file alias for a
-    loopback/local address — answered by a LOCAL file read: no DNS, no
-    resolver thread, no event-loop concern, and a same-call verdict where
-    the async layer can only fail closed or revalidate later.  A name on
-    several lines is local if ANY of them maps local (deny-floor direction).
+    *strict* raises ``_HostsFileTooLarge`` when the file holds more than
+    *limit* (the gate's in-call cap); otherwise the read stops at *limit*,
+    the truncation described at ``_HOSTS_FILE_READ_CAP``.
+    """
+    parts: "list[bytes]" = []
+    remaining = limit
+    with open(path, "rb") as fh:
+        while remaining > 0:
+            chunk = fh.read(min(_HOSTS_FILE_READ_CHUNK, remaining))
+            if not chunk:
+                break
+            parts.append(chunk)
+            remaining -= len(chunk)
+        if strict and remaining <= 0 and fh.read(1):
+            raise _HostsFileTooLarge(path)
+    return b"".join(parts)
+
+
+def _hosts_file_key(path: str) -> "_HostsKey":
+    """Cache key for *path*: stat identity, content digest, and the own-address state.
+
+    A same-size rewrite that restores mtime must still be a new key.  On
+    POSIX ``st_ctime`` catches it: any write or chmod sets ctime, and no
+    extra read is done (the digest field is None).  On Windows
+    ``st_ctime`` is creation time and catches nothing, so for a file no
+    larger than one read chunk the key also carries a blake2b digest of
+    that file, from one read bounded by the chunk size; a read that fails
+    or finds more than a chunk raises ``_HostsFileUnreadable``.  A Windows
+    file over one chunk keeps digest None and is never cached or served:
+    its content cannot be verified without a gate read past the chunk, so
+    ``_hosts_file_verdict`` answers every dotless name pending.  The last
+    two fields are the publication flag and the own set.
+    """
+    stat = os.stat(path)
+    digest: "bytes | None" = None
+    if _hosts_content_digest_enabled() and stat.st_size <= _HOSTS_FILE_READ_CHUNK:
+        try:
+            data = _read_hosts_bytes(path, _HOSTS_FILE_READ_CHUNK, strict=True)
+        except (OSError, _HostsFileTooLarge) as exc:
+            raise _HostsFileUnreadable(path) from exc
+        digest = _hosts_content_digest(data)
+    return (
+        stat.st_mtime,
+        stat.st_ctime,
+        stat.st_size,
+        digest,
+        _NETLINK_ADDRS_PUBLISHED,
+        _own_host_names(),
+    )
+
+
+def _parse_hosts_file(
+    path: str,
+    own: "frozenset[str]",
+    limit: "int | None" = None,
+    content: "bytes | None" = None,
+) -> "dict[str, bool]":
+    """``{name -> maps-to-local}`` for *path*, judged against the own set *own*.
+
+    *limit* bounds the read itself, in bytes: the gate passes it so a file
+    replaced by a larger one after its stat is never read past the in-call
+    cap on the event loop, and raises ``_HostsFileTooLarge`` instead.
+    *content*, when given, is parsed instead of reading *path*: the bytes
+    already read and hashed for a digest key, so the table is built from
+    exactly the content its key names.
+    """
+    if content is None and limit is not None:
+        content = _read_hosts_bytes(path, limit, strict=True)
+    if content is not None:
+        return _parse_hosts_chunks(_decoded_chunks(content, _HOSTS_FILE_READ_CHUNK), own)
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        # Bounded read (the repo-wide handle-iteration guard, and a real
+        # cap): see _HOSTS_FILE_READ_CAP for the overflow degradation path.
+        # Read in chunks; see _parse_hosts_chunks for why and how edges join.
+        def _read_chunks() -> "Iterator[str]":
+            remaining = _HOSTS_FILE_READ_CAP
+            while remaining > 0:
+                chunk = fh.read(min(_HOSTS_FILE_READ_CHUNK, remaining))
+                if not chunk:
+                    return
+                remaining -= len(chunk)
+                yield chunk
+
+        return _parse_hosts_chunks(_read_chunks(), own)
+
+
+def _parse_and_cache_for_key(
+    path: str,
+    key: "_HostsKey",
+    limit: "int | None" = None,
+) -> "dict[str, bool] | str":
+    """Parse *path* against *key*'s own set; cache and return it if *key* still holds.
+
+    Callers must first rule the key verifiable (``_unverifiable_hosts_file``):
+    a Windows key for a file over one chunk carries no digest and is never
+    parsed or cached here.
+
+    Returns the table, or a status string when nothing was cached:
+    ``"changed"`` when the key moved mid-parse (the enrichment worker can
+    publish the address table or grow the own set, and a table built across
+    that change could mark an alias for the new address remote),
+    ``"too-large"`` when the file holds more than *limit*, and ``"failed"``
+    when it could not be read or decoded.  A failed parse is never cached,
+    so the next gate call reads again; the gate answers it pending (fail
+    closed), since a hosts-file alias for this machine cannot be ruled out
+    while the file cannot be read.  May raise OSError from the second stat.
+
+    When *key* carries a digest (Windows), the bytes are read once, hashed,
+    and parsed from that same buffer, so the digest names exactly the
+    content the table came from; a digest that differs from *key*'s is
+    ``"changed"``.
+    """
+    try:
+        if key[3] is not None:
+            cap = _HOSTS_FILE_READ_CAP if limit is None else limit
+            data = _read_hosts_bytes(path, cap, strict=limit is not None)
+            if _hosts_content_digest(data) != key[3]:
+                return "changed"
+            table = _parse_hosts_file(path, key[-1], limit=limit, content=data)
+        else:
+            table = _parse_hosts_file(path, key[-1], limit=limit)
+    except _HostsFileTooLarge:
+        return "too-large"
+    except (OSError, ValueError):
+        return "failed"
+    try:
+        if _hosts_file_key(path) != key:
+            return "changed"
+    except _HostsFileUnreadable:
+        return "changed"
+    _HOSTS_FILE_CACHE[path] = (key, table)
+    return table
+
+
+def _unverifiable_hosts_file(key: "_HostsKey") -> bool:
+    """True for a Windows file over one chunk: no digest, so its content cannot be checked."""
+    return key[3] is None and _hosts_content_digest_enabled()
+
+
+def _warm_hosts_file_cache() -> None:
+    """Parse the hosts file(s) for the current key, off the gate path.
+
+    One parse per path per call (``_parse_and_cache_for_key``).  A changed
+    key caches nothing; the gate keeps answering pending for a file over the
+    in-call cap, and the next pass, or the next gate miss, retries.  An
+    up-to-date table costs a stat and an own-set read (plus, on Windows, a
+    bounded read and hash).  A Windows file over one chunk is skipped: the
+    gate never serves its table.  Best-effort.
     """
     for path in _hosts_file_paths():
         try:
-            stat = os.stat(path)
-            key = (stat.st_mtime, stat.st_size, _NETLINK_ADDRS_PUBLISHED)
+            key = _hosts_file_key(path)
+            if _unverifiable_hosts_file(key):
+                continue
             cached = _HOSTS_FILE_CACHE.get(path)
-            if cached is None or cached[0] != key:
-                table: "dict[str, bool]" = {}
-                with open(path, encoding="utf-8", errors="replace") as fh:
-                    # Bounded read (the repo-wide handle-iteration guard, and
-                    # a real cap): see _HOSTS_FILE_READ_CAP for the overflow
-                    # degradation path.
-                    for line in fh.read(_HOSTS_FILE_READ_CAP).splitlines():
-                        fields = line.partition("#")[0].split()
-                        if len(fields) < 2:
-                            continue
-                        addr = fields[0].split("%", 1)[0]
-                        try:
-                            ip: ipaddress.IPv4Address | ipaddress.IPv6Address = (
-                                ipaddress.ip_address(addr)
-                            )
-                        except ValueError:
-                            continue
-                        mapped = getattr(ip, "ipv4_mapped", None)
-                        if mapped is not None:
-                            ip = mapped
-                        local = (
-                            ip.is_loopback
-                            or ip.is_unspecified
-                            or str(ip).lower() in _own_host_names()
-                        )
-                        for name in fields[1:]:
-                            lowered = name.lower()
-                            table[lowered] = table.get(lowered, False) or local
-                cached = (key, table)
-                _HOSTS_FILE_CACHE[path] = cached
-            verdict = cached[1].get(host)
-            if verdict is False and not _NETLINK_ADDRS_PUBLISHED:
-                # Not-local is untrustworthy while the own-address set
-                # is incomplete: defer to the async verdict layer.
-                verdict = None
-            if verdict is not None:
-                return verdict
+            if cached is not None and cached[0] == key:
+                continue
+            _parse_and_cache_for_key(path, key)
+        except Exception:
+            continue
+
+
+def _hosts_file_warm_worker() -> None:
+    """Thread body for the on-demand warm; clears the single-flight latch."""
+    global _HOSTS_WARM_IN_FLIGHT
+    try:
+        _warm_hosts_file_cache()
+    finally:
+        with _HOSTS_WARM_LOCK:
+            _HOSTS_WARM_IN_FLIGHT = False
+
+
+def _schedule_hosts_file_warm() -> None:
+    """Start one background warm unless one is already running.  Never blocks."""
+    global _HOSTS_WARM_IN_FLIGHT
+    with _HOSTS_WARM_LOCK:
+        if _HOSTS_WARM_IN_FLIGHT:
+            return
+        _HOSTS_WARM_IN_FLIGHT = True
+    try:
+        threading.Thread(
+            target=_hosts_file_warm_worker, name="kirocrew-hosts-warm", daemon=True
+        ).start()
+    except Exception:
+        # A thread that cannot start leaves the latch clear so a later
+        # check retries; this check still answers pending (deny).
+        with _HOSTS_WARM_LOCK:
+            _HOSTS_WARM_IN_FLIGHT = False
+
+
+def _hosts_file_verdict(host: str) -> "bool | None":
+    """Hosts-file verdict: True local or pending, False remote, None absent/deferred.
+
+    This is the round-18 attack vector itself — a hosts-file alias for a
+    loopback/local address — answered from the table cached for the file's
+    current key.  Per call the gate stats each file (on Windows, also one
+    bounded read and hash of a file no larger than one chunk; a miss adds
+    two more, for the parse and its key re-check) and reads the
+    own-address set (twice when a remote entry is served: once for the
+    key, once to confirm it at return; each read is one lock round-trip
+    while enrichment is incomplete or due a refresh).  When a path has no
+    table for its current key (first check after start, file edited, own
+    addresses changed), a file no larger than one read chunk is parsed in
+    this call, so a cold dotless target still gets a
+    same-call verdict; that read is itself bounded by the chunk size, so a
+    file replaced by a larger one after the stat stops at the cap and is
+    pending.  A read that fails caches nothing and is pending too (fail
+    closed, where main allowed): the next call reads again, inline for a
+    small file and by re-scheduling the warm for a large one, so the
+    refusal lasts only while the file cannot be read.  A larger file is
+    not parsed here: the answer is True, a pending refusal, checked before
+    any path's verdict is used, and one single-flight warm thread is
+    started; the same command succeeds once the warm lands.
+
+    A same-size rewrite that restores mtime is a new key: on POSIX through
+    ``st_ctime``, with no extra read; on Windows, where ``st_ctime`` is
+    creation time, through a content digest taken on every call from one
+    read bounded by the chunk size, for a file no larger than one chunk.
+    A Windows file over one chunk cannot be verified without reading past
+    that bound, so every dotless name is pending there (True), with no
+    stale window; the refusal note tells the agent to use the full
+    hostname or an IP address.  An in-call parse whose key changed
+    while it ran is also pending.  A remote answer is given
+    only if publication and the own set still match the table's key at the
+    moment of return.  A name on several lines is local if ANY of them maps
+    local (deny-floor direction).
+    """
+    tables: "list[tuple[_HostsKey, dict[str, bool]]]" = []
+    for path in _hosts_file_paths():
+        try:
+            key = _hosts_file_key(path)
+        except _HostsFileUnreadable:
+            _schedule_hosts_file_warm()
+            return True
         except OSError:
             continue
-    return None
+        if _unverifiable_hosts_file(key):
+            return True
+        cached = _HOSTS_FILE_CACHE.get(path)
+        if cached is None or cached[0] != key:
+            if key[2] > _HOSTS_FILE_READ_CHUNK:
+                # Every call on an uncached key re-schedules the warm, so a
+                # retry does not hang on one thread that failed to start.
+                _schedule_hosts_file_warm()
+                return True
+            try:
+                result = _parse_and_cache_for_key(path, key, limit=_HOSTS_FILE_READ_CHUNK)
+            except OSError:
+                result = "changed"
+            if isinstance(result, str):
+                _schedule_hosts_file_warm()
+                return True
+            cached = (key, result)
+        tables.append(cached)
+    remote = []
+    for key, table in tables:
+        verdict = table.get(host)
+        if verdict is True:
+            return True
+        if verdict is False:
+            remote.append(key)
+    if not remote:
+        return None
+    # The worker may have published or grown the own set since the key was
+    # read; a not-local entry judged by the older state is not served.
+    own_state = (_NETLINK_ADDRS_PUBLISHED, _own_host_names())
+    if any((key[-2], key[-1]) != own_state for key in remote):
+        _schedule_hosts_file_warm()
+        return True
+    # Not-local counts only when judged after publication; while the
+    # own-address set is incomplete it defers to the async verdict layer.
+    # (Every remote key's publication bit equals own_state[0] here.)
+    return False if own_state[0] else None
 
 
 def _resolved_host_verdict(host: str, *, fail_closed: bool = True) -> bool:
@@ -2194,6 +2073,52 @@ _NETLINK_ADDRS_PUBLISHED: bool = not (
 )
 
 
+def warm_own_host_names() -> None:
+    """Start the own-address enrichment worker now instead of at the first ssh.
+
+    Without it the first IP-literal ssh check of a process is what starts the
+    worker, and that check sees the still-unpublished flag in the same instant,
+    so it is always refused.  The worker reads the netlink table before any DNS
+    lookup and publishes it at once.  This only runs the synchronous seed and
+    schedules the worker; the gateway startup hook calls it through
+    ``asyncio.to_thread`` so the seed stays off the event loop.
+    """
+    _own_host_names()
+
+
+def _publish_netlink_addresses(addrs: "set[str]") -> None:
+    """Merge the netlink table into the own-name cache, THEN open the window.
+
+    The order is load-bearing: flipping ``_NETLINK_ADDRS_PUBLISHED`` before
+    the addresses are in the cache would let a concurrent check see the
+    window open while an own secondary IP is still missing from the set,
+    and admit it.
+    """
+    global _OWN_HOST_NAMES_CACHE, _NETLINK_ADDRS_PUBLISHED
+    with _OWN_HOST_RESOLVE_LOCK:
+        base = _OWN_HOST_NAMES_CACHE if _OWN_HOST_NAMES_CACHE is not None else _own_host_seed()
+        _OWN_HOST_NAMES_CACHE = base | frozenset(a for a in addrs if a)
+        _NETLINK_ADDRS_PUBLISHED = True
+
+
+# Consecutive worker passes whose netlink dump did not complete.  A host
+# where every dump fails keeps IP-literal ssh refused for good, so the third
+# miss in a row logs one warning an operator can find.
+_NETLINK_MISSES = 0
+_NETLINK_MISS_WARN_AT = 3
+
+
+def _note_netlink_result(ok: bool) -> None:
+    global _NETLINK_MISSES
+    _NETLINK_MISSES = 0 if ok else _NETLINK_MISSES + 1
+    if _NETLINK_MISSES == _NETLINK_MISS_WARN_AT:
+        logger.warning(
+            "own-address netlink read has not completed in %d attempts; ssh/scp/sftp/rsync "
+            "to IP-literal targets stays refused until it does",
+            _NETLINK_MISSES,
+        )
+
+
 def _resolve_own_host_names() -> "tuple[frozenset[str], bool]":
     """Resolve this machine's own hostname/FQDN/addresses (lowered).
 
@@ -2207,6 +2132,30 @@ def _resolve_own_host_names() -> "tuple[frozenset[str], bool]":
     """
     names: set[str] = set(_own_host_seed())
     complete = True
+    # The netlink RTM_GETADDR dump lists EVERY assigned address (secondary
+    # IPv4s the SIOCGIFADDR sweep cannot see).  Its recv blocks, so it lives
+    # here in the worker.  Unlike the sweeps below it is LOAD-BEARING: the
+    # IP-literal window stays closed until it publishes, so an empty pass on
+    # a netlink-capable host keeps ``complete`` False and the backoff retry
+    # alive rather than caching a table-less process for its lifetime.
+    #
+    # It runs FIRST and publishes at once: it is a kernel-local read, while
+    # the DNS lookups below can take many seconds on a host whose name is not
+    # in DNS, and every IP-literal ssh is refused until this publishes.
+    nl = _linux_netlink_addresses()
+    if nl:
+        _note_netlink_result(True)
+        names |= nl
+        _publish_netlink_addresses(nl)
+    elif sys.platform.startswith("linux") and hasattr(socket, "AF_NETLINK"):
+        complete = False
+        _note_netlink_result(False)
+    # Parse the hosts file now, before the DNS lookups below (which can take
+    # seconds), with or without a netlink dump: until a table is cached a
+    # dotless ssh target is parsed for in the gate call (small file) or
+    # refused as pending (large file).  The pass re-warms after the
+    # DNS merge, which re-parses only if DNS added an own address.
+    _warm_hosts_file_cache()
     try:
         fqdn = socket.getfqdn().strip().lower()
         if fqdn and fqdn != "localhost":
@@ -2232,19 +2181,6 @@ def _resolve_own_host_names() -> "tuple[frozenset[str], bool]":
     # enrichment, and a host with no IPv6 route is not a partial pass -- so this
     # never touches ``complete`` (and the helper is best-effort, never raising).
     names |= _own_interface_addresses()
-    # The netlink RTM_GETADDR dump lists EVERY assigned address (secondary
-    # IPv4s the SIOCGIFADDR sweep cannot see).  Its recv blocks, so it lives
-    # here in the worker.  Unlike the sweeps above it is LOAD-BEARING: the
-    # IP-literal window stays closed until it publishes, so an empty pass on
-    # a netlink-capable host keeps ``complete`` False and the backoff retry
-    # alive rather than caching a table-less process for its lifetime.
-    global _NETLINK_ADDRS_PUBLISHED
-    nl = _linux_netlink_addresses()
-    if nl:
-        names |= nl
-        _NETLINK_ADDRS_PUBLISHED = True
-    elif sys.platform.startswith("linux") and hasattr(socket, "AF_NETLINK"):
-        complete = False
     return frozenset(n for n in names if n), complete
 
 
@@ -2265,11 +2201,19 @@ def _resolve_own_host_names_into_cache() -> None:
     try:
         resolved, complete = _resolve_own_host_names()
         if resolved:
-            existing = _OWN_HOST_NAMES_CACHE or frozenset()
-            _OWN_HOST_NAMES_CACHE = existing | resolved
+            # Under the lock: ``_publish_netlink_addresses`` merges into the
+            # same cache mid-pass, and an unlocked read-modify-write here
+            # could drop its addresses after the window already opened.
+            with _OWN_HOST_RESOLVE_LOCK:
+                existing = _OWN_HOST_NAMES_CACHE or frozenset()
+                _OWN_HOST_NAMES_CACHE = existing | resolved
         if complete:
             _OWN_HOST_RESOLVE_DONE = True
             _OWN_HOST_RESOLVE_STAMP = time.monotonic()
+        # Re-warm after the DNS-derived own addresses are merged, and on every
+        # refresh pass: a grown own set re-parses, an unchanged one costs a
+        # stat and an own-set read.
+        _warm_hosts_file_cache()
     finally:
         with _OWN_HOST_RESOLVE_LOCK:
             _OWN_HOST_RESOLVE_IN_FLIGHT = False
@@ -2354,9 +2298,13 @@ def _host_is_self(host: str, *, dns_fallback: bool = True) -> bool:
             ip = mapped
         if ip.is_loopback or ip.is_unspecified:
             return True
+        # Read the window flag BEFORE the names: the publisher stores the
+        # addresses and then sets the flag under one lock, so a True flag seen
+        # first guarantees the names read next already hold the netlink table.
+        published = _NETLINK_ADDRS_PUBLISHED
         if str(ip).lower() in _own_host_names():
             return True
-        if dns_fallback and not _NETLINK_ADDRS_PUBLISHED:
+        if dns_fallback and not published:
             # Same unread-table window as the ``inet_aton`` branch below --
             # this branch is the one IPv6 literals take (round-33).
             return True
@@ -2367,9 +2315,10 @@ def _host_is_self(host: str, *, dns_fallback: bool = True) -> bool:
         ip4 = ipaddress.IPv4Address(packed)
         if ip4.is_loopback or ip4.is_unspecified:
             return True
+        published = _NETLINK_ADDRS_PUBLISHED
         if str(ip4) in _own_host_names():
             return True
-        if dns_fallback and not _NETLINK_ADDRS_PUBLISHED:
+        if dns_fallback and not published:
             # The kernel address table is unread; this literal could be an
             # unlisted secondary of this machine.  Deny until the worker
             # publishes (round-33) -- host position only.
@@ -2385,8 +2334,9 @@ def _host_is_self(host: str, *, dns_fallback: bool = True) -> bool:
     if dns_fallback and _DNS_CANDIDATE_RE.fullmatch(host) is not None:
         if "." not in host:
             # round-21: a DOTLESS name is the hosts-file alias class the
-            # round-18 finding named -- and the hosts file is a local read
-            # that answers that vector SAME-CALL.  Absent an entry, answer
+            # round-18 finding named -- and the hosts table answers that
+            # vector SAME-CALL (a file over one read chunk is pending, i.e.
+            # refused, until a background parse for the current key lands).  Absent an entry, answer
             # OPEN while one async worker revalidates through DNS: the
             # fail-closed first contact broke the everyday ``ssh dev-dsk``
             # shape (CI allow pin), and a dotless loopback alias that lives
@@ -3153,6 +3103,8 @@ def _is_ssh_to_self(text_lower: str) -> bool:
         cmd_start = True  # the next token sits in program position
         outer_depth = 0
         xargs_prefix_index: "int | None" = None  # a bare ``xargs`` in this simple command
+        # Once per FRAME, not once per verb token: see ``_is_credential_mint``.
+        disqualified: "bool | None" = None
         for i, token in enumerate(tokens):
             verb = _ssh_family_verb(token)
             if verb is None and bound_program_verbs:
@@ -3241,7 +3193,9 @@ def _is_ssh_to_self(text_lower: str) -> bool:
             # run ends here.
             prev_stripped_tok = None
             # ``echo ssh localhost`` prints two words; it connects to nothing.
-            if _data_consumer_exempt(i, token, programs, tokens):
+            if disqualified is None:
+                disqualified = _shell_normalizer._data_consumer_command_disqualified(tokens)
+            if _data_consumer_exempt(i, token, programs, tokens, command_disqualified=disqualified):
                 continue
             # round-35 (GPT): launched through xargs, the verb's REAL argv
             # arrives on stdin -- and a here-string puts that stdin in the

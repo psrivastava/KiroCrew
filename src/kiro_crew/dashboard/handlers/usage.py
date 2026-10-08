@@ -7,6 +7,7 @@ import getpass
 import json
 import logging
 import math
+import os
 import re
 import time
 from collections import Counter
@@ -20,7 +21,11 @@ from kiro_crew import model_registry
 from kiro_crew.acp.types import TurnUsage
 from kiro_crew.config.paths import data_home, kiro_sessions_dir
 from kiro_crew.context_blocks import USER_LABEL
-from kiro_crew.hooks import validate_file_path
+from kiro_crew.hooks import (
+    FileTooLargeError,
+    safe_read_file_bytes_nolink,
+    validate_file_path,
+)
 from kiro_crew.jsonl_util import bounded_records
 from kiro_crew.loop_lock import LoopBoundLock
 from kiro_crew.messaging.link import telemetry_channel_of
@@ -30,6 +35,7 @@ from kiro_crew.metrics.turns import (
     emit_turn_usage,
     turn_outcome,
 )
+from kiro_crew.owner_only_files import owner_only_opener_for
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +91,9 @@ _TOKEN_CACHE_TTL = 120  # 2 min
 # See the _SESSIONS_DIR note above: resolved per call, ``None`` = live home.
 _TOKEN_USAGE_DIR: Path | None = None
 _TOKEN_HISTORY_DAYS = 30
+#: Window (in days) the Session Activity card and its Daily History table cover.
+#: The per-day credits column reads the same window so the two line up.
+_SESSIONS_HISTORY_DAYS = 30
 
 
 def _token_usage_dir() -> Path:
@@ -109,13 +118,24 @@ def _shards_in_window(days: int) -> list[Path]:
     The directory listing is cheap (≤31 entries) and we filter by filename
     rather than statting each file, so this stays well under a millisecond
     even on years-old installs.
+
+    A directory that exists but cannot be listed (a permission change, a
+    roaming or network home that is briefly unreachable) yields the same empty
+    window as a missing one: every reader of the shards treats an unreadable
+    shard as "no rows", and the directory is held to the same rule, so a
+    transient listing failure costs one refresh rather than the whole request.
     """
     paths: list[Path] = []
     shard_dir = _token_usage_dir()
     if not shard_dir.exists():
         return paths
     cutoff_date = (datetime.now().astimezone() - timedelta(days=days)).date()
-    for p in shard_dir.iterdir():
+    try:
+        entries = list(shard_dir.iterdir())
+    except OSError as exc:
+        logger.warning("usage: cannot list the per-turn usage shard directory: %s", exc)
+        return paths
+    for p in entries:
         if not p.is_file() or p.suffix != ".jsonl":
             continue
         try:
@@ -233,6 +253,61 @@ def slot_spend(days: int = SPEND_WINDOW_DAYS) -> dict[str, dict[str, float]]:
     return out
 
 
+def daily_credits(days: int = _SESSIONS_HISTORY_DAYS) -> dict[str, float]:
+    """Credits spent per LOCAL calendar day over the last *days*.
+
+    ``{"YYYY-MM-DD": credits}`` for every day that has at least one counted
+    row. Rows are admitted by the same three tests :func:`slot_spend` applies
+    (a ``tokens`` row, inside the per-row epoch cutoff, with a finite numeric
+    ``credits``) and keyed by :func:`_parse_row_day`, the local day the shard
+    partition itself uses. There is deliberately NO slot filter: every turn the
+    backend billed counts, background slots included, so a day's figure is the
+    day's whole spend rather than only its conversations.
+
+    Numeric hygiene: ``credits`` is coerced through ``float`` before the finite
+    test, because ``math.isfinite`` on an int wider than a double raises rather
+    than answers, and a row whose addition would push a day's total past the
+    finite range is dropped so the payload can never carry ``Infinity``.
+    """
+    cutoff = time.time() - (days * 86400)
+    out: dict[str, float] = {}
+    for path in _shards_in_window(days):
+        try:
+            with path.open("rb") as fh:
+                for line in bounded_records(fh, path, label="usage"):
+                    try:
+                        obj = json.loads(line)
+                    except ValueError:
+                        continue
+                    if not isinstance(obj, dict) or obj.get("_type") != "tokens":
+                        continue
+                    ts_raw = obj.get("ts")
+                    ts_epoch = _parse_row_ts(str(ts_raw or ""))
+                    if ts_epoch is None or ts_epoch < cutoff:
+                        continue
+                    credits = obj.get("credits")
+                    if isinstance(credits, bool) or not isinstance(credits, (int, float)):
+                        continue
+                    try:
+                        value = float(credits)
+                    except OverflowError:
+                        continue
+                    if not math.isfinite(value):
+                        continue
+                    day = _parse_row_day(ts_raw)
+                    if day is None:
+                        continue
+                    total = out.get(day, 0.0) + value
+                    if not math.isfinite(total):
+                        continue
+                    out[day] = total
+        except (OSError, UnicodeDecodeError):
+            # Same policy as every other shard reader here: a corrupt or
+            # unreadable shard costs its own rows, not the whole window.
+            continue
+    return out
+
+
 # A payload backstop, not a top-N: the panel lists sessions for the user to
 # browse, sort and group, so cutting it to the "hottest" few hid most of them
 # behind a number they could not reach. Measured over a 7d window this is 260
@@ -242,13 +317,6 @@ _CONTEXT_TOP_SESSIONS = 500
 # Fingerprint + TTL cache, same contract as _TOKEN_CACHE: the Telemetry panel
 # polls every 5s, and the shards are append-only, so (name, mtime, size) over
 # the window invalidates exactly when a turn lands.
-# Rough characters-per-token for English prose, used ONLY to express the
-# un-instrumented remainder (kiro-cli's base prompt + tool catalogue + steering)
-# in the same unit as KiroCrew's own exactly-counted blocks. Never applied to
-# those blocks themselves, and every surface that shows the derived number
-# labels it as an estimate.
-_EST_CHARS_PER_TOKEN = 4.0
-
 _CONTEXT_CACHE: dict[str, Any] | None = None
 _CONTEXT_CACHE_KEY: tuple[Any, ...] | None = None
 _CONTEXT_CACHE_TS: float = 0.0
@@ -657,96 +725,204 @@ def slot_turn_usage(
 
 
 def context_trace(slot: str, days: int = 14) -> dict[str, Any]:
-    """Per-turn injection breakdown for one session, newest shard last.
+    """Per-turn injection breakdown for one slot, oldest turn first.
 
-    Reads the ``ctx_blocks`` / ``phase`` fields ``persist_token_record`` writes
-    each turn and returns them in chronological order, plus per-block totals.
-    Each turn also carries the row's ``credits`` and ``duration_ms`` when the
-    shard recorded usable numbers: injection and billing live on the same row,
-    so the drill-down answers "what was injected and what it cost" in one read.
+    Served from the slot's ``usage`` PROJECTION -- one memoised fold read -- and no
+    longer by scanning the token shards. The scan it replaces opened every shard in
+    the window, JSON-parsed every row in each, and threw away all but this slot's:
+    work proportional to the whole installation's turn volume to answer a question
+    about one session. The crew log already records the same composition
+    (``context/composed``, which the ``usage`` fold folds into ``context.turns``),
+    so the projection is where the answer lives.
 
-    Kept out of the OTEL pipeline for the same reason as
-    :func:`context_occupancy`: this is per-session, per-turn detail, and slot
-    keys are unbounded-cardinality labels that must not become metric labels.
-    The bounded half (block label -> size, aggregated) is what belongs on a
-    metric; this is the drill-down.
+    Billing stays out of the payload: :func:`slot_turn_usage` is the per-turn reader
+    for ``credits`` / ``duration_ms``, and this trace answers only "what was
+    injected".
 
-    Rows written before this field existed simply carry no ``ctx_blocks`` and
-    are skipped, so the trace starts where the recording does rather than
-    inventing zeros for history.
+    Kept out of the OTEL pipeline for the same reason as :func:`context_occupancy`:
+    this is per-session, per-turn detail, and slot keys are unbounded-cardinality
+    labels that must not become metric labels. The bounded half (block label ->
+    size, aggregated) is what belongs on a metric; this is the drill-down.
 
-    ``estimated_other_chars`` is the remainder of the model's context that
-    KiroCrew did NOT inject — kiro-cli's own base prompt, its tool catalogue and
-    its steering files. It is an ESTIMATE and labelled as one everywhere it is
-    surfaced: the provider reports occupancy in tokens while every KiroCrew
-    block here is counted in exact characters, so the two can only be compared
-    through :data:`_EST_CHARS_PER_TOKEN`. Zero when occupancy is unknown or the
-    subtraction would go negative.
+    ONE BOUND on the payload: *days*. Turns older than the window are excluded, so
+    ``window_days`` keeps meaning what it meant and a caller asking for 14 days is
+    still answered about 14 days. The fold's own truncation needs no second field,
+    because every row carries its own ``ordinal`` -- a reader shown a truncated list
+    reads the first row's true position and knows exactly how much precedes it, which
+    a whole-session drop count applied to an array index could never tell it.
+
+    ``peak_context_used`` and ``context_window`` are the PROVIDER's own occupancy
+    reading and the window it was taken against, and they are ONE pair from ONE turn
+    -- the fullest turn INSIDE the day window. Both halves matter. The pair, because
+    the Session Breakdown tree divides one by the other, and a reading over a window
+    from somewhere else describes no turn that ran (a model switch moves the window).
+    Inside the window, because the caller asked about a span of days: on a long
+    session the fullest turn is frequently older than every row in that span. Neither
+    is derived from the turn's token counts, which are billing summed over every model
+    call and on a tool-using turn exceed the window they would be divided by.
+
+    HISTORY BEFORE THIS RELEASE. The crew log is the only source now, so a session
+    whose ``context/composed`` entries predate this fold reads with an unstated
+    ``phase`` (its chart does not split the session-start turn out) and no occupancy
+    until its first turn closes under this build; a session recorded with the crew log
+    switched off reads empty. No read-through to the token shards is offered, and that
+    is deliberate rather than deferred: this release stops writing ``ctx_blocks`` to
+    the row, and the scan it would perform was bounded to ``days``, so such a fallback
+    could serve data for at most that many days after release and would read nothing
+    for the rest of its life. A read path with a provable expiry date is worse than
+    none. Both cases self-heal as new turns are recorded.
+
+    Block sizes are in characters and occupancy is in tokens.
     """
+    # Imported here rather than at module scope, the same way ``work_ledger`` reaches
+    # this function: the projection module pulls in the ledger and work stores, and
+    # this handler module is imported from the route table they in turn reach.
+    from kiro_crew.crew_log.projection import read_slot_projection
+
+    try:
+        folded = read_slot_projection(slot, "usage").value
+    except Exception:
+        # A damaged or unreadable log reads as "nothing folded" rather than as a 500,
+        # the same contract the panel and work readers keep. WARNING because a trace
+        # that silently stopped updating has no other trace of its own, and it
+        # reproduces on every read until the log is repaired.
+        logger.warning("usage fold unreadable for slot %s", slot, exc_info=True)
+        folded = {}
+    context = folded.get("context") if isinstance(folded, dict) else None
+    if not isinstance(context, dict):
+        context = {}
+    rows = context.get("turns")
+    if not isinstance(rows, list):
+        rows = []
+
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).timestamp()
     turns: list[dict[str, Any]] = []
     totals: dict[str, int] = {}
-    for shard_path in _shards_in_window(days):
-        try:
-            with shard_path.open("rb") as fh:
-                for line in bounded_records(fh, shard_path, label="usage"):
-                    try:
-                        obj = json.loads(line)
-                    except ValueError:
-                        continue
-                    if not isinstance(obj, dict) or obj.get("_type") != "tokens":
-                        continue
-                    if str(obj.get("slot") or "") != slot:
-                        continue
-                    raw = obj.get("ctx_blocks")
-                    if not isinstance(raw, dict) or not raw:
-                        continue
-                    blocks = {str(k): _coerce_int(v) for k, v in raw.items() if _coerce_int(v) > 0}
-                    if not blocks:
-                        continue
-                    for label, size in blocks.items():
-                        totals[label] = totals.get(label, 0) + size
-                    turn_row: dict[str, Any] = {
-                        "ts": str(obj.get("ts") or ""),
-                        "phase": str(obj.get("phase") or ""),
-                        "blocks": blocks,
-                        "total_chars": sum(blocks.values()),
-                        "context_used": _coerce_int(obj.get("context_used")),
-                        "context_window": _coerce_int(obj.get("context_window")),
-                        "model": str(obj.get("model") or ""),
-                    }
-                    # The same shard row also carries the turn's billing; the
-                    # trace returns it rather than making the panel walk the
-                    # shards a second time through the usage-turns reader and
-                    # re-join what was never apart.
-                    for field in ("credits", "duration_ms"):
-                        value = _usage_number(obj.get(field))
-                        if value is not None:
-                            turn_row[field] = value
-                    turns.append(turn_row)
-        except (OSError, UnicodeDecodeError):
+    peak_used = 0
+    peak_window = 0
+    # Whether any row in the window carried a reading. It separates two causes of a
+    # zero window that must not share an answer: no reading in this span at all (the
+    # configured size is then the best a reader can be given), or a reading whose
+    # window the provider never stated (there IS no size it was measured against).
+    peak_seen = False
+    for row in rows:
+        if not isinstance(row, dict):
             continue
+        stamp = _row_iso(row.get("ts"))
+        if stamp is None:
+            # A row this reader cannot DATE cannot be placed inside or outside the
+            # window, and the window is the one thing the caller asked about.
+            continue
+        when, iso = stamp
+        if when < cutoff:
+            continue
+        sources = row.get("sources")
+        if not isinstance(sources, dict):
+            continue
+        blocks = {str(k): _coerce_int(v) for k, v in sources.items() if _coerce_int(v) > 0}
+        if not blocks:
+            continue
+        for label, size in blocks.items():
+            totals[label] = totals.get(label, 0) + size
+        # PRESENCE of the key, not its value, is what says this row's turn reported
+        # occupancy: the fold stamps both fields only when a closer carried them, so a
+        # row with no reading is absent rather than zero. Testing the value instead
+        # would make an unreported turn indistinguishable from a turn that genuinely
+        # measured zero, and every row would then claim to be a reading of 0.
+        has_reading = "used" in row
+        used = _coerce_int(row.get("used"))
+        # The window this row's occupancy is a fraction of. For a MEASURED turn it is
+        # the provider's own ``used_window`` -- the size the reading was actually taken
+        # against, which a model switch moves -- so ``context_used / context_window``
+        # is a coherent ratio from one measurement. The configured ``window`` (stamped
+        # at composition from the newest request/configured) is only the fallback for
+        # an UNMEASURED turn, which has no reading and so no window of its own; pairing
+        # a measured ``used`` with the configured size instead would divide the
+        # provider's reading by a size it was never measured against. This mirrors the
+        # peak below, which already takes its window from ``used_window``.
+        row_window = (
+            _coerce_int(row.get("used_window")) if has_reading else _coerce_int(row.get("window"))
+        )
+        turns.append(
+            {
+                "ts": iso,
+                "phase": str(row.get("phase") or ""),
+                "blocks": blocks,
+                # The fold records the composition's own total, which is what the
+                # writer measured; summing the blocks would silently drop whatever
+                # the row reports as omitted detail.
+                "total_chars": _coerce_int(row.get("chars")) or sum(blocks.values()),
+                # The provider's occupancy reading for the turn this composition
+                # belongs to, 0 when that turn reported none.
+                "context_used": used,
+                "context_window": row_window,
+                "model": str(row.get("model") or ""),
+                # The row's EXACT position in the whole session history, assigned by the
+                # fold before any truncation. A reader shows this as the turn's number
+                # directly, so it stays true no matter how many older rows the fold
+                # dropped or this day view excluded -- applying one whole-session omitted
+                # count to an array index would corrupt it, because the index counts only
+                # the rows still present AND inside the window.
+                "ordinal": _coerce_int(row.get("ordinal")),
+            }
+        )
+        # The peak INSIDE the requested window, with the window that same reading was
+        # measured against. Taken here rather than from a session-wide figure because
+        # the caller asked about a span of days: on a long session the fullest turn is
+        # frequently older than every row in that span, and reporting it would answer a
+        # question nobody asked.
+        #
+        # Fullest means the highest ``used / used_window`` RATIO, not the highest
+        # absolute ``used``: a model switch moves the window, so a turn with more used
+        # tokens against a larger window can be LESS full than a turn with fewer used
+        # tokens against a smaller one -- comparing ``used`` alone would crown the wrong
+        # turn and then divide it by a size it was never measured against. Only a
+        # "valid pair" (a reading whose window is positive) has a defined ratio, so a
+        # reading with no stated window is not a peak candidate: it has no size to be a
+        # fraction of, and letting it win would report a peak over a zero window. The
+        # ratio is compared by cross-multiplication (``used * peak_window`` vs
+        # ``peak_used * window``) to stay integer-exact and never divide by zero; both
+        # windows are positive here. ``>=`` keeps the LATEST among equally-full turns,
+        # the reading describing the model currently running.
+        row_used_window = _coerce_int(row.get("used_window"))
+        if has_reading and row_used_window > 0:
+            fuller = not peak_seen or used * peak_window >= peak_used * row_used_window
+            if fuller:
+                peak_used = used
+                peak_window = row_used_window
+                peak_seen = True
 
-    turns.sort(key=lambda t: str(t["ts"]))
-    injected = sum(totals.values())
-    # Occupancy is per-turn cumulative, so the largest reading in the session is
-    # the closest thing to "how full did this window get".
-    peak_used = max((int(t["context_used"]) for t in turns), default=0)
-    estimated_other = 0
-    if peak_used > 0:
-        estimated_other = max(0, int(peak_used * _EST_CHARS_PER_TOKEN) - injected)
     return {
         "slot": slot,
         "turns": turns,
         "totals": totals,
-        "injected_chars": injected,
+        "injected_chars": sum(totals.values()),
         "user_chars": totals.get(USER_LABEL, 0),
-        "estimated_other_chars": estimated_other,
         "peak_context_used": peak_used,
-        "context_window": next(
-            (int(t["context_window"]) for t in reversed(turns) if t["context_window"]), 0
-        ),
+        # The peak's own window once a reading exists in this span; otherwise the size
+        # the session is configured with, which is what a reader with no reading can
+        # still be told.
+        "context_window": peak_window if peak_seen else _coerce_int(context.get("window")),
         "window_days": days,
     }
+
+
+def _row_iso(raw: Any) -> tuple[float, str] | None:
+    """A fold row's ``ts`` as ``(epoch seconds, ISO-8601 UTC)``, or ``None``.
+
+    The crew log stamps an entry in epoch MILLISECONDS, and the payload's declared
+    shape is a string, so both forms are produced here from one conversion rather
+    than at the two places that need them -- a reader that dated a row one way and
+    displayed it another could show a turn it had excluded.
+    """
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        return None
+    seconds = raw / 1000.0
+    try:
+        return seconds, datetime.fromtimestamp(seconds, timezone.utc).isoformat()
+    except (OSError, OverflowError, ValueError):
+        # A stamp outside the platform's representable range dates nothing.
+        return None
 
 
 def cost_breakdown(days: int = SPEND_WINDOW_DAYS) -> dict[str, Any]:
@@ -1051,6 +1227,22 @@ def read_context_tokens(source: object) -> tuple[int, int]:
         return (0, 0)
 
 
+# Runaway guard for :func:`_wrapper_chain`, NOT a depth limit. The walk follows
+# the four documented holder attributes and stops at objects it has already
+# seen, so a real provider stack — a handful of wrappers around one handle and
+# one runtime — is exhausted long before this. What the bound exists for is a
+# source that SYNTHESIZES attributes: a ``MagicMock`` answers every ``getattr``
+# with a fresh child, so without a bound the walk would never end. It is sized
+# so that no plausible wrapper depth can reach it: a wrapper layer carrying all
+# four holders costs three nodes on the way down, so this admits twenty-plus
+# stacked layers, an order of magnitude past anything a session accumulates.
+_WRAPPER_CHAIN_MAX_NODES = 64
+
+# Holder attributes, in the order they are followed. ``_runtime`` is LAST on
+# purpose — see :func:`_wrapper_chain`.
+_WRAPPER_HOLDERS: tuple[str, ...] = ("client", "_client", "_handle", "_runtime")
+
+
 def _wrapper_chain(source: object) -> list[object]:
     """Collect *source* and the provider/client/handle wrappers nested under it.
 
@@ -1062,23 +1254,38 @@ def _wrapper_chain(source: object) -> list[object]:
     ``AcpSessionProvider`` to ``_client`` (the ``-> AcpClient`` annotation there
     carries a ``type: ignore``). A default Kiro turn therefore hides its resolved
     state two levels down, at ``provider.client._handle``, so probing a fixed
-    depth misses it. Breadth-first with a node cap and an identity-based visited
-    set, so a wrapper that points back at itself terminates.
+    depth misses it.
+
+    Depth-first along the holder attributes, with an identity-based visited set
+    so a wrapper that points back at itself (or two wrappers that share a
+    runtime) terminates. Depth-first, not breadth-first, because the model state
+    sits at the BOTTOM of the holder chain while every wrapper layer above it —
+    a fallback wrapper, session sharing, a subagent companion, a channel-linked
+    session — carries siblings that hold nothing. A breadth-first walk with a
+    node budget spends that budget on the siblings and, a few layers down,
+    stops short of the ``_model`` node; ``_resolve_model`` then persists a blank
+    and the credits land in the read-time ``unknown`` bucket. Following the
+    chain downward first reaches the handle regardless of how many layers are
+    stacked on top; :data:`_WRAPPER_CHAIN_MAX_NODES` is a runaway guard for
+    attribute-synthesizing sources, not a depth limit.
 
     ``_runtime`` is traversed **last** deliberately. It is the only holder of
     ``_agent`` for the session-provider shape (``runtime.py:273``), but it also
     carries the process-level ``--model`` argument (``runtime.py:280``); visiting
-    it after ``_handle`` keeps session-level model state ahead of process-level
-    state when :func:`read_effective_model` falls through to ``_model``.
+    it after the whole ``_handle`` subtree keeps session-level model state ahead
+    of process-level state when :func:`read_effective_model` falls through to
+    ``_model``.
     """
     chain: list[object] = []
+    # A stack: the LAST entry is visited next, so children are pushed in
+    # reverse holder order to come off in holder order.
     pending: list[object] = [source]
-    while pending and len(chain) < 8:
-        node = pending.pop(0)
+    while pending and len(chain) < _WRAPPER_CHAIN_MAX_NODES:
+        node = pending.pop()
         if node is None or any(seen is node for seen in chain):
             continue
         chain.append(node)
-        for holder in ("client", "_client", "_handle", "_runtime"):
+        for holder in reversed(_WRAPPER_HOLDERS):
             inner = getattr(node, holder, None)
             if inner is not None and not isinstance(inner, (str, bytes, int)):
                 pending.append(inner)
@@ -1223,8 +1430,6 @@ def _build_token_record(
     context_used: int = 0,
     context_window: int = 0,
     elapsed_ms: int = 0,
-    ctx_blocks: dict[str, int] | None = None,
-    phase: str = "",
     app: str = "",
 ) -> dict[str, Any]:
     """Build the JSONL token-usage record dict (no I/O).
@@ -1294,15 +1499,6 @@ def _build_token_record(
         "agent": agent or "",
         "context_used": _coerce_int(context_used),
         "context_window": _coerce_int(context_window),
-        # Per-turn injection breakdown: block label -> characters, from
-        # kiro_crew.context_blocks.split_blocks. Sizes are characters (exact and
-        # tokenizer-independent). ``phase`` separates the one-off session-start
-        # injection from the much smaller per-turn one so a reader never pools
-        # the two populations into one meaningless percentile.
-        "ctx_blocks": {
-            str(k): _coerce_int(v) for k, v in (ctx_blocks or {}).items() if _coerce_int(v) > 0
-        },
-        "phase": phase or "",
         # Additive: the turn's terminal stop reason ("" when the producer has
         # none). str-coerced so a non-string on a test double / legacy event
         # can't break json.dumps.
@@ -1326,8 +1522,69 @@ def _finite_only(record: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# The record fields that make a row billed: the same six dimensions
+# ``llm_helpers.usage_has_billing`` reads off a ``TurnUsage``, by their record
+# names. A claude-seam turn bills in tokens with ``cost`` still 0 (cost is a
+# session-cumulative delta that lands only when a cost frame arrives) and
+# credits stay 0 off the kiro path, so a credits-and-cost check alone would
+# stay silent for exactly the token-billed rows.
+_BILLED_RECORD_FIELDS: tuple[str, ...] = (
+    "credits",
+    "cost",
+    "input",
+    "output",
+    "cache_create",
+    "cache_read",
+)
+
+
+def _record_is_billed(record: dict[str, Any]) -> bool:
+    """Whether a BUILT record carries any billing dimension, non-finite aside.
+
+    Mirrors ``llm_helpers.usage_has_billing`` over the record's own fields
+    (:data:`_BILLED_RECORD_FIELDS`), so the write site judges the row it is
+    about to persist rather than the event it was built from. A non-finite
+    value is a corrupt measurement, handled by :func:`_write_token_record`'s
+    own sanitizer, not a charge.
+    """
+    for key in _BILLED_RECORD_FIELDS:
+        value = record.get(key)
+        if isinstance(value, (int, float)) and math.isfinite(value) and value != 0:
+            return True
+    return False
+
+
+def _warn_unattributed_billing(record: dict[str, Any]) -> None:
+    """Log — loudly — a billed row about to be persisted with no model.
+
+    Read time renders a blank ``model`` as ``unknown`` (``cost_breakdown``).
+    Left as the only signal, that bucket is where an attribution failure is
+    discovered weeks later, once it is large enough to notice, not where and
+    when it happens. The row is still persisted — the charge is real and
+    dropping it would understate spend — and the failure goes on record at the
+    moment of writing, naming the slot, surface and provider so the dispatch
+    path that lost the model can be found, and the billed dimensions so the
+    size of the loss is on record too. Nothing else: the row's other fields
+    are per-turn telemetry and do not belong in a log line.
+    """
+    if str(record.get("model") or "") or not _record_is_billed(record):
+        return
+    logger.warning(
+        "usage row: model attribution failed for a billed turn; persisting with a blank "
+        "model (read time renders it as 'unknown'). slot=%s surface=%s provider=%s "
+        "credits=%s cost=%s tokens=%s",
+        record.get("slot", ""),
+        record.get("surface", ""),
+        record.get("provider", ""),
+        record.get("credits", 0),
+        record.get("cost", 0),
+        {k: record.get(k, 0) for k in ("input", "output", "cache_create", "cache_read")},
+    )
+
+
 def _write_token_record(record: dict[str, Any], now: datetime) -> None:
     """Append a prebuilt token record to today's shard (blocking I/O)."""
+    _warn_unattributed_billing(record)
     shard_path = _shard_path_for(now)
     parent = shard_path.parent
     # mkdir only when missing — the dir is created once per day, not per turn.
@@ -1359,7 +1616,7 @@ def _write_token_record(record: dict[str, Any], now: datetime) -> None:
             ",".join(non_finite),
         )
         line = json.dumps(_finite_only(record), allow_nan=False)
-    with open(shard_path, "a", encoding="utf-8") as f:
+    with open(shard_path, "a", encoding="utf-8", opener=owner_only_opener_for(shard_path)) as f:
         f.write(line + "\n")
 
 
@@ -1374,8 +1631,6 @@ def persist_token_record(
     context_used: int = 0,
     context_window: int = 0,
     elapsed_ms: int = 0,
-    ctx_blocks: dict[str, int] | None = None,
-    phase: str = "",
     app: str = "",
     model_source: object = None,
 ) -> None:
@@ -1422,8 +1677,6 @@ def persist_token_record(
                 context_used=context_used,
                 context_window=context_window,
                 elapsed_ms=elapsed_ms,
-                ctx_blocks=ctx_blocks,
-                phase=phase,
                 app=app,
             ),
             now,
@@ -1443,8 +1696,6 @@ async def persist_token_record_async(
     context_used: int = 0,
     context_window: int = 0,
     elapsed_ms: int = 0,
-    ctx_blocks: dict[str, int] | None = None,
-    phase: str = "",
     app: str = "",
     model_source: object = None,
     emit_metric: bool = True,
@@ -1499,8 +1750,6 @@ async def persist_token_record_async(
             context_used=context_used,
             context_window=context_window,
             elapsed_ms=elapsed_ms,
-            ctx_blocks=ctx_blocks,
-            phase=phase,
             app=app,
         )
         # Before the offloaded write: a file-write failure must not cost the
@@ -1783,11 +2032,229 @@ def _parse_token_history() -> dict[str, Any]:
     return result
 
 
+#: A kiro-cli session's metadata document (``<id>.json`` beside its ``.jsonl``
+#: transcript) is read whole, so it is bounded. Real documents stay near 2 MB at
+#: most; a larger file is counted as unreadable instead of loaded.
+_CLI_SESSION_JSON_MAX_BYTES = 8 * 1024 * 1024
+
+#: Characters per token for the output estimate: kiro-cli records each reply's
+#: length in characters and no token count.
+_EST_CHARS_PER_TOKEN = 4
+
+#: Ceiling on every count read from a session document. Real counts sit far
+#: below it, and the bound keeps each product and sum built from them a finite
+#: float, so a corrupt document cannot raise ``OverflowError`` on this read path.
+_EST_COUNT_MAX = 10**12
+
+
+def _est_count(value: Any) -> int | None:
+    """A non-negative whole count from a session document, or ``None``."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if 0 <= value <= _EST_COUNT_MAX else None
+
+
+def _est_percent(value: Any) -> float | None:
+    """A context-usage percentage in ``[0, 100]``, or ``None``."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return float(value) if 0 <= value <= 100 else None
+    if isinstance(value, float) and math.isfinite(value) and 0.0 <= value <= 100.0:
+        return value
+    return None
+
+
+def _turn_window(model: str, session_model: str, session_window: int | None) -> int | None:
+    """The context window, in tokens, that a turn's usage percentage is a share of.
+
+    kiro-cli stores only the percentage, measured against the window of the model
+    that served the turn. The session document names one model and its window
+    (the session's current model), so that window applies to turns served by
+    that model or by ``auto``. Any other model's window comes from the model
+    registry; ``None`` means no source supplies a usable window.
+    """
+    if session_window and (not model or model == "auto" or model == session_model):
+        return session_window
+    return _est_count(model_registry.model_window(model)) if model else None
+
+
+def _estimate_cli_tokens(
+    listing: list[os.DirEntry[str]],
+    *,
+    root: Path,
+    since_day: str,
+    since_epoch: float,
+    until_day: str,
+) -> dict[str, Any]:
+    """Estimated Kiro CLI token use per local day, from the session documents.
+
+    kiro-cli writes zero into every token field of its per-turn metadata, so real
+    counts are not on disk. Each turn does record how many model requests it
+    made, its context-window usage at the end as a percentage, and its reply
+    length in characters. Every request re-sends the context, so a turn's input
+    is its request count times the context size averaged between the previous
+    turn's end and its own end. Output is the reply length divided by
+    :data:`_EST_CHARS_PER_TOKEN` as an approximation. That length leaves out
+    tool-call arguments and reasoning, and characters per token vary, so the
+    estimate is not a bound in either direction.
+
+    A turn with no usable context reading (it ended in an error before kiro-cli
+    recorded one, or its model's window is unknown) is taken to have kept the
+    context it started with. A session's first turn starts from zero.
+
+    Returns ``{"by_day": {day: {"input", "output", "requests"}}, "unreadable": n}``
+    for turns that ended on a day from *since_day* through *until_day* (both
+    inclusive, local ``YYYY-MM-DD``). A turn stamped after *until_day* (clock
+    skew, an imported session) is left out, so a caller passing today never
+    receives a future day. *listing* is the sessions directory's
+    :func:`os.scandir` entries. Each JSON document is validated first, and its
+    mtime then comes from its listing entry: on Windows the listing already
+    holds it, and on POSIX the entry stats its own path without following a
+    link. A validated document untouched since before *since_epoch* is skipped
+    before the no-link reader runs. A document inside the window whose listing
+    entry is a link, whatever its target, counts as unreadable before the reader
+    runs: :func:`validate_file_path` resolves a link, so the reader would open
+    the target, and a link to another document in the directory would count
+    that document's turns twice. The link check reads the type the directory
+    listing reports for the entry.
+    ``unreadable`` counts every document that :func:`validate_file_path` refuses
+    before the mtime check, whatever its age, because the estimator does not
+    inspect an unvalidated path. It also counts validated documents whose mtime
+    cannot be read, documents inside the window that are links, and documents
+    inside the window that the no-link reader refuses because its path
+    validation fails, a link is planted at the resolved name after validation,
+    the inode has a second hard link, the inode is not a regular file, the opened
+    file is outside *root*, the file cannot be read, or the file exceeds the size
+    bound. It also counts documents that are nested too deeply, are not JSON, are
+    not shaped like a session document (an object whose ``session_state`` object
+    holds the ``conversation_metadata.user_turn_metadatas`` list), or whose
+    non-empty turn list has no turn with an ``end_timestamp`` that
+    :func:`_parse_row_day` can read; a non-zero count makes the totals a lower
+    bound. kiro-cli writes only session documents here, so a renamed key in its
+    format raises that warning instead of reading as a session with nothing to
+    count. An empty turn list is a session with nothing to count yet, not an
+    unreadable one.
+    """
+    by_day: dict[str, dict[str, float]] = {}
+    unreadable = 0
+    for entry in listing:
+        f = Path(entry.path)
+        if f.suffix != ".json":
+            continue
+        if validate_file_path(str(f)) is None:
+            unreadable += 1
+            continue
+        try:
+            # The mtime comes from the listing entry, after validation. On
+            # Windows the listing already holds it, so this check opens no
+            # path: a junction swapped into an ancestor of the sessions
+            # directory after validation cannot turn it into an SMB probe. On
+            # POSIX the entry stats its own path without following a link. The
+            # skip keeps the reader from running on every document the
+            # directory has ever held.
+            if entry.stat(follow_symlinks=False).st_mtime < since_epoch:
+                continue
+        except OSError:
+            unreadable += 1
+            continue
+        if entry.is_symlink():
+            # The validator resolves a link, so the reader would open the
+            # target and pass containment for a link to another document in
+            # this directory, counting that document's turns a second time.
+            # The entry answers from the type the directory listing reports
+            # (on Windows always; on POSIX unless the filesystem reports no
+            # type, when it falls back to an lstat that does not follow the
+            # link).
+            unreadable += 1
+            continue
+        try:
+            raw = safe_read_file_bytes_nolink(
+                str(f), str(root), max_bytes=_CLI_SESSION_JSON_MAX_BYTES
+            )
+        except FileTooLargeError:
+            unreadable += 1
+            continue
+        if raw is None:
+            unreadable += 1
+            continue
+        try:
+            doc = json.loads(raw)
+        except (ValueError, RecursionError):  # Invalid text/JSON or excessive nesting
+            unreadable += 1
+            continue
+        state = doc.get("session_state") if isinstance(doc, dict) else None
+        meta = state.get("conversation_metadata") if isinstance(state, dict) else None
+        turns = meta.get("user_turn_metadatas") if isinstance(meta, dict) else None
+        if not isinstance(turns, list):
+            # Not shaped like a session document. kiro-cli writes nothing else
+            # here, so a renamed key in its format raises the unreadable-sessions
+            # warning instead of reading as a session with nothing to count.
+            unreadable += 1
+            continue
+        rts = state.get("rts_model_state") if isinstance(state, dict) else None
+        info = rts.get("model_info") if isinstance(rts, dict) else None
+        if not isinstance(info, dict):
+            info = {}
+        model_id = info.get("model_id")
+        session_model = model_id if isinstance(model_id, str) else ""
+        session_window = _est_count(info.get("context_window_tokens")) or None
+        prev_context = 0.0
+        dated = False
+        for turn in turns:
+            if not isinstance(turn, dict):
+                continue
+            turn_model = turn.get("model")
+            model = turn_model if isinstance(turn_model, str) else ""
+            pct = _est_percent(turn.get("final_context_usage_percentage"))
+            if pct is None:
+                pct = _est_percent(turn.get("context_usage_percentage"))
+            window = _turn_window(model, session_model, session_window)
+            requests = _est_count(turn.get("total_request_count")) or 0
+            reply_chars = _est_count(turn.get("assistant_response_length")) or 0
+            context = pct / 100.0 * window if pct is not None and window else prev_context
+            input_tokens = requests * (prev_context + context) / 2.0
+            # A turn outside the window still seeds the next turn's start.
+            prev_context = context
+            day = _parse_row_day(turn.get("end_timestamp"))
+            if day is not None:
+                dated = True
+            if day is None or day < since_day or day > until_day:
+                continue
+            bucket = by_day.setdefault(day, {"input": 0.0, "output": 0.0, "requests": 0.0})
+            bucket["input"] += input_tokens
+            bucket["output"] += reply_chars / _EST_CHARS_PER_TOKEN
+            bucket["requests"] += requests
+        if turns and not dated:
+            # Turns that cannot be placed on any day (a renamed stamp key) are a
+            # session the estimate cannot read, so it feeds the warning. An empty
+            # turn list is a session with nothing to count yet, and does not.
+            unreadable += 1
+    return {
+        "by_day": {
+            day: {k: int(round(v)) for k, v in counts.items()} for day, counts in by_day.items()
+        },
+        "unreadable": unreadable,
+    }
+
+
+def _sum_estimate(
+    by_day: dict[str, dict[str, int]], first_day: str, end_day: str | None
+) -> dict[str, int]:
+    """Sum :func:`_estimate_cli_tokens` days in ``[first_day, end_day)``; no end when ``None``."""
+    total = {"input": 0, "output": 0, "requests": 0}
+    for day, counts in by_day.items():
+        if day >= first_day and (end_day is None or day < end_day):
+            for key in total:
+                total[key] += counts[key]
+    return total
+
+
 def _parse_sessions() -> dict:
     """Parse local kiro session files for usage analytics."""
     sessions_dir = _sessions_dir()
 
-    cutoff = time.time() - (30 * 86400)
+    cutoff = time.time() - (_SESSIONS_HISTORY_DAYS * 86400)
     daily: Counter = Counter()
     daily_msgs: Counter = Counter()
     daily_tools: Counter = Counter()
@@ -1809,20 +2276,24 @@ def _parse_sessions() -> dict:
     # degraded answer, it is a differently-shaped one.
     read_error: dict[str, str] = {}
     try:
-        entries = list(sessions_dir.iterdir())
+        # One listing feeds both scans. The token estimate reads each document's
+        # mtime from its entry (see _estimate_cli_tokens).
+        with os.scandir(sessions_dir) as scan:
+            listing = list(scan)
     except FileNotFoundError:
         # First-run homes have no transcript directory yet; use the same
         # complete zero statistics as an existing, empty directory.
-        entries = []
+        listing = []
     except OSError as exc:
         # The OSError carries a filesystem path; keep it server-side and report a
         # generic message (the ``error`` field is rendered verbatim in the UI).
         logger.warning("usage: cannot read sessions directory: %s", exc)
-        entries = []
+        listing = []
         read_error = {
             "error": "cannot read sessions directory",
             "code": "sessions_dir_unreadable",
         }
+    entries = [Path(e.path) for e in listing]
 
     for f in entries:
         if f.suffix != ".jsonl":
@@ -1903,22 +2374,51 @@ def _parse_sessions() -> dict:
             sessions_dir,
         )
 
-    # Build daily history sorted by date
-    all_days = sorted(set(daily.keys()))
-    history = []
+    # Build daily history sorted by date. Credits come from the per-turn usage
+    # shards, not the transcripts, so a day can carry spend without a transcript
+    # (a background slot, a refused file): such a day still gets a row, with
+    # zero sessions, so that spend is shown rather than dropped. Counter lookups
+    # on those days read 0 without inserting a key.
+    credits_by_day = daily_credits(_SESSIONS_HISTORY_DAYS)
+    # The estimate feeds two readers with different windows: the card shows the
+    # whole previous month, the history rows below keep their 30-day window. The
+    # scan starts at the earlier of the two starts and stops at today, and each
+    # reader then takes its own days from the result.
+    month_start_dt = now_dt.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    last_month_start_dt = (month_start_dt - timedelta(days=1)).replace(day=1)
+    history_start_dt = datetime.fromtimestamp(cutoff).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    scan_start_dt = min(last_month_start_dt, history_start_dt)
+    month_start = month_start_dt.strftime("%Y-%m-%d")
+    last_month_start = last_month_start_dt.strftime("%Y-%m-%d")
+    history_start = history_start_dt.strftime("%Y-%m-%d")
+    estimate = _estimate_cli_tokens(
+        listing,
+        root=sessions_dir,
+        since_day=scan_start_dt.strftime("%Y-%m-%d"),
+        since_epoch=scan_start_dt.timestamp(),
+        until_day=today_str,
+    )
+    tokens_by_day: dict[str, dict[str, int]] = estimate["by_day"]
+    token_days = {d for d in tokens_by_day if d >= history_start}
+    all_days = sorted(set(daily.keys()) | set(credits_by_day.keys()) | token_days)
+    history: list[dict[str, Any]] = []
     for d in all_days:
+        day_tokens = tokens_by_day.get(d)
         history.append(
             {
                 "date": d,
                 "sessions": daily[d],
                 "messages": daily_msgs[d],
                 "tool_calls": daily_tools[d],
+                "credits": round(credits_by_day.get(d, 0.0), 2),
+                "est_tokens": day_tokens["input"] + day_tokens["output"] if day_tokens else 0,
             }
         )
 
     # Compute period summaries
     week_start = (now_dt - timedelta(days=now_dt.weekday())).strftime("%Y-%m-%d")
-    month_start = now_dt.strftime("%Y-%m-01")
 
     today = [h for h in history if h["date"] == today_str]
     week = [h for h in history if h["date"] >= week_start]
@@ -1954,6 +2454,15 @@ def _parse_sessions() -> dict:
         # session count with a positive refusal count is the exact silent
         # failure this field makes visible.
         "refused_transcripts": refused_transcripts,
+        # Kiro CLI token use estimated from the session documents (see
+        # _estimate_cli_tokens): calendar month to date and the whole previous
+        # month. A non-zero count beside them means the sums leave those session
+        # documents out.
+        "estimated_tokens": {
+            "this_month": _sum_estimate(tokens_by_day, month_start, None),
+            "last_month": _sum_estimate(tokens_by_day, last_month_start, month_start),
+            "unreadable_sessions": estimate["unreadable"],
+        },
         # Present only when the directory read itself failed. ``api_kiro_usage``
         # keys its no-cache decision on this, and the zeros above are then a
         # SHAPE, not a measurement -- which is why the message has to travel with
@@ -1967,8 +2476,8 @@ async def _cached_parse_sessions() -> dict:
 
     Both usage endpoints call this so neither blocks the aiohttp loop on the
     iterdir + per-file stat + json.loads scan, and a burst of polls reuses one
-    parse. Returns {} when there is no sessions directory (the common case for
-    claude_code/bedrock, where ~/.kiro/sessions/cli is kiro-cli's own store).
+    parse. A missing sessions directory is parsed into the route's complete zero
+    shape; returning a bare ``{}`` would violate the frontend contract.
     """
     global _SESSIONS_CACHE, _SESSIONS_CACHE_TS
     now = time.time()
@@ -1976,8 +2485,6 @@ async def _cached_parse_sessions() -> dict:
     # `is not None` (not truthiness) so a valid-but-empty {} parse is still a hit.
     if now - _SESSIONS_CACHE_TS < _CACHE_TTL and _SESSIONS_CACHE is not None:
         return _SESSIONS_CACHE
-    if not _sessions_dir().exists():
-        return {}
     async with _SESSIONS_CACHE_LOCK:
         # Re-check: a concurrent request may have refreshed while we waited, so
         # a burst of cold-cache polls collapses into a single parse.
@@ -1990,6 +2497,89 @@ async def _cached_parse_sessions() -> dict:
             _SESSIONS_CACHE = sessions
             _SESSIONS_CACHE_TS = time.time()
     return sessions
+
+
+# A cold 30-day session scan can traverse many large JSONL transcripts. Local
+# dashboard requests can wait for it, but a phone reaches the gateway through an
+# extra transport; waiting for the whole scan leaves its Usage card empty until
+# completion. Give cheap scans a small synchronous budget, then return cached
+# billing + a truthful refreshing marker while the one shared scan continues.
+_USAGE_SESSION_WAIT_SECONDS = 0.05
+_USAGE_SESSION_REFRESH_TASK: asyncio.Task[dict[str, Any]] | None = None
+
+
+def _empty_session_summary() -> dict[str, Any]:
+    """Complete zero-shaped session payload used only during a cold refresh."""
+    empty_period = {"sessions": 0, "messages": 0, "tool_calls": 0}
+    return {
+        "total_sessions": 0,
+        "total_messages": 0,
+        "total_tool_calls": 0,
+        "all_time_sessions": 0,
+        "daily_history": [],
+        "today": dict(empty_period),
+        "this_week": dict(empty_period),
+        "this_month": dict(empty_period),
+        "avg_msgs_per_session": 0.0,
+        "avg_tools_per_session": 0.0,
+        "refused_transcripts": 0,
+        "estimated_tokens": {
+            "this_month": {"input": 0, "output": 0, "requests": 0},
+            "last_month": {"input": 0, "output": 0, "requests": 0},
+            "unreadable_sessions": 0,
+        },
+    }
+
+
+async def _usage_sessions_snapshot() -> tuple[dict[str, Any], bool]:
+    """Return session analytics and whether a slower refresh is still running."""
+    global _USAGE_SESSION_REFRESH_TASK
+
+    loop = asyncio.get_running_loop()
+    task = _USAGE_SESSION_REFRESH_TASK
+    if task is not None and task.done():
+        _USAGE_SESSION_REFRESH_TASK = None
+        if task.cancelled():
+            task = None
+        else:
+            completed = task.result()
+            # Successful production refreshes populate _SESSIONS_CACHE before the
+            # task completes. A patched/test refresh or an error result does not;
+            # return that one result rather than discarding its only copy. Otherwise
+            # continue through freshness below so an expired cache starts a new scan.
+            if _SESSIONS_CACHE is None or "error" in completed:
+                return completed, False
+            task = None
+    elif task is not None and task.get_loop() is not loop:
+        # Module globals survive pytest/event-loop replacement and embedded
+        # gateway restarts. A task cannot be awaited from a different loop.
+        if not task.done():
+            task.cancel()
+        task = None
+        _USAGE_SESSION_REFRESH_TASK = None
+
+    now = time.time()
+    if now - _SESSIONS_CACHE_TS < _CACHE_TTL and _SESSIONS_CACHE is not None:
+        return _SESSIONS_CACHE, False
+
+    if task is None:
+        task = loop.create_task(_cached_parse_sessions(), name="usage-session-refresh")
+        _USAGE_SESSION_REFRESH_TASK = task
+
+    try:
+        sessions = await asyncio.wait_for(asyncio.shield(task), timeout=_USAGE_SESSION_WAIT_SECONDS)
+    except asyncio.TimeoutError:
+        stale = _SESSIONS_CACHE
+        if isinstance(stale, dict) and "today" in stale:
+            return stale, True
+        return _empty_session_summary(), True
+    except Exception:
+        if task.done():
+            _USAGE_SESSION_REFRESH_TASK = None
+        raise
+
+    _USAGE_SESSION_REFRESH_TASK = None
+    return sessions, False
 
 
 def get_usage_cache() -> dict:
@@ -2020,10 +2610,7 @@ async def api_kiro_usage(request: web.Request) -> web.Response:
             return web.json_response(_CACHE)
 
         username = getpass.getuser()
-
-        # Parse local sessions (runs in thread to avoid blocking)
-        loop = asyncio.get_running_loop()
-        sessions = await loop.run_in_executor(None, _parse_sessions)
+        sessions, refreshing = await _usage_sessions_snapshot()
 
         # Get billing from existing usage cache
         billing: dict = {}
@@ -2047,11 +2634,14 @@ async def api_kiro_usage(request: web.Request) -> web.Response:
             "username": username,
             "sessions": sessions,
             "billing": billing,
+            "refreshing": refreshing,
         }
 
         if "error" in sessions:
             response["error"] = sessions["error"]
-        else:
+        elif not refreshing:
+            # A partial response must never enter the two-minute full-response
+            # cache or the frontend's fast poll would keep reading the placeholder.
             _CACHE = response
             _CACHE_TS = time.time()
 

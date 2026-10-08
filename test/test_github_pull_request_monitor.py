@@ -11,7 +11,11 @@ from unittest import mock
 
 import pytest
 
-from kiro_crew.github_runner import SetupError
+from kiro_crew.github_runner import (
+    GITHUB_MAX_OWNER_CHARS,
+    GITHUB_MAX_REPO_CHARS,
+    SetupError,
+)
 from kiro_crew.monitoring import github_pull_request
 from kiro_crew.monitoring.decision import decide_monitor
 from kiro_crew.monitoring.github_pull_request import (
@@ -454,6 +458,46 @@ def test_pull_request_target_rejects_noncanonical_or_untrusted_input(raw: str) -
         parse_github_pull_request_target(raw)
 
 
+class TestTargetSegmentsAreBoundedInWidth:
+    """``GitHubPullRequestTarget`` bounds the width of its two path segments as well
+    as their charset. A charset with no quantifier admits a segment of any size, and
+    the segments it admits are what this adapter joins into the ``owner/repo`` slug it
+    hands the provider. Widths below are derived from the published limits, never
+    restated here.
+    """
+
+    def test_segments_at_githubs_own_limits_are_accepted(self) -> None:
+        owner = "o" * GITHUB_MAX_OWNER_CHARS
+        repo = "r" * GITHUB_MAX_REPO_CHARS
+
+        target = parse_github_pull_request_target(f"https://github.com/{owner}/{repo}/pull/1")
+
+        assert len(target.owner) == GITHUB_MAX_OWNER_CHARS
+        assert len(target.repo) == GITHUB_MAX_REPO_CHARS
+
+    @pytest.mark.parametrize("over", [1, 5000])
+    def test_an_owner_wider_than_githubs_login_limit_is_refused(self, over: int) -> None:
+        owner = "o" * (GITHUB_MAX_OWNER_CHARS + over)
+
+        with pytest.raises(ValueError, match="GitHub pull request"):
+            parse_github_pull_request_target(f"https://github.com/{owner}/repo/pull/1")
+
+    @pytest.mark.parametrize("over", [1, 5000])
+    def test_a_repository_wider_than_githubs_name_limit_is_refused(self, over: int) -> None:
+        repo = "r" * (GITHUB_MAX_REPO_CHARS + over)
+
+        with pytest.raises(ValueError, match="GitHub pull request"):
+            parse_github_pull_request_target(f"https://github.com/owner/{repo}/pull/1")
+
+    def test_the_typed_identity_refuses_an_oversized_segment_constructed_directly(
+        self,
+    ) -> None:
+        """The dataclass is the guard, not the URL parser: an in-process caller that
+        builds one straight from two strings meets the same bound."""
+        with pytest.raises(ValueError, match="GitHub pull request"):
+            GitHubPullRequestTarget("github.com", "o" * (GITHUB_MAX_OWNER_CHARS + 1), "repo", 1)
+
+
 def test_clean_pull_request_has_allowlisted_canonical_observation_and_fingerprint() -> None:
     """Adding provider payload fields or omitting a readiness fact breaks persistence."""
     provider, runner = _provider(_primary(), _threads())
@@ -624,7 +668,7 @@ def test_the_rollup_selection_asks_for_every_field_the_collapse_reads() -> None:
 
 
 def test_an_attempt_a_newer_run_replaced_is_not_reported_as_a_live_failure() -> None:
-    """The phantom wake this collapse exists to stop.
+    """The phantom wake this mark exists to stop.
 
     ``cancel-in-progress`` leaves the cancelled attempt in the rollup beside the
     run that replaced it, and ``CANCELLED`` maps to ``failed``, so counting every
@@ -632,7 +676,10 @@ def test_an_attempt_a_newer_run_replaced_is_not_reported_as_a_live_failure() -> 
     nothing can fix. Supersession is decided by the workflow RUN: these two rows
     are one dispatch retried, and only the newer run is live. Order must not
     matter either -- the rollup is not returned in start-time order, so a reader
-    that leaned on position would collapse the wrong way on the same board.
+    that leaned on position would mark the wrong way on the same board.
+
+    The displaced row is declassified, not deleted: it appears under ``superseded``,
+    which is what lets the report name the row a suppressed wake was suppressed for.
     """
     superseded = {
         "__typename": "CheckRun",
@@ -670,13 +717,80 @@ def test_an_attempt_a_newer_run_replaced_is_not_reported_as_a_live_failure() -> 
         "passed": ["CI / test"],
         "pending": [],
         "unknown": [],
+        "superseded": ["CI / test"],
     }
     assert first.observation.status is MonitorObservationStatus.SUCCESS
     assert first.observation.reason_code == "review_ready"
     assert first.observation.fingerprint == second.observation.fingerprint
 
 
-def test_two_rows_of_one_workflow_run_are_both_live_and_neither_is_collapsed() -> None:
+def test_the_row_cap_is_spent_after_the_mark_so_a_cut_successor_revives_no_phantom() -> None:
+    """A successor beyond the row cap still declassifies the row it replaced.
+
+    The cap bounds how many rows are reported, not how many are read to decide which
+    run is newest. Spending it first can cut the successor while keeping the attempt
+    it replaced, and that kept attempt then wins its own key and is reported as a live
+    ``failed`` row -- the phantom wake the mark exists to remove, reappearing on
+    exactly the boards big enough to hit the cap.
+    """
+    superseded = {
+        "__typename": "CheckRun",
+        "name": "test",
+        "workflowName": "CI",
+        "workflowDefinitionId": 7,
+        "workflowRunEvent": "pull_request",
+        "workflowRunId": 100,
+        "workflowRunConclusion": "CANCELLED",
+        "status": "COMPLETED",
+        "conclusion": "CANCELLED",
+    }
+    replacement = {
+        **superseded,
+        "workflowRunId": 200,
+        "workflowRunConclusion": "SUCCESS",
+        "conclusion": "SUCCESS",
+    }
+    filler = [
+        {"__typename": "StatusContext", "context": f"filler-{index:03d}", "state": "SUCCESS"}
+        for index in range(github_pull_request._MAX_CHECK_ROWS - 1)
+    ]
+    provider, _ = _provider(
+        _primary(statusCheckRollup=[superseded, *filler, replacement]),
+        _threads(),
+    )
+
+    result = _probe_one(provider)
+
+    checks = result.canonical["checks"]
+    assert isinstance(checks, dict)
+    assert checks["failed"] == []
+    assert checks["superseded"] == ["CI / test"]
+    assert result.observation.status is MonitorObservationStatus.PENDING
+    assert result.observation.reason_code == "checks_incomplete"
+
+
+def test_an_oversized_displaced_bucket_does_not_report_the_board_unmeasured() -> None:
+    """Displaced rows carry no verdict, so their own size is not a completeness claim.
+
+    Every live row is still measured when a head accumulates more displaced rows than
+    one bucket holds, and reporting the board incomplete there would hold a green
+    board pending on rows that decide nothing. They are also all handed on, so the one
+    cut happens where the projection can announce it.
+    """
+    live = github_pull_request.GitHubCheck("CI / test", "passed")
+    displaced = tuple(
+        github_pull_request.GitHubCheck(f"CI / old-{index:03d}", "superseded")
+        for index in range(101)
+    )
+
+    bounded, complete = github_pull_request._bounded_checks((live, *displaced))
+
+    assert complete is True
+    assert sum(1 for check in bounded if check.state == "superseded") == 101
+    assert live in bounded
+
+
+def test_two_rows_of_one_workflow_run_are_both_live_and_neither_is_marked() -> None:
     """Two rows of ONE run are concurrent, so start time must not collapse them.
 
     A workflow can publish a check run through the Checks API under the same
@@ -1216,8 +1330,8 @@ def test_two_runs_created_in_the_same_second_are_ordered_by_run_id() -> None:
     ``WorkflowRun.createdAt`` resolves to the second, and two runs of one workflow on
     one head routinely share it -- a workflow firing on both ``synchronize`` and
     ``edited`` produces exactly that, both under the ``pull_request`` event, so they
-    share this collapse's identity. Ordering on that timestamp leaves them tied, both
-    rows survive, and the bucket resolves to the cancelled one: a lane whose newest
+    share this mark's identity. Ordering on that timestamp leaves them tied, neither
+    row is marked, and the bucket resolves to the cancelled one: a lane whose newest
     run succeeded reads as a blocking failure. Run ids increase monotonically, so
     they order the pair on their own. This repository's readiness aggregate reached
     the same conclusion and records it at `.github/workflows/pr-readiness.yml`.
@@ -1255,6 +1369,7 @@ def test_two_runs_created_in_the_same_second_are_ordered_by_run_id() -> None:
         "passed": ["CI / test"],
         "pending": [],
         "unknown": [],
+        "superseded": ["CI / test"],
     }
     assert result.observation.reason_code == "review_ready"
 
@@ -3693,7 +3808,7 @@ async def test_shadow_records_a_stalled_watch_as_a_stall_not_as_the_subject() ->
         last_fingerprint="red-1",
         last_wake_fingerprint="red-1",
         coalesce_alerted={f"{MONITOR_REVISION_KEY_SPACE}red-1": 1_000.0},
-        budgets=MonitorBudgets(max_runtime_secs=10_000_000),
+        budgets=MonitorBudgets(max_runtime_secs=2_592_000),
     )
 
     for tick in range(DEFAULT_MONITOR_STALL_TICKS):
@@ -3971,8 +4086,9 @@ class TestRestFallbackOnRateLimit:
     def test_the_fallback_path_carries_only_validated_segments(self) -> None:
         """No provider-controlled text reaches a request path.
 
-        ``GitHubPullRequestTarget`` admits an owner and repository matching
-        ``_SEGMENT_RE`` and a positive integer number, and the revision has already
+        ``GitHubPullRequestTarget`` admits an owner matching
+        ``GITHUB_OWNER_SEGMENT_RE``, a repository matching ``GITHUB_REPO_SEGMENT_RE``
+        and a positive integer number, and the revision has already
         passed ``_HEAD_REVISION_RE`` on the primary read, so both paths are built
         from validated segments alone.
         """

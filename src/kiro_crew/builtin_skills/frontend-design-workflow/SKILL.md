@@ -74,11 +74,12 @@ than as a built-in skill, so it is only available where that app is installed.
 
 Before declaring the change ready, run a dedicated review from a
 **brand-new, non-technical user's perspective** — as a separate sub-agent via
-`spawn_run`, with `solo_reason="fresh_context"` (the review is wrong if the
-reviewer can see the builder's context, which is also why a one-task
-`spawn_run` needs the reason), `include_project=true` so it can open the UI but
-`include_memory=false` so the reviewer has no builder's context. The reviewer
-answers:
+`spawn_run` (the review is wrong if the reviewer can see the builder's
+context), `include_project=true` so it can open the UI but
+`include_memory=false` so the reviewer has no builder's context. The task text
+is the one channel your context still reaches it through: give only how to open
+the UI and the user goal to attempt, never the design rationale, the PR text,
+or where the new control lives. The reviewer answers:
 
 - **Discoverability**: can a first-time user find this feature without
   being told where it is?

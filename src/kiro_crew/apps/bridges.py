@@ -22,7 +22,7 @@ import zipfile
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterator, Optional
+from typing import Any, Callable, Container, Iterable, Iterator, Optional
 from urllib.parse import urlparse, urlunparse
 
 from kiro_crew import platform_compat
@@ -45,7 +45,11 @@ from kiro_crew.apps.manager import (
     get_app_manifest,
     list_apps,
 )
-from kiro_crew.apps.manifest import AppManifest
+from kiro_crew.apps.manifest import (
+    AppManifest,
+    has_stdio_mcp_server,
+    is_module_style_entry_point,
+)
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.loader import (
     config_dir,
@@ -57,9 +61,13 @@ from kiro_crew.cron import CronStoreBusy, CronStoreUnreadable, lookup_cron_folde
 from kiro_crew.cron_script import resolve_script_path
 from kiro_crew.env import emit_env
 from kiro_crew.executors import maintenance_executor
+from kiro_crew.gateway_lock import GatewayLock, GatewayLockError, LockFileError
+from kiro_crew.history import ConversationLog
 from kiro_crew.platform.governance import may_skip_gate_now, strip_ungoverned_auto_approve
 from kiro_crew.security import is_sensitive_path
 from kiro_crew.sel import sel
+from kiro_crew.session_map import SUPPRESS_REPLAY_FLAG, SessionMap
+from kiro_crew.user_json import loads_mcp_config, loads_user_json
 from kiro_crew.zip_vet import ZipInventoryRejected, vet_zip_inventory
 
 #: Absolute path of the stdlib-only launch shim, for interpreters whose
@@ -226,7 +234,7 @@ def _global_mcp_specs() -> dict[str, Any]:
     that cannot read it neutralizes nothing rather than failing app enable.
     """
     try:
-        raw = json.loads(
+        raw = loads_user_json(
             (Path.home() / ".kiro" / "settings" / "mcp.json").read_text(encoding="utf-8")
         )
         specs = raw.get("mcpServers")
@@ -311,9 +319,24 @@ def _apply_agent_prompt(
     return merged
 
 
-def _strip_ungoverned_auto_approve(servers: dict[str, Any]) -> dict[str, Any]:
-    """Drop a ceiling-governed ``autoApprove`` from a server map (see governance)."""
-    return dict(strip_ungoverned_auto_approve(servers))
+def _strip_ungoverned_auto_approve(
+    servers: dict[str, Any],
+    *,
+    third_party: Container[str] = (),
+    honour_owner_written: bool = True,
+) -> dict[str, Any]:
+    """Drop a ceiling-governed ``autoApprove`` from a server map (see governance).
+
+    ``third_party`` names the keys THIS app chose in a map that also holds the
+    owner's; ``honour_owner_written=False`` is for a map that is entirely an app's.
+    """
+    return dict(
+        strip_ungoverned_auto_approve(
+            servers,
+            third_party=third_party,
+            honour_owner_written=honour_owner_written,
+        )
+    )
 
 
 def _may_auto_approve(ref: str) -> bool:
@@ -332,11 +355,11 @@ def _ceiling_filtered_allowed(refs: object, agent_name: str = "") -> list[Any]:
     The decision itself is NOT made here. It is
     :func:`~kiro_crew.platform.governance.may_skip_gate`, because this is one of
     two places that write an ``allowedTools`` list — the host agent's shared-MCP
-    sync in ``agent.py`` is the other — and the earlier revision reimplemented
-    the rule locally, including a private copy of the builtin-tool→scope map. One
-    copy meant one write point was protected and the other was not, and a newly
-    governed scope silently re-opened the shortcut for the copy that had not heard
-    of it.
+    sync (``sync_shared_server_refs`` in ``agent_materialization/mcp_sources.py``)
+    is the other — so the rule is not reimplemented here. A local copy, including
+    a private builtin-tool→scope map, would protect one write point and not the
+    other, and a newly governed scope would silently re-open the shortcut for the
+    copy that had not heard of it.
     """
     out: list[Any] = []
     withheld: list[str] = []
@@ -556,7 +579,10 @@ def _pin_host_cli_command(app_name: str, cfg: dict[str, Any]) -> dict[str, Any]:
     existing = env.get("PYTHONPATH", "")
     env["PYTHONPATH"] = f"{pkg_parent}{os.pathsep}{existing}" if existing else pkg_parent
     env.setdefault("KIROCREW_HOME", str(app_dir(app_name).parent.parent))
+    # ``-P``: the MCP host spawns this server with a cwd Kiro Crew does not
+    # choose; keeping it off sys.path is the same guarantee the launchers give.
     argv = platform_compat.isolated_python_argv(
+        "-P",
         "-m",
         "kiro_crew",
         *list(cfg.get("args") or []),
@@ -719,7 +745,7 @@ _FRAMEWORK_OWNED_AGENT_KEYS = frozenset(
 def _read_agent_config(path: Path) -> dict[str, Any] | None:
     """The agent JSON currently on disk, or None when there is nothing usable."""
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = loads_user_json(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
     return data if isinstance(data, dict) else None
@@ -1053,9 +1079,22 @@ def _register_agents(
                 # on-disk entry — filtering each of those separately is how earlier
                 # rounds kept leaving one open. The host agent's writer does the same
                 # thing at the same position (see agent.install_agent).
+                #
+                # This map is an APP's, so it declines the owner-written opt-in
+                # outright instead of naming the app's keys. Naming them is an
+                # enumeration that goes stale: the manifest's servers, the shipped
+                # agent spec's own un-namespaced keys and the per-agent policy's
+                # `servers` keys were each found only after the previous one was
+                # covered, and a policy IS app-controlled state that may carry
+                # `autoApprove` (a shipped builtin already writes one). Nothing here
+                # is the owner stating a preference about their own tools, so the
+                # verbs a spec DECLARES still survive and everything else routes
+                # through the approval gate.
                 _servers = merged.get("mcpServers")
                 if isinstance(_servers, dict):
-                    merged["mcpServers"] = _strip_ungoverned_auto_approve(_servers)
+                    merged["mcpServers"] = _strip_ungoverned_auto_approve(
+                        _servers, honour_owner_written=False
+                    )
                 # The map above is FINAL — every source of servers has been merged —
                 # so this is the one point a dangling `@` grant is decidable. Warn,
                 # never reject: kiro-cli just skips the ref, so the agent works
@@ -1505,6 +1544,34 @@ def load_app_cron_defs(app_name: str) -> list[dict[str, Any]]:
     return defs
 
 
+def _resolve_and_vet_app_script(
+    script: str,
+    app_root: Path,
+    vet_script_file: Callable[[str], str | None],
+) -> tuple[str, str, str | None]:
+    """Resolve an app cron's script against its bundle and scan its body.
+
+    One function so ``register_app_crons_with_service`` can hand BOTH filesystem
+    steps to a single ``asyncio.to_thread`` call: resolution stats the script and
+    may walk the builtin manifest sources, and the body scan reads up to
+    ``_MAX_SCRIPT_SCAN_BYTES``. Splitting them across two offloads would pay two
+    thread hops per job for one logically atomic check.
+
+    Returns ``(file_path, func_name, error)``. ``error`` is the body scan's
+    refusal string, or ``None`` when the script passes. Resolution failures
+    propagate as ``PermissionError``/``FileNotFoundError``/``ValueError`` for the
+    caller's existing handler, which audits them as a path rejection -- a
+    distinction the caller keeps, so the SEL trail still separates "path refused"
+    from "body refused".
+
+    ``vet_script_file`` is injected rather than imported here because the import
+    is deferred at the call site to break the ``mcp_cron`` -> ... -> ``bridges``
+    cycle, and re-importing it inside a worker thread would reopen that.
+    """
+    file_path, func_name = resolve_script_path(script, app_root=app_root)
+    return file_path, func_name, vet_script_file(file_path)
+
+
 async def register_app_crons_with_service(app_name: str, cron_service: Any) -> list[str]:
     """Promote admitted app cron definitions into the running CronService.
 
@@ -1574,8 +1641,24 @@ async def register_app_crons_with_service(app_name: str, cron_service: Any) -> l
             )
         if script:
             try:
-                file_path, _ = resolve_script_path(script)
-                err = _vet_script_file(file_path)
+                # Off-loop, for the same reason as the folder lookup below: this
+                # coroutine is awaited on the gateway loop (app enable, gateway
+                # start), and this step stats the script, may walk the builtin
+                # manifest sources for the bundle, and reads up to
+                # _MAX_SCRIPT_SCAN_BYTES (256 KiB) for the body scan. Inline that
+                # parks every request and the heartbeat for its duration.
+                #
+                # `app_root` is bundle context the generic resolver cannot infer:
+                # an app's manifest names its script RELATIVE to its own tree
+                # ("job.py:run"), and this is that tree -- the immutable package
+                # dir for a shipped builtin, the installed snapshot for a third
+                # party, exactly as `_registration_source` chose it. Without it a
+                # relative spec resolved against the gateway process's CWD, so
+                # vetting looked for the file wherever the process happened to
+                # start and denied the cron on every pass.
+                file_path, func_name, err = await asyncio.to_thread(
+                    _resolve_and_vet_app_script, script, app_root, _vet_script_file
+                )
                 if err:
                     logger.warning("App %s: cron %r script rejected: %s", app_name, name, err)
                     sel().log_api_access(
@@ -1586,6 +1669,13 @@ async def register_app_crons_with_service(app_name: str, cron_service: Any) -> l
                         error=err,
                     )
                     continue
+                # Persist the RESOLVED spec, not the manifest's relative one.
+                # Every later consumer re-resolves `job.script` with no app
+                # context -- the fire-time governance gate, the launcher, the
+                # dashboard's source endpoint -- so a relative spec on the
+                # record would be re-resolved against their CWD and reproduce
+                # this very bug after registration had already passed.
+                script = f"{file_path}:{func_name}"
                 sel().log_api_access(
                     caller="app_bridge",
                     operation="app_cron_script_vetted",
@@ -1686,29 +1776,25 @@ async def register_app_crons_with_service(app_name: str, cron_service: Any) -> l
     return newly_registered
 
 
-async def deregister_app_crons_from_service(app_name: str, cron_service: Any) -> int:
-    """Remove app-owned cron jobs from the running CronService.
+async def deregister_app_crons_reporting_failures(app_name: str, cron_service: Any) -> int:
+    """Remove app-owned cron jobs, reporting EVERY failure to the caller.
 
-    Mirrors :func:`register_app_crons_with_service`. Uses :class:`CronSDK`,
-    which only removes jobs tagged ``created_by="app:{app_name}"`` — other
-    apps' jobs are unaffected.
+    Same removal as :func:`deregister_app_crons_from_service`, which wraps this
+    and is what most callers want. The difference is the disposition of an
+    unexpected failure, and it exists because ``0`` is otherwise ambiguous: it is
+    the honest answer for an app that owned nothing, and it is also what a write
+    that never reached disk looks like from outside. A caller about to do
+    something irreversible has to tell those apart, because the second case
+    leaves still-ENABLED rows on disk that keep firing against an app directory
+    that is gone.
 
-    ASYNC: awaits ``CronSDK.remove_all_async``, which removes all owned jobs in
-    ONE atomic ``CronService.remove_jobs_by_owner`` transaction (owned set
-    selected against the in-lock reloaded on-disk state, store-lock spin
-    offloaded to a worker thread) — all-or-nothing, never a partial removal that
-    orphans still-ENABLED app jobs, and never a cache-only snapshot that could
-    miss a cross-process creation. Awaitable directly on the gateway loop.
+    The rows cannot be re-counted to settle it either. A failing ``_save()``
+    leaves the removed rows filtered out of the in-memory job list and only a
+    reload restores them, so a post-hoc ``list_jobs`` reports the removal that
+    did not persist.
 
-    Idempotent — safe to call when no jobs are registered (returns ``0``).
-    Returns the number of jobs removed.
-
-    Propagates :class:`CronStoreBusy` and :class:`CronStoreUnreadable`
-    (re-raised) so a cleanup that could not complete is REPORTED to the
-    disable/uninstall caller as a failure rather than masked as a successful ``0``
-    while owned jobs stay enabled and keep executing. The two are siblings, not
-    subclasses, so each needs naming: an unreadable store degrades to an empty job
-    list, which is indistinguishable HERE from an app that owned nothing.
+    Returns the number of jobs removed. ``0`` from this function means the app
+    owned no jobs, and nothing else.
     """
     if cron_service is None:
         return 0
@@ -1744,6 +1830,46 @@ async def deregister_app_crons_from_service(app_name: str, cron_service: Any) ->
             resources=app_name,
             error=str(exc),
         )
+        raise
+
+
+async def deregister_app_crons_from_service(app_name: str, cron_service: Any) -> int:
+    """Remove app-owned cron jobs from the running CronService.
+
+    Mirrors :func:`register_app_crons_with_service`. Uses :class:`CronSDK`,
+    which only removes jobs tagged ``created_by="app:{app_name}"`` — other
+    apps' jobs are unaffected.
+
+    ASYNC: awaits ``CronSDK.remove_all_async``, which removes all owned jobs in
+    ONE atomic ``CronService.remove_jobs_by_owner`` transaction (owned set
+    selected against the in-lock reloaded on-disk state, store-lock spin
+    offloaded to a worker thread) — all-or-nothing, never a partial removal that
+    orphans still-ENABLED app jobs, and never a cache-only snapshot that could
+    miss a cross-process creation. Awaitable directly on the gateway loop.
+
+    Idempotent — safe to call when no jobs are registered (returns ``0``).
+    Returns the number of jobs removed.
+
+    Propagates :class:`CronStoreBusy` and :class:`CronStoreUnreadable`
+    (re-raised) so a cleanup that could not complete is REPORTED to the
+    disable/uninstall caller as a failure rather than masked as a successful ``0``
+    while owned jobs stay enabled and keep executing. The two are siblings, not
+    subclasses, so each needs naming: an unreadable store degrades to an empty job
+    list, which is indistinguishable HERE from an app that owned nothing.
+
+    An UNEXPECTED failure is reported as ``0``, which a caller must not read as
+    "the app owned nothing" — the logging and the audit entry above are where that
+    case is visible. A caller that has to tell the two apart, because what it does
+    next cannot be undone, calls
+    :func:`deregister_app_crons_reporting_failures` instead.
+    """
+    try:
+        return await deregister_app_crons_reporting_failures(app_name, cron_service)
+    except (CronStoreBusy, CronStoreUnreadable):
+        raise
+    except Exception:
+        # Logged and audited by the call above; this frame only chooses the
+        # disposition its own callers are written against.
         return 0
 
 
@@ -1853,9 +1979,10 @@ async def reconcile_app_crons_for_execution(cron_service: Any) -> list[str]:
 # ~/.kiro/settings/mcp.json. That shared file is read by everything else living
 # under ~/.kiro — Kiro IDE and any other kiro-cli agent — so registering an app's
 # tools there leaks them into surfaces that never installed the app (and a dead
-# HTTP entry there breaks EVERY kiro session, see backend.py's warning). KiroCrew
-# sessions read only the agent config (``includeMcpJson`` pinned False in
-# agent.py), so this is both sufficient and correctly scoped.
+# HTTP entry there breaks EVERY kiro session, see the boot-reconcile warning in
+# backend_runtime/startup.py). Kiro Crew sessions read only the agent config
+# (``includeMcpJson`` pinned False in agent.py), so this is both sufficient and
+# correctly scoped.
 def _mcp_json_path() -> Path:
     """KiroCrew's own agent config. A function, not an import-time constant:
     the path must track the live data home, and freezing it at import would
@@ -1966,7 +2093,7 @@ def _read_mcp_json_unlocked(*, strict: bool = False) -> dict[str, Any]:
     if not _mcp_json_path().is_file():
         return {}
     try:
-        return json.loads(_mcp_json_path().read_text(encoding="utf-8"))
+        return loads_mcp_config(_mcp_json_path().read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError) as exc:
         if strict:
             raise
@@ -1990,7 +2117,7 @@ def _resolve_live_mcp_url(app_name: str, url: str, live_port: int | None = None)
     """Rewrite a manifest HTTP MCP url's port to the backend's ACTUALLY-allocated port.
 
     Gateway-managed backends declare ``backend.port:"auto"`` and get a free port at
-    spawn time (``backend.py:_find_free_port`` — 9100 if free, else 9101, …). The
+    spawn time (``backend_runtime/ports.py:_find_free_port`` — 9100 if free, else 9101, …). The
     manifest's ``mcpServers.<name>.url`` carries an illustrative fixed port (e.g.
     ``http://localhost:9100/mcp``). Registering that verbatim is a latent bug: whenever
     the backend lands on a different port, the registered MCP server points at the wrong
@@ -2008,8 +2135,9 @@ def _resolve_live_mcp_url(app_name: str, url: str, live_port: int | None = None)
         return url
     try:
         if live_port is None:
-            # circular import: backend.py imports from bridges (reregister_app_mcp_servers
-            # in its boot path), so bridges can't import backend at module load — defer it.
+            # circular import: backend_runtime/registration.py imports from bridges
+            # (reregister_app_mcp_servers in its health gate), so bridges can't import
+            # backend at module load — defer it.
             from kiro_crew.apps.backend import get_app_backend_port
 
             live_port = get_app_backend_port(app_name)
@@ -2749,14 +2877,10 @@ def _maybe_provision_backendless_deps(app_name: str, manifest: "AppManifest") ->
         # empty deps tree. The stamp gate and the per-app flock make the
         # overlap with a real spawn cheap and safe. A MODULE-style entry
         # (trusted package code, the backend spawn's own trust gate) still
-        # never provisions app-dir requirements.
-        is_module_entry = (
-            "/" not in entry_point
-            and not entry_point.endswith((".py", ".js", ".ts", ".mjs", ".cjs", ".sh"))
-            and "." in entry_point
-            and not (root / entry_point).exists()
-        )
-        if is_module_entry:
+        # never provisions app-dir requirements -- decided by the same
+        # shared predicate the backend spawn and the install-time desktop
+        # gate answer from.
+        if is_module_style_entry_point(entry_point, root):
             return
     if not os.path.lexists(root / "requirements.txt"):
         # True ABSENCE only: is_file() would also answer False for a
@@ -2765,10 +2889,7 @@ def _maybe_provision_backendless_deps(app_name: str, manifest: "AppManifest") ->
         # provision_app_deps, whose failure epilogue surfaces it (ERROR log
         # + SEL event) instead of this fast path eating it.
         return
-    has_stdio = any(
-        isinstance(cfg, dict) and not cfg.get("url") for cfg in manifest.mcpServers.values()
-    )
-    if not has_stdio:
+    if not has_stdio_mcp_server(manifest):
         return
     # Deferred import: bridges is imported during backend's boot path, so it
     # cannot import backend at module load (same pattern as the other
@@ -2798,12 +2919,21 @@ def _register_mcp_servers(
     a hard error — breaking ALL kiro requests, not just this app's. (An alternate ACP
     backend reads a different config file, so it was unaffected — the asymmetry in the
     report.)
-    So: an HTTP server with NO resolvable LIVE port is NOT written at all (and any stale
-    entry for it is scrubbed) — never a dead URL the kiro binary might still dial whether
-    or not it honours a ``disabled`` flag. The boot/enable path calls
-    :func:`reregister_app_mcp_servers` with the real ``live_port`` once the backend is up,
-    which writes the entry with the correct, reachable port. stdio/command servers (no
-    ``url``) are always registered — they have no port to be dead.
+    So: a GATEWAY-MANAGED backend's HTTP server (``backend.entryPoint`` set) with NO
+    resolvable LIVE port is NOT written at all (and any stale entry for it is scrubbed) —
+    never a dead URL the kiro binary might still dial whether or not it honours a
+    ``disabled`` flag. The boot/enable path calls :func:`reregister_app_mcp_servers` with
+    the real ``live_port`` once the backend is up, which writes the entry with the
+    correct, reachable port.
+
+    A SELF-MANAGED app (empty ``backend.entryPoint``) is the exception: the gateway
+    launches no backend for it, so its ``url`` is an AUTHORITATIVE fixed endpoint, not an
+    illustrative port awaiting resolution. It never gets a live registration, so its url
+    is preserved rather than scrubbed — mirroring :func:`_collect_app_mcp_servers`
+    (``agent_materialization/mcp_sources.py``), the other writer of this config. The two
+    writers must agree, or one scrubs an entry the other immediately writes back.
+
+    stdio/command servers (no ``url``) are always registered — they have no port to be dead.
     """
     if not manifest.mcpServers:
         return []
@@ -2822,16 +2952,31 @@ def _register_mcp_servers(
             if isinstance(cfg, dict):
                 cfg = _pin_host_cli_command(app_name, cfg)
             is_http = isinstance(cfg, dict) and bool(cfg.get("url"))
-            if is_http and not resolved_port:
-                # No live backend → registering the manifest's dead default-port URL would
-                # break every kiro session. Skip it AND scrub any stale entry so a prior
-                # (now-dead) registration can't keep poisoning the provider path.
+            if is_http and not resolved_port and manifest.backend.entryPoint:
+                # GATEWAY-MANAGED backend (backend.entryPoint set) with no live port: the
+                # manifest's url carries only an ILLUSTRATIVE fixed port, so writing it
+                # verbatim is a dead default-port URL that breaks every kiro session. Skip
+                # it AND scrub any stale entry so a prior (now-dead) registration can't keep
+                # poisoning the provider path. The boot/enable path re-registers with the
+                # live port once the backend is up.
+                #
+                # A SELF-MANAGED app (empty backend.entryPoint) is the opposite case: it has
+                # no backend the gateway launches, so its url is an AUTHORITATIVE fixed
+                # endpoint that never gets a live registration — preserve it instead of
+                # dropping it. This mirrors ``_collect_app_mcp_servers`` in
+                # ``agent_materialization/mcp_sources.py`` (the other writer of this config),
+                # which keeps a self-managed url for exactly this reason. The two writers
+                # must agree, or registration scrubs the entry and the next rebuild writes
+                # it straight back.
                 servers.pop(namespaced, None)
                 skipped.append(namespaced)
                 continue
             if is_http:
+                # _resolve_live_mcp_url is a no-op without a live port, so a self-managed
+                # app's authoritative url is written through unchanged here.
                 cfg["url"] = _resolve_live_mcp_url(app_name, cfg["url"], live_port=resolved_port)
-                cfg.pop("disabled", None)  # backend is live — ensure enabled
+                if resolved_port:
+                    cfg.pop("disabled", None)  # backend is live — ensure enabled
             else:
                 # A stdio entry: resolve a bare interpreter to an absolute one — the
                 # app's venv python when present, else the running interpreter (see
@@ -2856,7 +3001,17 @@ def _register_mcp_servers(
         # the ceiling's denial, the same second route the agent-config writers
         # already close. Strip a governed grant here too; the tools stay, they
         # just go through the gate. Idempotent and a no-op on an ungoverned host.
-        mcp_data["mcpServers"] = dict(strip_ungoverned_auto_approve(servers))
+        # This app's own entries are named explicitly rather than left to the
+        # name-shape test: the rest of this map is the owner's own file, whose
+        # `autoApprove` the opt-in exists to honour, so the two cannot share one
+        # verdict. Every key carrying this app's prefix counts, including a stale
+        # one from an earlier registration.
+        mcp_data["mcpServers"] = dict(
+            strip_ungoverned_auto_approve(
+                servers,
+                third_party={k for k in servers if k.startswith(f"{app_name}:")},
+            )
+        )
         _write_mcp_json_unlocked(mcp_data)
     logger.info(
         "Registered %d MCP server(s) for app %s (live_port=%s); skipped %d HTTP server(s) "
@@ -3020,7 +3175,7 @@ def _scrub_legacy_shared_mcp(app_name: str) -> int:
         # rename. It is a DIFFERENT sidecar than _mcp_lock's default (that guards
         # kirocrew.json), so pass the legacy path explicitly.
         with _mcp_lock(target=_LEGACY_SHARED_MCP_PATH):
-            data = json.loads(_LEGACY_SHARED_MCP_PATH.read_text(encoding="utf-8"))
+            data = loads_mcp_config(_LEGACY_SHARED_MCP_PATH.read_text(encoding="utf-8"))
             servers = data.get("mcpServers", {})
             stale = [k for k in servers if k.startswith(prefix)]
             if not stale:
@@ -3370,10 +3525,206 @@ def reconcile_enabled_app_resources() -> dict[str, int]:
     return counts
 
 
+def app_conversation_keys(app_name: str, *, mapped_keys: Iterable[str] | None = None) -> list[str]:
+    """Session keys that still hold a resume pointer and belong to *app_name*.
+
+    A slot key an app chooses is often DETERMINISTIC — one slot per object it tracks,
+    named after that object — so the next slot created under that name is the same
+    key, and ``session.py``'s ``resume_sid = self._session_map.get(key)`` hands it the
+    previous conversation. That is correct while the app is installed: it is how a
+    long-lived per-object conversation keeps what it has learned about that object.
+    It stops being correct once the app is gone: reinstall it, open the same object,
+    and the first turn resumes a conversation from the previous installation — a
+    transcript from code that is gone.
+
+    Ownership is read from the record that already outlives the tab: every save
+    writes ``app`` into the conversation's metadata line, and closing a tab is a
+    save. Live ``_ChatSlot._app`` cannot answer here (the CLI path has no gateway,
+    and a closed slot is gone from a running one), and ``open_slots.json`` cannot
+    either — it tracks tabs to REOPEN, so a closed slot leaves it while the resume
+    pointer deliberately stays. A closed app slot is the mainline state before an
+    uninstall, so sourcing ownership from open tabs would miss the common case.
+
+    Scoped to keys that still have a sid, which makes this index exactly as wide as
+    the problem: a pointer exists only if a conversation was started, and starting
+    one writes the metadata line this reads.
+
+    **Which keys to look at is the caller's answer, not this function's, whenever
+    the caller owns a live map.** A detached ``SessionMap`` reads the file, and the
+    file lags a running gateway's map by whatever that map has not flushed, so a
+    detached enumeration can omit a key whose pointer already exists — and the
+    in-gateway caller then clears through the live map, leaving the pointer it
+    could not see behind for a reinstall to resume. So that caller passes
+    *mapped_keys* from its own manager (``mapped_session_keys() | session_keys()``,
+    the second covering an allocation still in flight), and the detached read is
+    reserved for the CLI path, which holds the gateway lock and therefore knows no
+    live map exists. Reading detached is sound only because nothing here writes —
+    the class's rule 3 forbids a detached WRITE.
+
+    Returns keys sorted for stable logs. Never raises: an uninstall the user asked
+    for does not fail over bookkeeping.
+    """
+    if not app_name:
+        return []
+    try:
+        log = ConversationLog()
+        candidates = SessionMap().mapped_sids_by_key() if mapped_keys is None else set(mapped_keys)
+        owned: list[str] = []
+        unreadable: list[str] = []
+        for key in candidates:
+            meta, readable = log.get_metadata_status(key)
+            if meta.get("app") == app_name:
+                owned.append(key)
+            elif not readable:
+                # A record that could not be READ is not a record that says "not this
+                # app", and the two are the same value here — ``{}``. Reported rather
+                # than guessed either way: claiming it would sweep up a conversation
+                # this app may not own, which is worse than the pointer it leaves, and
+                # dropping it in silence hides the one case where the answer is
+                # unknown. Not raised, because an uninstall the user asked for does
+                # not fail over bookkeeping.
+                unreadable.append(key)
+        if unreadable:
+            logger.warning(
+                "could not read the ownership record of %d conversation(s) while "
+                "resolving %r's keys, so their resume pointers are left in place: %s",
+                len(unreadable),
+                app_name,
+                ", ".join(sorted(unreadable)[:10]),
+            )
+        return sorted(owned)
+    except Exception:  # noqa: BLE001 — bookkeeping must not fail an uninstall
+        logger.warning("resolving %r's conversation keys failed", app_name, exc_info=True)
+        return []
+
+
+@dataclass(frozen=True)
+class SessionPointerCleanup:
+    """What a CLI-path pointer clear actually did.
+
+    ``dropped == 0`` alone cannot be reported to an operator: it is "this app owned
+    nothing", "a gateway owns the map, so nothing was attempted", and "the write
+    itself failed", and those need different messages — the first is complete, the
+    other two leave a pointer a reinstall will resume. ``declined`` and ``failed``
+    are what separate them.
+
+    ``failed`` covers the case the clear could not PERSIST: the sid clear and the
+    suppression flag are both mutations of a file that has to be written, so an
+    ENOSPC or a permission error leaves the pointer on disk while the count says
+    nothing was owned. It also covers a lock that could not be used at all
+    (:class:`~kiro_crew.gateway_lock.LockFileError`: ``gateway.lock`` is not a
+    regular file, or it or the home could not be opened, created or measured),
+    because no gateway owns the map then and stopping one would not help. Reported
+    rather than raised — the uninstall itself already
+    succeeded, and bookkeeping must not fail it — but not reported as clean either.
+    """
+
+    dropped: int = 0
+    declined: bool = False
+    failed: bool = False
+
+
+def discard_app_session_pointers(app_name: str) -> SessionPointerCleanup:
+    """Drop the resume pointer of every conversation this app owned. CLI PATH ONLY.
+
+    Called by the UNINSTALL paths only, and deliberately NOT from
+    :func:`deregister_app`: that runs on **disable** too (the CLI's disable action,
+    the disable route, and the enable/update reconcile), and disable is how an app
+    is routinely restarted — App Store Sync is a disable/enable pair. Clearing
+    pointers there would discard the accumulated context of every long-lived
+    conversation the app owns, on every sync.
+
+    ``clear_sid``, not ``delete``: the entry also carries the Slack thread/channel
+    linkage and the reverse index built from it, so dropping the whole row would
+    silently unlink a mirrored session. The cleared value is stashed as
+    ``discarded_sid``, so this is diagnosable and reversible by hand — the native
+    conversation itself is untouched on disk.
+
+    **Holds the gateway lock across the whole scan and write, and that is the
+    mechanism, not a courtesy.** This writes through a throwaway ``SessionMap``,
+    which is only sound when no other instance holds the file: a running gateway
+    keeps a long-lived map whose ``_data`` loaded at startup and whose every write
+    rewrites the whole file from that snapshot, so two writers do not merge — the
+    loser's rows vanish. Writing anyway would both fail to drop the pointer (the
+    live map's next write restores it) and drop whatever that map recorded since
+    this process read, costing an unrelated session its sid or its channel link.
+    Merely *asking* whether a gateway is up cannot establish that: a gateway
+    starting between the question and the write lands in exactly the case the
+    question was meant to exclude. Taking the same lock the gateway takes makes the
+    exclusion real in both directions — while we hold it no gateway can start, and
+    if one is already up we cannot take it and decline instead. Doing nothing is
+    the pre-existing behaviour; corrupting a stranger's session is not.
+
+    The cost is stated rather than hidden: a gateway attempting to start inside this
+    window is refused as it would be by any other holder. The window is one scan
+    plus one write, and the alternative is losing another session's row.
+
+    The in-gateway route does not come through here at all — it clears through the
+    live map, inside the app lifecycle lock.
+
+    Returns what it did, not just how much: a declined clear leaves a pointer behind
+    and the caller has to be able to say so.
+    """
+    try:
+        with GatewayLock(config_dir()):
+            keys = app_conversation_keys(app_name)
+            if not keys:
+                return SessionPointerCleanup()
+            smap = SessionMap()
+            # ``clear_sid`` reports whether it dropped anything, so the count is
+            # conversations orphaned by THIS uninstall rather than keys looked at.
+            # The suppression flag goes on every owned key regardless: dropping the
+            # sid stops the NATIVE resume only, and the transcript stays on disk, so
+            # without it the next installation's first turn under this key gets the
+            # removed app's history injected as replay. A key whose pointer was
+            # already gone still has a transcript, so it still needs the flag.
+            cleared = 0
+            for key in keys:
+                if smap.clear_sid(key):
+                    cleared += 1
+                smap.set_flag(key, SUPPRESS_REPLAY_FLAG, True)
+            # Durable BEFORE the lock is released. Off-loop writes are inline today,
+            # so this is belt and braces — but the ordering is the invariant, not a
+            # property inherited from being off the loop, which a later refactor
+            # could change without noticing this depends on it.
+            smap.flush()
+    except LockFileError as exc:
+        # Not a gateway owning the map: the lock file itself could not be used
+        # (not a regular file, or an open/create/stat failure), and stopping a
+        # gateway would not help. ``failed`` sends the operator to the log, where
+        # this names the path and the cause.
+        logger.warning("session pointer cleanup for %r could not lock: %s", app_name, exc)
+        return SessionPointerCleanup(failed=True)
+    except GatewayLockError:
+        logger.info(
+            "Left %s's conversation pointers in place: a gateway owns session_map.json "
+            "and a second writer would drop rows it has not flushed yet",
+            app_name,
+        )
+        return SessionPointerCleanup(declined=True)
+    except Exception:  # noqa: BLE001 — bookkeeping must not fail an uninstall
+        logger.warning("session pointer cleanup for %r failed", app_name, exc_info=True)
+        # ``failed``, never the default: the scan and the write are both in this
+        # block, so an ENOSPC or permission error on ``flush`` lands here with the
+        # pointer still on disk. Returning the default would tell the caller the app
+        # owned nothing, and the caller prints a success tick on that.
+        return SessionPointerCleanup(failed=True)
+    if cleared:
+        logger.info(
+            "Dropped %d resume pointer(s) for %s so a reinstall starts fresh",
+            cleared,
+            app_name,
+        )
+    return SessionPointerCleanup(dropped=cleared)
+
+
 def deregister_app(app_name: str) -> RegistrationResult:
     """Deregister all resources for an app.
 
     Removes symlinks and cron manifests.  Does not remove the app directory.
+
+    Does NOT touch session resume pointers — see
+    :func:`discard_app_session_pointers` for why that belongs to uninstall alone.
     """
     result = RegistrationResult()
 

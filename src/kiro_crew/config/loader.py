@@ -12,9 +12,12 @@ dashboard URL via the config file. (The dashboard *port* is set with the
 from __future__ import annotations
 
 import asyncio
+import codecs as _codecs
 import contextlib
 import copy
+import hashlib as _hashlib
 import json
+import locale as _locale
 import logging
 import math  # noqa: F401 - historical loader namespace compatibility
 import os
@@ -25,10 +28,10 @@ import sys
 import threading
 import uuid
 from collections.abc import Callable, Iterable, Iterator, Mapping, MutableMapping
-from dataclasses import MISSING, asdict, dataclass, field
+from dataclasses import MISSING, asdict, dataclass, field  # noqa: F401 - loader namespace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 from urllib.parse import urlsplit as _urlsplit  # noqa: F401 - compatibility facade
 
 # Module alias for post-split helpers. The `from ... import` list below is a
@@ -43,39 +46,56 @@ from kiro_crew import (
     platform_compat,
     windows_acl,
 )
-from kiro_crew.agent_sdk.backends import resolve_cc_permission_mode
+from kiro_crew.agent_sdk.backends import (
+    ACP_BACKENDS_EFFORT_FROM_ADVERTISED_OPTION,
+    resolve_cc_permission_mode,
+)
 from kiro_crew.agent_sdk.capabilities import MODEL_NAMESPACE_ACP, capabilities_for
 from kiro_crew.agent_spec_format import iter_agent_spec_files, parse_agent_spec_text
 
 # Leaf module (stdlib + platform_compat only) — no import cycle with config.
 from kiro_crew.atomic_write import atomic_write, on_event_loop
 
-# Computer-use defaults/ceilings come from the feature's constants module rather
-# than being re-spelled here (docs/system-specs/common/code-style.md: no
-# hardcoded values in business logic).
-# ``computer_use.types`` is deliberately dependency-free — it imports nothing from
-# ``kiro_crew`` — so this cannot create an import cycle with the loader, and the
-# ``computer_use`` package's ``__init__`` pulls in only ``platform_compat`` /
-# ``executors`` (both stdlib-only), never ``config``.
-from kiro_crew.computer_use.types import DEFAULT_ATTACH_SCREENSHOT as _CU_DEFAULT_ATTACH_SCREENSHOT
-from kiro_crew.computer_use.types import DEFAULT_MAX_TREE_DEPTH as _CU_DEFAULT_MAX_TREE_DEPTH
-from kiro_crew.computer_use.types import DEFAULT_MAX_TREE_NODES as _CU_DEFAULT_MAX_TREE_NODES
-from kiro_crew.computer_use.types import (
-    DEFAULT_SCREENSHOT_JPEG_QUALITY as _CU_DEFAULT_SCREENSHOT_JPEG_QUALITY,
-)
-from kiro_crew.computer_use.types import DEFAULT_SCREENSHOT_MAX_PX as _CU_DEFAULT_SCREENSHOT_MAX_PX
-from kiro_crew.computer_use.types import DEFAULT_TEXT_LIMIT as _CU_DEFAULT_TEXT_LIMIT
-from kiro_crew.computer_use.types import MAX_SCREENSHOT_MAX_PX as _CU_MAX_SCREENSHOT_MAX_PX
-from kiro_crew.computer_use.types import MAX_TEXT_LIMIT as _CU_MAX_TEXT_LIMIT
-from kiro_crew.computer_use.types import MAX_TREE_DEPTH_LIMIT as _CU_MAX_TREE_DEPTH
-from kiro_crew.computer_use.types import MAX_TREE_NODES_LIMIT as _CU_MAX_TREE_NODES
-from kiro_crew.computer_use.types import MIN_SCREENSHOT_MAX_PX as _CU_MIN_SCREENSHOT_MAX_PX
-
 # Post-split section internals are reached through the module: the name-level
 # `from kiro_crew.config.sections import (...)` block below is a FROZEN
 # pre-split snapshot (test_config_module_boundaries pins it), so a coercer added
 # after the split must not join it.
+from kiro_crew.config import migration as _migration
 from kiro_crew.config import sections as _sections
+
+# Section DTOs and their field-level coercion live in a one-way sibling module.
+# Re-export every historical loader name so existing imports keep working while
+# KiroCrewConfig remains the compatibility facade and owns read/merge/save.
+from kiro_crew.config.fields import _coerce_bool
+
+# Historical loader names no builder reads any more (a section's defaults are its
+# DTO fields'), kept bound from their owners for the facade.
+from kiro_crew.config.integration_sections import (  # noqa: F401
+    _CU_DEFAULT_ATTACH_SCREENSHOT,
+    _CU_DEFAULT_MAX_TREE_DEPTH,
+    _CU_DEFAULT_MAX_TREE_NODES,
+    _CU_DEFAULT_SCREENSHOT_JPEG_QUALITY,
+    _CU_DEFAULT_SCREENSHOT_MAX_PX,
+    _CU_DEFAULT_TEXT_LIMIT,
+    _DEFAULT_BACKOFF_MAX,
+    _DEFAULT_MAX_RECOVERY,
+    _DEFAULT_PROBE_FAILS,
+    _DEFAULT_SSH_COMPRESSION,
+    _DEFAULT_TUNNEL_BASE_PORT,
+    _DEFAULT_WARM_SET_CAP,
+)
+from kiro_crew.config.migration import (  # noqa: F401
+    _REPORTED_SUPERSEDED_KEYS,
+    CONNECTIONS_UI_MIGRATION_MARKER,
+    MIGRATE_AGENTS,
+    MIGRATE_CONNECTIONS_UI,
+    MIGRATE_DEFAULT_AGENT,
+    MIGRATE_SUPERSEDED_DEFAULTS,
+    MIGRATE_WORKSPACES,
+    _adopt_in_memory,
+    _overlay_supplies,
+    _report_superseded_defaults,
+)
 
 # Pure path primitives live in the leaf module ``config.paths`` (stdlib-only,
 # no ``kiro_crew`` imports) so the modules that only need ``config_dir()`` can
@@ -99,6 +119,7 @@ from kiro_crew.config.paths import (  # noqa: F401, kiro_agents_dir
     data_home,
     ensure_data_home,
     kiro_agents_dir,
+    project_agents_dir,
 )
 from kiro_crew.config.resolution import (  # noqa: F401
     _KNOWN_CONFIG_SECTIONS,
@@ -116,10 +137,50 @@ from kiro_crew.config.resolution import (  # noqa: F401
     tailnet_effective_allowed_logins,
     tailnet_identity_unknown,
 )
-
-# Section DTOs and their field-level coercion live in a one-way sibling module.
-# Re-export every historical loader name so existing imports keep working while
-# KiroCrewConfig remains the compatibility facade and owns read/merge/save.
+from kiro_crew.config.section_builders import (  # noqa: F401
+    _CU_MAX_SCREENSHOT_MAX_PX,
+    _CU_MAX_TEXT_LIMIT,
+    _CU_MAX_TREE_DEPTH,
+    _CU_MAX_TREE_NODES,
+    _CU_MIN_SCREENSHOT_MAX_PX,
+    _DEFAULT_CONNECT_TIMEOUT,
+    _DEFAULT_MINT_TIMEOUT,
+    _STT_IDLE_EVICT_SECS_MAX,
+    _STT_IDLE_EVICT_SECS_MIN,
+    _STT_INTERVAL_MS_MAX,
+    _STT_MAX_TIMEOUT_SECS,
+    _STT_MIN_PARTIAL_INTERVAL_MS,
+    _STT_MIN_SILENCE_MS,
+    _STT_MIN_TIMEOUT_SECS,
+    _build_computer_use_config,
+    _build_cron_history_config,
+    _build_discord_config,
+    _build_feishu_config,
+    _build_imessage_config,
+    _build_instances_config,
+    _build_knowledge_config,
+    _build_mcp_config,
+    _build_mcp_gateway_config,
+    _build_memory_config,
+    _build_messaging_config,
+    _build_monitoring_config,
+    _build_publish_config,
+    _build_session_summary_config,
+    _build_skills_config,
+    _build_slack_config,
+    _build_stt_config,
+    _build_taskrunner_config,
+    _build_teams_config,
+    _build_telegram_config,
+    _build_tunnel_config,
+    _build_wakatime_config,
+    _build_watchdog_config,
+    _build_webex_config,
+    _build_wecom_config,
+    _build_weixin_config,
+    _build_whatsapp_config,
+    coerce_runtime_ceiling,
+)
 from kiro_crew.config.sections import (  # noqa: F401
     _BOT_NAME_MAX,
     _BOT_NAME_RE,
@@ -238,7 +299,6 @@ from kiro_crew.config.sections import (  # noqa: F401
     MemoryStoreConfig,
     MessagingConfig,
     MonitoringConfig,
-    OrchestratorConfig,
     PublishConfig,
     ResolvedBindings,
     ResourceLimitsConfig,
@@ -313,10 +373,12 @@ from kiro_crew.config.sections import (  # noqa: F401
     yolo_duration_to_secs,
 )
 
-# Superseded-default reporting. Leaf module: stdlib only, so importing it
-# here creates no cycle.
-# The same module owns the one-shot adoption of the entries that opt into it.
-from kiro_crew.config.superseded_defaults import (
+# Superseded-default registry. Leaf module: stdlib only, so importing it
+# here creates no cycle. The same module owns the one-shot adoption of the
+# entries that opt into it; ``config.migration`` applies the drift readers, and
+# the loader keeps them bound, with ``record_adoptions`` as the ledger writer
+# its write-back passes on.
+from kiro_crew.config.superseded_defaults import (  # noqa: F401
     SupersededDefault,
     auto_adoptable,
     drift_summary,
@@ -347,21 +409,16 @@ from kiro_crew.config.validation import (  # noqa: F401
     _mask_value,
 )
 from kiro_crew.config.validation import validate_config_data as _validate_config_data  # noqa: F401
-from kiro_crew.constants import (
+from kiro_crew.constants import (  # noqa: F401 - loader namespace compatibility
+    DEFAULT_SPAWN_MIN_MEMORY_GB,
+    DEFAULT_SUBAGENT_COST_GB,
     DEFAULT_SUBAGENT_MAX_TURNS,
+    DEFAULT_SUBAGENT_QUEUE_MAX_WAIT_SECS,
     SUBAGENT_TIMEOUT_MAX,
     SUBAGENT_TIMEOUT_MIN,
     SUBAGENT_TIMEOUT_SECS,
 )
 from kiro_crew.effort import is_valid_effort, model_supports_effort
-from kiro_crew.instances.constants import DEFAULT_CONNECT_TIMEOUT_SECS as _DEFAULT_CONNECT_TIMEOUT
-from kiro_crew.instances.constants import DEFAULT_MAX_RECOVERY_ATTEMPTS as _DEFAULT_MAX_RECOVERY
-from kiro_crew.instances.constants import DEFAULT_MINT_TIMEOUT_SECS as _DEFAULT_MINT_TIMEOUT
-from kiro_crew.instances.constants import DEFAULT_PROBE_FAILURE_THRESHOLD as _DEFAULT_PROBE_FAILS
-from kiro_crew.instances.constants import DEFAULT_RECOVER_BACKOFF_MAX_SECS as _DEFAULT_BACKOFF_MAX
-from kiro_crew.instances.constants import DEFAULT_SSH_COMPRESSION as _DEFAULT_SSH_COMPRESSION
-from kiro_crew.instances.constants import DEFAULT_TUNNEL_BASE_PORT as _DEFAULT_TUNNEL_BASE_PORT
-from kiro_crew.instances.constants import DEFAULT_WARM_SET_CAP as _DEFAULT_WARM_SET_CAP
 from kiro_crew.mcp_gateway.rewriter import default_overlay_dir, default_socket_path
 
 # The memory-store shape rule, applied to store NAMES at load. Leaf module:
@@ -370,27 +427,27 @@ from kiro_crew.memory_stores import (
     DEFAULT_MEMORY_STORE,
     memory_store_name_defect,
 )
-
-# The speech-to-text defaults and the model catalog come from the package that
-# owns them, so the model menu this schema advertises cannot name a model that
-# cannot be downloaded, and a tuning knob cannot document a default the session
-# does not use. No cycle: the only config dependency anywhere under
-# ``kiro_crew.stt`` is the leaf ``config.paths``, never this module.
-from kiro_crew.stt.limits import DEFAULT_IDLE_EVICT_SECS as _STT_DEFAULT_IDLE_EVICT_SECS
-from kiro_crew.stt.limits import DEFAULT_PARTIAL_INTERVAL_MS as _STT_DEFAULT_PARTIAL_INTERVAL_MS
-from kiro_crew.stt.limits import DEFAULT_SILENCE_MS as _STT_DEFAULT_SILENCE_MS
-from kiro_crew.stt.limits import DEFAULT_TIMEOUT_SECS as _STT_DEFAULT_TIMEOUT_SECS
-from kiro_crew.stt.limits import MAX_IDLE_EVICT_SECS as _STT_IDLE_EVICT_SECS_MAX
-from kiro_crew.stt.limits import MAX_INTERVAL_MS as _STT_INTERVAL_MS_MAX
-from kiro_crew.stt.limits import MAX_TIMEOUT_SECS as _STT_MAX_TIMEOUT_SECS
-from kiro_crew.stt.limits import MIN_IDLE_EVICT_SECS as _STT_IDLE_EVICT_SECS_MIN
-from kiro_crew.stt.limits import MIN_PARTIAL_INTERVAL_MS as _STT_MIN_PARTIAL_INTERVAL_MS
-from kiro_crew.stt.limits import MIN_SILENCE_MS as _STT_MIN_SILENCE_MS
-from kiro_crew.stt.limits import MIN_TIMEOUT_SECS as _STT_MIN_TIMEOUT_SECS
-from kiro_crew.stt.models import DEFAULT_MODEL as _STT_DEFAULT_MODEL
+from kiro_crew.owner_only_files import GROUP_OTHER_BITS, is_owner_only_target
+from kiro_crew.session_start_sizing import AUTO as _SESSION_START_AUTO
+from kiro_crew.session_start_sizing import is_auto as _session_start_is_auto
+from kiro_crew.stt.limits import (  # noqa: F401
+    DEFAULT_IDLE_EVICT_SECS as _STT_DEFAULT_IDLE_EVICT_SECS,
+)
+from kiro_crew.stt.limits import (  # noqa: F401
+    DEFAULT_PARTIAL_INTERVAL_MS as _STT_DEFAULT_PARTIAL_INTERVAL_MS,
+)
+from kiro_crew.stt.limits import DEFAULT_SILENCE_MS as _STT_DEFAULT_SILENCE_MS  # noqa: F401
+from kiro_crew.stt.limits import DEFAULT_TIMEOUT_SECS as _STT_DEFAULT_TIMEOUT_SECS  # noqa: F401
+from kiro_crew.stt.models import DEFAULT_MODEL as _STT_DEFAULT_MODEL  # noqa: F401
+from kiro_crew.user_json import strip_utf8_bom
 
 logger = logging.getLogger(__name__)
 
+
+# ---------------------------------------------------------------------------
+# Credentials, the credential file and the dashboard port.
+# Named here: code-style.md cites this module for the credential keys and port.
+# ---------------------------------------------------------------------------
 # Credential keys loaded from .env / environment
 CRED_SLACK_APP_TOKEN = "SLACK_APP_TOKEN"
 CRED_SLACK_BOT_TOKEN = "SLACK_BOT_TOKEN"
@@ -478,6 +535,245 @@ _DEFAULT_PORT = 5476
 DASHBOARD_PORT: int = int(os.environ.get("KIROCREW_PORT", _DEFAULT_PORT))
 
 
+def env_path() -> Path:
+    return config_dir() / ".env"
+
+
+# ``.env`` paths already warned about as undecodable. The set exists because
+# the gateway re-reads ``.env`` from many call sites over its whole life
+# (every ``read_env_file_credential``), and one bad file must not log on each
+# read. A path leaves the set when :func:`read_env_file` next decodes it:
+# without that, the first warning would mute the path for the rest of the
+# process, and an operator who fixes the file and later breaks it again (a
+# second editor save in UTF-16) would get no warning at all while every
+# credential silently reads as unset.
+_warned_undecodable_env: set[str] = set()
+
+
+class EnvFileWideEncodingError(UnicodeDecodeError):
+    """A ``.env`` starts with a UTF-16 or UTF-32 byte-order mark.
+
+    Readers catch exactly this to treat the file as unset. Any other decode
+    error (a BOM-less file invalid in the chosen encoding) propagates as it
+    always has, so the BOM handling cannot hide an unrelated bad file.
+
+    ``encoding`` is the codec the mark declares (``"utf-32-le"`` and so on)
+    and ``object`` holds only the mark itself, never the credentials after
+    it. :attr:`wide_encoding` names the family for a message.
+    """
+
+    @property
+    def wide_encoding(self) -> str:
+        """``"UTF-16"`` or ``"UTF-32"``."""
+        return _wide_family(self.encoding)
+
+    def __str__(self) -> str:
+        # The base class would say "'utf-16-le' codec can't decode bytes in
+        # position 0-1", which reads as a decoding bug rather than a file
+        # saved in the wrong encoding.
+        return f"the .env is saved as {self.wide_encoding}; re-save it as UTF-8"
+
+
+# Longest mark first: a UTF-32LE mark (FF FE 00 00) begins with the UTF-16LE
+# one (FF FE), so it must be matched before it.
+_WIDE_BOMS = (
+    (_codecs.BOM_UTF32_LE, "utf-32-le"),
+    (_codecs.BOM_UTF32_BE, "utf-32-be"),
+    (_codecs.BOM_UTF16_LE, "utf-16-le"),
+    (_codecs.BOM_UTF16_BE, "utf-16-be"),
+)
+
+
+def _wide_family(codec: str) -> str:
+    return "UTF-32" if codec.startswith("utf-32") else "UTF-16"
+
+
+def _wide_bom(head: bytes) -> tuple[bytes, str] | None:
+    """The wide byte-order mark *head* starts with and the codec it declares."""
+    for bom, codec in _WIDE_BOMS:
+        if head.startswith(bom):
+            return bom, codec
+    return None
+
+
+def env_bom_prefix(ep: Path) -> str:
+    """The UTF-8 byte-order mark to put back when rewriting *ep*, or ``""``.
+
+    :func:`read_env_text` drops a UTF-8 BOM, and an in-place rewriter that
+    wrote the text back without it would change how the file decodes: with
+    the BOM it is UTF-8, without it a bare read falls back to the locale, so
+    a non-ASCII byte that loaded before the save would fail or turn to
+    mojibake after it. Each rewriter prefixes this to the text it writes.
+    Reads only the first three bytes; ``""`` when the file is absent or
+    unreadable.
+    """
+    try:
+        with ep.open("rb") as fh:
+            head = fh.read(len(_codecs.BOM_UTF8))
+    except OSError:
+        return ""
+    return "\ufeff" if head == _codecs.BOM_UTF8 else ""
+
+
+def decode_env_bytes(raw: bytes, encoding: str | None = None, errors: str = "strict") -> str:
+    """Decode the bytes of a ``.env`` file, honouring a byte-order mark.
+
+    A UTF-8 BOM (what PowerShell 5.1's ``Out-File -Encoding utf8`` writes) says
+    the file is UTF-8, so the rest is decoded as UTF-8 and the BOM is dropped:
+    left in, it becomes part of the first key and that credential silently
+    never matches. A UTF-16 BOM (PowerShell's default ``>`` / ``Out-File``) or
+    a UTF-32 one raises :class:`EnvFileWideEncodingError`, a
+    :class:`UnicodeDecodeError` readers can tell apart: a wide-encoded
+    credential file is not a supported format, and decoding it as UTF-8 or the
+    locale would either fail with an unrelated error or, under a single-byte
+    code page such as cp1252, silently yield NUL-riddled keys. Without a BOM
+    the bytes are decoded exactly as before: with *encoding*, or the locale
+    default that a bare ``read_text()`` uses when *encoding* is ``None``.
+    """
+    if raw.startswith(_codecs.BOM_UTF8):
+        return raw[len(_codecs.BOM_UTF8) :].decode("utf-8", errors)
+    wide = _wide_bom(raw)
+    if wide is not None:
+        bom, codec = wide
+        # Carry only the BOM bytes: ``.object`` is shown by repr() and by a
+        # traceback that captures locals, and the rest of the file is secrets.
+        reason = f"{_wide_family(codec)} byte-order mark"
+        raise EnvFileWideEncodingError(codec, bom, 0, len(bom), reason)
+    return raw.decode(encoding or _locale.getpreferredencoding(False), errors)
+
+
+def read_env_file(
+    ep: Path, encoding: str | None = None, errors: str = "strict"
+) -> tuple[bytes, str]:
+    """Read a ``.env`` file once; return its raw bytes and decoded text.
+
+    Every reader and in-place rewriter of the data home's ``.env`` decodes it
+    here, or through :func:`read_env_text`, so they agree on what the first
+    key is: if only the readers stripped a BOM, a dashboard clear could not
+    match the key the gateway loads, and the cleared credential would survive.
+    The bytes are for a rewriter that must compare against or restore exactly
+    what it parsed (the secrets migration); they come from the same read as
+    the text. Raises :class:`OSError` or :class:`UnicodeDecodeError`; a
+    rewriter lets the decode error propagate so it never overwrites a file it
+    could not parse. A successful decode re-arms :func:`warn_undecodable_env`
+    for *ep*.
+    """
+    raw = ep.read_bytes()
+    text = decode_env_bytes(raw, encoding, errors)
+    _warned_undecodable_env.discard(str(ep))
+    return raw, text
+
+
+def read_env_text(ep: Path, encoding: str | None = None) -> str:
+    """The decoded text of a ``.env`` file; see :func:`read_env_file`."""
+    return read_env_file(ep, encoding)[1]
+
+
+def warn_undecodable_env(ep: Path, exc: UnicodeDecodeError) -> None:
+    """Log that *ep* could not be decoded and is treated as unset.
+
+    Once per path until :func:`read_env_file` next decodes it.
+    """
+    key = str(ep)
+    if key in _warned_undecodable_env:
+        return
+    _warned_undecodable_env.add(key)
+    logger.warning(
+        "Cannot decode %s (%s); treating it as empty. Save it as UTF-8.",
+        ep,
+        exc.reason,
+    )
+
+
+def read_env_file_credential(key: str, env_file: Path | None = None) -> str:
+    """Best-effort read of one ``KEY=VALUE`` entry from the data home's ``.env``.
+
+    Same line format :meth:`KiroCrewConfig.load_credentials` parses (one pair
+    per line, ``#`` comments, no quotes required, last occurrence wins).
+    Returns ``""`` when the file is absent, unreadable or UTF-16/UTF-32 encoded —
+    callers treat the credential as unset rather than failing.
+
+    Blocking file IO: call via ``asyncio.to_thread`` from async paths.
+    """
+    ep = env_file if env_file is not None else env_path()
+    try:
+        text = read_env_text(ep)
+    except OSError:
+        return ""
+    except EnvFileWideEncodingError as exc:
+        warn_undecodable_env(ep, exc)
+        return ""
+    value = ""
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" in line:
+            k, v = line.split("=", 1)
+            if k.strip() == key:
+                value = v.strip()
+    return value
+
+
+def inject_kiro_cli_api_key(env: MutableMapping[str, str]) -> MutableMapping[str, str]:
+    """Ensure *env* carries kiro-cli's own model credential (``KIRO_API_KEY``).
+
+    The Docker entrypoint scrubs :data:`CREDENTIAL_KEYS` out of the gateway's
+    process environment into the data home's ``.env`` (mode 600) so they never
+    reside in a long-lived ``/proc/<pid>/environ``. Every other credential is
+    consumed in-process from :meth:`KiroCrewConfig.load_credentials`, but this
+    one authenticates the kiro-cli CHILD, which reads it from its own
+    environment — so kiro-cli spawn paths call this to hand the child exactly
+    the one variable it owns, without re-widening the parent's environ. A value
+    already present in *env* wins (same precedence as ``load_credentials``);
+    outside Docker nothing changes because the variable is still inherited.
+
+    Mutates *env* in place and returns it for convenience. Blocking file IO:
+    call via ``asyncio.to_thread`` from async paths.
+    """
+    if not env.get(CRED_KIRO_API_KEY):
+        val = read_env_file_credential(CRED_KIRO_API_KEY)
+        if val:
+            env[CRED_KIRO_API_KEY] = val
+    return env
+
+
+def strip_kiro_cli_api_key(env: MutableMapping[str, str]) -> MutableMapping[str, str]:
+    """Remove kiro-cli's model credential from a child that does not consume it.
+
+    Counterpart to :func:`inject_kiro_cli_api_key` for every ACP backend other
+    than kiro (Claude Code, and KAS): the credential authenticates
+    kiro-cli's OWN v2 agent loop, and it is deliberately NOT in
+    ``sandbox._AGENT_DENIED_ENV_KEYS``, so without this an inherited copy in the
+    raw ``os.environ`` snapshot would ride into an agent process that has no use
+    for it.
+
+    For KAS the child IS a kiro-cli: Crew reaches it through kiro-cli's ACP relay.
+    The strip applies when Crew owns that relay's credential -- the engine asks
+    Crew's vault over its ``_kiro/auth/getAccessToken`` callback, and an API key
+    in its environment would take precedence over the callback. A cli-owned
+    relay (``--auth-method cli``) authenticates itself, so the KAS harness hands
+    it the key with :func:`inject_kiro_cli_api_key` instead -- the test is what
+    the child's engine consumes, not which binary it is.
+
+    Matches the platform env-key convention (exact on POSIX, case-folded on
+    Windows) so a differently-cased Windows spelling cannot slip past. Mutates
+    *env* in place and returns it.
+    """
+    matched = [k for k in env if platform_compat.env_key_allowed(k, _KIRO_API_KEY_ONLY)]
+    for k in matched:
+        del env[k]
+    return env
+
+
+# Single-key allowlist for strip_kiro_cli_api_key's platform-aware matching.
+_KIRO_API_KEY_ONLY = frozenset({CRED_KIRO_API_KEY})
+
+
+# ---------------------------------------------------------------------------
+# Data-home and workspace locations.
+# Every helper reads this module's config_dir()/_default_workspace_base() at call time.
+# ---------------------------------------------------------------------------
 # Dir-derived path helpers (workspace_root, config_path, workspace_dir_for, …)
 # build on the pure primitives imported from ``config.paths`` above. They live
 # here — not in the leaf — so their ``config_dir()`` / ``_default_workspace_base()``
@@ -490,8 +786,19 @@ def _workspace_dir_file() -> Path:
     return config_dir() / "workspace_dir"
 
 
-def _resolve_workspace_root(root: Path) -> Path:
-    """Realpath-normalize a workspace root after ensuring it exists.
+def normalize_workspace_path(raw: str) -> Path:
+    """Drop ONE symmetric outer quote pair (keeping its inside verbatim), expand ``~``."""
+    text = raw.strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'":
+        raw = text[1:-1]
+    try:
+        return Path(raw).expanduser()
+    except RuntimeError:  # ``~unknown-user``: stays relative, so callers fall back
+        return Path(raw)
+
+
+def _resolve_workspace_root(root: Path, *, create: bool = True) -> Path:
+    """Realpath-normalize a workspace root, by default after ensuring it exists.
 
     On hosts with a symlinked ``$HOME``/workspace path (e.g. ``/home/<u> ->
     /local/home/<u>``, ``/home/<u>/workplace -> /workplace/<u>``) the symlink-form
@@ -504,34 +811,45 @@ def _resolve_workspace_root(root: Path) -> Path:
     Normalizing here, at the single source, makes the SAME resolved path flow into
     spawn cwd and the persisted session_map cwd so write and resume always agree.
     This mirrors the existing ``os.path.realpath`` in ``default_project_dir``.
+
+    ``create=False`` is for a read-only caller (the doctor) that must not leave a
+    workspace tree behind on a host where no gateway ever ran; realpath of a
+    missing path resolves the components that do exist.
     """
-    root.mkdir(parents=True, exist_ok=True)
+    if not root.is_absolute():
+        # A relative root would be created under whatever CWD this process has.
+        logger.warning("workspace root %r is not absolute; using the default", str(root))
+        root = _default_workspace_base() / _WORKSPACE_DIR_NAME
+    if create:
+        root.mkdir(parents=True, exist_ok=True)
     return Path(os.path.realpath(str(root)))
 
 
-def workspace_root() -> Path:
+def workspace_root(*, create: bool = True) -> Path:
     """Return the top-level workspace root for LLM sessions and tasks.
 
     Resolution order:
-    1. ``KIROCREW_WORKSPACE`` env var (used as-is, no subdirectory appended)
+    1. ``KIROCREW_WORKSPACE`` env var (no subdirectory appended)
     2. Saved path in ``config_dir()/workspace_dir`` (written by ``kirocrew setup``)
     3. Platform default with ``kirocrew-workspace`` subdirectory
 
+    Values are unquoted and ``~``-expanded; a non-absolute root is replaced by (3).
     The chosen root is realpath-normalized (see ``_resolve_workspace_root``) so
-    sessions resume correctly on hosts with a symlinked home/workspace path.
+    sessions resume correctly on hosts with a symlinked home/workspace path. It is
+    created unless ``create=False``, which only resolves the configured path.
     """
     override = os.environ.get("KIROCREW_WORKSPACE")
     if override:
-        return _resolve_workspace_root(Path(override))
+        return _resolve_workspace_root(normalize_workspace_path(override), create=create)
     if _workspace_dir_file().is_file():
         try:
             saved = _workspace_dir_file().read_text(encoding="utf-8").strip()
             if saved:
-                return _resolve_workspace_root(Path(saved))
+                return _resolve_workspace_root(normalize_workspace_path(saved), create=create)
         except OSError:
             pass
     base = _default_workspace_base()
-    return _resolve_workspace_root(base / _WORKSPACE_DIR_NAME)
+    return _resolve_workspace_root(base / _WORKSPACE_DIR_NAME, create=create)
 
 
 def _session_work_dir(session_key: str | None) -> Path:
@@ -553,11 +871,564 @@ def config_path() -> Path:
     return config_dir() / "config.json"
 
 
+def read_config_text(path: Path) -> str:
+    """The text of ``config.json`` / ``config.local.json``, without a leading BOM.
+
+    Both files are hand-edited, and an editor that saves "UTF-8 with BOM" puts a
+    U+FEFF in front that ``json.loads`` refuses. The mark is dropped by
+    :func:`kiro_crew.user_json.strip_utf8_bom`, the one place that already does it
+    for the other user-owned JSON files. Writers keep emitting plain UTF-8, so a
+    locked write removes the mark. Every in-tree reader of the live files comes
+    through here (``test_config_json_bom.test_every_config_reader_tolerates_a_bom``
+    pins it); readers of COPIES of them -- the pod seed and export bundles -- and
+    ``agent._load_json`` strip the same mark with
+    :func:`~kiro_crew.user_json.strip_utf8_bom` directly.
+    """
+    return strip_utf8_bom(path.read_text(encoding="utf-8"))
+
+
+def overlay_pins(*key_path: str) -> bool:
+    """Whether ``config.local.json`` sets the key at *key_path*.
+
+    That overlay deep-merges OVER ``config.json``, so a Settings switch that
+    writes the BASE file snaps back to the overlay's value after a successful
+    write. A surface reporting this can say why instead of looking broken.
+
+    Best-effort: an unreadable, non-UTF-8 or malformed overlay reports "not
+    pinned" rather than raising, matching the loader itself (it warns and marks
+    the file degraded). The effective value a caller reports is authoritative
+    either way. One helper rather than one per key: the shadowing mechanism is
+    the overlay, not the key.
+    """
+    try:
+        path = config_local_path()
+        if not path.is_file():
+            return False
+        # ValueError covers JSONDecodeError AND the UnicodeDecodeError a file
+        # saved in a non-UTF-8 code page raises.
+        node: object = json.loads(read_config_text(path))
+    except (OSError, ValueError):
+        return False
+    for key in key_path[:-1]:
+        if not isinstance(node, dict):
+            return False
+        node = node.get(key)
+    return isinstance(node, dict) and key_path[-1] in node
+
+
 def config_local_path() -> Path:
-    """Return path to config.local.json — user overrides that survive upgrades."""
+    """Return path to config.local.json — an overlay whose keys win over config.json."""
     return config_dir() / "config.local.json"
 
 
+def denied_commands_path() -> Path:
+    """Return path to denied_commands.json — the denied-command opt-out state.
+
+    This is a KEYSTONE trust-root file (on ``security._SENSITIVE_HOME_DIRS``):
+    it holds ``{disable_all, disabled_ids, user_added}``, the user's opt-out from
+    the built-in deny ceiling. It lives OUTSIDE the agent-readable
+    ``config.json`` precisely so an auto-approved/YOLO agent shell cannot write
+    it (via any shell trick) and disable its own deny ceiling. Only the operator
+    edits it out-of-band — through the dashboard ``/api/security/…`` endpoints,
+    which do not route through the agent tool gate. Respects ``KIROCREW_HOME``.
+    """
+    return config_dir() / "denied_commands.json"
+
+
+def registry_trust_path() -> Path:
+    """Return path to registry_trust.json — operator grants of ``owner`` trust to
+    hand-configured app registries.
+
+    This is a KEYSTONE trust-root file (on ``security._SENSITIVE_HOME_DIRS``),
+    for the same reason as :func:`denied_commands_path`: a grant lets the
+    registries it names have their apps cloned with the machine's git identity,
+    so it must be a decision only the operator can make. ``config.json`` is
+    agent-writable (any shell form), which is exactly why the registry rows there
+    can never carry the tier themselves; the grant lives here, out of the agent's
+    reach, and the operator edits it through the dashboard
+    ``/api/security/trusted-registries`` endpoints. Holds
+    ``{"version": 1, "owner_trusted": ["<credential-free repo url>", ...]}``.
+    Respects ``KIROCREW_HOME``.
+    """
+    return config_dir() / "registry_trust.json"
+
+
+def computer_use_state_path() -> Path:
+    """Return path to computer_use.json — the computer-use primary enable.
+
+    Same KEYSTONE reasoning as :func:`denied_commands_path`, and the leaf is on
+    ``security._CREW_SECRET_LEAVES`` for the same reason: enabling computer use
+    grants full desktop observation plus input synthesis into the operator's real
+    applications, which is a security ceiling, not a preference. Keeping it out
+    of the agent-readable ``config.json`` is what makes it un-flippable by a
+    prompt-injected agent — ``is_sensitive_path`` blocks the tool path and the
+    OS sandbox mounts the keystone read-only for the agent's shell.
+
+    Holds ``{enabled, allowed_apps, extra_denied_apps}``; every read fails soft
+    to DISABLED (see ``computer_use.enable_state``). The only writer is the
+    dashboard ``/api/computer-use/config`` PUT, which does not route through the
+    agent tool gate. Respects ``KIROCREW_HOME``.
+
+    Note the deliberate asymmetry with the ``computer_use`` section of
+    ``config.json``: that section carries display/limit knobs ONLY and has no
+    ``enabled`` field, precisely so there is exactly one place the feature can be
+    turned on and it is not one the agent can reach.
+    """
+    return config_dir() / "computer_use.json"
+
+
+def oauth_endpoints_path() -> Path:
+    """Return path to oauth_endpoints.json — the operator OAuth-endpoint extension.
+
+    Same KEYSTONE reasoning as :func:`denied_commands_path` and
+    :func:`computer_use_state_path`, and the leaf is on
+    ``security._CREW_SECRET_LEAVES`` for the same reason: each listed endpoint
+    widens the banner-only OAuth entropy carve-out (``security.py``'s
+    ``_OAUTH_AUTHORIZATION_ENDPOINTS``), so an agent that could write this file
+    could exempt an attacker-controlled host from the exfiltration heuristics —
+    it is a trust boundary, not a preference. ``is_sensitive_path`` blocks the
+    tool path and the OS sandbox mounts the keystone read-only for the shell.
+
+    Holds ``{"additional_authorization_endpoints": [{"host": …, "path": …}]}``;
+    every read fails soft to an EMPTY extension set (see
+    ``security._load_operator_oauth_endpoints``). There is no dashboard writer:
+    the operator hand-edits the file out-of-band. Respects ``KIROCREW_HOME``.
+    """
+    return config_dir() / "oauth_endpoints.json"
+
+
+def aws_consent_path() -> Path:
+    """Return path to aws_service_consent.json — paid-AWS-service consent.
+
+    Same KEYSTONE reasoning as :func:`computer_use_state_path`, and the leaf is
+    on ``security._CREW_SECRET_LEAVES`` for the same reason: a recorded consent
+    to call a PAID AWS service is an authorization, not a preference. Storing it
+    in ``config.json`` would leave it writable by any auto-approved agent shell,
+    so a prompt-injected agent could mint the grant and consent, on the
+    operator's behalf, to spending the operator's money in an account it picked.
+    ``is_sensitive_path`` blocks the tool path and the OS sandbox mounts the
+    keystone read-only for the shell.
+
+    Holds ``{"<service>": {profile, region, account, arn, granted_at}}``; every
+    read fails soft to NO CONSENT (see ``aws_consent.read_grant``). The writer is
+    the authenticated dashboard ``/api/aws/consent`` handler, which opens the path
+    directly rather than through this gate. Respects ``KIROCREW_HOME``.
+    """
+    return config_dir() / "aws_service_consent.json"
+
+
+def decisions_consent_path() -> Path:
+    """Return path to decisions_consent.json — consent to send conversation state to Jev.
+
+    Same KEYSTONE reasoning as :func:`aws_consent_path`, and the leaf is on
+    ``security._CREW_SECRET_LEAVES`` for the same reason: enabling the decision
+    seam sends message text and skill descriptions to an external, paid provider,
+    which is an egress authorization, not a preference. Kept out of the
+    agent-writable ``config.json`` so a prompt-injected shell cannot flip it and
+    have the live config watcher start the egress; ``is_sensitive_path`` blocks
+    the tool path and the OS sandbox mounts the keystone read-only for the shell.
+
+    Holds ``{"enabled": bool, "endpoint": str}`` -- the switch and the provider
+    address the owner consented to; every read fails soft to NOT CONSENTED (see
+    ``decisions.consent``). The only writer is the authenticated, browser-only
+    dashboard ``PUT /api/decisions/consent`` handler, which opens the path
+    directly rather than through this gate. Respects ``KIROCREW_HOME``.
+
+    The ``decisions`` section of ``config.json`` deliberately carries NO
+    ``enabled`` field: sampling share and provider knobs only, so there is exactly
+    one place the seam can be switched on and it is not one the agent can reach.
+    """
+    return config_dir() / "decisions_consent.json"
+
+
+def file_delivery_consent_path() -> Path:
+    """Return path to file_delivery_consent.json -- flagged-file delivery consent.
+
+    Same KEYSTONE reasoning as :func:`aws_consent_path`, and the leaf is on
+    ``security._CREW_SECRET_LEAVES`` for the same reason: a recorded consent to
+    deliver a file the credential scanner flagged is an authorization, not a
+    preference. Storing it in ``config.json`` would leave it writable by any
+    auto-approved agent shell, so a prompt-injected agent could mint the grant and
+    consent, on the owner's behalf, to shipping the owner's secrets -- the exact
+    shape ``CredentialPolicy.exempt_exact_hosts`` refuses when it says such a set
+    is "NEVER sourced from ``config.json``". ``is_sensitive_path`` blocks the tool
+    path and the OS sandbox mounts the keystone read-only for the shell.
+
+    Holds ``{"<destination_class>": {destination_class, granted_at}}``; every read
+    fails soft to NO CONSENT (see ``file_delivery_consent.read_grant``). The only
+    writer is the authenticated, OWNER-gated dashboard
+    ``/api/file-delivery/consent`` handler, which opens the path directly rather
+    than through this gate. There is deliberately NO CLI verb -- a terminal
+    command that records a grant on request is a grant an automated caller can
+    take. Respects ``KIROCREW_HOME``.
+    """
+    return config_dir() / "file_delivery_consent.json"
+
+
+def credential_redaction_path() -> Path:
+    """Return path to credential_redaction.json -- the credential-redaction switch.
+
+    Same KEYSTONE reasoning as :func:`file_delivery_consent_path`, and the leaf
+    is on ``security._CREW_SECRET_LEAVES`` for the same reason: turning the
+    credential scrubber OFF is an authorization, not a preference. Stored in the
+    agent-readable ``config.json`` it would be writable by any auto-approved agent
+    shell, so a prompt-injected agent could switch off the very pass that keeps
+    the secrets it can read out of the owner's dashboard file viewer (the one
+    surface the switch governs). ``is_sensitive_path`` blocks the tool path and
+    the OS sandbox mounts the keystone read-only for the shell.
+
+    Holds ``{"enabled": bool, "changed_at": str}``; a missing, unreadable or
+    malformed file reads as ENABLED (see ``security.redaction_switch``), so the
+    fail direction is always "keep redacting". The only writer is the
+    authenticated, OWNER-gated dashboard ``/api/security/credential-redaction``
+    handler. Respects ``KIROCREW_HOME``.
+    """
+    return config_dir() / "credential_redaction.json"
+
+
+def ssh_auth_sock_consent_path() -> Path:
+    """Return path to ssh_auth_sock_consent.json -- the SSH-agent forward consent.
+
+    Same KEYSTONE reasoning as :func:`aws_consent_path` and
+    :func:`file_delivery_consent_path`, and the leaf is on
+    ``security._CREW_SECRET_LEAVES`` for the same reason: keeping
+    ``SSH_AUTH_SOCK`` in the agent subprocess environment grants USE of the
+    operator's ssh-agent keys -- signing, git-over-SSH, and any authentication
+    the socket reaches -- for the lifetime of the session. That is an
+    authorization, not a preference. Stored in the agent-readable ``config.json``
+    it would be writable by any auto-approved agent shell, so a prompt-injected
+    agent could flip its own forwarding on and a subagent it spawns would then
+    authenticate as the operator with keys the sandbox exists to keep out of its
+    reach. ``is_sensitive_path`` blocks the tool path and the OS sandbox mounts
+    the keystone read-only for the agent's shell, so the consent is
+    un-flippable from inside the sandbox.
+
+    Holds ``{"enabled": bool, "granted_at": str}``; every read fails soft to
+    DISABLED (see ``ssh_auth_sock_consent.is_granted``). The only writer is the
+    authenticated, OWNER-gated dashboard handler, which opens the path directly
+    rather than through this gate. There is deliberately NO CLI verb -- a
+    terminal command that records the grant on request is a grant an automated
+    caller can take. Respects ``KIROCREW_HOME``.
+    """
+    return config_dir() / "ssh_auth_sock_consent.json"
+
+
+def read_local_secret(port: int, dial_host: str | None = None) -> str:
+    """Read the internal-API credential for the gateway on *port*.
+
+    Single home for the secret read that callers (cron scripts, MCP tool bridges,
+    CLI) need to authenticate to the gateway's internal API. Returns empty string
+    when no credential can be read.
+
+    Resolution depends on whether the caller can name the ADDRESS it dials:
+
+    * With *dial_host* -- the loopback host the caller is about to send the
+      credential to (``127.0.0.1``, ``localhost``, ``::1``) -- the credential is
+      resolved per LISTENER: :func:`run_marker.read_listener_secret` returns the
+      value published under every loopback family that host reaches. When it
+      returns a value, that value is used. When it returns nothing, the answer
+      turns on WHY:
+
+      - The gateway published NO listener entry for this port at all
+        (:func:`run_marker.has_listener_entries` is false) -- an older gateway,
+        or one that could not name its bound address. There is no OTHER
+        listener's credential on this port to confuse it with, so this falls back
+        to the port-keyed read and then the shared file, exactly as an
+        address-less caller does. This is the pre-per-listener world, not the
+        desync, and withholding the credential here would stop an ordinary
+        install from authenticating at all.
+      - Listener entries EXIST but none covers the family *dial_host* reaches.
+        A gateway bound some address other than the one being dialled, so the
+        port-keyed read could hand back a DIFFERENT listener's credential -- the
+        exact desync this issue closes. This FAILS CLOSED (returns ``""``): no
+        fallback, because the fallback is the bug.
+
+    * Without *dial_host* -- a caller that structurally cannot name an address --
+      resolution is per LISTENER for the port only: ``run/gateway-<port>.secret``,
+      then the shared ``.local_secret``. This is the pre-existing behaviour, kept
+      for the callers section 12.1 names as resolving a port and nothing finer.
+
+    Every reader that constructs a loopback URL a line or two away from this call
+    SHOULD pass that URL's host as *dial_host*, so the credential is paired to the
+    listener it will actually reach. *port* stays REQUIRED regardless: the
+    credential is a function of the dial target, so inferring the target here
+    would let a caller dial one gateway while authenticating for another -- the
+    exact desync, reintroduced one call site at a time and invisible at the call
+    site.
+    """
+    # Function-local: port_resolution imports this module, so a module-level
+    # import would be circular.
+    from kiro_crew.instances import run_marker
+
+    if dial_host:
+        try:
+            listener = run_marker.read_listener_secret(int(port), dial_host)
+            if listener:
+                return listener
+            # An empty listener read is a REFUSAL unless the gateway PROVABLY
+            # published no listener entries at all -- only then does this port
+            # predate the per-listener publish and the port-keyed read below is
+            # safe and required. ``has_listener_entries`` is three-valued: a
+            # proven-empty ``False`` re-opens the fallback; ``True`` (entries
+            # exist, none covered the family) and ``None`` (could not enumerate,
+            # so absence is unproven) both FAIL CLOSED here -- an unreadable
+            # ``run/`` must not silently downgrade to the shared credential.
+            if run_marker.has_listener_entries(int(port)) is not False:
+                return ""
+        except Exception:
+            return ""
+    try:
+        per_port = run_marker.read_secret(int(port))
+    except Exception:
+        per_port = ""
+    if per_port:
+        return per_port
+    try:
+        return (config_dir() / ".local_secret").read_text().strip()
+    except OSError:
+        return ""
+
+
+class WorkspaceDirUnusable(Exception):
+    """A workspace ``dir`` cannot be materialized as a directory.
+
+    ``code`` is the stable token both writers map onto their own error contract
+    (the dashboard's 409 body ``code``; the CLI's exit-1 message):
+    ``workspace_dir_not_a_directory`` when the path exists as something that is
+    not a directory, ``workspace_dir_uncreatable`` for everything else (a missing
+    parent, a parent swapped for a link, a permission error).
+    """
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+class _PinnedCreateRefusal(Exception):
+    """pinned_fs's refusal for the workspace create, mapped by the caller."""
+
+
+def materialize_workspace_dir(validated: Path, *, leaf: Path, display: str) -> None:
+    """Make *validated* exist as a directory: adopt one that is there, create one that is not.
+
+    One writer-side rule shared by the dashboard handler and the CLI: a published
+    workspace must name a usable directory for provider cwd and project documents.
+
+    *validated* is the path AS THE CALLER'S VALIDATION RESOLVED IT (``Path.resolve()``
+    at validation time). This function never resolves it again: resolving here would
+    follow whatever a parent component points at by now, which is the exact swap the
+    pinned create exists to refuse (see :func:`pinned_fs.pin_parent`).
+
+    An existing DIRECTORY is adopted untouched (pointing a new workspace at a folder
+    the owner already keeps is the normal case for an absolute ``dir``). Anything
+    else that exists at the name is refused, as is a missing PARENT: only the final
+    component is ever created, so a mistyped nested ``dir`` fails here instead of
+    committing an entry that breaks an unrelated member later.
+
+    Adoption AND creation are judged through the PINNED parent where the platform
+    can pin: every parent component is opened with ``O_NOFOLLOW`` relative to the
+    previous one, and the final name is inspected or made relative to that
+    descriptor. A component swapped for a link after validation is therefore
+    refused rather than followed. That is the discipline every other write under a
+    validated path in this product keeps (:mod:`kiro_crew.pinned_fs`). Where nothing
+    can be pinned (Windows: no ``dir_fd``, no ``O_NOFOLLOW``), both checks are by
+    name, which is that module's documented limit, not a silent substitute.
+
+    Not a rollback site: the directory this makes is left in place when the
+    caller's config write later fails. It is reachable only through the entry
+    written in the same locked section, and a concurrent create can already have
+    adopted it, so deleting it is the unsafe option.
+
+    *leaf* is the same path BEFORE resolution. Resolving follows a link at the
+    final name, so *validated* alone never shows one: the entry the caller
+    registers is the unresolved spelling, and a link or junction there is
+    refused on every platform. It is normalized first, so a ``..`` through a
+    missing component cannot make the probe miss the name resolution lands on.
+    """
+    if platform_compat.is_link_or_junction(os.path.normpath(leaf)):
+        raise WorkspaceDirUnusable(
+            "workspace_dir_not_a_directory",
+            f"'{display}' is a link, not a directory; choose another dir or remove it first",
+        )
+    if pinned_fs.supports_pinned_walk():
+        try:
+            parent_fd = pinned_fs.pin_parent(
+                str(validated.parent),
+                what=f"workspace directory {display!r}",
+                refusal=_PinnedCreateRefusal,
+            )
+            try:
+                st = pinned_fs.stat_at(parent_fd, validated.name)
+                if st is None:
+                    try:
+                        os.mkdir(validated.name, dir_fd=parent_fd)
+                        return
+                    except FileExistsError:
+                        st = pinned_fs.stat_at(parent_fd, validated.name)
+                if st is not None and _stat.S_ISDIR(st.st_mode):
+                    return
+                raise WorkspaceDirUnusable(
+                    "workspace_dir_not_a_directory",
+                    f"'{display}' exists and is not a directory; "
+                    "choose another dir or remove it first",
+                )
+            finally:
+                os.close(parent_fd)
+        except _PinnedCreateRefusal as exc:
+            raise WorkspaceDirUnusable(
+                "workspace_dir_uncreatable", f"Directory '{display}' could not be created: {exc}"
+            ) from exc
+        except OSError as exc:
+            raise WorkspaceDirUnusable(
+                "workspace_dir_uncreatable",
+                f"Directory '{display}' could not be created: {exc.strerror or exc}",
+            ) from exc
+
+    # By name here, so a link at the name must be screened out explicitly: a
+    # Windows junction answers is_dir() True and is_symlink() False, and the
+    # pinned arm above refuses every link through its lstat.
+    if not platform_compat.is_link_or_junction(validated) and validated.is_dir():
+        return
+    try:
+        os.mkdir(validated)
+    except FileExistsError as exc:
+        # EEXIST is the filesystem itself saying something is at the name: a
+        # racer's directory is the state this create wanted, while a file, a
+        # socket, a dangling link, a symlink or a junction cannot serve as a workspace, and
+        # registering one writes back exactly the unusable entry this prevents.
+        if not platform_compat.is_link_or_junction(validated) and validated.is_dir():
+            return
+        raise WorkspaceDirUnusable(
+            "workspace_dir_not_a_directory",
+            f"'{display}' exists and is not a directory; choose another dir or remove it first",
+        ) from exc
+    except OSError as exc:
+        raise WorkspaceDirUnusable(
+            "workspace_dir_uncreatable",
+            f"Directory '{display}' could not be created: {exc.strerror or exc}",
+        ) from exc
+
+
+def workspace_dir_for(workspace: str | None = None) -> Path:
+    """Resolve a named workspace to its directory path.
+
+    Reads the LOADED config's ``workspaces`` table, not the raw bytes on disk, so
+    this and ``resolve_agent_bindings`` cannot answer the same question two ways:
+    the loaded table is the one the validator has repaired and the write-back
+    migration has normalized, and it is what every other consumer already reads.
+
+    Values starting with ``/`` or ``~`` are treated as absolute paths.
+    Otherwise the value is relative to ``config_dir()`` (``~/.kiro/crew/``).
+
+    An unmapped name falls back to the ``WorkspaceConfig`` default directory —
+    NOT to ``default_workspace``'s directory, which could be an absolute path
+    outside the data home — and the fall-through is LOGGED. Two DISTINCT names
+    both resolving to the same ``<home>/workspace`` is how a workspace split
+    turns into a shared tree nobody notices, so that case warns. An install that
+    simply has no ``workspaces`` section yet is the ordinary fresh state and logs
+    at debug — it is one workspace, not a collision.
+
+    Never raises. ``default_project_dir`` and the workspace-identity block are
+    built on this, so a raise here would break a fresh install and take both
+    with it; a config that cannot be loaded resolves to the default directory.
+    """
+    mapping: dict[str, WorkspaceConfig] = {}
+    ws = workspace or ""
+    configured_default = ""
+    try:
+        cfg = KiroCrewConfig.load()
+        mapping = cfg.workspaces
+        configured_default = cfg.default_workspace
+        ws = workspace or configured_default
+    except Exception:
+        logger.warning(
+            "could not load config to resolve workspace %r; using the default directory",
+            workspace,
+            exc_info=True,
+        )
+
+    entry = mapping.get(ws)
+    if entry is None:
+        # An unmapped name resolves to the BASE workspace directory, never to the
+        # configured default's directory. That distinction is the boundary: this
+        # answer becomes a filesystem root, and one caller
+        # (``dashboard/handlers/files.py``'s ``?workspace=``) takes the name from a
+        # request without the ``is_sensitive_path`` check its ``?project=`` sibling
+        # applies. Hopping to ``default_workspace`` would let an unrecognized name
+        # reach whatever absolute ``dir`` that workspace declares, so an unmapped
+        # name stays inside the data home by construction.
+        #
+        # It is still a fail-OPEN worth naming: two DISTINCT declared-looking names
+        # both landing here share one tree, which is how a workspace split becomes a
+        # shared tree nobody notices. An install with no ``workspaces`` section is
+        # the ordinary fresh state and is one workspace, not a collision.
+        report = logger.debug if ws == configured_default else logger.warning
+        report(
+            "workspace %r is not declared in workspaces; falling back to the base "
+            "workspace directory",
+            ws,
+        )
+    return workspace_dir_from_entry(entry)
+
+
+def workspace_dir_from_entry(entry: WorkspaceConfig | None) -> Path:
+    """The directory a ``workspaces`` entry names, by the ONE placement rule.
+
+    ``entry.dir`` may be absolute (anywhere on the host) or relative to the
+    data home; an absent entry or an empty ``dir`` is the base workspace
+    directory under ``config_dir()``. :func:`workspace_dir_for` applies this
+    after its own config load; a caller that already holds a
+    :class:`KiroCrewConfig` snapshot (the folder-steering memory-store fence)
+    applies it directly to that snapshot's entries so every workspace it fences
+    comes from the same load -- a second load per name could observe a
+    different document (a concurrent write, a transient read failure) and
+    silently fall back to the base directory for a workspace the first load
+    had placed elsewhere.
+    """
+    dirname = entry.dir if entry is not None and entry.dir else WorkspaceConfig().dir
+    p = Path(dirname).expanduser()
+    if p.is_absolute():
+        return p
+    return config_dir() / dirname
+
+
+def default_project_dir(workspace: str | None = None) -> str:
+    """Resolve the default project directory for a workspace.
+
+    Returns the realpath of ``workspace_dir_for(workspace)`` if it exists and
+    is not a sensitive path, otherwise returns ``""``.
+
+    Used by chat_handlers (slot.project fallback) and session.py (pool cwd)
+    to avoid duplicating the same resolution + validation logic.
+    """
+    from kiro_crew.security import is_sensitive_path  # circular import
+
+    try:
+        ws_dir = os.path.realpath(str(workspace_dir_for(workspace)))
+        if os.path.isdir(ws_dir) and not is_sensitive_path(ws_dir):
+            return ws_dir
+    except Exception:
+        pass
+    return ""
+
+
+def resolve_agent_config_path() -> Path:
+    """Return defaults.json, preferring project-dir override for development.
+
+    All modules that need the agent config path should call this instead
+    of reimplementing the resolution chain.
+    """
+    proj = os.environ.get("KIROCREW_PROJECT_DIR")
+    if proj:
+        p = Path(proj) / "agents" / "defaults.json"
+        if p.exists():
+            return p
+    return config_package_dir() / "defaults.json"
+
+
+# ---------------------------------------------------------------------------
+# Unsandboxed-exec platform policy, applied where the raw document is read.
+# ---------------------------------------------------------------------------
 def unsandboxed_exec_platform_default() -> bool:
     """What an UNDECLARED ``agent.sandbox_allow_unsandboxed_exec`` resolves to here.
 
@@ -606,7 +1477,7 @@ def unsandboxed_exec_declared() -> bool:
     """
     for path in (config_path(), config_local_path()):
         try:
-            doc = json.loads(path.read_text(encoding="utf-8"))
+            doc = json.loads(read_config_text(path))
         except (OSError, ValueError):
             continue
         agent = doc.get("agent") if isinstance(doc, dict) else None
@@ -615,6 +1486,733 @@ def unsandboxed_exec_declared() -> bool:
     return False
 
 
+# ---------------------------------------------------------------------------
+# config.json document I/O: raw reads, the sidecar lock, atomic writes, meta stamp.
+# The config writers stay in this file: only loader.py is exempt from the writer scans.
+# ---------------------------------------------------------------------------
+def _lock_target(path: Path) -> Path:
+    """The path ``update_config_locked`` would put its lock sidecar beside.
+
+    It resolves a symlinked config before locking, so that -- not *path* -- is
+    what the containment question has to be asked about. Returns *path* unchanged
+    when it is not a symlink or cannot be resolved, which is the conservative
+    answer either way: an unresolvable path fails the containment check.
+    """
+    try:
+        return path.resolve() if path.is_symlink() else path
+    except OSError:
+        return path
+
+
+def _raw_config() -> dict:
+    """Load raw config.json as a dict, re-reading the file on every call.
+
+    Uncached on purpose: callers want the bytes on disk right now, and the
+    validated-config cache is keyed for :meth:`KiroCrewConfig.load`, not for
+    this raw view. An absent, unreadable or non-object file reads as ``{}``, so
+    the annotated ``dict`` holds for every caller.
+    """
+    p = config_path()
+    if not p.exists():
+        return {}
+    try:
+        raw = json.loads(read_config_text(p))
+    except (json.JSONDecodeError, OSError):
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+class ConfigWriteRefused(ValueError):
+    """A config document was refused at the publish floor and nothing was written.
+
+    Raised by :func:`write_config_atomically` before any byte reaches disk, for
+    content that must never be persisted: today, a provider key in plaintext under
+    ``agent.deepseek_env``, where the only admissible value is a
+    ``secret://<vault name>`` reference (``sections.deepseek_env_plaintext_keys``).
+    The message names env-var KEYS only, never the value, so it is safe to print
+    on a terminal and to log. A ``ValueError`` so the CLI's existing refusal shape
+    applies, and so a caller cannot mistake it for the unreadable-file case
+    :class:`ConfigReadError` names.
+    """
+
+
+class ConfigReadError(Exception):
+    """``config.json`` exists but could not be read as a config object.
+
+    Raised by :func:`read_config_for_update`, whose callers are about to write
+    the value back, and by :meth:`KiroCrewConfig.save` when the instance was
+    loaded while the base file could not be read. It deliberately does NOT
+    inherit from ``OSError`` or ``ValueError`` so an existing broad ``except
+    OSError`` around a write cannot swallow it and resume the clobbering path.
+    """
+
+
+def read_config_for_update(path: Path | None = None) -> dict:
+    """Read ``config.json`` for a read-modify-write, failing CLOSED.
+
+    Every partial config update (flip one toggle, persist one channel) has to
+    read the whole file, mutate one key, and write it all back. The obvious
+    ``try: json.loads(...) except Exception: data = {}`` is a **data-loss bug**
+    in that shape: the fallback is indistinguishable from "the user has no
+    settings", so the write-back replaces a fully populated config with a
+    single-key one. Every setting the user ever chose is gone, silently, and
+    the endpoint still reports success.
+
+    The read fails for mundane reasons — most commonly a *torn read*: a
+    truncate-then-write writer (a hand edit, another tool, an older build; no
+    product writer, see ``TestNoRawOpenWriteOfConfig``) leaves a window in which
+    a concurrent reader observes a half-written file. That window is small,
+    which is exactly what makes the resulting loss so hard to reproduce and
+    report.
+
+    So: an **absent** file returns ``{}`` (a genuine empty starting point), and
+    an unreadable or non-object file raises :class:`ConfigReadError`. Callers
+    must let that abort the update — leaving the existing file untouched is
+    always better than overwriting it with defaults.
+
+    Pair this with :func:`kiro_crew.atomic_write.atomic_write` on the way out so
+    the write cannot create the torn window for the next reader.
+    """
+    p = path if path is not None else config_path()
+    try:
+        if not p.exists():
+            return {}
+        raw = json.loads(read_config_text(p))
+    except (json.JSONDecodeError, UnicodeDecodeError, OSError) as e:
+        # UnicodeDecodeError is a ValueError, NOT an OSError, so it needs naming
+        # explicitly: a config containing invalid UTF-8 (a truncated multi-byte
+        # sequence from a torn write, or a mojibake'd hand edit) would otherwise
+        # escape this controlled path and crash the caller instead of returning
+        # the clean "config unreadable" refusal.
+        raise ConfigReadError(f"could not read config at {p}: {e}") from e
+    if not isinstance(raw, dict):
+        raise ConfigReadError(f"config at {p} is not a JSON object (got {type(raw).__name__})")
+    return raw
+
+
+def _refuse_unpublishable(data: dict, path: Path) -> None:
+    """Refuse *data* if it carries content this write must not land in ``config.json``.
+
+    The publish floor for every writer that lands a config document -- the locked
+    read-modify-write (``update_config_locked``, behind ``config set`` and every
+    dashboard PUT) and the whole-document :meth:`KiroCrewConfig.save` alike -- so
+    the rule holds however a value arrived. One rule today: a provider key typed
+    in plaintext under ``agent.deepseek_env`` is refused, because that mapping
+    takes ``secret://`` references only and a plaintext that reaches disk is
+    already the defect the spawn-time validator would later name. Keyed on the
+    document's SHAPE rather than on the path, so an agent spec written through the
+    same function is untouched -- it has no ``agent.deepseek_env`` to refuse.
+
+    What is refused is what THIS write does: a plaintext it introduces, or a
+    mapping it changes while a plaintext entry stays in it. A plaintext an older
+    build or a hand edit already landed, left exactly as the write found it, is not
+    this write's doing -- every writer in the product reaches this function, most
+    of them for fields nothing to do with this one and with no handler for the
+    refusal, so refusing them all would turn one stale value into an unhandled
+    exception on every Slack allowlist change and every unrelated dashboard write.
+    Such a write publishes, and the stale value is named on the log (keys only,
+    never the value) so it is not silent; the DeepSeek spawn that would use it is
+    still refused by the validator, and a write that does touch the mapping has to
+    remove the plaintext first. The prior document is read from *path*; when it
+    cannot be read the plaintext cannot be shown pre-existing and is refused, so an
+    absent or unparseable file fails closed.
+    """
+    agent = data.get("agent") if isinstance(data, dict) else None
+    mapping = agent.get("deepseek_env") if isinstance(agent, dict) else None
+    plaintext = _sections.deepseek_env_plaintext_keys(mapping)
+    if not plaintext:
+        return
+    names = ", ".join(repr(key) for key in plaintext)
+    if _deepseek_env_on_disk(path) == mapping:
+        logger.warning(
+            "config.json already holds a literal value under agent.deepseek_env entry %s; "
+            "this write left that mapping as it found it. That mapping takes a "
+            "'secret://<vault name>' reference only, and a DeepSeek session is refused "
+            "while it stands: save the key under Settings > Secrets, then map it as "
+            "'secret://<vault name>'.",
+            names,
+        )
+        return
+    raise ConfigWriteRefused(
+        f"agent.deepseek_env entry {names} holds a literal value, so the config "
+        "write was refused: this mapping takes a 'secret://<vault name>' reference "
+        "only, and no provider key is ever stored in config.json. Save the key "
+        "under Settings > Secrets, then map it as 'secret://<vault name>'."
+    )
+
+
+def _deepseek_env_on_disk(path: Path) -> object:
+    """The ``agent.deepseek_env`` value the document at *path* holds, or ``None``.
+
+    Read for :func:`_refuse_unpublishable` alone, to tell a plaintext this write
+    introduces from one it merely re-writes unchanged. ``None`` for an absent,
+    unreadable or unparseable file -- and for a document with no such mapping --
+    which the caller treats as "not shown pre-existing".
+    """
+    try:
+        document = json.loads(read_config_text(path))
+    except (OSError, ValueError):
+        return None
+    agent = document.get("agent") if isinstance(document, dict) else None
+    return agent.get("deepseek_env") if isinstance(agent, dict) else None
+
+
+def write_config_atomically(path: Path, data: dict, *, fsync: bool = False) -> None:
+    """Write a config dict to *path* atomically, PRESERVING its permissions.
+
+    The companion to :func:`read_config_for_update`. Two properties matter:
+
+    * **Atomic** (tmp+rename) so a concurrent reader can never observe a
+      half-written file. A truncate-then-write leaves a window in which a reader
+      sees invalid JSON; a reader that mistakes that for "no settings" will write
+      the emptiness back and destroy the user's config.
+    * **Mode-preserving.** Because tmp+rename creates a NEW inode, the umask
+      default (typically ``0644``) would silently replace an operator's tightened
+      ``0600``. ``config.json`` can hold inline credentials, so a settings write
+      must never widen who can read it. An existing file's mode is carried over
+      (minus group/other access inside the data home); a newly created one
+      defaults to owner-only.
+
+    ``atomic_write``'s ``mode`` routes through ``fchmod_safe``, which applies the
+    mode on POSIX and is a documented no-op on Windows.
+
+    **Windows gets a real owner-only DACL, not just the inert mode.** The lockdown
+    is applied in-process through ``advapi32`` (measured at 0.24 ms, against 313 ms
+    for the ``icacls`` subprocess), so it is safe on the event loop even though this
+    function is called from ``async`` request handlers and from
+    ``KiroCrewConfig.save()``. Since ``config.json`` can carry inline provider
+    tokens and API keys, applying it is the correct default rather than a duty
+    pushed onto each caller.
+
+    The two guarantees do not collide, because they apply on different platforms:
+    mode preservation is a POSIX concept (Windows has no bits to preserve), and
+    the DACL is a Windows concept. Hence the platform branch below rather than
+    passing both to ``atomic_write``, which refuses ``restrict_to_owner=True``
+    alongside a wider explicit ``mode``.
+
+    **On a network-homed data home the DACL turns on the CALLER, not the volume.**
+    The in-process lockdown costs 0.24 ms on a local volume but is bounded only by
+    SMB on a UNC or mapped-drive path, which a write running inline on the event
+    loop cannot afford. That is a fact about the calling thread, so it is asked as
+    one, via :func:`kiro_crew.atomic_write.on_event_loop`. A caller that has
+    offloaded this write -- ``dashboard/chat_utils.run_config_write``, any
+    ``asyncio.to_thread`` wrapper, and every CLI and startup path, which have no
+    loop at all -- blocks only its own thread and therefore gets the owner-only
+    DACL on **any** volume. Only a write still inline on the loop falls back to
+    classifying the volume and skipping when it is remote.
+
+    **Symlinks are followed, not replaced.** ``os.replace`` renames over the link
+    itself, turning a symlinked ``config.json`` into a regular file and orphaning
+    its target — whereas the ``write_text`` this replaced followed the link and
+    updated the target. Symlinking the config into a dotfiles repo is a normal
+    setup, so the target is resolved first to preserve that behavior.
+    """
+    _refuse_unpublishable(data, path)
+    # Resolve BEFORE stat/write so a symlinked config keeps pointing at its
+    # target (and the mode preserved is the target's, not the link's).
+    try:
+        if path.is_symlink():
+            path = path.resolve()
+    except OSError:
+        pass
+    # Decide the Windows lockdown HERE, before the stat and the mkdir below and
+    # before anything atomic_write does -- every one of those is a round-trip on a
+    # network-homed data home. A DACL write to a UNC or mapped-drive path is an
+    # unbounded SMB round-trip, so when it cannot be afforded it has to be ruled
+    # out before the work starts rather than part way through.
+    #
+    # But whether it can be afforded is a question about the CALLING THREAD, not
+    # about the volume. The volume was only ever a proxy: this function is
+    # synchronous and async dashboard handlers reach it inline, where an unbounded
+    # wait stalls the one loop the whole gateway shares. Off the loop there is
+    # nothing to stall -- a worker started by ``run_config_write`` /
+    # ``asyncio.to_thread``, a CLI invocation, a startup path all block only
+    # themselves -- so the same predicate ``atomic_write`` already gates its own
+    # unbounded-on-Windows step on decides here too, and a network-homed data home
+    # gets the DACL whenever its caller has offloaded the write.
+    #
+    # This sits just AFTER the symlink resolve rather than at the very top of the
+    # function, and deliberately: a config symlinked into a dotfiles repo (which
+    # the docstring above calls a normal setup) can point at a DIFFERENT volume
+    # than the link, so classifying before resolving would classify the wrong one.
+    # The resolve is two stats; the earliest CORRECT point is here.
+    lock_down = platform_compat.IS_POSIX
+    if not platform_compat.IS_POSIX:
+        if not on_event_loop():
+            # Nothing to stall, so the volume does not decide -- and is not even
+            # classified, because its answer could only weaken the outcome.
+            lock_down = True
+        else:
+            try:
+                lock_down = windows_acl.volume_is_local(path)
+            except Exception:
+                # A descriptor API that cannot be loaded cannot tell us the volume
+                # is local, and the lockdown would have failed on this host anyway.
+                lock_down = False
+            if not lock_down:
+                logger.warning(
+                    "config write: %s is on a non-local volume and this write is "
+                    "running on the event loop, so the owner-only DACL was "
+                    "SKIPPED to avoid stalling the loop on SMB; the file may be "
+                    "readable by other local users. Offloading the write "
+                    "(dashboard/chat_utils.run_config_write) applies the DACL "
+                    "here too",
+                    path,
+                )
+    try:
+        mode = _stat.S_IMODE(path.stat().st_mode) if path.exists() else 0o600
+    except OSError:
+        mode = 0o600
+    if is_owner_only_target(path):
+        # Preserving never means keeping it readable by others: inside the data
+        # home every file is owner-only (kiro_crew.owner_only_files), so a 0644
+        # left by an older version narrows to 0600 here. A config symlinked out of
+        # the home resolved to its target above and keeps the target's mode.
+        mode &= ~GROUP_OTHER_BITS
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(data, indent=2) + "\n"
+    if platform_compat.IS_POSIX:
+        atomic_write(path, payload, fsync=fsync, mode=mode)
+    elif lock_down:
+        # Windows: the mode bits above are inert (fchmod_safe is a documented
+        # no-op), so there is nothing to preserve and no conflict with
+        # restrict_to_owner's implied 0600. Taking the lockdown here rather than
+        # leaving it to callers also closes the window a post-write lockdown
+        # would leave: atomic_write applies the DACL to the temp file BEFORE any
+        # content reaches it, so an inline credential never exists in a file
+        # readable by other local accounts.
+        #
+        # restrict_on_error="warn", not the default "raise": config.json must not
+        # become unwritable because a DACL could not be applied. Same trade-off
+        # sel.py and dashboard/refresh_tokens.py already take, and strictly
+        # better than the previous behavior, which applied no DACL at all.
+        atomic_write(
+            path,
+            payload,
+            fsync=fsync,
+            restrict_to_owner=True,
+            restrict_on_error="warn",
+        )
+    else:
+        # Reached only by a write still INLINE ON THE LOOP whose volume is not
+        # local: exactly the write this branch did before the lockdown was added,
+        # so such a data home is no worse off than before. The residual is real and
+        # declared -- the file keeps the ACL it inherits from its parent -- but it
+        # is now per CALLER rather than per platform: offloading a caller moves it
+        # to the branch above and it gets the DACL with no change needed here.
+        atomic_write(path, payload, fsync=fsync, mode=mode)
+
+
+def coerce_dict_section(doc: dict, key: str) -> dict:
+    """Return ``doc[key]`` as a dict, REPLACING a degraded (non-dict) value.
+
+    The validated loader treats a malformed top-level section (``"workspaces":
+    []``, ``"agents": "oops"``) as absent and supplies defaults, so the
+    dataclass view never sees the damage. A raw delta mutator working on the
+    document as read (``update_config_locked``'s ``mutate``) must take the
+    same posture: a plain ``doc.setdefault(key, {})`` hands the degraded value
+    straight back, and the mutator then crashes on ``.values()``/``[name]``
+    with an HTTP 500 for the caller. Replacing the degraded section with a
+    fresh dict matches what the validated load already presents everywhere
+    else, and happens inside the same locked write, so the repair is atomic
+    with the mutation that needed it.
+    """
+    section = doc.get(key)
+    if not isinstance(section, dict):
+        section = {}
+        doc[key] = section
+    return section
+
+
+def coerce_config_field(
+    section: dict,
+    key: str,
+    expected: type | tuple[type, ...],
+    default: Any,
+) -> Any:
+    """Return ``section[key]`` when it is ``expected``-typed, else ``default``.
+
+    The sibling of :func:`coerce_dict_section` for the NESTED values a raw
+    reader consumes, not the whole section. The validated loader degrades a
+    wrong-typed field to its default (see ``config.resolution._coerced_section``
+    for sections), so the dataclass view never raises on a hand-edited
+    ``config.json`` with a mistyped field. A raw reader that pulls the value
+    straight out of the parsed document has no such guard, so a non-numeric
+    ``knowledge.fetch_top_n`` reaches ``int()`` and a non-string
+    ``slack.command`` reaches a char loop — each a loud ``TypeError`` on input
+    the loader itself degrades gracefully. Routing those reads through here
+    gives them the loader's posture in one place: a wrong-typed value falls
+    back to the default and is logged, instead of taking the request down.
+
+    An ABSENT key takes the default silently — that is the ordinary
+    unconfigured state, not a degradation. ``bool`` is deliberately NOT a
+    stand-in for ``int`` here: a reader asking for an ``int`` field that finds a
+    ``bool`` gets the default, matching JSON's own type distinction.
+    """
+    if key not in section:
+        return default
+    value = section[key]
+    # ``bool`` is a subclass of ``int``; keep them distinct so an ``int``
+    # field does not silently accept ``true``/``false`` (and vice versa).
+    want_int = expected is int or (
+        isinstance(expected, tuple) and int in expected and bool not in expected
+    )
+    if want_int and isinstance(value, bool):
+        logger.warning(
+            "config: '%s' is a boolean, expected %s — using default", key, _type_names(expected)
+        )
+        return default
+    if isinstance(value, expected):
+        return value
+    logger.warning(
+        "config: '%s' is not %s (got %s) — using default; the configured value is NOT in effect",
+        key,
+        _type_names(expected),
+        type(value).__name__,
+    )
+    return default
+
+
+def _type_names(expected: type | tuple[type, ...]) -> str:
+    if isinstance(expected, tuple):
+        return " or ".join(t.__name__ for t in expected)
+    return expected.__name__
+
+
+@contextlib.contextmanager
+def _config_write_lock(p: Path, *, wait: bool = True) -> Iterator[None]:
+    """Hold the sidecar advisory lock that serializes config-file writers.
+
+    THE one lock path for a config write: :func:`update_config_locked` and
+    :meth:`KiroCrewConfig.save` both come through here, so a second, subtly
+    different lock file can never reappear — the sidecar is always
+    ``<p>.lock`` beside the file being written (callers resolve a symlinked
+    config first, so it lands beside the TARGET; see :func:`_lock_target`).
+
+    The sidecar is opened (created if absent) and the advisory lock is taken
+    via :func:`platform_compat.file_lock` — ``fcntl.flock`` on POSIX, a bounded
+    ``msvcrt.locking`` spin on Windows, both fail-closed. The sidecar file
+    itself is deliberately left in place on exit: unlinking a lockfile that a
+    concurrent waiter has already opened re-introduces the race the lock
+    exists to prevent (the waiter would hold a lock on an unlinked inode while
+    a third writer creates a fresh sidecar and locks that instead), and on
+    Windows deleting a file another process holds open fails outright. One
+    stable sidecar per config file is the whole lifecycle.
+
+    **Lock ordering.** A caller that also holds the loop-side asyncio config
+    lock (``dashboard/handlers/agents._get_config_lock``) must acquire that
+    FIRST and this flock second, from a worker thread — the order
+    ``dashboard/chat_utils.run_config_write`` documents. Taking them in the
+    other order can deadlock against ``run_config_write`` holders. A POSIX
+    ``flock`` wait blocks its thread, so this must never be entered on the
+    event-loop thread with ``wait=True``; async callers offload (see
+    :meth:`KiroCrewConfig.save`).
+    """
+    lock_path = p.parent / (p.name + ".lock")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        with platform_compat.file_lock(fd, exclusive=True, wait=wait):
+            yield
+    finally:
+        os.close(fd)
+
+
+def update_config_locked(
+    path: Path | None = None,
+    *,
+    mutate: Callable[[dict], dict | None],
+    fsync: bool = False,
+    stamp_meta: bool = True,
+    on_corrupt: Literal["fail", "reset"] = "fail",
+    wait_for_lock: bool = True,
+    after_write: Callable[[], None] | None = None,
+) -> dict:
+    """Perform an atomic read-modify-write of a config file under an advisory lock.
+
+    ``after_write`` runs INSIDE the lock, only after the rename has committed the
+    new document (never when ``mutate`` returned ``None``): the hook for a
+    companion record that must follow the registry change and must not be
+    interleaved with another writer's -- the crew-teams drop that accompanies a
+    crew delete. Its exceptions propagate; the config write has already landed.
+
+    The locked primitive for every DIRECT
+    ``write_config_atomically(config_path())`` caller outside this module, and
+    the required path for new ``config.json`` mutations.  **No such caller
+    remains** -- the dashboard agents endpoint, ``security.py``, the apps manager
+    and the CLI setup wizard all route through the locked path, and ``memory.py``
+    reaches this function through ``dashboard/chat_utils.run_config_write``.
+    ``TestEveryConfigWriterIsLocked`` in
+    ``test/test_config_rmw_preserves_settings.py`` is the ratchet that keeps the
+    list from regrowing.
+
+    Read "direct caller outside this module" strictly: it is the exact set the
+    ratchet checks, and it is NOT the same as "every writer that reaches
+    ``config.json``".  :meth:`KiroCrewConfig.save` calls
+    :func:`write_config_atomically` and does NOT come through here -- but it holds
+    the SAME sidecar lock (via :func:`_config_write_lock`), so its rename cannot
+    land inside this function's read-modify-write.
+    ``save`` is still a whole-document publish of in-memory state, not an RMW:
+    a stale snapshot saved after a locked update overwrites it with older
+    values.  The lock fixes interleaving, not staleness.
+
+    A SECOND way to bypass this lock is to reach ``config_path()`` through
+    ``kiro_crew.agent._atomic_json_write``, which takes no sidecar lock at all.
+    ``TestEveryConfigWriterIsLocked`` does not see such a writer -- it matches
+    calls to :func:`write_config_atomically`, and that one makes none -- so
+    ``TestTheAtomicJsonWriteConfigFamilyIsRatcheted`` in the same file scans for
+    that spelling separately and pins its population to an EMPTY baseline: the
+    dashboard's per-channel savers (``messaging._LockedSectionWrite``), the STT
+    PUT and the MCP gateway-enable toggle all come through here.
+
+    Such a writer would rely on the in-process asyncio ``_get_config_lock()``
+    only, which serializes same-loop callers and nothing else, so it could still
+    interleave with a holder of this lock; ``api_feishu_config_save`` is the
+    shape to copy for a new handler.  Note that an ALIASED import of
+    :func:`write_config_atomically` would evade the sibling ratchet for the same
+    matching reason.
+
+    Contract:
+
+    * **Isolation.** An advisory file lock is held for the entire
+      read-modify-write, so two concurrent callers are serialized: neither can
+      land between the other's read and write.
+    * **Sidecar lockfile.** The lock lives on ``<path>.lock``, NOT on the
+      config file's own fd.  ``write_config_atomically`` replaces the inode
+      (tmp + rename), so a lock taken on the config file's fd would not
+      serialize against the rename — a second opener after the rename gets a
+      NEW fd on the NEW inode and takes the lock instantly, defeating the
+      purpose.
+    * **Fail-closed read (default).** :func:`read_config_for_update` is used
+      inside the critical section; with ``on_corrupt="fail"`` (the default), an
+      unreadable or malformed config raises :class:`ConfigReadError`, aborts
+      the update, and the lockfile is released.  The existing file is never
+      overwritten with defaults.
+    * **Reset-on-corrupt (opt-in).** With ``on_corrupt="reset"``, a
+      :class:`ConfigReadError` inside the critical section is caught WHILE THE
+      LOCK IS STILL HELD and the *mutate* callback is invoked with ``{}``.
+      The caller's write therefore happens in the same lock hold as the read
+      attempt, closing any window for a concurrent writer to land between.
+      The resulting file is written with mode ``0o600`` (no existing mode to
+      preserve from a corrupt file).
+    * **Mode-preserving write.** :func:`write_config_atomically` preserves the
+      existing file's permission bits, so a tightened ``0600`` is not widened.
+    * **Cross-platform.** Locking goes through
+      :func:`platform_compat.file_lock`, which uses ``fcntl.flock`` on POSIX
+      and a bounded ``msvcrt.locking`` spin on Windows.
+    * **Symlink-safe.** The target path is resolved before locking, so a
+      symlinked config is updated in place (matching
+      ``write_config_atomically``'s behavior).
+
+    Parameters
+    ----------
+    path : Path | None
+        Config file path; defaults to :func:`config_path`.
+    mutate : (dict) -> dict | None
+        Called with the current config data (possibly ``{}`` for a new file).
+        Must return the updated dict to write, or ``None`` to skip the write
+        (useful when the mutate discovers no change is needed).
+    fsync : bool
+        Passed through to :func:`write_config_atomically`.
+    stamp_meta : bool
+        If True (default), stamps the ``meta`` block via
+        :func:`stamp_config_meta` before writing.
+    on_corrupt : "fail" | "reset"
+        Behavior when :func:`read_config_for_update` raises
+        :class:`ConfigReadError`.  ``"fail"`` (default) re-raises, aborting the
+        update.  ``"reset"`` catches the error inside the lock hold and invokes
+        *mutate* with ``{}``; the caller's write proceeds in the same critical
+        section so no concurrent writer can land between.
+    wait_for_lock : bool
+        If True (default), block until the advisory lock is free -- correct for
+        a caller whose update must happen.  If False, the acquire is single-shot
+        and raises :class:`OSError` when another writer holds the lock; for a
+        caller whose write is OPTIONAL and retried later, and which may run on
+        the event-loop thread, where a POSIX ``flock`` wait would stall the
+        gateway for as long as the holder keeps it.  It never relaxes the
+        serialization -- a contended acquire declines instead of proceeding.
+
+    Returns
+    -------
+    dict
+        The final config dict (after mutation), whether or not a write occurred.
+
+    Raises
+    ------
+    ConfigReadError
+        If the existing config is unreadable or malformed and
+        ``on_corrupt="fail"``.
+    ConfigWriteRefused
+        If the mutated document carries content the publish floor never
+        persists (a plaintext value under ``agent.deepseek_env``). Raised
+        before any byte is written; the existing file is untouched.
+    OSError
+        If the lockfile cannot be opened/created or the lock cannot be acquired
+        (including a contended ``wait_for_lock=False`` acquire).
+    """
+    p = path if path is not None else config_path()
+    # Resolve symlinks before locking (same logic as write_config_atomically)
+    # so the sidecar sits beside the ACTUAL file, not the symlink.
+    try:
+        if p.is_symlink():
+            p = p.resolve()
+    except OSError:
+        pass
+    with _config_write_lock(p, wait=wait_for_lock):
+        try:
+            data = read_config_for_update(p)
+        except ConfigReadError:
+            if on_corrupt == "fail":
+                raise
+            # on_corrupt="reset": treat as empty inside the same lock hold.
+            data = {}
+        result = mutate(data)
+        if result is None:
+            return data
+        if stamp_meta:
+            result = stamp_config_meta(result)
+        write_config_atomically(p, result, fsync=fsync)
+        # A same-size replacement can retain an indistinguishable fingerprint
+        # on a coarse-timestamp filesystem. Clear eagerly before reporting the
+        # write complete so the next load cannot serve the pre-write snapshot,
+        # and wake the process watcher so the hot-apply path runs now rather
+        # than on its next poll.
+        _invalidate_config_cache()
+        _notify_live_watch()
+        if after_write is not None:
+            after_write()
+        return result
+
+
+def _notify_live_watch() -> None:
+    """Wake the process config watcher after a write landed on ``config.json``.
+
+    Every writer in this module ends here so the dashboard, ``kirocrew config
+    set`` and a boot-time migration all reach the hot-apply path the same way.
+    The import is lazy because ``config.live`` imports this module for its
+    loads; a no-op in a process that never started a watcher (the CLI).
+    """
+    from kiro_crew.config import live
+
+    live.notify_config_written()
+
+
+def stamp_config_meta(data: dict) -> dict:
+    """Return *data* with a freshly stamped ``meta`` block in front.
+
+    ``meta.lastTouchedVersion`` names the build that wrote the bytes now on
+    disk, which is the first thing to check when a ``config.json`` looks like
+    it came from an older schema. An existing stamp is therefore replaced
+    rather than merged.
+
+    Every writer that rebuilds the whole file from a dataclass round-trip has
+    to stamp through here: ``to_dict()`` models only the schema, so such a
+    write drops any top-level key the dataclass does not carry — ``meta``
+    among them. Writers that mutate the raw dict they read keep the block
+    without help.
+
+    Only ``config.json`` carries the block. ``config.local.json``, agent
+    specs, and the other JSON that shares :func:`write_config_atomically` do
+    not, so the stamping is deliberately separate from that function.
+    """
+    return {
+        "meta": {
+            "lastTouchedVersion": __version__,
+            "lastTouchedAt": datetime.now(timezone.utc).isoformat(),
+        },
+        **{k: v for k, v in data.items() if k != "meta"},
+    }
+
+
+def refresh_config_meta_stamp() -> bool:
+    """Re-stamp ``config.json``'s ``meta`` block when it names another build.
+
+    The stamp is only ever written as a side effect of a config write, so an
+    upgrade that never touches ``config.json`` leaves ``lastTouchedVersion``
+    naming the *previous* build indefinitely. That contradicts the field's
+    documented meaning ("the build that wrote the bytes now on disk") and
+    sends anyone debugging a version question chasing a build that is not
+    installed. Called once per gateway start, off the boot
+    path: a version check on one small file, a rewrite only when it differs.
+
+    Deliberately a plain field refresh, not a migration hook: the stamp is
+    replaced, every other key is preserved, and nothing else changes. When
+    the stored version already matches, the file is not rewritten at all
+    (no mtime churn, no ``lastTouchedAt`` bump). Nor is it rewritten while
+    the one-shot legacy ``skills.lazy_load`` rewrite is still due
+    (``migration.legacy_lazy_load_rewrite_due``): the old stamp is that
+    rewrite's proof, and a degraded first load leaves it pending.
+
+    The read-modify-write goes through :func:`update_config_locked` — the
+    required path for new ``config.json`` mutations — so the refresh holds
+    the sidecar advisory lock and can never revert a concurrent settings
+    write with its own earlier snapshot. Callers that run while the
+    dashboard serves requests must ALSO hold the in-process asyncio config
+    lock (``_get_config_lock``) around the call, because the legacy writers
+    serialize on that lock alone.
+
+    Best-effort by design — a stale stamp is a diagnostic blemish, never
+    worth failing a boot over. Returns ``True`` when a refresh was written,
+    ``False`` when nothing needed doing (absent/empty file, current stamp)
+    or the file could not be safely read (an unreadable/torn config must
+    never be replaced with a stamped-but-empty one).
+    """
+    path = config_path()
+    if not path.exists():
+        return False
+
+    wrote = False
+
+    def _stamp_if_stale(data: dict) -> dict | None:
+        nonlocal wrote
+        if not data:
+            # Absent or emptied between the exists() check and the lock hold:
+            # there is nothing to refresh, and writing would CREATE a config
+            # holding only a meta block.
+            return None
+        meta = data.get("meta")
+        stored = meta.get("lastTouchedVersion") if isinstance(meta, dict) else None
+        if stored == __version__:
+            return None  # current: skip the write entirely
+        if (
+            _migration.legacy_lazy_load_rewrite_due(
+                data, connections_marker=config_dir() / CONNECTIONS_UI_MIGRATION_MARKER
+            )
+            is not None
+        ):
+            # The old stamp is the proof the pending one-shot rewrite reads, and a
+            # load that could not write (a degraded section) has not used it yet.
+            # It is still the build that wrote these bytes, so keeping it is true.
+            return None
+        wrote = True
+        return data  # update_config_locked stamps the meta block itself
+
+    try:
+        update_config_locked(path, mutate=_stamp_if_stale)
+    except ConfigReadError:
+        logger.debug(
+            "config meta stamp refresh skipped: %s unreadable; leaving it untouched",
+            path,
+            exc_info=True,
+        )
+        return False
+    except OSError:
+        logger.debug(
+            "config meta stamp refresh failed: could not lock or write %s",
+            path,
+            exc_info=True,
+        )
+        return False
+    if wrote:
+        _invalidate_config_cache()
+        _notify_live_watch()
+    return wrote
+
+
+# ---------------------------------------------------------------------------
+# Write-back migration: the backup, the locked rewrite and the adoption-ledger seam.
+# What each migration changes lives in config.migration.
+# ---------------------------------------------------------------------------
 def _inside_data_home(path: Path) -> bool:
     """Whether *path* lives in ``config_dir()``, the one directory we own.
 
@@ -640,20 +2238,6 @@ def _inside_data_home(path: Path) -> bool:
         return path.parent.resolve() == config_dir().resolve()
     except OSError:
         return False
-
-
-def _lock_target(path: Path) -> Path:
-    """The path ``update_config_locked`` would put its lock sidecar beside.
-
-    It resolves a symlinked config before locking, so that -- not *path* -- is
-    what the containment question has to be asked about. Returns *path* unchanged
-    when it is not a symlink or cannot be resolved, which is the conservative
-    answer either way: an unresolvable path fails the containment check.
-    """
-    try:
-        return path.resolve() if path.is_symlink() else path
-    except OSError:
-        return path
 
 
 def _write_migration_backup(path: Path) -> None:
@@ -682,31 +2266,6 @@ def _write_migration_backup(path: Path) -> None:
     logger.info("Config migrated — backup saved to %s", backup)
 
 
-#: The write-back migrations a load can find pending, as recorded by
-#: :meth:`KiroCrewConfig._load_resolved` and re-checked against the on-disk
-#: document by :func:`_apply_document_migrations`.
-MIGRATE_WORKSPACES = "workspaces"
-MIGRATE_AGENTS = "agents"
-MIGRATE_DEFAULT_AGENT = "default_agent"
-MIGRATE_CONNECTIONS_UI = "connections_ui"
-#: Un-materialize the stored values that still hold a superseded default an entry
-#: marked ``auto_adopt``. Unlike the three above, this one carries a payload: the
-#: keys the load decided on travel separately in ``adopt_keys``, because the set is
-#: per-install rather than a fixed schema shape.
-MIGRATE_SUPERSEDED_DEFAULTS = "superseded_defaults"
-
-#: Sidecar marker recording that the one-shot ``connections_ui`` launch
-#: migration ran. Pre-launch builds materialized ``connections_ui: false`` into
-#: every config they saved (the key was the opt-in gate then, so a stored false
-#: was default noise, never a choice); post-launch the same bytes are the
-#: deliberate opt-out. The marker is the boundary between those two readings:
-#: a stored false found BEFORE it exists is stripped once, and any false found
-#: AFTER it exists is honoured forever. It lives beside ``config.json`` rather
-#: than inside it for the same reason as the superseded-defaults ack file — a
-#: full ``to_dict()`` rewrite carries only schema fields and would drop it.
-CONNECTIONS_UI_MIGRATION_MARKER = "connections_ui_migrated.json"
-
-
 def _apply_document_migrations(
     data: dict,
     pending: frozenset[str],
@@ -716,132 +2275,20 @@ def _apply_document_migrations(
     adopt_keys: frozenset[str] = frozenset(),
     recorded_adoptions: list[str] | None = None,
 ) -> bool:
-    """Apply the pending write-back migrations to a raw config document in place.
+    """Apply the pending write-back migrations; see :func:`migration.apply_document_migrations`.
 
-    *data* is ``config.json`` as read **inside the write lock**, not the merged
-    snapshot the calling load parsed. That is the whole point: the migration is
-    expressed as a delta against the document that is actually on disk right now,
-    so a config write that landed after this load's read survives instead of being
-    replaced by a re-serialization of the older snapshot.
-
-    *pending* names the migrations the load decided on, so this never widens what
-    the migration writes. The load's decisions are taken against the MERGED
-    base+overlay view; the overlay is user-owned and never written back, so a
-    migration the merged view did not ask for must not be invented here.
-
-    The seeded agent's kiro agent resolves the same three-way precedence the
-    loader itself applies, because it has to be the MERGED effective value (that
-    is what the default crew dispatched before the migration) computed against a
-    CURRENT base: *overlay_kiro_agent* first, since ``config.local.json`` wins the
-    deep-merge and the base can say nothing about it; then the base document's own
-    ``agent.default_agent`` as read here, so a ``config set`` that landed after
-    the load's read is honored rather than reverted; then *default_kiro_agent*,
-    the value the load resolved, which is the only one carrying the dataclass
-    default. Taking any single one of the three is wrong in a different direction.
-
-    Every entry is re-checked against *data* before it is applied, which makes the
-    function idempotent and makes a concurrent writer that already migrated a
-    no-op rather than a second rewrite. Returns True when anything changed; the
-    caller skips the write entirely when it returns False.
+    The adoption ledger writer is this module's ``record_adoptions``, read at call
+    time, so a write-back and anything that replaces that name here agree on it.
     """
-    changed = False
-
-    # Flat workspace strings -> {"dir": ...}. Per entry, and only for entries the
-    # document still holds as a string: a workspace added or rewritten by another
-    # writer since this load's read is left exactly as that writer left it.
-    if MIGRATE_WORKSPACES in pending:
-        raw_workspaces = data.get("workspaces")
-        if isinstance(raw_workspaces, dict):
-            for name, value in list(raw_workspaces.items()):
-                if isinstance(value, str):
-                    raw_workspaces[name] = asdict(WorkspaceConfig(dir=value))
-                    changed = True
-
-    # Seed the default agent when the document still has none.
-    if MIGRATE_AGENTS in pending:
-        stored_agents = data.get("agents")
-        if not isinstance(stored_agents, dict) or not stored_agents:
-            stored_agent_section = data.get("agent")
-            stored_kiro = (
-                stored_agent_section.get("default_agent")
-                if isinstance(stored_agent_section, dict)
-                else None
-            )
-            base_kiro = stored_kiro if isinstance(stored_kiro, str) and stored_kiro else None
-            data["agents"] = {
-                "default": asdict(
-                    KiroCrewAgentConfig(
-                        kiro_agent=overlay_kiro_agent or base_kiro or default_kiro_agent,
-                        workspace="default",
-                        memory_store="default",
-                    )
-                )
-            }
-            changed = True
-
-    # Strip the pre-launch materialized ``connections_ui: false``. Re-checked
-    # against *data*: only an exact stored ``false`` is touched, so a concurrent
-    # writer that already removed the key, or set it ``true``, is left alone.
-    # The one-shot boundary (a deliberate post-launch ``false`` must survive
-    # every later load) is enforced by the caller via the marker file — this
-    # delta is only ever pending on a load that found no marker.
-    if MIGRATE_CONNECTIONS_UI in pending:
-        if data.get("connections_ui") is False:
-            del data["connections_ui"]
-            changed = True
-
-    # Point default_agent at an agent that exists. Resolved against the
-    # document's OWN agents (after any seeding above), so a concurrent writer's
-    # newly added agent is a valid target rather than something we overwrite.
-    if MIGRATE_DEFAULT_AGENT in pending:
-        stored_agents = data.get("agents")
-        known = stored_agents if isinstance(stored_agents, dict) else {}
-        stored_default = data.get("default_agent")
-        if not isinstance(stored_default, str) or not stored_default or stored_default not in known:
-            if "default" in known:
-                data["default_agent"] = "default"
-            elif known:
-                data["default_agent"] = next(iter(known))
-            else:
-                data["default_agent"] = "default"
-            changed = data["default_agent"] != stored_default or changed
-
-    # Un-materialize the auto-adopting superseded defaults this load found. Four
-    # properties are load-bearing and all four live here rather than at the call
-    # site, because this is the only code that runs inside the config write lock:
-    #
-    # * RE-DETECTED against *data*, so a value another writer changed since this
-    #   load's read is left alone -- the same rule every migration above follows,
-    #   and the reason a live ``config set`` is never clobbered;
-    # * the ledger is written BEFORE the removal is reported as done. A removal
-    #   whose record did not land would repeat on the next load, and repeating is
-    #   the one failure that can override a value the operator restored. A failing
-    #   record therefore propagates and aborts the whole migration write;
-    # * every key it records is reported back through *recorded_adoptions*, because
-    #   writing the ledger first leaves a known residual: if the config write then
-    #   fails, the key is marked adopted while the stale value is still stored, and
-    #   the one-shot filter never revisits it. Nothing rolls the ledger back -- see
-    #   ``record_adoptions`` for why that residual is the one chosen -- so the caller
-    #   uses the list only to decide which keys the IN-MEMORY half may apply: those
-    #   whose removal it saw land, and no others;
-    # * ``drop_drifted_keys`` REMOVES the key rather than writing the new number, so
-    #   the field resolves through ``data.get(key, DEFAULT)`` until the next full
-    #   rewrite of the document re-materializes it.
-    #
-    # Lock order is config-then-ack, matching ``record_acks`` -- the only two sites
-    # that nest these locks, and they nest them the same way.
-    if MIGRATE_SUPERSEDED_DEFAULTS in pending and adopt_keys:
-        fresh = [
-            entry.dotted_key for entry in auto_adoptable(data) if entry.dotted_key in adopt_keys
-        ]
-        if fresh:
-            record_adoptions({key: stored_value_or_none(data, key) for key in fresh})
-            if recorded_adoptions is not None:
-                recorded_adoptions.extend(fresh)
-            if drop_drifted_keys(data, fresh):
-                changed = True
-
-    return changed
+    return _migration.apply_document_migrations(
+        data,
+        pending,
+        overlay_kiro_agent=overlay_kiro_agent,
+        default_kiro_agent=default_kiro_agent,
+        adopt_keys=adopt_keys,
+        recorded_adoptions=recorded_adoptions,
+        record_adoptions=record_adoptions,
+    )
 
 
 def _overlay_kiro_agent() -> str | None:
@@ -862,7 +2309,7 @@ def _overlay_kiro_agent() -> str | None:
         local_path = config_local_path()
         if not local_path.is_file():
             return None
-        raw = json.loads(local_path.read_text(encoding="utf-8"))
+        raw = json.loads(read_config_text(local_path))
     except (json.JSONDecodeError, UnicodeDecodeError, OSError):
         return None
     if not isinstance(raw, dict):
@@ -931,7 +2378,7 @@ def _persist_config_migration(
     and that writer's bytes are precisely what must not be clobbered: declining is
     the correct outcome, not a compromise. The migration is already
     retry-on-next-load by construction (the degraded-sections branch in
-    ``_load_resolved`` relies on the same property), so the next uncontended load
+    :func:`persist_write_back` relies on the same property), so the next uncontended load
     performs it. The remaining file I/O on the loop -- one read, one atomic
     rename -- is what ``cfg.save()`` did here before, unchanged.
 
@@ -1027,1124 +2474,212 @@ def _persist_config_migration(
     return wrote
 
 
-def _overlay_supplies(local_data: dict, dotted_key: str) -> bool:
-    """True when ``config.local.json`` itself carries *dotted_key*.
+# ---------------------------------------------------------------------------
+# Validated-document cache fingerprint and its sidecar.
+# ---------------------------------------------------------------------------
+def _config_fingerprint() -> tuple:
+    """Cheap signature of the config files — changes whenever either is edited.
 
-    The overlay wins the deep-merge, so where it names a field the base cannot be
-    the effective value. Adopting such a key in memory would replace the operator's
-    live overlay choice with a default -- the one thing an automatic adoption must
-    never do.
+    Includes replacement identity (device + inode) and change time in addition
+    to mtime, size, and mode. Dashboard/CLI writers publish with atomic rename;
+    on a coarse-timestamp filesystem an Incognito→Temporary replacement can
+    otherwise keep the same mtime and size, making another process's cache look
+    current. A missing file contributes a sentinel so create/delete also busts.
     """
-    section, _, field = dotted_key.partition(".")
-    section_data = local_data.get(section)
-    return isinstance(section_data, dict) and field in section_data
-
-
-def _adopt_in_memory(cfg: KiroCrewConfig, dotted_key: str, old_default: object) -> None:
-    """Move one parsed field from *old_default* to the LIVE dataclass default.
-
-    The dataclass default is read rather than the registry's ``new_default`` on
-    purpose. Both sides of a registry row are history, so on a key whose default
-    moved twice the matching row's ``new_default`` is an intermediate value, while
-    the field's own default is what the removal on disk will resolve to. Reading it
-    here keeps memory and disk agreeing on one number.
-
-    The guard is exact-value, not just key presence: a field whose parsed value
-    differs from *old_default* was clamped or coerced on the way in, and replacing
-    that would discard the loader's own correction rather than a stale default.
-    """
-    section, _, field = dotted_key.partition(".")
-    target = getattr(cfg, section, None)
-    if target is None:
-        return
-    fields_map = getattr(type(target), "__dataclass_fields__", {})
-    spec = fields_map.get(field)
-    if spec is None or getattr(target, field, None) != old_default:
-        return
-    live_default = spec.default
-    if live_default is MISSING:
-        return
-    setattr(target, field, live_default)
-
-
-def denied_commands_path() -> Path:
-    """Return path to denied_commands.json — the denied-command opt-out state.
-
-    This is a KEYSTONE trust-root file (on ``security._SENSITIVE_HOME_DIRS``):
-    it holds ``{disable_all, disabled_ids, user_added}``, the user's opt-out from
-    the built-in deny ceiling. It lives OUTSIDE the agent-readable
-    ``config.json`` precisely so an auto-approved/YOLO agent shell cannot write
-    it (via any shell trick) and disable its own deny ceiling. Only the operator
-    edits it out-of-band — through the dashboard ``/api/security/…`` endpoints,
-    which do not route through the agent tool gate. Respects ``KIROCREW_HOME``.
-    """
-    return config_dir() / "denied_commands.json"
-
-
-def computer_use_state_path() -> Path:
-    """Return path to computer_use.json — the computer-use primary enable.
-
-    Same KEYSTONE reasoning as :func:`denied_commands_path`, and the leaf is on
-    ``security._CREW_SECRET_LEAVES`` for the same reason: enabling computer use
-    grants full desktop observation plus input synthesis into the operator's real
-    applications, which is a security ceiling, not a preference. Keeping it out
-    of the agent-readable ``config.json`` is what makes it un-flippable by a
-    prompt-injected agent — ``is_sensitive_path`` blocks the tool path and the
-    OS sandbox mounts the keystone read-only for the agent's shell.
-
-    Holds ``{enabled, allowed_apps, extra_denied_apps}``; every read fails soft
-    to DISABLED (see ``computer_use.enable_state``). The only writer is the
-    dashboard ``/api/computer-use/config`` PUT, which does not route through the
-    agent tool gate. Respects ``KIROCREW_HOME``.
-
-    Note the deliberate asymmetry with the ``computer_use`` section of
-    ``config.json``: that section carries display/limit knobs ONLY and has no
-    ``enabled`` field, precisely so there is exactly one place the feature can be
-    turned on and it is not one the agent can reach.
-    """
-    return config_dir() / "computer_use.json"
-
-
-def oauth_endpoints_path() -> Path:
-    """Return path to oauth_endpoints.json — the operator OAuth-endpoint extension.
-
-    Same KEYSTONE reasoning as :func:`denied_commands_path` and
-    :func:`computer_use_state_path`, and the leaf is on
-    ``security._CREW_SECRET_LEAVES`` for the same reason: each listed endpoint
-    widens the banner-only OAuth entropy carve-out (``security.py``'s
-    ``_OAUTH_AUTHORIZATION_ENDPOINTS``), so an agent that could write this file
-    could exempt an attacker-controlled host from the exfiltration heuristics —
-    it is a trust boundary, not a preference. ``is_sensitive_path`` blocks the
-    tool path and the OS sandbox mounts the keystone read-only for the shell.
-
-    Holds ``{"additional_authorization_endpoints": [{"host": …, "path": …}]}``;
-    every read fails soft to an EMPTY extension set (see
-    ``security._load_operator_oauth_endpoints``). There is no dashboard writer:
-    the operator hand-edits the file out-of-band. Respects ``KIROCREW_HOME``.
-    """
-    return config_dir() / "oauth_endpoints.json"
-
-
-def aws_consent_path() -> Path:
-    """Return path to aws_service_consent.json — paid-AWS-service consent.
-
-    Same KEYSTONE reasoning as :func:`computer_use_state_path`, and the leaf is
-    on ``security._CREW_SECRET_LEAVES`` for the same reason: a recorded consent
-    to call a PAID AWS service is an authorization, not a preference. Storing it
-    in ``config.json`` would leave it writable by any auto-approved agent shell,
-    so a prompt-injected agent could mint the grant and consent, on the
-    operator's behalf, to spending the operator's money in an account it picked.
-    ``is_sensitive_path`` blocks the tool path and the OS sandbox mounts the
-    keystone read-only for the shell.
-
-    Holds ``{"<service>": {profile, region, account, arn, granted_at}}``; every
-    read fails soft to NO CONSENT (see ``aws_consent.read_grant``). The writers
-    are the authenticated dashboard ``/api/aws/consent`` handler and the
-    ``kirocrew aws-consent`` CLI, both of which open the path directly rather
-    than through this gate. Respects ``KIROCREW_HOME``.
-    """
-    return config_dir() / "aws_service_consent.json"
-
-
-def decisions_consent_path() -> Path:
-    """Return path to decisions_consent.json — consent to send conversation state to Jev.
-
-    Same KEYSTONE reasoning as :func:`aws_consent_path`, and the leaf is on
-    ``security._CREW_SECRET_LEAVES`` for the same reason: enabling the decision
-    seam sends message text and skill descriptions to an external, paid provider,
-    which is an egress authorization, not a preference. Kept out of the
-    agent-writable ``config.json`` so a prompt-injected shell cannot flip it and
-    have the live config watcher start the egress; ``is_sensitive_path`` blocks
-    the tool path and the OS sandbox mounts the keystone read-only for the shell.
-
-    Holds ``{"enabled": bool, "endpoint": str}`` -- the switch and the provider
-    address the owner consented to; every read fails soft to NOT CONSENTED (see
-    ``decisions.consent``). The only writer is the authenticated, browser-only
-    dashboard ``PUT /api/decisions/consent`` handler, which opens the path
-    directly rather than through this gate. Respects ``KIROCREW_HOME``.
-
-    The ``decisions`` section of ``config.json`` deliberately carries NO
-    ``enabled`` field: sampling share and provider knobs only, so there is exactly
-    one place the seam can be switched on and it is not one the agent can reach.
-    """
-    return config_dir() / "decisions_consent.json"
-
-
-def file_delivery_consent_path() -> Path:
-    """Return path to file_delivery_consent.json -- flagged-file delivery consent.
-
-    Same KEYSTONE reasoning as :func:`aws_consent_path`, and the leaf is on
-    ``security._CREW_SECRET_LEAVES`` for the same reason: a recorded consent to
-    deliver a file the credential scanner flagged is an authorization, not a
-    preference. Storing it in ``config.json`` would leave it writable by any
-    auto-approved agent shell, so a prompt-injected agent could mint the grant and
-    consent, on the owner's behalf, to shipping the owner's secrets -- the exact
-    shape ``CredentialPolicy.exempt_exact_hosts`` refuses when it says such a set
-    is "NEVER sourced from ``config.json``". ``is_sensitive_path`` blocks the tool
-    path and the OS sandbox mounts the keystone read-only for the shell.
-
-    Holds ``{"<destination_class>": {destination_class, granted_at}}``; every read
-    fails soft to NO CONSENT (see ``file_delivery_consent.read_grant``). The only
-    writer is the authenticated, OWNER-gated dashboard
-    ``/api/file-delivery/consent`` handler, which opens the path directly rather
-    than through this gate. There is deliberately NO CLI verb -- a terminal
-    command that records a grant on request is a grant an automated caller can
-    take. Respects ``KIROCREW_HOME``.
-    """
-    return config_dir() / "file_delivery_consent.json"
-
-
-def ssh_auth_sock_consent_path() -> Path:
-    """Return path to ssh_auth_sock_consent.json -- the SSH-agent forward consent.
-
-    Same KEYSTONE reasoning as :func:`aws_consent_path` and
-    :func:`file_delivery_consent_path`, and the leaf is on
-    ``security._CREW_SECRET_LEAVES`` for the same reason: keeping
-    ``SSH_AUTH_SOCK`` in the agent subprocess environment grants USE of the
-    operator's ssh-agent keys -- signing, git-over-SSH, and any authentication
-    the socket reaches -- for the lifetime of the session. That is an
-    authorization, not a preference. Stored in the agent-readable ``config.json``
-    it would be writable by any auto-approved agent shell, so a prompt-injected
-    agent could flip its own forwarding on and a subagent it spawns would then
-    authenticate as the operator with keys the sandbox exists to keep out of its
-    reach. ``is_sensitive_path`` blocks the tool path and the OS sandbox mounts
-    the keystone read-only for the agent's shell, so the consent is
-    un-flippable from inside the sandbox.
-
-    Holds ``{"enabled": bool, "granted_at": str}``; every read fails soft to
-    DISABLED (see ``ssh_auth_sock_consent.is_granted``). The only writer is the
-    authenticated, OWNER-gated dashboard handler, which opens the path directly
-    rather than through this gate. There is deliberately NO CLI verb -- a
-    terminal command that records the grant on request is a grant an automated
-    caller can take. Respects ``KIROCREW_HOME``.
-    """
-    return config_dir() / "ssh_auth_sock_consent.json"
-
-
-def read_local_secret(port: int) -> str:
-    """Read the internal-API credential for the gateway on *port*.
-
-    Single home for the secret read that callers (cron scripts, MCP tool bridges,
-    CLI) need to authenticate to the gateway's internal API. Returns empty string
-    when no credential can be read.
-
-    Resolution is per LISTENER first: ``run/gateway-<port>.secret``, then the
-    shared ``.local_secret``. That order is the invariant, and it lives here rather
-    than in each reader because the credential identifies ONE gateway generation
-    while the shared file has one slot per data home, last-writer-wins. A caller
-    that reads the shared file while a different generation owns the port it dials
-    gets 403 on every internal call.
-
-    *port* is REQUIRED, and deliberately so: the credential is a function of the
-    dial target, so inferring the target here would let a caller dial one gateway
-    while authenticating for another -- the exact desync this helper exists to
-    close, reintroduced one call site at a time and invisible at the call site. A
-    caller with no port must resolve one explicitly and pass it, where the choice
-    is reviewable.
-    """
-    # Function-local: port_resolution imports this module, so a module-level
-    # import would be circular.
-    from kiro_crew.instances import run_marker
-
-    try:
-        per_port = run_marker.read_secret(int(port))
-    except Exception:
-        per_port = ""
-    if per_port:
-        return per_port
-    try:
-        return (config_dir() / ".local_secret").read_text().strip()
-    except OSError:
-        return ""
-
-
-def _raw_config() -> dict:
-    """Load raw config.json as a dict, re-reading the file on every call.
-
-    Uncached on purpose: callers want the bytes on disk right now, and the
-    validated-config cache is keyed for :meth:`KiroCrewConfig.load`, not for
-    this raw view. An absent or unreadable file reads as ``{}``.
-    """
-    p = config_path()
-    if not p.exists():
-        return {}
-    try:
-        return json.loads(p.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return {}
-
-
-class ConfigReadError(Exception):
-    """``config.json`` exists but could not be read as a config object.
-
-    Raised only by :func:`read_config_for_update`, whose callers are about to
-    write the value back. It deliberately does NOT inherit from ``OSError`` or
-    ``ValueError`` so an existing broad ``except OSError`` around a write cannot
-    swallow it and resume the clobbering path.
-    """
-
-
-def read_config_for_update(path: Path | None = None) -> dict:
-    """Read ``config.json`` for a read-modify-write, failing CLOSED.
-
-    Every partial config update (flip one toggle, persist one channel) has to
-    read the whole file, mutate one key, and write it all back. The obvious
-    ``try: json.loads(...) except Exception: data = {}`` is a **data-loss bug**
-    in that shape: the fallback is indistinguishable from "the user has no
-    settings", so the write-back replaces a fully populated config with a
-    single-key one. Every setting the user ever chose is gone, silently, and
-    the endpoint still reports success.
-
-    The read fails for mundane reasons — most commonly a *torn read*: several
-    config writers still truncate-then-write, so a concurrent reader can
-    observe a half-written file. That window is small, which is exactly what
-    makes the resulting loss so hard to reproduce and report.
-
-    So: an **absent** file returns ``{}`` (a genuine empty starting point), and
-    an unreadable or non-object file raises :class:`ConfigReadError`. Callers
-    must let that abort the update — leaving the existing file untouched is
-    always better than overwriting it with defaults.
-
-    Pair this with :func:`kiro_crew.atomic_write.atomic_write` on the way out so
-    the write cannot create the torn window for the next reader.
-    """
-    p = path if path is not None else config_path()
-    try:
-        if not p.exists():
-            return {}
-        raw = json.loads(p.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, UnicodeDecodeError, OSError) as e:
-        # UnicodeDecodeError is a ValueError, NOT an OSError, so it needs naming
-        # explicitly: a config containing invalid UTF-8 (a truncated multi-byte
-        # sequence from a torn write, or a mojibake'd hand edit) would otherwise
-        # escape this controlled path and crash the caller instead of returning
-        # the clean "config unreadable" refusal.
-        raise ConfigReadError(f"could not read config at {p}: {e}") from e
-    if not isinstance(raw, dict):
-        raise ConfigReadError(f"config at {p} is not a JSON object (got {type(raw).__name__})")
-    return raw
-
-
-def write_config_atomically(path: Path, data: dict, *, fsync: bool = False) -> None:
-    """Write a config dict to *path* atomically, PRESERVING its permissions.
-
-    The companion to :func:`read_config_for_update`. Two properties matter:
-
-    * **Atomic** (tmp+rename) so a concurrent reader can never observe a
-      half-written file. A truncate-then-write leaves a window in which a reader
-      sees invalid JSON; a reader that mistakes that for "no settings" will write
-      the emptiness back and destroy the user's config.
-    * **Mode-preserving.** Because tmp+rename creates a NEW inode, the umask
-      default (typically ``0644``) would silently replace an operator's tightened
-      ``0600``. ``config.json`` can hold inline credentials, so a settings write
-      must never widen who can read it. An existing file's mode is carried over;
-      a newly created one defaults to owner-only.
-
-    ``atomic_write``'s ``mode`` routes through ``fchmod_safe``, which applies the
-    mode on POSIX and is a documented no-op on Windows.
-
-    **Windows gets a real owner-only DACL, not just the inert mode.** The lockdown
-    is applied in-process through ``advapi32`` (measured at 0.24 ms, against 313 ms
-    for the ``icacls`` subprocess), so it is safe on the event loop even though this
-    function is called from ``async`` request handlers and from
-    ``KiroCrewConfig.save()``. Since ``config.json`` can carry inline provider
-    tokens and API keys, applying it is the correct default rather than a duty
-    pushed onto each caller.
-
-    The two guarantees do not collide, because they apply on different platforms:
-    mode preservation is a POSIX concept (Windows has no bits to preserve), and
-    the DACL is a Windows concept. Hence the platform branch below rather than
-    passing both to ``atomic_write``, which refuses ``restrict_to_owner=True``
-    alongside a wider explicit ``mode``.
-
-    **On a network-homed data home the DACL turns on the CALLER, not the volume.**
-    The in-process lockdown costs 0.24 ms on a local volume but is bounded only by
-    SMB on a UNC or mapped-drive path, which a write running inline on the event
-    loop cannot afford. That is a fact about the calling thread, so it is asked as
-    one, via :func:`kiro_crew.atomic_write.on_event_loop`. A caller that has
-    offloaded this write -- ``dashboard/chat_utils.run_config_write``, any
-    ``asyncio.to_thread`` wrapper, and every CLI and startup path, which have no
-    loop at all -- blocks only its own thread and therefore gets the owner-only
-    DACL on **any** volume. Only a write still inline on the loop falls back to
-    classifying the volume and skipping when it is remote.
-
-    **Symlinks are followed, not replaced.** ``os.replace`` renames over the link
-    itself, turning a symlinked ``config.json`` into a regular file and orphaning
-    its target — whereas the ``write_text`` this replaced followed the link and
-    updated the target. Symlinking the config into a dotfiles repo is a normal
-    setup, so the target is resolved first to preserve that behavior.
-    """
-    # Resolve BEFORE stat/write so a symlinked config keeps pointing at its
-    # target (and the mode preserved is the target's, not the link's).
-    try:
-        if path.is_symlink():
-            path = path.resolve()
-    except OSError:
-        pass
-    # Decide the Windows lockdown HERE, before the stat and the mkdir below and
-    # before anything atomic_write does -- every one of those is a round-trip on a
-    # network-homed data home. A DACL write to a UNC or mapped-drive path is an
-    # unbounded SMB round-trip, so when it cannot be afforded it has to be ruled
-    # out before the work starts rather than part way through.
-    #
-    # But whether it can be afforded is a question about the CALLING THREAD, not
-    # about the volume. The volume was only ever a proxy: this function is
-    # synchronous and async dashboard handlers reach it inline, where an unbounded
-    # wait stalls the one loop the whole gateway shares. Off the loop there is
-    # nothing to stall -- a worker started by ``run_config_write`` /
-    # ``asyncio.to_thread``, a CLI invocation, a startup path all block only
-    # themselves -- so the same predicate ``atomic_write`` already gates its own
-    # unbounded-on-Windows step on decides here too, and a network-homed data home
-    # gets the DACL whenever its caller has offloaded the write.
-    #
-    # This sits just AFTER the symlink resolve rather than at the very top of the
-    # function, and deliberately: a config symlinked into a dotfiles repo (which
-    # the docstring above calls a normal setup) can point at a DIFFERENT volume
-    # than the link, so classifying before resolving would classify the wrong one.
-    # The resolve is two stats; the earliest CORRECT point is here.
-    lock_down = platform_compat.IS_POSIX
-    if not platform_compat.IS_POSIX:
-        if not on_event_loop():
-            # Nothing to stall, so the volume does not decide -- and is not even
-            # classified, because its answer could only weaken the outcome.
-            lock_down = True
-        else:
-            try:
-                lock_down = windows_acl.volume_is_local(path)
-            except Exception:
-                # A descriptor API that cannot be loaded cannot tell us the volume
-                # is local, and the lockdown would have failed on this host anyway.
-                lock_down = False
-            if not lock_down:
-                logger.warning(
-                    "config write: %s is on a non-local volume and this write is "
-                    "running on the event loop, so the owner-only DACL was "
-                    "SKIPPED to avoid stalling the loop on SMB; the file may be "
-                    "readable by other local users. Offloading the write "
-                    "(dashboard/chat_utils.run_config_write) applies the DACL "
-                    "here too",
-                    path,
-                )
-    try:
-        mode = _stat.S_IMODE(path.stat().st_mode) if path.exists() else 0o600
-    except OSError:
-        mode = 0o600
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps(data, indent=2) + "\n"
-    if platform_compat.IS_POSIX:
-        atomic_write(path, payload, fsync=fsync, mode=mode)
-    elif lock_down:
-        # Windows: the mode bits above are inert (fchmod_safe is a documented
-        # no-op), so there is nothing to preserve and no conflict with
-        # restrict_to_owner's implied 0600. Taking the lockdown here rather than
-        # leaving it to callers also closes the window a post-write lockdown
-        # would leave: atomic_write applies the DACL to the temp file BEFORE any
-        # content reaches it, so an inline credential never exists in a file
-        # readable by other local accounts.
-        #
-        # restrict_on_error="warn", not the default "raise": config.json must not
-        # become unwritable because a DACL could not be applied. Same trade-off
-        # sel.py and dashboard/refresh_tokens.py already take, and strictly
-        # better than the previous behavior, which applied no DACL at all.
-        atomic_write(
-            path,
-            payload,
-            fsync=fsync,
-            restrict_to_owner=True,
-            restrict_on_error="warn",
-        )
-    else:
-        # Reached only by a write still INLINE ON THE LOOP whose volume is not
-        # local: exactly the write this branch did before the lockdown was added,
-        # so such a data home is no worse off than before. The residual is real and
-        # declared -- the file keeps the ACL it inherits from its parent -- but it
-        # is now per CALLER rather than per platform: offloading a caller moves it
-        # to the branch above and it gets the DACL with no change needed here.
-        atomic_write(path, payload, fsync=fsync, mode=mode)
-
-
-def coerce_dict_section(doc: dict, key: str) -> dict:
-    """Return ``doc[key]`` as a dict, REPLACING a degraded (non-dict) value.
-
-    The validated loader treats a malformed top-level section (``"workspaces":
-    []``, ``"agents": "oops"``) as absent and supplies defaults, so the
-    dataclass view never sees the damage. A raw delta mutator working on the
-    document as read (``update_config_locked``'s ``mutate``) must take the
-    same posture: a plain ``doc.setdefault(key, {})`` hands the degraded value
-    straight back, and the mutator then crashes on ``.values()``/``[name]``
-    with an HTTP 500 for the caller. Replacing the degraded section with a
-    fresh dict matches what the validated load already presents everywhere
-    else, and happens inside the same locked write, so the repair is atomic
-    with the mutation that needed it.
-    """
-    section = doc.get(key)
-    if not isinstance(section, dict):
-        section = {}
-        doc[key] = section
-    return section
-
-
-@contextlib.contextmanager
-def _config_write_lock(p: Path, *, wait: bool = True) -> Iterator[None]:
-    """Hold the sidecar advisory lock that serializes config-file writers.
-
-    THE one lock path for a config write: :func:`update_config_locked` and
-    :meth:`KiroCrewConfig.save` both come through here, so a second, subtly
-    different lock file can never reappear — the sidecar is always
-    ``<p>.lock`` beside the file being written (callers resolve a symlinked
-    config first, so it lands beside the TARGET; see :func:`_lock_target`).
-
-    The sidecar is opened (created if absent) and the advisory lock is taken
-    via :func:`platform_compat.file_lock` — ``fcntl.flock`` on POSIX, a bounded
-    ``msvcrt.locking`` spin on Windows, both fail-closed. The sidecar file
-    itself is deliberately left in place on exit: unlinking a lockfile that a
-    concurrent waiter has already opened re-introduces the race the lock
-    exists to prevent (the waiter would hold a lock on an unlinked inode while
-    a third writer creates a fresh sidecar and locks that instead), and on
-    Windows deleting a file another process holds open fails outright. One
-    stable sidecar per config file is the whole lifecycle.
-
-    **Lock ordering.** A caller that also holds the loop-side asyncio config
-    lock (``dashboard/handlers/agents._get_config_lock``) must acquire that
-    FIRST and this flock second, from a worker thread — the order
-    ``dashboard/chat_utils.run_config_write`` documents. Taking them in the
-    other order can deadlock against ``run_config_write`` holders. A POSIX
-    ``flock`` wait blocks its thread, so this must never be entered on the
-    event-loop thread with ``wait=True``; async callers offload (see
-    :meth:`KiroCrewConfig.save`).
-    """
-    lock_path = p.parent / (p.name + ".lock")
-    p.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
-    try:
-        with platform_compat.file_lock(fd, exclusive=True, wait=wait):
-            yield
-    finally:
-        os.close(fd)
-
-
-def update_config_locked(
-    path: Path | None = None,
-    *,
-    mutate: Callable[[dict], dict | None],
-    fsync: bool = False,
-    stamp_meta: bool = True,
-    on_corrupt: Literal["fail", "reset"] = "fail",
-    wait_for_lock: bool = True,
-) -> dict:
-    """Perform an atomic read-modify-write of a config file under an advisory lock.
-
-    The locked primitive for every DIRECT
-    ``write_config_atomically(config_path())`` caller outside this module, and
-    the required path for new ``config.json`` mutations.  **No such caller
-    remains** -- the dashboard agents endpoint, ``security.py``, the apps manager
-    and the CLI setup wizard all route through the locked path, and ``memory.py``
-    reaches this function through ``dashboard/chat_utils.run_config_write``.
-    ``TestEveryConfigWriterIsLocked`` in
-    ``test/test_config_rmw_preserves_settings.py`` is the ratchet that keeps the
-    list from regrowing.
-
-    Read "direct caller outside this module" strictly: it is the exact set the
-    ratchet checks, and it is NOT the same as "every writer that reaches
-    ``config.json``".  :meth:`KiroCrewConfig.save` calls
-    :func:`write_config_atomically` and does NOT come through here -- but it holds
-    the SAME sidecar lock (via :func:`_config_write_lock`), so its rename cannot
-    land inside this function's read-modify-write.
-    ``save`` is still a whole-document publish of in-memory state, not an RMW:
-    a stale snapshot saved after a locked update overwrites it with older
-    values.  The lock fixes interleaving, not staleness.
-
-    A SECOND family of writers still bypasses this lock: writers that reach
-    ``config_path()`` through ``kiro_crew.agent._atomic_json_write``
-    (``messaging.py``'s per-channel savers, ``core.py``'s STT PUT, ``mcp.py``'s
-    gateway-enable). ``TestEveryConfigWriterIsLocked`` does not reach them --
-    it matches calls to :func:`write_config_atomically`, and these make none --
-    so they have their own ratchet,
-    ``TestTheAtomicJsonWriteConfigFamilyIsRatcheted`` in the same file, which
-    pins that family to a baseline that may only SHRINK.
-
-    That family relies on the in-process asyncio ``_get_config_lock()`` only,
-    which serializes same-loop callers and nothing else, so it can still
-    interleave with a holder of this lock.  Converting the remaining members is
-    follow-up work (``api_feishu_config_save`` and ``api_imessage_config_save``
-    are already through here and are the shape to copy); do not read either
-    ratchet's green as meaning the family is converted, only that it cannot
-    grow, and note that an ALIASED import of :func:`write_config_atomically`
-    would evade the sibling ratchet for the same matching reason.
-
-    Contract:
-
-    * **Isolation.** An advisory file lock is held for the entire
-      read-modify-write, so two concurrent callers are serialized: neither can
-      land between the other's read and write.
-    * **Sidecar lockfile.** The lock lives on ``<path>.lock``, NOT on the
-      config file's own fd.  ``write_config_atomically`` replaces the inode
-      (tmp + rename), so a lock taken on the config file's fd would not
-      serialize against the rename — a second opener after the rename gets a
-      NEW fd on the NEW inode and takes the lock instantly, defeating the
-      purpose.
-    * **Fail-closed read (default).** :func:`read_config_for_update` is used
-      inside the critical section; with ``on_corrupt="fail"`` (the default), an
-      unreadable or malformed config raises :class:`ConfigReadError`, aborts
-      the update, and the lockfile is released.  The existing file is never
-      overwritten with defaults.
-    * **Reset-on-corrupt (opt-in).** With ``on_corrupt="reset"``, a
-      :class:`ConfigReadError` inside the critical section is caught WHILE THE
-      LOCK IS STILL HELD and the *mutate* callback is invoked with ``{}``.
-      The caller's write therefore happens in the same lock hold as the read
-      attempt, closing any window for a concurrent writer to land between.
-      The resulting file is written with mode ``0o600`` (no existing mode to
-      preserve from a corrupt file).
-    * **Mode-preserving write.** :func:`write_config_atomically` preserves the
-      existing file's permission bits, so a tightened ``0600`` is not widened.
-    * **Cross-platform.** Locking goes through
-      :func:`platform_compat.file_lock`, which uses ``fcntl.flock`` on POSIX
-      and a bounded ``msvcrt.locking`` spin on Windows.
-    * **Symlink-safe.** The target path is resolved before locking, so a
-      symlinked config is updated in place (matching
-      ``write_config_atomically``'s behavior).
-
-    Parameters
-    ----------
-    path : Path | None
-        Config file path; defaults to :func:`config_path`.
-    mutate : (dict) -> dict | None
-        Called with the current config data (possibly ``{}`` for a new file).
-        Must return the updated dict to write, or ``None`` to skip the write
-        (useful when the mutate discovers no change is needed).
-    fsync : bool
-        Passed through to :func:`write_config_atomically`.
-    stamp_meta : bool
-        If True (default), stamps the ``meta`` block via
-        :func:`stamp_config_meta` before writing.
-    on_corrupt : "fail" | "reset"
-        Behavior when :func:`read_config_for_update` raises
-        :class:`ConfigReadError`.  ``"fail"`` (default) re-raises, aborting the
-        update.  ``"reset"`` catches the error inside the lock hold and invokes
-        *mutate* with ``{}``; the caller's write proceeds in the same critical
-        section so no concurrent writer can land between.
-    wait_for_lock : bool
-        If True (default), block until the advisory lock is free -- correct for
-        a caller whose update must happen.  If False, the acquire is single-shot
-        and raises :class:`OSError` when another writer holds the lock; for a
-        caller whose write is OPTIONAL and retried later, and which may run on
-        the event-loop thread, where a POSIX ``flock`` wait would stall the
-        gateway for as long as the holder keeps it.  It never relaxes the
-        serialization -- a contended acquire declines instead of proceeding.
-
-    Returns
-    -------
-    dict
-        The final config dict (after mutation), whether or not a write occurred.
-
-    Raises
-    ------
-    ConfigReadError
-        If the existing config is unreadable or malformed and
-        ``on_corrupt="fail"``.
-    OSError
-        If the lockfile cannot be opened/created or the lock cannot be acquired
-        (including a contended ``wait_for_lock=False`` acquire).
-    """
-    p = path if path is not None else config_path()
-    # Resolve symlinks before locking (same logic as write_config_atomically)
-    # so the sidecar sits beside the ACTUAL file, not the symlink.
-    try:
-        if p.is_symlink():
-            p = p.resolve()
-    except OSError:
-        pass
-    with _config_write_lock(p, wait=wait_for_lock):
+    sig: list = []
+    for p in (config_path(), config_local_path()):
         try:
-            data = read_config_for_update(p)
-        except ConfigReadError:
-            if on_corrupt == "fail":
-                raise
-            # on_corrupt="reset": treat as empty inside the same lock hold.
-            data = {}
-        result = mutate(data)
-        if result is None:
-            return data
-        if stamp_meta:
-            result = stamp_config_meta(result)
-        write_config_atomically(p, result, fsync=fsync)
-        # A same-size replacement can retain an indistinguishable fingerprint
-        # on a coarse-timestamp filesystem. Clear eagerly before reporting the
-        # write complete so the next load cannot serve the pre-write snapshot,
-        # and wake the process watcher so the hot-apply path runs now rather
-        # than on its next poll.
-        _invalidate_config_cache()
-        _notify_live_watch()
-        return result
+            st = p.stat()
+            sig.append(
+                (
+                    str(p),
+                    st.st_dev,
+                    st.st_ino,
+                    st.st_ctime_ns,
+                    st.st_mtime_ns,
+                    st.st_size,
+                    st.st_mode,
+                )
+            )
+        except OSError:
+            sig.append((str(p), None))
+    return tuple(sig)
 
 
-def _notify_live_watch() -> None:
-    """Wake the process config watcher after a write landed on ``config.json``.
+def _content_digest_of(parts: "list[bytes | None]") -> str:
+    """Digest *parts* -- one entry per config file, ``None`` for a file that is absent.
 
-    Every writer in this module ends here so the dashboard, ``kirocrew config
-    set`` and a boot-time migration all reach the hot-apply path the same way.
-    The import is lazy because ``config.live`` imports this module for its
-    loads; a no-op in a process that never started a watcher (the CLI).
+    Shared by :func:`config_content_stamp`, which reads the files, and by the load
+    path, which already holds what it parsed. One framing so the two answers are
+    comparable: each part is length-prefixed, so moving bytes from one file to the
+    other cannot produce the same digest, and an absent file gets its own token so
+    creating or deleting the overlay changes the answer.
+
+    Both sides hand over the file's DECODED text re-encoded, not the raw bytes, so
+    that they hash the same thing: the loader reads through ``read_text``, whose
+    newline translation the raw bytes would not survive, and a digest that disagreed
+    with itself across the two callers would refuse every comparison forever. What
+    this identifies is therefore the document, which is what the comparison is about.
     """
-    from kiro_crew.config import live
+    hasher = _hashlib.sha256()
+    for blob in parts:
+        if blob is None:
+            hasher.update(b"absent\x00")
+            continue
+        hasher.update(b"present\x00")
+        hasher.update(str(len(blob)).encode("ascii"))
+        hasher.update(b"\x00")
+        hasher.update(blob)
+    return hasher.hexdigest()
 
-    live.notify_config_written()
 
+def config_content_stamp() -> str | None:
+    """A digest of the config files' BYTES, or ``None`` when one cannot be read.
 
-# Keys already warned about in this process. The gateway loads config repeatedly
-# and a superseded default is per-install information, not per-load, so it is
-# said once; ``doctor`` is the surface that renders it again on demand.
-_REPORTED_SUPERSEDED_KEYS: set[str] = set()
+    :func:`_config_fingerprint` answers a cheaper and different question -- has
+    either file been REPLACED -- from stat metadata. For a rename that lands the
+    same byte count, the device, both timestamps, the size and the mode can all be
+    identical, leaving the inode as the only field that differs; where inodes are
+    not stable across a replacement, two different contents share a fingerprint. A
+    caller asking "is the live config still the bytes I derived this answer from"
+    is asking about content, so this reads the content.
 
-
-def _report_superseded_defaults(base_data: dict, *, skip: set[str] | None = None) -> None:
-    """Warn once when stored base values still hold a superseded default.
-
-    *base_data* is the ``config.json`` document as read, BEFORE the
-    ``config.local.json`` overlay is merged over it. Reporting on the base is the
-    point: the overlay is a separate user-owned file whose value is the operator's
-    live choice, so it neither proves nor disproves what the base has materialized.
-
-    Reads only. This deliberately does NOT correct the value -- for a key that also
-    has a documented escape hatch, a stored old default and a deliberate opt-out
-    are the same bytes on disk, so a rewrite cannot correct one without overriding
-    the other. Telling the operator is the part that can be done without guessing.
-
-    ONE line naming every drifted key, not one line per key. The registry is
-    append-only, so a per-key line means the terminal noise on a long-lived install
-    grows with every default the project ever changes -- and it lands on every
-    short-lived ``kirocrew`` invocation, where the once-per-process guard below
-    buys nothing because there the process IS the invocation. The per-key detail
-    belongs on the surface the operator asked for: ``kirocrew config defaults``,
-    and ``doctor``. It is also emitted at debug here, so a gateway run with
-    ``-vv`` still carries the full text in its own log.
-
-    Keys already named in this process are not repeated, so a gateway that loads
-    config many times says it once. An acknowledged key is not reported at all --
-    ``superseded_default_drift`` filters it -- which is what makes this line
-    answerable instead of permanent.
-
-    *skip* names the keys this load is ADOPTING. They are excluded because the line
-    tells the operator to run a command, and pointing them at a command for a key
-    that is being fixed in the same load is worse than saying nothing: by the time
-    they read it the key is already gone from the file.
+    ``None`` does NOT mean unchanged: it means the question could not be answered,
+    and a caller comparing stamps must treat it as a mismatch rather than a match.
+    The two paths are framed with their lengths so that moving bytes from one file
+    to the other cannot produce the same digest.
     """
-    skipped = skip or set()
-    drifted = [
-        e
-        for e in superseded_default_drift(base_data)
-        if e.dotted_key not in _REPORTED_SUPERSEDED_KEYS and e.dotted_key not in skipped
-    ]
-    if not drifted:
-        return
-    for entry in drifted:
-        _REPORTED_SUPERSEDED_KEYS.add(entry.dotted_key)
-        logger.debug("Superseded default in stored config: %s", drift_summary(entry))
-    logger.warning(
-        "%d stored config value(s) still hold a superseded default: %s. "
-        "Run 'kirocrew config defaults' to see each one, '--adopt' to take the "
-        "current defaults, or '--keep' to affirm yours and stop this notice.",
-        len(drifted),
-        ", ".join(e.dotted_key for e in drifted),
+    parts: list[bytes | None] = []
+    for p in (config_path(), config_local_path()):
+        try:
+            parts.append(read_config_text(p).encode("utf-8"))
+        except FileNotFoundError:
+            # A file that does not exist is a real state, not a failure.
+            parts.append(None)
+        except (OSError, UnicodeDecodeError):
+            return None
+    return _content_digest_of(parts)
+
+
+def _bind_content_digest(cfg: object, digest: str | None) -> None:
+    """Record on a loaded config which bytes it was parsed from.
+
+    The digest rides on the instance rather than in the dataclass, because it does not
+    describe the user's configuration: a field here would enter the constructor, the
+    generated settings surface and the field walk :func:`_adopt_in_memory` performs, all
+    of which speak for the document. Attaching it outside the field set keeps those
+    surfaces unchanged, at the cost that an object produced any other way -- a bare
+    ``KiroCrewConfig()``, a test double standing in for a load -- carries no such
+    attribute. :func:`load_config_with_content_stamp` therefore asks with a default, and
+    reads that absence as "provenance unknown".
+    """
+    setattr(cfg, "_content_digest", digest)
+
+
+def load_config_with_content_stamp() -> tuple[KiroCrewConfig, str | None]:
+    """Load the config together with the digest of the bytes it was parsed from.
+
+    The digest comes OUT of the load rather than being read around it, which is the
+    only way it can describe this object: reading the files on both sides of the call
+    proves the bytes did not move during it, but the load answers from a cache keyed
+    on stat metadata, so a replacement presenting the same fingerprint returns an
+    earlier object while those reads hash the new bytes. The cache entry carries the
+    digest of the bytes it was parsed from, so a hit reports its own provenance and a
+    miss reports what it just read.
+
+    ``None`` means no digest can be bound -- the files could not be read whole, or the
+    document was unusable and defaults were substituted. A caller must treat that as
+    unknown, never as a match.
+
+    For a caller that holds the result across other I/O and later writes something
+    derived from it, comparing this against :func:`config_content_stamp` is what tells
+    "my copy is still current" from "a save landed while I was working".
+    """
+    cfg = KiroCrewConfig.load()
+    return cfg, getattr(cfg, "_content_digest", None)
+
+
+def _cached_validated_data(fp: tuple | None = None) -> dict | None:
+    """Return a deep copy of the cached validated config dict, or None on miss.
+
+    Thin wrapper over the :class:`~kiro_crew.config.validation.ConfigCache`.
+    ``_config_fingerprint`` stays in this module because it reads
+    ``config_path()``/``config_local_path()``, which the test suite patches as
+    ``kiro_crew.config.loader.config_path``.
+
+    Pass *fp* when the caller has already computed the fingerprint, so one load
+    costs a single stat pass instead of one per consumer of it. Omitting it
+    stats, which suits a caller that has no fingerprint in hand.
+    """
+    return _CONFIG_CACHE.get(fp if fp is not None else _config_fingerprint())
+
+
+def _store_validated_data(
+    data: dict,
+    fp: tuple,
+    sidecar: dict | None = None,
+    *,
+    expected_generation: int | None = None,
+    content_digest: str | None = None,
+) -> None:
+    """Cache validated data unless a write invalidated its disk-read generation.
+
+    *content_digest* names the bytes *data* was parsed from, so a later hit on this
+    entry can say which content it represents rather than only which stat signature
+    it was filed under.
+    """
+    _CONFIG_CACHE.store(
+        data,
+        fp,
+        sidecar,
+        expected_generation=expected_generation,
+        content_digest=content_digest,
     )
 
 
-def stamp_config_meta(data: dict) -> dict:
-    """Return *data* with a freshly stamped ``meta`` block in front.
+#: Sidecar key under which the loader caches the pre-overlay base values of the
+#: top-level sections config.local.json touches. See ``_shadowed_base_sections``.
+_SIDECAR_BASE_SHADOW = "base_shadow"
+#: Whether the load that filled this cache entry found ``config.json`` present but
+#: unparseable. A cache hit carries it forward so :meth:`KiroCrewConfig.save` can
+#: refuse to publish a snapshot built without the base file.
+_SIDECAR_BASE_UNREADABLE = "base_unreadable"
 
-    ``meta.lastTouchedVersion`` names the build that wrote the bytes now on
-    disk, which is the first thing to check when a ``config.json`` looks like
-    it came from an older schema. An existing stamp is therefore replaced
-    rather than merged.
 
-    Every writer that rebuilds the whole file from a dataclass round-trip has
-    to stamp through here: ``to_dict()`` models only the schema, so such a
-    write drops any top-level key the dataclass does not carry — ``meta``
-    among them. Writers that mutate the raw dict they read keep the block
-    without help.
+def _shadowed_base_sections(base: dict, overlay: dict) -> dict:
+    """The base document's copy of every top-level section the overlay touches.
 
-    Only ``config.json`` carries the block. ``config.local.json``, agent
-    specs, and the other JSON that shares :func:`write_config_atomically` do
-    not, so the stamping is deliberately separate from that function.
+    ``_deep_merge`` lets an overlay leaf replace a base leaf, and after the merge
+    nothing remembers what the base held. That is fine for modelled keys — they
+    are parsed into fields and ``save()`` re-emits the field, while
+    ``_subtract_overlay`` keeps the overlay's value out of the base file. It is
+    NOT fine for the unknown keys ``_extra_sections`` / ``_extra_keys`` round-trip
+    verbatim: captured from the MERGED document they hold the overlay's value, so
+    ``save()`` emits it, the subtraction removes it (it equals the raw overlay
+    value), and the base file loses a key it had. Removing the overlay later then
+    reveals nothing — the base value is gone for good.
+
+    Capturing from the base instead makes the round-trip honest: ``save()`` emits
+    the base value, it differs from the overlay leaf so subtraction leaves it, and
+    the overlay still wins on the next load exactly as before.
+
+    Only sections the overlay names are kept (an overlay normally touches a few),
+    and only their base copy — the loader already has the merged copy. This rides
+    in the cache sidecar so a cache hit, where the overlay is not in scope,
+    can still capture correctly.
     """
-    return {
-        "meta": {
-            "lastTouchedVersion": __version__,
-            "lastTouchedAt": datetime.now(timezone.utc).isoformat(),
-        },
-        **{k: v for k, v in data.items() if k != "meta"},
-    }
+    return {k: copy.deepcopy(base[k]) for k in overlay if k in base}
 
 
-def refresh_config_meta_stamp() -> bool:
-    """Re-stamp ``config.json``'s ``meta`` block when it names another build.
-
-    The stamp is only ever written as a side effect of a config write, so an
-    upgrade that never touches ``config.json`` leaves ``lastTouchedVersion``
-    naming the *previous* build indefinitely. That contradicts the field's
-    documented meaning ("the build that wrote the bytes now on disk") and
-    sends anyone debugging a version question chasing a build that is not
-    installed. Called once per gateway start, off the boot
-    path: a version check on one small file, a rewrite only when it differs.
-
-    Deliberately a plain field refresh, not a migration hook: the stamp is
-    replaced, every other key is preserved, and nothing else changes. When
-    the stored version already matches, the file is not rewritten at all
-    (no mtime churn, no ``lastTouchedAt`` bump).
-
-    The read-modify-write goes through :func:`update_config_locked` — the
-    required path for new ``config.json`` mutations — so the refresh holds
-    the sidecar advisory lock and can never revert a concurrent settings
-    write with its own earlier snapshot. Callers that run while the
-    dashboard serves requests must ALSO hold the in-process asyncio config
-    lock (``_get_config_lock``) around the call, because the legacy writers
-    serialize on that lock alone.
-
-    Best-effort by design — a stale stamp is a diagnostic blemish, never
-    worth failing a boot over. Returns ``True`` when a refresh was written,
-    ``False`` when nothing needed doing (absent/empty file, current stamp)
-    or the file could not be safely read (an unreadable/torn config must
-    never be replaced with a stamped-but-empty one).
-    """
-    path = config_path()
-    if not path.exists():
-        return False
-
-    wrote = False
-
-    def _stamp_if_stale(data: dict) -> dict | None:
-        nonlocal wrote
-        if not data:
-            # Absent or emptied between the exists() check and the lock hold:
-            # there is nothing to refresh, and writing would CREATE a config
-            # holding only a meta block.
-            return None
-        meta = data.get("meta")
-        stored = meta.get("lastTouchedVersion") if isinstance(meta, dict) else None
-        if stored == __version__:
-            return None  # current: skip the write entirely
-        wrote = True
-        return data  # update_config_locked stamps the meta block itself
-
-    try:
-        update_config_locked(path, mutate=_stamp_if_stale)
-    except ConfigReadError:
-        logger.debug(
-            "config meta stamp refresh skipped: %s unreadable; leaving it untouched",
-            path,
-            exc_info=True,
-        )
-        return False
-    except OSError:
-        logger.debug(
-            "config meta stamp refresh failed: could not lock or write %s",
-            path,
-            exc_info=True,
-        )
-        return False
-    if wrote:
-        _invalidate_config_cache()
-        _notify_live_watch()
-    return wrote
-
-
-class WorkspaceDirUnusable(Exception):
-    """A workspace ``dir`` cannot be materialized as a directory.
-
-    ``code`` is the stable token both writers map onto their own error contract
-    (the dashboard's 409 body ``code``; the CLI's exit-1 message):
-    ``workspace_dir_not_a_directory`` when the path exists as something that is
-    not a directory, ``workspace_dir_uncreatable`` for everything else (a missing
-    parent, a parent swapped for a link, a permission error).
-    """
-
-    def __init__(self, code: str, message: str) -> None:
-        super().__init__(message)
-        self.code = code
-
-
-class _PinnedCreateRefusal(Exception):
-    """pinned_fs's refusal for the workspace create, mapped by the caller."""
-
-
-def materialize_workspace_dir(validated: Path, *, display: str) -> None:
-    """Make *validated* exist as a directory: adopt one that is there, create one that is not.
-
-    One writer-side rule shared by the dashboard handler and the CLI: a published
-    workspace must name a usable directory for provider cwd and project documents.
-
-    *validated* is the path AS THE CALLER'S VALIDATION RESOLVED IT (``Path.resolve()``
-    at validation time). This function never resolves it again: resolving here would
-    follow whatever a parent component points at by now, which is the exact swap the
-    pinned create exists to refuse (see :func:`pinned_fs.pin_parent`).
-
-    An existing DIRECTORY is adopted untouched (pointing a new workspace at a folder
-    the owner already keeps is the normal case for an absolute ``dir``). Anything
-    else that exists at the name is refused, as is a missing PARENT: only the final
-    component is ever created, so a mistyped nested ``dir`` fails here instead of
-    committing an entry that breaks an unrelated member later.
-
-    Adoption AND creation are judged through the PINNED parent where the platform
-    can pin: every parent component is opened with ``O_NOFOLLOW`` relative to the
-    previous one, and the final name is inspected or made relative to that
-    descriptor. A component swapped for a link after validation is therefore
-    refused rather than followed. That is the discipline every other write under a
-    validated path in this product keeps (:mod:`kiro_crew.pinned_fs`). Where nothing
-    can be pinned (Windows: no ``dir_fd``, no ``O_NOFOLLOW``), both checks are by
-    name, which is that module's documented limit, not a silent substitute.
-
-    Not a rollback site: the directory this makes is left in place when the
-    caller's config write later fails. It is reachable only through the entry
-    written in the same locked section, and a concurrent create can already have
-    adopted it, so deleting it is the unsafe option.
-    """
-    if pinned_fs.supports_pinned_walk():
-        try:
-            parent_fd = pinned_fs.pin_parent(
-                str(validated.parent),
-                what=f"workspace directory {display!r}",
-                refusal=_PinnedCreateRefusal,
-            )
-            try:
-                st = pinned_fs.stat_at(parent_fd, validated.name)
-                if st is None:
-                    try:
-                        os.mkdir(validated.name, dir_fd=parent_fd)
-                        return
-                    except FileExistsError:
-                        st = pinned_fs.stat_at(parent_fd, validated.name)
-                if st is not None and _stat.S_ISDIR(st.st_mode):
-                    return
-                raise WorkspaceDirUnusable(
-                    "workspace_dir_not_a_directory",
-                    f"'{display}' exists and is not a directory; "
-                    "choose another dir or remove it first",
-                )
-            finally:
-                os.close(parent_fd)
-        except _PinnedCreateRefusal as exc:
-            raise WorkspaceDirUnusable(
-                "workspace_dir_uncreatable", f"Directory '{display}' could not be created: {exc}"
-            ) from exc
-        except OSError as exc:
-            raise WorkspaceDirUnusable(
-                "workspace_dir_uncreatable",
-                f"Directory '{display}' could not be created: {exc.strerror or exc}",
-            ) from exc
-
-    if validated.is_dir():
-        return
-    try:
-        os.mkdir(validated)
-    except FileExistsError as exc:
-        # EEXIST is the filesystem itself saying something is at the name: a
-        # racer's directory is the state this create wanted, while a file, a
-        # socket, a dangling link or a symlink cannot serve as a workspace, and
-        # registering one writes back exactly the unusable entry this prevents.
-        if validated.is_dir() and not validated.is_symlink():
-            return
-        raise WorkspaceDirUnusable(
-            "workspace_dir_not_a_directory",
-            f"'{display}' exists and is not a directory; choose another dir or remove it first",
-        ) from exc
-    except OSError as exc:
-        raise WorkspaceDirUnusable(
-            "workspace_dir_uncreatable",
-            f"Directory '{display}' could not be created: {exc.strerror or exc}",
-        ) from exc
-
-
-def workspace_dir_for(workspace: str | None = None) -> Path:
-    """Resolve a named workspace to its directory path.
-
-    Reads the LOADED config's ``workspaces`` table, not the raw bytes on disk, so
-    this and ``resolve_agent_bindings`` cannot answer the same question two ways:
-    the loaded table is the one the validator has repaired and the write-back
-    migration has normalized, and it is what every other consumer already reads.
-
-    Values starting with ``/`` or ``~`` are treated as absolute paths.
-    Otherwise the value is relative to ``config_dir()`` (``~/.kiro/crew/``).
-
-    An unmapped name falls back to the ``WorkspaceConfig`` default directory —
-    NOT to ``default_workspace``'s directory, which could be an absolute path
-    outside the data home — and the fall-through is LOGGED. Two DISTINCT names
-    both resolving to the same ``<home>/workspace`` is how a workspace split
-    turns into a shared tree nobody notices, so that case warns. An install that
-    simply has no ``workspaces`` section yet is the ordinary fresh state and logs
-    at debug — it is one workspace, not a collision.
-
-    Never raises. ``default_project_dir`` and the workspace-identity block are
-    built on this, so a raise here would break a fresh install and take both
-    with it; a config that cannot be loaded resolves to the default directory.
-    """
-    mapping: dict[str, WorkspaceConfig] = {}
-    ws = workspace or ""
-    configured_default = ""
-    try:
-        cfg = KiroCrewConfig.load()
-        mapping = cfg.workspaces
-        configured_default = cfg.default_workspace
-        ws = workspace or configured_default
-    except Exception:
-        logger.warning(
-            "could not load config to resolve workspace %r; using the default directory",
-            workspace,
-            exc_info=True,
-        )
-
-    entry = mapping.get(ws)
-    if entry is None:
-        # An unmapped name resolves to the BASE workspace directory, never to the
-        # configured default's directory. That distinction is the boundary: this
-        # answer becomes a filesystem root, and one caller
-        # (``dashboard/handlers/files.py``'s ``?workspace=``) takes the name from a
-        # request without the ``is_sensitive_path`` check its ``?project=`` sibling
-        # applies. Hopping to ``default_workspace`` would let an unrecognized name
-        # reach whatever absolute ``dir`` that workspace declares, so an unmapped
-        # name stays inside the data home by construction.
-        #
-        # It is still a fail-OPEN worth naming: two DISTINCT declared-looking names
-        # both landing here share one tree, which is how a workspace split becomes a
-        # shared tree nobody notices. An install with no ``workspaces`` section is
-        # the ordinary fresh state and is one workspace, not a collision.
-        report = logger.debug if ws == configured_default else logger.warning
-        report(
-            "workspace %r is not declared in workspaces; falling back to the base "
-            "workspace directory",
-            ws,
-        )
-    dirname = entry.dir if entry is not None and entry.dir else WorkspaceConfig().dir
-
-    p = Path(dirname).expanduser()
-    if p.is_absolute():
-        return p
-    return config_dir() / dirname
-
-
-def default_project_dir(workspace: str | None = None) -> str:
-    """Resolve the default project directory for a workspace.
-
-    Returns the realpath of ``workspace_dir_for(workspace)`` if it exists and
-    is not a sensitive path, otherwise returns ``""``.
-
-    Used by chat_handlers (slot.project fallback) and session.py (pool cwd)
-    to avoid duplicating the same resolution + validation logic.
-    """
-    from kiro_crew.security import is_sensitive_path  # circular import
-
-    try:
-        ws_dir = os.path.realpath(str(workspace_dir_for(workspace)))
-        if os.path.isdir(ws_dir) and not is_sensitive_path(ws_dir):
-            return ws_dir
-    except Exception:
-        pass
-    return ""
-
-
-def env_path() -> Path:
-    return config_dir() / ".env"
-
-
-def read_env_file_credential(key: str, env_file: Path | None = None) -> str:
-    """Best-effort read of one ``KEY=VALUE`` entry from the data home's ``.env``.
-
-    Same line format :meth:`KiroCrewConfig.load_credentials` parses (one pair
-    per line, ``#`` comments, no quotes required, last occurrence wins).
-    Returns ``""`` when the file is absent or unreadable — callers treat the
-    credential as unset rather than failing.
-
-    Blocking file IO: call via ``asyncio.to_thread`` from async paths.
-    """
-    ep = env_file if env_file is not None else env_path()
-    try:
-        text = ep.read_text()
-    except OSError:
-        return ""
-    value = ""
-    for line in text.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if "=" in line:
-            k, v = line.split("=", 1)
-            if k.strip() == key:
-                value = v.strip()
-    return value
-
-
-def inject_kiro_cli_api_key(env: MutableMapping[str, str]) -> MutableMapping[str, str]:
-    """Ensure *env* carries kiro-cli's own model credential (``KIRO_API_KEY``).
-
-    The Docker entrypoint scrubs :data:`CREDENTIAL_KEYS` out of the gateway's
-    process environment into the data home's ``.env`` (mode 600) so they never
-    reside in a long-lived ``/proc/<pid>/environ``. Every other credential is
-    consumed in-process from :meth:`KiroCrewConfig.load_credentials`, but this
-    one authenticates the kiro-cli CHILD, which reads it from its own
-    environment — so kiro-cli spawn paths call this to hand the child exactly
-    the one variable it owns, without re-widening the parent's environ. A value
-    already present in *env* wins (same precedence as ``load_credentials``);
-    outside Docker nothing changes because the variable is still inherited.
-
-    Mutates *env* in place and returns it for convenience. Blocking file IO:
-    call via ``asyncio.to_thread`` from async paths.
-    """
-    if not env.get(CRED_KIRO_API_KEY):
-        val = read_env_file_credential(CRED_KIRO_API_KEY)
-        if val:
-            env[CRED_KIRO_API_KEY] = val
-    return env
-
-
-def strip_kiro_cli_api_key(env: MutableMapping[str, str]) -> MutableMapping[str, str]:
-    """Remove kiro-cli's model credential from a child that does not consume it.
-
-    Counterpart to :func:`inject_kiro_cli_api_key` for every ACP backend other
-    than kiro (Claude Code, and KAS): the credential authenticates
-    kiro-cli's OWN v2 agent loop, and it is deliberately NOT in
-    ``sandbox._AGENT_DENIED_ENV_KEYS``, so without this an inherited copy in the
-    raw ``os.environ`` snapshot would ride into an agent process that has no use
-    for it.
-
-    For KAS the child IS a kiro-cli: Crew reaches it through kiro-cli's ACP relay.
-    The strip still
-    applies because the v3 engine resolves its tokens either from kiro-cli's
-    OIDC store (``--auth-method cli``) or from Crew's own vault over its
-    ``_kiro/auth/getAccessToken`` callback, and an API key in its environment
-    would take precedence over both — the test is what the child's engine
-    consumes, not which binary it is.
-
-    Matches the platform env-key convention (exact on POSIX, case-folded on
-    Windows) so a differently-cased Windows spelling cannot slip past. Mutates
-    *env* in place and returns it.
-    """
-    matched = [k for k in env if platform_compat.env_key_allowed(k, _KIRO_API_KEY_ONLY)]
-    for k in matched:
-        del env[k]
-    return env
-
-
-# Single-key allowlist for strip_kiro_cli_api_key's platform-aware matching.
-_KIRO_API_KEY_ONLY = frozenset({CRED_KIRO_API_KEY})
-
-
-def resolve_agent_config_path() -> Path:
-    """Return defaults.json, preferring project-dir override for development.
-
-    All modules that need the agent config path should call this instead
-    of reimplementing the resolution chain.
-    """
-    proj = os.environ.get("KIROCREW_PROJECT_DIR")
-    if proj:
-        p = Path(proj) / "agents" / "defaults.json"
-        if p.exists():
-            return p
-    return config_package_dir() / "defaults.json"
+def _invalidate_config_cache() -> None:
+    """Drop the cached validated config (called after save()/write-back)."""
+    _CONFIG_CACHE.clear()
 
 
 # ---------------------------------------------------------------------------
-# Validation helpers — used by KiroCrewConfig.load()
+# Load-time field readers, the security clamp and the loader-owned section builders.
+# Every other section builder lives in config.section_builders.
 # ---------------------------------------------------------------------------
-
 # JSON Schema type → Python type names for log messages
 _JSON_TYPE_LABELS: dict[str, str] = {
     "string": "string",
@@ -2194,7 +2729,27 @@ def consume_managed_service_launch_environment(
     """
     source = os.environ if environ is None else environ
     value = source.pop(_MANAGED_SERVICE_ENV, None)
-    return {} if value is None else {_MANAGED_SERVICE_ENV: value}
+    if value is None:
+        return {}
+    if environ is None:
+        # Consumed for descendants only: the gateway's own exec successor (an
+        # in-app restart) is the same service launch and gets it back.
+        platform_compat.keep_for_reexec(_MANAGED_SERVICE_ENV, value)
+    return {_MANAGED_SERVICE_ENV: value}
+
+
+def launched_as_managed_service() -> bool:
+    """Whether a generated service definition launched this process.
+
+    Reads the marker where it still is, or where
+    :func:`consume_managed_service_launch_environment` kept it after taking it
+    out of the environment, so the answer does not change once the dashboard
+    has started.
+    """
+    marker = os.environ.get(_MANAGED_SERVICE_ENV)
+    if marker is None:
+        marker = platform_compat.kept_for_reexec().get(_MANAGED_SERVICE_ENV)
+    return marker == "1"
 
 
 def load_loop_stall_exit_after(
@@ -2213,7 +2768,7 @@ def load_loop_stall_exit_after(
     return resolve_loop_stall_exit_after(dashboard_data, environ)
 
 
-def _subagent_timeout_from(raw: object) -> int:
+def _subagent_timeout_from(raw: object, default: int) -> int:
     """Coerce ``agent.subagent_timeout_secs``, preserving its ``0`` sentinel.
 
     ``0`` means "use the default" and is normalized by the manager, so it must
@@ -2221,10 +2776,25 @@ def _subagent_timeout_from(raw: object) -> int:
     documented sentinel into a 60-second deadline that kills healthy subagents.
     Coercion still happens here as well as in ``_clamp_security_bounds``, because
     that clamp skips non-int values and a numeric STRING (``"30"``) reaches this
-    site unbounded.
+    site unbounded. A value it cannot read takes *default*, the field's.
     """
-    value = _safe_int(raw, SUBAGENT_TIMEOUT_SECS, 0, SUBAGENT_TIMEOUT_MAX)
+    value = _safe_int(raw, default, 0, SUBAGENT_TIMEOUT_MAX)
     return value if value == 0 else max(SUBAGENT_TIMEOUT_MIN, value)
+
+
+def _clamp_compact_wait_secs(raw: object, default: float) -> float:
+    """Coerce ``session.compact_wait_secs``, preserving its ``0`` sentinel.
+
+    ``0`` means "use the built-in budget" and the resolver falls back to
+    ``COMPACT_WAIT_TIMEOUT_SECS`` for it, so it must survive coercion. A
+    positive value is lifted to at least ``COMPACT_WAIT_SECS_MIN`` and capped
+    at ``COMPACT_WAIT_SECS_MAX``: ``_safe_float`` with ``lo=0`` collapses a
+    negative to the sentinel, then the floor keeps a hand-edited near-zero
+    value from arming a budget that restarts every compaction. A value it cannot
+    read takes *default*, the field's.
+    """
+    value = _safe_float(raw, default, lo=0.0, hi=_sections.COMPACT_WAIT_SECS_MAX)
+    return value if value == 0 else max(_sections.COMPACT_WAIT_SECS_MIN, value)
 
 
 _DEFAULT_MEMORY_MODES = frozenset({"persistent", "incognito", "temporary"})
@@ -2233,6 +2803,18 @@ _DEFAULT_MEMORY_MODES = frozenset({"persistent", "incognito", "temporary"})
 def _default_memory_mode_from(raw: object) -> str:
     """Normalize a stored dashboard default without failing open on corruption."""
     return raw if isinstance(raw, str) and raw in _DEFAULT_MEMORY_MODES else "temporary"
+
+
+def _folder_sort_from(raw: object, default: str) -> str:
+    """Normalize the sidebar folder sort mode; anything unknown is *default*, ``custom``.
+
+    ``custom`` is the stored-order behaviour every install had before the field
+    existed, so a missing, hand-edited or downgraded value changes nothing the
+    person sees. The sidebar's own reader makes the same choice.
+    """
+    if isinstance(raw, str) and raw in _sections.FOLDER_SORT_MODES:
+        return raw
+    return default
 
 
 # (section, key, min, max) for each bounded field clamped at load time. The
@@ -2281,6 +2863,11 @@ _SECURITY_BOUNDED_FIELDS: tuple[tuple[str, str, int, int], ...] = (
         CHAT_ENTRY_CACHE_BYTES_MAX,
     ),
     ("session", "pool_size", 0, POOL_SIZE_MAX),
+    # A kill budget belongs in this sweep for the reason the sweep exists: the
+    # value authorizes signals, and a hand-edited config.json never passes the
+    # dashboard's write gate. The floor is 0 because 0 is this field's OFF value, so
+    # a negative clamps toward observe-only rather than toward killing.
+    ("session", "reconcile_max_kills", 0, _sections.RECONCILE_MAX_KILLS_MAX),
 )
 
 
@@ -2444,146 +3031,76 @@ def _clamp_security_bounds(data: dict) -> None:
             )
 
 
-def _config_fingerprint() -> tuple:
-    """Cheap signature of the config files — changes whenever either is edited.
-
-    Includes replacement identity (device + inode) and change time in addition
-    to mtime, size, and mode. Dashboard/CLI writers publish with atomic rename;
-    on a coarse-timestamp filesystem an Incognito→Temporary replacement can
-    otherwise keep the same mtime and size, making another process's cache look
-    current. A missing file contributes a sentinel so create/delete also busts.
-    """
-    sig: list = []
-    for p in (config_path(), config_local_path()):
-        try:
-            st = p.stat()
-            sig.append(
-                (
-                    str(p),
-                    st.st_dev,
-                    st.st_ino,
-                    st.st_ctime_ns,
-                    st.st_mtime_ns,
-                    st.st_size,
-                    st.st_mode,
-                )
-            )
-        except OSError:
-            sig.append((str(p), None))
-    return tuple(sig)
-
-
-def _cached_validated_data(fp: tuple | None = None) -> dict | None:
-    """Return a deep copy of the cached validated config dict, or None on miss.
-
-    Thin wrapper over the :class:`~kiro_crew.config.validation.ConfigCache`.
-    ``_config_fingerprint`` stays in this module because it reads
-    ``config_path()``/``config_local_path()``, which the test suite patches as
-    ``kiro_crew.config.loader.config_path``.
-
-    Pass *fp* when the caller has already computed the fingerprint, so one load
-    costs a single stat pass instead of one per consumer of it. Omitting it
-    stats, which suits a caller that has no fingerprint in hand.
-    """
-    return _CONFIG_CACHE.get(fp if fp is not None else _config_fingerprint())
-
-
-def _store_validated_data(
-    data: dict,
-    fp: tuple,
-    sidecar: dict | None = None,
-    *,
-    expected_generation: int | None = None,
-) -> None:
-    """Cache validated data unless a write invalidated its disk-read generation."""
-    _CONFIG_CACHE.store(
-        data,
-        fp,
-        sidecar,
-        expected_generation=expected_generation,
-    )
-
-
-#: Sidecar key under which the loader caches the pre-overlay base values of the
-#: top-level sections config.local.json touches. See ``_shadowed_base_sections``.
-_SIDECAR_BASE_SHADOW = "base_shadow"
-
-
-def _shadowed_base_sections(base: dict, overlay: dict) -> dict:
-    """The base document's copy of every top-level section the overlay touches.
-
-    ``_deep_merge`` lets an overlay leaf replace a base leaf, and after the merge
-    nothing remembers what the base held. That is fine for modelled keys — they
-    are parsed into fields and ``save()`` re-emits the field, while
-    ``_subtract_overlay`` keeps the overlay's value out of the base file. It is
-    NOT fine for the unknown keys ``_extra_sections`` / ``_extra_keys`` round-trip
-    verbatim: captured from the MERGED document they hold the overlay's value, so
-    ``save()`` emits it, the subtraction removes it (it equals the raw overlay
-    value), and the base file loses a key it had. Removing the overlay later then
-    reveals nothing — the base value is gone for good.
-
-    Capturing from the base instead makes the round-trip honest: ``save()`` emits
-    the base value, it differs from the overlay leaf so subtraction leaves it, and
-    the overlay still wins on the next load exactly as before.
-
-    Only sections the overlay names are kept (an overlay normally touches a few),
-    and only their base copy — the loader already has the merged copy. This rides
-    in the cache sidecar so a cache hit, where the overlay is not in scope,
-    can still capture correctly.
-    """
-    return {k: copy.deepcopy(base[k]) for k in overlay if k in base}
-
-
-def _invalidate_config_cache() -> None:
-    """Drop the cached validated config (called after save()/write-back)."""
-    _CONFIG_CACHE.clear()
-
-
 # Compatibility facade: section DTOs remain importable from this module.
+
+
+def _session_start_concurrency(raw: object, ceiling: int = 64) -> int | str:
+    """A start width: ``"auto"`` or an int clamped to ``1..ceiling``.
+
+    ``agent.session_start_concurrency`` uses the default ceiling of 64;
+    ``agent.cold_start_concurrency`` and ``agent.runtime_spawn_concurrency`` pass
+    32. Anything that is neither (missing, a bool, a non-integral float, a
+    non-numeric string) falls back to the ``"auto"`` default, as a junk value of
+    any other int knob falls back to its default.
+    """
+    if _session_start_is_auto(raw) or isinstance(raw, bool):
+        return _SESSION_START_AUTO
+    if isinstance(raw, float) and not raw.is_integer():
+        return _SESSION_START_AUTO
+    try:
+        value = int(raw)  # type: ignore[call-overload]
+    except (TypeError, ValueError, OverflowError):
+        return _SESSION_START_AUTO
+    return max(1, min(ceiling, value))
 
 
 # Build each section in its own frame: the large inline constructor amplifies
 # line-tracing cost on every load. These helpers create fresh values, never
 # cache configuration, and leave resolution and admission checks unchanged.
 def _build_agent_config(agent_data: dict) -> AgentConfig:
+    section = _sections.SectionReader(AgentConfig, agent_data)
     return AgentConfig(
-        approval_mode=agent_data.get("approval_mode", "auto"),
-        streaming=agent_data.get("streaming", True),
-        model=agent_data.get("model", DEFAULT_MODEL),
-        role_models=coerce_role_models(agent_data.get("role_models")),
-        role_efforts=coerce_role_efforts(agent_data.get("role_efforts")),
-        fallback_model=coerce_fallback_model(agent_data.get("fallback_model", "auto")),
+        approval_mode=section.get("approval_mode"),
+        streaming=section.get("streaming"),
+        model=section.get("model"),
+        role_models=coerce_role_models(section.get("role_models")),
+        role_efforts=coerce_role_efforts(section.get("role_efforts")),
+        fallback_model=coerce_fallback_model(section.get("fallback_model")),
         refusal_fallback_model=_sections.coerce_refusal_fallback_model(
-            agent_data.get("refusal_fallback_model", "")
+            section.get("refusal_fallback_model")
         ),
-        reasoning_effort=agent_data.get("reasoning_effort", ""),
-        provider=agent_data.get("provider", "acp"),
-        mcp_registry_mode=_safe_bool(agent_data.get("mcp_registry_mode", False), False),
-        mcp_quarantine_after_failures=_safe_int(
-            agent_data.get("mcp_quarantine_after_failures", 3), 3
-        ),
-        acp_backend=_normalize_acp_backend(agent_data.get("acp_backend")),
-        member_acp_backend=_normalize_acp_backend(agent_data.get("member_acp_backend", "kas")),
-        default_agent=agent_data.get("default_agent", ""),
-        sweep_agents_backups=_safe_bool(agent_data.get("sweep_agents_backups", False), False),
-        sandbox=agent_data.get("sandbox", "auto"),
-        sandbox_allow_no_isolation=bool(agent_data.get("sandbox_allow_no_isolation", False)),
+        reasoning_effort=section.get("reasoning_effort"),
+        provider=section.get("provider"),
+        mcp_registry_mode=section.read("mcp_registry_mode", _safe_bool),
+        mcp_quarantine_after_failures=section.read("mcp_quarantine_after_failures", _safe_int),
+        acp_backend=_normalize_acp_backend(section.get("acp_backend")),
+        member_acp_backend=_normalize_acp_backend(section.get("member_acp_backend")),
+        default_agent=section.get("default_agent"),
+        # Through the module alias rather than a new top-level import: the loader's
+        # ``from ... import`` list is a FROZEN pre-split compatibility snapshot
+        # (``test_config_module_boundaries.test_loader_reexports_historical_snapshot_by_identity``),
+        # so a new name joins it only by being an old one. Same shape as
+        # ``coerce_refusal_fallback_model`` above.
+        deepseek_env=_sections.coerce_deepseek_env(section.get("deepseek_env")),
+        sweep_agents_backups=section.read("sweep_agents_backups", _safe_bool),
+        sandbox=section.get("sandbox"),
+        sandbox_allow_no_isolation=bool(section.get("sandbox_allow_no_isolation")),
         sandbox_allow_unsandboxed_exec=bool(
             agent_data.get(
                 "sandbox_allow_unsandboxed_exec",
                 unsandboxed_exec_platform_default(),
             )
         ),
-        apps_allow_third_party=_safe_bool(agent_data.get("apps_allow_third_party", False), False),
+        apps_allow_third_party=section.read("apps_allow_third_party", _safe_bool),
         apps_trusted=(
             [a for a in _trusted if isinstance(a, str) and a]
-            if isinstance(_trusted := agent_data.get("apps_trusted"), list)
-            else []
+            if isinstance(_trusted := section.get("apps_trusted"), list)
+            else section.default("apps_trusted")
         ),
         apps_trusted_local=(
             [a for a in _trusted_local if isinstance(a, str) and a]
-            if isinstance(_trusted_local := agent_data.get("apps_trusted_local"), list)
-            else []
+            if isinstance(_trusted_local := section.get("apps_trusted_local"), list)
+            else section.default("apps_trusted_local")
         ),
         apps_trusted_repositories=(
             {
@@ -2592,42 +3109,35 @@ def _build_agent_config(agent_data: dict) -> AgentConfig:
                 if isinstance(name, str) and isinstance(repository, str) and name and repository
             }
             if isinstance(
-                _trusted_repositories := agent_data.get("apps_trusted_repositories"),
+                _trusted_repositories := section.get("apps_trusted_repositories"),
                 dict,
             )
-            else {}
+            else section.default("apps_trusted_repositories")
         ),
-        apps_ui_stream_timeout_secs=_safe_int(
-            agent_data.get("apps_ui_stream_timeout_secs", 30), 30, 5, 600
-        ),
-        jail=_normalize_jail(agent_data.get("jail", "auto")),
+        apps_ui_stream_timeout_secs=section.read("apps_ui_stream_timeout_secs", _safe_int, 5, 600),
+        jail=_normalize_jail(section.get("jail")),
         dangerously_skip_permissions=_read_skip_permissions(agent_data),
-        yolo_duration=_normalize_yolo_duration(agent_data.get("yolo_duration")),
-        notify_override_expiry=agent_data.get("notify_override_expiry", True),
-        tool_search=bool(agent_data.get("tool_search", True)),
-        tool_search_min_pct=_safe_int(agent_data.get("tool_search_min_pct", 5), 5),
-        tool_search_min_tokens=_safe_int(agent_data.get("tool_search_min_tokens", 50000), 50000),
-        session_sharing=bool(agent_data.get("session_sharing", True)),
-        max_subagents=_safe_int(
-            agent_data.get("max_subagents", 0), 0, 0, SUBAGENT_AUTO_MAX_CEILING
+        yolo_duration=section.read("yolo_duration", _normalize_yolo_duration),
+        notify_override_expiry=section.get("notify_override_expiry"),
+        tool_search=bool(section.get("tool_search")),
+        tool_search_min_pct=section.read("tool_search_min_pct", _safe_int),
+        tool_search_min_tokens=section.read("tool_search_min_tokens", _safe_int),
+        session_sharing=bool(section.get("session_sharing")),
+        max_subagents=section.read("max_subagents", _safe_int, 0, SUBAGENT_AUTO_MAX_CEILING),
+        max_stop_hook_nudges=section.read("max_stop_hook_nudges", _safe_int, 0),
+        subagent_mem_buffer_pct=section.read("subagent_mem_buffer_pct", _safe_int),
+        chat_turn_timeout_secs=section.read(
+            "chat_turn_timeout_secs", _safe_int, CHAT_TURN_TIMEOUT_MIN, CHAT_TURN_TIMEOUT_MAX
         ),
-        max_stop_hook_nudges=_safe_int(agent_data.get("max_stop_hook_nudges", 100), 100, 0),
-        subagent_mem_buffer_pct=_safe_int(agent_data.get("subagent_mem_buffer_pct", 20), 20),
-        chat_turn_timeout_secs=_safe_int(
-            agent_data.get("chat_turn_timeout_secs", 14400),
-            14400,
-            CHAT_TURN_TIMEOUT_MIN,
-            CHAT_TURN_TIMEOUT_MAX,
-        ),
-        session_start_timeout_secs=_safe_int(
-            agent_data.get("session_start_timeout_secs", 90),
-            90,
+        session_start_timeout_secs=section.read(
+            "session_start_timeout_secs",
+            _safe_int,
             SESSION_START_TIMEOUT_MIN,
             SESSION_START_TIMEOUT_MAX,
         ),
-        tool_approval_timeout_secs=_safe_int(
-            agent_data.get("tool_approval_timeout_secs", 600),
-            600,
+        tool_approval_timeout_secs=section.read(
+            "tool_approval_timeout_secs",
+            _safe_int,
             TOOL_APPROVAL_TIMEOUT_MIN,
             TOOL_APPROVAL_TIMEOUT_MAX,
         ),
@@ -2643,7 +3153,7 @@ def _build_agent_config(agent_data: dict) -> AgentConfig:
         # validation, so it cannot ride the missing-field default back to
         # true; see the normalization above the `_validate_config_data`
         # call. `_safe_bool` here is the final guard for a real bool.
-        session_control=_safe_bool(agent_data.get("session_control", True), True),
+        session_control=section.read("session_control", _safe_bool),
         # Default true preserves the zero-configuration member-dispatch
         # grant (today's behaviour) for a MISSING key. A present-but-
         # malformed value was already coerced to False upstream, BEFORE
@@ -2651,33 +3161,43 @@ def _build_agent_config(agent_data: dict) -> AgentConfig:
         # back to true — see the `member_dispatch` normalization above
         # the `_validate_config_data` call. `_safe_bool` here is the
         # final guard for a real bool.
-        member_dispatch=_safe_bool(agent_data.get("member_dispatch", True), True),
-        subagent_cost_gb=_safe_float(agent_data.get("subagent_cost_gb", 0.5), 0.5),
-        subagent_cpu_cost_cores=_safe_float(agent_data.get("subagent_cpu_cost_cores", 1.0), 1.0),
-        subagent_auto_max=_safe_int(
-            agent_data.get("subagent_auto_max", 32), 32, 3, SUBAGENT_AUTO_MAX_CEILING
+        member_dispatch=section.read("member_dispatch", _safe_bool),
+        # Default true is the zero-configuration panel grant, and the guard is the
+        # one above: a present-but-malformed value was already coerced to False
+        # upstream, BEFORE schema validation, so it cannot ride the missing-field
+        # default back to true. `_safe_bool` here is the final guard for a real
+        # bool.
+        crew_panel=section.read("crew_panel", _safe_bool),
+        subagent_cost_gb=section.read("subagent_cost_gb", _safe_float),
+        subagent_cpu_cost_cores=section.read("subagent_cpu_cost_cores", _safe_float),
+        subagent_auto_max=section.read(
+            "subagent_auto_max", _safe_int, 3, SUBAGENT_AUTO_MAX_CEILING
         ),
-        subagent_spawn_stagger_secs=_safe_float(
-            agent_data.get("subagent_spawn_stagger_secs", 0.25), 0.25
-        ),
-        spawn_min_memory_gb=_safe_float(agent_data.get("spawn_min_memory_gb", 4.0), 4.0),
-        resource_pressure_gb=_safe_float(agent_data.get("resource_pressure_gb", 4.0), 4.0),
-        resource_critical_gb=_safe_float(agent_data.get("resource_critical_gb", 2.0), 2.0),
-        admission_gate=_safe_bool(agent_data.get("admission_gate"), True),
+        subagent_spawn_stagger_secs=section.read("subagent_spawn_stagger_secs", _safe_float),
+        spawn_min_memory_gb=section.read("spawn_min_memory_gb", _safe_float),
+        resource_pressure_gb=section.read("resource_pressure_gb", _safe_float),
+        resource_critical_gb=section.read("resource_critical_gb", _safe_float),
+        admission_gate=section.read("admission_gate", _safe_bool),
         # Durable task queue keys, adjacent to admission_gate because a
         # gated spawn is what the queue defers instead of refusing.
-        task_queue_enabled=_safe_bool(agent_data.get("task_queue_enabled"), True),
-        task_dispatch_window=_safe_int(agent_data.get("task_dispatch_window", 64), 64, 1, 4096),
+        task_queue_enabled=section.read("task_queue_enabled", _safe_bool),
+        task_dispatch_window=section.read("task_dispatch_window", _safe_int, 1, 4096),
         task_store_journal_mode=(
-            str(agent_data.get("task_store_journal_mode") or "auto").lower()
-            if str(agent_data.get("task_store_journal_mode") or "auto").lower()
+            journal_mode
+            if (
+                journal_mode := str(
+                    section.get("task_store_journal_mode")
+                    or section.default("task_store_journal_mode")
+                ).lower()
+            )
             in ("auto", "wal", "delete")
-            else "auto"
+            else section.default("task_store_journal_mode")
         ),
-        admit_wait_secs=_safe_int(agent_data.get("admit_wait_secs", 30), 30, 1, 3600),
-        start_collect_timeout_secs=_safe_int(
-            agent_data.get("start_collect_timeout_secs", 300), 300, 10, 3600
+        admit_wait_secs=section.read("admit_wait_secs", _safe_int, 1, 3600),
+        subagent_queue_max_wait_secs=section.read(
+            "subagent_queue_max_wait_secs", _safe_int, 0, 86400
         ),
+        start_collect_timeout_secs=section.read("start_collect_timeout_secs", _safe_int, 10, 3600),
         # Fairness lanes (taskq/lanes.py): weights shape the share of
         # picks; the reserve keeps children startable under full parents.
         lane_weights=(
@@ -2686,94 +3206,98 @@ def _build_agent_config(agent_data: dict) -> AgentConfig:
                 for lane, weight in _lane_weights.items()
                 if isinstance(lane, str) and lane
             }
-            if isinstance(_lane_weights := agent_data.get("lane_weights"), dict)
-            else {}
+            if isinstance(_lane_weights := section.get("lane_weights"), dict)
+            else section.default("lane_weights")
         ),
-        child_reserve=_safe_int(agent_data.get("child_reserve", 1), 1, 0, 8),
+        child_reserve=section.read("child_reserve", _safe_int, 0, 8),
         # Shared recovery ladder schedule (recovery/policy.py bounds).
-        recovery_backoff_base_secs=_safe_float(
-            agent_data.get("recovery_backoff_base_secs", 2.0), 2.0, 0.1, 60.0
+        recovery_backoff_base_secs=section.read(
+            "recovery_backoff_base_secs", _safe_float, 0.1, 60.0
         ),
-        recovery_backoff_max_secs=_safe_float(
-            agent_data.get("recovery_backoff_max_secs", 120.0), 120.0, 1.0, 3600.0
+        recovery_backoff_max_secs=section.read(
+            "recovery_backoff_max_secs", _safe_float, 1.0, 3600.0
         ),
-        # Session-start gate (acp/runtime.py SessionStartGate).
-        session_start_concurrency=_safe_int(
-            agent_data.get("session_start_concurrency", 2), 2, 1, 64
+        # Session-start gate (acp/runtime_start.py SessionStartGate).
+        # "auto" (default) is sized from the host once per process by
+        # session_start_sizing; an explicit integer keeps the 1..64 clamp.
+        session_start_concurrency=_session_start_concurrency(
+            agent_data.get("session_start_concurrency", "auto")
+        ),
+        # Env defaults for spawned kiro-cli children (acp/child_env_defaults.py).
+        # Through the module alias: the loader's import list is a frozen snapshot.
+        child_env_defaults=_sections.coerce_child_env_defaults(section.get("child_env_defaults")),
+        # Cold-start queues (session_allocation _start_sem, acp/runtime_start
+        # spawn admission); resolved by cold_start_sizing.
+        cold_start_concurrency=_session_start_concurrency(
+            agent_data.get("cold_start_concurrency"), ceiling=32
+        ),
+        runtime_spawn_concurrency=_session_start_concurrency(
+            agent_data.get("runtime_spawn_concurrency"), ceiling=32
         ),
         # Adaptive controller (adaptive/policy.py params_from_config).
-        adaptive_concurrency=_safe_bool(agent_data.get("adaptive_concurrency"), True),
+        adaptive_concurrency=section.read("adaptive_concurrency", _safe_bool),
         adaptive_concurrency_mode=(
-            "fixed" if agent_data.get("adaptive_concurrency_mode") == "fixed" else "aimd"
+            "fixed"
+            if section.get("adaptive_concurrency_mode") == "fixed"
+            else section.default("adaptive_concurrency_mode")
         ),
-        adaptive_floor=_safe_int(agent_data.get("adaptive_floor", 1), 1, 1, 64),
-        adaptive_initial=_safe_int(agent_data.get("adaptive_initial", 4), 4, 1, 64),
-        adaptive_slow_start=_safe_bool(agent_data.get("adaptive_slow_start"), True),
-        controller_sample_secs=_safe_int(agent_data.get("controller_sample_secs", 5), 5, 1, 300),
+        adaptive_floor=section.read("adaptive_floor", _safe_int, 1, 64),
+        adaptive_initial=section.read("adaptive_initial", _safe_int, 1, 64),
+        adaptive_slow_start=section.read("adaptive_slow_start", _safe_bool),
+        controller_sample_secs=section.read("controller_sample_secs", _safe_int, 1, 300),
         # Dependency coordinator (taskq/dependency.py coordinator_from_config).
-        dependency_max_attempts=_safe_int(
-            agent_data.get("dependency_max_attempts", 20), 20, 1, 1000
+        dependency_max_attempts=section.read("dependency_max_attempts", _safe_int, 1, 1000),
+        dependency_wait_deadline_secs=section.read(
+            "dependency_wait_deadline_secs", _safe_int, 0, 86400
         ),
-        dependency_wait_deadline_secs=_safe_int(
-            agent_data.get("dependency_wait_deadline_secs", 3600), 3600, 0, 86400
-        ),
-        dependency_wake_per_tick=_safe_int(
-            agent_data.get("dependency_wake_per_tick", 0), 0, 0, 4096
-        ),
-        dependency_wake_spacing_secs=_safe_float(
-            agent_data.get("dependency_wake_spacing_secs", 1.0), 1.0, 0.0, 60.0
+        dependency_wake_per_tick=section.read("dependency_wake_per_tick", _safe_int, 0, 4096),
+        dependency_wake_spacing_secs=section.read(
+            "dependency_wake_spacing_secs", _safe_float, 0.0, 60.0
         ),
         # Tool-stall watchdog (acp/session_handle.py WatchdogSettings).
         interactive_command_policy=(
-            "wait" if agent_data.get("interactive_command_policy") == "wait" else "cancel"
+            "wait"
+            if section.get("interactive_command_policy") == "wait"
+            else section.default("interactive_command_policy")
         ),
-        subagent_max_turns=_safe_int(
-            agent_data.get("subagent_max_turns", DEFAULT_SUBAGENT_MAX_TURNS),
-            DEFAULT_SUBAGENT_MAX_TURNS,
-            1,
-            SUBAGENT_MAX_TURNS_CEILING,
+        subagent_max_turns=section.read(
+            "subagent_max_turns", _safe_int, 1, SUBAGENT_MAX_TURNS_CEILING
         ),
-        subagent_timeout_secs=_subagent_timeout_from(
-            agent_data.get("subagent_timeout_secs", SUBAGENT_TIMEOUT_SECS)
+        subagent_timeout_secs=section.read("subagent_timeout_secs", _subagent_timeout_from),
+        subagent_stall_idle_secs=section.read("subagent_stall_idle_secs", _safe_int),
+        completion_keep=_validated_completion_keep(section.get("completion_keep")),
+        completion_keep_chars=section.read(
+            "completion_keep_chars", _safe_int, COMPLETION_KEEP_CHARS_MIN, COMPLETION_KEEP_CHARS_MAX
         ),
-        subagent_stall_idle_secs=_safe_int(agent_data.get("subagent_stall_idle_secs", 120), 120),
-        completion_keep=_validated_completion_keep(agent_data.get("completion_keep", "head")),
-        completion_keep_chars=_safe_int(
-            agent_data.get("completion_keep_chars", 3000),
-            3000,
-            COMPLETION_KEEP_CHARS_MIN,
-            COMPLETION_KEEP_CHARS_MAX,
-        ),
-        subagent_result_ttl_secs=_safe_int(agent_data.get("subagent_result_ttl_secs", 3600), 3600),
+        subagent_result_ttl_secs=section.read("subagent_result_ttl_secs", _safe_int),
         # Same band workflows/service.py clamp_run_timeout enforces, so a
         # hand-edited file and the live-bound setter agree.
-        workflow_run_timeout_secs=_safe_int(
-            agent_data.get("workflow_run_timeout_secs", 3600), 3600, 60, 21600
-        ),
+        workflow_run_timeout_secs=section.read("workflow_run_timeout_secs", _safe_int, 60, 21600),
         subagent_cwd_allowed_roots=(
             [r for r in _roots if isinstance(r, str)]
             if isinstance(_roots := agent_data.get("subagent_cwd_allowed_roots"), list)
-            else list(DEFAULT_CWD_ALLOWED_ROOTS)
+            else section.default("subagent_cwd_allowed_roots")
         ),
         log_level=(
             lvl.upper()
-            if isinstance(lvl := agent_data.get("log_level", "WARNING"), str)
-            else "WARNING"
+            if isinstance(lvl := section.get("log_level"), str)
+            else section.default("log_level")
         ),
-        bot_name=_sanitize_bot_name(agent_data.get("bot_name", "")),
-        max_channels=agent_data.get("max_channels", 1),
-        max_channel_agents=agent_data.get("max_channel_agents", 3),
+        bot_name=_sanitize_bot_name(section.get("bot_name")),
+        max_channels=section.get("max_channels"),
+        max_channel_agents=section.get("max_channel_agents"),
         soft_stop_budget_secs=max(
             SOFT_STOP_BUDGET_MIN,
             min(
                 SOFT_STOP_BUDGET_MAX,
-                _safe_float(agent_data.get("soft_stop_budget_secs", 10.0), 10.0),
+                section.read("soft_stop_budget_secs", _safe_float),
             ),
         ),
     )
 
 
 def _build_session_config(session_data: dict) -> SessionConfig:
+    section = _sections.SectionReader(SessionConfig, session_data)
     return SessionConfig(
         # The only field in this group whose site had no `_safe_int` at all, so
         # it is added here for consistency -- but NOT because the type was
@@ -2782,13 +3306,10 @@ def _build_session_config(session_data: dict) -> SessionConfig:
         # `_validate_config_data` runs over the raw dict before section
         # extraction and owns type handling. What was missing for this field, as
         # for the other ten, is the RANGE: an int of 999999999 loaded verbatim.
-        timeout_secs=_safe_int(
-            session_data.get("timeout_secs", DEFAULT_SESSION_TIMEOUT),
-            DEFAULT_SESSION_TIMEOUT,
-            SESSION_TIMEOUT_MIN,
-            SESSION_TIMEOUT_MAX,
+        timeout_secs=section.read(
+            "timeout_secs", _safe_int, SESSION_TIMEOUT_MIN, SESSION_TIMEOUT_MAX
         ),
-        empty_response_auto_continue=bool(session_data.get("empty_response_auto_continue", True)),
+        empty_response_auto_continue=bool(section.get("empty_response_auto_continue")),
         # RANGE-clamped like the other session ints: a hand-edited 0
         # or 999 must load as a sane budget, never disable recovery or
         # arm an unbounded ladder. Type handling is owned by
@@ -2797,536 +3318,171 @@ def _build_session_config(session_data: dict) -> SessionConfig:
         # imported: this module's top-level names are a FROZEN
         # compatibility facade (test_loader_reexports_historical
         # _snapshot_by_identity), so a new re-export may not be added.
-        empty_response_max_continues=_safe_int(
-            session_data.get("empty_response_max_continues", 1),
-            1,
+        empty_response_max_continues=section.read(
+            "empty_response_max_continues",
+            _safe_int,
             _sections.EMPTY_RESPONSE_MAX_CONTINUES_MIN,
             _sections.EMPTY_RESPONSE_MAX_CONTINUES_MAX,
         ),
-        autocompact_pct=_safe_float(
-            session_data.get("autocompact_pct", DEFAULT_AUTOCOMPACT_PCT),
-            DEFAULT_AUTOCOMPACT_PCT,
-            lo=AUTOCOMPACT_PCT_MIN,
-            hi=AUTOCOMPACT_PCT_MAX,
+        autocompact_pct=section.read(
+            "autocompact_pct", _safe_float, lo=AUTOCOMPACT_PCT_MIN, hi=AUTOCOMPACT_PCT_MAX
         ),
+        # Clamped on the read, like the sibling floats: 0 is the sentinel for
+        # "use the built-in budget" and any positive value is the wait, so a
+        # hand-edited negative collapses to 0 (fallback) and an oversized value
+        # is capped. Bounds are referenced via the module handle, not imported:
+        # this module's top-level names are a frozen compatibility facade.
+        compact_wait_secs=section.read("compact_wait_secs", _clamp_compact_wait_secs),
         pool_size=_safe_int(
             session_data.get("pool_size", DEFAULT_POOL_SIZE),
             DEFAULT_POOL_SIZE,
             0,
             POOL_SIZE_MAX,
         ),
-        pool_agent=str(session_data.get("pool_agent", "")),
-        pool_ttl_secs=_safe_int(
-            session_data.get("pool_ttl_secs", 1800),
-            1800,
-            POOL_TTL_SECS_MIN,
-            POOL_TTL_SECS_MAX,
+        pool_agent=str(section.get("pool_agent")),
+        pool_ttl_secs=section.read(
+            "pool_ttl_secs", _safe_int, POOL_TTL_SECS_MIN, POOL_TTL_SECS_MAX
         ),
-        eager_spawn=bool(session_data.get("eager_spawn", True)),
+        eager_spawn=bool(section.get("eager_spawn")),
         archive_retention_days=_archive_retention_days(session_data),
-        watchdog_rss_max_mb=_safe_int(
-            session_data.get("watchdog_rss_max_mb", _sections.DEFAULT_WATCHDOG_RSS_MAX_MB),
-            _sections.DEFAULT_WATCHDOG_RSS_MAX_MB,
+        watchdog_rss_max_mb=section.read("watchdog_rss_max_mb", _safe_int),
+        # Clamped HERE as well as in the `_SECURITY_BOUNDED_FIELDS` sweep, for the
+        # reason `_safe_int` states: that sweep runs over the raw dict and skips
+        # non-int values, so a numeric STRING passes it and coerces here.
+        reconcile_max_kills=section.read(
+            "reconcile_max_kills", _safe_int, 0, _sections.RECONCILE_MAX_KILLS_MAX
         ),
-    )
-
-
-def _build_taskrunner_config(taskrunner_data: dict) -> TaskRunnerConfig:
-    return TaskRunnerConfig(
-        max_parallel_steps=taskrunner_data.get("max_parallel_steps", DEFAULT_MAX_PARALLEL_STEPS),
-        workspace_dir=str(taskrunner_data.get("workspace_dir", "")),
-    )
-
-
-def _build_cron_history_config(cron_history_data: dict) -> CronHistoryConfig:
-    return CronHistoryConfig(
-        cron_summary_cap=_safe_int(cron_history_data.get("cron_summary_cap", 200), 200),
-        cron_trace_cap_kb=_safe_int(cron_history_data.get("cron_trace_cap_kb", 50), 50),
-        cron_max_records_per_job=_safe_int(
-            cron_history_data.get("cron_max_records_per_job", 100), 100
-        ),
-        cron_max_index_records=_safe_int(
-            cron_history_data.get("cron_max_index_records", 2000), 2000
-        ),
-    )
-
-
-def _build_messaging_config(messaging_data: dict) -> MessagingConfig:
-    return MessagingConfig(
-        use_transport=bool(messaging_data.get("use_transport", True)),
-        dm_scope=str(messaging_data.get("dm_scope", "per-channel-peer")),
-        idle_reset_minutes=_coerce_int(messaging_data.get("idle_reset_minutes"), 0),
-        daily_reset_hour=_coerce_int(messaging_data.get("daily_reset_hour"), -1),
-        queue_mode=str(messaging_data.get("queue_mode", "steer")),
-    )
-
-
-def _build_orchestrator_config(orchestrator_data: dict) -> OrchestratorConfig:
-    return OrchestratorConfig(
-        stage_timeout_seconds=_safe_int(orchestrator_data.get("stage_timeout_seconds", 1800), 1800),
-        # Default read off the dataclass rather than imported: the loader's
-        # re-export list from config.sections is a frozen boundary snapshot
-        # (test_config_module_boundaries), and this keeps
-        # DEFAULT_MAX_PLAN_DURATION as the single source of truth without
-        # adding an alias to it.
-        max_plan_duration_seconds=_safe_int(
-            orchestrator_data.get(
-                "max_plan_duration_seconds",
-                OrchestratorConfig.max_plan_duration_seconds,
-            ),
-            OrchestratorConfig.max_plan_duration_seconds,
-        ),
-    )
-
-
-def _build_watchdog_config(watchdog_data: dict) -> WatchdogConfig:
-    return WatchdogConfig(
-        check_after_secs=_safe_float(watchdog_data.get("check_after_secs", 60.0), 60.0),
-        stale_window_secs=_safe_float(watchdog_data.get("stale_window_secs", 600.0), 600.0),
-        tool_stall_suspect_secs=_safe_float(
-            watchdog_data.get("tool_stall_suspect_secs", 5400.0), 5400.0
-        ),
-        tool_stall_hard_cap_secs=_safe_float(
-            watchdog_data.get("tool_stall_hard_cap_secs", 7200.0), 7200.0
-        ),
-        model_silent_probe_secs=_safe_float(
-            watchdog_data.get("model_silent_probe_secs", 1800.0), 1800.0
-        ),
-        wellness_sample_secs=_safe_float(watchdog_data.get("wellness_sample_secs", 3.0), 3.0),
     )
 
 
 def _build_telemetry_config(telemetry_data: dict) -> TelemetryConfig:
+    section = _sections.SectionReader(TelemetryConfig, telemetry_data)
     return TelemetryConfig(
-        enabled=bool(telemetry_data.get("enabled", False)),
-        local_dir=str(telemetry_data.get("local_dir", "")),
-        export_interval_seconds=_safe_int(telemetry_data.get("export_interval_seconds", 60), 60),
-        retention_days=_safe_int(telemetry_data.get("retention_days", 0), 0),
-        max_total_mb=_safe_int(telemetry_data.get("max_total_mb", 0), 0),
-        otlp_endpoint=str(telemetry_data.get("otlp_endpoint", "")),
-        beacon_enabled=bool(telemetry_data.get("beacon_enabled", True)),
-        beacon_endpoint=str(telemetry_data.get("beacon_endpoint", _DEFAULT_BEACON_ENDPOINT)),
+        enabled=bool(section.get("enabled")),
+        local_dir=str(section.get("local_dir")),
+        export_interval_seconds=section.read("export_interval_seconds", _safe_int),
+        retention_days=section.read("retention_days", _safe_int),
+        max_total_mb=section.read("max_total_mb", _safe_int),
+        otlp_endpoint=str(section.get("otlp_endpoint")),
+        beacon_enabled=bool(section.get("beacon_enabled")),
+        beacon_endpoint=str(section.get("beacon_endpoint")),
     )
 
 
-def _build_memory_config(memory_data: dict) -> MemoryConfig:
-    return MemoryConfig(
-        embedding_provider=_coerce_embedding_provider(
-            memory_data.get("embedding_provider", "llama_cpp")
-        ),
-        embedding_dim=memory_data.get("embedding_dim", 1024),
-        embedding_threads=_safe_int(memory_data.get("embedding_threads", 4), 4, 1, 256),
-        # 0 is the documented "inherit embedding_threads" sentinel, so the
-        # floor is 0 rather than 1 — clamping it to 1 would erase a
-        # deliberate opt-in to the interactive pool.
-        embedding_bulk_threads=_safe_int(memory_data.get("embedding_bulk_threads", 1), 1, 0, 256),
-        embedding_bulk_duty=_safe_float(
-            memory_data.get("embedding_bulk_duty", 0.2), 0.2, 0.05, 1.0
-        ),
-        embed_model_url=memory_data.get("embed_model_url", ""),
-        embed_model_path=memory_data.get("embed_model_path", ""),
-        embed_model_id=memory_data.get("embed_model_id", ""),
-        embed_model_stamp=memory_data.get("embed_model_stamp", []),
-        embed_model_legacy_ids=memory_data.get("embed_model_legacy_ids", []),
-        embed_rebuild_generation=memory_data.get("embed_rebuild_generation", ""),
-        semantic_confidence_threshold=_safe_float(
-            memory_data.get("semantic_confidence_threshold", 0.8), 0.8, 0.0, 1.0
-        ),
-        episodic_dedup_threshold=_safe_float(
-            memory_data.get("episodic_dedup_threshold", 0.88), 0.88, 0.0, 1.0
-        ),
-        episodic_max_results=_safe_int(memory_data.get("episodic_max_results", 8), 8, 1, None),
-        episodic_max_count=_safe_int(
-            memory_data.get("episodic_max_count", 10_000), 10_000, 0, None
-        ),
-        decay_rates=(dr if isinstance(dr := memory_data.get("decay_rates", {}), dict) else {}),
-        semantic_keys=memory_data.get("semantic_keys", []),
-        history_idle_hours=memory_data.get("history_idle_hours", 3.0),
-        history_max_days=_safe_nonnegative_int(memory_data.get("history_max_days", 365), 365),
-        backup_enabled=_safe_bool(memory_data.get("backup_enabled", True), True),
-        backup_keep=_safe_int(memory_data.get("backup_keep", 7), 7, 1, None),
-        migrated=memory_data.get("migrated", False),
-    )
+def _title_refresh_every_turns(value: object, default: int) -> int:
+    """Parse ``dashboard.title_refresh_every_turns``: 0, or MIN..MAX.
 
-
-def _build_knowledge_config(knowledge_data: dict) -> KnowledgeConfig:
-    return KnowledgeConfig(
-        auto_ingest_artifacts=bool(knowledge_data.get("auto_ingest_artifacts", False)),
-        auto_ingest_artifact_kinds=[
-            k
-            for k in knowledge_data.get(
-                "auto_ingest_artifact_kinds",
-                DEFAULT_AUTO_INGEST_ARTIFACT_KINDS,
-            )
-            if isinstance(k, str)
-        ],
-        max_ingest_file_mb=(
-            float(mb)
-            if isinstance(
-                (mb := knowledge_data.get("max_ingest_file_mb", 100.0)),
-                (int, float),
-            )
-            and not isinstance(mb, bool)
-            and mb >= 0
-            else 100.0
-        ),
-        embed_timeout_secs=_safe_float(knowledge_data.get("embed_timeout_secs", 10.0), 10.0),
-        embed_content_budget=_safe_int(knowledge_data.get("embed_content_budget", 0), 0),
-        pool_idle_ttl_secs=_safe_nonnegative_int(
-            knowledge_data.get("pool_idle_ttl_secs", 300),
-            300,
-        ),
-        auto_add_documents=_read_auto_add_documents(knowledge_data),
-        folder_ingest_chunk_budget=_safe_nonnegative_int(
-            knowledge_data.get("folder_ingest_chunk_budget", 300),
-            300,
-            FOLDER_INGEST_CHUNK_BUDGET_MAX,
-        ),
-        dedup_every_n_sweeps=_safe_nonnegative_int(
-            knowledge_data.get("dedup_every_n_sweeps", 12),
-            12,
-            DEDUP_EVERY_N_SWEEPS_MAX,
-        ),
-        doc_ingest_hosts=[
-            str(h)
-            for h in knowledge_data.get("doc_ingest_hosts", [])
-            if isinstance(h, str) and h.strip()
-        ],
-        sweep_chunk_budget=_safe_nonnegative_int(
-            knowledge_data.get("sweep_chunk_budget", 500),
-            500,
-            SWEEP_CHUNK_BUDGET_MAX,
-        ),
-        import_chunk_budget=_safe_nonnegative_int(
-            knowledge_data.get("import_chunk_budget", 0),
-            0,
-            IMPORT_CHUNK_BUDGET_MAX,
-        ),
-        embed_rate_limit=_safe_nonnegative_int(
-            knowledge_data.get("embed_rate_limit", 120), 120, EMBED_RATE_LIMIT_MAX
-        ),
-        extraction_model=str(knowledge_data.get("extraction_model", "")).strip(),
-        extraction_pool_size=max(
-            EXTRACTION_POOL_SIZE_MIN,
-            min(
-                EXTRACTION_POOL_SIZE_MAX,
-                _safe_nonnegative_int(knowledge_data.get("extraction_pool_size", 3), 3),
-            ),
-        ),
-    )
-
-
-def _build_telegram_config(telegram_data: dict) -> TelegramConfig:
-    return TelegramConfig(
-        session_folder=_coerce_session_folder(telegram_data.get("session_folder")),
-        enabled=bool(telegram_data.get("enabled", False)),
-        bot_token=str(telegram_data.get("bot_token", "")),
-        allowed_user_ids=_coerce_int_ids(telegram_data.get("allowed_user_ids")),
-        soft_threshold_pct=_threshold_pct(telegram_data.get("soft_threshold_pct"), 80),
-        show_thinking=bool(telegram_data.get("show_thinking", False)),
-        allow_forum=bool(telegram_data.get("allow_forum", False)),
-        voice_replies=bool(telegram_data.get("voice_replies", False)),
-        forum_activation=_validate_telegram_activation(
-            str(telegram_data.get("forum_activation", "") or ACTIVATION_ALWAYS)
-        ),
-        allowed_forum_chat_ids=_coerce_int_ids(telegram_data.get("allowed_forum_chat_ids")),
-        accounts=_parse_telegram_accounts(telegram_data.get("accounts")),
-    )
-
-
-def _build_weixin_config(weixin_data: dict) -> WeixinConfig:
-    return WeixinConfig(
-        session_folder=_coerce_session_folder(weixin_data.get("session_folder")),
-        enabled=bool(weixin_data.get("enabled", False)),
-        token=str(weixin_data.get("token", "")),
-        account_id=str(weixin_data.get("account_id", "")),
-        base_url=str(weixin_data.get("base_url", "") or "https://ilinkai.weixin.qq.com"),
-        dm_policy=str(weixin_data.get("dm_policy", "allowlist") or "allowlist"),
-        allowed_user_ids=_coerce_opaque_str_ids(weixin_data.get("allowed_user_ids")),
-        soft_threshold_pct=_threshold_pct(weixin_data.get("soft_threshold_pct"), 80),
-        hard_threshold_pct=_threshold_pct(weixin_data.get("hard_threshold_pct"), 95),
-    )
-
-
-def _build_whatsapp_config(whatsapp_data: dict) -> WhatsAppConfig:
-    return WhatsAppConfig(
-        session_folder=_coerce_session_folder(whatsapp_data.get("session_folder")),
-        enabled=bool(whatsapp_data.get("enabled", False)),
-        dm_policy=str(whatsapp_data.get("dm_policy", "self") or "self"),
-        allowed_wa_ids=_coerce_str_ids(whatsapp_data.get("allowed_wa_ids")),
-        groups=_coerce_whatsapp_groups(whatsapp_data.get("groups")),
-        db_path=str(whatsapp_data.get("db_path", "")),
-        soft_threshold_pct=_threshold_pct(whatsapp_data.get("soft_threshold_pct"), 80),
-        hard_threshold_pct=_threshold_pct(whatsapp_data.get("hard_threshold_pct"), 95),
-    )
-
-
-def _build_discord_config(discord_data: dict) -> DiscordConfig:
-    return DiscordConfig(
-        session_folder=_coerce_session_folder(discord_data.get("session_folder")),
-        enabled=bool(discord_data.get("enabled", False)),
-        bot_token=str(discord_data.get("bot_token", "")),
-        # Discord user IDs are numeric snowflakes that exceed 2^53 —
-        # keep them as strings (JSON round-trip safe, matches the
-        # transport's string comparison).
-        allowed_user_ids=_coerce_str_ids(discord_data.get("allowed_user_ids")),
-        allowed_thread_ids=_coerce_str_ids(discord_data.get("allowed_thread_ids")),
-        allowed_channel_ids=_coerce_str_ids(discord_data.get("allowed_channel_ids")),
-        auto_thread=bool(discord_data.get("auto_thread", True)),
-        soft_threshold_pct=_threshold_pct(discord_data.get("soft_threshold_pct"), 80),
-        reactions_enabled=bool(discord_data.get("reactions_enabled", True)),
-        show_thinking=bool(discord_data.get("show_thinking", False)),
-    )
-
-
-def _build_webex_config(webex_data: dict) -> WebexConfig:
-    return WebexConfig(
-        session_folder=_coerce_session_folder(webex_data.get("session_folder")),
-        enabled=bool(webex_data.get("enabled", False)),
-        bot_token=str(webex_data.get("bot_token", "")),
-        allowed_emails=(
-            [e for e in webex_data.get("allowed_emails", []) if isinstance(e, str) and e]
-            if isinstance(webex_data.get("allowed_emails", []), list)
-            else []
-        ),
-        # Group spaces are a SECURITY decision, so the read is as explicit
-        # as the write: a field the loader forgets is not merely lost, it
-        # silently reverts to the safe default on the next restart while
-        # the settings panel keeps showing the saved value it read from
-        # config.json — the operator sees an enabled space allow-list and
-        # the gateway answers nobody.
-        allow_group_rooms=bool(webex_data.get("allow_group_rooms", False)),
-        allowed_room_ids=[
-            r for r in _safe_list(webex_data.get("allowed_room_ids")) if isinstance(r, str) and r
-        ],
-        reply_in_thread=bool(webex_data.get("reply_in_thread", True)),
-        wdm_base=str(webex_data.get("wdm_base", "") or ""),
-        soft_threshold_pct=_threshold_pct(webex_data.get("soft_threshold_pct"), 80),
-        hard_threshold_pct=_threshold_pct(webex_data.get("hard_threshold_pct"), 95),
-    )
-
-
-def _build_wakatime_config(wakatime_data: dict) -> WakaTimeConfig:
-    return WakaTimeConfig(
-        enabled=bool(wakatime_data.get("enabled", False)),
-        api_base_url=str(wakatime_data.get("api_base_url", "") or ""),
-    )
-
-
-def _build_imessage_config(imessage_data: dict) -> IMessageConfig:
-    return IMessageConfig(
-        session_folder=_coerce_session_folder(imessage_data.get("session_folder")),
-        enabled=bool(imessage_data.get("enabled", False)),
-        db_path=str(imessage_data.get("db_path", "")),
-        allowed_handles=[
-            h for h in _safe_list(imessage_data.get("allowed_handles")) if isinstance(h, str) and h
-        ],
-        service=str(imessage_data.get("service", "") or "imessage"),
-        soft_threshold_pct=_threshold_pct(imessage_data.get("soft_threshold_pct"), 80),
-        hard_threshold_pct=_threshold_pct(imessage_data.get("hard_threshold_pct"), 95),
-    )
-
-
-def _build_teams_config(teams_data: dict) -> TeamsConfig:
-    return TeamsConfig(
-        session_folder=_coerce_session_folder(teams_data.get("session_folder")),
-        enabled=bool(teams_data.get("enabled", False)),
-        app_id=str(teams_data.get("app_id", "")),
-        # Secret is env-only (MICROSOFT_APP_PASSWORD). Never sourced from
-        # config.json, which the agent can read — keeps the Azure Bot
-        # credential out of any agent-readable file.
-        app_password="",
-        tenant_id=str(teams_data.get("tenant_id", "")),
-        allowed_emails=(
-            [e for e in teams_data.get("allowed_emails", []) if isinstance(e, str) and e]
-            if isinstance(teams_data.get("allowed_emails", []), list)
-            else []
-        ),
-        soft_threshold_pct=_threshold_pct(teams_data.get("soft_threshold_pct"), 80),
-        hard_threshold_pct=_threshold_pct(teams_data.get("hard_threshold_pct"), 95),
-    )
-
-
-def _build_slack_config(slack_data: dict) -> SlackConfig:
-    return SlackConfig(
-        session_folder=_coerce_session_folder(slack_data.get("session_folder")),
-        allowed_users=[
-            u
-            for u in slack_data.get("allowed_users", [])
-            if isinstance(u, dict) and u.get("slack_id")
-        ],
-        tracking_channels=_validate_tracking_channels(slack_data.get("tracking_channels", [])),
-        open_channels=[c for c in slack_data.get("open_channels", []) if isinstance(c, str)],
-        command=slack_data.get("command", "kirocrew"),
-        forward_to_agent_callback=str(slack_data.get("forward_to_agent_callback") or "").strip(),
-        trusted_bot_ids={
-            b for b in _safe_list(slack_data.get("trusted_bot_ids")) if isinstance(b, str)
-        },
-        trusted_bot_turn_limit=_safe_int(slack_data.get("trusted_bot_turn_limit", 5), 5, lo=1),
-        allowed_enterprise_ids=[
-            e
-            for e in slack_data.get("allowed_enterprise_ids", [])
-            if isinstance(e, str) and (e.startswith("E") or e.startswith("T"))
-        ],
-        reactions={
-            k: v
-            for k, v in _safe_dict(slack_data.get("reactions")).items()
-            if isinstance(k, str) and (v is None or (isinstance(v, str) and v))
-        },
-        reactions_enabled=bool(slack_data.get("reactions_enabled", True)),
-        use_tunnel_url=bool(slack_data.get("use_tunnel_url", False)),
-        show_thinking=bool(slack_data.get("show_thinking", True)),
-        home_tab_sessions_per_kind=_safe_int(slack_data.get("home_tab_sessions_per_kind", 5), 5),
-    )
-
-
-def _build_publish_config(_dests_raw: list, publish_data: dict) -> PublishConfig:
-    return PublishConfig(
-        allowed_destinations=[d for d in _dests_raw if isinstance(d, str) and d],
-        relocate_roots=[
-            r for r in publish_data.get("relocate_roots", []) if isinstance(r, str) and r.strip()
-        ],
-    )
-
-
-def _build_wecom_config(wecom_data: dict) -> WeComConfig:
-    return WeComConfig(
-        session_folder=_coerce_session_folder(wecom_data.get("session_folder")),
-        # _safe_bool, not bool(): `bool("false")` is True, so a JSON string
-        # would read the operator's "off" as "on" -- enabling a channel,
-        # or opening it to every org member, from a config value that says the
-        # opposite. A non-bool must read as the default, not as truthy.
-        enabled=_safe_bool(wecom_data.get("enabled"), False),
-        allowed_users=[
-            u
-            for u in _safe_list(wecom_data.get("allowed_users"))
-            if isinstance(u, dict) and u.get("userid")
-        ],
-        allow_all_users=_safe_bool(wecom_data.get("allow_all_users"), False),
-        ws_url=str(wecom_data.get("ws_url", "wss://openws.work.weixin.qq.com")),
-        soft_threshold_pct=_threshold_pct(wecom_data.get("soft_threshold_pct"), 80),
-        hard_threshold_pct=_threshold_pct(wecom_data.get("hard_threshold_pct"), 95),
-    )
-
-
-def _build_feishu_config(feishu_data: dict) -> FeishuConfig:
-    return FeishuConfig(
-        enabled=_safe_bool(feishu_data.get("enabled"), False),
-        allowed_open_ids=_coerce_opaque_str_ids(feishu_data.get("allowed_open_ids")),
-        # Shape-safe coercion rather than bool() / a raw comprehension:
-        # the schema type check already substitutes the default for a
-        # wrong-typed value, and these helpers keep the guarantee local
-        # to the parse (and dedupe + strip the opaque ou_/oc_ ids).
-        allow_group=_safe_bool(feishu_data.get("allow_group"), False),
-        allowed_group_ids=_coerce_opaque_str_ids(feishu_data.get("allowed_group_ids")),
-        soft_threshold_pct=_safe_int(feishu_data.get("soft_threshold_pct", 80), 80),
-        hard_threshold_pct=_safe_int(feishu_data.get("hard_threshold_pct", 95), 95),
-        session_folder=_coerce_session_folder(feishu_data.get("session_folder")),
-    )
+    0 and every negative value parse to 0, the built-in schedule. Any value
+    ``_safe_int`` rejects (a bool, a fractional float, unparseable text) takes
+    *default*, the field's, which is that same 0. A value from 1 to MIN - 1 is
+    raised to MIN, so a user who asked for frequent refreshes gets the most
+    frequent cadence allowed rather than the built-in schedule. A value above MAX
+    is capped at MAX.
+    """
+    every = _safe_int(value, default, 0, _sections.TITLE_REFRESH_EVERY_TURNS_MAX)
+    return every if every == 0 else max(every, _sections.TITLE_REFRESH_EVERY_TURNS_MIN)
 
 
 def _build_dashboard_config(_degraded: set[str], dashboard_data: dict) -> DashboardConfig:
+    section = _sections.SectionReader(DashboardConfig, dashboard_data)
     return DashboardConfig(
-        url=dashboard_data.get("url", ""),
+        url=section.get("url"),
         tailscale=_tailscale_config_from(
             dashboard_data.get("tailscale"),
             _degraded,
             key_present="tailscale" in dashboard_data,
         ),
-        restore_sessions=dashboard_data.get("restore_sessions", False),
-        qr_session_until_restart=_safe_bool(dashboard_data.get("qr_session_until_restart"), True),
-        qr_session_persist_across_restart=_safe_bool(
-            dashboard_data.get("qr_session_persist_across_restart"), False
+        restore_sessions=section.get("restore_sessions"),
+        crewmate_threads=section.read("crewmate_threads", _safe_bool),
+        crewmates_in_agent_picker=section.read("crewmates_in_agent_picker", _safe_bool),
+        dynamic_dashboard_cards=section.read("dynamic_dashboard_cards", _safe_bool),
+        qr_session_until_restart=section.read("qr_session_until_restart", _safe_bool),
+        qr_session_persist_across_restart=section.read(
+            "qr_session_persist_across_restart", _safe_bool
         ),
-        restore_window_minutes=dashboard_data.get("restore_window_minutes", 30),
-        surface_channel_sessions=dashboard_data.get("surface_channel_sessions", True),
-        bot_name=dashboard_data.get("bot_name", ""),
-        avatar=dashboard_data.get("avatar", ""),
-        merge_queued_messages=dashboard_data.get("merge_queued_messages", False),
-        mcp_probe_timeout_secs=_safe_int(
-            dashboard_data.get("mcp_probe_timeout_secs", 15),
-            15,
-            MCP_PROBE_TIMEOUT_MIN,
-            MCP_PROBE_TIMEOUT_MAX,
+        restore_window_minutes=section.get("restore_window_minutes"),
+        surface_channel_sessions=section.get("surface_channel_sessions"),
+        bot_name=section.get("bot_name"),
+        avatar=section.get("avatar"),
+        merge_queued_messages=section.get("merge_queued_messages"),
+        title_refresh_every_turns=section.read(
+            "title_refresh_every_turns", _title_refresh_every_turns
+        ),
+        title_ticket_prefix=section.read("title_ticket_prefix", _safe_bool),
+        mcp_probe_timeout_secs=section.read(
+            "mcp_probe_timeout_secs", _safe_int, MCP_PROBE_TIMEOUT_MIN, MCP_PROBE_TIMEOUT_MAX
         ),
         loop_stall_exit_after_secs=(
             None
-            if dashboard_data.get("loop_stall_exit_after_secs") is None
+            if (loop_stall := section.get("loop_stall_exit_after_secs")) is None
             else _safe_int(
-                dashboard_data.get("loop_stall_exit_after_secs"),
+                loop_stall,
                 LOOP_STALL_EXIT_AFTER_DEFAULT,
                 LOOP_STALL_EXIT_AFTER_MIN,
                 LOOP_STALL_EXIT_AFTER_MAX,
             )
         ),
-        chat_entry_cache_max_entries=_safe_int(
-            dashboard_data.get("chat_entry_cache_max_entries", CHAT_ENTRY_CACHE_ENTRIES_DEFAULT),
-            CHAT_ENTRY_CACHE_ENTRIES_DEFAULT,
+        chat_entry_cache_max_entries=section.read(
+            "chat_entry_cache_max_entries",
+            _safe_int,
             CHAT_ENTRY_CACHE_ENTRIES_MIN,
             CHAT_ENTRY_CACHE_ENTRIES_MAX,
         ),
-        chat_entry_cache_max_bytes=_safe_int(
-            dashboard_data.get("chat_entry_cache_max_bytes", CHAT_ENTRY_CACHE_BYTES_DEFAULT),
-            CHAT_ENTRY_CACHE_BYTES_DEFAULT,
+        chat_entry_cache_max_bytes=section.read(
+            "chat_entry_cache_max_bytes",
+            _safe_int,
             CHAT_ENTRY_CACHE_BYTES_MIN,
             CHAT_ENTRY_CACHE_BYTES_MAX,
         ),
-        cautious_boot=_safe_bool(dashboard_data.get("cautious_boot"), True),
-        auto_open_browser=dashboard_data.get("auto_open_browser", True),
-        prevent_sleep=_safe_bool(dashboard_data.get("prevent_sleep"), False),
-        quick_send=dashboard_data.get("quick_send", False),
+        cautious_boot=section.read("cautious_boot", _safe_bool),
+        auto_open_browser=section.get("auto_open_browser"),
+        prevent_sleep=section.read("prevent_sleep", _safe_bool),
+        quick_send=section.get("quick_send"),
         model_picker_configured=(
-            _safe_bool(dashboard_data.get("model_picker_configured"), False)
+            section.read("model_picker_configured", _safe_bool)
             if "model_picker_configured" in dashboard_data
             else any(
                 isinstance(raw, str) and raw.strip() not in ("", "auto")
-                for raw in _safe_list(dashboard_data.get("model_picker_hidden_models"))
+                for raw in _safe_list(section.get("model_picker_hidden_models"))
             )
         ),
         model_picker_hidden_models=list(
             dict.fromkeys(
                 model
-                for raw in _safe_list(dashboard_data.get("model_picker_hidden_models"))
+                for raw in _safe_list(section.get("model_picker_hidden_models"))
                 if isinstance(raw, str) and (model := raw.strip()) and model != "auto"
             )
         ),
-        session_grid=dashboard_data.get("session_grid", False),
-        mcp_app_panel=dashboard_data.get("mcp_app_panel", False),
-        auto_open_git_panel=_safe_bool(dashboard_data.get("auto_open_git_panel"), False),
-        session_card_source_links=_safe_bool(dashboard_data.get("session_card_source_links"), True),
-        default_memory_mode=_default_memory_mode_from(
-            dashboard_data.get("default_memory_mode", "persistent")
+        session_grid=section.get("session_grid"),
+        mcp_app_panel=section.get("mcp_app_panel"),
+        auto_open_git_panel=section.read("auto_open_git_panel", _safe_bool),
+        session_card_source_links=section.read("session_card_source_links", _safe_bool),
+        default_memory_mode=_default_memory_mode_from(section.get("default_memory_mode")),
+        widget_density=section.get("widget_density"),
+        use_builtin_browser=section.read("use_builtin_browser", _safe_bool),
+        browser_view_port=_port_or_unset(section.get("browser_view_port")),
+        verbosity=_sections.normalize_verbosity(section.get("verbosity")),
+        link_previews=section.read("link_previews", _safe_bool),
+        tail_fork_enabled=section.get("tail_fork_enabled"),
+        terminal=section.get("terminal"),
+        default_project=section.get("default_project"),
+        theme_mode=section.get("theme_mode"),
+        sso_login_flags=str(section.get("sso_login_flags")),
+        theme_color=section.get("theme_color"),
+        language=str(section.get("language")),
+        recent_tint_count=section.read(
+            "recent_tint_count", _safe_int, RECENT_TINT_COUNT_MIN, RECENT_TINT_COUNT_MAX
         ),
-        widget_density=dashboard_data.get("widget_density", "more"),
-        use_builtin_browser=_safe_bool(dashboard_data.get("use_builtin_browser"), True),
-        browser_view_port=_port_or_unset(dashboard_data.get("browser_view_port", 0)),
-        verbosity=dashboard_data.get("verbosity", "default"),
-        link_previews=_safe_bool(dashboard_data.get("link_previews"), False),
-        usage_text_scrape_enabled=_safe_bool(
-            dashboard_data.get("usage_text_scrape_enabled"), False
-        ),
-        tail_fork_enabled=dashboard_data.get("tail_fork_enabled", False),
-        terminal=dashboard_data.get("terminal", {"enabled": True}),
-        default_project=dashboard_data.get("default_project", ""),
-        theme_mode=dashboard_data.get("theme_mode", ""),
-        sso_login_flags=str(dashboard_data.get("sso_login_flags", "")),
-        theme_color=dashboard_data.get("theme_color", ""),
-        language=str(dashboard_data.get("language", "")),
-        recent_tint_count=_safe_int(
-            dashboard_data.get("recent_tint_count", 0),
-            0,
-            RECENT_TINT_COUNT_MIN,
-            RECENT_TINT_COUNT_MAX,
-        ),
+        folder_sort=section.read("folder_sort", _folder_sort_from),
         update_nudge=(
-            dashboard_data.get("update_nudge", {})
-            if isinstance(dashboard_data.get("update_nudge"), dict)
-            else {}
+            nudge
+            if isinstance(nudge := section.get("update_nudge"), dict)
+            else section.default("update_nudge")
         ),
-        onboarded=bool(dashboard_data.get("onboarded", False)),
+        onboarded=bool(section.get("onboarded")),
         import_onboarded=_safe_bool(
             dashboard_data.get("import_onboarded"),
-            _safe_bool(dashboard_data.get("onboarded"), False),
+            section.read("onboarded", _safe_bool),
         ),
         # Falls back to `onboarded`: a user who finished first run before
         # this chapter existed has already reached the product, and
@@ -3334,385 +3490,80 @@ def _build_dashboard_config(_degraded: set[str], dashboard_data: dict) -> Dashbo
         # would suppress it forever.
         privacy_acked=_safe_bool(
             dashboard_data.get("privacy_acked"),
-            _safe_bool(dashboard_data.get("onboarded"), False),
+            section.read("onboarded", _safe_bool),
         ),
-        user_role=str(dashboard_data.get("user_role", "")),
-        user_role_other=str(dashboard_data.get("user_role_other", "")),
-        user_technical_level=str(dashboard_data.get("user_technical_level", "")),
-        tips_enabled=bool(dashboard_data.get("tips_enabled", True)),
-        feature_videos_enabled=_safe_bool(dashboard_data.get("feature_videos_enabled"), False),
-        feature_videos_cache_max_mb=_safe_float(
-            dashboard_data.get("feature_videos_cache_max_mb", 500.0), 500.0, lo=0.0
+        crewmates_onboarded=section.read("crewmates_onboarded", _safe_bool),
+        user_role=str(section.get("user_role")),
+        user_role_other=str(section.get("user_role_other")),
+        user_technical_level=str(section.get("user_technical_level")),
+        tips_enabled=bool(section.get("tips_enabled")),
+        feature_videos_enabled=section.read("feature_videos_enabled", _safe_bool),
+        feature_videos_cache_max_mb=section.read(
+            "feature_videos_cache_max_mb", _safe_float, lo=0.0
         ),
-        folder_suggestions_enabled=bool(dashboard_data.get("folder_suggestions_enabled", True)),
-        tips_cadence_hours=_safe_float(dashboard_data.get("tips_cadence_hours", 6.0), 6.0, lo=0.0),
-        tips_snooze_hours=_safe_float(dashboard_data.get("tips_snooze_hours", 48.0), 48.0, lo=0.0),
-        tips_recency_decay=_safe_float(
-            dashboard_data.get("tips_recency_decay", 0.6), 0.6, lo=0.0, hi=1.0
+        folder_suggestions_enabled=bool(section.get("folder_suggestions_enabled")),
+        tips_cadence_hours=section.read("tips_cadence_hours", _safe_float, lo=0.0),
+        tips_snooze_hours=section.read("tips_snooze_hours", _safe_float, lo=0.0),
+        tips_recency_decay=section.read("tips_recency_decay", _safe_float, lo=0.0, hi=1.0),
+        tips_model=str(section.get("tips_model")),
+        tips_explore_ratio=section.read("tips_explore_ratio", _safe_float, lo=0.0, hi=1.0),
+        gitlab_hosts=_coerce_gitlab_hosts(section.get("gitlab_hosts")),
+        jira_hosts=_coerce_jira_hosts(section.get("jira_hosts")),
+        # These two parse raw JSON entries into DTOs, so they are handed only a
+        # stored value; an omitted key is the field default as built.
+        link_patterns=(
+            _sections._coerce_link_patterns(dashboard_data["link_patterns"])
+            if "link_patterns" in dashboard_data
+            else section.default("link_patterns")
         ),
-        tips_model=str(dashboard_data.get("tips_model", "auto")),
-        tips_explore_ratio=_safe_float(
-            dashboard_data.get("tips_explore_ratio", 0.2), 0.2, lo=0.0, hi=1.0
-        ),
-        gitlab_hosts=_coerce_gitlab_hosts(dashboard_data.get("gitlab_hosts")),
-        jira_hosts=_coerce_jira_hosts(dashboard_data.get("jira_hosts")),
-        link_patterns=_sections._coerce_link_patterns(dashboard_data.get("link_patterns")),
-        jira_auth=[
-            JiraAuthEntry(
-                host=str(entry.get("host", "")),
-                email=str(entry.get("email", "")),
-            )
-            for entry in (dashboard_data.get("jira_auth") or [])
-            if isinstance(entry, dict) and entry.get("host")
-        ],
-    )
-
-
-def _build_tunnel_config(tunnel_data: dict) -> TunnelConfig:
-    return TunnelConfig(
-        enabled=bool(tunnel_data.get("enabled", False)),
-        name_mode=str(tunnel_data.get("name_mode", "username")),
-        name_override=str(tunnel_data.get("name_override", "")),
-    )
-
-
-def _build_stt_config(stt_data: dict) -> SttConfig:
-    return SttConfig(
-        enabled=_safe_bool(stt_data.get("enabled"), True),
-        provider=_validated_stt_provider(stt_data.get("provider", STT_PROVIDER_LOCAL)),
-        model=_validated_stt_model(stt_data.get("model", _STT_DEFAULT_MODEL)),
-        language_code=stt_data.get("language_code", _sections.STT_LANGUAGE_AUTO),
-        # Reached through the module rather than re-exported: the loader facade's
-        # import list from `sections` is a frozen pre-split snapshot
-        # (test_config_module_boundaries), so a new name must not join it.
-        polish=_safe_bool(stt_data.get("polish"), False),
-        streaming=_safe_bool(stt_data.get("streaming"), True),
-        silence_ms=_safe_int(
-            stt_data.get("silence_ms"),
-            _STT_DEFAULT_SILENCE_MS,
-            lo=_STT_MIN_SILENCE_MS,
-            hi=_STT_INTERVAL_MS_MAX,
-        ),
-        partial_interval_ms=_safe_int(
-            stt_data.get("partial_interval_ms"),
-            _STT_DEFAULT_PARTIAL_INTERVAL_MS,
-            lo=_STT_MIN_PARTIAL_INTERVAL_MS,
-            hi=_STT_INTERVAL_MS_MAX,
-        ),
-        idle_evict_secs=_safe_int(
-            stt_data.get("idle_evict_secs"),
-            _STT_DEFAULT_IDLE_EVICT_SECS,
-            lo=_STT_IDLE_EVICT_SECS_MIN,
-            hi=_STT_IDLE_EVICT_SECS_MAX,
-        ),
-        endpointing=_safe_bool(stt_data.get("endpointing"), False),
-        dictation_panel=_safe_bool(stt_data.get("dictation_panel"), True),
-        timeout_secs=_safe_int(
-            stt_data.get("timeout_secs"),
-            _STT_DEFAULT_TIMEOUT_SECS,
-            lo=_STT_MIN_TIMEOUT_SECS,
-            hi=_STT_MAX_TIMEOUT_SECS,
-        ),
-        transcribe_region=stt_data.get("transcribe_region", "us-east-1"),
-        transcribe_profile=stt_data.get("transcribe_profile", ""),
-    )
-
-
-def _build_computer_use_config(computer_use_data: dict) -> ComputerUseConfig:
-    return ComputerUseConfig(
-        max_tree_nodes=min(
-            _CU_MAX_TREE_NODES,
-            max(
-                1,
-                _safe_int(
-                    computer_use_data.get("max_tree_nodes", _CU_DEFAULT_MAX_TREE_NODES),
-                    _CU_DEFAULT_MAX_TREE_NODES,
-                ),
-            ),
-        ),
-        max_tree_depth=min(
-            _CU_MAX_TREE_DEPTH,
-            max(
-                1,
-                _safe_int(
-                    computer_use_data.get("max_tree_depth", _CU_DEFAULT_MAX_TREE_DEPTH),
-                    _CU_DEFAULT_MAX_TREE_DEPTH,
-                ),
-            ),
-        ),
-        text_limit=min(
-            _CU_MAX_TEXT_LIMIT,
-            max(
-                1,
-                _safe_int(
-                    computer_use_data.get("text_limit", _CU_DEFAULT_TEXT_LIMIT),
-                    _CU_DEFAULT_TEXT_LIMIT,
-                ),
-            ),
-        ),
-        attach_screenshot=_safe_bool(
-            computer_use_data.get("attach_screenshot", _CU_DEFAULT_ATTACH_SCREENSHOT),
-            _CU_DEFAULT_ATTACH_SCREENSHOT,
-        ),
-        screenshot_max_px=min(
-            _CU_MAX_SCREENSHOT_MAX_PX,
-            max(
-                _CU_MIN_SCREENSHOT_MAX_PX,
-                _safe_int(
-                    computer_use_data.get("screenshot_max_px", _CU_DEFAULT_SCREENSHOT_MAX_PX),
-                    _CU_DEFAULT_SCREENSHOT_MAX_PX,
-                ),
-            ),
-        ),
-        screenshot_jpeg_quality=min(
-            100,
-            max(
-                1,
-                _safe_int(
-                    computer_use_data.get(
-                        "screenshot_jpeg_quality", _CU_DEFAULT_SCREENSHOT_JPEG_QUALITY
-                    ),
-                    _CU_DEFAULT_SCREENSHOT_JPEG_QUALITY,
-                ),
-            ),
-        ),
-        # Default False: a missing or unparseable value must mean "do not
-        # draw on the operator's screen", never the reverse.
-        cursor_motion=_safe_bool(computer_use_data.get("cursor_motion", False), False),
-    )
-
-
-def _build_mcp_config(mcp_data: dict) -> McpConfig:
-    """Build the ``mcp`` section in its own frame (see the compound-section rule)."""
-    return McpConfig(
-        # Kept as authored strings — validation (absolute-only, ``~`` expansion,
-        # dedup) belongs to the consumer, kiro_crew.env.augmented_path, so the ONE
-        # gate the built-in directories already pass applies to these too instead
-        # of a second rule drifting here. Non-strings ARE dropped: the field is
-        # typed list[str] and to_dict() round-trips it verbatim into the saved
-        # config.
-        extra_path_dirs=[
-            d for d in _safe_list(mcp_data.get("extra_path_dirs", [])) if isinstance(d, str)
-        ],
-        # Only a real ``true`` opts in: a hand-edited truthy string must not grant
-        # a gate bypass by accident.
-        honour_auto_approve=mcp_data.get("honour_auto_approve") is True,
-    )
-
-
-def _build_mcp_gateway_config(mcp_gateway_data: dict) -> McpGatewayConfig:
-    _spawn_min = max(1, _safe_int(mcp_gateway_data.get("spawn_concurrency_min", 1), 1))
-    _spawn_max = max(_spawn_min, _safe_int(mcp_gateway_data.get("spawn_concurrency_max", 8), 8))
-    return McpGatewayConfig(
-        enabled=bool(mcp_gateway_data.get("enabled", False)),
-        # Absent -> True so installs that never configured this keep
-        # rendering. A malformed value cannot be distinguished here: the
-        # schema validator REMOVES an invalid value before the loader
-        # parses (see config/validation.py ``_apply_field_default``), so a
-        # hand-edited ``"false"`` arrives as absent and resolves to True,
-        # with a warning logged naming the field. ``_safe_bool`` is
-        # belt-and-braces for a schema gap, not the acting guard — the
-        # acting guard against a truthy string is the validator, since
-        # ``bool("false")`` is True. The write path is where an opt-out is
-        # actually enforced: the endpoint rejects any non-boolean body.
-        apps_enabled=_safe_bool(mcp_gateway_data.get("apps_enabled", True), True),
-        # ON by default. The forwarded set is a strict subset of the
-        # hashed set and gatewayd re-hashes the sidecar at spawn,
-        # forwarding nothing on mismatch, so a forwarded key is one every
-        # co-tenant of that backend declared identically. With it off, one
-        # ordinary declared key costs the whole server its pooling.
-        #
-        # Both arguments are True on purpose. A malformed value never
-        # reaches this call: ``config.validation`` type-checks first and
-        # ``_apply_field_default`` strips a non-boolean so the dataclass
-        # default applies, which is why the log says "using default". The
-        # fallback here is defence in depth for a bypassed validator, and
-        # giving it a different answer than the schema would only put two
-        # disagreeing defaults in the file.
-        forward_declared_env=_safe_bool(
-            mcp_gateway_data.get("forward_declared_env", FORWARD_DECLARED_ENV_DEFAULT),
-            FORWARD_DECLARED_ENV_DEFAULT,
-        ),
-        socket_path=str(mcp_gateway_data.get("socket_path", "")),
-        overlay_dir=str(mcp_gateway_data.get("overlay_dir", "")),
-        idle_timeout_secs=max(10, _safe_int(mcp_gateway_data.get("idle_timeout_secs", 300), 300)),
-        # 0 is meaningful (re-resolve every pass), so the floor is 0 and
-        # not the usual "at least something" clamp.
-        resolve_once_refresh_hours=max(
-            0, _safe_int(mcp_gateway_data.get("resolve_once_refresh_hours", 24), 24)
-        ),
-        max_backends=max(1, _safe_int(mcp_gateway_data.get("max_backends", 64), 64)),
-        # Admission keys. Clamps mirror the dataclass defaults: floor
-        # >= 1, ceiling >= floor, initial inside the band; 0 keeps the
-        # "auto" meaning on the host-budget ceilings.
-        spawn_concurrency_min=_spawn_min,
-        spawn_concurrency_max=_spawn_max,
-        spawn_concurrency_initial=min(
-            _spawn_max,
-            max(
-                _spawn_min,
-                _safe_int(mcp_gateway_data.get("spawn_concurrency_initial", 4), 4),
-            ),
-        ),
-        spawn_queue_wait_secs=max(
-            1, _safe_int(mcp_gateway_data.get("spawn_queue_wait_secs", 600), 600)
-        ),
-        initialize_timeout_secs=max(
-            1, _safe_int(mcp_gateway_data.get("initialize_timeout_secs", 10), 10)
-        ),
-        host_budget_max_procs=max(
-            0, _safe_int(mcp_gateway_data.get("host_budget_max_procs", 0), 0)
-        ),
-        host_budget_max_rss_mb=max(
-            0, _safe_int(mcp_gateway_data.get("host_budget_max_rss_mb", 0), 0)
-        ),
-        host_budget_max_fds=max(0, _safe_int(mcp_gateway_data.get("host_budget_max_fds", 0), 0)),
-        poolable_servers=[
-            s for s in mcp_gateway_data.get("poolable_servers", []) if isinstance(s, str)
-        ],
-        stub_servers=_resolve_stub_servers(mcp_gateway_data),
-        # The operator's deviations, kept ALONGSIDE the resolved set above
-        # rather than folded away: ``stub_servers`` here is already the
-        # effective answer, so a writer that wants to record a new
-        # decision needs to see which ones are decisions and which came
-        # from the roster. Shares the resolver with the runtime so a
-        # non-bool value is dropped in exactly one place.
-        stub_overrides=_resolve_stub_overrides(mcp_gateway_data),
-        # The file's own roster, carried so ``save()`` can put it back
-        # instead of flattening it to the effective set above. See the
-        # field's own comment for why that flattening is a data loss.
-        _stub_roster=_resolve_stub_roster(mcp_gateway_data),
-        # Hand-editable list of env NAMES; keep only strings and drop
-        # blanks so a stray null or nested object cannot reach the
-        # hashing layer as a key. Not deduplicated here — every consumer
-        # builds a frozenset from it.
-        pool_identity_env=[
-            s.strip()
-            for s in mcp_gateway_data.get("pool_identity_env", [])
-            if isinstance(s, str) and s.strip()
-        ],
-        prewarm_count=max(0, _safe_int(mcp_gateway_data.get("prewarm_count", 0), 0)),
-        read_buffer_limit_bytes=max(
-            1024,
-            _safe_int(
-                mcp_gateway_data.get("read_buffer_limit_bytes", 64 * 1024 * 1024),
-                64 * 1024 * 1024,
-            ),
-        ),
-        response_spill_threshold_bytes=max(
-            0,
-            _safe_int(
-                mcp_gateway_data.get("response_spill_threshold_bytes", 256 * 1024),
-                256 * 1024,
-            ),
+        jira_auth=(
+            [
+                _jira_auth_entry(entry)
+                for entry in (dashboard_data["jira_auth"] or [])
+                if isinstance(entry, dict) and entry.get("host")
+            ]
+            if "jira_auth" in dashboard_data
+            else section.default("jira_auth")
         ),
     )
 
 
-def _build_instances_config(
-    connect_timeout_raw: object, instances_data: dict, mint_timeout_raw: object
-) -> InstancesConfig:
-    return InstancesConfig(
-        enabled=bool(instances_data.get("enabled", False)),
-        warm_set_cap=_safe_int(
-            instances_data.get("warm_set_cap", _DEFAULT_WARM_SET_CAP), _DEFAULT_WARM_SET_CAP
-        ),
-        tunnel_base_port=_safe_int(
-            instances_data.get("tunnel_base_port", _DEFAULT_TUNNEL_BASE_PORT),
-            _DEFAULT_TUNNEL_BASE_PORT,
-        ),
-        ssh_compression=bool(instances_data.get("ssh_compression", _DEFAULT_SSH_COMPRESSION)),
-        connect_timeout_secs=(
-            _safe_float(connect_timeout_raw, _DEFAULT_CONNECT_TIMEOUT)
-            if connect_timeout_raw is not None
-            else None
-        ),
-        mint_timeout_secs=(
-            _safe_float(mint_timeout_raw, _DEFAULT_MINT_TIMEOUT)
-            if mint_timeout_raw is not None
-            else None
-        ),
-        max_recovery_attempts=_safe_int(
-            instances_data.get("max_recovery_attempts", _DEFAULT_MAX_RECOVERY),
-            _DEFAULT_MAX_RECOVERY,
-        ),
-        recover_backoff_max_secs=_safe_float(
-            instances_data.get("recover_backoff_max_secs", _DEFAULT_BACKOFF_MAX),
-            _DEFAULT_BACKOFF_MAX,
-        ),
-        probe_failure_threshold=_safe_int(
-            instances_data.get("probe_failure_threshold", _DEFAULT_PROBE_FAILS),
-            _DEFAULT_PROBE_FAILS,
-        ),
+def _jira_auth_entry(raw: dict) -> JiraAuthEntry:
+    """One ``dashboard.jira_auth`` row, read against :class:`JiraAuthEntry`'s defaults."""
+    entry = _sections.SectionReader(JiraAuthEntry, raw)
+    return JiraAuthEntry(
+        host=str(entry.get("host")),
+        # ``user`` is accepted as an alias; ``email`` wins when both are set.
+        email=str(raw.get("email") or raw.get("user") or entry.default("email")),
     )
 
 
-def _build_skills_config(skills_data: dict) -> SkillsConfig:
-    # Every default here is READ FROM THE DATACLASS, never written a second time.
-    # A config.json omits any key it predates, so a literal in this function is a
-    # second declaration of the same default that can drift from the first and then
-    # answer with the opposite value, silently, for exactly the installs that have
-    # not touched the setting.
-    d = SkillsConfig()
-    return SkillsConfig(
-        max_triggered=_safe_int(skills_data.get("max_triggered", d.max_triggered), d.max_triggered),
-        lazy_load=_safe_bool(skills_data.get("lazy_load", d.lazy_load), d.lazy_load),
-        auto_create_from_sessions=_safe_bool(
-            skills_data.get("auto_create_from_sessions", d.auto_create_from_sessions),
-            d.auto_create_from_sessions,
-        ),
-        auto_refine_on_deviation=_safe_bool(
-            skills_data.get("auto_refine_on_deviation", d.auto_refine_on_deviation),
-            d.auto_refine_on_deviation,
-        ),
-        auto_min_tool_calls=_safe_int(
-            skills_data.get("auto_min_tool_calls", d.auto_min_tool_calls), d.auto_min_tool_calls
-        ),
-        auto_similarity_threshold=_safe_float(
-            skills_data.get("auto_similarity_threshold", d.auto_similarity_threshold),
-            d.auto_similarity_threshold,
-        ),
-        approval_required=_safe_bool(
-            skills_data.get("approval_required", d.approval_required), d.approval_required
-        ),
-        max_auto_skills=_safe_int(
-            skills_data.get("max_auto_skills", d.max_auto_skills), d.max_auto_skills
-        ),
-        stale_after_days=_safe_int(
-            skills_data.get("stale_after_days", d.stale_after_days), d.stale_after_days
-        ),
-        archive_after_days=_safe_int(
-            skills_data.get("archive_after_days", d.archive_after_days), d.archive_after_days
-        ),
-        pending_ttl_days=_safe_int(
-            skills_data.get("pending_ttl_days", d.pending_ttl_days), d.pending_ttl_days
-        ),
-        generate_scripts=_safe_bool(
-            skills_data.get("generate_scripts", d.generate_scripts), d.generate_scripts
-        ),
-        judge_model=str(skills_data.get("judge_model", d.judge_model) or d.judge_model),
-        extra_paths=[p for p in _safe_list(skills_data.get("extra_paths")) if isinstance(p, str)],
-        # Security off-switch: malformed values must not become truthy
-        # through Python coercion (for example, the string "false").
-        project_skills_enabled=(
-            skills_data.get("project_skills_enabled", d.project_skills_enabled) is True
-        ),
+def _registry_entry(raw: dict) -> ExternalRegistryConfig:
+    """One ``registries`` row, read against :class:`ExternalRegistryConfig`'s defaults."""
+    entry = _sections.SectionReader(ExternalRegistryConfig, raw)
+    return ExternalRegistryConfig(
+        name=str(entry.get("name")),
+        repo=str(entry.get("repo")),
+        # Backward-compat: an entry that OMITS ``branch`` is a legacy config
+        # written before URL registries defaulted new entries to ``main`` (the
+        # registries PUT API now always persists an explicit branch). Such an
+        # entry relied on the historical ``mainline`` default, so preserve it
+        # here — silently retargeting it to ``main`` on upgrade would break any
+        # registry whose content still lives on ``mainline``. The one registry
+        # read whose default is deliberately NOT the field's.
+        branch=str(raw.get("branch", "mainline")),
+        # A credential-posture decision, so it is read back verbatim and
+        # validated downstream rather than here: an unrecognised value must
+        # resolve to the restrictive tier, which ``registry._registry_trust_tier``
+        # does. Absent -> the field's "index", so a config written before the
+        # field existed keeps the credential-free posture it had.
+        trust=str(entry.get("trust")),
     )
 
 
-def _build_session_summary_config(session_summary_data: dict) -> SessionSummaryConfig:
-    return SessionSummaryConfig(
-        enabled=bool(session_summary_data.get("enabled", False)),
-        min_user_turns=_safe_int(session_summary_data.get("min_user_turns", 2), 2),
-        regenerate_after_turns=_safe_int(session_summary_data.get("regenerate_after_turns", 1), 1),
-        max_intents=_safe_int(session_summary_data.get("max_intents", 50), 50),
-        max_constraints=_safe_int(session_summary_data.get("max_constraints", 50), 50),
-        assistant_excerpt_chars=_safe_int(
-            session_summary_data.get("assistant_excerpt_chars", 400), 400
-        ),
-    )
-
-
+# ---------------------------------------------------------------------------
+# KiroCrewConfig: load, serialize, save, and resolve models and providers.
+# ---------------------------------------------------------------------------
 @dataclass
 class KiroCrewConfig:
     agent: AgentConfig = field(
@@ -3726,10 +3577,6 @@ class KiroCrewConfig:
     taskrunner: TaskRunnerConfig = field(
         default_factory=TaskRunnerConfig,
         metadata=_meta("Task Runner", "Task runner configuration."),
-    )
-    orchestrator: OrchestratorConfig = field(
-        default_factory=OrchestratorConfig,
-        metadata=_meta("Orchestrator", "Autopilot/orchestrator settings."),
     )
     messaging: MessagingConfig = field(
         default_factory=MessagingConfig,
@@ -3952,7 +3799,12 @@ class KiroCrewConfig:
     )
     auto_update: bool = field(
         default=True,
-        metadata=_meta("Auto Update", "Enable automatic update checks."),
+        metadata=_meta(
+            "Auto Update",
+            "Where the install can apply updates, true installs them once no work is "
+            "running and restarts; false only notifies. Elsewhere it has no effect. "
+            "On those same installs a policy minimum version applies regardless.",
+        ),
     )
     #: Opt-in for the Connections gallery, which is merged but held for a later
     #: release. A real field rather than an unmodelled top-level key because the
@@ -4002,6 +3854,13 @@ class KiroCrewConfig:
         repr=False,
         compare=False,
     )
+
+    #: True when the load that built this instance found ``config.json`` present
+    #: but unparseable, so every base setting here is a DEFAULT, not the user's.
+    #: Describes this read, like ``_degraded_sections``; never serialized.
+    #: :meth:`save` refuses such an instance even if the file has been repaired
+    #: since, because publishing it would still replace the repaired settings.
+    _base_unreadable: bool = field(default=False, repr=False, compare=False)
 
     @property
     def degraded_sections(self) -> frozenset[str]:
@@ -4073,8 +3932,9 @@ class KiroCrewConfig:
         """Load config from ~/.kiro/crew/config.json, falling back to defaults.
 
         If ``config.local.json`` exists alongside ``config.json``, it is
-        deep-merged on top. User overrides in the local file survive
-        upgrades that regenerate ``config.json``.
+        deep-merged on top. User overrides in the local file win over whatever
+        is written to ``config.json``, including a whole-document replace
+        (``kirocrew config set --file``, or a dashboard import in Replace mode).
 
         The overlay is applied at load time but NOT persisted back by
         ``save()`` — only the base config is written to ``config.json``.
@@ -4083,15 +3943,15 @@ class KiroCrewConfig:
         # read, so a concurrent newer load cannot be overwritten by this one
         # finishing later (see publish_autocompact_pct) and this method adds no
         # filesystem I/O of its own on the event loop.
-        cfg, _autocompact_ticket = cls._load_resolved()
+        cfg, _autocompact_ticket, _content_digest = cls._load_resolved()
         # Push the MCP search-path setting to its consumer. It is PUSHED rather
         # than read there because kiro_crew.env.mcp_search_path is reached from
         # the event loop by every MCP probe and by the agent-config resolver, so
         # a config read on that side would stat/read/validate config.json on the
-        # loop. Done here rather than inside _load_resolved so EVERY return path
-        # publishes -- including the defaults path taken when neither config file
-        # could be read, which must CLEAR an already-published snapshot rather
-        # than leave a deleted directory resolving commands. Lazy import: env
+        # loop. Done here rather than inside the load pipeline so EVERY load
+        # publishes -- including one that found neither config file readable, which
+        # must CLEAR an already-published snapshot rather than leave a deleted
+        # directory resolving commands. Lazy import: env
         # must stay off this module's import graph.
         try:
             from kiro_crew.env import publish_config_path_dirs
@@ -4104,10 +3964,10 @@ class KiroCrewConfig:
         # Publish the alias table for the same reason and in the same place: the
         # display-side resolver (:func:`resolve_effective_agent`) runs on the
         # event loop for every slots frame, so it must never reach for
-        # config.json itself. Here rather than in _load_resolved so EVERY return
-        # path publishes -- including the degraded-defaults path, which must
-        # overwrite a richer previous snapshot rather than leave the resolver
-        # honoring aliases that do not load.
+        # config.json itself. Here rather than in the load pipeline so EVERY load
+        # publishes -- including a degraded-defaults one, which must overwrite a
+        # richer previous snapshot rather than leave the resolver honoring aliases
+        # that do not load.
         try:
             publish_agent_alias_snapshot(cfg)
         except Exception as e:  # pragma: no cover - defensive
@@ -4135,794 +3995,31 @@ class KiroCrewConfig:
             # A publish failure must never make the config unloadable; cron
             # keeps using the zone it already had.
             logger.warning("Publishing config timezone failed: %s", e)
+        # The digest of the bytes this object was parsed from, recorded ON the object
+        # so provenance travels with it and this method's signature stays as every
+        # caller has it. ``None`` when the read could not name any bytes -- the files
+        # were unreadable, or the document was unusable and field defaults stand in --
+        # and an object built any other way has no attribute at all, which reads the
+        # same. :func:`config_content_stamp` is what it is later compared against.
+        _bind_content_digest(cfg, _content_digest)
         return cfg
 
     @classmethod
-    def _load_resolved(cls) -> tuple[KiroCrewConfig, int]:
+    def _load_resolved(cls) -> tuple[KiroCrewConfig, int, str | None]:
         """Resolve the config from disk (or defaults). See :meth:`load`.
 
-        Split out so :meth:`load` owns the post-resolution publication on every
-        return path; this method may return from more than one place.
-
-        Returns the config PLUS the ordering ticket drawn before the read, which
-        is what lets :meth:`load` publish the compaction threshold in the correct
-        order relative to a concurrent load without any filesystem I/O of its own
-        on the event loop.
+        Split out so :meth:`load` owns the post-resolution publication. Runs the load
+        pipeline -- :func:`read_config_document`, :func:`build_config`, then
+        :func:`persist_write_back` -- and returns the
+        config PLUS the ordering ticket drawn before the read, which is what lets
+        :meth:`load` publish the compaction threshold in the correct order relative
+        to a concurrent load without any filesystem I/O of its own on the event
+        loop, and the digest of the bytes the config was parsed from.
         """
-        # Drawn BEFORE any read below, so it records when this load began
-        # observing the files rather than when it finished. See
-        # next_config_load_ticket and publish_autocompact_pct.
-        ticket = next_config_load_ticket()
-        path = config_path()
-
-        # Hot-path cache: reuse the validated, merged dict when neither config
-        # file has changed since the last load. Skips read + json.loads +
-        # _deep_merge + the full jsonschema.validate. A deep copy is returned so
-        # in-place mutation by callers (and the write-back migration below) can
-        # never corrupt the cached original.
-        #
-        # ONE stat pass serves both consumers of it below: the cache lookup and
-        # the pre-read TOCTOU fingerprint. load() runs on the event loop, so a
-        # second pass would be filesystem I/O there for information already in
-        # hand.
-        fp = _config_fingerprint()
-        # Data and sidecar come from ONE lock hold: fetched separately, a save()
-        # on another thread could clear the cache between the two and hand this
-        # load a merged document with an EMPTY base shadow — which would then be
-        # captured from as if no overlay existed (see _shadowed_base_sections).
-        cached = _CONFIG_CACHE.get_with_sidecar(fp)
-        # Pre-overlay base copy of the sections the overlay touched. Filled on the
-        # disk path below; read from the sidecar on a cache hit. Empty when there
-        # is no overlay, in which case the merged document IS the base.
-        base_shadow: dict = {}
-        # Bound BEFORE the cache branch, because only the reading branch can decide
-        # an adoption: a cache HIT means no base document was read this load, and a
-        # load that did not look at the file must not adopt from it. Empty is
-        # therefore the correct answer on the hot path, not a missing one -- the load
-        # that populated the cache already adopted.
-        adoptable: list[SupersededDefault] = []
-        if cached is not None:
-            data, sidecar = cached
-            base_shadow = sidecar.get(_SIDECAR_BASE_SHADOW, {})
-        else:
-            # Capture the invalidation generation BEFORE disk I/O. A successful
-            # write advances it, so this read cannot repopulate pre-write data
-            # after the writer clears the cache even if the filesystem's coarse
-            # timestamp and unchanged size leave the fingerprint identical.
-            read_generation = _CONFIG_CACHE.generation()
-            # fp was captured BEFORE reading, so a write landing during the read
-            # is detected: the fingerprint normally changes, and the generation
-            # fence covers filesystems where a same-size replacement does not.
-            # _store_validated_data documents this contract.
-            pre_read_fp = fp
-            data = {}
-            loaded_base = False
-            config_source_unreadable = False
-            if path.exists():
-                try:
-                    raw = json.loads(path.read_text(encoding="utf-8"))
-                    if isinstance(raw, dict):
-                        data = raw
-                        loaded_base = True
-                    else:
-                        config_source_unreadable = True
-                        logger.warning("Config is not a JSON object, using defaults")
-                        _mark_file_degraded(path)
-                except (json.JSONDecodeError, OSError) as e:
-                    config_source_unreadable = True
-                    logger.warning("Failed to load config from %s: %s", path, e)
-                    _mark_file_degraded(path)
-
-            # Report -- and, for the entries that opt in, ADOPT -- a stored BASE
-            # value that still holds a superseded default, before the overlay merge
-            # below: the overlay is the operator's live choice and says nothing about
-            # what the base materialized.
-            #
-            # The two halves differ in what they may touch. Reporting is read-only
-            # and covers every drifted key, because a key with a documented escape
-            # hatch cannot be corrected automatically -- a stale default and a
-            # deliberate opt-out are the same bytes. Adoption covers only the
-            # entries whose ``auto_adopt`` says the value has no second meaning, and
-            # happens at most once per key per install; ``auto_adoptable`` owns both
-            # filters plus the acknowledgment one.
-            #
-            # Skipped when no base file loaded -- nothing is stored to adopt or
-            # report on.
-            adoptable = []
-            if loaded_base:
-                adoptable = auto_adoptable(data)
-                _report_superseded_defaults(data, skip={e.dotted_key for e in adoptable})
-
-            # Deep-merge config.local.json overlay (user-owned, never touched by setup)
-            local_data: dict = {}
-            local_path = config_local_path()
-            if local_path.is_file():
-                try:
-                    st_mode = local_path.stat().st_mode
-                    if st_mode & 0o002:
-                        logger.warning(
-                            "config.local.json is world-writable (%o); "
-                            "consider running: chmod 600 %s",
-                            st_mode & 0o777,
-                            local_path,
-                        )
-                    raw_local = json.loads(local_path.read_text(encoding="utf-8"))
-                    if isinstance(raw_local, dict):
-                        local_data = raw_local
-                    else:
-                        config_source_unreadable = True
-                        logger.warning("config.local.json is not a JSON object, ignoring")
-                        _mark_file_degraded(local_path)
-                except (json.JSONDecodeError, OSError) as e:
-                    config_source_unreadable = True
-                    logger.warning("Failed to load config.local.json: %s", e)
-                    _mark_file_degraded(local_path)
-
-            if local_data:
-                # Remember the base copy of what the overlay is about to shadow —
-                # the last moment both documents exist. See _shadowed_base_sections.
-                base_shadow = _shadowed_base_sections(data, local_data)
-                data = _deep_merge(data, local_data)
-
-            # A present source that cannot be read or parsed may contain the
-            # operator's hard-off switch. Preserve that unknown as disabled
-            # before either the defaults return or schema normalization can
-            # turn it into the enabled-by-default missing-field case.
-            _fail_closed_project_skills_config(
-                data, config_source_unreadable=config_source_unreadable
-            )
-
-            # Return defaults only if neither file was successfully loaded. Seed
-            # the default "kirocrew" agent in-memory (matching the on-disk
-            # migration below) so a never-setup home still lists the default
-            # agent — but do NOT persist: a plain read (e.g. `agent list`) must
-            # not create config files as a side effect. Not cached — there's no
-            # file to invalidate against, and the path is already cheap
-            # (existence checks only, no read/parse/validate).
-            if not loaded_base and not local_data:
-                # An UNREADABLE file reaches this same "no config" branch as a
-                # genuinely absent one, and the two are opposite claims for a
-                # security gate: "the operator configured nothing" versus "we
-                # could not read what they configured". Carry the observation
-                # through so the caller can tell them apart.
-                cfg = cls(_degraded_sections=frozenset(_OBSERVED_DEGRADED_SECTIONS))
-                if (
-                    DEGRADED_WHOLE_CONFIG in _OBSERVED_DEGRADED_SECTIONS
-                    or "dashboard" in _OBSERVED_DEGRADED_SECTIONS
-                ):
-                    cfg.dashboard.default_memory_mode = "temporary"
-                cfg.skills.project_skills_enabled = (
-                    data.get("skills", {}).get("project_skills_enabled", True) is True
-                )
-                kiro = cfg.agent.default_agent or "kirocrew"
-                cfg.agents["default"] = KiroCrewAgentConfig(
-                    kiro_agent=kiro,
-                    workspace="default",
-                    memory_store="default",
-                )
-                cfg.default_agent = "default"
-                return cfg, ticket
-
-            # Preserve fail-closed security semantics before advisory schema
-            # validation can replace malformed input with a missing-field default.
-            # Normalize resource_limits FIRST, for exactly that reason. Its
-            # fields are declared ``int | None``, so jsonschema reads a
-            # hand-edited ``512.5`` as a type violation and
-            # ``_apply_field_default`` POPS the key -- deleting a ceiling the
-            # parse rule would have accepted, since it truncates. That deletion
-            # is not neutral: the rlimit path's fallback for a missing value is
-            # ``0``, which means "leave inherited", so a 512 MB ceiling becomes
-            # NO ceiling, and ``to_dict`` then persists ``null`` over what the
-            # operator wrote. Normalizing here means validation sees the same
-            # integers ``from_raw`` would produce; it is idempotent, so the
-            # section build below agrees by construction.
-            if isinstance(data.get("resource_limits"), dict):
-                data["resource_limits"] = asdict(
-                    ResourceLimitsConfig.from_raw(data["resource_limits"])
-                )
-            # Same fail-closed-before-validation reason for the two agent
-            # switches whose safe direction is FALSE.
-            # `agent.session_control` is the operator's single withdrawal of
-            # cross-session control, and `agent.member_dispatch` gates whether
-            # a crew member bypasses that withdrawal. Schema validation pops a
-            # present-but-malformed value and the missing-field default is TRUE
-            # for both, so a quoted `"false"` — a routine operator quoting
-            # mistake — would silently ride that default back to the
-            # capability staying enabled. Coerce a present non-bool to False
-            # HERE, so validation sees a valid bool and keeps it; a genuinely
-            # absent key is left absent and still defaults to true (today's
-            # behaviour). One loop, so neither switch can keep the guard while
-            # the other loses it.
-            #
-            # Say so out loud. The coercion resolves a malformed value one way,
-            # and an operator who meant the other way has no other signal:
-            # validation sees the repaired bool and stays quiet. The line names
-            # the key, the type it found and the JSON it wanted, so the fix is
-            # the next thing the operator does rather than a capability they
-            # find missing later.
-            _agent_section = data.get("agent")
-            if isinstance(_agent_section, dict):
-                for _fail_closed_key in ("session_control", "member_dispatch"):
-                    if _fail_closed_key in _agent_section and not isinstance(
-                        _agent_section[_fail_closed_key], bool
-                    ):
-                        logger.warning(
-                            "agent.%s is %s, not a boolean; reading it as the safe "
-                            "value false (the capability is OFF). Write true or false "
-                            "without quotes to choose.",
-                            _fail_closed_key,
-                            type(_agent_section[_fail_closed_key]).__name__,
-                        )
-                        _agent_section[_fail_closed_key] = False
-            # Keep a genuinely absent default backward-compatible with older
-            # configs, but normalize a PRESENT malformed value before advisory
-            # schema validation can delete it and turn corruption into the
-            # missing-field Persistent default.
-            _dashboard_section = data.get("dashboard")
-            if isinstance(_dashboard_section, dict) and "default_memory_mode" in _dashboard_section:
-                _dashboard_section["default_memory_mode"] = _default_memory_mode_from(
-                    _dashboard_section["default_memory_mode"]
-                )
-            # Validate against JSON Schema (advisory — never fatal)
-            _validate_config_data(data)
-            # Clamp security-relevant resource-limit knobs to their API ceilings
-            # BEFORE caching, so a hand-edited/prompt-injected config.json that
-            # exceeds a ceiling cannot drive resource exhaustion (DoS). Runs only
-            # on the disk-read path; cache hits below already serve clamped values.
-            _clamp_security_bounds(data)
-            # Cache under the PRE-read fingerprint and generation. A mid-read
-            # write either changes the fingerprint or advances the generation;
-            # both paths force the next load to re-read. The base shadow rides
-            # along so a hit can capture unknown keys from the base document
-            # exactly as this disk read did.
-            _store_validated_data(
-                data,
-                pre_read_fp,
-                {_SIDECAR_BASE_SHADOW: base_shadow},
-                expected_generation=read_generation,
-            )
-
-        # Collected during the parse that discards them — the only moment the
-        # evidence exists, since the migration below rewrites config.json in
-        # normalized form (see KiroCrewConfig.degraded_sections).
-        _degraded: set[str] = set()
-        agent_data = _coerced_section(data, "agent", _degraded)
-        session_data = _coerced_section(data, "session", _degraded)
-        taskrunner_data = _coerced_section(data, "taskrunner", _degraded)
-        cron_history_data = _coerced_section(data, "cron_history", _degraded)
-        memory_data = _coerced_section(data, "memory", _degraded)
-        knowledge_data = _coerced_section(data, "knowledge", _degraded)
-        telegram_data = _coerced_section(data, "telegram", _degraded)
-        weixin_data = _coerced_section(data, "weixin", _degraded)
-        whatsapp_data = _coerced_section(data, "whatsapp", _degraded)
-        feishu_data = _coerced_section(data, "feishu", _degraded)
-        discord_data = _coerced_section(data, "discord", _degraded)
-        webex_data = _coerced_section(data, "webex", _degraded)
-        wakatime_data = _coerced_section(data, "wakatime", _degraded)
-        teams_data = _coerced_section(data, "teams", _degraded)
-        imessage_data = _coerced_section(data, "imessage", _degraded)
-        slack_data = _coerced_section(data, "slack", _degraded)
-        publish_data = _coerced_section(data, "publish", _degraded)
-        # A malformed allowed_destinations is the same class as a malformed
-        # section one level down, in two shapes. A non-LIST value:
-        # iterating it either crashes load() with a TypeError (a scalar — a
-        # config typo must not abort gateway startup) or yields garbage (a
-        # dict iterates as its keys, a string as its characters). A list with
-        # non-string/empty ENTRIES: the parse filter drops them, so an
-        # all-invalid narrowing like [1, 2] parses to [] — indistinguishable
-        # from "no restriction configured", the exact silent widening this fix
-        # exists to stop. Both shapes record the degradation so the publish
-        # gate denies, and parse from what safely remains. Validation cannot
-        # repair these values (publish.allowed_destinations is fail-closed
-        # there — repairing an OPEN default silently widens), so the loader
-        # must be the layer that survives them.
-        _dests_raw = publish_data.get("allowed_destinations", [])
-        if not isinstance(_dests_raw, list):
-            _degraded.add("publish")
-            _OBSERVED_DEGRADED_SECTIONS.add("publish")
-            logger.warning(
-                "config: 'publish.allowed_destinations' is not a list (got %s) "
-                "— treating the publish section as degraded; publishing is "
-                "denied until the file is fixed and the gateway restarted",
-                type(_dests_raw).__name__,
-            )
-            _dests_raw = []
-        elif any(not (isinstance(_d, str) and _d) for _d in _dests_raw):
-            _degraded.add("publish")
-            _OBSERVED_DEGRADED_SECTIONS.add("publish")
-            logger.warning(
-                "config: 'publish.allowed_destinations' carries entr(y/ies) "
-                "that are not non-empty strings — treating the publish section "
-                "as degraded; publishing is denied until the file is fixed and "
-                "the gateway restarted",
-            )
-            _dests_raw = []
-        # Back-compat: this channel's config section was renamed
-        # "wechat" -> "wecom". Fall back to the legacy key so existing
-        # installs keep their WeCom settings on upgrade (read-only alias;
-        # no broader migration machinery).
-        # Alias-aware: record under whichever key the operator actually used, so
-        # the warning names the section they can go and fix.
-        _wecom_key = "wecom" if "wecom" in data else "wechat"
-        wecom_data = _coerced_section(data, _wecom_key, _degraded)
-        dashboard_data = _coerced_section(data, "dashboard", _degraded)
-        # Persistent is the compatibility default only when a readable config
-        # genuinely omits this field. If the dashboard section or either config
-        # file was unreadable, the missing value may have been a privacy choice
-        # we could not recover, so new chats must fail closed to Temporary until
-        # the operator fixes the file and restarts the gateway.
-        if (
-            "dashboard" in _degraded
-            or "dashboard" in _OBSERVED_DEGRADED_SECTIONS
-            or DEGRADED_WHOLE_CONFIG in _OBSERVED_DEGRADED_SECTIONS
-        ):
-            dashboard_data["default_memory_mode"] = "temporary"
-        stt_data = _coerced_section(data, "stt", _degraded)
-        computer_use_data = _coerced_section(data, "computer_use", _degraded)
-        instances_data = _coerced_section(data, "instances", _degraded)
-        connect_timeout_raw = instances_data.get("connect_timeout_secs")
-        mint_timeout_raw = instances_data.get("mint_timeout_secs")
-        mcp_gateway_data = _coerced_section(data, "mcp_gateway", _degraded)
-        mcp_data = _coerced_section(data, "mcp", _degraded)
-        heartbeat_data = _coerced_section(data, "heartbeat", _degraded)
-        heartbeat_default_deliver = (
-            str(heartbeat_data.get("default_deliver", "slack")).strip().lower()
-        )
-        if heartbeat_default_deliver not in ("slack", "dashboard"):
-            heartbeat_default_deliver = "slack"
-        # A stored document written before this key existed has no "monitoring"
-        # object at all, and that is the case that must keep working: the miss
-        # resolves to the dataclass default, which is the off position. So an
-        # already-installed gateway needs nothing written to be correct here --
-        # only a gateway that wants the key ON writes it, and Settings does
-        # that. (The hazard this avoids belongs to a SHIPPED DEFAULT that
-        # CHANGES: config.json materializes every key, so the stored value
-        # outranks the new default forever. Adding a key has no stored value to
-        # outrank it.)
-        monitoring_data = _coerced_section(data, "monitoring", _degraded)
-        monitoring_prefer_structured_arming = _safe_bool(
-            monitoring_data.get("prefer_structured_arming"), False
-        )
-        tunnel_data = _coerced_section(data, "tunnel", _degraded)
-        skills_data = _coerced_section(data, "skills", _degraded)
-        session_summary_data = _coerced_section(data, "session_summary", _degraded)
-        messaging_data = _coerced_section(data, "messaging", _degraded)
-        telemetry_data = _coerced_section(data, "telemetry", _degraded)
-        orchestrator_data = _coerced_section(data, "orchestrator", _degraded)
-        watchdog_data = _coerced_section(data, "watchdog", _degraded)
-        decisions_data = _coerced_section(data, "decisions", _degraded)
-        resource_limits_data = _coerced_section(data, "resource_limits", _degraded)
-
-        # Parse agents section into dict[str, KiroCrewAgentConfig]
-        raw_agents = data.get("agents", {})
-        agents: dict[str, KiroCrewAgentConfig] = {}
-        if isinstance(raw_agents, dict):
-            for name, entry in raw_agents.items():
-                if isinstance(entry, dict):
-                    # config.json is hand-editable (and agent-writable), so a
-                    # non-string model (e.g. `model: 123`) must not survive the
-                    # load — it would reach normalize_agent_model().strip() and
-                    # raise AttributeError from the resolver instead of simply
-                    # being ignored.
-                    raw_model = entry.get("model", "")
-                    # Same guard as model: a non-string triggers (e.g. `1`) must
-                    # not survive load — select_crew's roster calls .strip() on it.
-                    raw_triggers = entry.get("triggers", "")
-                    agents[name] = KiroCrewAgentConfig(
-                        member_id=entry.get("member_id", ""),
-                        kiro_agent=entry.get("kiro_agent", ""),
-                        workspace=entry.get("workspace", "default"),
-                        memory_store=entry.get("memory_store", "default"),
-                        model=raw_model if isinstance(raw_model, str) else "",
-                        # Same hand-editable-config guard: an unknown level must
-                        # collapse to "" (inherit) rather than travel to the
-                        # provider, where kiro-cli rejects the whole overlay.
-                        reasoning_effort=coerce_effort(entry.get("reasoning_effort", "")),
-                        description=entry.get("description", ""),
-                        triggers=raw_triggers if isinstance(raw_triggers, str) else "",
-                        source=entry.get("source", "kirocrew"),
-                        # Hand-editable config: a quoted "true" or a stray int
-                        # must not become a truthy star, so only a real bool
-                        # is honoured and anything else reads as un-starred.
-                        starred=_safe_bool(entry.get("starred", False), False),
-                        # Same guard family as model/triggers: config.json is
-                        # hand-editable, so a junk value must collapse to 0
-                        # (inherit the global window), never crash the load.
-                        # lo=0 keeps a negative override from arming an
-                        # instant-cancel window.
-                        watchdog_tool_stall_suspect_secs=_safe_float(
-                            entry.get("watchdog_tool_stall_suspect_secs", 0.0), 0.0, lo=0.0
-                        ),
-                        watchdog_tool_stall_hard_cap_secs=_safe_float(
-                            entry.get("watchdog_tool_stall_hard_cap_secs", 0.0), 0.0, lo=0.0
-                        ),
-                        telegram_account=entry.get("telegram_account", ""),
-                        session_color=_safe_color(entry.get("session_color", "")),
-                        # Module-qualified on purpose: the facade's `from
-                        # sections import` list is a frozen pre-split snapshot
-                        # (test_config_module_boundaries), and post-split
-                        # internals are reached through the module, not
-                        # re-exported from here.
-                        avatar=_sections._safe_avatar(entry.get("avatar")),
-                    )
-
-        # Migrate workspaces from flat or structured format
-        raw_workspaces = data.get("workspaces", {})
-        if not isinstance(raw_workspaces, dict):
-            raw_workspaces = {}
-        workspaces = _migrate_workspaces(raw_workspaces)
-
-        # Parse memory_stores; synthesize default if missing.
-        #
-        # A store NAME becomes a single path segment under
-        # ``memory_stores.MEMORY_STORES_DIR_NAME``, so the shape rule is applied
-        # here too — at BOOT, where the operator can see it — rather than only at
-        # the first memory write. Reported, never REPAIRED: the entry is kept
-        # verbatim so a ``to_dict()``/``save()`` round-trip cannot erase the
-        # operator's own declaration, and no name is rewritten into a usable one,
-        # because sanitizing ``../work`` or ``Work`` into ``work`` is the one
-        # thing that would merge two crews' memory into one directory.
-        #
-        # Kept, but not usable: ``memory_stores.usable_store_names`` drops a
-        # malformed name from the resolvable set, so a crew bound to it degrades
-        # at ``resolve_agent_bindings`` instead of carrying the name to a
-        # resolver that would raise on it.
-        raw_stores = data.get("memory_stores", {})
-        memory_stores: dict[str, MemoryStoreConfig] = {}
-        if isinstance(raw_stores, dict) and raw_stores:
-            for name, entry in raw_stores.items():
-                if not isinstance(entry, dict):
-                    continue
-                defect = memory_store_name_defect(name)
-                if defect is not None:
-                    logger.warning(
-                        "memory_stores: store name %r is unusable (%s); any crew "
-                        "bound to it cannot resolve a memory directory",
-                        name,
-                        defect,
-                    )
-                memory_stores[name] = MemoryStoreConfig(
-                    owner_member_id=entry.get("owner_member_id", ""),
-                    description=entry.get("description", ""),
-                    embedding_provider=entry.get("embedding_provider", ""),
-                    owner_member=entry.get("owner_member", ""),
-                    memory_version=entry.get("memory_version", 1),
-                )
-        if not memory_stores:
-            memory_stores[DEFAULT_MEMORY_STORE] = MemoryStoreConfig()
-
-        # Parse top-level default_agent and default_memory_store
-        default_agent_val = data.get("default_agent", "")
-        if not isinstance(default_agent_val, str):
-            default_agent_val = ""
-        default_memory_store_val = data.get("default_memory_store", DEFAULT_MEMORY_STORE)
-        if not isinstance(default_memory_store_val, str):
-            default_memory_store_val = DEFAULT_MEMORY_STORE
-        # Reported, not repaired, for the same reason as the store names above.
-        # Legacy default_memory_store is retained for V1 compatibility. Member
-        # member resolution never uses it as a fallback or a filesystem path.
-        elif memory_store_name_defect(default_memory_store_val) is not None:
-            logger.warning(
-                "default_memory_store %r is not a usable store name (%s); preserved "
-                "for V1 compatibility but not used for member memory resolution",
-                default_memory_store_val,
-                memory_store_name_defect(default_memory_store_val),
-            )
-
-        # Capture unknown top-level sections verbatim so a section this core does
-        # not model (e.g. an edition-contributed section written by a companion)
-        # survives the load()->to_dict()->save() round-trip instead of being
-        # silently dropped. ``meta`` is stamped by save() itself, so it is never
-        # treated as an unknown section to preserve.
-        #
-        # Captured from the BASE view, not the merged one: for any section the
-        # overlay touched, ``base_shadow`` holds what config.json itself said.
-        # Capturing the merged value would make save() emit the overlay's leaf,
-        # which _subtract_overlay then removes — deleting the base file's own
-        # value. See _shadowed_base_sections. Sections the overlay did not touch
-        # are identical in both views.
-        capture_view = {**data, **base_shadow}
-        extra_sections = {
-            k: v
-            for k, v in capture_view.items()
-            if k not in _KNOWN_CONFIG_SECTIONS and k not in CONFIG_RESERVED_TOP_KEYS
-        }
-
-        cfg = cls(
-            agent=_build_agent_config(agent_data),
-            session=_build_session_config(session_data),
-            taskrunner=_build_taskrunner_config(taskrunner_data),
-            cron_history=_build_cron_history_config(cron_history_data),
-            messaging=_build_messaging_config(messaging_data),
-            # orchestrator/watchdog are advertised in config-baseline.json,
-            # served by /api/config/schema, and read by real consumers
-            # (acp/session_handle.py, dashboard/chat_orchestrator.py), so load()
-            # passes these kwargs — without them config.json values would be
-            # silently ignored and the dataclass defaults would always win.
-            orchestrator=_build_orchestrator_config(orchestrator_data),
-            watchdog=_build_watchdog_config(watchdog_data),
-            resource_limits=ResourceLimitsConfig.from_raw(resource_limits_data),
-            telemetry=_build_telemetry_config(telemetry_data),
-            memory=_build_memory_config(memory_data),
-            knowledge=_build_knowledge_config(knowledge_data),
-            telegram=_build_telegram_config(telegram_data),
-            weixin=_build_weixin_config(weixin_data),
-            whatsapp=_build_whatsapp_config(whatsapp_data),
-            discord=_build_discord_config(discord_data),
-            webex=_build_webex_config(webex_data),
-            wakatime=_build_wakatime_config(wakatime_data),
-            imessage=_build_imessage_config(imessage_data),
-            teams=_build_teams_config(teams_data),
-            slack=_build_slack_config(slack_data),
-            publish=_build_publish_config(_dests_raw, publish_data),
-            wecom=_build_wecom_config(wecom_data),
-            feishu=_build_feishu_config(feishu_data),
-            dashboard=_build_dashboard_config(_degraded, dashboard_data),
-            tunnel=_build_tunnel_config(tunnel_data),
-            hooks=data.get("hooks", {}),
-            agents=agents,
-            default_agent=default_agent_val,
-            workspaces=workspaces,
-            default_workspace=data.get("default_workspace", "default"),
-            memory_stores=memory_stores,
-            default_memory_store=default_memory_store_val,
-            # Every default below restates its dataclass default, and the two must
-            # stay equal: the branch above returns bare dataclass defaults when
-            # neither config file exists, so a disagreement gives one field two
-            # different defaults depending on whether a config.json is present, and
-            # the schema, the docs and the doctor can only describe one of them.
-            stt=_build_stt_config(stt_data),
-            # Every numeric knob is clamped to the same ceiling the MCP tool
-            # schemas enforce, so a hand-edited config.json cannot ask for an
-            # unbounded accessibility walk or a full-resolution screenshot.
-            # There is deliberately NO ``enabled`` key read here — see
-            # ComputerUseConfig's docstring and computer_use_state_path().
-            computer_use=_build_computer_use_config(computer_use_data),
-            auto_update=data.get("auto_update", True),
-            connections_ui=_safe_bool(data.get("connections_ui", True), True),
-            _degraded_sections=frozenset(_degraded | _OBSERVED_DEGRADED_SECTIONS),
-            timezone=data.get("timezone", ""),
-            snapshot_dir=data.get("snapshot_dir", ""),
-            registries=[
-                ExternalRegistryConfig(
-                    name=str(r.get("name", "")),
-                    repo=str(r.get("repo", "")),
-                    # Backward-compat: an entry that OMITS ``branch`` is a legacy
-                    # config written before URL registries defaulted new entries
-                    # to ``main`` (the registries PUT API now always persists an
-                    # explicit branch). Such an entry relied on the historical
-                    # ``mainline`` default, so preserve it here — silently
-                    # retargeting it to ``main`` on upgrade would break any
-                    # registry whose content still lives on ``mainline``.
-                    branch=str(r.get("branch", "mainline")),
-                    # A credential-posture decision, so it is read back verbatim
-                    # and validated downstream rather than here: an unrecognised
-                    # value must resolve to the restrictive tier, which
-                    # ``registry._registry_trust_tier`` does. Absent -> "index",
-                    # so a config written before the field existed keeps the
-                    # credential-free posture it had.
-                    trust=str(r.get("trust", "index")),
-                )
-                for r in (data.get("registries") or [])
-                if isinstance(r, dict) and r.get("repo")
-            ],
-            mcp_gateway=_build_mcp_gateway_config(mcp_gateway_data),
-            mcp=_build_mcp_config(mcp_data),
-            instances=_build_instances_config(
-                connect_timeout_raw, instances_data, mint_timeout_raw
-            ),
-            heartbeat=HeartbeatConfig(default_deliver=heartbeat_default_deliver),
-            monitoring=MonitoringConfig(
-                prefer_structured_arming=monitoring_prefer_structured_arming
-            ),
-            decisions=DecisionsConfig.from_raw(decisions_data),
-            skills=_build_skills_config(skills_data),
-            session_summary=_build_session_summary_config(session_summary_data),
-            slack_channels={
-                ch_id: ChannelConfig.from_dict(ch_data)
-                for ch_id, ch_data in (
-                    slack_data.get("channels", {})
-                    if isinstance(slack_data.get("channels"), dict)
-                    else {}
-                ).items()
-                if isinstance(ch_data, dict)
-            },
-            slack_dm_activation=_validate_activation(
-                slack_data.get("dm_activation", ACTIVATION_ALWAYS)
-            ),
-            observe_max_messages=max(
-                1, _safe_int(slack_data.get("observe_max_messages", 200), 200)
-            ),
-            observe_ttl_hours=max(
-                0.0, _safe_float(slack_data.get("observe_ttl_hours", 168.0), 168.0)
-            ),
-            _extra_sections=extra_sections,
-        )
-
-        # Unknown keys nested inside a modelled section. Captured AFTER
-        # construction because deciding what is unknown needs the built
-        # dataclasses' own field sets, not a second hand-maintained list that
-        # could drift from them. Same base-not-merged view as _extra_sections
-        # above, for the same reason.
-        cfg._extra_keys = _resolution.capture_extra_section_keys(capture_view, cfg)
-
-        # Write-back migration: if the on-disk config has legacy format
-        # (flat workspace strings, missing sections), back up the original
-        # and save the migrated version.  One-shot — subsequent loads see
-        # the canonical format and skip.
-        #
-        # The in-memory half below mutates `cfg` and RECORDS which migrations it
-        # decided on; the on-disk half re-reads config.json inside the write lock
-        # and applies exactly those as a delta (see _persist_config_migration),
-        # rather than `cfg.save()`, which would re-serialize this load's whole
-        # snapshot and drop any config write that landed after this load's read.
-        #
-        # Bound BEFORE the try: the ``finally`` at the end reads them, and an
-        # exception raised before their assignments would turn a logged write-back
-        # failure into a NameError out of load().
-        adopt_keys: set[str] = set()
-        adoption_landed = False
-        confirmed_adoptions: list[str] = []
-
-        try:
-            pending: set[str] = set()
-            # Flat workspace strings → need migration to {"dir": ...}
-            for v in raw_workspaces.values():
-                if isinstance(v, str):
-                    pending.add(MIGRATE_WORKSPACES)
-                    break
-
-            # One-time migration: create default agent when none exists
-            if not cfg.agents:
-                kiro = cfg.agent.default_agent or "kirocrew"
-                cfg.agents["default"] = KiroCrewAgentConfig(
-                    kiro_agent=kiro,
-                    workspace="default",
-                    memory_store="default",
-                )
-                pending.add(MIGRATE_AGENTS)
-            if not cfg.default_agent or cfg.default_agent not in cfg.agents:
-                # Prefer "default" if it exists, otherwise use first available agent
-                if "default" in cfg.agents:
-                    cfg.default_agent = "default"
-                elif cfg.agents:
-                    cfg.default_agent = next(iter(cfg.agents))
-                else:
-                    cfg.default_agent = "default"
-                pending.add(MIGRATE_DEFAULT_AGENT)
-
-            # One-shot launch migration for ``connections_ui`` (see the marker
-            # constant's docstring). Decided on the BASE document, not the
-            # merged view: the overlay is user-owned prose we never rewrite,
-            # and the stale materialization only ever landed in config.json.
-            connections_marker = config_dir() / CONNECTIONS_UI_MIGRATION_MARKER
-            connections_migrating = False
-            if not connections_marker.exists():
-                if data.get("connections_ui") is False:
-                    # In-memory half: this very load must already serve the
-                    # launch default — the strip below is the on-disk echo.
-                    cfg.connections_ui = True
-                    pending.add(MIGRATE_CONNECTIONS_UI)
-                connections_migrating = True
-
-            # Adopt the auto-adopting superseded defaults. The in-memory half is
-            # applied BELOW, after the write is confirmed -- never here. Applying it
-            # eagerly would let a failed write leave the running config holding a
-            # value the stored document does not agree with, invisibly: the operator
-            # reads 1800 in config.json while the gateway runs 10800.
-            #
-            # In memory still matters as much as the file, which is why it happens at
-            # all: the gateway reads these budgets once at startup, so a disk-only
-            # fix would leave the very run that performed it still on the old value,
-            # and "upgraded, restarted, nothing changed" is the complaint.
-            adopt_keys = {e.dotted_key for e in adoptable}
-            if adopt_keys:
-                pending.add(MIGRATE_SUPERSEDED_DEFAULTS)
-
-            needs_migration = bool(pending)
-
-            persisted = True
-            # Tracked SEPARATELY from ``persisted``, which starts True so the
-            # connections_ui marker still lands on a load that needed no migration
-            # at all. This one starts False and is set only where the adoption
-            # actually reached disk, so every OTHER way out -- a contended-lock
-            # deferral, the degraded-sections branch below, an exception caught by
-            # the handler at the end -- leaves it False and drops the cache in the
-            # ``finally``.
-            if needs_migration and not cfg._degraded_sections:
-                persisted = _persist_config_migration(
-                    path,
-                    frozenset(pending),
-                    default_kiro_agent=cfg.agent.default_agent or "kirocrew",
-                    adopt_keys=frozenset(adopt_keys),
-                    confirmed_adoptions=confirmed_adoptions,
-                )
-                adoption_landed = persisted
-                # In memory only for keys the migration CONFIRMED it removed, and
-                # only where the overlay does not supply the field: there the stale
-                # base bytes are cleared like any other, but the effective value
-                # belongs to ``config.local.json`` and is the operator's live choice.
-                by_key = {e.dotted_key: e for e in adoptable}
-                for key in confirmed_adoptions:
-                    entry = by_key.get(key)
-                    if entry is not None:
-                        logger.warning(
-                            "config: adopted current default for %s; removed stored value %r. "
-                            "To restore it: kirocrew config set %s %s",
-                            key,
-                            entry.old_default,
-                            key,
-                            entry.old_default,
-                        )
-                    if entry is not None and not _overlay_supplies(local_data, key):
-                        _adopt_in_memory(cfg, key, entry.old_default)
-            elif needs_migration:
-                # This load DISCARDED something (a malformed section, an
-                # unreadable file). The write-back serializes only the parsed
-                # fields, so writing back here would replace the operator's
-                # malformed narrowing with clean defaults — erasing the only
-                # on-disk evidence and turning the denial into silent
-                # allow-all at the next restart. Keep the malformed
-                # bytes; every future process re-observes and re-denies until
-                # the operator actually fixes the file. Migration re-runs on
-                # the first clean load.
-                logger.warning(
-                    "config: skipping write-back migration — this load "
-                    "degraded section(s) %s and writing back would erase the "
-                    "evidence; fix the file to clear",
-                    sorted(cfg._degraded_sections),
-                )
-
-            # Record the connections_ui boundary only after a pass that was
-            # allowed to act on it AND whose write-back actually landed. A
-            # degraded load skips both the strip and the marker; a contended
-            # lock makes _persist_config_migration return False with nothing
-            # written, and the marker MUST defer with the strip — marker
-            # without strip would freeze the stale false as a deliberate
-            # opt-out forever. (The already-migrated-by-another-writer path
-            # also returns False; the marker then lands on the next load,
-            # which finds nothing to strip. One extra boot, same endpoint.)
-            # Failure to write the marker itself is logged and retried next
-            # load — the strip's own condition makes the retry converge.
-            if connections_migrating and persisted and not cfg._degraded_sections:
-                atomic_write(
-                    connections_marker,
-                    json.dumps(
-                        {
-                            "migrated_at": datetime.now(timezone.utc).isoformat(),
-                            "stripped_stale_false": MIGRATE_CONNECTIONS_UI in pending,
-                        },
-                        indent=2,
-                    )
-                    + "\n",
-                )
-        except Exception as e:
-            # Migration write-back is best-effort; never block startup.
-            logger.warning("Config write-back failed: %s", e)
-        finally:
-            # An adoption that did NOT reach disk must not be frozen behind the
-            # validated-data cache. Only a load that READS the base document can
-            # decide an adoption (``adoptable`` is empty on a cache hit, by design),
-            # so a read-and-skip that left its document cached would have every
-            # later load serve the stale value and never retry -- the ceiling the
-            # operator upgraded to fix would come back and stay. In a ``finally``
-            # rather than beside the write, because the write is skipped by more
-            # than one path (a contended lock, an exception) and each leaves the
-            # same stale cache entry.
-            #
-            # The degraded-sections branch is the exception, and it is excluded on
-            # purpose. Its retry condition is not "the next load" but "the operator
-            # fixes the file and restarts the gateway" -- degradation observations
-            # are sticky for the life of a process (``_OBSERVED_DEGRADED_SECTIONS``),
-            # so until then the write is refused every time, and dropping the cache
-            # buys nothing except a full re-read and re-parse of config.json on
-            # EVERY load for as long as the two conditions coexist. After the
-            # restart the fixed file's fingerprint misses the (empty) cache and the
-            # adoption retries on that first load -- no invalidation needed.
-            if adopt_keys and not adoption_landed and not cfg._degraded_sections:
-                _invalidate_config_cache()
-
-        return cfg, ticket
+        doc = read_config_document()
+        cfg = build_config(doc, cls)
+        persist_write_back(cfg, doc)
+        return cfg, doc.ticket, doc.content_digest
 
     def to_dict(self) -> dict:
         """Serialize config to the JSON structure used by config.json."""
@@ -4959,7 +4056,6 @@ class KiroCrewConfig:
             "mcp_gateway": asdict(self.mcp_gateway),
             "mcp": asdict(self.mcp),
             "taskrunner": asdict(self.taskrunner),
-            "orchestrator": asdict(self.orchestrator),
             "watchdog": asdict(self.watchdog),
             "resource_limits": asdict(self.resource_limits),
             "messaging": asdict(self.messaging),
@@ -5061,9 +4157,14 @@ class KiroCrewConfig:
         write. Every read-modify-write flow, and every dashboard/coroutine
         caller, belongs on :func:`update_config_locked` (via
         ``dashboard/chat_utils.run_config_write``), which holds the flock
-        across the WHOLE read-mutate-write transaction; no coroutine in the tree
-        calls ``save()`` at all (``TestNoInlineSaveOnTheEventLoop`` pins that
-        structurally).
+        across the WHOLE read-mutate-write transaction. No coroutine calls
+        ``save()`` inline (``TestNoInlineSaveOnTheEventLoop``) and no dashboard
+        module reaches it at all, offloaded or not
+        (``TestNoDashboardModuleSavesTheWholeConfig``).
+
+        **Fails closed on an unreadable file.** If ``config.json`` exists but does
+        not parse, this raises :class:`ConfigReadError` and writes nothing: an
+        instance loaded from such a file holds defaults, not the user's settings.
 
         **Async callers must offload.** A contended POSIX ``flock`` blocks
         the calling thread for as long as the holder keeps it, which on the
@@ -5101,7 +4202,7 @@ class KiroCrewConfig:
         local_path = config_local_path()
         if local_path.is_file():
             try:
-                raw_local = json.loads(local_path.read_text(encoding="utf-8"))
+                raw_local = json.loads(read_config_text(local_path))
                 if isinstance(raw_local, dict):
                     # Compare CANONICAL values for resource_limits.
                     # _subtract_overlay recognises an overlay-owned leaf only when
@@ -5141,6 +4242,18 @@ class KiroCrewConfig:
         except OSError:
             pass
         with _config_write_lock(p):
+            # Never publish over a file that does not parse. load() answers such a
+            # file with DEFAULTS, so this snapshot would replace every setting the
+            # user has with them -- silently, and with the endpoint reporting
+            # success. Same fail-closed rule as update_config_locked; a missing
+            # file (the create-default callers) is still written.
+            if self._base_unreadable and p.exists():
+                raise ConfigReadError(
+                    f"refusing to save over {p}: this snapshot was loaded while the "
+                    "file did not parse, so it holds defaults, not the saved settings"
+                )
+            if p.exists():
+                read_config_for_update(p)
             write_config_atomically(p, stamp_config_meta(d))
         # Drop the validated-data cache so the next load() re-reads this write.
         # mtime-keying already detects the change; this makes it immediate even
@@ -5319,13 +4432,17 @@ class KiroCrewConfig:
         whenever the surface named the crew — the same class of drift in the other
         direction. With no crew record to read, ``agent`` IS the agent name (the
         background/heartbeat session keys pass it directly) and is used as-is.
+
+        The bound name goes through :func:`dispatch_kiro_agent` first: the role
+        set holds DECLARED names, and a crew that recorded a worker's file name
+        runs that worker all the same.
         """
         crew = self._crew_record(agent, crew_agent)
         if crew is not None:
             pinned = coerce_effort(crew.reasoning_effort)
             if pinned:
                 return pinned
-        template = crew.kiro_agent if crew is not None else (agent or "")
+        template = dispatch_kiro_agent(crew.kiro_agent) if crew is not None else (agent or "")
         if template in BACKGROUND_WORKER_AGENTS:
             return self.agent.resolve_effort("background")
         return self.agent.reasoning_effort
@@ -5349,10 +4466,24 @@ class KiroCrewConfig:
         ``realpath`` calls plus twice as many ``is_sensitive_path`` round trips
         through the two-worker ``mc-pathres`` pool; when that pool is also
         serving the skill scanner's bulk traffic, those waits queue and their
-        sum crosses the loop-stall watchdog. A warm call now costs one
-        ``scandir``. On the loop, cold or changed snapshots refresh in the
-        ``mc-discovery`` pool while this lookup serves previous rows (or no
-        pin until the first refresh lands). Off-loop callers parse inline.
+        sum crosses the loop-stall watchdog. A warm call costs one ``scandir``.
+        On the loop, cold or changed snapshots refresh in the ``mc-discovery``
+        pool while this lookup serves the previous rows. Off-loop callers parse
+        inline.
+
+        An EMPTY snapshot on the loop -- nothing published yet, or just cleared --
+        is answered ``""`` (no pin), and NOT from the named agent's own file: a
+        spec read, however bounded, is filesystem IO on the event loop, and the
+        loop-stall watchdog this snapshot exists for makes no exception for a
+        small one. The one caller that resolves a pin on a cold snapshot, the
+        persistent background session created at gateway start before the first
+        refresh lands, is async and warms the snapshot first
+        (:func:`kiro_crew.agent_discovery.warm_agent_specs`, awaited in
+        ``_ensure_background`` before the provider factory runs), so this lookup
+        then finds warm rows through the path above and ``_bg`` is created on its
+        own pin instead of the chat model for the gateway's lifetime. A snapshot
+        that holds rows is served as it stands, whether or not it names this
+        agent.
 
         JSON-first precedence is kept: with two live specs of DIFFERENT stems
         both declaring this name, the ``.json`` one wins, as the unordered
@@ -5410,7 +4541,12 @@ class KiroCrewConfig:
                     ep.chmod(0o600)
             except OSError:
                 logger.warning("Cannot enforce permissions on %s", ep)
-            for line in ep.read_text().splitlines():
+            try:
+                env_text = read_env_text(ep)
+            except EnvFileWideEncodingError as exc:
+                warn_undecodable_env(ep, exc)
+                env_text = ""
+            for line in env_text.splitlines():
                 line = line.strip()
                 if not line or line.startswith("#"):
                     continue
@@ -5476,6 +4612,7 @@ class KiroCrewConfig:
         from kiro_crew.providers.acp import (
             AcpProvider,  # circular: acp -> client -> session -> config.loader
         )
+        from kiro_crew.session_work_dir import is_disposable_session_key
 
         model = self.agent.model
         if model == DEFAULT_MODEL:
@@ -5520,6 +4657,14 @@ class KiroCrewConfig:
             # caller passing it into the catch-all would be swallowed here and
             # the session would spawn on the backend's default with no error.
             permission_mode: str | None = None,
+            shared_scratch: Path | None = None,
+            # The subagent manager's gate-exit start-clock reset for a DEDICATED
+            # subagent process. NAMED for the same reason ``permission_mode``
+            # is: swallowed by the catch-all, the dedicated path would silently
+            # keep charging session-start-gate queue time to the startup
+            # watchdog, which is the exact defect the callback exists to end.
+            on_gate_acquired: Callable[..., None] | None = None,
+            on_gate_queued: Callable[..., None] | None = None,
             **_kwargs: object,
         ) -> AcpProvider:
             wdir = Path(cwd) if cwd else _session_work_dir(session_key)
@@ -5592,7 +4737,19 @@ class KiroCrewConfig:
             # dashboard slot's effort, or a sub-agent's resolved "subagent"
             # effort) still wins over all of it.
             _eff = reasoning_effort_override or self.resolve_session_effort(agent, crew_agent)
-            if m and _eff and is_valid_effort(_eff) and model_supports_effort(m):
+            # On a harness whose effort capability and vocabulary come from the
+            # option it ADVERTISES, neither check below can answer here. This
+            # factory runs before any session exists, the registry carries none of
+            # the operator's own model ids, and Crew's ladder does not list every
+            # level such a harness offers -- so both facts arrive with
+            # ``session/new``, and ``AcpProvider._resolve_effort`` validates the
+            # level against the advertised list once they do. The level is carried
+            # forward for a member and judged there. Judging it HERE drops it on
+            # every cold start, and the session then runs the adapter's own default
+            # while the dashboard still shows the level the operator picked.
+            _from_option = _backend in ACP_BACKENDS_EFFORT_FROM_ADVERTISED_OPTION
+            _registry_ok = is_valid_effort(_eff) and model_supports_effort(m)
+            if m and _eff and (_from_option or _registry_ok):
                 _eff_per_model[m] = _eff
             elif _eff and is_valid_effort(_eff):
                 # Single-authority drop warning: a valid requested effort is
@@ -5643,11 +4800,1046 @@ class KiroCrewConfig:
                 mcp_gateway_overlay=_gw_overlay,
                 mcp_gateway_socket=_gw_socket,
                 permission_mode=resolve_cc_permission_mode(permission_mode, _backend),
+                # A dedicated subagent process joins its parent's session tree:
+                # the tree's work directory is mounted beside its own scratch
+                # and is what its ``$KIROCREW_SCRATCH`` names (agent_scratch).
+                shared_scratch=shared_scratch,
+                on_gate_acquired=on_gate_acquired,
+                on_gate_queued=on_gate_queued,
+                # Only a work dir DERIVED from a one-run key is the provider's
+                # to reclaim at shutdown; an explicit ``cwd`` is the caller's
+                # directory whatever the key says (session_work_dir).
+                disposable_work_dir=not cwd and is_disposable_session_key(session_key),
             )
 
         return _acp
 
 
+# ---------------------------------------------------------------------------
+# The load pipeline: read the document, build the config, persist the write-back.
+# ---------------------------------------------------------------------------
+@dataclass
+class ConfigDocument:
+    """What one read of ``config.json`` and ``config.local.json`` observed.
+
+    :func:`read_config_document` produces it; :func:`build_config` turns it into a
+    :class:`KiroCrewConfig` without touching the filesystem; :func:`persist_write_back`
+    runs the write-back migration it makes due. Besides this document, the build
+    reads (and extends) one process-wide input: the sticky set of degraded-section
+    observations (``_OBSERVED_DEGRADED_SECTIONS``).
+
+    ``data`` is the read stage's OUTPUT, not raw file content: the overlay is merged,
+    the read-stage repairs are applied (a quoted ``"false"`` on an agent off-switch
+    reads as ``false``; an unreadable source leaves ``skills.project_skills_enabled``
+    off), and the document is validated and clamped. The build applies none of those
+    repairs itself, so a document assembled in memory must already hold them.
+    Single-use: building normalizes ``data`` in place, as the load always has.
+    """
+
+    #: Load-order ticket drawn before any read (see :func:`next_config_load_ticket`).
+    ticket: int
+    #: The ``config.json`` path this read resolved.
+    path: Path
+    #: The repaired, validated, overlay-merged document. When neither file loaded it
+    #: is ``{}``, or carries only the project-skills off-switch an unreadable file
+    #: leaves behind.
+    data: dict
+    #: False when neither file loaded: the build starts from the field defaults.
+    loaded: bool
+    #: Digest of the bytes ``data`` was parsed from, or ``None`` when none can be named.
+    content_digest: str | None
+    #: ``config.json`` was present but unreadable or not a JSON object.
+    base_unreadable: bool = False
+    #: The base document's copy of each top-level section the overlay touched.
+    base_shadow: dict = field(default_factory=dict)
+    #: ``config.local.json`` as this read parsed it; ``{}`` on a cache hit.
+    overlay: dict = field(default_factory=dict)
+    #: Superseded defaults this read found adoptable; only a disk read finds any.
+    adoptable: list[SupersededDefault] = field(default_factory=list)
+    #: The 0.6.x-or-older writer stamp when the legacy ``skills.lazy_load`` rewrite is due.
+    legacy_lazy_stamp: str | None = None
+
+
+def read_config_document() -> ConfigDocument:
+    """Read ``config.json`` and ``config.local.json`` into a :class:`ConfigDocument`.
+
+    The stage that reads the two files and the validated-data cache to build the
+    document (the write-back re-reads ``config.json`` under its lock). It draws the
+    load-order ticket, takes ONE fingerprint stat pass of both files, and either serves
+    the cache entry that fingerprint names or reads both files, merges the overlay,
+    applies the fail-closed normalizations, validates and clamps the result and caches
+    it. A
+    missing, unreadable or malformed file never raises: it degrades to defaults and is
+    recorded (``_mark_file_degraded``). Writes no config file: it fills the cache and,
+    when a security clamp fires, records a SEL event. The superseded defaults it
+    reports are logged, and only a disk read decides an adoption.
+    """
+    # Drawn BEFORE any read below, so it records when this load began
+    # observing the files rather than when it finished. See
+    # next_config_load_ticket and publish_autocompact_pct.
+    ticket = next_config_load_ticket()
+    path = config_path()
+
+    # Hot-path cache: reuse the validated, merged dict when neither config
+    # file has changed since the last load. Skips read + json.loads +
+    # _deep_merge + the full jsonschema.validate. A deep copy is returned so
+    # in-place mutation by callers (and by persist_write_back) can never corrupt
+    # the cached original.
+    #
+    # ONE stat pass serves both consumers of it below: the cache lookup and
+    # the pre-read TOCTOU fingerprint. load() runs on the event loop, so a
+    # second pass would be filesystem I/O there for information already in
+    # hand.
+    fp = _config_fingerprint()
+    # Data and sidecar come from ONE lock hold: fetched separately, a save()
+    # on another thread could clear the cache between the two and hand this
+    # load a merged document with an EMPTY base shadow — which would then be
+    # captured from as if no overlay existed (see _shadowed_base_sections).
+    cached = _CONFIG_CACHE.get_with_sidecar(fp)
+    if cached is not None:
+        # A cache HIT read no base document this load, and a load that did not look
+        # at the file must not adopt from it, so the document carries no adoptable
+        # superseded default and no legacy ``skills.lazy_load`` stamp. Empty is the
+        # correct answer on the hot path, not a missing one -- the load that
+        # populated the cache already decided both.
+        data, sidecar, content_digest = cached
+        return ConfigDocument(
+            ticket=ticket,
+            path=path,
+            data=data,
+            loaded=True,
+            content_digest=content_digest,
+            base_unreadable=bool(sidecar.get(_SIDECAR_BASE_UNREADABLE, False)),
+            base_shadow=sidecar.get(_SIDECAR_BASE_SHADOW, {}),
+        )
+
+    # Pre-overlay base copy of the sections the overlay touched. Filled below.
+    # Empty when there is no overlay, in which case the merged document IS the base.
+    base_shadow: dict = {}
+    # The writer stamp of 0.6.x or older the base document carried when the legacy
+    # ``skills.lazy_load`` rewrite is due, or None.
+    legacy_lazy_stamp: str | None = None
+    base_unreadable = False
+    # Capture the invalidation generation BEFORE disk I/O. A successful
+    # write advances it, so this read cannot repopulate pre-write data
+    # after the writer clears the cache even if the filesystem's coarse
+    # timestamp and unchanged size leave the fingerprint identical.
+    read_generation = _CONFIG_CACHE.generation()
+    # fp was captured BEFORE reading, so a write landing during the read
+    # is detected: the fingerprint normally changes, and the generation
+    # fence covers filesystems where a same-size replacement does not.
+    # _store_validated_data documents this contract.
+    pre_read_fp = fp
+    data = {}
+    loaded_base = False
+    config_source_unreadable = False
+    # The bytes, kept so the digest names exactly what was parsed rather
+    # than whatever a later read would find.
+    read_parts: list[bytes | None] = [None, None]
+    digestible = True
+    if path.exists():
+        try:
+            base_text = read_config_text(path)
+            read_parts[0] = base_text.encode("utf-8")
+            raw = json.loads(base_text)
+            if isinstance(raw, dict):
+                data = raw
+                loaded_base = True
+            else:
+                config_source_unreadable = True
+                base_unreadable = True
+                logger.warning("Config is not a JSON object, using defaults")
+                _mark_file_degraded(path)
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError) as e:
+            config_source_unreadable = True
+            base_unreadable = True
+            # A digest names the BYTES, and a document that read whole but would
+            # not parse still has bytes to name -- what it does not have is
+            # faithful CONTENT, which ``degraded_sections`` is what reports. Only
+            # a read that never completed leaves nothing to name.
+            if read_parts[0] is None:
+                digestible = False
+            logger.warning("Failed to load config from %s: %s", path, e)
+            _mark_file_degraded(path)
+
+    # Report -- and, for the entries that opt in, ADOPT -- a stored BASE
+    # value that still holds a superseded default, before the overlay merge
+    # below: the overlay is the operator's live choice and says nothing about
+    # what the base materialized.
+    #
+    # The two halves differ in what they may touch. Reporting is read-only
+    # and covers every drifted key, because a key with a documented escape
+    # hatch cannot be corrected automatically -- a stale default and a
+    # deliberate opt-out are the same bytes. Adoption covers only the
+    # entries whose ``auto_adopt`` says the value has no second meaning, and
+    # happens at most once per key per install; ``auto_adoptable`` owns both
+    # filters plus the acknowledgment one.
+    #
+    # Skipped when no base file loaded -- nothing is stored to adopt or
+    # report on.
+    adoptable = []
+    if loaded_base:
+        adoptable = auto_adoptable(data)
+        # Decided here, on the base as the previous build left it: once this
+        # load writes, or the gateway's meta refresh runs, the stamp names
+        # the running build and the proof is gone.
+        legacy_lazy_stamp = _migration.legacy_lazy_load_rewrite_due(
+            data, connections_marker=config_dir() / CONNECTIONS_UI_MIGRATION_MARKER
+        )
+        report_skip = {e.dotted_key for e in adoptable}
+        if legacy_lazy_stamp is not None:
+            # The line must not send the operator after a key this same
+            # load removes (it applies once the registry has a row for it).
+            report_skip.add(_migration.LAZY_LOAD_KEY)
+        _report_superseded_defaults(data, skip=report_skip)
+
+    # Deep-merge config.local.json overlay (user-owned, never touched by setup)
+    local_data: dict = {}
+    local_path = config_local_path()
+    if local_path.is_file():
+        try:
+            st_mode = local_path.stat().st_mode
+            if st_mode & 0o002:
+                logger.warning(
+                    "config.local.json is world-writable (%o); consider running: chmod 600 %s",
+                    st_mode & 0o777,
+                    local_path,
+                )
+            local_text = read_config_text(local_path)
+            read_parts[1] = local_text.encode("utf-8")
+            raw_local = json.loads(local_text)
+            if isinstance(raw_local, dict):
+                local_data = raw_local
+            else:
+                config_source_unreadable = True
+                logger.warning("config.local.json is not a JSON object, ignoring")
+                _mark_file_degraded(local_path)
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError) as e:
+            config_source_unreadable = True
+            # Same rule as the base file: bytes that read whole can be named
+            # whether or not they parsed.
+            if read_parts[1] is None:
+                digestible = False
+            logger.warning("Failed to load config.local.json: %s", e)
+            _mark_file_degraded(local_path)
+
+    if local_data:
+        # Remember the base copy of what the overlay is about to shadow —
+        # the last moment both documents exist. See _shadowed_base_sections.
+        base_shadow = _shadowed_base_sections(data, local_data)
+        data = _deep_merge(data, local_data)
+
+    # A present source that cannot be read or parsed may contain the
+    # operator's hard-off switch. Preserve that unknown as disabled
+    # before either the defaults return or schema normalization can
+    # turn it into the enabled-by-default missing-field case.
+    _fail_closed_project_skills_config(data, config_source_unreadable=config_source_unreadable)
+
+    # Neither file loaded: hand back an unloaded document, which build_config turns
+    # into field defaults and the write-back skips. Not cached — there's no file to
+    # invalidate against, and the path is already cheap (existence checks only, no
+    # read/parse/validate).
+    if not loaded_base and not local_data:
+        # Both files absent is a VALID state with bytes to name -- the digest of
+        # "neither file exists" -- and naming it is what lets a caller holding
+        # this config tell "still absent" from "someone just created one". Only
+        # a read that never completed reaches here with nothing to name.
+        return ConfigDocument(
+            ticket=ticket,
+            path=path,
+            data=data,
+            loaded=False,
+            content_digest=_content_digest_of(read_parts) if digestible else None,
+            base_unreadable=base_unreadable,
+        )
+
+    # Preserve fail-closed security semantics before advisory schema
+    # validation can replace malformed input with a missing-field default.
+    # Normalize resource_limits FIRST, for exactly that reason. Its
+    # fields are declared ``int | None``, so jsonschema reads a
+    # hand-edited ``512.5`` as a type violation and
+    # ``_apply_field_default`` POPS the key -- deleting a ceiling the
+    # parse rule would have accepted, since it truncates. That deletion
+    # is not neutral: the rlimit path's fallback for a missing value is
+    # ``0``, which means "leave inherited", so a 512 MB ceiling becomes
+    # NO ceiling, and ``to_dict`` then persists ``null`` over what the
+    # operator wrote. Normalizing here means validation sees the same
+    # integers ``from_raw`` would produce; it is idempotent, so
+    # build_config agrees by construction.
+    if isinstance(data.get("resource_limits"), dict):
+        data["resource_limits"] = asdict(ResourceLimitsConfig.from_raw(data["resource_limits"]))
+    # Same fail-closed-before-validation reason for the three agent
+    # switches whose safe direction is FALSE.
+    # `agent.session_control` is the operator's single withdrawal of
+    # cross-session control, `agent.member_dispatch` gates whether
+    # a crew member bypasses that withdrawal, and `agent.crew_panel`
+    # gates the member's own webview. Schema validation pops a
+    # present-but-malformed value and the missing-field default is TRUE
+    # for all three, so a quoted `"false"` -- a routine operator quoting
+    # mistake -- would silently ride that default back to the
+    # capability staying enabled. Coerce a present non-bool to False
+    # HERE, so validation sees a valid bool and keeps it; a genuinely
+    # absent key is left absent and still defaults to true (today's
+    # behaviour). One loop, so no switch can keep the guard while
+    # another loses it.
+    #
+    # Say so out loud. The coercion resolves a malformed value one way,
+    # and an operator who meant the other way has no other signal:
+    # validation sees the repaired bool and stays quiet. The line names
+    # the key, the type it found and the JSON it wanted, so the fix is
+    # the next thing the operator does rather than a capability they
+    # find missing later.
+    _agent_section = data.get("agent")
+    if isinstance(_agent_section, dict):
+        for _fail_closed_key in ("session_control", "member_dispatch", "crew_panel"):
+            if _fail_closed_key in _agent_section and not isinstance(
+                _agent_section[_fail_closed_key], bool
+            ):
+                logger.warning(
+                    "agent.%s is %s, not a boolean; reading it as the safe "
+                    "value false (the capability is OFF). Write true or false "
+                    "without quotes to choose.",
+                    _fail_closed_key,
+                    type(_agent_section[_fail_closed_key]).__name__,
+                )
+                _agent_section[_fail_closed_key] = False
+    # Keep a genuinely absent default backward-compatible with older
+    # configs, but normalize a PRESENT malformed value before advisory
+    # schema validation can delete it and turn corruption into the
+    # missing-field Persistent default.
+    _dashboard_section = data.get("dashboard")
+    if isinstance(_dashboard_section, dict) and "default_memory_mode" in _dashboard_section:
+        _dashboard_section["default_memory_mode"] = _default_memory_mode_from(
+            _dashboard_section["default_memory_mode"]
+        )
+    # Validate against JSON Schema (advisory — never fatal)
+    _validate_config_data(data)
+    # Clamp security-relevant resource-limit knobs to their API ceilings
+    # BEFORE caching, so a hand-edited/prompt-injected config.json that
+    # exceeds a ceiling cannot drive resource exhaustion (DoS). Runs only
+    # on the disk-read path; a cache hit, served above, already holds clamped values.
+    _clamp_security_bounds(data)
+    # Cache under the PRE-read fingerprint and generation. A mid-read
+    # write either changes the fingerprint or advances the generation;
+    # both paths force the next load to re-read. The base shadow rides
+    # along so a hit can capture unknown keys from the base document
+    # exactly as this disk read did.
+    # Named from the bytes THIS read parsed, so a later hit on this entry can
+    # say which content it represents. Withheld only when a file existed and
+    # could not be READ whole: a document that read but would not parse still
+    # has bytes to name, and that it is not faithful is what
+    # ``degraded_sections`` reports instead.
+    content_digest = _content_digest_of(read_parts) if digestible else None
+    # Cached only when every present file read WHOLE. A transient read
+    # failure (a sharing violation, an EIO) on config.json with an overlay
+    # present leaves an overlay-only document here, and caching it under
+    # the unchanged stat fingerprint served the base settings at their
+    # defaults on every later load until a file happened to change. A file
+    # whose bytes read fine but would not parse is a stable fact about
+    # those bytes and still caches.
+    if digestible:
+        _store_validated_data(
+            data,
+            pre_read_fp,
+            {_SIDECAR_BASE_SHADOW: base_shadow, _SIDECAR_BASE_UNREADABLE: base_unreadable},
+            expected_generation=read_generation,
+            content_digest=content_digest,
+        )
+
+    return ConfigDocument(
+        ticket=ticket,
+        path=path,
+        data=data,
+        loaded=True,
+        content_digest=content_digest,
+        base_unreadable=base_unreadable,
+        base_shadow=base_shadow,
+        overlay=local_data,
+        adoptable=adoptable,
+        legacy_lazy_stamp=legacy_lazy_stamp,
+    )
+
+
+#: The class whose field defaults an omitted top-level key reads, bound at import so a
+#: test that rebinds the module's ``KiroCrewConfig`` cannot steer -- or break -- a
+#: real load, which never read that global.
+_TOP_LEVEL_DEFAULTS: type[KiroCrewConfig] = KiroCrewConfig
+
+
+def build_config(
+    doc: ConfigDocument, config_cls: type[KiroCrewConfig] = KiroCrewConfig
+) -> KiroCrewConfig:
+    """Build the :class:`KiroCrewConfig` a :class:`ConfigDocument` describes.
+
+    No filesystem I/O. Reads *doc* and the process-wide sticky degraded set, and
+    extends that set. Every section is extracted through ``_coerced_section``, so a
+    present section that is not an object is recorded -- in the returned config's
+    ``degraded_sections`` and in the sticky set -- and logged, then built from its
+    field defaults; a degraded dashboard section (or an observed whole-file
+    degradation) forces Temporary memory mode, and a malformed publish narrowing
+    denies publishing. Unknown top-level sections and section keys are captured from
+    the BASE view (``data`` with ``base_shadow`` over it) for the round-trip. The
+    read stage's agent off-switch and project-skills repairs, validation and security
+    clamp are not repeated here (``ResourceLimitsConfig.from_raw`` and the memory-mode
+    parse do run again, idempotently).
+    An unloaded document (neither file read) yields the field defaults plus the
+    seeded default crew, with the fail-closed overrides a degraded or unreadable read
+    leaves: the project-skills off-switch ``data`` carries, and Temporary memory mode
+    once the dashboard section or the whole file was observed degraded. The
+    write-back migration is :func:`persist_write_back`'s, so a loaded document missing
+    its default agent or ``default_agent`` comes back that way.
+
+    *config_cls* is the class to build; ``KiroCrewConfig._load_resolved`` passes its
+    own ``cls``, so a load never builds whatever class a rebound module global names.
+    """
+    data = doc.data
+    base_shadow = doc.base_shadow
+    if not doc.loaded:
+        # Seed the default "kirocrew" agent in-memory (matching the on-disk
+        # migration in persist_write_back) so a never-setup home still lists the
+        # default agent — but do NOT persist: a plain read (e.g. `agent list`) must
+        # not create config files as a side effect, so the write-back skips an
+        # unloaded document.
+        #
+        # An UNREADABLE file reaches this same "no config" branch as a
+        # genuinely absent one, and the two are opposite claims for a
+        # security gate: "the operator configured nothing" versus "we
+        # could not read what they configured". Carry the observation
+        # through so the caller can tell them apart.
+        cfg = config_cls(_degraded_sections=frozenset(_OBSERVED_DEGRADED_SECTIONS))
+        cfg._base_unreadable = doc.base_unreadable
+        if (
+            DEGRADED_WHOLE_CONFIG in _OBSERVED_DEGRADED_SECTIONS
+            or "dashboard" in _OBSERVED_DEGRADED_SECTIONS
+        ):
+            cfg.dashboard.default_memory_mode = "temporary"
+        cfg.skills.project_skills_enabled = (
+            _sections.SectionReader(SkillsConfig, data.get("skills", {})).get(
+                "project_skills_enabled"
+            )
+            is True
+        )
+        kiro = cfg.agent.default_agent or "kirocrew"
+        cfg.agents["default"] = KiroCrewAgentConfig(
+            kiro_agent=kiro,
+            workspace="default",
+            memory_store="default",
+        )
+        cfg.default_agent = "default"
+        return cfg
+
+    # Collected during the parse that discards them — the only moment the
+    # evidence exists, since the write-back rewrites config.json in
+    # normalized form (see KiroCrewConfig.degraded_sections).
+    _degraded: set[str] = set()
+    agent_data = _coerced_section(data, "agent", _degraded)
+    session_data = _coerced_section(data, "session", _degraded)
+    taskrunner_data = _coerced_section(data, "taskrunner", _degraded)
+    cron_history_data = _coerced_section(data, "cron_history", _degraded)
+    memory_data = _coerced_section(data, "memory", _degraded)
+    knowledge_data = _coerced_section(data, "knowledge", _degraded)
+    telegram_data = _coerced_section(data, "telegram", _degraded)
+    weixin_data = _coerced_section(data, "weixin", _degraded)
+    whatsapp_data = _coerced_section(data, "whatsapp", _degraded)
+    feishu_data = _coerced_section(data, "feishu", _degraded)
+    discord_data = _coerced_section(data, "discord", _degraded)
+    webex_data = _coerced_section(data, "webex", _degraded)
+    wakatime_data = _coerced_section(data, "wakatime", _degraded)
+    teams_data = _coerced_section(data, "teams", _degraded)
+    imessage_data = _coerced_section(data, "imessage", _degraded)
+    slack_data = _coerced_section(data, "slack", _degraded)
+    publish_data = _coerced_section(data, "publish", _degraded)
+    # A malformed allowed_destinations is the same class as a malformed
+    # section one level down, in two shapes. A non-LIST value:
+    # iterating it either crashes load() with a TypeError (a scalar — a
+    # config typo must not abort gateway startup) or yields garbage (a
+    # dict iterates as its keys, a string as its characters). A list with
+    # non-string/empty ENTRIES: the parse filter drops them, so an
+    # all-invalid narrowing like [1, 2] parses to [] — indistinguishable
+    # from "no restriction configured", the exact silent widening this fix
+    # exists to stop. Both shapes record the degradation so the publish
+    # gate denies, and parse from what safely remains. Validation cannot
+    # repair these values (publish.allowed_destinations is fail-closed
+    # there — repairing an OPEN default silently widens), so the loader
+    # must be the layer that survives them.
+    _dests_raw = _sections.SectionReader(PublishConfig, publish_data).get("allowed_destinations")
+    if not isinstance(_dests_raw, list):
+        _degraded.add("publish")
+        _OBSERVED_DEGRADED_SECTIONS.add("publish")
+        logger.warning(
+            "config: 'publish.allowed_destinations' is not a list (got %s) "
+            "— treating the publish section as degraded; publishing is "
+            "denied until the file is fixed and the gateway restarted",
+            type(_dests_raw).__name__,
+        )
+        _dests_raw = []
+    elif any(not (isinstance(_d, str) and _d) for _d in _dests_raw):
+        _degraded.add("publish")
+        _OBSERVED_DEGRADED_SECTIONS.add("publish")
+        logger.warning(
+            "config: 'publish.allowed_destinations' carries entr(y/ies) "
+            "that are not non-empty strings — treating the publish section "
+            "as degraded; publishing is denied until the file is fixed and "
+            "the gateway restarted",
+        )
+        _dests_raw = []
+    # Back-compat: this channel's config section was renamed
+    # "wechat" -> "wecom". Fall back to the legacy key so existing
+    # installs keep their WeCom settings on upgrade (read-only alias;
+    # no broader migration machinery).
+    # Alias-aware: record under whichever key the operator actually used, so
+    # the warning names the section they can go and fix.
+    _wecom_key = "wecom" if "wecom" in data else "wechat"
+    wecom_data = _coerced_section(data, _wecom_key, _degraded)
+    dashboard_data = _coerced_section(data, "dashboard", _degraded)
+    # Persistent is the compatibility default only when a readable config
+    # genuinely omits this field. If the dashboard section or either config
+    # file was unreadable, the missing value may have been a privacy choice
+    # we could not recover, so new chats must fail closed to Temporary until
+    # the operator fixes the file and restarts the gateway.
+    if (
+        "dashboard" in _degraded
+        or "dashboard" in _OBSERVED_DEGRADED_SECTIONS
+        or DEGRADED_WHOLE_CONFIG in _OBSERVED_DEGRADED_SECTIONS
+    ):
+        dashboard_data["default_memory_mode"] = "temporary"
+    stt_data = _coerced_section(data, "stt", _degraded)
+    computer_use_data = _coerced_section(data, "computer_use", _degraded)
+    instances_data = _coerced_section(data, "instances", _degraded)
+    instances = _sections.SectionReader(InstancesConfig, instances_data)
+    connect_timeout_raw = instances.get("connect_timeout_secs")
+    mint_timeout_raw = instances.get("mint_timeout_secs")
+    mcp_gateway_data = _coerced_section(data, "mcp_gateway", _degraded)
+    mcp_data = _coerced_section(data, "mcp", _degraded)
+    heartbeat = _sections.SectionReader(
+        HeartbeatConfig, _coerced_section(data, "heartbeat", _degraded)
+    )
+    heartbeat_default_deliver = str(heartbeat.get("default_deliver")).strip().lower()
+    if heartbeat_default_deliver not in ("slack", "dashboard"):
+        heartbeat_default_deliver = heartbeat.default("default_deliver")
+    # A stored document written before this key existed has no "monitoring"
+    # object at all, and that is the case that must keep working: the miss
+    # resolves to the dataclass default, which is the off position. So an
+    # already-installed gateway needs nothing written to be correct here --
+    # only a gateway that wants the key ON writes it, and Settings does
+    # that. (The hazard this avoids belongs to a SHIPPED DEFAULT that
+    # CHANGES: config.json materializes every key, so the stored value
+    # outranks the new default forever. Adding a key has no stored value to
+    # outrank it.)
+    monitoring_data = _coerced_section(data, "monitoring", _degraded)
+    monitoring_prefer_structured_arming = _sections.SectionReader(
+        MonitoringConfig, monitoring_data
+    ).read("prefer_structured_arming", _safe_bool)
+    tunnel_data = _coerced_section(data, "tunnel", _degraded)
+    skills_data = _coerced_section(data, "skills", _degraded)
+    session_summary_data = _coerced_section(data, "session_summary", _degraded)
+    messaging_data = _coerced_section(data, "messaging", _degraded)
+    telemetry_data = _coerced_section(data, "telemetry", _degraded)
+    watchdog_data = _coerced_section(data, "watchdog", _degraded)
+    decisions_data = _coerced_section(data, "decisions", _degraded)
+    resource_limits_data = _coerced_section(data, "resource_limits", _degraded)
+
+    # Parse agents section into dict[str, KiroCrewAgentConfig]
+    raw_agents = data.get("agents", {})
+    agents: dict[str, KiroCrewAgentConfig] = {}
+    if isinstance(raw_agents, dict):
+        for name, entry in raw_agents.items():
+            if isinstance(entry, dict):
+                crew = _sections.SectionReader(KiroCrewAgentConfig, entry)
+                # config.json is hand-editable (and agent-writable), so a
+                # non-string model (e.g. `model: 123`) must not survive the
+                # load — it would reach normalize_agent_model().strip() and
+                # raise AttributeError from the resolver instead of simply
+                # being ignored.
+                raw_model = crew.get("model")
+                # Same guard as model: a non-string triggers (e.g. `1`) must
+                # not survive load — select_crew's roster calls .strip() on it.
+                raw_triggers = crew.get("triggers")
+                # Same guard family: the label is rendered verbatim by every
+                # roster surface, so a non-string collapses to "" (show the
+                # name) rather than reaching the wire.
+                raw_display_name = crew.get("display_name")
+                agents[name] = KiroCrewAgentConfig(
+                    member_id=crew.get("member_id"),
+                    kiro_agent=crew.get("kiro_agent"),
+                    workspace=crew.get("workspace"),
+                    memory_store=crew.get("memory_store"),
+                    model=raw_model if isinstance(raw_model, str) else crew.default("model"),
+                    # Same hand-editable-config guard: an unknown level must
+                    # collapse to "" (inherit) rather than travel to the
+                    # provider, where kiro-cli rejects the whole overlay.
+                    reasoning_effort=coerce_effort(crew.get("reasoning_effort")),
+                    display_name=(
+                        raw_display_name
+                        if isinstance(raw_display_name, str)
+                        else crew.default("display_name")
+                    ),
+                    description=crew.get("description"),
+                    triggers=(
+                        raw_triggers if isinstance(raw_triggers, str) else crew.default("triggers")
+                    ),
+                    source=crew.get("source"),
+                    # Hand-editable config: a quoted "true" or a stray int
+                    # must not become a truthy star, so only a real bool
+                    # is honoured and anything else reads as un-starred.
+                    starred=crew.read("starred", _safe_bool),
+                    # Same guard family as model/triggers: config.json is
+                    # hand-editable, so a junk value must collapse to 0
+                    # (inherit the global window), never crash the load.
+                    # lo=0 keeps a negative override from arming an
+                    # instant-cancel window.
+                    watchdog_tool_stall_suspect_secs=crew.read(
+                        "watchdog_tool_stall_suspect_secs", _safe_float, lo=0.0
+                    ),
+                    watchdog_tool_stall_hard_cap_secs=crew.read(
+                        "watchdog_tool_stall_hard_cap_secs", _safe_float, lo=0.0
+                    ),
+                    telegram_account=crew.get("telegram_account"),
+                    session_color=_safe_color(crew.get("session_color")),
+                    # Module-qualified on purpose: the facade's `from
+                    # sections import` list is a frozen pre-split snapshot
+                    # (test_config_module_boundaries), and post-split
+                    # internals are reached through the module, not
+                    # re-exported from here.
+                    avatar=_sections._safe_avatar(crew.get("avatar")),
+                )
+
+    # Migrate workspaces from flat or structured format
+    raw_workspaces = data.get("workspaces", {})
+    if not isinstance(raw_workspaces, dict):
+        # Reported, not just replaced: a gate that fences the memory
+        # workspaces (folder steering's silo fence) reads this table to
+        # learn WHERE the workspaces are, and an operator's absolute
+        # workspace directory that this load could not read is a directory
+        # the fence would otherwise not know to cover. Same posture as the
+        # ``dashboard.tailscale`` key: the consumer decides to fail closed.
+        logger.warning(
+            "Config 'workspaces' is not a JSON object (got %s); the workspace "
+            "table is unavailable for this load",
+            type(raw_workspaces).__name__,
+        )
+        _degraded.add(_resolution.DEGRADED_WORKSPACES)
+        raw_workspaces = {}
+    workspaces = _migrate_workspaces(raw_workspaces)
+
+    # Parse memory_stores; synthesize default if missing.
+    #
+    # A store NAME becomes a single path segment under
+    # ``memory_stores.MEMORY_STORES_DIR_NAME``, so the shape rule is applied
+    # here too — at BOOT, where the operator can see it — rather than only at
+    # the first memory write. Reported, never REPAIRED: the entry is kept
+    # verbatim so a ``to_dict()``/``save()`` round-trip cannot erase the
+    # operator's own declaration, and no name is rewritten into a usable one,
+    # because sanitizing ``../work`` or ``Work`` into ``work`` is the one
+    # thing that would merge two crews' memory into one directory.
+    #
+    # Kept, but not usable: ``memory_stores.usable_store_names`` drops a
+    # malformed name from the resolvable set, so a crew bound to it degrades
+    # at ``resolve_agent_bindings`` instead of carrying the name to a
+    # resolver that would raise on it.
+    raw_stores = data.get("memory_stores", {})
+    memory_stores: dict[str, MemoryStoreConfig] = {}
+    if isinstance(raw_stores, dict) and raw_stores:
+        for name, entry in raw_stores.items():
+            if not isinstance(entry, dict):
+                continue
+            defect = memory_store_name_defect(name)
+            if defect is not None:
+                logger.warning(
+                    "memory_stores: store name %r is unusable (%s); any crew "
+                    "bound to it cannot resolve a memory directory",
+                    name,
+                    defect,
+                )
+            store = _sections.SectionReader(MemoryStoreConfig, entry)
+            memory_stores[name] = MemoryStoreConfig(
+                owner_member_id=store.get("owner_member_id"),
+                description=store.get("description"),
+                embedding_provider=store.get("embedding_provider"),
+                owner_member=store.get("owner_member"),
+                memory_version=store.get("memory_version"),
+            )
+    if not memory_stores:
+        memory_stores[DEFAULT_MEMORY_STORE] = MemoryStoreConfig()
+
+    # The top-level keys read against KiroCrewConfig's own fields, and the slack
+    # keys that land on top-level fields under the same names. Against the base
+    # config, not *config_cls*: an omitted key reads KiroCrewConfig's default even
+    # when a subclass is built.
+    top = _sections.SectionReader(_TOP_LEVEL_DEFAULTS, data)
+    slack_top = _sections.SectionReader(_TOP_LEVEL_DEFAULTS, slack_data)
+
+    # Parse top-level default_agent and default_memory_store
+    default_agent_val = top.get("default_agent")
+    if not isinstance(default_agent_val, str):
+        default_agent_val = top.default("default_agent")
+    default_memory_store_val = top.get("default_memory_store")
+    if not isinstance(default_memory_store_val, str):
+        default_memory_store_val = top.default("default_memory_store")
+    # Reported, not repaired, for the same reason as the store names above.
+    # Legacy default_memory_store is retained for V1 compatibility. Member
+    # member resolution never uses it as a fallback or a filesystem path.
+    elif memory_store_name_defect(default_memory_store_val) is not None:
+        logger.warning(
+            "default_memory_store %r is not a usable store name (%s); preserved "
+            "for V1 compatibility but not used for member memory resolution",
+            default_memory_store_val,
+            memory_store_name_defect(default_memory_store_val),
+        )
+
+    # Capture unknown top-level sections verbatim so a section this core does
+    # not model (e.g. an edition-contributed section written by a companion)
+    # survives the load()->to_dict()->save() round-trip instead of being
+    # silently dropped. ``meta`` is stamped by save() itself, so it is never
+    # treated as an unknown section to preserve.
+    #
+    # Captured from the BASE view, not the merged one: for any section the
+    # overlay touched, ``base_shadow`` holds what config.json itself said.
+    # Capturing the merged value would make save() emit the overlay's leaf,
+    # which _subtract_overlay then removes — deleting the base file's own
+    # value. See _shadowed_base_sections. Sections the overlay did not touch
+    # are identical in both views.
+    capture_view = {**data, **base_shadow}
+    extra_sections = {
+        k: v
+        for k, v in capture_view.items()
+        if k not in _KNOWN_CONFIG_SECTIONS and k not in CONFIG_RESERVED_TOP_KEYS
+    }
+
+    cfg = config_cls(
+        agent=_build_agent_config(agent_data),
+        session=_build_session_config(session_data),
+        taskrunner=_build_taskrunner_config(taskrunner_data),
+        cron_history=_build_cron_history_config(cron_history_data),
+        messaging=_build_messaging_config(messaging_data),
+        # watchdog is advertised in config-baseline.json, served by
+        # /api/config/schema, and read by acp/session_handle.py, so load()
+        # passes this kwarg — without it config.json values would be
+        # silently ignored and the dataclass defaults would always win.
+        watchdog=_build_watchdog_config(watchdog_data),
+        resource_limits=ResourceLimitsConfig.from_raw(resource_limits_data),
+        telemetry=_build_telemetry_config(telemetry_data),
+        memory=_build_memory_config(memory_data),
+        knowledge=_build_knowledge_config(knowledge_data),
+        telegram=_build_telegram_config(telegram_data),
+        weixin=_build_weixin_config(weixin_data),
+        whatsapp=_build_whatsapp_config(whatsapp_data),
+        discord=_build_discord_config(discord_data),
+        webex=_build_webex_config(webex_data),
+        wakatime=_build_wakatime_config(wakatime_data),
+        imessage=_build_imessage_config(imessage_data),
+        teams=_build_teams_config(teams_data),
+        slack=_build_slack_config(slack_data),
+        publish=_build_publish_config(_dests_raw, publish_data),
+        wecom=_build_wecom_config(wecom_data),
+        feishu=_build_feishu_config(feishu_data),
+        dashboard=_build_dashboard_config(_degraded, dashboard_data),
+        tunnel=_build_tunnel_config(tunnel_data),
+        hooks=top.get("hooks"),
+        agents=agents,
+        default_agent=default_agent_val,
+        workspaces=workspaces,
+        default_workspace=top.get("default_workspace"),
+        memory_stores=memory_stores,
+        default_memory_store=default_memory_store_val,
+        stt=_build_stt_config(stt_data),
+        # Every numeric knob is clamped to the same ceiling the MCP tool
+        # schemas enforce, so a hand-edited config.json cannot ask for an
+        # unbounded accessibility walk or a full-resolution screenshot.
+        # There is deliberately NO ``enabled`` key read here — see
+        # ComputerUseConfig's docstring and computer_use_state_path().
+        computer_use=_build_computer_use_config(computer_use_data),
+        # ``_coerce_bool``, not ``_safe_bool``: this one key decides whether
+        # an unattended installer runs, and the two wrong answers are not
+        # symmetric. A hand-edited ``"auto_update": "false"`` is truthy to
+        # the loop, and ``_safe_bool`` would fold it (and ``0``, and
+        # ``null``) to this field's True default — installing on a host whose
+        # owner wrote the opposite. So a recognized spelling is honoured, and
+        # anything else unreadable falls back to OFF: an update not applied
+        # is a notification, while one applied against the owner's wish is a
+        # restart they did not ask for. An ABSENT key still defaults ON.
+        auto_update=(
+            top.default("auto_update")
+            if "auto_update" not in data
+            else _coerce_bool(data.get("auto_update"), False)
+        ),
+        connections_ui=top.read("connections_ui", _safe_bool),
+        _degraded_sections=frozenset(_degraded | _OBSERVED_DEGRADED_SECTIONS),
+        timezone=top.get("timezone"),
+        snapshot_dir=top.get("snapshot_dir"),
+        registries=[
+            _registry_entry(r)
+            for r in (data.get("registries") or [])
+            if isinstance(r, dict) and r.get("repo")
+        ],
+        mcp_gateway=_build_mcp_gateway_config(mcp_gateway_data),
+        mcp=_build_mcp_config(mcp_data),
+        instances=_build_instances_config(connect_timeout_raw, instances_data, mint_timeout_raw),
+        heartbeat=HeartbeatConfig(default_deliver=heartbeat_default_deliver),
+        monitoring=_build_monitoring_config(monitoring_data, monitoring_prefer_structured_arming),
+        decisions=DecisionsConfig.from_raw(decisions_data),
+        skills=_build_skills_config(skills_data),
+        session_summary=_build_session_summary_config(session_summary_data),
+        slack_channels={
+            ch_id: ChannelConfig.from_dict(ch_data)
+            for ch_id, ch_data in (
+                slack_data.get("channels", {})
+                if isinstance(slack_data.get("channels"), dict)
+                else {}
+            ).items()
+            if isinstance(ch_data, dict)
+        },
+        slack_dm_activation=_validate_activation(
+            slack_data.get("dm_activation", top.default("slack_dm_activation"))
+        ),
+        observe_max_messages=max(1, slack_top.read("observe_max_messages", _safe_int)),
+        observe_ttl_hours=max(0.0, slack_top.read("observe_ttl_hours", _safe_float)),
+        _extra_sections=extra_sections,
+    )
+
+    # Unknown keys nested inside a modelled section. Captured AFTER
+    # construction because deciding what is unknown needs the built
+    # dataclasses' own field sets, not a second hand-maintained list that
+    # could drift from them. Same base-not-merged view as _extra_sections
+    # above, for the same reason.
+    cfg._extra_keys = _resolution.capture_extra_section_keys(capture_view, cfg)
+
+    cfg._base_unreadable = doc.base_unreadable
+    return cfg
+
+
+def persist_write_back(cfg: KiroCrewConfig, doc: ConfigDocument) -> None:
+    """Run the write-back migration a LOADED document makes due, in memory and on disk.
+
+    Decides the pending migrations from *cfg* and *doc* -- flat workspace strings, a
+    missing default crew or ``default_agent`` (both seeded into *cfg* here), the
+    one-shot ``connections_ui`` strip, the superseded defaults *doc* may adopt and the
+    legacy ``skills.lazy_load`` rewrite -- then applies them to ``config.json`` as a
+    delta under the write lock (:func:`_persist_config_migration`) and moves *cfg* to
+    each adopted value only once the write confirmed it. Skips the disk write for a
+    load that degraded a section, so the malformed bytes stay as evidence. Never
+    raises: a failure is logged and the migration retries on a later load. Drops the
+    validated-data cache when an adoption did not reach disk. An unloaded document
+    has nothing to migrate and returns at once: a plain read of a never-set-up home
+    must not create config files.
+    """
+    if not doc.loaded:
+        return
+    path = doc.path
+    data = doc.data
+    adoptable = doc.adoptable
+    legacy_lazy_stamp = doc.legacy_lazy_stamp
+    local_data = doc.overlay
+    # The workspace table as build_config read it: a value that is not an object
+    # was reported there and holds nothing to migrate.
+    raw_workspaces = data.get("workspaces", {})
+    if not isinstance(raw_workspaces, dict):
+        raw_workspaces = {}
+
+    # Write-back migration: if the on-disk config has legacy format
+    # (flat workspace strings, missing sections), back up the original
+    # and save the migrated version.  One-shot — subsequent loads see
+    # the canonical format and skip.
+    #
+    # The in-memory half below mutates `cfg` and RECORDS which migrations it
+    # decided on; the on-disk half re-reads config.json inside the write lock
+    # and applies exactly those as a delta (see _persist_config_migration),
+    # rather than `cfg.save()`, which would re-serialize this load's whole
+    # snapshot and drop any config write that landed after this load's read.
+    #
+    # Bound BEFORE the try: the ``finally`` at the end reads them, and an
+    # exception raised before their assignments would turn a logged write-back
+    # failure into a NameError out of load().
+    adopt_keys: set[str] = set()
+    adoption_landed = False
+    confirmed_adoptions: list[str] = []
+
+    try:
+        pending: set[str] = set()
+        # Flat workspace strings → need migration to {"dir": ...}
+        for v in raw_workspaces.values():
+            if isinstance(v, str):
+                pending.add(MIGRATE_WORKSPACES)
+                break
+
+        # One-time migration: create default agent when none exists
+        if not cfg.agents:
+            kiro = cfg.agent.default_agent or "kirocrew"
+            cfg.agents["default"] = KiroCrewAgentConfig(
+                kiro_agent=kiro,
+                workspace="default",
+                memory_store="default",
+            )
+            pending.add(MIGRATE_AGENTS)
+        if not cfg.default_agent or cfg.default_agent not in cfg.agents:
+            # Prefer "default" if it exists, otherwise use first available agent
+            if "default" in cfg.agents:
+                cfg.default_agent = "default"
+            elif cfg.agents:
+                cfg.default_agent = next(iter(cfg.agents))
+            else:
+                cfg.default_agent = "default"
+            pending.add(MIGRATE_DEFAULT_AGENT)
+
+        # One-shot launch migration for ``connections_ui`` (see the marker
+        # constant's docstring). Decided on the BASE document, not the
+        # merged view: the overlay is user-owned prose we never rewrite,
+        # and the stale materialization only ever landed in config.json.
+        connections_marker = config_dir() / CONNECTIONS_UI_MIGRATION_MARKER
+        connections_migrating = False
+        if not connections_marker.exists():
+            if data.get("connections_ui") is False:
+                # In-memory half: this very load must already serve the
+                # launch default — the strip below is the on-disk echo.
+                cfg.connections_ui = True
+                pending.add(MIGRATE_CONNECTIONS_UI)
+            connections_migrating = True
+
+        # Adopt the auto-adopting superseded defaults. The in-memory half is
+        # applied BELOW, after the write is confirmed -- never here. Applying it
+        # eagerly would let a failed write leave the running config holding a
+        # value the stored document does not agree with, invisibly: the operator
+        # reads 1800 in config.json while the gateway runs 10800.
+        #
+        # In memory still matters as much as the file, which is why it happens at
+        # all: the gateway reads these budgets once at startup, so a disk-only
+        # fix would leave the very run that performed it still on the old value,
+        # and "upgraded, restarted, nothing changed" is the complaint.
+        adopt_keys = {e.dotted_key for e in adoptable}
+        if adopt_keys:
+            pending.add(MIGRATE_SUPERSEDED_DEFAULTS)
+        # The legacy lazy_load rewrite rides the same write, ledger and
+        # confirmed-only in-memory half as an adoption (see its id's docstring).
+        if legacy_lazy_stamp is not None:
+            pending.add(_migration.MIGRATE_SKILLS_LAZY_LOAD)
+
+        needs_migration = bool(pending)
+
+        persisted = True
+        # Tracked SEPARATELY from ``persisted``, which starts True so the
+        # connections_ui marker still lands on a load that needed no migration
+        # at all. This one starts False and is set only where the adoption
+        # actually reached disk, so every OTHER way out -- a contended-lock
+        # deferral, the degraded-sections branch below, an exception caught by
+        # the handler at the end -- leaves it False and drops the cache in the
+        # ``finally``.
+        if needs_migration and not cfg._degraded_sections:
+            persisted = _persist_config_migration(
+                path,
+                frozenset(pending),
+                default_kiro_agent=cfg.agent.default_agent or "kirocrew",
+                adopt_keys=frozenset(adopt_keys),
+                confirmed_adoptions=confirmed_adoptions,
+            )
+            adoption_landed = persisted
+            # In memory only for keys the migration CONFIRMED it removed, and
+            # only where the overlay does not supply the field: there the stale
+            # base bytes are cleared like any other, but the effective value
+            # belongs to ``config.local.json`` and is the operator's live choice.
+            by_key = {e.dotted_key: e for e in adoptable}
+            for key in confirmed_adoptions:
+                entry = by_key.get(key)
+                if entry is not None:
+                    logger.warning(
+                        "config: adopted current default for %s; removed stored value %r. "
+                        "To restore it: kirocrew config set %s %s",
+                        key,
+                        entry.old_default,
+                        key,
+                        entry.old_default,
+                    )
+                if entry is not None and not _overlay_supplies(local_data, key):
+                    _adopt_in_memory(cfg, key, entry.old_default)
+            if _migration.LAZY_LOAD_KEY in confirmed_adoptions:
+                overlay_sets_it = _overlay_supplies(local_data, _migration.LAZY_LOAD_KEY)
+                logger.warning(
+                    "config: removed skills.lazy_load=false from config.json: Kiro "
+                    "Crew %s stored it when false was the default full skills "
+                    "listing, and false now selects the short skill entry. %s To "
+                    "choose the short entry: kirocrew config set skills.lazy_load false",
+                    legacy_lazy_stamp,
+                    (
+                        "config.local.json still sets the key, and its value applies."
+                        if overlay_sets_it
+                        else "The current default (the ranked skill index) applies."
+                    ),
+                )
+                if not overlay_sets_it:
+                    _adopt_in_memory(cfg, _migration.LAZY_LOAD_KEY, False)
+        elif needs_migration:
+            # This load DISCARDED something (a malformed section, an
+            # unreadable file). The write-back serializes only the parsed
+            # fields, so writing back here would replace the operator's
+            # malformed narrowing with clean defaults — erasing the only
+            # on-disk evidence and turning the denial into silent
+            # allow-all at the next restart. Keep the malformed
+            # bytes; every future process re-observes and re-denies until
+            # the operator actually fixes the file. Migration re-runs on
+            # the first clean load.
+            logger.warning(
+                "config: skipping write-back migration — this load "
+                "degraded section(s) %s and writing back would erase the "
+                "evidence; fix the file to clear",
+                sorted(cfg._degraded_sections),
+            )
+
+        # Record the connections_ui boundary only after a pass that was
+        # allowed to act on it AND whose write-back actually landed. A
+        # degraded load skips both the strip and the marker; a contended
+        # lock makes _persist_config_migration return False with nothing
+        # written, and the marker MUST defer with the strip — marker
+        # without strip would freeze the stale false as a deliberate
+        # opt-out forever. (The already-migrated-by-another-writer path
+        # also returns False; the marker then lands on the next load,
+        # which finds nothing to strip. One extra boot, same endpoint.)
+        # Failure to write the marker itself is logged and retried next
+        # load — the strip's own condition makes the retry converge.
+        if connections_migrating and persisted and not cfg._degraded_sections:
+            atomic_write(
+                connections_marker,
+                json.dumps(
+                    {
+                        "migrated_at": datetime.now(timezone.utc).isoformat(),
+                        "stripped_stale_false": MIGRATE_CONNECTIONS_UI in pending,
+                    },
+                    indent=2,
+                )
+                + "\n",
+            )
+    except Exception as e:
+        # Migration write-back is best-effort; never block startup.
+        logger.warning("Config write-back failed: %s", e)
+    finally:
+        # An adoption that did NOT reach disk must not be frozen behind the
+        # validated-data cache. Only a load that READS the base document can
+        # decide an adoption (``adoptable`` is empty on a cache hit, by design),
+        # so a read-and-skip that left its document cached would have every
+        # later load serve the stale value and never retry -- the ceiling the
+        # operator upgraded to fix would come back and stay. In a ``finally``
+        # rather than beside the write, because the write is skipped by more
+        # than one path (a contended lock, an exception) and each leaves the
+        # same stale cache entry.
+        #
+        # The degraded-sections branch is the exception, and it is excluded on
+        # purpose. Its retry condition is not "the next load" but "the operator
+        # fixes the file and restarts the gateway" -- degradation observations
+        # are sticky for the life of a process (``_OBSERVED_DEGRADED_SECTIONS``),
+        # so until then the write is refused every time, and dropping the cache
+        # buys nothing except a full re-read and re-parse of config.json on
+        # EVERY load for as long as the two conditions coexist. After the
+        # restart the fixed file's fingerprint misses the (empty) cache and the
+        # adoption retries on that first load -- no invalidation needed.
+        if (
+            (adopt_keys or legacy_lazy_stamp is not None)
+            and not adoption_landed
+            and not cfg._degraded_sections
+        ):
+            _invalidate_config_cache()
+
+
+# ---------------------------------------------------------------------------
+# Provider factory seam.
+# ---------------------------------------------------------------------------
 def build_provider_factory(cfg: "KiroCrewConfig") -> Callable:
     """Return the LLM-provider factory for *cfg*, via the platform seam.
 
@@ -5685,20 +5877,46 @@ def build_provider_factory(cfg: "KiroCrewConfig") -> Callable:
 
 
 # ---------------------------------------------------------------------------
-# Agent resolver and kiro agent validation
+# Published snapshots: state a load or scan publishes so event-loop readers do no
+# config I/O (agent specs, the alias table, the compaction threshold, the timezone).
 # ---------------------------------------------------------------------------
-
-
-def _workspace_name_for_dir(config: KiroCrewConfig, ws_dir: Path) -> str:
-    """Find the workspace name whose dir matches *ws_dir*."""
-    for name, ws_cfg in config.workspaces.items():
-        if Path(ws_cfg.dir) == ws_dir:
-            return name
-    return "default"
-
-
 _MATERIALIZED_AGENTS: frozenset[str] = frozenset()
+# Filename stem -> declared name, for the configs whose file is NOT named after
+# the agent (a package installs ``<Package>-<agent>.json`` declaring ``<agent>``).
+# Rewritten IN PLACE by each full refresh, never rebound: the integration
+# harness clears it between boots like every other home-derived dict, and its
+# residue witness compares a dict by identity. See :func:`dispatch_kiro_agent`.
+_MATERIALIZED_STEMS: dict[str, str] = {}
 _MATERIALIZED_AGENTS_READY = False
+# Whether the snapshot now installed came from a scan that read every spec.
+# Published with the snapshot, under the same lock, because the healer reads the
+# INSTALLED snapshot, which a later partial scan may have replaced since the
+# refresh that called it scanned (see :func:`reset_dangling_default_agent`).
+_MATERIALIZED_COMPLETE = False
+# Every name a landed snapshot or a publish has let a binding dispatch in this
+# process: declared names and the file names mapped to one. Updated in place,
+# never rebound. A name in it that the current snapshot does not declare was
+# REMOVED, which is the evidence :func:`reset_dangling_default_agent` needs;
+# keeping it here rather than diffing two consecutive scans means a refresh that
+# does not heal cannot use the evidence up before one that does.
+#
+# An insertion-ordered dict used as a set, bounded by :func:`_remember_seen`:
+# every name the directory still declares moves to the end on each scan, so the
+# oldest entries are the removals seen longest ago, and those go first when the
+# count passes its bound.
+_MATERIALIZED_SEEN: dict[str, None] = {}
+# The directory is user-writable and its files choose these names, so the
+# retained maps are bounded where they are kept: at most this many entries each,
+# and no name (a stem, or the name it maps to) longer than this. A name past the
+# length bound is not recorded. For the stem map that leaves the binding
+# dispatched verbatim; for the removal evidence it means a default bound to that
+# name is never reset, which is the healer's answer to anything it cannot be
+# sure of.
+_MATERIALIZED_SEEN_MAX = 4096
+_MATERIALIZED_SEEN_NAME_MAX_CHARS = 256
+# What the last bounded write dropped, so a diagnostic is written when that
+# changes rather than on every refresh of an unchanged directory.
+_MATERIALIZED_LAST_DROPPED: dict[str, int] = {}
 # Bumped by every publish. A refresh samples it before scanning and, if it moved
 # while the scan was in flight, unions instead of replacing — otherwise a scan
 # that globbed the directory BEFORE a registration wrote into it would assign its
@@ -5717,8 +5935,73 @@ _MATERIALIZED_REFRESH_APPLIED = 0
 _MATERIALIZED_AGENTS_LOCK = threading.Lock()
 
 
+def _report_dropped(what: str, dropped: int) -> None:
+    """One aggregate line when a bounded write's drop count changes.
+
+    Every bounded map reports through here, once per landed scan or publish
+    and only when the count differs from the last report for *what*, so an
+    unchanged oversized directory is reported once, not on every refresh.
+    """
+    if _MATERIALIZED_LAST_DROPPED.get(what, 0) == dropped:
+        return
+    _MATERIALIZED_LAST_DROPPED[what] = dropped
+    if dropped:
+        logger.warning(
+            "agents directory: %d %s not kept (bounds: %d entries, %d characters per name)",
+            dropped,
+            what,
+            _MATERIALIZED_SEEN_MAX,
+            _MATERIALIZED_SEEN_NAME_MAX_CHARS,
+        )
+
+
+def _remember_seen(names: Iterable[str]) -> None:
+    """Record *names* in ``_MATERIALIZED_SEEN`` as the newest entries, within its bounds.
+
+    Caller holds ``_MATERIALIZED_AGENTS_LOCK``. A name already present moves to
+    the end, so what the directory still declares stays newest and the oldest
+    entries are stale removal evidence; those are evicted first once the count
+    passes ``_MATERIALIZED_SEEN_MAX``. Overlong names and evictions are counted
+    and reported in one line (see :func:`_report_dropped`).
+    """
+    dropped = 0
+    for name in names:
+        if len(name) > _MATERIALIZED_SEEN_NAME_MAX_CHARS:
+            dropped += 1
+            continue
+        _MATERIALIZED_SEEN.pop(name, None)
+        _MATERIALIZED_SEEN[name] = None
+    while len(_MATERIALIZED_SEEN) > _MATERIALIZED_SEEN_MAX:
+        del _MATERIALIZED_SEEN[next(iter(_MATERIALIZED_SEEN))]
+        dropped += 1
+    _report_dropped("removal-evidence name(s)", dropped)
+
+
+# Whether the last :func:`_scan_materialized_index` on THIS thread read every
+# candidate spec. Thread-local, not returned: the scan's ``(names, stems)``
+# contract has other callers, and each refresh runs its scan and reads this on
+# one thread. A scan that skipped an unreadable or unparseable spec leaves that
+# agent's name out of the snapshot although its file is still there, so its
+# absence is not evidence of a removal (see :func:`refresh_materialized_agents`).
+_SCAN_STATE = threading.local()
+
+
 def _scan_materialized_agents(agents_dir: Path) -> frozenset[str]:
     """Every agent name declared by the kiro agent configs in *agents_dir*.
+
+    See :func:`_scan_materialized_index`, which this reads the names half of.
+    """
+    return _scan_materialized_index(agents_dir)[0]
+
+
+def _scan_materialized_index(agents_dir: Path) -> tuple[frozenset[str], dict[str, str]]:
+    """``(declared names, stem -> declared name)`` for the configs in *agents_dir*.
+
+    The names half is described below. The second half maps a filename stem to
+    the name its config declares, only where the two differ, the stem is not
+    itself a declared name, and exactly one parsed config has that stem. It lets
+    a binding that recorded the FILE name (``KiroPkg-captain`` for a config
+    declaring ``captain``) still dispatch the agent the file declares.
 
     Each config contributes its DECLARED ``name`` field; the filename stem is
     used only as a fallback when a config declares no name, since it is then the
@@ -5730,16 +6013,20 @@ def _scan_materialized_agents(agents_dir: Path) -> frozenset[str]:
     glob and the per-file reads, so callers must invoke it OFF the event loop.
     """
     names: set[str] = set()
+    stems: dict[str, str] = {}
+    ambiguous: set[str] = set()
     # Deferred import: `hooks` reaches back into this module for config paths, so
     # the edge must resolve lazily. A failure here propagates to
     # refresh_materialized_agents, which logs and leaves the snapshot untouched —
     # fail-closed, rather than falling back to an unguarded read.
     from kiro_crew.hooks import safe_read_file
 
+    _SCAN_STATE.complete = True
     try:
         candidates = iter_agent_spec_files(agents_dir)
     except OSError:
-        return frozenset()
+        _SCAN_STATE.complete = False
+        return frozenset(), {}
     for af in candidates:
         try:
             # Through the sensitive-path gate, not a bare read: this directory is
@@ -5750,6 +6037,8 @@ def _scan_materialized_agents(agents_dir: Path) -> frozenset[str]:
             # refused entry is skipped by the same handler as an unreadable one.
             data = parse_agent_spec_text(safe_read_file(str(af)), af)
         except (ValueError, OSError):
+            # Its agent may be one this scan now leaves out; the scan is partial.
+            _SCAN_STATE.complete = False
             continue
         # Skip stray non-object JSON a user may have dropped in the dir. The
         # filename stem is only trusted AFTER the file parses as an agent config:
@@ -5769,12 +6058,35 @@ def _scan_materialized_agents(agents_dir: Path) -> frozenset[str]:
         declared = data.get("name")
         if isinstance(declared, str) and declared:
             names.add(declared)
+            if declared != af.stem:
+                if af.stem in stems and stems[af.stem] != declared:
+                    ambiguous.add(af.stem)
+                stems[af.stem] = declared
         else:
             names.add(af.stem)
-    return frozenset(names)
+    # A stem that is itself some agent's declared name already dispatches that
+    # agent; one two configs share is no evidence of which was meant. The map is
+    # kept for the process, so it is bounded here, where it is built: an
+    # overlong stem or name is left out (the binding then dispatches verbatim),
+    # and past the count bound the rest are dropped. Both are reported once.
+    kept: dict[str, str] = {}
+    dropped = 0
+    for stem, name in stems.items():
+        if stem in names or stem in ambiguous:
+            continue
+        if (
+            len(stem) > _MATERIALIZED_SEEN_NAME_MAX_CHARS
+            or len(name) > _MATERIALIZED_SEEN_NAME_MAX_CHARS
+            or len(kept) >= _MATERIALIZED_SEEN_MAX
+        ):
+            dropped += 1
+            continue
+        kept[stem] = name
+    _report_dropped("file-name mapping(s)", dropped)
+    return frozenset(names), kept
 
 
-def refresh_materialized_agents() -> None:
+def refresh_materialized_agents(*, heal_default: bool = False) -> None:
     """Rescan the kiro agents directory into the in-memory snapshot.
 
     MUST be called off the event loop — it globs a directory and reads every
@@ -5786,6 +6098,18 @@ def refresh_materialized_agents() -> None:
     :func:`resolve_agent_bindings` on every turn of an app-bound session) then
     does zero filesystem work. Never raises.
 
+    A scan that lands is the one moment the snapshot is known to be whole, so
+    a caller acting for the owner passes ``heal_default=True`` to also run
+    :func:`reset_dangling_default_agent`. Healing is opt-in because the reset
+    writes the owner's ``config.json``: a refresh reached from anyone else's
+    request (an app token's turn, a lookup) must not, and a lazy build can run
+    inside a caller's own locked config write (the default-agent PUT reaches
+    :func:`dispatch_kiro_agent` from its mutate), where the reset's write would
+    wait on the lock that caller holds. A refresh that does not heal still
+    records what it saw removed, for the next one that does. A scan that could
+    not read or parse every spec never heals: the agent of a skipped file is
+    missing from that snapshot while its file is still on disk.
+
     Consequence worth stating plainly: editing an existing config IN PLACE — say
     renaming its ``name`` field by hand — refreshes nothing, so that new name
     stays undispatchable until the next registration or gateway boot. Hand-editing
@@ -5794,13 +6118,16 @@ def refresh_materialized_agents() -> None:
     rather than papered over with a per-file stat.
     """
     global _MATERIALIZED_AGENTS, _MATERIALIZED_AGENTS_READY, _MATERIALIZED_REFRESH_ISSUED
-    global _MATERIALIZED_REFRESH_APPLIED
+    global _MATERIALIZED_REFRESH_APPLIED, _MATERIALIZED_COMPLETE
     with _MATERIALIZED_AGENTS_LOCK:
         generation_at_start = _MATERIALIZED_AGENTS_GENERATION
         _MATERIALIZED_REFRESH_ISSUED += 1
         my_ticket = _MATERIALIZED_REFRESH_ISSUED
     try:
-        snapshot = _scan_materialized_agents(kiro_agents_dir())
+        agents_dir = kiro_agents_dir()
+        _SCAN_STATE.complete = True
+        snapshot, stems = _scan_materialized_index(agents_dir)
+        scan_complete = bool(getattr(_SCAN_STATE, "complete", True))
     except Exception:  # noqa: BLE001 — a refresh failure only costs a fallback
         logger.debug("Failed to refresh materialized agent names", exc_info=True)
         return
@@ -5820,6 +6147,16 @@ def refresh_materialized_agents() -> None:
             # registration apply the authoritative view (including removals).
             snapshot = frozenset(snapshot | _MATERIALIZED_AGENTS)
         _MATERIALIZED_AGENTS = snapshot
+        # In place, new entries first: a reader between the two statements sees
+        # every current stem (an old value for one just rewritten, never a hole),
+        # and the dict's identity holds across refreshes and boots.
+        _MATERIALIZED_STEMS.update(stems)
+        for stale in [stem for stem in _MATERIALIZED_STEMS if stem not in stems]:
+            del _MATERIALIZED_STEMS[stale]
+        # One call per landed snapshot, so its eviction and its report happen
+        # once for the whole of what it declares.
+        _remember_seen([*snapshot, *stems])
+        _MATERIALIZED_COMPLETE = scan_complete
         _MATERIALIZED_AGENTS_READY = True
         _MATERIALIZED_REFRESH_APPLIED = my_ticket
     # An app install/upgrade that rewrote agent JSON just landed in the snapshot;
@@ -5832,6 +6169,243 @@ def refresh_materialized_agents() -> None:
         invalidate_include_crew_context_cache()
     except Exception:  # noqa: BLE001 — best-effort; a stale flag is not fatal
         logger.debug("Failed to invalidate includeCrewContext cache", exc_info=True)
+    # Only a scan that read every spec may heal: one that skipped a file it could
+    # not read or parse is missing that file's agent while the file is still
+    # there, and the reset it would make is durable.
+    if heal_default and scan_complete:
+        reset_dangling_default_agent()
+
+
+def _removal_evidence() -> tuple[frozenset[str] | None, frozenset[str], bool]:
+    """``(installed names, removed names, scan complete)``, read in one lock hold.
+
+    ``None`` names while no snapshot has landed. Read together so the removals
+    and the completeness flag describe the same installed snapshot.
+    """
+    with _MATERIALIZED_AGENTS_LOCK:
+        names = _MATERIALIZED_AGENTS if _MATERIALIZED_AGENTS_READY else None
+        removed = frozenset(
+            _MATERIALIZED_SEEN.keys() - _MATERIALIZED_AGENTS - _MATERIALIZED_STEMS.keys()
+        )
+        return names, removed, _MATERIALIZED_COMPLETE
+
+
+def reset_dangling_default_agent() -> bool:
+    """Set ``default_agent`` back to ``default`` when its template file is gone.
+
+    An agent the owner made the default can lose its spec after the fact: a
+    package uninstall removes its file, a disabled app deregisters its
+    agents, a user deletes the file by hand. The alias row stays in
+    ``config.json`` and ``default_agent`` still names it, so every new chat
+    dispatches a name kiro-cli does not list and fails "Agent mode ... is not
+    available". The owner's call for that state is the shipped ``default`` crew,
+    which binds the managed template, so this points ``default_agent`` there.
+    The alias row is left alone: it is the owner's record, and the template may
+    come back.
+
+    "Gone" is a REMOVED name: one an earlier landed snapshot (or a publish) in
+    this process let a binding dispatch, and the current snapshot does not.
+    Absence alone is not evidence. A
+    binding can name an agent this directory never declared and still
+    dispatch: a project checkout's own spec (kiro-cli resolves ``--agent``
+    against the session's directory first) or an agent the edition contributes.
+    For the same reason a removed name the edition still supplies is kept.
+
+    Decides against the materialized snapshot only, so it is a pure in-memory
+    check between the config load and the write, and it never acts on
+    uncertainty -- a cold or empty snapshot, nothing removed, an unreadable or
+    degraded config, a missing ``default`` alias, or a default already
+    ``default`` all leave the file untouched. The managed ``kirocrew`` template is exempt: a missing one is
+    regenerated before spawn (``agent.ensure_agent_materialized``), not a loss.
+    The write is the same locked read-modify-write the default-agent PUT uses,
+    and both conditions are re-derived inside the lock, so a PUT that repointed
+    the default in the window wins. Runs OFF the event loop (it loads the config
+    and takes the config lock); :func:`refresh_materialized_agents` is its
+    caller. Never raises. Returns ``True`` when the default was reset.
+    """
+    names, removed, complete = _removal_evidence()
+    if not names or not removed or not complete:
+        return False
+    try:
+        cfg = KiroCrewConfig.load()
+    except Exception:  # noqa: BLE001 — an unreadable config is exactly when not to act
+        logger.debug("default agent check: config unreadable", exc_info=True)
+        return False
+    if cfg.degraded_sections:
+        return False
+    current = cfg.default_agent
+    row = cfg.agents.get(current)
+    if current == "default" or row is None or "default" not in cfg.agents:
+        return False
+    template = _dangling_template(row.kiro_agent, names)
+    if template is None or template not in removed or template in _edition_agent_names():
+        return False
+    workspace_dir = _alias_workspace_dir(cfg.workspaces, row.workspace, cfg.default_workspace)
+    if _workspace_declares(template, workspace_dir):
+        return False
+    reset = False
+
+    def _reset(data: dict) -> dict | None:
+        nonlocal reset
+        agents = data.get("agents")
+        if data.get("default_agent") != current or not isinstance(agents, dict):
+            return None
+        row = agents.get(current)
+        if "default" not in agents or not isinstance(row, dict):
+            return None
+        # Re-derived from the snapshot installed NOW: another refresh may have
+        # replaced the one read above, and if its scan was partial its absences
+        # are not evidence.
+        names_now, removed_now, complete_now = _removal_evidence()
+        if names_now is None or not complete_now or template not in removed_now:
+            return None
+        if _dangling_template(row.get("kiro_agent"), names_now) != template:
+            return None
+        # The workspace checked above must still be the one this row places in;
+        # a row repointed at another workspace in the window was not checked.
+        if _locked_workspace_dir(data, row) != workspace_dir:
+            return None
+        data["default_agent"] = "default"
+        reset = True
+        return data
+
+    try:
+        update_config_locked(config_path(), mutate=_reset, stamp_meta=False)
+    except (ConfigReadError, ConfigWriteRefused, OSError):
+        logger.debug("default agent check: config write declined", exc_info=True)
+        return False
+    if not reset:
+        return False
+    logger.warning(
+        "default agent %r runs template %r, whose file is gone from %s; "
+        "default_agent reset to 'default'",
+        current,
+        template,
+        kiro_agents_dir(),
+    )
+    _log_default_agent_reset(current, template)
+    return True
+
+
+def _alias_workspace_dir(
+    workspaces: Mapping[str, WorkspaceConfig], name: str, default_name: str
+) -> Path:
+    """The directory an alias's ``workspace`` places it in, as dispatch does.
+
+    The named entry, else the ``default_workspace`` entry, through
+    :func:`workspace_dir_from_entry`, the one placement rule.
+    """
+    return workspace_dir_from_entry(workspaces.get(name) or workspaces.get(default_name))
+
+
+def _locked_workspace_dir(data: dict, row: dict) -> Path | None:
+    """:func:`_alias_workspace_dir` for a raw ``config.json`` document and row.
+
+    ``None`` when the document's ``workspaces`` section is not the plain
+    name -> ``{"dir": ...}`` shape, so a caller comparing it declines.
+    """
+    raw = data.get("workspaces", {})
+    if not isinstance(raw, dict):
+        return None
+    entries: dict[str, WorkspaceConfig] = {}
+    for name, entry in raw.items():
+        if not isinstance(entry, dict) or not isinstance(entry.get("dir", ""), str):
+            return None
+        entries[name] = WorkspaceConfig(dir=entry.get("dir", ""))
+    name = row.get("workspace") or KiroCrewAgentConfig.__dataclass_fields__["workspace"].default
+    default_name = (
+        data.get("default_workspace")
+        or KiroCrewConfig.__dataclass_fields__["default_workspace"].default
+    )
+    if not isinstance(name, str) or not isinstance(default_name, str):
+        return None
+    return _alias_workspace_dir(entries, name, default_name)
+
+
+def _workspace_declares(template: str, workspace_dir: Path) -> bool:
+    """Whether the checkout at *workspace_dir* still declares *template*.
+
+    The removal evidence comes from the user-level agents directory only, but
+    kiro-cli resolves ``--agent`` against the session's project directory first,
+    so a global spec uninstalled while the alias's workspace still declares a
+    same-named spec leaves the default dispatching there. Read with the same
+    scan the user-level snapshot uses, over ``<workspace>/.kiro/agents`` (the
+    only project location the backend activates, both spec forms), so its
+    completeness is known. Answers ``True`` -- do not reset -- whenever it cannot
+    be sure: a sensitive workspace directory (never read), a listing that fails,
+    or a scan that skipped a spec it could not read or parse. A workspace with
+    no ``.kiro/agents`` directory, or none at all, declares nothing.
+    """
+    from kiro_crew.security import is_sensitive_path  # circular import
+
+    try:
+        if is_sensitive_path(str(workspace_dir)):
+            return True
+        agents_dir = project_agents_dir(workspace_dir)
+        if not agents_dir.exists():
+            return False
+        previous = getattr(_SCAN_STATE, "complete", True)
+        try:
+            names, _stems = _scan_materialized_index(agents_dir)
+            complete = bool(getattr(_SCAN_STATE, "complete", True))
+        finally:
+            _SCAN_STATE.complete = previous
+    except Exception:  # noqa: BLE001 — an unreadable checkout is not evidence of removal
+        logger.debug("default agent check: workspace agents unreadable", exc_info=True)
+        return True
+    return not complete or template in names
+
+
+def _edition_agent_names() -> frozenset[str]:
+    """Names of the agents the edition contributes beside the on-disk specs.
+
+    Taken from ``agent_discovery._with_edition_agents``, the one reader of the
+    edition's agent catalog, so the healer and the agent listing agree on which
+    rows exist: its failure handling (none on an adapter error) and its row
+    validation apply here unchanged. The public edition contributes none.
+    """
+    # Deferred: agent_discovery imports this package's paths at load time.
+    from kiro_crew.agent_discovery import _with_edition_agents
+
+    return frozenset(agent.name for agent in _with_edition_agents([]))
+
+
+def _dangling_template(kiro_agent: object, names: frozenset[str]) -> str | None:
+    """The template a ``kiro_agent`` binding runs, when *names* does not declare it.
+
+    ``None`` for a healthy binding, and for the managed ``kirocrew`` template
+    (bound explicitly or by an empty binding), which self-heals elsewhere. The
+    binding goes through :func:`dispatch_kiro_agent` so a row that recorded a
+    file name counts as the agent that file declares.
+    """
+    bound = kiro_agent if isinstance(kiro_agent, str) else ""
+    template = dispatch_kiro_agent(bound) or "kirocrew"
+    if template == "kirocrew" or template in names:
+        return None
+    return template
+
+
+def _log_default_agent_reset(alias: str, template: str) -> None:
+    """Best-effort SEL record of a default-agent reset, like the clamp event."""
+    try:
+        from kiro_crew.sel import SecurityEvent, sel
+
+        sel().log(
+            SecurityEvent(
+                event_id=uuid.uuid4().hex[:16],
+                timestamp=datetime.now(timezone.utc).isoformat(),
+                event_type="default_agent_reset",
+                caller_identity="config_loader",
+                agent="",
+                source="background",
+                operation="config.default_agent",
+                outcome="reset",
+                resources=f"agent:{alias}",
+                metadata={"template": template, "reset_to": "default"},
+            )
+        )
+    except Exception:
+        logger.debug("SEL default-agent-reset event failed", exc_info=True)
 
 
 def publish_materialized_agents(names: Iterable[str]) -> None:
@@ -5856,6 +6430,7 @@ def publish_materialized_agents(names: Iterable[str]) -> None:
         return
     with _MATERIALIZED_AGENTS_LOCK:
         _MATERIALIZED_AGENTS = frozenset(_MATERIALIZED_AGENTS | fresh)
+        _remember_seen(fresh)
         _MATERIALIZED_AGENTS_READY = True
         # Signals any in-flight refresh that its view predates this write, so it
         # unions rather than replacing (see refresh_materialized_agents).
@@ -5891,6 +6466,55 @@ def schedule_materialized_agents_refresh() -> None:
         loop.run_in_executor(None, refresh_materialized_agents)
     except Exception:  # noqa: BLE001 — a scheduling failure only costs a fallback
         logger.debug("Failed to schedule materialized agent refresh", exc_info=True)
+
+
+def dispatch_kiro_agent(kiro_agent: str) -> str:
+    """The name kiro-cli knows for a crewmate's bound ``kiro_agent``.
+
+    A crewmate created by hand, or by an older guide, can record the agent's
+    FILE name (``KiroPkg-captain``, from ``~/.kiro/agents/KiroPkg-captain.json``)
+    while the file declares ``"name": "captain"``. kiro-cli lists agents by
+    declared name only, so dispatching the file name fails closed with "Agent
+    mode ... is not available". This maps such a stem to the name its file
+    declares, so the existing crewmate works without editing its row.
+
+    Changes nothing else: a name that is itself declared, a stem two files share,
+    a name the edition contributes, and any unknown name are returned verbatim. A pure in-memory lookup (see
+    :func:`_materialized_kiro_agent` for why), built by the same full refresh.
+    """
+    if not kiro_agent or kiro_agent in _MATERIALIZED_AGENTS:
+        return kiro_agent
+    if not _MATERIALIZED_AGENTS_READY:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            refresh_materialized_agents(heal_default=False)
+        else:
+            return kiro_agent
+    mapped = _MATERIALIZED_STEMS.get(kiro_agent)
+    if mapped is None:
+        return kiro_agent
+    # A name the edition contributes is that agent, whatever a local file of the
+    # same stem declares: the directory is user-writable, so a file must not be
+    # able to redirect a binding to an edition agent onto some other agent.
+    # Asked only when a mapping exists, so the common path stays in memory.
+    if kiro_agent in _edition_agent_names():
+        return kiro_agent
+    return mapped
+
+
+def member_template_id(agent_cfg: KiroCrewAgentConfig) -> str:
+    """The template a crewmate row runs: its ``kiro_agent`` through
+    :func:`dispatch_kiro_agent`, ``kirocrew`` when the row binds none.
+
+    The one rule for turning a row into an ``ExecutionContext.template_id``.
+    Every dispatch path reads that field verbatim -- the subagent run hands it
+    to kiro-cli, ``resolve_session_agent_bindings`` republishes it as the
+    session's agent -- so a file-name binding is mapped where the row is read,
+    before the record exists, by each builder (:func:`resolve_member_execution`
+    and the subagent admission gate's resume and inherited-member arms).
+    """
+    return dispatch_kiro_agent(agent_cfg.kiro_agent) or "kirocrew"
 
 
 def _materialized_kiro_agent(agent_name: str | None, project_dir: str | None = None) -> str:
@@ -5957,8 +6581,9 @@ def _materialized_kiro_agent(agent_name: str | None, project_dir: str | None = N
         try:
             asyncio.get_running_loop()
         except RuntimeError:
-            # No loop on this thread: scanning here blocks nothing.
-            refresh_materialized_agents()
+            # No loop on this thread: scanning here blocks nothing. The lazy
+            # build only answers this lookup (see refresh_materialized_agents).
+            refresh_materialized_agents(heal_default=False)
             if agent_name in _MATERIALIZED_AGENTS:
                 return agent_name
         else:
@@ -6204,6 +6829,17 @@ def published_config_timezone() -> str:
     return _CONFIG_TIMEZONE
 
 
+# ---------------------------------------------------------------------------
+# Agent resolver and kiro agent validation
+# ---------------------------------------------------------------------------
+def _workspace_name_for_dir(config: KiroCrewConfig, ws_dir: Path) -> str:
+    """Find the workspace name whose dir matches *ws_dir*."""
+    for name, ws_cfg in config.workspaces.items():
+        if Path(ws_cfg.dir) == ws_dir:
+            return name
+    return "default"
+
+
 def resolve_effective_agent(agent_name: str | None, project_dir: str | None = None) -> str:
     """Name the agent that will actually answer *agent_name*, or ``""``.
 
@@ -6417,7 +7053,8 @@ def resolve_agent_identity(config, agent_name=None, *, selection_kind="") -> tup
     )
     return (
         alias,
-        passthrough or (record.kiro_agent if record else config.agent.default_agent),
+        passthrough
+        or (dispatch_kiro_agent(record.kiro_agent) if record else config.agent.default_agent),
         normalize_agent_model(record.model) if record else "",
     )
 
@@ -6469,7 +7106,10 @@ def resolve_agent_bindings(
     if ws_name in config.workspaces:
         ws_dir = Path(config.workspaces[ws_name].dir)
     else:
-        logger.warning(
+        # When the agent already names default_workspace there is nothing to fall
+        # back to, and "'x' not found, falling back to 'x'" would only mislead.
+        log = logger.debug if ws_name == config.default_workspace else logger.warning
+        log(
             "Agent workspace '%s' not found, falling back to default_workspace '%s'",
             ws_name,
             config.default_workspace,
@@ -6481,23 +7121,21 @@ def resolve_agent_bindings(
 
     # Existing V1 members keep their exact configured store binding.
     # Canonical member/store mismatches are rejected before legacy use.
-    store_name = (
-        execution_context.store.store_id
-        if execution_context is not None
-        else (
-            DEFAULT_MEMORY_STORE
-            if passthrough
-            else require_member_memory_store(
-                config, resolved_alias, require_directory=validate_memory_files
-            )
+    if execution_context is not None:
+        store_name = execution_context.store.store_id
+    elif passthrough:
+        store_name = DEFAULT_MEMORY_STORE
+    else:
+        store_name = require_member_memory_store(
+            config, resolved_alias, require_directory=validate_memory_files
         )
-    )
 
-    kiro_agent = (
-        execution_context.template_id
-        if execution_context is not None
-        else passthrough or agent_cfg.kiro_agent
-    )
+    if execution_context is not None:
+        kiro_agent = execution_context.template_id
+        if execution_context.selection_kind == "member":
+            kiro_agent = dispatch_kiro_agent(kiro_agent)
+    else:
+        kiro_agent = passthrough or dispatch_kiro_agent(agent_cfg.kiro_agent)
 
     # Build effective memory config via dict-level merge
     store_cfg = config.memory_stores.get(store_name)

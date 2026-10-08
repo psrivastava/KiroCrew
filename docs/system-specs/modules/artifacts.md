@@ -8,12 +8,12 @@ history, and a stable handle the agent can iterate on across sessions.
 A typical flow:
 
 1. Agent emits an `<mcwidget>` in chat ("here's your CR queue")
-2. Agent (or user) calls `artifact_save` — the widget is persisted under
-   `~/.kiro/crew/artifacts/<slug>/current.html`
-3. Days later, in a fresh session, the user says "iterate on the cr-queue
-   artifact and add an age column"
-4. Agent calls `artifact_get("cr-queue")` to read the current HTML, modifies
-   it, then `artifact_update("cr-queue", content=…)` to publish a new version
+2. When the assistant segment finalizes, the backend auto-registers the widget
+   as an unpinned artifact under `~/.kiro/crew/artifacts/<slug>/current.html`
+3. Days later, in a fresh session, the user asks to iterate on that stable slug
+   and add an age column
+4. Agent calls `artifact_get("<slug>")` to read the current HTML, modifies it,
+   then calls `artifact_update("<slug>", content=…)` to publish a new version
 5. The previous version is preserved under `versions/v1.html` for rollback
 
 The dashboard provides a `/artifacts` library page for browse/search and a
@@ -32,6 +32,273 @@ Loading, empty results, filtering, and read errors therefore keep the same mode.
 
 ## Storage Layout
 
+### Dynamic Dashboard presentation
+
+Automatic session status cards and saved task views have different owners.
+With `dashboard.dynamic_dashboard_cards` enabled, host session events queue a
+bounded background update using only that session's recent, redacted messages.
+Only a root session gets an automatic card (see the root-session rule below).
+The model chooses the card's HTML/CSS and flat text fields; subsequent updates
+can omit HTML and reuse the prior layout with exactly the same data field names.
+A field-name change requires explicit replacement HTML; invalid data-only output
+does not blank the valid prior publication. Large prior layouts stay on the host
+when necessary to leave room for recent evidence in the bounded model input.
+Generation failure retains prior content only while its source and privacy remain
+valid. These cards are transient, not saved
+artifacts, and do not require a conductor or worker to call `artifact_update`.
+The host shows their content publication time separately from live run state.
+The event, privacy and resource contract is in
+[learn-cron-dashboard](learn-cron-dashboard.md#automatic-session-status-cards).
+The Needs you inbox precedes cards, and all answer/approval authority stays in
+native controls. Disabling automatic content does not disable those controls.
+
+### The root session's automatic card: numbers from folds, sentences from the model
+
+Only a ROOT session gets an automatic card. Root is
+`card_lifecycle.is_root_session`: an empty `_created_by` (the birth-time edge) AND no
+parent in the crew log's session tree (the edge an adopt or release moves later, the
+same `parent_slot is None` the sidebar reads through `parent_payload`). A worker gets no
+card; the browser's `SessionStatusFrame` mirrors both edges (`created_by` and `parent`)
+and never fetches one for it. The model card also needs the crew log on: with
+`KIROCREW_CREW_LOG` opted out there is nothing to fold, so no card is generated.
+
+Every number on that card comes from the session's own crew log. `build_crew_main` in
+`kiro_crew.crew_main_contract` folds four renders -- `status`, `work`, `usage`,
+`approvals` -- into `CrewMainDerived`, every value a finished string. Absence is
+three-state in words: a missing key reads `not recorded`, a fold that could not be read
+reads `could not be read`. No value is a percentage, and every count states its
+denominator where one exists.
+
+The model still designs the card's layout, as before, but writes no number. It receives
+the folded values under `facts` as read-only text and binds each one by field name with
+`data-dashboard-field`; its own data is exactly `lede`, `you` and `notes`. The publish
+seam (`_root_card_output`) refuses the whole card when the model's part carries a digit
+-- in a sentence, in any text the layout shows, or as a JSON number -- when it writes a
+field it does not own, when its layout binds a name outside the contract, or when its
+layout leaves any fact unbound (`_layout_hides_a_fact`), since a layout of three
+sentences would publish a card with no numbers. Digits in CSS are layout and pass. Only then does `merge_crew_main`, which names every field, put
+the folded values beside the three sentences.
+
+The three sentences are written in one language, which the host names under
+`language` in the evidence (`_card_language`): the configured dashboard UI language
+(`context.ui_language_tag`) when there is one, as for the session title, otherwise a
+short sample of the newest text the user typed, with pasted code and links cut out.
+The facts, the previous card, assistant replies and automation rows each carry a
+language of their own, so the prompt tells the model never to take the language from
+them.
+
+The session folds are read from the crew log UNIT the slot writes now
+(`crew_log.emit.slot_previous_store`), never from the slot's session key: a fold of a
+name no unit carries is an empty record whose counts read as zero. No unit of the slot
+at all reads `not recorded`; units the store cannot rank read `could not be read`.
+
+Numbers follow the log between generations. Each batch the crew-log writer commits
+(`emit.add_growth_listener`) for a slot whose card is already published re-folds and
+re-binds the numbers on a task of its own, with no model
+call, no permit and none of the hourly budget; the layout and the sentences stay as the
+model last returned them. The opt-in and the budget therefore pace the sentences only.
+
+An HTML/widget artifact tagged `task-dashboard` is a model-authored task view,
+not a fixed dashboard schema. The chat's **Dynamic Dashboard** side-panel tab
+(labelled **Dashboard**; the three-tile dock above the composer opens it) and Crew's
+single **Dashboard** tab select
+only artifacts whose recorded originating slot is the current slot or a durable
+`created_by` descendant. A presentation-only child session can therefore publish
+without impersonating its conductor. The same slug is updated at milestones;
+visible hosts re-read the artifact inventory on each `artifact_update` frame and
+load new revisions.
+
+The side panel's Dashboard view hands its whole **Overview** to that published
+view: the host draws the header (title, help, permission mode), the Overview /
+Questions / Approvals segments with their counts, and the stale / missing-source
+notices, then renders the selected published view and nothing native beside it.
+The automatic card (`SessionStatusFrame`) shows only while no published view
+exists; progress bars, status tiles, blocked and work-item lists are not drawn
+in the panel (the dock above the composer keeps its native tiles). Questions and
+Approvals remain host-rendered `AttentionCard`s — the sandboxed page can name a
+decision but never answer or approve one. The Questions tab also lists an idle
+session whose newest reply ends in an `[OPTIONS: ...]` ask, keyed by the slot's
+`options_ts` and answered with the bare labels; a label starting with `/` is
+dropped, since sent bare it would run as a slash command, and a real question
+card for the same session wins. The automatic card's prompt forbids restating
+pending questions, choices or decisions, since the Questions tab is the one
+place they are answered. The request that asks the agent for a
+page (`commandCenter.prompt.ts`, `REQUEST_PUBLISHED_VIEW`) recommends, without
+enforcing, a layout for that whole-Overview placement: what needs the user first
+with the decision named or linked (answering happens in the Questions tab), one
+line per work item with a status word and details folded, dependencies shown when
+tasks wait on others, cost and technical detail inside the folds, theme CSS
+variables. The artifacts skill repeats the recommendation.
+
+The whole Dynamic Dashboard surface is a developer Feature Preview
+(`PREVIEW_DASHBOARD`, `website/src/utils/previewFlags.ts`), default OFF and
+gating INGRESS only: with the flag off the dock, the + menu entry, a persisted
+Dashboard tab and the Sessions menu's All Dashboards item are withheld, while
+`/session-dashboards` stays routable and every API above is unchanged. The Crew
+chat's Dashboard tab is not withheld: it is the crewmate's own published page,
+a standing tab whatever the flag. The **Automatic cards for all sessions** switch
+lives inside that preview's card in Settings > Developer > Feature Previews,
+shown whether the preview is on or off: it is a gateway-wide spend setting, and
+hiding it would leave cards running with no control on this device.
+Session matching strips the dashboard scope and normalizes registered channel
+keys with the history safe-key rules, retaining the channel namespace. Unknown
+prefixes are not folded; missing task roots remain fail-closed.
+Models choose the layout and task-specific content; no particular board or graph
+is mandatory. The `artifacts` skill documents this publishing contract.
+Crew's existing member-published webview shares this presentation selector, not
+its renderer or permissions. Its member-panel API and sandbox remain unchanged;
+a pipeline publication is one view within the same dashboard. The global session
+dashboard supplies the cross-session summary and Needs you inbox, while questions
+and approvals remain native host controls outside every published document.
+The Crew entry stays **Dashboard**; the publication's expand/collapse, dialog,
+loading and error chrome consistently names the **published view**.
+
+The host independently projects live sessions, subagents, workflows and accepted
+conductor work. It never treats idle sessions as completed work, nor worker
+`done` reports as conductor acceptance. Missing/failed sources are shown as
+unknown or stale, not as an empty successful run. Questions and approvals have
+native host controls, exact session/request identities and explicit submission;
+Normal/Reads/Trust/YOLO mode is explicitly labeled as the permission mode, never
+changed by the dashboard. Native Reject once addresses both the owning slot and
+exact request ID through the slot approval endpoint, which preserves the
+`rejected_once` decision without rejecting the remaining batch. Connection-scoped
+request IDs may collide across unrelated sessions and must never be resolved by
+a global ID scan. Dashboard actions bind the request's origin as well: native
+actions send `origin: native` and require that exact slot's live request; coordinator
+actions send `origin=coordinator` and the inventory record's exact raw slot. The
+server checks the coordinator record and resolves its state-only future without
+an intervening await. Stale/missing/mismatched targets return 404, never fall
+through to another origin, and retire the displayed controls without claiming
+success. Origin-qualified card identity prevents a coordinator's delivered state
+from hiding a colliding native request after the inventory changes. Existing
+callers that omit origin retain their legacy fallback behavior.
+Command input stays verbatim in a keyboard-accessible scrolling
+preview, including on narrow screens. No bulk approval is implied. A failed or
+uncertain send retains the answer and
+does not automatically retry. Native answers steer their own waiting turn when
+either live run state or that slot's reloaded dashboard snapshot is running;
+sibling sessions never determine this decision. Approvals are separate from informational blockers.
+
+`TaskDashboardFrame` uses the sandbox-document service with an empty sandbox:
+no scripts, same-origin, forms, popups or control bridge. A dedicated document
+builder removes executable code, resource hints, nested documents and outbound
+navigation before rendering. It inspects actual attributes irrespective of SVG
+namespace and keeps only fragment hrefs; empty hrefs are navigation too.
+Models freely design supported HTML/CSS/SVG layouts and native
+disclosures; dynamic evidence arrives through published revisions, not model
+JavaScript. Deny-by-default CSP permits only inline styling and data fonts; no
+image loads, since an image is bytes the browser decodes for display and the
+backend text scan cannot read them, so image-source attributes are removed too.
+An automatic card is held to the text the backend scanned: its CSP also refuses
+fonts and its `@font-face` rules are deleted (a font remaps the glyphs shown),
+declarations that draw characters absent from the markup (`content`, `quotes`,
+`list-style*`, `hyphenate-character`, `text-emphasis*`, `text-overflow`) are
+removed, and so are the `alt`, `title`, `start` and `value` attributes the
+browser displays as text. Saved views keep their authored CSS and attributes.
+The page receives no credentials or host state. Model-authored status is labeled a
+published view; it never replaces the host's trusted approval inventory.
+Automatic card data binds through `data-dashboard-field` text containers using
+`textContent`, never HTML interpolation or an executable update script. An absent
+field clears the old text. Only visible frames obtain a sandbox document; hiding
+or paging them out releases it. The fleet keeps wrappers for the bounded live
+slot inventory (`MAX_LIVE_SLOTS`, 500) to retain each saved-view selection. Twelve
+session summaries are active on a page, with one automatic card and at most one
+selected saved view each: at most 24 iframe documents, not twelve mounted wrappers.
+Native attention controls remain mounted independently to preserve drafts across
+filters and pages. The task panel
+mounts its own session's automatic card (a worker carries none) plus its selected
+task publication. Under Progress it shows the work items whenever the board has
+any, and adds the running runs, uncapped, only when the board is not the progress
+source (absent, or with omitted entries): that is when the dock's Progress
+list shows runs, and that list caps its rows and hands its overflow to the panel,
+so the rest must be readable there. It carries no live run roster beyond that; idle and done runs
+stay with the sidebar's Subagents and Workflows tabs; Crew's
+existing protected-template renderer retains its own lifecycle.
+The optional creation request is a model-facing English prompt; translated UI
+copy names the published view, and the artifacts skill owns its technical
+publishing contract. Source failures render through the shared error notice in
+both the dock and panel, with no navigation hand-off beside unsent answer drafts.
+The chat dock above the composer, in the composer's own column, is three tiles
+and nothing else: progress (accepted or checked-off count, else the running
+count written as "N running", under one Progress label either way), blocked, and Needs you. Each tile
+is a disclosure button for its own short list (`aria-expanded`; the open tile
+points at its region with `aria-controls`, and a second click closes it), grouped
+under the Dashboard name; in a narrow column the tiles wrap onto further rows
+rather than truncating their labels. Beside them sit two actions, open the
+Dashboard tab (icon plus its "Open Dashboard" text) and hide. A tile discloses a list read from the same source as its
+number: the running work items when a board exists (a blocked item is the
+Blocked tile's row, a waiting one is nobody's progress), else the running runs;
+the blocked runs and items; the requests. Each row hands off to the panel (the
+row is the button, named by its item) and never mounts an answer or approval
+control, so a draft has one home: the panel, which the dock's labelled Open
+Dashboard button also reaches. The panel loads lazily with its tab, so the shell chunk carries only the
+dock; a panel chunk that fails to load is caught by a boundary local to the tab,
+which says so through the shared error notice with no navigation hand-off, and
+never reaches the route boundary that would replace the chat page. Opening the
+panel moves focus to the panel heading once it shows, unless the user
+has moved focus elsewhere meanwhile. The dock hides to a single pill that
+carries the hide glyph, or a red count while something needs the user (persisted
+per browser as `mc-task-dashboard-hidden`), and it is one element in both forms;
+the toggle unmounts the pressed control, so a hide or show made from the dock's
+own controls hands focus to the counterpart (hide lands on the pill, show on the
+hide button), while a mount or a persisted value takes no focus. It is removed
+once a complete, current read shows every run at rest, no request waiting and
+the plan complete; a paused workflow rests (no tile counts it), a queued worker
+or an item's open question does not; a work board settles when every item is
+accepted, rejected or abandoned, a half-loaded or disconnected inventory is
+never settled, and a session with an open plan stays shown even when a board
+supplies the progress number. That verdict is retained in page memory per
+root across dock remounts, but is not persisted across a page reload: one entry
+per root that ever settled in this page lifetime, released when that root shows
+new work, cleared by reload; it arms only
+after a complete read of a readable scope: before the first slot list lands
+nothing is loading or stale and the empty model is vacuously settled, which
+must not count. Once a
+complete read has settled the task, a later connection drop, source error or
+remount's loading window does not bring the dock back, and only evidence of new
+work releases it — a complete read showing something running, blocked or asking,
+or a live slot state that already says someone is waiting on the user. The panel header carries the same three
+tiles; its explanatory copy (scope, permission-mode note, containment statement,
+last-checked time) lives behind one info control.
+No command-center source polls. The dock, panel and all-session view read each
+source once and re-read it on the frame that announces its change: `approval` and
+`approval_resolved` for both approval systems, `question_card` and its retirement
+for questions, `artifact_update` for a task dashboard, the crew log's
+`slot_projection` for the work board of a team holding that slot, and workflow
+events into the store, with a finished, failed or cancelled run also re-reading
+the workflow snapshot the store's live runs are laid over, and the store's own
+workflow heal read replacing that snapshot; a reconnect re-reads all of them.
+Window focus re-reads a command-center source only while it has failed, since the frame
+that would refresh it may never come; a healthy source is left to its frames. The dock, mounted in every chat, reads the work
+board only for a team (a slot with sessions created under it) or whenever a published
+view keeps the dock relevant for that slot, so a verdict never settles over an item the
+unread board still holds open; the panel always
+does. Only questions and approvals decide the stale notice and the "updated"
+clock, so an optional source that fails (workflows answer 503 while their service
+starts) cannot hide a fresh decision; the dock, panel and all-session view show
+one notice listing every failed source (workflow runs, the work items under Live
+activity, published views) beside those decisions, with the reassurance said once,
+so a missing source is never read as an empty one. A work board the dock does not read contributes nothing, even when an
+open panel cached one. Approvals share the app shell's
+`global-approvals` cache, which keeps its own 30-second refresh and is re-read on
+reconnect. A `slot_projection` frame never cancels a work read in flight; one
+more read follows it once it settles. The shared model's session-state rule — a
+session is running while its turn runs, while subagents run, or while it
+holds queued messages; a paused workflow waits and a planning
+one runs — also governs the all-session view's Running badge and its sort
+priority, which read the same model rather than the slot's turn flag alone. The all-session view takes its sort order
+when the set of sessions, what needs attention, the filter or the page changes,
+not on activity, since moving a card reloads its iframes and their single-use
+documents; a card shows the published views of its whole
+`created_by` team, as the task panel does. The work board is the one host source the crew log
+owns, a checkpointed slot fold. Pending approvals and questions stay on the live
+host inventory rather than a crew-log projection: a card needs the request's tool
+input, which the crew log only digests, and a decision needs the live future the
+resolve endpoints check, which a recorded request cannot prove still exists.
+Incognito/temporary artifact persistence restrictions remain unchanged.
+
+### Artifact files
+
 ```
 ~/.kiro/crew/artifacts/
 └── <slug>/
@@ -43,19 +310,19 @@ Loading, empty results, filtering, and read errors therefore keep the same mode.
         └── …
 ```
 
-`meta.json` schema:
+`meta.json` schema (serialized by `kiro_crew.artifact_store.records`):
 
 | Field | Type | Notes |
 |---|---|---|
 | `slug` | string | URL-safe handle. Derived from `name` when not given, resolving a collision by suffixing (`-2`, `-3`, …); an explicitly-passed slug is refused — never renamed — when it is already taken or malformed |
 | `name` | string | Human-readable display name |
 | `kind` | enum | `widget`, `html`, `markdown`, `svg`, `json`, `text`, `webapp`, `image` — inferred on save when the caller omits it (see [Kind inference](#kind-inference)) |
-| `source` | enum | `chat` (default), `cron`, `subagent`, `manual`, `import` |
+| `source` | enum | `chat` (default), `cron`, `subagent`, `manual`, `import`, `dashboard`, `slack`, `cli`, `task-runner`, `unknown` |
 | `pinned` | bool | "Starred" — user-curated keep flag (default `false`). Drives the Artifacts page **Starred** view. Metadata-only; toggling does NOT bump `version`. |
 | `auto_registered` | bool | `true` when the store created this record automatically from a chat-emitted `<mcwidget>` (see [Widget auto-registration](#widget-auto-registration)) rather than from an explicit save. Sweepable by the retention pass while unpinned; tolerant-loaded (pre-existing artifacts default `false`, so they are never swept). |
 | `description` | string | Optional, ≤ 2,000 chars |
-| `tags` | string[] | ≤ 16 tags, alphanumeric / `_`, `:`, `.`, `-` |
-| `version` | int | Latest version number; bumps on every content change |
+| `tags` | string[] | ≤ 16 labels, each a well-formed tag (see [Validation & Limits](#validation--limits)) stored in its NFC spelling |
+| `version` | int | Latest snapshot version; bumps when a content change is snapshotted |
 | `created_at` / `updated_at` | string | ISO 8601 UTC microseconds |
 
 ## Public API
@@ -68,7 +335,7 @@ from kiro_crew.artifacts import ArtifactStore, get_default_store
 store = get_default_store()
 art = store.create(name="CR Queue", content="<table>…</table>", tags=["ops"])
 art = store.get(art.slug)
-art = store.update(art.slug, content="<table>… age column …</table>")
+art = store.update(art.slug, content="<table>… age column …</table>", snapshot=True)
 versions = store.list_versions(art.slug)
 items = store.list(tag="ops")
 store.delete(art.slug)
@@ -82,6 +349,103 @@ The store is thread-safe. A module-level singleton is available via
 `get_default_store()`; pass an explicit `root` to `ArtifactStore(root=...)`
 for isolated test instances.
 
+#### Code ownership
+
+`kiro_crew.artifacts` is the facade every caller imports. It owns the store and
+keeps its whole import surface, re-exporting each moved name with one identity:
+`kiro_crew.artifacts.ArtifactFolderStore` and
+`kiro_crew.artifact_store.folders.ArtifactFolderStore` are the same class. Its
+`__all__` is derived from what the module binds plus its forwarding table
+(`_EXPORTS`), minus the forwarding machinery, so a star import exposes every
+public name, the moved and forwarded ones included, and no list of names is kept
+by hand. The `records` and `comments` helpers the store calls are internal to it
+and are imported from their owner.
+
+| Owner | Responsibility |
+|---|---|
+| `kiro_crew.artifacts` | `ArtifactStore`: the shared per-root lock, the directory layout, the fenced file IO (`_read_text` / `_write_text` / `_read_bytes` / `_write_bytes`), versions and pruning, the live `source_path` pointer and its allowed roots, publication-record reads and writes, comment and retention orchestration, the change listener and the `kirocrew.artifact.created` counter. Also the caps (`MAX_VERSIONS`, `MAX_CONTENT_BYTES`, `MAX_COMMENTS_PER_ARTIFACT`, `MAX_EVENTS_PER_ARTIFACT`, `MAX_AUTO_WIDGET_ARTIFACTS`), the clock (`_now_iso`), the `slug_is_well_formed` predicate and the `get_default_store` / `get_default_folder_store` singletons |
+| `kiro_crew.artifact_store.model` | The error hierarchy, the `EXPECT_ABSENT` generation sentinel and the record dataclasses (`Artifact`, `ArtifactPublication`, `ForkMetadata`, `ArtifactComment`, `ImageMetadata`) |
+| `kiro_crew.artifact_store.rules` | Field limits and grammar (slug, tag, name, description, `source_path`), `slugify`, the kind policy (`_infer_kind`, `detect_editor_kind`, `USER_SELECTABLE_KINDS`), the theme-colour lint, the document-path test and session-scope matching |
+| `kiro_crew.artifact_store.images` | The raster mime allowlist and the standard-library header sniffers |
+| `kiro_crew.artifact_store.records` | The persisted formats: `meta.json` and its tolerant load, the lifecycle event entries (`ALLOWED_EVENT_TYPES`), `comments.json`, and the publication and fork-metadata field allowlists |
+| `kiro_crew.artifact_store.comments` | The comment-thread rules: the forwarding filter, whole-thread cap pruning, the provider merge, the anchor rescan and root-cascade removal |
+| `kiro_crew.artifact_store.folders` | `ArtifactFolderStore` and `artifact_folders.json` |
+| `dashboard/handlers/artifacts.py` | The HTTP projection: request parsing, the restricted-session gate, SEL audit, response redaction (`_serialize`), the publish governance gates and the live-refresh broadcast |
+| `kiro_crew.mcp_tools.artifacts` | The MCP projection: tool schemas and handlers, which reach the artifact store only through the HTTP API |
+
+No module under `kiro_crew.artifact_store` imports `kiro_crew.artifacts` at import
+time (`folders` names `ArtifactStore` for type checking only), and none performs
+networking or redaction or touches the filesystem except `ArtifactFolderStore` on
+its own file. `rules` imports `kiro_crew.history` and `kiro_crew.messaging.link`
+inside `_strip_session_scope` because both import the facade back. The moved
+error classes (`ArtifactError` and its five subclasses) keep `kiro_crew.artifacts`
+as their `__module__`, so tracebacks and the error types in logs are unchanged;
+the cost is that `inspect.getsource` cannot find them through that name and
+raises `OSError`, and `inspect.getfile` names `artifacts.py` rather than the owner
+file that defines them. Every other moved class -- the record
+dataclasses, the class of `EXPECT_ABSENT` and `ArtifactFolderStore` -- reports
+the owner module that defines it, so the source lookup and a debugger find its
+definition.
+
+The store's seams belong to the facade, which hands them to the owners at call
+time, so they are patched on `kiro_crew.artifacts`: `config_dir`, `_now_iso`,
+`MAX_VERSIONS`, `MAX_CONTENT_BYTES`, `MAX_COMMENTS_PER_ARTIFACT`,
+`MAX_EVENTS_PER_ARTIFACT`, the fence helpers (`_open_pinned_for_read`,
+`canonical_path_refusal`, `sensitive_path_refusal`, `is_sensitive_path`) and the
+`_default_store` / `_default_folder_store` singletons. `get_default_folder_store`
+builds its store on the facade's `config_dir`, so the default
+`artifact_folders.json` follows the same patch as the default store's root.
+
+The store calls every owner helper through its facade name, so rebinding one on
+`kiro_crew.artifacts` steers the store: `slugify`, `_validate_slug`,
+`_validate_name`, `_validate_description`, `_validate_tags`, `_validate_kind`,
+`_validate_source`, `_validate_source_path`, `_infer_kind`, `detect_editor_kind`,
+`_markdown_misclassification_reason`, `_session_touched` and
+`_sniff_image_dimensions`. `slug_is_well_formed` lives in the facade on the same
+`_validate_slug` binding, so it cannot disagree with the store. A call a helper
+makes inside its owner module resolves there: `_session_touched` calls `rules`'
+`_strip_session_scope`, `slugify` calls `rules`' `slug_hash_fallback`, and
+`_sniff_image_dimensions` calls `images`' per-format sniffers
+(`_sniff_jpeg_dimensions`, `_sniff_webp_dimensions`). Owner modules bind their
+own imports too: a directly constructed `ArtifactFolderStore` takes its default
+path from `folders`' `config_dir` and logs through `folders`' `logger`, which is
+the same `kiro_crew.artifacts` logger object.
+
+Rule data an owner's own code reads has one binding, in the owner, and the
+facade forwards it instead of holding a copy: `_EXPORTS` maps each such name to
+its owner, the module `__getattr__` answers a read from the owner in
+`sys.modules`, and the module's class sends a write or a delete to the owner. A
+patch through `kiro_crew.artifacts` (`monkeypatch`, or `mock.patch` without
+`create`) and a patch of the owner module therefore both reach every reader that
+looks the name up on the owner or the facade when it runs (a module that imports a
+forwarded name by name keeps its own copy, as `code_review_sage`'s report module
+does with `_SLUG_RE`), and the store reads these names through the owner module too (`create_image`
+truncates to `MAX_NAME_LEN` / `MAX_DESCRIPTION_LEN`, and `update` pre-checks
+`ALLOWED_EVENT_TYPES`). That covers the field limits and grammar
+(`MAX_NAME_LEN`, `MAX_DESCRIPTION_LEN`, `MAX_TAGS`, `MAX_TAG_LEN`,
+`MAX_SOURCE_PATH_LEN`, `_SLUG_RE`, `_SLUG_NORMALIZE_RE`), the kind sets and inference tables
+(`ALLOWED_KINDS`, `ALLOWED_SOURCES`, `DOC_EXTENSIONS`, `_EXT_KIND_MAP`,
+`_HTML_SNIFF_MARKERS`, `_MD_HEADING_RE`, `_SVG_ROOT_RE`), the theme-colour lint
+patterns (`_HARDCODED_COLOR_RE`, `_HREF_ATTR_RE`) and `_strip_session_scope` in
+`rules`, the event-type vocabulary (`ALLOWED_EVENT_TYPES`) in `records`, the
+folder limits (`FOLDER_PATH_SEP`, `MAX_FOLDER_DEPTH`, `_NO_GENERATIONS`) in
+`folders`, and the per-format sniffers (`_sniff_jpeg_dimensions`,
+`_sniff_webp_dimensions`) in `images`. The moved classes stay ordinary bindings
+of the facade, since a class is never rebound and the store's string annotations
+resolve through them. The forwarding `__getattr__` is hidden from type checkers,
+which see each forwarded name through a `TYPE_CHECKING` import from its owner.
+`mock.patch(..., create=True)` on a forwarded name is not supported, because its
+exit deletes the owner's binding, and `test_artifacts_refactor_create_guard`
+refuses one anywhere in the test trees. `_IMAGE_MIME_EXT` is read only by the
+store, so its facade binding is the live one. `MAX_AUTO_WIDGET_ARTIFACTS` is the
+default argument of `prune_auto_widgets`, bound when the class is defined.
+
+`test_artifacts_refactor_store_contract` derives, from the tests themselves, every
+name a test rebinds on `kiro_crew.artifacts`, and fails when one is neither
+forwarded nor held by the facade alone with no owner function reading its own
+binding of it. Its one listed exception is `config_dir`, which `folders` reads for
+a directly constructed `ArtifactFolderStore`.
+
 `list()` returns newest first on a TOTAL order, `(updated_at, slug)` descending.
 The tie-break is load-bearing, not cosmetic: `updated_at` is microsecond ISO, so
 two artifacts written inside one microsecond carry the identical stamp, and
@@ -94,8 +458,8 @@ artifact is newest on otherwise identical data.
 
 `store.create()` (and every path that funnels through it — the HTTP create
 route, the `artifact_save` MCP tool, the `kirocrew artifact save` CLI) infers
-`kind` when the caller omits it (`kind=None`), via `_infer_kind(content,
-source_path, explicit)`:
+`kind` when the caller omits it (`kind=None`), via
+`_infer_kind(content, source_path, explicit)` in `kiro_crew.artifact_store.rules`:
 
 1. **Explicit wins** — a non-empty `kind` argument is used as-is (back-compat).
 2. **Extension** — for file-backed artifacts (`source_path` set): `.md` /
@@ -103,9 +467,10 @@ source_path, explicit)`:
    `.json` → `json`, `.txt` → `text`, any other extension → `text`.
 3. **Content sniff** — for inline content with no `source_path`: HTML-ish
    markup (`<div`, `<span`, `<style`, `<table`, `<mcwidget`, `<html`,
-   `<!doctype html`) → `widget`; a leading markdown heading (`#`…`######`) or
-   content with **no** `<` at all → `markdown`; otherwise the legacy `widget`
-   default (ambiguous blobs keep prior behavior).
+   `<!doctype html`) → `widget`; an empty body → `widget`; a leading markdown
+   heading (`#`…`######`) or non-empty content with **no** `<` at all →
+   `markdown`; otherwise the legacy `widget` default (ambiguous blobs keep prior
+   behavior).
 
 Only `widget` and `markdown` are inferred from inline content; the richer
 kinds need the extension signal. This is the safety prerequisite that lets
@@ -129,7 +494,7 @@ doc stored as `widget` renders as raw inner HTML).
 | `artifact_folder_move` | Reparent a folder; cycle-guarded |
 | `artifact_folder_delete` | Delete a folder; default keeps contents (re-parent), `delete_contents=true` cascades |
 | `artifact_move` | Move an artifact into a folder / unfile it (metadata-only, no version bump) |
-| `artifact_get_comments` | Read all comments on an artifact (local + provider-synced) |
+| `artifact_get_comments` | Read all comments on an artifact (local + provider-synced); `exclude_resolved=true` omits resolved threads (root-granular) so a mid-review read is not re-handed feedback already addressed |
 | `artifact_post_comment` | Post a comment; agent comments carry the structured `is_agent` flag (no emoji stamped into the body — dashboard renders a lucide `Bot` icon, CLI prefixes a plain-text `[agent]` marker) + SEL-audited; `scope='shared'` syncs to the provider |
 | `artifact_mark_review` | Advance a comment thread to REVIEW status (agent can mark_review but NEVER resolve) |
 | `artifact_reply_comment` | Reply to an existing comment thread; a reply to a provider-origin parent posts back to the provider |
@@ -138,7 +503,11 @@ doc stored as `widget` renders as raw inner HTML).
 Schemas live in `validation.py` (`ARTIFACT_*_SCHEMA`) and are registered in
 `MCP_CORE_SCHEMAS`. The MCP tool layer always proxies through the HTTP API so
 SEL audit, restricted-session enforcement, and any future authorization
-middleware live in one place.
+middleware live in one place. The `tags` and `tag` arguments are checked by the
+store's own tag rule (`rules.normalize_tag`, called from the schemas' custom
+validator) rather than by a pattern of their own, so the tool and the store
+cannot disagree about a tag; the schema fields keep only the count and length
+caps.
 
 ### CLI (`kirocrew artifact`)
 
@@ -160,9 +529,10 @@ The CLI proxies through the gateway HTTP API (matches `kirocrew learn`).
 | `GET` | `/api/artifacts` | `?tag&kind&q` filters + `?folder=` scoping (absent = all; empty = unfiled/root; id = that folder) + `?session=` scoping (same absent/empty distinction; validated like `origin_session_key`) + `?pinned=` (tri-state — unrecognized values don't scope); returns `{artifacts: […]}` |
 | `POST` | `/api/artifacts` | JSON body — creates, returns full artifact + content; optional `folder` key (id or human path, mkdir -p) |
 | `GET` | `/api/artifacts/{slug}` | Returns full artifact + content |
-| `PATCH` | `/api/artifacts/{slug}` | Partial update; `content` bumps version; optional `folder` key (metadata-only) |
+| `PATCH` | `/api/artifacts/{slug}` | Partial update; MCP-authenticated content updates snapshot by default, dashboard saves snapshot only with `snapshot: true`; optional `folder` key is metadata-only |
 | `DELETE` | `/api/artifacts/{slug}` | Permanent delete |
 | `PATCH` | `/api/artifacts/{slug}/pin` | Star/unstar — body `{pinned: bool}` (strictly boolean; non-booleans rejected). Metadata-only, no version bump |
+| `PATCH` | `/api/artifacts/{slug}/relocate` | Point a file-backed artifact at a validated `source_path`; dashboard HTTP surface only (the `artifact_move` MCP tool moves folders instead) |
 | `GET` | `/api/artifacts/session-docs` | Virtual, read-only list of non-code documents produced across chat sessions (the "All" firehose). `?session=<slot>` scopes to one session. Creates nothing; each entry carries `saved` (pinned) + `slug`. Registered before the `/{slug}` dynamic route |
 | `POST` | `/api/artifacts/materialize` | Turn a recorded chat document into a real, pinned file-backed artifact — body `{path}`. The path MUST be a document recorded in chat `file_changes` (authorization allowlist); the read goes through `hooks.safe_read_file_bytes` (is_sensitive_path + `O_NOFOLLOW` + `MAX_FILE_BYTES` cap). Idempotent by `source_path` |
 | `GET` | `/api/artifacts/{slug}/versions` | `{slug, versions: [int]}` |
@@ -176,20 +546,20 @@ The CLI proxies through the gateway HTTP API (matches `kirocrew learn`).
 | `POST` | `/api/artifacts/{slug}/pull-latest` | Pull the tracked upstream (`?source=publication\|origin\|auto`) into a NEW local snapshot via `publish_sync.pull_upstream`; ungated ingress |
 | `GET` | `/api/artifacts/{slug}/upstream-status` | Cheap metadata-only drift check (`publish_sync.upstream_status`); best-effort, never blocks on the network |
 | `POST` | `/api/artifacts/{slug}/overwrite-remote` | Force-push local content over an upstream-ahead remote (`publish_sync.overwrite_upstream`); **egress — gated by `_publish_governance_denied` on the resolved `publication.provider`** |
-| `GET` | `/api/remote-artifacts/{provider}/browse` | Provider-routed discovery: `?q=` → `search_remote`, else `list_remote(?scope=mine\|shared\|public)`; rows annotated with `local_slug`; unregistered provider → 503 (matches clone/fork) |
+| `GET` | `/api/remote-artifacts/{provider}/browse` | Provider-routed discovery: `?q=` → `search_remote`, else `list_remote(?scope=mine\|shared\|public)`; rows annotated with `local_slug`; unregistered provider → 404; registered but unavailable → 503 |
 | `POST` | `/api/remote-artifacts/{provider}/clone` | Bidirectional clone (`publish_sync.clone_from_remote`, sets `auto_sync=True` → arms future pushes); **gated by `_publish_governance_denied` on the routed provider**; empty registry → 503. Body: `{ "external_id": ... }` (provider-native ids can contain `/`, which a path segment can't carry) |
 | `POST` | `/api/remote-artifacts/{provider}/fork` | Independent copy with pull-only `fork_metadata` lineage (`publish_sync.fork_from_remote`); ungated ingress; empty registry → 503. Body: `{ "external_id": ... }` |
-| `GET` | `/api/remote-artifacts/{provider}/{external_id}` | Read-only detail fetch (metadata + content) for a provider-hosted artifact the user has no local copy of — content source for the remote-detail viewer; ungated ingress; passes `_redact_remote_response`; empty registry → 503 |
+| `GET` | `/api/remote-artifacts/{provider}/{external_id}` | Read-only detail fetch (metadata + content) for a provider-hosted artifact the user has no local copy of — content source for the remote-detail viewer; ungated ingress; passes `_redact_remote_response`; unregistered provider → 404; provider failure → 502 |
 | `GET` | `/api/remote-artifacts/{provider}/{external_id}/comments` | List comments on a provider-hosted artifact (`fetch_comments`, `COMMENTS_READ`); TTL-cached in memory; provider failure surfaces as `remote_sync_error`, not a 500; ungated ingress; anchor/body redacted per comment |
 | `POST` | `/api/remote-artifacts/{provider}/{external_id}/comments` | Post a top-level comment straight through to the provider (`post_comment`, `COMMENTS_WRITE`, scope=shared); **egress — gated by `_publish_governance_denied` on the routed provider** |
 | `POST` | `/api/remote-artifacts/{provider}/{external_id}/comments/{comment_id}/reply` | Reply to a provider thread (`reply_comment`); **egress — gated by `_publish_governance_denied`** |
 | `POST` | `/api/remote-artifacts/{provider}/{external_id}/comments/{comment_id}/review` | Advance a provider thread to REVIEW (`mark_review`); **egress — gated by `_publish_governance_denied`** |
 | `DELETE` | `/api/remote-artifacts/{provider}/{external_id}/comments/{comment_id}` | Delete a provider comment (`delete_comment`); **egress — gated by `_publish_governance_denied`** |
 
-`external_id` (and `comment_id`) travel as percent-encoded path segments on
-these routes; aiohttp's `path_safe` matching (3.9.2+) preserves `%2F`, so a
-provider-native id containing `/` round-trips correctly (browse-listing ids are
-slash-free in practice). Clone/fork keep the id in the JSON body instead.
+Detail and comment operations carry `external_id` (and `comment_id`) in path
+segments, so the browse/detail ids used there must be slash-free; aiohttp decodes
+an encoded slash before route matching. Clone and fork keep `external_id` in the
+JSON body specifically so provider-native ids containing `/` round-trip safely.
 
 POST/PATCH/DELETE require an unrestricted session. The HTTP body envelope is
 capped at 2 MiB; the store enforces a per-content cap of 25 MiB
@@ -207,7 +577,7 @@ whose first `kiro_crew` import reached `artifacts` before `validation`;
 rename-safe membership id, tolerant-loaded for legacy meta.json.
 `ArtifactStore.set_folder()` is a metadata-only move (NO version bump);
 `list(folder=)` filters (None = all, `""` = unfiled, id = that folder).
-`ArtifactFolderStore` keeps a flat `parent_id` tree in
+`ArtifactFolderStore` (`kiro_crew.artifact_store.folders`) keeps a flat `parent_id` tree in
 `~/.kiro/crew/artifact_folders.json` — create/rename/reparent (cycle- and
 depth-guarded, `MAX_FOLDER_DEPTH` 20)/reorder/delete, breadcrumb, item counts,
 and id-or-path resolution with mkdir -p semantics (`resolve_path`, all-or-nothing
@@ -382,10 +752,14 @@ using the publication the handler already read for its version capture. The orde
 chosen for its crash residue: die between the two steps in this order and the copy is
 withdrawn while the artifact remains, which the user simply deletes again; die between
 them in the reverse order and the local record is already gone while the content is still
-public, with nothing left to withdraw it by. Since `delete()` removes the artifact
-directory by slug under the store lock rather than writing back a value read earlier,
-placing a network round trip ahead of it does not widen any compare-and-swap window -- a
-save landing in that window is included in the delete the user asked for.
+public, with nothing left to withdraw it by. `delete()` removes the artifact directory BY
+SLUG under the store lock, and a slug is a name the store re-mints identically once freed,
+so placing a network round trip ahead of it DOES widen a window: a save landing there is
+included in the delete the user asked for, but an artifact deleted and recreated under the
+same title in that window takes the name back, and a removal by name alone would destroy
+the newcomer. The handler therefore holds `publication_guard` across the round trip and
+passes the generation and publication id it read into the removal, which is where the
+comparison happens -- see the withdrawal rules below.
 
 The local delete proceeds on ONE rule: only when there is nothing left to withdraw, or
 the destination confirmed the withdrawal. Anything else refuses, loudly. A destination
@@ -421,18 +795,50 @@ refuses the whole cascade, leaving the artifacts, their handles and the folder i
 That preflight cannot be trusted on its own, because nothing holds a lock across it and
 the destruction that follows: the folder tree and the artifact store have independent
 locks, and taking both would invite an ordering deadlock. An artifact filed into the
-subtree after the preflight enumerated it therefore reaches the destruction still
-holding a publication nobody withdrew. So the refusal is asked of the delete itself
-rather than checked in the cascade loop: `ArtifactStore.delete` takes an opt-in
-`refuse_if_published` flag and re-reads the record inside the same lock as the removal,
-which is what makes it hold. A check in the loop would be a check-then-act over a
-snapshot, so a publish landing between the scan and that artifact's own delete would
-still be destroyed. The flag defaults to False, so the single-artifact path is
-unchanged: it is answered at the handler, which attempts the withdrawal and refuses on
-its outcome. The folder tree change is already committed by the time the cascade
-refuses and cannot be rolled back, so a kept artifact survives with a dangling folder
-id and degrades to Unfiled, which readers already tolerate; the response names it so a
-partly-refused cascade does not read as a completed one.
+subtree after the preflight enumerated it, or re-published between its withdrawal and its
+removal, would otherwise reach the destruction still holding a publication nobody
+withdrew.
+
+The refusal is therefore asked of the delete itself rather than checked in the cascade
+loop: `ArtifactStore.delete` takes an opt-in `refuse_if_published` flag and re-reads the
+record inside the same lock as the removal, since a check in the loop would be a
+check-then-act over a snapshot. That re-read is necessary and **not** sufficient on its
+own, because the store lock is not the lock publication state is decided under. The
+decisive one is `publish_sync.publication_guard`, the per-slug lock every path holds when
+it reads whether an artifact has a live publication and then ACTS on that reading. The
+cascade holds it across BOTH the withdrawal and the destruction of each artifact, so a
+publish cannot land between them. It is taken in exactly three places -- `publish`, the
+single-artifact delete route, and the folder-cascade route -- and `unpublish` is
+deliberately not one of them: it clears a record after a network withdrawal while holding
+no guard, so there the identity comparison below is the ONLY thing standing between it and
+clearing a newcomer's handle. The registry backing the guard is refcounted: the count is
+taken before the acquire so a waiter keeps the entry alive, and an entry drops only at zero
+holders, where a later caller minting a fresh lock excludes nobody. That is what makes
+guarding ANY well-formed slug affordable rather than only the ones the store could resolve,
+which matters because a slug the store reads as empty is the only slug an artifact created
+inside the delete's own window can occupy. A malformed slug still passes through unguarded
+so the store answers `4xx`.
+
+Membership in the guarded set names an ARTIFACT, never a name. A freed slug is re-minted
+identically and creating an artifact takes no guard, so the cascade carries
+`destroyable_generations`, a slug-to-generation map, and each door compares identity under
+the lock it removes beneath: `expect_created_at` for the artifact's generation, and
+`expect_publication_id` for the publication's own id, because `set_publication` replaces
+only the publication block and leaves `created_at` untouched, so a re-publish of the same
+artifact is invisible to the generation alone. Expected ABSENCE is its own value,
+`EXPECT_ABSENT`, rather than `None`: `None` means there is no identity to compare and so
+performs no check at all, which on the absent-slug path is precisely the newcomer the guard
+was taken for. An artifact holding a slug the caller did not name therefore survives. The
+map defaults to empty, so a caller naming no generations destroys nothing rather than
+everything, and the response separates the reasons: `replaced_artifact_slugs` for one
+replaced after the caller named it, `kept_published_artifact_slugs` for one still
+published, `unguarded_artifact_slugs` for one that joined the subtree outside the guarded
+set. The single-artifact door answers `409` on the same comparison.
+
+The folder tree change is already committed by the time the cascade refuses and cannot be
+rolled back, so a kept artifact survives with a dangling folder id and degrades to Unfiled,
+which readers already tolerate; the response names it so a partly-refused cascade does not
+read as a completed one.
 
 `unpublish` is **not** a way out of a kept publication either, though it was designed as
 one. It obeys the same absence rule as the delete path: a destination that refuses the
@@ -558,17 +964,16 @@ pristine to every metadata signal above, and the sweep would otherwise delete th
 user's comments along with it.
 
 The edit test is `updated_at == created_at`, **not** `version == 1`: `update()`
-bumps `version` only when `snapshot=True`, so a plain content save — the common
-agent-iteration path — leaves the version at 1 while rewriting the body. Keying on
+bumps `version` only when `snapshot=True`, so a non-snapshot dashboard or direct
+store save can leave the version at 1 while rewriting the body. Keying on
 the version would let the sweep delete freshly-iterated widgets. Conversely
 `set_pinned` / `set_folder` deliberately don't touch `updated_at`, which is why
 they are separate signals.
 
-Ordering is newest-first, re-sorted on `(updated_at, slug)` inside the sweep:
-`list()`'s `updated_at`-only sort is not a total order, so widgets registered in
-the same microsecond would otherwise tie-break by directory scan order and make
-*which* one gets deleted nondeterministic. The candidate snapshot is taken
-unlocked, so eligibility is **re-checked and the directory removed in a single
+Ordering is newest-first on the same total `(updated_at, slug)` order used by
+`list()`. The sweep re-sorts defensively so its destructive boundary does not
+inherit an ordering assumption from the candidate source. The candidate snapshot
+is taken unlocked, so eligibility is **re-checked and the directory removed in a single
 lock acquisition** — otherwise a star landing mid-sweep would lose to a stale
 verdict and silently delete an artifact the user had just claimed. Note the sweep
 deliberately does NOT delegate to `delete()`: re-checking under the lock and then
@@ -596,6 +1001,12 @@ inputs, distinguished by the leading **star** column:
   **All** view via `GET /api/artifacts/session-docs`. Clicking a row opens a
   **read-only preview** (`SessionDocPreview`) that fetches the file through the
   redacting `GET /api/file-read` endpoint — a pure read that registers nothing.
+  It reads through the shared `utils/fileReadQuery` entry (`['file-read', path]`),
+  the same one the chat side panel's file tabs use, so the binary verdict comes
+  with it: bytes the backend marks binary render an **undecodable** status (no
+  Retry, since a refetch cannot make them text), and a 404 at render time shows a
+  missing-file placeholder. In the table view the session documents sit under a
+  "From your chats · N" divider.
   A document recorded with a **relative path is refused client-side** (no
   request is sent): `resolve=1` would resolve it against the gateway's
   *current* project directory, not the project it was recorded under, so a
@@ -634,6 +1045,15 @@ Materialization is authorization-gated: the requested path must appear in the
 recorded chat `file_changes` (never an arbitrary client path), and the read is
 routed through the `hooks.safe_read_file_bytes` keystone. `source` is recorded
 as `chat` for materialized documents.
+
+Both the session-document list and that allowlist come from the recorded
+`meta.file_changes`, which is capped per turn (`dashboard/chat_runner.py`): at
+most 200 entries (`_MAX_TURN_SNAPSHOT_ENTRIES`, newest kept), and 400,000 chars
+of path plus snapshot content beside the turn's protected entry
+(`_MAX_TURN_SNAPSHOT_CHARS`). An entry dropped by the cap is only counted, in
+`file_changes_omitted_files`, so it never appears and cannot be materialized. A
+demoted entry loses its snapshot content but keeps its path, so it still
+appears.
 
 ### In-session Artifacts tab
 
@@ -679,17 +1099,79 @@ every write-side unit test still green — so test the round-trip
 
 ## Validation & Limits
 
+The field limits and grammar are `kiro_crew.artifact_store.rules`; the content,
+version and auto-widget caps are the store's, in `kiro_crew.artifacts`.
+
 | Field | Limit |
 |---|---|
 | `slug` | regex `^[a-z0-9](?:[a-z0-9-]{0,78}[a-z0-9])?$`, ≤ 80 chars |
 | `name` | ≤ 200 chars, non-empty |
 | `description` | ≤ 2,000 chars |
-| `tags` | ≤ 16 tags; each ≤ 64 chars |
+| `tags` | ≤ 16 tags; each ≤ 64 code points of its NFC form (`MAX_TAG_LEN`), made of Unicode letters, the marks that attach to them (`Mn`/`Mc`, at most 4 on one character) and digits (`Nd`/`Nl`) plus `_`, `:`, `.`, `-`, opening with a letter or digit, every code point visible (no `Default_Ignorable_Code_Point`, no enclosing mark) and its own spelling (no compatibility form of other characters) (`normalize_tag`) |
 | `content` | ≤ 25 MiB (`MAX_CONTENT_BYTES`) |
-| `kind` | one of `widget` / `html` / `markdown` / `svg` / `json` / `text` / `webapp` |
-| `source` | one of `chat` / `cron` / `subagent` / `manual` / `import` |
+| `kind` | one of `widget` / `html` / `markdown` / `svg` / `json` / `text` / `image` / `webapp` |
+| `source` | stored values: `chat` / `cron` / `subagent` / `manual` / `import` / `dashboard` / `slack` / `cli` / `task-runner` / `unknown`; the MCP save schema accepts the first five explicitly |
 | `MAX_VERSIONS` | 50 (oldest pruned beyond cap) |
 | `MAX_AUTO_WIDGET_ARTIFACTS` | 200 (oldest **unpinned auto-registered** widgets pruned beyond cap) |
+
+A tag is a user-facing label that lives only in `meta.json` — never a file
+name, a URL segment or a query identifier, which is the slug's job (`slugify`
+keeps slugs ASCII by transliterating) — so its alphabet is the user's: `売上`,
+`café`, `München` and `हिन्दी` are tags. Nonspacing and spacing marks (`Mn`,
+`Mc`) are admitted because NFC leaves some standing beside their base letter
+(Devanagari vowel signs, Thai tone marks) and without them whole scripts could
+not be written, and a mark follows a letter, a digit or another mark, never a
+separator (an accent on a hyphen is refused the way a leading mark is: it has
+no base); enclosing marks (`Me`, the keycap that turns `1` into an emoji,
+the enclosing circle) are refused with the symbols, and so are other numbers
+(`No`: `½`, `²`, `①`, the numerals of scripts that do not count in decimal
+digits), which are symbols drawn from a digit rather than digits. One character
+carries at most four combining marks (`MAX_CONSECUTIVE_MARKS`): Hebrew pointing
+and a Tibetan syllable stay within that, and `a` under 63 accents is a glyph
+that overflows its chip, not writing. Everything else is refused
+with a plain-English reason: punctuation other than the four separators, symbols
+and emoji, and every control, format (zero-width, bidi override) and whitespace
+character. A second test runs before the category test: every code point of the
+Unicode `Default_Ignorable_Code_Point` property (`_DEFAULT_IGNORABLE`, the
+published table, 4,174 code points) is refused as "renders as nothing", because
+the property also holds letters and marks — the variation selectors, the
+combining grapheme joiner, the Hangul fillers — that the category test would
+admit although a reader cannot see them. Admitting one would give `ops` an
+invisible twin `ops<VS16>` that `list(tag="ops")` misses, and would let a
+credential planted in a tag (`AKIA<VS16>IOSFODNN7EXAMPLE`) pass the dashboard's
+redactor while reading as the bare key; the MCP gate's sanitizer keeps these
+marks (they are `Mn`, and emoji text needs them), so the tag rule is the check
+that stops them. The table is hand-derived from Unicode 15.0, the version Python
+3.12 ships; a test pins `unicodedata.unidata_version` to it, and on a runtime
+with a newer Unicode (Python 3.13 ships 15.1) it is skipped with a reason that
+names the regeneration step, since the table cannot be checked there. A third test, also
+before the category test, refuses every code point whose NFKC form differs from
+itself — a compatibility form of other characters: full-width `ｏｐｓ`,
+mathematical `𝐨𝐩𝐬`, the `ﬁ` ligature, `µ`, `①`, `Ⅻ` — naming the plain
+spelling to write instead, because NFC leaves these alone and each would be a
+second stored tag with the look of `ops`, `fi`, `μ`, `1` or `XII`. Two letters
+are kept as typed by decision: THAI CHARACTER SARA AM and LAO VOWEL SIGN AM
+decompose for compatibility into NIKHAHIT + SARA AA, yet the composed form is
+what every Thai and Lao keyboard types (`น้ำ`, water, is written with U+0E33);
+they are the only tag-admissible letters whose `<compat>` decomposition opens
+with a combining mark, and a test pins the allowlist to exactly them. The
+outcome is that a tag is always visible and has one unambiguous spelling, with
+two stated residuals the rule does not chase: a cross-script confusable such as
+Cyrillic `орѕ` beside Latin `ops`, and the decomposed twin `นํา` of the kept SARA
+AM. The confusable is not a compatibility form -- NFKC leaves it, so no
+normalization rule tells the two apart -- and telling them apart is a
+confusables check (UTS #39 skeletons compared against the tags already stored,
+plus its script-mixing restriction, under which a Latin-with-Han-and-Kana tag
+such as `日本語-api` is allowed and `орѕ` beside `ops` is caught), a different
+mechanism from the spelling rule this change is about and left out of it rather
+than half-done. The store writes the NFC form, two spellings of one
+label dedupe to one tag, and `list(tag=…)` reads its filter through the same
+rule, so a label matches however it was typed and a filter that is not a tag
+matches nothing. ASCII tags are unchanged by all of this. The widening is a
+one-way door: once non-ASCII tags are stored in `meta.json`, reverting this
+rule or narrowing it later strands them — an update that re-sends such a tag is
+refused and `list(tag=…)` cannot reach it — so a later narrowing ships with a
+migration that rewrites or drops the stranded tags first.
 
 ## Security
 
@@ -698,9 +1180,10 @@ every write-side unit test still green — so test the round-trip
 - **Sensitive paths** — every read and write goes through
   the sensitive-path fence. The store's own file helpers (`_read_text` /
   `_write_text` / `_read_bytes` / `_write_bytes`) canonicalise the path with
-  `os.path.realpath` and ask `security.is_sensitive_canonical_path()` (through
-  `_fence_refuses`), the shared entry point for a caller-canonicalised path: it
-  answers with `security.is_sensitive_path()` on the event loop and with
+  `os.path.realpath` and ask `security.canonical_path_refusal()` (through
+  `_fence_refusal`), the reason-or-None form of the shared entry point for a
+  caller-canonicalised path: it answers with `security.sensitive_path_refusal()`
+  on the event loop and with
   `security.is_sensitive_resolved_path()` off it, so a caller earns the
   off-pool gate by offloading, never by declaring anything; `GET
   /api/artifacts` runs `store.list()` on a worker for that reason. The two read
@@ -708,11 +1191,13 @@ every write-side unit test still green — so test the round-trip
   `_open_pinned_for_read`): a link at the final name is refused, the inode must
   be a regular file with one link, and the fence judges the kernel's path for
   the opened inode whenever it differs from the path already judged. The root
-  check and the file-backed `source_path` pointers stay on
-  `security.is_sensitive_path()` unconditionally; the store refuses to
-  instantiate at any sensitive root.
-- **Relocate root confinement** — `PATCH /relocate` (and the `artifact_move`
-  MCP tool) point a file-backed artifact at a `source_path`; a later GET reads
+  check asks `security.sensitive_path_refusal()`: the store refuses to
+  instantiate at any sensitive root, and a resolver stall is refused like a
+  match but raised with the producer's own "could not be verified" wording.
+  The file-backed `source_path` pointers stay on the bounded
+  `security.is_sensitive_path()` and fall back to the snapshot silently.
+- **Relocate root confinement** — `PATCH /api/artifacts/{slug}/relocate`
+  points a file-backed artifact at a `source_path`; a later GET reads
   that file, so an unconfined relocate would be an agent-reachable
   arbitrary-local-file read primitive. The target is therefore confined to the
   user's home dir by default (an operator can widen to additional absolute roots
@@ -734,9 +1219,10 @@ every write-side unit test still green — so test the round-trip
   loaded companion's extra credential/cookie regexes apply to the audit trail.
 - **Atomic writes** — `_write_text()` writes to a `.tmp` sibling and renames,
   so a crash mid-write cannot corrupt `current.html` or `meta.json`.
-- **Tolerant load** — `_read_meta_file()` ignores unknown keys and supplies
-  defaults for missing keys, so future schema additions don't break existing
-  files.
+- **Tolerant load** — `ArtifactStore._read_meta_file()` hands the parsed file to
+  `decode_meta` in `kiro_crew.artifact_store.records`, which ignores unknown keys
+  and supplies defaults for missing keys, so future schema additions don't break
+  existing files.
 - **Frontend rendering** — artifact bodies are rendered in the same sandboxed
   iframe that powers `<mcwidget>`, and that frame loads a **real document** from
   `GET /sandbox-doc/{doc_id}/{tok}` rather than a browser-built `blob:` URL. A
@@ -803,12 +1289,13 @@ every write-side unit test still green — so test the round-trip
 ## Versioning
 
 Each `create()` writes the initial content to `current.html` and snapshots
-it as `versions/v1.html`. Each subsequent `update(slug, content=…)` that
-changes the content bumps the version number, writes the new content as
-both `current.html` and `versions/v{N}.html`. Older versions remain in
-`versions/` untouched until the prune cap is reached, so any prior version
-can be re-read via `get(slug, version=N)` or rolled back into `current.html`
-via a follow-up `update()`.
+it as `versions/v1.html`. `update(slug, content=…, snapshot=False)` updates the
+live state without adding a numbered version; `snapshot=True` also increments
+`version` and writes `versions/v{N}.html`. The MCP `artifact_update` path defaults
+to snapshots, while dashboard Save does not unless it sends `snapshot: true`.
+Older versions remain untouched until the prune cap is reached, so any retained
+version can be read via `get(slug, version=N)` or restored as a fresh snapshot by
+`artifact_revert`.
 
 `list_versions(slug)` returns the sorted set of stored version numbers.
 `get(slug, version=N)` reads a specific version. After pruning, lower-numbered
@@ -819,11 +1306,24 @@ out-of-range versions.
 
 Comments live in a per-artifact `comments.json` sidecar (`ArtifactComment`
 dataclass; threads are one level deep — replies carry the root's id as
-`thread_id`). `status` is `open | review | resolved`; `sync_state` tracks
+`thread_id`). The file format is `kiro_crew.artifact_store.records`
+(`decode_comments` / `encode_comments`); the thread rules — the forwarding filter,
+the whole-thread retention cap, the provider merge, the anchor rescan and the
+root-cascade delete — are `kiro_crew.artifact_store.comments`; `ArtifactStore`
+holds the lock and does the IO. `status` is `open | review | resolved`; `sync_state` tracks
 provider push status (`local_only | pending_push | synced | push_failed`).
 Provider push/reconcile itself is companion-edition-only behavior behind the
 CPP publish seam — the open-source core carries the `sync_state` field and
 enforces the provider-origin guards, but ships no remote reconcile loop.
+
+**Forwarding filter.** `GET /api/artifacts/{slug}/comments?exclude_resolved=1`
+(or `=true`) drops resolved threads at thread-root granularity: a reply inherits
+its root's status (`filter_comments_for_forward` in `artifact_store/comments.py`).
+Without the parameter the full list comes back. The companion chat's Submit
+forwards only unresolved threads, through the client mirror
+`lib/commentFilter.ts`, which also drives the agent-facing open-comment count.
+The comments sidebar still lists every thread, with resolved ones behind its
+show-resolved toggle, by design.
 
 **Inbound comment sync (fetch-on-view).** `GET /api/artifacts/{slug}/comments`
 opportunistically pulls the provider's comments (`fetch_comments`, when the
@@ -939,11 +1439,13 @@ adding a parallel watcher (see `kiro_crew.knowledge.artifact_ingest`):
   `ensure_artifact_source`, `refresh_artifact_name`, `ingest_artifact`'s
   `_get_state` read and `release_stale_claim` write, the per-job
   `get_job_status` read in `reconcile_artifacts`, and `remove_artifact` (a
-  `delete_items_batch` → graph rebuild). The one take still on the loop is
-  `ingest_artifact`'s post-ingest `get_job_status` read: it sits between the
-  commit and the fallback ownership write, so offloading it belongs with the
-  ownership-write change that keeps those two from being separated by a
-  cancellation point. The ordering the handler describes is preserved across
+  `delete_items_batch` → graph rebuild). `ingest_artifact`'s post-ingest
+  `get_job_status` read travels with the fallback ownership write as one
+  `run_to_completion` unit, so no cancellation point separates them. That
+  fallback, and the in-hop retry of a failed ownership write, go through
+  `_write_ownership_if_intact`: under `BEGIN IMMEDIATE` it names the group only
+  while every committed id still exists, so a concurrent dedup verdict on the
+  row is never overwritten. The ordering the handler describes is preserved across
   the hops — name refresh before ingest, the kind-change reconcile before the
   ingest — and the deduped/ownership finalizers still run on the pipeline's own
   worker hop, not the loop.
@@ -1131,7 +1633,19 @@ effect: the host route `/artifacts/:slug` owns the URL, and an in-place
 
 **Composer staging** — "Ask agent to address" routes into the bound session and
 *stages* (never auto-sends) its message through the existing `writePrefill`
-sessionStorage channel ChatPage already consumes on slot activation.
+sessionStorage channel ChatPage already consumes on slot activation (the
+slot-change restore in `website/src/pages/chat/page/composerDrafts.ts`).
+
+**Selection comment composer** — selecting a passage opens a type-first comment
+composer on the artifact page, the remote artifact page and the chat side
+panel's file view. A draft is kept per passage in `sessionStorage`
+(`utils/composerDraftStore.ts`) under `mc-artifact-composer-draft:<slug>`,
+`mc-remote-artifact-composer-draft:<provider>/<id>` or
+`mc-comment-composer-draft:<path>`. Closing a non-empty draft asks before
+discarding it. Posting shows a saving state; a failed post keeps the text in the
+box for a retry; a post refused after the composer closed shows a banner quoting
+the passage. Kinds that cannot anchor a comment (`json`, `svg`, images) get Copy
+only on a selection.
 
 ## Roadmap
 
@@ -1183,7 +1697,7 @@ only, mirrored by the server CSP `frame-src https://*.cloudfront.net`);
 | `deploy_target.region` | string | AWS region |
 | `deploy_target.public_url` | string | The live HTTPS URL |
 | `deploy_target.profile` | string | Named AWS CLI profile used |
-| `app_dir` | string | Absolute path of the local app tree that was/would be deployed. Set by the artifact author (the deploy API never sees the artifact and the directory together, so it cannot back-fill this). LLM-influenceable — re-validated against the allow-listed local roots at serve time. |
+| `app_dir` | string | Absolute path of the local app tree that was/would be deployed. Set by the artifact author. A deploy by slug resolves `app_dir/public` from it (`deploy.handlers.resolve_webapp_public_dir`, shared with the app preview) and writes `lifecycle` and `deploy_target` back, but never writes `app_dir` itself. LLM-influenceable — re-validated against the allow-listed local roots at serve time. |
 | `architecture.tier` | enum | `"static"`, `"api"`, `"stateful"` |
 | `architecture.resources` | list | `[{type, id}]` — infrastructure resources |
 | `lifecycle.created_at` | string | ISO 8601 creation time |
@@ -1302,7 +1816,8 @@ agent-authored SVG as an image would reintroduce a same-origin script vector.
 ```
 
 The sidecar's extension is derived **from the allowlisted mime**, never from the
-stored `ext` field, on every read (see [Security](#security)). `delete` removes
+stored `ext` field, on every read (see [Security](#security)). The allowlist and
+the header sniffers live in `kiro_crew.artifact_store.images`. `delete` removes
 the whole artifact directory, so the sidecar needs no separate cleanup.
 
 ### `image` metadata schema

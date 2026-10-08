@@ -36,6 +36,12 @@ from kiro_crew.env import mcp_runtime_path, resolve_krb5_ccname
 from kiro_crew.mcp_gateway import transport
 from kiro_crew.mcp_gateway.pool import READ_BUFFER_LIMIT_BYTES
 from kiro_crew.mcp_gateway.shutdown_budget import TOTAL_SHUTDOWN_BUDGET_SECS
+from kiro_crew.metrics.events import (
+    LIVENESS_ESCALATED_LATENCY_MS,
+    LIVENESS_ESCALATED_PROBES,
+    emit_counter,
+    emit_histogram,
+)
 from kiro_crew.recovery.ladder import L4_GATEWAYD, LADDER, default_ladder
 from kiro_crew.sandbox import _SENSITIVE_ENV_PREFIXES as _SANDBOX_SENSITIVE_ENV_PREFIXES
 
@@ -248,6 +254,10 @@ class GatewayManager:
         self._last_drift_check = 0.0
         self._cap_settle_logged = False
         self._lifecycle_lock = asyncio.Lock()
+        # Detached fire-and-forget telemetry tasks (saturation-signal emits).
+        # Held only so the event loop keeps a strong reference until each
+        # finishes; each removes itself on done. Never awaited by any caller.
+        self._telemetry_tasks: set[asyncio.Task[None]] = set()
 
     @property
     def socket_path(self) -> Path:
@@ -401,6 +411,11 @@ class GatewayManager:
     def _owned_by_a_live_other(self, pong: dict) -> bool:
         """True when the pong names an owner that is alive and is not this process.
 
+        The supervisor an in-app restart through a supervising launcher leaves
+        behind counts as this process: a live ancestor whose image is not a
+        Python interpreter (``platform_compat.is_exec_supervisor_of_this_process``).
+        A live gateway ancestor still runs Python and stays a rival.
+
         ``owner_pid`` 0 or absent means an operator-run or pre-owner daemon: no
         one else's, so adoptable on the other gates. A dead owner is an orphan
         (its sweeper will take it down shortly) and is adoptable on the other
@@ -411,6 +426,11 @@ class GatewayManager:
         if isinstance(owner, bool) or not isinstance(owner, int) or owner <= 0:
             return False
         if owner == os.getpid():
+            return False
+        if platform_compat.is_exec_supervisor_of_this_process(owner):
+            # The supervisor an in-app restart through a supervising launcher
+            # left behind: this gateway's own previous image, now running the
+            # launcher. The code and orphan gates still apply to its daemon.
             return False
         return platform_compat.pid_exists(owner)
 
@@ -691,8 +711,10 @@ class GatewayManager:
         # with no ceiling on a slow or remote home, and this method already
         # offloads a single chmod.
         env["PATH"] = await asyncio.to_thread(mcp_runtime_path, env.get("PATH", ""))
+        # ``-P``: the daemon inherits this process's cwd -- the home directory
+        # under the service unit -- and ``-m`` would put it ahead of the stdlib.
         argv = platform_compat.isolated_python_argv(
-            "-m", _GATEWAYD_MODULE,
+            "-P", "-m", _GATEWAYD_MODULE,
             "--socket", str(self._spec.socket_path),
             # This process is the daemon's one owner: it exits when we are
             # gone (start-time-checked, so a recycled PID does not count)
@@ -1080,6 +1102,13 @@ class GatewayManager:
                 ),
                 timeout=_left(),
             )
+        except FileNotFoundError:
+            # No socket (or named pipe) at the address: no daemon is running.
+            # That is the expected answer on every cold start, so it is a
+            # probe result, not a fault. A socket that exists but refuses or
+            # times out stays at WARNING below.
+            logger.debug("mcp-gateway ping: no daemon socket at %s", self._spec.socket_path)
+            return None
         except (asyncio.TimeoutError, OSError) as exc:
             logger.warning("mcp-gateway ping connect failed: %s", exc)
             return None
@@ -1295,7 +1324,7 @@ class GatewayManager:
                     # The load misverdict this change exists to fix is already
                     # handled by the escalation: a daemon that answers either
                     # probe is alive and is never displaced.
-                    pong = await self._ping_with_escalation()
+                    pong = await self._ping_with_escalation(observe=True)
                     if pong is not None:
                         if await self._reconcile_adopted(pong):
                             continue
@@ -1519,7 +1548,7 @@ class GatewayManager:
             # gives up at it, so a healthy daemon serving 100+ connections looks
             # identical to a dead one. Killing the wrong one costs every attached
             # session its tools.
-            if await self._ping_with_escalation() is not None:
+            if await self._ping_with_escalation(observe=True) is not None:
                 consecutive_failures = 0
                 continue
             consecutive_failures += 1
@@ -1537,7 +1566,7 @@ class GatewayManager:
                     f" (no reply within {_LIVENESS_ESCALATED_TIMEOUT_SECS:.0f}s)"
                 )
 
-    async def _ping_with_escalation(self) -> Optional[dict]:
+    async def _ping_with_escalation(self, *, observe: bool = False) -> Optional[dict]:
         """The daemon's pong, allowing for a loaded event loop.
 
         The fast probe's 2s bound measures load, not liveness, and
@@ -1550,15 +1579,65 @@ class GatewayManager:
         Not used by the one-shot assessment gates (start-up election, the
         post-respawn incumbent check) or by the public status probe. For the
         status probe that is deliberate: a UI poll is waiting on it. For the
-        assessment gates it is only a scope boundary — their miss path can
-        unlink a LIVE daemon's socket, because ``transport.probe_live`` reads a
-        saturated accept backlog as not-live. See the daemon-lifecycle spec;
-        that defect belongs to the endpoint lifecycle, not to this verdict.
+        assessment gates it is only a scope boundary: their miss path goes
+        through ``transport.remove_stale``, which leaves an endpoint that
+        ``transport.probe_live`` reports live in place. See the daemon-lifecycle
+        spec.
+
+        Observability (``observe=True`` only): the escalation itself is the
+        precursor state to every kill/reconnect cycle — the fast bound missed,
+        so the daemon is loaded, and this longer probe is the only thing that
+        can tell loaded-but-alive from dead. That state is otherwise silent, so
+        the watchdog callers surface it: a counter of escalated probes
+        (``answered`` distinguishes loaded-but-alive from dead) and, when the
+        daemon answers, the OBSERVED round-trip latency the fast bound throws
+        away — the load evidence an operator needs to see saturation before it
+        becomes an outage, and the field data against which
+        ``_LIVENESS_ESCALATED_TIMEOUT_SECS`` can be checked. ``observe`` is
+        False for the start-up confirmation caller: a fast miss there is a
+        daemon still coming up, not a saturated one, and would pollute the
+        series with start-up noise. The emit is fire-and-forget so telemetry
+        never gates the verdict — on the adopted path this probe's duration IS
+        the outage, and an awaited emit on a saturated executor would extend it.
         """
         pong = await self._ping_payload()
         if pong is not None:
             return pong
-        return await self._ping_payload(timeout=_LIVENESS_ESCALATED_TIMEOUT_SECS)
+        started = time.perf_counter()
+        escalated = await self._ping_payload(timeout=_LIVENESS_ESCALATED_TIMEOUT_SECS)
+        if not observe:
+            # Start-up confirmation caller: a fast miss here is a daemon still
+            # coming up, not a saturated one, so it is not the signal.
+            return escalated
+        # Read the clock the instant the probe returns, BEFORE any emit: the
+        # counter/histogram calls do a lazy provider import and record
+        # synchronously, and that cost must not land inside the measured span —
+        # it would show up as daemon latency, worst on the sub-millisecond
+        # round trip this series exists to keep honest.
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        answered = escalated is not None
+
+        # Off the event loop AND fire-and-forget: the FIRST emit in this process
+        # builds the metrics recorder synchronously (disk config load, deferred
+        # SDK import, an install-id file dance — tens of ms). This runs on the
+        # supervisor's own loop, and on the adopted path the probe's duration IS
+        # the outage, so neither an inline emit nor an awaited thread hop may
+        # extend the verdict. The emit is swallowed-error best-effort, so a
+        # detached task that fails changes nothing the caller sees.
+        def _emit_saturation_signal() -> None:
+            emit_counter(LIVENESS_ESCALATED_PROBES, {"answered": answered})
+            if answered:
+                emit_histogram(
+                    LIVENESS_ESCALATED_LATENCY_MS,
+                    elapsed_ms,
+                    {"process": "gatewayd"},
+                    unit="ms",
+                )
+
+        task = asyncio.ensure_future(asyncio.to_thread(_emit_saturation_signal))
+        self._telemetry_tasks.add(task)
+        task.add_done_callback(self._telemetry_tasks.discard)
+        return escalated
 
     async def _terminate_process(self, *, grace_secs: float) -> None:
         proc = self._process

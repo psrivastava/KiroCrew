@@ -15,12 +15,37 @@ _Redactor = Callable[[str], tuple[str, object]]
 #: rides in the ``approval_resolved`` payload: without it an expired card
 #: renders as a rejection.
 _EXPIRED_DECISION = "expired"
+#: The audit outcome of a wait whose id a later same-id request took over.
+_SUPERSEDED_DECISION = "superseded"
 
 
 def _redact(text: object, redact_url: _Redactor, redact_secret: _Redactor) -> str:
     value, _ = redact_url(str(text or ""))
     value, _ = redact_secret(value)
     return value
+
+
+def _push_slots(state: Any) -> None:
+    """Recompute the slot lane flags; a failed push never breaks the approval."""
+    try:
+        state.push_slots_update()
+    except Exception:
+        state._log.debug("push_slots_update failed after approval status change", exc_info=True)
+
+
+def _bounded_purpose(text: str) -> str:
+    """Cap a redacted approval purpose to the display bound native purposes use."""
+    # Circular import: chat_utils imports state, which imports this module.
+    from kiro_crew.dashboard.chat_utils import _MAX_TOOL_PURPOSE, _redact_tool_field
+
+    return _redact_tool_field(text, limit=_MAX_TOOL_PURPOSE)
+
+
+def _slot_decision(approved: bool, rejected_once: bool) -> str:
+    """The decision string a slot's approval future carries."""
+    if approved:
+        return "approved"
+    return "rejected_once" if rejected_once else "rejected"
 
 
 class ApprovalCoordinator:
@@ -45,14 +70,26 @@ class ApprovalCoordinator:
         state._approval_futures[approval_id] = future
         state._pending_approvals[approval_id] = {
             "id": approval_id,
+            # The request id is the caller's and can recur; this names THIS
+            # request, so a card rendered from an earlier record with the same
+            # id cannot resolve its replacement.
+            "instance": uuid.uuid4().hex,
             "source": source,
             "tool": _redact(tool, redact_url, redact_secret),
             "tool_input": _redact(tool_input, redact_url, redact_secret),
-            "tool_purpose": _redact(tool_purpose, redact_url, redact_secret),
+            # Retained and broadcast, so bounded here like the native path's
+            # purpose: a caller's multi-megabyte purpose never reaches the record.
+            "tool_purpose": _bounded_purpose(_redact(tool_purpose, redact_url, redact_secret)),
             "slot": slot,
             "ts": time.time(),
         }
         state.broadcast_ws("approval", state._pending_approvals[approval_id])
+        # The record names its owning slot, and the slot projection reads the
+        # live records through ``pending_coordinator_approvals``: this push is
+        # what moves the parent slot into the Needs Approval lane. Without it
+        # the lane, the command palette and Crew Companion's session watch all
+        # keep reading the slot as idle until some unrelated push happens.
+        _push_slots(state)
         timeout = (
             state._BACKGROUND_APPROVAL_TIMEOUT_SECS if is_background else state._APPROVAL_TIMEOUT
         )
@@ -61,16 +98,32 @@ class ApprovalCoordinator:
         except (asyncio.TimeoutError, asyncio.CancelledError):
             return False
         finally:
-            # A future that never carried a decision means the wait expired or
-            # was cancelled: retire the approval BEFORE popping it, or the
-            # rendered card keeps live buttons that answer 404 forever because
-            # no ``approval_resolved`` frame is ever emitted. A resolved future
-            # (done with a result) is retired by resolve()/resolve_state();
-            # retiring again here would double the broadcast on the healthy path.
-            if future.cancelled() or not future.done():
-                ApprovalCoordinator._retire_unresolved(state, approval_id, slot)
-            state._pending_approvals.pop(approval_id, None)
-            state._approval_futures.pop(approval_id, None)
+            # The id is the caller's and can recur while this wait is open; a
+            # later request then owns the record and the future under it. Only
+            # this request's own are retired and removed, judged by the future
+            # this wait created: the replacement's card, buttons and resolver
+            # stay live, and its own exit takes the slot out of the lane.
+            if state._approval_futures.get(approval_id) is future:
+                # A future that never carried a decision means the wait expired
+                # or was cancelled: retire the approval BEFORE popping it, or
+                # the rendered card keeps live buttons that answer 404 forever
+                # because no ``approval_resolved`` frame is ever emitted. A
+                # resolved future (done with a result) is retired by
+                # resolve()/resolve_state(); retiring again here would double
+                # the broadcast on the healthy path.
+                if future.cancelled() or not future.done():
+                    ApprovalCoordinator._retire_unresolved(state, approval_id, slot)
+                state._pending_approvals.pop(approval_id, None)
+                state._approval_futures.pop(approval_id, None)
+                # Every exit -- decided, expired, cancelled -- leaves the record
+                # gone, so one push here takes the slot back out of the lane.
+                _push_slots(state)
+            elif future.cancelled() or not future.done():
+                # Superseded by a same-id request: its frame, record and slot
+                # lane now belong to the replacement and are left alone, but
+                # this wait still ended undecided and the audit trail says so,
+                # under its own outcome so the replacement's rows stay distinct.
+                state._audit_approval(slot or "state", approval_id, False, _SUPERSEDED_DECISION)
 
     @staticmethod
     def _retire_unresolved(state: Any, approval_id: str, slot_key: str) -> None:
@@ -93,7 +146,7 @@ class ApprovalCoordinator:
             )
 
     @staticmethod
-    def audit_and_broadcast(
+    def audit(
         state: Any,
         session_key: str,
         approval_id: str,
@@ -102,6 +155,7 @@ class ApprovalCoordinator:
         *,
         audit_provider: Callable[[], Any],
     ) -> None:
+        """Record one approval outcome in the SEL, without telling any client."""
         try:
             audit_provider().log_tool_invocation(
                 session_key=session_key,
@@ -112,6 +166,20 @@ class ApprovalCoordinator:
             )
         except Exception:
             state._log.warning("SEL audit failed for approval resolution", exc_info=True)
+
+    @staticmethod
+    def audit_and_broadcast(
+        state: Any,
+        session_key: str,
+        approval_id: str,
+        approved: bool,
+        decision: str,
+        *,
+        audit_provider: Callable[[], Any],
+    ) -> None:
+        ApprovalCoordinator.audit(
+            state, session_key, approval_id, approved, decision, audit_provider=audit_provider
+        )
         try:
             payload: dict = {"id": approval_id, "approved": approved}
             if session_key and session_key != "state":
@@ -142,32 +210,57 @@ class ApprovalCoordinator:
         rejected_once: bool,
         permission_marker: Callable[[list[dict], str, str], bool],
     ) -> bool:
-        if approved:
-            decision = "approved"
-        elif rejected_once:
-            decision = "rejected_once"
-        else:
-            decision = "rejected"
         if state.resolve_state_approval(approval_id, approved):
             if rejected_once:
                 state._log.warning(
                     "approval %s resolved at state level; decision %r downgraded to rejected",
                     approval_id,
-                    decision,
+                    _slot_decision(approved, rejected_once),
                 )
             return True
         for slot in state._slots.values():
-            future = slot._approval_futures.get(approval_id)
-            if future and not future.done():
-                future.set_result(decision)
-                if permission_marker(slot.messages, approval_id, decision):
-                    # The periodic flush skips clean slots; the resolved marker
-                    # must become durable before its future disappears.
-                    slot._dirty = True
-                state._audit_and_broadcast_approval(slot.key, approval_id, approved, decision)
-                state.push_slots_update()
+            if ApprovalCoordinator.resolve_on_slot(
+                state,
+                slot,
+                approval_id,
+                approved,
+                rejected_once=rejected_once,
+                permission_marker=permission_marker,
+            ):
                 return True
         return False
+
+    @staticmethod
+    def resolve_on_slot(
+        state: Any,
+        slot: Any,
+        approval_id: str,
+        approved: bool,
+        *,
+        rejected_once: bool,
+        permission_marker: Callable[[list[dict], str, str], bool],
+        expected_future: asyncio.Future[str] | None = None,
+    ) -> bool:
+        """Resolve *approval_id* on *slot*'s own future only; never a state-level one.
+
+        With *expected_future*, resolve only while the slot still holds THAT
+        future under the id: request ids recur within one slot, so a caller that
+        judged one request across an await must not settle a newer same-id one.
+        """
+        future = slot._approval_futures.get(approval_id)
+        if not future or future.done():
+            return False
+        if expected_future is not None and future is not expected_future:
+            return False
+        decision = _slot_decision(approved, rejected_once)
+        future.set_result(decision)
+        if permission_marker(slot.messages, approval_id, decision):
+            # The periodic flush skips clean slots; the resolved marker
+            # must become durable before its future disappears.
+            slot._dirty = True
+        state._audit_and_broadcast_approval(slot.key, approval_id, approved, decision)
+        state.push_slots_update()
+        return True
 
 
 class QuestionCoordinator:
@@ -213,7 +306,20 @@ class QuestionCoordinator:
         return safe_questions
 
     @staticmethod
-    async def post_card(state: Any, slot_key: str, questions: list[dict]) -> int:
+    async def post_card(
+        state: Any, slot_key: str, questions: list[dict], *, native: bool = False
+    ) -> int:
+        """Post one non-blocking card and record it on the slot.
+
+        ``native`` marks kiro-cli's own ``AskUserQuestion`` card, raised while
+        its turn is still running and waiting on the answer. The client routes
+        that card's answer as a steer into the live turn, where the MCP
+        ``ask_question`` card (posted after the turn ended) starts a next turn
+        even while sub-agents keep the slot busy. Both are otherwise the same
+        server-owned card: one ``card_id``, one record, one retirement. The
+        flag rides the frame AND the record so a reload rehydrates the routing
+        with the card.
+        """
         safe_questions = state._redact_questions(questions)
         card_id = f"card-{uuid.uuid4().hex[:16]}"
         # Register before an await so a user row racing a backpressured socket
@@ -223,11 +329,13 @@ class QuestionCoordinator:
             blocking=False,
             card_id=card_id,
             questions=safe_questions,
+            native=native,
         )
         payload = {
             "slot": slot_key,
             "card_id": card_id,
             "questions": safe_questions,
+            "native": native,
             "ts": time.time(),
         }
         return int(await state.deliver_ws_owners("question_card", payload))
@@ -240,6 +348,7 @@ class QuestionCoordinator:
         blocking: bool,
         card_id: str,
         questions: list[dict] | None,
+        native: bool = False,
     ) -> None:
         slot = state._slots.get(slot_key)
         if slot is None or not card_id:
@@ -253,6 +362,8 @@ class QuestionCoordinator:
         entry: dict = {"ts": time.time(), "blocking": blocking}
         if questions is not None:
             entry["questions"] = questions
+        if native:
+            entry["native"] = True
         slot._question_pending[card_id] = entry
         state._push_slots()
 

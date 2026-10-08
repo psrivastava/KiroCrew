@@ -1,11 +1,12 @@
 import { useState, useEffect, useRef, memo, type ReactNode } from 'react'
-import { CheckCircle, Handshake, Ban, Wrench, AlertTriangle } from 'lucide-react'
+import { CheckCircle, ChevronRight, Handshake, Ban, Wrench, AlertTriangle } from 'lucide-react'
 import { sanitizeLlmOutput } from '../../utils/sanitize'
 import { purposeFromToolArgs } from '../../utils/toolPurpose'
 import { deriveToolCallTitle } from '../../utils/toolCallTitle'
 import { ToolInputText } from '../../components/ToolInputText'
 import ErrorNotice from '../../components/ErrorNotice'
 import { ApiError } from '../../api/client'
+import { isTerminalApprovalRefusal } from '../../api/apiError'
 import { useRowDisclosure } from './rowDisclosure'
 
 import { i18nT } from '../../i18n/t'
@@ -191,10 +192,8 @@ const CollapsibleToolGroup = memo(function CollapsibleToolGroup({ count, autoExp
         setLocalResolved(null)
         setSubmitting(false)
         const refusal = err instanceof ApiError ? err : null
-        const gone = !!refusal && !refusal.authRequired
-          && (refusal.status === 404 || (refusal.status === 400 && refusal.message === 'no pending approval'))
         setFailure({
-          terminal: gone,
+          terminal: isTerminalApprovalRefusal(err),
           message: refusal?.message ?? '',
           attempted: decision,
         })
@@ -233,7 +232,10 @@ const CollapsibleToolGroup = memo(function CollapsibleToolGroup({ count, autoExp
         ) : isRunning ? (
           <span className="w-2.5 h-2.5 rounded-full bg-ok animate-pulse flex-shrink-0" aria-label={i18nT('pages.chat.collapsibleToolGroup.running')} />
         ) : (
-          <span className={`transition-transform duration-150 ${expanded ? 'rotate-90' : ''}`}>▶</span>
+          // Lucide, never a text glyph: AUTOSDE use-lucide-icons / no-emoji-as-icons
+          // are blocking on src/**/*.tsx, and the label carries the name, so the
+          // indicator is decorative.
+          <ChevronRight size={14} aria-hidden="true" className={`flex-shrink-0 transition-transform duration-150 ${expanded ? 'rotate-90' : ''}`} />
         )}
         <span>{labelNode}</span>
       </button>

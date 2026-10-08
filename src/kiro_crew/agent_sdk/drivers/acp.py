@@ -44,6 +44,8 @@ if TYPE_CHECKING:
     from kiro_crew.agent_sdk.context import ContextPromptProvider
 
 __all__ = [
+    "EntitlementRevalidating",
+    "catalog_row_would_drop",
     "context_provider_of",
     "projected_session_mcp_servers",
     "agent_spec_mcp_refs",
@@ -56,8 +58,32 @@ __all__ = [
     "kiro_cli_resolves",
     "provider_error_client",
     "resolve_pin_spelling",
+    "resolve_pin_spelling_on",
     "run_kiro_native_commands",
+    "drain_skill_view_aliases",
+    "skill_view_alias_census",
+    "skill_view_sidecar_dirs",
+    "skill_view_source_agent",
 ]
+
+
+class EntitlementRevalidating(Exception):
+    """Signal: a read-path entitlement revalidation is in flight, not yet landed.
+
+    Raised by the ACP session handle's ``maybe_refresh_available_models`` when
+    its single-flight probe does not finish within the read deadline. The
+    model-list endpoint turns this into its degraded (503) response so the
+    frontend keeps its last-good list and polls again, rather than caching the
+    un-revalidated snapshot as a live answer that no later poll would ever
+    correct. Not an error condition: the probe is still running and the next
+    read serves its result. A probe that FAILS is caught and fails open (current
+    snapshot), never surfaced as this.
+
+    Defined on the SDK surface, not in the ACP layer, because the endpoint that
+    catches it is application code: an ``except`` clause needs the class bound at
+    module level, and the agent-sdk-boundary gate refuses application code a new
+    ACP-layer import. The ACP driver raises it from here.
+    """
 
 
 def finish_suspended_spawn(process: object, pid: int, *, label: str) -> bool:
@@ -103,6 +129,66 @@ def resolve_pin_spelling(model_id: str, advertised: object) -> str:
     from kiro_crew.acp.client import resolve_pin_spelling as _impl
 
     return _impl(model_id, advertised)  # type: ignore[arg-type]
+
+
+def resolve_pin_spelling_on(model_id: str, advertised: object, backend: str) -> str:
+    """The spelling *model_id* resolves to on *backend*, or ``""`` when none.
+
+    The same delegation as :func:`resolve_pin_spelling`, to the backend-aware
+    resolver: a harness whose advertised rows are ``<model>[<effort>]`` pairs
+    takes the bare model on its ``model`` config option, so a bare pin resolves
+    there even though the advertised list never spells it. *backend* stays a
+    plain string, so no ACP type crosses the boundary here either.
+    """
+    from kiro_crew.acp.client import resolve_pin_spelling_on as _impl
+
+    return _impl(model_id, advertised, backend=backend)  # type: ignore[arg-type]
+
+
+def catalog_row_would_drop(model_id: str, advertised: object) -> bool:
+    """Whether the entitlement filter drops catalog row *model_id* against
+    *advertised*.
+
+    Thin delegation to :func:`kiro_crew.acp.client.catalog_row_would_drop`, the
+    single keep/drop verdict shared by the model-list endpoint and the ACP
+    read-path revalidation trigger, so the endpoint reaches it through the SDK
+    surface instead of importing the ACP layer (the agent-sdk-boundary gate
+    refuses a new edge). Plain data in, a bool out. Function-local import for
+    the same reason as :func:`resolve_pin_spelling`.
+    """
+    from kiro_crew.acp.client import catalog_row_would_drop as _impl
+
+    return _impl(model_id, advertised)  # type: ignore[arg-type]
+
+
+async def resolve_kiro_bin_for_spawn() -> str | None:
+    """The Kiro CLI path to spawn, resolved off the event loop, or ``None``.
+
+    Thin delegation to :func:`kiro_crew.acp.client._resolve_kiro_bin_for_spawn`
+    so the model-list endpoint reaches the spawn path through the SDK surface
+    instead of importing the ACP layer (the agent-sdk-boundary gate refuses a new
+    edge). No argument, a path string or ``None`` back — no ACP type crosses the
+    boundary. Function-local import for the same reason as :func:`resolve_pin_spelling`.
+    """
+    from kiro_crew.acp.client import _resolve_kiro_bin_for_spawn as _impl
+
+    return await _impl()
+
+
+def resolve_ssh_auth_sock(env: dict[str, str]) -> None:
+    """Point ``SSH_AUTH_SOCK`` in *env* at a live agent socket, in place.
+
+    Thin delegation to :func:`kiro_crew.acp.client._resolve_ssh_auth_sock` so the
+    model-list endpoint reaches it through the SDK surface instead of importing
+    the ACP layer (the agent-sdk-boundary gate refuses a new edge). A plain env
+    mapping in, mutated in place, nothing back — no ACP type crosses the
+    boundary. The caller runs it off the event loop (it globs ``/tmp``); keeping
+    it a plain sync function preserves that contract. Function-local import for
+    the same reason as :func:`resolve_pin_spelling`.
+    """
+    from kiro_crew.acp.client import _resolve_ssh_auth_sock as _impl
+
+    _impl(env)
 
 
 def derived_agent_permissions(allowed_tools: object, agent_filename: str) -> dict:
@@ -564,3 +650,88 @@ def projected_session_mcp_servers(
     from kiro_crew.acp.session_mcp import session_mcp_servers
 
     return session_mcp_servers(agent, work_dir=work_dir)
+
+
+def inherits_default_resources(work_dir: str | Path | None) -> bool:
+    """Whether a custom agent started in *work_dir* inherits kiro-cli's default resources.
+
+    Global and workspace steering plus ``AGENTS.md``. The answer is the skill
+    projection's, so Crew's own overlay on the native setting is not mistaken for
+    the user opting out.
+    """
+    from kiro_crew.acp.skill_projection import (
+        inherits_default_resources as projection_inherits_default_resources,
+    )
+
+    return projection_inherits_default_resources(work_dir)
+
+
+def skill_view_alias_census(agents_dir: "Path") -> dict[str, int]:
+    """Count projected skill-view aliases as plain integers; reads, never writes.
+
+    The keys are ``total``, ``leased``, ``foreign_home``, ``foreign_leased``,
+    ``unreadable_leases`` and ``truncated``; their meaning is the projection
+    module's, and so is the data-home identity the foreign split is judged
+    against.
+    """
+    from kiro_crew.acp.skill_projection import census_projected_aliases
+
+    return census_projected_aliases(agents_dir)
+
+
+def skill_view_residue_census(agents_dir: "Path") -> dict[str, int]:
+    """Count the projection's non-alias residue as plain integers; reads, never writes.
+
+    The keys are ``sidecars``, ``orphan_sidecars``, ``alias_locks``,
+    ``rewritten`` and ``truncated``; their meaning is the projection module's.
+    """
+    from kiro_crew.acp.skill_projection import census_projection_residue
+
+    return census_projection_residue(agents_dir)
+
+
+def skill_view_churning_env_keys(agents_dir: "Path") -> list[str]:
+    """``<server>.<ENV_KEY>`` names whose value differs across one agent's aliases; reads only."""
+    from kiro_crew.acp.skill_projection import census_churning_env_keys
+
+    return census_churning_env_keys(agents_dir)
+
+
+def drain_skill_view_aliases() -> int:
+    """Best-effort drain of unused skill-view aliases this data home owns; never raises.
+
+    Returns how many aliases were removed. What counts as unused is the
+    projection module's rule.
+    """
+    from kiro_crew.acp.skill_projection import drain_stale_aliases
+
+    return drain_stale_aliases()
+
+
+def skill_view_source_agent(name: str) -> str | None:
+    """The agent a skill-view name was built from; a plain agent name is itself.
+
+    ``None`` when *name* is a view whose source nothing records, so the caller
+    refuses it rather than guessing an agent. Which record answers is the
+    projection module's rule. Blocking: it may read one sidecar.
+    """
+    from kiro_crew.acp.skill_projection import RetiredSkillView, source_agent_name
+
+    try:
+        return source_agent_name(name)
+    except RetiredSkillView:
+        return None
+
+
+def skill_view_sidecar_dirs() -> tuple[str, str]:
+    """``(metadata, leases)``: the two non-spec directory names beside the aliases.
+
+    For messages that point an operator at them; their contents stay the
+    projection module's business.
+    """
+    from kiro_crew.acp.skill_projection import (
+        _PROJECTION_LEASE_DIR_NAME,
+        _PROJECTION_METADATA_DIR_NAME,
+    )
+
+    return (_PROJECTION_METADATA_DIR_NAME, _PROJECTION_LEASE_DIR_NAME)

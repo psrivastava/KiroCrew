@@ -23,8 +23,12 @@ from aiohttp import WSMsgType, web
 # can diagnose. api_ws_stt() re-checks and returns a friendly WS error.
 try:
     from amazon_transcribe.client import TranscribeStreamingClient
+    from amazon_transcribe.exceptions import BadRequestException as _TranscribeBadRequest
+    from amazon_transcribe.exceptions import UnknownServiceException as _TranscribeUnknownService
 except ImportError:  # pragma: no cover — exercised by test_import_error_*
     TranscribeStreamingClient = None  # type: ignore[assignment,misc]
+    _TranscribeBadRequest = None  # type: ignore[assignment,misc]
+    _TranscribeUnknownService = None  # type: ignore[assignment,misc]
 
 from kiro_crew import aws_consent, stt
 from kiro_crew.config.loader import KiroCrewConfig
@@ -32,6 +36,7 @@ from kiro_crew.dashboard.origin import check_origin, mark_audit_claimed
 from kiro_crew.llm_helpers import run_bg_oneliner
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
+from kiro_crew.start_priority import StartPriority
 from kiro_crew.stt.engine import pcm_from_int16
 from kiro_crew.stt.limits import DECODE_ABORT_GRACE_SECS
 from kiro_crew.stt.vad import Endpointer as AudioEndpointer
@@ -92,6 +97,27 @@ _active_sessions = 0
 # stalling. Generous enough for the largest model on a slow link, since the
 # alternative to waiting is a first run that cannot succeed.
 _MAX_MODEL_PREPARE_SECS = 1800
+
+
+def _prepare_timeout_ms() -> int:
+    """Milliseconds a client should allow for preparation, per THIS server's ceiling.
+
+    Announced on the `status` frames that say preparation is under way, for the
+    same reason `ready` announces `final_timeout_ms`: the deadline belongs to the
+    side that owns the wait. A client picking its own number picks one this side
+    does not honour, and the only interesting case is the number being SHORTER --
+    the client then abandons a load this server is still working on, discarding
+    audio the next frame would have transcribed.
+
+    Deliberately longer than the server's own ceiling by the wire grace, so the
+    timeout is reached HERE first. This side knows why preparation failed and
+    says so in a coded `error`; the client's timer is a backstop for a socket
+    that dies without one, and a backstop that fires first would replace every
+    real diagnosis with a guess about the connection.
+    """
+    return (_MAX_MODEL_PREPARE_SECS + _LOCAL_FINAL_WIRE_GRACE_SECS) * 1000
+
+
 # How often a download in progress republishes its byte count. This is NOT
 # cosmetic: `useMeetingTranscription` arms a 20s stall watchdog on the last frame
 # it received and RECONNECTS when it fires, so a single status frame at the start
@@ -114,6 +140,17 @@ _CODE_SESSION_FAILED = "stt_session_failed"
 # profile+region. Distinct from `_CODE_SESSION_FAILED` because the fix is an
 # operator action in Settings rather than a retry.
 _CODE_CONSENT_REQUIRED = "stt_consent_required"
+# Amazon Transcribe refused to open a stream with the operator's custom vocabulary
+# (deleted, still processing, or in another region). Distinct from
+# `_CODE_SESSION_FAILED` because retrying cannot help: the fix is choosing another
+# vocabulary, or none, in Settings.
+_CODE_VOCABULARY_REJECTED = "stt_transcribe_vocabulary_rejected"
+# AWS refused to start the stream because the configured credentials are not
+# allowed to. Distinct from `_CODE_SESSION_FAILED` because every retry is refused
+# the same way: the fix is the profile's credentials or permissions.
+_CODE_AWS_ACCESS_DENIED = "stt_aws_access_denied"
+# The error type AWS returns for an authorization refusal.
+_AWS_ACCESS_DENIED_ERROR = "AccessDeniedException"
 
 # ── Semantic endpointing (stt.endpointing, default off) ──
 # On each stable Transcribe `final`, a fast background model judges whether the
@@ -148,6 +185,22 @@ def _redacted(text: str) -> str:
     out, _ = redact_exfiltration_urls(text)
     out, _ = redact_credentials(out)
     return out
+
+
+def _vocabulary_rejected(exc: BaseException, vocabulary: str) -> bool:
+    """Whether a refused stream start was Amazon Transcribe refusing *vocabulary*.
+
+    Narrow on purpose: a vocabulary must be configured, the refusal must be the
+    service's ``BadRequestException`` (raised by ``start_stream_transcription``
+    itself, before any audio is sent), and its message must name the vocabulary. A
+    bad request for any other reason keeps the generic code, so an operator is
+    never sent to change a vocabulary that is not the problem.
+    """
+    if not vocabulary or _TranscribeBadRequest is None:
+        return False
+    if not isinstance(exc, _TranscribeBadRequest):
+        return False
+    return "vocabulary" in str(getattr(exc, "message", "")).lower()
 
 
 def _drop_task_result(task: "asyncio.Task[Any]") -> None:
@@ -382,6 +435,8 @@ class _Endpointer:
                 model=self._model,
                 sel_source="stt_endpointing",
                 timeout=self._timeout,
+                # The person is mid-dictation; the verdict drives auto-submit.
+                start_priority=StartPriority.FOREGROUND,
             )
         except Exception:
             logger.debug("stt endpointing classification failed", exc_info=True)
@@ -654,7 +709,8 @@ async def _run_local_session(
     # visible one. Best-effort like every other pre-`ready` send. `pending_load` is
     # advisory (a concurrent session may change residency between the check and the
     # load), so this only ever adds or omits one announce — `prepare` still loads.
-    if session.pending_load():
+    announced_load = session.pending_load()
+    if announced_load:
         logger.info("Loading local speech model %s before first transcript", cfg.stt.model)
         await _send(
             {
@@ -663,13 +719,21 @@ async def _run_local_session(
                 "downloaded_bytes": 0,
                 "total_bytes": 0,
                 "code": "",
+                "prepare_timeout_ms": _prepare_timeout_ms(),
             }
         )
 
     prepare_task = asyncio.create_task(session.prepare())
     try:
         events = await asyncio.wait_for(
-            asyncio.shield(_relay_download_progress(prepare_task, _send)),
+            asyncio.shield(
+                _relay_download_progress(
+                    prepare_task,
+                    _send,
+                    session.pending_load,
+                    announced_load,
+                )
+            ),
             timeout=_MAX_MODEL_PREPARE_SECS,
         )
     except asyncio.TimeoutError:
@@ -950,6 +1014,24 @@ def _apple_start_failure_code(cfg: "KiroCrewConfig") -> str:
     return availability_detail(cfg.stt).code or _CODE_SESSION_FAILED
 
 
+def _transcribe_start_failure(exc: Exception) -> tuple[str, str]:
+    """The ``(message, code)`` for a Transcribe stream that would not start.
+
+    Only AWS's authorization refusal gets its own code. AWS authorizes the call
+    when the stream opens, and the consent gate's ``sts:GetCallerIdentity`` probe
+    needs no permission, so credentials that may not stream pass every earlier
+    check and are refused again on every retry. An authentication failure is not
+    that case: an expired or invalid token fails the probe on the next attempt with
+    AWS's own reason, and one IAM has not propagated yet is accepted seconds later,
+    so "record again" stays the right advice for it.
+
+    The message stays fixed text because AWS's own carries the caller's ARN.
+    """
+    if isinstance(exc, _TranscribeUnknownService) and exc.error_code == _AWS_ACCESS_DENIED_ERROR:
+        return "AWS denied access to transcribe:StartStreamTranscription", _CODE_AWS_ACCESS_DENIED
+    return "failed to start transcription", _CODE_SESSION_FAILED
+
+
 async def _run_apple_session(
     ws: web.WebSocketResponse,
     cfg: "KiroCrewConfig",
@@ -1183,6 +1265,8 @@ def _status_int(value: object) -> int:
 async def _relay_download_progress(
     prepare_task: "asyncio.Task[list[stt.SttEvent]]",
     send: Callable[[dict], Awaitable[bool]],
+    pending_load: Callable[[], bool] = lambda: False,
+    announced: bool = True,
 ) -> list[stt.SttEvent]:
     """Await *prepare_task*, republishing the model store's byte count while it runs.
 
@@ -1199,6 +1283,11 @@ async def _relay_download_progress(
     `_MAX_MODEL_PREPARE_SECS` ceiling this wait is what applies. Kept for that, not
     for the case its progress frames were originally written for.
 
+    *announced* says whether a `preparing` frame has already gone out, and
+    *pending_load* re-asks whether one is owed. Both default to announcing nothing,
+    so a caller that does not pass them gets the behaviour this function had before
+    the deferred announce existed.
+
     Sending is best-effort on purpose: a failed send means the peer is gone, and
     the transfer must still be allowed to finish so the bytes are on disk for the
     next attempt. So a send failure stops the reporting, never the download.
@@ -1209,6 +1298,33 @@ async def _relay_download_progress(
             return await prepare_task
         status = stt.model_store().status
         if status.get("step") != stt.STAGE_DOWNLOADING:
+            # Nothing is transferring, so this is the load half of the wait. The
+            # caller asked `pending_load()` once BEFORE starting `prepare`, and
+            # that read is advisory: a model resident at that instant can be
+            # evicted before the load looks for it, and then the load happens with
+            # nothing announced. The client's budget for an un-announced wait is
+            # the short one, so the utterance it is holding is discarded at sixty
+            # seconds while this side is still building the context.
+            #
+            # Asked again HERE because the answer can only have become true: a load
+            # already under way cannot un-need announcing. Gated on `pending_load`
+            # rather than on reaching this branch, so a socket where nothing is
+            # loading announces nothing and keeps the short budget -- which is the
+            # whole reason the two waits are told apart.
+            if not announced and pending_load():
+                announced = True
+                logger.info("Local speech model load began after the pre-check saw it resident")
+                if not await send(
+                    {
+                        "type": "status",
+                        "stage": stt.STAGE_PREPARING,
+                        "downloaded_bytes": 0,
+                        "total_bytes": 0,
+                        "code": "",
+                        "prepare_timeout_ms": _prepare_timeout_ms(),
+                    }
+                ):
+                    return await prepare_task
             continue
         delivered = await send(
             {
@@ -1217,6 +1333,7 @@ async def _relay_download_progress(
                 "downloaded_bytes": _status_int(status.get("downloaded_bytes")),
                 "total_bytes": _status_int(status.get("total_bytes")),
                 "code": stt.CODE_MODEL_MISSING,
+                "prepare_timeout_ms": _prepare_timeout_ms(),
             }
         )
         if not delivered:
@@ -1330,12 +1447,16 @@ async def api_ws_stt(request: web.Request) -> web.WebSocketResponse:
             await _close_and_end_audit(ws, caller, outcome="error")
             return ws
 
+        vocabulary = cfg.stt.transcribe_vocabulary
         stream = None
         try:
             stream = await client.start_stream_transcription(
                 language_code=cfg.stt.effective_language_code,
                 media_sample_rate_hz=STREAM_SAMPLE_RATE_HZ,
                 media_encoding="pcm",
+                # The operator's custom vocabulary, if one is chosen. None sends no
+                # vocabulary header at all.
+                vocabulary_name=vocabulary or None,
                 # Stabilization=high tells Transcribe to commit each word
                 # sooner, at the cost of slightly more downstream corrections.
                 # For interactive dictation this trades accuracy on the last
@@ -1344,9 +1465,20 @@ async def api_ws_stt(request: web.Request) -> web.WebSocketResponse:
                 enable_partial_results_stabilization=True,
                 partial_results_stability="high",
             )
-        except Exception:
-            logger.exception("Failed to start Transcribe stream")
-            await _send_error(ws, "failed to start transcription", _CODE_SESSION_FAILED)
+        except Exception as exc:
+            if _vocabulary_rejected(exc, vocabulary):
+                logger.warning(
+                    "Amazon Transcribe refused custom vocabulary %r: %s",
+                    vocabulary,
+                    getattr(exc, "message", ""),
+                )
+                await _send_error(
+                    ws, "custom vocabulary rejected by Amazon Transcribe", _CODE_VOCABULARY_REJECTED
+                )
+            else:
+                logger.exception("Failed to start Transcribe stream")
+                message, code = _transcribe_start_failure(exc)
+                await _send_error(ws, message, code)
             await _close_and_end_audit(ws, caller, outcome="error")
             return ws
 

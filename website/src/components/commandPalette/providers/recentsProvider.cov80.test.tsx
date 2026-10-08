@@ -29,8 +29,10 @@ vi.mock('../../../api/client', () => ({ api: apiMock }))
 
 const thunks = vi.hoisted(() => ({
   createSlot: vi.fn(() => () => ({ unwrap: () => Promise.resolve('zzq-new') })),
-  switchSlot: vi.fn((key: string) => ({ type: 'zzq/switchSlot', payload: key })),
-  resumeFromHistory: vi.fn((arg: unknown) => ({ type: 'zzq/resume', payload: arg })),
+  // Thunks, like the real ones: the rows unwrap the dispatch to focus the
+  // composer once the switch, or the resume, has entered the session.
+  switchSlot: vi.fn((arg: { key: string }) => () => ({ unwrap: () => Promise.resolve({ key: arg.key }) })),
+  resumeFromHistory: vi.fn(() => () => ({ unwrap: () => Promise.resolve({ ok: true, surface: '' }) })),
 }))
 vi.mock('../../../store/chatSlice', async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
@@ -100,14 +102,22 @@ describe('hasPlaceholderTitle / isEmptyNewSlot', () => {
 })
 
 describe('prepareCurrentSlots', () => {
-  it('orders empty-new first, then pinned, then recency', () => {
+  it('orders empty-new first, then recency, with a pin claiming no place', () => {
     const { ordered, hasEmptyNew } = prepareCurrentSlots([
       slot({ key: 'zzq-old', last_activity_ts: 1_000 }),
       slot({ key: 'zzq-pinned', pinned: true, last_activity_ts: 500 }),
       slot({ key: 'zzq-new', title: 'New Session…', messages: 0 }),
       slot({ key: 'zzq-recent', last_activity_ts: 2_000 }),
     ])
-    expect(ordered.map((s) => s.key)).toEqual(['zzq-new', 'zzq-pinned', 'zzq-recent', 'zzq-old'])
+    // The pinned slot is the LEAST recent of the three and sorts last: this list
+    // answers "what was I just in", so a pin cannot lift a stale session over
+    // fresher ones. It still renders its pin.
+    expect(ordered.map((s) => s.key)).toEqual([
+      'zzq-new',
+      'zzq-recent',
+      'zzq-old',
+      'zzq-pinned',
+    ])
     expect(hasEmptyNew).toBe(true)
   })
 
@@ -179,7 +189,7 @@ describe('sessionStatus', () => {
     const st = sessionStatus(slot({ key: 'zzq', running: true }), [], {
       kind: 'tool',
       toolName: 'fs_read',
-      text: 'zzq reading',
+      purpose: 'zzq reading',
     })
     expect(st.label).toBeTruthy()
   })

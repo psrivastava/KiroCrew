@@ -324,6 +324,8 @@ class TestToLlmEventFieldParity:
             return default + 1.5
         if default is None:
             return {"sentinel": field.name}
+        if isinstance(default, tuple):
+            return (("sentinel-" + field.name, None),)
         return None
 
     def test_all_acp_event_fields_forwarded_or_allowlisted(self):
@@ -844,6 +846,36 @@ class TestStartKiroRuntimeResume:
         assert loaded_sid == "abc-123"
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("session_key", "resolved", "expected"),
+        [
+            # No key is foreground by itself: a provider started with no priority set
+            # (outside SessionManager) is BACKGROUND, whatever key it serves.
+            ("dashboard:chat-1-1785445181", None, "BACKGROUND"),
+            ("subagent:abc123", None, "BACKGROUND"),
+            # The session layer's priority reaches both queues.
+            ("dashboard:chat-1-1785445181", "FOREGROUND", "FOREGROUND"),
+            ("cron:job-1", "FOREGROUND", "FOREGROUND"),
+            ("dashboard:chat-1-1785445181", "BACKGROUND", "BACKGROUND"),
+        ],
+    )
+    async def test_the_start_priority_reaches_both_start_queues(
+        self, session_key, resolved, expected
+    ):
+        """The spawn admission and the session/new gate are told one priority: the
+        one the session layer set on the provider for this start."""
+        from kiro_crew.start_priority import StartPriority
+
+        provider = self._kiro_provider()
+        provider._client._session_key = session_key
+        if resolved is not None:
+            provider.start_priority = StartPriority[resolved]
+        _handle, runtime = await self._run_start(provider, "", file_exists=True)
+        want = StartPriority[expected]
+        assert runtime.spawn.await_args.kwargs["start_priority"] is want
+        assert runtime.create_session.await_args.kwargs["start_priority"] is want
+
+    @pytest.mark.asyncio
     async def test_resume_skipped_when_transcript_missing(self):
         provider = self._kiro_provider()
         _handle, runtime = await self._run_start(provider, "stale-sid", file_exists=False)
@@ -920,6 +952,117 @@ class TestStartKiroRuntimeResume:
 
         # The orphaned runtime was killed exactly once before the raise propagated.
         mock_runtime.kill.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_a_slow_cleanup_drain_neither_masks_nor_replaces_the_setup_failure(self, caplog):
+        # The field log for a Windows host that kept failing session setup
+        # carried only the cleanup kill's drain traceback, never the failure
+        # that asked for the kill. The original failure is what the caller
+        # gets, and it is in the log at WARNING; a cleanup drain that is still
+        # running is neither raised nor allowed to bury it.
+        import logging
+
+        from test_update_provider import _UNALLOCATABLE_PID
+
+        from kiro_crew import platform_compat
+
+        provider = self._kiro_provider(model="auto")
+        provider._client._resume_session_id = ""
+
+        mock_runtime = MagicMock()
+        mock_runtime.pid = _UNALLOCATABLE_PID
+        mock_runtime.spawn = AsyncMock()
+        mock_runtime.kill = AsyncMock(
+            side_effect=platform_compat.WindowsTreeDrainPending(
+                root_pid=_UNALLOCATABLE_PID, pending=2
+            )
+        )
+        mock_runtime.saw_not_logged_in = MagicMock(return_value=False)
+        mock_runtime.saw_sandbox_init_failure = MagicMock(return_value=False)
+        mock_runtime.settle_stderr = AsyncMock()
+        # Backend-authored text can carry a line break and a terminal escape;
+        # neither may reach the log line, which must stay one line.
+        mock_runtime.create_session = AsyncMock(
+            side_effect=RuntimeError(
+                "session limit reached\n21:00:00 ERROR forged line \x1b[31mred"
+            )
+        )
+
+        with (
+            patch("kiro_crew.providers.acp.AcpRuntime", return_value=mock_runtime),
+            patch("kiro_crew.providers.acp.AcpSessionProvider"),
+            caplog.at_level(logging.WARNING, logger="kiro_crew.providers.acp"),
+        ):
+            with pytest.raises(RuntimeError, match="session limit reached"):
+                await provider._start_kiro_runtime()
+
+        mock_runtime.kill.assert_awaited_once()
+        setup = [
+            r
+            for r in caplog.records
+            if r.name == "kiro_crew.providers.acp" and "session limit reached" in r.getMessage()
+        ]
+        assert len(setup) == 1, [r.getMessage() for r in caplog.records]
+        assert setup[0].levelname == "WARNING"
+        assert str(_UNALLOCATABLE_PID) in setup[0].getMessage()
+        assert "RuntimeError" in setup[0].getMessage()
+        assert "\n" not in setup[0].getMessage()
+        assert "\x1b" not in setup[0].getMessage()
+
+    @pytest.mark.asyncio
+    async def test_a_cancel_during_the_startup_settle_reaches_the_caller(self):
+        # The shared-runtime twin of AcpClient's startup settle, at the site
+        # where it really waits: create_session() failed on a LIVE runtime, so
+        # the stderr drain is still running when the translation settles it (up
+        # to 0.5 s). A Stop 0.1 s into that wait must end the start as a cancel,
+        # not as the generic AcpRuntimeError the pool replaces with a fresh
+        # worker -- and the post-spawn guard must still kill the runtime.
+        from test_update_provider import _UNALLOCATABLE_PID
+
+        from kiro_crew.acp.runtime import AcpRuntime
+        from kiro_crew.acp.session_handle import AcpRuntimeError
+
+        provider = self._kiro_provider(model="auto")
+        provider._client._resume_session_id = ""  # no resume -> straight to create_session
+
+        mock_runtime = MagicMock()
+        mock_runtime.pid = _UNALLOCATABLE_PID
+        mock_runtime.spawn = AsyncMock()
+        mock_runtime.kill = AsyncMock()
+        mock_runtime.create_session = AsyncMock(side_effect=AcpRuntimeError("session/new died"))
+        mock_runtime.saw_not_logged_in = MagicMock(return_value=False)
+        mock_runtime.saw_sandbox_init_failure = MagicMock(return_value=False)
+        mock_runtime._stderr_task = asyncio.ensure_future(asyncio.sleep(3600))
+        settle_entered = asyncio.Event()
+
+        async def _real_settle(timeout: float = 0.5) -> None:
+            settle_entered.set()
+            # Long, so the cancel below cannot race the budget on a loaded runner.
+            await AcpRuntime.settle_stderr(mock_runtime, 30)
+
+        mock_runtime.settle_stderr = _real_settle
+
+        with (
+            patch("kiro_crew.providers.acp.AcpRuntime", return_value=mock_runtime),
+            patch("kiro_crew.providers.acp.AcpSessionProvider"),
+        ):
+            start = asyncio.ensure_future(provider._start_kiro_runtime())
+            try:
+                await asyncio.wait_for(settle_entered.wait(), timeout=5)
+                await asyncio.sleep(0.1)
+                start.cancel()
+                await asyncio.wait({start}, timeout=5)
+                assert start.done(), "the start never finished"
+                assert start.cancelled(), (
+                    f"the runtime start ended with {start.exception()!r} instead of "
+                    "the cancel that arrived during its stderr settle"
+                )
+                mock_runtime.spawn.assert_awaited_once()
+                mock_runtime.kill.assert_awaited_once()
+            finally:
+                mock_runtime._stderr_task.cancel()
+                if not start.done():
+                    start.cancel()
 
     @pytest.mark.asyncio
     async def test_successful_start_does_not_kill_runtime(self):
@@ -1049,10 +1192,23 @@ class TestFixBDeadRuntimeRespawn:
         return provider
 
     @pytest.mark.asyncio
-    async def test_dead_runtime_respawned_and_create_session_on_new(self):
+    @pytest.mark.parametrize(
+        ("session_key", "expected"),
+        [
+            ("dashboard:chat-1-1785445181", "FOREGROUND"),
+            ("slack:C1:1700000000.000100", "FOREGROUND"),
+            ("subagent:abc123", "BACKGROUND"),
+        ],
+    )
+    async def test_dead_runtime_respawned_and_create_session_on_new(self, session_key, expected):
         """When runtime.is_alive() returns False after failed resume,
-        a new runtime is spawned and create_session is called on it."""
+        a new runtime is spawned and create_session is called on it -- and the
+        respawn takes the same start priority as the first spawn."""
+        from kiro_crew.start_priority import StartPriority
+
         provider = self._kiro_provider()
+        provider._client._session_key = session_key
+        provider.start_priority = StartPriority[expected]
 
         # First runtime: spawns OK but dies during resume
         dead_runtime = MagicMock()
@@ -1103,6 +1259,10 @@ class TestFixBDeadRuntimeRespawn:
         # create_session called on the NEW runtime (not the dead one)
         new_runtime.create_session.assert_awaited_once()
         dead_runtime.create_session.assert_not_called()
+        want = StartPriority[expected]
+        assert dead_runtime.spawn.await_args.kwargs["start_priority"] is want
+        assert new_runtime.spawn.await_args.kwargs["start_priority"] is want
+        assert new_runtime.create_session.await_args.kwargs["start_priority"] is want
 
 
 class TestLoadSessionWithRetry:
@@ -1367,13 +1527,24 @@ class TestStartKiroRuntimeModelEntitlement:
         provider._client._resume_session_id = ""  # straight to create_session
         return provider
 
-    async def _run(self, model, advertised):
+    async def _run(self, model, advertised, *, probe=None, probe_raises=False):
         provider = self._kiro_provider(model)
         handle = MagicMock()
         handle.session_id = "kiro-sess-1"
         handle.store_session_config = MagicMock()
         handle.set_model = AsyncMock()
         handle.available_models = [{"modelId": m, "name": m} for m in advertised]
+        # The spawn-time withhold revalidates once via refresh_available_models
+        # before dropping a pin. Default: the probe agrees with the startup
+        # snapshot (returns it unchanged), so existing behaviour is preserved.
+        if probe_raises:
+            handle.refresh_available_models = AsyncMock(side_effect=RuntimeError("boom"))
+        elif probe is not None:
+            handle.refresh_available_models = AsyncMock(
+                return_value=[{"modelId": m, "name": m} for m in probe]
+            )
+        else:
+            handle.refresh_available_models = AsyncMock(return_value=list(handle.available_models))
         runtime = MagicMock()
         runtime.pid = 4321
         runtime.spawn = AsyncMock()
@@ -1410,6 +1581,55 @@ class TestStartKiroRuntimeModelEntitlement:
     async def test_auto_sentinel_never_reaches_the_check(self):
         handle = await self._run("auto", ["claude-sonnet-4.6"])
         handle.set_model.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_pin_absent_from_startup_snapshot_is_applied_when_the_probe_reveals_it(self):
+        # FP1: the startup snapshot was captured inside the race window and
+        # omits an entitled pin. Revalidating once before withholding reveals it,
+        # so the pin IS applied rather than silently dropped for the session.
+        handle = await self._run(
+            "claude-opus-4.8",
+            ["claude-sonnet-4.6"],
+            probe=["claude-sonnet-4.6", "claude-opus-4.8"],
+        )
+        handle.refresh_available_models.assert_awaited_once()
+        handle.set_model.assert_awaited_once_with("claude-opus-4.8")
+
+    @pytest.mark.asyncio
+    async def test_spawn_withhold_revalidation_forces_a_fresh_probe(self):
+        # D1: dropping a configured pin is a one-shot decision, not a burst, so
+        # its revalidation passes force=True — it must not honour a no-evidence
+        # failure the picker read path cached in the shared attempt-clock window.
+        handle = await self._run(
+            "claude-opus-4.8",
+            ["claude-sonnet-4.6"],
+            probe=["claude-sonnet-4.6", "claude-opus-4.8"],
+        )
+        handle.refresh_available_models.assert_awaited_once()
+        assert handle.refresh_available_models.await_args.kwargs.get("force") is True
+        # The probe agrees the pin is genuinely not entitled -> withhold as today.
+        handle = await self._run(
+            "claude-opus-4.8", ["claude-sonnet-4.6"], probe=["claude-sonnet-4.6"]
+        )
+        handle.refresh_available_models.assert_awaited_once()
+        handle.set_model.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_probe_failure_leaves_the_withhold_in_place(self):
+        # A failed probe is no evidence: keep the snapshot verdict (withhold),
+        # fail open exactly as today.
+        handle = await self._run("claude-opus-4.8", ["claude-sonnet-4.6"], probe_raises=True)
+        handle.set_model.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_qualifier_only_miss_resolves_via_the_fold_without_probing(self):
+        # O2: a `<namespace>::bare-id` pin the session advertises BARE resolves
+        # through resolve_pin_spelling with zero wire traffic. The fold runs
+        # FIRST, so no throwaway session/new (refresh_available_models) is opened
+        # on this common cold-start path; the bare id is what reaches set_model.
+        handle = await self._run("openrouter::z-ai/glm-5.3-flash", ["auto", "z-ai/glm-5.3-flash"])
+        handle.refresh_available_models.assert_not_awaited()
+        handle.set_model.assert_awaited_once_with("z-ai/glm-5.3-flash")
 
 
 def test_child_fidelity_aware_survives_client_replacement():

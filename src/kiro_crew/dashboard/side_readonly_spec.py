@@ -49,11 +49,13 @@ import copy
 import hashlib
 import json
 import logging
+import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from kiro_crew.validation import _AGENT_NAME_RE
+from kiro_crew.validation import is_registered_agent_name
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +97,9 @@ class ReadOnlySpecError(RuntimeError):
     * ``derived_path_foreign`` — a file at the derived path is not this
       module's (no owner marker); it is left alone and the turn is refused.
     * ``spec_write_failed`` — the derived file could not be written.
+    * ``base_spec_malformed`` — the base spec carries ``mcpServers`` or
+      ``toolsSettings`` (or an entry under either) that is neither an object
+      nor ``null``, so its grants cannot be found to empty.
     """
 
     def __init__(self, code: str, detail: str):
@@ -133,10 +138,112 @@ def readonly_agent_name(base_name: str, source_id: str | None = None) -> str:
     return f"{base_name}{READONLY_SUFFIX}-{tag}"
 
 
+#: The two shapes :func:`readonly_agent_name` produces: ``<base>--readonly`` and
+#: ``<base>--readonly-<8 hex>``. Always applied with ``fullmatch``.
+_DERIVED_NAME_RE = re.compile(r"(?P<base>.+)--readonly(?:-[0-9a-f]{8})?")
+
+
+def readonly_base_name(name: str) -> str | None:
+    """The base agent *name* was derived from, or ``None`` when it has neither derived shape.
+
+    The inverse of :func:`readonly_agent_name` on the NAME alone: it reads no
+    file, so it cannot tell a generated spec from a user's own agent that
+    happens to be called ``<x>--readonly``. Use it only to WORD a message; a
+    decision about what a spec is goes through :func:`is_owned_readonly_spec`,
+    which reads the owner marker.
+    """
+    match = _DERIVED_NAME_RE.fullmatch(name) if isinstance(name, str) else None
+    return match.group("base") if match else None
+
+
+def unavailable_mode_explanation(agent: str) -> tuple[str, str]:
+    """``(cause, remedy)`` for kiro-cli not advertising *agent* as a mode.
+
+    Completes the "Agent mode ... is not available" refusal the ACP layer raises,
+    which puts the cause before its "Refusing to run the backend default mode"
+    sentence and the remedy after it. For an ordinary agent the file is likely
+    missing and ``kirocrew setup --agent-only`` writes the managed ones. For a
+    spec THIS module published both halves of that are wrong: setup never writes
+    it (a side turn does, see :func:`publish_readonly_spec`), and it is usually
+    PRESENT -- kiro-cli lists its agents once, at process start, so a process
+    started before the side turn published it cannot select it, and the remedy
+    says a new session fixes that. The spec is not a sub-agent either, which is
+    the other way a caller reaches this message, so the remedy also names the
+    base agent -- or says to omit ``agent``, since the host default is reached
+    that way rather than by name.
+
+    Which answer applies is decided by the owner marker on the file at the
+    derived path, not by the name: a user's own agent that is merely called
+    ``<x>--readonly`` keeps the ordinary answer. Blocking I/O (one bounded read
+    through the hardened spec reader): the ACP callers run it off the loop.
+    """
+    base = readonly_base_name(agent)
+    if base is None or not _is_published_readonly_spec(agent):
+        return (
+            f"its ~/.kiro/agents/{agent}.json is likely missing.",
+            "Run `kirocrew setup --agent-only` to materialize the agent config.",
+        )
+    return (
+        f"{agent!r} is the read-only spec Kiro Crew derives from {base!r} for side "
+        "replies: a side turn writes it, `kirocrew setup` does not, and kiro-cli lists "
+        "only the agents present when its process started.",
+        "A new session starts a kiro-cli that lists it. It is not a sub-agent: to spawn "
+        f"its source agent, name {base!r}, or omit 'agent' when that is the default agent.",
+    )
+
+
+def _is_published_readonly_spec(name: str) -> bool:
+    """Whether ``~/.kiro/agents/<name>.json`` is a regular file carrying the owner marker.
+
+    ``False`` on any read failure: the caller then gives the ordinary answer,
+    which is what it gave before this module existed.
+    """
+    # Function-local for two reasons. ``agent_discovery`` imports this module at
+    # module scope (``is_internal_agent_spec`` reads the owner marker), so a
+    # module-scope import back would be circular. ``kiro_crew.agent`` is heavy,
+    # and this runs only on an already-failing mode refusal.
+    from kiro_crew.agent import kiro_agents_dir_path
+    from kiro_crew.agent_discovery import _read_agent_spec
+
+    target = kiro_agents_dir_path() / f"{name}.json"
+    try:
+        if os.path.islink(target) or not os.path.isfile(target):
+            return False
+        data = _read_agent_spec(target, operation="agent_mode_refusal", source="unknown")
+    except Exception:  # noqa: BLE001 -- wording only; the refusal is raised regardless
+        logger.debug("could not read %s to word a mode refusal", target, exc_info=True)
+        return False
+    return is_owned_readonly_spec(data)
+
+
 def spec_digest(spec: dict[str, Any]) -> str:
     """sha256 of the canonical JSON of *spec* (sorted keys, no whitespace)."""
     canonical = json.dumps(spec, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _grant_container(spec: dict[str, Any], key: str) -> dict[str, Any]:
+    """``spec[key]`` as a mapping to scrub; absent or ``null`` carries no grant."""
+    value = spec.get(key)
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ReadOnlySpecError(
+            "base_spec_malformed", f"{key} is a {type(value).__name__}, not an object"
+        )
+    return value
+
+
+def _grant_entry(value: Any, key: str) -> dict[str, Any]:
+    """One entry under *key*; ``null`` carries no grant, any other non-object is refused."""
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ReadOnlySpecError(
+            "base_spec_malformed",
+            f"an entry under {key} is a {type(value).__name__}, not an object",
+        )
+    return value
 
 
 def derive_readonly_spec(
@@ -165,7 +272,9 @@ def derive_readonly_spec(
     * ``includeMcpJson`` → ``False`` — the global ``mcp.json`` carries its own
       ``autoApprove`` lists, which this derivation cannot see or empty. Under
       READ_ONLY an MCP-served tool is never provably read-only anyway, so
-      nothing the side chat can use is lost.
+      nothing the side chat can use is lost. ``useLegacyMcpJson``, kiro-cli's
+      alias for the same field, is removed so the file does not declare it
+      twice.
     * ``autoAllowReadonly`` → ``False`` when present — kiro-cli's own (retired)
       read-only auto-approve, whose notion of read-only is not the host's.
     * ``permissions`` → ``{"rules": []}`` when the base carries one — the KAS
@@ -182,13 +291,17 @@ def derive_readonly_spec(
     ``tools``, ``mcpServers`` (minus ``autoApprove``), ``resources``, ``prompt``,
     ``model`` and every other key are untouched: mounting a tool is not
     approving it, and the reads the side chat exists for go through the gate.
+
+    A ``mcpServers`` or ``toolsSettings`` value, or an entry under either, that
+    is neither an object nor ``null`` raises ``base_spec_malformed``: its grants
+    cannot be located, so the turn is refused rather than run with them.
     """
-    if not _AGENT_NAME_RE.match(base_name or ""):
+    if not is_registered_agent_name(base_name):
         raise ReadOnlySpecError(
             "unsafe_name", f"agent name {base_name!r} is not a valid agent name"
         )
     derived_name = readonly_agent_name(base_name, source_id)
-    if not _AGENT_NAME_RE.match(derived_name):
+    if not is_registered_agent_name(derived_name):
         raise ReadOnlySpecError(
             "unsafe_name", f"derived name {derived_name!r} exceeds the agent-name grammar"
         )
@@ -204,24 +317,30 @@ def derive_readonly_spec(
         )
     )
     spec["allowedTools"] = []
-    servers = spec.get("mcpServers")
-    if isinstance(servers, dict):
-        for server in servers.values():
-            if isinstance(server, dict):
-                server.pop("autoApprove", None)
-    settings = spec.get("toolsSettings")
-    if isinstance(settings, dict):
-        for tool_settings in settings.values():
-            if isinstance(tool_settings, dict):
-                for key in [
-                    k for k in tool_settings if str(k).startswith(_TOOL_SETTING_GRANT_PREFIXES)
-                ]:
-                    tool_settings.pop(key, None)
+    for server in _grant_container(spec, "mcpServers").values():
+        _grant_entry(server, "mcpServers").pop("autoApprove", None)
+    for tool_settings in _grant_container(spec, "toolsSettings").values():
+        entry = _grant_entry(tool_settings, "toolsSettings")
+        for key in [k for k in entry if str(k).startswith(_TOOL_SETTING_GRANT_PREFIXES)]:
+            entry.pop(key, None)
+    spec.pop("useLegacyMcpJson", None)
     spec["includeMcpJson"] = False
     if "autoAllowReadonly" in spec:
         spec["autoAllowReadonly"] = False
     if "permissions" in spec:
-        spec["permissions"] = {"rules": []}
+        # An empty policy is still a policy, and the KEY's presence is what a
+        # kiro-cli below ``SPEC_PERMISSIONS_MIN_VERSION`` -- or one whose
+        # version cannot be established -- refuses the whole file for
+        # (``deny_unknown_fields``). This file is published into the registry
+        # kiro-cli loads agents from, so a refusal here costs the side turn the
+        # very isolation this module exists to give it. Same gate, and same
+        # removal of an inherited value, as the generated writers in
+        # ``agent.py``; on an accepting release it derives ``{"rules": []}``
+        # from the emptied grants above, which is what this line wrote. The
+        # guard stays: a base carrying no block never gains one.
+        from kiro_crew.agent import _write_derived_permissions
+
+        _write_derived_permissions(spec, spec["allowedTools"], derived_name)
     spec.pop("hooks", None)
     return spec
 
@@ -230,7 +349,16 @@ def is_owned_readonly_spec(data: Any) -> bool:
     """True when *data* is a spec this module wrote (owner marker present)."""
     if not isinstance(data, dict):
         return False
-    description = data.get("description")
+    return is_readonly_spec_description(data.get("description"))
+
+
+def is_readonly_spec_description(description: object) -> bool:
+    """True when *description* carries this module's owner marker.
+
+    The test :func:`is_owned_readonly_spec` applies to a raw spec, exposed on the
+    field alone so a caller holding a discovery row (``AgentInfo.description``)
+    rather than the parsed file asks the same question.
+    """
     return isinstance(description, str) and description.startswith(OWNER_MARKER)
 
 
@@ -251,7 +379,9 @@ def _read_base_spec(base_name: str, project_dir: str | None) -> tuple[dict[str, 
     from kiro_crew.agent_discovery import _read_agent_spec, project_agent_files, project_agent_name
 
     if project_dir:
-        for spec_file in project_agent_files(project_dir):
+        for spec_file in project_agent_files(
+            project_dir, operation="side_readonly_spec", source="dashboard"
+        ):
             if project_agent_name(spec_file) == base_name:
                 data = _read_agent_spec(
                     spec_file, operation="side_readonly_spec", source="dashboard"
@@ -288,7 +418,9 @@ def _refuse_if_shadowed(derived_name: str, target: Path, project_dir: str | None
     from kiro_crew.agent_discovery import project_agent_files, project_agent_name
 
     if project_dir:
-        for spec_file in project_agent_files(project_dir):
+        for spec_file in project_agent_files(
+            project_dir, operation="side_readonly_spec", source="dashboard"
+        ):
             if spec_file.stem == derived_name or project_agent_name(spec_file) == derived_name:
                 raise ReadOnlySpecError(
                     "derived_name_shadowed",

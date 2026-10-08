@@ -3,7 +3,7 @@ import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { api, ApiError } from '../api/client'
 import { store, useAppDispatch } from '../store'
 import { deleteSlot, switchSlot } from '../store/chatSlice'
-import { updateSlotPin, updateSlot, markSlotRead, markSlotUnread } from '../store/dashboardSlice'
+import { updateSlotPin, markSlotRead, markSlotUnread, slotWriteStampOf } from '../store/dashboardSlice'
 import { emitSlotRead } from '../lib/slotReadRelay'
 import { copySessionLink } from '../utils/shareUrl'
 import { useMoveSlotToFolder } from './useMoveSlotToFolder'
@@ -19,6 +19,10 @@ interface PinMutationEntry {
   succeeded: boolean | null
   pinGeneration: number
   slotsGeneration: number
+  /** `slotWriteSeq` right after this entry's optimistic write. */
+  writeSeq: number
+  /** The `pinned` value the server answered this entry's PATCH with. */
+  confirmedPinned: boolean | null
 }
 
 interface PinMutationBatch {
@@ -72,8 +76,6 @@ export interface SessionActions {
   toggleRead: (slotKey: string) => void
   /** Toggle pinned. */
   togglePin: (slotKey: string) => void
-  /** Toggle orchestrator (Autopilot) mode on/off, with a confirm. */
-  toggleMode: (slotKey: string) => void
   /** Copy the session's share link. */
   copyLink: (slotKey: string) => void
   /** Move to a folder (or root for null) — shared optimistic move + rollback. */
@@ -97,24 +99,45 @@ export function useSessionActions(mode?: string): SessionActions {
     const snapshotVersion = ++batch.snapshotVersion
     try {
       let slots: ChatSlot[]
-      for (let attempt = 0; ; attempt += 1) {
-        const slotsGeneration = store.getState().dashboard.slotsGeneration ?? 0
-        slots = await queryClient.fetchQuery<ChatSlot[]>({
-          queryKey: ['chat-slots', 'pin-reconcile', ++pinReconcileRequestId],
-          queryFn: () => api.chatSlots() as Promise<ChatSlot[]>,
-          staleTime: 0,
-          gcTime: 0,
+      const slotsGeneration = store.getState().dashboard.slotsGeneration ?? 0
+      if (batch.entries.every(candidate => candidate.succeeded === true
+        && typeof candidate.confirmedPinned === 'boolean'
+        && candidate.slotsGeneration === slotsGeneration)) {
+        // Every PATCH answered with the value it committed, no full-list
+        // writer advanced while the batch was in flight, and
+        // `setSlotPinInOrder` runs one key's requests in order, so the last
+        // answer per key is the server's state after this batch. No list
+        // re-read is needed. A row some other writer touched after the last
+        // optimistic write (this tab's own `slot_patch`, or another tab's) is
+        // left as Redux holds it: that write is at least as new as the answer.
+        const lastByKey = new Map<string, PinMutationEntry>()
+        for (const candidate of batch.entries) lastByKey.set(candidate.key, candidate)
+        const dashboard = store.getState().dashboard
+        slots = dashboard.slots.map(slot => {
+          const last = lastByKey.get(slot.key)
+          if (!last || slotWriteStampOf(dashboard, slot.key) > last.writeSeq) return slot
+          return { ...slot, pinned: last.confirmedPinned as boolean }
         })
-        // A newer mutation may have joined this batch while the snapshot was in flight.
-        // Its own settlement will fetch again; only that newest request may reconcile.
-        if (snapshotVersion !== batch.snapshotVersion
-          || batch.entries.some(candidate => candidate.succeeded === null)) return
-        if ((store.getState().dashboard.slotsGeneration ?? 0) === slotsGeneration) break
-        // Continuous live frames must not create an unbounded GET loop. After
-        // bounded retries, Redux itself is the newest accepted full-slot snapshot.
-        if (attempt >= 2) {
-          slots = store.getState().dashboard.slots
-          break
+      } else {
+        for (let attempt = 0; ; attempt += 1) {
+          const slotsGeneration = store.getState().dashboard.slotsGeneration ?? 0
+          slots = await queryClient.fetchQuery<ChatSlot[]>({
+            queryKey: ['chat-slots', 'pin-reconcile', ++pinReconcileRequestId],
+            queryFn: () => api.chatSlots() as Promise<ChatSlot[]>,
+            staleTime: 0,
+            gcTime: 0,
+          })
+          // A newer mutation may have joined this batch while the snapshot was in flight.
+          // Its own settlement will fetch again; only that newest request may reconcile.
+          if (snapshotVersion !== batch.snapshotVersion
+            || batch.entries.some(candidate => candidate.succeeded === null)) return
+          if ((store.getState().dashboard.slotsGeneration ?? 0) === slotsGeneration) break
+          // Continuous live frames must not create an unbounded GET loop. After
+          // bounded retries, Redux itself is the newest accepted full-slot snapshot.
+          if (attempt >= 2) {
+            slots = store.getState().dashboard.slots
+            break
+          }
         }
       }
       if (activePinMutationBatch === batch) activePinMutationBatch = null
@@ -195,8 +218,9 @@ export function useSessionActions(mode?: string): SessionActions {
       }
       // No server re-read is attempted here, on purpose: this branch IS the
       // failed re-read, and the authoritative pinned state arrives without one.
-      // Every accepted `PATCH /api/chat/slots/{slot}/pin` ends in
-      // `push_slots_update()`, and a websocket reconnect refetches the whole
+      // Every accepted `PATCH /api/chat/slots/{slot}/pin` ends in a
+      // `slot_patch` frame (a full slot list on a gateway without it), and a
+      // websocket reconnect refetches the whole
       // list. The `invalidateQueries({ queryKey: ['chat-slots'] })` this branch
       // used to end with was never that retry -- no query is registered on that
       // key, so it refreshed nothing (#10204).
@@ -237,34 +261,25 @@ export function useSessionActions(mode?: string): SessionActions {
         succeeded: null,
         pinGeneration: 0,
         slotsGeneration: dashboard.slotsGeneration ?? 0,
+        writeSeq: 0,
+        confirmedPinned: null,
       }
       batch.entries.push(entry)
       dispatch(updateSlotPin({ key, pinned }))
-      entry.pinGeneration = store.getState().dashboard.slotPinGenerations?.[key] ?? 0
+      const afterWrite = store.getState().dashboard
+      entry.pinGeneration = afterWrite.slotPinGenerations?.[key] ?? 0
+      entry.writeSeq = afterWrite.slotWriteSeq ?? 0
       return { batch, entry }
     },
-    onSuccess: (_data, _vars, ctx) => ctx
-      ? finishPinMutation(ctx.batch, ctx.entry, true)
-      : undefined,
+    onSuccess: (data, _vars, ctx) => {
+      if (!ctx) return undefined
+      const answered = (data as { pinned?: unknown } | undefined)?.pinned
+      ctx.entry.confirmedPinned = typeof answered === 'boolean' ? answered : null
+      return finishPinMutation(ctx.batch, ctx.entry, true)
+    },
     onError: (_err, _vars, ctx) => ctx
       ? finishPinMutation(ctx.batch, ctx.entry, false)
       : undefined,
-  })
-
-  // Orchestrator/Autopilot mode toggle (optimistic, server-persisted).
-  const modeMutation = useMutation({
-    mutationFn: ({ key, newMode }: { key: string; newMode: string }) => api.setSlotMode(key, newMode),
-    onMutate: ({ key, newMode }) => {
-      const prev = store.getState().dashboard.slots.find(s => s.key === key)?.mode ?? ''
-      dispatch(updateSlot({ key, mode: newMode }))
-      return { key, prev, newMode }
-    },
-    onError: (_err, _vars, ctx) => {
-      if (!ctx) return
-      // Guarded rollback: don't clobber a superseding mode toggle.
-      const current = store.getState().dashboard.slots.find(s => s.key === ctx.key)?.mode ?? ''
-      if (current === ctx.newMode) dispatch(updateSlot({ key: ctx.key, mode: ctx.prev }))
-    },
   })
 
   // Session reload (relaunch the agent process in place). No optimistic state:
@@ -290,7 +305,6 @@ export function useSessionActions(mode?: string): SessionActions {
   // recreated on every render (the mutation result objects are new each render).
   const { mutate: forkMutate } = forkMutation
   const { mutate: pinMutate } = pinMutation
-  const { mutate: modeMutate } = modeMutation
   const { mutate: reloadMutate } = reloadMutation
 
   const duplicate = useCallback((slotKey: string) => { forkMutate(slotKey) }, [forkMutate])
@@ -313,16 +327,6 @@ export function useSessionActions(mode?: string): SessionActions {
     pinMutate({ key: slotKey, pinned: !isPinned })
   }, [pinMutate])
 
-  const toggleMode = useCallback((slotKey: string) => {
-    const cur = store.getState().dashboard.slots.find(s => s.key === slotKey)?.mode ?? ''
-    const newMode = cur === 'orchestrator' ? '' : 'orchestrator'
-    if (confirm(newMode === 'orchestrator'
-      ? i18nT('hooks.useSessionActions.switch_to_autopilot_mode_future_messages_will_us')
-      : i18nT('hooks.useSessionActions.switch_to_normal_chat_mode_future_messages_will'))) {
-      modeMutate({ key: slotKey, newMode })
-    }
-  }, [modeMutate])
-
   const copyLink = useCallback((slotKey: string) => {
     const slot = store.getState().dashboard.slots.find(s => s.key === slotKey)
     copySessionLink(slotKey, slot?.title, undefined, mode)
@@ -338,5 +342,5 @@ export function useSessionActions(mode?: string): SessionActions {
     if (!loadChatConfig().confirmCloseSession || confirm(i18nT('hooks.useSessionActions.close_this_session'))) dispatch(deleteSlot(slotKey))
   }, [dispatch])
 
-  return { duplicate, toggleRead, togglePin, toggleMode, copyLink, move, reload, close }
+  return { duplicate, toggleRead, togglePin, copyLink, move, reload, close }
 }

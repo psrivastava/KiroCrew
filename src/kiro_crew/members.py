@@ -24,6 +24,7 @@ import logging
 import os
 import re
 import stat
+from collections.abc import Container, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -33,6 +34,7 @@ from kiro_crew import platform_compat
 from kiro_crew.artifacts import slugify
 from kiro_crew.atomic_write import atomic_write, fsync_dir, read_bytes_with_retry
 from kiro_crew.config.paths import data_home
+from kiro_crew.external_text import external_text_requires_redaction
 from kiro_crew.mcp_gateway.claim import STUB_SESSION_TOKEN_ENV
 from kiro_crew.pinned_fs import (
     PinnedPathRefusal,
@@ -40,6 +42,12 @@ from kiro_crew.pinned_fs import (
     supports_pinned_walk,
 )
 from kiro_crew.slugs import slug_hash_fallback
+from kiro_crew.validation import (
+    _AGENT_NAME_RE,
+    MAX_SHORT_STRING,
+    normalize_unicode,
+    sanitize_string,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -217,6 +225,96 @@ def member_dispatch_session_server(
     ``None`` when the server command cannot be resolved — the member thread
     then runs as plain chat and the caller logs the degradation.
     """
+    return _member_session_element(
+        MEMBER_DISPATCH_SERVER, "mcp-dashboard", session_key, session_token
+    )
+
+
+#: MCP server mounted per session into member DM threads so a crew can publish
+#: its own webview (``panel_publish``) and discover what renders it
+#: (``panel_templates``). A SECOND session-level mount beside
+#: :data:`MEMBER_DISPATCH_SERVER` rather than a widening of it, because
+#: assignment in Kiro Crew is per server: the dashboard set is folder
+#: organization plus session control, publishing a document is neither, and the
+#: two are withdrawn independently (``agent.member_dispatch``,
+#: ``agent.crew_panel``).
+MEMBER_PANEL_SERVER = "kirocrew-panel"
+
+
+def member_panel_session_server(
+    session_key: str, session_token: str = ""
+) -> dict[str, object] | None:
+    """ACP ``session/new`` ``mcpServers`` element mounting the crew panel.
+
+    The panel server is ``opt_in`` in ``agent._MANAGED_MCP_SERVERS``, so no spec
+    emits it, and the Capabilities editor cannot offer it either: that list is
+    built from CONFIGURED connections and a host-managed opt-in server is not
+    one. This element is therefore the only path by which a crew member reaches
+    its own webview, exactly as :func:`member_dispatch_session_server` is the
+    only path to session control.
+
+    Identity carriage, env and failure mode are that function's, through the one
+    writer :func:`_member_session_element`: the panel server reads the session's
+    tool policy through the same ``mcp_shared.run_mcp_stdio_loop`` path, so an
+    entry without the attestation comes up present-but-unusable and refuses
+    every call as ``identity_unattested``.
+
+    ``None`` when the server command cannot be resolved; the caller logs the
+    degradation and the DM thread keeps the rest of its tools.
+    """
+    return _member_session_element(MEMBER_PANEL_SERVER, "mcp-panel", session_key, session_token)
+
+
+def crew_panel_enabled() -> bool:
+    """Whether a crew member's DM session is granted its own webview.
+
+    The operator ceiling on the zero-configuration panel grant, and the mirror of
+    :func:`~kiro_crew.dashboard.session_control.member_dispatch_enabled`: default
+    true is the contract the capability ships with, and ``agent.crew_panel:
+    false`` withdraws it from every member at once without editing a spec.
+
+    Fails CLOSED in both directions the ceiling can lose the operator's value,
+    for the reason that reader states: a config read that RAISES resolves to
+    false, and a config that LOADS having discarded the ``agent`` section
+    resolves to false too. ``load()`` does not raise on a malformed section, it
+    coerces the section away and falls back to the field default, which is
+    permissive, so without the second check a degraded overlay carrying
+    ``crew_panel: false`` would silently revert to the grant the operator meant
+    to withdraw.
+    """
+    # circular import: the config loader's provider-backend path imports this
+    # module, so both names are resolved at call time like the seams below.
+    from kiro_crew.config.loader import DEGRADED_WHOLE_CONFIG, KiroCrewConfig
+
+    try:
+        cfg = KiroCrewConfig.load()
+    except Exception:
+        logger.warning(
+            "crew_panel: config read failed - withdrawing the panel grant until config loads",
+            exc_info=True,
+        )
+        return False
+    if cfg.degraded_sections & {DEGRADED_WHOLE_CONFIG, "agent"}:
+        logger.warning("crew_panel: agent config section degraded - withdrawing the panel grant")
+        return False
+    return bool(cfg.agent.crew_panel)
+
+
+def _member_session_element(
+    server_name: str, invocation: str, session_key: str, session_token: str
+) -> dict[str, object] | None:
+    """One session-level ``mcpServers`` element for a member DM thread.
+
+    The single writer of the shape both member mounts use. Two servers reach a
+    member session and each needs the same three things: the managed home
+    override, this session's identity, and the port this gateway actually bound.
+    Composing the element twice is how one of them would later be built without
+    one of them.
+
+    *invocation* is the managed subcommand (``mcp-dashboard``, ``mcp-panel``).
+    ``None`` when it cannot be resolved, which each caller reports in its own
+    words because the capability lost differs.
+    """
     # circular import: agent's module graph is heavy and imports config, which
     # sits below this module for the thread-endpoint path.
     from kiro_crew.agent import _kirocrew_mcp_invocation, _managed_mcp_env
@@ -226,9 +324,9 @@ def member_dispatch_session_server(
     from kiro_crew.port_resolution import resolve_serving_port
 
     try:
-        command, args = _kirocrew_mcp_invocation("mcp-dashboard")
+        command, args = _kirocrew_mcp_invocation(invocation)
     except Exception:  # pragma: no cover - defensive; resolver logs its own reason
-        logger.warning("member dispatch: could not resolve the dashboard server command")
+        logger.warning("member mount: could not resolve the %s server command", server_name)
         return None
     if not command:
         return None
@@ -251,7 +349,7 @@ def member_dispatch_session_server(
     # than forwarded.
     env.append({"name": "KIROCREW_BOUND_PORT", "value": str(resolve_serving_port())})
     return {
-        "name": MEMBER_DISPATCH_SERVER,
+        "name": server_name,
         "command": command,
         "args": list(args),
         "env": env,
@@ -273,8 +371,180 @@ _SLUG_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,78}[a-z0-9])?\Z")
 _TRACEABLE_MEMORY_MODES = frozenset({"persistent"})
 
 
+MEMBER_NAME_MAX_CHARS = MAX_SHORT_STRING
+
+
+class MemberNameError(ValueError):
+    """Raised when a Crew Member display name is unsafe or unusable."""
+
+
 class MemberSlugError(ValueError):
     """Raised when a member slug is unusable or cannot be allocated."""
+
+
+def validate_member_name(name: object) -> str:
+    """Return an exact Crew Member display name, else raise MemberNameError."""
+    if not isinstance(name, str) or not name:
+        raise MemberNameError("name must be a non-empty string")
+    if len(name) > MEMBER_NAME_MAX_CHARS:
+        raise MemberNameError(f"name must be at most {MEMBER_NAME_MAX_CHARS} characters")
+    if name != name.strip():
+        raise MemberNameError("name must not start or end with whitespace")
+    try:
+        name.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise MemberNameError("name must be valid UTF-8 text") from exc
+    if len(name.splitlines()) != 1 or "\t" in name:
+        raise MemberNameError("name must not contain line breaks or tabs")
+    if sanitize_string(name) != name:
+        raise MemberNameError("name must not contain hidden or non-canonical characters")
+    # ``.`` and ``..`` are URL path segments every client normalizes away before
+    # the request leaves the browser, so a crew so named could be created but
+    # never addressed at ``/api/agents/{name}`` for edit or delete.
+    if not name.strip("."):
+        raise MemberNameError("name must not consist only of periods")
+    return name
+
+
+#: Longest base a derived crew id keeps, leaving room for a ``-<n>`` suffix
+#: inside ``_AGENT_NAME_RE``'s 64-character cap.
+_CREW_ID_BASE_MAX_CHARS = 56
+
+#: Suffixes tried before a derived crew id falls back to the name's hash.
+_CREW_ID_SUFFIX_ATTEMPTS = 99
+
+
+def is_crew_id(value: object) -> bool:
+    """Return whether *value* is shaped like a new crew's config key.
+
+    A crew id is the identifier grammar crews carried before free-form names
+    (``validation._AGENT_NAME_RE``). New crews are keyed by one; a crew already
+    stored under a free-form name stays readable and is never renamed.
+    """
+    return isinstance(value, str) and bool(_AGENT_NAME_RE.match(value))
+
+
+def crew_id_for_display_name(name: str, taken: Container[str]) -> str:
+    """Derive an unused crew id for a crew the user named *name*.
+
+    The id is a slug of the name, suffixed ``-2``, ``-3``... past any id in
+    *taken*. A name with no slug-safe characters (CJK, emoji) derives from its
+    hash, so two such names never share an id. Deterministic for a given
+    *name* and *taken*.
+    """
+    base = slugify(name)[:_CREW_ID_BASE_MAX_CHARS].strip("-")
+    if not base or base == slug_hash_fallback(name, "artifact"):
+        base = slug_hash_fallback(name, "crew")
+    for n in range(1, _CREW_ID_SUFFIX_ATTEMPTS + 1):
+        candidate = base if n == 1 else f"{base}-{n}"
+        if candidate not in taken and is_crew_id(candidate):
+            return candidate
+    return slug_hash_fallback(name, "crew")
+
+
+@dataclass(frozen=True)
+class NewCrewKey:
+    """How a crew being created is keyed and labelled.
+
+    ``taken`` is the name the user would see twice when the create must be
+    refused (``409 agent_exists``), else ``""``.
+    """
+
+    key: str
+    display_name: str
+    taken: str
+
+
+def key_new_crew(name: str, display_name: str, agents: Mapping[str, object]) -> NewCrewKey:
+    """Decide the config key and label for a crew created as *name*.
+
+    An id-shaped *name* is the key as sent. A free-form one is kept as the
+    label of an id :func:`crew_id_for_display_name` derives. An explicit
+    *display_name* is the label either way. The create is refused when the
+    key is taken, or when the name the crew would show (its label, else its
+    key) is exactly what another crew already shows. The one decision both
+    create surfaces (``POST /api/agents``, ``kirocrew agent create``) share.
+    """
+    if is_crew_id(name):
+        key, label = name, display_name
+        if key in agents:
+            return NewCrewKey(key, label, name)
+    else:
+        key, label = crew_id_for_display_name(name, agents), display_name or name
+    shown = label or key
+    for other_key, other in agents.items():
+        if (getattr(other, "display_name", "") or other_key) == shown:
+            return NewCrewKey(key, label, shown)
+    return NewCrewKey(key, label, "")
+
+
+def is_valid_member_name(value: object) -> bool:
+    """Return whether *value* is a valid Crew Member display name."""
+    try:
+        validate_member_name(value)
+    except MemberNameError:
+        return False
+    return True
+
+
+def is_readable_member_name(value: object) -> bool:
+    """Return whether an exact stored Crew Member name may identify local data."""
+    if not isinstance(value, str) or len(value) > MEMBER_NAME_MAX_CHARS:
+        return False
+    if is_valid_member_name(value):
+        return True
+    nfc = normalize_unicode(value)
+    return sanitize_string(value) == nfc and is_valid_member_name(nfc)
+
+
+def is_dispatchable_member_name(value: object) -> bool:
+    """Return whether a stored Crew Member name can safely reach a model.
+
+    Legacy NFD spellings pass only when their NFC form is valid and both forms
+    are safe to expose.
+    """
+    if not is_readable_member_name(value):
+        return False
+    assert isinstance(value, str)
+    nfc = normalize_unicode(value)
+    return not external_text_requires_redaction(value) and (
+        nfc == value or not external_text_requires_redaction(nfc)
+    )
+
+
+def is_configured_dispatchable_member(name: object, config=None) -> bool:
+    """Return whether *name* is a stored Crew Member that can safely reach a model.
+
+    The agent-choice guards (chat send, slot agent switch, OpenAI-compatible
+    ``model``) admit a bare template or legacy name by the registered-agent
+    grammar (``validation.is_registered_agent_name``: the slot grammar or a
+    published dotted template). A free-form display name -- ``dr. eggbot`` --
+    fails that grammar, so those guards admit it ONLY when it is a configured
+    member: the roster lists exactly these names, and a string that is not a
+    member key never reaches the template lookup as if it were a template. Loads
+    the config only when called, so callers check the grammar first and pay this
+    read on the free-form path alone.
+    """
+    if not isinstance(name, str) or not name:
+        return False
+    if config is None:
+        # Function-local like ``member_slug`` below: ``config.loader`` imports
+        # ``select_provider_backend`` from this module, so a module-scope import
+        # here would close the cycle.
+        from kiro_crew.config.loader import KiroCrewConfig
+
+        config = KiroCrewConfig.load()
+    return name in config.agents and is_dispatchable_member_name(name)
+
+
+def member_pin_matches(mode: object, current_agent: object, requested_agent: object) -> bool:
+    """Return whether a request preserves a dispatchable Crew Member pin."""
+    return (
+        mode == DM_SLOT_MODE
+        and is_dispatchable_member_name(current_agent)
+        and isinstance(requested_agent, str)
+        and requested_agent == current_agent
+    )
 
 
 def members_root() -> Path:
@@ -338,13 +608,48 @@ def slug_for_name(name: str) -> str:
     return validate_slug(base)
 
 
+def canonical_member_key(name: str, config=None) -> str:
+    """The ROSTER's own spelling of *name*, or *name* unchanged when it has none.
+
+    The roster is keyed by the display name somebody typed, so its keys carry case:
+    ``Atlas``. Every per-member path is then derived from the key's ``member_id``
+    through :func:`member_slug` -- and a caller holding ``atlas`` misses the key, gets
+    no ``member_id``, and falls through to ``slug_for_name("atlas")``. That is a
+    DIFFERENT slug from the one the member's own session writes under, so a write and
+    a read of one crewmate land in two directories, both succeeding and neither
+    seeing the other.
+
+    An exact hit wins, so a roster that really holds two keys differing only in case
+    keeps answering each of them as itself. A unique case-insensitive hit is then
+    taken as the same member, because that is what it is. An AMBIGUOUS fold -- two
+    keys, neither matching exactly -- returns *name* unchanged rather than picking
+    one: those two already collide at the slug level, and the surfaces that care
+    refuse that slug outright (``dashboard_slug_ambiguous``). Guessing here would
+    turn a refusal into a write on whichever key sorted first.
+    """
+    if not isinstance(name, str) or not name:
+        return name
+    if config is None:
+        from kiro_crew.config.loader import KiroCrewConfig
+
+        config = KiroCrewConfig.load()
+    agents = getattr(config, "agents", None) or {}
+    if name in agents:
+        return name
+    folded = name.casefold()
+    hits = [key for key in agents if isinstance(key, str) and key.casefold() == folded]
+    return hits[0] if len(hits) == 1 else name
+
+
 def member_slug(name: str, config=None) -> str:
     """Use persisted member identity; legacy members retain their existing slug."""
     if config is None:
         from kiro_crew.config.loader import KiroCrewConfig
 
         config = KiroCrewConfig.load()
-    agent = config.agents.get(name)
+    # Through the roster's own spelling first. A caller that holds `atlas` for the key
+    # `Atlas` otherwise reads no `member_id` and derives a second slug for one member.
+    agent = config.agents.get(canonical_member_key(name, config))
     member_id = getattr(agent, "member_id", "") if agent else ""
     return validate_slug(member_id) if member_id else slug_for_name(name)
 
@@ -353,7 +658,7 @@ def _stable_member_slug(slug: str, name: str) -> bool:
     from kiro_crew.config.loader import KiroCrewConfig
 
     cfg = KiroCrewConfig.load()
-    agent = cfg.agents.get(name)
+    agent = cfg.agents.get(canonical_member_key(name, cfg))
     return bool(agent and getattr(agent, "member_id", "") == slug)
 
 
@@ -889,6 +1194,132 @@ def member_briefing_supported() -> bool:
     return bool(getattr(os, "O_NOFOLLOW", 0)) and supports_pinned_walk()
 
 
+def _briefing_pinned_target(slug: str) -> tuple[str, str]:
+    """``(resolved members root / slug, BRIEFING_FILE_NAME)`` for the pinned open.
+
+    The ROOT is resolved once (the pinned walk's "caller resolves once"
+    contract) and the member's own directory component is appended LEXICALLY,
+    never resolved: ``member_dir`` resolves ``members/<slug>`` too, and a
+    ``members/<slug>`` swapped for a symlink to a peer's directory would then
+    be followed *before* the walk begins -- the walk pins whatever the link
+    points at and reads the peer's briefing as this member's. Left lexical,
+    that component is opened with ``O_NOFOLLOW`` like every other and a link
+    there is refused, which is the property the agent-writable
+    ``members/<slug>/`` directory needs.
+    """
+    validate_slug(slug)
+    root = members_root().resolve()
+    return str(root / slug), BRIEFING_FILE_NAME
+
+
+MEMBER_BRIEFING_TRUNCATION_MARKER = "\n[... briefing truncated at cap — prune it]"
+
+
+def read_member_briefing_bounded(slug: str) -> tuple[str, float | None, bool]:
+    """The bounded, UNCAPPED briefing buffer, its mtime, and whether the read hit its bound.
+
+    The read half of :func:`read_member_briefing`, for a caller that must
+    transform the text BEFORE cutting it at :data:`MEMBER_BRIEFING_MAX_CHARS`
+    -- the dashboard's briefing endpoint redacts credentials, and a redaction
+    run over already-capped text cannot match a token the cap split in two:
+    the plaintext prefix would cross the boundary unmatched. The buffer is
+    still bounded by the read itself (``(cap + 2) * 4`` bytes; see
+    :func:`read_member_briefing`), so a token that straddles THAT edge is
+    possible too, which is why :func:`cap_member_briefing` can drop the split
+    tail. The third value is ``True`` when the file ran past the READ bound
+    (the buffer lacks the file's tail); whether the text also runs past the
+    character cap is :func:`cap_member_briefing`'s call, made on the text it
+    is given -- after any transform -- not on the raw length. The mtime is
+    from the same open as the text and ``None`` whenever the text reads as no
+    briefing. Blocking file IO.
+    """
+    try:
+        parent, name = _briefing_pinned_target(slug)
+    except (MemberSlugError, OSError, RuntimeError):
+        return "", None, False
+    byte_cap = (MEMBER_BRIEFING_MAX_CHARS + 2) * 4
+    if not member_briefing_supported():
+        # Fail closed (see the docstring): without O_NOFOLLOW and the pinned
+        # ancestor walk there is no race-free way to refuse a symlink on an
+        # agent-writable path.
+        return "", None, False
+    try:
+        fd = open_in_pinned_parent(
+            parent,
+            name,
+            flags=os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0),
+            mode=0o600,
+            what="member briefing",
+        )
+    except (PinnedPathRefusal, OSError):
+        # Missing file/dir, a symlink refused anywhere on the pinned walk
+        # (``members/<slug>`` itself included) or the leaf, or any unreadable
+        # state — all read as "no briefing yet".
+        return "", None, False
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            # A FIFO, device or socket is never a briefing; reading one can
+            # block or misbehave, so it reads as "no briefing yet".
+            return "", None, False
+        data = os.read(fd, byte_cap + 1)
+    except OSError:
+        return "", None, False
+    finally:
+        os.close(fd)
+    mtime = float(st.st_mtime)
+    truncated_bytes = len(data) > byte_cap
+    if truncated_bytes:
+        # The cut can split a multi-byte character; the tail is being
+        # truncated anyway, so drop the partial character rather than failing
+        # the whole read over it.
+        text = data[:byte_cap].decode("utf-8", errors="ignore").strip()
+    else:
+        try:
+            text = data.decode("utf-8").strip()
+        except UnicodeError:
+            return "", None, False
+    return text, mtime, truncated_bytes
+
+
+def cap_member_briefing(
+    text: str, read_bounded: bool, *, drop_split_tail: bool = False
+) -> tuple[str, bool]:
+    """Cut ``text`` at :data:`MEMBER_BRIEFING_MAX_CHARS` with the visible marker.
+
+    Returns the text and whether it was cut. ``read_bounded`` is the third
+    value of :func:`read_member_briefing_bounded`: when the read hit its byte
+    bound the buffer lacks the file's tail, so the marker is owed even when
+    what remains fits the cap. Otherwise the cut happens only when the text
+    GIVEN runs past the cap -- measured here, on the text as it is now, so a
+    caller that redacted the buffer first (the dashboard endpoint) is judged
+    on the redacted length: a briefing that only overflowed before its
+    placeholders shrank it is shown whole, with no marker and no word lost.
+
+    With ``drop_split_tail`` the cut also removes the trailing run of
+    non-whitespace characters, so the shown text never ends in the FIRST HALF
+    of a word the cap split: every credential the redaction chain knows is
+    such a run, and a token that straddles the cut (either the character cap
+    or the bounded read's own edge) would otherwise cross the wire as an
+    unmatched plaintext prefix. At most one word of the shown tail is lost to
+    it; a briefing with no whitespace at all in its first cap's worth of
+    characters reads as the marker alone, which is the fail-closed answer.
+    The prompt path keeps the plain cut: the member reads its own file, and
+    the marker is what tells it to prune.
+    """
+    text = text.strip()
+    if not read_bounded and len(text) <= MEMBER_BRIEFING_MAX_CHARS:
+        return text, False
+    head = text[:MEMBER_BRIEFING_MAX_CHARS]
+    if drop_split_tail:
+        stripped = head.rstrip()
+        cut = len(stripped)
+        while cut > 0 and not stripped[cut - 1].isspace():
+            cut -= 1
+        head = stripped[:cut].rstrip()
+    return head + MEMBER_BRIEFING_TRUNCATION_MARKER, True
+
+
 def read_member_briefing(slug: str) -> str:
     """Return a member's briefing text capped for injection, or ``""``.
 
@@ -914,7 +1345,10 @@ def read_member_briefing(slug: str) -> str:
       alone is not enough, because the member's own directory
       (``members/<slug>/``) is agent-writable too, and swapping IT for a link
       redirects the whole traversal while the leaf open still finds an
-      ordinary file (the same ancestor-swap shape the pinned walk exists to close).
+      ordinary file. That is why the walk starts from the resolved members
+      ROOT with ``<slug>`` appended lexically (:func:`_briefing_pinned_target`)
+      rather than from :func:`member_dir`, whose own ``resolve()`` would follow
+      such a link before the walk could refuse it.
       ``O_NONBLOCK`` makes a FIFO open return immediately instead of waiting
       for a writer (both at open time — no check-then-open race); ``fstat``
       then rejects anything that is not a regular file. Where the pinned walk
@@ -930,57 +1364,8 @@ def read_member_briefing(slug: str) -> str:
 
     Blocking file IO: call via ``asyncio.to_thread`` from async code.
     """
-    try:
-        path = member_briefing_path(slug)
-    except (MemberSlugError, OSError, RuntimeError):
-        return ""
-    byte_cap = (MEMBER_BRIEFING_MAX_CHARS + 2) * 4
-    if not member_briefing_supported():
-        # Fail closed (see the docstring): without O_NOFOLLOW and the pinned
-        # ancestor walk there is no race-free way to refuse a symlink on an
-        # agent-writable path.
-        return ""
-    try:
-        # ``path.parent`` comes from :func:`member_dir`, which resolves and
-        # containment-checks it — the "caller resolves once" contract of the
-        # pinned walk. The walk then refuses any component swapped for a link
-        # after that resolution, ``members/<slug>/`` included.
-        fd = open_in_pinned_parent(
-            str(path.parent),
-            path.name,
-            flags=os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0),
-            mode=0o600,
-            what="member briefing",
-        )
-    except (PinnedPathRefusal, OSError):
-        # Missing file/dir, a symlink refused anywhere on the pinned walk
-        # (ancestor or leaf), or any unreadable state — all read as "no
-        # briefing yet".
-        return ""
-    try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
-            # A FIFO, device or socket is never a briefing; reading one can
-            # block or misbehave, so it reads as "no briefing yet".
-            return ""
-        data = os.read(fd, byte_cap + 1)
-    except OSError:
-        return ""
-    finally:
-        os.close(fd)
-    truncated_bytes = len(data) > byte_cap
-    if truncated_bytes:
-        # The cut can split a multi-byte character; the tail is being
-        # truncated anyway, so drop the partial character rather than failing
-        # the whole read over it.
-        text = data[:byte_cap].decode("utf-8", errors="ignore").strip()
-    else:
-        try:
-            text = data.decode("utf-8").strip()
-        except UnicodeError:
-            return ""
-    if truncated_bytes or len(text) > MEMBER_BRIEFING_MAX_CHARS:
-        return text[:MEMBER_BRIEFING_MAX_CHARS] + "\n[... briefing truncated at cap — prune it]"
-    return text
+    text, _mtime, read_bounded = read_member_briefing_bounded(slug)
+    return cap_member_briefing(text, read_bounded)[0]
 
 
 def record_activity(

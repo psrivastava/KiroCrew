@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import tempfile
 import uuid
@@ -13,7 +14,12 @@ from aiohttp.multipart import BodyPartReader
 
 from kiro_crew.dashboard import part_stream
 from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
-from kiro_crew.portability import apply_import_zip, create_export_zip, validate_import_zip
+from kiro_crew.portability import (
+    apply_import_zip,
+    create_export_zip,
+    unbundled_agent_templates,
+    validate_import_zip,
+)
 from kiro_crew.sel import sel as _sel_fn  # circular import — sel imports lazily
 from kiro_crew.snapshot import NamedStoresInUse, SourceComponentUnsound
 
@@ -31,6 +37,13 @@ logger = logging.getLogger(__name__)
 #: the largest value consistent with the guard downstream.
 _MAX_IMPORT_BYTES = 2 * 1024**3
 
+#: Export response header naming the agent templates the bundle does not carry.
+UNBUNDLED_TEMPLATES_HEADER = "X-Kirocrew-Unbundled-Templates"
+
+#: Export response header: how many chats were left out so the archive stays within
+#: what import accepts (`portability._export_sessions`). A bare non-negative integer.
+SESSIONS_SKIPPED_SIZE_HEADER = "X-Kirocrew-Sessions-Skipped-Size"
+
 
 def _sel():
     return _sel_fn()
@@ -41,7 +54,9 @@ async def _read_upload_file(request: web.Request) -> tuple[Path | None, web.Resp
     reader = await request.multipart()
     part = await reader.next()
     if part is None or not isinstance(part, BodyPartReader) or part.name != "file":
-        return None, web.json_response({"error": "file field required"}, status=400)
+        return None, web.json_response(
+            {"error": "file field required", "code": "file_field_required"}, status=400
+        )
 
     # A single path rather than a scratch directory: the callers below already
     # own the returned file and unlink it in their `finally`, so a directory
@@ -69,15 +84,24 @@ async def api_portability_export(request: web.Request) -> web.Response:
     subject that is not the owner (an allow-listed messaging user holding a
     ``!dashboard`` token, say) must not be able to pull it. This aggregate export
     requires owner permission independently of member memory visibility.
+
+    ``?include_sessions=true`` adds the persistent dashboard chats
+    (`portability._export_sessions`); without it the archive carries none.
     """
     if "user" not in request or not request["user"]:
-        return web.json_response({"error": "authentication required"}, status=401)
+        return web.json_response(
+            {"error": "authentication required", "code": "auth_required"}, status=401
+        )
     denied = await require_owner_dashboard_request(request, "portability.export")
     if denied is not None:
         return denied
     caller = request["user"]
+    # Opt-in per export: chats ride only when this request asks for them.
+    include_sessions = request.query.get("include_sessions", "").lower() in ("1", "true")
     try:
-        zip_bytes, manifest = await asyncio.to_thread(create_export_zip)
+        zip_bytes, manifest = await asyncio.to_thread(
+            create_export_zip, include_sessions=include_sessions
+        )
     except Exception as e:
         logger.exception("Export failed")
         _sel().log_api_access(
@@ -86,43 +110,65 @@ async def api_portability_export(request: web.Request) -> web.Response:
             outcome="error",
             error=str(e),
         )
-        return web.json_response({"error": "Export failed"}, status=500)
+        return web.json_response({"error": "Export failed", "code": "export_failed"}, status=500)
 
     ts = manifest.get("created_at", "unknown").replace(":", "").replace("-", "")
     filename = f"kirocrew-export-{ts}.zip"
 
+    contents = manifest.get("contents", {})
+    skipped_size = contents.get("sessions_skipped_size", 0)
+    if not isinstance(skipped_size, int) or isinstance(skipped_size, bool) or skipped_size < 0:
+        skipped_size = 0
     _sel().log_api_access(
         caller=caller,
         operation="portability.export",
         outcome="ok",
-        resources=f"size={len(zip_bytes)}",
+        resources=f"size={len(zip_bytes)}"
+        + (
+            f",sessions={contents.get('session_count', 0)},sessions_skipped_size={skipped_size}"
+            if include_sessions
+            else ""
+        ),
     )
 
-    return web.Response(
-        body=zip_bytes,
-        content_type="application/zip",
-        headers={
-            "Content-Disposition": f'attachment; filename="{filename}"',
-            "Content-Length": str(len(zip_bytes)),
-        },
-    )
+    headers = {
+        "Content-Disposition": f'attachment; filename="{filename}"',
+        "Content-Length": str(len(zip_bytes)),
+    }
+    # The body is the archive, so the warning rides a header: the agent templates
+    # the crews name, none of which the bundle carries. JSON with ASCII escapes, so
+    # a hand-edited name cannot break the header line.
+    # Bounded upstream (count and length), so the header stays small; the left-out
+    # count rides along as a trailing "+N".
+    unbundled, more = await asyncio.to_thread(unbundled_agent_templates)
+    if unbundled:
+        headers[UNBUNDLED_TEMPLATES_HEADER] = json.dumps(unbundled + ([f"+{more}"] if more else []))
+    if include_sessions:
+        headers[SESSIONS_SKIPPED_SIZE_HEADER] = str(skipped_size)
+    return web.Response(body=zip_bytes, content_type="application/zip", headers=headers)
 
 
 async def api_portability_import(request: web.Request) -> web.Response:
     """POST /api/portability/import — upload and apply a Kiro Crew export zip.
 
     Owner-only, like the export: an import rewrites the install's memory -- every named
-    store's included -- and its config.
+    store's included -- and its config. Merge (the default) never overwrites a settings
+    document this install has; see `portability._merge_settings`.
     """
     if "user" not in request or not request["user"]:
-        return web.json_response({"error": "authentication required"}, status=401)
+        return web.json_response(
+            {"error": "authentication required", "code": "auth_required"}, status=401
+        )
     denied = await require_owner_dashboard_request(request, "portability.import")
     if denied is not None:
         return denied
     caller = request["user"]
     mode = request.query.get("mode", "merge")
     if mode not in ("merge", "replace"):
-        return web.json_response({"error": "mode must be 'merge' or 'replace'"}, status=400)
+        return web.json_response(
+            {"error": "mode must be 'merge' or 'replace'", "code": "invalid_import_mode"},
+            status=400,
+        )
 
     zip_path, err_resp = await _read_upload_file(request)
     if err_resp is not None:
@@ -138,9 +184,16 @@ async def api_portability_import(request: web.Request) -> web.Response:
                 outcome="denied",
                 error=error,
             )
-            return web.json_response({"ok": False, "error": error}, status=400)
+            return web.json_response(
+                {"ok": False, "error": error, "code": "import_archive_invalid"}, status=400
+            )
 
-        summary = await asyncio.to_thread(apply_import_zip, zip_path, mode)
+        # The running gateway's notification-settings store, so restored mutes apply at
+        # once instead of being written back over by its in-memory copy.
+        channel_settings = getattr(request.app.get("state"), "notification_channel_settings", None)
+        summary = await asyncio.to_thread(
+            apply_import_zip, zip_path, mode, channel_settings=channel_settings
+        )
 
         # `staging` is recorded here, not only returned. Nothing renders it, and
         # whether an import was pinned, mixed or unpinned is a security property of the
@@ -186,7 +239,9 @@ async def api_portability_import(request: web.Request) -> web.Response:
             outcome="error",
             error=str(e),
         )
-        return web.json_response({"ok": False, "error": "Import failed"}, status=500)
+        return web.json_response(
+            {"ok": False, "error": "Import failed", "code": "import_failed"}, status=500
+        )
     finally:
         zip_path.unlink(missing_ok=True)
 
@@ -194,7 +249,9 @@ async def api_portability_import(request: web.Request) -> web.Response:
 async def api_portability_preview(request: web.Request) -> web.Response:
     """POST /api/portability/preview — validate and preview a zip without applying."""
     if "user" not in request or not request["user"]:
-        return web.json_response({"error": "authentication required"}, status=401)
+        return web.json_response(
+            {"error": "authentication required", "code": "auth_required"}, status=401
+        )
     caller = request["user"]
 
     zip_path, err_resp = await _read_upload_file(request)
@@ -227,6 +284,8 @@ async def api_portability_preview(request: web.Request) -> web.Response:
             outcome="error",
             error=str(e),
         )
-        return web.json_response({"ok": False, "error": "Preview failed"}, status=500)
+        return web.json_response(
+            {"ok": False, "error": "Preview failed", "code": "preview_failed"}, status=500
+        )
     finally:
         zip_path.unlink(missing_ok=True)

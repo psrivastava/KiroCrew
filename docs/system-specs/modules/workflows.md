@@ -20,7 +20,7 @@ driver of that substrate. TaskRunner is another, stricter product layer: it uses
 the common substrate but keeps its planning, approval, retry, test,
 git/worktree, replan, persistence, and cleanup semantics.
 
-The subsystem lives in `src/kiro_crew/workflows/` (13 modules). This file is the
+The subsystem lives in `src/kiro_crew/workflows/` (14 modules, including `__init__.py`). This file is the
 **frozen contract** those modules cite: `workflows/__init__.py` declares the `ctx`
 Protocol and the event vocabulary and points here, `events.py` says the per-type
 `data` field table lives here, and `validate.py` says never to relax a check here
@@ -65,16 +65,24 @@ context      (may import: __init__, validate)
     ↑
 runner       (may import: __init__, validate, dsl, events, context, schema, registry)
     ↑
-service      (may import: validate, registry, runner, agent_exec, agent_pool, store, library)
+service      (may import: validate, registry, runner, agent_exec, agent_pool, store, library, events)
 ```
+
+The scan counts only relative sibling imports (`from .sib import …`, level 1).
+An absolute `kiro_crew.workflows.*` import is outside it: `agent_pool` imports
+`agent_exec` and `library` imports `store` that way, so the diagram's "leaves" are
+leaves only in the relative-import sense the test checks.
 
 The same test forbids the engine from importing `kiro_crew.dashboard.state` or
 `kiro_crew.dashboard.ws` directly, so progress leaves the engine only through the
 injected event sink. `agent_exec`, `agent_pool`, and `store` are **optional
-adapters**, not engine layers: `store.py` and `runner.py` import
-`kiro_crew.config` / `kiro_crew.sel` / `kiro_crew.security` inside `try/except
-ImportError` and degrade to a default or a no-op, so the engine stays importable
-standalone.
+adapters**, not engine layers. `runner.py` imports `kiro_crew.sel` and the
+`kiro_crew.security` redactors inside `try/except ImportError` and degrades to a
+no-op audit and unredacted (still truncated) failure text, so the engine stays
+importable standalone. `store.py` guards only `kiro_crew.config.loader.KiroCrewConfig`
+that way (falling back to `config_dir()/workflows`); its `platform_compat`,
+`config.paths`, `execution_context`, `pinned_fs` and `security` imports are hard
+dependencies.
 
 `test/test_workflows_presence.py` additionally fails the build if any
 `workflows/*.py` module is not imported by some `test/test_workflows_*.py`, so a
@@ -420,7 +428,13 @@ Static rejections:
 - **`FORBIDDEN_NAMES`:** `eval`, `exec`, `compile`, `open`, `input`, `__import__`,
   `__builtins__`, `globals`, `locals`, `vars`, `getattr`, `setattr`, `delattr`,
   `breakpoint`, `memoryview`, `classmethod`, `staticmethod`, `super`, `type`.
-- **No dunder attribute or name access** (`().__class__`, `__builtins__`).
+- **No dunder, private or introspection attribute access, and no dunder name access**
+  (`().__class__`, `__builtins__`, `x._y`, `FORBIDDEN_ATTRS` — frame, code and
+  generator internals such as `gi_frame` / `f_globals` / `tb_frame`, and `mro`),
+  nor `.format` / `.format_map`, whose template is interpreted at run time. One
+  predicate (`_attr_reason`) judges an attribute node, a format-string field and
+  a class-pattern keyword (`MatchClass.kwd_attrs`, a plain string rather than an
+  attribute node) alike.
 - **Shape:** a module-level `META` assigned a **pure literal** dict
   (`ast.literal_eval`; both `META = {...}` and `META: dict = {...}` are accepted),
   and an `async def workflow(ctx)` entrypoint whose first parameter is named `ctx`
@@ -441,8 +455,10 @@ Static rejections:
   instead of failing mid-run:
   - `await ctx.phase(...)` / `await ctx.log(...)` / `await ctx.nudge(...)`, because
     those are synchronous.
-  - `with ctx.<m>(...)` for any `m` outside `{phase, log, nudge}`, and `async with
-    ctx.<anything>(...)` at all.
+  - `with ctx.<m>(...)` for a known async `ctx` method (`agent`, `parallel`,
+    `pipeline`, `workflow`, `approve`); other attribute names are left to the ctx
+    surface check. `async with ctx.<m>(...)` is rejected for every known `ctx`
+    method, `phase` / `log` / `nudge` included.
   - inline dereference of a nullable awaited result:
     `(await ctx.agent(...)).get(...)` or `[...]` or `.attr`, for `agent`,
     `parallel`, `pipeline`, `workflow` and `approve`. Binding to a variable first
@@ -543,7 +559,7 @@ None-guard, and `validate` rejects the inline unguarded dereference.
 
 | Ceiling | Constant | Value | Behavior at the limit |
 |---------|----------|-------|----------------------|
-| Wall clock per run | `runner.DEFAULT_RUN_TIMEOUT_SECS` | 3600s | `run_failed`, `where="ceiling"`, `error="timeout"` |
+| Wall clock per run | `runner.DEFAULT_RUN_TIMEOUT_SECS` | 3600s | `run_failed` with `where="ceiling"` and `error="run exceeded <N>s"`; the `RunResult.error` is `"timeout"` |
 | Wall-clock bounds | `MIN_RUN_TIMEOUT_SECS` / `MAX_RUN_TIMEOUT_SECS` | 60s / 21600s (6h) | a caller value is clamped into the range |
 | Agent calls per run | `context.DEFAULT_MAX_AGENTS_PER_RUN` | 1000 | `BudgetExceeded` -> `run_failed`, `where="ceiling"` |
 | Tool calls per agent step | `agent_exec._MAX_TURNS_PER_STEP` | 200 | `stream_and_collect` stops the step; prevents an infinite tool loop from prompt injection |
@@ -603,8 +619,8 @@ objects (in particular never the `asyncio.Task`).
 `RunHandle` holds `run_id`, `name`, `status`, the growing `events` list, `result`,
 `error`, `author`, `session_key`, `source`, `args`, `agent_results`,
 `agent_errors`, exact saved-definition provenance, optional `derived_from`
-ancestry, and the driving `task`. Statuses: `running`, `finished`, `failed`,
-`cancelled`.
+ancestry, and the driving `task`. Statuses: `running`, `paused`, `finished`,
+`failed`, `cancelled`; `running` and `paused` are active states.
 
 Two distinct serializations:
 
@@ -751,9 +767,10 @@ Properties that matter:
 
 - **Atomic writes:** temp file plus `os.replace`, then `chmod 0o600`, so a crash
   mid-write cannot corrupt a run file.
-- **Redaction before disk:** every string in the record passes through
-  `redact_exfiltration_urls` then `redact_credentials`, recursively. Defense in
-  depth; the HTTP and chat surfaces redact again on the way out.
+- **Redaction before disk:** every string **value** in the record passes through
+  `redact_exfiltration_urls` then `redact_credentials`, recursively. Mapping keys
+  are retained as-is by `WorkflowRunStore`; the HTTP and chat response redactors
+  independently cover both keys and values on the way out.
 - **Injective paths:** a `run_id` is sanitized to alphanumerics plus `_`/`-` so a
   malformed id cannot traverse out of the runs dir. Because sanitizing is lossy,
   when it changes the id a 12-hex-char sha256 prefix of the original is appended,
@@ -831,9 +848,11 @@ mutation remain on the owning loop. This is startup-only on an unpublished
 registry, never concurrent with live runs or host reopen. Cancellation (including
 repeated cancellation) drains the owned load before propagating, leaving no late
 writer to race a subsequent initialization. The synchronous constructor and
-`load_persisted()` remain available for standalone callers. Both paths retain the
-store's best-effort failure semantics: awaiting I/O does not certify a successful
-write when the store itself reports failure only through debug logging.
+`load_persisted()` remain available for standalone callers. Inventory failures
+propagate. Snapshot-save failures raised by the store are converted by the registry
+into the run's sanitized persistence-health error, so awaiting the I/O drains the
+attempt but does not by itself certify durable success; store deletion remains
+best-effort.
 
 ### Reusable definition library
 
@@ -871,6 +890,10 @@ if credential or exfiltration redaction would change executable source, the save
 the library never persists a corrupted script. Async gateway, authoring, and saved-run
 paths offload library disk I/O to worker threads, while the service serializes library
 operations so slug allocation and revision checks remain atomic in-process.
+Revision updates also hold a sidecar file lock across the disk read, expected-revision
+check, and atomic replacement. This makes two gateway or harness processes sharing
+the library reject the second update to the same revision rather than silently
+accepting both and losing one writer's source.
 
 Only explicitly saved definitions participate in local authoring matches.
 `search(intent)` uses deterministic local lexical ranking. `author(intent)` adds
@@ -886,7 +909,7 @@ their exact YAML to TaskRunner without LLM decomposition and retain the saved
 definition id, slug, and revision on both the project and shared run.
 
 The chat run card offers explicit promotion after an ad-hoc Python run reaches
-`finished`. Agent Capabilities > Workflows has **Workflow library** and **Runs**
+`finished`. Customize > Workflows has **Workflow library** and **Runs**
 views; the Runs view lists both dynamic Python and TaskRunner-backed runs. It
 also offers promotion for a paused or finished TaskRunner plan whose run
 declares the `save` capability. It loads the response-redacted run snapshot for
@@ -906,7 +929,7 @@ editor uses the same line-numbered, horizontally scrolling source surface in
 editable mode. Python is highlighted as Python and TaskRunner plans as YAML. Both
 source views are presentation-only:
 neither normalizes nor reformats source bytes. On success, the card shows
-`/workflow <slug>` and links to Agent Capabilities > Workflows.
+`/workflow <slug>` and links to Customize > Workflows.
 
 Session promotion derives lineage from the validated original source's
 `META["adapted_from"]` and accepts it only when the exact id and revision exist in
@@ -1008,10 +1031,10 @@ multiple snapshots behind an active write, superseded intermediate snapshots are
 discarded and the newest snapshot is written last; deletion uses the same queue
 so an in-flight checkpoint cannot resurrect a removed run.
 
-Run ids are `wf_NNNNNN` from a per-process monotonic counter, deliberately with no
-time or random component so they stay resume-stable. On startup, after rehydrating
-persisted runs, the counter continues past the highest persisted sequence so new
-ids cannot collide with restored ones.
+Run ids are durable monotonic `wf_NNNNNN` values allocated by
+`workflow_memory.allocate_run_id()`. The service's recovered sequence is only a
+lower bound; the cross-process, fsync-backed high-water allocator is authoritative.
+See [Atomic run identity allocation](#atomic-run-identity-allocation).
 
 ### Authoring
 
@@ -1024,7 +1047,20 @@ Each failed attempt is destroyed before the next. Authentication, configuration,
 permission, arbitrary, model-prompt, and validation failures are not startup
 retries. Once a session is ready, script validation still loops up to
 `_AUTHOR_RETRIES + 1` = 3 attempts and feeds the validation errors back on each
-retry. `_strip_fence` peels only the opening fence line and a trailing fence,
+retry. When the previous reply was cut off, the retry says so and asks for a
+shorter complete script instead of "fix it", since a same-length regeneration
+stops in the same place. A reply counts as cut off when its turn ended with ACP
+stop reason `max_tokens`, even when the script validates, or when it fails to
+parse because it ends mid-construct: a bracket or triple-quoted string still
+open at end of input, or a syntax error on its last line
+(`_ends_mid_construct`). When every attempt fails,
+the result's `errors` keeps each attempt's errors, prefixed `attempt N/3:`, so
+the failed run shows what every attempt hit rather than only the last. Because
+that list is stored and served verbatim as the run's error, each attempt
+retains at most `_AUTHOR_ERRORS_PER_ATTEMPT` errors, each cut to
+`_AUTHOR_ERROR_CHARS` characters, plus one `+N more errors` entry counting the
+rest; the retry prompt still receives every error in full.
+`_strip_fence` peels only the opening fence line and a trailing fence,
 never splitting on every ``` , because a literal triple backtick inside the
 script body would otherwise truncate it mid-statement.
 
@@ -1159,14 +1195,27 @@ run **ceiling** is unaffected by that and is config-driven.
 
 ### HTTP surface
 
-Registered in `dashboard/server.py`, handled in
+Registered in `dashboard/server_runtime/mcp_routes.py`, handled in
 `dashboard/handlers/workflows.py`. These back both the chat `workflow_*` MCP tools
 (which call them with `X-Internal-Secret`) and the Workflows dashboard tab; the
 caller's `X-Session-Key` header becomes the run's `author` and `session_key`.
 
 Before author, source run, intent run, saved-definition run or subtree rerun
-calls the service, ordinary transport authentication and owner/app permissions
-apply. The session's canonical execution record is captured before asynchronous
+calls the service, ordinary transport authentication applies, and then a split by
+caller class:
+
+- **Source, intent and saved-definition runs** (`POST /api/workflows/run`,
+  `/run_intent`, `/definitions/{ref}/run`): a dashboard-user request (no
+  `internal_auth`, `app == ""`) must be the dashboard owner
+  (`require_owner_dashboard_request`, 403 `owner_only`). An `X-Internal-Secret`
+  loopback caller (the chat `workflow_*` MCP tools) and a manifest-scoped app token
+  keep the controls that already govern them. `POST /api/spawn` and
+  `POST /api/crons` gate the dashboard-user class the same way.
+- **Definition create, update and run promotion** are owner-only for every caller.
+- **Run list, detail, cancel and rerun** go through `workflow_memory.authorize_run`
+  (the list keeps only the runs it admits).
+
+The session's canonical execution record is captured before asynchronous
 dispatch; missing or malformed member identity refuses instead of selecting Global.
 Run list/detail/cancel/rerun keep ordinary execution permissions. A permitted
 rerun retains the original run's member/store and strictest privacy mode, even
@@ -1210,6 +1259,28 @@ the redacted event plus the run's `session_key`, and the frontend
 budget snapshot. On a terminal state, `dashboard/workflow_inject.py` posts the
 result into the originating chat slot and starts (or queues) an agent turn so the
 user gets a synthesized answer rather than a raw blob.
+
+An agent the run ends before it finishes has no `agent_finished`: `_RunContext.agent()`
+records that event only after its call returns, and a cancel leaves the call by
+`CancelledError`, which is not the `Exception` its handler catches, whether an operator
+cancelled the run or the wall-clock ceiling cancelled the script task before recording
+`run_failed` (`where="ceiling"`). A budget ceiling cannot leave an agent in flight:
+`BudgetExceeded` is raised before `agent_started` (see the order of operations above).
+The views therefore derive that agent's state from the RUN status, not from an
+event of its own (`runModel.agentState`): an agent with no finish reads as running
+only while the run is `running` or `paused`, and as **stopped** once the run is
+terminal (`finished`, `failed`, `cancelled`), drawn with the `Square` stop mark the
+subagent surfaces use for the same state and named with the chat stop card's
+catalog entry. The current phase of a cancelled run reads as **stopped** too, never
+as a success: the run ended inside it, so the phase did not complete. So does an
+earlier phase the run ended inside: `pipeline()` has no barrier between stages, so a
+later phase can start while an earlier one still has an agent in flight, and that
+phase reads **stopped** rather than ok beside its stopped row. A `finished`
+run's current phase is ok and a `failed` run's is failed. The tree
+(`WorkflowRunTree.tsx`) and the graph (`planModel.ts`, `WorkflowRunGraph.tsx`) share
+the rule so one run cannot read two ways; pinned by
+`website/src/test/WorkflowRunTree.cancelledAgents.test.tsx`,
+`WorkflowRunGraph.test.tsx` and `workflowPlanModel.test.ts`.
 
 ### Plan preview and the graph view
 
@@ -1295,12 +1366,12 @@ rerun stays on the run controls, where the control names what it does.
 Per-node token cost is absent by necessity, not by choice: the stream carries a
 run-level budget only (`run_started.budget_total`, `budget_update.spent`) and no
 per-agent cost attribution, so drawing one would mean inventing a number. Per-node
-TIMING needs no new data, which is why it shipped first (#11795): `agent_started`
-and `agent_finished` each already carry a `ts`.
+TIMING needs no new data: `agent_started` and `agent_finished` each carry a `ts`.
 
 ### MCP tools
 
-`mcp_core.py` exposes eight tools that forward to the routes above:
+`mcp_tools/workflows.py` exposes eight tools that forward through the shared MCP
+HTTP helpers to the routes above:
 `workflow_author`, `workflow_run` (takes `source`, `intent`, or an exact saved
 `workflow` reference, plus `input`, `name`, `args`, `budget_total`),
 `workflow_library_list`, `workflow_status`, `workflow_result`, `workflow_list`,
@@ -1320,14 +1391,16 @@ The dashboard handles `/workflow <slug> [input]` locally before harness session
 acquisition; `/workflow` alone lists saved definitions. This keeps the command
 identical across Kiro and adapted harnesses, and prevents an explicit reference
 from being reinterpreted by a harness. The definition format selects its owning
-driver; there is no user-facing engine choice. The Agent Capabilities →
+driver; there is no user-facing engine choice. The Customize →
 Workflows tab is the human management surface. Its Workflow library view owns
 listing, authoring unsaved drafts, lineage, source edits as new revisions, and
 exact saved runs; its Runs view owns common history and explicit promotion.
 
 The `workflows` builtin app (`apps/builtins/workflows/`) is `defaultEnabled:
 false` and `hidden: true`; it exposes `/validate`, `/run` and `/examples` over its
-own stdlib HTTP server.
+own stdlib HTTP server. Its `/run` endpoint uses the deterministic `_stub_agent`;
+real agent orchestration runs through the gateway service and the MCP/HTTP surfaces
+above.
 
 `/examples` serves the scripts in [`examples/workflows/`](examples/workflows/),
 which `server.py::_examples_dir()` locates by walking up from the module toward the
@@ -1363,7 +1436,7 @@ call site safe without a try/except at each one.
 | `agent.workflow_run_timeout_secs` | 3600 | default wall-clock ceiling per run; clamped to 60..21600 by `clamp_run_timeout`, so it can be raised for long multi-phase investigations but never disabled |
 
 Workflow agent concurrency is **not** configurable: it is pinned at 4 in
-`dashboard/server.py` for the pool-bound reason above.
+`dashboard/server_runtime/workflow_startup.py` for the pool-bound reason above.
 
 ## Changing this contract
 
@@ -1453,7 +1526,7 @@ by name; the two together are why a single missed AST pattern is not an escape.
 | B2 | No dunder attribute or name access (`().__class__`, `__builtins__`, and the rest), no private (`_`-prefixed) attribute access, and no `.format` / `.format_map` call — their template is interpreted at run time, so a traversal can be assembled from parts no static fold can resolve (f-strings are the replacement: their fields are real AST and are already checked). An inline adversarial-escape corpus is rejected wholesale. | `test_workflows_invariants.py::test_b2_dunder_attribute_rejected`, `::test_b2_adversarial_escapes_rejected` | `validate.py` |
 | B3 | The nondeterminism modules (`time`, `random`, `uuid`) are unreachable, statically (they cannot be imported) and at run time (no `__import__` in the sandbox namespace, and `SAFE_BUILTINS` excludes nondeterministic and I/O builtins). Determinism is what makes a run stream resume-stable. | static: `test_workflows_invariants.py::test_b3_determinism_modules_rejected`, `::test_b3_safe_builtins_exclude_nondeterminism_and_io`; runtime: `test_workflows_context.py::test_import_statement_fails_in_safe_globals`, `::test_hostile_snippet_fails_at_runtime_in_safe_globals` | `validate.py`, `context.py` (`build_safe_globals`) |
 | B4 | Event persistence is JSON only: `serialize_events` / `deserialize_events` round-trip through `json`, reject non-JSON and non-array input, and the module imports no `pickle` / `marshal` / `shelve`. | `test_workflows_events.py::test_round_trip_through_json`, `::test_serialize_output_is_pure_json`, `::test_deserialize_rejects_non_json`, `::test_events_module_has_no_pickle_import` | `events.py` |
-| B5 | A wall-clock timeout terminates a runaway run and reports it as a clean `run_failed` with `where == "ceiling"` and `error == "timeout"`. The guard must never let an `asyncio.CancelledError` escape `run()` to the caller. | `test_workflows_runner.py::test_wall_clock_timeout_kills_runaway`, `::test_timeout_never_leaks_cancellederror` | `runner.py` |
+| B5 | A wall-clock timeout terminates a runaway run and reports it as a clean `run_failed` with `where == "ceiling"` (event error `run exceeded <N>s`) and a `RunResult` whose `error == "timeout"`. The guard must never let an `asyncio.CancelledError` escape `run()` to the caller. | `test_workflows_runner.py::test_wall_clock_timeout_kills_runaway`, `::test_timeout_never_leaks_cancellederror` | `runner.py` |
 | B6 | `AgentCounter` caps lifetime `ctx.agent()` calls per run (default `DEFAULT_MAX_AGENTS_PER_RUN = 1000`) and the cap is enforced through the runner: an unbounded agent loop stops at the limit and ends as `run_failed` at the ceiling. | `test_workflows_context.py::test_agent_counter_raises_past_limit`, `::test_agent_counter_default_limit`; `test_workflows_runner.py::test_agent_count_cap_enforced` | `context.py` (`AgentCounter`), `runner.py` |
 | B7 | The exec namespace exposes only `SAFE_BUILTINS` plus `ctx`, so a script has no filesystem or egress reach: `open`, `eval`, `exec`, `compile`, `__import__`, `input` and `getattr` are absent, and benign safe builtins still work. | `test_workflows_context.py::test_safe_globals_only_exposes_ctx_and_safe_builtins`, `::test_hostile_snippet_fails_at_runtime_in_safe_globals`, `::test_safe_builtins_actually_usable` | `context.py` (`build_safe_globals`) |
 | B9 | Every hostile script in the on-disk escape corpus (`test/workflows/malicious/*.py`) is statically rejected, with a non-empty error. The corpus directory must exist and be non-empty, and a new escape idea is added by dropping a file in it: the test parametrizes over the directory. | `test_workflows_malicious.py::test_every_malicious_script_is_rejected`, `::test_corpus_dir_exists_and_is_populated` | `validate.py`, `test/workflows/malicious/` |
@@ -1510,7 +1583,7 @@ and a git-dependent gate can redden a clean trunk.
 
 | Gate | Guarantees | Pinned by | Constrains |
 |---|---|---|---|
-| F1 | The layering holds: `validate` / `dsl` / `schema` / `events` / `registry` / `__init__` and the optional adapters (`agent_exec`, `agent_pool`, `store`, `library`) are leaves with no intra-package siblings; `context` may import `validate`; `runner` may import `validate`, `dsl`, `events`, `context`, `schema`, `registry`; `service` sits above the runner. No module may import backwards, no module escapes the declared contract, and the engine must not reach into `kiro_crew.dashboard.state` or `kiro_crew.dashboard.ws` (progress goes through the event bus or a port). | `test_workflows_architecture.py::test_layering_no_backward_or_unexpected_sibling_imports`, `::test_engine_does_not_import_dashboard_internals`, `::test_every_module_is_covered_by_the_contract` | all of `src/kiro_crew/workflows/` |
+| F1 | The layering in [Module layering](#module-layering) holds. No module may import backwards, no module escapes the declared contract, and the engine must not reach into `kiro_crew.dashboard.state` or `kiro_crew.dashboard.ws` (progress goes through the event bus or a port). | `test_workflows_architecture.py::test_layering_no_backward_or_unexpected_sibling_imports`, `::test_engine_does_not_import_dashboard_internals`, `::test_every_module_is_covered_by_the_contract` | all of `src/kiro_crew/workflows/` |
 | F2 | The frozen contract in `workflows/__init__.py` cannot drift silently: `__all__`, the `WorkflowContext` data attributes, its exact method set, each method's signature and async-ness, each port's methods and `runtime_checkable`-ness, `EVENT_TYPES` (exact and ordered), and the event envelope keys plus JSON round-trip. Changing any of them is an explicit re-freeze that must update `__init__.py`, the spec above, and this test together. | `test_workflows_conformance.py::test_all_exports_exact`, `::test_ctx_method_set_exact`, `::test_ctx_method_signature`, `::test_port_method_signature`, `::test_event_types_exact_and_ordered`, `::test_event_envelope_keys_exact` | `__init__.py` |
 | F3 | Every implementation module under `workflows/` is imported by at least one `test/test_workflows_*.py`, so a module cannot be added without a test that reaches it. The gate carries its own negative control, so it cannot silently stop catching orphans. | `test_workflows_presence.py::test_every_workflows_module_has_a_referencing_test`, `::test_presence_gate_flags_an_orphan_module` | all of `src/kiro_crew/workflows/` |
 
@@ -1622,6 +1695,25 @@ share denotes that server's administrators, not this machine's. An unknown user
 SID, unreadable owner or any other owner still refuses. The existing fail-loud
 owner-only DACL lockdown remains required for both directories and files; no
 ownership is rewritten. POSIX retains its exact-current-UID check.
+
+The allocator's link trust anchor is the parent of the workflows directory
+(`config_dir()` by default). A link at or above it is the operator's own layout
+-- a symlinked `$HOME` such as `/home/u -> /local/home/u`, or a data home
+relocated onto another disk -- and allocation proceeds through it, the same two
+layouts `atomic_write`'s parent-link guard trusts. Below the anchor every
+directory is one the allocator creates itself, so the workflows directory, the
+lock and the counter are each refused as `redirected` unless their resolved path
+equals the resolved anchor joined with the lexical names below it; the lock and
+counter additionally keep their `O_NOFOLLOW`, regular-file, single-link and
+same-inode checks on the opened descriptor.
+
+Every allocator refusal is a `WorkflowAllocatorError`, a `WorkflowMemoryError`
+subclass. `admission_errors` logs the original refusal text (and its cause) at
+warning level, then answers an allocator refusal with code
+`workflow_allocator_unavailable` and the refusal's own text -- no memory store
+was consulted, so the memory wording would misname it. Every other
+`WorkflowMemoryError` keeps code `workflow_memory_unavailable` and the text
+"Workflow memory is unavailable; no Global fallback was used."
 
 Saved task-plan execution passes its captured execution context to TaskRunner,
 including calls supplying only `author`. Runtime, worker and reviewer contexts

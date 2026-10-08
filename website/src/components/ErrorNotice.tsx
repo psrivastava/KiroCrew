@@ -4,6 +4,7 @@ import AskAgentButton, { handoffErrorToAgent } from './AskAgentButton'
 import type { ErrorReport } from '../utils/errorReport'
 
 import { i18nT } from '../i18n/t'
+import { withOriginLink } from './withOriginLink'
 
 export type ErrorNoticeMenuItemComponent = ComponentType<{
   title?: string
@@ -21,15 +22,27 @@ export type ErrorNoticeMenuItemComponent = ComponentType<{
  * notice. `describedBy` points back to that passive alert. Successful selection
  * follows Radix's normal close path. A staging failure prevents that close so
  * the diagnostic and recovery action stay visible.
+ *
+ * `outcome` is an optional one-line consequence rendered under the label, for a
+ * host whose every other item names its outcome in a sub-line: there, a bare
+ * "Ask the agent" was the one control a reader could not identify ("no idea
+ * what it does or why it's in this menu"). The host words it for the notice it
+ * follows; the tooltip keeps describing the mechanism.
  */
 export function ErrorNoticeMenuItem({
   Item,
   message,
   describedBy,
+  outcome,
+  report,
 }: {
   Item: ErrorNoticeMenuItemComponent
   message?: string | null
   describedBy: string
+  outcome?: string
+  /** The structured report, for a host whose `message` is its own rewording
+   *  and so differs from the journal entry `findReport` looks up. */
+  report?: ErrorReport
 }) {
   if (!message) return null
 
@@ -38,11 +51,18 @@ export function ErrorNoticeMenuItem({
       title={i18nT('components.askAgent.open_a_chat_with_this_error_s_context_attached')}
       aria-describedby={describedBy}
       onSelect={(event) => {
-        if (!handoffErrorToAgent({ message })) event.preventDefault()
+        if (!handoffErrorToAgent({ message, report })) event.preventDefault()
       }}
     >
       <Sparkles size={13} className="shrink-0 text-muted" aria-hidden="true" />
-      {i18nT('components.askAgent.ask_the_agent')}
+      {outcome ? (
+        <span className="flex min-w-0 flex-col">
+          <span className="truncate">{i18nT('components.askAgent.ask_the_agent')}</span>
+          <span className="truncate text-[11px] text-muted">{outcome}</span>
+        </span>
+      ) : (
+        i18nT('components.askAgent.ask_the_agent')
+      )}
     </Item>
   )
 }
@@ -73,9 +93,14 @@ export default function ErrorNotice({
   report,
   title,
   onDismiss,
+  dismissLabel,
+  dismissLabelVisible = false,
   variant = 'block',
   askAgent = false,
   askAgentLabel,
+  actionPlacement = 'beside',
+  messagePlacement = 'beside',
+  scrollMessage = false,
   footer,
   onHandoff,
   className = '',
@@ -97,6 +122,30 @@ export default function ErrorNotice({
   title?: string
   /** Renders a dismiss affordance when provided. */
   onDismiss?: () => void
+  /**
+   * Name of the dismiss control — its accessible name AND its tooltip — when
+   * the bare "Dismiss" would leave out what the click commits to: a notice
+   * whose dismissal is REMEMBERED (it stays away on the next visit until its
+   * condition changes) owes the user that promise where they can read it
+   * before clicking, sighted or not. Ignored without `onDismiss`. The control
+   * only ever removes the notice; there is no toned-down or muted register
+   * for an error (a failure toned down to a polite status is still a failure
+   * — see `errors-use-error-notice`), so a caller that wants the notice gone
+   * hides it, and one that wants it seen renders it exactly like this.
+   */
+  dismissLabel?: string
+  /**
+   * Show `dismissLabel` as VISIBLE text beside the ✕ -- the same one string,
+   * read three ways (text, accessible name, tooltip) -- when dismissing is a
+   * step in the user's task rather than the closing of a notice ("Dismiss
+   * notice and re-enable Install" on a banner whose dismissal re-enables the
+   * Install button), so the path back is discoverable without reading the
+   * paragraph that mentions it. Off by default: every other consumer keeps the
+   * icon-only ✕ exactly as it renders today. Ignored without `onDismiss`. In
+   * the block variant a control with text is wide, so the notice's row wraps
+   * and the text takes a line of its own below the message at narrow widths.
+   */
+  dismissLabelVisible?: boolean
   /** `block` = boxed banner; `inline` = compact text for an existing flex row. */
   variant?: 'block' | 'inline'
   /**
@@ -123,6 +172,37 @@ export default function ErrorNotice({
    * `askAgent` is off.
    */
   askAgentLabel?: string
+  /**
+   * Where the hand-off sits in the block variant. `beside` (default) puts it in
+   * the banner's right-hand column, which is right for a banner that spans a
+   * page. `below` stacks it under the text, inside the text column: in a
+   * NARROW host — the chat sidebar is ~300px — a sibling column takes a third
+   * of the width and the title and message wrap one or two words per line. Not
+   * a container query: jsdom cannot evaluate one, so the pin would be
+   * untestable, and `container-type` on the shared root would collapse a
+   * notice laid out in a shrink-to-fit context. Ignored by the inline variant
+   * and when `askAgent` is off.
+   */
+  actionPlacement?: 'beside' | 'below'
+  /**
+   * Where the `message` sits relative to the `title`. `beside` (default) runs
+   * the two as one sentence -- right when the message is the human-readable
+   * clause ("Save failed: the folder no longer exists"). `below` puts the message
+   * on its own line under the title, smaller and secondary: for a notice whose
+   * `message` is a raw server string kept because it is the journal lookup key
+   * (the hand-off recovers endpoint and status from it) while the plain-language
+   * `title` carries the meaning -- "config store" and "gateway" mean nothing to
+   * a first-time reader, so they read as a detail, not as the lead. In the
+   * inline variant the row wraps to make the line. Ignored without a `title`.
+   */
+  messagePlacement?: 'beside' | 'below'
+  /**
+   * Let the message scroll inside a height-constrained block notice while its
+   * built-in hand-off stays visible. The host supplies the height constraint
+   * and uses `actionPlacement="below"` for a separate hand-off line.
+   * Off by default; ignored by the inline variant.
+   */
+  scrollMessage?: boolean
   /**
    * Rendered INSIDE the banner, under the message (block variant only) — for
    * a follow-on line that answers the message above it (a resolved outcome, a
@@ -166,18 +246,26 @@ export default function ErrorNotice({
   testId?: string
 }) {
   if (!message) return null
+  // The secondary line: smaller than the title, lighter than the lead, but still
+  // the alert's own colour -- it is the failure's text, demoted, not a caption.
+  const messageBelow = messagePlacement === 'below' && Boolean(title)
+
+  // One name for the dismiss control, read two ways: `aria-label` for the
+  // accessibility tree and `title` as the tooltip, so a sighted user hovering
+  // the icon-only ✕ sees the same promise a screen reader announces.
+  const dismissName = dismissLabel ?? i18nT('components.errorNotice.dismiss')
 
   if (variant === 'inline') {
     return (
       <span
         role="alert"
-        className={`inline-flex items-center gap-1.5 text-[12px] text-danger ${className}`}
+        className={`inline-flex items-center gap-1.5 text-[12px] text-danger ${messageBelow ? 'flex-wrap' : ''} ${className}`}
         id={id}
         data-testid={testId}
       >
         <AlertTriangle size={14} className="shrink-0" aria-hidden="true" />
         {title && <strong className="font-semibold">{title}</strong>}
-        <span className={`min-w-0 ${messageClassName}`} style={{ overflowWrap: 'anywhere' }} title={messageTooltip}>{message}</span>
+        <span className={`min-w-0 ${messageBelow ? 'basis-full text-[11px] font-normal text-danger/80' : ''} ${messageClassName}`} style={{ overflowWrap: 'anywhere' }} title={messageTooltip}>{withOriginLink(message)}</span>
         {askAgent && (
           <AskAgentButton
             report={report}
@@ -189,35 +277,76 @@ export default function ErrorNotice({
         {onDismiss && (
           <button
             type="button"
-            className="shrink-0 bg-transparent border-none p-0 cursor-pointer text-danger/70 hover:text-danger transition-colors"
-            aria-label={i18nT('components.errorNotice.dismiss')}
+            className={`shrink-0 bg-transparent border-none p-0 cursor-pointer text-danger/70 hover:text-danger transition-colors${dismissLabelVisible ? ' inline-flex items-center gap-1 text-[12px] font-medium whitespace-nowrap' : ''}`}
+            aria-label={dismissName}
+            title={dismissName}
             onClick={onDismiss}
           >
             <X size={13} aria-hidden="true" />
+            {dismissLabelVisible && <span>{dismissName}</span>}
           </button>
         )}
       </span>
     )
   }
 
+  // A dismiss whose name is shown as text (`dismissLabelVisible`) is a wide
+  // control -- "Dismiss notice and re-enable Install" is ~230px at 12px, and the
+  // German and French strings are longer -- and it shares the row with the
+  // message and the agent hand-off. At 320px the three cannot stand side by
+  // side: the label was `whitespace-nowrap`, so the message column was crushed
+  // to nothing and the row overflowed the notice. Same cure as
+  // CrashReportNotice: `flex-wrap` -> `md:flex-nowrap` on the row, and the
+  // control takes a full-width line of its own (`basis-full`, right-aligned)
+  // below the message at narrow widths, rejoining the row at `md`. That line is
+  // the notice's content width, and the German label (~300px at 12px) is wider
+  // than it at 320px, so below `md` the button may shrink and its label wrap:
+  // `shrink-0` and `whitespace-nowrap` hold only from `md` up, where the row has
+  // room for the whole label on one line. One DOM node for the action at every
+  // width -- never a hidden/shown pair, which would make
+  // `getByRole('button', { name })` match twice. The icon-only ✕ keeps the
+  // single-row shape every existing consumer's tests read.
+  const dismissButton = onDismiss && (
+    <button
+      type="button"
+      className={`${dismissLabelVisible ? '' : 'shrink-0 '}bg-transparent border-none p-0 cursor-pointer text-danger/70 hover:text-danger transition-colors${dismissLabelVisible ? ' inline-flex items-center gap-1 mt-[1px] text-[12px] font-medium min-w-0 md:shrink-0 md:whitespace-nowrap' : ''}`}
+      aria-label={dismissName}
+      title={dismissName}
+      onClick={onDismiss}
+    >
+      <X size={14} aria-hidden="true" />
+      {dismissLabelVisible && <span>{dismissName}</span>}
+    </button>
+  )
+
   return (
     <div
       role="alert"
-      className={`rounded-lg border border-danger/40 bg-danger/10 px-3 py-2 flex items-start gap-2 text-[13px] text-danger ${className}`}
+      className={`rounded-lg border border-danger/40 bg-danger/10 px-3 py-2 flex ${dismissLabelVisible ? 'flex-wrap md:flex-nowrap ' : ''}items-start gap-2 text-[13px] text-danger ${className}`}
       id={id}
       data-testid={testId}
     >
       <AlertTriangle size={14} className="mt-[2px] shrink-0" aria-hidden="true" />
-      <div className="min-w-0 flex-1 whitespace-pre-wrap" style={{ overflowWrap: 'anywhere' }}>
+      <div className={`min-w-0 flex-1 whitespace-pre-wrap${scrollMessage ? ' min-h-0 self-stretch flex flex-col' : ''}`} style={{ overflowWrap: 'anywhere' }}>
         {title && <strong className="font-semibold">{title} </strong>}
         {/* Wrapped only when asked: the bare text node is the shape every
             existing consumer's tests read. */}
-        {messageClassName || messageTooltip
-          ? <span className={messageClassName} title={messageTooltip}>{message}</span>
-          : message}
+        {scrollMessage || messageBelow || messageClassName || messageTooltip
+          ? <span className={`${messageBelow ? 'block text-[12px] font-normal text-danger/80' : ''} ${messageClassName}${scrollMessage ? ' min-h-0 overflow-y-auto' : ''}`} title={messageTooltip}>{withOriginLink(message)}</span>
+          : withOriginLink(message)}
         {footer && <div className="mt-1 font-normal">{footer}</div>}
+        {askAgent && actionPlacement === 'below' && (
+          <div className={`mt-1.5${scrollMessage ? ' shrink-0' : ''}`}>
+            <AskAgentButton
+              report={report}
+              message={message}
+              onHandoff={onHandoff}
+              label={askAgentLabel}
+            />
+          </div>
+        )}
       </div>
-      {askAgent && (
+      {askAgent && actionPlacement === 'beside' && (
         <AskAgentButton
           report={report}
           message={message}
@@ -226,16 +355,13 @@ export default function ErrorNotice({
           className="mt-[1px]"
         />
       )}
-      {onDismiss && (
-        <button
-          type="button"
-          className="shrink-0 bg-transparent border-none p-0 cursor-pointer text-danger/70 hover:text-danger transition-colors"
-          aria-label={i18nT('components.errorNotice.dismiss')}
-          onClick={onDismiss}
-        >
-          <X size={14} aria-hidden="true" />
-        </button>
-      )}
+      {dismissLabelVisible
+        ? dismissButton && (
+          <span className="basis-full md:basis-auto shrink-0 flex justify-end">
+            {dismissButton}
+          </span>
+        )
+        : dismissButton}
     </div>
   )
 }

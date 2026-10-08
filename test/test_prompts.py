@@ -31,6 +31,7 @@ from kiro_crew.dashboard.handlers import (
 )
 from kiro_crew.dashboard.handlers import prompts as _prompts_mod
 from kiro_crew.platform_compat import IS_POSIX
+from kiro_crew.security.credential_sources import CredentialEvidence
 
 # ── Shared fixtures ──
 
@@ -45,6 +46,21 @@ def _isolate_home(tmp_path, monkeypatch):
 
     h._prompt_cache = None
     h._prompt_cache_ts = 0
+
+
+@pytest.fixture(autouse=True)
+def _no_turn_tail(monkeypatch):
+    """Skip the turn's tail, which needs far more of a slot than ``_Slot`` models.
+
+    The tail (and the done row the cycle's end appends) is pinned with a real
+    slot in ``test/test_dashboard_chat.py::TestRunChatEarlyExitHandOff``; here
+    only what prompt expansion writes is asserted.
+    """
+
+    async def _skip(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr("kiro_crew.dashboard.chat_runner._end_turn_tail", _skip)
 
 
 @pytest.fixture()
@@ -209,12 +225,9 @@ class _Slot:
         self._queue = []
         self._stop_generation = 0
         self._stopping = False
-        # Mirrors _ChatSlot's model-access / fallback defaults. _run_chat's
-        # per-turn reset reads _model_access_recovery_pending on EVERY turn
-        # (including the slash-command turns these tests drive); the companion
-        # fields are read/written in that same block once the guard is True.
-        self._model_access_recovery_pending = False
-        self._model_access_recovery_stop_gen = 0
+        # Mirrors _ChatSlot's model-access / fallback defaults: _run_chat's
+        # per-turn reset writes the one-shot flag on EVERY turn, including the
+        # slash-command turns these tests drive.
         self._model_access_fallback_used = False
         self._active_fallback_model = ""
         # Mirrors _ChatSlot._chunk_seq: the per-slot chunk counter _run_chat continues.
@@ -224,6 +237,10 @@ class _Slot:
         # from a genuine message, prompt turns included.
         self._refusal_retry_text = ""
         self._refusal_fallback_attempted = False
+        # Mirrors _ChatSlot's per-turn redaction state: _run_chat clears both
+        # at every turn start.
+        self.credential_evidence = CredentialEvidence()
+        self.segment_raw_text: str | None = ""
         self.linked_session_key = ""
         # Mirrors _ChatSlot.project: the per-slot local project @mention/​/prompts
         # resolve against. "" means no project (global prompts only), matching
@@ -1335,12 +1352,12 @@ class TestRunChatPrompts:
         _aim_pkg(aim_dir, "Pkg-1.0", "1", {"review": "# R\nDo review."})
         s, sl = _ss()
         asyncio.run(_run_chat(s, sl, "/prompts"))
-        assert "@agent-sop:review" in sl.messages[-2][1]
+        assert "@agent-sop:review" in sl.messages[-1][1]
 
     def test_slash_list_empty(self):
         s, sl = _ss()
         asyncio.run(_run_chat(s, sl, "/prompts"))
-        assert "No prompts found" in sl.messages[-2][1]
+        assert "No prompts found" in sl.messages[-1][1]
 
     def test_slash_get_ok(self, aim_dir, mock_sel, monkeypatch):
         _aim_pkg(aim_dir, "Pkg-1.0", "1", {"review": "# R\nDo review."})
@@ -1364,19 +1381,19 @@ class TestRunChatPrompts:
         _aim_pkg(aim_dir, "Pkg-1.0", "1", {"review": "# R\nDo review."})
         s, sl = _ss()
         asyncio.run(_run_chat(s, sl, "/prompts get"))
-        assert "@agent-sop:review" in sl.messages[-2][1]
+        assert "@agent-sop:review" in sl.messages[-1][1]
 
     def test_slash_list_explicit(self, aim_dir, mock_sel):
         """``/prompts list`` works the same as ``/prompts``."""
         _aim_pkg(aim_dir, "Pkg-1.0", "1", {"review": "# R\nDo review."})
         s, sl = _ss()
         asyncio.run(_run_chat(s, sl, "/prompts list"))
-        assert "@agent-sop:review" in sl.messages[-2][1]
+        assert "@agent-sop:review" in sl.messages[-1][1]
 
     def test_slash_get_not_found(self, mock_sel):
         s, sl = _ss()
         asyncio.run(_run_chat(s, sl, "/prompts get nonexistent"))
-        assert "not found" in sl.messages[-2][1]
+        assert "not found" in sl.messages[-1][1]
 
     def test_slash_get_blocked(self, aim_dir, mock_sel, monkeypatch):
         """Prompt discovered but blocked at read time by chat-level check."""
@@ -1479,15 +1496,27 @@ class TestPromptExpansionStaysOffTheEventLoop:
 
     def test_no_coroutine_resolves_a_mention_inline(self):
         """The ``@mention`` site cannot be driven without a live session, so the
-        rule is pinned statically over ``chat_runner``'s own source: a bare call
-        from a coroutine is an on-loop call, whichever site adds it."""
+        rule is pinned statically over the source of ``chat_runner`` and the
+        ``chat_turn`` owners composed into it: a bare call from a coroutine is an
+        on-loop call, whichever site adds it."""
+        import importlib
+        import pkgutil
+
         import kiro_crew.dashboard.chat_runner as cr
+        from kiro_crew.dashboard import chat_turn
 
         tree = ast.parse(Path(cr.__file__).read_text(encoding="utf-8"))
+        owners = [
+            importlib.import_module(f"{chat_turn.__name__}.{info.name}")
+            for info in pkgutil.iter_modules(chat_turn.__path__)
+        ]
+        assert owners, "the owner scan found no module, so it is measuring nothing"
+        trees = [tree, *(ast.parse(Path(m.__file__).read_text(encoding="utf-8")) for m in owners)]
         blocking = {"_expand_prompt_mention", "_resolve_prompt_mention"}
         inline = [
             "{} -> {}".format(fn.name, node.func.id)
-            for fn in ast.walk(tree)
+            for module_tree in trees
+            for fn in ast.walk(module_tree)
             if isinstance(fn, ast.AsyncFunctionDef)
             for node in ast.walk(fn)
             if isinstance(node, ast.Call)

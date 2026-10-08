@@ -21,6 +21,9 @@ AGENT_FILENAME = "kirocrew.json"
 
 # Background/auxiliary managed agent specs KiroCrew writes under ~/.kiro/agents/.
 LITE_AGENT_FILENAME = "kirocrew-lite.json"
+# The tool-less agent a non-operator channel sender talks to. Its own file so the
+# background helper (lite) may grow a tool one day without handing it to a guest.
+GUEST_AGENT_FILENAME = "kirocrew-guest.json"
 CONDUCTOR_AGENT_FILENAME = "kirocrew-conductor.json"
 PIPELINE_CONDUCTOR_AGENT_FILENAME = "kirocrew-pipeline-conductor.json"
 # The goal conductor's work-ledger variant, and a SEPARATE spec rather than a flag
@@ -33,9 +36,30 @@ PIPELINE_CONDUCTOR_AGENT_FILENAME = "kirocrew-pipeline-conductor.json"
 LEDGER_CONDUCTOR_AGENT_FILENAME = "kirocrew-ledger-conductor.json"
 SECURITY_CONDUCTOR_AGENT_FILENAME = "kirocrew-security-conductor.json"
 WORKER_AGENT_FILENAME = "kirocrew-worker.json"
+# The dashboard-author crewmate: authors ONE dashboard template and lands it as a
+# pull request, writing no runtime code. Its own file because it is a dispatched,
+# worker-shaped agent with its own charter and tool surface -- it writes files and
+# drives git, but mounts neither the work-ledger set nor the publication surface, so
+# it is neither the default-mirroring worker nor a conductor. Its system prompt and
+# tool charter are the shipped ``dashboard-template/agent-spec.md`` (parsed at install);
+# its installer lives in ``worker_agent.py`` beside the other dispatched-agent installer.
+DASHBOARD_AUTHOR_AGENT_FILENAME = "kirocrew-dashboard-author.json"
 KNOWLEDGE_AGENT_FILENAME = "kirocrew-knowledge.json"
 RESEARCH_AGENT_FILENAME = "kirocrew-research.json"
 HEARTBEAT_AGENT_FILENAME = "kirocrew-heartbeat.json"
+DASHBOARD_MANAGER_AGENT_FILENAME = "kirocrew-dashboard-manager.json"
+
+# The dashboard manager's agent NAME, derived from its filename rather than spelled
+# a second time. kiro-cli resolves an agent by reading ``<agents dir>/<name>.json``,
+# so the two are the same string by construction -- and this one is also a wire
+# string in the member base prompt, which routes a crewmate's page work to it. A
+# name that drifts from the filename routes the member to an agent that does not
+# resolve, which fails the turn rather than the feature.
+#
+# It lives HERE, with the filenames, because this module imports nothing from the
+# package: ``context_assembly.member`` needs the name for the prompt it builds, and
+# reading it off ``agent.py`` would close an import cycle at module scope.
+DASHBOARD_MANAGER_AGENT_NAME = DASHBOARD_MANAGER_AGENT_FILENAME[: -len(".json")]
 
 # Collective allowlists — the EXACT filenames KiroCrew owns in each dir. Used by
 # the Playwright convergence sweep (browser/setup.py) so it rewrites only files
@@ -44,14 +68,17 @@ HEARTBEAT_AGENT_FILENAME = "kirocrew-heartbeat.json"
 OWNED_KIRO_AGENT_FILES = (
     AGENT_FILENAME,
     LITE_AGENT_FILENAME,
+    GUEST_AGENT_FILENAME,
     CONDUCTOR_AGENT_FILENAME,
     PIPELINE_CONDUCTOR_AGENT_FILENAME,
     LEDGER_CONDUCTOR_AGENT_FILENAME,
     SECURITY_CONDUCTOR_AGENT_FILENAME,
     WORKER_AGENT_FILENAME,
+    DASHBOARD_AUTHOR_AGENT_FILENAME,
     KNOWLEDGE_AGENT_FILENAME,
     RESEARCH_AGENT_FILENAME,
     HEARTBEAT_AGENT_FILENAME,
+    DASHBOARD_MANAGER_AGENT_FILENAME,
 )
 
 # The specs that MUST exist for the product to work at all. kiro-cli resolves an
@@ -61,11 +88,57 @@ OWNED_KIRO_AGENT_FILES = (
 #   * ``kirocrew.json``      — the agent behind user-facing chat.
 #   * ``kirocrew-lite.json`` — the cheap background agent (auto-titles,
 #     compaction, heartbeat), reached via ``SessionManager.get_bg_session``.
-# The remaining OWNED_KIRO_AGENT_FILES entries are deliberately excluded: their
-# installers in ``agent.py`` already degrade to ``logger.debug`` on failure
-# because each one only disables its own feature (goal conducting, Knowledge
-# extraction, Research Lab, unattended heartbeat polling).
+# The remaining OWNED_KIRO_AGENT_FILES entries are deliberately excluded because
+# each one only disables its own feature (guest replies, goal conducting,
+# Knowledge extraction, Research Lab, unattended heartbeat polling). Their
+# installer calls in ``agent.py`` degrade to ``logger.debug`` on failure, except
+# ``kirocrew-guest.json``, which ``_install_aim_capabilities`` writes unguarded
+# after the lite fallback.
 REQUIRED_KIRO_AGENT_FILES = (
     AGENT_FILENAME,
     LITE_AGENT_FILENAME,
+)
+
+# Agent ids the KAS engine (``kiro-cli acp --agent-engine v3``) will not run
+# from the wire. A ``_meta.kiro.customAgents`` entry under one of these ids is
+# accepted without an error and then either never appears in the session's
+# ``availableModes`` or is shadowed by the engine's own built-in agent of that
+# id, so a ``session/set_mode`` for it is refused, or activates the built-in
+# instead of the definition Crew sent. Measured against kiro-cli 2.23.0 by
+# injecting every id below in ONE ``session/new``, each with a distinctive
+# ``description``, and reading the advertised mode back:
+#
+#   injected id                       advertised mode         definition that runs
+#   ------------------------------    --------------------    --------------------
+#   default                           none (dropped)          none: set_mode refused
+#   vibe / spec / quick-spec /        the built-in            the built-in; the
+#     bug-fix / plan / autonomous     (origin: bundled)       client entry discarded
+#   Default / DEFAULT / Vibe / Spec   the client entry        the client entry
+#     / PLAN / kiro_default / kiro    (origin: client)
+#     / kiro-default / default_agent
+#   kirocrew-conductor /              the client entry        the client entry: the
+#     semantic_reviewer (also on      (origin: client)        wire definition replaces
+#     disk, advertised from there)                            the on-disk one
+#
+# The match is therefore exact and case-sensitive: the built-in ids are all
+# lower-case, and every case variant registers as an ordinary client agent.
+#
+# Why this lives with the FILENAMES: Kiro Crew names a crewmate's private
+# template copy after the crewmate, and the seeded first crewmate is called
+# ``default``, so without this set its first template edit writes
+# ``~/.kiro/agents/default.json`` and binds the crewmate to an id that can never
+# be activated on KAS. The template writers (fork, publish, create) consult it
+# when choosing a stem, and the KAS projection refuses the id with the remedy
+# instead of letting the misleading "spec is likely missing" refusal fire, or
+# letting a built-in silently run in the crewmate's place.
+KAS_RESERVED_AGENT_IDS = frozenset(
+    {
+        "default",
+        "vibe",
+        "spec",
+        "quick-spec",
+        "bug-fix",
+        "plan",
+        "autonomous",
+    }
 )

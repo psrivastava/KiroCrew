@@ -19,6 +19,7 @@ import json
 import logging
 import re
 import time
+import unicodedata
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 import aiohttp
@@ -39,15 +40,19 @@ from kiro_crew.dashboard.chat_utils import (
 )
 from kiro_crew.loop_lock import LoopBoundLock
 from kiro_crew.messaging.identity import channel_inbound_permitted
-from kiro_crew.messaging.renderer import redaction_notice
+from kiro_crew.messaging.renderer import count_redaction_tags, redaction_notice
 from kiro_crew.security import (
-    CREDENTIAL_REDACTION_TAGS,
-    EXFILTRATION_REDACTION_TAG_PREFIX,
     redact_and_truncate,
     redact_credentials,
     redact_exfiltration_urls,
 )
 from kiro_crew.sel import sel
+from kiro_crew.session_lifecycle import (
+    STOP_DECLINED_COMPACTING_TEXT,
+    compaction_in_flight,
+    consume_stop_declined,
+    decline_stop,
+)
 from kiro_crew.slack.allowlist import (
     ACTION_ALLOWLIST_APPROVE,
     ACTION_ALLOWLIST_DENY,
@@ -61,6 +66,7 @@ from kiro_crew.slack.format import (
     OPTIONS_ACTION_PREFIX,
     OPTIONS_CHECKBOXES_ACTION,
     OPTIONS_SUBMIT_ACTION,
+    SESSION_LINK_ACTION,
     build_options_selected_blocks,
     escape_mrkdwn,
     replace_options_blocks,
@@ -90,8 +96,10 @@ from kiro_crew.slack.renderer import (
     TOOL_DENY_ACTION_PREFIX,
     TOOL_TRUST_ACTION_PREFIX,
     SlackApprovalDecider,
+    split_approval_token,
 )
-from kiro_crew.slack.scope_probe import warn_unreadable_tracked_channels
+from kiro_crew.slack.scope_probe import log_probe_failure, warn_unreadable_tracked_channels
+from kiro_crew.start_priority import StartPriority
 
 if TYPE_CHECKING:
     from kiro_crew.slack.gateway import GatewayOrchestrator
@@ -101,22 +109,87 @@ logger = logging.getLogger(__name__)
 # Matches the plain-text quarantine/context fence keyword phrase, tolerant of
 # case, surrounding dashes, and whitespace, so attacker-controlled forwarded
 # text cannot forge a boundary line. Used to neutralize embedded markers BEFORE
-# the fence is interpolated around untrusted content (XPIA hardening).
+# the fence is interpolated around untrusted content (XPIA hardening). Matching
+# runs on the normalized view, so each word join is one run of whitespace,
+# underscore or hyphen, possibly empty; no two optional classes are adjacent.
+#
+# The pattern starts at the first keyword, not at the leading dashes and
+# whitespace: a leading ``-*\s*`` lets a search restart at every offset of a
+# long whitespace run, which is quadratic in the run length.
+# :func:`_extend_fence_span_left` adds that prefix back in one linear pass.
+_FENCE_WORD_JOIN = r"[\s_-]*"
 _FENCE_MARKER_RE = re.compile(
-    r"-{0,}\s*(?:UNTRUSTED FORWARDED CONTENT|CONTEXT ENTRY)\s+(?:BEGIN|END)\s*-{0,}",
+    r"(?:"
+    + _FENCE_WORD_JOIN.join(("UNTRUSTED", "FORWARDED", "CONTENT"))
+    + "|"
+    + _FENCE_WORD_JOIN.join(("CONTEXT", "ENTRY"))
+    + ")"
+    + _FENCE_WORD_JOIN
+    + r"(?:BEGIN|END)\s*-{0,}",
     re.IGNORECASE,
 )
 _FENCE_MARKER_NEUTRALIZED = "[removed embedded fence marker]"
+
+
+def _fence_fold(ch: str) -> str:
+    """*ch* as the marker matcher's normalized view spells it (see ``_marker_spans``)."""
+    from kiro_crew.context import _MULTIBYTE_TABLE, _is_marker_ignorable
+
+    if ch.isascii():
+        return ch
+    folded = ""
+    for compatible in unicodedata.normalize("NFKC", ch):
+        if not _is_marker_ignorable(compatible):
+            for candidate in compatible.translate(_MULTIBYTE_TABLE):
+                folded += "-" if unicodedata.category(candidate) == "Pd" else candidate
+    return folded
+
+
+def _extend_fence_span_left(text: str, start: int, floor: int) -> int:
+    """Move *start* left over the ``-*\\s*`` prefix a fence marker may carry.
+
+    Reads the normalized view right to left like the regex prefix did:
+    whitespace next to the keyword, then dashes, never below *floor* (the end of
+    the previous span).  One original character can fold to several view
+    characters (``←`` folds to ``<-``); it joins the prefix when its trailing
+    view characters do, and the walk stops at it when the rest do not.  A
+    character the normalized view drops counts in either phase.
+    """
+    in_dashes = False
+    while start > floor:
+        folded = _fence_fold(text[start - 1])
+        consumed = 0
+        for view_char in reversed(folded):
+            if view_char == "-":
+                in_dashes = True
+            elif in_dashes or not view_char.isspace():
+                break
+            consumed += 1
+        if folded and not consumed:
+            break
+        start -= 1
+        if consumed < len(folded):
+            break
+    # A dropped character is part of the prefix only between matched ones.
+    while _fence_fold(text[start]) == "":
+        start += 1
+    return start
 
 
 def _neutralize_fence_markers(text: str) -> str:
     """Neutralize Unicode-normalized forwarded/context fence variants."""
     # Local import avoids the context -> Slack handler import cycle during
     # module initialization; interaction handlers run only after startup.
-    from kiro_crew.context import _apply_marker_spans, _marker_spans
+    from kiro_crew.context import _apply_marker_spans, _marker_spans, _merge_overlapping_spans
 
     spans = _marker_spans(text, (_FENCE_MARKER_RE,))
-    return _apply_marker_spans(text, spans, _FENCE_MARKER_NEUTRALIZED)
+    floor = 0
+    extended: list[tuple[int, int]] = []
+    for start, end in spans:
+        extended.append((_extend_fence_span_left(text, start, floor), end))
+        floor = end
+    merged = _merge_overlapping_spans(extended)
+    return _apply_marker_spans(text, merged, _FENCE_MARKER_NEUTRALIZED)
 
 
 # Module-level orchestrator reference — set by ``init()``.
@@ -152,6 +225,7 @@ def _probe_tracked_channel_scope(channel_ids: set[str]) -> None:
     )
     _orch._handler_tasks.add(t)
     t.add_done_callback(_orch._handler_tasks.discard)
+    t.add_done_callback(log_probe_failure)
 
 
 # ---------------------------------------------------------------------------
@@ -582,6 +656,7 @@ async def _handle_shortcut_submission(payload: dict) -> None:
             subagent_manager=_orch.subagent_mgr,
             task_runner=_orch.task_runner,
             action_context=action_context,
+            start_priority=StartPriority.FOREGROUND,
         )
     )
     _orch._handler_tasks.add(t)
@@ -653,6 +728,14 @@ async def dispatch(payload: dict) -> None:
 
     # ── OPTIONS checkboxes toggle — no-op, wait for Send ──
     if action_id == OPTIONS_CHECKBOXES_ACTION:
+        return
+
+    # ── "Open session" deep-link button — no-op ──
+    # A URL button opens its link in the browser directly; Slack still POSTs a
+    # block_actions event for it, so ack it here as a no-op rather than letting it
+    # fall through to the tool-approval handler (which would look up a nonexistent
+    # approval). No server work, so no channels-governance gate is needed.
+    if action_id == SESSION_LINK_ACTION:
         return
 
     # ── OPTIONS Send / legacy choice buttons ──
@@ -978,8 +1061,13 @@ async def dispatch(payload: dict) -> None:
         approved = is_trust or action_id.startswith(TOOL_APPROVE_ACTION_PREFIX)
         # value / action_id suffix carry the session-namespaced approval token
         # (session_key:request_id) so a click resolves ONLY its own session's
-        # pending tool — kiro-cli request ids restart at 1 per session.
-        approval_key = action.get("value", "") or action_id.rsplit("_", 1)[-1]
+        # pending tool — kiro-cli request ids restart at 1 per session — plus the
+        # prompt's own nonce, which is what distinguishes these buttons from an
+        # earlier prompt's still clickable at the same key. Split rather than
+        # forwarded whole so the audit line records the request, not the secret.
+        approval_key, press_nonce = split_approval_token(
+            action.get("value", "") or action_id.rsplit("_", 1)[-1]
+        )
         # Inbound channels-governance gate: a button press resolves a tool approval
         # (executes the governed tool) or a Trust escalation, so a channels policy
         # that denies ``slack`` must stop it — same gate as an inbound message.
@@ -992,7 +1080,7 @@ async def dispatch(payload: dict) -> None:
             logger.info("slack tool-approval dropped: denied by channels governance policy")
             # Resolve the pending future as DENIED so the tool is refused promptly
             # instead of left pending until timeout.
-            SlackApprovalDecider.resolve_global(approval_key, False)
+            SlackApprovalDecider.resolve_global(approval_key, False, nonce=press_nonce)
             sel().log_api_access(
                 caller=user_id,
                 operation="slack.transport_tool_approval",
@@ -1004,9 +1092,12 @@ async def dispatch(payload: dict) -> None:
         # Trust grants per-session auto-approve BEFORE resolving, so subsequent
         # tools in this session are auto-approved (mirrors native trust_tool).
         if is_trust:
-            sess_key = SlackApprovalDecider.session_for(approval_key)
-            add_trusted_session(sess_key, _orch.sessions if _orch else None)
-        resolved = SlackApprovalDecider.resolve_global(approval_key, approved)
+            sess_key = SlackApprovalDecider.session_for(approval_key, nonce=press_nonce)
+            # No live prompt answers to this press, so there is no session to widen.
+            # Granting on the empty key would escalate whatever later reads it.
+            if sess_key:
+                add_trusted_session(sess_key, _orch.sessions if _orch else None)
+        resolved = SlackApprovalDecider.resolve_global(approval_key, approved, nonce=press_nonce)
         if not resolved:
             label = "⏱ This approval already expired."
             outcome = "expired"
@@ -1419,6 +1510,7 @@ async def _route_action_to_session(
             subagent_manager=_orch.subagent_mgr,
             task_runner=_orch.task_runner,
             action_context=action_context,
+            start_priority=StartPriority.FOREGROUND,
         )
     )
     _orch._handler_tasks.add(t)
@@ -1482,7 +1574,11 @@ def _options_block_id(payload: dict, action: dict | None = None) -> str | None:
             return bid
     values = (payload.get("state") or {}).get("values") or {}
     for block_id, vals in values.items():
-        if isinstance(vals, dict) and OPTIONS_CHECKBOXES_ACTION in vals and isinstance(block_id, str):
+        if (
+            isinstance(vals, dict)
+            and OPTIONS_CHECKBOXES_ACTION in vals
+            and isinstance(block_id, str)
+        ):
             return block_id
     return None
 
@@ -1809,6 +1905,7 @@ async def _handle_options_submit(payload: dict, channel: str, msg_ts: str) -> No
             target_slot_name=_pinned_slot_name,
             route_pinned=_route_pinned,
             asker_key=_asker_key,
+            start_priority=StartPriority.FOREGROUND,
         )
     )
     _orch._handler_tasks.add(t)
@@ -1940,8 +2037,7 @@ async def _handle_options(payload: dict, action: dict, channel: str, msg_ts: str
     async with options_edit_lock(channel, msg_ts):
         if not claim_options_answer(channel, msg_ts):
             logger.debug(
-                "options click: control %s/%s was already answered; dropping the "
-                "duplicate",
+                "options click: control %s/%s was already answered; dropping the " "duplicate",
                 channel,
                 msg_ts,
             )
@@ -2060,6 +2156,7 @@ async def _handle_options(payload: dict, action: dict, channel: str, msg_ts: str
             target_slot_name=_pinned_slot_name,
             route_pinned=_route_pinned,
             asker_key=_asker_key,
+            start_priority=StartPriority.FOREGROUND,
         )
     )
     _orch._handler_tasks.add(t)
@@ -2122,9 +2219,7 @@ async def _handle_allowlist(
             return
         _orch._allowed_users.add(new_user_id)
         set_allowed_users(_orch._allowed_users)
-        await run_config_write(
-            persist_allowed_user, new_user_id, name=display_name
-        )
+        await run_config_write(persist_allowed_user, new_user_id, name=display_name)
         sel().log_api_access(
             caller=approver_id,
             operation="slack.allowlist.approve",
@@ -2139,9 +2234,7 @@ async def _handle_allowlist(
                 dm = await _orch.slack.open_dm(new_user_id)
                 await _orch.slack.post_message(
                     dm,
-                    "✅ You've been added to the allowlist. You can now message me!\n\n"
-                    "⚠️ *Do not enter sensitive or confidential data into Kiro Crew.*"
-                    " Follow your organization's data handling policy when using this tool.",
+                    "✅ You've been added to the allowlist. You can now message me!",
                 )
             except Exception:
                 logger.debug("Failed to DM approved user %s", new_user_id, exc_info=True)
@@ -2202,9 +2295,7 @@ async def _handle_track_channel(
         _orch._tracking_channels.add(target_channel_id)
         set_tracking_channels(_orch._tracking_channels)
         _probe_tracked_channel_scope({target_channel_id})
-        await run_config_write(
-            persist_tracking_channel, target_channel_id, name=channel_name
-        )
+        await run_config_write(persist_tracking_channel, target_channel_id, name=channel_name)
         sel().log_api_access(
             caller=approver_id,
             operation="slack.track_channel.approve",
@@ -2221,9 +2312,7 @@ async def _handle_track_channel(
         # Remove from in-memory set and persisted config
         _orch._tracking_channels.discard(target_channel_id)
         set_tracking_channels(_orch._tracking_channels)
-        await run_config_write(
-            persist_tracking_channel, target_channel_id, remove=True
-        )
+        await run_config_write(persist_tracking_channel, target_channel_id, remove=True)
         sel().log_api_access(
             caller=approver_id,
             operation="slack.track_channel.deny",
@@ -2424,21 +2513,35 @@ async def _handle_stop_confirm(payload: dict, channel: str, msg_ts: str, user_id
     # Find the active session in this channel/thread
     thread_ts = payload.get("message", {}).get("thread_ts") or msg_ts
     has_session = _orch.sessions.has_session(thread_ts)
-    active_task = _orch._session_tasks.pop(thread_ts, None)
+    # READ, not popped: removed below only once the cancel went through.
+    active_task = _orch._session_tasks.get(thread_ts)
 
     if has_session or active_task:
         response_url = payload.get("response_url", "")
 
-        async def _update_ephemeral(blocks: list[dict], text: str) -> None:
-            if response_url:
-                try:
-                    async with aiohttp.ClientSession() as sess:
-                        await sess.post(
-                            response_url,
-                            json={"replace_original": True, "text": text, "blocks": blocks},
-                        )
-                except Exception:
-                    pass
+        async def _update_ephemeral(blocks: list[dict], text: str) -> bool:
+            """Replace the ephemeral card; did the replacement land?
+
+            Reported rather than swallowed because one caller GATES a destructive
+            escalation on this text having reached the presser: there is no
+            response url on every route, and the post's own error is caught here,
+            so "nothing raised" is not the same as "the presser was told".
+
+            The status is read for the same reason. A response url expires, and
+            an expired one answers 4xx with a body rather than raising, so the
+            send returns normally having delivered nothing.
+            """
+            if not response_url:
+                return False
+            try:
+                async with aiohttp.ClientSession() as sess:
+                    resp = await sess.post(
+                        response_url,
+                        json={"replace_original": True, "text": text, "blocks": blocks},
+                    )
+                    return 200 <= int(resp.status) < 300
+            except Exception:
+                return False
 
         async def _on_soft() -> None:
             from kiro_crew.slack.blocks import build_stopped_blocks
@@ -2456,9 +2559,53 @@ async def _handle_stop_confirm(payload: dict, channel: str, msg_ts: str, user_id
                     channel, "⛔ Execution stopped — session reset.", thread_ts
                 )
 
-        outcome = await _orch.sessions.stop_turn(thread_ts, on_soft=_on_soft, on_hard=_on_hard)
-        if active_task and not active_task.done():
-            active_task.cancel()
+        # A repeat press within the window by the same presser, while the
+        # compaction still holds the session, is the forcing second press the
+        # decline reply promised; the marker is spent either way.
+        _force = consume_stop_declined(thread_ts, user_id) and compaction_in_flight(
+            _orch.sessions, thread_ts
+        )
+        # ``preserve_queue`` with the force: the hard reset pops the session and
+        # its queue, which in a shared thread holds co-tenants' messages;
+        # ``stop_turn`` parks them for the successor instead.
+        _kw = {"force": True, "preserve_queue": True} if _force else {}
+        outcome = await _orch.sessions.stop_turn(
+            thread_ts, on_soft=_on_soft, on_hard=_on_hard, **_kw
+        )
+        if outcome == "compacting":
+            # Nothing was stopped: the task stays tracked and nothing is cancelled.
+            # The reply promises that a repeat forces, so arm the marker for this
+            # presser -- after the reply landed, since an escalation they were
+            # never warned about is a silent reset. Kill Now stays the other route.
+            async def _say_declined() -> bool:
+                if await _update_ephemeral([], STOP_DECLINED_COMPACTING_TEXT):
+                    return True
+                # The ephemeral card needs a response url this route does not
+                # always carry. The presser still has to be told, because the
+                # marker below is what turns their next press into a reset, so
+                # fall back to a thread message and report what landed.
+                if not (_orch and _orch.slack and channel):
+                    return False
+                try:
+                    return bool(
+                        await _orch.slack.post_message(
+                            channel, STOP_DECLINED_COMPACTING_TEXT, thread_ts
+                        )
+                    )
+                except Exception:
+                    return False
+
+            await decline_stop(thread_ts, user_id, _say_declined)
+        else:
+            # Pop only the task this Stop ended; a successor dispatched during
+            # the await from pending work is cancelled with it (see the same
+            # guard on the !stop command path in slack/events.py).
+            # A successor dispatched from a message admitted mid-await is the
+            # user's newer intent: left running and tracked.
+            if _orch._session_tasks.get(thread_ts) is active_task:
+                _orch._session_tasks.pop(thread_ts, None)
+            if active_task and not active_task.done():
+                active_task.cancel()
         # If stop_turn returned "idle" (no active turn), neither callback
         # fired — dismiss the stale ephemeral with a "Nothing running" message.
         if outcome == "idle":
@@ -3024,9 +3171,7 @@ async def _clear_session_dismissed(session_key: str) -> None:
     try:
         await asyncio.to_thread(_orch.conv_log.clear_closed, session_key)
     except Exception:
-        logger.warning(
-            "session resume: dismissal not cleared for %s", session_key, exc_info=True
-        )
+        logger.warning("session resume: dismissal not cleared for %s", session_key, exc_info=True)
 
 
 async def _handle_session_end(
@@ -3156,8 +3301,33 @@ async def _handle_inline_stop(
             except Exception:
                 pass
 
-    outcome = await _orch.sessions.stop_turn(session_key, on_soft=_on_soft, on_hard=_on_hard)
-    if outcome == "idle" and _orch.slack and channel and msg_ts:
+    # A repeat press within the window by the same presser, while the compaction
+    # still holds the session, is the forcing second press the decline promised.
+    _force = consume_stop_declined(session_key, user_id) and compaction_in_flight(
+        _orch.sessions, session_key
+    )
+    # ``preserve_queue`` with the force, for the reason the confirm button gives.
+    _kw = {"force": True, "preserve_queue": True} if _force else {}
+    outcome = await _orch.sessions.stop_turn(session_key, on_soft=_on_soft, on_hard=_on_hard, **_kw)
+    if outcome == "compacting":
+        # The reply promises that a repeat forces, so arm the marker -- and only
+        # once the reply landed. This update is conditional on a client and a
+        # message id and swallows its own transport error, so arming first would
+        # leave the escalation live with the presser never warned, and their
+        # retry would hard-reset the session silently.
+        async def _say_declined() -> bool:
+            if not (_orch.slack and channel and msg_ts):
+                return False
+            try:
+                await _orch.slack.update_message(
+                    channel, msg_ts, text=STOP_DECLINED_COMPACTING_TEXT
+                )
+            except Exception:
+                return False
+            return True
+
+        await decline_stop(session_key, user_id, _say_declined)
+    elif outcome == "idle" and _orch.slack and channel and msg_ts:
         try:
             await _orch.slack.update_message(channel, msg_ts, text="⏹ Nothing running.")
         except Exception:
@@ -3271,7 +3441,9 @@ async def _handle_tool_approval(
 # ---------------------------------------------------------------------------
 
 # Shown when a non-authorized user clicks a review-mode button.
-_REVIEW_AUTH_DENIED_MSG = "⚠️ Only the bot owner or the user who requested this draft can act on it."
+_REVIEW_AUTH_DENIED_MSG = (
+    "⚠️ Only the bot owner or the user who requested this draft can act on it."
+)
 
 
 async def _delete_review_placeholder(channel: str, thread_ts: str) -> None:
@@ -3359,8 +3531,7 @@ async def _handle_review_approve(payload: dict, action: dict) -> None:
     # redacted domain, and its failure must not undo the posted draft -- the draft
     # is already public, so raising here would lose the warning and the approve's
     # remaining teardown too.
-    _cred_redactions = sum(draft.count(tag) for tag in CREDENTIAL_REDACTION_TAGS)
-    _url_redactions = draft.count(EXFILTRATION_REDACTION_TAG_PREFIX)
+    _cred_redactions, _url_redactions = count_redaction_tags(draft)
     if _cred_redactions > 0 or _url_redactions > 0:
         try:
             await _orch.slack.post_message(
@@ -3663,6 +3834,7 @@ async def _handle_review_revise_submit(payload: dict) -> None:
                 subagent_manager=_orch.subagent_mgr,
                 task_runner=_orch.task_runner,
                 channel_activation=ACTIVATION_REVIEW,
+                start_priority=StartPriority.FOREGROUND,
             )
             logger.info("Review revision requested by %s in %s", caller, channel)
         except Exception:

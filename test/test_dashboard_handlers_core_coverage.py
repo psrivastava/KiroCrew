@@ -60,6 +60,10 @@ def _req(
     is a different thing from ``app`` (the aiohttp application): ``""`` means the
     dashboard user, a name means an app token, and ``None`` reproduces a path
     where no auth middleware ran and the claim is absent.
+
+    The claims are exposed through ``in`` and ``[]`` as well as ``get``, because
+    an owner-gated handler distinguishes an ABSENT app claim from an empty one
+    and reads it with ``"app" in request``.
     """
     req = MagicMock(spec=web.Request)
     req.remote = remote
@@ -69,6 +73,8 @@ def _req(
     req.match_info = match_info or {}
     claims: dict = {"user": user, "app": app_token}
     req.get = lambda key, default=None: claims.get(key, default)
+    req.__contains__.side_effect = lambda key: key in claims and claims[key] is not None
+    req.__getitem__.side_effect = lambda key: claims[key]
     return req
 
 
@@ -104,6 +110,7 @@ def fake_sel(monkeypatch) -> MagicMock:
     package attribute is what the handler observes.
     """
     recorder = MagicMock()
+    recorder.dropped_events = 0
     monkeypatch.setattr("kiro_crew.dashboard.handlers.sel", lambda: recorder)
     return recorder
 
@@ -642,7 +649,13 @@ class TestSttConfigEndpoint:
     @pytest.fixture(autouse=True)
     def _quiet_probes(self, monkeypatch):
         monkeypatch.setattr(core_mod, "_stt_prereq_commands", lambda _p: [])
-        monkeypatch.setattr(core_mod, "is_available", lambda _cfg: False)
+        # api_stt_config derives BOTH `available` and `code` from availability_detail
+        # (the same probe api_stt_status uses), so the two fields cannot disagree.
+        monkeypatch.setattr(
+            core_mod,
+            "availability_detail",
+            lambda _cfg: core_mod.stt.Availability(False),
+        )
 
     @pytest.mark.asyncio
     async def test_put_rejects_malformed_body(self, seeded_config) -> None:
@@ -908,6 +921,47 @@ class TestSttConfigEndpoint:
         # Served independently of `available` so the UI can flag the .webm
         # decode gap even when the provider reads ready.
         assert isinstance(body["ffmpeg_missing"], bool)
+        # The availability code rides this same query so the chat modal can render
+        # the precise per-code reason without a second request. Empty here because
+        # the fixture's detail is `Availability(False)` with the default CODE_OK.
+        assert body["code"] == ""
+
+    @pytest.mark.asyncio
+    async def test_get_carries_the_availability_code_from_the_same_detail(
+        self, seeded_config, monkeypatch
+    ) -> None:
+        """The chat modal keys off a machine-readable code to explain WHY voice is
+        unavailable, and it reads that code from this one query the composer
+        already makes. `available` and `code` are derived from the SAME detail so
+        a "not available" answer can never carry an empty/OK code."""
+        monkeypatch.setattr(
+            core_mod,
+            "availability_detail",
+            lambda _cfg: core_mod.stt.Availability(
+                False, core_mod.stt.CODE_EXTRA_MISSING, "needs the voice extra"
+            ),
+        )
+        async with TestClient(TestServer(_stt_app())) as client:
+            body = await (await client.get("/api/config/stt")).json()
+        assert body["available"] is False
+        assert body["code"] == core_mod.stt.CODE_EXTRA_MISSING
+        assert body["code"] == "stt_extra_missing"
+
+    @pytest.mark.asyncio
+    async def test_get_carries_an_empty_code_when_available(
+        self, seeded_config, monkeypatch
+    ) -> None:
+        """When recognition can run the code is the empty string (CODE_OK), and
+        `available` is True: the two fields are read from one detail."""
+        monkeypatch.setattr(
+            core_mod,
+            "availability_detail",
+            lambda _cfg: core_mod.stt.Availability(True),
+        )
+        async with TestClient(TestServer(_stt_app())) as client:
+            body = await (await client.get("/api/config/stt")).json()
+        assert body["available"] is True
+        assert body["code"] == ""
 
     @pytest.mark.asyncio
     async def test_get_defaults_to_the_local_provider_with_streaming_on(
@@ -1627,6 +1681,45 @@ class TestSttTranscribe:
         assert text.endswith(" thanks")
 
     @pytest.mark.asyncio
+    async def test_none_backend_result_is_a_generic_500(self, monkeypatch) -> None:
+        """The backend's failure sentinel must not look like a silent recording."""
+        monkeypatch.setattr(
+            "kiro_crew.transcribe.transcribe_audio",
+            AsyncMock(return_value=None),
+        )
+        field = SimpleNamespace(
+            name="audio",
+            filename="recording.webm",
+            read_chunk=AsyncMock(side_effect=[b"x", b""]),
+        )
+
+        resp = await core_mod.api_stt_transcribe(_multipart_req(field))
+
+        assert resp.status == 500
+        assert json.loads(resp.body) == {
+            "error": "transcription failed",
+            "code": "stt_transcription_failed",
+        }
+
+    @pytest.mark.asyncio
+    async def test_empty_transcript_remains_a_success(self, monkeypatch) -> None:
+        """A valid recording with no recognised speech remains distinguishable."""
+        monkeypatch.setattr(
+            "kiro_crew.transcribe.transcribe_audio",
+            AsyncMock(return_value=""),
+        )
+        field = SimpleNamespace(
+            name="audio",
+            filename="recording.webm",
+            read_chunk=AsyncMock(side_effect=[b"x", b""]),
+        )
+
+        resp = await core_mod.api_stt_transcribe(_multipart_req(field))
+
+        assert resp.status == 200
+        assert json.loads(resp.body) == {"text": ""}
+
+    @pytest.mark.asyncio
     async def test_backend_failure_is_a_generic_500(self, monkeypatch) -> None:
         monkeypatch.setattr(
             "kiro_crew.transcribe.transcribe_audio",
@@ -1650,24 +1743,136 @@ class TestSttTranscribe:
 
 
 class TestSelEndpoints:
+    #: The audit trail is owner-only, so every read below is made AS the owner.
+    _OWNER_APP = {"state": SimpleNamespace(owner_id="dashboard")}
+
+    def _owner_req(self, **kwargs):
+        return _req(app=self._OWNER_APP, user="dashboard", **kwargs)
+
     @pytest.mark.asyncio
     async def test_events_uses_default_limit(self, fake_sel) -> None:
         fake_sel.recent.return_value = [{"event": "a"}]
-        resp = await core_mod.api_sel_events(_req())
+        resp = await core_mod.api_sel_events(self._owner_req())
         assert json.loads(resp.body) == {"events": [{"event": "a"}], "count": 1}
         assert fake_sel.recent.call_args.kwargs["limit"] == 100
 
     @pytest.mark.asyncio
     async def test_events_caps_limit_at_1000(self, fake_sel) -> None:
         fake_sel.recent.return_value = []
-        await core_mod.api_sel_events(_req(query={"limit": "99999"}))
+        await core_mod.api_sel_events(self._owner_req(query={"limit": "99999"}))
         assert fake_sel.recent.call_args.kwargs["limit"] == 1000
 
     @pytest.mark.asyncio
     async def test_events_falls_back_on_unparsable_limit(self, fake_sel) -> None:
         fake_sel.recent.return_value = []
-        await core_mod.api_sel_events(_req(query={"limit": "many"}))
+        await core_mod.api_sel_events(self._owner_req(query={"limit": "many"}))
         assert fake_sel.recent.call_args.kwargs["limit"] == 100
+
+    @pytest.mark.asyncio
+    async def test_a_successful_owner_read_is_audited_after_it_is_served(self, fake_sel) -> None:
+        """A trail of refusals alone never says the log was read.
+
+        The denial branch records who was turned away; without a matching row for
+        the read that succeeded, an operator reviewing the trail cannot tell an
+        untouched log from one the owner has been reading. The write lands AFTER the
+        rows are captured, because ``recent()`` flushes the write queue before it
+        walks the log: enqueued first, this row would reach disk in time to be
+        served back as the newest event, and a ``limit=1`` read would return nothing
+        but its own audit.
+        """
+        calls: list[str] = []
+        fake_sel.log_api_access.side_effect = lambda **kw: calls.append(f"audit:{kw['outcome']}")
+        fake_sel.recent.side_effect = lambda **kw: calls.append("read") or [{"event": "a"}]
+
+        resp = await core_mod.api_sel_events(self._owner_req())
+
+        assert resp.status == 200
+        assert calls == ["read", "audit:allowed"]
+        assert json.loads(resp.body) == {"events": [{"event": "a"}], "count": 1}
+        kwargs = fake_sel.log_api_access.call_args.kwargs
+        assert kwargs["operation"] == "sel.events.read"
+        assert kwargs["outcome"] == "allowed"
+        assert kwargs["caller"] == "dashboard"
+
+    @pytest.mark.asyncio
+    async def test_a_refused_read_writes_no_allow_row(self, fake_sel) -> None:
+        """The negative: the allow row must mean authorized, not merely attempted.
+
+        A refused caller never reaches this handler's own audit, so it writes
+        nothing at all here -- the denial row belongs to the shared owner gate and
+        is covered where that gate lives. What this pins is that the allow row
+        cannot be produced by an attempt.
+        """
+        resp = await core_mod.api_sel_events(_req(app=self._OWNER_APP, user="someone-else"))
+
+        assert resp.status == 403
+        fake_sel.log_api_access.assert_not_called()
+        fake_sel.recent.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"user": "someone-else"},
+            {"user": None},
+            {"app_token": "an-app"},
+            {"app_token": None},
+        ],
+        ids=["other-user", "no-user", "app-token", "absent-app-claim"],
+    )
+    async def test_events_refuses_every_non_owner_caller(self, fake_sel, kwargs) -> None:
+        """The rows name the resources a security decision was about.
+
+        A dashboard session is not by itself the owner: the messaging bridges
+        mint a presigned token whose subject is the allowed user's own id, so
+        serving these rows to any authenticated session hands one principal the
+        other's audit trail. Each parameter is a caller class that must fail
+        closed, and the read must not happen AT ALL -- a 403 whose body still
+        carried the rows would pass a status-only assertion.
+        """
+        resp = await core_mod.api_sel_events(_req(app=self._OWNER_APP, **kwargs))
+        assert resp.status == 403
+        assert json.loads(resp.body) == {
+            "error": "owner authorization required",
+            "code": "owner_only",
+        }
+        fake_sel.recent.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("subject", ["local-app", "local-startup"])
+    async def test_events_tells_a_pre_owner_session_to_sign_in_again(
+        self, fake_sel, subject
+    ) -> None:
+        """A bootstrap subject under a configured owner IS the owner, refused.
+
+        Configuring an owner after the dashboard session was signed leaves that
+        session's subject at the bootstrap name, and a token refresh preserves the
+        subject, so the real owner keeps failing the gate until they sign in again.
+        A generic 403 gives the one caller class that can act on the refusal no way
+        to know that, which is why the denial goes through the shared tail: the
+        status is 401 and the code names re-authentication. The read must still not
+        happen -- the relabel changes the response, not the decision.
+        """
+        resp = await core_mod.api_sel_events(_req(app=self._OWNER_APP, user=subject, app_token=""))
+        assert resp.status == 401
+        assert json.loads(resp.body)["code"] == "stale_session_reauth"
+        fake_sel.recent.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_events_keeps_a_generic_403_when_no_owner_is_configured(self, fake_sel) -> None:
+        """No owner configured means a bootstrap subject is not stale.
+
+        ``is_owner_dashboard_request`` admits the implicit local owner in that
+        configuration, so this asserts the gate does not hand out the 401 to a
+        caller whose credential is current: reaching the relabel requires a
+        CONFIGURED owner, and the subject here is simply not that owner.
+        """
+        resp = await core_mod.api_sel_events(
+            _req(app={"state": SimpleNamespace(owner_id="")}, user="someone-else")
+        )
+        assert resp.status == 403
+        assert json.loads(resp.body)["code"] == "owner_only"
+        fake_sel.recent.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_verify_reports_intact_chain(self, fake_sel) -> None:
@@ -1679,6 +1884,7 @@ class TestSelEndpoints:
             "integrity": "ok",
             "tampered": 0,
             "detail": "",
+            "dropped_events": 0,
         }
 
     @pytest.mark.asyncio
@@ -1697,6 +1903,14 @@ class TestSelEndpoints:
         body = json.loads((await core_mod.api_sel_verify(_req())).body)
         assert body["integrity"] == "unverifiable"
         assert "refused" in body["detail"]
+
+    @pytest.mark.asyncio
+    async def test_verify_reports_dropped_events(self, fake_sel) -> None:
+        """The writer's lost-batch counter is surfaced next to the chain verdict."""
+        fake_sel.verify_integrity.return_value = _SelVerification(7, 7, True, "")
+        fake_sel.dropped_events = 4
+        body = json.loads((await core_mod.api_sel_verify(_req())).body)
+        assert body["dropped_events"] == 4
 
 
 class TestSecurityStats:
@@ -1741,8 +1955,21 @@ class TestSecurityStats:
 # ── Agent settings PUT (/api/config/kirocrew) ───────────────────────────
 
 
+@web.middleware
+async def _owner_identity(request, handler):
+    request["user"] = "local-app"
+    request["app"] = ""
+    state = request.app.get("state")
+    if state is not None:
+        state.owner_id = ""
+    return await handler(request)
+
+
 def _agent_cfg_app() -> web.Application:
-    app = web.Application()
+    app = web.Application(middlewares=[_owner_identity])
+    state = MagicMock()
+    state.owner_id = ""
+    app["state"] = state
     app.router.add_route("*", "/api/config/kirocrew", core_mod.api_kirocrew_config)
     return app
 
@@ -1775,6 +2002,57 @@ class TestAgentSettingsPut:
             assert resp.status == 500
             assert (await resp.json())["error"] == "config.json is corrupt"
         assert seeded_config.read_text(encoding="utf-8") == "<<not json>>"
+
+    @pytest.mark.asyncio
+    async def test_a_stale_plaintext_on_disk_does_not_brick_an_unrelated_put(
+        self, seeded_config, fake_sel
+    ) -> None:
+        """A plaintext ``agent.deepseek_env`` value an older build landed is not this
+        write's doing: the publish floor lets a write that leaves the mapping as it
+        found it through (naming the stale key on the log), so a settings change
+        that never touched that field is a 200, not a 500 with a traceback."""
+        stale = {"DEEPSEEK_API_KEY": "sk-live-not-a-reference"}
+        seeded_config.write_text(
+            json.dumps({"agent": {"approval_mode": "auto", "deepseek_env": stale}}) + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        async with TestClient(TestServer(_agent_cfg_app())) as client:
+            resp = await _put_agent(client, {"subagent_max_turns": 5})
+            assert resp.status == 200
+        written = json.loads(seeded_config.read_text(encoding="utf-8"))
+        assert written["agent"]["subagent_max_turns"] == 5
+        assert written["agent"]["deepseek_env"] == stale, "the write left the mapping as it was"
+
+    @pytest.mark.asyncio
+    async def test_a_write_the_publish_floor_refuses_is_a_clean_coded_400(
+        self, seeded_config, fake_sel, monkeypatch
+    ) -> None:
+        """When the floor does refuse a document, the PUT arm answers the operator's
+        one-line instruction with a machine-readable code -- never an escaped
+        ``ValueError``. The field is not editable through this surface today, so the
+        refusal is raised the way the floor raises it rather than provoked through
+        the body."""
+        from kiro_crew.config import loader as loader_mod
+        from kiro_crew.config.loader import ConfigWriteRefused
+
+        message = (
+            "agent.deepseek_env entry 'DEEPSEEK_API_KEY' holds a literal value, so the "
+            "config write was refused: this mapping takes a 'secret://<vault name>' "
+            "reference only."
+        )
+
+        def refuse(*_args, **_kwargs):
+            raise ConfigWriteRefused(message)
+
+        monkeypatch.setattr(loader_mod, "update_config_locked", refuse)
+        async with TestClient(TestServer(_agent_cfg_app())) as client:
+            resp = await _put_agent(client, {"subagent_max_turns": 5})
+            assert resp.status == 400
+            body = await resp.json()
+            assert body["code"] == "config_write_refused"
+            assert body["error"] == message
+        assert fake_sel.log_api_access.call_args.kwargs["outcome"] == "denied"
 
     @pytest.mark.asyncio
     async def test_out_of_range_turns_is_denied(self, seeded_config, fake_sel) -> None:
@@ -1954,7 +2232,8 @@ class TestPatchGuards:
     ) -> None:
         """A dead end ("not editable") becomes a next step for fields whose
         side effects the generic write cannot reproduce."""
-        app = web.Application()
+        app = web.Application(middlewares=[_owner_identity])
+        app["state"] = SimpleNamespace(owner_id="")
         app.router.add_patch("/api/config/kirocrew", core_mod.api_kirocrew_config_patch)
         async with TestClient(TestServer(app)) as client:
             resp = await client.patch(
@@ -1966,7 +2245,8 @@ class TestPatchGuards:
 
     @pytest.mark.asyncio
     async def test_unknown_field_is_refused(self, seeded_config, fake_sel) -> None:
-        app = web.Application()
+        app = web.Application(middlewares=[_owner_identity])
+        app["state"] = SimpleNamespace(owner_id="")
         app.router.add_patch("/api/config/kirocrew", core_mod.api_kirocrew_config_patch)
         async with TestClient(TestServer(app)) as client:
             resp = await client.patch(
@@ -1980,7 +2260,10 @@ class TestFallbackModelPatch:
     """agent.fallback_model — single-value str spec with role-model validation."""
 
     def _app(self) -> web.Application:
-        app = web.Application()
+        # PATCH /api/config/kirocrew is owner-gated: supply the same signed
+        # local-owner identity the sibling patch tests use.
+        app = web.Application(middlewares=[_owner_identity])
+        app["state"] = SimpleNamespace(owner_id="")
         app.router.add_patch("/api/config/kirocrew", core_mod.api_kirocrew_config_patch)
         return app
 
@@ -2034,6 +2317,97 @@ class TestFallbackModelPatch:
             )
             assert resp.status == 400
             assert "invalid value" in (await resp.json())["error"]
+
+    def _app_with_session(self, provider: object) -> web.Application:
+        app = web.Application(middlewares=[_owner_identity])
+        app["state"] = SimpleNamespace(
+            owner_id="", sessions=SimpleNamespace(active_providers=lambda: [provider])
+        )
+        app.router.add_patch("/api/config/kirocrew", core_mod.api_kirocrew_config_patch)
+        return app
+
+    @pytest.mark.asyncio
+    async def test_pin_denied_by_a_stale_snapshot_is_revalidated_first(
+        self, seeded_config, fake_sel
+    ) -> None:
+        """The PATCH revalidates the live snapshot before the synchronous
+        validator reads it, so a startup-race answer cannot deny an entitled pin."""
+        rows = [{"modelId": "auto"}]
+
+        class _Healing:
+            client = SimpleNamespace(backend="")  # the default harness the pin runs on
+
+            async def maybe_refresh_available_models(self, catalog_ids):
+                assert catalog_ids[0] == "claude-opus-5"
+                rows.append({"modelId": "claude-opus-5"})
+                return list(rows)
+
+            def available_models(self):
+                return list(rows)
+
+        async with TestClient(TestServer(self._app_with_session(_Healing()))) as client:
+            resp = await client.patch(
+                "/api/config/kirocrew",
+                json={"path": "agent.fallback_model", "value": "claude-opus-5"},
+            )
+            assert resp.status == 200
+
+    @pytest.mark.asyncio
+    async def test_pin_is_refused_while_its_revalidation_is_in_flight(
+        self, seeded_config, fake_sel
+    ) -> None:
+        from kiro_crew.agent_sdk.drivers.acp import EntitlementRevalidating
+
+        class _Pending:
+            client = SimpleNamespace(backend="")
+
+            async def maybe_refresh_available_models(self, _catalog_ids):
+                raise EntitlementRevalidating
+
+            def available_models(self):
+                return [{"modelId": "auto"}]
+
+        async with TestClient(TestServer(self._app_with_session(_Pending()))) as client:
+            resp = await client.patch(
+                "/api/config/kirocrew",
+                json={"path": "agent.fallback_model", "value": "claude-opus-5"},
+            )
+            assert resp.status == 400
+            assert (await resp.json())["error"] == core_mod._ROLE_PIN_REVALIDATING
+
+    @pytest.mark.asyncio
+    async def test_newer_session_on_another_harness_never_judges_the_pin(
+        self, seeded_config, fake_sel
+    ) -> None:
+        """Newest-first evidence is scoped to the harness the pin runs on (the
+        default backend, kiro): a Claude member DM created later is the newest
+        live session, but its catalog cannot reject a kiro id the account has."""
+
+        class _Session:
+            def __init__(self, backend: str, ids: list[str]) -> None:
+                self.client = SimpleNamespace(backend=backend)
+                self._rows = [{"modelId": m} for m in ids]
+
+            def available_models(self):
+                return list(self._rows)
+
+            async def maybe_refresh_available_models(self, _catalog_ids):
+                return list(self._rows)
+
+        kiro = _Session("", ["auto", "claude-opus-5"])
+        claude_member = _Session("claude", ["claude-opus-4-1", "claude-sonnet-4-5"])
+        app = web.Application(middlewares=[_owner_identity])
+        app["state"] = SimpleNamespace(
+            owner_id="",
+            sessions=SimpleNamespace(active_providers=lambda: [kiro, claude_member]),
+        )
+        app.router.add_patch("/api/config/kirocrew", core_mod.api_kirocrew_config_patch)
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.patch(
+                "/api/config/kirocrew",
+                json={"path": "agent.fallback_model", "value": "claude-opus-5"},
+            )
+            assert resp.status == 200, await resp.text()
 
 
 class TestAdvertisedModelGuards:
@@ -2298,6 +2672,128 @@ class TestLocalToken:
         assert json.loads(resp.body)["code"] == "member_owner_token_refused"
         assert fake_sel.log_api_access.call_args.kwargs["resources"] == "unverified-owner-process"
         minted.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("shares_namespaces,status", [(False, 403), (True, 200)])
+    async def test_linux_namespace_divergence_alone_decides_the_owner_verdict(
+        self, monkeypatch, fake_sel, shares_namespaces, status
+    ) -> None:
+        """On Linux the namespace comparison is the whole owner verdict.
+
+        The other refusal tests on this route hand the gate no peer pid, which
+        answers on its first leg and leaves the Linux measure unreached from here.
+        In this one the kernel DOES identify the caller and its start id IS
+        readable, so the two callers below differ by one bit: whether they share
+        the gateway's user and mount namespaces. A same-uid caller that does not
+        is refused, and the refusal carries the code a mint reads its remedy from
+        beside the audit value the pod records for it.
+
+        Both directions are asserted, because a gate that refused every caller
+        would satisfy the negative one on its own. The comparison is also pinned
+        to the gateway's own pid, which is what makes it a statement about this
+        process rather than about any two processes. The app-backend escape is
+        held off so one cause decides the verdict; it is covered separately.
+        """
+        from kiro_crew import member_memory_auth as auth
+
+        peer_pid = 12345
+        monkeypatch.setattr("kiro_crew.dashboard.handlers.is_loopback", lambda _r: True)
+        monkeypatch.setattr(auth, "sys", SimpleNamespace(platform="linux"))
+        monkeypatch.setattr(auth, "_request_peer_pid", lambda _request: peer_pid)
+        monkeypatch.setattr(auth, "_gateway_spawned_app_backend", lambda _pid: False)
+        monkeypatch.setattr(
+            auth.platform_compat, "get_process_start_id", lambda _pid: "synthetic-start"
+        )
+        namespaces = MagicMock(return_value=shares_namespaces)
+        monkeypatch.setattr(auth.platform_compat, "process_namespaces_match", namespaces)
+        minted = MagicMock(return_value="issued-value")
+        monkeypatch.setattr(core_mod, "generate_token", minted)
+
+        resp = await core_mod.api_token_local(
+            _req(
+                app={"local_secret": "right", "state": SimpleNamespace(owner_id="owner-1")},
+                headers={"X-Local-Secret": "right"},
+            )
+        )
+
+        assert resp.status == status
+        namespaces.assert_called_once_with(peer_pid, os.getpid())
+        if status == 403:
+            assert json.loads(resp.body)["code"] == "member_owner_token_refused"
+            assert (
+                fake_sel.log_api_access.call_args.kwargs["resources"] == "unverified-owner-process"
+            )
+            minted.assert_not_called()
+        else:
+            minted.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_every_refusal_carries_a_code_matching_its_audit_record(
+        self, monkeypatch, fake_sel
+    ) -> None:
+        """All three gates are machine-distinguishable to the caller, not just one.
+
+        The SEL record already tells the three apart. A caller that can read only
+        one of them has to guess between the other two, and their remedies differ:
+        one is a worktree update, one regenerates the secret, and the third is about
+        which process called and is fixed by neither. Each ``code`` therefore pairs
+        with the ``resources`` value written for the same refusal, so the pairing
+        cannot drift apart silently.
+        """
+        from kiro_crew import member_memory_auth as auth
+
+        seen: dict[str, str] = {}
+
+        monkeypatch.setattr("kiro_crew.dashboard.handlers.is_loopback", lambda _r: False)
+        resp = await core_mod.api_token_local(_req(remote="203.0.113.9"))
+        assert resp.status == 403
+        seen[json.loads(resp.body)["code"]] = fake_sel.log_api_access.call_args.kwargs["resources"]
+
+        monkeypatch.setattr("kiro_crew.dashboard.handlers.is_loopback", lambda _r: True)
+        resp = await core_mod.api_token_local(
+            _req(app={"local_secret": "right"}, headers={"X-Local-Secret": "wrong"})
+        )
+        assert resp.status == 403
+        seen[json.loads(resp.body)["code"]] = fake_sel.log_api_access.call_args.kwargs["resources"]
+
+        monkeypatch.setattr(auth, "_request_peer_pid", lambda _request: None)
+        resp = await core_mod.api_token_local(
+            _req(app={"local_secret": "right"}, headers={"X-Local-Secret": "right"})
+        )
+        assert resp.status == 403
+        seen[json.loads(resp.body)["code"]] = fake_sel.log_api_access.call_args.kwargs["resources"]
+
+        assert seen == {
+            "loopback_only": "non-loopback",
+            "invalid_secret": "invalid-secret",
+            "member_owner_token_refused": "unverified-owner-process",
+        }
+
+    @pytest.mark.asyncio
+    async def test_the_codes_do_not_disclose_more_than_the_error_text(
+        self, monkeypatch, fake_sel
+    ) -> None:
+        """A code restates the refusal the body already names in words.
+
+        The endpoint is reachable without a credential, so anything added to its
+        refusal body is readable by whoever could already read the ``error``
+        string. These two codes carry no fact that string does not.
+        """
+        monkeypatch.setattr("kiro_crew.dashboard.handlers.is_loopback", lambda _r: False)
+        body = json.loads((await core_mod.api_token_local(_req(remote="203.0.113.9"))).body)
+        assert body["error"] == "loopback only"
+        assert body["code"] == "loopback_only"
+
+        monkeypatch.setattr("kiro_crew.dashboard.handlers.is_loopback", lambda _r: True)
+        body = json.loads(
+            (
+                await core_mod.api_token_local(
+                    _req(app={"local_secret": "right"}, headers={"X-Local-Secret": "wrong"})
+                )
+            ).body
+        )
+        assert body["error"] == "invalid secret"
+        assert body["code"] == "invalid_secret"
 
     @pytest.mark.asyncio
     async def test_bad_embed_port_is_dropped(
@@ -2567,3 +3063,27 @@ class TestSessionAgentPathIdValidation:
         monkeypatch.setattr("kiro_crew.session_workspace.list_results", lambda _s: [])
         resp = await core_mod.api_session_agents_list(_req(match_info={"id": good}))
         assert resp.status == 200
+
+
+class TestNonAsciiLocalSecret:
+    """A non-ASCII ``X-Local-Secret`` is a wrong secret, never a crash.
+
+    ``hmac.compare_digest`` raises TypeError on a str holding a non-ASCII
+    character, so each of the three local-secret gates answered 500 and never
+    wrote its denial record. A raw non-UTF-8 header byte decodes to a lone
+    surrogate, which is the second parameter.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("handler", ["api_token_local", "api_logout", "api_shutdown"])
+    @pytest.mark.parametrize("bad", ["é", "\udcff", "\ud800"])
+    async def test_refused_like_a_wrong_secret(
+        self, monkeypatch, fake_sel, handler: str, bad: str
+    ) -> None:
+        monkeypatch.setattr("kiro_crew.dashboard.handlers.is_loopback", lambda _r: True)
+        resp = await getattr(core_mod, handler)(
+            _req(app={"local_secret": "right"}, headers={"X-Local-Secret": bad})
+        )
+        assert resp.status == 403
+        assert json.loads(resp.body)["error"] == "invalid secret"
+        assert fake_sel.log_api_access.call_args.kwargs["resources"] == "invalid-secret"

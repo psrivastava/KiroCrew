@@ -35,6 +35,11 @@ from kiro_crew.subagent import SpawnApprovalUnreachable, SubagentManager
 pytestmark = pytest.mark.usefixtures("healthy_host_memory")
 
 
+@pytest.fixture(autouse=True)
+def _close_subagent_managers(close_subagent_managers):
+    """Every manager built here is closed at teardown; the body is in ``conftest``."""
+
+
 # --------------------------------------------------------------------------
 # Manager-level doubles (same posture as test_subagent_spawn_approval_parked_6484)
 # --------------------------------------------------------------------------

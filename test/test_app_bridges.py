@@ -391,10 +391,49 @@ class TestAgentRegistration:
         entry = written["mcpServers"]["test-app:srv"]
         assert "autoApprove" not in entry, "a governed grant must not reach the file kiro-cli reads"
 
-    def test_register_mcp_keeps_autoapprove_only_with_the_opt_in(
+    def test_a_malformed_agent_spec_does_not_abort_the_apps_other_agents(
+        self, tmp_path, app_env
+    ):
+        """One bad `mcpServers` must not cost the app every agent after it.
+
+        `_register_agents` loops over the manifest's agents, so anything that raises
+        on one spec stops the LATER, valid ones from being materialized and the app
+        silently loses capability it declared. A value that is not a mapping is
+        carried through to the writer, which skips what it cannot read.
+        """
+        from kiro_crew.apps import bridges as bridges_mod
+
+        src = _make_app_source(
+            tmp_path, agents=["agents/bad-agent.json", "agents/my-agent.json"]
+        )
+        # A LIST of mappings: truthy, so `or {}` does not neutralize it, and its
+        # elements are unhashable, so building a name set from it raises.
+        (src / "agents" / "bad-agent.json").write_text(
+            json.dumps({"name": "bad-agent", "model": "auto", "mcpServers": [{"srv": {}}]})
+        )
+        install_app(src)
+        manifest = AppManifest.from_json_file(
+            app_env["home"] / "apps" / "test-app" / APP_MANIFEST_FILENAME
+        )
+        app_root = app_env["home"] / "apps" / "test-app"
+        registered = bridges_mod._register_agents("test-app", manifest, app_root)
+        assert any(
+            "my-agent" in name for name in registered
+        ), f"the valid agent was not materialized: {registered}"
+
+    def test_register_mcp_never_keeps_an_apps_own_autoapprove(
         self, tmp_path, app_env, monkeypatch
     ):
-        """An absent ceiling does not keep the key -- ``mcp.honour_auto_approve`` does."""
+        """The opt-in honours the OWNER's list, and an app's own is not the owner's.
+
+        ``mcp.honour_auto_approve`` records a decision about a list the owner typed
+        about their own tools. A manifest's ``autoApprove`` is chosen by the app,
+        reaches this file as ``<app>:<server>``, and would exempt a third party's
+        own tools from the approval gate with no card -- so it is stripped whatever
+        the key says. This reverses the earlier expectation here, which kept it once
+        the key was on; making that key default ON is what turned a setting almost
+        nobody had into a grant on every default-config host.
+        """
         from kiro_crew.apps import bridges as bridges_mod
         from kiro_crew.config import live
         from kiro_crew.config.loader import KiroCrewConfig
@@ -414,7 +453,9 @@ class TestAgentRegistration:
         )
         bridges_mod._register_mcp_servers("test-app", manifest)
         written = json.loads(bridges_mod._mcp_json_path().read_text(encoding="utf-8"))
-        assert written["mcpServers"]["test-app:srv"].get("autoApprove") == ["ok"]
+        entry = written["mcpServers"]["test-app:srv"]
+        assert "autoApprove" not in entry, "an app's own grant must not reach the file kiro-cli reads"
+        assert entry["command"] == "run", "the server itself must stay available"
 
     def test_missing_agent_file_skipped(self, tmp_path, app_env):
         src = _make_app_source(tmp_path, agents=["agents/nonexistent.json"])
@@ -1040,8 +1081,9 @@ class TestMCPRegistration:
         assert data["mcpServers"]["test-app:my-mcp"]["url"] == "http://localhost:9101/mcp"
 
     def test_http_mcp_server_skipped_when_backend_not_yet_up(self, tmp_path, app_env, monkeypatch):
-        # REGRESSION (revert): if the backend isn't running
-        # (port unknown), an HTTP MCP server must NOT be registered at all — registering
+        # REGRESSION (revert): a GATEWAY-MANAGED backend's HTTP server
+        # (backend.entryPoint set) with the backend not running (port unknown) must NOT be
+        # registered at all — registering
         # the manifest's illustrative dead port (:9100) into global ~/.kiro/settings/mcp.json
         # makes kiro-cli try to connect on EVERY session → "backend hiccup" → 3 retries →
         # hard error, breaking all requests. The enable/boot flow re-registers with the
@@ -1055,6 +1097,7 @@ class TestMCPRegistration:
 
         src = _make_app_source(
             tmp_path,
+            backend={"entryPoint": "backend/app.py"},
             mcpServers={
                 "my-mcp": {"url": "http://localhost:9100/mcp"},
             },
@@ -1071,7 +1114,8 @@ class TestMCPRegistration:
     def test_http_mcp_dead_entry_scrubbed_on_reregister_without_backend(
         self, tmp_path, app_env, monkeypatch
     ):
-        # A stale dead-port entry from a prior (now-down) registration must be SCRUBBED
+        # A GATEWAY-MANAGED backend's stale dead-port entry from a prior (now-down)
+        # registration must be SCRUBBED
         # when we re-register and the backend still isn't up — so it can't keep poisoning
         # every kiro session across reboots/disable.
         import kiro_crew.apps.backend as backend_mod
@@ -1082,6 +1126,7 @@ class TestMCPRegistration:
 
         src = _make_app_source(
             tmp_path,
+            backend={"entryPoint": "backend/app.py"},
             mcpServers={
                 "my-mcp": {"url": "http://localhost:9100/mcp"},
             },
@@ -1125,6 +1170,70 @@ class TestMCPRegistration:
         assert registered == ["test-app:my-stdio"]
         assert "test-app:my-stdio" in json.loads(mcp_path.read_text(encoding="utf-8"))["mcpServers"]
 
+    def test_self_managed_http_url_registered_without_backend(
+        self, tmp_path, app_env, monkeypatch
+    ):
+        # A SELF-MANAGED app (no backend.entryPoint) runs no gateway-launched backend, so
+        # its mcpServers url is an AUTHORITATIVE fixed endpoint — not an illustrative port
+        # awaiting a live allocation. It never gets a live registration, so the registrar
+        # must PRESERVE it (not scrub it as a dead default port). This mirrors
+        # _collect_app_mcp_servers (test_app_mcp_scoping::test_self_managed_http_url_is_preserved),
+        # the other writer of this config: the two must agree or one scrubs what the other
+        # writes straight back.
+        import kiro_crew.apps.backend as backend_mod
+        import kiro_crew.apps.bridges as bmod
+
+        mcp_path = tmp_path / "mcp.json"
+        monkeypatch.setattr(bmod, "_mcp_json_path", lambda: mcp_path)
+        # No backend the gateway launches → no live port, ever.
+        monkeypatch.setattr(backend_mod, "get_app_backend_port", lambda _n: None)
+
+        src = _make_app_source(
+            tmp_path,
+            mcpServers={
+                "companion": {"url": "http://127.0.0.1:7778/mcp"},
+            },
+        )
+        install_app(src)
+        manifest = AppManifest.from_json_file(
+            app_env["home"] / "apps" / "test-app" / APP_MANIFEST_FILENAME
+        )
+        assert manifest.backend.entryPoint == ""  # self-managed
+        registered = _register_mcp_servers("test-app", manifest)
+        assert registered == ["test-app:companion"]
+        written = json.loads(mcp_path.read_text(encoding="utf-8"))["mcpServers"]
+        # The authoritative manifest url is preserved verbatim (no live port to rewrite to).
+        assert written["test-app:companion"]["url"] == "http://127.0.0.1:7778/mcp"
+
+    def test_backend_app_portless_url_still_scrubbed(self, tmp_path, app_env, monkeypatch):
+        # The complement of the self-managed case: an app that DOES declare a backend
+        # (backend.entryPoint set) still has its portless url scrubbed when no live port
+        # is known — the scrub is now conditional on backend.entryPoint, not removed.
+        import kiro_crew.apps.backend as backend_mod
+        import kiro_crew.apps.bridges as bmod
+
+        mcp_path = tmp_path / "mcp.json"
+        monkeypatch.setattr(bmod, "_mcp_json_path", lambda: mcp_path)
+        monkeypatch.setattr(backend_mod, "get_app_backend_port", lambda _n: None)
+
+        src = _make_app_source(
+            tmp_path,
+            backend={"entryPoint": "backend/app.py"},
+            mcpServers={
+                "my-mcp": {"url": "http://localhost:9100/mcp"},
+            },
+        )
+        install_app(src)
+        manifest = AppManifest.from_json_file(
+            app_env["home"] / "apps" / "test-app" / APP_MANIFEST_FILENAME
+        )
+        assert manifest.backend.entryPoint == "backend/app.py"
+        registered = _register_mcp_servers("test-app", manifest)
+        assert registered == []
+        assert "test-app:my-mcp" not in json.loads(mcp_path.read_text(encoding="utf-8")).get(
+            "mcpServers", {}
+        )
+
     def test_reregister_app_mcp_servers_overwrites_with_live_port(
         self, tmp_path, app_env, monkeypatch
     ):
@@ -1139,6 +1248,7 @@ class TestMCPRegistration:
 
         src = _make_app_source(
             tmp_path,
+            backend={"entryPoint": "backend/app.py"},
             mcpServers={
                 "my-mcp": {"url": "http://localhost:9100/mcp"},
             },
@@ -1673,7 +1783,7 @@ class TestStdioInterpreterResolution:
             setup=_fake_venv_python,
         )
         assert entry["command"] == sys.executable
-        assert entry["args"][:3] == ["-s", "-m", "kiro_crew"]
+        assert entry["args"][:4] == ["-s", "-P", "-m", "kiro_crew"]
 
     def test_an_http_entry_is_unaffected(self, tmp_path, app_env, monkeypatch):
         import kiro_crew.apps.backend as backend_mod
@@ -3802,6 +3912,10 @@ class TestAppEventBusIsActuallyWired:
         from kiro_crew.dashboard.state import DashboardState
 
         src = inspect.getsource(server_mod)
+        # The app backend waves hand it over from a server_runtime owner.
+        owners = sorted((Path(server_mod.__file__).parent / "server_runtime").glob("[!_]*.py"))
+        assert owners, "expected the server_runtime owners beside server.py"
+        src += "".join(path.read_text(encoding="utf-8") for path in owners)
         # Whatever the gateway hands to the hooks system must exist on the state.
         for attr in re.findall(r"broadcast_fn=state\.([A-Za-z_][A-Za-z0-9_]*)", src):
             assert hasattr(DashboardState, attr), (
@@ -4585,15 +4699,17 @@ class TestDemotionKeepsBackendIndependentServers:
         assert calls == {"app": "app"}
 
     def test_the_registration_path_pops_a_stale_http_entry(self):
-        # Pins the property the fix leans on, in the code that owns it: with no live
-        # port, an HTTP server is removed rather than merely left unwritten — otherwise
-        # the dead url would survive the demotion.
+        # Pins the property the fix leans on, in the code that owns it: for a
+        # gateway-managed backend with no live port, an HTTP server is removed rather than
+        # merely left unwritten — otherwise the dead url would survive the demotion. The
+        # scrub is conditional on backend.entryPoint (a self-managed app's url is kept),
+        # mirroring _collect_app_mcp_servers.
         import inspect
 
         import kiro_crew.apps.bridges as brmod
         src = inspect.getsource(brmod._register_mcp_servers)
         assert "servers.pop(namespaced, None)" in src
-        assert "if is_http and not resolved_port:" in src
+        assert "if is_http and not resolved_port and manifest.backend.entryPoint:" in src
 
 
 class TestScrubFallsBackWhenTheManifestCannotSay:
@@ -4673,7 +4789,7 @@ class TestLifecycleWritersShareTheHealthSerialization:
 
         # A non-empty manifest: the function returns before the lock when there is
         # nothing to register, so an empty one would pass this test vacuously.
-        monkeypatch.setattr(brmod, "strip_ungoverned_auto_approve", lambda m: m)
+        monkeypatch.setattr(brmod, "strip_ungoverned_auto_approve", lambda m, **kw: m)
         brmod._register_mcp_servers(
             "app",
             SimpleNamespace(

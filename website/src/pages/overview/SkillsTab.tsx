@@ -18,10 +18,12 @@ import { useListDetailView } from '../../hooks/useListDetailView'
 import { useProvider } from '../../providers'
 import type { Skill } from '../../types'
 import SkillContextBudget from './SkillContextBudget'
+import { SKILL_SORTS, sortSkills, type SkillSort } from './skillSort'
+import SimpleSelect from '../../components/SimpleSelect'
 
 import { Trans } from 'react-i18next'
 
-import { fmtBytes, fmtCompact } from '../../i18n/format'
+import { fmtBytes, fmtCompact, fmtDateTime, fmtNumber, fmtRelative } from '../../i18n/format'
 import { i18nT } from '../../i18n/t'
 import { parseErrorCode, findReport, type ErrorReport } from '../../utils/errorReport'
 import { SettingRef } from '../../components/settingRef/SettingRef'
@@ -42,6 +44,23 @@ const PANE_SHELL_CLASS = 'flex gap-3 -mx-2 md:mx-0 h-[calc(100vh-260px)] support
 
 /** Humanize a kebab/snake-case skill name for display. */
 const displayName = (s: Skill) => s.name.replace(/[-_]/g, ' ').replace(/\b\w/g, c => c.toUpperCase())
+
+/** A list row's usage text, or null for a skill with no recorded use.
+ *
+ *  `id` lets the row name this text as its description: the row's
+ *  `aria-label` replaces its content, so without it a screen reader never
+ *  hears the count. `aria-describedby` splits on whitespace and a skill
+ *  directory name may hold a space, so the id percent-encodes whitespace,
+ *  and `%` with it so distinct keys keep distinct ids. */
+function skillUsage(s: Skill): { id: string; text: string; title: string } | null {
+  if (!s.deliveries) return null
+  const uses = fmtNumber(s.deliveries)
+  return {
+    id: `skill-usage-${s.key.replace(/[\s%]/g, c => encodeURIComponent(c))}`,
+    text: i18nT('pages.overview.skillsTab.usage_short', { uses, when: fmtRelative(s.last_used_at) }),
+    title: i18nT('pages.overview.skillsTab.usage_title', { uses, when: fmtDateTime(s.last_used_at) }),
+  }
+}
 
 /** A skill only carries injection cost when a trigger can fire it, so the
  *  control is meaningless for a pinned (`always: true`) skill — the matcher
@@ -72,6 +91,7 @@ export default function SkillsTab() {
   const [creating, setCreating] = useState(false)
   const [formData, setFormData] = useState<SkillFormData>(EMPTY_FORM)
   const [skillFilter, setSkillFilter] = useState('')
+  const [skillSort, setSkillSort] = useState<SkillSort>('default')
   const [selectedKey, setSelectedKey] = useState<string | null>(null)
   const [detailEditing, setDetailEditing] = useState(false)
   // Multi-provider skill browser drawer (Add Skill button).
@@ -238,10 +258,10 @@ export default function SkillsTab() {
     const q = skillFilter.toLowerCase()
     const match = (s: Skill) => !q || (s.name + ' ' + s.key + ' ' + (s.description || '')).toLowerCase().includes(q)
     return {
-      localSkills: skills.filter(s => s.source !== 'package').filter(match),
-      packageSkills: skills.filter(s => s.source === 'package').filter(match),
+      localSkills: sortSkills(skills.filter(s => s.source !== 'package').filter(match), skillSort),
+      packageSkills: sortSkills(skills.filter(s => s.source === 'package').filter(match), skillSort),
     }
-  }, [skills, skillFilter])
+  }, [skills, skillFilter, skillSort])
 
   const allFiltered = useMemo(() => [...localSkills, ...packageSkills], [localSkills, packageSkills])
   const selectedSkill = useMemo(() => skills.find(s => s.key === selectedKey) ?? null, [skills, selectedKey])
@@ -295,6 +315,7 @@ export default function SkillsTab() {
     // of keeping its live cursor and hover — a silent no-op on a control that
     // looks live reads as a broken UI.
     const rowInert = updateSkill.isPending
+    const usage = skillUsage(s)
     return (
       <div
         key={s.key}
@@ -303,6 +324,7 @@ export default function SkillsTab() {
         aria-current={isSel ? 'true' : undefined}
         aria-disabled={rowInert ? 'true' : undefined}
         aria-label={i18nT('pages.overview.skillsTab.select', { name: displayName(s) })}
+        aria-describedby={usage?.id}
         onClick={() => selectSkill(s)}
         onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); selectSkill(s) } }}
         className={`flex flex-col gap-0.5 px-3 py-2.5 rounded-md mb-1 transition-colors ${
@@ -321,7 +343,12 @@ export default function SkillsTab() {
                 ? <span className="text-[10px] px-1.5 py-[1px] rounded-full bg-accent-subtle text-accent border border-accent/30 font-bold shrink-0">{i18nT('pages.overview.skillsTab.pointer')}</span>
                 : <span className="text-[10px] px-1.5 py-[1px] rounded-full bg-bg-elevated text-muted border border-border font-bold shrink-0">{i18nT('pages.overview.skillsTab.on_demand')}</span>}
         </div>
-        <div className="text-[11px] text-muted font-mono truncate">{s.key}</div>
+        <div className="flex items-baseline gap-2 min-w-0">
+          {/* The usage text narrows this line, so the key carries its own title
+           *  for the part the ellipsis hides. */}
+          <span className="text-[11px] text-muted font-mono truncate flex-1" title={s.key}>{s.key}</span>
+          {usage && <span id={usage.id} className="text-[11px] text-muted whitespace-nowrap shrink-0" title={usage.title}>{usage.text}</span>}
+        </div>
         {s.loaded_by_agents && s.loaded_by_agents.length > 0 && (
           <div className="text-[10px] text-muted/70 truncate" title={i18nT('pages.overview.skillsTab.loaded_by_2', { agents: s.loaded_by_agents.join(', ') })}>
             {i18nT('pages.overview.skillsTab.loaded_by')} {i18nT('pages.overview.skillsTab.agent', { count: s.loaded_by_agents.length })}
@@ -389,12 +416,29 @@ export default function SkillsTab() {
     <h4 className="text-sm font-semibold text-text-strong mb-2 flex flex-wrap items-center gap-2">{i18nT('pages.overview.skillsTab.skills_count', { count: skills.length })} <InfoTip text={i18nT('pages.overview.skillsTab.skills_tip')} /> <span className="w-full md:w-auto md:ml-auto flex flex-col md:flex-row items-stretch md:items-center [&>button]:justify-center md:[&>button]:justify-start gap-2"><Btn onClick={showBudget} className="text-accent border-accent/30 bg-accent/5 hover:bg-accent/10">{i18nT('pages.overview.skillsTab.budget_doorway_static')}</Btn><Btn onClick={() => setSkillBrowserOpen(true)}><Download size={14} /> {i18nT('pages.overview.skillsTab.add_skill')}</Btn><Btn primary onClick={() => { setFormData(EMPTY_FORM); setCreateError(''); setCreating(true) }}>{i18nT('pages.overview.skillsTab.create_new_skill')}</Btn></span></h4>
     <p className="text-[12px] text-muted mb-2"><Trans i18nKey="pages.overview.skillsTab.auto_create_hint" components={{ settingRef: <SettingRef configKey="skills.auto_create_from_sessions" /> }} /></p>
     <Card>
-      <div className="flex items-center gap-2 mb-3">
-        <div className="relative max-w-[480px] flex-1">
+      {/* Wraps instead of squeezing the search: beside the sort and refresh
+        * controls, a 320px pane leaves the field about 80px wide. */}
+      <div className="flex flex-wrap items-center gap-2 mb-3">
+        <div className="relative max-w-[480px] flex-1 min-w-48">
           <SearchInput placeholder={i18nT('pages.overview.skillsTab.filter_skills')} value={skillFilter} onChange={e => setSkillFilter(e.target.value)} />
           {skillFilter && <button className="absolute right-2 top-1/2 -translate-y-1/2 text-muted hover:text-text transition-colors cursor-pointer" onClick={() => setSkillFilter('')} aria-label={i18nT('pages.overview.skillsTab.clear_search')}>{"\u00d7"}</button>}
         </div>
         <div className="ml-auto flex items-center gap-2">
+          <SimpleSelect
+            className="w-auto h-8"
+            // The trigger hugs its value, so the list must not inherit that
+            // width: at it, "Default order" wraps onto two lines.
+            contentClassName="min-w-max"
+            aria-label={i18nT('pages.overview.skillsTab.sort_label')}
+            options={SKILL_SORTS}
+            optionLabels={[
+              i18nT('pages.overview.skillsTab.sort_default'),
+              i18nT('pages.overview.skillsTab.sort_most_used'),
+              i18nT('pages.overview.skillsTab.sort_recently_used'),
+            ]}
+            value={skillSort}
+            onChange={v => setSkillSort(v as SkillSort)}
+          />
           <Btn onClick={() => refetch()} disabled={isFetching} aria-label={i18nT('pages.overview.skillsTab.refresh_skills')}><RefreshCw size={14} className={isFetching ? 'animate-spin' : ''} /></Btn>
         </div>
       </div>
@@ -418,6 +462,16 @@ export default function SkillsTab() {
            of that draft. The hand-off returns as soon as no session holds a
            draft. */
         <ErrorNotice className="mb-3" askAgent={!detailEditing} message={deleteError?.message} report={deleteError?.report} onDismiss={() => setDeleteError(null)} testId="skill-delete-failure" />
+      )}
+      {/* A save failure whose editor is NOT mounted: a viewport crossing
+        * (desktop -> phone) can hide the detail pane while the edit session
+        * stays latched, so a PUT that rejects afterwards has no editor to
+        * report in. Show the retained failure here instead. Same retire rules
+        * as the in-editor notice (dismiss, Edit re-entry, a later success);
+        * a row tap reopens the latched editor, which then shows it inline.
+        * No hand-off: the latched draft is still the only copy of the edit. */}
+      {detailEditing && !showDetail && updateError && (
+        <ErrorNotice className="mb-3" variant="inline" title={i18nT('pages.overview.skillsTab.update_failed_title')} message={updateError} onDismiss={() => setUpdateError('')} testId="skill-update-failure-list" />
       )}
 
       {skills.length === 0 ? <EmptyState icon={<Sparkles className="lucide-inline" />} title={i18nT('pages.overview.skillsTab.no_skills_yet')} subtitle={i18nT('pages.overview.skillsTab.empty_subtitle')} action={<Btn onClick={() => setSkillBrowserOpen(true)}><Download size={14} /> {i18nT('pages.overview.skillsTab.add_skill')}</Btn>} /> : (
@@ -461,7 +515,7 @@ export default function SkillsTab() {
                     gate only suppresses it while the editor is VISIBLE. */}
                 {isMobile && (
                   <div className="px-4 pt-2.5 shrink-0">
-                    <ListDetailBack label={i18nT('pages.overview.skillsTab.skills')} onBack={() => { if (updateSkill.isPending) return; closeDetail() }} />
+                    <ListDetailBack label={i18nT('pages.overview.skillsTab.skills')} disabled={updateSkill.isPending} onBack={() => { if (updateSkill.isPending) return; closeDetail() }} />
                   </div>
                 )}
                 <div className="flex items-center justify-between gap-2 flex-wrap px-4 py-2.5 border-b border-border shrink-0">
@@ -720,10 +774,17 @@ function PendingCandidateRow({ p, autoOpen, approveRefusal, mixedQueue, onApprov
     rowRef.current?.scrollIntoView({ block: 'center', behavior: 'smooth' })
   }, [autoOpen])
   const isUpdate = p.kind === 'update'
-  const { data: detail } = useQuery<PendingDetail>({
+  const {
+    data: detail,
+    fetchStatus: detailFetchStatus,
+    error: detailReadError,
+  } = useQuery<PendingDetail>({
     queryKey: ['skills-pending-detail', p.slug],
     queryFn: () => api.skillPendingDetail(p.slug),
     enabled: open,
+    // The candidate is a file an agent can rewrite, and no push follows, so the
+    // global staleTime: Infinity served the first-open body until a reload.
+    staleTime: 0,
   })
   return (
     <div ref={rowRef} className={`p-2 rounded-md border ${autoOpen ? 'border-accent ring-1 ring-accent' : 'border-border'}`}>
@@ -763,7 +824,11 @@ function PendingCandidateRow({ p, autoOpen, approveRefusal, mixedQueue, onApprov
             replace the newer approved content — the backend refuses both, so keep
             the button disabled and let the expanded panel explain. */}
         {(() => {
-          const approveDisabled = !open || !detail || (isUpdate && (!detail.diff || !!detail.stale_base))
+          // The re-read is a background one, so the old body is still on screen
+          // while it flies -- and stays there when it fails. Either way what is
+          // shown is not known to be the file Approve would promote.
+          const detailUnconfirmed = detailFetchStatus !== 'idle' || !!detailReadError
+          const approveDisabled = !open || !detail || detailUnconfirmed || (isUpdate && (!detail.diff || !!detail.stale_base))
           return (
             <Btn
               /* Non-primary while the candidate is flagged AND the button is
@@ -832,6 +897,32 @@ function PendingCandidateRow({ p, autoOpen, approveRefusal, mixedQueue, onApprov
                 ? <ValidationFindings report={approveRefusal.report} />
                 : undefined
             }
+          />
+        </div>
+      )}
+      {open && detailReadError && (
+        /* The read that would confirm this candidate failed, so Approve is held
+           and the panel below is the last good read rather than the file.
+           `pending_skill_unreadable` is the one failure whose server prose a
+           user cannot act on: the candidate is still listed, so the generic
+           notice would leave them clicking a row that keeps 404ing. The
+           translated copy names the state and the action that applies. */
+        <div className="mt-2">
+          <ErrorNotice
+            message={
+              parseErrorCode((detailReadError as { body?: string }).body ?? '')
+                === 'pending_skill_unreadable'
+                ? i18nT('pages.overview.skillsTab.detail_unreadable')
+                : detailReadError.message
+            }
+            /* The journal is keyed on the API's own message text, so the
+               localized sentence above would miss it and the hand-off would
+               carry the sentence alone -- no endpoint, status, code or body.
+               Look the report up by the ORIGINAL message, as the sibling
+               notices in GitPanel and MobileConnectModal do. */
+            report={findReport(detailReadError.message)}
+            askAgent
+            askAgentLabel={i18nT('pages.overview.skillsTab.ask_agent_about_failure')}
           />
         </div>
       )}

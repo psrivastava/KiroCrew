@@ -59,7 +59,7 @@ vi.mock('framer-motion', async () => {
 vi.mock('../components/ProjectPicker', () => ({ default: () => null }))
 /** Mutable so one test can flip the sidebar into board (tag-column) view. */
 const cfg = vi.hoisted(() => ({
-  value: { tagColumnsEnabled: false, confirmCloseSession: false, defaultAutopilot: false } as Record<string, unknown>,
+  value: { tagColumnsEnabled: false, confirmCloseSession: false } as Record<string, unknown>,
 }))
 vi.mock('../pages/chat/ChatSettings', () => ({
   loadChatConfig: () => cfg.value,
@@ -222,7 +222,7 @@ function renderSidebar(opts: RenderOpts = {}) {
   mocks.chatFolders.mockResolvedValue(folders)
   if (opts.flat) localStorage.setItem(FLAT_VIEW_LS_KEY, '1')
   if (opts.board) {
-    cfg.value = { tagColumnsEnabled: true, confirmCloseSession: false, defaultAutopilot: false }
+    cfg.value = { tagColumnsEnabled: true, confirmCloseSession: false }
     mocks.chatTags.mockResolvedValue(TAGS)
     mocks.tagColumns.mockResolvedValue(COLUMNS)
   }
@@ -336,7 +336,7 @@ beforeEach(() => {
   localStorage.setItem('mc-session-stale-collapse-ms', '0')
   localStorage.setItem(HIDDEN_FOLDERS_LS_KEY, JSON.stringify([HIDDEN_FOLDER_ID]))
   dnd.active = null
-  cfg.value = { tagColumnsEnabled: false, confirmCloseSession: false, defaultAutopilot: false }
+  cfg.value = { tagColumnsEnabled: false, confirmCloseSession: false }
   mocks.chatFolders.mockResolvedValue(FOLDERS)
   mocks.updateChatFolder.mockResolvedValue({ ok: true })
   mocks.reorderChatFolders.mockResolvedValue({ ok: true })
@@ -1049,6 +1049,8 @@ describe('ChatSidebar — board column drag targets', () => {
     const status = column('col-status')
     expect(fireEvent.dragOver(status, { dataTransfer: transfer(['text/plain']) })).toBe(false)
     expect(status.className).toContain('ring-accent')
+    // The refusal hint belongs to derived lanes only; a tag lane takes the card.
+    expect(screen.queryByTestId('column-derived-hint-col-status')).toBeNull()
 
     const plain = column('col-plain')
     // A plain label column cannot receive a card, so the drag is not accepted.

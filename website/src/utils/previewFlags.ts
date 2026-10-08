@@ -55,11 +55,28 @@ export interface PreviewFlagChange {
 export const PREVIEW_WEBHOOKS = `${PREVIEW_FLAG_PREFIX}webhooks`
 
 /**
+ * Artifact Deploy (`/deploy`): publishing an artifact to a public HTTPS URL in
+ * the operator's own AWS account.
+ *
+ * Gating the INGRESS only, like every flag here. `/deploy` stays routable, the
+ * deploy API is untouched, and an existing deployment keeps working — what the
+ * flag controls is whether the product OFFERS the surface to someone who has not
+ * asked for it. The doors are the Artifacts page's Artifact Deploy button and its
+ * dropdown twin, the webapp card's Deploy hero, and the "Publish to public web
+ * (your AWS)" row in the publish panel.
+ *
+ * Default OFF because every door leads to spending money in a real AWS account
+ * and to content served on the open internet. That is not a reasonable default
+ * for a surface still settling.
+ */
+export const PREVIEW_ARTIFACT_DEPLOY = `${PREVIEW_FLAG_PREFIX}artifact-deploy`
+
+/**
  * Crew Members: the Crew Members page (`/members`) and its rail item.
  *
  * This flag used to hold a second door too — the "New Crew Mode chat" entry in
  * the sidebar's create menu. Crew Mode retired in favour of the Members page,
- * and that menu entry is now "Crew Members": rendered whatever this flag says,
+ * and that menu entry is now "Crewmates": rendered whatever this flag says,
  * it opens `/members` when the flag is on and, when off, the Settings card that
  * turns it on (`ChatSidebar.openCrewMembers`). The flag therefore gates only the
  * page and where the entry lands, never whether the entry exists — a user who
@@ -108,6 +125,40 @@ export const PREVIEW_REMOTE_CREW_CHAT = `${PREVIEW_FLAG_PREFIX}remote-crew-chat`
  * and skip the fetch, rather than fetching and hiding the rows.
  */
 export const PREVIEW_INSTANCE_SESSIONS = `${PREVIEW_FLAG_PREFIX}instance-sessions`
+
+/**
+ * The composable-layout dev harness (`/layout-harness`).
+ *
+ * Held because it is a MECHANISM being built beside the Members page, not a
+ * shippable surface: it mounts the layout renderer + scope over a hand-authored
+ * seed so the "panes connect by placement" mechanism can be verified in
+ * isolation, and it changes nothing a user sees. Gating the INGRESS only —
+ * turning it off hides the route; it orphans nothing (the harness holds no saved
+ * state). Its own flag so it releases (or is retired) independently.
+ *
+ * The key string is `layout-harness`, matching the flag the layout feature
+ * itself reads, so the toggle here and the feature's own gate agree on one key.
+ */
+export const PREVIEW_LAYOUT_HARNESS = `${PREVIEW_FLAG_PREFIX}layout-harness`
+
+/**
+ * The Dynamic Dashboard: the status dock above the composer, the side panel's
+ * Dashboard view, the Crewmates page's Dashboard tab, and the "All dashboards"
+ * page (`/session-dashboards`).
+ *
+ * Held because the surface is still being designed — what the panel shows,
+ * what the agent's published page is asked to carry, and where the automatic
+ * card belongs are all moving — so it is not something to put in front of a
+ * user yet. A developer turns it on here to work on it.
+ *
+ * Gating the INGRESS only, like every flag here. `/session-dashboards` stays
+ * routable, the dashboard-card and work-projection APIs are untouched, and a
+ * published view an agent already authored stays an ordinary artifact. The
+ * flag decides whether the dock, the menu entries and the tabs are OFFERED; a
+ * persisted `command-center` tab is withheld from the strip while it is off
+ * and returns when it is on, exactly as a host withdrawal does.
+ */
+export const PREVIEW_DASHBOARD = `${PREVIEW_FLAG_PREFIX}dashboard`
 
 /**
  * Read a preview flag. Absent, unparseable, or storage-denied all mean OFF —

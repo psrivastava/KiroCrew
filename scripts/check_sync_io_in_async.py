@@ -24,7 +24,7 @@ when you got it wrong. This gate is the thing that fails.
 **A wait reachable from the event loop must be shorter than the watchdog budget
 -- or, better, must not be reachable from the loop at all.** SQLite
 ``busy_timeout`` values in this tree run to 30s
-(``apps/builtins/auto_research/handlers.py``), 10s (``knowledge/store.py``) and
+(``apps/builtins/auto_research/campaign/storage.py``), 10s (``knowledge/store.py``) and
 5s (``vector_memory.py``), none of them chosen against
 ``dashboard.loop_stall_exit_after_secs=25``. A 30s lock wait REACHABLE FROM THE
 LOOP kills the process by arithmetic, with no bug anywhere else.
@@ -276,9 +276,10 @@ FAMILY_REMEDY = {
 HEADER = """\
 # Blocking IO calls inside an `async def`, as `<count> <path>`.
 # Each one stalls every session's turn while it runs, and a stall longer than
-# dashboard.loop_stall_exit_after_secs (25s) makes the watchdog kill the
-# gateway (#3057, #1572). The gate requires every OTHER file to be clean and
-# none of these counts to grow, so this list can only shrink.
+# dashboard.loop_stall_exit_after_secs (default 25s foreground, 90s managed
+# service) makes the watchdog kill the gateway (#3057, #1572). The gate
+# requires every OTHER file to be clean and none of these counts to grow, so
+# this list can only shrink.
 #
 # Do NOT add or raise a line to make a red gate green: a new offender belongs
 # in a thread (`await asyncio.to_thread(...)`, or a named lane from
@@ -289,8 +290,7 @@ HEADER = """\
 # Refresh (after fixing something listed here):
 #   python3 scripts/check_sync_io_in_async.py --update-baseline
 #
-# See where the remaining calls are, worst files first (the work queue for the
-# cleanup tracked at #7019):
+# List any on-loop blocking calls, worst files first:
 #   python3 scripts/check_sync_io_in_async.py --report
 """
 

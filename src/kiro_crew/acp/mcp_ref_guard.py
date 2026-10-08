@@ -1,7 +1,7 @@
 """The ACP layer's reporting half of the unresolved-``@server``-ref detector.
 
-The question itself -- which of a spec's ``@server`` refs name nothing a session
-receives -- is provider-neutral plain data and lives in
+The question itself -- which of a spec's ``@server`` refs name nothing in Crew's
+projection for the session -- is provider-neutral plain data and lives in
 :mod:`kiro_crew.agent_sdk.mcp_refs`, which is what lets ``kirocrew doctor`` ask it
 without importing this layer. What lives HERE is the part that is genuinely ACP's:
 turning that answer into one structured log line at the point where a session's
@@ -126,10 +126,23 @@ def warn_unresolved_server_refs(
     if len(shown) < len(unresolved):
         listed += f" (+{len(unresolved) - len(shown)} more)"
     safe_agent = _log_safe(sanitize_sink_text(agent, NAME_CAP))
+    # The closing sentence claims only what the wire proves, on EVERY backend.
+    # "Absent" would be the strong claim, and no backend's array is provably the
+    # session's whole MCP surface: Claude Code mounts its own user- and
+    # project-scope ``mcpServers`` and plugins beside the array, codex-acp merges
+    # the array on top of ``~/.codex/config.toml``, and kiro-cli loads the global
+    # ``~/.kiro/settings/mcp.json`` into every agent by default (a spec may opt out
+    # of the global file with ``includeMcpJson: false``). So a same-named server
+    # may be serving a listed ref on any of them, and the detector, which judges
+    # the wire (or the spec) alone by design, cannot tell which. The line says what
+    # it knows -- Crew's projection delivers none of them -- and stops short of
+    # what it does not.
     logger.warning(
-        "agent-spec tool refs name no MCP server this session receives: "
-        "backend=%r agent=%r unresolved=%s mcp_gateway=%s. Those tools are absent "
-        "from the session with nothing else to say so -- the harness still works. "
+        "agent-spec tool refs name no MCP server in Crew's projection for this "
+        "session: backend=%r agent=%r unresolved=%s mcp_gateway=%s. Crew's projection "
+        "delivers none of those servers; the harness may mount a same-named server "
+        "from its own configuration, so a listed ref may still be served and this "
+        "line cannot tell which. The harness still works. "
         "A backend that reads no agent file needs a mirror "
         "(src/kiro_crew/providers/mirrors/) to project the spec onto its "
         "session/new mcpServers array.",

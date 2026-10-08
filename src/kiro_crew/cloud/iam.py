@@ -27,6 +27,17 @@ MANAGED_TAG_KEY = "kirocrew:managed"
 # The IAM role name pattern the template uses; PassRole is scoped to it.
 ROLE_NAME_PREFIX = "kirocrew-ec2-"
 
+# IAM path the template puts the instance role under. CreateRole and PassRole
+# are scoped to this path, so the launcher can only create roles here and only
+# roles here can be passed to EC2. A role at the root path that merely shares
+# the name prefix does not match.
+ROLE_PATH = "/kirocrew-ec2/"
+INSTANCE_ROLE_ARN = f"arn:aws:iam::*:role{ROLE_PATH}{ROLE_NAME_PREFIX}*"
+# Roles launched before ROLE_PATH existed sit at the root path. Only the
+# non-escalating management verbs keep this pattern, so those stacks can still
+# be updated and destroyed.
+LEGACY_ROLE_ARN = f"arn:aws:iam::*:role/{ROLE_NAME_PREFIX}*"
+
 # The permissions-boundary managed-policy name. This is a SINGLE, shared,
 # account/region-agnostic, CONTENT-FIXED managed policy (NO per-tag suffix), so
 # its content is identical for every launch and it can be created ONCE and reused
@@ -293,53 +304,47 @@ def policy_document() -> dict[str, Any]:
             ],
         },
         {
-            # Account-wide read-only calls that can't be stack-ARN-scoped:
-            # ListStacks enumerates, GetTemplateSummary validates the template
-            # body before a stack exists.
-            "Sid": "CloudFormationRead",
+            # Account-wide read-only discovery that can't be resource-scoped. Four
+            # statements — CloudFormation read (ListStacks enumerates,
+            # GetTemplateSummary validates a template body before a stack exists),
+            # the tagging API (`kirocrew cloud list` discovers instances), the EC2
+            # Describe* set, and the Route53 DNS preflight — all share Effect=Allow,
+            # Resource="*" and no Condition, so they are ONE statement. Merging them
+            # is permission-neutral (identical effective tuple set) and keeps the
+            # policy under IAM's 6,144-char managed-policy cap; every action here is
+            # read-only, so the shared "*" resource grants nothing a split wouldn't.
+            #
+            # NB (Route53DnsPreflight): a private hosted zone bound to the target
+            # VPC can be authoritative for a host the bootstrap downloads from (e.g.
+            # Amazon Q's `q.<region>.amazonaws.com` endpoint zone shadows
+            # desktop-release.q.us-east-1.amazonaws.com), which makes the install
+            # fail on NXDOMAIN with no fallthrough to public DNS. The launch
+            # degrades gracefully without route53:ListHostedZonesByVPC — it just
+            # loses the early warning — so it is safe to omit on an older policy.
+            # ListHostedZonesByVPC does not support resource-level permissions.
+            #
+            # ec2:Describe* is one wildcard, not a list: CloudFormation's EC2
+            # handlers call about twenty Describe actions (see the pinned schema
+            # lists in test/fixtures/cfn_schema_handler_permissions.json), none
+            # take resource-level scoping, and listing them breaks the 6,144
+            # cap. The trade: the launcher can read EC2 metadata across the
+            # account; it gains no write. The Describe calls that return secrets
+            # (instance and launch-template user data, Spot launch specs, VPN
+            # pre-shared keys, account-wide tag values) are cut back out by DenyForeignUserData and
+            # DenySecretReads below.
+            # ssm:DescribeAssociation / ListAssociations are the Instance
+            # handler's association reads.
+            "Sid": "CloudFormationAndResourceDiscovery",
             "Effect": "Allow",
             "Action": [
                 "cloudformation:ListStacks",
                 "cloudformation:GetTemplateSummary",
+                "tag:GetResources",
+                "ec2:Describe*",
+                "ssm:DescribeAssociation",
+                "ssm:ListAssociations",
+                "route53:ListHostedZonesByVPC",
             ],
-            "Resource": "*",
-        },
-        {
-            # `kirocrew cloud list` discovers instances via the tagging API.
-            "Sid": "TagDiscovery",
-            "Effect": "Allow",
-            "Action": ["tag:GetResources"],
-            "Resource": "*",
-        },
-        {
-            "Sid": "Ec2Discovery",
-            "Effect": "Allow",
-            "Action": [
-                "ec2:DescribeInstances",
-                "ec2:DescribeInstanceStatus",
-                "ec2:DescribeImages",
-                "ec2:DescribeVpcs",
-                "ec2:DescribeSubnets",
-                "ec2:DescribeRouteTables",
-                "ec2:DescribeSecurityGroups",
-                "ec2:DescribeKeyPairs",
-                "ec2:DescribeAvailabilityZones",
-                "ec2:DescribeInstanceTypeOfferings",
-            ],
-            "Resource": "*",
-        },
-        {
-            # DNS preflight: a private hosted zone bound to the target VPC can be
-            # authoritative for a host the bootstrap downloads from (e.g. Amazon
-            # Q's `q.<region>.amazonaws.com` endpoint zone shadows
-            # desktop-release.q.us-east-1.amazonaws.com), which makes the install
-            # fail on NXDOMAIN with no fallthrough to public DNS. The launch
-            # degrades gracefully without this action — it just loses the early
-            # warning — so it is safe to omit on an older policy.
-            # ListHostedZonesByVPC does not support resource-level permissions.
-            "Sid": "Route53DnsPreflight",
-            "Effect": "Allow",
-            "Action": ["route53:ListHostedZonesByVPC"],
             "Resource": "*",
         },
         {
@@ -410,18 +415,32 @@ def policy_document() -> dict[str, Any]:
             "Resource": "arn:aws:ec2:*:*:vpc/*",
         },
         {
-            # SG rule mutation is gated to KiroCrew-tagged security groups: the
-            # stack's SG carries kirocrew:managed=true from creation
-            # (TagSpecifications), so CFN can add its egress/SSH rules — but a
-            # leaked launcher credential can't Authorize/Revoke rules on an
-            # UNRELATED security group (which would expose other account
-            # resources). Revoke is already in Ec2DestructiveTagged; Authorize is
-            # here.
-            "Sid": "Ec2SecurityGroupRulesTagged",
+            # Tag-gated mutation of resources managed by Kiro Crew: SG-rule
+            # mutation, the destructive SG/tag verbs, and instance lifecycle. All
+            # three share the same Effect + Resource ("*") + Condition
+            # (aws:ResourceTag/kirocrew:managed=true), so they are ONE statement —
+            # merging them is permission-neutral (identical effective tuple set)
+            # and keeps the policy under IAM's 6,144-char managed-policy cap. The
+            # tag gate means a leaked launcher credential can't Authorize/Revoke
+            # rules on, delete/retag, or stop/terminate an UNRELATED (untagged)
+            # resource; the stack's SG + instance carry kirocrew:managed=true from
+            # creation (TagSpecifications), so CFN's own calls still authorize.
+            # RevokeSecurityGroupEgress is required: before CloudFormation applies
+            # the template's declared SecurityGroupEgress it revokes the implicit
+            # allow-all egress rule EC2 adds to every new VPC security group.
+            "Sid": "Ec2ManagedResourceMutateTagged",
             "Effect": "Allow",
             "Action": [
                 "ec2:AuthorizeSecurityGroupEgress",
                 "ec2:AuthorizeSecurityGroupIngress",
+                "ec2:RevokeSecurityGroupEgress",
+                "ec2:RevokeSecurityGroupIngress",
+                "ec2:DeleteSecurityGroup",
+                "ec2:DeleteTags",
+                "ec2:StopInstances",
+                "ec2:StartInstances",
+                "ec2:TerminateInstances",
+                "ec2:RebootInstances",
             ],
             "Resource": "*",
             "Condition": {"StringEquals": {f"aws:ResourceTag/{MANAGED_TAG_KEY}": "true"}},
@@ -447,32 +466,6 @@ def policy_document() -> dict[str, Any]:
             },
         },
         {
-            # Destructive verbs, gated to KiroCrew-tagged resources so a leaked
-            # launcher credential can't delete/retag security groups it never
-            # created. The stack's SG carries kirocrew:managed=true from creation.
-            "Sid": "Ec2DestructiveTagged",
-            "Effect": "Allow",
-            "Action": [
-                "ec2:RevokeSecurityGroupIngress",
-                "ec2:DeleteSecurityGroup",
-                "ec2:DeleteTags",
-            ],
-            "Resource": "*",
-            "Condition": {"StringEquals": {f"aws:ResourceTag/{MANAGED_TAG_KEY}": "true"}},
-        },
-        {
-            "Sid": "Ec2LifecycleTagged",
-            "Effect": "Allow",
-            "Action": [
-                "ec2:StopInstances",
-                "ec2:StartInstances",
-                "ec2:TerminateInstances",
-                "ec2:RebootInstances",
-            ],
-            "Resource": "*",
-            "Condition": {"StringEquals": {f"aws:ResourceTag/{MANAGED_TAG_KEY}": "true"}},
-        },
-        {
             # Role create MUST carry our SHARED, PRE-CREATED permissions boundary.
             # iam:CreateRole is the enforcement point: a kirocrew-ec2-* role can
             # ONLY be created WITH our permissions boundary (iam:PermissionsBoundary
@@ -495,7 +488,7 @@ def policy_document() -> dict[str, Any]:
             "Sid": "IamCreateRoleWithBoundary",
             "Effect": "Allow",
             "Action": ["iam:CreateRole"],
-            "Resource": f"arn:aws:iam::*:role/{ROLE_NAME_PREFIX}*",
+            "Resource": INSTANCE_ROLE_ARN,
             "Condition": {
                 "ArnLike": {"iam:PermissionsBoundary": f"arn:aws:iam::*:policy/{BOUNDARY_NAME}"}
             },
@@ -520,19 +513,45 @@ def policy_document() -> dict[str, Any]:
             # that key isn't in PutRolePolicy's request context, so it would deny
             # the call. aws:ResourceTag (not iam:ResourceTag) — verified with the
             # IAM policy simulator that PutRolePolicy honors the global key.
-            "Sid": "IamPutRolePolicyForInstance",
+            #
+            # iam:TagRole is MERGED into this statement: it shares the exact same
+            # Effect + Resource (the kirocrew-ec2-* role ARN) + Condition
+            # (aws:ResourceTag/kirocrew:managed=true), so combining them is
+            # permission-neutral and helps keep the policy under IAM's 6,144-char
+            # cap. TagRole is REQUIRED because CloudFormation's CreateRole passes
+            # the role's Tags inline (the template's InstanceRole.Tags), and AWS
+            # authorizes that inline tagging as iam:TagRole (see AWS docs
+            # id_tags_roles.html) — without it the boundary-gated CreateRole fails
+            # 403 and the launch can't tag the role kirocrew:managed=true. The
+            # aws:ResourceTag gate is the non-spoofable distinguisher, proven live
+            # with a least-privilege assumed-role principal:
+            #   * (a) A boundary-gated CreateRole WITH inline Tags is ALLOWED: at
+            #     CreateRole, AWS evaluates the embedded TagRole authorization with
+            #     aws:ResourceTag reflecting the tags BEING applied, so the
+            #     kirocrew:managed=true tag is already "present" in context → match.
+            #   * (b) A STANDALONE tag-role on a pre-existing unbounded victim
+            #     (which does NOT yet carry kirocrew:managed) is DENIED — the key
+            #     is absent/mismatched → no match. So the launcher can tag roles it
+            #     is creating (which already carry the tag) but CANNOT add the
+            #     managed tag to a role that lacks it — which is what keeps the
+            #     PutRolePolicy tag gate non-spoofable.
+            # NB: we do NOT use iam:PermissionsBoundary here — validated live that
+            # AWS does NOT propagate that key into the CreateRole-embedded TagRole
+            # check (it DENIED case (a)); aws:ResourceTag is the key that works.
+            "Sid": "IamPutRolePolicyAndTagRoleOnManaged",
             "Effect": "Allow",
-            "Action": ["iam:PutRolePolicy"],
-            "Resource": f"arn:aws:iam::*:role/{ROLE_NAME_PREFIX}*",
+            "Action": ["iam:PutRolePolicy", "iam:TagRole"],
+            "Resource": INSTANCE_ROLE_ARN,
             "Condition": {"StringEquals": {f"aws:ResourceTag/{MANAGED_TAG_KEY}": "true"}},
         },
         {
             # Non-escalating role/profile management (no boundary condition
             # needed: none of these can widen the role's permissions).
             #
-            # NB: iam:TagRole is NOT here — it is boundary-gated in its OWN
-            # statement below (IamTagRoleWithBoundary). Leaving it unconditioned
-            # here would DEFEAT the aws:ResourceTag gate on PutRolePolicy/PassRole:
+            # NB: iam:TagRole is NOT here — it is tag-gated in the merged
+            # IamPutRolePolicyAndTagRoleOnManaged statement above. Leaving it
+            # unconditioned here would DEFEAT the aws:ResourceTag gate on
+            # PutRolePolicy:
             # a leaked launcher credential could TAG a pre-existing, out-of-band,
             # unbounded kirocrew-ec2-* role as kirocrew:managed=true, then inline
             # admin + pass it to EC2. The tag is only non-spoofable if the same
@@ -553,45 +572,10 @@ def policy_document() -> dict[str, Any]:
                 "iam:RemoveRoleFromInstanceProfile",
             ],
             "Resource": [
-                f"arn:aws:iam::*:role/{ROLE_NAME_PREFIX}*",
+                INSTANCE_ROLE_ARN,
+                LEGACY_ROLE_ARN,
                 f"arn:aws:iam::*:instance-profile/{ROLE_NAME_PREFIX}*",
             ],
-        },
-        {
-            # iam:TagRole is REQUIRED because CloudFormation's CreateRole passes the
-            # role's Tags inline (the template's InstanceRole.Tags), and AWS
-            # authorizes that inline tagging as iam:TagRole (see AWS docs
-            # id_tags_roles.html) — without it the boundary-gated CreateRole fails
-            # 403 and the launch can't tag the role kirocrew:managed=true (which the
-            # PutRolePolicy/PassRole gate then requires). But leaving it
-            # unconditioned would DEFEAT that downstream tag gate: a leaked launcher
-            # credential could tag a pre-existing, out-of-band, UNBOUNDED
-            # kirocrew-ec2-* role kirocrew:managed=true, then inline admin + pass it
-            # to EC2 (the tag is only non-spoofable if the same policy can't apply
-            # it to an arbitrary role).
-            #
-            # Gate: aws:ResourceTag/kirocrew:managed=true — the role must ALREADY be
-            # tagged managed. This is the non-spoofable distinguisher, proven live
-            # with a least-privilege assumed-role principal:
-            #   * (a) A boundary-gated CreateRole WITH inline Tags is ALLOWED: at
-            #     CreateRole, AWS evaluates the embedded TagRole authorization with
-            #     aws:ResourceTag reflecting the tags BEING applied, so the
-            #     kirocrew:managed=true tag is already "present" in context → match.
-            #   * (b) A STANDALONE tag-role on a pre-existing unbounded victim
-            #     (which does NOT yet carry kirocrew:managed) is DENIED — the key is
-            #     absent/mismatched → no match. So the launcher can tag roles it is
-            #     creating (which already carry the tag) but CANNOT add the managed
-            #     tag to a role that lacks it.
-            # NB: we do NOT use iam:PermissionsBoundary here — validated live that
-            # AWS does NOT propagate that key into the CreateRole-embedded TagRole
-            # check (it DENIED case (a)); aws:ResourceTag is the key that works.
-            # This closes the full chain: TagRole(victim) is denied, so
-            # PutRolePolicy/PassRole never get their tag precondition either.
-            "Sid": "IamTagRoleOnManaged",
-            "Effect": "Allow",
-            "Action": ["iam:TagRole"],
-            "Resource": f"arn:aws:iam::*:role/{ROLE_NAME_PREFIX}*",
-            "Condition": {"StringEquals": {f"aws:ResourceTag/{MANAGED_TAG_KEY}": "true"}},
         },
         {
             # The SHARED, IMMUTABLE instance permissions boundary. The launcher
@@ -623,8 +607,11 @@ def policy_document() -> dict[str, Any]:
             # mismatch, so a permissive boundary seeded at this name is refused
             # (it can never under-cap a role), it can only block launches (a DoS).
             # Operators who want to eliminate even that pre-create the boundary as an
-            # admin (kirocrew cloud iam-boundary) and drop this statement — the
-            # launcher then only *references* the boundary ARN.
+            # admin (kirocrew cloud iam-boundary) and remove the iam:CreatePolicy
+            # action from this statement — the launcher then only *references* the
+            # boundary ARN. The statement itself stays: its two read verbs are what
+            # every launch uses to verify the boundary before reusing it, so a
+            # launcher without them cannot launch at all.
             "Sid": "IamInstanceBoundaryCreateOnce",
             "Effect": "Allow",
             "Action": [
@@ -657,7 +644,7 @@ def policy_document() -> dict[str, Any]:
                 "iam:AttachRolePolicy",
                 "iam:DetachRolePolicy",
             ],
-            "Resource": f"arn:aws:iam::*:role/{ROLE_NAME_PREFIX}*",
+            "Resource": [INSTANCE_ROLE_ARN, LEGACY_ROLE_ARN],
             "Condition": {
                 "ArnEquals": {
                     "iam:PolicyARN": "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
@@ -665,44 +652,32 @@ def policy_document() -> dict[str, Any]:
             },
         },
         {
-            # PassRole is scoped to the kirocrew-ec2-* role ARN, gated on the EC2
-            # service (iam:PassedToService) AND on our creation tag
-            # (aws:ResourceTag/kirocrew:managed=true) — the same non-spoofable
-            # constraint as PutRolePolicy. Without the tag, a leaked launcher
-            # credential could pass a PRE-EXISTING, unbounded kirocrew-ec2-* role
-            # (created out-of-band by a third party) to EC2. Only a role WE
-            # created (boundary-gated CreateRole, tagged atomically) matches, so
-            # the role EC2 receives is always boundary-capped. Both StringEquals
-            # conditions must hold. (Validated live + policy simulator.)
+            # PassRole is scoped to roles under ROLE_PATH and to the EC2 service
+            # (iam:PassedToService). AWS documents that aws:ResourceTag does not
+            # give reliable results for iam:PassRole, and with that key (or
+            # iam:AssociatedResourceArn) as a condition CloudFormation's
+            # RunInstances is denied at the Instance resource. The path does the
+            # job the tag was meant to do: the launcher's only way to put a role
+            # there is the boundary-gated CreateRole, so a pre-existing root-path
+            # kirocrew-ec2-* role cannot be passed. The legacy root pattern is
+            # deliberately NOT here.
             "Sid": "IamPassRoleToEc2",
             "Effect": "Allow",
             "Action": ["iam:PassRole"],
-            "Resource": f"arn:aws:iam::*:role/{ROLE_NAME_PREFIX}*",
+            "Resource": INSTANCE_ROLE_ARN,
             "Condition": {
-                "StringEquals": {
-                    "iam:PassedToService": "ec2.amazonaws.com",
-                    f"aws:ResourceTag/{MANAGED_TAG_KEY}": "true",
-                },
-                # iam:AssociatedResourceArn fully satisfies the confused-deputy
-                # rule (CWE-269): the passed role may only be associated with an
-                # EC2 instance (not, e.g., re-passed to another resource type),
-                # complementing iam:PassedToService. Wildcard account/region so
-                # one printed policy works everywhere; ArnLike because it is an
-                # ARN pattern.
-                "ArnLike": {
-                    "iam:AssociatedResourceArn": "arn:aws:ec2:*:*:instance/*",
-                },
+                "StringEquals": {"iam:PassedToService": "ec2.amazonaws.com"},
             },
         },
         {
             # The sensitive verbs — StartSession (interactive shell / tunnel)
-            # and SendCommand (effectively RCE) — are gated to KiroCrew-tagged
-            # INSTANCES so a leaked launcher credential can't open sessions or
-            # run commands on every SSM-managed box in the account (mirrors
-            # Ec2LifecycleTagged). The tag condition is on the instance resource
-            # only: SSM documents don't carry our tag, so gating them too would
-            # (per-resource evaluation) deny the whole call — the documents are
-            # allowed unconditioned in the statement below.
+            # and SendCommand (effectively RCE) — are gated to instances tagged by
+            # Kiro Crew so a leaked launcher credential can't open sessions or
+            # run commands on every SSM-managed box in the account (mirrors the
+            # tag gate on Ec2ManagedResourceMutateTagged). The tag condition is on
+            # the instance resource only: SSM documents don't carry our tag, so
+            # gating them too would (per-resource evaluation) deny the whole call —
+            # the documents are allowed unconditioned in the statement below.
             "Sid": "SsmSessionOnManagedInstances",
             "Effect": "Allow",
             "Action": [
@@ -849,7 +824,7 @@ def policy_document() -> dict[str, Any]:
             # token is already TTL-short and loopback-only; this shrinks the
             # discovery path further). The agent chokepoint additionally denies
             # GetCommandInvocation from an agent session (see cloud.aws).
-            "Sid": "SsmSessionControlAndRead",
+            "Sid": "SsmStatusRead",
             "Effect": "Allow",
             "Action": [
                 "ssm:DescribeInstanceInformation",
@@ -860,7 +835,7 @@ def policy_document() -> dict[str, Any]:
             "Resource": "*",
         },
         {
-            "Sid": "SsmAmiParameter",
+            "Sid": "SsmAmi",
             "Effect": "Allow",
             "Action": ["ssm:GetParameter", "ssm:GetParameters"],
             "Resource": "arn:aws:ssm:*::parameter/aws/service/*",
@@ -888,6 +863,37 @@ def policy_document() -> dict[str, Any]:
             "Sid": "Identity",
             "Effect": "Allow",
             "Action": ["sts:GetCallerIdentity"],
+            "Resource": "*",
+        },
+        {
+            # ec2:Describe* includes DescribeInstanceAttribute, which returns an
+            # instance's user data, and user data often holds bootstrap secrets.
+            # CloudFormation's Instance handler reads the attribute of the
+            # instance it manages, which carries kirocrew:managed=true, so only
+            # reads of every OTHER instance are denied. An explicit Deny cannot
+            # be undone by a later Allow.
+            "Sid": "DenyForeignUserData",
+            "Effect": "Deny",
+            "Action": ["ec2:DescribeInstanceAttribute"],
+            "Resource": "*",
+            "Condition": {"StringNotEquals": {f"aws:ResourceTag/{MANAGED_TAG_KEY}": "true"}},
+        },
+        {
+            # The other ec2:Describe* calls that return secrets: launch-template
+            # and Spot launch specifications carry user data, VPN connections
+            # carry the pre-shared keys, and DescribeTags lists free-text tag
+            # values of every resource in the account. The template and the
+            # CLI use none of them (instance discovery goes through
+            # tag:GetResources and DescribeInstances), so they are denied
+            # outright.
+            "Sid": "DenySecretReads",
+            "Effect": "Deny",
+            "Action": [
+                "ec2:DescribeLaunchTemplateVersions",
+                "ec2:DescribeSpot*Requests",
+                "ec2:DescribeTags",
+                "ec2:DescribeVpnConnections",
+            ],
             "Resource": "*",
         },
     ]

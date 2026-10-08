@@ -77,8 +77,12 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator, NamedTuple
 
+from kiro_crew.atomic_write import atomic_write, fsync_dir
 from kiro_crew.config.paths import data_home
+from kiro_crew.constants import env_file_display
 from kiro_crew.platform_compat import (
+    IS_WINDOWS,
+    make_owner_only_dir,
     release_lock,
     strip_extended_length_prefix,
     try_acquire_lock,
@@ -109,11 +113,13 @@ _ENTRY_SRC = "gateway"
 #: the entry is still owed and counted by the writer rather than lost.
 _APPEND_FLUSH_SECONDS = 5.0
 
-#: Slots whose ledger fold is kept between reads. Bounded by COUNT: each
-#: checkpoint is a bounded record, so what needs a ceiling is how many are
-#: retained. Insertion-ordered, so the oldest is the one evicted.
-_FOLD_CACHE_SLOTS = 64
-_fold_cache: "dict[tuple[str, str], tuple[tuple[str, ...], tuple[int, ...], Any]]" = {}
+#: How many times :func:`_unit_last_seq` opens a unit's log that refused to open, and
+#: how long it waits between opens: about half a second in all, the window
+#: ``atomic_write`` budgets for the same Windows hold -- an indexer or scanner handle on
+#: a file that was just written. A heuristic shared with that one, not a measured
+#: hold-time distribution.
+_SEQ_READ_ATTEMPTS = 10
+_SEQ_READ_BACKOFF_SECS = 0.05
 
 #: Whether each slot's LAST append reached disk before its call answered. Read by
 #: the record route so a caller is told, rather than being handed a 200 that
@@ -249,6 +255,15 @@ _MAX_EXCLUDED_BYTES = _MAX_EXCLUDED_UNITS * (_MAX_UNIT_ID_BYTES + 1)
 #: correction, a manual set -- makes a newer unit sort before an older one, which
 #: applies a retired session's goal and phase over a later one's.
 _UNIT_ORDER_FILE = "unit-order"
+#: Work records need a separate causal order. Sharing the ledger's order would let
+#: a later ledger-only append move a unit whose work update is stale past the unit
+#: holding the newest work update.
+_WORK_UNIT_ORDER_FILE = "work-unit-order"
+#: Panel publishes need a third, for the same reason work records do: sharing either
+#: order would let an append that is not a publish move a unit whose newest PANEL is
+#: older past the unit holding the newest one, and the panel fold takes the newest
+#: entry whole.
+_PANEL_UNIT_ORDER_FILE = "panel-unit-order"
 #: How many of a slot's units the order log keeps, newest kept. A slot gains one
 #: per reset, so this is generous. Past it the oldest recorded ids drop out and
 #: those units fold with the never-recorded ones, which the fold applies BEFORE
@@ -393,7 +408,9 @@ def _control_file(slot_key: str, name: str, *, create: bool = False) -> Path:
     """
     directory = control_dir(slot_key)
     if create:
-        directory.mkdir(parents=True, exist_ok=True)
+        # Owner-only at the DIRECTORY, so every control file and every temp a rewrite
+        # stages inside it is covered without each writer choosing a mode.
+        make_owner_only_dir(directory)
     return directory / name
 
 
@@ -562,7 +579,9 @@ def _projection() -> Any:
     return projection
 
 
-def crew_log_units(slot_key: str, live_session_id: str = "", alias: str = "") -> tuple[str, ...]:
+def crew_log_units(
+    slot_key: str, live_session_id: str = "", alias: str = "", *, strict: bool = False
+) -> tuple[str, ...]:
     """Every crew log holding *slot_key*'s ledger entries, oldest unit first.
 
     *slot_key* is the CANONICAL spelling — the one a unit header records — and *alias*
@@ -573,13 +592,34 @@ def crew_log_units(slot_key: str, live_session_id: str = "", alias: str = "") ->
     crew log is switched off. Every failure to LIST them answers the same way,
     because this runs on the read path of a loop cycle and a listing that cannot be
     made must not raise into one.
+
+    *strict* is for a caller that decides an OBLIGATION from the listing rather than
+    reading from it. For a reader, an unlistable slot and a slot with no units are
+    the same empty record; for a caller asking "is there a unit a later fact must go
+    into", they are opposite answers, and the empty one reports an obligation
+    discharged that was never looked for. ``strict`` raises instead, and is carried
+    DOWN to both store lookups -- the canonical spelling's and the alias's -- because
+    the scan that can fail is theirs: a flag that only re-raised from this function's
+    own ``except`` would never fire, since the store swallows its own scan failure
+    and answers empty before anything here sees it.
+
+    A session root that does not EXIST is not a failure under ``strict`` either. A
+    store nothing has written yet holds no unit for any slot, which is the same
+    answer a reader gets, and raising there would make every dismissal on a fresh
+    install retryable forever. Only a root that exists and could not be read, or a
+    unit that cannot be proved while holding entries, is the indeterminate case.
+
+    One link of this chain is deliberately NOT strict-gated: ``_recorded_unit_order``
+    answers ``()`` when its own file cannot be read, which reorders the units and
+    cannot drop one. The caller that matters here searches all of them, so an
+    unknown order cannot turn a unit that holds a row into "no unit holds it".
     """
     if not slot_key:
         return ()
     try:
         from kiro_crew.crew_log.store import session_units_for_slot
 
-        units = session_units_for_slot(slot_key)
+        units = session_units_for_slot(slot_key, strict=strict)
         if alias and alias != slot_key:
             # The caller's own spelling is joined BESIDE the canonical one, so a record
             # written under it keeps reading. Its units come FIRST: the canonical ones
@@ -588,7 +628,12 @@ def crew_log_units(slot_key: str, live_session_id: str = "", alias: str = "") ->
             # exclusion list and one order log however a caller spells its key.
             seen = set(units)
             units = (
-                tuple(unit for unit in session_units_for_slot(alias) if unit not in seen) + units
+                tuple(
+                    unit
+                    for unit in session_units_for_slot(alias, strict=strict)
+                    if unit not in seen
+                )
+                + units
             )
         excluded = _excluded_units(slot_key)
         if excluded:
@@ -615,12 +660,24 @@ def crew_log_units(slot_key: str, live_session_id: str = "", alias: str = "") ->
             # be wrong about which unit that is, because its caller is inside it.
             units = tuple(u for u in units if u != live_session_id) + (live_session_id,)
         return units
+    except FileNotFoundError:
+        # The session root has never been created, so no slot has a unit and this is
+        # not indeterminate: it is the same empty answer a reader gets, and the only
+        # one a store nothing has written can give. Raising here under ``strict``
+        # would make every dismissal on a fresh install permanently retryable.
+        return ()
     except Exception:
         # FAIL CLOSED to no units, which reads as the empty record. An exclusion list
         # that cannot be read is the case this matters for: answering with the units
         # anyway would serve a deleted conversation's state to whoever holds the slot
         # key now, and nothing later takes that back, while an empty record is
         # recovered by the next read that can see the list.
+        #
+        # A ``strict`` caller is not reading, it is deciding whether a later fact has
+        # a unit to go into, and the empty answer would tell it there is none -- so it
+        # gets the failure and can report a retryable outcome instead.
+        if strict:
+            raise
         logger.warning("ledger: could not list the crew logs for this slot", exc_info=True)
         return ()
 
@@ -634,113 +691,96 @@ def _fold_checkpoint(slot_key: str, units: "tuple[str, ...]") -> Any:
     the record on every wake would re-walk its whole history each time, which is the
     one cost the stored document did not have.
 
-    So the checkpoint is kept in memory per slot and ADVANCED over the entries that
-    arrived since, using the same seq-anchored machinery a cold fold uses -- the
-    resumed answer and the from-scratch answer come out of one implementation, which
-    is the property ``projection`` pins.
+    The incremental fold belongs to the crew log and is shared with every other
+    slot-keyed reader (:func:`kiro_crew.crew_log.projection.fold_slot_warm`): it keeps
+    this fold's cell in memory per slot, continues it over the entries that arrived
+    since, and refolds cold for every shape that cannot be carried -- a different unit
+    list, a unit whose log was removed and recreated, an earlier unit that grew, a seq
+    that went backwards. ONE implementation rather than one per consumer, because each
+    of these readers has to enforce the same rules and a rule missing from one of them
+    is a wrong record rather than a slow one.
 
-    Three things force a cold rebuild, and each would otherwise be a wrong answer
-    rather than a slow one: a different unit list (the slot started another ACP
-    session), a newest unit whose seq went BACKWARDS (its log was removed and
-    recreated, so the seqs describe different bytes), and nothing cached at all.
-    Only the newest unit can grow -- an earlier unit's session is over -- so
-    advancing reads just its tail.
-
-    In memory rather than on disk on purpose: the reader that pays this cost is the
-    gateway's own loop, one process, and a durable checkpoint is a store of its own
-    with its own invalidation rules. A second process simply folds cold.
+    The cell is in memory, and the fold it holds is ALSO on disk beside the newest
+    unit's log, so a second process -- and this one after a cache eviction -- resumes
+    over the entries appended since instead of re-walking the history. Measured on a
+    644 MB log: 70.2 s to fold cold against 11.6 s to resume. The file is the crew log's
+    (``crew_log.checkpoint``'s slot section) and every condition that retires one is
+    stated there; a missing, stale or unreadable savepoint folds cold, which is this
+    read's own answer to doubt and reaches the same record at more cost.
     """
-    projection = _projection()
-    # The DATA HOME is part of the identity, not just the slot. One process serves
-    # more than one home -- a pod, a test, a gateway restarted in place -- and a slot
-    # key plus an ACP session id are not unique across them, so keying on the slot
-    # alone lets one home's checkpoint answer another home's read. The store's own
-    # scan fingerprint takes the same precaution for the same reason.
-    cache_key = (str(data_home()), slot_key)
-    cached = _fold_cache.get(cache_key)
-    # EVERY unit's seq, not only the newest one's. An older unit is not closed to
-    # writes: a forced reset tears a session down while a turn is still running, and
-    # that turn goes on appending through the handle it already holds, so an earlier
-    # unit can still grow. Keying growth on the newest unit alone would leave those
-    # entries permanently outside the record -- the unit list is unchanged and the
-    # newest seq is unchanged, so nothing would ever invalidate the checkpoint.
-    seqs = tuple(_unit_last_seq(unit) for unit in units)
-    if cached is not None and cached[0] == units and cached[1] != seqs:
-        # Only the newest unit grew, and only forward: that is the one shape the
-        # checkpoint can be continued over, because its state was folded through
-        # every earlier unit already. Anything else -- an earlier unit that grew, or
-        # any unit whose seq went BACKWARDS because its log was removed and
-        # recreated -- describes different bytes and folds cold.
-        continuable = (
-            len(seqs) == len(cached[1])
-            and seqs[:-1] == cached[1][:-1]
-            and bool(seqs)
-            and seqs[-1] > cached[1][-1]
-        )
-        if continuable:
-            handle = projection.open_session_log(units[-1])
-            if handle is not None:
-                grown = projection.advance(
-                    cached[2],
-                    handle.iter_from(cached[1][-1] + 1, known=projection.KNOWN_TYPES),
-                )
-                # The SAME guard the cold path applies below, and for the same reason:
-                # ``seqs`` was sampled before ``iter_from`` ran, so an append landing
-                # during it is folded into ``grown`` but not into that sample. Caching
-                # the pair would claim "state through N+1, seqs through N", and the next
-                # read would see the seq move, judge itself continuable, and advance from
-                # an entry already folded -- which ``advance`` refuses as at-or-below the
-                # checkpoint, surfacing as an EMPTY record rather than an error. An active
-                # session appending while its own record is read is the ordinary case
-                # here, not a rare one.
-                if tuple(_unit_last_seq(unit) for unit in units) == seqs:
-                    _remember_fold(cache_key, units, seqs, grown)
-                return grown
-    elif cached is not None and cached[0] == units:
-        return cached[2]
-    checkpoint = projection.fold_slot_checkpoint(_FOLD_NAME, units)
-    # Cache only a snapshot the fold AGREES with. ``seqs`` was sampled before the
-    # fold, and an append landing while it ran is folded into the checkpoint but not
-    # into that sample -- so the pair would say "state through N+1, seqs through N",
-    # and the next read would advance from a seq already folded. ``advance`` refuses
-    # that entry as at-or-below the checkpoint, which surfaces as an empty record
-    # rather than as an error. Re-sampling and comparing is the whole guard: unequal
-    # means this answer is correct but not cacheable, so it is returned uncached and
-    # the next read folds cold.
-    if tuple(_unit_last_seq(unit) for unit in units) == seqs:
-        _remember_fold(cache_key, units, seqs, checkpoint)
-    return checkpoint
+    return _projection().fold_slot_warm(_FOLD_NAME, units, slot=slot_key)
 
 
-def _unit_last_seq(unit_id: str) -> int:
-    """The newest seq in *unit_id*'s log as the file itself reports it, or 0."""
-    try:
-        handle = _projection().open_session_log(unit_id)
-    except Exception:
-        return 0
-    if handle is None:
-        return 0
-    # ``last_seq`` on a freshly opened handle is read off the file's tail, which is
-    # what makes it usable as a growth signal for a reader that never appends.
-    return int(getattr(handle, "last_seq", 0) or 0)
+def _unit_last_seq(unit_id: str) -> int | None:
+    """The newest seq in *unit_id*'s log as the file itself reports it.
 
+    0 when the unit has no log, and ``None`` when its log could not be READ. The two
+    are kept apart because a growth check needs opposite answers from them. A unit
+    with no log has written nothing, so 0 is a fact about it. A log that refused to
+    open says nothing about how far it has grown, and reading that as 0 makes the
+    check wrong both ways: sampled after an append it reads as "did not grow", so a
+    landed update is reported lost and its unit's precedence is never published;
+    sampled before one it reads as "was empty", so the entries already there count as
+    this append landing.
 
-def _remember_fold(
-    cache_key: "tuple[str, str]",
-    units: "tuple[str, ...]",
-    seqs: "tuple[int, ...]",
-    checkpoint: Any,
-) -> None:
-    """Cache *checkpoint* under *cache_key* (data home + slot), keeping it bounded.
-
-    Replaced whole per slot, and capped by count: a gateway sees many slots over its
-    life and each checkpoint is a bounded record, so the ceiling is on how many are
-    retained. The oldest entry goes first; an evicted slot folds cold on its next
-    read, which costs time and never correctness.
+    A refusal that clears on its own (:func:`_clears_on_its_own`) is retried first,
+    because Windows refuses an open for as long as another handle -- an indexer, a
+    scanner -- holds the file in a way that excludes it, and that window is short.
+    Bounded by a COUNT rather than by a clock, so one sequence of refusals gets one
+    answer on every host. Any other failure answers ``None`` at once.
     """
-    _fold_cache[cache_key] = (units, seqs, checkpoint)
-    while len(_fold_cache) > _FOLD_CACHE_SLOTS:
-        _fold_cache.pop(next(iter(_fold_cache)))
+    failure = ""
+    attempts = 0
+    while attempts < _SEQ_READ_ATTEMPTS:
+        if attempts:
+            time.sleep(_SEQ_READ_BACKOFF_SECS)
+        attempts += 1
+        try:
+            handle = _projection().open_session_log(unit_id)
+        except Exception as exc:
+            # Kept as TEXT, never as the exception: its traceback would hold this frame
+            # and its callers', and a crew log handle bound in any of them with it.
+            failure = f"{type(exc).__name__}: {exc}"
+            if _clears_on_its_own(exc):
+                continue
+            break
+        if handle is None:
+            return 0
+        # ``last_seq`` on a freshly opened handle is read off the file's tail, which is
+        # what makes it usable as a growth signal for a reader that never appends.
+        return int(getattr(handle, "last_seq", 0) or 0)
+    logger.warning(
+        "ledger: could not read this unit's crew log (%d attempt(s)): %s", attempts, failure
+    )
+    return None
+
+
+def _clears_on_its_own(exc: Exception) -> bool:
+    """Whether an open that raised *exc* is worth trying again.
+
+    ``FileNotFoundError`` is the unit's newest segment vanishing between being listed
+    and its tail being read -- a replace, a prune -- and the next listing finds it or
+    finds it gone, on every platform. (A header segment that vanishes reads as a
+    damaged header instead, which is not retried and fails closed.) ``PermissionError``
+    is a sharing or lock violation only on Windows; on POSIX it is a real access fault
+    that no retry clears, so it answers at once, the split ``atomic_write`` makes for
+    the same error. Nothing else is retried: the store lock's own refusal is a plain
+    ``OSError`` raised after its ceiling, on a holder that is stuck, so a retry would
+    only wait that ceiling out again, and a damaged header reads the same every time.
+    """
+    if isinstance(exc, FileNotFoundError):
+        return True
+    return IS_WINDOWS and isinstance(exc, PermissionError)
+
+
+def _grew(seq_before: int | None, seq_after: int | None) -> bool:
+    """Whether two samples of one unit's newest seq PROVE its log grew between them.
+
+    An unreadable sample proves nothing, so it never counts as growth. That is the
+    fail-closed side: everything this gates -- a durable acknowledgement, a published
+    precedence, a committed carry -- is a claim that something landed.
+    """
+    return seq_before is not None and seq_after is not None and seq_after > seq_before
 
 
 def read_state(slot_key: str, live_session_id: str = "") -> dict[str, Any]:
@@ -789,10 +829,10 @@ def read_state(slot_key: str, live_session_id: str = "") -> dict[str, Any]:
         value = _projection().projection_of(base).value
     except Exception:
         logger.warning("ledger: folding this slot's crew logs failed", exc_info=True)
-        # The cached checkpoint is not trusted after a failed advance: the failure
-        # may have been a log this build cannot read, and a half-advanced state must
-        # not become the answer to the next read.
-        _fold_cache.pop((str(data_home()), canonical), None)
+        # The warm cell is not trusted after a failed fold: the failure may have been a
+        # log this build cannot read, and a half-folded state must not become the answer
+        # to the next read. Dropping it costs the next read a cold fold.
+        _projection().forget_slot_folds(canonical, _FOLD_NAME)
         # NOT previewed here. A refused fold means a reader older than the writer, so
         # the log may hold entries newer than the document -- answering with the
         # document would assert something about a log this build could not read.
@@ -960,7 +1000,10 @@ def record_update(
     # nothing was written HERE, whatever the counter says. Both are required, so the
     # remaining false positive needs a concurrent append into the SAME unit -- the
     # same conversation writing twice at once -- rather than any session anywhere.
-    landed = _unit_last_seq(session_id) > seq_before
+    # A sample that could not be read proves nothing either way, so it is NOT landed.
+    seq_after = _unit_last_seq(session_id)
+    landed = _grew(seq_before, seq_after)
+    unread = seq_before is None or seq_after is None
     durable = drained and landed and crew_log_emit.dropped_writes() == refused_before
     # PUBLISH PRECEDENCE ONLY ONCE THIS UNIT'S LOG HAS ACTUALLY GROWN. This call must
     # stay AFTER ``landed`` is computed, and the order is load-bearing rather than
@@ -977,15 +1020,29 @@ def record_update(
     # PROCESS-WIDE, so a concurrent session's refusal would suppress a precedence
     # note this unit had genuinely earned. ``landed`` is exactly the fact the file
     # asserts: this unit's own newest seq moved.
+    #
+    # A log that could not be read on either side leaves the move unproved, and the
+    # note is withheld then too: it is a claim that this unit recorded, and an unproved
+    # claim is not made. A missing note is also the state a crash between an entry and
+    # its note already leaves, which this unit's next proved record corrects.
     if landed:
         _note_unit_order(slot_key, session_id)
+    if unread:
+        logger.warning(
+            "ledger: this unit's crew log could not be read %s the append, so the update "
+            "is not proved to have landed; it is reported not durable and this unit's "
+            "precedence is not published",
+            " and ".join(
+                side for side, seq in (("before", seq_before), ("after", seq_after)) if seq is None
+            ),
+        )
     if not drained:
         logger.warning(
             "ledger: the crew log writer did not drain within %.1fs; this update is "
             "queued and counted, not yet durable",
             _APPEND_FLUSH_SECONDS,
         )
-    elif not durable:
+    elif not durable and not unread:
         logger.warning(
             "ledger: the crew log refused an append while this update was in flight; "
             "the update may not have landed and the next one supersedes it"
@@ -1195,16 +1252,17 @@ def _carry_legacy_forward(slot_key: str, session_id: str) -> bool:
     # checks it: a process-wide refusal counter cannot say whether this append landed,
     # and committing the claim on a weaker signal marks the document consumed when it
     # was not carried.
-    landed = _unit_last_seq(session_id) > seq_before
+    seq_after = _unit_last_seq(session_id)
+    landed = _grew(seq_before, seq_after)
     if not drained or not landed or crew_log_emit.dropped_writes() != refused_before:
         # The carry is owed rather than lost, but this call must not go on to fold a
         # base that is missing it and then write an update over the gap: that would
         # order the update ahead of the state it is meant to extend. Refusing sends
         # the caller back.
-        if drained and not landed:
-            # PROVED it can never land: the queue emptied and this unit's own seq did
-            # not move, so nothing of this carry is still in flight. RELEASING is what
-            # lets the retry carry at once.
+        if drained and not landed and seq_before is not None and seq_after is not None:
+            # PROVED it can never land: the queue emptied and this unit's own seq, read
+            # both times, did not move, so nothing of this carry is still in flight.
+            # RELEASING is what lets the retry carry at once.
             _finish_carry(slot_key, landed=False)
         # Otherwise the append may still be QUEUED -- a flush that ran out of budget
         # leaves work behind, and the process-wide refusal counter cannot say whose
@@ -1216,6 +1274,11 @@ def _carry_legacy_forward(slot_key: str, session_id: str) -> bool:
         # goes stale after _CARRY_STALE_SECS and a take-over carries, which is safe for
         # that same reason. A refusal bounded by the staleness window is the cheaper
         # side of the trade against history that cannot be repaired.
+        #
+        # A seq that could not be READ is held the same way, since it proves neither
+        # side: the carry may have landed in the very log that would not open, and a
+        # retry whose fold cannot read that log either may see an empty record and
+        # carry again.
         raise LedgerUnavailable(
             "this slot's earlier ledger state is still being carried into its crew log; "
             "try the update again"
@@ -1254,7 +1317,9 @@ class SlotExclusion(NamedTuple):
     carry_tombstoned: bool
 
 
-def exclude_units(slot_key: str, unit_ids: "tuple[str, ...]") -> SlotExclusion:
+def exclude_units(
+    slot_key: str, unit_ids: "tuple[str, ...]", *, refusable: bool = True
+) -> SlotExclusion:
     """Record that *unit_ids* must never again be folded into *slot_key*'s record.
 
     Returns what this call recorded -- see :class:`SlotExclusion`. A delete with NO
@@ -1295,6 +1360,11 @@ def exclude_units(slot_key: str, unit_ids: "tuple[str, ...]") -> SlotExclusion:
     its transcript on the strength of an exclusion this call was about to withdraw --
     resurrecting the state that delete removed. From inside the hold no other delete can
     observe the intermediate state, so there is no reliance to break.
+
+    *refusable* is False for a caller already past the transcript's unlink, which has
+    nothing left to refuse. Its directory sync is then best-effort, because taking the
+    ids back over a failed sync would leave the deleted conversation's unit neither
+    excluded nor removed.
     """
     if not slot_key:
         return SlotExclusion((), False)
@@ -1343,16 +1413,44 @@ def exclude_units(slot_key: str, unit_ids: "tuple[str, ...]") -> SlotExclusion:
             # settle the marker, and UNLINK its transcript on the strength of an
             # exclusion this call is about to take back -- resurrecting the state it
             # deleted. Nobody can observe the intermediate state from in here.
+            tombstoned = False
+            # Whether the take-back may withdraw the marker is decided from what the
+            # marker WAS, not from ``tombstoned``: a commit whose read-back raises has
+            # already renamed the marker into place without ever returning True.
+            committed_before = True
             try:
+                committed_before = _carry_committed(carried)
                 tombstoned = _settle_carry_locked(carried, landed=True)
+                # ONE sync of the control directory for both renames above. The caller
+                # unlinks the transcript next, and a crash that kept that unlink while
+                # losing the exclusion's rename would fold the deleted units into the
+                # next session. A control directory this call created relies on the
+                # filesystem to order its own entry in the parent.
+                fsync_dir(path.parent, best_effort=not refusable)
             except (ValueError, OSError):
                 # ROLLED BACK to the set this transaction FOUND, not by subtracting the
                 # ids it added: inside the hold those are the same thing, and writing
                 # back what was read cannot express anything else. The delete is refused
                 # either way, so a rollback that does not persist is reported rather
                 # than raised over the original failure.
+                took_back = False
+                if not committed_before:
+                    # The tombstone THIS call committed goes too, or a refused delete
+                    # would silence the still-live session's earlier state for good.
+                    try:
+                        took_back = _withdraw_tombstone_locked(carried)
+                    except OSError:
+                        logger.error(
+                            "ledger: could not withdraw slot %r's carry tombstone after "
+                            "the delete was refused; remove %r by hand to restore that "
+                            "session's earlier state",
+                            slot_key,
+                            _CARRIED_FILE,
+                            exc_info=True,
+                        )
                 if added:
                     _rewrite_lines(path, current)
+                    took_back = True
                     if set(added) & set(
                         _read_lines(path, limit=_MAX_EXCLUDED_BYTES, reject_oversized=True)
                     ):
@@ -1363,6 +1461,22 @@ def exclude_units(slot_key: str, unit_ids: "tuple[str, ...]") -> SlotExclusion:
                             slot_key,
                             list(added),
                             _DELETED_UNITS_FILE,
+                        )
+                if took_back:
+                    # The take-back is synced like the writes it undoes: a crash that
+                    # kept their renames and lost this one would leave the live
+                    # session's record excluded with nothing to say so.
+                    try:
+                        fsync_dir(path.parent)
+                    except OSError:
+                        logger.error(
+                            "ledger: could not confirm slot %r's take-back reached disk "
+                            "after the delete was refused; after a crash, check %r and "
+                            "%r by hand",
+                            slot_key,
+                            _DELETED_UNITS_FILE,
+                            _CARRIED_FILE,
+                            exc_info=True,
                         )
                 raise
         return SlotExclusion(added, tombstoned)
@@ -1412,7 +1526,7 @@ def unexclude_units(
     live slot's record reading empty until an operator edits it -- recoverable by hand,
     which the alternative ordering is not. A failed WITHDRAWAL is raised for the same
     reason rather than logged and dropped: the marker standing means the spared
-    session's earlier state is never carried, and only this path ever removes one.
+    session's earlier state is never carried, and a raise is a retryable answer.
     """
     if not slot_key or not (unit_ids or restore_carry):
         return
@@ -1431,19 +1545,20 @@ def unexclude_units(
         # Removing that marker carries the other delete's legacy state into a recycled
         # slot, silently, with nothing left to put it back.
         with _locked(control_dir(slot_key), create=False):
-            kept: "tuple[str, ...]" = ()
-            if path.exists():
-                kept = tuple(
-                    unit
-                    for unit in _read_lines(path, limit=_MAX_EXCLUDED_BYTES, reject_oversized=True)
-                    if unit not in drop
-                )
+            current = _read_lines(path, limit=_MAX_EXCLUDED_BYTES, reject_oversized=True)
+            kept = tuple(unit for unit in current if unit not in drop)
+            changed = kept != current
+            if changed:
                 _rewrite_lines(path, kept)
             if restore_carry and not kept:
                 # NOT ``_finish_carry(landed=False)``: that releases a claim still
                 # reading ``pending`` and deliberately leaves a committed marker alone,
                 # so it would be inert against the very tombstone this is undoing.
-                _withdraw_tombstone_locked(carried)
+                changed = _withdraw_tombstone_locked(carried) or changed
+            if changed:
+                # Best-effort: the rollback has already landed, so a failed sync must
+                # not report a record that folds normally as one that reads empty.
+                fsync_dir(path.parent, best_effort=True)
     except (ValueError, OSError) as exc:
         logger.error(
             "ledger: could NOT roll back slot %r's exclusion of %s after a delete that "
@@ -1687,15 +1802,19 @@ def _finish_carry(slot_key: str, *, landed: bool) -> bool:
     try:
         path = _control_file(slot_key, _CARRIED_FILE)
         with _locked(control_dir(slot_key)):
-            return _settle_carry_locked(path, landed=landed)
+            committed = _settle_carry_locked(path, landed=landed)
+            if committed:
+                # Best-effort: the marker already reads committed, and the non-empty
+                # fold refuses a second carry whether or not this rename survives.
+                fsync_dir(path.parent, best_effort=True)
+            return committed
     except (ValueError, OSError):
         if landed:
-            # NOT swallowed: an absent or pending marker is a CLAIMABLE one, so a
-            # delete that went ahead on it would let the next session on this recycled
-            # slot key carry the deleted conversation's document in. The delete's
-            # caller turns this into a refused delete, mirroring the exclusion write;
-            # the carry path keeps its own tolerance at its own call site, where the
-            # append has already landed and the stale claim is safe to leave.
+            # NOT swallowed: ``False`` already means "committed by another call", so a
+            # commit that did not reach disk has to be told apart from it. The carry
+            # path tolerates the raise at its own call site, where the append has
+            # already landed and the stale claim is safe to leave. A delete settles
+            # inside its own hold through ``_settle_carry_locked`` instead.
             logger.error(
                 "ledger: could NOT commit slot %r's legacy-document marker", slot_key, exc_info=True
             )
@@ -1707,14 +1826,18 @@ def _finish_carry(slot_key: str, *, landed: bool) -> bool:
     return False
 
 
-def _withdraw_tombstone_locked(path: Path) -> None:
+def _withdraw_tombstone_locked(path: Path) -> bool:
     """Remove a COMMITTED carry marker, for a caller ALREADY holding the slot's lock.
 
-    The exact inverse of the tombstone :func:`exclude_units` writes, and the only thing
-    in this module that removes a committed marker: :func:`_finish_carry` refuses to,
-    because a committed marker is normally another call's proof that a carry landed. The
-    caller earns this by having reported writing it and by finding no exclusion left on
-    the slot.
+    Answers whether a marker was removed. The exact inverse of the tombstone
+    :func:`exclude_units` writes, and the only thing in this module that removes a
+    committed marker: :func:`_finish_carry` refuses to, because a committed marker is
+    normally another call's proof that a carry landed. Two callers earn it, in
+    different ways. :func:`unexclude_units` has been told the delete wrote it, and
+    lifts it only when no exclusion is left on the slot. :func:`exclude_units`'s
+    take-back removes a marker it committed in the SAME hold, whatever else is
+    recorded, because that marker is its own write. A ``pending`` claim it overwrote
+    is not put back, the residual the carry restore in :func:`unexclude_units` accepts.
 
     Split out for the same reason :func:`_settle_carry_locked` is: the lock is not
     re-entrant, and the withdrawal has to happen in the SAME hold as the exclusion
@@ -1723,17 +1846,20 @@ def _withdraw_tombstone_locked(path: Path) -> None:
     is undoing -- ``_carry_committed`` answers what the marker SAYS, never whose it is.
 
     RAISES rather than swallowing, because the marker standing means the spared
-    session's earlier goal and phase are never carried, and only this function ever
-    removes a committed marker. Swallowing makes that loss permanent and silent; the
-    caller turns a raise into a retryable answer, which can actually succeed.
+    session's earlier goal and phase are never carried. :func:`unexclude_units` turns
+    the raise into a retryable answer, which can actually succeed. The take-back in
+    :func:`exclude_units` LOGS it instead: that delete is already refused, and its
+    original failure is the one that propagates.
     """
+    if not _carry_committed(path):
+        return False
+    path.unlink(missing_ok=True)
     if _carry_committed(path):
-        path.unlink(missing_ok=True)
-        if _carry_committed(path):
-            raise OSError("the carry tombstone did not withdraw")
+        raise OSError("the carry tombstone did not withdraw")
+    return True
 
 
-def _note_unit_order(slot_key: str, session_id: str) -> None:
+def _note_unit_order(slot_key: str, session_id: str, *, order_file: str = _UNIT_ORDER_FILE) -> None:
     """Record that *session_id* recorded into *slot_key*, and that it recorded LAST.
 
     The fold reads units in this order and applies a later update over an earlier one,
@@ -1764,9 +1890,9 @@ def _note_unit_order(slot_key: str, session_id: str) -> None:
     if not slot_key or not session_id:
         return
     try:
-        path = _control_file(slot_key, _UNIT_ORDER_FILE, create=True)
+        path = _control_file(slot_key, order_file, create=True)
         with _locked(control_dir(slot_key)):
-            known = _recorded_unit_order(slot_key)
+            known = _recorded_unit_order(slot_key, order_file=order_file)
             if known and known[-1] == session_id:
                 return
             if session_id in known:
@@ -1801,23 +1927,92 @@ def _note_unit_order(slot_key: str, session_id: str) -> None:
         logger.warning("ledger: could not record this slot's unit order", exc_info=True)
 
 
-def _rewrite_lines(path: Path, lines: "tuple[str, ...]") -> None:
-    """Replace a control file with *lines*, one per line, atomically.
+def note_work_unit_recorded(slot_key: str, session_id: str) -> None:
+    """Publish that *session_id* just appended a work record under its slot."""
+    _note_unit_order(
+        canonical_slot(slot_key, session_id),
+        session_id,
+        order_file=_WORK_UNIT_ORDER_FILE,
+    )
 
-    A torn rewrite would lose the causal order the fold depends on, so the new content
-    is written beside the file and renamed over it: a reader sees the whole old file
-    or the whole new one.
+
+def work_crew_log_units(slot_key: str) -> tuple[str, ...]:
+    """Work-record units for *slot_key* in causal append order, oldest first.
+
+    Units absent from the bounded order tail predate every retained unit and fold
+    first. Listing failures fail closed because this runs on a loop-cycle read path.
     """
-    tmp = path.with_name(path.name + ".tmp")
-    with tmp.open("w", encoding="utf-8") as fh:
-        for line in lines:
-            fh.write(f"{line}\n")
-        fh.flush()
-        os.fsync(fh.fileno())
-    os.replace(tmp, path)
+    if not slot_key:
+        return ()
+    try:
+        from kiro_crew.crew_log.store import session_units_for_slot
+
+        units = session_units_for_slot(slot_key)
+        recorded = _recorded_unit_order(slot_key, order_file=_WORK_UNIT_ORDER_FILE)
+        if recorded:
+            known = [unit for unit in recorded if unit in units]
+            rest = [unit for unit in units if unit not in recorded]
+            units = tuple(rest + known)
+        return units
+    except Exception:
+        logger.warning("work ledger: could not list this slot's crew logs", exc_info=True)
+        return ()
 
 
-def _recorded_unit_order(slot_key: str) -> "tuple[str, ...]":
+def note_panel_unit_recorded(slot_key: str, session_id: str) -> None:
+    """Publish that *session_id* just appended a panel record under its slot."""
+    _note_unit_order(
+        canonical_slot(slot_key, session_id),
+        session_id,
+        order_file=_PANEL_UNIT_ORDER_FILE,
+    )
+
+
+def panel_crew_log_units(slot_key: str) -> tuple[str, ...]:
+    """Panel units for *slot_key* in causal append order, oldest first.
+
+    Units absent from the bounded order tail predate every retained unit and fold
+    first. Listing failures fail closed, which for the panel costs the history and not
+    the panel: the file is the durable record and the read falls back to it.
+    """
+    if not slot_key:
+        return ()
+    try:
+        from kiro_crew.crew_log.store import session_units_for_slot
+
+        units = session_units_for_slot(slot_key)
+        recorded = _recorded_unit_order(slot_key, order_file=_PANEL_UNIT_ORDER_FILE)
+        if recorded:
+            known = [unit for unit in recorded if unit in units]
+            rest = [unit for unit in units if unit not in recorded]
+            units = tuple(rest + known)
+        return units
+    except Exception:
+        logger.warning("panel: could not list this slot's crew logs", exc_info=True)
+        return ()
+
+
+def _rewrite_lines(path: Path, lines: "tuple[str, ...]") -> None:
+    """Replace a control file with *lines*, one per line, atomically and fsynced.
+
+    A torn rewrite would lose the causal order the fold depends on, so a reader must
+    see the whole old file or the whole new one. The caller holds the slot's lock,
+    and every control-file writer does, so a temp already in the directory is one a
+    killed writer left behind: it is swept here, or every SIGKILL mid-rewrite would
+    leave a uniquely named temp that nothing ever removes.
+
+    The directory is NOT synced here. The callers whose next step depends on the
+    rename surviving a crash sync it once for the whole transaction.
+    """
+    for stale in path.parent.glob("*.tmp"):
+        try:
+            stale.unlink()
+        except OSError:
+            pass
+    atomic_write(path, "".join(f"{line}\n" for line in lines), fsync=True)
+
+
+def _recorded_unit_order(slot_key: str, *, order_file: str = _UNIT_ORDER_FILE) -> "tuple[str, ...]":
     """The units this slot recorded into, oldest first. Empty when there is no log.
 
     DEDUPLICATED, and truncated to the newest :data:`_MAX_ORDERED_UNITS` distinct ids
@@ -1831,7 +2026,7 @@ def _recorded_unit_order(slot_key: str) -> "tuple[str, ...]":
     unboundedly.
     """
     try:
-        path = _control_file(slot_key, _UNIT_ORDER_FILE)
+        path = _control_file(slot_key, order_file)
         if not path.exists():
             return ()
         with path.open("r", encoding="utf-8") as fh:
@@ -1903,7 +2098,9 @@ def _require_crew_log(session_id: str) -> Any:
     if not crew_log_emit.enabled():
         raise LedgerUnavailable(
             "the session ledger is recorded in this session's crew log, which is "
-            f"switched off; set {crew_log_emit.CREW_LOG_ENV}=1 to record one"
+            f"switched off because {crew_log_emit.CREW_LOG_ENV} is set to 0, false, no, off or an "
+            f"unrecognised value; unset it (or remove it from {env_file_display()}) and "
+            "restart the gateway to record one"
         )
     projection = _projection()
     from kiro_crew.crew_log.schema import KIND_SESSION

@@ -59,9 +59,11 @@ def schemas() -> list[dict[str, Any]]:
                 "<mcwidget>) so the user can find, view, and iterate on it later. "
                 "Returns the slug — a stable handle the user (and you) can "
                 "reference in future sessions ('iterate on artifact <slug>'). "
-                "Use this when the user asks to save a widget, when you create "
-                "something worth keeping, or before iterating (use artifact_update "
-                "for the iteration step itself)."
+                "Every <mcwidget> you emit in chat is ALREADY auto-registered as an "
+                "artifact (except in an incognito or temporary session), so do not "
+                "call this on emitted widget content (it makes a duplicate); the "
+                "user's star pins it. Use this for content you never emitted as a "
+                "widget. Iterate with artifact_get + artifact_update."
             ),
             "inputSchema": {
                 "type": "object",
@@ -159,8 +161,9 @@ def schemas() -> list[dict[str, Any]]:
             "description": (
                 "Update an artifact's live state. Each agent edit "
                 "automatically creates a new version (like a git commit) — "
-                "the user can revert to any prior agent iteration via "
-                "artifact_revert. Use after artifact_get when iterating "
+                "the user can revert to any retained version via "
+                "artifact_revert (the newest 50 are kept; see "
+                "artifact_versions). Use after artifact_get when iterating "
                 "on an existing artifact at the user's request."
             ),
             "inputSchema": {
@@ -295,7 +298,10 @@ def schemas() -> list[dict[str, Any]]:
             "description": (
                 "Get all comments on an artifact (local + provider-synced). "
                 "Use to read feedback, review comments, or discussion threads "
-                "on an artifact before addressing them."
+                "on an artifact before addressing them. Pass "
+                "exclude_resolved=true to skip threads that are already "
+                "resolved, so a mid-review read does not hand you back feedback "
+                "you have addressed."
             ),
             "inputSchema": {
                 "type": "object",
@@ -303,6 +309,10 @@ def schemas() -> list[dict[str, Any]]:
                     "slug": {
                         "type": "string",
                         "description": "Artifact slug to get comments for.",
+                    },
+                    "exclude_resolved": {
+                        "type": "boolean",
+                        "description": "Omit threads whose root is resolved (default false).",
                     },
                 },
                 "required": ["slug"],
@@ -419,9 +429,10 @@ def schemas() -> list[dict[str, Any]]:
         {
             "name": "artifact_folder_list",
             "description": (
-                "List the artifact-library folder tree. Returns each folder's id, "
-                "name, parent_id, human path, and direct item_count. Use to "
-                "discover folder ids/paths before moving or organizing artifacts."
+                "List the artifact-library folder tree. Returns one line per "
+                "folder with its id, human path and direct item count, sorted by "
+                "path. Use to discover folder ids/paths before moving or "
+                "organizing artifacts."
             ),
             "inputSchema": {"type": "object", "properties": {}},
         },
@@ -528,7 +539,10 @@ def schemas() -> list[dict[str, Any]]:
                 "Preview a deploy of a webapp artifact or local directory to a "
                 "public URL on the user's AWS account. This tool is PREVIEW-ONLY: "
                 "it returns scan status and deploy details but never executes. "
-                "Final confirmation happens in the dashboard Artifact Deploy page. "
+                "Final confirmation happens in the dashboard on the Artifact "
+                "Deploy page (/deploy) -> Pending confirmations; the Artifacts "
+                "page shows its Artifact Deploy button only when the Artifact "
+                "Deploy Feature Preview is on, and /deploy works either way. "
                 "Restricted-session guard and SEL audit apply identically to the "
                 "HTTP endpoint."
             ),
@@ -542,12 +556,13 @@ def schemas() -> list[dict[str, Any]]:
                     "artifact_slug": {
                         "type": "string",
                         "description": (
-                            "Slug of a static artifact (widget/html/markdown) "
-                            "to deploy — its content is rendered as a page. "
-                            "kind=webapp artifacts are rejected (their content "
-                            "is an app summary, not deployable HTML — deploy "
-                            "the app's built directory via local_dir instead). "
-                            "Mutually exclusive with local_dir."
+                            "Slug of an artifact to deploy. A static artifact "
+                            "(widget/html/markdown) has its content rendered "
+                            "as a page; a kind=webapp artifact deploys its "
+                            "app's static root through the same checks as "
+                            "local_dir (refused with webapp_root_unavailable "
+                            "when that root cannot be resolved). Mutually "
+                            "exclusive with local_dir."
                         ),
                     },
                     "local_dir": {
@@ -937,7 +952,11 @@ def artifact_delete(name: str, args: dict[str, Any]) -> str:
 def artifact_get_comments(name: str, args: dict[str, Any]) -> str:
     args = validate_tool_args(args, ARTIFACT_GET_COMMENTS_SCHEMA)
     slug = args["slug"]
-    d = mcp_core._get(f"/api/artifacts/{slug}/comments")
+    # The default stays the full list: this tool's contract is "read the
+    # comments", and changing what it returns by default would silently shift
+    # every existing agent workflow. Opting in is one flag.
+    qs = "?exclude_resolved=true" if args.get("exclude_resolved") else ""
+    d = mcp_core._get(f"/api/artifacts/{slug}/comments{qs}")
     if d.get("error"):
         return f"Error: {d['error']}"
     comments = d.get("comments", [])
@@ -959,9 +978,16 @@ def artifact_get_comments(name: str, args: dict[str, Any]) -> str:
         # those follow-up tools uncallable from a get_comments result.
         cid = c.get("id")
         id_tag = f" (id={cid})" if cid else ""
+        # The indent alone loses which parent a reply answers once threads
+        # interleave, so name the parent id and the creation time.
+        meta = ""
+        if c.get("parent_id"):
+            meta += f" parent={c['parent_id']}"
+        if c.get("created_at"):
+            meta += f" at={c['created_at']}"
         lines.append(
             f"{indent}{prefix}{c.get('author', '?')}: {comment_body}"
-            f"{anchor} [{c.get('status', 'open')}]{id_tag}"
+            f"{anchor} [{c.get('status', 'open')}]{id_tag}{meta}"
         )
     result_str = f"Comments on `{slug}` ({len(comments)}):\n" + "\n".join(lines)
     # Route verbatim comment egress through the canonical context-aware shim
@@ -1174,7 +1200,18 @@ def deploy_artifact(name: str, args: dict[str, Any]) -> str:
     # carry file content.
     from kiro_crew.deploy.handlers import _redact_text as _deploy_redact
     if d.get("error"):
-        return f"Error: {_deploy_redact(str(d['error']))}"
+        # `error` is now the plain human sentence and `details` carries the stack
+        # and parameter names. Relay BOTH: the LLM is the caller that needs to
+        # read "use ttl_hours=0" to retry correctly, and the banner-friendly
+        # sentence alone would strip exactly that.
+        msg = _deploy_redact(str(d["error"]))
+        extra = _deploy_redact(str(d.get("details", "")))
+        remedy = _deploy_redact(str(d.get("remediation", "")))
+        if extra:
+            msg = f"{msg}\nDetails: {extra}"
+        if remedy:
+            msg = f"{msg}\nCommand: {remedy}"
+        return f"Error: {msg}"
     if d.get("blocked"):
         findings = _deploy_redact(str(d.get("findings", "")))
         if d.get("credential"):
@@ -1201,8 +1238,10 @@ def deploy_artifact(name: str, args: dict[str, Any]) -> str:
             f"Deploy blocked by scan ({d.get('count', '?')} non-credential "
             f"finding(s)):\n{findings}\n\n"
             f"These findings are overridable by a HUMAN: the deploy now "
-            f"appears under \"Pending confirmations\" on the Artifact "
-            f"Deploy page, where the user can review the findings and "
+            f"appears under \"Pending confirmations\" on the dashboard's "
+            f"Artifact Deploy page (/deploy; its button on the Artifacts page "
+            f"needs the Artifact Deploy Feature Preview), where the user can "
+            f"review the findings and "
             f"explicitly deploy anyway (or dismiss).\n"
             f"\nWARNING: Anyone with the published link can view this content. "
             f"It is served on the public internet with no authentication. Relay "
@@ -1236,7 +1275,9 @@ def deploy_artifact(name: str, args: dict[str, Any]) -> str:
         f"It is served on the public internet with no authentication. Relay "
         f"this warning to the user before they confirm.\n"
         f"\nThis deploy now appears under \"Pending confirmations\" on the "
-        f"Artifact Deploy page in the dashboard. Open it to confirm or dismiss."
+        f"dashboard's Artifact Deploy page (/deploy; its button on the "
+        f"Artifacts page needs the Artifact Deploy Feature Preview). Open it "
+        f"there to confirm or dismiss."
     )
 
 

@@ -25,6 +25,7 @@ import errno
 import io
 import logging
 import os
+import stat
 import struct
 import subprocess
 import sys
@@ -405,6 +406,41 @@ class TestWindowsLocking:
                 with pc.file_lock(handle.fileno()):
                     pytest.fail("body must not run without the lock")
 
+    def test_file_lock_not_waiting_reports_a_held_lock_as_blocking(self, monkeypatch, tmp_path):
+        """``wait=False`` must raise BlockingIOError, not the stuck-holder OSError.
+
+        The two refusals mean different things to a caller — "someone holds it
+        right now, come back later" versus "a holder is stuck past the ceiling" —
+        and only the first is safe to retry, so collapsing them would turn a
+        normal contended write into a reported fault.
+        """
+        _fake_windows(monkeypatch)
+        monkeypatch.setattr(pc, "_win_acquire_blocking", lambda *_a, **_k: False)
+        lock = tmp_path / "nowait.lock"
+        lock.write_text("")
+        with open(lock, "r+") as handle:
+            with pytest.raises(BlockingIOError, match="not waiting for it"):
+                with pc.file_lock(handle.fileno(), wait=False):
+                    pytest.fail("body must not run without the lock")
+
+    def test_file_lock_names_the_callers_own_timeout_in_the_refusal(
+        self, monkeypatch, tmp_path
+    ):
+        """An explicit ``timeout`` is the ceiling the refusal must name.
+
+        The message is the only evidence of WHY the critical section was declined,
+        so reporting the 300s default when the caller waited 2.5s would send a
+        reader hunting for a stall that never happened.
+        """
+        _fake_windows(monkeypatch)
+        monkeypatch.setattr(pc, "_win_acquire_blocking", lambda *_a, **_k: False)
+        lock = tmp_path / "timeout.lock"
+        lock.write_text("")
+        with open(lock, "r+") as handle:
+            with pytest.raises(OSError, match=r"limit 2\.5s"):
+                with pc.file_lock(handle.fileno(), timeout=2.5):
+                    pytest.fail("body must not run without the lock")
+
     def test_acquire_lock_fails_closed(self, monkeypatch, tmp_path):
         _fake_windows(monkeypatch)
         monkeypatch.setattr(pc, "_win_acquire_blocking", lambda *_a, **_k: False)
@@ -610,6 +646,18 @@ class TestGetProcessStartId:
         monkeypatch.setattr(pc.sys, "platform", "win32")
         monkeypatch.setattr(pc, "process_start_time", lambda pid: None)
         assert pc.get_process_start_id(5) is None
+
+    def test_a_nonpositive_pid_is_unknown_without_a_platform_read(self, monkeypatch):
+        # pid <= 0 names no process, so the guard answers None before dispatch --
+        # the win32 producer (and every other platform's) is never consulted.
+        monkeypatch.setattr(pc.sys, "platform", "win32")
+
+        def _refuse(_pid):
+            raise AssertionError("get_process_start_id read a non-positive pid")
+
+        monkeypatch.setattr(pc, "process_start_time", _refuse)
+        assert pc.get_process_start_id(0) is None
+        assert pc.get_process_start_id(-1) is None
 
     def test_identity_never_contains_a_colon(self, monkeypatch):
         # Callers embed the value in colon-delimited records.
@@ -976,6 +1024,9 @@ def _exit_code_kernel32(code: int, *, ok: bool = True, terminated: bool = True) 
     return types.SimpleNamespace(
         GetExitCodeProcess=_Fn(_get_exit_code),
         TerminateProcess=_const(terminated),
+        # WAIT_TIMEOUT: the process object is not signalled, so a refused
+        # terminate is read as a refusal of a live process.
+        WaitForSingleObject=_const(0x102),
         CloseHandle=_const(True),
     )
 
@@ -1426,19 +1477,50 @@ class TestRmtreeForce:
         victim = tmp_path / "ro.txt"
         victim.write_text("x")
         victim.chmod(0o444)
-        removed: list[str] = []
-        pc._clear_readonly_and_retry(removed.append, str(victim), OSError("denied"))
-        assert removed == [str(victim)]
+        pc._clear_readonly_and_retry(os.unlink, str(victim), OSError("denied"))
+        assert not victim.exists()
 
     def test_readonly_hook_warns_when_the_retry_also_fails(self, tmp_path, caplog):
-        def _boom(_path: str) -> None:
-            raise OSError("still denied")
-
         victim = tmp_path / "ro.txt"
         victim.write_text("x")
         with caplog.at_level(logging.WARNING, logger=pc.logger.name):
-            pc._clear_readonly_and_retry(_boom, str(victim), OSError("denied"))
+            # rmdir on a file fails again on every platform.
+            pc._clear_readonly_and_retry(os.rmdir, str(victim), OSError("denied"))
         assert any("Cannot remove" in r.getMessage() for r in caplog.records)
+
+    def test_readonly_hook_does_not_retry_a_failed_open_or_listing(self, tmp_path, caplog):
+        # rmtree reports a directory it could not open with func=os.open, which
+        # takes more than a path: a blind retry raised TypeError out of the hook.
+        directory = tmp_path / "locked"
+        directory.mkdir()
+        with caplog.at_level(logging.WARNING, logger=pc.logger.name):
+            for func in (os.open, os.close, os.scandir, os.lstat):
+                pc._clear_readonly_and_retry(func, str(directory), OSError("denied"))
+        assert directory.is_dir()
+        assert sum("Cannot remove" in r.getMessage() for r in caplog.records) == 4
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks and modes")
+    def test_readonly_hook_never_chmods_through_a_link_on_posix(self, tmp_path):
+        # rmtree hands the hook the failing entry's path; an agent-written tree
+        # can make that a symlink to any file this process can reach.
+        victim = tmp_path / "victim"
+        victim.write_text("x")
+        victim.chmod(0o640)
+        link = tmp_path / "link"
+        link.symlink_to(victim)
+
+        # rmdir on a symlink fails, so only the hook's own handling is observed.
+        pc._clear_readonly_and_retry(os.rmdir, str(link), OSError("denied"))
+        assert stat.S_IMODE(victim.stat().st_mode) == 0o640
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX modes")
+    def test_readonly_hook_leaves_a_failed_directory_listable_on_posix(self, tmp_path):
+        directory = tmp_path / "busy"
+        directory.mkdir(mode=0o700)
+        (directory / "held").write_text("x")
+        pc._clear_readonly_and_retry(os.rmdir, str(directory), OSError("not empty"))
+        assert stat.S_IMODE(directory.stat().st_mode) == 0o700
+        assert [p.name for p in directory.iterdir()] == ["held"]
 
 
 class TestLinkHelpers:
@@ -1994,15 +2076,20 @@ class TestProcRss:
         # Sampled a moment apart, so allow drift rather than demanding equality.
         assert abs(measured - vm_rss_kb * 1024) < 4 * 1024 * 1024
 
-    def test_linux_fallback_scales_the_peak_from_kib_to_bytes(self, monkeypatch):
-        # Unit handling is the trap: ru_maxrss is KiB on Linux and bytes on
-        # macOS, with nothing in the value to tell them apart.
+    def test_linux_fallback_scales_the_peak_from_kib_to_bytes(self, monkeypatch, tmp_path):
+        # Unit handling is the trap: the kernel prints VmHWM in kB with nothing
+        # in the value to say so. The Linux peak is the process's OWN VmHWM, not
+        # ru_maxrss, which execve seeds with the parent's peak.
         monkeypatch.setattr(pc, "IS_POSIX", True)
         monkeypatch.setattr(pc.sys, "platform", "linux")
         _fake_resource(
             monkeypatch,
-            getrusage=lambda _who: types.SimpleNamespace(ru_maxrss=2048),
+            getrusage=lambda _who: types.SimpleNamespace(ru_maxrss=999_999_999),
         )
+        status = tmp_path / "status"
+        status.write_text("VmHWM:\t    2048 kB\n", encoding="utf-8")
+        monkeypatch.setattr(pc, "_LINUX_STATUS_PATH", status)
+        monkeypatch.setattr(pc, "_LINUX_PEAK_RSS_FLOOR", 0)
         monkeypatch.setattr(pc, "_linux_current_rss_bytes", lambda: None)
         assert pc.proc_rss_bytes() == 2048 * 1024
 
@@ -2043,12 +2130,13 @@ class TestProcRss:
         monkeypatch.setattr(pc.ctypes, "CDLL", _no_libsystem)
         assert pc.proc_rss_bytes() == 555
 
-    def test_a_total_posix_failure_is_zero(self, monkeypatch):
+    def test_a_total_posix_failure_is_zero(self, monkeypatch, tmp_path):
         def _boom(_who: Any) -> Any:
             raise OSError("no rusage")
 
         monkeypatch.setattr(pc, "IS_POSIX", True)
         _fake_resource(monkeypatch, getrusage=_boom)
+        monkeypatch.setattr(pc, "_LINUX_STATUS_PATH", tmp_path / "no-proc")
         monkeypatch.setattr(pc, "_linux_current_rss_bytes", lambda: None)
         monkeypatch.setattr(pc, "_macos_current_rss_bytes", lambda: None)
         assert pc.proc_rss_bytes() == 0
@@ -2104,13 +2192,19 @@ class TestMachTaskBasicInfoLayout:
 class TestProcPeakRss:
     """The peak is still reported, but as its own clearly-named reading."""
 
-    def test_posix_scales_kib_to_bytes_on_linux(self, monkeypatch):
+    def test_posix_scales_kib_to_bytes_on_linux(self, monkeypatch, tmp_path):
+        # Linux reads its own VmHWM (kB); ru_maxrss there is the parent's
+        # inherited peak and must not be the source.
         monkeypatch.setattr(pc, "IS_POSIX", True)
         monkeypatch.setattr(pc.sys, "platform", "linux")
         _fake_resource(
             monkeypatch,
-            getrusage=lambda _who: types.SimpleNamespace(ru_maxrss=2048),
+            getrusage=lambda _who: types.SimpleNamespace(ru_maxrss=999_999_999),
         )
+        status = tmp_path / "status"
+        status.write_text("VmHWM:\t    2048 kB\n", encoding="utf-8")
+        monkeypatch.setattr(pc, "_LINUX_STATUS_PATH", status)
+        monkeypatch.setattr(pc, "_LINUX_PEAK_RSS_FLOOR", 0)
         assert pc.proc_peak_rss_bytes() == 2048 * 1024
 
     def test_posix_reports_bytes_directly_on_macos(self, monkeypatch):
@@ -2122,12 +2216,15 @@ class TestProcPeakRss:
         )
         assert pc.proc_peak_rss_bytes() == 999
 
-    def test_a_getrusage_failure_is_zero(self, monkeypatch):
+    def test_a_getrusage_failure_is_zero(self, monkeypatch, tmp_path):
+        # The single POSIX source failing (VmHWM on Linux, getrusage elsewhere)
+        # is 0: neither falls through to the other.
         def _boom(_who: Any) -> Any:
             raise OSError("no rusage")
 
         monkeypatch.setattr(pc, "IS_POSIX", True)
         _fake_resource(monkeypatch, getrusage=_boom)
+        monkeypatch.setattr(pc, "_LINUX_STATUS_PATH", tmp_path / "no-proc")
         assert pc.proc_peak_rss_bytes() == 0
 
     def test_windows_reads_the_peak_working_set(self, monkeypatch):

@@ -8,9 +8,13 @@ they need a marker the model and the frontend can both recognise.
 **The user may not be present.** Process the envelope and act; do not answer it as
 though someone is waiting for a conversational reply.
 
-Every prefix is defined once, in `src/kiro_crew/dashboard/state.py`, so the
-frontend has one list to mirror and no second copy can drift. Classification is by
-`str.startswith` on the resolved prefix, never by a loose regex.
+Most dashboard-owned prefixes are defined once in `src/kiro_crew/dashboard/state.py`;
+a few (the MCP app message envelope among them) live in
+`src/kiro_crew/dashboard/chat_utils.py`.
+The two core-safe sub-agent completion markers live in `src/kiro_crew/constants.py`
+so `subagent.py` can import them without importing the dashboard layer; `state.py`
+imports and aggregates them. Classification is by `str.startswith` on the resolved
+prefix or prefix tuple, never by a loose regex.
 
 ## Cron notification
 
@@ -77,17 +81,32 @@ single completion path that serves every terminal outcome:
 Agent `<id>` (<agent name>) <status> <emoji>
 Task: <first 100 chars of the task>
 
+Usage: <credits> credits · <elapsed>
+
 <result detail>
 ```
 
-- Prefix `SUBAGENT_COMPLETION_PREFIX = '[Subagent completion event]'`.
+- `SUBAGENT_COMPLETION_PREFIX = '[Subagent completion event]'` is defined in
+  `constants.py` and included in `state.py`'s `SUBAGENT_COMPLETION_PREFIXES`
+  aggregate.
 - `<status> <emoji>` is one of `completed ✅`, `failed ❌`, or `stopped by user ⏹`.
   The agent-name parenthetical is present only when the sub-agent ran under a named
   agent.
 - The detail is the trimmed result when it fits. When the completion copy dropped
-  content, or in orchestrator mode, it is a summary plus a `result_path` pointer, so
+  content, it is a summary plus a `result_path` pointer, so
   the parent reads the full transcript on demand (`read`, `grep`, `spawn_status`)
   instead of re-running the sub-agent.
+- Usage is cumulative across all attempted turns in the run, including billed
+  retries that failed before the final turn. Providers that do not report credit
+  billing render this line as `Usage: <elapsed>`; the missing credit label is
+  intentional, and zero is not a claim that the run was free. Reported credits
+  use two decimals below 10 and one decimal at or above 10, matching the
+  dashboard's precision.
+- The same charge is written into the PARENT's crew log as `credits` on
+  `subagent/completed` or `subagent/failed`, and `usage.credits_by_source.subagent`
+  folds it. This line and that entry read the one accumulator, so they cannot
+  disagree; the entry drops an unbilled zero rather than writing it, which is the
+  same posture as this line omitting the credit label.
 - A user-stopped agent says so explicitly and instructs the parent not to treat the
   partial output as a finished result or retry it unprompted.
 - A wide wave is delivered in chunks under a sibling prefix,
@@ -108,11 +127,15 @@ Task: <first 100 chars of the task>
 races the sub-agents. Your reply is what the user sees, so fold the results into it
 rather than pasting them.
 
-When every agent in a fan-out has completed and each result has been processed, one
-further synthesis turn is fired, prefixed `SUBAGENT_SYNTHESIS_PREFIX = '[SYSTEM]
-Sub-agent synthesis:'`. Its visible reply is the consolidated, user-facing summary,
-so treat it as the deliverable: restate the goal, synthesize across the agents
-rather than repeating each in turn, and give concrete next actions.
+When every agent in a fan-out has completed and the results reached you in two or
+more completion turns, one further synthesis turn is fired, prefixed
+`SUBAGENT_SYNTHESIS_PREFIX = '[SYSTEM] Sub-agent synthesis:'`. Its visible reply is
+the consolidated, user-facing summary, so treat it as the deliverable: restate the
+goal, synthesize across the agents rather than repeating each in turn, and give
+concrete next actions. A batch whose results all arrived in one turn (a lone
+sub-agent, or one wave digest) normally gets no synthesis turn: that turn's reply
+is the deliverable. The one exception is a task store the turn-end fire gate
+could not read; its later re-check fires the synthesis as before.
 
 The prompt itself is appended to the slot as an `inject` row carrying
 `meta.injectKind = "synthesis"`, and the turn is dispatched with
@@ -130,6 +153,7 @@ session failed (most commonly a delivery timeout). `subagent.py` builds:
 [Subagent completion event]
 Agent `<id>` ❌ <reason>
 Task: <first 100 chars of the task>
+Usage: <credits> credits · <elapsed>
 <outcome line>
 Result saved at: <path> (<n> bytes)
 Use the read tool to retrieve it if needed.
@@ -140,7 +164,10 @@ completion — this path fires for every terminal state, including runs that
 never executed (the never-ran reading comes from the record's execution marker,
 never from its error wording):
 
-- completed: `The agent finished but result delivery timed out.`
+- completed: `The agent finished, but its result could not be delivered.`
+  The line names no mechanism: `<reason>` above it already carries one, and
+  most call sites pass something other than a timeout (a dead provider, a
+  died ACP process, a raw exception string).
 - failed after execution began: `The agent failed before a result could be delivered.`
 - failed before execution (approval or queued rejection, no output exists):
   `The run failed before it started, so there is no result to deliver.`
@@ -151,13 +178,32 @@ never from its error wording):
 The result-path lines are present only when a result file exists. **The result is
 on disk**, so use the `read` tool to retrieve it rather than re-running the work.
 
-Two adjacent variants exist for a gateway restart, same prefix:
+Four adjacent variants exist for a gateway restart, same prefix. They omit
+usage because a run the restart caught has no settled terminal billing record:
 
-- `⚠️ orphaned by gateway restart` plus `Result saved at: <path>` and
-  `Use the read tool to retrieve it.`
+- `✅ finished before gateway restart` plus `Result saved at: <path>` and
+  `Use the read tool to retrieve it.` — only when the run recorded
+  `result_complete`, which a run that claimed its completed ending does once
+  `result.txt` holds the whole answer (the window this leaves:
+  [subagent](../modules/subagent.md#gateway-restart-reconciliation)). It is a
+  completed run (outcome `ok`) that arrives late.
+- `✅ finished before gateway restart` plus a line saying it finished without
+  writing any text — a run that recorded `result_complete` with no
+  `result.txt` (a tool-only run).
+- `⚠️ cut off mid-turn by gateway restart` plus `Partial output saved at: <path>`
+  and a line saying the text stops wherever the restart landed. `result.txt` is
+  appended per streamed chunk, so a run killed mid-turn leaves a non-empty file
+  holding an opening sentence; this variant exists so the parent is not sent to
+  read a fragment as though it were the answer.
 - `❌ lost to gateway restart` plus `No result was captured before the restart.`
+  When the run's conversation is still resumable
+  (`session_map.session_files_resumable` on the orphan's `session_id` /
+  `provider`), one more line follows: how many turns it completed, its last
+  tool call, and the `spawn_continue(conversation="<id>", task=...)` handle
+  that resumes it — see `orphan_resume_hint` in
+  [subagent](../modules/subagent.md#gateway-restart-reconciliation).
 
-All three are redacted before any delivery path. When the parent has no open
+All four are redacted before any delivery path. When the parent has no open
 dashboard surface, undelivered notices are batched into a single digest DM rather
 than N pings.
 
@@ -176,6 +222,7 @@ boundary:
 | `recovery` | A runner-authored continuation | Its own recovery card, or a generic note if the marker is unrecognised |
 | `cron` | A scheduled job's output — the user's own | Labelled bubble (also carries `cronLabel`) |
 | `user_replay` | The user's original message, replayed because the turn emitted nothing | Ordinary bubble; it is speech |
+| `mcp_app` | A message an MCP app authored into the chat | App-labelled row (also carries `appLabel`); see [mcp-apps.md](../modules/mcp-apps.md) |
 
 `resolveInjectCard` in `website/src/pages/chat/RecoveryCard.tsx` is the single
 decision point, shared by `ChatPage` and the `transcriptRenderers` registry so the
@@ -230,8 +277,9 @@ permission request. Holding the unanswered request is what makes that race-free:
 the turn is provably in flight, so the notice is queued and folded in at the next
 model-inference boundary — the one right after the rejected tool resolves — and
 the model adapts inside the SAME turn. It is opt-in by positive capability
-(`supports_steer`, i.e. `ACP_BACKENDS_STEER`), so a harness without mid-turn
-steer is unchanged.
+(`supports_refusal_steer`, i.e. `ACP_BACKENDS_STEER`), so a harness without mid-turn
+steer is unchanged, and so is codex: its user steer rides `_session/steering`, but its
+approval answer cancels the turn and drops what was injected into it.
 
 `should_queue_refusal_recovery` then suppresses the extra turn only when every
 refusal got a notice AND a `steering_consumed` echo accounted for all of them. An
@@ -264,6 +312,181 @@ was never judged and to state the permission it needs). All three are steered
 once, at the shared reject branch, gated on the host-recorded provenance; a
 genuine user refusal records no cause, so kiro-cli's generic denial stays the
 true attribution there and no notice is sent.
+
+**The headless funnel steers the same notice.** `llm_helpers._resolve_permission`
+answers permissions for every surface without a dashboard slot — cron, Slack and
+channel turns driven through `stream_and_collect`, workflows, heartbeat, Meetings
+transcript turns — and `llm_helpers.run_bg_oneliner` answers them for the
+tool-free background one-liners (titles, labels, summaries). Each host deny there
+awaits `deny_notice.steer_refusal_notice` through the module's
+`_steer_host_deny` immediately before `reject_tool`, naming its cause per site:
+
+- `policy` — a safety rule judged the call itself: an always-deny pattern hit, a
+  hook `deny`, the shared permission floor refusing an `AUTO_APPROVE` call.
+  Carries the class remediation.
+- `surface_policy` — the SURFACE refused the call, not a rule about the call:
+  the reject-all and read-only tool policies, the tool-free one-liner, and a
+  name-based grant withheld on a surface with no approver to fall back to. No
+  remediation, because it is keyed off the reason and the model's own title, and
+  on a surface where no tool can run (or no one can approve) it would name a
+  sanctioned command the model cannot run there; the withheld-grant reason is
+  host-authored and carries no rule identity, so the title would be the only
+  anchor.
+- `invalid_name` — the call carried no title, the one deny the model can fix.
+
+The one genuine user rejection on that funnel (the interactive approver said no)
+sends no notice. Two orderings are load-bearing at every site and are pinned by
+a source-walking test (`test_llm_helpers_deny_notice.py`): the SEL audit row is
+written BEFORE the steer and the reject (both await the ACP pipe, and a stalled
+pipe cancels the coroutine at the turn deadline — an audit sequenced after them
+never runs), and an audit that cannot be written raises before the wire, so a
+deny never proceeds unaudited — the request stays unanswered and the caller's
+own deadline bounds it, exactly as an approval whose audit fails after the wire
+keeps raising. A cancellation that lands inside the
+steer still answers the wire: the reject is scheduled as a strongly referenced
+task whose outcome is read when it settles, and the cancellation re-raises at
+once — the cancellation is the caller's deadline, so nothing waits past it.
+
+**The messaging surfaces steer the same notice.** The native Slack handler
+(`slack/handler.py`) and the channel-neutral `messaging.TurnDriver` each carry
+a thin `_steer_host_deny` that redacts the reason and forwards to
+`deny_notice.steer_refusal_notice`; the channel agent stream (`channel.py`)
+reuses `llm_helpers`' helper (passing the rendered tool name as `title`), since
+its cancellation shape is the same. Each is
+awaited immediately before each host-deny `reject_tool` with the SEL row
+written first. Per site:
+
+- Slack: the PreToolUse hook's `deny` on the message path — `policy`, with the
+  hook's reason; the approval prompt expiring unanswered — `approval_timeout`.
+  A Deny click in
+  `handle_interaction` and the teardown-only `_reject_orphaned_tool` send no
+  notice.
+- Channel agents: the containment boundary refusing a direct-to-user messaging
+  tool — `surface_policy` (the model's way forward is a channel post); the
+  PreToolUse gate's deny — `policy`, with the gate's reason; an approval card the
+  channel cannot show in full — the new `approval_oversize` (nothing was judged;
+  the model can split the request, and the notice says so — kept apart from
+  `approval_undeliverable`, whose guidance is to state the permission needed); a
+  card that expired unanswered — `approval_timeout`. The reader's own Deny on
+  that same card shares its `reject_tool` line and sends no notice: the steer sits
+  under the timeout flag alone.
+- TurnDriver: the deny-every-tool switch for a sender other than the operator —
+  `surface_policy`; the PreToolUse gate's deny — `policy`. A gate built by
+  `messaging.dispatch.build_tool_gate` leaves the hook's reason on itself as
+  `last_deny_reason` (the same attribute-on-a-callable shape as
+  `ApprovalDecider.last_deny_cause`), so the notice names the rule; a plain
+  callable gets a notice naming the gate. The decider path is unchanged: only a
+  recorded `approval_timeout` steers, a human's Deny stays bare.
+
+A cancellation inside any of these steers answers the wire through an orphan
+reject, and that reject audits ONLY where the caller audits after the wire (the
+Slack approval-timeout arm, the TurnDriver's decider path -- `audited=False`);
+an audit-first site (`audited=True`) already has its SEL row, and the ledger is
+append-only, so a second row for one decision would be a duplicate nothing
+reconciles.
+
+`test_messaging_deny_notice.py` enumerates every `reject_tool(` on the three
+surfaces with its verdict (host deny / user rejection / cleanup / mixed) and
+fails when a site is missing from the enumeration, a host deny is not preceded
+by the steer, a user rejection is, or a mixed site's steer is not under its host
+guard.
+
+**The prompt optimizer, the task-refine turn and the unattended auto-improvement
+runner steer the same notice.** `dashboard/handlers/optimizer.py` rewrites one
+prompt in a side-session that runs no tools; its one reject is `surface_policy`,
+the notice saying the optimizer permits nothing. `dashboard/handlers/taskrunner.py`
+(`_run_refine`) drafts a task spec with text only; its one reject is
+`surface_policy` the same way. Both write the denied attempt as a SEL row
+FIRST (`source` `optimizer` / `taskrunner_refine`), then steer, then reject. The
+unattended auto-improvement runner
+(`apps/builtins/auto_improvement/spine/agent_runner.py`) denies through ONE
+funnel, `SessionAgentRunner._reject`, whose REQUIRED `cause=` keyword is the
+per-site verdict; the SEL row is written first, its `error` naming which gate
+refused (`governance_deny`, `governance_hook_unavailable`, `shell_denylist`,
+`not_in_allowed_tools`). No person is attached to this surface, so every deny
+is a host deny. Per site:
+
+- the platform governance gate's `deny` -- `policy`, with the hook's own reason;
+  the same gate's fail-closed arm, when the hook LAYER raised -- `hook_error`
+  (nothing judged the call). The gate names the cause itself
+  (`_GovernanceDeny.cause`) rather than leaving the funnel to read it off the
+  reason's wording.
+- the app-local shell denylist (`shell_command_refusal`) -- `policy`, with the
+  denylist's reason.
+- the caller's `allowed_tools` refusing a tool it does not list (or an empty
+  list refusing every tool) -- `surface_policy`; the notice names what the run
+  permits, never a sanctioned alternative.
+- `_approve`'s audit-or-deny arm, when the SEL row an unattended approval
+  requires cannot be written -- the new `audit_unavailable` cause: the host
+  could not record the call, so it refused rather than run it unaudited;
+  nothing judged the action, and one retry is reasonable. Distinct from
+  `hook_error`, which would send the model looking at a gate that never ran.
+
+`test_handlers_auto_improvement_deny_notice.py` enumerates every `reject_tool(`
+in the three modules and every funnel call with its verdict, pins the funnel's
+order and required keyword, and drives each deny with a provider double
+recording steer/reject order.
+
+**The task runner steers the same notice.** `task_executor` answers the
+permission requests of every autonomous-project and cron-launched step turn
+through `tool_permission.settle`, where every refusal says who refused: a HOST
+refusal carries a `DENY_CAUSE_*` cause and steers `llm_helpers._steer_host_deny`
+before the reject, a person's no and a teardown carry none and stay bare, and a
+host refusal without a cause cannot be built. The SEL row is written first at
+every site. Per site:
+
+- the agent spec's PreToolUse gate blocked the call (a delivered deny, or a gate
+  with no verdict — an unreadable spec, a hook that could not run) — `policy`,
+  with the gate's reason, as the chat runner steers the same `BLOCKED:` strings;
+  the stored hooks' `deny` — `policy`, with the hook's reason.
+- the unattended run refusing a call nothing trusts (no approval handler, no
+  hook auto-approve) — `surface_policy`; the notice says what the surface
+  permits (tools in `hooks.auto_approve_tools`) and offers no remediation.
+- the interactive handler's no (`interactive_rejected`) and the reject that
+  precedes a mid-stream compaction send no notice: the first is the person's
+  verdict, the second tears the turn down to re-run it, so there is no
+  continuing turn for a notice to correct.
+
+`task_planner.decompose` (the decomposition turn) denies inline, audit → steer →
+reject: the stored hooks' `deny` — `policy`; the deny-by-default when the phase
+has no hook store to gate a call — `surface_policy` (the planning phase runs no
+tools). `test_taskrunner_deny_notice.py` enumerates the planner's sites with
+their verdicts and drives each deny on both modules with a provider double
+recording steer/reject order; `test_tool_permission.py` pins the ladder's
+order and its cause rule.
+
+**The eval harness and the subagent surface steer the same notice.**
+`eval/runner.py` answers a scenario turn's permission requests inline, audit →
+steer → reject, at three sites: the permission gate's refusal (`refusal_for`) —
+`policy`, with the gate's own reason; the harness's own path check on a
+filesystem tool (a sensitive credential path, or no path it can read from the
+input) — `policy`; and a tool the harness does not know to be read-only —
+`surface_policy`, the notice saying the harness runs tools read-only and
+offering no remediation. `eval/judge.py` denies every tool call at its one site —
+`surface_policy` (the judge runs no tools). The subagent surface answers through
+`tool_permission.settle` with the ladder `subagent_manager/run.py` builds, under
+the same cause rule. The SEL row (and the child-denial metric) is written first.
+Per site:
+
+- the agent spec's PreToolUse gate blocked the call, and the stored hooks'
+  `deny` — `policy`, with the gate's or the hook's reason.
+- the unattended run refusing a call nothing positively authorizes (no approval
+  handler, no `parent_policy=auto`, no hook auto-approve) — `surface_policy`;
+  the notice names every tier that could still have authorized it. The
+  fail-closed answer to a backend child's request whose security context is
+  absent (`child_low_fidelity`, no approver attached) — `surface_policy`.
+- the approvers' no (the per-subagent factory, the gateway fallback, the
+  child-request approver) send no notice: the person's verdict is the truth.
+  The rejects that precede a `turn_limit` / `child_escalation_limit` bail send
+  none either: the run ends there, so no continuing turn exists for a notice to
+  correct.
+
+`test_eval_subagent_deny_notice.py` enumerates every `reject_tool(` in the two
+eval modules with its verdict and drives each of their denies; through a real
+subagent run it drives each host deny above, the gateway approver's no and a
+`turn_limit` bail, all with a provider double recording steer/reject order.
+`test_tool_permission.py` drives every approver's no and both bails through the
+subagent's own ladder, and pins the ladder's order and its cause rule.
 
 The recovery classification for the last two rows of the marker table above
 is **structural**: the queue entry
@@ -355,10 +578,16 @@ next turn into the same slot:
 
 ```
 [auto-nudge cycle <N>]
+[patrol budget: cycle <N>/<max_cycles>, <left>s/<max_runtime_secs>s runtime left]
 <nudge message>
 ```
 
 - `N` is `cycle_count + 1`. Only DELIVERED nudges count toward `max_cycles`.
+- The `[patrol budget: ...]` line appears only on a loop with a cycle or runtime
+  cap, and names only the caps it has; an uncapped loop's tag is unchanged. It
+  ends `; 10% or less left` once either budget is at or under 10% of its cap. It states a
+  fact and asks for nothing; the goal-conductor skill is what tells its agent to
+  renew on those cycles (`nudge_cycle_header`).
 - `{{STOP_FILE}}` in the configured message is substituted with the resolved stop
   sentinel path before the tag is prepended.
 - The slot entry uses role `nudge` with a structured `nudge` meta block (`cycle`,
@@ -457,8 +686,9 @@ text back toward the session, but it **cannot inject a turn**. The path is:
    (truncated to 64 chars), the payload must be a plain object, and the composed
    text is capped. It formats `[UI] <action>: <JSON payload>` (or `[UI] <action>`
    with no payload) and dispatches an internal `mc-widget-send` event.
-3. `ChatPage.tsx` **pre-fills the composer** with that text and records it. It
-   never auto-submits.
+3. `ChatPage.tsx` **pre-fills the composer** with that text and records it
+   (the `mc-widget-send` listener in `useAutoSendIntake`,
+   `website/src/pages/chat/page/launchIntake.ts`). It never auto-submits.
 
 The iframe's own `isTrusted` click check is NOT the trust boundary and must not be
 treated as authoritative: LLM-emitted `<script>` in the same document can
@@ -467,11 +697,9 @@ the parent requires an explicit human gesture, so a widget action can never beco
 a user-role turn on its own.
 
 When the user does send the pre-filled text, the turn is tagged
-`meta.origin = 'widget'`. The backend then refuses the one chat-text-reachable
-privilege escalation for such turns: orchestrator `go` / `go all` auto-run is
-denied (audited as `auto_run_denied`) and the text falls through to a normal, fully
-gated turn. Mode changes and tool approvals live on separate endpoints an iframe
-cannot reach.
+`meta.origin = 'widget'` and runs as a normal, fully gated turn. No chat text
+grants a privilege: mode changes and tool approvals live on separate endpoints
+an iframe cannot reach.
 
 So there is no `[Widget action event]` envelope. What reaches the session is an
 ordinary user message beginning `[UI] `, sent by a human, carrying an origin tag.
@@ -487,10 +715,15 @@ speech rather than as the user.
 |---|---|---|
 | `[work ledger — …]` | `session_ledger.py` snapshot builder, composed into a nudge by `dashboard/handlers/autonudge.py` | Durable per-session state that outranks the model's recollection of earlier cycles. |
 | `[Hook context:]` … `[End of hook context]` | `context.py` hook-context assembly | Context supplied by a configured hook whose action is `HOOK_INJECT_CONTEXT`; webhook-restored workflow state is one producer, not the envelope's only meaning. The payload is untrusted third-party data. |
-| `[Previous run result — do NOT repeat the same content]` | `cron.py` | A recurring cron's own last output, so the turn reports only what changed. |
-| `[RESOURCES]` | `resource_status.py` advisory builder | Host memory crossed the tight/critical threshold; take the lighter path this turn. |
-| `[Relevant skills for this message]` | `skills.py` pointer renderer | Skill candidates named by path instead of by injected body. The body must be read before use unless that skill already appears earlier in the conversation, where native history still carries its instructions. |
-| `[INCOGNITO SESSION]` / `[TEMPORARY SESSION]` | `dashboard/chat_utils.py` ephemeral-session prefixes | An instruction, not a tool-level gate: it forbids memory tools (writes in incognito, reads as well in temporary) and keeps nothing of the chat, its history or its lessons. `learn_remove` and the cron tools stay permitted as active user actions, and a cron change persists outside the ephemeral transcript. |
+| `[MCP app message from "server/tool"]` … `[End of MCP app message]` | `dashboard/chat_utils.py` (`APP_MESSAGE_PREFIX`, `APP_MESSAGE_END`; queue kind `mcp_app_message`) | A message an MCP app sent into the chat; the app's words, not the user's. See [mcp-apps.md](../modules/mcp-apps.md). |
+| `[Workflow completion event]` | `dashboard/workflow_inject.py` | A background workflow run finished; the next line names the workflow, run id and status. |
+| `[Content filter — continuing on the fallback model]` | `REFUSAL_FALLBACK_RECOVERY_PREFIX` in `dashboard/state.py`, built in `dashboard/chat_utils.py` | The primary model refused on a content filter and the turn continues on the fallback model. |
+| `[Task checklist — automatic recovery]` | `todo_recovery_prompt` in `dashboard/state.py` | The conversation restarted, so the todo tool holds an empty list; rebuild it from the dashboard checklist shown. |
+| `[Previous run result — do NOT repeat the same content]` | `cron_service/identity.py` (`build_cron_session_context`) | A recurring cron's own last output, so the turn reports only what changed. |
+| `[RESOURCES]` | `resource_status.py` advisory builder | Host memory crossed the tight/critical threshold, **or** the agent slice sits within `_SLICE_TASKS_TIGHT_RATIO` of its cgroup `pids.max`, **or** the macOS kernel reports memory pressure of WARN or worse (`ResourceStatus.memory_pressure_held`) while the figure reads ample or cannot be read; take the lighter path this turn. |
+| `[Relevant skills for this message]` | `skill_runtime/delivery.py` pointer renderer (`trigger_hint`) | Skill candidates named by path instead of by injected body. The body must be read before use unless that skill already appears earlier in the conversation, where native history still carries its instructions. |
+| `[Kiro Crew host notice] You have made the same tool call …` | `repeat_loop.py` (`build_repeat_loop_notice`), steered by `dashboard/chat_runner.py` (`_steer_repeat_loop_notice`) | The same tool call with the same input returned the same result `REPEAT_LOOP_THRESHOLD` times in one turn. Advice only: nothing was refused or stopped, it is sent at most once per call per turn, and it never joins the refusal ledger, so it schedules no recovery turn. Sent only where `supports_refusal_steer` holds; a hint written after the turn's last tool result may go unread, which is harmless because the loop has ended. |
+| `[INCOGNITO SESSION]` / `[TEMPORARY SESSION]` | `dashboard/chat_utils.py` ephemeral-session prefixes | An instruction, not a tool-level gate: it forbids memory tools (writes in incognito, reads as well in temporary) and learns nothing from the chat — the transcript itself is kept in History for the user, but no lesson, memory or summary is derived from it. `learn_remove` and the cron tools stay permitted as active user actions, and a cron change persists outside the transcript. |
 
 ## Adding a new envelope
 

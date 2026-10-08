@@ -89,7 +89,7 @@ def test_the_fake_backend_keeps_readiness_offline() -> None:
 
     Asserted on the SCRIPT, which owns the gateway leg's environment: the ACP
     backend is pointed at the fake one shipping inside the payload under test.
-    A future edit that drops this makes the 30-second ceiling depend on a model
+    A future edit that drops this makes the 50-second ceiling depend on a model
     download and turns a real gate into a flake.
     """
     script = _read(INSTALLER_SCRIPT)
@@ -152,6 +152,20 @@ def test_the_guide_check_can_actually_fail(guide: str) -> None:
     # bullets, so a raw substring test would pass without the sentence ever
     # having been removed.
     assert removed not in re.sub(r"\s+", " ", guide)
+
+
+def test_the_pr_gate_install_ceiling_stays_within_the_release_smoke() -> None:
+    """Both scripts time the same silent install on the same runner class.
+
+    The PR gate is the performance ceiling, so it may be tighter than the
+    release smoke but never looser.
+    """
+    pattern = r"^\$MaxInstallSeconds = (\d+)$"
+    release = ROOT / "scripts" / "smoke-windows-install.ps1"
+    pr_gate = re.findall(pattern, _read(INSTALLER_SCRIPT), re.MULTILINE)
+    smoke = re.findall(pattern, _read(release), re.MULTILINE)
+    assert len(pr_gate) == 1 and len(smoke) == 1, (pr_gate, smoke)
+    assert int(pr_gate[0]) <= int(smoke[0]), (pr_gate, smoke)
 
 
 def test_the_windows_smoke_install_is_gated_on_a_real_artifact() -> None:

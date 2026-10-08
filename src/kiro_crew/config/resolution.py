@@ -24,7 +24,9 @@ logger = logging.getLogger("kiro_crew.config.loader")
 # save, never warned about and never resurrected.
 #   * agent_template_pane — retired: the agent editor's Template pane renders
 #     unconditionally now, so a stale materialized ``false`` must not warn.
-CONFIG_RESERVED_TOP_KEYS: frozenset = frozenset({"meta", "agent_template_pane"})
+#   * orchestrator — retired with chat Autopilot mode; its stage and plan
+#     budgets have no reader, so a stale section loads as nothing.
+CONFIG_RESERVED_TOP_KEYS: frozenset = frozenset({"meta", "agent_template_pane", "orchestrator"})
 
 # Top-level config.json sections this core models AND round-trips through
 # to_dict(). Any other top-level key found at load() is captured into
@@ -69,7 +71,6 @@ _KNOWN_CONFIG_SECTIONS: frozenset = frozenset(
         "mcp_gateway",
         "mcp",
         "taskrunner",
-        "orchestrator",
         "watchdog",
         "resource_limits",
         "messaging",
@@ -344,6 +345,14 @@ DEGRADED_WHOLE_CONFIG = "*"
 #: so the tailnet gate denies on exactly the narrowing it enforces, and an
 #: unrelated malformed ``dashboard`` value does not.
 DEGRADED_TAILSCALE = "dashboard.tailscale"
+
+#: ``degraded_sections`` key for "the ``workspaces`` table could not be read"
+#: (a non-object value). The table names WHERE the Global V1 memory workspaces
+#: live, some possibly at absolute directories outside the data home; a fence
+#: built without it covers only the default directory, so a consumer that
+#: fences memory stores (folder steering) treats this like the whole config
+#: being unreadable and fails closed.
+DEGRADED_WORKSPACES = "workspaces"
 
 
 def tailnet_identity_unknown(sections: frozenset[str]) -> bool:

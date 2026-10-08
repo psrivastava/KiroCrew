@@ -11,8 +11,16 @@ param(
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
-$MaxInstallSeconds = 120
-$MaxGatewayReadySeconds = 30
+# A performance ceiling, deliberately tighter than the 300 s release smoke in
+# scripts/smoke-windows-install.ps1. 45 green main runs (2026-10-03..04) installed
+# in 39-98 s, median 60 s; 200 s is about twice the slowest, so a slow hosted
+# runner alone does not fail it while a real installer slowdown still does.
+$MaxInstallSeconds = 200
+# Healthy boot on the runner is ~12-24 s (observed 2026-09-29). /api/ready does not await
+# the Kiro CLI probe, but a tolerated probe timeout (_PROBE_TIMEOUT_SECS = 10 s in
+# src/kiro_crew/kiro_prerequisite.py) still slowed one boot from 12.8 s to 30.1 s on the
+# same sha (issue #11810). 24 s plus that ~17 s is ~41 s, rounded up to 50.
+$MaxGatewayReadySeconds = 50
 
 # `Stop-GatewayTree`, shared with `scripts/smoke-windows-install.ps1`. Both boot a
 # gateway out of an installed tree and then uninstall it, so the teardown that makes
@@ -337,7 +345,7 @@ try {
   # Marks this as a test rig. It grants no launch privilege: the shim above is
   # exec'd by the ordinary in-place path like any other runnable file.
   $env:KIROCREW_FAKE_ACP_TEST_MODE = "1"
-  # Embeddings are default-on; a ~610MB download inside a 30-second readiness
+  # Embeddings are default-on; a ~610MB download inside a 50-second readiness
   # ceiling would fail the gate for a reason unrelated to the artifact.
   $env:KIROCREW_SKIP_MODEL_DOWNLOAD = "1"
   # Bytecode this boot compiles goes OUTSIDE the installed tree, which is what the
@@ -356,7 +364,7 @@ try {
   $env:PYTHONUTF8 = "1"
   $env:PYTHONIOENCODING = "utf-8:backslashreplace"
   $gatewayProcess = Start-Process -FilePath $bundledPython -ArgumentList @(
-    "-s", "-m", "kiro_crew", "gateway", "--no-open", "--port", "$gatewayPort"
+    "-s", "-P", "-m", "kiro_crew", "gateway", "--no-open", "--port", "$gatewayPort"
   ) -WorkingDirectory $installLocation -RedirectStandardOutput $gatewayStdout `
     -RedirectStandardError $gatewayStderr -WindowStyle Hidden -PassThru
 
@@ -406,7 +414,9 @@ if (-not $gatewayReady) {
   Get-Content -LiteralPath $gatewayStdout -Tail 30 -ErrorAction SilentlyContinue
   Write-Host "Gateway stderr tail:"
   Get-Content -LiteralPath $gatewayStderr -Tail 30 -ErrorAction SilentlyContinue
-  throw "Installed gateway was not ready within $MaxGatewayReadySeconds seconds."
+  $probeTimedOut = [bool](Select-String -LiteralPath $gatewayStderr -Pattern 'probe timed out' `
+    -SimpleMatch -Quiet -ErrorAction SilentlyContinue)
+  throw "Installed gateway was not ready within $MaxGatewayReadySeconds seconds (Kiro CLI probe timed out: $probeTimedOut)."
 }
 Write-Host "Installed gateway became ready in $gatewayElapsed seconds ($startupPycCount pycs)."
 if ($env:GITHUB_STEP_SUMMARY) {
@@ -431,6 +441,16 @@ if ($uninstallProcess.ExitCode -ne 0) {
   throw "Silent uninstall exited with code $($uninstallProcess.ExitCode)."
 }
 
+# An NSIS uninstaller started without `_?=` copies itself to %TEMP% (Au_.exe /
+# Un_A.exe) and relaunches, so the process waited on above can exit while the
+# real uninstall is still running. Wait for that relaunched copy too (bounded at
+# 120 s), so the 30 s registration poll starts when the uninstall is done. A copy
+# that never exits still ends in the named failure below.
+$relaunchDeadline = [DateTime]::UtcNow.AddSeconds(120)
+while ([DateTime]::UtcNow -lt $relaunchDeadline -and @(Get-Process -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -match '^(Au_|Un_A)$' }).Count -ne 0) {
+  Start-Sleep -Milliseconds 250
+}
 $uninstallDeadline = [DateTime]::UtcNow.AddSeconds(30)
 do {
   $remainingRegistrations = @(Find-InstallerRegistrations $expectedDisplayName)
@@ -442,7 +462,7 @@ do {
   [DateTime]::UtcNow -lt $uninstallDeadline
 )
 if ($remainingRegistrations.Count -ne 0) {
-  throw "Silent uninstall left a $productName registration behind."
+  throw "Silent uninstall left a $productName registration behind: $(($remainingRegistrations | ForEach-Object { $_.PSPath }) -join '; ')"
 }
 if (Test-Path -LiteralPath $installLocation) {
   # NAME the residue. "The directory is still there" is not actionable: the

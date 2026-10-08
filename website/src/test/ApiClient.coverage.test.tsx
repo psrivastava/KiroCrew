@@ -1,8 +1,9 @@
 /**
  * Behavioural coverage for the shared dashboard API client (`src/api/client.ts`).
  *
- * `client.ts` is one transport layer plus ~450 thin typed methods over it. What
- * can actually break here is (a) the transport contract — session-key header,
+ * `client.ts` is one transport layer plus the `api` object of thin typed methods
+ * over it, most of them defined by domain in `src/api/client/*.ts`. What can
+ * actually break here is (a) the transport contract — session-key header,
  * auth recovery, `ApiError` + error journalling, artifact-write tracking — and
  * (b) URL/body CONSTRUCTION in the methods that are not one-liners: query
  * builders, conditionally-omitted body keys, path encoding, the SSE reader, the
@@ -32,10 +33,13 @@ import {
   attemptSilentRefresh,
   __resetAuthRecoveryStateForTests,
   SEARCH_MIN_CHARS,
+  BROWSE_FILES_TIMEOUT_MS,
+  FILE_SEARCH_TIMEOUT_MS,
 } from '../api/client'
 import { STALE_OWNER_SESSION_CODE, __resetStaleOwnerHandlerForTests, installStaleOwnerHandler } from '../api/staleOwnerSignal'
 import { queryClient } from '../api/queryClient'
-import { recentErrors, __resetErrorJournalForTests } from '../utils/errorReport'
+import { recentErrors, reportForError, findReport, recordError, __resetErrorJournalForTests, TRANSPORT_REJECTION_COOLDOWN_MS, TRANSPORT_REJECTION_WINDOW_CAP } from '../utils/errorReport'
+import { buildErrorPrompt } from '../utils/errorReport.prompt'
 import { copyToClipboard } from '../utils/clipboard'
 import { resizeImageForModel } from '../utils/resizeImage'
 import { hasPendingArtifactWrite, __resetArtifactWrites } from '../lib/artifactWrites'
@@ -59,13 +63,13 @@ type Init = RequestInit & { headers?: Record<string, string> }
 function res(
   status: number,
   body: unknown,
-  opts: { headers?: Record<string, string>; text?: string } = {},
+  opts: { headers?: Record<string, string>; text?: string; url?: string } = {},
 ): Response {
   const text = opts.text ?? (typeof body === 'string' ? body : JSON.stringify(body))
   return {
     ok: status >= 200 && status < 300,
     status,
-    url: 'http://localhost:6776/api/probe',
+    url: opts.url ?? 'http://localhost:6776/api/probe',
     headers: { get: (k: string) => opts.headers?.[k] ?? opts.headers?.[k.toLowerCase()] ?? null },
     json: async () => (typeof body === 'string' ? JSON.parse(body) : body),
     text: async () => text,
@@ -137,6 +141,22 @@ describe('client transport', () => {
     await api.toggleUserDeniedCommand('r1', false)
     expect(call(2).method).toBe('PATCH')
     expect(call(2).body).toEqual({ enabled: false })
+  })
+
+  it('uses a distinct adoption route before ordinary tag policy PATCH', async () => {
+    await api.adoptChatTag('tag / one', true)
+    expect(call()).toMatchObject({
+      url: '/api/chat/tags/tag%20%2F%20one/adopt',
+      method: 'POST',
+      body: { status: true },
+    })
+
+    await api.updateChatTag('tag / one', { agent: 'add-only' })
+    expect(call(1)).toMatchObject({
+      url: '/api/chat/tags/tag%20%2F%20one',
+      method: 'PATCH',
+      body: { agent: 'add-only' },
+    })
   })
 
   it('DELETE omits the JSON content type when it carries no body, and sets it when it does', async () => {
@@ -332,6 +352,28 @@ describe('client response handling', () => {
     })
   })
 
+  it('pins each failure its OWN journal entry, so two same-message refusals do not alias', async () => {
+    // The journal resolves by exact message, newest first. Two endpoints refused with the one
+    // server line ("Access denied") therefore both resolved to whichever failed LAST, and the
+    // first notice handed the agent the second read's endpoint. The transport pins the entry
+    // to the error it throws; `reportForError` reads that before the journal.
+    const denied = (url: string) =>
+      res(403, '{"error":"Access denied","code":"access_denied"}', { url })
+    fetchMock.mockResolvedValueOnce(denied('http://localhost:6776/api/security/stats'))
+    const first = await api.securityStats().catch((e: unknown) => e)
+    fetchMock.mockResolvedValueOnce(denied('http://localhost:6776/api/apps/demo/trust'))
+    const second = await api.trustApp('demo').catch((e: unknown) => e)
+
+    expect(first).toBeInstanceOf(ApiError)
+    expect(second).toBeInstanceOf(ApiError)
+    // Both journaled under one message; the newest is the second read's.
+    expect(recentErrors().map(r => r.message)).toEqual(['Access denied', 'Access denied'])
+    expect(recentErrors()[0].endpoint).toBe('/api/apps/demo/trust')
+
+    expect(reportForError(first)?.endpoint).toBe('/api/security/stats')
+    expect(reportForError(second)?.endpoint).toBe('/api/apps/demo/trust')
+  })
+
   it('maps an API-Gateway throttle body to a readable message', () => {
     const msg = friendlyErrText(429, '{"message":"Rate exceeded","throttlingReasons":null}')
     expect(msg).not.toContain('throttlingReasons')
@@ -339,7 +381,16 @@ describe('client response handling', () => {
   })
 
   it('jNullable returns null on 204 rather than exploding on an empty body', async () => {
-    fetchMock.mockResolvedValue(res(204, null, { text: '' }))
+    // The fixture's `json()` must REJECT, as a real 204 `Response` does: there is no
+    // body to parse. With the lenient `res()` default (`json: async () => null` for a
+    // null body) this test passed even with the 204 branch removed entirely, so it
+    // could not fail and was not guarding the behaviour its name claims. Verified by
+    // removing the branch: lenient fixture green, this one red.
+    const noContent = {
+      ...res(204, null, { text: '' }),
+      json: async () => { throw new SyntaxError('Unexpected end of JSON input') },
+    } as unknown as Response
+    fetchMock.mockResolvedValue(noContent)
     await expect(api.tipsNext()).resolves.toBeNull()
     await expect(api.onboardingImportState({ completed: true })).resolves.toBeNull()
   })
@@ -347,6 +398,188 @@ describe('client response handling', () => {
   it('jNullable still rejects with ApiError on a real failure', async () => {
     fetchMock.mockResolvedValue(res(500, 'boom'))
     await expect(api.tipsNext()).rejects.toBeInstanceOf(ApiError)
+  })
+})
+
+/* ───────────────── transport rejection (no HTTP Response) journaling ───────────────── */
+
+describe('transport rejection journaling', () => {
+  // #9579 / #12433: a fetch that rejects at the network layer never produces a
+  // Response, so `apiFailure` (which takes one) never runs and the failure was
+  // journaled nowhere — the "ask the agent" hand-off degraded to a bare
+  // "Failed to fetch" with no endpoint. The five helpers and the raw-fetch
+  // family both route through `jfetch`, which journals the rejection.
+
+  it('journals a network rejection on a five-helper (GET) call with endpoint and method, no status', async () => {
+    fetchMock.mockRejectedValue(new TypeError('Failed to fetch'))
+    await expect(api.securityStats()).rejects.toThrow('Failed to fetch')
+    const [report] = recentErrors()
+    expect(report).toMatchObject({
+      source: 'api',
+      message: 'Failed to fetch',
+      endpoint: '/api/security/stats',
+      method: 'GET',
+      code: 'network',
+    })
+    // No response arrived: a synthetic status would mis-route a reader to the server.
+    expect(report.status).toBeUndefined()
+    // The method renders in the hand-off prompt alongside the endpoint.
+    expect(buildErrorPrompt(report, 'lead')).toContain('- Request: GET /api/security/stats')
+  })
+
+  it('journals a network rejection on a raw-fetch-family method too', async () => {
+    fetchMock.mockRejectedValue(new TypeError('Failed to fetch'))
+    await expect(api.sessionsMemory()).rejects.toThrow('Failed to fetch')
+    expect(recentErrors()[0]).toMatchObject({
+      source: 'api',
+      message: 'Failed to fetch',
+      endpoint: '/api/sessions/memory',
+    })
+  })
+
+  it('records the rejection message VERBATIM so findReport/ask-agent can resolve it', async () => {
+    // findReport matches on exact message; rewording here would orphan the entry.
+    fetchMock.mockRejectedValue(new TypeError('Load failed')) // Safari's wording
+    const err = await api.securityStats().catch((e: unknown) => e)
+    expect(recentErrors()[0].message).toBe('Load failed')
+    // The report is pinned to the rejection, so the notice resolves THIS endpoint.
+    expect(reportForError(err)?.endpoint).toBe('/api/security/stats')
+  })
+
+  it('does NOT journal a deliberate AbortError (unmount / superseded react-query key)', async () => {
+    const abort = new DOMException('The operation was aborted.', 'AbortError')
+    fetchMock.mockRejectedValue(abort)
+    await expect(api.securityStats()).rejects.toBe(abort)
+    expect(recentErrors()).toHaveLength(0)
+  })
+
+  it('DOES journal a withDeadline TimeoutError (a genuine failure, not an abort)', async () => {
+    const timeout = new Error('deadline exceeded')
+    timeout.name = 'TimeoutError'
+    fetchMock.mockRejectedValue(timeout)
+    await expect(api.securityStats()).rejects.toThrow('deadline exceeded')
+    expect(recentErrors()[0]).toMatchObject({
+      source: 'api',
+      message: 'deadline exceeded',
+      code: 'timeout',
+      endpoint: '/api/security/stats',
+    })
+  })
+
+  it('burst-caps repeats per endpoint so offline polling cannot flush the 20-deep ring', async () => {
+    fetchMock.mockRejectedValue(new TypeError('Failed to fetch'))
+    // Same endpoint rejected many times in a tight burst -> one entry, not many.
+    for (let i = 0; i < 25; i++) await api.securityStats().catch(() => {})
+    const sameEndpoint = recentErrors().filter(r => r.endpoint === '/api/security/stats')
+    expect(sameEndpoint).toHaveLength(1)
+  })
+
+  it('still records a DIFFERENT endpoint on its own first miss during the burst', async () => {
+    fetchMock.mockRejectedValue(new TypeError('Failed to fetch'))
+    await api.securityStats().catch(() => {})
+    await api.sessionsMemory().catch(() => {})
+    const endpoints = recentErrors().map(r => r.endpoint).sort()
+    expect(endpoints).toEqual(['/api/security/stats', '/api/sessions/memory'])
+  })
+
+  it('records the same endpoint again once the cooldown window has elapsed', async () => {
+    vi.useFakeTimers()
+    try {
+      fetchMock.mockRejectedValue(new TypeError('Failed to fetch'))
+      await api.securityStats().catch(() => {})
+      await api.securityStats().catch(() => {})
+      expect(recentErrors().filter(r => r.endpoint === '/api/security/stats')).toHaveLength(1)
+      vi.advanceTimersByTime(TRANSPORT_REJECTION_COOLDOWN_MS + 1)
+      await api.securityStats().catch(() => {})
+      expect(recentErrors().filter(r => r.endpoint === '/api/security/stats')).toHaveLength(2)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  // ── review (#17378, iamwhatever): the wrong endpoint must not reach the hand-off ──
+
+  it('two endpoints failing with the SAME network message each resolve their OWN endpoint', async () => {
+    // The blocker: every network drop carries one message ("Failed to fetch"),
+    // and the message-only `findReport` returns whichever journaled LAST, so a
+    // notice during an outage named another poll's endpoint. The report is
+    // pinned to each rejection, so `reportForError` resolves THIS request's.
+    fetchMock.mockRejectedValueOnce(new TypeError('Failed to fetch'))
+    const first = await api.securityStats().catch((e: unknown) => e)
+    fetchMock.mockRejectedValueOnce(new TypeError('Failed to fetch'))
+    const second = await api.sessionsMemory().catch((e: unknown) => e)
+
+    // Both journaled under the one message, newest first — exactly the ambiguity.
+    expect(recentErrors().map(r => r.message)).toEqual(['Failed to fetch', 'Failed to fetch'])
+    expect(recentErrors()[0].endpoint).toBe('/api/sessions/memory')
+
+    // The pin disambiguates: each error resolves its own request's endpoint.
+    expect(reportForError(first)?.endpoint).toBe('/api/security/stats')
+    expect(reportForError(second)?.endpoint).toBe('/api/sessions/memory')
+  })
+
+  it('findReport (message-only lookup) refuses a transport rejection, so no surface picks up the wrong endpoint', async () => {
+    // The message-only sites (AskAgentButton, lifecycle.ts, …) call findReport(e.message).
+    // A transport rejection shares its message with every other drop, so it must
+    // NOT be findable that way; it is reachable only through the pinned report.
+    fetchMock.mockRejectedValue(new TypeError('Failed to fetch'))
+    await api.securityStats().catch(() => {})
+    expect(findReport('Failed to fetch')).toBeUndefined()
+  })
+
+  it('findReport still resolves an ANSWERED failure that shares the message of a later rejection', async () => {
+    // A real HTTP failure (status, endpoint) stays findable by message. Only the
+    // transport rejections are skipped, so the message-only path keeps working
+    // for the answered failures it was built for.
+    recordError({ source: 'api', message: 'Load failed', status: 502, endpoint: '/api/answered' })
+    fetchMock.mockRejectedValue(new TypeError('Load failed')) // Safari wording, same text
+    await api.securityStats().catch(() => {})
+    // The newest "Load failed" is the rejection, but findReport skips it and
+    // returns the answered failure's own report.
+    expect(findReport('Load failed')?.endpoint).toBe('/api/answered')
+    expect(findReport('Load failed')?.status).toBe(502)
+  })
+
+  it('keys the burst cap on method + endpoint, so a POST and a GET on one path do not share a bucket', async () => {
+    // GET /api/workspaces (a poll) and POST /api/workspaces (a user write) are
+    // different requests. Sharing a bucket suppressed the POST and left its
+    // notice resolving the GET's method; separate buckets keep each honest.
+    fetchMock.mockRejectedValueOnce(new TypeError('Failed to fetch'))
+    await api.workspaces().catch(() => {}) // GET
+    fetchMock.mockRejectedValueOnce(new TypeError('Failed to fetch'))
+    const post = await api.createWorkspace({ name: 'w' }).catch((e: unknown) => e) // POST
+
+    const workspaceEntries = recentErrors().filter(r => r.endpoint === '/api/workspaces')
+    expect(workspaceEntries.map(r => r.method).sort()).toEqual(['GET', 'POST'])
+    // The POST's notice resolves its own method, not the earlier GET poll's.
+    expect(reportForError(post)?.method).toBe('POST')
+  })
+
+  it('a suppressed repeat still resolves THIS endpoint through the stored report, not a message fallback', async () => {
+    // A second rejection of one endpoint inside the cooldown records nothing new,
+    // but the error still carries the first miss's report (pinned), so a notice
+    // resolves this endpoint rather than falling through to a wrong message match.
+    fetchMock.mockRejectedValue(new TypeError('Failed to fetch'))
+    await api.securityStats().catch(() => {}) // first miss records
+    const repeat = await api.securityStats().catch((e: unknown) => e) // suppressed
+    expect(recentErrors().filter(r => r.endpoint === '/api/security/stats')).toHaveLength(1)
+    expect(reportForError(repeat)?.endpoint).toBe('/api/security/stats')
+  })
+
+  it('a wide outage cannot flush the ring: answered failures recorded before it survive', async () => {
+    // The per-endpoint cap alone did not bound the TOTAL, so 20+ distinct polling
+    // endpoints each recording once still emptied the 20-deep ring of real
+    // reports. The window ceiling caps distinct rejection keys per window.
+    const answered = recordError({ source: 'api', message: 'denied', status: 403, endpoint: '/api/answered-before' })
+    // Far more distinct endpoints fail than the ceiling admits.
+    fetchMock.mockRejectedValue(new TypeError('Failed to fetch'))
+    for (let i = 0; i < TRANSPORT_REJECTION_WINDOW_CAP + 10; i++) {
+      await api.artifact(`art-${i}`).catch(() => {}) // GET /api/artifacts/<slug> — distinct endpoints
+    }
+    const rejectionCount = recentErrors().filter(r => r.code === 'network').length
+    expect(rejectionCount).toBeLessThanOrEqual(TRANSPORT_REJECTION_WINDOW_CAP)
+    // The answered failure from before the outage is still in the journal.
+    expect(recentErrors().some(r => r.id === answered.id)).toBe(true)
   })
 })
 
@@ -950,14 +1183,16 @@ describe('query-string builders', () => {
     expect(call(1).url).toBe('/api/sessions?limit=10&offset=20&preview=1')
     await api.sessions(30, 0, false, true)
     expect(call(2).url).toBe('/api/sessions?limit=30&offset=0&exclude_open=1')
+    await api.sessions(30, 0, false, true, true)
+    expect(call(3).url).toBe('/api/sessions?limit=30&offset=0&exclude_open=1&user_only=1')
     await api.sessionsSearch('a b', 5)
-    expect(call(3).url).toBe('/api/sessions/search?q=a%20b&limit=5')
+    expect(call(4).url).toBe('/api/sessions/search?q=a%20b&limit=5')
     await api.vectorEpisodic(10, 5, 'promo,l6')
-    expect(call(4).url).toBe('/api/memory/episodic?limit=10&offset=5&tags=promo%2Cl6')
+    expect(call(5).url).toBe('/api/memory/episodic?limit=10&offset=5&tags=promo%2Cl6')
     await api.vectorEpisodic()
-    expect(call(5).url).toBe('/api/memory/episodic?limit=50&offset=0')
+    expect(call(6).url).toBe('/api/memory/episodic?limit=50&offset=0')
     await api.vectorEpisodicSearch('q', 'tag')
-    expect(call(6).url).toBe('/api/memory/episodic/search?q=q&tags=tag')
+    expect(call(7).url).toBe('/api/memory/episodic/search?q=q&tags=tag')
   })
 
   it('discovery endpoints append provider and limit only when set', async () => {
@@ -1002,14 +1237,22 @@ describe('query-string builders', () => {
     expect(call(4).url).toBe('/api/file-diff?path=%2Frepo%2Fa%20b.ts')
   })
 
-  it('fileSearch scopes to a project and forwards the abort signal', async () => {
+  it('scopes fileSearch to a project and relays the abort signal under its deadline', async () => {
     const ctl = new AbortController()
     await api.fileSearch('cli', 'kirocrew', ctl.signal)
     expect(call().url).toBe('/api/file-search?q=cli&project=kirocrew')
-    expect(call().init?.signal).toBe(ctl.signal)
+    // The fetch gets the DEADLINE's signal, not the caller's: the bound lives in
+    // the client, so a caller cannot opt out of it by handing over its own.
+    const relayed = call().init?.signal as AbortSignal
+    expect(relayed).toBeInstanceOf(AbortSignal)
+    expect(relayed).not.toBe(ctl.signal)
+    // Relay is asserted where observable -- on a request still in flight; this one
+    // has settled, so its timer and listener are already released.
+
+    // A caller that passes no signal is bounded all the same.
     await api.fileSearch('cli')
     expect(call(1).url).toBe('/api/file-search?q=cli')
-    expect(call(1).init).toBeUndefined()
+    expect(call(1).init?.signal).toBeInstanceOf(AbortSignal)
   })
 
   it('artifactSessionDocs can scope to one session', async () => {
@@ -1147,33 +1390,13 @@ describe('request bodies with conditionally-omitted keys', () => {
     })
   })
 
-  it('createChatSlot carries adopt_remote_slot and resolves NO default memory mode for it', async () => {
-    // THE ADOPT WIRE FORMAT. `adopt_remote_slot` is the peer session's own slot
-    // key, and it rides the SAME create route beside `instance_id` — the contract
-    // deliberately adds no second endpoint, because the local slot is created the
-    // same way either way and only what it binds to changes.
+  it('createChatSlot sends agent_kind beside an agent and never a crew binding', async () => {
     await api.createChatSlot(
-      undefined, undefined, undefined, undefined, undefined, undefined,
-      undefined, undefined, 'inst-a', 'chat-9',
+      undefined, 'a', undefined, undefined, 'persistent', undefined,
+      undefined, undefined, 'member',
     )
     expect(call().url).toBe('/api/chat/slots')
-    expect(call().body).toEqual({ instance_id: 'inst-a', adopt_remote_slot: 'chat-9' })
-    // No `/api/dashboard/config` read at all: an adopt inherits the PEER
-    // session's `memory_mode`, so resolving this machine's default would send a
-    // value the server has to ignore — and if it ever stopped ignoring it, an
-    // incognito peer session would land here as a persistent transcript. That is
-    // why `memory_mode` is ABSENT above rather than defaulted, and why exactly
-    // one request went out.
-    expect(fetchMock).toHaveBeenCalledTimes(1)
-
-    // An explicit mode still wins: a caller that names one means it.
-    await api.createChatSlot(
-      undefined, undefined, undefined, undefined, 'incognito', undefined,
-      undefined, undefined, 'inst-a', 'chat-9',
-    )
-    expect(call(1).body).toEqual({
-      memory_mode: 'incognito', instance_id: 'inst-a', adopt_remote_slot: 'chat-9',
-    })
+    expect(call().body).toEqual({ agent: 'a', agent_kind: 'member', memory_mode: 'persistent' })
   })
 
   it('sessionStorageRestore adds the uid list only for a partial restore', async () => {
@@ -1307,8 +1530,10 @@ describe('request bodies with conditionally-omitted keys', () => {
   it('mcpGatewaySetStub has a single and a batch form', async () => {
     await api.mcpGatewaySetStub('fs', true)
     expect(call().body).toEqual({ name: 'fs', stub: true })
+    await api.mcpGatewaySetStub('fs', true, 'command-hash:env-hash')
+    expect(call(1).body).toEqual({ name: 'fs', stub: true, expected_launch: 'command-hash:env-hash' })
     await api.mcpGatewaySetStubMany(['fs', 'git'], false)
-    expect(call(1).body).toEqual({ names: ['fs', 'git'], stub: false })
+    expect(call(2).body).toEqual({ names: ['fs', 'git'], stub: false })
   })
 
   it('createTagColumn/updateTagColumn pass the filter mode straight through', async () => {
@@ -1463,6 +1688,110 @@ describe('sendChat theme consent', () => {
 
 /* ─────────────── 3. the non-trivial method implementations ─────────────── */
 
+describe('deadline-bound endpoints', () => {
+  // Exercised against a stubbed `fetch`, the only layer where the bound is
+  // observable -- the component harnesses stub `api.*` and would bypass it.
+
+  const realTimeout = globalThis.setTimeout
+
+  /** Shrink the deadline without touching the production composition, and record the
+   *  value it asked for, so the assertion costs milliseconds rather than a real 10s
+   *  wait. Same shape the base's other client-deadline suites use. */
+  function shrinkDeadline(ms: number, record?: (asked: number) => void) {
+    vi.spyOn(globalThis, 'setTimeout').mockImplementation(((fn: () => void, asked?: number) => {
+      record?.(asked ?? 0)
+      return realTimeout(fn, ms)
+    }) as unknown as typeof globalThis.setTimeout)
+  }
+
+  const wedged = () => fetchMock.mockImplementation(
+    (_u: string, init?: RequestInit) =>
+      new Promise((_resolve, reject) => {
+        const s = init?.signal
+        if (s?.aborted) return reject(s.reason)
+        s?.addEventListener('abort', () => reject(s.reason), { once: true })
+      }),
+  )
+
+  it('rejects with the TimeoutError-named Error shape the cause-keyed notices decode', async () => {
+    // A transport default that rejects with any other shape stops `isDeadlineError` recognising
+    // it, silently degrading every cause-keyed notice here to the generic "failed" copy.
+    const { isDeadlineError } = await import('../api/queryClient')
+    const { searchErrorCause } = await import('../lib/searchErrorCause')
+    wedged()
+    shrinkDeadline(20)
+    const err = await api.browseFiles('/p').then(() => null, (e: unknown) => e)
+    expect(err).toBeInstanceOf(Error)
+    expect((err as Error).name).toBe('TimeoutError')
+    expect(isDeadlineError(err)).toBe(true)
+    expect(searchErrorCause(err)).toBe('timed_out')
+  })
+
+  it('bounds api.recentProjects, the picker sibling that shares the wedged loop', async () => {
+    // Fail-first: unbounded, the Recent tab sat empty for as long as the gateway hung.
+    const asked: number[] = []
+    wedged()
+    shrinkDeadline(20, ms => asked.push(ms))
+    await expect(api.recentProjects()).rejects.toMatchObject({ name: 'TimeoutError' })
+    expect(asked).toContain(BROWSE_FILES_TIMEOUT_MS)
+  })
+
+  it('bounds api.browseDirs too, the sibling both directory pickers spin on', async () => {
+    // Fail-first: unbounded, this promise never settled and the Project/Workspace
+    // pickers sat on an empty browse list for as long as they stayed open.
+    const asked: number[] = []
+    wedged()
+    shrinkDeadline(20, ms => asked.push(ms))
+    await expect(api.browseDirs('/p')).rejects.toMatchObject({ name: 'TimeoutError' })
+    expect(asked).toContain(BROWSE_FILES_TIMEOUT_MS)
+  })
+
+  it('bounds api.browseFiles, so a wedged gateway stops the folder listing spinning', async () => {
+    // Fail-first: unbounded, this promise never settled and FolderPanel showed its
+    // loading state for as long as the panel stayed open.
+    const asked: number[] = []
+    wedged()
+    shrinkDeadline(20, ms => asked.push(ms))
+    await expect(api.browseFiles('/p')).rejects.toMatchObject({ name: 'TimeoutError' })
+    expect(asked).toContain(BROWSE_FILES_TIMEOUT_MS)
+  })
+
+  it('bounds api.projectTree by the WHOLE-TREE deadline, not the one-level listing one', async () => {
+    // The listing bound is documented as shorter "because a listing walks one level, not the
+    // tree", so the tree read sharing it contradicted that; assertion two is the drift control.
+    const asked: number[] = []
+    wedged()
+    shrinkDeadline(20, ms => asked.push(ms))
+    await expect(api.projectTree('/p')).rejects.toMatchObject({ name: 'TimeoutError' })
+    expect(asked).toContain(FILE_SEARCH_TIMEOUT_MS)
+    expect(asked).not.toContain(BROWSE_FILES_TIMEOUT_MS)
+  })
+
+  it('leaves api.projectGitStatus UNBOUNDED, the scope this PR declares and its comment states', async () => {
+    // Bounding it puts the raw English deadline message into every locale, because the git
+    // panel renders the server message verbatim and has no timeout copy of its own.
+    const asked: number[] = []
+    wedged()
+    shrinkDeadline(20, ms => asked.push(ms))
+    void api.projectGitStatus('/p').catch(() => {})
+    await new Promise(resolve => realTimeout(resolve, 60))
+    expect(asked).not.toContain(BROWSE_FILES_TIMEOUT_MS)
+  })
+
+  it('passes the caller signal through browseFiles, so a superseded listing is cancelled', async () => {
+    const ac = new AbortController()
+    fetchMock.mockImplementation(
+      (_u: string, init?: RequestInit) =>
+        new Promise((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), { once: true })
+        }),
+    )
+    const p = api.browseFiles('/p', ac.signal)
+    ac.abort(new Error('superseded'))
+    await expect(p).rejects.toBeTruthy()
+  })
+})
+
 describe('revealPath', () => {
   // The transport is side-effect-free: it posts the action and returns the wire
   // shape. When the host is headless it hands back a `copy` path for the caller
@@ -1579,6 +1908,21 @@ describe('uploadFiles', () => {
     } as unknown as Response)
     const out = await api.uploadFiles([png('a.png')])
     expect(out).toMatchObject({ paths: [], error: 'Internal Server Error' })
+  })
+
+  it("hands the caller's AbortSignal to the request, so an upload can be cancelled", async () => {
+    const ac = new AbortController()
+    fetchMock.mockResolvedValue(okJson({ paths: ['/up/a.png'] }))
+    await api.uploadFiles([png('a.png')], ac.signal)
+    // Without this the composer's cancel control has nothing to abort: the
+    // request runs to completion whatever the user does.
+    expect(call().init?.signal).toBe(ac.signal)
+  })
+
+  it('omits signal entirely when the caller passes none', async () => {
+    fetchMock.mockResolvedValue(okJson({ paths: ['/up/a.png'] }))
+    await api.uploadFiles([png('a.png')])
+    expect(call().init?.signal).toBeUndefined()
   })
 
   it('refuses to trust a 200 whose paths field is not an array', async () => {
@@ -1835,10 +2179,24 @@ describe('every api method issues one well-formed /api request', () => {
   const methods = Object.entries(api as unknown as Record<string, AnyFn>)
     .filter(([name, fn]) => typeof fn === 'function' && !HAND_TESTED.has(name))
 
+  // A deadline composes its own signal with the caller's, so identity is not the
+  // contract for these methods. Keep this list narrow: every other dispatched
+  // signal must still be the exact one supplied by the caller.
+  const DEADLINE_WRAPPED_METHODS = new Set([
+    'fileSearch',
+    'browseFiles',
+    'browseDirs',
+    'browseDrives',
+    'recentProjects',
+    'projectTree',
+  ])
+  const CALLER_SIGNAL = new AbortController().signal
+
   // Methods whose URL comes out of an ARGUMENT'S FIELD rather than a positional
   // string. The generic `'sw-1'` args below would make such a method build its
   // URL from `undefined` — a harness artifact, not a defect in the method — so
-  // each one names the minimal shape its URL is read from.
+  // each one names the minimal shape its URL is read from. Signal-bearing methods
+  // also receive a real signal so the probe can assert their dispatch contract.
   const ARGS: Record<string, unknown[]> = {
     // Memory reads take typed objects; positional strings do not satisfy the
     // query/record contract and would manufacture undefined URL parameters.
@@ -1855,10 +2213,26 @@ describe('every api method issues one well-formed /api request', () => {
     // not a defect: a real caller hands this a Blob, exactly as here, and a Blob
     // body is left alone the same way a FormData one is.
     importSessionFromFile: [new Blob(['{}'], { type: 'application/gzip' })],
+    updateInstance: ['sw-1', {}, { signal: CALLER_SIGNAL }],
+    chatSlotDetail: ['sw-1', undefined, undefined, CALLER_SIGNAL],
+    sendChat: ['sw-1', 'sw-2', 'sw-3', CALLER_SIGNAL],
+    spawnStatus: ['sw-1', { signal: CALLER_SIGNAL }],
+    fileSearch: ['sw-1', 'sw-2', CALLER_SIGNAL],
+    pathComplete: ['sw-1', 'sw-2', 'sw-3', CALLER_SIGNAL],
+    browseFiles: ['sw-1', CALLER_SIGNAL],
   }
 
   it('covers the whole surface (guards against the table silently shrinking)', () => {
     expect(methods.length).toBeGreaterThan(300)
+  })
+
+  it('keeps deadline-bound file reads in the universal request probe', () => {
+    expect(methods.map(([name]) => name)).toEqual(expect.arrayContaining([
+      'fileSearch',
+      'browseFiles',
+      'browseDirs',
+      'recentProjects',
+    ]))
   })
 
   it.each(methods.map(([name]) => name))('%s', async (name) => {
@@ -1875,6 +2249,13 @@ describe('every api method issues one well-formed /api request', () => {
     expect(url.startsWith('/api/'), `${name} escaped the /api prefix: ${url}`).toBe(true)
     for (const junk of ['undefined', '[object Object]', 'NaN', '/null']) {
       expect(url.includes(junk), `${name} leaked ${junk} into ${url}`).toBe(false)
+    }
+    if (init?.signal !== undefined) {
+      if (DEADLINE_WRAPPED_METHODS.has(name)) {
+        expect(init.signal, `${name} dropped its deadline signal`).toBeInstanceOf(AbortSignal)
+      } else {
+        expect(init.signal, `${name} did not forward the caller signal`).toBe(CALLER_SIGNAL)
+      }
     }
     // A body is only ever sent with a method that can carry one.
     if (init?.body !== undefined) {

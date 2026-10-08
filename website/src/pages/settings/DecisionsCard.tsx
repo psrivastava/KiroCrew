@@ -1,12 +1,14 @@
 import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useSearchParams } from 'react-router-dom'
+import { Trans } from 'react-i18next'
 import { resolveLegacyHighlightId } from '../../hooks/useSettingHighlight'
 import { AlertTriangle, CircleDot } from 'lucide-react'
 
 import { api } from '../../api/client'
 import { isNotFoundError } from '../../api/apiError'
 import ErrorNotice from '../../components/ErrorNotice'
+import { SettingsLink } from '../../components/SettingsLink'
 import { Suspense, lazy } from 'react'
 import { SettingsCard, SettingsToggle, SettingsInput } from '../../components/settings'
 import { SecretField } from '../../components/SecretField'
@@ -15,15 +17,22 @@ import { useAvailableModelsQuery } from '../../hooks/useAvailableModels'
 import {
   DECISIONS_API_KEY_SECRET,
   DECISIONS_BUCKET_PATH,
+  DECISIONS_LANE_LLM,
   DECISIONS_MODEL_ROUTE_PATH,
+  DECISIONS_NUDGE_WAKE_MODEL_PATH,
+  DECISIONS_NUDGE_WAKE_POINT,
+  DECISIONS_NUDGE_WAKE_PROVIDER_PATH,
   POINT_ACTIVE,
   POINT_NEEDS_SCOPE,
   readDecisions,
   readModelRoute,
+  readNudgeWake,
   type DecisionPointRow,
 } from './decisionsPreview'
 import { fmtPercent } from '../../i18n/format'
+import { DECISIONS_PROVIDER_QUERY_KEY, PRESET_NONE } from './decisionsProviderQuery'
 import { i18nT } from '../../i18n/t'
+import { fetchDashboardConfig } from '../../api/dashboardConfigQuery'
 
 /**
  * One point's own settings, on a lazy boundary.
@@ -40,6 +49,14 @@ import { i18nT } from '../../i18n/t'
  */
 const DecisionsPointPanel = lazy(async () => ({
   default: (await import('./DecisionsPointPanel')).DecisionsPointPanel,
+}))
+
+/**
+ * The decision-model picker, on the same kind of boundary: none of its controls is
+ * in the settings registry, so search never probes for it.
+ */
+const DecisionsProviderPicker = lazy(async () => ({
+  default: (await import('./DecisionsProviderPicker')).DecisionsProviderPicker,
 }))
 
 /**
@@ -173,7 +190,7 @@ export function DecisionsCard() {
   // an egress switch.
   const dashCfgQ = useQuery<{ decisions_enabled?: boolean }>({
     queryKey: ['dashboardConfig'],
-    queryFn: () => api.dashboardConfig(),
+    queryFn: fetchDashboardConfig,
     staleTime: 30_000,
   })
   const governancePermits = dashCfgQ.data?.decisions_enabled === true
@@ -192,6 +209,13 @@ export function DecisionsCard() {
     queryFn: () => api.secretsList(),
   })
   const view = readDecisions(consentQ.data, configQ.data)
+  // Shared with the picker through the query key: the card reads it only to decide
+  // whether the hand-edited-address pointer applies.
+  const providerQ = useQuery({
+    queryKey: DECISIONS_PROVIDER_QUERY_KEY,
+    queryFn: () => api.getDecisionsProvider(),
+    retry: false,
+  })
   const modelsQ = useAvailableModelsQuery()
 
   /* ── Which row the panel belongs to ──────────────────────────────────────── */
@@ -206,6 +230,15 @@ export function DecisionsCard() {
 
   /* ── Reads that feed the panels ──────────────────────────────────────────── */
   const modelRoute = readModelRoute(configQ.data)
+  // The judge point's own two values, read on the same terms as the tier map above.
+  const nudgeWake = readNudgeWake(configQ.data)
+  // INHERIT first, then every advertised id. `auto` is dropped because the empty
+  // option already means inherit and two words for it would read as two behaviours.
+  // A pinned id the backend no longer advertises is kept so a reader can switch off it.
+  const judgeModelOptions = ['', ...modelsQ.data.map(m => m.name).filter(m => m !== 'auto')]
+  if (nudgeWake.llmModel && !judgeModelOptions.includes(nudgeWake.llmModel)) {
+    judgeModelOptions.splice(1, 0, nudgeWake.llmModel)
+  }
   // The reviewed CEILING, off the keystone the switch writes. `config.json` carries
   // what the seam asks for and an agent may raise it; this is the number the gate
   // clamps to, so it is the one a reader may act on and the one the box edits.
@@ -329,6 +362,7 @@ export function DecisionsCard() {
       'pages.developer.featurePreviewsTab.decisions_point_compaction_keep',
     ),
     'memory.recall': i18nT('pages.developer.featurePreviewsTab.decisions_point_memory_recall'),
+    'nudge.wake': i18nT('pages.developer.featurePreviewsTab.decisions_point_nudge_wake'),
   }
   const POINT_WHAT: Record<string, string> = {
     'skills.select': i18nT('pages.developer.featurePreviewsTab.decisions_what_skills_select'),
@@ -341,29 +375,47 @@ export function DecisionsCard() {
     'memory.recall': i18nT(
       'pages.developer.featurePreviewsTab.decisions_what_memory_recall',
     ),
+    'nudge.wake': i18nT('pages.developer.featurePreviewsTab.decisions_what_nudge_wake'),
   }
   const STATUS_WORD: Record<string, string> = {
     [POINT_ACTIVE]: i18nT('pages.developer.featurePreviewsTab.decisions_status_active'),
     [POINT_NEEDS_SCOPE]: i18nT('pages.developer.featurePreviewsTab.decisions_status_needs_scope'),
   }
+  const smallModelJudgeWord = i18nT(
+    'pages.developer.featurePreviewsTab.decisions_status_judged_by_small_model',
+  )
   // A label per SCOPE, so a point that needs a new one draws its switch with no
   // per-point branch here.
   const SCOPE_LABEL: Record<string, string> = {
     tool_args: i18nT('pages.developer.featurePreviewsTab.decisions_tool_args'),
     compaction: i18nT('pages.developer.featurePreviewsTab.decisions_compaction'),
     memory_text: i18nT('pages.developer.featurePreviewsTab.decisions_memory_text'),
+    nudge_evidence: i18nT('pages.developer.featurePreviewsTab.decisions_nudge_evidence'),
   }
   const SCOPE_DESC: Record<string, string> = {
     tool_args: i18nT('pages.developer.featurePreviewsTab.decisions_tool_args_desc'),
     compaction: i18nT('pages.developer.featurePreviewsTab.decisions_compaction_desc'),
     memory_text: i18nT('pages.developer.featurePreviewsTab.decisions_memory_text_desc'),
+    nudge_evidence: i18nT('pages.developer.featurePreviewsTab.decisions_nudge_evidence_desc'),
   }
   const TIER_LABEL: Record<string, string> = {
     simple: i18nT('pages.developer.featurePreviewsTab.decisions_tier_simple'),
     medium: i18nT('pages.developer.featurePreviewsTab.decisions_tier_medium'),
     complex: i18nT('pages.developer.featurePreviewsTab.decisions_tier_complex'),
   }
+  // One label per provider word the judge accepts, keyed as the config spells it.
+  const PROVIDER_LABEL: Record<string, string> = {
+    auto: i18nT('pages.developer.featurePreviewsTab.decisions_judge_provider_auto'),
+    jev: i18nT('pages.developer.featurePreviewsTab.decisions_judge_provider_jev'),
+    llm: i18nT('pages.developer.featurePreviewsTab.decisions_judge_provider_llm'),
+  }
   const inheritLabel = i18nT('pages.developer.featurePreviewsTab.decisions_tier_inherit')
+  // The judge's own word for INHERIT. The tier label above says the SESSION's model,
+  // which is what a tier's empty value keeps; the judge's empty value resolves the
+  // judge agent's own model instead, so reusing that label would name the wrong one.
+  const judgeInheritLabel = i18nT(
+    'pages.developer.featurePreviewsTab.decisions_judge_model_inherit',
+  )
   const offWord = i18nT('pages.developer.featurePreviewsTab.decisions_status_off')
 
   // The recorded answer PER SCOPE, keyed as the keystone spells it. A switch reading
@@ -375,12 +427,31 @@ export function DecisionsCard() {
     tool_args: view.toolArgs,
     compaction: view.compaction,
     memory_text: view.memoryText,
+    nudge_evidence: view.nudgeEvidence,
   }
 
   const nameOf = (id: string) => POINT_NAME[id] ?? id
   // An unknown status reads as OFF: the fail-closed direction, since the alternative
-  // is claiming a point runs on a word this build cannot read.
-  const statusWord = (row: DecisionPointRow) => STATUS_WORD[row.status] ?? offWord
+  // is claiming a point runs on a word this build cannot read. The judge row is the
+  // one row whose ACTIVE has two meanings, and the generic word is a contradiction
+  // under the list's own "while this is on" heading when the switch is off -- so it
+  // names the lane instead, and only when that lane is the one that would run.
+  //
+  // WHICH lane comes off the row. This side cannot work it out: `auto` resolves
+  // against the Jev lane being ARMED for this point, which needs that point's own
+  // evidence scope, and this card holds no reader for a scope the build may not
+  // register -- so deriving it from the switch would print the generic word over a
+  // small-model judge for the default provider.
+  const statusWord = (row: DecisionPointRow) => {
+    if (
+      row.id === DECISIONS_NUDGE_WAKE_POINT &&
+      row.status === POINT_ACTIVE &&
+      row.lane === DECISIONS_LANE_LLM
+    ) {
+      return smallModelJudgeWord
+    }
+    return STATUS_WORD[row.status] ?? offWord
+  }
 
   /* ── Keyboard: the list is one tab stop and the arrows move within it ────── */
   const moveHighlight = (delta: number) => {
@@ -406,6 +477,9 @@ export function DecisionsCard() {
   // reorder them can land the delete last and erase the key just saved.
   const apiKeyBusy = !apiKeyKnown || secretMut.isPending || secretDelMut.isPending
   const bucket = view.bucket ?? 100
+  // With no decision model chosen there is nothing to consent to sending to; the
+  // gateway refuses an enabling write, and the switch says so instead of offering one.
+  const noModel = providerQ.data?.active === PRESET_NONE
 
   return (
     <SettingsCard>
@@ -429,7 +503,9 @@ export function DecisionsCard() {
         description={i18nT('pages.developer.featurePreviewsTab.decisions_desc')}
         checked={view.enabled}
         onChange={v => consentMut.mutate(v)}
-        disabled={switchFrozen || consentMut.isPending || scopeMut.isPending}
+        // With no model the switch can still be turned OFF: a consent that stood
+        // before the switch to No model must stay revocable.
+        disabled={switchFrozen || (noModel && !view.enabled) || consentMut.isPending || scopeMut.isPending}
         describedBy={describedBy}
       />
       {/* The egress fact carries body weight, not muted fine print: it is what a
@@ -440,7 +516,16 @@ export function DecisionsCard() {
         id={EGRESS_NOTE_ID}
         className={backendMissing ? 'text-[12px] text-muted opacity-40' : 'text-[12px] text-text'}
       >
-        {i18nT('pages.developer.featurePreviewsTab.decisions_egress')}
+        {/* Any address the gateway classifies as this machine -- a local preset or a
+            hand-written loopback address -- makes the "over the internet" sentence
+            false. The local wording names only the first hop ("the server at the
+            address below, on this machine") and leaves where that server forwards it
+            to the server, which holds for a hand-written tunnel too. */}
+        {noModel
+          ? i18nT('pages.developer.featurePreviewsTab.decisions_no_model_note')
+          : providerQ.data?.loopback === true
+            ? i18nT('pages.developer.featurePreviewsTab.decisions_egress_local')
+            : i18nT('pages.developer.featurePreviewsTab.decisions_egress')}
       </p>
       {/* The sampling share, stated in BOTH switch states and OUTSIDE the disclosure.
         * The decisions module spec under docs/system-specs/modules pins it there: the
@@ -448,7 +533,7 @@ export function DecisionsCard() {
         * they have to see it before they flip the switch. Behind a closed disclosure it
         * is a fact they do not see -- the same argument that keeps the egress note above
         * out. The SLIDER stays in the shared block; this is the fact, not the control. */}
-      {view.supported && (
+      {view.supported && !noModel && (
         <p className="text-[12px] text-muted">
           {i18nT('pages.developer.featurePreviewsTab.decisions_bucket_hint', {
             percent: fmtPercent(bucket / 100),
@@ -458,22 +543,37 @@ export function DecisionsCard() {
       {/* WHERE the messages go, as a fact beside the switch: consent is given for an
           address, and the gate holds the config to that address afterwards. Mono and
           untranslated — it is a URL a reader may compare against their provider. */}
-      {view.supported && view.configuredEndpoint && (
+      {view.supported && view.configuredEndpoint && !noModel && (
         <p className="text-[12px] text-muted">
           {i18nT('pages.developer.featurePreviewsTab.decisions_sent_to')}{' '}
           <span className="font-mono break-all">{view.configuredEndpoint}</span>
         </p>
       )}
-      {/* And where that address is changed. The card offers no control for it: `PATCH
-          /api/config/kirocrew` excludes `decisions.provider.*`, so a dashboard caller
-          cannot choose where the state a decision point collects is sent, and a field
-          here would be one whose every save is refused. Its own paragraph, so the
-          address line stays the one short fact a reader compares against their
-          provider. */}
-      {view.supported && view.configuredEndpoint && (
+      {/* Where an address set by hand is changed. `PATCH /api/config/kirocrew`
+          excludes `decisions.provider.*`, so no generic field here can choose where
+          the state a decision point collects is sent. The picker below switches
+          between hosted Jev and a local preset through its own owner-only route,
+          which takes a preset id and a port and builds the address itself; an
+          address that is neither is the one case it cannot name, so only then does
+          this pointer say where it lives. Shown too while the provider read has not
+          answered, since that is the state in which the picker says nothing. */}
+      {view.supported && view.configuredEndpoint && (providerQ.data === undefined || providerQ.data.active === 'custom') && (
         <p className="text-[12px] text-muted">
           {i18nT('pages.developer.featurePreviewsTab.decisions_endpoint_pointer')}
         </p>
+      )}
+      {/* A hand-written loopback address is sent no Jev key; a tunnel to hosted Jev
+          would then fail with 401 and decisions would quietly stop, so say it here,
+          where the owner is looking, not only in the gateway log. */}
+      {view.supported && providerQ.data?.active === 'custom' && providerQ.data.loopback === true && (
+        <p className="text-[12px] text-warn">
+          {i18nT('pages.developer.featurePreviewsTab.decisions_custom_loopback_no_key')}
+        </p>
+      )}
+      {view.supported && (
+        <Suspense fallback={<div className="h-24" aria-hidden />}>
+          <DecisionsProviderPicker frozen={frozen} cardReadFailed={readFailed} consentOn={view.enabled} />
+        </Suspense>
       )}
       {/* The redirected-config state: consent stands for one address, config.json now
           names another, so nothing is sent. A WARNING, not a paragraph: it is the one
@@ -687,7 +787,13 @@ export function DecisionsCard() {
       {/* ── OVERVIEW + DETAIL ───────────────────────────────────────────────── */}
       {view.supported && rows.length === 0 && (
         <p className="text-[12px] text-muted">
-          {i18nT('pages.developer.featurePreviewsTab.decisions_points_unavailable')}
+          {/* The notice says where to update, so the place it names is a link to
+              it. One catalog string carries the anchor, so a translation can put
+              it wherever its grammar needs. */}
+          <Trans
+            i18nKey="pages.developer.featurePreviewsTab.decisions_points_unavailable"
+            components={[<SettingsLink key="l" tab="releases" />]}
+          />
         </p>
       )}
       {view.supported && rows.length > 0 && (
@@ -844,6 +950,25 @@ export function DecisionsCard() {
                     tiersDisabled={frozen}
                     onTierChange={(tier, value) =>
                       configMut.mutate({ path: `${DECISIONS_MODEL_ROUTE_PATH}.${tier}`, value })
+                    }
+                    judgeProvider={nudgeWake.provider}
+                    judgeModel={nudgeWake.llmModel}
+                    judgeInheritLabel={judgeInheritLabel}
+                    // A pinned model the backend no longer advertises stays selectable,
+                    // for the same reason a tier's does: otherwise a reader could not
+                    // switch back off it. `auto` is dropped because INHERIT already is
+                    // the empty option, and offering both would be two words for it.
+                    judgeModelOptions={judgeModelOptions}
+                    providerLabel={PROVIDER_LABEL}
+                    // NOT gated on consent, unlike the scope switch above: the small-model
+                    // lane needs none, and an owner with no Jev key must be able to pick
+                    // it while the switch is off.
+                    judgeDisabled={frozen}
+                    onJudgeProviderChange={value =>
+                      configMut.mutate({ path: DECISIONS_NUDGE_WAKE_PROVIDER_PATH, value })
+                    }
+                    onJudgeModelChange={value =>
+                      configMut.mutate({ path: DECISIONS_NUDGE_WAKE_MODEL_PATH, value })
                     }
                   />
                 </Suspense>

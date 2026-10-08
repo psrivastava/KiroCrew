@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, onTestFinished } from 'vitest'
 import { screen, fireEvent, waitFor, within, act } from '@testing-library/react'
 import { renderWithProviders } from '../../test/helpers'
+import { AppIdentityProvider } from '../../app-sdk/identity'
 import { i18nT } from '../../i18n/t'
 import { fmtBytes } from '../../i18n/format'
 import type {
@@ -139,6 +140,17 @@ function stubActiveJob(kind: 'snapshot' | 'sessions') {
 
 beforeEach(() => {
   vi.clearAllMocks()
+  // Reset, not clear: a clear keeps each mock's persistent and queued-once
+  // implementations, so a case that stubs a running backup (or holds a read in
+  // flight) would hand that state to whichever case runs next, and a case that
+  // seeds nothing would pass only after one that did. Every case starts from
+  // the same present, empty drive instead.
+  for (const group of [awsControlApi, api] as unknown as Array<Record<string, unknown>>) {
+    for (const fn of Object.values(group)) {
+      if (vi.isMockFunction(fn)) fn.mockReset()
+    }
+  }
+  stubDrivePresent()
   // The grid/list toggle persists per section to localStorage, which outlives a
   // single test. Without this, a test that switches a section's view silently
   // changes what every LATER test in the file renders -- the table controls
@@ -167,7 +179,14 @@ async function renderDrive(section: 'drive' | 'library' | 'backup' | 'access') {
     : section === 'library' ? <LibrarySection account={ACCOUNT_ID} bucket={driveExists.bucket} />
     : section === 'backup' ? <BackupSection account={ACCOUNT_ID} />
     : <AccessSection account={ACCOUNT_ID} />
-  renderWithProviders(el)
+  // Under the app's own identity, the way `BuiltinAppRoute` mounts these
+  // sections: their queries are keyed through the host, so a bare render
+  // resolves them unprefixed and the cache layout stops being the product's.
+  renderWithProviders(
+    <AppIdentityProvider appId="aws-control" origin="builtin">
+      {el}
+    </AppIdentityProvider>,
+  )
 }
 
 /**
@@ -185,6 +204,44 @@ async function renderDrive(section: 'drive' | 'library' | 'backup' | 'access') {
 async function chooseFromMenu(trigger: HTMLElement, itemTestId: string) {
   fireEvent.keyDown(trigger, { key: 'Enter' })
   fireEvent.click(await screen.findByTestId(itemTestId))
+}
+
+/**
+ * Wait until a useDialogFocusTrap dialog can HEAR a key, not just until it is
+ * mounted. The share and move dialogs open from a `setTimeout(0)` (openShare /
+ * openMove), so their render is a default-priority update whose passive effects
+ * may run a scheduler task after the commit `findByTestId` resolved on. The
+ * trap's window keydown (Escape) listener is one of those effects; an Escape
+ * sent before it exists is lost, and the dialog never closes. The trap moves
+ * focus into the dialog in the same effect flush (the dialog has no autoFocus of
+ * its own), so focus inside it proves the listener is attached.
+ */
+async function findTrappedDialog(testId: string): Promise<HTMLElement> {
+  const dialog = await screen.findByTestId(testId)
+  await waitFor(() => expect(dialog.contains(document.activeElement)).toBe(true))
+  return dialog
+}
+
+/**
+ * Record what the page showed each time a useDialogFocusTrap re-armed its window
+ * keydown listener. The trap's Escape handler is the dialog's `close`, which
+ * closes over the render's state (ShareDialog's `shareMut.isPending`), so the
+ * trap re-adds its capture-phase listener in the passive effect of every render.
+ * A key sent between the commit a test waited on and that re-add reaches the
+ * previous render's handler, or none. Waiting for a re-arm recorded WHILE the
+ * awaited state was on screen proves the handler a key now reaches has seen it.
+ */
+function recordTrapRearms<T>(snapshot: () => T): T[] {
+  const seen: T[] = []
+  const realAdd = window.addEventListener.bind(window)
+  const adds = vi.spyOn(window, 'addEventListener').mockImplementation(
+    (...args: Parameters<typeof window.addEventListener>) => {
+      if (args[0] === 'keydown' && args[2] === true) seen.push(snapshot())
+      realAdd(...args)
+    },
+  )
+  onTestFinished(() => adds.mockRestore())
+  return seen
 }
 
 const BLOCKED_HOST_KEY = 'apps.awsControl.console.backup_nightly_sessions_blocked_host'
@@ -908,6 +965,8 @@ describe('DrivePage sections: folder disclosure and downloads', () => {
     // A fake tab whose location we can inspect: the handler must set its href.
     const fakeTab = { location: { href: '' }, close: vi.fn() } as unknown as Window
     const openSpy = vi.spyOn(window, 'open').mockReturnValue(fakeTab)
+    // Restored even if an assertion below throws, so no later test opens a dead tab.
+    onTestFinished(() => openSpy.mockRestore())
 
     await renderDrive('drive')
 
@@ -923,7 +982,6 @@ describe('DrivePage sections: folder disclosure and downloads', () => {
     expect(openSpy).toHaveBeenCalledWith('', '_blank')
     await waitFor(() => expect(fakeTab.location.href).toBe('https://example-presigned/dl?sig=y'))
     expect(fakeTab.close).not.toHaveBeenCalled()
-    openSpy.mockRestore()
   })
 
   it('closes the blank tab when the download presign fails', async () => {
@@ -936,6 +994,8 @@ describe('DrivePage sections: folder disclosure and downloads', () => {
     vi.mocked(awsControlApi.driveDownload).mockRejectedValue(new Error('AccessDenied'))
     const fakeTab = { location: { href: '' }, close: vi.fn() } as unknown as Window
     const openSpy = vi.spyOn(window, 'open').mockReturnValue(fakeTab)
+    // Restored even if an assertion below throws, so no later test opens a dead tab.
+    onTestFinished(() => openSpy.mockRestore())
 
     await renderDrive('drive')
 
@@ -947,7 +1007,6 @@ describe('DrivePage sections: folder disclosure and downloads', () => {
     // unhandled rejection from an onClick with no catch, which tells the user
     // nothing; the row must say the download did not start.
     expect(await screen.findByTestId('drive-download-error')).toBeTruthy()
-    openSpy.mockRestore()
   })
 
   /* ── Drive: upload flow, including the client-side bad-name guard ────────── */
@@ -2795,6 +2854,48 @@ describe('DrivePage sections: per-install backup attribution', () => {
       i18nT('apps.awsControl.console.backup_install_rename_failed'),
     )
   })
+
+  it('keeps the archive rows across a toggle when nothing namespaces the key', async () => {
+    // The ONE case in this file that mounts without an app identity, because the
+    // un-namespaced key IS the subject. The section keeps the rows on screen
+    // while a toggle refetches by finding the account in the PREVIOUS query's
+    // key, and the host decides how many segments sit in front of that account.
+    // An index counted from the front reads the remote-list flag as the account
+    // here, the placeholder is dropped, and the panel holding the toggle
+    // vanishes under the cursor mid-click.
+    //
+    // The co-tenant read is held IN FLIGHT rather than resolved, so the rows can
+    // only still be on screen because the placeholder put them there. Resolving
+    // it would let the refetch land and repaint the same rows for a reason this
+    // case is not testing.
+    stubDrivePresent()
+    const archive = {
+      nightly: false,
+      runs: {},
+      install: { id: INSTALL_ID, label: 'This Mac' },
+      remote: remoteWith({ otherLabel: 'Alice laptop' }),
+    } as BackupStatus
+    vi.mocked(awsControlApi.backup)
+      .mockReset()
+      .mockResolvedValueOnce(archive)
+      .mockResolvedValueOnce(archive)
+      .mockReturnValue(new Promise<BackupStatus>(() => {}))
+    renderWithProviders(<BackupSection account={ACCOUNT_ID} />)
+
+    fireEvent.click(await screen.findByTestId('backup-remote-toggle'))
+    const opened = await screen.findByTestId('backup-archive')
+    const before = within(opened).getAllByTestId('backup-archive-row').length
+    expect(before).toBeGreaterThan(0)
+
+    // A new key: the co-tenant roster costs its own AWS call, so this refetches.
+    fireEvent.click(within(opened).getByRole('switch'))
+    await waitFor(() => expect(awsControlApi.backup).toHaveBeenCalledTimes(3))
+
+    // Same account, so the rows already fetched stay while that call is in
+    // flight -- the rows, not a skeleton, and not an unmounted panel.
+    expect(screen.getByTestId('backup-archive')).toBeTruthy()
+    expect(screen.getAllByTestId('backup-archive-row')).toHaveLength(before)
+  })
 })
 
 describe('download tab: the noopener trap', () => {
@@ -2816,6 +2917,8 @@ describe('download tab: the noopener trap', () => {
     })
     const fakeTab = { location: { href: '' }, close: vi.fn(), opener: {} } as unknown as Window
     const openSpy = vi.spyOn(window, 'open').mockReturnValue(fakeTab)
+    // Restored even if an assertion below throws, so no later test opens a dead tab.
+    onTestFinished(() => openSpy.mockRestore())
 
     await renderDrive('drive')
     // Download moved into the row's overflow, so the gesture now starts from the
@@ -2833,7 +2936,6 @@ describe('download tab: the noopener trap', () => {
         'https://signed.example/report.pdf',
       ),
     )
-    openSpy.mockRestore()
   })
 })
 
@@ -4501,6 +4603,8 @@ describe('DrivePage sections: preview, rename, search', () => {
     vi.mocked(awsControlApi.driveDownload).mockRejectedValue(new Error('AccessDenied'))
     const fakeTab = { location: { href: '' }, close: vi.fn() } as unknown as Window
     const openSpy = vi.spyOn(window, 'open').mockReturnValue(fakeTab)
+    // Restored even if an assertion below throws, so no later test opens a dead tab.
+    onTestFinished(() => openSpy.mockRestore())
     await renderDrive('drive')
 
     fireEvent.click((await screen.findAllByTestId('drive-preview-open'))[1])
@@ -4511,7 +4615,6 @@ describe('DrivePage sections: preview, rename, search', () => {
     expect(notice).toHaveTextContent(i18nT('apps.awsControl.console.download_failed'))
     // Inside the dialog, not only in the pane behind it.
     expect(screen.getByTestId('drive-preview-dialog').contains(notice)).toBe(true)
-    openSpy.mockRestore()
   })
 
   it("another file's download failure does not appear inside a preview", async () => {
@@ -4523,6 +4626,8 @@ describe('DrivePage sections: preview, rename, search', () => {
     vi.mocked(awsControlApi.driveDownload).mockRejectedValue(new Error('AccessDenied'))
     const fakeTab = { location: { href: '' }, close: vi.fn() } as unknown as Window
     const openSpy = vi.spyOn(window, 'open').mockReturnValue(fakeTab)
+    // Restored even if an assertion below throws, so no later test opens a dead tab.
+    onTestFinished(() => openSpy.mockRestore())
     await renderDrive('drive')
 
     // Fail a download from photo.png's row menu (first file row)...
@@ -4532,7 +4637,6 @@ describe('DrivePage sections: preview, rename, search', () => {
     fireEvent.click(screen.getAllByTestId('drive-preview-open')[1])
     await screen.findByTestId('drive-preview-text')
     expect(screen.queryByTestId('drive-preview-download-error')).toBeNull()
-    openSpy.mockRestore()
   })
 
   it('changing the query closes a rename editor that was open on a hit', async () => {
@@ -4804,10 +4908,7 @@ describe('DrivePage sections: keyboard paths and honest copy', () => {
     // Pointer open: the button is NOT focused first, exactly as Safari leaves it.
     fireEvent.pointerDown(trigger, { pointerType: 'mouse', button: 0, ctrlKey: false })
     fireEvent.click(await screen.findByTestId('drive-share'))
-    const dialog = await screen.findByTestId('share-dialog')
-    // Mounting the dialog precedes useDialogFocusTrap's passive effects:
-    // wait for focus entry before sending Escape to its keydown listener.
-    await waitFor(() => expect(dialog.contains(document.activeElement)).toBe(true))
+    await findTrappedDialog('share-dialog')
 
     fireEvent.keyDown(document, { key: 'Escape' })
     await waitFor(() => expect(screen.queryByTestId('share-dialog')).toBeNull())
@@ -4829,19 +4930,22 @@ describe('DrivePage sections: keyboard paths and honest copy', () => {
     const trigger = await screen.findByTestId('drive-more')
     trigger.focus()
     await chooseFromMenu(trigger, 'drive-share')
-    const dialog = await screen.findByTestId('share-dialog')
     // The panel is the dialog and holds focus; the scrim is presentational.
+    const dialog = await findTrappedDialog('share-dialog')
     expect(dialog.getAttribute('role')).toBe('dialog')
-    // `useDialogFocusTrap` moves focus in a passive effect, one tick after the
-    // commit that `findByTestId` resolved on, so "holds focus" is a condition
-    // to wait for, not a property of the first frame the dialog is in the DOM.
-    await waitFor(() => expect(dialog.contains(document.activeElement)).toBe(true))
+    const rearms = recordTrapRearms(() => ({
+      minting: screen.queryByTestId('share-create')?.textContent === i18nT('apps.awsControl.console.share_creating'),
+      minted: screen.queryByTestId('share-result') !== null,
+    }))
 
     // Escape while the link is being created is refused.
     fireEvent.click(screen.getByTestId('share-create'))
     await waitFor(() =>
       expect(screen.getByTestId('share-create')).toHaveTextContent(i18nT('apps.awsControl.console.share_creating')),
     )
+    // Pressed against the handler that knows a mint is in flight, so the refusal
+    // is the dialog's answer, not a key nobody heard.
+    await waitFor(() => expect(rearms.some((r) => r.minting)).toBe(true))
     fireEvent.keyDown(document, { key: 'Escape' })
     expect(screen.getByTestId('share-dialog')).toBeTruthy()
 
@@ -4853,6 +4957,9 @@ describe('DrivePage sections: keyboard paths and honest copy', () => {
       },
     })
     await screen.findByTestId('share-result')
+    // The result's commit is not enough: the handler that still says "minting"
+    // stays armed until the trap re-arms for it.
+    await waitFor(() => expect(rearms.some((r) => r.minted)).toBe(true))
     fireEvent.keyDown(document, { key: 'Escape' })
     await waitFor(() => expect(screen.queryByTestId('share-dialog')).toBeNull())
     // Focus went back to where the reader was, not to <body>.
@@ -4972,7 +5079,7 @@ describe('DrivePage sections: keyboard paths and honest copy', () => {
 
     fireEvent.pointerDown(trigger, { pointerType: 'mouse', button: 0, ctrlKey: false })
     fireEvent.click(await screen.findByTestId('drive-search-share'))
-    await screen.findByTestId('share-dialog')
+    await findTrappedDialog('share-dialog')
 
     fireEvent.keyDown(document, { key: 'Escape' })
     await waitFor(() => expect(screen.queryByTestId('share-dialog')).toBeNull())

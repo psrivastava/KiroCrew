@@ -40,18 +40,26 @@ interface SettingsToggleProps {
    *  acts, instead of leaving a side effect discoverable only by exploring. */
   describedBy?: string
   /**
-   * A "?" tip beside the label, for a sentence that explains what the control IS.
+   * An info tip beside the label, for prose that explains what the control IS.
    *
    * The counterpart to `description`, which keeps its text permanently on the row.
    * Use `description` only when the sentence is needed to MAKE the choice (a
-   * consequence, a cost, where data goes); anything a reader would want once and
-   * never again belongs here, because a row that always shows two lines of prose
-   * spends attention whether or not it is being read.
+   * consequence, a cost, where data goes, a status); anything a reader would want
+   * once and never again belongs here, because a row that always shows two lines
+   * of prose spends attention whether or not it is being read. The tip shows on
+   * hover and focus, pins on click or tap, and is the control's accessible
+   * description (`InfoTip`). One catalog string per tip.
    */
   hint?: string
+  /**
+   * `false` drops the `data-setting-*` highlight anchors, for a copy of a
+   * Settings row drawn somewhere else (the What's-new modal reuses About's
+   * update switches), so a deep link can only land on the panel's row.
+   */
+  anchor?: boolean
 }
 
-export function SettingsToggle({ label, description, hint, checked, onChange, disabled, configKey, describedBy }: SettingsToggleProps) {
+export function SettingsToggle({ label, description, hint, checked, onChange, disabled, configKey, describedBy, anchor = true }: SettingsToggleProps) {
   /**
    * Did this activation come from the "?" tip rather than the row?
    *
@@ -64,13 +72,13 @@ export function SettingsToggle({ label, description, hint, checked, onChange, di
   const fromHint = (e?: React.MouseEvent | React.KeyboardEvent) =>
     e?.target instanceof HTMLElement && e.target.closest('[data-settings-hint]') !== null
   return (
-    <Clickable data-setting-label={label} {...(configKey ? { 'data-setting-key': configKey } : {})} className={`flex items-center justify-between py-1.5 group ${disabled ? 'opacity-40 cursor-not-allowed' : 'cursor-pointer'}`} onClick={e => { if (!fromHint(e)) onChange(!checked) }} disabled={disabled}>
+    <Clickable {...(anchor ? { 'data-setting-label': label, ...(configKey ? { 'data-setting-key': configKey } : {}) } : {})} className={`flex items-center justify-between py-1.5 group ${disabled ? 'opacity-40 cursor-not-allowed' : 'cursor-pointer'}`} onClick={e => { if (!fromHint(e)) onChange(!checked) }} disabled={disabled}>
       <div className="flex-1 min-w-0 mr-4">
         <div className="flex items-center gap-1.5">
           <div className="text-[13px] font-semibold text-text group-hover:text-text-strong transition-colors">{label}</div>
           {/* Marked, not handled: `fromHint` above reads this attribute off the
               event target, so the tip needs no handler of its own. */}
-          {hint && <span data-settings-hint><InfoTip text={hint} /></span>}
+          {hint && <span data-settings-hint><InfoTip text={hint} placement="top" /></span>}
         </div>
         {description && <div className="text-[12px] text-muted mt-0.5">{description}</div>}
       </div>
@@ -103,7 +111,7 @@ export function SettingsField({ label, description, hint, configKey, settingId, 
         {controlId
           ? <label htmlFor={controlId} className="text-[13px] font-semibold text-text">{label}</label>
           : <span className="text-[13px] font-semibold text-text">{label}</span>}
-        {hint && <InfoTip text={hint} />}
+        {hint && <InfoTip text={hint} placement="top" />}
       </div>
       {description && <div className="text-[12px] text-muted">{description}</div>}
       {children}
@@ -157,6 +165,7 @@ export function SettingsSelect({ label, description, hint, value, options, optio
 interface SettingsComboboxProps {
   label: string
   description?: string
+  hint?: string
   value: string
   options: SearchableSelectOption[]
   onChange: (value: string) => void
@@ -178,10 +187,10 @@ interface SettingsComboboxProps {
  * scan, or one that carries a per-option sublabel. Reach for `SettingsSelect` at
  * a dozen-ish fixed options and this past that.
  */
-export function SettingsCombobox({ label, description, value, options, onChange, triggerFallback, searchPlaceholder, customValueOption, action, actionStatus, configKey }: SettingsComboboxProps) {
+export function SettingsCombobox({ label, description, hint, value, options, onChange, triggerFallback, searchPlaceholder, customValueOption, action, actionStatus, configKey }: SettingsComboboxProps) {
   const controlId = React.useId()
   return (
-    <SettingsField label={label} description={description} configKey={configKey} controlId={controlId}>
+    <SettingsField label={label} description={description} hint={hint} configKey={configKey} controlId={controlId}>
       <SearchableSelect
         id={controlId}
         options={options}
@@ -316,6 +325,8 @@ export function SettingsInput({ label, description, hint, value, onChange, onBlu
 /* ── Section header (sits outside the Card) ── */
 
 interface SettingsSectionProps {
+  /** Section heading. Required: every SettingsSection in the app is titled, so
+   *  the header always renders (no title-less caller to guard for). */
   title: string
   /**
    * Optional node rendered inline after the title — a platform/status tag such
@@ -337,12 +348,115 @@ interface SettingsSectionProps {
   children?: React.ReactNode
 }
 
+/* ── A settings deep link that is still looking for its row ──
+ *
+ * The command palette and every `SettingRef` chip navigate to
+ * `/settings/<tab>?highlight=<id>`, and `useSettingHighlight` then resolves that
+ * id by QUERYING THE DOM for the row. A collapsed group renders no rows at all,
+ * so a setting inside one is not merely hidden from the reader -- it is absent
+ * from the document the deep link searches, and the link arrives on the tab
+ * having revealed nothing and rung nothing.
+ *
+ * What is published is the SELECTOR the probe is looking for, not merely the fact
+ * that it is looking. A bare "a link is pending" flag is not enough to decide
+ * which group should answer it: every collapsible group on the page would see the
+ * same flag and open, which trades "the target stays hidden" for "unrelated groups
+ * open and stay open". The Voice tab is where that shows, because it nests one
+ * collapsible group inside another -- "Start dictation with a key" is the last
+ * child of "Fine-tuning" -- so a link to a Fine-tuning row opened both.
+ *
+ * Carried as a signal rather than read from the router HERE, because
+ * `SettingsSection` is also rendered outside a router (Mochi's Electron renderer
+ * under `apps/mochi`), where a `useSearchParams` in a shared primitive would
+ * throw. `useSettingHighlight` owns the router and publishes.
+ */
+let deepLinkTarget: string | null = null
+const deepLinkListeners = new Set<() => void>()
+
+/**
+ * Publish the CSS selector a settings deep link is probing for, or null when none
+ * is outstanding. For containment only: the probe's own resolution is finer (it
+ * disambiguates a repeated label by `occurrence`), and a group answers the coarser
+ * question "is the row it wants inside me".
+ */
+export function setSettingsDeepLinkTarget(next: string | null): void {
+  if (deepLinkTarget === next) return
+  deepLinkTarget = next
+  for (const cb of deepLinkListeners) cb()
+}
+
+function subscribeDeepLinkTarget(cb: () => void): () => void {
+  deepLinkListeners.add(cb)
+  return () => { deepLinkListeners.delete(cb) }
+}
+const readDeepLinkTarget = () => deepLinkTarget
+const readDeepLinkOnServer = (): string | null => null
+
 export function SettingsSection({ title, badge, collapsible, children }: SettingsSectionProps) {
   const [open, setOpen] = React.useState(false)
   const bodyId = React.useId()
+  const bodyRef = React.useRef<HTMLDivElement>(null)
+  const target = React.useSyncExternalStore(
+    subscribeDeepLinkTarget, readDeepLinkTarget, readDeepLinkOnServer,
+  )
+  /* Which target this group has already answered for, so the two passes below
+   * settle exactly once instead of oscillating. */
+  const answered = React.useRef<string | null>(null)
+  /* Whether THIS effect is the thing that opened the group. Only a group the probe
+   * revealed may be closed again by the probe; one that was already open on arrival
+   * -- the user opened it -- is never ours to close. */
+  const revealed = React.useRef(false)
+  /* REVEAL, then KEEP only if it was ours. A closed group cannot be asked what it
+   * contains -- that is the whole defect -- so it opens far enough to be searched
+   * and closes again in the same commit when the row is not inside it. Both passes
+   * are layout effects, so the speculative open is never painted.
+   *
+   * Nesting resolves itself: a child group answers before its parent, and the
+   * parent's query spans its whole subtree, so a target inside the nested group
+   * keeps BOTH open while a target beside it keeps only the parent.
+   *
+   * A group the USER opened is left alone: when it is already `open` on arrival the
+   * effect stamps `answered` and returns without ever touching `open` or the
+   * `revealed` flag, so nothing here closes something a reader chose to see. Latched
+   * for the owner, because the probe strips its parameter the moment it has rung
+   * the row and a group that merely mirrored the signal would close on that tick.
+   *
+   * The signal's withdrawal clears `answered`, so the SAME deep link used a second
+   * time reveals the group again instead of returning early on a stale stamp. */
+  React.useLayoutEffect(() => {
+    if (!collapsible) return
+    /* Signal withdrawn. Clear BOTH latches: `answered` so the same link reveals the
+     * group again on its next use, and `revealed` so a group the probe once opened
+     * is no longer flagged probe-owned once the link that opened it is gone. Leaving
+     * `revealed` latched would let a LATER deep link to a row elsewhere collapse a
+     * group the reader had meanwhile re-opened by hand -- the exact case the
+     * `revealed` guard exists to prevent. */
+    if (!target) { answered.current = null; revealed.current = false; return }
+    if (answered.current === target) return
+    if (!open) { setOpen(true); revealed.current = true; return }
+    answered.current = target
+    /* Already open before the probe touched it: the user opened it. Stamp and leave
+     * `open` and `revealed` alone -- a group the reader chose to see is never ours
+     * to close, even when the target it wants is somewhere else. */
+    if (!revealed.current) return
+    /* Decided one microtask after the reveal, not inside it. A NESTED group opens
+     * in a later commit than its parent -- the parent has to render its body before
+     * the child exists to open at all -- so a parent that answered within this
+     * commit would search a subtree whose child group has not rendered yet, find
+     * nothing, and close over the very row it holds. React flushes the whole
+     * cascade of layout-effect state updates synchronously in one task, so a
+     * microtask queued here runs after every group has revealed and still before
+     * the browser paints: nothing speculative is ever on screen. */
+    let cancelled = false
+    queueMicrotask(() => {
+      if (cancelled) return
+      if (!bodyRef.current?.querySelector(target)) { setOpen(false); revealed.current = false }
+    })
+    return () => { cancelled = true }
+  }, [collapsible, target, open])
   return (
     <>
-      {/* `mt-4` separates one section from the previous section's controls, so it
+      {/* `mt-6` separates one section from the previous section's controls, so it
         * is load-bearing between sections — but the FIRST section on a tab has
         * nothing above it except the pane, which already owns the gap under the
         * narrow tab strip (SidePanelLayout's `pt-3`) and under the desktop header
@@ -351,7 +465,7 @@ export function SettingsSection({ title, badge, collapsible, children }: Setting
         * only the leading one matches. When a tab renders something of its own
         * above the first section, the header is no longer first and keeps the
         * margin — which is what it should do, because now something IS above it. */}
-      <div className="flex items-center gap-2 mt-4 mb-2 first:mt-0">
+      <div className="flex items-center gap-2 mt-6 mb-1 first:mt-0">
         {collapsible ? (
           /* The whole header is the control, not a chevron beside it: a 14px
              target next to a clickable-looking title is the classic near-miss.
@@ -368,22 +482,22 @@ export function SettingsSection({ title, badge, collapsible, children }: Setting
               size={14}
               className={`text-muted transition-transform group-hover:text-text ${open ? 'rotate-90' : ''}`}
             />
-            <h4 className="text-sm font-semibold text-text-strong">{title}</h4>
+            <h4 className="text-base font-semibold text-text-strong">{title}</h4>
           </button>
         ) : (
-          <h4 className="text-sm font-semibold text-text-strong">{title}</h4>
+          <h4 className="text-base font-semibold text-text-strong">{title}</h4>
         )}
         {badge}
       </div>
       {/* Unmounted rather than hidden when closed. A collapsed group exists to
           stop costing the reader attention, and an `aria-hidden` subtree still
           costs a screen-reader user their place in the tab order. */}
-      {collapsible ? open && <div id={bodyId}>{children}</div> : children}
+      {collapsible ? open && <div id={bodyId} ref={bodyRef}>{children}</div> : children}
     </>
   )
 }
 
-/* ── Settings Card (thin wrapper around Card with vertical gap) ── */
+/* ── Settings Card (borderless group of controls with vertical gap) ── */
 
 /**
  * Delay step between successive settings cards' entrance animations, in ms.
@@ -409,11 +523,16 @@ export function SettingsCard({ index, children }: {
   children: React.ReactNode
 }) {
   return (
+    // Borderless: the section heading and spacing mark the group, so a box
+    // around it would only add a second frame inside the settings pane.
+    // `data-settings-card` is a stable, nonvisual crop anchor for the capture
+    // scripts (the visual `.card-glow` frame is gone).
     <div
-      className="card-glow border border-border bg-card rounded-lg p-5 mb-4 animate-rise shadow-sm transition-all"
+      data-settings-card=""
+      className="mb-2 animate-rise"
       style={index ? { animationDelay: `${index * SETTINGS_CARD_STAGGER_MS}ms` } : undefined}
     >
-      <div className="flex flex-col gap-1">
+      <div className="flex flex-col gap-2.5">
         {children}
       </div>
     </div>
@@ -437,6 +556,15 @@ interface SettingsStepperProps {
   onIncrement: () => void
   onDecrement: () => void
   onReset?: () => void
+  /**
+   * When given, the readout is a number input: the typed integer is passed
+   * here on Enter or blur, and the box then shows `value` again, so the
+   * caller's own clamp decides what is displayed. Empty or non-numeric input,
+   * and Escape, revert to `value`. `min` / `max` are the input's native range.
+   */
+  onSet?: (value: number) => void
+  min?: number
+  max?: number
   suffix?: string
   disabled?: boolean
   /** Backend config key this stepper writes. */
@@ -446,7 +574,45 @@ interface SettingsStepperProps {
 /** Shared box of the centre readout, whether it is a reset button or plain text. */
 const STEPPER_READOUT_CLASS = 'min-w-[56px] h-8 rounded-md border border-border bg-bg-elevated text-text-strong text-sm font-bold flex items-center justify-center px-2 transition-all'
 
-export function SettingsStepper({ label, description, hint, value, onIncrement, onDecrement, onReset, suffix = '', disabled, configKey }: SettingsStepperProps) {
+function StepperValueInput({ label, value, onSet, min, max, suffix, disabled }: { label: string; value: number | string; onSet: (value: number) => void; min?: number; max?: number; suffix: string; disabled?: boolean }) {
+  const [draft, setDraft] = React.useState(String(value))
+  // A new `value` from the caller (a step, or the result of a typed value)
+  // replaces whatever is in the box.
+  const [shown, setShown] = React.useState(value)
+  if (shown !== value) {
+    setShown(value)
+    setDraft(String(value))
+  }
+  const commit = () => {
+    const n = draft.trim() === '' ? NaN : Math.round(Number(draft))
+    setDraft(String(value))
+    if (Number.isFinite(n) && n !== value) onSet(n)
+  }
+  return (
+    <span className={`${STEPPER_READOUT_CLASS} gap-0.5 cursor-text hover:border-border-strong focus-within:border-accent${disabled ? ' opacity-40' : ''}`}>
+      <input
+        type="number"
+        inputMode="numeric"
+        min={min}
+        max={max}
+        step={1}
+        disabled={disabled}
+        aria-label={label}
+        value={draft}
+        onChange={e => setDraft(e.target.value)}
+        onBlur={commit}
+        onKeyDown={e => {
+          if (e.key === 'Enter') commit()
+          else if (e.key === 'Escape') setDraft(String(value))
+        }}
+        className="w-[3.5ch] bg-transparent text-right text-text-strong text-sm font-bold [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none disabled:cursor-not-allowed"
+      />
+      {suffix && <span aria-hidden="true">{suffix}</span>}
+    </span>
+  )
+}
+
+export function SettingsStepper({ label, description, hint, value, onIncrement, onDecrement, onReset, onSet, min, max, suffix = '', disabled, configKey }: SettingsStepperProps) {
   return (
     <SettingsField label={label} description={description} hint={hint} configKey={configKey}>
       <div className="flex items-center gap-2">
@@ -457,7 +623,9 @@ export function SettingsStepper({ label, description, hint, value, onIncrement, 
           onClick={onDecrement}
           aria-label={i18nT('components.settings.decrease')}
         >−</button>
-        {onReset ? (
+        {onSet ? (
+          <StepperValueInput label={label} value={value} onSet={onSet} min={min} max={max} suffix={suffix} disabled={disabled} />
+        ) : onReset ? (
           <button
             type="button"
             disabled={disabled}

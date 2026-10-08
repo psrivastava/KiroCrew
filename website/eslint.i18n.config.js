@@ -100,6 +100,15 @@ export default [
       // to this module will not be reported. Keep it stylesheet-only; anything a
       // person reads belongs in the component with `i18nT`.
       'src/components/fileChangeChipsCss.ts',
+      // The Liquid Glass surface: SVG path data, an inline SVG displacement-map
+      // document, `url("data:image/svg+xml…")`, `linear-gradient(…)`, `path("…")`
+      // and `color-mix(…)` values, every one built as a string and handed to the
+      // CSS or SVG parser. It renders no copy of its own: `children` is the only
+      // text on screen, and that text belongs to (and is gated at) the caller.
+      //
+      // Stated as a false-negative class, per this file's convention: any copy
+      // added to this module will not be reported. Keep it effect-only.
+      'src/components/ui/liquid-glass.tsx',
       // Synthesizes the `diff --git` / `---` / `+++` headers Pierre needs to
       // identify a file in a bare patch body: git wire format handed to Pierre's
       // parser, never read as words. Extracted from `PullRequestPanel.tsx` so that
@@ -189,6 +198,13 @@ export default [
       // keep both modules parser-facing only.
       'src/lib/widgetSrcdoc.ts',
       'src/lib/mcpAppSrcdoc.ts',
+      // Same parser-only boundary as the srcdoc builders above: this module
+      // sanitizes model markup and injects CSP, a DOCTYPE and theme CSS. None
+      // of its literals are human-facing copy; translating them breaks the
+      // policy or the frame. TaskDashboardFrame.tsx stays fully gated.
+      // False-negative class: copy added here would not be checked. Keep this
+      // exact module parser-only, with all host text in its translated consumer.
+      'src/pages/chat/command-center/dashboardDocument.ts',
       // Per-app scoped CSS, injected as `<style>{APP_CSS}</style>`. Each module is
       // ONE template literal of stylesheet text handed to the CSS parser -- selectors,
       // lengths and `var(--…)` references. None of it is read as words, and the
@@ -646,15 +662,17 @@ export default [
               // a closed DOM set cannot match prose — no English phrase is
               // `AltRight` — and a new key code has to be added here on purpose.
               '^(?:Alt|Control|Meta|Shift)(?:Left|Right)$',
-              // The TWO provider-CLI LOGIN COMMANDS the pull-request panel offers
-              // as copyable recovery text (`pullRequestErrorDetails` returns one
-              // verbatim and the panel renders it in a <code> block). A command
-              // typed into a terminal is a wire string: translating it breaks
-              // it. Enumerated rather than shaped, like the key codes above — a
-              // "lowercase words" shape would exempt exactly the prose this
-              // config fights hardest, and this is a closed two-member set that
-              // grows only when a new provider CLI is wired in on purpose.
+              // The provider-CLI LOGIN COMMANDS: the pull-request panel offers
+              // one as copyable recovery text (`pullRequestErrorDetails` returns
+              // it verbatim and the panel renders it in a <code> block), and Issue
+              // Radar's `providerTerms().loginCommand` shows one in its sign-in
+              // hint. A command typed into a terminal is a wire string:
+              // translating it breaks it. Enumerated rather than shaped, like the
+              // key codes above — a "lowercase words" shape would exempt exactly
+              // the prose this config fights hardest, and this is a closed set
+              // that grows only when a new provider CLI is wired in on purpose.
               '^(?:gh|glab) auth login$',
+              '^az login$',
               // A `mc:`-NAMESPACED BROWSER-STORAGE KEY, e.g.
               // `mc:notif:activeKinds:v2`, `mc:notif:seenChannels`. The dashboard
               // namespaces every localStorage key it owns under `mc:`, and such
@@ -880,7 +898,7 @@ export default [
               // per-channel settings panels. Enumerated and whole-value-anchored,
               // so a sentence merely mentioning a channel is still reported —
               // only the bare name is exempt.
-              '^(Slack|Discord|Telegram|Teams|Webex|WeCom|WeChat|WhatsApp)$',
+              '^(Slack|Discord|Telegram|Teams|Webex|WeCom|WeChat|WhatsApp|iMessage|Feishu)$',
               // The code-forge product brands, in the do-not-translate glossary for
               // the same reason and enforced there by `glossary.test.ts`: "GitLab" is
               // "GitLab" in every language, and a localized spelling would name a
@@ -1033,6 +1051,13 @@ export default [
               // its argument is an attribute/type selector walked up the tree,
               // never rendered copy.
               'querySelector(All)?', 'closest', 'getElementById', 'createElement',
+              // App-local builder for `[data-setting-*="…"]` anchor selectors
+              // (`src/hooks/useSettingHighlight.ts`). Its first argument is one of
+              // three machine anchor names and its second a resolved id/key/label;
+              // the string it returns is handed to `querySelector`/`matches` and
+              // never rendered — same CSS-selector contract as `querySelector`
+              // directly above. Uniquely named so the exclusion masks no other callee.
+              '^settingAnchorSelector$',
               'addEventListener', 'removeEventListener', 'matchMedia',
               // WebGL/DOM capability lookups take registry identifiers
               // (`WEBGL_lose_context`), which are mixed-case and so escape the
@@ -1454,6 +1479,17 @@ export default [
     },
   },
 
+  // HOOK EVENT NAMES ONLY: matched BY VALUE against the backend's event
+  // allowlist, and rendered verbatim on the hook's own row, so a translated one is
+  // rejected on save and disagrees with its row. Extracted so the page keeps its
+  // gate. See the module's own header.
+  {
+    files: ['src/pages/hookEventWireValues.ts'],
+    rules: {
+      'i18next/no-literal-string': 'off',
+    },
+  },
+
   // SEARCH-KEYWORD SYNONYMS ONLY: a manual overlay of extra query terms merged
   // into the Settings search corpus so a query like "dark mode" finds a setting
   // whose label does not contain those words. Every value is a term matched
@@ -1504,6 +1540,46 @@ export default [
   // tight.
   {
     files: ['src/utils/fontFamilyOptions.ts'],
+    rules: {
+      'i18next/no-literal-string': 'off',
+    },
+  },
+
+  // CUSTOM FONT PICKER CANDIDATES: the sibling of monoFontCandidates.ts for the
+  // "Custom" Font Family option's picker. Same names-only rationale — every
+  // literal is a font family name matched by value against the machine's font
+  // book, so a translated name resolves to nothing. Kept in its own module so the
+  // exemption stays tight; the picker's own copy (label, description, free-text
+  // row) lives in the catalog.
+  {
+    files: ['src/utils/customFontCandidates.ts'],
+    rules: {
+      'i18next/no-literal-string': 'off',
+    },
+  },
+
+  // PASTE-TOKEN FORMAT ONLY, same "format IS the interface" category as
+  // `scrollInspector.ts` above: the one words-shaped literal in this module is
+  // `formatToken`'s `[ Paste #N · M lines ]` serialization (which also carries
+  // the block's stable id between two invisible U+2063 fences). It is a protocol
+  // token embedded verbatim in composer/message text and matched back by
+  // `PASTE_TOKEN_REGEX`; translating it would break that round-trip — the regex
+  // would stop recognising the token and the paste would be sent as literal
+  // text. The chip label the USER reads is a separate, translated string
+  // (`i18nT('components.pastedChip.paste_lines', …)`) rendered by the chip
+  // components; this module renders nothing (no JSX, no i18nT, pure
+  // serialization plus the localStorage side-table) and holds no other prose.
+  // The file passed the gate until #13851 touched `formatToken` to add the
+  // stable id, which moved the long-standing literal onto a line this branch
+  // wrote; [added-lines] then charged a format string that was never copy.
+  //
+  // Scoped to this one file for the reason the exemptions above are: a
+  // `words.exclude` shape for the token's `[ Paste #` / ` lines ]` quasis would
+  // also release that prose anywhere else in the tree. Copy added here later
+  // belongs in the catalog, not under this exemption; keep this module
+  // serialization-only.
+  {
+    files: ['src/utils/pasteTokens.ts'],
     rules: {
       'i18next/no-literal-string': 'off',
     },

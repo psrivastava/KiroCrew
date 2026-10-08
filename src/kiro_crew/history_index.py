@@ -103,6 +103,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Iterable, Sequence
 
 from kiro_crew._sqlite_compat import fts5_available, is_cjk_char, sqlite3
+from kiro_crew.owner_only_files import mkdirs_owner_only, prepare_owner_only_sqlite
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from kiro_crew.history_search import SearchNeedle
@@ -149,12 +150,18 @@ def cjk_inventory(folded: str) -> str:
 
     The projection the ``unicode61`` column indexes. Order is stable only to keep
     the value diffable while debugging; nothing depends on it.
+
+    ``dict.fromkeys`` dedupes the whole string first — a C-level pass whose
+    result is bounded by the number of DISTINCT characters, never by transcript
+    length — and ``is_cjk_char`` then classifies only those survivors, a few
+    thousand calls at most. The naive orderings both lose on what may be
+    megabytes of transcript on the index write path: classifying per character
+    holds the GIL for a Python-level walk of the full text, and projecting with
+    ``_CJK_PATTERN.findall`` materializes one list element per CJK occurrence,
+    which on a CJK-heavy transcript is a transient allocation proportional to
+    the whole document.
     """
-    seen: dict[str, None] = {}
-    for ch in folded:
-        if ch not in seen and is_cjk_char(ch):
-            seen[ch] = None
-    return " ".join(seen)
+    return " ".join(ch for ch in dict.fromkeys(folded) if is_cjk_char(ch))
 
 
 def _sqlite_stat_identity(value: int) -> int | str:
@@ -220,7 +227,9 @@ class SessionSearchIndex:
         conn = getattr(self._local, "conn", None)
         if conn is not None:
             return conn
-        self._db_path.parent.mkdir(parents=True, exist_ok=True)
+        # Owner-only from creation: the index holds a copy of every message.
+        mkdirs_owner_only(self._db_path.parent)
+        prepare_owner_only_sqlite(self._db_path)
         conn = sqlite3.connect(
             str(self._db_path),
             timeout=_CONNECT_TIMEOUT_SECS,

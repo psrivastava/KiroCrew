@@ -66,7 +66,7 @@ from kiro_crew.agent_discovery import (
     iter_agent_spec_files,
     list_agents,
 )
-from kiro_crew.agent_files import OWNED_KIRO_AGENT_FILES
+from kiro_crew.agent_files import KAS_RESERVED_AGENT_IDS, OWNED_KIRO_AGENT_FILES
 from kiro_crew.agent_spec_format import is_markdown_spec
 from kiro_crew.config.loader import (
     KiroCrewConfig,
@@ -87,6 +87,7 @@ from kiro_crew.dashboard.chat_utils import drained_to_thread
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.executors import discovery_executor
 from kiro_crew.sel import sel
+from kiro_crew.validation import TEMPLATE_NAME_RE
 from kiro_crew.webhooks import token_store
 
 logger = logging.getLogger(__name__)
@@ -432,7 +433,6 @@ async def api_agent_template_create(request: web.Request) -> web.Response:
     # definition-key helpers, so its name/lock/spec helpers are bound here at
     # call time rather than at import time.
     from kiro_crew.dashboard.handlers.agents import (
-        _TEMPLATE_NAME_RE,
         _AmbiguousTemplateName,
         _get_config_lock,
         _is_reserved_basename,
@@ -455,7 +455,7 @@ async def api_agent_template_create(request: web.Request) -> web.Response:
             {"error": "body must be a JSON object", "code": "invalid_body"}, status=400
         )
     raw_name = body.get("name")
-    if not isinstance(raw_name, str) or not _TEMPLATE_NAME_RE.match(raw_name.strip()):
+    if not isinstance(raw_name, str) or not TEMPLATE_NAME_RE.fullmatch(raw_name.strip()):
         return web.json_response(
             {
                 "error": "name must be 1-63 letters, digits, dots, dashes or underscores",
@@ -469,6 +469,19 @@ async def api_agent_template_create(request: web.Request) -> web.Response:
     }:
         return web.json_response(
             {"error": f"'{name}' is reserved", "code": "template_name_reserved"}, status=400
+        )
+    if name in KAS_RESERVED_AGENT_IDS:
+        # The KAS engine keeps its own agent under this id (or drops the entry)
+        # without an error, so a template created under it never runs there.
+        # Exact match, as the engine matches: ``Default`` registers normally.
+        # Its own code, distinct from the runtime-owned stems above, so the
+        # dashboard can say WHOSE name it is rather than "reserved" alone.
+        return web.json_response(
+            {
+                "error": f"'{name}' is reserved by the KAS agent engine",
+                "code": "template_name_reserved_by_engine",
+            },
+            status=400,
         )
     description = body.get("description", "")
     if not isinstance(description, str) or len(description) > MAX_TEMPLATE_DESCRIPTION_CHARS:
@@ -684,7 +697,7 @@ async def api_agent_template_delete(request: web.Request) -> web.Response:
 
     The reference check and the unlink are ONE critical section, off the loop,
     under every lock the reference stores' writers take -- the shape
-    ``_unlink_copy_unless_referenced`` in ``handlers.agents`` established:
+    ``_unlink_copy_unless_referenced`` in ``dashboard/agent_admin/template_lineage.py`` established:
 
     * the folder store lock (``state.hold_folders``), held across the whole
       section, so no folder pin can commit between the check and the unlink;

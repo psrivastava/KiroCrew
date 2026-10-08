@@ -10,12 +10,12 @@ import { useLanguage } from '../../i18n/LanguageProvider'
 import { deriveShellSummary, pickToolLabel } from '../../utils/toolLabel'
 import { deriveToolCallTitle, relDisplayPath } from '../../utils/toolCallTitle'
 import { LoaderCircle, CircleSlash, CircleAlert, CircleDot, Lock, PanelRight, ChevronDown, AppWindow } from 'lucide-react'
-import { PanelRightSolid } from '../../components/icons/panels'
+import { SidePanelGlyph } from '../../components/SidePanelGlyph'
 import ErrorNotice from '../../components/ErrorNotice'
 import { motion, AnimatePresence, useReducedMotion } from 'framer-motion'
 import type { ChatMessage } from '../../types'
 import { ToolDetails } from './ToolDetails'
-import { extractDenyDetail } from '../../utils/denyReason'
+import { extractDenyDetail, extractDenyNotice } from '../../utils/denyReason'
 import { registerToolPill } from '../../store/toolPillRegistry'
 import { ROW_PILL_BUTTON_CLASS, ROW_PILL_WRAPPER_CLASS } from './rowPill'
 import { extractToolFilePath } from '../../utils/toolFilePath'
@@ -34,6 +34,7 @@ import { useLanguageGeneration } from '../../i18n/useLanguageGeneration'
 import { isRejectedDecision } from '../../utils/approvalDecision'
 import { selectToolRowIndex, lookupLogEntry, denySiblingContent } from './toolRowIndex'
 import type { ToolActivity } from '../../types'
+import { pathBasename } from '../../utils/pathBasename'
 
 // Stable empties for slots with no per-slot state yet. A fresh `[]` per
 // selector run would change identity every dispatch and defeat the
@@ -236,7 +237,7 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
   // expansion as well as completion status for the icon. All transcript scans go
   // through the shared per-slot index (see toolRowIndex.ts): built once per
   // (messages, toolLog) identity change, O(1) per row per dispatch.
-  const { effectiveId, isDone: logIsDone, isRejected, isAutoDenied, autoDenyReason, purpose, input, output, auto, ts, executionStartedAt, hasEntry, isShell, toolKind, toolName, trustedToolName, mcpServer, fromLog } = useAppSelector(s => {
+  const { effectiveId, isDone: logIsDone, isRejected, isAutoDenied, autoDenyReason, autoDenyNotice, purpose, input, output, inputCut, outputCut, auto, ts, executionStartedAt, hasEntry, isShell, toolKind, toolName, trustedToolName, mcpServer, fromLog } = useAppSelector(s => {
     // Slot-aware: for a non-active slot (split-view pane) read that slot's
     // per-slot tool log / messages / running state; `slot` undefined or equal to
     // the active slot → active-slot globals.
@@ -263,14 +264,18 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
     // Output panel leads with its own LOCALIZED sentence and follows with the
     // rule, so the user learns which rule fired without a translated sentence
     // being replaced by untranslated English (extractDenyDetail yields "" for a
-    // row without that marker, and the panel then shows the localized line
-    // alone). The interactive user-reject path also appends a 🚫 message, but
-    // that flow ALSO resolves a permission message as rejected —
-    // wasRejectedByPerm() takes precedence below, so a user rejection still
-    // shows red, not amber.
+    // row without that marker). A row without the marker but with the host's
+    // own "Blocked: …" sentence — the gate-crash refusal, which says no policy
+    // rule fired — yields that sentence as the NOTICE, and the panel shows it
+    // in place of the localized line rather than contradicting it. A row with
+    // neither (hook blocked) shows the localized line alone. The interactive
+    // user-reject path also appends a 🚫 message, but that flow ALSO resolves
+    // a permission message as rejected — wasRejectedByPerm() takes precedence
+    // below, so a user rejection still shows red, not amber.
     const denySibling = denySiblingContent(index, toolCallId, message)
     const autoDenied = !!denySibling
     const autoDenyReason = extractDenyDetail(denySibling)
+    const autoDenyNotice = extractDenyNotice(denySibling)
 
     const e = lookupLogEntry(index, toolCallId, label)
     if (e) {
@@ -281,9 +286,15 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
         isDone, isRejected: rejected,
         isAutoDenied: !rejected && autoDenied,
         autoDenyReason,
+        autoDenyNotice,
         purpose: e.purpose || '',
         input: e.input || '',
         output: e.output || '',
+        // Clamp seams for the two payloads (null when nothing was cut). The
+        // panel renders the localized marker there at view time; the store
+        // holds only the offset, so a language switch re-renders it.
+        inputCut: e.input_cut ?? null,
+        outputCut: e.output_cut ?? null,
         auto: !!e.auto,
         ts: e.ts || 0,
         executionStartedAt: e.execution_started_at || 0,
@@ -319,8 +330,11 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
       isDone: true, isRejected: rejected,
       isAutoDenied: !rejected && autoDenied,
       autoDenyReason,
+      autoDenyNotice,
       purpose: (message.meta?.purpose as string) || '',
-      input: metaInput, output: metaOutput, auto: false,
+      // Persisted meta is served whole by the server (_tool_meta caps at 1 MB,
+      // never clamps), so a historical row has no seam to mark.
+      input: metaInput, output: metaOutput, inputCut: null, outputCut: null, auto: false,
       // ChatMessage.ts is a string (ISO timestamp) when restored from history;
       // parse it for the meta-row time renderer. Falls to 0 if unparseable —
       // fmtTime hides the row when ts is 0.
@@ -633,8 +647,8 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
   // size caps in presentToolDiff.
   const denied = isRejected || isAutoDenied
   const diffView = useMemo(
-    () => (denied ? null : presentToolDiff(toolKind, input)),
-    [denied, toolKind, input],
+    () => (denied ? null : presentToolDiff(toolKind, input, inputCut)),
+    [denied, toolKind, input, inputCut],
   )
   // Per-card density control, FOLDED by default: a turn that edits several
   // files stacks a full patch per file, so the answer the reader came for
@@ -725,9 +739,18 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
   // to fix: it names no rule, so the reader cannot tell WHICH policy fired.
   // Detail is absent for a hook-blocked row, which carries no marker; the
   // localized line then stands alone, exactly as it did before.
-  const denyOutput = [i18nT('pages.chat.toolCallLine.blocked_by_security_policy'), autoDenyReason]
-    .filter(Boolean)
-    .join('\n')
+  //
+  // A row that carries no marker but does carry the host's own "Blocked: …"
+  // sentence (the gate-crash refusal) shows that sentence INSTEAD of the
+  // localized line: the sentence states that no policy rule fired, so leading
+  // with "blocked by security policy" would assert the very thing it denies.
+  // The gate-crash sentence is an error (a caught gate exception), so it
+  // renders through ErrorNotice below rather than as the details output.
+  const denyOutput = autoDenyNotice
+    ? ''
+    : [i18nT('pages.chat.toolCallLine.blocked_by_security_policy'), autoDenyReason]
+      .filter(Boolean)
+      .join('\n')
 
   // The language-neutral, argument-derived title for this call — `List files
   // in src` for `ls -la src`, `Session send: <target>` for an MCP call, kiro-cli's
@@ -780,7 +803,7 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
   // icon, so the affordance names the file it opens — crucial in simplified /
   // purpose mode where the label is prose and no path is otherwise shown. The
   // full path stays in the button tooltip and the expanded details.
-  const basename = useMemo(() => (filePath ? (filePath.split('/').pop() || filePath) : null), [filePath])
+  const basename = useMemo(() => (filePath ? (pathBasename(filePath) || filePath) : null), [filePath])
   // When the chip is shown, strip the now-redundant path out of the visible
   // label. A derived `Read src/a.ts` → `Read` (the title carries the display
   // path, the chip the basename); purpose-mode prose contains no path substring
@@ -1034,7 +1057,7 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
           aria-label={i18nT('pages.chat.toolCallLine.open_in_side_panel', { path: filePath })}
         >
           <span className="max-w-[240px] truncate">{basename}</span>
-          <PanelRightSolid size={12} className="shrink-0" />
+          <SidePanelGlyph size={12} className="shrink-0" />
         </button>
       )}
       </div>
@@ -1066,7 +1089,7 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
           }}
         >
           <FileDiff size={12} className="shrink-0" aria-hidden />
-          {chipView.path && <span className="font-mono max-w-[240px] truncate">{chipView.path.split('/').pop()}</span>}
+          {chipView.path && <span className="font-mono max-w-[240px] truncate">{pathBasename(chipView.path)}</span>}
           <span className="tabular-nums">
             {chipView.removed > 0 && <span className="text-danger">{chipView.truncated ? '≥' : ''}-{chipView.removed}</span>}
             {chipView.removed > 0 && chipView.added > 0 && ' '}
@@ -1163,7 +1186,11 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
             transition={{ duration: 0.35, ease: [0.4, 0.0, 0.2, 1] /* Material standard */ }}
             style={{ overflow: 'hidden' }}
           >
-            <ToolDetails purpose={purpose} pillLabel={toolLabel} toolName={derived.rawTitle || label} input={input} output={isAutoDenied ? denyOutput : output} auto={auto} pending={hasPendingPerm} ts={ts} hasEntry={hasEntry} fmtTime={fmtTime} barColor={barStyle} layoutId={`tool-detail-${effectiveId || toolCallId || fallbackId}`} flush />
+            {/* askAgent on: a transcript row holds no draft of its own, the
+                composer draft is persisted per slot, and an in-chat hand-off
+                opens a fresh slot rather than navigating away. */}
+            {isAutoDenied && <ErrorNotice variant="inline" message={autoDenyNotice} askAgent testId="gate-crash-notice" />}
+            <ToolDetails purpose={purpose} pillLabel={toolLabel} toolName={derived.rawTitle || label} input={input} output={isAutoDenied ? denyOutput : output} inputCut={inputCut} outputCut={isAutoDenied ? null : outputCut} auto={auto} pending={hasPendingPerm} ts={ts} hasEntry={hasEntry} fmtTime={fmtTime} barColor={barStyle} layoutId={`tool-detail-${effectiveId || toolCallId || fallbackId}`} flush />
           </motion.div>
         )}
       </AnimatePresence>

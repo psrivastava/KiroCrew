@@ -1,4 +1,4 @@
-# KiroCrewWebsite — Agent Guidelines
+# Kiro Crew Website — Agent Guidelines
 
 **This file is a ROUTER, not a manual.** It carries only the rules whose violation
 causes damage before a pointer could be read. Everything else is a link you MUST
@@ -19,6 +19,7 @@ them.
 | shared components, a11y, URL sanitization, data fetching, the stack, adding a dependency | [frontend-conventions](docs/frontend-conventions.md) |
 | any user-facing string, date, number, or sort order | [i18n-catalog](docs/i18n-catalog.md) + [i18n gates](../docs/ci/i18n-gates.md) |
 | `src/extensions.ts`, edition composition, registries | [extension-seams](docs/extension-seams.md) |
+| `src/api/` — `client.ts`, `api/client/*.ts`, adding an API method | [extension-seams](docs/extension-seams.md) (the transport seam and the method ratchets) |
 | tests (vitest, MSW, Playwright, Electron), or a test that fails only in CI | [testing](docs/testing.md) |
 | the Electron desktop shell | [electron/README.md](electron/README.md) |
 | anything backend, or a whole-system question | [`../AGENTS.md`](../AGENTS.md) |
@@ -57,8 +58,9 @@ the `internal-content-scan` check.
   that writes a config path, or the `<SettingRef configKey="...">` chip silently
   degrades to a CLI popover even though a toggle exists. Backend drift guards catch bad
   keys, not missing ones, so this rule is the only gate for the missing case.
-- **Icons: `lucide-react` only, with `className="lucide-inline"`.** Never an emoji,
-  never a hand-rolled SVG, never `size={N}`. Enforced by `AUTOSDE.yaml`
+- **Icons: use `lucide-react`; use `className="lucide-inline"` when a glyph sits
+  inline with text.** Never use an emoji or hand-rolled SVG as an icon. Size props
+  are valid for standalone glyphs. Enforced by `AUTOSDE.yaml`
   (`use-lucide-icons`, `no-emoji-as-icons`).
 - **Errors shown to the user render through `ErrorNotice`**, never a hand-written
   `<div className="text-danger">{err}</div>`. Turn on `askAgent` wherever the
@@ -90,6 +92,15 @@ the `internal-content-scan` check.
   the UX Review lane (lens 13) — a hard swap with no stated reason is a BLOCK.
 - **Styling uses design tokens** (`var(--bg)`, `var(--text)`, …), never a literal
   color.
+- **Frontend tests are deterministic.** No promise-sleep barrier and no
+  `page.waitForTimeout` barrier; `Date` pinned with `vi.setSystemTime`; fake timers
+  restored in an `afterEach` or `onTestFinished`, which still run when the test times
+  out; wait for every value you read whose content comes from a different async source
+  than the one you awaited. Enforced on new and
+  changed test lines by `AUTOSDE.yaml` (`frontend-tests-are-deterministic`). A
+  Playwright spec that passes only on a retry is flaky: fix it, never raise `retries`.
+  Detail in
+  [testing § Determinism](docs/testing.md#determinism-establish-the-state-you-assert-on).
 - **Typography:** no `text-xs`, and no text below 10px.
 - **Accessibility:** use `<Clickable>` rather than `<div onClick>`; give every
   icon-only button an `aria-label`; use `<Btn>` / `<SendBtn>` rather than a raw

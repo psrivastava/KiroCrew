@@ -604,6 +604,88 @@ class TestVoiceConfig:
             )
             assert resp.status == 400
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            b'{"timezone": "Asia/Shanghai", "voice_reply": {"voice_id": "Ruth"',
+            b"",
+        ],
+        ids=["truncated", "empty"],
+    )
+    async def test_put_on_an_unreadable_config_is_refused_and_applies_nothing(
+        self, tmp_path, monkeypatch, raw
+    ):
+        """A write that could not land is a 5xx, the file keeps its bytes, and the
+        live `_vc` keeps its value: a swallowed failure behind {"ok": true} would
+        run a setting the next restart silently reverts."""
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        mock_vc = MagicMock(default_voice="Ruth", global_enabled=False)
+        monkeypatch.setattr("kiro_crew.dashboard.chat_voice._vc", mock_vc)
+        cfg_path = tmp_path / "config.json"
+        cfg_path.write_bytes(raw)
+        monkeypatch.setattr("kiro_crew.dashboard.chat_voice.config_path", lambda: cfg_path)
+        state = _make_state(tmp_path)
+        async with TestClient(TestServer(_make_voice_app(state))) as client:
+            resp = await client.put("/api/voice/config", json={"voice": "Matthew", "enabled": True})
+            assert resp.status == 500
+            assert (await resp.json())["code"] == "config_corrupt"
+        assert cfg_path.read_bytes() == raw
+        assert mock_vc.default_voice == "Ruth"
+        assert mock_vc.global_enabled is False
+
+    @pytest.mark.asyncio
+    async def test_put_is_a_locked_delta_write_off_the_loop(self, tmp_path, monkeypatch):
+        """The persist is ``update_config_locked`` (flock + tmp/rename + meta stamp
+        + live-watcher wake) run in a worker, never an ``open(..., "w")``
+        truncate-then-write -- the torn-read window the config spec names as the
+        cause of "all my settings reset themselves". Only the named key changes;
+        every other section and voice key keeps its value."""
+        from kiro_crew.config import loader
+        from kiro_crew.dashboard import chat_voice as cv
+
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        mock_vc = MagicMock(default_voice="Ruth")
+        monkeypatch.setattr(cv, "_vc", mock_vc)
+        cfg_path = tmp_path / "config.json"
+        seeded = {
+            "timezone": "Asia/Shanghai",
+            "agent": {"approval_mode": "interactive"},
+            "voice_reply": {"enabled": True, "rate": "120%", "auto_reply_to_voice": False},
+        }
+        cfg_path.write_text(json.dumps(seeded), encoding="utf-8")
+        monkeypatch.setattr(cv, "config_path", lambda: cfg_path)
+
+        seen: dict[str, object] = {}
+        real = loader.update_config_locked
+
+        def _spy(*args, **kwargs):
+            seen["on_loop"] = _on_running_loop()
+            seen["path"] = args[0] if args else kwargs.get("path")
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(cv, "update_config_locked", _spy)
+        state = _make_state(tmp_path)
+        async with TestClient(TestServer(_make_voice_app(state))) as client:
+            resp = await client.put("/api/voice/config", json={"voice": "Matthew"})
+            assert resp.status == 200
+        assert seen == {"on_loop": False, "path": cfg_path}
+        persisted = json.loads(cfg_path.read_text(encoding="utf-8"))
+        assert "meta" in persisted, "the locked writer stamps meta; a raw dump does not"
+        persisted.pop("meta")
+        expected = json.loads(json.dumps(seeded))
+        expected["voice_reply"]["voice_id"] = "Matthew"
+        assert persisted == expected
+        assert mock_vc.default_voice == "Matthew"
+
+
+def _on_running_loop() -> bool:
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    return True
+
 
 class TestVoiceSynthesize:
     @pytest.mark.asyncio
@@ -980,6 +1062,48 @@ class TestVoiceVoices:
         async with TestClient(TestServer(app)) as client:
             resp = await client.get("/api/voice/voices")
             assert resp.status == 502
+
+    @pytest.mark.asyncio
+    async def test_voices_cli_does_not_inherit_python_env(self, tmp_path, monkeypatch):
+        """A Python-based ``aws`` (aws-cli v1) breaks when it imports the
+        gateway's own packages, so the child env carries no PYTHONPATH or
+        PYTHONHOME while the rest of the environment still reaches it."""
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        mock_vc = MagicMock(provider="polly", aws_profile="", region="")
+        monkeypatch.setattr("kiro_crew.dashboard.chat_voice._vc", mock_vc)
+        monkeypatch.setattr("kiro_crew.dashboard.chat_voice._voices_cache", None)
+        monkeypatch.setattr("kiro_crew.dashboard.chat_voice._voices_cache_ts", 0)
+        monkeypatch.setenv("PYTHONPATH", "/bundle/site-packages")
+        monkeypatch.setenv("PYTHONHOME", "/bundle")
+        monkeypatch.setenv("MESH2535_KEEP", "kept")
+        seen: dict = {}
+
+        async def mock_exec(*args, **kwargs):
+            seen.update(kwargs)
+            proc = MagicMock()
+            proc.returncode = 0
+            proc.communicate = AsyncMock(return_value=(b'{"Voices": []}', b""))
+            return proc
+
+        monkeypatch.setattr("asyncio.create_subprocess_exec", mock_exec)
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_voice.resolve_polly_cli", lambda: "/usr/bin/aws"
+        )
+
+        from kiro_crew.dashboard.chat_voice import api_voice_voices
+
+        app = web.Application()
+        app["state"] = _make_state(tmp_path)
+        app.router.add_get("/api/voice/voices", api_voice_voices)
+
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get("/api/voice/voices")
+            assert resp.status == 200
+
+        env = seen["env"]
+        assert "PYTHONPATH" not in env
+        assert "PYTHONHOME" not in env
+        assert env["MESH2535_KEEP"] == "kept"
 
     @pytest.mark.asyncio
     async def test_voices_timeout(self, tmp_path, monkeypatch):

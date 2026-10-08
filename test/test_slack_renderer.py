@@ -31,6 +31,7 @@ from kiro_crew.slack.renderer import (
     SlackRenderer,
     build_approval_blocks,
     is_wait_identity,
+    split_approval_token,
 )
 
 
@@ -80,6 +81,21 @@ class _RecSlack:
     async def post_blocks(self, channel, blocks, text, thread_ts=None, **kw):
         self.calls.append(("post_blocks", {"blocks": blocks}))
         return self._ts()
+
+    def approval_token(self):
+        """The (registry key, nonce) pair the posted Approve button carries.
+
+        A click sends back the button's own ``value``, so a test that resolves
+        with anything else is not pressing what the user pressed.
+        """
+        for name, kw in reversed(self.calls):
+            if name != "post_blocks":
+                continue
+            for block in kw["blocks"]:
+                for element in block.get("elements", []):
+                    if str(element.get("action_id", "")).startswith(TOOL_APPROVE_ACTION_PREFIX):
+                        return split_approval_token(element.get("value", ""))
+        return None
 
     async def post_message(self, channel, text, thread_ts=None, **kw):
         self.calls.append(("post_message", {"text": text}))
@@ -511,11 +527,15 @@ class TestApprovalDecider:
         async def scenario():
             task = asyncio.create_task(driver.run("hi"))
             for _ in range(1000):
-                if decider._futures:
+                if decider._futures and rec.approval_token():
                     break
                 await asyncio.sleep(0)
-            assert SlackApprovalDecider.session_for("thread-42:rqS") == "thread-42"
-            assert SlackApprovalDecider.resolve_global("thread-42:rqS", True) is True
+            token = rec.approval_token()
+            assert token is not None
+            key, nonce = token
+            assert key == "thread-42:rqS"
+            assert SlackApprovalDecider.session_for(key, nonce=nonce) == "thread-42"
+            assert SlackApprovalDecider.resolve_global(key, True, nonce=nonce) is True
             await task
 
         asyncio.run(scenario())
@@ -539,11 +559,15 @@ class TestApprovalDecider:
         async def scenario():
             task = asyncio.create_task(driver.run("hi"))
             for _ in range(1000):
-                if decider._futures:
+                if decider._futures and rec.approval_token():
                     break
                 await asyncio.sleep(0)
             # Resolve WITHOUT a direct decider reference — as interactions.py does.
-            assert SlackApprovalDecider.resolve_global("rqG", True) is True
+            token = rec.approval_token()
+            assert token is not None
+            key, nonce = token
+            assert key == "rqG"
+            assert SlackApprovalDecider.resolve_global(key, True, nonce=nonce) is True
             await task
 
         asyncio.run(scenario())
@@ -569,10 +593,13 @@ class TestApprovalDecider:
         async def scenario():
             task = asyncio.create_task(driver.run("hi"))
             for _ in range(1000):
-                if decider._futures:
+                if decider._futures and rec.approval_token():
                     break
                 await asyncio.sleep(0)
-            assert SlackApprovalDecider.resolve_global("rqD", False) is True
+            token = rec.approval_token()
+            assert token is not None
+            key, nonce = token
+            assert SlackApprovalDecider.resolve_global(key, False, nonce=nonce) is True
             await task
 
         asyncio.run(scenario())
@@ -613,6 +640,10 @@ class TestApprovalDecider:
             dec_a = SlackApprovalDecider(session_key="thread-A")
             dec_b = SlackApprovalDecider(session_key="thread-B")
             ev = AcpEvent(kind=EVENT_PERMISSION_REQUEST, request_id="1", options=[])
+            # The renderer opens each window (and mints its nonce) before posting.
+            nonce_a = dec_a.reserve("1")
+            nonce_b = dec_b.reserve("1")
+            assert nonce_a and nonce_b and nonce_a != nonce_b
             task_a = _asyncio.create_task(dec_a(ev))
             task_b = _asyncio.create_task(dec_b(ev))
             for _ in range(1000):
@@ -623,11 +654,11 @@ class TestApprovalDecider:
             assert SlackApprovalDecider._REGISTRY.get("thread-A:1") is dec_a
             assert SlackApprovalDecider._REGISTRY.get("thread-B:1") is dec_b
             # Approve ONLY thread B via its namespaced token.
-            assert SlackApprovalDecider.resolve_global("thread-B:1", True) is True
+            assert SlackApprovalDecider.resolve_global("thread-B:1", True, nonce=nonce_b) is True
             assert (await task_b) is True  # B approved
             # A is untouched and still pending — deny it to finish the test.
             assert not task_a.done()
-            assert SlackApprovalDecider.resolve_global("thread-A:1", False) is True
+            assert SlackApprovalDecider.resolve_global("thread-A:1", False, nonce=nonce_a) is True
             assert (await task_a) is False  # A independently denied
 
         _asyncio.run(scenario())
@@ -1642,3 +1673,78 @@ class TestOptionsFooterCancellationDefersFinalize:
             assert renderer.turn_finalized is True
 
         asyncio.run(scenario())
+
+
+class TestTransportRedactionNotice:
+    """The DEFAULT Slack path posts a redaction notice below a rewritten answer.
+
+    Driven through the real TurnDriver so the StreamRedactor writes the
+    placeholder exactly as production does. The tally counts the final
+    display-safe body plus the posted 💭 reasoning, mirroring the native
+    handler's per-turn count; shared wording is pinned in
+    ``test_credential_redaction_notice.py``.
+    """
+
+    _SECRET_URI = "postgresql://user:SuperSecret123@db.example.com:5432/prod"
+
+    def _run(self, rec, events):
+        renderer = SlackRenderer(rec, "C1", "t1", reactions_enabled=False)
+        provider = _Provider(events)
+        asyncio.run(TurnDriver(provider, renderer, approval_mode="auto").run("hi"))
+
+    def test_redacted_answer_is_followed_by_one_threaded_notice(self):
+        rec = _RecSlack()
+        self._run(
+            rec,
+            [
+                AcpEvent(kind=EVENT_TEXT_CHUNK, text=f"Run: psql {self._SECRET_URI}"),
+                AcpEvent(kind=EVENT_COMPLETE, stop_reason="end_turn"),
+            ],
+        )
+        outbound = [str(kw.get("text") or kw.get("final_text") or "") for _method, kw in rec.calls]
+        assert not any("SuperSecret123" in t for t in outbound)
+        notices = [
+            kw["text"]
+            for method, kw in rec.calls
+            if method == "post_message" and "Security notice" in str(kw.get("text"))
+        ]
+        assert len(notices) == 1
+        assert "SuperSecret123" not in notices[0]
+        # Below the answer: the stream is finalized before the notice posts.
+        methods = [m for m, _ in rec.calls]
+        last_post_message = max(i for i, m in enumerate(methods) if m == "post_message")
+        assert methods.index("stop_stream") < last_post_message
+
+    def test_clean_answer_posts_no_notice(self):
+        rec = _RecSlack()
+        self._run(
+            rec,
+            [
+                AcpEvent(kind=EVENT_TEXT_CHUNK, text="All green, deploy finished."),
+                AcpEvent(kind=EVENT_COMPLETE, stop_reason="end_turn"),
+            ],
+        )
+        assert not any(
+            "Security notice" in str(kw.get("text"))
+            for method, kw in rec.calls
+            if method == "post_message"
+        )
+
+    def test_notice_send_failure_does_not_fail_a_delivered_turn(self):
+        class _NoticeFailsSlack(_RecSlack):
+            async def post_message(self, channel, text, thread_ts=None, **kw):
+                if "Security notice" in str(text):
+                    raise RuntimeError("slack down after the answer")
+                return await super().post_message(channel, text, thread_ts, **kw)
+
+        rec = _NoticeFailsSlack()
+        # Must not raise: the answer is already delivered when the notice fails.
+        self._run(
+            rec,
+            [
+                AcpEvent(kind=EVENT_TEXT_CHUNK, text=f"Run: psql {self._SECRET_URI}"),
+                AcpEvent(kind=EVENT_COMPLETE, stop_reason="end_turn"),
+            ],
+        )
+        stops = [kw for m, kw in rec.calls if m == "stop_stream"]
+        assert len(stops) == 1 and "[REDACTED: credential]" in str(stops[0]["final_text"])

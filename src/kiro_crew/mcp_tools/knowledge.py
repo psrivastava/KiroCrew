@@ -113,6 +113,9 @@ def schemas() -> list[dict[str, Any]]:
                 "spec, RFC, runbook, or wiki page that explains intent, a "
                 "decision, or how something works, and that you would want to "
                 "find again in a future session.\n\n"
+                "It works only when the operator turned on "
+                "knowledge.auto_add_documents (off by default). A refusal naming "
+                "that key means it is off: tell the user, do not retry.\n\n"
                 "Pass the document TEXT you already have as `content` -- this tool "
                 "never opens files, so read the document with your own tools first, "
                 "then hand over the text. Also pass where it came from as "
@@ -190,6 +193,11 @@ def schemas() -> list[dict[str, Any]]:
     ]
 
 
+# Appended when the embedding model cannot serve this search, so the caller
+# knows meaning-based (and CJK) matches were not tried.
+_KEYWORD_ONLY_NOTE = " (vector path unavailable; keyword results only)"
+
+
 def local_knowledge_search(name: str, args: dict[str, Any]) -> str:
     args = validate_tool_args(args, LOCAL_KNOWLEDGE_SEARCH_SCHEMA)
     query = args["query"]
@@ -260,7 +268,7 @@ def local_knowledge_search(name: str, args: dict[str, Any]) -> str:
             outcome="no_results",
             metadata={"query": audit_query},
         )
-        return "No relevant knowledge found."
+        return "No relevant knowledge found." + ("" if available else _KEYWORD_ONLY_NOTE)
 
     # Format output. Source identity (source_type/source_name/source_uri)
     # and the per-document locator (file_path for folders, artifact_slug +
@@ -269,6 +277,7 @@ def local_knowledge_search(name: str, args: dict[str, Any]) -> str:
     lines = [
         "\U0001f4da Knowledge Library "
         "(supplementary reference \u2014 extract only what's relevant to the question):"
+        + ("" if available else _KEYWORD_ONLY_NOTE)
     ]
     for r in results:
         title = r.get("title") or "(untitled)"

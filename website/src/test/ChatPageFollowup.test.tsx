@@ -36,6 +36,7 @@ vi.mock('../api/client', () => ({
     chatSlotDetail: vi.fn().mockResolvedValue({ messages: [], running: false, has_more: false, total: 0 }),
     sendChat: vi.fn().mockResolvedValue({ ok: true, json: () => Promise.resolve({ ok: true }) }),
     chatHistory: vi.fn().mockResolvedValue({ sessions: [] }),
+    dashboardConfig: vi.fn().mockResolvedValue({}),
     models: vi.fn().mockResolvedValue([]),
     agents: vi.fn().mockResolvedValue([]),
     agentDetail: vi.fn().mockResolvedValue({}),
@@ -55,6 +56,11 @@ vi.mock('../api/client', () => ({
     // so answer them so the notice does not compete with the assertions below.
     chatFolders: vi.fn().mockResolvedValue([]),
     tagColumns: vi.fn().mockResolvedValue([]),
+    // Same for the settings read behind the sidebar's folder order: unanswered,
+    // it fails and the sidebar renders a second `role="alert"` beside the
+    // worktree-failure notice the assertions below look up by role.
+    kirocrewConfig: vi.fn().mockResolvedValue({}),
+    agentResolvedModel: vi.fn().mockResolvedValue({ pinned: false }),
   },
   SEARCH_MIN_CHARS: 2,
 }))
@@ -254,5 +260,16 @@ describe('ChatPage follow-up worktree orchestration', () => {
     fireEvent.click(screen.getByRole('button', { name: /add to this session/i }))
     await waitFor(() => expect(composer().value).toContain(ITEM.prompt))
     expect(composer().value).toBe(`half-written thought\n\n${ITEM.prompt}`)
+  })
+
+  it('a redaction card pre-fill appends to an unsent draft instead of destroying it', async () => {
+    const store = makeStore()
+    await renderPage(store)
+    fireEvent.change(composer(), { target: { value: 'half-written thought' } })
+    act(() => {
+      window.dispatchEvent(new CustomEvent('mc:prefill-composer', { detail: { text: 'Please rotate the key.' } }))
+    })
+    await waitFor(() => expect(composer().value).toContain('Please rotate the key.'))
+    expect(composer().value).toBe('half-written thought\n\nPlease rotate the key.')
   })
 })

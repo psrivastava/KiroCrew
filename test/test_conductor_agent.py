@@ -28,6 +28,8 @@ from skill_script_helpers import load_skill_script
 
 from kiro_crew import agent
 from kiro_crew.agent_files import CONDUCTOR_AGENT_FILENAME, OWNED_KIRO_AGENT_FILES
+from kiro_crew.agent_sdk.drivers.acp import derived_agent_permissions
+from kiro_crew.kiro_cli import SPEC_PERMISSIONS_MIN_VERSION
 from kiro_crew.skills import _BUILTIN_SKILLS_DIR
 
 SKILL_DIR = (
@@ -35,12 +37,33 @@ SKILL_DIR = (
 )
 SCRIPT = SKILL_DIR / "scripts" / "accept_eval.py"
 
-#: An allowlisted command that always exits 0 — the "pass" fixture.
+#: A release that accepts a spec ``permissions`` block, and one that refuses it.
+#: Expressed against the floor rather than as literals so raising the floor
+#: cannot leave a test asserting the old boundary.
+_ACCEPTS = SPEC_PERMISSIONS_MIN_VERSION
+_REFUSES = (SPEC_PERMISSIONS_MIN_VERSION[0], SPEC_PERMISSIONS_MIN_VERSION[1] - 1, 0)
+_INHERITED_PERMISSIONS = {"rules": [{"capability": "web_fetch", "effect": "deny"}]}
+
+
+def _pin_spec_permissions_cli(monkeypatch, which):
+    """Pin what the writer's version gate believes the installed kiro-cli is.
+
+    The generated spec writers share one gate (``_write_derived_permissions``), which
+    reads ``installed_kiro_cli_version`` function-locally from
+    ``kiro_crew.kiro_cli``, so the patch lands in the owning module. Without it
+    the answer is whatever the test HOST has, which on CI is nothing and reads
+    as "unknown" -- the refusing case -- so a writer test asserting a
+    ``permissions`` block would fail for a host reason rather than a code one.
+    ``which`` is one of ``"accepts"``, ``"refuses"`` or ``"unknown"``.
+    """
+    version = {"accepts": _ACCEPTS, "refuses": _REFUSES, "unknown": None}[which]
+    monkeypatch.setattr("kiro_crew.kiro_cli.installed_kiro_cli_version", lambda: version)
 
 
 class TestConductorInstaller:
-    def _install(self, tmp_path, monkeypatch, *, may_auto_approve=None):
+    def _install(self, tmp_path, monkeypatch, *, may_auto_approve=None, cli_version="accepts"):
         monkeypatch.setattr(agent, "kiro_agents_dir_path", lambda: tmp_path)
+        _pin_spec_permissions_cli(monkeypatch, cli_version)
         monkeypatch.setattr(
             agent,
             "build_agent_config",
@@ -53,6 +76,7 @@ class TestConductorInstaller:
                 },
                 "tools": ["fs_write", "@kirocrew-core"],
                 "allowedTools": ["@kirocrew-core"],
+                "permissions": _INHERITED_PERMISSIONS,
             },
         )
         monkeypatch.setattr(
@@ -164,7 +188,13 @@ class TestConductorInstaller:
         for verb in (
             "chat_folder_move_session",
             "chat_folder_move",
+            # Renames or restyles an existing folder, which may be the person's.
+            "chat_folder_update",
             "session_send",
+            # The fan-out write, withheld on `session_send`'s reason multiplied by
+            # the fleet: one call runs ingested text as a user-role turn in every
+            # session this agent created, and nothing bounds what is sent.
+            "session_broadcast",
             "session_stop",
         ):
             assert f"@kirocrew-dashboard/{verb}" not in granted, verb
@@ -174,6 +204,11 @@ class TestConductorInstaller:
             "chat_folder_file_self",
             "session_create",
             "session_read_message",
+            # A pure read, narrower than `session_read_message` beside it (a
+            # liveness word per child, no transcript content), and asked on every
+            # unattended patrol cycle -- so gating it would put an approval prompt
+            # in a loop with nobody at the keyboard.
+            "session_status",
         ):
             assert f"@kirocrew-dashboard/{verb}" in granted, verb
 
@@ -193,6 +228,7 @@ class TestConductorInstaller:
             "@kirocrew-dashboard/chat_folder_file_self",
             "@kirocrew-dashboard/session_create",
             "@kirocrew-dashboard/session_read_message",
+            "@kirocrew-dashboard/session_status",
         }
         # The bare server must never appear: it would grant every verb, including
         # the four the test above withholds.
@@ -433,7 +469,7 @@ class TestConductorInstaller:
         filter, because the agent copies whichever it read last.
         """
         prompt = self._install(tmp_path, monkeypatch)["prompt"]
-        assert "Filter the returned" in prompt
+        assert "Filter the `accept_batch`" in prompt
         assert "whose status is `done`" in prompt
         body = " ".join((SKILL_DIR / "SKILL.md").read_text(encoding="utf-8").split())
         assert "keep only the entries whose item is currently `status: done`" in body
@@ -458,14 +494,72 @@ class TestConductorInstaller:
         assert "`work_report` at round boundaries" in body
         assert "root conductor gets `not_bound`" in body
 
-    def test_prompt_notes_the_patrol_gate_is_still_a_timer(self, tmp_path, monkeypatch):
-        """``monitor_start`` gates on one pull-request URL and nothing else today, so
-        a cycle fires whether or not anything was reported. The prompt says so, and
-        says what to switch to, rather than implying a gate that does not exist.
+    def test_prompt_and_skill_require_the_ledger_watch_and_the_interval_band(
+        self, tmp_path, monkeypatch
+    ):
+        """A loop without ``watch="work-ledger"`` is a plain timer that pays a turn
+        every interval, and a 30-minute interval leaves a worker's report unread
+        for half an hour. Both the prompt and the skill must make the watch
+        mandatory and keep the interval inside the band ``patrol_budget.py``
+        enforces.
         """
-        prompt = self._install(tmp_path, monkeypatch)["prompt"]
-        assert "monitor_start" in prompt
-        assert 'watch: "work-ledger"' in prompt
+        prompt = " ".join(self._install(tmp_path, monkeypatch)["prompt"].split())
+        body = " ".join((SKILL_DIR / "SKILL.md").read_text(encoding="utf-8").split())
+        assert 'Always pass `watch="work-ledger"`' in prompt
+        assert '`watch="work-ledger"` is mandatory' in body
+        for text in (prompt, body):
+            assert 'monitor_update(watch="work-ledger")' in text
+            assert "300..900" in text
+            assert "interval_secs=1800" not in text
+            assert "on a timer today" not in text
+
+    def test_prompt_and_skill_run_rounds_back_to_back_and_stop_on_two_signals(
+        self, tmp_path, monkeypatch
+    ):
+        """A finished round must not wait on the user: the Round-0 go-ahead covers
+        every round. Patrol ends only when every item is terminal or the user
+        stops it, and a question parks one item instead of stopping the loop.
+        """
+        prompt = " ".join(self._install(tmp_path, monkeypatch)["prompt"].split())
+        body = " ".join((SKILL_DIR / "SKILL.md").read_text(encoding="utf-8").split())
+        assert "Rounds run back to back" in prompt
+        assert "Do not wait for the user between rounds" in body
+        assert "propose the next round. Then wait." not in body
+        assert "Patrol ends on two signals only" in prompt
+        assert "Patrol ends on exactly two signals" in body
+        assert "Needs-human checklist" in body
+        for text in (prompt, body):
+            assert "Round-0 go-ahead" in text
+            assert "runaway backstop, not a stop signal" in text
+            assert "credentials, spend, deleting or overwriting someone's work" in text
+            assert "Park just this item" in text
+
+    def test_needs_human_checklist_puts_the_risk_check_before_the_default(
+        self, tmp_path, monkeypatch
+    ):
+        """A model stops at the first step that applies. If "pick a default"
+        came first, a spend, delete or force-overwrite choice with an obvious
+        default would be taken unattended, so the risk check must lead.
+        """
+        prompt = " ".join(self._install(tmp_path, monkeypatch)["prompt"].split())
+        body = " ".join((SKILL_DIR / "SKILL.md").read_text(encoding="utf-8").split())
+        for text in (prompt, body):
+            assert text.index("Is it credentials, spend") < text.index("Not risky? Pick a default")
+            assert "Can you pick a default?" not in text
+            assert "Can I pick a default?" not in text
+
+    def test_back_to_back_rounds_keep_a_spend_bound(self, tmp_path, monkeypatch):
+        """Without a pause between rounds, a default item cap and a no-progress
+        back-off are the only spend gates when the user set no budget.
+        """
+        prompt = " ".join(self._install(tmp_path, monkeypatch)["prompt"].split())
+        body = " ".join((SKILL_DIR / "SKILL.md").read_text(encoding="utf-8").split())
+        for text in (prompt, body):
+            assert "spend is bounded" in text
+            assert "two rounds in a row" in text
+            assert "re-plan may add items only" in text
+        assert "at most 20 ledger items" in prompt
+        assert "at most **20 ledger items**" in body
 
     def test_prompt_names_its_own_skill_and_not_the_deprecated_alias(self, tmp_path, monkeypatch):
         """The procedure lives in ``goal-conductor``. ``goal-ledger-conductor`` is a
@@ -484,7 +578,7 @@ class TestConductorInstaller:
         body = " ".join((SKILL_DIR / "SKILL.md").read_text(encoding="utf-8").split())
         assert "Bind BEFORE you seed" in body
         assert "Never leave `agent` unset" in body
-        assert "work_ledger_read` first, every cycle" in body
+        assert "work_ledger_read` with `compact=true` first, every cycle" in body
         assert "action=accept" in body
 
     def test_prompt_and_skill_close_a_child_once_its_item_is_terminal(self, tmp_path, monkeypatch):
@@ -590,8 +684,10 @@ class TestConductorInstaller:
             "@kirocrew-dashboard/chat_folder_file_self",
             "@kirocrew-dashboard/session_create",
             "@kirocrew-dashboard/session_read_message",
+            "@kirocrew-dashboard/session_status",
             "@kirocrew-work/work_ledger_read",
             "@kirocrew-work/work_ledger_record",
+            "@kirocrew-work/work_ledger_rebuild",
             "@kirocrew-work/work_brief",
         ]
 
@@ -629,10 +725,12 @@ class TestConductorInstaller:
             "kirocrew-dashboard/chat_folder_tree",
             "kirocrew-dashboard/session_create",
             "kirocrew-dashboard/session_read_message",
+            "kirocrew-dashboard/session_status",
         ]
         work_resources = [
             "kirocrew-work/work_brief",
             "kirocrew-work/work_ledger_read",
+            "kirocrew-work/work_ledger_rebuild",
             "kirocrew-work/work_ledger_record",
         ]
         data = self._install(tmp_path, monkeypatch)
@@ -683,6 +781,29 @@ class TestConductorInstaller:
         data = self._install(tmp_path, monkeypatch, may_auto_approve=lambda ref: False)
         assert data["permissions"] == {"rules": []}
         assert data["allowedTools"] == []
+
+    def test_the_permissions_field_is_gated_on_the_installed_kiro_cli(self, tmp_path, monkeypatch):
+        """Written on an accepting release, withheld on a refusing or unknown one.
+
+        The generated conductor spec gates its ``permissions`` write on the
+        installed kiro-cli, sharing the default spec's gate: a kiro-cli whose
+        schema predates the field would otherwise refuse the WHOLE spec and fall
+        back to broader default grants. ``allowedTools`` is untouched either way
+        -- it is the KAS-only projection that is withheld, not the grant list
+        kiro-cli reads.
+        """
+        accepting = self._install(tmp_path, monkeypatch, cli_version="accepts")
+        assert accepting.get("permissions"), "an accepting CLI must get the block"
+        assert accepting["permissions"] != _INHERITED_PERMISSIONS
+        assert accepting["permissions"] == derived_agent_permissions(
+            accepting["allowedTools"], CONDUCTOR_AGENT_FILENAME
+        )
+        assert accepting["allowedTools"], "the grant list is never withheld"
+
+        for refusing in ("refuses", "unknown"):
+            data = self._install(tmp_path, monkeypatch, cli_version=refusing)
+            assert "permissions" not in data, f"{refusing} CLI must get no block"
+            assert data["allowedTools"], "the grant list is never withheld"
 
     def test_withholding_a_grant_is_audit_logged(self, tmp_path, monkeypatch):
         """A withheld grant is a permission DECISION and must leave a record.
@@ -757,8 +878,10 @@ class TestConductorInstaller:
             "@kirocrew-dashboard/chat_folder_file_self",
             "@kirocrew-dashboard/session_create",
             "@kirocrew-dashboard/session_read_message",
+            "@kirocrew-dashboard/session_status",
             "@kirocrew-work/work_ledger_read",
             "@kirocrew-work/work_ledger_record",
+            "@kirocrew-work/work_ledger_rebuild",
             "@kirocrew-work/work_brief",
         ]
 
@@ -886,18 +1009,18 @@ class TestConductorInstaller:
         assert "2. `session_create`" in dispatch
 
     def test_pr_checks_seed_may_name_the_prepare_pr_skill_by_path(self):
-        """A ``pr_checks`` seed can point the worker at prepare-pr's SKILL.md.
+        """A ``pr_checks`` seed can point the worker at kirocrew-prepare-pr's SKILL.md.
 
         ``kirocrew-worker`` is a custom agent: ``_skills_injection_plan`` gives it
         no catalog and no trigger matching, so however a seed is worded nothing
-        auto-loads ``prepare-pr`` in the worker session. The conductor naming the
+        auto-loads ``kirocrew-prepare-pr`` in the worker session. The conductor naming the
         file is the only route. Pinned as an OPTIONAL hint, not a mandate: a user
-        who does not want prepare-pr must not have it forced on every worker.
+        who does not want kirocrew-prepare-pr must not have it forced on every worker.
         """
         text = (SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
         dispatch = text.split("### Dispatch a round")[1].split("### Patrol")[0]
         flat = " ".join(dispatch.split())
-        assert "`<crew-home>/skills/kirocrew-dev/prepare-pr/SKILL.md`" in flat
+        assert "`<crew-home>/skills/kirocrew-dev/kirocrew-prepare-pr/SKILL.md`" in flat
         assert "may name the PR procedure" in flat
         # Optional, by design.
         assert "Optional" in flat

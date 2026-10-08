@@ -26,6 +26,50 @@ from aiohttp import web
 from kiro_crew.apps.builtins.ops_mission_control.backend import models, routes, store
 
 
+def _http_surface_modules() -> list:
+    """``routes`` plus every module of the ``http_routes`` package whose handlers it composes.
+
+    Enumerated from the package directory rather than listed, so a module added there later
+    is scanned by every source guard below without anyone remembering to add it.
+    """
+    import importlib
+
+    package = Path(routes.__file__).parent / "http_routes"
+    modules = [routes]
+    for path in sorted(package.rglob("*.py")):
+        dotted = ".".join(path.relative_to(package).with_suffix("").parts)
+        name = routes.__package__ + ".http_routes"
+        if dotted != "__init__":
+            name += "." + dotted.removesuffix(".__init__")
+        modules.append(importlib.import_module(name))
+    return modules
+
+
+def _http_surface_source() -> str:
+    """The source of the whole HTTP surface: the facade and every projection it composes."""
+    import inspect
+
+    return "\n".join(inspect.getsource(module) for module in _http_surface_modules())
+
+
+def _handler_source(name: str) -> str:
+    """``routes.<name>`` plus the same-named projection it delegates to, when it is a shell.
+
+    A facade handler that forwards to a projection holds none of the code a scan is about,
+    so scanning it alone would pass vacuously. Both are returned, so the scan covers the
+    object the router serves AND the body that does the work.
+    """
+    import inspect
+
+    served = getattr(routes, name)
+    sources = [inspect.getsource(served)]
+    for module in _http_surface_modules()[1:]:
+        projection = getattr(module, name, None)
+        if projection is not None and projection is not served:
+            sources.append(inspect.getsource(projection))
+    return "\n".join(sources)
+
+
 class TestRouteRegistration(unittest.IsolatedAsyncioTestCase):
     async def test_all_routes_are_namespaced_under_the_app(self):
         """A builtin registering outside its own namespace would shadow core APIs."""
@@ -639,6 +683,17 @@ class TestLedgerHygieneWiring(unittest.IsolatedAsyncioTestCase):
             side_effect=RuntimeError("faiss unavailable"),
         ):
             result = routes._index_ledger_safely()
+        self.assertEqual(result, {"scanned": 0, "written": 0, "skipped": 0, "embedded": 0})
+
+    async def test_persistence_switch_skips_automatic_ledger_index_write(self):
+        """The nightly app sweep must obey the global automatic-write switch."""
+        cfg = mock.MagicMock()
+        cfg.memory.persistence_enabled = False
+        with mock.patch("kiro_crew.config.loader.KiroCrewConfig.load", return_value=cfg):
+            with mock.patch("kiro_crew.vector_memory.VectorMemoryStore") as store_cls:
+                result = routes._index_ledger_safely()
+
+        store_cls.assert_not_called()
         self.assertEqual(result, {"scanned": 0, "written": 0, "skipped": 0, "embedded": 0})
 
     async def test_a_prune_fault_cannot_cost_the_ledger_push(self):
@@ -1836,14 +1891,18 @@ class TestTheAutonomyGateIsAChokepoint(unittest.IsolatedAsyncioTestCase):
 
         backend = pathlib.Path(routes.__file__).parent
         offenders = []
-        for path in sorted(backend.glob("*.py")):
+        # `rglob`, not `glob`: the handlers live in `backend/http_routes/`, and a second
+        # caller hidden one directory down is exactly what this must not miss.
+        for path in sorted(backend.rglob("*.py")):
             # `encoding=` is required: these sources contain em-dashes, and a bare `read_text()`
             # decodes as cp1252 on Windows and raises before the assertion can run.
             for lineno, line in enumerate(
                 path.read_text(encoding="utf-8").splitlines(), 1
             ):
                 if re.search(r"\bsink\.execute\(|\.execute\(.*signal", line):
-                    offenders.append(f"{path.name}:{lineno}: {line.strip()}")
+                    offenders.append(
+                        f"{path.relative_to(backend).as_posix()}:{lineno}: {line.strip()}"
+                    )
         self.assertEqual(
             len(offenders),
             1,
@@ -1859,10 +1918,9 @@ class TestTheAutonomyGateIsAChokepoint(unittest.IsolatedAsyncioTestCase):
         A permit built beside the write would be a rubber stamp: the type would still be
         satisfied while no gate had run.
         """
-        import inspect
         import re
 
-        source = inspect.getsource(routes)
+        source = _http_surface_source()
         # Constructor calls, not the class definition or type annotations.
         constructions = [
             line.strip()
@@ -2024,6 +2082,39 @@ class TestBlockedStateReadsThePublicSlotContract(unittest.IsolatedAsyncioTestCas
         # Falls back to the PUBLIC attribute, not to the old private reach-in.
         self.assertTrue(result["pending_approval"])
 
+    def test_waiting_for_input_is_read_from_the_serializer(self):
+        """The chat slot exposes its open-question flag only through ``to_dict()``."""
+
+        class _Slot:
+            running = False
+            messages: list = []
+
+            def __init__(self, public: dict | None):
+                self.public = public
+
+            def to_dict(self, **_kw):
+                if self.public is None:
+                    raise RuntimeError("slot serializer blew up")
+                return self.public
+
+        def read(slot):
+            class _State:
+                @staticmethod
+                def get_slot(key):
+                    return slot
+
+            class _Req:
+                app = {"state": _State()}
+
+            result = routes._slot_state(cast(web.Request, _Req()), "probe")
+            assert result is not None, "the stub always resolves a slot"
+            return result["waiting_for_input"]
+
+        self.assertTrue(read(_Slot({"needs_input": True, "waiting_for_input": True})))
+        # A finished turn (assistant spoke last, nothing asked) is not blocked on input.
+        self.assertFalse(read(_Slot({"needs_input": False, "waiting_for_input": True})))
+        self.assertFalse(read(_Slot(None)), "a serializer fault degrades to False")
+
 
 class TestRotationDescribeDoesNotBlockTheLoop(unittest.IsolatedAsyncioTestCase):
     """``rotation.describe`` reaches the same ``gh api user`` spawn the gate does.
@@ -2094,13 +2185,19 @@ class TestRotationDescribeDoesNotBlockTheLoop(unittest.IsolatedAsyncioTestCase):
         )
 
     def test_no_handler_evaluates_describe_on_the_loop(self):
-        import inspect
         import re
 
-        source = inspect.getsource(routes)
+        source = _http_surface_source()
         # Code only: the comments explaining the fix necessarily quote the broken shape.
         code = "\n".join(
             line for line in source.splitlines() if not line.lstrip().startswith("#")
+        )
+        # A floor on what the scan sees, so it cannot pass by finding nothing: `/state`,
+        # `/handover` and `/rotation` each resolve the rotation.
+        self.assertEqual(
+            len(re.findall(r"to_thread\(\s*rotation\.describe", code)),
+            3,
+            "expected the three rotation.describe sites (/state, /handover, /rotation)",
         )
         inline = [
             line.strip()
@@ -2171,10 +2268,9 @@ class TestStatePollDoesNotBlockOnEntryPointDiscovery(unittest.IsolatedAsyncioTes
     """
 
     def test_companion_discovery_is_off_the_loop(self):
-        import inspect
         import re
 
-        source = inspect.getsource(routes._handle_state)
+        source = _handler_source("_handle_state")
         code = "\n".join(
             line for line in source.splitlines() if not line.lstrip().startswith("#")
         )
@@ -2189,6 +2285,7 @@ class TestStatePollDoesNotBlockOnEntryPointDiscovery(unittest.IsolatedAsyncioTes
             [],
             f"companion_summary() scans installed distributions; keep it off-loop: {inline}",
         )
+        self.assertIn("companion_summary", code, "the scan must see the /state call it guards")
 
     async def test_a_slow_entry_point_scan_does_not_stall_the_loop(self):
         import asyncio
@@ -2316,9 +2413,8 @@ class TestOutboundNotesAreRedacted(unittest.IsolatedAsyncioTestCase):
 
     def test_redaction_happens_before_the_length_clip(self):
         """Clipping first could sever a token so the pattern does not match."""
-        import inspect
 
-        source = inspect.getsource(routes._handle_action)
+        source = _handler_source("_handle_action")
         code = "\n".join(
             line for line in source.splitlines() if not line.lstrip().startswith("#")
         )
@@ -2334,12 +2430,17 @@ class TestOutboundNotesAreRedacted(unittest.IsolatedAsyncioTestCase):
 
     def test_no_outbound_note_bypasses_the_floor(self):
         """Guards the class, not just the two sites — the URL slip taught that lesson."""
-        import inspect
         import re
 
-        source = inspect.getsource(routes)
+        source = _http_surface_source()
         code = "\n".join(
             line for line in source.splitlines() if not line.lstrip().startswith("#")
+        )
+        # The action note, the drafted proposal note and the approved proposal's stored note.
+        self.assertGreaterEqual(
+            len(re.findall(r'(body|proposal)\.get\(\s*"note"', code)),
+            3,
+            "the scan must see every note heading to a provider",
         )
         raw = [
             ln.strip()
@@ -2390,7 +2491,7 @@ class TestACredentialBearingRemoteIsRefused(unittest.IsolatedAsyncioTestCase):
         from kiro_crew.apps.builtins.ops_mission_control.backend.providers import read_config
 
         token = "ghp_ThisIsTheActualTokenValue"
-        app = web.Application()
+        app = TestAStoreThatRefusesToWriteIsReportedNotCrashed._owner_app()
         routes.register_routes(app)
         with mock.patch.object(routes, "is_app_enabled", return_value=True):
             async with TestClient(TestServer(app)) as client:
@@ -2411,7 +2512,7 @@ class TestACredentialBearingRemoteIsRefused(unittest.IsolatedAsyncioTestCase):
         """The guard must not break the feature it protects."""
         from aiohttp.test_utils import TestClient, TestServer
 
-        app = web.Application()
+        app = TestAStoreThatRefusesToWriteIsReportedNotCrashed._owner_app()
         routes.register_routes(app)
         with mock.patch.object(routes, "is_app_enabled", return_value=True):
             async with TestClient(TestServer(app)) as client:
@@ -2568,7 +2669,7 @@ class TestOnlyOneApprovalCanWin(unittest.IsolatedAsyncioTestCase):
 
 
 class TestNoHandlerParsesAStoredFileOnTheLoop(unittest.IsolatedAsyncioTestCase):
-    """Every store/ledger read in `routes.py` must go through `asyncio.to_thread`.
+    """Every store/ledger read on the HTTP surface must go through `asyncio.to_thread`.
 
     These helpers parse a JSON/JSONL file whose size grows with use, and they sit on POLLED
     endpoints. Measured in this environment:
@@ -2742,10 +2843,16 @@ class TestNoHandlerParsesAStoredFileOnTheLoop(unittest.IsolatedAsyncioTestCase):
         rotation.describe(shift))` — and reads as fixed at a glance, which is why it needs
         its own check.
         """
-        import inspect
         import re
 
-        source = inspect.getsource(routes)
+        source = _http_surface_source()
+        # A floor, so the scan cannot pass by finding nothing: the three `rotation.describe`
+        # hops are `to_thread` lines this guard reads on every run.
+        self.assertGreaterEqual(
+            len(re.findall(r"to_thread\(\s*rotation\.describe", source)),
+            3,
+            "the scan must see the surface's to_thread calls",
+        )
         offenders = []
         for lineno, line in enumerate(source.splitlines(), 1):
             if line.strip().startswith("#") or "to_thread(" not in line:
@@ -2787,10 +2894,13 @@ class TestNoHandlerParsesAStoredFileOnTheLoop(unittest.IsolatedAsyncioTestCase):
 
         Fails against the pre-fix source, which had both helpers inside `to_thread(...)`.
         """
-        import inspect
         import re
 
-        source = inspect.getsource(routes)
+        source = _http_surface_source()
+        # The transition handler calls both of these on the loop; a scan that cannot find
+        # them is not checking them.
+        for helper in self.LOOP_OWNED_STATE_HELPERS[:2]:
+            self.assertRegex(source, rf"\b{re.escape(helper)}\(", f"{helper} is not on the surface")
         offenders = []
         for lineno, line in enumerate(source.splitlines(), 1):
             if line.strip().startswith("#") or "to_thread(" not in line:
@@ -2917,9 +3027,8 @@ class TestManualClaimResolvesTheSignalServerSide(unittest.IsolatedAsyncioTestCas
 
     def test_the_route_does_not_authorize_against_the_request_body(self):
         """Structural: the claimed signal must come from poll_all, not Signal.from_dict."""
-        import inspect
 
-        source = inspect.getsource(routes._handle_claim)
+        source = _handler_source("_handle_claim")
         code = "\n".join(
             line for line in source.splitlines() if not line.lstrip().startswith("#")
         )
@@ -3035,12 +3144,12 @@ class TestTheSlotKeyIsDerivedNotTrusted(unittest.TestCase):
         A behavioural test would need a live slot registry; what actually matters is that the
         field is never consulted, so that is asserted directly.
         """
-        import inspect
 
-        source = inspect.getsource(routes)
+        source = _http_surface_source()
         code = "\n".join(
             line for line in source.splitlines() if not line.lstrip().startswith("#")
         )
+        self.assertIn("canonical_slot_key(", code, "the scan must see the key derivation")
         self.assertNotIn(
             "inc.slot_key",
             code,
@@ -3271,10 +3380,9 @@ class TestApprovedProposalSchedulesVerification(unittest.IsolatedAsyncioTestCase
         expression to `_schedule_verification` — a future edit to one has to touch the other or
         this fails. Cheaper than discovering the drift from a false ledger miss.
         """
-        import inspect
         import re
 
-        source = inspect.getsource(routes)
+        source = _http_surface_source()
         calls = re.findall(r"_schedule_verification,\s*(.*?)\)", source, re.DOTALL)
         # The `def` line has no `incident` argument name; keep only the two call sites.
         arg_blobs = [c for c in calls if "incident" in c]
@@ -3336,6 +3444,21 @@ class TestAStoreThatRefusesToWriteIsReportedNotCrashed(unittest.IsolatedAsyncioT
     def _refuse(*_a, **_kw):
         raise PermissionError(13, "Permission denied")
 
+    @staticmethod
+    def _owner_app() -> web.Application:
+        """An app whose requests read as the dashboard owner (the secret routes are
+        owner-gated): no configured owner, caller ``local-app``."""
+
+        @web.middleware
+        async def _identity(request, handler):
+            request["user"] = "local-app"
+            request["app"] = ""
+            return await handler(request)
+
+        app = web.Application(middlewares=[_identity])
+        app["state"] = mock.MagicMock(owner_id="")
+        return app
+
     async def _client(self, app):
         from aiohttp.test_utils import TestClient, TestServer
 
@@ -3346,7 +3469,7 @@ class TestAStoreThatRefusesToWriteIsReportedNotCrashed(unittest.IsolatedAsyncioT
 
     async def test_a_refused_secret_save_is_a_coded_503_not_a_500(self):
         token = "u+ThisIsTheActualTokenValue"
-        app = web.Application()
+        app = self._owner_app()
         routes.register_routes(app)
         with mock.patch.object(routes, "is_app_enabled", return_value=True):
             with mock.patch.object(routes, "put_secret", self._refuse):
@@ -3367,7 +3490,7 @@ class TestAStoreThatRefusesToWriteIsReportedNotCrashed(unittest.IsolatedAsyncioT
         """The load-bearing one. The failure this replaces did not 500 — it returned
         ``{"ok": true, "removed": false}``, i.e. "there was nothing to revoke", while the
         live token was still on disk. Anything 2xx here is the bug."""
-        app = web.Application()
+        app = self._owner_app()
         routes.register_routes(app)
         with mock.patch.object(routes, "is_app_enabled", return_value=True):
             with mock.patch.object(routes, "delete_secret", self._refuse):
@@ -3395,7 +3518,7 @@ class TestAStoreThatRefusesToWriteIsReportedNotCrashed(unittest.IsolatedAsyncioT
         def _corrupt(*_a, **_kw):
             raise corrupt
 
-        app = web.Application()
+        app = self._owner_app()
         routes.register_routes(app)
         with mock.patch.object(routes, "is_app_enabled", return_value=True):
             with mock.patch.object(routes, "put_secret", _corrupt):
@@ -3423,7 +3546,7 @@ class TestAStoreThatRefusesToWriteIsReportedNotCrashed(unittest.IsolatedAsyncioT
         def _corrupt(*_a, **_kw):
             raise corrupt
 
-        app = web.Application()
+        app = self._owner_app()
         routes.register_routes(app)
         with mock.patch.object(routes, "is_app_enabled", return_value=True):
             with mock.patch.object(routes, "delete_secret", _corrupt):
@@ -3441,7 +3564,7 @@ class TestAStoreThatRefusesToWriteIsReportedNotCrashed(unittest.IsolatedAsyncioT
         """The ceiling is the one value where a silent partial apply is a security state."""
         from kiro_crew.apps.builtins.ops_mission_control.backend import policy_store
 
-        app = web.Application()
+        app = self._owner_app()
         routes.register_routes(app)
         with mock.patch.object(routes, "is_app_enabled", return_value=True):
             with mock.patch.object(policy_store, "set_ceiling", self._refuse):
@@ -3463,7 +3586,7 @@ class TestAStoreThatRefusesToWriteIsReportedNotCrashed(unittest.IsolatedAsyncioT
         so `merge_provider_config` now propagates a failed read and this route needed the
         same coded refusal. Found in review (Opus 4.8, Design Review).
         """
-        app = web.Application()
+        app = self._owner_app()
         routes.register_routes(app)
         with mock.patch.object(routes, "is_app_enabled", return_value=True):
             with mock.patch.object(routes, "merge_provider_config", self._refuse):
@@ -3488,7 +3611,7 @@ class TestAStoreThatRefusesToWriteIsReportedNotCrashed(unittest.IsolatedAsyncioT
         def _corrupt(*_a, **_kw):
             raise corrupt
 
-        app = web.Application()
+        app = self._owner_app()
         routes.register_routes(app)
         with mock.patch.object(routes, "is_app_enabled", return_value=True):
             with mock.patch.object(routes, "merge_provider_config", _corrupt):
@@ -3752,7 +3875,7 @@ class TestAStoreThatRefusesToWriteIsReportedNotCrashed(unittest.IsolatedAsyncioT
         def _corrupt(*_a, **_kw):
             raise corrupt
 
-        app = web.Application()
+        app = self._owner_app()
         routes.register_routes(app)
         with mock.patch.object(routes, "is_app_enabled", return_value=True):
             with mock.patch.object(policy_store, "set_ceiling", _corrupt):
@@ -3834,7 +3957,7 @@ class TestAStoreThatRefusesToWriteIsReportedNotCrashed(unittest.IsolatedAsyncioT
         """
         from kiro_crew.apps.builtins.ops_mission_control.backend import slack_out
 
-        app = web.Application()
+        app = self._owner_app()
         routes.register_routes(app)
         with mock.patch.object(routes, "is_app_enabled", return_value=True):
             with mock.patch.object(slack_out, "set_settings", self._refuse):
@@ -3857,7 +3980,7 @@ class TestAStoreThatRefusesToWriteIsReportedNotCrashed(unittest.IsolatedAsyncioT
         """
         from kiro_crew.apps.builtins.ops_mission_control.backend import policy_store
 
-        app = web.Application()
+        app = self._owner_app()
         routes.register_routes(app)
         with mock.patch.object(routes, "is_app_enabled", return_value=True):
             with mock.patch.object(policy_store, "set_ceiling", self._refuse):
@@ -3872,7 +3995,7 @@ class TestAStoreThatRefusesToWriteIsReportedNotCrashed(unittest.IsolatedAsyncioT
 
     async def test_an_ordinary_settings_write_still_succeeds(self):
         """Negative control: the guard must not break the route it protects."""
-        app = web.Application()
+        app = self._owner_app()
         routes.register_routes(app)
         with mock.patch.object(routes, "is_app_enabled", return_value=True):
             client = await self._client(app)

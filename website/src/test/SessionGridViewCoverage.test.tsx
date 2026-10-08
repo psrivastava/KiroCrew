@@ -16,9 +16,10 @@
  * tree transforms are exercised end to end.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { screen, waitFor, fireEvent, within } from '@testing-library/react'
+import { screen, waitFor, fireEvent, within, act } from '@testing-library/react'
 import SessionGridView from '../components/SessionGridView'
 import PaneDim from '../components/PaneDim'
+import { loadChatConfig, saveChatConfig } from '../pages/chat/ChatSettings'
 import { renderWithProviders } from './helpers'
 import { api } from '../api/client'
 import { emitSlotFocused } from '../hooks/useWebSocket'
@@ -43,6 +44,7 @@ vi.mock('../components/ChatPane', () => ({
     onSplitRight,
     onSplitDown,
     leading,
+    onFileOpen,
   }: {
     slotKey: string
     focused?: boolean
@@ -51,6 +53,7 @@ vi.mock('../components/ChatPane', () => ({
     onSplitRight?: () => void
     onSplitDown?: () => void
     leading?: { inset?: boolean; control?: React.ReactNode }
+    onFileOpen?: (path: string, opts?: { line?: number; endLine?: number }) => void
   }) => (
     <div data-testid={`pane-${slotKey}`} data-focused={focused ? 'yes' : 'no'} data-leading={leading ? (leading.inset ? 'inset' : 'control') : 'none'}>
       {leading?.control}
@@ -59,6 +62,7 @@ vi.mock('../components/ChatPane', () => ({
       <button type="button" aria-label={`remove ${slotKey}`} onClick={onRemove} />
       <button type="button" aria-label={`right ${slotKey}`} onClick={onSplitRight} />
       <button type="button" aria-label={`down ${slotKey}`} onClick={onSplitDown} />
+      <button type="button" aria-label={`open file ${slotKey}`} onClick={() => onFileOpen?.('/tmp/report.pdf')} />
     </div>
   ),
 }))
@@ -101,11 +105,11 @@ function seedApi(slots: Slot[] = []) {
   return m
 }
 
-function renderGrid(seedSlot?: string | null, leading?: { inset?: boolean; control?: React.ReactNode }) {
+function renderGrid(seedSlot?: string | null, leading?: { inset?: boolean; control?: React.ReactNode }, onFileOpen?: (path: string, opts?: { line?: number; endLine?: number; slot?: string | null }) => void) {
   const onClose = vi.fn()
   const onCollapse = vi.fn()
   const utils = renderWithProviders(
-    <SessionGridView onClose={onClose} onCollapse={onCollapse} seedSlot={seedSlot} leading={leading} />,
+    <SessionGridView onClose={onClose} onCollapse={onCollapse} seedSlot={seedSlot} leading={leading} onFileOpen={onFileOpen} />,
   )
   return { ...utils, onClose, onCollapse }
 }
@@ -227,6 +231,24 @@ describe('SessionGridView — entry seeding', () => {
     fireEvent.click(screen.getByRole('button', { name: 'focus b' }))
     await waitFor(() => expect(dimOf('b').dataset.paneDim).toBe('off'))
     expect(dimOf('a').dataset.paneDim).toBe('on')
+  })
+
+  // The "Dim inactive panes" chat setting off: no pane carries the overlay,
+  // and turning it back on restores the dim on the unfocused pane live.
+  it('dims no pane when the dim-inactive-panes setting is off', async () => {
+    saveChatConfig({ ...loadChatConfig(), dimInactivePanes: false })
+    seedStore('a', { type: 'split', id: 'root', dir: 'col', sizes: [0.5, 0.5], children: [leaf('l-a', 'a'), leaf('l-b', 'b')] })
+    seedApi([{ key: 'a' }, { key: 'b' }])
+    renderGrid('a')
+    await screen.findByTestId('pane-b')
+    const dimOf = (id: string) => screen.getByTestId(`pane-${id}`).querySelector('[data-pane-dim]') as HTMLElement
+    expect(dimOf('a').style.opacity).toBe('0')
+    expect(dimOf('b').dataset.paneDim).toBe('off')
+    expect(dimOf('b').style.opacity).toBe('0')
+
+    act(() => saveChatConfig({ ...loadChatConfig(), dimInactivePanes: true }))
+    await waitFor(() => expect(dimOf('b').style.opacity).toBe('var(--pane-dim-opacity)'))
+    expect(dimOf('a').style.opacity).toBe('0')
   })
 
   it('leaves split mode when there is no session to seed from', async () => {
@@ -445,6 +467,47 @@ describe('SessionGridView — leaf rendering', () => {
   })
 })
 
+describe('SessionGridView — per-pane file opener (#9921)', () => {
+  // Every pane shares ONE host opener, but each pane owns a different session.
+  // The view must stamp the opened tab with the pane's OWN slot so a file opened
+  // from a non-focused pane binds to that pane's chat, not the host's active one.
+  it('stamps a file opened in a pane with that pane\'s slot', async () => {
+    seedStore('a', splitOf([leaf('l-a', 'a'), leaf('l-b', 'b')]))
+    seedApi([{ key: 'a' }, { key: 'b' }])
+    const onFileOpen = vi.fn()
+    renderGrid('a', undefined, onFileOpen)
+    await screen.findByTestId('pane-b')
+
+    fireEvent.click(screen.getByLabelText('open file b'))
+
+    expect(onFileOpen).toHaveBeenCalledWith('/tmp/report.pdf', { slot: 'b' })
+  })
+
+  it('binds each pane to its own slot, not a shared one', async () => {
+    seedStore('a', splitOf([leaf('l-a', 'a'), leaf('l-b', 'b')]))
+    seedApi([{ key: 'a' }, { key: 'b' }])
+    const onFileOpen = vi.fn()
+    renderGrid('a', undefined, onFileOpen)
+    await screen.findByTestId('pane-b')
+
+    fireEvent.click(screen.getByLabelText('open file a'))
+    fireEvent.click(screen.getByLabelText('open file b'))
+
+    expect(onFileOpen).toHaveBeenNthCalledWith(1, '/tmp/report.pdf', { slot: 'a' })
+    expect(onFileOpen).toHaveBeenNthCalledWith(2, '/tmp/report.pdf', { slot: 'b' })
+  })
+
+  it('renders a pane without an opener when the host supplies none', async () => {
+    seedApi([{ key: 'a' }])
+    renderGrid('a')
+    const pane = await screen.findByTestId('pane-a')
+    // The stub's open-file button is inert (onFileOpen undefined); clicking it
+    // must not throw. Pinning that the pane still renders is enough.
+    fireEvent.click(within(pane).getByLabelText('open file a'))
+    expect(pane).toBeTruthy()
+  })
+})
+
 describe('SessionGridView — picker list', () => {
   it('excludes sessions already pinned in a pane', async () => {
     seedApi([{ key: 'a', title: 'Alpha' }, { key: 'b', title: 'Bravo' }])
@@ -469,6 +532,34 @@ describe('SessionGridView — picker list', () => {
     expect(titles[1]).toContain('Running one')
     expect(titles[2]).toContain('Idle one')
     expect(titles[3]).toContain('Older one')
+  })
+
+  it('ranks recency by INSTANT, not by timestamp text', async () => {
+    // The test above cannot catch this: its stamps are same-shaped, so text
+    // order and instant order agree and either implementation passes.
+    //
+    // `last_activity_ts` is the raw transcript `ts`, forwarded verbatim by
+    // slot_projection, and the backend states those rows do NOT share one
+    // format (`history.transcript_sort_key`). Two aware stamps under different
+    // offsets separate the two orderings: `09:00+08:00` is 01:00Z and
+    // `02:30+00:00` is 02:30Z, so the LATER session carries the SMALLER string
+    // and a text compare lists it second. Both carry an offset, so the instants
+    // are the same on any runner — no host-timezone dependency.
+    const EARLIER = '2026-09-14T09:00:00+08:00'
+    const LATER = '2026-09-14T02:30:00+00:00'
+    expect(EARLIER.localeCompare(LATER)).toBeGreaterThan(0)
+    expect(Date.parse(EARLIER)).toBeLessThan(Date.parse(LATER))
+
+    seedApi([
+      { key: 'stale', title: 'Stale one', last_activity_ts: EARLIER },
+      { key: 'live', title: 'Live one', last_activity_ts: LATER },
+    ])
+    renderGrid(null)
+
+    await waitFor(() => expect(rowsOf(onlyPicker())).toHaveLength(2))
+    const titles = rowsOf(onlyPicker()).map((r) => r.textContent)
+    expect(titles[0]).toContain('Live one')
+    expect(titles[1]).toContain('Stale one')
   })
 
   it('ranks a session waiting on your answer with the approvals, above running', async () => {

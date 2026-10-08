@@ -398,6 +398,30 @@ class TestSurfaceChannelSession:
             impostor.linked_session_key == ""
         ), "a slot with no channel provenance was bound to a channel conversation"
 
+    def test_reconciles_an_interrupted_local_turn_marker(self, dashboard_state: Any) -> None:
+        """A dashboard turn on a channel-surfaced slot leaves its in-flight marker
+        on the channel transcript's metadata line; surfacing is that slot's only
+        restore path, so it converts a leftover marker like the dashboard ones."""
+        slot = channel_slots.surface_channel_session(
+            dashboard_state,
+            _session("slack:1.1", title="Interrupted channel turn"),
+            {"turn_in_flight_generation": 17},
+            [
+                {"role": "user", "content": "inspect it"},
+                {"role": "assistant", "content": "partial result"},
+                {"role": "tool", "content": "read complete", "meta": {"done": True}},
+            ],
+            session_key="slack:1.1",
+        )
+
+        assert slot is not None
+        assert slot.to_dict()["interrupted"] is True
+        assert slot.messages[-1]["meta"]["kind"] == "gateway_restart_interruption"
+        assert slot._turn_in_flight_generation == 0
+        assert slot._dirty is True
+        # Past the window boundary, so the next save writes the row.
+        assert slot._disk_window_len == len(slot.messages) - 1
+
     def test_an_unresolvable_session_key_surfaces_the_slot_unbound(
         self, dashboard_state: Any
     ) -> None:
@@ -490,6 +514,34 @@ class TestSurfaceChannelSession:
         assert slot.folder_id == "f1"
         assert slot.pinned is True
         assert slot.created_at == "2026-07-30T00:00:00Z"
+
+    def test_restores_model_and_reasoning_effort_through_shared_helper(
+        self, dashboard_state: Any
+    ) -> None:
+        """Channel surfacing hydrates model fields through the same helper as
+        the persistence loaders and History resume: reasoning_effort comes
+        back, and a non-string model (metadata is agent-writable) is dropped
+        instead of being assigned raw.
+        """
+        slot = channel_slots.surface_channel_session(
+            dashboard_state,
+            _session("slack:1.1"),
+            {"model": "claude-opus-5", "reasoning_effort": "high"},
+            [],
+        )
+        assert slot is not None
+        assert slot.model == "claude-opus-5"
+        assert slot.reasoning_effort == "high"
+
+        tampered = channel_slots.surface_channel_session(
+            dashboard_state,
+            _session("slack:1.2"),
+            {"model": {"not": "a string"}, "reasoning_effort": "not-an-effort"},
+            [],
+        )
+        assert tampered is not None
+        assert tampered.model == ""
+        assert tampered.reasoning_effort == ""
 
     def test_redacts_titles_and_messages(self, dashboard_state: Any) -> None:
         slot = channel_slots.surface_channel_session(
@@ -1312,3 +1364,51 @@ class TestFailedTranscriptReadDefers:
         state.conversation_log.read_messages = lambda key: []
         assert await channel_slots.reconcile_channel_slots(state, 60) == 1
         assert "slack_1.1" in state._slots
+
+
+@pytest.mark.usefixtures("frozen_clock")
+class TestReconcileKeepsMarkedEffort:
+    """A backend-advertised effort level outlives a restart on channel surfacing.
+
+    After a restart the process-global effort vocabulary holds only the
+    fallback set, so a persisted ``minimal`` is unknown until a session
+    re-advertises it. The reconcile pass reads the gateway-owned marker off
+    the loop and hands it to ``surface_channel_session``; without that, the
+    strict validator drops the level and the next save persists the loss.
+    """
+
+    @pytest.mark.asyncio
+    async def test_marked_custom_effort_survives_reconcile(
+        self, dashboard_state: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from kiro_crew.dashboard import chat_persistence
+
+        monkeypatch.setattr(
+            chat_persistence,
+            "_reasoning_effort_values",
+            set(chat_persistence._REASONING_EFFORT_FALLBACK),
+        )
+        assert "minimal" not in chat_persistence._REASONING_EFFORT_FALLBACK
+        monkeypatch.setattr(chat_persistence, "_reasoning_effort_marked", set())
+        seen: list[object] = []
+
+        def fake_marker(raw: object) -> bool:
+            seen.append(raw)
+            return raw == "minimal"
+
+        monkeypatch.setattr(chat_persistence, "_has_validated_effort_marker", fake_marker)
+        state = dashboard_state
+        _map_stems(state, "slack:1.1", "slack:1.2")
+        state.conversation_log.list_sessions = lambda: [
+            _session("slack_1.1"),
+            _session("slack_1.2"),
+        ]
+        efforts = {"slack_1.1": "minimal", "slack_1.2": "turbo"}
+        state.conversation_log.get_metadata = lambda key: {"reasoning_effort": efforts[key]}
+        state.conversation_log.read_messages = lambda key: []
+
+        assert await channel_slots.reconcile_channel_slots(state, 60) == 2
+        assert sorted(str(x) for x in seen) == ["minimal", "turbo"]
+        # Marked level is kept; an unmarked unknown level is still rejected.
+        assert state._slots["slack_1.1"].reasoning_effort == "minimal"
+        assert state._slots["slack_1.2"].reasoning_effort == ""

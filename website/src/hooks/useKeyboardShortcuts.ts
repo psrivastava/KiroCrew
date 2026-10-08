@@ -1,11 +1,11 @@
 import { useEffect, useCallback, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useAppDispatch, useAppStore } from '../store'
-import { switchSlot, deleteSlot, openActivityToTab, selectSidebarSubagentCounts, selectSidebarApprovalCounts, selectSidebarWorkflowActive, selectSidebarAutomationRunningKeys } from '../store/chatSlice'
+import { switchSlot, deleteSlot, openActivityToTab, selectSidebarStartedSubagentCounts, selectSidebarApprovalCounts, selectSidebarWorkflowActive, selectSidebarAutomationRunningKeys } from '../store/chatSlice'
 import { inferLane } from '../pages/chat/sessionLane'
 import { normalizeRunSessionKey } from '../apps/workflows/runModel'
 import { loadChatConfig } from '../pages/chat/ChatSettings'
-import { queryComposerOrExpand, queryPendingApprovalAction, releaseComposerForKeyboardSwitch } from '../pages/chat/composerFocus'
+import { focusComposerElement, queryComposerOrExpand, queryPendingApprovalAction, releaseComposerForKeyboardSwitch } from '../pages/chat/composerFocus'
 import { reportSeamCollision } from '../apps/seamCollision'
 import {
   loadPanelToggleOverrides,
@@ -38,6 +38,14 @@ import { canGoBack, canGoForward } from '../lib/routeHistoryPosition'
 import { useGuardedHistoryStep } from '../components/NavigationLeaveGuard'
 import { MOBILE_BREAKPOINT } from './useIsMobile'
 import { isEditableTarget } from '../utils/editableTarget'
+import { closeShownCrewWindow, crewWindowShown } from '../pages/chat/crew-window/crewWindowStore'
+
+/** Shortcuts scoped to the session on screen (see the crew-window guard). */
+const CREW_WINDOW_SCOPED: ReadonlySet<string> = new Set([
+  'close-chat', 'focus-input', 'focus-approval',
+  'cycle-agent', 'cycle-prev-agent', 'cycle-reasoning', 'cycle-prev-reasoning',
+  'cycle-approval', 'cycle-prev-approval', 'cycle-model', 'cycle-prev-model',
+])
 
 /**
  * Group ids + ordering live in the registry (`lib/shortcutRegistry`); re-exported
@@ -275,8 +283,11 @@ export const SHORTCUT_LABEL_KEY: Record<string, string> = {
   'toggle-focus-mode': 'hooks.useKeyboardShortcuts.toggle_focus_mode',
   // Reused: the ChatInput control this chord fires.
   'optimize-prompt': 'components.chatInput.optimize_prompt',
+  'edit-last-message': 'hooks.useKeyboardShortcuts.edit_last_message',
   'agent-monitor': 'hooks.useKeyboardShortcuts.open_agent_monitor',
   'stop-speaking': 'hooks.useKeyboardShortcuts.stop_speaking',
+  'notification-prev': 'hooks.useKeyboardShortcuts.previous_notification',
+  'notification-next': 'hooks.useKeyboardShortcuts.next_notification',
   'instance-1': 'hooks.useKeyboardShortcuts.switch_to_local',
   'instance-2': 'hooks.useKeyboardShortcuts.switch_to_remote_crew',
   'instance-3': 'hooks.useKeyboardShortcuts.switch_to_remote_crew',
@@ -623,7 +634,7 @@ export function formatShortcut(def: ShortcutDef): string {
   if (def.ctrl) parts.push(mac ? '\u2303' : 'Ctrl')
   if (def.alt) parts.push(mac ? '\u2325' : 'Alt')
   if (def.shift) parts.push(mac ? '\u21e7' : 'Shift')
-  const keyLabel = def.key === 'ArrowLeft' ? '\u2190' : def.key === 'ArrowRight' ? '\u2192' : def.key === '`' ? '`' : def.key === 'Enter' ? (mac ? '\u23ce' : 'Enter') : def.key === ',' ? ',' : def.key === 'Escape' ? '\u238b' : def.key.toUpperCase()
+  const keyLabel = def.key === 'ArrowLeft' ? '\u2190' : def.key === 'ArrowRight' ? '\u2192' : def.key === 'ArrowUp' ? '\u2191' : def.key === 'ArrowDown' ? '\u2193' : def.key === '`' ? '`' : def.key === 'Enter' ? (mac ? '\u23ce' : 'Enter') : def.key === ',' ? ',' : def.key === 'Escape' ? '\u238b' : def.key.toUpperCase()
   parts.push(keyLabel)
   return parts.join(mac ? '' : ' + ')
 }
@@ -698,10 +709,14 @@ interface UseKeyboardShortcutsOpts {
    * nav row disappears.
    */
   onToggleTerminal?: () => void
+  /** Add a docked terminal tab (VS Code's Create New Terminal), opening the
+   *  panel if needed. Same ownership and unbound-when-undefined rule as
+   *  `onToggleTerminal`. */
+  onNewTerminal?: () => void
   disabled?: boolean
 }
 
-export function useKeyboardShortcuts({ onToggleShortcutsModal, onNewChat, onCycleAgent, onCyclePrevAgent, onCycleReasoningEffort, onCyclePrevReasoningEffort, onCycleApprovalMode, onCyclePrevApprovalMode, onCycleModel, onCyclePrevModel, onToggleFocusMode, onToggleLeftSidebar, onToggleSessionPanel, onToggleSidePanel, onToggleTerminal, disabled }: UseKeyboardShortcutsOpts) {
+export function useKeyboardShortcuts({ onToggleShortcutsModal, onNewChat, onCycleAgent, onCyclePrevAgent, onCycleReasoningEffort, onCyclePrevReasoningEffort, onCycleApprovalMode, onCyclePrevApprovalMode, onCycleModel, onCyclePrevModel, onToggleFocusMode, onToggleLeftSidebar, onToggleSessionPanel, onToggleSidePanel, onToggleTerminal, onNewTerminal, disabled }: UseKeyboardShortcutsOpts) {
   const dispatch = useAppDispatch()
   const navigate = useNavigate()
   const guardedHistoryStep = useGuardedHistoryStep()
@@ -785,7 +800,8 @@ export function useKeyboardShortcuts({ onToggleShortcutsModal, onNewChat, onCycl
     'session-panel': onToggleSessionPanel,
     'side-panel': onToggleSidePanel,
     'terminal': onToggleTerminal,
-  }), [onToggleLeftSidebar, onToggleSessionPanel, onToggleSidePanel, onToggleTerminal])
+    'terminal-new': onNewTerminal,
+  }), [onToggleLeftSidebar, onToggleSessionPanel, onToggleSidePanel, onToggleTerminal, onNewTerminal])
 
   const handler = useCallback((e: KeyboardEvent) => {
     const isInput = isEditableTarget(e)
@@ -968,8 +984,13 @@ export function useKeyboardShortcuts({ onToggleShortcutsModal, onNewChat, onCycl
         // walked a stack the visible UI does not reflect is the same wrong in
         // native form. Only the text-field gate unclaims (see the hit-null
         // above): the field consumes the caret chord and never navigates.
-        'history-back': () => { if (!isNarrowViewport() && canGoBack()) guardedHistoryStep(-1) },
-        'history-forward': () => { if (!isNarrowViewport() && canGoForward()) guardedHistoryStep(1) },
+        // An allowed step arms the composer release (after the draft ask, so
+        // the one-shot's clock starts when the step commits), so the
+        // destination's autofocus skips once and the NEXT press is not eaten
+        // by the text field. Not Mac-gated: the text-field unclaim is
+        // platform-wide.
+        'history-back': () => { if (!isNarrowViewport() && canGoBack()) guardedHistoryStep(-1, releaseComposerForKeyboardSwitch) },
+        'history-forward': () => { if (!isNarrowViewport() && canGoForward()) guardedHistoryStep(1, releaseComposerForKeyboardSwitch) },
         'cycle-agent': () => onCycleAgent?.(),
         'cycle-prev-agent': () => onCyclePrevAgent?.(),
         'cycle-reasoning': () => onCycleReasoningEffort?.(),
@@ -996,7 +1017,7 @@ export function useKeyboardShortcuts({ onToggleShortcutsModal, onNewChat, onCycl
         // composer was COLLAPSED and had to be asked back — without that, "focus
         // text input" silently did nothing for as long as the user left it
         // collapsed, which outlives a reload.
-        'focus-input': () => queryComposerOrExpand(ta => ta.focus()),
+        'focus-input': () => queryComposerOrExpand(focusComposerElement),
         // ⌘N / Ctrl+N (alias Option/Alt+Shift+N): new session.
         'new-chat': () => onNewChat(),
         // ⌘W / Ctrl+W (alias Option/Alt+Shift+W): close the current session —
@@ -1015,12 +1036,15 @@ export function useKeyboardShortcuts({ onToggleShortcutsModal, onNewChat, onCycl
         // of an armed goal loop, during a dynamic workflow, and while background
         // sub-agents run — all of which `deleteSlot` retires. Reusing `inferLane`
         // with the same extras the sidebar computes keeps this gate and the
-        // Working/Waiting/Needs-approval lanes from ever disagreeing.
+        // Working/Waiting/Needs-approval lanes from ever disagreeing. Queued
+        // children are not in the lane (nothing has started), but closing
+        // retires them too, so they confirm on their own term.
         'close-chat': () => {
           if (!activeSlot) return
           const slot = slots.find(s => s.key === activeSlot)
           const state = appStore.getState()
-          const subagentsRunning = selectSidebarSubagentCounts(state)[activeSlot] || 0
+          const subagentsRunning = selectSidebarStartedSubagentCounts(state)[activeSlot] || 0
+          const subagentsQueued = state.chat.subagentQueued?.[activeSlot] || 0
           const lane = slot ? inferLane(slot, {
             subagentAwaiting: Math.min(selectSidebarApprovalCounts(state)[activeSlot] || 0, subagentsRunning),
             workflowActive: normalizeRunSessionKey(activeSlot) in selectSidebarWorkflowActive(state),
@@ -1028,7 +1052,8 @@ export function useKeyboardShortcuts({ onToggleShortcutsModal, onNewChat, onCycl
             detailedSubagentsRunning: subagentsRunning > 0,
           }) : 'idle'
           const modChord = e.metaKey || e.ctrlKey
-          const mustConfirm = loadChatConfig().confirmCloseSession || (modChord && lane !== 'idle')
+          const mustConfirm = loadChatConfig().confirmCloseSession
+            || (modChord && (lane !== 'idle' || subagentsQueued > 0))
           if (!mustConfirm || confirm(i18nT('hooks.useKeyboardShortcuts.close_this_session'))) {
             dispatch(deleteSlot(activeSlot))
           }
@@ -1036,6 +1061,14 @@ export function useKeyboardShortcuts({ onToggleShortcutsModal, onNewChat, onCycl
       }
       // Every `registry` entry has an action here (shortcutRegistry.test pins the
       // two sets). An id without one is left unclaimed rather than swallowed.
+      // A crew window covers the local session: shortcuts that act on "the
+      // current session" must not reach the hidden one. Close closes the
+      // window; the rest do nothing there.
+      if (crewWindowShown() && CREW_WINDOW_SCOPED.has(hit)) {
+        e.preventDefault()
+        if (hit === 'close-chat') closeShownCrewWindow()
+        return
+      }
       const action = Object.prototype.hasOwnProperty.call(actions, hit) ? actions[hit] : undefined
       if (action) {
         e.preventDefault()

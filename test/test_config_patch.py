@@ -11,10 +11,21 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 
+@web.middleware
+async def _owner_identity(request, handler):
+    request["user"] = "local-app"
+    request["app"] = ""
+    state = request.app.get("state")
+    if state is not None:
+        state.owner_id = ""
+    return await handler(request)
+
+
 def _make_app() -> web.Application:
     from kiro_crew.dashboard.handlers import api_kirocrew_config_patch
 
-    app = web.Application()
+    app = web.Application(middlewares=[_owner_identity])
+    app["state"] = MagicMock()
     app.router.add_patch("/api/config/kirocrew", api_kirocrew_config_patch)
     return app
 
@@ -91,6 +102,7 @@ def _arm(app: web.Application, state: SimpleNamespace) -> None:
     from kiro_crew.dashboard.server import _register_config_watch
 
     app["state"] = state
+    state.set_dynamic_cards_enabled = MagicMock()
     initial = KiroCrewConfig.load()
     _register_config_watch(app, state, initial=initial)  # type: ignore[arg-type]
 
@@ -112,9 +124,183 @@ def _live_state(**overrides) -> SimpleNamespace:
         channel_manager=None,
         _slots={},
         push_slots_update=lambda: None,
+        push_refresh=MagicMock(),
+        notify=MagicMock(),
     )
     base.update(overrides)
     return SimpleNamespace(**base)
+
+
+@pytest.mark.asyncio
+async def test_backend_switch_after_setup_does_not_probe(tmp_config) -> None:
+    from kiro_crew.kiro_prerequisite import KiroPrerequisiteService
+
+    service = MagicMock(spec=KiroPrerequisiteService)
+    service.initial_setup_complete = True
+    service.record_independent_backend_setup = AsyncMock(
+        side_effect=AssertionError("completed setup must not probe again")
+    )
+    app = _make_app()
+    app["kiro_prerequisite_service"] = service
+    async with TestClient(TestServer(app)) as client:
+        response = await _patch(client, "agent.acp_backend", "claude")
+        assert response.status == 200
+    service.record_independent_backend_setup.assert_not_awaited()
+    assert json.loads(tmp_config.read_text(encoding="utf-8"))["agent"]["acp_backend"] == "claude"
+
+
+@pytest.mark.asyncio
+async def test_selecting_installed_independent_agent_persists_first_run_completion(
+    tmp_config, tmp_path, monkeypatch
+) -> None:
+    """A second browser must not depend on the first browser's localStorage."""
+    from kiro_crew import sandbox
+    from kiro_crew.agent_sdk import backend_install
+    from kiro_crew.kiro_prerequisite import KiroPrerequisiteService
+
+    data_home = tmp_path / "data-home"
+    service = KiroPrerequisiteService(
+        platform_name="linux",
+        environ={"HOME": str(tmp_path), "PATH": ""},
+        home=tmp_path,
+        data_home=data_home,
+        audit_writer=lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(sandbox, "detect_backend", lambda: "bwrap")
+    monkeypatch.setattr(sandbox, "configured_sandbox_mode", lambda: "standard")
+    monkeypatch.setattr(sandbox, "credential_mask_applies", lambda _mode: True)
+    monkeypatch.setattr(
+        backend_install,
+        "probe_backend",
+        lambda backend: backend_install.BackendInstallState(
+            backend, backend, backend_install.INSTALLED
+        ),
+    )
+    app = _make_app()
+    app["kiro_prerequisite_service"] = service
+
+    async with TestClient(TestServer(app)) as client:
+        response = await _patch(client, "agent.acp_backend", "claude")
+        assert response.status == 200
+
+    restarted = KiroPrerequisiteService(
+        platform_name="linux",
+        environ={"HOME": str(tmp_path), "PATH": ""},
+        home=tmp_path,
+        data_home=data_home,
+        audit_writer=lambda *_args, **_kwargs: None,
+    )
+    assert restarted.initial_setup_complete is True
+
+
+@pytest.mark.asyncio
+async def test_marker_write_failure_reports_saved_config_without_claiming_setup_complete(
+    tmp_config, tmp_path, monkeypatch
+) -> None:
+    from kiro_crew import sandbox
+    from kiro_crew.agent_sdk import backend_install
+    from kiro_crew.kiro_prerequisite import KiroPrerequisiteService
+
+    service = KiroPrerequisiteService(
+        platform_name="linux",
+        environ={"HOME": str(tmp_path), "PATH": ""},
+        home=tmp_path,
+        data_home=tmp_path / "data-home",
+        audit_writer=lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(sandbox, "detect_backend", lambda: "bwrap")
+    monkeypatch.setattr(sandbox, "configured_sandbox_mode", lambda: "standard")
+    monkeypatch.setattr(sandbox, "credential_mask_applies", lambda _mode: True)
+    monkeypatch.setattr(
+        backend_install,
+        "probe_backend",
+        lambda backend: backend_install.BackendInstallState(
+            backend, backend, backend_install.INSTALLED
+        ),
+    )
+    monkeypatch.setattr(
+        service, "_mark_setup_complete", MagicMock(side_effect=OSError("disk full"))
+    )
+    app = _make_app()
+    app["kiro_prerequisite_service"] = service
+
+    async with TestClient(TestServer(app)) as client:
+        response = await _patch(client, "agent.acp_backend", "claude")
+        assert response.status == 503
+        body = await response.json()
+        assert body["code"] == "setup_marker_write_failed"
+        assert body["config_saved"] is True
+    assert json.loads(tmp_config.read_text(encoding="utf-8"))["agent"]["acp_backend"] == "claude"
+    assert service.initial_setup_complete is False
+
+
+@pytest.mark.asyncio
+async def test_recheck_records_setup_after_configure_then_install(
+    tmp_config, tmp_path, monkeypatch
+) -> None:
+    from kiro_crew import sandbox
+    from kiro_crew.agent_sdk import backend_install
+    from kiro_crew.dashboard.handlers import acp_backend_status
+    from kiro_crew.kiro_prerequisite import KiroPrerequisiteService
+
+    service = KiroPrerequisiteService(
+        platform_name="linux",
+        environ={"HOME": str(tmp_path), "PATH": ""},
+        home=tmp_path,
+        data_home=tmp_path / "data-home",
+        audit_writer=lambda *_args, **_kwargs: None,
+    )
+    installed = False
+    monkeypatch.setattr(sandbox, "detect_backend", lambda: "bwrap")
+    monkeypatch.setattr(sandbox, "configured_sandbox_mode", lambda: "standard")
+    monkeypatch.setattr(sandbox, "credential_mask_applies", lambda _mode: True)
+    monkeypatch.setattr(
+        backend_install,
+        "probe_backend",
+        lambda backend: backend_install.BackendInstallState(
+            backend,
+            backend,
+            backend_install.INSTALLED if installed else backend_install.MISSING,
+        ),
+    )
+    monkeypatch.setattr(
+        acp_backend_status,
+        "_recheck",
+        lambda backend: {"id": backend, "installed": backend_install.INSTALLED},
+    )
+    app = _make_app()
+    app["kiro_prerequisite_service"] = service
+    app.router.add_post("/api/acp-backends/recheck", acp_backend_status.api_acp_backend_recheck)
+    audit = MagicMock()
+    monkeypatch.setattr(acp_backend_status, "sel", lambda: audit)
+
+    async with TestClient(TestServer(app)) as client:
+        response = await _patch(client, "agent.acp_backend", "claude")
+        assert response.status == 200
+        assert service.initial_setup_complete is False
+        installed = True
+        mark_setup_complete = service._mark_setup_complete
+        monkeypatch.setattr(
+            service, "_mark_setup_complete", MagicMock(side_effect=OSError("disk full"))
+        )
+        response = await client.post("/api/acp-backends/recheck", json={"backend": "claude"})
+        assert response.status == 503
+        body = await response.json()
+        assert body["code"] == "setup_marker_write_failed"
+        # The fresh probe row rides along on the marker-write failure so the
+        # client can apply it instead of re-painting the stale pre-install
+        # verdict under a "could not check" line.
+        assert body["backend"] == {"id": "claude", "installed": backend_install.INSTALLED}
+        assert service.initial_setup_complete is False
+        audit.log_api_access.assert_called_once()
+        audit_args = audit.log_api_access.call_args.kwargs
+        assert audit_args["outcome"] == "error"
+        assert audit_args["resources"] == "claude"
+        assert audit_args["error"] == "setup_marker_write_failed"
+        monkeypatch.setattr(service, "_mark_setup_complete", mark_setup_complete)
+        response = await client.post("/api/acp-backends/recheck", json={"backend": "claude"})
+        assert response.status == 200
+    assert service.initial_setup_complete is True
 
 
 # ── Per-role models (agent.role_models.*) ─────────────────────────────────
@@ -131,6 +317,36 @@ class TestRoleModels:
         assert data["agent"]["role_models"]["subagent"] == "claude-sonnet-4.6"
         # Sibling agent keys survive the nested write.
         assert data["agent"]["approval_mode"] == "auto"
+
+    @pytest.mark.asyncio
+    async def test_a_write_the_publish_floor_refuses_is_a_coded_400_not_a_500(
+        self, tmp_config, monkeypatch
+    ) -> None:
+        """``ConfigWriteRefused`` is a ``ValueError``, but it is the operator's input
+        being declined, not a server failure: it must be answered as a coded 400
+        carrying the floor's one-line instruction, before the generic ``ValueError``
+        arm that reports a malformed section as a 500. The field is not editable
+        through this surface today, so the refusal is raised the way the floor
+        raises it rather than provoked through the body."""
+        from kiro_crew.config import loader as loader_mod
+        from kiro_crew.config.loader import ConfigWriteRefused
+
+        message = (
+            "agent.deepseek_env entry 'DEEPSEEK_API_KEY' holds a literal value, so the "
+            "config write was refused."
+        )
+
+        def refuse(*_args, **_kwargs):
+            raise ConfigWriteRefused(message)
+
+        monkeypatch.setattr(loader_mod, "update_config_locked", refuse)
+        async with TestClient(TestServer(_make_app())) as c:
+            resp = await _patch(c, "agent.role_models.subagent", "auto")
+            assert resp.status == 400
+            body = await resp.json()
+            assert body["code"] == "config_write_refused"
+            assert body["error"] == message
+        assert json.loads(tmp_config.read_text(encoding="utf-8")) == _seed_config()
 
     @pytest.mark.asyncio
     async def test_role_model_auto_allowed(self, tmp_config) -> None:
@@ -275,6 +491,56 @@ class TestTerminalCompletionEnabled:
             assert resp.status == 400
 
 
+# ── Terminal tab reuse (dashboard.terminal.reuse_current) ─────────────────
+
+
+class TestTerminalReuseCurrent:
+    """The Settings → Display → Terminal "Reuse the current terminal" toggle."""
+
+    @pytest.mark.asyncio
+    async def test_true_written_nested(self, tmp_config) -> None:
+        app, _ = _make_app_with_state()
+        async with TestClient(TestServer(app)) as client:
+            resp = await _patch(client, "dashboard.terminal.reuse_current", True)
+            assert resp.status == 200
+        data = json.loads(tmp_config.read_text())
+        assert data["dashboard"]["terminal"]["reuse_current"] is True
+
+    @pytest.mark.asyncio
+    async def test_write_keeps_sibling_terminal_keys(self, tmp_config) -> None:
+        # The shell and completion keys live in the same `terminal` object;
+        # flipping reuse must not drop them.
+        tmp_config.write_text(
+            json.dumps(
+                {
+                    "dashboard": {
+                        "terminal": {"shell": "/bin/bash", "completion": {"enabled": False}}
+                    }
+                }
+            )
+        )
+        app, _ = _make_app_with_state()
+        async with TestClient(TestServer(app)) as client:
+            resp = await _patch(client, "dashboard.terminal.reuse_current", True)
+            assert resp.status == 200
+        data = json.loads(tmp_config.read_text())
+        assert data["dashboard"]["terminal"] == {
+            "shell": "/bin/bash",
+            "completion": {"enabled": False},
+            "reuse_current": True,
+        }
+
+    @pytest.mark.asyncio
+    async def test_non_boolean_rejected(self, tmp_config) -> None:
+        # `bool("true")` is True: the route must refuse rather than coerce, so
+        # the handler's literal-``True`` check keeps meaning "on" only for a
+        # real boolean.
+        app, _ = _make_app_with_state()
+        async with TestClient(TestServer(app)) as client:
+            resp = await _patch(client, "dashboard.terminal.reuse_current", "true")
+            assert resp.status == 400
+
+
 class TestPatchGeneral:
     @pytest.mark.asyncio
     async def test_unknown_field_returns_400(self, tmp_config) -> None:
@@ -314,6 +580,60 @@ class TestEnumValidator:
         async with TestClient(TestServer(_make_app())) as c:
             resp = await _patch(c, "agent.approval_mode", 123)
             assert resp.status == 400
+
+
+# ── Sidebar folder sort mode ─────────────────────────────────────────────
+
+
+class TestFolderSortRoundTrip:
+    """``dashboard.folder_sort`` is the one stored copy of the sidebar's folder
+    order, written by the sidebar menu and read back by the sidebar AND by the
+    ``kirocrew-dashboard`` MCP server -- so what a PATCH stores must be exactly
+    what a fresh load reads, and nothing outside the mode list may land."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("mode", ["custom", "name", "created"])
+    async def test_every_mode_round_trips_through_the_config_file(self, tmp_config, mode) -> None:
+        from kiro_crew.config.loader import KiroCrewConfig
+
+        async with TestClient(TestServer(_make_app())) as c:
+            resp = await _patch(c, "dashboard.folder_sort", mode)
+            assert resp.status == 200, await resp.text()
+        stored = json.loads(tmp_config.read_text(encoding="utf-8"))
+        assert stored["dashboard"]["folder_sort"] == mode
+        assert KiroCrewConfig.load().dashboard.folder_sort == mode
+
+    @pytest.mark.asyncio
+    async def test_a_value_outside_the_mode_list_is_refused_and_the_file_untouched(
+        self, tmp_config
+    ) -> None:
+        from kiro_crew.config.loader import KiroCrewConfig
+
+        async with TestClient(TestServer(_make_app())) as c:
+            assert (await _patch(c, "dashboard.folder_sort", "name")).status == 200
+            for bad in ("alphabetical", "", "Name", 1, None, ["name"]):
+                resp = await _patch(c, "dashboard.folder_sort", bad)
+                assert resp.status == 400, bad
+        assert KiroCrewConfig.load().dashboard.folder_sort == "name"
+
+    def test_the_allowlist_enum_is_the_loader_list_spelled_once(self) -> None:
+        """Three spellings of the same set -- the dataclass field's enum metadata,
+        the shared constant, and the PATCH allowlist -- pinned equal, so a fourth
+        mode cannot be writable without being loadable or the other way round."""
+        from dataclasses import fields
+
+        from kiro_crew.config.sections import (
+            FOLDER_SORT_DEFAULT,
+            FOLDER_SORT_MODES,
+            DashboardConfig,
+        )
+        from kiro_crew.dashboard.handlers.core import _EDITABLE_CONFIG
+
+        spec = _EDITABLE_CONFIG["dashboard.folder_sort"]
+        assert spec == {"type": "enum", "values": list(FOLDER_SORT_MODES)}
+        field = next(f for f in fields(DashboardConfig) if f.name == "folder_sort")
+        assert field.metadata["enum"] == list(FOLDER_SORT_MODES)
+        assert field.default == FOLDER_SORT_DEFAULT == "custom"
 
 
 # ── Int validator ────────────────────────────────────────────────────────
@@ -755,14 +1075,42 @@ class TestDefaultModelPatch:
         _arm(app, state)
         sub = live.subscribe("agent.model", callback=seen.append, name="probe")
         try:
-            async with TestClient(TestServer(app)) as c:
-                assert (await _patch(c, "agent.model", "claude-sonnet-4.5")).status == 200
+            with patch(
+                "kiro_crew.agent.rebuild_agent_config_reporting",
+                return_value=(tmp_config, True),
+            ):
+                async with TestClient(TestServer(app)) as c:
+                    assert (await _patch(c, "agent.model", "claude-sonnet-4.5")).status == 200
         finally:
             sub.cancel()
         assert [c.new.agent.model for c in seen] == ["claude-sonnet-4.5"]
         # A default change must NEVER take the destructive path — that clears
         # _sessions and shuts live providers down, killing in-flight turns.
         state.sessions.reload_provider_factory.assert_not_awaited()
+        state.push_refresh.assert_called_once_with("agents")
+
+    @pytest.mark.asyncio
+    async def test_failed_spec_rebuild_surfaces_error_and_stays_pending(self, tmp_config) -> None:
+        """PATCH persists first, so a failed derived-spec rebuild must be visible
+        and remain queued for the watcher's automatic retry."""
+        from kiro_crew.config import live
+
+        state = _live_state()
+        app = _make_app()
+        _arm(app, state)
+        with patch(
+            "kiro_crew.agent.rebuild_agent_config_reporting",
+            side_effect=OSError("spec directory is read-only"),
+        ):
+            async with TestClient(TestServer(app)) as c:
+                resp = await _patch(c, "agent.model", "claude-sonnet-4.5")
+                assert resp.status == 200
+
+        state.push_refresh.assert_not_called()
+        state.notify.assert_called_once()
+        assert any(
+            "agent.model" in missed for _subscription, missed in live.watch()._stale.values()
+        )
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(

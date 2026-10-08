@@ -73,6 +73,12 @@ If absent, use `web_fetch` and tell the user the panel fallback needs the vetted
 sandbox-sealed install from **Settings → Browser**. Installation makes browsing
 available; agent commands still follow the ordinary shell approval ladder.
 
+That install downloads Playwright's own Chromium build onto the gateway's machine.
+When a browser is missing, point the user at that download rather than at a system
+Google Chrome package, which is a different browser and not what the CLI launches.
+Only on Debian or Ubuntu does the download also try to install OS libraries; a
+missing-library failure carries the command for the user to run.
+
 That panel also controls `dashboard.use_builtin_browser`. When it is off, the
 `browser` tool directs you to `playwright-cli`; relay this as the user's setting,
 not a missing panel.
@@ -125,6 +131,12 @@ The browser 'chrome' is not open, please run open first
 ```
 
 That is a wrong session name, not a failed attach; do not re-attach to fix it.
+
+`attach --extension` also gives you ONE tab: the one the extension was activated
+on. `tab-list` is not a view of the browser, so a page the user already has open is
+unreachable until they click the extension icon while on it — ask for that click
+rather than opening your own second copy of the page they are looking at. Tabs you
+create with `tab-new` are drivable, but a later re-attach drops them from the list.
 
 `playwright-cli list` shows every browser on the machine, including other
 sessions'. Only close one you opened. A session named `panel-<owner6>-<slot8>` is the

@@ -53,9 +53,148 @@ def _url_payload_command(n: int) -> str:
 #: Ceiling on the whole security PACKAGE, not on any one file in it. The controls
 #: were one module of about 21,800 lines, and the split adds a re-export block, an
 #: export manifest and the mirroring facade on top of the code it relocates, so the
-#: budget is that size plus room for the machinery. It is a bound on total volume:
+#: budget is that size plus room for the machinery, plus the redaction record,
+#: credential-source and allowed-host modules, plus the resolver child script
+#: (``_child_realpath.py``, ~190 lines) that lives beside the resolver it serves
+#: rather than in the pool package. It is a bound on total volume:
 #: relocating a declaration between submodules moves nothing across it.
-_PACKAGE_LINE_BUDGET = 26_000
+#:
+#: Raised again, from 27,200, when the facade stopped binding re-exported names
+#: eagerly and began resolving each through its owner. That trades one import block
+#: for two name lists -- an owner table and a ``TYPE_CHECKING`` block, one line per
+#: exported name in each -- which measured 618 lines at the current surface and is
+#: machinery, not control logic.
+#:
+#: Raised again, from 27,751, for the write-protected home entries covering the MCP
+#: launch-approval directory and ``mcp/resolved``: gatewayd spawns an approved stub's
+#: backend outside the sandbox, so a session must not be able to write either path.
+#:
+#: Raised again, from 27,761, for the ssh self-target refusal note: it says how long
+#: a retry can still land inside the background check and names the IP-literal case
+#: where this machine's address list cannot be read, so a refused agent knows when
+#: to stop retrying and what to use instead.
+#:
+#: Raised again, from 27,766, for the write-protected home entry covering the kiro-cli
+#: global MCP registry (``~/.kiro/settings/mcp.json``) and its ``KIRO_HOME``
+#: re-anchoring: an ``autoApprove`` on an entry there is honoured by default and skips
+#: the tool gate entirely, while the entry that decides it is admitted on its name
+#: shape rather than on who wrote the file -- so an agent-writable registry grants its
+#: own verbs a standing bypass. The reasoning for one leaf is most of the cost, which
+#: is the shape every entry on this tier has.
+#:
+#: Raised again, from 27,814, for resolving the ``$HOME``-rooted form of both kiro-cli
+#: write-tier leaves rather than only their ``KIRO_HOME`` copies. Anchoring them
+#: lexically covered a symlinked ``$HOME`` itself but not one further down the path, so
+#: a dotfile-managed ``~/.kiro`` left the real spec dir and the real MCP registry outside
+#: the fence while their ``~``-spelled paths stayed inside it. The cost is the reasoning
+#: plus one shared tuple, which is what replaces a second per-leaf arm.
+#:
+#: Lowered to 27,851 by SUBTRACTION. An earlier revision of this branch also emitted
+#: every kiro-cli target in a second, all-forward-slash spelling, on the premise that a
+#: Windows root could reach the anchor builder carrying the operator's own separators.
+#: That premise is false: every root arrives through ``_resolve_root_anchors``, which
+#: returns ``_realpath_or_none(expanded) or _lexical_root(expanded)``, and both answer
+#: in the native spelling -- ``_lexical_root``'s ``os.path.normpath`` converts
+#: ``C:/Users/x`` to ``C:\Users\x``. With no input that fails without it, the second
+#: spelling was decoration, and on POSIX it would fence a bogus neighbour for any file
+#: whose name contains a backslash. It is removed together with the two tests that
+#: existed only for it; the ``$HOME``-symlink coverage passes without it, which is what
+#: shows it was never load-bearing.
+#:
+#: Raised again, from 27,851, because the ``KIRO_HOME`` half was two hardcoded
+#: per-leaf arms while the ``$HOME`` half looped the tuple -- so the tuple's own
+#: comment ("a third leaf joins both halves by landing here") was false, and a third
+#: leaf would have been fenced under ``$HOME`` and writable under the override. Both
+#: halves now loop the same tuple, each leaf's tail is spelled once, and a test adds a
+#: probe leaf and asserts BOTH spellings refuse -- it fails on the old code.
+#:
+#: Re-pinned again, on top of every raise above, for the ``panel-dismissals`` leaf
+#: added to ``_CREW_SECRET_LEAVES`` in ``paths.py``: one entry plus the comment
+#: stating why nothing a run can reach may forge or delete the operator's dismissal
+#: records. Ten lines, all of them the fence declaration and its reason -- no new
+#: control logic and no new matching pass. This branch's raise and the ones above it
+#: are independent additions to the same ratchet, so the number below is re-MEASURED
+#: off the tree rather than being the arithmetic sum of the deltas.
+#: Raised again, from 27,863, for the own-address startup warm in ``argv_floor``:
+#: the gateway starts the netlink read at boot, the worker reads and publishes that
+#: table before any DNS lookup, and the publish merges the addresses and opens the
+#: IP-literal window in one lock hold while each check reads the window flag before
+#: the names, so the first ssh after a restart is not refused as this machine and a
+#: secondary own IP is never admitted mid-publish. A dump that ends without
+#: NLMSG_DONE, or that the kernel flags NLM_F_DUMP_INTR, counts as unread, so a
+#: partial table never opens the window. So does an NLMSG_DONE whose errno is not 0.
+#: Three incomplete dumps in a row log one warning, so a host whose table never
+#: reads can be told apart from a target that is really this machine.
+#:
+#: Re-pinned from 27,942 for the NUL blanking in ``inline_payload._lex``: one line
+#: that swaps each NUL for a space before tokenizing, plus the docstring saying why.
+#: CPython 3.12 raises ``SystemError`` for a NUL after an indented block, which
+#: escaped the lexer and crashed the gate on an ordinary ``b'\0'`` in a payload.
+#: No new rule and no new matching pass.
+#: Raised again, from 27,948, by one line: the ``vouched-executions`` entry in
+#: ``_SENSITIVE_HOME_DIRS``. Each file there is the gateway's restart-surviving
+#: word that a session may reach its member's private store, so no file tool may
+#: write it. The fuller reason lives beside its ``sandbox._CREW_HIDDEN_LEAVES`` mask.
+#:
+#: Re-pinned from 27,949 for ``redaction._DOCUMENT_LINK_RE``: pass 3 skips a run
+#: wholly inside a Google Docs, Drive or Confluence link of a fixed route, because a
+#: document id is the same random base64 a key is and no gate can split the two.
+#: One route regex, one span helper, a four-line check in pass 3, and the comment
+#: naming the residual. No pass widened and no threshold moved.
+#:
+#: Raised again, from 28,025, for the ssh self-target floor's boot-time warm-up: the
+#: own-address table is read at gateway startup and published before the DNS
+#: lookups, and background threads parse the hosts-file table (in bounded chunks,
+#: keyed on the own-address set it was judged by). On a miss the gate path parses
+#: only a file that fits in one read chunk; a larger file is refused as pending
+#: until the background parse is cached. On Windows, where ``st_ctime`` is creation
+#: time, the key also carries a content digest (``hosts_file.py``, which holds the
+#: line parser and digest helpers apart from ``argv_floor``'s per-module cap). A
+#: Windows file too large to hash on the gate is never served, so a dotless target
+#: there is pending, and the ssh self-target refusal note says so.
+#:
+#: Raised again, from 28,399, by two lines: case (1) of the ssh self-target refusal
+#: note names a dotless target refused while a hosts file over 64 KiB is still read
+#: in the background, so a caller retries it rather than treating it as settled.
+#:
+#: Raised again, from 28,401, for the containment gate's ``pre_resolved`` keyword:
+#: one keyword on ``path_contains_sensitive``, forwarded to the two helpers that
+#: already take it, plus the preconditions it carries written on the keyword
+#: itself. The claim is ``is_sensitive_resolved_path``'s, unchanged: the caller
+#: holds the canonical spelling and is off the event loop, so the anchors resolve
+#: inline. No new entry point, no target, no matching rule and no threshold moved.
+#:
+#: The number IS the package's measured total, carrying no spare room: a ratchet with
+#: headroom admits exactly the unreviewed growth it exists to catch, so the next line
+#: added here fails this gate and has to be re-pinned deliberately, with its reason
+#: written above. The guards that detect a monolith growing back are the per-file cap
+#: and the facade's share below, and both must stay untouched.
+#:
+#: Raised for the ``registry_trust.json`` leaf added to ``_CREW_SECRET_LEAVES`` in
+#: ``paths.py``: the operator's grants of ``owner`` trust to a hand-configured app
+#: registry live in a keystone file on the same read+write floor as
+#: ``denied_commands.json``, so the leaf and its two-line reason are three lines the gate
+#: cannot avoid.
+#:
+#: Raised for the read-only bash gate's refusal of variable-assigning expansions
+#: (`$[...]`, an `=` after `${`): one pattern alternative plus its reason comment.
+#:
+#: Raised for six stdout-only filters on the read-only bash allowlist (`tr`, `nl`,
+#: `rev`, `comm`, `od`, `column`) and their reason comment.
+#:
+#: Raised for pass 3's macOS per-user directory exemption in ``redaction``:
+#: withholding this host's own ``confstr`` id from the bare-secret scan, so a macOS
+#: temp path (a computer-use screenshot among them) is not read as a key, costs the
+#: id lookup, its grammar, the per-id pattern, the reason only the host's own id is
+#: safe to withhold, and window classification with whole-run context that exempts
+#: only windows sharing ≥ 24 bytes with that id while every other positive window
+#: redacts each piece it touches. One mechanism, no new pass.
+#:
+#: Raised again, from 28,551, for the Windows alias fold in ``paths.py``: one lexical
+#: helper strips a local-drive namespace prefix and a default-stream suffix, and
+#: ``_candidate_forms`` resolves the folded spelling while keeping the raw one as a
+#: candidate. No target, no matching rule and no threshold moved.
+_PACKAGE_LINE_BUDGET = 28_572
 
 #: Ceiling on any ONE file in the package. This is what the bound is really for --
 #: a package total says nothing about a single file growing back into a second

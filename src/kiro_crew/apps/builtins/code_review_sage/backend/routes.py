@@ -43,6 +43,7 @@ from aiohttp import web
 from kiro_crew import hooks, model_registry
 from kiro_crew.apps.manager import is_app_enabled
 from kiro_crew.atomic_write import atomic_write
+from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
 from kiro_crew.loop_lock import LoopBoundLock
 
 logger = logging.getLogger("kirocrew.app.code-review-sage")
@@ -158,7 +159,11 @@ def _write_runs(payload: str) -> None:
     ``store.remove_run_dir`` are offloaded).
     """
     f = _runs_file()
-    f.parent.mkdir(parents=True, exist_ok=True)
+    # Guarded rather than a bare `mkdir(parents=True)`: the write below refuses a
+    # linked parent, but a bare mkdir has already BUILT the tree inside the link's
+    # target by the time it runs, so the refusal arrives after the directories
+    # exist where the planter wants them. The refusal has to come first.
+    store.mkdir_refusing_links(f.parent)
     # The shared helper replaces through ``replace_with_retry``, so a transient
     # Windows sharing violation does not silently lose the save. It also
     # picks a random mkstemp name, applies the owner-only lockdown to the temp
@@ -666,6 +671,9 @@ async def _handle_review(request: web.Request) -> web.Response:
 
     Body: ``{"links": "<pasted CR links>"}`` or ``{"changes": ["CR-1", ...]}``.
     Returns immediately with a ``run_id``; poll ``/runs`` for status."""
+    owner_denied = await require_owner_dashboard_request(request, "code_review_sage.review")
+    if owner_denied is not None:
+        return owner_denied
     try:
         body = await request.json()
     except Exception:
@@ -830,6 +838,9 @@ async def _handle_review_repo(request: web.Request) -> web.Response:
     Body: ``{"repo": "<github repo url>", "force": bool}``. By default only PRs
     NOT yet reviewed at their current head SHA are queued; ``force=true`` reviews
     ALL open PRs regardless of the dedup index."""
+    owner_denied = await require_owner_dashboard_request(request, "code_review_sage.review_repo")
+    if owner_denied is not None:
+        return owner_denied
     try:
         body = await request.json()
     except Exception:
@@ -996,6 +1007,9 @@ async def _handle_run_cancel(request: web.Request) -> web.Response:
     started are dropped, but a change already mid-review finishes, because its
     worker session owns an in-flight model turn that cannot be torn down without
     corrupting the shared pool. The UI must not promise an instant stop."""
+    owner_denied = await require_owner_dashboard_request(request, "code_review_sage.run_cancel")
+    if owner_denied is not None:
+        return owner_denied
     run_id = _run_id_param(request)
     async with _LOCK:
         run = _find_run(run_id)
@@ -1015,6 +1029,9 @@ async def _handle_run_cancel(request: web.Request) -> web.Response:
 
 async def _handle_run_delete(request: web.Request) -> web.Response:
     """DELETE .../runs/{run_id} — dismiss a finished thread and delete its data."""
+    owner_denied = await require_owner_dashboard_request(request, "code_review_sage.run_delete")
+    if owner_denied is not None:
+        return owner_denied
     run_id = _run_id_param(request)
     async with _LOCK:
         run = _find_run(run_id)
@@ -1166,6 +1183,9 @@ async def _handle_run_post(request: web.Request) -> web.Response:
     still going, when its records have been cleared, or when it already posted —
     a duplicate post is not undoable from here.
     """
+    owner_denied = await require_owner_dashboard_request(request, "code_review_sage.run_post")
+    if owner_denied is not None:
+        return owner_denied
     run_id = _run_id_param(request)
     force = request.query.get("force", "").lower() in ("1", "true", "yes")
     try:
@@ -1349,6 +1369,9 @@ async def _handle_run_archive(request: web.Request) -> web.Response:
     Reports are archived automatically when a run finishes; this is the retry /
     share path for a run whose archive failed (or one archived before the artifact
     was pruned). The report itself lives in the run dir either way."""
+    owner_denied = await require_owner_dashboard_request(request, "code_review_sage.run_archive")
+    if owner_denied is not None:
+        return owner_denied
     run_id = _run_id_param(request)
     async with _LOCK:
         run = _find_run(run_id)
@@ -1465,6 +1488,24 @@ async def _handle_my_repos(request: web.Request) -> web.Response:
         return web.json_response({"code": "provider_unavailable", "error": str(exc)}, status=502)
 
 
+async def _handle_review_queue(request: web.Request) -> web.Response:
+    """GET .../review-queue — open PRs where the ``gh`` user is a requested
+    reviewer. Like ``/my-repos``, an unusable ``gh`` is a 200 ``setup_required``."""
+    try:
+        rows, truncated = await asyncio.to_thread(discovery.list_review_requested)
+    except discovery.GhSetupError as exc:
+        return web.json_response({"prs": [], "setup_required": True, "error": str(exc)})
+    except discovery.GhError as exc:
+        logger.warning("review queue failed: %s", exc)
+        return web.json_response(
+            {"code": "provider_unavailable", "error": "upstream service error"}, status=502)
+    # The same change id the repo list carries: the detail pane scopes posting by
+    # it, and an empty one would publish every change of a multi-PR run.
+    for row in rows:
+        row["change_id"] = review_driver.change_id_for(row["url"])
+    return web.json_response({"prs": rows, "truncated": truncated})
+
+
 def _pull_request_ref(link: str) -> dict | None:
     """Parse a pasted GitHub PR URL into the repo plus the PR's identity.
 
@@ -1497,6 +1538,9 @@ async def _handle_repos(request: web.Request) -> web.Response:
     if request.method == "GET":
         repos = await asyncio.to_thread(discovery.read_repos)
         return web.json_response({"repos": repos})
+    owner_denied = await require_owner_dashboard_request(request, "code_review_sage.repos_write")
+    if owner_denied is not None:
+        return owner_denied
     try:
         body = await request.json()
     except Exception:
@@ -1708,6 +1752,9 @@ async def _handle_settings(request: web.Request) -> web.Response:
             }
         return web.json_response(await asyncio.to_thread(_build_settings_response))
     # PUT
+    owner_denied = await require_owner_dashboard_request(request, "code_review_sage.settings_write")
+    if owner_denied is not None:
+        return owner_denied
     try:
         body = await request.json()
     except Exception:
@@ -1781,6 +1828,10 @@ async def _handle_namespaces(request: web.Request) -> web.Response:
             logger.warning("namespace list failed: %s", exc, exc_info=True)
             return web.json_response({"namespaces": [], "active": ["default"]})
 
+    owner_denied = await require_owner_dashboard_request(
+        request, "code_review_sage.namespaces_write")
+    if owner_denied is not None:
+        return owner_denied
     try:
         body = await request.json()
     except Exception:
@@ -2052,6 +2103,9 @@ async def _handle_consolidate(request: web.Request) -> web.Response:
     APPLY is deterministic and refuses empty content, which is what keeps a bad
     merge from wiping the reviewer's memory.
     """
+    owner_denied = await require_owner_dashboard_request(request, "code_review_sage.consolidate")
+    if owner_denied is not None:
+        return owner_denied
     try:
         body = await request.json()
     except Exception:
@@ -2244,6 +2298,9 @@ async def _ensure_followup_folder(state: Any) -> str:
             "hidden": False,
             "parent_id": "",
             "project_dir": "",
+            # Same stamp the dashboard's own folder creators write; the sidebar's
+            # ``created`` folder sort reads it.
+            "created_at": time.time(),
         }
         folders.append(folder)
         return True, str(folder["id"])
@@ -2276,6 +2333,9 @@ async def _handle_followup_start(request: web.Request) -> web.Response:
     resume itself is already armed when this returns, so the slot's first turn
     loads the reviewer's transcript.
     """
+    owner_denied = await require_owner_dashboard_request(request, "code_review_sage.followup_start")
+    if owner_denied is not None:
+        return owner_denied
     try:
         body = await request.json()
     except Exception:
@@ -2389,22 +2449,41 @@ def register_routes(app: web.Application) -> None:
     # exists at startup. Without this, the UI gets {} from the generic config
     # endpoint and shows a perpetual "Initializing…" message because it needs
     # resolved_paths.reports to render the main view.
-    try:
-        store.ensure_layout()
-    except Exception:  # pragma: no cover - never break gateway startup
-        logger.warning("code-review-sage: ensure_layout failed at startup", exc_info=True)
+    #
+    # OFF the event loop, for the same reason as the reap below: `register_routes`
+    # is sync and `start_dashboard` is a coroutine, so anything in this body runs
+    # on the loop, and the layout pass walks each of nine directories' ancestor
+    # chain to refuse a planted link before creating it. On a network-homed or
+    # stalled data directory those walks are exactly the "synchronous filesystem
+    # walk" that freezes the gateway heartbeat.
+    #
+    # An `on_startup` hook keeps the ordering the UI depends on: aiohttp runs
+    # these hooks during runner setup, BEFORE the site accepts a connection, so
+    # the layout is in place before any request can read `resolved_paths`. The
+    # hook is what lets the walk happen in a worker thread while preserving that.
+    async def _ensure_layout_on_startup(_app: web.Application) -> None:
+        try:
+            await asyncio.to_thread(store.ensure_layout)
+        except Exception:  # pragma: no cover - never break gateway startup
+            logger.warning(
+                "code-review-sage: ensure_layout failed at startup", exc_info=True)
+
+    app.on_startup.append(_ensure_layout_on_startup)
     _load_runs()  # restore durable job status (mark orphaned 'running' as 'interrupted')
     # A run dir with no registry entry is unreachable residue (crash between the
     # two writes, or an older layout) — reap it once at startup, but OFF the event
     # loop. `register_routes` is a sync function called from `start_dashboard`,
     # which is a coroutine, so everything here runs on the loop: this reap walks
     # every run dir and deletes the unreferenced ones, and its cost grows with
-    # accumulated residue, so on a host with stale runs it stalled gateway startup.
-    # `ensure_layout` and `_load_runs` above stay inline deliberately — they are
-    # bounded, and the routes cannot answer correctly until they have run (an empty
-    # `_RUNS` or missing `resolved_paths` is what the UI renders as a perpetual
-    # "Initializing…"). Cleanup has no such ordering requirement, so it is the one
-    # that can wait.
+    # accumulated residue, so on a host with stale runs it stalls gateway startup.
+    # The layout pass above is a startup hook for the same reason.
+    #
+    # `_load_runs` is the one that stays inline, and it is the cheap one: a single
+    # `read_text` of one registry file, which returns immediately when the file is
+    # absent. What both hooks keep is the ordering the UI depends on -- aiohttp
+    # runs `on_startup` before the site accepts a connection, so a request never
+    # observes a missing `resolved_paths` or an empty `_RUNS`, which is what it
+    # would render as a perpetual "Initializing" message.
 
     async def _reap_on_startup(_app: web.Application) -> None:
         try:
@@ -2439,6 +2518,7 @@ def register_routes(app: web.Application) -> None:
     app.router.add_get("/api/apps/code-review-sage/repo-prs", _handle_repo_prs)
     app.router.add_get("/api/apps/code-review-sage/recent-repos", _handle_recent_repos)
     app.router.add_get("/api/apps/code-review-sage/my-repos", _handle_my_repos)
+    app.router.add_get("/api/apps/code-review-sage/review-queue", _handle_review_queue)
     app.router.add_get("/api/apps/code-review-sage/repos", _handle_repos)
     app.router.add_post("/api/apps/code-review-sage/repos", _handle_repos)
     app.router.add_delete("/api/apps/code-review-sage/repos", _handle_repos)

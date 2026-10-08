@@ -22,7 +22,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from kiro_crew.subagent import SubagentInfo, SubagentManager
+from kiro_crew.subagent import SUCCESSOR_UNKNOWN, SubagentInfo, SubagentManager
+from kiro_crew.subagent_manager.continuation import ContinuationCoordinator
 from kiro_crew.subagent_persistence import create_agent_folder, write_run_agent
 
 # ``SubagentManager.spawn`` refuses -- registering no task -- while the host
@@ -34,31 +35,8 @@ pytestmark = pytest.mark.usefixtures("healthy_host_memory")
 
 
 @pytest.fixture(autouse=True)
-def _close_subagent_managers(monkeypatch):
-    """Close every ``SubagentManager`` built in a test.
-
-    Construction opens the durable task queue (a SQLite connection and its
-    writer thread); nothing in these unit tests closes it, so each manager
-    leaked those descriptors. Track every instance and release it at teardown.
-    """
-    import kiro_crew.subagent as _subagent_mod
-
-    created = []
-    orig_init = _subagent_mod.SubagentManager.__init__
-
-    def _tracking_init(self, *args, **kwargs):
-        orig_init(self, *args, **kwargs)
-        created.append(self)
-
-    monkeypatch.setattr(_subagent_mod.SubagentManager, "__init__", _tracking_init)
-    try:
-        yield
-    finally:
-        for mgr in created:
-            try:
-                mgr.close()
-            except Exception:
-                pass
+def _close_subagent_managers(close_subagent_managers):
+    """Every manager built here is closed at teardown; the body is in ``conftest``."""
 
 
 def _mock_sessions(resumed: bool = False) -> MagicMock:
@@ -142,6 +120,7 @@ def _stop_reason(info: SubagentInfo) -> str:
 @pytest.mark.parametrize("continuation", [False, True])
 async def test_run_execution_publication_is_off_loop(monkeypatch, continuation):
     from kiro_crew import execution_context, subagent_persistence
+    from kiro_crew.subagent import _RunCreditAccounting
 
     manager = _manager()
     manager.dependency_coordinator_async = AsyncMock(return_value=None)
@@ -172,7 +151,9 @@ async def test_run_execution_publication_is_off_loop(monkeypatch, continuation):
     monkeypatch.setattr(execution_context, "read_session_execution", read)
     monkeypatch.setattr(execution_context, "bind_session_execution", bind)
     with pytest.raises(Published):
-        await asyncio.wait_for(manager._run_events._run_inner_impl(info, key), 10)
+        await asyncio.wait_for(
+            manager._run_events._run_inner_impl(info, key, _RunCreditAccounting(info)), 10
+        )
     assert [operation[0] for operation in operations] == (
         ["read", "bind"] if continuation else ["bind"]
     )
@@ -1846,6 +1827,22 @@ class TestSteerRun:
         shared.steer.assert_awaited_once_with("adjust")
 
     @pytest.mark.asyncio
+    async def test_a_session_that_can_lose_a_delivered_steer_is_refused(self) -> None:
+        """codex can drop a steer it reported delivered; a subagent run cannot
+        requeue it, so the steer is refused and the parent is told to follow up."""
+        manager = _manager()
+        shared = AsyncMock()
+        shared.steer = AsyncMock(return_value=True)
+        shared.steer_needs_loss_recovery = True
+        info = SubagentInfo(id="a1", task="t")
+        info._session_sharing = True
+        info._shared_provider = shared
+        manager._agents["a1"] = info
+        ok, detail = await manager.steer_run("a1", "adjust")
+        assert not ok and detail.startswith("steer_unsupported") and "follow_up" in detail
+        shared.steer.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_no_session_reachable(self) -> None:
         """A live run with no reachable session now gets the startup
         grace, then the typed ``session_starting`` refusal (retryable) —
@@ -1922,34 +1919,37 @@ class TestReleaseAndSweep:
         ok, detail = manager.release_conversation("c1")
         assert not ok and detail.startswith("conversation_gone")
 
-    def test_sweep_expires_only_idle_past_ttl(self) -> None:
+    @pytest.mark.asyncio
+    async def test_sweep_expires_only_idle_past_ttl(self) -> None:
         sessions = _mock_sessions()
         manager = _manager(sessions)
         now = time.time()
         manager._conversations["subagent:old1"] = now - 7 * 3600  # expired
         manager._conversations["subagent:new1"] = now - 60  # fresh
         with patch("kiro_crew.subagent._cleanup_session_files_sync"):
-            manager._sweep_conversations(now)
+            await manager._sweep_conversations_async(now)
         assert "subagent:old1" not in manager._conversations
         assert "subagent:new1" in manager._conversations
 
-    def test_sweep_drops_malformed_registry_key(self) -> None:
+    @pytest.mark.asyncio
+    async def test_sweep_drops_malformed_registry_key(self) -> None:
         manager = _manager()
         now = time.time()
         manager._conversations["malformed"] = now - 7 * 3600
-        with patch.object(manager, "release_conversation") as release:
-            manager._sweep_conversations(now)
+        with patch.object(manager, "release_conversation_async", AsyncMock()) as release:
+            await manager._sweep_conversations_async(now)
         assert "malformed" not in manager._conversations
         release.assert_not_called()
 
-    def test_sweep_refreshes_busy_conversation(self) -> None:
+    @pytest.mark.asyncio
+    async def test_sweep_refreshes_busy_conversation(self) -> None:
         sessions = _mock_sessions()
         manager = _manager(sessions)
         now = time.time()
         manager._conversations["subagent:busy1"] = now - 7 * 3600
         live = SubagentInfo(id="busy1", task="t")  # not done
         manager._agents["busy1"] = live
-        manager._sweep_conversations(now)
+        await manager._sweep_conversations_async(now)
         assert manager._conversations["subagent:busy1"] == now  # refreshed
 
 
@@ -3681,3 +3681,188 @@ class TestSharedBindIdentityLabel:
         info, live, _ = await self._bound(ACP_BACKEND_KIRO)
         assert info._session_provider == PROVIDER_LABEL_DEFAULT
         assert live and live[0].get("provider") == PROVIDER_LABEL_DEFAULT
+
+
+class TestSuccessorClaim:
+    """A failed run has one successor: a dashboard retry or a continuation."""
+
+    @staticmethod
+    def _failed(manager: SubagentManager, run_id: str = "fail1234") -> SubagentInfo:
+        failed = SubagentInfo(id=run_id, task="t", done=True, error="turn_limit:100")
+        manager._agents[run_id] = failed
+        return failed
+
+    # Every state a failed run's successor claim can be in, and whether a retry
+    # and a continuation are each granted from it. The continuation column is
+    # the claim alone: a live or queued continuation is refused one step later
+    # by the conversation-busy check every continuation already runs.
+    @staticmethod
+    def _state_none(m: SubagentManager, f: SubagentInfo) -> None:
+        return None
+
+    @staticmethod
+    def _state_retry_starting(m: SubagentManager, f: SubagentInfo) -> None:
+        assert m.claim_retry(f) == ""
+
+    @staticmethod
+    def _state_retried(m: SubagentManager, f: SubagentInfo) -> None:
+        assert m.claim_retry(f) == ""
+        m.settle_retry(f, "retry5678")
+
+    @staticmethod
+    def _state_retry_start_failed(m: SubagentManager, f: SubagentInfo) -> None:
+        assert m.claim_retry(f) == ""
+        m.settle_retry(f, None)
+
+    @staticmethod
+    def _state_continuation_starting(m: SubagentManager, f: SubagentInfo) -> None:
+        assert m._claim_continuation(f.id, "x", "")[1] is None
+
+    @staticmethod
+    def _state_continued(m: SubagentManager, f: SubagentInfo) -> None:
+        assert m._claim_continuation(f.id, "x", "")[1] is None
+        m._settle_continuation(f, SubagentInfo(id="cont0001", task="t"))
+
+    @staticmethod
+    def _state_continuation_start_failed(m: SubagentManager, f: SubagentInfo) -> None:
+        assert m._claim_continuation(f.id, "x", "")[1] is None
+        m._settle_continuation(f, None)
+
+    @staticmethod
+    def _state_retry_start_raised(m: SubagentManager, f: SubagentInfo) -> None:
+        assert m.claim_retry(f) == ""
+        m.settle_retry(f, SUCCESSOR_UNKNOWN)
+        m.settle_retry(f, None)
+
+    @staticmethod
+    def _state_continuation_start_raised(m: SubagentManager, f: SubagentInfo) -> None:
+        assert m._claim_continuation(f.id, "x", "")[1] is None
+        m._settle_continuation(f, None, raised=True)
+
+    @staticmethod
+    def _state_continued_then_refused(m: SubagentManager, f: SubagentInfo) -> None:
+        TestSuccessorClaim._state_continued(m, f)
+        assert m._claim_continuation(f.id, "x", "")[1] is None
+        busy = SubagentInfo(id="x", task="t", done=True, error="conversation_busy: busy")
+        m._settle_continuation(f, busy)
+
+    @staticmethod
+    def _state_queued_continuation(m: SubagentManager, f: SubagentInfo) -> None:
+        m._queue.append({"_preassigned_id": "cont0001", "conversation_key": f"subagent:{f.id}"})
+
+    @staticmethod
+    def _state_live_continuation(m: SubagentManager, f: SubagentInfo) -> None:
+        m._agents["cont0001"] = SubagentInfo(
+            id="cont0001", task="t", conversation_key=f"subagent:{f.id}"
+        )
+
+    @staticmethod
+    def _state_finished_continuation(m: SubagentManager, f: SubagentInfo) -> None:
+        m._agents["cont0001"] = SubagentInfo(
+            id="cont0001", task="t", done=True, conversation_key=f"subagent:{f.id}"
+        )
+
+    @pytest.mark.parametrize(
+        ("state", "retry_granted", "continue_granted"),
+        [
+            ("none", True, True),
+            ("retry_starting", False, False),
+            ("retried", False, False),
+            ("retry_start_failed", True, True),
+            ("retry_start_raised", False, False),
+            ("continuation_starting", False, False),
+            ("continued", False, True),
+            ("continuation_start_failed", True, True),
+            ("continuation_start_raised", False, True),
+            ("continued_then_refused", False, True),
+            ("queued_continuation", False, True),
+            ("live_continuation", False, True),
+            ("finished_continuation", False, True),
+        ],
+    )
+    def test_every_claim_state_answers_retry_and_continue(
+        self, state: str, retry_granted: bool, continue_granted: bool
+    ) -> None:
+        for op in ("retry", "continue"):
+            manager = _manager()
+            failed = self._failed(manager)
+            getattr(self, f"_state_{state}")(manager, failed)
+            if op == "retry":
+                assert (manager.claim_retry(failed) == "") is retry_granted, op
+            else:
+                refusal = manager._claim_continuation(failed.id, "x", "")[1]
+                assert (refusal is None) is continue_granted, op
+                if refusal is not None:
+                    assert refusal.error.startswith("conversation_busy")
+
+    def test_a_continued_run_stays_claimed_after_its_successor_leaves(self) -> None:
+        manager = _manager()
+        failed = self._failed(manager)
+        self._state_continued(manager, failed)
+        manager._agents.pop("cont0001", None)
+        assert manager.claim_retry(failed) == "cont0001"
+
+    @pytest.mark.asyncio
+    async def test_retry_is_refused_while_a_continuation_start_is_in_flight(self) -> None:
+        """The continuation claims before its first await, so a retry landing
+        while its durable accept is still pending sees the claim."""
+        manager = _manager()
+        failed = self._failed(manager)
+        gate = asyncio.Event()
+        seen: list[str] = []
+
+        async def slow_continue(*_a, **_k):
+            seen.append(manager.claim_retry(failed))
+            await gate.wait()
+            return SubagentInfo(id="cont0001", task="t")
+
+        with patch.object(
+            ContinuationCoordinator, "continue_conversation_async_impl", new=slow_continue
+        ):
+            task = asyncio.ensure_future(manager.continue_conversation_async("fail1234", "x"))
+            await asyncio.sleep(0)
+            assert manager.claim_retry(failed) != ""
+            gate.set()
+            await task
+        assert seen and seen[0] != ""
+        assert manager.claim_retry(failed) == "cont0001"
+
+    @pytest.mark.asyncio
+    async def test_a_continuation_start_that_raises_keeps_the_claim(self) -> None:
+        manager = _manager()
+        failed = self._failed(manager)
+
+        async def raises(*_a, **_k):
+            raise asyncio.CancelledError
+
+        with (
+            patch.object(ContinuationCoordinator, "continue_conversation_async_impl", new=raises),
+            pytest.raises(asyncio.CancelledError),
+        ):
+            await manager.continue_conversation_async("fail1234", "x")
+        assert manager.claim_retry(failed) == SUCCESSOR_UNKNOWN
+        assert manager._claim_continuation("fail1234", "x", "")[1] is None
+
+    @pytest.mark.asyncio
+    async def test_second_continuation_is_refused_while_the_first_is_starting(self) -> None:
+        manager = _manager()
+        self._failed(manager)
+        gate = asyncio.Event()
+        starts: list[str] = []
+
+        async def slow_continue(*_a, **_k):
+            starts.append("x")
+            await gate.wait()
+            return SubagentInfo(id="cont0001", task="t")
+
+        with patch.object(
+            ContinuationCoordinator, "continue_conversation_async_impl", new=slow_continue
+        ):
+            first = asyncio.ensure_future(manager.continue_conversation_async("fail1234", "a"))
+            await asyncio.sleep(0)
+            second = await manager.continue_conversation_async("fail1234", "b")
+            gate.set()
+            await first
+        assert second is not None and second.done
+        assert second.error.startswith("conversation_busy")
+        assert starts == ["x"]

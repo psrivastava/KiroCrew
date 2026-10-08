@@ -89,12 +89,30 @@ _SPAWN_TIMEOUT_SECS = 60.0
 _POLL_SECS = 0.1
 
 
+def _settle(sessions, *keys):
+    """Backdate transcripts past the backfill quiet window.
+
+    ``backfill_index`` defers a session whose file changed within
+    ``history_search._INDEX_QUIET_WINDOW_SECS``: it is treated as still being
+    written. These tests append and expect the CHILD to index in the same
+    breath, and a monkeypatch does not reach a spawned interpreter, so the
+    file's own mtime is moved back instead -- the one signal the deferral reads
+    that crosses the process boundary.
+    """
+    from kiro_crew import history_search
+
+    settled = time.time() - history_search._INDEX_QUIET_WINDOW_SECS - 600.0
+    for key in keys:
+        os.utime(sessions / f"{key}.jsonl", (settled, settled))
+
+
 def _seeded_sessions(tmp_path):
     """A session directory with transcripts and no index yet."""
     sessions = tmp_path / "sessions"
     log = ConversationLog(base_dir=sessions)
     log.append("alpha", "user", "a session about deployment contention")
     log.append("beta", "user", "a session about astronomy and telescopes")
+    _settle(sessions, "alpha", "beta")
     return sessions
 
 
@@ -721,14 +739,23 @@ def test_a_contended_write_waits_instead_of_failing(tmp_path):
     db_path = tmp_path / "session_index.db"
     holder = SessionSearchIndex(db_path)
     writer = SessionSearchIndex(db_path)
-    assert holder.available and writer.available
-
-    hold_secs = 0.3
+    ready = threading.Event()
+    start_write = threading.Event()
+    attempted = threading.Event()
+    completed = threading.Event()
+    released = threading.Event()
     outcome: dict[str, object] = {}
+
+    def observe_statement(statement: str) -> None:
+        if statement.lstrip().upper().startswith("BEGIN IMMEDIATE"):
+            attempted.set()
 
     def contended_write() -> None:
         # Its own thread, so it gets its own connection (they are thread-local).
         try:
+            writer._ensure_open().set_trace_callback(observe_statement)
+            ready.set()
+            assert start_write.wait(10), "the holder never released the start barrier"
             writer.sync(
                 "contended",
                 mtime_ns=1,
@@ -737,33 +764,43 @@ def test_a_contended_write_waits_instead_of_failing(tmp_path):
                 ino=1,
                 texts=["a write that had to wait for the other writer"],
             )
-            outcome["ok"] = True
+            outcome["finished_after_release"] = released.is_set()
         except Exception as exc:  # pragma: no cover - would be a real regression
             outcome["error"] = repr(exc)
+        finally:
+            writer.close()
+            completed.set()
 
+    conn = holder._ensure_open()
+    thread = threading.Thread(target=contended_write, name="contended-writer")
     try:
-        # Take the database's write lock and hold it.
-        conn = holder._ensure_open()
-        conn.execute("BEGIN IMMEDIATE")
-        conn.execute("SELECT 1").fetchone()
-
-        thread = threading.Thread(target=contended_write, name="contended-writer")
-        started = time.monotonic()
+        assert holder.available and writer.available
         thread.start()
-        time.sleep(hold_secs)
+        assert ready.wait(10), f"writer connection never opened: {outcome}"
+        # Open the writer first, then hold the lock at its actual write attempt.
+        conn.execute("BEGIN IMMEDIATE")
+        start_write.set()
+        assert attempted.wait(10), f"the writer never attempted BEGIN IMMEDIATE: {outcome}"
+        assert not completed.wait(0.1), "the write returned while the holder owned the lock"
+        # Record the release before unlocking, so the writer proves the ordering.
+        released.set()
         conn.execute("COMMIT")
-        thread.join(timeout=30.0)
-        elapsed = time.monotonic() - started
 
-        assert not thread.is_alive(), "the contended write never finished"
+        assert completed.wait(10), "the contended write never finished after lock release"
         assert "error" not in outcome, f"contended write raised: {outcome.get('error')}"
-        assert elapsed >= hold_secs, "the write did not actually contend"
+        assert outcome.get("finished_after_release") is True, "the write did not actually contend"
         # The proof: the row is there, so the write waited out the lock rather
         # than being swallowed as a failure.
         assert "contended" in writer.indexed_keys()
     finally:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        start_write.set()
+        if thread.ident is not None:
+            thread.join(timeout=15)
         holder.close()
         writer.close()
+        assert not thread.is_alive(), "the contended writer survived cleanup"
 
 
 # ----------------------------------------------- delete vs reindex, two processes
@@ -800,6 +837,9 @@ def test_the_child_honours_the_cross_process_session_lock(tmp_path):
 
         with log._locked("gamma"):
             log.append("gamma", "user", "a session written while its lock is held")
+            # Settled while the lock is still held, so the only thing keeping
+            # the child off this session below is the lock itself.
+            _settle(sessions, "gamma")
             # The child now sees an unindexed session it cannot lock. Give it
             # several passes (its busy pause is 0.1 s here) to try and fail.
             deadline = time.monotonic() + 2.5

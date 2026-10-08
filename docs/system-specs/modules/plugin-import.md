@@ -13,10 +13,11 @@ specifies the converter, not the mapping.
 ## 1. What it is for
 
 Two claims needed proving before Kiro Crew accepts foreign plugin contributions:
-that the extension points we already have can receive them, and that receiving
-them does not require running foreign code. A converter proves both. It reads
-JSON and copies files; the emitted app is an ordinary Kiro Crew app with no trace
-of the source runtime and nothing to supervise.
+that the extension points we already have can receive them, and that conversion
+does not require running foreign code. A converter proves both. It reads JSON
+and copies files; the converter itself has no foreign runtime to supervise. The
+emitted app is an ordinary Kiro Crew app, so a mapped MCP server can be launched
+after installation under the normal app lifecycle.
 
 It is deliberately not an adapter. A package's in-process code -- tools, hook
 callbacks, services -- is not converted and cannot be: that half needs a process
@@ -130,8 +131,8 @@ with a program to run (`command`) or an endpoint to connect to (`url`); an entry
 carrying neither names no server at all. Nothing else in the conversion catches it,
 because an empty or transportless object is a valid object, holds no
 package-relative field to refuse, and has nothing over-limit for the bounding pass
-to trim -- so it was emitted into app.json as a server with no way to reach it,
-which no reader can launch and no message mentioned. This is asked separately from
+to trim -- so without this check it would be emitted into app.json as a server
+with no way to reach it, which no reader can launch and no message mentions. This is asked separately from
 whether a transport is USABLE, which is the package-relative question above, and it
 is declined the same way every other invalid entry is: the entry is dropped and
 named, and the import goes on.
@@ -153,8 +154,8 @@ an npm scope specifier (`@scope/pkg`) and a URL (`git+https://...`). The flag
 exclusion covers the FLAG, never a path it carries: the value after the first `=` is
 re-tested by the same rule, so `--config=./local/thing` and `--plugin=bin/server`
 answer yes while `--pkg=@scope/x`, `--src=git+https://...` and a bare `--quiet`
-answer no. Excluding every token that began with a dash was how the shape this
-detector exists to catch got back in through option syntax: such a value resolves
+answer no. Excluding every token that begins with a dash would let the shape this
+detector exists to catch back in through option syntax: such a value resolves
 against the session's working directory exactly as the bare spelling does. A bare
 command
 (`npx`), a package specifier (`some-mcp@latest`) and a version-suffixed interpreter
@@ -165,12 +166,14 @@ package-relative one emits the first and reports the second.
 
 ## 4. The two safety properties
 
-**No foreign code runs.** Conversion opens JSON files and copies bytes. Nothing
-in the package is imported, evaluated, or spawned -- at conversion time or after.
-A hook's `command` string is data. Pinned by
+**No foreign code runs during conversion.** Conversion opens JSON files and
+copies bytes. Nothing in the package is imported, evaluated, or spawned while
+the converter runs. After installation, mapped MCP server commands follow the
+ordinary app lifecycle; package-relative programs are refused by §3.1. A hook's
+`command` string remains data. Pinned by
 `TestUnmappedKinds::test_conversion_runs_no_command_from_the_package`, which
 gives the package a hook that would create a sentinel file and asserts the file
-does not exist.
+does not exist during conversion.
 
 **A linked source root is refused before anything probes it.** A probe resolves the
 path, so on Windows a junction whose target is a UNC share makes the OS authenticate
@@ -204,7 +207,7 @@ reported warning, never a silent trim: at most 200 skills per package, 8 levels
 of skill-tree depth, 32 MiB per copied file, and per skill tree 2000 files and
 128 MiB in total. The last two are a separate question from the per-file bound and
 from depth: depth limits how DEEP a walk goes and never how wide, so a tree of many
-small files, or of files each just under the per-file cap, was unbounded. The
+small files, or of files each just under the per-file cap, would be unbounded. The
 allowance is shared across the whole recursion, because a per-directory cap is not
 a cap on a tree, and it is spent only by a copy that landed.
 
@@ -269,8 +272,8 @@ over-deep subtree is never held in memory to be discarded afterwards.
 branch that drops an entry -- a non-string key, an over-long key, a non-finite
 number, an over-deep value -- appends a warning and keeps nothing, so a ceiling on
 the retained container never fires on precisely the inputs that grow the report. A
-container of nothing but dropped entries left the retained count at zero forever and
-grew the warning list once per input entry.
+cap on retained entries would leave the count at zero forever for a container of
+nothing but dropped entries, while the warning list grows once per input entry.
 
 **A hooks declaration is bounded at `MAX_HOOK_DOCUMENTS` entries inspected.** Nothing
 rejects a repeat, so a manifest may declare one file any number of times and each

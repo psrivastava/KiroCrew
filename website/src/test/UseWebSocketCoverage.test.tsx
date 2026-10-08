@@ -27,8 +27,8 @@ import {
 } from '../hooks/useWebSocket'
 import { api } from '../api/client'
 import { store as globalStore } from '../store'
-import chatReducer, { setActiveSlot, clearMessages, sseChatMessage, sseActivityEvent, setQuestionCard, resolveQuestionCard, sseAutomation, resolveByApprovalId } from '../store/chatSlice'
-import { sseSlots } from '../store/dashboardSlice'
+import chatReducer, { PANE_HYDRATE_LIMIT, setActiveSlot, clearMessages, sseChatMessage, sseActivityEvent, setQuestionCard, resolveQuestionCard, sseAutomation, resolveByApprovalId } from '../store/chatSlice'
+import { sseSlots, addSlotOptimistic, armConfirmedCloseHold, removeSlotOptimistic } from '../store/dashboardSlice'
 import { addNotification, removeNotificationByTs } from '../store/notificationsSlice'
 import type { ChatSlot } from '../types'
 import { recentErrors } from '../utils/errorReport'
@@ -326,6 +326,69 @@ describe('useWebSocket frame router', () => {
     expect(dash().slots[0].todo).toEqual(todo)
   })
 
+  it('refreshes slots once when a slot patch names an absent row', async () => {
+    globalStore.dispatch(sseSlots([slotFixture(ACTIVE)]))
+    try {
+      const { ws } = mount()
+      await act(async () => { await Promise.resolve(); await Promise.resolve() })
+      vi.mocked(api.chatSlots).mockClear()
+
+      act(() => {
+        ws.simulateMessage({
+          type: 'slot_patch',
+          data: { slots: [{ key: BACKGROUND, title: 'New session' }] },
+        })
+      })
+
+      expect(api.chatSlots).toHaveBeenCalledTimes(1)
+    } finally {
+      globalStore.dispatch(sseSlots([]))
+    }
+  })
+
+  it('does not refresh slots when a slot patch names a present row', async () => {
+    globalStore.dispatch(sseSlots([slotFixture(ACTIVE)]))
+    try {
+      const { ws } = mount()
+      await act(async () => { await Promise.resolve(); await Promise.resolve() })
+      vi.mocked(api.chatSlots).mockClear()
+
+      act(() => {
+        ws.simulateMessage({
+          type: 'slot_patch',
+          data: { slots: [{ key: ACTIVE, title: 'Renamed session' }] },
+        })
+      })
+
+      expect(api.chatSlots).not.toHaveBeenCalled()
+    } finally {
+      globalStore.dispatch(sseSlots([]))
+    }
+  })
+
+  it('does not refresh slots when an absent patched row is closing', async () => {
+    globalStore.dispatch(sseSlots([slotFixture(ACTIVE), slotFixture(BACKGROUND)]))
+    globalStore.dispatch(armConfirmedCloseHold(BACKGROUND))
+    globalStore.dispatch(removeSlotOptimistic(BACKGROUND))
+    try {
+      const { ws } = mount()
+      await act(async () => { await Promise.resolve(); await Promise.resolve() })
+      vi.mocked(api.chatSlots).mockClear()
+
+      act(() => {
+        ws.simulateMessage({
+          type: 'slot_patch',
+          data: { slots: [{ key: BACKGROUND, title: 'Closing session' }] },
+        })
+      })
+
+      expect(api.chatSlots).not.toHaveBeenCalled()
+    } finally {
+      globalStore.dispatch(addSlotOptimistic(slotFixture(BACKGROUND)))
+      globalStore.dispatch(sseSlots([]))
+    }
+  })
+
   it('refreshes the pending-skill queues when a candidate is staged', () => {
     const { ws } = mount()
     act(() => { ws.simulateMessage({ type: 'skills.pending_changed', data: {} }) })
@@ -388,7 +451,10 @@ describe('useWebSocket frame router', () => {
     expect(note?.body).toBe(delivery === 'live' ? `${body}\n\n**Reason:** cleanup` : body)
   })
 
-  it('raises a desktop notification for an approval while the tab is hidden', () => {
+  it('hands an approval to the feed and raises no desktop notification of its own', () => {
+    // The feed entry is what reaches the OS (useNativeNotification constructs
+    // the toast, tagged with the approval id); a constructor here would be a
+    // second banner for the same approval.
     class MockNotification {
       static permission = 'granted'
       static instances: { title: string }[] = []
@@ -404,7 +470,10 @@ describe('useWebSocket frame router', () => {
           data: { id: 'ap-1', slot: ACTIVE, source: 'agent', tool: 'execute_bash', tool_input: '{}', ts: 5 },
         })
       })
-      expect(MockNotification.instances).toHaveLength(1)
+      expect(MockNotification.instances).toHaveLength(0)
+      const feedNote = testStore.getState().notifications.items.find(n => n.approval_id === 'ap-1')
+      expect(feedNote?.kind).toBe('approval')
+      expect(feedNote?.title).toContain('execute_bash')
       const card = chat().messages.find(m => m.role === 'permission')
       expect(card?.meta?.approval_id).toBe('ap-1')
       expect(chat().toolLog.some(e => e.approval_id === 'ap-1')).toBe(true)
@@ -1374,6 +1443,18 @@ describe('useWebSocket frame router', () => {
     expect(steer?.role).toBe('user')
   })
 
+  it('a steer echo keeps the quote its meta carries, and drops a malformed one', () => {
+    const { ws } = mount()
+    const quote = { role: 'assistant', text: 'older reply', ts: '29' }
+    act(() => {
+      ws.simulateMessage({ type: 'steer_push', data: { slot: ACTIVE, content: '> older reply\n\nfollow-up', ts: '30', meta: { quote } } })
+      ws.simulateMessage({ type: 'steer_push', data: { slot: ACTIVE, content: 'plain', ts: '31', meta: { quote: { role: 'system', text: 'x' } } } })
+    })
+    const steers = chat().messages.filter(m => m.meta?.steer === true)
+    expect(steers[0]?.meta?.quote).toEqual(quote)
+    expect(steers[1]?.meta?.quote).toBeUndefined()
+  })
+
   it('records a tool call and its result against the slot', () => {
     const { ws } = mount()
     act(() => {
@@ -1406,7 +1487,7 @@ describe('useWebSocket frame router', () => {
     expect(stored[0].tool_call_id).toBe('tc-app')
   })
 
-  it('marks a live question card fresh and clears it on resolution', () => {
+  it('stores a live question card under its server identity and clears it on resolution', () => {
     const { ws } = mount()
     act(() => {
       ws.simulateMessage({
@@ -1415,7 +1496,6 @@ describe('useWebSocket frame router', () => {
       })
     })
     expect(chat().pendingQuestions[ACTIVE]?.ask_id).toBe('ask-live')
-    expect(chat().pendingQuestions[ACTIVE]?.cardId).toBeTruthy()
 
     act(() => { ws.simulateMessage({ type: 'question_card_resolved', data: { ask_id: 'ask-live' } }) })
     expect(chat().pendingQuestions[ACTIVE]).toBeUndefined()
@@ -1617,18 +1697,19 @@ describe('useWebSocket frame router', () => {
       ws.simulateMessage({ type: 'chat_status', data: { slot: ACTIVE, status: 'Compacting…' } })
     })
     expect(chat().slotContextPct[ACTIVE]).toBe(42)
-    expect(chat().slotStatusDetail[ACTIVE]?.text).toBe('Compacting…')
+    expect(chat().slotStatusDetail[ACTIVE]).toMatchObject({ kind: 'thinking', label: 'Compacting…' })
 
     // A status frame with no text is ignored rather than clearing the detail.
     act(() => { ws.simulateMessage({ type: 'chat_status', data: { slot: ACTIVE } }) })
-    expect(chat().slotStatusDetail[ACTIVE]?.text).toBe('Compacting…')
+    expect(chat().slotStatusDetail[ACTIVE]).toMatchObject({ kind: 'thinking', label: 'Compacting…' })
   })
 
   it('re-reads the transcript when a variant switch names a slot', () => {
     const { ws } = mount()
     ;(api.chatSlotDetail as ReturnType<typeof vi.fn>).mockClear()
     act(() => { ws.simulateMessage({ type: 'chat_variant_switch', data: { slot: ACTIVE } }) })
-    expect(api.chatSlotDetail).toHaveBeenCalledWith(ACTIVE)
+    // An empty view asks for the floor-sized page, never the whole transcript.
+    expect(api.chatSlotDetail).toHaveBeenCalledWith(ACTIVE, PANE_HYDRATE_LIMIT)
   })
 
   it('chimes once when a turn completes', () => {
@@ -2256,7 +2337,6 @@ describe('useWebSocket frame router', () => {
       slot: ACTIVE,
       card_id: 'card-gone',
       questions: [{ question: 'Stale', options: [{ label: 'x' }] }],
-      fresh: true,
     })
     ;(api.pendingQuestions as ReturnType<typeof vi.fn>).mockResolvedValueOnce([])
     act(() => {
@@ -2273,7 +2353,6 @@ describe('useWebSocket frame router', () => {
       slot: ACTIVE,
       card_id: 'card-old',
       questions: [{ question: 'Old', options: [{ label: 'x' }] }],
-      fresh: true,
     })
     ;(api.pendingQuestions as ReturnType<typeof vi.fn>).mockResolvedValueOnce([
       { card_id: 'card-new', slot: ACTIVE, questions: [{ question: 'New', options: [{ label: 'y' }] }] },
@@ -2296,7 +2375,6 @@ describe('useWebSocket frame router', () => {
       slot: ACTIVE,
       card_id: 'card-live',
       questions: [{ question: 'Still asking', options: [{ label: 'x' }] }],
-      fresh: true,
     })
     ;(api.pendingQuestions as ReturnType<typeof vi.fn>).mockResolvedValueOnce([
       { card_id: 'card-live', slot: ACTIVE, questions: [{ question: 'Still asking', options: [{ label: 'x' }] }] },
@@ -2305,14 +2383,13 @@ describe('useWebSocket frame router', () => {
       globalStore.dispatch(held)
       testStore.dispatch(held as never)
     })
-    const deliveryId = chat().pendingQuestions[ACTIVE]?.cardId
-    expect(deliveryId).toBeTruthy()
+    const entry = chat().pendingQuestions[ACTIVE]
+    expect(entry?.serverCardId).toBe('card-live')
     mount()
     await act(async () => { await Promise.resolve() })
-    expect(chat().pendingQuestions[ACTIVE]?.serverCardId).toBe('card-live')
-    // The SAME entry, not a drop-and-re-add: a fresh per-delivery id would mean
-    // the component remounted, discarding a half-typed answer on every reconnect.
-    expect(chat().pendingQuestions[ACTIVE]?.cardId).toBe(deliveryId)
+    // The SAME entry, not a drop-and-re-add: a replaced entry would reset the
+    // draft protection and let a reconnect discard a half-typed answer.
+    expect(chat().pendingQuestions[ACTIVE]).toBe(entry)
   })
 
   it('restores a stateless card when a queued answer is cancelled', async () => {
@@ -2359,7 +2436,6 @@ describe('useWebSocket frame router', () => {
       slot: ACTIVE,
       card_id: 'card-new',
       questions: [{ question: 'Live', options: [{ label: 'y' }] }],
-      fresh: true,
     })
     mount()
     // Both stores: the hook reads the module store for its snapshots (like the
@@ -2653,7 +2729,7 @@ describe('useWebSocket connection lifecycle', () => {
 
       const second = WS_INSTANCES[1]
       act(() => { second.simulateOpen() })
-      expect(api.chatSlotDetail).toHaveBeenCalledWith(ACTIVE)
+      expect(api.chatSlotDetail).toHaveBeenCalledWith(ACTIVE, PANE_HYDRATE_LIMIT)
       expect(second.send).toHaveBeenCalledWith(JSON.stringify({ type: 'subscribe_subagents' }))
       unmount()
     } finally {

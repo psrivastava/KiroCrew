@@ -6,8 +6,8 @@
 > approach — so a reviewer can understand the delta at a glance, and so the fork
 > can be re-based on future upstream pulls without re-deriving intent.
 >
-> **Branch:** `ccrew-claude-codex` · **Fork base:** upstream commit `64f3b5811`
-> (`fix(test): drop the stale 501-until-diag premise from test_mcp_debug (#12865)`).
+> **Branch:** `main` · **Fork base:** upstream commit `8fe49bd54` (synced 2026-10-08;
+> originally forked at `64f3b5811`). Every upstream sync is recorded in §9.
 
 ---
 
@@ -62,7 +62,7 @@ the two apps never collide:
 |---|---|---|---|
 | `app.name` (→ lock + userData) | "Kiro Crew" | "CCrew" | `main.js` (`ccrewAppName()`) |
 | Default data home | `~/.kiro/crew` | `~/.ccrew` | `home-dir.js` (`canonicalHome`) |
-| Default gateway port | 5476 | 5490 | `main.js` (`resolvePort`) |
+| Default gateway port | 5476 | 5490 | `main.js` (`resolvePort` → `host-config.js` `selectLaunchPort({ defaultPort })`) |
 | Windows AppUserModelID | `com.amazon.kiro.crew` | `com.ccrew.app` | `main.js` |
 
 An explicit `KIROCREW_HOME` override still wins over the CCrew default. A plain
@@ -100,7 +100,7 @@ own non-nestable OS sandbox, and let that sandbox own the isolation.
 |---|---|
 | `ACP_BACKENDS_SKIP_CREW_SEATBELT_MACOS` | New capability set, `{claude}` only; `agent_sdk/backends.py`, re-exported via `acp_backends.py` + `acp/types.py` |
 | `wrap_argv` / `wrap_argv_async` | New `skip_crew_seatbelt_macos` param; a **darwin-only** branch env-scrubs and returns WITHOUT the seatbelt |
-| `acp/client.py` | Passes the flag by set membership at the Claude spawn |
+| `acp/launch.py` | Passes the flag by set membership at the shared ACP spawn (moved out of `acp/client.py` upstream) |
 
 Deliberately a **separate** set from `ACP_BACKENDS_INTERNAL_SANDBOX` (harness-
 parity H6, one set per capability): that set carries the Windows no-backend
@@ -126,7 +126,10 @@ unchanged.
 The sidebar ghost glyph is a raster `logo.png` (purple), so it can't be recolored
 by a token. A `.ccrew-logo-tint` CSS class hue-rotates it to lime on both glyph
 `<img>` sites. Reversible, no new asset.
-- `website/src/index.css` (`.ccrew-logo-tint`), applied in `website/src/App.tsx`.
+- `website/src/index.css` (`.ccrew-logo-tint`), applied in `website/src/App.tsx`
+  (`MobileNavGlyph`) and `website/src/shell/nav/railChrome.tsx` (`RailHeaderGlyph`).
+- Claude-session API methods live in `website/src/api/client/sessions.ts`
+  (upstream split `api/client.ts` into per-domain modules).
 
 ### 3.2 Active-backend chip
 The chat only ever showed the **agent-spec name** ("default") — never the ACP
@@ -339,3 +342,58 @@ or **System Settings → Privacy & Security → "Open Anyway"** on the first
 blocked launch. Because CCrew has its own bundle id (`com.ccrew.app`), name,
 data home (`~/.ccrew`) and port (5490), it installs and runs **side by side**
 with an installed KiroCrew — neither replaces the other.
+
+---
+
+## 9. Upstream merge log
+
+One entry per upstream sync, newest first. Append a new entry in the same
+commit as the merge, and bump the **Fork base** line at the top of this file.
+
+**How to sync** (remote `upstream` = `kirodotdev/KiroCrew`):
+
+```bash
+git fetch upstream
+git checkout -b sync/upstream-<YYYY-MM-DD> main
+git merge upstream/main          # resolve; never squash — keep both parents
+```
+
+Where upstream moved code that CCrew edited, take upstream's new structure and
+re-apply the CCrew change at the new location, then update the "Where" cells in
+§2–§4. Translation conflicts are almost always sibling keys added at the same
+spot: keep both and fix the comma. Then run the checks in §5/§8 plus the i18n
+parity and logo-glyph tests, and record the entry below.
+
+**Entry template:**
+
+```markdown
+### YYYY-MM-DD — `<upstream sha>` (merge `<merge sha>`, PR #N)
+- **Range:** `<old base>..<new base>`, N upstream commits; CCrew side had M commits.
+- **Conflicts:** N files. Relocated CCrew changes: <file → new file, …>.
+- **Other fallout:** <behavior changes, renamed APIs, new specs to read>.
+- **Verified:** <tests/builds run and results>. **Not run:** <what and why>.
+```
+
+### 2026-10-08 — `8fe49bd54` (merge `7174ddaaa`, branch `sync/upstream-2026-10-08`)
+- **Range:** `64f3b5811..8fe49bd54`, 2275 upstream commits; CCrew side had 22
+  commits (through PR #4).
+- **Conflicts:** 18 files. Upstream had moved code CCrew edited, so the CCrew
+  changes were re-applied in the new locations:
+  - macOS Claude sandbox skip (PR #4, §2.2): `acp/client.py` → `acp/launch.py`
+    (shared ACP spawn moved there).
+  - Claude CLI session API methods (§4.5): `website/src/api/client.ts` →
+    `website/src/api/client/sessions.ts` (per-domain client split).
+  - Sidebar glyph tint (§3.1): `App.tsx` → `website/src/shell/nav/railChrome.tsx`.
+  - Default port 5490 (§2): small addition to upstream's new
+    `website/electron/host-config.js`, passed from `main.js`.
+  - Electron app name and packaged-files list: same files (`main.js`,
+    `package.json`), both sides kept.
+  - Translation catalogs (12 locales + pseudo-locale): both sides kept; all
+    still parse as JSON.
+- **Verified:** backend reinstalled into `.venv`; flake8 + black clean on edited
+  files; Claude-session, sandbox, backend-card, harness-parity and ACP launch
+  tests 437 passed / 10 skipped. Frontend type check clean, `npm run build`
+  staged into `src/kiro_crew/static/dist`; i18n parity + logo-glyph tests (121)
+  passed. Electron host-config + CCrew identity tests 118 passed / 2 skipped.
+- **Not run:** full test suite (CI), `mypy --platform linux`, desktop `.app`
+  build (must run from a terminal, §8).

@@ -26,6 +26,7 @@ import type { ChatMessage, McpApplyChange, McpServer } from '../../types'
 import { fmtDate } from '../../i18n/format'
 import { Badge, Btn, ContentSkeleton, SearchInput } from '../../components/ui'
 import ErrorNotice from '../../components/ErrorNotice'
+import RestartButton from '../../components/RestartButton'
 import { findReport, type ErrorReport } from '../../utils/errorReport'
 import McpTab from '../overview/McpTab'
 import ProviderLogo, { PROVIDER_LOGO_SLUGS } from './ProviderLogo'
@@ -43,6 +44,12 @@ const MINT_POLL_MS = 2_000
  *  local stat, so this is slow relative to the mint poll — it only has to notice
  *  a grant completed outside the dashboard and keep connected-since fresh. */
 const CONNECTION_STATUS_POLL_MS = 30_000
+
+/** The guide section that shows the oauth_endpoints.json entry a refused
+ *  approval address needs. Linked from the mint_url_rejected feedback via
+ *  `Feedback.help`, so the card's remedy ends in a link rather than a bare path. */
+const OAUTH_ENDPOINT_ALLOWLIST_GUIDE_URL =
+  'https://github.com/kirodotdev/KiroCrew/blob/main/docs/guides/connecting-remote-oauth-mcp-server.md#if-the-host-is-not-recognized-the-oauth-endpoint-allowlist'
 
 export type ConnectionCardState =
   | 'not-connected'
@@ -1385,7 +1392,7 @@ export default function ConnectionsPage({ servicesEnabled = false }: { servicesE
     // Decided BEFORE any setState: a state updater runs on a later render, so
     // collecting side-effect targets inside one leaves them empty at read time.
     const cleared: string[] = []
-    const mintFailures: Array<{ slug: string; reason?: string }> = []
+    const mintFailures: Array<{ slug: string; reason?: string; endpoint?: string }> = []
     const grantedMints: string[] = []
     for (const provider of CONNECTION_PROVIDERS) {
       const pending = locallyWaiting[provider.slug]
@@ -1406,7 +1413,7 @@ export default function ConnectionsPage({ servicesEnabled = false }: { servicesE
           && mint.reason
         )
       ) {
-        mintFailures.push({ slug: provider.slug, reason: mint.reason })
+        mintFailures.push({ slug: provider.slug, reason: mint.reason, endpoint: mint.rejected_endpoint })
       }
       if (outcome.probe) grantedMints.push(provider.slug)
     }
@@ -1433,8 +1440,10 @@ export default function ConnectionsPage({ servicesEnabled = false }: { servicesE
     if (mintFailures.length) {
       setFeedback(current => {
         const next = { ...current }
-        for (const { slug, reason } of mintFailures) {
+        for (const { slug, reason, endpoint } of mintFailures) {
           let error: string
+          let detail: string | undefined
+          let help: Feedback['help']
           switch (reason) {
             case 'mint_timeouterror':
               error = t('pages.connectionsPage.mint_failure_timed_out')
@@ -1446,7 +1455,19 @@ export default function ConnectionsPage({ servicesEnabled = false }: { servicesE
               error = t('pages.connectionsPage.mint_failure_server_absent')
               break
             case 'mint_url_rejected':
-              error = t('pages.connectionsPage.mint_failure_url_rejected')
+              // Name WHICH endpoint was refused when the backend could reduce it
+              // to a copy-ready host/path. The error line stays one sentence;
+              // the oauth_endpoints.json remedy rides `detail` (its own line)
+              // and the guide rides `help` (a link), so the alarm text does not
+              // swallow the instructions. Without an endpoint the card keeps
+              // its unnamed message rather than show a remedy that cannot work.
+              if (endpoint) {
+                error = t('pages.connectionsPage.mint_failure_url_rejected_endpoint', { endpoint })
+                detail = t('pages.connectionsPage.mint_failure_url_rejected_endpoint_detail', { endpoint })
+                help = { href: OAUTH_ENDPOINT_ALLOWLIST_GUIDE_URL }
+              } else {
+                error = t('pages.connectionsPage.mint_failure_url_rejected')
+              }
               break
             default:
               error = t('pages.connectionsPage.mint_failure_unknown')
@@ -1454,6 +1475,8 @@ export default function ConnectionsPage({ servicesEnabled = false }: { servicesE
           next[slug] = {
             kind: 'error',
             text: t('pages.connectionsPage.action_failed', { error }),
+            ...(detail ? { detail } : {}),
+            ...(help ? { help } : {}),
           }
         }
         return next
@@ -1813,33 +1836,49 @@ export default function ConnectionsPage({ servicesEnabled = false }: { servicesE
 
   return (
     <section className="min-w-0" aria-label={t('pages.connectionsPage.connections')}>
-      <div className="mb-4 flex border-b border-border" role="tablist" aria-label={t('pages.connectionsPage.connection_views')}>
-        <button
-          id="connections-services-tab"
-          type="button"
-          role="tab"
-          aria-selected={activeTab === 'services'}
-          aria-controls="connections-services-panel"
-          tabIndex={activeTab === 'services' ? 0 : -1}
-          onClick={() => selectTab('services')}
-          onKeyDown={onTabKeyDown}
-          className={`flex items-center gap-1.5 border-b-2 px-3 py-2 text-[13px] font-medium transition-colors ${activeTab === 'services' ? 'border-accent text-accent' : 'border-transparent text-muted hover:text-text'}`}
-        >
-          <Link2 className="h-4 w-4" aria-hidden="true" /> {t('pages.connectionsPage.services')}
-        </button>
-        <button
-          id="connections-mcp-tab"
-          type="button"
-          role="tab"
-          aria-selected={activeTab === 'mcp-servers'}
-          aria-controls="connections-mcp-panel"
-          tabIndex={activeTab === 'mcp-servers' ? 0 : -1}
-          onClick={() => selectTab('mcp-servers')}
-          onKeyDown={onTabKeyDown}
-          className={`flex items-center gap-1.5 border-b-2 px-3 py-2 text-[13px] font-medium transition-colors ${activeTab === 'mcp-servers' ? 'border-accent text-accent' : 'border-transparent text-muted hover:text-text'}`}
-        >
-          <Server className="h-4 w-4" aria-hidden="true" /> {t('pages.connectionsPage.mcp_servers')}
-        </button>
+      {/* Apply & Restart lives here because this is where MCP server changes
+          are made: a newly enabled server reaches a chat that is already
+          running only after its session is relaunched. Outside the tablist so
+          the tab roles stay a clean pair. The muted line beside it says what
+          restarts and what is kept BEFORE the click — "Restart" alone reads as
+          "interrupts whatever is running", and the confirm is too late for the
+          reader deciding whether to press at all. */}
+      {/* Narrow-first: at 320px the tablist, the hint and the button cannot
+          share one row, so they stack (tabs, then the restart controls beneath
+          them) and only join into one header band from `sm` up. */}
+      <div className="mb-4 flex flex-col gap-2 border-b border-border sm:flex-row sm:items-center sm:justify-between sm:gap-3">
+        <div className="flex" role="tablist" aria-label={t('pages.connectionsPage.connection_views')}>
+          <button
+            id="connections-services-tab"
+            type="button"
+            role="tab"
+            aria-selected={activeTab === 'services'}
+            aria-controls="connections-services-panel"
+            tabIndex={activeTab === 'services' ? 0 : -1}
+            onClick={() => selectTab('services')}
+            onKeyDown={onTabKeyDown}
+            className={`flex items-center gap-1.5 border-b-2 px-3 py-2 text-[13px] font-medium transition-colors ${activeTab === 'services' ? 'border-accent text-accent' : 'border-transparent text-muted hover:text-text'}`}
+          >
+            <Link2 className="h-4 w-4" aria-hidden="true" /> {t('pages.connectionsPage.services')}
+          </button>
+          <button
+            id="connections-mcp-tab"
+            type="button"
+            role="tab"
+            aria-selected={activeTab === 'mcp-servers'}
+            aria-controls="connections-mcp-panel"
+            tabIndex={activeTab === 'mcp-servers' ? 0 : -1}
+            onClick={() => selectTab('mcp-servers')}
+            onKeyDown={onTabKeyDown}
+            className={`flex items-center gap-1.5 border-b-2 px-3 py-2 text-[13px] font-medium transition-colors ${activeTab === 'mcp-servers' ? 'border-accent text-accent' : 'border-transparent text-muted hover:text-text'}`}
+          >
+            <Server className="h-4 w-4" aria-hidden="true" /> {t('pages.connectionsPage.mcp_servers')}
+          </button>
+        </div>
+        <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1.5 pb-2 sm:justify-end sm:pb-1.5">
+          <span className="min-w-0 max-w-[34rem] text-[11.5px] leading-snug text-muted">{t('components.restartButton.beside_hint')}</span>
+          <RestartButton />
+        </div>
       </div>
 
       {activeTab === 'services' ? (

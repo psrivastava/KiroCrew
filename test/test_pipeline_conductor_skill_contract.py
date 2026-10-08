@@ -283,7 +283,7 @@ class TestClaimPreflightIsDocumented:
         assert "not a bare cross-reference" in preflight
         assert "a mention decides nothing" in preflight
 
-    def test_the_five_checks_are_all_named(self):
+    def test_the_six_checks_are_all_named(self):
         preflight = _skill_section(self.HEADING)
         for check in (
             "merged_prs",
@@ -291,6 +291,7 @@ class TestClaimPreflightIsDocumented:
             "prose_claim",
             "symbol_on_base",
             "recency",
+            "forge_claim",
         ):
             assert check in preflight, check
 
@@ -299,7 +300,22 @@ class TestClaimPreflightIsDocumented:
         against a shared rate limit, so it is not part of the contract."""
         preflight = _skill_section(self.HEADING)
         assert "closedByPullRequestsReferences" not in preflight
-        assert "Five checks" in preflight
+        assert "Six checks" in preflight
+
+    def test_a_forge_claim_is_honoured_with_or_without_an_assignee(self):
+        """A ``claimed`` label from another pipeline must not read as CLAIM
+        when the item has no assignee. The skill names labels and assignees the
+        cross-operator lock, so the preflight has to read both, either alone,
+        and the skill has to say so where the conductor reads the verdicts."""
+        preflight = _flat(_skill_section(self.HEADING))
+        assert "`forge_claim`" in preflight
+        assert "**skip** `forge-claim`" in preflight
+        assert "either field alone is a claim" in preflight
+        # Our own atomic claim must not read as somebody else's, or a conductor
+        # re-checking an item it holds is told to abandon it.
+        assert "your own atomic claim" in preflight
+        # And the CLOSE for an already-fixed item is not hidden behind the SKIP.
+        assert "open, claimed and already fixed still reads close" in preflight
 
     def test_symbol_absence_alone_does_not_veto(self):
         """Unconditionally, that check parks every feature request naming a
@@ -1203,13 +1219,20 @@ class TestAdmissionIsSizedOnDelivery:
         assert "`mv`" in admission
 
     def test_the_banned_pytest_rule_is_described_as_the_code_implements_it(self):
-        """The rule flags a run whose worker count was not explicitly chosen. It
-        is NOT "an unbounded -n", and a bare pytest is not the safe form: it
-        inherits the project's addopts."""
+        """The rule flags a run whose worker pool bypasses the budget: an explicit
+        numeric ``-n`` of two or more. ``auto`` and a bare pytest are the budgeted
+        forms (the bare one inherits ``-n auto`` from ``addopts``) and are quiet, as
+        are the single-process ``-n0`` / ``-n 1``."""
         admission = _flat(_skill_section(self.HEADING))
-        assert "not explicitly chosen" in admission
-        assert "bare `pytest` is therefore flagged" in admission
+        assert "bypasses the budget" in admission
+        assert "two or more" in admission
+        assert "bare `pytest` are quiet" in admission
         assert "inherits the project's `addopts`" in admission
+        assert "`-n0` and `-n 1` are quiet" in admission
+        assert "last one wins" in admission
+        # The inverted sense, which the admission must not describe.
+        assert "not explicitly chosen" not in admission
+        assert "bare `pytest` is therefore flagged" not in admission
 
     def test_the_banned_response_is_keyed_on_four_ownership_classes(self):
         """Keying it on one actionable-or-not boolean forces an unclassified line
@@ -1379,7 +1402,9 @@ class TestWorkOrderBriefClauses:
         would make the mandatory gate raise ``ModuleNotFoundError`` on every push
         -- a fleet-wide push refusal. The clause carries the exception and its
         reason, because an unexplained omission gets 'fixed' back in."""
-        gate_scripts = REPO_ROOT / "src/kiro_crew/builtin_skills/kirocrew-dev/prepare-pr/scripts"
+        gate_scripts = (
+            REPO_ROOT / "src/kiro_crew/builtin_skills/kirocrew-dev/kirocrew-prepare-pr/scripts"
+        )
         preflight = (gate_scripts / "preflight.py").read_text(encoding="utf-8")
         assert "from push_guard import" in preflight, "the sibling import this guards is gone"
         brief = _flat(_skill_section(self.HEADING))
@@ -1387,7 +1412,7 @@ class TestWorkOrderBriefClauses:
         assert "modulenotfounderror" in brief
 
     def test_the_push_gate_checks_the_tree_it_claims_to_check(self):
-        """``push_guard.py`` inspects base and commit structure, never the index,
+        """``push_guard.py`` checks the INDEX against HEAD but never the worktree,
         so the clause has to demand the clean tree itself -- otherwise it promises
         a check no mandated script performs and unstaged work reaches the PR."""
         brief = _flat(_skill_section(self.HEADING))
@@ -1428,7 +1453,8 @@ class TestWorkOrderBriefClauses:
         dependency runs skill-prose to skill-script and not to any one
         repository's CI."""
         script = (
-            REPO_ROOT / "src/kiro_crew/builtin_skills/kirocrew-dev/prepare-pr/scripts/push_guard.py"
+            REPO_ROOT
+            / "src/kiro_crew/builtin_skills/kirocrew-dev/kirocrew-prepare-pr/scripts/push_guard.py"
         ).read_text(encoding="utf-8")
         declared = re.search(r"^DEFAULT_MAX_AHEAD = (\d+)", script, re.M)
         assert declared, "DEFAULT_MAX_AHEAD not found in push_guard.py"
@@ -1439,6 +1465,26 @@ class TestWorkOrderBriefClauses:
             f"brief says the script defaults to {stated.group(1)} but "
             f"DEFAULT_MAX_AHEAD is {declared.group(1)}"
         )
+
+    def test_the_briefs_refusal_codes_track_the_script(self):
+        """The clause lists the codes that mean REFUSED. The index refusal is a
+        named constant in the script; a brief that drops it would read 41 as an
+        unknown code, so the number is asserted against the script."""
+        script = (
+            REPO_ROOT
+            / "src/kiro_crew/builtin_skills/kirocrew-dev/kirocrew-prepare-pr/scripts/push_guard.py"
+        ).read_text(encoding="utf-8")
+        declared = re.search(r"^EXIT_FOREIGN_INDEX = (\d+)", script, re.M)
+        assert declared, "EXIT_FOREIGN_INDEX not found in push_guard.py"
+        brief = _flat(_skill_section(self.HEADING))
+        assert (
+            f"`{declared.group(1)}` the gate refused" in brief
+        ), "the brief does not list the index refusal code"
+        assert "push_guard.py --commit" in brief, "the brief does not prescribe commits by name"
+        # The squash counts the commits it is about to collapse, so the PR's
+        # own ceiling there would refuse exactly the branches that need it.
+        assert "--max-ahead {max_commits} --squash" not in brief
+        assert "--squash" in brief and "--require-single-on-base" in brief
 
     def test_the_suite_wrapper_ban_excludes_the_push_gate(self):
         """The ban and the gate live in the same brief, and the ban is the more

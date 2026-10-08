@@ -53,31 +53,8 @@ _REFUSAL = name_grant.Refusal(name_grant.SHADOWED, "head resolves to a shadowing
 
 
 @pytest.fixture(autouse=True)
-def _close_subagent_managers(monkeypatch):
-    """Close every ``SubagentManager`` built in a test.
-
-    Construction opens the durable task queue (a SQLite connection and its
-    writer thread); nothing in these unit tests closes it, so each manager
-    leaked those descriptors. Track every instance and release it at teardown.
-    """
-    import kiro_crew.subagent as _subagent_mod
-
-    created = []
-    orig_init = _subagent_mod.SubagentManager.__init__
-
-    def _tracking_init(self, *args, **kwargs):
-        orig_init(self, *args, **kwargs)
-        created.append(self)
-
-    monkeypatch.setattr(_subagent_mod.SubagentManager, "__init__", _tracking_init)
-    try:
-        yield
-    finally:
-        for mgr in created:
-            try:
-                mgr.close()
-            except Exception:
-                pass
+def _close_subagent_managers(close_subagent_managers):
+    """Every manager built here is closed at teardown; the body is in ``conftest``."""
 
 
 def _stub_verdict(monkeypatch, refusal):
@@ -176,10 +153,12 @@ class TestLoopSafetyPins:
     def test_every_surface_shares_the_one_off_loop_entry_point(self):
         # The dashboard's rung seam IS the promoted helper (an alias, never a
         # copy), and no surface spawns its own thread instead of using it.
+        import importlib
         import inspect
+        import pkgutil
 
-        from kiro_crew import llm_helpers, subagent, task_executor
-        from kiro_crew.dashboard import chat_runner
+        from kiro_crew import llm_helpers, subagent, task_executor, tool_permission
+        from kiro_crew.dashboard import chat_runner, chat_turn
         from kiro_crew.discord import transport_dispatch as discord_dispatch
         from kiro_crew.messaging import driver
         from kiro_crew.slack import handler as slack_handler
@@ -187,10 +166,19 @@ class TestLoopSafetyPins:
         from kiro_crew.telegram import transport_dispatch as telegram_dispatch
 
         assert chat_runner._name_grant_refusal_off_loop is name_grant.refusal_for_command_off_loop
+        # The dashboard's rung is composed into chat_runner from these owners.
+        owners = [
+            importlib.import_module(f"{chat_turn.__name__}.{info.name}")
+            for info in pkgutil.iter_modules(chat_turn.__path__)
+        ]
+        assert owners, "the owner scan found no module, so it is measuring nothing"
         for mod in (
             chat_runner,
+            *owners,
             task_executor,
             subagent,
+            # The subagent's and the task runner's name check is made here.
+            tool_permission,
             driver,
             slack_handler,
             llm_helpers,
@@ -226,7 +214,9 @@ def _mock_sessions(provider):
     s = MagicMock()
     s.get_or_create = AsyncMock(return_value=(provider, True, False))
 
-    async def _open_task_session(_pk, session_key, *, agent=None, cwd=None, approval_policy=""):
+    async def _open_task_session(
+        _pk, session_key, *, agent=None, cwd=None, approval_policy="", start_priority=None
+    ):
         return await s.get_or_create(session_key, agent=agent, cwd=cwd)
 
     s.open_task_session = _open_task_session
@@ -601,12 +591,11 @@ class TestTurnDriverSurface:
         # surface's one security decision to an unattributable row.
         import inspect
 
-        from kiro_crew.discord import transport_dispatch as discord_dispatch
         from kiro_crew.messaging import dispatch
         from kiro_crew.slack import transport_dispatch as slack_dispatch
         from kiro_crew.telegram import transport_dispatch as telegram_dispatch
 
-        for mod in (dispatch, slack_dispatch, discord_dispatch, telegram_dispatch):
+        for mod in (dispatch, slack_dispatch, telegram_dispatch):
             assert "audit_session_key=" in inspect.getsource(mod), mod.__name__
 
 

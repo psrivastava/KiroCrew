@@ -15,12 +15,13 @@ stopped request.
 
 `voice_reply.resolve_system_tts()` returns `(engine, binary)` for the host:
 `say` on macOS, `sapi` (Windows PowerShell 5.1 driving `System.Speech`) on
-Windows, `espeak-ng` on everything else when it is installed. Resolution goes
-through `platform_compat.trusted_system_bin`, not `PATH`, so a shim in an
-agent-writable directory cannot be handed LLM text. Linux is the one platform
-where the answer can be `None` — a stock Ubuntu Desktop ships the espeak-ng
-library and data but not the CLI — and that is reported as unavailable rather
-than papered over.
+Windows, and `espeak-ng` on other platforms, with the legacy `espeak` binary
+accepted as a fallback under the same engine identity. Resolution goes through
+`platform_compat.trusted_system_bin`, not `PATH`, so a shim in an
+agent-writable directory cannot be handed LLM text. The answer is `None` on any
+platform whose engine binary is missing; Linux is the common case — a stock
+Ubuntu Desktop ships the espeak-ng library and data but not the CLI — and that is
+reported as unavailable rather than papered over.
 
 Resolution is a handful of directory stats, and a stat is not bounded: a fixed
 directory on a stalled network or fuse mount blocks, and one loop serves every
@@ -135,17 +136,19 @@ Telegram and dashboard paths. Three rules:
 | Voice endpoints | `dashboard.chat_voice.api_voice_config()`, `api_voice_synthesize()`, `api_voice_cancel()`, `api_voice_voices()`, and `api_voice_system_voices()` | Read and persist configuration, synthesize and interrupt dashboard speech, and return the Polly and built-in-engine catalogues. |
 | Provider implementation | `voice_reply.synthesize_speech()`, `streaming_piper_reply()`, `streaming_voice_reply()`, and `stitch_mp3s()` | Redacts text, selects a provider, streams local PCM, and joins completed Polly chunks. |
 | Resident local voice | `piper_runtime.PiperRuntime`, `piper_worker.serve()` | Owns one sandboxed Piper model and serial framed requests, with cancellation, idle, model-change, and shutdown cleanup. |
-| Streaming playback | `website/src/hooks/useWebSocket.ts`, `website/src/lib/voicePlayback.ts` | Detects speech boundaries, coalesces pending requests, schedules PCM on one audio clock, and handles interruption. |
+| Streaming playback | `website/src/hooks/websocket/voicePlayback.ts`, `website/src/lib/voicePlayback.ts` | Detects speech boundaries, coalesces pending requests, schedules PCM on one audio clock, and handles interruption. `website/src/hooks/useWebSocket.ts` composes it and routes the `voice_*` frames and the stream and turn boundaries to it. |
 | Playback failures | `website/src/components/VoicePlaybackNotice.tsx` | Displays localized playback or provider failures and retains their machine code in the error report. |
 | Settings | `website/src/pages/settings/VoicePanel.tsx` | Updates auto-speak, provider, and the selected provider's settings; fetches each provider's voice catalogue only while that provider is selected. |
-| Slack reply | `slack.handler.handle_message()` and `_safe_voice_reply()` | Starts a background provider-aware voice reply when thread, global, or voice-input settings allow it. |
+| Slack reply | `slack.handler.handle_message()`, through `_reply_by_voice()` and `_safe_voice_reply()` (`slack/handler_runtime/voice.py`) | Starts a background provider-aware voice reply when thread, global, or voice-input settings allow it. |
 
 ## Dashboard auto-speak
 
-`useWebSocket` buffers `chat_chunk` text and, after it updates the Redux
-streaming message, scans the active slot for completed sentence boundaries. It
-submits only text beyond `voiceProgressRef.spokenLen` through
-`enqueueVoiceSynthesis()`. The progress record is keyed by slot and message
+The socket's chat-stream buffer (`website/src/hooks/websocket/streamBuffers.ts`)
+batches `chat_chunk` text and, after it updates the Redux streaming message,
+hands the active slot to the playback owner
+(`website/src/hooks/websocket/voicePlayback.ts`), which scans it for completed
+sentence boundaries. It submits only text beyond `voiceProgressRef.spokenLen`
+through `enqueueVoiceSynthesis()`. The progress record is keyed by slot and message
 identity: this prevents an old segment or a background slot from replaying text
 or resetting the active response.
 
@@ -181,8 +184,9 @@ behind playback, the next chunk starts at the current clock with a small
 scheduling margin. MP3 and browsers without Web Audio use a sequential media
 element queue. Polly therefore retains media-element clip-boundary gaps; the
 continuous PCM clock applies to local WAV playback. Polly also shares the
-newline/CJK sentence splitter: multiline or CJK replies can produce more smaller
-requests than the previous Latin-punctuation-only splitter. Text content and AWS
+newline/CJK sentence splitter, which splits at newlines and CJK punctuation as
+well as Latin punctuation, so multiline or CJK replies produce more, smaller
+requests. Text content and AWS
 consent remain unchanged; this is not a claim of lower Polly cost or latency.
 A playback generation prevents a decode that finishes after stop
 from scheduling obsolete audio.
@@ -334,7 +338,8 @@ before any audio has started. `useVoiceInput` also dispatches it when an actual
 batch or streaming recording starts, before microphone acquisition, so the
 recognizer does not capture ongoing synthesized speech. Hover prewarming does
 not interrupt playback. Clicking Read aloud while audio plays stops it.
-`useWebSocket` maps the event to `stopVoice()`, which stops scheduled PCM sources,
+The playback owner (`website/src/hooks/websocket/voicePlayback.ts`) maps the
+event to `stopVoice()`, which stops scheduled PCM sources,
 pauses an active media element, revokes queued blob URLs, invalidates pending
 decodes and synthesis requests, and sets `voiceMutedRef`.
 
@@ -360,16 +365,23 @@ synthesis so simultaneous local requests cannot load unbounded models.
 ## Configuration and API
 
 Configuration is stored under `voice_reply` in the Crew configuration file.
-`slack.handler.load_voice_reply_config()` loads the live `_VoiceConfig`, and
-`api_voice_config()` merges a partial update back into that section rather than
-replacing it. The merge preserves voice settings owned by other channels.
+`slack.handler.load_voice_reply_config()` (defined in `slack/handler_runtime/voice.py`)
+loads the live `_VoiceConfig`, which stays module state of `slack/handler.py`. A
+`PUT /api/voice/config` validates the whole patch first, then persists it as a
+locked delta read-modify-write (`run_config_write` → `update_config_locked`)
+that sets only the named keys inside `voice_reply`, so voice settings owned by
+other channels and every other section are kept. Only after the write lands is
+the patch applied to the live `_vc`, so a failed write never leaves the gateway
+running a value the file does not hold. A failed write answers non-2xx with a
+`code`: 500 `config_corrupt` (config.json unreadable), 400
+`config_write_refused`, or 500 `config_write_failed`; success is `{"ok": true}`.
 
 | Setting | Meaning |
 |---|---|
 | `provider` | Resolved by `voice_reply.resolve_configured_provider()` for every reader; invalid values fall back to `voice_reply.DEFAULT_PROVIDER`, and an unnamed provider beside a configured `piper_model` keeps Piper. |
 | `enabled` | Enables global Slack voice replies. |
 | `auto_speak` | Enables dashboard auto-speak; `api_voice_config()` exposes it as `autoSpeak`. |
-| `voice_id`, `engine`, `pitch` | Polly synthesis settings, also usable as request overrides for the dashboard synthesis endpoint. |
+| `voice_id`, `engine`, `pitch` | Polly synthesis settings. The dashboard synthesis endpoint accepts per-request overrides on the Polly path only, as body fields `voice` (not `voice_id`), `engine`, `rate` and `pitch`. |
 | `rate` | Speech rate as a percentage. Shared by Polly and the built-in engine, which converts it to words per minute or to SAPI's `-10..10`. |
 | `system_voice` | The built-in engine's own voice selector; empty means the OS default voice. |
 | `aws_profile`, `region` | Passed to the AWS CLI by the Polly provider. |
@@ -412,13 +424,15 @@ spawning the AWS CLI. It returns no audio when consent is absent, which lets its
 callers retain their text response rather than spending through an unattended
 path.
 
-`_synthesize_polly()`, `_synthesize_piper()`, and `streaming_piper_reply()` run their commands through
-`wrap_argv_async(..., _prepare=wrap_argv)` and catch
-`SandboxUnavailableError` separately from provider failures. They log the
-sandbox error kind and its own message, then **re-raise**. The distinction is
-load-bearing because only the sandbox layer can distinguish a missing backend
-from transient pressure or an existing outer sandbox, and therefore provides the
-applicable remedy.
+`_synthesize_polly()` and `streaming_piper_reply()` run their commands through
+`wrap_argv_async(..., _prepare=wrap_argv)`. `_synthesize_piper()` instead delegates
+to `_run_tts_subprocess()`, which uses `sandboxed_spawn_argv_async()` and the
+credential-scrubbed child environment. Those chokepoints catch
+`SandboxUnavailableError` separately from provider failures, log the sandbox
+error kind and its own message, then **re-raise**. The distinction is load-bearing
+because only the sandbox layer can distinguish a missing backend from transient
+pressure or an existing outer sandbox, and therefore provides the applicable
+remedy.
 
 Re-raising rather than returning `None` is what lets that remedy reach a person.
 A refusal collapsed into the generic "no audio" result is indistinguishable from
@@ -459,20 +473,21 @@ surface can show:
   The `piper` provider takes neither: it has its own streaming path whose runtime
   converts the refusal into `VoiceSynthesisError("voice_sandbox_unavailable")`,
   which carries the sandbox's own prose to the HTTP caller but raises no
-  notification. Recovering the note there means reading the preserved cause, and
-  is deliberately not part of this change.
+  notification; recovering the note there would mean reading the preserved cause.
 - `synthesize_and_deliver()` has no channel for prose, so it still reports "no
   audio" and catches the refusal explicitly so it cannot escape as an unhandled
-  error on a voice reply. Both current callers then drop that signal — Slack's
+  error on a voice reply. Both callers drop that signal — Slack's
   `_safe_voice_reply` discards the returned bool and Telegram only logs it — so a
-  refusal is still silent on those surfaces. Closing that is a separate change to
-  those callers, not to this function.
+  refusal is silent on those surfaces; the gap is in those callers, not in this
+  function.
 
 ## Slack voice replies
 
-`slack.handler` accepts `!voice` thread commands for enabling and disabling a
+`slack.handler` accepts `!voice` thread commands (`_bang_voice`,
+`slack/handler_runtime/commands.py`) for enabling and disabling a
 thread, toggling global replies, and choosing a voice, engine, speed, or pitch.
-`handle_message()` starts `_safe_voice_reply()` as a background task when a
+`handle_message()` calls `_reply_by_voice()` (`slack/handler_runtime/voice.py`),
+which starts `_safe_voice_reply()` as a background task when a
 thread or global setting enables replies, or when voice-input reply settings
 allow a transcribed voice message to receive audio. `_safe_voice_reply()` calls
 the provider-aware `voice_reply.voice_reply()` path, so Slack replies follow

@@ -17,14 +17,25 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { renderHook, render as rtlRender, act } from '@testing-library/react'
 import { type RefObject } from 'react'
-import { readFileSync } from 'node:fs'
+import { readFileSync, readdirSync } from 'node:fs'
+import { join } from 'node:path'
 
 // Resolved from the vitest cwd (website/), used by the chokepoint source guard.
-const HOOK_SRC = 'src/hooks/virtualizer/useVirtualChat.ts'
+// The virtualizer is a facade over composed owners, so the source guards below
+// read EVERY module in its directory: a new owner file is covered the moment it
+// exists, and a raw write cannot escape the guard by moving to another file.
+const VIRTUALIZER_DIR = 'src/hooks/virtualizer'
+const CHOKEPOINT_SRC = join(VIRTUALIZER_DIR, 'followPolicy.ts')
+const virtualizerSources = (): { file: string; src: string }[] =>
+  readdirSync(VIRTUALIZER_DIR)
+    .filter((f) => /\.tsx?$/.test(f))
+    .sort()
+    .map((f) => ({ file: f, src: readFileSync(join(VIRTUALIZER_DIR, f), 'utf8').replace(/\r\n/g, '\n') }))
 import { useVirtualChat } from '../hooks/virtualizer/useVirtualChat'
 import {
   HEIGHT_SCHEMA_VERSION,
   SCHEMA_VERSION_KEY,
+  TOUCHED_AT_KEY,
 } from '../hooks/virtualizer/HeightCache'
 import type { UseVirtualChatOptions } from '../hooks/virtualizer/types'
 
@@ -372,28 +383,39 @@ describe('useVirtualChat: every scroll write goes through the one chokepoint', (
   // load-bearing). Asserting it at the source level does discriminate: adding a
   // raw write fails this test immediately.
   it('has no raw scrollTop / scrollTo writes outside writeScrollTop', () => {
-    const src = readFileSync(HOOK_SRC, 'utf8')
-    // Isolate the chokepoint body — the one place raw writes are allowed.
-    const chokeStart = src.indexOf('const writeScrollTop = useCallback(')
+    const choke = readFileSync(CHOKEPOINT_SRC, 'utf8').replace(/\r\n/g, '\n')
+    // The chokepoint body — the one place raw writes are allowed — lives in the
+    // follow owner. Its declaration must exist there exactly once.
+    const chokeStart = choke.indexOf('const writeScrollTop = useCallback(')
     expect(chokeStart).toBeGreaterThan(-1)
-    const chokeEnd = src.indexOf('\n  )', chokeStart)
-    const outside = src.slice(0, chokeStart) + src.slice(chokeEnd)
+    expect(choke.indexOf('const writeScrollTop = useCallback(', chokeStart + 1)).toBe(-1)
+    const chokeEnd = choke.indexOf('\n  )', chokeStart)
+    expect(chokeEnd).toBeGreaterThan(chokeStart)
 
-    const rawWrites = outside
-      .split('\n')
-      .map((line, i) => ({ line: line.trim(), n: i + 1 }))
-      .filter(({ line }) => !line.startsWith('//'))
-      .filter(({ line }) => /\.scrollTop\s*(=|\+=|-=)/.test(line) || /\.scrollTo\(\{/.test(line))
+    const rawWrites: string[] = []
+    for (const { file, src } of virtualizerSources()) {
+      const outside = file === 'followPolicy.ts' ? src.slice(0, chokeStart) + src.slice(chokeEnd) : src
+      outside
+        // Prose that names a write (`el.scrollTop = target` in a doc) is not one.
+        // Only a block that OPENS a line is stripped: a `/*` inside a `//`
+        // comment or after code must not open a span that hides real code.
+        .replace(/^\s*\/\*[\s\S]*?\*\//gm, '')
+        .split('\n')
+        .map((line) => line.trim())
+        .filter((line) => !line.startsWith('//'))
+        .filter((line) => /\.scrollTop\s*(=|\+=|-=)/.test(line) || /\.scrollTo\(\{/.test(line))
+        .forEach((line) => rawWrites.push(`${file}: ${line}`))
+    }
 
     expect(
-      rawWrites.map((r) => r.line),
+      rawWrites,
       'raw scroll writes must go through writeScrollTop(el, top, behavior, accounting)',
     ).toEqual([])
   })
 
   it('states an accounting disposition at every call site', () => {
-    const src = readFileSync(HOOK_SRC, 'utf8')
-    const calls = [...src.matchAll(/writeScrollTop\(\s*el[^)]*\)/g)].map((m) => m[0])
+    const calls = virtualizerSources().flatMap(({ src }) =>
+      [...src.matchAll(/writeScrollTop\(\s*el[^)]*\)/g)].map((m) => m[0]))
     // Every call site (excluding the declaration) passes 'pin' or 'release'.
     expect(calls.length).toBeGreaterThanOrEqual(5)
     for (const c of calls) {
@@ -757,13 +779,14 @@ describe('useVirtualChat: height-cache eviction cap is wired to the row count', 
     for (let i = 0; i < n; i++) blob[`m${i}`] = 40 + (i % 5)
     window.localStorage.setItem(`vc_heights_${sessionId}`, JSON.stringify(blob))
   }
-  // HEIGHTS only. The schema stamp shares the blob but is not a row, and
-  // counting it would put every cap assertion one off the cap it names.
+  // HEIGHTS only. The schema stamp and the lastTouched stamp share the blob but
+  // are not rows, and counting them would put every cap assertion off the cap
+  // it names.
   const persistedCount = (sessionId: string) => {
     const raw = window.localStorage.getItem(`vc_heights_${sessionId}`)
     if (!raw) return 0
     return Object.keys(JSON.parse(raw) as Record<string, number>)
-      .filter((k) => k !== SCHEMA_VERSION_KEY).length
+      .filter((k) => k !== SCHEMA_VERSION_KEY && k !== TOUCHED_AT_KEY).length
   }
   // Mount, then push ONE real measurement through the hook's own measure path.
   // That matters: flush() skips when the cache isn't dirty, so without a write

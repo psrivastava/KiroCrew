@@ -33,7 +33,7 @@ from kiro_crew.safety_override import safety_override
 from kiro_crew.security import is_sensitive_path, redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
 from kiro_crew.session import BACKGROUND_KEY
-from kiro_crew.subagent import compute_max_subagents
+from kiro_crew.subagent import compute_memory_sized_parallel_cap
 from kiro_crew.task_executor import (
     build_task_prompt,
     execute_single_task,
@@ -93,6 +93,7 @@ if TYPE_CHECKING:
     from kiro_crew.taskq.adapters import runner as _runner_adapter
 
 from kiro_crew.learn import Lesson
+from kiro_crew.start_priority import StartPriority
 
 logger = logging.getLogger(__name__)
 
@@ -113,7 +114,9 @@ TaskRun = Project
 
 _MAX_REPLAN = MAX_REPLAN
 _MAX_TOTAL_TASKS = MAX_TOTAL_TASKS
-_MAX_PARALLEL_TASKS = 3  # ctor fallback default when compute_max_subagents fails; live cap is self._max_parallel_steps
+_MAX_PARALLEL_TASKS = (
+    3  # ctor fallback when the memory-sized cap fails; live cap is self._max_parallel_steps
+)
 _MAX_CONCURRENT_TASKS = 3  # max simultaneous task runs
 _SESSION_PREFIX = SESSION_PREFIX
 _STALL_TIMEOUT = STALL_TIMEOUT
@@ -459,13 +462,16 @@ class TaskRunner:
         self._global_timeout = global_timeout
         self._token_budget = token_budget
         self._on_approval = on_approval
-        # Concurrency cap for parallel task groups. ``compute_max_subagents`` is
-        # the host-safe ceiling (derived from ``agent.subagent_auto_max`` and
-        # clamped to host memory/CPU headroom) — it exists to prevent OOM, so it
-        # is always the upper bound. A positive ``taskrunner.max_parallel_steps``
-        # may only lower it (intentional throttling for cost / rate-limits);
-        # ``0`` (or unset) means "use the computed ceiling". An explicit value can
-        # never raise concurrency above the host-safe maximum.
+        # Concurrency cap for parallel task groups.
+        # ``compute_memory_sized_parallel_cap`` is the host-safe ceiling (host
+        # memory over the per-agent cost, clamped to ``[3,
+        # agent.subagent_auto_max]``) -- it exists to prevent OOM, because no
+        # per-start memory floor prices a TaskRunner step the way it prices a
+        # subagent start, so it is always the upper bound. A positive
+        # ``taskrunner.max_parallel_steps`` may only lower it (intentional
+        # throttling for cost / rate-limits); ``0`` (or unset) means "use the
+        # computed ceiling". An explicit value can never raise concurrency above
+        # the host-safe maximum.
         try:
             cfg: KiroCrewConfig | None = KiroCrewConfig.load()
         except Exception:
@@ -771,7 +777,9 @@ class TaskRunner:
     def _clamp_parallel_steps(requested: int | None, cfg: KiroCrewConfig | None) -> int:
         """Bound *requested* by the host-safe ceiling; ``0``/``None`` means the ceiling."""
         try:
-            auto_cap = compute_max_subagents(cfg) if cfg is not None else _MAX_PARALLEL_TASKS
+            auto_cap = (
+                compute_memory_sized_parallel_cap(cfg) if cfg is not None else _MAX_PARALLEL_TASKS
+            )
         except Exception:
             auto_cap = _MAX_PARALLEL_TASKS
         auto_cap = max(1, auto_cap)
@@ -1079,6 +1087,7 @@ class TaskRunner:
         workflow_source: str = "",
         session_key: str = "",
         execution_context: ExecutionContext | None = None,
+        start_priority: StartPriority = StartPriority.BACKGROUND,
     ) -> Project:
         execution = await capture_admission_execution(
             self._ctx,
@@ -1174,7 +1183,9 @@ class TaskRunner:
             else:
                 try:
                     run.tasks = await asyncio.wait_for(
-                        self._decompose(decompose_input, run.work_dir, task_id),
+                        self._decompose(
+                            decompose_input, run.work_dir, task_id, start_priority=start_priority
+                        ),
                         timeout=180,
                     )
                 except asyncio.TimeoutError:
@@ -1761,7 +1772,7 @@ class TaskRunner:
                 # not a hardcoded batch size. All ready tasks are dispatched at once
                 # and the semaphore caps how many run simultaneously, so a slow task
                 # no longer stalls a whole fixed-size batch. The knob is the single
-                # place to lift concurrency (capped by compute_max_subagents ceiling).
+                # place to lift concurrency (capped by the memory-sized ceiling).
                 results: list[bool | BaseException] = []
                 sem = asyncio.Semaphore(max_parallel_steps)
 
@@ -1972,13 +1983,22 @@ class TaskRunner:
         if not memory_ctx:
             memory_ctx = run.memory.summary()
         err_detail = failed_task.error[:300]
+        # A failed step whose prompt may already have run (Task.resume_hint) must
+        # not come back as fresh work: the new plan starts by inspecting state.
+        may_have_run = (
+            "\n  The failed task's last attempt may already have run part of its "
+            "work: plan a first step that inspects the current state, and do not "
+            "restate that work as new.\n"
+            if failed_task.resume_hint
+            else ""
+        )
         replan_spec = (
             "You are a planning agent. A task in the pipeline failed.\n"
             "Re-plan ONLY the remaining work. Do not repeat completed tasks.\n"
             "Address the failure cause in your new plan.\n\n"
             f"## Original Specification\n\n{run.spec_content}\n\n"
             f"## Completed Tasks\n{completed_summary}\n\n"
-            f"## Failed Task\n- \u274c {failed_task.title}: {err_detail}\n\n"
+            f"## Failed Task\n- \u274c {failed_task.title}: {err_detail}\n{may_have_run}\n"
             f"{memory_ctx}\n\nRe-plan the REMAINING work."
         )
         new_tasks = await self._decompose(replan_spec, run.work_dir, run.task_id)
@@ -2538,6 +2558,8 @@ class TaskRunner:
         spec: str,
         work_dir: str = "",
         task_id: str = "",
+        *,
+        start_priority: StartPriority = StartPriority.BACKGROUND,
     ) -> list[Task]:
         return await decompose(
             spec,
@@ -2546,6 +2568,7 @@ class TaskRunner:
             work_dir=work_dir or str(self._work_dir),
             task_id=task_id,
             agent=self._agent,
+            start_priority=start_priority,
         )
 
     # ── Notifications ──
@@ -2617,6 +2640,12 @@ class TaskRunner:
     # ── Learn from Failures ──
 
     async def _extract_lesson(self, task: Task, run: Project | None = None) -> None:
+        # Global persistence switch (memory.persistence_enabled):
+        # skip BEFORE the LLM call, so a disabled system spends no turn
+        # distilling a lesson it is not allowed to store. Placed ahead of store
+        # resolution so member-private lesson stores are covered too.
+        if not KiroCrewConfig.load().memory.persistence_enabled:
+            return
         try:
             from kiro_crew.memory_stores import UnknownMemoryStore
 
@@ -2913,6 +2942,12 @@ class TaskRunner:
                                 "error": t.error or "",
                                 "result": (t.result or "")[:2000],
                                 "attempts": t.attempts,
+                                # Durable so an ambiguous-delivery resume hint set
+                                # on a crash-recovery retry survives a gateway
+                                # restart; without it a restart in that window
+                                # would restore the task to a verbatim replay of a
+                                # possibly-executed step.
+                                "resume_hint": t.resume_hint or "",
                             }
                             for t in run.tasks
                         ],
@@ -3040,11 +3075,27 @@ class TaskRunner:
         try:
             from kiro_crew.workflow_memory import read_task_snapshot
 
-            items = json.loads(read_task_snapshot(path, public_payload=raw))
+            legacy: list[dict] = []
+            items = json.loads(
+                read_task_snapshot(path, public_payload=raw, legacy_references=legacy)
+            )
         except Exception as exc:
             self._snapshot_recovery_incomplete = True
             logger.error("Failed to read task snapshot (%s)", type(exc).__name__)
             return
+        if legacy:
+            # A row of exactly the pre-release shape is left out of the restored
+            # runs rather than refusing the registry: its payload in the hidden
+            # sidecar is never read, so the task cannot resume. Writes are not
+            # fenced by it, so the next snapshot rewrites the registry without
+            # it; a restart that finds the same rows again logs this once more.
+            logger.warning(
+                "Left out %d task record(s) from a 0.7.0 pre-release (%s); their private "
+                "payloads were not read and those tasks cannot resume. Re-create them to "
+                "run them again.",
+                len(legacy),
+                ", ".join(row["task_id"] for row in legacy),
+            )
         for item in items:
             try:
                 execution_context = execution_from_record(item, required=False)
@@ -3081,6 +3132,7 @@ class TaskRunner:
                         status=TaskStatus(t["status"]),
                         error=t.get("error", ""),
                         result=t.get("result", ""),
+                        resume_hint=t.get("resume_hint", ""),
                         attempts=t.get("attempts", 1),
                         depends_on=t.get("depends_on", []),
                         requires_approval=t.get("requires_approval", False),

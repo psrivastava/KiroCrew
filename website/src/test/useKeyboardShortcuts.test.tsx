@@ -1,5 +1,7 @@
 import React from 'react'
 import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { closeCrewWindow, currentCrewWindow, markCrewWindowShown, openCrewWindow } from '../pages/chat/crew-window/crewWindowStore'
+import * as chatSlice from '../store/chatSlice'
 import { fireEvent, screen, act, render } from '@testing-library/react'
 import { MemoryRouter, useLocation } from 'react-router-dom'
 import { Provider } from 'react-redux'
@@ -8,6 +10,8 @@ import { PANEL_TOGGLE_SHORTCUTS_KEY } from '../lib/panelToggleShortcuts'
 import { matchShortcutEvent, resolveShortcuts } from '../lib/shortcutRegistry'
 import { renderHookWithProviders, createTestStore, renderWithProviders } from './helpers'
 import { consumeComposerRelease } from '../pages/chat/composerFocus'
+import { recordRouteNavigation, _resetRouteHistoryPositionForTest } from '../lib/routeHistoryPosition'
+import { NavigationLeaveGuardProvider, useRegisterNavigationLeaveGuard } from '../components/NavigationLeaveGuard'
 import chatReducer from '../store/chatSlice'
 import dashboardReducer from '../store/dashboardSlice'
 import ShortcutsModal from '../components/ShortcutsModal'
@@ -113,6 +117,48 @@ describe('useKeyboardShortcuts — toggle behavior', () => {
     const event = new KeyboardEvent('keydown', { code: 'KeyW', altKey: true, shiftKey: true, cancelable: true, bubbles: true })
     const prevented = !document.dispatchEvent(event)
     expect(prevented).toBe(true)
+  })
+
+  it('Alt+Shift+W closes an open crew window, never the local session under it', async () => {
+    const store = createTestStore({
+      dashboard: { slots: [{ key: 'slot-1', title: 'Chat 1', messages: 1, running: false }] } as unknown as RootState['dashboard'],
+      chat: { activeSlot: 'slot-1', slotHistory: [] } as unknown as RootState['chat'],
+    })
+    const spy = vi.spyOn(chatSlice, 'deleteSlot')
+    openCrewWindow({ instanceId: 'cd-1', key: 'k1' })
+    const unmark = markCrewWindowShown(closeCrewWindow)
+    try {
+      renderHookWithProviders(
+        () => useKeyboardShortcuts({ onToggleShortcutsModal, onNewChat }),
+        { store },
+      )
+      document.dispatchEvent(new KeyboardEvent('keydown', { code: 'KeyW', altKey: true, shiftKey: true, cancelable: true, bubbles: true }))
+      expect(currentCrewWindow()).toBeNull()
+      expect(spy).not.toHaveBeenCalled()
+    } finally {
+      unmark()
+      closeCrewWindow()
+      spy.mockRestore()
+    }
+  })
+
+  it('Alt+Shift+W runs the shown window\'s own close (an embedded host navigates)', () => {
+    const store = createTestStore({
+      dashboard: { slots: [{ key: 'slot-1', title: 'Chat 1', messages: 1, running: false }] } as unknown as RootState['dashboard'],
+      chat: { activeSlot: 'slot-1', slotHistory: [] } as unknown as RootState['chat'],
+    })
+    const hostClose = vi.fn()
+    const unmark = markCrewWindowShown(hostClose)
+    try {
+      renderHookWithProviders(
+        () => useKeyboardShortcuts({ onToggleShortcutsModal, onNewChat }),
+        { store },
+      )
+      document.dispatchEvent(new KeyboardEvent('keydown', { code: 'KeyW', altKey: true, shiftKey: true, cancelable: true, bubbles: true }))
+      expect(hostClose).toHaveBeenCalledTimes(1)
+    } finally {
+      unmark()
+    }
   })
 
   it('Alt+Shift+W is suppressed when shortcuts are disabled', () => {
@@ -364,6 +410,97 @@ describe('useKeyboardShortcuts — route-history chord', () => {
     act(() => { document.dispatchEvent(event) })
     expect(event.defaultPrevented).toBe(true)
     expect(screen.getByTestId('hist-loc').textContent).toBe('/chat')
+  })
+
+  it('Ctrl+← arms the composer release, so the next press is not eaten by autofocus', () => {
+    // Non-Mac on purpose: the text-field unclaim is platform-wide, so the
+    // arming must be too.
+    consumeComposerRelease()
+    setupAt(['/chat', '/settings'])
+    window.history.replaceState({ idx: 1 }, '', '/settings')
+    const event = new KeyboardEvent('keydown', { code: 'ArrowLeft', key: 'ArrowLeft', ctrlKey: true, cancelable: true, bubbles: true })
+    act(() => { document.dispatchEvent(event) })
+    expect(screen.getByTestId('hist-loc').textContent).toBe('/chat')
+    expect(consumeComposerRelease()).toBe(true)
+  })
+
+  it('Ctrl+→ arms the composer release too', () => {
+    consumeComposerRelease()
+    try {
+      setupAt(['/chat', '/settings'])
+      // Seed a forward frontier: an entry at idx 1 was seen, we now stand at 0.
+      window.history.replaceState({ idx: 1 }, '', '/settings')
+      recordRouteNavigation('PUSH')
+      window.history.replaceState({ idx: 0 }, '', '/chat')
+      const event = new KeyboardEvent('keydown', { code: 'ArrowRight', key: 'ArrowRight', ctrlKey: true, cancelable: true, bubbles: true })
+      act(() => { document.dispatchEvent(event) })
+      expect(event.defaultPrevented).toBe(true)
+      expect(consumeComposerRelease()).toBe(true)
+    } finally {
+      _resetRouteHistoryPositionForTest()
+    }
+  })
+
+  describe('behind the draft ask', () => {
+    function GuardedProbe({ guard }: { guard: () => boolean }) {
+      useRegisterNavigationLeaveGuard(guard)
+      return <Probe />
+    }
+
+    const setupGuarded = (guard: () => boolean) => {
+      const store = createTestStore({
+        dashboard: { slots: [] } as unknown as RootState['dashboard'],
+        chat: { activeSlot: null, slotHistory: [] } as unknown as RootState['chat'],
+      })
+      render(
+        <Provider store={store}>
+          <NavigationLeaveGuardProvider>
+            <MemoryRouter initialEntries={['/chat', '/settings']} initialIndex={1}>
+              <GuardedProbe guard={guard} />
+            </MemoryRouter>
+          </NavigationLeaveGuardProvider>
+        </Provider>,
+      )
+      window.history.replaceState({ idx: 1 }, '', '/settings')
+    }
+
+    const pressBack = () => {
+      const event = new KeyboardEvent('keydown', { code: 'ArrowLeft', key: 'ArrowLeft', ctrlKey: true, cancelable: true, bubbles: true })
+      act(() => { document.dispatchEvent(event) })
+    }
+
+    it('a vetoed step leaves the release unarmed', () => {
+      consumeComposerRelease()
+      setupGuarded(() => false)
+      pressBack()
+      expect(screen.getByTestId('hist-loc').textContent).toBe('/settings')
+      expect(consumeComposerRelease()).toBe(false)
+    })
+
+    it('arms after the ask, so a slow confirm does not expire the one-shot', () => {
+      consumeComposerRelease()
+      const t0 = 1_000_000
+      const now = vi.spyOn(Date, 'now').mockReturnValue(t0)
+      try {
+        // The user takes longer than the one-shot's lifetime to answer.
+        setupGuarded(() => { now.mockReturnValue(t0 + 5000); return true })
+        pressBack()
+        expect(screen.getByTestId('hist-loc').textContent).toBe('/chat')
+        expect(consumeComposerRelease()).toBe(true)
+      } finally {
+        now.mockRestore()
+      }
+    })
+  })
+
+  it('does not arm the release when there is nowhere to go', () => {
+    consumeComposerRelease()
+    setupAt(['/chat'])
+    window.history.replaceState({ idx: 0 }, '', '/chat')
+    const event = new KeyboardEvent('keydown', { code: 'ArrowLeft', key: 'ArrowLeft', ctrlKey: true, cancelable: true, bubbles: true })
+    act(() => { document.dispatchEvent(event) })
+    expect(event.defaultPrevented).toBe(true)
+    expect(consumeComposerRelease()).toBe(false)
   })
 
   it('claims the chord even at the bottom of the stack, so the two affordances agree', () => {
@@ -1541,6 +1678,21 @@ describe('useKeyboardShortcuts — registry chords (conventional defaults + alia
           },
         },
       } as unknown as RootState['chat'],
+    })
+    renderHookWithProviders(() => useKeyboardShortcuts({ onToggleShortcutsModal, onNewChat }), { store })
+    press({ code: 'KeyW', ctrlKey: true })
+    expect(confirmSpy).toHaveBeenCalledTimes(1)
+    expect(store.getState().dashboard.slots.find(s => s.key === 'slot-1')).toBeDefined() // declined → kept
+    confirmSpy.mockRestore()
+  })
+
+  it('Ctrl+W asks first for a session whose children are only queued (closing retires them)', () => {
+    // Queued children are not Working, so the lane reads idle; the gate must
+    // still confirm, because deleteSlot cancels the accepted spawns.
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false)
+    const store = createTestStore({
+      dashboard: { slots: [{ key: 'slot-1', title: 'Chat 1', messages: 1, running: false }] } as unknown as RootState['dashboard'],
+      chat: { activeSlot: 'slot-1', slotHistory: [], subagentQueued: { 'slot-1': 2 } } as unknown as RootState['chat'],
     })
     renderHookWithProviders(() => useKeyboardShortcuts({ onToggleShortcutsModal, onNewChat }), { store })
     press({ code: 'KeyW', ctrlKey: true })

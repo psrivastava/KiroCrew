@@ -4,18 +4,22 @@ from __future__ import annotations
 
 import json
 import os
+import threading
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+import kiro_crew.cron_script as cron_script
 from kiro_crew import platform_compat as pc
 from kiro_crew.cron_script import (
     _MAX_BAD_OUTPUT_HEAD,
     _MAX_SCRIPT_STDERR_TAIL,
     _REDACT_STRADDLE_MARGIN,
     Done,
+    McpToolError,
     Report,
     ScriptContext,
     Skip,
@@ -39,7 +43,7 @@ def _cron_caller_is_named(named_cron_caller):
 
 
 @pytest.fixture(autouse=True)
-def _crons_dir_tracks_patched_home(monkeypatch):
+def _crons_dir_tracks_patched_home(monkeypatch, tmp_path):
     """Keep ``cron_script.config_dir()`` pointed at ``<patched home>/.kirocrew``.
 
     The data home moved from the top-level ``~/.kirocrew`` to ``~/.kiro/crew``
@@ -53,10 +57,31 @@ def _crons_dir_tracks_patched_home(monkeypatch):
     it tracks whatever ``Path.home()`` each test patches) — preserving the
     existing ``.kirocrew/crons`` layout the tests build. Tests that patch
     ``cron_script.config_dir`` themselves still win (applied later).
+
+    The stub CREATES the directory, because the real resolver does: ``config_dir``
+    runs ``mkdir(parents=True, exist_ok=True)`` on every call, so a path it hands
+    back always exists on disk. A stub that only computes the path models a home
+    that the production code cannot be handed, and a caller that legitimately
+    creates something beside the tree it returns then fails on a missing parent
+    that no real run has.
+
+    Creating means the fallback matters: a test in this module that does NOT patch
+    ``Path.home`` would otherwise have this stub create directories in the
+    OPERATOR's real home, which outlive the run and which the conftest's
+    real-data-home guards cannot see (they inspect ``KIROCREW_HOME`` only). So an
+    unpatched home resolves to a per-test tmp dir instead, the same shape
+    ``test_cron_secret_env.py`` uses.
     """
-    monkeypatch.setattr(
-        "kiro_crew.cron_script.config_dir", lambda: Path.home() / ".kirocrew"
-    )
+    real_home = Path.home()
+    fallback = tmp_path / "kirocrew-home-fallback"
+
+    def _home_dir() -> Path:
+        home = Path.home()
+        d = fallback if home == real_home else home / ".kirocrew"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    monkeypatch.setattr("kiro_crew.cron_script.config_dir", _home_dir)
 
 
 class TestResolveScriptPath:
@@ -260,10 +285,13 @@ class TestCronSandboxUnavailableIsStructuredNotRaised:
         script = tmp_path / "job.py"
         script.write_text("def run(msg=''):\n    return {'status': 'ok'}\n")
         # resolve_script_path enforces an allowed root; point it at tmp_path so
-        # this test exercises the wrap_argv failure, not the path guard.
+        # this test exercises the wrap_argv failure, not the path guard. The stub
+        # accepts the launcher's keywords (`allow_bundle_roots`) rather than a
+        # bare spec, so a signature change fails at the real call site instead of
+        # inside the stub.
         monkeypatch.setattr(
             "kiro_crew.cron_script.resolve_script_path",
-            lambda spec: (str(script), "run"),
+            lambda spec, **_kw: (str(script), "run"),
         )
         result = run_script_sandboxed(f"{script}:run", "job-id", timeout=10)
         assert result["status"] == "error"
@@ -288,11 +316,14 @@ class TestCommandCronShellResolution:
         assert cron_script._resolve_command_shell() == "/bin/sh"
 
     def test_brace_expanding_sh_is_rejected(self, monkeypatch):
-        """macOS /bin/sh is bash-in-POSIX-mode and STILL performs brace
-        expansion, so the runtime probe MUST reject it — otherwise
-        `cat ~/.a{w,w}s/credentials` hides from the vet the same way a `bash -c`
-        candidate would. No fallback: the caller then fails-closed with a
-        legible error, matching the Windows path."""
+        """A trusted `sh` the probe rejects in EVERY form is refused.
+
+        bash-as-`sh` (macOS /bin/sh, Linux `/bin/sh -> bash`) is not such a
+        shell: it passes invoked `+B` — see
+        ``test_bash_invoked_as_sh_passes_the_real_probe_with_expansion_off``.
+        What stays refused is a shell that expands however it is invoked,
+        otherwise `cat ~/.a{w,w}s/credentials` hides from the vet. No fallback:
+        the caller then fails-closed with a legible error."""
         from kiro_crew import cron_script
 
         monkeypatch.setattr(cron_script.platform_compat, "IS_WINDOWS", False)
@@ -375,6 +406,154 @@ class TestCommandCronShellResolution:
         result = cron_script.run_command_sandboxed("echo hi", timeout=10)
         assert result["status"] == "error"
         assert "No POSIX shell" in result["output"]
+
+    def test_posix_refusal_names_this_hosts_shells_not_windows(self, monkeypatch):
+        """On macOS / Linux the refusal must describe THIS host.
+
+        A refusal naming Windows ("Windows ships no such shell") gives a Mac
+        operator whose /bin/sh plainly works nothing to act on. The POSIX wording
+        names the trusted paths, the probe they failed and the remedy, and never
+        names Windows.
+        """
+        from kiro_crew import cron_script
+
+        monkeypatch.setattr(cron_script.platform_compat, "IS_WINDOWS", False)
+        monkeypatch.setattr(cron_script, "_resolve_command_shell", lambda: None)
+        result = cron_script.run_command_sandboxed("echo hi", timeout=10)
+
+        assert result["status"] == "error"
+        assert result["exit_code"] == -1
+        output = result["output"]
+        assert "Windows" not in output
+        assert "/bin/sh" in output and "/usr/bin/sh" in output
+        assert "+B" in output
+        assert "script cron" in output
+        # The failed probe is cached for the gateway's lifetime, so fixing the
+        # shell alone is not enough: the refusal must name the restart.
+        assert "restart the gateway" in output
+
+    def test_windows_refusal_keeps_its_by_design_reason(self, monkeypatch):
+        """The Windows wording is unchanged: there the refusal IS the platform."""
+        from kiro_crew import cron_script
+
+        monkeypatch.setattr(cron_script.platform_compat, "IS_WINDOWS", True)
+        output = cron_script.run_command_sandboxed("echo hi", timeout=10)["output"]
+
+        assert "Windows ships no such shell" in output
+        assert "Git for Windows" in output
+
+    def test_a_concurrent_failing_probe_cannot_erase_a_proven_form(self, monkeypatch):
+        """Two command crons resolving the shell on a cold cache stay coherent.
+
+        Thread A proves the ``+B`` form. Thread B starts on the same cold cache
+        and its probe fails transiently. Unserialized, B finishes after A,
+        clears the brace-off record A just wrote and caches the shell as
+        unusable, so A's executor reads the plain form and runs with brace
+        expansion ON. The probe must own the check-probe-record sequence, so B
+        sees A's answer instead of probing.
+        """
+        import threading
+
+        from kiro_crew import cron_script
+
+        monkeypatch.setattr(cron_script, "_POSIX_STRICT_CACHE", {})
+        monkeypatch.setattr(cron_script, "_BRACE_OFF_SHELLS", {})
+        a_in_brace_off_probe = threading.Event()
+        b_probing = threading.Event()
+        a_done = threading.Event()
+        b_probe_calls: list[bool] = []
+
+        def _probe(shell: str, brace_off: bool) -> bool:
+            if threading.current_thread().name == "probe-a":
+                if not brace_off:
+                    return False
+                a_in_brace_off_probe.set()
+                # Give B the chance to probe concurrently; it can only if the
+                # sequence is unserialized.
+                b_probing.wait(timeout=1.0)
+                return True
+            b_probe_calls.append(brace_off)
+            b_probing.set()
+            a_done.wait(timeout=5.0)
+            return False
+
+        monkeypatch.setattr(cron_script, "_probe_one_form", _probe)
+        results: dict[str, bool] = {}
+
+        def _run_a() -> None:
+            results["a"] = cron_script._shell_is_posix_strict("/bin/sh")
+            a_done.set()
+
+        def _run_b() -> None:
+            results["b"] = cron_script._shell_is_posix_strict("/bin/sh")
+
+        a = threading.Thread(target=_run_a, name="probe-a")
+        b = threading.Thread(target=_run_b, name="probe-b")
+        a.start()
+        assert a_in_brace_off_probe.wait(timeout=5.0)
+        b.start()
+        a.join(timeout=10.0)
+        b.join(timeout=10.0)
+
+        assert results == {"a": True, "b": True}
+        assert b_probe_calls == [], "a second probe ran while the first owned the cold cache"
+        assert cron_script._command_argv("/bin/sh", "echo p.{q,q}") == [
+            "/bin/sh",
+            "+B",
+            "-c",
+            "echo p.{q,q}",
+        ]
+
+    @pytest.mark.skipif(pc.IS_WINDOWS, reason="POSIX shell semantics")
+    @pytest.mark.parametrize("source", ["bash-linked-as-sh", "host-bin-sh"])
+    def test_bash_invoked_as_sh_passes_the_real_probe_with_expansion_off(
+        self, monkeypatch, tmp_path, source
+    ):
+        """The shape of macOS /bin/sh, measured on a real shell rather than a stub.
+
+        bash started under the name ``sh`` enters POSIX mode, which is what
+        macOS /bin/sh is, and POSIX mode still brace-expands: the plain probe
+        form prints ``x.a x.a``. The resolver must accept it through the ``+B``
+        form and the executor must reuse that form, so the command the cron
+        actually runs keeps a brace group literal.
+
+        ``host-bin-sh`` runs the same assertions on this host's own /bin/sh when
+        it is such a shell -- on a macOS runner that is the bash 3.2 the report
+        came from, on AL2023 / RHEL / Fedora it is the ``/bin/sh -> bash`` link.
+        ``bash-linked-as-sh`` builds the shape from whatever bash is installed,
+        so a host whose /bin/sh is dash still exercises the ``+B`` path.
+        """
+        import shutil
+        import subprocess
+
+        from kiro_crew import cron_script
+
+        if source == "host-bin-sh":
+            sh = "/bin/sh"
+        else:
+            bash = shutil.which("bash")
+            if bash is None:
+                pytest.skip("no bash on this host")
+            link = tmp_path / "sh"
+            link.symlink_to(bash)
+            sh = str(link)
+        plain = subprocess.run(
+            [sh, "-c", "echo x.{a,a}"], capture_output=True, text=True, encoding="utf-8"
+        )
+        if source == "host-bin-sh" and plain.stdout.strip() != "x.a x.a":
+            pytest.skip("this host's /bin/sh does not brace-expand (dash / ash)")
+        assert plain.stdout.strip() == "x.a x.a", "bash-as-sh should brace-expand plainly"
+
+        monkeypatch.setattr(cron_script, "wrap_argv", lambda argv, **k: (list(argv), None))
+        monkeypatch.setattr(cron_script, "cgroup_scope_argv", lambda argv: list(argv))
+        monkeypatch.setattr(cron_script, "_POSIX_STRICT_CACHE", {})
+        monkeypatch.setattr(cron_script, "_BRACE_OFF_SHELLS", {})
+
+        assert cron_script._shell_is_posix_strict(sh) is True
+        argv = cron_script._command_argv(sh, "echo p.{q,q}")
+        assert argv == [sh, "+B", "-c", "echo p.{q,q}"]
+        ran = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8")
+        assert ran.stdout.strip() == "p.{q,q}"
 
 
 class TestRunScriptSandboxed:
@@ -625,6 +804,28 @@ def run(ctx):
         with patch("pathlib.Path.home", return_value=tmp_path):
             result = run_script_sandboxed(script_path + ":run", "test-job-id", "hello-world")
         assert result["status"] == "ok"
+
+    def test_dataclass_with_postponed_annotations_loads(self, tmp_path):
+        """A script that runs under plain Python must also load in the child.
+
+        ``dataclasses`` resolves a string annotation through
+        ``sys.modules[cls.__module__]``, so a script module the launcher never
+        registers there fails at import under ``from __future__ import annotations``.
+        """
+        script_path = self._write_script(
+            tmp_path,
+            "from __future__ import annotations\n"
+            "from dataclasses import dataclass\n"
+            "@dataclass\n"
+            "class Item:\n"
+            "    name: str\n"
+            "def run(ctx):\n"
+            "    if Item('x').name != 'x':\n"
+            "        raise RuntimeError('dataclass field lost')\n",
+        )
+        with patch("pathlib.Path.home", return_value=tmp_path):
+            result = run_script_sandboxed(script_path + ":run", "test-job-id", "")
+        assert result["status"] == "ok", result
 
 
 class TestScriptContext:
@@ -1258,6 +1459,142 @@ class TestScriptContextCallTool:
                 ctx.call_tool("nonexistent", "tool", {})
 
 
+class TestScriptContextKeepsServers:
+    """One run's calls to a server share its process, and close() stops it."""
+
+    @pytest.fixture
+    def started(self, monkeypatch):
+        """Every fake server started, in order. ``fail_next`` is the error its next call raises."""
+        started = []
+
+        class FakeClient:
+            def __init__(self, server, session_key=""):
+                self.server, self.calls, self.closed = server, [], 0
+                self.running, self.fail_next = True, None
+                started.append(self)
+
+            def call_tool(self, name, arguments):
+                self.calls.append(name)
+                if self.fail_next is not None:
+                    failure, self.fail_next = self.fail_next, None
+                    raise failure
+                return f"{self.server}:{name}"
+
+            def is_running(self):
+                return self.running
+
+            def close(self):
+                self.closed += 1
+                self.running = False
+
+        monkeypatch.setattr("kiro_crew.cron_script.McpToolClient", FakeClient)
+        return started
+
+    @staticmethod
+    def _ctx():
+        return ScriptContext(job=SimpleNamespace(id="j1", message=""))
+
+    def test_calls_to_one_server_share_its_process(self, started):
+        ctx = self._ctx()
+        results = [ctx.call_tool("slack", tool, {}) for tool in "abc"]
+        assert results == ["slack:a", "slack:b", "slack:c"]
+        (server,) = started
+        assert (server.calls, server.closed) == (["a", "b", "c"], 0)
+        ctx.close()
+        assert server.closed == 1
+
+    def test_each_server_name_gets_its_own_process(self, started):
+        ctx = self._ctx()
+        for server, tool in (("slack", "a"), ("builder", "b"), ("slack", "c")):
+            ctx.call_tool(server, tool, {})
+        assert [(s.server, s.calls) for s in started] == [("slack", ["a", "c"]), ("builder", ["b"])]
+        ctx.close()
+        assert [s.closed for s in started] == [1, 1]
+
+    def test_a_call_without_an_answer_stops_its_server_and_the_next_call_starts_another(
+        self, started
+    ):
+        ctx = self._ctx()
+        ctx.call_tool("slack", "a", {})
+        started[0].fail_next = RuntimeError("MCP server 'slack' disconnected")
+        with pytest.raises(RuntimeError, match="disconnected"):
+            ctx.call_tool("slack", "b", {})
+        assert started[0].closed == 1
+        assert ctx.call_tool("slack", "c", {}) == "slack:c"
+        assert [s.calls for s in started] == [["a", "b"], ["c"]]
+
+    def test_a_tool_error_keeps_its_server_for_the_next_call(self, started):
+        ctx = self._ctx()
+        ctx.call_tool("slack", "a", {})
+        started[0].fail_next = McpToolError("MCP tool error: boom")
+        with pytest.raises(McpToolError, match="boom"):
+            ctx.call_tool("slack", "b", {})
+        assert started[0].closed == 0
+        assert ctx.call_tool("slack", "c", {}) == "slack:c"
+        (server,) = started
+        assert server.calls == ["a", "b", "c"]
+        ctx.close()
+        assert server.closed == 1
+
+    def test_a_kept_server_that_exited_is_replaced(self, started):
+        ctx = self._ctx()
+        ctx.call_tool("slack", "a", {})
+        started[0].running = False
+        ctx.call_tool("slack", "b", {})
+        assert started[0].closed == 1, "an exited server's files are still cleaned up"
+        assert [s.calls for s in started] == [["a"], ["b"]]
+
+    def test_a_call_made_while_another_runs_starts_its_own_server(self, started):
+        ctx = self._ctx()
+        ctx.call_tool("slack", "warm", {})
+        first = started[0]
+        answer = first.call_tool
+        entered, release = threading.Event(), threading.Event()
+
+        def held(name, arguments):
+            entered.set()
+            assert release.wait(5)
+            return answer(name, arguments)
+
+        first.call_tool = held
+        worker = threading.Thread(target=ctx.call_tool, args=("slack", "slow", {}))
+        worker.start()
+        try:
+            assert entered.wait(5)
+            assert ctx.call_tool("slack", "fast", {}) == "slack:fast"
+        finally:
+            release.set()
+            worker.join(5)
+        second = started[1]
+        assert second.calls == ["fast"]
+        assert first.closed == 1, "the call finishing last finds a kept server and stops its own"
+        ctx.close()
+        assert second.closed == 1
+
+    def test_nothing_is_kept_after_close(self, started):
+        ctx = self._ctx()
+        ctx.call_tool("slack", "a", {})
+        ctx.close()
+        ctx.call_tool("slack", "b", {})
+        assert [s.closed for s in started] == [1, 1]
+        ctx.close()
+        assert [s.closed for s in started] == [1, 1]
+
+    def test_close_stops_every_kept_server_even_when_one_fails_to_stop(self, started):
+        ctx = self._ctx()
+        ctx.call_tool("slack", "a", {})
+        ctx.call_tool("builder", "b", {})
+        stuck = started[0]
+
+        def refuse():
+            stuck.closed += 1
+            raise OSError("cannot stop")
+
+        stuck.close = refuse
+        ctx.close()
+        assert [s.closed for s in started] == [1, 1]
+
+
 class TestRunCommandSandboxedEdgeCases:
     """Additional edge case tests for run_command_sandboxed."""
 
@@ -1346,6 +1683,35 @@ def run(ctx):
             result = run_script_sandboxed(script_path + ":run", "test-job", "")
         assert result["status"] == "ok"
 
+    @pytest.mark.parametrize(
+        ("ending", "status"),
+        [("return", "ok"), ("raise Skip()", "skip"), ("raise ValueError('bad')", "error")],
+    )
+    def test_the_launcher_closes_the_context_however_the_script_ends(
+        self, tmp_path, monkeypatch, ending, status
+    ):
+        marker = tmp_path / "closed.txt"
+        script_path = self._write_script(
+            tmp_path,
+            f"""
+from pathlib import Path
+from kiro_crew.cron_script import Skip
+def run(ctx):
+    ctx.close = lambda: Path(ctx.message).write_text(str(Path.cwd()))
+    {ending}
+""",
+        )
+        original_popen_limited = cron_script.popen_limited
+        monkeypatch.setattr(
+            cron_script,
+            "popen_limited",
+            partial(original_popen_limited, cwd=tmp_path),
+        )
+        with patch("pathlib.Path.home", return_value=tmp_path):
+            result = run_script_sandboxed(script_path + ":run", "test-job", str(marker))
+        assert result["status"] == status
+        assert marker.read_text() == str(tmp_path)
+
 
 class TestMcpToolClientProtocol:
     """Tests for McpToolClient JSON-RPC protocol internals."""
@@ -1388,8 +1754,8 @@ class TestMcpToolClientProtocol:
         client._proc = MagicMock()
         client._proc.stdout = MagicMock()
         client._proc.stdout.readline.side_effect = ["\n", "  \n", '{"id":1,"result":"ok"}\n']
-        msg = client._recv()
-        assert msg == {"id": 1, "result": "ok"}
+        # Each skipped line is one read, so _rpc's line cap counts it.
+        assert [client._recv() for _ in range(3)] == [{}, {}, {"id": 1, "result": "ok"}]
 
     def test_rpc_sends_and_receives(self):
         from kiro_crew.cron_script import McpToolClient
@@ -1414,8 +1780,9 @@ class TestMcpToolClientProtocol:
         client._proc.stdout = MagicMock()
         client._req_id = 0
         client._proc.stdout.readline.return_value = ""
-        with pytest.raises(RuntimeError, match="disconnected"):
+        with pytest.raises(RuntimeError, match="disconnected") as raised:
             client._rpc("tools/list")
+        assert not isinstance(raised.value, McpToolError)
 
     def test_call_tool_success(self):
         from kiro_crew.cron_script import McpToolClient
@@ -1452,7 +1819,7 @@ class TestMcpToolClientProtocol:
             )
             + "\n"
         )
-        with pytest.raises(RuntimeError, match="Invalid request"):
+        with pytest.raises(McpToolError, match="Invalid request"):
             client.call_tool("bad_tool", {})
 
     def test_call_tool_is_error_flag(self):
@@ -1476,7 +1843,7 @@ class TestMcpToolClientProtocol:
             )
             + "\n"
         )
-        with pytest.raises(RuntimeError, match="tool failed"):
+        with pytest.raises(McpToolError, match="tool failed"):
             client.call_tool("failing_tool", {})
 
     def test_call_tool_is_error_no_content(self):
@@ -1491,7 +1858,7 @@ class TestMcpToolClientProtocol:
             json.dumps({"jsonrpc": "2.0", "id": 1, "result": {"isError": True, "content": []}})
             + "\n"
         )
-        with pytest.raises(RuntimeError, match="unknown error"):
+        with pytest.raises(McpToolError, match="unknown error"):
             client.call_tool("failing_tool", {})
 
     def test_close_with_sandbox_cleanup(self, tmp_path):
@@ -1584,6 +1951,8 @@ class TestScriptContextCallToolSuccess:
         ) as mock_sel:
             result = ctx.call_tool("server", "tool", {"key": "val"})
         assert result == "result text"
+        mock_client.close.assert_not_called()
+        ctx.close()
         mock_client.close.assert_called_once()
         mock_sel().log_tool_invocation.assert_called()
 
@@ -1722,7 +2091,7 @@ class TestResolveScriptPathSensitive:
         script = crons_dir / "test.py"
         script.write_text("def run(ctx): pass")
         with patch("pathlib.Path.home", return_value=tmp_path), patch(
-            "kiro_crew.cron_script.is_sensitive_path", return_value=True
+            "kiro_crew.cron_script.sensitive_path_refusal", return_value="Blocked: x"
         ):
             with pytest.raises(PermissionError, match="security policy"):
                 resolve_script_path(str(script) + ":run")

@@ -34,7 +34,7 @@ from kiro_crew.crew_log import session_tree
 from kiro_crew.crew_log.errors import CrewLogError
 from kiro_crew.crew_log.schema import KIND_SESSION
 from kiro_crew.crew_log.session_tree import TreeNode
-from kiro_crew.crew_log.store import LOG_FILE, crew_log_root
+from kiro_crew.crew_log.store import LOG_FILE, crew_log_root, log_exception_text
 from kiro_crew.crew_log.store import now_ms as store_now_ms
 from kiro_crew.crew_log.store import segment_first_seqs
 
@@ -153,8 +153,8 @@ def recorded_class(session_id: str) -> dict[str, Any] | None:
         bundle = projections.fold_session(session_id, ("class",), since=since, log=handle)
         _keep_class_bundle(session_id, bundle)
     except (CrewLogError, OSError):
-        logger.debug(
-            "no class record for %r: its log could not be folded", session_id, exc_info=True
+        log_exception_text(
+            logger, logging.DEBUG, "no class record for %r: its log could not be folded", session_id
         )
         return None
     if bundle.last_seq < held:
@@ -351,6 +351,16 @@ def dispatch_view(preferred: Iterable[str] = ()) -> DispatchView:
         return DispatchView(slot_of_unit={}, nodes={}, incomplete=True)
     slots = {record.sid: record.slot for record in reading.records if record.sid and record.slot}
     return DispatchView(slot_of_unit=slots, nodes=reading.nodes, incomplete=reading.incomplete)
+
+
+def slot_chain(head_sid: str) -> session_tree.ChainReading:
+    """*head_sid*'s slot succession chain, newest first, from the shared scanner.
+
+    Through the same :data:`_TREE` the dispatch view scans with, so its per-unit head
+    cache is paid once for both. BLOCKING; never raises
+    (:meth:`~kiro_crew.crew_log.session_tree.SessionTree.chain`).
+    """
+    return _TREE.chain(head_sid)
 
 
 def read_page(session_id: str, start: int, end: int) -> dict[str, Any]:

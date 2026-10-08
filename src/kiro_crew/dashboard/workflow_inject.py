@@ -18,6 +18,7 @@ import re
 from typing import Any, Callable, Optional
 
 from kiro_crew.dashboard.chat_utils import dashboard_slot_key
+from kiro_crew.dashboard.slot_ownership import app_holds_gateway_key
 from kiro_crew.dashboard.state import (
     DashboardState,
     append_and_surface,
@@ -166,9 +167,25 @@ def inject_workflow_result(
         if slot is None:
             if snapshot.get("memory_mode", "persistent") != "persistent":
                 return False
+            # Never adopt an app-owned slot under the run's key: linking it would
+            # hand the app the originating session's transcript.
+            if app_holds_gateway_key(state, f"workflow-{run_id}", "workflow.inject_result"):
+                return False
             slot = state.get_or_create_slot(name=f"workflow-{run_id}")
             if not getattr(slot, "linked_session_key", ""):
                 slot.linked_session_key = session_key
+                # A reused ``workflow-<run_id>`` slot object can still hold the
+                # PRIOR run's in-memory dismissed set. Leaving it in place while
+                # the slot now links a DIFFERENT transcript would let the next
+                # union-save fold those foreign tombstones into the newly-linked
+                # transcript and suppress unrelated links there — the same silent,
+                # permanent cross-transcript corruption the cron bind path clears
+                # against. Empty the set and mark it dismissed-unhydrated so the
+                # union carries only the linked transcript's own on-disk line; a
+                # later readable restore replaces it authoritatively.
+                slot._dismissed_source_links = set()
+                slot.invalidate_source_links()
+                slot._dismissed_hydrated = False
                 note_crew_log_class(state, slot)
             slot.title = f"Workflow: {snapshot.get('name') or run_id}"
 

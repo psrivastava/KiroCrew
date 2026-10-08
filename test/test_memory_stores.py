@@ -392,19 +392,70 @@ class TestWorkspaceFallThrough:
     def test_it_agrees_with_resolve_agent_bindings(self) -> None:
         """One table, one answer: both resolvers now read ``cfg.workspaces``.
 
-        Including for a config the schema repairs. A legacy FLAT
-        ``{"name": "dir"}`` entry is a type mismatch the validator removes before
-        the loader sees it, so the loaded table has no such workspace — and
-        ``resolve_agent_bindings`` has always answered from that table. Reading
-        the raw bytes instead is what let the two disagree.
+        Including for a legacy FLAT ``{"name": "dir"}`` entry: the loader
+        migrates it into the table, and both resolvers answer from that table
+        rather than from the raw bytes.
         """
         from kiro_crew.config.loader import resolve_agent_bindings
 
         _write_config({"workspaces": {"alt": "alt-tree"}, "default_workspace": "alt"})
         cfg = KiroCrewConfig.load()
-        assert "alt" not in cfg.workspaces
+        assert cfg.workspaces["alt"].dir == "alt-tree"
         bindings = resolve_agent_bindings(cfg)
         assert workspace_dir_for("alt") == config_dir() / bindings.workspace_dir
+
+    _FALLBACK_TEXT = "not found, falling back to default_workspace"
+
+    def _fallback_warnings(self, caplog) -> list[str]:
+        return [
+            r.getMessage()
+            for r in caplog.records
+            if r.levelno >= logging.WARNING and self._FALLBACK_TEXT in r.getMessage()
+        ]
+
+    def test_a_real_fallback_to_default_workspace_warns(self, caplog) -> None:
+        """An agent naming an undeclared workspace really does move; say so."""
+        from kiro_crew.config.loader import resolve_agent_bindings
+
+        _write_config(
+            {
+                "workspaces": {"main": {"dir": "main-tree"}},
+                "default_workspace": "main",
+                "agents": {"crew": {"kiro_agent": "kirocrew", "workspace": "ghost"}},
+                "default_agent": "crew",
+            }
+        )
+        cfg = KiroCrewConfig.load()
+        with caplog.at_level(logging.DEBUG, logger="kiro_crew.config.loader"):
+            bindings = resolve_agent_bindings(cfg, agent_name="crew")
+        assert bindings.workspace_dir == Path("main-tree")
+        warnings = self._fallback_warnings(caplog)
+        assert len(warnings) == 1
+        assert "'ghost'" in warnings[0] and "'main'" in warnings[0]
+
+    def test_no_warning_when_the_agent_already_names_default_workspace(self, caplog) -> None:
+        """Logging "'x' not found, falling back to 'x'" is noise, not a fallback."""
+        from kiro_crew.config.loader import resolve_agent_bindings
+
+        _write_config(
+            {
+                "workspaces": {"main": {"dir": "main-tree"}},
+                "default_workspace": "ghost",
+                "agents": {"crew": {"kiro_agent": "kirocrew", "workspace": "ghost"}},
+                "default_agent": "crew",
+            }
+        )
+        cfg = KiroCrewConfig.load()
+        assert cfg.default_workspace == "ghost" and "ghost" not in cfg.workspaces
+        with caplog.at_level(logging.DEBUG, logger="kiro_crew.config.loader"):
+            bindings = resolve_agent_bindings(cfg, agent_name="crew")
+        assert bindings.workspace_dir == Path("workspace")
+        assert self._fallback_warnings(caplog) == []
+        # Still traceable at debug level.
+        assert any(
+            r.levelno == logging.DEBUG and self._FALLBACK_TEXT in r.getMessage()
+            for r in caplog.records
+        )
 
     def test_a_declared_absolute_dir_is_returned_as_is(self, tmp_path) -> None:
         _write_config(

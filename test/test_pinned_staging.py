@@ -182,6 +182,30 @@ def test_open_dir_pinned_refuses_a_parent_that_became_a_link(tmp_path: Path) -> 
     assert "became a symbolic link" in str(excinfo.value)
 
 
+@pinned_only
+def test_a_refused_link_names_both_causes_rather_than_asserting_a_swap(tmp_path: Path) -> None:
+    """The refusal must not report an attack it cannot see.
+
+    A link met on the walk has two causes: swapped after the caller resolved
+    the path, or there all along because the caller never resolved it. Nothing
+    reachable from here tells them apart - the filesystem is read after the
+    swap either way - so the message names both and asserts neither. Claiming
+    a swap sends a reader hunting an attacker who was never there; claiming a
+    caller error denies one who was.
+    """
+    real = tmp_path / "real"
+    (real / "inside").mkdir(parents=True)
+    link = tmp_path / "link"
+    link.symlink_to(real)
+
+    with pytest.raises(pinned_fs.PinnedPathRefusal) as excinfo:
+        pinned_fs.pin_parent(str(link / "inside"), what="staging root")
+    message = str(excinfo.value)
+    assert "became a symbolic link after the path was checked" in message
+    assert "was one all along because this path was handed in unresolved" in message
+    assert "is not a directory at all" in message
+
+
 # ── Hardlink aliases ─────────────────────────────────────────────────────────
 
 
@@ -2362,3 +2386,44 @@ class TestFdRealPathHome:
         # freshly-closed real fd would race reuse by another thread in the
         # test process, so the impossible number is the deterministic probe.
         assert pinned_fs.fd_real_path(2**30) is None
+
+
+@pytest.mark.parametrize("fail", [False, True], ids=["success", "mid-write-failure"])
+def test_copy_reports_opened_identity_before_writing(tmp_path, monkeypatch, fail):
+    src = tmp_path / "source.txt"
+    src.write_bytes(b"complete source")
+    dst = tmp_path / "destination.txt"
+    opened = []
+    published = []
+    copy_bytes = pinned_fs.shutil.copyfileobj
+
+    def checked_copy(fsrc, fdst):
+        assert len(opened) == 1
+        actual = os.fstat(fdst.fileno())
+        assert (opened[0].st_dev, opened[0].st_ino) == (actual.st_dev, actual.st_ino)
+        assert opened[0].st_size == 0
+        assert not published, "the existing callback stays success-only"
+        if fail:
+            fdst.write(fsrc.read(4))
+            fdst.flush()
+            raise OSError(errno.ENOSPC, "injected disk full")
+        copy_bytes(fsrc, fdst)
+
+    monkeypatch.setattr(pinned_fs.shutil, "copyfileobj", checked_copy)
+    if fail:
+        with pytest.raises(OSError, match="injected disk full"):
+            pinned_fs.copy_file_pinned(
+                str(src), str(dst), on_opened=opened.append, on_created=published.append
+            )
+        assert dst.read_bytes() == b""
+        assert published == []
+    else:
+        assert pinned_fs.copy_file_pinned(
+            str(src), str(dst), on_opened=opened.append, on_created=published.append
+        )
+        assert dst.read_bytes() == src.read_bytes()
+        assert len(published) == 1
+        assert published[0].st_size == len(b"complete source")
+    actual = dst.stat()
+    assert len(opened) == 1
+    assert (opened[0].st_dev, opened[0].st_ino) == (actual.st_dev, actual.st_ino)

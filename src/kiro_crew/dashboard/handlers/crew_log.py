@@ -32,33 +32,30 @@ and ``resolve``, applied to a range read.
 The storage package is imported LAZILY here, on the first call that needs it,
 never at module import. The crew log is an optional subsystem behind
 ``KIROCREW_CREW_LOG``, this module is reachable from the dashboard's boot
-path, and a gateway launched with the flag unset must not pay to load a store it
-will not read -- the same split the emitter keeps, and one a test pins from a
+path, and a gateway launched with the flag set to a falsy value must not pay to
+load a store it will not read -- the same split the emitter keeps, and one a test pins from a
 clean interpreter.
 """
 
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
+import os
+import threading
 from collections import OrderedDict
+from collections.abc import Callable
 from types import ModuleType
 from typing import TYPE_CHECKING, Any, Final
 
 from aiohttp import web
 
-from kiro_crew.constants import env_flag_enabled
+from kiro_crew.constants import CREW_LOG_ENV, ENV_FALSY, crew_log_enabled, env_file_display
 from kiro_crew.dashboard.handlers._shared import (
     guard_owner_surface_routes,
     require_owner_dashboard_request,
 )
-
-#: The variable that switches the crew log on, spelled here rather than read from
-#: the emitter's ``CREW_LOG_ENV``. This module sits on the gateway's boot path and
-#: importing that module to learn whether it is wanted is the very cost the flag
-#: exists to avoid. A test pins this string against the emitter's own constant, so
-#: the two cannot drift apart unnoticed.
-CREW_LOG_ENV: Final[str] = "KIROCREW_CREW_LOG"
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, never imported at runtime
     from kiro_crew.crew_log.errors import CrewLogError
@@ -89,6 +86,42 @@ def _crew_log_read() -> ModuleType:
 #: The frame a growing crew log pushes. The RFC's name, kept.
 FRAME = "session_projection"
 
+#: The frame about a SLOT's crew log. ONE frame kind, two shapes, and the second is
+#: additive on purpose.
+#:
+#: ``{"slot": s}`` alone is the original and still means "re-read this slot": a growth
+#: signal with no value, which is all a session-driven pass can say about folds it did not
+#: run.
+#:
+#: ``{"slot": s, "fold": f, "revision": n, "value": {...}}`` is what an EAGER advance
+#: sends, and it carries the folded value so the client needs no re-read at all. The
+#: client keeps the highest ``revision`` per (slot, fold) and discards anything lower
+#: (:func:`kiro_crew.crew_log.projection.fold_slot_warm_revised` mints it).
+#:
+#: One frame kind rather than two, because the client already routes this one to the same
+#: query key the value belongs to, and a second channel would be a second place to keep
+#: that mapping correct.
+SLOT_FRAME = "slot_projection"
+
+#: Sent to a client AT SUBSCRIBE TIME, before it issues any baseline read:
+#: ``{"revisions": {slot: {fold: revision}}}``, the newest revision this process has
+#: published for each cell.
+#:
+#: WHY BEFORE THE BASELINE. A baseline read already on the wire resolves into the same
+#: cache entry a pushed frame writes, and it resolves LATER, so it wins -- serving a value
+#: older than one the client was already handed, with nothing left to correct it. A floor
+#: established first makes that impossible: the client discards any frame at or below its
+#: floor and refuses a baseline response older than it.
+#:
+#: A FLOOR AND NOT A VALUE. It carries revisions, never folded values: a connecting client
+#: still reads its own baseline, and sending values for every slot this gateway has folded
+#: would push a payload nobody asked for at exactly the moment a tab is slowest.
+SLOT_SUBSCRIBED_FRAME = "slot_projection/subscribed"
+
+#: Units whose owning slot is remembered. A unit's header is written once and
+#: never rewritten, so the answer never goes stale; the bound only caps memory.
+MAX_CACHED_SLOT_OWNERS: Final[int] = 512
+
 #: Distinct refs a single page resolves. Each resolution opens the cited unit and
 #: walks to the span, so the work is bounded per request rather than left to
 #: however many citations a page happens to carry; identical refs on one page are
@@ -111,6 +144,14 @@ MAX_CACHED_SESSIONS: Final[int] = 32
 
 def _bad_request(message: str, code: str) -> web.Response:
     return web.json_response({"error": message, "code": code}, status=400)
+
+
+def _owner_served_refusal(name: str) -> web.Response:
+    """The answer for a slot-keyed fold its owner serves: the same as an unregistered name."""
+    return _bad_request(
+        f"projection {name!r} is slot-keyed and is served by its owner, not by this route",
+        "unknown_projection",
+    )
 
 
 def _seq_param(request: web.Request, name: str) -> int | None:
@@ -293,6 +334,12 @@ async def api_session_crew_log_projection(request: web.Request) -> web.Response:
         projections.require_name(name)
     except CrewLogError as exc:
         return _bad_request(exc.message, "unknown_projection")
+    if name == projections.OWNER_SERVED_SLOT_PROJECTION:
+        # A slot-keyed fold its OWNER serves: the owner orders the slot's units by
+        # what the crew recorded and pins the live unit last, which this route cannot
+        # do, and folding the one unit it addresses would serve a part of the record
+        # as the whole. Refused the way an unregistered name is.
+        return _owner_served_refusal(name)
     unit_id, _ = _unit_id(request, session_id)
     try:
         if name in projections.SLOT_PROJECTION_NAMES:
@@ -351,27 +398,56 @@ async def api_session_crew_log_projections(request: web.Request) -> web.Response
     unit_id, resolved = _unit_id(request, session_id)
     drained = await asyncio.to_thread(_settle_writes)
     try:
-        bundle = await asyncio.to_thread(
-            projections.fold_session, unit_id, projections.PROJECTION_NAMES
-        )
+        # The WARM memo the eager worker keeps, so a read after a wake is a lookup and
+        # each fold carries the revision its pushed frames carry: the panel orders a
+        # baseline against a push by that number.
+        warm = await asyncio.to_thread(projections.fold_session_warm, unit_id)
     except CrewLogError as exc:
         return _crew_log_refusal(exc)
-    folded = {
-        name: projections.projection_of(checkpoint).to_dict()
-        for name, checkpoint in bundle.checkpoints.items()
-    }
+    folded = {name: warm.projection(name).to_dict() for name in projections.PROJECTION_NAMES}
     # ``session_id`` names what the CALLER asked about, the same rule the two older
     # reads follow: a client polling by slot key compares this against the id it
     # sent, and answering with the resolved ACP id would break that comparison and
     # put an internal identity on the wire.
-    return web.json_response(
-        {
-            "session_id": session_id,
-            "projections": folded,
-            "resolved": resolved,
-            "writes_drained": drained,
-        }
-    )
+    # Whether the gateway is recording at all. An empty fold cannot say, and the two
+    # cases want different words: a session that has not recorded yet, and a gateway
+    # whose flag switched recording off.
+    recording = crew_log_enabled()
+    payload: dict[str, Any] = {
+        "session_id": session_id,
+        # The unit these folds came from, beside the id the caller asked with. A pushed
+        # ``session_projection`` frame names its unit, and the panel applies one only
+        # when it names THIS unit: after a slot moves to a new ACP session, a late frame
+        # from the old one must not land in the new one's panel.
+        "unit": unit_id,
+        "projections": folded,
+        "resolved": resolved,
+        "writes_drained": drained,
+        "recording": recording,
+    }
+    if not recording:
+        payload["flag_value"] = value = crew_log_flag_value()
+        # Whether the value is one of the switch-off spellings. The panel words an
+        # unrecognised one as such, so a typo is not read as the app misspelling it.
+        payload["flag_recognised"] = value.lower() in ENV_FALSY
+        # The ``.env`` the gateway reads, so the panel names the file to edit.
+        payload["env_file"] = env_file_display()
+    return web.json_response(payload)
+
+
+#: The longest flag value the fold read quotes back; a longer one is cut.
+_FLAG_VALUE_MAX = 40
+
+
+def crew_log_flag_value() -> str:
+    """The ``KIROCREW_CREW_LOG`` value that switched recording off, as the panel quotes it.
+
+    Only this one variable, and only its printable characters up to
+    :data:`_FLAG_VALUE_MAX`: the read is owner-gated, and the operator set the value
+    themselves, so quoting it lets them see a typo instead of a list of spellings.
+    """
+    value = os.environ.get(CREW_LOG_ENV, "").strip()
+    return "".join(char for char in value if char.isprintable())[:_FLAG_VALUE_MAX]
 
 
 #: How long a fold read waits for the writer to owe nothing before folding anyway.
@@ -512,11 +588,18 @@ def _crew_log_refusal(exc: "CrewLogError") -> web.Response:
 #: cannot drift.
 CREW_LOG_MCP_CALLER: Final[str] = "kirocrew-crew-log"
 
-#: How to switch the crew log on, quoted in the refusal a disabled read earns. An
-#: agent that reads ``crew_log_disabled`` should not have to be told separately.
-CREW_LOG_ENABLE_HINT: Final[str] = (
-    f"set {CREW_LOG_ENV}=1 in ~/.kiro/crew/.env and restart the gateway"
-)
+
+def crew_log_enable_hint() -> str:
+    """How to switch the crew log back on, quoted in the refusal a disabled read earns.
+
+    The log is on by default, so a disabled read means the variable holds a falsy or
+    unrecognised value. An agent that reads ``crew_log_disabled`` should not have to be
+    told separately. The ``.env`` named is the one the gateway reads.
+    """
+    return (
+        f"{CREW_LOG_ENV} is set to 0, false, no, off or an unrecognised value; unset it "
+        f"(or remove it from {env_file_display()}) and restart the gateway"
+    )
 
 
 def _forbidden(reason: str) -> web.Response:
@@ -534,7 +617,7 @@ def _disabled() -> web.Response:
     """
     return web.json_response(
         {
-            "error": f"the crew log is switched off; {CREW_LOG_ENABLE_HINT}",
+            "error": f"the crew log is switched off; {crew_log_enable_hint()}",
             "code": "crew_log_disabled",
         },
         status=422,
@@ -1504,15 +1587,55 @@ def _unit_param(request: web.Request) -> str:
     return (request.match_info.get("unit") or "").strip()
 
 
+async def _offload_then_recheck(
+    request: web.Request,
+    operation: str,
+    work: Callable[[], Any],
+    respond: Callable[[Any], web.Response],
+    *,
+    unit: str = "",
+    listing: bool = False,
+) -> web.Response:
+    """Read off the loop, re-check the grant the read suspended, then answer.
+
+    An agent-door read that suspends owes four steps in one order: authorize, build
+    the payload off the loop, re-check the grant, answer. The gate is the route's own
+    first line because what it authorizes differs per route; the other three are the
+    same three calls in the same order everywhere, and they live here so that a route
+    cannot answer out of that order. The route hands over the read and the shaping and
+    never names the payload, so "answered without re-checking" is not a shape a route
+    can write -- which is a stronger guarantee than every route happening to get the
+    order right.
+
+    ``work`` is the read, already bound to its arguments, and runs in a thread.
+    ``respond`` turns the payload into the response and belongs to the ROUTE, because
+    what a payload means differs per route: a page with no log is a 404, a fold is
+    wrapped with the unit it was folded from, a listing is returned as it stands. It
+    is called only once the re-check holds, so a withdrawn grant reaches the caller as
+    the refusal and the route's shaping never runs at all.
+
+    A storage refusal is mapped here rather than per route because all three reads map
+    it the same way: :func:`_crew_log_refusal` keeps the code the caller can act on.
+    """
+    from kiro_crew.crew_log.errors import CrewLogError
+
+    try:
+        payload = await asyncio.to_thread(work)
+    except CrewLogError as exc:
+        return _crew_log_refusal(exc)
+    stale = await _stale_grant_refusal(request, operation, unit=unit, listing=listing)
+    if stale is not None:
+        return stale
+    return respond(payload)
+
+
 async def api_crew_log_sessions(request: web.Request) -> web.Response:
     """GET /api/crew-log/sessions -- one row per session crew log this caller may see."""
     denied = await _authorize_crew_log_read(request, "session_crew_log.list", listing=True)
     if denied is not None:
         return denied
-    if not env_flag_enabled(CREW_LOG_ENV):
+    if not crew_log_enabled():
         return _disabled()
-    from kiro_crew.crew_log.errors import CrewLogError
-
     try:
         limit = int(request.query.get("limit") or 50)
         active_within_secs = int(request.query.get("active_within_secs") or 0)
@@ -1544,8 +1667,10 @@ async def api_crew_log_sessions(request: web.Request) -> web.Response:
             return False
         return not _workspace_refusal(caller_workspace, recorded)
 
-    try:
-        payload = await asyncio.to_thread(
+    return await _offload_then_recheck(
+        request,
+        "session_crew_log.list",
+        functools.partial(
             _crew_log_read().list_session_units,
             slot_contains=request.query.get("slot_contains", "") or "",
             active_within_ms=active_within_secs * 1000,
@@ -1554,13 +1679,12 @@ async def api_crew_log_sessions(request: web.Request) -> web.Response:
             scope_unit=scope_unit,
             scope_slot=scope_slot,
             admit_dispatched=_admit,
-        )
-    except CrewLogError as exc:
-        return _crew_log_refusal(exc)
-    stale = await _stale_grant_refusal(request, "session_crew_log.list", listing=True)
-    if stale is not None:
-        return stale
-    return web.json_response(payload)
+        ),
+        # A listing is returned as it stands: each row was admitted as it was
+        # gathered, so there is nothing left to shape.
+        web.json_response,
+        listing=True,
+    )
 
 
 async def api_crew_log_resolve(request: web.Request) -> web.Response:
@@ -1583,7 +1707,7 @@ async def api_crew_log_resolve(request: web.Request) -> web.Response:
     key = asked
     if not key:
         return _bad_request("key is required", "unresolvable_key")
-    if not env_flag_enabled(CREW_LOG_ENV):
+    if not crew_log_enabled():
         return _disabled()
     unit = target
     if not unit:
@@ -1610,26 +1734,27 @@ async def api_crew_log_unit_page(request: web.Request) -> web.Response:
     denied = await _authorize_crew_log_read(request, "session_crew_log.read", unit=unit)
     if denied is not None:
         return denied
-    if not env_flag_enabled(CREW_LOG_ENV):
+    if not crew_log_enabled():
         return _disabled()
-    from kiro_crew.crew_log.errors import CrewLogError
-
     try:
         start, end = _span(request)
     except ValueError as exc:
         return _bad_request(str(exc), "bad_range")
-    try:
-        payload = await asyncio.to_thread(_read_page, unit, start, end)
-    except CrewLogError as exc:
-        return _crew_log_refusal(exc)
-    stale = await _stale_grant_refusal(request, "session_crew_log.read", unit=unit)
-    if stale is not None:
-        return stale
-    if not payload.get("exists"):
-        return web.json_response(
-            {"error": f"no session crew log for {unit!r}", "code": "unknown_unit"}, status=404
-        )
-    return web.json_response(payload)
+
+    def _respond(payload: Any) -> web.Response:
+        if not payload.get("exists"):
+            return web.json_response(
+                {"error": f"no session crew log for {unit!r}", "code": "unknown_unit"}, status=404
+            )
+        return web.json_response(payload)
+
+    return await _offload_then_recheck(
+        request,
+        "session_crew_log.read",
+        functools.partial(_read_page, unit, start, end),
+        _respond,
+        unit=unit,
+    )
 
 
 async def api_crew_log_unit_projection(request: web.Request) -> web.Response:
@@ -1638,7 +1763,7 @@ async def api_crew_log_unit_projection(request: web.Request) -> web.Response:
     denied = await _authorize_crew_log_read(request, "session_crew_log.projection", unit=unit)
     if denied is not None:
         return denied
-    if not env_flag_enabled(CREW_LOG_ENV):
+    if not crew_log_enabled():
         return _disabled()
     from kiro_crew.crew_log.errors import CrewLogError
 
@@ -1648,14 +1773,31 @@ async def api_crew_log_unit_projection(request: web.Request) -> web.Response:
         projections.require_name(name)
     except CrewLogError as exc:
         return _bad_request(exc.message, "unknown_projection")
-    try:
-        result = await asyncio.to_thread(projections.read_projection, unit, name)
-    except CrewLogError as exc:
-        return _crew_log_refusal(exc)
-    stale = await _stale_grant_refusal(request, "session_crew_log.projection", unit=unit)
-    if stale is not None:
-        return stale
-    return web.json_response({"session_id": unit, **result.to_dict()})
+    if name == projections.OWNER_SERVED_SLOT_PROJECTION:
+        # Same refusal as the per-session route: this fold is slot-keyed and served
+        # by its owner; a per-unit fold of it would be a part served as the whole.
+        return _owner_served_refusal(name)
+    if name in projections.SLOT_PROJECTION_NAMES:
+        # This route folds ONE unit. A slot-keyed fold joins every unit the slot ran
+        # under (and, for the work board, its bound workers' units), so one unit's
+        # answer would be a partial record that reads as whole. The session route
+        # resolves the slot from the unit's header and serves these names whole.
+        return _bad_request(
+            f"projection {name!r} is keyed by slot, not by session", "slot_projection"
+        )
+
+    def _respond(result: Any) -> web.Response:
+        # The fold is named by the unit it was folded from, which the reader needs
+        # and the fold itself does not carry.
+        return web.json_response({"session_id": unit, **result.to_dict()})
+
+    return await _offload_then_recheck(
+        request,
+        "session_crew_log.projection",
+        functools.partial(projections.read_projection, unit, name),
+        _respond,
+        unit=unit,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -1664,23 +1806,47 @@ async def api_crew_log_unit_projection(request: web.Request) -> web.Response:
 
 
 class CrewLogPublisher:
-    """Folds a grown crew log off the loop and pushes what moved.
+    """Pushes folded crew-log values to the dashboard's sockets.
 
-    One instance per gateway, installed at startup. It holds each watched
-    session's fold state, so a growth costs a read of the entries that arrived
-    rather than a read of the whole file, which is what makes pushing all five
-    projections on every batch affordable.
+    One instance per gateway, installed at startup. TWO SOURCES feed it, and both end
+    in the same frames. The crew-log bus hands it every fold the eager worker advanced
+    (:meth:`on_fold_advanced`), which is the normal path: the value is already folded
+    and only needs sending. The emitter's growth listener (:meth:`notify`) is the
+    BACKSTOP for a wake the eager queue dropped: a coalesced pass reads the same warm
+    session memo (``fold_session_warm``), which is a lookup when the eager worker got
+    there first and a short continuation when it did not.
 
-    A frame is sent only for a projection whose ``seq`` advanced. Re-sending an
-    unchanged value would spend a socket write to tell a client nothing, and the
-    client's own truncate-on-reconnect rule is stated in terms of that seq.
+    A session frame is sent only for a fold whose REVISION is above the last one this
+    publisher sent for that (session, fold), so the two sources never send one value
+    twice and an idle session sends nothing. A seq could not do this: it restarts when a
+    unit is recreated under the same id, where a revision only rises.
     """
 
     def __init__(self, state: Any) -> None:
         self._state = state
         self._loop: asyncio.AbstractEventLoop | None = None
         self._dirty: set[str] = set()
-        self._bundles: "OrderedDict[str, Any]" = OrderedDict()
+        # The newest revision SENT per (session, fold), bounded LRU by session. What
+        # stops the bus and the growth backstop sending one value twice. Touched only on
+        # the loop.
+        self._sent: "OrderedDict[str, dict[str, int]]" = OrderedDict()
+        # Session values the bus delivered and the current window has not sent yet: the
+        # newest (revision, seq, value) per (session, fold). See :meth:`_schedule_session`.
+        self._pending: "dict[tuple[str, str], tuple[int, int, dict[str, Any]]]" = {}
+        self._sessions_armed = False
+        self._bus_disposers: "list[Callable[[], None]]" = []
+        self._slot_owners: "OrderedDict[str, str]" = OrderedDict()
+        # The newest revision published per (slot, fold), which is what a connecting
+        # client is handed as its floor. Written on the fold worker's thread and read on
+        # the loop, so both sides take ``_revisions_lock``: a first write for a slot
+        # adds a key, and a reader iterating the map at that moment would raise.
+        # Bounded LRU by slot at ``MAX_CACHED_SLOT_OWNERS``, like its siblings: the keys
+        # are slot names entries carry, so an unbounded map would grow for the life of
+        # the gateway and be serialized onto every socket at accept. A slot evicted
+        # here only means a new tab gets no floor for it, which is a tab that accepts
+        # the first revision it sees -- correct, because nothing was pushed to it.
+        self._revisions: "OrderedDict[str, dict[str, int]]" = OrderedDict()
+        self._revisions_lock = threading.Lock()
         self._scheduled = False
         # A flush pass runs to completion before the next one starts. Without
         # this, a growth arriving during a slow fold would schedule a second
@@ -1689,6 +1855,8 @@ class CrewLogPublisher:
         # land and be broadcast last. When a pass finishes with more work marked,
         # it schedules the next pass itself.
         self._flushing = False
+        # True while a lineage push is armed on the loop (see :meth:`_mark_tree`).
+        self._tree_scheduled = False
 
     # -- writer thread ------------------------------------------------------ #
 
@@ -1710,6 +1878,274 @@ class CrewLogPublisher:
             # The loop is closed, which happens while the gateway shuts down. A
             # push nobody can receive is not worth reporting.
             logger.debug("crew log growth for %s arrived after the loop closed", session_id)
+
+    # -- fold worker thread, via the crew-log bus --------------------------- #
+
+    def subscribe_bus(self) -> None:
+        """Subscribe this publisher to the crew-log bus, replacing any earlier pair.
+
+        TWO keyed fold subscriptions, one per scope, so each handler receives only its
+        own kind of fold and the bus never hands a slot event to the session path or the
+        reverse, plus one for the session tree. The disposers are KEPT: a second install in the same process (a gateway
+        restarted inside one interpreter) disposes the old pair before subscribing the
+        new one, so this publisher is never called twice for one event.
+        """
+        # boot-path import gate: the bus is imported where the publisher is installed.
+        from kiro_crew.crew_log import bus as crew_log_bus
+
+        for dispose in self._bus_disposers:
+            dispose()
+        self._bus_disposers = [
+            crew_log_bus.subscribe(
+                crew_log_bus.FOLD_ADVANCED, self.on_slot_fold, scope=crew_log_bus.SCOPE_SLOT
+            ),
+            crew_log_bus.subscribe(
+                crew_log_bus.FOLD_ADVANCED,
+                self.on_session_fold,
+                scope=crew_log_bus.SCOPE_SESSION,
+            ),
+            # The session tree's change event: an open, a takeover, a release, a forget,
+            # or the seed landing. The sidebar's nesting is pushed from here.
+            crew_log_bus.subscribe(crew_log_bus.TREE_ADVANCED, self.on_tree_advanced),
+        ]
+
+    def unsubscribe_bus(self) -> None:
+        """Drop every bus subscription. Idempotent."""
+        disposers, self._bus_disposers = self._bus_disposers, []
+        for dispose in disposers:
+            dispose()
+
+    def on_fold_advanced(self, event: Any) -> None:
+        """Route one :class:`FoldAdvanced` to the handler for its scope.
+
+        The bus subscriptions call :meth:`on_slot_fold` and :meth:`on_session_fold`
+        directly, already filtered by scope; this is the entry for a caller holding an
+        event of either kind.
+        """
+        scope = str(getattr(event, "scope", "") or "")
+        if scope == "slot":
+            self.on_slot_fold(event)
+        elif scope == "session":
+            self.on_session_fold(event)
+
+    def on_slot_fold(self, event: Any) -> None:
+        """THE WS EXPORTER for a slot fold: one frame per event, no coalesce.
+
+        Called on the crew log's FOLD WORKER thread, synchronously inside
+        ``bus.publish``. Same shape and same reason as :meth:`notify`: no I/O, no lock,
+        hand the frame to the loop that owns the sockets and return. The value arrives
+        already folded, so there is nothing to read.
+
+        NOT COALESCED, which is the folder's doing rather than an omission: it drains its
+        whole queue per batch and folds each (key, fold) once, so a turn's burst reaches
+        this once per fold it moved.
+
+        The event is read DEFENSIVELY -- a bus carries whatever a publisher sends, and a
+        malformed one must cost this frame rather than the fan-out to the next subscriber.
+        """
+        unpacked = self._unpack(event)
+        loop = self._loop
+        if unpacked is None or loop is None:
+            return
+        key, fold, revision, _seq, value = unpacked
+        try:
+            self._record_revision(key, fold, revision)
+            loop.call_soon_threadsafe(self._push_fold, key, fold, revision, value)
+        except RuntimeError:
+            logger.debug("crew log fold for %s/%s arrived after the loop closed", key, fold)
+
+    def on_session_fold(self, event: Any) -> None:
+        """THE WS EXPORTER for a session fold: held for the next coalesced send.
+
+        Same thread and same contract as :meth:`on_slot_fold`. A SESSION fold that is
+        not advertised (``class``) is not sent: its one reader asks for it by name, and a
+        browser cannot draw it.
+        """
+        unpacked = self._unpack(event)
+        loop = self._loop
+        if unpacked is None or loop is None:
+            return
+        key, fold, revision, seq, value = unpacked
+        if fold not in _crew_log().PROJECTION_NAMES:
+            return
+        try:
+            loop.call_soon_threadsafe(self._schedule_session, key, fold, revision, seq, value)
+        except RuntimeError:
+            logger.debug("crew log fold for %s/%s arrived after the loop closed", key, fold)
+
+    @staticmethod
+    def _unpack(event: Any) -> "tuple[str, str, int, int, dict[str, Any]] | None":
+        """``(key, fold, revision, seq, value)`` from *event*, or ``None`` if malformed."""
+        key = str(getattr(event, "key", "") or "")
+        fold = str(getattr(event, "fold", "") or "")
+        revision = int(getattr(event, "revision", 0) or 0)
+        seq = int(getattr(event, "seq", 0) or 0)
+        value = getattr(event, "value", None)
+        if not key or not fold or revision <= 0 or not isinstance(value, dict):
+            return None
+        return key, fold, revision, seq, value
+
+    def on_tree_advanced(self, event: Any) -> None:
+        """The session tree moved. Called on whichever thread changed it.
+
+        That is the emitter's writer thread for an open or a takeover, so this does what
+        :meth:`notify` does: no I/O, no lock, one hop to the loop. The event carries no
+        tree -- the push re-joins the projection against the live slots on the loop.
+        """
+        loop = self._loop
+        if loop is None:
+            return
+        try:
+            loop.call_soon_threadsafe(self._mark_tree)
+        except RuntimeError:
+            logger.debug("session tree change arrived after the loop closed")
+
+    # -- event loop --------------------------------------------------------- #
+
+    def _mark_tree(self) -> None:
+        """Arm ONE coalesced lineage push. On the loop.
+
+        A burst -- a lead opening six workers, a seed landing beside a turn's open -- is
+        one push after :data:`COALESCE_SECONDS`, not one per change.
+        """
+        if self._tree_scheduled or self._loop is None:
+            return
+        self._tree_scheduled = True
+        self._loop.call_later(COALESCE_SECONDS, self._push_tree)
+
+    def _push_tree(self) -> None:
+        """Send the slots whose ``parent`` moved. On the loop. Never raises."""
+        self._tree_scheduled = False
+        push = getattr(self._state, "push_lineage_patch", None)
+        if push is None:
+            return
+        try:
+            push()
+        except Exception:
+            logger.debug("session lineage push failed", exc_info=True)
+
+    def _push_fold(self, slot: str, fold: str, revision: int, value: "dict[str, Any]") -> None:
+        """Broadcast one folded slot value. On the loop.
+
+        An empty room is still a broadcast, which costs the hub one membership check and
+        keeps this path free of a second liveness rule to keep in step with
+        :meth:`_watchers`.
+        """
+        self._state.broadcast_ws_owners(
+            SLOT_FRAME,
+            {"slot": slot, "fold": fold, "revision": int(revision), "value": value},
+        )
+
+    def _schedule_session(
+        self, session_id: str, fold: str, revision: int, seq: int, value: "dict[str, Any]"
+    ) -> None:
+        """Queue one eagerly folded session value for the next coalesced send. On the loop.
+
+        COALESCED, unlike a slot fold, because a session fold moves on EVERY entry --
+        ``status`` counts them all, including each streamed ``message/chunk`` -- and the
+        eager worker folds as fast as entries land. Sending each of those values would
+        put a frame per chunk on every owner socket, where the panel can show one every
+        :data:`COALESCE_SECONDS`. So the newest value per (session, fold) is held and the
+        window sends it; the fold itself is not delayed, only the frame.
+        """
+        held = self._pending.get((session_id, fold))
+        if held is None or revision > held[0]:
+            self._pending[(session_id, fold)] = (revision, seq, value)
+        if self._sessions_armed:
+            return
+        loop = self._loop
+        if loop is None:
+            return
+        self._sessions_armed = True
+        loop.call_later(COALESCE_SECONDS, self._drain_sessions)
+
+    def _drain_sessions(self) -> None:
+        """Send every held session value. On the loop, at the end of a window."""
+        self._sessions_armed = False
+        pending, self._pending = self._pending, {}
+        loop = self._loop
+        if loop is None or not pending:
+            return
+        task = loop.create_task(self._send_pending(pending))
+        task.add_done_callback(_report_send_failure)
+
+    async def _send_pending(
+        self, pending: "dict[tuple[str, str], tuple[int, int, dict[str, Any]]]"
+    ) -> None:
+        for (session_id, fold), (revision, seq, value) in pending.items():
+            await self._send_session(session_id, fold, revision, seq, value)
+
+    async def _send_session(
+        self,
+        session_id: str,
+        fold: str,
+        revision: int,
+        seq: int,
+        value: "dict[str, Any]",
+        slot: "str | None" = None,
+    ) -> bool:
+        """Broadcast one session fold's value if it is newer than the last one sent.
+
+        *slot* is the session's slot when the caller already resolved it this pass, so a
+        pass over seven folds asks the header once rather than seven times.
+        """
+        sent = self._sent.get(session_id)
+        if sent is not None and sent.get(fold, 0) >= revision:
+            return False
+        if slot is None:
+            slot = await self._slot_of(session_id)
+        # Re-read after the await: a newer value may have been sent while the slot was
+        # being resolved, and sending this one after it would put an older value last.
+        sent = self._sent.get(session_id)
+        if sent is not None and sent.get(fold, 0) >= revision:
+            return False
+        if sent is None:
+            sent = self._sent[session_id] = {}
+        sent[fold] = revision
+        self._sent.move_to_end(session_id)
+        while len(self._sent) > MAX_CACHED_SESSIONS:
+            self._sent.popitem(last=False)
+        self._state.broadcast_ws_owners(
+            FRAME,
+            {
+                "session_id": session_id,
+                "slot": slot,
+                "name": fold,
+                "seq": int(seq),
+                "value": value,
+                "revision": int(revision),
+            },
+        )
+        return True
+
+    def _record_revision(self, slot: str, fold: str, revision: int) -> None:
+        """Remember *slot*'s *fold* was published at *revision*. Any thread."""
+        with self._revisions_lock:
+            folds = self._revisions.get(slot)
+            if folds is None:
+                folds = self._revisions[slot] = {}
+            folds[fold] = max(folds.get(fold, 0), revision)
+            self._revisions.move_to_end(slot)
+            while len(self._revisions) > MAX_CACHED_SLOT_OWNERS:
+                self._revisions.popitem(last=False)
+
+    def known_revisions(self) -> "dict[str, dict[str, int]]":
+        """The newest revision this process has published, per slot and fold.
+
+        What a client is told AT SUBSCRIBE TIME, before it issues its baseline reads
+        (:data:`SLOT_SUBSCRIBED_FRAME`). It is a floor and not a value: the client records
+        it, then discards any frame at or below it AND refuses to let a baseline response
+        that is older than it stand.
+
+        That ordering is the point. A baseline read already on the wire resolves into the
+        same cache entry a pushed frame writes, so without a floor established first the
+        older response wins by arriving last, and nothing is left to correct it.
+
+        A COPY taken under the lock, because the caller hands this to a serializer on
+        the loop while the fold worker may be writing the live map.
+        """
+        with self._revisions_lock:
+            return {slot: dict(folds) for slot, folds in self._revisions.items()}
 
     # -- event loop --------------------------------------------------------- #
 
@@ -1766,13 +2202,21 @@ class CrewLogPublisher:
             return
         from kiro_crew.crew_log.errors import CrewLogError
 
+        grown: dict[str, str] = {}
         for session_id in sessions:
             try:
-                await self._publish(session_id)
+                slot = await self._slot_of(session_id)
+                if await self._publish(session_id, slot):
+                    grown[session_id] = slot
             except CrewLogError as exc:
                 logger.debug("crew log fold refused for %s: %s", session_id, exc)
             except Exception:  # pragma: no cover - a push must not kill the loop
                 logger.debug("crew log publish failed for %s", session_id, exc_info=True)
+        # One frame per slot per pass: a slot's units growing together, or a team
+        # whose sessions all grew in one burst, is one re-read, not one each.
+        slots: dict[str, None] = {slot: None for slot in grown.values() if slot}
+        for slot in slots:
+            self._state.broadcast_ws_owners(SLOT_FRAME, {"slot": slot})
 
     def _watchers(self) -> bool:
         """Whether a dashboard user has a socket open."""
@@ -1784,35 +2228,47 @@ class CrewLogPublisher:
         except Exception:  # pragma: no cover - a probe failure is not a verdict
             return False
 
-    async def _publish(self, session_id: str) -> None:
+    async def _publish(self, session_id: str, slot: "str | None" = None) -> bool:
+        """Push every advertised fold of *session_id* that moved; whether any did.
+
+        The growth BACKSTOP. It reads the warm session memo the eager worker writes, so
+        when that worker already folded this growth the pass is a lookup and the
+        revisions it finds have already been sent; when the worker's wake was dropped,
+        this is the pass that folds and sends.
+
+        "Moved" is a revision above the last one SENT, so a log removed and recreated
+        under the same id -- which can come back at the same terminal seq carrying
+        different values -- still pushes: the memo refuses to continue a different
+        file and mints new revisions for every fold it rebuilt.
+        """
         projections = _crew_log()
-        before = self._bundles.get(session_id)
-        bundle = await asyncio.to_thread(
-            projections.fold_session,
-            session_id,
-            projections.PROJECTION_NAMES,
-            since=before,
-        )
-        self._bundles[session_id] = bundle
-        self._bundles.move_to_end(session_id)
-        while len(self._bundles) > MAX_CACHED_SESSIONS:
-            self._bundles.popitem(last=False)
-        # A seq is only comparable WITHIN one file. ``fold_session`` refuses to
-        # reuse a bundle whose origin does not match the file and rebuilds from the
-        # start, so a log removed and recreated can come back with the same
-        # terminal seq and entirely different values. Comparing seqs alone would
-        # read that as "nothing moved" and suppress every frame, leaving each
-        # client holding the retired file's projection with no later growth able to
-        # dislodge it. When the origin changes, every projection is new.
-        rebuilt = before is None or before.origin != bundle.origin
-        for name, checkpoint in bundle.checkpoints.items():
-            previous = before.checkpoints.get(name) if before is not None else None
-            if not rebuilt and previous is not None and previous.last_seq == checkpoint.last_seq:
+        warm = await asyncio.to_thread(projections.fold_session_warm, session_id)
+        moved = False
+        for name in projections.PROJECTION_NAMES:
+            rendered = warm.projection(name)
+            if rendered.revision <= 0:
                 continue
-            if checkpoint.last_seq == 0:
-                continue
-            value = projections.projection_of(checkpoint)
-            self._state.broadcast_ws_owners(FRAME, {"session_id": session_id, **value.to_dict()})
+            if slot is None:
+                slot = await self._slot_of(session_id)
+            if await self._send_session(
+                session_id, name, rendered.revision, rendered.seq, rendered.value, slot
+            ):
+                moved = True
+        return moved
+
+    async def _slot_of(self, session_id: str) -> str:
+        """The slot *session_id*'s unit belongs to, from its immutable header."""
+        cached = self._slot_owners.get(session_id)
+        if cached is not None:
+            self._slot_owners.move_to_end(session_id)
+            return cached
+        slot: str = await asyncio.to_thread(_crew_log().slot_of_session, session_id)
+        # An unprovable owner is not cached: the header may not be written yet.
+        if slot:
+            self._slot_owners[session_id] = slot
+            while len(self._slot_owners) > MAX_CACHED_SLOT_OWNERS:
+                self._slot_owners.popitem(last=False)
+        return slot
 
     # -- lifecycle ---------------------------------------------------------- #
 
@@ -1825,29 +2281,68 @@ class CrewLogPublisher:
         frame goes to a room nobody is in, which looks exactly like a session that
         stopped updating.
 
-        Scheduling flags belong to the loop that is going away: a timer armed on it
-        will never fire, and a flush marked in flight there will never finish. Left
-        set, ``_scheduled`` makes ``_mark`` believe a pass is already coming and
-        ``_flushing`` makes ``_run`` yield to a pass that does not exist, so the
-        publisher goes quiet for good. The dirty set is KEPT -- those sessions did
-        grow, the entries are on disk, and the next pass folds them forward.
+        EVERY scheduling flag belongs to the loop that is going away: a timer armed on
+        it will never fire, and a flush marked in flight there will never finish. Left
+        set, ``_scheduled`` makes ``_mark`` believe a pass is already coming,
+        ``_flushing`` makes ``_run`` yield to a pass that does not exist, and
+        ``_sessions_armed`` makes ``_schedule_session`` hold every session value for a
+        window that never closes -- so the publisher goes quiet for good and the held
+        map only grows. All three are cleared here.
+
+        The WORK they guarded is kept and re-armed on this loop: the dirty set (those
+        sessions did grow, the entries are on disk) and the held session values (the
+        newest per cell, which no later fold may repeat). Called on *loop*, so the
+        timers can be armed directly.
         """
         self._loop = loop
         if state is not None:
             self._state = state
+        tree_owed = self._tree_scheduled
         self._scheduled = False
         self._flushing = False
+        self._sessions_armed = False
+        self._tree_scheduled = False
+        if tree_owed:
+            # A push armed on the retiring loop never fires; re-arm it here so a tree
+            # change that landed during the swap still reaches the new sockets.
+            self._tree_scheduled = True
+            loop.call_later(COALESCE_SECONDS, self._push_tree)
+        if self._dirty:
+            self._scheduled = True
+            loop.call_later(COALESCE_SECONDS, self._run)
+        if self._pending:
+            self._sessions_armed = True
+            loop.call_later(COALESCE_SECONDS, self._drain_sessions)
+
+
+def _report_send_failure(task: "asyncio.Task[Any]") -> None:
+    """Log a session send that raised. A push must never take the loop down."""
+    if task.cancelled():
+        return
+    error = task.exception()
+    if error is not None:
+        logger.debug("crew log session push failed", exc_info=error)
 
 
 _publisher: CrewLogPublisher | None = None
 
 
+def live_publisher() -> "CrewLogPublisher | None":
+    """The installed publisher, or ``None`` when the crew log is off or not yet installed.
+
+    An accessor rather than the module global, so a caller reading the revision floor on
+    the socket path does not reach into another module's private name.
+    """
+    return _publisher
+
+
 def install_crew_log_publisher(state: Any) -> CrewLogPublisher | None:
     """Register the crew-log push with the emitter, once per process.
 
-    Returns ``None`` and does nothing when the crew log is switched off. This runs
-    on the gateway's boot path, so a launch without the flag must not pay for a
-    subsystem it will not use: the flag is read from the environment here, before
+    Returns ``None`` and does nothing when the crew log is switched off. The gateway
+    calls this once its listener is serving, so building the publisher never delays
+    the bind, and a launch that switches the flag off does not pay for a subsystem it
+    will not use at all: the flag is read from the environment here, before
     the emitter is imported and before a publisher is built. Importing the emitter
     to ask it whether it is enabled would be the cost itself, which is why the
     variable's name is spelled out below rather than read from that module.
@@ -1860,17 +2355,29 @@ def install_crew_log_publisher(state: Any) -> CrewLogPublisher | None:
     twice.
     """
     global _publisher
-    if not env_flag_enabled(CREW_LOG_ENV):
+    if not crew_log_enabled():
         return None
     loop = asyncio.get_running_loop()
     if _publisher is not None:
         _publisher.bind(loop, state)
+        _publisher.subscribe_bus()
         return _publisher
     from kiro_crew.crew_log import emit as crew_log_emit
 
     _publisher = CrewLogPublisher(state)
     _publisher.bind(loop, state)
     crew_log_emit.add_growth_listener(_publisher.notify)
+    # THE BUS SUBSCRIPTIONS, and the reason they are here rather than in the folder: this
+    # is the one place the dashboard state exists, so this is where a consumer of a
+    # crew-log event can be attached without the crew log naming the dashboard. The
+    # growth listener says a session's file moved; the bus says a fold's value moved and
+    # what it is, or that the session tree moved. A re-install swaps them through their
+    # disposers.
+    _publisher.subscribe_bus()
+    # The bus keeps nothing for a late subscriber, and a client can read the slot list
+    # before this line runs: its seed may already have landed and announced to nobody.
+    # One push now re-joins the tree against the live slots, so that page still nests.
+    _publisher._mark_tree()
     return _publisher
 
 

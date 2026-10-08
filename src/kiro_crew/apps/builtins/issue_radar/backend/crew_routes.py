@@ -2,12 +2,11 @@
 
 Registered from ``routes.register_routes`` (one import, one call) rather than by
 the app manifest, so this app still has exactly ONE place that lists its routes.
-It lives in its own module because ``routes.py`` is already 200KB and the crew
-surface is a separate feature with its own store; the shared request plumbing
-(``_key_from_request``, ``_str_field``, ``_st``, ``_require_enabled``,
-``_pr_action_preamble``, ``_audit``) is imported from ``routes`` rather than
-re-derived, because a second copy of a gate is how one of them eventually ships
-without the check.
+It lives in its own module because the crew surface is a separate feature with
+its own store; the shared request plumbing (``_key_from_request``,
+``_str_field``, ``_st``, ``_require_enabled``, ``_pr_action_preamble``,
+``_audit``) is imported from ``routes`` rather than re-derived, because a second
+copy of a gate is how one of them eventually ships without the check.
 
 Routes, all under ``/api/apps/issue-radar``:
 
@@ -43,10 +42,13 @@ WRITE-PERMISSION DECISION (the one this module had to make). Two tiers:
     same button.
 
   * Every LOCAL crew route (crews, crew, work, pause, settings) requires the repo
-    to be CONNECTED but **not** writable. Three reasons, in the order they
-    mattered:
+    to be CONNECTED but **not** writable. Its dashboard caller must also be the
+    dashboard OWNER (``_body_preamble``): a live crew runs under the owner's
+    auto-approve grant, so only the owner may create or steer one. Three reasons
+    for connected-not-writable, in the order they mattered:
       1. Precedent: ``_handle_put_investigation`` is the same shape — per-repo
-         local state, nothing reaches the forge — and is gated on connected only.
+         local state, nothing reaches the forge — and checks owner and connected,
+         never the forge permission.
       2. ``_repo_can_write`` FAILS CLOSED, and these writes are how a crew records
          work it has ALREADY done. Gating them on a remote permission read means a
          network blip leaves a crew holding a dirty worktree with no way to persist
@@ -56,9 +58,9 @@ WRITE-PERMISSION DECISION (the one this module had to make). Two tiers:
          suggest-only there, and a crew that investigates and records what it found
          without pushing is a legitimate configuration. Permissions can also be
          granted later without recreating the crew.
-    The exposure this accepts is bounded and local: a user who can reach the
-    dashboard can create crew records on a repo they cannot write to. Those records
-    cannot mutate the repo — the first forge write refuses.
+    The exposure this accepts is bounded and local: the owner can create crew
+    records on a repo they cannot write to. Those records cannot mutate the repo —
+    the first forge write refuses.
 
 ``crew_store.CrewStoreError`` maps to **409**, never 500: every raise is a
 user-visible condition (a duplicate crew name, a second item trying to enter an
@@ -128,7 +130,7 @@ _AGENT_REACHABLE: frozenset[tuple[str, str]] = frozenset(
     {("GET", "/crew"), ("PUT", "/crew/work")}
 )
 
-#: Work-item fields ``PUT /crew/work`` forwards to ``upsert_work_item``.
+#: Work-item fields ``PUT /crew/work`` forwards to ``commit_work_progress``.
 #:
 #: Listed explicitly so the envelope keys (owner/repo/crew_id/number/event/
 #: event_kind) cannot land in the patch, and so this route's writable surface is
@@ -174,10 +176,58 @@ def _crew_conflict(handler):
     async def _wrapped(request: web.Request) -> web.Response:
         try:
             return await handler(request)
+        except crew_store.CrewLedgerEntryTooLarge as exc:
+            # Can never land however often it is retried, so it is not a conflict: the
+            # caller has to record fewer or shorter fields, and 413 says exactly that.
+            return web.json_response(
+                {"error": str(exc), "code": "ledger_entry_too_large"}, status=413
+            )
+        except crew_store.CrewLedgerUnavailable as exc:
+            # A crew whose session has no crew log (log switched off, or no turn run
+            # yet) has nowhere to record into. Named so the agent can tell it from a
+            # refusal of the update itself and stop retrying the same body.
+            return web.json_response(
+                {"error": str(exc), "code": "crew_log_unavailable"}, status=409
+            )
+        except crew_store.CrewLedgerNotRecorded as exc:
+            # The writer drained and the entry is not in the log: nothing was
+            # recorded. A server-side failure of the write, not a conflict of the
+            # update, so 503 -- the same body may be sent again.
+            return web.json_response(
+                {"error": str(exc), "code": "ledger_not_recorded"}, status=503
+            )
         except crew_store.CrewStoreError as exc:
             return web.json_response({"error": str(exc), "code": "crew_conflict"}, status=409)
 
     return _wrapped
+
+
+def _crew_live_unit(request: web.Request, crew: dict[str, Any]) -> str:
+    """The crew log unit *crew*'s slot is serving on now, or ``""``.
+
+    A ledger entry is appended to the CREW's own crew log, whichever caller writes
+    it -- the agent, whose session key is the crew's slot, and the dashboard alike
+    -- so the unit is resolved from the crew's slot key and never from the caller's
+    session. An exact registry read plus an attribute read: no disk, no mutation of
+    session state as a side effect of describing it.
+
+    ``""`` when the slot has no live ACP session: the crew has never run a turn, or
+    its session was torn down and not yet re-created. The store refuses on that
+    rather than guessing a unit, because an update filed under the wrong session is
+    worse than one the caller is told did not land.
+    """
+    from kiro_crew.crew_log.resolve import unit_for_session_key
+
+    slot = str(crew.get("slot_key") or "")
+    state = request.app.get("state")
+    sessions = getattr(state, "sessions", None)
+    if not slot or sessions is None:
+        return ""
+    try:
+        return unit_for_session_key(sessions, f"dashboard:{slot}")
+    except Exception:
+        logger.debug("crew ledger: resolving the crew's live unit failed", exc_info=True)
+        return ""
 
 
 def _agent_gate(method: str, path: str, handler):
@@ -423,8 +473,16 @@ async def _json_object(request: web.Request) -> tuple[dict, web.Response | None]
 
 async def _body_preamble(
     request: web.Request,
+    operation: str,
 ) -> tuple[dict, provider.RepoKey, web.Response | None]:
-    """JSON body + owner/repo + the connected-repo gate, for the mutating routes.
+    """Owner gate + JSON body + owner/repo + the connected-repo gate, for the
+    mutating routes.
+
+    The owner gate runs first, before the body is read. Every route that calls
+    this preamble writes crew state the watchdog acts on (a live crew is launched
+    with an auto-approve grant in the owner's name), so only the dashboard owner
+    may reach it. An app token and a non-owner dashboard subject get the shared
+    403 ``owner_only``. ``operation`` names the route in that denial's audit row.
 
     Deliberately NOT ``routes._pr_action_preamble``: that one also demands
     ``_repo_can_write``, which these local-state writes intentionally do not
@@ -432,6 +490,11 @@ async def _body_preamble(
     non-object 400, the not-connected 404 — is the same, in the same order, so a
     caller cannot tell the two preambles apart except by the gate that differs.
     """
+    from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+
+    owner_denied = await require_owner_dashboard_request(request, operation)
+    if owner_denied is not None:
+        return {}, provider.RepoKey(), owner_denied
     raw, early = await _json_object(request)
     if early is not None:
         return {}, provider.RepoKey(), early
@@ -584,6 +647,7 @@ def _crew_page(owner: str, repo: str, crew_id: str, limit: int, root: Any) -> di
         who needs more.
     """
     skips = crew_store.read_skips(owner, repo, root)
+    folded = crew_store.read_ledger(owner, repo, crew_id, root)["counts"]
     return {
         "crew": crew_store.read_crew(owner, repo, crew_id, root),
         "items": crew_store.list_work_items(owner, repo, crew_id, root),
@@ -594,7 +658,15 @@ def _crew_page(owner: str, repo: str, crew_id: str, limit: int, root: Any) -> di
             {"number": row["number"], "reason": row["reason"], "scope": row["scope"]}
             for row in crew_store.recent_skips(owner, repo, root, limit=_MAX_RECENT_SKIPS)
         ],
-        "counts": {"open": crew_store.open_slot_count(owner, repo, crew_id, root)},
+        "counts": {
+            "open": crew_store.open_slot_count(owner, repo, crew_id, root),
+            # The fold counts what its bounded collections evicted so a crew can be
+            # told ONCE PER SNAPSHOT that something was dropped. Left in the fold
+            # value alone, nothing that reads ever said it -- and this payload is what
+            # ``issue_radar_crew_read`` serves.
+            "evicted_items": folded["evicted_items"],
+            "evicted_skips": folded["evicted_skips"],
+        },
     }
 
 
@@ -649,7 +721,7 @@ async def _handle_crew_create(request: web.Request) -> web.Response:
     duplicate comes back as the store's own 409 message, which names the taken
     name rather than a generic conflict.
     """
-    body, key, early = await _body_preamble(request)
+    body, key, early = await _body_preamble(request, "issue_radar.crew_create")
     if early is not None:
         return early
     if not routes._str_field(body, "name"):
@@ -752,7 +824,7 @@ async def _handle_crew_update(request: web.Request) -> web.Response:
     nudge firing before the watchdog's next sweep would take one whole auto-approved
     turn under a setting the human had already switched off.
     """
-    body, key, early = await _body_preamble(request)
+    body, key, early = await _body_preamble(request, "issue_radar.crew_update")
     if early is not None:
         return early
     crew_id = routes._str_field(body, "id")
@@ -779,7 +851,7 @@ async def _handle_crew_retire(request: web.Request) -> web.Response:
     make an old comment look like a live claim. Idempotent — retiring a retired
     crew re-stamps it rather than 409ing, so a double-click is not an error.
     """
-    body, key, early = await _body_preamble(request)
+    body, key, early = await _body_preamble(request, "issue_radar.crew_retire")
     if early is not None:
         return early
     crew_id = routes._str_field(body, "id")
@@ -890,7 +962,7 @@ async def _handle_crew_work(request: web.Request) -> web.Response:
             return early
         crew_id = str(crew.get("id") or "")
     else:
-        body, key, early = await _body_preamble(request)
+        body, key, early = await _body_preamble(request, "issue_radar.crew_work")
         if early is not None:
             return early
         crew_id = routes._str_field(body, "crew_id")
@@ -939,10 +1011,37 @@ async def _handle_crew_work(request: web.Request) -> web.Response:
              "code": "unexpected_number"},
             status=400,
         )
+    # `clear` names work-item fields this update EMPTIES. The tool schema keeps
+    # every field strictly typed (an integer cannot be null there), so this list
+    # is how a caller says "no pull request any more"; it becomes an explicit null
+    # in the patch, which the store records as a clear. A name that is not a
+    # clearable field is refused rather than ignored: a typo that no-ops would
+    # leave the caller believing a field was emptied.
+    clear_names: list[str] = []
+    if "clear" in body:
+        raw_clear = body["clear"]
+        if not isinstance(raw_clear, list) or not all(isinstance(n, str) for n in raw_clear):
+            return web.json_response(
+                {"error": "'clear' must be a list of field names", "code": "invalid_clear"},
+                status=400,
+            )
+        unknown = sorted(set(raw_clear) - set(crew_store.CLEARABLE_FIELDS))
+        if unknown:
+            return web.json_response(
+                {"error": (f"'clear' names {', '.join(repr(n) for n in unknown)}; the fields "
+                           f"that can be cleared are {', '.join(crew_store.CLEARABLE_FIELDS)}"),
+                 "code": "invalid_clear"},
+                status=400,
+            )
+        clear_names = list(dict.fromkeys(raw_clear))
 
-    _crew, missing = await _require_crew(key, crew_id, must_be_live=True)
+    crew, missing = await _require_crew(key, crew_id, must_be_live=True)
     if missing is not None:
         return missing
+    # The entry lands in the CREW's own crew log, whichever caller writes it, so the
+    # unit is resolved from the crew's slot rather than from the caller's session. A
+    # crew with no live session has no log to append to and the store refuses.
+    session_id = _crew_live_unit(request, crew)
 
     if crew_level:
         # Refused rather than dropped. Every field named here patches a WORK ITEM,
@@ -951,7 +1050,7 @@ async def _handle_crew_work(request: web.Request) -> web.Response:
         # stored anywhere. `skip_scope` is named alongside them because a pass is a
         # decision about one issue and is indexed by that issue's number.
         stray = sorted(
-            field for field in (*_WORK_PATCH_FIELDS, "skip_scope") if field in body
+            field for field in (*_WORK_PATCH_FIELDS, "skip_scope", "clear") if field in body
         )
         if stray:
             return web.json_response(
@@ -967,6 +1066,7 @@ async def _handle_crew_work(request: web.Request) -> web.Response:
             key.repo,
             crew_id,
             event_text,
+            session_id=session_id,
         )
         return web.json_response(checkpoint)
 
@@ -983,6 +1083,10 @@ async def _handle_crew_work(request: web.Request) -> web.Response:
         return number_error
 
     patch = {field: body[field] for field in _WORK_PATCH_FIELDS if field in body}
+    for name in clear_names:
+        # A field both cleared and set in one call keeps the set value, the same
+        # rule the fold applies to the entry.
+        patch.setdefault(name, None)
     # The route derives the pass's PROSE (only it has the request body); the store
     # owns the coupling — a non-`None` reason is what makes the transaction index
     # one, in the same call and under the same lock as the item and the line.
@@ -1001,6 +1105,7 @@ async def _handle_crew_work(request: web.Request) -> web.Response:
         event_text,
         skip_reason=skip_reason,
         skip_scope=routes._str_field(body, "skip_scope"),
+        session_id=session_id,
     )
     return web.json_response(committed)
 
@@ -1034,7 +1139,7 @@ async def _handle_crew_pause(request: web.Request) -> web.Response:
     resuming does not re-arm here, because the watchdog relaunches a live crew on
     its next cycle and doing it twice would arm two loops for one slot.
     """
-    body, key, early = await _body_preamble(request)
+    body, key, early = await _body_preamble(request, "issue_radar.crew_pause")
     if early is not None:
         return early
     paused = body.get("paused")
@@ -1136,7 +1241,7 @@ async def _handle_crews_settings_put(request: web.Request) -> web.Response:
     partial patch cannot discard a key it did not send and there is nothing for an
     optimistic-concurrency check to protect.
     """
-    body, key, early = await _body_preamble(request)
+    body, key, early = await _body_preamble(request, "issue_radar.crews_settings_put")
     if early is not None:
         return early
     patch = body.get("settings")

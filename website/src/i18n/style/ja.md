@@ -55,9 +55,12 @@ digits, no leading/trailing or doubled space).
 ### §1.1 Spacing at a script boundary
 
 Put a half-width space between a Latin run and adjacent Japanese
-(`Kiro Crew を起動`), except where the Latin run is the head of a compound the
-language has absorbed (`MCPサーバー`). This one is **review-only**: the boundary
-is a judgement call and a mechanical rule would fire on every absorbed compound.
+(`Kiro Crew を起動`, `MCP サーバー`), except where a Latin run that is NOT a
+do-not-translate term is the head of a compound the language has absorbed
+(`APIキー`). A do-not-translate term always takes the space: `i18n-translate.mjs
+verify` reads `MCPサーバー` as a dropped `MCP` and refuses the shard. Beyond that,
+this one is **review-only**: the boundary is a judgement call and a mechanical
+rule would fire on every absorbed compound.
 
 ---
 
@@ -88,15 +91,17 @@ reads as "light" or "right" access far sooner than "write".
 | present (attending) | 在席 | プレゼント |
 | open (a free slot) | 空き | 開く |
 
-Checked by `jaStyle.test.ts`, which only judges a key whose **English** carries
-the cue — so a legitimate `ライト` ("light theme") is never caught.
+`jaStyle.test.ts` checks the `write access` and `present` rows only when the
+**English** carries the cue, so a legitimate `ライト` ("light theme") is never caught.
+The `open` / free-slot row is review-only.
 
 ---
 
 ## §3 Do not translate
 
-Product names stay in Latin script. The list is in `glossary.json` under `dnt`:
-`KiroCrew` / `Kiro Crew`, `Kiro`, `Slack`, `Discord`, `MCP`, `GitHub`, `Playwright`, etc.
+Product names stay in Latin script. The canonical list in `glossary.json` includes
+`KiroCrew`, `Kiro`, `Slack`, `Discord`, `MCP`, `GitHub`, `Playwright`, and others. The
+prose brand `Kiro Crew` also remains unchanged.
 
 Also stays in English: AWS service names, key legends (Enter, Shift, ⌘),
 `main`/`origin`/`HEAD`, paths, filenames, config keys, and `cron` (the syntax —
@@ -162,6 +167,7 @@ copy must not add fragments: one key per sentence.
 | no ideographic space | `jaStyle.test.ts` |
 | no space inside a katakana compound | `jaStyle.test.ts` |
 | trailing long-vowel mark kept | `jaStyle.test.ts` |
+| `write access` and `present` use their context-specific terms | `jaStyle.test.ts` |
 | no だ・である ending, no kanji auxiliaries | `jaStyle.test.ts` |
 | balanced brackets and quotes, incl. mixed width | `qa.test.ts` |
 | no full-width Latin or digits | `qa.test.ts` |
@@ -170,5 +176,5 @@ copy must not add fragments: one key per sentence.
 | correct CLDR plural categories (1: other) | `catalogParity.test.ts` |
 | do-not-translate terms present | `glossary.test.ts` |
 
-Everything in §1.1, §3 and the rest of §4 is review-only — the judgements a human
-has to make.
+Everything in §1.1, the `open` row of §2.1, §3 and the rest of §4 is review-only —
+the judgements a human has to make.
