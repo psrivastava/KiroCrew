@@ -89,6 +89,14 @@ from kiro_crew.apps.official_category_order import forget_cache as forget_catego
 from kiro_crew.apps.official_category_order import load_category_order
 from kiro_crew.apps.official_editorial import forget_cache as forget_editorial_cache
 from kiro_crew.apps.official_editorial import load_sections
+from kiro_crew.apps.proxy_auth import (
+    PRINCIPAL_AGENT_TOOL,
+    PRINCIPAL_APP_TOKEN,
+    PRINCIPAL_NONE,
+    PRINCIPAL_OWNER_SESSION,
+    PROXY_PRINCIPAL_HEADER,
+    sign_proxy_principal_claim,
+)
 from kiro_crew.apps.registry import (
     _ART_IMAGE_EXTENSIONS,
     _ART_MANIFEST_FIELDS,
@@ -130,12 +138,10 @@ from kiro_crew.apps.registry_pipeline.checkout import _HOOKS_NEUTRALIZER_ARGV
 from kiro_crew.apps.spawn_sdk import build_spawn_impl
 from kiro_crew.apps.teardown import forget_app_hooks, teardown_app_runtime
 from kiro_crew.apps.version import check_min_version as _check_min_version_str
-from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.loader import (
     ConfigReadError,
     KiroCrewConfig,
     config_path,
-    read_config_text,
     update_config_locked,
 )
 from kiro_crew.cron import CronStoreBusy, CronStoreUnreadable
@@ -2010,9 +2016,20 @@ async def handle_enable_app(request: web.Request) -> web.Response:
             # same "no body" path as malformed JSON, not a 500.
             pass
     session_approval_consent = body.get("sessionApprovalConsent") is True
-    if session_approval_consent:
+    # The entries the owner was shown, as {"api": [...], "events": [...]}.
+    # Anything else approves nothing: a bare flag cannot say what was seen.
+    raw_grants = body.get("grantsConsent")
+    grants_consent: dict[str, list[str]] | None = None
+    if isinstance(raw_grants, dict):
+        grants_consent = {
+            family: [e for e in raw_grants.get(family) or [] if isinstance(e, str)]
+            for family in ("api", "events")
+            if isinstance(raw_grants.get(family) or [], list)
+        }
+    if session_approval_consent or grants_consent is not None:
         # Consent hands an app control of the OWNER's sessions, so only the
         # owner can give it. Same gate the other machine-global mutations use.
+        # Approving held-back api/events entries widens the app the same way.
         from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
 
         denied = await require_owner_dashboard_request(request, "app_enable_session_consent")
@@ -2032,7 +2049,11 @@ async def handle_enable_app(request: web.Request) -> web.Response:
         # A re-enable repeats every step but the Python hooks: the flag does not prove
         # onEnable ran (a file-only CLI enable skips it), while hook_reconcile loads hooks.
         was_enabled = app_enabled_state(name) is True
-        result = enable_app(name, session_approval_consent=session_approval_consent)
+        result = enable_app(
+            name,
+            session_approval_consent=session_approval_consent,
+            grants_consent=grants_consent,
+        )
         if not result.ok:
             sel().log_api_access(
                 caller="dashboard",
@@ -4264,6 +4285,13 @@ _PROXY_HOP_HEADERS = frozenset(
 # subprocess that also serves content from the user's own projects. The HMAC is
 # all the backend needs to trust a proxied request, so dropping the rest is a
 # pure hardening with no functional loss.
+#
+# The two gateway-authored proxy headers are stripped too. For an app that has
+# not opted in to ``backend.signedPrincipal``, a caller-sent
+# ``x-kirocrew-principal`` would otherwise reach a backend that never asked for
+# one, and could pass for the gateway's. For ``x-kirocrew-proxy``, stripping the
+# caller's copy first keeps the outgoing request from depending on which spelling
+# of a header the HTTP client lets win when the gateway sets its own value below.
 _PROXY_STRIP_HEADERS = _PROXY_HOP_HEADERS | frozenset(
     {
         "cookie",
@@ -4272,6 +4300,8 @@ _PROXY_STRIP_HEADERS = _PROXY_HOP_HEADERS | frozenset(
         "x-session-token",
         "x-session-key",
         "x-internal-caller",
+        "x-kirocrew-proxy",
+        "x-kirocrew-principal",
     }
 )
 
@@ -4309,6 +4339,33 @@ def _resolve_app_backend_url(name: str) -> str | None:
     # app resolves a backend here and is then refused below with 502 "has no
     # secret", which is not detectable at registration time.
     return resolve_mcp_backend_url(manifest.mcpServers)
+
+
+def _proxy_principal(request: web.Request) -> tuple[str, str]:
+    """The ``(kind, owner_id)`` an opted-in backend's principal claim carries.
+
+    Read only from what ``token_auth_middleware`` already authenticated, never from
+    a request header, and checked in this order:
+
+    1. ``agent-tool``: internal authentication granted the call. MCP tools, agents,
+       subagents and crons reach admitted routes this way. It is checked first so a
+       request that also carries an owner cookie can never inherit the owner's trust.
+    2. ``app-token``: the caller holds an app token.
+    3. ``owner-session``: a dashboard session cookie authenticated the request, not a
+       ``?token=`` link, and the shared owner predicate matches. Only this kind names
+       an owner.
+    4. ``none``: everything else.
+    """
+    if request.get("internal_auth") is True:
+        return PRINCIPAL_AGENT_TOOL, ""
+    if request.get("app"):
+        return PRINCIPAL_APP_TOKEN, ""
+    if request.get("is_dashboard_user") is True and request.get("auth_from_query_token") is False:
+        from kiro_crew.dashboard.handlers.source_providers import is_owner_dashboard_request
+
+        if is_owner_dashboard_request(request):
+            return PRINCIPAL_OWNER_SESSION, str(request.get("user") or "")
+    return PRINCIPAL_NONE, ""
 
 
 async def handle_app_api_proxy(request: web.Request) -> web.StreamResponse:
@@ -4435,6 +4492,33 @@ async def handle_app_api_proxy(request: web.Request) -> web.StreamResponse:
             {"error": "proxy auth failed: cannot read app secret"},
             status=502,
         )
+
+    # Opt-in only: an app without ``backend.signedPrincipal`` receives no principal
+    # header. Read off the loop, like the enablement gate above, because it is a file.
+    manifest = await asyncio.to_thread(get_app_manifest, name)
+    if manifest is not None and manifest.backend.signedPrincipal:
+        principal_kind, owner_id = _proxy_principal(request)
+        try:
+            headers[PROXY_PRINCIPAL_HEADER] = sign_proxy_principal_claim(
+                kind=principal_kind,
+                owner_id=owner_id,
+                method=request.method,
+                target=wire_target,
+                body=body or b"",
+                secret=secret,
+            )
+        except ValueError as exc:
+            # The signer refuses a claim outside its one valid shape, such as an owner
+            # id with a control character. Forwarding the request without its claim
+            # would hand an opted-in backend a request it cannot classify, so refuse.
+            logger.warning("Failed to sign the principal claim for %s: %s", name, exc)
+            return web.json_response(
+                {
+                    "code": "proxy_principal_sign_failed",
+                    "error": "proxy auth failed: cannot sign principal claim",
+                },
+                status=502,
+            )
 
     # Set once the relay has begun. The two handlers below consult it: after
     # the head has gone out, no status of the gateway's own can be sent any more.
@@ -4777,13 +4861,51 @@ async def handle_registries(request: web.Request) -> web.Response:
             stripped_claims.append(name)
         validated.append({"name": name, "repo": repo, "branch": branch, "trust": trust})
 
-    # Update config file (atomic write to prevent corruption on crash)
+    # The registry list is part of config.json, so its read-modify-write must
+    # serialize against BOTH config writer generations, not just one: the sidecar
+    # advisory flock that ``update_config_locked`` takes, and the loop-side
+    # ``_get_config_lock`` asyncio lock that the legacy dashboard writers (agents
+    # endpoint, updates.py, security.py, messaging.py, mcp.py, core.py STT) still
+    # serialize on ALONE. Holding only the flock does not exclude that family, so
+    # a concurrent PUT there could commit from a snapshot taken before this write
+    # and silently revert it — the lost update ``config/loader.py`` warns about
+    # when it says such callers must ALSO hold the in-process asyncio lock.
+    # ``run_config_write`` is the one entry point that holds both, and it still
+    # hands the blocking work to a worker, so the loop never stalls.
+    #
+    # Call-time import, deliberately, and NOT under AUTOSDE ``top-level-imports``'
+    # circular-import exception -- there is no cycle on this edge today; every
+    # import order was checked.  The reason is layering and load cost, both
+    # checkable:
+    #
+    #   * No module in ``src/kiro_crew/apps/`` imports ``kiro_crew.dashboard`` at
+    #     module scope.  Not one.  ``apps`` sits below ``dashboard``, and hoisting
+    #     this would create the package's first load-time edge in the wrong
+    #     direction -- into a package that already imports back into this one
+    #     (``dashboard/routes/system.py``, ``dashboard/handlers/security.py``).
+    #     ``apps.manager`` already defers its ``apps.routes`` import for a cycle
+    #     that IS real; widening the graph here makes that worse, not better.
+    #   * Measured: hoisting pulls 117 additional modules into every importer of
+    #     ``apps.routes`` (479 -> 596), and loads the whole ``dashboard.chat_utils``
+    #     tree on paths that today never touch it.
+    #
+    # Same reasoning, same file, as ``handle_app_uninstall``'s lazy
+    # ``_get_config_lock`` import; ``run_config_write`` itself defers that import
+    # for an outright cycle.
+    from kiro_crew.dashboard.chat_utils import run_config_write
+
     cfg = Path(config_path())
     try:
-        data = json.loads(read_config_text(cfg)) if cfg.is_file() else {}
-        if not isinstance(data, dict):
-            raise json.JSONDecodeError("config.json is not a JSON object", "", 0)
-    except json.JSONDecodeError:
+        newly_trusted = await run_config_write(_write_registries_config, cfg, validated)
+    except ConfigReadError as exc:
+        if isinstance(exc.__cause__, OSError):
+            sel().log_api_access(
+                caller="dashboard",
+                operation="registries.update",
+                outcome="failed",
+                resources=f"config read error: {exc.__cause__}",
+            )
+            return web.json_response({"error": f"cannot read config: {exc.__cause__}"}, status=500)
         sel().log_api_access(
             caller="dashboard",
             operation="registries.update",
@@ -4799,43 +4921,22 @@ async def handle_registries(request: web.Request) -> web.Response:
             caller="dashboard",
             operation="registries.update",
             outcome="failed",
-            resources=f"config read error: {exc}",
+            resources=f"config write error: {exc}",
         )
-        return web.json_response({"error": f"cannot read config: {exc}"}, status=500)
-    # Detect hosts this PUT newly introduces to the registry trust set. A
-    # configured registry host is fed into the loosened-sandbox / SSH-clone
-    # trust set (see registry._configured_registry_hosts) AND its apps become
-    # installable with gateway privileges, so admitting a host is a genuine
-    # trust grant — not just a config edit. The generic ``registries.update``
-    # event does not record WHICH host gained trust, leaving an unreconstructable
-    # audit gap; emit a distinct, per-host ``registries.host_trust_granted``
-    # event so incident response can always establish when/how a host entered
-    # the trust set. Compare against the PRIOR on-disk config, not the freshly
-    # validated list, so re-saving an unchanged list emits nothing.
-    # ``data.get("registries") or []`` (not ``data.get("registries", [])``):
-    # a config carrying an explicit ``"registries": null`` loads fine elsewhere
-    # via the same ``or []`` idiom, so iterating the bare ``.get`` default would
-    # attempt to loop over ``None`` and turn this repair-PUT into an HTTP 500,
-    # blocking the only dashboard path that could fix the malformed value.
-    prior = data.get("registries") or []
-    prior_hosts = {
-        h for r in prior if isinstance(r, dict) and (h := _git_url_host(str(r.get("repo", ""))))
-    }
-    newly_trusted_hosts: list[str] = []
-    for r in validated:
-        host = _git_url_host(r["repo"])
-        if host and host not in prior_hosts and host not in newly_trusted_hosts:
-            newly_trusted_hosts.append(host)
-            sel().log_api_access(
-                caller="dashboard",
-                operation="registries.host_trust_granted",
-                outcome="success",
-                resources=f"host={host} repo={_strip_git_target_userinfo(r['repo'])}",
-            )
+        return web.json_response(
+            {
+                "error": f"cannot write config: {exc}",
+                "code": "registries_config_write_failed",
+            },
+            status=500,
+        )
 
-    data["registries"] = validated
-    cfg.parent.mkdir(parents=True, exist_ok=True)
-    atomic_write(cfg, json.dumps(data, indent=2) + "\n")
+    # The per-host trust grants are audited by ``_write_registries_config`` itself,
+    # on the worker thread that committed them -- see the comment there for why
+    # this cannot be done here.  What remains is the API-outcome event, which
+    # correctly belongs to the request: if the caller was cancelled it never runs,
+    # because the request did not succeed.
+    newly_trusted_hosts = [host for host, _repo in newly_trusted]
 
     sel().log_api_access(
         caller="dashboard",
@@ -4859,6 +4960,73 @@ async def handle_registries(request: web.Request) -> web.Response:
             "newlyTrustedHosts": newly_trusted_hosts,
         }
     )
+
+
+def _write_registries_config(cfg: Path, validated: list[dict[str, str]]) -> list[tuple[str, str]]:
+    """Replace the registry trust set under the config lock, off the loop.
+
+    Emits a per-host ``registries.host_trust_granted`` SEL event after, and only
+    after, the write commits, and returns each newly trusted ``(host, repo)`` pair
+    for the response body.  Host discovery belongs inside the locked mutation:
+    comparing with a pre-lock snapshot would race a concurrent config writer and
+    could report a grant that was not new.
+
+    Why the returned hosts are audited at all: a configured registry host is fed
+    into the loosened-sandbox / SSH-clone trust set (see
+    ``registry._configured_registry_hosts``) AND its apps become installable with
+    gateway privileges, so admitting a host is a genuine trust grant, not just a
+    config edit.  The generic ``registries.update`` event does not record WHICH
+    host gained trust, leaving an unreconstructable audit gap; a distinct per-host
+    ``registries.host_trust_granted`` event lets incident response always establish
+    when and how a host entered the trust set.  Comparison is
+    against the PRIOR on-disk config rather than the freshly validated list, so
+    re-saving an unchanged list emits nothing.
+    """
+    newly_trusted: list[tuple[str, str]] = []
+
+    def _mutate(data: dict) -> dict:
+        # ``or []`` deliberately treats a legacy explicit null as an empty list,
+        # keeping PUT as the repair path for that otherwise valid JSON value.
+        prior = data.get("registries") or []
+        prior_hosts = {
+            host
+            for row in prior
+            if isinstance(row, dict) and (host := _git_url_host(str(row.get("repo", ""))))
+        }
+        seen_hosts: set[str] = set()
+        for row in validated:
+            host = _git_url_host(row["repo"])
+            if host and host not in prior_hosts and host not in seen_hosts:
+                seen_hosts.add(host)
+                newly_trusted.append((host, _strip_git_target_userinfo(row["repo"])))
+        data["registries"] = validated
+        return data
+
+    update_config_locked(cfg, mutate=_mutate)
+
+    # Audit HERE, in the worker, and not in the async caller.  ``run_config_write``
+    # shields this thread and drains it across cancellation, then re-raises
+    # ``CancelledError`` and DISCARDS the return value.  A gateway shutdown or a
+    # client disconnect landing in that window therefore commits the trust grant
+    # and never reaches an audit emitted by the caller -- persisted trust with no
+    # ``host_trust_granted`` record, which is precisely the reconstruction gap
+    # this event exists to close.  Emitting on the thread that completed the write
+    # binds the event to the commit: the two cannot disagree, because nothing can
+    # interrupt a thread between these two statements.
+    #
+    # Still strictly after ``update_config_locked`` returns, so a failed write
+    # raises before any grant is announced.  SEL is thread-safe and adapts to an
+    # off-loop caller (``_on_event_loop``), and a non-critical event swallows
+    # filesystem errors rather than raising, so this cannot turn a committed
+    # write into a 500.
+    for host, public_repo in newly_trusted:
+        sel().log_api_access(
+            caller="dashboard",
+            operation="registries.host_trust_granted",
+            outcome="success",
+            resources=f"host={host} repo={public_repo}",
+        )
+    return newly_trusted
 
 
 async def handle_registries_refresh(request: web.Request) -> web.Response:

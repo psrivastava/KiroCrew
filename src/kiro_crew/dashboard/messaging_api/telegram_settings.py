@@ -10,8 +10,8 @@ token values are write-only (rotate at @BotFather if ever needed).
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
-import os
 from typing import TYPE_CHECKING, Any
 
 from aiohttp import web
@@ -27,11 +27,12 @@ if TYPE_CHECKING:
         _mask_secret,
         _sel,
         _threshold_pct_rejection,
-        _write_env_off_loop,
+        _write_env_or_roll_back,
         channel_restart_required,
         clean_session_folder,
         ensure_channel_folder,
         is_direct_local_request,
+        live,
         read_config_text,
         run_to_completion,
         stored_folder_name,
@@ -379,20 +380,33 @@ async def _telegram_config_save_locked(request: web.Request) -> web.Response:
     # ``.env`` slot cannot leave a fallback behind. Absent, the drop is a no-op
     # and the write is skipped.
     purge_legacy_token = CRED_TELEGRAM_BOT_TOKEN in env_updates
-    if staged or purge_legacy_token:
-        tg_cfg.update(staged)
-        # Through ``update_config_locked``: it holds the advisory lock on the
-        # sidecar ``<path>.lock`` across the whole read-modify-write, so a writer
-        # in ANOTHER PROCESS cannot land between our read and our write, and the
-        # staged keys (plus the legacy ``bot_token`` purge) are merged into the
-        # file as re-read inside that lock. Off-loop: file IO, and it may wait on
-        # another holder of the lock.
-        try:
-            await _LockedSectionWrite(
+    cfg_write: _LockedSectionWrite | None = None
+    # Hold the live-config watcher across the config+credential pair: a failed
+    # .env write rolls the config back, so nothing in between may be applied
+    # to the running gateway.
+    with live.hold():
+        if staged or purge_legacy_token:
+            tg_cfg.update(staged)
+            # Through ``update_config_locked``: it holds the advisory lock on the
+            # sidecar ``<path>.lock`` across the whole read-modify-write, so a writer
+            # in ANOTHER PROCESS cannot land between our read and our write, and the
+            # staged keys (plus the legacy ``bot_token`` purge) are merged into the
+            # file as re-read inside that lock. Off-loop: file IO, and it may wait on
+            # another holder of the lock.
+            cfg_write = _LockedSectionWrite(
                 path, "telegram", staged, drop_keys=("bot_token",) if purge_legacy_token else ()
-            ).commit()
-        except ConfigReadError:
-            return _deny("config.json is corrupt", status=500)
+            )
+            try:
+                await cfg_write.commit()
+            except ConfigReadError:
+                return _deny("config.json is corrupt", status=500)
+        if env_updates:
+            # A failed .env write undoes the config commit above, so a refused
+            # save changes nothing (see _write_env_or_roll_back).
+            rollback = (
+                functools.partial(cfg_write.rollback, "Telegram") if cfg_write is not None else None
+            )
+            await _write_env_or_roll_back(env_updates, rollback)
 
     # Create the configured session folder now, on this user-initiated save,
     # so the reconcile path never has to write the folder store. Best-effort:
@@ -407,18 +421,6 @@ async def _telegram_config_save_locked(request: web.Request) -> web.Response:
                 _folder_name,
                 relabel="session_folder" in staged,
             )
-    if env_updates:
-        # Off-loop: the .env write is blocking file IO (lock, temp write,
-        # owner-only lockdown, replace) and must not block the event loop.
-        await _write_env_off_loop(env_updates, config_kept=True)
-        # Keep the live process environment in sync with the new .env state
-        # (load_credentials() lets os.environ win over .env — see the Slack
-        # save handler for the full rationale).
-        for key, new_val in env_updates.items():
-            if new_val is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = new_val
 
     _sel().log_api_access(
         caller=caller,

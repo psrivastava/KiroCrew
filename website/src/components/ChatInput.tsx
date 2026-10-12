@@ -1,4 +1,6 @@
 import { useRef, useEffect, useMemo, useCallback, useId, memo, lazy, Suspense } from 'react'
+import { GUIDE_KEEP_CLEAR } from '../guide/trustRoot'
+import { useGuidePredicate } from '../guide/guidePredicates'
 import { markComposerResize } from '../utils/composerResize'
 import { ArrowUp, Loader2, RotateCw, Sparkles, Target, CheckCircle, Lock, FolderOpen, ClipboardList, PenLine, MoreHorizontal, Terminal } from 'lucide-react'
 import SketchDialog from './SketchDialog'
@@ -21,6 +23,7 @@ import { useComposerSendMode } from '../hooks/useComposerSendMode'
 import TrustDropdown from './TrustDropdown'
 import { useIsMobile } from '../hooks/useIsMobile'
 import { isTouchDevice } from '../utils/isTouchDevice'
+import { focusComposerAfterPick as pickerFocusAfterPick } from './chat-input/pickerFocus'
 import ErrorNotice from './ErrorNotice'
 import PromptLengthNotice from './PromptLengthNotice'
 import RunInTerminalConfirm from './RunInTerminalConfirm'
@@ -40,6 +43,7 @@ import { useStopDeclinedHint } from '../hooks/useStopDeclinedHint'
 import { useScrollEdges } from '../hooks/useScrollEdges'
 import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem } from './ui/dropdown-menu'
 import { i18nT } from '../i18n/t'
+import { uiLocation } from '../uiLocations/uiLocation'
 import { fmtDateFields } from '../i18n/format'
 import SessionRefStrip from './SessionRefStrip'
 import { Glass } from './Glass'
@@ -57,6 +61,7 @@ import { useAutoCompactThreshold } from './chat-input/autoCompact'
 import { AttachMenu, usePlusMenu } from './chat-input/attach'
 import { BusySendControls, CompactingIndicator, useComposerSend } from './chat-input/busySend'
 import { CollapsedComposerBar, collapseMenuRowElement, useComposerCollapse } from './chat-input/collapse'
+import { useGuideRevealScope } from '../guide/GuideRevealScope'
 import { useComposerFocus, useComposerKeyDown, useEditorInput } from './chat-input/keyboard'
 import { INPUT_DRAG_MIN_H, useManualHeight, useStripHeights, useTextareaAutosize } from './chat-input/sizing'
 import { usePromptHistory, useUndoHistory } from './chat-input/draftHistory'
@@ -177,6 +182,7 @@ function ChatInput({
   onFileSelect,
   onTreeEntryDrop,
   clampDropOffset,
+  onMentionKey,
   onFileOpen,
   project,
   projectBranch,
@@ -199,6 +205,7 @@ function ChatInput({
   quickSend,
   followUpLayout,
   followUpSourceKey,
+  followUpMulti = true,
   followUpPendingOptions,
   followUpRefusedOptions,
   followUpError,
@@ -249,6 +256,7 @@ function ChatInput({
     onVoiceStop,
     voiceCaptureActive,
     voiceError = null,
+    voiceKeptRecording = null,
     voiceLevel = 0,
     voiceDeviceLabel = '',
     voiceDeviceId = '',
@@ -326,6 +334,10 @@ function ChatInput({
   // cleared by the chip's `click`, so a keyboard activation (no mousedown; the
   // chip itself is focused) reads false rather than a stale press.
   const modelChipPressedFromComposerRef = useRef(false)
+  // Focus hand-back for the control-row pickers after a PICK -- see
+  // `chat-input/pickerFocus.ts` for the contract (why it reports where focus
+  // LANDED, and why touch and a disabled box return false).
+  const focusComposerAfterPick = useCallback(() => pickerFocusAfterPick(composerControl()), [composerControl])
   // Attribute the Lexical editor's own growth to the composer (see
   // composerResize.ts). The textarea path attributes inside `applyHeight`, which
   // the contenteditable never runs — its box grows through CSS min/max-height as
@@ -354,7 +366,7 @@ function ChatInput({
   const { anyPickerOpenRef, closePickers, openPickersForText, prefetchSkills } = pickers
   const { publishLexicalSelection, recordCaret, showDictation, cancelVoiceDrain } = useDictationControls({
     composerControl, value, autoFocusKey, anyPickerOpenRef, voiceCaretRef, voicePendingCaretRef, voiceDictationPanel,
-    voiceRecording, voiceError, voiceSampleRef, voiceTranscribing, onVoiceCancel, onVoiceToggle,
+    voiceRecording, voiceDrainCancellable, voiceError, voiceSampleRef, voiceTranscribing, onVoiceCancel, onVoiceToggle,
   })
   const wrapperRef = useRef<HTMLDivElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
@@ -373,7 +385,7 @@ function ChatInput({
       : `${base}\n${i18nT('components.chatInput.branch', { branch: projectBranch })}`
   }, [project, projectBranch, projectDetached])
   const { ctxPopoverOpen, setCtxPopoverOpen, ctxWrapRef } = useContextPopover()
-  const plus = usePlusMenu({ pickers, value, onChange, composerControl })
+  const plus = usePlusMenu({ pickers, value, onChange, composerControl, fileInputRef })
   const { setPlusOpen, sketchOpen, setSketchOpen } = plus
   // Client-side `accept` is a UX hint only (input-validation guidance: server enforces type via
   // magic bytes, size, and malware scanning — never trust the extension/MIME here).
@@ -416,6 +428,8 @@ function ChatInput({
   const { botName } = useBranding()
   const isMobile = useIsMobile()
   const directFilePicker = isMobile || isTouchDevice()
+  // The "+" menu is drawn for a mouse; on touch the file picker opens directly.
+  useGuidePredicate('mouse_input', !isTouchDevice())
   const [attachControlRow, controlRowEdges, remeasureControlRow] = useScrollEdges<HTMLDivElement>()
   // The control row's chips are prop-driven (the auto-nudge loop chip, the
   // approval-mode picker) and appear or change label while the row keeps its
@@ -454,6 +468,9 @@ function ChatInput({
     : 'components.chatInput.continue_thread')
   const autoCompactThreshold = useAutoCompactThreshold({ activeSlot, ctxPopoverOpen, queryClient, dispatch })
   const { composerCollapsed, collapsedBarRef, collapseComposer, expandComposer, collapsedDraftLine } = useComposerCollapse({ collapsible, composerControl, value })
+  // The message box's guide scope (`composer.box`): a step through the
+  // collapsed bar completes the moment the box reads open again.
+  useGuideRevealScope('composer.box', !composerCollapsed)
   const collapseMenuRow = collapsible ? collapseMenuRowElement(() => { setPlusOpen(false); collapseComposer() }) : null
   // Refs mirror frequently-changing props/state read from inside the keydown handler
   // so it doesn't re-create on every keystroke.
@@ -539,7 +556,7 @@ function ChatInput({
     [promptOptimizer, connected, optimizePrompt],
   )
   const handleKeyDown = useComposerKeyDown({
-    rawPasteRef, handleUndoKey, endUndoBurst, handleTokenKey, promptOptimizer: promptOptimizer && !terminal.active, connected, optimizePrompt, sendOnEnter, onChange, optimizingRef,
+    rawPasteRef, handleUndoKey, endUndoBurst, handleTokenKey, onMentionKey, promptOptimizer: promptOptimizer && !terminal.active, connected, optimizePrompt, sendOnEnter, onChange, valueFromUserRef, optimizingRef,
     fireComposer, ime, sentMessages, onEditLastRequest, anyPickerOpenRef, promptHistory, valueRef, inputRef, pasteBlocksRef,
   })
   const { handleTextareaChange, handleLexicalChange } = useEditorInput({ onChange, valueFromUserRef, openPickersForText, recordCaret, lexicalControlRef, voiceCaretRef })
@@ -637,7 +654,7 @@ function ChatInput({
 
       {/* Ghost follow-up bubbles floating above input */}
       {!showGhost && followUpOptions && followUpOptions.length > 0 && onFollowUpSelect && (
-          <FollowUpBar options={followUpOptions} picked={followUpPicked ?? new Set()} onSelect={selectFollowUp} onSend={fireFollowUp} quickSend={quickSend} layout={followUpLayout} sourceKey={followUpSourceKey} pendingOptions={followUpPendingOptions} refusedOptions={followUpRefusedOptions} error={followUpError} />
+          <FollowUpBar options={followUpOptions} picked={followUpPicked ?? new Set()} onSelect={selectFollowUp} onSend={fireFollowUp} quickSend={quickSend} multi={followUpMulti} layout={followUpLayout} sourceKey={followUpSourceKey} pendingOptions={followUpPendingOptions} refusedOptions={followUpRefusedOptions} error={followUpError} />
       )}
 
       {/* Tip / folder-suggestion band — LAST above the composer so it always
@@ -708,6 +725,7 @@ function ChatInput({
       <Glass
         radius={16}
         data-testid="composer-dock"
+        {...GUIDE_KEEP_CLEAR}
         className={hasApproval ? 'glass-shadow approval-glow' : 'glass-shadow'}
       >
       <AnimatePresence>
@@ -984,7 +1002,7 @@ function ChatInput({
         <VoiceCaptureStatus
           voiceHoldMode={voiceHoldMode} touchPtt={touchPtt} showDictation={showDictation} value={value} voicePartial={voicePartial}
           voiceDeviceLabel={voiceDeviceLabel} voiceDeviceId={voiceDeviceId} onSelectVoiceDevice={onSelectVoiceDevice} voiceDeviceSwitchIsLive={voiceDeviceSwitchIsLive}
-          voiceStreaming={voiceStreaming} voiceDownload={voiceDownload} voiceRecording={voiceRecording} voiceLevel={voiceLevel} voiceError={voiceError}
+          voiceStreaming={voiceStreaming} voiceDownload={voiceDownload} voiceRecording={voiceRecording} voiceLevel={voiceLevel} voiceError={voiceError} voiceKeptRecording={voiceKeptRecording}
           onClearVoiceError={onClearVoiceError} voiceDrainCancellable={voiceDrainCancellable} cancelVoiceDrain={cancelVoiceDrain} onVoiceToggle={onVoiceToggle}
           micHeldElsewhere={micHeldElsewhere} micHeldElsewhereLabel={micHeldElsewhereLabel} micHeldElsewhereAction={micHeldElsewhereAction} voiceHeldLanded={voiceHeldLanded}
         />
@@ -1035,6 +1053,7 @@ function ChatInput({
                 onReady={markLexicalReady}
                 onSelectionChange={publishLexicalSelection}
                 onHistoryStep={stepUndoHistory}
+                onEndUndoBurst={endUndoBurst}
                 sentMessages={sentMessages}
                 historyScope={slotId}
                 onEditLastRequest={onEditLastRequest}
@@ -1057,7 +1076,13 @@ function ChatInput({
             gap, the `inset-0` mirror grows with it, and once the draft scrolls
             the taller mirror clamps to a smaller scrollTop than the textarea:
             the paste chip's background drifts off the token text.
-            playwright/composer-paste-highlight.spec.ts pins this. */}
+            `[scrollbar-gutter:stable]` is load-bearing the same way: the mirror
+            never shows a scrollbar, so the textarea's classic scrollbar (6px,
+            index.css) would make its text box narrower than the mirror's, wrap
+            a line the mirror keeps whole, and move every later chip a line.
+            Both boxes reserve the gutter, so both wrap at the same width.
+            playwright/composer-paste-highlight.spec.ts pins the first and
+            playwright/composer-paste-highlight-scrollbar.spec.ts the second. */}
         <textarea
           ref={setComposerTextareaRef}
           aria-label={inputAriaLabel ?? i18nT('components.chatInput.message_input')}
@@ -1067,7 +1092,7 @@ function ChatInput({
           data-composer-typo
           // Chromium paints no `text-overflow` on a `::placeholder`, so the cut tail
           // fades out instead, the way the app's other cut edges do.
-          className={/* focus-cue-ok: maintainer decision -- the glass dock holding this textarea does not change on focus (no ring, no colour, no shadow step; index.css `.glass-shadow`), and a ring on the textarea itself is not wanted either; the caret is the composer's focus indicator. */ `relative block w-full bg-transparent border-none ${INPUT_TYPO} text-text outline-hidden min-h-[44px] max-h-[50vh] placeholder:text-muted resize-none ${placeholderIsHint ? 'placeholder:whitespace-nowrap placeholder:overflow-hidden placeholder:[mask-image:linear-gradient(to_right,black_calc(100%-1.5rem),transparent)] placeholder:[-webkit-mask-image:linear-gradient(to_right,black_calc(100%-1.5rem),transparent)]' : ''} ${manualHeight !== null ? 'flex-1' : ''} ${disabled ? 'opacity-40 pointer-events-none' : ''} ${optimizing ? 'opacity-30' : ''}`}
+          className={/* focus-cue-ok: maintainer decision -- the glass dock holding this textarea does not change on focus (no ring, no colour, no shadow step; index.css `.glass-shadow`), and a ring on the textarea itself is not wanted either; the caret is the composer's focus indicator. */ `relative block w-full [scrollbar-gutter:stable] bg-transparent border-none ${INPUT_TYPO} text-text outline-hidden min-h-[44px] max-h-[50vh] placeholder:text-muted resize-none ${placeholderIsHint ? 'placeholder:whitespace-nowrap placeholder:overflow-hidden placeholder:[mask-image:linear-gradient(to_right,black_calc(100%-1.5rem),transparent)] placeholder:[-webkit-mask-image:linear-gradient(to_right,black_calc(100%-1.5rem),transparent)]' : ''} ${manualHeight !== null ? 'flex-1' : ''} ${disabled ? 'opacity-40 pointer-events-none' : ''} ${optimizing ? 'opacity-30' : ''}`}
           style={manualHeight !== null ? { height: '100%' } : undefined}
           placeholder={activePlaceholder}
           readOnly={optimizing}
@@ -1199,7 +1224,7 @@ function ChatInput({
                 </Suspense>
               )}
               {!isMobile && approvalMode && (
-                <ApprovalModePicker mode={approvalMode} slotKey={activeSlot || ''} openSignal={approvalPickerSignal} nudge={approvalNudgeActive} onNudgeDismiss={dismissApprovalNudge} onNudgeHide={hideApprovalNudge} />
+                <ApprovalModePicker mode={approvalMode} slotKey={activeSlot || ''} onPicked={focusComposerAfterPick} openSignal={approvalPickerSignal} nudge={approvalNudgeActive} onNudgeDismiss={dismissApprovalNudge} onNudgeHide={hideApprovalNudge} />
               )}
               </div>
               {/* Edge cues: the row itself fades out at a clipped edge (`edge-fade-x`,
@@ -1208,7 +1233,7 @@ function ChatInput({
                   over the translucent composer. */}
             </div>
             {isMobile && approvalMode && (
-              <ApprovalModePicker mode={approvalMode} slotKey={activeSlot || ''} compact openSignal={approvalPickerSignal} nudge={approvalNudgeActive} onNudgeDismiss={dismissApprovalNudge} onNudgeHide={hideApprovalNudge} />
+              <ApprovalModePicker mode={approvalMode} slotKey={activeSlot || ''} compact onPicked={focusComposerAfterPick} openSignal={approvalPickerSignal} nudge={approvalNudgeActive} onNudgeDismiss={dismissApprovalNudge} onNudgeHide={hideApprovalNudge} />
             )}
           </div>
           <div className={`flex items-center gap-1 shrink-0${terminal.active ? ' ml-auto max-w-full justify-end [&>button]:shrink-0' : ''}`}>
@@ -1230,7 +1255,7 @@ function ChatInput({
               // user with something to say is never left without a send.
               <CompactingIndicator />
             ) : (isRunning || stopState === 'soft_pending' || stopState === 'killing') && (onStop || (!terminal.active && canSteer && onSteer)) ? (
-              <BusySendControls stopState={stopState} killingEscaped={killingEscaped} stopWithTap={stopWithTap} isQueued={isQueued && !terminal.active} composerHasDraft={composerHasDraft && !terminal.active} canSteer={canSteer} onSteer={onSteer} steerOnly={steerOnly} fireComposer={fireComposer} disabled={disabled} holdSend={holdSend} holdSendReason={holdSendReason} connected={connected} effectiveBusyMode={effectiveBusyMode} setBusySendMode={setBusySendMode} sendOnEnter={sendOnEnter} jevAutoAvailable={jevAutoAvailable} onStop={onStop} terminalActive={terminal.active} stopDeclinedArmed={stopDeclinedArmed} />
+              <BusySendControls stopState={stopState} killingEscaped={killingEscaped} stopWithTap={stopWithTap} isQueued={isQueued && !terminal.active} composerHasDraft={composerHasDraft && !terminal.active} canSteer={canSteer} onSteer={onSteer} steerOnly={steerOnly} fireComposer={fireComposer} disabled={disabled} holdSend={holdSend} holdSendReason={holdSendReason} connected={connected} effectiveBusyMode={effectiveBusyMode} setBusySendMode={setBusySendMode} onBusyModePicked={focusComposerAfterPick} sendOnEnter={sendOnEnter} jevAutoAvailable={jevAutoAvailable} onStop={onStop} terminalActive={terminal.active} stopDeclinedArmed={stopDeclinedArmed} />
             ) : !terminal.active && (<>
               {promptOptimizer && <button
                 className={`w-8 h-8 rounded-lg border-none flex items-center justify-center cursor-pointer transition-all disabled:cursor-not-allowed ${optimizing ? 'bg-accent/20 text-accent animate-pulse' : 'bg-transparent text-muted hover:text-accent hover:bg-accent/10 disabled:opacity-40 disabled:hover:text-muted disabled:hover:bg-transparent'}`}
@@ -1295,6 +1320,7 @@ function ChatInput({
                 title={holdSend ? holdSendReason : undefined}
                 aria-label={i18nT('components.chatInput.send')}
                 {...offlineProps(connected, 'send', 'Send')}
+                {...uiLocation('composer.send')}
               >
                 <ArrowUp size={18} />
               </button>

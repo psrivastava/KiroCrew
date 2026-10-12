@@ -6,7 +6,7 @@
 > approach — so a reviewer can understand the delta at a glance, and so the fork
 > can be re-based on future upstream pulls without re-deriving intent.
 >
-> **Branch:** `main` · **Fork base:** upstream commit `8fe49bd54` (synced 2026-10-08;
+> **Branch:** `main` · **Fork base:** upstream commit `150605b8e` (synced 2026-10-12;
 > originally forked at `64f3b5811`). Every upstream sync is recorded in §9.
 
 ---
@@ -373,6 +373,27 @@ parity and logo-glyph tests, and record the entry below.
 - **Other fallout:** <behavior changes, renamed APIs, new specs to read>.
 - **Verified:** <tests/builds run and results>. **Not run:** <what and why>.
 ```
+
+### 2026-10-12 — `150605b8e` (branch `sync/upstream-2026-10-12`)
+- **Range:** `8fe49bd54..150605b8e`, 642 upstream commits; no new CCrew commits
+  since the previous sync.
+- **Conflicts:** 1 file, `website/electron/test/gateway-env.test.js` — both
+  sides appended a test at the same spot (CCrew's KIROCREW_HOME spawn-env pin,
+  upstream's bundled-Python env isolation); kept both. No CCrew change needed
+  relocating: the §2.2 seatbelt seam, `api/client/sessions.ts`, the logo tint
+  and `ccrew-identity.js` all merged cleanly.
+- **Other fallout:** upstream's `buildGatewayEnvironment` now takes
+  `(env, { bundled, platform })`; the CCrew `KIROCREW_HOME` key still reaches
+  the spawn env.
+- **Verified:** backend reinstalled; flake8 clean on the seatbelt seam files;
+  ACP launch/spawn, sandbox argv, backend-card, harness-parity and Claude-session
+  tests 466 passed / 10 skipped. Frontend `npm ci`, type check and build clean,
+  staged into `src/kiro_crew/static/dist`; i18n parity + glyph + CCrew tests 115
+  passed. Electron suite 2593 passed / 2 failed / 4 skipped — both failures are
+  in files identical to upstream (`download-handler.test.js` reserved-path case;
+  `gateway-shim-tree-kill.test.js` `spawn EPERM` under the agent sandbox).
+- **Not run:** full suite (CI), `mypy --platform linux`, black gate (the system
+  `python3` has no black), desktop `.app` build.
 
 ### 2026-10-08 — `8fe49bd54` (merge `7174ddaaa`, branch `sync/upstream-2026-10-08`)
 - **Range:** `64f3b5811..8fe49bd54`, 2275 upstream commits; CCrew side had 22

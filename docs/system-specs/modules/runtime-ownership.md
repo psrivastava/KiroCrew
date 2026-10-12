@@ -65,6 +65,23 @@ is a last release — byte-for-byte the unpooled behaviour, with the claim recor
 Raising it is a behaviour change that needs the eligibility rules deciding which
 sessions may share a process, and those do not live here.
 
+**A founding `spawn()` holds nothing.** The table's bookkeeping — entries, the
+lease index, the last-runtime map, foundings in flight — is only read or written
+in stretches with no `await`, which on one event loop is what keeps it consistent
+and what keeps a cancellation from landing mid-change; there is no registry lock.
+`spawn()` runs outside every such stretch, so a real launch (admission wait,
+subprocess, ACP handshake) never makes an unrelated `acquire` or any `release`
+wait, and founding starts on different keys overlap. A miss registers a per-key
+founding; a same-key arrival waits on it only while the launching runtime will
+still have room for it (founder plus waiters below `cap`), and otherwise founds
+concurrently, because waiting would just serialize two launches. At `cap=1` nobody
+ever waits. A waiter is shielded from the founder's fate: it wakes on success,
+failure or cancellation alike and re-picks, founding itself if it must, so a
+founder's error is never handed to another session. Every exit from the founder
+clears the marker and wakes its waiters; a runtime is published in the same
+synchronous stretch in which `spawn()` returns, so no cancellation point lies
+between a spawned runtime and its entry.
+
 On the **chat** registration path a lease means the same thing as registry
 membership, which is why it is taken there rather than at provider start:
 `session_allocation.SessionAllocationService._get_or_create_impl` calls
@@ -209,6 +226,36 @@ torn-down table and from the caller's captured pop — and touches no tenancy an
 other session's lease. It is best effort by design: a release that did not happen
 costs an honest refusal, while an exception raised out of it would cost a wedged
 process its only remaining kill.
+
+The funnel also ends a registration that is not a lease. A provider reaching
+`_sync_kill_provider` is being abandoned — its client's `shutdown` will never run —
+so the funnel calls the client's own synchronous hand-back for its
+`settings.local.json` seed (`AcpClient.release_settings_seed_claim`, resolved by
+name so this leaf stays ignorant of the ACP layer). Without it the client's live
+claim on that seed outlived the client for the life of the gateway and every later
+session on the same work dir read the path as a live sibling's. The hand-back
+follows the gate's verdict rather than running ahead of it, because a successor
+that adopts the seed re-writes `permissions.defaultMode` on disk, and that must not
+happen under a runtime that may still be running:
+
+- **released** when the teardown is authorized and committed, immediately before
+  the first signal (ahead of the grace, so a replacement spawn on the same work dir
+  finds the slot free when it seeds); when there is no pid at all (a seed is
+  written before the spawn publishes one, so the claim belongs to the client
+  object and no runtime stands behind it); and when the recorded root is known to
+  be gone or recycled (`_root_identity_refuted`: the pid names no process, or a
+  live start identity was read and differs from the recorded one);
+- **kept** while the gate refuses the kill because a lease or a tenancy still
+  holds the runtime, and when the root's identity cannot be read (the pid exists
+  but its start identity is unavailable, or none was recorded at spawn). A kept
+  claim keeps the successor on the live-sibling rule — it declines its own seed
+  rather than re-seeding the file — and is handed back by a later teardown of the
+  same runtime or reclaimed as stale once this process exits.
+
+Like the lease release it is best effort and never lets an exception out. Which
+registrations it withdraws, and why the durable half, is the seed's own spec
+([claude-code-provider.md](claude-code-provider.md) § *Session-scoped Claude
+settings*).
 
 ### Kill owed, and the hand-back
 

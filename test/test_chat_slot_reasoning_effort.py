@@ -262,6 +262,32 @@ class TestChatSlotReasoningEffort:
         assert slot.reasoning_effort == level
 
     @pytest.mark.asyncio
+    async def test_a_same_level_pick_on_a_legacy_codex_pin_bumps_the_effort_generation(self):
+        # The legacy-suffix fold skips the fast path and the level write is a
+        # same-value one the setter does not count, so the bump must happen on
+        # the comparison. Mutation guard: gating the bump on `not legacy_base`.
+        slot = _ChatSlot("test")
+        slot.model = "gpt-6-sol[max]"
+        slot.reasoning_effort = "high"
+        before = slot._effort_pick_gen
+        provider = MagicMock(spec=AcpProvider)
+        provider.capabilities = SimpleNamespace(backend="codex")
+        provider.supports_effort.return_value = True
+        provider.has_active_turn.return_value = False
+        provider.change_effort = AsyncMock(return_value=True)
+        state = _mock_state(slot, provider)
+
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.post(
+                "/api/chat/slots/test/reasoning-effort",
+                json={"reasoning_effort": "high"},
+            )
+
+        assert resp.status == 200
+        assert slot.model == "gpt-6-sol"
+        assert slot._effort_pick_gen > before
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize(
         ("global_backend", "member_backend", "expected_model"),
         [
@@ -530,6 +556,24 @@ class TestChatSlotReasoningEffort:
             state.sessions.reset.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_re_picking_the_shown_level_still_bumps_the_effort_generation(self):
+        # A same-level pick is still the user's explicit choice: a pending
+        # session_set_model effort compares this generation at turn start and
+        # must yield to it. Mutation guard: returning before the bump.
+        slot = _ChatSlot("test")
+        slot.reasoning_effort = "medium"
+        before = slot._effort_pick_gen
+        state = _mock_state(slot)
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.post(
+                "/api/chat/slots/test/reasoning-effort",
+                json={"reasoning_effort": "medium"},
+            )
+            assert resp.status == 200
+        assert slot._effort_pick_gen > before
+        state.sessions.reset.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_same_effort_with_bare_model_skips_live_switch(self):
         slot = _ChatSlot("test")
         slot.model = "gpt-6-sol"
@@ -629,6 +673,33 @@ class TestChatSlotReasoningEffortLiveProvider:
             assert slot.reasoning_effort == "xhigh"
             provider.change_effort.assert_awaited_once_with("xhigh")
             # Live update succeeded → no session reset.
+            state.sessions.reset.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_level_the_live_session_hides_is_refused_without_a_reset(self):
+        # A harness that is the authority on its own vocabulary hides a Crew level
+        # it has no value for. Refused up front: nothing persists, nothing is
+        # pushed, and the session is not reset into re-reading it.
+        from kiro_crew.providers.acp import AcpProvider
+
+        provider = MagicMock(spec=AcpProvider)
+        provider.supports_effort = MagicMock(return_value=True)
+        provider.has_active_turn = MagicMock(return_value=False)
+        provider.accepts_effort_level = MagicMock(return_value=False)
+        provider.change_effort = AsyncMock(return_value=True)
+        slot = _ChatSlot("test")
+        slot.reasoning_effort = "high"
+        state = _mock_state(slot, provider=provider)
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.post(
+                "/api/chat/slots/test/reasoning-effort",
+                json={"reasoning_effort": "medium"},
+            )
+            assert resp.status == 400
+            assert (await resp.json())["code"] == "effort_level_not_offered"
+            assert slot.reasoning_effort == "high"
+            provider.accepts_effort_level.assert_called_once_with("medium")
+            provider.change_effort.assert_not_awaited()
             state.sessions.reset.assert_not_called()
 
     @pytest.mark.asyncio

@@ -137,6 +137,13 @@ describe('listedByDefault / rosterShows', () => {
     // The default crew is exempt by NAME only.
     expect(listedByDefault(byName('default'), '')).toBe(false)
   })
+  it('lists Mate, the first crewmate, from the start; a fresh roster shows Mate and not the default crew', () => {
+    const fresh = [
+      { name: 'default', ...NO, last_chat_ts: 0, source: 'builtin' },
+      { name: 'mate', ...NO, last_chat_ts: 0, source: 'builtin' },
+    ]
+    expect(names(rosterPopulation(fresh, WITH_DEFAULT))).toEqual(['mate'])
+  })
   it('a starred row is listed like a chatted one, so starring a row reached through the search keeps it', () => {
     expect(listedByDefault(byName('app-bot'), 'default')).toBe(false)
     expect(listedByDefault({ ...byName('app-bot'), starred: true }, 'default')).toBe(true)
@@ -147,6 +154,12 @@ describe('listedByDefault / rosterShows', () => {
   it('a live preview counts as a message, so a just-chatted row stays listed before a refetch', () => {
     expect(listedByDefault({ ...byName('app-bot'), last_message: 'hi' }, 'default')).toBe(true)
     expect(listedByDefault({ ...byName('app-bot'), last_message: '  ' }, 'default')).toBe(false)
+  })
+  it('the search also reads the agent template, so a row is reachable by what it RUNS', () => {
+    // The folded roster in the header chip has always offered this term; it
+    // lives here now so the column's search reaches the same rows.
+    expect(rosterShows({ name: 'oncall', kiro_agent: 'kirocrew-oncall' }, { search: 'kirocrew-onc', defaultAgent: 'default' })).toBe(true)
+    expect(rosterShows({ name: 'oncall', kiro_agent: 'kirocrew-oncall' }, { search: 'radar', defaultAgent: 'default' })).toBe(false)
   })
   it('a typed search decides alone: it reaches hidden rows and skips listed ones it misses', () => {
     expect(rosterShows(byName('legacy-aim'), { search: 'aim', defaultAgent: 'default' })).toBe(true)

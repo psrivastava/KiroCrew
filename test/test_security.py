@@ -6629,6 +6629,58 @@ class TestAdaptiveHomeTargetsExpiry:
             == 5.0
         )
 
+        # The ceiling is the measurement, not generous headroom: the committed
+        # sweep (``measure_path_gate_ttl.py ksweep``, hogs 0,1,2,4,8) found 54.4s
+        # as the largest expiry a serveable load demanded, and the operator ceiling
+        # stays at or above it so a serveable load can always be admitted. A value
+        # at or below the measured max is honoured while one above it is refused
+        # back to the reviewed default; a value in (measured max, old headroom] --
+        # e.g. 120s, which the prior 300s ceiling admitted -- must now be refused.
+        assert security.paths._TTL_MAX_SECS_MAX == pytest.approx(60.0)
+        monkeypatch.setenv(security._TTL_MAX_SECS_ENV, "54.4")
+        assert security._env_float(
+            security._TTL_MAX_SECS_ENV,
+            security.paths._TTL_MAX_SECS_DEFAULT,
+            security.paths._TTL_MAX_SECS_MIN,
+            security.paths._TTL_MAX_SECS_MAX,
+        ) == pytest.approx(54.4)
+        monkeypatch.setenv(security._TTL_MAX_SECS_ENV, "120")
+        assert (
+            security._env_float(
+                security._TTL_MAX_SECS_ENV,
+                security.paths._TTL_MAX_SECS_DEFAULT,
+                security.paths._TTL_MAX_SECS_MIN,
+                security.paths._TTL_MAX_SECS_MAX,
+            )
+            == security.paths._TTL_MAX_SECS_DEFAULT
+        ), "a value above the measured maximum must fall back to the default"
+
+    def test_documented_worst_case_age_is_derived_from_the_constants(self) -> None:
+        """The ~42s worst case the comment/spec cite is computed, not asserted blind.
+
+        Worst-case data age for a BOUNDED rebuild = the default expiry ceiling PLUS
+        the rebuild's full deadline (its budget plus its capped grace), because the
+        expiry clock starts only after the build returns. If any of those constants
+        moves, the documented number must move with it -- this derives it so the two
+        cannot drift apart.
+        """
+        from kiro_crew import security
+
+        budget = security.paths._PATH_RESOLVE_REBUILD_TIMEOUT_SECS
+        grace = min(
+            budget * security.paths._PATH_RESOLVE_GRACE_FACTOR,
+            security.paths._PATH_RESOLVE_GRACE_MAX_SECS,
+        )
+        assert budget == pytest.approx(8.0)
+        assert grace == pytest.approx(4.0), "8s budget's grace is capped at 4s"
+        bounded_deadline = budget + grace
+        assert bounded_deadline == pytest.approx(12.0), "one bounded rebuild runs at most 12s"
+        worst_case_age = security.paths._TTL_MAX_SECS_DEFAULT + bounded_deadline
+        assert worst_case_age == pytest.approx(42.0), (
+            "the documented worst-case age is 30s default expiry + 12s bounded "
+            "rebuild deadline = ~42s; update the comment and spec if this changes"
+        )
+
     def test_a_bad_knob_value_keeps_the_reviewed_default(self, monkeypatch) -> None:
         """Absent, unparseable and out-of-range all fall back to the default.
 
@@ -7346,6 +7398,26 @@ class TestEnvDumpGrepAwsNarrowing:
         # dump under another name -- named for the same reason ``environ`` is.
         "typeset | grep AWS_SECRET",
         "typeset | grep AWS_",
+        # Every filter spelling, prefixed or not. The filter word is bounded on its
+        # left so prose ending in ``sed`` is not a filter, which is exactly the bound
+        # that would drop these if the spellings were not listed.
+        "env | egrep AWS_",
+        "env | fgrep AWS_",
+        "env | zgrep AWS_",
+        "env | zegrep AWS_SECRET",
+        "env | rgrep AWS_",
+        "env | ugrep AWS_",
+        "env | ggrep AWS_",
+        "env | pcre2grep AWS_",
+        "env | gawk /AWS_/",
+        "env | mawk /AWS_/",
+        "env | nawk /AWS_/",
+        "env | gsed -n /AWS_/p",
+        "env | /usr/bin/grep AWS_",
+        "env | /usr/bin/gawk /AWS_/",
+        "env | xargs grep AWS_",
+        "env | xargs -0 grep AWS_",
+        "env | busybox grep AWS_",
     )
 
     # What refusing to guess at statement boundaries costs. Every one of these was
@@ -7411,6 +7483,17 @@ class TestEnvDumpGrepAwsNarrowing:
         "grep -rn AWS_SECRET_ACCESS_KEY src/",
         "cat .github/workflows/ci.yml | grep AWS_",
         "docker inspect x | grep AWS_REGION",
+        # Prose and markdown that merely END a word in a filter name. ``used``,
+        # ``closed``, ``proposed`` and ``caused`` are not ``sed``, across lines and
+        # in either case.
+        "We set goals | then used AWS tools",
+        "We set goals | then used aws",
+        "set\n|\nused\nAWS",
+        "env vars | the outage caused aws alarms",
+        "set the table | closed the AWS ticket",
+        # ``rg`` is not a listed filter, so a resource-group column beside AWS is prose.
+        "| Set up | RG | AWS |",
+        "| Status | Item |\n|---|---|\n| Closed | env work |\n| Proposed | set up AWS |",
     )
 
     # ``printenv NAME`` prints a value directly -- its own catalog rule, no pipe.
@@ -7552,6 +7635,31 @@ class TestEnvDumpGrepAwsNarrowing:
     def test_benign_commands_pass_both_tiers(self, cmd: str) -> None:
         assert not self._keystone(cmd), cmd
         assert not self._catalog_matcher().match(cmd), cmd
+
+    # A markdown body handed to a non-shell MCP tool is scanned with the command
+    # rules, so prose that reads as a filter would refuse the whole call.
+    MARKDOWN_TOOL_BODY = (
+        "## Weekly briefing\n\n"
+        "We set the agenda for the env cleanup.\n\n"
+        "| Item | Status |\n"
+        "|------|--------|\n"
+        "| Closed | the old pipeline |\n"
+        "| Proposed | move to AWS Lambda |\n"
+        "| Used | aws cli v2 |\n"
+    )
+
+    def test_a_markdown_tool_body_passes_the_command_rules(self) -> None:
+        from kiro_crew.llm_helpers import _first_tool_input_denial
+
+        assert _first_tool_input_denial([self.MARKDOWN_TOOL_BODY], None, command_rules=True) is None
+
+    def test_a_dump_in_a_tool_argument_is_still_refused(self) -> None:
+        from kiro_crew.llm_helpers import _first_tool_input_denial
+        from kiro_crew.security import _ENV_CRED_DENIAL_REASON
+
+        denial = _first_tool_input_denial(["env | egrep AWS_SECRET"], None, command_rules=True)
+        assert denial is not None
+        assert _ENV_CRED_DENIAL_REASON in denial
 
     @pytest.mark.parametrize("cmd", PRINTENV_DENIED)
     def test_printenv_of_a_secret_is_denied(self, cmd: str) -> None:

@@ -202,10 +202,30 @@ class _Host:
         mp.setattr(cli_doctor, "machine_hostname", lambda: "devbox")
         mp.setattr(cli_doctor, "is_local_only", lambda host, has_slack: self.local)
         import kiro_crew._sqlite_compat as sqlite_compat
+        import kiro_crew.browser_cli.install as browser_install
         import kiro_crew.channels as channels
 
         mp.setattr(sqlite_compat, "fts5_available", lambda: self.fts5)
+        # The browser-bootstrap rows resolve through the patched ``shutil.which``;
+        # pin the writability probe too, so the host's real files never decide.
+        mp.setattr(
+            browser_install,
+            "bootstrap_tool_provenance",
+            lambda path: {
+                "path": path,
+                "real_path": path,
+                "writable_at": "",
+                "own_toolchain": False,
+                "shared_write": False,
+            },
+        )
         mp.setattr(channels, "channel_readiness", lambda cfg, creds: tuple(self.readiness))
+        import kiro_crew.doctor_checks.resources as resources
+
+        # Added after the sections moved, so the facade does not forward it: the
+        # marker goes on the family that defines it. The real section reads the
+        # host's process table, which no frozen report can pin.
+        mp.setattr(resources, "_doctor_acp_runtimes", self._marker("_doctor_acp_runtimes"))
         mp.setitem(sys.modules, "faiss", None)
         mp.setitem(sys.modules, "amazon_transcribe", None)
         mp.setitem(sys.modules, "amazon_transcribe.client", None)
@@ -324,6 +344,10 @@ Dependencies
   <<_doctor_agent_auth>>
   git:         ✅ /usr/bin/git
   node:        ✅ /usr/bin/node (v22.3.0)
+  browser npm: ⏹ not found (the browser install needs Node.js with npm)
+  browser node: ✅ /usr/bin/node
+               These rows resolve from this shell's PATH; the gateway logs the npm and Node it
+               actually ran at install time.
 
 Project
   source dir:  ✅ <TMP>/checkout (Kiro Crew source checkout)
@@ -366,6 +390,7 @@ Configuration
   <<_doctor_live_target_pointer>>
   <<_doctor_masked_credential_aliases>>
   <<_doctor_memory_pressure>>
+  <<_doctor_acp_runtimes>>
   <<_doctor_runtime_tmpfs>>
   <<_doctor_cli_installer_residue>>
   <<_doctor_cron_health>>
@@ -481,6 +506,10 @@ Dependencies
   git:         ❌ not found (needed for kirocrew update)
   node:        ❌ v18.19.0 < v20.0.0
                Fix: Node.js v18.19.0 is too old: Kiro Crew needs v20.0.0 or newer. Update Node.js: install 24 LTS from https://nodejs.org, or run `nvm install 24` / `mise use -g node@24`.
+  browser npm: ⏹ not found (the browser install needs Node.js with npm)
+  browser node: ✅ /usr/bin/node
+               These rows resolve from this shell's PATH; the gateway logs the npm and Node it
+               actually ran at install time.
 
 Project
   source dir:  ❌ stale — points to deleted <TMP>/gone
@@ -525,6 +554,7 @@ Configuration
   <<_doctor_live_target_pointer>>
   <<_doctor_masked_credential_aliases>>
   <<_doctor_memory_pressure>>
+  <<_doctor_acp_runtimes>>
   <<_doctor_runtime_tmpfs>>
   <<_doctor_cli_installer_residue>>
   <<_doctor_cron_health>>

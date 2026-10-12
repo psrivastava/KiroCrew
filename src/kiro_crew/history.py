@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Any, Literal, overload
 
 from kiro_crew import platform_compat
-from kiro_crew.atomic_write import atomic_write, atomic_write_at
+from kiro_crew.atomic_write import append_line, atomic_write, atomic_write_at
 from kiro_crew.chat_attachments import persist_inline_images, same_text_modulo_images
 from kiro_crew.config.loader import KiroCrewConfig, config_dir
 
@@ -195,6 +195,7 @@ SLOT_OWNED_META_KEYS: frozenset[str] = frozenset(
         "model",
         "reasoning_effort",
         "autocompact_pct",
+        "turn_timeout_secs",
         # Source-link dismissals: the slot save is authoritative (it rebuilds the
         # line from ``slot._dismissed_source_links``), so on a FULL save absence
         # means "no dismissals". Naming it here also folds it into
@@ -247,6 +248,12 @@ SLOT_OWNED_META_KEYS: frozenset[str] = frozenset(
         # would hand back a prompt whose turn already ran.
         "queued_prompts",
         "pinned",
+        # Slot-owned so ABSENCE retracts it: an unmute writes no key, and an
+        # unowned key would be carried forward forever by
+        # ``carry_unowned_metadata`` -- the session could never be un-muted.
+        "mutes_opened",
+        # Same reason: an unmute of the per-row mute writes no key.
+        "muted",
         "color_index",
         "color_hex",
         "color_theme",
@@ -1015,9 +1022,24 @@ def _safe_mtime(path: Path) -> float | None:
         return None
 
 
-def _cache_identity(stat: os.stat_result) -> tuple[int, int, int]:
-    """Return a cache stamp that survives an mtime-preserving rewrite."""
-    return (stat.st_mtime_ns, stat.st_ctime_ns, stat.st_ino)
+#: ``(st_mtime_ns, st_ctime_ns, st_size, st_ino)`` -- see :func:`_cache_identity`.
+CacheIdentity = tuple[int, int, int, int]
+
+
+def _cache_identity(stat: os.stat_result) -> CacheIdentity:
+    """Return a cache stamp that survives an mtime-preserving rewrite.
+
+    ``st_size`` rides along because the timestamps alone cannot tell two in-place
+    rewrites apart when they land on one clock tick: NTFS stamps writes from a
+    system clock that moves in ~1-16 ms steps, and Windows ``st_ctime`` is the
+    creation time, which a rewrite never moves. An external writer that appends
+    rows to an already-cached transcript within that tick would otherwise be
+    served the stale parse, and a window reconcile reading it would see nothing
+    to append. Size cannot catch a same-length rewrite; the invalidation
+    generation covers those from this process, the flock witness those from
+    another.
+    """
+    return (stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size, stat.st_ino)
 
 
 def _restore_mtime(path: Path, prev_mtime: float | None) -> None:
@@ -1690,9 +1712,7 @@ class ConversationLog:
         # parsed-transcript working set without limit. Eviction is
         # least-recently-used and deterministic; writes invalidate per-key via
         # _invalidate_cache so a stale entry can never outlive a file change.
-        self._msg_cache: _LRUCache[tuple[tuple[int, int, int], int, list[dict]]] = _LRUCache(
-            cache_max
-        )
+        self._msg_cache: _LRUCache[tuple[CacheIdentity, int, list[dict]]] = _LRUCache(cache_max)
         #: ``(identity, gen, meta)`` — like the search memos, entries record the
         #: invalidation generation and a warm hit requires both fields to
         #: match, so a same-process metadata edit through another instance
@@ -1705,7 +1725,7 @@ class ConversationLog:
         #: already use to decline that knob. Deliberately not overridable: a test
         #: that needs a small bound assigns ``_meta_cache`` directly rather than
         #: adding a constructor parameter no product caller uses.
-        self._meta_cache: _LRUCache[tuple[tuple[int, int, int], int, dict]] = _LRUCache(
+        self._meta_cache: _LRUCache[tuple[CacheIdentity, int, dict]] = _LRUCache(
             _METADATA_CACHE_MAX
         )
         #: Bounded identity-keyed LRU of formatted ``recent()`` windows keyed by
@@ -1716,9 +1736,7 @@ class ConversationLog:
         #: call. This memoizes the formatted window; the stored identity guards
         #: staleness even when a housekeeping write preserves mtime. Own
         #: ``_LRUCache`` → own internal lock.
-        self._recent_cache: _LRUCache[tuple[tuple[int, int, int], int, list[dict]]] = _LRUCache(
-            cache_max
-        )
+        self._recent_cache: _LRUCache[tuple[CacheIdentity, int, list[dict]]] = _LRUCache(cache_max)
         #: Bounded memo of lightweight message projections containing only
         #: ``ts`` and ``meta.file_changes``. The Artifacts "All" view scans
         #: every session, so routing it through ``_msg_cache`` retains the full
@@ -1752,7 +1770,7 @@ class ConversationLog:
         #: order; :class:`_SearchTextCache` keeps that guarantee by refusing
         #: admission instead of evicting, so the sessions that fit stay cached
         #: and the bound is now a real memory ceiling rather than a proxy for one.
-        self._folded_cache: _SearchTextCache[tuple[tuple[int, int, int], int, int, str]] = (
+        self._folded_cache: _SearchTextCache[tuple[CacheIdentity, int, int, str]] = (
             _SearchTextCache(_SEARCH_FOLD_BUDGET_BYTES, lambda v: v[3].__sizeof__(), "fold")
         )
         #: session key → (identity, gen, raw message texts) for snippet extraction.
@@ -1772,7 +1790,7 @@ class ConversationLog:
         #: same generation field as ``_folded_cache`` above, for the same
         #: cross-instance reason: both memos are derived from the messages, so
         #: they go stale at exactly the same moment.
-        self._snippet_cache: _SearchTextCache[tuple[tuple[int, int, int], int, list[str]]] = (
+        self._snippet_cache: _SearchTextCache[tuple[CacheIdentity, int, list[str]]] = (
             _SearchTextCache(
                 _SEARCH_SNIPPET_BUDGET_BYTES,
                 lambda v: v[2].__sizeof__() + sum(t.__sizeof__() for t in v[2]),
@@ -1836,7 +1854,7 @@ class ConversationLog:
         self._rewrite_coordinator = HistoryRewriteCoordinator(self)
 
     @staticmethod
-    def _cache_identity(stat: os.stat_result) -> tuple[int, int, int]:
+    def _cache_identity(stat: os.stat_result) -> CacheIdentity:
         return _cache_identity(stat)
 
     def _file_lock(self, key: str) -> threading.RLock:
@@ -2693,8 +2711,9 @@ class ConversationLog:
 
             # Session transcripts are intentionally local plaintext JSONL (the
             # documented storage format), not a credential/secret store.
-            with open(path, "a", encoding="utf-8", opener=owner_only_opener) as f:
-                f.write(json.dumps(msg) + "\n")  # lgtm[py/clear-text-storage-sensitive-data]
+            append_line(  # lgtm[py/clear-text-storage-sensitive-data]
+                path, json.dumps(msg), opener=owner_only_opener
+            )
 
             # Invalidate cache since file changed
             self._invalidate_cache(key)
@@ -3575,7 +3594,7 @@ class ConversationLog:
     def _build_folded(
         self,
         key: str,
-        identity: tuple[int, int, int],
+        identity: CacheIdentity,
         gen: int,
     ) -> tuple[int, str] | None:
         return self._catalog_projection._build_folded(key, identity, gen)
@@ -3606,6 +3625,13 @@ class ConversationLog:
 
     def read_messages_chained(self, key: str) -> list[dict]:
         return self._read_projection.read_messages_chained(key)
+
+    def read_messages_chained_tail(self, key: str, limit: int) -> list[dict]:
+        """The newest *limit* rows of :meth:`read_messages_chained`, read from the end.
+
+        See ``TranscriptReadProjection.read_messages_chained_tail``.
+        """
+        return self._read_projection.read_messages_chained_tail(key, limit)
 
     def read_messages_chained_full(self, key: str) -> list[dict]:
         """Chained transcript INCLUDING each key's size-rotated archive head.

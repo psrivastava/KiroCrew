@@ -22,6 +22,7 @@ import pytest
 from chat_test_helpers import _make_state
 
 from kiro_crew.dashboard import chat_persistence as cp
+from kiro_crew.dashboard.relay_archive import relay_archive_refusal
 from kiro_crew.dashboard.slot_buffers import (
     sanitize_restored_deferred_notes,
     serialize_deferred_notes,
@@ -53,6 +54,7 @@ _POPULATED: dict = {
     "model": "model-m",
     "reasoning_effort": "high",
     "autocompact_pct": 44.0,
+    "turn_timeout_secs": 28800,
     "_dismissed_source_links": {K1, K2},
     "workspace": "ws",
     "memory_store": "silo",
@@ -70,6 +72,8 @@ _POPULATED: dict = {
     "_origin": "cron",
     "_artifact": "my-artifact",
     "pinned": True,
+    "mutes_opened": True,
+    "muted": True,
     "color_index": 3,
     "color_hex": "#abcdef",
     "color_theme": "dark",
@@ -114,6 +118,7 @@ _BASE_LINE_ORDER = (
     "model",
     "reasoning_effort",
     "autocompact_pct",
+    "turn_timeout_secs",
     "dismissed_source_links",
     "mode",
     "workspace",
@@ -132,6 +137,8 @@ _BASE_LINE_ORDER = (
     "created_by",
     "artifact",
     "pinned",
+    "mutes_opened",
+    "muted",
     "color_index",
     "color_hex",
     "color_theme",
@@ -151,6 +158,8 @@ _BASE_MERGE_ORDER = (
     "folder_id",
     "tags",
     "pinned",
+    "mutes_opened",
+    "muted",
     "mode",
     "artifact",
     "reasoning_effort",
@@ -161,6 +170,7 @@ _BASE_MERGE_ORDER = (
     "model",
     "queued_prompts",
     "autocompact_pct",
+    "turn_timeout_secs",
     "title",
     "title_origin",
     "title_refresh_mark",
@@ -321,9 +331,9 @@ def test_the_table_declares_every_asymmetry_the_readers_had():
         "model": ["recent", "restore"],
         "reasoning_effort": ["recent", "restore"],
         "memory_store": ["recent", "restore"],
-        "executor": ["restore"],
-        "instance_id": ["restore"],
-        "remote_slot": ["restore"],
+        "executor": ["recent", "restore"],
+        "instance_id": ["recent", "restore"],
+        "remote_slot": ["recent", "restore"],
         "created_by": ["recent", "restore"],
         "app": ["recent", "restore"],
         "artifact": ["recent", "restore"],
@@ -563,6 +573,24 @@ def test_an_old_relay_line_keeps_the_archive_marker_and_ignores_its_relay_flag(
     slot, applied, _ = _read_back(state, meta, codec.RESTORE)
     assert (slot.executor, slot.instance_id, slot.remote_slot) == expected
     assert not hasattr(applied, "relay_in_flight")
+
+
+def test_a_recent_restored_relay_chat_stays_a_read_only_archive(tmp_path, monkeypatch):
+    """The recent-sessions restore keeps the relay marker: an old relay chat comes
+    back a read-only archive, and the next save writes the binding back."""
+    state = _state(tmp_path, monkeypatch)
+    meta = {"executor": "remote", "instance_id": "inst-1", "remote_slot": "rs-1"}
+    slot, _, _ = _read_back(state, meta, codec.RECENT)
+    assert (slot.executor, slot.instance_id, slot.remote_slot) == ("remote", "inst-1", "rs-1")
+    refusal = relay_archive_refusal(slot)
+    assert refusal is not None and refusal.status == 409
+    assert json.loads(refusal.text)["code"] == "relay_archive_read_only"
+    line = codec.encode(slot, folds=_slot_folds(slot))
+    assert (line["executor"], line["instance_id"], line["remote_slot"]) == (
+        "remote",
+        "inst-1",
+        "rs-1",
+    )
 
 
 def test_a_resume_drops_a_folder_only_on_a_verdict_about_that_folder(tmp_path, monkeypatch):

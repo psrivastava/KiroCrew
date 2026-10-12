@@ -60,7 +60,7 @@ import {
   shortenEcsTarget,
   usesSsmTransport,
 } from '../../utils/remoteCrew'
-import { Card, Btn, Badge, IconButton } from '../../components/ui'
+import { Card, Btn, Badge, IconButton, Toggle } from '../../components/ui'
 import { SettingsToggle } from '../../components/settings'
 import {
   DropdownMenu,
@@ -89,9 +89,12 @@ import { readPersistedString, usePersistedString } from '../../hooks/usePersiste
 import { usePersistedBool } from '../../hooks/usePersistedBool'
 import { AUTO_CONNECT_KEY } from '../../hooks/useAutoConnectInstances'
 import { copyToClipboard } from '../../utils/clipboard'
+import { useScrollEdges } from '../../hooks/useScrollEdges'
 import { useAppDispatch, useAppSelector } from '../../store'
 import { removeWarm, setCrewEditForm } from '../../store/instancesSlice'
+import { setCrewEnabled } from '../../lib/crewEnabled'
 import { i18nT } from '../../i18n/t'
+import { guideCaution } from '../../guide/trustRoot'
 import { AddInstanceForm, StatusBadge } from './InstancesPanel'
 import {
   EditInstanceForm,
@@ -128,9 +131,13 @@ const connectionTypeHint = (inst: InstanceView): string =>
  * it is a wall of text, and a button that promised a dashboard would be the
  * defect this field replaces.
  */
-function TurnUrlField({ url, crewName }: { url: string; crewName: string }) {
+export function TurnUrlField({ url, crewName }: { url: string; crewName: string }) {
   const [copied, setCopied] = useState(false)
   const [copyFailed, setCopyFailed] = useState(false)
+  // Same scrollbar-none field as WebhooksPage's CopyField: a hidden scrollbar
+  // leaves a long URL's clipped tail unsignalled, so paint the edge cue. #4074.
+  const [attachEdges, edges, remeasure] = useScrollEdges<HTMLElement>()
+  useEffect(() => { remeasure() }, [url, remeasure])
   const label = i18nT('pages.settings.remoteCrewPanel.copy_turn_url', { name: crewName })
   const handleCopy = async () => {
     if (await copyToClipboard(url)) {
@@ -147,9 +154,20 @@ function TurnUrlField({ url, crewName }: { url: string; crewName: string }) {
         {i18nT('pages.settings.remoteCrewPanel.turn_api')}
       </div>
       <div className="flex items-center gap-2 bg-bg-elevated border border-border rounded-md pl-3 pr-1.5 py-1.5">
-        <code className="flex-1 min-w-0 font-mono text-[12px] overflow-x-auto whitespace-nowrap scrollbar-none text-card-fg">
-          {url}
-        </code>
+        {/* Wrapper for the edge cues: the fades anchor to this non-scrolling
+            parent, not the scrolled code element. from-bg-elevated matches the
+            field surface. */}
+        <div className="relative flex-1 min-w-0">
+          <code ref={attachEdges} className="block min-w-0 font-mono text-[12px] overflow-x-auto whitespace-nowrap scrollbar-none text-card-fg">
+            {url}
+          </code>
+          {edges.left && (
+            <div aria-hidden="true" data-testid="turn-url-cue-left" className="pointer-events-none absolute left-0 top-0 bottom-0 w-4 z-10 bg-gradient-to-r from-bg-elevated to-transparent" />
+          )}
+          {edges.right && (
+            <div aria-hidden="true" data-testid="turn-url-cue-right" className="pointer-events-none absolute right-0 top-0 bottom-0 w-4 z-10 bg-gradient-to-l from-bg-elevated to-transparent" />
+          )}
+        </div>
         <IconButton aria-label={label} onClick={handleCopy} title={label}>
           {copied ? <Check size={14} className="text-ok" /> : <Copy size={14} />}
         </IconButton>
@@ -511,7 +529,11 @@ function SigninPromptBlock({ job, onRestart, restarting, onFetch, fetching, noti
         {starting
           ? i18nT('pages.settings.remoteCrewPanel.sign_in_starting')
           : stale
-            ? i18nT('pages.settings.remoteCrewPanel.sign_in_unconfirmed')
+            // The "start over" sentence names the link below, so it is shown
+            // only where that link is: a crew that never registered has none.
+            ? canRestart
+              ? `${i18nT('pages.settings.remoteCrewPanel.sign_in_unconfirmed')} ${i18nT('pages.settings.remoteCrewPanel.sign_in_unconfirmed_expired')}`
+              : i18nT('pages.settings.remoteCrewPanel.sign_in_unconfirmed')
             : awaiting
               // Names the two sign-ins as ONE act. The reader could not tell
               // whether the Kiro sign-in step and the company SSO approval were
@@ -810,6 +832,9 @@ function SettingUpRow({ job, onCancel, cancelling }: { job: LaunchJob; onCancel:
 
 /** One switchable crew — a cloud-launched instance (Stop / Delete by tag) or a
  *  hand-added machine (Remove). */
+/** The one line that says what a crew's on/off switch does; every switch points at it. */
+const CREW_SWITCH_HINT_ID = 'remote-crew-switch-hint'
+
 function CrewRow({
   inst,
   cloudTag,
@@ -819,6 +844,7 @@ function CrewRow({
   confirmRemove,
   onConnect,
   onDisconnect,
+  onSetEnabled,
   onDiagnose,
   onRemove,
   onStop,
@@ -850,6 +876,7 @@ function CrewRow({
   confirmRemove: boolean
   onConnect: (id: string) => void
   onDisconnect: (id: string) => void
+  onSetEnabled: (id: string, enabled: boolean) => void
   onDiagnose: (id: string) => void
   onRemove: (id: string) => void
   onStop: (tag: string, coords: CloudCoords) => void
@@ -959,7 +986,15 @@ function CrewRow({
               : `${usesSsmTransport(inst) && inst.aws_region ? ` (${inst.aws_region})` : ''} ${i18nT('pages.settings.instancesPanel.port_2')} ${inst.remote_port}`}
           </div>
           <div className="mt-1 flex items-center gap-1.5 flex-wrap">
-            <StatusBadge status={inst.status} />
+            {!inst.disabled && <StatusBadge status={inst.status} />}
+            <span className="inline-flex items-center gap-1.5 text-[12px] text-muted">
+              <Toggle checked={!inst.disabled} onChange={on => onSetEnabled(inst.id, on)}
+                disabled={!!busy || deleting} describedBy={CREW_SWITCH_HINT_ID}
+                label={i18nT('pages.settings.remoteCrewPanel.crew_enabled_named', { name: inst.name })} />
+              {inst.disabled
+                ? i18nT('pages.settings.remoteCrewPanel.crew_disabled')
+                : i18nT('pages.settings.remoteCrewPanel.crew_enabled')}
+            </span>
             {awaitingSignin && (
               <Badge variant="warn" title={i18nT('pages.settings.remoteCrewPanel.needs_sign_in_hint')}>
                 <KeyRound className="lucide-inline" /> {i18nT('pages.settings.remoteCrewPanel.needs_sign_in')}
@@ -994,7 +1029,7 @@ function CrewRow({
           <Btn onClick={() => onDisconnect(inst.id)} disabled={!!busy || deleting}>
             <Unplug className="lucide-inline" /> {i18nT('pages.settings.instancesPanel.disconnect')}
           </Btn>
-        ) : (
+        ) : inst.disabled ? null : (
           <Btn primary onClick={() => onConnect(inst.id)} disabled={!!busy || deleting}>
             <Plug className="lucide-inline" /> {busy === `connect:${inst.id}` ? i18nT('pages.settings.instancesPanel.connecting') : i18nT('pages.settings.instancesPanel.connect')}
           </Btn>
@@ -1026,7 +1061,7 @@ function CrewRow({
           </Btn>
         ) : isCloud && confirmDelete ? (
           <>
-            <Btn danger onClick={() => onDelete(cloudTag, coordsOf(inst))} disabled={!!busy} aria-label={i18nT('pages.settings.remoteCrewPanel.confirm_delete_of', { name: inst.name })}>
+            <Btn danger onClick={() => onDelete(cloudTag, coordsOf(inst))} disabled={!!busy} aria-label={i18nT('pages.settings.remoteCrewPanel.confirm_delete_of', { name: inst.name })} {...guideCaution}>
               {/* Names its target on screen, not only to assistive tech: this click
                   terminates an EC2 instance, and "Confirm delete" beside two other
                   rows does not say WHICH. */}
@@ -1858,6 +1893,15 @@ export function RemoteCrewPanel() {
     onError: (e, id) => setActionErr(i18nT('pages.settings.instancesPanel.disconnect_failed', { id, error: errMsg(e, i18nT('pages.settings.instancesPanel.unknown_error')) })),
     onSettled: reloadInstances,
   })
+  const crewToggleMutation = useMutation({
+    mutationFn: ({ id, enabled }: { id: string; enabled: boolean }) => setCrewEnabled(dispatch, id, enabled),
+    onMutate: () => setActionErr(null),
+    onError: (e, { id }) => setActionErr(i18nT('pages.settings.remoteCrewPanel.crew_toggle_failed', {
+      name: instancesQuery.data?.instances?.find(i => i.id === id)?.name || id,
+      error: errMsg(e, i18nT('pages.settings.instancesPanel.unknown_error')),
+    })),
+    onSettled: reloadInstances,
+  })
   const removeMutation = useMutation({
     mutationFn: async (id: string) => { await api.disconnectInstance(id).catch(() => {}); await api.removeInstance(id) },
     onMutate: () => setActionErr(null),
@@ -2025,7 +2069,7 @@ export function RemoteCrewPanel() {
         ? `stop:${stopMutation.variables?.tag}`
         : startMutation.isPending
           ? `start:${startMutation.variables?.tag}`
-          : disconnectMutation.isPending || removeMutation.isPending || deleteMutation.isPending
+          : disconnectMutation.isPending || removeMutation.isPending || deleteMutation.isPending || crewToggleMutation.isPending
             ? 'busy'
             : ''
 
@@ -2262,6 +2306,9 @@ export function RemoteCrewPanel() {
                 <Btn onClick={reloadInstances} aria-label={i18nT('pages.settings.instancesPanel.refresh')}><RefreshCw className="lucide-inline" /></Btn>
               </div>
             </div>
+            <p id={CREW_SWITCH_HINT_ID} className="text-[12px] text-muted mb-1">
+              {i18nT('pages.settings.remoteCrewPanel.crew_switch_hint')}
+            </p>
             {needsRestart && (
               <div role="status" className="flex items-start gap-2 px-3 py-2 mb-3 text-[13px] rounded-md bg-warn/10 text-warn border border-warn/30">
                 <AlertTriangle size={14} className="lucide-inline mt-0.5 shrink-0" />
@@ -2317,6 +2364,7 @@ export function RemoteCrewPanel() {
                     confirmRemove={confirmRemoveId === inst.id}
                     onConnect={id => connectMutation.mutate(id)}
                     onDisconnect={id => disconnectMutation.mutate(id)}
+                    onSetEnabled={(id, enabled) => crewToggleMutation.mutate({ id, enabled })}
                     onDiagnose={id => diagnoseMutation.mutate(id)}
                     onRemove={id => removeMutation.mutate(id)}
                     onStop={(tag, coords) => stopMutation.mutate({ tag, coords })}
@@ -2757,7 +2805,16 @@ export function RemoteCrewPanel() {
                 launch={input => launchMutation.mutate({
                   provider_id: selectedProvisioner.id,
                   profile: input.profile ?? '',
-                  region: input.region ?? '',
+                  // `||`, not `??`: a provisioner form with no region field sends
+                  // an EMPTY STRING, not undefined, and every provisioner's
+                  // preflight refuses an empty region -- reported as
+                  // `region='' is not a region`, which reads as a malformed value
+                  // rather than an absent one. Falling back to the panel's own
+                  // region means a form that does not ask for one inherits the
+                  // account the reader already chose here. The gateway defaults
+                  // it too, from the operator's config; this is what keeps the
+                  // two from disagreeing about which region the reader picked.
+                  region: input.region || region,
                   size_key: input.size_key,
                 })}
                 launching={launchMutation.isPending}

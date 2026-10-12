@@ -351,14 +351,16 @@ strict-read shape as the `boot` gate flags in
 **This policy is also the trust root for the security ceiling.**
 `require_policy_signature` (default `false`) additionally demands a *verified*
 `identity.signature` on `security_policy.json`, keyed by that document's
-`identity.issuer` in the same `trust_keys` map — one key store, not two. It is a
+`identity.issuer` in `trust_public_keys` (a base64 Ed25519 public key, policy
+issuers only) or else in the same `trust_keys` map — one key store, not two. An
+issuer with a public key never falls back to its `trust_keys` secret. It is a
 **separate** flag from `require_signature` on purpose: a fleet that signs its
 plugins has not thereby promised to sign its governance ceiling, and conflating
 them would break managed fleets on upgrade. The flag lives here rather than inside
 the security policy because a document cannot be the authority on whether it must
 be authentic. `canonical_signing_bytes` / `hmac_signature` are shared by both
 checks so the two trust roots cannot drift apart. The governance loader reads
-these two fields through `read_policy_trust_root()` — a **side-effect-free**
+these fields through `read_policy_trust_root()` — a **side-effect-free**
 reader that records no posture and emits no SEL, because unlike
 `load_admission_policy` (once per process at boot) it runs on a repeating path.
 See `governance.md` → "Policy authenticity".
@@ -642,6 +644,13 @@ Wired sites:
   exfil-then-credential two-pass (the Default `CredentialPolicy.redact` delegates
   to `security.redact`); a loaded companion adds its internal-token regexes
   uniformly across every egress surface.
+- Content scans (`binary_content_is_flagged`, `wide_content_is_flagged`) are serialized
+  behind one re-entrant lock (`_SCAN_LOCK`) and their verdicts are kept in a 256-entry LRU
+  (`_SCAN_VERDICTS`) keyed by (scan kind, SHA-256 of the bytes, `governance_generation()`),
+  so the same file served repeatedly is scanned once. A verdict is kept only if neither the
+  governance generation nor this thread's redact-degrade count moved while it ran, so an
+  answer the bare baseline gave in the active context's place is never reused; a scan that
+  raises caches nothing and still fails closed.
 - Gate-side LOG lines (`kiro_crew.platform.redact_log_via_context`) — the same
   companion-aware redaction for an operational log or audit line, which unlike an
   egress sink cannot afford to raise. `redact_via_context` propagates

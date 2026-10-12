@@ -70,6 +70,12 @@ export interface MessageRenderContext {
   /** Stable React key the list computed for this row. */
   key: string
   onFileOpen?: (path: string, opts?: { line?: number; endLine?: number }) => void
+  /** Open an artifact (`/artifacts/<slug>` link in a reply) in the host's side
+   *  panel, the way the main chat does. Absent = the link stays a plain
+   *  `target="_blank"` anchor to the standalone artifact view, which a
+   *  crewmate DM must not do (#18320). Capability by omission, like
+   *  `onFileOpen`. */
+  onArtifactOpen?: (slug: string) => void
   /** Selection actions the host offers on assistant text (see
    *  chat-core/composer/selectionActions). Absent = Copy only. */
   onQuote?: (text: string, rect: DOMRect) => void
@@ -372,12 +378,14 @@ export interface AssistantBubbleOptions {
    *  another reply, which the SDK's own rule reads as "the turn goes on".
    *  Streaming rows never draw a footer, whatever this says. */
   forceFooter?: boolean
-  /** Decide the steer-chip suppression against a transcript the host holds
-   *  instead of `ctx.messages`. A host that FILTERS the list before rendering
-   *  (a crewmate's chat drops the `inject` rows) must pass the unfiltered one,
-   *  or the policy-block marker is never found and a system-forced
-   *  continuation is credited to the user. */
-  policyBlockTranscript?: { messages: ChatMessage[]; index: number }
+  /** Never draw the "Steered" chip, whatever the reply's `[STEERING …]` ack
+   *  says. A host whose every busy send IS a steer (a crewmate's chat: one
+   *  named peer, no queue) sets it — there the chip would end nearly every
+   *  reply with the very mechanics the surface hides (#17838). Off (default)
+   *  the SDK rule applies: the chip draws unless the turn's steer was a
+   *  system policy notice rather than the user's (`turnHadPolicyBlock`). The
+   *  raw marker is stripped from the prose either way. */
+  suppressSteerAck?: boolean
   /** Session routing for the reply's markdown: open a session chip, plus the
    *  roster and the active key the chip resolver needs. All three or none — the
    *  renderer gates on (`onSessionOpen` AND `sessions`), so a half-wired host
@@ -394,6 +402,9 @@ export interface AssistantBubbleOptions {
    *  `messageTs`, which also versions this row's local image URLs, so a host
    *  passes it with the triple rather than on its own. */
   messageTs?: string
+  /** The bubble's own Regenerate action (its hover row), for the host that
+   *  can regenerate this reply. Absent: no Regenerate. */
+  onRegenerate?: () => void
 }
 
 /**
@@ -462,6 +473,7 @@ export function renderAssistantBubble(
       showFooter={showFooter}
       slotRunning={ctx.running}
       onFileOpen={ctx.onFileOpen}
+      onArtifactOpen={ctx.onArtifactOpen}
       onQuote={ctx.onQuote}
       onAsk={ctx.onAsk}
       // Session routing, from the host or absent. `MarkdownRenderer` gates on
@@ -477,11 +489,8 @@ export function renderAssistantBubble(
       decisionsStrip={decisionStripFieldOf(m)}
       fileChanges={(m.meta as Record<string, unknown> | undefined)?.file_changes as FileChangeEntry[] | undefined}
       fileChangesOmittedFiles={(m.meta as Record<string, unknown> | undefined)?.file_changes_omitted_files}
-      suppressSteerAck={
-        opts.policyBlockTranscript
-          ? turnHadPolicyBlock(opts.policyBlockTranscript.messages, opts.policyBlockTranscript.index)
-          : turnHadPolicyBlock(ctx.messages, ctx.index)
-      }
+      onRegenerate={opts.onRegenerate}
+      suppressSteerAck={opts.suppressSteerAck || turnHadPolicyBlock(ctx.messages, ctx.index)}
       bubbleClassName={bubbleClassName}
       onReplyInThread={isStreaming ? undefined : replyInThreadFor(m, ctx)}
       onQuoteMessage={quoteMessageFor(m, ctx, 'assistant')}
@@ -657,7 +666,9 @@ export const defaultMessageRenderers: readonly MessageRenderer[] = [
     // Reasoning roles derive from the shared classification (see
     // pages/chat/groupDisplayItems.ts) so this default cannot drift from the
     // surfaces that DO draw them; the lifecycle roles are local to this entry.
-    roles: [...REASONING_ROLES, 'system', 'done', 'queued'],
+    // `card` is a change card / guide offer: drawn only by a host that
+    // has the card stores (pages/chat/transcriptRenderers), never as a bubble.
+    roles: [...REASONING_ROLES, 'system', 'done', 'queued', 'card'],
     render: () => null,
   },
   {

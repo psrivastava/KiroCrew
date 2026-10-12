@@ -37,6 +37,7 @@ vi.mock('../api/client', () => ({
 import SessionTitleControl from '../pages/chat/SessionTitleControl'
 import { MOVE_UNDO_MS } from '../components/MoveUndoBar'
 import { api } from '../api/client'
+import { updateSlotPin } from '../store/dashboardSlice'
 
 const SLOT = 'pane-a'
 const TITLE = 'Alpha session'
@@ -235,7 +236,7 @@ describe('SessionTitleControl', () => {
     await waitFor(() => expect(storeTitle(store)).toBe('Generated title'))
     // Spinner gone; the Auto-title button's place is taken by the Undo offer.
     await waitFor(() => expect(screen.getByRole('button', { name: `Undo: ${TITLE}` })).toBeTruthy())
-    expect(screen.queryByText('Auto-title…')).toBeNull()
+    expect(screen.queryByText('Generating title…')).toBeNull()
   })
 
   it('offers a one-shot Undo after a generated title lands, which restores the previous name through the rename path', async () => {
@@ -400,6 +401,16 @@ describe('SessionTitleControl', () => {
     expect(regen.getAttribute('tabindex')).not.toBe('-1')
   })
 
+  it('the regenerate button names its action with a verb, not a state noun (#14443)', () => {
+    renderControl()
+    const regen = screen.getByRole('button', { name: REGEN })
+    // A noun label ("Auto-title") read as "this title is automatic" once Enter
+    // returned focus to the header and revealed it; the verb says what a press does.
+    expect(regen.textContent).toBe('Regenerate title')
+    expect(regen.getAttribute('aria-label')).toMatch(/^Regenerate title/)
+    expect(screen.queryByText(/Auto-title/)).toBeNull()
+  })
+
   it('no Undo is offered when the generated title equals the current one', async () => {
     vi.mocked(api.generateTitle).mockResolvedValueOnce({ title: TITLE })
     renderControl()
@@ -415,10 +426,12 @@ describe('SessionTitleControl', () => {
     await act(async () => { fireEvent.click(screen.getByRole('button', { name: REGEN })) })
     expect(screen.queryByRole('button', { name: REGEN })).toBeNull()
     // The busy state is named, not just drawn: the label stays beside the spinner.
-    expect(screen.getByText('Auto-title…').closest('[role="status"]')).not.toBeNull()
+    expect(screen.getByText('Generating title…').closest('[role="status"]')).not.toBeNull()
+    // The busy label is a progress phrase, never the button's imperative verb.
+    expect(screen.queryByText(/Regenerate title/)).toBeNull()
     await act(async () => { resolve({ title: 'Done' }) })
     // Settled: the busy status is gone and the Undo offer stands in the button's place.
-    await waitFor(() => expect(screen.queryByText('Auto-title…')).toBeNull())
+    await waitFor(() => expect(screen.queryByText('Generating title…')).toBeNull())
     expect(screen.getByRole('button', { name: `Undo: ${TITLE}` })).toBeTruthy()
   })
 
@@ -793,5 +806,30 @@ describe('SessionTitleControl', () => {
     expect(screen.getByDisplayValue(TITLE)).toBeTruthy()
     // Beside the editor the glyph names itself.
     expect(screen.getByRole('img', { name: 'Incognito — memory writes disabled' })).toBeTruthy()
+  })
+
+  it('marks a pinned session beside the title and follows a pin toggled elsewhere', () => {
+    // The header menu's Pin moves the sidebar row into the pinned group, often
+    // out of view, so the header is where the user sees whether it took.
+    const { store } = renderControl()
+    expect(screen.queryByTestId('session-pinned-glyph')).toBeNull()
+    act(() => { store.dispatch(updateSlotPin({ key: SLOT, pinned: true })) })
+    const glyph = screen.getByTestId('session-pinned-glyph')
+    expect(glyph.getAttribute('title')).toBe('Pinned')
+    const trigger = screen.getByRole('button', { name: `${RENAME}, Pinned` })
+    expect(trigger.contains(glyph)).toBe(true)
+    // Beside the editor it names itself, as the memory glyph does.
+    fireEvent.click(glyph)
+    expect(screen.getByRole('img', { name: 'Pinned' })).toBeTruthy()
+    act(() => { fireEvent.keyDown(screen.getByDisplayValue(TITLE), { key: 'Escape' }) })
+    act(() => { store.dispatch(updateSlotPin({ key: SLOT, pinned: false })) })
+    expect(screen.queryByTestId('session-pinned-glyph')).toBeNull()
+    expect(screen.getByRole('button', { name: RENAME })).toBeTruthy()
+  })
+
+  it('orders the pin before the memory-mode glyph in the trigger name', () => {
+    const { store } = renderControl({ memoryMode: 'incognito' })
+    act(() => { store.dispatch(updateSlotPin({ key: SLOT, pinned: true })) })
+    expect(screen.getByRole('button', { name: `${RENAME}, Pinned, Incognito — memory writes disabled` })).toBeTruthy()
   })
 })

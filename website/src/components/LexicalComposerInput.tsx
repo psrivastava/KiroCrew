@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef } from 'react'
 import { LexicalComposer } from '@lexical/react/LexicalComposer'
 import { ContentEditable } from '@lexical/react/LexicalContentEditable'
 import { HistoryPlugin } from '@lexical/react/LexicalHistoryPlugin'
@@ -24,6 +24,7 @@ import {
   COMMAND_PRIORITY_HIGH,
   COPY_COMMAND,
   CUT_COMMAND,
+  DELETE_CHARACTER_COMMAND,
   type EditorState,
   type ElementNode,
   type LexicalEditor,
@@ -54,7 +55,7 @@ import {
   hasPlainClipboardText,
   stripTrailingBlankLines,
 } from './composerPastePolicy'
-import { listLineBreakEdit } from './composerListContinuation'
+import { listLineBreakEdit, listMarkerBackspaceEdit, type ListLineBreakEdit } from './composerListContinuation'
 import {
   $createPasteTokenNode,
   $isPasteTokenNode,
@@ -111,6 +112,9 @@ interface LexicalComposerInputProps {
    *  snapshot history answers here and returns true when it handled the step.
    *  Without it Lexical's HistoryPlugin handles undo as usual. */
   onHistoryStep?: (direction: 'undo' | 'redo') => boolean
+  /** Close the host's coalescing typing burst, so a structural edit the
+   *  composer makes (a list-marker Backspace) gets its own undo step. */
+  onEndUndoBurst?: () => void
   onUploadFiles?: (files: File[]) => void
   sentMessages?: PromptHistoryItem[]
   /** Owner of `sentMessages` (the slot); a change ends prompt-history browsing. */
@@ -238,12 +242,48 @@ function $applyListLineBreak(): boolean {
   })
   const edit = listLineBreakEdit($getRoot().getTextContent(), $pointOffset(selection.anchor), chips)
   if (!edit) return false
+  $applyRenumber(edit)
   const range = $createRangeSelection()
   $setPointAtOffset(range.anchor, edit.start)
   $setPointAtOffset(range.focus, edit.end)
   $setSelection(range)
   if (edit.insert) range.insertRawText(edit.insert)
   else range.removeText()
+  return true
+}
+
+// The number rewrites below the edited item, last to first: each sits after
+// the edit, so writing them never moves an offset still to be used.
+function $applyRenumber(edit: ListLineBreakEdit): void {
+  for (const write of [...(edit.renumber ?? [])].reverse()) {
+    const digits = $createRangeSelection()
+    $setPointAtOffset(digits.anchor, write.start)
+    $setPointAtOffset(digits.focus, write.end)
+    $setSelection(digits)
+    digits.insertRawText(write.insert)
+  }
+}
+
+// Remove the list marker in front of a collapsed caret in one Backspace
+// (listMarkerBackspaceEdit); false leaves the one-character delete to
+// PlainTextPlugin. One editor update, one undo step: `endUndoBurst` runs
+// before the edit so the host's typing snapshot is kept, not overwritten.
+function $applyListMarkerBackspace(endUndoBurst?: () => void): boolean {
+  const selection = $getSelection()
+  if (!$isRangeSelection(selection) || !selection.isCollapsed()) return false
+  const chips = $nodesOfType(PasteTokenNode).map(node => {
+    const start = $nodeStartOffset(node)
+    return { start, end: start + node.getTextContentSize() }
+  })
+  const edit = listMarkerBackspaceEdit($getRoot().getTextContent(), $pointOffset(selection.anchor), chips)
+  if (!edit) return false
+  endUndoBurst?.()
+  $applyRenumber(edit)
+  const range = $createRangeSelection()
+  $setPointAtOffset(range.anchor, edit.start)
+  $setPointAtOffset(range.focus, edit.end)
+  $setSelection(range)
+  range.removeText()
   return true
 }
 
@@ -338,7 +378,8 @@ function HostHistoryPlugin({ onHistoryStep }: { onHistoryStep: (direction: 'undo
   const [editor] = useLexicalComposerContext()
   const stepRef = useRef(onHistoryStep)
   stepRef.current = onHistoryStep
-  useEffect(() => {
+  // Layout effect, like Lexical's own plugins: see InteractionPlugin.
+  useLayoutEffect(() => {
     const offUndo = editor.registerCommand(UNDO_COMMAND, () => { stepRef.current('undo'); return true }, COMMAND_PRIORITY_CRITICAL)
     const offRedo = editor.registerCommand(REDO_COMMAND, () => { stepRef.current('redo'); return true }, COMMAND_PRIORITY_CRITICAL)
     return () => { offUndo(); offRedo() }
@@ -374,8 +415,11 @@ function InteractionPlugin({
   readOnly,
   sendOnEnter,
   showFullPastes,
-}: Pick<LexicalComposerInputProps, 'blocks' | 'onBlocksChange' | 'onChange' | 'onSend' | 'onOptimizeChord' | 'onUploadFiles' | 'sentMessages' | 'historyScope' | 'onEditLastRequest' | 'disabled' | 'readOnly' | 'sendOnEnter' | 'showFullPastes'>) {
+  onEndUndoBurst,
+}: Pick<LexicalComposerInputProps, 'blocks' | 'onBlocksChange' | 'onChange' | 'onSend' | 'onOptimizeChord' | 'onUploadFiles' | 'sentMessages' | 'historyScope' | 'onEditLastRequest' | 'disabled' | 'readOnly' | 'sendOnEnter' | 'showFullPastes' | 'onEndUndoBurst'>) {
   const [editor] = useLexicalComposerContext()
+  const endUndoBurstRef = useRef(onEndUndoBurst)
+  endUndoBurstRef.current = onEndUndoBurst
   const blocksRef = useRef(blocks)
   const rawPasteRef = useRef(false)
   const historyCursorRef = useRef<PromptHistoryCursor | null>(null)
@@ -391,7 +435,14 @@ function InteractionPlugin({
   if (!imeLatchRef.current) imeLatchRef.current = createImeLatch()
   blocksRef.current = blocks
 
-  useEffect(() => {
+  // A layout effect, not a passive one, for the same reason Lexical registers
+  // its own plain-text handlers in one (usePlainTextSetup): the editor root
+  // takes keydown from the moment ContentEditable's ref sets it, during this
+  // same commit, while a passive effect waits for the scheduler's next task.
+  // On the lazy first mount that task is a separate macrotask, so between the
+  // two an Enter chord reaches only Lexical's default handler and inserts a
+  // line break instead of sending or optimizing (#18193).
+  useLayoutEffect(() => {
     const latch = imeLatchRef.current!
     // Track composition on the editor root itself, with the same stranded-latch
     // recovery the textarea binding carries: a composition abandoned without
@@ -554,6 +605,18 @@ function InteractionPlugin({
       () => continueList(false),
       COMMAND_PRIORITY_HIGH,
     )
+    // Backspace (its keydown and the `deleteContentBackward` beforeinput)
+    // arrives as a backward DELETE_CHARACTER_COMMAND. Android Chrome is the
+    // exception: Lexical leaves a collapsed delete to the browser there,
+    // because Chromium Android ignores preventDefault on that event, so this
+    // handler never runs and the marker deletes one character at a time.
+    // Claiming the beforeinput instead would delete the marker and then one
+    // more character natively.
+    const unregisterMarkerBackspace = editor.registerCommand(
+      DELETE_CHARACTER_COMMAND,
+      isBackward => isBackward && !editor.isComposing() && $applyListMarkerBackspace(() => endUndoBurstRef.current?.()),
+      COMMAND_PRIORITY_HIGH,
+    )
 
     const moveAfterRecall = (value: string, position: 'start' | 'end') => {
       requestAnimationFrame(() => {
@@ -617,6 +680,7 @@ function InteractionPlugin({
       unregisterEnter()
       unregisterLineBreak()
       unregisterParagraph()
+      unregisterMarkerBackspace()
       unregisterArrowUp()
       unregisterArrowDown()
       rootListeners()
@@ -650,6 +714,7 @@ export default function LexicalComposerInput({
   onReady,
   onSelectionChange,
   onHistoryStep,
+  onEndUndoBurst,
   onUploadFiles,
   sentMessages,
   historyScope,
@@ -729,6 +794,7 @@ export default function LexicalComposerInput({
           disabled={disabled}
           readOnly={readOnly}
           sendOnEnter={sendOnEnter}
+          onEndUndoBurst={onEndUndoBurst}
         />
       </div>
     </LexicalComposer>

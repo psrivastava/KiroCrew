@@ -30,7 +30,7 @@ from kiro_crew.dashboard.handlers import work_ledger as routes
 
 #: The real implementation, captured before the autouse fixture stubs the name.
 #: A test that drives the true branch has to reach past its own default.
-_REAL_REACHES_A_CHANNEL = routes._reaches_a_channel
+_REAL_REACHES_A_CHANNEL = routes.reaches_a_channel
 
 CONDUCTOR_A = "chat-a-conductor"
 CONDUCTOR_B = "chat-b-conductor"
@@ -64,7 +64,7 @@ def _open_route(monkeypatch):
 
     monkeypatch.setattr(routes, "_recognize_session", _recognized)
     monkeypatch.setattr(routes, "_is_restricted_session", lambda *a: False)
-    monkeypatch.setattr(routes, "_reaches_a_channel", lambda request, sk: False)
+    monkeypatch.setattr(routes, "reaches_a_channel", lambda state, sk: False)
     # The routes record every write into the caller's crew log and refuse when
     # they cannot: a ``MagicMock`` state resolves no unit, so the gate is opened
     # here and the append is swallowed. ``test_work_ledger_projection.py`` drives
@@ -395,6 +395,7 @@ async def test_every_store_code_maps_to_the_status_the_rfc_tabulates():
         "item_closed": 409,
         "item_cap_exceeded": 409,
         "item_store_full": 409,
+        "goal_item_cap_reached": 409,
         "depth_exceeded": 409,
         "crew_log_incomplete": 409,
         "cache_dirty": 409,
@@ -452,6 +453,9 @@ async def test_item_closed_is_409_for_both_halves():
 @pytest.mark.asyncio
 async def test_item_cap_exceeded_is_409():
     await two_by_two()
+    # Past the goal's default spend cap of 20, so the open cap is what bites.
+    status, _ = await _record(CONDUCTOR_A, {"action": "goal", "item_cap": wl.MAX_GOAL_ITEM_CAP})
+    assert status == 200
     for n in range(wl.MAX_ITEMS_PER_CONDUCTOR - 1):
         status, _ = await _record(
             CONDUCTOR_A,
@@ -464,6 +468,47 @@ async def test_item_cap_exceeded_is_409():
     )
     assert status == 409
     assert body["code"] == wl.CODE_ITEM_CAP_EXCEEDED
+
+
+@pytest.mark.asyncio
+async def test_goal_item_cap_reached_is_409_and_item_cap_raises_it():
+    """The goal's spend cap answers 409 with its own code; a goal write raises it."""
+    await two_by_two()
+    status, _ = await _record(CONDUCTOR_A, {"action": "goal", "item_cap": 2})
+    assert status == 200
+    acceptance = {"kind": "human_approval"}
+    # two_by_two already created one item on this board.
+    status, _ = await _record(
+        CONDUCTOR_A, {"action": "create", "title": "b", "acceptance": acceptance}
+    )
+    assert status == 200
+    status, body = await _record(
+        CONDUCTOR_A, {"action": "create", "title": "c", "acceptance": acceptance}
+    )
+    assert status == 409
+    assert body["code"] == wl.CODE_GOAL_ITEM_CAP_REACHED
+    status, _ = await _record(CONDUCTOR_A, {"action": "goal", "item_cap": 3})
+    assert status == 200
+    status, read = await _read(CONDUCTOR_A)
+    assert status == 200
+    assert read["conductor"]["item_cap"] == 3
+    assert read["conductor"]["goal_items_used"] == 2
+    # A goal the user replaced, recorded with new_goal, starts the count again.
+    status, _ = await _record(CONDUCTOR_A, {"action": "goal", "goal": "next", "new_goal": True})
+    assert status == 200
+    status, read = await _read(CONDUCTOR_A)
+    assert read["conductor"]["goal_items_used"] == 0
+    status, _ = await _record(
+        CONDUCTOR_A, {"action": "create", "title": "c", "acceptance": acceptance}
+    )
+    assert status == 200
+
+
+@pytest.mark.asyncio
+async def test_an_item_cap_past_the_ceiling_is_refused_400():
+    await two_by_two()
+    status, _ = await _record(CONDUCTOR_A, {"action": "goal", "item_cap": 257})
+    assert status == 400
 
 
 @pytest.mark.asyncio
@@ -858,7 +903,7 @@ def test_the_schema_caps_restate_the_stores_own():
 def test_the_worker_schema_has_no_conductor_field():
     """The absence IS the guarantee — stronger than an allowlist kept correct by hand."""
     names = {f.name for f in validation.WORK_REPORT_SCHEMA.fields}
-    assert names == {"status", "summary", "artifacts", "pr"}
+    assert names == {"status", "summary", "artifacts", "pr", "reason"}
     for forbidden in (
         "item_id",
         "session",
@@ -989,7 +1034,7 @@ async def test_an_outbound_mirrored_session_is_refused_like_a_channel_one(monkey
     channel, so its key looks local while the disclosure is identical. The key alone
     is therefore not the test."""
     ids = await two_by_two()
-    monkeypatch.setattr(routes, "_reaches_a_channel", lambda request, sk: True)
+    monkeypatch.setattr(routes, "reaches_a_channel", lambda state, sk: True)
     for status, body in (
         await _brief(WORKER_A),
         await _report(WORKER_A, {"status": "done", "summary": "x"}),
@@ -1013,7 +1058,7 @@ def test_the_mirror_probe_fails_closed_on_an_unreadable_store(monkeypatch):
 
     monkeypatch.setattr(session_control, "_has_channel_mirror", _boom)
     request = _req("GET", "/api/work-ledger", sk="chat-probe")
-    assert _REAL_REACHES_A_CHANNEL(request, "chat-probe") is True
+    assert _REAL_REACHES_A_CHANNEL(request.app["state"], "chat-probe") is True
 
 
 @pytest.mark.asyncio
@@ -1138,12 +1183,12 @@ async def test_a_read_refuses_when_a_mirror_appears_during_the_read(monkeypatch)
     ids = await two_by_two()
     calls = {"n": 0}
 
-    def _mirror_appears_after_entry(request: Any, sk: str) -> bool:
+    def _mirror_appears_after_entry(state: Any, sk: str) -> bool:
         # False for the entry check, True for the post-read re-check.
         calls["n"] += 1
         return calls["n"] > 1
 
-    monkeypatch.setattr(routes, "_reaches_a_channel", _mirror_appears_after_entry)
+    monkeypatch.setattr(routes, "reaches_a_channel", _mirror_appears_after_entry)
     status, body = await _brief(WORKER_A)
     assert status == 403
     assert body["code"] == "channel_session"

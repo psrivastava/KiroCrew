@@ -20,6 +20,11 @@ from kiro_crew.on_loop_db import STORE_STRICT_ENV, OnLoopDBGuard
 from kiro_crew.owner_only_files import prepare_owner_only_sqlite
 
 from .._sqlite_compat import fts5_cjk_match_groups, fts5_segment_for_index, sqlite3
+from ..sqlite_quarantine import (
+    SidecarNotMovable,
+    is_damaged_database_error,
+    quarantine_sqlite_file,
+)
 
 #: Test-only switch. ``False`` in production: every connection keeps SQLite's
 #: own thread-affinity guard (``check_same_thread=True``), so a caller that
@@ -763,6 +768,10 @@ _RECLAIM_CHUNK = 200
 class KnowledgeStore:
     def __init__(self, db_path: str, *, read_only: bool = False):
         self._db_path = db_path
+        # Notices for the user about how this library was opened (a damaged
+        # file moved aside), the same channel ``TaskStore.warnings`` is. The
+        # gateway shows each one on the dashboard.
+        self.warnings: list[str] = []
         # A read-only store runs neither the schema DDL nor `_migrate()` and opens
         # every connection with SQLite `mode=ro`, so a write is refused by the
         # engine rather than by convention -- see `open_read_only`.
@@ -840,9 +849,66 @@ class KnowledgeStore:
         # `_load_graph()` call sites and every query path stay fully guarded.
         if read_only:
             return
-        with _ON_LOOP_DB_GUARD.allow_on_loop():
-            self._init_schema()
-            self._migrate()
+        try:
+            with _ON_LOOP_DB_GUARD.allow_on_loop():
+                self._init_schema()
+                self._migrate()
+        except BaseException:
+            # The store is never handed out, so its connection would only be
+            # freed by the cyclic collector -- and an open handle keeps the
+            # file from being moved aside on Windows.
+            conn = getattr(self._thread_local, "conn", None)
+            if conn is not None:
+                conn.close()
+                self._thread_local.conn = None
+            raise
+
+    @classmethod
+    def open_recovering(cls, db_path: str) -> "KnowledgeStore":
+        """Open the library, moving a damaged file aside instead of failing.
+
+        The gateway builds its store before the listener binds, so a file SQLite
+        reports as damaged (``file is not a database``, ``database disk image is
+        malformed``) would stop every start. Such a file and its sidecars are
+        renamed to ``knowledge.db.corrupt-<utc>`` and an empty library is
+        created. The old file is kept, never deleted, and one warning names it,
+        in the log and on :attr:`warnings` for the dashboard. When its
+        ``-wal`` or ``-journal`` will not move, nothing moves and the error is
+        raised: a new library would overwrite those pages. Any other error --
+        a locked, busy, read-only or full database -- is raised unchanged.
+        """
+        try:
+            return cls(db_path)
+        except sqlite3.DatabaseError as exc:
+            if not is_damaged_database_error(exc):
+                raise
+            reason = str(exc)
+        try:
+            moved = quarantine_sqlite_file(Path(db_path), data_sidecars_must_move=True)
+        except SidecarNotMovable as exc:
+            logger.warning(
+                "knowledge: %s is damaged (%s) and was kept in place, not replaced: %s",
+                db_path,
+                reason,
+                exc,
+            )
+            raise
+        logger.warning(
+            "knowledge: %s was damaged (%s); moved aside as %s and started an empty library. "
+            "Sources must be added again; documents added inline exist only in the kept copy.%s",
+            db_path,
+            reason,
+            moved.target.name,
+            f" Sidecar(s) left in place: {', '.join(moved.left)}." if moved.left else "",
+        )
+        store = cls(db_path)
+        # Plain words for the dashboard; the path, the SQLite error and any
+        # sidecar detail stay in the log above.
+        store.warnings.append(
+            "Your knowledge library file was damaged, so a new empty library was started. "
+            f"The old file was kept as {moved.target.name}. Add your sources again."
+        )
+        return store
 
     @classmethod
     def open_read_only(cls, db_path: str) -> "KnowledgeStore":
@@ -896,7 +962,13 @@ class KnowledgeStore:
             conn = sqlite3.connect(self._db_path, **connect_kwargs)
             if test_mode:
                 conn._owner_ident = threading.get_ident()
-            conn.execute("PRAGMA journal_mode=WAL")
+            try:
+                conn.execute("PRAGMA journal_mode=WAL")
+            except sqlite3.Error:
+                # A file that is not a database fails here; release the handle so
+                # the caller can move the file aside.
+                conn.close()
+                raise
         conn.execute("PRAGMA busy_timeout=10000")
         conn.execute("PRAGMA foreign_keys=ON")
         conn.row_factory = sqlite3.Row
@@ -987,15 +1059,6 @@ class KnowledgeStore:
                 PRIMARY KEY (item_id, entity_id)
             );
 
-            -- merged_into_source_id names the SOURCE whose copy of this document
-            -- survived a de-duplication collapse. It is deliberately a source id and
-            -- never an item id: item_ids must keep meaning "the items this row owns",
-            -- because dedup derives a document's hash and embedding from whatever
-            -- item_ids points at, and delete authority follows the same list. A row
-            -- naming another source's items would therefore be enumerated as a second
-            -- document over one physical item set, and collapsing that pair deletes
-            -- the surviving copy. The marker records the relationship instead, so
-            -- deleting the surviving source can clear it and let this row re-ingest.
             CREATE TABLE IF NOT EXISTS source_locations (
                 id TEXT PRIMARY KEY,
                 item_id TEXT NOT NULL REFERENCES items(id),
@@ -1032,6 +1095,15 @@ class KnowledgeStore:
             -- extraction call per chunk, so a file that never completes has to be
             -- retired rather than retried on every sweep. Reset to 0 by any terminal
             -- write ('done', 'deduped', 'failed').
+            -- merged_into_source_id names the SOURCE whose copy of this document
+            -- survived a de-duplication collapse. It is deliberately a source id and
+            -- never an item id: item_ids must keep meaning "the items this row owns",
+            -- because dedup derives a document's hash and embedding from whatever
+            -- item_ids points at, and delete authority follows the same list. A row
+            -- naming another source's items would therefore be enumerated as a second
+            -- document over one physical item set, and collapsing that pair deletes
+            -- the surviving copy. The marker records the relationship instead, so
+            -- deleting the surviving source can clear it and let this row re-ingest.
             CREATE TABLE IF NOT EXISTS folder_file_state (
                 source_id TEXT NOT NULL REFERENCES sources(id),
                 file_path TEXT NOT NULL,
@@ -1080,6 +1152,27 @@ class KnowledgeStore:
                 merged_into_source_id TEXT,
                 source_uri TEXT,
                 PRIMARY KEY (source_id, slug)
+            );
+
+            -- Positive crash-residue evidence for the agent ingest path, held
+            -- SEPARATELY from the ownership row above. An ingest records one of
+            -- these before it commits any item and deletes it on finalize, so a
+            -- row surviving into a drained maintenance window is proof that an
+            -- ingest of exactly this content started and never finished. It is a
+            -- distinct table, not a status on agent_item_state, for two reasons
+            -- the single-row design cannot meet: a re-add that REPLACES a live
+            -- group has an active ownership row for its slug at the same time as
+            -- its own in-flight intent, and two interrupted attempts at one slug
+            -- (a crash, then an edited retry that also crashes) must each leave
+            -- their own evidence rather than overwrite the first. Keying on
+            -- content_hash as well as (source_id, slug) lets both coexist, so
+            -- the sweep can reap EITHER crashed attempt by its own hash.
+            CREATE TABLE IF NOT EXISTS agent_ingest_intent (
+                source_id TEXT NOT NULL REFERENCES sources(id),
+                slug TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                PRIMARY KEY (source_id, slug, content_hash)
             );
 
             -- Tombstones for auto-discovered sources the user deleted. Keyed by
@@ -1430,6 +1523,530 @@ class KnowledgeStore:
         with self._graph_lock:
             if self._graph_loaded:
                 self._load_graph()
+
+    def agent_owned_item_ids(self, source_id: str) -> set[str] | None:
+        """Every item id a live ``agent_item_state`` row names for a source.
+
+        A row left by a refused write owns an empty group and names nothing,
+        which is correct: its items were adopted by the winner's row and are
+        named THERE. Returns ``None`` -- "cannot tell" -- if ANY row's
+        ``item_ids`` is unreadable: the owned set would then be missing items
+        that are genuinely owned, and a caller treating those as residue would
+        delete owned content. A stale item is recoverable; a wrongly-deleted one
+        is not, so every caller stands its sweep/cleanup down on ``None``.
+
+        The single source of this derivation. The residue sweep and
+        ``agent_source.clear_ingesting`` both read it from here rather than each
+        spelling the same query, JSON parse and unreadable-group fail-safe.
+        """
+        ids_owned: set[str] = set()
+        for row in self.db.execute(
+                "SELECT item_ids FROM agent_item_state WHERE source_id = ?",
+                (source_id,)).fetchall():
+            raw = row["item_ids"]
+            if raw in (None, ""):
+                continue
+            try:
+                parsed = json.loads(raw)
+            except (TypeError, ValueError):
+                return None
+            if isinstance(parsed, list):
+                ids_owned.update(i for i in parsed if isinstance(i, str))
+        return ids_owned
+
+    def _adopt_agent_sole_copy_residue(self, source_id: str) -> set[str] | None:
+        """Adopt crash residue that is a document's ONLY surviving content.
+
+        Runs as the first step of :meth:`reclaim_agent_source_residue`, inside
+        its drained maintenance window. A replace whose old-group delete
+        committed but whose ownership-row write did not (a store written
+        while those two were separate commits) leaves a slug whose
+        row still names the DELETED previous group, beside the new version's
+        unowned items and their intent marker. Reaping those items, as the
+        marker alone would authorize, deletes the document's last copy. So for
+        a slug whose row names a non-empty group of which NOTHING still exists
+        (under any source or status), the unowned items of EVERY marker at that
+        slug are written into its row instead, and those markers are retired.
+
+        Nothing stored proves an attempt finished: a hard kill can land after
+        any chunk commit, and no record says how many chunks the attempt meant
+        to write. So adoption keeps the residue but claims no content for it.
+        The row's ``content_hash`` is cleared rather than set to an attempt's
+        hash, because that hash is what tells the next add of the same text
+        "unchanged since last add" -- a truncated attempt adopted under it would
+        never get its missing chunks written. And every attempt is kept, not
+        only the newest, because the newest may be the truncated one and an
+        older one the last complete version. The next add at the slug, of any
+        content, replaces the whole adopted group.
+
+        Left to the sweep, unchanged: a slug with no row (a first add that
+        crashed -- nothing was replaced, so nothing is lost), and a row that
+        owned nothing (a refused or deduped document whose content another row
+        holds). A hash marked at more than one such slug cannot be attributed to
+        one document; it is SPARED rather than adopted or reaped, and so is
+        every other attempt at a slug holding one, so nothing there is deleted
+        while its ownership is unclear -- a leaked duplicate is recoverable, a
+        deleted sole copy is not.
+
+        Returns the spared hashes for the sweep to leave alone, or ``None`` --
+        "cannot tell, do not sweep" -- when an ownership group is unreadable.
+        """
+        spared: set[str] = set()
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            owned = self.agent_owned_item_ids(source_id)
+            if owned is None:
+                self.db.execute("COMMIT")
+                return None
+            markers: dict[str, list[tuple[str, str]]] = defaultdict(list)
+            for r in self.db.execute(
+                    "SELECT slug, content_hash, started_at FROM agent_ingest_intent "
+                    "WHERE source_id = ?", (source_id,)).fetchall():
+                if not r["content_hash"]:
+                    continue
+                markers[r["slug"]].append((r["content_hash"], r["started_at"] or ""))
+            # Pass 1: the slugs whose recorded group is GONE -- not one of its
+            # ids exists any more, under any source or status. An item a user
+            # set non-active, or one a delete detached to another source, still
+            # exists, so its row is not a candidate and keeps its claim.
+            candidates: list[str] = []
+            for slug in markers:
+                row = self.db.execute(
+                    "SELECT item_ids FROM agent_item_state "
+                    "WHERE source_id = ? AND slug = ?",
+                    (source_id, slug)).fetchone()
+                if not row or row["item_ids"] in (None, ""):
+                    continue
+                try:
+                    group = json.loads(row["item_ids"])
+                except (TypeError, ValueError):
+                    self.db.execute("COMMIT")
+                    return None
+                group = [i for i in group if isinstance(i, str)] \
+                    if isinstance(group, list) else []
+                if not group:
+                    continue
+                gone = True
+                for off in range(0, len(group), _RECLAIM_CHUNK):
+                    batch = group[off:off + _RECLAIM_CHUNK]
+                    if self.db.execute(
+                            f"SELECT 1 FROM items "  # noqa: S608
+                            f"WHERE id IN ({','.join('?' * len(batch))}) LIMIT 1",
+                            batch).fetchone():
+                        gone = False
+                        break
+                if gone:
+                    candidates.append(slug)
+            # A hash is ambiguous only between CANDIDATE slugs: a marker at a
+            # slug whose group is live is that slug's ordinary residue.
+            candidate_slugs_by_hash: dict[str, int] = defaultdict(int)
+            for slug in candidates:
+                for content_hash in {h for h, _ in markers[slug]}:
+                    candidate_slugs_by_hash[content_hash] += 1
+            adopted_total = 0
+            for slug in candidates:
+                # Every attempt's residue, newest attempt first. None of them can
+                # be proven complete, so none is chosen over another: the newest
+                # may be a truncated edit and an older one the last full version.
+                attempts: list[tuple[str, list[str]]] = []
+                for content_hash, started in sorted(
+                        markers[slug], key=lambda m: m[1], reverse=True):
+                    ids = [
+                        r["id"] for r in self.db.execute(
+                            "SELECT id, created_at FROM items "
+                            "WHERE source_id = ? AND status = 'active' "
+                            "AND content_hash = ? ORDER BY chunk_index, created_at",
+                            (source_id, content_hash)).fetchall()
+                        if r["id"] not in owned
+                        and (r["created_at"] or "") >= started
+                    ]
+                    if ids:
+                        attempts.append((content_hash, ids))
+                if not attempts:
+                    continue
+                if any(candidate_slugs_by_hash[h] > 1 for h, _ in attempts):
+                    # One of them cannot be attributed to this document alone:
+                    # adopt nothing here and reap nothing here either, so no
+                    # attempt at this slug is lost while ownership is unclear.
+                    spared.update(h for h, _ in attempts)
+                    continue
+                group = [i for _, ids in attempts for i in ids]
+                # ``content_hash`` is cleared, not set to an attempt's hash: the
+                # add path reads a matching hash as "unchanged since last add",
+                # and this group is not proven to hold any attempt in full.
+                self.db.execute(
+                    "UPDATE agent_item_state SET content_hash = NULL, "
+                    "item_ids = ?, status = 'active', updated_at = ? "
+                    "WHERE source_id = ? AND slug = ?",
+                    (json.dumps(group), datetime.now().isoformat(),
+                     source_id, slug))
+                for content_hash, _ids in attempts:
+                    self.db.execute(
+                        "DELETE FROM agent_ingest_intent "
+                        "WHERE source_id = ? AND slug = ? AND content_hash = ?",
+                        (source_id, slug, content_hash))
+                owned.update(group)
+                adopted_total += len(group)
+            self.db.execute("COMMIT")
+        except Exception:
+            self.db.execute("ROLLBACK")
+            raise
+        if adopted_total:
+            logger.info(
+                "agent residue sweep adopted %d item(s) that were a replaced "
+                "document's only surviving copy", adopted_total)
+        return spared
+
+    def reclaim_agent_source_residue(self) -> int:
+        """Delete items an interrupted agent-document ingest provably left behind.
+
+        A HARD KILL during an agent-document ingest is still open: the item
+        chunks and the ``agent_item_state`` ownership-row write are separate
+        commits on an autocommit connection, so a process killed between the
+        item commit and the row commit leaves committed items that no row names.
+        The replacement path keys off that row, so the next add of the same
+        document adds a second copy instead of replacing the first -- the
+        duplicate this sweep repairs. Nothing else on the agent path reaps that
+        residue, so it is permanent until this sweep removes it.
+
+        REAPS ONLY ON POSITIVE EVIDENCE, NEVER BY ABSENCE OF A ROW. "No row
+        names this item" is NOT proof of crash residue: ``_import_bundle_state``
+        has several paths that leave a bundle's agent items unowned on purpose --
+        a row skipped as ``ownership_row_key_held_locally``, an empty or
+        over-claiming group, a bundle with no state tables -- and a single-item
+        export/import round trip (``export_item`` writes no state row) does the
+        same. A sweep keyed on absence would silently and unrecoverably delete
+        every such imported item. So the ingest records an intent marker in
+        ``agent_ingest_intent`` BEFORE it commits items and deletes it on
+        finalize; a marker that survives into a drained maintenance window is
+        the positive proof that an ingest started and never finished. This sweep
+        deletes an unowned ``active`` agent item ONLY when its ``content_hash``
+        matches an intent marker -- the hash the crashed ingest stamped on every
+        chunk it wrote (``items.content_hash`` over the newline-normalized
+        extracted text, the same value the ingest records on the marker). An
+        imported item has no such marker for its hash, so it is never a
+        candidate. The marker sits in its own table rather than on the ownership
+        row, so it covers a crash while REPLACING a live group as well as a
+        first add, and two interrupted attempts at one slug each keep their own
+        evidence. A reaped attempt's marker is deleted in the same transaction.
+
+        NEVER DELETES A DOCUMENT'S SOLE SURVIVING COPY: before any residue is
+        chosen, :meth:`_adopt_agent_sole_copy_residue` adopts the residue of a
+        slug whose recorded group is gone into that slug's row (and
+        spares a hash it cannot attribute to one slug), so a replace interrupted
+        after its old-group delete is repaired rather than emptied.
+
+        SCOPED TO THE ``agent://`` SOURCE ALONE: only the agent path writes these
+        markers, so the sweep cannot reach a folder- or artifact-backed item.
+
+        An item another source also holds (a dedup co-location) is DETACHED, not
+        destroyed: ``delete_items_batch_in_txn`` with ``owner_source_id`` moves
+        ownership to a surviving holder and drops only the agent source's
+        location row. Only an item no other source holds is removed outright.
+
+        Runs off the boot path inside ``maintenance_window`` like
+        :meth:`reclaim_orphans`: that waits for in-flight ingestion to drain and
+        holds new ingestion off, so an item still mid-ingest -- its marker not
+        yet replaced by the finalize hop -- is never read as residue. Returns the
+        number of residue items removed.
+        """
+        agent_src = self.get_source_by_uri("agent://")
+        if not agent_src:
+            return 0
+        source_id = agent_src["id"]
+
+        def _owned_ids() -> set[str] | None:
+            """Every item id a live state row names for this source.
+
+            Delegates to :meth:`agent_owned_item_ids` -- the one place this
+            derivation lives. Returns ``None`` ("cannot tell, do not sweep")
+            when any row's ``item_ids`` is unreadable, in which case the whole
+            sweep stands down for this source until the corruption is resolved
+            (a stale item is recoverable; a wrongly-deleted one is not).
+            """
+            return self.agent_owned_item_ids(source_id)
+
+        owned = _owned_ids()
+        if owned is None:
+            return 0
+
+        def _ingesting_hashes() -> dict[str, str]:
+            """Content hash -> EARLIEST ``started_at`` of a marker naming it.
+
+            The ingest writes one of these before it commits items and deletes it
+            on finalize, so a marker present in a drained maintenance window is
+            positive proof that an ingest of exactly this content started and
+            never finished. An item is residue ONLY if its own ``content_hash``
+            is in this map AND it was created at or after the attempt began
+            (``items.created_at >= started_at``); an imported item that merely
+            lacks an ownership row has no marker, and a pre-existing or bundle
+            item created BEFORE the crash is excluded by the timestamp even when
+            it happens to share a hash. The marker lives in its own table, so it
+            coexists with a live ownership row for the same slug -- a re-add that
+            crashes while replacing a live group leaves its marker here just as a
+            first add does. When two markers name one hash the EARLIEST start is
+            kept, so neither crashed attempt's residue is excluded by the other.
+            """
+            out: dict[str, str] = {}
+            for row in self.db.execute(
+                    "SELECT content_hash, started_at FROM agent_ingest_intent "
+                    "WHERE source_id = ?",
+                    (source_id,)).fetchall():
+                h = row["content_hash"]
+                if not h:
+                    continue
+                started = row["started_at"] or ""
+                if h not in out or started < out[h]:
+                    out[h] = started
+            return out
+
+        def _live_owned_hashes() -> set[str] | None:
+            """Content hashes a HEALTHY ownership row holds AT A SLUG THAT HAS NO
+            MARKER for that hash.
+
+            A matching marker hash alone must not authorize deleting an item: a
+            document deduped against another, then disturbed by a delete, can
+            leave its ONLY copy unowned (``_adopt_reassigned_item`` refuses an
+            ambiguous hash rather than cross-wire two groups), and a same-content
+            crash marker would then name that surviving copy's hash. Deleting it
+            on hash evidence is irreversible data loss. So if the content behind
+            a hash is still held by a healthy ownership row at a DIFFERENT
+            document -- one with no crash marker of its own for that hash -- the
+            sweep leaves every unowned copy of that hash alone: the content is
+            accounted for elsewhere and the hash is not safe residue evidence.
+            A healthy row shields its hash whether it still NAMES live items or
+            its group is EMPTY: a reassignment that refused ambiguous ownership
+            leaves a ``deduped`` row with no items but a surviving sole copy, and
+            that copy's hash must be shielded by the row's existence alone.
+
+            The shield is UNCONDITIONAL on any healthy or ``deduped`` row's hash,
+            with no exclusion for a hash that also carries a crash marker at the
+            same slug. An earlier design excluded such a (slug, hash) pair so a
+            genuine same-slug retry's orphan could be reaped, but that exclusion
+            stripped protection from the ONE case where the "orphan" is actually
+            the slug's sole surviving copy -- an irreversible deletion. Between
+            leaking a duplicate (the exclusion's absence, self-healing: a later
+            identical add dedups it) and deleting the last copy (the exclusion's
+            presence), the fail-safe choice is to shield, so the exclusion is
+            gone. Returns ``None`` -- "cannot tell, do not sweep" -- if any row's
+            ``item_ids`` is unreadable, for the same fail-safe reason as
+            :func:`_owned_ids`.
+            """
+            # item id -> content_hash, for every item a healthy row names.
+            protect_ids: set[str] = set()
+            # Hashes a healthy row CLAIMS directly even though its item group is
+            # empty. A ``deduped`` row left by a reassignment that could not
+            # establish ownership (``_adopt_reassigned_item`` refuses an
+            # ambiguous hash) names no items, so it would contribute nothing to
+            # ``protect_ids`` and give the hash no shield -- yet its surviving
+            # copy is the ONLY one, and a same-content crash marker names that
+            # copy's hash, so the sweep would delete it irreversibly. The row's
+            # existence attests the content is accounted for, so shield its hash
+            # directly.
+            claimed: set[str] = set()
+            for table, healthy in _DOC_STATE_TABLES:
+                key_col = _DOC_STATE_KEY_COL[table]
+                hash_col = _OWNERSHIP_HASH_COL[table]
+                for row in self.db.execute(
+                        f"SELECT {key_col} AS k, {hash_col} AS h, "  # noqa: S608
+                        f"item_ids FROM {table} WHERE status = ?",
+                        (healthy,)).fetchall():
+                    raw = row["item_ids"]
+                    if raw in (None, ""):
+                        # Empty group: the row still claims its content hash, so
+                        # the sweep must not delete an unowned copy of it.
+                        if row["h"]:
+                            claimed.add(row["h"])
+                        continue
+                    try:
+                        parsed = json.loads(raw)
+                    except (TypeError, ValueError):
+                        return None
+                    if isinstance(parsed, list):
+                        if not parsed and row["h"]:
+                            # A row whose JSON group is an empty list claims its
+                            # hash for the same reason as a NULL/'' group.
+                            claimed.add(row["h"])
+                        protect_ids.update(
+                            i for i in parsed if isinstance(i, str))
+            # ``deduped`` agent rows are NOT ``active`` so the loop above skips
+            # them, but a ``deduped`` row is exactly the reassignment-refusal case:
+            # it owns no items yet records that this slug's content is accounted
+            # for by the winner elsewhere. Its ``content_hash`` must shield that
+            # content so the sweep never deletes an unowned sole copy of it on
+            # bare marker evidence.
+            for row in self.db.execute(
+                    "SELECT content_hash AS h FROM agent_item_state "
+                    "WHERE source_id = ? AND status = 'deduped'",
+                    (source_id,)).fetchall():
+                if row["h"]:
+                    claimed.add(row["h"])
+            if not protect_ids:
+                return set(claimed)
+            live: set[str] = set(claimed)
+            ids = list(protect_ids)
+            for off in range(0, len(ids), _RECLAIM_CHUNK):
+                batch = ids[off:off + _RECLAIM_CHUNK]
+                live.update(
+                    r["content_hash"] for r in self.db.execute(
+                        f"SELECT content_hash FROM items "  # noqa: S608
+                        f"WHERE id IN ({','.join('?' * len(batch))})",
+                        batch).fetchall()
+                    if r["content_hash"])
+            return live
+
+        ingesting = _ingesting_hashes()
+        if not ingesting:
+            return 0
+        # Sole-copy adoption runs BEFORE any residue is chosen. It may
+        # rewrite an ownership row, so ownership and the marker map are re-read
+        # once it has committed.
+        spared = self._adopt_agent_sole_copy_residue(source_id)
+        if spared is None:
+            return 0
+        owned = _owned_ids()
+        if owned is None:
+            return 0
+        ingesting = _ingesting_hashes()
+        if not ingesting:
+            return 0
+        live_owned = _live_owned_hashes()
+        if live_owned is None:
+            return 0
+        live_owned |= spared
+        # Active items under the agent source that no row owns, whose content
+        # hash a stale ``ingesting`` marker names, AND which were created at or
+        # after that marker's attempt began -- the positive, attempt-scoped
+        # evidence of an interrupted ingest. The ``created_at`` gate is what makes
+        # a bare hash match safe: a pre-existing or bundle-imported item that
+        # merely shares a hash was created BEFORE the crash marker, so it is never
+        # mistaken for this attempt's residue and is never deleted. A hash a
+        # healthy ownership row still names anywhere is also EXCLUDED: that content
+        # is live-held. Read outside the transaction; each delete chunk re-derives
+        # ownership, the marker map and the live-owned set under the writer lock so
+        # a row or marker written between the read and the delete still protects
+        # its items.
+        residue = [
+            row["id"] for row in self.db.execute(
+                "SELECT id, content_hash, created_at FROM items "
+                "WHERE source_id = ? AND status = 'active'",
+                (source_id,)).fetchall()
+            if row["id"] not in owned and row["content_hash"] in ingesting
+            and row["content_hash"] not in live_owned
+            and (row["created_at"] or "") >= ingesting[row["content_hash"]]
+        ]
+        if not residue:
+            return 0
+        removed = 0
+        acted_hashes: set[str] = set()
+        for offset in range(0, len(residue), _RECLAIM_CHUNK):
+            chunk = residue[offset:offset + _RECLAIM_CHUNK]
+            self.db.execute("BEGIN IMMEDIATE")
+            try:
+                # Re-read ownership under the lock: an ingest that committed its
+                # row after the candidate read above must not have its items
+                # swept. A row written in the gap names them now, so they drop
+                # out of ``still_residue`` and survive. An unreadable group that
+                # appeared in the gap stands the sweep down for the same
+                # fail-safe reason as the initial read.
+                owned_now = _owned_ids()
+                if owned_now is None:
+                    self.db.execute("COMMIT")
+                    break
+                # Re-read the intent markers too: an ingest that finalized in the
+                # gap deletes its marker, so its hash drops out of this set and
+                # its items stop being proven residue -- they survive. Only items
+                # whose hash STILL has a marker remain candidates.
+                ingesting_now = _ingesting_hashes()
+                # And re-read the live-owned hashes: a group adopted or re-added
+                # in the gap now holds this content, so an unowned copy of its
+                # hash stops being safe residue evidence and survives.
+                live_now = _live_owned_hashes()
+                if live_now is None:
+                    self.db.execute("COMMIT")
+                    break
+                live_now |= spared
+                # And the item must still exist, still belong to this source,
+                # still be ACTIVE, and still carry a hash a marker names. The
+                # status filter closes the window where a concurrent writer
+                # flipped the item out of ``active`` between the candidate read
+                # and this lock: the sweep deletes only rows it re-confirms are
+                # live residue, never one another path has already retired.
+                present_now = {
+                    r["id"]: (r["content_hash"], r["created_at"] or "")
+                    for r in self.db.execute(
+                        f"SELECT id, content_hash, created_at FROM items "  # noqa: S608
+                        f"WHERE source_id = ? AND status = 'active' "
+                        f"AND id IN ({','.join('?' * len(chunk))})",
+                        (source_id, *chunk)).fetchall()
+                }
+                still_residue = [
+                    i for i in chunk
+                    if i in present_now and i not in owned_now
+                    and present_now[i][0] in ingesting_now
+                    and present_now[i][0] not in live_now
+                    and present_now[i][1] >= ingesting_now[present_now[i][0]]
+                ]
+                if still_residue:
+                    # owner_source_id => an item another source co-holds is
+                    # detached to that holder, only a truly single-held item is
+                    # destroyed. Same semantics the live delete paths use.
+                    self.delete_items_batch_in_txn(
+                        still_residue, owner_source_id=source_id)
+                    removed += len(still_residue)
+                    acted_hashes.update(
+                        present_now[i][0] for i in still_residue)
+                self.db.execute("COMMIT")
+            except Exception:
+                self.db.execute("ROLLBACK")
+                raise
+        # Retire markers ONCE, after every chunk, and ONLY for a hash that has no
+        # unowned ATTEMPT-CREATED active item left under this source. A document's
+        # chunks all share one hash and a single interrupted ingest can exceed one
+        # delete chunk, so retiring a hash's marker mid-loop (the moment any batch
+        # touched it) would strand the rest of that document's chunks: the next
+        # sweep's marker map would then omit them and they would survive forever
+        # as duplicates. Deferring retirement and gating it on "no unowned
+        # same-hash item created at/after the attempt remains" keeps the evidence
+        # alive until the last orphan of that content is reaped, and clears it as
+        # soon as it is spent -- a pre-existing or bundle item that merely shares
+        # the hash (created before the marker) is not this attempt's residue and
+        # must not pin the marker open.
+        if acted_hashes:
+            self.db.execute("BEGIN IMMEDIATE")
+            try:
+                owned_final = _owned_ids()
+                started_by_hash = _ingesting_hashes()
+                for h in acted_hashes:
+                    started = started_by_hash.get(h)
+                    if started is None:
+                        # The marker is already gone (a finalize cleared it in the
+                        # gap); nothing to retire.
+                        continue
+                    remaining = [
+                        r["id"] for r in self.db.execute(
+                            "SELECT id, created_at FROM items "
+                            "WHERE source_id = ? AND status = 'active' "
+                            "AND content_hash = ?",
+                            (source_id, h)).fetchall()
+                        if (owned_final is None or r["id"] not in owned_final)
+                        and (r["created_at"] or "") >= started
+                    ]
+                    if not remaining:
+                        self.db.execute(
+                            "DELETE FROM agent_ingest_intent "
+                            "WHERE source_id = ? AND content_hash = ?",
+                            (source_id, h))
+                self.db.execute("COMMIT")
+            except Exception:
+                self.db.execute("ROLLBACK")
+                raise
+        if removed:
+            self.reload_graph()
+            logger.info(
+                "knowledge: reclaimed %d orphaned item(s) in the agent aggregate "
+                "source left by an interrupted ingest", removed)
+        return removed
 
     def _prune_orphan_entities(self) -> None:
         """Delete entities nothing references any more -- no mention, no relation.
@@ -2021,6 +2638,7 @@ class KnowledgeStore:
             self.db.execute("DELETE FROM folder_file_state WHERE source_id = ?", (source_id,))
             self.db.execute("DELETE FROM artifact_item_state WHERE source_id = ?", (source_id,))
             self.db.execute("DELETE FROM agent_item_state WHERE source_id = ?", (source_id,))
+            self.db.execute("DELETE FROM agent_ingest_intent WHERE source_id = ?", (source_id,))
             self.db.execute("DELETE FROM sources WHERE id = ?", (source_id,))
             self._prune_orphan_entities()
             self.db.execute("COMMIT")
@@ -3604,9 +4222,20 @@ Called by ``FolderWatcher.scan_source`` when it refuses such a row, which is
                 target_source = (source_id_map.get(raw_source)
                                  if isinstance(raw_source, str) else None)
                 key = _bundle_state_text(f"{table}.{key_col}", row.get(key_col))
-                if target_source is None or not key:
+                if not key:
                     continue
                 group = _bundle_item_group(row.get("item_ids"))
+                if target_source is None:
+                    # A text source id the bundle never declares resolves to no source
+                    # here, so the row is skipped and the items it names arrive unowned.
+                    # The account names the row in the bundle's own words, as every other
+                    # unowned-arrival path does; the handler redacts these fields by name.
+                    stranded = sorted(set(group) & inserted_items)
+                    if isinstance(raw_source, str) and stranded:
+                        dropped.append({"reason": "ownership_row_source_undeclared",
+                                        "table": table, "source_id": raw_source,
+                                        "key": key, "items": ",".join(stranded)})
+                    continue
                 if not group:
                     continue
                 existing = self.db.execute(

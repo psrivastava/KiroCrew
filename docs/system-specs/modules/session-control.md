@@ -22,9 +22,11 @@ unreachable in production because the caller's `X-Internal-Secret` is ignored.
 | `session_fork` | `POST /api/session-control/fork` | Open a new session that CARRIES a copy of a source session's transcript — the caller's own by default — the way the dashboard's Fork button does; optionally titled, filed, and cut at a fork point |
 | `session_stop` | `POST /api/session-control/stop` | Stop another session's in-flight turn |
 | `session_end_wait` | `POST /api/session-control/end-wait` | Wake a session the caller CREATED from the `wait` tool early, keeping its turn; any other target is refused `not_creator`, for every caller class |
-| `session_set_model` | `POST /api/session-control/set-model` | Record a pending model pick on an idle session; `apply_pending_model_pick` commits it at the start of the target's next turn after re-running `authorize_target` in the same synchronous step. A busy target is refused with `target_busy` and keeps its model |
+| `session_retry` | `POST /api/session-control/retry` | Re-run a failed last turn through `continue_slot_turn`, the Resume button's path, with `require_interrupted=True` (`turn_not_failed` otherwise) and `authorize_target` re-run synchronously under the slot lock before the continuation is queued |
+| `session_set_model` | `POST /api/session-control/set-model` | Record a pending model and/or reasoning-effort pick on an idle session; `apply_pending_model_pick` commits it at the start of the target's next turn after re-running `authorize_target` in the same synchronous step. Each half yields separately to a newer user pick from its own control. A busy target is refused with `target_busy` and keeps its settings |
 | `session_reload` | `POST /api/session-control/reload` | Relaunch the agent process of an idle session the caller created, through `chat_handlers.reload_slot_session` (shared with the tab menu's Reload session). The transcript is kept and gets one notice naming the caller. Self, remote-crew and busy targets (turn running or starting, queued messages, sub-agents) are refused |
-| `session_close` | `POST /api/session-control/close` | Close (archive) another session, as the tab ✕ does — heavier than stop, and recoverable rather than a delete |
+| `session_rename` | `POST /api/session-control/rename` | Set the caller's own title or a target's through `chat_title.apply_manual_title`, the sidebar rename's code, after `authorize_target` with `allow_self`; a scheduled run's own session is still refused as `unattended_target`. The title is final (`_TITLE_ORIGIN_USER`). An empty title, one over 200 characters (before or after `_scrub_text` redaction, which lengthens credential-shaped text into markers), one with no character that renders (only whitespace, characters `terminal_safe._is_invisible` reports such as zero-width, variation-selector and Hangul-filler characters, or the blank Braille pattern U+2800), one containing U+2800 anywhere (scanning normalization keeps it, so it could split a secret past the redactors), or one with a control character or any text-direction control (embeddings, overrides, isolates and the U+200E/U+200F/U+061C marks), or any other `Cf` format character except U+200C/U+200D and the tag characters U+E0020..U+E007F that spell flag subdivisions (`_is_allowed_format_char`; the tag block's other `Cf` character, U+E0001 LANGUAGE TAG, is refused; its unassigned code points are not `Cf`), is refused with `invalid_title`; if the history write fails the live slot keeps and broadcasts the new title (best-effort, like the sidebar and channel renames; the next full save writes it) and the verb answers `title_persist_failed` (500) instead of `ok` |
+| `session_close` | `POST /api/session-control/close` | Close (archive) another session, or the caller itself, as the tab ✕ does — heavier than stop, and recoverable rather than a delete |
 | `session_revive` | `POST /api/session-control/revive` | Bring an archived session back into the live sidebar, as clicking it in the History tab does — the mirror of close, optionally filing it into a folder |
 | `session_send` | `POST /api/session-control/send` | Deliver a message that another session runs as its next turn, or cut it into the turn already running (`steer`) |
 | `session_broadcast` | `POST /api/session-control/broadcast` | Deliver ONE message to several sessions — by default every session the caller created — in a required `queue` or `steer` mode, reporting the outcome per target |
@@ -38,7 +40,11 @@ unreachable in production because the caller's `X-Internal-Secret` is ignored.
 through `authorize_target` like every other verb and add tree checks of their
 own. Adopt refuses 409 `would_cycle` when the target is an ancestor of the
 caller, and 409 `tree_unavailable` / `tree_not_ready` when the tree cannot be
-read. Release waives the self-target refusal (`allow_self=True`), since a
+read. Both also refuse 409 `target_replaced` when the slot under the target
+key, compared by object identity after the final authorization, is a
+different session from the one captured before the first suspension (a close
+plus a same-key reopen); nothing is appended and a retry acts on the current
+session. Release waives the self-target refusal (`allow_self=True`), since a
 session releasing itself reaches no peer, and refuses 409 `already_root` or 403
 `not_parent`. Both wait until the tree append is durable before answering, so a
 takeover that never reached the disk is refused rather than reported. Neither
@@ -147,12 +153,22 @@ that edge can exist, but is a weaker, agent-editable source. The union is the
 answer, and every row names the sources that placed it (`crew_log`, `history`,
 `live`, joined with `+`).
 
-The row's `status` separates `working` / `queued` / `idle` / `gone` /
-`unknown`. A tree-backed row absent from the dashboard is `gone`, preserving the
-existing meaning. A history-only row is `unknown`: its metadata proves the
-session was created, but does not claim whether it finished or was lost. This
-does not add another completed-versus-lost conflation to `gone` (tracked in issue
-#14213). The persisted field is already read by the member ownership boundary in
+The row's `status` separates `working` / `queued` / `idle` / `closed` / `lost` /
+`unknown`. A tree-backed row absent from the dashboard is `closed` or `lost`: the
+roster records that a session the dashboard no longer holds still existed, and
+its folded lifecycle says which fate it met. `closed` (carrying `closed_at`) is
+the DELIBERATE tab close -- the worker finished and its tab was closed
+(`session/closed` with reason `removed`, written by `_close_slot`); nothing is there to re-dispatch. `lost` is
+the fail-safe default: a session gone with a turn still open, or whose newest completed turn did not end
+cleanly (a deliberate mid-turn close cancels the running turn, whose `turn/completed`
+carries an abnormal `stop_reason` and clears `turn_open`), or whose only close
+edge came from a process recycle (`reset`) or a `destroy`, or whose fold could
+not be read -- the state a patrol re-dispatches. A history-only row is `unknown`:
+its metadata proves the session was created, but does not claim whether it
+finished or was lost. Splitting `closed` from `lost` is what resolves the
+completed-versus-lost conflation #14213 named; the split reads the lifecycle the
+status fold already projects, adding no new crew-log vocabulary. The persisted
+field is already read by the member ownership boundary in
 session-control authorization, so using it for an informational roster row asks
 no more trust of it than the existing fence. It does not become crew-log lineage,
 and its distinct `source` keeps that visible.
@@ -218,6 +234,23 @@ the slot's `_tab_id`) is treated as the sender being gone; and a structurally
 exempt entry is never dropped at all. The report is
 best-effort and does not gate the drop — withholding the message is the
 authorization decision, and it must not depend on the notice landing.
+
+**A deliberate discard reports to the sender too.** The drain is not the only
+place a stamped entry leaves the queue unrun: a person cancelling its queue card
+(`api_chat_slot_queue_cancel`) and a hard stop clearing the queue
+(`stop_slot_turn`'s escalated branch) discard it as well, and the sender's last
+word is still the `started: false` receipt. Both sites read the entry's stamp and
+call `notify_send_origin_discarded` with their cause (`SEND_DISCARD_QUEUE_CANCEL`,
+`SEND_DISCARD_HARD_STOP`), which appends a notice to the sender naming the target,
+what discarded the message and an excerpt, and saying it will not run. The wording
+names the discard rather than a constraint, because neither discard changes an
+authorization. The recipient is resolved by the same check as the drop notice
+(`_send_origin_recipient`), so the same four cases write nothing: no stamp, a
+self-send, a closed sender, and a reused key held by a different tab. The hard
+stop reports exactly the entries it takes off the queue, before the settle can
+suspend; a send that lands during the settle stays queued and is not reported,
+because it will still run. Best-effort here too: the discard
+was already decided by the person or the stop.
 
 **The stamp names a session, not a key, and does not survive a restart.** It
 carries the sender's `_tab_id` beside its slot key and is omitted unless both are
@@ -403,7 +436,7 @@ window and replaces it with a narrower one: the steer RPC suspends on
   it; a peer's steer does not.
 
 A steer is a delivery MODE, not a permission: `authorize_target` decides who may
-send, unchanged, and a crew-bound (`executor == "remote"`) target stays refused
+send, unchanged, and a relay archive (`executor == "remote"`) stays refused with `relay_archive_read_only`
 before either arm is reached. `steer` is strictly typed at both entry points (the
 tool schema and the HTTP handler) and defaults false, so a caller that omits it
 keeps the queue-or-run behaviour.
@@ -499,7 +532,7 @@ through the child's mint, message copy, save and the deleted-source rollback. Th
 session-control verb calls the same two, so what an agent's fork copies and what
 it inherits — agent, model, memory store and mode bound at birth, project,
 folder, tags, `forked_from` — is by construction what a person's fork copies
-and inherits. The human route's behaviour is unchanged by the split; the core
+and inherits, except the sidebar pin (last table row). The human route's behaviour is unchanged by the split; the core
 takes the request-derived facts as arguments (`request_app`, `origin`,
 `count_user_session`, `jev_route_allowed`, the SEL caller and operation) and the
 two routes answer them differently:
@@ -510,6 +543,7 @@ two routes answer them differently:
 | `count_user_session` | `True` — a human request-layer session for the pulse survey | `False` — an agent-made session is not one (`test_session_pulse_session_count` sweeps for the literal, so the core takes it as a parameter and the only literal `True` stays in `chat_fork.py`) |
 | `jev_route_allowed` | `is_owner_dashboard_request` | `False` — arming a second routed session is the owner's own click, which no agent caller made; the child keeps the parent's pinned `model` |
 | SEL operation | `chat.slot_fork` | `session_control.fork`, on the core's rows and on this module's own `_audit` row (`session_fork`), so the two entry points stay distinguishable |
+| Sidebar pin (`stamp`) | `_inherit_pin(source.slot)` copies the parent's `pinned` onto the child before its birth save, so the fork stays beside its parent in the pinned group; the response carries `pinned` | Never pinned: `pinned` marks a session as human-owned |
 
 The core's refusals are `web.json_response` objects — that is the module's
 refusal shape and its coded sites are what the error-code ratchet
@@ -551,7 +585,7 @@ and skip the target guard while keeping the creator gates.
 **What the child gets on top of the human fork**, applied by a `stamp` callback
 `fork_slot` runs on the child before its birth save, so it lands in the same
 metadata line as the transcript and is on disk before the slot is broadcast (no
-second persistence window; a failed save withdraws the whole child): `title` (else the fork's `↳ Fork of <parent>`),
+second persistence window; a failed save withdraws the whole child): `title` (a final, user-origin name; else the fork's `↳ Fork of <parent>`, which the background `refresh_forked_title` pass renames from the latest person-typed question when the parent's title was auto),
 `folder_id` (else the parent's folder, which the human fork inherits; an
 unknown folder refuses the whole fork before any copy, confirmed read-only under
 the folder-store lock like `create_session`, and the Model-B un-hide runs only
@@ -825,7 +859,11 @@ A private member store is reachable on two authorities and no others:
   chose would make the two sources one. Claiming it is OPT-IN: the default is not to
   vouch, so a binder that says nothing about provenance publishes the record and
   claims no authority, and a caller that should have claimed it fails loudly at a
-  refused dispatch rather than quietly widening access. A member-LESS identity is never
+  refused dispatch rather than quietly widening access. An owner's pick of a member
+  for a dashboard tab or member DM thread (`_pin_private_agent_assignment`) vouches:
+  every caller authorizes the owner's request first, and the store it publishes is
+  the one config resolves for that member, never one carried from the record. A
+  member-LESS identity is never
   vouched even when its caller asks: no member means the Global store, and the admission
   identifies its caller by member, so the entry could never be admitted.
   A record published elsewhere can also leave a vouched entry behind.
@@ -1048,14 +1086,14 @@ KAS backend the wire agent projection additionally grants the server in
 conductor's set (`_CONDUCTOR_DASHBOARD_GRANTS`: `chat_folder_tree`,
 `chat_folder_create`, `chat_folder_file_self`, `session_create`,
 `session_read_message`, `session_status`) plus `session_send`,
-`session_broadcast` and `session_stop` — the write verbs are safe to auto-approve for a member *specifically* because the
+`session_broadcast`, `session_stop` and `session_retry` — the write verbs are safe to auto-approve for a member *specifically* because the
 `created_by` ownership fence above bounds them to worker sessions the member
 itself opened. Member sessions also bypass the provider warm pool
 (`bypass_member`): a pooled child was spawned with no session key on the
 default backend, so a warm hit would skip both the member backend route and
 the mount. The member backend is `agent.member_acp_backend` (default `kas`),
 and requires a wire-capable backend (`ACP_BACKENDS_MEMBER_DISPATCH`: the
-claude seam, KAS, codex, opencode and goose); kiro-cli v2 reads its template from disk and
+claude seam, KAS, codex, opencode, goose and deepseek); kiro-cli v2 reads its template from disk and
 exposes no per-session channel, so a member session on it runs as plain chat —
 the tools are simply not mounted, never mounted-and-refused. Codex qualifies
 because `providers/mirrors/codex.py` already gives it a per-session array and
@@ -1067,7 +1105,7 @@ mechanism. `tool_gate.is_enforced` is true for opencode as well, on
 BACK from the harness's own config resolution before the first prompt, so a session
 that cannot establish the asking posture is refused there too, and
 `providers/mirrors/opencode.py` documents `permission_surface_owned` as
-accepted-and-ignored for exactly that reason.
+accepted-and-ignored for exactly that reason. deepseek's routing, `VERIFIED_GATE_EXTENSION`, is enforced too: Crew's gate plugin answers every tool call with `ask`, and its load marker is read back before the first prompt. deepseek has no mirror, so its member array comes from `AcpClient._mirrorless_member_mounts`: only the member mounts, with `disabled` honoured and a narrowed tool withholding its whole server, since no mirror carries a per-tool deny there. An element that cannot start fails the whole deepseek session, so an entry that does not resolve is never placed.
 
 ### The crew panel rides the same vehicle
 
@@ -1641,6 +1679,21 @@ silently skip everything in between. The caller falls back to a tail read.
 window means the target finished and went idle, which is different from "nothing
 new yet". `queue_depth` reports how much the target still owes.
 
+A turn parked on a tool approval keeps `running` true for the whole approval
+window, so `running` alone cannot tell "working" from "waiting on a person".
+While the target has an open approval, the read adds `pending_approval: true`
+and, when a title is known, `pending_approval_tool` (redacted, at most
+`MAX_PENDING_APPROVAL_TOOL_CHARS`). The values are the slot projection's own
+`pending_approval` and `pending_approval_info["tool"]` (`slot.to_dict()`), the
+fields the dashboard card reads, so the two cannot disagree; that covers both
+the slot's `_approval_futures` (a native tool prompt) and
+`state.pending_coordinator_approvals(slot.key)` (a sub-agent spawn gate or a
+tool inside a running sub-agent). `to_dict()` walks the transcript, so it runs
+only once one of those registries has an open entry. The fields are absent when
+nothing is waiting. `session_status` rows
+carry the same two fields from the same helper, `_pending_approval_fields`; the
+row's `status` stays `working`.
+
 The cursor deliberately stops **before the streaming tail**. `chat_runner`
 appends a `chunk` row per token burst and `_flush_segment` then deletes that
 trailing run, replacing it with one durable assistant message — so chunk rows are
@@ -1736,7 +1789,11 @@ the conversation is saved to history (`closed=True`) and can be reopened later, 
 closing dismisses the LIVE tab, it does not delete the transcript. It is a
 strictly heavier act than `session_stop` — an in-flight turn is cancelled first
 and its work discarded — so the tool description tells the caller to read the
-session before closing it. It reuses the dashboard's own close path
+session before closing it. Close waives the self-target refusal
+(`allow_self=True`, as release does) on both its admission gate and its pre-pop
+re-check, so a session that has finished its one job can archive its own tab; the
+self-close cancels the caller's own running turn, which is the turn that asked
+for it, and every other caller and target rule still applies. It reuses the dashboard's own close path
 (`close_slot`), the same sequence the ✕ button runs: a synchronous tombstone,
 auto-nudge-loop retirement BEFORE the awaits so no nudge resurrects the tab, the
 owning app's close hook with rollback, persist-as-closed, and per-tab session

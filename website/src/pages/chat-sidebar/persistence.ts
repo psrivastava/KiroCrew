@@ -51,6 +51,11 @@ export function readStoredStaleCollapse(): number {
 
 /** Whether the filter menu's Folders section is rolled up to its heading. */
 export const FOLDERS_SHELVED_LS_KEY = 'mc-filter-folders-shelved'
+// A status chip's HIDE state ('1' = drop its matching rows). One per chip that
+// can hide; referenced from that chip's `SESSION_FILTERS` entry in ./filters.
+export const UNREAD_HIDDEN_LS_KEY = 'mc-session-unread-hidden'
+export const RUNNING_HIDDEN_LS_KEY = 'mc-session-running-hidden'
+export const PINNED_HIDDEN_LS_KEY = 'mc-session-pinned-hidden'
 
 /** Read the persisted hidden-folder ids. Runs in a useState initializer during
  *  render, so a throwing localStorage (private mode / disabled storage) or a
@@ -107,10 +112,15 @@ export const SIDEBAR_LANE_LS_KEY = 'mc-sidebar-lane'
  *  default, so a crew this browser has never seen shows its rows. */
 export const CREW_COLLAPSED_LS_KEY = 'mc-sidebar-crew-collapsed'
 
+/** The collapsed spaces (a crew's own folders) inside crew groups, as
+ *  `crewSpaceId` strings. Separate from the crew ids: one crew's group and its
+ *  folders open and close on their own. */
+export const CREW_SPACE_COLLAPSED_LS_KEY = 'mc-sidebar-crew-space-collapsed'
+
 /** The collapsed crew ids, or an empty set when the value is unusable. */
-export function readCollapsedCrews(): Set<string> {
+export function readCollapsedCrews(key = CREW_COLLAPSED_LS_KEY): Set<string> {
   try {
-    const parsed: unknown = JSON.parse(localStorage.getItem(CREW_COLLAPSED_LS_KEY) ?? '[]')
+    const parsed: unknown = JSON.parse(localStorage.getItem(key) ?? '[]')
     return new Set(Array.isArray(parsed) ? parsed.filter((v): v is string => typeof v === 'string') : [])
   } catch {
     return new Set()

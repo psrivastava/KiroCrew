@@ -2226,6 +2226,44 @@ class TestProcessArgvMatchesExact:
         assert pc.process_argv_matches_exact(4242, []) is False
         assert seen == []
 
+    def test_argv_fingerprint_is_stable_and_tells_processes_apart(self):
+        """The same live process fingerprints the same every time; another
+        argv fingerprints differently; a pid nothing runs at answers None."""
+
+        def spawn(n):
+            if pc.IS_POSIX:
+                sleep_bin = shutil.which("sleep") or "/bin/sleep"
+                return subprocess.Popen([sleep_bin, str(300 + n)], start_new_session=True)
+            return self._spawn(f"kirocrew-argvsig-{n}")[0]
+
+        first = spawn(0)
+        try:
+            second = spawn(1)
+            try:
+                # Popen returns only after exec succeeded, so the argv is in place.
+                a = pc.process_argv_fingerprint(first.pid)
+                b = pc.process_argv_fingerprint(second.pid)
+                if pc.IS_POSIX:
+                    assert a is not None and len(a) == 64
+                    assert pc.process_argv_fingerprint(first.pid) == a
+                    assert b is not None and b != a
+                else:
+                    # Windows records no fingerprint: reclaim keeps the exact check.
+                    assert a is None and b is None
+            finally:
+                self._reap(second)
+        finally:
+            self._reap(first)
+        for bad in (0, 1, -5, True, "4242"):
+            assert pc.process_argv_fingerprint(bad) is None
+
+    def test_windows_records_no_argv_fingerprint(self, monkeypatch):
+        """Windows keeps the exact command-line check, so nothing is read."""
+        seen = self._as_windows(monkeypatch, "ssh.exe -N h")
+
+        assert pc.process_argv_fingerprint(4242) is None
+        assert seen == []
+
     def test_cmd_shim_target_never_matches_on_windows(self, monkeypatch):
         # A .cmd entrypoint runs under cmd.exe, whose command line differs.
         argv = [r"C:\Program Files\Amazon\AWSCLIV2\aws.cmd", "ssm", "start-session"]
@@ -6416,8 +6454,9 @@ def test_traversed_components_visits_a_hop_in_the_middle_of_a_chain(tmp_path):
 
     Neither ``realpath`` then ``.parents`` nor a lexical walk over the entry names
     ``writable``; the component walk records it because it reads it. The symlinks
-    themselves are absent: their mode is meaningless and the directory holding
-    them governs their replacement.
+    themselves are absent: their mode is meaningless, and
+    ``traversed_components_and_links`` reports them for a question that needs
+    their owners.
     """
     from kiro_crew import platform_compat
 
@@ -6460,6 +6499,40 @@ def test_traversed_components_visits_both_sides_of_a_symlinked_directory_compone
     assert holder.resolve() in components
     assert (holder / "bin").resolve() in components
     assert prefix / "bin" not in components, "the symlink itself is not a component"
+
+
+def test_traversed_components_and_links_names_every_symlink_the_walk_follows(tmp_path):
+    """The final name's link, a hop in the middle and a symlinked directory alike.
+
+    Each is spelled under a directory the walk read, which is where its owner's
+    right to replace it is decided in a sticky directory, and the directories
+    are exactly what ``traversed_components`` answers for the same path.
+    """
+    from kiro_crew import platform_compat
+
+    if platform_compat.IS_WINDOWS:  # pragma: no cover - POSIX symlinks
+        pytest.skip("POSIX symlink semantics")
+
+    (tmp_path / "hop").mkdir()
+    (tmp_path / "dir").mkdir()
+    entry, middle, _writable, target = _hop_chain(tmp_path / "hop")
+    via_dir, prefix, _holder, _leaf = _symlinked_component_chain(tmp_path / "dir")
+
+    def spelled(link: Path) -> Path:
+        return link.parent.resolve() / link.name
+
+    for path, expected in ((entry, [entry, middle]), (via_dir, [prefix / "bin"])):
+        walk = platform_compat.traversed_components_and_links(path)
+
+        assert walk is not None
+        components, links = walk
+        assert components == platform_compat.traversed_components(path)
+        assert links == [spelled(link) for link in expected]
+        assert all(link.parent in components for link in links)
+    assert platform_compat.traversed_components_and_links(target) == (
+        platform_compat.traversed_components(target),
+        [],
+    )
 
 
 def test_traversed_components_is_none_on_a_symlink_loop(tmp_path):
@@ -7726,6 +7799,33 @@ class TestKillAndReap:
         proc.kill.assert_called_once()
 
 
+class TestTerminateAndReapSyncReapedChild:
+    """The blocking twin of the reaped-child guard in :func:`kill_and_reap`."""
+
+    @pytest.mark.parametrize("live", [True, False])
+    def test_the_tree_kill_addresses_only_a_child_that_is_not_reaped(self, live) -> None:
+        """``terminate_and_reap_sync``'s fallback (Windows, a reaped child, or
+        one outside its own group) kills by pid. Once ``poll()`` has reaped the
+        child its pid may name another process, so only an unreaped child's
+        tree is killed. The group and same-group probes are pinned so the reap
+        check alone decides."""
+        from unittest import mock
+
+        proc = mock.MagicMock()
+        proc.pid = 99_999_999_999  # above every pid_max: never a live process
+        proc.poll.return_value = None if live else 0
+        with (
+            mock.patch.object(pc, "_isolated_group_of_live_child", lambda *a, **k: None),
+            mock.patch.object(pc, "_shares_own_process_group", lambda _pid: False),
+            mock.patch.object(pc, "kill_process_tree") as tree,
+        ):
+            pc.terminate_and_reap_sync(proc, grace=0.1, reap_timeout=0.1)
+        if live:
+            tree.assert_called_once_with(99_999_999_999, pc.SIGKILL)
+        else:
+            tree.assert_not_called()
+
+
 class TestPublishDirNoreplace:
     """Workspace installs must never replace a raced empty
     destination -- POSIX os.rename silently replaces an empty directory, so
@@ -7866,6 +7966,26 @@ class TestOpenLockFile:
         assert lock.exists()
         assert lock.read_bytes() == b""
 
+    def test_non_creating_open_refuses_a_missing_file_and_creates_nothing(self, tmp_path):
+        from kiro_crew.platform_compat import open_lock_file
+
+        lock = tmp_path / "absent.lock"
+        with pytest.raises(FileNotFoundError):
+            with open_lock_file(lock, create=False):
+                pass
+        assert not lock.exists()
+
+    def test_non_creating_open_preserves_existing_content(self, tmp_path):
+        lock = tmp_path / "held.lock"
+        lock.write_text("holder-pid 1234")
+        from kiro_crew.platform_compat import file_lock, open_lock_file
+
+        with open_lock_file(lock, create=False) as fd:
+            assert lock.read_text() == "holder-pid 1234"  # open did not truncate
+            with file_lock(fd, exclusive=True):
+                pass
+        assert lock.read_text() == "holder-pid 1234"
+
     def test_no_lock_site_opens_truncating(self):
         # CONTRACT (the work-ledger fix's test shape, applied fleet-wide): grep the source
         # tree for a truncating open whose descriptor is handed to a
@@ -7875,13 +7995,6 @@ class TestOpenLockFile:
         import kiro_crew
 
         src_root = os.path.dirname(os.path.abspath(kiro_crew.__file__))
-        # deploy/pending.py and deploy/profiles.py are owned by an in-flight
-        # deploy-locks fix; drop the exemptions once it merges — the scan
-        # will then enforce those sites too.
-        exempt = {
-            os.path.join(src_root, "deploy", "pending.py"),
-            os.path.join(src_root, "deploy", "profiles.py"),
-        }
         offenders = []
         open_w = re.compile(r"""\bopen\([^)]*["']wb?["']\)""")
         acquire = re.compile(r"\b(file_lock|flock_exclusive|acquire_lock)\(\s*\w+\.fileno\(\)")
@@ -7890,8 +8003,6 @@ class TestOpenLockFile:
                 if not name.endswith(".py"):
                     continue
                 path = os.path.join(dirpath, name)
-                if path in exempt:
-                    continue
                 with open(path, encoding="utf-8", errors="replace") as fh:
                     lines = fh.readlines()
                 for i, line in enumerate(lines):

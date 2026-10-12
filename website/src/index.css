@@ -231,6 +231,107 @@
                  U+3200-32FF, U+3300-33FF, U+3400-4DBF, U+4E00-9FFF, U+A960-A97F,
                  U+AC00-D7AF, U+D7B0-D7FF, U+F900-FAFF, U+FE30-FE4F, U+FF00-FFEF;
 }
+/* Kana-only and Hangul-only fallback faces (#13085). The default
+   --script-fallbacks token below names no face that draws kana or Hangul, so
+   under a non-ja/ko UI (e.g. <html lang="en">) Japanese and Korean CONTENT
+   falls to the browser's per-script OS fallback, which on the Linux Electron
+   AppImage renders missing-glyph boxes (tofu) in chat and the Markdown preview.
+   These two aliases are added to the default token so kana and Hangul draw a
+   real face on EVERY surface regardless of UI language.
+
+   Their unicode-range is deliberately NARROWER than 'KC Japanese Fallback' /
+   'KC Korean Fallback': kana and Hangul ONLY, with NO Han range. The regional
+   faces claim the shared Han ideographs (U+4E00-9FFF etc.), so putting one in
+   the default token would force Japanese or Korean Han glyph forms onto all
+   bare-Han content under an English UI — the exact regression the
+   :root/html:lang() split exists to avoid. A kana/Hangul-only range draws only
+   the code points that are tofu today; bare Han is left to the OS/browser
+   locale-aware cascade exactly as before, and when the UI IS ja/ko the
+   html:lang() rules still swap in the full regional faces (which lead these in
+   the stack). local() names mirror the regional faces so no new host font is
+   required. unicode-range keeps them off Latin, so the user's Font Family
+   preference and every Latin stack are byte-identical to before. */
+@font-face {
+  font-family: 'KC Kana Fallback';
+  font-style: normal; font-weight: 400;
+  src: local('Hiragino Sans W3'), local('HiraginoSans-W3'),
+       local('Yu Gothic Regular'), local('YuGothic-Regular'),
+       local('Yu Gothic UI Regular'), local('YuGothicUI-Regular'), local('Meiryo'),
+       local('Noto Sans CJK JP'), local('NotoSansCJKjp-Regular'),
+       local('Noto Sans JP'), local('NotoSansJP-Regular'),
+       local('IPAexGothic'), local('IPAGothic'), local('TakaoPGothic'),
+       local('VL PGothic'), local('VLPGothic-Regular'),
+       local('Source Han Sans JP'), local('SourceHanSansJP-Regular'),
+       local('Droid Sans Fallback');
+  unicode-range: U+3040-309F, U+30A0-30FF, U+31F0-31FF, U+FF65-FF9F;
+}
+@font-face {
+  font-family: 'KC Kana Fallback';
+  font-style: normal; font-weight: 700;
+  src: local('Hiragino Sans W6'), local('HiraginoSans-W6'),
+       local('Yu Gothic Bold'), local('YuGothic-Bold'),
+       local('Yu Gothic UI Bold'), local('YuGothicUI-Bold'), local('Meiryo Bold'),
+       local('Meiryo-Bold'), local('Noto Sans CJK JP Bold'),
+       local('NotoSansCJKjp-Bold'), local('Noto Sans JP Bold'),
+       local('NotoSansJP-Bold'), local('IPAexGothic'), local('IPAGothic'),
+       local('TakaoPGothic'), local('VL PGothic'),
+       local('Source Han Sans JP Bold'), local('SourceHanSansJP-Bold'),
+       local('Droid Sans Fallback');
+  unicode-range: U+3040-309F, U+30A0-30FF, U+31F0-31FF, U+FF65-FF9F;
+}
+@font-face {
+  font-family: 'KC Hangul Fallback';
+  font-style: normal; font-weight: 400;
+  src: local('Apple SD Gothic Neo'), local('AppleSDGothicNeo-Regular'),
+       local('Malgun Gothic'), local('MalgunGothic'), local('Noto Sans CJK KR'),
+       local('NotoSansCJKkr-Regular'), local('Noto Sans KR'), local('NotoSansKR-Regular'),
+       local('Source Han Sans KR'), local('SourceHanSansKR-Regular'),
+       local('Nanum Gothic'), local('NanumGothic'), local('UnDotum'),
+       local('Baekmuk Gulim'), local('Droid Sans Fallback');
+  unicode-range: U+1100-11FF, U+3130-318F, U+A960-A97F, U+AC00-D7AF, U+D7B0-D7FF;
+}
+@font-face {
+  font-family: 'KC Hangul Fallback';
+  font-style: normal; font-weight: 700;
+  src: local('Apple SD Gothic Neo Bold'), local('AppleSDGothicNeo-Bold'),
+       local('Malgun Gothic Bold'), local('MalgunGothic-Bold'),
+       local('Noto Sans CJK KR Bold'), local('NotoSansCJKkr-Bold'),
+       local('Noto Sans KR Bold'), local('NotoSansKR-Bold'),
+       local('Source Han Sans KR Bold'), local('SourceHanSansKR-Bold'),
+       local('Nanum Gothic Bold'), local('NanumGothic-Bold'), local('UnDotum Bold'),
+       local('Baekmuk Gulim'), local('Droid Sans Fallback');
+  unicode-range: U+1100-11FF, U+3130-318F, U+A960-A97F, U+AC00-D7AF, U+D7B0-D7FF;
+}
+@font-face {
+  font-family: 'KC Kana Mono Fallback';
+  font-style: normal; font-weight: 400;
+  src: local('Sarasa Mono J'), local('SarasaMonoJ-Regular'),
+       local('Noto Sans Mono CJK JP'), local('NotoSansMonoCJKjp-Regular');
+  unicode-range: U+3040-309F, U+30A0-30FF, U+31F0-31FF, U+FF65-FF9F;
+}
+@font-face {
+  font-family: 'KC Kana Mono Fallback';
+  font-style: normal; font-weight: 700;
+  src: local('Sarasa Mono J Bold'), local('SarasaMonoJ-Bold'),
+       local('Noto Sans Mono CJK JP Bold'), local('NotoSansMonoCJKjp-Bold');
+  unicode-range: U+3040-309F, U+30A0-30FF, U+31F0-31FF, U+FF65-FF9F;
+}
+@font-face {
+  font-family: 'KC Hangul Mono Fallback';
+  font-style: normal; font-weight: 400;
+  src: local('D2Coding'), local('D2Coding-Regular'), local('Sarasa Mono K'),
+       local('SarasaMonoK-Regular'), local('Noto Sans Mono CJK KR'),
+       local('NotoSansMonoCJKkr-Regular');
+  unicode-range: U+1100-11FF, U+3130-318F, U+A960-A97F, U+AC00-D7AF, U+D7B0-D7FF;
+}
+@font-face {
+  font-family: 'KC Hangul Mono Fallback';
+  font-style: normal; font-weight: 700;
+  src: local('D2Coding Bold'), local('D2Coding-Bold'), local('Sarasa Mono K Bold'),
+       local('SarasaMonoK-Bold'), local('Noto Sans Mono CJK KR Bold'),
+       local('NotoSansMonoCJKkr-Bold');
+  unicode-range: U+1100-11FF, U+3130-318F, U+A960-A97F, U+AC00-D7AF, U+D7B0-D7FF;
+}
 @font-face {
   font-family: 'KC Devanagari Fallback';
   font-style: normal; font-weight: 400;
@@ -282,6 +383,70 @@
        local('Segoe UI'), local('SegoeUI'), local('Roboto'), local('Liberation Sans'),
        local('DejaVu Sans'), local('Noto Sans'), local('Nimbus Sans');
   unicode-range: U+0022, U+0027;
+}
+
+/* ─── Space Grotesk + JetBrains Mono (SIL-OFL) ── the brand faces ───
+   Served from the dashboard's own origin so the shell needs no third-party
+   host: it renders the same on a VPN-only or offline install, and the CSP
+   admits no outside font origin. The files sit in src/assets/fonts/ so Vite
+   content-hashes them into /assets/ (cached as immutable); each family's
+   OFL.txt ships unhashed under public/fonts/<family>/.
+   Each family is one variable face split by script with unicode-range, so a
+   page downloads only the subsets it draws (Latin, in practice). The ranges
+   are the per-subset ranges the upstream font CSS publishes. */
+@font-face {
+  font-family: 'Space Grotesk';
+  font-style: normal; font-weight: 400 700; font-display: swap;
+  src: url('./assets/fonts/space-grotesk/SpaceGrotesk-vietnamese.woff2') format('woff2');
+  unicode-range: U+0102-0103,U+0110-0111,U+0128-0129,U+0168-0169,U+01A0-01A1,U+01AF-01B0,U+0300-0301,U+0303-0304,U+0308-0309,U+0323,U+0329,U+1EA0-1EF9,U+20AB;
+}
+@font-face {
+  font-family: 'Space Grotesk';
+  font-style: normal; font-weight: 400 700; font-display: swap;
+  src: url('./assets/fonts/space-grotesk/SpaceGrotesk-latin-ext.woff2') format('woff2');
+  unicode-range: U+0100-02BA,U+02BD-02C5,U+02C7-02CC,U+02CE-02D7,U+02DD-02FF,U+0304,U+0308,U+0329,U+1D00-1DBF,U+1E00-1E9F,U+1EF2-1EFF,U+2020,U+20A0-20AB,U+20AD-20C0,U+2113,U+2C60-2C7F,U+A720-A7FF;
+}
+@font-face {
+  font-family: 'Space Grotesk';
+  font-style: normal; font-weight: 400 700; font-display: swap;
+  src: url('./assets/fonts/space-grotesk/SpaceGrotesk-latin.woff2') format('woff2');
+  unicode-range: U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,U+0329,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD;
+}
+@font-face {
+  font-family: 'JetBrains Mono';
+  font-style: normal; font-weight: 400 500; font-display: swap;
+  src: url('./assets/fonts/jetbrains-mono/JetBrainsMono-cyrillic-ext.woff2') format('woff2');
+  unicode-range: U+0460-052F,U+1C80-1C8A,U+20B4,U+2DE0-2DFF,U+A640-A69F,U+FE2E-FE2F;
+}
+@font-face {
+  font-family: 'JetBrains Mono';
+  font-style: normal; font-weight: 400 500; font-display: swap;
+  src: url('./assets/fonts/jetbrains-mono/JetBrainsMono-cyrillic.woff2') format('woff2');
+  unicode-range: U+0301,U+0400-045F,U+0490-0491,U+04B0-04B1,U+2116;
+}
+@font-face {
+  font-family: 'JetBrains Mono';
+  font-style: normal; font-weight: 400 500; font-display: swap;
+  src: url('./assets/fonts/jetbrains-mono/JetBrainsMono-greek.woff2') format('woff2');
+  unicode-range: U+0370-0377,U+037A-037F,U+0384-038A,U+038C,U+038E-03A1,U+03A3-03FF;
+}
+@font-face {
+  font-family: 'JetBrains Mono';
+  font-style: normal; font-weight: 400 500; font-display: swap;
+  src: url('./assets/fonts/jetbrains-mono/JetBrainsMono-vietnamese.woff2') format('woff2');
+  unicode-range: U+0102-0103,U+0110-0111,U+0128-0129,U+0168-0169,U+01A0-01A1,U+01AF-01B0,U+0300-0301,U+0303-0304,U+0308-0309,U+0323,U+0329,U+1EA0-1EF9,U+20AB;
+}
+@font-face {
+  font-family: 'JetBrains Mono';
+  font-style: normal; font-weight: 400 500; font-display: swap;
+  src: url('./assets/fonts/jetbrains-mono/JetBrainsMono-latin-ext.woff2') format('woff2');
+  unicode-range: U+0100-02BA,U+02BD-02C5,U+02C7-02CC,U+02CE-02D7,U+02DD-02FF,U+0304,U+0308,U+0329,U+1D00-1DBF,U+1E00-1E9F,U+1EF2-1EFF,U+2020,U+20A0-20AB,U+20AD-20C0,U+2113,U+2C60-2C7F,U+A720-A7FF;
+}
+@font-face {
+  font-family: 'JetBrains Mono';
+  font-style: normal; font-weight: 400 500; font-display: swap;
+  src: url('./assets/fonts/jetbrains-mono/JetBrainsMono-latin.woff2') format('woff2');
+  unicode-range: U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,U+0329,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD;
 }
 
 /* ─── OpenDyslexic (SIL-OFL) ── accessibility built-in ───
@@ -363,8 +528,8 @@
      same reason, fixing the straight-quote glyph (#6374) in every UI language.
      It is sans-only: the mono stacks resolve to JetBrains Mono, whose straight
      quotes are already correct. */
-  --script-fallbacks:'KC Straight Quotes','KC Devanagari Fallback','KC Bengali Fallback';
-  --script-fallbacks-mono:'KC Devanagari Fallback','KC Bengali Fallback';
+  --script-fallbacks:'KC Straight Quotes','KC Kana Fallback','KC Hangul Fallback','KC Devanagari Fallback','KC Bengali Fallback';
+  --script-fallbacks-mono:'KC Kana Mono Fallback','KC Kana Fallback','KC Hangul Mono Fallback','KC Hangul Fallback','KC Devanagari Fallback','KC Bengali Fallback';
   /* An installed theme pack fills --theme-font-sans / --theme-font-mono with its
      own faces (see hooks/themeCss.ts). Reading them here means code surfaces
      follow a pack's monospace face without the user having to switch the whole UI
@@ -384,21 +549,31 @@
 html:lang(zh-CN) {
   /* Isolated Simplified aliases for Chinese UI. Not :lang(zh): that also
      matches zh-TW / zh-HK / zh-Hant. Document-level only — :root/--font-body
-     and useZoom already resolve var(--script-fallbacks) on <html>. */
-  --script-fallbacks:'KC Straight Quotes','KC Han Fallback','KC Devanagari Fallback','KC Bengali Fallback';
-  --script-fallbacks-mono:'KC Han Mono Fallback','KC Han Fallback','KC Devanagari Fallback','KC Bengali Fallback';
+     and useZoom already resolve var(--script-fallbacks) on <html>.
+     'KC Han Fallback' draws neither kana nor Hangul, so the kana/Hangul-only
+     aliases follow it: Japanese and Korean CONTENT under a Chinese UI (#13085)
+     otherwise falls to the OS cascade and renders as tofu. They carry no Han
+     range, so they never override the leading Simplified Han face. */
+  --script-fallbacks:'KC Straight Quotes','KC Han Fallback','KC Kana Fallback','KC Hangul Fallback','KC Devanagari Fallback','KC Bengali Fallback';
+  --script-fallbacks-mono:'KC Han Mono Fallback','KC Han Fallback','KC Kana Mono Fallback','KC Kana Fallback','KC Hangul Mono Fallback','KC Hangul Fallback','KC Devanagari Fallback','KC Bengali Fallback';
 }
 html:lang(ja) {
   /* Never retain the SC aliases here. If no named Japanese face is installed,
-     falling through lets the browser use its lang-aware Japanese fallback. */
-  --script-fallbacks:'KC Straight Quotes','KC Japanese Fallback','KC Devanagari Fallback','KC Bengali Fallback';
-  --script-fallbacks-mono:'KC Japanese Mono Fallback','KC Japanese Fallback','KC Devanagari Fallback','KC Bengali Fallback';
+     falling through lets the browser use its lang-aware Japanese fallback.
+     'KC Japanese Fallback' covers kana but NOT Hangul, so the Hangul-only alias
+     follows it: Korean content under a Japanese UI (#13085) would otherwise be
+     tofu. No Han range on it, so the leading Japanese face still wins Han. */
+  --script-fallbacks:'KC Straight Quotes','KC Japanese Fallback','KC Hangul Fallback','KC Devanagari Fallback','KC Bengali Fallback';
+  --script-fallbacks-mono:'KC Japanese Mono Fallback','KC Japanese Fallback','KC Hangul Mono Fallback','KC Hangul Fallback','KC Devanagari Fallback','KC Bengali Fallback';
 }
 html:lang(ko) {
   /* Never retain the SC or JP aliases here. Neither draws Hangul, so leaving one
-     in front only delays resolution to the browser's lang-aware Korean fallback. */
-  --script-fallbacks:'KC Straight Quotes','KC Korean Fallback','KC Devanagari Fallback','KC Bengali Fallback';
-  --script-fallbacks-mono:'KC Korean Mono Fallback','KC Korean Fallback','KC Devanagari Fallback','KC Bengali Fallback';
+     in front only delays resolution to the browser's lang-aware Korean fallback.
+     'KC Korean Fallback' covers Hangul but NOT kana, so the kana-only alias
+     follows it: Japanese content under a Korean UI (#13085) would otherwise be
+     tofu. No Han range on it, so the leading Korean face still wins Han. */
+  --script-fallbacks:'KC Straight Quotes','KC Korean Fallback','KC Kana Fallback','KC Devanagari Fallback','KC Bengali Fallback';
+  --script-fallbacks-mono:'KC Korean Mono Fallback','KC Korean Fallback','KC Kana Mono Fallback','KC Kana Fallback','KC Devanagari Fallback','KC Bengali Fallback';
 }
 /* Dark theme shadows */
 :root,[data-theme="dark"],[data-theme="monokai-dark"],[data-theme="solarized-dark"],[data-theme="amber-dark"],[data-theme="nord-dark"],[data-theme="dracula-dark"],[data-theme="rosepine-dark"],[data-theme="catppuccin-dark"],[data-theme="tokyonight-dark"],[data-theme="gruvbox-dark"],[data-theme="ice-dark"]{
@@ -482,6 +657,10 @@ html:lang(ko) {
   --shadow-md:0 4px 12px rgba(0,0,0,.08),0 0 0 1px rgba(0,0,0,.04);
   --shadow-lg:0 12px 28px rgba(0,0,0,.12);
 }
+/* Internal token, outside the [data-theme] blocks so packs cannot set it.
+   --shadow-lg alone reads flat over near-black chat; light mode keeps it. */
+:root{--shadow-float:0 0 0 1px rgba(0,0,0,.4),0 24px 64px -8px rgba(0,0,0,.7),0 8px 24px rgba(0,0,0,.45)}
+[data-mode="light"]{--shadow-float:var(--shadow-lg)}
 :root,[data-theme="dark"],[data-theme="amber-dark"]{
   --search-highlight:rgba(255,167,38,.45);--search-highlight-current:rgba(255,120,0,.85);--search-highlight-current-border:rgba(255,255,255,.9);
   --bg:#12141a;--bg-accent:#14161d;--bg-elevated:#1a1d25;--bg-hover:#262a35;
@@ -1422,7 +1601,24 @@ html:lang(ko) {
      than `:focus` so a pointer click never paints it — the ring is drawn only
      for the keyboard and AT interactions that have no other cue to where focus
      sits. `outline` is used (not border/box-shadow) because it is painted
-     outside the box and so cannot shift layout. */
+     outside the box and so cannot shift layout.
+     OUTLINE-ONLY BY DESIGN. The accent `outline` carries the theme's identity.
+     It is deliberately NOT paired with a `box-shadow` hairline at the global
+     level, because the house opt-out — `outline-hidden`/`outline-none` — resets
+     only `outline`, not `box-shadow`. A global hairline would therefore survive
+     the opt-out and paint a hard high-contrast rectangle on every element that
+     meant to opt out: the chat composer and docked SearchBar, the
+     programmatically-focused `<h1 tabIndex={-1} outline-hidden>` page titles
+     (OnboardingFlow, AgentImportFlow, PrivacyChapter) and the `focus-visible:
+     bg-*` menu rows. Keeping the global rule outline-only means opting out stays
+     a complete opt-out, exactly as on main.
+     WHERE THE 3:1 HAIRLINE LIVES: controls that need to clear WCAG 1.4.11's 3:1
+     non-text floor in the three light palettes where `--accent` alone is below
+     it (rosepine-light 2.60, everforest-light 2.81, intellij-light 2.92) opt IN
+     to `.focus-ring` / `.focus-ring-accent*`, which add the opaque `--text-strong`
+     hairline on top of the accent band. Those utilities are the migrated call
+     sites from issue #4428; the global accent outline is the baseline cue for
+     everything else. */
   :focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   @media(prefers-reduced-motion:reduce){*:not([data-virtuoso-scroller] *),*::before,*::after{animation-duration:0.01ms !important;animation-iteration-count:1 !important}}
   /* The rule above zeroes animation-DURATION but not animation-DELAY, and both
@@ -2701,7 +2897,7 @@ body.mc-focus-mode.mc-focus-rail .focus-chrome-rail{
    `outline:none` opts out of the global ring in favour of this border + glow,
    and the extra class raises specificity so the two never stack. */
 .focus-ring:focus-visible{outline:none;border-color:var(--ring);
-  box-shadow:0 0 0 3px var(--accent-subtle),0 0 20px color-mix(in srgb,var(--accent) 8%,transparent)}
+  box-shadow:0 0 0 1px var(--text-strong),0 0 0 3px var(--accent-subtle),0 0 20px color-mix(in srgb,var(--accent) 8%,transparent)}
 /* The desktop Settings search bar (pages/settings/SettingsSearch.tsx) is a boxed
    input, not a glass pane, so it keeps a focus ring -- the shared shape with a
    neutral colour: a stronger neutral border and a neutral halo, never the theme
@@ -2712,6 +2908,71 @@ body.mc-focus-mode.mc-focus-rail .focus-chrome-rail{
    name only. Same specificity chain plus one class, so it wins here only. */
 .settings-search .focus-ring:focus-visible{border-color:color-mix(in srgb,var(--text) 60%,var(--border));
   box-shadow:0 0 0 3px color-mix(in srgb,var(--text) 22%,transparent),0 0 20px rgba(0,0,0,.06)}
+
+/* ── Shared accent focus ring (WCAG 1.4.11-safe) ── */
+/* The house keyboard-focus cue for controls that want the THEME ACCENT ring
+   rather than the neutral `.focus-ring` glow (completion-card scroll regions,
+   row-pill buttons, icon buttons, text inputs). Replaces the old per-site
+   `focus-visible:ring-2 focus-visible:ring-accent focus-visible:outline-hidden`
+   cluster — see issue #4428.
+
+   WHY A SHARED UTILITY AND NOT `ring-accent`: `--accent` is where each theme
+   spends its identity, so it must stay the ring colour, but it is NOT a token
+   with a contrast contract — it falls below WCAG 1.4.11's 3:1 non-text floor
+   against `--bg` in three light palettes (rosepine-light 2.60, everforest-light
+   2.81, intellij-light 2.92) and lower still against the accent-tinted card fill
+   (2.39 / 2.56 / 2.66). A translucent `ring-accent/40` or `/50` cannot reach the
+   floor with ANY opaque token at that alpha. So the identity hue cannot also
+   carry the minimum.
+
+   HOW: hue identifies, a neutral hairline carries the minimum. The inner 1px
+   layer is opaque `--text-strong`, which clears 3:1 against both `--bg` and the
+   card fill in every one of the 36 built-in themes (worst case 6.48:1,
+   everforest-light); the accent band outside it supplies the theme identity. A
+   control stays legible even in the themes where the accent alone would not.
+   `outline:2px solid transparent` opts out of the global `:focus-visible` ring
+   in favour of this `box-shadow` cue, and the `.focus-ring-accent` class raises
+   specificity so the two never stack. The outline is TRANSPARENT rather than
+   `none` so that in `forced-colors: active` (Windows High Contrast) — where the
+   UA forces every `box-shadow` to `none` and would otherwise leave these
+   migrated controls with no focus ring at all (a WCAG 2.4.7 regression) — the
+   system repaints the transparent outline in its own highlight colour. This
+   matches the `outline-hidden` behaviour every call site had before migration
+   (Tailwind 4's `outline-hidden` expands to a transparent forced-colors
+   outline) and the repo's established `forced-colors` handling elsewhere.
+   `box-shadow` (like `outline`) paints outside the border box, so it never
+   shifts layout. The `-inset` variant uses `outline-offset:-2px` so its forced-
+   colors ring is drawn inside the clipped box, matching its inset shadow. */
+.focus-ring-accent:focus-visible{outline:2px solid transparent;outline-offset:2px;
+  box-shadow:0 0 0 1px var(--text-strong),0 0 0 3px var(--accent)}
+/* A control that marks SELECTION with its own `ring-1 ring-accent ring-offset-1`
+   (the colour swatches in `TagManagerList`) loses that selection cue while it
+   is keyboard-focused, because `.focus-ring-accent`'s `box-shadow` replaces the
+   Tailwind ring. Re-add the selection as an OUTER layer beyond the focus band
+   so a focused + selected swatch still reads as chosen: 1px gap (`--bg`) then a
+   2px `--accent` selection ring outside the 3px focus band. `aria-pressed=true`
+   is the selected state the swatch sets.
+   NARROWED to the swatch's own `.swatch-cue` class: the bare
+   `.focus-ring-accent[aria-pressed="true"]` selector also matched two toggles
+   that carry no selection ring to restore (the TagManagerList status toggle and
+   the band filter chip), giving them an unwanted outer accent ring. Only the
+   colour swatch combines `.swatch-cue` + `.focus-ring-accent` + `aria-pressed`,
+   so this reaches exactly the one consumer that needs it. */
+.swatch-cue.focus-ring-accent[aria-pressed="true"]:focus-visible{
+  box-shadow:0 0 0 1px var(--text-strong),0 0 0 3px var(--accent),
+             0 0 0 4px var(--bg),0 0 0 6px var(--accent)}
+/* Gap variant: a 1px `--bg` gap between the control edge and the hairline, for
+   a BORDERED option whose pre-migration cue carried `ring-offset-1
+   ring-offset-bg` (the `SessionPulseSurveyCard` rating options). The gap keeps
+   the ring from sitting flush against the option's own border. The hairline and
+   accent band shift out by 1px; the hairline still carries the 3:1 floor. */
+.focus-ring-accent-gap:focus-visible{outline:2px solid transparent;outline-offset:2px;
+  box-shadow:0 0 0 1px var(--bg),0 0 0 2px var(--text-strong),0 0 0 4px var(--accent)}
+/* Inset variant for a scroll region flush inside an `overflow-hidden` box (the
+   completion / compaction / workflow card digests), where an outset ring would
+   be clipped. `inset` draws the same two layers INSIDE the content edge. */
+.focus-ring-accent-inset:focus-visible{outline:2px solid transparent;outline-offset:-2px;
+  box-shadow:inset 0 0 0 1px var(--text-strong),inset 0 0 0 3px var(--accent)}
 
 /* ── Colour-swatch hover cue ── */
 /* The colour swatches (session colours, folder/tag colours) carry no built-in
@@ -2806,6 +3067,17 @@ body.mc-focus-mode.mc-focus-rail .focus-chrome-rail{
 .side-tab-inactive:hover::before{
   content:'';position:absolute;left:0;right:0;top:2px;bottom:4px;
   border-radius:8px;background:var(--bg-hover);z-index:-1}
+/* Narrow strip: the pinned views (Changes / Artifacts / Files) are labelled,
+   but at a strip too narrow for three labels an INACTIVE pinned chip drops to
+   its icon, so all three stay on screen instead of the last one scrolling out
+   of view. The active chip keeps its word; every chip keeps its aria-label and
+   tooltip. Unlayered, so it beats the chip's Tailwind width/padding utilities.
+   The strip is the query container (`side-panel-strip-cq`). */
+.side-panel-strip-cq{container-type:inline-size}
+@container (max-width:400px){
+  .side-tab-pinned-idle{width:2rem;max-width:none;justify-content:center;padding-left:0;padding-right:0}
+  .side-tab-pinned-idle .side-tab-label,.side-tab-pinned-idle .side-tab-badge{display:none}
+}
 /* Reveal-in-sidebar confirmation: an accent outline the reveal handler holds
    briefly and then fades (ChatSidebar reveal effect, issue #912). Outline, not
    background, because the revealed row is usually the active one and already
@@ -2878,6 +3150,12 @@ body.mc-focus-mode.mc-focus-rail .focus-chrome-rail{
    would silence the alarm exactly for the users who asked for less motion. */
 .session-row.session-loop-stalled{background-color:var(--danger-subtle);animation:kc-loop-stalled-flash 1.6s ease-in-out infinite}
 @keyframes kc-loop-stalled-flash{0%,100%{background-color:var(--danger-subtle)}50%{background-color:transparent}}
+/* Live session dot (ChatSidebar `showLiveDot`): leads the session name while the
+   row's state resolver says the session is working. A filled accent disc, so it
+   claims none of the row chrome other states own: the background (selection,
+   stalled alarm) and the left edge (session colour bar, recency tint) stay
+   untouched. Its pulse is the shared `animate-pulse` utility on the element. */
+.session-live-dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--accent);margin-right:6px;vertical-align:middle;flex-shrink:0}
 .session-row.session-colored{position:relative}
 /* Flush against the row's left edge, and inset vertically by exactly the row's
    corner radius — so the bar spans (row height - 2 * radius) and its ends stop
@@ -3241,7 +3519,11 @@ body.mc-focus-mode.mc-focus-rail .focus-chrome-rail{
  * anchored on `--bg` (#12141a) in dark and on white in light. `--glass-tint`
  * itself is the step the host wears (`.glass-<step>` below, `thin` on :root), and
  * the modifier steps further down mix INTO `--glass-tint-step`, the host's own
- * plain step tint, so an accent chip on a thick pane is a thick accent. */
+ * plain step tint, so an accent chip on a thick pane is a thick accent.
+ * `--glass-band-plain` is the band's own plain value for the same reason: the
+ * hue modifiers mix into it and set `--glass-band`, so the lit edges of a
+ * tinted pane are lit in the pane's hue. A white band on a purple pane read as
+ * a white frame around it, not as light (issue #18314). */
 :root {
   --glass-tint-ultrathin: rgba(34, 33, 37, 0.30);
   --glass-tint-thin: rgba(30, 30, 34, 0.40);
@@ -3250,7 +3532,7 @@ body.mc-focus-mode.mc-focus-rail .focus-chrome-rail{
   --glass-tint-ultrathick: rgba(24, 25, 30, 0.78);
   --glass-tint-step: var(--glass-tint-thin);
   --glass-tint: var(--glass-tint-thin);
-  --glass-band: rgba(255, 255, 255, 0.22); --glass-edge: rgba(255, 255, 255, 0.14); --glass-hairline: rgba(0, 0, 0, 0.50);
+  --glass-band-plain: rgba(255, 255, 255, 0.22); --glass-band: var(--glass-band-plain); --glass-edge: rgba(255, 255, 255, 0.14); --glass-hairline: rgba(0, 0, 0, 0.50);
 }
 [data-mode="light"] {
   --glass-tint-ultrathin: rgba(236, 236, 236, 0.35);
@@ -3258,7 +3540,7 @@ body.mc-focus-mode.mc-focus-rail .focus-chrome-rail{
   --glass-tint-regular: rgba(243, 243, 243, 0.55);
   --glass-tint-thick: rgba(245, 245, 245, 0.65);
   --glass-tint-ultrathick: rgba(247, 247, 247, 0.82);
-  --glass-band: rgba(255, 255, 255, 1); --glass-edge: rgba(0, 0, 0, 0.24); --glass-hairline: rgba(0, 0, 0, 0.20);
+  --glass-band-plain: rgba(255, 255, 255, 1); --glass-band: var(--glass-band-plain); --glass-edge: rgba(0, 0, 0, 0.24); --glass-hairline: rgba(0, 0, 0, 0.20);
 }
 /* The step a pane wears, set on the host by Glass.tsx. Both tokens are set so a
  * modifier below (also on the host) can mix into `--glass-tint-step` while
@@ -3293,11 +3575,19 @@ body.mc-focus-mode.mc-focus-rail .focus-chrome-rail{
  * `thin` on :root) -- so the hue lands on the pane's own thickness, and a
  * property reads a sibling token rather than itself. These rules follow the
  * step classes so that, at equal specificity, the modifier's `--glass-tint`
- * wins on a host carrying both. */
-.glass-accent { --glass-tint: color-mix(in srgb, var(--accent) 14%, var(--glass-tint-step)); }
+ * wins on a host carrying both.
+ *
+ * A HUE modifier also tints the light bands: the same hue at the same share,
+ * mixed into `--glass-band-plain` (the polarity's plain band) and set as
+ * `--glass-band`, which the primitive paints as the 1px crisp core and the
+ * specular gradient along the top and bottom edges. Light through tinted
+ * glass carries the tint; a band left pure white framed an accent pane in a
+ * white line in light mode and washed its edge grey in dark (issue #18314).
+ * The neutral steps (`glass-hover`, `glass-faded`) leave the band alone. */
+.glass-accent { --glass-tint: color-mix(in srgb, var(--accent) 14%, var(--glass-tint-step)); --glass-band: color-mix(in srgb, var(--accent) 14%, var(--glass-band-plain)); }
 .glass-faded { --glass-tint: color-mix(in srgb, var(--glass-tint-step) 55%, transparent); }
-.glass-warn { --glass-tint: color-mix(in srgb, var(--warn) 12%, var(--glass-tint-step)); }
-.glass-danger { --glass-tint: color-mix(in srgb, var(--danger) 12%, var(--glass-tint-step)); }
+.glass-warn { --glass-tint: color-mix(in srgb, var(--warn) 12%, var(--glass-tint-step)); --glass-band: color-mix(in srgb, var(--warn) 12%, var(--glass-band-plain)); }
+.glass-danger { --glass-tint: color-mix(in srgb, var(--danger) 12%, var(--glass-tint-step)); --glass-band: color-mix(in srgb, var(--danger) 12%, var(--glass-band-plain)); }
 .glass-hover:hover { --glass-tint: color-mix(in srgb, var(--text) 8%, var(--glass-tint-step)); }
 
 /* The context shelf (agent, project, branch, model chips) sits BELOW the glass

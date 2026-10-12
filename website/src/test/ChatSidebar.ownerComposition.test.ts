@@ -109,14 +109,15 @@ describe('the facade composition', () => {
   // The owner hooks in the order the facade calls them. Each sits where its block sat
   // before the owners were extracted, which is what keeps React's effect order.
   const CALL_ORDER = [
-    'useSessionSources', 'useDebouncedSessionSearch', 'useSessionRename', 'useSidebarLane',
+    'useSessionSources', 'useDebouncedSessionSearch', 'useSessionRename', 'useSessionAutoTitle', 'useSidebarLane',
     'useSessionFilterState', 'useSessionStatusFilters', 'useHistoryPane', 'usePinnedSessionOrder',
     'useStaleCollapse', 'useFolderSort', 'useFolderRename', 'useSidebarTags',
     'useBoardColumns', 'useSidebarResize', 'usePinnedOrderAuthority', 'useColumnPopover', 'useBoardColumnMutations',
     'useColumnMatches', 'useFolderVisibility', 'useStaleMoveWatcher', 'useSearchMatches',
-    'useCollapsedCrews', 'useHoverHold', 'useLineageAvailable', 'useHoverPinLiveness', 'useStaleNarrowBridge',
+    'useCollapsedCrews', 'useCollapsedCrewSpaces', 'useCrewEnable', 'useHoverHold', 'useLineageAvailable', 'useHoverPinLiveness', 'useStaleNarrowBridge',
     'useFolderFilterReveal', 'useConductorLane', 'useLaneCycle', 'useShortcutOrder',
-    'useFolderFilterRows', 'useFolderMutations', 'useBoardFolderCollapse', 'useNativeSessionDrag', 'useFolderDropOps',
+    'useFolderFilterRows', 'useFolderMutations', 'useHoldPinnedHeaderOnCollapse', 'useBoardFolderCollapse',
+    'useNativeSessionDrag', 'useFolderDropOps',
     'useFolderTree', 'useSidebarReveal', 'useSidebarMoveUndo', 'useSidebarDragHandlers',
     'useFolderChatCreate', 'useSessionCreate', 'usePinnedKeyboardReorder', 'useRootFolderLanes',
   ]

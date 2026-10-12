@@ -113,6 +113,8 @@ from kiro_crew.crew_log.schema import KIND_SESSION, MAX_ENTRY_BYTES, Entry
 from kiro_crew.crew_log.session_tree import OpenedRecord, log_rank_of
 from kiro_crew.crew_log.store import (
     CrewLog,
+    ReadCursor,
+    ResumePoint,
     log_exception_text,
     segment_paths,
     session_units_by_slot,
@@ -125,7 +127,7 @@ from kiro_crew.projection import ProjectionRegistry, Savepoint, attribute_seq
 if TYPE_CHECKING:
     # Type-only: the savepoint module imports this one, so a runtime import here
     # would close the cycle the function-local imports below exist to avoid.
-    from kiro_crew.crew_log.checkpoint import PrefixWitness
+    from kiro_crew.crew_log.checkpoint import CutWitness, PrefixWitness
 
 # The ledger fold reads a record whose semantics -- which phases end a workstream,
 # which event kinds exist, how much of each field is kept -- belong to the ledger
@@ -144,6 +146,7 @@ from kiro_crew.session_ledger import LEDGER_ENTRY_TYPE
 from kiro_crew.session_ledger import SCHEMA_VERSION as LEDGER_SCHEMA_VERSION
 from kiro_crew.session_ledger import TERMINAL_PHASES as LEDGER_TERMINAL_PHASES
 from kiro_crew.work_vocab import (
+    WORK_BLOCKED_REASONS,
     WORK_CONDUCTOR_FIELDS,
     WORK_STORED_ITEM_LIMIT,
     WorkBoardItem,
@@ -173,7 +176,15 @@ PROJECTION_NAMES: Final[tuple[str, ...]] = (
 #: that one machinery folds it -- the same checkpoint, the same incremental reuse, the
 #: same recreated-log guard -- while staying out of the advertised set, which would
 #: otherwise name a projection with no reader.
-INTERNAL_PROJECTION_NAMES: Final[tuple[str, ...]] = ("class",)
+#: ``outline`` joins it for the same reason stated one way further: it is keyed by one
+#: SESSION, because a turn ordinal and a seq both restart in the next succession unit
+#: (the ``timeline`` fold raises rather than render two units as one list), so the fold
+#: that answers "what was this conversation" answers it per log. But no side panel draws
+#: it -- its reader is a dashboard block that asks for it by name, the way ``class``'s
+#: one caller does -- and an outline moves on the three entries of every turn, so
+#: advertising it would push a frame to every owner socket on each of them for a
+#: projection the panel set has no reader for.
+INTERNAL_PROJECTION_NAMES: Final[tuple[str, ...]] = ("class", "outline")
 
 #: Folds keyed by one SESSION, which are the ones the projection kernel drives
 #: (:func:`_session_registry`). The advertised panel set plus the internal ``class``:
@@ -376,6 +387,53 @@ TIMELINE_TYPES: Final[frozenset[str]] = frozenset(
         "subagent/spawned",
         "subagent/completed",
         "subagent/failed",
+    }
+)
+
+#: Newest turn rows an ``outline`` keeps, the same window posture and the same value
+#: as :data:`TIMELINE_LIMIT`. The count that fell off the front rides beside the rows,
+#: so a reader is never shown a window that looks like a whole conversation.
+OUTLINE_TURN_LIMIT: Final[int] = 200
+
+#: CHARACTERS of an outline row's first-user-line preview. Characters and not bytes,
+#: the unit every clamp in this module counts in (:data:`TEXT_LIMIT`, :func:`_as_str`),
+#: so one figure describes the clamp and the byte cost is read off it: a 4-byte UTF-8
+#: character is four times an ASCII one, which is the direction
+#: :data:`_SLOT_FOLD_ROW_BYTES`' measurements are taken in.
+#:
+#: Smaller than :data:`OUTLINE_REPLY_CHARS` because the two previews are read for
+#: different lengths: a prompt is scanned to RECOGNISE a turn and a reply is scanned to
+#: recall what came of it. The pair is also the row's whole free-text budget -- a row
+#: with two unclamped text fields is the shape that breaks a byte budget -- so it is
+#: stated here as one decision rather than inherited twice from ``TEXT_LIMIT``.
+OUTLINE_PROMPT_CHARS: Final[int] = 100
+
+#: CHARACTERS of an outline row's settled-reply preview. Same unit and same reason as
+#: :data:`OUTLINE_PROMPT_CHARS`, at :data:`TEXT_LIMIT`'s own figure: the reply is the
+#: field a reader actually reads for content.
+OUTLINE_REPLY_CHARS: Final[int] = 200
+
+#: Types an ``outline`` records, and the whole of what one row can be built from.
+#:
+#: WHAT IS ABSENT IS THE CONTRACT. ``context/composed`` is where every injected block
+#: is recorded -- system-injected rules, memory, environment context -- and it is not
+#: here, so no row can carry one. ``tool/called`` and ``tool/completed`` are not here
+#: either, so no row can carry tool output. That is structural rather than filtered:
+#: a type absent from this set never reaches :func:`_outline_step` at all, because
+#: ``affects`` is built from it and the kernel skips both the copy and the step.
+#:
+#: It holds for the prompt column for a second, stronger reason. ``message/received``
+#: carries the body the gateway ACCEPTED -- both writers pass the typed message
+#: (``on_message_received(role="user", text=user_typed_message)``) -- never the
+#: composed prompt, so the injected blocks are not in the field this fold reads even
+#: before the type set is applied.
+OUTLINE_TYPES: Final[frozenset[str]] = frozenset(
+    {
+        "turn/started",
+        "turn/refused",
+        "turn/completed",
+        "message/received",
+        "message/sent",
     }
 )
 
@@ -1551,6 +1609,9 @@ def _usage_start() -> dict[str, Any]:
         # left. Only a new unit -- a new session or a compaction, each its own crew log --
         # starts a new key space, because that is where turn numbers restart.
         "context_key_unit": 0,
+        # Whether a session-start composition has been folded yet, so exactly one row
+        # -- the session's real start -- is stamped ``first_start``.
+        "context_started": False,
         # A monotonic 1-based counter over the slot's TURN HISTORY, never reset by
         # truncation. Each composition row is stamped with its value as ``ordinal`` so a
         # retained row carries its TRUE position in the whole session history -- exact
@@ -1997,6 +2058,14 @@ def _usage_step(state: dict[str, Any], entry: Entry) -> None:
         # when this turn is already the one it last accounted for, so a second
         # composition does not advance past the real turn sequence.
         row["ordinal"] = _count_turn_ordinal(state, state["context_key_unit"], row["turn"])
+        # Whether this row is the slot's FIRST session-start composition: the session's
+        # real start, as opposed to a later rebuild. Not derivable from the ordinal --
+        # a refused or composition-less turn 1 consumes ordinal 1, so the real start
+        # can carry 2 -- nor from the earliest retained row, which a trimmed window or
+        # a day view can make a rebuild. The fold sees every entry, so it marks it once.
+        row["first_start"] = row["phase"] == PHASE_SESSION_START and not state["context_started"]
+        if row["first_start"]:
+            state["context_started"] = True
         turns_window = state["context_turns"]
         turns_window.append(row)
         if len(turns_window) > CONTEXT_TURNS_LIMIT:
@@ -3691,6 +3760,277 @@ def _class_render(state: dict[str, Any]) -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------- #
+# outline -- one row per turn: the first user line and the settled reply
+# --------------------------------------------------------------------------- #
+#
+# WHAT THIS FOLD IS FOR. A reader skimming a long session wants the conversation a
+# human would recognise: what was asked, and what came of it, once per turn. The
+# ``timeline`` fold answers a different question with the same entries -- it lists
+# MOMENTS and deliberately carries no bodies -- and the page route serves the bodies
+# whole. Neither gives a turn-per-row skim, which is what a dashboard block binds to.
+#
+# WHAT A ROW IS ANCHORED ON, and why it is NOT the turn boundary. ``turn/started`` is
+# the obvious anchor and it is the wrong one here, because of the order this product's
+# writer actually uses: ``on_message_received`` runs BEFORE the dispatch gates
+# (``chat_runner`` line ~11809) and ``on_turn_started`` runs after them (~11949), with
+# five refusal gates in between. So a REFUSED turn carries its prompt and its
+# ``turn/refused`` and never gets a boundary entry at all. A fold anchored on the
+# boundary would drop every refused turn's row outright -- and worse, that turn's
+# ``message/received`` would then land on the PREVIOUS row and report one turn's
+# question against another turn's answer. Rows are therefore anchored on the turn
+# ORDINAL: the first entry naming an ordinal above the newest row opens the row, and
+# that entry's seq is the load-through target. In this log that entry IS the prompt,
+# which makes it a better target than the boundary: paging back through it loads the
+# turn including the question.
+#
+# WHAT "SETTLED" MEANS, which is the one rule here that had to be decided rather than
+# read off the writer. A turn that was steered, retried or ran several model calls has
+# more than one candidate reply, and the fold must name one:
+#
+#   1. A ``message/sent`` carrying ``interrupted`` is a reply a steer CUT, and it is
+#      skipped outright -- it does not become the draft and it does not clear a draft
+#      already held. A cut reply is the one candidate that is provably not what the
+#      turn settled on, and this product records that fact on the entry
+#      (``interrupted``: "True when a steer cut this reply"), so the rule reads it
+#      rather than guessing from ordering.
+#   2. Otherwise the NEWEST uncut reply wins: each one overwrites a draft, so a
+#      multi-step turn settles on its last model call rather than its first.
+#   3. The draft commits at the turn's own closer and not before, so an OPEN turn
+#      shows no reply at all. A reply shown while its turn is still running is a
+#      reading of a turn that has not happened yet.
+#   4. A RETRY -- a second ``turn/started`` at the same ordinal, which this product
+#      marks with ``attempt`` -- CLEARS the row's committed reply and the draft. The
+#      previous attempt's reply is stale by the rerun's own declaration. The row keeps
+#      its prompt and its anchor: the rerun re-ran the same question.
+#
+# Rule 4 is where this diverges from the reference implementation a second time. There
+# a non-advancing boundary is skipped and the standing entry keeps the old reply until
+# something overwrites it; here the rerun is a recorded fact with its own field, so the
+# fold can say "that answer was retracted" instead of serving it until replaced.
+
+
+def _outline_preview(value: Any, limit: int) -> str:
+    """*value*'s text collapsed to one line and clipped to *limit* CHARACTERS.
+
+    Characters, which is the unit every clamp in this module counts in, and an
+    ellipsis when anything was cut -- so a clipped line is never read as a whole one.
+
+    Sliced BEFORE the whitespace collapse rather than after. The collapse walks the
+    whole string, and this runs on every message entry in the log, so normalising a
+    body at the entry ceiling to produce a hundred characters would pay the length of
+    the log's bulk for a preview. The slice is deliberately wider than *limit*
+    (whitespace collapse SHRINKS a string, so a slice at exactly *limit* can come back
+    short); what survives past the slice is marked cut even when the collapsed head
+    came back under budget, because the remainder was real and went unread.
+    """
+    if not isinstance(value, str) or not value:
+        return ""
+    window = limit * 4
+    head = value[:window]
+    unread = len(value) > window
+    collapsed = " ".join(head.split())
+    if not collapsed:
+        return ""
+    if len(collapsed) > limit:
+        return collapsed[: limit - 1].rstrip() + "\u2026"
+    return collapsed + "\u2026" if unread else collapsed
+
+
+def _outline_start() -> dict[str, Any]:
+    return {
+        # Rows in ascending turn order, newest last, windowed to OUTLINE_TURN_LIMIT.
+        "turns": [],
+        # Rows cut off the front, so the window says it is one.
+        "dropped": 0,
+        # The open turn's newest UNCUT reply, held until its closer commits it. Not
+        # rendered: a draft is a reply whose turn has not settled, and rule 3 above is
+        # that no reader sees one.
+        "draft": "",
+        # Which ordinal the draft belongs to; 0 outside a turn. The draft is committed
+        # only by a closer naming this ordinal, so a closer arriving out of order
+        # cannot commit one turn's reply onto another turn's row.
+        "draft_turn": 0,
+        # The newest seq folded, for the same guard the ``timeline`` fold states: a
+        # seq restarts at 1 in the next succession unit, so a seq at or below this one
+        # is the mark that a slot-wide read is folding two units into one list.
+        "last_seq": 0,
+    }
+
+
+def _outline_row(state: dict[str, Any], turn: int, entry: Entry) -> "dict[str, Any] | None":
+    """The row *turn* belongs to, opening one when *entry* is the first to name it.
+
+    ``None`` when *turn* is BELOW the newest row's ordinal: that is a regressive
+    boundary, and placing it would unsort the outline. The newest row's OWN ordinal is
+    not regressive -- that is the retry and the rest of a turn's entries -- so it is
+    returned rather than refused.
+    """
+    turns: list[dict[str, Any]] = state["turns"]
+    if turns:
+        last = turns[-1]
+        if turn == last["turn"]:
+            return last
+        if turn < last["turn"]:
+            return None
+    row: dict[str, Any] = {
+        "turn": turn,
+        # The anchor: the seq of the first entry that named this turn. See the section
+        # note -- in this log that is the prompt, not the boundary.
+        "seq": entry.seq,
+        "time": entry.time,
+        "actor": "",
+        "prompt": "",
+        "reply": "",
+    }
+    turns.append(row)
+    if len(turns) > OUTLINE_TURN_LIMIT:
+        state["dropped"] += len(turns) - OUTLINE_TURN_LIMIT
+        del turns[: len(turns) - OUTLINE_TURN_LIMIT]
+    return row
+
+
+def _outline_step(state: dict[str, Any], entry: Entry) -> None:
+    if entry.type not in OUTLINE_TYPES:
+        return
+    if entry.seq <= state["last_seq"]:
+        # The guard ``_timeline_step`` states, for the same reason and in the same
+        # words: this fold spans ONE succession unit. It is session-keyed, so the only
+        # reader today never gets here; the day a slot-keyed reader folds it, two units
+        # interleaved by wall clock arrive as an inversion and must fail loudly rather
+        # than render as one scrambled conversation.
+        raise CrewLogError(
+            f"outline row at seq {entry.seq} is at or below the fold's seq "
+            f"{state['last_seq']}; the outline fold spans one succession unit, not a "
+            f"slot of them -- order the units by succession before folding",
+            code=CODE_BAD_DATA,
+            field="seq",
+        )
+    state["last_seq"] = entry.seq
+    data = entry.data
+    turn = data.get("turn")
+    if not isinstance(turn, int) or isinstance(turn, bool) or turn < 0:
+        # A row is placed BY its ordinal, so an entry that names none names no row.
+        # Checked here rather than trusted from the type declaration: a declaration
+        # binds the writer, and a damaged or planted line is the input that ignores it.
+        return
+    row = _outline_row(state, turn, entry)
+    if row is None:
+        return
+
+    if entry.type == "message/received":
+        # THE FIRST-USER-LINE RULE, both halves of it. ``role`` must be the human one,
+        # so a body written under another role cannot reach the column a reader reads
+        # as the question -- today both writers pass ``role="user"`` with the TYPED
+        # message, and this gate is what keeps that true of a writer added later. And
+        # the row's prompt is filled only while it is still empty, so a STEER (a second
+        # human message inside the same turn) keeps the line that opened the turn.
+        if _as_str(data.get("role")) != "user" or row["prompt"]:
+            return
+        row["prompt"] = _outline_preview(data.get("text"), OUTLINE_PROMPT_CHARS)
+        return
+
+    if entry.type == "message/sent":
+        # Rule 1: a cut reply is skipped and does NOT clear the standing draft.
+        if data.get("interrupted") is True:
+            return
+        # Rule 2: the newest uncut reply wins, INCLUDING one with no readable body.
+        #
+        # An empty preview is not the same fact as a cut reply, and only rule 1 may
+        # keep a draft standing. A body too long for one line is stored as
+        # ``message/chunk`` entries and its citing ``message/sent`` carries ``chunks``
+        # and ``chars`` and no ``text`` at all -- so a turn that narrates before a tool
+        # call ("let me check that") and then answers at length has a LAST reply this
+        # fold cannot read. Holding the narration there would publish an intermediate
+        # line as the thing the turn settled on, which no reader can tell from a real
+        # answer. Empty is the honest preview, and it is what this fold's scope says:
+        # it does not read ``message/chunk``, so an overflow body has none here.
+        state["draft"] = _outline_preview(data.get("text"), OUTLINE_REPLY_CHARS)
+        state["draft_turn"] = turn
+        return
+
+    if entry.type == "turn/started":
+        row["actor"] = _as_str(data.get("actor"))
+        # RULE 4, AND IT KEYS ON THE START RATHER THAN ON THE NUMBER. A start at an
+        # ordinal that already has one is the turn running again, so every TERMINAL
+        # marker the row carries -- the refusal that stopped the last try, the answer
+        # the last try settled on, and the draft that answer commits from -- is
+        # retracted here. The row keeps its prompt and its anchor: the rerun re-runs
+        # the same question.
+        #
+        # Keying on ``attempt`` alone is not enough, because a rerun is numbered only
+        # when the writer can number it. ``on_turn_refused`` does not advance the
+        # attempt counter, so a refused turn that is rewound or regenerated starts
+        # again at attempt 1 with the field omitted -- and a row would then show one
+        # try's refusal beside the next try's answer.
+        row.pop("refused", None)
+        row["reply"] = ""
+        state["draft"] = ""
+        state["draft_turn"] = 0
+        attempt = data.get("attempt")
+        if isinstance(attempt, int) and not isinstance(attempt, bool) and attempt > 1:
+            # RECORDED separately from the retraction, because which try this is and
+            # what the last try produced are two different facts: a numbered rerun says
+            # so on the row, an unnumbered one is still a rerun.
+            row["attempt"] = attempt
+        return
+
+    if entry.type == "turn/refused":
+        # A turn a gate stopped before it ran. Recorded so a reader sees a turn that
+        # produced nothing rather than one still open -- and the row exists at all
+        # only because rows are anchored on the ordinal; see the section note.
+        row["actor"] = _as_str(data.get("actor"))
+        row["refused"] = _as_str(data.get("reason"))
+        # RETRACTED HERE TOO, and not only at ``turn/started``. A refusal is written
+        # WITHOUT a start -- the gates run between the two, which is the same ordering
+        # the ordinal anchor exists for -- so a rerun that is refused never reaches the
+        # retraction a start carries. Regenerate removes a settled answer and runs the
+        # turn again; Stop while it is still preparing lands exactly here, and leaving
+        # the committed reply would show the answer that was REMOVED beside the reason
+        # the rerun produced none. "This ordinal produced nothing" has to retract both
+        # the committed reply and any standing draft, or it is only half said.
+        row["reply"] = ""
+        state["draft"] = ""
+        state["draft_turn"] = 0
+        return
+
+    # turn/completed -- rule 3: the draft commits here and nowhere earlier.
+    if state["draft"] and state["draft_turn"] == turn:
+        row["reply"] = state["draft"]
+    state["draft"] = ""
+    state["draft_turn"] = 0
+
+
+def _outline_copy(state: dict[str, Any]) -> dict[str, Any]:
+    """Every container ``_outline_step`` can reach, copied; the rest shared.
+
+    Spelled out rather than left to the deep copy because this fold wakes on the
+    message entries that are the bulk of a log, and a deep copy of the window would
+    pay for the whole window on each of them. Two levels is all there is: the row list
+    and each row, whose values are scalars.
+    """
+    return {
+        **state,
+        "turns": [dict(row) for row in state["turns"]],
+    }
+
+
+def _outline_render(state: dict[str, Any]) -> dict[str, Any]:
+    turns: list[dict[str, Any]] = state["turns"]
+    return {
+        "turns": [dict(row) for row in turns],
+        # The window's own account of itself, beside the rows rather than inferred.
+        "dropped": state["dropped"],
+        "limit": OUTLINE_TURN_LIMIT,
+        # The clamps the previews were built with, so a block rendering a row knows
+        # what a trailing ellipsis means without reading this module.
+        "prompt_chars": OUTLINE_PROMPT_CHARS,
+        "reply_chars": OUTLINE_REPLY_CHARS,
+        "first_turn": turns[0]["turn"] if turns else None,
+        "last_turn": turns[-1]["turn"] if turns else None,
+    }
+
+
+# --------------------------------------------------------------------------- #
 # Reading a slot's folds
 # --------------------------------------------------------------------------- #
 
@@ -4118,20 +4458,26 @@ class _UnitMark:
 
     The fingerprint settles the units a continuation does not re-read. It cannot settle
     the newest one, which a continuation exists to let GROW: an append moves size and
-    mtime by itself, so a stat has nothing left to compare there. That unit is settled
-    instead by :class:`_PrefixSeen`, a decode-free digest of the records already folded,
-    which is the only evidence that distinguishes a file that grew from one truncated
-    and regrown to the same reading.
+    mtime by itself, so a stat has nothing left to compare there.
+
+    ``cuts`` is what settles that one. It is :meth:`CrewLog.cuts`, the number of times
+    the store has cut this unit's history back, and a cut is the only thing that can
+    change a record a fold already consumed -- so the same count twice means those
+    records are the same bytes, read off a file a few bytes long rather than off the
+    log. ``None`` is NOT PROVEN rather than zero, and a mark carrying it falls back to
+    :class:`_PrefixSeen`, the decode-free digest of the records already folded, which is
+    what a log created before the counter existed is settled by.
     """
 
     origin: str | None
     last_seq: int
     size: int | None = None
     mtime_ns: int | None = None
+    cuts: int | None = None
 
 
 def _unit_mark(unit_id: str) -> _UnitMark:
-    """*unit_id*'s log identity, newest seq and fingerprint, or an unknown mark.
+    """*unit_id*'s log identity, newest seq, fingerprint and cut count.
 
     ``origin`` is ``None`` for an unreadable or header-less log, and every caller
     treats that as unknown and folds cold -- which is also why the fingerprint needs no
@@ -4145,7 +4491,13 @@ def _unit_mark(unit_id: str) -> _UnitMark:
         origin, size, mtime_ns = _log_identity(handle)
         # ``last_seq`` on a freshly opened handle is read off the file's tail, which
         # is what makes it usable as a growth signal for a reader that never appends.
-        return _UnitMark(origin, int(getattr(handle, "last_seq", 0) or 0), size, mtime_ns)
+        return _UnitMark(
+            origin,
+            int(getattr(handle, "last_seq", 0) or 0),
+            size,
+            mtime_ns,
+            handle.cuts(),
+        )
     except Exception:
         return _UnitMark(None, 0)
 
@@ -4199,6 +4551,64 @@ def _prefix_holds(unit_id: str, seen: _PrefixSeen) -> bool:
     """
     again = _unit_prefix(unit_id, seen.records)
     return again is not None and again.records == seen.records and again.sha == seen.sha
+
+
+#: What :func:`_folded_prefix_holds` concluded, and how.
+#:
+#: ``UNCUT`` and ``CUT`` are decided by the cut counter alone; ``UNPROVEN`` is the
+#: counter declining to answer, and the digest decides instead. Three values rather
+#: than a bool because the costs differ: two of them are a few bytes read, and the
+#: third is a byte walk of the whole folded prefix.
+_UNCUT = "uncut"
+_CUT = "cut"
+_UNPROVEN = "unproven"
+
+
+def _cut_verdict(now: "int | None", held: "int | None") -> str:
+    """Whether the cut counter proves this unit's folded records are still intact.
+
+    The store raises the counter ONCE BEFORE each cut and once after it, and
+    :meth:`CrewLog.cuts` answers ``None`` for the odd value in between. So a reading
+    that comes back at all was taken with the bytes settled, and two equal such readings
+    bracket a window in which no cut COMPLETED -- which is the question, because a cut
+    is the only thing in this store that can change a record already on disk. Equal
+    therefore means the folded records are the same bytes, and that is the whole proof.
+
+    One raise would not do it. It brackets "a cut STARTED since you last looked", and a
+    reader that sampled the raised value, folded the records that cut was about to
+    remove, and sampled the same value again afterwards would compare equal across the
+    rewrite.
+
+    Unequal means a cut landed, which is not a slow case to re-check but a decided one:
+    the records a fold consumed may be gone. Either reading being ``None`` proves nothing
+    in either direction -- an absent, unreadable or mid-cut counter is not a count.
+    """
+    if now is None or held is None:
+        return _UNPROVEN
+    return _UNCUT if now == held else _CUT
+
+
+def _folded_prefix_holds(unit_id: str, memo: "_SlotMemo", mark: _UnitMark) -> bool:
+    """Whether the records *memo* already folded from *unit_id* are still those bytes.
+
+    The cheap proof first. A unit whose cut counter reads the same as it did when the
+    memo was built has not been cut since, and nothing else in the store can disturb a
+    committed record -- so the question is settled by a few bytes, and the warm read
+    costs the same on a log of ten entries and a log of a hundred thousand.
+
+    The digest is the fallback, not the rule. It walks and hashes every record the fold
+    consumed, so its price rises with the log: the records it re-reads are exactly the
+    ones the reader has paid for once already. It is here for the readings the counter
+    declines to make -- a log created before the counter existed carries none until its
+    first cut, and a log whose cut is in flight right now has nothing settled to report
+    -- and for those the digest is the only evidence there is.
+    """
+    verdict = _cut_verdict(mark.cuts, memo.marks[-1].cuts if memo.marks else None)
+    if verdict == _UNCUT:
+        return True
+    if verdict == _CUT:
+        return False
+    return memo.prefix is not None and _prefix_holds(unit_id, memo.prefix)
 
 
 class _SlotFold:
@@ -4260,14 +4670,36 @@ class _SlotStream:
     :func:`fold_slot_checkpoint` has always answered with; it starts at *since*, so a
     warm tail that turned out to be empty reports the position it resumed from rather
     than dropping to zero.
+
+    *resume* is a :class:`~kiro_crew.crew_log.store.ResumePoint` from an earlier pass,
+    and it turns the walk of ONE unit's log into a read of its tail: without it,
+    reaching ``since + 1`` means decoding every record below it, so a poll that finds
+    one new entry decodes the whole log. It names a byte offset in one file, so it is
+    applied only when this stream reads exactly one unit -- the warm tail's shape --
+    and a stream over several units ignores it rather than aiming a position at the
+    wrong log.
+
+    :attr:`points` is the third thing the caller needs afterwards: per unit, the
+    resume point the walk reached, for the next pass to hand back. A unit that
+    yielded nothing leaves no entry in it at all, which is how the caller tells
+    "nothing arrived, keep the point you have" from "this is the new point".
     """
 
-    def __init__(self, unit_ids: Sequence[str], *, base: int = 0, since: int = 0) -> None:
+    def __init__(
+        self,
+        unit_ids: Sequence[str],
+        *,
+        base: int = 0,
+        since: int = 0,
+        resume: "ResumePoint | None" = None,
+    ) -> None:
         self._unit_ids = tuple(unit_ids)
         self._base = base
         self._since = since
+        self._resume = resume if len(self._unit_ids) == 1 else None
         self.reached = since
         self.heights: dict[str, int] = {}
+        self.points: "dict[str, ResumePoint]" = {}
 
     def __iter__(self) -> "Iterator[_Ordinal]":
         base = self._base
@@ -4277,7 +4709,16 @@ class _SlotStream:
                 continue
             top = base
             reached = self._since
-            for entry in handle.iter_from(self._since + 1, known=KNOWN_TYPES):
+            # One cursor PER UNIT. A shared one would end the pass holding whichever
+            # unit yielded last, and a later unit that yielded nothing would leave an
+            # earlier unit's offset standing as this unit's position.
+            cursor = ReadCursor()
+            for entry in handle.iter_from(
+                self._since + 1,
+                known=KNOWN_TYPES,
+                resume=self._resume,
+                cursor=cursor,
+            ):
                 ordinal = base + entry.seq
                 top = max(top, ordinal)
                 reached = max(reached, entry.seq)
@@ -4285,6 +4726,8 @@ class _SlotStream:
             base = top
             self.heights[unit_id] = reached
             self.reached = reached
+            if cursor.at is not None:
+                self.points[unit_id] = cursor.at
 
 
 @dataclass
@@ -4320,14 +4763,25 @@ class _SlotMemo:
     #: to whole-mark equality, so a rewrite there already folds cold; the newest unit is
     #: admitted precisely because it GREW, and growth moves its size and mtime by
     #: itself, which leaves a stat with nothing to say about the bytes underneath.
-    #: ``None`` means no digest is vouched for -- the file moved during the pass, or
-    #: could not be read -- and a continuation is refused rather than trusted.
+    #: ``None`` means no digest is vouched for, which has two causes now. The unit's cut
+    #: counter settles the question on its own, so no digest was taken -- the ordinary
+    #: case. Or one was wanted and could not be had: the file moved during the pass, or
+    #: could not be read. The two are told apart by the mark's own ``cuts``, and a
+    #: continuation with neither is refused rather than trusted.
     prefix: "_PrefixSeen | None" = None
     #: The kernel ORDINAL this cell is persisted through on disk
     #: (:func:`kiro_crew.crew_log.checkpoint.save_slot`), or 0 when nothing is. What
     #: :func:`_persist_slot_fold` measures a write against, carried on the cell so a
     #: continuation decides without reading the file to find out.
     saved: int = 0
+    #: Where in the NEWEST unit's log this cell's fold stopped, as a byte offset the
+    #: next read can open the file at. Without it a continuation still decodes every
+    #: record below the seq it resumes from, so an idle board's poll costs the whole
+    #: log however little arrived -- the second linear term in a warm read, beside the
+    #: digest the cut counter replaced. ``None`` means no position is vouched for and
+    #: the next read walks from the top: a pass that yielded nothing new, a unit list
+    #: that changed, or a point the store itself declined to issue.
+    resume: "ResumePoint | None" = None
     #: What ORDERS this cell against every other value of the same (slot, fold). Minted
     #: when the cell is built, so a cell CARRIED FORWARD unchanged keeps its number and a
     #: cell that folded anything new gets a higher one. See :func:`_next_slot_revision`.
@@ -4635,15 +5089,22 @@ def fold_slot_warm(name: str, unit_ids: Sequence[str], *, slot: str) -> Checkpoi
     read streams every unit. Both go through the kernel, so there is no second folding
     path that could disagree with the first about the same bytes.
 
-    A continuation also HASHES that one file's already-folded records before trusting
-    them (:func:`_prefix_holds`). The store rewrites a committed prefix on two recovery
-    paths -- an unreachable chunk group is truncated away and closers are appended with
-    seqs continuing from the cut, and a failed append is truncated back after its bytes
-    reached the disk -- and a reader holds no append lock while either runs. Both leave
-    a file that has grown since the last read and reuses seqs the fold already consumed,
-    which is a pure append to every stat and to every seq comparison. The digest is
-    decode-free, so it costs a byte walk of one unit against the parse-and-fold walk of
-    every unit that a cold read would pay.
+    A continuation also PROVES that one file's already-folded records are still those
+    bytes before trusting them (:func:`_folded_prefix_holds`). The store rewrites a
+    committed prefix on two recovery paths -- an unreachable chunk group is truncated
+    away and closers are appended with seqs continuing from the cut, and a failed append
+    is truncated back after its bytes reached the disk -- and a reader holds no append
+    lock while either runs. Both leave a file that has grown since the last read and
+    reuses seqs the fold already consumed, which is a pure append to every stat and to
+    every seq comparison.
+
+    The proof is a COUNT, not a hash: the store raises the unit's cut counter before
+    each of those truncations, so two equal readings of a few bytes bracket a window in
+    which no committed record changed. That is what keeps a warm read the same price on
+    a log of ten entries and a log of a hundred thousand. Hashing the already-folded
+    records proves the same thing by re-walking exactly the bytes the reader has paid
+    for once, which charges the whole folded prefix per read; it is the fallback for a
+    log with no counter and nothing else.
 
     THE INVARIANT: the heights sampled before a pass reads are its READ PLAN, never the
     cell's claim about itself. What a memo remembers is what the pass actually FOLDED
@@ -4715,16 +5176,13 @@ def _fold_slot_warm_locked(
             # one here would move the number on every poll of an idle board, and a client
             # would re-seed from a frame that carries the value it already holds.
             return _slot_checkpoint(name, memo)
-        if (
-            _continuable(marks, memo.marks)
-            and memo.prefix is not None
-            and _prefix_holds(units[-1], memo.prefix)
-        ):
-            before = _unit_prefix(units[-1])
+        if _continuable(marks, memo.marks) and _folded_prefix_holds(units[-1], memo, marks[-1]):
+            before = _digest_to_carry(units, marks)
             tail = _SlotStream(
                 units[-1:],
                 base=sum(mark.last_seq for mark in marks[:-1]),
                 since=memo.reached,
+                resume=_resume_from(memo),
             )
             for event in tail:
                 memo.registry.drive(memo.store, event)
@@ -4736,6 +5194,7 @@ def _fold_slot_warm_locked(
                 reached=tail.reached,
                 prefix=_vouched(units[-1], before),
                 saved=memo.saved,
+                resume=tail.points.get(units[-1], memo.resume),
                 revision=_minted_revision(),
                 weight=_cell_weight(name, memo.registry, memo.store),
             )
@@ -4754,7 +5213,7 @@ def _fold_slot_warm_locked(
     cold = _SlotStream(units)
     registry = ProjectionRegistry(seq_of=_ordinal_seq)
     registry.register(_SlotFold(_FOLDS[name], slot))
-    before = _unit_prefix(units[-1]) if units else None
+    before = _digest_to_carry(units, marks)
     registry.prime(slot, cold)
     fresh = _SlotMemo(
         registry=registry,
@@ -4766,6 +5225,7 @@ def _fold_slot_warm_locked(
         # Nothing on disk is standing behind this value: a cold fold is what happens when
         # no savepoint could be used, so the next write is owed for the whole position.
         saved=0,
+        resume=cold.points.get(units[-1]) if units else None,
         # A cold fold is where the three rollover cases land -- a new unit, a unit
         # recreated under the same id, a rewritten prefix -- and every one of them can
         # leave ``reached`` unmoved or lower. The mint is what makes the value after them
@@ -4794,8 +5254,15 @@ def _slot_cell(name: str, memo: _SlotMemo) -> "tuple[Any, int] | None":
 
 
 def _identity_marks(marks: "Sequence[_UnitMark]") -> "list[list[Any]]":
-    """*marks* as the JSON a slot savepoint's identity block compares verbatim."""
-    return [[mark.origin, mark.last_seq, mark.size, mark.mtime_ns] for mark in marks]
+    """*marks* as the JSON a slot savepoint's identity block compares verbatim.
+
+    EVERY field of the mark, including ``cuts``, because the block's job is to be
+    admitted on exactly the shapes :func:`_continuable` admits and that function compares
+    an earlier unit's mark whole. An earlier unit that was cut therefore retires the
+    savepoint here as it folds cold there, rather than the two disagreeing about the same
+    unit vector.
+    """
+    return [[mark.origin, mark.last_seq, mark.size, mark.mtime_ns, mark.cuts] for mark in marks]
 
 
 def _resume_slot_fold(
@@ -4835,19 +5302,21 @@ def _resume_slot_fold(
     )
     if saved is None:
         return None
-    # A FULL digest of the newest unit, read before this pass consumes it -- the same
-    # thing the cold and warm paths read, and for the same reason. The savepoint's own
-    # witness cannot stand in for it: that digest ends at the seq the savepoint was
-    # written at, and this pass is about to fold the TAIL above it, so a cell carrying
-    # it would vouch for bytes it did not read. Two things go wrong when it does, and
-    # both are silent. A continuation then asks :func:`_prefix_holds` about the saved
-    # boundary only, so a tail rewritten in place -- the store's own recovery truncates
-    # an unreachable chunk group and re-appends with the seqs continuing from the cut --
-    # compares equal, and the cell keeps state folded from bytes the file has replaced.
-    # And :func:`_persist_slot_fold` would write a witness whose ``seq`` is above its own
-    # ``prefix_records``, which :func:`prefix_admit` refuses on the next read, so every
-    # other restart pays a cold fold.
-    before = _unit_prefix(units[-1])
+    # The newest unit's own evidence, read before this pass consumes it -- the same thing
+    # the cold and warm paths read, and for the same reason. On a unit with a cut counter
+    # that is the counter, already in ``marks[-1]``, and nothing is hashed. On one without
+    # it is a FULL digest, and the savepoint's own witness cannot stand in for that
+    # digest: the witness ends at the seq the savepoint was written at, and this pass is
+    # about to fold the TAIL above it, so a cell carrying it would vouch for bytes it did
+    # not read. Two things go wrong when it does, and both are silent. A continuation then
+    # asks :func:`_prefix_holds` about the saved boundary only, so a tail rewritten in
+    # place -- the store's own recovery truncates an unreachable chunk group and
+    # re-appends with the seqs continuing from the cut -- compares equal, and the cell
+    # keeps state folded from bytes the file has replaced. And :func:`_persist_slot_fold`
+    # would write a witness whose ``seq`` is above its own ``prefix_records``, which
+    # :func:`prefix_admit` refuses on the next read, so every other restart pays a cold
+    # fold.
+    before = _digest_to_carry(units, marks)
     registry = ProjectionRegistry(seq_of=_ordinal_seq)
     registry.register(_SlotFold(_FOLDS[name], slot))
     tail = _SlotStream(units[-1:], base=base, since=saved.reached)
@@ -4914,6 +5383,14 @@ def _resume_slot_fold(
         reached=tail.reached,
         prefix=_vouched(units[-1], before),
         saved=saved.watermark,
+        # No resume point, so the first continuation of a cell that stood on a savepoint
+        # walks the newest unit once and reports a point of its own. The tail folded here
+        # could issue one, and it would be as sound as any other: the cut count is what
+        # vouches for an unread prefix, and this pass holds it. It is left unset because
+        # a point is an optimisation and this is the one pass that cannot be checked
+        # against the loop that wrote it -- the state it continues came from another
+        # process, so ``reached`` here is the savepoint's position advanced by this tail
+        # rather than a height this cell folded end to end.
         revision=_minted_revision(),
         weight=_cell_weight(name, registry, slot),
     )
@@ -4930,23 +5407,25 @@ def _persist_slot_fold(
 
     A WARM CONTINUATION WRITES TOO, and that is the one place this departs from the
     session half, where a pass standing on a cached bundle writes nothing. The reason the
-    session half refuses is that a cached bundle records no digest, so nothing a later
-    pass can read is evidence about the bytes below its seq. A slot cell is different: it
-    CARRIES its digest (``_SlotMemo.prefix``) and :func:`_continuable` re-checks it
-    through :func:`_prefix_holds` before carrying the cell forward, so custody of the
-    already-folded prefix survives from the pass that folded it to this one. Without
-    this, a gateway that stays up leaves the savepoint wherever the process first folded,
-    and the restart it exists for replays the whole gap.
+    session half refuses is that a cached bundle records no evidence, so nothing a later
+    pass can read says anything about the bytes below its seq. A slot cell is different:
+    it CARRIES its evidence -- the newest unit's cut count in ``_SlotMemo.marks``, or its
+    digest in ``_SlotMemo.prefix`` on a unit that states no count -- and
+    :func:`_folded_prefix_holds` re-checks it before carrying the cell forward, so custody
+    of the already-folded prefix survives from the pass that folded it to this one.
+    Without this, a gateway that stays up leaves the savepoint wherever the process first
+    folded, and the restart it exists for replays the whole gap.
 
-    *sampled* is the newest unit's mark as read BEFORE the pass, and two of its fields do
-    the work. Its ``origin`` is the identity the pass folded under, which the write
-    refuses to differ from. Its ``last_seq`` is the boundary the digest in ``memo.prefix``
-    was taken at, so a pass that ended somewhere ELSE -- the file grew under it -- matches
-    nothing and writes nothing: the digest would then cover fewer bytes than the state was
-    folded from, which is the one savepoint no later read recovers from. That costs the
-    savepoint and never the read, which is already served.
+    *sampled* is the newest unit's mark as read BEFORE the pass, and three of its fields
+    do the work. Its ``origin`` is the identity the pass folded under, which the write
+    refuses to differ from. Its ``last_seq`` is the boundary the evidence was taken at, so
+    a pass that ended somewhere ELSE -- the file grew under it -- matches nothing and
+    writes nothing: the evidence would then cover fewer bytes than the state was folded
+    from, which is the one savepoint no later read recovers from. That costs the savepoint
+    and never the read, which is already served. And its ``cuts`` is which of the two
+    witnesses this unit gets.
 
-    THE PREFIX IS CONFIRMED HERE, at the write, and that is what makes one rule cover
+    THE EVIDENCE IS CONFIRMED HERE, at the write, and that is what makes one rule cover
     every pass that reaches this function. A digest taken before a pass and never asked
     again would certify bytes a concurrent truncation changed afterwards, and because
     every later resume recomputes the same changed bytes it would match, and the state
@@ -4954,9 +5433,14 @@ def _persist_slot_fold(
     and warm passes also vouch for their own digest (:func:`_vouched`), which they need
     for their cell; asking again here costs one decode-free walk on a pass that has just
     parsed and folded the same file, and it buys the property that NOTHING writes a
-    savepoint without re-reading the bytes its state came from.
+    savepoint without re-reading the evidence its state came from. The counter is
+    re-confirmed for the same reason and at a fraction of the price -- and it is the
+    stronger of the two here, because a cut during the pass RAISES it rather than being
+    hashed into agreement with itself.
     """
-    if not memo.units or sampled is None or sampled.origin is None or memo.prefix is None:
+    if not memo.units or sampled is None or sampled.origin is None:
+        return memo
+    if sampled.cuts is None and memo.prefix is None:
         return memo
     if memo.reached != sampled.last_seq:
         return memo
@@ -4979,10 +5463,11 @@ def _persist_slot_fold(
 
     if not savepoints.write_is_earned(watermark, memo.saved):
         return memo
-    if not _prefix_holds(memo.units[-1], memo.prefix):
-        return memo
     handle = open_session_log(memo.units[-1])
     if handle is None:
+        return memo
+    witness = _slot_witness(handle, memo, sampled)
+    if witness is None:
         return memo
     written = savepoints.save_slot(
         handle,
@@ -4993,19 +5478,39 @@ def _persist_slot_fold(
         ordinal_base=sum(mark.last_seq for mark in memo.marks[:-1]),
         state=_state,
         watermark=watermark,
-        # The digest read before the pass and re-confirmed just above, re-labelled with
-        # the boundary it was taken at. It covers at least every record the fold
-        # consumed -- a whole-file walk reaches past the newest entry, never short of it
-        # -- so it is a witness through ``reached`` and a stricter one than the seq span
-        # alone would be.
-        prefix=savepoints.PrefixWitness(
-            seq=memo.reached, records=memo.prefix.records, sha=memo.prefix.sha
-        ),
+        prefix=witness,
         expect_origin=sampled.origin,
     )
     if not written:
         return memo
     return replace(memo, saved=watermark)
+
+
+def _slot_witness(
+    handle: CrewLog, memo: _SlotMemo, sampled: _UnitMark
+) -> "PrefixWitness | CutWitness | None":
+    """The evidence *memo*'s savepoint records, re-confirmed now, or ``None``.
+
+    The cut count where the unit states one: *sampled*'s reading, taken before the pass,
+    checked against the live file here. A cut in between raises the live count, so this
+    answers ``None`` and the savepoint is skipped rather than written with a witness its
+    own resume could never admit.
+
+    The digest otherwise, re-labelled with the boundary it was taken at. It covers at
+    least every record the fold consumed -- a whole-file walk reaches past the newest
+    entry, never short of it -- so it is a witness through ``reached`` and a stricter one
+    than the seq span alone would be.
+    """
+    from kiro_crew.crew_log import checkpoint as savepoints
+
+    if sampled.cuts is not None:
+        held = savepoints.CutWitness(seq=memo.reached, cuts=sampled.cuts)
+        return held if savepoints.cuts_unchanged(handle, held) else None
+    if memo.prefix is None or not _prefix_holds(memo.units[-1], memo.prefix):
+        return None
+    return savepoints.PrefixWitness(
+        seq=memo.reached, records=memo.prefix.records, sha=memo.prefix.sha
+    )
 
 
 def _cell_weight(name: str, registry: ProjectionRegistry, store: str) -> int:
@@ -5020,6 +5525,46 @@ def _cell_weight(name: str, registry: ProjectionRegistry, store: str) -> int:
     except Exception:  # pragma: no cover - a cell the registry did not build
         return slot_fold_cell_bytes(name)
     return slot_fold_cell_bytes(name, state)
+
+
+def _digest_to_carry(
+    units: "tuple[str, ...]", marks: "tuple[_UnitMark, ...]"
+) -> "_PrefixSeen | None":
+    """The newest unit's whole-file digest, for a memo that will NEED one.
+
+    A memo needs one only when the next read of this unit cannot be settled by its cut
+    counter, and the counter's presence is what says which case this is. So a unit that
+    HAS a counter skips the hash on the write side of the memo as well as the read side
+    -- which is where most of the saving is, because this digest covers the whole file
+    rather than the records a fold consumed.
+
+    A unit with no counter gets the digest, and the next read is settled by it exactly
+    as before.
+    """
+    if not units or not marks:
+        return None
+    return None if marks[-1].cuts is not None else _unit_prefix(units[-1])
+
+
+def _resume_from(memo: "_SlotMemo") -> "ResumePoint | None":
+    """*memo*'s resume point, but only where it agrees with what *memo* folded.
+
+    The point and ``reached`` are two records of the same fact -- the last entry this
+    cell consumed from its newest unit -- written by the same loop, so they agree by
+    construction today. This asserts it anyway, because the two failures are not the
+    same size. A point BELOW ``reached`` costs a few extra records on the next read.
+    A point ABOVE it would make the next read open the file past entries the cell
+    never folded and never yield them, which is state silently missing from a fold
+    that reports itself complete.
+
+    So anything other than equality drops back to the full walk: the store's own
+    checks cannot catch this one, since an offset that is a perfectly good record
+    boundary for the seq it names is exactly what this would hand them.
+    """
+    point = memo.resume
+    if point is None or point.seq != memo.reached:
+        return None
+    return point
 
 
 def _vouched(unit_id: str, before: "_PrefixSeen | None") -> "_PrefixSeen | None":
@@ -5058,15 +5603,16 @@ def _folded_marks(
 
     *carried* is a warm continuation's earlier marks, which this pass did not read and
     has already found unchanged; only the newest unit is re-stated from the stream.
+
+    Built by REPLACING one field of the sampled mark rather than by naming the fields to
+    keep. A mark is compared whole, so a field this function forgot to carry would read
+    as changed on the very next pass and send every warm read of every slot back to a
+    cold fold -- a mark rebuilt field by field makes that the default outcome of adding
+    one.
     """
     base = list(carried if carried is not None else sampled)
     return tuple(
-        _UnitMark(
-            sampled[index].origin,
-            stream.heights.get(unit, base[index].last_seq),
-            sampled[index].size,
-            sampled[index].mtime_ns,
-        )
+        replace(sampled[index], last_seq=stream.heights.get(unit, base[index].last_seq))
         for index, unit in enumerate(units)
     )
 
@@ -5502,6 +6048,7 @@ _WORK_BASELINE_FIELDS: Final[tuple[str, ...]] = (
     "round",
     "fails",
     "status",
+    "reason",
     "summary",
     "artifacts",
     "pr",
@@ -5566,6 +6113,7 @@ def _work_new_item(item_id: str, stamp_ms: int) -> dict[str, Any]:
         "round": 0,
         "fails": 0,
         "status": None,
+        "reason": None,
         "summary": "",
         "artifacts": {},
         "pr": None,
@@ -5798,6 +6346,9 @@ def _work_apply(item: dict[str, Any], data: Mapping[str, Any], stamp_ms: int) ->
         for name in _WORK_WORKER_FIELDS:
             if name in data:
                 item[name] = _work_field(name, data[name])
+        # Every report REPLACES the reason, so an absent one is a cleared one rather
+        # than "unchanged" -- the one worker field read that way.
+        item["reason"] = _work_reason(data.get("reason"))
         item["last_report_at"] = _work_stamp(data.get("last_report_at"), stamp_ms)
     else:
         allowed = _WORK_CONDUCTOR_FIELDS.get(action)
@@ -5835,6 +6386,11 @@ def _work_apply(item: dict[str, Any], data: Mapping[str, Any], stamp_ms: int) ->
     )
 
 
+def _work_reason(value: Any) -> str | None:
+    """A report's ``reason`` when it is one of the closed vocabulary, else unset."""
+    return value if isinstance(value, str) and value in WORK_BLOCKED_REASONS else None
+
+
 def _work_field(name: str, value: Any) -> Any:
     """*value* in the shape the record holds for *name*; the fold's own shape gate."""
     if name in ("acceptance", "artifacts"):
@@ -5845,6 +6401,8 @@ def _work_field(name: str, value: Any) -> Any:
         return dict(value)
     if name in ("round", "fails", "pr"):
         return _as_int(value) if value is not None else None
+    if name == "reason":
+        return _work_reason(value)
     if name in ("verdict", "worker_session_key", "status"):
         return _work_text(name, value) if value is not None else None
     return _work_text(name, value)
@@ -7886,7 +8444,9 @@ _FOLDS: Final[dict[str, _Fold]] = {
         # a block of four zeros as unreported, and a savepoint from a build that
         # counted it as a report would resume onto this logic still carrying the
         # inflated count for the life of the unit.
-        state_version=_FOLD_STATE_VERSION_BASE + 10,
+        # Moved again for ``context_started`` and the per-row ``first_start``: a
+        # savepoint without them would mark a later rebuild as the session's start.
+        state_version=_FOLD_STATE_VERSION_BASE + 11,
     ),
     # The panel's feed section reads this one, so it is pushed like the rest; its value
     # is bounded by ``TIMELINE_LIMIT`` whatever the session's length.
@@ -7945,6 +8505,21 @@ _FOLDS: Final[dict[str, _Fold]] = {
         _class_render,
         affects=KNOWN_TYPES,
         copy_state=_flat_copy,
+    ),
+    # Keyed by one SESSION and NOT advertised -- the two choices are argued where
+    # :data:`INTERNAL_PROJECTION_NAMES` names it. ``affects`` is
+    # :data:`OUTLINE_TYPES`, whose ABSENCES are the fold's contract: no
+    # ``context/composed`` and no ``tool/*``, so no row can carry an injected block or
+    # tool output. ``copy_state`` is spelled out because this is the one internal fold
+    # woken by the message entries that are a log's bulk, and the deep-copy fallback
+    # would charge each of them a copy of the whole window.
+    "outline": _Fold(
+        "outline",
+        _outline_start,
+        _outline_step,
+        _outline_render,
+        affects=OUTLINE_TYPES,
+        copy_state=_outline_copy,
     ),
     # The SLOT-keyed folds each answer to exactly ONE entry type -- their ``step``
     # returns on its first line for anything else -- so ``affects`` names that type and

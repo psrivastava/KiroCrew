@@ -651,9 +651,7 @@ def _append_compaction_notice(state: DashboardState, slot: _ChatSlot, msg_text: 
     msg_text, _ = redact_credentials(msg_text)
     msg_text, _ = redact_exfiltration_urls(msg_text)
     meta = {"kind": "compaction"}
-    append_and_surface(
-        state, slot, "assistant", msg_text, "msg msg-a", meta=meta, extra={"kind": "compaction"}
-    )
+    append_and_surface(state, slot, "assistant", msg_text, "msg msg-a", meta=meta)
 
 
 def _broadcast_compaction_result(
@@ -3743,6 +3741,12 @@ FALSE_TOOL_BLOCKER_REPLAY_KIND = "false_tool_blocker_replay"
 #: Row-level kind for the `error` notice appended when a recovery has ALREADY
 #: been queued, so the frontend can tell a pending retry from a terminal failure.
 TRANSIENT_RETRY_KIND = "transient_retry"
+#: ``meta.kind`` of the runner's empty-response recovery notice cards (the
+#: continue and give-up rungs of the ladder, and the post-compaction resume).
+#: They are the runner talking about its own machinery, so a surface that draws
+#: only what a person must act on -- the Crewmate chat -- drops them by this
+#: tag (``crewmateBubbles.isCrewmateChatRow``), never by matching their words.
+EMPTY_TURN_NOTICE_KIND = "empty_turn"
 
 #: ``meta["notice"]`` on the three `error` rows the transient-5xx ladder appends
 #: (chat_runner ``acp_error_is_transient`` branches). The row's CONTENT is the
@@ -3823,6 +3827,16 @@ CRON_NOTIFICATION_KIND = "cron_notification"
 #: into user-authored, persisted, channel-mirrored history).
 MCP_APP_MESSAGE_KIND = "mcp_app_message"
 
+#: A runner notice re-routed into a crew member's own next turn — today the
+#: automation arm/revision/stop refusal (``session_directive_apply``). A member
+#: DM draws messages only and never replays a ``notice`` row to the model, so a
+#: refused directive there would reach neither the person nor the crewmate; this
+#: kind delivers it as an ``inject`` row the crewmate's turn carries. System
+#: injection like the kinds above: runner-authored, never user speech, must
+#: break a user-message merge (folding it into a user turn would flip
+#: runner-authored text into user-authored, persisted history).
+AUTOMATION_NOTICE_KIND = "automation_notice"
+
 #: Provenance banner wrapped around every app-originated message. Structural
 #: classification is by the queue entry's ``kind`` tag (unforgeable, set at
 #: enqueue time); the banner exists for the MODEL and the transcript reader,
@@ -3836,7 +3850,12 @@ SUBAGENT_DELIVERY_KINDS = frozenset((SUBAGENT_COMPLETION_KIND, SYNTHETIC_RECOVER
 
 #: All system-injection kinds (for set-membership checks).
 _SYSTEM_INJECTION_KINDS = SUBAGENT_DELIVERY_KINDS | frozenset(
-    (CRON_NOTIFICATION_KIND, MCP_APP_MESSAGE_KIND, FALSE_TOOL_BLOCKER_REPLAY_KIND)
+    (
+        CRON_NOTIFICATION_KIND,
+        MCP_APP_MESSAGE_KIND,
+        AUTOMATION_NOTICE_KIND,
+        FALSE_TOOL_BLOCKER_REPLAY_KIND,
+    )
 )
 
 
@@ -4159,6 +4178,13 @@ def _broadcast_expired_oauth_banners(state: "DashboardState", slot: "_ChatSlot")
     # and the live-child probe reads the session pool — a side effect the
     # common case must not pay (and one that would burn a pool read at every
     # teardown site this helper rides).
+    #
+    # A restored sidebar row whose window is still pending has sent no row to
+    # any tab in this process (opening the tab loads the window first), so no
+    # tab shows one of its banners to withdraw; asking would load its whole
+    # transcript on the loop for nothing.
+    if getattr(slot, "window_pending", False) is True:
+        return
     candidates = [
         message
         for message in slot.messages
@@ -4247,6 +4273,21 @@ def _expire_dead_child_oauth_meta(role: str, meta: dict, live_child: str) -> dic
     out.pop("oauth_url", None)
     out["expired"] = True
     return out
+
+
+#: Key on an in-memory slot message holding the top-level fields a NEWER build wrote
+#: on its transcript row, which this build does not know (kept by restore, written
+#: back by the slot save; see ``slot_persistence.message_entries``). Server-side
+#: only: every path that sends a message out removes it with
+#: :func:`without_unknown_row_fields`.
+UNKNOWN_ROW_FIELDS_KEY = "_unknown_row_fields"
+
+
+def without_unknown_row_fields(m: dict) -> dict:
+    """A copy of *m* without :data:`UNKNOWN_ROW_FIELDS_KEY`; the one strip every egress uses."""
+    if UNKNOWN_ROW_FIELDS_KEY not in m:
+        return dict(m)
+    return {key: value for key, value in m.items() if key != UNKNOWN_ROW_FIELDS_KEY}
 
 
 def _prepare_messages(
@@ -4342,7 +4383,7 @@ def _prepare_messages_scoped(messages: list[dict], running: bool, *, live_child:
             wire = serialize_wire_content(text)
             if wire is not text:
                 m = {**m, "content": wire}
-        msg_out = dict(m)
+        msg_out = without_unknown_row_fields(m)
         if msg_out.get("variants"):
             # Snapshot for the same reason as _redact_meta — this runs in a
             # worker thread (slot-detail render offload) while the event
@@ -4356,6 +4397,15 @@ def _prepare_messages_scoped(messages: list[dict], running: bool, *, live_child:
             ]
         meta = parse_cls_meta(m.get("cls", ""))
         if meta is not None:
+            # cls replaces meta, but a permission row's delivery id (`meta.mid`,
+            # stamped by _ChatSlot.append) is not in cls, and its approval is
+            # bound to that id (register_approval). Keep it for permission rows
+            # only, so every other row's wire meta stays exactly as before.
+            stored = m.get("meta")
+            stored_mid = stored.get("mid") if isinstance(stored, dict) else None
+            keep_mid = isinstance(stored_mid, str) and stored_mid and "mid" not in meta
+            if role == "permission" and keep_mid:
+                meta = {**meta, "mid": stored_mid}
             msg_out["meta"] = _expire_dead_child_oauth_meta(
                 role, _redact_meta_for_role(role, meta), live_child
             )

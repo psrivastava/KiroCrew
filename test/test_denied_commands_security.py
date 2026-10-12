@@ -37,6 +37,7 @@ from kiro_crew.security import perm_verb_mention as _perm_verb_mention
 from kiro_crew.security import (
     pinned_builtin_command_ids,
 )
+from kiro_crew.testing.wait import wait_until
 
 _GOLDEN = Path(__file__).parent / "fixtures" / "denied_commands_golden.json"
 
@@ -7732,34 +7733,39 @@ class TestEmptyArgvElementDoesNotBreakTheDenyView:
         # interposed empty word is still not a publish.
         assert is_denied('git "" stash push') is None
 
-    def test_a_whitespace_only_word_is_a_documented_residual(self):
-        """DOCUMENTED GAP, pinned rather than claimed.
+    def test_a_whitespace_only_word_is_elided_from_an_added_view(self):
+        """A quoted WHITESPACE-ONLY word does not hide a command-shape rule.
 
-        A quoted WHITESPACE-ONLY word (``rm -rf " " /home/x``) renders the same
-        extra separator and still escapes the rule.  It is NOT fixed here.  A
-        render that dropped it would be additive like the empty-elided one and so
-        could not lose a denial, but it is not the same claim: an empty element
-        carries no characters, so a view without it is still the argv the shell
-        hands over, while a whitespace-only element is a real operand naming a
-        file that can exist, so a view without it is an argv ONE OPERAND SHORT of
-        the one that runs.  ``is_denied``'s exception machinery is matched against
-        views, so the direction that widening opens is ALLOW.
+        ``rm -rf " " /home/x`` runs the recursive delete with one extra operand
+        (a file named by a single space), but the single-space join renders that
+        operand as extra separators and the rule's text is not a substring of the
+        plain view or the empty-elided one.  A FOURTH view drops whitespace-only
+        tokens.  It is appended beside the others, never substituted, so it can
+        only add a match: a view whose match an exception excuses moves on to the
+        next pattern, and any other view that matches still denies.
 
-        The naive alternative is unsound and must not be chosen either:
-        whitespace-collapsing the joined line would merge a two-word filename
-        into two operands and match a rule against a command that was never run --
-        the second assertion below is what keeps that on the record.
-
-        When that gap is closed, this test is the one that must
-        flip.
+        The view is one operand short of the argv that runs, so it is a render
+        to match deny rules against, not a claim about which files are named.
+        Whitespace-collapsing the joined line instead is unsound: it would merge a
+        two-word filename into two operands, so a token that carries any
+        non-whitespace character is kept whole -- the last assertion pins that.
         """
         from kiro_crew import security
 
-        for cmd in ('rm -rf " " /home/x', "rm -rf $'\\t' /home/x"):
-            assert is_denied(cmd) is None, (
-                f"{cmd!r} is now denied -- the residual this pins is closed, so update "
-                "the security spec and flip this assertion"
-            )
+        for cmd in (
+            'rm -rf " " /home/x',
+            "rm -rf $'\\t' /home/x",
+            "rm -rf ' ' $'\\t' /home/x",
+        ):
+            assert (
+                is_denied(cmd) is not None
+            ), f"a whitespace-only word escaped the deny view: {cmd!r}"
+        # The added view is appended after the plain and empty-elided renders.
+        views = security._deny_segment_views('rm -rf " " /home/x')
+        assert views[-1] == "rm -rf /home/x"
+        assert "rm -rf   /home/x" in views
+        # A command with no whitespace-only word gains no view.
+        assert security._deny_segment_views("ls -la /tmp") == ("ls -la /tmp",)
         # ...and the two-word filename that makes a whitespace collapse unsound.
         assert security._deny_segment_views('rm -rf "a b"')[-1] == "rm -rf a b"
 
@@ -9139,8 +9145,23 @@ class TestSandboxEscapeSshSelf:
         assert "203.0.113.66" in resolved
         assert _argv_floor._NETLINK_ADDRS_PUBLISHED is True
 
+    _RESOLVER_THREAD = "kirocrew-own-host-resolve"
+
+    @classmethod
+    def _resolvers_now(cls) -> set[int]:
+        """The resolver daemons alive right now, by identity."""
+        return {id(t) for t in threading.enumerate() if t.name == cls._RESOLVER_THREAD}
+
     def _open_window(self, monkeypatch, *, netlink, fqdn=lambda: ""):
-        """A fresh process: nothing published, the worker free to start now."""
+        """A fresh process: nothing published, the worker free to start now.
+
+        Records the resolver daemons already alive, so :meth:`_join_resolver`
+        joins only the one this test starts. ``threading.enumerate()`` is
+        process-wide, and the unit tests below call the cache function directly,
+        where a macOS ``getfqdn`` for a ``*.local`` name takes seconds, so a
+        neighbour's daemon can still be running here under any test order.
+        """
+        self._foreign_resolvers = self._resolvers_now()
         monkeypatch.setattr(_argv_floor, "_OWN_HOST_NAMES_CACHE", None)
         monkeypatch.setattr(_argv_floor, "_OWN_HOST_RESOLVE_DONE", False)
         monkeypatch.setattr(_argv_floor, "_OWN_HOST_RESOLVE_NEXT_TRY", 0.0)
@@ -9150,11 +9171,24 @@ class TestSandboxEscapeSshSelf:
         monkeypatch.setattr(_argv_floor.socket, "getfqdn", fqdn)
         monkeypatch.setattr(_argv_floor.socket, "getaddrinfo", lambda *a, **k: [])
 
-    @staticmethod
-    def _join_resolver():
+    #: Lost-run bounds for the resolver tests below. Once released, the netlink
+    #: publish and the worker's exit take milliseconds; these only end a wedged
+    #: worker, inside half the suite's 120 s timeout.
+    _PUBLISH_DEADLINE_SECS = 30.0
+    _RESOLVER_JOIN_SECS = 30.0
+    #: How long a stubbed DNS lookup holds the worker. It must outlast the publish
+    #: wait, or a slow publish lets DNS return before the test can see it still
+    #: in flight. The test's ``finally`` releases it, so no passing run spends it.
+    _DNS_HOLD_SECS = 2 * _PUBLISH_DEADLINE_SECS
+
+    def _join_resolver(self):
+        """Join the resolver this test started, and fail if it outlives its bound."""
+        foreign = getattr(self, "_foreign_resolvers", frozenset())
+        bound = self._RESOLVER_JOIN_SECS
         for t in threading.enumerate():
-            if t.name == "kirocrew-own-host-resolve":
-                t.join(5)
+            if t.name == self._RESOLVER_THREAD and id(t) not in foreign:
+                t.join(bound)
+                assert not t.is_alive(), f"the own-host resolver still ran after {bound:.0f}s"
 
     def test_startup_warm_publishes_before_the_first_ip_literal(self, monkeypatch):
         # Without a boot-time read, the first IP-literal ssh of a gateway
@@ -9175,19 +9209,22 @@ class TestSandboxEscapeSshSelf:
         # The netlink dump runs BEFORE DNS: a host whose name is not in DNS
         # must not keep every IP literal refused for the length of the lookups,
         # and the warm returns without waiting for either.
+        # The lookup's hold outlasts the publish wait, so the in-flight check
+        # below runs while DNS is still held however long the publish took.
         release = threading.Event()
 
         def _slow_fqdn():
-            release.wait(5)
+            release.wait(self._DNS_HOLD_SECS)
             return ""
 
         self._open_window(monkeypatch, netlink=lambda: {"203.0.113.66"}, fqdn=_slow_fqdn)
         try:
             _argv_floor.warm_own_host_names()
-            deadline = time.monotonic() + 5
-            while not _argv_floor._NETLINK_ADDRS_PUBLISHED:
-                assert time.monotonic() < deadline, "netlink never published"
-                time.sleep(0.01)
+            wait_until(
+                lambda: _argv_floor._NETLINK_ADDRS_PUBLISHED,
+                timeout=self._PUBLISH_DEADLINE_SECS,
+                describe=lambda: "netlink never published",
+            )
             assert _argv_floor._OWN_HOST_RESOLVE_IN_FLIGHT is True  # DNS still blocked
             assert "203.0.113.66" in _argv_floor._OWN_HOST_NAMES_CACHE
             assert _denied_by("ssh 198.51.100.9 id") is None

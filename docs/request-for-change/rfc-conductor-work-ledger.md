@@ -591,7 +591,7 @@ which is checked against the derived item list rather than trusted from the argu
 `ttl_secs` and `max_messages` default to the caps rather than to unbounded, so a
 conductor that grants a channel carelessly still grants a channel that ends.
 
-Errors: `identity_unresolved` (403), `no_ledger` (404), `unknown_item` (404), `already_bound` (409), `item_closed` (409), `item_cap_exceeded` (409), `item_store_full` (409), `depth_exceeded` (409), `channel_cap_exceeded` (409), `field_too_long` (400), `invalid_action` (400), `invalid_value` (400).
+Errors: `identity_unresolved` (403), `no_ledger` (404), `unknown_item` (404), `already_bound` (409), `item_closed` (409), `item_cap_exceeded` (409), `item_store_full` (409), `goal_item_cap_reached` (409), `depth_exceeded` (409), `channel_cap_exceeded` (409), `field_too_long` (400), `invalid_action` (400), `invalid_value` (400).
 
 ### Worker-to-worker communication
 
@@ -906,7 +906,7 @@ Seven phases. Each is independently shippable and independently abandonable, and
 | 3b — visibility (`siblings`) | proposed — not implemented | |
 | 5 — communication | proposed — not implemented | |
 | 4 — the surfaces (Crew board) | **done** | [#12792](https://github.com/kirodotdev/KiroCrew/pull/12792) |
-| 6 — every conductor records (v5): pipeline and security mount `kirocrew-work` from the shared base | in progress | [#17992](https://github.com/kirodotdev/KiroCrew/pull/17992), issue [#17977](https://github.com/kirodotdev/KiroCrew/issues/17977) |
+| 6 — every conductor records (v5): pipeline and security mount `kirocrew-work` from the shared base | **done** | [#17992](https://github.com/kirodotdev/KiroCrew/pull/17992) (`8fe49bd54a`), issue [#17977](https://github.com/kirodotdev/KiroCrew/issues/17977) |
 
 **Phase 3 is not a precondition for use.** `kirocrew-conductor` runs a goal end to end
 on a plain timer too: it polls with `work_ledger_read` on its nudge interval and pays
@@ -1213,9 +1213,9 @@ which expire on the same schedule as the alias, so its deletion — with
 `test_conductor_ledger_entry.py` — moves out of Phase 4 and rides with the alias's
 removal next release. Phase 4 keeps the Crew page surfaces.
 
-`kirocrew-pipeline-conductor` and `kirocrew-security-conductor` still mount nothing, for
-the reason §Agent spec changes gives — their children report through their own skills'
-scripts.
+`kirocrew-pipeline-conductor` and `kirocrew-security-conductor` mount `kirocrew-work`
+from the shared conductor base since v5 ([#17992](https://github.com/kirodotdev/KiroCrew/pull/17992)),
+recording each dispatched item while keeping their own skills' stores as detail.
 
 ## Open questions
 

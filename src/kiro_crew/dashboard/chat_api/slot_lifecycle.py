@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
-from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 from aiohttp import web
@@ -20,7 +19,6 @@ if TYPE_CHECKING:
         _app_cancel_denied,
         _ChatSlot,
         _history_key_for,
-        _normalize_slot_key,
         _persist_handover_tail,
         _replacement_shares_transcript,
         _resettle_restricted_key,
@@ -30,10 +28,12 @@ if TYPE_CHECKING:
         deny_app_slot_access,
         effective_session_key,
         logger,
+        loop_slot_keys,
         note_slot_closed,
         read_bounded_json,
         save_slot_off_loop,
         sel,
+        select_idle_slot_keys,
         slot_not_found,
         time,
     )
@@ -490,39 +490,6 @@ async def _await_guarded_history_write(slot: "_ChatSlot", name: str) -> bool:
         await asyncio.wait(pending, timeout=remaining)
 
 
-async def _wake_conductor_for_closed_worker(name: str) -> None:
-    """Pull *name*'s conductor's work-ledger tick forward, if *name* was a bound worker.
-
-    NEVER RAISES. A close is a user action with rollback paths for its own four failure
-    modes; "the conductor was not told early" is not one of them, because the conductor's
-    scheduled tick reads the same ledger a cadence later. So every failure here is a
-    DEBUG line and the close proceeds.
-
-    The import is function-local: ``conductor_wake`` reaches the work-ledger store, and
-    every gateway runs this close path whether or not any conductor has ever opened a
-    ledger.
-
-    WHEN IT IS CALLED. TRIGGER TWO of the crew-log wake, and only from the two exits
-    where the close is COMMITTED: after the archival save succeeds, and after the
-    hand-over exit's tail drain landed. Never between the pop and the save. The
-    conductor's probe answers "is this worker closed" by looking the slot up, and a
-    ``worker_closed`` answer persists a stall observation that no rollback retracts; a
-    tick fired in that window would read the popped slot as gone, and the save's
-    failure arm would then put the slot back under a permanent false "worker gone".
-
-    Awaited rather than detached: the binding read is offloaded inside and ``fire_now``
-    has no suspension point, so this adds one executor hop to a teardown that has
-    already awaited several -- and a detached task would outlive the close and could
-    fire after a same-key recreate.
-    """
-    try:
-        from kiro_crew import conductor_wake
-
-        await conductor_wake.fire_for_worker_slot(name)
-    except Exception:  # noqa: BLE001 - a push must never fail a close
-        logger.debug("conductor wake on close failed for %s", name, exc_info=True)
-
-
 async def close_slot(
     state: DashboardState,
     slot: "_ChatSlot",
@@ -838,8 +805,6 @@ async def _close_slot(
         # Otherwise return, do not raise: for the ORIGINAL the close is complete
         # (popped, task cancelled, tail durable), so every caller — the DELETE
         # handler and session-control's close_target — must read this as success.
-        # Committed, so the conductor may be told now and not before.
-        await _wake_conductor_for_closed_worker(name)
         return
     try:
         await save_slot_off_loop(state, slot, closed=True, closed_at=closed_at, best_effort=False)
@@ -924,11 +889,48 @@ async def _close_slot(
         # that landed during the save gets the marker re-derived from ITSELF instead
         # of inheriting the original's.
         _resettle_restricted_key(state, name)
+        # Record the DELIBERATE close as a ``session/closed`` crew-log edge with
+        # ``END_REASON_REMOVED`` so a later ``session_status`` gone row for this
+        # worker reads ``closed`` ("finished, nothing to re-dispatch") rather than
+        # ``lost``. This lives HERE, in the one deliberate-close caller, not in
+        # ``SessionManager.remove``: ``remove`` has many callers (archive sweeps,
+        # mid-handshake teardowns, Slack command paths) that are NOT a worker
+        # finishing, and stamping ``removed`` from inside it would make a reaped or
+        # torn-down worker read ``closed`` too. The sid is resolved from the session
+        # MAP (``mapped_sid``, in-memory, no prune), not from a live provider,
+        # because a worker that finished and sat idle may already have been
+        # process-recycled by ``reset`` -- which pops the live session and wrote a
+        # ``reset`` close -- before its tab was closed; the map still names the sid,
+        # and this ``removed`` edge, written after that ``reset``, is the newest
+        # lifecycle entry, so the gone row reads ``closed``.
+        #
+        # AWAITED before the wake below, not fire-and-forget: the conductor is woken
+        # on the strength of this close, and a ``session_status`` it runs then folds
+        # this worker's lifecycle. If the ``removed`` edge had not yet landed, that
+        # fold would read the earlier ``reset`` and report ``lost`` -- a redundant
+        # re-dispatch of a worker that is actually finished. So we hand the append to
+        # ``awaiting_commit`` and only wake once it has committed. Key-scoped
+        # ``_slot_still_ours`` guard first: a recreate can land between the save and
+        # here, and ``_history_key_for(name)`` is the session an unbound replacement
+        # runs on, so emitting for it would mis-stamp a live replacement. Fail-soft
+        # and bounded: a drop or timeout from ``awaiting_commit`` leaves the edge
+        # unwritten and the row reads ``lost`` -- the fail-safe direction (a transient
+        # redundant re-dispatch, never a lost worker), so we wake regardless.
+        if _slot_still_ours(state, name, slot):
+            close_sid = state.sessions.mapped_sid(_history_key_for(name))
+            if close_sid:
+                from kiro_crew.crew_log import emit as crew_log_emit
+                from kiro_crew.metrics.sessions import END_REASON_REMOVED
+
+                await crew_log_emit.awaiting_commit(
+                    lambda on_settled: crew_log_emit.on_session_closed(
+                        close_sid, END_REASON_REMOVED, on_settled=on_settled
+                    ),
+                    what=f"session/closed(removed) for {close_sid}",
+                )
         # Durable, so no rollback can retract this frame — a client pruning its
         # per-slot cards on it can never be pruning a slot that comes back.
         state.push_slot_removed(name)
-        # Committed, so the conductor may be told now and not before.
-        await _wake_conductor_for_closed_worker(name)
     # The app was already told, and compensated if the persist above failed — see
     # the notify block before the pop and the rollback in the except branch.
     # Kill the per-tab session to free resources. Re-check identity ONE more
@@ -1008,22 +1010,13 @@ async def api_chat_slots_cleanup(request: web.Request) -> web.Response:
     # nature between cycles (a 6h CI wait looks exactly like abandonment), so
     # the 3-day idle heuristic would shoot the longest-running loops. Resolved
     # once, outside the per-slot loop, so a large registry costs one pass.
-    _looped: set[str] = set()
     try:
         from kiro_crew.autonudge import (
             get_instance as _autonudge_get,  # circular: autonudge -> dashboard.chat -> chat_handlers
         )
 
         _svc = _autonudge_get()
-        if _svc is not None:
-            for _lp in _svc.list_all():
-                if not _lp.active:
-                    continue
-                _looped.add(_lp.slot_key)
-                # A channel-born loop is bound under its channel session key
-                # (slack:<ts>) while its tab is named with the folded form
-                # (slack_<ts>) — match both or the exemption misses the tab.
-                _looped.add(_normalize_slot_key(_lp.slot_key))
+        _looped = loop_slot_keys(_svc.list_all()) if _svc is not None else set()
     except Exception:
         # Fail CLOSED for the loops: if the registry cannot be read we do not
         # know which slots are protected, so archive nothing this pass rather
@@ -1032,50 +1025,15 @@ async def api_chat_slots_cleanup(request: web.Request) -> web.Response:
         return web.json_response(
             {"ok": True, "archived": 0, "keys": [], "failed": [], "skipped": "autonudge_unknown"}
         )
-    stale_keys: list[str] = []
-    active_is_stale = False
-    for name in list(state._slots):
-        slot = state._slots.get(name)
-        if slot is None or slot.pinned:
-            continue
-        if name in _looped:
-            continue
-        # App Kit ownership isolation: app callers can only archive
-        # their own slots. Dashboard users (empty request_app) pass
-        # through and can archive anything.
-        if request_app:
-            if slot._app != request_app:
-                continue
-        last_activity = 0.0
-        if slot.messages:
-            for m in reversed(slot.messages):
-                ts = m.get("ts", "")
-                if not ts:
-                    continue
-                try:
-                    dt = datetime.fromisoformat(ts)
-                    if dt.tzinfo is None:
-                        dt = dt.replace(tzinfo=timezone.utc)
-                    last_activity = dt.timestamp()
-                except (ValueError, TypeError):
-                    continue
-                break
-        if not last_activity:
-            try:
-                dt = datetime.fromisoformat(slot.created_at)
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=timezone.utc)
-                last_activity = dt.timestamp()
-            except Exception:
-                last_activity = 0.0
-        if not last_activity:
-            continue  # unknown activity — don't archive
-        if last_activity >= cutoff:
-            continue
-        if name == active_slot:
-            active_is_stale = True
-            continue
-        stale_keys.append(name)
+    # One selection for this button and the background idle sweep: pinned slots,
+    # loop-driven slots, other apps' slots and slots of unknown activity are kept.
+    stale_keys, active_is_stale = select_idle_slot_keys(
+        state,
+        looped=_looped,
+        cutoff=cutoff,
+        request_app=request_app,
+        active_slot=active_slot,
+    )
     # Dry-run: return the exact list without archiving
     if dry_run:
         sel().log_api_access(

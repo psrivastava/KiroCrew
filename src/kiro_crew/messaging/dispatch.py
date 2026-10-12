@@ -646,15 +646,17 @@ def build_directive_consumer(
     and everything it cannot answer fails CLOSED in the authorizer.
     """
 
-    async def _consume(kind: str, args: dict[str, Any]) -> None:
+    async def _consume(kind: str, args: dict[str, Any]) -> bool:
         # Deferred import: the dashboard package imports every channel package
         # at boot, and the channel packages import this module (cycle).
-        from kiro_crew.dashboard.session_directive_apply import apply_session_directive
+        from kiro_crew.dashboard.session_directive_apply import (
+            apply_session_directive_outcome,
+        )
 
         state: Any = getattr(dispatcher, "dashboard_state", None)
         if state is None:
             state = _ChannelDirectiveState(sessions=sessions)
-        result = await apply_session_directive(
+        outcome = await apply_session_directive_outcome(
             state,
             None,
             session_key,
@@ -662,6 +664,7 @@ def build_directive_consumer(
             args,
             producer_is_channel=True,
         )
+        result = outcome.text
         # The channel surface never renders tool results, so the applier's
         # confirmation has no user-facing sink here; this log is the operator's
         # record (the applier itself SEL-audits every outcome). Failures log at
@@ -673,6 +676,10 @@ def build_directive_consumer(
         result, _ = redact_credentials(result)
         log = logger.warning if result.startswith(("Error", "Failed")) else logger.info
         log("session directive %s on %s: %s", kind, session_key, result)
+        # The driver reads this as the structured terminal-turn signal (see
+        # ``TurnDriver.DirectiveConsumer``): a quiet end applied on a channel
+        # turn owes the thread no empty-turn notice.
+        return outcome.ends_turn
 
     return _consume
 
@@ -1460,7 +1467,8 @@ class Asker:
     ``None`` leaves it unmirrored. ``addressed=False`` is a rules-mode message
     nobody addressed to the agent: no decider, no record, and the tool-less refusal
     ends silently (the turn-ceiling and member-memory refusals still render).
-    ``model`` reaches a session only at creation.
+    ``model`` reaches a session only at creation. ``agent`` is this
+    conversation's own ``/agent`` pick; ``None`` runs the pipeline's agent.
     """
 
     session_key: str
@@ -1475,6 +1483,7 @@ class Asker:
     origin: ChannelLink | None = None
     display_name: str | None = None
     model: str | None = None
+    agent: str | None = None
 
     @property
     def can_prompt(self) -> bool:
@@ -1891,7 +1900,7 @@ class ChannelTurns:
         # session is acquired.
         if Drift.NO_GOVERNANCE_BACKSTOP not in drift and not await inbound_permitted(channel):
             return self._outcome(Verdict.DENIED, monitor)
-        agent = self._agent()
+        agent = asker.agent or self._agent()
         if asker.resumed:
             # A resumed session must run as ITSELF: on a cold start ``get_or_create``
             # applies the agent it is handed, so the dispatcher's own agent would load
@@ -2409,6 +2418,34 @@ class ChannelTurns:
                 )
                 await sessions.record_failure(session_key)
                 verdict = Verdict.UNDELIVERED
+            elif getattr(driver, "unfinished_turn", False) is True:
+                # The handle ended a turn the backend never finished; the driver
+                # already followed the partial text with the timeout notice. The
+                # runtime still reads alive, so book a failure and reset the
+                # session (keeping the conversation), as the compaction-failure
+                # retry above does, or the next message waits on it again.
+                logger.warning(
+                    "%s: the turn for %s ended unfinished (%s); resetting the session",
+                    channel,
+                    session_key,
+                    stop_reason,
+                )
+                # At its threshold the breaker resets the session inside
+                # record_failure and answers True. A same-key message can claim a
+                # successor while that reset is awaited, so a second reset here
+                # would end the successor mid-turn: reset only when it did not.
+                breaker_reset = await sessions.record_failure(session_key)
+                verdict = Verdict.FAILED
+                if breaker_reset is not True:
+                    try:
+                        await sessions.reset(session_key)
+                    except Exception:
+                        logger.warning(
+                            "%s: session reset after an unfinished turn failed session=%s",
+                            channel,
+                            session_key,
+                            exc_info=True,
+                        )
             else:
                 _record_success(sessions, session_key, channel)
                 verdict = Verdict.ANSWERED
@@ -2564,8 +2601,12 @@ class ChannelTurns:
             if self._approvals.discard is not None:
                 self._approvals.discard(session_key)
             # A turn that consumed the post-compaction flag but never landed
-            # discarded the prompt carrying the re-injected context; the bracket puts
-            # the flag back, then settles the skill-body dedup writes.
+            # discarded the prompt carrying the re-injected context, and a backend
+            # that compacted the session during the turn dropped it; the bracket
+            # arms the flag for either, then settles the skill-body dedup writes.
+            # ``driver`` is the latest attempt's: a replay after a COMPACTION_FAILED
+            # reset reports on the successor session, not the one the reset replaced.
+            bracket.compacted(driver)
             bracket.settle()
             # Always finalize the turn, even if get_or_create raised before the
             # semaphore was held. Only release if we actually acquired it.

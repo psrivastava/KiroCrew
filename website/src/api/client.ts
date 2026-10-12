@@ -23,6 +23,7 @@ import {
   noteStaleOwnerResponse,
 } from './staleOwnerSignal'
 import { edgeChallengeMessage, noteEdgeAuthChallenge } from './edgeAuthChallenge'
+import { AUTH_BANNER_BUTTON_CSS, AUTH_BANNER_CSS } from './authBannerStyles'
 import { beginArtifactWrite, endArtifactWrite } from '../lib/artifactWrites'
 import { withDeadline } from '../lib/withDeadline'
 import { installApiTransport } from './apiTransport'
@@ -74,6 +75,11 @@ import type { DecisionsConsentData } from './client/decisions'
 
 export type { TunnelStatus } from './client/system'
 export type { WakaTimeStatsEntry, WakaTimeStats } from './client/telemetry'
+export type {
+  UsageSeriesDimension,
+  UsageSeriesLayer,
+  UsageSeriesPayload,
+} from './client/telemetry'
 export type {
   KiroPrerequisiteStatus,
   KasLoginStatus,
@@ -162,6 +168,7 @@ export type {
 export type {
   MemberRosterRow,
   MemberActivityEntry,
+  MemberRecap,
   CrewTeam,
   CrewPanelData,
   CrewPanelMeta,
@@ -209,7 +216,7 @@ export type {
   FileMenuSurface,
   FileMenuContext,
 } from './client/apps'
-export type { AppPublishProvider } from './client/artifacts'
+export type { AppPublishProvider, DeploySitesResponse } from './client/artifacts'
 export { browserInstallConflictJob } from './client/browserAndComputerUse'
 export type {
   BrowserInstallData,
@@ -493,9 +500,7 @@ function showSessionExpiredBanner(lead?: string): void {
   _emitAuthEvent('mc-auth-required')
   const el = document.createElement('div')
   el.id = 'mc-session-expired'
-  el.style.cssText =
-    'position:fixed;top:0;left:0;right:0;z-index:99999;background:#b91c1c;color:#fff;' +
-    'padding:12px 20px;text-align:center;font:14px/1.5 system-ui;'
+  el.style.cssText = AUTH_BANNER_CSS
   const b = document.createElement('b')
   b.textContent = lead ?? i18nT('api.client.session_expired')
   const input = document.createElement('input')
@@ -637,6 +642,44 @@ function showSessionExpiredBanner(lead?: string): void {
   el.append(dismiss)
   document.body.prepend(el)
   requestAnimationFrame(() => input.focus())
+}
+
+/**
+ * Raise the app-level notice for an interposed proxy's sign-in page.
+ *
+ * The proxy's refusal is already worded on the failing request's `ApiError`, but
+ * most of the requests a lapse breaks are background polls whose errors no card
+ * renders, so a tab left open past the proxy's session lifetime failed every poll
+ * for as long as it stayed open with nothing on screen. This is that missing
+ * signal.
+ *
+ * It shares the session-expired banner's element and latch rather than adding a
+ * second one, so the 2xx self-dismissal in `removeAuthBanner` clears it on the
+ * first request that gets through again, and a gateway denial arriving meanwhile
+ * cannot stack a second banner on top. It offers no token field: the gateway never
+ * saw the request, so no token could clear it. There is no dismiss control
+ * either; the notice lasts exactly as long as the requests keep being refused.
+ */
+function showEdgeChallengeBanner(): void {
+  if (_sessionExpiredShown || typeof document === 'undefined') return
+  _sessionExpiredShown = true
+  _emitAuthEvent('mc-auth-required')
+  const el = document.createElement('div')
+  el.id = 'mc-session-expired'
+  el.setAttribute('role', 'alert')
+  el.dataset.variant = 'edge-challenge'
+  el.style.cssText = AUTH_BANNER_CSS
+  const text = document.createElement('span')
+  text.textContent = i18nT('api.client.proxy_challenge_reload')
+  const reload = document.createElement('button')
+  reload.type = 'button'
+  reload.textContent = i18nT('components.errorBoundary.reload_page')
+  reload.style.cssText = AUTH_BANNER_BUTTON_CSS
+  // A full-document navigation is what lets a redirect-based proxy run its
+  // sign-in; a fetch cannot follow it.
+  reload.addEventListener('click', () => { window.location.reload() })
+  el.append(text, reload)
+  document.body.prepend(el)
 }
 
 export function checkSessionExpired(r: Response): Response {
@@ -788,6 +831,9 @@ const apiFailure = (r: Response, errText: string, benign?: BenignDenial): ApiErr
   // Every one of these needs a person: the gateway never saw the request, so a silent
   // retry a second later reproduces it whether a session lapsed or a firewall refused.
   const edgeAuthExpired = edgeOutcome !== null
+  // A framed pane cannot complete a sign-in inside itself and its message already
+  // says where to go, so only a top-level document raises the notice.
+  if (edgeOutcome === 'challenged') showEdgeChallengeBanner()
   const message = staleOwnerSession
     ? i18nT('api.client.stale_owner_session_sign_in_again')
     : authRequired
@@ -940,6 +986,16 @@ const INSTANCES_DISABLED: BenignDenial = { status: 403, code: 'instances_disable
  * calls diverge.
  */
 const jInstancesDisabled = (r: Response) => parseJson(r, INSTANCES_DISABLED)
+
+/**
+ * The second one, on its own merits: `/api/crew-board` answering `no_ledger` for a
+ * session that never ran a goal. Every reader treats it as "no board", not a
+ * failure (the Crew board page, its menu entry, the crewmate resume greeting),
+ * and the greeting probes it on every crewmate open, so journaling it would fill
+ * the error reports with one routine 404 per open.
+ */
+const CREW_BOARD_NO_LEDGER: BenignDenial = { status: 404, code: 'no_ledger' }
+const jCrewBoard = (r: Response) => parseJson(r, CREW_BOARD_NO_LEDGER)
 
 /** Add transport failures that have no HTTP Response to the same journal as apiFailure.
  *
@@ -1199,6 +1255,7 @@ const transport: ClientTransport = {
   jNullable,
   jInstancesDisabled,
   jfetch,
+  jCrewBoard,
   sessionKeyHeader: _sk,
   checkSessionExpired,
   removeAuthBanner,

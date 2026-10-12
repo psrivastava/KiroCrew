@@ -31,6 +31,7 @@ Only the owner (set via `KIROCREW_OWNER_ID`) can use these:
 | `!ta <name>` | Set agent for this thread only |
 | `!ta off` | Remove thread agent override |
 | `!ta` | Show the current thread agent |
+| `/agent <name>` | Same as `!ta <name>` (type a space first if Slack offers it as a slash command) |
 | `!channel` | Show current channel activation mode |
 | `!channel always/mention/observe/review/off` | Set channel activation mode |
 | `!channel agent <name/off>` | Set per-channel agent override |
@@ -91,9 +92,9 @@ When Kiro Crew needs to run a tool (file write, bash command, etc.):
 
 1. **Auto mode** (`!yolo on`): silently approves everything
 2. **Interactive mode** (default): posts Approve / Trust session / Reject buttons
-3. 120-second timeout — auto-rejects if no click. Slack has its own figure; the
-   other five channels that prompt at all wait five minutes, and four channels do
-   not prompt. See [Channel capabilities](channel-capabilities.md).
+3. `agent.tool_approval_timeout_secs` timeout (default 600 seconds) —
+   auto-rejects if no click. The other five channels that prompt at all wait
+   five minutes, and four channels do not prompt. See [Channel capabilities](channel-capabilities.md).
 4. "Trust session" approves all remaining tools for that session
 
 Approval buttons appear in both Slack and the dashboard. Approving in either

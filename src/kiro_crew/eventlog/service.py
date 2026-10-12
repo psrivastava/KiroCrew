@@ -39,6 +39,7 @@ from kiro_crew.eventlog import members_projections, types
 from kiro_crew.eventlog.log import APPEND_CONTENTION_SECONDS, MemberLog
 from kiro_crew.eventlog.members_projections import all_units
 from kiro_crew.eventlog.types import Event
+from kiro_crew.owner_only_files import OWNER_ONLY_FILE_MODE, mkdirs_owner_only
 from kiro_crew.projection import EMPTY_WATERMARK, DirectoryCheckpointStore, ProjectionRegistry
 
 logger = logging.getLogger(__name__)
@@ -88,14 +89,26 @@ def _redact_projection_value(value: object) -> object:
     reads use, recursively, so a credential- or presigned-URL-shaped value an
     operator planted in an activity ``project`` (or any nested string) cannot
     reach the browser through the live projection push.
+
+    The string branch also applies the URL-secret-parameter layer
+    (``external_text.redact_url_secret_params``) that the sibling roster/agents
+    egress chain (``external_text.redact_external_text``, via ``_roster_mask``)
+    carries, so the two chains agree by construction. That layer catches a short
+    URL-embedded credential such as ``https://h.example/v1?api_key=abc123`` -- a
+    query under the exfiltration pass's length floor whose value is not
+    credential-shaped -- which the exfiltration and credential passes leave
+    untouched. Both the roster projection block (``GET /api/members``) and the
+    live member-projection WS push fold this function, and the roster ROW masks
+    the same leaf, so projection and row render it the same way.
     """
+    from kiro_crew.external_text import redact_url_secret_params
     from kiro_crew.security.exfil import redact_exfiltration_urls
     from kiro_crew.security.redaction import redact_credentials
 
     if isinstance(value, str):
         text, _ = redact_exfiltration_urls(value)
         text, _ = redact_credentials(text)
-        return text
+        return redact_url_secret_params(text)
     if isinstance(value, dict):
         # Redact keys too, not just values: a contributed projection key is
         # app-authored (`<app>/<name>`) and a nested data key can be arbitrary
@@ -563,8 +576,8 @@ def _retire_legacy_activity(slug: str) -> bool:
     if fenced is None:
         return False
     try:
-        fenced.parent.mkdir(parents=True, exist_ok=True)
-        fenced.touch(exist_ok=True)
+        mkdirs_owner_only(fenced.parent)
+        fenced.touch(mode=OWNER_ONLY_FILE_MODE, exist_ok=True)
         # touch() puts the directory entry in the page cache only. Without this the
         # entry can be absent after a crash while the rename below has already
         # landed, which is the one combination the ordering above rules out.
@@ -1113,11 +1126,12 @@ class MemberEventLogService:
 
         try:
             directory = crew_log_dir(KIND_MEMBER, slug)
-            # Owner-only, and mkdir masks rather than widens, so this cannot grant
-            # more than 0o700 whatever the umask is. These directories hold
-            # conversation bodies once a writer uses one, and a peer's create would
-            # inherit this mode rather than set its own.
-            directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+            # Owner-only at every level it creates, the parent ``crew-log/members``
+            # included (``mkdir(parents=True, mode=...)`` applies the mode to the
+            # leaf only). These directories hold conversation bodies once a writer
+            # uses one, and a peer's create would inherit this mode rather than set
+            # its own.
+            mkdirs_owner_only(directory)
         except OSError:
             logger.warning(
                 "crew log: cannot hold the unit lease for %r; keeping its legacy activity",

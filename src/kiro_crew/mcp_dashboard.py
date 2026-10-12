@@ -763,7 +763,8 @@ def _session_tools() -> tuple[Tool, ...]:
                         "type": "string",
                         "description": (
                             "Short name for the new session, shown in the sidebar. Omit to "
-                            "keep the fork's own `Fork of <source title>`."
+                            "start from `Fork of <source title>`, which is then renamed "
+                            "automatically after the latest question the copy holds."
                         ),
                     },
                     "folder": {
@@ -856,17 +857,46 @@ def _session_tools() -> tuple[Tool, ...]:
             routes=("POST /api/session-control/end-wait",),
         ),
         Tool(
+            name="session_retry",
+            description=(
+                "Re-run another session's last turn when it FAILED: it ended in an "
+                "error (for example 'Request initialize timed out' at start) or with no "
+                "reply. Does the same thing as pressing Resume in that tab: the session "
+                "picks up its most recent request, and no second copy of the prompt is "
+                "added. Use this instead of re-sending the prompt with session_send. "
+                "Refused while the target is running, busy or has queued messages, and "
+                "refused when its last turn finished normally or was stopped, so it "
+                "cannot regenerate a good answer. After two failed starts in a row it is "
+                "refused with session_start_repeat: the host needs attention, not a "
+                "third retry."
+            ),
+            schema={
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "description": "Session key from list_sessions, or its exact title.",
+                    },
+                },
+                "required": ["target"],
+            },
+            run=_run_session_retry,
+            identity="strict",
+            routes=("POST /api/session-control/retry",),
+        ),
+        Tool(
             name="session_set_model",
             description=(
-                "Change the model another session runs on. Only an IDLE session takes "
-                "the change: if the target has a turn or sub-agents in flight the call "
-                "fails with 'session busy, model not changed' and nothing changes. To "
-                "force it, stop the target with session_stop first, then retry. The "
-                "model is applied when the target's next turn starts, after the same "
-                "permission check runs again; if the target has become channel-linked "
-                "or otherwise out of reach by then, the change is dropped. The "
-                "conversation is kept. 'auto', 'Auto (Jev)' and sessions bound to a "
-                "remote crew are refused."
+                "Change the model and/or reasoning effort another session runs on; "
+                "pass either or both. Only an IDLE session takes the change: if the "
+                "target has a turn or sub-agents in flight the call fails with "
+                "'session busy, model not changed' and nothing changes. To force it, "
+                "stop the target with session_stop first, then retry. The change is "
+                "applied when the target's next turn starts, after the same permission "
+                "check runs again; if the target has become channel-linked or otherwise "
+                "out of reach by then, the change is dropped. A model or effort the "
+                "user picks in the meantime wins. The conversation is kept. 'auto', "
+                "'Auto (Jev)' and sessions bound to a remote crew are refused."
             ),
             schema={
                 "type": "object",
@@ -879,11 +909,21 @@ def _session_tools() -> tuple[Tool, ...]:
                         "type": "string",
                         "description": (
                             "Model to switch to: a canonical key or provider id, e.g. "
-                            "'sonnet' or 'opus'. 'auto' is owner-only."
+                            "'sonnet' or 'opus'. 'auto' is owner-only. Omit it to keep "
+                            "the target's model and change only reasoning_effort."
+                        ),
+                    },
+                    "reasoning_effort": {
+                        "type": "string",
+                        "description": (
+                            "Reasoning effort for the target, one of the five standard "
+                            "levels: 'low', 'medium', 'high', 'xhigh', 'max'. Omit it to "
+                            "keep the target's current level. Other levels, and going "
+                            "back to the model's default, are set from the dropdown."
                         ),
                     },
                 },
-                "required": ["target", "model"],
+                "required": ["target"],
             },
             run=_run_session_set_model,
             identity="strict",
@@ -918,6 +958,43 @@ def _session_tools() -> tuple[Tool, ...]:
             routes=("POST /api/session-control/reload",),
         ),
         Tool(
+            name="session_rename",
+            description=(
+                "Rename a live session's sidebar title: your own session, or one you "
+                "may control with session_stop. A conductor uses it to relabel the "
+                "workers it created as their work changes. The new title is final, the "
+                "same as a manual rename: the automatic titler stops refreshing that "
+                "session. Metadata only; the transcript, model and any running turn "
+                "are untouched. A crew member or an agent-created session may rename "
+                "only itself and sessions it created; a scheduled run may rename only "
+                "sessions it created, never its own session. ARCHIVED (history) "
+                "sessions are not addressable."
+            ),
+            schema={
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "description": (
+                            "Session key from list_sessions, 'dashboard:<slot>' key, or "
+                            "its exact unique title."
+                        ),
+                    },
+                    "title": {
+                        "type": "string",
+                        "description": (
+                            "New title, 1-200 characters after surrounding whitespace is "
+                            "stripped; no control characters."
+                        ),
+                    },
+                },
+                "required": ["target", "title"],
+            },
+            run=_run_session_rename,
+            identity="strict",
+            routes=("POST /api/session-control/rename",),
+        ),
+        Tool(
             name="session_close",
             description=(
                 "Close another session — the same thing as pressing the ✕ on that tab. "
@@ -928,7 +1005,9 @@ def _session_tools() -> tuple[Tool, ...]:
                 "(a finished watcher, a workstream you handed off), not to interrupt one "
                 "you might still need — for that, session_stop only cancels the turn and "
                 "leaves the tab open. Read the session first when you are unsure what it "
-                "is doing."
+                "is doing. You may also pass your OWN session key to close yourself once "
+                "your one job is finished; that cancels this turn, so make it your last "
+                "call and write anything the person should read before it."
             ),
             schema={
                 "type": "object",
@@ -1116,17 +1195,25 @@ def _session_tools() -> tuple[Tool, ...]:
                 "now — the roster a conductor patrols. Each row is `working` (a "
                 "turn is in flight, wait), `queued` (idle with messages waiting), "
                 "`idle` (open and doing nothing — this is the one that needs a "
-                "decision), `gone` (the crew log remembers the session and the "
-                "dashboard no longer holds it: closed, archived, or lost with the "
-                "process that ran it — re-dispatch it or drop it, there is nothing "
-                "left to message), or `unknown` (birth metadata records that you "
+                "decision), `closed` (the crew log recorded a DELIBERATE tab close "
+                "and the dashboard no longer holds it: a worker that FINISHED and "
+                "closed its tab — ignore it, it carries `closed_at`), `lost` (the "
+                "crew log remembers the session, the dashboard no longer holds it, "
+                "and it did NOT close cleanly — a turn was still open, a process "
+                "recycle or destroy tore it down, or its lifecycle could not be "
+                "read: treat it as lost with the process that ran it and "
+                "re-dispatch it), or `unknown` (birth metadata records that you "
                 "created it, but neither a live session nor an attested crew-log "
                 "edge exists — it was created and its fate is not recorded, so "
-                "read it before you re-dispatch it). `gone` is the reason to use "
-                "this instead of "
+                "read it before you re-dispatch it). A row with "
+                "`pending_approval: true` is parked on a tool approval a person "
+                "must answer (`pending_approval_tool` names the tool when known): "
+                "it still reads `working`, but waiting will not move it. `closed` "
+                "and `lost` are the reason to use this instead of "
                 "reading sessions one at a time: a worker that vanished is absent "
-                "from any live list, so a live list cannot tell a worker that died "
-                "from one you never dispatched. Read both quality fields before "
+                "from any live list, so a live list cannot tell a worker that "
+                "finished from one lost mid-task from one you never dispatched. "
+                "Read both quality fields before "
                 "trusting the count: `tree` describes the crew-log roster and "
                 "`history` describes transcript birth metadata. For either one, "
                 "`readable` means that source was read completely, `incomplete` "
@@ -1209,7 +1296,11 @@ def _session_tools() -> tuple[Tool, ...]:
                 "and you get only what arrived in between, so a poll loop does not re-read "
                 "the same messages. ``running: false`` with nothing new means the target "
                 "finished and is idle, which is the difference between 'not done yet' and "
-                "'done'. READ-only: it never sends anything or changes the target's state."
+                "'done'. ``pending_approval: true`` means the target is parked on a "
+                "tool approval a person must answer (``pending_approval_tool`` names "
+                "the tool when known); it stays ``running`` but will not progress "
+                "until someone decides. READ-only: it never sends anything or changes "
+                "the target's state."
             ),
             schema={
                 "type": "object",
@@ -2526,6 +2617,20 @@ def _summary_time(value: object) -> str:
         return "at an unknown time"
 
 
+def _closed_at_display(value: object) -> str:
+    """A gone row's ``closed_at`` (crew-log epoch MILLISECONDS) as UTC ISO-8601.
+
+    The close edge stamps ``entry.time`` from ``now_ms()``, so the value is in
+    milliseconds; render it human-readable rather than as a raw epoch number. Falls
+    back to the value's own string form when it is not a finite millisecond count,
+    so a malformed stamp still shows something rather than raising in the renderer.
+    """
+    try:
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(float(value) / 1000.0))  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError, OSError):
+        return str(value)
+
+
 def _render_session_summary(resp: dict[str, Any]) -> str:
     """Render a ``/api/session-control/summary`` body as compact text.
 
@@ -2710,18 +2815,60 @@ def _run_session_end_wait(args: dict[str, Any], ctx: ToolContext) -> str:
     )
 
 
+def _run_session_retry(args: dict[str, Any], ctx: ToolContext) -> str:
+    try:
+        resp = ctx.client.post(
+            "/api/session-control/retry",
+            {"target": args["target"]},
+            session_key=ctx.caller_key,
+        )
+    except DashboardError as refused:
+        return f"Error: could not retry that session's turn: {refused.error}"
+    target = resp.get("target", args["target"])
+    return redact(
+        f"\U0001f501 Retry started in `{target}`. Its transcript shows the resume row; "
+        "read it with session_read_message."
+    )
+
+
 def _run_session_set_model(args: dict[str, Any], ctx: ToolContext) -> str:
+    payload = {"target": args["target"]}
+    for key in ("model", "reasoning_effort"):
+        if key in args:
+            payload[key] = args[key]
     try:
         resp = ctx.client.post(
             "/api/session-control/set-model",
-            {"target": args["target"], "model": args["model"]},
+            payload,
             session_key=ctx.caller_key,
         )
     except DashboardError as refused:
         return f"Error: could not change that session's model: {refused.error}"
     target = resp.get("target", args["target"])
-    model = resp.get("model") or "auto"
-    return redact(f"\U0001f501 `{target}` will switch to `{model}` when its next turn starts.")
+    effort = resp.get("reasoning_effort")
+    effort_text = f"reasoning effort `{effort}`"
+    if "model" in resp:
+        change = f"`{resp.get('model') or 'auto'}`"
+        if effort is not None:
+            change += f" at {effort_text}"
+    else:
+        change = effort_text
+    return redact(f"\U0001f501 `{target}` will switch to {change} when its next turn starts.")
+
+
+def _run_session_rename(args: dict[str, Any], ctx: ToolContext) -> str:
+    try:
+        resp = ctx.client.post(
+            "/api/session-control/rename",
+            {"target": args["target"], "title": args["title"]},
+            session_key=ctx.caller_key,
+        )
+    except DashboardError as refused:
+        resp = refused.body
+    if resp.get("error"):
+        return redact(f"Error: could not rename that session: {resp['error']}")
+    target = resp.get("target", args["target"])
+    return redact(f"Renamed `{target}` to {resp.get('title', args['title'])!r}.")
 
 
 def _run_session_reload(args: dict[str, Any], ctx: ToolContext) -> str:
@@ -2965,10 +3112,20 @@ def _run_session_status(args: dict[str, Any], ctx: ToolContext) -> str:
     for row in rows:
         target = str(row.get("target", ""))
         status = str(row.get("status", ""))
-        if status == "gone":
+        if status == "closed":
+            closed_at = row.get("closed_at")
+            when = f" at {_closed_at_display(closed_at)}" if closed_at else ""
             status_lines.append(
-                f"  \U0001faa6 `{target}` — gone (the crew log has it, the "
-                "dashboard does not: closed, archived, or lost)"
+                f"  \u2705 `{target}` — closed (finished and closed its tab{when}; "
+                "nothing to re-dispatch)"
+            )
+            continue
+        if status == "lost":
+            status_lines.append(
+                f"  \U0001faa6 `{target}` — lost (the crew log has it, the "
+                "dashboard does not, and it did not close cleanly — a turn was "
+                "open, a recycle or destroy tore it down, or the lifecycle could "
+                "not be read: re-dispatch it)"
             )
             continue
         title = str(row.get("title", ""))
@@ -2986,6 +3143,12 @@ def _run_session_status(args: dict[str, Any], ctx: ToolContext) -> str:
             )
             continue
         mark = {"working": "\U0001f503", "queued": "\u23f8\ufe0f"}.get(status, "\U0001f4a4")
+        if row.get("pending_approval"):
+            status_lines.append(
+                f"  \u270b `{target}` ({title}) — {status}, "
+                f"{_pending_approval_phrase(row)}{queued}"
+            )
+            continue
         status_lines.append(f"  {mark} `{target}` ({title}) — {status}{queued}")
     status_lines.extend(quality_notes)
     return redact("\n".join(status_lines))
@@ -3030,6 +3193,12 @@ def _run_session_release(args: dict[str, Any], ctx: ToolContext) -> str:
     )
 
 
+def _pending_approval_phrase(resp: dict[str, Any]) -> str:
+    """The state words for a session parked on a tool approval."""
+    tool = str(resp.get("pending_approval_tool") or "")
+    return "waiting on a tool approval" + (f": {redact(tool)}" if tool else "")
+
+
 def _run_session_read_message(args: dict[str, Any], ctx: ToolContext) -> str:
     query = f"target={quote(str(args['target']))}&limit={args.get('limit', 20)}"
     if args.get("since") is not None:
@@ -3040,6 +3209,8 @@ def _run_session_read_message(args: dict[str, Any], ctx: ToolContext) -> str:
         return f"Error: could not read that session: {refused.error}"
     msg_rows = resp.get("messages") or []
     state_line = "still working" if resp.get("running") else "idle"
+    if resp.get("pending_approval"):
+        state_line = _pending_approval_phrase(resp)
     queued = resp.get("queue_depth", 0)
     if queued:
         state_line += f", {queued} message(s) queued"
@@ -3047,6 +3218,11 @@ def _run_session_read_message(args: dict[str, Any], ctx: ToolContext) -> str:
         state_line += f", model {redact(str(resp['model']))}"
     if resp.get("pending_model"):
         state_line += f", pending model {redact(str(resp['pending_model']))} for its next turn"
+    if resp.get("reasoning_effort"):
+        state_line += f", reasoning effort {redact(str(resp['reasoning_effort']))}"
+    if resp.get("pending_reasoning_effort"):
+        pending_effort = redact(str(resp["pending_reasoning_effort"]))
+        state_line += f", pending reasoning effort {pending_effort} for its next turn"
     head_line = (
         f"\U0001f4d6 `{resp.get('target', '')}` — {resp.get('title', '')} "
         f"({state_line}; total={resp.get('total', 0)})"

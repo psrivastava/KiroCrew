@@ -123,12 +123,21 @@ def _rewrite_log(unit_id: str, edit: "Callable[[list[str]], list[str]]") -> None
     rewritten file back to a size that predates it, and the fold then reads a log
     short by whole entries. Taking the same lock serializes the rewrite against the
     writer, so the file the fold reads is the one the test wrote.
+
+    The rewrite is also bracketed as a completed cut (``_open_cut`` before the bytes,
+    ``_close_cut`` after), the way the store brackets every change to a committed
+    record. A warm fold trusts the records it already consumed for as long as the
+    unit's cut counter reads the same, so a rewrite that left the counter alone would
+    be invisible to any fold that ran before it, and the fold would keep the stamp
+    the rewrite meant to damage.
     """
     lock_path = store._lock_path(lg.KIND_SESSION, unit_id)
     path = lg.crew_log_path(lg.KIND_SESSION, unit_id)
     with store._open_lock(lock_path):
         lines = path.read_text(encoding="utf-8").splitlines()
+        store._open_cut(path.parent)
         path.write_text("\n".join(edit(lines)) + "\n", encoding="utf-8")
+        store._close_cut(path.parent)
 
 
 # --------------------------------------------------------------------- emitter
@@ -598,8 +607,10 @@ def test_the_owner_count_is_bounded_and_evicts_the_oldest():
 #: The reference page's own reader hint, as the paragraph it is written in. The
 #: pins below derive what a reader is promised from THIS text rather than from a
 #: list kept here, so a hint that grows a field the record does not carry reds.
-#: The panel type is the page's last documented type, so its hint is the last one.
+#: Read inside the panel type's own subsection, so a type documented after it does
+#: not move the anchor.
 _READER_HINT_HEAD = "**Reader hint**"
+_PANEL_SUBSECTION = "### `panel/published`"
 
 
 def _reader_hint() -> str:
@@ -608,9 +619,10 @@ def _reader_hint() -> str:
         Path(__file__).resolve().parents[1] / "docs" / "reference" / "crew-log" / "session-types.md"
     )
     text = page.read_text(encoding="utf-8")
-    # The panel type is the page's last documented type, so its hint is the last
-    # one on the page; sliced to the blank line that ends the paragraph.
-    head = text.rindex(_READER_HINT_HEAD)
+    # The hint inside the panel type's subsection, sliced to the blank line that
+    # ends the paragraph.
+    start = text.index(_PANEL_SUBSECTION)
+    head = text.index(_READER_HINT_HEAD, start)
     para = text[head:].split("\n\n", 1)[0]
     assert "crew_key" in para, "the panel type's reader hint moved; re-anchor this"
     return para

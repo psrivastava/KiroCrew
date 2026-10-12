@@ -7,7 +7,7 @@ is a FOLD: `status`, `usage`, `timeline`, `tools`, `approvals`, `subagents` and
 `class` -- the session side panel of the RFC's section 5 table, plus the one fold a
 READER of another unit's log consults rather than a panel. This module is those six
 advertised folds, the internal `class` fold, the slot-keyed `ledger`, `radar`,
-`work` and `panel` folds, the two read routes that serve them, and the frame that pushes a fold
+`work`, `panel`, `agentic`, `mistakes` and `workstreams` folds, the two read routes that serve them, and the frame that pushes a fold
 when the file grows.
 
 The split it implements is RFC NFR-2: the backend folds and cuts pages, the
@@ -19,7 +19,7 @@ sends, so `PROJECTION_NAMES` holds those six. A fold in `SLOT_PROJECTION_NAMES` 
 keyed by a SLOT rather than by one unit: a slot owns one ACP session id at a time,
 so the state it accrues over its life is spread across a unit per id it ran under,
 and answering for it means joining them. `SLOT_PROJECTION_NAMES` holds `ledger`,
-`radar`, `work` and `panel`, and those names are kept OUT of
+`radar`, `work`, `panel`, `agentic`, `mistakes` and `workstreams`, and those names are kept OUT of
 `PROJECTION_NAMES` for that reason -- the growth push and the side panel address a
 session, and pushing a slot-wide value under one session's id would report a partial
 answer as the whole one. `FOLD_NAMES` is the union of the two, and the import-time
@@ -64,8 +64,8 @@ step for an entry a fold does not name, and `None` would leave a reader unable t
 "all of them" from "not decided".
 
 **Every fold is eager today, and `LAZY_FOLD_REASONS` is empty.** The two families each
-have their own warm path (section 5.1): the four SLOT folds -- `ledger`, `radar`, `work`,
-`panel` -- are continued in the slot memo, and the seven SESSION folds -- the six the
+have their own warm path (section 5.1): the seven SLOT folds -- `ledger`, `radar`, `work`,
+`panel`, `agentic`, `mistakes` and `workstreams` -- are continued in the slot memo, and the seven SESSION folds -- the six the
 crew-log panel draws plus the internal `class` -- in the session memo.
 `EAGER_SLOT_FOLD_NAMES` and `EAGER_SESSION_FOLD_NAMES` name the two halves, and an eager
 fold in neither is refused at import, because it would be woken for and then have
@@ -217,7 +217,7 @@ and its one caller asks the registry for it by name.
 | projection | what it answers |
 |---|---|
 | `status` | Is this session open, and what is it doing: lifecycle, the open turn and its attempt, agent/owner/slot/cwd, current model and provider, turns completed and refused, the last stop reason, dropped writes. |
-| `usage` | What it spent: credits from all three spenders, split by which spent what in `credits_by_source`; the four token dimensions, per model; the per-turn context bill by source kind from `context/composed`, plus `context.turns`, a bounded list of per-turn rows (ordinal, phase, window, occupancy); compaction count and the context they freed; step count and time. The usage route also reads it per SLOT (`read_slot_projection(slot, "usage")`), with the slot's units ordered by `previous` succession (`_usage_units_in_succession`) rather than by `createdAt`. |
+| `usage` | What it spent: credits from all three spenders, split by which spent what in `credits_by_source`; the four token dimensions, per model; the per-turn context bill by source kind from `context/composed`, plus `context.turns`, a bounded list of per-turn rows (ordinal, phase, window, occupancy); compaction count and the context they freed; step count and time. The usage route also reads it per SLOT (`read_slot_projection(slot, "usage")`), with the slot's units ordered by `previous` succession (`units_in_succession`) rather than by `createdAt`. |
 | `timeline` | The newest turn, lifecycle and cost MOMENTS, oldest first. Message, step and tool entries are deliberately absent: they are the bulk of a log, the page route and `tools` already serve them, and including them would make the timeline a second copy of the file. |
 | `tools` | Calls matched to completions by `call_id`: totals, per name, open calls, unmatched completions. An error is `status` in `refused`/`error`/`failed` OR `is_error` true -- two independent signals, and an absent `is_error` is not a claim that the call worked. |
 | `approvals` | Requests matched to decisions by `approval_id`: pending, decided, the decision tally, the last decision. The native permission path writes both types (`on_approval_requested` / `on_approval_decided` in the chat runner); coordinator approvals and question cards are not recorded. |
@@ -359,6 +359,15 @@ reopened.
 | `radar` | An Issue Radar crew's ledger: its work items (newest progress first), a bounded tail of progress lines, its own passes for the repository's shared skip index, and the per-item history of phase entries. It interprets only `radar/recorded` and renders the shapes the crew page, the fabric and the `issue_radar_crew_read` tool already expect (`apps/builtins/issue_radar/backend/crew_ledger_spec.md`). |
 | `work` | The conductor work board: its header, items, bindings, worker reports and bounded per-item event tails. It interprets only `work/recorded`; entries naming another board are excluded. The header carries `last_entry_at`, the greatest accepted entry time in the current generation, which is where board age comes from; a checkpoint without it is discarded and cold-folded. |
 | `panel` | The crew's published webview, folded from `panel/published` entries in the member's own DM session log. |
+| `agentic` | The crewmate's own dynamic-dashboard values, the latest per field, folded from `dashboard/agentic_value` entries in the member's own DM session log. It keeps up to `DASHBOARD_VALUE_LIMIT` fields, re-checks each value's declared type and byte size against the template manifest, and evicts the least recently written field past the cap. |
+| `mistakes` | The crewmate's mistake book: refused dashboard writes grouped by `(code, field)` from `dashboard/agentic_refused` entries, worst group first, carrying the correction a later accepted write recorded. It keeps up to `MISTAKE_GROUP_LIMIT` groups. |
+| `workstreams` | The project report: every board this slot reaches, keyed by `(slot, generation)`, each task costed by the credits of the worker session bound to it. It reads `work/recorded`, `session/opened` and the three turn closers, and counts board, task and spender overflow rather than dropping it silently. |
+
+No fold interprets `card/*` or `guide/*`. They are declared in the type registry, so
+every fold's `known=` vocabulary includes them and a log holding them folds as
+before; the conversation they describe is drawn from the transcript's `card` rows,
+and a reader rebuilding it from the log alone pairs each opener with the newest
+closer of the same id (`crew-log-core.md` section 5, "Cards and guides").
 
 A slot-keyed fold is the module's stated exception to "one fold, one unit", and it
 is stated rather than assumed, because a reader has to know which kind of fold it
@@ -407,11 +416,13 @@ the fold interprets only its own entry type but still reads every line to find i
 So the ledger and the radar store read through one shared memo, `fold_slot_warm`,
 kept per data home, slot and fold. A warm read reads ONE file -- the newest unit, from
 its remembered position -- after checking each unit's `_UnitMark` fingerprint and
-hashing the newest unit's already-folded prefix, which the store can rewrite on its
-recovery paths. A changed unit list, a unit whose seq went backwards, growth in any
-unit but the newest, a prefix that no longer hashes the same, or a cold memo each
-force a full refold, because each would otherwise be a wrong answer rather than a slow
-one.
+proving the newest unit's already-folded prefix intact, which it needs because the store
+can rewrite a committed prefix on its recovery paths. The proof is the unit's CUT COUNT
+(`CrewLog.cuts`, section 7.2), read in a few bytes; hashing that prefix is the fallback
+for a log that states no count. A changed unit list, a unit whose seq went backwards,
+growth in any unit but the newest, a cut count that moved, a prefix that hashes
+differently, or a cold memo each force a full refold, because each would otherwise be a
+wrong answer rather than a slow one.
 
 The radar fold's own rules, applied to the bytes as the writer applies them to a
 request: an entry naming a crew other than the fold's first is left out (every unit
@@ -512,7 +523,7 @@ client is trusted with. So a key that the session registry recognises is resolve
 to the unit it is serving through `crew_log.resolve.unit_for_session_key`, and an
 id the registry does not recognise -- which is what an ACP id is, since it is not a
 session key -- is used VERBATIM. That ordering is what keeps a unit-id-addressed
-read working unchanged, and there are now two such callers on main: the
+read working, and two callers address by unit id: the
 `kirocrew-crew-log` MCP server reads a unit by id through the unit-keyed door
 described below, and the `session_projection` frame carries the unit it folded as
 `session_id`, so anything taking an id out of a frame addresses by unit id too.
@@ -568,8 +579,7 @@ the same scope as a filter, because an unscoped listing would name every session
 the host and a per-unit gate cannot refuse that after the fact. A conductor reading
 the crew logs of the sub-sessions it dispatched is the ordinary shape of the work,
 and the lineage record already says which session created which, so the entitlement
-comes from a recorded fact. Issues #11963 and #12025 were closed as not planned for
-that reason.
+comes from a recorded fact.
 
 The lineage is not the whole entitlement, because it OUTLIVES a workspace switch: the
 creator edge is written on the dispatched session and nothing rewrites it, so a
@@ -945,7 +955,7 @@ is the safe direction: the table then holds fewer cells than its bytes allow, ne
 also checks that a driven cell weighs no more than it is charged, so a clamp raised
 without re-measuring fails CI.
 
-**This reverses two earlier decisions.** The count ceiling (64 cells) assumed cells are
+A count ceiling cannot bound the resident total. A ceiling of 64 cells treats cells as
 comparable, and they are not: a `panel` cell is a few hundred KiB and a `radar` cell at
 its caps about 24 GiB (24,402 MiB), so one ceiling of 64 priced a resident total across four orders of
 magnitude with no number in the code moving. Eager folding makes the high end reachable,
@@ -1071,8 +1081,13 @@ pull-forward (`conductor_wake`) is the second subscriber: it holds one keyed
 `(slot, <board>, work)` `FOLD_ADVANCED` subscription per board with an active work-ledger
 loop, joined with `baseline=True`, kept in step with the loop table (`install`,
 `sync_subscriptions`) and disposed when the loop ends or the service stops. On a board's event it diffs each item's `last_report_at` against the
-board it last saw and pulls the conductor's armed work-ledger loop forward for the items
-that moved -- the event's `key` is the conductor's board, so it reads no binding.
+board it last saw and pulls the conductor's armed work-ledger loop forward for an item
+that moved AND whose status is in `work_vocab.WORK_WAKE_STATUSES` (`done`, `blocked`,
+`question`) -- the event's `key` is the conductor's board, so it reads no binding, and a
+`progress` report advances the board without buying a tick the conductor's own gate
+would answer quiet. It is the only wake: a worker's slot closing and a worker's turn
+ending reach none, and a crashed worker is surfaced by the item's `stale` / `orphaned`
+flags on the loop's scheduled tick.
 Further consumers -- a summary fold over a session's events, the automatic-card sentence
 trigger, channel notifications -- are expected to subscribe the same way and are not
 built here.
@@ -1333,25 +1348,38 @@ cap) are the cold seed's, not a poll's.
 key space) and `lineage_pending: true` while the projection is unseeded. The projection
 announces `TREE_ADVANCED` on every tree change and when its seed lands, and
 `DashboardState.push_lineage_patch` answers it with one coalesced `slot_patch` carrying
-`parent` and `lineage_pending` per row, so nesting appears without a full slot reload.
+`parent` and `lineage_pending` per row, so nesting appears without a full slot reload. A child dispatched but not yet run has no fold node of its own -- its crew log opens only with its first turn -- so each slot row also carries `created_by` and `lineage_minted`, and `lineage_parents` nests such a row under its creator from `created_by` alone, but only when `lineage_minted` vouches that this gateway process stamped the pair at mint (a `created_by` rehydrated from an agent-editable transcript is a claim, not a witness, and nests nothing). A node, once it exists, wins over the row's own `created_by`, including a node whose `parent_slot` is `None` (a `session/released` that let the edge go). This fallback is the slots payload's only: the Sessions table's runtime-map rows carry neither field and keep the folded answer.
 
 **The wire.** Each session row of `GET /api/sessions/memory` carries `parent`:
 `null` for a session nobody created, otherwise `{slot, key}` -- the cited creator
 slot, and `key` the creator's LIVE session key when the creator is running and the
-edge can be followed (`null` for a creator that is not running, a node on a cycle,
-or a citation pointing at the row itself). The join from a log's slot to a live
-row is by slot key alone: a dashboard row's key is `dashboard:{slot.key}` and its
-log -- and any child citing it -- carries the bare `slot.key`. `totals` carries
+edge can be followed (`null` for a node on a cycle, a citation pointing at the row
+itself, and a creator that is not running with no open session anywhere above it).
+When the creator is not running but an ANCESTOR is, `key` is that ancestor's live
+session key and the row carries a third field, `ancestor: true`. That is the one
+case where `key` and `slot` name different sessions: the row nests where the run is
+owned -- the nearest open ancestor, not the root, so `lead -> A -> B -> worker` with
+`B` closed nests the worker under `A` -- while `slot` still cites the creator that is
+gone, and a surface reads the closed-creator cue off that pair. The walk up the chain
+is cycle-guarded by the slots it has visited and by the fold's own `cycle` mark, and
+bounded by `TREE_UNIT_CAP`, already the most records a scan holds and so the most
+slots any chain can run through. `ancestor` is omitted, never `false`, so an
+ordinary edge is the two-key payload it has always been. The join from a log's slot
+to a live row is by slot key alone: a dashboard row's key is `dashboard:{slot.key}`
+and its log -- and any child citing it -- carries the bare `slot.key`. `totals` carries
 `lineage_over_cap` and `lineage_cap` (above); the sampler hands the tree the live
 rows' ACP session ids (`runtime_pids` carries each as `sid`, bounded by
 `MAX_ACP_SESSION_ID_LEN` at retention) so those logs are read first. The Memory column's hint says each row is its own runtime's figure, a parent's figure does not include the rows nested under it, and a group's header row under Group by is the one row that does total (TanStack's sum aggregation on the grouped column, which is the base table's behaviour), so the reader is not left to guess which bold rows sum. A task row carries a muted "task" marker before its name: once created sessions nest too, indent alone no longer says which kind an indented row is, and the kind otherwise showed only on hover (a session's name underlines, a task's does not). A folded session's count is the visible text "M MB in N hidden rows", unit included and the memory bound to the rows in the words (beside the parent's own Memory cell a bare "N rows, M MB" left the reader unsure which figure was whose): it counts sessions and tasks, where the footer's "nested" counts sessions only, and a bare numeral beside that reads as either; the memory is the hidden rows' own figures summed, carried on the badge because a folded parent's figure is its own and without the roll-up beside it the fold reads as a family total (a row with no memory data contributes nothing, and a fold with none shows the count alone). The
 System page's Sessions table nests a session under `parent.key` exactly as it
 nests a task under its `parent`, to whatever depth the creating went, with a task
 under whichever session spawned it wherever that session sits; a created session
-whose creator is not running is a top-level row that still carries its citation.
+with nothing open above it is a top-level row that still carries its citation.
 A row nested under its creator needs no further citation: its place in the tree
 is one, and the creator's expander names the relation ("Collapse sessions under
-{name}"). A created row that could NOT be nested (creator not running, a cycle)
+{name}"). A row placed on an `ancestor` edge is nested under a session that did not
+create it, so the citation it shows names `slot` rather than `key` -- crediting the
+creating to the ancestor would name a session that did not do it. A created row that
+could NOT be nested (nothing open above it, a cycle)
 says who opened it as VISIBLE text under its name -- "Created by {creator} (not
 running, so shown top-level)", the creator's display name when it has a live row, else the slot the
 log cited; the parenthetical names the one reason a created row is top-level
@@ -1532,10 +1560,9 @@ are both floors under what six now cost. Re-measuring on a different host would 
 self-consistent set of ratios with two hosts' numbers mixed together, which is the reading
 this paragraph warns against.
 
-An earlier revision of that sentence said 3.2 ms to resume. It was measured before
-the prefix digest existed and is no longer true of any resume: the digest is
-verified on the way in and rechecked after the pass, and those two hashes are
-essentially the whole of the 44.8 ms. Section 6 gives the attribution.
+The resume cost is dominated by the prefix digest: it is verified on the way in
+and rechecked after the pass, and those two hashes are essentially the whole of
+the 44.8 ms. Section 6 gives the attribution.
 
 One file per fold, inside the unit's own directory, which the RFC's section 3
 already names:
@@ -1610,10 +1637,9 @@ comes from the handle's own parsed header. That header is read once when the han
 is opened, so a handle held across a recreation would keep reporting the retired
 file's stamp -- leaving device and inode as the only live signal, and those agree
 whenever the new file lands on the freed inode, which is the common case rather than
-a rare one. An earlier revision of this section said the savepoint FILES were exempt
-because `load` and `save` hold a freshly opened handle. That was wrong: both take
-the handle their caller passes, which is the handle `fold_session` folds with, so
-the disk read is what protects them too.
+a rare one. The savepoint files are not exempt: `load` and `save` take the handle
+their caller passes, which is the handle `fold_session` folds with, so the disk read
+is what protects them too.
 
 **The prefix digest is what makes "a consumed entry cannot change" checkable rather
 than assumed, and it is affordable because folding is not the same work as reading.**
@@ -1630,10 +1656,7 @@ way in and rechecked after the pass, which is why an otherwise idle resume spend
 the record count and hashes again -- 66.6 ms for `prefix_witness`, 20.6 ms for the
 recheck -- and lands at 197.1 ms, about what folding cold costs. The savepoint still
 wins on the reads that dominate, the ones with nothing or little to fold, but by
-roughly 1.7x to 4x rather than by an order of magnitude. An earlier revision of this
-section quoted 343.6 ms for that cold fold and called the guard 6% of it; that figure
-disagreed with section 7's own measurement of the same log, and both are replaced by
-the one run quoted there. The boundary it is handed is a RECORD count,
+roughly 1.7x to 4x rather than by an order of magnitude. The boundary it is handed is a RECORD count,
 and the FOLD resolves that count, from the last seq it read before its pass, through
 `CrewLog.raw_records_through`, which is the one place a seq is read. And the framing is
 the store's own rather than a second copy in the savepoint module, because this is the
@@ -1670,10 +1693,9 @@ folded with `since=` on every publish -- brings its savepoint forward on the nex
 that folds the prefix instead of on every read, which is the lag the section below
 already allows for.
 
-An earlier revision of this section derived the boundary as `last_seq - first_seq + 1`
-and justified it by saying the log is append-only with contiguous seqs, so a count
-names the same boundary and a damaged line still occupies its slot. That was wrong,
-and a reviewer caught it. A SUBSTITUTED damaged line does occupy its slot, but a blank
+The boundary is a RECORD count, not the entry span `last_seq - first_seq + 1`: a
+count of entries would assume a damaged line still occupies its slot, and that does
+not hold. A SUBSTITUTED damaged line does occupy its slot, but a blank
 or unparseable line that the entry reader skips is still a record to the raw walk, so
 the entry span and the record count diverge by one per such line. Handed the entry
 span, the walk stopped that many records short, and the trailing records the fold HAD
@@ -1683,8 +1705,7 @@ record per line, so only a fold that owes a write calls it; a savepoint is writt
 rarely, and the reader is handed the resolved count, which keeps verification
 decode-free.
 
-The honest cost of this, corrected after a reviewer caught the first version of this
-sentence overclaiming: a savepoint saves the FOLD work, not the parse. `iter_from`
+The honest cost of this: a savepoint saves the FOLD work, not the parse. `iter_from`
 walks `_iter_segments` and drops entries below the requested seq AFTER constructing
 them, so a resumed read that has anything to fold still decodes the prefix it skips
 folding. What the digest adds on top is a second pass over the same bytes, hashing
@@ -1763,8 +1784,8 @@ that was wrong -- `session_tree_projection.py` declares its own `CHECKPOINT_VERS
 imports neither name -- so both are gone, and a fold's version is unreachable except
 through its own fold.
 
-*This reverses an earlier decision recorded here, and the reason it was right then
-is worth keeping.* One shared number was chosen because it OVER-retires, and
+A single shared version number is the rejected alternative, and the reason it is
+tempting is worth keeping. One shared number OVER-retires, and
 over-retiring costs a refold while under-retiring serves a wrong number. That
 argument held while nothing proved the bump had happened for the fold that needed
 it: a per-fold number with a global pin can be forgotten for one fold, and the
@@ -1779,17 +1800,19 @@ ones savepoints exist for.
 
 A slot fold has the same problem the session folds had and a worse version of it: the
 warm cell above is per process and bounded by resident bytes, so a gateway restart and a
-ceiling eviction both used to re-fold every unit the slot ran under from its first
-record. Measured on a 644 MB single-segment log of 310,000 `ledger/recorded` entries, one
+ceiling eviction would each otherwise re-fold every unit the slot ran under from
+its first record. Measured on a 644 MB single-segment log of 310,000 `ledger/recorded` entries, one
 host, a fresh process per read and the file warm in the page cache: 70.2 s with no
 savepoint and all 310,000 entries parsed, 21.2 s resuming from one with nothing parsed
 below it. The read that pays this is `session_ledger.read_state`, which is how an agent
 recovers what it was working on, so without a savepoint a restart makes the first ledger
-read of each slot the slowest one -- and `#16663` is that read hitting its timeout.
+read of each slot the slowest one, and a large ledger can hit the read's timeout.
 
 The one cold fold that WRITES the savepoint costs 74.5 s on the same log, about four
-seconds over the fold that writes nothing: the write re-reads the prefix digest it is
-about to certify. That is paid once and buys every later restart the 70 s.
+seconds over the fold that writes nothing, when the witness is a digest: that write
+re-reads the prefix it is about to certify. That is paid once and buys every later restart
+the 70 s. A unit that states a cut count pays none of those four seconds, because its
+witness is the count rather than a walk (section 7.2).
 
 Same store, same kernel envelope, same `prefix_admit`, in a leaf of its own:
 
@@ -1797,7 +1820,7 @@ Same store, same kernel envelope, same `prefix_admit`, in a leaf of its own:
 <newest unit's store dir>/slot-projections/<fold>.json
 {"v", "key", "state_version", "watermark",
  "identity": {"slot", "units", "marks", "unit", "origin", "first_seq"},
- "witness": {"seq", "prefix_sha", "prefix_records"},
+ "witness": {"seq", "prefix_cuts"} or {"seq", "prefix_sha", "prefix_records"},
  "state"}
 ```
 
@@ -1808,14 +1831,15 @@ by the other's identity block for the life of the unit, which is correct and lea
 neither fold a savepoint it ever gets to use.
 
 **At the NEWEST unit**, which is the only unit a continuation lets grow and the one whose
-bytes the witness is a digest of. The file therefore inherits the `crew-log` fence and is
+bytes the witness stands for. The file therefore inherits the `crew-log` fence and is
 removed with the unit, and a slot that gains a unit -- a session reset -- finds no
 savepoint at its new newest unit and folds cold once, which is what the warm cell already
 does for a changed unit list.
 
 **The identity block carries the whole unit vector**, because the state was folded over
 all of it: the slot key, the units in fold order, and every EARLIER unit's whole mark
-(`origin`, height, `size`, `mtime_ns`) as `_folded_marks` recorded it. That is the same
+(`origin`, height, `size`, `mtime_ns`, `cuts`) as `_folded_marks` recorded it, every field
+of it because the comparison below is whole-mark. That is the same
 comparison `_continuable` makes before carrying a warm cell forward, so the savepoint is
 admitted on exactly the shapes the warm cell is. An added or removed unit, an earlier unit
 that grew, an earlier unit rewritten in place, and a unit recreated under the same id each
@@ -1833,19 +1857,22 @@ past entries the tail then folds again, or short of ones it never folds.
 
 **A warm continuation writes too**, which is where this departs from the session half. A
 session pass standing on a cached bundle writes nothing, because a bundle records no
-digest and nothing a later pass can read is evidence about the bytes below its seq. A
-slot cell CARRIES its digest (`_SlotMemo.prefix`) and `_continuable` re-checks it through
-`_prefix_holds` before carrying the cell forward, so custody of the already-folded prefix
+evidence and nothing a later pass can read says anything about the bytes below its seq. A
+slot cell CARRIES its evidence -- the newest unit's cut count in `_SlotMemo.marks`, or its
+digest in `_SlotMemo.prefix` on a unit that states no count -- and `_folded_prefix_holds`
+re-checks it before carrying the cell forward, so custody of the already-folded prefix
 survives from the pass that folded it to this one. Without this a gateway that stays up
 would leave the savepoint wherever the process first folded, and the restart it exists for
 would replay the whole gap.
 
-**Nothing writes without re-reading the bytes its state came from.** `_persist_slot_fold`
-confirms the digest at the moment of the write, which is the "after" half of the rule the
-rest of this section states, and it refuses a pass whose `reached` is not the height it
-sampled before folding -- a file that grew underneath it leaves the digest covering fewer
-bytes than the state was folded from. Both cost the savepoint and never the read, which is
-already served.
+**Nothing writes without re-reading the evidence its state came from.** `_slot_witness`
+confirms it at the moment of the write, which is the "after" half of the rule the rest of
+this section states, and `_persist_slot_fold` refuses a pass whose `reached` is not the
+height it sampled before folding -- a file that grew underneath it leaves the evidence
+covering fewer bytes than the state was folded from. Both cost the savepoint and never the
+read, which is already served. The counter is the stronger of the two here as well as the
+cheaper: a cut during the pass RAISES it, where a digest read before the pass is
+recomputed from the changed bytes by every later resume and agrees with itself.
 
 **A resumed read renders the state before trusting it.** The admission conditions read a
 state's top level, so a payload malformed BELOW it survives a tail that touches nothing
@@ -1860,8 +1887,8 @@ pins one case per refused shape above, each asserting the resumed value equals t
 from-empty value AND that the read really walked the log -- without the second assertion
 two cold folds agree trivially.
 
-**EVERY pass reads its own digest before folding, the resumed one included.** A cell's
-`prefix` has to cover the bytes that cell's own pass consumed. The savepoint's stored
+**EVERY pass reads its own evidence before folding, the resumed one included.** A cell's
+evidence has to cover the bytes that cell's own pass consumed. The savepoint's stored
 witness looks like a free substitute on the resumed path, since `prefix_admit` has just
 verified it against the live file -- but it ends at the seq the savepoint was WRITTEN at,
 and a resumed pass folds the tail above that. Carrying it breaks both halves of this
@@ -1871,20 +1898,24 @@ compares equal while the file is taller, growth is admitted, and the cell keeps 
 folded from bytes the file has replaced. And `_persist_slot_fold` writes a witness whose
 `seq` sits above its own `prefix_records`, which `prefix_admit` refuses on the next read,
 so every OTHER restart cold-folds behind a savepoint that looks healthy on disk. So
-`_resume_slot_fold` reads `_unit_prefix(units[-1])` before its pass and `_vouched` after
-it, and `save_slot` refuses a witness whose `records` is below `seq - first_seq + 1` --
-`prefix_admit`'s own inequality, asked at the write so a payload that could only ever be
-refused is never written. `SlotSavepoint` hands back no digest at all for the same
-reason: a field whose only use was that substitution is a field that invites it again.
+`_resume_slot_fold` reads `_digest_to_carry(units, marks)` before its pass and `_vouched`
+after it -- the cut count where the unit states one, in which case nothing is hashed on
+this path either, and a full digest where it does not -- and `save_slot` refuses a digest
+witness whose `records` is below `seq - first_seq + 1`, `prefix_admit`'s own inequality,
+asked at the write so a payload that could only ever be refused is never written. A cut
+witness has no span to fall short of: it says the records this unit holds are the ones they
+were, and retention taking the front off is caught by `first_seq` in the identity block.
+`SlotSavepoint` hands back no witness at all for the same reason the digest is re-read: a
+field whose only use was that substitution is a field that invites it again.
 
 **And the savepoint is RE-ADMITTED after the pass.** `load_slot` admits it against the
-file as it is then, and the window to the pass's own digest capture is not empty: the
+file as it is then, and the window to the pass's own evidence capture is not empty: the
 store's supersede repair replaces orphan chunk records at seqs the savepoint already
 consumed. The tail starts above those seqs so the fold never reads the replacement, and
-the digest captured after the repair matches the repaired file, so `_vouched` accepts it
+evidence captured after the repair describes the repaired file, so `_vouched` accepts it
 -- every check on the resuming side passes while the state came from bytes the repair
 removed. `checkpoint.slot_resume_still_verifies` asks `load_slot` again once the fold is
-done, which is the same admission rather than a second digest routine that would have to
+done, which is the same admission rather than a second routine that would have to
 agree with it, and a mismatch costs a cold fold. It is
 `resumed_prefix_still_verifies` for the slot half, separate only because the identity it
 re-compares is the unit vector rather than one log's.
@@ -1904,13 +1935,166 @@ framing decodes to a state with none of the fold's keys, which `Checkpoint.from_
 refuses, so it is retired to one cold fold rather than misread. The escaping costs about
 1 KB on a 207 KB `ledger` savepoint, against the 2 MiB cap.
 
-The remaining linear cost of a resumed read is not the fold. It is the prefix digests
-(about 4.9 s each of the 21.2 s above -- one read before the pass, one confirming it held
-across it, one re-admitting the savepoint after it) and `iter_from`'s scan to reach the
-resume seq (6.7 s), all of which walk the file without decoding it and none of which
-this savepoint can remove. The fold
+The remaining linear cost of a resumed read is not the fold. On a log settled by the
+digest it is the prefix digests (about 4.9 s each of the 21.2 s above -- one read before
+the pass, one confirming it held across it, one re-admitting the savepoint after it) and
+`iter_from`'s scan to reach the resume seq (6.7 s), all of which walk the file without
+decoding it. Section 7.2 removes the three digests on a unit that states a cut count,
+which leaves the `iter_from` scan as the one remaining linear term. The fold
 itself -- the 60 s the cold read spends -- is gone, and it is where the cost was: a
 `ledger` state holding its full event tail is copied once per entry that moves the fold.
+
+### 7.2 The cut counter -- the evidence both halves read
+
+`<unit's store dir>/.cuts`, a decimal count, seeded `0` at `create`. Not named like a
+history segment, so every segment walk and retention ignore it, and it goes with the unit.
+
+**What question it answers.** A warm continuation and a savepoint resume both have to prove
+the same thing before standing on state folded earlier: that the records that fold consumed
+are still the same bytes. The store's rule is that a committed line is never rewritten and
+two recovery paths bend it -- an unreachable chunk group is dropped and closers are appended
+from the cut, and a failed append is removed after its bytes reached the disk. Both leave a
+file that is longer with a higher newest seq, which every stat and every seq comparison
+reads as a plain append, while a record an earlier read folded now carries other bytes.
+
+**Why a count is the right evidence.** A truncation is the only thing in this store that can
+change a committed record, so counting truncations is exactly the signal. `store._truncate`
+and `store._rollback_append` -- the two functions that perform the store's only mutations,
+so no call site can forget -- bracket their bytes with it.
+
+**A SEQLOCK, so the value counts cut PHASES rather than cuts.** `_open_cut` raises it to an
+ODD number and fsyncs before the truncation; `_close_cut` raises it back to EVEN once the
+bytes have settled. `read_cuts` reports nothing at all for an odd value, so a reader that
+samples the counter anywhere inside a cut is told "not proven" instead of being handed a
+value it could match again afterwards. Two equal readings therefore bracket a window in
+which no cut COMPLETED, and a reading costs a few bytes whatever the log's size.
+
+One raise would not be enough, and this is the subtle part. It brackets "a cut STARTED since
+you last looked", which is not the question a reader is asking. A reader holds no lock, so it
+can sample the raised value between the raise and the truncation, fold the records that cut is
+about to remove, and find the SAME value again on its next read -- nothing raises it a third
+time. It would compare equal and continue over bytes the cut replaced, and
+`_persist_slot_fold` would persist that state, so the wrong fold would survive restarts.
+
+**NO VALUE IS EVER ISSUED TWICE**, which is what every reading of this counter rests on: a
+held count is believed because it could only have come from the state it was taken in. So
+`_open_cut` advances from the number ON DISK (`_read_cuts_raw`, which reports an odd value
+where `read_cuts` refuses to) rather than from what a reader would be told. An odd reading is
+a cut that was opened and never closed -- a crash, or a close whose write failed -- and it
+advances by TWO, staying odd and never landing on the even value readers held before that
+cut. Where the file says nothing at all there is no number to advance from, so the count
+starts again at an odd `time.time_ns()` (`_fresh_phase`), past any count a log reaches by
+being cut. Counting up from one instead would close on `2`, which is the second cut of every
+log and the value a savepoint written before the lost cut is most likely to hold.
+
+**The old value is retired BEFORE the new one is published, in place, and that ordering is
+what makes the counter durable on any filesystem.** `atomic_write` forces the counter's bytes
+and renames it into place, but the NAME lives in the parent directory, and a directory sync
+is not available everywhere: `fsync_dir` returns QUIETLY where the platform cannot express
+one (Windows has no directory descriptor; some filesystems reject `fsync` on a directory).
+That is the right contract for it and the wrong evidence for a cut -- a rename there is as
+durable as the filesystem feels like being, so a power loss can keep the log's truncation and
+lose the counter's new name, leaving the name pointing at the OLD inode and a reader coming
+back to the PRE-CUT count beside repaired history.
+
+So `_retire_cuts_inode` empties the existing counter in place first -- `truncate(0)` plus an
+`fsync` of the DESCRIPTOR, which changes contents rather than any directory entry, so it is
+as real as the device is and owes the directory nothing. An empty file is not a decimal
+number, so `read_cuts` answers nothing for it. Both `_write_cuts` and `_unprove_cuts` go
+through it, which means a lost rename and a lost unlink both come back to a counter that
+proves nothing instead of one that proves the wrong thing. `_sync_cuts_dir` still runs and is
+still required not to ERROR -- an `EIO` says the device refused a write, and refusing the cut
+over that is cheap -- but its SILENCE is no longer load-bearing and nothing reads it as
+proof. A cut therefore SURVIVES a directory that cannot be synced at all, rather than being
+refused over it.
+
+**One caller has nothing else holding it up, and it uses the strict spelling.** When the
+emptying itself FAILS, `_unprove_cuts` has only an unlink left -- a directory change, and the
+sole thing between the cut and a reader holding the count it removes. There the answer comes
+from `_cuts_dir_forced`, which performs the directory sync itself and reports only a sync it
+actually did, so a filesystem that cannot express one refuses the cut instead of passing it.
+The lenient spelling stays everywhere else, because a cut refused for a missing directory
+sync would refuse every cut such a platform ever makes.
+
+The two ends are deliberately asymmetric. `_open_cut` must not be skipped: if it can neither
+raise the counter nor retire it (`_unprove_cuts`, which unlinks the file or empties it in
+place, needing no space on a full disk), it RAISES `CutUnaccounted` (`cut_unaccounted`)
+and the cut does not happen -- leaving the file as it was, which the next open repairs
+again. `_unprove_cuts`
+reports success only for a retirement it PERFORMED and made durable, never from reading the
+counter afterwards: `read_cuts` answers nothing for an UNREADABLE counter as readily as for
+an absent one, so a counter another process holds open -- a Windows sharing lock denies the
+replace, the unlink and the open together -- would certify its own retirement with its old
+value still on disk, and come back the moment the handle closed. Cutting while a
+reader can still read a count that certifies the removed bytes is a wrong answer that
+persists; an uncut file is recoverable. `_close_cut` is best-effort and silent, because
+failing is already safe: a counter left odd reads as a cut in flight forever, which every
+reader answers with the digest or a fold from empty. That is also what a crash between the
+truncation and the close leaves behind, so the failure and the crash get one answer.
+
+**A refused cut is RETRYABLE, on every path, which is why `CutUnaccounted` is an `OSError`
+and not a `CrewLogError`.** Every cut here is a recovery the caller is doing on its way to
+something else -- the torn-tail truncation an `append` performs before it writes, the same
+truncation in `CrewLog.open`, the unreachable-group drop in the interrupted-turn repair --
+so the refusal surfaces as that caller's failure, carrying that caller's entry with it.
+`writer._is_refusal` reads a `CrewLogError` as "declined on its own merits, retrying is
+pointless" and the write-behind drops the entry; the causes that refuse a cut are storage
+faults that CLEAR (a full disk, a read-only remount, another process holding `.cuts` open),
+so reporting one that way would permanently lose a valid event a later retry would have
+written. The truncation is refused either way; what changes is only what the caller is told
+about trying again.
+
+**The ROLLBACK path says something stronger: an unknown outcome.** The rollback's own bytes
+are already in the file when `_open_cut` declines, so `_write_then_sync` reports
+`IndeterminateAppend` -- not "nothing happened" but "something may have". The residue is an
+unterminated tail the next `open` truncates, and the entry is still worth writing again.
+
+Counting the cuts was chosen over never reusing a seq. A highest-ever-issued number stops a
+reused seq being misread as new, but it does not tell the reader that records it already
+folded were REMOVED: after the group-drop repair the reader resumes above a chunk the file no
+longer holds and keeps serving it, so a continued fold stops equalling a fold from empty. The
+property needed is not "seqs are unique" but "nothing I folded has changed".
+
+**Three outcomes, on both halves.** `_folded_prefix_holds` for the warm cell and
+`checkpoint._cuts_admit` for the savepoint read it the same way. Equal counts continue with
+nothing hashed. A moved count folds cold. An absent, unreadable or ODD count is NOT PROVEN
+rather than zero, and falls back to the digest -- reading absent as zero would be the
+dangerous shortcut, because a counter deleted after a cut would then compare equal across it.
+
+"Unreadable" includes TOO LONG TO CONVERT. The counter is a plain file anything on the host
+can write, and CPython refuses to turn a decimal string past its integer-conversion limit
+(4300 digits by default) into an `int` -- while `str.isdecimal` says yes to every one of
+those digits, so the guard in front of the conversion passes it through. `read_cuts` catches
+that and answers nothing, because a `ValueError` would surface in a reader whose only
+question was whether a cut had happened and fail the whole fold.
+
+**Upgrade story.** Nothing migrates and nothing is rewritten. A log from before the counter
+carries none, which reads as not proven, so it keeps being settled by the digest exactly as
+section 7 describes; its first cut creates the counter and every read after that is cheap. A
+log created from now on is cheap from its first entry.
+
+**What it narrows, accepted.** For a unit with a counter the proof is "nothing the store does
+changed these records", not "these records hash the same". So a same-length in-place rewrite
+that is not a cut -- a hand-edit, a file-sync tool, corruption -- keeps the count and is
+served warm, where the digest would have caught it. The store performs no such mutation and
+nothing else in it defends against one; the alternative is paying the digest on every read.
+`test_crew_log_cut_counter.py` asserts that divergence directly, so a build that reinstates
+the hash fails there rather than changing the trade silently. Away from a cut the counter is
+an optimisation token and a write fault costs only speed -- `_seed_cuts` at `create` is silent
+for that reason, since there is nothing to protect yet and a create that refused over it would
+refuse a good log.
+
+**What it does not fix on the cold path.** A warm continuation now carries a resume point
+(`ResumePoint`, held as `_SlotMemo.resume`) naming the byte offset in the newest unit's
+segment where its fold stopped, vouched by that unit's cut count and the seq at that
+offset. `CrewLog.iter_from`, given a point it can confirm, opens the segment at that
+record and decodes only what follows, so a warm continuation no longer walks the prefix
+below its resume seq. The point is dropped and the full walk restored when the cut count
+moved, the segment was retention-dropped, the offset no longer frames the expected seq, or
+the point's seq disagrees with the one reached. So `CrewLog.iter_from` decodes every
+record of the segment and discards those below the seq it was asked for -- a read of a
+20,000-entry log decoding 20,020 records to yield one -- only on the cold or
+first-continuation path, not on a steady-state warm poll.
 
 ## 8. The pull-request holders -- the second fold across logs
 
@@ -2224,7 +2408,8 @@ to share one instance between callers.
   state beside the log it came from; this scan's state is a per-segment read
   position and reference set held in memory and keyed by session, which is
   already the shape such a file would carry, so persistence stays additive.
-- **Crew-kind folds.** No crew writer exists.
+- **Crew-kind folds.** The crew kind has writers (`on_crew_dispatch`,
+  `on_crew_report`), but no crew-kind fold reads their entries yet.
 - **Subagent lineage and fork pointers.** A `subagent/spawned` entry's `ref` is
   resolved on the page like any other citation. The session tree (section 6)
   folds the `session_create` edge only: a `spawn_run` subagent has no session

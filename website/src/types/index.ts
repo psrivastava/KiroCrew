@@ -879,6 +879,10 @@ export interface McpServer {
    *  alongside `authChallenge`; absent is "unknown", which is why the sign-in
    *  wording is gated on an explicit `false`. */
   authGrantPresent?: boolean
+  /** The owner added this remote server from the dashboard, at this url, so the
+   *  table may offer the in-place sign-in on it. Absent or false for a server
+   *  an agent, a session or a hand edit added. */
+  ownerSignIn?: boolean
   /** Spec-declared temp keys the probe refused (path already redacted); the
    *  probe ran with the managed temp instead. Absent when nothing was refused. */
   tempRefusals?: McpTempRefusal[]
@@ -987,6 +991,14 @@ export interface McpSessionReport {
    * gateway from before the guard shipped sends no such key.
    */
   unresolved_refs?: string[]
+  /**
+   * Servers that started but gave this session no tools — usually a tool name
+   * that clashes with another server's, so the backend kept only one. Optional
+   * because an older gateway sends no such key.
+   */
+  no_tools?: string[]
+  /** How many more such servers there were than `no_tools` lists (bucket cap). */
+  no_tools_omitted?: number
   /** Reported initialized. */
   ready: string[]
   /** Reported a startup failure. */
@@ -995,6 +1007,12 @@ export interface McpSessionReport {
   awaiting_auth: string[]
   /** Server name -> its redacted failure reason, when one was reported. */
   failures: Record<string, string>
+  /**
+   * Failed servers whose reason reads as a credential they did not have when
+   * they started: a new session loads them once the credential exists.
+   * Optional because an older gateway sends no such key.
+   */
+  restart_to_load?: string[]
 }
 
 export interface SessionLink {
@@ -1155,9 +1173,6 @@ export interface ChatSlot {
   row_identity?: string
   /** Provider session identity when it differs from the dashboard slot key. */
   linked_session_key?: string
-  /** The transcript filename stem the server resolved for this slot: the key the
-   *  Older sessions list gives the same session, sent verbatim to reopen it. */
-  history_key?: string
   /** Prompts held for a later turn on this slot. */
   queue_depth?: number
   key: string; title?: string; messages: number; running: boolean; stopping?: boolean; pending_approval?: boolean; created?: string; last_ts?: string; last_turn_ts?: string; last_message?: string; agent?: string; model?: string; reasoning_effort?: string; mode?: string; surface?: string; workspace?: string; trust?: boolean; trust_scope?: string; trust_reads?: boolean; folder_id?: string; pinned?: boolean; tags?: string[]; tags_revision?: string; links?: SessionLink[]; slack_linked?: boolean; slack_channel?: string; slack_thread_ts?: string; color_index?: number | null; color_hex?: string | null; memory_mode?: 'persistent' | 'incognito' | 'temporary'; project?: string; forked_from?: string | null; source_links?: { provider: SourceProviderId; number: number; url: string; label?: string; repo?: string; ci?: 'running' | 'passed' | 'failed' | null; state?: 'open' | 'draft' | 'merged' | 'closed'; mergeable?: string; mergeStateStatus?: string; kind?: 'change' | 'issue'; identity?: string }[]; source_links_total?: number
@@ -1180,6 +1195,20 @@ export interface ChatSlot {
    * before nesting a row that has no session-tree node yet — a child between
    * `session_create` and its first turn, which has no crew log to fold. */
   lineage_minted?: boolean
+  /** The user-owned "mute sessions it opens" rule. When true on a creating
+   * session, every session it opens -- and anything those open, down the
+   * `created_by` chain -- is muted for attention: no turn-done chime,
+   * background-finished toast or unread badge, from the first turn. The
+   * creator keeps all of its own signals, and a tool-approval prompt from a
+   * muted session still surfaces. Set only by the user (never an agent);
+   * durable, so it survives a gateway restart. */
+  mutes_opened?: boolean
+  /** The user-owned per-row mute of THIS session, set from its own kebab menu.
+   * When true: no turn-done chime, background-finished toast or unread badge.
+   * A completion that pauses
+   * for the user, a terminal error and a tool-approval prompt still surface.
+   * Durable, like `pinned`. */
+  muted?: boolean
   /** The session tree's parent edge for this slot, attached to every row by
    * `_attach_slot_parents`: `{slot, key}`, or null when this slot has no parent.
    * `slot` is the parent's own citation and `key` names the parent's row IN THIS
@@ -1189,8 +1218,13 @@ export interface ChatSlot {
    * Distinct from `created_by`, and both are needed to know whether a slot is a
    * root: `created_by` is the birth-time edge, written once, while this one
    * carries the edge an adopt or release moves later. An adopted session has an
-   * empty `created_by` and a parent here. */
-  parent?: { slot: string; key: string | null } | null
+   * empty `created_by` and a parent here.
+   *
+   * `ancestor` is present and true only when `key` names an open ANCESTOR instead of
+   * the creator in `slot`, which the backend resolves when the creator itself has
+   * closed: the row nests where the run is owned and keeps citing its closed
+   * creator. */
+  parent?: { slot: string; key: string | null; ancestor?: boolean } | null
   /** Artifact companion binding: slug of the artifact this slot is a companion
    * chat for. Set at slot create and persisted in the history meta line, so the
    * binding survives a gateway restart and a History-page resume. */
@@ -1485,6 +1519,10 @@ export interface ChatMessage {
 
 export interface SubagentActivity {
   id: string; task: string; agent: string
+  /** The wave this agent belongs to, absent for a solo spawn. Folded from the
+   *  `batch_id` the gateway stamps on every spawn/done/snapshot frame; shown as
+   *  a short batch chip in the Subagents panel so wave siblings group (#759). */
+  batchId?: string
   /** Model the live session actually resolved to serve, '' when unknown. Folded
    *  from the `model` field on the `subagent_spawn`/`subagent_done`/snapshot WS
    *  frames; shown beside the agent pill in the Subagents panel so a model-pinned
@@ -1592,6 +1630,10 @@ export interface Notification {
   // RFC Phase 4: inline actions, stacking, dashboard-internal deep link
   group_key?: string; url?: string
   actions?: { id: string; label: string; url?: string }[]
+  /** The crewmate that published the note, stamped by the gateway from the
+   *  publishing session. Persisted rows are untrusted: read it through
+   *  `noteMember`, which checks the shape. */
+  member?: { slug: string; name: string }
 }
 
 /** One row from GET /api/notifications/channels. */
@@ -1777,7 +1819,14 @@ export interface RemoteArtifact {
 export interface Artifact {
   slug: string
   name: string
-  kind: 'widget' | 'html' | 'markdown' | 'svg' | 'json' | 'text' | 'webapp' | 'image'
+  /** `dashboard` is a CREWMATE'S DASHBOARD PACKAGE -- the `bound_to`, `model`,
+   *  `view` and `theme` document `artifact_store/dashboard_package.py` validates.
+   *  It is in this union because the Artifacts library lists and versions it like
+   *  any other record, which is where its history and its revert come from, and
+   *  deliberately NOT in any picker: the backend keeps it out of
+   *  `USER_SELECTABLE_KINDS` so nobody can mint one by hand, and a kind offered in
+   *  the UI that the server refuses is a dead menu entry. */
+  kind: 'widget' | 'html' | 'markdown' | 'svg' | 'json' | 'text' | 'webapp' | 'image' | 'dashboard'
   /** Provenance/origin bucket. Carries either a legacy bucket
    * (chat|cron|subagent|manual|import) or the actual session origin
    * (dashboard|slack|cli|task-runner|unknown), so treated as an open string. */
@@ -1793,6 +1842,9 @@ export interface Artifact {
   created_at: string
   updated_at: string
   content?: string
+  /** Opaque optimistic-concurrency token for `content`; echo it back as
+   * `expected_token` on a content save. Absent for live file-backed artifacts. */
+  content_token?: string
   /** Original source path for file-backed artifacts (live pointer). */
   source_path?: string
   /** True when the live state differs from the latest numbered snapshot.

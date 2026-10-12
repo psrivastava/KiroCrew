@@ -74,7 +74,6 @@ function props(over: Partial<Props> = {}): Props {
     currentSlot: { key: 'slot-a', title: 'Release notes' } as ChatSlot,
     sidebarAutoHidden: { current: true },
     openSidebar: vi.fn(),
-    menuAutoTitleInFlight: { current: false },
     effectiveMode: 'normal',
     sidebarOnScreen: false,
     activePoppedOut: false,
@@ -117,6 +116,13 @@ describe('leading cell', () => {
   it('marks a temporary session', () => {
     render(<MobileTopBar {...props({ currentSlot: { key: 'slot-a', memory_mode: 'temporary' } as ChatSlot })} />)
     expect(screen.getByLabelText(i18nT('pages.chatPage.temporary_no_memory_reads_or_writes'))).toBeInTheDocument()
+  })
+
+  it('marks a pinned session at rest and drops the mark once unpinned', () => {
+    const { rerender } = render(<MobileTopBar {...props({ currentSlot: { key: 'slot-a', pinned: true } as ChatSlot })} />)
+    expect(screen.getByLabelText(i18nT('pages.chatSidebar.pinned'))).toBeInTheDocument()
+    rerender(<MobileTopBar {...props({ currentSlot: { key: 'slot-a', pinned: false } as ChatSlot })} />)
+    expect(screen.queryByLabelText(i18nT('pages.chatSidebar.pinned'))).toBeNull()
   })
 
   it('stands the title down in split view and the toggle down in a chat embed', () => {
@@ -171,7 +177,6 @@ describe('session menu actions', () => {
     expect(p.setActionError).toHaveBeenCalledWith(null)
     await act(async () => { resolve({ title: 'Shipping plan' }) })
     expect(p.dispatch).toHaveBeenCalledWith(sseSlotTitle({ key: 'slot-a', title: 'Shipping plan' }))
-    expect(p.menuAutoTitleInFlight.current).toBe(false)
   })
 
   it('auto-title narrates a failure through the page, titled', async () => {
@@ -181,7 +186,6 @@ describe('session menu actions', () => {
     fireEvent.click(screen.getByText('auto-title'))
     await waitFor(() => expect(p.showActionError).toHaveBeenCalledWith('model offline', i18nT('pages.chatPage.could_not_generate_title')))
     expect(p.dispatch).not.toHaveBeenCalled()
-    expect(p.menuAutoTitleInFlight.current).toBe(false)
   })
 
   it('the open title editor drives the page state', () => {

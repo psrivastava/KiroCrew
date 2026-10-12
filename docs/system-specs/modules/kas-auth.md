@@ -226,6 +226,23 @@ cross-process lock** (mirror kiro-cli's `refresh_coordinator`) so concurrent ses
 don't stampede the refresh endpoint; re-read the store inside the lock and skip the
 HTTP call if a peer already refreshed.
 
+Two callers renew a stored identity, both through `auth/refresh.ensure_fresh`, so
+the lock above orders them: the engine's `_kiro/auth/getAccessToken` callback
+(`KasAuthProvider.current`), and a gateway tick
+(`dashboard/sign_in_refresher.run_sign_in_refresher`, started beside the
+stale-asset watchdog) that sleeps until the highest-priority stored identity
+enters the margin and renews it then, so the stored expiry the sign-in card and
+`kirocrew doctor` read does not freeze while no agent turn runs. The
+tick never renews a token outside the margin, does not retry while the
+refresh-rejected marker stands (a new sign-in clears it), backs off from 30s to
+5min on a transient failure, and does not import `kiro_crew.auth` until the vault
+file exists. It renews while the gateway is idle too, so a refused renewal
+surfaces without waiting for a chat turn. Each renewal request is capped at
+8s, and gateway shutdown waits up to 9s (alongside, and inside, the graceful
+shutdown budget) for an in-flight renewal to finish
+(`drain_sign_in_refresher`), so a rotated refresh token is persisted rather
+than consumed at the issuer and lost to the hard exit.
+
 ## Storage
 
 Context: kiro-cli does **not** encrypt its tokens — they live plaintext in a SQLite
@@ -251,7 +268,11 @@ Defense in depth: the whole `kas` directory (vault included) is a keystone leaf 
 `security._CREW_SECRET_LEAVES`, so the agent can neither read nor write its own
 credential store — the denylist blocks the tools, and encryption at rest means a
 ciphertext-only leak (backup, sync, accidental read) discloses nothing without the
-key file. Do not weaken either layer. The threat model is honest about its limits:
+key file. The directory is also an OS-level sandbox mask, and because the store
+creates it on the first sign-in, `kas` is in
+`sandbox._CREW_PRECREATE_HIDDEN_DIR_LEAVES`: it exists (empty, 0700) before every
+Linux namespace spawn, so a sandbox started before that sign-in still has it masked.
+Do not weaken either layer. The threat model is honest about its limits:
 a same-UID attacker who can read the key file can decrypt — the vault defends
 against agent reads and ciphertext-only leaks, not same-UID malware (same position
 as sops/age key files and Ansible vault-password files).

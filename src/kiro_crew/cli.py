@@ -20,10 +20,14 @@ from __future__ import annotations
 
 # Ensure SSL certs are found before any library caches its SSL context.
 # The ``kirocrew`` entry-point (console_scripts) bypasses ``__main__.py``,
-# so we must run this here as well.
+# so we must run this here as well. The inherited llama.cpp path is removed
+# before any thread or child process exists because a concurrent environment
+# snapshot can observe a removal between enumerating and reading the key.
+from kiro_crew._llama_lib_path import drop_inherited_lib_path
 from kiro_crew._ssl_compat import _ensure_ssl_certs
 
 _ensure_ssl_certs()
+drop_inherited_lib_path()
 
 import argparse
 import asyncio
@@ -945,8 +949,8 @@ _LOG_FATAL_ERRNOS = frozenset({errno.ENOSYS, errno.EPERM, errno.EACCES, errno.ER
 _LOG_ERROR_STREAK_LIMIT = 3
 
 
-class _OwnerOnlyRotatingFileHandler(RotatingFileHandler):
-    """RotatingFileHandler whose log files are created ``0600``.
+def _open_owner_only(handler: logging.FileHandler):  # type: ignore[no-untyped-def]
+    """Open *handler*'s log file the way ``FileHandler._open`` does, but ``0600``.
 
     The stdlib opens the log with the builtin ``open``, so ``gateway.log`` -- and
     the fresh file every rollover creates -- would come out at the umask default
@@ -955,18 +959,72 @@ class _OwnerOnlyRotatingFileHandler(RotatingFileHandler):
     owner-only policy. Only the creation mode changes; an existing file keeps its
     mode (the startup sweep tightens one an older version created).
     """
+    # The stdlib's own handle on ``open`` (it survives interpreter teardown),
+    # read through getattr because typeshed does not declare it.
+    open_func = getattr(handler, "_builtin_open", open)
+    return open_func(
+        handler.baseFilename,
+        handler.mode,
+        encoding=handler.encoding,
+        errors=handler.errors,
+        opener=owner_only_opener,
+    )
+
+
+class _OwnerOnlyRotatingFileHandler(RotatingFileHandler):
+    """RotatingFileHandler whose log files are created ``0600`` (see
+    :func:`_open_owner_only`)."""
 
     def _open(self):  # type: ignore[no-untyped-def]
-        # The stdlib's own handle on ``open`` (it survives interpreter teardown),
-        # read through getattr because typeshed does not declare it.
-        open_func = getattr(self, "_builtin_open", open)
-        return open_func(
-            self.baseFilename,
-            self.mode,
-            encoding=self.encoding,
-            errors=self.errors,
-            opener=owner_only_opener,
-        )
+        return _open_owner_only(self)
+
+
+class _AppendOnlyLogFileHandler(logging.FileHandler):
+    """Appends each record to ``gateway.log`` and closes the file again.
+
+    Every process that is not the gateway (the ``mcp-*`` stdio servers,
+    ``kirocrew chat``, short CLI verbs) writes through this handler. It never
+    rotates and holds no open handle between records. Windows refuses to rename
+    a file while any other process has it open, so a child that kept its own
+    handle on ``gateway.log`` for its whole lifetime made every one of the
+    gateway's size rollovers fail, and the gateway's file log then dropped
+    every later record until restart. The gateway is the only rotator, and the
+    only window in which a child can block a rename is the write of one record.
+
+    The constructor opens the file once and closes it, so a log path the
+    process may not write (a sandbox deny) still raises at setup, where
+    ``_setup_cli_logging`` falls back to console-only logging.
+    """
+
+    def __init__(self, filename: Path, encoding: str = "utf-8") -> None:
+        super().__init__(filename, mode="a", encoding=encoding)
+        self._close_stream()
+
+    def _open(self):  # type: ignore[no-untyped-def]
+        return _open_owner_only(self)
+
+    def _close_stream(self) -> None:
+        stream, self.stream = self.stream, None  # type: ignore[assignment]
+        if stream is not None:
+            try:
+                stream.close()
+            except OSError:
+                pass  # the record was already written or reported
+
+    def emit(self, record: logging.LogRecord) -> None:
+        # ``Handler.handle`` holds the handler lock around emit, so the
+        # open/write/close below is atomic with respect to this handler.
+        # ``FileHandler.emit`` opens the file outside its own error handling,
+        # so a failed open is routed to ``handleError`` here instead of
+        # raising into the code that logged.
+        try:
+            super().emit(record)
+        except RecursionError:
+            raise
+        except Exception:
+            self.handleError(record)
+        finally:
+            self._close_stream()
 
 
 class _FdTrackingRotatingFileHandler(_OwnerOnlyRotatingFileHandler):
@@ -1154,6 +1212,10 @@ def _setup_cli_logging(command: str | None, verbose: int) -> None:
     handler and the queue handler carry no level of their own, so a runtime
     ``agent.log_level`` change (``handlers/updates.py::apply_log_level``) that
     moves the logger reaches ``gateway.log`` with nothing else to update.
+
+    Only the ``gateway`` command rotates ``gateway.log``. Every other process
+    writes through ``_AppendOnlyLogFileHandler``, which never rotates and holds
+    no handle between records, so it cannot block the gateway's rename on Windows.
     """
     if verbose >= 2:
         level = logging.DEBUG
@@ -1200,20 +1262,30 @@ def _setup_cli_logging(command: str | None, verbose: int) -> None:
     # swallows it, but it spams "--- Logging error ---" tracebacks and drops the
     # line). ensure_utf8_console() only fixes the console streams, not this file
     # handler.
+    boot_rotation_error: OSError | None = None
     if command == "gateway":
         prev_log = log_file.with_suffix(".log.prev")
         if log_file.exists() and log_file.stat().st_size > 0:
             try:
                 log_file.replace(prev_log)
-            except OSError:
-                pass  # race or permission — keep going
+            except OSError as exc:
+                # Keep going on the old file; reported once the handler exists.
+                boot_rotation_error = exc
         if detached:
             _redirect_fds_to(log_file)
     # Detached mode uses the fd-tracking subclass: a size-based rollover
     # renames gateway.log, and without re-pointing, the redirected raw fds
     # would follow the renamed inode through .1 → .2 → .3 → unlink, losing
     # later raw stderr from all retained logs.
-    handler_cls = _FdTrackingRotatingFileHandler if detached else _OwnerOnlyRotatingFileHandler
+    #
+    # Only the gateway rotates gateway.log. Every other process appends one
+    # record at a time and holds no handle in between, because on Windows a
+    # handle held by any other process makes the gateway's rename fail.
+    rotates = detached or command == "gateway"
+    if detached:
+        rotating_cls: type[RotatingFileHandler] = _FdTrackingRotatingFileHandler
+    else:
+        rotating_cls = _OwnerOnlyRotatingFileHandler
     # Seatbelt/sandbox children (e.g. ``kirocrew mcp-core`` under a sandboxed
     # agent profile) inherit a deny on ``gateway.log``. For those, opening the
     # file handler must not abort the process: the console handler
@@ -1226,7 +1298,11 @@ def _setup_cli_logging(command: str | None, verbose: int) -> None:
     # soft-failing here would boot a long-lived gateway with no persistent log
     # AND no destination for the warning saying so. Let the OSError propagate.
     try:
-        fh = handler_cls(log_file, maxBytes=2 * 1024 * 1024, backupCount=3, encoding="utf-8")
+        fh: logging.FileHandler
+        if rotates:
+            fh = rotating_cls(log_file, maxBytes=2 * 1024 * 1024, backupCount=3, encoding="utf-8")
+        else:
+            fh = _AppendOnlyLogFileHandler(log_file, encoding="utf-8")
     except OSError as exc:
         if detached:
             raise
@@ -1300,6 +1376,12 @@ def _setup_cli_logging(command: str | None, verbose: int) -> None:
     else:
         target_logger.addHandler(fh)
 
+    if boot_rotation_error is not None:
+        logging.getLogger("kiro_crew").warning(
+            "could not move %s aside at boot (%s); appending to the previous run's log",
+            log_file,
+            boot_rotation_error,
+        )
     # Install secret redaction filter — scrubs Bearer tokens from all kiro_crew
     # log output before it reaches any handler. The filter also accepts literal
     # secret values to redact, but none are passed here: wiring resolved vault
@@ -1809,6 +1891,16 @@ Examples:
         default="",
         help='Tool approval mode ("auto" to auto-approve all tools)',
     )
+    cron_add.add_argument(
+        "--managed-by",
+        dest="managed_by",
+        default=None,
+        metavar="KEY",
+        help="Install-time owner key for an external installer (e.g. "
+        "'mysystem:owner/asset-name'). Unique across the store: a second add with the "
+        "same key is refused. Re-install with 'cron remove --managed-by KEY' and then "
+        "add again.",
+    )
     cron_update = cron_sub.add_parser("update", help="Update a cron job")
     cron_update.add_argument("job_id", help="Job ID to update")
     cron_update.add_argument("--name", help="New job name")
@@ -1837,7 +1929,15 @@ Examples:
         help='Tool approval mode ("auto" to auto-approve, "default" to reset)',
     )
     cron_rm = cron_sub.add_parser("remove", help="Remove a cron job")
-    cron_rm.add_argument("job_id", help="Job ID to remove")
+    cron_rm_target = cron_rm.add_mutually_exclusive_group(required=True)
+    cron_rm_target.add_argument("job_id", nargs="?", default=None, help="Job ID to remove")
+    cron_rm_target.add_argument(
+        "--managed-by",
+        dest="managed_by",
+        default=None,
+        metavar="KEY",
+        help="Remove the job registered with 'cron add --managed-by KEY'",
+    )
     cron_pause = cron_sub.add_parser("pause", help="Pause a cron job")
     cron_pause.add_argument("job_id", help="Job ID to pause")
     cron_resume = cron_sub.add_parser("resume", help="Resume a cron job")
@@ -2456,6 +2556,13 @@ Examples:
         ),
     )
 
+    # gateway-pid — read-only: print the PID holding this home's gateway.lock as
+    # JSON, resolved through the same socket-independent lock_holder oracle that
+    # `stop --expect-pid`/`restart` use. The desktop supervisor calls this when
+    # its listener snapshot cannot name a draining gateway (socket released, lock
+    # still held) so recovery can wait for that pid instead of giving up.
+    cli_help.add_command(sub, "gateway-pid")
+
     # service — install/uninstall/status as a system-level systemd unit (Linux,
     # /etc/systemd/system/, requires sudo) or launchd LaunchAgent (macOS,
     # ~/Library/LaunchAgents/, no sudo) so the gateway survives SSH disconnect,
@@ -2518,6 +2625,8 @@ Examples:
   kirocrew cloud launch --size power     # non-interactive size
   kirocrew cloud launch --new            # create a separate new instance
   kirocrew cloud launch --subnet subnet-0abc…  # pin the launch to an exact subnet
+  kirocrew cloud launch --extra-packages gh,jq # also install these dnf packages
+  kirocrew cloud launch --ami ami-0abc…  # launch from your own AL2023-based image
   kirocrew cloud list                    # list your cloud instances
   kirocrew cloud connect                 # reopen the dashboard over SSM
   kirocrew cloud stop | start            # pause / resume (save cost)
@@ -2580,6 +2689,20 @@ Examples:
         "auto-discovery — required to target a dedicated/private-subnet VPC "
         "when a default VPC exists. The subnet must have internet egress "
         "(NAT or IGW route).",
+    )
+    _c_launch.add_argument(
+        "--ami",
+        default="",
+        metavar="AMI_ID",
+        help="Launch from this AMI (ami-xxxx) instead of the latest Amazon Linux 2023 "
+        "image. It must match the size tier's architecture and be AL2023-compatible.",
+    )
+    _c_launch.add_argument(
+        "--extra-packages",
+        default="",
+        metavar="PKGS",
+        help='Extra dnf packages to install on the box, comma-separated (e.g. "gh,jq"). '
+        "A package dnf cannot find is skipped with a warning in the setup log.",
     )
     _c_launch.add_argument("-y", "--yes", action="store_true", help="Accept defaults, no prompts")
     _c_launch.add_argument(
@@ -2761,6 +2884,9 @@ Examples:
     # mcp-panel (MCP server -- an agent publishes its own dashboard panel).
     # Mounted only for an agent whose spec grants the opt-in set.
     sub.add_parser("mcp-panel")
+    # mcp-guide (MCP server -- the always-on platform guide server; today it
+    # carries ``rename_self``, a crewmate renaming itself in its own chat).
+    sub.add_parser("mcp-guide")
 
     # Builtin app MCP servers (spawned by the agent backend, not user-facing).
     # Only builtins that actually ship an ``mcp_server`` module get a verb —
@@ -2986,6 +3112,16 @@ Examples:
         action="store_true",
         help="Cancel a staged memory restore without changing active memory",
     )
+    mem_create = mem_sub.add_parser(
+        "create-store",
+        help="Create a declared memory store's directory (use never creates it)",
+        description=(
+            "Create the directory of a named V1 memory store declared in config.json "
+            "memory_stores. A store is never created on first use, so a deleted store "
+            "stays missing until this is run. Member stores are created with their member."
+        ),
+    )
+    mem_create.add_argument("name", help="The declared store's name")
     mem_carve = mem_sub.add_parser(
         "carve", help="Filter or count a crew store's memory by its carve facets"
     )
@@ -3047,7 +3183,14 @@ Examples:
     )
     agent_create.add_argument("--display-name", default="", help="Label the dashboard shows")
     agent_create.add_argument("--kiro-agent", default="kirocrew", help="Kiro agent name")
-    agent_create.add_argument("--workspace", default="default", help="Workspace name")
+    agent_create.add_argument(
+        "--workspace",
+        default="",
+        help=(
+            "Share an existing workspace by name; omitted, the member gets a workspace "
+            "of its own (member-<slug>)"
+        ),
+    )
     agent_create.add_argument(
         "--memory-store",
         default="default",
@@ -3057,6 +3200,10 @@ Examples:
     agent_update.add_argument("name", help="Agent name to update")
     agent_update.add_argument("--kiro-agent", help="New kiro agent name")
     agent_update.add_argument("--workspace", help="New workspace name")
+    agent_update.add_argument(
+        "--display-name",
+        help='New label the dashboard shows; "" clears it back to the agent name',
+    )
     agent_update.add_argument(
         "--memory-store",
         help=(
@@ -3251,6 +3398,15 @@ env var overrides it.
     cli_help.hide_internal_commands(sub)
 
     args = parser.parse_args()
+
+    # The mcp-* stdio servers run one per agent session, so a gateway hosts
+    # dozens. If any import reaches numpy, OpenBLAS/OpenMP start one spinning
+    # thread per core. Cap both at one before anything below imports the
+    # server; an operator's own value wins. Set in-process rather than in the
+    # managed MCP spec env so every spec writer and builtin app server gets it.
+    if (args.command or "").startswith("mcp-"):
+        for _var in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS"):
+            os.environ.setdefault(_var, "1")
 
     # MCP servers and CLI commands hold their managed-venv tree for the process
     # lifetime, so another process's update cannot prune it underneath them.
@@ -3564,6 +3720,10 @@ env var overrides it.
         # Lazily imported like mcp-dashboard above: a default-off optional
         # subsystem must not be imported just to start the gateway.
         importlib.import_module("kiro_crew.mcp_panel").run_mcp_server()
+    elif args.command == "mcp-guide":
+        # Lazily imported for the same reason: an opt-in server must not be
+        # imported just to start the gateway.
+        importlib.import_module("kiro_crew.mcp_guide").run_mcp_server()
     elif args.command.startswith("mcp-") and args.command[4:] in _BUILTIN_NAMES:
         # Registration gates this verb on _builtin_mcp_server_available, and
         # _run_app_mcp_server is the ONE dispatch-time spelling of "import the
@@ -3637,6 +3797,10 @@ env var overrides it.
         from kiro_crew.cli_server import _restart
 
         _restart(args.port)
+    elif args.command == "gateway-pid":
+        from kiro_crew.cli_server import _gateway_pid
+
+        _gateway_pid()
     elif args.command == "service":
         from kiro_crew.cli_server import _service_cmd
 

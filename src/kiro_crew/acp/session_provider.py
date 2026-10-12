@@ -565,6 +565,9 @@ class AcpSessionProvider(LLMProvider):
 
     @property
     def native_context_documents(self) -> dict[str, str]:
+        fit = getattr(self._handle, "native_context_documents_fit", None)
+        if fit is not None and not fit():
+            return {}
         return dict(self._handle.native_context_documents)
 
     @property
@@ -1030,6 +1033,16 @@ class AcpSessionProvider(LLMProvider):
         return backend in ACP_BACKENDS_COMPACT or backend in ACP_BACKENDS_HARNESS_MANAGED
 
     @property
+    def harness_managed_compaction_backend(self) -> str | None:
+        """Same membership answer as
+        ``AcpProvider.harness_managed_compaction_backend``, for the bare
+        shared-subagent shape handed out without the wrapper."""
+        backend = self.backend
+        if not isinstance(backend, str) or backend not in ACP_BACKENDS_HARNESS_MANAGED:
+            return None
+        return backend
+
+    @property
     def compaction_unmanaged_backend(self) -> str | None:
         """Backend id when neither Crew nor the harness compacts, else ``None``.
 
@@ -1131,6 +1144,10 @@ class AcpSessionProvider(LLMProvider):
         """Execute a kiro slash command. Returns response text."""
         return await self._guarded(self._handle.send_command(command, args))
 
+    async def command_result(self, command: str) -> dict[str, Any]:
+        """Execute a native kiro command and return its structured result."""
+        return await self._guarded(self._handle.command_result(command))
+
     async def set_config_option(self, config_id: str, value: str) -> None:
         """Set a session config option (e.g. effort level)."""
         await self._guarded(self._handle.set_config_option(config_id, value))
@@ -1195,7 +1212,7 @@ class AcpSessionProvider(LLMProvider):
                 if not resolve_pin_spelling_on(
                     model_id, fresh, backend=self.backend
                 ) and model_is_unusable(model_id, fresh or advertised):
-                    raise AcpModelUnavailable(model_id, fresh or advertised)
+                    raise AcpModelUnavailable(model_id, fresh or advertised, backend=self.backend)
         await self._guarded(self._handle.set_model(model_id))
 
     async def set_mode(self, agent_name: str) -> None:

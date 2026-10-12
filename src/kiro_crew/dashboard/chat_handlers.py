@@ -9,10 +9,11 @@ import logging
 import math
 import os
 import tempfile
+import threading
 import time
 import uuid
 import weakref
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from datetime import datetime, timezone
 from itertools import islice  # noqa: F401
 from pathlib import Path
@@ -29,12 +30,16 @@ from kiro_crew.agent_discovery import cached_project_agent_names, warm_project_a
 from kiro_crew.agent_sdk.backends import ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS
 from kiro_crew.agent_sdk.capabilities import MODEL_NAMESPACE_ACP, capabilities_of
 from kiro_crew.agent_sdk.provider_identity import is_claude_code
+from kiro_crew.agent_switch_command import switch_announcement
 from kiro_crew.config.loader import (
     AUTOCOMPACT_PCT_MAX,
     AUTOCOMPACT_PCT_MIN,
+    CHAT_TURN_TIMEOUT_MAX,
+    CHAT_TURN_TIMEOUT_MIN,
     KiroCrewConfig,
     _workspace_name_for_dir,
     config_dir,
+    crew_autocompact_pct,
     default_project_dir,
     published_autocompact_pct,
     resolve_agent_bindings,
@@ -84,7 +89,6 @@ from kiro_crew.dashboard.chat_api.slot_lifecycle import (  # noqa: F401
     _restore_slot_nudge_loop,
     _retire_slot_nudge_loop,
     _slot_still_ours,
-    _wake_conductor_for_closed_worker,
     api_chat_slot_delete,
     api_chat_slot_reset_conversation,
     api_chat_slots_cleanup,
@@ -141,6 +145,7 @@ from kiro_crew.dashboard.chat_persistence import (  # noqa: F401
     pin_private_agent_store,
     register_reasoning_effort_values,
     release_prewarmed_session,
+    remember_unknown_row_fields,
     save_slot_off_loop,
 )
 from kiro_crew.dashboard.chat_runner import (
@@ -211,6 +216,7 @@ from kiro_crew.dashboard.handlers._shared import (
 from kiro_crew.dashboard.handlers.source_providers import is_owner_dashboard_request
 from kiro_crew.dashboard.relay_archive import relay_archive_refusal
 from kiro_crew.dashboard.request_priority import owner_start_priority
+from kiro_crew.dashboard.session_folders import SessionFolderError, create_session_folder
 from kiro_crew.dashboard.slot_buffers import (
     MAX_DEFERRED_NOTE_CHARS,
     MAX_DEFERRED_NOTES,
@@ -243,6 +249,10 @@ from kiro_crew.dashboard.slot_projection import (  # noqa: F401
     stop_declined_armed,
 )
 from kiro_crew.dashboard.slot_queue_repository import warn_if_not_durable
+from kiro_crew.dashboard.slot_retention import (  # noqa: F401
+    loop_slot_keys,
+    select_idle_slot_keys,
+)
 from kiro_crew.dashboard.state import (  # noqa: F401
     _MAX_DISMISSED_SOURCE_LINKS,
     DashboardState,
@@ -254,13 +264,14 @@ from kiro_crew.dashboard.state import (  # noqa: F401
     durable_row_count,
     is_stop_event_row,
     is_turn_interrupted,
+    load_window_off_loop,
     note_crew_log_class,
     parse_cls_meta,
     request_slot_origin,
     row_mid,
 )
 from kiro_crew.dashboard.system_notices import SESSION_RELOAD_KIND, is_system_notice
-from kiro_crew.dashboard.turn_dispatch import spawn_guarded_turn
+from kiro_crew.dashboard.turn_dispatch import chat_turn_timeout_secs, spawn_guarded_turn
 from kiro_crew.history import (  # noqa: F401
     HUMAN_TURN_META_KEY,
     carry_provenance,
@@ -268,7 +279,11 @@ from kiro_crew.history import (  # noqa: F401
 )
 from kiro_crew.history_projection import TranscriptRevisionChanged  # noqa: F401
 from kiro_crew.jsonl_util import OversizedRecord, SplitlinesBoundaryRecord  # noqa: F401
-from kiro_crew.llm_helpers import pick_epoch_host, slot_switch_session_lock
+from kiro_crew.llm_helpers import (
+    pick_epoch_host,
+    provider_model_pin_refused,
+    slot_switch_session_lock,
+)
 from kiro_crew.memory_startup import MemoryStartupUnavailable, wait_for_memory_preparation
 from kiro_crew.memory_stores import UnknownMemoryStore
 from kiro_crew.messaging.link import canonical_key, is_channel_session_key  # noqa: F401
@@ -295,6 +310,7 @@ from kiro_crew.session_agent_selection import (
 )
 from kiro_crew.session_lifecycle import compaction_in_flight
 from kiro_crew.session_summary import count_user_turns_in_records
+from kiro_crew.start_priority import person_priority
 from kiro_crew.trust_patterns import (
     base_consent_pattern,
     base_trust_patterns,
@@ -718,6 +734,20 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
     if not isinstance(slot_name, str) and slot_name is not None:
         slot_name = None  # coerce non-string slot to auto-generate
     _requested_key = _normalize_slot_key(slot_name) if slot_name else ""
+    # Which of the owner's tabs is talking in this slot, so a live guide
+    # observation asks that tab and no other (``guide_observe``), and which
+    # language that tab's dashboard shows (``X-UI-Lang``), so ``find_ui`` quotes
+    # labels as that screen spells them. Only the owner's own send, only the
+    # tab id and a shipped-catalog tag, only in memory.
+    _guide_tab = request.headers.get("X-Guide-Tab")
+    _ui_lang = request.headers.get("X-UI-Lang")
+    if _requested_key and (_guide_tab or _ui_lang) and not request.get("app", ""):
+        from kiro_crew.dashboard.handlers.source_providers import is_owner_dashboard_request
+
+        if is_owner_dashboard_request(request):
+            from kiro_crew.dashboard.guide_observe import note_chat_sender
+
+            note_chat_sender(state, _requested_key, _guide_tab, _ui_lang)
     # Ownership BEFORE get_or_create_slot below, whose memory-mode and
     # under-construction 409s would otherwise answer an app about a session it
     # may not see. Member, cron and workflow keys are refused here too. The
@@ -735,6 +765,12 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
         )
         if denied is not None:
             return denied
+    # A tab restored as a sidebar row loads its window here, with the transcript
+    # read off the loop, before anything below reads its rows. The live slot is
+    # read again after the await, so a close or a replacement during the load is
+    # what the rest of this handler sees.
+    if _requested_key and (_pending := state._slots.get(_requested_key)) is not None:
+        await load_window_off_loop(_pending)
     existing = state._slots.get(_requested_key) if _requested_key else None
     # An app's auto-created slot must not land on a transcript it does not own:
     # its first save would stamp the app onto that transcript's metadata line.
@@ -2370,6 +2406,36 @@ async def api_chat_slot_create(request: web.Request) -> web.Response:
         # it and continue to use the project endpoint for scope changes.
         if folder_project and folder_applied and not slot.project:
             slot.project = folder_project
+        # A fresh folder per new chat, when the owner turned it on. Only for a
+        # brand-new unnamed dashboard chat: a named create can reopen a saved
+        # session, and apps, crons and ephemeral helpers keep their own rules. A
+        # project-linked folder (applied above) wins, an artifact companion chat
+        # keeps the default, and a dashboard caller opts out with
+        # `no_session_folder` when it sets the project itself right after the
+        # create or opens a purpose-built chat (an app, an intake, a hand-off).
+        # A refused root or a failed create falls through to the default below
+        # and is reported in the response, so the chat still opens and the user is
+        # told why it has no folder of its own.
+        session_folder_notice = ""
+        session_folder_root = getattr(cfg.dashboard, "session_folder_root", "") if cfg else ""
+        if (
+            isinstance(session_folder_root, str)
+            and session_folder_root
+            and not slot.project
+            and is_new_slot
+            and not _requested_key
+            and body.get("no_session_folder") is not True
+            and not body.get("artifact")
+            and not request_app
+            and not cron_creator
+            and not body.get("ephemeral")
+            and is_owner_dashboard_request(request)
+        ):
+            try:
+                slot.project = await asyncio.to_thread(create_session_folder, session_folder_root)
+            except SessionFolderError as exc:
+                logger.warning("Slot %s: no session folder (%s)", slot.key, exc)
+                session_folder_notice = "session_folder_unavailable"
         # Default project to workspace directory so file search works out of the box
         if not slot.project:
             cfg_proj = cfg.dashboard.default_project if cfg else ""
@@ -2515,7 +2581,10 @@ async def api_chat_slot_create(request: web.Request) -> web.Response:
     # idle until it timed out.
     if slot.executor != "remote":
         schedule_eager_spawn(state, slot, start_priority=owner_start_priority(request))
-    return web.json_response(state.serialize_slot(slot))
+    created = state.serialize_slot(slot)
+    if session_folder_notice:
+        created["session_folder_notice"] = session_folder_notice
+    return web.json_response(created)
 
 
 def _reject_pending_approvals(slot: _ChatSlot) -> None:
@@ -2775,7 +2844,13 @@ async def _persist_handover_tail(
     # covered, so the difference is exactly what has never reached disk. ``_dirty``
     # covers the other shape of unsaved state: an in-place edit to a row already
     # persisted leaves the length unchanged.
-    unsaved = max(0, len(slot.messages) - slot._disk_window_len)
+    # A restored sidebar row whose window never loaded holds no row that is not
+    # already on disk, so its window as held (empty) is the whole answer, and
+    # reading ``messages`` would load its transcript on the loop to learn it.
+    window = (
+        slot.loaded_messages() if getattr(slot, "window_pending", False) is True else slot.messages
+    )
+    unsaved = max(0, len(window) - slot._disk_window_len)
     # A queued prompt is unsaved state that changes NEITHER of those: its row is
     # written by the drain, so the window length is unchanged, and an enqueue does
     # not dirty the slot. Reporting a clean hand-over over that state would send
@@ -2879,11 +2954,10 @@ def _unblock_pending_waits(state: DashboardState, slot: _ChatSlot) -> None:
 
     * pending tool approvals (:func:`_reject_pending_approvals`)
     * pending agent questions that have a server-side wait
-      (:meth:`DashboardState.cancel_questions_for_slot`) — the blocked HTTP
-      request holds an MCP worker, so resolving the future is what lets that
-      socket close and the call return. Only the ``POST /api/ask-question``
-      path creates such a wait; the MCP ``ask_question`` tool posts a stateless
-      card and ends the turn, so it leaves nothing to release here.
+      (:meth:`DashboardState.cancel_questions_for_slot`). The blocking MCP
+      ``ask_question`` registers its card in ``_pending_questions`` under the
+      slot, so cancelling resolves its future as ``withdrawn`` and the tool call
+      returns; the legacy ``POST /api/ask-question`` wait is released the same way.
 
     They are combined here deliberately: a new blocking wait added later must
     be released from every stop path, and three separate call sites each
@@ -3516,7 +3590,7 @@ def _cancel_target(slot: _ChatSlot) -> str:
 
 
 def _app_cancel_denied(
-    request: web.Request, slot: _ChatSlot, operation: str, target_key: str
+    request: web.Request | Mapping[str, Any], slot: _ChatSlot, operation: str, target_key: str
 ) -> web.Response | None:
     """Whether *request* may cancel *target_key*, as an indistinguishable 404.
 
@@ -3690,12 +3764,37 @@ async def stop_slot_turn(
         # this hard kill a clean stop. Scoped to this card so it cannot defer
         # a later card's ack.
         slot._stop_escalated_card_id = slot._stop_event_id
+        # Take the queue and empty it in one step, then settle what was taken. The
+        # settle can suspend (it waits on a sub-agent's teardown and writes its
+        # tombstones on a worker thread), and a send that lands meanwhile is
+        # acknowledged as queued; a clear after the await would discard it with
+        # nothing settled and nothing said. The kill discards what was queued
+        # when it was pressed, and a later send stays queued for the next turn.
+        discarded = list(slot._queue)
+        slot._queue.clear()
+        # A cross-session delivery among the taken entries has a sender holding a
+        # "queued, will run later" receipt; nothing else here reaches that sender.
+        # Told before the settle can suspend, so a cancellation of this stop
+        # cannot leave a discarded entry unreported.
+        # circular import: session_control imports this package's modules at module level.
+        from kiro_crew.dashboard.session_control import (
+            SEND_DISCARD_HARD_STOP,
+            notify_send_origin_discarded,
+        )
+
+        for _entry in discarded:
+            notify_send_origin_discarded(
+                state,
+                entry_meta=_entry.get("meta"),
+                target_slot=slot,
+                text=_entry.get("content") or "",
+                cause=SEND_DISCARD_HARD_STOP,
+            )
         await _settle_discarded_stage_deliveries(
             state,
             slot,
-            [str(entry.get("content", "")) for entry in slot._queue],
+            [str(entry.get("content", "")) for entry in discarded],
         )
-        slot._queue.clear()
         # Hard kill = "discard everything": drop unconsumed steers too, so the
         # end-of-turn requeue (chat_runner finally) has nothing to resurrect.
         # Mirrors the queue clear above; a soft stop preserves both.
@@ -3995,28 +4094,83 @@ async def api_chat_slot_continue(request: web.Request) -> web.Response:
     if refusal is not None:
         return refusal
 
+    try:
+        await continue_slot_turn(
+            state,
+            slot,
+            directive_user_origin=not bool(request.get("app", "")),
+            # Same-name registration can change while the lock or child probe waits.
+            replaced=lambda: _slot_replaced_while_queued(
+                state, slot, name, request, "chat.slot_continue"
+            ),
+        )
+    except SlotContinueRefusal as exc:
+        if exc.code == "slot_not_found":
+            return _slot_not_found()
+        return web.json_response({"error": exc.message, "code": exc.code}, status=exc.status)
+    return web.json_response({"ok": True, "slot": slot.key})
+
+
+class SlotContinueRefusal(Exception):
+    """A Continue that was refused, carrying the 409 the endpoint renders.
+
+    Raised by :func:`continue_slot_turn` so the Continue endpoint and
+    session-control's ``retry_target`` map the same refusals the same way.
+    ``code`` is the machine-readable contract; ``message`` is advisory prose.
+    """
+
+    def __init__(self, message: str, code: str, status: int = 409) -> None:
+        super().__init__(message)
+        self.message = message
+        self.code = code
+        self.status = status
+
+
+async def continue_slot_turn(
+    state: DashboardState,
+    slot: _ChatSlot,
+    *,
+    directive_user_origin: bool,
+    via: str = "",
+    require_interrupted: bool = False,
+    before_dispatch: Callable[[], None] | None = None,
+    extra_meta: dict[str, Any] | None = None,
+    replaced: Callable[[], bool] | None = None,
+) -> None:
+    """Queue the Resume/Continue body at the head of *slot* and dispatch it.
+
+    The mechanism behind ``api_chat_slot_continue``, shared with
+    ``session_control.retry_target`` so the button and the ``session_retry``
+    tool run one path and refuse the same states. Authorization is the
+    caller's: this function checks only whether the slot can take a
+    continuation right now, and raises :class:`SlotContinueRefusal` when it
+    cannot.
+
+    ``require_interrupted`` refuses a slot whose last turn did not fail
+    (``turn_not_failed``); Continue leaves it off. ``before_dispatch`` runs
+    synchronously under the slot lock immediately before the queue insert and
+    may raise :class:`SlotContinueRefusal`. ``via`` is recorded on the
+    ``dashboard_continue`` audit line when set. ``extra_meta`` is merged into
+    the queue entry's ``meta`` (session control stamps the sending slot there,
+    so a drain-time drop is reported back to it). ``replaced`` is checked after
+    each await (the lock, the sub-agent probe) and refuses with a 404
+    ``slot_not_found`` when it returns True: the Continue endpoint passes
+    ``_slot_replaced_while_queued`` for its slot name.
+    """
     async with slot._lock:
         # Same-name registration can change while the lock or child probe waits.
-        if _slot_replaced_while_queued(state, slot, name, request, "chat.slot_continue"):
-            return _slot_not_found()
+        if replaced is not None and replaced():
+            raise SlotContinueRefusal("not found", "slot_not_found", status=404)
         if slot.running:
-            return web.json_response(
-                {"error": "slot is running", "code": "slot_running"}, status=409
-            )
+            raise SlotContinueRefusal("slot is running", "slot_running")
         if slot._stopping or slot._stop_state != "idle":
-            return web.json_response(
-                {"error": "a stop is in progress", "code": "slot_stopping"}, status=409
-            )
+            raise SlotContinueRefusal("a stop is in progress", "slot_stopping")
         if slot.queue_depth:
             # The runner is about to pick the thread back up on its own; adding a
             # continuation would double-fire.
-            return web.json_response(
-                {"error": "queued messages pending", "code": "slot_queue_pending"}, status=409
-            )
+            raise SlotContinueRefusal("queued messages pending", "slot_queue_pending")
         if any(not f.done() for f in slot._approval_futures.values()):
-            return web.json_response(
-                {"error": "approval pending", "code": "slot_approval_pending"}, status=409
-            )
+            raise SlotContinueRefusal("approval pending", "slot_approval_pending")
         # Background sub-agents are still running (or waiting to start) for this
         # slot. `slot.running` is False here — the parent turn ENDS while its
         # children keep going — so nothing above catches this, and the widened
@@ -4039,17 +4193,15 @@ async def api_chat_slot_continue(request: web.Request) -> web.Response:
         # `f"dashboard:{slot.key}"`: a channel-born slot's children register
         # under the channel key, and the dashboard-prefixed form silently
         # matches nothing — `_history_key_for`'s own docstring says as much.
-        denied_409 = await _subagents_attached_response(
+        subagents_denied = await _subagents_attached_response(
             state, slot, effective_session_key(slot), "continue"
         )
-        if _slot_replaced_while_queued(state, slot, name, request, "chat.slot_continue"):
-            return _slot_not_found()
-        if denied_409 is not None:
-            return denied_409
+        if replaced is not None and replaced():
+            raise SlotContinueRefusal("not found", "slot_not_found", status=404)
+        if subagents_denied is not None:
+            raise SlotContinueRefusal("sub-agents are running", "slot_subagents_running")
         if not _has_conversation(slot):
-            return web.json_response(
-                {"error": "nothing to continue", "code": "slot_empty"}, status=409
-            )
+            raise SlotContinueRefusal("nothing to continue", "slot_empty")
         # The same session start has already failed twice in a row with nothing
         # but Resume presses between the attempts. Continue would re-issue the
         # identical ``session/new`` a third time: the turn has no registered
@@ -4063,16 +4215,11 @@ async def api_chat_slot_continue(request: web.Request) -> web.Response:
         # today's behaviour exactly: one Resume, same continuation, same words.
         failures = session_start_failure_streak(slot.messages)
         if failures >= _SESSION_START_REPEAT_REFUSAL_AT:
-            return web.json_response(
-                {
-                    "error": (
-                        f"the agent session failed to start {failures} times in a "
-                        "row; Resume would run the same start again. Restart the "
-                        "gateway (kirocrew restart), then send your message again."
-                    ),
-                    "code": "session_start_repeat",
-                },
-                status=409,
+            raise SlotContinueRefusal(
+                f"the agent session failed to start {failures} times in a "
+                "row; Resume would run the same start again. Restart the "
+                "gateway (kirocrew restart), then send your message again.",
+                "session_start_repeat",
             )
 
         # _is_interrupted does not AUTHORIZE the continue — it only picks which
@@ -4080,7 +4227,23 @@ async def api_chat_slot_continue(request: web.Request) -> web.Response:
         # getting this wrong is not cosmetic: telling a model that finished
         # cleanly that it was "interrupted before it finished" sends it looking
         # for half-done work that does not exist.
-        resume = _MANUAL_RESUME_MSG if _is_interrupted(slot) else _MANUAL_CONTINUE_MSG
+        interrupted = _is_interrupted(slot)
+        if require_interrupted and not interrupted:
+            # session_retry's own refusal: a turn that finished, or that the user
+            # ended with Stop, is not a failure to re-run. Continue would carry on
+            # from it, but a retry verb must never become a way for another
+            # session to make this one produce a fresh answer on top of a good one.
+            raise SlotContinueRefusal(
+                "the last turn did not fail; there is nothing to retry",
+                "turn_not_failed",
+            )
+        resume = _MANUAL_RESUME_MSG if interrupted else _MANUAL_CONTINUE_MSG
+        if before_dispatch is not None:
+            # Synchronous, under the lock, with no await between it and the
+            # insert below: a caller whose authority was decided before the lock
+            # (session control) re-checks it at the last point where refusing
+            # still changes nothing.
+            before_dispatch()
         # circular import: session_control imports this package's modules at module level.
         from kiro_crew.dashboard.session_control import containment_meta
 
@@ -4093,26 +4256,29 @@ async def api_chat_slot_continue(request: web.Request) -> web.Response:
             0,
             resume,
             kind=SYNTHETIC_RECOVERY_KIND,
-            meta=containment_meta(state, slot),
-            directive_user_origin=not bool(request.get("app", "")),
+            meta={**containment_meta(state, slot), **(extra_meta or {})},
+            directive_user_origin=directive_user_origin,
         )
 
-    sel().log_tool_invocation(
-        session_key=_history_key_for(name),
-        agent=getattr(slot, "agent", "") or "kirocrew",
-        source="dashboard",
-        tool_name="dashboard_continue",
-        tool_kind="command",
-        outcome="ok",
-        metadata={"slot": name},
-    )
+    # The queue entry is already committed; audit failure must not strand it.
+    try:
+        sel().log_tool_invocation(
+            session_key=_history_key_for(slot.key),
+            agent=getattr(slot, "agent", "") or "kirocrew",
+            source="dashboard",
+            tool_name="dashboard_continue",
+            tool_kind="command",
+            outcome="ok",
+            metadata={"slot": slot.key, **({"via": via} if via else {})},
+        )
+    except Exception:
+        logger.warning("continue: SEL audit failed (slot %s)", slot.key, exc_info=True)
     started = await _start_next_queued_turn(state, slot)
     if not started:
         # Lost a race for the queue entry (a concurrent dequeue consumed it).
         # The turn is running either way, so this is not an error for the caller.
-        logger.info("continue: queue entry consumed by a concurrent dequeue (slot %s)", name)
+        logger.info("continue: queue entry consumed by a concurrent dequeue (slot %s)", slot.key)
     state.push_slots_update()
-    return web.json_response({"ok": True, "slot": slot.key})
 
 
 #: Consecutive tagged session-start failures at which Continue stops re-running
@@ -4595,14 +4761,29 @@ async def api_chat_slot_queue_cancel(request: web.Request) -> web.Response:
     # Read the entry's origin before removing it: a cancel puts the text back in
     # the composer, so a redacted copy of the user's own words would replace the
     # link they typed with a placeholder.
-    _user_origin = queue_entry_is_user_origin(
-        next((i for i in slot._queue if i["id"] == queue_id), None)
-    )
+    _entry = next((i for i in slot._queue if i["id"] == queue_id), None)
+    _user_origin = queue_entry_is_user_origin(_entry)
     content = slot.queue_remove_by_id(queue_id)
     if content is None:
         return web.json_response({"error": "queue item not found"}, status=404)
     _remove_queued_by_id(slot.messages, queue_id)
     slot.invalidate_source_links()
+    # A cross-session delivery has a sender holding a "queued, will run later"
+    # receipt, and the retracted card below is on this session, which the sender
+    # does not read. Its own transcript is told the message will never run.
+    # circular import: session_control imports this package's modules at module level.
+    from kiro_crew.dashboard.session_control import (
+        SEND_DISCARD_QUEUE_CANCEL,
+        notify_send_origin_discarded,
+    )
+
+    notify_send_origin_discarded(
+        state,
+        entry_meta=_entry.get("meta") if _entry is not None else None,
+        target_slot=slot,
+        text=content,
+        cause=SEND_DISCARD_QUEUE_CANCEL,
+    )
     _redacted = queued_text_for_display(content, user_origin=_user_origin)
     state.broadcast_ws("queue_cancel", {"slot": name, "queue_id": queue_id, "content": _redacted})
     state.push_slots_update()
@@ -4901,7 +5082,11 @@ _slot_switch_session_lock = slot_switch_session_lock
 
 
 def _slot_replaced_while_queued(
-    state: DashboardState, slot: _ChatSlot, name: str, request: web.Request, operation: str
+    state: DashboardState,
+    slot: _ChatSlot,
+    name: str,
+    request: web.Request | Mapping[str, Any],
+    operation: str,
 ) -> bool:
     """Whether ``name`` registers a different object than *slot* -- checked after a lock await.
 
@@ -4941,7 +5126,12 @@ def _slot_replaced_while_queued(
 
 
 def _switch_target_busy(
-    state: DashboardState, slot: _ChatSlot, session_key: str, provider: object
+    state: DashboardState,
+    slot: _ChatSlot,
+    session_key: str,
+    provider: object,
+    *,
+    own_turn: bool = False,
 ) -> bool:
     """Whether a turn is in flight on *session_key* -- the switch handlers' pre-commit refusal.
 
@@ -4984,8 +5174,14 @@ def _switch_target_busy(
     ``skip_if_busy`` decline in ``SessionManager.reset`` as the backstop for
     a turn that starts after this read: message dispatch takes none of the
     switch locks, so this is a fast path, not the authority.
+
+    *own_turn* is the in-turn ``/agent <name>`` command (``switch_slot_agent``
+    called from the slot's own turn, before it acquires a session): that turn
+    is the switch itself and never prompts the provider, so its own
+    ``running`` flag is not a turn in flight. The provider probe and every
+    OTHER slot's turn still refuse.
     """
-    if slot.running:
+    if slot.running and not own_turn:
         return True
     if isinstance(provider, LLMProvider) and provider.has_active_turn():
         return True
@@ -4997,7 +5193,9 @@ def _switch_target_busy(
     # the comparison must too (``slot_switch_session_lock`` keys the same way).
     target = canonical_key(session_key)
     return any(
-        other.running and canonical_key(_cancel_target(other)) == target
+        other.running
+        and not (own_turn and other is slot)
+        and canonical_key(_cancel_target(other)) == target
         for other in list(state._slots.values())
     )
 
@@ -5010,6 +5208,69 @@ class _MemberMemoryRequiresNewConversation(ValueError):
     conversation-boundary refusal it means, instead of wrapping it in the
     store-unavailable 503 the generic except produces.
     """
+
+
+class SlotAgentSwitchCaller(NamedTuple):
+    """Who asked :func:`switch_slot_agent` to switch: an HTTP request, or a turn.
+
+    The HTTP route passes its request (:meth:`for_request`); the chat runner's
+    in-turn ``/agent <name>`` command passes :meth:`for_turn`. Everything the
+    switch reads about its caller is here, so the two doors run ONE
+    transaction instead of two copies that drift.
+    """
+
+    #: The app the caller acts for ("" = the dashboard).
+    app: str
+    #: Peer address, for the audit trail.
+    remote: str
+    #: Whether the dashboard owner asked. A turn's command never claims it: its
+    #: text can come from any allowed channel user, so it gets the permitted-user
+    #: rules (templates and V1 stores, never a V2 member store).
+    owner: bool
+    #: The HTTP request, when there is one.
+    request: web.Request | None = None
+    #: The switch runs inside the slot's own turn (see ``_switch_target_busy``).
+    own_turn: bool = False
+
+    @classmethod
+    def for_request(cls, request: web.Request) -> SlotAgentSwitchCaller:
+        from kiro_crew.dashboard.handlers.source_providers import is_owner_dashboard_request
+
+        return cls(
+            app=str(request.get("app", "") or ""),
+            remote=request.remote or "",
+            owner=is_owner_dashboard_request(request),
+            request=request,
+        )
+
+    @classmethod
+    def for_turn(cls, slot: _ChatSlot) -> SlotAgentSwitchCaller:
+        # The slot's own app scope: an app's turn is held to what that app's
+        # own request could do, never widened to the dashboard's.
+        return cls(app=slot._app or "", remote="", owner=False, own_turn=True)
+
+    @property
+    def scope(self) -> web.Request | Mapping[str, Any]:
+        """What the app-isolation helpers read (they take ``request.get("app")``)."""
+        return self.request if self.request is not None else {"app": self.app}
+
+    async def require_owner(self, operation: str) -> web.Response | None:
+        if self.request is not None:
+            from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+
+            return await require_owner_dashboard_request(self.request, operation)
+        if self.owner:
+            return None
+        sel().log_api_access(
+            caller=self.app or "turn",
+            operation=operation,
+            outcome="denied",
+            source="dashboard",
+            resources="non_owner_block",
+        )
+        return web.json_response(
+            {"error": "owner authorization required", "code": "owner_only"}, status=403
+        )
 
 
 async def api_chat_slot_agent(request: web.Request) -> web.Response:
@@ -5026,11 +5287,68 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
     if body_err is not None:
         return body_err
     assert body is not None  # read_bounded_json returns (dict, None) on success
+    # `announce`: the composer's `/agent <name>` asks for the transcript line
+    # the in-turn command appends; the picker sends no flag and appends none.
+    announce = body.get("announce", False)
+    if not isinstance(announce, bool):
+        return web.json_response(
+            {"error": "announce must be a boolean", "code": "invalid_announce"}, status=400
+        )
+    resp = await switch_slot_agent(
+        state,
+        slot,
+        name,
+        body.get("agent", ""),
+        body.get("agent_kind", ""),
+        SlotAgentSwitchCaller.for_request(request),
+    )
+    if announce:
+        ok, outcome = agent_switch_outcome(resp)
+        if ok:
+            text = switch_announcement(
+                str(outcome.get("agent") or slot.agent), str(outcome.get("warning") or "")
+            )
+            text, _ = redact_credentials(text)
+            text, _ = redact_exfiltration_urls(text)
+            slot.append("assistant", text, "msg msg-a")
+            state.push_slots_update()
+    return resp
+
+
+def agent_switch_outcome(resp: web.Response) -> tuple[bool, dict[str, Any]]:
+    """Whether a :func:`switch_slot_agent` response committed, and its JSON body.
+
+    The body is ``{}`` when it is not a JSON object, so a caller reads
+    ``error`` / ``agent`` / ``warning`` from it without its own guards.
+    """
+    try:
+        body = json.loads(resp.text or "{}")
+    except (TypeError, ValueError):
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    return resp.status == 200 and bool(body.get("ok")), body
+
+
+async def switch_slot_agent(
+    state: DashboardState,
+    slot: _ChatSlot,
+    name: str,
+    agent_name: Any,
+    agent_kind: Any,
+    caller: SlotAgentSwitchCaller,
+) -> web.Response:
+    """Switch *slot* (registered as *name*) to *agent_name*: resolve, reset, commit.
+
+    The transaction behind ``POST /api/chat/slots/{slot}/agent`` and the
+    in-turn ``/agent <name>`` command. Answers the route's own responses, so a
+    non-HTTP caller reads ``status`` and the JSON ``error``/``code`` body.
+    """
     if slot.mode == members_mod.DM_SLOT_MODE and not members_mod.is_dispatchable_member_name(
         slot.agent
     ):
         sel().log_api_access(
-            caller=request.remote or "",
+            caller=caller.remote,
             operation="chat.slot_agent",
             outcome="denied",
             source="member_pin",
@@ -5044,7 +5362,6 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
             },
             status=409,
         )
-    agent_name = body.get("agent", "")
     member_pin_match = members_mod.member_pin_matches(slot.mode, slot.agent, agent_name)
     if not isinstance(agent_name, str) or (
         agent_name
@@ -5057,7 +5374,6 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
     ):
         return web.json_response({"error": "invalid agent name"}, status=400)
     # Same contract as the create route: an optional namespace for the name.
-    agent_kind = body.get("agent_kind", "")
     if agent_kind not in ("", "member", "template"):
         return web.json_response(
             {"error": "invalid agent kind", "code": "invalid_agent_kind"}, status=400
@@ -5098,7 +5414,7 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
         # Re-authorize after the await above (see _slot_replaced_while_queued):
         # ``name`` can be recreated for a different app while this request
         # queued, and every read of ``slot`` below would be of the stale one.
-        if _slot_replaced_while_queued(state, slot, name, request, "chat.slot_agent"):
+        if _slot_replaced_while_queued(state, slot, name, caller.scope, "chat.slot_agent"):
             return slot_not_found()
         # The session the switch resets — ``effective_session_key``, never
         # ``_history_key_for`` (see api_chat_slot_model): a channel- or
@@ -5117,19 +5433,16 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
         await _stack.enter_async_context(_slot_switch_session_lock(session_key))
         # Second lock-acquisition await, second re-check: a same-name
         # recreate lands during this wait just as easily as during the first.
-        if _slot_replaced_while_queued(state, slot, name, request, "chat.slot_agent"):
+        if _slot_replaced_while_queued(state, slot, name, caller.scope, "chat.slot_agent"):
             return slot_not_found()
         # App isolation on the SESSION, not just the slot (the cancel routes'
         # policy): slot ownership does not imply ownership of a linked
         # channel session, so an app caller may not switch the agent a
         # channel thread runs on. Denied as an indistinguishable 404.
-        denied = _app_cancel_denied(request, slot, "chat.slot_agent", session_key)
+        denied = _app_cancel_denied(caller.scope, slot, "chat.slot_agent", session_key)
         if denied is not None:
             return denied
-        from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
-        from kiro_crew.dashboard.handlers.source_providers import is_owner_dashboard_request
-
-        owner_request = is_owner_dashboard_request(request)
+        owner_request = caller.owner
         if not owner_request:
             # Permitted chat users keep template and legacy V1 choices, but
             # cannot change a member assignment through aggregate controls. Refuse a V2 choice
@@ -5153,7 +5466,7 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
                 return _store_unavailable_response(slot.memory_store, exc)
             choice_store = choice_cfg.memory_stores.get(choice.memory_store_name)
             if choice_store is not None and choice_store.memory_version == 2:
-                denied = await require_owner_dashboard_request(request, "chat.slot_agent")
+                denied = await caller.require_owner("chat.slot_agent")
                 if denied is not None:
                     return denied
         if agent_name != slot.agent:
@@ -5196,7 +5509,7 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
         # retryable once the turn completes. Checked BEFORE the commit below,
         # so nothing needs rolling back.
         busy_provider = state.sessions.get_provider(session_key)
-        if _switch_target_busy(state, slot, session_key, busy_provider):
+        if _switch_target_busy(state, slot, session_key, busy_provider, own_turn=caller.own_turn):
             return web.json_response(
                 {"error": "a turn is in flight", "code": "turn_in_flight"}, status=409
             )
@@ -5270,7 +5583,7 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
                 if selected_store is not None and selected_store.memory_version == 2:
                     # The member may have moved to V2 during resolution. No
                     # derived fields, reset or history write has committed yet.
-                    denied = await require_owner_dashboard_request(request, "chat.slot_agent")
+                    denied = await caller.require_owner("chat.slot_agent")
                     if denied is not None:
                         return denied
             assignment_resolved = bindings.requested_resolved
@@ -5528,7 +5841,7 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
         # fast path plus the atomic skip_if_busy decline below are what keep
         # the teardown off a streaming turn.
         recheck = state.sessions.get_provider(session_key)
-        if _switch_target_busy(state, slot, session_key, recheck):
+        if _switch_target_busy(state, slot, session_key, recheck, own_turn=caller.own_turn):
             _rollback_switch()
             return web.json_response(
                 {"error": "a turn is in flight", "code": "turn_in_flight"}, status=409
@@ -5813,11 +6126,7 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
             # A non-owner choice preserves the recorded session assignment.
             slot._memory_assignment_from_history = not owner_request
 
-        owner_pick = (
-            slot.agent is committed_agent
-            and assignment_resolved
-            and is_owner_dashboard_request(request)
-        )
+        owner_pick = slot.agent is committed_agent and assignment_resolved and caller.owner
         if owner_pick:
             slot._memory_assignment_from_history = False
 
@@ -5911,7 +6220,7 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
     # The reset destroyed any eagerly created session; picking an agent is
     # itself a strong first-message intent signal (it also resets the
     # project), so re-arm the speculative spawn for the new bindings.
-    schedule_eager_spawn(state, slot, start_priority=owner_start_priority(request))
+    schedule_eager_spawn(state, slot, start_priority=person_priority(caller.owner))
     state.push_slots_update()
     resp_body: dict = {
         "ok": True,
@@ -6095,6 +6404,21 @@ async def _try_live_model_switch(
             exc,
         )
         return False
+    refused = provider.model_pin_refused if provider_model_pin_refused(provider) else ""
+    if refused:
+        # The shared-runtime handle applies a model through its config-option
+        # ladder NON-strictly: an adapter that refuses every spelling leaves the
+        # session on its default and records the refused id instead of raising
+        # (the dedicated AcpClient raised above). The user named this exact
+        # model, so answer it the way the dedicated runtime does: same error,
+        # same 4xx, slot keeps its old model. The handle resets the record at
+        # the start of every call, so this is THIS pick's verdict, not a stale
+        # one. On a pair-id harness the advertised list is the entitlement, so
+        # a bare id the pairs serve being refused is the adapter contradicting
+        # its own list, which selects the adapter-mismatch wording.
+        raise AcpModelUnavailable.for_recorded_refusal(
+            refused, provider.available_models(), backend=provider.client.backend
+        )
     # Client-scoped explicit-pick epoch. The pick GENERATION above is
     # slot-local, but two slots can drive one wire session (a channel-born
     # slot and its dashboard alias share `effective_session_key`), and the
@@ -6649,11 +6973,15 @@ _source_link_txn_locks: "weakref.WeakValueDictionary[str, asyncio.Lock]" = (
 async def api_chat_slot_autocompact(request: web.Request) -> web.Response:
     """GET/POST /api/chat/slots/{slot}/autocompact — per-session compact threshold.
 
-    GET returns the slot's override (``pct``, null when it follows the global),
-    the current global (``global_pct``), and the valid range. POST takes
+    GET returns the slot's override (``pct``, null when it follows a default),
+    the current global (``global_pct``), the default the session's crew
+    declares (``agent_pct``) with that crew's name (``agent``), both null when
+    it declares none -- the session then follows the global -- and the valid
+    range. POST takes
     ``{"pct": <number|null>}``: a number sets this session's override (rejected
     outside the documented range, matching the global knob's PATCH validation),
-    null clears it back to the global. The value applies to the live session
+    null clears it back to the agent's default, else the global. The value
+    applies to the live session
     immediately via the SessionManager override map and persists with the slot
     metadata, so it survives gateway restarts.
     """
@@ -6676,6 +7004,7 @@ async def api_chat_slot_autocompact(request: web.Request) -> web.Response:
             {
                 "pct": slot.autocompact_pct,
                 "global_pct": published_autocompact_pct(),
+                **await _slot_agent_autocompact_fields(state, slot),
                 "min": AUTOCOMPACT_PCT_MIN,
                 "max": AUTOCOMPACT_PCT_MAX,
             }
@@ -6876,8 +7205,223 @@ async def api_chat_slot_autocompact(request: web.Request) -> web.Response:
         state.sessions.set_autocompact_pct(effective_session_key(slot), live_pct)
         logger.info("Slot %s autocompact_pct set to %r", name, live_pct)
         return web.json_response(
-            {"ok": True, "pct": live_pct, "global_pct": published_autocompact_pct()}
+            {
+                "ok": True,
+                "pct": live_pct,
+                "global_pct": published_autocompact_pct(),
+                **await _slot_agent_autocompact_fields(state, slot),
+            }
         )
+
+
+async def _slot_agent_autocompact_fields(state: DashboardState, slot: Any) -> dict[str, Any]:
+    """``agent_pct`` and ``agent``: the default *slot*'s session takes from its crew.
+
+    Both are null when the session follows the global because its crew
+    declares no default. A live session answers for the crew it started
+    under. Without one (a new slot, an idle expiry, a restart before the first
+    turn) the answer is for the crew the slot's next session starts under, so
+    the popover shows the number the next context reading compacts at.
+    """
+    key = effective_session_key(slot)
+    sessions = state.sessions
+    if sessions is not None and sessions.has_session(key):
+        found = sessions.agent_autocompact_default(key)
+    else:
+        found = await asyncio.to_thread(_slot_next_agent_autocompact_default, key, slot)
+    if found is None:
+        return {"agent_pct": None, "agent": None}
+    # The name is display text for the popover, never an identity this route
+    # acts on. Crew names are operator- and agent-writable and the name grammar
+    # admits token-shaped strings, so it is scrubbed like any other label.
+    label, _ = redact_exfiltration_urls(found[0])
+    label, _ = redact_credentials(label)
+    return {"agent_pct": found[1], "agent": label}
+
+
+def _slot_next_agent_autocompact_default(session_key: str, slot: Any) -> tuple[str, float] | None:
+    """The crew a fresh session of *slot* would run, and the default it declares.
+
+    Resolves the slot's selection the way a dashboard turn does before it
+    starts a session: the crew is the resolved alias, and a template
+    selection runs under no crew. Config and binding reads touch files, so
+    callers run this off the event loop.
+    """
+    try:
+        cfg = KiroCrewConfig.load()
+        bindings = resolve_session_agent_bindings(
+            resolve_agent_bindings,
+            cfg,
+            session_key,
+            slot.agent or None,
+            slot.project or None,
+        )
+    except Exception:
+        logger.debug("autocompact: could not resolve slot %s's agent", session_key, exc_info=True)
+        return None
+    if bindings.selection_kind == "template":
+        return None
+    crew = bindings.resolved_alias or ""
+    pct = crew_autocompact_pct(cfg, crew)
+    return None if pct is None else (crew, pct)
+
+
+def _turn_timeout_body_value(body: dict[str, Any]) -> tuple[int | None, web.Response | None]:
+    """The ``secs`` a turn-timeout POST asks for, or the 400 that refuses it.
+
+    Held to the same range and the same whole-seconds unit as the global
+    ``agent.chat_turn_timeout_secs`` write gate, so a session can be given any
+    limit Settings could save and nothing Settings would refuse. ``null`` asks
+    to follow the global limit again.
+    """
+
+    def _refuse(error: str, code: str) -> tuple[None, web.Response]:
+        return None, web.json_response({"error": error, "code": code}, status=400)
+
+    if "secs" not in body:
+        return _refuse("secs is required (integer or null)", "secs_required")
+    secs = body["secs"]
+    if secs is None:
+        return None, None
+    # bool is an int subclass; refuse it by name rather than as 0 or 1 seconds.
+    if isinstance(secs, bool) or not isinstance(secs, int):
+        return _refuse("secs must be a whole number of seconds or null", "secs_not_an_integer")
+    if not (CHAT_TURN_TIMEOUT_MIN <= secs <= CHAT_TURN_TIMEOUT_MAX):
+        return _refuse(
+            f"secs must be between {CHAT_TURN_TIMEOUT_MIN} and {CHAT_TURN_TIMEOUT_MAX}",
+            "secs_out_of_range",
+        )
+    return secs, None
+
+
+async def _turn_timeout_payload(secs: int | None) -> dict[str, Any]:
+    """What the session menu shows: this session's limit and the global one."""
+    global_secs = await asyncio.to_thread(chat_turn_timeout_secs)
+    return {
+        "secs": secs,
+        "global_secs": int(global_secs),
+        "min": CHAT_TURN_TIMEOUT_MIN,
+        "max": CHAT_TURN_TIMEOUT_MAX,
+    }
+
+
+async def api_chat_slot_turn_timeout(request: web.Request) -> web.Response:
+    """GET/POST /api/chat/slots/{slot}/turn-timeout — this session's turn time limit.
+
+    GET returns the session's own limit (``secs``, null while it follows the
+    global), the global ``agent.chat_turn_timeout_secs`` (``global_secs``) and
+    the valid range. POST takes ``{"secs": <integer|null>}``: an integer gives
+    this session its own limit, which its next turn runs under instead of the
+    global one; null returns it to the global. Out-of-range values are refused,
+    matching the global setting's write gate.
+
+    The value lives on the slot and in the session's metadata line, so it
+    survives a gateway restart; the turn dispatch reads it when each turn
+    starts (``turn_dispatch.resolve_turn_limit``), so a turn already running
+    keeps the limit it started with. The write holds the compaction-threshold
+    route's per-transcript lock and pins the save to the authorized
+    transcript, and the live field changes only once the write has committed
+    (see the comment at the save).
+    """
+    state: DashboardState = request.app["state"]
+    name = request.match_info["slot"]
+    slot = state._slots.get(name)
+    if not slot:
+        return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
+    request_app = request.get("app", "")
+    denied = deny_app_slot_session_access(request_app, slot, name, "slot_turn_timeout")
+    if denied is not None:
+        return denied
+    if request.method == "GET":
+        return web.json_response(await _turn_timeout_payload(slot.turn_timeout_secs))
+    body, body_err = await read_bounded_json(request)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
+    secs, refused = _turn_timeout_body_value(body)
+    if refused is not None:
+        return refused
+
+    def _gone() -> web.Response:
+        return web.json_response(
+            {"error": "session was deleted or rebound", "code": "session_gone"}, status=409
+        )
+
+    locked_history_key = slot_history_key(slot)
+    async with _autocompact_txn_lock(locked_history_key):
+        stale = _reauthorize_after_await(state, slot, name, request_app, "slot_turn_timeout")
+        if stale is not None:
+            return stale
+        authorized_history_key = slot_history_key(slot)
+        if authorized_history_key != locked_history_key:
+            return _gone()
+        committed = False
+        if state.conversation_log:
+            # Persist before publishing. The new value reaches disk as a STAGED
+            # value while the live field keeps the committed one, so a turn
+            # dispatched during the save still runs under the committed limit
+            # and a failed save leaves nothing to undo. The live field (and the
+            # live field of every alias slot on this transcript) flips in the
+            # save's commit hook, which runs under the transcript lock right
+            # after the write lands: an alias flush needs that lock to
+            # serialize, so none can write the old value back over this one.
+            # The aliases are listed inside the hook, so a slot bound to this
+            # transcript while the save ran is published to as well.
+
+            def _publish_committed() -> None:
+                nonlocal committed
+                committed = True
+                others = [other for other in list(state._slots.values()) if other is not slot]
+                for other in (slot, *others):
+                    if slot_history_key(other) == authorized_history_key:
+                        other.turn_timeout_secs = secs
+                        other._turn_timeout_hydrated = True
+
+            try:
+                saved = await save_slot_off_loop(
+                    state,
+                    slot,
+                    force=True,
+                    best_effort=False,
+                    expected_history_key=authorized_history_key,
+                    turn_timeout_override=(secs,),
+                    after_commit_under_lock=_publish_committed,
+                )
+            except Exception:
+                # Nothing committed and nothing was published. Dirty only so an
+                # unrelated flush re-converges the unchanged durable record.
+                slot._dirty = True
+                logger.exception("Slot %s turn_timeout_secs persist failed", name)
+                return web.json_response(
+                    {"error": "could not persist turn time limit", "code": "persist_failed"},
+                    status=500,
+                )
+            if not saved:
+                # Refused without writing: the session was deleted, or the slot
+                # was rebound to another transcript mid-request.
+                return _gone()
+            # The persist await is a rebind window. A slot that now routes to
+            # another transcript holds THAT transcript's limit, set by whatever
+            # rebound it, so a rejection here leaves the slot's field alone.
+            stale = _reauthorize_after_await(state, slot, name, request_app, "slot_turn_timeout")
+            if stale is not None:
+                return stale
+            if slot_history_key(slot) != authorized_history_key:
+                return _gone()
+            if not committed:
+                # A tab with no metadata line yet: the empty-window merge does
+                # not materialize one, so there is no durable record to be the
+                # authority. The slot is the only copy until the tab's first
+                # full save, which writes this field, the same way a model
+                # picked on a fresh tab persists.
+                slot.turn_timeout_secs = secs
+        else:
+            slot.turn_timeout_secs = secs
+        # The picked value is now the slot's own, read or not before.
+        slot._turn_timeout_hydrated = True
+        committed_secs = slot.turn_timeout_secs
+        logger.info("Slot %s turn_timeout_secs set to %r", name, committed_secs)
+        return web.json_response({"ok": True, **await _turn_timeout_payload(committed_secs)})
 
 
 async def api_chat_slots_model(request: web.Request) -> web.Response:
@@ -7216,6 +7760,12 @@ async def api_chat_slot_reasoning_effort(request: web.Request) -> web.Response:
     overlay). Effort is Opus/Sonnet-only; on a non-capable model this is a
     persisted no-op (no live apply, no session reset).
     """
+    # circular import: session_control imports this package's modules at module level.
+    from kiro_crew.dashboard.session_control import (
+        effort_commit_needs_reset,
+        legacy_effort_base,
+    )
+
     state: DashboardState = request.app["state"]
     name = request.match_info["slot"]
     slot = state._slots.get(name)
@@ -7282,6 +7832,17 @@ async def api_chat_slot_reasoning_effort(request: web.Request) -> web.Response:
         denied = _app_cancel_denied(request, slot, "chat.slot_reasoning_effort", session_key)
         if denied is not None:
             return denied
+        _live = state.sessions.get_provider(session_key)
+        if effort and isinstance(_live, AcpProvider) and not _live.accepts_effort_level(effort):
+            # A level the live session's own vocabulary hides: refused here, so
+            # it neither persists nor falls through to a session reset.
+            return web.json_response(
+                {
+                    "error": f"reasoning_effort {effort!r} is not offered by this session",
+                    "code": "effort_level_not_offered",
+                },
+                status=400,
+            )
         try:
             await asyncio.to_thread(_remember_reasoning_effort_for_restore, effort)
         except (OSError, ValueError) as exc:
@@ -7295,16 +7856,17 @@ async def api_chat_slot_reasoning_effort(request: web.Request) -> web.Response:
             )
         provider = state.sessions.get_provider(session_key)
         legacy_model = slot.model
-        split_base, legacy_level = model_registry.split_effort_suffix(legacy_model)
         legacy_base = ""
-        if legacy_level:
+        if model_registry.split_effort_suffix(legacy_model)[1]:
+            # The backend is only worth resolving when the pin carries a suffix.
             backend = (
                 provider.capabilities.backend
                 if isinstance(provider, AcpProvider)
                 else await _configured_backend_for_slot(slot)
             )
-            if backend in ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS:
-                legacy_base = split_base
+            legacy_base = legacy_effort_base(
+                legacy_model, pair_id_backend=backend in ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS
+            )
 
         def normalize_legacy_model() -> dict[str, str]:
             if not legacy_base or slot.model != legacy_model:
@@ -7313,8 +7875,16 @@ async def api_chat_slot_reasoning_effort(request: web.Request) -> web.Response:
             slot._dirty = True
             return {"model": legacy_base}
 
-        if slot.reasoning_effort == effort and not legacy_base:
-            return web.json_response({"ok": True, "reasoning_effort": effort})
+        if slot.reasoning_effort == effort:
+            # Re-picking the level already shown is still an explicit user
+            # choice: bump the effort generation so a pending session_set_model
+            # effort yields to it, as the model route bumps its own generation
+            # on a same-value pick. Bumped here rather than on the write below,
+            # which the setter skips as a same-value write, so a codex pin still
+            # carrying a legacy ``[level]`` suffix gets the bump too.
+            slot._effort_pick_gen += 1
+            if not legacy_base:
+                return web.json_response({"ok": True, "reasoning_effort": effort})
         logger.info("Slot %s reasoning_effort switched to %r", name, effort or "default")
 
         _updated_live: bool | None = False
@@ -7351,8 +7921,8 @@ async def api_chat_slot_reasoning_effort(request: web.Request) -> web.Response:
                     type(exc).__name__,
                     exc,
                 )
-        elif isinstance(provider, AcpProvider):
-            # Model does not support effort — persist the slot value for when the
+        elif not effort_commit_needs_reset(provider):
+            # Model does not support effort: persist the slot value for when the
             # user switches to a capable model, but do not touch the live session.
             _updated_live = True
             logger.info("Slot %s effort persisted (model not effort-capable)", name)
@@ -8321,14 +8891,60 @@ def deny_non_dashboard_caller(request: web.Request, operation: str) -> web.Respo
     return None
 
 
+async def _internal_session_approval_refusal(
+    request: web.Request, operation: str
+) -> "web.Response | None":
+    """Deny bare internal-auth callers on the session-approval routes.
+
+    ``X-Internal-Secret`` proves only that the caller runs on this loopback — not
+    who it is.  Any process holding ``.local_secret`` can otherwise reach these
+    routes and set approval mode for every session.
+
+    The one admitted internal path is a cron script presenting its attested
+    ``cron:<id>`` key on ``chat_mode``.  That caller's own ``cron_creator_admission``
+    and ``cron_mode_refusal`` fences apply after this guard, so the cron still only
+    touches sessions it created and only with the two modes its gate allows.
+
+    Every other internal-auth caller — bare secret with no key, any key on
+    ``chat_slot_approve`` or the ``/api/approvals/{id}/{action}`` route, even a
+    verified ``dashboard:`` or ``subagent:`` key — is refused here like a non-owner.
+    Self-approval (setting trust on one's own slot) is the same harm as setting it on
+    any other slot, so it is not an exception.
+    """
+    from kiro_crew.dashboard.handlers._shared import (
+        _owner_denial_response,
+        member_request_scope,
+    )
+
+    scope = await member_request_scope(request)
+    session = scope.session or ""
+    if scope.verified and session.startswith("cron:") and operation == "chat_mode":
+        return None
+    try:
+        sel().log_api_access(
+            caller=session or "internal",
+            operation=operation,
+            outcome="denied",
+            source="internal_auth",
+            error="internal-auth caller is not admitted on session approval",
+        )
+    except Exception:  # pragma: no cover - audit is best-effort
+        logger.debug("SEL audit failed for internal-auth session approval denial", exc_info=True)
+    return _owner_denial_response(request, "forbidden")
+
+
 async def deny_session_approval_caller(request: web.Request, operation: str) -> web.Response | None:
     """Allow the dashboard owner or an app with the live session approval grant.
+
+    Internal-auth callers are handled by :func:`_internal_session_approval_refusal`:
+    only a cron script with its attested key is admitted on ``chat_mode``; every
+    other internal caller is refused like a non-owner.
 
     The grant verdict is this request's one read (:func:`session_grant`), shared
     with the per-slot checkpoint that already ran for a per-slot route.
     """
     if request.get("internal_auth") is True:
-        return None
+        return await _internal_session_approval_refusal(request, operation)
     request_app = str(request.get("app") or "")
     if not request_app:
         return deny_non_dashboard_caller(request, operation)
@@ -8361,6 +8977,40 @@ async def deny_session_approval_caller(request: web.Request, operation: str) -> 
             "code": "session_approval_not_granted",
         },
         status=403,
+    )
+
+
+def bare_approval_decide_allowed(request: web.Request) -> bool:
+    """Whether *request* may decide a tool approval by its request id alone.
+
+    A request id is minted by the caller that raised the approval and can recur,
+    so a decide that names only the id resolves whichever request holds it at
+    that moment. The owner-bound targets (``origin=coordinator`` with the exact
+    slot and instance, or ``origin: "native"`` with the row's ``request_mid``)
+    name the request a card actually showed and are accepted from every caller.
+
+    The bare form is accepted only from the dashboard user's own browser
+    session: the auth middleware sets a PRESENT, empty ``app`` claim for a
+    validated dashboard session token (the same positive proof
+    ``is_owner_dashboard_request`` reads), and ``internal_auth`` marks a loopback
+    ``X-Internal-Secret`` caller (an agent, MCP tool or cron), which is not a
+    person looking at a card. Every other caller (internal secret, or any
+    request the middleware left without a dashboard-user claim) must send an
+    owner-bound target. App callers are judged by their own grant path before
+    this check and never reach it.
+    """
+    if request.get("internal_auth") is True:
+        return False
+    return request.get("app", None) == ""
+
+
+def _approval_target_required() -> web.Response:
+    return web.json_response(
+        {
+            "error": "an owner-bound approval target is required",
+            "code": "approval_target_required",
+        },
+        status=404,
     )
 
 
@@ -8425,14 +9075,16 @@ async def api_chat_slot_followup(request: web.Request) -> web.Response:
     )
     resp: dict[str, Any] = {"ok": True, "count": len(items), "delivered": clients}
     if not getattr(slot, "project", ""):
-        # Parity with session_directive_apply._suggest_followup: the card's
-        # worktree button renders disabled for an unscoped slot, and the caller
-        # (the MCP relay, and through it the model) must hear that from the
-        # delivery path — the tool description alone cannot know this slot.
+        # Parity with session_directive_apply._suggest_followup: an unscoped
+        # slot's card offers a plain new chat instead of the worktree route,
+        # and the caller (the MCP relay, and through it the model) must hear
+        # that from the delivery path — the tool description alone cannot know
+        # this slot.
         resp["warning"] = (
-            "this session has no project directory, so the card's 'Start in "
-            "new worktree' button is disabled; steer the user to 'Add to this "
-            "session' or to scoping a project first"
+            "this session has no project directory, so the card offers 'Start "
+            "in new chat' (a new chat with no worktree) instead of 'Start in "
+            "new worktree'; for isolated git work, suggest scoping a git "
+            "repository first"
         )
     return web.json_response(resp)
 
@@ -8490,6 +9142,272 @@ async def api_recent_projects(request: web.Request) -> web.Response:
         operation="recent_projects",
         outcome="allowed",
         resources=f"count={len(dirs)}",
+    )
+    return web.json_response({"dirs": dirs})
+
+
+# Favourites are a SEPARATE file from the recents list, not a flag on its rows, because
+# the two have different lifetimes: recents is a rolling window capped at
+# _MAX_RECENT_PROJECTS and rewritten on every project switch, so a favourite stored
+# there would fall off the end of a busy week. There is no cap: only the dashboard owner
+# can write the file (both write verbs are owner-gated), so a bound would have no caller
+# to defend against, and a list the user curates by hand should not refuse an entry.
+#
+# Both write verbs are a read-modify-write of one file, run on worker threads, so two
+# overlapping requests (two dashboard tabs) would each write back the snapshot they read
+# and one change would be lost. One lock serialises the whole transaction for both.
+_favorite_projects_lock = threading.Lock()
+
+
+def _favorite_projects_path() -> Path:
+    return config_dir() / "favorite_projects.json"
+
+
+class FavoritesUnreadable(Exception):
+    """`favorite_projects.json` exists but is not a JSON list we can read."""
+
+
+def _load_favorite_projects(*, strict: bool = False) -> list[str]:
+    """The stored favourites, de-duplicated, with NO filesystem probing.
+
+    This is the list the write paths edit, so it keeps entries whose directory is
+    currently unreachable: a favourite on a detached volume or a not-yet-cloned
+    worktree must survive a round trip through add or remove rather than being
+    deleted as a side effect of someone else's write. `_read_favorite_projects`
+    applies the display filter instead.
+
+    An absent file is an empty list. A file that exists but cannot be read or is not
+    a JSON list (a hand edit with a typo, a permission change) reads as empty for
+    DISPLAY, but `strict=True` raises `FavoritesUnreadable` instead: the write paths
+    pass it, because writing back an empty snapshot would silently replace the
+    user's whole list, which unlike the recents window cannot be rebuilt.
+    """
+
+    fp = _favorite_projects_path()
+    if not fp.is_file():
+        return []
+    try:
+        stored = json.loads(fp.read_text(encoding="utf-8"))
+    except Exception as exc:
+        if strict:
+            raise FavoritesUnreadable(str(exc)) from exc
+        return []
+    if not isinstance(stored, list):
+        if strict:
+            raise FavoritesUnreadable("not a JSON list")
+        return []
+    out: list[str] = []
+    for entry in stored:
+        if isinstance(entry, str) and entry and entry not in out:
+            out.append(entry)
+    return out
+
+
+def _read_favorite_projects() -> list[str]:
+    """Favourites for display: existing, non-sensitive directories, stored order kept.
+
+    Insertion order is the answer, not recency or the alphabet -- the list is one the
+    user curates by hand, so a favourite stays where they put it. The sensitive-path
+    filter matches the recents read: a path that became sensitive after it was
+    favourited is withheld from the response, and removing it stays possible because
+    the delete path reads `_load_favorite_projects` instead of this.
+    """
+
+    return [d for d in _load_favorite_projects() if os.path.isdir(d) and not is_sensitive_path(d)]
+
+
+def _write_favorite_projects(paths: list[str]) -> None:
+    """Replace the favourites file atomically (same temp-file dance as the recents write)."""
+
+    fp = _favorite_projects_path()
+    fp.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=fp.parent, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as tmp_fh:
+            tmp_fh.write(json.dumps(paths))
+        os.replace(tmp, fp)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
+def _probe_favorite_candidate(path: str) -> tuple[str, bool, bool]:
+    """Resolve `path` and answer (resolved, is a directory, is sensitive).
+
+    One function so the add handler can hand every filesystem probe to a worker thread
+    in a single call: `realpath` walks the symlink chain and the sensitivity check
+    resolves too, and on a stalled network mount either would freeze the event loop.
+    """
+
+    resolved = os.path.realpath(os.path.expanduser(path))
+    return resolved, os.path.isdir(resolved), is_sensitive_path(resolved)
+
+
+def _add_favorite_project(path: str) -> list[str]:
+    """Append `path` to the favourites; returns the display list.
+
+    Appends rather than prepends so the order the user built stays put. Already
+    favourited is a no-op success -- the button is a toggle whose "on" state can be
+    requested twice (two tabs, a double click) and neither caller should see an error
+    for a list that already says what they asked it to say.
+    """
+
+    with _favorite_projects_lock:
+        stored = _load_favorite_projects(strict=True)
+        if path not in stored:
+            stored.append(path)
+            _write_favorite_projects(stored)
+    return _read_favorite_projects()
+
+
+def _remove_favorite_project(path: str) -> list[str]:
+    """Drop `path` from the favourites; returns the display list.
+
+    Both the path as given and its resolved form are dropped. The add path stores the
+    resolved form, but an entry can sit in the file unresolved -- a hand-edited file, or
+    a spelling whose symlink chain has since moved -- and a remove that matched only one
+    spelling would leave a row the user cannot get rid of. Missing is a no-op.
+    """
+
+    resolved = os.path.realpath(os.path.expanduser(path))
+    with _favorite_projects_lock:
+        stored = _load_favorite_projects(strict=True)
+        kept = [p for p in stored if p != path and p != resolved]
+        if len(kept) != len(stored):
+            _write_favorite_projects(kept)
+    return _read_favorite_projects()
+
+
+def _favorites_unreadable_response() -> web.Response:
+    """409 for a write refused because the stored list could not be read.
+
+    Refused rather than written: the write would replace a list the user may have
+    spent months curating with a single entry. The message names the file so the
+    user can repair it, and nothing on disk is touched.
+    """
+
+    return web.json_response(
+        {
+            "error": (
+                f"{_favorite_projects_path().name} could not be read, so it was left "
+                "untouched. Fix or remove it, then try again."
+            ),
+            "code": "favorites_unreadable",
+        },
+        status=409,
+    )
+
+
+async def api_favorite_projects(request: web.Request) -> web.Response:
+    """GET /api/favorite-projects — list the favourited project directories."""
+
+    dirs = await asyncio.to_thread(_read_favorite_projects)
+    sel().log_api_access(
+        caller=request.get("user", "dashboard"),
+        operation="favorite_projects",
+        outcome="allowed",
+        resources=f"count={len(dirs)}",
+    )
+    return web.json_response({"dirs": dirs})
+
+
+async def api_favorite_project_add(request: web.Request) -> web.Response:
+    """POST /api/favorite-projects — favourite one project directory.
+
+    Validated the way setting a slot's project is (`api_chat_slot_project`): a real
+    directory, resolved, and not a sensitive path. Storing the resolved form is what
+    lets the picker's star compare a row against this list by string.
+
+    Owner-gated, unlike the GET beside it: the favourites file is the owner's own
+    config, so an installed app whose manifest covers this path may read the list but
+    must not edit it. The gate goes BEFORE the body is read and before any filesystem
+    probe, so a refused caller gets no directory-existence oracle out of it.
+    """
+
+    denied = deny_non_dashboard_caller(request, "favorite_project_add")
+    if denied is not None:
+        return denied
+    body, body_err = await read_bounded_json(request)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
+    path = body.get("path", "")
+    if not isinstance(path, str):
+        return web.json_response(
+            {"error": "path must be a string", "code": "path_not_a_string"}, status=400
+        )
+    path = path.strip()
+    if not path:
+        return web.json_response({"error": "path is required", "code": "path_required"}, status=400)
+    path, is_dir, sensitive = await asyncio.to_thread(_probe_favorite_candidate, path)
+    if not is_dir:
+        return web.json_response(
+            {"error": "Not a directory", "code": "not_a_directory"}, status=400
+        )
+    if sensitive:
+        sel().log_api_access(
+            caller=request.get("user", "dashboard"),
+            operation="favorite_project_add",
+            outcome="denied",
+            resources=f"path={path}",
+            error="sensitive path",
+        )
+        return web.json_response({"error": "Access denied", "code": "denied"}, status=403)
+    try:
+        dirs = await asyncio.to_thread(_add_favorite_project, path)
+    except FavoritesUnreadable as exc:
+        sel().log_api_access(
+            caller=request.get("user", "dashboard"),
+            operation="favorite_project_add",
+            outcome="denied",
+            resources=f"path={path}",
+            error=f"favorites file unreadable: {exc}",
+        )
+        return _favorites_unreadable_response()
+    sel().log_api_access(
+        caller=request.get("user", "dashboard"),
+        operation="favorite_project_add",
+        outcome="allowed",
+        resources=f"path={path} count={len(dirs)}",
+    )
+    return web.json_response({"dirs": dirs})
+
+
+async def api_favorite_project_remove(request: web.Request) -> web.Response:
+    """DELETE /api/favorite-projects?path=… — un-favourite one project directory.
+
+    The path comes from the query string, not a body, because a DELETE body is not
+    carried reliably by every client. None of the add path's filesystem checks run
+    here: a favourite whose directory was deleted, or which became sensitive after it
+    was stored, is exactly the row a user needs to be able to remove, and demanding it
+    still be a listable directory would strand it.
+
+    Owner-gated for the same reason as the add above.
+    """
+
+    denied = deny_non_dashboard_caller(request, "favorite_project_remove")
+    if denied is not None:
+        return denied
+    path = (request.query.get("path") or "").strip()
+    if not path:
+        return web.json_response({"error": "path is required", "code": "path_required"}, status=400)
+    try:
+        dirs = await asyncio.to_thread(_remove_favorite_project, path)
+    except FavoritesUnreadable as exc:
+        sel().log_api_access(
+            caller=request.get("user", "dashboard"),
+            operation="favorite_project_remove",
+            outcome="denied",
+            resources=f"path={path}",
+            error=f"favorites file unreadable: {exc}",
+        )
+        return _favorites_unreadable_response()
+    sel().log_api_access(
+        caller=request.get("user", "dashboard"),
+        operation="favorite_project_remove",
+        outcome="allowed",
+        resources=f"path={path} count={len(dirs)}",
     )
     return web.json_response({"dirs": dirs})
 
@@ -8802,6 +9720,34 @@ async def api_chat_mode(request: web.Request) -> web.Response:
         if denied is not None:
             return denied
 
+    return await apply_approval_mode(
+        state,
+        mode=mode,
+        slot=slot,
+        slot_key=slot_key,
+        request_app=request_app,
+        cron_creator=cron_creator,
+        audit_caller=audit_caller,
+    )
+
+
+async def apply_approval_mode(
+    state: DashboardState,
+    *,
+    mode: str,
+    slot: _ChatSlot | None,
+    slot_key: str | None,
+    request_app: str,
+    cron_creator: str,
+    audit_caller: Callable[[str], str],
+) -> web.Response:
+    """Apply an approval mode to ONE resolved slot (or every slot when ``slot`` is None).
+
+    The mutation half of ``POST /api/chat/mode``, after every caller check has
+    passed. Shared with the crewmate profile write (``PUT /api/agents/{name}``),
+    which applies the stored permission to the crewmate's live DM slot through
+    this same path rather than a copy of it.
+    """
     # The safety override (YOLO) is PROCESS-GLOBAL while an approval mode is
     # per-slot, so revoking it on behalf of a request that named ONE slot drops
     # every OTHER slot out of YOLO too. That is how a programmatic per-slot
@@ -9201,6 +10147,11 @@ async def api_chat_slot_approve(request: web.Request) -> web.Response:
     if denied is not None:
         return denied
     strict_native = "origin" in body
+    if not strict_native and not request_app and not bare_approval_decide_allowed(request):
+        # A decide by request id alone, from a caller that is not the dashboard
+        # owner's browser session: refuse it rather than resolve whichever
+        # request now holds the id.
+        return _approval_target_required()
     if strict_native:
         request_mid = body.get("request_mid")
         if (
@@ -9571,6 +10522,41 @@ def _validate_content(content: object) -> web.Response | None:
     return None
 
 
+def _is_secret_shaped_context(content: str) -> bool:
+    """Whether the credential redactor would rewrite pending-context *content*.
+
+    Pending context is in-band: the drain prepends it to the next user message,
+    so the model reads it as ordinary prompt text and "consume silently" is a
+    request, not a guarantee. It is not a confidential channel, and a payload
+    that carries a secret hands that secret to the model and to everything the
+    turn's output reaches. The check is the credential redactor itself -- a
+    payload it would rewrite is a payload that is refused -- so the admission
+    rule and the redaction rule cannot drift apart.
+    """
+    cleaned, _ = redact_credentials(content)
+    return cleaned != content
+
+
+def _refuse_secret_shaped_context(content: str) -> web.Response | None:
+    """400 ``context_secret_shaped`` for credential-shaped *content*, else None.
+
+    The refusal never echoes any part of the content.
+    """
+    if not _is_secret_shaped_context(content):
+        return None
+    return web.json_response(
+        {
+            "error": (
+                "pending context must not carry credentials: the content contains "
+                "a credential-shaped value. Pending context is delivered as "
+                "model-visible prompt text, not as a confidential channel"
+            ),
+            "code": "context_secret_shaped",
+        },
+        status=400,
+    )
+
+
 def _normalize_source(source: object) -> str:
     """Trim a caller source to its stored form: a stripped str.
 
@@ -9743,8 +10729,9 @@ def _enqueue_pending_context(
     """Build, cap, and append a ``_pending_context`` entry.
 
     Returns a 4xx response on a bad request (429 could not be queued, 400
-    invalid ``max_age``), else None on success. The entry is consumed on the next
-    user-initiated message via ``drain_pending_context``.
+    invalid ``max_age`` or credential-shaped content), else None on success.
+    The entry is consumed on the next user-initiated message via
+    ``drain_pending_context``.
 
     A 400 leaves the queue untouched. The two 429s come from different places:
     ``_build_pending_context_entry`` returns the per-source ``capacity_reached``
@@ -9793,10 +10780,17 @@ def _build_pending_context_entry(
     400 or 429 on the POST -- while HOLDING the entry until the running turn
     ends. Queueing it at the POST instead would hand it to the turn already in
     flight, since that turn drains the queue after its task is assigned.
+
+    Every pending-context entry is built here, so this is where a
+    credential-shaped payload is refused (``context_secret_shaped``): no
+    producer can queue one by skipping a handler-level check.
     """
     bad_age = _validate_max_age(max_age)
     if bad_age is not None:
         return None, bad_age
+    secret_shaped = _refuse_secret_shaped_context(content)
+    if secret_shaped is not None:
+        return None, secret_shaped
     if _source_cap_reached(slot, source):
         return None, web.json_response(
             {
@@ -9825,6 +10819,10 @@ async def api_chat_slot_context(request: web.Request) -> web.Response:
 
     No LLM turn is triggered, no WS event is broadcast, and no visible
     message is appended to the slot's chat history.
+
+    The content reaches the model in-band, as prompt text, so it is not a
+    confidential channel: a credential-shaped ``content`` is refused with a
+    400 ``context_secret_shaped`` and the queue is left unchanged.
 
     Body::
 
@@ -10165,6 +11163,10 @@ async def api_chat_slot_note(request: web.Request) -> web.Response:
             "ephemeral": true         // optional, default true (passed to the context entry)
         }
 
+    A credential-shaped ``content`` never seats a context half: the context
+    half reaches the model in-band and is not a confidential channel. The
+    visible line is still written, redacted, and ``contextSkipped`` is true.
+
     Returns ``{"ok", "appended", "visibleDeferred", "contextSkipped", "pending"}``.
     If the source's per-source context cap is already full the visible line is
     still written and ``contextSkipped`` is true: the cap protects the context
@@ -10299,7 +11301,12 @@ async def api_chat_slot_note(request: web.Request) -> web.Response:
     # null means no expiry, the same as it does on /context.
     context_skipped = False
     context_entry: dict[str, object] | None = None
-    if _source_cap_reached(slot, source):
+    if _is_secret_shaped_context(content):
+        # Pending context reaches the model in-band, so a credential-shaped note
+        # never seats a context half. Its visible line is still written,
+        # redacted below, and the skip is reported the way a full cap is.
+        context_skipped = True
+    elif _source_cap_reached(slot, source):
         context_skipped = True
     elif deferred and not slot.has_pending_context_seat():
         # The HELD path must refuse the context half at admission, the same way
@@ -10343,8 +11350,9 @@ async def api_chat_slot_note(request: web.Request) -> web.Response:
 
     # Caller-controlled content reaching the visible transcript (SSE plus the
     # on-disk JSONL). Redact at this sink so a secret or exfil URL cannot land
-    # in user-visible history. The context half stays raw: that is the
-    # trusted-caller boundary inherited from /context. Attribution scope: the
+    # in user-visible history. The context half is never rewritten: a
+    # credential-shaped note seats no context half at all, and the context half
+    # otherwise carries the caller's bytes unchanged. Attribution scope: the
     # note CONTENT runs through the exfiltration → credential redaction pair and
     # nothing more — a note carries a source LABEL, not a rewritten body, so no
     # format-char normalization is layered on the content here.

@@ -83,6 +83,16 @@ export interface MemberActivityEntry {
 /** One team of crewmates (GET /api/teams). `members` are exact crew NAMES in
  *  the user's order; a crewmate is on at most one team, which the store
  *  enforces on every write. */
+/** GET /api/members/{slug}/recap: the work a crewmate holds, for its cold-start
+ *  welcome. Goals still open (in its thread or a recent session), then the
+ *  newest other sessions that ran as it. */
+export interface MemberRecap {
+  slug: string
+  member: string
+  paused: { goal: string; next: string }[]
+  recent: { title: string; ts: number }[]
+}
+
 export interface CrewTeam {
   id: string
   name: string
@@ -195,7 +205,10 @@ export function createAgentsEndpoints({ post, put, del, j, jfetch: fetch, sessio
       fetch('/api/agents/catalog', {
         headers: sessionKey ? { 'X-Session-Key': sessionKey } : { ..._sk },
       }).then(j) as Promise<{ agents: KiroCrewAgent[]; default_agent: string }>,
-    createKirocrewAgent: (body: object) => post('/api/agents', body).then(j),
+    /** `extra` carries per-request headers (a guided create's `X-Guide-*`);
+     *  it rides THIS request only, never the shared transport. */
+    createKirocrewAgent: (body: object, extra?: Record<string, string>) =>
+      (extra ? post('/api/agents', body, undefined, extra) : post('/api/agents', body)).then(j),
     // Crew Members page — roster of GLOBAL crews with DM-thread binding and the
     // cheap live-status fields the backend can answer without IO (richer live
     // detail rides the already-subscribed WS `slots` frames).
@@ -205,6 +218,21 @@ export function createAgentsEndpoints({ post, put, del, j, jfetch: fetch, sessio
     // mode="member"), so this is also the only place a member slot key comes from.
     memberThread: (slug: string) =>
       post('/api/members/' + encodeURIComponent(slug) + '/thread').then(j) as Promise<{ slot_key: string; slug: string; member: string }>,
+    // Mate's once-only first greeting. The server decides: it starts one
+    // Mate turn only for Mate's own empty pinned thread, at most once
+    // ever, and answers every other case with the outcome that declined it.
+    memberGreet: (slug: string) =>
+      post('/api/members/' + encodeURIComponent(slug) + '/greet').then(j) as Promise<{ outcome: string }>,
+    // Fresh start on a crewmate's pinned thread: stop any turn, then drop the
+    // conversation so the next turn starts clean. Same slot key; the
+    // transcript stays. `reset_at` is the server's time of the reset; `outcome`
+    // is `queued` when the session was still busy and the clear waits for it.
+    // `reset_persisted` is false when the clear landed but the fold boundary
+    // failed to append to the member log -- the clear itself is never retried
+    // for that fault, so the page's own in-session fold (set from `reset_at`
+    // regardless) is what the user sees; only a reload loses it.
+    memberFreshStart: (slug: string) =>
+      post('/api/members/' + encodeURIComponent(slug) + '/fresh-start').then(j) as Promise<{ slot: string; reset_at: string; outcome: 'cleared' | 'queued'; reset_persisted: boolean }>,
     // A member's recent activity pointers (real recorded signal only: session
     // participations and routing decisions). `member` is the exact crew name —
     // slugs are lossy, so the backend filters the shared log by exact name.
@@ -252,9 +280,15 @@ export function createAgentsEndpoints({ post, put, del, j, jfetch: fetch, sessio
     // wrong cells as agentic -- which is the one thing this surface must not get
     // wrong, because it is the reader's only signal of how much to trust a number.
     // `member` is the exact crew name, as every member route takes it (slugs are lossy).
-    memberDashboard: (slug: string, member: string) =>
+    // `locale` is the UI language the page should render its own words in; the
+    // gateway checks it against the shipped catalogs and falls back to English.
+    /** `preview`: the STAGED page `dashboard_preview` set aside, which no version
+     *  records; 404 `no_preview` once nothing is staged. */
+    memberDashboard: (slug: string, member: string, locale = '', preview = false) =>
       fetch(
-        '/api/members/' + encodeURIComponent(slug) + '/dashboard?member=' + encodeURIComponent(member),
+        '/api/members/' + encodeURIComponent(slug) + '/dashboard?member=' + encodeURIComponent(member)
+          + (locale ? '&locale=' + encodeURIComponent(locale) : '')
+          + (preview ? '&preview=1' : ''),
       ).then(j) as Promise<{
         instance_version: number
         template: { id: string; version: number }
@@ -266,6 +300,24 @@ export function createAgentsEndpoints({ post, put, del, j, jfetch: fetch, sessio
         manifest: DashboardManifest
         state: 'empty' | 'live' | 'stale' | 'error'
       } | null>,
+    // A ROOT session's own dynamic dashboard, the same body as `memberDashboard`.
+    // Keyed by the slot: the gateway reads every field from that session's own work
+    // ledger and crew log, and answers 404 `not_root_session` for a dispatched or
+    // adopted one.
+    sessionDashboard: (slot: string, locale = '', preview = false) => {
+      const p = new URLSearchParams()
+      if (locale) p.set('locale', locale)
+      if (preview) p.set('preview', '1')
+      const query = p.toString()
+      return fetch('/api/chat/slots/' + encodeURIComponent(slot) + '/dashboard' + (query ? '?' + query : '')).then(j) as Promise<{
+        instance_version: number
+        template: { id: string; version: number }
+        html: string
+        rendered_html?: string
+        manifest: DashboardManifest
+        state: 'empty' | 'live' | 'stale' | 'error'
+      } | null>
+    },
     // The crewmate's self-maintained briefing markdown. Read-only from the UI
     // (no editor: the file is agent-written and edited where the crewmate keeps
     // it). `member` is the exact crew name (slugs are lossy).
@@ -290,6 +342,12 @@ export function createAgentsEndpoints({ post, put, del, j, jfetch: fetch, sessio
          *  notes. */
         truncated: boolean
       }>,
+    // The work a crewmate holds (open goals, recent sessions), read for its
+    // cold-start welcome. `member` is the exact crew name (slugs are lossy).
+    memberRecap: (slug: string, member: string) =>
+      fetch(
+        '/api/members/' + encodeURIComponent(slug) + '/recap?member=' + encodeURIComponent(member),
+      ).then(j) as Promise<MemberRecap>,
     // Crewmate teams: a name plus an ordered member list, stored by the gateway
     // in the data home's crew-teams directory. Dashboard-only like the members routes; the three
     // writes are owner actions. `remove` rather than `delete`: a reserved word

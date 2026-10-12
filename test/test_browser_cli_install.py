@@ -726,6 +726,23 @@ def test_cli_env_layers_node_dirs_over_the_broad_path(monkeypatch: pytest.Monkey
     assert mod.cli_env()["PATH"] == "/node/bin:/home/.local/bin:/usr/bin"
 
 
+def test_cli_env_trusts_the_os_certificate_store(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Node children verify TLS against the OS store as well as Node's bundled roots.
+
+    A GUI-launched gateway has no shell profile, so a corporate proxy CA that the
+    OS already trusts would otherwise never reach the browser-download child.
+    """
+    monkeypatch.delenv("NODE_USE_SYSTEM_CA", raising=False)
+
+    assert mod.cli_env()["NODE_USE_SYSTEM_CA"] == "1"
+
+
+def test_cli_env_keeps_a_user_set_system_ca_choice(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("NODE_USE_SYSTEM_CA", "0")
+
+    assert mod.cli_env()["NODE_USE_SYSTEM_CA"] == "0"
+
+
 @pytest.mark.skipif(
     os.name == "nt",
     reason="POSIX ~ expansion and the ~/.local/bin (mise) layout; Windows uses a different PATH set",
@@ -820,7 +837,9 @@ class TestPerEngineDownloads:
         monkeypatch.setattr(mod, "cli_command", lambda cli=None: [cli or str(fake_cli)])
         seen: list[list[str]] = []
 
-        def _fake_step(name, argv, timeout, hint="", failure_signal=None):
+        def _fake_step(
+            name, argv, timeout, hint="", failure_signal=None, hint_requires_signal=False
+        ):
             seen.append(argv)
             return {"name": name, "ok": True, "returncode": 0}
 
@@ -934,6 +953,46 @@ class TestFailureDetailIsRedactedAtTheSource:
 
         assert step["hint"] == hint
         assert step["stderr"] == f"Missing libraries\n\n{hint}"
+
+    def test_a_hint_that_requires_the_signal_is_withheld_from_an_unrelated_failure(
+        self, monkeypatch
+    ):
+        """A verdict about the host is evidenced by the missing-library report
+        alone; a download that failed for another reason keeps its own error."""
+        hint = "WebKit is not supported on this operating system"
+        monkeypatch.setattr(mod, "_run", lambda argv, timeout: (1, "", "server returned code 503"))
+
+        step = mod._step(
+            "install-browser",
+            ["pw", "install-browser", "webkit"],
+            1.0,
+            hint=hint,
+            failure_signal=mod.os_deps.host_deps_unsatisfied,
+            hint_requires_signal=True,
+        )
+
+        assert step["ok"] is False
+        assert step["hint"] == ""
+        assert step["stderr"] == "server returned code 503"
+
+    @pytest.mark.parametrize("rc", [0, 1], ids=["exit-0", "exit-1"])
+    def test_a_hint_that_requires_the_signal_rides_on_a_signalled_failure(self, monkeypatch, rc):
+        hint = "WebKit is not supported on this operating system"
+        stderr = "Host system is missing dependencies to run browsers.\n    libgtk-4.so.1"
+        monkeypatch.setattr(mod, "_run", lambda argv, timeout: (rc, "", stderr))
+
+        step = mod._step(
+            "install-browser",
+            ["pw", "install-browser", "webkit"],
+            1.0,
+            hint=hint,
+            failure_signal=mod.os_deps.host_deps_unsatisfied,
+            hint_requires_signal=True,
+        )
+
+        assert step["ok"] is False
+        assert step["hint"] == hint
+        assert step["stderr"] == f"{stderr}\n\n{hint}"
 
     def test_credential_straddling_truncation_boundary_is_still_redacted(self, monkeypatch, caplog):
         """A URL credential whose ``@`` anchor sits past the display cap.
@@ -1133,6 +1192,106 @@ class TestCliPathTrust:
 
         assert mod.cli_path() == str(cli.resolve())
 
+    def test_install_refuses_up_front_when_the_workspace_contains_the_data_home(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        home, crew = self._isolate(tmp_path, monkeypatch)
+        monkeypatch.setattr(mod, "_agent_writable_roots", lambda: (home.resolve(),))
+        calls = _wire(monkeypatch, {"npm": "/n/npm"})
+
+        result = mod.install()
+
+        assert result["ok"] is False
+        assert [s["name"] for s in result["steps"]] == ["check-install-boundary"]
+        detail = result["steps"][0]["stderr"]
+        assert f"{home.resolve()} contains the Kiro Crew data home ({crew})" in detail
+        assert "agent-writable" in detail
+        assert calls == []
+
+    def test_install_proceeds_over_the_data_home_when_a_vetted_system_launcher_resolves(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        home, _crew = self._isolate(tmp_path, monkeypatch)
+        system = self._executable(tmp_path / "opt" / "bin" / mod.CLI_BIN)
+        monkeypatch.setattr(mod, "_agent_writable_roots", lambda: (home.resolve(),))
+        monkeypatch.setattr(mod, "_system_cli_candidates", lambda: (system,))
+        monkeypatch.setattr(mod, "_gateway_writable_component", lambda candidate, resolved: None)
+        _wire(monkeypatch, {"npm": "/n/npm"})
+
+        result = mod.install()
+
+        assert result["steps"][0]["name"] == "npm-install-global"
+
+    def test_install_proceeds_when_the_workspace_is_beside_the_data_home(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        self._isolate(tmp_path, monkeypatch)
+        workspace = tmp_path / "workplace" / "kirocrew-workspace"
+        workspace.mkdir(parents=True)
+        monkeypatch.setattr(mod, "_agent_writable_roots", lambda: (workspace.resolve(),))
+        _wire(monkeypatch, {"npm": "/n/npm"})
+
+        result = mod.install()
+
+        assert result["steps"][0]["name"] == "npm-install-global"
+
+    def test_a_refused_launcher_found_after_install_names_it_and_the_reason(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _home, crew = self._isolate(tmp_path, monkeypatch)
+        leaf = crew / "playwright-cli"
+        cli = self._executable(leaf / "bin" / mod.CLI_BIN)
+        monkeypatch.setattr(mod, "_agent_writable_roots", lambda: (leaf.resolve(),))
+        _wire(monkeypatch, {"npm": "/n/npm"})
+
+        result = mod.install()
+
+        step = result["steps"][-1]
+        assert step["name"] == "resolve-binary"
+        assert step["stderr"] == (
+            f"{mod.CLI_BIN} was installed at {cli} but refused: "
+            f"the resolved executable is inside the agent-writable tree {leaf.resolve()}"
+        )
+
+    def test_install_reports_an_absent_managed_launcher_as_not_found(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        self._isolate(tmp_path, monkeypatch)
+        _wire(monkeypatch, {"npm": "/n/npm"})
+
+        result = mod.install()
+
+        step = result["steps"][-1]
+        assert step["name"] == "resolve-binary"
+        assert step["stderr"] == (
+            f"{mod.CLI_BIN} was not found in the managed tools leaf after a successful install"
+        )
+
+    def test_a_user_local_refusal_names_the_boundary(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        home, _crew = self._isolate(tmp_path, monkeypatch)
+        crew = home / ".local" / "share" / "crew"
+        crew.mkdir(parents=True)
+        monkeypatch.setattr(mod, "config_dir", lambda: crew)
+        self._executable(crew / "playwright-cli" / "bin" / mod.CLI_BIN)
+
+        reason = mod._managed_leaf_unresolved_reason()
+
+        assert "under the user-local tree" in reason
+
     def test_a_path_first_shim_is_not_resolved(
         self,
         tmp_path: Path,
@@ -1204,6 +1363,133 @@ class TestCliPathTrust:
         assert repr(str(candidate.resolve())) in warning
         assert "writable by the gateway user" in warning
 
+    def test_legacy_user_local_launcher_is_reported_refused(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """User-local upgrade journey: a ``~/.local/bin`` launcher is present but
+        declined, so the surface can explain the one-time managed reinstall."""
+        home, _crew = self._isolate(tmp_path, monkeypatch)
+        shim = self._executable(home / ".local" / "bin" / mod.CLI_BIN)
+        monkeypatch.setenv("PATH", str(shim.parent))
+
+        assert mod.cli_path() is None
+        assert mod.legacy_launcher_refused() is True
+
+    def test_version_manager_launcher_is_reported_refused(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Version-manager upgrade journey: a PATH-resolved launcher (as a mise,
+        nvm, or Volta shim dir would contribute) is present but declined."""
+        self._isolate(tmp_path, monkeypatch)
+        shim = self._executable(tmp_path / "vm-shims" / mod.CLI_BIN)
+        monkeypatch.setenv("PATH", str(shim.parent))
+
+        assert mod.cli_path() is None
+        assert mod.legacy_launcher_refused() is True
+
+    def test_no_launcher_at_all_is_not_reported_refused(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Nothing on disk or PATH: not a refusal, so the plain not-installed
+        message stays, not the reinstall explanation."""
+        self._isolate(tmp_path, monkeypatch)
+
+        assert mod.cli_path() is None
+        assert mod.legacy_launcher_refused() is False
+
+    def test_a_trusted_managed_launcher_is_not_reported_refused(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A resolvable managed launcher is not a refusal even if a legacy shim
+        also sits on PATH -- the trusted copy wins and the panel is available."""
+        home, crew = self._isolate(tmp_path, monkeypatch)
+        self._executable(crew / "playwright-cli" / "bin" / mod.CLI_BIN)
+        shim = self._executable(home / ".local" / "bin" / mod.CLI_BIN)
+        monkeypatch.setenv("PATH", str(shim.parent))
+
+        assert mod.cli_path() is not None
+        assert mod.legacy_launcher_refused() is False
+
+    def test_a_trusted_system_launcher_resolves_and_is_not_a_refusal(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """When no managed leaf exists, a trusted fixed system candidate resolves
+        -- the panel is available, so this is not a refusal."""
+        self._isolate(tmp_path, monkeypatch)
+        candidate = self._executable(tmp_path / "system-bin" / mod.CLI_BIN)
+        monkeypatch.setattr(mod, "_system_cli_candidates", lambda: (candidate,))
+        # The fixed system location is trusted here; only the agent-writable and
+        # user-local floors reject, and this candidate is under neither.
+        monkeypatch.setattr(mod, "_gateway_writable_component", lambda c, r: None)
+
+        assert mod.cli_path() == str(candidate.resolve())
+        assert mod.legacy_launcher_refused() is False
+
+    def test_an_agent_writable_path_shim_is_not_reported_as_legacy(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A planted shim on PATH that resolves inside an agent-writable tree is
+        refused, but it is NOT a user's legacy install -- a reinstall would not
+        address it -- so the plain refusal message stays, not the reinstall copy."""
+        self._isolate(tmp_path, monkeypatch)
+        project = tmp_path / "project"
+        shim = self._executable(project / "bin" / mod.CLI_BIN)
+        monkeypatch.setenv("PATH", str(shim.parent))
+        monkeypatch.setattr(mod, "_agent_writable_roots", lambda: (project.resolve(),))
+
+        assert mod.cli_path() is None
+        assert mod.legacy_launcher_refused() is False
+
+    def test_a_user_owned_system_install_refused_as_writable_is_legacy(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A user's own machine install -- a Homebrew ``/opt/homebrew/bin`` or an
+        npm-global ``/usr/local/bin`` launcher -- is a fixed system candidate
+        refused as writable by the gateway user. It IS the user's own install, so
+        a one-time managed reinstall is the remedy and the surface explains it."""
+        self._isolate(tmp_path, monkeypatch)
+        candidate = self._executable(tmp_path / "homebrew" / "bin" / mod.CLI_BIN)
+        monkeypatch.setattr(mod, "_system_cli_candidates", lambda: (candidate,))
+
+        assert mod.cli_path() is None
+        assert mod.legacy_launcher_refused() is True
+
+    def test_agent_writable_roots_unverifiable_is_not_reported_as_legacy(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """When the agent-writable roots cannot be verified the candidate is
+        refused as an anomaly, not a user install -- a reinstall would not
+        address it -- so the plain refusal message stays, not the reinstall copy.
+        This case does not carry the ``agent-writable tree`` substring, which the
+        earlier reason-string classification would have mis-read as legacy."""
+        self._isolate(tmp_path, monkeypatch)
+        shim = self._executable(tmp_path / "vm-shims" / mod.CLI_BIN)
+        monkeypatch.setenv("PATH", str(shim.parent))
+
+        def _boom() -> tuple[Path, ...]:
+            raise RuntimeError("roots backend unavailable")
+
+        monkeypatch.setattr(mod, "_agent_writable_roots", _boom)
+
+        assert mod.cli_path() is None
+        assert mod.legacy_launcher_refused() is False
+
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX symlink and permission semantics")
 class TestGatewayWritableComponentWalksEveryDirectory:
@@ -1272,7 +1558,7 @@ class TestGatewayWritableComponentWalksEveryDirectory:
         entry, writable, _target = self._hop_chain(tmp_path)
         self._writable_only(monkeypatch, writable)
 
-        resolved, reason = mod._system_candidate(entry)
+        resolved, reason, _kind = mod._system_candidate(entry)
 
         assert resolved is None
         assert reason is not None
@@ -1290,7 +1576,7 @@ class TestGatewayWritableComponentWalksEveryDirectory:
         entry, prefix, _leaf = self._symlinked_component_chain(tmp_path)
         self._writable_only(monkeypatch, prefix)
 
-        resolved, reason = mod._system_candidate(entry)
+        resolved, reason, _kind = mod._system_candidate(entry)
 
         assert resolved is None
         assert reason is not None
@@ -1304,7 +1590,7 @@ class TestGatewayWritableComponentWalksEveryDirectory:
         entry, _writable, target = self._hop_chain(tmp_path)
         self._writable_only(monkeypatch, None)
 
-        assert mod._system_candidate(entry) == (target.resolve(), None)
+        assert mod._system_candidate(entry) == (target.resolve(), None, None)
 
     def test_the_direct_launcher_file_walk_uses_the_same_enumeration(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -2945,3 +3231,44 @@ class TestPlaywrightHostPlatform:
 
     def test_no_os_release_falls_back_like_playwright(self, monkeypatch):
         assert self._host(monkeypatch, system="linux") == "ubuntu24.04-x64"
+
+
+def test_install_resolves_npm_and_node_once_and_logs_what_it_runs(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The bootstrap's PATH-derived npm/Node are resolved once and recorded.
+
+    Reporting only: the logged writability never changes whether the install runs.
+    """
+    crew = tmp_path / "crew"
+    monkeypatch.setattr(mod, "config_dir", lambda: crew)
+    calls = _wire(monkeypatch, {"npm": "/n/npm", "playwright-cli": "/n/playwright-cli"})
+    lookups: list[str] = []
+    resolve = mod.find_node_tool
+    monkeypatch.setattr(
+        mod, "find_node_tool", lambda name, base_path=None: (lookups.append(name), resolve(name))[1]
+    )
+    monkeypatch.setattr(
+        mod,
+        "bootstrap_tool_provenance",
+        lambda path: {
+            "path": path,
+            "real_path": path,
+            "writable_at": "/n",
+            "own_toolchain": False,
+            "shared_write": True,
+        },
+    )
+
+    with caplog.at_level("INFO", logger=mod.__name__):
+        result = mod.install()
+
+    assert result["ok"] is True
+    assert sorted(lookups) == ["node", "npm"]
+    assert calls[0][0] == "/n/npm"
+    logged = caplog.text
+    assert "browser install bootstrap: npm=/n/npm" in logged
+    assert "browser install bootstrap: node=/n/node" in logged
+    assert "user-writable at=/n, own toolchain=False, group/other-writable=True" in logged

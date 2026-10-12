@@ -51,14 +51,14 @@ def _isolated(tmp_path, monkeypatch):
     # Each test runs on its own event loop and an ``asyncio.Lock`` binds to the
     # loop it is first contended on, so a lock left from one test would fail the
     # next test's contended wait with "bound to a different event loop".
-    routes._BOARD_LOCKS.clear()
+    routes._BOARD_LOCKS._locks.clear()
 
     async def _recognized(*a: Any, **k: Any) -> None:
         return None
 
     monkeypatch.setattr(routes, "_recognize_session", _recognized)
     monkeypatch.setattr(routes, "_is_restricted_session", lambda *a: False)
-    monkeypatch.setattr(routes, "_reaches_a_channel", lambda request, sk: False)
+    monkeypatch.setattr(routes, "reaches_a_channel", lambda state, sk: False)
     yield
     _SLOTS.clear()
 
@@ -543,6 +543,71 @@ def test_a_rebuild_sets_the_create_counter_to_what_the_record_holds(monkeypatch)
     monkeypatch.setattr(wl, "MAX_STORED_ITEMS_PER_CONDUCTOR", 2)
     wl.apply_conductor_action(CONDUCTOR, "create", title="second", acceptance={})
     assert wl.read_conductor(CONDUCTOR).created_total == 2
+
+
+def _seed_cached_cap(goal_version: int, item_cap: int, base: int) -> None:
+    """Write a cached header carrying a spend cap, as goal writes would leave it."""
+    wl.ensure_conductor(CONDUCTOR, goal="ship it")
+    header_path = wl.conductor_dir(CONDUCTOR) / "conductor.json"
+    stored = json.loads(header_path.read_text(encoding="utf-8"))
+    stored.update(goal_version=goal_version, item_cap=item_cap, goal_items_base=base)
+    header_path.write_text(json.dumps(stored), encoding="utf-8")
+
+
+def test_a_clean_rebuild_keeps_the_cached_goal_item_cap(monkeypatch):
+    """The cap rides no log entry, so a cache in step with the record keeps it."""
+    fold = _rendered(CONDUCTOR, "it_0000abcd")
+    fold["conductor"]["goal_version"] = 1
+    monkeypatch.setattr(
+        projection,
+        "read_slot_projection",
+        lambda slot, name, **_kw: SimpleNamespace(value=fold if name == "work" else {}),
+    )
+    _seed_cached_cap(goal_version=1, item_cap=50, base=1)
+    wl.rebuild_from_projection(CONDUCTOR)
+    header = wl.read_conductor(CONDUCTOR)
+    assert (header.item_cap, header.goal_items_base) == (50, 1)
+
+
+def test_a_clean_rebuild_of_an_upgraded_header_counts_from_the_upgrade(monkeypatch):
+    """A trusted header with no stored count start keeps its legacy status."""
+    fold = _rendered(CONDUCTOR, "it_0000abcd")
+    fold["conductor"]["goal_version"] = 1
+    monkeypatch.setattr(
+        projection,
+        "read_slot_projection",
+        lambda slot, name, **_kw: SimpleNamespace(value=fold if name == "work" else {}),
+    )
+    _seed_cached_cap(goal_version=1, item_cap=20, base=0)
+    header_path = wl.conductor_dir(CONDUCTOR) / "conductor.json"
+    stored = json.loads(header_path.read_text(encoding="utf-8"))
+    stored.pop("goal_items_base")
+    header_path.write_text(json.dumps(stored), encoding="utf-8")
+    wl.rebuild_from_projection(CONDUCTOR)
+    header = wl.read_conductor(CONDUCTOR)
+    assert (header.created_total, header.goal_items_base, header.goal_items_used) == (1, 1, 0)
+
+
+def test_a_dirty_rebuild_drops_a_refused_goal_writes_cap_and_count_start(monkeypatch):
+    """A goal write the record never got can carry a raised cap and a reset count.
+
+    The rebuild puts the recorded goal back, so it must not keep that write's budget:
+    it falls back to the default cap, counted from the board's first create.
+    """
+    fold = _rendered(CONDUCTOR, "it_0000abcd")
+    fold["conductor"]["goal_version"] = 1
+    monkeypatch.setattr(
+        projection,
+        "read_slot_projection",
+        lambda slot, name, **_kw: SimpleNamespace(value=fold if name == "work" else {}),
+    )
+    _seed_cached_cap(goal_version=2, item_cap=200, base=1)
+    wl.mark_cache_dirty(CONDUCTOR, "an unrecorded write could not be undone")
+    wl.rebuild_from_projection(CONDUCTOR)
+    header = wl.read_conductor(CONDUCTOR)
+    assert header.goal == "ship it"
+    assert (header.item_cap, header.goal_items_base) == (wl.DEFAULT_GOAL_ITEM_CAP, 0)
+    assert header.goal_items_used == header.created_total == 1
 
 
 def test_a_bound_workers_real_unit_joins_the_fold_and_its_report_is_rebuilt():
@@ -2461,8 +2526,20 @@ async def test_a_write_queued_behind_the_lock_rechecks_the_dirty_flag_under_it(m
     _real_units(monkeypatch)
     item_id = await _board()
 
-    lock = routes._board_lock(CONDUCTOR)
-    await lock.acquire()
+    async def _hold_the_board() -> tuple[asyncio.Future[None], asyncio.Event]:
+        """Hold CONDUCTOR's board lock in a helper task until the returned event is set."""
+        held, release = asyncio.Event(), asyncio.Event()
+
+        async def _holder() -> None:
+            async with routes._board_lock(CONDUCTOR):
+                held.set()
+                await asyncio.wait_for(release.wait(), 10)
+
+        holder = asyncio.ensure_future(_holder())
+        await asyncio.wait_for(held.wait(), 10)
+        return holder, release
+
+    holder, release = await _hold_the_board()
     queued = asyncio.ensure_future(
         _record(CONDUCTOR, {"action": "decide", "item_id": item_id, "decision": "go"})
     )
@@ -2470,7 +2547,8 @@ async def test_a_write_queued_behind_the_lock_rechecks_the_dirty_flag_under_it(m
         await asyncio.sleep(0.005)
     assert not queued.done()  # past the early check, waiting on the lock
     wl.mark_cache_dirty(CONDUCTOR, "the write ahead could not be undone")
-    lock.release()
+    release.set()
+    await asyncio.wait_for(holder, 10)
 
     status, body = await queued
     assert (status, body["code"]) == (409, "cache_dirty"), body
@@ -2478,13 +2556,14 @@ async def test_a_write_queued_behind_the_lock_rechecks_the_dirty_flag_under_it(m
 
     # The same race on the worker's route.
     wl.clear_cache_dirty(CONDUCTOR)
-    await lock.acquire()
+    holder, release = await _hold_the_board()
     queued = asyncio.ensure_future(_report(WORKER, {"status": "progress", "summary": "x"}))
     for _ in range(20):
         await asyncio.sleep(0.005)
     assert not queued.done()
     wl.mark_cache_dirty(CONDUCTOR, "the write ahead could not be undone")
-    lock.release()
+    release.set()
+    await asyncio.wait_for(holder, 10)
     status, body = await queued
     assert (status, body["code"]) == (409, "cache_dirty"), body
     assert wl.read_work_item(CONDUCTOR, item_id).status is None

@@ -649,6 +649,7 @@ class _UnitState:
     unit_id: str = ""
     error: str = ""
     result: str = ""
+    started: str = ""
 
     @property
     def reachable(self) -> bool:
@@ -721,7 +722,15 @@ class _UnitState:
         return f"{self.scope} scope: {self.active} ({self.sub}){alias}"
 
 
-_SHOW_PROPERTIES = ("Id", "LoadState", "ActiveState", "SubState", "FragmentPath", "Result")
+_SHOW_PROPERTIES = (
+    "Id",
+    "LoadState",
+    "ActiveState",
+    "SubState",
+    "FragmentPath",
+    "Result",
+    "ExecMainStartTimestampMonotonic",
+)
 
 
 def _unit_state(*, user: bool) -> _UnitState:
@@ -770,6 +779,65 @@ def _unit_state(*, user: bool) -> _UnitState:
         fragment=props.get("FragmentPath", ""),
         unit_id=props.get("Id", ""),
         result=props.get("Result", ""),
+        started=props.get("ExecMainStartTimestampMonotonic", ""),
+    )
+
+
+def _loaded_restart_prevent(*, user: bool) -> str | None:
+    """The ``RestartPreventExitStatus`` value the scope's manager has LOADED for
+    our unit -- the merged unit, drop-ins included, as of the last daemon-reload
+    -- or ``None`` when ``systemctl`` answered with no such property line.
+
+    ``--all`` so an unset property still prints as ``RestartPreventExitStatus=``
+    (empty) rather than being omitted, which keeps "not set" apart from "this
+    systemctl did not answer".
+    """
+    res = _systemctl(
+        "show",
+        "--all",
+        "-p",
+        "RestartPreventExitStatus",
+        f"{SERVICE_NAME}.service",
+        sudo=False,
+        user=user,
+    )
+    for line in (res.stdout or "").splitlines():
+        key, sep, value = line.partition("=")
+        if sep and key.strip() == "RestartPreventExitStatus":
+            return value.strip()
+    return None
+
+
+def _stale_unit_line(state: _UnitState) -> str | None:
+    """One line saying the LOADED unit does not exempt
+    :data:`LIVE_HOLDER_EXIT_CODE` from ``Restart=``, with the command that fixes
+    it, or ``None`` when there is nothing to say.
+
+    ``service install`` writes the unit once and no upgrade re-renders it, so a
+    unit written before the exemption existed keeps relaunching into the
+    live-holder refusal. The manager's loaded value is what is asked, not the
+    file on disk: it is what systemd acts on, it includes drop-ins, and a file
+    edited without a daemon-reload still reads as missing. Read-only on purpose:
+    no sudo, no rewrite, no reload. Only a loaded unit that is ours
+    (:attr:`_UnitState.ours`) is asked; a property ``systemctl`` did not report
+    makes no claim.
+    """
+    if state.load != "loaded" or not state.ours:
+        return None
+    value = _loaded_restart_prevent(user=state.scope == "user")
+    if value is None or str(LIVE_HOLDER_EXIT_CODE) in value.split():
+        return None
+    directive = f"RestartPreventExitStatus={LIVE_HOLDER_EXIT_CODE}"
+    if state.scope == "system":
+        remedy = "re-run `sudo kirocrew service install` to re-render it"
+    else:
+        where = f" in {state.fragment}" if state.fragment else ""
+        remedy = (
+            f"add it under [Service]{where}, then run `systemctl --user daemon-reload`"
+        )
+    return (
+        f"  ⚠️  the loaded unit lacks `{directive}`, which this build's unit carries "
+        f"(no upgrade re-renders an installed unit): {remedy}."
     )
 
 
@@ -1957,6 +2025,12 @@ def stop() -> None:
 # an exec failure and a Python import error with margin; a gateway that dies
 # later than that is the supervisor's to report, and `kirocrew service status`
 # / `kirocrew logs` are where it shows.
+#
+# A unit whose ``RestartSec`` is shorter than the read interval can die and be
+# ``active`` again between two reads, so the state alone can step over the
+# death. Each read therefore also carries ``ExecMainStartTimestampMonotonic``:
+# the manager stamps it at every exec of the main process, so a value that
+# changes inside the window is a restart the reads never saw in progress.
 _RESTART_SETTLE_SECS = 2.0
 _RESTART_POLL_SECS = 0.25
 
@@ -1985,9 +2059,15 @@ def _confirm_up(*, user: bool) -> tuple[str, str] | None:
     the deadline and reports what it finds there. A manager that stops answering
     mid-window leaves the unit's health UNKNOWN — not "exiting", not "restarted"
     — and is reported as :data:`RESTART_UNCONFIRMED`.
+
+    A main-process start stamp that changes between two reads is a death and a
+    re-exec the state reads fell between (a short ``RestartSec``), reported as
+    :data:`RESTART_NOT_UP` whatever state the later read shows. A manager that
+    answers no stamp (``0`` or absent) leaves this check off.
     """
     unit = f"{SERVICE_NAME}.service"
     deadline = time.monotonic() + _RESTART_SETTLE_SECS
+    first_start = ""
     while True:
         state = _unit_state(user=user)
         if not state.reachable:
@@ -2002,6 +2082,16 @@ def _confirm_up(*, user: bool) -> tuple[str, str] | None:
                 RESTART_NOT_UP,
                 f"{unit} is {state.active} ({state.sub}){last} after the restart — "
                 f"the gateway exits as soon as it starts",
+            )
+        started = state.started if state.started not in ("", "0") else ""
+        if started and not first_start:
+            first_start = started
+        elif started and started != first_start:
+            return (
+                RESTART_NOT_UP,
+                f"{unit} exited and was started again by the manager after the "
+                f"restart (now {state.active} ({state.sub}){last}) — the gateway "
+                f"exits as soon as it starts",
             )
         if time.monotonic() >= deadline:
             if state.up:
@@ -2108,7 +2198,11 @@ def status() -> str:
     ``ActiveState (SubState)``, followed by the ``systemctl status`` block for
     each scope that actually has a unit. A scope with no unit never shows
     systemd's ``inactive (dead)`` for it: that line, printed for the system
-    scope alone, is what makes a running user-scope gateway read as dead.
+    scope alone, is what makes a running user-scope gateway read as dead. A
+    loaded unit of ours whose manager-loaded ``RestartPreventExitStatus`` does
+    not name :data:`LIVE_HOLDER_EXIT_CODE` gets one more line under its headline
+    naming the directive and the command that adds it (:func:`_stale_unit_line`);
+    nothing is rewritten.
 
     Status is queryable without sudo. We avoid sudo here so
     ``kirocrew service status`` doesn't prompt for a password just to
@@ -2118,6 +2212,9 @@ def status() -> str:
     for user in (False, True):
         state = _unit_state(user=user)
         lines = [state.headline()]
+        stale = _stale_unit_line(state)
+        if stale is not None:
+            lines.append(stale)
         if state.installed:
             res = _systemctl(
                 "status", f"{SERVICE_NAME}.service", "--no-pager", sudo=False, user=user

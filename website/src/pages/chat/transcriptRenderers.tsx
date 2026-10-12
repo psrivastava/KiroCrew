@@ -35,10 +35,11 @@ import type React from 'react'
 import ThinkingBlock from './ThinkingBlock'
 import ToolCallLine from './ToolCallLine'
 import NudgeCard, { nudgeMatchesLoop } from './NudgeCard'
+import ConversationCard, { CARD_ROLE } from '../../cards/ConversationCard'
 import RecoveryCard, { opensTurn, resolveInjectCard } from './RecoveryCard'
 import { SystemNoticeRow, isSystemNoticeRow } from './CompactionCard'
 import SkillLoadCard, { isSkillLoadRow } from './SkillLoadCard'
-import { ErrorCard, SESSION_START_REPEAT_REFUSAL_AT, isAuthRequired, isCapabilitiesChanged, isModelUnentitled, isSessionStartFailed, isUsageLimit, sessionStartFailureStreak } from './ErrorCard'
+import { ErrorCard, SESSION_START_REPEAT_REFUSAL_AT, isAuthRequired, isCapabilitiesChanged, isModelUnentitled, isSessionStartFailed, isTurnTimeout, isUsageLimit, sessionStartFailureStreak } from './ErrorCard'
 import { FEATURE_REQUEST_FORM_URL, isFeatureRequestRow } from '../../prompts/featureRequest'
 import NoticeCard from './NoticeCard'
 import { resolveTransientNotice } from './transientNotice'
@@ -51,7 +52,9 @@ import { REASONING_ROLES, hasReasoningContent } from './groupDisplayItems'
 import { FileCard } from '../../components/FileCard'
 import UserMessage from './UserMessage'
 import CrewmateMessage, { type CrewmateIdentity } from './CrewmateMessage'
-import { crewmateBubbleClass, crewmateRunPosition } from '../../components/chat/crewmateBubbles'
+import { crewmateBubbleClass, crewmateCornerClass, crewmateRunPosition } from '../../components/chat/crewmateBubbles'
+import { CardCornersContext } from '../../cards/cardCorners'
+import { CardAuthorContext } from '../../cards/cardAuthor'
 import { formatTs, quoteMessageFor, renderAssistantBubble, replyInThreadFor, threadFooterFor, type MessageRenderer, type MessageRenderContext } from '../../app-sdk/messageRenderers'
 import { renderUserContent } from './ChatPageMessageContent'
 import { fmtMessageTimeFull } from './messageTime'
@@ -155,6 +158,9 @@ export interface TranscriptRendererOptions {
   /** Fix affordance for a `materialization_changed` row: open the named crew
    *  member's Capabilities pane. Omitted on a surface with no crew editor. */
   onOpenCapabilities?: (member: string) => void
+  /** Fix affordance for a `turn_timeout` row: deep-link to the Turn Time Limit
+   *  setting. Omitted on a surface with no settings route. */
+  onOpenTurnLimit?: () => void
   /** Draw the assistant rows as a CREWMATE speaking: avatar + name + time on
    *  the first message of a run, one bordered bubble per message, grouped
    *  corners (components/chat/crewmateBubbles). Set by the Members page for a
@@ -164,9 +170,10 @@ export interface TranscriptRendererOptions {
    *  drawn. */
   crewmate?: CrewmateIdentity
   /** The UNFILTERED transcript behind a crewmate's chat. The rows the pane
-   *  draws are `ctx.messages`; the rows the pane dropped (the `inject` row a
-   *  policy block writes among them) are only here. Read for the steer-chip
-   *  decision, never for layout. Meaningless without `crewmate`. */
+   *  draws are `ctx.messages`; the turn boundaries the pane dropped (a patrol
+   *  wake, a cron or sub-agent envelope between two replies) are only here.
+   *  Read for the run position, never for layout. Meaningless without
+   *  `crewmate`. */
   crewmateTranscript?: ChatMessage[]
 }
 
@@ -380,6 +387,33 @@ export function createTranscriptRenderers(
       },
     },
     {
+      // Mate's change card or guide offer, at the point it was proposed. The
+      // row holds a reference; the live card is the card / guide store's, so it
+      // updates in place (cards/ConversationCard). The SDK default draws nothing
+      // for this role, which is right for a store-free surface.
+      id: 'conversation_card',
+      roles: [CARD_ROLE],
+      // In a crewmate's chat the card is the crewmate's own message: it joins
+      // the run of the reply that explains it, in the same column and exactly
+      // as wide as a reply.
+      render: (m, ctx) => {
+        if (!crewmate) return ctx.row(<ConversationCard message={m} slot={o.slot} />)
+        const pos = crewmateRunPosition(ctx.messages, ctx.index, crewmateTranscript)
+        return ctx.row(
+          <CrewmateMessage pos={pos}>
+            {/* Same cap as a crewmate bubble (72ch at the message font size). */}
+            <div className="max-w-[72ch]" style={{ fontSize: 'var(--mc-message-font-size, 14px)' }}>
+              <CardCornersContext.Provider value={crewmateCornerClass(pos)}>
+                <CardAuthorContext.Provider value={crewmate.label || crewmate.name}>
+                  <ConversationCard message={m} slot={o.slot} />
+                </CardAuthorContext.Provider>
+              </CardCornersContext.Provider>
+            </div>
+          </CrewmateMessage>,
+        )
+      },
+    },
+    {
       // No default entry: an auto-nudge turn would draw nothing at all.
       id: 'nudge',
       roles: ['nudge'],
@@ -411,6 +445,20 @@ export function createTranscriptRenderers(
         if (!parsed) return null
         return ctx.row(<RecoveryCard parsed={parsed} disclosureKey={ctx.key} />)
       },
+    },
+    {
+      // A re-routed automation refusal (`injectKind: 'automation_notice'`,
+      // session_directive_apply._deliver_refusal_to_crewmate) exists ONLY to
+      // carry the refusal into the crewmate's next turn for the model; the
+      // person-facing surface is the `notice` bar the same refusal already
+      // wrote. The crewmate DM hides this inject row via MACHINERY_ROLES; every
+      // other surface (the Sessions page) suppresses it here too, so the raw
+      // `[Automation notice] …` text never draws as a second row beside the
+      // notice bar. Must precede the generic inject bubble.
+      id: 'automation_notice_inject',
+      roles: ['inject'],
+      match: m => (m.meta as { injectKind?: unknown } | undefined)?.injectKind === 'automation_notice',
+      render: () => null,
     },
     {
       // Refines `assistant`: a gateway system notice (kind=compaction or
@@ -466,14 +514,14 @@ export function createTranscriptRenderers(
             const pos = crewmateRunPosition(ctx.messages, ctx.index, crewmateTranscript)
             // The run ends here (single / end): the row after it is a boundary
             // the user sees or the turn ended, so this bubble is the one that
-            // carries the hover actions. The policy-block read goes to
-            // the unfiltered transcript — see `crewmateTranscript`; the row is
-            // located by identity, since the filter keeps the same objects.
-            const full = crewmateTranscript
-            const fullIndex = full ? full.indexOf(m) : -1
+            // carries the hover actions. No "Steered" chip on any bubble: in a
+            // DM with one named peer every send while it works is a steer, so
+            // the ack kiro-cli emits would close nearly every reply with the
+            // mechanics this surface hides (#17838). The marker is still
+            // stripped from the prose.
             const bubble = renderAssistantBubble(m, ctx, crewmateBubbleClass(pos), {
               forceFooter: pos === 'single' || pos === 'end',
-              policyBlockTranscript: full && fullIndex >= 0 ? { messages: full, index: fullIndex } : undefined,
+              suppressSteerAck: true,
               // A crewmate's reply is prose about the crew's own work, so it
               // names sessions constantly. Same triple the single-chat page
               // hands its bubble, and `m.ts` with it so the SHORT form resolves
@@ -552,15 +600,22 @@ export function createTranscriptRenderers(
             unentitledElsewhere={unentitled}
             featureRequestFormUrl={featureRequestFormUrl}
             onOpenCapabilities={openCapabilities}
+            onOpenTurnLimit={isTurnTimeout(m) ? o.onOpenTurnLimit : undefined}
+            turnLimitSlot={isTurnTimeout(m) ? o.slot : undefined}
           />,
         )
       },
     },
     // Replaces the SDK's `user` entry (same id) ONLY when the host asks for it:
     // identical content path (renderUserContent — paste chips, inline images
-    // and file cards included), one prop different. Absent the flag no entry is emitted, so every other
-    // surface keeps the SDK row byte-for-byte.
-    ...(o.hideSteerBadge
+    // and file cards included), one or two props different. Two hosts ask: a
+    // steer-only surface (no badge) and a crewmate's chat (the accent fill,
+    // #17839). The crewmate case is its own trigger, not a consequence of the
+    // badge flag: the Members page left `steer-only` in #16684, so gating the
+    // accent on `hideSteerBadge` alone left #17918's fill unreachable on the
+    // one surface it was built for (#18361). Absent both no entry is emitted,
+    // so every other surface keeps the SDK row byte-for-byte.
+    ...(o.hideSteerBadge || crewmate
       ? [{
           id: 'user',
           roles: ['user'],
@@ -583,10 +638,12 @@ export function createTranscriptRenderers(
                   activeSession: o.activeSession,
                   messageTs: m.ts,
                 })}
-                hideSteerBadge
+                // Passed through, not forced: a crewmate chat in split busy
+                // mode still steers, and its Steered chip stays.
+                hideSteerBadge={o.hideSteerBadge}
                 // The accent fill pairs with the crewmate's gray bubble above
                 // (#17839); a host that hides the steer badge without a
-                // crewmate (none today) keeps the neutral surface.
+                // crewmate keeps the neutral surface.
                 tone={crewmate ? 'accent' : 'default'}
                 onReplyInThread={replyInThreadFor(m, ctx)}
                 onQuoteMessage={quoteMessageFor(m, ctx, 'user')}

@@ -74,6 +74,7 @@ from kiro_crew.autonudge import (
     APPROVAL_STALL_REASON,
     CONSECUTIVE_FAILURE_REASON,
     FINISHED_LOOP_REASONS,
+    MODEL_REFUSED_REASON,
     MONITOR_TERMINAL_REASON,
     STRUCTURAL_TERMINAL_REASON,
     AutoNudgeService,
@@ -115,7 +116,11 @@ from kiro_crew.config.loader import (
     workspace_root,
 )
 from kiro_crew.config.paths import kiro_agents_dir
-from kiro_crew.constants import SUBAGENT_COMPLETION_META_KEY, strip_control_comments
+from kiro_crew.constants import (
+    NO_TOOL_CALLS_NOTE,
+    SUBAGENT_COMPLETION_META_KEY,
+    strip_control_comments,
+)
 from kiro_crew.context import ContextBuilder, session_store_for_turn
 from kiro_crew.context_management import summarize_result
 from kiro_crew.cron import (  # noqa: F401
@@ -136,8 +141,10 @@ from kiro_crew.dashboard.chat_runner import (
     _arm_queued_delivery_settlement,
     _auto_approve_reason,
     _resolve_channel_target,
+    _retire_sessions_on_identity_change,
     _run_chat,
     _slot_is_trusted,
+    drain_idle_parent_queue_for_stall,
     turn_stats_meta,
 )
 from kiro_crew.dashboard.chat_utils import (  # noqa: F401
@@ -177,6 +184,7 @@ from kiro_crew.dashboard.origin import (
     parse_dashboard_url,
     resolve_dashboard_host,
 )
+from kiro_crew.dashboard.sign_in_refresher import drain_sign_in_refresher, run_sign_in_refresher
 from kiro_crew.dashboard.stale_asset_watchdog import (
     run_stale_asset_watchdog,
     shutdown_exit_code,
@@ -185,6 +193,7 @@ from kiro_crew.dashboard.state import (
     SUBAGENT_BATCH_COMPLETION_PREFIX,
     SUBAGENT_COMPLETION_PREFIX,
     DashboardState,
+    load_window_off_loop,
 )
 from kiro_crew.dashboard.token_auth import MAX_SESSION_TTL_SECS, generate_token
 from kiro_crew.dashboard.turn_dispatch import bounded_chat_turn, spawn_guarded_turn
@@ -315,6 +324,7 @@ from kiro_crew.monitoring.models import (
 )
 from kiro_crew.notifications.bus import MONITOR_CHANNEL
 from kiro_crew.platform import boot_platform
+from kiro_crew.platform.bootstrap import apply_kas_cli_floor
 from kiro_crew.platform.context import (  # noqa: F401
     PlatformCompositionError,
     current_context,
@@ -369,7 +379,7 @@ from kiro_crew.security import (
     redact_credentials,
     redact_exfiltration_urls,
 )
-from kiro_crew.sel import sel
+from kiro_crew.sel import flush_audit_queue_before_hard_exit, sel
 from kiro_crew.service.common import restart_command_hint
 from kiro_crew.session import (
     HEARTBEAT_KEY,
@@ -691,10 +701,46 @@ class _DmDispatchAdapter:
 # active slots) — the marker is best-effort, the slot save is not.
 _MARKER_WRITE_WAIT_SECS = 5.0
 
+# How often the gateway re-stats the governance profiles directory and re-derives
+# the on-disk auto-approvals when a saved profile has moved the governance answer.
+# Bounds how long a profile that withdraws an auto-approved tool can be bypassed by
+# a newly started session; an unchanged tick costs a directory stat.
+_PROFILE_PROJECTION_POLL_S = 15.0
+
 
 # Slack Block Kit section.text hard limit is 3000 chars.
 # We split cron output at this boundary so each chunk fits in a section block.
 _CRON_MSG_LIMIT = 3000
+
+
+#: Session-key prefixes of a workflow RUN's step sessions, each followed by
+#: ``<run_id>:``: per-call (``wf:``), pooled worker, unpooled call, and the
+#: memory-scoped worker key.
+_WORKFLOW_STEP_PREFIXES = ("wf:", "wf-pool:", "wf-unpooled:", "wf-worker:")
+
+
+def _spawn_parent_slot(parent_key: str, workflow_service: Any) -> str:
+    """The dashboard slot whose Trust governs a spawn parented on *parent_key*.
+
+    A workflow step runs in its own ``<prefix>:<run_id>:...`` session, which no
+    tab displays. Its spawns answer to the chat that STARTED the run: the registry
+    records that origin ``session_key`` only after the run route proved the
+    caller is that session. An unknown run or a blank origin yields ``""``, so
+    the spawn prompts exactly as before.
+    """
+    if not parent_key:
+        return ""
+    if not parent_key.startswith(_WORKFLOW_STEP_PREFIXES):
+        return subagent_event_slot(parent_key)
+    run_id = parent_key.split(":", 2)[1]
+    registry = getattr(workflow_service, "registry", None)
+    try:
+        handle = registry.get(run_id) if run_id and registry is not None else None
+    except Exception:
+        logger.warning("spawn slot: workflow run %s lookup failed", run_id, exc_info=True)
+        return ""
+    origin = str(getattr(handle, "session_key", "") or "")
+    return subagent_event_slot(origin) if origin else ""
 
 
 def _live_session_work_dirs(sessions: Any) -> list[str]:
@@ -706,6 +752,13 @@ def _live_session_work_dirs(sessions: Any) -> list[str]:
         for path in (str(getattr(p, "cwd", "") or "") for p in sessions.active_providers())
         if path
     ]
+
+
+def _live_session_agents(sessions: Any) -> set[str]:
+    """The agent names every provider the session registry holds now was spawned with."""
+    if sessions is None:
+        return set()
+    return {agent for agent in map(read_effective_agent, sessions.active_providers()) if agent}
 
 
 def _sweep_predecessor_session_work_dirs(live_work_dirs: list[str]) -> int:
@@ -1025,6 +1078,9 @@ class GatewayOrchestrator:
         # task so _check_console_script can kill and reap its child group.
         self._console_script_repair_task: "asyncio.Task[None] | None" = None
         self._marker_write_task: "asyncio.Task[None] | None" = None
+        # Shutdown waits on this task so an in-flight sign-in renewal can
+        # persist its replacement credential before the hard exit.
+        self._sign_in_refresher_task: "asyncio.Task[None] | None" = None
         # Set by the shutdown path when the marker write is still in flight:
         # tells the writer thread to self-clear after publishing, closing the
         # write-after-clear race without any event-loop dependency.
@@ -1050,6 +1106,9 @@ class GatewayOrchestrator:
         # installed. Cancelled on shutdown so stalled network or installer work
         # cannot hold the process open.
         self._update_check_task: "asyncio.Task[None] | None" = None
+        # Periodic governance-profile re-projection; cancelled at shutdown beside the
+        # distribution refresher, so no rebuild starts into a closing gateway.
+        self._profile_watch_task: "asyncio.Task[None] | None" = None
         self._update_apply_deferred = False
         self._pending_update_respawn: Callable[[], str] | None = None
         # Whether the pending restart serves a policy floor, and its target key:
@@ -3070,6 +3129,12 @@ class GatewayOrchestrator:
                         slot = await rehydrate_slot_from_history_async(
                             self.dashboard_state, slot_key
                         )
+                    elif getattr(slot, "window_pending", False) is True:
+                        # A tab restored as a sidebar row: its window loads
+                        # before the delivery below appends to it, off the loop
+                        # for the same reason, and the tab is read again after.
+                        await load_window_off_loop(slot)
+                        slot = self.dashboard_state.get_slot(slot_key)
                     label = redact(job.name)
                     if slot:
                         wrapped = f'[Cron notification: "{label}"]\n{message}\n[/Cron notification]'
@@ -4665,6 +4730,19 @@ class GatewayOrchestrator:
                         expected=bound_execution,
                     )
 
+                # The dashboard's per-turn account gate, run before acquiring as
+                # _run_chat runs it. A `cron:` key never claims a warm-pool
+                # process, but a fire whose sub-agents are still running skips the
+                # reset in its `finally`, and the next fire of a
+                # `persistent_session` job, or of the same `agent_sequence` step,
+                # reuses that live session. After an account switch or
+                # `kiro-cli logout` outside the dashboard it still holds the
+                # previous account, and a host where only crons run has no
+                # dashboard turn to retire it. Passed as unattended: when the gate
+                # cannot identify the signed-in account (a social login, an
+                # unreadable store) the fire touches no session, since it could
+                # not tell a stale one from a healthy one on any fire.
+                await _retire_sessions_on_identity_change(self.dashboard_state, unattended=True)
                 try:
                     client, is_new, resumed = await self.sessions.get_or_create(
                         key,
@@ -4787,6 +4865,10 @@ class GatewayOrchestrator:
                             f"cron '{job.name}': empty agent_sequence step cannot resolve a crew; "
                             "refusing to dispatch",
                         )
+                        # The job's own configuration causes this refusal, so a
+                        # retry meets it again: a plain one-shot is parked
+                        # (``run_parks_one_shot``) instead of retried every floor.
+                        job.refusal_cannot_clear = True
                         return None
                     _live_agent = _retained_session_agent_mismatch(
                         step.session_key, step.dispatch_agent
@@ -4838,11 +4920,20 @@ class GatewayOrchestrator:
                         # None until a completion is observed: a stream that ends
                         # without one is not landed.
                         _seq_stop: dict[str, str | None] = {"reason": None}
+                        # Whether the backend reported a completed compaction during
+                        # the step's stream, which drops the session-start context.
+                        _seq_compaction: dict[str, bool] = {"completed": False}
 
                         def _seq_note_complete(
                             ev: Any, _box: dict[str, str | None] = _seq_stop
                         ) -> None:
                             _box["reason"] = str(getattr(ev, "stop_reason", "") or "")
+
+                        def _seq_note_compaction(
+                            ev: Any, _box: dict[str, bool] = _seq_compaction
+                        ) -> None:
+                            if getattr(ev, "text", "") == "completed":
+                                _box["completed"] = True
 
                         try:
                             _seq_execution = cron_execution.with_template(
@@ -4915,6 +5006,7 @@ class GatewayOrchestrator:
                                     ),
                                     on_tool_gate=_gate.note,
                                     on_complete=_seq_note_complete,
+                                    on_compaction=_seq_note_compaction,
                                     fallback_models=configured_fallback_chain(),
                                 )
                             )
@@ -4992,13 +5084,15 @@ class GatewayOrchestrator:
                             )
                         finally:
                             # Before the reset below: a turn that consumed the
-                            # post-compaction flag but never landed puts it back so
-                            # a session that survives (deferred reset) re-injects.
+                            # post-compaction flag but never landed, or whose backend
+                            # compacted the session, sets the flag so a session that
+                            # survives (deferred reset) re-injects.
                             rearm_reinjection(
                                 self.sessions,
                                 agent_session_key,
                                 consumed=_seq_reinjection,
                                 landed=_seq_landed,
+                                compacted=_seq_compaction["completed"],
                             )
                             rollback_skill_bodies(
                                 self.ctx_builder, agent_session_key, landed=_seq_landed
@@ -5097,9 +5191,16 @@ class GatewayOrchestrator:
             _needs_reinjection = False
             _turn_landed = False
             _turn_stop: dict[str, str | None] = {"reason": None}
+            # Whether the backend reported a completed compaction during the
+            # turn's stream, which drops the session-start context.
+            _turn_compaction: dict[str, bool] = {"completed": False}
 
             def _note_complete(ev: Any, _box: dict[str, str | None] = _turn_stop) -> None:
                 _box["reason"] = str(getattr(ev, "stop_reason", "") or "")
+
+            def _note_compaction(ev: Any, _box: dict[str, bool] = _turn_compaction) -> None:
+                if getattr(ev, "text", "") == "completed":
+                    _box["completed"] = True
 
             try:
                 assert self.sessions is not None
@@ -5258,6 +5359,7 @@ class GatewayOrchestrator:
                     ),
                     on_tool_gate=_gate.note,
                     on_complete=_note_complete,
+                    on_compaction=_note_compaction,
                     fallback_models=configured_fallback_chain(),
                 )
 
@@ -5739,8 +5841,10 @@ class GatewayOrchestrator:
                         # the transient arm does, or the finally below would
                         # re-arm the REPLACEMENT after the retry lands and keeps
                         # it (deferred reset for pending sub-agents) -- one
-                        # duplicated re-injection on its next turn.
+                        # duplicated re-injection on its next turn. A compaction
+                        # the destroyed session reported goes with it.
                         _needs_reinjection = False
+                        _turn_compaction["completed"] = False
                         _acp_retry_attempted = True
                         return await _cron_callback(job)
                     except Exception:
@@ -6183,10 +6287,15 @@ class GatewayOrchestrator:
             finally:
                 assert self.sessions is not None
                 # Before the reset below: a turn that consumed the post-compaction
-                # flag but never landed puts it back so a session that survives
-                # (deferred reset) re-injects on its next turn.
+                # flag but never landed, or whose backend compacted the session,
+                # sets the flag so a session that survives (deferred reset)
+                # re-injects on its next turn.
                 rearm_reinjection(
-                    self.sessions, session_key, consumed=_needs_reinjection, landed=_turn_landed
+                    self.sessions,
+                    session_key,
+                    consumed=_needs_reinjection,
+                    landed=_turn_landed,
+                    compacted=_turn_compaction["completed"],
                 )
                 rollback_skill_bodies(self.ctx_builder, session_key, landed=_turn_landed)
                 if _acquired:
@@ -6453,10 +6562,12 @@ class GatewayOrchestrator:
                     # BEFORE the release: the next task of the cycle builds on
                     # the same session, and a settle after it would act on that
                     # task's build instead.
-                    if _turn_compaction["completed"]:
-                        self.sessions.mark_needs_reinjection(session_key)
                     rearm_reinjection(
-                        self.sessions, session_key, consumed=_needs_reinjection, landed=_turn_landed
+                        self.sessions,
+                        session_key,
+                        consumed=_needs_reinjection,
+                        landed=_turn_landed,
+                        compacted=_turn_compaction["completed"],
                     )
                     rollback_skill_bodies(self.ctx_builder, session_key, landed=_turn_landed)
                     # Release the per-session semaphore so the next task in
@@ -7245,6 +7356,14 @@ class GatewayOrchestrator:
                 loop.slot_key,
                 loop.id,
             )
+        elif getattr(slot, "window_pending", False) is True:
+            # A tab restored as a sidebar row (a paused loop's tab can be one)
+            # loads its window before the nudge appends to it, with the read off
+            # the loop for the reason above. The same tab must still be live
+            # after the await; a tab closed meanwhile takes no nudge.
+            await load_window_off_loop(slot)
+            if self.dashboard_state.get_slot(loop.slot_key) is not slot:
+                return _delivery_result(wake_message, MonitorDispatchResult.UNAVAILABLE)
         # STRUCTURAL-TERMINAL GUARD (message loops only). If the slot's LAST
         # delivered turn ended on a malformed-request rejection, the backend
         # refused the payload's SHAPE, deterministically -- re-injecting the same
@@ -7307,6 +7426,63 @@ class GatewayOrchestrator:
                 "advanced under the fired turn, so the verdict is stale",
                 loop.id,
             )
+        # MODEL-REFUSED GUARD (message loops only). If this loop's own last
+        # delivered cycle ended on a content refusal that nothing retried, the
+        # next cycle would send the same prompt to the same model and be declined
+        # the same way, cycle after cycle, with nobody told. Stop the loop with
+        # ``model_refused`` and notify the owner once instead. Same scoping as the
+        # structural guard above: the verdict names the loop id, and the stop is
+        # applied under the (id, generation) fence, so a revised instruction is
+        # not stopped by a refusal of the old one. The slot's verdict is cleared at
+        # the start of every genuine new turn (a person's message), which lets the
+        # loop fire again once the context changes. Compared as a ``str`` so a
+        # bare MagicMock slot's attribute cannot match.
+        _refused_loop_id = getattr(slot, "_last_turn_model_refused_loop_id", "")
+        if (
+            wake_message is None
+            and isinstance(_refused_loop_id, str)
+            and _refused_loop_id
+            and _refused_loop_id == loop.id
+            and self.autonudge_svc is not None
+        ):
+            _refused_gen = getattr(slot, "_last_turn_model_refused_loop_gen", 0)
+            stopped_loop = await self.autonudge_svc.update(  # type: ignore[union-attr]
+                loop.id,
+                active=False,
+                stopped_reason=MODEL_REFUSED_REASON,
+                expected_generation=_refused_gen if isinstance(_refused_gen, int) else 0,
+            )
+            # Same three answers as the structural fence: inactive means stopped,
+            # None means not a live target, and an active loop means the
+            # generation moved under the refused turn (a stale verdict).
+            if stopped_loop is None or not stopped_loop.active:
+                if stopped_loop is not None and stopped_loop.stopped_reason == MODEL_REFUSED_REASON:
+                    logger.warning(
+                        "AutoNudge: loop %s on slot %s stopped -- its last cycle "
+                        "was declined by the model's content filter and no "
+                        "fallback retried it, so the next cycle would be declined "
+                        "the same way",
+                        loop.id,
+                        loop.slot_key,
+                    )
+                    self._notify_nudge_expired(stopped_loop)
+                return _delivery_result(wake_message, MonitorDispatchResult.UNAVAILABLE)
+            logger.info(
+                "AutoNudge: loop %s refusal stop skipped -- config generation "
+                "advanced under the refused turn, so the verdict is stale",
+                loop.id,
+            )
+        # This cycle's work-ledger news: which items moved, and where to read the
+        # rest. Built ONCE, here, because both ways of delivering it are below -- the
+        # prefix onto the nudge prompt a step down, and the steer into a turn already
+        # running further down still -- and both must carry the same text. Empty for
+        # every other loop shape and for a cycle with nothing owed, which is what
+        # keeps those paths byte-identical to what shipped.
+        _wake_text = (
+            await self._work_ledger_wake_text(loop)
+            if self._work_ledger_wake_loop(loop, wake_message)
+            else ""
+        )
         if wake_message is None:
             # Snapshot message, sentinel AND config generation TOGETHER, before
             # the compose_nudge_body() await: a concurrent PATCH during that
@@ -7320,6 +7496,13 @@ class GatewayOrchestrator:
             _fired_generation = loop.config_generation
             msg = await compose_nudge_body(_fired_message, _fired_sentinel, loop.slot_key)
             tagged = f"{nudge_cycle_header(loop)}\n{msg}"
+            if _wake_text:
+                # The news FIRST, then the standing patrol instruction. Without this
+                # the delivered turn carried the cycle header and the loop's own
+                # message alone: the probe's briefs died with the verdict the gate
+                # read, so the conductor was not told which item had moved and spent
+                # a ``work_ledger_read`` finding out.
+                tagged = f"{_wake_text}\n\n{tagged}"
         else:
             tagged = wake_message
             # Capture the generation on THIS arm too. A monitor wake runs the
@@ -7336,8 +7519,9 @@ class GatewayOrchestrator:
         # so an existing loop's row is byte-identical to today's.
         #
         # A banner deliberately skips ``compose_nudge_body``: that composer
-        # prefixes the work-ledger snapshot, which the model wants and a display
-        # line does not. ``render_nudge_message`` still applies, so
+        # prefixes the SESSION ledger snapshot (``session_ledger.render_snapshot``,
+        # not the work ledger, whose wake carries a read pointer instead), which the
+        # model wants and a display line does not. ``render_nudge_message`` still applies, so
         # ``{{STOP_FILE}}`` resolves in a banner as it does in a message.
         #
         # A banner is a MESSAGE-loop concept: a monitor wake (``wake_message``)
@@ -7369,10 +7553,23 @@ class GatewayOrchestrator:
         )
 
         if slot.running:
-            # Turn still active — drop this nudge. Next idle-timer tick will
-            # schedule again once the turn ends.
-            # Queueing would stack identical 3KB+ nudges and blow up the context
-            # window. Returning False keeps cycle_count accurate (only delivered
+            # Turn still active. A work-ledger wake goes INTO that turn rather than
+            # waiting it out: its payload is a line naming the item that moved plus a
+            # line saying where to read it, and a conductor told a worker finished
+            # three minutes after the fact has lost the whole point of an
+            # event-driven watch. Everything else still declines -- queueing a
+            # multi-kilobyte instruction payload behind a turn would stack identical
+            # copies and blow out the context window.
+            if _wake_text and await self._steer_work_ledger_wake(loop, slot, _wake_text):
+                # DISPATCHED, because the news reached a model turn: that is what the
+                # fire exists to do, and the loop must not re-owe a wake it has
+                # delivered. It also charges the cycle, which is the honest direction
+                # for a budget -- a steered wake buys the conductor's attention just
+                # as a fired turn does, so counting it can only leave the loop's
+                # remaining cycles understated, never overspent.
+                return _delivery_result(wake_message, MonitorDispatchResult.DISPATCHED)
+            # Next idle-timer tick will schedule again once the turn ends.
+            # Returning False keeps cycle_count accurate (only delivered
             # nudges count toward max_cycles).
             logger.info(
                 "AutoNudge skip: slot %s is running (loop %s cycle %d)",
@@ -7537,6 +7734,14 @@ class GatewayOrchestrator:
             # provider entry to cover revocation during that setup.
             if completion_hook is not None and not await completion_hook.authorize():
                 return
+            # NO AUDIENCE FENCE for the work-ledger wake, and its absence is now
+            # structural rather than a choice: the wake carries ``wake_brief`` lines
+            # and a ``work_ledger_read`` pointer, so there is no worker-authored
+            # ledger prose in it for a fence to withhold. The conductor's own read,
+            # which is what the pointer sends it to, goes through
+            # ``_caller_key`` -- which judges the containment and records the
+            # admission itself, inside this very turn. So the gate did not move; it
+            # moved to the one place that reads the board.
             await _run_chat(
                 dashboard_state,
                 turn_slot,
@@ -7578,6 +7783,189 @@ class GatewayOrchestrator:
             task.add_done_callback(_settle_unstarted_admission)
             return _delivery_result(wake_message, await admission)
         return _delivery_result(wake_message, MonitorDispatchResult.DISPATCHED)
+
+    def _work_ledger_wake_loop(self, loop: NudgeLoop, wake_message: str | None) -> bool:
+        """Whether *loop* is a GATED work-ledger watch delivering its own wake.
+
+        The one loop shape the two paths below are for. A structured monitor
+        (``wake_message is not None``) composes its own envelope through its
+        controller and needs neither; a plain prompt loop has no probe and so no
+        news of its own to carry; a gated watch on some other subject gets its text
+        from that subject's probe and is not this module's to reshape.
+        """
+        if wake_message is not None:
+            return False
+        monitor = getattr(loop, "monitor", None)
+        if monitor is None or not getattr(loop, "gate", False):
+            return False
+        from kiro_crew import probes
+
+        return str(getattr(monitor, "kind", "")) == probes.WORK_LEDGER
+
+    async def _work_ledger_wake_text(self, loop: NudgeLoop) -> str:
+        """The text a work-ledger wake delivers for *loop*, or ``""``.
+
+        Which items moved, as the kernel's briefs named them, and then the pointer
+        telling the conductor to read the ledger for itself.
+        ``ledger_wake.wake_turn_text`` owns the shape; this method owns where the
+        briefs come from.
+
+        The briefs come from the loop's OWED wake claim, which is the only holder of
+        them: the kernel composed them into the verdict the gate read, and a gated
+        loop's fire path has no envelope to carry a verdict. Read rather than taken,
+        so a fire this text is refused by leaves it owed to the retry.
+
+        A POINTER, NOT THE BOARD, and that is a cost argument. Inlining the compact
+        board makes one item moving cost a payload proportional to the whole goal:
+        tens of kilobytes of mostly-closed rows on a twenty-item ledger, re-sent per
+        wake to save one tool call. It also makes the text ledger prose, which may
+        enter only a turn whose cross-surface publication is fenced for that turn's
+        whole life -- so a board cannot ride the steer, and the two delivery routes
+        then carry different text. The pointer is constant in size, discloses
+        nothing, and leaves the board to the conductor's own ``work_ledger_read``:
+        identity-gated, audited and containment-judged at the moment of the read, by
+        the route that already owns all three.
+
+        Empty when there is nothing owed, which leaves the plain nudge untouched: a
+        quiet-streak floor tick, a fallback, or a retry whose claim was released
+        observed no news, so there is no item to point AT. It also must not give the
+        steer below something to inject -- such a tick would interrupt a turn the
+        user is driving to say nothing, and charge a cycle for it.
+
+        The claim is the only input, so there is no dashboard check: nothing here
+        reads the dashboard, and the caller returns before this on a gateway without
+        one.
+        """
+        service = self.autonudge_svc
+        if service is None:
+            return ""
+        reader = getattr(service, "pending_wake_briefs", None)
+        briefs = str(reader(loop.id)) if callable(reader) else ""
+        if not briefs:
+            return ""
+        from kiro_crew import ledger_wake
+
+        return ledger_wake.wake_turn_text(briefs)
+
+    async def _steer_work_ledger_wake(self, loop: NudgeLoop, slot: Any, text: str) -> bool:
+        """Inject *text*, *loop*'s pending wake, into the turn *slot* is running.
+
+        THE FIX for a wake that lands mid-turn. The fire below declines a running
+        slot, and declining is right for a plain nudge -- a multi-kilobyte
+        instruction payload queued behind a turn would stack identical copies and
+        blow out the context window. A work-ledger wake is the opposite shape: a
+        line naming the item that moved plus a line saying where to read it, which
+        is exactly what a steer is for. So rather than hold it until the turn ends,
+        the news goes INTO the turn that is running.
+
+        Authorization is the fire's own, unchanged. ``_dashboard_mode_admits`` is
+        checked here because the ordinary path checks it only past the running-slot
+        return, and a steer must not become the way around it. Nothing else is
+        needed: the loop is already authorized to start a WHOLE TURN on this slot
+        with this text, and a steer delivers strictly less -- same session, smaller
+        payload, no new turn -- so it cannot reach anywhere the fire could not.
+
+        The containment snapshot is recorded for the REQUEUE. A turn that ends while
+        the steer RPC is suspended degrades the text to a queue card, and the drain
+        re-checks that card against the containment that held when it was admitted;
+        an entry carrying no stamp falls to the drain's fail-closed floor instead.
+        ``user_origin=False``, because nobody typed this into the session's own
+        surface, so it must not inherit a human's exemption from the drain's linked
+        drop.
+
+        IT CARRIES THE SAME TEXT THE FIRE DOES, and the wake being a pointer is what
+        makes that safe. Worker-authored ledger prose may enter only a turn whose
+        cross-surface publication this gateway has fenced for that turn's WHOLE life,
+        and a turn already running stops being such a turn the moment its text is
+        requeued -- the teardown clears the fence and the drain starts a successor
+        nothing re-fences. A steer can always be requeued, which is what this
+        method's own ``STEER_REQUEUED`` arm exists for, so a board could not ride it
+        and this delivery would have to be the smaller one. It is not: the text is
+        ``ledger_wake.wake_brief`` lines plus a ``work_ledger_read`` pointer, the
+        same text ``irq`` is already allowed to persist outside the store's
+        identity-gated read path, so the two routes cannot diverge.
+
+        *text* is passed in rather than built here because the caller has already
+        built it for the other delivery, and both must deliver the same string.
+
+        ``False`` for every refusal -- a mode that declines, a slot with no
+        steer-capable client, a backend that queued the text instead of consuming it
+        -- and the caller then declines the fire exactly as it did before, leaving
+        the wake owed and the turn-end retry to deliver it.
+        """
+        state = self.dashboard_state
+        if state is None or not text or bool(getattr(slot, "is_closing", False)):
+            return False
+        if not await self._dashboard_mode_admits(loop, slot):
+            await self._audit_fire_refused(loop, slot)
+            return False
+        # Deferred import for the cycle the sibling fire path documents: gateway ->
+        # dashboard.chat_delivery -> gateway.
+        from kiro_crew.dashboard.chat_delivery import (
+            STEER_REQUEUED,
+            STEER_STEERED,
+            steer_into_running_turn,
+        )
+        from kiro_crew.dashboard.session_control import containment_meta
+
+        try:
+            admission = containment_meta(state, slot)
+        except Exception:
+            # A containment this cannot read is not one to steer past. Declining
+            # costs the wake its place in THIS turn; the turn-end retry still
+            # delivers it, so the cheap failure is to fall back to the fire.
+            logger.debug(
+                "AutoNudge: could not read containment for loop %s -- not steering",
+                loop.id,
+                exc_info=True,
+            )
+            return False
+        # NO AUDIENCE FENCE HERE, and its absence is the point rather than an
+        # omission: this delivery carries structural briefs and a read pointer only,
+        # so there is nothing a fence would withhold. A fence recorded on the running
+        # turn would also be the wrong promise -- the teardown clears it, and a
+        # requeued steer's successor would run without it.
+        try:
+            outcome = await steer_into_running_turn(
+                state, slot, text, user_origin=False, admission=admission
+            )
+        except Exception:
+            logger.warning(
+                "AutoNudge: steering loop %s's work-ledger wake raised -- " "leaving the wake owed",
+                loop.id,
+                exc_info=True,
+            )
+            return False
+        if outcome == STEER_REQUEUED:
+            # The turn ended while the RPC was suspended, so the teardown degraded
+            # the text to a queue card at the HEAD of the slot queue. It runs, as
+            # its own turn, and the drain's own notice covers the one case it does
+            # not. So the news is delivered and the claim must be discharged:
+            # reporting a refusal here would re-owe these briefs, the turn-end retry
+            # would deliver them a second time on another charged turn, and on the
+            # possibly-delivered path ``chat_delivery`` forbids resending the text.
+            logger.info(
+                "AutoNudge: loop %s's work-ledger wake was requeued as its own turn "
+                "on slot %s; the wake is discharged",
+                loop.id,
+                loop.slot_key,
+            )
+            return True
+        if outcome != STEER_STEERED:
+            logger.info(
+                "AutoNudge: loop %s could not steer its work-ledger wake into the "
+                "running turn (%s); the wake stays owed",
+                loop.id,
+                outcome,
+            )
+            return False
+        logger.info(
+            "AutoNudge: loop %s steered its work-ledger wake into the turn already "
+            "running on slot %s",
+            loop.id,
+            loop.slot_key,
+        )
+        return True
 
     @staticmethod
     async def _dashboard_mode_admits(loop: NudgeLoop, slot: Any) -> bool:
@@ -7882,6 +8270,9 @@ class GatewayOrchestrator:
                     # An ACTIVE loop holding for an unanswered approval; the
                     # popover words it as paused.
                     "approval_stalled": bool(loop.approval_stalled),
+                    # An ACTIVE work-ledger watch holding because every open item
+                    # waits on a person; the popover says it is waiting on you.
+                    "waiting_on_person": bool(loop.waiting_on_person),
                 }
                 if is_structured_monitor_loop(loop):
                     assert loop.monitor is not None
@@ -8493,6 +8884,18 @@ class GatewayOrchestrator:
                     "agent.yolo_duration has an 'until_shutdown' option that "
                     "has no timed expiry."
                 )
+            elif not terminal and not capped_out and loop.stopped_reason == MODEL_REFUSED_REASON:
+                title = "Monitoring loop stopped — the model declined its last cycle"
+                body = (
+                    f"The loop stopped after {loop.cycle_count} cycles because "
+                    "the model's content filter declined its last cycle and "
+                    "nothing retried it on another model, so further cycles "
+                    "would send the same prompt to the same model and be "
+                    "declined the same way. Open the session to see the "
+                    "refusal, then reword the goal, switch the session's model "
+                    "or set agent.refusal_fallback_model, and restart the loop "
+                    "from the goal popover."
+                )
             elif (
                 not terminal
                 and not capped_out
@@ -8668,6 +9071,23 @@ class GatewayOrchestrator:
                 "Heartbeat: failed to persist slot title for %s", slot.key, exc_info=True
             )
 
+    async def _resolve_loaded_slot(self, slot_name: str) -> Any:
+        """The dashboard slot *slot_name* names, with a pending window loaded off the loop.
+
+        For a background delivery about to append to or prompt that tab. A tab
+        restored as a sidebar row loads its window on a worker thread first, and
+        the name is resolved again after the await, so a tab closed meanwhile
+        reads as gone.
+        """
+        state = self.dashboard_state
+        if state is None:
+            return None
+        slot = state.resolve_slot(slot_name)
+        if slot is not None and getattr(slot, "window_pending", False) is True:
+            await load_window_off_loop(slot)
+            slot = state.resolve_slot(slot_name)
+        return slot
+
     async def _deliver_result(
         self,
         title: str,
@@ -8722,7 +9142,7 @@ class GatewayOrchestrator:
                 logger.debug("Heartbeat prompt:dashboard: missing slot name, skipping")
                 return
             if self.dashboard_state:
-                slot = self.dashboard_state.resolve_slot(slot_name)
+                slot = await self._resolve_loaded_slot(slot_name)
                 if slot:
                     # Truncate the variable-size *content* separately so the title/prefix
                     # can never be sliced at a multi-byte boundary. errors='ignore'
@@ -8783,7 +9203,7 @@ class GatewayOrchestrator:
         if deliver.startswith("dashboard:"):
             slot_name = deliver.removeprefix("dashboard:")
             if self.dashboard_state:
-                slot = self.dashboard_state.resolve_slot(slot_name)
+                slot = await self._resolve_loaded_slot(slot_name)
                 if slot:
                     sel().log_api_access(
                         caller="heartbeat",
@@ -9136,7 +9556,9 @@ class GatewayOrchestrator:
                         # failure this recovery drains, so the sub-agent is what
                         # caused the turn.
                         _turn_actor="subagent",
-                    )
+                    ),
+                    state=self.dashboard_state,
+                    slot=slot,
                 ),
             )
             slot.task = _task
@@ -9295,6 +9717,13 @@ class GatewayOrchestrator:
                 _injection_slot = _slot_for_parent(self.dashboard_state, parent_key)
                 if _injection_slot is None:
                     _injection_slot = self.dashboard_state.get_slot(_parent_slot_name)
+                if getattr(_injection_slot, "window_pending", False) is True:
+                    # A parent tab restored as a sidebar row loads its window
+                    # before the completion is delivered into it, off the loop.
+                    await load_window_off_loop(_injection_slot)
+                    _injection_slot = _slot_for_parent(
+                        self.dashboard_state, parent_key
+                    ) or self.dashboard_state.get_slot(_parent_slot_name)
             _completion_key = getattr(_injection_slot, "key", "")
             _injection_slot_name = (
                 _completion_key
@@ -9372,6 +9801,15 @@ class GatewayOrchestrator:
             title, _ = redact_exfiltration_urls(title)
             title, _ = redact_credentials(title)
 
+            # A completed run that made no tool call cannot have touched the disk,
+            # so it carries the claim note in the event the parent reads its
+            # narration from. A lone run or a single wave gets no synthesis turn,
+            # so this event is the only place the parent can be told before it
+            # reports the work to the user. Stops and failures say nothing: their
+            # prose already tells the parent not to treat the output as finished.
+            no_tools_note = ""
+            if single_outcome == OUTCOME_OK and not _flush_only and info.made_no_tool_calls:
+                no_tools_note = f"⚠ Agent `{info.id}` {NO_TOOL_CALLS_NOTE}"
             announce = (
                 f"{SUBAGENT_COMPLETION_PREFIX}\n"
                 f"Agent `{info.id}`"
@@ -9379,7 +9817,7 @@ class GatewayOrchestrator:
                 f" {status} {emoji}\n"
                 f"Task: {task_text}\n\n"
                 f"Usage: {usage}\n\n"
-                f"{detail}"
+                f"{detail}" + (f"\n\n{no_tools_note}" if no_tools_note else "")
             )
             # Structured header facts for the dashboard card, stamped on the row
             # so a reword of the prose above cannot silently break rendering.
@@ -9499,7 +9937,9 @@ class GatewayOrchestrator:
                     _kept = " (partial: backend failed to generate the final response)"
                     bp["ok_lines"].append(
                         f"— `{info.id}` ✅{_kept if info.partial else ''} {task_text[:80]}"
-                        f"{_model_tag} · {usage}" + (f"\n  → {result_path}" if result_path else "")
+                        f"{_model_tag} · {usage}"
+                        + (f"\n  → {result_path}" if result_path else "")
+                        + (f"\n  {no_tools_note}" if no_tools_note else "")
                     )
                 else:
                     bp["fail_lines"].append(
@@ -10004,7 +10444,9 @@ class GatewayOrchestrator:
                                     # is the same injector dispatching directly.
                                     _turn_actor="subagent",
                                     **_run_kwargs,
-                                )
+                                ),
+                                state=self.dashboard_state,
+                                slot=_injection_slot,
                             )
                         )
                         _injection_slot.task = _task
@@ -10479,7 +10921,11 @@ class GatewayOrchestrator:
             """Resolve slot from spawn request_id (spawn:{agent_id})."""
             agent_id = request_id.removeprefix("spawn:")
             info = self.subagent_mgr.get(agent_id) if self.subagent_mgr is not None else None
-            slot = _event_slot(info.parent_session_key) if info and info.parent_session_key else ""
+            # A workflow step's spawn resolves to the run's origin chat.
+            slot = _spawn_parent_slot(
+                info.parent_session_key if info else "",
+                getattr(self.dashboard_state, "workflow_service", None),
+            )
             logger.info(
                 "_spawn_slot_resolver: rid=%s agent_id=%s info=%s slot=%s",
                 request_id,
@@ -10584,6 +11030,11 @@ class GatewayOrchestrator:
             if etype == "subagent_injection_failed":
                 # Show error in UI + queue for LLM context on next turn.
                 slot = self.dashboard_state.get_slot(slot_name)
+                if slot is not None and getattr(slot, "window_pending", False) is True:
+                    # A parent tab restored as a sidebar row loads its window
+                    # before the card is appended, with the read off the loop.
+                    await load_window_off_loop(slot)
+                    slot = self.dashboard_state.get_slot(slot_name)
                 if slot:
                     task_preview = redact_and_truncate(info.task or "", 100)
                     error_text, _ = redact_exfiltration_urls(extra.get("error", "timed out"))
@@ -10637,6 +11088,23 @@ class GatewayOrchestrator:
                 # deltas (tool/stalled/retrying) coalesce at scale into ONE
                 # subagent_batch_update frame per tick; lifecycle events
                 # (spawn/done/recovering/batch_*) always pass through.
+                #
+                # A child the reaper flagged stalled does not hold the parent's
+                # user messages (``subagents_hold_user_messages``), yet nothing
+                # else starts that drain: a message queued BEFORE the flag is set
+                # stays queued until the next send or the wall-clock reap. Kick
+                # the parent slot's drain here — before the coalescer can absorb
+                # the UI frame — so the parked message starts now. The drain
+                # re-reads the hold under the slot lock, so a live sibling keeps
+                # the queue parked and a running slot is left alone.
+                if etype == "subagent_stalled" and extra.get("stalled"):
+                    _drain = asyncio.ensure_future(
+                        drain_idle_parent_queue_for_stall(
+                            self.dashboard_state, info.parent_session_key
+                        )
+                    )
+                    self.dashboard_state._background_tasks.add(_drain)
+                    _drain.add_done_callback(self.dashboard_state._background_tasks.discard)
                 if self._subagent_coalescer().handle(etype, {**base, **extra}):
                     return
                 self.dashboard_state.broadcast_ws(etype, {**base, **extra})
@@ -10666,6 +11134,11 @@ class GatewayOrchestrator:
             if not self.dashboard_state or not slot_name:
                 return False
             slot = self.dashboard_state.get_slot(slot_name)
+            if slot is not None and getattr(slot, "window_pending", False) is True:
+                # A parent tab restored as a sidebar row loads its window before
+                # the notice is appended, with the read off the loop.
+                await load_window_off_loop(slot)
+                slot = self.dashboard_state.get_slot(slot_name)
             if not slot:
                 return False
             safe_msg, _ = redact_exfiltration_urls(msg)
@@ -11059,6 +11532,14 @@ class GatewayOrchestrator:
             replay.cancel()
             with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError, Exception):
                 await asyncio.wait_for(replay, timeout=1.0)
+        # Stop the governance profile watch for the same reason the refresher below is
+        # stopped: no re-projection may start into a closing gateway. A rebuild already
+        # running in its worker thread finishes on its own; this only stops new ones.
+        profile_watch = self._profile_watch_task
+        if profile_watch is not None and not profile_watch.done():
+            profile_watch.cancel()
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                await asyncio.wait_for(profile_watch, timeout=1.0)
         # Stop polling the central policy source, so a fetch in flight cannot
         # install a ceiling into a context the rest of this teardown is dismantling.
         # The join budget is deliberately small: the thread waits on an Event, so
@@ -13070,7 +13551,6 @@ class GatewayOrchestrator:
             os.getpid(),
             datetime.now(timezone.utc).isoformat(),
         )
-
         # Raise FD limit — each kiro-cli session uses ~6 FDs (3 pipes)
         # plus MCP server subprocesses. Default macOS limit (256) is too low.
         # No-op on Windows (no per-process descriptor rlimit).
@@ -13285,6 +13765,18 @@ class GatewayOrchestrator:
 
         self._install_shutdown_signal_handlers()
 
+        # Warn when this gateway's code is a git work tree someone could rebase
+        # under it. Past KIROCREW_READY (no-new-work-on-gateway-boot-path),
+        # off-loop, fire-and-forget: it only logs.
+        if not self._test_mode:
+            from kiro_crew.live_checkout import warn_if_running_from_git_checkout
+
+            _checkout_task = asyncio.create_task(
+                asyncio.to_thread(warn_if_running_from_git_checkout)
+            )
+            self._background_tasks.add(_checkout_task)
+            _checkout_task.add_done_callback(self._background_tasks.discard)
+
         # The run directories a PREDECESSOR gateway of this data home left behind
         # (session_work_dir). Ordered after ``cleanup_orphaned_sessions`` above,
         # which reaped this home's pid ledger -- the ledger's remaining entries
@@ -13385,6 +13877,34 @@ class GatewayOrchestrator:
         # ``_test_mode`` skips it so the offline E2E gate never makes an outbound
         # request.
         if not self._test_mode:
+            # A governance profile is saved by editing a file under the profiles
+            # directory, which no distribution poll observes, and a host with no
+            # distribution source runs no poll at all. This watch re-stats that
+            # directory off the loop and re-derives the on-disk auto-approvals when the
+            # combined ceiling + profile answer has moved; on every other tick it is a
+            # directory stat and an integer compare. Sleeps first, so boot does no extra
+            # work, and starts in its own block, so a failure seeding the baseline or
+            # starting the refresher below does not take the watch down with it.
+            try:
+                from kiro_crew.agent import reproject_for_profile_change
+
+                async def _watch_profile_projection() -> None:
+                    while True:
+                        await asyncio.sleep(_PROFILE_PROJECTION_POLL_S)
+                        try:
+                            await asyncio.to_thread(reproject_for_profile_change)
+                        except Exception:
+                            logger.warning(
+                                "governance profile re-projection failed; the profile "
+                                "watch retries it after its raise backoff",
+                                exc_info=True,
+                            )
+
+                self._profile_watch_task = asyncio.create_task(
+                    _watch_profile_projection(), name="governance-profile-projection"
+                )
+            except Exception:
+                logger.warning("the governance profile watch did not start", exc_info=True)
             with contextlib.suppress(Exception):
                 from kiro_crew.agent import (
                     prime_ceiling_projection,
@@ -13411,8 +13931,9 @@ class GatewayOrchestrator:
                 # Seeded BEFORE the poller starts: the first poll can itself install a new
                 # ceiling, and a baseline taken on the hook's first call would record that
                 # generation and skip the rebuild it needed.
-                prime_ceiling_projection()
+                await asyncio.to_thread(prime_ceiling_projection)
                 register_post_install_hook(reproject_for_ceiling_change)
+
                 await asyncio.to_thread(start_refresher)
 
         # ── Hosted feature-video clips ──
@@ -13618,6 +14139,14 @@ class GatewayOrchestrator:
         self._background_tasks.add(_watchdog)
         _watchdog.add_done_callback(self._background_tasks.discard)
 
+        # Renew the stored Kiro sign-in before it expires, not only when an
+        # agent turn asks for a token. Loads the auth subsystem only
+        # once a sign-in vault exists; see dashboard/sign_in_refresher.
+        _sign_in_refresher = asyncio.create_task(run_sign_in_refresher(shutdown_event))
+        self._sign_in_refresher_task = _sign_in_refresher
+        self._background_tasks.add(_sign_in_refresher)
+        _sign_in_refresher.add_done_callback(self._background_tasks.discard)
+
         print("👻 Kiro Crew gateway starting…")
 
         connected = await self._connect_slack()
@@ -13807,10 +14336,15 @@ class GatewayOrchestrator:
         except Exception:
             logger.debug("Gateway run-marker clear skipped", exc_info=True)
 
+        # The sign-in tick drains alongside the graceful shutdown, inside the
+        # same budget: an in-flight renewal finishes and persists the rotated
+        # refresh credential instead of being cut off by os._exit below.
+        _sign_in_drain = asyncio.create_task(drain_sign_in_refresher(self._sign_in_refresher_task))
         try:
             await asyncio.wait_for(self._shutdown(), timeout=GRACEFUL_SHUTDOWN_SECS)
         except (asyncio.TimeoutError, Exception):
             logger.warning("Graceful shutdown timed out — force exiting")
+        await _sign_in_drain
 
         print("👻 Goodbye!")
         # Kill any kiro-cli processes that survived graceful shutdown.
@@ -13858,8 +14392,14 @@ class GatewayOrchestrator:
         # logged a few lines up, the one record a stuck-shutdown post-mortem
         # actually needs. Bounded and off-loop so a wedged disk cannot delay
         # the exit (see drain_log_queue_before_hard_exit).
+        #
+        # Flush SEL BEFORE the gateway.log tail (the order slack/events.py uses):
+        # draining gateway.log first stops its listener, and a SEL write failure
+        # then logs its "dropped N events" line into a dead queue, so the audit
+        # loss would leave no trace.
         from kiro_crew.cli import drain_log_queue_before_hard_exit
 
+        await flush_audit_queue_before_hard_exit()
         await drain_log_queue_before_hard_exit()
         os._exit(exit_code)
 
@@ -14241,6 +14781,32 @@ _runtime.compose(
 # be garbage-collected mid-flight.
 _SLICE_LIMITS_TASK: "asyncio.Task[None] | None" = None
 
+# Strong reference to the background KAS kiro-cli floor check, for the same reason.
+_KAS_CLI_FLOOR_TASK: "asyncio.Task[None] | None" = None
+
+
+def _start_kas_cli_floor(cfg: KiroCrewConfig) -> "asyncio.Task[None]":
+    """Schedule :func:`apply_kas_cli_floor` off the boot path and return its task.
+
+    The check pins kiro-cli and spawns ``acp --help``, so it runs in a thread and
+    the gateway binds without waiting for it. Until it lands, a configured KAS
+    stays selected, which is also what a check that cannot run leaves. Failure is
+    logged and contained: the backend stays as configured.
+    """
+    global _KAS_CLI_FLOOR_TASK
+
+    async def _run() -> None:
+        try:
+            await asyncio.to_thread(apply_kas_cli_floor, cfg)
+        except Exception:
+            logging.getLogger(__name__).warning(
+                "KAS kiro-cli floor check failed; continuing", exc_info=True
+            )
+
+    _KAS_CLI_FLOOR_TASK = asyncio.create_task(_run(), name="kas-cli-floor")
+    return _KAS_CLI_FLOOR_TASK
+
+
 # Strong ref to the fire-and-forget agents-dir janitor sweep launched at boot
 # (the loop holds tasks weakly, so without this it could be GC'd mid-flight).
 _AGENTS_JANITOR_TASK: "asyncio.Task[None] | None" = None
@@ -14291,6 +14857,14 @@ async def run_gateway(
     # non-standalone profile that cannot compose its companion fails closed.
     boot_platform(cfg)
 
+    # ── KAS kiro-cli floor ──
+    # A configured KAS on a kiro-cli that cannot select the KAS engine falls back
+    # to kiro-cli, with the notice in the log. Scheduled in the background, never
+    # awaited here: it spawns ``acp --help``. Skipped in test_mode so the offline
+    # E2E gate never spawns the developer's real kiro-cli.
+    if not test_mode:
+        _start_kas_cli_floor(cfg)
+
     # ── Aggregate cgroup ceiling for all agent scopes ──
     # The per-spawn scope wrapper (sandbox.cgroup_scope_argv) bounds ONE spawn
     # tree; this bounds ALL of them together by putting MemoryMax/TasksMax on
@@ -14340,6 +14914,18 @@ async def run_gateway(
                         kiro_agents_dir(),
                         sweep_backups=cfg.agent.sweep_agents_backups,
                     )
+                    # Derived read-only side-chat specs whose base agent is gone
+                    # (the hourly wake below repeats it). No live-session names
+                    # are passed: a side session starting meanwhile publishes
+                    # its spec first, and the reap re-checks the base under the
+                    # publication lock. It parses only the files named in a
+                    # derived shape, and scans for a base only when no file of
+                    # that base's name exists.
+                    from kiro_crew.dashboard.side_readonly_spec import (
+                        reap_orphaned_readonly_specs,
+                    )
+
+                    reap_orphaned_readonly_specs()
                     # The per-spawn skill-view prune is capped, so a backlog
                     # left by earlier builds would take hundreds of spawns to
                     # clear. Drain it once here, in lock-bounded batches.
@@ -14425,6 +15011,21 @@ async def run_gateway(
                     logging.getLogger(__name__).debug(
                         "session work-dir sweep failed", exc_info=True
                     )
+                # Derived read-only side-chat specs whose base agent was removed
+                # while the gateway stayed up. A spec a live session was spawned
+                # under is skipped: its base may go, but its session stays bound
+                # to that file until it ends.
+                try:
+                    from kiro_crew.dashboard.side_readonly_spec import (
+                        reap_orphaned_readonly_specs,
+                    )
+
+                    await asyncio.to_thread(
+                        reap_orphaned_readonly_specs,
+                        _live_session_agents(getattr(orchestrator, "sessions", None)),
+                    )
+                except Exception:
+                    logging.getLogger(__name__).debug("read-only spec reap failed", exc_info=True)
 
         _AGENT_SCRATCH_SWEEP_TASK = asyncio.create_task(
             _run_agent_scratch_sweep(), name="agent-scratch-sweep"

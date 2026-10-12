@@ -1,6 +1,6 @@
 import * as React from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { Pencil, Circle, Pin, Locate, Link2, Tag as TagIcon, X, ExternalLink, Monitor, Undo2, RotateCw, PanelTop, Sparkles, GitFork } from 'lucide-react'
+import { Pencil, Circle, Pin, Locate, Link2, Tag as TagIcon, X, ExternalLink, Monitor, Undo2, RotateCw, PanelTop, Sparkles, GitFork, BellOff, Volume2, VolumeX } from 'lucide-react'
 import type { ChatFolder } from '../types'
 import FolderMoveSubmenu from './FolderMoveSubmenu'
 import ErrorNotice, { ErrorNoticeMenuItem } from './ErrorNotice'
@@ -11,9 +11,11 @@ import ImportSessionItem from './ImportSessionItem'
 import CrewBoardMenuItem from './CrewBoardMenuItem'
 import SessionColorSwatches from './SessionColorSwatches'
 import SourceLinksSubmenu from './SourceLinksSubmenu'
+import { SessionTurnLimitSubmenu } from './SessionTurnLimitMenu'
 import LinkedSurfacesSection from './LinkedSurfacesSection'
 import { DropdownMenuItem, DropdownMenuSeparator } from './ui/dropdown-menu'
 import { ContextMenuItem, ContextMenuSeparator } from './ui/context-menu'
+import { muteFlagErrorKey } from '../store/dashboardSlice'
 import { useAppSelector } from '../store'
 import { selectSlotSubagents } from '../store/chatSlice'
 import { useTagPopover } from '../hooks/useTagPopover'
@@ -21,6 +23,7 @@ import { api } from '../api/client'
 import { useSessionActions } from '../hooks/useSessionActions'
 import { useChatPopouts } from '../hooks/useChatPopouts'
 
+import { uiLocation } from '../uiLocations/uiLocation'
 import { i18nT } from '../i18n/t'
 export interface SessionActionsMenuProps {
   /** Chooses the Radix primitive family; must match the enclosing menu. */
@@ -58,40 +61,14 @@ export interface SessionActionsMenuProps {
    * hosts the fork button.
    */
   onDuplicate?: () => void
+  /** A second, muted line under Close that says what the press reaches. It wraps,
+   *  so on a phone, where this menu is the only close, nothing is cut off. */
+  closeHint?: string
   /** Extra items rendered in the top "informational" group (header-only today:
    *  the MCP-servers submenu). Generic so the shared menu stays surface-agnostic. */
   infoSlots?: React.ReactNode[]
   /** Called after a colour pick; lets a caller that controls its own menu close it (the header does). */
   onColorPicked?: () => void
-  /**
-   * Replace the Close item's action. The only caller that passes it is the session
-   * tree, whose ✕ closes the card AND the sessions nested under it: the
-   * menu sits next to that ✕ on the same card, and on a phone it IS the only close
-   * affordance, so a menu that closed one session there would be a second, quieter
-   * answer to the same question.
-   *
-   * A bubble prop rather than something internalised, because the subtree is only
-   * knowable where the lineage is: the chat header and a popped-out window have no
-   * tree on screen and keep the connected single-session close.
-   */
-  onClose?: (slotKey: string) => void
-  /**
-   * Override for the Close menu item's label, for surfaces where the close
-   * reaches more than this one session. Matches `closeSessionLabel` on `SessionRow`.
-   */
-  closeLabel?: string
-  /**
-   * A second, muted line under `closeLabel` that says what the press reaches and
-   * how to get it back. It wraps, so on a phone, where this menu is the only
-   * close, nothing is cut off.
-   */
-  closeHint?: string
-  /**
-   * The close would refuse (something in the tree is still running): the item
-   * reads muted instead of destructive, and stays selectable so the press can
-   * open the notice that says who is running.
-   */
-  closeMuted?: boolean
   /**
    * Whether the chat sidebar -- and with it the banner that says a failed
    * folder-order read -- is on screen while this menu is open. The sidebar's
@@ -151,13 +128,13 @@ export function collapseGroups<T>(groups: (T | false | null | undefined)[][]): T
  *   [close]          Close session
  */
 export default function SessionActionsMenu({
-  variant, slotKey, mode, onReveal, onRename, onAutoTitle, onOpenInNewTab, onDuplicate, infoSlots, onColorPicked, onClose, closeLabel, closeHint, closeMuted = false, sidebarOnScreen = false, omitPopout = false,
+  variant, slotKey, mode, onReveal, onRename, onAutoTitle, onOpenInNewTab, onDuplicate, closeHint, infoSlots, onColorPicked, sidebarOnScreen = false, omitPopout = false,
 }: SessionActionsMenuProps) {
   const Item = variant === 'context' ? ContextMenuItem : DropdownMenuItem
   const Separator = variant === 'context' ? ContextMenuSeparator : DropdownMenuSeparator
 
   // Generic, surface-agnostic actions — one definition, wired straight to the store.
-  const { toggleRead, togglePin, copyLink, move, reload, close } = useSessionActions(mode)
+  const { toggleRead, togglePin, toggleMutesOpened, toggleMuted, copyLink, move, reload, close } = useSessionActions(mode)
   // Popped-out window coordination (shared singleton — one channel for all menus).
   const { isPoppedOut, isSelfPopout, open: openPopout, focus: focusPopout, bringBack, returnSelfToMain } = useChatPopouts()
   // This menu also renders INSIDE a popout window (via the header). There the
@@ -175,6 +152,17 @@ export default function SessionActionsMenu({
   const isUnread = useAppSelector(s => s.dashboard.unreadSlots.includes(slotKey))
   const slot = useAppSelector(s => s.dashboard.slots.find(x => x.key === slotKey))
   const isPinned = !!slot?.pinned
+  const isMutesOpened = !!slot?.mutes_opened
+  const isMuted = !!slot?.muted
+  // Same store-backed failure notice as the opened-sessions toggle below.
+  const mutedError = useAppSelector(s => s.dashboard.slotMuteFlagError?.[muteFlagErrorKey('muted', slotKey)])
+  const mutedErrorId = React.useId()
+  // A persisted mute-toggle failure for THIS row (set after rollback by the
+  // mutation's onError). Store-backed so the notice survives the kebab closing
+  // and reopening -- the row's state and what the user clicked now disagree,
+  // and this is the only place that disagreement is said.
+  const mutesOpenedError = useAppSelector(s => s.dashboard.slotMuteFlagError?.[muteFlagErrorKey('mutes_opened', slotKey)])
+  const mutesOpenedErrorId = React.useId()
   const isRunning = !!slot?.running
   // The move-to submenu lists chat folders in the order the sidebar draws them.
   // A failed read (no body to draw from) is said once per screen, by the
@@ -209,7 +197,7 @@ export default function SessionActionsMenu({
     // Modifiers to the tab itself
     [
       onRename && (
-        <Item key="rename" onSelect={onRename}>
+        <Item key="rename" onSelect={onRename} {...uiLocation('sessions.row-menu.rename')}>
           <Pencil size={13} className="shrink-0 text-muted" /> {i18nT('components.sessionActionsMenu.rename')}
         </Item>
       ),
@@ -221,9 +209,73 @@ export default function SessionActionsMenu({
       <Item key="read" onSelect={() => toggleRead(slotKey)}>
         <Circle size={13} className="shrink-0 text-muted" /> {isUnread ? i18nT('components.sessionActionsMenu.mark_as_read') : i18nT('components.sessionActionsMenu.mark_as_unread')}
       </Item>,
-      <Item key="pin" onSelect={() => togglePin(slotKey)}>
+      <Item key="pin" onSelect={() => togglePin(slotKey)} {...uiLocation('sessions.row-menu.pin')}>
         <Pin size={13} className="shrink-0 text-muted" /> {isPinned ? i18nT('components.sessionActionsMenu.unpin') : i18nT('components.sessionActionsMenu.pin')}
       </Item>,
+      // Per-row mute, keyed to THIS row's slotKey (not the active tab), so a
+      // background session can be silenced while the user works elsewhere.
+      <Item key="mute" onSelect={() => toggleMuted(slotKey)}>
+        {/* A speaker, not the bell: the bell belongs to "Mute sessions this one
+         *  opens" just below, and the two must not read as one control. */}
+        {isMuted
+          ? <Volume2 size={13} className="shrink-0 text-muted" />
+          : <VolumeX size={13} className="shrink-0 text-muted" />}
+        {' '}{isMuted ? i18nT('components.sessionActionsMenu.unmute') : i18nT('components.sessionActionsMenu.mute')}
+      </Item>,
+      mutedError && (
+        <React.Fragment key="mute-error">
+          <div className="max-w-[300px] px-2 py-1.5">
+            <ErrorNotice
+              id={mutedErrorId}
+              variant="inline"
+              className="flex-wrap"
+              title={isMuted
+                // The row has rolled back, so its current state names the
+                // action that failed: still muted means the unmute failed.
+                ? i18nT('components.sessionActionsMenu.unmute_failed')
+                : i18nT('components.sessionActionsMenu.mute_failed')}
+              message={mutedError}
+              messagePlacement="below"
+              testId="session-menu-mute-error"
+            />
+          </div>
+          <ErrorNoticeMenuItem
+            Item={Item}
+            message={mutedError}
+            describedBy={mutedErrorId}
+          />
+          <Separator />
+        </React.Fragment>
+      ),
+      <Item key="mute-opened" onSelect={() => toggleMutesOpened(slotKey)}>
+        <BellOff size={13} className="shrink-0 text-muted" /> {isMutesOpened ? i18nT('components.sessionActionsMenu.unmute_sessions_it_opens') : i18nT('components.sessionActionsMenu.mute_sessions_it_opens')}
+      </Item>,
+      // The mute toggle has no server re-read; a failed PATCH leaves the row on
+      // its prior value while the user clicked the other way. Say so through
+      // ErrorNotice (the rule's in-menu form: a passive notice carrying the
+      // server's words plus a hand-off item that re-runs the toggle), so the
+      // failure is never swallowed into a silent no-op.
+      mutesOpenedError && (
+        <React.Fragment key="mute-opened-error">
+          <div className="max-w-[300px] px-2 py-1.5">
+            <ErrorNotice
+              id={mutesOpenedErrorId}
+              variant="inline"
+              className="flex-wrap"
+              title={i18nT('components.sessionActionsMenu.mute_sessions_it_opens_failed')}
+              message={mutesOpenedError}
+              messagePlacement="below"
+              testId="session-menu-mute-opened-error"
+            />
+          </div>
+          <ErrorNoticeMenuItem
+            Item={Item}
+            message={mutesOpenedError}
+            describedBy={mutesOpenedErrorId}
+          />
+          <Separator />
+        </React.Fragment>
+      ),
       folders.length > 0 && (
         <FolderMoveSubmenu
           key="move"
@@ -374,6 +426,10 @@ export default function SessionActionsMenu({
     // data-[disabled]:pointer-events-none, so a hover `title` can never fire
     // there and the grey row would otherwise explain nothing.
     [
+      // This session's own turn time limit: how long one of its turns may run
+      // before it is stopped, instead of the global Settings value. Beside
+      // Reload because both are about how this session's agent runs.
+      <SessionTurnLimitSubmenu key="turn-limit" slotKey={slotKey} variant={variant} />,
       <Item
         key="reload"
         disabled={reloadBlocked}
@@ -392,17 +448,17 @@ export default function SessionActionsMenu({
     ],
     // Close session — terminal, destructive
     [
-      <Item key="close" className={closeMuted ? 'text-muted' : 'text-danger focus:text-danger'} data-close-muted={closeMuted ? '' : undefined} onSelect={() => (onClose ?? close)(slotKey)}>
+      <Item key="close" className="text-danger focus:text-danger" onSelect={() => close(slotKey)}>
         {closeHint ? (
           <>
             <X size={13} className="self-start mt-0.5 shrink-0" />
             <span className="flex min-w-0 flex-col">
-              <span>{closeLabel ?? i18nT('components.sessionActionsMenu.close_session')}</span>
+              <span>{i18nT('components.sessionActionsMenu.close_session')}</span>
               <span className="max-w-[15rem] whitespace-normal text-[11px] leading-snug text-muted" data-testid="close-item-hint">{closeHint}</span>
             </span>
           </>
         ) : (
-          <><X size={13} /> {closeLabel ?? i18nT('components.sessionActionsMenu.close_session')}</>
+          <><X size={13} /> {i18nT('components.sessionActionsMenu.close_session')}</>
         )}
       </Item>,
     ],

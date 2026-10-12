@@ -101,6 +101,7 @@ from kiro_crew.messaging.inbound_spool import InboundRoute, spool_refused_turn
 from kiro_crew.messaging.link import (  # noqa: F401
     CHAT_TYPE_DIRECT,
     CHAT_TYPE_FORUM,
+    CHAT_TYPE_PRIVATE_TOPIC,
     DM_SCOPE_UNIFIED,
     ChannelLink,
     bind_origin_mirror,
@@ -902,7 +903,7 @@ class TelegramDispatcher:
         if origin_tag and session_provenance_tag(session_key) != origin_tag:
             await self._reply(chat_id, _STALE_OPTIONS_REFUSAL, thread=reply_thread)
             return
-        privacy_mode.hydrate(self.sessions, session_key)
+        await privacy_mode.hydrate_inbound(self.sessions, session_key)
         if privacy_request:
             try:
                 await privacy_mode.apply_mode(
@@ -1028,6 +1029,9 @@ class TelegramDispatcher:
         # turn consumed the one-shot flag, and whether it landed (recorded success).
         _needs_reinjection = False
         _turn_landed = False
+        # The turn's driver, for the finally: it records whether the backend
+        # compacted the session, on every exit path.
+        driver: TurnDriver | None = None
         try:
             # Ack placeholder first (before the potentially slow cold-start);
             # on_turn_start is idempotent so the driver's later call no-ops.
@@ -1226,17 +1230,48 @@ class TelegramDispatcher:
 
             # ── Post-turn bookkeeping (each guarded so a failure here can't
             # fall through to the except and re-record the successful turn). ──
-            self.sessions.record_success(session_key)
-            # Beside the counter it stands in for: a landed turn clears the
-            # shared-death streak exactly as it clears the consecutive-failure
-            # count, so the streak stays a consecutive run rather than a lifetime
-            # total whose bound is permanently tripped.
-            runtime_death.clear_shared_deaths(session_key)
+            _unfinished = getattr(driver, "unfinished_turn", False) is True
+            if _unfinished:
+                # The handle ended a turn the backend never finished; the driver
+                # already followed the partial text with the timeout notice. The
+                # runtime still reads alive, so book a failure and reset the
+                # session (keeping the conversation), as the shared channel
+                # dispatcher does, or the next message waits on it again.
+                logger.warning(
+                    "Telegram transport_dispatch: the turn for %s ended unfinished; "
+                    "resetting the session",
+                    session_key,
+                )
+                # At its threshold the breaker resets the session inside
+                # record_failure and answers True. A same-key message can claim a
+                # successor while that reset is awaited, so a second reset here
+                # would end the successor mid-turn: reset only when it did not.
+                breaker_reset = await self.sessions.record_failure(session_key)
+                if breaker_reset is not True:
+                    try:
+                        await self.sessions.reset(session_key)
+                    except Exception:
+                        logger.warning(
+                            "Telegram transport_dispatch: session reset after an "
+                            "unfinished turn failed session=%s",
+                            session_key,
+                            exc_info=True,
+                        )
+            else:
+                self.sessions.record_success(session_key)
+                # Beside the counter it stands in for: a landed turn clears the
+                # shared-death streak exactly as it clears the consecutive-failure
+                # count, so the streak stays a consecutive run rather than a lifetime
+                # total whose bound is permanently tripped.
+                runtime_death.clear_shared_deaths(session_key)
             # The prompt (with any re-injected context) reached the model and
             # the turn completed, so the finally must NOT restore the flag --
             # unless the user cancelled it, which discards that prompt.
             _turn_landed = driver_turn_landed(driver)
-            Stats().inc_message_success()
+            if _unfinished:
+                Stats().inc_message_failed()
+            else:
+                Stats().inc_message_success()
             if accumulated and not muted and self._voice_enabled(route):
                 # Its own bookkeeping step, and last-effort by design: the text
                 # answer has already landed, so a TTS failure must not reach the
@@ -1485,10 +1520,15 @@ class TelegramDispatcher:
             # and leaves the real window armed past the end of its turn.
             _APPROVAL_REGISTRY.discard_session(session_key)
             # A turn that consumed the post-compaction flag but never landed
-            # discarded the prompt carrying the re-injected context; put the
-            # flag back so the next turn re-injects it.
+            # discarded the prompt carrying the re-injected context, and a backend
+            # that compacted the session during the turn dropped it; either way
+            # the flag is set so the next turn re-injects it.
             rearm_reinjection(
-                self.sessions, session_key, consumed=_needs_reinjection, landed=_turn_landed
+                self.sessions,
+                session_key,
+                consumed=_needs_reinjection,
+                landed=_turn_landed,
+                compacted=getattr(driver, "compaction_completed", False) is True,
             )
             rollback_skill_bodies(self.ctx_builder, session_key, landed=_turn_landed)
             # Always finalize the placeholder (no perma-"🤔 …"), even if
@@ -2192,8 +2232,18 @@ class TelegramDispatcher:
         """Map an inbound message/callback to its conversation-identity key.
 
         Returns ``(slot, comp)`` where ``slot`` selects the session namespace:
-          * private DM -> ``(CHAT_TYPE_DIRECT, str(user_id))`` -- byte-for-byte
-            the pre-forum identity, so DM keys are unchanged.
+          * threadless private DM -> ``(CHAT_TYPE_DIRECT, str(user_id))`` --
+            byte-for-byte the pre-forum identity, so a user who never turns on
+            private-chat topics keeps the exact same DM key (and the General
+            topic, which carries no ``message_thread_id``, stays on it too).
+          * private-chat forum Topic -> ``(CHAT_TYPE_PRIVATE_TOPIC,
+            "{chat_id}:{thread}")``. Telegram now supports forum topics inside a
+            1:1 DM (Bot API ``Message.message_thread_id`` "for supergroups and
+            private chats"); each topic is its own conversation, mirroring the
+            supergroup case. It is still a 1:1 DM with one allow-listed user, so
+            it stays on the ``direct`` side of the dashboard-link/host-listing
+            token guards (see ``_is_private_route``), but it is per-topic
+            isolated and never collapses under ``dm_scope=unified``.
           * supergroup forum Topic -> ``(CHAT_TYPE_FORUM, "{chat_id}:{thread}")``.
 
         A threadless supergroup (General) message is denied at the forum gate
@@ -2206,21 +2256,46 @@ class TelegramDispatcher:
         if chat_type in ("group", "supergroup"):
             comp = f"{chat_id}:{thread}" if thread else str(chat_id)
             return CHAT_TYPE_FORUM, comp
+        if thread:
+            # A private chat carrying a message_thread_id is a direct-message
+            # forum Topic: fold (chat_id, thread) so each topic is its own
+            # session instead of sharing the one DM session.
+            return CHAT_TYPE_PRIVATE_TOPIC, f"{chat_id}:{thread}"
         return CHAT_TYPE_DIRECT, str(user_id)
 
     @staticmethod
-    def _route_thread(route: tuple[str, str]) -> int | None:
-        """The forum Topic id for a ``route``, or None for a DM.
+    def _is_private_route(route: tuple[str, str]) -> bool:
+        """True when ``route`` is a 1:1 DM with the user -- the baseline direct
+        DM OR a private-chat forum Topic.
 
-        Mirrors ``_route_key``'s ``comp`` encoding: a forum Topic route carries
-        ``"{chat_id}:{thread}"`` -> the Topic id; a DM (direct) route -> None.
-        An authorized forum turn always carries a Topic (General is denied at
-        the gate), so the threadless-``comp`` -> None case is only the defensive
-        fallback. Threads every dispatcher-originated send back into the
-        SAME Topic the turn came from.
+        Both are the SAME person in the SAME private chat, so both pass the
+        token-leak guards that gate reply AUDIENCE (``/kirocrew dashboard``,
+        the host-wide listings in ``_require_direct_chat``): there is no group
+        to read the reply. A supergroup forum Topic (``CHAT_TYPE_FORUM``) is
+        readable by the whole supergroup, so it is NOT private here.
+
+        This is deliberately distinct from the owner-DM session-control
+        exemption (``session_control.owner_dm_refusal``), which stays
+        ``direct`` + a single scope segment only: a private topic can hold a
+        conversation but does not gain host-wide session-control authority (the
+        fail-safe default), and that predicate is shared with Discord.
+        """
+        return route[0] in (CHAT_TYPE_DIRECT, CHAT_TYPE_PRIVATE_TOPIC)
+
+    @staticmethod
+    def _route_thread(route: tuple[str, str]) -> int | None:
+        """The forum Topic id for a ``route``, or None for a threadless DM.
+
+        Mirrors ``_route_key``'s ``comp`` encoding: a forum Topic route (group
+        ``CHAT_TYPE_FORUM`` or private-chat ``CHAT_TYPE_PRIVATE_TOPIC``) carries
+        ``"{chat_id}:{thread}"`` -> the Topic id; a threadless direct DM route
+        -> None. An authorized supergroup turn always carries a Topic (General
+        is denied at the gate), so the threadless-``comp`` -> None case is only
+        the defensive fallback. Threads every dispatcher-originated send back
+        into the SAME Topic the turn came from.
         """
         slot, comp = route
-        if slot == CHAT_TYPE_FORUM and ":" in comp:
+        if slot in (CHAT_TYPE_FORUM, CHAT_TYPE_PRIVATE_TOPIC) and ":" in comp:
             return int(comp.split(":", 1)[1])
         return None
 

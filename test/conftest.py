@@ -407,7 +407,9 @@ CREDENTIAL_STRADDLE_SHAPES = [
 ]
 
 
-def assert_rejected_without_backtracking(reject, build_pump) -> None:
+def assert_rejected_without_backtracking(
+    reject, build_pump, *, budget_seconds: float = REDOS_LARGE_BUDGET_SECONDS
+) -> None:
     """Assert a marker grammar handles an adversarial pump in linear CPU time.
 
     ``build_pump(n)`` returns an input with an ``n``-unit pump (a run of tabs, ``n``
@@ -448,7 +450,9 @@ def assert_rejected_without_backtracking(reject, build_pump) -> None:
 
     The budgets are generous on purpose (a decade or more over the shipped cost):
     a real complexity regression is orders of magnitude, and a tight bound only
-    turns runner variance into red.
+    turns runner variance into red. ``budget_seconds`` is the long pumps' absolute
+    budget; a converted guard passes the constant it already carried, since a
+    ratchet may only tighten.
     """
     import time
 
@@ -471,7 +475,7 @@ def assert_rejected_without_backtracking(reject, build_pump) -> None:
         )
 
     def refused(cost: float, bound: float) -> bool:
-        return cost >= REDOS_LARGE_BUDGET_SECONDS or cost > bound
+        return cost >= budget_seconds or cost > bound
 
     def floor_of_readings(text: str, settle_below: float, bound: float) -> float:
         # Up to three readings; stop at the first one under ``settle_below``, and
@@ -487,14 +491,14 @@ def assert_rejected_without_backtracking(reject, build_pump) -> None:
 
     previous: tuple[int, float] | None = None
     for n in REDOS_LARGE_PUMPS:
-        bound = REDOS_LARGE_BUDGET_SECONDS
+        bound = budget_seconds
         if previous is not None:
             bound = max(REDOS_SCALING_RATIO * previous[1], REDOS_SCALING_FLOOR_SECONDS)
         # A size the next one is compared against keeps all three readings: its
         # cheapest is the baseline, and an inflated baseline would hide a regression.
         settle_below = bound if n == REDOS_LARGE_PUMPS[-1] else 0.0
         cost = floor_of_readings(build_pump(n), settle_below, bound)
-        assert cost < REDOS_LARGE_BUDGET_SECONDS, (
+        assert cost < budget_seconds, (
             f"handling a {n}-unit pump cost {cost:.2f}s of CPU -- superlinear in the "
             "pump length"
         )
@@ -2220,6 +2224,34 @@ def isolate_mcp_host_paths(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPat
     global_mcp = tmp_path / "host-kiro-settings" / "mcp.json"
     monkeypatch.setattr(mcp_handlers, "_GLOBAL_MCP_JSON", global_mcp)
     monkeypatch.setattr(mcp_handlers, "_MCP_LOCK_PATH", global_mcp.with_suffix(".lock"))
+
+
+@pytest.fixture
+def ample_host_free_memory(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin the free-memory reading behind the memory posture to a healthy host.
+
+    ``resource_status._read_available_gb`` is the live input of the posture
+    that ``admission_check`` and ``prewarm_allowance`` act on. While it reads
+    critical, the cron due-scan defers interval and one-shot firings and the
+    chat runner holds no eager pre-warm session. A test that fires a cron job
+    or an eager spawn then fails on a runner with 2 GB or less free, with no
+    hint that memory is involved: ``svc._claims[job_id]`` raises a bare
+    ``KeyError``, a wait times out, or ``get_or_create`` is awaited 0 times.
+    Seen on the v0.9.0-insider.1 release run (8 failures that pass on a host
+    with free memory).
+
+    The reading is pinned, not ``probe`` itself, because ``prewarm_allowance``
+    reads it without going through ``probe``. Only this reading is pinned: a
+    test about the slice, cgroup or host readers below it must not opt in,
+    since this hides them. A test about the posture patches the reader in its
+    own body, on top of this.
+
+    Opt in per module with
+    ``pytestmark = pytest.mark.usefixtures("ample_host_free_memory")``.
+    """
+    import kiro_crew.resource_status as resource_status
+
+    monkeypatch.setattr(resource_status, "_read_available_gb", lambda: _HEALTHY_AVAILABLE_GB)
 
 
 @pytest.fixture

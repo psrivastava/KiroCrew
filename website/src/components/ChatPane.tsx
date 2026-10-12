@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback, useEffect, useLayoutEffect, useMemo } from 'react'
+import { useState, useRef, useCallback, useEffect, useLayoutEffect, useMemo, type ComponentType, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
 import { useNavigate } from 'react-router-dom'
 import { X } from 'lucide-react'
@@ -9,10 +9,14 @@ import ChatMessageList from '../app-sdk/ChatMessageList'
 import type { VirtualTranscriptHandle } from '../app-sdk/ChatMessageList'
 import type { ThreadHooks } from '../app-sdk/messageRenderers'
 import { EdgeFade, JumpToBottomButton } from '../app-sdk/ChatScrollChrome'
+import { DOCK_CLEARANCE_PX, useComposerDockMetrics } from '../pages/chat/composerDockMetrics'
 import { createTranscriptRenderers } from '../pages/chat/transcriptRenderers'
 import ChatInput, { type ComposerBusyMode } from './ChatInput'
+import type { ChatInputProps } from './chat-input/props'
 import { busySteerFlag } from './chat-input/busySend'
 import { filterCrewmateChat } from './chat/crewmateBubbles'
+import CrewmateLiveActivity from './chat/CrewmateLiveActivity'
+import { useCrewmateGreetingShown } from './chat/useCrewmateGreetingShown'
 import type { CrewmateIdentity } from '../pages/chat/CrewmateMessage'
 import ErrorNotice from './ErrorNotice'
 import { Btn } from './ui'
@@ -25,15 +29,13 @@ export type PaneLeading = { inset?: boolean; control?: React.ReactNode }
 import PendingQuestionCard from './PendingQuestionCard'
 import QueueStack, { SubagentDeliveryProgress, splitPaneMessages } from './QueueStack'
 import SubagentProgressBar from '../pages/chat/SubagentProgressBar'
-import CommandCenterDock from '../pages/chat/command-center/CommandCenterDock'
-import { usePreviewFlag } from '../hooks/usePreviewFlag'
-import { PREVIEW_DASHBOARD } from '../utils/previewFlags'
 import ChatFooter from '../pages/chat/ChatFooter'
 import PinnedPrompt from '../pages/chat/PinnedPrompt'
 import SessionTitleControl from '../pages/chat/SessionTitleControl'
 import { pinCandidateKey, usePinnedPrompt } from '../pages/chat/usePinnedPrompt'
 import { useJevAutoSend } from '../pages/chat/useJevAutoSend'
 import type { DisplayItem } from '../pages/chat/types'
+import { useSlotActivity } from '../pages/members/useSlotActivity'
 import AgentDropdownList, { DefaultAgentRow, ManageAgentsFooter } from './AgentDropdownList'
 import { agentSwitchFailureMessage } from '../utils/agentSwitchFeedback'
 import { agentOrDefaultLabel } from '../utils/agentLabel'
@@ -58,10 +60,10 @@ import { useKirocrewConfigReader } from '../hooks/useKirocrewConfigReader'
 import { useImeGuard } from '../hooks/useImeGuard'
 import { useScrollEdgesY } from '../hooks/useScrollEdges'
 import { useAppSelector, useAppDispatch, store } from '../store'
-import { PANE_HYDRATE_LIMIT, capturePendingAskId, confirmOptimisticSend, resolveOptimisticSteer, selectSlotMessages, selectSendConfirmed, selectSlotStreamState, selectSlotRunEpoch, selectComposerBusy, hydrateSlotMessages, appendSlotMessage, requestStop, loadOlderMessages, loadOlderSlotMessages, syncSlotRunningFromServer, setAgentSwitchNotice, stageToMainComposer, pendingQuestionFor } from '../store/chatSlice'
+import { PANE_HYDRATE_LIMIT, capturePendingAskId, confirmOptimisticSend, markSendUnconfirmed, resolveOptimisticSteer, selectSlotMessages, selectSendConfirmed, selectSlotStreamState, selectSlotRunEpoch, selectComposerBusy, hydrateSlotMessages, appendSlotMessage, requestStop, loadOlderMessages, loadOlderSlotMessages, syncSlotRunningFromServer, setAgentSwitchNotice, stageToMainComposer, pendingQuestionFor } from '../store/chatSlice'
 import { handleStopPress, isEscalationState } from '../utils/stopDebounce'
 import { deriveFollowUpOptions } from '../app-sdk/protocol'
-import { appendFollowUpOption, removeFollowUpOption, type OwnedSuffix } from '../lib/followUpToggle'
+import { appendFollowUpOption, removeFollowUpOption, selectSingleFollowUpOption, type OwnedSuffix } from '../lib/followUpToggle'
 import { CONTENT_WIDTH, loadChatConfig, type ChatConfig } from '../pages/chat/ChatSettings'
 import { scaleContentWidth } from '../pages/chat/contentWidth'
 import { tryQuickSend } from '../lib/quickSend'
@@ -102,6 +104,8 @@ import {
 
 
 import { i18nT } from '../i18n/t'
+import { earlierConversationRenderer, foldEarlierConversation } from './EarlierConversation'
+import { answerRejectedMessage } from '../utils/questionAnswers'
 import { fetchDashboardConfig } from '../api/dashboardConfigQuery'
 
 /**
@@ -130,23 +134,27 @@ export default function ChatPane({
   onSplitDown,
   onOpenFull,
   agentLocked,
+  composerInput: ComposerInput = ChatInput,
   frameless,
+  topInset = 0,
   followContentWidth,
   hideEmptyHint,
   openSideChat,
   leading,
   onFileOpen,
+  onArtifactOpen,
   busyMode = 'split',
   crewmate,
+  crewmateGreeting,
   onOpenCrewWorkLog,
-  onOpenCommandCenter,
   threads,
   onSessionOpen,
   sessions,
   activeSession,
+  crewmateCreated,
+  foldBefore,
 }: {
   slotKey: string
-  onOpenCommandCenter?: () => void
   focused?: boolean
   onFocus?: () => void
   onRemove?: () => void
@@ -160,6 +168,10 @@ export default function ChatPane({
    *  the agent picker is not offered at all, instead of offering a control
    *  whose every selection the backend 409s. */
   agentLocked?: boolean
+  /** The input the pane's composer draws, fed every ChatInput prop. Absent:
+   *  the ordinary ChatInput. The Crewmates page passes its own CrewComposer,
+   *  which reuses ChatInput without the session toolbar line. */
+  composerInput?: ComponentType<ChatInputProps>
   /** Split view: this pane owns the surface's top-left corner, where the shell
    *  keeps the sessions-sidebar toggle. `inset` reserves that toggle's column
    *  (desktop: the toggle is the shell's absolutely positioned button, and the
@@ -172,6 +184,13 @@ export default function ChatPane({
    *  (border, rounded corners) would duplicate it. Split-view panes keep
    *  the chrome — there the bar IS the pane's identity. */
   frameless?: boolean
+  /** Height, in px, of a host band that floats OVER the pane's top edge (the
+   *  Members DM header, #18325): the scroller pads its rows below it, so at
+   *  scroll top nothing hides under the band while the conversation still
+   *  scrolls under it; the pinned-prompt band hangs under it too. Measured
+   *  by the host, never a constant. 0 (default): the pane's top edge is the
+   *  host's own content edge, as in a split pane under its title bar. */
+  topInset?: number
   /** The pane follows the user's Content width setting (transcript AND
    *  composer, both halves of CONTENT_WIDTH), resolved from the pane's own
    *  live chatConfig. Defaults to false = both variables pinned to '100%':
@@ -185,6 +204,10 @@ export default function ChatPane({
    *  above the pane (the Members page's "Couldn't reconnect" notice) sets it,
    *  so the pane does not say "go" one line under a host that says "broken". */
   hideEmptyHint?: boolean
+  /** ISO time of a fresh start on this thread. Rows written before it fold
+   *  under one closed "Earlier conversation" divider the reader can open.
+   *  Display only: the rows stay in the transcript. */
+  foldBefore?: string
   /** Bring a Side Chat surface for this pane's slot on screen. The selection
    *  toolbar offers "Ask" only when the host provides it: the pane owns its
    *  composer (so Quote is always there) but no Side Chat of its own — the
@@ -196,6 +219,15 @@ export default function ChatPane({
    *  the pane shows every attachment but cannot open one. Capability by
    *  omission, like `openSideChat`. */
   onFileOpen?: (path: string, opts?: { line?: number; endLine?: number }) => void
+  /** Open an artifact named in a reply (`/artifacts/<slug>` link) in the
+   *  host's side panel, the way the main chat does. Without it the link is a
+   *  plain `target="_blank"` anchor to the standalone artifact view -- a
+   *  crewmate's reply that names the artifact it just made then opens it in
+   *  another browser tab, or nowhere when the shell swallows the popup
+   *  (#18320). Capability by omission, like
+   *  `onFileOpen`: the Members page wires its panel's artifact opener, a
+   *  split-view pane passes nothing (its dock is `activeSlot`-keyed). */
+  onArtifactOpen?: (slug: string) => void
   /** What the composer's send does while the slot is busy. Defaults to
    *  `'split'` — the same Steer/Queue split button as the main chat, which
    *  split-view (⌘D) panes keep: they are the main chat's own sessions seen
@@ -213,6 +245,12 @@ export default function ChatPane({
    *  (components/chat/crewmateBubbles). Undefined = an ordinary transcript;
    *  decided by the host, never inferred from the slot. */
   crewmate?: CrewmateIdentity
+  /** A message from the crewmate the HOST draws after the last row (the
+   *  Members page's warm resume / cold welcome, `mateGreeting.ts`). It sits in
+   *  the transcript like a reply but is not one: never a slot row, never sent,
+   *  so it costs no model call and the model never reads it back. Only
+   *  meaningful with `crewmate`. */
+  crewmateGreeting?: React.ReactNode
   /** Focus the crewmate's Work log tab (the side-panel tab that holds what
    *  the filter hid). When given, the quiet hint's "where the work went" line
    *  is a link that opens it, so the words that read as a destination are one;
@@ -236,6 +274,8 @@ export default function ChatPane({
   onSessionOpen?: (key: string) => void
   sessions?: ReadonlyMap<string, string>
   activeSession?: string
+  /** Host confirmation of a user-created crewmate, never a synthetic AI reply. */
+  crewmateCreated?: ReactNode
 }) {
   // One instance covers both dropdown filter inputs (never open at once).
   const dispatch = useAppDispatch()
@@ -243,9 +283,6 @@ export default function ChatPane({
   // Same gate the main chat uses: hide a Connections-owned OAuth banner only
   // while the card that owns that flow is reachable.
   const connectionsUiOn = useConnectionsUiEnabled()
-  // The Dynamic Dashboard is a Feature Preview (Settings > Developer): its
-  // dock is offered only to someone who turned it on, whatever the host wired.
-  const dashboardPreview = usePreviewFlag(PREVIEW_DASHBOARD)
   const [input, setInput] = useState('')
   const [pendingFiles, setPendingFiles] = useState<string[]>([])
   const pendingDirs = useMemo(() => parseDirTokens(input).map(t => t.rel), [input])
@@ -498,14 +535,26 @@ export default function ChatPane({
   // prop). Filtered HERE, above the list, so the run positions the assistant
   // rows compute from their neighbours see the drawn list, and so the pinned
   // prompt, the earlier-messages anchor and the empty hint all agree with what
-  // is on screen. Same array identity back when nothing is dropped. While a
-  // turn runs, its tool calls and thinking stay in, so the chat shows what the
-  // crewmate is doing (same liveness the footer reads).
+  // is on screen. Same array identity back when nothing is dropped. The turn
+  // in flight is filtered like any other: what the crewmate is doing right now
+  // is the status line above the footer (`liveActivity`), not a transcript
+  // row, so the working indicator holds still while steps come and go.
   const crewmateLive = running || !!paneSlot?.running
   const messages = useMemo(
-    () => (crewmate ? filterCrewmateChat(paneMessages, crewmateLive) : paneMessages),
-    [crewmate, paneMessages, crewmateLive],
+    () => (crewmate ? filterCrewmateChat(paneMessages) : paneMessages),
+    [crewmate, paneMessages],
   )
+  // The host's greeting is drawn while it is still the newest word: a reply
+  // landing after it (a patrol / wake turn keeps it up) takes it down.
+  const greetingShown = useCrewmateGreetingShown(!!crewmate && !!crewmateGreeting, messages)
+  // What the crewmate is doing right now, for the status line above the
+  // working indicator: read through the SAME seam the DM header's identity
+  // pill reads (`useSlotActivity` over the slot's live status record), so the
+  // two can never name one moment differently (same `delegatedOnly` input).
+  const liveActivity = useSlotActivity(crewmate ? slotKey : '', {
+    running: crewmateLive,
+    delegatedOnly: !!paneSlot?.subagents_running && !paneSlot?.running,
+  })
   // The unfiltered rows, handed to the row set for the one read that must see
   // what the filter dropped (the steer-chip decision reads the policy-block
   // inject row). `undefined` for an ordinary chat, so its renderer set does not
@@ -533,7 +582,7 @@ export default function ChatPane({
   // for the same reason as ChatPage: both would offer the same choices, and
   // only the card can answer the blocked tool call.
   const pendingQuestion = useAppSelector((s) => pendingQuestionFor(s.chat.pendingQuestions, slotKey))
-  const { followUpOptions, followUpSourceKey } = useMemo(
+  const { followUpOptions, followUpSourceKey, followUpMulti } = useMemo(
     () => deriveFollowUpOptions(allMessages, busy, !!pendingQuestion),
     [allMessages, busy, pendingQuestion],
   )
@@ -563,7 +612,11 @@ export default function ChatPane({
     setInput(next)
   }, [])
   const followUpOptionsKey = followUpOptions.join('\x00')
-  useEffect(() => { setFollowUpPicked(new Set()); followUpInsertedRef.current = null }, [followUpOptionsKey, slotKey])
+  // A single-select offer is keyed on its source row too: a newer reply can repeat
+  // the same labels, and a single-select pick must not replace text the user picked
+  // from the older offer. Multi-select rows keep the label-only reset.
+  const singleSourceKey = followUpMulti ? null : followUpSourceKey
+  useEffect(() => { setFollowUpPicked(new Set()); followUpInsertedRef.current = null }, [followUpOptionsKey, singleSourceKey, followUpMulti, slotKey])
   // Quick Send parity with ChatPage: same query key, so the cache is shared
   // with the page and no extra request is made for a pane.
   const { data: dashCfg } = useQuery<{ quick_send?: boolean; decisions_enabled?: boolean }>({ queryKey: ['dashboardConfig'], queryFn: fetchDashboardConfig, staleTime: 30_000 })
@@ -583,11 +636,16 @@ export default function ChatPane({
   }, [])
   // Same enablement the main chat honours (Settings → Chat → pin last prompt),
   // read through the hook's ref so the scroll recompute never closes over a
-  // stale config.
+  // stale config. Never in a crewmate's chat (#18346): the banner is for long
+  // agent runs where the question scrolls away while the answer streams; a DM
+  // with a colleague has short turns, the user's bubble is one row back, and
+  // under the floating glass header (#18325) a second floating card read as
+  // clutter. Ordinary chats and split panes keep it.
+  const pinOn = chatConfig.pinLastPrompt && !crewmate
   useEffect(() => {
-    pin.pinEnabledRef.current = chatConfig.pinLastPrompt
-    if (!chatConfig.pinLastPrompt) setPinned(null)
-  }, [chatConfig.pinLastPrompt, pin.pinEnabledRef, setPinned])
+    pin.pinEnabledRef.current = pinOn
+    if (!pinOn) setPinned(null)
+  }, [pinOn, pin.pinEnabledRef, setPinned])
   // The transcript row whose bubble the banner is standing in for. The list
   // hides it (ts-keyed, index fallback — see ChatMessageList.hiddenRow);
   // memoised so the memo'd list does not re-render on every pane render.
@@ -1177,10 +1235,19 @@ export default function ChatPane({
         // Report ONLY -- the error row. The restore is `restore`'s job above;
         // handing the payload back here too would restore a `refused` twice.
         reportFailure: (reason, status) => reportSendFailure(reason, status, !optionText),
-        // Only the no-bubble composer send that actually restored gets the
-        // notice; a bubble that stayed pending needs no "check the transcript"
-        // warning, and an option send restored nothing to warn about.
-        warnUnconfirmed: () => { if (!bubbleMinted && !optionText) dispatch(appendSlotMessage({ slot: slotKey, message: { role: 'notice', content: '\u26A0\uFE0F ' + i18nT('pages.chatPage.delivery_unconfirmed'), cls: '' } })) },
+        // A bubble that stayed pending is marked (the mark draws its pending
+        // line) and gets the pending notice under it, as ChatPage does. A
+        // no-bubble composer send that restored gets the "text is back"
+        // notice; an option send restored nothing to warn about. Both rows
+        // are addressed to the SENDING slot.
+        warnUnconfirmed: () => {
+          if (bubbleMinted) {
+            dispatch(markSendUnconfirmed({ slot: slotKey, sendId }))
+            dispatch(appendSlotMessage({ slot: slotKey, message: { role: 'notice', content: '\u26A0\uFE0F ' + i18nT('pages.chatPage.delivery_unconfirmed_pending'), cls: '' } }))
+          } else if (!optionText) {
+            dispatch(appendSlotMessage({ slot: slotKey, message: { role: 'notice', content: '\u26A0\uFE0F ' + i18nT('pages.chatPage.delivery_unconfirmed'), cls: '' } }))
+          }
+        },
         // doSend mints no optimistic STEER bubble to drop, so the 'drop' arm
         // (refused/response-late/queued demotion) is a no-op here -- a non-busy
         // send's plain bubble and a busy send's absent bubble are both
@@ -1215,7 +1282,7 @@ export default function ChatPane({
       // receipt. Guarded independently of the rulings above so a `steered` or
       // `queued` receipt still settles the ask correctly.
       if (!askAtSend) return
-      void resolveAskAfterSend(receipt.body, askAtSend, dispatch)
+      void resolveAskAfterSend(receipt.body, askAtSend, dispatch, slotKey)
     })
   }, [input, pendingFiles, pasteBlocks, setPasteBlocks, busy, slotKey, dispatch, restoreIntoComposer, reportSendFailure, scrollToBottom, consumeQuote, recoverQuoteInto])
 
@@ -1240,8 +1307,18 @@ export default function ChatPane({
     // steer flag, leaving doSend owning the draft and bubble bookkeeping
     // (it inlines attachments as this path does below, so a send the server
     // demotes to the text-only queue still carries them).
-    if (!running) { doSend(undefined, true); return }
+    //
+    // "No turn" is read from the slot's server flag too, not only this tab's
+    // stream state: a background slot (a crewmate DM) turns busy here only on
+    // a chunk or tool frame, so while its turn thinks, or was already running
+    // when the pane mounted, the stream state still reads idle. Taking the
+    // send path then minted no bubble (the slot is busy) and the message
+    // showed only when the server echoed it. A stale flag
+    // is safe: the server finds no turn, dispatches one, and the receipt's
+    // `turn` ruling demotes the steer bubble to a plain row.
+    if (!running && !paneSlot?.running) { doSend(undefined, true); return }
     const raw = input.trim()
+    const askAtSteer = capturePendingAskId(store.getState().chat.pendingQuestions, slotKey)
     const files = pendingFiles
     const sentQuote = consumeQuote('').quote
     // A steer cannot restore what it cleared on an empty payload, so refuse a
@@ -1312,8 +1389,12 @@ export default function ChatPane({
         // with the card, so the token alone would restore as a dead chip.
         stashDemoted: (queueId) => queuedSendStash.set(queueId, { raw: steerPastes.length ? expandPasteTokens(raw, steerPastes) : raw, files, sent: txt, ...(sentQuote ? { quote: sentQuote } : {}) }),
       })
+      // Release a blocking card only once the gateway accepted the steer, so the agent is told to read a message that arrived.
+      if (askAtSteer && (receipt.status === 'dispatched' || receipt.status === 'queued')) {
+        void resolveAskAfterSend(receipt.body, askAtSteer, dispatch, slotKey)
+      }
     })
-  }, [running, doSend, input, pendingFiles, pasteBlocks, setPasteBlocks, slotKey, dispatch, reportSendFailure, restoreIntoComposer, consumeQuote, recoverQuoteInto])
+  }, [running, paneSlot?.running, doSend, input, pendingFiles, pasteBlocks, setPasteBlocks, slotKey, dispatch, reportSendFailure, restoreIntoComposer, consumeQuote, recoverQuoteInto])
 
   // Stop mirrors ChatPage's press protocol (ChatPage.onStop): the first press
   // is the cooperative cancel, a second press while the slot reports
@@ -1501,7 +1582,14 @@ export default function ChatPane({
   const setToolDisclosureFor = useCallback((key: string, expanded: boolean) => {
     setToolDisclosure((prev) => ({ ...prev, [key]: expanded }))
   }, [])
-  const renderers = useMemo(
+  // The fresh-start fold opens per fresh start: a newer one closes it again.
+  const [openFold, setOpenFold] = useState<string | undefined>(undefined)
+  const foldOpen = !!foldBefore && openFold === foldBefore
+  const listMessages = useMemo(
+    () => foldEarlierConversation(messages, foldBefore, foldOpen),
+    [messages, foldBefore, foldOpen],
+  )
+  const baseRenderers = useMemo(
     () => createTranscriptRenderers({
       slot: slotKey,
       toolDisclosure,
@@ -1523,13 +1611,22 @@ export default function ChatPane({
     }),
     [slotKey, toolDisclosure, setToolDisclosureFor, busyMode, onFileOpen, crewmate, crewmateTranscript, onSessionOpen, sessions, activeSession],
   )
+  const renderers = useMemo(
+    () => (foldBefore
+      ? [earlierConversationRenderer(foldOpen, () => setOpenFold(foldOpen ? undefined : foldBefore)), ...baseRenderers]
+      : baseRenderers),
+    [baseRenderers, foldBefore, foldOpen],
+  )
 
+  // The composer dock floats over the bottom of the scroller (ChatPage's
+  // layout, shared measurement): `dockH` is what the scroller pays below its
+  // last row, `inputAreaRef` the quote flight's landing box.
+  const { inputAreaRef, dockH, dockGutter, dockRef } = useComposerDockMetrics(scrollerRef)
   // Quote / Ask on selected assistant text — the same chat-core seam the main
   // chat uses (chat-core/composer/selectionActions), bound to THIS pane's
   // composer and slot. Before this the pane's selection toolbar offered Copy
   // only: the SDK's assistant row draws the actions the host hands it, and no
   // host but ChatPage handed any.
-  const inputAreaRef = useRef<HTMLDivElement>(null)
   const { onQuote, onAsk, quoteFlight, endQuoteFlight } = useSelectionQuoteAsk({ slot: slotKey, setInput, revealComposer, openSideChat })
 
   const ddInputCls = 'w-full px-2 py-1 text-[13px] font-body bg-bg border border-border rounded text-text outline-hidden focus-visible:border-accent'
@@ -1652,7 +1749,12 @@ export default function ChatPane({
             the pane root is what this band is anchored to, so it can never
             paint over that header. right-1.5 keeps it off the scrollbar
             track, as on the main chat. */}
-        <div className="relative z-[2]">
+        {/* `top: topInset` (a relative offset, no flow height) moves the fold
+            sentinel — the line the banner sticks to, read by its
+            getBoundingClientRect — and the banner with it under a host band
+            floating over the pane's top, so the pinned prompt never hides
+            under that band. */}
+        <div className="relative z-[2]" style={topInset ? { top: topInset } : undefined}>
           <div ref={pin.pinFoldRef} aria-hidden className="h-0" />
           {pinnedState && (
             <div className="absolute top-0 left-0 right-1.5 pointer-events-none">
@@ -1685,7 +1787,7 @@ export default function ChatPane({
             TranscriptScrollShell for the style contract it enforces. */}
         <ChatMessageList
           ref={listRef}
-          messages={messages}
+          messages={listMessages}
           // The slot's own liveness too, not only this session's stream: a
           // DM/member pane observing a turn driven elsewhere still follows.
           running={running || !!paneSlot?.running}
@@ -1698,12 +1800,19 @@ export default function ChatPane({
           onAsk={onAsk}
           threads={threads}
           onFileOpen={onFileOpen}
+          onArtifactOpen={onArtifactOpen}
           transcript={{
             sessionId: `pane:${slotKey}`,
             scrollerRef,
             onScroll: onScrollPin,
             onAtBottomChange: setIsAtBottom,
-            scrollerStyle: { paddingTop: 12, paddingBottom: 12, minHeight: 0 },
+            // `topInset`: a host band floating over the pane's top (the
+            // Members DM header) is paid for here, so the first rows clear it
+            // at scroll top and pass under it once the reader scrolls. The
+            // dock floats over the scroller's bottom edge, so the scroller
+            // pays for that strip too, plus the same clearance ChatPage keeps
+            // between its last line and the glass.
+            scrollerStyle: { paddingTop: 12 + topInset, paddingBottom: dockH + DOCK_CLEARANCE_PX, minHeight: 0 },
             // handOff off: its navigation would discard this pane's unsaved draft.
             earlier: pagesActiveSlot
               ? { hasMore: activeHasMore, loading: loadingOlder, failed: olderFailed, onLoad: loadOlder, handOff: false }
@@ -1730,8 +1839,13 @@ export default function ChatPane({
                     spoken and where the work went, instead of "type a message
                     to start" beside a summary that counts its wakes. Said only
                     once the read is the WHOLE history (`crewmateQuietUnproven`
-                    above): a bounded window with no speech in it is not proof. */}
-                {messages.length === 0 && !running && !slotDetailFailed && !hideEmptyHint && !crewmateQuietUnproven && (
+                    above): a bounded window with no speech in it is not proof.
+                    Nor while the crewmate is at work (`crewmateLive`, the same
+                    liveness the status line and footer read): its current step
+                    is on screen, so "hasn't said anything" would sit under a
+                    line that shows it busy. */}
+                {crewmateCreated}
+                {messages.length === 0 && !(crewmate ? crewmateLive : running) && !slotDetailFailed && !hideEmptyHint && !crewmateQuietUnproven && (
                   <div className="text-center text-muted text-[13px] px-4 py-8" data-testid={crewmate && paneMessages.length > 0 ? 'crewmate-quiet-hint' : undefined}>
                     {crewmate && paneMessages.length > 0 ? (
                       <>
@@ -1778,7 +1892,13 @@ export default function ChatPane({
                  tool steps. Inside the scroll container, after the last message,
                  so it reads as "the reply is coming" exactly where the reply will
                  land. Stop/regenerate chrome stays page-level: the pane derives
-                 the footer's inputs from its own per-slot stream state. */
+                 the footer's inputs from its own per-slot stream state. A
+                 crewmate's current step is the one-line status directly above
+                 it, mounted for the whole live turn so the indicator never
+                 moves while steps come and go (#18238). */
+              <>
+              {greetingShown && crewmateGreeting}
+              {crewmate && crewmateLive && <CrewmateLiveActivity activity={liveActivity} />}
               <ChatFooter
                 running={running || !!paneSlot?.running}
                 stopping={streamState === 'stopping' || !!paneSlot?.stopping}
@@ -1790,18 +1910,35 @@ export default function ChatPane({
                     : 0
                 }
               />
+              </>
             ),
           }}
         />
-        {/* Bottom fade overlays the scroller's last 24px above the status bars
-            and composer (in-flow height cancelled by its own negative margin). */}
-        <EdgeFade side="bottom" />
-
-        <div className="relative">
+        {/* Composer dock. Floats over the bottom of the transcript scroller
+            instead of sitting under it in the flex column (ChatPage's iOS
+            toolbar layout, decided in
+            docs/decisions/2026-10-02-chat-transcript-scrolls-under-the-composer-glass.md):
+            the scroller runs the full height of the pane and the conversation
+            scrolls UNDER the glass; the scroller pays for the covered strip
+            with `paddingBottom: dockH + DOCK_CLEARANCE_PX`, measured from this
+            box by `dockRef`. No opaque bottom fade any more: the material's
+            blur and tint keep the dock legible. The root is plain
+            `pointer-events-none`; `dock-inert` (index.css) goes on the TWO
+            inner wrapper boxes below, as on ChatPage, so every bar, card and
+            the composer still catches input while the empty width beside them
+            lets wheel and touch reach the transcript. NOT on the root: the
+            jump pill is a direct child of the root, and its wrapper is a
+            full-width `pointer-events-none` strip (ChatScrollChrome) that
+            `.dock-inert>*` would turn back on, swallowing clicks, selection
+            and wheel over the rows behind it whenever the pill is showing.
+            No z-index on purpose: the dock paints over the scroller because
+            it follows it in DOM order. `right: dockGutter` keeps the
+            scrollbar column clear. */}
+        <div ref={dockRef} className="absolute left-0 bottom-0 pointer-events-none" style={{ right: dockGutter }} data-testid="composer-dock-root">
         <JumpToBottomButton visible={!isAtBottom && messages.length > 0} onClick={scrollToBottom} />
 
+        <div className="dock-inert" data-testid="composer-status-stack">
         <SubagentProgressBar slot={slotKey} />
-        {dashboardPreview && onOpenCommandCenter && <CommandCenterDock slot={slotKey} onOpen={onOpenCommandCenter} />}
 
         <SubagentDeliveryProgress count={systemDeliveryCount} />
         {/* Rendered on server state only. A `steer-only` host never ASKS for a
@@ -1814,124 +1951,121 @@ export default function ChatPane({
           <QueueStack messages={queuedMessages} onCancel={onCancelQueued} onInterrupt={onInterruptQueued} onEdit={onEditQueued} onReorder={onReorderQueued} pendingIds={queuePendingIds} />
         )}
 
-        {/* The pending ask_question card renders per pane: in split mode the
-            agent that asked may not be the pane the user is looking at, and
-            without this its card never appears anywhere, so it waits out its
-            full window. */}
-        <PendingQuestionCard
-          slotKey={slotKey}
-          /* doSend() reads the composer state, so the fallback sends directly
-             through the chat-core transport. The card is already cleared by
-             the time this runs, so a swallowed failure would destroy the
-             user's answer outright; on refusal, transport failure, or
-             the abort deadline it goes back into the composer through the
-             same recovery `doSend` uses. `response-late` restores HERE unlike
-             the composer send: a deadline can fire before the POST ever
-             reached the gateway, and with the card gone a silently lost
-             answer has no other trace — the worst case is a duplicate answer,
-             which the user can see and delete. `unknown` stays silent — a 2xx
-             proves the request was accepted, so the answer may well have
-             landed, and handing it back would invite a second answer to a
-             question already gone. */
-          onFallbackSend={(text) => {
-            const fail = (reason?: string, status?: SendReceiptStatus) => { reportSendFailure(reason, status); restoreIntoComposer(text, [], [], slotKey) }
-            void sendTurn({ message: text, slot: slotKey }).then((receipt) => {
-              if (receipt.status === 'refused' || receipt.status === 'transport-error' || receipt.status === 'response-late') {
-                fail(receipt.reason, receipt.status)
-              }
-            })
-          }}
-          /* No-ask_id card: the card IS the interaction, answered in one click.
-             A native AskUserQuestion card is raised while its own turn is still
-             running and waiting on the answer, so a plain send would queue
-             behind that turn and the question would never be consumed (#10634).
-             When the slot is busy the turn is live, so steer the answer INTO it
-             (`steer: true`); when the turn has ended, `busy` is false and this
-             starts an ordinary next turn, exactly as the non-blocking
-             `ask_question` card does. `busy` is the shared `selectComposerBusy`
-             rule (chatSlice) the main chat keys on too, so the two routes match.
-             Steer ONLY the native card, which the server marks `native` on the
-             `question_card` frame and the /pending row. The non-blocking
-             `ask_question` card carries the same server `card_id` but no such
-             mark: it can be answered while sub-agents keep the slot busy, and
-             it must still start a next turn.
+        {/* The pending ask_question card shares the message column's gutter and
+            --mc-content-width clamp, so it lines up with the messages above it
+            and the composer below at every content-width setting. QuestionCard
+            carries no horizontal margin of its own, so this px-4 is its only
+            gutter. Change cards and guide offers are NOT here: each is
+            a row of the conversation, drawn where it was proposed
+            (cards/ConversationCard). */}
+        <div className="px-4 mx-auto w-full" style={{ maxWidth: 'var(--mc-content-width, 900px)' }} data-testid="chat-card-column">
+          {/* The pending ask_question card renders per pane: in split mode the
+              agent that asked may not be the pane the user is looking at, and
+              without this its card never appears anywhere, so it waits out its
+              full window. */}
+          <PendingQuestionCard
+            slotKey={slotKey}
+            onFallbackSend={(text, questions) => {
+              // The wait is gone (404), so the answer cannot become a tool result
+              // any more. Hand it back to the composer rather than sending it: the
+              // text quotes the agent's own questions, and only the user may
+              // decide to send that as their message. Same recovery as ChatPage.
+              restoreIntoComposer(text, [], [], slotKey)
+              // The submit was rejected, so this is an error row (ErrorNotice), not a warn notice.
+              dispatch(appendSlotMessage({ slot: slotKey, message: answerRejectedMessage(questions) }))
+            }}
+            /* No-ask_id card: the card IS the interaction, answered in one click.
+               A native AskUserQuestion card is raised while its own turn is still
+               running and waiting on the answer, so a plain send would queue
+               behind that turn and the question would never be consumed (#10634).
+               When the slot is busy the turn is live, so steer the answer INTO it
+               (`steer: true`); when the turn has ended, `busy` is false and this
+               starts an ordinary next turn, exactly as the non-blocking
+               `ask_question` card does. `busy` is the shared `selectComposerBusy`
+               rule (chatSlice) the main chat keys on too, so the two routes match.
+               Steer ONLY the native card, which the server marks `native` on the
+               `question_card` frame and the /pending row. The non-blocking
+               `ask_question` card carries the same server `card_id` but no such
+               mark: it can be answered while sub-agents keep the slot busy, and
+               it must still start a next turn.
 
-             Recovery differs by whether this is a live steer. A LIVE steer uses
-             the receipt-aware policy owned by `applySteerReceipt` (issue #9457),
-             exactly as the main chat's steer path: a `refused`/`transport-error`
-             reports and restores; a `response-late` restores and warns
-             delivery-unconfirmed -- UNLESS the `steer_push`/user echo carrying
-             this send's `sendId` already reconciled the optimistic bubble, in
-             which case the steer provably landed and the indeterminate HTTP
-             outcome is ignored (no restore, no duplicate). That echo
-             short-circuit is why a CONFIRMED steer is never handed back as if it
-             failed. An IDLE answer is an ordinary send with no live turn to
-             reconcile against, so it keeps the plain report-and-restore the card
-             fallback has always used. `onFallbackSend` is left untouched as the
-             expired-blocking-card (404) recovery path and is NOT reused here. */
-          onDirectSend={(text) => {
-            // The card IS the interaction, answered in one click. A NATIVE
-            // AskUserQuestion card (marked `native` by the server) is raised
-            // while its own turn is still running and waiting on the answer, so
-            // a plain send would queue behind that turn and the question would
-            // never be consumed (#10634): when the slot is busy that turn is
-            // live, so the answer STEERS into it. The non-blocking
-            // `ask_question` card carries no such mark; it can be answered
-            // while sub-agents keep the slot busy and must still start a next
-            // turn, never steer.
-            //
-            // Both routes are otherwise ONE path: mint an optimistic user bubble
-            // carrying the `sendId`, POST through `sendTurn`, and reconcile the
-            // bubble through `applySteerReceipt` + `resolveOptimisticSteer`
-            // exactly as `doSteer` does. `resolveOptimisticSteer` is what makes
-            // every receipt cell correct without a bespoke ladder: a `turn`
-            // outcome DEMOTES the bubble to a plain user row (so a dispatched
-            // answer stays in the transcript and survives reload), and every
-            // other outcome (`queued`/drop) REMOVES it (so a queued answer shows
-            // only as its QueueStack card, never a duplicate, and a failed one
-            // leaves no orphan). The card cleared on submit, so a genuine
-            // non-delivery hands the answer back to the composer via `restore`,
-            // UNLESS the `steer_push`/user echo carrying this `sendId` already
-            // reconciled the bubble -- proof it landed, so no restore and no
-            // duplicate. Only the `steer` POST flag and the pre-append chunk
-            // drain differ between the two routes.
-            const steerLive = busy && pendingQuestion?.native === true
-            const sendId = `s-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
-            // Drain the per-frame chunk buffer before the append, as `doSteer`
-            // does: a pre-steer chunk still buffered means the finalize-on-steer
-            // finds no streaming row, so the bubble would flush BELOW it and
-            // post-steer chunks would corrupt transcript order (#6075 class).
-            // Only a live steer injects into a streaming turn, so only it drains.
-            if (steerLive) drainPendingChunks()
-            dispatch(appendSlotMessage({ slot: slotKey, message: { role: 'user', content: text, cls: 'msg msg-u', ts: new Date().toISOString(), meta: { ...(steerLive ? { steer: true } : {}), optimistic: true, sendId } } }))
-            void sendTurn({ message: text, slot: slotKey, meta: { sendId }, ...(steerLive ? { steer: true } : {}) }).then((receipt) => {
-              applySteerReceipt(receipt, {
-                // A confirmed echo is stronger evidence than a missing/late HTTP
-                // response: if it landed, do NOT restore (the fix for the
-                // "confirmed steers restored as failed" finding).
-                echoReconciled: () => selectSendConfirmed(store.getState(), slotKey, sendId),
-                // The card cleared on submit, so the answer lives nowhere else:
-                // hand it back on every non-delivered ruling. The bubble is
-                // dropped by `resolveBubble` below, so this never leaves an
-                // orphan row beside the restored text.
-                restore: () => restoreIntoComposer(text, [], [], slotKey),
-                reportFailure: (reason, status) => reportSendFailure(reason, status),
-                // The leading char is NoticeCard's WARN tone selector (parseNotice
-                // strips it and renders a lucide TriangleAlert -- it is never shown
-                // as an emoji icon). Built from code points so the source carries
-                // no emoji literal for the no-emoji-as-icons gate to match.
-                warnUnconfirmed: () => dispatch(appendSlotMessage({ slot: slotKey, message: { role: 'notice', content: String.fromCodePoint(0x26A0, 0xFE0F) + ' ' + i18nT('pages.chatPage.delivery_unconfirmed'), cls: '' } })),
-                // Demote the bubble to a plain user row when the answer landed on
-                // a turn; drop it on every other outcome (queued/refused/late) so
-                // a queued answer shows only as its QueueStack card and a failed
-                // one leaves no orphan.
-                resolveBubble: (outcome) => dispatch(resolveOptimisticSteer({ slot: slotKey, sendId, outcome: outcome === 'turn' ? 'turn' : 'queued' })),
-                // Text-only card answer: no queued-stash binding to carry.
-                stashDemoted: () => undefined,
+               Recovery differs by whether this is a live steer. A LIVE steer uses
+               the receipt-aware policy owned by `applySteerReceipt` (issue #9457),
+               exactly as the main chat's steer path: a `refused`/`transport-error`
+               reports and restores; a `response-late` restores and warns
+               delivery-unconfirmed -- UNLESS the `steer_push`/user echo carrying
+               this send's `sendId` already reconciled the optimistic bubble, in
+               which case the steer provably landed and the indeterminate HTTP
+               outcome is ignored (no restore, no duplicate). That echo
+               short-circuit is why a CONFIRMED steer is never handed back as if it
+               failed. An IDLE answer is an ordinary send with no live turn to
+               reconcile against, so it keeps the plain report-and-restore the card
+               fallback has always used. `onFallbackSend` is left untouched as the
+               expired-blocking-card (404) recovery path and is NOT reused here. */
+            onDirectSend={(text) => {
+              // The card IS the interaction, answered in one click. A NATIVE
+              // AskUserQuestion card (marked `native` by the server) is raised
+              // while its own turn is still running and waiting on the answer, so
+              // a plain send would queue behind that turn and the question would
+              // never be consumed (#10634): when the slot is busy that turn is
+              // live, so the answer STEERS into it. The non-blocking
+              // `ask_question` card carries no such mark; it can be answered
+              // while sub-agents keep the slot busy and must still start a next
+              // turn, never steer.
+              //
+              // Both routes are otherwise ONE path: mint an optimistic user bubble
+              // carrying the `sendId`, POST through `sendTurn`, and reconcile the
+              // bubble through `applySteerReceipt` + `resolveOptimisticSteer`
+              // exactly as `doSteer` does. `resolveOptimisticSteer` is what makes
+              // every receipt cell correct without a bespoke ladder: a `turn`
+              // outcome DEMOTES the bubble to a plain user row (so a dispatched
+              // answer stays in the transcript and survives reload), and every
+              // other outcome (`queued`/drop) REMOVES it (so a queued answer shows
+              // only as its QueueStack card, never a duplicate, and a failed one
+              // leaves no orphan). The card cleared on submit, so a genuine
+              // non-delivery hands the answer back to the composer via `restore`,
+              // UNLESS the `steer_push`/user echo carrying this `sendId` already
+              // reconciled the bubble -- proof it landed, so no restore and no
+              // duplicate. Only the `steer` POST flag and the pre-append chunk
+              // drain differ between the two routes.
+              const steerLive = busy && pendingQuestion?.native === true
+              const sendId = `s-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+              // Drain the per-frame chunk buffer before the append, as `doSteer`
+              // does: a pre-steer chunk still buffered means the finalize-on-steer
+              // finds no streaming row, so the bubble would flush BELOW it and
+              // post-steer chunks would corrupt transcript order (#6075 class).
+              // Only a live steer injects into a streaming turn, so only it drains.
+              if (steerLive) drainPendingChunks()
+              dispatch(appendSlotMessage({ slot: slotKey, message: { role: 'user', content: text, cls: 'msg msg-u', ts: new Date().toISOString(), meta: { ...(steerLive ? { steer: true } : {}), optimistic: true, sendId } } }))
+              void sendTurn({ message: text, slot: slotKey, meta: { sendId }, ...(steerLive ? { steer: true } : {}) }).then((receipt) => {
+                applySteerReceipt(receipt, {
+                  // A confirmed echo is stronger evidence than a missing/late HTTP
+                  // response: if it landed, do NOT restore (the fix for the
+                  // "confirmed steers restored as failed" finding).
+                  echoReconciled: () => selectSendConfirmed(store.getState(), slotKey, sendId),
+                  // The card cleared on submit, so the answer lives nowhere else:
+                  // hand it back on every non-delivered ruling. The bubble is
+                  // dropped by `resolveBubble` below, so this never leaves an
+                  // orphan row beside the restored text.
+                  restore: () => restoreIntoComposer(text, [], [], slotKey),
+                  reportFailure: (reason, status) => reportSendFailure(reason, status),
+                  // The leading char is NoticeCard's WARN tone selector (parseNotice
+                  // strips it and renders a lucide TriangleAlert -- it is never shown
+                  // as an emoji icon). Built from code points so the source carries
+                  // no emoji literal for the no-emoji-as-icons gate to match.
+                  warnUnconfirmed: () => dispatch(appendSlotMessage({ slot: slotKey, message: { role: 'notice', content: String.fromCodePoint(0x26A0, 0xFE0F) + ' ' + i18nT('pages.chatPage.delivery_unconfirmed'), cls: '' } })),
+                  // Demote the bubble to a plain user row when the answer landed on
+                  // a turn; drop it on every other outcome (queued/refused/late) so
+                  // a queued answer shows only as its QueueStack card and a failed
+                  // one leaves no orphan.
+                  resolveBubble: (outcome) => dispatch(resolveOptimisticSteer({ slot: slotKey, sendId, outcome: outcome === 'turn' ? 'turn' : 'queued' })),
+                  // Text-only card answer: no queued-stash binding to carry.
+                  stashDemoted: () => undefined,
+                })
               })
-            })
-          }}
-        />
+            }}
+          />
+        </div>
 
         {/* No hand-off: the composer draft (`input`) below is unsaved local state. */}
         <ErrorNotice
@@ -1987,11 +2121,12 @@ export default function ChatPane({
           onDismiss={() => setTitleError(null)}
         />
 
+        </div>
         {/* Quote transit: the selection flies from where it was taken into this
             pane's composer (the wrapper below is the landing target — same
             shape as ChatPage's inputAreaRef). */}
         {quoteFlight && <FlyingQuote text={quoteFlight.text} from={quoteFlight.from} targetRef={inputAreaRef} onComplete={endQuoteFlight} />}
-        <div ref={inputAreaRef} className="relative z-10">
+        <div ref={inputAreaRef} className="relative z-10 dock-inert">
         <Composer
           ref={composerRef}
           slotKey={slotKey}
@@ -2000,7 +2135,7 @@ export default function ChatPane({
           voice={composerVoiceOptions}
           pastes={composerPastes}
         >
-        <ChatInput
+        <ComposerInput
           value={input}
           onChange={handleUserInput}
           onSend={doSend}
@@ -2054,6 +2189,7 @@ export default function ChatPane({
           followUpLayout={chatConfig.followUpLayout}
           quickSend={dashCfg?.quick_send}
           followUpSourceKey={followUpSourceKey}
+          followUpMulti={followUpMulti}
           onFollowUpSelect={(o: string, e: React.MouseEvent, _key: string | null | undefined, sendNow: (text: string) => void) => {
             // One-click Quick Send takes the same gate as ChatPage: enabled +
             // no shift + not busy + not already in multi-select.
@@ -2079,9 +2215,12 @@ export default function ChatPane({
               setInput(r.value)
               setFollowUpPicked(next)
             } else {
-              const next = new Set(followUpPickedRef.current); next.add(o)
+              // `[OPTION:]` is single-select: the new pick replaces the previous one.
+              const next = followUpMulti ? new Set(followUpPickedRef.current) : new Set<string>(); next.add(o)
               followUpPickedRef.current = next
-              const r = appendFollowUpOption(inputRef.current, followUpInsertedRef.current, o)
+              const r = followUpMulti
+                ? appendFollowUpOption(inputRef.current, followUpInsertedRef.current, o)
+                : selectSingleFollowUpOption(inputRef.current, followUpInsertedRef.current, o)
               followUpInsertedRef.current = r.owned
               inputRef.current = r.value
               setInput(r.value)

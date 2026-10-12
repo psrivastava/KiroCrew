@@ -15,8 +15,13 @@ export interface Slot {
    * here, matching `Slot.key` -- and is null when the creator is not running or the
    * records formed a cycle. A row can therefore cite a creator it cannot nest under,
    * which is the orphan the conductor lane marks with a muted prefix.
+   *
+   * `ancestor` is present and true when `key` names an open ANCESTOR rather than the
+   * creator in `slot` -- the creator closed and the lane nests the row under the
+   * nearest session above it that is still open. The row then wears the same
+   * closed-creator glyph an orphan does, one level in.
    */
-  parent?: { slot?: string; key?: string | null } | null
+  parent?: { slot?: string; key?: string | null; ancestor?: boolean } | null
   /** Present and true while the gateway's lineage projection is still seeding for the
    *  current store, which makes THIS frame's `parent` provisional rather than final.
    *  Absent on an ordinary frame, and absent when there is nothing to wait for (the
@@ -52,6 +57,9 @@ export interface Slot {
    *  the local slot key — read `key`. */
   row_identity?: string
   peer_name?: string
+  /** A peer row's folder in the PEER's own tree (`InstanceSessionRow`); read
+   *  only by the crew group's spaces, never as a local `folder_id`. */
+  peer_folder_id?: string
   unread?: boolean
   // `pending_approval` rides on every ChatSlot payload; the sidebar reads it to
   // suppress the "your turn" dot and show the yellow "Needs approval" subtitle.
@@ -116,6 +124,8 @@ export interface Slot {
   memory_mode?: 'persistent' | 'incognito' | 'temporary'
   folder_id?: string
   pinned?: boolean
+  /** The per-row mute (see ChatSlot.muted); drawn as a marker at rest. */
+  muted?: boolean
   tags?: string[]
   forked_from?: string | null
   source_links?: Array<{

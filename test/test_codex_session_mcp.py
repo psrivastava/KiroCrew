@@ -1241,6 +1241,20 @@ class TestSpecDisabledToolRefusal:
         await client._handle_permission(_codex_mcp_approval(11, "c4"))
         assert sent == [(11, {"outcome": {"outcome": "selected", "optionId": "cancel"}})]
 
+    def test_a_first_class_pair_is_retained_verbatim_and_never_marked_unreadable(
+        self, tmp_path, agents_dir
+    ):
+        """The KAS MCP-name bound and the unreadable mark belong to the KAS channel;
+        the codex pair is a first-class path and reads as it always did -- a
+        513-character tool half is retained verbatim, an exact deny on it binds,
+        and nothing is marked or refused for it (H13)."""
+        client = self._client(tmp_path, agents_dir, disabled=[])
+        client._extract_tool_event(_codex_mcp_tool_call("c9", "kirocrew-core", "t" * 513))
+        assert client._tool_call_identity_unreadable == {}
+        event = client._build_permission_event(_codex_mcp_approval(31, "c9"))
+        assert event is not None and event.mcp_identity_unreadable is False
+        assert (event.mcp_server_name, event.tool_name) == ("kirocrew-core", "t" * 513)
+
     @pytest.mark.asyncio
     async def test_the_auto_approve_site_refuses_an_MCP_approval_it_cannot_identify(
         self, tmp_path, agents_dir, monkeypatch
@@ -1441,9 +1455,15 @@ class TestSpecDisabledToolRefusal:
         says the codex refusal must then fire on the ``tool_call`` frame instead.
         """
         from kiro_crew import mcp_core, mcp_cron
+        from kiro_crew.mcp_tools import apps as apps_tools
 
+        # ``kirocrew-core`` lists an app's tools only while that app is enabled and
+        # the isolated test home has none installed, so the gate is held open: the
+        # premise must hold for every DECLARED tool, hidden or not.
+        with patch.object(apps_tools, "app_enabled_state", lambda _name: True):
+            core_tools = mcp_core._list_tools()
         for server, tools in (
-            ("kirocrew-core", mcp_core._list_tools()),
+            ("kirocrew-core", core_tools),
             ("kirocrew-cron", mcp_cron._list_tools()),
         ):
             assert tools, server

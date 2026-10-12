@@ -4,6 +4,7 @@ import { motion, AnimatePresence, Reorder } from 'framer-motion'
 import { usePointerDrag } from '../hooks/usePointerDrag'
 import { useLongPressReorder } from '../hooks/useLongPressReorder'
 import { useImeGuard } from '../hooks/useImeGuard'
+import { useScrollEdges } from '../hooks/useScrollEdges'
 import { TerminalSquare, Plus, X, ChevronDown, ChevronRight, PictureInPicture2, MoreHorizontal, PanelRight, PanelBottom, Loader2 } from 'lucide-react'
 import {
   DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem,
@@ -27,6 +28,8 @@ import {
 } from '../hooks/useBottomTerminal'
 
 import { i18nT } from '../i18n/t'
+import { uiLocation } from '../uiLocations/uiLocation'
+import { useGuideRevealScope } from '../guide/GuideRevealScope'
 
 /** A terminal tab chip — mirrors the activity-bar SidePanel TabChip design.
  *  `hintId` names the strip's visible editing helper (rendered outside the
@@ -336,6 +339,12 @@ export function TerminalTabsView({ variant }: { variant: 'dock' | 'popout' }) {
   }, [])
   const hintId = useId()
 
+  // Edge cues for the tab strip: it hides its scrollbar, so a gradient is the
+  // only signal that tabs continue past the clipped edge. The scroller keeps
+  // its box as tabs open/close/rename, so remeasure on the tabs list.
+  const [attachEdges, edges, remeasure] = useScrollEdges<HTMLUListElement>()
+  useEffect(() => { remeasure() }, [tabs, remeasure])
+
   // New tabs spawn in the selected session's project directory when one is
   // set; otherwise the backend's default cwd applies.
   const activeSlotProject = useAppSelector(selectActiveSlotProject)
@@ -394,7 +403,12 @@ export function TerminalTabsView({ variant }: { variant: 'dock' | 'popout' }) {
       {/* Tab strip — same aesthetics as the activity-bar strip; drag chips
           horizontally to reorder (framer Reorder). */}
       <div className="flex items-center gap-1.5 h-10 shrink-0 pl-1 pr-1.5">
+        {/* Wrapper for the edge cues: the fades anchor to this non-scrolling
+            parent, not the scrolled Reorder.Group. min-w-0 lets the scroller
+            shrink below its content like the group did. */}
+        <div className="relative min-w-0 flex items-center">
         <Reorder.Group
+          ref={attachEdges}
           axis="x"
           values={tabs}
           onReorder={setTabsOrder}
@@ -419,6 +433,15 @@ export function TerminalTabsView({ variant }: { variant: 'dock' | 'popout' }) {
             />
           ))}
         </Reorder.Group>
+        {/* from-bg matches the strip's var(--bg) surface. A dragged chip's
+            higher z-index stays above the cue on purpose. */}
+        {edges.left && (
+          <div aria-hidden="true" data-testid="terminal-tabs-cue-left" className="pointer-events-none absolute left-0 top-0 bottom-0 w-6 z-10 bg-gradient-to-r from-bg to-transparent" />
+        )}
+        {edges.right && (
+          <div aria-hidden="true" data-testid="terminal-tabs-cue-right" className="pointer-events-none absolute right-0 top-0 bottom-0 w-6 z-10 bg-gradient-to-l from-bg to-transparent" />
+        )}
+        </div>
         {/* + opens a new terminal tab instantly (no menu). */}
         <button
           className="flex items-center justify-center w-7 h-7 rounded-md text-muted hover:text-text hover:bg-bg-hover transition-colors bg-transparent border-none cursor-pointer shrink-0 disabled:opacity-40 disabled:cursor-not-allowed"
@@ -431,18 +454,19 @@ export function TerminalTabsView({ variant }: { variant: 'dock' | 'popout' }) {
         </button>
         {variant === 'dock' ? (
           <div className="flex items-center gap-0.5 ml-auto shrink-0">
-            <DropdownMenu>
+            <DropdownMenu guideScope="menu:shell.terminal-more">
               <DropdownMenuTrigger asChild>
                 <button
                   className="flex items-center justify-center w-7 h-7 rounded-md text-muted hover:text-text hover:bg-bg-hover transition-colors bg-transparent border-none cursor-pointer shrink-0"
                   aria-label={i18nT('components.bottomTerminalPanel.more_actions')}
                   title={i18nT('components.bottomTerminalPanel.more_actions')}
+                  {...uiLocation('shell.terminal-more')}
                 >
                   <MoreHorizontal size={14} />
                 </button>
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end" className="min-w-[180px]">
-                <DropdownMenuItem onSelect={toggleTerminalPosition}>
+                <DropdownMenuItem onSelect={toggleTerminalPosition} {...uiLocation('shell.terminal-more.position')}>
                   {position === 'bottom' ? <PanelRight size={13} className="shrink-0" /> : <PanelBottom size={13} className="shrink-0" />}
                   {position === 'bottom' ? i18nT('components.bottomTerminalPanel.move_panel_to_right') : i18nT('components.bottomTerminalPanel.move_panel_to_bottom')}
                 </DropdownMenuItem>
@@ -550,6 +574,9 @@ export function TerminalDetachedBar() {
 export default function BottomTerminalPanel() {
   const { open, height, width, position } = useBottomTerminal()
   const [dragging, setDragging] = useState(false)
+  // The docked panel's guide scope (`shell.terminal-panel`), reported from
+  // outside its `open` guard so "closed" is said while it is hidden.
+  useGuideRevealScope('shell.terminal-panel', open)
 
   const isRight = position === 'right'
 

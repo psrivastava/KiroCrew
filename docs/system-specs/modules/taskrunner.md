@@ -296,6 +296,11 @@ visible_sources = {"text", "spec", "file", "chat", "dashboard", "mcp", "yaml"}
 | `plan()` API | `"text"`, `"spec"`, `"file"` | ✅ |
 | Cron job | must pass `source="cron"` | ❌ (filtered out) |
 
+The status response derives its top-level `running` flag from the runs that remain
+visible after the source filter. Hidden cron work cannot make an otherwise idle
+result set report that one of its returned projects is running. Caller admission
+and visibility filtering remain unchanged.
+
 ### Decomposer Selection
 
 `run()` picks the decomposer from the spec's suffix, not from the caller. A spec whose
@@ -727,6 +732,14 @@ screens it through `_validate_spec_path` (`hooks.validate_file_path`, off the ev
 loop): a traversal, a missing file or a UNC/laundered link answers
 `400 invalid_spec_path`, and a sensitive credential path answers `403 access_denied`.
 
+Starting is refused while the `projects` app (the Task Runner page) is
+switched off in Library: `POST /api/taskrunner` answers 409 `app_disabled`
+("Task Runner is disabled. Enable it in Library to start tasks.") before any
+inline spec is written, the `task_run` MCP tool relays the same refusal, and
+the chat command `task run <spec>` replies with that sentence. Only an
+explicit `enabled: false` install record counts as disabled
+(`apps.manager.app_disabled`); a host with no record runs tasks.
+
 ### Status Response
 
 A partial example; each run also carries `name`, `auto_approve`,
@@ -1069,6 +1082,7 @@ Only fires when there is truly ZERO activity for the stall period.
   - Returns `{"steps": [...]}` (or `{"tasks": [...]}`) or a bare JSON array of steps
 - Self-review: `taskrunner:{task_id}:review` (separate session, reset in finally) (owned by `task_executor.py`)
 - Context compaction between steps routes through `SessionManager.compact_if_needed(key)`, preserving the gateway's deduplication, cooldown, turn-semaphore exclusion, and skills reinjection. A `"busy"` decline is retried later with no direct `provider.compact()` fallback. Its shared post-check uses the attempt's immediate effect verdict (`_POST_COMPACT_RESET_PCT`) and awaits a reset before the next step cold-starts; deferred readings only damp later growth, while the mid-stream overflow guard covers the interim.
+- The mid-stream overflow handler compacts in place and resets the session if that does not complete. On a backend `messaging.commands.compact_unsupported_backend(client)` names, it skips the `/compact` call and its wait and resets the session straight away, since the wait could only time out.
 
 Every step gets `is_new=True` on its first message, which triggers full `ContextBuilder` injection: user preferences, active projects, recent history, semantic memory, lessons, episodic memory queried by the step prompt, and triggered skills. The budget matches a normal chat session.
 

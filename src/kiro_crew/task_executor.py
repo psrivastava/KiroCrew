@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable, cast
 
 from kiro_crew import git_coord, platform_compat, runtime_death, shutdown_event, tool_permission
 from kiro_crew.acp.client import AcpProcessDied
+from kiro_crew.agent_sdk import CONTEXT_EVENT_COMPACTION
 from kiro_crew.agent_sdk.drivers.acp_vocab import (
     STOP_CLASS_CANCELLED,
     STOP_CLASS_FAILED,
@@ -45,6 +46,7 @@ from kiro_crew.llm_helpers import (
     provider_last_turn_usage,
     stream_and_collect_json,
 )
+from kiro_crew.messaging.commands import compact_unsupported_backend
 from kiro_crew.messaging.dispatch import (
     consume_reinjection,
     rearm_reinjection,
@@ -769,9 +771,11 @@ async def execute_task(
 
         _acquired = False
         # Post-compaction re-injection bookkeeping for the finally: whether this
-        # turn consumed the one-shot flag, and whether it landed (recorded success).
+        # turn consumed the one-shot flag, whether it landed (recorded success),
+        # and whether the backend reported that it compacted the session.
         _needs_reinjection = False
         _turn_landed = False
+        _turn_compacted = False
         # Whether this attempt's stream produced output or a tool call: a death
         # after either may have left work done, so its retry resumes rather than
         # restates the step (the chat runner's ``turn_emitted``).
@@ -898,6 +902,12 @@ async def execute_task(
                     _spec = await turn_spec_hooks(client, event.text or "")
                     _policy = _policy_for(spec=_spec)
                     await refuse_stale_switch(client, event.text or "")
+                elif event.kind == CONTEXT_EVENT_COMPACTION:
+                    # The backend compacted the session on its own: the
+                    # session-start context is gone from its window, and the
+                    # finally arms the flag.
+                    if event.text == "completed":
+                        _turn_compacted = True
                 elif event.kind == EVENT_TOOL_CALL:
                     _attempt_emitted = True
                     # Fire PreToolUse hooks for auto-approved tools (informational only).
@@ -1088,26 +1098,35 @@ async def execute_task(
                 f"⚠️ Context window {pct:.0f}% full — compressing conversation history. "
                 "Accuracy may degrade due to summarized context.\n\n"
             )
-            try:
-                await client.compact()
-                # The manager's budget, the one resolver every caller uses; it
-                # holds in a standalone `kirocrew run`, which arms no
-                # live-config watcher.
-                compact_result = await client.wait_for_compaction(
-                    timeout=sessions.compact_wait_budget_secs()
+            unsupported = compact_unsupported_backend(client)
+            if unsupported:
+                # This backend never answers /compact, so the wait would only
+                # run out its budget before ending in this same reset.
+                logger.info(
+                    "Task %d: %s cannot compact, resetting session", task.index, unsupported
                 )
-                if compact_result.get("type") == "completed":
-                    logger.info("Task %d: compaction succeeded", task.index)
-                else:
-                    logger.warning(
-                        "Task %d: compaction %s, resetting session",
-                        task.index,
-                        compact_result.get("type", "unknown"),
-                    )
-                    await sessions.reset(session_key)
-            except Exception:
-                logger.debug("Mid-stream compaction failed, resetting", exc_info=True)
                 await sessions.reset(session_key)
+            else:
+                try:
+                    await client.compact()
+                    # The manager's budget, the one resolver every caller uses; it
+                    # holds in a standalone `kirocrew run`, which arms no
+                    # live-config watcher.
+                    compact_result = await client.wait_for_compaction(
+                        timeout=sessions.compact_wait_budget_secs()
+                    )
+                    if compact_result.get("type") == "completed":
+                        logger.info("Task %d: compaction succeeded", task.index)
+                    else:
+                        logger.warning(
+                            "Task %d: compaction %s, resetting session",
+                            task.index,
+                            compact_result.get("type", "unknown"),
+                        )
+                        await sessions.reset(session_key)
+                except Exception:
+                    logger.debug("Mid-stream compaction failed, resetting", exc_info=True)
+                    await sessions.reset(session_key)
             await on_notify(
                 f"🗜️ Task {task.index}: context compressed",
                 f"Context was {pct:.0f}% full — compacted to continue.",
@@ -1327,10 +1346,15 @@ async def execute_task(
             return False
         finally:
             # A turn that consumed the post-compaction flag but never landed
-            # discarded the prompt carrying the re-injected context; put the
-            # flag back so the next attempt re-injects it.
+            # discarded the prompt carrying the re-injected context, and a
+            # backend that compacted the session during the turn dropped it;
+            # either way the flag is set so the next attempt re-injects it.
             rearm_reinjection(
-                sessions, session_key, consumed=_needs_reinjection, landed=_turn_landed
+                sessions,
+                session_key,
+                consumed=_needs_reinjection,
+                landed=_turn_landed,
+                compacted=_turn_compacted,
             )
             rollback_skill_bodies(ctx, session_key, landed=_turn_landed)
             if _acquired:

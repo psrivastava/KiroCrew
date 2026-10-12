@@ -76,6 +76,7 @@ instead of the row simply disappearing.
 | Config load | Invalid JSON → log warning, return defaults |
 | Skill index (`list_skills`) | One global SKILL.md that is not UTF-8 or cannot be opened → one warning naming the file, that row dropped, every other row listed. Never a failed listing: the index feeds every chat turn and `GET /api/skills`. Rationale: [memory-skills-hooks](../modules/memory-skills-hooks.md) |
 | Process spawn | Backend-specific executable resolver, including trusted-path checks where required; clear error if missing |
+| Notes git subprocess (`md_notebook/git_ops.py`) | A non-zero exit reports git's last 3 stderr lines PLUS the first transport-caused line when one sits outside that tail. git ends every fetch/push failure with the same access-rights boilerplate and prints an SSH diagnosis first, so a tail alone reports a permission problem the operator does not have (a host reachable only via `~/.ssh/config` never resolved at all). The extra line widens what the message reports; it does not decide whether the command failed. |
 | asyncio loop callback | A Windows Proactor reset repeated by its `connection_lost` close callback is warning-only; task-level connection resets and other exceptions remain ERRORs with crash breadcrumbs |
 
 ## Dashboard Error Codes
@@ -243,6 +244,58 @@ the hint is its only transient marker). Onboarding a backend means auditing that
 alternation. The kiro-cli mid-stream envelope ("Encountered an error in the
 response stream: …") is deliberately NOT a hint — matching it would make the
 branch a catch-all that discards the real cause.
+
+A **network-path drop** is the one transient class that waits by time rather
+than by count. `AcpError.connection_failure` is set from the raw frame when the
+verdict is transient and `classify_provider_error` names the frame
+`PROVIDER_ERROR_CONNECTION`: connection wording (`_RE_CONNECTION`) or a
+connector dispatch failure, with no throttle, usage limit, auth or
+session-expiry rejection, or model-availability answer outranking it. The
+formatter folds a dispatch failure into the generic 5xx prose, which is why the
+verdict travels as a tag instead of being read back from the message. On an
+interactive dashboard turn
+(`chat_runner`'s pre-stream transient branch) a connection failure keeps
+re-prompting the same live session past `TRANSIENT_RETRIES` until
+`CONNECTION_RECOVERY_WINDOW_SECS` (300 s) have passed since the ladder's first
+retry, on the same backoff curve capped at `CONNECTION_RETRY_MAX_DELAY` (30 s),
+and shows one standing "Connection unstable — retrying…" notice for the extra
+attempts rather than one per attempt. Stop, a landed turn and an exhausted
+window end it exactly as they end the fixed ladder. Provider answers keep the
+fixed count: a provider that answers with errors is not helped by a longer wait.
+
+### Provider failures a harness writes as text
+
+codex-acp reports a turn's terminal provider error to a client without JetBrains
+AIR's `sessionFailure` capability as an `agent_message_chunk` (the error message
+plus a blank line) and then answers the prompt with `end_turn`
+(`CodexEventHandler.createErrorEvent`, every release read from 1.11.0 to
+2.1.2-preview.5). Crew does not declare AIR: that one declaration also switches
+the adapter's tool-call, plan and permission frames to AIR shapes. Members of
+`ACP_BACKENDS_UNATTRIBUTED_TERMINAL_ERROR` are handled in
+`AcpSessionHandle._run_turn` instead:
+
+- A text chunk with no `messageId` is adapter-authored. Model text always names
+  its item. The adapter's fixed notices (`Warning: `, `Config warning: `,
+  `*Context compacted`) and every chunk of a prompt the adapter parses as a slash
+  command are delivered as they arrive.
+- Any other such chunk is HELD, together with a steer-consumed report behind it.
+  Content, a permission request or any other terminal after it releases
+  everything held, in order and unchanged. A co-tenant's fanned-out frame
+  (`runtime_global`) on a shared process passes through without releasing it.
+- An `end_turn` right behind held chunks, each a whole chunk ending in a blank
+  line, makes the turn FAIL. The chunks are never delivered as text, duplicates
+  collapse to one message, and the turn raises through `_raise_acp_error` with
+  the provider message (unwrapped from codex's `{"type":"error","status":N,...}`
+  envelope, status kept as `(HTTP N)`). Wording, the transient verdict (a 5xx is
+  transient, a 4xx is not), and the model-substitution and sign-in tags therefore
+  come from the same classifier as every other harness. Withholding the steer
+  report lets the caller queue that steer again.
+- A JSON-RPC error that follows held chunks (codex's `usageLimitExceeded` writes
+  the text and fails the prompt) is raised alone, so the failure is reported once.
+
+The selected model and effort are untouched, and no recovery is added: whether
+the failed turn is retried is decided downstream from the raised error, exactly
+as for any other harness.
 
 ## Model-Side Refusals
 

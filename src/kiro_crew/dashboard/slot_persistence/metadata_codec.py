@@ -53,7 +53,12 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, ClassVar
 
 from kiro_crew import model_registry
-from kiro_crew.config.loader import AUTOCOMPACT_PCT_MAX, AUTOCOMPACT_PCT_MIN
+from kiro_crew.config.loader import (
+    AUTOCOMPACT_PCT_MAX,
+    AUTOCOMPACT_PCT_MIN,
+    CHAT_TURN_TIMEOUT_MAX,
+    CHAT_TURN_TIMEOUT_MIN,
+)
 from kiro_crew.dashboard.chat_title import (
     _TITLE_ORIGINS,
     _counts_as_user_turn,
@@ -289,6 +294,22 @@ def _validate_autocompact_pct(raw: object) -> float | None:
     return None
 
 
+def _validate_turn_timeout_secs(raw: object) -> int | None:
+    """Return *raw* as a turn time limit in whole seconds within range, else None.
+
+    Restore-path twin of the endpoint validation, on a line the agent's own
+    tools can write: an integer outside the global setting's range clamps to
+    it, the way the loader treats ``agent.chat_turn_timeout_secs``, and anything
+    that is not an integer (a bool, a float, a string) is discarded so the
+    session follows the global limit.
+    """
+    if isinstance(raw, int) and not isinstance(raw, bool):
+        return min(max(raw, CHAT_TURN_TIMEOUT_MIN), CHAT_TURN_TIMEOUT_MAX)
+    if raw is not None:
+        logger.warning("Discarding invalid persisted turn_timeout_secs: %r", raw)
+    return None
+
+
 def _restore_dismissed_source_links(slot: "_ChatSlot", raw: object) -> None:
     """Rehydrate the per-slot dismissed source-link identity set from metadata.
 
@@ -432,6 +453,23 @@ class SaveFolds:
     channel_folder_filed: bool = False
     tab_id: object = None
     rotation_generation: int | None = None
+    # Staged ``mutes_opened`` value. ``None`` (the default) means "read the live
+    # ``slot.mutes_opened``", which every caller but the mute endpoint relies on.
+    # The mute endpoint persists its NEW value through this fold while leaving the
+    # live flag at its committed value across the save, then flips the live flag
+    # only after the write commits under the transcript lock -- so a concurrent
+    # slots broadcast during the save window never observes the provisional value.
+    # Honored by BOTH the full ``build_full_line`` path and the empty-window
+    # ``merge_empty_window`` path (a message-less newborn), so a staged value
+    # reaches disk whichever branch the save takes.
+    mutes_opened: bool | None = None
+    # Staged per-row ``muted`` value; same contract as ``mutes_opened`` above.
+    muted: bool | None = None
+    # Staged ``turn_timeout_secs``, the same shape for the turn-time-limit
+    # endpoint. Wrapped in a 1-tuple because ``None`` is a real value there (it
+    # clears the session's limit): ``None`` here means "nothing staged, read the
+    # live slot", ``(value,)`` means "write *value*".
+    turn_timeout_secs: tuple[int | None] | None = None
 
 
 @dataclass
@@ -634,6 +672,18 @@ def _read_autocompact_pct(r: _Read) -> None:
         r.slot.autocompact_pct = _validate_autocompact_pct(r.meta["autocompact_pct"])
 
 
+def _read_turn_timeout_secs(r: _Read) -> None:
+    r.slot.turn_timeout_secs = _validate_turn_timeout_secs(r.meta.get("turn_timeout_secs"))
+
+
+def _staged_turn_timeout(slot: Any, folds: SaveFolds) -> int | None:
+    """The turn time limit a save writes: the endpoint's staged value, else the slot's."""
+    if folds.turn_timeout_secs is not None:
+        return folds.turn_timeout_secs[0]
+    value: int | None = slot.turn_timeout_secs
+    return value
+
+
 def _read_dismissed_source_links(r: _Read) -> None:
     _restore_dismissed_source_links(r.slot, r.meta.get("dismissed_source_links"))
 
@@ -754,6 +804,16 @@ def _read_artifact(r: _Read) -> None:
 def _read_pinned(r: _Read) -> None:
     if r.meta.get("pinned"):
         r.slot.pinned = True
+
+
+def _read_mutes_opened(r: _Read) -> None:
+    if r.meta.get("mutes_opened"):
+        r.slot.mutes_opened = True
+
+
+def _read_muted(r: _Read) -> None:
+    if r.meta.get("muted"):
+        r.slot.muted = True
 
 
 def _read_color_index(r: _Read) -> None:
@@ -979,6 +1039,19 @@ FIELDS: tuple[Field, ...] = (
         read=_read_autocompact_pct,
     ),
     Field(
+        "turn_timeout_secs",
+        _ALL,
+        attr="turn_timeout_secs",
+        line=lambda s, f: _staged_turn_timeout(s, f) or OMIT,
+        merge=_staged_turn_timeout,
+        read=_read_turn_timeout_secs,
+        why=(
+            "the full save omits the key while the session follows the global "
+            "limit; the merge writes null so clearing it reaches a line already "
+            "on disk. Both forms prefer the endpoint's staged value"
+        ),
+    ),
+    Field(
         "dismissed_source_links",
         _ALL,
         attr="_dismissed_source_links",
@@ -1063,20 +1136,20 @@ FIELDS: tuple[Field, ...] = (
     # target would resurrect a session that can never run.
     Field(
         "executor",
-        frozenset({RESTORE}),
+        frozenset({RESTORE, RECENT}),
         attr="executor",
         line=_if_bound(lambda s: "remote"),
         merge=_if_bound(lambda s: "remote"),
         read=_read_executor,
         why=(
-            "only RESTORE rehydrates the remote binding. RECENT does not, so the "
-            "next full save of a recent-restored remote session clears it (#10826); "
-            "RESUME deliberately does not, and the session comes back local"
+            "both startup restores keep the marker, so an old relay chat comes back "
+            "a read-only archive, never a local chat (#10826); RESUME deliberately "
+            "does not, and the session comes back local"
         ),
     ),
     Field(
         "instance_id",
-        frozenset({RESTORE}),
+        frozenset({RESTORE, RECENT}),
         attr="instance_id",
         line=_if_bound(lambda s: s.instance_id),
         merge=_if_bound(lambda s: s.instance_id),
@@ -1084,7 +1157,7 @@ FIELDS: tuple[Field, ...] = (
     ),
     Field(
         "remote_slot",
-        frozenset({RESTORE}),
+        frozenset({RESTORE, RECENT}),
         attr="remote_slot",
         line=_if_bound(lambda s: s.remote_slot),
         merge=_if_bound(lambda s: s.remote_slot),
@@ -1182,6 +1255,30 @@ FIELDS: tuple[Field, ...] = (
         line=_flag(lambda s: s.pinned),
         merge=_always(lambda s: bool(s.pinned)),
         read=_read_pinned,
+    ),
+    Field(
+        "mutes_opened",
+        _ALL,
+        attr="mutes_opened",
+        # Prefer the staged fold value when the save supplies one (the mute
+        # endpoint persisting its NEW value while the live flag still holds the
+        # committed value); otherwise read the live slot, as every other save
+        # does. Same choice in both forms so the full line and the empty-window
+        # merge agree on what reaches disk.
+        line=lambda s, f: (
+            True if (s.mutes_opened if f.mutes_opened is None else f.mutes_opened) else OMIT
+        ),
+        merge=lambda s, f: bool(s.mutes_opened if f.mutes_opened is None else f.mutes_opened),
+        read=_read_mutes_opened,
+    ),
+    Field(
+        "muted",
+        _ALL,
+        attr="muted",
+        # Same staged-override contract as ``mutes_opened`` above.
+        line=lambda s, f: True if (s.muted if f.muted is None else f.muted) else OMIT,
+        merge=lambda s, f: bool(s.muted if f.muted is None else f.muted),
+        read=_read_muted,
     ),
     Field(
         "color_index",
@@ -1375,6 +1472,7 @@ LINE_ORDER: tuple[str, ...] = (
     "model",
     "reasoning_effort",
     "autocompact_pct",
+    "turn_timeout_secs",
     "dismissed_source_links",
     "mode",
     "workspace",
@@ -1393,6 +1491,8 @@ LINE_ORDER: tuple[str, ...] = (
     "created_by",
     "artifact",
     "pinned",
+    "mutes_opened",
+    "muted",
     "color_index",
     "color_hex",
     "color_theme",
@@ -1415,6 +1515,8 @@ MERGE_ORDER: tuple[str, ...] = (
     "folder_id",
     "tags",
     "pinned",
+    "mutes_opened",
+    "muted",
     "mode",
     "artifact",
     "reasoning_effort",
@@ -1425,6 +1527,7 @@ MERGE_ORDER: tuple[str, ...] = (
     "model",
     "queued_prompts",
     "autocompact_pct",
+    "turn_timeout_secs",
     "title",
     "title_origin",
     "title_refresh_mark",

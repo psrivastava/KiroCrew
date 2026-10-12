@@ -55,6 +55,7 @@ with one identity, so callers import from here.
 from __future__ import annotations
 
 import hashlib
+import hmac as _hmac
 import importlib
 import json
 import logging
@@ -77,6 +78,7 @@ from typing import List as _List
 from kiro_crew import hooks, pinned_fs, platform_compat
 from kiro_crew.artifact_source import is_verifiable_root
 from kiro_crew.artifact_store import comments as _threads
+from kiro_crew.artifact_store import dashboard_package as _dashboard
 from kiro_crew.artifact_store import records as _records
 from kiro_crew.artifact_store import rules as _rules
 from kiro_crew.artifact_store.comments import (  # noqa: F401 - facade surface
@@ -89,6 +91,7 @@ from kiro_crew.artifact_store.model import (  # noqa: F401 - facade surface
     Artifact,
     ArtifactAlreadyExistsError,
     ArtifactComment,
+    ArtifactConflictError,
     ArtifactError,
     ArtifactNotFoundError,
     ArtifactPublication,
@@ -220,6 +223,7 @@ for _moved in (
     ArtifactValidationError,
     ArtifactStillPublishedError,
     ArtifactReplacedError,
+    ArtifactConflictError,
 ):
     _moved.__module__ = __name__
 del _moved
@@ -278,6 +282,15 @@ def _now_iso() -> str:
     deterministically by ``updated_at``.
     """
     return datetime.now(timezone.utc).isoformat(timespec="microseconds")
+
+
+#: Shape of a wire ``content_token`` / ``expected_token``: 256 random bits as hex.
+_TOKEN_RE = re.compile(r"[0-9a-f]{64}")
+
+
+def _new_content_token() -> str:
+    """Return a fresh random optimistic-concurrency token."""
+    return os.urandom(32).hex()
 
 
 def _validate_content(content: str) -> str:
@@ -460,6 +473,36 @@ class ArtifactStore:
     def root(self) -> Path:
         return self._root
 
+    def _ensure_content_token_locked(self, art: Artifact) -> None:
+        """Assign and persist a token for an untokened store-backed artifact.
+
+        Called under the store lock by paths that serve or compare the token.
+        """
+        if not art.content_token:
+            art.content_token = _new_content_token()
+            self._write_meta(art)
+
+    def _rotate_content_token_locked(self, slug: str) -> str:
+        """Persist a fresh token for *slug* before its content is rewritten.
+
+        The token lives in meta.json and the content in current.html, and the
+        two writes are not atomic together. Rotating first means a failure
+        between them leaves a token that refuses every earlier read (a false
+        409), never one that still admits a stale save over the new content.
+        Only the token is written here; the caller persists its other changes
+        with the rest of its write. Called under the store lock.
+        """
+        token = _new_content_token()
+        on_disk = self._load_meta(slug)
+        on_disk.content_token = token
+        self._write_meta(on_disk)
+        return token
+
+    @staticmethod
+    def _is_live_pointer(art: Artifact) -> bool:
+        """True when reads come from ``source_path`` rather than the store's own copy."""
+        return bool(art.source_path) and not art.source_copy_only
+
     def set_change_listener(self, listener: Callable[[str, str], None] | None) -> None:
         """Register a callback fired after a content-affecting mutation.
 
@@ -547,6 +590,22 @@ class ArtifactStore:
         if kind_auto:
             kind = "markdown"
         kind = _validate_kind(_infer_kind(content, source_path, kind))
+        if kind == _dashboard.DASHBOARD_KIND:
+            # A dashboard artifact's content is a LAYOUT PACKAGE, so the write
+            # gate runs here rather than at each caller: every create reaches
+            # this line, and the stored bytes are the canonical form so a later
+            # layout comparison cannot be perturbed by the author's whitespace.
+            #
+            # A live file pointer is refused outright. The store validates what
+            # it writes, but a linked file is read back from disk on every get,
+            # where an edit made outside the store would reach the page as a
+            # package nothing checked.
+            if source_path:
+                raise ArtifactValidationError(
+                    "a dashboard package is store-owned: kind='dashboard' takes no "
+                    "source_path, because a linked file is read back unvalidated"
+                )
+            content = _dashboard.canonical_package_content(content)
         source = _validate_source(source)
         description = _validate_description(description)
         tags_list = _validate_tags(tags)
@@ -588,6 +647,8 @@ class ArtifactStore:
             )
             art.events_backfilled = True
             self._write_artifact(art, content)
+            if self._is_live_pointer(art):
+                art.content_token = None
             logger.info("artifact created: slug=%s name=%s kind=%s", slug, name, kind)
         self._fire_change("upsert", slug)
         # After the write, so a failed create contributes nothing. ``kind`` and
@@ -755,7 +816,7 @@ class ArtifactStore:
         # the lock and an image artifact's bytes are never rewritten in place.
         return self._read_image_asset_bytes(asset), mime
 
-    def get(self, slug: str, *, version: int | None = None) -> Artifact:
+    def get(self, slug: str, *, version: int | None = None, assign_token: bool = False) -> Artifact:
         """Return an artifact (with content) by slug, optionally a specific version.
 
         Live-pointer behavior: for file-backed artifacts (those
@@ -769,6 +830,12 @@ class ArtifactStore:
         If the source file is missing or unreadable, falls back to the
         last-known snapshot in ``current.html`` so the artifact stays
         viewable even after the source file moves or is deleted.
+
+        A current store-backed read returns the stored ``content_token``. An
+        artifact saved before content tokens existed has none, and only a read
+        with ``assign_token`` gives it one, persisted to meta.json so the read
+        can guard a later save. That is a write, so the caller must be off the
+        event loop: the dashboard's detail read is the one that sets it.
         """
         slug = _validate_slug(slug)
         with self._lock:
@@ -799,6 +866,7 @@ class ArtifactStore:
                 if vk:
                     meta.kind = vk
                 meta.live_dirty = False  # historical view — not "live"
+                meta.content_token = None
                 return meta
             # Current view: prefer source_path for file-backed artifacts.
             # A copy never reads from disk: it records source_path purely as
@@ -815,8 +883,23 @@ class ArtifactStore:
                     # own makes a dead pointer look completely healthy.
                     meta.source_missing = True
                     meta.content = self._read_text(self._artifact_dir(slug) / "current.html")
+                meta.content_token = None
             else:
                 meta.content = self._read_text(self._artifact_dir(slug) / "current.html")
+                if assign_token:
+                    try:
+                        self._ensure_content_token_locked(meta)
+                    except OSError:
+                        # An untokened artifact on an unwritable data directory must
+                        # still open. Serve it without a token (last-write-wins): the
+                        # token assigned in memory was never persisted, so returning
+                        # it would 409 every later guarded save from this client.
+                        logger.warning(
+                            "artifact %s: could not persist a content token; serving it unguarded",
+                            slug,
+                            exc_info=True,
+                        )
+                        meta.content_token = None
             # Compute live_dirty by comparing the live content to the
             # latest numbered snapshot. Catches both silent saves AND
             # external file edits to source_path that we never saw —
@@ -1051,6 +1134,7 @@ class ArtifactStore:
         event_type: str | None = None,
         from_version: int | None = None,
         snapshot: bool = False,
+        expected_token: str | None = None,
     ) -> Artifact:
         """Update an artifact in place. Content writes always update the live
         state (source_path on disk for file-backed artifacts, current.html
@@ -1070,10 +1154,38 @@ class ArtifactStore:
         ``user``. Must be in :data:`ALLOWED_EVENT_TYPES` if provided.
         ``from_version`` is recorded on ``reverted`` events so the timeline
         can show "Reverted to vN".
+
+        ``expected_token`` makes a content write conditional: it is the
+        ``content_token`` a prior ``get()`` returned, and when the stored token
+        differs the write raises :class:`ArtifactConflictError` and changes
+        nothing. A change written to current.html outside this store is not
+        detected. Omitted, the write is last-write-wins. It applies to
+        store-backed artifacts only; a live file-backed artifact serves no token
+        and ignores it, because its content is owned by the source file.
         """
         slug = _validate_slug(slug)
+        if expected_token is not None and not (
+            isinstance(expected_token, str) and _TOKEN_RE.fullmatch(expected_token)
+        ):
+            raise ArtifactValidationError(
+                "expected_token must be the 64-character hex content_token from a prior read"
+            )
         with self._lock:
             art = self._load_meta(slug)
+            guarded = (
+                expected_token is not None
+                and content is not None
+                and not self._is_live_pointer(art)
+            )
+            if guarded:
+                assert expected_token is not None  # narrowed by ``guarded``
+                self._ensure_content_token_locked(art)
+                assert art.content_token is not None
+                if not _hmac.compare_digest(art.content_token, expected_token):
+                    raise ArtifactConflictError(
+                        f"artifact {slug!r} changed since it was read; refetch and re-base",
+                        current_token=art.content_token,
+                    )
             changed_content = False
             # True when this call READ art.content off source_path (snapshot path),
             # which makes writing it back unsafe -- see the snapshot branch below.
@@ -1105,6 +1217,86 @@ class ArtifactStore:
                 art.kind_auto = False
             if webapp_metadata is not None:
                 art.webapp_metadata = webapp_metadata
+            # The dashboard write gate. ``art.kind`` is final by here, so this
+            # one block governs every update that lands on a dashboard artifact
+            # -- the dashboard tool path, the browser PATCH and a plain
+            # ``artifact_update`` all arrive through this method -- and decides
+            # three things the generic path cannot:
+            #
+            # 1. the content is a valid package, stored canonically;
+            # 2. a REVERT restores layout only: ``revert_package`` keeps the
+            #    LIVE ``bound_to`` so rolling back past a rebind cannot hand
+            #    this page to the crewmate the stale binding names (values need
+            #    no handling -- they were never in the package);
+            # 3. the version. A dashboard snapshots exactly when the layout
+            #    changed, overriding the caller's ``snapshot`` either way: an
+            #    MCP write defaults it to True and would version every
+            #    no-op recompose, while a browser write defaults it to False
+            #    and would leave a real layout change with no history to
+            #    revert to.
+            if art.kind == _dashboard.DASHBOARD_KIND:
+                # A dashboard is store-owned, and ``create`` already refuses a
+                # ``source_path`` for that reason. The same has to hold on the
+                # way IN to the kind: converting an artifact that keeps a live
+                # file pointer would leave a dashboard whose bytes are re-read
+                # from a file outside the store on every get, so the package a
+                # page renders is one nothing validated -- and a revert would
+                # then write the binding it recovered into that outside file.
+                if kind_changed and art.source_path and not art.source_copy_only:
+                    raise ArtifactValidationError(
+                        "switching an artifact to kind='dashboard' cannot keep a live "
+                        "source_path: a dashboard package is store-owned, so clear the "
+                        "pointer in the same write"
+                    )
+                if content is None:
+                    if kind_changed:
+                        raise ArtifactValidationError(
+                            "switching an artifact to kind='dashboard' needs the package "
+                            "content in the same write: there is nothing valid to store"
+                        )
+                    # No content, so no layout change, so no version -- this
+                    # also disarms the explicit-Snapshot path below, which would
+                    # otherwise re-version the live package unchanged.
+                    snapshot = False
+                    # Disarming that path removes a SECOND thing it does: it is
+                    # also where a snapshot-only update loads the live bytes off
+                    # disk. A caller that asked for a snapshot and got a
+                    # meta-only record back reads ``art.content`` as empty, and
+                    # an auto-sync publisher then uploads that emptiness over a
+                    # live dashboard and records the push as a success. So the
+                    # package is loaded here instead: the caller gets the bytes
+                    # it asked for, and the version count still does not move.
+                    art.content = self._read_text(self._artifact_dir(slug) / "current.html")
+                else:
+                    stored_package = self._read_text(self._artifact_dir(slug) / "current.html")
+                    if event_type == "reverted":
+                        content = _dashboard.revert_package(stored_package, content)
+                    else:
+                        content = _dashboard.canonical_package_content(content)
+                    art.content = content
+                    snapshot = _dashboard.layout_changed(stored_package, content)
+            # EVENT TYPE VALIDATED HERE, which is the FIRST point it can be: the
+            # effective ``snapshot`` flag is settled by the line above (a dashboard
+            # layout change forces it on) and nothing has been written yet.
+            #
+            # A REJECTED REQUEST MUST CHANGE NOTHING, and that is what fixes this spot.
+            # Everything downstream writes: the content token rotates, ``current.html``
+            # is replaced, the comment anchors are rescanned. A refusal raised from
+            # inside the version block further down therefore answers 400 for a write
+            # that has already landed, and landed with no version entry naming it. So
+            # the check belongs ahead of all three, not merely ahead of the version
+            # bump it guards.
+            #
+            # OUTSIDE the snapshot block on purpose, so the check does not depend on
+            # whether this particular write happens to version. An event type that is
+            # not a real lifecycle event is refused on every update, which is the
+            # honest answer to a caller naming one. ``None`` is not an event: it means
+            # "decide from the actor" and passes through.
+            if event_type is not None and event_type not in _records.ALLOWED_EVENT_TYPES:
+                raise ArtifactValidationError(
+                    f"invalid event type {event_type!r}: "
+                    f"must be one of {sorted(_records.ALLOWED_EVENT_TYPES)}"
+                )
             art.updated_at = _now_iso()
 
             # Snapshot of current live state (no new content provided).
@@ -1165,6 +1357,8 @@ class ArtifactStore:
                         )
                         art.kind = detected
                 prev = self._artifact_dir(slug) / "current.html"
+                if content is not None:
+                    art.content_token = self._rotate_content_token_locked(slug)
                 self._write_text(prev, live_content)
                 # Never mirror back for a copy — editing it must not rewrite
                 # the user's original file — and never for content this call
@@ -1202,16 +1396,10 @@ class ArtifactStore:
                 self._rescan_comment_anchors_locked(slug, live_content)
 
                 if snapshot:
-                    # Validate event_type BEFORE side effects.
-                    # Otherwise an invalid event_type raises after the
-                    # version bump and versions/v{N}.html write, leaving an
-                    # orphaned file on disk because _write_meta is never
-                    # reached. Validate first; commit second.
-                    if event_type is not None and event_type not in _records.ALLOWED_EVENT_TYPES:
-                        raise ArtifactValidationError(
-                            f"invalid event type {event_type!r}: "
-                            f"must be one of {sorted(_records.ALLOWED_EVENT_TYPES)}"
-                        )
+                    # ``event_type`` is validated far earlier, ahead of this write's
+                    # first side effect. See the check beside the snapshot flag: it
+                    # must run before the content token and ``current.html``, both of
+                    # which this block is downstream of.
                     # Bump version + capture the new state under
                     # versions/v{N}.html so it's preserved in history.
                     art.version += 1
@@ -1247,6 +1435,8 @@ class ArtifactStore:
                     k: v for k, v in art.version_kinds.items() if k.isdigit() and int(k) > cutoff
                 }
             self._write_meta(art)
+            if self._is_live_pointer(art):
+                art.content_token = None
             self._prune_versions(slug)
             logger.info(
                 "artifact updated: slug=%s version=%s changed_content=%s snapshot=%s",
@@ -1530,6 +1720,7 @@ class ArtifactStore:
         Metadata is preserved untouched: the user may well have named or tagged the
         document before typing, and this is a content write, not a reset.
         """
+        art.content_token = self._rotate_content_token_locked(art.slug)
         self._write_text(self._artifact_dir(art.slug) / "current.html", draft)
         art.content = draft
         # A settled draft is this document's first content, so it gets the same
@@ -2091,6 +2282,21 @@ class ArtifactStore:
         source_root = _validate_source_path(source_root, "source_root") if source_path else ""
         with self._lock:
             art = self._load_meta(slug)
+            # A dashboard package is store-owned: ``create`` refuses a
+            # ``source_path`` and ``update`` refuses converting into the kind
+            # while one is kept, so this is the third door into the same state
+            # and it has to be shut too. Pointing a dashboard at a file makes
+            # every later get re-read the package from outside the store, past
+            # the write gate -- and a revert, which recovers the live binding
+            # from ``current.html``, would then write that binding into the
+            # file, handing the page to whoever the stale copy named. Clearing
+            # the pointer (an empty ``source_path``) stays allowed: that is the
+            # direction which RESTORES store ownership.
+            if source_path and art.kind == _dashboard.DASHBOARD_KIND:
+                raise ArtifactValidationError(
+                    "a dashboard package is store-owned: kind='dashboard' takes no "
+                    "source_path, so it cannot be relocated onto a file"
+                )
             art.source_path = source_path
             art.source_root = source_root
             # Relocate is an explicit "this artifact tracks THIS file" act, so
@@ -2405,6 +2611,7 @@ class ArtifactStore:
         self._mkdirs(adir / "versions")  # creates adir too
         self._write_text(adir / "current.html", content)
         self._snapshot_version(art.slug, art.version, adir / "current.html")
+        art.content_token = _new_content_token()
         self._write_meta(art)
 
     def _write_image_artifact(self, art: Artifact, data: bytes) -> None:
@@ -2423,6 +2630,7 @@ class ArtifactStore:
         self._snapshot_version(art.slug, art.version, adir / "current.html")
         assert art.image is not None  # set by create_image before this is called
         self._write_bytes(adir / f"asset.{art.image.ext}", data)
+        art.content_token = _new_content_token()
         self._write_meta(art)
 
     def _snapshot_version(self, slug: str, version: int, src: Path) -> None:

@@ -597,6 +597,51 @@ def ensure_memory_store_dir(store: str) -> Path:
         return target
 
 
+def create_store_remedy(store: str) -> str:
+    """The command that creates a declared V1 store's missing directory."""
+    return f"run `kirocrew memory create-store {store}` to create it"
+
+
+def create_declared_store(store: str) -> tuple[Path, bool]:
+    """Create a DECLARED named V1 store's directory; ``(path, created)``.
+
+    The one explicit create step for such a store. Use never creates it:
+    :func:`require_memory_store` refuses a missing directory before
+    :func:`ensure_memory_store_dir` is reached, so a deleted store is not
+    silently recreated empty. An operator runs this instead.
+
+    Refuses the default store (its root is ``workspace/``), an undeclared name,
+    and a V2 member store (provisioned with its member). An existing directory
+    is left as it is and answered with ``created=False``.
+    """
+    name = resolve_declared_store(store)
+    if name == DEFAULT_MEMORY_STORE:
+        raise UnknownMemoryStore("the default store needs no create step")
+    from kiro_crew.config.loader import KiroCrewConfig
+
+    config = KiroCrewConfig.load()
+    if memory_store_version(name) == 2:
+        raise UnknownMemoryStore(
+            f"memory store {name!r} is a member store; it is created with its member"
+        )
+    # Ownership and shape checks only: the directory is what this creates.
+    require_memory_store(name, config=config, require_directory=False)
+    with memory_store_namespace_lock():
+        target = _named_store_dir(name)
+        if target.is_dir():
+            # Left exactly as it is: no mode change, no content change.
+            existed = True
+        elif os.path.lexists(target):
+            raise UnknownMemoryStore(
+                f"memory store {name!r} path exists and is not a directory; nothing was created"
+            )
+        else:
+            existed = False
+            target = ensure_memory_store_dir(name)
+    require_memory_store(name, config=config)
+    return target, not existed
+
+
 def member_memory_identity(store: str) -> tuple[str, int]:
     """Read the canonical database identity without any filesystem manifest."""
     from kiro_crew.vector_memory import read_member_database_identity
@@ -625,7 +670,10 @@ def memory_store_version(store: str) -> int:
 
 def _require_legacy_store_files(store: str, target: Path) -> None:
     """An explicit member database cannot be opened through the V1 API."""
-    import sqlite3
+    # The same SQLite library the store opens this file with: a second copy keeps
+    # its own lock table, and closing its connection drops the POSIX locks the
+    # open store holds on the file, letting another process write mid-transaction.
+    from kiro_crew._sqlite_compat import sqlite3
 
     database = target / MEMORY_DB_FILE
     if not database.exists():
@@ -1392,7 +1440,7 @@ def _provision_member_memory(config, member: str) -> str:
     from kiro_crew.memory import PREFERENCES_FILE, PROJECTS_FILE
 
     manual = target / "memory"
-    manual.mkdir()
+    manual.mkdir(mode=0o700)
     atomic_write(manual / PREFERENCES_FILE, "# Member Preferences\n", fsync=True)
     atomic_write(manual / PROJECTS_FILE, "# Member Projects\n", fsync=True)
     agent.member_id = member_id
@@ -1466,6 +1514,14 @@ def retire_unpublished_allocation(
     return removed
 
 
+class MemberApprovalConflict(Exception):
+    """The stored ``approval_mode`` is not the one the writer read."""
+
+    def __init__(self, current: str) -> None:
+        super().__init__("the permission changed since it was read")
+        self.current = current
+
+
 @memory_store_namespace_lock()
 def persist_member_config(
     config,
@@ -1474,6 +1530,8 @@ def persist_member_config(
     create: bool = False,
     expected_store=None,
     changed_fields: set[str] | None = None,
+    expected_approval_mode: str | None = None,
+    new_workspace: str = "",
 ) -> None:
     """Atomically publish a member and its ownership while retaining other writes.
 
@@ -1494,6 +1552,13 @@ def persist_member_config(
     Updates may name only the fields the caller actually changed, preserving
     concurrent edits to other fields. None retains full-record publication;
     creation always publishes the full record. A new binding must be included.
+
+    ``new_workspace`` names the workspace :func:`member_workspace.provision_member_workspace`
+    allocated for this create, if any. It is published in the SAME locked mutation
+    as the record (:func:`member_workspace.publish_member_workspace`: the name and
+    directory are re-checked against the document under the lock, the directory
+    is made, the entry written), so a member never lands bound to a workspace the
+    table does not declare. A create only; an update never allocates one.
     """
     from dataclasses import asdict
 
@@ -1523,6 +1588,15 @@ def persist_member_config(
         if not unchanged_binding and store != DEFAULT_MEMORY_STORE
         else None
     )
+    if new_workspace and not create:
+        raise UnknownMemoryStore("a member update cannot allocate a workspace")
+    if new_workspace and (
+        config.agents[member].workspace != new_workspace or new_workspace not in config.workspaces
+    ):
+        raise UnknownMemoryStore(
+            f"workspace {new_workspace!r} is not the binding of Crew Member {member!r}"
+        )
+    workspace_entry = config.workspaces[new_workspace] if new_workspace else None
 
     def mutate(data: dict) -> dict:
         agents = data.setdefault("agents", {})
@@ -1548,6 +1622,17 @@ def persist_member_config(
                 raise UnknownMemoryStore(
                     f"Crew Member {member!r} memory changed concurrently; reload the roster"
                 )
+        if expected_approval_mode is not None and not create:
+            # Compare-and-set against the record on disk, inside the
+            # cross-process lock: a CLI or other-process write that landed
+            # after the caller loaded its snapshot wins, and this one is refused.
+            from kiro_crew.config.sections import coerce_member_approval_mode
+
+            stored_mode = coerce_member_approval_mode(
+                current.get("approval_mode") if isinstance(current, dict) else None
+            )
+            if stored_mode != expected_approval_mode:
+                raise MemberApprovalConflict(stored_mode)
         if (
             isinstance(current, dict)
             and current.get("member_id")
@@ -1578,6 +1663,10 @@ def persist_member_config(
             ):
                 raise UnknownMemoryStore(f"memory store {store!r} ownership changed concurrently")
             stores[store] = {**(existing or {}), **store_record}
+        if workspace_entry is not None:
+            from kiro_crew.member_workspace import publish_member_workspace
+
+            publish_member_workspace(data, new_workspace, workspace_entry)
         if create:
             crew_teams.release_for_create(member)
         agents[member] = {**(current or {}), **agent_record}

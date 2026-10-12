@@ -12,6 +12,7 @@ Composed onto :mod:`kiro_crew.slack.handler`; see
 from __future__ import annotations
 
 import asyncio
+import re
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -30,10 +31,12 @@ if TYPE_CHECKING:
         _is_sessions_keyword,
         _thread_agents,
         _thread_projects,
+        agent_switch_target,
         append_and_surface,
         config_path,
         is_allowed_user,
         is_sensitive_path,
+        load_window_off_loop,
         logger,
         privacy_mode,
         redact_credentials,
@@ -61,6 +64,18 @@ def _hydrate_conv_flags(sessions: object, session_key: str) -> None:
     from the durable ``SessionMap`` entry).
     """
     privacy_mode.hydrate(sessions, session_key)
+
+
+async def _hydrate_conv_header(sessions: object, session_key: str) -> None:
+    """Restore the mode the transcript header records, read off the loop.
+
+    The header half of the inbound restore (``privacy_mode.hydrate_inbound``,
+    which reads the map row as well): a thread whose map row is missing stays
+    private when its header records the mode. It yields, so each caller awaits
+    it beside ``_hydrate_thread_overrides`` -- before the owner re-check that
+    commits the route -- and still runs ``_hydrate_conv_flags`` where it did.
+    """
+    await privacy_mode.hydrate_inbound(sessions, session_key)
 
 
 async def _apply_privacy_mode(
@@ -364,6 +379,31 @@ async def maybe_route_linked_thread(
         return False
     if not route_pinned and _is_sessions_keyword(text):
         return False
+    # An @mention leads the text of a mention event; for ``/agent <name>`` drop
+    # it, so the slot's runner sees the command and switches the linked chat's
+    # agent (the switch the dashboard's picker makes) instead of prompting the
+    # model with it.
+    _unmentioned = re.sub(r"^<@[A-Z0-9]+(?:\|[^>]*)?>\s*", "", text.strip())
+    if not route_pinned and agent_switch_target(_unmentioned) is not None:
+        text = _unmentioned
+
+    if getattr(_linked_slot, "window_pending", False) is True:
+        # A tab restored as a sidebar row: its window loads with the read off
+        # the loop before the row lands. The thread can be relinked or unlinked
+        # while that awaits, so an unpinned route is resolved again and then
+        # pinned to what it resolves to, which bounds this to one more pass.
+        await load_window_off_loop(_linked_slot)
+        if not route_pinned and _dashboard_state.get_linked_slot(reply_ts) is not _linked_slot:
+            return await maybe_route_linked_thread(
+                text,
+                session_key,
+                user_id,
+                channel,
+                slack,
+                reply_ts,
+                target_slot=_dashboard_state.get_linked_slot(reply_ts),
+                route_pinned=True,
+            )
 
     _linked_slot_key = _linked_slot.key
     # Redact for UI display only — LLM receives original text so it can process

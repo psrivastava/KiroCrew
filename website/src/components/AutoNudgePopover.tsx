@@ -1,6 +1,7 @@
 import { type ReactNode, useEffect, useId, useMemo, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Check, Goal, Pause, Play, Radar, X, Zap } from 'lucide-react'
+import { uiLocation } from '../uiLocations/uiLocation'
 import { Popover, PopoverTrigger, PopoverContent } from './ui/popover'
 import { Btn } from './ui'
 import ErrorNotice from './ErrorNotice'
@@ -285,6 +286,10 @@ export default function AutoNudgePopover({ slotKey, loop, open, onOpenChange, on
   const heldForApproval = !!loop?.active && loop.approval_stalled === true
   /** Running in the sense the controls mean: active and not held. */
   const runsNow = !!loop?.active && !heldForApproval
+  /** An ACTIVE work-ledger watch resting because every open task waits on a
+   *  person. Its controls stay as running (Nudge now still fires a turn), but its
+   *  status reads in the warn tone, because the next move is the user's. */
+  const waitingOnPerson = runsNow && loop?.waiting_on_person === true
   const pauseName = i18nT('components.autoNudgePopover.pause_loop')
   /** The fire control names what THIS press does: with no loop it creates and
    *  starts the loop (no fire); on a loop it fires now, resuming first when the
@@ -511,7 +516,9 @@ export default function AutoNudgePopover({ slotKey, loop, open, onOpenChange, on
   const statusText = loop
     ? heldForApproval
       ? i18nT('components.autoNudgePopover.paused_approval_hold')
-      : loop.active
+      : waitingOnPerson
+        ? i18nT('components.autoNudgePopover.waiting_on_person_hold')
+        : loop.active
         ? countdownText
         : doneLine
           ? i18nT(doneLine.key)
@@ -611,7 +618,7 @@ export default function AutoNudgePopover({ slotKey, loop, open, onOpenChange, on
           <p
             data-testid="auto-nudge-status"
             className={`mb-2 rounded-md border px-2 py-1.5 text-[11px] leading-relaxed ${
-              runsNow
+              runsNow && !waitingOnPerson
                 ? writeDisabled ? 'border-border bg-bg text-muted' : 'border-ok/30 bg-ok-subtle text-ok-fg'
                 : finished
                   ? 'border-info/30 bg-info-subtle text-info'
@@ -891,7 +898,7 @@ export default function AutoNudgePopover({ slotKey, loop, open, onOpenChange, on
                 would refuse the resume anyway, and a live Play here would promise
                 one. Clear is the only way on; a new goal is set after it. */}
             <div className="flex items-center gap-2" data-testid="auto-nudge-controls">
-              <Btn type="button" className={ICON_BTN} onClick={pause} disabled={saving || writeDisabled || !loop.active} aria-label={pauseName} title={pauseName}>
+              <Btn type="button" className={ICON_BTN} onClick={pause} disabled={saving || writeDisabled || !loop.active} aria-label={i18nT('components.autoNudgePopover.pause_loop')} title={pauseName} {...uiLocation('composer.automation.pause')}>
                 <Pause size={14} aria-hidden />
               </Btn>
               <Btn

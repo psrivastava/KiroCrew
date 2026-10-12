@@ -36,7 +36,7 @@ import time
 import uuid
 from collections.abc import Sequence  # noqa: F401
 from pathlib import Path  # noqa: F401
-from typing import Any
+from typing import Any, cast  # noqa: F401  (cast: crew_records reads it)
 
 from aiohttp import BodyPartReader, web  # noqa: F401
 
@@ -53,7 +53,9 @@ from kiro_crew.acp_backends import (
 from kiro_crew.agent import (  # noqa: F401
     AGENT_FILENAME,
     OWNED_KIRO_AGENT_FILES,
+    SharedAgentHomeRefused,
     _atomic_json_write,
+    _declined_foreign_spec_write,
     _is_confirmed_managed_dashboard_author,
     _refresh_forked_templates,
     _spec_path_is_safe,
@@ -174,7 +176,6 @@ from kiro_crew.dashboard.agent_admin.avatars import (  # noqa: F401
     _avatar_variant_paths,
     _avatars_dir,
     _carry_motions_through_motionless_save,
-    _carry_pack_through_faceless_save,
     _commit_promoted_avatar,
     _discard_pending_avatar,
     _image_body_complete,
@@ -207,6 +208,7 @@ from kiro_crew.dashboard.agent_admin.capabilities import (  # noqa: F401
     api_capability_skills_uninstall,
 )
 from kiro_crew.dashboard.agent_admin.crew_records import (  # noqa: F401
+    _api_kirocrew_agents_create,
     _crew_effort_rejected,
     _crew_memory_store_rejected,
     _refresh_session_defaults,
@@ -220,6 +222,7 @@ from kiro_crew.dashboard.agent_admin.crew_removal import (  # noqa: F401
     api_kirocrew_agent_delete,
 )
 from kiro_crew.dashboard.agent_admin.crew_update import (  # noqa: F401
+    _apply_member_approval_to_live_thread,
     _effort_inputs,
     api_kirocrew_agent_update,
 )
@@ -256,10 +259,12 @@ from kiro_crew.dashboard.agent_admin.template_lineage import (  # noqa: F401
     _ForeignPrivateCopy,
     _ForkBookkeepingFailed,
     _is_reserved_basename,
+    _lineage_unverifiable_error,
     _load_template_specs,
     _PublishNameBound,
     _rebind_crew_locked,
     _reserved_binding_names,
+    _sidecar_unverifiable,
     _spec_stem_on_disk,
     _StaleBinding,
     _unlink_copy_unless_referenced,
@@ -302,6 +307,12 @@ from kiro_crew.executors import discovery_executor, maintenance_executor, subpro
 from kiro_crew.external_text import redact_external_text as _redact_external  # noqa: F401
 from kiro_crew.kiro_prerequisite import spawn_supervised_oneshot
 from kiro_crew.loop_lock import LoopBoundLock
+from kiro_crew.member_workspace import (  # noqa: F401
+    AUTO_WORKSPACE,
+    MemberWorkspaceUnavailable,
+    provision_member_workspace,
+    retire_unpublished_workspace,
+)
 from kiro_crew.members import MemberNameError, key_new_crew, validate_member_name  # noqa: F401
 from kiro_crew.memory_stores import (  # noqa: F401
     DEFAULT_MEMORY_STORE,
@@ -1407,6 +1418,11 @@ async def api_effort_levels(request: web.Request) -> web.Response:
 async def api_slash_commands(request: web.Request) -> web.Response:
     """GET /api/slash-commands — list available slash commands (provider-aware)."""
     cfg = KiroCrewConfig.load()
+    # This global endpoint has no session/member key; the configured default
+    # backend is its capability authority, independent of the provider label.
+    blocked_commands = _BLOCKED_SLASH_COMMANDS
+    if capabilities_for(cfg.agent.acp_backend).supports_native_todos:
+        blocked_commands = blocked_commands - {"/todos"}
     if is_claude_code(cfg.agent.provider):
         state: DashboardState = request.app["state"]
         cc_commands: list[str] = []
@@ -1429,7 +1445,7 @@ async def api_slash_commands(request: web.Request) -> web.Response:
         result = [
             {"name": f"/{c}", "description": SLASH_COMMAND_DESCRIPTIONS.get(f"/{c}", "")}
             for c in cc_commands
-            if f"/{c}" not in _BLOCKED_SLASH_COMMANDS
+            if f"/{c}" not in blocked_commands
         ]
         for command in ("/side", "/workflow"):
             if not any(item["name"] == command for item in result):
@@ -1445,7 +1461,7 @@ async def api_slash_commands(request: web.Request) -> web.Response:
     return web.json_response(
         [
             {"name": c, "description": SLASH_COMMAND_DESCRIPTIONS.get(c, "")}
-            for c in sorted(_SLASH_COMMANDS - _BLOCKED_SLASH_COMMANDS)
+            for c in sorted(_SLASH_COMMANDS - blocked_commands)
         ]
     )
 

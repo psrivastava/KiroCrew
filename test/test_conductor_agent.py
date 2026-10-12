@@ -248,8 +248,7 @@ class TestConductorInstaller:
         case, because they reach ``allowed_tools_to_permissions`` as separate
         patterns and a family could classify differently: persistent work
         (``task_run``, the ``workflow_*`` group), agent fan-out (the ``spawn_*``
-        group), session and workspace mutation (``set_project``,
-        ``reset_conversation``), egress (``deploy_artifact``, ``browser``,
+        group), workspace mutation (``set_project``), egress (``deploy_artifact``, ``browser``,
         ``ops_mission_control_api``) and the ``artifact_*`` writes.
 
         Spelled as literals, deliberately: deriving the expectation from
@@ -273,6 +272,11 @@ class TestConductorInstaller:
             "@kirocrew-core/send_message",
             "@kirocrew-core/send_notification",
             "@kirocrew-core/ask_question",
+            "@kirocrew-core/nothing_to_do",
+            # Granted on purpose: the conductor drops its own chat at a round
+            # close. The directive consumer still refuses it from any wake it
+            # cannot vouch for (test_conductor_wake_reset.py).
+            "@kirocrew-core/reset_conversation",
         }
         # The bare server is what this test exists to keep out: it would re-grant
         # all 74 registered core tools, including every verb named below.
@@ -289,9 +293,9 @@ class TestConductorInstaller:
             "spawn_sub_agents",
             "spawn_steer",
             "spawn_continue",
-            # Mutating the caller's own session or project out from under it.
+            # Mutating the caller's own project out from under it.
+            # (``reset_conversation`` moved to the granted set above, on purpose.)
             "set_project",
-            "reset_conversation",
             # Egress and machine reach.
             "deploy_artifact",
             "browser",
@@ -570,16 +574,27 @@ class TestConductorInstaller:
         assert "`goal-conductor`" in prompt
         assert "goal-ledger-conductor" not in prompt
 
-    def test_skill_body_matches_the_prompt_on_the_load_bearing_rules(self):
+    def test_skill_body_matches_the_prompt_on_the_load_bearing_rules(self, tmp_path, monkeypatch):
         """The prompt is the summary and the skill is the procedure; a disagreement
         between them is resolved nondeterministically by whichever the model weighs
         more. These four are the rules that make this flow what it is.
+
+        The read-first rule is asserted on BOTH sides, because that is the one a
+        wake can contradict: a wake carries a pointer to the ledger rather than a
+        copy of it, so a surface telling the conductor a turn may arrive holding the
+        board has it act on a one-line notification as if it were the state.
         """
         body = " ".join((SKILL_DIR / "SKILL.md").read_text(encoding="utf-8").split())
+        prompt = " ".join(self._install(tmp_path, monkeypatch)["prompt"].split())
         assert "Bind BEFORE you seed" in body
         assert "Never leave `agent` unset" in body
-        assert "work_ledger_read` with `compact=true` first, every cycle" in body
         assert "action=accept" in body
+        for surface, text in (("skill", body), ("prompt", prompt)):
+            assert "Read the ledger first, every cycle" in text, surface
+            assert "already carries the board" not in text, (
+                f"the {surface} still tells the conductor a turn can arrive holding "
+                "the board; a wake carries a pointer to work_ledger_read"
+            )
 
     def test_prompt_and_skill_close_a_child_once_its_item_is_terminal(self, tmp_path, monkeypatch):
         """A conductor that stops an item's loop and leaves its session open leaves a
@@ -679,6 +694,8 @@ class TestConductorInstaller:
             "@kirocrew-core/send_message",
             "@kirocrew-core/send_notification",
             "@kirocrew-core/ask_question",
+            "@kirocrew-core/nothing_to_do",
+            "@kirocrew-core/reset_conversation",
             "@kirocrew-dashboard/chat_folder_tree",
             "@kirocrew-dashboard/chat_folder_create",
             "@kirocrew-dashboard/chat_folder_file_self",
@@ -709,6 +726,8 @@ class TestConductorInstaller:
             "kirocrew-core/list_sessions",
             "kirocrew-core/monitor_start",
             "kirocrew-core/monitor_update",
+            "kirocrew-core/nothing_to_do",
+            "kirocrew-core/reset_conversation",
             "kirocrew-core/resource_status",
             "kirocrew-core/select_crew",
             "kirocrew-core/send_message",
@@ -873,6 +892,8 @@ class TestConductorInstaller:
             "@kirocrew-core/send_message",
             "@kirocrew-core/send_notification",
             "@kirocrew-core/ask_question",
+            "@kirocrew-core/nothing_to_do",
+            "@kirocrew-core/reset_conversation",
             "@kirocrew-dashboard/chat_folder_tree",
             "@kirocrew-dashboard/chat_folder_create",
             "@kirocrew-dashboard/chat_folder_file_self",

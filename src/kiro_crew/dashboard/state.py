@@ -330,7 +330,7 @@ MAX_LIVE_SLOTS = 500
 
 #: Fields whose dashboard-user projection is identical for every slot-patch
 #: audience. Per-audience fields such as ``source_links`` require a full frame.
-_SLOT_PATCH_FIELDS = frozenset({"pinned", "title", "folder_id"})
+_SLOT_PATCH_FIELDS = frozenset({"pinned", "mutes_opened", "muted", "title", "folder_id"})
 
 #: The most live slots ONE creator may hold, as a sub-ceiling under
 #: :data:`MAX_LIVE_SLOTS`. The global ceiling alone bounds the total but not the
@@ -495,10 +495,18 @@ def _attach_slot_parents(
     through ``session_create``: the sidebar already receives the slots broadcast, so
     the edge rides a frame it gets anyway rather than a route it would have to poll.
 
-    The SHAPE is byte-identical to the Sessions table's ``parent`` -- same two keys,
-    same meaning, same ``key: None`` for a creator that is not running or sits on a
-    cycle -- because one moved ``nestsUnder`` serves both views and a second shape
-    would be a second way to nest the same gateway. What differs, necessarily, is the
+    The SHAPE is byte-identical to the Sessions table's ``parent`` -- same keys, same
+    meaning, same ``key: None`` for a creator that is not running under a chain with
+    nothing open in it, or one that sits on a cycle -- because one moved ``nestsUnder``
+    serves both views and a second shape would be a second way to nest the same
+    gateway. A third key, ``ancestor``, rides the one case where ``key`` and ``slot``
+    name different sessions: the creator in ``slot`` has CLOSED and ``key`` is the
+    nearest session above it still open, so the row nests where the run is owned and
+    still cites a creator that is gone (see
+    :func:`~kiro_crew.crew_log.session_tree.parent_payload`). It is omitted, never
+    ``False``, so an ordinary edge is the payload it has always been.
+
+    What differs between the two views, necessarily, is the
     KEY SPACE: ``key`` names the creator's row IN THIS PAYLOAD, so here it is the bare
     slot key and on the memory payload it is the full ``dashboard:`` session key.
     ``nestsUnder`` resolves ``parent.key`` against its own payload's keys, so that is
@@ -1132,6 +1140,140 @@ def chat_message_frame(note: dict, *, include_metadata: bool) -> dict[str, Any]:
     return frame
 
 
+#: The tool row a turn ends on when the agent called ``nothing_to_do``. Read from
+#: the row's persisted TRUSTED identity (``_tool_identity_fields``: the backend's
+#: ``_meta.kiro`` name and server), never from the row's title text, so a shell
+#: command printing the tool's name cannot close a turn.
+QUIET_END_TOOL = "nothing_to_do"
+QUIET_END_SERVER = "kirocrew-core"
+
+
+def is_quiet_end_row(m: dict) -> bool:
+    """True when *m* is the APPLIED ``nothing_to_do`` directive's tool row.
+
+    A quiet end is a FINISHED turn: the agent ran its checks, had nothing the
+    user needs to read, and said so through the directive rather than by
+    stopping bare. Without this the transcript tail is ``[user|nudge, tool…]``
+    -- shape-identical to a gateway that died mid-turn -- so the composer
+    would offer Resume and the sidebar would flag the session as interrupted
+    on every quiet patrol cycle.
+
+    Two structured facts, both required: the row's trusted identity, and the
+    ``meta.ends_turn`` flag the runner stamps only when the applier's
+    ``DirectiveOutcome.ends_turn`` was True. A REFUSED call (a person opened
+    the turn) carries the identity and no flag, so it stays an unanswered turn.
+
+    Mirrors ``isQuietEndRow`` in ``website/src/store/chat/selectors.ts``.
+    """
+    if m.get("role") != "tool":
+        return False
+    meta = m.get("meta")
+    if not isinstance(meta, dict):
+        return False
+    return (
+        meta.get("tool_name") == QUIET_END_TOOL
+        and meta.get("mcp_server") == QUIET_END_SERVER
+        and meta.get("ends_turn") is True
+    )
+
+
+def chat_message_note(slot_key: str, msg: dict, *, workspace: str | None) -> dict[str, Any]:
+    """Build the ``chat_message`` broadcast note for an appended row.
+
+    The ONE builder shared by the append door (``_broadcast_chat_message``) and
+    the reader-suppressed frame in ``append_and_surface``, so a row leaves the
+    backend in one form whichever door delivers it. *workspace* scopes the
+    allowed-link hosts, as in ``_prepare_messages``.
+    """
+    role = msg.get("role", "")
+    content = msg.get("content", "")
+    # This site and _prepare_messages (the HTTP history path) share ONE
+    # helper — chat_utils.redact_display_content — so a row's *content*
+    # leaves the backend in one byte form regardless of which consumer
+    # receives it, including structured (list/dict) legacy content, which
+    # is redacted recursively rather than skipped. Scope: content only —
+    # `cls` / `meta` and the live `chat_chunk` stream are deliberately not
+    # covered (see the direct_meta comment below). Gate is `!= "user"` for
+    # the same reason as there: every non-user role can carry model/tool
+    # output, and user-authored content stays raw (the user typed it and
+    # is the only one who sees it back).
+    # Deferred import: chat_utils imports from this module at module
+    # level, so the reverse import must stay function-level.
+    from kiro_crew.dashboard.chat_utils import (
+        redact_display_content,
+        serialize_wire_content,
+        with_allowed_links_restored,
+    )
+
+    restored_meta: dict | None = None
+    if role != "user" and content:
+        # The same allowed-host scope as _prepare_messages, so the live
+        # frame and the history agree on an allowed link: its placeholder
+        # becomes the address again, then the display pass runs.
+        from kiro_crew.security.exfil import scoped_exempt_hosts
+        from kiro_crew.security.redaction_allow import allowed_hosts_for
+
+        with scoped_exempt_hosts(allowed_hosts_for(workspace)):
+            if isinstance(content, str) and isinstance(msg.get("meta"), dict):
+                shown = with_allowed_links_restored({"content": content, "meta": msg["meta"]})
+                content = shown["content"]
+                restored_meta = shown["meta"]
+            content = redact_display_content(content)
+    else:
+        # The wire-string invariant covers EVERY row: a structured user
+        # row or a falsy container serializes to text without redaction.
+        content = serialize_wire_content(content)
+    payload: dict[str, Any] = {
+        "_type": "chat_message",
+        "slot": slot_key,
+        "role": role,
+        "content": content,
+        "ts": msg.get("ts", ""),
+    }
+    # Include cls for backward compatibility
+    cls_val = msg.get("cls", "")
+    if cls_val:
+        payload["cls"] = cls_val
+        # Parse cls as JSON to send structured meta field for new frontend
+        meta = parse_cls_meta(cls_val)
+        if meta is not None:
+            payload["meta"] = meta
+    # Also include direct meta (e.g. tool_call_id on tool messages).
+    #
+    # Deliberately NOT redacted here, unlike the `cls` branch above (which is
+    # sanitised by parse_cls_meta). Two reasons, both load-bearing:
+    #
+    # 1. This is the LIVE oauth banner's egress path. _emit_mcp_oauth_request
+    #    appends the banner with a real `oauth_url`, already gated by
+    #    security.oauth_url_contains_credential — the shared security gate, which
+    #    exempts standard high-entropy OAuth values only at exact code-owned
+    #    authorization endpoints while scanning everything else fail-closed.
+    #    Running _redact_meta_for_role here would blank a genuine
+    #    Google/GitHub consent URL and break the user's ability to authorize
+    #    an MCP server.
+    # 2. chat_utils imports from this module, so importing the redactors the
+    #    other way would be a cycle.
+    #
+    # What makes that safe: live tool meta is redacted at source (_tool_meta),
+    # and a DISK-LOADED message reaches this path only when the caller opts
+    # in per-role. Both restore loops pass broadcast=False, and the ONE
+    # exception is refresh_channel_window, which replays a channel
+    # transcript's tail and passes broadcast_user=True so a message typed in
+    # Slack renders at all (nothing rendered it optimistically here). That
+    # exception cannot carry unredacted meta: ConversationLog.append writes
+    # only role/content/ts/source_thread/source_user for such a row -- no
+    # meta dict -- so the arm below never fires for it, and the row's
+    # content is human-typed, which is deliberately raw at every other
+    # boundary too. The invariant is pinned by
+    # test_rehydrate_does_not_broadcast_replayed_messages and
+    # test_restore_recent_sessions_does_not_broadcast_either. Do not relax
+    # it further without re-checking that meta is still absent.
+    direct_meta = restored_meta if restored_meta is not None else msg.get("meta")
+    if direct_meta and isinstance(direct_meta, dict):
+        payload["meta"] = {**(payload.get("meta") or {}), **direct_meta}
+    return payload
+
+
 def is_stop_event_row(m: dict) -> bool:
     """True when *m* is the card recorded because the user pressed Stop.
 
@@ -1187,7 +1329,7 @@ def is_stop_event_row(m: dict) -> bool:
 #: turn; here the question is whether a dispatch happened that got no reply,
 #: and a recovery or replay dispatch that died is exactly such a turn.
 _TURN_INJECT_KINDS: frozenset[str] = frozenset(
-    {"cron", "mcp_app", "recovery", "user_replay", "synthesis"}
+    {"cron", "mcp_app", "recovery", "user_replay", "synthesis", "automation_notice"}
 )
 
 
@@ -1249,6 +1391,11 @@ def is_turn_interrupted(messages: list[dict]) -> bool:
     """
     saw_trailing_error = False
     saw_compaction_result = False
+    # A tool row met AFTER the quiet end (later in time): the model broke the
+    # contract and kept working, so the quiet-end row is not the turn's last
+    # act and must not close it -- a gateway that died in that later work
+    # would otherwise hide behind it.
+    saw_later_tool = False
     for m in reversed(messages):
         role = m.get("role")
         meta = m.get("meta") or {}
@@ -1262,6 +1409,15 @@ def is_turn_interrupted(messages: list[dict]) -> bool:
         # first.
         if is_stop_event_row(m):
             return False
+        # A quiet end (``nothing_to_do``) is the turn's deliberate ending too:
+        # same reasoning as the Stop card, same position in the scan. Only the
+        # newest turn's row reaches here, for the same reason -- and only when
+        # it IS the turn's last tool row.
+        if is_quiet_end_row(m):
+            if not saw_later_tool:
+                return False
+        elif role == "tool":
+            saw_later_tool = True
         if is_system_notice(role, meta):
             # Remember a compaction RESULT row on the newest turn. Skipping the
             # row is still right in general (an auto-compaction notice inside
@@ -1464,6 +1620,42 @@ def stuck_turn_notice(parked_secs: float) -> str:
 
 
 _MAX_SLOT_MESSAGES = 10000  # Keep all messages — virtual scrolling handles performance
+# Serializes the replay of a lazily restored slot's window, never its disk read:
+# ``_ChatSlot.load_window`` reads before it takes this, so the lock is held only
+# for the in-memory replay. Re-entrant because the replay appends through
+# ``_ChatSlot.messages`` itself; one lock for every slot because a replay is rare
+# (once per restored row) and short.
+_LAZY_WINDOW_LOCK = threading.RLock()
+
+
+async def load_window_off_loop(slot: Any) -> None:
+    """Load a restored sidebar row's pending window with its disk reads off the loop.
+
+    Every async path that acts on a live slot it did not just create awaits this
+    before it reads the slot's rows: the per-slot routes, a send, a session-control
+    delivery or read, and a result delivered into an existing tab. The reads run
+    on a worker thread and the apply runs back on the loop, so the first reader
+    never stalls the gateway on a large transcript. A slot that carries its window
+    (every slot but a pending restored row) returns at once, without suspending.
+    When something reads ``messages`` during the await, that read loads the window
+    inline and this result is dropped.
+    """
+    if getattr(slot, "window_pending", False) is not True:
+        return
+    read = getattr(slot._lazy_window, "read", None)
+    if not callable(read):
+        return
+    prefetched = await asyncio.to_thread(read, slot)
+    slot.load_window(*prefetched)
+
+
+def _on_event_loop() -> bool:
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    return True
+
 
 #: Transient/streaming roles that are never persisted by the save path
 #: (``chat_persistence._build_message_entry`` returns ``None`` for them) and are
@@ -1544,7 +1736,6 @@ def append_and_surface(
     *,
     meta: dict | None = None,
     broadcast_user: bool = False,
-    extra: dict | None = None,
 ) -> dict[str, Any]:
     """Append a row and surface it live -- through exactly one identity-carrying door.
 
@@ -1573,9 +1764,12 @@ def append_and_surface(
     ``broadcast_user=True`` and get the same single identity-carrying delivery.
 
     Redaction is the caller's job (unchanged from the sites this replaces):
-    content passed here must already be display-safe. The append path re-redacts
-    non-user content in ``_broadcast_chat_message``; the reader-suppressed frame
-    below does not, matching the manual frames it replaces.
+    content passed here must already be display-safe. Both doors also run the
+    same display pass on non-user content: the reader-suppressed frame below is
+    built by ``chat_message_note`` + ``chat_message_frame``, the same builders
+    the append door's WebSocket arm uses, so the frame is identical whether or
+    not a stream reader is attached. A route kind belongs in ``meta``, which
+    both doors carry.
 
     Returns the appended row (so callers can read ``row_mid`` off it).
     """
@@ -1584,20 +1778,11 @@ def append_and_surface(
     else:
         msg = slot.append(role, content, cls, meta=meta)
     if getattr(slot, "_has_reader", False):
-        frame: dict[str, Any] = {
-            "slot": slot.key,
-            "role": role,
-            "content": content,
-            "ts": msg.get("ts", ""),
-        }
-        if cls:
-            frame["cls"] = cls
-        row_meta = msg.get("meta")
-        if isinstance(row_meta, dict) and row_meta:
-            frame["meta"] = row_meta
-        if extra:
-            frame.update(extra)
-        state.broadcast_ws("chat_message", frame)
+        workspace = getattr(slot, "workspace", None)
+        note = chat_message_note(
+            slot.key, msg, workspace=workspace if isinstance(workspace, str) else None
+        )
+        state.broadcast_ws("chat_message", chat_message_frame(note, include_metadata=True))
     return msg
 
 
@@ -1675,11 +1860,20 @@ _PUBLIC_STATUS_DENY_AUDIT: dict[str, float] = {}
 _PUBLIC_STATUS_GRANT_WINDOW_SECS = 300.0
 
 
+def _drop_expired_public_status_audits(audit: dict[str, float], now: float) -> None:
+    # An entry past its window is never read again, so each insert drops those;
+    # the map then holds only the links audited inside the current window.
+    cutoff = now - _PUBLIC_STATUS_GRANT_WINDOW_SECS
+    for stale in [url for url, at in list(audit.items()) if at <= cutoff]:
+        audit.pop(stale, None)
+
+
 def _audit_public_status_grant(url: str) -> None:
     now = time.monotonic()
     last = _PUBLIC_STATUS_GRANT_AUDIT.get(url)
     if last is not None and (now - last) < _PUBLIC_STATUS_GRANT_WINDOW_SECS:
         return
+    _drop_expired_public_status_audits(_PUBLIC_STATUS_GRANT_AUDIT, now)
     _PUBLIC_STATUS_GRANT_AUDIT[url] = now
     try:
         sel().log_api_access(
@@ -1703,6 +1897,7 @@ def _audit_public_status_denied(url: str) -> None:
     last = _PUBLIC_STATUS_DENY_AUDIT.get(url)
     if last is not None and (now - last) < _PUBLIC_STATUS_GRANT_WINDOW_SECS:
         return
+    _drop_expired_public_status_audits(_PUBLIC_STATUS_DENY_AUDIT, now)
     _PUBLIC_STATUS_DENY_AUDIT[url] = now
     try:
         sel().log_api_access(
@@ -2684,15 +2879,21 @@ class _ChatSlot:
         "_crew_log_previous_from_mapping",
         "_crew_log_opened_sid",
         "_crew_log_pending_channel",
-        "reasoning_effort",
+        "_reasoning_effort",
+        "_effort_pick_gen",
         "autocompact_pct",
+        "turn_timeout_secs",
+        "_turn_timeout_hydrated",
         "mode",
         "workspace",
         "memory_store",
         "_memory_assignment_from_history",
         "project",
         "created_at",
-        "messages",
+        "_messages",
+        "_lazy_window",
+        "_lazy_tail",
+        "_window_loader_thread",
         "total_messages",
         "_task",
         "_turn_admission_reserved",
@@ -2713,6 +2914,7 @@ class _ChatSlot:
         "_trust",
         "_trust_scope",
         "_trust_reads",
+        "_member_approval_seeded",
         "_trusted_patterns",
         "_titled",
         "_title_origin",
@@ -2758,6 +2960,7 @@ class _ChatSlot:
         "_stop_escalated_card_id",
         "_pending_reset_history_key",
         "_pending_discard_conversation_key",
+        "_pending_discard_from_wake",
         "_pending_model_pick",
         "_eager_spawn_task",
         "_eager_spawn_failures",
@@ -2780,6 +2983,8 @@ class _ChatSlot:
         "_folder_changed",
         "_folder_suggested",
         "pinned",
+        "mutes_opened",
+        "muted",
         "tags",
         "tags_revision",
         "_pending_subagent_failures",
@@ -2798,6 +3003,7 @@ class _ChatSlot:
         "_tool_stall_retries",
         "_tool_stall_exhausted_emitted",
         "_transient_5xx_retries",
+        "_transient_ladder_started",
         "_infra_retries",
         "_fallback_candidate_idx",
         "_fallback_walked",
@@ -2819,6 +3025,8 @@ class _ChatSlot:
         "_last_turn_structural_terminal",
         "_last_turn_structural_terminal_loop_id",
         "_last_turn_structural_terminal_loop_gen",
+        "_last_turn_model_refused_loop_id",
+        "_last_turn_model_refused_loop_gen",
         "_prestream_exhausted_cycles",
         "_poisoned_reset_used",
         "_session_not_found_retry_used",
@@ -2855,6 +3063,7 @@ class _ChatSlot:
         "_channel_window_mtime",
         "_disk_older_count",
         "_disk_older_durable_count",
+        "_unknown_row_fields_bytes",
         "_disk_window_len",
         "_disk_meta_created_at",
         "_disk_meta_observed",
@@ -2887,6 +3096,8 @@ class _ChatSlot:
         "_steer_user_origin",
         "_steer_channel_origin",
         "_turn_channel_narrowed",
+        "_turn_channel_origin",
+        "_turn_user_sent",
         "_steer_admissions",
         "_steer_decision_strips",
         "_steer_possibly_delivered",
@@ -2996,13 +3207,27 @@ class _ChatSlot:
         # inheriting rather than pinning. "" = unknown. Written through
         # `record_served_model`.
         self.served_model: str = ""
-        # Reasoning effort: "" = provider default, else one of low/medium/high/max.
-        # Currently consumed by an alternate ACP backend (--effort flag); ACP wired later.
-        self.reasoning_effort: str = ""
+        # Reasoning effort: "" = provider default, else one of
+        # low/medium/high/xhigh/max (``EFFORT_LEVELS`` in ``effort.py``). A live
+        # session applies it as ``session/set_config_option`` on the backends in
+        # ``ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION`` (claude, codex, deepseek, KAS as
+        # ``effortLevel``, pi) and as the ``/effort`` command on kiro-cli.
+        # Every write that changes the level bumps ``_effort_pick_gen`` (see the
+        # property), so a queued session_set_model effort can tell that a newer
+        # choice landed even when that choice returned to the level it saw.
+        self._effort_pick_gen: int = 0
+        self._reasoning_effort: str = ""
         # Per-session auto-compact threshold override (percent). None = follow
         # the global session.autocompact_pct. Persisted with the slot and
         # re-seeded into the SessionManager after restore.
         self.autocompact_pct: float | None = None
+        # Per-session turn time limit (seconds). None = follow the global
+        # agent.chat_turn_timeout_secs. Persisted with the slot; read by the turn
+        # dispatch (turn_dispatch.resolve_turn_limit) when each turn starts.
+        self.turn_timeout_secs: int | None = None
+        # False while a reopened tab's own limit is still unread from its
+        # transcript: its saves carry the on-disk value forward meanwhile.
+        self._turn_timeout_hydrated: bool = True
         # "" = default chat; app workers may carry their own mode (design-critique)
         self.mode = mode
         self.workspace = workspace
@@ -3039,7 +3264,17 @@ class _ChatSlot:
         # in flight.
         self._turn_in_flight_prompt: dict[str, Any] | None = None
         self.created_at: str = datetime.now(timezone.utc).isoformat()
-        self.messages: list[dict[str, Any]] = []
+        self._messages: list[dict[str, Any]] = []
+        # A restored sidebar row whose transcript window has not been loaded yet:
+        # the loader to run on first read of ``messages``, and the bounded tail
+        # the sidebar summary projects from meanwhile. Both None on every slot
+        # that carries its window. See ``chat_persistence`` lazy restore.
+        self._lazy_window: Callable[[_ChatSlot], None] | None = None
+        self._lazy_tail: list[dict[str, Any]] | None = None
+        # The thread replaying that window right now, so the replay's own reads
+        # of ``messages`` see the list it is filling while every other thread's
+        # read waits for the replay to finish.
+        self._window_loader_thread: int | None = None
         self._buffers = SlotBufferCoordinator()
         self._projection = SlotProjection()
         self._queue_repository = SlotQueueRepository(
@@ -3166,6 +3401,8 @@ class _ChatSlot:
         # the decision — ``safety_override().is_scope_active()`` is.
         self._trust_scope: str = ""
         self._trust_reads: bool = False  # auto-approve read-only bash commands
+        # A crewmate thread took its profile's approval mode (members handler).
+        self._member_approval_seeded: bool = False
         self._trusted_patterns: set[str] = set()  # session-scoped fnmatch globs
         self._titled: bool = False  # True once a title has been assigned
         # Provenance of the current title: "auto" (LLM auto-titler or its
@@ -3406,6 +3643,9 @@ class _ChatSlot:
         # called from inside the turn it wants to end, and the immediate route
         # refuses a busy slot rather than tearing down a turn mid-write.
         self._pending_discard_conversation_key: str | None = None
+        # True when a patrol wake queued that discard: it then also waits, at
+        # the boundary, while a question card or tool approval is pending.
+        self._pending_discard_from_wake: bool = False
         # Set by session_set_model on an idle slot; consumed at the start of the
         # next turn (session_control.apply_pending_model_pick), which re-checks
         # the caller's authorization and commits the model in one synchronous
@@ -3463,6 +3703,18 @@ class _ChatSlot:
         # and a reset flag cannot produce a second card.
         self._folder_suggested: bool = False
         self.pinned: bool = False  # pinned to top of sidebar
+        # When set on a creating session, every session it opens (and anything
+        # those open, down the ``_created_by`` chain) is muted for attention:
+        # no turn-done chime, background-finished toast or unread badge. The
+        # creator itself stays unmuted -- its reports are the signal the user
+        # wants -- and tool-approval prompts stay exempt. Owned by the
+        # user through the slot's kebab menu, never set by an agent, and
+        # derived from the durable ``created_by`` chain on the client.
+        self.mutes_opened: bool = False
+        # Per-row mute of THIS session, set by the user from its own kebab
+        # menu: no turn-done chime, background-finished toast or unread badge
+        # on the client. Tool-approval prompts stay exempt. Durable like ``pinned``; never set by an agent.
+        self.muted: bool = False
         self.tags: list[str] = []  # assigned tag ids (see DashboardState._tags)
         # Change identity for tag snapshots. Orderable (see mint_tags_revision):
         # equality identifies a specific frame, and the sequence prefix lets a
@@ -3536,6 +3788,10 @@ class _ChatSlot:
         # ConnectionReset) retries on the interactive stream path. Distinct
         # budget from prompt-busy / pipe-death; reset on a completed turn.
         self._transient_5xx_retries: int = 0
+        # time.monotonic() at the current transient ladder's first retry, the
+        # start of the network-drop recovery window. Re-stamped whenever the
+        # ladder starts from zero, so it needs no reset of its own.
+        self._transient_ladder_started: float = 0.0
         # L1 gateway-capacity retries: how many times THIS cycle waited out an
         # infrastructure refusal of a tool call (the ladder owns the budget; this
         # is the slot-visible count the health panel classifies as recovering).
@@ -3646,6 +3902,15 @@ class _ChatSlot:
         # guard passes it to AutoNudgeService.update(expected_generation=...) so
         # the stop is applied under an atomic (id, generation) fence.
         self._last_turn_structural_terminal_loop_gen: int = 0
+        # The loop whose own delivered cycle ended on a content refusal that
+        # nothing retried, and the config generation it fired under. Empty when
+        # the last turn was not such a cycle. The auto-nudge fire guard reads the
+        # pair and stops that loop with ``model_refused`` instead of firing the
+        # same prompt into the same model again; cleared at the start of every
+        # genuine new turn, like the structural verdict above. Not persisted, for
+        # the same reason as that verdict.
+        self._last_turn_model_refused_loop_id: str = ""
+        self._last_turn_model_refused_loop_gen: int = 0
         # Poisoned-conversation escalation (cross-cycle). A cycle that EXHAUSTS
         # the transient-5xx ladder with ZERO output counts one pre-stream
         # exhaustion; consecutive exhausted cycles indicate the backend is
@@ -3781,6 +4046,9 @@ class _ChatSlot:
         self._disk_older_count: int = (
             0  # count of disk messages OLDER than in-memory window (stable, set at restore/resume)
         )
+        # Bytes of newer-build row fields the messages keep (an upper bound; see
+        # slot_persistence.message_entries.MAX_UNKNOWN_ROW_FIELDS_SLOT_BYTES).
+        self._unknown_row_fields_bytes: int = 0
         # Durable-only frozen-prefix counter: how many durable rows (role not
         # in ``_TRANSIENT_ROLES``) have LEFT the in-memory window off the front.
         # Absolute message positions (``session_control.read_messages``) are
@@ -3979,6 +4247,21 @@ class _ChatSlot:
         # the turn, a declined or requeued steer included (narrowing is the direction
         # that cannot be wrong); the turn resets it at its end and at the next start.
         self._turn_channel_narrowed: bool = False
+        # The running turn's OPENER provenance: True while a turn a channel message
+        # opened (`_run_chat(_directive_channel_origin=True)`) is in flight. Set at
+        # the turn's outermost start and cleared at its end, beside
+        # `_turn_channel_narrowed`; read by gateway routes a tool call reaches
+        # mid-turn (the guide routes refuse a channel turn), which have
+        # no other way to learn where the turn came from.
+        self._turn_channel_origin: bool = False
+        # Whether the running turn is one the person sent from the dashboard
+        # (`_run_chat(_directive_user_origin=True)` and not a channel's): set at
+        # the turn's outermost start and cleared at its end beside
+        # `_turn_channel_origin`. A loop wake, a cron or app injection, a
+        # `session_send` and a sub-agent completion never set it, and a steer
+        # that is not the user's clears it (`chat_delivery`), so the guide routes
+        # that act for the user refuse them.
+        self._turn_user_sent: bool = False
         # The containment that held when an in-flight steer was AUTHORIZED, keyed by
         # the same message text and kept in the same LOCKSTEP. The requeue stamps it
         # on the queue entry instead of reading the slot again: its own moment is the
@@ -4120,6 +4403,24 @@ class _ChatSlot:
         """
         self.tags_revision = mint_tags_revision()
         return self.tags_revision
+
+    @property
+    def reasoning_effort(self) -> str:
+        """The slot's reasoning effort: "" = provider default, else a level."""
+        return self._reasoning_effort
+
+    @reasoning_effort.setter
+    def reasoning_effort(self, value: str) -> None:
+        # Bumped on every write that changes the level, rollbacks included: a
+        # rollback that lands while a session_set_model effort is pending drops
+        # that pick rather than letting it overwrite a level the user touched.
+        # A same-value write is not a new choice (the dropdown route re-commits
+        # the level it already wrote after awaiting its live push), so it must
+        # not drop a pick queued during that await; the route's explicit
+        # same-level fast path bumps the generation itself.
+        if value != self._reasoning_effort:
+            self._effort_pick_gen += 1
+        self._reasoning_effort = value
 
     @property
     def is_closing(self) -> bool:
@@ -5586,6 +5887,114 @@ class _ChatSlot:
             "total": len(links),
         }
 
+    @property
+    def messages(self) -> list[dict[str, Any]]:
+        """The in-memory transcript window, loaded on first read for a lazy row.
+
+        A sidebar row restored at startup carries only its metadata until
+        something needs its rows. Every reader goes through here, so the first
+        one -- opening the tab, a turn, an injected row, a fork -- loads the
+        window before it sees a single row, and no reader can act on the empty
+        list a stub holds. Readers that only need the sidebar summary use
+        :meth:`sidebar_messages`, and the save path uses :meth:`loaded_messages`,
+        so neither forces a load.
+        """
+        if getattr(self, "_lazy_window", None) is not None:
+            self.load_window()
+        return self._messages
+
+    @messages.setter
+    def messages(self, value: list[dict[str, Any]]) -> None:
+        # A wholesale replacement is a decision about the window, so it ends a
+        # pending lazy load rather than letting the load land on top of it.
+        if getattr(self, "_lazy_window", None) is not None:
+            self._lazy_window = None
+            self._lazy_tail = None
+        self._messages = value
+
+    def load_window(self, *prefetched: Any) -> None:
+        """Run a pending window load now; a no-op once the window is loaded.
+
+        *prefetched* are the loader's disk reads when the caller already made
+        them off the loop (:func:`load_window_off_loop`). Without them the reads
+        run here, before the load lock is taken: the lock only ever covers the
+        replay, so a load on one thread never holds a reader on another (the
+        loop's among them) behind a transcript read. The row stays pending
+        until the replay has finished, so a reader on another thread waits for
+        the whole window instead of seeing the list half filled.
+        """
+        loader = getattr(self, "_lazy_window", None)
+        if loader is None or getattr(self, "_window_loader_thread", None) == threading.get_ident():
+            # Loaded, or the replay's own read of the list it is filling.
+            return
+        if not prefetched:
+            if _on_event_loop():
+                # The load still runs (a reader must never see the empty stub),
+                # but it reads the transcript on the loop: the path that got
+                # here should have awaited ``load_window_off_loop`` first.
+                logger.warning(
+                    "Loading the transcript window of %s on the event loop; "
+                    "the reader did not await load_window_off_loop first",
+                    self.key,
+                    stack_info=True,
+                )
+            read = getattr(loader, "read", None)
+            if callable(read):
+                # A failed read leaves the row pending and raises, so the next
+                # read retries.
+                prefetched = read(self)
+        with _LAZY_WINDOW_LOCK:
+            if getattr(self, "_lazy_window", None) is not loader:
+                # Another reader's load landed while this one read, or the
+                # window was replaced wholesale; that answer stands.
+                return
+            self._window_loader_thread = threading.get_ident()
+            try:
+                loader(self, *prefetched)
+            except BaseException:
+                # Fail closed: the row stays pending and the read raises, so
+                # nothing can append to (and a later save rewrite the
+                # transcript from) a window that never loaded. The next read
+                # retries.
+                self._messages = []
+                self._lazy_window = loader
+                raise
+            else:
+                self._lazy_window = None
+                self._lazy_tail = None
+            finally:
+                self._window_loader_thread = None
+
+    @property
+    def window_pending(self) -> bool:
+        """Whether this slot is a restored row whose window is not loaded yet."""
+        return getattr(self, "_lazy_window", None) is not None
+
+    def loaded_messages(self) -> list[dict[str, Any]]:
+        """A copy of the window as it is in memory, without loading a pending one.
+
+        Empty for a row whose window was never loaded, which is exactly what the
+        save path needs: such a row holds no rows that are not already on disk,
+        so its save is the metadata-only merge and the transcript is untouched.
+        Copied under the load lock, which a replay holds throughout, so a save
+        in the flush thread snapshots the window from before a replay or after
+        it, never one the replay is still filling in place.
+        """
+        with _LAZY_WINDOW_LOCK:
+            return list(self._messages)
+
+    def sidebar_messages(self) -> list[dict[str, Any]]:
+        """The rows the sidebar summary projects from, without forcing a load.
+
+        For a row whose window is still pending this is the bounded tail read at
+        restore, which holds everything the summary looks at: the newest row's
+        timestamp, the last conversational message and its options, and whether
+        the last turn was interrupted.
+        """
+        if self.window_pending:
+            return self._lazy_tail or []
+        return self.messages
+
     def _summary_source_links(self) -> list[dict]:
         # Skip extraction itself when the chips are off, not just the two fields
         # the projection derives from it: `_pr_source_links()` scans the transcript
@@ -6021,6 +6430,10 @@ class DashboardState:
         # ``len(_slots)`` alone undercounts by however many imports are in flight,
         # and each concurrent import would then be waved past a full-slot cap.
         self._slots_under_construction: set[str] = set()
+        # The slot each connected owner dashboard reports in the foreground, by
+        # connection (``slot_retention.note_foreground``). The idle sweep never
+        # archives a slot someone is looking at.
+        self._foreground_slots: dict[int, str] = {}
         self._slack_to_slot: dict[str, str] = {}  # Slack session_key → slot name
         # Live OPTIONS controls, keyed by the SESSION KEY that owns them.
         #
@@ -6198,6 +6611,12 @@ class DashboardState:
         # question card is addressed to one slot rather than the whole gateway.
         self._pending_questions: dict[str, dict] = {}
         self._question_futures: dict[str, asyncio.Future] = {}  # type: ignore[type-arg]
+        # Recent endings let reconnecting owner windows distinguish submitted answers.
+        self._recent_question_resolutions: dict[str, tuple[str, float]] = {}
+        # Blocking MCP ``ask_question`` calls, keyed by ask_id: which session owns
+        # each (a wait from any other session is refused), its redacted
+        # questions, deadline and why it ended. See QuestionCoordinator.
+        self._agent_asks: dict[str, dict] = {}
         self._flush_task: asyncio.Task | None = None  # type: ignore[type-arg]
         self._persistence_coordinator = _new_dashboard_persistence()
         # Update progress tracking (shared across all connected clients)
@@ -6980,6 +7399,14 @@ class DashboardState:
     # margin below the watchdog. `wait` can afford 1800s because it is a
     # different mechanism; copying that number here was the bug.
     _QUESTION_TIMEOUT_MAX = 540  # 9 minutes — 60s under the 600s tool-stall watchdog
+    # The blocking MCP ``ask_question`` is not bound by the cap above: its tool
+    # call waits in short slices and pings /api/session-keepalive between them,
+    # which resets the stall watchdog the same way the ``wait`` tool does. So
+    # the window is sized for a person, not for a transport. A tool call that
+    # stops polling for _AGENT_ASK_STALE_SECS is presumed dead and its card is
+    # withdrawn, so a crashed subprocess cannot leave a card collecting answers.
+    _AGENT_ASK_WINDOW_DEFAULT = 1800  # 30 minutes
+    _AGENT_ASK_STALE_SECS = 120
     _FLUSH_INTERVAL = 5  # seconds between dirty-slot flushes
 
     # ── FIX 2: bounded concurrency for unattended, app-owned turns ──────────
@@ -7134,7 +7561,13 @@ class DashboardState:
         if self._knowledge_store is None:
             db_dir = os.path.join(str(config_dir()), "workspace", "knowledge")
             mkdirs_owner_only(db_dir)
-            self._knowledge_store = KnowledgeStore(os.path.join(db_dir, "knowledge.db"))
+            self._knowledge_store = KnowledgeStore.open_recovering(
+                os.path.join(db_dir, "knowledge.db")
+            )
+            # The log alone is not enough: an empty library with no word on
+            # screen reads as data loss. The bell feed is where the user looks.
+            for warning in self._knowledge_store.warnings:
+                self.notify("agent", "Knowledge library was reset", warning, url="/knowledge")
         return self._knowledge_store
 
     def enable_yolo(self, *, from_config: bool = False) -> None:
@@ -7325,6 +7758,7 @@ class DashboardState:
         *,
         blocking: bool | None = None,
         card_id: str | None = None,
+        reason: str | None = None,
     ) -> bool:
         """Retire only question records matching both supplied filters."""
         return _questions_for(self).clear_pending(
@@ -7332,15 +7766,27 @@ class DashboardState:
             slot_key,
             blocking=blocking,
             card_id=card_id,
+            reason=reason,
         )
 
-    def _broadcast_question_retired(self, slot_key: str, card_ids: list[str]) -> None:
+    def _broadcast_question_retired(
+        self,
+        slot_key: str,
+        cards: list[str] | list[tuple[str, bool]],
+        *,
+        reason: str | None = None,
+    ) -> None:
         """Tell owner clients that question cards are no longer actionable."""
-        _questions_for(self).broadcast_retired(self, slot_key, card_ids)
+        normalized = [(card, False) if isinstance(card, str) else card for card in cards]
+        _questions_for(self).broadcast_retired(self, slot_key, normalized, reason=reason)
 
     def _push_slots(self) -> None:
         """Push question status without failing the question lifecycle."""
         _questions_for(self).push_slots(self)
+
+    def recent_question_resolutions(self) -> dict[str, str]:
+        """Return bounded recent blocking ask endings for reconnect repair."""
+        return _questions_for(self).recent_resolutions(self)
 
     async def request_question(
         self,
@@ -7358,9 +7804,31 @@ class DashboardState:
             timeout,
         )
 
-    def resolve_question(self, ask_id: str, answers: dict[str, str] | None) -> bool:
-        """Resolve one blocking question future if it is still pending."""
-        return _questions_for(self).resolve(self, ask_id, answers)
+    def resolve_question(
+        self, ask_id: str, answers: dict[str, str] | None, *, reason: str | None = None
+    ) -> bool:
+        """Resolve one blocking question future if it is still pending.
+
+        ``reason`` says why a ``None`` answer ended the wait (``dismissed``,
+        ``composer``, ...); only a blocking MCP ask reports it back to the agent.
+        """
+        return _questions_for(self).resolve(self, ask_id, answers, reason=reason)
+
+    async def open_agent_ask(
+        self, ask_id: str, slot_key: str, session_key: str, questions: list[dict]
+    ) -> int | None:
+        """Open a blocking MCP ask, or return ``None`` when live asks fill the cap."""
+        return await _questions_for(self).open_agent_ask(
+            self, ask_id, slot_key, session_key, questions
+        )
+
+    async def wait_agent_ask(self, ask_id: str, session_key: str, slice_secs: float) -> dict | None:
+        """Wait one slice for an agent ask; ``None`` when the caller does not own it."""
+        return await _questions_for(self).wait_agent_ask(self, ask_id, session_key, slice_secs)
+
+    def withdraw_agent_ask(self, ask_id: str, session_key: str) -> bool:
+        """Withdraw an agent ask whose tool call was cancelled."""
+        return _questions_for(self).withdraw_agent_ask(self, ask_id, session_key)
 
     def cancel_questions_for_slot(self, slot_key: str) -> int:
         """Unblock every blocking question owned by one slot."""
@@ -7391,11 +7859,13 @@ class DashboardState:
         url: str | None = None,
         actions: list[dict[str, Any]] | None = None,
         channel: str | None = None,
+        member: dict[str, str] | None = None,
     ) -> None:
         """Validate and deliver a legacy notification without raising.
 
         ``channel`` overrides the system channel ``kind`` maps to (see
         :func:`payload_from_legacy`); ``kind`` still reaches the frontend.
+        ``member`` attributes the note to the crewmate that published it.
         """
         _notifications_for(self).notify(
             self,
@@ -7406,6 +7876,7 @@ class DashboardState:
             url=url,
             actions=actions,
             channel=channel,
+            member=member,
         )
 
     def _deliver_note(self, note: dict[str, Any]) -> None:
@@ -7585,6 +8056,7 @@ class DashboardState:
         """Update a slot's Slack link state and persist to SessionStore."""
         slot = self._slots.get(slot_name)
         if not slot:
+            logger.warning("slack link skipped: no live slot %r (chat closed?)", slot_name)
             return
         # A thread handoff is ONE action with TWO persisted writes: the previous
         # owner's link is cleared and this slot's is claimed. Each write rewrites
@@ -7912,94 +8384,10 @@ class DashboardState:
 
     def _broadcast_chat_message(self, slot_key: str, msg: dict) -> None:
         """Push a chat message to all SSE clients via the global stream."""
-        role = msg.get("role", "")
-        content = msg.get("content", "")
-        # This site and _prepare_messages (the HTTP history path) share ONE
-        # helper — chat_utils.redact_display_content — so a row's *content*
-        # leaves the backend in one byte form regardless of which consumer
-        # receives it, including structured (list/dict) legacy content, which
-        # is redacted recursively rather than skipped. Scope: content only —
-        # `cls` / `meta` and the live `chat_chunk` stream are deliberately not
-        # covered (see the direct_meta comment below). Gate is `!= "user"` for
-        # the same reason as there: every non-user role can carry model/tool
-        # output, and user-authored content stays raw (the user typed it and
-        # is the only one who sees it back).
-        # Deferred import: chat_utils imports from this module at module
-        # level, so the reverse import must stay function-level.
-        from kiro_crew.dashboard.chat_utils import (
-            redact_display_content,
-            serialize_wire_content,
-            with_allowed_links_restored,
-        )
-
-        restored_meta: dict | None = None
-        if role != "user" and content:
-            # The same allowed-host scope as _prepare_messages, so the live
-            # frame and the history agree on an allowed link: its placeholder
-            # becomes the address again, then the display pass runs.
-            from kiro_crew.security.exfil import scoped_exempt_hosts
-            from kiro_crew.security.redaction_allow import allowed_hosts_for
-
-            _slot = self.get_slot(slot_key)
-            with scoped_exempt_hosts(allowed_hosts_for(getattr(_slot, "workspace", None))):
-                if isinstance(content, str) and isinstance(msg.get("meta"), dict):
-                    shown = with_allowed_links_restored({"content": content, "meta": msg["meta"]})
-                    content = shown["content"]
-                    restored_meta = shown["meta"]
-                content = redact_display_content(content)
-        else:
-            # The wire-string invariant covers EVERY row: a structured user
-            # row or a falsy container serializes to text without redaction.
-            content = serialize_wire_content(content)
-        payload: dict[str, Any] = {
-            "_type": "chat_message",
-            "slot": slot_key,
-            "role": role,
-            "content": content,
-            "ts": msg.get("ts", ""),
-        }
-        # Include cls for backward compatibility
-        cls_val = msg.get("cls", "")
-        if cls_val:
-            payload["cls"] = cls_val
-            # Parse cls as JSON to send structured meta field for new frontend
-            meta = parse_cls_meta(cls_val)
-            if meta is not None:
-                payload["meta"] = meta
-        # Also include direct meta (e.g. tool_call_id on tool messages).
-        #
-        # Deliberately NOT redacted here, unlike the `cls` branch above (which is
-        # sanitised by parse_cls_meta). Two reasons, both load-bearing:
-        #
-        # 1. This is the LIVE oauth banner's egress path. _emit_mcp_oauth_request
-        #    appends the banner with a real `oauth_url`, already gated by
-        #    security.oauth_url_contains_credential — the shared security gate, which
-        #    exempts standard high-entropy OAuth values only at exact code-owned
-        #    authorization endpoints while scanning everything else fail-closed.
-        #    Running _redact_meta_for_role here would blank a genuine
-        #    Google/GitHub consent URL and break the user's ability to authorize
-        #    an MCP server.
-        # 2. chat_utils imports from this module, so importing the redactors the
-        #    other way would be a cycle.
-        #
-        # What makes that safe: live tool meta is redacted at source (_tool_meta),
-        # and a DISK-LOADED message reaches this path only when the caller opts
-        # in per-role. Both restore loops pass broadcast=False, and the ONE
-        # exception is refresh_channel_window, which replays a channel
-        # transcript's tail and passes broadcast_user=True so a message typed in
-        # Slack renders at all (nothing rendered it optimistically here). That
-        # exception cannot carry unredacted meta: ConversationLog.append writes
-        # only role/content/ts/source_thread/source_user for such a row -- no
-        # meta dict -- so the arm below never fires for it, and the row's
-        # content is human-typed, which is deliberately raw at every other
-        # boundary too. The invariant is pinned by
-        # test_rehydrate_does_not_broadcast_replayed_messages and
-        # test_restore_recent_sessions_does_not_broadcast_either. Do not relax
-        # it further without re-checking that meta is still absent.
-        direct_meta = restored_meta if restored_meta is not None else msg.get("meta")
-        if direct_meta and isinstance(direct_meta, dict):
-            payload["meta"] = {**(payload.get("meta") or {}), **direct_meta}
-        self._broadcast(payload)
+        workspace = None
+        if msg.get("role", "") != "user" and msg.get("content", ""):
+            workspace = getattr(self.get_slot(slot_key), "workspace", None)
+        self._broadcast(chat_message_note(slot_key, msg, workspace=workspace))
 
     def _record_member_row(self, slot_key: str, msg: dict) -> None:
         """Append one ``member/message`` for a row landing in a member DM slot.
@@ -10089,11 +10477,19 @@ class DashboardState:
         """Publish that slot *key* left the registry without re-sending the list.
 
         Patch-capable sockets receive ``{"slots": [...], "removed": [key]}``.
-        The ``slots`` rows re-state the ``parent`` of every row whose creator is
-        not live, because a removed conductor turns its workers' ``parent.key``
-        to ``None`` in the full frame; carrying those rows keeps the sidebar's
-        nesting identical to what a full list would have produced. Everyone else
-        gets the full list, as with :meth:`push_slot_patch`.
+        The ``slots`` rows re-state the ``parent`` of every row the removal MOVED,
+        because a removed conductor changes its workers' ``parent`` in the full
+        frame; carrying those rows keeps the sidebar's nesting identical to what a
+        full list would have produced. Everyone else gets the full list, as with
+        :meth:`push_slot_patch`.
+
+        Two shapes qualify, and the second is why the test is not ``key is None``.
+        A worker with no open ancestor loses its key outright. A worker that HAS one
+        is re-parented onto it and carries ``ancestor``, so its key is a live string
+        -- the lead's -- and a null test would leave the client holding the closed
+        conductor's key, a row the same frame just removed. Every one of those
+        workers would then render top-level with the orphan glyph until a full frame
+        happened along, which is the behaviour this method exists to prevent.
 
         A key that is registered again (a same-name replacement landed while the
         close was tearing down) is not removed: the full push describes it. The
@@ -10132,14 +10528,14 @@ class DashboardState:
         if self._has_slot_patch_clients():
             rows = self._lineage_rows()
             _attach_slot_parents(rows, getattr(self, "spend_slot_by_session", None))
-            orphans = [
+            restated = [
                 {"key": row["key"], "parent": row["parent"]}
                 for row in rows
                 if isinstance(row.get("parent"), dict)
-                and row["parent"].get("key") is None
+                and (row["parent"].get("key") is None or row["parent"].get("ancestor") is True)
                 and not row.get("lineage_pending")
             ]
-            self._send_slot_patch({"slots": orphans, "removed": [key]})
+            self._send_slot_patch({"slots": restated, "removed": [key]})
         self._emit_member_slot_transitions()
 
     def _has_slot_patch_clients(self) -> bool:
@@ -10387,8 +10783,8 @@ class DashboardState:
     def broadcast_context_usage(self, slot_key: str, payload: dict) -> None:
         _persistence_for(self).broadcast_context_usage(self, slot_key, payload)
 
-    def ensure_context_snapshots_loaded(self) -> None:
-        _persistence_for(self).ensure_context_snapshots_loaded(self)
+    def ensure_context_snapshots_loaded(self) -> bool:
+        return _persistence_for(self).ensure_context_snapshots_loaded(self)
 
     def context_snapshot_for(self, slot_key: str) -> dict | None:
         return _persistence_for(self).context_snapshot_for(self, slot_key)

@@ -1005,7 +1005,12 @@ def test_the_unassignable_set_is_derived_from_the_registry(monkeypatch):
     only refusals; granting it would spend the worker's context on tools that
     cannot answer it."""
     assert agent._worker_unassignable_servers() == frozenset(
-        {"kirocrew-dashboard", "kirocrew-crew-log", "kirocrew-debug", "kirocrew-panel"}
+        {
+            "kirocrew-dashboard",
+            "kirocrew-crew-log",
+            "kirocrew-debug",
+            "kirocrew-panel",
+        }
     )
     monkeypatch.setitem(
         agent._MANAGED_MCP_SERVERS,
@@ -1720,6 +1725,67 @@ def test_the_fingerprint_covers_the_mirrored_keys_and_nothing_else(tmp_path, mon
     reordered = {k: spec[k] for k in reversed(list(spec))}
     default.write_text(json.dumps(reordered), encoding="utf-8")
     assert agent.default_spec_fingerprint() == agent.default_spec_fingerprint()
+
+
+def _spec_with_creds_agent_nonce(nonce: str) -> dict[str, Any]:
+    spec = json.loads(json.dumps(_DEFAULT_SPEC_ON_DISK))
+    spec["mcpServers"]["creds-agent"] = {
+        "command": "creds-launcher",
+        "args": ["mcp", "start-server", "creds-agent"],
+        "env": {
+            "CREDS_AGENT_URL": "${CREDS_AGENT_URL}",
+            "AIM_CREDS_AGENT_INJECTION": nonce,
+        },
+    }
+    return spec
+
+
+def test_a_per_launch_env_nonce_does_not_move_the_fingerprint(tmp_path, monkeypatch):
+    """A launcher re-stamps ``AIM_CREDS_AGENT_INJECTION`` into every agent spec it manages
+    on every session launch. That value is a nonce, not a grant — ``skill_projection``
+    already leaves it out of identity digests — so the fingerprint must not move with
+    it, or every concurrent launch reads as a trust change and ends the worker whose
+    load straddled it. Every other env value is still a grant and still counts."""
+    monkeypatch.delenv("KIROCREW_SKILL_VIEW_VOLATILE_ENV", raising=False)
+    monkeypatch.setattr(agent, "kiro_agents_dir_path", lambda: tmp_path)
+    default = tmp_path / AGENT_FILENAME
+    default.write_text(json.dumps(_spec_with_creds_agent_nonce("1fbf21ab")), encoding="utf-8")
+    before = agent.default_spec_fingerprint()
+
+    default.write_text(json.dumps(_spec_with_creds_agent_nonce("c45a9953")), encoding="utf-8")
+    assert agent.default_spec_fingerprint() == before
+
+    rotated = _spec_with_creds_agent_nonce("c45a9953")
+    rotated["mcpServers"]["creds-agent"]["env"]["CREDS_AGENT_URL"] = "https://other"
+    default.write_text(json.dumps(rotated), encoding="utf-8")
+    assert agent.default_spec_fingerprint() != before
+
+    # Only the VALUE is volatile. A default that drops the key is a changed spec:
+    # otherwise the mirror would keep an env entry absent from the default.
+    dropped = _spec_with_creds_agent_nonce("c45a9953")
+    del dropped["mcpServers"]["creds-agent"]["env"]["AIM_CREDS_AGENT_INJECTION"]
+    default.write_text(json.dumps(dropped), encoding="utf-8")
+    assert agent.default_spec_fingerprint() != before
+
+
+def test_a_nonce_restamp_during_the_load_does_not_end_the_session(tmp_path, monkeypatch):
+    """The production shape of the failure: the gate captures the spec, another session
+    launching re-stamps the nonce before kiro-cli's ``initialize`` answers, and the
+    post-load bracket re-checks. Identity differs (a new file), so the verdict falls to
+    the fingerprint — which must agree, because nothing the worker inherits changed."""
+    monkeypatch.setattr(agent, "kiro_agents_dir_path", lambda: tmp_path)
+    default = tmp_path / AGENT_FILENAME
+    default.write_text(json.dumps(_spec_with_creds_agent_nonce("1fbf21ab")), encoding="utf-8")
+    agent._install_worker_agent()
+    snap = agent.require_fresh_derived_spec("kirocrew-worker", None)
+    assert snap is not None
+
+    # A longer nonce, so the size alone moves the identity when both writes land in
+    # one coarse mtime tick.
+    default.write_text(json.dumps(_spec_with_creds_agent_nonce("c45a9953e7")), encoding="utf-8")
+    assert agent.default_spec_identity() != snap.identity
+
+    agent.require_unchanged_derived_spec(snap)
 
 
 def test_a_missing_default_spec_refuses_the_spawn(tmp_path, monkeypatch):
@@ -2602,7 +2668,7 @@ def test_the_snapshot_never_takes_its_fingerprint_from_the_sidecar():
     assert (
         "get_mirrored_from" not in src
     ), "the snapshot's fingerprint must be of the bytes the gate read, not a recorded value"
-    assert "_spec_fingerprint(" in src
+    assert "_surface_fingerprint(" in src
 
 
 def test_a_default_spec_that_never_settles_refuses_the_spawn(tmp_path, monkeypatch):
@@ -2984,6 +3050,8 @@ def test_the_bracketed_helper_orders_gate_send_and_check_by_consumption_point():
         raise AssertionError(f"{target} not found")
 
     assert _at("wire_registered") < _at("METHOD_SET_MODE") < _at("require_unchanged_derived_spec")
+    assert isinstance(body[-1], ast.Return)
+    assert _names([body[-1]]) == {"sent_alias"}
 
 
 def test_a_revocation_between_the_payload_build_and_activation_is_caught(tmp_path, monkeypatch):
@@ -3035,19 +3103,40 @@ def test_a_revocation_between_the_payload_build_and_activation_is_caught(tmp_pat
 
 
 def _runtime_for_spawn(monkeypatch, attempts_outcomes):
-    """A runtime whose ``_spawn_admitted`` plays back the given outcomes in order."""
+    """A runtime whose ``_spawn_admitted`` plays back the given outcomes in order.
+
+    A ``DerivedSpecStale`` outcome leaves the state the real failed-start guard
+    leaves for the post-handshake refusal -- its reap is a ``kill()``, so the child
+    is gone and the runtime marked dead -- and an attempt on a runtime still marked
+    dead fails the way the real handshake does, so a retry that skipped the revive
+    cannot pass here. Any other raised outcome stands for a refusal before a child
+    exists, which leaves nothing to reap.
+    """
     from kiro_crew.acp import runtime as runtime_mod
+    from kiro_crew.acp.session_handle import AcpRuntimeDead
     from kiro_crew.acp.types import ACP_BACKEND_KIRO
 
     rt = object.__new__(runtime_mod.AcpRuntime)
     rt._acp_backend = ACP_BACKEND_KIRO
     rt._process = None
+    rt._dead = False
+    rt._process_tree_confirmed_dead = False
+    rt._initialized = False
+    rt._session_queues = {}
+    rt._answer_tasks = set()
+    rt._scratch_dir = None
+    rt._stderr_lines = []
     calls: list[int] = []
     outcomes = list(attempts_outcomes)
 
     async def _spawn_admitted():
+        if rt._dead:
+            raise AcpRuntimeDead("runtime is dead")
         calls.append(len(calls))
         outcome = outcomes.pop(0)
+        if isinstance(outcome, agent.DerivedSpecStale):
+            rt._dead = True
+            rt._process_tree_confirmed_dead = True
         if isinstance(outcome, BaseException):
             raise outcome
 
@@ -3145,6 +3234,9 @@ class _FakeHandle:
         return self
 
     def begin_session(self, servers):
+        return None
+
+    def record_mcp_launches(self, spec, wire_servers):
         return None
 
     def queued_frame_count(self):

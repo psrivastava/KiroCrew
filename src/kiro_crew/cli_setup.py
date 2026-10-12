@@ -200,18 +200,19 @@ def _setup_electron() -> None:
         print("  ⚠️  Kiro Crew desktop app is only available on macOS.")
         return
 
+    electron_dir = _find_electron_dir()
+    if electron_dir is None:
+        print("  ⚠️  Desktop app sources not found, so there is nothing to build.")
+        print("     If you are running the packaged desktop app, you already have it.")
+        print(
+            "     To build it from source, run setup from a source checkout "
+            "or run `make desktop` there."
+        )
+        return
+
     if not shutil.which("node"):
         print("  ❌ Node.js not found — required to build the desktop app.")
         print("     Install Node.js and re-run: kirocrew setup --electron-only")
-        return
-
-    electron_dir = _find_electron_dir()
-    if electron_dir is None:
-        print("  ❌ Desktop app sources not found.")
-        print(
-            "     The desktop app is built from a source checkout — clone the "
-            "repo and run `make desktop` (or run setup from the checkout)."
-        )
         return
 
     print("  🔨 Building Kiro Crew desktop app…")
@@ -410,13 +411,38 @@ def _setup_impl(
     print("\n👻 Done! Try: kirocrew doctor && kirocrew gateway")
 
 
+def _builtin_cloud_lane_offered() -> bool:
+    """Whether the composed platform offers the built-in ``aws_ec2`` lane.
+
+    Reads the list through ``dashboard/handlers_cloud.py::_provisioners`` itself,
+    the same read and degraded-seam fallback the Set-up tab is drawn from, so the
+    wizard and the tab cannot disagree about whether this deployment offers EC2.
+    ``PlatformCompositionError`` still propagates, per ``safe_context_call``.
+    """
+    # Deferred: the dashboard handler module pulls in the cloud/dashboard graph,
+    # which only this last, optional wizard step needs.
+    from kiro_crew.dashboard.handlers_cloud import _provisioners
+    from kiro_crew.platform.interfaces import BUILTIN_PROVISIONER_ID
+
+    return any(r.id == BUILTIN_PROVISIONER_ID for r in _provisioners())
+
+
 def _maybe_setup_cloud() -> None:
     """Offer to launch KiroCrew on the user's own AWS EC2.
 
     A thin delegating step — all AWS/CloudFormation/SSM logic lives in the
     testable ``kiro_crew.cloud`` module. This just asks and hands off to the
     launcher wizard (``kirocrew cloud launch``).
+
+    Offered only while the deployment's ``remote_provisioners`` seam still
+    lists the built-in EC2 lane, the same list the dashboard's Set-up tab is
+    drawn from. An edition that withdraws that lane (a managed fleet whose
+    users must not stand up hosts in a personal account) must not have its
+    first-run wizard put the same launch in front of every new user.
+    ``kirocrew cloud launch`` itself is left reachable as the explicit path.
     """
+    if not _builtin_cloud_lane_offered():
+        return
     print("\n── Run on AWS (optional) ──\n")
     print("  Kiro Crew can run 24/7 on your own AWS EC2 instance (bring your own")
     print("  AWS account; credentials stay in the aws CLI — never stored here).")

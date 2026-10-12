@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from copy import deepcopy
 from typing import TYPE_CHECKING, Any
 
 from kiro_crew import shutdown_event
@@ -148,10 +149,11 @@ async def _record_approval_hold(svc: AutoNudgeService, slot_key: str) -> None:
     """Set *slot_key*'s approval hold durably, then announce it.
 
     Persist before publishing, the same shape as ``release_approval_hold``: the
-    flag and its start time are written under ``_lock`` and the write is AWAITED
+    flag and its start time are staged on a copy of the loop, written under
+    ``_lock``, and applied to the live loop only once the AWAITED write returns,
     before the WARNING, the ``updated`` event and the one-time ``held`` notice.
-    A write that fails restores
-    both fields, so a hold the store never accepted is never shown or acted on.
+    A write that fails leaves the live loop untouched, so a hold the store never
+    accepted is never shown or acted on -- not even during the write.
     A ``CancelledError`` from the writer arrives only after the write settled, so
     the hold is kept; only the announcement is skipped.
     """
@@ -164,16 +166,22 @@ async def _record_approval_hold(svc: AutoNudgeService, slot_key: str) -> None:
         # to settle the monitor as an ``approval_stall`` stop, so the flag is
         # still recorded for it -- with no hold time and no hold notice.
         structured = is_structured_monitor_loop(loop)
-        loop.approval_stalled = True
-        loop.approval_stalled_at = 0.0 if structured else time.time()
+        stalled_at = 0.0 if structured else time.time()
+        staged = deepcopy(loop)
+        staged.approval_stalled = True
+        staged.approval_stalled_at = stalled_at
         try:
-            await svc._write_monitor_snapshot_locked()
+            await svc._write_monitor_snapshot_locked(
+                svc._monitor_snapshot_with_replacement(loop, staged)
+            )
         except asyncio.CancelledError:
+            # The writer re-raises only after the write settled: the hold is on
+            # disk, so memory takes it too, and only the announcement is skipped.
+            loop.approval_stalled, loop.approval_stalled_at = True, stalled_at
             raise
-        except Exception:
-            loop.approval_stalled = False
-            loop.approval_stalled_at = 0.0
-            raise
+        # Only the two hold fields are applied: a lock-free writer (the
+        # turn-completion path) may have moved another field during the await.
+        loop.approval_stalled, loop.approval_stalled_at = True, stalled_at
     if structured:
         return
     logger.warning(
@@ -209,10 +217,11 @@ async def release_approval_hold(
     ``arm=False``: its own turn-complete hook arms the loop when that turn ends,
     which is the "user wins" rule ``notify_user_input`` already keeps.
 
-    Persist before publishing: the cleared hold and the moved clock are written
-    under ``_lock`` and the write is AWAITED before anything is emitted, armed or
-    reported. A write that fails restores all three fields, so the loop stays
-    held exactly as the store says. A ``CancelledError`` from the writer arrives
+    Persist before publishing: the cleared hold and the moved clock are staged on
+    a copy of the loop, written under ``_lock``, and only applied to the live loop
+    once the AWAITED write returns -- so no reader sees a release the store has
+    not accepted. A write that fails leaves the live loop untouched, held exactly
+    as the store says. A ``CancelledError`` from the writer arrives
     only after the write settled, so the release is durable and kept; the arm is
     skipped then, and the reconciler re-arms the loop, which is not held any more.
     A structured monitor never holds (its tick path does not read the flag), so
@@ -232,7 +241,6 @@ async def release_approval_hold(
         held = 0.0
         if isinstance(since, (int, float)) and not isinstance(since, bool) and 0 < since <= now:
             held = now - since
-        prior = (loop.approval_stalled, loop.approval_stalled_at, loop.created_ts)
         created = loop.created_ts
         if (
             held
@@ -240,16 +248,35 @@ async def release_approval_hold(
             and not isinstance(created, bool)
             and created > 0
         ):
-            loop.created_ts = created + held
-        loop.approval_stalled = False
-        loop.approval_stalled_at = 0.0
+            created = created + held
+        staged = deepcopy(loop)
+        staged.approval_stalled = False
+        staged.approval_stalled_at = 0.0
+        staged.created_ts = created
+        # A person-wait hold that overlaps this one credits its own span on release.
+        # Push its start forward by the overlap just credited here, so those seconds
+        # are handed back once, not twice; its time before the overlap still counts.
+        pw_since = loop.waiting_on_person_at
+        if (
+            held
+            and loop.waiting_on_person
+            and isinstance(pw_since, (int, float))
+            and not isinstance(pw_since, bool)
+            and 0 < pw_since < now
+        ):
+            pw_since += now - max(pw_since, since)
+        staged.waiting_on_person_at = pw_since
         try:
-            await self._write_monitor_snapshot_locked()
+            await self._write_monitor_snapshot_locked(
+                self._monitor_snapshot_with_replacement(loop, staged)
+            )
         except asyncio.CancelledError:
+            # Settled before the re-raise: the release is durable, so keep it.
+            loop.approval_stalled, loop.approval_stalled_at, loop.created_ts = False, 0.0, created
+            loop.waiting_on_person_at = pw_since
             raise
-        except Exception:
-            loop.approval_stalled, loop.approval_stalled_at, loop.created_ts = prior
-            raise
+        loop.approval_stalled, loop.approval_stalled_at, loop.created_ts = False, 0.0, created
+        loop.waiting_on_person_at = pw_since
     logger.warning(
         "AutoNudge: loop %s resumed after %.0fs paused for approval (%s)",
         loop.id,
@@ -268,11 +295,12 @@ async def release_approval_hold(
 def _schedule_release(svc: AutoNudgeService, slot_key: str, *, why: str, arm: bool = True) -> None:
     """Run :func:`release_approval_hold` detached, for a synchronous caller.
 
-    Supervised through ``_inflight_adds`` like the judge label and the conductor
-    wake: strongly referenced, and a failed write is logged rather than lost. A
-    plain helper rather than a service member, for the reason
-    ``_wake_bound_conductor`` gives. Never raises: the approval and message paths
-    that call it must not fail because a release could not be scheduled.
+    Supervised through ``_inflight_adds`` like the judge label: strongly referenced,
+    and a failed write is logged rather than lost. A plain helper taking *svc* rather
+    than a service member, because it is reached from call sites in this module alone
+    and binding it on the class would put a name on the service's surface that nothing
+    outside here can use. Never raises: the approval and message paths that call it
+    must not fail because a release could not be scheduled.
     """
     if not slot_key:
         return
@@ -317,6 +345,9 @@ def notify_cycle_start_failed(self: AutoNudgeService, slot_key: str) -> None:
     if not loop or not loop.active:
         return
     loop.consecutive_start_failures += 1
+    # The conductor never read the ledger on this cycle, so the person-wait hold
+    # must not treat it as seen: the next tick fires and tries again.
+    loop.ledger_seen_fp = ""
     logger.warning(
         "AutoNudge: loop %s's cycle never got a model session "
         "(%d consecutive); it will back off at %d and stand down at %d",
@@ -416,6 +447,9 @@ async def notify_cycle_failed(
         #     the cancellation propagate with the increment intact.
         prior = loop.consecutive_failed_cycles
         loop.consecutive_failed_cycles = prior + 1
+        # A failed turn read nothing, so the person-wait hold must not count its
+        # ledger as seen; in memory only -- losing it on a restart costs one turn.
+        loop.ledger_seen_fp = ""
         try:
             # ``_write_monitor_snapshot_locked`` offloads the fsyncing
             # ``_write_state`` to a worker thread and ABSORBS cancellation until
@@ -512,10 +546,6 @@ def notify_turn_complete(
     the five is stored: the rule reduces them to one boolean plus two numbers and a
     flag, and that is what the loop's record and the calibration log keep.
     """
-    # TRIGGER THREE of the crew-log wake, and it has to run BEFORE the lookup below.
-    # That lookup asks for a loop on THIS slot; a worker has none, so every early return
-    # under it is the normal case for the slot this trigger is about.
-    _wake_bound_conductor(self, slot_key)
     loop = self._find_by_slot(slot_key)
     if not loop or not loop.active:
         return
@@ -571,58 +601,30 @@ def notify_turn_complete(
     if loop.id in self._firing:
         self._rearm_pending.add(loop.id)
         return
+    if loop.id in self._pending_monitor_wake:
+        # A wake this loop OWES, and the turn it was refused by has just ended.
+        #
+        # The refusal is ordinary: ``_fire_dashboard_nudge`` declines a busy slot, so
+        # a worker reporting while its conductor is mid-turn gets its wake held. The
+        # fire path already re-owes the claim and grants the next tick a gate-free
+        # retry, but nothing brought that tick FORWARD -- this hook armed toward the
+        # loop's own deadline, so on the hours-long cadence a work-ledger watch is
+        # meant to enable the report waited out a whole interval. Measured at 14 to 30
+        # minutes on a twenty-minute loop.
+        #
+        # Delay zero rather than ``_arm_from_deadline``'s overdue beat: that beat
+        # exists so an elapsed deadline does not ambush someone mid-conversation, and
+        # the turn it protects has just finished. The retry runs the ordinary
+        # ``_timer`` body, so every terminal bound still applies and a slot that
+        # became busy again simply refuses and re-owes.
+        logger.debug(
+            "AutoNudge: loop %s has a wake owed and its turn just ended -- "
+            "retrying the delivery now rather than at its deadline",
+            loop.id,
+        )
+        self._arm_timer(loop, delay=0.0)
+        return
     self._arm_from_deadline(loop)
-
-
-def _wake_bound_conductor(svc: AutoNudgeService, slot_key: str) -> None:
-    """Pull *slot_key*'s conductor forward, if *slot_key* is a bound worker's slot.
-
-    OUTCOME-BLIND on purpose, and that is what this trigger adds over the other two. The
-    hook this sits in is called for every turn end after HOOK_EVENT_STOP, so a turn that
-    raised, a turn that produced nothing, and a turn that simply forgot to report all
-    reach it identically -- and those are exactly the endings that write no
-    ``work/recorded`` entry, so trigger one never sees them. The gate still decides
-    whether a turn is spent: a worker that reported ``progress`` and then ended its turn
-    pulls the tick forward and the probe answers quiet.
-
-    DETACHED, because this hook is synchronous and its caller is the gateway finishing a
-    turn. Supervised through ``_inflight_adds`` like the judge label above it, so the task
-    is strongly referenced and its failure is logged rather than swallowed by the garbage
-    collector. Never raises: a turn end must not fail because a push could not be
-    scheduled.
-
-    A PLAIN HELPER taking *svc*, not a service member: it is reached from exactly one
-    call site in this module, and binding it on the class would put a name on the
-    service's surface that nothing outside here can use.
-    """
-    if not slot_key:
-        return
-    try:
-        # Local, for the reason the judge import below is: ``conductor_wake`` reaches the
-        # work-ledger store, and this hook runs on every turn of every session.
-        from kiro_crew import conductor_wake
-
-        asyncio.get_running_loop()
-        task = asyncio.ensure_future(conductor_wake.fire_for_worker_slot(slot_key))
-    except RuntimeError:
-        # No running loop: a synchronous test driver or a shutdown path. Nothing to
-        # schedule onto, and the conductor's own tick still covers it.
-        return
-    except Exception:  # pragma: no cover - a turn end must not fail on this
-        logger.debug("AutoNudge: could not schedule a conductor wake for %s", slot_key)
-        return
-    svc._inflight_adds.add(task)
-
-    def _finish(t: "asyncio.Task[str]") -> None:
-        svc._inflight_adds.discard(t)
-        if not t.cancelled() and t.exception() is not None:
-            logger.debug(
-                "AutoNudge: conductor wake for %s failed",
-                slot_key,
-                exc_info=t.exception(),
-            )
-
-    task.add_done_callback(_finish)
 
 
 def notify_user_input(self: AutoNudgeService, slot_key: str, *, human: bool = False) -> None:
@@ -718,7 +720,11 @@ def _cancel_timer(self: AutoNudgeService, loop_id: str, *, drop_claims: bool = T
     # and is charged as a wake as well, counting one delivered turn under two
     # counters. That trade is deliberate: an undelivered observation is lost rather
     # than attributed to a turn that did not carry it.
-    self._pending_monitor_wake.discard(loop_id)
+    # The claim carries the wake's text, so dropping the claim drops the text with
+    # it -- which is the point of keeping them in one value. A cancelled cycle's
+    # briefs must not ride the loop's next fire: they would name items a turn
+    # nobody delivered had observed.
+    self._pending_monitor_wake.pop(loop_id, None)
     self._pending_floor_tick.discard(loop_id)
 
 

@@ -183,7 +183,6 @@ from kiro_crew.config.section_builders import (  # noqa: F401
 )
 from kiro_crew.config.sections import (  # noqa: F401
     _BOT_NAME_MAX,
-    _BOT_NAME_RE,
     _COLOR_HEX_RE,
     _CONNECT_TIMEOUT_CEILING,
     _DEFAULT_BEACON_ENDPOINT,
@@ -669,6 +668,16 @@ def read_env_text(ep: Path, encoding: str | None = None) -> str:
     return read_env_file(ep, encoding)[1]
 
 
+def undecodable_env_message(ep: Path, exc: UnicodeDecodeError) -> str:
+    """The one sentence that tells an operator *ep* is unreadable and how to fix it.
+
+    The gateway logs it through :func:`warn_undecodable_env`, and ``service
+    install`` / ``doctor`` print it where the shell cannot see that log, so every
+    surface names the same file and the same re-save.
+    """
+    return f"Cannot decode {ep} ({exc.reason}); treating it as empty. Save it as UTF-8."
+
+
 def warn_undecodable_env(ep: Path, exc: UnicodeDecodeError) -> None:
     """Log that *ep* could not be decoded and is treated as unset.
 
@@ -678,14 +687,12 @@ def warn_undecodable_env(ep: Path, exc: UnicodeDecodeError) -> None:
     if key in _warned_undecodable_env:
         return
     _warned_undecodable_env.add(key)
-    logger.warning(
-        "Cannot decode %s (%s); treating it as empty. Save it as UTF-8.",
-        ep,
-        exc.reason,
-    )
+    logger.warning("%s", undecodable_env_message(ep, exc))
 
 
-def read_env_file_credential(key: str, env_file: Path | None = None) -> str:
+def read_env_file_credential(
+    key: str, env_file: Path | None = None, *, definitive: list[bool] | None = None
+) -> str:
     """Best-effort read of one ``KEY=VALUE`` entry from the data home's ``.env``.
 
     Same line format :meth:`KiroCrewConfig.load_credentials` parses (one pair
@@ -693,15 +700,29 @@ def read_env_file_credential(key: str, env_file: Path | None = None) -> str:
     Returns ``""`` when the file is absent, unreadable or UTF-16/UTF-32 encoded —
     callers treat the credential as unset rather than failing.
 
+    ``definitive``, when given, receives ONE bool from this same read: True when
+    the file was decoded or does not exist, so an empty answer means the key is
+    not there; False when it could not be read or is UTF-16/UTF-32, so an empty
+    answer proves nothing. Any other decode error propagates, as before, and
+    records nothing.
+
     Blocking file IO: call via ``asyncio.to_thread`` from async paths.
     """
     ep = env_file if env_file is not None else env_path()
     try:
         text = read_env_text(ep)
+    except FileNotFoundError:
+        if definitive is not None:
+            definitive.append(True)
+        return ""
     except OSError:
+        if definitive is not None:
+            definitive.append(False)
         return ""
     except EnvFileWideEncodingError as exc:
         warn_undecodable_env(ep, exc)
+        if definitive is not None:
+            definitive.append(False)
         return ""
     value = ""
     for line in text.splitlines():
@@ -712,6 +733,8 @@ def read_env_file_credential(key: str, env_file: Path | None = None) -> str:
             k, v = line.split("=", 1)
             if k.strip() == key:
                 value = v.strip()
+    if definitive is not None:
+        definitive.append(True)
     return value
 
 
@@ -2644,6 +2667,9 @@ _SIDECAR_BASE_SHADOW = "base_shadow"
 #: unparseable. A cache hit carries it forward so :meth:`KiroCrewConfig.save` can
 #: refuse to publish a snapshot built without the base file.
 _SIDECAR_BASE_UNREADABLE = "base_unreadable"
+#: Whether the load that filled this cache entry found ``config.local.json`` present
+#: but unparseable, carried forward the same way for ``_overlay_unreadable``.
+_SIDECAR_OVERLAY_UNREADABLE = "overlay_unreadable"
 
 
 def _shadowed_base_sections(base: dict, overlay: dict) -> dict:
@@ -3296,6 +3322,45 @@ def _build_agent_config(agent_data: dict) -> AgentConfig:
     )
 
 
+def _load_idle_exempt_keys(raw: object) -> list[str]:
+    """Return the configured keys, stripped because the idle sweep matches them exactly.
+
+    A non-list loads as no exemptions. An over-long key is dropped rather than
+    truncated, because a truncated key could match a different session.
+    """
+    if not isinstance(raw, list):
+        return []
+
+    idle_exempt_keys: list[str] = []
+    overlong_count = 0
+    overflow_count = 0
+    for candidate in raw:
+        if not isinstance(candidate, str):
+            continue
+        key = candidate.strip()
+        if not key:
+            continue
+        if len(key) > _sections.IDLE_EXEMPT_KEY_MAX_CHARS:
+            overlong_count += 1
+            continue
+        if len(idle_exempt_keys) >= _sections.IDLE_EXEMPT_KEYS_MAX:
+            overflow_count += 1
+            continue
+        idle_exempt_keys.append(key)
+
+    if overlong_count or overflow_count:
+        logger.warning(
+            "session.idle_exempt_keys: dropped %d key(s) longer than %d characters "
+            "and %d past the %d-key limit; kept %d",
+            overlong_count,
+            _sections.IDLE_EXEMPT_KEY_MAX_CHARS,
+            overflow_count,
+            _sections.IDLE_EXEMPT_KEYS_MAX,
+            len(idle_exempt_keys),
+        )
+    return idle_exempt_keys
+
+
 def _build_session_config(session_data: dict) -> SessionConfig:
     section = _sections.SectionReader(SessionConfig, session_data)
     return SessionConfig(
@@ -3309,6 +3374,7 @@ def _build_session_config(session_data: dict) -> SessionConfig:
         timeout_secs=section.read(
             "timeout_secs", _safe_int, SESSION_TIMEOUT_MIN, SESSION_TIMEOUT_MAX
         ),
+        idle_exempt_keys=_load_idle_exempt_keys(section.get("idle_exempt_keys")),
         empty_response_auto_continue=bool(section.get("empty_response_auto_continue")),
         # RANGE-clamped like the other session ints: a hand-edited 0
         # or 999 must load as a sane budget, never disable recovery or
@@ -3383,6 +3449,15 @@ def _title_refresh_every_turns(value: object, default: int) -> int:
     return every if every == 0 else max(every, _sections.TITLE_REFRESH_EVERY_TURNS_MIN)
 
 
+def _session_folder_root_or_empty(value: object) -> str:
+    """``dashboard.session_folder_root`` as a trimmed string; "" (off) for any non-string.
+
+    A hand-edited number or list must read as "off", never as a path built from its
+    ``str()``: the value names the directory new session folders are created in.
+    """
+    return value.strip() if isinstance(value, str) else ""
+
+
 def _build_dashboard_config(_degraded: set[str], dashboard_data: dict) -> DashboardConfig:
     section = _sections.SectionReader(DashboardConfig, dashboard_data)
     return DashboardConfig(
@@ -3401,6 +3476,7 @@ def _build_dashboard_config(_degraded: set[str], dashboard_data: dict) -> Dashbo
             "qr_session_persist_across_restart", _safe_bool
         ),
         restore_window_minutes=section.get("restore_window_minutes"),
+        idle_slot_sweep_days=section.read("idle_slot_sweep_days", _safe_int, 0, 3650),
         surface_channel_sessions=section.get("surface_channel_sessions"),
         bot_name=section.get("bot_name"),
         avatar=section.get("avatar"),
@@ -3460,12 +3536,16 @@ def _build_dashboard_config(_degraded: set[str], dashboard_data: dict) -> Dashbo
         default_memory_mode=_default_memory_mode_from(section.get("default_memory_mode")),
         widget_density=section.get("widget_density"),
         use_builtin_browser=section.read("use_builtin_browser", _safe_bool),
+        browser_local_origins=_sections.coerce_browser_local_origins(
+            section.get("browser_local_origins")
+        ),
         browser_view_port=_port_or_unset(section.get("browser_view_port")),
         verbosity=_sections.normalize_verbosity(section.get("verbosity")),
         link_previews=section.read("link_previews", _safe_bool),
         tail_fork_enabled=section.get("tail_fork_enabled"),
         terminal=section.get("terminal"),
         default_project=section.get("default_project"),
+        session_folder_root=_session_folder_root_or_empty(section.get("session_folder_root")),
         theme_mode=section.get("theme_mode"),
         sso_login_flags=str(section.get("sso_login_flags")),
         theme_color=section.get("theme_color"),
@@ -3502,6 +3582,7 @@ def _build_dashboard_config(_degraded: set[str], dashboard_data: dict) -> Dashbo
             "feature_videos_cache_max_mb", _safe_float, lo=0.0
         ),
         folder_suggestions_enabled=bool(section.get("folder_suggestions_enabled")),
+        topic_tags_enabled=section.read("topic_tags_enabled", _safe_bool),
         tips_cadence_hours=section.read("tips_cadence_hours", _safe_float, lo=0.0),
         tips_snooze_hours=section.read("tips_snooze_hours", _safe_float, lo=0.0),
         tips_recency_decay=section.read("tips_recency_decay", _safe_float, lo=0.0, hi=1.0),
@@ -3861,6 +3942,12 @@ class KiroCrewConfig:
     #: :meth:`save` refuses such an instance even if the file has been repaired
     #: since, because publishing it would still replace the repaired settings.
     _base_unreadable: bool = field(default=False, repr=False, compare=False)
+
+    #: True when the load that built this instance found ``config.local.json``
+    #: present but unparseable, so nothing the overlay sets is here. Describes this
+    #: read, like ``_base_unreadable``; never serialized. ``degraded_sections`` cannot
+    #: answer this for one load: its whole-config marker lasts the process.
+    _overlay_unreadable: bool = field(default=False, repr=False, compare=False)
 
     @property
     def degraded_sections(self) -> frozenset[str]:
@@ -4652,6 +4739,10 @@ class KiroCrewConfig:
             extra_env: dict[str, str] | None = None,
             reasoning_effort_override: str | None = None,
             crew_agent: str | None = None,
+            # The backend a caller asked for explicitly (``spawn_run(backend=...)``).
+            # NAMED so it is never swallowed by the catch-all: the session would
+            # silently start on the configured default. ``None`` = no override.
+            backend_override: str | None = None,
             # Per-session opt-in for the claude backend's own permission
             # classifier. NAMED rather than left to ``**_kwargs`` on purpose: a
             # caller passing it into the catch-all would be swallowed here and
@@ -4696,8 +4787,9 @@ class KiroCrewConfig:
             # backend, and why to_acp_id is the non-claude choice, is documented
             # on that method.)
             # Per-session backend selection -- ONE call to the selection gate's
-            # per-session half (members.select_provider_backend: member-DM
-            # auto-route > configured default). The factory body carries no
+            # per-session half (members.select_provider_backend: the caller's
+            # explicit backend > member-DM auto-route > configured default). The
+            # factory body carries no
             # branching of its own, so the kiro construction path gains no
             # second check (harness-parity H3/H13); resolve_selected_backend
             # inside the helper applies the same governance/selectability gate
@@ -4711,6 +4803,7 @@ class KiroCrewConfig:
                 session_key,
                 self.agent.member_acp_backend,
                 self.agent.acp_backend,
+                backend_override=backend_override,
             )
             # Resolved BEFORE the model, and threaded into the resolution: the
             # model's namespace translation and its pin-scope check both have to
@@ -4850,6 +4943,8 @@ class ConfigDocument:
     content_digest: str | None
     #: ``config.json`` was present but unreadable or not a JSON object.
     base_unreadable: bool = False
+    #: ``config.local.json`` was present but unreadable or not a JSON object.
+    overlay_unreadable: bool = False
     #: The base document's copy of each top-level section the overlay touched.
     base_shadow: dict = field(default_factory=dict)
     #: ``config.local.json`` as this read parsed it; ``{}`` on a cache hit.
@@ -4858,6 +4953,10 @@ class ConfigDocument:
     adoptable: list[SupersededDefault] = field(default_factory=list)
     #: The 0.6.x-or-older writer stamp when the legacy ``skills.lazy_load`` rewrite is due.
     legacy_lazy_stamp: str | None = None
+    #: True when this read parsed the files, False on a cache hit or an in-memory
+    #: document. The build's advisory warnings fire only on a disk read, as
+    #: validation's do, so a cached load does not repeat them.
+    disk_read: bool = False
 
 
 def read_config_document() -> ConfigDocument:
@@ -4910,6 +5009,7 @@ def read_config_document() -> ConfigDocument:
             loaded=True,
             content_digest=content_digest,
             base_unreadable=bool(sidecar.get(_SIDECAR_BASE_UNREADABLE, False)),
+            overlay_unreadable=bool(sidecar.get(_SIDECAR_OVERLAY_UNREADABLE, False)),
             base_shadow=sidecar.get(_SIDECAR_BASE_SHADOW, {}),
         )
 
@@ -4920,6 +5020,7 @@ def read_config_document() -> ConfigDocument:
     # ``skills.lazy_load`` rewrite is due, or None.
     legacy_lazy_stamp: str | None = None
     base_unreadable = False
+    overlay_unreadable = False
     # Capture the invalidation generation BEFORE disk I/O. A successful
     # write advances it, so this read cannot repopulate pre-write data
     # after the writer clears the cache even if the filesystem's coarse
@@ -5012,10 +5113,12 @@ def read_config_document() -> ConfigDocument:
                 local_data = raw_local
             else:
                 config_source_unreadable = True
+                overlay_unreadable = True
                 logger.warning("config.local.json is not a JSON object, ignoring")
                 _mark_file_degraded(local_path)
         except (json.JSONDecodeError, OSError, UnicodeDecodeError) as e:
             config_source_unreadable = True
+            overlay_unreadable = True
             # Same rule as the base file: bytes that read whole can be named
             # whether or not they parsed.
             if read_parts[1] is None:
@@ -5051,6 +5154,7 @@ def read_config_document() -> ConfigDocument:
             loaded=False,
             content_digest=_content_digest_of(read_parts) if digestible else None,
             base_unreadable=base_unreadable,
+            overlay_unreadable=overlay_unreadable,
         )
 
     # Preserve fail-closed security semantics before advisory schema
@@ -5141,7 +5245,11 @@ def read_config_document() -> ConfigDocument:
         _store_validated_data(
             data,
             pre_read_fp,
-            {_SIDECAR_BASE_SHADOW: base_shadow, _SIDECAR_BASE_UNREADABLE: base_unreadable},
+            {
+                _SIDECAR_BASE_SHADOW: base_shadow,
+                _SIDECAR_BASE_UNREADABLE: base_unreadable,
+                _SIDECAR_OVERLAY_UNREADABLE: overlay_unreadable,
+            },
             expected_generation=read_generation,
             content_digest=content_digest,
         )
@@ -5153,10 +5261,12 @@ def read_config_document() -> ConfigDocument:
         loaded=True,
         content_digest=content_digest,
         base_unreadable=base_unreadable,
+        overlay_unreadable=overlay_unreadable,
         base_shadow=base_shadow,
         overlay=local_data,
         adoptable=adoptable,
         legacy_lazy_stamp=legacy_lazy_stamp,
+        disk_read=True,
     )
 
 
@@ -5208,6 +5318,7 @@ def build_config(
         # through so the caller can tell them apart.
         cfg = config_cls(_degraded_sections=frozenset(_OBSERVED_DEGRADED_SECTIONS))
         cfg._base_unreadable = doc.base_unreadable
+        cfg._overlay_unreadable = doc.overlay_unreadable
         if (
             DEGRADED_WHOLE_CONFIG in _OBSERVED_DEGRADED_SECTIONS
             or "dashboard" in _OBSERVED_DEGRADED_SECTIONS
@@ -5369,6 +5480,7 @@ def build_config(
                     # collapse to "" (inherit) rather than travel to the
                     # provider, where kiro-cli rejects the whole overlay.
                     reasoning_effort=coerce_effort(crew.get("reasoning_effort")),
+                    approval_mode=_sections.coerce_member_approval_mode(crew.get("approval_mode")),
                     display_name=(
                         raw_display_name
                         if isinstance(raw_display_name, str)
@@ -5394,6 +5506,7 @@ def build_config(
                     watchdog_tool_stall_hard_cap_secs=crew.read(
                         "watchdog_tool_stall_hard_cap_secs", _safe_float, lo=0.0
                     ),
+                    autocompact_pct=_crew_autocompact_pct(crew),
                     telegram_account=crew.get("telegram_account"),
                     session_color=_safe_color(crew.get("session_color")),
                     # Module-qualified on purpose: the facade's `from
@@ -5603,8 +5716,13 @@ def build_config(
     # could drift from them. Same base-not-merged view as _extra_sections
     # above, for the same reason.
     cfg._extra_keys = _resolution.capture_extra_section_keys(capture_view, cfg)
+    if doc.disk_read:
+        # The MERGED view, unlike the capture: a misspelling in either file has
+        # no effect, so either one is worth naming.
+        _resolution.warn_misspelled_section_keys(data, cfg)
 
     cfg._base_unreadable = doc.base_unreadable
+    cfg._overlay_unreadable = doc.overlay_unreadable
     return cfg
 
 
@@ -6517,6 +6635,19 @@ def member_template_id(agent_cfg: KiroCrewAgentConfig) -> str:
     return dispatch_kiro_agent(agent_cfg.kiro_agent) or "kirocrew"
 
 
+#: Agents kiro-cli ships inside its own binary. No spec file declares them in any
+#: agents directory, so no scan below can find them, yet kiro-cli launches and
+#: switches to them like any other: ``/agent kiro_planner`` (or ``/plan``) moves a
+#: session onto one. The set is what ``kiro-cli acp`` advertises in
+#: ``availableModes`` and starts as ``currentModeId`` under ``--agent``, measured
+#: against kiro-cli 2.21.1. It is NOT ``kiro-cli agent list``'s ``(Built-in)``
+#: rows: ``kiro_help`` is listed there but is not an ACP agent (``--agent
+#: kiro_help`` silently starts ``kiro_default``), and ``kiro_guide`` is the ACP
+#: one. A spec file of the same name, when one exists, is what kiro-cli loads
+#: instead; the answer here is the same name.
+KIRO_CLI_BUILTIN_AGENTS = frozenset({"kiro_default", "kiro_guide", "kiro_planner"})
+
+
 def _materialized_kiro_agent(agent_name: str | None, project_dir: str | None = None) -> str:
     """Return *agent_name* when a materialized kiro agent config declares it.
 
@@ -6575,6 +6706,10 @@ def _materialized_kiro_agent(agent_name: str | None, project_dir: str | None = N
     """
     if not agent_name:
         return ""
+    if agent_name in KIRO_CLI_BUILTIN_AGENTS:
+        # kiro-cli's own agents have no file to find (see the constant). Without
+        # this, a switch to one is recorded and then refused on the next turn.
+        return agent_name
     if _MATERIALIZED_AGENTS_READY and agent_name in _MATERIALIZED_AGENTS:
         return agent_name
     if not _MATERIALIZED_AGENTS_READY:
@@ -6992,6 +7127,36 @@ def _project_declares_agent(agent_name: str, project_dir: str) -> bool:
     except Exception:  # noqa: BLE001 — a probe failure only costs a fallback
         logger.debug("Project agent probe failed for %r", agent_name, exc_info=True)
         return False
+
+
+def _crew_autocompact_pct(crew: "_sections.SectionReader") -> float:
+    """Read one crew record's ``autocompact_pct``: 0 (inherit) or a value in range.
+
+    config.json is hand-editable, so junk and a negative value collapse to 0
+    (inherit the global) rather than crash the load. Any positive value is
+    held to the global knob's documented range, so a per-agent default can
+    neither thrash compaction (below the minimum) nor never fire (above the
+    maximum).
+    """
+    value = crew.read("autocompact_pct", _safe_float, lo=0.0, hi=AUTOCOMPACT_PCT_MAX)
+    if 0.0 < value < AUTOCOMPACT_PCT_MIN:
+        return AUTOCOMPACT_PCT_MIN
+    return value
+
+
+def crew_autocompact_pct(config: "KiroCrewConfig", crew_name: str) -> float | None:
+    """The compaction threshold crew *crew_name* declares, or ``None`` to inherit.
+
+    *crew_name* is a canonical ``config.agents`` key, the identity a session's
+    allocation resolved (:func:`resolve_crew_identity`). A name that is not a
+    crew, or a crew that leaves the field at 0, inherits the global
+    ``session.autocompact_pct``. The value is the one :func:`_crew_autocompact_pct`
+    validated at load, so this is a lookup and nothing more.
+    """
+    crew = config.agents.get(crew_name) if crew_name else None
+    if crew is None or not crew.autocompact_pct:
+        return None
+    return crew.autocompact_pct
 
 
 def resolve_crew_identity(

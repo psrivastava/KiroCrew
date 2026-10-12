@@ -38,6 +38,7 @@ from kiro_crew.acp.types import (
     STOP_CLASS_CANCELLED,
     STOP_REASON_COMPACTION_FAILED,
     STOP_REASON_REFUSAL,
+    STOP_REASON_STALE_RECOVER,
     STOP_REASON_TOOL_STALL,
     classify_stop_reason,
 )
@@ -49,6 +50,7 @@ from kiro_crew.constants import (
     STEER_NOTICE_BOUND_SECS,
 )
 from kiro_crew.deny_notice import steer_refusal_notice
+from kiro_crew.executors import run_in_tool_gate_pool
 from kiro_crew.messaging.empty_turn_copy import (
     EMPTY_TURN_NOTICE,
     EMPTY_TURN_NOTICE_AFTER_WORK,
@@ -57,6 +59,7 @@ from kiro_crew.messaging.empty_turn_copy import (
     EMPTY_TURN_NOTICE_REFUSAL,
     EMPTY_TURN_NOTICE_UNCLOSED,
     EMPTY_TURN_NOTICE_UNCLOSED_AFTER_WORK,
+    UNFINISHED_TURN_NOTICE,
 )
 from kiro_crew.messaging.renderer import (
     COMPACTION,
@@ -78,6 +81,7 @@ from kiro_crew.permission_floor import OUTCOME_REJECTED_TRANSPORT_FLOOR
 from kiro_crew.security import StreamRedactor, redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
 from kiro_crew.tool_call_title import derive_tool_call_title
+from kiro_crew.tool_gate_busy import TOOL_GATE_BUSY_REASON
 
 logger = logging.getLogger(__name__)
 
@@ -120,8 +124,12 @@ AutoApprovePredicate = Callable[[Any], bool]
 #: invokes it when a genuine directive-tool result (see ``session_directive``)
 #: carries a decoded marker; the caller injects a consumer bound to ITS OWN
 #: session key (keeping the driver channel-neutral), typically
-#: ``messaging.dispatch.build_directive_consumer``.
-DirectiveConsumer = Callable[[str, dict[str, Any]], Awaitable[None]]
+#: ``messaging.dispatch.build_directive_consumer``. The awaited value is the
+#: structured terminal-turn signal: ``True`` when the applied directive is the
+#: turn's intended terminal output (``DirectiveOutcome.ends_turn``), so the
+#: empty-turn verdict is owed no notice. Any other value (``None`` from an
+#: older consumer) means the turn is judged as usual.
+DirectiveConsumer = Callable[[str, dict[str, Any]], Awaitable[Any]]
 
 # ── Empty-turn verdict ─────────────────────────────────────────────────────
 #
@@ -148,8 +156,13 @@ DirectiveConsumer = Callable[[str, dict[str, Any]], Awaitable[None]]
 # sentences comes from :data:`_ERROR_STOP_LABELS` -- fixed copy for a closed
 # protocol value, never the wire string, which a backend authors and which
 # would otherwise reach the channel and the transcript unredacted.
-
 _ERROR_STOP_PREFIX = "error:"
+#: The stop reasons of a turn the backend never finished, which end with
+#: ``UNFINISHED_TURN_NOTICE``: the session handle's own turn ceiling
+#: (``"timeout"``) or a stale turn its probe confirmed wedged. Kept here, beside
+#: this module's other ACP stop reasons, so ``empty_turn_copy`` imports no ACP
+#: name: it is loaded while ``kiro_crew.acp.client`` initialises.
+UNFINISHED_STOP_REASONS = frozenset({"timeout", STOP_REASON_STALE_RECOVER})
 #: The ``error:``-family terminals the ACP layer itself synthesises, each with
 #: the words the notice uses for it. Any other ``error:`` reason -- the family
 #: is open on the wire -- takes the generic label, so no backend prose is ever
@@ -159,6 +172,21 @@ _ERROR_STOP_LABELS: dict[str, str] = {
     STOP_REASON_COMPACTION_FAILED: "compaction failed",
 }
 _ERROR_STOP_GENERIC_LABEL = "backend error"
+
+#: What the tool gate answers for a call no ``mc-toolgate`` worker ran inside the
+#: queue bound (``executors.run_in_tool_gate_pool``). Refused like a deny.
+_GATE_UNJUDGED = "unjudged"
+
+
+def _gate_unjudged(waited: float) -> str:
+    return _GATE_UNJUDGED
+
+
+def _is_fault_terminal(stop_reason: str) -> bool:
+    """A terminal the user must hear about even after a quiet directive: the
+    refusal, and the ``error:`` family the ACP layer synthesises. A clean
+    ``end_turn`` (or an absent reason) is not one."""
+    return stop_reason == STOP_REASON_REFUSAL or stop_reason.startswith(_ERROR_STOP_PREFIX)
 
 
 def empty_turn_notice(
@@ -522,18 +550,29 @@ class TurnDriver:
         # re-injection bookkeeping (no completion: the prompt never landed; an
         # empty reason: a normal end of turn), so the presence is kept apart.
         self.completion_observed: bool = False
+        self.unfinished_turn: bool = False
         # The empty-turn verdict of the last run() (see :func:`empty_turn_notice`):
         # the sentence the dispatcher persists as a ``notice`` row when the turn
         # closed with no assistant text, ``""`` when it produced text or the
         # user cancelled. The same sentence rides the DONE event to the renderer,
         # so the bubble and the transcript can never tell two stories.
         self.empty_turn_notice: str = ""
+        # Whether a TERMINAL directive applied this turn (the consumer answered
+        # ``True``): a quiet end the model asked for is not an empty reply, so
+        # :func:`empty_turn_notice` is not consulted. Reset per run().
+        self.terminal_directive_applied: bool = False
         # The channel-safe assistant text run() has accumulated SO FAR -- the
         # same value run() returns once the stream ends, kept current at every
         # growth site so it survives an exception. A dispatcher whose run() raised
         # reads it to record the reply the renderer was already handed (and the
         # user already saw), instead of filing the turn as if it produced nothing.
         self.partial_text: str = ""
+        # Whether the backend reported a ``completed`` compaction during the last
+        # run(). A backend that compacts its own window drops the session-start
+        # context, so the dispatcher's settle arms the one-shot re-injection flag
+        # from this. Set the moment the status arrives, so it survives an
+        # exception the way ``partial_text`` does.
+        self.compaction_completed: bool = False
         # Synchronous pre-registration shutdown gate, supplied by the dispatcher
         # as a zero-arg closure over its SessionManager and session key. It lives
         # HERE rather than at each call site because the only placement that is
@@ -547,7 +586,12 @@ class TurnDriver:
         """Drive one turn; return the accumulated channel-safe assistant text."""
         accumulated = ""
         self.empty_turn_notice = ""
+        # Set when the terminal is one of UNFINISHED_STOP_REASONS; the dispatcher
+        # reads it to book the turn a failure and reset the session.
+        self.unfinished_turn = False
+        self.terminal_directive_applied = False
         self.partial_text = ""
+        self.compaction_completed = False
         # Whether this turn did work a reply could be missing FROM: a tool call
         # or a reasoning chunk. Decides between the two end-of-turn notices; a
         # replayed message would re-run what these already did.
@@ -792,8 +836,21 @@ class TurnDriver:
                 # overridden by auto-approve, per-session Trust, or YOLO
                 # (mirrors native handle_message's hooks.on_tool_call gate).
                 if self.tool_gate is not None:
-                    _gate = self.tool_gate(event)
-                    if _gate == "deny":
+                    # Off the loop: the gate is ``hooks.on_tool_call``, whose path
+                    # tier waits on the resolver child (see
+                    # ``executors.run_in_tool_gate_pool``), on the dedicated
+                    # ``mc-toolgate`` pool. Same verdict, and the gate's
+                    # ``last_deny_reason`` is read only after it returns. A call
+                    # no gate worker ran answers ``_GATE_UNJUDGED``: refused.
+                    _gate = await run_in_tool_gate_pool(
+                        self.tool_gate, event, on_queue_timeout=_gate_unjudged
+                    )
+                    if _gate in ("deny", _GATE_UNJUDGED):
+                        _audit_reason = (
+                            "reason=gate_unjudged"
+                            if _gate == _GATE_UNJUDGED
+                            else "reason=hook_deny"
+                        )
                         sel().log_api_access(
                             caller="turn_driver",
                             operation="tool_permission",
@@ -801,7 +858,7 @@ class TurnDriver:
                             source="messaging",
                             resources=(
                                 f"request_id={event.request_id} "
-                                f"mode={self.approval_mode} reason=hook_deny"
+                                f"mode={self.approval_mode} {_audit_reason}"
                             ),
                         )
                         # The gate judged the call itself: a policy verdict.
@@ -809,10 +866,16 @@ class TurnDriver:
                         # the hook's reason on itself (``last_deny_reason``); a
                         # plain callable has none, and the notice then names
                         # the gate rather than inventing a rule.
+                        if _gate == _GATE_UNJUDGED:
+                            _deny_reason = TOOL_GATE_BUSY_REASON
+                        else:
+                            _deny_reason = (
+                                getattr(self.tool_gate, "last_deny_reason", "")
+                                or "blocked by the PreToolUse security gate"
+                            )
                         await self._steer_host_deny(
                             event,
-                            getattr(self.tool_gate, "last_deny_reason", "")
-                            or "blocked by the PreToolUse security gate",
+                            _deny_reason,
                             cause=DENY_CAUSE_POLICY,
                             audited=True,
                         )
@@ -959,6 +1022,9 @@ class TurnDriver:
                     resources=f"request_id={event.request_id} mode={self.approval_mode}",
                 )
             elif kind == EVENT_COMPACTION_STATUS:
+                # Before the dispatch, so a renderer that raises cannot lose it.
+                if event.text == "completed":
+                    self.compaction_completed = True
                 await self.renderer.dispatch(
                     OutputEvent(kind=COMPACTION, context_usage_pct=event.context_usage_pct)
                 )
@@ -992,13 +1058,34 @@ class TurnDriver:
                     await self.renderer.dispatch(OutputEvent(kind=STEER_CONSUMED))
                 pending_steer_events = 0
                 # After the flushes: ``accumulated`` is final only now, and the
-                # verdict must read the same text the renderer was handed.
-                self.empty_turn_notice = empty_turn_notice(
-                    accumulated,
-                    completed=True,
-                    stop_reason=event.stop_reason or "",
-                    productive=productive,
+                # verdict must read the same text the renderer was handed. A
+                # turn that ended on a terminal directive AND closed cleanly
+                # owes no verdict: the quiet end IS the reply. A refusal or an
+                # ``error:``-family terminal after the directive is a fault the
+                # user still has to hear about, so those keep their notice.
+                self.empty_turn_notice = (
+                    ""
+                    if self.terminal_directive_applied
+                    and not _is_fault_terminal(event.stop_reason or "")
+                    else empty_turn_notice(
+                        accumulated,
+                        completed=True,
+                        stop_reason=event.stop_reason or "",
+                        productive=productive,
+                    )
                 )
+                if (event.stop_reason or "") in UNFINISHED_STOP_REASONS:
+                    # A turn the backend never finished: whatever streamed is a
+                    # partial answer, not the reply. The notice goes out as the
+                    # turn's last text, so every renderer shows it after the
+                    # partial text (or alone) the same way, and the textless
+                    # verdict above is not owed on top of it.
+                    self.unfinished_turn = True
+                    self.empty_turn_notice = ""
+                    separator = "\n\n" if accumulated.strip() else ""
+                    await self.renderer.dispatch(
+                        OutputEvent(kind=TEXT_CHUNK, text=separator + UNFINISHED_TURN_NOTICE)
+                    )
                 await self.renderer.dispatch(
                     OutputEvent(
                         kind=DONE, stop_reason=event.stop_reason, notice=self.empty_turn_notice
@@ -1143,11 +1230,14 @@ class TurnDriver:
         if consumed is not None and event.tool_call_id:
             consumed.add(event.tool_call_id)
         try:
-            await consumer(tool, args)
+            applied = await consumer(tool, args)
         except Exception:
             # The consumer is injected code applying a side effect; a failure
             # there must never abort the rest of the turn's stream.
             logger.warning("session-directive consumer failed for %r", tool, exc_info=True)
+            return
+        if applied is True:
+            self.terminal_directive_applied = True
 
     async def _steer_deny_cause(self, event: Any) -> None:
         """Explain a host-caused denial to the model before the reject goes out.

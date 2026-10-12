@@ -141,6 +141,7 @@ _HISTORY_CORE_VERBS: frozenset[str] = frozenset(
         "@kirocrew-core/send_message",
         "@kirocrew-core/send_notification",
         "@kirocrew-core/ask_question",
+        "@kirocrew-core/nothing_to_do",
     }
 )
 # The dashboard verbs every conductor ships: the folder/session reads and creates,
@@ -178,7 +179,7 @@ _SHIPPED_GRANT_HISTORY: dict[str, frozenset[str]] = {
     "kirocrew-conductor": (
         frozenset({"session", "report", "tool_search", "@kirocrew-core"})
         | _HISTORY_CORE_VERBS
-        | {"@kirocrew-core/select_crew"}
+        | {"@kirocrew-core/select_crew", "@kirocrew-core/reset_conversation"}
         | _HISTORY_DASHBOARD_VERBS
         | {"@kirocrew-dashboard/chat_folder_file_self"}
         | _HISTORY_WORK_VERBS
@@ -187,7 +188,7 @@ _SHIPPED_GRANT_HISTORY: dict[str, frozenset[str]] = {
     "kirocrew-ledger-conductor": (
         frozenset({"session", "report", "tool_search"})
         | _HISTORY_CORE_VERBS
-        | {"@kirocrew-core/select_crew"}
+        | {"@kirocrew-core/select_crew", "@kirocrew-core/reset_conversation"}
         | _HISTORY_DASHBOARD_VERBS
         | {"@kirocrew-dashboard/chat_folder_file_self"}
         | _HISTORY_WORK_VERBS

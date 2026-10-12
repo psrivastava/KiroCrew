@@ -425,7 +425,10 @@ caller treats ``""`` as "no push target", so each refusal below fails closed.
    differ, or ``target_url`` is missing or does not validate, there is no push target.
 3. **Local paths stay allowed.** ``/tmp/x.git`` and ``file://`` have no network host to
    redirect to; they are what the app's own tests push to, and a local bare repo is a
-   legitimate offline setup.
+   legitimate offline setup. On Windows a drive path (``C:\work\repo.git`` or
+   ``C:/work/repo.git``) is local too, even though ``urlparse`` reads the drive letter as a
+   scheme. Elsewhere the same text stays refused, because git on POSIX parses ``C:path``
+   as scp-like ssh to a host named ``C``.
 
 With no ``origin_url``, the legacy ``target_url`` is re-validated and its rebuilt clone URL
 is used. The security guidance on untrusted URL destinations asks for exactly this:
@@ -434,6 +437,7 @@ allowlist the destination rather than trust persisted input.
 **Pinned invariants.**
 
 - `resolve_origin_url` host-allowlists a stored `origin_url` (exact host, no `http://`/`git://`, no sentinel); local paths stay allowed. (D-57)
+- A Windows drive path is a local `origin_url` only when running on Windows; on POSIX the same text is ssh to a one-letter host and stays refused (`test_a_drive_shaped_origin_stays_refused_where_git_reads_it_as_ssh`).
 - A network `origin_url` must name the same `owner/repo` as the validated `target_url` (`_remote_slug`); a mismatch or an invalid `target_url` leaves no push target (`test_origin_url_wins_when_present`). (D-138)
 
 ### Why tool approval is one-shot and a queued change is not "filed"
@@ -732,6 +736,7 @@ rather than starting two threads and hoping, so it is deterministic.
 - `POST /setup-clone` re-checks `_run_is_active()` inside `clone_lock` and answers 409 `run_in_progress`. (D-95)
 - `PUT /config` takes `clone_lock` and re-checks `_run_is_active()` inside it; a structural test asserts both workspace-mutating handlers do. (D-96)
 - The draft and commit routes re-check the run status inside `clone_lock`; a structural guard asserts all four clone-mutating handlers do. (D-115)
+- `POST /run` admits under `app_lifecycle_lock` and answers 403 `app_disabled` when `is_app_enabled` is false at admission; otherwise it records `RunSupervisor.stop_seq()` and passes it to `start` as `admitted_at`, which `start` re-checks after `_build_driver` and raises `RuntimeError` ("the run was stopped before it started", mapped to 409 `session_conflict`) when a `stop` or the disable hook landed meanwhile, so a run cannot launch into an app disabled or stopped while its driver was being built (`test_run_start_honors_stop`, `test_start_is_refused_once_the_app_is_disabled`).
 
 ### Why the manual draft path materializes its own diff
 
@@ -968,6 +973,7 @@ attributes pin, and a structural test enumerates the helpers that must.
 - `clone_setup.checkout_branch` routes through the shared `git_safety` config and pin. (D-129)
 - `proposer._capture_diff` calls `require_pinned` first, and the structural helper list includes it (`test_every_host_side_git_helper_injects_the_safe_config`). (D-132)
 - Host-side `git` decodes output leniently (`errors="replace"`), so a non-UTF-8 byte in a changed file cannot kill a watcher. (D-142)
+- Every host-side git call also disables git's config-defined hooks (`hook.<name>.command`, git 2.54+), emitting `-c hook.<name>.enabled=false` for each `hook.<name>.*` git would read in the worktree and every initialized submodule (`git_safety.hook_off_args`, which delegates to `git_config_hooks.config_hook_disable_args`), because `core.hooksPath=<devnull>` moves only the hook directory and does not reach a config-defined hook whose name the repository chooses. The same call pins submodule recursion off (`submodule.recurse=false`, `fetch.recurseSubmodules=false`, `_SUBMODULE_RECURSION_PINS`) so a recursive fetch or checkout cannot read an uninitialized submodule's config, and it fails closed (`ConfigHookScanError` to `GitSafetyError`) when the hook names cannot be listed safely.
 
 ### Gate and measurement invariants
 
@@ -1098,6 +1104,10 @@ Three tiers, each where it fits:
    Stop and timeout cancel the active assignment and release its session.
    Deadline errors use the existing `timeout after Ns` contract so bug and
    performance authoring retain completed edits for the deterministic gate.
+   A turn the backend ends unfinished (stop reason `timeout` or
+   `stale_recover`, or a stream that ends with no turn end) returns `ok=False`
+   with an error that begins `the backend did not finish the turn`; authoring
+   reads it the same way and retains completed edits.
    Per-role provider-reported USD totals feed the existing combined run budget.
    Kiro credit usage is not converted to dollars; the USD cap does not bound
    credit spend. Cycle, time and tool-call limits still apply. The deterministic

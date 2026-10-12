@@ -23,11 +23,13 @@ from unittest.mock import AsyncMock
 import pytest
 
 from kiro_crew.acp.types import (
+    EVENT_COMPACTION_STATUS,
     EVENT_COMPLETE,
     EVENT_PERMISSION_REQUEST,
     EVENT_TEXT_CHUNK,
     STOP_REASON_CANCELLED,
     STOP_REASON_END_TURN,
+    STOP_REASON_STALE_RECOVER,
 )
 from kiro_crew.messaging.link import canonical_key
 from kiro_crew.session import BACKGROUND_KEY
@@ -269,6 +271,113 @@ class TestTransportBookkeepingIsolation:
         )
         # Turn recorded success once; the audit failure was swallowed.
         assert calls == {"success": 1, "failure": 0}
+
+
+class _VerdictSessions(FakeSessions):
+    """Books the turn's verdict, its resets and its context check in one ledger.
+
+    ``breaker_trips`` makes ``record_failure`` answer as the real breaker does at
+    its threshold: it resets the session itself and returns True. Each reset ends
+    the runtime that is live, and a same-key message claims a successor while the
+    reset is awaited.
+    """
+
+    def __init__(self, provider, *, breaker_trips=False):
+        super().__init__(provider)
+        self.breaker_trips = breaker_trips
+        self.ledger: list[str] = []
+        self.runtimes = ["first"]
+        self.killed: list[str] = []
+
+    def record_success(self, session_key):
+        self.ledger.append("success")
+
+    async def record_failure(self, session_key):
+        self.ledger.append("failure")
+        if self.breaker_trips:
+            await self.reset(session_key)
+            return True
+        return False
+
+    async def reset(self, session_key):
+        self.ledger.append("reset")
+        self.killed.append(self.runtimes[-1])
+        self.runtimes.append(f"successor {len(self.runtimes)}")
+
+    def check_context_usage(self, key, provider):
+        self.ledger.append("context_check")
+        return 0.0
+
+
+class TestTransportUnfinishedTurn:
+    """A turn the backend never finished is a failure on this path too, and resets.
+
+    ``TurnDriver.run`` follows the partial text with the notice that the next
+    message starts the agent again, on every path that drives it. This dispatcher
+    makes that true: it books a failure and resets the session, once.
+    """
+
+    def _run(self, monkeypatch, stop_reason, *, breaker_trips=False):
+        monkeypatch.setattr(transport_dispatch, "_get_default_agent", lambda: "kirocrew")
+        monkeypatch.setattr(
+            transport_dispatch,
+            "_hydrate_thread_overrides",
+            AsyncMock(return_value=None),
+        )
+        monkeypatch.setattr(transport_dispatch, "_hydrate_conv_flags", lambda *a, **k: None)
+        monkeypatch.setattr(transport_dispatch, "_thread_agents", {})
+        slack = RecordingSlackClient()
+        sessions = _VerdictSessions(
+            ScriptedProvider(
+                [
+                    make_event(EVENT_TEXT_CHUNK, text="half an answer"),
+                    make_event(EVENT_COMPLETE, stop_reason=stop_reason),
+                ]
+            ),
+            breaker_trips=breaker_trips,
+        )
+        asyncio.run(
+            transport_dispatch.handle_message_transport(
+                slack=slack,
+                sessions=sessions,
+                channel="C1",
+                text="hello",
+                thread_ts=None,
+                msg_ts=_MSG_TS,
+                user_id="U_OWNER",
+                context_builder=None,
+                conversation_log=None,
+            )
+        )
+        return sessions, slack
+
+    @pytest.mark.parametrize("stop_reason", ["timeout", STOP_REASON_STALE_RECOVER])
+    def test_an_unfinished_turn_is_a_failure_and_resets_the_session(self, monkeypatch, stop_reason):
+        sessions, slack = self._run(monkeypatch, stop_reason)
+        shown = "\n".join(str(v) for (_m, kw) in slack.transcript for v in kw.values())
+        assert "did not finish its answer" in shown, shown
+        # No success, one failure, one reset, and no context check on the runtime
+        # the reset replaced.
+        assert sessions.ledger == ["failure", "reset"]
+        assert sessions.killed == ["first"]
+
+    @pytest.mark.parametrize("stop_reason", ["timeout", STOP_REASON_STALE_RECOVER])
+    def test_at_the_breaker_threshold_an_unfinished_turn_resets_once(
+        self, monkeypatch, stop_reason
+    ):
+        """The failure that trips the breaker resets the session inside
+        ``record_failure``. A successor a same-key message started during that reset
+        is the live runtime afterwards, so the turn must not reset it again."""
+        sessions, _slack = self._run(monkeypatch, stop_reason, breaker_trips=True)
+        assert "failure" in sessions.ledger and "success" not in sessions.ledger, sessions.ledger
+        killed = sessions.killed
+        assert killed == ["first"], f"the dispatcher reset again after the breaker did: {killed}"
+        assert sessions.ledger == ["failure", "reset"]
+
+    def test_a_finished_turn_is_a_success_and_keeps_the_session(self, monkeypatch):
+        sessions, _slack = self._run(monkeypatch, STOP_REASON_END_TURN)
+        assert sessions.ledger == ["success", "context_check"]
+        assert sessions.killed == []
 
 
 # ── Keyword commands on the transport path (spawn/run/cron/sessions) ──
@@ -812,6 +921,45 @@ class TestTransportCompactionReinjection:
         self._run(sessions, cb)
         assert cb.captured.get("needs_reinjection") is True
         assert failures == [canonical_key(_MSG_TS)]
+        assert ledger["marks"] == 1 and ledger["armed"] is True
+
+    @pytest.mark.parametrize(("status", "marks"), [("completed", 1), ("failed", 0)])
+    def test_a_backend_compaction_arms_the_flag_for_the_next_turn(self, monkeypatch, status, marks):
+        # The backend compacted its own window mid-turn: the session-start context
+        # is gone even though this turn landed, so the next turn must send it.
+        self._prep(monkeypatch)
+        sessions = _CapturingSessions(
+            ScriptedProvider(
+                [
+                    make_event(EVENT_TEXT_CHUNK, text="hi"),
+                    make_event(EVENT_COMPACTION_STATUS, text=status),
+                    make_event(EVENT_COMPLETE, stop_reason=STOP_REASON_END_TURN),
+                ]
+            )
+        )
+        ledger = _arm_reinjection(sessions)
+        ledger["armed"] = False
+        self._run(sessions, _CapturingCtxBuilder())
+        assert ledger["marks"] == marks and ledger["armed"] is bool(marks)
+
+    def test_a_backend_compaction_arms_the_flag_when_the_turn_then_dies(self, monkeypatch):
+        self._prep(monkeypatch)
+
+        class _CompactThenDie(ScriptedProvider):
+            async def stream(self, message):
+                self.stream_calls += 1
+                yield make_event(EVENT_COMPACTION_STATUS, text="completed")
+                raise RuntimeError("backend died after compacting")
+
+        sessions = _CapturingSessions(_CompactThenDie([]))
+        ledger = _arm_reinjection(sessions)
+        ledger["armed"] = False
+
+        async def _record_failure(key):
+            return None
+
+        sessions.record_failure = _record_failure
+        self._run(sessions, _CapturingCtxBuilder())
         assert ledger["marks"] == 1 and ledger["armed"] is True
 
 

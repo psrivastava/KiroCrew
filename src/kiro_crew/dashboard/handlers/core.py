@@ -33,6 +33,8 @@ from kiro_crew.config.loader import (
     _VALID_STT_PROVIDERS,
     AUTOCOMPACT_PCT_MAX,
     AUTOCOMPACT_PCT_MIN,
+    CHAT_TURN_TIMEOUT_MAX,
+    CHAT_TURN_TIMEOUT_MIN,
     COMPLETION_KEEP_CHARS_MIN,
     DEDUP_EVERY_N_SWEEPS_MAX,
     EMBED_RATE_LIMIT_MAX,
@@ -57,19 +59,24 @@ from kiro_crew.config.loader import (
     ConfigReadError,
     ConfigWriteRefused,
     KiroCrewConfig,
+    _clamp_compact_wait_secs,
     coerce_dict_section,
     config_path,
     update_config_locked,
 )
 from kiro_crew.config.sections import (
+    COMPACT_WAIT_SECS_MAX,
+    COMPACT_WAIT_SECS_MIN,
     DECISION_BUCKET_MAX,
     DECISION_BUCKET_MIN,
     DECISION_MODEL_ROUTE_TIERS,
     FOLDER_SORT_MODES,
     JUDGE_PROVIDERS,
     STT_LANGUAGE_AUTO,
+    TITLE_REFRESH_EVERY_TURNS_MAX,
     transcribe_vocabulary_name,
 )
+from kiro_crew.config.superseded_defaults import ack_explicit_write
 from kiro_crew.context_management import RESULT_FILE_MAX_BYTES
 from kiro_crew.dashboard.chat_utils import drained_to_thread, run_config_write
 from kiro_crew.dashboard.handlers._shared import (
@@ -1363,7 +1370,7 @@ AUTO_FETCH_BUNDLED = "bundled"
 
 def _ffmpeg_auto_fetch() -> str:
     """Whether this host's decoder can be fetched, and if not, why not."""
-    if platform_compat.is_bundled_interpreter():
+    if stt_decoder.bundle_carries_decoder():
         return AUTO_FETCH_BUNDLED
     if stt_decoder.artifact_for() is None:
         return AUTO_FETCH_UNSUPPORTED
@@ -1890,7 +1897,7 @@ def _stt_prereq_commands(provider: str = "local") -> list[str]:
         command = pip_extra_install_command(extra)
         if command:
             cmds.append(command)
-    if not platform_compat.is_bundled_interpreter():
+    if not stt_decoder.bundle_carries_decoder():
         cmds.extend(_ffmpeg_install_commands())
     return cmds
 
@@ -2654,6 +2661,18 @@ def _selectable_acp_backends() -> list[str]:
     return selectable_backend_values()
 
 
+# The grammar of every model PIN a Settings picker writes and `_validate_role_model`
+# then checks against the account's entitlement. The pickers list the advertised
+# model names, which OpenCode spells `provider/model`, so a pin accepts a bare id
+# OR slash-joined segments; the empty value (INHERIT / disabled, per key) still
+# matches. Malformed segments (`a//b`, `/a`, `a/`) and shell metacharacters are
+# refused. One constant so a picker cannot offer an id a sibling pin refuses.
+_MODEL_PIN_PATTERN = (
+    r"(?:[A-Za-z0-9][A-Za-z0-9._\-\[\]]*|[A-Za-z0-9][A-Za-z0-9._\-]*"
+    r"(?:/[A-Za-z0-9][A-Za-z0-9._\-]*)+)?\Z"
+)
+
+
 _EDITABLE_CONFIG: dict[str, dict] = {
     "agent.provider": {"type": "enum", "values": ["acp"]},
     # Which ACP agent drives a session: "" = kiro-cli, "kas" = kiro-agent.
@@ -2668,25 +2687,27 @@ _EDITABLE_CONFIG: dict[str, dict] = {
     # fixed list: the real vocabulary is whatever the live kiro-cli advertises
     # (/api/models spawns it to find out), and it spans both canonical registry
     # keys ("opus-4.8-1m") and kiro's own ids ("claude-opus-4.8"). So this is a
-    # grammar check instead — model-id charset only, no separators or shell
-    # metacharacters — and an unknown-but-well-formed id is rejected downstream
-    # by kiro itself rather than silently accepted here. "auto"/"" = defer to
-    # the agent config / kiro's own default.
-    "agent.model": {"type": "str", "max_len": 64, "pattern": r"^[A-Za-z0-9._\-\[\]]*$"},
-    # Per-task-class model overrides. Same grammar as agent.model (the real
-    # vocabulary is whatever the backend advertises). "" / "auto" defers to the
-    # chat default. `validate_fn` additionally rejects a well-formed id the
-    # active provider or the account's entitlement cannot honor.
+    # grammar check instead — `_MODEL_PIN_PATTERN`, the grammar every model pin
+    # shares, since the Settings → Chat picker lists the same advertised names
+    # (provider-qualified on OpenCode) — and an unknown-but-well-formed id is
+    # rejected downstream by kiro itself rather than silently accepted here.
+    # "auto"/"" = defer to the agent config / kiro's own default.
+    "agent.model": {"type": "str", "max_len": 64, "pattern": _MODEL_PIN_PATTERN},
+    # Per-task-class model overrides. The model-pin grammar (the real
+    # vocabulary is whatever the backend advertises, provider-qualified on
+    # OpenCode). "" / "auto" defers to the chat default. `validate_fn`
+    # additionally rejects a well-formed id the active provider or the
+    # account's entitlement cannot honor.
     "agent.role_models.background": {
         "type": "str",
         "max_len": 64,
-        "pattern": r"^[A-Za-z0-9._\-\[\]]*$",
+        "pattern": _MODEL_PIN_PATTERN,
         "validate_fn": _validate_role_model,
     },
     "agent.role_models.subagent": {
         "type": "str",
         "max_len": 64,
-        "pattern": r"^[A-Za-z0-9._\-\[\]]*$",
+        "pattern": _MODEL_PIN_PATTERN,
         "validate_fn": _validate_role_model,
     },
     # Throttle-exhaustion fallback model. Single value: "auto" (default) defers
@@ -2697,7 +2718,7 @@ _EDITABLE_CONFIG: dict[str, dict] = {
     "agent.fallback_model": {
         "type": "str",
         "max_len": 64,
-        "pattern": r"^[A-Za-z0-9._\-\[\]]*$",
+        "pattern": _MODEL_PIN_PATTERN,
         "validate_fn": _validate_role_model,
     },
     # Content-filter (refusal) fallback model. Single value: "" (default)
@@ -2708,7 +2729,7 @@ _EDITABLE_CONFIG: dict[str, dict] = {
     "agent.refusal_fallback_model": {
         "type": "str",
         "max_len": 64,
-        "pattern": r"^[A-Za-z0-9._\-\[\]]*$",
+        "pattern": _MODEL_PIN_PATTERN,
         "validate_fn": _validate_role_model,
     },
     "agent.reasoning_effort": {"type": "enum", "values": ["", *EFFORT_LEVELS]},
@@ -2743,6 +2764,13 @@ _EDITABLE_CONFIG: dict[str, dict] = {
         "min": SOFT_STOP_BUDGET_MIN,
         "max": SOFT_STOP_BUDGET_MAX,
     },
+    # Same bounds as the load-time clamp, so Settings cannot save a ceiling the
+    # loader would then rewrite. Read on every turn, so the next turn follows it.
+    "agent.chat_turn_timeout_secs": {
+        "type": "int",
+        "min": CHAT_TURN_TIMEOUT_MIN,
+        "max": CHAT_TURN_TIMEOUT_MAX,
+    },
     "session.timeout_secs": {"type": "int", "min": SESSION_TIMEOUT_MIN, "max": SESSION_TIMEOUT_MAX},
     # Range shared with the load-time clamp in config/loader.py — one constant
     # pair, so the write gate and the load path cannot drift.
@@ -2750,6 +2778,17 @@ _EDITABLE_CONFIG: dict[str, dict] = {
         "type": "float",
         "min": AUTOCOMPACT_PCT_MIN,
         "max": AUTOCOMPACT_PCT_MAX,
+    },
+    # ``0`` (the built-in budget) or 60-3600 s. Not one contiguous range, so the
+    # write CLAMPS through the load path's own coercion instead of rejecting:
+    # the stored value is exactly what a load of it would produce, and the
+    # response's ``clamp_notice`` lets the Settings row say what was saved.
+    # ``min``/``max`` are the positive band, reported in that notice.
+    "session.compact_wait_secs": {
+        "type": "float",
+        "min": COMPACT_WAIT_SECS_MIN,
+        "max": COMPACT_WAIT_SECS_MAX,
+        "clamp_fn": lambda v: _clamp_compact_wait_secs(v, 0.0),
     },
     "session.pool_size": {"type": "int", "min": 0, "max": 10},
     "session.pool_agent": {"type": "str", "values_fn": _agent_values},
@@ -2776,6 +2815,17 @@ _EDITABLE_CONFIG: dict[str, dict] = {
         "type": "int",
         "min": RECENT_TINT_COUNT_MIN,
         "max": RECENT_TINT_COUNT_MAX,
+    },
+    # Auto-title refresh cadence (Settings → Chat → Sessions). The gate admits
+    # the loader's whole domain, 0 (the built-in schedule) through MAX, and the
+    # loader raises a stored 1-3 to MIN, the same as it does for a value
+    # `kirocrew config set` wrote. The row reads back the LOADED value, so it
+    # shows the cadence that runs. chat_title reads the key on every turn, so a
+    # save applies from the next turn with no restart.
+    "dashboard.title_refresh_every_turns": {
+        "type": "int",
+        "min": 0,
+        "max": TITLE_REFRESH_EVERY_TURNS_MAX,
     },
     # The sidebar's folder sort mode. A view preference the sidebar menu writes and
     # the kirocrew-dashboard MCP server reads back, so the two draw the tree in
@@ -2975,15 +3025,15 @@ _EDITABLE_CONFIG: dict[str, dict] = {
 # so the masked GET returns a sentinel for it. The same entitlement validation as
 # the `agent.role_models.*` pins next to it, because the vocabulary is identically
 # unknowable up front: `""` INHERITS (the turn keeps its session's model) and no
-# concrete id is named here. The grammar is wider: a tier also accepts
-# `provider/model` ids, while a role_models pin stays one segment.
+# concrete id is named here. The grammar is `_MODEL_PIN_PATTERN`, shared with the
+# role-model and fallback pins.
 for _tier in DECISION_MODEL_ROUTE_TIERS:
     _EDITABLE_CONFIG[f"decisions.model_route.{_tier}"] = {
         "type": "str",
         "max_len": 64,
         # OpenCode's picker advertises provider/model ids. Allow those while
         # retaining the empty INHERIT value and rejecting malformed segments.
-        "pattern": r"(?:[A-Za-z0-9][A-Za-z0-9._\-\[\]]*|[A-Za-z0-9][A-Za-z0-9._\-]*(?:/[A-Za-z0-9][A-Za-z0-9._\-]*)+)?\Z",
+        "pattern": _MODEL_PIN_PATTERN,
         "validate_fn": _validate_role_model,
     }
 
@@ -2997,11 +3047,14 @@ for _tier in DECISION_MODEL_ROUTE_TIERS:
 # its own consent scope, not by either of these keys.
 #
 # ``provider`` is a closed enum, so a typo is a refusal rather than a silently
-# different judge. ``llm_model`` takes the same grammar and the same entitlement
-# validation as the ``agent.role_models.*`` pins and the ``decisions.model_route``
-# tiers, because the vocabulary is identically unknowable up front: the id must be
-# one the provider advertises to this account, and ``JUDGE_MODEL_DEFAULT`` INHERITS
-# (the judge keeps the model its agent already resolves).
+# different judge. ``llm_model`` takes the same entitlement validation as the
+# ``agent.role_models.*`` pins and the ``decisions.model_route`` tiers, because the
+# vocabulary is identically unknowable up front: the id must be one the provider
+# advertises to this account, and ``JUDGE_MODEL_DEFAULT`` INHERITS (the judge keeps
+# the model its agent already resolves). Its grammar stays the bare id, NOT
+# ``_MODEL_PIN_PATTERN``: the decision gate scrubs any model that fails
+# ``decisions.types.is_model_id`` (no ``/``), so a saved ``provider/model`` pin
+# would never reach the judge.
 _EDITABLE_CONFIG["decisions.nudge_wake.provider"] = {
     "type": "enum",
     "values": list(JUDGE_PROVIDERS),
@@ -3100,6 +3153,7 @@ async def api_kirocrew_config_patch(request: web.Request) -> web.Response:
 
     path_key: str = body.get("path", "")
     value: Any = body.get("value")
+    clamp_notice: dict | None = None
 
     spec = _EDITABLE_CONFIG.get(path_key)
     if not spec:
@@ -3127,7 +3181,8 @@ async def api_kirocrew_config_patch(request: web.Request) -> web.Response:
     elif spec["type"] == "int":
         try:
             value = int(value)
-        except (TypeError, ValueError):
+        # int() raises OverflowError on a non-finite float, which aiohttp's json.loads accepts.
+        except (TypeError, ValueError, OverflowError):
             return _deny("must be an integer", f"{path_key}={value}")
         lo, hi = spec.get("min", 0), spec.get("max", 999999)
         if value < lo or value > hi:
@@ -3136,6 +3191,10 @@ async def api_kirocrew_config_patch(request: web.Request) -> web.Response:
         if not isinstance(value, bool):
             return _deny("must be a boolean", f"{path_key}={value}")
     elif spec["type"] == "float":
+        clamp_fn = spec.get("clamp_fn")
+        if clamp_fn is not None and isinstance(value, bool):
+            # bool is an int subclass: `true` must not save as a 1 s budget.
+            return _deny("must be a number", f"{path_key}={value}")
         try:
             value = float(value)
         except (TypeError, ValueError):
@@ -3143,7 +3202,18 @@ async def api_kirocrew_config_patch(request: web.Request) -> web.Response:
         if not math.isfinite(value):
             return _deny("must be a finite number", f"{path_key}={value}")
         lo, hi = spec.get("min", 0.0), spec.get("max", 999999.0)
-        if value < lo or value > hi:
+        if clamp_fn is not None:
+            stored = float(clamp_fn(value))
+            if stored != value:
+                clamp_notice = {
+                    "path": path_key,
+                    "requested": value,
+                    "stored": stored,
+                    "min": float(lo),
+                    "max": float(hi),
+                }
+            value = stored
+        elif value < lo or value > hi:
             return _deny(f"must be between {lo} and {hi}", f"{path_key}={value}")
     elif spec["type"] == "str":
         if not isinstance(value, str):
@@ -3372,6 +3442,12 @@ async def api_kirocrew_config_patch(request: web.Request) -> web.Response:
                     raise ValueError(f"config section '{part}' is not an object")
                 section = nxt
             section[parts[-1]] = value
+            # Saving the old default of an auto-adopting superseded-default row
+            # (a 7200 turn limit) is an explicit choice. Ack it here, under the
+            # config lock and before the write, so the reload this write triggers
+            # does not adopt it away. A failed ack raises OSError and aborts the
+            # write, rather than saving a value the next load would delete.
+            ack_explicit_write(path_key, value)
             return data
 
         try:
@@ -3430,7 +3506,10 @@ async def api_kirocrew_config_patch(request: web.Request) -> web.Response:
                     },
                     status=503,
                 )
-    return web.json_response(_masked_config_dict(applied))
+    payload = _masked_config_dict(applied)
+    if clamp_notice is not None:
+        payload["clamp_notice"] = clamp_notice
+    return web.json_response(payload)
 
 
 # ── Local token bootstrap (Electron / local apps) ─────────────────────

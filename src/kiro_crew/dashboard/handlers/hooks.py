@@ -7,6 +7,7 @@ import functools
 import json
 import logging
 import os
+import secrets
 import time
 from pathlib import Path
 from typing import Any, Callable, TypeVar
@@ -21,16 +22,20 @@ from kiro_crew.agent import (
     agents_spec_lock,
     kiro_agents_dir_path,
 )
+from kiro_crew.agent_capabilities import CapabilityError
 from kiro_crew.agent_discovery import _read_agent_spec, list_agents
 from kiro_crew.config.loader import KiroCrewConfig, data_home
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.execution_context import ExecutionContext, clear_session_execution
-from kiro_crew.executors import run_in_embed_pool
+from kiro_crew.executors import run_in_embed_pool, run_in_tool_gate_pool
+from kiro_crew.memory_startup import MemoryStartupUnavailable, wait_for_memory_preparation
 from kiro_crew.permission_floor import (
     OUTCOME_PENDING_APPROVAL,
     OUTCOME_REJECTED_TRANSPORT_FLOOR,
 )
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
+from kiro_crew.session_capabilities import CapabilityStartupError
+from kiro_crew.tool_gate_busy import hook_gate_busy
 from kiro_crew.validation import sanitize_string
 
 logger = logging.getLogger(__name__)
@@ -954,7 +959,9 @@ async def api_hooks_agent(request: web.Request) -> web.Response:
             {"error": "sessionKey must be a string", "code": "session_key_not_a_string"}, status=400
         )
     if not session_key:
-        session_key = f"hook:default:{int(time.time())}"
+        # Per call, not per second: one turn runs per key, so two deliveries in
+        # the same second that shared a key would have the second refused.
+        session_key = f"hook:default:{int(time.time())}-{secrets.token_hex(6)}"
     if not session_key.startswith(_HOOK_SESSION_PREFIX):
         return web.json_response(
             {
@@ -1171,6 +1178,41 @@ async def api_hooks_agent(request: web.Request) -> web.Response:
 _EVENT_PERMISSION_REQUEST_KIND = "permission_request"
 
 
+def _capability_refusal_text(
+    exc: CapabilityError | CapabilityStartupError, agent: str | None
+) -> str:
+    """The run result for a member start the capability check stopped.
+
+    Both exception types carry only a bounded machine code, never file bytes,
+    so the code is safe to show. The member comes from the refusal when the
+    check recorded it, otherwise from the hook's own destination agent.
+
+    A ``CapabilityError`` refuses the member's saved spec, which the user fixes
+    in Capabilities. A ``CapabilityStartupError`` can also be a start that raced
+    a save or could not be verified after the process ran, which a resend may
+    clear, so its text asks for a resend first.
+    """
+    member = (getattr(exc, "member", "") or agent or "").strip() or "this crew member"
+    if isinstance(exc, CapabilityStartupError):
+        return (
+            f"Hook agent did not run: the start of {member} could not be verified "
+            f"({exc}). Send the webhook again; if it repeats, check {member} > Capabilities."
+        )
+    if exc.code == "materialization_changed":
+        filename = exc.file
+        where = f" ({filename})" if filename else ""
+        return (
+            f"Hook agent did not start: the agent file{where} for {member} was edited "
+            f"outside the Capabilities page. Open {member} > Capabilities, review the "
+            "change and save it, then send the webhook again."
+        )
+    return (
+        f"Hook agent did not start: the capability check for {member} refused the "
+        f"start ({exc.code}). Open {member} > Capabilities to see what needs fixing, "
+        "then send the webhook again."
+    )
+
+
 async def _run_hook_inner(
     state: DashboardState,
     session_key: str,
@@ -1178,8 +1220,14 @@ async def _run_hook_inner(
     agent: str | None,
     *,
     execution_context: ExecutionContext | None = None,
+    on_client: Callable[[Any], None] | None = None,
 ) -> str:
-    """Inner agent turn — called within timeout wrapper."""
+    """Inner agent turn — called within timeout wrapper.
+
+    ``on_client`` receives the session's provider as soon as it exists, so the
+    caller can still read that session's MCP report when this coroutine is
+    cancelled by the timeout or raises.
+    """
     from dataclasses import replace
 
     from kiro_crew import name_grant
@@ -1228,6 +1276,8 @@ async def _run_hook_inner(
         agent = execution.template_id or None
     memory_store = await session_store_for_turn(state.context_builder, session_key)
     client, is_new, resumed = await state.sessions.get_or_create(session_key, agent=agent)
+    if on_client is not None:
+        on_client(client)
     full_message = message
     # The ContextBuilder prompt is the only text on this path that legitimately
     # MINTS structural boundary markers, so it is the one text the scrub below
@@ -1283,8 +1333,10 @@ async def _run_hook_inner(
             hooks_gate = getattr(state.context_builder, "hooks", None)
             if hooks_gate is not None:
                 try:
-                    decision = hooks_gate.on_tool_call(
+                    decision = await run_in_tool_gate_pool(
+                        hooks_gate.on_tool_call,
                         event.title,
+                        on_queue_timeout=hook_gate_busy,
                         session_key=session_key,
                         agent=agent or "",
                         **hook_gate_kwargs(event),
@@ -1445,6 +1497,24 @@ async def _run_hook_inner(
     return result_text
 
 
+def _hook_mcp_problems(client: Any) -> str:
+    """One line naming the MCP servers this webhook session could not use, or "".
+
+    A webhook run's session is ephemeral and headless, so a server that failed to
+    start in it is otherwise visible only as missing tools. The line goes to the
+    operator (run history and the delivered result), never back into a prompt, so
+    the sanitized failure reasons are kept. Never worth failing a run over.
+    """
+    if client is None:
+        return ""
+    try:
+        report = client.mcp_session_report()
+        return report.problem_summary() if report is not None else ""
+    except Exception:
+        logger.debug("webhook MCP session report unreadable", exc_info=True)
+        return ""
+
+
 async def _run_hook_agent(
     state: DashboardState,
     session_key: str,
@@ -1470,6 +1540,8 @@ async def _run_hook_agent(
     result_text = ""
     outcome = "completed"
     detail = ""
+    clients: list[Any] = []
+    mcp_problems = ""
     try:
         # Loading the persisted context (written by the register_hook MCP tool)
         # is INSIDE the try because the caller's permit and the in-flight claim
@@ -1497,9 +1569,22 @@ async def _run_hook_agent(
                 f"{message}"
             )
 
+        # The inner turn's first step opens the session's memory, which the
+        # gateway keeps closed from boot until its startup preparation task has
+        # restored and initialized every store. A dashboard chat turn waits for
+        # that task before it reads memory; this turn takes the same bounded
+        # wait, so a webhook accepted during startup runs once memory is ready
+        # instead of failing on its first read.
+        await wait_for_memory_preparation(getattr(state, "memory_startup_task", None))
+
         result_text = await asyncio.wait_for(
             _run_hook_inner(
-                state, session_key, message, agent, execution_context=execution_context
+                state,
+                session_key,
+                message,
+                agent,
+                execution_context=execution_context,
+                on_client=clients.append,
             ),
             timeout=timeout_secs,
         )
@@ -1509,6 +1594,24 @@ async def _run_hook_agent(
         detail = result_text
         logger.warning("Hook agent timeout: %s", session_key)
         await state.sessions.record_failure(session_key)
+    except (CapabilityError, CapabilityStartupError) as exc:
+        # The member's capability check stopped the start. The run record and
+        # the delivered result name the refusal and what to do about it, which
+        # the generic arm below cannot.
+        outcome = "error"
+        result_text = _capability_refusal_text(exc, agent)
+        detail = result_text
+        logger.warning("Hook agent %s did not start: %s", session_key, exc)
+        await state.sessions.record_failure(session_key)
+    except MemoryStartupUnavailable as exc:
+        # Memory preparation outlasted the wait, or recovery failed for this
+        # store. The run record and the delivered result name that, so the
+        # caller knows to retry or to inspect memory recovery.
+        outcome = "error"
+        result_text = f"Hook agent did not start: {exc}"
+        detail = result_text
+        logger.warning("Hook agent %s did not start: %s", session_key, exc)
+        await state.sessions.record_failure(session_key)
     except Exception:
         outcome = "error"
         result_text = f"Hook agent error: internal failure (session {session_key})"
@@ -1516,6 +1619,16 @@ async def _run_hook_agent(
         logger.exception("Hook agent failed for %s", session_key)
         await state.sessions.record_failure(session_key)
     finally:
+        # Read before release/reset: the report lives on the session being torn
+        # down. Here rather than in the inner turn so a timeout or crash still
+        # says which servers never started.
+        mcp_problems = _hook_mcp_problems(clients[0] if clients else None)
+        if mcp_problems:
+            logger.warning(
+                "Hook agent %s: MCP servers unusable in this run — %s",
+                session_key,
+                mcp_problems,
+            )
         try:
             state.sessions.release(session_key)
         except Exception:
@@ -1528,7 +1641,7 @@ async def _run_hook_agent(
             # PERSISTENT only -- `_run_hook_inner` raises for any other mode -- so
             # the bind leaves a vouched entry rather than a live carrier.
             #
-            # Hook session keys are per-request by default (`hook:default:{ts}`),
+            # Hook session keys are per-request by default (`hook:default:{ts}-{hex}`),
             # and per-event keys are the ordinary webhook pattern, so without this
             # the map would gain one permanent entry per authenticated request and
             # grow until the process restarted.
@@ -1549,6 +1662,9 @@ async def _run_hook_agent(
     # history — the only place an operator can check — named a destination that
     # received nothing.
     destinations: list[str] = []
+    mcp_notice = f"MCP servers unusable in this run: {mcp_problems}" if mcp_problems else ""
+    if mcp_notice:
+        result_text = f"{result_text}\n\n{mcp_notice}" if result_text else mcp_notice
     if result_text:
         # Sanitize before delivery.
         result_text, _ = redact_exfiltration_urls(result_text)
@@ -1587,6 +1703,8 @@ async def _run_hook_agent(
             detail = "Delivered to " + " + ".join(destinations)
         else:
             detail = "Delivery failed for every destination"
+    if mcp_notice:
+        detail = f"{mcp_notice} | {detail}" if detail else mcp_notice
     await asyncio.to_thread(
         webhooks.run_store().record,
         outcome=outcome,

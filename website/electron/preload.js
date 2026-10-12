@@ -32,6 +32,14 @@ contextBridge.exposeInMainWorld("kirocrew", {
   // are validated in the main process (handleWindowControl /
   // applyWindowControl).
   windowControl: (action) => ipcRenderer.send("window-control", String(action || "")),
+  // Announce a download the app is about to start, so the Electron shell's
+  // will-download handler auto-saves ONLY downloads the app explicitly asked
+  // for (the export path). Without a matching announcement a same-origin or
+  // blob download gets the normal Save dialog instead of a silent save. The
+  // main process keys the expectation by THIS frame's own origin; `filename`
+  // is the leaf name the download will carry. No-op (absent) in a plain
+  // browser, where downloadBlob falls back to the browser's own handling.
+  expectDownload: (filename) => ipcRenderer.send("download:expect", String(filename || "")),
 });
 
 contextBridge.exposeInMainWorld("electronAPI", {
@@ -117,6 +125,13 @@ contextBridge.exposeInMainWorld("electronAPI", {
     const handler = (_e, path) => cb(path);
     ipcRenderer.on("navigate", handler);
     return () => ipcRenderer.removeListener("navigate", handler);
+  },
+  // View > Toggle Focus Mode: main.js asks the dashboard to flip focus mode,
+  // whose own toggle is hidden while it is on.
+  onToggleFocusMode: (cb) => {
+    const handler = () => cb();
+    ipcRenderer.on("focus-mode:toggle", handler);
+    return () => ipcRenderer.removeListener("focus-mode:toggle", handler);
   },
   onFullScreenChanged: (callback) => {
     const handler = (_event, isFullScreen) => callback(!!isFullScreen);

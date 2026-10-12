@@ -52,7 +52,7 @@ from kiro_crew.crew_log.entry_types import (
     MISTAKE_CORRECTED_CODE,
     MISTAKES_FOLD_NAME,
 )
-from kiro_crew.dashboard_templates.manifest import FIELD_TYPES, FieldSpec, TemplateManifest
+from kiro_crew.dashboard_templates.manifest import FIELD_TYPES, FieldSpec, Shape, TemplateManifest
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 
 logger = logging.getLogger(__name__)
@@ -129,6 +129,94 @@ class Instance:
     instance_version: int
 
 
+#: Every non-live package state, and the refusal an agent is told for it.
+#:
+#: Keyed by the STATE STRING, which is what lets this table live here rather than in
+#: :mod:`kiro_crew.dashboard_package`: the Model type travels from this module to that
+#: one, so a type import back would close a cycle. The two halves are pinned against
+#: each other by ``test_dashboard_package`` -- a state added there with no row here
+#: would reach an agent as a bare "no package", which is the wrong instruction for two
+#: of the three.
+#:
+#: ``no_instance`` is kept as the code for an absent package rather than renamed, so a
+#: mistake book already grouping refusals under it goes on grouping them: the group key
+#: is ``(code, field)`` and a new code would strand every lesson a crewmate has learnt.
+PACKAGE_REFUSALS: Final[dict[str, str]] = {
+    "empty": "no_instance",
+    "error": "package_model_invalid",
+}
+
+#: The refusal a package-bound write gets while the DISPLAY still selects a different
+#: Model from the one the write would be checked against. Its own code, because the
+#: remedy is neither "create a package" nor "repair this one": the package is fine and
+#: the write is fine, and what is missing is the half that draws it.
+PACKAGE_DISPLAY_PENDING: Final[str] = "package_display_pending"
+
+
+def display_pending_refusal(field: str) -> WriteRefused:
+    """A live package whose values nothing would draw yet.
+
+    Checking a write against the package's Model while the member's page renders from
+    its TEMPLATE instance lets a value land that the display cannot draw -- a string
+    where the page reads a list renders as nothing, so the cards that were there
+    disappear and no error is raised anywhere. The old values are still in the log, but
+    a reader looking at the page cannot tell that from an empty list.
+
+    Refused rather than written, because the two halves disagreeing is not something an
+    agent can see or work around. The caller decides WHEN to ask this: the condition is
+    about the display, which is not this module's to read.
+    """
+    return WriteRefused(
+        PACKAGE_DISPLAY_PENDING,
+        field,
+        "this crewmate's page is composed from a dashboard package, and the display "
+        "still draws it from the template instance -- so a value checked against the "
+        "package could be one the page cannot draw, and writing it would blank what is "
+        "already there. Nothing is wrong with the package or the value: wait for the "
+        "display to read the package, and write it then",
+    )
+
+
+#: What each refusal tells the agent to DO, which is the half a bare state cannot
+#: supply. One sentence per state, and they differ in the action rather than in tone:
+#: create one, tell a human, stop reaching for it.
+_PACKAGE_REMEDIES: Final[dict[str, str]] = {
+    "empty": (
+        "this crewmate has no dashboard package yet, so it has no field to write: "
+        "create one with a Model that declares this field, then write it"
+    ),
+    "error": (
+        "this crewmate's dashboard package has a Model that does not load, so there is "
+        "nothing to check a write against -- ask the human to repair or replace the "
+        "package"
+    ),
+}
+
+
+def package_refusal(state: str, state_reason: str, field: str) -> WriteRefused | None:
+    """The refusal for a non-live package state, or ``None`` when the state is live.
+
+    ONE mapping, called by the write path immediately after the reader. The state's own
+    sentence is quoted after the remedy rather than instead of it, because the two
+    answer different questions: ``state_reason`` says what the reader found and the
+    remedy says what to do about it, and an agent handed only the first retries the
+    same write forever.
+
+    An UNKNOWN state refuses as well, and refuses honestly. Reporting an unrecognised
+    state as live would check the write against a ``None`` Model; reporting it as
+    "no package" would tell the agent to create one it may well already have.
+    """
+    if state == "live":
+        return None
+    code = PACKAGE_REFUSALS.get(state, "package_unreadable")
+    remedy = _PACKAGE_REMEDIES.get(
+        state,
+        f"this gateway does not understand what state {state!r} its dashboard package "
+        "is in, so it will not check a write against it -- ask the human",
+    )
+    return WriteRefused(code, field, f"{remedy}. {state_reason}".strip())
+
+
 def agentic_fields(manifest: TemplateManifest) -> dict[str, FieldSpec]:
     """The fields the crewmate may write, by name."""
     return {name: spec for name, spec in manifest.fields.items() if spec.agentic}
@@ -157,6 +245,76 @@ def type_holds(declared: str, value: Any) -> bool:
     if declared == "object":
         return isinstance(value, dict)
     return False
+
+
+#: How many shape problems one refusal names. The first few are enough to fix the
+#: write; a list of every bad row in a long array is one the reader skims.
+SHAPE_PROBLEMS_SHOWN: Final[int] = 6
+
+
+def _shape_line(shape: Shape) -> str:
+    """One shape in a few words: ``string (decide|approve|do)``, ``array of string``."""
+    if shape.enum:
+        return f"{shape.type} ({'|'.join(str(v) for v in shape.enum)})"
+    if shape.type == "array" and shape.items is not None:
+        return f"array of {_shape_line(shape.items)}"
+    if shape.type == "object" and shape.properties is not None:
+        return "object {" + ", ".join(sorted(shape.properties)) + "}"
+    return shape.type
+
+
+def _valid_keys(shape: Shape) -> str:
+    """The keys an object may carry, each with its shape, required ones marked."""
+    props = shape.properties or {}
+    return ", ".join(
+        f"{key}{' (required)' if key in shape.required else ''}: {_shape_line(sub)}"
+        for key, sub in sorted(props.items())
+    )
+
+
+def shape_problems(shape: Shape, value: Any, where: str, out: list[str]) -> None:
+    """Append to *out* every way *value* breaks *shape*, up to the shown cap.
+
+    Each problem names WHERE (``for_you[0]``) and what is valid there, so the
+    sentence is the fix: a refused key comes with the keys the page reads.
+    """
+    if len(out) >= SHAPE_PROBLEMS_SHOWN:
+        return
+    if not type_holds(shape.type, value):
+        out.append(f"{where} wants {_shape_line(shape)}, and this is {_describe(value)}")
+        return
+    if shape.enum and value not in shape.enum:
+        out.append(f"{where} is {value!r}, not one of " + "|".join(str(v) for v in shape.enum))
+        return
+    if shape.type == "array" and shape.items is not None:
+        for index, item in enumerate(value):
+            shape_problems(shape.items, item, f"{where}[{index}]", out)
+            if len(out) >= SHAPE_PROBLEMS_SHOWN:
+                return
+        return
+    if shape.type != "object":
+        return
+    if shape.properties is not None:
+        unknown = sorted(str(k) for k in value if k not in shape.properties)
+        missing = [k for k in shape.required if k not in value]
+        if unknown or missing:
+            said = []
+            if unknown:
+                said.append("unknown key(s) " + ", ".join(repr(k) for k in unknown))
+            if missing:
+                said.append("missing required key(s) " + ", ".join(repr(k) for k in missing))
+            out.append(f"{where} has " + " and ".join(said) + f"; valid keys: {_valid_keys(shape)}")
+        for key, sub in shape.properties.items():
+            if key in value:
+                shape_problems(sub, value[key], f"{where}.{key}", out)
+                if len(out) >= SHAPE_PROBLEMS_SHOWN:
+                    return
+        return
+    if shape.values is not None:
+        for key, item in value.items():
+            shape_problems(shape.values, item, f"{where}[{key!r}]", out)
+            if len(out) >= SHAPE_PROBLEMS_SHOWN:
+                return
 
 
 def _describe(value: Any) -> str:
@@ -319,6 +477,23 @@ def check_write(
             f"{AGENTIC_VALUE_DEPTH} levels deep -- flatten it to rows a page can draw, "
             "or send the one level the field shows and write the rest as its own field",
         )
+    # AFTER the depth check, because this walks the value and the depth bound is
+    # what keeps the walk's recursion bounded.
+    if spec.shape is not None:
+        problems: list[str] = []
+        shape_problems(spec.shape, value, field, problems)
+        if problems:
+            raise WriteRefused(
+                "wrong_shape",
+                field,
+                (
+                    f"{field!r} does not match the shape template "
+                    f"{instance.manifest.id!r} draws: "
+                    + "; ".join(problems)
+                    + ". "
+                    + _repeat_note(mistakes, "wrong_shape", field)
+                ).strip(),
+            )
     size = _value_bytes(value)
     if size < 0:
         raise WriteRefused(
@@ -349,6 +524,28 @@ def check_write(
             f"is not a storable {spec.type}, so nothing could store or draw it -- send a "
             "value with no credential-like text in it",
         )
+    # The SHAPE is asked again too, and not only the type. The scrub rewrites strings,
+    # so a declared choice that is itself credential-shaped passes the check above --
+    # a placeholder is a perfectly good ``string`` -- and then lands in the cell as a
+    # value the page's own Model says cannot be there. Everything the shape constrains
+    # beyond the type is in the same position: an enum member, a required key under a
+    # scrubbed name, an item in a typed array.
+    if spec.shape is not None:
+        cleaned_problems: list[str] = []
+        shape_problems(spec.shape, cleaned, field, cleaned_problems)
+        if cleaned_problems:
+            raise WriteRefused(
+                "redacted_value_invalid",
+                field,
+                (
+                    f"redacting credentials from this value for {field!r} leaves "
+                    f"something the shape {instance.manifest.id!r} draws does not "
+                    "accept: "
+                    + "; ".join(cleaned_problems)
+                    + ". The STORED value is the scrubbed one, so send a value whose "
+                    "credential-like text is not part of what the shape requires"
+                ).strip(),
+            )
     if cleaned_size > DASHBOARD_VALUE_BYTES:
         raise WriteRefused(
             "redacted_value_too_large",
@@ -466,6 +663,7 @@ _NAME_CODES: Final[frozenset[str]] = frozenset({"unknown_field", "field_not_agen
 _VALUE_CODES: Final[frozenset[str]] = frozenset(
     {
         "wrong_type",
+        "wrong_shape",
         "value_too_large",
         "value_not_serializable",
         "value_too_deep",
@@ -532,8 +730,15 @@ def fields_for_agent(
     *,
     history: Sequence[Mapping[str, Any]] | None = None,
     rollback_versions: Sequence[int] | None = None,
+    values: Mapping[str, Any] | None = None,
+    written_at: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """What an agent is told BEFORE it writes: the fields, their sources, its mistakes.
+
+    *values* is the page's current read, by field name, and *written_at* the host's
+    stamp for each agentic cell. Each agentic row then carries its current value and
+    each fold row a one-line summary; ``None`` (the read failed) leaves both out
+    rather than reporting every cell empty.
 
     This is the read that makes the first try usually work. Without it an agent
     guesses a field name, is refused, and spends a cycle learning what one call
@@ -558,14 +763,31 @@ def fields_for_agent(
             "rollback_versions": sorted(rollback_versions or ()),
         }
     listed: list[dict[str, Any]] = []
+    current = values if isinstance(values, Mapping) else None
+    stamps = written_at if isinstance(written_at, Mapping) else {}
     for name, spec in sorted(instance.manifest.fields.items()):
         row: dict[str, Any] = {"field": name, "type": spec.type}
+        # The WHOLE shape, so the first write can be the right one: a type alone
+        # says "array" and not which keys each row of it must carry.
+        row["schema"] = spec.shape.describe() if spec.shape is not None else {"type": spec.type}
         if spec.agentic:
             row["source"] = "agentic"
+            if current is not None:
+                # What is on the page NOW, so a write that edits one card of a list
+                # starts from the list that is there rather than from a guess.
+                row["written"] = name in current
+                if name in current:
+                    row["value"] = current[name]
+                    if stamps.get(name):
+                        row["written_at"] = str(stamps[name])
         else:
             row["source"] = "fold"
             row["fold"] = spec.fold
             row["path"] = spec.path
+            if current is not None:
+                # One line, never the data: a fold value can be the whole work
+                # board, and the agent cannot write it anyway.
+                row["summary"] = fold_summary(current[name]) if name in current else "no value"
         listed.append(row)
     return {
         "template": {"id": instance.manifest.id, "version": instance.manifest.version},
@@ -577,6 +799,69 @@ def fields_for_agent(
         "history": _recent_history(history),
         "rollback_versions": sorted(rollback_versions or ()),
     }
+
+
+#: Keys whose string value is a stamp, newest-first comparable as ISO text.
+_STAMP_KEYS: Final[tuple[str, ...]] = ("at", "ts", "updated_at", "last_report_at", "last_entry_at")
+
+
+def fold_summary(value: Any) -> str:
+    """One line about a fold value: how many rows, and the newest stamp among them."""
+    if isinstance(value, list):
+        rows = [row for row in value if isinstance(row, Mapping)]
+        stamps = [
+            str(row[key])
+            for row in rows
+            for key in _STAMP_KEYS
+            if isinstance(row.get(key), str) and row.get(key)
+        ]
+        line = f"{len(value)} item{'' if len(value) == 1 else 's'}"
+        return line + (f", latest {max(stamps)}" if stamps else "")
+    if isinstance(value, Mapping):
+        return f"{len(value)} key{'' if len(value) == 1 else 's'}"
+    if isinstance(value, str):
+        return value if len(value) <= 80 else f"string, {len(value)} chars"
+    if value is None:
+        return "no value"
+    try:
+        return json.dumps(value, allow_nan=False)
+    except (TypeError, ValueError):
+        return type(value).__name__
+
+
+def turn_block(slug: str) -> str:
+    """The ``[DASHBOARD]`` lines for a crewmate's turn, or ``""`` when it has none.
+
+    A few lines on purpose: which page is in force and which fields are the
+    crewmate's to write. The shapes and the mistake book stay behind
+    ``dashboard_fields``, because a block on every turn is paid for on every turn.
+    TOTAL: a dashboard that cannot be read costs the turn this block, nothing else.
+    """
+    try:
+        from kiro_crew.dashboard_templates import instance as instance_store
+        from kiro_crew.dashboard_templates.manifest import parse_manifest
+
+        record = instance_store.read(slug)
+        if record.state == instance_store.STATE_EMPTY:
+            fallback = instance_store.default_instance(slug)
+            if fallback is None:
+                return ""
+            record = fallback
+        elif record.state not in (instance_store.STATE_LIVE, instance_store.STATE_STALE):
+            return ""
+        manifest = parse_manifest(dict(record.manifest))
+    except Exception:
+        logger.debug("no [DASHBOARD] block for %r", slug, exc_info=True)
+        return ""
+    names = sorted(agentic_fields(manifest))
+    writes = ", ".join(names) if names else "none (every field is folded)"
+    return (
+        "[DASHBOARD]\n"
+        f"Your dynamic dashboard is template {manifest.id} v{manifest.version}; the "
+        "Dashboard tab shows it only with the 'Dynamic Dashboard' Feature Preview on.\n"
+        f"Fields you write: {writes}. Call dashboard_fields for their shapes and "
+        "current values before dashboard_write."
+    )
 
 
 def _recent_history(history: Sequence[Mapping[str, Any]] | None) -> list[dict[str, Any]]:

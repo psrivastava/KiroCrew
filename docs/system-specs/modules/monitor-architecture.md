@@ -157,6 +157,53 @@ replacement starts its own cycle count. As a backstop, `work_ledger_read` flags 
 read included -- a loop watching something else reads no ledger, so it does not
 count. The Crew page board does not show the flag yet.
 
+A `work-ledger` watch waits longer for its quiet floor while no worker has
+reported. Every gated loop is delivered anyway after `_MAX_QUIET_STREAK` (10)
+quiet ticks, and for this kind that turn re-read a long conductor chat to find
+the board as the conductor left it. The probe publishes `WorkLedgerProbe.revision`,
+a digest of each item's worker-owned report fields (`last_report_at`,
+`status`, `summary`; `no-reports` for a board read with none yet). The conductor's own writes -- a verdict, a new item -- do not
+move it, though they still move the kernel epoch. The gate keeps it on the
+monitor as `ledger_revision`, and every delivered turn copies it to
+`ledger_delivered_revision`. While the two match, the floor is
+`_IDLE_LEDGER_QUIET_FLOOR` (40) ticks instead of 10, and it still delivers
+there, which also bounds a stall the probe's rate limit folded forward without
+waking. A new worker report puts the floor back to 10 at once. Report and stall
+wakes are untouched: they are `WAKE` verdicts and never reach the floor branch.
+The longer floor never applies while the loop's recent turns failed to start or
+errored (`consecutive_start_failures`, `consecutive_failed_cycles`), or when the
+revision is unknown (empty, or unreadable on load). Other kinds keep the
+shipped floor.
+
+A delivered work-ledger wake is a POINTER, not a copy of the board.
+`ledger_wake.wake_turn_text` prefixes the nudge with the kernel's structural briefs
+naming what moved (truncated at `MAX_WAKE_BRIEF_CHARS`, 4000) and then one
+`WAKE_READ_POINTER` line telling the conductor to call
+`work_ledger_read(item_id=<id>)` for the item a brief named, or
+`work_ledger_read(compact=true)` for the board. The conductor reads the ledger
+itself, through its own identity-gated, audited and containment-judged route.
+
+The wake used to carry the compact board inline, built at delivery by
+`compact_wake_snapshot` and bounded by `WAKE_SNAPSHOT_BUDGET_CHARS` (24000). That
+made the cost of one item moving proportional to the whole goal -- on a twenty-item
+board, around 20 KB of mostly-closed rows re-sent on every wake to save one tool
+call -- so it was replaced by the pointer and the builder, its `WakeSnapshot` value
+and its `work_ledger_wake_snapshot` audit operation were deleted. The board was also
+the only reason the delivery needed an audience fence
+(`record_audience_admission(..., for_pending_turn=True)`, likewise deleted): ledger
+prose may enter only a turn whose cross-surface publication is fenced for that
+turn's whole life, and the fence now belongs to the read route alone.
+
+A wake that lands while the slot is already running is STEERED into that running
+turn (`_steer_work_ledger_wake`) rather than declined, because its payload is small.
+The steer and the fire now carry the SAME text, which the pointer is what makes
+possible: a steer can be requeued, a requeue drops the running turn's fence, and the
+board could therefore never ride one -- while briefs and a read pointer disclose only
+item ids and statuses, the same text `irq` may already persist outside the store's
+gated read path. `AutoNudgeService.notify_turn_complete` brings the busy-retry
+forward to `delay=0` on turn end instead of waiting for the loop deadline, and the
+per-loop wake text is held in `_pending_monitor_wake`, a `dict` keyed by loop id.
+
 The `monitoring/` package now has a different extension point:
 `models.MonitorProbe`, a structural Protocol with no behaviour inheritance, plus
 the data-only kind registry. The four source-provider adapters and the workflow
@@ -243,6 +290,27 @@ user or agent stop. The runaway backstop is the same
 `monitoring.max_runtime_secs` ceiling, measured as the loop's age from
 `created_ts`: past it nothing is extended, the bound stops the loop as before,
 and the refusal is logged at WARNING.
+
+A work-ledger watch also HOLDS while every open item waits on a person: each is
+`blocked` or `question` with the worker's `reason` `approval` or `needs_human`,
+no item's worker session is gone, and the ledger's fingerprint
+(`probes.work_ledger.person_wait_fingerprint`, which is
+`worker_report_revision` -- the same worker-report digest the quiet floor reads,
+so nothing the conductor writes moves it) equals `ledger_seen_fp`, the one read at the tick
+that delivered the loop's last turn. `_holds_for_person_wait` checks this in
+`_timer` ahead of the cycle cap and the runtime budget, so a held tick fires
+nothing, reaches no probe gate or quiet floor, and is neither extended nor
+stopped; it re-arms at the loop's interval and sets `waiting_on_person` (with
+`waiting_on_person_at`), which `monitor_inspect`, the REST row and the
+`autonudge_state` frame carry. A worker's report changes the fingerprint and
+releases it on the next tick; the conductor's own writes do not; a manual fire clears `ledger_seen_fp` so it
+is never held; a loop already held for an unanswered approval is left to that
+hold. On release the held time is added to `created_ts`, as the approval hold
+does, so it spends neither the runtime budget nor the backstop. That exemption
+is on purpose and matches the approval hold: a held loop fires nothing, so a
+patrol whose people never answer stays a paused row that costs one ledger read
+per interval, never a runaway. Doubt fires: an unreadable ledger or a fresh loop
+never holds.
 
 An unanswered tool approval HOLDS a prompt loop rather than stopping it: it
 stays active, fires nothing and spends neither bound, and it resumes on its own

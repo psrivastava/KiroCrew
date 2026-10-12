@@ -63,6 +63,7 @@ from kiro_crew.env import emit_env
 from kiro_crew.executors import maintenance_executor
 from kiro_crew.gateway_lock import GatewayLock, GatewayLockError, LockFileError
 from kiro_crew.history import ConversationLog
+from kiro_crew.mcp_utils import without_mcp_refs
 from kiro_crew.platform.governance import may_skip_gate_now, strip_ungoverned_auto_approve
 from kiro_crew.security import is_sensitive_path
 from kiro_crew.sel import sel
@@ -539,8 +540,8 @@ def _apply_agent_mcp_policy(
             "disabled": True,
             "disabledTools": list(disabled) if isinstance(disabled, list) else [],
         }
-        tools = [t for t in tools if t != f"@{name}"]
-        allowed = [t for t in allowed if t != f"@{name}"]
+        tools = without_mcp_refs(tools, (name,), per_tool=False)
+        allowed = without_mcp_refs(allowed, (name,))
 
     agent_data["mcpServers"] = servers
     agent_data["tools"] = tools
@@ -1109,7 +1110,20 @@ def _register_agents(
                         agent_name,
                         ", ".join(dangling),
                     )
-                atomic_write(link_path, json.dumps(merged, indent=2) + "\n")
+                # The ownership decision and the write share one critical section,
+                # the agent-spec lock every spec writer of this directory holds: an
+                # instance on a data home that does not own the shared agents
+                # directory leaves the owner's copy in place rather than stamping its
+                # own launcher and data home into a spec the owner's sessions load. A
+                # refusal is permanent until ownership changes, so it is not an I/O
+                # failure a retry could clear. Imported here, like every other read of
+                # the agent facade in this module.
+                from kiro_crew import agent as _agent
+
+                with _agent.agents_spec_lock(agents_dir):
+                    if _agent._declined_foreign_spec_write(link_path):
+                        continue
+                    atomic_write(link_path, json.dumps(merged, indent=2) + "\n")
                 registered.append(_namespace(app_name, agent_name))
                 # The DECLARED name only — kiro-cli enumerates agents by their
                 # `name` field, so the namespaced filename stem is not a name it
@@ -1481,7 +1495,9 @@ def _register_crons(app_name: str, manifest: AppManifest) -> list[str]:
 
     path = _app_crons_path(app_name)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(cron_defs, indent=2), encoding="utf-8")
+    # Atomic: the scheduler reads this file at every start, so a write cut off
+    # part way must leave the previous definitions in place, not a torn file.
+    atomic_write(path, json.dumps(cron_defs, indent=2))
     logger.info("Wrote %d cron definition(s) for app %s", len(cron_defs), app_name)
     return registered
 
@@ -1523,7 +1539,16 @@ def load_app_cron_defs(app_name: str) -> list[dict[str, Any]]:
         return []
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
+    except (json.JSONDecodeError, UnicodeDecodeError, OSError) as exc:
+        # A manifest that exists but cannot be read (for example one left torn by
+        # an interrupted write) is logged at WARNING and treated as no crons, so
+        # none of the app's scheduled jobs from it are registered.
+        logger.warning(
+            "App %s: cron manifest %s could not be read (%s); ignoring it",
+            app_name,
+            path,
+            type(exc).__name__,
+        )
         return []
     if not isinstance(data, list):
         logger.warning(

@@ -55,6 +55,7 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any, NamedTuple
 
+from kiro_crew.agent_sdk.backend_mcp_ability import ability_for
 from kiro_crew.agent_sdk.capabilities import capabilities_of
 from kiro_crew.hooks import (
     HOOK_EVENT_AGENT_SPAWN,
@@ -100,6 +101,10 @@ _CACHE_MAX = 64
 #: is one literal name, never a glob, which would widen the guard across servers; the
 #: tool keeps the object form's own set, ``*`` included (``@server/*``).
 _MCP_MATCHER_RE = re.compile(r"@[A-Za-z0-9_.\-]+/[A-Za-z0-9_.*\-]+")
+
+#: The hooks concern's id on a backend's MCP ability card
+#: (:func:`kiro_crew.agent_sdk.backend_mcp_ability.concern_id` of ``Concern.HOOKS``).
+_HOOKS_CONCERN = "hooks"
 
 #: Per spec content: the hooks that run, and how many ``confirm: true`` documents
 #: were skipped (the session-start notice names the count).
@@ -361,9 +366,12 @@ def _agent_spec(agent_id: str, project_dir: str | None = None) -> dict[str, Any]
 
     *project_dir* is the session's checkout on a backend that resolves its spec
     project-nearest first (goose, opencode; see ``overlay_project_scope``). There a
-    project spec of that name is the one the session runs, so its hooks are the
-    ones read, and a project spec that cannot be read raises. KAS reads the user
-    level alone, so it passes none.
+    project spec of that name is the one the session runs, but its hooks are
+    commands, so they are read only when the checkout is trusted to choose them
+    (``session_mcp.trusted_project_agent_spec``, the verdict that also gates its
+    ``mcpServers``). An untrusted one yields the user-level spec of that name, and
+    a project spec that cannot be read raises. KAS reads the user level alone, so
+    it passes none.
 
     A KAS mode switch can move a session to one of KAS's own built-in modes
     (``vibe``), which has no Crew spec: it carries no spec hooks, and the Hooks
@@ -374,11 +382,11 @@ def _agent_spec(agent_id: str, project_dir: str | None = None) -> dict[str, Any]
     # circular import: the ACP layer imports the config loader, which sits below
     # this module; resolved at call time like the other driver seams here.
     from kiro_crew.acp.kas_agents import agent_spec_absent, load_agent_spec
-    from kiro_crew.acp.session_mcp import project_agent_spec
+    from kiro_crew.acp.session_mcp import trusted_project_agent_spec
     from kiro_crew.config.paths import kiro_agents_dir
 
     if project_dir:
-        declared, spec = project_agent_spec(agent_id, project_dir)
+        declared, spec = trusted_project_agent_spec(agent_id, project_dir)
         if declared:
             if spec is None:
                 raise ValueError(f"the project spec for agent {agent_id!r} could not be read")
@@ -454,6 +462,36 @@ def crew_fired_spec_hooks(
     spec = _agent_spec(agent_id, project_dir)
     hooks, unconfirmable = _convert(agent_id, spec)
     return list(hooks), spec_keys_without_carrier(spec), unconfirmable
+
+
+def spec_hooks_run_nowhere(provider: object) -> bool:
+    """Whether a session on *provider* runs none of its agent spec's ``hooks``.
+
+    True where the backend's mirror rules the hooks concern ``no-channel`` or
+    ``withheld``: the harness is not sent the field, and Crew does not fire it.
+    False where the harness runs the field itself (kiro-cli), where Crew fires it
+    (``crew_fires_spec_hooks``), and for a backend with no ruling, about which
+    nothing is established.
+    """
+    caps = capabilities_of(provider)
+    if caps.crew_fires_spec_hooks:
+        return False
+    ability = ability_for(caps.backend)
+    return _HOOKS_CONCERN in ability.no_channel or _HOOKS_CONCERN in ability.withheld
+
+
+def spec_hook_events(agent_id: str, project_dir: str | None = None) -> list[str]:
+    """The events the active agent spec has hooks on, as an agent spec spells them.
+
+    Each event is named once, in kiro-cli's order. Read through the conversion Crew
+    fires from, so an entry that would not run where Crew fires the field (disabled,
+    waiting for a confirmation, malformed) is not named. For the session-start
+    notice on a backend where :func:`spec_hooks_run_nowhere` holds. Raises when the
+    spec cannot be read. *project_dir* is :func:`spec_project_dir` of the session.
+    """
+    hooks, _unconfirmable = _convert(agent_id, _agent_spec(agent_id, project_dir))
+    present = {hook.event for hook in hooks}
+    return [name for name, event in _OBJECT_EVENT_TO_HOOK_EVENT.items() if event in present]
 
 
 class TurnSpecHooks(NamedTuple):

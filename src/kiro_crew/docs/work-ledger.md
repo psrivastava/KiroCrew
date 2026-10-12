@@ -47,6 +47,7 @@ An item is the unit of dispatch. It holds:
 | `fails` | conductor | how many acceptance attempts came back `fail` |
 | `state` | conductor | `open`, or terminal: `accepted` / `rejected` / `abandoned` |
 | `status` | worker | `progress` / `done` / `blocked` / `question` |
+| `reason` | worker | on `blocked` / `question`, when only a person can move it: `approval` / `needs_human` |
 | `summary` | worker | the worker's own account, up to 500 chars |
 | `artifacts` | worker | pointers to what it produced |
 | `pr` | worker | a pull-request number it produced |
@@ -163,6 +164,26 @@ One call, four statuses:
 separate values and not one "stuck". A build the worker does not control is
 `blocked`; a choice only the conductor can make is `question`.
 
+**`reason` says when a `blocked` or `question` report waits on a person.**
+`approval` means a tool approval timed out or is waiting, and `needs_human`
+means only a person can unblock it. A wait on a build, service or other item
+carries no reason. It is refused on `progress` and `done`, and every report
+replaces it. When every open item waits on a person (`approval` or
+`needs_human`) and nothing on the ledger changed since the conductor's last
+turn, the conductor's `work-ledger` watch holds: no turns, no extension, and
+the goal popover says it is waiting on you. A worker's new report releases it;
+the conductor's own writes do not.
+
+**A report is the only thing that wakes a conductor.** `blocked`, `question`
+and `done` pull its `work-ledger` loop forward to within seconds. `progress`
+does not, which is what makes a pause cheap: a worker that stops to wait reports
+`progress` and its conductor spends no turn hearing it. A worker turn that ends
+having reported nothing wakes nobody, and neither does a worker's session
+closing. What covers a worker that crashed or went silent is the item's own
+`stale` and `orphaned` flags, read on the conductor's ordinary patrol tick;
+those also cover a worker whose process died with its session still open, which
+no wake ever did.
+
 Reports belong at real milestones, not on a timer.
 `summary` is capped at 500 characters.
 A longer one is **cut to the cap, not refused**: the stored value carries a note
@@ -204,9 +225,18 @@ A conductor stops patrolling only when every item is terminal (accepted,
 rejected or abandoned), or when the user says stop, in words or through a round
 or time budget they set. An item that fails acceptance three times is closed
 `rejected` and the rest keep going. A decision that needs a person parks only
-that item: the conductor asks about it and keeps patrolling the others. With no
-budget from the user, a goal holds at most 20 items, and two rounds in a row
-with nothing accepted also stop new dispatches until the user answers.
+that item: the conductor asks about it and keeps patrolling the others.
+
+Spend is bounded in code, not only in the prompt. Each goal may create at most
+`item_cap` items, closed ones and every round's re-plans included. The default
+is 20; a `goal` write sets it (`item_cap`, 1 to 256). A `create` past it is
+refused `goal_item_cap_reached`, and the board writes nothing. That is a
+needs-human spend stop: the conductor pauses, asks the user, and raises
+`item_cap` if they agree. The loop is not stopped. Only a goal write with
+`new_goal=true` (a goal the user replaced) starts a new count; rewording the
+goal, moving the round or raising the cap keeps it. A board that never records
+a goal, such as a pipeline or security conductor's queue, has no goal cap. Two rounds in a row with nothing accepted also stop new dispatches
+until the user answers.
 
 ## Not the same as the session ledger, or subagents
 

@@ -10,6 +10,7 @@ import type { PasteBlock } from '../../utils/pasteTokens'
 import { offlineProps } from '../../utils/offline'
 import type { SendMode } from '../../pages/chat/ChatSettings'
 import { i18nT } from '../../i18n/t'
+import { uiLocation } from '../../uiLocations/uiLocation'
 import type { ComposerBusyMode } from './props'
 
 /* The composer's send path: `fireComposer` is every Enter and Send, idle or
@@ -188,7 +189,7 @@ export function useComposerSend({ slotId, busyMode, isRunning, stopState, canSte
 
 /** The send slot while a turn runs or a stop is in progress. Stop escalates
  *  from a soft stop to a force kill; a draft offers steer or queue. */
-export function BusySendControls({ stopState, killingEscaped, stopWithTap, isQueued, composerHasDraft, canSteer, onSteer, steerOnly, fireComposer, disabled, holdSend, holdSendReason, connected, effectiveBusyMode, setBusySendMode, sendOnEnter, jevAutoAvailable, onStop, stopDeclinedArmed = false, terminalActive = false }: {
+export function BusySendControls({ stopState, killingEscaped, stopWithTap, isQueued, composerHasDraft, canSteer, onSteer, steerOnly, fireComposer, disabled, holdSend, holdSendReason, connected, effectiveBusyMode, setBusySendMode, onBusyModePicked, sendOnEnter, jevAutoAvailable, onStop, stopDeclinedArmed = false, terminalActive = false }: {
   stopState?: 'idle' | 'soft_pending' | 'killing'
   /** The press before this one was declined (compaction); the backend treats
    *  the next press as the force stop, and the armed Stop's hint says so. */
@@ -207,6 +208,8 @@ export function BusySendControls({ stopState, killingEscaped, stopWithTap, isQue
   connected: boolean
   effectiveBusyMode: BusySendMode
   setBusySendMode: ReturnType<typeof useBusySendMode>[1]
+  /** Forwarded to `BusySendButton.onPicked`: the composer's focus hand-back after a steer/queue pick. */
+  onBusyModePicked?: () => boolean
   sendOnEnter: SendMode
   jevAutoAvailable: boolean
   onStop?: () => void
@@ -292,6 +295,7 @@ export function BusySendControls({ stopState, killingEscaped, stopWithTap, isQue
         <BusySendButton
           mode={effectiveBusyMode}
           onModeChange={setBusySendMode}
+          onPicked={onBusyModePicked}
           onFire={fireComposer}
           disabled={disabled || holdSend}
           disabledReason={holdSend ? `${heldBusyAction} — ${holdSendReason}` : undefined}
@@ -316,7 +320,7 @@ export function BusySendControls({ stopState, killingEscaped, stopWithTap, isQue
         <span className="text-[13px] leading-4 text-muted min-w-0 break-words" data-testid="stop-declined-hint">{i18nT('components.chatInput.click_again_to_force_stop_resets_session')}</span>
       </div>
     ) : onStop ? (
-      <button className="w-8 h-8 rounded-lg bg-transparent border-none text-danger hover:bg-danger/10 flex items-center justify-center cursor-pointer transition-all" onClick={stopWithTap} title={i18nT('components.chatInput.stop_generation')} aria-label={i18nT('components.chatInput.stop_generation')} data-testid="stop-button-armed">
+      <button className="w-8 h-8 rounded-lg bg-transparent border-none text-danger hover:bg-danger/10 flex items-center justify-center cursor-pointer transition-all" onClick={stopWithTap} title={i18nT('components.chatInput.stop_generation')} aria-label={i18nT('components.chatInput.stop_generation')} data-testid="stop-button-armed" {...uiLocation('composer.stop')}>
         <Square size={18} fill="currentColor" />
       </button>
     ) : steerOnly ? (
@@ -337,6 +341,7 @@ export function BusySendControls({ stopState, killingEscaped, stopWithTap, isQue
       <BusySendButton
         mode={effectiveBusyMode}
         onModeChange={setBusySendMode}
+        onPicked={onBusyModePicked}
         onFire={fireComposer}
         disabled
         altChordAvailable={sendOnEnter === 'enter'}

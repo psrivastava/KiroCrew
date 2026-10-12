@@ -229,6 +229,28 @@ _CRON_FIELD_JSON_TYPES = {
     "skip_dates": "an array of YYYY-MM-DD strings",
 }
 
+#: Refusal for a manifest that schedules ``crons`` without the ``permissions.cron``
+#: grant. A schedule runs agent prompts or commands unattended, so the
+#: ``permissions`` block an operator reads before installing must say so; the
+#: message carries the one-line fix because the install error is the channel an
+#: app author reads.
+CRON_PERMISSION_REQUIRED_ERROR = (
+    'crons is declared but permissions.cron is not: add "cron": true under '
+    '"permissions" in app.json'
+)
+
+
+def cron_permission_error(manifest: AppManifest) -> str:
+    """Return the missing-grant refusal for *manifest*, or ``""`` when it holds.
+
+    The rule applies wherever an app is admitted with a new manifest -- install,
+    update and self-registration -- and never at load time, so an app installed
+    before the rule keeps loading and firing its crons until its next update.
+    """
+    if manifest.crons and not manifest.permissions.cron:
+        return CRON_PERMISSION_REQUIRED_ERROR
+    return ""
+
 
 @dataclass
 class CronEntry:
@@ -717,6 +739,10 @@ class BackendConfig:
     healthCheck: str = "/health"  # health check endpoint path  # noqa: N815
     routes: str = ""  # base route path, e.g. /api/apps/oncall-watchtower
     type: str = ""  # "python", "asgi", "node", "exec", or "" (auto-detect)
+    # Opt in to a request-bound principal claim from the gateway's reverse proxy.
+    # Only the literal JSON boolean true enables it: a string or a number keeps
+    # the default off, so a malformed manifest never widens what a backend trusts.
+    signedPrincipal: bool = False  # noqa: N815
     hooks: HooksConfig = field(default_factory=HooksConfig)
 
     def to_dict(self) -> dict[str, Any]:
@@ -731,6 +757,8 @@ class BackendConfig:
             d["routes"] = self.routes
         if self.type:
             d["type"] = self.type
+        if self.signedPrincipal:
+            d["signedPrincipal"] = True
         hooks_d = self.hooks.to_dict()
         if hooks_d:
             d["hooks"] = hooks_d
@@ -746,6 +774,7 @@ class BackendConfig:
             healthCheck=str(data.get("healthCheck", "/health")),  # noqa: N815
             routes=str(data.get("routes", "")),
             type=str(data.get("type", "")),
+            signedPrincipal=data.get("signedPrincipal") is True,  # noqa: N815
             hooks=hooks,
         )
 
@@ -2611,6 +2640,9 @@ class AppManifest:
                     f"cron entry {cron.name!r}: must specify at least one of "
                     "'agent', 'agent_sequence', 'message', 'command', or 'script'"
                 )
+        cron_grant_error = cron_permission_error(self)
+        if cron_grant_error:
+            errors.append(cron_grant_error)
 
         # Backend hooks validation
         errors.extend(self.backend.hooks.validate())

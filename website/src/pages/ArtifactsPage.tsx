@@ -38,13 +38,16 @@ import { markJustCreatedBlank } from '../lib/blankHandoff'
 import { IMPORT_ACCEPT, IMPORTABLE_EXT_LIST, MAX_IMPORT_BYTES, planFileImport, wasContentRedacted, type ImportPlan, type ImportRejection } from '../lib/artifactImport'
 import { haptic } from '../lib/haptic'
 import type { Artifact, ArtifactFolder, PublishProviderDescriptor, RemoteArtifact, SessionDoc } from '../types'
-import { KIND_BADGE, isoToTs, docFileType, FolderColorSwatches, FolderGlyph, FolderNameInput, FolderMenu, SessionDocStar, LibraryTable, LibraryTree } from '../components/library/LibraryTable'
+import { KIND_BADGE, isoToTs, docFileType, FolderColorSwatches, FolderGlyph, FolderNameInput, FolderMenu, SessionDocStar, SessionDocPath, LibraryTable, LibraryTree } from '../components/library/LibraryTable'
 import SessionDocPreview from '../components/library/SessionDocPreview'
 import type { SortKey, SortState, LibraryDrag, FolderActions } from '../components/library/LibraryTable'
 import { WidgetThumb, ContentThumb, ImageThumb, WebAppThumb } from '../components/library/ArtifactThumbs'
 import { useColumnCount } from '../hooks/useColumnCount'
 
 import { i18nT } from '../i18n/t'
+import { uiLocation } from '../uiLocations/uiLocation'
+import { guidePick } from '../uiLocations/targetRegistry'
+import { useGuideSelection } from '../guide/guidePredicates'
 
 const KIND_OPTIONS = ['', 'widget', 'html', 'markdown', 'svg', 'json', 'text', 'webapp', 'image'] as const
 
@@ -352,7 +355,9 @@ function LocalCardBody({ a, context }: { a: Artifact; context: LibCtx }) {
     <DndDraggable id={`artifact:${a.slug}`} data={{ type: 'artifact', slug: a.slug, name: a.name, folderId: a.folder_id || '' } satisfies LibraryDrag}>
       {({ setNodeRef, listeners, isDragging }) => (
     <div
-      ref={setNodeRef}
+      // The artifact's name as the card shows it: a guide's pick outlines the
+      // one card named exactly like this (artifacts.list).
+      {...guidePick(a.name, setNodeRef)}
       {...listeners}
       role="button"
       tabIndex={0}
@@ -676,7 +681,8 @@ function LibraryMasonry({
   return (
     // -mr-3 offsets each card's own mr-3 so the trailing column's gutter
     // doesn't add page width; cards carry mr-3 (gutter) + mb-3 (row gap).
-    <div ref={widthRef} data-testid="artifacts-gallery" className={masonryOwnsScroll
+    // The picker a guide's "choose the artifact" step points at (artifacts.list).
+    <div {...uiLocation('artifacts.list', widthRef)} aria-label={i18nT('pages.artifactsPage.your_artifacts')} data-testid="artifacts-gallery" className={masonryOwnsScroll
       ? (fillPage ? '-mr-3 flex-1 min-h-0' : '-mr-3 h-[60vh]')
       : '-mr-3'}>
       {asList ? (
@@ -811,7 +817,12 @@ function SessionDocsGallery({ docs, pending, onMaterialize, materializingPath, o
             <SessionDocStar d={d} busy={materializingPath === d.path} onMaterialize={handleMaterialize} />
             <FileText size={13} className="text-ok shrink-0" />
             <span className="text-sm text-text-strong font-medium truncate min-w-0 max-w-[280px]">{d.name}</span>
-            <span className="text-[11px] text-muted truncate min-w-0 flex-1">{d.path}</span>
+            {/* The path control is as wide as its text, so the free space after
+              * it keeps the row's preview click. Wrapping puts a launch
+              * refusal on its own line under the path. */}
+            <span className="flex flex-wrap items-center gap-x-2 gap-y-0.5 min-w-0 flex-1">
+              <SessionDocPath path={d.path} className="text-[11px] text-muted truncate min-w-0" />
+            </span>
             <span className="text-[12px] text-muted truncate min-w-0 max-w-[180px]" title={d.session_title}>{d.session_title}</span>
             <span className="text-[12px] text-muted whitespace-nowrap shrink-0">{_timeAgo(isoToTs(d.updated_at))}</span>
           </Clickable>
@@ -1551,6 +1562,9 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
     () => scopedVisible.map((a) => ({ kind: 'local' as const, key: a.slug, art: a })),
     [scopedVisible],
   )
+  // The library is where an artifact is chosen; opening one makes the pick,
+  // reported by the artifact's own page (ArtifactDetailPage).
+  useGuideSelection('artifact_open', { selected: false, available: gridEntries.length > 0 })
 
   const handleDelete = useCallback((a: Artifact) => {
     if (window.confirm(i18nT('pages.artifactsPage.remove_artifact_confirm', { slug: a.slug }))) {
@@ -1641,6 +1655,7 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
         type="button"
         onClick={() => { setPinnedOnly(true); safeSetItem('mc-artifacts-pinned-only', '1') }}
         aria-pressed={pinnedOnly}
+        {...uiLocation('artifacts.starred')}
         className={`px-2.5 py-1 rounded-md text-[12px] font-medium transition-colors cursor-pointer border-none inline-flex items-center gap-1 ${pinnedOnly ? 'bg-accent text-accent-fg' : 'bg-transparent text-muted hover:text-text'}`}
       >
         <Star size={12} className={pinnedOnly ? 'fill-current' : ''} /> {i18nT('pages.artifactsPage.starred')}
@@ -1775,10 +1790,11 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
                 disabled={newArtifactMut.isPending}
                 className="flex items-center gap-1.5 rounded-r-none"
                 title={i18nT('pages.artifactsPage.start_a_new_blank_document_in_the_library')}
+                {...uiLocation('artifacts.new')}
               >
                 {newArtifactMut.isPending ? <Loader2 size={13} className="animate-spin" /> : <FilePlus size={13} />} {i18nT('pages.artifactsPage.new_artifact')}
               </Btn>
-              <DropdownMenu>
+              <DropdownMenu guideScope="menu:artifacts.add-menu">
                 <DropdownMenuTrigger asChild>
                   <Btn
                     // On a phone this menu also holds the folder action, so an
@@ -1797,12 +1813,13 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
                     // pinning a literal height that the label's font would
                     // outgrow.
                     className="rounded-l-none border-l-0 px-1 self-stretch"
+                    {...uiLocation('artifacts.add-menu')}
                   >
                     {addArtifactMut.isPending ? <Loader2 size={13} className="animate-spin" /> : <ChevronDown size={13} />}
                   </Btn>
                 </DropdownMenuTrigger>
                 <DropdownMenuContent align="end">
-                  <DropdownMenuItem onSelect={handleAddArtifact}>
+                  <DropdownMenuItem onSelect={handleAddArtifact} {...uiLocation('artifacts.import')}>
                     <FileText size={13} className="text-muted shrink-0" /> {i18nT('pages.artifactsPage.import_from_a_file')}
                   </DropdownMenuItem>
                   {/* On a phone this menu is also where the folder action lives:
@@ -1844,7 +1861,7 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
               onChange={handleAddArtifactFile}
             />
             {!isMobile && (
-              <Btn onClick={handleNewFolder} className="flex items-center gap-1.5" title={i18nT('pages.artifactsPage.create_a_folder_to_organize_your_artifacts')}>
+              <Btn onClick={handleNewFolder} className="flex items-center gap-1.5" title={i18nT('pages.artifactsPage.create_a_folder_to_organize_your_artifacts')} {...uiLocation('artifacts.new-folder')}>
                 <FolderPlus size={13} /> {i18nT('pages.artifactsPage.new_folder')}
               </Btn>
             )}
@@ -1903,7 +1920,7 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
               </div>
             </div>
             {cloudDeployEnabled && !isMobile && deployPreview && (
-              <Btn onClick={() => navigate('/deploy')} className="flex items-center gap-1.5 ml-auto" title={i18nT('pages.artifactsPage.artifact_deploy_aws_profiles_and_published_sites')}>
+              <Btn onClick={() => navigate('/deploy')} className="flex items-center gap-1.5 ml-auto" title={i18nT('pages.artifactsPage.artifact_deploy_aws_profiles_and_published_sites')} {...uiLocation('artifacts.deploy')}>
                 <Globe size={13} /> {i18nT('pages.artifactsPage.artifact_deploy')}
               </Btn>
             )}

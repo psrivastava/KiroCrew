@@ -44,10 +44,15 @@ from __future__ import annotations
 
 # System-trust injection is process-local and must run before imports below can
 # create or cache an SSLContext. Environment-only CA settings are inherited
-# from GatewayManager, but Security.framework-backed contexts are not.
+# from GatewayManager, but Security.framework-backed contexts are not. The
+# inherited llama.cpp path is removed before any thread or child process exists
+# because a concurrent environment snapshot can observe a removal between
+# enumerating and reading the key.
+from kiro_crew._llama_lib_path import drop_inherited_lib_path
 from kiro_crew._ssl_compat import _ensure_ssl_certs
 
 _ensure_ssl_certs()
+drop_inherited_lib_path()
 
 import asyncio
 import contextlib
@@ -81,7 +86,7 @@ from kiro_crew.mcp_caller import _parent_pid as _ppid_fn  # noqa: F401
 from kiro_crew.mcp_cleanup import KIROCREW_BIN_MCP_SERVERS  # noqa: F401 - not a seam
 from kiro_crew.mcp_gateway import socketsec  # noqa: F401
 from kiro_crew.mcp_gateway import tool_surface  # noqa: F401 - not a seam
-from kiro_crew.mcp_gateway import credwatch, hazards, launch_approval, transport
+from kiro_crew.mcp_gateway import backend_record, credwatch, hazards, launch_approval, transport
 from kiro_crew.mcp_gateway.admission import SpawnGateClosed  # noqa: F401 - not a seam
 from kiro_crew.mcp_gateway.admission import SpawnGateTimeout  # noqa: F401 - not a seam
 from kiro_crew.mcp_gateway.admission import (
@@ -193,6 +198,7 @@ from kiro_crew.mcp_gateway.daemon.identity import (  # noqa: F401
     _conn_index_add,
     _conn_index_discard,
     _peer_admitted,
+    _pid_live_tenants,
     _register_pids,
     _resolve_peer_identity,
     _resolve_register_identity,
@@ -504,6 +510,26 @@ async def run_gatewayd(
             socket_path,
         )
         return
+    # The lock proves no other daemon serves this socket, so a backend record
+    # still on disk was left by a generation that died without draining (crash,
+    # OOM-kill, an outside SIGKILL) and nobody else will act on it: the first
+    # heartbeat below would overwrite it. Move it aside now; the kills run as a
+    # background task below, so how much leaked does not delay the bind the
+    # manager is timing.
+    try:
+        stale_records = await asyncio.to_thread(
+            backend_record.detach, backend_record.record_path(socket_path)
+        )
+    except OSError:
+        # Serving over a record that could not be moved aside would overwrite
+        # it on the first heartbeat (backend_record.detach). Refuse to start;
+        # the manager's respawn retries, and stubs use per-session exec meanwhile.
+        logger.error(
+            "gatewayd: could not move the previous backend record aside -- refusing to start",
+            exc_info=True,
+        )
+        os.close(lock_fd)
+        raise
     await transport.remove_stale(socket_path)
 
     resolver = target_resolver if target_resolver is not None else env_target_resolver
@@ -653,10 +679,18 @@ async def run_gatewayd(
     flush_sweeper: Optional[asyncio.Task[None]] = None
     topup_sweeper: Optional[asyncio.Task[None]] = None
     credential_watchers: list[asyncio.Task[None]] = []
+    boot_reap: Optional[asyncio.Task[int]] = None
     # The warm-pool passes and their tasks (a no-op owner when prewarming is off).
     prewarmer = _Prewarmer(pool, resolver, admission, hot_keys, prewarm_count)
 
     try:
+        if stale_records:
+            boot_reap = asyncio.create_task(
+                backend_record.reap_all(
+                    stale_records, reason="left by a previous gatewayd that did not drain"
+                ),
+                name="mcp-gateway-boot-reap",
+            )
         # Local IPC endpoint: an AF_UNIX socket on POSIX, a named pipe on
         # Windows. ``transport`` owns the platform split so nothing here (or in
         # the stub, the manager, claim or abort) has to know which is in play.
@@ -868,6 +902,9 @@ async def run_gatewayd(
         await prewarmer.cancel_all()
 
         await _retire_task(flush_sweeper)
+        # Retired like the sweepers: an interrupted reap leaves its
+        # ``.reaping`` file in place, and the next boot picks it up again.
+        await _retire_task(boot_reap)
 
         # Final flush so the last observation window isn't lost on a clean
         # shutdown. Off the loop; best-effort (we're tearing down anyway).
@@ -895,7 +932,7 @@ async def run_gatewayd(
         logger.info("gatewayd stopped")
 
 
-async def _retire_task(task: Optional[asyncio.Task[None]]) -> None:
+async def _retire_task(task: Optional["asyncio.Task[Any]"]) -> None:
     """Cancel one of ``run_gatewayd``'s background tasks and wait for it to end."""
     if task is None:
         return

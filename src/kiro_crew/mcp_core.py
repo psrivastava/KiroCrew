@@ -54,18 +54,22 @@ from kiro_crew.loopback_http import loopback_urlopen
 from kiro_crew.mcp_caller import (
     CallerContext,
     current_caller,
+    host_pid_is_shared,
     resolve_own_identity,
     set_current_caller,
 )
 from kiro_crew.mcp_shared import (
+    DeferredTool,
     call_tool_with_logging,
+    drive_deferred,
     external_client_identity_note,
     internal_caller,
+    map_deferred,
     run_mcp_stdio_loop,
     spawned_without_gateway_identity,
 )
 from kiro_crew.mcp_tool_titles import with_titles
-from kiro_crew.mcp_tools import build_tool_list, dispatch
+from kiro_crew.mcp_tools import build_tool_list, build_tool_names, dispatch
 from kiro_crew.members import record_activity
 from kiro_crew.memory_stores import UnknownMemoryStore
 from kiro_crew.messaging.link import is_legacy_slack_key, legacy_key
@@ -89,6 +93,7 @@ from kiro_crew.skills import SkillsLoader
 from kiro_crew.trigger_match import rank_triggered
 from kiro_crew.validation import (
     MCP_CORE_SCHEMAS,
+    coerce_mcp_tool_args,
     validate_tool_args,
 )
 
@@ -494,6 +499,21 @@ def _list_tools() -> list[dict[str, Any]]:
     return with_titles(CORE_MCP_SERVER, build_tool_list())
 
 
+def _list_tool_names() -> list[str]:
+    """Tool NAMES only, without assembling descriptions.
+
+    The names-only read path ``mcp_discovery._managed_tools_in_process`` prefers
+    when it keeps only names. It returns exactly the names ``_list_tools`` would,
+    in the same order, but ``build_tool_names`` takes the ``names_only`` path so
+    the two descriptions that reach for a live value (the sub-agent cap and
+    agents-directory scan in ``mcp_tools.spawn``, the config reads in
+    ``mcp_tools.control``) are never performed. ``with_titles`` is intentionally
+    not applied: it only decorates descriptions, which a names-only caller
+    discards.
+    """
+    return build_tool_names()
+
+
 def _internal_secret() -> str:
     """Credential for the gateway this client will dial, paired to its port.
 
@@ -675,7 +695,12 @@ def _resolve_session_key_strict() -> str:
        broker stub, no config key) — which is why it is accepted ABOVE the env
        var: where the two disagree, a warm-pool rekey has made the env stale and
        the file is current.
-    2. The gateway-injected ``KIROCREW_SESSION_KEY`` env var.
+    2. The gateway-injected ``KIROCREW_SESSION_KEY`` env var, EXCEPT on a host
+       pid the mapping records as hosting several sessions. The var is stamped
+       once per runtime and inherited by every MCP child of it, so on a shared
+       runtime it names one tenant and cannot say which one is calling — the same
+       ground on which source 3 refuses such a pid
+       (:func:`_host_pid_hosts_several_sessions`).
     3. The direct ``KIROCREW_HOST_PID`` -> ``session_pid_<pid>.txt``
        lookup, but ONLY when the HMAC sidecar written by the gateway
        verifies (:func:`kiro_crew.session_pid_sig.verify_session_pid`).
@@ -725,10 +750,17 @@ def _resolve_session_key_strict() -> str:
     if from_token:
         return from_token
     sk = os.environ.get("KIROCREW_SESSION_KEY", "")
-    if sk:
+    host_pid = os.environ.get("KIROCREW_HOST_PID", "")
+    # The env var is PROCESS-keyed: it is stamped once, with the session the
+    # runtime was spawned for, and every MCP child of that runtime inherits the
+    # same value. One runtime hosts many ACP sessions, so on a runtime a signed
+    # mapping records as multi-tenant the var names ONE tenant and cannot say
+    # which one is calling — the same reason source 3 below refuses such a pid.
+    # Answering would attribute this caller to a co-tenant and a state-mutating
+    # tool would write another session's state.
+    if sk and not _host_pid_hosts_several_sessions(host_pid):
         return sk
     try:
-        host_pid = os.environ.get("KIROCREW_HOST_PID", "")
         if host_pid.isdigit():
             from kiro_crew.session_pid_sig import verify_session_pid
 
@@ -736,6 +768,30 @@ def _resolve_session_key_strict() -> str:
     except Exception:
         pass
     return ""
+
+
+def _host_pid_hosts_several_sessions(host_pid: str) -> bool:
+    """True only when the mapping POSITIVELY records several sessions on *host_pid*.
+
+    Delegates to :func:`kiro_crew.mcp_caller.host_pid_is_shared`, the one answer
+    both resolvers share, so the strict path and the client-side ladder cannot
+    disagree about how many sessions a pid serves, nor about which mapping read
+    decides it.
+
+    That shared answer takes the UNSIGNED read on purpose, because it only ever
+    DENIES an identity. A same-uid agent that forges a tenant section costs its
+    target a refusal that names the reason, while the MAC-verified read would
+    make the guard silently inert wherever the SEL trust root is missing, which
+    is exactly where identity is already weakest. Source 3 below still demands
+    the MAC, because source 3 GRANTS a key.
+
+    Absence is NOT evidence: a missing or malformed mapping answers False and
+    leaves the env var exactly as authoritative as it was, so the single-session
+    topology the var was written for is unaffected and only a pid recorded as
+    shared loses it. Never raises -- an identity source that can raise would turn
+    a resolvable session into a crashed tool call.
+    """
+    return host_pid_is_shared(host_pid)
 
 
 def strict_identity_diagnosis(server: str = "kirocrew-core") -> str:
@@ -844,6 +900,7 @@ REFLEXIVE_TOOL_MODULES: frozenset[str] = frozenset(
         "mcp_debug.py",
         "mcp_work.py",
         "mcp_panel.py",
+        "mcp_guide.py",
         "mcp_tools/apps.py",
         "mcp_tools/control.py",
         "mcp_tools/learn.py",
@@ -1355,9 +1412,9 @@ def _transport_failure(message: str, mark: bool) -> dict:
     ``transport_error`` means acceptance is undetermined — the request may have
     reached the gateway before the response failed (a read timeout after spawn
     acceptance, say), so the caller must not declare a definite rejection nor
-    retry on its own. Only spawn_run's batch reconcile consumes it, and it only
-    ever posts, so the flag stays opt-in per verb rather than becoming a new field
-    on every reply.
+    retry on its own. Its readers (spawn_run's batch reconcile, the cron tool
+    proxy, learn_add) all post, so the flag stays opt-in per verb rather than
+    becoming a new field on every reply.
     """
     out: dict[str, object] = {"error": message}
     if mark:
@@ -1591,9 +1648,10 @@ def _post(
         return {"error": _sk_err}
     if sk:
         headers["X-Session-Key"] = sk
-    # ``transport_error`` is consumed only by spawn_run's batch reconcile: it
-    # means acceptance is unknown, so that member must not be declared lost.
-    # Other _post callers should treat the payload as a normal error.
+    # ``transport_error`` means acceptance is unknown. A caller that reads it
+    # (spawn_run's batch reconcile, the cron tool proxy, learn_add) must not
+    # report a definite failure; other _post callers treat the payload as a
+    # normal error.
     return _send(
         path,
         data=data,
@@ -1927,7 +1985,12 @@ def _validate_args(name: str, args: dict[str, Any]) -> dict[str, Any]:
     """Validate tool arguments against schema. Returns cleaned args."""
     schema = MCP_CORE_SCHEMAS.get(name)
     if schema:
-        return validate_tool_args(args, schema)
+        # Repair an int that an upstream deferred-schema runtime re-typed from a
+        # numeric-looking string ("42" -> 42) back to its string form on a
+        # string field, BEFORE validation. This lives at the MCP entry point —
+        # not in the shared validate_field — so the dashboard HTTP endpoints
+        # keep their original contract (see coerce_mcp_tool_args).
+        return validate_tool_args(coerce_mcp_tool_args(args, schema), schema)
     return args  # tools without schemas pass through
 
 
@@ -2107,6 +2170,19 @@ def derive_directive(
 
 
 def _call_tool(name: str, raw_args: dict[str, Any]) -> str:
+    """Run one tool call to completion and return its text.
+
+    The entry point every direct caller and test uses. A handler that returns
+    a :class:`DeferredTool` (``wait``, ``spawn_sub_agents``) is driven to
+    completion here, so from this side a deferred tool is a blocking one. The
+    stdio server uses :func:`_call_tool_deferrable` instead, which hands the
+    deferred object to the dispatch loop's timer rather than sleeping on it.
+    """
+    result = _call_tool_deferrable(name, raw_args)
+    return drive_deferred(result, clock=time) if isinstance(result, DeferredTool) else result
+
+
+def _call_tool_deferrable(name: str, raw_args: dict[str, Any]) -> "str | DeferredTool":
     # Call-in-flight record for control._emit_directive: the tool name and the
     # RAW arguments (pre-validation), which is what the gateway is told so it can
     # re-derive the directive itself. Cleared on exit so a direct handler call in
@@ -2126,7 +2202,7 @@ def _call_tool(name: str, raw_args: dict[str, Any]) -> str:
         _CURRENT_CALL_RAW_ARGS.reset(_t_args)
 
 
-def _call_tool_body(name: str, raw_args: dict[str, Any]) -> str:
+def _call_tool_body(name: str, raw_args: dict[str, Any]) -> "str | DeferredTool":
     if _DIRECTIVE_CAPTURE.get() is not None:
         # Gateway-side derivation (derive_directive): the handler's only write is
         # the directive it publishes, which capture_directive intercepts, and the
@@ -2146,20 +2222,22 @@ def _call_tool_body(name: str, raw_args: dict[str, Any]) -> str:
     # produced it, so a directive emitted by the PREVIOUS call must not be able
     # to authorize marker-shaped bytes in this one.
     clear_vouch()
-    return refuse_if_markerless(
+    result = call_tool_with_logging(
         name,
-        call_tool_with_logging(
-            name,
-            raw_args,
-            _validate_args,
-            _call_tool_inner,
-            # Real caller identity when resolvable (per-call caller context in
-            # pooled backends, env/PID otherwise) — a hardcoded "mcp_core" lost
-            # attribution for every standard tool audit in shared backends.
-            session_key=_resolve_session_key() or "mcp_core",
-            downstream_service="kirocrew-core",
-        ),
+        raw_args,
+        _validate_args,
+        _call_tool_inner,
+        # Real caller identity when resolvable (per-call caller context in
+        # pooled backends, env/PID otherwise) — a hardcoded "mcp_core" lost
+        # attribution for every standard tool audit in shared backends.
+        session_key=_resolve_session_key() or "mcp_core",
+        downstream_service="kirocrew-core",
     )
+    if isinstance(result, DeferredTool):
+        # Not a result yet: the loop answers the call when a step settles it,
+        # and the tag below is applied to that text then, as it is here.
+        return map_deferred(result, lambda text: refuse_if_markerless(name, text))
+    return refuse_if_markerless(name, result)
 
 
 # ── Chat-history search helpers (Phase 1: search_chat_history / get_chat_session) ──
@@ -2706,7 +2784,7 @@ def _crew_ledger_view(payload: dict[str, Any]) -> dict[str, Any]:
     return view
 
 
-def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
+def _call_tool_inner(name: str, args: dict[str, Any]) -> "str | DeferredTool":
     """Run one tool call and return its text result.
 
     Handlers live beside their descriptors in :mod:`kiro_crew.mcp_tools`; this
@@ -2754,7 +2832,9 @@ def run_mcp_core_server() -> None:
         "kirocrew-core",
         "1.0.0",
         _list_tools,
-        _call_tool,
+        # Deferrable: a waiting tool hands the loop a DeferredTool instead of
+        # holding the worker (see mcp_shared.DeferredTool).
+        _call_tool_deferrable,
         # Pooled-operation opt-in: kirocrew-core consumes the per-call
         # ``kirocrew.caller`` identity (see _resolve_session_key*), so it is
         # safe to share one backend across sessions. All four managed servers
@@ -2763,4 +2843,7 @@ def run_mcp_core_server() -> None:
         # pooled all the same (nothing declines to pool one; see
         # ``rewriter.UNPOOLABLE_SERVERS``) and simply never receives an identity.
         advertise_caller_identity=ADVERTISE_CALLER_IDENTITY,
+        # The only server that parks DeferredTools, so the only one whose
+        # gateway needs the in-flight report (see run_mcp_stdio_loop).
+        reports_inflight=True,
     )

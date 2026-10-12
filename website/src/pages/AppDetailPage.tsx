@@ -19,6 +19,7 @@ import { needsDesktopApp } from '../lib/electron'
 import { api } from '../api/client'
 import { isNotFoundError } from '../api/apiError'
 import { PageHeader, Card, CardTitle, Badge, Btn } from '../components/ui'
+import { uiLocation } from '../uiLocations/uiLocation'
 import SessionApprovalModes from '../components/appstore/SessionApprovalModes'
 import AppIcon from '../components/AppIcon'
 import TrustAppModal, {
@@ -29,6 +30,7 @@ import AppSource from '../components/appstore/AppSource'
 import { recordEvent } from '../rum'
 import { useTheme } from '../hooks/useTheme'
 import { DOUBLE_TAP_MS, DOUBLE_TAP_SLOP, DOUBLE_TAP_ZOOM, usePinchZoom } from '../hooks/usePinchZoom'
+import { useScrollEdges } from '../hooks/useScrollEdges'
 import ErrorNotice from '../components/ErrorNotice'
 import { useConfirm } from '../components/ConfirmDialog'
 import { findReport, recordError } from '../utils/errorReport'
@@ -91,6 +93,7 @@ type AppInfo = Pick<RegistryApp, '_registry' | 'provenance'> & {
   installedVersion?: string
   enabled?: boolean
   sessionApprovalConsentPending?: boolean
+  approvedGrants?: { api?: string[]; events?: string[] }
   managed?: string
   source?: string
   installedAt?: string
@@ -225,6 +228,7 @@ const DRAG_SLOP = 6
 
 export function ScreenshotGallery({ screenshots, fallbacks }: { screenshots: string[]; fallbacks?: string[] }) {
   const [selected, setSelected] = useState<number | null>(null)
+  const [attachEdges, edges, remeasure] = useScrollEdges<HTMLDivElement>()
   // Both lists are TYPED string[] but can arrive as arbitrary JSON at
   // runtime: the registry-only branch spreads the raw (third-party) registry
   // row into the view model, so a malformed row declaring `screenshots: {}`
@@ -242,6 +246,10 @@ export function ScreenshotGallery({ screenshots, fallbacks }: { screenshots: str
   // stay default-inert (the contract #6865 locked for AppIcon).
   const screensKey = screenList.join('\n')
   const fallbacksKey = fallbackList.join('\n')
+  // The scroller keeps its box while its thumbnails change (list refetch, a
+  // thumbnail resolving or going terminal), so only this remeasure refreshes
+  // the edge cue; per-image onLoad covers late width settling. The remeasure
+  // effect itself lives below, after the failure latches it depends on.
   // Re-arm the latches during render rather than in a passive effect. An image
   // rendered for a new generation can fail BEFORE an effect would run, and the
   // effect's reset would then erase that real failure and re-show the dead URL.
@@ -278,6 +286,14 @@ export function ScreenshotGallery({ screenshots, fallbacks }: { screenshots: str
     && failures.fallbacksKey === fallbacksKey
     ? failures.fallback
     : NO_SCREENSHOT_FAILURES
+
+  // Refresh the edge cue when the thumbnail set changes. A thumbnail going
+  // terminal UNMOUNTS its button (resolvedAt -> ''), shrinking scrollWidth
+  // with no onLoad, no box resize and — at scrollLeft 0 — no scroll event, so
+  // the failure-latch sizes are a dep alongside screensKey: an unmount that
+  // makes the strip fit must clear a now-stale right-edge fade.
+  const failedCount = primaryFailed.size + fallbackFailed.size
+  useEffect(() => { remeasure() }, [screensKey, failedCount, remeasure])
 
   // ── screenshot magnification (issue #6162) ────────────────────────────────
   // This lightbox is the third full-viewport magnify overlay, bound by the same
@@ -414,7 +430,11 @@ export function ScreenshotGallery({ screenshots, fallbacks }: { screenshots: str
     <>
       <div className="mb-6">
         <div className="text-[12px] text-muted uppercase tracking-wider mb-3">{i18nT('pages.appDetailPage.screenshots')}</div>
-        <div className="flex gap-3 overflow-x-auto pb-2 scrollbar-none">
+        {/* The wrapper exists for the edge cues: absolutely-positioned children
+            of the scroller travel with the scrolled content, so the fades
+            anchor to this non-scrolling parent instead. */}
+        <div className="relative">
+        <div ref={attachEdges} className="flex gap-3 overflow-x-auto pb-2 scrollbar-none">
           {screenList.map((_, i) => {
             // Second chance per thumbnail; a terminal index unmounts its
             // button entirely — the old display:none shape left an invisible,
@@ -444,10 +464,21 @@ export function ScreenshotGallery({ screenshots, fallbacks }: { screenshots: str
                       previous, screensKey, fallbacksKey, i, tier,
                     ))
                   }}
+                  onLoad={() => remeasure()}
                 />
               </button>
             )
           })}
+        </div>
+        {/* Edge cues: this scroller hides its scrollbar (scrollbar-none), so a
+            gradient is the only signal that thumbnails continue past the
+            clipped edge. from-bg matches the page surface. */}
+        {edges.left && (
+          <div aria-hidden="true" data-testid="app-screenshots-cue-left" className="pointer-events-none absolute left-0 top-0 bottom-0 w-6 z-10 bg-gradient-to-r from-bg to-transparent" />
+        )}
+        {edges.right && (
+          <div aria-hidden="true" data-testid="app-screenshots-cue-right" className="pointer-events-none absolute right-0 top-0 bottom-0 w-6 z-10 bg-gradient-to-l from-bg to-transparent" />
+        )}
         </div>
       </div>
 
@@ -616,6 +647,17 @@ export default function AppDetailPage() {
   const reconsentMsg = app?.sessionApprovalConsentPending
     ? i18nT('pages.appDetailPage.session_approval_reconsent_notice', { name: appDisplayName(app) })
     : ''
+  // Declared api/events entries outside the approved set (`approvedGrants`) are
+  // held back: the app runs without them until the owner approves them here.
+  const stagedApi = app?.approvedGrants
+    ? (app.manifest?.permissions?.api || []).filter(p => !(app.approvedGrants?.api || []).includes(p))
+    : []
+  const stagedEvents = app?.approvedGrants
+    ? (app.manifest?.permissions?.events || []).filter(e => !(app.approvedGrants?.events || []).includes(e))
+    : []
+  const hasStagedGrants = stagedApi.length + stagedEvents.length > 0
+  // Shown where the notice was once the owner approves, so the moment is confirmed.
+  const [grantsApprovedMsg, setGrantsApprovedMsg] = useState('')
   const enableLabel = app?.sessionApprovalConsentPending
     ? i18nT('pages.appDetailPage.enable_and_allow_chat_control')
     : i18nT('pages.appDetailPage.enable')
@@ -784,6 +826,7 @@ export default function AppDetailPage() {
             installedVersion: installed.version,
             enabled: installed.enabled,
             sessionApprovalConsentPending: installed.sessionApprovalConsentPending,
+            approvedGrants: installed.approvedGrants,
             managed: installed.managed,
             source: installed.source,
             installedAt: installed.installedAt,
@@ -908,6 +951,7 @@ export default function AppDetailPage() {
             installedVersion: installed.version,
             enabled: installed.enabled,
             sessionApprovalConsentPending: installed.sessionApprovalConsentPending,
+            approvedGrants: installed.approvedGrants,
             managed: installed.managed,
             source: installed.source,
             installedAt: installed.installedAt,
@@ -1393,6 +1437,78 @@ export default function AppDetailPage() {
           </div>
         )}
 
+        {app.installed && hasStagedGrants && (
+          <div
+            role="status"
+            className="mb-4 flex flex-wrap items-start gap-3 rounded-lg border border-warn/30 bg-warn-subtle p-3 animate-rise"
+          >
+            <ShieldAlert size={14} className="mt-[3px] shrink-0 text-warn" />
+            <div className="text-text text-sm flex-1 min-w-0 grid gap-2">
+              <span>
+                {app.enabled
+                  ? i18nT('pages.appDetailPage.grants_reconsent_notice', { name: appDisplayName(app) })
+                  : i18nT('pages.appDetailPage.grants_reconsent_notice_disabled', { name: appDisplayName(app) })}
+              </span>
+              {app.enabled && (
+                <span className="text-[13px] text-text">{i18nT('pages.appDetailPage.grants_reconsent_keep', { name: appDisplayName(app) })}</span>
+              )}
+              {stagedApi.length > 0 && (
+                <div>
+                  <div className="text-[13px]">{i18nT('pages.appDetailPage.grants_reconsent_api')}</div>
+                  <div className="flex flex-wrap gap-1 mt-1">
+                    {stagedApi.map(p => (
+                      <code key={p} className="bg-bg-elevated border border-border px-1.5 py-0.5 rounded text-[11px] text-text">{p}</code>
+                    ))}
+                  </div>
+                </div>
+              )}
+              {stagedEvents.length > 0 && (
+                <div>
+                  <div className="text-[13px]">{i18nT('pages.appDetailPage.grants_reconsent_events')}</div>
+                  <div className="flex flex-wrap gap-1 mt-1">
+                    {stagedEvents.map(e => (
+                      <code key={e} className="bg-bg-elevated border border-border px-1.5 py-0.5 rounded text-[11px] text-text">{e}</code>
+                    ))}
+                  </div>
+                </div>
+              )}
+              {app.enabled && (
+                <span className="text-[13px] text-muted">{i18nT('pages.appDetailPage.grants_reconsent_undo', { name: appDisplayName(app) })}</span>
+              )}
+            </div>
+            {/* Approval is offered only on a running app: on a disabled one the
+                enable route would also switch the app on. Enabling it first runs
+                it on the approved set, and the notice stays until approval. */}
+            {app.enabled && (
+            <Btn
+              primary
+              onClick={async () => {
+                setActionLoading('approve_grants')
+                const approved = [...stagedApi, ...stagedEvents].join(', ')
+                try {
+                  await api.enableApp(app.name, false, { api: stagedApi, events: stagedEvents })
+                  setGrantsApprovedMsg(i18nT('pages.appDetailPage.grants_approved', { entries: approved }))
+                  await load()
+                  window.dispatchEvent(new Event('mc:apps-changed'))
+                } catch (e) {
+                  setError(e instanceof Error ? e.message : String(e))
+                } finally {
+                  setActionLoading(null)
+                }
+              }}
+              disabled={actionLoading === 'approve_grants'}
+            >
+              {i18nT('pages.appDetailPage.approve_new_permissions')}
+            </Btn>
+            )}
+          </div>
+        )}
+        {grantsApprovedMsg && !hasStagedGrants && (
+          <div role="status" className="mb-4 bg-ok/10 border border-ok/20 rounded-lg p-3 animate-rise">
+            <span className="text-ok text-sm block">{grantsApprovedMsg}</span>
+          </div>
+        )}
+
         {/* Error. No special execution-policy branch here any more: an untrusted
             third-party app is refused with `app_execution_denied`, and that
             refusal is now resolved INLINE by the consent modal (granting this
@@ -1533,7 +1649,7 @@ export default function AppDetailPage() {
             {/* Actions */}
             <div className="flex items-center gap-2 flex-wrap">
               {!app.installed && !clientInstall && (
-                <Btn primary onClick={handleInstall} disabled={actionLoading === 'install' || installRefusedForGood} title={installDisabledTitle}>
+                <Btn {...uiLocation('apps.detail.install')} primary onClick={handleInstall} disabled={actionLoading === 'install' || installRefusedForGood} title={installDisabledTitle}>
                   {actionLoading === 'install' ? <><Loader2 size={14} className="animate-spin" /> {i18nT('pages.appDetailPage.installing')}</> : <><Download size={14} /> {i18nT('pages.appDetailPage.install')}</>}
                 </Btn>
               )}
@@ -1576,7 +1692,7 @@ export default function AppDetailPage() {
               {app.installed && !isSelfManaged && !isBuiltin && (
                 <>
                   {app.enabled ? (
-                    <Btn onClick={() => handleAction('disable')} disabled={actionLoading === 'disable'}><PowerOff size={14} /> {i18nT('pages.appDetailPage.disable')}</Btn>
+                    <Btn {...uiLocation('apps.detail.disable')} onClick={() => handleAction('disable')} disabled={actionLoading === 'disable'}><PowerOff size={14} /> {i18nT('pages.appDetailPage.disable')}</Btn>
                   ) : (
                     /* Enable stays available in a browser: enabling is a
                        server-side state change (backend, agents and crons run
@@ -1603,9 +1719,9 @@ export default function AppDetailPage() {
                   )}
                     </>
                   )}
-                  {canUpdate && app.updateAvailable && <Btn onClick={handleInstall} disabled={actionLoading === 'install' || installRefusedForGood} title={installDisabledTitle} className="!bg-[var(--info)] !text-white hover:!opacity-80">{actionLoading === 'install' ? <><Loader2 size={14} className="animate-spin" /> {i18nT('pages.appDetailPage.updating')}</> : <><ArrowUp size={14} /> {i18nT('pages.appDetailPage.update')}</>}</Btn>}
-                  {canUpdate && !app.updateAvailable && <Btn onClick={() => handleAction('update')} disabled={actionLoading === 'update'} title={i18nT('pages.appDetailPage.sync_app_from_its_source_directory')}><RefreshCw size={14} /> {i18nT('pages.appDetailPage.sync')}</Btn>}
-                  {canUninstall && <Btn danger onClick={() => handleAction('uninstall')} disabled={actionLoading === 'uninstall'}><Trash2 size={14} /> {i18nT('pages.appDetailPage.uninstall')}</Btn>}
+                  {canUpdate && app.updateAvailable && <Btn {...uiLocation('apps.detail.update')} onClick={handleInstall} disabled={actionLoading === 'install' || installRefusedForGood} title={installDisabledTitle} className="!bg-[var(--info)] !text-white hover:!opacity-80">{actionLoading === 'install' ? <><Loader2 size={14} className="animate-spin" /> {i18nT('pages.appDetailPage.updating')}</> : <><ArrowUp size={14} /> {i18nT('pages.appDetailPage.update')}</>}</Btn>}
+                  {canUpdate && !app.updateAvailable && <Btn {...uiLocation('apps.detail.sync')} onClick={() => handleAction('update')} disabled={actionLoading === 'update'} title={i18nT('pages.appDetailPage.sync_app_from_its_source_directory')}><RefreshCw size={14} /> {i18nT('pages.appDetailPage.sync')}</Btn>}
+                  {canUninstall && <Btn {...uiLocation('apps.detail.uninstall')} danger onClick={() => handleAction('uninstall')} disabled={actionLoading === 'uninstall'}><Trash2 size={14} /> {i18nT('pages.appDetailPage.uninstall')}</Btn>}
                 </>
               )}
             </div>
@@ -1811,7 +1927,10 @@ export default function AppDetailPage() {
                     <div className="text-muted text-[11px] uppercase tracking-wider mb-1">{i18nT('pages.appDetailPage.api_access')}</div>
                     <div className="flex flex-wrap gap-1">
                       {(app.manifest.permissions.api || []).map((p: string) => (
-                        <code key={p} className="bg-bg-elevated border border-border px-1.5 py-0.5 rounded text-[11px] text-text">{p}</code>
+                        <code key={p} className="bg-bg-elevated border border-border px-1.5 py-0.5 rounded text-[11px] text-text">
+                          {p}
+                          {stagedApi.includes(p) && <span className="ml-1 text-warn">· {i18nT('pages.appDetailPage.grant_not_approved')}</span>}
+                        </code>
                       ))}
                     </div>
                   </div>
@@ -1821,7 +1940,10 @@ export default function AppDetailPage() {
                     <div className="text-muted text-[11px] uppercase tracking-wider mb-1">{i18nT('pages.appDetailPage.websocket_events')}</div>
                     <div className="flex flex-wrap gap-1">
                       {(app.manifest.permissions.events || []).map((e: string) => (
-                        <code key={e} className="bg-bg-elevated border border-border px-1.5 py-0.5 rounded text-[11px] text-text">{e}</code>
+                        <code key={e} className="bg-bg-elevated border border-border px-1.5 py-0.5 rounded text-[11px] text-text">
+                          {e}
+                          {stagedEvents.includes(e) && <span className="ml-1 text-warn">· {i18nT('pages.appDetailPage.grant_not_approved')}</span>}
+                        </code>
                       ))}
                     </div>
                   </div>

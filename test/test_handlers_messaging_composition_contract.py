@@ -601,6 +601,7 @@ _FACADE_DEFS = (
     "_threshold_pct_rejection",
     "_wide_env_refusal",
     "_write_env_off_loop",
+    "_write_env_or_roll_back",
     "_write_env_updates",
     "_write_env_updates_locked",
 )
@@ -907,8 +908,11 @@ _RESOLVED_DYNAMIC_PATCHES = {
     ),
     (
         "test_env_file_bom.py",
-        "test_a_save_that_keeps_its_config_says_the_other_settings_were_saved",
+        "test_a_wide_env_refuses_the_save_and_leaves_the_config_as_it_was",
     ): (frozenset({"_validate_discord_token", "_validate_telegram_token"})),
+    ("test_env_file_bom.py", "test_any_failed_env_write_rolls_the_config_back"): (
+        frozenset({"_validate_discord_token", "_validate_telegram_token"})
+    ),
 }
 
 

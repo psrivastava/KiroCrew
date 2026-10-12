@@ -56,7 +56,10 @@ carries:
   schedule). Picking two shows a crewmate in either state.
 
 Each row shows the crewmate's face, the last message in its thread, and a
-**Stopped** chip when you stopped that turn yourself.
+**Stopped** chip when you stopped that turn yourself. A crewmate whose own
+thread has a live monitor or goal loop running shows an **on watch** mark — a
+faint accent ring with one dot orbiting its avatar, and the word beside it —
+until the loop stops.
 
 ## The standing thread
 
@@ -65,6 +68,12 @@ The thread is derived from the crewmate's identity, so it is the same thread
 every time: closing it, restarting the gateway, or coming back a week later
 reopens the same conversation with its history. That is the point of a crewmate
 over an ordinary session — the context you built up with it is where you left it.
+
+Opening a thread that is new, or idle for six hours or more, with no goal in
+flight shows a welcome card above the chat: goals the crewmate left open (in
+this thread or a recent session of its own), then its recent sessions, and a
+prompt to pick one up. It is read from the session ledgers and the session list,
+with no model call and no chat turn, and shows once per idle stretch.
 
 Member threads are deliberately kept out of the Sessions list; the Crewmates
 page is their only home. The right-hand side panel is the chat page's panel with
@@ -81,14 +90,14 @@ A few situations make Kiro Crew refuse to open a thread rather than guess:
 
 | What you see | What happened |
 |---|---|
-| bound to a crew the registry no longer names | The crewmate was renamed or deleted while its thread survived. Restore the name, or delete the thread from History. |
+| bound to a crew the registry no longer names | The crewmate was renamed or deleted while its thread survived. Restore the name, or delete the thread from Older Sessions in the Sessions list. |
 | this thread's history exists but its binding is gone | The transcript is on disk with nothing claiming it. Handing it to whoever holds the name now would show one crewmate another's conversation. |
-| shares its short name with … | Two crewmates fold to the same short name and therefore the same thread. A crewmate cannot be renamed, so delete one and create it again under a name that folds differently. |
+| shares its short name with … | Two crewmates fold to the same short name and therefore the same thread. Renaming changes only the name a crewmate shows, never its short name, so delete one and create it again under a name that folds differently. |
 
 ## Creating and editing
 
 **New crewmate** — the hero button on an empty roster, or the **+** menu in the
-roster header once one exists (its rows are **New crewmate** and **New team**)
+roster header once one exists (its one row is **New crewmate**)
 — opens an in-page dialog on the Crewmates page. It asks for a **Name** and what the crewmate is **Built from** (the
 starting setup it copies), plus an optional line on **what it looks after**;
 **Advanced** unfolds the workspace, model, triggers and session color. Creating
@@ -108,8 +117,10 @@ second its own identity, so each keeps its own chat and memory.
 
 ### Teams
 
-Teams group the roster: **New team** in the **+** menu creates one, and its
-crewmates are listed under it. Opening a team shows the team view. When a
+Teams group the roster: a team's crewmates are listed under its header, and
+opening the team shows the team view. Creating a team is not offered on the
+page for now (the **+** menu has no **New team** row); an existing team is
+renamed, re-membered or deleted from its view's **Edit team**. When a
 crewmate there asks a question, an answer option drafts a reply in that
 crewmate's chat; nothing is sent until you send it. Deleting a team keeps its
 crewmates' chats.
@@ -130,8 +141,18 @@ kirocrew agent list
 kirocrew agent create --name oncall --kiro-agent kirocrew --workspace default
 kirocrew agent create --name oncall-2 --display-name "On-call 2" --kiro-agent kirocrew
 kirocrew agent update oncall --workspace incidents
+kirocrew agent update oncall --display-name "On-call"
 kirocrew agent delete oncall
 ```
+
+Renaming changes only the name a crewmate shows: its agent name, short name,
+chat, schedules and memory stay where they are, and `--display-name ""` goes
+back to showing the agent name. A name another crewmate already shows is
+refused, as is one with line breaks or hidden characters. A crewmate can also
+take a new name itself: tell it in its own chat what to call it, and it renames
+itself with the `rename_self` tool, under the same rules. It cannot rename
+another crewmate, and nothing but a message you send in the dashboard can make
+it rename itself.
 
 Creating a crewmate allocates its memory store for it. That store cannot later
 be pointed somewhere else or shared with another crewmate — `kirocrew agent

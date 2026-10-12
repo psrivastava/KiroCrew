@@ -238,6 +238,7 @@ class _GateMixin(ManagerComponent):
         crew: str = "",
         target_member: str | None = None,
         delegation: dict[str, str] | None = None,
+        backend: str | None = None,
         _execution_context: dict | None = None,
         _parent_spawn_policy: "ParentSpawnPolicy | None" = None,
         _agent_check: "AgentCheck | None" = None,
@@ -639,6 +640,9 @@ class _GateMixin(ManagerComponent):
             "max_turns": max_turns,
             "model": model,
             "reasoning_effort": reasoning_effort,
+            # The drain re-enters ``spawn`` from this dict alone: a run that hit
+            # the concurrency gate would otherwise start on the default backend.
+            "backend": backend,
             "allowed_tools": allowed_tools,
             "bare": bare,
             "cwd": resolved_cwd,
@@ -947,6 +951,7 @@ class _GateMixin(ManagerComponent):
             "parent_session_key": parent_session_key,
             "model": model or "",
             "reasoning_effort": reasoning_effort or "",
+            "backend": backend,
             "allowed_tools": list(allowed_tools) if allowed_tools else [],
             "bare": bare,
             "keep": keep,
@@ -1094,16 +1099,15 @@ class _GateMixin(ManagerComponent):
                     **_task_audit,
                 },
             )
-            memory_detail = (
-                unknown_note
-                if lane_held
-                else (
-                    f"{unknown_note}; need {min_mem:.1f} GB"
-                    if unknown_usage
-                    else f"low memory: {avail_gb:.1f} GB available, need {min_mem:.1f} GB "
+            if lane_held:
+                memory_detail = unknown_note
+            elif unknown_usage:
+                memory_detail = f"{unknown_note}; need {min_mem:.1f} GB"
+            else:
+                memory_detail = (
+                    f"low memory: {avail_gb:.1f} GB available, need {min_mem:.1f} GB "
                     f"({candidate_price or 0.0:.2f} GB for this start)"
                 )
-            )
             # A floor wait carries no pressure clock (the hold below is not
             # evaluated for it): one an earlier hold started is dropped, so time
             # spent below the floor never counts toward the hold's bound.
@@ -2083,8 +2087,9 @@ class _GateMixin(ManagerComponent):
         self._manager._forget_pending_start(info.id)
         if info.batch_id and self._manager._on_done:
             try:
-                self._manager._tasks[f"reject-{info.id}"] = asyncio.ensure_future(
-                    self._manager._safe_announce(info)
+                self._hold_announce_task(
+                    f"reject-{info.id}",
+                    asyncio.ensure_future(self._manager._safe_announce(info)),
                 )
             except RuntimeError:
                 pass  # no running loop (sync/test context)

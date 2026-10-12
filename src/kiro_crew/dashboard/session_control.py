@@ -28,7 +28,10 @@ that did not hold at admission. A dropped CROSS-SESSION delivery is reported bac
 to its sender too, since the target's own notice is on a transcript the sender
 does not read: the entry also carries the sending session, as a slot key plus
 that slot's tab identity (:func:`send_origin_meta`), and the drop appends a
-notice there (:func:`notify_send_origin_dropped`). A human-typed queued message
+notice there (:func:`notify_send_origin_dropped`). The two deliberate discards
+of a queued entry, a person cancelling its queue card and a hard stop clearing
+the queue, report back the same way with their own wording
+(:func:`notify_send_origin_discarded`). A human-typed queued message
 shares the same window and the same re-check, and carries no sender to report to.
 
 Authorization is deny-by-default and checked in one place
@@ -43,13 +46,15 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import unicodedata
 import uuid
-from collections.abc import Awaitable, Callable, Iterator
+from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 from kiro_crew import model_registry
+from kiro_crew.agent_sdk.backends import ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS
 from kiro_crew.agent_sdk.capabilities import MODEL_NAMESPACE_ACP, capabilities_for
 from kiro_crew.agent_sdk.provider_identity import is_claude_code
 from kiro_crew.config.loader import (
@@ -81,6 +86,7 @@ from kiro_crew.dashboard.chat_persistence import (
     _recent_session_slot_name,
     save_slot_off_loop,
 )
+from kiro_crew.dashboard.chat_title import apply_manual_title
 from kiro_crew.dashboard.chat_utils import (
     _history_key_for,
     _normalize_model,
@@ -93,6 +99,7 @@ from kiro_crew.dashboard.create_rate_limit import (
     allow_create,
     has_create_budget,
 )
+from kiro_crew.dashboard.handlers._shared import _scrub_text
 from kiro_crew.dashboard.relay_archive import (
     RELAY_ARCHIVE_CODE,
     RELAY_ARCHIVE_ERROR,
@@ -104,8 +111,10 @@ from kiro_crew.dashboard.state import (
     SlotOrigin,
     _normalize_slot_key,
     _safe_folder_tree,
+    load_window_off_loop,
 )
 from kiro_crew.dashboard.stop_retry import allow_escalation
+from kiro_crew.effort import EFFORT_LEVELS, is_valid_effort
 from kiro_crew.execution_context import (
     ExecutionContext,
     MemoryStoreRef,
@@ -117,13 +126,17 @@ from kiro_crew.execution_context import (
     revouch_at_verified_admission,
 )
 from kiro_crew.history import metadata_now_iso, transcript_stem
+from kiro_crew.llm_helpers import slot_switch_session_lock
 from kiro_crew.members import select_provider_backend
 from kiro_crew.memory_stores import named_store_or_empty
 from kiro_crew.messaging.link import CHAT_TYPE_DIRECT, ChannelLink, parse_session_key
 from kiro_crew.messaging.transport import DM_TARGET_PREFIX, sole_direct_target
+from kiro_crew.metrics.sessions import END_REASON_REMOVED
+from kiro_crew.metrics.turns import turn_outcome
 from kiro_crew.security import redact, redact_and_truncate
 from kiro_crew.sel import sel
 from kiro_crew.session_summary import derive_state
+from kiro_crew.terminal_safe import _is_invisible  # one shared list of invisible code points
 from kiro_crew.validation import (
     _MODEL_NAME_RE,
     BROADCAST_TARGET_ALLOWANCE_SECS,
@@ -147,6 +160,9 @@ DEFAULT_READ_MESSAGES = 20
 # Per-message content cap for reads, so pulling a transcript tail cannot return
 # a multi-megabyte tool payload verbatim.
 MAX_READ_CONTENT_CHARS = 4000
+
+# Cap on the tool title a read or status row names as waiting for approval.
+MAX_PENDING_APPROVAL_TOOL_CHARS = 200
 
 # Bounds on a ``read_summary`` response. The stored summary caps intent and note
 # COUNTS at 50 but neither per-intent list lengths nor string lengths, so the
@@ -1436,6 +1452,20 @@ CHANNEL_RECIPIENT_META_KEY = "channel_recipient"
 # a caller holding several deliveries in flight can tell which one went.
 SEND_DROP_EXCERPT_CHARS = 120
 
+# The two deliberate discards of a queued entry that are not the drain's
+# authorization re-check: a person cancelling the entry's queue card, and a hard
+# stop clearing the whole queue. Each is passed as the ``cause`` of
+# :func:`notify_send_origin_discarded`, which words the sender's notice from it.
+SEND_DISCARD_QUEUE_CANCEL = "queue_cancel"
+SEND_DISCARD_HARD_STOP = "hard_stop"
+
+# Sender-notice phrasing per discard cause. Neither discard changes a
+# constraint, so the drain's containment wording would describe nothing here.
+_SEND_DISCARD_REASONS = {
+    SEND_DISCARD_QUEUE_CANCEL: "it was cancelled from that session's queue",
+    SEND_DISCARD_HARD_STOP: "a hard stop of that session discarded its queue",
+}
+
 # Transcript-notice phrasing per snapshot field, for the drop notice a reader
 # of the session must be able to understand without knowing this module.
 _CONTAINMENT_CHANGE_LABELS = {
@@ -1865,15 +1895,9 @@ def notify_send_origin_dropped(
     drop still proceeds. Withholding the message is the authorization decision,
     and it must not depend on the report landing.
     """
-    if not origin:
-        return False
     target_key = str(getattr(target_slot, "key", ""))
-    if origin == target_key:
-        return False
-    sender = state._slots.get(origin)
+    sender = _send_origin_recipient(state, origin, origin_tab, target_key)
     if sender is None:
-        return False
-    if str(getattr(sender, "_tab_id", "") or "") != str(origin_tab or ""):
         return False
     try:
         excerpt = send_drop_excerpt(text)
@@ -1894,6 +1918,83 @@ def notify_send_origin_dropped(
         )
         return False
     return True
+
+
+def notify_send_origin_discarded(
+    state: "DashboardState",
+    *,
+    entry_meta: Any,
+    target_slot: "_ChatSlot",
+    text: Any,
+    cause: str,
+) -> bool:
+    """Tell the SENDING session that a deliberate discard removed its queued delivery.
+
+    The drain is not the only place a stamped entry leaves the queue unrun. A
+    person cancelling its queue card (``api_chat_slot_queue_cancel``) and a hard
+    stop clearing the queue (``stop_slot_turn``) discard it too, and the sender's
+    last word on the message is still the ``started: False`` receipt that said it
+    would run later. Every other sign of the discard lands on the target, which
+    the sender does not read.
+
+    *cause* is :data:`SEND_DISCARD_QUEUE_CANCEL` or :data:`SEND_DISCARD_HARD_STOP`
+    and selects the wording: a deliberate discard changes no authorization, so the
+    notice names what discarded the entry rather than a constraint.
+
+    *entry_meta* is the discarded entry's own ``meta``, read here rather than by
+    the caller so both discard sites read the stamp the way the drain does. The
+    recipient is resolved exactly as :func:`notify_send_origin_dropped` resolves
+    it, so the same four cases answer False without writing: no stamp, a
+    self-send, a closed sender, and a key now held by a different tab.
+
+    Best-effort: a failure is logged and the discard stands, because the person
+    or the stop already decided it.
+    """
+    target_key = str(getattr(target_slot, "key", ""))
+    origin = send_origin_slot(entry_meta)
+    sender = _send_origin_recipient(state, origin, send_origin_tab(entry_meta), target_key)
+    if sender is None:
+        return False
+    try:
+        reason = _SEND_DISCARD_REASONS[cause]
+        excerpt = send_drop_excerpt(text)
+        sender.append(
+            "notice",
+            f"⚠️ Message you sent to {target_key} was discarded before it ran: "
+            + reason
+            + ". It was not delivered and will not run."
+            + (f' Text: "{excerpt}"' if excerpt else ""),
+            "msg msg-info",
+        )
+    except Exception:
+        logger.exception(
+            "Failed to report a discarded delivery to its sender (origin=%s, target=%s)",
+            origin,
+            target_key,
+        )
+        return False
+    return True
+
+
+def _send_origin_recipient(
+    state: "DashboardState", origin: str, origin_tab: str, target_key: str
+) -> "_ChatSlot | None":
+    """The live sending slot a sender notice may be written to, or None.
+
+    One resolver for both sender notices, so the four non-notice cases
+    :func:`notify_send_origin_dropped` documents cannot hold on one discard path
+    and not another: no stamp, a self-send, a closed sender, and a reused key
+    whose current occupant is a different tab. An absent *origin_tab* never
+    matches a live slot, so the identity check cannot be skipped by omitting it.
+    """
+    if not origin or origin == target_key:
+        return None
+    sender = state._slots.get(origin)
+    if sender is None:
+        return None
+    if str(getattr(sender, "_tab_id", "") or "") != str(origin_tab or ""):
+        return None
+    return sender
 
 
 def notify_channel_recipient_dropped(
@@ -2232,6 +2333,25 @@ def _resolve_slot(
             code="ambiguous_target",
         )
     return found[0] if found else None
+
+
+async def load_target_window(state: "DashboardState", target: str) -> None:
+    """Load the pending window of the live session *target* names, off the loop.
+
+    For a verb whose gate and delivery read the target's rows with no suspension
+    between them: it runs before that verb's prewarm, the last suspension ahead
+    of the gate. It resolves *target* as the gate does and decides nothing, so a
+    target the gate then refuses has had only the load its next reader would do.
+    """
+    target = (target or "").strip()
+    if not target:
+        return
+    try:
+        slot = _resolve_slot(state, target)
+    except SessionControlError:
+        return
+    if slot is not None:
+        await load_window_off_loop(slot)
 
 
 def _broadcast_resolution_slots(
@@ -3312,8 +3432,9 @@ async def fork_session(
     be an eligible CREATOR -- the same refusal set ``create_session`` applies,
     because a fork manufactures a session the caller then owns.
 
-    What the child gets on top of the human fork: ``title`` (else the fork's own
-    ``Fork of <parent>``), ``folder_id`` (else the parent's folder, as the human
+    What the child gets on top of the human fork: ``title`` (final; else the
+    fork's own ``Fork of <parent>``, which the fork's background title pass may
+    rename), ``folder_id`` (else the parent's folder, as the human
     fork inherits it), creator attribution (``created_by`` = the caller, so the
     other verbs reach it afterwards and the per-creator ceiling counts it) and the
     caller's session posture (``_trust`` / ``_trust_reads`` -- the same two
@@ -3441,6 +3562,10 @@ async def fork_session(
         )
 
     audit_caller = f"session:{caller_key}"
+    # The copy below reads the source's rows: a source restored as a sidebar
+    # row loads its window first, off the loop. The source is re-admitted after
+    # these awaits, as it already is for the ones that follow.
+    await load_window_off_loop(source_slot)
     fork_source = await resolve_fork_source(
         source_slot, audit_caller=audit_caller, audit_operation="session_control.fork"
     )
@@ -3537,6 +3662,9 @@ async def fork_session(
         if clean_title:
             child.title = clean_title
             child._titled = True
+            # The caller chose this name, so it is final: the fork's own
+            # background title pass and the refresh both leave it alone.
+            child._title_origin = "user"
         if folder_id:
             child.folder_id = folder_id
 
@@ -3925,9 +4053,19 @@ def record_audience_admission(slot: Any, admission: dict[str, Any]) -> None:
 
     A caller with no slot record of its own leaves nothing, which is the behaviour
     such a caller has today.
+
+    NO OPT-OUT from the in-a-turn guard, because every caller is inside the turn its
+    admission is about. A producer that merely has a turn PENDING cannot be: an entry
+    nothing clears makes the publisher withhold the mirror leg of an unrelated later
+    reply, judged by an admission that was never about it. The work-ledger wake is
+    the one shape that could want it -- it delivers into a turn it starts -- and it
+    carries a pointer to ``work_ledger_read`` rather than a board, so the read that
+    needs an admission is the conductor's own call inside its own turn.
     """
     fences = getattr(slot, "_steer_audience_fences", None)
-    if slot is None or not isinstance(fences, dict) or not _in_runner_turn(slot):
+    if slot is None or not isinstance(fences, dict):
+        return
+    if not _in_runner_turn(slot):
         return
     key = AUDIENCE_ADMISSION_KEY_PREFIX + json.dumps(
         admission.get(QUEUED_CONTAINMENT_META_KEY, {}), sort_keys=True, default=str
@@ -4034,9 +4172,13 @@ def authorize_target(
     member) the fence is evaluated inline as before.
 
     ``allow_self`` waives the self-target refusal, and with it the ownership fence for
-    that one case. Exactly one verb passes it: a release, where the target itself is a
+    that one case. Three verbs pass it. A release, where the target itself is a
     legitimate caller because a session taken over must not depend on its holder still
-    running to get out. It waives nothing else -- an ephemeral, app-scoped or
+    running to get out. A close, so a session that has finished its one job can archive
+    its own tab instead of leaving it for the person or its creator to dismiss; the close
+    is the same recoverable archival a peer close is, and it cancels the caller's own
+    running turn, which is the turn asking for it. And a rename, because a session naming
+    itself acts on nothing but its own sidebar label. It waives nothing else -- an ephemeral, app-scoped or
     channel-linked caller is still refused, and a target that is not the caller is
     still judged by every rule above.
     """
@@ -4269,6 +4411,34 @@ def _slot_object(state: "DashboardState", slot_key: str) -> "object | None":
         return None
 
 
+def _target_replaced(state: "DashboardState", slot_key: str, observed: "object | None") -> bool:
+    """Whether the slot under *slot_key* differs from *observed*, the captured session.
+
+    The identity read-back that a tree verb runs after its final authorization. *observed*
+    is the target slot object captured BEFORE the verb's first suspension; this re-reads
+    the object under the same key and reports whether it has changed. A close plus a
+    reopen under the SAME key inside the suspensions between capture and append puts a
+    different session's object there -- open, passing every fence, with a log of its own
+    -- which no key-only check can tell from the original. A verb that finds this true
+    refuses rather than appending an adoption or release against a session that never took
+    part, in an entry nothing later corrects.
+
+    Encapsulated rather than inlined for the reason :func:`_freshest_sid` is: the slot
+    captures a verb takes before its resolutions are what the capture-ordering invariant
+    rests on, and a bare :func:`_slot_object` read in the verb body AFTER the suspending
+    resolution would read as a late capture. The read-back lives here, where it is a
+    comparison and not a capture.
+
+    ``True`` when nothing is there now and something was (the target simply closed), which
+    is a refusal too -- a verb cannot record a change to a session that is gone. The pure
+    close is also caught earlier by the gate's own re-resolve, which is why the close
+    tests assert ``target_not_found``; this guard's own case is the reopen the gate admits.
+    A ``None`` capture (the target was never a held object) can only become non-``None``,
+    which is still a change, so the comparison stays correct at the edges.
+    """
+    return _slot_object(state, slot_key) is not observed
+
+
 def _freshest_sid(
     state: "DashboardState", slot_key: str, resolved: str, observed: "object | None"
 ) -> str:
@@ -4410,6 +4580,18 @@ async def adopt_target(
         caller_key = caller_slot_key(state, caller_session_key)
         from kiro_crew.crew_log import emit as crew_log_emit
 
+        # The TARGET's object, captured before the first suspension, so the final
+        # authorization can tell the session it admitted apart from a same-key
+        # replacement. Everything about the target below -- the gate's re-resolve, the
+        # ``_live_sid_of`` mapping read -- is keyed by ``slot.key``, and a key is not an
+        # identity: the target can close and a NEW session can open under the same slot
+        # key in the awaits ahead (the gate's warm, the lock wait, the id resolution's
+        # store read), and every key-only check then answers for the replacement. The
+        # adoption would be appended against a conversation that was never adopted, in an
+        # entry nothing later corrects. The object itself does not move, so comparing it
+        # after the gate is what makes the refusal below possible.
+        target_at_resolve = _slot_object(state, slot.key)
+
         target_sid = _live_sid_of(state, slot.key)
         if not crew_log_emit.enabled() or not target_sid:
             # Checked FIRST because it is the PERMANENT one of the two refusals below: with
@@ -4489,6 +4671,25 @@ async def adopt_target(
                     "cannot be adopted",
                     status=409,
                     code="tree_unavailable",
+                )
+            # REFUSED -- not silently re-resolved -- when the slot under the target key is a
+            # different session from the one the pre-lock gate admitted. The gate re-resolves BY
+            # KEY and ``_live_sid_of`` reads the mapping BY KEY, so a close plus a same-key
+            # reopen inside the awaits above leaves both answering for the replacement: an
+            # open session that passes every fence, whose log ``target_sid`` now names. The
+            # adoption would then be appended against a conversation that was never
+            # adopted, and the entry is append-only -- there is no later write that
+            # corrects it. The captured object is this process's identity for the admitted
+            # session; the replacement is a different object under the same key, so the
+            # ``is`` comparison is what the key-only checks cannot do. A caller may retry:
+            # a fresh attempt resolves the current session honestly.
+            if _target_replaced(state, slot.key, target_at_resolve):
+                raise SessionControlError(
+                    f"{target!r} was replaced by a new session under the same key, so the "
+                    "adoption would name a session that was never adopted -- retry to act "
+                    "on the current one",
+                    status=409,
+                    code="target_replaced",
                 )
             # REFRESHED here, synchronously, for the same reason the resolutions happen
             # before the gate: the gate's own warm suspends, and either of these slots can
@@ -4574,6 +4775,16 @@ async def release_target(
         releasing_self = slot.key == caller_key
         from kiro_crew.crew_log import emit as crew_log_emit
 
+        # The TARGET's object, captured before the first suspension, for the reason the
+        # adoption captures it: the gate re-resolves and ``_live_sid_of`` reads BY KEY, so
+        # a close plus a same-key reopen inside the awaits ahead would leave both naming a
+        # replacement session, and the release would be appended against a conversation
+        # that was never released -- append-only, so nothing later corrects it. The
+        # ``allow_self`` case is covered too: when the caller IS the target, this just
+        # captures the caller's own live object, and a same-key reopen there means a
+        # different session is now calling, which the final gate should likewise refuse.
+        target_at_resolve = _slot_object(state, slot.key)
+
         target_sid = _live_sid_of(state, slot.key)
         if not crew_log_emit.enabled() or not target_sid:
             # The permanent refusal first, for the reason the adoption checks it first.
@@ -4633,6 +4844,21 @@ async def release_target(
                     "cannot be released",
                     status=409,
                     code="tree_unavailable",
+                )
+            # REFUSED -- not silently re-resolved -- when the slot under the target key is a
+            # different session from the one the pre-lock gate admitted, for the reason the adoption
+            # refuses: the gate and ``_live_sid_of`` both resolve BY KEY, so a same-key
+            # reopen inside the awaits above leaves them answering for a replacement, and
+            # the release would be appended against a session that was never released. The
+            # captured object is this process's identity for the admitted session; a caller
+            # may retry to act on the current one.
+            if _target_replaced(state, slot.key, target_at_resolve):
+                raise SessionControlError(
+                    f"{target!r} was replaced by a new session under the same key, so the "
+                    "release would name a session that was never released -- retry to act "
+                    "on the current one",
+                    status=409,
+                    code="target_replaced",
                 )
             # Refreshed here, synchronously, for the reason the adoption refreshes: the
             # gate's warm suspends, and the parent can open its next store inside it.
@@ -5022,6 +5248,114 @@ async def stop_target(
     return {"ok": True, "target": slot.key, **result}
 
 
+async def retry_target(
+    state: "DashboardState",
+    *,
+    caller_session_key: str,
+    target: str,
+    caller_fenced: bool | None = None,
+) -> dict[str, Any]:
+    """Re-run *target*'s failed last turn, via the same path as the Resume button.
+
+    Reuses ``chat_handlers.continue_slot_turn``, the mechanism behind
+    ``POST /api/chat/slots/{slot}/continue``: the recovery continuation is queued
+    at the head and dispatched, so the transcript gains the same recovery row a
+    Resume press leaves and no second copy of the user's message. Every refusal
+    Continue makes applies unchanged, including ``session_start_repeat`` after
+    two identical failed starts.
+
+    One refusal is this verb's own: ``turn_not_failed`` when
+    ``is_turn_interrupted`` says the last turn finished or was ended with Stop.
+    Continue carries on from a finished turn; a retry must not, or one session
+    could make another produce a fresh answer on top of a good one.
+
+    Not readiness-gated, for the reason ``api_chat_slot_continue`` gives: it
+    mutates nothing durable before dispatch, so the turn's own start is the
+    authority and a signed-out install reports in the transcript.
+
+    ``caller_fenced`` has the meaning :func:`stop_target` documents.
+    """
+    # The retry re-reads the target's last turn: a target restored as a
+    # sidebar row loads its window first, ahead of the prewarm below.
+    await load_target_window(state, target)
+    # Same prewarm ordering as `close_target`: the SEL and config reads must be
+    # warm before the synchronous gate, and the fence verdict is resolved once so
+    # the re-check under the slot lock never loads config on the loop.
+    try:
+        await asyncio.to_thread(sel)
+    except Exception:  # noqa: BLE001 - a prewarm failure must not fail the retry
+        logger.warning("session-control SEL prewarm failed", exc_info=True)
+    await prewarm_enabled_check()
+
+    caller_key = caller_slot_key(state, caller_session_key)
+    if caller_fenced is None:
+        caller_fenced = bool(caller_key) and _caller_is_ownership_fenced(state, caller_key)
+
+    slot = authorize_target(
+        state,
+        caller_session_key=caller_session_key,
+        target=target,
+        operation="retry",
+        precomputed_ownership_fenced=caller_fenced,
+    )
+    slot_key = slot.key
+    # Deferred for the same import cycle `stop_target` documents.
+    from kiro_crew.dashboard.chat_handlers import SlotContinueRefusal, continue_slot_turn
+
+    def _reassert_retryable() -> None:
+        # The slot lock `continue_slot_turn` takes, and its sub-agent probe, are
+        # awaits: a target that was reachable at the gate above can become
+        # channel-linked or mirrored, or be replaced under the same key, before
+        # the continuation is queued. Re-run the same gate here, synchronously
+        # and with no config read, as `close_target` does at its point of no
+        # return.
+        try:
+            live = authorize_target(
+                state,
+                caller_session_key=caller_session_key,
+                target=slot_key,
+                operation="retry",
+                skip_enabled_check=True,
+                precomputed_ownership_fenced=caller_fenced,
+            )
+        except SessionControlError as exc:
+            raise SlotContinueRefusal(exc.message, exc.code, status=exc.status) from exc
+        if live is not slot:
+            raise SlotContinueRefusal(
+                "the target session was replaced during the retry", "target_replaced"
+            )
+
+    with _audit_denials(
+        caller_session_key=caller_session_key, operation="retry", slot_key=slot_key
+    ):
+        # The same predicate the Continue endpoint refuses on, so the button and
+        # the verb cannot drift: a relay archive would run the crew's old turn on
+        # this machine.
+        if is_relay_archive(slot):
+            raise SessionControlError(RELAY_ARCHIVE_ERROR, code=RELAY_ARCHIVE_CODE, status=409)
+        try:
+            await continue_slot_turn(
+                state,
+                slot,
+                # An agent asked for this, not the person at the keyboard: the
+                # turn must not gain the authenticated-human flag.
+                directive_user_origin=False,
+                via="session_control",
+                require_interrupted=True,
+                before_dispatch=_reassert_retryable,
+                extra_meta=send_origin_meta(state, caller_key),
+            )
+        except SlotContinueRefusal as exc:
+            raise SessionControlError(exc.message, status=exc.status, code=exc.code) from exc
+    _audit(
+        caller_session_key=caller_session_key,
+        operation="retry",
+        slot_key=slot_key,
+        outcome="allowed",
+    )
+    return {"ok": True, "target": slot_key}
+
+
 async def end_wait_target(
     state: "DashboardState",
     *,
@@ -5103,10 +5437,14 @@ async def set_model_target(
     *,
     caller_session_key: str,
     target: str,
-    model: str,
+    model: str | None = None,
+    reasoning_effort: str | None = None,
     caller_fenced: bool | None = None,
 ) -> dict[str, Any]:
-    """Record *model* as *target*'s pending pick, applied when its next turn starts.
+    """Record *model* and/or *reasoning_effort* as *target*'s pending pick.
+
+    ``None`` for either means "keep what the target has"; at least one must be
+    given. The pick is applied when the target's next turn starts.
 
     Nothing about the target changes now. The pick is committed by
     :func:`apply_pending_model_pick` at the start of the target's next turn,
@@ -5125,6 +5463,15 @@ async def set_model_target(
     routing, which the model route keeps owner-only. A crew-bound (remote)
     target runs its turns on the peer, where this pick would never be applied.
 
+    A reasoning effort must be one of the five canonical levels (``low``,
+    ``medium``, ``high``, ``xhigh``, ``max``), which every backend accepts;
+    any other level, including ``""``, is refused here and is set from the
+    effort dropdown instead. It is committed with the model in the same step.
+    It is NOT pushed live the way that route pushes it: the
+    turn-start reset makes the cold start apply it through the same
+    ``reasoning_effort_override`` the route's reset fallback relies on, with no
+    provider await after the gate.
+
     ``caller_fenced`` has the meaning :func:`stop_target` documents.
     """
     # Deferred for the same import cycle `stop_target` documents.
@@ -5139,35 +5486,61 @@ async def set_model_target(
 
     # Validated before any gate: a malformed pick needs no target lookup, and
     # refusing it first keeps a bad argument from reading as an access decision.
-    # Stripped once, so every check and the stored pick see the same spelling.
-    model = model.strip()
-    # "auto" is refused with the Jev sentinel: with the Jev preview on, a slot
-    # on "auto" hands each turn's model choice to Jev routing, which only the
-    # owner may arm. The picker's display label and any case of the sentinel
-    # are refused the same way, so no spelling of the Jev entry is stored.
-    # An empty name is the absence of a pick, not a model.
-    folded = model.lower()
-    if (
-        _is_jev_route_pick(model)
-        or folded in _JEV_ROUTE_AUTO_MODELS
-        or folded in _JEV_ROUTE_SPELLINGS
-    ):
+    if model is None and reasoning_effort is None:
         raise SessionControlError(
-            "Auto and Auto (Jev) can only be picked by the owner from the model picker",
-            code="model_owner_only",
-            status=403,
+            "pass a model, a reasoning_effort, or both", code="bad_request", status=400
         )
-    if not model:
-        raise SessionControlError("model is required", code="model_rejected", status=400)
-    if redact(model) != model:
-        # The pick is stored on the slot and broadcast to every dashboard, so a
-        # credential-shaped argument is refused rather than persisted.
-        raise SessionControlError(
-            "model looks like it contains a credential; model not changed",
-            code="model_rejected",
-            status=400,
-        )
-    model_name = _normalize_model(model)
+    if reasoning_effort is not None:
+        if not is_valid_effort(reasoning_effort):
+            # Only the five standard levels: each folds onto every backend's
+            # cold start, so a level checked here cannot go stale before the
+            # target's next turn applies it. A level only one harness advertises
+            # (Pi's ``minimal``, Claude's ``default``) is set from that session's
+            # effort dropdown, which reads its live list.
+            #
+            # "" (back to the model default) is refused too: on a kiro-family
+            # backend the default only takes once the workspace effort overlay
+            # is cleared, which only the dropdown route's live clear_effort does.
+            # Committed here, the cold start would recover the old level from
+            # the overlay while every surface said "default".
+            raise SessionControlError(
+                f"reasoning_effort must be one of: {', '.join(EFFORT_LEVELS)}. "
+                "Other levels, and returning a session to its model's default, are "
+                "set from its effort dropdown.",
+                code="effort_rejected",
+                status=400,
+            )
+    model_name: str | None = None
+    if model is not None:
+        # Stripped once, so every check and the stored pick see the same spelling.
+        model = model.strip()
+        # "auto" is refused with the Jev sentinel: with the Jev preview on, a slot
+        # on "auto" hands each turn's model choice to Jev routing, which only the
+        # owner may arm. The picker's display label and any case of the sentinel
+        # are refused the same way, so no spelling of the Jev entry is stored.
+        # An empty name is the absence of a pick, not a model.
+        folded = model.lower()
+        if (
+            _is_jev_route_pick(model)
+            or folded in _JEV_ROUTE_AUTO_MODELS
+            or folded in _JEV_ROUTE_SPELLINGS
+        ):
+            raise SessionControlError(
+                "Auto and Auto (Jev) can only be picked by the owner from the model picker",
+                code="model_owner_only",
+                status=403,
+            )
+        if not model:
+            raise SessionControlError("model is required", code="model_rejected", status=400)
+        if redact(model) != model:
+            # The pick is stored on the slot and broadcast to every dashboard, so a
+            # credential-shaped argument is refused rather than persisted.
+            raise SessionControlError(
+                "model looks like it contains a credential; model not changed",
+                code="model_rejected",
+                status=400,
+            )
+        model_name = _normalize_model(model)
     try:
         agent_cfg = (await asyncio.to_thread(KiroCrewConfig.load)).agent
         provider = agent_cfg.provider
@@ -5202,11 +5575,16 @@ async def set_model_target(
     target_provider = (
         provider if is_claude_code(provider) else capabilities_for(backend).provider_seam
     )
-    rejected = _model_rejected_reason(model_name, provider=target_provider)
+    rejected = (
+        _model_rejected_reason(model_name, provider=target_provider)
+        if model_name is not None
+        else ""
+    )
     if rejected:
         raise SessionControlError(rejected, code="model_rejected", status=400)
     if (
-        not is_claude_code(target_provider)
+        model_name is not None
+        and not is_claude_code(target_provider)
         and capabilities_for(backend).model_id_namespace == MODEL_NAMESPACE_ACP
     ):
         # On a kiro-cli backend an alias such as "sonnet" is not a wire id: stored
@@ -5219,6 +5597,9 @@ async def set_model_target(
     ):
         if is_relay_archive(slot):
             raise SessionControlError(RELAY_ARCHIVE_ERROR, code=RELAY_ARCHIVE_CODE, status=409)
+        # No restore-allowlist marker is written for the level: the five
+        # canonical levels are always restorable (`_REASONING_EFFORT_FALLBACK`),
+        # so the marker the effort dropdown writes for other levels is a no-op.
         session_key = effective_session_key(slot)
         if _switch_target_busy(state, slot, session_key, state.sessions.get_provider(session_key)):
             raise _target_busy_error()
@@ -5238,6 +5619,12 @@ async def set_model_target(
         # Nothing awaits between here and the store below, so this check
         # holds until the pick is recorded.
         if slot._model_pick_lock.locked():
+            raise _target_busy_error()
+        # The effort dropdown holds the per-session switch lock across its
+        # commit, its live push and any rollback. A level captured inside that
+        # window would record a generation the rollback then bumps, and the
+        # next turn would silently drop the pick, so refuse it the same way.
+        if reasoning_effort is not None and slot_switch_session_lock(session_key).locked():
             raise _target_busy_error()
         live = authorize_target(
             state,
@@ -5266,16 +5653,243 @@ async def set_model_target(
             caller_tab_id=caller_tab_id,
             caller_fenced=caller_fenced,
             pick_gen=slot._model_pick_gen,
+            reasoning_effort=reasoning_effort,
+            effort_gen=slot._effort_pick_gen,
+            pair_id_backend=backend in ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS,
         )
 
+    requested = _pick_fields(model_name, reasoning_effort)
     _audit(
         caller_session_key=caller_session_key,
         operation="set_model",
         slot_key=slot_key,
         outcome="allowed",
-        detail={"model": model_name or "auto", "stage": "pending"},
+        detail={**_pick_audit_fields(model_name, reasoning_effort), "stage": "pending"},
     )
-    return {"ok": True, "target": slot_key, "model": model_name, "pending": True}
+    return {"ok": True, "target": slot_key, **requested, "pending": True}
+
+
+def _pick_fields(model: str | None, reasoning_effort: str | None) -> dict[str, str]:
+    """The pick's requested fields, omitting the ones the caller left alone."""
+    fields: dict[str, str] = {}
+    if model is not None:
+        fields["model"] = model
+    if reasoning_effort is not None:
+        fields["reasoning_effort"] = reasoning_effort
+    return fields
+
+
+def _pick_audit_fields(model: str | None, reasoning_effort: str | None) -> dict[str, str]:
+    """:func:`_pick_fields` spelled for the audit trail, where "" reads as a default."""
+    fields: dict[str, str] = {}
+    if model is not None:
+        fields["model"] = model or "auto"
+    if reasoning_effort is not None:
+        fields["reasoning_effort"] = reasoning_effort or "default"
+    return fields
+
+
+#: Stored cap on a renamed title, the same ``[:200]`` the sidebar rename route and
+#: :func:`create_session` keep. The MCP schema's own bound on the argument is the
+#: generic ``MAX_SHORT_STRING`` (500), so :func:`_clean_rename_title` is what
+#: refuses a title between 201 and 500 characters, for MCP and direct callers alike.
+_MAX_RENAME_TITLE_CHARS = 200
+
+#: Every Unicode text-direction control, refused in a renamed title: the
+#: embeddings, overrides and isolates (U+202A..U+202E, U+2066..U+2069) and the
+#: directional marks (U+200E, U+200F, U+061C).
+_BIDI_CONTROLS = frozenset(
+    "\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069\u200e\u200f\u061c"
+)
+
+#: Characters that render as a blank glyph yet are neither whitespace nor
+#: invisible to :func:`kiro_crew.terminal_safe._is_invisible`, which already
+#: covers format characters, variation selectors, the Hangul and Khmer fillers
+#: and the tag block. The blank Braille pattern is the one such character: a
+#: printable symbol that draws nothing.
+_BLANK_GLYPHS = frozenset("\u2800")
+
+#: Format characters (category ``Cf``) a renamed title may contain: the zero-width
+#: non-joiner and joiner, which emoji sequences and joined scripts such as Persian
+#: and Devanagari need. The tag characters U+E0020..U+E007F are allowed
+#: separately, by range; the tag block's other format character, U+E0001
+#: LANGUAGE TAG, is refused. Its unassigned code points are not ``Cf`` and are
+#: not refused by this rule.
+_ALLOWED_FORMAT_CHARS = frozenset("\u200c\u200d")
+
+
+def _is_allowed_format_char(ch: str) -> bool:
+    """True for a format character a renamed title keeps: a joiner, or a tag
+    character (U+E0020..U+E007F), which spells the subdivision of a flag emoji
+    such as England's. Every other ``Cf`` character is refused."""
+    return ch in _ALLOWED_FORMAT_CHARS or "\U000e0020" <= ch <= "\U000e007f"
+
+
+def _clean_rename_title(title: str) -> str:
+    """Validate *title* for :func:`rename_target` and return the stored form.
+
+    The rules are the sidebar's: surrounding whitespace is stripped, an empty
+    result is refused, and nothing over 200 characters is stored. Two refusals
+    go further than the sidebar, because the sidebar's text box can produce
+    neither case and a model can: a title over the cap is refused instead of cut
+    down, and a control character (a newline, a tab, an escape) is refused
+    because a sidebar title is one line.
+
+    The stored form is the scrubbed title, which can differ from what the caller
+    sent: ``handlers._shared._scrub_text`` replaces credential-shaped text with a
+    longer marker, also catching a secret split by an invisible character. A
+    title that grows past the cap that way is refused, never cut, so no stored
+    title holds a torn marker. The verb's reply carries this stored form, so the
+    caller reads back what the sidebar shows.
+    """
+    stripped = title.strip()
+    if not stripped:
+        raise SessionControlError("title is required", code="invalid_title", status=400)
+    if len(stripped) > _MAX_RENAME_TITLE_CHARS:
+        raise SessionControlError(
+            f"title is longer than {_MAX_RENAME_TITLE_CHARS} characters; session not renamed",
+            code="invalid_title",
+            status=400,
+        )
+    if any(unicodedata.category(ch) == "Cc" or ch in "\u2028\u2029" for ch in stripped):
+        raise SessionControlError(
+            "title contains a control character; session not renamed",
+            code="invalid_title",
+            status=400,
+        )
+    # A direction control makes the sidebar render the label in an order other
+    # than the one it was written in.
+    if any(ch in _BIDI_CONTROLS for ch in stripped):
+        raise SessionControlError(
+            "title contains a text-direction control; session not renamed",
+            code="invalid_title",
+            status=400,
+        )
+    # Any other format character (a zero-width space, a word joiner, a byte-order
+    # mark, a soft hyphen) is invisible inside a visible title, so it can make a
+    # near-duplicate of another session's label. Only the format characters that
+    # emoji and joined scripts need are kept: see :func:`_is_allowed_format_char`.
+    if any(unicodedata.category(ch) == "Cf" and not _is_allowed_format_char(ch) for ch in stripped):
+        raise SessionControlError(
+            "title contains an invisible format character; session not renamed",
+            code="invalid_title",
+            status=400,
+        )
+    # A title needs at least one character that shows something. Invisible
+    # characters (a zero-width space or joiner, a variation selector, a Hangul
+    # filler) survive `str.strip()`, so a title made only of them, or of blank
+    # glyphs, would store an invisible, final name the automatic titler can
+    # never replace. Such characters are kept inside a visible title: a joiner
+    # is how an emoji sequence is written.
+    if all(ch.isspace() or _is_invisible(ch) or ch in _BLANK_GLYPHS for ch in stripped):
+        raise SessionControlError("title is required", code="invalid_title", status=400)
+    # A blank glyph is refused anywhere in the title, not only in an all-blank
+    # one. `terminal_safe.normalize_for_scanning` does not remove it (it is a
+    # printable symbol, not an invisible character), so one placed inside a
+    # secret ("AKIA\u2800...") would split it past the redactors that
+    # `_scrub_text` runs below.
+    if any(ch in _BLANK_GLYPHS for ch in stripped):
+        raise SessionControlError(
+            "title contains a blank glyph (U+2800); session not renamed",
+            code="invalid_title",
+            status=400,
+        )
+    # Sanitized with the stored-field scrub the dashboard handlers use: the title
+    # is broadcast to every dashboard and persisted with the transcript. The
+    # redactors match literal patterns, so an invisible character placed inside
+    # a secret ("AKIA\u200d...", "AKIA\ufe0f...") would split it past the match;
+    # `_scrub_text` also scans a normalized copy and keeps it when that copy
+    # reveals a secret, and otherwise leaves invisible characters in place, so
+    # an emoji sequence is unchanged. Its control-character step is inert here,
+    # because a control character was refused above.
+    scrubbed = _scrub_text(stripped)
+    # Redaction markers are longer than the text they replace. A title they push
+    # past the cap is refused like any other over-long title rather than cut,
+    # so a stored title never holds a torn marker. The message names no part of
+    # the title, so the redacted text is not echoed back.
+    if len(scrubbed) > _MAX_RENAME_TITLE_CHARS:
+        raise SessionControlError(
+            f"title is longer than {_MAX_RENAME_TITLE_CHARS} characters once "
+            "credential-shaped text in it is redacted; session not renamed",
+            code="invalid_title",
+            status=400,
+        )
+    return scrubbed
+
+
+async def rename_target(
+    state: "DashboardState",
+    *,
+    caller_session_key: str,
+    target: str,
+    title: str,
+    caller_fenced: bool | None = None,
+) -> dict[str, Any]:
+    """Rename *target*'s sidebar title, the way the sidebar's own rename does.
+
+    The reach is :func:`stop_target`'s plus the caller itself. For a target that
+    is not the caller, every rule in :func:`authorize_target` applies, including
+    the ownership fence that keeps a crew member, a cron run, an owner-DM channel
+    session and any agent-created session to the sessions it created. For the
+    caller itself, ``allow_self`` waives the self-target refusal and, with it,
+    that ownership fence, since a session naming itself acts on nothing but its
+    own sidebar label. It waives nothing else: an ephemeral, app-scoped or
+    channel-linked caller is still refused, and so is a cron run's own session,
+    because the unattended-target refusal is checked before ``allow_self``.
+
+    The rename is final (``_TITLE_ORIGIN_USER``), so the automatic titler stops
+    refreshing the target, exactly as after a manual rename. It changes nothing
+    else about the target and does not wait for a running turn.
+
+    ``caller_fenced`` has the meaning :func:`stop_target` documents.
+    """
+    # Validated before any gate, as `set_model_target` does: a malformed title
+    # needs no target lookup, and refusing it first keeps a bad argument from
+    # reading as an access decision.
+    clean_title = _clean_rename_title(title)
+    # Same prewarm ordering as `stop_target`: nothing may suspend between the
+    # gate and the write it authorizes.
+    try:
+        await asyncio.to_thread(sel)
+    except Exception:  # noqa: BLE001 - a prewarm failure must not fail the rename
+        logger.warning("session-control SEL prewarm failed", exc_info=True)
+    await prewarm_enabled_check()
+
+    slot = authorize_target(
+        state,
+        caller_session_key=caller_session_key,
+        target=target,
+        operation="rename",
+        precomputed_ownership_fenced=caller_fenced,
+        allow_self=True,
+    )
+    # `apply_manual_title` assigns every field before its first await, so the
+    # title is on the slot before this coroutine can suspend.
+    if not await apply_manual_title(state, slot, clean_title):
+        _audit(
+            caller_session_key=caller_session_key,
+            operation="rename",
+            slot_key=slot.key,
+            outcome="error",
+            detail={"chars": len(clean_title), "reason": "title_persist_failed"},
+        )
+        raise SessionControlError(
+            f"{slot.key!r} now shows the new title, but it could not be saved yet; "
+            "the session's next save writes it, and until then a restart brings back "
+            "the previous title. Renaming again with the same title is safe",
+            status=500,
+            code="title_persist_failed",
+        )
+    _audit(
+        caller_session_key=caller_session_key,
+        operation="rename",
+        slot_key=slot.key,
+        outcome="allowed",
+        detail={"chars": len(clean_title)},
+    )
+    # The slot's title, not this call's: a rename that overtook this one while it
+    # saved has already replaced it, and the caller acts on what the reply names.
+    return {"ok": True, "target": slot.key, "title": slot.title}
 
 
 @dataclass(frozen=True)
@@ -5287,13 +5901,40 @@ class PendingModelPick:
     in the meantime wins over this one. The tab identity is what ties the pick
     to the calling session: a slot key can be handed to a new occupant after
     the caller closes, and that occupant must not inherit the pick.
+
+    ``model`` or ``reasoning_effort`` is ``None`` when the caller left that
+    setting alone. ``effort_gen`` is the target's effort write generation at
+    call time: any write since (the effort dropdown, a fork, a restore) means
+    a newer choice landed, and it wins over this one even when it returned to
+    the level the caller saw. ``pair_id_backend`` records that the target's
+    backend spells effort into the model id (``gpt-6-astra[max]``), so a
+    committed level must also fold a legacy suffix off the pin, as the effort
+    dropdown route does.
     """
 
-    model: str
+    model: str | None
     caller_session_key: str
     caller_tab_id: str
     caller_fenced: bool
     pick_gen: int
+    reasoning_effort: str | None = None
+    effort_gen: int = 0
+    pair_id_backend: bool = False
+
+
+def _pending_pick_view(pick: PendingModelPick | None) -> dict[str, str]:
+    """The ``pending_*`` fields ``session_read_message`` reports for *pick*.
+
+    Redacted: the owner's picker stores whatever string it is given.
+    """
+    if pick is None:
+        return {}
+    view: dict[str, str] = {}
+    if pick.model is not None:
+        view["pending_model"] = redact(pick.model)
+    if pick.reasoning_effort is not None:
+        view["pending_reasoning_effort"] = pick.reasoning_effort
+    return view
 
 
 def _caller_tab_id(state: "DashboardState", caller_session_key: str) -> str:
@@ -5327,23 +5968,65 @@ def _another_alias_is_mid_turn(state: "DashboardState", slot: "_ChatSlot") -> bo
     )
 
 
+def legacy_effort_base(model: str | None, *, pair_id_backend: bool) -> str:
+    """The base id a pin folds to when an effort level is committed, or ``""``.
+
+    On a backend that spells effort into the model id (codex:
+    ``gpt-6-astra[max]``), a pin still carrying a ``[level]`` suffix would keep
+    claiming the old level after a new one is committed, so the commit folds the
+    pin to its base id. Any other backend, or a pin with no suffix, folds nothing.
+
+    The effort dropdown route and :func:`apply_pending_model_pick` both commit a
+    level, and both ask this, so a change to the fold reaches both paths.
+    """
+    if not pair_id_backend:
+        return ""
+    base, level = model_registry.split_effort_suffix(model or "")
+    return base if level else ""
+
+
+def effort_commit_needs_reset(provider: object) -> bool:
+    """Whether committing a new effort level must reset the live session.
+
+    A live ACP session whose model takes no effort level keeps the level as a
+    stored value only: it applies once the user picks a capable model, and a
+    reset would restart the session for nothing. Any other live session, or no
+    live session, needs the reset (or the live push the dropdown tries first)
+    for the level to take.
+
+    Shared by the effort dropdown route and :func:`apply_pending_model_pick`
+    for the same reason as :func:`legacy_effort_base`.
+    """
+    # Duck-typed so this module stays above the agent-SDK boundary. Every
+    # LLMProvider has ``supports_effort``, and the base one returns a placeholder
+    # False, so only a provider that sets ``reports_effort_support`` (the ACP
+    # provider) can skip the reset. Read off the class, as isinstance would, so
+    # any other provider, an unspecced test double or no session keeps it.
+    if getattr(provider.__class__, "reports_effort_support", False) is not True:
+        return True
+    return provider.supports_effort() is not False  # type: ignore[attr-defined]
+
+
 def apply_pending_model_pick(state: "DashboardState", slot: "_ChatSlot") -> bool:
     """Commit *slot*'s pending ``session_set_model`` pick, if it is still allowed.
 
     Called at the start of the slot's turn, before a session is acquired, after
     :func:`prewarm_enabled_check` so the fence re-read below is a cache hit.
-    SYNCHRONOUS on purpose: the gate and the write to ``slot.model`` run with no
-    suspension between them, so nothing can link or mirror the target after it
-    was authorized and before the model changed. A pick the gate now refuses is
-    dropped and audited, and the turn runs on the model it already had. So is a
-    pick the user has overtaken with a newer picker choice.
+    SYNCHRONOUS on purpose: the gate and the writes to ``slot.model`` and
+    ``slot.reasoning_effort`` run with no suspension between them, so nothing
+    can link or mirror the target after it was authorized and before either
+    changed. A pick the gate now refuses is dropped and audited, and the turn
+    runs on the model and effort it already had. So is each half of a pick the
+    user has overtaken with a newer choice from that half's own control.
 
     The ownership fence only tightens: a caller fenced at call time stays
     fenced, and one that was not is re-checked now, since it may have become a
     fenced crew member while the pick waited.
 
-    Returns True when ``slot.model`` changed, meaning a live session still runs
-    the old model and must be reset before this turn uses it.
+    Returns True when the live session must be reset before this turn uses it:
+    ``slot.model`` changed (or a fallback serves the session), a codex pin's
+    legacy ``[level]`` suffix was folded away, or ``slot.reasoning_effort``
+    changed.
     """
     pick = slot._pending_model_pick
     if pick is None:
@@ -5365,7 +6048,13 @@ def apply_pending_model_pick(state: "DashboardState", slot: "_ChatSlot") -> bool
         logger.info("session-control set_model: pick on %s deferred, alias mid-turn", slot.key)
         return False
     slot._pending_model_pick = None
-    if slot._model_pick_gen != pick.pick_gen:
+    # Each half of the pick yields separately to a newer choice the user made
+    # from its own control, so a dropdown effort pick does not throw away the
+    # caller's model, nor a picker model pick the caller's effort.
+    model = pick.model
+    effort = pick.reasoning_effort
+    if model is not None and slot._model_pick_gen != pick.pick_gen:
+        model = None
         _audit(
             caller_session_key=pick.caller_session_key,
             operation="set_model",
@@ -5373,6 +6062,22 @@ def apply_pending_model_pick(state: "DashboardState", slot: "_ChatSlot") -> bool
             outcome="denied",
             detail={"code": "superseded_by_newer_pick", "stage": "turn_start"},
         )
+    # On a pair-id backend (codex) the model picker IS the effort control: a
+    # user picking ``gpt-6-astra[max]`` bumps only the model generation, so a
+    # newer model pick supersedes the effort half as well.
+    if effort is not None and (
+        slot._effort_pick_gen != pick.effort_gen
+        or (pick.pair_id_backend and slot._model_pick_gen != pick.pick_gen)
+    ):
+        effort = None
+        _audit(
+            caller_session_key=pick.caller_session_key,
+            operation="set_model",
+            slot_key=slot.key,
+            outcome="denied",
+            detail={"code": "superseded_by_newer_effort", "stage": "turn_start"},
+        )
+    if model is None and effort is None:
         return False
     if _caller_tab_id(state, pick.caller_session_key) != pick.caller_tab_id:
         _audit(
@@ -5417,24 +6122,40 @@ def apply_pending_model_pick(state: "DashboardState", slot: "_ChatSlot") -> bool
             detail={"code": "target_replaced", "stage": "turn_start"},
         )
         return False
-    # A fallback serving the session means the wire model differs from the pin,
-    # so an equal pin still needs the session reset, as the picker treats it.
-    changed = (
-        (slot.model or "") != pick.model
-        or bool(slot._active_fallback_model)
-        or bool(slot._refusal_fallback_primary)
-    )
-    slot.model = pick.model
-    # A concrete pick answers the routing question, as it does from the picker.
-    slot.jev_route = False
-    # Recorded as an explicit pick so the model-fallback restore never undoes it.
-    slot._model_pick_gen += 1
+    changed = False
+    if model is not None:
+        # A fallback serving the session means the wire model differs from the
+        # pin, so an equal pin still needs the session reset, as the picker
+        # treats it.
+        changed = (
+            (slot.model or "") != model
+            or bool(slot._active_fallback_model)
+            or bool(slot._refusal_fallback_primary)
+        )
+        slot.model = model
+        # A concrete pick answers the routing question, as it does from the picker.
+        slot.jev_route = False
+        # Recorded as an explicit pick so the model-fallback restore never undoes it.
+        slot._model_pick_gen += 1
+    if effort is not None:
+        base = legacy_effort_base(slot.model, pair_id_backend=pick.pair_id_backend)
+        if base:
+            slot.model = base
+            changed = True
+        if (slot.reasoning_effort or "") != effort and effort_commit_needs_reset(
+            state.sessions.get_provider(effective_session_key(slot))
+        ):
+            # A live session keeps the level it started with; the reset the
+            # caller arms on True makes the cold start read this one. A model
+            # that takes no level keeps it stored only, as the dropdown does.
+            changed = True
+        slot.reasoning_effort = effort
     _audit(
         caller_session_key=pick.caller_session_key,
         operation="set_model",
         slot_key=slot.key,
         outcome="allowed",
-        detail={"model": pick.model or "auto", "stage": "turn_start"},
+        detail={**_pick_audit_fields(model, effort), "stage": "turn_start"},
     )
     return changed
 
@@ -5738,6 +6459,7 @@ async def close_target(
         target=target,
         operation="close",
         precomputed_ownership_fenced=caller_fenced,
+        allow_self=True,
     )
     slot_key = slot.key
     # Deferred for the same import cycle `stop_target` documents.
@@ -5773,6 +6495,7 @@ async def close_target(
                 operation="close",
                 skip_enabled_check=True,
                 precomputed_ownership_fenced=caller_fenced,
+                allow_self=True,
             )
         except SessionControlError as exc:
             # A stale-authorization refusal (mirrored/linked/workspace/caller-gone)
@@ -6647,6 +7370,9 @@ async def send_to_target(
         _delivery_progress if _delivery_progress is not None else _DeliveryProgress()
     )
 
+    # The delivery appends to the target's rows: a target restored as a
+    # sidebar row loads its window first, ahead of the prewarm below.
+    await load_target_window(state, target)
     # Same prewarm ordering as `stop_target`, for the same reasons: the SEL
     # write inside `authorize_target`'s deny path must be a cache hit, and the
     # config warm must be the LAST suspension before the synchronous gate.
@@ -7576,9 +8302,143 @@ def _created_tree_roster(caller_key: str) -> "tuple[list[str], str]":
     return children, ("incomplete" if reading.incomplete or overflow else "readable")
 
 
+def _gone_slot_lifecycles(slots: "Sequence[str]") -> dict[str, dict[str, Any]]:
+    """Fold each gone slot's lifecycle so a `gone` row can say CLOSED versus LOST.
+
+    The crew log already records a ``session/closed`` edge and the status fold
+    already projects it as ``lifecycle``/``closed_at`` (see
+    :func:`~kiro_crew.crew_log.projection._status_render`). This reads that
+    projection per slot and nothing more -- no new terminal vocabulary, no new
+    verb -- so a worker whose tab was closed after it finished is told apart from
+    one lost with its process.
+
+    The read is slot-keyed (:func:`~kiro_crew.crew_log.projection.read_slot_projection`),
+    so it folds over EVERY unit the slot ran under, newest last, and reports the
+    lifecycle of the slot's current session. A slot that was reopened and later
+    closed again reads ``closed``; the ``session/opened`` of the reopen resets the
+    close the earlier life recorded, which the status fold already handles.
+
+    Returns a map ``{slot: {"status", "closed_at"?}}``. A slot is ``closed`` (and
+    carries its ``closed_at``) only when its fold's newest life ended by the
+    DELIBERATE tab close -- ``close_reason`` is ``removed`` and no turn is still
+    open (see :func:`_lifecycle_is_closed`). Everything else is ``lost``: an
+    ``open``/``unknown`` lifecycle, a read that raised, OR a ``closed`` lifecycle
+    whose edge came from a process recycle (``reset``: idle expiry, RSS recycle,
+    model/provider switch, the watchdogs) or a ``destroy`` (including mid-turn) --
+    teardowns the tab and conversation outlive. "Lost" is the fail-safe reading: it
+    is the state a patrol re-dispatches, and reporting a worker lost when it may
+    have finished is cheaper than reading a recycled or mid-turn worker as
+    ``closed`` and telling a conductor to stop looking for it.
+
+    Touches disk (one slot-keyed fold per slot), so it is called off the event loop.
+    """
+    from kiro_crew.crew_log.projection import read_slot_projection
+
+    out: dict[str, dict[str, Any]] = {}
+    for slot in slots:
+        try:
+            value = read_slot_projection(slot, "status").value
+        except Exception:
+            # A read fault is not evidence the worker closed cleanly, so it reads as
+            # LOST -- the fail-safe answer, the one a patrol acts on by re-dispatching.
+            logger.debug("gone row lifecycle could not be folded for %s", slot, exc_info=True)
+            out[slot] = {"status": "lost"}
+            continue
+        if _lifecycle_is_closed(value):
+            out[slot] = {"status": "closed", "closed_at": value.get("closed_at")}
+        else:
+            out[slot] = {"status": "lost"}
+    return out
+
+
+#: Close reasons that mean "the worker FINISHED and its tab was closed" -- the one
+#: direction a gone row may call ``closed``. Only the deliberate tab ✕ / ``session_close``
+#: teardown (``remove`` -> ``END_REASON_REMOVED``) qualifies. Every OTHER close edge is a
+#: process recycle or a mid-turn teardown that the tab and conversation survive --
+#: ``reset`` (idle expiry, RSS recycle, model/provider switch, the watchdogs),
+#: ``destroyed``/``destroyed_sid_retained`` (``destroy``, including mid-turn) -- and must
+#: read ``lost``, the fail-safe state a patrol re-dispatches. Reading one of those as
+#: ``closed`` is the fail-OPEN harm this split exists to remove: it would tell a conductor
+#: a lost worker finished, so it stops looking for it.
+_FINISHED_CLOSE_REASONS = frozenset({END_REASON_REMOVED})
+
+
+def _lifecycle_is_closed(value: "Mapping[str, Any]") -> bool:
+    """Whether a folded slot status means the worker finished and closed its tab.
+
+    ``True`` only when the fold's newest life is closed by the DELIBERATE end
+    (``close_reason`` in :data:`_FINISHED_CLOSE_REASONS`), no turn is still open,
+    AND the newest completed turn ended cleanly. A ``closed`` lifecycle alone is
+    not enough: the ``session/closed`` edge is also written on every process
+    recycle (``reset``) and on ``destroy`` (including mid-turn), teardowns the tab
+    and conversation outlive.
+
+    The ``last_stop_reason`` guard is the third fail-safe, and it is the one a
+    deliberate MID-TURN close needs: closing a tab with a turn in flight cancels
+    ``slot.task``, and the cancelled turn's ``finally`` writes a real
+    ``turn/completed`` (``stop_reason`` ``cancelled``/``failed``/``error:*``) that
+    CLEARS ``turn_open`` -- so the ``turn_open`` guard above does not catch it, and
+    a worker killed mid-turn would read ``closed`` ("finished, nothing to
+    re-dispatch") when its work did not finish. A newest turn that did not end
+    cleanly (:func:`turn_outcome` other than ``"ok"``) therefore reads ``lost``.
+    A clean ``end_turn`` and the ``None`` of a tab closed before any turn ran both
+    classify ``"ok"`` -- a session that genuinely finished (or never started work)
+    stays ``closed``.
+
+    A close whose reason is a recycle, a close with a turn still open, a newest
+    turn that did not end cleanly, or any non-closed lifecycle all read as
+    not-closed -> the caller reports ``lost``, the fail-safe direction.
+    """
+    if value.get("lifecycle") != "closed":
+        return False
+    if value.get("turn_open"):
+        # A session cut off with a turn in flight did not finish, however it was
+        # torn down -- the projection leaves the open turn set on a close for
+        # exactly this reader to see (crew_log/projection.py::_status_render).
+        return False
+    if turn_outcome(value.get("last_stop_reason")) != "ok":
+        # The newest completed turn did not end cleanly. A deliberate mid-turn
+        # close cancels the running turn, whose ``finally`` records a
+        # ``turn/completed`` with an abnormal ``stop_reason`` and clears
+        # ``turn_open`` -- so this is the only guard that still sees the work was
+        # cut off. ``None``/``end_turn`` are both ``"ok"``, so a clean finish and a
+        # never-worked tab close stay ``closed``.
+        return False
+    return value.get("close_reason") in _FINISHED_CLOSE_REASONS
+
+
 def _bounded_status_title(value: object) -> str:
     """A display-safe title bounded before it is retained in a status row."""
     return sanitize_outbound(str(value or ""))[:MAX_SESSION_STATUS_TITLE_CHARS]
+
+
+def _pending_approval_fields(state: "DashboardState", slot: Any) -> dict[str, Any]:
+    """``{"pending_approval": True, "pending_approval_tool": ...}`` while *slot* waits.
+
+    A turn parked on a tool approval keeps ``running`` true, so without this a
+    creator polling the session sees ``working`` for the whole approval window.
+    The answer is the slot projection's own ``pending_approval`` and
+    ``pending_approval_info`` -- the fields the dashboard card reads -- so the
+    two cannot disagree. ``to_dict`` walks the transcript, so it runs only once
+    one of the two registries it consults has an open entry; an ordinary turn
+    pays one dict scan and the response shape is unchanged.
+    """
+    futures = getattr(slot, "_approval_futures", None) or {}
+    pending_for = getattr(state, "pending_coordinator_approvals", None)
+    if not any(not fut.done() for fut in futures.values()) and not (
+        callable(pending_for) and pending_for(slot.key)
+    ):
+        return {}
+    projected = slot.to_dict()
+    if not projected.get("pending_approval"):
+        return {}
+    fields: dict[str, Any] = {"pending_approval": True}
+    tool = str((projected.get("pending_approval_info") or {}).get("tool") or "")
+    if tool:
+        fields["pending_approval_tool"] = redact_and_truncate(
+            sanitize_outbound(tool), MAX_PENDING_APPROVAL_TOOL_CHARS
+        )
+    return fields
 
 
 def _created_history_roster(
@@ -7662,10 +8522,18 @@ async def created_session_status(
     * ``queued`` — idle, but messages are waiting to run. Also wait, but nothing is
       happening yet, so a steer would land on nothing.
     * ``idle`` — open and doing nothing. This is the one that needs a decision.
-    * ``gone`` — the crew log names it and the dashboard does not hold it: closed,
-      archived, or lost with the process that ran it. Re-dispatch or drop it; there
-      is nothing here to message, and :func:`authorize_target` would answer
-      ``target_not_found``.
+    * ``closed`` — the crew log names it, the dashboard does not hold it, and the
+      log records a ``session/closed`` edge: a worker that FINISHED and closed its
+      tab. Carries ``closed_at``. Ignore it; there is nothing here to message, and
+      :func:`authorize_target` would answer ``target_not_found``.
+    * ``lost`` — the crew log names it, the dashboard does not hold it, and no
+      qualifying clean deliberate close was recorded: either no ``session/closed``
+      edge at all, or the newest one is a ``reset``/``destroy`` teardown or a close
+      whose last turn did not end cleanly — none of which means "finished, nothing
+      to re-dispatch". Lost with the process that ran it (or its opener was retained
+      out of the log). Re-dispatch it. ``closed`` and ``lost`` are the two fates the
+      old single ``gone`` status could not tell apart, and they call for opposite
+      actions.
     * ``unknown`` — history records the creator but neither a live slot nor an
       attested tree edge exists. The row proves the session was created without
       claiming whether it finished or was lost.
@@ -7684,8 +8552,8 @@ async def created_session_status(
     The ownership fence applies to the rows, not just to the verb: a fenced caller
     (a crew member, a cron, an agent-created session) sees the live sessions it
     created and nothing else, so this verb cannot become a way to enumerate the
-    user's own sessions by their titles. A ``gone`` row carries only a slot key the
-    caller already knew, and no title, so it is listed either way.
+    user's own sessions by their titles. A ``closed`` or ``lost`` row carries only
+    a slot key the caller already knew, and no title, so it is listed either way.
     """
     deny = _deny_factory(caller_session_key=caller_session_key, operation="status", target="")
     caller_key = refuse_caller_identity(state, caller_session_key=caller_session_key, deny=deny)
@@ -7734,20 +8602,10 @@ async def created_session_status(
 
     # Live slot state stays on the event loop and is read only after the history
     # worker returns. Reading it inside the worker would let the result go stale
-    # before these rows are built.
+    # before these rows are built. This read only names the caller's own creations
+    # (`_created_by`, not workspace), so it is not the workspace-boundary read --
+    # that is `resolvable_keys`, built below AFTER the last suspension in this verb.
     live_children = broadcast_audience(state, caller_key)
-    # The SAME containment set `session_broadcast` resolves names against, resolved
-    # here once and applied to every live row below. Read after the re-check above,
-    # so a mirror bound during the scan is already reflected in it.
-    resolvable_keys = {
-        slot.key
-        for slot in _broadcast_resolution_slots(
-            state,
-            caller_key=caller_key,
-            caller_slot=caller_slot,
-            ownership_fenced=ownership_fenced,
-        )
-    }
 
     rows: list[dict[str, Any]] = []
     roster = set(tree_children) | set(history_children) | set(live_children)
@@ -7762,7 +8620,51 @@ async def created_session_status(
     # Zero when nothing was cut, so a reader distinguishes "no overflow" from a
     # cut whose size it must know to judge the roster it was handed.
     roster_omitted = max(0, len(roster) - MAX_SESSION_STATUS_ROWS)
-    for key in sorted(roster)[:MAX_SESSION_STATUS_ROWS]:
+    retained = sorted(roster)[:MAX_SESSION_STATUS_ROWS]
+    # A `gone` row -- the tree names it and the dashboard does not hold it -- splits
+    # into `closed` and `lost`, and the two call for OPPOSITE actions: ignore a
+    # worker that finished and closed its tab, re-dispatch one lost with its
+    # process. The split is read from the ``session/closed`` edge the status fold
+    # already projects, so it is a disk fold per gone slot and runs OFF the loop,
+    # the same worker-thread discipline the history scan above keeps. Scoped to the
+    # retained, tree-attested, now-absent slots so no fold is paid for a row that
+    # will not carry the distinction.
+    gone_slots = [key for key in retained if key in tree_children and state.get_slot(key) is None]
+    gone_lifecycles = (
+        await asyncio.to_thread(_gone_slot_lifecycles, gone_slots) if gone_slots else {}
+    )
+    # The gone fold above is the LAST suspension in this verb, and the live-row
+    # containment must be computed after it, not before. A live worker can be moved
+    # across the workspace boundary mid-fold -- `api_chat_slot_workspace` reassigns
+    # `_slot.workspace` on a running slot with no idle requirement -- so a
+    # `resolvable_keys` built before this await would admit a worker on its
+    # pre-move workspace and then carry its `display_title` out of the caller's
+    # workspace in the row loop below. So re-call the caller gate on the same terms
+    # and REBUILD containment here, after the final await, exactly as the block
+    # after the history scan does: the boundary every row is filtered on is read
+    # from the live slots as they stand once nothing else can suspend.
+    refuse_caller_surface(state, caller_key=caller_key, deny=deny)
+    if str(getattr(caller_slot, "workspace", "default")) != caller_workspace:
+        raise deny(
+            "the calling session moved workspace while its roster was being read; " "call again",
+            "caller_changed_mid_read",
+        )
+    # The SAME containment set `session_broadcast` resolves names against, resolved
+    # here once and applied to every live row below. Built AFTER the gone fold's
+    # await (and its re-check), so a worker moved across the boundary during that
+    # fold is already excluded -- its `workspace` is re-read here as it now stands,
+    # and the fail-safe follows: a row the moved worker would carry is dropped by
+    # the `resolvable_keys` membership test below rather than leaked.
+    resolvable_keys = {
+        slot.key
+        for slot in _broadcast_resolution_slots(
+            state,
+            caller_key=caller_key,
+            caller_slot=caller_slot,
+            ownership_fenced=ownership_fenced,
+        )
+    }
+    for key in retained:
         slot = state.get_slot(key)
         from_tree = key in tree_children
         from_history = key in history_children
@@ -7779,7 +8681,37 @@ async def created_session_status(
             if from_tree:
                 # The attested tree still owns this status. History may corroborate
                 # the birth, but it does not turn editable metadata into lineage.
-                rows.append({"target": key, "status": "gone", "source": "+".join(sources)})
+                #
+                # CLOSED vs LOST, read from the ``session/closed`` edge the status
+                # fold projects: a worker that closed its tab after finishing is
+                # ``closed`` and carries its ``closed_at``; one gone without a
+                # recorded close -- lost with its process, or whose opener was
+                # retained out of the log -- is ``lost``. Defaults to ``lost`` when
+                # the fold was not made (a slot absent from the map), the fail-safe
+                # reading a patrol re-dispatches rather than drops.
+                lifecycle = gone_lifecycles.get(key, {"status": "lost"})
+                gone_row: dict[str, Any] = {
+                    "target": key,
+                    "status": lifecycle["status"],
+                    "source": "+".join(sources),
+                }
+                if lifecycle["status"] == "closed":
+                    gone_row["closed_at"] = lifecycle.get("closed_at")
+                rows.append(gone_row)
+                continue
+            if not from_history:
+                # Neither tree nor history, and no live slot. A row reaches here
+                # only because it was in ``retained`` -- read from the creator's
+                # live children BEFORE the gone-fold await -- and its slot has since
+                # gone: a worker the caller created that never took a first turn (so
+                # no tree edge) and left no history row (the history scan filters on
+                # workspace) can have its tab closed WHILE the fold runs on its
+                # worker thread, landing here with ``slot is None`` and both durable
+                # sources absent. Reading ``history_children[key]`` would raise
+                # ``KeyError`` and fail the whole roster. Drop the row: the worker is
+                # gone with no durable record to report, which is the fail-safe
+                # reading -- the same "nothing to say about a slot that vanished with
+                # no attested trace" the ``lost`` default elsewhere takes.
                 continue
             meta = history_children[key]
             rows.append(
@@ -7816,6 +8748,7 @@ async def created_session_status(
                 "status": "working" if running else ("queued" if queue_depth else "idle"),
                 "running": running,
                 "queue_depth": queue_depth,
+                **_pending_approval_fields(state, slot),
                 "source": "+".join(sources),
             }
         )
@@ -8000,17 +8933,17 @@ def read_messages(
         # "nothing happening".
         **({"streaming": True} if durable_end < len(raw_window) else {}),
         "queue_depth": len(slot._queue),
+        # A turn parked on a tool approval is still ``running``; this says it is
+        # waiting on a person rather than working.
+        **_pending_approval_fields(state, slot),
         # The model the target's turns use, and a session_set_model pick still
         # waiting for its next turn, so a caller can see whether its pick took.
         # Redacted: the owner's picker stores whatever string it is given.
         # The served model when the backend has reported one (it reflects an
         # inherited default or an active fallback), otherwise the pin.
         "model": redact(slot.served_model or slot.model or ""),
-        **(
-            {"pending_model": redact(slot._pending_model_pick.model)}
-            if slot._pending_model_pick is not None
-            else {}
-        ),
+        **_pending_pick_view(slot._pending_model_pick),
+        "reasoning_effort": slot.reasoning_effort or "",
         "total": total,
         # The cursor to poll with next. This is NOT `total`: when more than
         # `limit` rows are new, the window stops short of the end, and a caller

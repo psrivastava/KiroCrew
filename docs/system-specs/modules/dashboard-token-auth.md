@@ -36,6 +36,12 @@ Rotation-on-use races when a refresh POST is duplicated (network retry / double-
 
 ### Dashboard client: who owns browser-side recovery
 
+Portability export and import use direct fetches rather than the API client's
+transport. Their error branches pass the response status and parsed refusal to
+`noteStaleOwnerResponse`, raising the existing re-authentication prompt only for
+`401 stale_session_reauth`. Inline refusals remain visible; generic 401 and owner-only
+403 responses do not raise that prompt. The non-owner-gated import preview is unchanged.
+
 The browser half of refresh and re-authentication is split by responsibility
 across a few frontend owners. None of them authorizes anything: authorization
 stays on the gateway, in the token middleware and in the handler-level owner
@@ -318,7 +324,7 @@ def token_auth_middleware(local_only: bool = True) -> Callable[..., Any]:
 The `local_only` parameter is accepted for backward compatibility but does not control whether ordinary loopback requests authenticate. `token_auth_middleware()` requires a token on ordinary loopback routes (`test_loopback_requires_token`). An internal route can grant a loopback caller with a valid `X-Internal-Secret`; a mixed internal route without that secret follows its cookie-authentication branch.
 
 Request flow:
-1. Internal-path handling is separate: a loopback caller with a valid `X-Internal-Secret` is admitted, a mixed internal path can validate a cookie, and a strict internal path denies non-loopback callers; ordinary loopback requests continue to the token gate (`token_auth_middleware`; `test_loopback_requires_token`).
+1. Internal-path handling is separate: a loopback caller with a valid `X-Internal-Secret` is admitted, a mixed internal path can validate a cookie, and a strict internal path denies non-loopback callers; ordinary loopback requests continue to the token gate (`token_auth_middleware`; `test_loopback_requires_token`). A mixed internal path's cookie branch, on loopback and off it, sets `auth_from_query_token` from the credential `_extract_and_validate_token` validated, as the main path does: true for a `?token=` link, false for the session cookie, including a cookie adopted after a failed link.
 2. Bypass named non-secret routes: prefix routes `/assets/`, `/static/`, `/fonts/`, `/vendor/`, `/artifact-app/`, `/sandbox-doc/`, and `/browser-view/`; exact routes `/logo.png`, `/favicon.ico`, `/manifest.json`, `/sw.js`, `/pcm-worklet.js`, `/api/token/local`, `/api/shutdown`, `/api/logout`, `/api/theme/boot`, `/api/health`, `/api/live`, `/api/ready`, and `/browser-view` (the bare form, which the trailing-slash prefix misses — bypassed so the relay's uniform 404 answers instead of the middleware's distinguishable 403); anchored icon files; and method-scoped routes `GET`/`HEAD /apps/<name>/ui/*`, `POST /api/hooks/agent`, `POST /api/messaging/teams`, `POST /api/apps/<name>/token`, `POST /api/auth/refresh`, `POST /api/auth/logout`, and `POST /api/update/revalidate` (`UPDATE_REVALIDATE_PATH`: the CLI's post-update badge revalidate, which self-authenticates over loopback with `X-Local-Secret`, re-checked in `api_update_revalidate`) (`_BYPASS_PREFIXES`, `_BYPASS_EXACT`, `_BYPASS_EXACT_METHODS`, and `token_auth_middleware()`). `/browser-view/` is unlike every other bypass on this list: it is the one route that **proxies foreign content** (the Playwright CLI browser view) rather than serving gateway-owned assets. It carries its own authentication — a per-instance capability token embedded in the path, minted by the view supervisor and disclosed only through the cookie-authed, owner-gated `/api/browser/view` payload, constant-time-compared before any per-request ownership probe runs — and every tokenless or wrong-token request answers a uniform 404. The full model (post-connect ownership re-proof, CSP sandbox stamp, SEL audit of every allow/deny) is specified in `dashboard/handlers/browser_view_relay.py` and the [browser module spec](browser.md).
 
    `/api/token/local` carries its own gate: loopback (or a same-principal unix
@@ -479,7 +485,7 @@ re-enable unexpired sessions previously revoked by `kirocrew logout`.
 
 An **app token** (payload carries a non-empty `app` claim, minted by the `X-App-Secret` exchange at `POST /api/apps/<name>/token`) must not have the same reach as a dashboard-user token. `_enforce_app_scope(request, app_name, path)` applies least privilege, **deny-by-default**:
 
-- An app token may access **only** (1) its **own namespace** — `/apps/<name>/...` and `/api/apps/<name>/...`, matched on a path boundary so app `foo` cannot reach app `foo-bar` — and (2) the API path prefixes the app declared in its manifest `permissions.api` allowlist (`_app_api_allowlist`, cached ~30s; any load failure returns an empty tuple → confined to its own namespace only). Everything else is a 403 with an `app_scope_check` SEL audit event.
+- An app token may access **only** (1) its **own namespace** — `/apps/<name>/...` and `/api/apps/<name>/...`, matched on a path boundary so app `foo` cannot reach app `foo-bar` — and (2) the API path prefixes the app declared in its manifest `permissions.api` allowlist (`_app_api_allowlist`, cached ~30s; any load failure returns an empty tuple → confined to its own namespace only; entries an update added stay out until the owner approves them, see `approved-grants.json` in app-kit-platform §13). Everything else is a 403 with an `app_scope_check` SEL audit event.
 - It is enforced in **every** middleware branch that admits a token (the normal cookie/query-param flow and the cross-app `/apps/<other>/api` reverse-proxy re-check) — otherwise an app token could reach a mixed internal path (e.g. `/api/chat`, `/api/spawn`) with no app identity set and be mistaken for the dashboard user (privilege escalation).
 - It is a **no-op for dashboard-user tokens** (empty `app` claim), which bypass the gate entirely.
 
@@ -871,7 +877,11 @@ tries the same refresh and, when it fails, hands recovery to its hub instead of
 raising the banner. A 401 or 403 without the header whose
 body is an HTML document came from a proxy in front of the gateway; the client
 words it through `website/src/api/edgeAuthChallenge.ts` and never offers the
-token flow, which could not clear it.
+token flow, which could not clear it. In a top-level document that refusal also
+raises the same fixed banner the gateway denial uses, with the reload instruction
+and a reload button in place of the token field; it shares that banner's latch,
+so the first 2xx clears it. An embedded pane raises nothing, because its message
+already names where to sign in.
 
 > **Note:** the *No token* / *Expired token* / *Invalid HMAC signature* rows above apply to `/api/*`, `/apps/*`, and non-`GET`/`HEAD` requests. A non-API `GET`/`HEAD` navigation in those same states is instead served the public SPA shell (200) so the app can cold-start its refresh flow — see *SPA Shell Bypass (cold-start recovery)*. `IP mismatch` is **not** relaxed: it remains a hard 403 (theft signal).
 

@@ -6,7 +6,9 @@ plus a real :class:`ArtifactStore` rooted at a tmp dir for end-to-end coverage.
 
 from __future__ import annotations
 
+import itertools
 import json
+import threading
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -17,8 +19,10 @@ from kiro_crew import artifacts as art_mod
 from kiro_crew.artifacts import ArtifactStore
 from kiro_crew.dashboard.handlers.artifacts import (
     _MAX_BODY_BYTES,
+    _clean_origin_session_key,
     api_artifact_delete,
     api_artifact_detail,
+    api_artifact_events,
     api_artifact_materialize,
     api_artifact_relocate,
     api_artifact_reprobe_notice,
@@ -93,6 +97,13 @@ def patch_restricted(monkeypatch):
 
 
 @pytest.fixture
+def sequential_tokens(monkeypatch) -> None:
+    """Hand out distinct content tokens in order, so no comparison rests on chance."""
+    counter = itertools.count(1)
+    monkeypatch.setattr(art_mod, "_new_content_token", lambda: f"{next(counter):064x}")
+
+
+@pytest.fixture
 def linkable_project(tmp_path: Path, monkeypatch):
     """A project directory whose files earn a LINK verdict on promote.
 
@@ -135,6 +146,40 @@ def disposable_file(tmp_path: Path, monkeypatch):
 
 def _json_body(resp) -> dict:
     return json.loads(resp.body)
+
+
+# ── Origin session key ──────────────────────────────────────────────────────
+
+
+class TestCleanOriginSessionKey:
+    """The validator judges the WHOLE client value, trailing newline included.
+
+    Python's ``$`` matches immediately before a final newline, so a
+    ``$``-anchored pattern applied with ``.match`` accepts ``"dashboard:abc\\n"``,
+    and both HTTP write paths (artifact create, conversation-log materialize)
+    would store it unchanged; the store compares session keys exactly, so such a
+    value never matches the real session again. The pattern anchors at ``\\Z``,
+    as the artifact tag validators do.
+    """
+
+    @pytest.mark.parametrize(
+        "key", ["chat-2", "dashboard:chat-2", "cron:foo", "1700000000.123456", "a" * 128]
+    )
+    def test_key_inside_the_grammar_is_returned_unchanged(self, key: str) -> None:
+        assert _clean_origin_session_key(key) == key
+
+    @pytest.mark.parametrize("key", ["dashboard:abc\n", "a" * 128 + "\n"])
+    def test_trailing_newline_collapses_to_no_origin(self, key: str) -> None:
+        """The one placement a ``$`` anchor lets through."""
+        assert _clean_origin_session_key(key) == ""
+
+    @pytest.mark.parametrize("key", ["dashboard:a\nbc", "\ndashboard:abc", "dashboard:abc\n\n"])
+    def test_any_other_newline_placement_still_collapses(self, key: str) -> None:
+        assert _clean_origin_session_key(key) == ""
+
+    @pytest.mark.parametrize("raw", [None, 7, ["chat-2"], "", "a" * 129, "chat 2", "<b>"])
+    def test_values_outside_the_grammar_still_collapse(self, raw: object) -> None:
+        assert _clean_origin_session_key(raw) == ""
 
 
 # ── List ────────────────────────────────────────────────────────────────────
@@ -2657,3 +2702,102 @@ class TestUpdateWebappMetadata:
         )
         # Bounded validator rejects non-http(s) URLs.
         assert resp.status == 400
+
+
+# ── optimistic-concurrency content token ────────────────────────────────────
+
+
+@pytest.mark.usefixtures("sequential_tokens")
+class TestUpdateConflictToken:
+    @pytest.mark.asyncio
+    async def test_detail_assigns_a_pre_token_artifact_its_token(
+        self, isolated_store, patch_restricted
+    ) -> None:
+        isolated_store.create(name="x", content="v1", slug="x")
+        path = isolated_store.root / "x" / "meta.json"
+        meta = json.loads(path.read_text(encoding="utf-8"))
+        del meta["content_token"]
+        path.write_text(json.dumps(meta), encoding="utf-8")
+        body = _json_body(await api_artifact_detail(_request(match={"slug": "x"})))
+        assert body["content_token"]
+        assert json.loads(path.read_text(encoding="utf-8"))["content_token"] == body["content_token"]
+
+    @pytest.mark.asyncio
+    async def test_detail_carries_the_persisted_token(
+        self, isolated_store, patch_restricted
+    ) -> None:
+        isolated_store.create(name="x", content="v1", slug="x")
+        body = _json_body(await api_artifact_detail(_request(match={"slug": "x"})))
+        assert body["content_token"] == isolated_store.get("x").content_token
+
+    @pytest.mark.asyncio
+    async def test_matching_token_saves_and_returns_the_next_token(
+        self, isolated_store, patch_restricted
+    ) -> None:
+        isolated_store.create(name="x", content="v1", slug="x")
+        token = isolated_store.get("x").content_token
+        resp = await api_artifact_update(
+            _request(body={"content": "v2", "expected_token": token}, match={"slug": "x"})
+        )
+        assert resp.status == 200
+        body = _json_body(resp)
+        assert body["content"] == "v2"
+        assert body["content_token"] == isolated_store.get("x").content_token != token
+
+    @pytest.mark.asyncio
+    async def test_stale_token_answers_409_with_the_rebase_token(
+        self, isolated_store, patch_restricted
+    ) -> None:
+        isolated_store.create(name="x", content="v1", slug="x")
+        stale = isolated_store.get("x").content_token
+        isolated_store.update("x", content="newer")
+        resp = await api_artifact_update(
+            _request(body={"content": "stale", "expected_token": stale}, match={"slug": "x"})
+        )
+        assert resp.status == 409
+        body = _json_body(resp)
+        assert body["code"] == "artifact_conflict"
+        assert body["current_token"] == isolated_store.get("x").content_token
+        assert "version" not in body
+        assert isolated_store.get("x").content == "newer"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("bad", ["short", 42, ["x"]])
+    async def test_malformed_token_is_a_400(self, isolated_store, patch_restricted, bad) -> None:
+        isolated_store.create(name="x", content="v1", slug="x")
+        resp = await api_artifact_update(
+            _request(body={"content": "v2", "expected_token": bad}, match={"slug": "x"})
+        )
+        assert resp.status == 400
+        assert isolated_store.get("x").content == "v1"
+
+
+# ── current reads off the event loop ────────────────────────────────────────
+
+
+class TestCurrentReadsOffTheLoop:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "handler", [api_artifact_detail, api_artifact_events, api_artifact_delete]
+    )
+    async def test_untokened_read_runs_in_the_executor(
+        self, isolated_store, patch_restricted, monkeypatch, handler
+    ) -> None:
+        # These reads run in the executor; the detail read of a pre-token
+        # artifact persists its token to meta.json.
+        isolated_store.create(name="x", content="v1", slug="x")
+        path = isolated_store.root / "x" / "meta.json"
+        meta = json.loads(path.read_text(encoding="utf-8"))
+        del meta["content_token"]
+        path.write_text(json.dumps(meta), encoding="utf-8")
+        real_get = isolated_store.get
+        threads: list[int] = []
+
+        def _get(*args, **kwargs):
+            threads.append(threading.get_ident())
+            return real_get(*args, **kwargs)
+
+        monkeypatch.setattr(isolated_store, "get", _get)
+        resp = await handler(_request(match={"slug": "x"}))
+        assert resp.status == 200
+        assert threads and threading.get_ident() not in threads

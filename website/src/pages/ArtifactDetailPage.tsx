@@ -5,7 +5,7 @@ import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import WebAppArtifactCard from '../components/WebAppArtifactCard'
 import { useNavigate, useParams } from 'react-router-dom'
 import { useQuery, useQueryClient, useMutation } from '@tanstack/react-query'
-import { ArrowLeft, ArrowUp, Camera, Check, Copy, ExternalLink, Download, GitFork, Pencil, RefreshCw, X, AlertCircle, AlertTriangle, RotateCcw, Plus, Sparkles, MessageSquare, Monitor, Undo2, Upload, Star, Folder as FolderIcon } from 'lucide-react'
+import { ArrowLeft, ArrowUp, Camera, Check, Copy, ExternalLink, Download, GitFork, Globe, Pencil, RefreshCw, X, AlertCircle, AlertTriangle, RotateCcw, Plus, Sparkles, MessageSquare, Monitor, Undo2, Upload, Star, Folder as FolderIcon } from 'lucide-react'
 import { copyToClipboard } from '../utils/clipboard'
 import { useTheme } from '../hooks/useTheme'
 import { type IframeSelection } from '../hooks/useCommentBridge'
@@ -15,6 +15,7 @@ import { fetchSlots, addSlotOptimistic, removeSlotOptimistic, armConfirmedCloseH
 import { safeHttpUrl } from '../lib/safeUrl'
 import { buildSrcdoc, readThemeVars } from '../lib/widgetSrcdoc'
 import { api } from '../api/client'
+import { ApiError } from '../api/apiError'
 import { sendTurn } from '../chat-core/transport/sendTurn'
 import { slotBusySteer } from '../components/chat-input/busySend'
 import { useJevAutoSend } from './chat/useJevAutoSend'
@@ -54,6 +55,8 @@ import { PublishHub, publishNoticeKey } from '../components/PublishHub'
 import type { Artifact, ArtifactEvent, ArtifactComment, CommentAnchor, ChatSlot } from '../types'
 
 import { i18nT } from '../i18n/t'
+import { uiLocation } from '../uiLocations/uiLocation'
+import { useGuideSelection } from '../guide/guidePredicates'
 import { errMessage } from '../utils/thunkError'
 import { byRecentActivity } from '../utils/slotRecency'
 import { fmtDateFields } from '../i18n/format'
@@ -121,6 +124,7 @@ function FolderChip({ artifact }: { artifact: Artifact }) {
           }`}
           title={current ? i18nT('pages.artifactDetailPage.filed_in_click_to_move', { path }) : i18nT('pages.artifactDetailPage.not_in_a_folder_click_to_file')}
           aria-label={current ? i18nT('pages.artifactDetailPage.folder_move_to_folder', { path }) : i18nT('pages.artifactDetailPage.move_to_folder')}
+          {...uiLocation('artifacts.detail.move-to-folder')}
         >
           <FolderIcon size={10} className={current ? 'text-accent' : undefined} />
           {current ? current.name : 'folder'}
@@ -310,6 +314,18 @@ function ArtifactPopoutControl({ slug, name }: { slug: string; name: string }) {
   )
 }
 
+/** The live `current_token` from a stale-write 409 (see ArtifactConflictError), or
+ * `undefined` when `err` is anything else. */
+function conflictToken(err: unknown): string | undefined {
+  if (!(err instanceof ApiError) || err.status !== 409) return undefined
+  try {
+    const token = (JSON.parse(err.body) as { current_token?: unknown }).current_token
+    return typeof token === 'string' ? token : undefined
+  } catch {
+    return undefined
+  }
+}
+
 export default function ArtifactDetailPage({ popout = false }: { popout?: boolean } = {}) {
   const { slug = '' } = useParams<{ slug: string }>()
   const navigate = useNavigate()
@@ -384,6 +400,24 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
   const [editedContent, setEditedContent] = useState('')
   const [saving, setSaving] = useState(false)
   const [saveError, setSaveError] = useState<string | null>(null)
+  // Identifies the artifact and edit session that owns an async write. Navigation,
+  // starting an edit and ending one advance it, so a late completion only touches
+  // the edit session that sent it.
+  const editGenerationRef = useRef(0)
+  // Token of the content this edit started from (Artifact.content_token). Pinned at
+  // edit start and advanced only by this page's own successful save, so a
+  // background refetch can never re-base a stale buffer onto newer content.
+  const editBaseTokenRef = useRef<string | undefined>(undefined)
+  // The live token from a 409. Only the explicit Save sends it, as the deliberate
+  // overwrite its relabelled button offers; every other write keeps the base
+  // token and keeps being refused.
+  const overwriteTokenRef = useRef<string | undefined>(undefined)
+  // Set while a write carrying one of those tokens is on the wire. Only its own
+  // response advances the base token, so a second write sent before it settles
+  // (Cmd+S pressed twice) would be refused as stale with this tab the only
+  // writer. A save skipped here leaves the buffer dirty, so nothing is lost.
+  const tokenWriteInFlightRef = useRef(false)
+  const [saveConflict, setSaveConflict] = useState(false)
   const [showPublish, setShowPublish] = useState(false)
   // Tag editing: tags shown in the header are editable inline. Adding a tag
   // posts metadata-only (no version bump). Removing a tag works the same way.
@@ -481,6 +515,7 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
   // to another would attempt to fetch v5 of the new artifact (which may not
   // exist), and stale edit state would leak into the new artifact.
   useEffect(() => {
+    editGenerationRef.current += 1
     setSelectedVersion(null)
     setEditing(false)
     setEditedContent('')
@@ -489,6 +524,9 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
     // into a rendered preview.
     setPreviewDuringEdit(false)
     setSaveError(null)
+    editBaseTokenRef.current = undefined
+    overwriteTokenRef.current = undefined
+    setSaveConflict(false)
     setAddingTag(false)
     setNewTag('')
     setRenaming(false)
@@ -520,6 +558,9 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
   // historical view still tracks the pointer it will return to. This also covers
   // /popout/artifact/:slug, which renders this page in its own window.
   useArtifactLiveReload(slug, detailQuery.data?.source_path)
+  // The open artifact is the guide's pick (artifact_open), named as its card
+  // in the library names it, so later steps stay about this one artifact.
+  useGuideSelection('artifact_open', { selected: !popout && !!detailQuery.data, available: true, name: popout ? undefined : detailQuery.data?.name })
 
   const versions = versionsQuery.data?.versions || []
   const effectiveVersion = selectedVersion ?? detailQuery.data?.version ?? null
@@ -684,7 +725,11 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
   // ── Edit / save / cancel / revert handlers ────────────────────────────────
   const startEditing = useCallback(() => {
     if (!artifact || !editable) return
+    editGenerationRef.current += 1
     setEditedContent(artifact.content ?? '')
+    editBaseTokenRef.current = artifact.content_token
+    overwriteTokenRef.current = undefined
+    setSaveConflict(false)
     setEditing(true)
     setSaveError(null)
   }, [artifact, editable])
@@ -779,19 +824,34 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
     }
   }, [justCreatedBlank, queryClient])
 
+  // Every way out of an edit (Cancel, Escape, the version switch) ends it here, so
+  // none of them leaves its save notice or preview toggle behind. Advancing the
+  // generation also stops a write still on the wire from re-arming the notice.
+  const endEditing = useCallback(() => {
+    editGenerationRef.current += 1
+    setEditing(false)
+    setEditedContent('')
+    setSaveError(null)
+    setSaveConflict(false)
+    setPreviewDuringEdit(false)
+  }, [])
+
   const cancelEditing = useCallback(async () => {
     if (dirty && !(await confirm({
       title: i18nT('pages.artifactDetailPage.discard_unsaved_changes'),
       confirmLabel: i18nT('pages.artifactDetailPage.discard_changes_button'),
     }))) return
-    setEditing(false)
-    setEditedContent('')
-    setSaveError(null)
-    setPreviewDuringEdit(false)
-  }, [dirty, confirm])
+    endEditing()
+  }, [dirty, confirm, endEditing])
 
-  const handleSave = useCallback(async (snapshot = false) => {
-    if (!artifact || !dirty) return
+  // `overwrite` is passed ONLY by the relabelled Save button's own click after a
+  // 409. Every other save path (Cmd+S, Cmd+Shift+S, Snapshot) keeps the base
+  // token, so it is refused again instead of silently replacing newer content.
+  const handleSave = useCallback(async (snapshot = false, overwrite = false) => {
+    if (!artifact || !dirty || tokenWriteInFlightRef.current) return
+    const editGeneration = editGenerationRef.current
+    const writeSlug = artifact.slug
+    tokenWriteInFlightRef.current = true
     // Same race as commitRename: the discard snapshot still reads empty until
     // the query refetches, so disarm synchronously or an unmount landing
     setSaving(true)
@@ -800,11 +860,21 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
       // snapshot=true → bumps version (creates a new numbered snapshot).
       // snapshot=false → silently updates the live state without versioning,
       // matching the explicit-snapshot model.
-      await api.updateArtifact(artifact.slug, { content: editedContent, snapshot })
-      await queryClient.invalidateQueries({ queryKey: ['artifact', slug] })
+      const saved = await api.updateArtifact(writeSlug, {
+        content: editedContent,
+        snapshot,
+        expected_token: overwrite ? overwriteTokenRef.current : editBaseTokenRef.current,
+      })
+      await queryClient.invalidateQueries({ queryKey: ['artifact', writeSlug] })
       if (snapshot) {
-        await queryClient.invalidateQueries({ queryKey: ['artifact-versions', slug] })
-        await queryClient.invalidateQueries({ queryKey: ['artifact-events', slug] })
+        await queryClient.invalidateQueries({ queryKey: ['artifact-versions', writeSlug] })
+        await queryClient.invalidateQueries({ queryKey: ['artifact-events', writeSlug] })
+      }
+      if (editGenerationRef.current !== editGeneration) return
+      editBaseTokenRef.current = saved?.content_token
+      overwriteTokenRef.current = undefined
+      setSaveConflict(false)
+      if (snapshot) {
         // Snapshot is a deliberate checkpoint — drop out of edit mode
         // so the user sees the result. Plain Save (silent) keeps the
         // user in the editor: after the query
@@ -815,11 +885,23 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
         setPreviewDuringEdit(false)
       }
     } catch (err) {
-      setSaveError(err instanceof Error ? err.message : String(err))
+      const liveToken = conflictToken(err)
+      if (liveToken !== undefined) {
+        await queryClient.invalidateQueries({ queryKey: ['artifact', writeSlug] })
+        if (editGenerationRef.current !== editGeneration) return
+        // Nothing was written. Keep the draft, arm the explicit Save as a
+        // deliberate overwrite, and refresh what the page shows.
+        overwriteTokenRef.current = liveToken
+        setSaveConflict(true)
+        setSaveError(i18nT('pages.artifactDetailPage.save_conflict_changed_since_read'))
+      } else if (editGenerationRef.current === editGeneration) {
+        setSaveError(err instanceof Error ? err.message : String(err))
+      }
     } finally {
+      tokenWriteInFlightRef.current = false
       setSaving(false)
     }
-  }, [artifact, dirty, editedContent, queryClient, slug])
+  }, [artifact, dirty, editedContent, queryClient])
 
   // Stash for the keyboard handler effect — keeps deps minimal.
   const handleSaveRef = useRef(handleSave)
@@ -830,7 +912,36 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
   // data-loss path where pulling mid-edit discarded the working buffer.
   const flushLiveEdits = useCallback(async () => {
     if (!editing || !dirty || !artifact) return
-    await api.updateArtifact(artifact.slug, { content: editedContent, snapshot: false })
+    const editGeneration = editGenerationRef.current
+    const writeSlug = artifact.slug
+    // Holds off a save for as long as this flush is on the wire. The banner
+    // cannot start a flush during a save: it is disabled while `saving`.
+    tokenWriteInFlightRef.current = true
+    try {
+      await api.updateArtifact(writeSlug, {
+        content: editedContent,
+        snapshot: false,
+        expected_token: editBaseTokenRef.current,
+      })
+      await queryClient.invalidateQueries({ queryKey: ['artifact', writeSlug] })
+    } catch (err) {
+      // A stale flush must not overwrite newer content ahead of a pull: stay in
+      // the editor with the conflict shown, and let the caller abort. Retrying
+      // the pull stays refused; only the explicit Save may overwrite.
+      const liveToken = conflictToken(err)
+      if (liveToken !== undefined) {
+        await queryClient.invalidateQueries({ queryKey: ['artifact', writeSlug] })
+        if (editGenerationRef.current === editGeneration) {
+          overwriteTokenRef.current = liveToken
+          setSaveConflict(true)
+          setSaveError(i18nT('pages.artifactDetailPage.save_conflict_changed_since_read'))
+        }
+      }
+      throw err
+    } finally {
+      tokenWriteInFlightRef.current = false
+    }
+    if (editGenerationRef.current !== editGeneration) return
     // Drop out of edit mode after flushing. The buffer is now persisted (and a
     // subsequent pull checkpoints it as a version), so once the post-mutate
     // refetch lands the pulled/overwritten content the viewer must render
@@ -840,8 +951,7 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
     setEditing(false)
     setEditedContent('')
     setPreviewDuringEdit(false)
-    await queryClient.invalidateQueries({ queryKey: ['artifact', slug] })
-  }, [editing, dirty, artifact, editedContent, queryClient, slug])
+  }, [editing, dirty, artifact, editedContent, queryClient])
 
   // Snapshot the current live state without an edit. Used by the Snapshot
   // button when not editing — captures whatever is on disk / current.html
@@ -1291,6 +1401,7 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
       const res = await api.createChatSlot(
         undefined, undefined, undefined, undefined, undefined,
         i18nT('pages.artifactDetailPage.session_title', { name: artifact.name }), artifact.slug,
+        undefined, undefined, true,
       )
       if (prefillText) writePrefill(res.key, prefillText)
       dispatch(addSlotOptimistic({
@@ -1894,6 +2005,7 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
               // Named so it is distinguishable from the document-type control
               // beside it -- both for assistive tech and for tests.
               aria-label={i18nT('pages.artifactDetailPage.version')}
+              {...uiLocation('artifacts.detail.versions')}
               disabled={saving}
               options={versionOptions}
               optionLabels={versionOptionLabels}
@@ -1905,8 +2017,7 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
                 }))) return
                 // A typed comment draft is lost with the toolbar the switch unmounts.
                 await guardCommentDraft(() => {
-                  setEditing(false)
-                  setEditedContent('')
+                  endEditing()
                   if (raw === 'live') {
                     setSelectedVersion(null)
                   } else {
@@ -1943,12 +2054,18 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
               <>
                 <button
                   type="button"
-                  onClick={() => handleSave(false)}
+                  onClick={() => handleSave(false, saveConflict)}
                   disabled={!dirty || saving}
                   className={`px-2 py-1 rounded-md text-[12px] font-medium border transition-all disabled:opacity-40 ${dirty ? 'border-accent text-accent-fg bg-accent cursor-pointer hover:bg-accent-hover' : 'border-border text-muted cursor-default'}`}
-                  title={i18nT('pages.artifactDetailPage.save_to_live_cmd_s_updates_the_live_state_withou')}
+                  title={saveConflict
+                    ? i18nT('pages.artifactDetailPage.save_overwrite_newer_content_title')
+                    : i18nT('pages.artifactDetailPage.save_to_live_cmd_s_updates_the_live_state_withou')}
                 >
-                  {saving ? i18nT('pages.artifactDetailPage.saving') : i18nT('pages.artifactDetailPage.save')}
+                  {saving
+                    ? i18nT('pages.artifactDetailPage.saving')
+                    : saveConflict
+                      ? i18nT('pages.artifactDetailPage.save_overwrite_newer_content')
+                      : i18nT('pages.artifactDetailPage.save')}
                 </button>
                 <button
                   type="button"
@@ -2035,6 +2152,7 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
               title={panel === 'comments' ? i18nT('pages.artifactDetailPage.hide_comments') : i18nT('pages.artifactDetailPage.show_comments')}
               aria-label={i18nT('pages.artifactDetailPage.toggle_comments')}
               aria-pressed={panel === 'comments'}
+              {...uiLocation('artifacts.detail.comments')}
             >
               <span className="inline-flex items-center gap-1">
                 <MessageSquare size={13} />
@@ -2088,7 +2206,7 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
         )}
 
         {(artifact.fork_metadata || artifact.publication) && (
-          <UpstreamSyncBanner artifact={artifact} onBeforeMutate={flushLiveEdits} onPulled={() => {
+          <UpstreamSyncBanner artifact={artifact} busy={saving} onBeforeMutate={flushLiveEdits} onPulled={() => {
             queryClient.invalidateQueries({ queryKey: ['artifact', slug] })
             queryClient.invalidateQueries({ queryKey: ['upstream-status', slug] })
           }} />
@@ -2110,10 +2228,23 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
             `dirty && confirm(discard_unsaved_changes)`, and the deleted-artifact
             handler sets `saveError` INSTEAD of navigating precisely so the user
             can copy their work out. A one-click navigation off this surface would
-            destroy it, and would bypass the beforeunload guard too. */}
+            destroy it, and would bypass the beforeunload guard too. The conflict
+            footer's link opens a NEW tab, so this page and its buffer stay put. */}
         <ErrorNotice
           message={saveError}
-          title={i18nT('pages.artifactDetailPage.save_failed')}
+          title={saveConflict
+            ? i18nT('pages.artifactDetailPage.save_conflict_title')
+            : i18nT('pages.artifactDetailPage.save_failed')}
+          footer={saveConflict && (
+            <a
+              href={`/artifacts/${encodeURIComponent(slug)}`}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="underline hover:no-underline"
+            >
+              {i18nT('pages.artifactDetailPage.save_conflict_open_newer_in_new_tab')}
+            </a>
+          )}
           className="mb-3"
         />
 
@@ -2397,7 +2528,9 @@ const _SYNC_TONES: Record<string, { wrap: string; btn: string }> = {
   danger: { wrap: 'border-danger/40 bg-danger-subtle text-danger', btn: 'border-danger/40 text-danger hover:bg-danger/10' },
 }
 
-function UpstreamSyncBanner({ artifact, onPulled, onBeforeMutate }: { artifact: Artifact; onPulled: () => void; onBeforeMutate?: () => Promise<void> }) {
+// `busy` while the page's own save is on the wire: a flush started then would
+// re-send that save's base token and be refused as stale.
+function UpstreamSyncBanner({ artifact, busy = false, onPulled, onBeforeMutate }: { artifact: Artifact; busy?: boolean; onPulled: () => void; onBeforeMutate?: () => Promise<void> }) {
   const fm = artifact.fork_metadata
   const pub = artifact.publication
   const [pulling, setPulling] = useState(false)
@@ -2450,7 +2583,9 @@ function UpstreamSyncBanner({ artifact, onPulled, onBeforeMutate }: { artifact: 
         setNotice(String(res.pull_result.reason || i18nT('pages.artifactDetailPage.nothing_to_pull')))
       else onPulled()
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : i18nT('pages.artifactDetailPage.pull_failed'))
+      // A refused flush is already shown by the page's conflict notice.
+      if (conflictToken(e) === undefined)
+        setError(e instanceof Error ? e.message : i18nT('pages.artifactDetailPage.pull_failed'))
     } finally {
       setPulling(false)
     }
@@ -2471,7 +2606,9 @@ function UpstreamSyncBanner({ artifact, onPulled, onBeforeMutate }: { artifact: 
         setError(String(res.overwrite_result.reason || i18nT('pages.artifactDetailPage.could_not_overwrite')))
       else onPulled()
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : i18nT('pages.artifactDetailPage.overwrite_failed'))
+      // A refused flush is already shown by the page's conflict notice.
+      if (conflictToken(e) === undefined)
+        setError(e instanceof Error ? e.message : i18nT('pages.artifactDetailPage.overwrite_failed'))
     } finally {
       setOverwriting(false)
     }
@@ -2489,7 +2626,8 @@ function UpstreamSyncBanner({ artifact, onPulled, onBeforeMutate }: { artifact: 
       if ((res as { error?: string })?.error) setError(String((res as { error?: string }).error))
       else onPulled()
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : i18nT('pages.artifactDetailPage.snapshot_failed'))
+      if (conflictToken(e) === undefined)
+        setError(e instanceof Error ? e.message : i18nT('pages.artifactDetailPage.snapshot_failed'))
     } finally {
       setSnapshotting(false)
     }
@@ -2518,6 +2656,15 @@ function UpstreamSyncBanner({ artifact, onPulled, onBeforeMutate }: { artifact: 
   // hardcoded vendor string.
   const provLabel = providers.find((p) => p.name === pub?.provider)?.display_name
     || pub?.provider || 'the remote'
+  // The publication's own link, scheme-checked before it becomes clickable so a
+  // provider cannot smuggle a javascript:/file: URL into it. Worded like the
+  // Publish panel's link to a public-web copy, since both open the published page.
+  const publishedUrl = safeHttpUrl(pub?.view_url || '')
+  const publishedLink = publishedUrl && (
+    <a href={publishedUrl} target="_blank" rel="noopener noreferrer" className="underline hover:no-underline">
+      {i18nT('pages.artifactDetailPage.open_published_page')}
+    </a>
+  )
 
   // Local edits not yet published, with no remote drift: a visible prompt to
   // publish them. (When the remote is ALSO ahead, the pull/overwrite banner
@@ -2526,13 +2673,16 @@ function UpstreamSyncBanner({ artifact, onPulled, onBeforeMutate }: { artifact: 
     return (
       <div className="mb-3 flex items-center gap-2 px-3 py-2 rounded-md border text-[13px] border-warn/40 bg-warn-subtle text-warn">
         <Camera size={14} className="lucide-inline shrink-0" />
-        <span className="flex-1">{i18nT('pages.artifactDetailPage.local_changes_not_yet_published_to')} {provLabel}.</span>
+        <span className="flex-1">
+          {i18nT('pages.artifactDetailPage.local_changes_not_yet_published_to')} {provLabel}.
+          {publishedLink && <>{' · '}{publishedLink}</>}
+        </span>
         {/* No hand-off: editor buffer editedContent may be dirty */}
         <ErrorNotice variant="inline" message={error} />
         <Btn
           type="button"
           onClick={handleSnapshot}
-          disabled={snapshotting}
+          disabled={snapshotting || busy}
           className="gap-1 px-2 py-0.5 text-[12px] font-medium border-warn/50 hover:bg-warn/10"
           title={i18nT('pages.artifactDetailPage.snapshot_the_current_content_as_a_new_version_an')}
         >
@@ -2543,8 +2693,20 @@ function UpstreamSyncBanner({ artifact, onPulled, onBeforeMutate }: { artifact: 
     )
   }
 
-  // Nothing to surface: not a fork and the remote copy isn't ahead.
-  if (!fm && !upstreamAhead) return null
+  // Not a fork and the remote copy isn't ahead: nothing to sync, so a published
+  // artifact shows only where its published copy lives.
+  if (!fm && !upstreamAhead) {
+    if (!pub || !publishedLink) return null
+    const info = _SYNC_TONES.info
+    return (
+      <div className={`mb-3 flex items-center gap-2 px-3 py-2 rounded-md border text-[13px] ${info.wrap}`}>
+        <Globe size={14} className="lucide-inline shrink-0" />
+        <span className="flex-1">
+          {i18nT('pages.artifactDetailPage.published_to_provider', { provider: provLabel })}{' · '}{publishedLink}
+        </span>
+      </div>
+    )
+  }
 
   const tone = _SYNC_TONES[upstreamAhead ? 'warn' : 'info']
   // Provider-supplied (fork/publication metadata) — validate the scheme before
@@ -2586,7 +2748,7 @@ function UpstreamSyncBanner({ artifact, onPulled, onBeforeMutate }: { artifact: 
         <Btn
           type="button"
           onClick={handlePull}
-          disabled={pulling || overwriting}
+          disabled={pulling || overwriting || busy}
           className={`gap-1 px-2 py-0.5 text-[12px] font-medium ${tone.btn}`}
           title={i18nT('pages.artifactDetailPage.pull_the_latest_remote_content_as_a_new_local_ve')}
         >
@@ -2598,7 +2760,7 @@ function UpstreamSyncBanner({ artifact, onPulled, onBeforeMutate }: { artifact: 
         <Btn
           type="button"
           onClick={handleOverwrite}
-          disabled={overwriting || pulling}
+          disabled={overwriting || pulling || busy}
           className={`gap-1 px-2 py-0.5 text-[12px] font-medium ${tone.btn}`}
           title={i18nT('pages.artifactDetailPage.push_your_local_version_up_as_the_remote_s_new_v')}
         >

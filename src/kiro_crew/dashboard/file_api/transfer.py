@@ -22,10 +22,13 @@ if TYPE_CHECKING:
         _STREAM_TEXT_PROBE_BYTES,
         FILE_READ_SCHEMA,
         ValidationError,
+        _audit_consented_download,
+        _audit_owner_grant_refusal,
         _open_checked,
         _open_checked_file,
         _OpenDenied,
         _OpenRefusal,
+        _owner_grant_releases_flagged,
         _PathProbeBusy,
         _probe_busy_response,
         _probe_request_path,
@@ -33,10 +36,12 @@ if TYPE_CHECKING:
         _run_path_probe,
         _sel,
         _sniff_media_type,
+        binary_content_is_flagged,
         logger,
         redact,
         require_owner_dashboard_request,
         validate_tool_args,
+        wide_content_is_flagged,
     )
 
 
@@ -176,11 +181,12 @@ async def api_file_download(request: web.Request) -> web.Response:
     Security: same path-validation as file-read (validate_tool_args,
     _validate_dashboard_path, sensitive-path filter). Symlinks rejected
     via O_NOFOLLOW. Files larger than _MAX_UPLOAD_BYTES are rejected.
-    Text files are still scanned for sensitive content (credentials and
-    exfiltration URLs); a positive hit aborts the download. Binary
-    files are served as-is without a MIME allowlist, since attachment
-    disposition + nosniff prevents inline rendering on the dashboard
-    origin.
+    Content is scanned for sensitive material (credentials and exfiltration
+    URLs); a positive hit aborts the download unless the owner holds the
+    ``owner_dashboard`` file-delivery grant, the same grant and owner-identity
+    test ``GET /api/outbox/{filename}`` applies. Binary files are served
+    as-is without a MIME allowlist, since attachment disposition + nosniff
+    prevents inline rendering on the dashboard origin.
     """
     owner_denied = await require_owner_dashboard_request(request, "file_download")
     if owner_denied is not None:
@@ -244,29 +250,60 @@ async def api_file_download(request: web.Request) -> web.Response:
     #
     # Mostly-binary files can still hide credential patterns in their
     # decodable runs (e.g. an ASCII-art `AKIA...` with one stray non-UTF-8
-    # byte). Decoding with errors='replace' for the *scan only* (the served
-    # bytes are still raw) ensures the credential pass cannot be bypassed
-    # by sprinkling a single non-UTF-8 byte into the file.
+    # byte). Non-UTF-8 bytes take the shared binary scan, which reads every
+    # byte and knows a JPEG's standard Huffman table is not a bot token.
     try:
-        text = data.decode("utf-8")
+        text: str | None = data.decode("utf-8")
     except UnicodeDecodeError:
-        text = data.decode("utf-8", errors="replace")
+        text = None
     # Route through the context-aware redact() so a loaded companion's extra
     # credential regexes also abort the download; the scrubbed != text diff is
     # the gate (no count needed).
-    scrubbed = redact(text)
-    if scrubbed != text:
-        _sel().log_tool_invocation(
-            session_key="dashboard",
-            tool_name="file_download",
-            outcome="denied",
-            resources=path,
-            error="content_redacted",
-        )
-        return web.json_response(
-            {"error": "file content was redacted; download aborted", "code": "content_redacted"},
-            status=400,
-        )
+    #
+    # The wide pass reads the raw bytes, because a credential at UTF-16/UTF-32
+    # spacing is NUL-interleaved ASCII that no contiguous-ASCII detector in
+    # redact() matches. Short-circuited, so a file the text pass already flags
+    # pays no second scan. It is CPU work over up to the read cap, so it runs on
+    # the bounded transfer pool, never the shared default executor.
+    consent_note: dict[str, str] = {}
+    if text is not None:
+        refusal = "content_redacted" if redact(text) != text else ""
+    else:
+        try:
+            flagged = await _run_path_probe(binary_content_is_flagged, data, transfer=True)
+        except _PathProbeBusy:
+            return _probe_busy_response(resource=path, tool_name="file_download")
+        refusal = "content_redacted" if flagged else ""
+    if not refusal:
+        try:
+            wide = await _run_path_probe(wide_content_is_flagged, data, transfer=True)
+        except _PathProbeBusy:
+            return _probe_busy_response(resource=path, tool_name="file_download")
+        if wide:
+            refusal = "wide_credential_detected"
+    if refusal:
+        # A flagged file of the owner's own is released by the owner's
+        # file-delivery grant, the same gate the outbox download applies.
+        if not await _owner_grant_releases_flagged(request):
+            _sel().log_tool_invocation(
+                session_key="dashboard",
+                tool_name="file_download",
+                outcome="denied",
+                resources=path,
+                error=refusal,
+            )
+            _audit_owner_grant_refusal(request, name=os.path.basename(path), what="flagged content")
+            # One client-facing code for both passes: the dashboard keys its
+            # credential-refusal copy on it.
+            return web.json_response(
+                {
+                    "error": "file content was redacted; download aborted",
+                    "code": "content_redacted",
+                },
+                status=400,
+            )
+        consent_note["error"] = "sensitive_content_delivered_with_consent"
+        _audit_consented_download(os.path.basename(path))
 
     safe_name = urllib.parse.quote(os.path.basename(path), safe="")
     content_type, _ = mimetypes.guess_type(path)
@@ -278,6 +315,7 @@ async def api_file_download(request: web.Request) -> web.Response:
         tool_name="file_download",
         outcome="success",
         resources=path,
+        **consent_note,
     )
     return web.Response(
         body=data,
@@ -395,16 +433,15 @@ async def api_file_stream(request: web.Request) -> web.StreamResponse:
             # Sibling-control parity: file-download refuses text content that
             # redact() flags. Media magics can be weak (the bare mp3 frame
             # sync is two bytes), so a credential-bearing TEXT file with a
-            # forged prefix must not stream out here. Decode with
-            # errors="replace" -- exactly as the download scan does -- so an
-            # invalid byte (including the forged magic itself) cannot skip
-            # the credential pass; replacement chars break no real credential
-            # pattern, and genuine binary media decodes to replacement-dense
-            # junk that redact() leaves unchanged. The scan is bounded to the
-            # probe window; the full-file scan remains the download path's.
+            # forged prefix must not stream out here. A non-UTF-8 probe takes
+            # the shared binary scan, as file-download does.
             probe = header + fobj.read(_STREAM_TEXT_PROBE_BYTES - len(header))
-            probe_text = probe.decode("utf-8", errors="replace")
-            if redact(probe_text) != probe_text:
+            try:
+                probe_text = probe.decode("utf-8")
+                flagged = redact(probe_text) != probe_text
+            except UnicodeDecodeError:
+                flagged = binary_content_is_flagged(probe)
+            if flagged:
                 fobj.close()
                 return ("refused", "content_redacted", validated)
             fobj.seek(0)

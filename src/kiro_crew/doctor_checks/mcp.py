@@ -311,7 +311,23 @@ _STRICT_IDENTITY_SERVERS = (
     "kirocrew-crew-log",
     "kirocrew-debug",
     "kirocrew-panel",
+    "kirocrew-guide",
 )
+
+
+#: How Doctor names a probe that could not verify the daemon. "unreachable"
+#: is a transport that did not answer; "unverified" is an answer that could not
+#: be trusted or read. Only ``absent`` prints "not running".
+_DAEMON_PROBE_REASONS: dict[str, tuple[str, str]] = {
+    "connect_timeout": ("unreachable", "connect timed out"),
+    "connect_error": ("unreachable", "connect failed"),
+    "response_timeout": ("unreachable", "no reply in time"),
+    "connection_lost": ("unreachable", "connection closed before a reply"),
+    "refused_principal": ("unverified", "endpoint owner not confirmed"),
+    "malformed_response": ("unverified", "malformed reply"),
+    "not_pong": ("unverified", "reply was not a pong"),
+    "invalid_context": ("unverified", "probe ran inside an event loop"),
+}
 
 
 def _doctor_mcp_gateway_daemon(issues: list[str]) -> None:
@@ -327,13 +343,20 @@ def _doctor_mcp_gateway_daemon(issues: list[str]) -> None:
     """
     try:
         from kiro_crew.code_fingerprint import code_fingerprint
-        from kiro_crew.mcp_gateway.daemon_control import describe_daemon
+        from kiro_crew.mcp_gateway import daemon_control as dc
 
-        info = describe_daemon()
+        probe = dc.describe_daemon_detailed()
     except Exception:
         return
+    info = probe.info
     if info is None:
-        print("  mcp gateway daemon: ⏹ not running (pooling off, or no session has started one)")
+        if probe.outcome == dc.PROBE_ABSENT:
+            print(
+                "  mcp gateway daemon: ⏹ not running (pooling off, or no session has started one)"
+            )
+            return
+        label, reason = _DAEMON_PROBE_REASONS.get(probe.outcome, ("unverified", probe.outcome))
+        print(f"  mcp gateway daemon: ⚠ {label}: {reason} after {probe.elapsed_secs:.1f}s")
         return
     mine = code_fingerprint()
     owner = (
@@ -403,17 +426,15 @@ def _doctor_strict_identity(cfg: KiroCrewConfig) -> None:
     names = ", ".join(unrouted)
     print(f"  strict identity: ⏹ not routed through the gateway: {names}")
     render._print_wrapped(
-        "Tools that must know which session is calling (monitor_start, "
-        "session_ledger_*, set_project, ask_question, session control, "
-        "chat_folder_*) get no per-call caller injection on these servers: on "
-        "the kiro backend the session's AcpRuntime carries no session key in "
-        "its environment by design, and the gateway injects the caller only for "
-        "routed servers. They still resolve through the signed per-session "
-        "token on the session's MCP element, and are refused only when no "
-        "strict channel resolves. Route them from "
-        "MCP Management (or add them to mcp_gateway.stub_servers and restart) "
-        "if you use those tools. Leaving them unrouted is a valid choice — "
-        "routing starts a broker and one stub process per server — so this is "
-        "a note, not a problem to fix; the tools' own refusal now names the "
-        "same cause."
+        "This is the default and needs no change. Tools that must know which "
+        "session is calling (monitor_start, cron_add, session_ledger_*, "
+        "set_project, ask_question, session control, chat_folder_*) identify it "
+        "from a signed per-session token on the session's MCP element, which "
+        "needs no routing and no gateway. This check reads config only and does "
+        "not verify a live session. If one of those tools is refused, its error "
+        "names the identity channel that failed; route the server from MCP "
+        "Management (or add it to mcp_gateway.stub_servers and restart) only "
+        "when that error says the element carried no session token. Leaving "
+        "servers unrouted is a valid choice — routing starts a broker and one "
+        "stub process per server."
     )

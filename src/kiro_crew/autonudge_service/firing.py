@@ -18,11 +18,17 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from copy import deepcopy
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 from kiro_crew import shutdown_event
-from kiro_crew.autonudge_service.gate import _WAKE_FOLLOWUP_TICKS
+from kiro_crew.autonudge_service.gate import (
+    _WAKE_FOLLOWUP_TICKS,
+    _delivery_basis,
+    _record_delivered_reading,
+    _record_delivered_revision,
+)
 from kiro_crew.autonudge_service.maintenance import _release_mutation_lock
 from kiro_crew.autonudge_service.model import (
     _CONSECUTIVE_FAILURE_STANDDOWN_AFTER,
@@ -125,6 +131,12 @@ async def _timer(self: AutoNudgeService, loop: NudgeLoop, delay: float | None = 
         # itself, the self-guard applies and the deactivation returns normally.
         self._cancel_timer(loop.id)
         await self.update(loop.id, active=False, stopped_reason=STOP_SENTINEL_REASON)
+        return
+    # The person-wait HOLD, ahead of both bounds: a work-ledger watch whose open items
+    # all wait on a person, unchanged since its last delivered turn, has nothing to
+    # read. Held, it fires no turn, takes no floor turn (the gate below is never
+    # reached), and is neither extended nor stopped by a spent bound.
+    if await self._holds_for_person_wait(loop):
         return
     # Cycle cap reached?
     if loop.max_cycles and loop.cycle_count >= loop.max_cycles:
@@ -406,6 +418,9 @@ async def _run_fire_cycle(self: AutoNudgeService, loop: NudgeLoop) -> None:
     # on _persist_locked(), so the delivered cycle was never written and the
     # loop could run extra cycles after a restart. _run_fire_cycle owns the
     # window; this method is the body.
+    # Read before the dispatch, which is a long await an owner can re-aim the loop
+    # inside; see ``_record_delivered_reading``.
+    delivery_basis = _delivery_basis(loop)
     try:
         delivered = await self._on_fire(loop)
     except Exception:
@@ -422,7 +437,9 @@ async def _run_fire_cycle(self: AutoNudgeService, loop: NudgeLoop) -> None:
                 self._rearm_fail_count.get(loop.id, 0) + 1,
             )
     claimed_wake = loop.id in self._pending_monitor_wake
-    self._pending_monitor_wake.discard(loop.id)
+    # Taken, not merely tested: the claim carries the wake's own text, and the
+    # re-owe below has to put the same text back rather than an empty one.
+    claimed_briefs = self._pending_monitor_wake.pop(loop.id, "")
     claimed_floor = loop.id in self._pending_floor_tick
     self._pending_floor_tick.discard(loop.id)
     if claimed_wake and loop.monitor is not None:
@@ -463,7 +480,12 @@ async def _run_fire_cycle(self: AutoNudgeService, loop: NudgeLoop) -> None:
             # single point delivery is confirmed, and the claim is discarded
             # there. A retry that is refused again re-owes it, which is correct
             # and bounded by the same backoff that bounds the retry itself.
-            self._pending_monitor_wake.add(loop.id)
+            #
+            # Re-owed WITH ITS TEXT. The retry takes the observation-free bypass, so
+            # it never re-reads the probe and the briefs cannot be rebuilt: an empty
+            # re-owe here would deliver the news as a bare cycle header, which is the
+            # whole defect the text was added to close.
+            self._pending_monitor_wake[loop.id] = claimed_briefs
         if claimed_floor:
             # Same reasoning: a refused floor delivery spent nothing, so the charge
             # stays owed rather than being recorded or dropped.
@@ -480,6 +502,12 @@ async def _run_fire_cycle(self: AutoNudgeService, loop: NudgeLoop) -> None:
         self._rearm_fail_count.pop(loop.id, None)
         loop.cycle_count += 1
         loop.last_fire_ts = time.time()
+        # What this turn's ledger looked like, read at the top of its tick: the
+        # person-wait hold compares later ticks against it. Read BEFORE the turn,
+        # so a write that lands during it counts as news for the next tick.
+        tick_fp = self._ledger_tick_fp.pop(loop.id, None)
+        if tick_fp is not None:
+            loop.ledger_seen_fp = tick_fp
         # The turn really went out, so the verdict that asked for it can now be
         # labelled by what that turn does. Stamped HERE and nowhere earlier, for the
         # same reason the flag below is cleared here: a refused fire, a timer the
@@ -634,6 +662,14 @@ async def _run_fire_cycle(self: AutoNudgeService, loop: NudgeLoop) -> None:
         # carry. The clear may ride the delivered path's own write: losing it costs
         # one extra fire, which is the direction to be wrong in.
         loop.monitor.floor_fire_pending = False
+    if delivered and loop.monitor is not None:
+        # A work-ledger watch remembers the revision this turn was delivered at, so
+        # a later quiet floor can tell whether the ledger moved since. Rides the
+        # delivered path's own write, like the counters above.
+        _record_delivered_revision(loop.monitor)
+        # And a pull-request watch remembers the short reading this turn carried, if
+        # any, so a repeat of it can be held instead of delivering again.
+        _record_delivered_reading(loop, delivery_basis)
     if not delivered:
         # If the fire path already removed the loop (e.g. slot missing →
         # remove()), do NOT resurrect it with a fresh timer — that would
@@ -741,6 +777,128 @@ def _ledger_has_open_items(conductor_key: str) -> bool:
     return has_open_items(conductor_key)
 
 
+def _ledger_person_wait_fp(
+    conductor_key: str, worker_closed: Callable[[str], bool] | None = None
+) -> str | None:
+    """The ledger's fingerprint while every open item waits on a person. Blocking."""
+    from kiro_crew.probes.work_ledger import person_wait_fingerprint
+
+    return person_wait_fingerprint(conductor_key, worker_closed=worker_closed)
+
+
+async def _holds_for_person_wait(self: AutoNudgeService, loop: NudgeLoop) -> bool:
+    """Whether this tick of a work-ledger watch holds because everyone waits on a person.
+
+    Holds when every open item is ``blocked`` / ``question`` with reason ``approval``
+    or ``needs_human`` AND the ledger's fingerprint equals the one recorded at the
+    loop's last delivered turn (``ledger_seen_fp``). The fingerprint covers only
+    worker-owned fields, so a worker's report releases the hold on the next tick with
+    no re-arm (its push also pulls that tick forward); the conductor's own writes
+    leave it held.
+
+    A held tick re-arms at the loop's own interval, the way a quiet tick does, so the
+    next check costs one ledger read and no model call. Doubt never holds: an
+    unreadable ledger, or a loop with no recorded fingerprint yet, fires as before.
+    True when the tick is held and the caller must return.
+    """
+    # An approval-stalled loop already holds further down, arming nothing; this
+    # hold's interval re-arm must not wake it on a schedule.
+    if not loop.active or loop.approval_stalled or not self._observes_work_ledger(loop):
+        self._ledger_tick_fp.pop(loop.id, None)
+        return False
+    fp = await asyncio.get_running_loop().run_in_executor(
+        None, _ledger_person_wait_fp, loop.slot_key, self._worker_closed
+    )
+    self._ledger_tick_fp[loop.id] = fp or ""
+    if fp and loop.ledger_seen_fp == fp:
+        if not (loop.active and self._loops.get(loop.id) is loop):
+            return True
+        if not loop.waiting_on_person:
+            # Persist before publishing, as the approval hold does: the hold and its
+            # start time are written under the lock and the write is awaited before
+            # anything is announced. A refused write restores both and fires as
+            # before -- doubt never holds.
+            if not await _commit_person_wait(self, loop, held=True):
+                return False
+            logger.warning(
+                "AutoNudge: loop %s holds -- every open work-ledger item waits on a "
+                "person and nothing changed since its last turn; it fires nothing "
+                "until the ledger moves",
+                loop.id,
+            )
+            self._emit("updated", loop)
+        loop.next_due_ts = time.time() + loop.idle_secs
+        self._persist_soon()
+        self._arm_from_deadline(loop)
+        return True
+    if loop.waiting_on_person:
+        if not await _commit_person_wait(self, loop, held=False):
+            # The store still says held, so the loop stays held and re-checks on its
+            # interval rather than acting on a release nothing recorded.
+            loop.next_due_ts = time.time() + loop.idle_secs
+            self._arm_from_deadline(loop)
+            return True
+        logger.warning(
+            "AutoNudge: loop %s released from its person-wait hold -- the ledger moved",
+            loop.id,
+        )
+        self._emit("updated", loop)
+    return False
+
+
+async def _commit_person_wait(svc: AutoNudgeService, loop: NudgeLoop, *, held: bool) -> bool:
+    """Write the person-wait hold's start (*held*) or its release, durably. Blocking-free.
+
+    The release hands the held time back to ``created_ts``, as the approval hold
+    does: a hold fires nothing, so it must spend neither the runtime budget nor the
+    backstop, and the tick that carries the news must not be the one that stops the
+    loop. A stored start that is not a finite positive number (a hand-edited row)
+    credits nothing rather than raising. True once the write landed; on a refused
+    write every field is restored and False is returned.
+    """
+    async with svc._lock:
+        # Staged on a copy and written first: the live loop -- which the REST row, the
+        # inspect reading and the state frame read without the lock -- takes the new
+        # fields only once the store has them, as ``release_approval_hold`` does.
+        now = time.time()
+        if held:
+            new = (True, now, loop.created_ts)
+        else:
+            since = loop.waiting_on_person_at
+            created = loop.created_ts
+            if (
+                isinstance(since, (int, float))
+                and not isinstance(since, bool)
+                and 0 < since <= now
+                and isinstance(created, (int, float))
+                and not isinstance(created, bool)
+                and created > 0
+            ):
+                created = created + (now - since)
+            new = (False, 0.0, created)
+        staged = deepcopy(loop)
+        staged.waiting_on_person, staged.waiting_on_person_at, staged.created_ts = new
+        try:
+            await svc._write_monitor_snapshot_locked(
+                svc._monitor_snapshot_with_replacement(loop, staged)
+            )
+        except asyncio.CancelledError:
+            # Settled before the re-raise: the write is durable, so keep it.
+            loop.waiting_on_person, loop.waiting_on_person_at, loop.created_ts = new
+            raise
+        except Exception:
+            logger.warning(
+                "AutoNudge: loop %s person-wait %s was not recorded -- the store "
+                "refused the write",
+                loop.id,
+                "hold" if held else "release",
+                exc_info=True,
+            )
+            return False
+        loop.waiting_on_person, loop.waiting_on_person_at, loop.created_ts = new
+    return True
+
+
 def _ledger_backstop_secs() -> int:
     """The runaway backstop: the configured monitoring runtime ceiling."""
     try:
@@ -837,8 +995,28 @@ async def _extend_for_open_ledger(self: AutoNudgeService, loop: NudgeLoop, bound
     return True
 
 
+def _pushed_arm_delay(loop: NudgeLoop, requested: float, now: float) -> float:
+    """*requested* seconds, clamped so a push only ever moves a fire EARLIER.
+
+    A pull-forward is allowed to bring a loop's next cycle closer and nothing else, so
+    a batching window may not outlive the deadline the loop already holds: arming past
+    it would push the loop's own scheduled tick out by the difference, because
+    :func:`_arm_timer` replaces the armed timer rather than adding a second one. A loop
+    with no deadline yet (``next_due_ts`` is 0 -- a just-delivered fire, a legacy store
+    entry) has nothing to be later than, so the window stands as asked.
+
+    Returns ``0.0`` for anything not a positive window, which is the immediate arm every
+    caller had before a window existed.
+    """
+    if requested <= 0:
+        return 0.0
+    if loop.next_due_ts <= 0:
+        return requested
+    return max(min(requested, loop.next_due_ts - now), 0.0)
+
+
 async def fire_now(
-    self: AutoNudgeService, loop_id: str, *, defer_if_firing: bool = False
+    self: AutoNudgeService, loop_id: str, *, defer_if_firing: bool = False, delay: float = 0.0
 ) -> tuple["NudgeLoop | None", str, int]:
     """Bring one loop's next cycle forward to now, out of band from its countdown.
 
@@ -861,6 +1039,17 @@ async def fire_now(
     does not ambush a user mid-conversation — they keep deferring it simply
     by typing. A manual trigger IS the user asking, so the condition the beat
     protects against is not present.
+
+    ``delay`` arms the pulled-forward cycle after a BATCHING WINDOW instead of at
+    once, and is the whole mechanism behind the work-ledger wake batch: several
+    workers reporting inside one window share the single tick the first of them
+    armed, because that tick reads the ledger when it runs rather than when it was
+    armed. The window is clamped to the loop's own deadline
+    (:func:`_pushed_arm_delay`), so a push still only ever moves a fire EARLIER --
+    the arm replaces the armed timer, and an unclamped window on a loop about to
+    fire anyway would delay the loop's own scheduled tick. Zero, the default, is the
+    immediate arm every caller had before the parameter existed; a caller with a
+    person behind it keeps it, since nobody presses a button to wait a minute.
 
     Three refusals, and each one is load-bearing rather than defensive:
 
@@ -940,19 +1129,27 @@ async def fire_now(
             # out the conductor's whole patrol cadence.
             self._pulled_forward.add(loop_id)
         return None, "loop is already firing", 409
-    self._arm_timer(loop, delay=0.0)
+    armed_in = _pushed_arm_delay(loop, delay, time.time())
+    self._arm_timer(loop, delay=armed_in)
     if defer_if_firing:
         # A worker's push, not a person's press: the tick it armed is marked so the gate
         # observes rather than spending the post-wake follow-up, and so a quiet answer
-        # keeps the loop's deadline. Logged at DEBUG because it happens once per worker
-        # write, turn end and close; the operator's button keeps its INFO line below.
+        # keeps the loop's deadline. The mark is also what tells a later push inside this
+        # window that the tick it needs is already armed. Logged at DEBUG because it
+        # happens once per worker write, turn end and close; the operator's button keeps
+        # its INFO line below.
         self._pushed_ticks.add(loop_id)
         logger.debug(
-            "AutoNudge: loop %s pulled forward by a worker's write -- cycle %d armed to run now",
+            "AutoNudge: loop %s pulled forward by a worker's write -- cycle %d armed to "
+            "run in %.1fs",
             loop.id,
             loop.cycle_count + 1,
+            armed_in,
         )
         return loop, "", 200
+    # A person asked for this turn, so it must not meet the person-wait hold:
+    # forgetting what the last turn saw makes the next tick fire.
+    loop.ledger_seen_fp = ""
     logger.info(
         "AutoNudge: loop %s brought forward by hand — cycle %d armed to run now",
         loop.id,

@@ -160,6 +160,9 @@ def _fake_systemctl(
     does next: a dict, or a sequence of dicts answered to successive ``show``
     reads of the restarted scope (the last one sticky), so a unit that reads
     ``active`` once and then ``activating (auto-restart)`` is one entry each.
+    A state dict's optional ``Started`` is the ``ExecMainStartTimestampMonotonic``
+    the read reports; without it the line is left out, as a manager that does
+    not answer the property does.
 
     Nothing here spawns anything: the whole point of the fixture is that the
     systemd user manager is host state and must never be touched from a test.
@@ -209,6 +212,8 @@ def _fake_systemctl(
                     f"SubState={props['SubState']}\nFragmentPath={fragment}\n"
                     f"Result={props.get('Result', 'success')}\n"
                 )
+                if "Started" in props:
+                    body += f"ExecMainStartTimestampMonotonic={props['Started']}\n"
             return subprocess.CompletedProcess(tokens, 0, body, "")
         if verb == "is-active":
             state = (props or _DEAD)["ActiveState"]
@@ -1292,7 +1297,8 @@ class TestMacOSPlistRendering:
 
         assert plist_path.exists()
         called = [c.args[0] for c in proc.call_args_list]
-        assert ["launchctl", "load", "-w", str(plist_path)] in called
+        uid = getattr(os, "getuid", lambda: -1)()
+        assert ["launchctl", "bootstrap", f"gui/{uid}", str(plist_path)] in called
 
 
 class TestControllerDispatch:
@@ -1407,23 +1413,21 @@ class TestControllerDispatch:
             "kiro_crew.service.controller.current_platform",
             return_value=Platform.LAUNCHD,
         ), patch.object(svc_macos, "is_active", return_value=True), patch.object(
-            svc_macos, "stop"
+            svc_macos, "stop", return_value=True
         ) as mock_stop:
             assert controller.stop_service() is True
         mock_stop.assert_called_once()
 
-    def test_stop_service_returns_false_when_macos_inactive(self):
+    def test_stop_service_returns_false_when_macos_has_nothing_loaded(self):
         from kiro_crew.service import controller
         from kiro_crew.service import macos as svc_macos
 
         with patch(
             "kiro_crew.service.controller.current_platform",
             return_value=Platform.LAUNCHD,
-        ), patch.object(svc_macos, "is_active", return_value=False), patch.object(
-            svc_macos, "stop"
-        ) as mock_stop:
+        ), patch.object(svc_macos, "stop", return_value=False) as mock_stop:
             assert controller.stop_service() is False
-        mock_stop.assert_not_called()
+        mock_stop.assert_called_once()
 
     def test_stop_service_unsupported_returns_false(self):
         from kiro_crew.service import controller
@@ -1531,7 +1535,7 @@ class TestControllerDispatch:
         with patch(
             "kiro_crew.service.controller.current_platform",
             return_value=Platform.LAUNCHD,
-        ), patch.object(svc_macos, "is_active", return_value=True), patch.object(
+        ), patch.object(svc_macos, "is_loaded", return_value=True), patch.object(
             svc_macos, "restart", return_value=True
         ) as mock_restart:
             report = controller.restart_service()
@@ -1546,7 +1550,7 @@ class TestControllerDispatch:
         with patch(
             "kiro_crew.service.controller.current_platform",
             return_value=Platform.LAUNCHD,
-        ), patch.object(svc_macos, "is_active", return_value=True), patch.object(
+        ), patch.object(svc_macos, "is_loaded", return_value=True), patch.object(
             svc_macos, "restart", return_value=False
         ) as mock_restart:
             report = controller.restart_service()
@@ -1565,7 +1569,7 @@ class TestControllerDispatch:
         with patch(
             "kiro_crew.service.controller.current_platform",
             return_value=Platform.LAUNCHD,
-        ), patch.object(svc_macos, "is_active", return_value=False), patch.object(
+        ), patch.object(svc_macos, "is_loaded", return_value=False), patch.object(
             svc_macos, "restart"
         ) as mock_restart:
             report = controller.restart_service()
@@ -2372,7 +2376,8 @@ class TestLinuxServiceScopes:
         assert _NO_BUS in report.user
         assert self._user_calls(run) == [["systemctl", "--user", "show", "-p", "Id", "-p",
                                           "LoadState", "-p", "ActiveState", "-p", "SubState",
-                                          "-p", "FragmentPath", "-p", "Result", _UNIT]], run.calls
+                                          "-p", "FragmentPath", "-p", "Result", "-p",
+                                          "ExecMainStartTimestampMonotonic", _UNIT]], run.calls
 
     def test_uninstall_removes_both_scopes_and_the_controller_names_each(
         self, tmp_path, monkeypatch, capsys
@@ -3804,6 +3809,51 @@ class TestLinuxServiceScopes:
         assert report.ok is True
         assert sum(svc_linux.time.sleeps) >= svc_linux._RESTART_SETTLE_SECS
 
+    def test_restart_catches_a_re_exec_the_state_reads_stepped_over(self):
+        """`RestartSec=100ms`: the unit dies and is `active` again between two
+        0.25 s reads, so every read says `active (running)`. The main process's
+        start stamp changed between them, and that is a failed restart."""
+        from kiro_crew.service import linux as svc_linux
+
+        first = dict(_RUNNING, Started="5000000")
+        again = dict(_RUNNING, Started="5300000")
+        run = _fake_systemctl(system=None, user=_RUNNING, restart_lands_in=[first, again])
+        with patch("kiro_crew.service.linux.subprocess.run", side_effect=run):
+            report = svc_linux.restart()
+
+        assert report.ok is False
+        (failure,) = report.failures
+        assert failure.kind == RESTART_NOT_UP
+        assert failure.hint == "journalctl --user -u kirocrew.service -n 50 --no-pager"
+        assert "started again" in failure.reason
+        assert "active (running)" in failure.reason
+
+    def test_restart_with_a_steady_start_stamp_is_ok(self):
+        """The same stamp at every read across the window: one exec, still up."""
+        from kiro_crew.service import linux as svc_linux
+
+        steady = dict(_RUNNING, Started="5000000")
+        run = _fake_systemctl(system=None, user=_RUNNING, restart_lands_in=steady)
+        with patch("kiro_crew.service.linux.subprocess.run", side_effect=run):
+            report = svc_linux.restart()
+
+        assert report.ok is True
+        assert sum(svc_linux.time.sleeps) >= svc_linux._RESTART_SETTLE_SECS
+
+    def test_restart_ignores_an_unset_start_stamp(self):
+        """`0` is systemd's answer before the main process has ever been
+        exec'd; going from `0` to a real stamp is the first exec, not a
+        restart."""
+        from kiro_crew.service import linux as svc_linux
+
+        unset = dict(_RUNNING, Started="0")
+        stamped = dict(_RUNNING, Started="5000000")
+        run = _fake_systemctl(system=None, user=_RUNNING, restart_lands_in=[unset, stamped])
+        with patch("kiro_crew.service.linux.subprocess.run", side_effect=run):
+            report = svc_linux.restart()
+
+        assert report.ok is True
+
     def test_restart_into_a_start_limit_hit_is_a_failure(self):
         """Three crashes in the burst window: `failed` with Result=start-limit-hit."""
         from kiro_crew.service import linux as svc_linux
@@ -4145,21 +4195,23 @@ class TestMacOSControlPaths:
 
     def test_install_unloads_existing_plist_before_writing(self, tmp_path, monkeypatch):
         """Re-running install on a host that already has the plist loaded
-        should unload first, then write+load. Otherwise the new plist
-        wouldn't take effect."""
+        should boot it out first, then write+bootstrap. Otherwise the new
+        plist wouldn't take effect."""
         from kiro_crew.service import macos as svc_macos
 
         plist_dir = tmp_path / "LaunchAgents"
         plist_path = plist_dir / f"{LAUNCHD_LABEL}.plist"
         log_dir = tmp_path / "Logs"
         plist_dir.mkdir(parents=True)
-        # Pre-create the plist so install hits the unload-first branch.
+        # Pre-create the plist so install hits the bootout-first branch.
         plist_path.write_text("<plist/>")
         monkeypatch.setattr(svc_macos, "PLIST_DIR", plist_dir)
         monkeypatch.setattr(svc_macos, "PLIST_PATH", plist_path)
         monkeypatch.setattr(svc_macos, "LOG_DIR", log_dir)
         monkeypatch.setattr(svc_macos, "STDOUT_LOG", log_dir / "gateway.log")
         monkeypatch.setattr(svc_macos, "STDERR_LOG", log_dir / "gateway.err")
+        # Every stubbed `print` answers "still loaded"; skip the settle wait.
+        monkeypatch.setattr(svc_macos, "_BOOTOUT_SETTLE_SECS", 0.0)
 
         ok = MagicMock(returncode=0, stdout="", stderr="")
         with patch(
@@ -4170,12 +4222,12 @@ class TestMacOSControlPaths:
         ) as run:
             svc_macos.install()
         called = [c.args[0] for c in run.call_args_list]
-        # The unload must come BEFORE the load for the new plist to take effect.
+        # The bootout must come BEFORE the bootstrap for the new plist to take effect.
         unload_idx = next(
-            i for i, c in enumerate(called) if c[:2] == ["launchctl", "unload"]
+            i for i, c in enumerate(called) if c[:2] == ["launchctl", "bootout"]
         )
         load_idx = next(
-            i for i, c in enumerate(called) if c[:2] == ["launchctl", "load"]
+            i for i, c in enumerate(called) if c[:2] == ["launchctl", "bootstrap"]
         )
         assert unload_idx < load_idx
 
@@ -4200,7 +4252,8 @@ class TestMacOSControlPaths:
             svc_macos.uninstall()
         assert not plist_path.exists()
         called = [c.args[0] for c in run.call_args_list]
-        assert ["launchctl", "unload", "-w", str(plist_path)] in called
+        uid = getattr(os, "getuid", lambda: -1)()
+        assert ["launchctl", "bootout", f"gui/{uid}/{LAUNCHD_LABEL}"] in called
         assert sentinel.read_text() == "user data"
 
     def test_uninstall_idempotent_when_plist_missing(self, tmp_path, monkeypatch):
@@ -4247,9 +4300,9 @@ class TestMacOSControlPaths:
 
     def test_stop_unloads_plist_when_present(self, tmp_path, monkeypatch):
         # ``launchctl stop`` would just send SIGTERM and KeepAlive would
-        # restart the agent immediately. ``unload`` (without ``-w``) is
-        # the supported way to actually stop the running gateway, while
-        # leaving the plist enabled for the next login.
+        # restart the agent immediately. ``bootout`` removes the job from its
+        # domain, so there is nothing to respawn, while leaving the plist
+        # enabled for the next login.
         from kiro_crew.service import macos as svc_macos
 
         plist_path = tmp_path / "agent.plist"
@@ -4259,9 +4312,10 @@ class TestMacOSControlPaths:
         with patch(
             "kiro_crew.service.macos.subprocess.run", return_value=ok
         ) as run:
-            svc_macos.stop()
+            assert svc_macos.stop() is True
         called = [c.args[0] for c in run.call_args_list]
-        assert ["launchctl", "unload", str(plist_path)] in called
+        uid = getattr(os, "getuid", lambda: -1)()
+        assert ["launchctl", "bootout", f"gui/{uid}/{LAUNCHD_LABEL}"] in called
         # Crucially, we should NOT have called `launchctl stop`.
         assert not any(c[:2] == ["launchctl", "stop"] for c in called)
 
@@ -7535,3 +7589,125 @@ class TestAppArmorLauncherUninstall:
 
         assert calls == [("rm", "-f", str(path))]
         assert outcome.changed is True
+
+
+class TestLinuxStatusNamesAStaleLoadedUnit:
+    """``service status`` asks each scope's manager for the LOADED
+    ``RestartPreventExitStatus`` of our unit and, when it does not name
+    ``LIVE_HOLDER_EXIT_CODE``, prints one line naming the directive and the
+    command that adds it. Nothing is rewritten, reloaded or run under sudo."""
+
+    @pytest.fixture(autouse=True)
+    def _not_root(self, _floor_monkeypatch, tmp_path):
+        from kiro_crew.service import linux as svc_linux
+
+        _floor_monkeypatch.setattr(svc_linux.os, "geteuid", lambda: 1000, raising=False)
+        _floor_monkeypatch.setenv("USER", "tester")
+        _floor_monkeypatch.setattr(svc_linux, "UNIT_PATH", tmp_path / "system" / _UNIT)
+        user_unit = tmp_path / ".config" / "systemd" / "user" / _UNIT
+        _floor_monkeypatch.setattr(svc_linux, "user_unit_file_path", lambda: user_unit)
+
+    @staticmethod
+    def _with_loaded(run, *, system=None, user=None):
+        """Wrap a ``_fake_systemctl`` so the ``RestartPreventExitStatus`` query
+        answers ``system`` / ``user`` per scope (``None``: no property line).
+
+        The values the tests pass are the strings live managers print (systemd
+        245 and 252): ``78``, ``1 78``, ``78 TERM`` (a signal prints without its
+        ``SIG`` prefix), and an empty value for a unit without the directive."""
+
+        def wrapped(argv, *a, **k):
+            tokens = list(argv)
+            if "show" in tokens and "RestartPreventExitStatus" in tokens:
+                wrapped.calls.append(tokens)
+                value = user if "--user" in tokens else system
+                body = "" if value is None else f"RestartPreventExitStatus={value}\n"
+                return subprocess.CompletedProcess(tokens, 0, body, "")
+            result = run(argv, *a, **k)
+            wrapped.calls.append(tokens)
+            return result
+
+        wrapped.calls = []
+        return wrapped
+
+    @staticmethod
+    def _status(run):
+        from kiro_crew.service import linux as svc_linux
+
+        with patch("kiro_crew.service.linux.subprocess.run", side_effect=run):
+            return svc_linux.status()
+
+    def test_a_system_unit_loaded_without_the_exemption_is_named_with_the_reinstall_remedy(self):
+        run = self._with_loaded(_fake_systemctl(system=_RUNNING, user=None), system="")
+        out = self._status(run)
+
+        lines = out.splitlines()
+        idx = next(i for i, line in enumerate(lines) if "lacks" in line)
+        assert "`RestartPreventExitStatus=78`" in lines[idx], out
+        assert "`sudo kirocrew service install`" in lines[idx], out
+        assert lines[idx - 1].startswith("system scope: active (running)"), out
+        assert all("sudo" not in c for c in run.calls), run.calls
+        assert not any("daemon-reload" in c for c in run.calls), run.calls
+
+    def test_a_user_unit_loaded_without_the_exemption_gets_a_no_sudo_remedy(self, tmp_path):
+        fragment = str(tmp_path / "u" / _UNIT)
+        run = self._with_loaded(
+            _fake_systemctl(system=None, user=_RUNNING, user_fragment=fragment), user=""
+        )
+        out = self._status(run)
+
+        stale = [line for line in out.splitlines() if "lacks" in line]
+        assert len(stale) == 1, out
+        assert fragment in stale[0]
+        assert "`systemctl --user daemon-reload`" in stale[0]
+        assert "sudo" not in stale[0]
+        assert not any("daemon-reload" in c for c in run.calls), run.calls
+
+    @pytest.mark.parametrize("loaded", ["78", "78 TERM", "1 78"])
+    def test_a_loaded_exemption_in_either_scope_reads_clean(self, loaded):
+        run = self._with_loaded(
+            _fake_systemctl(system=_RUNNING, user=_RUNNING), system=loaded, user=loaded
+        )
+        assert "lacks" not in self._status(run)
+
+    def test_a_loaded_value_that_does_not_name_the_live_holder_code_is_reported(self):
+        run = self._with_loaded(_fake_systemctl(system=_RUNNING, user=None), system="1 TERM")
+        assert "lacks `RestartPreventExitStatus=78`" in self._status(run)
+
+    def test_no_property_line_makes_no_claim(self):
+        run = self._with_loaded(_fake_systemctl(system=_RUNNING, user=None), system=None)
+        assert "lacks" not in self._status(run)
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [{"system_load": "masked"}, {"system_id": "shared.service"}],
+        ids=["masked", "alias"],
+    )
+    def test_a_unit_that_is_not_loaded_or_not_ours_is_not_asked(self, kwargs):
+        run = self._with_loaded(_fake_systemctl(system=_RUNNING, user=None, **kwargs), system="")
+        out = self._status(run)
+
+        assert "lacks" not in out, out
+        assert not any("RestartPreventExitStatus" in c for c in run.calls), run.calls
+
+    def test_the_query_asks_for_empty_properties_too(self):
+        """``--all`` keeps an unset property printed as ``Key=`` rather than
+        omitted, so "unset" is not read as "systemctl did not answer"."""
+        run = self._with_loaded(_fake_systemctl(system=_RUNNING, user=None), system="78")
+        self._status(run)
+
+        query = next(c for c in run.calls if "RestartPreventExitStatus" in c)
+        assert query[:3] == ["systemctl", "show", "--all"], query
+
+    def test_the_freshly_rendered_unit_carries_the_exemption(self):
+        """The renderer and the check name the same code: a unit this build
+        writes carries the value the check looks for."""
+        from kiro_crew.service import linux as svc_linux
+
+        with (
+            patch.object(svc_linux, "_current_group", lambda _u: "tester"),
+            patch.object(svc_linux.selinux, "installer_context", lambda _b: None),
+        ):
+            for user_scope in (False, True):
+                rendered = svc_linux.render_unit(user_scope=user_scope).splitlines()
+                assert f"RestartPreventExitStatus={svc_linux.LIVE_HOLDER_EXIT_CODE}" in rendered

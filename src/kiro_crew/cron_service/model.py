@@ -75,6 +75,14 @@ class CronJob:
     # read solely where a one-shot would otherwise be consumed by a run it never
     # had. Reset at the start of every run.
     run_never_started: bool = False
+    # Runtime-only (never serialized): set by the gateway, with
+    # ``run_never_started``, when THIS run was refused for a reason in the job's
+    # own configuration that a retry cannot clear (an empty ``agent_sequence``
+    # step). A plain one-shot refused this way is parked as a one-shot that ran
+    # is, instead of retrying on every floor for as long as the gateway runs; a
+    # ``delete_after_run`` one-shot is still retained by ``run_never_started``.
+    # Reset at the start of every run.
+    refusal_cannot_clear: bool = False
     last_result: str | None = None
     # Epoch at which ``last_result`` was produced, written by
     # :meth:`set_run_result` and PERSISTED. Carries the run's identity for
@@ -159,6 +167,17 @@ class CronJob:
     # Such a job simply never shows the hint.
     source_preset: str = ""
     source_template_prompt: str = ""
+    # Install-time provenance: the namespaced key an external installer owns
+    # this job under (``kirocrew cron add --managed-by <key>``), e.g.
+    # ``"<system>:owner/asset-name"``. Unique across the store by construction
+    # -- the only writer, :meth:`CronService.add_managed_job`, refuses a second
+    # job with the same key. It is how an installer finds its own job again
+    # without knowing the random ``id``: uninstall removes it
+    # (``kirocrew cron remove --managed-by <key>``) and a re-install is remove
+    # then add. Create-only: no update path accepts it, so a user edit on the
+    # Schedule page never detaches a job from its installer. ``""`` means "not
+    # installer-managed".
+    managed_by: str = ""
     silent: bool = False  # suppress auto-delivery; agent sends via send_message
     session_key: str = ""  # session that created this job (for scoped removal)
     last_posted_hash: str = ""  # hash of last result posted to Slack (dedup)

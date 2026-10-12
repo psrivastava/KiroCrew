@@ -113,13 +113,26 @@ class DashboardPersistenceCoordinator:
         # persists the window itself through its own archival save.
         if getattr(slot, "is_closing", False):
             return
-        if not owner.conversation_log or not slot.messages:
+        if not owner.conversation_log:
             return
         # A queued user prompt is persisted by the metadata line, not by a row,
         # so an enqueue does not make the transcript dirty. Save on either
         # signal: ``_dirty`` for the window, queue drift for the queue.
         if not slot._dirty and not getattr(slot, "queue_persist_pending", False):
             return
+        # A message-less slot has no window to write, but it can still owe a
+        # metadata edit: a newborn from ``session_create`` has a birth line, and
+        # a sidebar color, title or similar edit made before its first message
+        # only marks it dirty. The forced save takes the empty-window merge for
+        # it, which writes into an existing line only, so a plain empty tab
+        # still gets no file. Queue drift alone (an enqueue or a cancel) is saved
+        # too. A line-less tab writes nothing, and the merge credits the queue
+        # witness for it, so the drift does not re-run the save on every tick.
+        # The window as held in memory: a restored row whose window is still
+        # pending is message-less here too, and reading ``messages`` would load
+        # its whole transcript in this thread for a metadata-only save.
+        loaded = getattr(slot, "loaded_messages", None)
+        force = not (loaded() if callable(loaded) else slot.messages)
         save_slot_to_history = self._slot_saver_provider()
 
         # Keep the dirty bit true for the whole save. chat_fork treats it as
@@ -140,7 +153,16 @@ class DashboardPersistenceCoordinator:
             # matters here more than elsewhere, because a periodic save is a full
             # metadata rebuild -- it does not request the ``rows_only`` deferral
             # that keeps another holder's folder, title and tag.
-            save_slot_to_history(owner, slot, expected_slot_name=slot.key)
+            if force:
+                save_slot_to_history(
+                    owner,
+                    slot,
+                    expected_slot_name=slot.key,
+                    force=True,
+                    refuse_stale_empty_merge=True,
+                )
+            else:
+                save_slot_to_history(owner, slot, expected_slot_name=slot.key)
         except Exception:
             # A failed write remains owed to the next periodic pass.
             self._logger_provider().warning("Flush failed for slot %s", slot.key, exc_info=True)
@@ -311,33 +333,53 @@ class DashboardPersistenceCoordinator:
             owner._context_snapshots[slot_key] = snapshot
             owner._context_snapshots_dirty = True
 
-    def ensure_context_snapshots_loaded(self, owner: Any) -> None:
-        """Merge earlier-process snapshots into memory without overwriting live data."""
+    def ensure_context_snapshots_loaded(self, owner: Any) -> bool:
+        """Merge earlier-process snapshots into memory without overwriting live data.
+
+        Returns ``True`` once the disk copy is merged (or was merged earlier).
+        Returns ``False`` when the file exists but could not be READ this
+        instant (an ``OSError`` such as a Windows sharing violation): its
+        content is unknown and may be intact, so the loaded flag stays unset
+        and the next call retries. Latching an empty map here would let the
+        next flush replace the file with only the live readings and destroy
+        every other tab's saved reading. Content that was read but does not
+        parse (truncated or non-object JSON) holds nothing recoverable, so it
+        is treated as empty and latched, and the next write repairs the file.
+        """
         with owner._context_snapshots_lock:
             if owner._context_snapshots_loaded:
-                return
+                return True
         try:
-            raw = self._json_codec_provider().loads(
-                (self._config_dir_provider() / "context_snapshots.json").read_text()
-            )
+            text = (self._config_dir_provider() / "context_snapshots.json").read_text()
         except FileNotFoundError:
-            raw = {}
-        except Exception:
+            text = None
+        except OSError:
             self._logger_provider().debug(
-                "context_snapshots.json unreadable; starting empty",
+                "context_snapshots.json unreadable; not latching, will retry",
                 exc_info=True,
             )
-            raw = {}
+            return False
+        raw: Any = {}
+        if text is not None:
+            try:
+                raw = self._json_codec_provider().loads(text)
+            except Exception:
+                self._logger_provider().debug(
+                    "context_snapshots.json corrupt; starting empty",
+                    exc_info=True,
+                )
+                raw = {}
         if not isinstance(raw, dict):
             raw = {}
         with owner._context_snapshots_lock:
             if owner._context_snapshots_loaded:
-                return
+                return True
             for key, value in raw.items():
                 if isinstance(key, str) and isinstance(value, dict):
                     owner._context_snapshots.setdefault(key, value)
             # Publish the loaded flag only after the merge, under the same lock.
             owner._context_snapshots_loaded = True
+        return True
 
     @staticmethod
     def context_snapshot_for(owner: Any, slot_key: str) -> dict | None:
@@ -372,7 +414,18 @@ class DashboardPersistenceCoordinator:
             "ensure_context_snapshots_loaded",
             self.ensure_context_snapshots_loaded,
         )
-        ensure_loaded()
+        if ensure_loaded() is False:
+            # The file exists but could not be read this instant, so its
+            # readings are not in memory. Writing now would replace them with
+            # only the live readings: before restore that is every tab the
+            # restore has yet to rebuild, after restore every open tab with no
+            # fresh reading in this process. Skip the write and keep the map
+            # dirty; the next flush retries the read against the intact file.
+            # Same rule as the pre-restore open_slots.json seed read.
+            self._logger_provider().debug(
+                "context snapshot flush skipped: existing snapshots unreadable"
+            )
+            return
 
         # Serialize complete flushes. The data lock intentionally excludes IO,
         # but the flush lock prevents an older stalled write from landing after

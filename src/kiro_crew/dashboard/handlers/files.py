@@ -152,6 +152,7 @@ from kiro_crew.dashboard.file_api.path_complete import (  # noqa: F401
 )
 from kiro_crew.dashboard.file_api.pinned_io import (  # noqa: F401
     _CheckedFile,
+    _classify_request_paths,
     _file_write_blocking,
     _open_checked,
     _open_checked_file,
@@ -162,6 +163,7 @@ from kiro_crew.dashboard.file_api.pinned_io import (  # noqa: F401
     _read_request_path,
     _resolve_project_relative,
     _TextRead,
+    api_file_kinds,
 )
 from kiro_crew.dashboard.file_api.project_dirs import (  # noqa: F401
     _git_head_path,
@@ -237,10 +239,16 @@ from kiro_crew.dashboard.handlers._shared import (
 )
 from kiro_crew.dashboard.handlers.messaging import _resolve_session_target
 from kiro_crew.dashboard.origin import is_direct_local_request
+from kiro_crew.dashboard.session_folders import (  # noqa: F401
+    SESSION_FOLDER_ROOT_MAX_CHARS,
+    validate_session_folder_root,
+)
+from kiro_crew.dashboard.slot_projection import summary_rows
 from kiro_crew.dashboard.state import (  # noqa: F401
     VALID_MEMORY_MODES,
     DashboardState,
     append_and_surface,
+    load_window_off_loop,
 )
 from kiro_crew.doc_blocks import extract_blocks  # noqa: F401
 from kiro_crew.doc_parser import extract_slides, extract_text, join_slides  # noqa: F401
@@ -273,6 +281,7 @@ from kiro_crew.sandbox import (  # noqa: F401
 )
 from kiro_crew.security import (  # noqa: F401
     BINARY_MIME_ALLOWLIST,
+    is_sensitive_canonical_path,
     is_sensitive_path,
     is_sensitive_resolved_path,
     path_contains_sensitive,
@@ -285,6 +294,8 @@ from kiro_crew.security import (  # noqa: F401
 from kiro_crew.validation import (  # noqa: F401
     FILE_READ_SCHEMA,
     MODEL_ID_RE,
+    MODEL_PICKER_HIDDEN_MODEL_ID_RE,
+    MODEL_PICKER_HIDDEN_MODELS_MAX,
     ValidationError,
     validate_tool_args,
 )
@@ -777,10 +788,19 @@ async def api_outbox_notify(request: web.Request) -> web.Response:
     # webhook session that owns no chat, a closed tab); suppress the card rather
     # than surface it in an unrelated conversation.
     if not active and not session_key and state._slots:
+        # The summary rows, so picking the newest tab does not load every
+        # restored sidebar row's window to read one timestamp.
         active = max(
             state._slots.values(),
-            key=lambda s: s.messages[-1]["ts"] if s.messages else "",
+            key=lambda s: summary_rows(s)[-1]["ts"] if summary_rows(s) else "",
         )
+    if active is not None and getattr(active, "window_pending", False) is True:
+        # The card is appended to the destination's rows: a tab restored as a
+        # sidebar row loads its window first, with the read off the loop, and the
+        # destination is read again after the await.
+        await load_window_off_loop(active)
+        if state.get_slot(active.key) is not active:
+            active = None
     delivered = False
     if active is not None and (active.messages or header_targeted):
         delivered = True
@@ -819,6 +839,79 @@ async def api_outbox_notify(request: web.Request) -> web.Response:
         resources=f"filename={file_data['filename']} delivered={int(delivered)}",
     )
     return web.json_response({"ok": True})
+
+
+async def _owner_grant_releases_flagged(request: web.Request) -> bool:
+    """Whether the owner's ``owner_dashboard`` grant releases flagged bytes to THIS caller.
+
+    The one test every owner-facing download route applies to a file the scanner
+    flagged: ``GET /api/outbox/{filename}`` and ``GET /api/file-download`` serve the
+    same audience, so they share one gate rather than two copies of it. Call it only
+    inside a flagged-content branch, so a clean file never touches the store.
+
+    The store read goes through ``asyncio.to_thread``: ``is_granted`` ends in a
+    synchronous file read, and a coroutine that waits on storage stalls the whole
+    gateway event loop.
+
+    TWO conjuncts, and the second is not redundant. A route absent from every
+    ``token_auth`` bypass list needs AUTHENTICATION, which is not OWNER IDENTITY. A
+    Slack allow-listed non-owner running ``!dashboard`` authenticates with
+    ``app == ""`` and ``sub != owner_id``, so ordinary token auth admits them while
+    ``is_owner_dashboard_request`` does not. Without the owner conjunct the grant
+    would convert a clean 400-for-everyone into raw bytes for every authenticated
+    caller -- widening the audience as a side effect of a control meant to narrow
+    it. A route with its own front owner gate still asks here, so the grant's
+    audience never depends on each caller remembering that gate.
+    """
+    from kiro_crew.dashboard.handlers.source_providers import (  # lazy: import cycle
+        is_owner_dashboard_request,
+    )
+
+    granted = await asyncio.to_thread(
+        file_delivery_consent.is_granted, file_delivery_consent.CLASS_OWNER_DASHBOARD
+    )
+    return granted and is_owner_dashboard_request(request)
+
+
+def _audit_owner_grant_refusal(request: web.Request, *, name: str, what: str) -> None:
+    """Record a flagged download the grant gate refused, naming the conjunct that refused.
+
+    *what* names the scan that tripped (``"flagged content"`` or ``"flagged binary
+    content"``). The reason then says which conjunct stopped it.
+
+    Identity is the discriminator, not the grant. The conjunction short-circuits, so
+    in the default no-grant state a non-owner is refused before identity is ever
+    examined; an entry keyed off the grant would record a Slack allow-listed
+    non-owner reaching for a flagged file as an ordinary scanner hold-back,
+    byte-identical to the owner's own -- losing the attribution exactly in the
+    configuration almost every install runs. The identity read is pure attribute
+    reads, so unlike the grant it needs no thread.
+    """
+    from kiro_crew.dashboard.handlers.source_providers import (  # lazy: import cycle
+        is_owner_dashboard_request,
+    )
+
+    cross_principal = not is_owner_dashboard_request(request)
+    file_delivery_consent.audit_refusal(
+        file_delivery_consent.CLASS_OWNER_DASHBOARD,
+        leg="download",
+        name=name,
+        reason=f"{what}, non-owner caller" if cross_principal else f"{what}, no grant",
+        caller=str(request.get("user") or "unknown") if cross_principal else "",
+    )
+
+
+def _audit_consented_download(name: str) -> None:
+    """Record that flagged bytes left for the owner's browser under the grant.
+
+    The refusal this replaces is self-evident in the 400, whereas a successful
+    consented download would otherwise leave no trace.
+    """
+    file_delivery_consent.audit_decision(
+        file_delivery_consent.CLASS_OWNER_DASHBOARD,
+        outcome="delivered",
+        detail=f"download: {name}",
+    )
 
 
 async def api_outbox_download(request: web.Request) -> web.StreamResponse:
@@ -868,64 +961,6 @@ async def api_outbox_download(request: web.Request) -> web.StreamResponse:
     except UnicodeDecodeError:
         is_text = False
 
-    def _grant_permits_this_handover(granted: bool) -> bool:
-        """Whether the owner's recorded grant releases flagged bytes to THIS caller.
-
-        This is where the flagged bytes actually leave for the owner's browser, so
-        a grant is honoured here AND the handover is audited -- the refusal it
-        replaces was self-evident in the 400, whereas a successful consented
-        download would otherwise leave no trace.
-
-        *granted* arrives already resolved because reading it ends in a
-        synchronous store read, and this closure is called from a coroutine: each
-        caller resolves the grant with ``asyncio.to_thread`` inside its own
-        flagged-content branch, which keeps the read off the gateway event loop
-        and keeps a clean file from touching the store at all. What stays here is
-        the in-memory half of the test.
-
-        TWO conjuncts, and the second is not redundant. This route is absent from
-        every ``token_auth`` bypass list, which establishes that it needs
-        AUTHENTICATION -- not that it needs OWNER IDENTITY. A Slack allow-listed
-        non-owner running ``!dashboard`` authenticates with ``app == ""`` and
-        ``sub != owner_id``, so ordinary token auth admits them while
-        ``is_owner_dashboard_request`` does not. Without the owner conjunct the
-        grant would convert a clean 400-for-everyone into raw bytes for every
-        authenticated caller -- widening the audience as a side effect of a control
-        meant to narrow it, and contradicting the "owner's own authenticated
-        browser" audience this class is scoped to.
-
-        One function for both content kinds on purpose: a text file and a media
-        file carrying the same credential reach the same audience through this
-        route, so a second copy of the test is a second thing to forget.
-        """
-        from kiro_crew.dashboard.handlers.source_providers import (  # lazy: import cycle
-            is_owner_dashboard_request,
-        )
-
-        return granted and is_owner_dashboard_request(request)
-
-    def _requester_is_not_the_owner() -> bool:
-        """Whether THIS caller is somebody other than the dashboard owner.
-
-        The refusal entry has to say which of the gate's two conjuncts stopped the
-        handover, and the grant cannot answer that: the conjunction short-circuits,
-        so in the default no-grant state a non-owner is refused before identity is
-        ever examined. Keying the entry off the grant would therefore record a Slack
-        allow-listed non-owner reaching for a flagged file as an ordinary scanner
-        hold-back, byte-identical to the owner's own -- losing the attribution
-        exactly in the configuration almost every install runs. Identity answers it
-        in every configuration, and a non-owner is refused here whether or not a
-        grant exists.
-
-        Pure attribute reads, so unlike the grant this needs no thread: it consults
-        the request's own claims and the in-memory owner id.
-        """
-        from kiro_crew.dashboard.handlers.source_providers import (  # lazy: import cycle
-            is_owner_dashboard_request,
-        )
-
-        return not is_owner_dashboard_request(request)
-
     def _audit_consented_handover() -> None:
         _sel().log_tool_invocation(
             session_key="api",
@@ -935,11 +970,7 @@ async def api_outbox_download(request: web.Request) -> web.StreamResponse:
             outcome="completed",
             error="sensitive_content_delivered_with_consent",
         )
-        file_delivery_consent.audit_decision(
-            file_delivery_consent.CLASS_OWNER_DASHBOARD,
-            outcome="delivered",
-            detail=f"download: {path.name}",
-        )
+        _audit_consented_download(path.name)
 
     if is_text:
         # Two passes on this branch, not one. ``redact`` reads the correctly
@@ -952,10 +983,7 @@ async def api_outbox_download(request: web.Request) -> web.StreamResponse:
         redacted = redact(text)
         narrow_flagged = redacted != text
         if narrow_flagged or await asyncio.to_thread(wide_content_is_flagged, raw):
-            granted = await asyncio.to_thread(
-                file_delivery_consent.is_granted, file_delivery_consent.CLASS_OWNER_DASHBOARD
-            )
-            if not _grant_permits_this_handover(granted):
+            if not await _owner_grant_releases_flagged(request):
                 _sel().log_tool_invocation(
                     session_key="api",
                     source="api",
@@ -964,24 +992,7 @@ async def api_outbox_download(request: web.Request) -> web.StreamResponse:
                     outcome="denied",
                     error="content_redacted" if narrow_flagged else "wide_credential_detected",
                 )
-                # The two conjuncts fail for different events, so the entry must
-                # not read the same for both. Identity is the discriminator, not
-                # the grant: the conjunction short-circuits, so a non-owner in the
-                # default no-grant state never reaches the owner check, and an
-                # entry keyed off the grant would call that a scanner hold-back and
-                # name the other principal nowhere.
-                cross_principal = _requester_is_not_the_owner()
-                file_delivery_consent.audit_refusal(
-                    file_delivery_consent.CLASS_OWNER_DASHBOARD,
-                    leg="download",
-                    name=path.name,
-                    reason=(
-                        "flagged content, non-owner caller"
-                        if cross_principal
-                        else "flagged content, no grant"
-                    ),
-                    caller=str(request.get("user") or "unknown") if cross_principal else "",
-                )
+                _audit_owner_grant_refusal(request, name=path.name, what="flagged content")
                 return web.json_response(
                     {"error": "file content was redacted; download aborted"}, status=400
                 )
@@ -1010,10 +1021,7 @@ async def api_outbox_download(request: web.Request) -> web.StreamResponse:
         # scanned, and off the event loop because the scan is CPU work over up to
         # the read cap and a media file is routinely far larger than a text one.
         if await asyncio.to_thread(binary_content_is_flagged, raw):
-            granted = await asyncio.to_thread(
-                file_delivery_consent.is_granted, file_delivery_consent.CLASS_OWNER_DASHBOARD
-            )
-            if not _grant_permits_this_handover(granted):
+            if not await _owner_grant_releases_flagged(request):
                 _sel().log_tool_invocation(
                     session_key="api",
                     source="api",
@@ -1022,21 +1030,7 @@ async def api_outbox_download(request: web.Request) -> web.StreamResponse:
                     outcome="denied",
                     error="binary_credential_detected",
                 )
-                # Same discriminator as the text branch above: identity, because the
-                # conjunction short-circuits before the owner check in the default
-                # no-grant state.
-                cross_principal = _requester_is_not_the_owner()
-                file_delivery_consent.audit_refusal(
-                    file_delivery_consent.CLASS_OWNER_DASHBOARD,
-                    leg="download",
-                    name=path.name,
-                    reason=(
-                        "flagged binary content, non-owner caller"
-                        if cross_principal
-                        else "flagged binary content, no grant"
-                    ),
-                    caller=str(request.get("user") or "unknown") if cross_principal else "",
-                )
+                _audit_owner_grant_refusal(request, name=path.name, what="flagged binary content")
                 return web.json_response(
                     {
                         "error": "binary file contains embedded credentials; download aborted",
@@ -1577,6 +1571,47 @@ _WALK_MAX_SCAN_SCOPED = 50_000
 _WALK_MAX_SCAN_UNSCOPED = 5_000
 _WALK_MAX_DIRS_VISITED = 20_000
 
+#: Wall-clock budget for ONE ``_walk_file_search`` pass. The scan/dirs ceilings
+#: above bound how MANY filesystem calls the walk makes, not how LONG each one
+#: takes. On local disk a ceiling-reaching walk measured 4.20s worst, so the
+#: client's own 15s deadline (``FILE_SEARCH_TIMEOUT_MS`` in ``api/client/files.ts``)
+#: has ~3.6x headroom there -- but that figure is local disk only. On an
+#: NFS/SSHFS-class mount each ``os.stat``/``scandir`` is a network round trip, so
+#: the same bounded number of calls can run many times longer and blow straight
+#: past the client's 15s; the client's Retry re-enters the same bound, so a
+#: healthy-but-slow store fails every attempt. This bounds the one term store
+#: speed inflates: when a per-directory or per-stride clock check finds the
+#: budget spent, the walk stops and returns the partial set it gathered, the
+#: same early stop the entry/dir ceilings already make for size, reached by
+#: elapsed time. The check is cooperative, so a single ``os.stat`` that blocks
+#: on a dead mount can overrun the budget before the next check runs; this
+#: shortens the common slow-but-alive case rather than guaranteeing a hard
+#: wall-clock cap. 10s is chosen to sit
+#: under the client's 15s on a store that
+#: answers each call, with room for admission and round trips.
+#: Module-level so a test can shrink it, exactly as ``_GREP_TIME_BUDGET_SECS``.
+_WALK_TIME_BUDGET_SECS = 10.0
+
+#: How many entries one ``_collect`` scans between wall-clock checks in
+#: ``_walk_file_search``. A single enormous directory could otherwise overrun the
+#: budget between the per-directory checks, so the entry loop re-reads the clock
+#: every stride -- the same trick, and for the same reason, as the grep path's
+#: ``_GREP_ROW_DEADLINE_STRIDE``. Module-level so a test can shrink it.
+_WALK_DEADLINE_STRIDE = 512
+
+
+#: The monotonic clock ``_walk_file_search`` reads for its wall-clock budget,
+#: named on the module (the facade every owner function resolves against) rather
+#: than called as ``time.monotonic`` inline. A deadline test drives the walk's
+#: clock deterministically by patching THIS name -- advancing it per yielded
+#: directory so the budget crosses on a chosen directory -- which touches only
+#: the walk and leaves the stdlib ``time`` module untouched for the event loop
+#: and every other test (tests-are-deterministic). ``time.monotonic`` is a
+#: facade name no owner captures, so the patch cannot silently miss a caller.
+def _walk_monotonic() -> float:
+    return time.monotonic()
+
+
 # Hard ceiling on the caller-supplied ``limit`` of /api/file-search. The walk
 # collects ``max_results * 10`` candidates per kind, so the limit multiplies real
 # filesystem work; a fixed server-side ceiling keeps a hostile ``?limit=`` from
@@ -1985,6 +2020,12 @@ def _probe_request_path(raw: str) -> _PathProbe:
     if not path:
         return _PathProbe("", False, False)
     return _PathProbe(path, os.path.isfile(path), os.path.isdir(path))
+
+
+#: Most paths one ``POST /api/file-kinds`` request may name. A transcript view
+#: asks for a few dozen; the cap bounds how long one request holds its probe
+#: worker, and the client splits a larger set across requests.
+_FILE_KINDS_MAX_PATHS = 100
 
 
 #: How much of a file /api/file-read returns, in CHARACTERS -- the unit matters,

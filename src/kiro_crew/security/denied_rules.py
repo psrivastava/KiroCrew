@@ -138,24 +138,24 @@ _ENV_DUMP_VERBS = r"(?:environ|printenv|typeset|export\s+-p|env|set)"
 #   ``src/environment`` and ``settings.py`` are not dumps. A ``.`` or ``/`` before
 #   the verb is deliberately allowed: ``/usr/bin/env``, ``/bin/printenv`` and
 #   ``/proc/self/environ`` are the same dumps under a path and are the most
-#   ordinary spelling of the command. The filter word is bounded on its right the
-#   same way, so a quoted filter (``env | 'grep' AWS_SECRET``) still counts while
-#   ``grepfoo`` does not;
+#   ordinary spelling of the command. The filter word is bounded on BOTH sides, so
+#   ``'grep'`` and ``/usr/bin/grep`` count while ``grepfoo`` and the ``sed`` in ``used``
+#   do not; the prefixed spellings (``egrep``, ``gawk``, ``gsed``) are listed for it;
 # * the selector must be a name whose selection can PRINT a credential
 #   (``_AWS_VAR_SELECTOR``) -- ``env | grep AWS_REGION`` cannot, and is allowed.
 # A ``|`` must appear between the dump and the filter, which is what keeps ``env``
 # as a wrapper (``env FOO=1 cmd``), ``set -e; grep AWS_ file.txt`` and
 # ``cat .env; grep AWS_ config.py`` out.
 #
-# The gaps are deliberately plain ``.*`` -- ordered existence within one LINE, with
-# no attempt to confine the match to a single shell statement or pipeline stage.
+# The gaps are deliberately plain ``.*`` -- ordered existence across the text (the
+# matcher crosses line breaks), with no statement or pipeline-stage scoping.
 # A statement-scoped span has to treat ``;`` and ``&`` as separators, and a regex
 # cannot tell a separator from the identical character inside a quoted argument:
 # ``env | sed 's/;/x/' | grep AWS_SECRET_ACCESS_KEY`` and
 # ``env | grep -E 'a&b|AWS_SECRET'`` are ordinary credential dumps whose only
 # unusual feature is a quoted separator, and a span that stops there fails OPEN.
 # Guessing the other way costs an over-block instead: a ``set …`` earlier in the
-# line makes any later ``… | grep AWS_`` in the same line a match. That is the
+# text makes any later ``… | grep AWS_`` a match. That is the
 # residual, it is the safe direction, and it is the reason the gaps are not spans.
 #
 # What this rule does NOT cover, on purpose: a dump REDIRECTED to a file and read
@@ -169,7 +169,7 @@ _ENV_DUMP_VERBS = r"(?:environ|printenv|typeset|export\s+-p|env|set)"
 _ENV_DUMP_GREP_AWS_PATTERN = (
     rf"(?<![\w-]){_ENV_DUMP_VERBS}(?!\w)"
     + r".*\|.*"
-    + r"(?:grep|awk|sed)(?!\w)"
+    + r"(?<![\w-])(?:[a-z0-9]{0,5}grep|[gmn]?awk|g?sed|ssed)(?!\w)"
     + r".*"
     + _AWS_VAR_SELECTOR
 )
@@ -2199,6 +2199,29 @@ def _exception_eligible(view: str) -> bool:
     behaviour changes.
     """
     return not _SHELL_ACTIVE_CHARS.intersection(view)
+
+
+#: kiro-cli's display prefix on a shell call's title, lowercased like the views.
+_SHELL_TITLE_PREFIX = "running: "
+
+
+def _exception_applies(view: str, exceptions: list[str]) -> bool:
+    """Whether one of *exceptions* exonerates the lowercased *view*.
+
+    The view must be eligible (:func:`_exception_eligible`), and the globs are
+    matched against the command behind ONE exact leading ``running: ``. kiro-cli
+    titles a shell call ``Running: <command>`` and the deny tiers judge that
+    title as a subject of its own, so a verb-anchored glob would otherwise never
+    match it and the title would be refused for a command that is exonerated.
+    Reading through the prefix keeps condition 1 above intact: the glob still
+    has to start at the command's first word, and the title gets the verdict of
+    the command it displays, never a weaker one.
+    """
+    if not exceptions or not _exception_eligible(view):
+        return False
+    if view.startswith(_SHELL_TITLE_PREFIX):
+        view = view[len(_SHELL_TITLE_PREFIX) :]
+    return any(fnmatch.fnmatch(view, e.lower()) for e in exceptions)
 
 
 # Maps a deny pattern to the globs that exonerate it.  When an input matches

@@ -17,6 +17,7 @@ import os
 import platform
 import re
 import time
+from collections.abc import Awaitable
 from pathlib import Path
 from typing import Any, Callable, cast  # noqa: F401
 
@@ -133,6 +134,7 @@ from kiro_crew.dashboard.messaging_api.notifications import (  # noqa: F401
     api_notifications_clear,
 )
 from kiro_crew.dashboard.messaging_api.proactive_send import (  # noqa: F401
+    _SLACK_ERRORS_WITH_UNKNOWN_OUTCOME,
     _audit_send_message,
     _deliver_send_message_fallback,
     _post_send_message_to_slack,
@@ -145,6 +147,8 @@ from kiro_crew.dashboard.messaging_api.proactive_send import (  # noqa: F401
     _SendMessageBody,
     _SendMessageOutcome,
     _session_link_blocks,
+    _slack_rate_limited,
+    _slack_rejected_outright,
     api_delete_message,
     api_update_message,
 )
@@ -183,6 +187,7 @@ from kiro_crew.dashboard.messaging_api.slack_settings import (  # noqa: F401
 )
 from kiro_crew.dashboard.messaging_api.spawn import (  # noqa: F401
     _continue_on_loop,
+    _requested_backend,
     _slot_for_parent,
     _spawn_on_loop,
     _spawn_request_memory_mode,
@@ -223,6 +228,7 @@ from kiro_crew.dashboard.state import (  # noqa: F401
     PERSISTED_SUBAGENT_REPLAY_KEEP,
     PERSISTED_SUBAGENT_REPLAY_MAX_AGE_SECS,
     DashboardState,
+    load_window_off_loop,
 )
 from kiro_crew.dashboard.token_auth import (  # noqa: F401
     LINK_WINDOW_SECS,
@@ -236,6 +242,7 @@ from kiro_crew.dashboard.ws_event_scope import (  # noqa: F401
     persisted_snapshot_denial_reason,
     slot_owner_snapshot,
 )
+from kiro_crew.members import attributable_session_key, member_identity_for_session
 from kiro_crew.messaging.display_safety import redact_for_display
 from kiro_crew.messaging.link import SLACK_NAMESPACE, ChannelLink  # noqa: F401
 from kiro_crew.messaging.renderer import (  # noqa: F401
@@ -735,6 +742,10 @@ async def api_notification_agent_push(request: web.Request) -> web.Response:
     actions = body.get("actions")
     if actions is not None and not isinstance(actions, list):
         return web.json_response({"error": "actions must be a list"}, status=400)
+    # Attribution comes from an attested, non-app session header, never the
+    # body, so no caller can put another crewmate's face on its note.
+    attribution_key = await asyncio.to_thread(attributable_session_key, request)
+    member = await asyncio.to_thread(member_identity_for_session, attribution_key)
     payload = NotificationPayload(
         source="system",
         channel="system.agent",
@@ -745,6 +756,7 @@ async def api_notification_agent_push(request: web.Request) -> web.Response:
         url=body.get("url"),
         group_key=body.get("group_key"),
         actions=actions,
+        member=member,
     )
     try:
         note = state.notification_bus.push(payload)
@@ -1038,6 +1050,11 @@ async def api_send_message(request: web.Request) -> web.Response:
                 was_loaded = slot is not None
                 if slot is None:
                     slot = await rehydrate_slot_from_history_async(state, slot_key)
+                elif getattr(slot, "window_pending", False) is True:
+                    # A tab restored as a sidebar row loads its window before
+                    # the delivery below appends to it, with the read off the loop.
+                    await load_window_off_loop(slot)
+                    slot = state.get_slot(slot_key)
                 logger.info(
                     "send_message session=origin resolved slot_key=%s job=%s was_loaded=%s rehydrated=%s",
                     slot_key,
@@ -1125,6 +1142,7 @@ async def api_send_message(request: web.Request) -> web.Response:
                 channel_type=channel_type,
                 caller_session=caller_session,
                 declared_session=declared_session,
+                attribution_session=await asyncio.to_thread(attributable_session_key, request),
                 is_cron_caller=is_cron_caller,
                 send_to_slack=send_to_slack,
             )
@@ -2188,7 +2206,7 @@ def _clean_id_list(raw: object, is_valid: Callable[[str], bool], label: str) -> 
     return out
 
 
-async def _write_env_off_loop(updates: dict[str, str | None], *, config_kept: bool = False) -> None:
+async def _write_env_off_loop(updates: dict[str, str | None]) -> None:
     """Run the blocking ``.env`` write on a worker, drained under the config lock.
 
     Every caller holds ``_get_config_lock()`` across this, and a thread cannot be
@@ -2211,13 +2229,10 @@ async def _write_env_off_loop(updates: dict[str, str | None], *, config_kept: bo
     A ``.env`` saved as UTF-16 or UTF-32 is refused before anything is written
     (:func:`_write_env_updates_locked` never overwrites a file it cannot
     parse). That refusal is raised here as a 409 carrying the fix, so every
-    channel save answers it the same way instead of with an opaque 500. A
-    caller that rolls its config write back on a failed ``.env`` write (Slack,
-    Teams, Webex, WeCom and Feishu) still does, because it catches every
-    exception; Discord and Telegram commit config before this call and keep it,
-    so their 409 leaves the config change in place and only the ``.env`` part
-    unsaved, which a retry after the UTF-8 re-save completes. Those two callers
-    pass ``config_kept=True`` so the 409 says their other settings were saved.
+    channel save answers it the same way instead of with an opaque 500. Every
+    saver (Slack, Teams, Webex, WeCom, Feishu, Discord and Telegram) reaches
+    this through :func:`_write_env_or_roll_back`, which rolls the config write
+    back on any failure, so on every channel the 409 means nothing was saved.
     """
     fut = asyncio.ensure_future(asyncio.to_thread(_write_env_updates, updates))
     try:
@@ -2226,23 +2241,57 @@ async def _write_env_off_loop(updates: dict[str, str | None], *, config_kept: bo
         await asyncio.wait([fut])
         raise
     except _loader.EnvFileWideEncodingError as exc:
-        raise _wide_env_refusal(exc, config_kept=config_kept) from exc
+        raise _wide_env_refusal(exc) from exc
 
 
-def _wide_env_refusal(
-    exc: _loader.EnvFileWideEncodingError, *, config_kept: bool = False
-) -> web.HTTPConflict:
-    """The response for a channel save refused because ``.env`` is wide-encoded.
+async def _write_env_or_roll_back(
+    env_updates: dict[str, str | None],
+    rollback: Callable[[], Awaitable[None]] | None,
+) -> None:
+    """Write a channel save's ``.env`` half, undoing its config half on failure.
 
-    ``config_kept`` is set by a caller whose config write stays in place when
-    the ``.env`` write is refused, so the message does not imply the whole save
-    was discarded.
+    Every channel saver commits ``config.json`` first and then calls this, so the
+    second half of the transaction exists once and a new saver cannot copy only
+    part of it. *rollback* undoes the config commit; pass ``None`` when the save
+    wrote no config.
+
+    A failed write runs *rollback* and re-raises, so a refused save (the wide
+    ``.env`` 409 included) changes nothing. A cancellation drains the write
+    first and runs *rollback* only when the write itself failed: a write that
+    landed before the cancel arrived already pairs with the committed config,
+    and rolling the config back would split the pair it means to keep. The
+    cancellation is re-raised either way.
+
+    On success the process environment is updated to match: ``load_credentials()``
+    lets ``os.environ`` win over ``.env``, so a replaced or cleared token would
+    otherwise keep reading as installed until restart, and spawned children
+    would inherit the stale value.
     """
-    outcome = "The .env was not changed"
-    outcome += "; your other settings were saved." if config_kept else "."
+    write = asyncio.ensure_future(_write_env_off_loop(env_updates))
+    try:
+        await asyncio.shield(write)
+    except asyncio.CancelledError:
+        await asyncio.gather(write, return_exceptions=True)
+        failed = not write.cancelled() and write.exception() is not None
+        if failed and rollback is not None:
+            await rollback()
+        raise
+    except BaseException:
+        if rollback is not None:
+            await rollback()
+        raise
+    for key, new_val in env_updates.items():
+        if new_val is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = new_val
+
+
+def _wide_env_refusal(exc: _loader.EnvFileWideEncodingError) -> web.HTTPConflict:
+    """The response for a channel save refused because ``.env`` is wide-encoded."""
     message = (
         f"{_loader.env_path()} is saved as {exc.wide_encoding}, which Kiro Crew "
-        f"cannot read. Re-save it as UTF-8 and save again. {outcome}"
+        "cannot read. Re-save it as UTF-8 and save again. The .env was not changed."
     )
     return web.HTTPConflict(
         text=json.dumps({"error": message}),

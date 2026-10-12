@@ -98,7 +98,7 @@ _BASE_NAMES = frozenset("""
         NATIVE_SUBAGENT_OUTPUT_HARD NATIVE_SUBAGENT_OUTPUT_TAIL NATIVE_SUBAGENT_TERMINAL_KEEP
         NATIVE_SUBAGENT_TERMINAL_TTL_SECS NamedTuple OUTCOME_REJECTED_TRANSPORT_FLOOR
         PENDING_CHANNEL_ATTR PHASE_PER_TURN PHASE_SESSION_START POISONED_SESSION_CYCLES Path
-        PostedOptions PromptBusyExhaustedError QUESTION_CARD_SHOWN_PREFIX QUICK_PROMPTS
+        PostedOptions PromptBusyExhaustedError QUICK_PROMPTS
         REFUSAL_INBAND_RECOVERY_PREFIX REFUSAL_RECOVERY_PREFIX RESTORED_QUEUE_KEY
         RecoveryPayload Refusal RefusalInfo
         ResetCause ResolvedBindings
@@ -1570,7 +1570,8 @@ _STAYS_IN_THE_RUNNER = (
     r"except AcpProcessDied",
     r"\.recent\(",
     r"warm_project_agent_names\(",
-    r"\.on_tool_call\(",
+    # The tool-gate consultation: the sync call, or the awaitable form a coroutine uses.
+    r"\.on_tool_call\(|run_in_tool_gate_pool\(\s*[\w.]+\.on_tool_call,",
     r"spawn_guarded_turn\(",
     r"create_task\(",
     r"ensure_future\(",

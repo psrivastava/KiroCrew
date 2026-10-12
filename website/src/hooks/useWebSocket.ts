@@ -1,4 +1,5 @@
 import { useEffect, useRef, useCallback } from 'react'
+import { isLookPreviewFrame } from '../utils/lookPreview'
 import { useQueryClient } from '@tanstack/react-query'
 import { useAppDispatch } from '../store'
 import { sseTodoUpdate, sseMcpReportUpdate, sseSlotTitle, triggerRefresh, fetchSlots, remoteSlotRead, sseSubagentStatus, sseSubagentText, type SubagentDetail } from '../store/dashboardSlice'
@@ -9,6 +10,9 @@ import {
 } from '../store/chatSlice'
 import { store } from '../store'
 import { TAB_ID } from '../api/tabId'
+import { applyGuideUpdate } from '../api/guide'
+import { handleGuideObserveFrame } from '../guide/liveObservation'
+import { applyCardUpdate } from '../api/cards'
 import type { Notification, TodoList, McpSessionReport } from '../types'
 import { i18nT } from '../i18n/t'
 import { teamRoots } from '../pages/chat/command-center/model'
@@ -72,7 +76,7 @@ export { __resetRedactionHealForTests, healRedactionSwitchAfterReconnect } from 
 // this facade like every other owner binding. Both are named so a caller can
 // invalidate the same key the handler invalidates: a second spelling of that
 // prefix would let a refresh reach a different cache entry from the frame.
-export { MEMBER_DASHBOARD_QUERY_PREFIX, handleDashboardMoved } from './websocket/serverState'
+export { MEMBER_DASHBOARD_QUERY_PREFIX, SESSION_DASHBOARD_QUERY_PREFIX, handleDashboardMoved } from './websocket/serverState'
 export { identityOf, askIdsOf, reconcileQuestions, staleAskIds } from './websocket/composerCards'
 export { resolvedSince } from './websocket/retiredIds'
 export { UPDATE_RESTART_LATCH_KEY, UPDATE_RESTART_LATCH_TTL_MS, consumeUpdateRestartLatch } from './websocket/bundleReload'
@@ -214,6 +218,11 @@ export function useWebSocket() {
     // next frame routes normally.
     ws.onmessage = (e) => {
       if (socket.wsRef.current === ws) lastFrameAtRef.current = Date.now()
+      // The look-preview frame (utils/lookPreview.ts) is a still picture of the
+      // product drawn from fixtures: no live frame may repaint it with the
+      // user's real sessions, runs or notices. The socket stays open only so
+      // the frame never shows a disconnected state.
+      if (isLookPreviewFrame()) return
       try {
         const { type, data, msg } = decodeFrame(e.data)
         switch (type) {
@@ -233,6 +242,24 @@ export function useWebSocket() {
             // the panel's visibility depends on the pending count.
             queryClient.invalidateQueries({ queryKey: ['skills-pending'] })
             queryClient.invalidateQueries({ queryKey: ['skills'] })
+            break
+          }
+          case 'guide_update': {
+            // Owner-only frame; folded into the pending-guides cache, which
+            // is also re-read on reconnect (frames are one-shot).
+            applyGuideUpdate(queryClient, (data as { guide?: unknown }).guide)
+            break
+          }
+          case 'guide_observe': {
+            // Owner-only frame naming ONE tab; that tab answers with ids and
+            // enum states only, every other tab ignores it.
+            handleGuideObserveFrame(data)
+            break
+          }
+          case 'card_update': {
+            // Owner-only frame; folded into that slot's change-cards cache,
+            // which is also re-read on reconnect (frames are one-shot).
+            applyCardUpdate(queryClient, (data as { card?: unknown }).card)
             break
           }
           case 'todo_update': {
@@ -333,9 +360,16 @@ export function useWebSocket() {
             break
           }
           case 'dashboard_value_written':
-            // A crewmate wrote one of its own dashboard fields mid-turn. The frame
-            // carries only {slug}; the tab's refetch re-asks the server, which
-            // re-composes the page and re-checks ownership.
+          case 'dashboard_instance_changed':
+            // A crewmate or a root session wrote one of its own dashboard fields, or
+            // changed its page, mid-turn. The frame carries only {slug} or {slot};
+            // the tab's refetch re-asks the server, which re-composes the page and
+            // re-checks ownership.
+            handleDashboardMoved(queryClient, data)
+            break
+          case 'dashboard_instance_changed':
+            // The crewmate's dashboard PAGE changed: a template applied or a
+            // version rolled back. Same {slug}-only frame, same re-read.
             handleDashboardMoved(queryClient, data)
             break
           case 'notification_ack':
@@ -543,7 +577,7 @@ export function useWebSocket() {
             break
           }
           case 'subagent_spawn':
-            dispatch(sseSubagentSpawn(data as { slot: string; id: string; task: string; agent: string; model?: string; requested_model?: string }))
+            dispatch(sseSubagentSpawn(data as { slot: string; id: string; task: string; agent: string; model?: string; requested_model?: string; batch_id?: string }))
             break
           case 'subagent_queued':
             // The count plus the gate's optional `reason` label (absent from an
@@ -573,7 +607,7 @@ export function useWebSocket() {
             // Flush any buffered chunks before the done event, so the final
             // streaming text is visible before the agent transitions to done.
             buffers.flushSubagentChunks()
-            dispatch(sseSubagentDone(data as { slot: string; id: string; elapsed: number; credits?: number; error?: string; stopped?: boolean; outcome?: 'completed' | 'failed' | 'stopped'; task?: string; agent?: string; model?: string; requested_model?: string; result?: string }))
+            dispatch(sseSubagentDone(data as { slot: string; id: string; elapsed: number; credits?: number; error?: string; stopped?: boolean; outcome?: 'completed' | 'failed' | 'stopped'; task?: string; agent?: string; model?: string; requested_model?: string; batch_id?: string; result?: string }))
             break
           case 'app_reload':
             emitAppReload(data as { app: string })
@@ -581,7 +615,7 @@ export function useWebSocket() {
           case 'subagent_snapshot': {
             // Clear any buffered chunks for this agent — the snapshot's streaming
             // field is authoritative and already includes any in-flight text.
-            const snapData = data as { id: string; slot: string; task: string; agent: string; model?: string; requested_model?: string; streaming: string; last_tool: string; started: number; tool_count?: number; stalled?: boolean }
+            const snapData = data as { id: string; slot: string; task: string; agent: string; model?: string; requested_model?: string; batch_id?: string; streaming: string; last_tool: string; started: number; tool_count?: number; stalled?: boolean }
             buffers.dropSubagentKey(snapData.slot, snapData.id)
             dispatch(sseSubagentSnapshot(snapData))
             break
@@ -905,6 +939,7 @@ export function useWebSocket() {
   useEffect(() => {
     socket.resume()
     connect()
+    const detachQuestionRetirements = store.subscribe(cards.onQuestionStateChange)
     const detachVoice = voice.attachWindowEvents()
     const detachFocus = attachFocusRelay({
       socket,
@@ -916,10 +951,11 @@ export function useWebSocket() {
       buffers.flushForUnmount()
       socket.closeForUnmount()
       voice.dispose()
+      detachQuestionRetirements()
       detachVoice()
       detachFocus()
     }
-  }, [socket, connect, voice, buffers])
+  }, [socket, connect, voice, buffers, cards])
 
   return { subscribeLogs: socket.subscribeLogs, subscribeSubagents: socket.subscribeSubagents, forceReconnect }
 }

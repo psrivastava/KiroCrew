@@ -12,11 +12,14 @@
  *    `[Subagent completion event]` envelopes, tool-call rows, reasoning
  *    bursts, and the say-nothing rows a quiet patrol ends on — is filtered at
  *    RENDER time by `filterCrewmateChat`. Nothing is deleted: the rows stay in
- *    the slot's transcript and the Work log reads them from there. The one
- *    exception is the turn IN FLIGHT: while the crewmate works, its tool calls
- *    and thinking since the turn opened stay in, so the chat shows what it is
- *    doing with the same rows the ordinary transcript draws. They fold away
- *    again when the turn ends.
+ *    the slot's transcript and the Work log reads them from there — the turn
+ *    in flight included. What the crewmate is doing RIGHT NOW is not a
+ *    transcript row at all but ONE status line beside the working indicator
+ *    (`CrewmateLiveActivity`, fed by the DM header pill's own reading,
+ *    `useSlotActivity`), so the reader sees the current step, never the list
+ *    of steps (#18238). A line that swaps its text in place is also what keeps
+ *    the indicator still: rows mounting and unmounting above it made the ghost
+ *    hop on every step.
  *
  * 2. HOW A RUN LOOKS. Consecutive messages from the crewmate form a run: one
  *    bubble per message, grouped corners on the run's (left) side, and NO
@@ -35,7 +38,6 @@ import { isSystemNoticeRow } from '../../pages/chat/CompactionCard'
 import { isWorkflowCompletionMessage } from '../../pages/chat/WorkflowCompletionCard'
 import { isSubagentCompletionMessage } from '../../pages/chat/subagentCompletion'
 import { REASONING_ROLES } from '../../pages/chat/groupDisplayItems'
-import { opensTurn } from '../../pages/chat/RecoveryCard'
 import type { ChatMessage } from '../../types'
 import { isHiddenInvisibleAssistantRow } from '../../utils/invisibleText'
 
@@ -61,9 +63,9 @@ const MACHINERY_ROLES: ReadonlySet<string> = new Set([
   'nudge', 'inject', 'subagent', 'tool', 'tool_call', 'tool_result', 'thinking', 'done',
 ])
 
-/** The live turn's progress rows: tool calls (the 🔧 line and its hidden
- *  ✅ / 🚫 siblings, which the list reads for the denied flag) and thinking. */
-const LIVE_PROGRESS_ROLES: ReadonlySet<string> = new Set(['tool', ...REASONING_ROLES])
+/** A turn's progress rows: tool calls (the 🔧 line and its hidden ✅ / 🚫
+ *  siblings) and thinking. Never drawn in the chat; a run reads past them. */
+const PROGRESS_ROLES: ReadonlySet<string> = new Set(['tool', ...REASONING_ROLES])
 
 /** The stop card travels under `system`; every other `system` row is state
  *  no surface draws. */
@@ -77,10 +79,9 @@ function isStopCard(m: ChatMessage): boolean {
  *  among `system` rows: it IS drawn (the user pressed Stop and sees the card),
  *  so it is a boundary like an error row, not state the run reads past. */
 function isRunTransparent(m: ChatMessage): boolean {
-  // A live turn's progress rows (kept only while the turn runs) are the turn's
-  // own machinery: the run, its corners and its footer read past them exactly
-  // as they do once the rows fold away, so nothing reshapes at turn end.
-  if (LIVE_PROGRESS_ROLES.has(m.role)) return true
+  // A turn's progress rows are its own machinery: the run, its corners and
+  // its footer read past them, running or settled alike.
+  if (PROGRESS_ROLES.has(m.role)) return true
   if (m.role === 'permission') return !!m.meta?.resolved
   if (isStopCard(m)) return false
   return m.role === 'system' || m.role === 'done' || m.role === 'queued'
@@ -103,11 +104,33 @@ export function isCrewmateSpeech(m: ChatMessage): boolean {
   return !isHiddenInvisibleAssistantRow(m) && !isSystemNoticeRow(m) && !isWorkflowCompletionMessage(m) && !isSubagentCompletionMessage(m)
 }
 
+/** The `notice` kinds a crewmate's chat drops: the runtime's own machinery that
+ *  the person has nothing to do with. `empty_turn` is the runner's empty-response
+ *  recovery card (`chat_utils.EMPTY_TURN_NOTICE_KIND`); `arm_refusal` is the
+ *  automation arm/revision/stop refusal (`session_directive_apply.ARM_REFUSAL_NOTICE_KIND`),
+ *  which is re-routed to the crewmate's next turn as an `inject` row instead.
+ *  Every notice OUTSIDE this set names something the person may have to act on
+ *  (a dropped queued message, a model-fallback hint) and keeps drawing. */
+const CREWMATE_HIDDEN_NOTICE_KINDS: ReadonlySet<string> = new Set(['empty_turn', 'arm_refusal'])
+function isHiddenCrewmateNotice(m: ChatMessage): boolean {
+  const kind = (m.meta as { kind?: unknown } | undefined)?.kind
+  return typeof kind === 'string' && CREWMATE_HIDDEN_NOTICE_KINDS.has(kind)
+}
+
 /** Whether a row is drawn in a crewmate's chat at all. */
 export function isCrewmateChatRow(m: ChatMessage): boolean {
   if (MACHINERY_ROLES.has(m.role)) return false
   if (m.role === 'assistant') return isCrewmateSpeech(m)
   if (m.role === 'system') return isStopCard(m)
+  // A crewmate's chat shows messages only, so a `notice` the runtime writes
+  // about its OWN machinery is dropped — an empty-turn recovery card, and the
+  // automation arm/revision/stop refusal, which reaches the crewmate through
+  // its next turn instead (`session_directive_apply`). The drop is by an
+  // ALLOWLIST of those kinds, never by role: a notice the PERSON must act on
+  // (a dropped queued message, a model-fallback hint, a directive-not-applied
+  // warning) has no second route, so it keeps drawing. The Sessions page draws
+  // every notice as today.
+  if (m.role === 'notice') return !isHiddenCrewmateNotice(m)
   // A pending approval is the approval surface and stays; a RESOLVED one draws
   // nothing (its renderer returns null) and must not count as content — kept,
   // it would hide the quiet hint behind a blank chat. Same rule `isRunTransparent`
@@ -119,20 +142,10 @@ export function isCrewmateChatRow(m: ChatMessage): boolean {
   return true
 }
 
-/** The rows a crewmate's chat draws, in transcript order. With `live` (the
- *  slot is running a turn) the progress rows after the newest turn opener are
- *  kept too; the opener is the transcript's own `opensTurn`, so a steer sent
- *  into the running turn does not restart it. Same array identity back when
- *  nothing was dropped, so a memo on the result stays stable. */
-export function filterCrewmateChat(messages: ChatMessage[], live = false): ChatMessage[] {
-  let turnStart = messages.length
-  if (live) {
-    turnStart = 0
-    for (let i = messages.length - 1; i >= 0; i -= 1) {
-      if (opensTurn(messages[i])) { turnStart = i + 1; break }
-    }
-  }
-  const kept = messages.filter((m, i) => isCrewmateChatRow(m) || (i >= turnStart && LIVE_PROGRESS_ROLES.has(m.role)))
+/** The rows a crewmate's chat draws, in transcript order. Same array identity
+ *  back when nothing was dropped, so a memo on the result stays stable. */
+export function filterCrewmateChat(messages: ChatMessage[]): ChatMessage[] {
+  const kept = messages.filter(isCrewmateChatRow)
   return kept.length === messages.length ? messages : kept
 }
 
@@ -149,13 +162,16 @@ function neighbour(messages: ChatMessage[], index: number, dir: -1 | 1): ChatMes
  *  wake or an envelope between two replies is filtered out — so the boundary
  *  is read from the UNFILTERED transcript when the caller passes it: any row
  *  between the two that is not the turn's own machinery ends the turn. Without
- *  a transcript (a host that has none) adjacency in the drawn list is the rule. */
+ *  a transcript (a host that has none) adjacency in the drawn list is the rule.
+ *  A change card or guide offer (`card` rows) is the crewmate's own proposal,
+ *  so it joins the run like a message, grouped with the reply that explains it
+ *  instead of floating between two speakers. */
 function chained(
   a: ChatMessage | undefined,
   b: ChatMessage | undefined,
   transcript: ChatMessage[] | undefined,
 ): boolean {
-  if (!a || !b || !isCrewmateSpeech(a) || !isCrewmateSpeech(b)) return false
+  if (!a || !b || !isRunMember(a) || !isRunMember(b)) return false
   if (!transcript) return true
   const ia = transcript.indexOf(a)
   const ib = transcript.indexOf(b)
@@ -168,6 +184,16 @@ function chained(
     return false
   }
   return true
+}
+
+/** The `card` role a change card or guide offer is written under
+ *  (cards/ConversationCard's CARD_ROLE, restated to keep this module free of
+ *  the card store's imports). */
+const CARD_ROW_ROLE = 'card'
+
+/** A row that belongs to the crewmate's run: its speech, or its own proposal. */
+function isRunMember(m: ChatMessage): boolean {
+  return isCrewmateSpeech(m) || m.role === CARD_ROW_ROLE
 }
 
 /** A completion envelope is a turn boundary WHATEVER role carries it: a
@@ -241,6 +267,12 @@ const BUBBLE_BASE =
 /** Classes for the crewmate's message bubble at `pos`. */
 export function crewmateBubbleClass(pos: CrewmateRunPosition): string {
   return `${BUBBLE_BASE} ${CORNERS[pos]}`
+}
+
+/** The run's corner rule alone, for a surface in the run that draws its own
+ *  box (a change card or guide offer). */
+export function crewmateCornerClass(pos: CrewmateRunPosition): string {
+  return CORNERS[pos]
 }
 
 /** Vertical rhythm of a row. Bubbles inside a run sit close but never touch:

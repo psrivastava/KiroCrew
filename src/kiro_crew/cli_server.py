@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import NoReturn
 
 from kiro_crew import __version__, dep_sync, platform_compat
+from kiro_crew.app_lifecycle_client import _deadline_expired
 from kiro_crew.beacon import distribution, is_default_home
 from kiro_crew.config import KiroCrewConfig
 from kiro_crew.config.loader import (
@@ -48,7 +49,7 @@ from kiro_crew.embeddings import (
     model_file_present,
     store_embedding_space_is_stale,
 )
-from kiro_crew.env import activate_mise
+from kiro_crew.env import activate_mise, resolved_command_casing
 from kiro_crew.frontend import build_frontend_sync, ensure_dev_dist_symlink
 from kiro_crew.gateway_lock import LockProbeError, lock_holder
 from kiro_crew.git_divergence import (
@@ -157,6 +158,12 @@ def _probe_dashboard_health(port: int) -> None:
         pass
 
 
+# How long the token command waits for the gateway to answer. A gateway whose
+# event loop is starved by a CPU-bound thread can take 12-14 s to answer while
+# still being healthy.
+_TOKEN_REQUEST_TIMEOUT = 20.0
+
+
 def _token(args: argparse.Namespace) -> None:
     """Print a dashboard URL with a fresh auth token.
 
@@ -190,7 +197,7 @@ def _token(args: argparse.Namespace) -> None:
         url += f"&embed_parent_port={int(epp)}"
     req = urllib.request.Request(url, headers={"X-Local-Secret": secret})
     try:
-        with loopback_urlopen(req, timeout=5) as resp:
+        with loopback_urlopen(req, timeout=_TOKEN_REQUEST_TIMEOUT) as resp:
             data = json.loads(resp.read())
             token = data.get("token", "")
     except urllib.error.HTTPError as exc:
@@ -207,7 +214,18 @@ def _token(args: argparse.Namespace) -> None:
         )
         sys.exit(1)
     except Exception as exc:
-        print(f"❌ Could not reach gateway on port {port}: {exc}", file=sys.stderr)
+        if _deadline_expired(exc):
+            # Something is listening and took the request, so the gateway is
+            # alive. Saying "could not reach" sends the operator to restart a
+            # healthy gateway. The line names no other probe command: the
+            # status command's own short timeout reports a busy gateway as down.
+            print(
+                f"❌ Gateway on port {port} is up but did not answer within "
+                f"{_TOKEN_REQUEST_TIMEOUT:g} s (busy). Try again in a moment.",
+                file=sys.stderr,
+            )
+        else:
+            print(f"❌ Could not reach gateway on port {port}: {exc}", file=sys.stderr)
         sys.exit(1)
 
     if not token:
@@ -482,6 +500,64 @@ def _verified_loopback_gateway_pids(port: int) -> list[int]:
     if owner is None or owner != os.getuid():
         return []
     return [pid]
+
+
+def _gateway_pid() -> None:
+    """Print this home's gateway-lock holder as one line of JSON, then exit 0.
+
+    Read-only. Resolves the incumbent through :func:`gateway_lock.lock_holder`,
+    the same non-destructive oracle ``stop --expect-pid`` and ``restart`` use,
+    so the answer is **socket-independent**: it names a draining gateway that
+    has already released its listener socket but still holds ``gateway.lock``,
+    which the desktop's own ``lsof``/``netstat`` listener snapshot cannot. Left
+    unhandled, the desktop cannot name the incumbent, refuses to respawn, and
+    sits with no gateway until a human relaunches. The desktop supervisor calls
+    this when its listener snapshot comes up empty, so it can wait for the named
+    pid to exit (releasing the lock) before spawning.
+
+    Output is a single JSON object on stdout, exit code 0 in every case the
+    probe can answer:
+
+    - ``{"holder": "process", "pid": N, "alive": true, "source": "..."}``
+      -- a live holder is named; the caller waits for pid N to exit.
+    - ``{"holder": "nobody"}`` -- the lock is free (or its recorded holder is
+      dead); nothing is holding it, so the caller may spawn at once.
+
+    An indeterminate probe (:class:`gateway_lock.LockProbeError`) splits two
+    ways. When the lock is POSITIVELY held by a gateway that hides its own pid
+    -- a draining gateway whose stamp is unreadable under a Windows mandatory
+    lock -- it prints ``{"holder": "held"}`` and exits 0: a gateway IS alive,
+    so the caller waits for the lock to be released (the gateway to finish
+    exiting) and then spawns, rather than giving up. Otherwise -- the probe
+    could not establish whether the lock is held (an unopenable lock file, an
+    unmeasurable filesystem), or a forked inheritor that nothing ends holds it
+    -- it prints ``{"holder": "indeterminate", "reason": "..."}`` and exits 2:
+    waiting has no end, so the caller must NOT spawn and must not wait
+    unbounded -- it surfaces the terminal error.
+    """
+    try:
+        holder = lock_holder(config_dir())
+    except LockProbeError as exc:
+        if exc.held:
+            # Positively held, holder unnameable: a live gateway (likely still
+            # draining). Name it as held so the caller waits for release.
+            print(json.dumps({"holder": "held", "reason": str(exc)}))
+            return
+        print(json.dumps({"holder": "indeterminate", "reason": str(exc)}))
+        sys.exit(2)
+    if holder.pid is None or not holder.alive:
+        print(json.dumps({"holder": "nobody"}))
+        return
+    print(
+        json.dumps(
+            {
+                "holder": "process",
+                "pid": holder.pid,
+                "alive": holder.alive,
+                "source": holder.source,
+            }
+        )
+    )
 
 
 def _stop_expected_pid(port: int, expect_pid: int) -> None:
@@ -1096,7 +1172,10 @@ def _own_console_script() -> str | None:
     if not path.is_absolute():
         # argv[0] may be a bare name found on PATH ("kirocrew") or a relative
         # path; resolve it the way the shell did.
-        resolved = shutil.which(argv0)
+        # ``resolved_command_casing``: on Windows ``which`` spells the appended
+        # extension as PATHEXT does (``kirocrew.EXE``), and a launcher shim that
+        # dispatches on its own basename refuses that spelling.
+        resolved = resolved_command_casing(shutil.which(argv0))
         if not resolved:
             return None
         # MUST be absolutized. ``shutil.which`` returns an argument that already
@@ -1159,7 +1238,10 @@ def _spawn_detached_gateway(port: int | None = None) -> subprocess.Popen[bytes]:
     # Created 0600, like every file in the data home (owner_only_files).
     log_fh = open(log_path, "a", encoding="utf-8", opener=owner_only_opener)  # noqa: SIM115
 
-    bin_path = _own_console_script() or shutil.which("kirocrew")
+    # The PATH fallback goes through ``resolved_command_casing`` for the same
+    # reason as in ``_own_console_script``: a ``kirocrew.EXE`` spelling makes a
+    # Windows launcher shim exit at once, after the old gateway was stopped.
+    bin_path = _own_console_script() or resolved_command_casing(shutil.which("kirocrew"))
     if bin_path:
         argv: list[str] = [bin_path, "gateway"]
     else:

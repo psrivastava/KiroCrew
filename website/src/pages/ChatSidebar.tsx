@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect, memo, useMemo, useCallback, useId, useContext, Fragment } from 'react'
 import { createPortal } from 'react-dom'
 import { LayoutGroup, AnimatePresence, motion } from 'framer-motion'
-import { Plus, X, Pin, Monitor, ArrowUpDown, Eye, EyeOff, VenetianMask, Ghost, FolderPlus, FolderX, MessageSquare, MessageSquarePlus, Folder, ChevronRight, ChevronDown, ChevronUp, Clock, Pencil, BrushCleaning, Link2, Circle, MoreVertical, Tag as TagIcon, Columns3, CornerDownRight, GripVertical, Check, GitFork, List, ListTree, Loader, Loader2, Settings, RotateCcw, Bot, ExternalLink, Cpu, GitMerge, Workflow, CircleDot, Users, TriangleAlert, Goal, MessageCircleQuestionMark, ShieldCheck, Server, Pause, Play, Hourglass } from 'lucide-react'
+import { Plus, X, Pin, VolumeX, Monitor, ArrowUpDown, Eye, EyeOff, VenetianMask, FolderPlus, FolderX, MessageSquare, MessageSquarePlus, Folder, ChevronRight, ChevronDown, ChevronUp, Clock, Pencil, BrushCleaning, Link2, Circle, MoreVertical, Tag as TagIcon, Columns3, CornerDownRight, GripVertical, Check, GitFork, List, ListTree, Loader, Loader2, Settings, RotateCcw, Bot, ExternalLink, Cpu, GitMerge, Workflow, CircleDot, Users, TriangleAlert, Goal, MessageCircleQuestionMark, ShieldCheck, Server, Pause, Play, Hourglass } from 'lucide-react'
 import GithubLogo from '../components/icons/GithubLogo'
 import GitlabLogo from '../components/icons/GitlabLogo'
 import { FolderBody } from '../components/FolderBody'
@@ -13,7 +13,7 @@ import FolderGlyph from '../components/FolderGlyph'
 import { DndContext, DragOverlay, MeasuringStrategy } from '@dnd-kit/core'
 import { SortableContext, verticalListSortingStrategy } from '@dnd-kit/sortable'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { useNavigate } from 'react-router-dom'
+import { useLocation, useNavigate } from 'react-router-dom'
 import { usePreviewFlag } from '../hooks/usePreviewFlag'
 import { PREVIEW_DASHBOARD } from '../utils/previewFlags'
 import { shallowEqual, useStore } from 'react-redux'
@@ -21,12 +21,13 @@ import { useAppDispatch, useAppSelector } from '../store'
 import type { RootState } from '../store'
 import { useConnected } from '../hooks/useConnected'
 import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuSub, DropdownMenuSubTrigger, DropdownMenuSubContent } from '../components/ui/dropdown-menu'
-import { ContextMenu, ContextMenuTrigger, ContextMenuContent, ContextMenuItem, ContextMenuSeparator, ContextMenuSub, ContextMenuSubTrigger, ContextMenuSubContent } from '../components/ui/context-menu'
+import { ContextMenu, ContextMenuTrigger, ContextMenuContent, ContextMenuItem, ContextMenuSeparator } from '../components/ui/context-menu'
 import { offlineProps } from '../utils/offline'
-import { switchSlot, deleteSlot, fetchHistory, resumeFromHistory, deleteHistorySession, selectSidebarWorkflowActive, selectAutomationForSlot } from '../store/chatSlice'
+import { switchSlot, deleteSlot, fetchHistory, resumeFromHistory, deleteHistorySession, setCloseRefused, selectSidebarWorkflowActive, selectAutomationForSlot } from '../store/chatSlice'
 import { slotIsRemoteBound } from '../store/dashboardSlice'
 import { IS_MAC } from '../hooks/useKeyboardShortcuts'
 import { api, SEARCH_MIN_CHARS } from '../api/client'
+import { isInstancesDisabledError } from '../utils/instancesDisabled'
 import { errMessage } from '../utils/thunkError'
 import { computeRecentRank, recencyTintShadow, clampTintCount } from '../utils/recencyTint'
 import { folderOffersHide } from '../utils/folderVisibility'
@@ -44,14 +45,14 @@ import { useAvailableModelsQuery } from '../hooks/useAvailableModels'
 import { useListboxKeyboard } from '../hooks/useListboxKeyboard'
 import { useDndSensors } from '../hooks/useDndSensors'
 import { useSessionPalette } from '../hooks/useSessionPalette'
-import { ancestorsOf, descendantsOf, orphanCitation } from '../lib/sessionLineage'
+import { ancestorsOf, closedCreatorCitation, descendantsOf, orphanCitation } from '../lib/sessionLineage'
 import { partitionBulkSwitch } from '../lib/bulkModelSwitch'
+import { isEmbeddedPane } from '../lib/embedded'
+import { setCrewEnabled } from '../lib/crewEnabled'
 import { useReducedMotion } from '../hooks/useReducedMotion'
 import { useSimplifiedToolNames } from '../hooks/useSimplifiedToolNames'
 import { useLanguage } from '../i18n/LanguageProvider'
 import { useSessionActions } from '../hooks/useSessionActions'
-import { useCloseSessionTree } from '../hooks/useCloseSessionTree'
-import { sidebarRowBackgroundOnly, sidebarRowRunning } from '../lib/sessionCloseTree'
 import { useChatPopouts } from '../hooks/useChatPopouts'
 import { platformShortcut } from '../utils/platform'
 import { useImeGuard } from '../hooks/useImeGuard'
@@ -94,6 +95,8 @@ import { deriveAutomationStatus, MONITOR_STATUS_KEYS } from '../monitoring/autom
 import MonitorRadar from '../components/MonitorRadar'
 
 import { i18nT } from '../i18n/t'
+import { uiLocation } from '../uiLocations/uiLocation'
+import { useGuideDisclosureScope } from '../guide/GuideRevealScope'
 import { agentOrDefaultLabel } from '../utils/agentLabel'
 import { useLaneScrollMemory } from '../hooks/useLaneScrollMemory'
 import { useScrollEdges } from '../hooks/useScrollEdges'
@@ -101,18 +104,21 @@ import { compareText, fmtDateFields, fmtList } from '../i18n/format'
 import { sidebarCollision } from './chat-sidebar/dnd/collision'
 export { sidebarCollision, isFolderNestBand } from './chat-sidebar/dnd/collision'
 export { boardSidebarWidth } from './chat-sidebar/board'
+import { PrivateChatRow } from './chat-sidebar/PrivateChatRow'
 import { ChatPaneDropZone, RootDropHint, BoardUnfileDropStrip, SortableFolderBlock, SortableSubfolderBlock, SortableColumnFolder, FolderDragGhost, SessionDragGhost } from './chat-sidebar/dnd/targets'
 import type { Slot, SourceLinkState, SidebarSourceLink, HistoryItem, AgentInfo, SessionFilterKey } from './chat-sidebar/types'
 import { FOLDERS_SHELVED_LS_KEY, FLAT_VIEW_LS_KEY } from './chat-sidebar/persistence'
 import { SESSION_FILTERS, useSessionFilterState, useSessionStatusFilters } from './chat-sidebar/filters'
 import { useDebouncedSessionSearch, useSearchMatches } from './chat-sidebar/search'
 import { openCrewWindow, useCrewWindow } from './chat/crew-window/crewWindowStore'
+import { useStableCallbackProps } from './chat/useStableCallbackProps'
 import { sessionRowIdentity, historyRowIdentity } from './chat-sidebar/rowIdentity'
 import { buildSidebarRows, chipLabel, sameRowView, type ConductorRowView, type RowScene, type RowShell, type SessionRowView, type SidebarRows } from './chat-sidebar/rows'
 import { useSessionSources } from './chat-sidebar/sessionSources'
-import { CrewGroupSection, CrewOfflineContext, LocalGroupHeader, useCollapsedCrews } from './chat-sidebar/CrewGroups'
+import { CrewGroupSection, CrewOfflineContext, LocalGroupHeader, crewSpaceChain, useCollapsedCrews, useCollapsedCrewSpaces, useCrewEnable } from './chat-sidebar/CrewGroups'
 import { crewOf, type CrewGroup } from '../hooks/useInstanceSessions'
-import { useSessionRename, useFolderRename } from './chat-sidebar/rename'
+import { useSessionRename, useSessionAutoTitle, useFolderRename } from './chat-sidebar/rename'
+import { useSlotTitleGenerating } from '../hooks/slotTitleGeneration'
 import { useSidebarLane, useLaneCycle, renderedLane } from './chat-sidebar/lanes'
 import { useHistoryPane } from './chat-sidebar/history'
 import { usePinnedSessionOrder, usePinnedOrderAuthority, usePinnedKeyboardReorder } from './chat-sidebar/pinnedOrder'
@@ -127,6 +133,8 @@ import { useLineageAvailable, useConductorLane, citedCreatorOf } from './chat-si
 import { useShortcutOrder } from './chat-sidebar/shortcuts'
 import { useFolderDropOps, useSidebarMoveUndo, useSidebarDragHandlers, useNativeSessionDrag } from './chat-sidebar/dnd/useSidebarDrag'
 import { useSidebarReveal } from './chat-sidebar/reveal'
+import { useHoldPinnedHeaderOnCollapse } from './chat-sidebar/stickyCollapse'
+import { COLLAPSE_FLOOR_ATTR } from './chat-sidebar/collapseFloor'
 import { useFolderChatCreate, useSessionCreate } from './chat-sidebar/create'
 
 /**
@@ -200,6 +208,11 @@ const ROW_STATUS_LINE_MUTED_CLS = `${ROW_STATUS_CLS} text-muted flex items-cente
  *  glyphs outranks another. */
 const ROW_ICON_PX = 10
 
+/** The row-state branches that mean "this session is working right now". The
+ *  title line's live dot lights only when one of these wins the row's state
+ *  resolver, so the dot and the secondary line always name the same state. */
+const LIVE_ROW_STATE_KEYS: ReadonlySet<string> = new Set(['running', 'subagents', 'snapshot_live_work'])
+
 /** Is this click the "open as a tab" modifier gesture? One predicate for every
  *  surface that offers it (session rows, the New button, the folder create
  *  entries), so the platform split cannot drift between them. The split is deliberate: Ctrl+click IS a
@@ -223,18 +236,17 @@ function slotStatusText(detail: ToolStatusDetail | undefined, simplifiedToolName
 }
 
 /** Quiet boundary between manually ordered pins and automatically sorted rows.
- *  Starts 2px left of the row content column: `ml-2` 8 against the root-lane
- *  row pad 10, and inside a folder body `FOLDER_ROW_PAD_CLS` moves it to 7
- *  against the in-folder pad 9 (the `data-pinned-divider` hook). Main had the
- *  same 2px relation (`mx-3` 12 against a 14px pad). `mr-3` keeps the right
- *  edge on the rows' `pr-3`. */
+ *  Starts 2px left of the row content column: `mx-3` 12 against the rows' 14px
+ *  pad (`ROW_BOX_CLS` `pl-3.5`), which is the same pad inside a folder body, so
+ *  no per-body override is needed. `mr-3` keeps the right edge on the rows'
+ *  `pr-3`. */
 function PinnedSessionDivider() {
   return (
     <div
       data-testid="pinned-session-divider"
       data-pinned-divider=""
       aria-hidden="true"
-      className="ml-2 mr-3 my-1 h-[4px] shrink-0 border-y border-border-strong opacity-70"
+      className="mx-3 my-1 h-[4px] shrink-0 border-y border-border-strong opacity-70"
     />
   )
 }
@@ -515,10 +527,10 @@ function SessionSourceChips({ slotKey, links, total, connected, isActive, onOpen
     // The row is a click-to-switch button; never let a chip click reach it,
     // whichever branch we take below.
     e.stopPropagation()
-    // A pointer click focuses the anchor, and the row's action strip is
-    // revealed on focus-within, so a focused chip would pin that strip visible
-    // after the pointer leaves the row. Drop focus on pointer clicks only
-    // (`detail` counts clicks; keyboard activation reports 0) so Enter on a
+    // A pointer click focuses the anchor. The row's action strip reveals on
+    // `:focus-visible`, which a mouse-focused anchor does not normally match;
+    // drop focus on pointer clicks anyway so a stale focus can never pin it.
+    // `detail` counts clicks and keyboard activation reports 0, so Enter on a
     // focused chip leaves focus where a keyboard user expects it.
     if (e.detail > 0) e.currentTarget.blur()
     if (!onOpenSource || !connected || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return
@@ -761,31 +773,34 @@ const FOLDER_BODY_OPEN_PADDING = `2px 0 2px ${FOLDER_BODY_INSET_PX}px`
 const FOLDER_ROW_STICKY_Z = 20
 
 /** The list-view folder body: the connector line (`border-l`) plus the gap after
- *  it, and a tighter left pad (9px, `R_in`) for every row filed inside a folder.
- *  The folder's own line already marks the grouping, so rows under it do not need
- *  the full 10px root-lane pad. 9 and not less: the recency tint paints an accent
- *  stripe up to 7px wide at the row's left edge (`recencyTintShadow`), and 9 keeps
- *  2px between that stripe and the text. The descendant selectors outrank the
- *  rows' own `pl-2.5` / `ml-[10px]` (two classes vs one), and nested bodies apply
- *  the same value, so depth does not compound it. That precedence is proven only
- *  by the measured playwright/sidebar-folder-alignment.spec.ts; the jsdom tests
- *  pin class strings and would stay green if the specificity flipped. The
- *  divider, the dormant
- *  toggle, the empty-folder "new chat" affordance, the pinned divider and the
- *  "N hidden folders" reveal row move with the row so all stay on (the pinned
- *  divider: 2px left of) its content column. Shared by the list-view and
- *  board-view folder bodies. */
-export const FOLDER_ROW_PAD_CLS = '[&_.session-row]:pl-[9px] [&_[data-row-divider]]:ml-[9px] [&_[data-stale-toggle]]:pl-[9px] [&_[data-folder-new-chat]]:pl-[9px] [&_[data-pinned-divider]]:ml-[7px] [&_[data-folder-hidden-reveal]]:pl-[9px]'
-export const FOLDER_BODY_CLS = `relative border-l border-border mb-1 ml-1 pl-[3px] rounded-bl-md ${FOLDER_ROW_PAD_CLS}`
+ *  it. `ml-3` 12 puts the line under the header's glyph (guide 1: P = D + M,
+ *  14 = 2 + 12) and `pl-1` 4 closes guide 2 (name == content). Rows filed inside
+ *  a folder keep the row's own pad (`ROW_BOX_CLS` `pl-3.5`, R = 14 = P), so
+ *  there is no per-body row-pad override and depth does not enter the algebra.
+ *  This is the geometry decided in docs/decisions/
+ *  2026-10-09-folder-glyph-sits-on-its-connector-line.md; `relative` is the
+ *  containing block for `FolderRail`'s hit strip and draws nothing. Shared by
+ *  every list-view folder body. */
+export const FOLDER_BODY_CLS = 'relative border-l border-border mb-1 ml-3 pl-1 rounded-bl-md'
 
-/** The board-view folder body. Its header is not the list header: `paddingLeft`
- *  6, an 11px glyph and `gap-2` 8 put the folder name at 6 + 11 + 8 = 25 from the
- *  header box, against the list header's 3 + 12 + 4 = 19. So the board body keeps
- *  the same row pads (`FOLDER_ROW_PAD_CLS`, R_in 9) and takes a wider body pad:
- *  D 2 + `ml-2` 8 + border 1 + `pl-[5px]` 5 + R_in 9 = 25, rows on the name. The
- *  connector lands at D + 8 = 10, inside the glyph's 6..17 span. Each board
- *  nesting level costs 2 + 8 + 1 + 5 = 16px. */
-export const BOARD_FOLDER_BODY_CLS = `relative border-l border-border ml-2 pl-[5px] ${FOLDER_ROW_PAD_CLS}`
+/** The board-view folder body: `ml-3` (12) + 1px border + `pl-1` (4) lands the
+ *  rows at the same x as #3905's `ml-4` (16 + 1), and the 4px pad is what keeps
+ *  `FolderRail`'s hit strip (-5..3 across the border) off the rows: with no pad
+ *  the strip sits over the first 3px of every row, and a click there folds the
+ *  folder instead of opening the session. The list body has the same clearance.
+ *  Rows inside it carry their own `ROW_BOX_CLS` pad. */
+export const BOARD_FOLDER_BODY_CLS = 'relative border-l border-border ml-3 pl-1'
+
+/** The look shared by the sidebar's in-list text controls: the per-folder dormant
+ *  toggle and the "Show all older sessions" row. Both are buttons that read as
+ *  plain text, so they get one size and one hover fill; at a smaller size with a
+ *  fainter fill the dormant toggle read as a caption, not a control. Padding and
+ *  margins stay per row: the toggle's `px-3` 12 puts its chevron 2px left of the
+ *  session rows' 14px content column, the same relation as the pinned divider,
+ *  in the root lane and inside every folder body alike. */
+export const SIDEBAR_TEXT_CONTROL_CLS = 'text-left text-[12px] text-muted hover:text-accent hover:bg-accent-subtle rounded-md cursor-pointer bg-transparent border-none transition-colors'
+/** The dormant toggle: the shared look plus a full-width flex row for the chevron. */
+export const STALE_TOGGLE_CLS = `w-full flex items-center gap-1.5 px-3 py-0.5 leading-4 ${SIDEBAR_TEXT_CONTROL_CLS}`
 
 /** What a session row can DO: every callback and ref it needs, built ONCE in the
  *  shell and handed to every row, so the row's memo compares one stable reference
@@ -796,9 +811,10 @@ interface SessionRowActions {
   onRenameChange: (value: string) => void
   onRenameCommit: (key: string, value: string) => void
   onRenameCancel: () => void
+  /** The row menu's "Regenerate title": re-derives the title from the
+   *  conversation without making the session active. */
+  onAutoTitle: (key: string) => void
   onDuplicate: (key: string) => void
-  /** The row's ✕. In the nesting conductor lane this is the tree close, so a card
-   *  with sessions under it closes its subtree (see `useCloseSessionTree`). */
   onCloseSession: (key: string) => void
   onMenuCloseAutoFocus: (e: Event) => void
   onSelectSlot?: (key: string) => void
@@ -839,6 +855,61 @@ interface SessionRowProps {
  *  per-slot state (status line, goal loop, queued sub-agents, workflow runs)
  *  is subscribed to HERE, slot-scoped, so a background event re-renders only
  *  the row it belongs to. */
+/** The ONE notice for a failed ['instances'] read issued by the rows'
+ *  runs-elsewhere chips, mounted only where InstanceTabBar is not: an embedded pane (the bar never
+ *  polls there) and a top-level /embed/* route (that layout has no top bar).
+ *  Everywhere else the bar shows the same failure, so a second notice would
+ *  duplicate it. Both surfaces stay silent on exactly one denial, decided by
+ *  the shared `isInstancesDisabledError`: the gateway's own `instances_disabled`
+ *  403 (the feature is simply off). The route's other 403s (non-owner,
+ *  Slack-origin) are real authorization failures and show on both. */
+function RemoteCrewNamesError() {
+  const { pathname } = useLocation()
+  const topBarAbsent = isEmbeddedPane() || pathname.startsWith('/embed/')
+  // Same key and fetcher as the chips, so this observer adds no request.
+  const { error } = useQuery({
+    queryKey: ['instances'],
+    queryFn: () => api.listInstances(),
+    enabled: topBarAbsent,
+  })
+  if (!topBarAbsent || !error || isInstancesDisabledError(error)) return null
+  return (
+    <div className="mx-2 mt-2 shrink-0">
+      <ErrorNotice
+        variant="inline"
+        className="flex-wrap w-full"
+        message={errMessage(error) || i18nT('components.instanceTabBar.instances_load_failed')}
+        askAgent
+        testId="remote-crew-names-error"
+      />
+    </div>
+  )
+}
+
+/** The runs-elsewhere chip of a remote-EXECUTED local row, with the peer's
+ *  display name read from the SHARED ['instances'] cache. Its own component so
+ *  the query observer exists only on rows that are actually bound: an observer
+ *  in every row, even a disabled one, re-registers its options on every row
+ *  render, and each registration is a query-cache event every cache listener
+ *  answers, a per-row cost a full folder pays on each sidebar commit. Falls
+ *  back to the instance id: it is less friendly but it is true, and a blank chip
+ *  would claim the session runs somewhere unnamed. */
+function ExecutorCrewChip({ instanceId }: { instanceId: string }) {
+  const { data } = useQuery({
+    queryKey: ['instances'],
+    queryFn: () => api.listInstances(),
+    enabled: !!instanceId,
+  })
+  const name = data?.instances?.find(i => i.id === instanceId)?.name || instanceId
+  return (
+    <RemoteCrewChip
+      name={name}
+      label={i18nT('pages.chatSidebar.on_instance', { name })}
+      title={i18nT('pages.chatSidebar.runs_on_crew', { name })}
+    />
+  )
+}
+
 const SessionRow = memo(function SessionRow({ view, actions }: SessionRowProps) {
   const {
     slot: s, showDivider, scope, navScope, holdContainer, isActive, isOut, isPinned, isUnread, isRunning,
@@ -847,36 +918,17 @@ const SessionRow = memo(function SessionRow({ view, actions }: SessionRowProps) 
     opensElsewhere, peerId, peerName,
   } = view
   const conductor = view.conductor
-  // A card with sessions under it in the nesting conductor lane closes its whole
-  // subtree, so its ✕ and row menu say how many: the row model's `subtreeCount`
-  // is taken over the lane's kept rows, the same rows the close plans over.
-  // When the press would refuse (this card or a session under it is running),
-  // the ✕ and the menu say so first: muted, "Can't close: N running", and still
-  // pressable, because the press opens the notice that lists who is running.
-  const closeBlockedCount = conductor && conductor.subtreeCount > 0 && conductor.subtreeRunning > 0 ? conductor.subtreeRunning : undefined
-  const closeSessionCount = !closeBlockedCount && conductor && conductor.subtreeCount > 0 ? conductor.subtreeCount + 1 : undefined
-  const closeSessionLabel = closeBlockedCount
-    ? i18nT('pages.chatSidebar.close_blocked', { count: closeBlockedCount })
-    : conductor && conductor.subtreeCount > 0
-      ? i18nT('pages.chatSidebar.close_session_tree', { count: conductor.subtreeCount, total: conductor.subtreeCount + 1 })
-      : undefined
-  // The row menu splits the same reach over two lines: the action, then a muted
-  // line that wraps, so a phone's narrow menu never cuts the sentence off.
-  const closeMenuLabel = closeBlockedCount
-    ? closeSessionLabel
-    : conductor && conductor.subtreeCount > 0
-      ? i18nT('pages.chatSidebar.close_all', { count: conductor.subtreeCount + 1 })
-      : undefined
-  const closeMenuHint = !closeBlockedCount && conductor && conductor.subtreeCount > 0
-    ? i18nT('pages.chatSidebar.close_session_tree_hint', { count: conductor.subtreeCount })
-    : undefined
+  // A card with sessions under it says how far its ✕ reaches: this one session,
+  // never the ones it opened, which stay open and keep running.
+  const closeReachLabel = conductor && conductor.childCount > 0 ? i18nT('pages.chatSidebar.close_this_session_only') : undefined
+  const closeReachHint = conductor && conductor.childCount > 0 ? i18nT('pages.chatSidebar.close_keeps_children_hint') : undefined
   const {
     connected, mode, isMobile, colorMode, defaultAgent, installedAgents, tagById, paletteColors, boost, boostFor,
     recentTintCount, dragInFlight, activeDraggedKey, activeDraggedPinnedIndex,
   } = view.shell
   const {
     onNativeDragStart, onNativeDragEnd, onPinnedKeyboardReorder,
-    renameInputRef, onRenameStart, onRenameChange, onRenameCommit, onRenameCancel,
+    renameInputRef, onRenameStart, onRenameChange, onRenameCommit, onRenameCancel, onAutoTitle,
     onDuplicate, onCloseSession, onMenuCloseAutoFocus, onSelectSlot, onOpenSlotInNewTab, onOpenSource, onOpenPeerSession,
     openElsewhere, toggleConductor,
   } = actions
@@ -885,13 +937,14 @@ const SessionRow = memo(function SessionRow({ view, actions }: SessionRowProps) 
   // (rename, close, fork, drag, the row menu) is withheld exactly as it is for a peer
   // row, because the slot's lifecycle is owned elsewhere.
   const onOpenElsewhere = opensElsewhere != null ? () => openElsewhere(opensElsewhere) : undefined
+  const titleGenerating = useSlotTitleGenerating(s.key)
   // Peer ownership, present only on a row sourced from a connected remote
   // instance. Every local-only affordance below is gated on its ABSENCE rather
   // than disabled: a control that looks actionable and silently does nothing is
   // worse than no control, and none of close / duplicate / rename / reorder can
   // be honoured for a session whose slot lives on another machine.
   //
-  // `peerId`, NOT the `instance_id` that `remoteCrewName` below reads: these two
+  // `peerId`, NOT the `instance_id` that `ExecutorCrewChip` below reads: these two
   // sit in one scope and mean opposite things. This one says the session is not
   // ours; that one says the session IS ours and dispatches elsewhere. It and
   // `peerName` come from the row model's origin check, set on a peer view only.
@@ -915,18 +968,6 @@ const SessionRow = memo(function SessionRow({ view, actions }: SessionRowProps) 
   // i18nT strings must re-translate even when no prop moves.
   const langGen = useLanguageGeneration()
   const dispatch = useAppDispatch()
-  // The peer's display name for the runs-elsewhere chip. Read from the SHARED
-  // ['instances'] cache and enabled only for a row that is actually bound, so a
-  // peerless install never issues the query. Falls back to the instance id: it is
-  // less friendly but it is true, and a blank chip would claim the session runs
-  // somewhere unnamed.
-  const remoteCrewQuery = useQuery({
-    queryKey: ['instances'],
-    queryFn: () => api.listInstances(),
-    enabled: s.executor === 'remote' && !!s.instance_id,
-  })
-  const remoteCrewName =
-    remoteCrewQuery.data?.instances?.find(i => i.id === s.instance_id)?.name || s.instance_id || ''
   const ime = useImeGuard()
   const simplifiedToolNames = useSimplifiedToolNames()
   const uiLang = useLanguage().resolved
@@ -1233,7 +1274,7 @@ const SessionRow = memo(function SessionRow({ view, actions }: SessionRowProps) 
     // being a ternary; here it has to be explicit.
     //
     // The tail is `last_message`, and the `unread` dot rides on it (below).
-    const rowState = ([
+    const rowStateEntry = ([
       {
         // Pending approval outranks running (mirrors the Board's inferLane,
         // which returns its approval lane before the running check), so an owed
@@ -1512,7 +1553,16 @@ const SessionRow = memo(function SessionRow({ view, actions }: SessionRowProps) 
           </div>
         ),
       },
-    ] as const).find(entry => entry.when)?.build() ?? null
+    ] as const).find(entry => entry.when)
+    const rowState = rowStateEntry?.build() ?? null
+    // The title-line live dot reads the WINNING branch of the resolver above, so
+    // it can never disagree with the secondary line: it lights exactly when that
+    // line says the session is working (a turn, started sub-agents, or reconnect
+    // live work). A branch that outranks those wins the line and leaves the title
+    // bare: an owed approval or answer, a loop, a monitor wake, a workflow run or
+    // an interrupted turn each carry their own stronger cue. A queued-only row
+    // has no dot either, because its own branch says nothing has started.
+    const showLiveDot = !!rowStateEntry && LIVE_ROW_STATE_KEYS.has(rowStateEntry.key)
 
     // `unread` sits LAST, so it lights only when nothing else claims the slot.
     // That is stricter than the dot it replaces, which coexisted with the
@@ -1589,22 +1639,15 @@ const SessionRow = memo(function SessionRow({ view, actions }: SessionRowProps) 
       slotKey: rowKey,
       mode,
       onRename: () => onRenameStart(rowKey, scope, rowTitle && rowTitle !== rowKey ? rowTitle : '', true),
+      onAutoTitle: () => onAutoTitle(rowKey),
       onOpenInNewTab: onOpenSlotInNewTab ? () => onOpenSlotInNewTab(rowKey) : undefined,
-      // The same close the row's ✕ performs, also scoped to the conductor lane:
-      // `treeClose` resolves to `closeSessionTree` there and `sessionActions.close`
-      // everywhere else, so the menu never silently collapses a subtree that is
-      // not visible in the current lane.
-      onClose: onCloseSession,
-      // When the conductor lane shows a card with nested sessions, the menu's
-      // Close item does what the ✕ does: close the whole subtree. Give it the
-      // same scoped label so the user knows what the press reaches.
-      closeLabel: closeMenuLabel,
-      closeHint: closeMenuHint,
-      closeMuted: closeBlockedCount != null,
       // A row menu opens from inside this panel, where the folder-order banner
       // (when there is one) sits over the tree -- the menu need not repeat it.
       sidebarOnScreen: true,
-    }), [rowKey, mode, onRenameStart, scope, rowTitle, onOpenSlotInNewTab, onCloseSession, closeMenuLabel, closeMenuHint, closeBlockedCount])
+      // On a card with sessions under it, the menu's Close says it reaches this
+      // one session only, as visible text: a phone has no hover tooltip.
+      closeHint: closeReachHint,
+    }), [rowKey, mode, onRenameStart, onAutoTitle, scope, rowTitle, onOpenSlotInNewTab, closeReachHint])
     const rowActions = useMemo(() => (void langGen, !renamingHere && !foreignRow ? (isMobile ? (
       <div className="absolute top-1/2 -translate-y-1/2 right-1.5 flex items-center gap-0.5">
         <DropdownMenu>
@@ -1617,43 +1660,24 @@ const SessionRow = memo(function SessionRow({ view, actions }: SessionRowProps) 
         </DropdownMenu>
       </div>
     ) : (
-      <IconButtonGroup reveal className="absolute top-1/2 -translate-y-1/2 right-1.5 has-[[data-state=open]]:opacity-100">
-        <DropdownMenu>
+      // The open session's row keeps its actions shown, so a guide can point
+      // at its ⋯ (sessions.row-menu, resolved to the open row's copy) with no
+      // pointer on the row.
+      <IconButtonGroup className={`absolute top-1/2 -translate-y-1/2 right-1.5 opacity-0 group-hover:opacity-100 [@media(hover:none)]:opacity-100 group-focus-visible:opacity-100 group-has-[:focus-visible]:opacity-100 has-[[data-state=open]]:opacity-100 ${isActive ? '!opacity-100' : ''}`}>
+        <DropdownMenu guideScope="menu:sessions.row-menu">
           <DropdownMenuTrigger asChild>
-            <IconButton title={i18nT('pages.chatSidebar.more')} aria-label={i18nT('pages.chatSidebar.more_options')} onMouseDown={e => e.stopPropagation()} onClick={e => e.stopPropagation()}><MoreVertical size={12} /></IconButton>
+            <IconButton title={i18nT('pages.chatSidebar.more')} aria-label={i18nT('pages.chatSidebar.more_options')} {...uiLocation('sessions.row-menu')} onMouseDown={e => e.stopPropagation()} onClick={e => e.stopPropagation()}><MoreVertical size={12} /></IconButton>
           </DropdownMenuTrigger>
           <DropdownMenuContent align="end" className="min-w-[160px]" onClick={e => e.stopPropagation()} onCloseAutoFocus={onMenuCloseAutoFocus}>
             <SessionActionsMenu variant="dropdown" {...rowMenuProps} />
           </DropdownMenuContent>
         </DropdownMenu>
-        <IconButton variant="accent" title={i18nT('pages.chatSidebar.duplicate')} aria-label={i18nT('pages.chatSidebar.duplicate')} onMouseDown={e => e.stopPropagation()} onClick={e => { e.stopPropagation(); onDuplicate(rowKey) }}><GitFork size={12} /></IconButton>
-        <IconButton variant={closeBlockedCount ? 'default' : 'danger'} title={closeSessionLabel ?? i18nT('pages.chatSidebar.close')} aria-label={closeSessionLabel ?? i18nT('pages.chatSidebar.close_session')} onMouseDown={e => e.stopPropagation()} onClick={e => { e.stopPropagation(); onCloseSession(rowKey) }} className={closeBlockedCount ? 'flex shrink-0 items-center gap-0.5 whitespace-nowrap opacity-60' : closeSessionCount ? 'flex shrink-0 items-center gap-0.5 whitespace-nowrap' : undefined} data-testid={closeBlockedCount ? 'row-close-blocked' : closeSessionCount ? 'row-close-tree' : undefined} aria-describedby={closeSessionCount ? `row-close-hint-${rowKey}` : undefined}>
-          <X size={12} />
-          {closeBlockedCount ? (
-            <span aria-hidden="true" className="text-[11px] font-semibold leading-none tabular-nums" data-testid="row-close-blocked-label">
-              {i18nT('pages.chatSidebar.close_blocked_short', { count: closeBlockedCount })}
-            </span>
-          ) : null}
-          {/* The reach, on the button itself: it reads "Close 5" whenever it is
-              shown. A bare count read as an unread or alert badge, and the word
-              alone hid that the press reaches more than this one session.
-              Decorative for a screen reader, which already hears the full label. */}
-          {closeSessionCount ? (
-            <span className="flex items-baseline gap-1 text-[11px] font-semibold leading-none tabular-nums">
-              <span aria-hidden="true" data-testid="row-close-word">{i18nT('pages.chatSidebar.close')}</span>
-              <span aria-hidden="true" data-testid="row-close-count">{closeSessionCount}</span>
-              {/* What the number counts, for a screen reader: read as the
-                  button's description after its full label. */}
-              <span id={`row-close-hint-${rowKey}`} className="sr-only" data-testid="row-close-hint">
-                {i18nT('pages.chatSidebar.close_count_hint', { count: closeSessionCount })}
-              </span>
-            </span>
-          ) : null}
-        </IconButton>
+        <IconButton variant="accent" title={i18nT('pages.chatSidebar.duplicate')} aria-label={i18nT('pages.chatSidebar.duplicate')} {...uiLocation('sessions.row-duplicate')} onMouseDown={e => e.stopPropagation()} onClick={e => { e.stopPropagation(); onDuplicate(rowKey) }}><GitFork size={12} /></IconButton>
+        <IconButton variant="danger" title={closeReachLabel ?? i18nT('pages.chatSidebar.close')} aria-label={closeReachLabel !== undefined ? i18nT('pages.chatSidebar.close_this_session_only') : i18nT('pages.chatSidebar.close_session')} {...uiLocation('sessions.row-close')} onMouseDown={e => e.stopPropagation()} onClick={e => { e.stopPropagation(); onCloseSession(rowKey) }}><X size={12} /></IconButton>
       </IconButtonGroup>
     )) : null
     // `langGen` (read with `void` above) because the labels are i18nT strings, which re-translate on a catalog load.
-    ), [renamingHere, foreignRow, isMobile, rowMenuProps, onMenuCloseAutoFocus, onDuplicate, onCloseSession, closeSessionLabel, closeSessionCount, closeBlockedCount, rowKey, langGen])
+    ), [renamingHere, foreignRow, isMobile, isActive, rowMenuProps, onMenuCloseAutoFocus, onDuplicate, onCloseSession, closeReachLabel, rowKey, langGen])
     const rowContextMenuContent = useMemo(() => (void langGen, !foreignRow ? (
       <ContextMenuContent className="min-w-[160px]" onClick={e => e.stopPropagation()} onCloseAutoFocus={onMenuCloseAutoFocus}>
         <SessionActionsMenu variant="context" {...rowMenuProps} />
@@ -1896,7 +1920,7 @@ const SessionRow = memo(function SessionRow({ view, actions }: SessionRowProps) 
            *  The alignment guides are untouched: the gutter was out of flow and
            *  contributed nothing to the content column, so removing it moves no x —
            *  see ChatSidebar.folderAlignment.test.tsx, which still asserts the
-           *  row's `pl-2.5` is the content column's whole left offset. */}
+           *  row's `pl-3.5` is the content column's whole left offset. */}
           {/* The conductor lane's indent and chevron, INSIDE the row. Two reasons they
            *  are here rather than in a wrapper around the card: the divider is a
            *  sibling of this row, so it keeps spanning the full width at every depth;
@@ -2082,13 +2106,7 @@ const SessionRow = memo(function SessionRow({ view, actions }: SessionRowProps) 
                *  is first on a federated search row: it qualifies the whole row,
                *  so a user scanning the list should meet it before the per-session
                *  flags that only make sense once you know where the session is. */}
-              {s.executor === 'remote' && !inCrewGroup && (
-                <RemoteCrewChip
-                  name={remoteCrewName}
-                  label={i18nT('pages.chatSidebar.on_instance', { name: remoteCrewName })}
-                  title={i18nT('pages.chatSidebar.runs_on_crew', { name: remoteCrewName })}
-                />
-              )}
+              {s.executor === 'remote' && !inCrewGroup && <ExecutorCrewChip instanceId={s.instance_id || ''} />}
               {s.memory_mode === 'incognito' && <span className="text-muted" title={i18nT('pages.chatSidebar.incognito_no_memory_writes')}><EyeOff size={10} /></span>}
               {s.memory_mode === 'temporary' && <span className="text-aim" title={i18nT('pages.chatSidebar.temporary_no_memory_reads_or_writes')}><VenetianMask size={10} /></span>}
               {/* Trailing meta grouped under ONE ml-auto: two sibling auto
@@ -2102,7 +2120,7 @@ const SessionRow = memo(function SessionRow({ view, actions }: SessionRowProps) 
                *  both read as a stutter. Folder membership is carried by the tree
                *  itself in folder view; in flat view the row's own context menu
                *  still names it. */}
-              {slotActivityTs(s) || isPinned || conductorMeta ? (
+              {slotActivityTs(s) || isPinned || s.muted || conductorMeta ? (
                 <span className="ml-auto inline-flex items-center gap-1 shrink-0">
                   {/* FIRST in the group, so it sits immediately left of the timestamp
                    *  and the timestamp keeps the position it has in every other lane.
@@ -2113,6 +2131,9 @@ const SessionRow = memo(function SessionRow({ view, actions }: SessionRowProps) 
                   {/* Last in the row: the pin is a state marker, not a label, so
                    *  it sits after the text that reads left-to-right rather than
                    *  pushing the agent name off its own start edge. */}
+                  {/* At rest, not hover-only: a muted session must read differently
+                   *  from a quiet one. Beside the pin, the other state marker. */}
+                  {s.muted && <span className="shrink-0" data-testid="session-row-muted" role="img" aria-label={i18nT('pages.chatSidebar.muted')} title={i18nT('pages.chatSidebar.muted')}><VolumeX size={10} className="text-muted" /></span>}
                   {isPinned && <span className="shrink-0" title={i18nT('pages.chatSidebar.pinned')}><Pin size={10} className="text-accent" /></span>}
                 </span>
               ) : null}
@@ -2122,12 +2143,10 @@ const SessionRow = memo(function SessionRow({ view, actions }: SessionRowProps) 
                 secondary line down by a full line box on some rows, which is what
                 made the list read as ragged. The full string stays reachable
                 through the `title` attribute, and the rename box below is the one
-                place it is shown in full. On a touch screen the row's buttons stay
-                shown, so a card with "Close 5" reserves room for it and the title
-                truncates first, never the control. */}
+                place it is shown in full. */}
             <div
               data-session-title
-              className={`${ROW_TITLE_CLS} font-semibold text-text ${renamingHere ? '' : 'truncate'}${(closeSessionCount || closeBlockedCount) && !isMobile ? ' [@media(hover:none)]:pr-24' : ''}`}
+              className={`${ROW_TITLE_CLS} font-semibold text-text ${renamingHere ? '' : 'truncate'}`}
               title={s.title && s.title !== s.key ? s.title : s.key}
             >
               {/* No separate fork glyph: forked titles already carry the
@@ -2138,7 +2157,23 @@ const SessionRow = memo(function SessionRow({ view, actions }: SessionRowProps) 
                   A separate ↳ glyph also double-stacked into "↳↳ Fork of …". */}
               {renamingHere ? (
                 <textarea ref={renameInputRef} rows={1} className={`w-full bg-bg-elevated border border-accent rounded px-1 py-0 ${ROW_TITLE_CLS} text-text-strong outline-hidden select-text resize-none block overflow-hidden focus-ring`} value={renameValue} onChange={e => onRenameChange(e.target.value)} {...ime.bindEnter<HTMLTextAreaElement>({ onEnter: () => { (document.activeElement as HTMLTextAreaElement)?.blur() }, onEscape: onRenameCancel, onBlur: () => onRenameCommit(s.key, renameValue) })} onMouseDown={e => e.stopPropagation()} />
-              ) : (s.title && s.title !== s.key ? s.title : s.key)}
+              ) : (
+                <>
+                  {/* The live dot leads the name, where the eye lands when
+                      scanning a long list. It carries the row's working state
+                      on its own (the status line below may be truncated or
+                      read separately), so it keeps a real accessible name. */}
+                  {showLiveDot && (
+                    <span className="session-live-dot animate-pulse" role="img" aria-label={i18nT('pages.chatSidebar.running_marker')} title={i18nT('pages.chatSidebar.running_marker')} data-testid="session-live-dot" />
+                  )}
+                  {/* A menu-started Regenerate title closes its menu at once, so
+                      the row itself says the model call is running. */}
+                  {titleGenerating && (
+                    <Loader size={ROW_ICON_PX} className="lucide-inline mr-1 shrink-0 text-accent animate-spin" role="img" aria-label={i18nT('pages.chatPage.regenerating_title')} data-testid="row-title-generating" />
+                  )}
+                  {s.title && s.title !== s.key ? s.title : s.key}
+                </>
+              )}
             </div>
             {/* Secondary line: one ordered resolver decides both the words and the
                 marker leading them (#3830), so the two can no longer disagree.
@@ -2172,7 +2207,8 @@ const SessionRow = memo(function SessionRow({ view, actions }: SessionRowProps) 
           </div>
           {/* Hide the hover action popup (⋯ / duplicate / close) while THIS slot
            *  is being renamed: it is absolute-positioned at right-1.5 and reveals
-           *  on focus-within, so the focused rename input would otherwise make it
+           *  on `:focus-visible` inside the row, which a focused text input
+           *  always matches, so the rename input would otherwise make it
            *  pop up and overlap the input's right edge. Mirrors the folder-header
            *  guard below (!(editingId === folder.id && editScope === 'list')). */}
           {/* A PEER-OWNED row shows NO action group at all: every entry in it
@@ -2194,7 +2230,7 @@ const SessionRow = memo(function SessionRow({ view, actions }: SessionRowProps) 
          *  the row instead. Matches the Figma, which carries this border on the
          *  `content` frame rather than on the row.
          *
-         *  10px is the row's content offset: the row's whole `pl-2.5`, since
+         *  14px is the row's content offset: the row's whole `pl-3.5`, since
          *  nothing else lives in that pad. The right inset is the row's own
          *  padding. */}
         {/* `-mt-px` so the rule does NOT add a row of layout height. In flow it made
@@ -2203,7 +2239,7 @@ const SessionRow = memo(function SessionRow({ view, actions }: SessionRowProps) 
          *  60 and 61 on one list), which no fixed row height can compensate for.
          *  Overlaying the row's last pixel keeps the pitch equal to the row height.
          *  The left inset is unchanged — it still starts at the content x. */}
-        {showDivider && <div data-row-divider="" className="ml-[10px] mr-3 -mt-px border-b border-border" />}
+        {showDivider && <div data-row-divider="" className="ml-[14px] mr-3 -mt-px border-b border-border" />}
       </motion.div>
         )}
       </DndDroppable>
@@ -2416,6 +2452,12 @@ function ChatSidebar({
     historySearchResults, instancesList, instanceSessions, remoteSessionsError, allRows, allLiveSlots,
     selectInstance, crewGroups,
   } = useSessionSources({ historyFilter, slotTitleDigest, localSlots })
+  // Whether any row renders a runs-elsewhere chip, i.e. whether this sidebar
+  // issues the ['instances'] read that RemoteCrewNamesError reports on.
+  const hasRemoteExecutedRow = useMemo(
+    () => allRows.some(r => r.executor === 'remote' && !!r.instance_id),
+    [allRows],
+  )
   // Opening a crew row is local and instant: the window reads the peer's slot
   // itself, so nothing is created here and there is nothing to wait on.
   const crewWindow = useCrewWindow()
@@ -2474,6 +2516,7 @@ function ChatSidebar({
     suppressMenuRestoreRef, onRenameStart, onRenameChange, onRenameCancel, onRenameCommit,
     onMenuCloseAutoFocus,
   } = useSessionRename({ dispatch, store, queryClient })
+  const { autoTitleError, setAutoTitleError, onAutoTitle } = useSessionAutoTitle({ dispatch, store })
   // Folder create / settings modal target. One modal instance is rendered at the
   // sidebar root, so — unlike the inline inputs it replaced — it needs no column
   // scope: a folder rendered in several board columns can only have one modal.
@@ -2491,6 +2534,7 @@ function ChatSidebar({
     filterHiddenFolders, setFilterHiddenFolders, toggleFolderFilter, unhideFolderChain,
     showAllFolders, filterTagIds, toggleTagFilter, clearTagFilter, foldersShelved, setFoldersShelved,
     toggleFoldersShelved, toggleFilter, disableFilter, enableFilter,
+    hiddenFilters, toggleHideFilter, clearHiddenFilters,
   } = useSessionFilterState()
   const {
     slotsLoaded, workflowActiveSet, automationRunningSet, subagentCounts, subagentStartedCounts, subagentApprovalCounts, unreadSet,
@@ -2700,8 +2744,8 @@ function ChatSidebar({
             if (next.has(containerId)) next.delete(containerId); else next.add(containerId)
             return next
           })}
-          data-stale-toggle="" className="w-full flex items-center gap-1.5 pl-2.5 pr-3 py-0.5 rounded-md text-[11px] leading-4 text-muted hover:text-accent hover:bg-bg-hover transition-all bg-transparent border-none cursor-pointer text-left">
-          <DisclosureChevron open={open} size={11} />
+          data-stale-toggle="" className={STALE_TOGGLE_CLS}>
+          <DisclosureChevron open={open} size={12} />
           <span id={lblId} className="tabular-nums">{label}</span>
           <span id={ctxId} className="sr-only">{containerName
             ? i18nT('pages.chatSidebar.stale_collapse_ctx_in_name', { name: containerName })
@@ -2732,7 +2776,8 @@ function ChatSidebar({
         type="button"
         data-testid={`older-sessions-hint-${lane}`}
         onClick={openHistoryPane}
-        className="mt-1 mx-1 px-2 py-1.5 text-left text-[12px] text-muted hover:text-accent hover:bg-accent-subtle rounded-md cursor-pointer bg-transparent border-none transition-colors"
+        {...uiLocation('sessions.show-all-older')}
+        className={`mt-1 mx-1 px-2 py-1.5 ${SIDEBAR_TEXT_CONTROL_CLS}`}
       >
         {i18nT('pages.chatSidebar.show_all_older_sessions')}
       </button>
@@ -2852,17 +2897,17 @@ function ChatSidebar({
     filters: {
       tags: { resolved: activeTagIds, raw: filterTagIds },
       search: { text: slotFilter, folderMatches: folderNameMatchIds },
-      status: { active: activeFilters, paused: filtersPaused, recentWindowMs },
+      status: { active: activeFilters, hidden: hiddenFilters, paused: filtersPaused, recentWindowMs },
       folders: { hiddenSubtree: filterHiddenSubtree, active: folderFilterActive },
     },
-    clears: { tags: clearTagFilter, search: clearSearch, status: clearAllFilters, folder: clearFolderHide },
+    clears: { tags: clearTagFilter, search: clearSearch, status: clearAllFilters, folder: clearFolderHide, hides: clearHiddenFilters },
     crewGroups: shownCrewGroups,
     sortKey,
     clock: Date.now,
     frozen: dragFrozen,
   }, previousRowsRef.current)
   previousRowsRef.current = sidebarRows
-  const { listNarrowed, revealBlockingFilters, laneOrder, isRowFolderHidden } = sidebarRows
+  const { listNarrowed, revealBlockingFilters, laneOrder, isRowFolderHidden, isRowStatusHidden } = sidebarRows
   // `laneSlots` is the Local lanes' rows: `filteredSlots` minus every row a crew
   // group holds. `shownCrewRows` is each crew group's rows, the folder hide applied.
   const {
@@ -2871,6 +2916,10 @@ function ChatSidebar({
   } = sidebarRows.lanes
   const filterCounts = sidebarRows.statusCounts
   const [collapsedCrews, toggleCrewCollapsed, expandCrew] = useCollapsedCrews()
+  const [collapsedSpaces, toggleSpaceCollapsed, expandSpaces] = useCollapsedCrewSpaces()
+  const enableCrew = useCallback((id: string) => setCrewEnabled(dispatch, id, true)
+    .finally(() => { void queryClient.invalidateQueries({ queryKey: ['instances'] }) }), [dispatch, queryClient])
+  const crewEnable = useCrewEnable(enableCrew, id => instancesList.find(i => i.id === id)?.name || id)
 
   const { hoverPinRef, heldDisplacedRef, releaseHoverPin, heldLane, onRootPointerOver } = useHoverHold()
 
@@ -2927,7 +2976,8 @@ function ChatSidebar({
   // Reduced motion disables every row. Otherwise renderSessionRow enrolls only
   // the first SIDEBAR_DISPLACEMENT_WINDOW paint positions in layout projection,
   // bounding Framer's measurement set without a total-list-size cliff.
-  const rowAnimEnabled = !reduceMotion
+  // `rowAnimEnabled` itself is derived below the pinned-header hold, which
+  // also turns it off (see `instantCloseId`).
 
   const {
     isFolderFilteredOut, revealedContainers, toggleReveal, hiddenByContainer, allHiddenFolders,
@@ -2936,35 +2986,20 @@ function ChatSidebar({
   const {
     citedCreatorExists, conductorRows, conductorMatching, lineage, conductorExpanded, toggleConductorExpanded,
     expandConductorAncestors,
-  } = useConductorLane({ conductorLaneActive, allRows, allLiveSlots, isRowFolderHidden, laneOrder, flatSlots })
-  // The rows the conductor lane may show, by identity: every match, plus each
-  // ancestor a match needs to hang from. The lane draws exactly these, the ✕
-  // label counts exactly these, and the tree close plans over exactly these, so
-  // a press can never reach a worker the filter or a hidden folder kept off screen.
-  const conductorKept = useMemo(() => {
-    const kept = new Set<string>()
-    if (!lineage) return kept
-    const onLane = new Set(conductorRows.map(s => sessionRowIdentity(s)))
-    for (const id of conductorMatching) {
-      if (!onLane.has(id)) continue
-      kept.add(id)
-      for (const up of ancestorsOf(id, lineage.parentOf)) kept.add(up)
-    }
-    return kept
-  }, [lineage, conductorRows, conductorMatching])
-  const conductorSearching = slotFilter.trim() !== ''
-  const treeCloseRows = useMemo(
-    () => localSlots.filter(s => conductorKept.has(sessionRowIdentity(s))),
-    [localSlots, conductorKept],
-  )
+  } = useConductorLane({ conductorLaneActive, allRows, allLiveSlots, isRowFolderHidden, isRowStatusHidden, laneOrder, flatSlots })
   // Reveal opens the crew group holding the target, then the lane's own ancestors.
   // Looked up in `allRows`: the reveal may be clearing the filter that hides it.
   const expandRevealAncestors = useCallback((identity: string) => {
     const row = allRows.find(s => sessionRowIdentity(s) === identity)
     const crew = row ? crewOf(row) : undefined
-    if (crew && shownCrewRows.has(crew)) expandCrew(crew)
+    if (crew && shownCrewRows.has(crew)) {
+      expandCrew(crew)
+      // And the crew's own spaces above the row, so the reveal lands on it.
+      const folders = shownCrewGroups.find(g => g.id === crew)?.folders ?? []
+      expandSpaces(...crewSpaceChain(crew, folders, row?.peer_folder_id))
+    }
     expandConductorAncestors(identity)
-  }, [allRows, shownCrewRows, expandCrew, expandConductorAncestors])
+  }, [allRows, shownCrewRows, shownCrewGroups, expandCrew, expandSpaces, expandConductorAncestors])
 
   const {
     availableLanes, nextLane, laneSwitchLabel, cycleLane,
@@ -2980,6 +3015,19 @@ function ChatSidebar({
   const {
     createFolderMutation, deleteFolderMutation, updateFolderMutation, toggleCollapse,
   } = useFolderMutations({ queryClient, setFolderActionError, folders })
+  // The list view's toggle. Its folder headers are sticky, so a collapse also
+  // moves the lane to keep a pinned header where it is painted, in the commit
+  // that hides the body (see stickyCollapse.ts); `from` is the pressed control,
+  // inside the folder block.
+  const { armHold, disarm: disarmHold, instantCloseId } = useHoldPinnedHeaderOnCollapse(laneScrollRef, folders)
+  // A collapse from a pinned header takes the reduced-motion path for its one
+  // commit (`instantCloseId`, see stickyCollapse.ts).
+  const rowAnimEnabled = !reduceMotion && instantCloseId === null
+  const toggleListFolderCollapse = (folder: ChatFolder, from: HTMLElement) => {
+    if (folder.collapsed) disarmHold()
+    else armHold(folder.id, from.closest<HTMLElement>('[data-folder-drop]'))
+    toggleCollapse(folder.id)
+  }
 
   const { clearBoardCollapse, boardFolderCollapsed, toggleColumnCollapse } = useBoardFolderCollapse()
 
@@ -3023,34 +3071,9 @@ function ChatSidebar({
   // each behaviour has one definition. Rename + Tags stay local (they drive this
   // component's inline-edit + tag-popover state).
   const sessionActions = useSessionActions(mode)
-  // The row ✕ closes the card AND the sessions nested under it, so on a lead it can
-  // end several workers' turns at once. `useCloseSessionTree` owns that: it plans the
-  // subtree from the same lineage edges this lane nests by, asks before destroying
-  // work still in flight, and falls back to `sessionActions.close` verbatim for a card
-  // with nothing under it. `runningSet` is passed as the predicate so the
-  // dialog marks exactly the rows the lane draws as running.
-  // Passed plain, not memoized: the hook reads its inputs through a ref so that
-  // `closeSessionTree` keeps one identity for the sidebar's life, which is what
-  // lets it ride into each row's memoized menu props without busting the row memo.
-  // `subagentCounts[s.key] > 0`: a worker whose own turn has ended while its
-  // background subagent is still working looks idle to `runningSet`, but it has
-  // active work that the tree close would silently cancel. Include it in the
-  // guard so those workers block the cascade the same way a running turn does.
-  const { closeSessionTree, closeTreeDialog, closeTreeError, closeTreeNotice } = useCloseSessionTree({
-    rows: treeCloseRows,
-    allRows: localSlots,
-    isRunning: (s: Slot) => sidebarRowRunning(s, runningSet, subagentCounts),
-    isBackgroundOnly: (s: Slot) => sidebarRowBackgroundOnly(s, runningSet, subagentCounts),
-    closeOne: sessionActions.close,
-    // The still-running notice links each running session to itself, opened the
-    // same way a press on its row opens it, so the person can stop it there.
-    openOne: (key: string) => { dispatch(switchSlot({ key, announceOnMissing: true })); onSelectSlot?.(key) },
-  })
-  // The tree-close guard is scoped to the conductor lane while it nests: tree
-  // nesting is only visible there. In the flat, folder and board lanes, and in the
-  // conductor lane while a search flattens it, the user sees no nested structure,
-  // so pressing ✕ on a session closes exactly that one session.
-  const treeClose = conductorLaneActive && !conductorSearching ? closeSessionTree : sessionActions.close
+  // The last close the server refused, from any close path (this sidebar, a
+  // session menu elsewhere, Cmd+W): `deleteSlot` records it so none drops it.
+  const closeRefused = useAppSelector(st => st.chat.closeRefused)
   // Which sessions are currently open in a popped-out window (shared singleton).
   const { poppedOut } = useChatPopouts()
   const {
@@ -3237,7 +3260,7 @@ function ChatSidebar({
           {/* List-view parity: an empty folder's row keeps its action cluster
             *  visible (see the note in renderFolderHeader). */}
           {!(editingId === folder.id && editScope === columnId) && (
-          <span className={`${emptyBody ? '' : 'opacity-0 '}group-hover:opacity-100 [@media(hover:none)]:opacity-100 group-focus-within:opacity-100 focus-within:opacity-100 has-[[data-state=open]]:opacity-100 transition-opacity flex items-center gap-0.5`}>
+          <span className={`${emptyBody ? '' : 'opacity-0 '}group-hover:opacity-100 [@media(hover:none)]:opacity-100 group-focus-visible:opacity-100 group-has-[:focus-visible]:opacity-100 has-[[data-state=open]]:opacity-100 transition-opacity flex items-center gap-0.5`}>
             {/* ⋯ menu + a primary "new chat in folder" action, mirroring the
              *  list-view folder header (renderFolderHeader) so board view has
              *  the same one-click way to start a session inside a folder. */}
@@ -3250,37 +3273,15 @@ function ChatSidebar({
               <DropdownMenuContent align="start" className="min-w-[180px]" onClick={e => e.stopPropagation()} onCloseAutoFocus={onMenuCloseAutoFocus}>
                 <DropdownMenuItem onClick={() => { suppressMenuRestoreRef.current = true; setEditingId(folder.id); setEditScope(columnId); setEditName(folder.name) }}><Pencil size={13} /> {i18nT('pages.chatSidebar.rename')}</DropdownMenuItem>
                 <DropdownMenuItem data-testid={`col-${columnId}-folder-${folder.id}-new-sub`} onClick={() => { setFolderModal({ mode: 'create', parentId: folder.id }) }}><FolderPlus size={13} /> {i18nT('pages.chatSidebar.new_subfolder')}</DropdownMenuItem>
-                {(() => {
-                  const rows = (
-                    <>
-                      {/* Menu create entries take NO open-in-tab gesture (#10575,
-                       *  scoped out): a menu closes on select, and Radix keyboard
-                       *  activation synthesizes a modifier-free click, so the
-                       *  gesture would be mouse-only and undiscoverable. */}
-                      <DropdownMenuItem data-testid={`col-${columnId}-folder-${folder.id}-new-incognito`} onClick={() => { createChatInFolder(folder.id, { columnId, memoryMode: 'incognito' }) }}><EyeOff size={13} className="text-warn" /> {i18nT('components.welcomeView.incognito')}</DropdownMenuItem>
-                      <DropdownMenuItem data-testid={`col-${columnId}-folder-${folder.id}-new-temporary`} onClick={() => { createChatInFolder(folder.id, { columnId, memoryMode: 'temporary' }) }}><VenetianMask size={13} className="text-aim" /> {i18nT('components.welcomeView.temporary')}</DropdownMenuItem>
-                    </>
-                  )
-                  // A flyout has nowhere to open at phone width, so inline the rows
-                  // under a caption there instead (parity with the + New menu).
-                  if (isMobile) {
-                    return (
-                      <>
-                        <DropdownMenuLabel className="text-[11px] uppercase tracking-[.04em] flex items-center gap-2"><Ghost size={13} className="text-muted" /> {i18nT('pages.chatSidebar.new_ephemeral_chat')}</DropdownMenuLabel>
-                        {rows}
-                      </>
-                    )
-                  }
-                  return (
-                    <DropdownMenuSub>
-                      <DropdownMenuSubTrigger data-testid={`col-${columnId}-folder-${folder.id}-new-ephemeral`}>
-                        <Ghost size={13} className="text-muted" /> {i18nT('pages.chatSidebar.new_ephemeral_chat')}
-                        <ChevronRight size={13} className="ml-auto text-muted" />
-                      </DropdownMenuSubTrigger>
-                      <DropdownMenuSubContent>{rows}</DropdownMenuSubContent>
-                    </DropdownMenuSub>
-                  )
-                })()}
+                {/* Menu create entries take NO open-in-tab gesture (#10575,
+                 *  scoped out): a menu closes on select, and Radix keyboard
+                 *  activation synthesizes a modifier-free click, so the
+                 *  gesture would be mouse-only and undiscoverable. Listed flat,
+                 *  same as the list-view folder menu (renderFolderMenuItems). */}
+                <DropdownMenuSeparator />
+                <DropdownMenuItem className="items-start" data-testid={`col-${columnId}-folder-${folder.id}-new-incognito`} onClick={() => { createChatInFolder(folder.id, { columnId, memoryMode: 'incognito' }) }}><PrivateChatRow kind="incognito" /></DropdownMenuItem>
+                <DropdownMenuItem className="items-start" data-testid={`col-${columnId}-folder-${folder.id}-new-temporary`} onClick={() => { createChatInFolder(folder.id, { columnId, memoryMode: 'temporary' }) }}><PrivateChatRow kind="temporary" /></DropdownMenuItem>
+                <DropdownMenuSeparator />
                 {/* Re-parent: board-view parity with the list-view folder menu. */}
                 <FolderMoveSubmenu variant="dropdown" label={i18nT('pages.chatSidebar.move_folder_to')} sortMode={folderSortMode}
                   folders={reparentTargets}
@@ -3312,9 +3313,9 @@ function ChatSidebar({
         {renderFolderCreateError(folder.id, columnId)}
         {!emptyBody && (
         <FolderBody padding={FOLDER_BODY_OPEN_PADDING} open={!collapsed && !forceCollapsed}>
-          {/* `BOARD_FOLDER_BODY_CLS`: the same row pads as the list-view body
-           *  (`FOLDER_ROW_PAD_CLS`), with a body pad sized to this header, so in
-           *  both views a folder's rows land on that folder's name column. */}
+          {/* `BOARD_FOLDER_BODY_CLS`: the connector beside the rows with the
+           *  4px pad that clears the rail's hit strip, as in the list view;
+           *  rows inside keep their own `ROW_BOX_CLS` pad. */}
           <div className={BOARD_FOLDER_BODY_CLS}>
             {(deepChildren.length > 0 || childSlots.length > 0) && (
               <FolderRail name={folder.name} id={`${columnId}-${folder.id}`} onToggle={() => toggleColumnCollapse(columnId, folder)} />
@@ -3373,20 +3374,25 @@ function ChatSidebar({
   const navigateRef = useRef(navigate)
   navigateRef.current = navigate
   const openElsewhere = useCallback((path: string) => { navigateRef.current(path) }, [])
+  // The caller's source-reveal handler is rebuilt whenever its own inputs move,
+  // and a new identity here would rebuild `rowActions` and re-render every row.
+  // Rows only ever CALL it, so they get a stable forwarder to the latest one;
+  // an absent handler stays undefined, which the chips read as "cannot reveal".
+  const { onOpenSource: stableOpenSource } = useStableCallbackProps({ onOpenSource })
   // What every session row can do, built once: the row's memo compares this one
   // reference, so none of these may take a new identity per render.
   const rowActions = useMemo(() => ({
-    renameInputRef, onRenameStart, onRenameChange, onRenameCommit, onRenameCancel,
-    onDuplicate: sessionActions.duplicate, onCloseSession: treeClose,
-    onMenuCloseAutoFocus, onSelectSlot, onOpenSlotInNewTab, onOpenSource,
+    renameInputRef, onRenameStart, onRenameChange, onRenameCommit, onRenameCancel, onAutoTitle,
+    onDuplicate: sessionActions.duplicate, onCloseSession: sessionActions.close,
+    onMenuCloseAutoFocus, onSelectSlot, onOpenSlotInNewTab, onOpenSource: stableOpenSource,
     onOpenPeerSession: openPeerSession,
     onNativeDragStart: startBoardCardDrag, onNativeDragEnd: endNativeSessionDrag,
     onPinnedKeyboardReorder: reorderPinnedByKeyboard,
     openElsewhere, toggleConductor: toggleConductorExpanded,
   }), [
-    renameInputRef, onRenameStart, onRenameChange, onRenameCommit, onRenameCancel,
-    sessionActions.duplicate, treeClose, onMenuCloseAutoFocus, onSelectSlot, onOpenSlotInNewTab,
-    onOpenSource, openPeerSession, startBoardCardDrag, endNativeSessionDrag, reorderPinnedByKeyboard,
+    renameInputRef, onRenameStart, onRenameChange, onRenameCommit, onRenameCancel, onAutoTitle,
+    sessionActions.duplicate, sessionActions.close, onMenuCloseAutoFocus, onSelectSlot, onOpenSlotInNewTab,
+    stableOpenSource, openPeerSession, startBoardCardDrag, endNativeSessionDrag, reorderPinnedByKeyboard,
     openElsewhere, toggleConductorExpanded,
   ])
   // The values every row shows the same way, ONE object per change of any of them:
@@ -3432,11 +3438,34 @@ function ChatSidebar({
   // collides (Framer paints one, hides the rest). Distinct scope = distinct id.
   // Paint-order stamp threaded through every row this render — see
   // RowPlacement.orderStamp for why the memo boundary needs it.
-  let sessionRowOrderStamp = 0
+  // Stamps are keyed by (scope, row) and remembered for this render's closure.
+  // Folder blocks are rendered by a CHILD (SortableFolderBlock /
+  // SortableSubfolderBlock call `renderFolderBlock` from their own render), and
+  // dnd-kit re-renders those children on its own, e.g. when it re-measures a
+  // droppable after a row mounts. That deferred call runs after this render's
+  // pass has stamped every row, so a running counter would hand every row in
+  // the block the clamped stamp: all of them re-render with row animation off,
+  // then again when the next shell render restores the real stamps. Reusing the
+  // stamp the pass already assigned keeps the deferred render's row view
+  // identical, so the rows bail out of it. `sessionRowStampCount` is the running
+  // total across scopes, which is what the clamp counts.
+  const sessionRowStamps = new Map<string, Map<string, number>>()
+  let sessionRowStampCount = 0
   const renderSessionRow = (s: Slot, _indent: number, showDivider: boolean, scope = 'list', navScope = scope, holdContainer = navScope, conductor?: ConductorRowView) => {
     // Clamped, not raw: rows past the window share a stamp and bail out of a
     // displacement above them (see SIDEBAR_DISPLACEMENT_WINDOW).
-    const orderStamp = Math.min(sessionRowOrderStamp++, SIDEBAR_DISPLACEMENT_WINDOW)
+    let scopeStamps = sessionRowStamps.get(scope)
+    if (!scopeStamps) {
+      scopeStamps = new Map<string, number>()
+      sessionRowStamps.set(scope, scopeStamps)
+    }
+    const stampKey = sessionRowIdentity(s)
+    let orderStamp = scopeStamps.get(stampKey)
+    if (orderStamp === undefined) {
+      orderStamp = Math.min(sessionRowStampCount, SIDEBAR_DISPLACEMENT_WINDOW)
+      sessionRowStampCount += 1
+      scopeStamps.set(stampKey, orderStamp)
+    }
     const view = rowViews.view(s, {
       scope, navScope, holdContainer, showDivider, orderStamp, conductor,
       // staticRows (the compositor drawer) folds into the one row-animation
@@ -3463,14 +3492,20 @@ function ChatSidebar({
   // The per-machine group chrome each list lane draws: `Local` above the lane's
   // own rows, the crew groups below them. Both are null with no crew group.
   const localGroupHeader = shownCrewGroups.length > 0 ? <LocalGroupHeader /> : null
-  const renderCrewGroups = (): React.ReactNode => shownCrewGroups.map(g => (
+  const renderCrewGroups = (): React.ReactNode => [crewEnable.notice, ...shownCrewGroups.map(g => (
     <CrewGroupSection key={g.id} group={g} rows={shownCrewRows.get(g.id) ?? []}
       collapsed={collapsedCrews.has(g.id)} onToggle={toggleCrewCollapsed} hideWhenEmpty={listNarrowed}
       chevron={<DisclosureChevron open={!collapsedCrews.has(g.id)} size={11} />}
+      onEnable={crewEnable.onEnable}
+      spaces={{
+        collapsed: collapsedSpaces, onToggle: toggleSpaceCollapsed,
+        // A local folder's own body: connector line, inset and collapse motion.
+        body: (open, children) => <FolderBody padding={FOLDER_BODY_OPEN_PADDING} open={open}><div className={FOLDER_BODY_CLS}>{children}</div></FolderBody>,
+      }}
       renderRows={(rows, scope) => rows.map((s, i) => renderSessionRow(
         s, 0, i < rows.length - 1 && !isActiveRow(s) && !isActiveRow(rows[i + 1]), scope,
       ))} />
-  ))
+  ))]
 
   // ── Folder row: matches session-row width (full width minus drawer padding) ──
   // Recursively check if a folder or any descendant contains an unread slot.
@@ -3612,44 +3647,33 @@ function ChatSidebar({
     const ctx = variant === 'context'
     const Item = ctx ? ContextMenuItem : DropdownMenuItem
     const Separator = ctx ? ContextMenuSeparator : DropdownMenuSeparator
-    const Sub = ctx ? ContextMenuSub : DropdownMenuSub
-    const SubTrigger = ctx ? ContextMenuSubTrigger : DropdownMenuSubTrigger
-    const SubContent = ctx ? ContextMenuSubContent : DropdownMenuSubContent
     const tid = (name: string) => `folder-${name}-${folder.id}${ctx ? '-ctx' : ''}`
-    const ephemeralRows = (
+    const privateChatRows = (
       <>
         {/* Menu create entries take NO open-in-tab gesture (#10575,
          *  scoped out): a menu closes on select, and Radix keyboard
          *  activation synthesizes a modifier-free click, so the
          *  gesture would be mouse-only and undiscoverable. */}
-        <Item data-testid={tid('new-incognito')} onClick={() => { createChatInFolder(folder.id, { memoryMode: 'incognito' }) }}><EyeOff size={13} className="text-warn" /> {i18nT('components.welcomeView.incognito')}</Item>
-        <Item data-testid={tid('new-temporary')} onClick={() => { createChatInFolder(folder.id, { memoryMode: 'temporary' }) }}><VenetianMask size={13} className="text-aim" /> {i18nT('components.welcomeView.temporary')}</Item>
+        <Item className="items-start" data-testid={tid('new-incognito')} onClick={() => { createChatInFolder(folder.id, { memoryMode: 'incognito' }) }}>
+          <PrivateChatRow kind="incognito" />
+        </Item>
+        <Item className="items-start" data-testid={tid('new-temporary')} onClick={() => { createChatInFolder(folder.id, { memoryMode: 'temporary' }) }}>
+          <PrivateChatRow kind="temporary" />
+        </Item>
       </>
     )
     return (
       <>
         <Item data-testid={tid('rename')} onClick={() => { suppressMenuRestoreRef.current = true; setEditingId(folder.id); setEditScope('list'); setEditName(folder.name) }}><Pencil size={13} /> {i18nT('pages.chatSidebar.rename')}</Item>
         <Item data-testid={tid('new-subfolder')} onClick={() => { setFolderModal({ mode: 'create', parentId: folder.id }) }}><FolderPlus size={13} /> {i18nT('pages.chatSidebar.new_subfolder')}</Item>
-        {/* A flyout has nowhere to open at phone width, so inline the rows
-         *  under a caption there instead (parity with the + New menu). The
-         *  context family has no Label primitive, so the caption is a plain
-         *  div styled like DropdownMenuLabel. */}
-        {isMobile ? (
-          <>
-            {ctx
-              ? <div className="px-3 py-1.5 text-[11px] font-semibold text-muted uppercase tracking-[.04em] flex items-center gap-2"><Ghost size={13} className="text-muted" /> {i18nT('pages.chatSidebar.new_ephemeral_chat')}</div>
-              : <DropdownMenuLabel className="text-[11px] uppercase tracking-[.04em] flex items-center gap-2"><Ghost size={13} className="text-muted" /> {i18nT('pages.chatSidebar.new_ephemeral_chat')}</DropdownMenuLabel>}
-            {ephemeralRows}
-          </>
-        ) : (
-          <Sub>
-            <SubTrigger data-testid={tid('new-ephemeral')}>
-              <Ghost size={13} className="text-muted" /> {i18nT('pages.chatSidebar.new_ephemeral_chat')}
-              <ChevronRight size={13} className="ml-auto text-muted" />
-            </SubTrigger>
-            <SubContent>{ephemeralRows}</SubContent>
-          </Sub>
-        )}
+        {/* The two private modes are listed flat, each naming its own action
+         *  and what it does with memory. A grouping caption read as a button
+         *  at phone width and named the pair with a word no other surface
+         *  uses, so neither a caption nor a submenu stands between the user
+         *  and the choice. */}
+        <Separator />
+        {privateChatRows}
+        <Separator />
         {/* Re-parent: move this folder under another folder or back to the
          *  top level. Self + descendants are excluded (cycle guard). */}
         <FolderMoveSubmenu variant={variant} label={i18nT('pages.chatSidebar.move_folder_to')} sortMode={folderSortMode}
@@ -3753,22 +3777,22 @@ function ChatSidebar({
         // and each landed 2px out. It is now a named, exported constant that the
         // alignment test imports and asserts against the rendered padding, so it
         // is no longer a free empirical term.
-        // P = this `pl-[3px]` 3,
-        // G = glyph 12, g = `gap-[4px]`, M = body `ml-1` 4, B = 1px border,
-        // p = body `pl-[3px]` 3, R = root-lane row `pl-2.5` 10, R_in = in-folder
-        // row pad 9 (`FOLDER_BODY_CLS` overrides the row's pad inside a body):
+        // P = this `px-3.5` 14,
+        // G = glyph 14, g = `gap-[5px]` 5, M = body `ml-3` 12, B = 1px border,
+        // p = body `pl-1` 4, R = session row `pl-3.5` 14 (the same pad in the root
+        // lane and inside every folder body):
         //
-        //   GUIDE 1  connector line runs under the glyph     P <= D + M < P + G
-        //   GUIDE 2  name == agent / title / tool-call sub   P + G + g = D+M+B+p+R_in
-        //   GUIDE 3  glyph hangs left of sibling content     R_sib - P > 0
+        //   GUIDE 1  glyph sits ON the connector line        P = D + M
+        //   GUIDE 2  name == agent / title / tool-call sub   P + G + g = D + M + B + p + R
+        //   GUIDE 3  nested glyph == sibling content column  P = R
         //
-        //   3 <= 6 < 15      3 + 12 + 4 = 2 + 4 + 1 + 3 + 9   root 10-3 = 7, nested 9-3 = 6
+        //   14 = 2 + 12      14 + 14 + 5 = 2 + 12 + 1 + 4 + 14      14 = 14
         //
-        // Each nesting level costs D + M + B + p = 10px (19 before). The glyph used
-        // to sit ON the sibling content column (P = R), which pinned the per-level
-        // cost at glyph + gap and wasted the width session titles need; it now
-        // outdents into the row gutter like a tree view, and the NAME carries the
-        // alignment instead.
+        // Each nesting level costs D + M + B + p = 19px. This is the maintainer's
+        // decided geometry (#3905; docs/decisions/2026-10-09-folder-glyph-sits-on-
+        // its-connector-line.md). A tighter indent that outdents the glyph off its
+        // connector line (#14717) was reverted by that decision: the glyph on the
+        // line is the picture, and width for titles is not bought by moving it.
         //
         // All three hold at EVERY depth and in the root lane: the algebra has no
         // per-depth term, so depth 3 nests exactly as depth 2 does.
@@ -3797,10 +3821,10 @@ function ChatSidebar({
         // (`.folder-row-sticky`); `sticky` also serves as the containing block
         // the old `relative` provided for the absolutely-positioned children.
         style={{ top: `calc(var(--folder-row-sticky-h) * ${depth} - var(--folder-row-sticky-inset))`, zIndex: FOLDER_ROW_STICKY_Z - depth }}
-        className={`folder-row folder-row-sticky group sticky flex items-center gap-2 pl-[3px] pr-2.5 py-1.5 rounded-md text-sm text-muted transition-all${emptyRow ? '' : ' hover:text-text hover:bg-bg-hover'} ${draggable ? 'cursor-grab active:cursor-grabbing' : ''}${folderFlash ? ` session-reveal-flash${folderFlash === 'fade' ? ' session-reveal-flash-fade' : ''}` : ''}`}>
+        className={`folder-row folder-row-sticky group sticky flex items-center gap-2 px-3.5 py-1.5 rounded-md text-sm text-muted transition-all${emptyRow ? '' : ' hover:text-text hover:bg-bg-hover'} ${draggable ? 'cursor-grab active:cursor-grabbing' : ''}${folderFlash ? ` session-reveal-flash${folderFlash === 'fade' ? ' session-reveal-flash-fade' : ''}` : ''}`}>
         {editingId === folder.id && editScope === 'list' ? (
           <>
-            <FolderGlyph color={folder.color} icon={folder.icon} size={12} open={!collapsed} />
+            <FolderGlyph color={folder.color} icon={folder.icon} size={14} open={!collapsed} />
             <Input ref={folderEditInputRef} className="flex-1 py-0.5 text-[13px] min-w-0" value={editName} onChange={e => setEditName(e.target.value)} onClick={e => e.stopPropagation()} onMouseDown={e => e.stopPropagation()} {...ime.bindEnter<HTMLInputElement>({ onEnter: () => renameCommit(folder.id, editName), onEscape: () => setEditingId(null), onBlur: () => renameCommit(folder.id, editName) })} />
             <span className="text-[11px] text-muted tabular-nums shrink-0">{count}</span>
           </>
@@ -3817,7 +3841,7 @@ function ChatSidebar({
              *  still double-click renames and the row's own cluster still creates
              *  and opens the menu, so the row keeps every action it can honour. */}
             <HeaderShell
-              className={`flex items-center gap-[4px] flex-1 min-w-0 bg-transparent border-none text-left text-inherit p-0${emptyRow ? '' : ' cursor-pointer'}`}
+              className={`flex items-center gap-[5px] flex-1 min-w-0 bg-transparent border-none text-left text-inherit p-0${emptyRow ? '' : ' cursor-pointer'}`}
               {...(emptyRow
                 // Nothing to disclose, but the row is still a DRAG HANDLE while it
                 // is draggable, and this shell is the only focusable thing inside
@@ -3836,7 +3860,7 @@ function ChatSidebar({
                 type: 'button' as const,
                 'aria-expanded': !collapsed,
                 'aria-label': collapsed ? i18nT('pages.chatSidebar.expand_folder_name', { name: folder.name }) : i18nT('pages.chatSidebar.collapse_folder_name', { name: folder.name }),
-                onClick: () => toggleCollapse(folder.id),
+                onClick: (e: React.MouseEvent<HTMLElement>) => toggleListFolderCollapse(folder, e.currentTarget),
               })}>
               {/* An inert row's glyph says "inactive" by WEIGHT, not by shape. The
                *  closed shape is this product's "collapsed, click to expand"
@@ -3852,7 +3876,7 @@ function ChatSidebar({
                *  binding the glyph to that alone would draw the closed shape on an
                *  inert row - this product's "click to expand" affordance on a row
                *  that cannot expand. An inert row is always drawn open. */}
-              <FolderGlyph color={folder.color} icon={folder.icon} size={12} open={!collapsed || emptyRow}
+              <FolderGlyph color={folder.color} icon={folder.icon} size={14} open={!collapsed || emptyRow}
                 className={emptyRow ? 'shrink-0 text-muted/40 transition-colors' : undefined}
                 testId={`folder-collapse-${folder.id}`} />
               {/* Double-click rename is a mouse-only power shortcut; the accessible
@@ -3912,7 +3936,7 @@ function ChatSidebar({
           *  is what an empty folder usually wants), so nothing is ADDED to the
           *  row and the two-buttons-per-row cap is untouched. */}
         {!(editingId === folder.id && editScope === 'list') && (
-        <div className={`transition-all flex items-center gap-0.5 rounded-md group-focus-within:opacity-100 focus-within:opacity-100 has-[[data-state=open]]:opacity-100${emptyRow ? ' shrink-0 -my-1' : ' absolute top-1/2 -translate-y-1/2 right-1.5 p-1 bg-card border border-border shadow-sm opacity-0 group-hover:opacity-100 [@media(hover:none)]:opacity-100 [@media(hover:none)]:static [@media(hover:none)]:translate-y-0 [@media(hover:none)]:shrink-0 [@media(hover:none)]:-my-1 [@media(hover:none)]:p-0 [@media(hover:none)]:bg-transparent [@media(hover:none)]:border-transparent [@media(hover:none)]:shadow-none'}`}>
+        <div className={`transition-all flex items-center gap-0.5 rounded-md group-focus-visible:opacity-100 group-has-[:focus-visible]:opacity-100 has-[[data-state=open]]:opacity-100${emptyRow ? ' shrink-0 -my-1' : ' absolute top-1/2 -translate-y-1/2 right-1.5 p-1 bg-card border border-border shadow-sm opacity-0 group-hover:opacity-100 [@media(hover:none)]:opacity-100 [@media(hover:none)]:static [@media(hover:none)]:translate-y-0 [@media(hover:none)]:shrink-0 [@media(hover:none)]:-my-1 [@media(hover:none)]:p-0 [@media(hover:none)]:bg-transparent [@media(hover:none)]:border-transparent [@media(hover:none)]:shadow-none'}`}>
           {/* ⋯ menu first, then the primary "new chat" action.  Sibling
            *  <button>s of the collapse toggle (valid ARIA — no nesting). */}
           <DropdownMenu>
@@ -3964,7 +3988,7 @@ function ChatSidebar({
           aria-expanded={open}
           title={open ? i18nT('pages.chatSidebar.collapse_hidden_folders') : i18nT('pages.chatSidebar.show_hidden_folder', { count: n })}
           data-folder-hidden-reveal=""
-          className="w-full flex items-center gap-1.5 py-1 pl-2.5 pr-2 text-left text-[11px] text-muted hover:text-text hover:bg-accent-subtle rounded-md cursor-pointer bg-transparent border-none transition-colors"
+          className="w-full flex items-center gap-1.5 py-1 pl-3.5 pr-2 text-left text-[11px] text-muted hover:text-text hover:bg-accent-subtle rounded-md cursor-pointer bg-transparent border-none transition-colors"
         >
           <DisclosureChevron open={open} size={11} />
           <span>{i18nT('pages.chatSidebar.hidden_folder_count', { count: n })}</span>
@@ -4073,7 +4097,7 @@ function ChatSidebar({
     const emptyBody = hideEmptyFolderBody && childNodes.length === 0
     const wrapped = childNodes.length > 0 ? (
       <div key={`folder-children-${folder.id}`} className={FOLDER_BODY_CLS}>
-        <FolderRail name={folder.name} id={folder.id} onToggle={() => toggleCollapse(folder.id)} />
+        <FolderRail name={folder.name} id={folder.id} onToggle={e => toggleListFolderCollapse(folder, e.currentTarget)} />
         {childNodes}
       </div>
     ) : emptyBody || listNarrowed ? null : (
@@ -4092,7 +4116,7 @@ function ChatSidebar({
           }) : undefined}
           onClick={e => createChatInFolder(folder.id, { inNewTab: !!onOpenSlotInNewTab && isOpenInTabModifierClick(e) })}
           title={i18nT('pages.chatSidebar.new_chat_in_name', { name: folder.name })} aria-label={i18nT('pages.chatSidebar.new_chat_in_name', { name: folder.name })}
-          className="w-full flex items-center gap-2.5 pl-2.5 pr-3 py-2 rounded-md text-[12px] text-muted hover:text-accent hover:bg-bg-hover transition-all bg-transparent border-none cursor-pointer text-left">
+          className="w-full flex items-center gap-2.5 pl-3.5 pr-3 py-2 rounded-md text-[12px] text-muted hover:text-accent hover:bg-bg-hover transition-all bg-transparent border-none cursor-pointer text-left">
           <span>{i18nT('pages.chatSidebar.new_chat_in_name', { name: folder.name })}</span><MessageSquarePlus size={13} className="shrink-0 ml-auto" />
         </button>
       </div>
@@ -4113,7 +4137,7 @@ function ChatSidebar({
           <div ref={setNodeRef} data-folder-drop={folder.id} style={{ '--folder-pin-stack': `calc(var(--folder-row-sticky-h) * ${depth + 1})` } as React.CSSProperties} className={`rounded-md transition-all mb-0.5${isOver ? ' ring-1 ring-accent' : ''}`}>
             {renderFolderHeader(folder, dragHandleProps, emptyBody, depth)}
             {renderFolderCreateError(folder.id)}
-            {wrapped && <FolderBody key={`folder-body-${folder.id}`} padding={FOLDER_BODY_OPEN_PADDING} open={!folder.collapsed && !forceCollapsed}>{wrapped}</FolderBody>}
+            {wrapped && <FolderBody key={`folder-body-${folder.id}`} padding={FOLDER_BODY_OPEN_PADDING} open={!folder.collapsed && !forceCollapsed} instantClose={instantCloseId === folder.id}>{wrapped}</FolderBody>}
           </div>
         )}
       </DndDroppable>,
@@ -4185,9 +4209,14 @@ function ChatSidebar({
   const compactHeader = paintedSidebarWidth < 256
   const tinyHeader = paintedSidebarWidth < 200
 
+  // The Older Sessions pane's guide scope (`open:chat.older-sessions`).
+  useGuideDisclosureScope('chat.older-sessions', historyOpen)
+
   return (
     // stable theming hook 'sidebar' — see website/docs/theming-contract.md
-    <div ref={sidebarRootRef} onPointerOver={onRootPointerOver} onPointerLeave={releaseHoverPin} className={`${LIST_SHELL_CLS} flex flex-col shrink-0 relative h-full`} style={rootStyle}>
+    // The region is the session picker a guide's "choose the session" step
+    // points at (`sessions.list`): both layouts draw their rows inside it.
+    <div role="region" aria-label={i18nT('pages.chatSidebar.sessions')} {...uiLocation('sessions.list', sidebarRootRef)} onPointerOver={onRootPointerOver} onPointerLeave={releaseHoverPin} className={`${LIST_SHELL_CLS} flex flex-col shrink-0 relative h-full`} style={rootStyle}>
       {/* Drag handle — the shared column grip (components/ResizeHandle), so
           this edge looks and behaves exactly like the Crew Members roster's and
           the app workspaces'. Positioned absolutely on the card's right border
@@ -4222,12 +4251,12 @@ function ChatSidebar({
           {!tinyHeader && <span className={LIST_TITLE_CLS}>{i18nT('pages.chatSidebar.sessions')}</span>}
         </div>
         <div className="flex items-center gap-1.5 shrink-0">
-          <DropdownMenu>
+          <DropdownMenu guideScope="menu:sessions.list-menu">
             <DropdownMenuTrigger asChild>
-              <button className="mc-touch-hit w-7 h-7 rounded-md border border-border bg-transparent text-muted cursor-pointer flex items-center justify-center hover:border-border-strong hover:text-text transition-all" title={i18nT('pages.chatSidebar.more_options')} aria-label={i18nT('pages.chatSidebar.more_options')}><MoreVertical size={14} /></button>
+              <button className="mc-touch-hit w-7 h-7 rounded-md border border-border bg-transparent text-muted cursor-pointer flex items-center justify-center hover:border-border-strong hover:text-text transition-all" title={i18nT('pages.chatSidebar.more_options')} aria-label={i18nT('pages.chatSidebar.more_options')} {...uiLocation('sessions.list-menu')}><MoreVertical size={14} /></button>
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end" className="min-w-[180px]">
-              {dashboardPreview && <DropdownMenuItem onSelect={() => navigate('/session-dashboards')}>
+              {dashboardPreview && <DropdownMenuItem onSelect={() => navigate('/session-dashboards')} {...uiLocation('sessions.list-menu.dashboards')}>
                 <Monitor size={14} className="text-muted" />
                 {i18nT('commandCenter.all_title')}
               </DropdownMenuItem>}
@@ -4262,13 +4291,14 @@ function ChatSidebar({
                 if (next && !rawColumns.some(c => c.source === 'state' || c.name || (c.tag_ids || []).length || c.include_untagged)) {
                   seedStateLanesMutation.mutate()
                 }
-              }}>
+              }} {...uiLocation('sessions.list-menu.view')}>
                 <Columns3 size={14} className={tagColumnsEnabled && rawColumns.length > 0 ? 'text-accent' : 'text-muted'} />
                 {tagColumnsEnabled && rawColumns.length > 0 ? i18nT('pages.chatSidebar.switch_to_list_view') : i18nT('pages.chatSidebar.switch_to_board_view')}
               </DropdownMenuItem>
               {tagColumnsEnabled && rawColumns.length > 0 && missingLanes.length > 0 && (
                 <DropdownMenuItem
                   data-testid="add-state-lanes"
+                  {...uiLocation('sessions.list-menu.add-lanes')}
                   disabled={seedStateLanesMutation.isPending}
                   onClick={() => { if (!seedStateLanesMutation.isPending) seedStateLanesMutation.mutate() }}
                 >
@@ -4276,7 +4306,7 @@ function ChatSidebar({
                   {i18nT('pages.chatSidebar.add_state_lanes')}
                 </DropdownMenuItem>
               )}
-              <DropdownMenuItem onClick={() => { setCleanupOpen(!cleanupOpen); setCleanupExpanded(false); setCleanupError('') }}>
+              <DropdownMenuItem onClick={() => { setCleanupOpen(!cleanupOpen); setCleanupExpanded(false); setCleanupError('') }} {...uiLocation('sessions.list-menu.clean-up')}>
                 <BrushCleaning size={14} className="text-muted" />
                 {i18nT('pages.chatSidebar.clean_up_sessions')}
               </DropdownMenuItem>
@@ -4284,11 +4314,11 @@ function ChatSidebar({
                 <FolderX size={14} className="text-muted" />
                 {i18nT('pages.chatSidebar.clean_up_empty_folders_menu')}
               </DropdownMenuItem>
-              <DropdownMenuItem onClick={() => { setBulkModelOpen(true); setBulkModel(''); setBulkSkipRunning(true); setBulkModelError('') }}>
+              <DropdownMenuItem onClick={() => { setBulkModelOpen(true); setBulkModel(''); setBulkSkipRunning(true); setBulkModelError('') }} {...uiLocation('sessions.list-menu.switch-model')}>
                 <Cpu size={14} className="text-muted" />
                 {i18nT('pages.chatSidebar.switch_all_to_model')}
               </DropdownMenuItem>
-              <DropdownMenuItem onClick={() => setManageTagsOpen(o => !o)}>
+              <DropdownMenuItem onClick={() => setManageTagsOpen(o => !o)} {...uiLocation('sessions.list-menu.manage-tags')}>
                 <TagIcon size={14} className="text-muted" />
                 {i18nT('pages.chatSidebar.manage_tags')}
               </DropdownMenuItem>
@@ -4320,13 +4350,14 @@ function ChatSidebar({
               title={i18nT('pages.chatSidebar.new_chat')}
               aria-label={i18nT('pages.chatSidebar.new_chat_session')}
               aria-busy={creatingSlot}
+              {...uiLocation('chat.new-session')}
             >{creatingSlot ? <Loader2 size={15} className="animate-spin" /> : <Plus size={15} />}{!compactHeader && <span className="whitespace-nowrap">{creatingSlot ? i18nT('pages.chatSidebar.creating') : i18nT('pages.chatSidebar.new')}</span>}</button>
             <span className="w-px h-4 bg-accent-fg opacity-30" aria-hidden="true" />
-            <DropdownMenu open={newChatMenuOpen} onOpenChange={o => { setNewChatMenuOpen(o); if (!o) setRemoteCrewError('') }}>
+            <DropdownMenu guideScope="menu:sessions.create-menu" open={newChatMenuOpen} onOpenChange={o => { setNewChatMenuOpen(o); if (!o) setRemoteCrewError('') }}>
               <DropdownMenuTrigger asChild>
                 <button
                   className="mc-touch-hit-end flex items-center justify-center w-6 h-7 rounded-e-md cursor-pointer bg-transparent border-none text-accent-fg hover:bg-black/10 active:scale-95 transition-all"
-                  title={i18nT('pages.chatSidebar.create')} aria-label={i18nT('pages.chatSidebar.more_create_options')}><ChevronDown size={13} /></button>
+                  title={i18nT('pages.chatSidebar.create')} aria-label={i18nT('pages.chatSidebar.more_create_options')} {...uiLocation('sessions.create-menu')}><ChevronDown size={13} /></button>
               </DropdownMenuTrigger>
               {/* max-w bounds the menu: the mode descriptions below are full
                *  sentences, and without an upper bound a flex item's automatic
@@ -4341,57 +4372,17 @@ function ChatSidebar({
                 <DropdownMenuItem disabled={creatingSlot} onClick={() => { createChatMutation.mutate({ inNewTab: false }) }}>
                   <MessageSquarePlus size={14} className="text-muted" /> {i18nT('pages.chatSidebar.new_chat')}
                 </DropdownMenuItem>
-                {/* Ephemeral session types are grouped one level down: they are two
-                 *  spellings of one choice (a session that leaves no lasting memory),
-                 *  so listing both at the top level would double the session-type rows
-                 *  a user reads before picking an ordinary chat. max-w bounds the
-                 *  submenu for the same reason the parent content is bounded — the
-                 *  glosses are full sentences and would otherwise stretch it across
-                 *  the session list instead of wrapping. */}
-                {(() => {
-                  const ephemeralRows = (
-                    <>
-                      <DropdownMenuItem className="items-start" data-testid="new-incognito-chat" disabled={creatingSlot} onClick={() => { createEphemeralChatMutation.mutate('incognito') }}>
-                        <EyeOff size={14} className="text-muted mt-[3px] shrink-0" />
-                        <span className="flex min-w-0 flex-col gap-px">
-                          <span>{i18nT('components.welcomeView.incognito')}</span>
-                          <span className="whitespace-normal text-[11px] leading-snug text-muted">{i18nT('components.welcomeView.incognito_desc')}</span>
-                        </span>
-                      </DropdownMenuItem>
-                      <DropdownMenuItem className="items-start" data-testid="new-temporary-chat" disabled={creatingSlot} onClick={() => { createEphemeralChatMutation.mutate('temporary') }}>
-                        <VenetianMask size={14} className="text-muted mt-[3px] shrink-0" />
-                        <span className="flex min-w-0 flex-col gap-px">
-                          <span>{i18nT('components.welcomeView.temporary')}</span>
-                          <span className="whitespace-normal text-[11px] leading-snug text-muted">{i18nT('components.welcomeView.temporary_desc')}</span>
-                        </span>
-                      </DropdownMenuItem>
-                    </>
-                  )
-                  // A flyout has nowhere to open at phone width (Radix pins a
-                  // submenu to the trigger's side and only shifts it vertically),
-                  // so on a phone the two modes are listed inline under a caption.
-                  if (isMobile) {
-                    return (
-                      <>
-                        <DropdownMenuLabel className="text-[11px] uppercase tracking-[.04em] flex items-center gap-2">
-                          <Ghost size={13} className="text-muted" /> {i18nT('pages.chatSidebar.new_ephemeral_chat')}
-                        </DropdownMenuLabel>
-                        {ephemeralRows}
-                      </>
-                    )
-                  }
-                  return (
-                  <DropdownMenuSub>
-                    <DropdownMenuSubTrigger>
-                      <Ghost size={14} className="text-muted" /> {i18nT('pages.chatSidebar.new_ephemeral_chat')}
-                      <ChevronRight size={13} className="ml-auto text-muted" />
-                    </DropdownMenuSubTrigger>
-                    <DropdownMenuSubContent className="max-w-[264px]">
-                      {ephemeralRows}
-                    </DropdownMenuSubContent>
-                  </DropdownMenuSub>
-                  )
-                })()}
+                {/* The two private modes sit at the top level beside New chat,
+                 *  each naming its own action and what it does with memory. They
+                 *  used to share a submenu named for a word no other surface uses,
+                 *  which at phone width collapsed into a caption that read as a
+                 *  button. */}
+                <DropdownMenuItem className="items-start" data-testid="new-incognito-chat" disabled={creatingSlot} onClick={() => { createEphemeralChatMutation.mutate('incognito') }} {...uiLocation('sessions.create-menu.incognito')}>
+                  <PrivateChatRow kind="incognito">{i18nT('pages.chatSidebar.new_incognito_chat')}</PrivateChatRow>
+                </DropdownMenuItem>
+                <DropdownMenuItem className="items-start" data-testid="new-temporary-chat" disabled={creatingSlot} onClick={() => { createEphemeralChatMutation.mutate('temporary') }} {...uiLocation('sessions.create-menu.temporary')}>
+                  <PrivateChatRow kind="temporary">{i18nT('pages.chatSidebar.new_temporary_chat')}</PrivateChatRow>
+                </DropdownMenuItem>
                 {/* Import creates a session too, so it sits with the create rows
                  *  rather than only in a per-session ⋯ menu that has to be opened
                  *  on some unrelated session first. */}
@@ -4418,16 +4409,11 @@ function ChatSidebar({
                   <Users size={14} className="text-muted mt-[3px] shrink-0" />
                   <span className="flex min-w-0 flex-col gap-px">
                     <span>{i18nT('pages.chatSidebar.open_crew_members')}</span>
-                    {/* The gloss tells the truth about where the click lands. While
-                     *  the page is preview-gated the entry detours to the Settings
-                     *  card that turns it on, and a gloss that still promised the
-                     *  page read as "offered and hidden at once" (UX review on
-                     *  #9519) — so it discloses the detour instead. */}
                     <span className="whitespace-normal text-[11px] leading-snug text-muted">{crewPreview ? i18nT('pages.chatSidebar.open_crew_members_desc') : i18nT('pages.chatSidebar.open_crew_members_gated_desc')}</span>
                   </span>
                 </DropdownMenuItem>
                 <DropdownMenuSeparator />
-                <DropdownMenuItem onClick={() => { setFolderModal({ mode: 'create', parentId: '' }) }}>
+                <DropdownMenuItem onClick={() => { setFolderModal({ mode: 'create', parentId: '' }) }} {...uiLocation('sessions.create-menu.new-folder')}>
                   <FolderPlus size={14} className="text-muted" /> {i18nT('pages.chatSidebar.new_folder')}
                 </DropdownMenuItem>
                 {folders.length > 0 && (() => {
@@ -4446,11 +4432,15 @@ function ChatSidebar({
                   // A flyout has nowhere to open at phone width (Radix pins a
                   // submenu to the trigger's side and only shifts it vertically),
                   // so on a phone the folders are listed inline under a caption.
+                  // The caption carries no icon: drawn with the same Folder glyph
+                  // as the rows under it, it read as one more tappable row. Text
+                  // alone, in the FILTER / SORT BY caption style, marks a heading.
                   if (isMobile) {
                     return (
                       <>
-                        <DropdownMenuLabel className="text-[11px] uppercase tracking-[.04em] flex items-center gap-2">
-                          <Folder size={13} className="text-muted" /> {i18nT('pages.chatSidebar.new_chat_in_folder')}
+                        <DropdownMenuSeparator />
+                        <DropdownMenuLabel data-testid="new-chat-in-folder-caption" className="text-[11px] uppercase tracking-[.04em]">
+                          {i18nT('pages.chatSidebar.new_chat_in_folder')}
                         </DropdownMenuLabel>
                         <div className="max-h-[240px] overflow-y-auto">{folderRows}</div>
                       </>
@@ -4649,12 +4639,19 @@ function ChatSidebar({
       })()}
 
       {/* Switch-all-to-model dialog — mirrors the Clean Up panel. Picking a
-       *  model applies it to every live session (each switch resets that
-       *  session); running sessions are skipped by default. */}
+       *  model applies it to every live session; running sessions are skipped
+       *  by default. A switch restarts each session's agent process and keeps
+       *  its conversation: the next turn resumes it on the new model. The one
+       *  thing a switch can destroy is a reply in flight, and only for a
+       *  running session left unskipped, so the red caveat renders only once
+       *  the skip box is cleared with some session running. */}
       {bulkModelOpen && (
         <div className="mx-2 mb-2 p-3 rounded-lg bg-bg border border-border shadow-md text-sm animate-rise">
           <div className="font-medium text-text-strong mb-2"><Cpu size={14} className="lucide-inline" /> {i18nT('pages.chatSidebar.switch_all_sessions')}</div>
-          <div className="text-muted text-[12px] mb-2">{i18nT('pages.chatSidebar.pick_a_model_for_every_session_switching_a_sessi')} <span className="text-danger">{i18nT('pages.chatSidebar.resets_its_conversation')}</span>.</div>
+          <div className="text-muted text-[12px] mb-2">
+            {i18nT('pages.chatSidebar.bulk_switch_keeps_conversation')}
+            {bulkRunningCount > 0 && !bulkSkipRunning && <> <span data-testid="bulk-model-running-caveat" className="text-danger">{i18nT('pages.chatSidebar.bulk_switch_stops_running_reply')}</span></>}
+          </div>
           {bulkModelsFailed && (
             <div className="flex flex-wrap items-center gap-2 mb-2">
               {/* No hand-off: the chosen bulkModel/skipRunning selection is unsaved,
@@ -4815,6 +4812,7 @@ function ChatSidebar({
                 <FilterMenuLabel>{i18nT('pages.chatSidebar.filter')}</FilterMenuLabel>
                 {SESSION_FILTERS.map(filterDef => {
                   const active = activeFilters.has(filterDef.key)
+                  const hidden = hiddenFilters.has(filterDef.key)
                   const slotCount = filterCounts[filterDef.key] ?? 0
                   const isRecent = filterDef.key === 'recent'
                   if (isRecent) {
@@ -4949,17 +4947,72 @@ function ChatSidebar({
                       </DropdownMenuSub>
                     )
                   }
-                  return (
+                  const filterLabel = i18nT(FILTER_LABEL_KEY[filterDef.key])
+                  const canHide = !!filterDef.hideStorageKey
+                  const showRow = (
                     <DropdownMenuItem
                       key={filterDef.key}
                       title={i18nT(FILTER_DESCRIPTION_KEY[filterDef.key])}
                       // Keep the menu open so multiple filters can be toggled.
                       onSelect={e => { e.preventDefault(); toggleFilter(filterDef.key) }}
+                      className={canHide ? 'flex-1 min-w-0' : undefined}
                     >
                       {filterDef.icon(active)}
-                      <span className="flex-1 truncate">{i18nT(FILTER_LABEL_KEY[filterDef.key])}{slotCount > 0 ? ` (${slotCount})` : ''}</span>
+                      <span className="flex-1 truncate">{filterLabel}{slotCount > 0 ? ` (${slotCount})` : ''}</span>
                       {active && <Check size={14} className="text-accent shrink-0" />}
                     </DropdownMenuItem>
+                  )
+                  if (!canHide) return showRow
+                  // Two menu items drawn as one row, not a button nested in one: a
+                  // focusable control inside a menuitem is skipped by the menu's
+                  // roving focus and read as part of the row's name. The second
+                  // item sits where the check mark would go and is offered only
+                  // while show-only is OFF: with it on, the row carries its check
+                  // like every other filter row, so a click anywhere on it, the
+                  // check included, turns show-only off as it always did, and going
+                  // from show-only straight to a hide is two clicks on purpose.
+                  // While the chip is hiding the item draws the lit hide icon;
+                  // otherwise the icon appears on row hover or focus, and always on
+                  // touch screens, which have no hover. The wrapper stays in place
+                  // either way so the row is not remounted, which would drop the
+                  // menu's focus from it, when show-only flips. The styling sits on
+                  // the wrapper and the icon slot, not on the menu primitives.
+                  // The wrapper fades with the same `transition-colors` the menu
+                  // items carry: an instant wrapper over fading items leaves the
+                  // eye item's own padded focus box behind for a beat when the
+                  // pointer leaves the row.
+                  const hideLabel = hidden
+                    ? i18nT('pages.chatSidebar.filter_unhide_named', { filter: filterLabel })
+                    : i18nT('pages.chatSidebar.filter_hide_named', { filter: filterLabel })
+                  return (
+                    <div
+                      key={filterDef.key}
+                      role="group"
+                      className="group/filter flex items-center rounded-md transition-colors hover:bg-bg-hover focus-within:bg-bg-hover"
+                    >
+                      {showRow}
+                      {!active && (
+                        <DropdownMenuItem
+                          aria-label={hideLabel}
+                          title={hideLabel}
+                          onSelect={e => { e.preventDefault(); toggleHideFilter(filterDef.key) }}
+                          className="group/hide shrink-0"
+                          data-testid={`filter-hide-${filterDef.key}`}
+                          data-filter-hidden={hidden ? 'true' : undefined}
+                        >
+                          <span
+                            className={hidden
+                              ? 'inline-flex size-3.5 items-center justify-center rounded bg-accent-subtle text-accent ring-4 ring-accent-subtle'
+                              : 'inline-flex size-3.5 items-center justify-center text-muted group-focus/hide:text-text'}
+                          >
+                            <EyeOff
+                              size={12}
+                              className={hidden ? undefined : 'opacity-0 group-hover/filter:opacity-100 group-focus-within/filter:opacity-100 [@media(hover:none)]:opacity-100'}
+                            />
+                          </span>
+                        </DropdownMenuItem>
+                      )}
+                    </div>
                   )
                 })}
                 {/* Lift every active status filter at once, for a look at the
@@ -5331,6 +5384,35 @@ function ChatSidebar({
           })}
         </div>
       )}
+      {/* The hides, as ONE aggregate chip in their own row, for the same reason as
+          the tag chip: the row above holds the base branch's filter chips and must
+          not grow, and a chip per hidden status would add up to three more buttons
+          to it. Neutral like every clear-several pill (`FilterChip` doc): the one
+          click drops every hide at once. Counts ride inside the label the way the
+          roster's chip carries its own, and the accessible name says what the
+          click does. After the include chips so the strip reads what is kept,
+          then what is dropped. */}
+      {hiddenFilters.size > 0 && (
+        <div className="px-3 pb-1">
+          <FilterChip
+            aggregate
+            label={i18nT('pages.chatSidebar.hiding_named_filter', {
+              filter: fmtList(
+                SESSION_FILTERS.filter(filterDef => hiddenFilters.has(filterDef.key)).map(filterDef => {
+                  const slotCount = filterCounts[filterDef.key] ?? 0
+                  return `${i18nT(FILTER_LABEL_KEY[filterDef.key])}${slotCount > 0 ? ` (${slotCount})` : ''}`
+                }),
+                { type: 'unit', style: 'short' },
+              ),
+            })}
+            clearLabel={i18nT('pages.chatSidebar.filter_unhide_named', {
+              filter: fmtList(SESSION_FILTERS.filter(filterDef => hiddenFilters.has(filterDef.key)).map(filterDef => i18nT(FILTER_LABEL_KEY[filterDef.key]))),
+            })}
+            onClear={clearHiddenFilters}
+            testId="hidden-filter-chip"
+          />
+        </div>
+      )}
       {seedError && (
         /* Outside the layout branches on purpose. A TOTAL seed failure leaves
          * zero columns, so the board branch never renders — a banner inside it
@@ -5364,6 +5446,9 @@ function ChatSidebar({
           )}
         </div>
       )}
+      {/* Yields to the preview's instance-sessions banner, which already reports
+       *  a failed ['instances'] read when the preview flag is on. */}
+      {hasRemoteExecutedRow && !remoteSessionsError && <RemoteCrewNamesError />}
       {/* Read failures for the two lists this pane is built from. Same placement
        *  rationale as the seed banner: a failed folders query means no folder
        *  tree, a failed columns query means no board, so neither branch can host
@@ -5402,6 +5487,19 @@ function ChatSidebar({
        *  Inputs are already persisted or were never typed (a create menu pick),
        *  so the hand-off loses nothing. Dismissable: the failure is a moment, not
        *  a state — the caches have already been re-synced. */}
+      {/* A refused single-session close. Dismissable: the session is simply still
+       *  open, and closing it again is the retry. A "still saving" refusal clears
+       *  on its own, so it offers no agent hand-off; any other failure does. */}
+      <ErrorNotice
+        title={i18nT('pages.chatSidebar.close_refused_title')}
+        message={closeRefused
+          ? i18nT(closeRefused.reason === 'historyWrite' ? 'pages.chatSidebar.close_refused' : 'pages.chatSidebar.close_refused_other', { title: closeRefused.title })
+          : null}
+        askAgent={closeRefused?.reason === 'failed'}
+        onDismiss={() => dispatch(setCloseRefused(null))}
+        className="mx-2 mt-2 shrink-0"
+        testId="close-refused"
+      />
       <ErrorNotice
         title={i18nT('pages.chatSidebar.folder_update_failed')}
         message={folderActionError}
@@ -5410,12 +5508,6 @@ function ChatSidebar({
         className="mx-2 mt-2 shrink-0"
         testId="folder-action-error"
       />
-      {/* A confirmed subtree close that the server refused per session. It sits in
-       *  this same band because it is the same kind of fact: a write on the rows
-       *  below failed, the list already agrees with what did happen, and the row
-       *  staying put is the only other trace the person would get. */}
-      {closeTreeError}
-      {closeTreeNotice}
       {/* The folder order (dashboard.folder_sort) could not be read AND there is
        *  no body to fall back on: the tree is drawn in the stored order meanwhile
        *  and sibling drags are withdrawn, so the person is told why the order they
@@ -5494,6 +5586,17 @@ function ChatSidebar({
         className="mx-2 mt-2 shrink-0"
         testId="rename-error"
       />
+      <ErrorNotice
+        title={i18nT('pages.chatPage.could_not_generate_title')}
+        message={autoTitleError}
+        askAgent
+        // Below, not beside: at sidebar width a side link squeezes the
+        // message into a one-word column.
+        actionPlacement="below"
+        onDismiss={() => setAutoTitleError('')}
+        className="mx-2 mt-2 shrink-0"
+        testId="auto-title-error"
+      />
         {/* An instance that is CONNECTED but did not answer contributes no rows.
           *  Saying so is the difference between "that instance has nothing open" and
           *  "we could not ask": without this line the list silently claims a
@@ -5560,7 +5663,7 @@ function ChatSidebar({
             {(() => {
               const tree = lineage
               if (!tree) return null
-              const searching = conductorSearching
+              const searching = slotFilter.trim() !== ''
               // Keyed by identity, exactly as `lineage` is: a raw-key map would let a
               // federated peer row overwrite the local row it collides with, so one
               // session would vanish and the other would render twice.
@@ -5570,7 +5673,12 @@ function ChatSidebar({
               // did not admit it -- so it renders dimmed and still carries its chevron.
               // Without it a filtered-out conductor's workers each resolved no parent
               // and scattered to the top level, which is what switching on Unread did.
-              const kept = conductorKept
+              const kept = new Set<string>()
+              for (const id of conductorMatching) {
+                if (!byKey.has(id)) continue
+                kept.add(id)
+                for (const up of ancestorsOf(id, tree.parentOf)) kept.add(up)
+              }
               const keptKids = (key: string) =>
                 (tree.children.get(key) ?? []).filter(k => kept.has(k))
               const rows: Array<{ id: string; slot: Slot; depth: number; childCount: number; expanded: boolean; orphanOf: string | null; citesParent?: string | null; anchorOnly: boolean; aggregate: { needsYou: number; running: number } | null }> = []
@@ -5607,9 +5715,18 @@ function ChatSidebar({
                 // creator closed or because the folder filter conceals it is decided
                 // against the unfiltered population. A creator that is still there is
                 // open and running, so saying it closed would be false.
-                const cited = orphanCitation(slot, tree.parentOf.get(key) ?? null)
+                //
+                // `closedCreatorCitation` is the row the backend re-parented: it IS
+                // placed, under the nearest ancestor still open, and its own creator
+                // closed. Same fact as an orphan's, so the same glyph, and the backend
+                // said so outright -- which is why `ancestor` settles the reading here
+                // rather than the population being consulted for it.
+                const placedUnder = tree.parentOf.get(key) ?? null
+                const cited = orphanCitation(slot, placedUnder)
+                  ?? closedCreatorCitation(slot, placedUnder)
                 const creator = citedCreatorOf(slot)
-                const creatorStillOpen = cited != null && creator !== null
+                const creatorStillOpen = cited != null && slot.parent?.ancestor !== true
+                  && creator !== null
                   && (citedCreatorExists.get(creator.origin)?.has(creator.key) ?? false)
                 rows.push({
                   id: key,
@@ -5662,18 +5779,6 @@ function ChatSidebar({
                     {renderSessionRow(row.slot, row.depth, showDivider, 'conductor', 'conductor', 'conductor', {
                       depth: row.depth,
                       childCount: row.childCount,
-                      // Every descendant under this card -- what the ✕ label quotes.
-                      // Zero while searching: the lane is flat then and the ✕ closes one session.
-                      subtreeCount: searching ? 0 : descendantsOf(row.id, tree.children).filter(k => kept.has(k)).length,
-                      // What the press would find running, by the close's own predicate,
-                      // so the ✕ says "Can't close" before the press instead of after.
-                      // Only a card with sessions under it: a leaf keeps the plain single close.
-                      subtreeRunning: (() => {
-                        if (searching) return 0
-                        const under = descendantsOf(row.id, tree.children).filter(k => kept.has(k))
-                        if (under.length === 0) return 0
-                        return [row.id, ...under].filter(k => { const s = byKey.get(k); return s != null && sidebarRowRunning(s, runningSet, subagentCounts) }).length
-                      })(),
                       expanded: row.expanded,
                       aggregate: row.aggregate,
                       orphanOf: row.orphanOf,
@@ -5777,7 +5882,7 @@ function ChatSidebar({
                     <Fragment key={sessionRowIdentity(s)}>
                       {startsAutomaticSection(flatSlots, i) && <PinnedSessionDivider />}
                       {showHeader && (
-                        <div data-date-header data-testid="date-segment-header" className="pl-2 pr-3 pt-3 pb-1 text-[11px] font-semibold text-muted uppercase tracking-[.06em] select-none first:pt-1">{seg}</div>
+                        <div data-date-header data-testid="date-segment-header" className="px-3 pt-3 pb-1 text-[11px] font-semibold text-muted uppercase tracking-[.06em] select-none first:pt-1">{seg}</div>
                       )}
                       {renderSessionRow(s, 0, showDivider, flatLaneScope, flatLaneScope, flatHoldContainer)}
                     </Fragment>
@@ -5807,6 +5912,14 @@ function ChatSidebar({
           // still work, and the list's own overflow is still the affordance.
           <SessionRowWindowContext.Provider value={laneRowWindow.rowWindow}>
           <motion.div ref={setLaneScrollEl} onScroll={laneScrollMemory.onScroll} layoutScroll={rowAnimEnabled} className={`${LIST_BODY_CLS} flex flex-col`} style={{ scrollbarWidth: 'none' }} data-testid="tree-view-lane">
+            {/* Scroll floor for collapseFloor.ts: lets a folder collapsed near
+             *  the end of the list stay where its pinned header was instead of
+             *  the list sliding down. Zero height and first in the lane, so
+             *  nothing above it can move it; its hidden child is placed only
+             *  during a collapse. */}
+            <div {...{ [COLLAPSE_FLOOR_ATTR]: '' }} aria-hidden="true" className="relative h-0 shrink-0">
+              <div className="absolute left-0 w-px h-px hidden pointer-events-none" />
+            </div>
             {/* Tree-lane fallback, completing the set (flat and board lanes
              *  carry the same): a create into a folder the folder-filter or
              *  hide feature excludes never renders that folder's header, so
@@ -6407,6 +6520,7 @@ function ChatSidebar({
       <div
         role="button"
         tabIndex={0}
+        {...uiLocation('chat.older-sessions')}
         onClick={() => { if (historyOpen) setHistoryOpen(false); else openHistoryPane() }}
         onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); if (historyOpen) setHistoryOpen(false); else openHistoryPane() } }}
         /* pt/pb are 14px, not py-3, so this row's top border lands on the same
@@ -6640,7 +6754,7 @@ function ChatSidebar({
                           Hidden for remote rows: deleteHistorySession targets the
                           LOCAL session file, which for a remote row is at best a
                           same-keyed unrelated conversation. */}
-                      {!remoteInstanceId && <div className="absolute top-1/2 -translate-y-1/2 right-1.5 opacity-0 group-hover:opacity-100 [@media(hover:none)]:opacity-100 group-focus-within:opacity-100 focus-within:opacity-100 transition-all flex items-center gap-0.5 rounded-md p-1 bg-card border border-border shadow-sm">
+                      {!remoteInstanceId && <div className="absolute top-1/2 -translate-y-1/2 right-1.5 opacity-0 group-hover:opacity-100 [@media(hover:none)]:opacity-100 group-focus-visible:opacity-100 group-has-[:focus-visible]:opacity-100 transition-all flex items-center gap-0.5 rounded-md p-1 bg-card border border-border shadow-sm">
                         <button type="button" title={i18nT('pages.chatSidebar.delete_history_session')} aria-label={i18nT('pages.chatSidebar.delete_history_session')} className="text-[12px] text-muted cursor-pointer p-[4px] rounded hover:text-danger hover:bg-danger-subtle transition-all bg-transparent border-none" onMouseDown={e => e.stopPropagation()} onClick={e => { e.stopPropagation(); if (confirm(i18nT('pages.chatSidebar.are_you_sure_you_want_to_delete_this_history_ses'))) dispatch(deleteHistorySession(s.key)) }}><X size={12} /></button>
                       </div>}
                     </div>
@@ -6700,11 +6814,6 @@ function ChatSidebar({
           </motion.div>
         )}
       </AnimatePresence>
-
-      {/* The close-tree confirm, one instance for the whole sidebar: a press lands
-       *  on one row at a time, and the hook already answers an earlier ask "no"
-       *  when a second arrives. */}
-      {closeTreeDialog}
 
       {/* One folder create/settings modal for the whole sidebar. Rendered here
        *  rather than per-row so a folder shown in several board columns can only
