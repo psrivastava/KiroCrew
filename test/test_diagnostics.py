@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import threading
 import time
 import zipfile
 from pathlib import Path
@@ -25,7 +26,7 @@ import pytest
 import yaml
 
 from conftest import make_dir_link, requires_symlinks
-from kiro_crew import beacon, diagnostics, release_channel
+from kiro_crew import agent_scratch, beacon, diagnostics, release_channel
 from kiro_crew.dashboard.handlers import diagnostics as dh
 from kiro_crew.diagnostics import BundleResult
 
@@ -66,6 +67,9 @@ def _isolate(monkeypatch, home: Path) -> None:
     """Point the collector at a temp home and stub host-specific probes."""
     home.mkdir(parents=True, exist_ok=True)
     monkeypatch.setattr("kiro_crew.diagnostics.config_dir", lambda: home)
+    # The per-process kiro-cli logs are read from the agent scratch root, which
+    # sits under the data home too.
+    monkeypatch.setattr(agent_scratch, "config_dir", lambda: home)
     # Pin Path.home() too: on Windows the real host home is a PARENT of tmp_path,
     # so without this the real home would collapse the tmp prefix and the
     # fixtures' home paths would never match. Both the collector's home and
@@ -374,9 +378,7 @@ def test_authorization_scheme_credential_fully_redacted(tmp_path, monkeypatch):
     """A non-Bearer scheme + raw token must be fully redacted (not just the scheme)."""
     home = tmp_path / "home"
     _isolate(monkeypatch, home)
-    (home / "gateway.log").write_text(
-        "Authorization: Token abc-123-def-456-ghijklmno\nplain\n"
-    )
+    (home / "gateway.log").write_text("Authorization: Token abc-123-def-456-ghijklmno\nplain\n")
     r = diagnostics.collect_bundle(output_dir=tmp_path / "out")
     with zipfile.ZipFile(r.zip_path) as z:
         gw = z.read("gateway.log").decode()
@@ -457,17 +459,15 @@ def test_archive_is_opened_in_binary_mode(tmp_path, monkeypatch):
     assert seen, "collect_bundle did not open the archive via os.open"
     expected = getattr(os, "O_BINARY", 0)
     assert seen[0] & os.O_CREAT and seen[0] & os.O_WRONLY and seen[0] & os.O_TRUNC
-    assert seen[0] & expected == expected, (
-        "archive fd is missing O_BINARY — bundles would be corrupt on Windows"
-    )
+    assert (
+        seen[0] & expected == expected
+    ), "archive fd is missing O_BINARY — bundles would be corrupt on Windows"
     # And the archive it produced is actually readable back.
     with zipfile.ZipFile(r.zip_path) as z:
         assert "gateway.log" in z.namelist()
 
 
-def test_tail_truncation_keeps_credentials_attached_to_their_anchor(
-    tmp_path, monkeypatch
-):
+def test_tail_truncation_keeps_credentials_attached_to_their_anchor(tmp_path, monkeypatch):
     """A byte-offset tail must not strip a header name off its own credential.
 
     ``_EXTRA_REDACTIONS`` anchors on the header NAME and redacts to end-of-line,
@@ -482,12 +482,7 @@ def test_tail_truncation_keeps_credentials_attached_to_their_anchor(
 
     secret = "TAILboundaryLEAK123456789abcdefXYZ"
     # Pad so the 200-byte window starts partway through the Authorization line.
-    log = (
-        "x" * 300
-        + "\n"
-        + f"Authorization: Basic {secret}\n"
-        + "tail marker line\n"
-    )
+    log = "x" * 300 + "\n" + f"Authorization: Basic {secret}\n" + "tail marker line\n"
     (home / "gateway.log").write_text(log)
 
     r = diagnostics.collect_bundle(output_dir=tmp_path / "out")
@@ -589,6 +584,90 @@ def test_symlinked_source_is_not_followed(tmp_path, monkeypatch):
     assert "TOPSECRETsymlinkVALUE123" not in joined
 
 
+def _scratch_chat_log(root: Path, name: str, body: str, mtime: float) -> None:
+    """Write ``<root>/<name>/kiro-log/kiro-chat.log`` with its mtime pinned."""
+    log = root / name / agent_scratch.KIRO_CLI_LOG_SUBDIR / agent_scratch.KIRO_CLI_CHAT_LOG_NAME
+    log.parent.mkdir(parents=True)
+    log.write_text(body, encoding="utf-8")
+    os.utime(log, (mtime, mtime))
+
+
+def test_bundle_takes_the_newest_per_process_chat_logs(tmp_path, monkeypatch):
+    """The bundle carries the newest per-process kiro-cli chat logs from scratch.
+
+    Each spawned kiro-cli logs into its own scratch dir, which no shared
+    ``kiro-log`` location reaches. The bundle takes the newest of those logs by
+    mtime, up to the cap, as ``kiro-chat/<scratch dir>.log`` beside the shared
+    ``kiro-chat.log``, and scrubs them like every other member.
+    """
+    home = tmp_path / "home"
+    _isolate(monkeypatch, home)
+    shared = tmp_path / "kiro-chat.log"
+    shared.write_text("shared log line\n", encoding="utf-8")
+    monkeypatch.setattr(diagnostics, "_kiro_cli_chat_log", lambda: shared)
+    monkeypatch.setattr(diagnostics, "_MAX_SCRATCH_CHAT_LOGS", 2)
+    root = agent_scratch.scratch_root()
+    # Neither the name order nor the write order is the newest-first order.
+    _scratch_chat_log(root, "chat-a-00000001", "middle log line\n", 1_700_000_100)
+    _scratch_chat_log(root, "chat-b-00000002", "oldest log line\n", 1_700_000_000)
+    _scratch_chat_log(root, "chat-c-00000003", f"newest log line\n{_GATEWAY}", 1_700_000_200)
+
+    r = diagnostics.collect_bundle(output_dir=tmp_path / "out")
+
+    with zipfile.ZipFile(r.zip_path) as z:
+        assert [n for n in z.namelist() if n.startswith("kiro-chat/")] == [
+            "kiro-chat/chat-c-00000003.log",
+            "kiro-chat/chat-a-00000001.log",
+        ]
+        newest = z.read("kiro-chat/chat-c-00000003.log").decode()
+        assert "shared log line" in z.read("kiro-chat.log").decode()
+    assert "newest log line" in newest
+    for secret in _SECRETS:
+        assert secret not in newest, f"secret leaked from a scratch chat log: {secret!r}"
+    assert r.redaction_summary["kiro-chat/chat-c-00000003.log"] >= 3
+
+
+def test_bundle_never_walks_a_linked_scratch_level(tmp_path, monkeypatch):
+    """A linked scratch root, scratch dir or ``kiro-log`` is skipped, never walked.
+
+    ``Path.is_dir()`` follows a link, and the log on its far side is a regular
+    file the per-file check passes, so each DIRECTORY level needs its own guard
+    to keep an off-tree ``kiro-chat.log`` out of a bundle bound for a public
+    issue. ``make_dir_link`` stages a junction on Windows and a directory symlink
+    elsewhere, so the guard is exercised on every platform.
+    """
+    home = tmp_path / "home"
+    _isolate(monkeypatch, home)
+    root = agent_scratch.scratch_root()
+    off_tree = tmp_path / "off-tree"
+    _scratch_chat_log(root, "real-00000001", "kept log line\n", 1_700_000_000)
+    _scratch_chat_log(off_tree, "dir", "OFFTREEscratchDIR\n", 1_700_000_100)
+    _scratch_chat_log(off_tree, "log", "OFFTREEkiroLOG\n", 1_700_000_200)
+    make_dir_link(root / "linked-dir-00000002", off_tree / "dir")
+    (root / "linked-log-00000003").mkdir()
+    make_dir_link(
+        root / "linked-log-00000003" / agent_scratch.KIRO_CLI_LOG_SUBDIR,
+        off_tree / "log" / agent_scratch.KIRO_CLI_LOG_SUBDIR,
+    )
+
+    def scratch_members() -> tuple[list[str], bytes]:
+        r = diagnostics.collect_bundle(output_dir=tmp_path / "out")
+        with zipfile.ZipFile(r.zip_path) as z:
+            names = z.namelist()
+            blob = b"".join(z.read(n) for n in names)
+        return [n for n in names if n.startswith("kiro-chat/")], blob
+
+    members, blob = scratch_members()
+    assert members == ["kiro-chat/real-00000001.log"]
+    assert b"OFFTREE" not in blob
+
+    # The same tree reached through a linked ROOT is not walked at all.
+    root.rename(tmp_path / "moved-root")
+    make_dir_link(root, tmp_path / "moved-root")
+    members, _ = scratch_members()
+    assert members == []
+
+
 @pytest.mark.skipif(
     os.name == "nt",
     reason=(
@@ -638,13 +717,121 @@ def test_issue_url_is_well_formed(tmp_path, monkeypatch):
 
     r = diagnostics.collect_bundle(note="hi", output_dir=tmp_path / "out")
 
-    assert r.github_issue_url.startswith(
-        "https://github.com/kirodotdev/KiroCrew/issues/new?"
-    )
+    assert r.github_issue_url.startswith("https://github.com/kirodotdev/KiroCrew/issues/new?")
     # Routes through the issue FORM, not a free-form body: the form is what
     # carries the version / install / channel answers triage reads.
     assert "template=bug_report.yml" in r.github_issue_url
     assert "body=" not in r.github_issue_url
+
+
+class TestFeedbackTrackerSeam:
+    """The ``feedback`` CPP seam: an edition retargets the issue link.
+
+    Both links the gateway builds -- the dashboard's ``github_issue_url`` and the
+    terminal print ``terminal_issue_url`` -- read ``current_context().feedback``.
+    The public Default answers ``None`` and keeps the pre-filled GitHub link; an
+    edition's URL REPLACES it; a bad answer degrades to the public link.
+    A composition failure keeps the bundle usable but omits both issue links.
+    """
+
+    class _Tracker:
+        def __init__(self, answer=None, exc=None):  # type: ignore[no-untyped-def]
+            self.answer = answer
+            self.exc = exc
+            self.calls: list[tuple[str, str, bool]] = []
+
+        def report_issue_url(self, bundle, note, *, prefill):  # type: ignore[no-untyped-def]
+            self.calls.append((bundle.filename, note, prefill))
+            if self.exc is not None:
+                raise self.exc
+            return self.answer
+
+    @pytest.fixture
+    def install(self, monkeypatch):  # type: ignore[no-untyped-def]
+        """Install a context whose ``feedback`` seam is the given provider."""
+        import dataclasses
+
+        from kiro_crew import platform as platform_pkg
+
+        def _install(provider):  # type: ignore[no-untyped-def]
+            ctx = dataclasses.replace(platform_pkg.current_context(), feedback=provider)
+            monkeypatch.setattr(diagnostics, "current_context", lambda: ctx)
+            return provider
+
+        return _install
+
+    @pytest.fixture(autouse=True)
+    def _pinned_probes(self, _floor_monkeypatch):  # type: ignore[no-untyped-def]
+        # The floor patcher, not the shared one: an autouse pin on the shared
+        # monkeypatch is lifted by any test that calls monkeypatch.undo().
+        _floor_monkeypatch.setattr(diagnostics, "_kiro_cli_version", lambda: "kiro-cli 2.14.2")
+        _pin_provenance(_floor_monkeypatch)
+
+    def _result(self, tmp_path):  # type: ignore[no-untyped-def]
+        name = "kirocrew-diagnostics-20260811.zip"
+        return BundleResult(zip_path=tmp_path / name, filename=name)
+
+    def test_default_provider_keeps_the_public_link(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        from kiro_crew.platform.defaults import DefaultFeedbackTrackerProvider
+
+        result = self._result(tmp_path)
+        assert DefaultFeedbackTrackerProvider().report_issue_url(result, "x", prefill=True) is None
+        assert diagnostics.terminal_issue_url(result, "x") == diagnostics._issue_url(
+            result, "x", prefill=False
+        )
+
+    def test_edition_url_replaces_both_links_and_sees_the_prefill_flag(
+        self, tmp_path, monkeypatch, install
+    ) -> None:  # type: ignore[no-untyped-def]
+        tracker = install(self._Tracker(answer="https://tracker.example.test/new?bundle=1"))
+        home = tmp_path / "home"
+        _isolate(monkeypatch, home)
+
+        r = diagnostics.collect_bundle(note="it broke", output_dir=tmp_path / "out")
+        printed = diagnostics.terminal_issue_url(r, "it broke")
+
+        assert r.github_issue_url == "https://tracker.example.test/new?bundle=1"
+        assert printed == "https://tracker.example.test/new?bundle=1"
+        # One call per surface, each told which surface it is for.
+        assert [c[2] for c in tracker.calls] == [True, False]
+        assert all(c[0] == r.filename and c[1] == "it broke" for c in tracker.calls)
+        assert "github.com" not in r.github_issue_url
+
+    @pytest.mark.parametrize(
+        "bad", [42, "", "   ", b"https://x"], ids=["int", "empty", "blank", "bytes"]
+    )
+    def test_a_non_url_answer_degrades_to_the_public_link(self, tmp_path, install, bad) -> None:  # type: ignore[no-untyped-def]
+        install(self._Tracker(answer=bad))
+        result = self._result(tmp_path)
+        assert diagnostics.terminal_issue_url(result) == diagnostics._issue_url(
+            result, "", prefill=False
+        )
+
+    def test_an_adapter_error_degrades_to_the_public_link(self, tmp_path, install) -> None:  # type: ignore[no-untyped-def]
+        install(self._Tracker(exc=RuntimeError("tracker down")))
+        result = self._result(tmp_path)
+        assert diagnostics.terminal_issue_url(result) == diagnostics._issue_url(
+            result, "", prefill=False
+        )
+
+    def test_a_composition_error_keeps_the_bundle_without_issue_links(
+        self, tmp_path, monkeypatch, install, caplog
+    ) -> None:  # type: ignore[no-untyped-def]
+        from kiro_crew.platform import PlatformCompositionError
+
+        install(self._Tracker(exc=PlatformCompositionError("companion did not compose")))
+        _isolate(monkeypatch, tmp_path / "home")
+
+        result = diagnostics.collect_bundle(output_dir=tmp_path / "out")
+        printed = diagnostics.terminal_issue_url(result)
+
+        assert result.zip_path.is_file()
+        assert zipfile.is_zipfile(result.zip_path)
+        assert result.github_issue_url == ""
+        assert printed == ""
+        assert "github.com" not in result.github_issue_url
+        assert "github.com" not in printed
+        assert "platform companion does not compose" in caplog.text
 
 
 class TestTerminalIssueUrlSurvivesRedaction:
@@ -1095,12 +1282,7 @@ class TestReportProvenance:
 # are invisible at runtime -- the form just comes up with an empty field -- so
 # they are pinned here instead.
 
-_TEMPLATE = (
-    Path(__file__).resolve().parents[1]
-    / ".github"
-    / "ISSUE_TEMPLATE"
-    / "bug_report.yml"
-)
+_TEMPLATE = Path(__file__).resolve().parents[1] / ".github" / "ISSUE_TEMPLATE" / "bug_report.yml"
 
 
 def _template_dropdown_options(field_id: str) -> list[str]:
@@ -1128,9 +1310,7 @@ def test_channel_options_exist_in_the_issue_template():
 def test_install_options_exist_in_the_issue_template():
     options = _template_dropdown_options("install")
     for value in diagnostics._INSTALL_OPTIONS.values():
-        assert value in options, (
-            f"{value!r} is not an option of bug_report.yml's install dropdown"
-        )
+        assert value in options, f"{value!r} is not an option of bug_report.yml's install dropdown"
 
 
 def test_every_known_distribution_maps_to_an_install_option():
@@ -1147,10 +1327,7 @@ def test_triage_workflow_maps_every_channel_dropdown_answer():
     no error anywhere, because "no answer" is a legitimate outcome.
     """
     workflow = (
-        Path(__file__).resolve().parents[1]
-        / ".github"
-        / "workflows"
-        / "issue-triage.yml"
+        Path(__file__).resolve().parents[1] / ".github" / "workflows" / "issue-triage.yml"
     ).read_text(encoding="utf-8")
 
     for option in _template_dropdown_options("channel"):
@@ -1213,6 +1390,48 @@ class TestUsableDirRejectsEveryDirLink:
         monkeypatch.setattr(diagnostics.platform_compat, "is_link_or_junction", lambda p: True)
         assert diagnostics._usable_dir(real) is False
 
+    def test_a_link_is_refused_before_anything_follows_it(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # `is_dir()` follows a link to answer, and on Windows following one whose
+        # target is a UNC share authenticates to that host before the answer is
+        # thrown away, so the link check has to come first.
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        link = tmp_path / "kiro-log"
+        make_dir_link(link, outside)
+        followed: list[Path] = []
+        real_is_dir = Path.is_dir
+
+        def recording_is_dir(self, *args, **kwargs):
+            followed.append(self)
+            return real_is_dir(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "is_dir", recording_is_dir)
+
+        assert diagnostics._usable_dir(link) is False
+        assert link not in followed
+
+
+@requires_symlinks
+def test_a_linked_log_is_refused_before_anything_follows_it(tmp_path, monkeypatch):
+    """``_usable_log`` checks for a link before ``is_file()``, which follows one."""
+    target = tmp_path / "real.log"
+    target.write_text("log line\n", encoding="utf-8")
+    link = tmp_path / "kiro-chat.log"
+    link.symlink_to(target)
+    followed: list[Path] = []
+    real_is_file = Path.is_file
+
+    def recording_is_file(self, *args, **kwargs):
+        followed.append(self)
+        return real_is_file(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "is_file", recording_is_file)
+
+    assert diagnostics._usable_log(link) is False
+    assert link not in followed
+
 
 # ── API handlers (mode-independent: stub request + asyncio.run) ──────────────
 
@@ -1255,9 +1474,7 @@ def _stub_sel(monkeypatch) -> MagicMock:
 
 
 def test_download_rejects_path_traversal(tmp_path, monkeypatch):
-    monkeypatch.setattr(
-        "kiro_crew.dashboard.handlers.diagnostics.config_dir", lambda: tmp_path
-    )
+    monkeypatch.setattr("kiro_crew.dashboard.handlers.diagnostics.config_dir", lambda: tmp_path)
     sel = _stub_sel(monkeypatch)
     resp = asyncio.run(dh.api_diagnostics_download(_DownloadReq("../../etc/passwd")))
     assert resp.status == 403
@@ -1268,9 +1485,7 @@ def test_download_rejects_non_zip(tmp_path, monkeypatch):
     diag = tmp_path / "diagnostics"
     diag.mkdir()
     (diag / "foo.txt").write_text("not a zip")
-    monkeypatch.setattr(
-        "kiro_crew.dashboard.handlers.diagnostics.config_dir", lambda: tmp_path
-    )
+    monkeypatch.setattr("kiro_crew.dashboard.handlers.diagnostics.config_dir", lambda: tmp_path)
     sel = _stub_sel(monkeypatch)
     resp = asyncio.run(dh.api_diagnostics_download(_DownloadReq("foo.txt")))
     assert resp.status == 403
@@ -1281,19 +1496,54 @@ def test_download_allows_and_audits_valid_zip(tmp_path, monkeypatch):
     diag = tmp_path / "diagnostics"
     diag.mkdir()
     (diag / "b.zip").write_bytes(b"PK\x03\x04zip")
-    monkeypatch.setattr(
-        "kiro_crew.dashboard.handlers.diagnostics.config_dir", lambda: tmp_path
-    )
+    monkeypatch.setattr("kiro_crew.dashboard.handlers.diagnostics.config_dir", lambda: tmp_path)
     sel = _stub_sel(monkeypatch)
     resp = asyncio.run(dh.api_diagnostics_download(_DownloadReq("b.zip")))
     assert resp.status == 200
     assert sel.log_tool_invocation.call_args.kwargs["outcome"] == "allowed"
 
 
-def test_collect_handler_returns_download_url(tmp_path, monkeypatch):
-    monkeypatch.setattr(
-        "kiro_crew.dashboard.handlers.diagnostics.config_dir", lambda: tmp_path
+@pytest.mark.parametrize("filename", ["b.zip", "../../etc/passwd"])
+def test_download_path_checks_run_off_the_event_loop_thread(tmp_path, monkeypatch, filename):
+    # ``resolve()`` and ``is_file()`` stat the data home, and a stat on a mount
+    # that stopped answering blocks for as long as the kernel does: on the loop
+    # that stalls every session, so the checks must run on a worker thread for
+    # both a served and a refused name.
+    diag = tmp_path / "diagnostics"
+    diag.mkdir()
+    (diag / "b.zip").write_bytes(b"PK\x03\x04zip")
+    monkeypatch.setattr("kiro_crew.dashboard.handlers.diagnostics.config_dir", lambda: tmp_path)
+    sel = _stub_sel(monkeypatch)
+    loop_thread = threading.get_ident()
+    check_threads: set[int] = set()
+    real_resolve = Path.resolve
+    real_is_file = Path.is_file
+
+    def tracked_resolve(self, *a, **kw):
+        if diag in (self, *self.parents):
+            check_threads.add(threading.get_ident())
+        return real_resolve(self, *a, **kw)
+
+    def tracked_is_file(self, *a, **kw):
+        if diag in self.parents:
+            check_threads.add(threading.get_ident())
+        return real_is_file(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "resolve", tracked_resolve)
+    monkeypatch.setattr(Path, "is_file", tracked_is_file)
+    resp = asyncio.run(dh.api_diagnostics_download(_DownloadReq(filename)))
+
+    served = filename == "b.zip"
+    assert resp.status == (200 if served else 403)
+    assert sel.log_tool_invocation.call_args.kwargs["outcome"] == (
+        "allowed" if served else "denied"
     )
+    assert check_threads, "the download never checked the bundle path"
+    assert loop_thread not in check_threads
+
+
+def test_collect_handler_returns_download_url(tmp_path, monkeypatch):
+    monkeypatch.setattr("kiro_crew.dashboard.handlers.diagnostics.config_dir", lambda: tmp_path)
     fake = BundleResult(
         zip_path=tmp_path / "b.zip",
         filename="b.zip",
@@ -1351,8 +1601,6 @@ def test_old_bundles_are_pruned(tmp_path):
 
 
 def test_collect_handler_rejects_non_object_body(tmp_path, monkeypatch):
-    monkeypatch.setattr(
-        "kiro_crew.dashboard.handlers.diagnostics.config_dir", lambda: tmp_path
-    )
+    monkeypatch.setattr("kiro_crew.dashboard.handlers.diagnostics.config_dir", lambda: tmp_path)
     resp = asyncio.run(dh.api_diagnostics_collect(_CollectReq(["not", "a", "dict"])))
     assert resp.status == 400

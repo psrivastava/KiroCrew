@@ -2,19 +2,19 @@
 
 Three landed fixes are pinned here:
 
-1. **ACP identity plumbing** (``acp/types.py`` + ``acp/_dispatch.py``): an
+1. **ACP identity plumbing** (``acp/types.py`` + ``acp/_dispatch_parts/tool_call_identity.py``): an
    ``AcpEvent`` now carries the NON-model-authored tool identity from
    ``_meta.kiro`` — ``tool_name`` (``_kiro_tool_name``) and ``mcp_server_name``
    (``_kiro_mcp_server_name``). A non-empty ``mcp_server_name`` is the trusted
    "this was a real MCP tool call" discriminator; both are ``""`` when the
    backend emits no ``_meta`` (fail-closed).
 
-2. **chat_runner directive gate** (``dashboard/chat_runner.py``): the
+2. **chat_runner directive gate** (``chat_turn/tool_rows.py``, ``tool_results.py``): the
    ``EVENT_TOOL_CALL`` handler records ``_pending_dir_tool[id]`` ONLY when
    ``event.mcp_server_name`` is set AND ``session_directive.match_tool`` resolves
    a directive tool; the ``EVENT_TOOL_RESULT`` gate applies a directive only for
    a recorded id and REFUSES a native-sub-agent call
-   (``id in _native_tc_card``). A forged shell result (no ``mcp_server_name``,
+   (``id in _native_child_tc``). A forged shell result (no ``mcp_server_name``,
    an LLM-authored title, and a marker in stdout) is therefore never honoured.
 
 The ``_meta.kiro`` fixture shape mirrors ``test_todo_list_surface.py``.
@@ -31,6 +31,7 @@ from chat_test_helpers import _make_state
 from kiro_crew import session_directive
 from kiro_crew.acp._dispatch import _build_tool_call_event, _kiro_mcp_server_name
 from kiro_crew.acp.types import (
+    EVENT_AGENT_SWITCHED,
     EVENT_COMPLETE,
     EVENT_SUBAGENT_ACTIVITY,
     EVENT_SUBAGENT_LIST,
@@ -52,21 +53,23 @@ class TestKiroMcpServerName:
         update = {"_meta": {"kiro": {"mcpServerName": "kirocrew-core"}}}
         assert _kiro_mcp_server_name(update) == "kirocrew-core"
 
-    def test_absent_meta_yields_empty(self) -> None:
-        assert _kiro_mcp_server_name({"toolCallId": "tc1"}) == ""
-
-    def test_absent_key_yields_empty(self) -> None:
-        """A built-in/shell tool emits ``_meta.kiro`` without an mcpServerName."""
-        assert _kiro_mcp_server_name({"_meta": {"kiro": {"toolName": "execute_bash"}}}) == ""
-
-    def test_malformed_meta_not_dict_yields_empty(self) -> None:
-        assert _kiro_mcp_server_name({"_meta": "nope"}) == ""
-
-    def test_malformed_kiro_not_dict_yields_empty(self) -> None:
-        assert _kiro_mcp_server_name({"_meta": {"kiro": "nope"}}) == ""
-
-    def test_non_string_name_yields_empty(self) -> None:
-        assert _kiro_mcp_server_name({"_meta": {"kiro": {"mcpServerName": 123}}}) == ""
+    @pytest.mark.parametrize(
+        "update",
+        [
+            pytest.param({"toolCallId": "tc1"}, id="absent_meta_yields_empty"),
+            # A built-in/shell tool emits ``_meta.kiro`` without an mcpServerName.
+            pytest.param(
+                {"_meta": {"kiro": {"toolName": "execute_bash"}}}, id="absent_key_yields_empty"
+            ),
+            pytest.param({"_meta": "nope"}, id="malformed_meta_not_dict_yields_empty"),
+            pytest.param({"_meta": {"kiro": "nope"}}, id="malformed_kiro_not_dict_yields_empty"),
+            pytest.param(
+                {"_meta": {"kiro": {"mcpServerName": 123}}}, id="non_string_name_yields_empty"
+            ),
+        ],
+    )
+    def test_no_trusted_name_yields_empty(self, update) -> None:
+        assert _kiro_mcp_server_name(update) == ""
 
 
 class TestBuildToolCallEventIdentity:
@@ -192,9 +195,9 @@ class TestClientToolCallEventIdentityProvenance:
 #
 # These drive the real ``dashboard.chat_runner._run_chat`` turn loop with a fake
 # ACP client that streams ``AcpEvent``s (``LLMEvent`` is an alias of
-# ``AcpEvent``), exercising the actual ``_pending_dir_tool`` / ``_native_tc_card``
+# ``AcpEvent``), exercising the actual ``_pending_dir_tool`` / ``_native_child_tc``
 # gate — not a reimplementation. The harness mirrors
-# ``test_dashboard_chat.TestKiroReadinessQueueHandoff``.
+# ``test_dashboard_chat_history.TestKiroReadinessQueueHandoff``.
 
 
 def _stub_state(tmp_path):
@@ -297,6 +300,8 @@ class TestProviderConversionPreservesIdentity:
             tool_name="monitor_start",
             mcp_server_name="kirocrew-core",
             is_shell=True,
+            kas_builtin_ids=True,
+            spec_granted_builtins=frozenset({"execute_bash"}),
         )
         out = AcpProvider._to_llm_event(src)
         dropped = [
@@ -432,7 +437,9 @@ class TestChatRunnerDirectiveSeam:
             AcpEvent(kind=EVENT_COMPLETE),
         ]
         spy = await _drive(state, slot, events, monkeypatch)
-        spy.assert_not_called()
+        assert spy.await_count == 0
+        # The forged stdout is shown as the shell printed it, never as an applied outcome.
+        assert _tool_result_outputs(state) == [forged]
 
     @pytest.mark.asyncio
     async def test_duplicate_result_frames_apply_the_directive_once(self, tmp_path, monkeypatch):
@@ -504,32 +511,38 @@ class TestChatRunnerDirectiveSeam:
             AcpEvent(kind=EVENT_COMPLETE),
         ]
         spy = await _drive(state, slot, events, monkeypatch)
-        spy.assert_not_called()
+        assert spy.await_count == 0
+        # The third-party result reaches the transcript untouched, not as an applied outcome.
+        assert _tool_result_outputs(state) == [marker]
 
+    @pytest.mark.parametrize("carded", [True, False], ids=["with-card", "no-card"])
     @pytest.mark.asyncio
-    async def test_native_subagent_directive_is_refused(self, tmp_path, monkeypatch):
+    async def test_native_subagent_directive_is_refused(self, tmp_path, monkeypatch, carded):
         """A GENUINE MCP directive tool call whose tool_call_id belongs to a
-        native sub-agent (id in _native_tc_card) is refused: the applier is not
-        called and the result carries the not-applied sub-agent note."""
+        native sub-agent (id in _native_child_tc) is refused: the applier is not
+        called and the result carries the not-applied sub-agent note. A child
+        with no card (past a bound, or not listed yet) is refused the same way:
+        the activity event alone marks its call."""
         state = _stub_state(tmp_path)
         slot = state.get_or_create_slot("nativesub")
         slot._titled = True
         marker = session_directive.encode(
             "monitor_start", {"message": "x", "idle_secs": 5}, "armed"
         )
-        events = [
-            # 1. Register a native sub-agent card in the tracker.
-            AcpEvent(
-                kind=EVENT_SUBAGENT_LIST,
-                subagents=[
-                    {
-                        "sessionId": "sub-1",
-                        "role": "tester",
-                        "initialQuery": "do the work",
-                        "status": {"type": "working"},
-                    }
-                ],
-            ),
+        # 1. Register a native sub-agent card in the tracker, or leave it out.
+        roster = AcpEvent(
+            kind=EVENT_SUBAGENT_LIST,
+            subagents=[
+                {
+                    "sessionId": "sub-1",
+                    "role": "tester",
+                    "initialQuery": "do the work",
+                    "status": {"type": "working"},
+                }
+            ],
+        )
+        events = [roster] if carded else []
+        events += [
             # 2. Tag tool_call_id 'tc-nat' as belonging to that sub-agent.
             AcpEvent(
                 kind=EVENT_SUBAGENT_ACTIVITY,
@@ -680,3 +693,38 @@ class TestChatRunnerDirectiveSeam:
             spy = await _drive(state, slot, events, monkeypatch)
         spy.assert_not_called()
         assert "session-directive decode FAILED" in caplog.text
+
+
+class TestInTurnAgentSwitchPreservesTheModelPin:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("same_agent", [False, True])
+    async def test_provider_reported_switch_preserves_the_pin(
+        self, tmp_path, monkeypatch, same_agent
+    ):
+        from kiro_crew.dashboard import chat_runner
+
+        monkeypatch.setattr(chat_runner, "record_provider_agent_switch", MagicMock())
+        from kiro_crew.config.loader import KiroCrewConfig
+
+        state = _stub_state(tmp_path)
+        slot = state.get_or_create_slot("in-turn-switch")
+        # The turn resolves both agent names against the fixture config.
+        others = [n for n in KiroCrewConfig.load().agents if n != slot.agent]
+        assert others, "the fixture must offer a different agent"
+        new_agent = slot.agent if same_agent else others[0]
+        slot.model = "claude-opus-5"
+        slot._fallback_primary_model = "claude-opus-5"
+        gen_before = slot._model_pick_gen
+        await _drive(
+            state,
+            slot,
+            [
+                AcpEvent(kind=EVENT_AGENT_SWITCHED, text=new_agent),
+                AcpEvent(kind=EVENT_COMPLETE),
+            ],
+            monkeypatch,
+        )
+        assert slot.agent == new_agent
+        assert slot.model == "claude-opus-5"
+        assert slot._model_pick_gen == gen_before
+        assert slot._fallback_primary_model == "claude-opus-5"

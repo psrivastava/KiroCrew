@@ -19,6 +19,10 @@ import type { MemberSignals } from './rosterFilter'
 vi.mock('../../components/CrewStateAvatar', () => ({
   default: ({ seed }: { seed: string }) => <span data-testid="avatar-stub">{seed}</span>,
 }))
+// The import dialog reads the card store; its own suite covers it.
+vi.mock('./CrewmateImportDialog', () => ({
+  default: () => <div data-testid="import-dialog-stub" />,
+}))
 
 import CrewmateSwitcher, { CrewmateUnreadColumn } from './CrewmateSwitcher'
 
@@ -38,7 +42,7 @@ const MEMBERS = [
 function setup(props: Partial<Parameters<typeof CrewmateSwitcher>[0]> = {}) {
   const onPick = vi.fn()
   const onCreate = vi.fn()
-  render(<CrewmateSwitcher members={MEMBERS} defaultAgent="" activeName="scribe" onPick={onPick} onCreate={onCreate} {...props} />)
+  render(<CrewmateSwitcher members={MEMBERS} activeName="scribe" onPick={onPick} onCreate={onCreate} {...props} />)
   return { onPick, onCreate }
 }
 
@@ -50,7 +54,7 @@ const open = async () => {
 const options = (list: HTMLElement) => within(list).getAllByRole('option')
 
 describe('CrewmateSwitcher closed chip', () => {
-  it('stacks the OTHER crewmates\' faces in roster order; no count, the roster word folded until hover', () => {
+  it('stacks the OTHER mates\' faces in roster order; no count, the roster word folded until hover', () => {
     setup()
     const faces = within(chip()).getAllByTestId('avatar-stub').map((f) => f.textContent)
     // Three faces at most, none of them the open crewmate: the identity pill
@@ -64,22 +68,41 @@ describe('CrewmateSwitcher closed chip', () => {
     // rest; it slides open on hover, focus or while the list is open. The
     // button is named by aria-label, so the fold changes nothing spoken.
     const label = screen.getByTestId('crewmate-switcher-label')
-    expect(label).toHaveTextContent('Crewmates')
+    expect(label).toHaveTextContent('Mates')
     expect(label.className).toContain('grid-cols-[0fr]')
     expect(label.className).toContain('group-hover:grid-cols-[1fr]')
     expect(label.className).toContain('group-focus-visible:grid-cols-[1fr]')
     expect(label.className).toContain('group-data-[state=open]:grid-cols-[1fr]')
     expect(label.className).toContain('motion-reduce:transition-none')
     expect((label.firstElementChild as HTMLElement).className).toContain('overflow-hidden')
-    expect(chip()).toHaveAccessibleName('Crewmates')
-    expect(chip()).toHaveAttribute('title', 'Switch crewmate')
+    expect(chip()).toHaveAccessibleName('Mates')
+    expect(chip()).toHaveAttribute('title', 'Switch mate')
     expect(chip()).toHaveAttribute('aria-expanded', 'false')
   })
 
-  it('falls back to the open crewmate\'s own face when it is the whole roster', () => {
+  it('falls back to the open mate\'s own face when it is the whole roster', () => {
     setup({ members: [MEMBERS[1]] })
     const faces = within(chip()).getAllByTestId('avatar-stub').map((f) => f.textContent)
     expect(faces).toEqual(['scribe'])
+  })
+
+  // The first Mate's entrance (#23207): while Mate's face is centre stage the
+  // folded roster is the only roster on screen, so its stack holds Mate's
+  // face unpainted, box kept, exactly as the pill's slot and a roster row do.
+  it('holds the face of the mate on stage unpainted, keeping its place in the stack', () => {
+    setup({ members: [MEMBERS[1]], faceOnStageFor: 'scribe' })
+    const face = within(chip()).getByTestId('crewmate-switcher-face')
+    expect(face).toHaveAttribute('data-entrance-empty', '')
+    expect(face).toHaveStyle({ visibility: 'hidden' })
+    expect(within(face).getByTestId('avatar-stub')).toHaveTextContent('scribe')
+  })
+
+  it('leaves every face painted when no mate is on stage', () => {
+    setup()
+    for (const face of within(chip()).getAllByTestId('crewmate-switcher-face')) {
+      expect(face).not.toHaveAttribute('data-entrance-empty')
+      expect(face).not.toHaveStyle({ visibility: 'hidden' })
+    }
   })
 })
 
@@ -104,24 +127,30 @@ describe('CrewmateSwitcher roster action', () => {
 })
 
 describe('CrewmateSwitcher open list', () => {
-  it('lists every crewmate with the current one selected', async () => {
+  it('lists every mate, the open one pinned first and selected, the rest in roster order', async () => {
     setup()
     const list = await open()
     expect(chip()).toHaveAttribute('aria-expanded', 'true')
     const opts = options(list)
-    expect(opts.map((o) => within(o).getByTestId('avatar-stub').textContent)).toEqual(['oncall', 'scribe', 'Radar One', 'fixer'])
-    expect(opts.map((o) => o.getAttribute('aria-selected'))).toEqual(['false', 'true', 'false', 'false'])
-    expect(opts[1]).toHaveAttribute('data-active', 'true')
-    // The second line: Working for a running crewmate, else its agent or last message.
-    expect(opts[1]).toHaveTextContent('Working')
-    expect(opts[0]).toHaveTextContent('kirocrew-oncall')
+    expect(opts.map((o) => within(o).getByTestId('avatar-stub').textContent)).toEqual(['scribe', 'oncall', 'Radar One', 'fixer'])
+    expect(opts.map((o) => o.getAttribute('aria-selected'))).toEqual(['true', 'false', 'false', 'false'])
+    expect(opts[0]).toHaveAttribute('data-active', 'true')
+    // The second line is the roster row's: the last-message preview, never the
+    // agent template or a Working word (presence rides the avatar dot).
+    expect(opts[2]).toHaveTextContent('Swept the board')
+    expect(opts[1]).not.toHaveTextContent('kirocrew-oncall')
+    // Working is spoken, not shown: the dot carries it visibly.
+    expect(within(opts[0]).getByTestId('crewmate-switcher-row-working-label')).toHaveClass('sr-only')
+    expect(opts[0]).toHaveAccessibleName(/scribe.*Working/)
   })
 
   it('filters by display name, slug-ish name, and agent template; says when nothing matches', async () => {
     setup()
     const list = await open()
     const search = screen.getByTestId('crewmate-switcher-search')
-    expect(search).toHaveAccessibleName('Find a crewmate')
+    // Same words as the roster column's search over the same roster (#24448).
+    expect(search).toHaveAccessibleName('Search mates…')
+    expect(search).toHaveAttribute('placeholder', 'Search mates…')
 
     fireEvent.change(search, { target: { value: 'radar' } })
     // Matches the display name AND the agent template ("radar-template").
@@ -132,7 +161,7 @@ describe('CrewmateSwitcher open list', () => {
 
     fireEvent.change(search, { target: { value: 'nobody' } })
     expect(within(list).queryAllByRole('option')).toHaveLength(0)
-    expect(screen.getByTestId('crewmate-switcher-empty')).toHaveTextContent('No crewmate matches')
+    expect(screen.getByTestId('crewmate-switcher-empty')).toHaveTextContent('No mate matches')
     // The create door is still offered under an empty result.
     expect(screen.getByTestId('crewmate-switcher-create')).toBeInTheDocument()
   })
@@ -144,25 +173,26 @@ describe('CrewmateSwitcher open list', () => {
     const hidden = row('ghostwriter', { kiro_agent: 'kirocrew-ghost', has_dm_message: false, dashboard_created: false } as Partial<MemberRosterRow>)
     setup({ members: [...MEMBERS, hidden] })
     const list = await open()
-    expect(options(list).map((o) => within(o).getByTestId('avatar-stub').textContent)).toEqual(['oncall', 'scribe', 'Radar One', 'fixer'])
+    expect(options(list).map((o) => within(o).getByTestId('avatar-stub').textContent)).toEqual(['scribe', 'oncall', 'Radar One', 'fixer'])
 
     fireEvent.change(screen.getByTestId('crewmate-switcher-search'), { target: { value: 'ghost' } })
     expect(options(list).map((o) => within(o).getByTestId('avatar-stub').textContent)).toEqual(['ghostwriter'])
   })
 
-  it('keeps the OPEN crewmate listed even when the hide rule would drop it', async () => {
+  it('keeps the OPEN mate listed even when the hide rule would drop it', async () => {
     const hidden = row('ghostwriter', { has_dm_message: false, dashboard_created: false } as Partial<MemberRosterRow>)
     setup({ members: [...MEMBERS, hidden], activeName: 'ghostwriter' })
     const list = await open()
     const opts = options(list)
-    expect(opts.map((o) => within(o).getByTestId('avatar-stub').textContent)).toEqual(['oncall', 'scribe', 'Radar One', 'fixer', 'ghostwriter'])
-    expect(opts[4]).toHaveAttribute('aria-selected', 'true')
+    // Listed AND pinned first, like any open crewmate.
+    expect(opts.map((o) => within(o).getByTestId('avatar-stub').textContent)).toEqual(['ghostwriter', 'oncall', 'scribe', 'Radar One', 'fixer'])
+    expect(opts[0]).toHaveAttribute('aria-selected', 'true')
   })
 
-  it('reports a pick by name and closes; picking the current crewmate reports nothing', async () => {
+  it('reports a pick by name and closes; picking the current mate reports nothing', async () => {
     const { onPick } = setup()
     let list = await open()
-    fireEvent.click(options(list)[1]) // scribe, already open
+    fireEvent.click(options(list)[0]) // scribe, already open (pinned first)
     expect(onPick).not.toHaveBeenCalled()
     await waitFor(() => expect(screen.queryByTestId('crewmate-switcher-list')).toBeNull())
 
@@ -185,7 +215,7 @@ describe('CrewmateSwitcher open list', () => {
     expect(options(list)).toHaveLength(4)
   })
 
-  it('the New crewmate footer opens the create dialog and closes the list', async () => {
+  it('the New mate footer opens the create dialog and closes the list', async () => {
     const { onCreate, onPick } = setup()
     await open()
     fireEvent.click(screen.getByTestId('crewmate-switcher-create'))
@@ -198,10 +228,23 @@ describe('CrewmateSwitcher open list', () => {
     setup({ onCreate: undefined })
     await open()
     expect(screen.queryByTestId('crewmate-switcher-create')).toBeNull()
+    expect(screen.queryByTestId('crewmate-switcher-import')).toBeNull()
+  })
+
+  it('Import from file sits under New mate and opens the import dialog', async () => {
+    const { onCreate } = setup()
+    const list = await open()
+    const items = within(list).getAllByRole('button').map(b => b.getAttribute('data-testid'))
+    expect(items.indexOf('crewmate-switcher-import')).toBe(items.indexOf('crewmate-switcher-create') + 1)
+    expect(screen.queryByTestId('import-dialog-stub')).toBeNull()
+    fireEvent.click(screen.getByTestId('crewmate-switcher-import'))
+    expect(await screen.findByTestId('import-dialog-stub')).toBeTruthy()
+    expect(onCreate).not.toHaveBeenCalled()
+    await waitFor(() => expect(screen.queryByTestId('crewmate-switcher-list')).toBeNull())
   })
 })
 
-const QUIET: MemberSignals = { running: false, needsYou: false, unread: false, patrolling: false }
+const QUIET: MemberSignals = { running: false, needsYou: false, unread: false, patrolling: false, goal: false }
 /** The page's resolver, as a map by name: anyone not listed is quiet. */
 const signalsBy = (by: Record<string, Partial<MemberSignals>>) => (m: MemberRosterRow): MemberSignals => ({ ...QUIET, ...by[m.name] })
 
@@ -209,35 +252,52 @@ describe('CrewmateSwitcher live signals', () => {
   it('each row carries the roster cues — presence while working, a named needs-you dot, a named unread dot', async () => {
     setup({ signals: signalsBy({ oncall: { needsYou: true }, scribe: { running: true }, fixer: { unread: true } }) })
     const list = await open()
-    const [oncall, scribe, radar, fixer] = options(list)
+    // scribe is the open crewmate, so it is pinned first.
+    const [scribe, oncall, radar, fixer] = options(list)
 
     // Needs-you: a warn dot on the right edge, spoken in the row's name, with
     // the state WRITTEN beside it — colour alone is not a state a reader can be
     // sure of. The word is decorative (the named dot already carries the fuller
     // sentence), so the name says it once.
-    expect(within(oncall).getByTestId('crewmate-switcher-needs-you-dot')).toHaveAccessibleName('Needs your approval or answer')
+    expect(within(oncall).getByTestId('crewmate-switcher-row-needs-you-dot')).toHaveAccessibleName('Needs your approval or answer')
     expect(within(oncall).getByTestId('crewmate-switcher-row-needs-you')).toHaveTextContent('Needs you')
     expect(oncall).toHaveAccessibleName(/oncall.*Needs your approval or answer/)
     expect(oncall).not.toHaveAccessibleName(/Needs you\b.*Needs you/)
-    expect(within(oncall).queryByTestId('crewmate-switcher-unread-dot')).toBeNull()
-    expect(within(oncall).queryByTestId('crewmate-switcher-presence-dot')).toBeNull()
+    expect(within(oncall).queryByTestId('crewmate-switcher-row-unread-dot')).toBeNull()
+    expect(within(oncall).queryByTestId('crewmate-switcher-row-presence-dot')).toBeNull()
 
-    // Working: the presence dot on the face and the Working line (which is what
-    // names the state), no right-edge marker.
-    expect(within(scribe).getByTestId('crewmate-switcher-presence-dot')).toBeInTheDocument()
+    // Working: the presence dot on the face, the word for the screen reader
+    // only (the dot is aria-hidden), no right-edge marker.
+    expect(within(scribe).getByTestId('crewmate-switcher-row-presence-dot')).toBeInTheDocument()
+    expect(within(scribe).getByTestId('crewmate-switcher-row-working-label')).toHaveClass('sr-only')
     expect(scribe).toHaveAccessibleName(/scribe.*Working/)
-    expect(within(scribe).queryByTestId('crewmate-switcher-needs-you-dot')).toBeNull()
+    expect(within(scribe).queryByTestId('crewmate-switcher-row-needs-you-dot')).toBeNull()
 
-    // Unread: the accent dot, spoken, and written.
-    expect(within(fixer).getByTestId('crewmate-switcher-unread-dot')).toHaveAccessibleName('Unread message')
-    expect(within(fixer).getByTestId('crewmate-switcher-unread')).toHaveTextContent('Unread')
+    // Unread: the named status dot, as on the roster row.
+    expect(within(fixer).getByTestId('crewmate-switcher-row-unread-dot')).toHaveAccessibleName('Unread message')
     expect(fixer).toHaveAccessibleName(/fixer.*Unread message/)
     expect(fixer).not.toHaveAccessibleName(/Unread.*Unread/)
 
     // A quiet crewmate shows no marker at all — idle is the resting state.
-    expect(within(radar).queryByTestId('crewmate-switcher-presence-dot')).toBeNull()
-    expect(within(radar).queryByTestId('crewmate-switcher-needs-you-dot')).toBeNull()
-    expect(within(radar).queryByTestId('crewmate-switcher-unread-dot')).toBeNull()
+    expect(within(radar).queryByTestId('crewmate-switcher-row-presence-dot')).toBeNull()
+    expect(within(radar).queryByTestId('crewmate-switcher-row-needs-you-dot')).toBeNull()
+    expect(within(radar).queryByTestId('crewmate-switcher-row-unread-dot')).toBeNull()
+    expect(within(radar).queryByTestId('crewmate-switcher-row-goal-mark')).toBeNull()
+    expect(within(radar).queryByTestId('crewmate-switcher-row-loop-label')).toBeNull()
+  })
+
+  it('the face wrapper is a flex box, so no text line box grows it below the face and pulls it off the text centre', async () => {
+    // jsdom has no layout, so this pins the structure Chromium measured: a
+    // BLOCK wrapper around the inline-flex avatar opened a line box whose
+    // strut descent made the box 38.7px for a 32px face, and the row's
+    // `items-center` then left the face 3.3px above the name + status block.
+    setup({ signals: signalsBy({ scribe: { running: true } }) })
+    const list = await open()
+    for (const option of options(list)) {
+      const face = within(option).getByTestId('crewmate-switcher-row-face')
+      expect(face).toHaveClass('flex')
+      expect(face.firstElementChild).toHaveClass('inline-flex')
+    }
   })
 
   it('a row parked on you AND unread shows both markers, needs-you first', async () => {
@@ -245,33 +305,47 @@ describe('CrewmateSwitcher live signals', () => {
     const list = await open()
     const fixer = options(list)[3]
     const marks = within(fixer).getAllByRole('img').map((el) => el.getAttribute('data-testid'))
-    expect(marks).toEqual(['crewmate-switcher-needs-you-dot', 'crewmate-switcher-unread-dot'])
+    expect(marks).toEqual(['crewmate-switcher-row-needs-you-dot', 'crewmate-switcher-row-unread-dot'])
+  })
+
+  it('a mate with a goal carries the named goal mark on its name line; on watch is spoken, not written', async () => {
+    setup({ signals: signalsBy({ oncall: { goal: true, patrolling: true }, fixer: { goal: true } }) })
+    const list = await open()
+    const [, oncall, radar, fixer] = options(list)
+    expect(within(oncall).getByTestId('crewmate-switcher-row-goal-mark')).toHaveAccessibleName('Has a goal')
+    expect(within(fixer).getByTestId('crewmate-switcher-row-goal-mark')).toHaveAccessibleName('Has a goal')
+    expect(within(radar).queryByTestId('crewmate-switcher-row-goal-mark')).toBeNull()
+    // The on-watch word is for the screen reader only; the ring on the face is the visible mark.
+    expect(within(oncall).getByTestId('crewmate-switcher-row-loop-label')).toHaveClass('sr-only')
+    expect(oncall).toHaveAccessibleName(/oncall.*Has a goal.*On watch/)
+    expect(within(oncall).getByTestId('crewmate-switcher-row-loop-indicator')).toBeInTheDocument()
+    expect(within(fixer).queryByTestId('crewmate-switcher-row-loop-indicator')).toBeNull()
   })
 
   it('the row signals come from the resolver, not the roster row: a stale running flag defers to it', async () => {
     // The roster row says scribe is running; the live resolver says it is not.
     setup({ signals: signalsBy({}) })
     const list = await open()
-    const scribe = options(list)[1]
-    expect(within(scribe).queryByTestId('crewmate-switcher-presence-dot')).toBeNull()
-    expect(scribe).not.toHaveTextContent('Working')
+    const scribe = options(list)[0]
+    expect(within(scribe).queryByTestId('crewmate-switcher-row-presence-dot')).toBeNull()
+    expect(within(scribe).queryByTestId('crewmate-switcher-row-working-label')).toBeNull()
   })
 
   it('without a resolver a row falls back to its own running flag', async () => {
     setup()
     const list = await open()
-    expect(within(options(list)[1]).getByTestId('crewmate-switcher-presence-dot')).toBeInTheDocument()
-    expect(chip()).toHaveAccessibleName('Crewmates')
+    expect(within(options(list)[0]).getByTestId('crewmate-switcher-row-presence-dot')).toBeInTheDocument()
+    expect(chip()).toHaveAccessibleName('Mates')
     expect(screen.queryByTestId('crewmate-switcher-needs-you')).toBeNull()
   })
 
-  it('the closed chip shows a needs-you dot, and says so, only when a crewmate OTHER than the open one needs you', () => {
+  it('the closed chip shows a needs-you dot, and says so, only when a mate OTHER than the open one needs you', () => {
     const { unmount } = render(
       <CrewmateSwitcher members={MEMBERS} activeName="scribe" onPick={vi.fn()} signals={signalsBy({ oncall: { needsYou: true } })} />,
     )
     expect(screen.getByTestId('crewmate-switcher-needs-you')).toBeInTheDocument()
     expect(chip()).toHaveAttribute('data-needs-you', 'true')
-    expect(chip()).toHaveAccessibleName('Crewmates, Needs your approval or answer')
+    expect(chip()).toHaveAccessibleName('Mates, Needs your approval or answer')
     unmount()
 
     // Only the OPEN crewmate needs you: its thread is on screen, so the chip
@@ -281,7 +355,7 @@ describe('CrewmateSwitcher live signals', () => {
     )
     expect(screen.queryByTestId('crewmate-switcher-needs-you')).toBeNull()
     expect(chip()).not.toHaveAttribute('data-needs-you')
-    expect(chip()).toHaveAccessibleName('Crewmates')
+    expect(chip()).toHaveAccessibleName('Mates')
   })
 
   it('working and unread elsewhere do not light the chip — only needs-you does', () => {
@@ -289,15 +363,15 @@ describe('CrewmateSwitcher live signals', () => {
       <CrewmateSwitcher members={MEMBERS} activeName="scribe" onPick={vi.fn()} signals={signalsBy({ oncall: { running: true, unread: true } })} />,
     )
     expect(screen.queryByTestId('crewmate-switcher-needs-you')).toBeNull()
-    expect(chip()).toHaveAccessibleName('Crewmates')
+    expect(chip()).toHaveAccessibleName('Mates')
   })
 })
 
 describe('CrewmateSwitcher opens on an outside request', () => {
   it('a bumped openRequest opens the list; the mount value does not', async () => {
-    const { rerender } = render(<CrewmateSwitcher members={MEMBERS} defaultAgent="" activeName="scribe" onPick={vi.fn()} openRequest={3} />)
+    const { rerender } = render(<CrewmateSwitcher members={MEMBERS} activeName="scribe" onPick={vi.fn()} openRequest={3} />)
     expect(screen.queryByTestId('crewmate-switcher-list')).toBeNull()
-    rerender(<CrewmateSwitcher members={MEMBERS} defaultAgent="" activeName="scribe" onPick={vi.fn()} openRequest={4} />)
+    rerender(<CrewmateSwitcher members={MEMBERS} activeName="scribe" onPick={vi.fn()} openRequest={4} />)
     expect(await screen.findByTestId('crewmate-switcher-list')).toBeInTheDocument()
   })
 })
@@ -307,11 +381,11 @@ describe('CrewmateUnreadColumn', () => {
   const column = (props: Partial<Parameters<typeof CrewmateUnreadColumn>[0]> = {}) => {
     const onPick = vi.fn()
     const onMore = vi.fn()
-    const view = render(<CrewmateUnreadColumn members={MEMBERS} defaultAgent="" activeName="scribe" onPick={onPick} onMore={onMore} {...props} />)
+    const view = render(<CrewmateUnreadColumn members={MEMBERS} activeName="scribe" onPick={onPick} onMore={onMore} {...props} />)
     return { onPick, onMore, ...view }
   }
 
-  it('one named pill per unread crewmate other than the open one, in roster order; a click picks it', () => {
+  it('one named pill per unread mate other than the open one, in roster order; a click picks it', () => {
     const { onPick } = column({ signals: signalsBy({ fixer: { unread: true }, oncall: { unread: true } }) })
     expect(screen.getByTestId('crewmate-switcher-unread-column')).toHaveAttribute('data-count', '2')
     expect(pills().map((p) => p.getAttribute('data-member'))).toEqual(['oncall', 'fixer'])
@@ -325,7 +399,7 @@ describe('CrewmateUnreadColumn', () => {
     expect(screen.queryByTestId('crewmate-switcher-unread-more')).toBeNull()
   })
 
-  it('draws nothing when nothing is unread, nor for the OPEN crewmate alone', () => {
+  it('draws nothing when nothing is unread, nor for the OPEN mate alone', () => {
     const { unmount } = column()
     expect(pills()).toHaveLength(0)
     expect(screen.getByTestId('crewmate-switcher-unread-column')).toHaveAttribute('data-count', '0')

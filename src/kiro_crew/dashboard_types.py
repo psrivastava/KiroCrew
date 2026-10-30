@@ -54,20 +54,24 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Final, Mapping
 
-from kiro_crew.crew_log.entry_types import DASHBOARD_FOLD_NAME
+from kiro_crew.crew_log.entry_types import CUSTOM_FOLD_NAME, DASHBOARD_FOLD_NAME
 from kiro_crew.crew_log.projection import (
     _FOLDS,
     _SLOT_FOLD_ROW_BYTES,
+    _TREE_FOLD_ROW_BYTES,
     FOLD_NAMES,
+    INTERNAL_SLOT_PROJECTION_NAMES,
     OWNER_SERVED_SLOT_PROJECTION,
     SESSION_FOLD_NAMES,
     SLOT_PROJECTION_NAMES,
+    TREE_PROJECTION_NAMES,
 )
 from kiro_crew.dashboard_templates.manifest import FIELD_TYPES
 
 __all__ = [
     "KEYED_BY_SESSION",
     "KEYED_BY_SLOT",
+    "KEYED_BY_TREE",
     "UNKNOWN_TYPE",
     "FoldType",
     "catalog",
@@ -76,6 +80,11 @@ __all__ = [
 
 KEYED_BY_SESSION: Final[str] = "session"
 KEYED_BY_SLOT: Final[str] = "slot"
+#: The THIRD key kind: a fold keyed by a tree ROOT, folded over the logs of every slot
+#: the tree reaches. What a block binding a TREE names, and the one kind no bus push can
+#: carry, so its value belongs to a page load and a refetch -- a composing agent reads
+#: that off this value, so it is a distinct word and not ``slot`` with a footnote.
+KEYED_BY_TREE: Final[str] = "tree"
 
 #: The ``type`` of a leaf the probe saw as ``null`` and nothing declares. Deliberately
 #: NOT a member of :data:`~kiro_crew.dashboard_templates.manifest.FIELD_TYPES`: a Model
@@ -99,6 +108,15 @@ _PROBE_SLOT: Final[str] = "catalog-probe"
 #: _a_real_path`` fails on a path the probe does not reach, and the companion test fails
 #: on a null leaf with no entry -- so the two directions are both pinned and neither a
 #: removed field nor an added one passes quietly.
+#: Crew's five running sums, in characters, as the usage fold's context part names them.
+_CREW_SUMS: Final[dict[str, Any]] = {
+    "type": "object",
+    "properties": {
+        name: {"type": "number", "integer": True}
+        for name in ("message", "memory", "rules", "skills", "other")
+    },
+}
+
 _NULLABLE: Final[dict[str, dict[str, Any]]] = {
     # ``_status_render``: three stamps, three reasons and the previous unit's id, all
     # null until the entry that carries them is folded.
@@ -133,6 +151,66 @@ _NULLABLE: Final[dict[str, dict[str, Any]]] = {
             "seq": {"type": "number", "integer": True},
         },
     },
+    # ``projection_usage_measured.context_render``: the newest turn and the newest
+    # session-start row, both null before the first composed turn. Crew's five sums are
+    # whole character counts; ``engine`` (the agent engine's own measurement, null when
+    # it measured nothing) and ``ttft_ms`` are the engine's to shape, so a key below
+    # them is not this catalog's to judge.
+    "usage.context.latest": {
+        "type": "object",
+        "properties": {
+            "turn": {"type": "number", "integer": True},
+            "phase": {"type": "string"},
+            "ours": _CREW_SUMS,
+            "loop_chars": {"type": "number", "integer": True},
+            "loop_estimated": {"type": "boolean"},
+            "engine": {
+                "type": "object",
+                "opaque": True,
+                "nullable": True,
+                "keyed_by": "a field of the engine's context/measured breakdown",
+            },
+            "ttft_ms": {
+                "type": "object",
+                "opaque": True,
+                "nullable": True,
+                "keyed_by": "a time-to-first-output part, in milliseconds",
+            },
+            "context_used": {"type": "number", "integer": True},
+            "context_window": {"type": "number", "integer": True},
+            # The turn's Kiro Crew blocks by name, characters each, and how many did
+            # not fit the per-turn cap.
+            "blocks": {
+                "type": "object",
+                "opaque": True,
+                "keyed_by": "a Kiro Crew context block's name",
+            },
+            "blocks_omitted": {"type": "number", "integer": True},
+        },
+    },
+    # ``_chart_row`` plus ``figure``: the start row carries the chart's numbers only.
+    "usage.context.start": {
+        "type": "object",
+        "properties": {
+            "turn": {"type": "number", "integer": True},
+            "ours": _CREW_SUMS,
+            "loop": {"type": "number", "integer": True},
+            # The turn's own occupancy reading in tokens, 0 when it reported none.
+            "used": {"type": "number", "integer": True},
+            # The row's version: it changes whenever the row is written again.
+            "version": {"type": "number", "integer": True},
+            # The size the turn's own panel heads with; null with neither an engine
+            # measurement nor a reading.
+            "figure": {
+                "type": "object",
+                "nullable": True,
+                "properties": {
+                    "n": {"type": "number", "integer": True},
+                    "unit": {"type": "string"},
+                },
+            },
+        },
+    },
     # ``_timeline_render``: the first and last seq of the window, null while it is empty.
     "timeline.first_seq": {"type": "number", "integer": True},
     "timeline.last_seq": {"type": "number", "integer": True},
@@ -159,6 +237,11 @@ _NULLABLE: Final[dict[str, dict[str, Any]]] = {
     "outline.last_turn": {"type": "number", "integer": True},
     # ``_work_render``: the item this board hangs under, null for a root conductor.
     "work.conductor.parent_item": {"type": "string"},
+    # ``_otel_session_tree_render``: how many creators stood above this session, null
+    # until its ``session/opened`` folds and for a session that never carried a depth.
+    # A whole count of hops up the tree, so a number and an integer -- the OTel export
+    # maps it to a fixed depth bucket label for one counter add.
+    "otel_session_tree.depth": {"type": "number", "integer": True},
 }
 
 #: Objects whose KEYS are not this catalog's to enumerate, each ``"<fold>.<path>"`` ->
@@ -177,7 +260,6 @@ _NULLABLE: Final[dict[str, dict[str, Any]]] = {
 #: to a fold cannot land as "has no keys".
 _OPAQUE: Final[dict[str, str]] = {
     "usage.by_model": "a model id",
-    "usage.context.by_source": "a context source name",
     "tools.by_name": "a tool name",
     "approvals.by_decision": "a decision value",
     "subagents.by_id": "a subagent id",
@@ -186,6 +268,7 @@ _OPAQUE: Final[dict[str, str]] = {
     "radar.phase_lines": "an item id",
     "panel.data": "a key the publishing crew chose",
     "panel.owners": "an owning crew key",
+    "otel_usage.turns": "an actor value",
     # Built from the fold's own registry constant rather than spelled out, because a
     # key naming a fold under a name the registry does not carry is not an error here:
     # ``_node`` looks this table up with a plain ``in``, misses, and falls through to
@@ -193,7 +276,114 @@ _OPAQUE: Final[dict[str, str]] = {
     # validator that no key below it is valid. That is the opposite of what this entry
     # says, and it is the one failure in this module that is silent.
     f"{DASHBOARD_FOLD_NAME}.fields": "an agentic field name",
+    # The same, for the records a script cron appends: each key is the record type
+    # the script named, and a page binds ``custom.latest.<type>.data.<key>``.
+    f"{CUSTOM_FOLD_NAME}.latest": "a custom record type a script cron named",
 }
+
+
+def _row_keys() -> dict[str, dict[str, Any]]:
+    """Public row metadata for script readers; paths still stop at an array.
+
+    Leaf keys come from the fold's vocabulary. Nested workstream keys are pinned
+    against its real renderer by tests, so the catalog describes public rows rather
+    than the fold's private state. Notes state units and missing-value semantics.
+    """
+    from kiro_crew.crew_log.projection_crewmate import _MILESTONE_TEXT_KEYS, _WAITING_TEXT_KEYS
+    from kiro_crew.crew_log.projection_side_panel import TIMELINE_MOMENT_KEYS
+    from kiro_crew.crew_log.projection_subagents import SUBAGENT_ROW_KEYS
+    from kiro_crew.crew_log.projection_workers import WORKER_ROW_KEYS
+
+    series = {
+        "row_keys": ["hour", "credits", "accepted"],
+        "names_the_row": "hour",
+        "row_note": "UTC hourly buckets, oldest first; accepted is per bucket, not cumulative",
+    }
+    tasks = {
+        "row_keys": [
+            "item_id",
+            "title",
+            "state",
+            "status",
+            "summary",
+            "verdict",
+            "pr",
+            "round",
+            "spender",
+            "credits",
+            "credits_reported",
+            "duration_ms",
+            "last_report_at",
+            "created_at",
+            "closed_at",
+            "decision",
+            "events",
+            "events_seen",
+        ],
+        "names_the_row": "title",
+        "row_note": "created_at/closed_at are ISO times; an empty end is unknown or still open",
+        "nested_rows": {
+            "events": {"row_keys": ["at", "kind", "status", "text"], "names_the_row": "text"},
+        },
+    }
+    return {
+        "timeline.moments": {
+            "row_keys": list(TIMELINE_MOMENT_KEYS),
+            "names_the_row": "type",
+            "row_note": "time is epoch milliseconds; event-specific keys can be absent",
+        },
+        "subagents.by_id": {
+            "row_keys": list(SUBAGENT_ROW_KEYS),
+            "names_the_row": "task",
+        },
+        "workers.items": {
+            "row_keys": list(WORKER_ROW_KEYS),
+            "names_the_row": "task",
+            "row_note": "current states, not completion percentages; timestamps are ISO strings",
+        },
+        "goal.goals": {"row_keys": ["text"], "names_the_row": "text"},
+        "goal.milestones": {
+            "row_keys": list(_MILESTONE_TEXT_KEYS),
+            "names_the_row": "text",
+            "row_note": "target/current are text; current is the crewmate's own latest reading; latest snapshot, not history",
+        },
+        "waiting.items": {
+            "row_keys": [*_WAITING_TEXT_KEYS, "options", "options_omitted"],
+            "names_the_row": "text",
+            "row_note": "options is a list of strings; asked_at is the recorded time string",
+        },
+        "custom.latest": {
+            "row_keys": ["data", "at", "seq", "writer", "member", "crew_key"],
+            "names_the_row": "writer",
+            "row_note": (
+                "one row per record type, the latest record only; data is the object the "
+                "script sent (bind custom.latest.<type>.data.<key>), at is its ISO time, "
+                "writer is cron:<job id> stamped by the gateway"
+            ),
+        },
+        "workstreams.series": series,
+        "workstreams.items": {
+            "row_keys": [
+                "id",
+                "goal",
+                "round",
+                "parent",
+                "total",
+                "accepted",
+                "open",
+                "needs_you",
+                "credits",
+                "credits_reported",
+                "last_activity_at",
+                "tasks",
+                "tasks_omitted",
+                "series",
+            ],
+            "names_the_row": "goal",
+            "row_note": "accepted/total measures work; credits_reported=false means unmeasured",
+            "nested_rows": {"tasks": tasks, "series": series},
+        },
+    }
 
 
 @dataclass(frozen=True)
@@ -225,9 +415,12 @@ class FoldType:
     #: What the fold's stored state is versioned at. A reader comparing two gateways'
     #: catalogs uses it to tell "the same fold" from "the same name".
     state_version: int
-    #: Bytes the warm cache charges one row of this fold, for a composer sizing a block
-    #: against a fold that retains rows. ``None`` for a session-keyed fold, which holds
-    #: no warm slot cell and is charged by serialized size instead.
+    #: Bytes charged for one row of this fold, for a composer sizing a block against a
+    #: fold that retains rows. Read from the key kind's own measured table -- the slot
+    #: folds' for a slot fold, the tree folds' for a tree fold -- because each kind states
+    #: its figure against its own largest member and a kind with no measured cost would
+    #: leave the budget charging an unmeasured fallback. ``None`` for a session-keyed
+    #: fold, which holds no cell at all and is charged by serialized size instead.
     row_bytes: int | None
     folded_through: int | None = None
 
@@ -292,12 +485,14 @@ def _node(fold: str, path: str, value: Any) -> dict[str, Any]:
         # FIELD_TYPES` and ``integer`` is not one of them -- a validator comparing types
         # must keep matching ``number``.
         return {"type": jtype, "integer": isinstance(value, int)}
+    rows = _row_keys().get(key, {})
     if jtype != "object":
         # An array is a LEAF: a fold path cannot index one, so an element shape here
-        # would describe something no Model field can name.
-        return {"type": jtype}
+        # would describe something no Model field can name. Its row keys are still
+        # named, for a script that draws the rows.
+        return {"type": jtype, **rows}
     if key in _OPAQUE:
-        opaque: dict[str, Any] = {"type": "object", "opaque": True}
+        opaque: dict[str, Any] = {"type": "object", "opaque": True, **rows}
         keyed_by = _OPAQUE[key]
         if keyed_by:
             opaque["keyed_by"] = keyed_by
@@ -323,6 +518,21 @@ def _probe(name: str) -> dict[str, Any]:
     return _node(name, "", fold.render(state))
 
 
+def _keyed_by(name: str) -> str:
+    """Which of the THREE key kinds *name* is keyed by.
+
+    Tested against the kernel's own sets, most specific first: the tree set is the
+    newest and the smallest, and a two-branch ``slot else session`` would have reported
+    a tree fold as session-keyed -- the one answer that reads as a complete and wrong
+    one, since a composer would then key a tree block by a session unit id.
+    """
+    if name in TREE_PROJECTION_NAMES:
+        return KEYED_BY_TREE
+    if name in SLOT_PROJECTION_NAMES or name in INTERNAL_SLOT_PROJECTION_NAMES:
+        return KEYED_BY_SLOT
+    return KEYED_BY_SESSION
+
+
 def catalog(folded_through: Mapping[str, int | None] | None = None) -> tuple[FoldType, ...]:
     """Every data type a dashboard can bind to, in registry order.
 
@@ -340,10 +550,10 @@ def catalog(folded_through: Mapping[str, int | None] | None = None) -> tuple[Fol
             # derived type sets to the fold it is derived FROM, and a reader walks it
             # to find the subscription a block actually needs.
             source_fold=name,
-            keyed_by=KEYED_BY_SLOT if name in SLOT_PROJECTION_NAMES else KEYED_BY_SESSION,
+            keyed_by=_keyed_by(name),
             owner_served=name == OWNER_SERVED_SLOT_PROJECTION,
             state_version=_FOLDS[name].state_version,
-            row_bytes=_SLOT_FOLD_ROW_BYTES.get(name),
+            row_bytes=_SLOT_FOLD_ROW_BYTES.get(name, _TREE_FOLD_ROW_BYTES.get(name)),
             folded_through=reached.get(name),
         )
         for name in FOLD_NAMES
@@ -364,4 +574,9 @@ def describe(folded_through: Mapping[str, int | None] | None = None) -> dict[str
         "owner_served": OWNER_SERVED_SLOT_PROJECTION,
         "session_keyed": list(SESSION_FOLD_NAMES),
         "slot_keyed": list(SLOT_PROJECTION_NAMES),
+        # The third key kind, listed beside the other two so a reader resolving a type's
+        # key does it from one payload. No bus push can carry a fold here, so its value
+        # belongs to a page load and a refetch, and that read ships with the first block
+        # that consumes it -- which is what a composer has to know beyond its name.
+        "tree_keyed": list(TREE_PROJECTION_NAMES),
     }

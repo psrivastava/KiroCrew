@@ -40,7 +40,9 @@ import ast
 import asyncio
 import contextlib
 import inspect
+import json
 import textwrap
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -65,6 +67,8 @@ from kiro_crew.acp.types import (
 from kiro_crew.acp_backends import (
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_CODEX,
+    ACP_BACKEND_COPILOT,
+    ACP_BACKEND_DEEPSEEK,
     ACP_BACKEND_GOOSE,
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
@@ -134,6 +138,25 @@ CAPTURED_HISTORY_REPLAY: dict[str, Any] = {
 }
 
 
+#: codex-acp's ``/compact`` turn on the lane pin (2.3.0; 2.2.2 sent the same),
+#: captured in the Real Adapter Contract Tests lane: the same pair with NO
+#: ``_meta``, and a terminal with no title.
+FIXTURE_222 = (
+    Path(__file__).resolve().parent / "fixtures" / "acp_frames" / "codex" / "compact-live.jsonl"
+)
+
+
+def _updates_222() -> list[dict[str, Any]]:
+    frames = [json.loads(line) for line in FIXTURE_222.read_text(encoding="utf-8").splitlines()[1:]]
+    return [f["params"]["update"] for f in frames if f.get("method") == "session/update"]
+
+
+def _pair_222() -> tuple[dict[str, Any], dict[str, Any]]:
+    calls = [u for u in _updates_222() if u["sessionUpdate"] in ("tool_call", "tool_call_update")]
+    assert len(calls) == 2, calls
+    return calls[0], calls[1]
+
+
 def _update_msg(update: dict[str, Any]) -> JsonRpcMessage:
     return JsonRpcMessage(
         method="session/update",
@@ -178,10 +201,19 @@ class TestMembership:
                 ACP_BACKEND_OPENCODE,
                 ACP_BACKEND_GOOSE,
                 ACP_BACKEND_KAS,
+                ACP_BACKEND_PI,
+                ACP_BACKEND_COPILOT,
             }
         )
         assert ACP_BACKENDS_INLINE_COMPACTION == frozenset(
-            {ACP_BACKEND_CLAUDE, ACP_BACKEND_CODEX, ACP_BACKEND_OPENCODE, ACP_BACKEND_GOOSE}
+            {
+                ACP_BACKEND_CLAUDE,
+                ACP_BACKEND_CODEX,
+                ACP_BACKEND_OPENCODE,
+                ACP_BACKEND_GOOSE,
+                ACP_BACKEND_PI,
+                ACP_BACKEND_COPILOT,
+            }
         )
 
 
@@ -206,10 +238,11 @@ class TestParseCodexCompactionUpdate:
         assert parse_codex_compaction_update(CAPTURED_HISTORY_REPLAY) is None
 
     def test_the_marker_is_required(self) -> None:
-        """Matched on ``_meta.contextCompaction``, never on the title -- the title
-        is display text the adapter is free to reword or localize."""
+        """A marked frame is matched on ``_meta.contextCompaction``, never on the
+        title. An unmarked one is the 2.2.2 shape, read only under the pinned title
+        (see ``TestTheUnmarked222Pair``)."""
         unmarked = {k: v for k, v in CAPTURED_START.items() if k != "_meta"}
-        assert parse_codex_compaction_update(unmarked) is None
+        assert parse_codex_compaction_update({**unmarked, "title": "Thinking"}) is None
         other_marker = {**CAPTURED_START, "_meta": {"somethingElse": {"version": 1}}}
         assert parse_codex_compaction_update(other_marker) is None
 
@@ -388,8 +421,8 @@ class TestTheManualCommandIsOffered:
 
     def test_a_non_member_still_refuses(self) -> None:
         """The gate is not disabled, only widened."""
-        provider = AcpProvider(acp_backend=ACP_BACKEND_PI)
-        assert compact_unsupported_backend(provider) == ACP_BACKEND_PI
+        provider = AcpProvider(acp_backend=ACP_BACKEND_DEEPSEEK)
+        assert compact_unsupported_backend(provider) == ACP_BACKEND_DEEPSEEK
 
 
 class TestCrewsOwnThresholdCompactionRuns:
@@ -401,8 +434,8 @@ class TestCrewsOwnThresholdCompactionRuns:
         assert _compact_unsupported_backend(provider) is None
 
     def test_the_gate_still_declines_a_non_member(self) -> None:
-        provider = AcpProvider(acp_backend=ACP_BACKEND_PI)
-        assert _compact_unsupported_backend(provider) == ACP_BACKEND_PI
+        provider = AcpProvider(acp_backend=ACP_BACKEND_DEEPSEEK)
+        assert _compact_unsupported_backend(provider) == ACP_BACKEND_DEEPSEEK
 
 
 # --------------------------------------------------------------------------- #
@@ -831,3 +864,72 @@ def _stub_provider(impl: Any, backend: str) -> Any:
     if "self.backend" in source:
         stub.backend = backend  # type: ignore[attr-defined]
     return stub
+
+
+# --------------------------------------------------------------------------- #
+# 2b. The codex-acp 2.2.2 shape: the same pair, unmarked
+# --------------------------------------------------------------------------- #
+
+
+class TestTheUnmarked222Pair:
+    """2.2.2 dropped ``_meta.contextCompaction``; Crew still reads the pair."""
+
+    def test_the_capture_carries_no_marker(self) -> None:
+        start, done = _pair_222()
+        assert "_meta" not in start and "_meta" not in done
+        assert (start["kind"], start["title"], start["status"]) == (
+            "think",
+            _dispatch.CODEX_COMPACTION_TITLE,
+            "in_progress",
+        )
+        assert done["status"] == "completed" and "title" not in done
+
+    def test_only_the_pinned_title_on_a_think_call_starts_it(self) -> None:
+        start, _ = _pair_222()
+
+        def parse(update: dict[str, Any]) -> str | None:
+            return _dispatch.parse_codex_compaction_update(update, allow_unmarked=True)
+
+        assert parse(start) == "started"
+        assert parse({**start, "title": "Compact the conversation"}) is None
+        assert parse({**start, "kind": "other"}) is None
+        assert parse({**start, "status": "completed"}) is None, "a replayed past compaction"
+        assert _dispatch.parse_codex_compaction_update(start) is None, "unmarked needs the opt-in"
+
+    def test_an_unmarked_terminal_needs_the_pending_start_id(self) -> None:
+        start, done = _pair_222()
+
+        def parse(update: dict[str, Any], pending: object = None) -> str | None:
+            return _dispatch.parse_codex_compaction_update(update, pending, allow_unmarked=True)
+
+        assert parse(done) is None
+        assert parse(done, True) is None, "a marked start's flag is not an id"
+        assert parse(done, "another-call") is None
+        assert parse(done, start["toolCallId"]) == "completed"
+
+    @pytest.mark.parametrize("make", [lambda: _bare_client(), lambda: _bare_handle()])
+    def test_both_transports_report_started_then_completed(self, make: Any) -> None:
+        owner = make()
+        events = []
+        for update in _updates_222():
+            arg = _update_msg(update) if isinstance(owner, AcpClient) else update
+            event = owner._codex_compaction_event(arg)
+            if event is not None:
+                events.append(event)
+        assert [(e.kind, e.text, e.title) for e in events] == [
+            (EVENT_COMPACTION_STATUS, "started", ""),
+            (EVENT_COMPACTION_STATUS, "completed", ""),
+        ]
+        assert not owner._codex_compaction_pending
+        assert owner.last_prompt_stats.context_pct_unknown, "the meter must reset"
+
+    @pytest.mark.parametrize("make", [lambda b: _bare_client(b), lambda b: _bare_handle(b)])
+    def test_another_inline_harness_is_never_read_by_the_title(self, make: Any) -> None:
+        """Only ``ACP_BACKENDS_UNMARKED_COMPACTION_PAIR`` opts in: claude's own think
+        call titled the same way is an ordinary tool call."""
+        assert ACP_BACKEND_CLAUDE in ACP_BACKENDS_INLINE_COMPACTION
+        owner = make(ACP_BACKEND_CLAUDE)
+        for update in _updates_222():
+            arg = _update_msg(update) if isinstance(owner, AcpClient) else update
+            assert owner._codex_compaction_event(arg) is None
+        assert not owner.last_prompt_stats.context_pct_unknown

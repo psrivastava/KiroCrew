@@ -94,7 +94,7 @@ from typing import TYPE_CHECKING, Any
 # circular import: apps.manager imports config helpers that transitively pull
 # in ``kiro_crew.dashboard.state``; keeping ``get_app_manifest`` at module
 # scope requires it to load after this module's own definitions are visible,
-# which the current import order satisfies (state.py imports us lazily inside
+# which the current import order satisfies (state_parts/slots_push.py imports us lazily inside
 # broadcast_ws, and ws.py imports us before apps.manager). Kept top-level per
 # the top-level-imports guideline.
 from kiro_crew.apps.manager import get_app_manifest, is_app_enabled, staged_app_grants
@@ -236,13 +236,14 @@ _SLOT_SCOPED_EVENTS = frozenset({
     "activity_event", "session_summary",
     # Voice
     "voice_chunk", "voice_complete", "voice_error",
-    # Approvals and question cards (carry a slot field)
-    "approval", "approval_resolved", "question_card",
+    # Approvals, question cards and an MCP elicitation answer (carry a slot field)
+    "approval", "approval_resolved", "question_card", "elicitation_resolved",
     # Subagent lifecycle. Every one of these is fired through
     # ``SubagentManager._fire_event`` and reaches the wire via
-    # ``broadcast_ws(etype, ...)`` with a VARIABLE etype (slack/gateway.py's
-    # ``_subagent_event``), so a guard that scans broadcast call sites for string
-    # literals cannot see them -- ``TestFireEventNamesAreClassified`` reads the
+    # ``broadcast_ws(etype, ...)`` with a VARIABLE etype (the ``_subagent_event``
+    # closure in slack/gateway_runtime/subagent_wiring.py), so a guard that scans
+    # broadcast call sites for string literals cannot see them --
+    # ``TestFireEventNamesAreClassified`` reads the
     # emitter's own literals instead. Each payload carries id + slot.
     "subagent_spawn", "subagent_done", "subagent_tool", "subagent_chunk",
     "subagent_snapshot", "subagent_status", "subagent_queued",
@@ -309,6 +310,17 @@ _OWNER_ONLY_EVENTS = MEMBER_LOG_EVENTS | frozenset({
     # A live-observation request to one owner tab (``handlers/guide.py``): ids
     # only, but which controls the agent is asking about is the operator's own.
     "guide_observe",
+    # One crewmate's dashboard field values
+    # (``handlers/member_dashboard_fields.FIELD_FRAME``). Sent through
+    # ``broadcast_ws_owners``, so an app token is already outside the socket set
+    # it reaches, and the classification guard does not scan that fan-out --
+    # classified anyway, for the reason the comment above this set gives: the
+    # frame carries work-ledger and crew-log values, which is what the whole
+    # ``/api/members`` surface withholds from an app, so the denial should be the
+    # intentional one with its own audit reason rather than the unknown-event
+    # floor, and a later literal broadcast of this name must not silently start
+    # reaching an app token.
+    "dashboard_fields",
 })
 
 
@@ -379,6 +391,45 @@ def notification_source_app(source: str) -> str:
     if source.startswith(_APP_SOURCE_PREFIX):
         return source[len(_APP_SOURCE_PREFIX):]
     return ""
+
+
+def is_app_channel(channel: str) -> bool:
+    """Whether a notification channel belongs to an app rather than the system."""
+    owner = notification_channel_owner(channel)
+    return bool(owner) and owner != _SYSTEM_SOURCE
+
+
+def app_origin_frame(event_type: str, data: object) -> bool:
+    """Whether a frame carries an app's own output.
+
+    An app-published event, an app's push notification, or a setting on one of an
+    app's notification channels. A socket with no app surface (a relayed teammate's,
+    see ``kiro_relay.caller.RELAY_TEAMMATE_WS_FLAG``) is withheld all three.
+    """
+    if event_type == _APP_EVENT_WS_TYPE:
+        return True
+    fields = data if isinstance(data, dict) else {}
+    if event_type in _SOURCE_FILTERED_EVENTS:
+        return bool(notification_source_app(str(fields.get("source", ""))))
+    if event_type == _CHANNEL_SETTINGS_EVENT:
+        return is_app_channel(str(fields.get("channel", "")))
+    return False
+
+
+#: Why a relayed teammate was withheld an app's output, on any transport.
+RELAY_TEAMMATE_APP_FRAME = "relay_teammate_app_frame"
+
+
+def audit_teammate_withheld(event_type: str) -> None:
+    """Record, best-effort, that a relayed teammate was withheld an app's output.
+
+    The one denied row every transport writes for that decision: the WebSocket
+    gate, the SSE stream and the notification reads.
+    """
+    try:
+        _audit_deny(DASHBOARD_USER_AUDITEE, event_type, RELAY_TEAMMATE_APP_FRAME)
+    except Exception:
+        logger.debug("ws_event_scope: SEL audit for a teammate withhold failed", exc_info=True)
 
 
 _GLOBAL_EVENT_DECLARATIONS: dict[str, str] = {
@@ -772,7 +823,7 @@ def _slot_visible(
     state: DashboardState,
 ) -> bool:
     """Return True if *app* may receive slot-scoped events for *slot*."""
-    # circular import: state.py's broadcast_ws imports ws_event_allowed from
+    # circular import: state_parts/slots_push.py's broadcast_ws imports ws_event_allowed from
     # this module at runtime; importing SlotOrigin at module scope would
     # create a bootstrap cycle during state.py initialisation.
     from kiro_crew.dashboard.state import SlotOrigin
@@ -1396,7 +1447,7 @@ def filter_slots_for_app(
         if slot is None:
             continue
         if _slot_visible(slot, app, allowed_events, state):
-            result.append(_strip_source_link_status(slot_dict))
+            result.append(_strip_pin_rank(_strip_source_link_status(slot_dict)))
             _audit_allow(app, "slots_item")
         else:
             _audit_deny(app, "slots_item", "slot_scope_denied")
@@ -1408,7 +1459,21 @@ def filter_slots_for_app(
 # an app token must never receive provider status — its scope is slot metadata,
 # not the operator's credential-backed view of a repository. Stripped here so
 # widening the general list for dashboard users cannot leak into an app frame.
-_SOURCE_LINK_STATUS_KEYS = ("ci", "state", "mergeable", "mergeStateStatus")
+_SOURCE_LINK_STATUS_KEYS = ("ci", "ciPending", "state", "mergeable", "mergeStateStatus")
+
+
+def _strip_pin_rank(slot_dict: dict[str, Any]) -> dict[str, Any]:
+    """Return *slot_dict* without its pinned-order fields.
+
+    A rank is a position in the person's whole pinned order, so in a filtered
+    view the gaps between the ranks left would count the pinned sessions the
+    caller cannot see. The order is the person's; scoped callers get none of it.
+    """
+    from kiro_crew.dashboard.pinned_session_order import PIN_ORDER_FIELDS
+
+    if PIN_ORDER_FIELDS.isdisjoint(slot_dict):
+        return slot_dict
+    return {k: v for k, v in slot_dict.items() if k not in PIN_ORDER_FIELDS}
 
 
 def _strip_source_link_status(slot_dict: dict[str, Any]) -> dict[str, Any]:

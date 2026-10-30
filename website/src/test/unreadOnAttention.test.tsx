@@ -31,6 +31,7 @@ import {
 } from '../hooks/unreadOnAttention'
 import { NotificationsPanel } from '../pages/settings/NotificationsPanel'
 import en from '../i18n/locales/en.manual.json'
+import { sharedItem } from './unreadStorageTestUtils'
 
 vi.mock('../api/client', () => ({
   api: {
@@ -100,7 +101,7 @@ describe('chatMessageMarksUnread', () => {
 describe('memberThreadRowMarksUnread', () => {
   beforeEach(() => localStorage.clear())
 
-  it('off: badges only a row the crewmate wrote to the user', () => {
+  it('off: badges only a row the mate wrote to the user', () => {
     expect(memberThreadRowMarksUnread('assistant')).toBe(true)
     expect(memberThreadRowMarksUnread('permission')).toBe(true)
     for (const role of ['tool_call', 'tool_result', 'inject', 'subagent', 'user', 'chunk', 'streaming', undefined]) {
@@ -259,7 +260,7 @@ describe('unread badge over the dashboard socket', () => {
 
   // A crewmate's DM thread: the Crewmates rail dot means "they said something
   // to you". Its tool calls are its own work and never light it.
-  it("member thread: a crewmate's tool call and tool result badge nothing", () => {
+  it("member thread: a mate's tool call and tool result badge nothing", () => {
     const ws = mount()
     globalStore.dispatch(sseSlots([{ key: MEMBER, messages: 1, running: true, mode: 'member', agent: 'ada' }]))
     send(ws, row('tool_call', MEMBER))
@@ -268,7 +269,7 @@ describe('unread badge over the dashboard socket', () => {
     expect(unread()).not.toContain(MEMBER)
   })
 
-  it("member thread: a crewmate's message badges", () => {
+  it("member thread: a mate's message badges", () => {
     const ws = mount()
     globalStore.dispatch(sseSlots([{ key: MEMBER, messages: 1, running: true, mode: 'member', agent: 'ada' }]))
     send(ws, row('assistant', MEMBER))
@@ -376,7 +377,7 @@ describe('unread badge over the dashboard socket', () => {
 
   // The gateway never saves a permission row, so after a restart no slot
   // last_ts reaches its ts. A watermark taken from it could never be covered.
-  const sharedWatermark = () => (JSON.parse(localStorage.getItem('mc-unread-shared') ?? '{}') as Record<string, string>)[BACKGROUND]
+  const sharedWatermark = () => (JSON.parse(sharedItem('mc-unread-shared') ?? '{}') as Record<string, string>)[BACKGROUND]
 
   it.each([false, true])('a permission row records no watermark of its own (opt-in %s)', (optIn) => {
     if (optIn) localStorage.setItem(UNREAD_ON_ATTENTION_KEY, '1')

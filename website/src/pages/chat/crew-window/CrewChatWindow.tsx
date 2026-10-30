@@ -3,7 +3,7 @@
  *
  *  Nothing here is stored on the hub. The transcript, the running flag and the
  *  pending approval are the peer's, read through `/api/instances/{id}/proxy/`,
- *  and every action (send, stop, approve, continue, regenerate, rewind) calls
+ *  and every action (send, steer, stop, approve, continue, regenerate, rewind) calls
  *  the peer's own route for its own slot. The hub's proxy redacts every reply
  *  before it reaches this component, so peer text renders as delivered.
  *
@@ -16,39 +16,67 @@
  *  must not draw from its own state). */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { Link } from 'react-router-dom'
 import { Server, X } from 'lucide-react'
-import { api } from '../../../api/client'
+import { api, ApiError } from '../../../api/client'
 import { crewPeerUrl } from '../../../api/client/instances'
 import { useAppSelector } from '../../../store'
+import { useSelectInstance } from '../../../hooks/useSelectInstance'
 import { Btn } from '../../../components/ui'
 import ErrorNotice from '../../../components/ErrorNotice'
+import RemoteBehindBadge from '../../../components/RemoteBehindBadge'
 import Glass from '../../../components/Glass'
 import ChatInput from '../../../components/ChatInput'
+import { Composer, type ComposerHandle, type ComposerVoiceOptions } from '../../../chat-core/composer/Composer'
+import { busySteerFlag } from '../../../components/chat-input/busySend'
 import ChatMessageList from '../../../app-sdk/ChatMessageList'
 import ChatFooter from '../ChatFooter'
+import QueueStack, { SubagentDeliveryProgress, splitPaneMessages } from '../../../components/QueueStack'
+import { hydrateQueuedBubbles, normalizeQueueEntries } from '../../../store/chatSlice'
 import { ReadOnlyCodeCtx } from '../../../components/markdown/contexts'
 import { SlotProvider } from '../../../providers/SlotContext'
 import { i18nT } from '../../../i18n/t'
 import { errMessage } from '../../../utils/thunkError'
-import type { ChatMessage } from '../../../types'
-import { closeCrewWindow, coverSiblings, markCrewWindowShown, readCrewDraft, subscribeCrewDraft, writeCrewDraft, type CrewWindowTarget } from './crewWindowStore'
+import type { ChatMessage, ChatSlot } from '../../../types'
+import { capsRetryInterval, closeCrewWindow, coverSiblings, markCrewWindowShown, readCrewDraft, subscribeCrewDraft, writeCrewDraft, type CrewWindowTarget } from './crewWindowStore'
 import { createCrewWindowRenderers, crewWindowSlot } from './crewWindowRenderers'
 import { useCrewWindowModelPicker, type PeerModelFields } from './crewWindowModelPicker'
+import { useCrewWindowAgentMode, type PeerAgentModeFields } from './crewWindowAgentMode'
 import { mergeRecoveredDraft } from '../../../utils/chatDrafts'
-import { isHiddenInvisibleAssistantRow } from '../../../utils/invisibleText'
+import { sessionDisplayTitle } from '../../../utils/sessionDisplayTitle'
+import { isHiddenInvisibleAssistantRow, isRetractedSteerRow } from '../../../utils/invisibleText'
 import { isSystemNoticeRow } from '../CompactionCard'
 import { useMessageQuote } from '../../../chat-core/composer/useMessageQuote'
 import type { MessageQuote } from '../../../chat-core/composer/messageQuote'
+import { loadChatConfig } from '../ChatSettings'
 
 interface PeerApproval { origin?: string; request_id?: string; request_mid?: string }
-interface PeerSlot extends PeerModelFields { key?: string; title?: string; running?: boolean; interrupted?: boolean; agent?: string; pending_approval_info?: PeerApproval | null }
-interface PeerDetail { title?: string; running?: boolean; messages?: ChatMessage[] }
+interface PeerSlot extends PeerModelFields, PeerAgentModeFields {
+  key?: string; title?: string; running?: boolean; interrupted?: boolean; agent?: string; pending_approval_info?: PeerApproval | null
+  // The peer's own turn state, drawn by the composer as it draws a local one.
+  stopping?: boolean; stop_state?: ChatSlot['stop_state']; stop_declined?: boolean; compacting?: boolean; project?: string
+}
+/** The slot detail, with the peer's own context meter reading. */
+interface PeerDetail { title?: string; running?: boolean; messages?: ChatMessage[]; queue?: unknown[]; context_pct?: number; context_used_tokens?: number; context_window_tokens?: number }
 
 /** How long a burst of peer frames waits before one transcript re-read. */
 const REFETCH_THROTTLE_MS = 300
 /** How often an unmatched (or unreachable) crew's version is re-read. */
 const CAPS_RETRY_MS = 5000
 const NO_MESSAGES: ChatMessage[] = []
+const NO_INSTANCES: never[] = []
+
+/** The proxy's codes for a request that never reached the crew's chat:
+ *  the tunnel is down, has no credential, the crew did not answer, or it
+ *  refused the tunnel's credential. */
+const UNREACHABLE_CODES = new Set(['proxy_peer_not_connected', 'proxy_no_credential', 'proxy_peer_unreachable', 'proxy_unauthorized', 'instances_manager_unavailable'])
+
+/** Whether an action failed because the crew could not be reached, not
+ *  because the crew said no. */
+function isUnreachable(err: unknown): boolean {
+  if (!(err instanceof ApiError)) return false
+  try { return UNREACHABLE_CODES.has(String((JSON.parse(err.body) as { code?: unknown }).code)) } catch { return false }
+}
 
 /** Whether the hub redacted part of this text (its proxy marker). */
 function hasRedaction(text?: string): boolean {
@@ -71,16 +99,20 @@ function withoutHubRecords(m: ChatMessage): ChatMessage {
 export default function CrewChatWindow({ target, onClose = closeCrewWindow }: { target: CrewWindowTarget; onClose?: () => void }) {
   const { instanceId, key } = target
   const queryClient = useQueryClient()
-  const slotPath = 'api/chat/slots/' + encodeURIComponent(key)
+  // `?crew=all` keeps a Crew Mode root's crew members in the peer's answer, the
+  // same way the local slot list asks for them.
+  const slotsPath = 'api/chat/slots'
+  const slotPath = slotsPath + '/' + encodeURIComponent(key)
   const slotKeyQ = useMemo(() => ['crew-window', instanceId, key, 'slot'] as const, [instanceId, key])
   const detailKeyQ = useMemo(() => ['crew-window', instanceId, key, 'detail'] as const, [instanceId, key])
   const instancesQ = useQuery({ queryKey: ['instances'], queryFn: () => api.listInstances() })
   const name = instancesQ.data?.instances.find(i => i.id === instanceId)?.name || instanceId
+  const { selectInstance } = useSelectInstance(instancesQ.data?.instances ?? NO_INSTANCES)
   // A tunnel that is down answers `version: ""`, which reads as a mismatch;
   // re-ask until the versions match so a reconnect unlocks the window.
   const capsQ = useQuery({
     queryKey: ['instance-caps', instanceId], queryFn: () => api.instancesCapabilities(instanceId),
-    refetchInterval: q => (q.state.data?.version_match === true ? false : CAPS_RETRY_MS),
+    refetchInterval: q => capsRetryInterval(q.state.data, CAPS_RETRY_MS),
   })
   const versionOk = capsQ.data?.version_match === true
   // The tunnel's own state, not the warm map: `warm` tracks only crews whose
@@ -94,7 +126,7 @@ export default function CrewChatWindow({ target, onClose = closeCrewWindow }: { 
   // detail carries the transcript. Both are the peer's own answers.
   const slotQ = useQuery({
     queryKey: slotKeyQ,
-    queryFn: async () => ((await api.crewPeerGet(instanceId, 'api/chat/slots')) as PeerSlot[]).find(s => s.key === key) ?? null,
+    queryFn: async () => ((await api.crewPeerGet(instanceId, slotsPath + '?crew=all')) as PeerSlot[]).find(s => s.key === key) ?? null,
     enabled: versionOk,
   })
   const detailQ = useQuery({
@@ -215,15 +247,21 @@ export default function CrewChatWindow({ target, onClose = closeCrewWindow }: { 
       if (text.trim()) recoverIntoDraft(text)
     },
   })
-  const send = () => {
+  const composerRef = useRef<ComposerHandle>(null)
+  /** Send the draft. While the peer runs, the composer's busy choice picks:
+   *  a plain send the peer queues, or `steer` into the running turn. */
+  const send = (steer = false) => {
     const typed = (rewindTs ? rewindText : draft).trim()
     if ((!typed && (rewindTs || !messageQuote.pendingQuote)) || action.isPending || !connected) return
     // A held rewind waits for an idle peer: mid-turn the peer refuses it.
     if (rewindTs && running) return
+    // A send ends live streaming dictation before the box is cleared, or the
+    // next partial rebuilds the sent text (see useComposerVoice.disarmForSend).
+    composerRef.current?.voice()?.disarmForSend()
     const { quote, text: message } = rewindTs ? { quote: null, text: typed } : messageQuote.consume(typed)
     const req = rewindTs
       ? { path: slotPath + '/rewind', body: { ts: rewindTs, content: message } }
-      : { path: 'api/chat?ws=1', body: { message, slot: key, ...(quote ? { meta: { quote } } : {}) } }
+      : { path: 'api/chat?ws=1', body: { message, slot: key, ...(steer ? { steer: true } : {}), ...(quote ? { meta: { quote } } : {}) } }
     // Cleared at dispatch so text typed while the send is in flight is never
     // wiped by its success; a failure restores it only into an empty box.
     if (rewindTs) setRewindText('')
@@ -231,8 +269,27 @@ export default function CrewChatWindow({ target, onClose = closeCrewWindow }: { 
     setRewindTs(null)
     action.mutate({ ...req, message, rewindTs, typed, quote })
   }
+  // Dictation runs on THIS machine (mic + STT); only the text goes to the
+  // peer, through the same send as a typed message. An auto-submit (endpoint
+  // or release) picks steer or queue the way Enter does, from this window's
+  // busy-send choice. It reads the latest `send` and run state through a ref.
+  const autoSubmitRef = useRef<() => void>(() => {})
+  const voiceOptions = useMemo<ComposerVoiceOptions>(() => ({ onAutoSubmit: () => autoSubmitRef.current() }), [])
 
   const running = slotQ.data?.running ?? detailQ.data?.running ?? false
+  // When the crew cannot be reached, its last-known running state is stale:
+  // stop the animation so the transcript does not contradict the notice.
+  const displayRunning = running && !(action.error && isUnreachable(action.error))
+  autoSubmitRef.current = () => {
+    const live = running && !rewindTs
+    send(!!busySteerFlag({ slotKey: crewWindowSlot(instanceId, key), busy: live, turnRunning: live, stopState: slotQ.data?.stop_state, jevAutoConsented: false }))
+  }
+  // Resume, as locally: only on a turn the peer itself calls interrupted,
+  // and not while a refused rewind is held (Send retries that first).
+  const continuable = connected && !running && !rewindTs && !slotQ.data?.stopping && !!slotQ.data?.interrupted
+  const continuing = action.isPending && action.variables?.path === slotPath + '/continue'
+  // This machine's display choice for the meter; the reading is the peer's.
+  const [chatConfig] = useState(loadChatConfig)
   const approval = slotQ.data?.pending_approval_info
   // Only a native approval names its transcript row, and the peer's strict
   // check needs that row's id so a stale card cannot decide a newer request.
@@ -248,6 +305,14 @@ export default function CrewChatWindow({ target, onClose = closeCrewWindow }: { 
     const mid = typeof m.meta?.mid === 'string' ? m.meta.mid : ''
     return { ...m, meta: { ...m.meta, approval_id: JSON.stringify([aid, mid]) } }
   }), [detailQ.data?.messages])
+  // Sends the peer holds behind its running turn, from the same slot detail,
+  // through the hydration and split the local panes use (a sub-agent delivery
+  // shows as the progress line, not a user card). Read-only: cancel and edit
+  // would need peer queue routes this window does not call.
+  const { queuedMessages, systemDeliveryCount } = useMemo(
+    () => splitPaneMessages(hydrateQueuedBubbles([], normalizeQueueEntries(detailQ.data?.queue))),
+    [detailQ.data?.queue],
+  )
   const approve = useCallback((approvalId: string, decision: string) => {
     let row: unknown
     try { row = JSON.parse(approvalId) } catch { row = null }
@@ -261,8 +326,24 @@ export default function CrewChatWindow({ target, onClose = closeCrewWindow }: { 
   }, [nativeApproval, instanceId, slotPath, settle, name])
   // The newest turn row the transcript draws as a bubble: a system notice
   // (compaction, reload) and a say-nothing reply are not one.
-  const lastTurn = [...messages].reverse().find(m => m.role === 'user' || (m.role === 'assistant' && !isSystemNoticeRow(m) && !isHiddenInvisibleAssistantRow(m)))
-  const title = slotQ.data?.title || detailQ.data?.title || key
+  const lastTurn = [...messages].reverse().find(m =>
+    !isRetractedSteerRow(m) && (
+      m.role === 'user' ||
+      (m.role === 'assistant' && !isSystemNoticeRow(m) && !isHiddenInvisibleAssistantRow(m))
+    ),
+  )
+  // An untitled session shows the shared "Untitled session" label, never the
+  // internal slot key. The key still routes every request (crewWindowSlot,
+  // slotPath); only the header text changes. The label is used ONLY once a
+  // query has resolved with an empty title. While the slot/detail reads are
+  // pending, errored, or gated off by a version mismatch (enabled: versionOk)
+  // there is no title to trust, so the header shows the crew's own name (the
+  // same identifier the load_failed / feed_lost notices use) and drops the
+  // "On {{name}}" subtitle, which would only repeat it.
+  const titleResolved = slotQ.data !== undefined || detailQ.data !== undefined
+  const title = titleResolved
+    ? sessionDisplayTitle({ key, title: slotQ.data?.title || detailQ.data?.title })
+    : name
   const loadError = detailQ.error ?? slotQ.error ?? instancesQ.error ?? capsQ.error
   const versionMismatch = capsQ.data && !capsQ.data.version_match ? capsQ.data : null
   const actionPending = action.isPending
@@ -309,6 +390,7 @@ export default function CrewChatWindow({ target, onClose = closeCrewWindow }: { 
   const picker = useCrewWindowModelPicker({
     instanceId, slotKey: crewWindowSlot(instanceId, key), slotPath, slot: slotQ.data, caps: capsQ.data, enabled: versionOk, onWritten: settle,
   })
+  const agentMode = useCrewWindowAgentMode({ instanceId, slotKey: key, slotPath, name, slot: slotQ.data, caps: capsQ.data, enabled: versionOk, onWritten: settle })
   const rootRef = useRef<HTMLDivElement>(null)
   useEffect(() => {
     const root = rootRef.current
@@ -323,10 +405,29 @@ export default function CrewChatWindow({ target, onClose = closeCrewWindow }: { 
       <div className="flex items-center gap-2 px-4 py-2 border-b border-border">
         <Server size={14} className="text-info shrink-0" aria-hidden="true" />
         <span className="truncate font-semibold min-w-0">{title}</span>
-        <span className="text-muted truncate">{i18nT('pages.chat.crewWindow.running_on_header', { name })}</span>
+        {titleResolved && <span className="text-muted truncate">{i18nT('pages.chat.crewWindow.running_on_header', { name })}</span>}
         <span className="ml-auto text-muted truncate hidden sm:inline">{i18nT('pages.chat.crewWindow.close_hint', { name })}</span>
         <Btn className="shrink-0" onClick={onClose}><X size={14} aria-hidden="true" />{i18nT('pages.chat.crewWindow.close')}</Btn>
       </div>
+      {/* Its own line under the title row, so a long version pair never
+          competes with Close in a narrow pane. The incompatible case already
+          has its own notice below; this covers the skew that still chats (a
+          patch or pre-release behind). */}
+      {capsQ.data?.version_match && capsQ.data.behind && (
+        <div className="px-4 py-1.5 border-b border-border flex items-center gap-2 flex-wrap">
+          <RemoteBehindBadge
+            className="whitespace-normal"
+            behind={capsQ.data.behind}
+            remote={capsQ.data.version}
+            local={capsQ.data.local_version}
+          />
+          {/* The update itself lives on the crew's Remote Crew row; the
+              composer's draft is kept in session storage across the move. */}
+          <Link to="/settings/instances" className="text-[12px] text-accent hover:underline">
+            {i18nT('pages.chat.crewWindow.update_in_remote_crew', { name })}
+          </Link>
+        </div>
+      )}
       <div className="relative flex-1 min-h-0">
       <div className="absolute inset-0 overflow-y-auto pt-3 flex flex-col gap-1" aria-live="polite" style={{ paddingBottom: dockH + 16 }}>
         <div className="px-4 flex flex-col gap-3">
@@ -346,19 +447,15 @@ export default function CrewChatWindow({ target, onClose = closeCrewWindow }: { 
         {/* Every code fence here is the peer's: copy only, never Edit or Run
             in THIS machine's terminal. */}
         <ReadOnlyCodeCtx.Provider value={true}>
-          <ChatMessageList messages={messages} running={running} renderers={renderers} onApprove={approve} onQuoteMessage={messageQuote.quoteMessage} />
+          <ChatMessageList messages={messages} running={displayRunning} renderers={renderers} onApprove={approve} onQuoteMessage={messageQuote.quoteMessage} />
         </ReadOnlyCodeCtx.Provider>
-        <ChatFooter running={running && !approval?.request_id} stopping={false} state="" lastRole={messages[messages.length - 1]?.role ?? ''} />
+        {/* The footer reads the peer's turn phase from `state` and its stop
+            from `stopState`, the same two fields the local chat passes. */}
+        <ChatFooter running={displayRunning && !approval?.request_id} stopping={!!slotQ.data?.stopping} state={slotQ.data?.compacting ? 'compacting' : ''} stopState={slotQ.data?.stop_state} lastRole={messages[messages.length - 1]?.role ?? ''} />
         <div className="px-4 flex flex-col gap-3">
           {nativeApproval && <div className="text-muted mx-auto w-full" style={{ maxWidth: 'var(--mc-content-width, 900px)' }} data-testid="crew-window-approval-hint">{i18nT('pages.chat.crewWindow.approval_hint')}</div>}
           {approval?.request_id && !nativeApproval && (
             <div className="text-muted" data-testid="crew-window-approval-elsewhere">{i18nT('pages.chat.crewWindow.approval_elsewhere', { name })}</div>
-          )}
-          {!running && slotQ.data?.interrupted && (
-            <div className="flex items-center gap-2 text-muted" data-testid="crew-window-interrupted">
-              {i18nT('pages.chat.crewWindow.interrupted')}
-              <Btn disabled={!connected || action.isPending} onClick={() => action.mutate({ path: slotPath + '/continue' })}>{i18nT('pages.chat.crewWindow.continue')}</Btn>
-            </div>
           )}
         </div>
       </div>
@@ -369,11 +466,39 @@ export default function CrewChatWindow({ target, onClose = closeCrewWindow }: { 
         {/* The composer's own column, so a notice about a pick sits over the box and chip it is about. */}
         <div className="px-4 mx-auto w-full flex flex-col gap-2" style={{ maxWidth: 'var(--mc-input-width, 900px)' }}>
           {/* No hand-off: the composer below may hold an unsent draft. */}
-          {action.error && <ErrorNotice title={i18nT('pages.chat.crewWindow.action_failed', { name })} message={errMessage(action.error)} onDismiss={() => action.reset()} />}
+          {/* An unreachable crew did not say no: its own words, no raw error,
+              and a way to the crew's own dashboard (which reconnects it). */}
+          {action.error && isUnreachable(action.error) && (
+            <ErrorNotice
+              testId="crew-window-unreachable"
+              message={i18nT('pages.chat.crewWindow.unreachable', { name })}
+              onDismiss={() => action.reset()}
+              footer={<Btn onClick={() => selectInstance(instanceId)}>{i18nT('pages.chat.crewWindow.open_crew_dashboard', { name })}</Btn>}
+            />
+          )}
+          {action.error && !isUnreachable(action.error) && (
+            <ErrorNotice
+              title={i18nT('pages.chat.crewWindow.action_failed', { name })}
+              message={errMessage(action.error)}
+              onDismiss={() => action.reset()}
+              footer={<Btn onClick={() => selectInstance(instanceId)}>{i18nT('pages.chat.crewWindow.open_crew_dashboard', { name })}</Btn>}
+            />
+          )}
           {/* No hand-off: the composer below may hold an unsent draft. */}
-          {!!picker.error && <ErrorNotice title={i18nT('pages.chat.crewWindow.action_failed', { name })} message={errMessage(picker.error)} onDismiss={picker.clearError} />}
+          {!!picker.error && (
+            <ErrorNotice
+              title={i18nT('pages.chat.crewWindow.action_failed', { name })}
+              message={errMessage(picker.error)}
+              onDismiss={picker.clearError}
+              footer={<Btn onClick={() => selectInstance(instanceId)}>{i18nT('pages.chat.crewWindow.open_crew_dashboard', { name })}</Btn>}
+            />
+          )}
+          {/* No hand-off: same draft. The peer refused an agent or approval-mode change. */}
+          {!!agentMode.error && <ErrorNotice title={i18nT('pages.chat.crewWindow.action_failed', { name })} message={agentMode.error} onDismiss={agentMode.clearError} />}
           {/* No hand-off: same draft. The capability read retries in place. */}
           {picker.effortCapsFailed && <ErrorNotice variant="inline" message={i18nT('pages.chatPage.effort_options_unavailable')} />}
+          {agentMode.readFailed.agents && <ErrorNotice variant="inline" message={i18nT('components.agentSelector.roster_load_failed')} />}
+          {agentMode.readFailed.mode && <ErrorNotice variant="inline" message={i18nT('pages.chat.crewWindow.mode_unknown', { name })} />}
           {!connected && <div className="text-muted">{i18nT('pages.chat.crewWindow.offline', { name })}</div>}
           {rewindTs && (
             <div className="flex items-center gap-2 text-muted">
@@ -381,40 +506,81 @@ export default function CrewChatWindow({ target, onClose = closeCrewWindow }: { 
               <Btn onClick={() => { setRewindTs(null); setRewindText('') }}>{i18nT('pages.chat.crewWindow.cancel_rewind')}</Btn>
             </div>
           )}
+          {/* fuseBelow off: the stack stands as whole cards over the composer. */}
+          {(queuedMessages.length > 0 || systemDeliveryCount > 0) && (
+            <div data-testid="crew-window-queue">
+              <SubagentDeliveryProgress count={systemDeliveryCount} />
+              <QueueStack messages={queuedMessages} fuseBelow={false} />
+            </div>
+          )}
         </div>
         {/* The shared composer, under a slot key no local session can carry:
             its store reads (approvals, tool log, busy mode) then find nothing
             of the hub's own sessions. Menus, the optimizer and the approval
-            chrome are off, as in the side panel: each acts on a LOCAL slot.
+            bar are off, as in the side panel: each acts on a LOCAL slot. (The
+            approval-MODE picker is on, wired to the peer.)
             Offline, a disabled fieldset turns the whole composer off, as the
             RFC's "input disabled" says; the composer's own offline state would
             name the hub's gateway, not this crew. */}
         <fieldset disabled={!connected} className="contents">
         <SlotProvider slotId={crewWindowSlot(instanceId, key)}>
+        {/* Voice is keyed per editor: a rewind edit and the saved draft are
+            two boxes, so switching between them ends the other box's
+            dictation instead of writing its words into this one. */}
+        <Composer
+          ref={composerRef}
+          slotKey={crewWindowSlot(instanceId, key) + (rewindTs ? ':rewind' : '')}
+          value={rewindTs ? rewindText : draft}
+          onChange={rewindTs ? setRewindText : setDraft}
+          voice={voiceOptions}
+        >
           <ChatInput
             value={rewindTs ? rewindText : draft}
             onChange={rewindTs ? setRewindText : setDraft}
-            onSend={send}
+            onSend={() => send()}
             onStop={() => action.mutate({ path: slotPath + '/stop' })}
             isRunning={running}
+            // Mid-turn the composer offers steer or queue, as locally.
+            canSteer={running}
+            onSteer={() => send(true)}
+            isQueued={!!slotQ.data?.stopping}
+            stopState={slotQ.data?.stop_state}
+            stopDeclined={!!slotQ.data?.stop_declined}
+            compacting={!!slotQ.data?.compacting}
+            continuable={continuable}
+            continueIsRecovery
+            continuing={continuing}
+            onContinue={() => { if (continuable && !action.isPending) action.mutate({ path: slotPath + '/continue' }) }}
+            contextPct={detailQ.data?.context_pct}
+            contextUsedTokens={detailQ.data?.context_used_tokens}
+            contextWindowTokens={detailQ.data?.context_window_tokens}
+            showContextPct={chatConfig.showContextPct}
+            showContextTokens={chatConfig.showContextTokens}
+            // The PEER's folder, as a label: no picker, and nothing on this
+            // machine is rooted at it (see `sessionOnPeer`).
+            project={slotQ.data?.project || ''}
+            sessionOnPeer
             autoFocusKey={rewindTs}
             placeholder={placeholder}
             inputAriaLabel={placeholder}
             typedCommandMenus={false}
             slotApprovalChrome={false}
             promptOptimizer={false}
-            // Model + effort write the PEER's slot. Attach, the agent picker
-            // and the approval-mode picker are not passed, so the composer
-            // does not draw them: each writes THIS gateway's state.
+            // Model, effort, agent and approval mode write the PEER's slot.
+            // Attach is not passed, so the composer does not draw it: it
+            // uploads to THIS gateway.
             {...picker.chipProps}
+            {...agentMode.chipProps}
             pendingQuote={rewindTs ? null : messageQuote.pendingQuote}
             onRemoveQuote={messageQuote.clearQuote}
           />
+        </Composer>
         </SlotProvider>
         </fieldset>
       </Glass>
       </div>
       {picker.portal}
+      {agentMode.portal}
       </div>
     </div>
   )

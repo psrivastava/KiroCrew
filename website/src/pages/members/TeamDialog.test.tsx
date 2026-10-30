@@ -26,7 +26,7 @@ import TeamDialog from './TeamDialog'
 /* TeamDialog's CREATE mode, pinned on the component.
  *
  * The Crewmates page no longer draws a New team door -- team creation is hidden
- * for the current phase (`MembersPage.tsx`, the "+" menu) -- so these cases are
+ * for the current phase (`MembersPageRoster.tsx`, the "+" menu) -- so these cases are
  * what keeps the create half honest while nothing on screen reaches it: the
  * checklist it opens with, the gate on a name, the body it posts, and the draft
  * guard. They are also the proof that restoring the door is a revert rather
@@ -57,7 +57,7 @@ beforeEach(() => {
 })
 
 describe('TeamDialog create mode', () => {
-  it('lists every crewmate with the team it is on, names the one-team rule, and says it creates', async () => {
+  it('lists every mate with the team it is on, names the one-team rule, and says it creates', async () => {
     renderCreate([TRIAGE])
     const body = await screen.findByTestId('team-dialog-body')
     const rows = within(body).getAllByTestId('team-dialog-row')
@@ -71,7 +71,7 @@ describe('TeamDialog create mode', () => {
     expect(screen.getByTestId('team-dialog-save')).toHaveTextContent('Create team')
   })
 
-  it('gates Create on a name, then posts the picked crewmates in roster order and reports the saved team', async () => {
+  it('gates Create on a name, then posts the picked mates in roster order and reports the saved team', async () => {
     const created: CrewTeam = { id: 'def456def456', name: 'Release', members: ['oncall', 'docs'] }
     teamsCreate.mockResolvedValue({ team: created })
     const { onSaved } = renderCreate()

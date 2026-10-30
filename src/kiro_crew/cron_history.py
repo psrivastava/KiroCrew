@@ -498,7 +498,7 @@ class CronHistoryStore:
         """
         try:
             os.stat(self._dir)
-            fd = os.open(str(self._lock_path()), os.O_WRONLY | os.O_CREAT, 0o600)
+            fd = platform_compat.open_create_or_existing(str(self._lock_path()), os.O_WRONLY, 0o600)
         except OSError:
             return False
         os.close(fd)
@@ -548,7 +548,7 @@ class CronHistoryStore:
 
     def _lock(self) -> int:
         """Acquire advisory lock, return fd."""
-        fd = os.open(str(self._lock_path()), os.O_WRONLY | os.O_CREAT, 0o600)
+        fd = platform_compat.open_create_or_existing(str(self._lock_path()), os.O_WRONLY, 0o600)
         platform_compat.acquire_lock(fd, exclusive=True)
         return fd
 
@@ -559,14 +559,14 @@ class CronHistoryStore:
     async def append(self, record: CronRunRecord) -> None:
         """Write record to job file and index."""
         # Cap fields
-        # The ONE truncation site for a summary: cron.py's run, timeout and
+        # The ONE truncation site for a summary: the cron service's run, timeout and
         # cancel recorders all hand the whole text over uncut, so the
         # configured cap and the keep-the-facts rule apply once, here. A
         # caller that pre-slices defeats both.
         #
         # One boundary this does not reach: a command cron's failure path caps
         # the JOB FIELD it writes (``job.last_error = err_str[:200]`` in
-        # slack/gateway.py), which is a registry-size decision about crons.json,
+        # slack/gateway_runtime/cron_exec.py), which is a registry-size decision about crons.json,
         # not a decision about this record. The recorder still passes that field
         # over whole, so such a summary is simply as long as the field it came
         # from. Lifting that cap belongs to whoever owns the registry's size.
@@ -743,6 +743,20 @@ class CronHistoryStore:
             return False
         try:
             return await asyncio.to_thread(self._delete_job_history_sync, job_id)
+        except OSError as exc:
+            self._degrade("delete_job_history", exc)
+            return False
+
+    def delete_job_history_sync(self, job_id: str) -> bool:
+        """Synchronous :meth:`delete_job_history`, for a loop-less caller.
+
+        Blocking filesystem I/O under the history lock, so it never runs on an
+        event loop; there, await :meth:`delete_job_history`.
+        """
+        if not self._enabled:
+            return False
+        try:
+            return self._delete_job_history_sync(job_id)
         except OSError as exc:
             self._degrade("delete_job_history", exc)
             return False

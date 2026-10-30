@@ -2,7 +2,7 @@
 
 ``ui.show`` points at one indexed UI location. Its plan (version 2: one step
 list per placement, each step with an id) is generated with the find_ui index
-(``website/scripts/lib/ui-index.mjs`` ``guidePlanFor``); the gateway accepts
+(``website/scripts/lib/ui-index-guide.mjs`` ``guidePlanFor``); the gateway accepts
 only an id whose packaged plan exists, records the placement the claiming tab
 walks, and find_ui hands out a ``ui.show`` guide_ref only for such an id.
 """
@@ -391,7 +391,8 @@ def test_the_browser_module_and_the_index_carry_one_build_digest() -> None:
         | frozenset(raw["guide_gates"])
     )
     assert manifest.selections == frozenset(raw["guide_selections"])
-    assert manifest.gates["developer_mode"] == "developer.developer-mode"
+    assert manifest.gates["preview_flag:mc-preview-webhooks"] == "developer.webhooks"
+    assert "preview_flag:mc-preview-crew" not in manifest.gates
     assert manifest.gates["terminal_enabled"] is None
     assert manifest.plan_predicates["chat.older-sessions"] == (
         "full_dashboard",
@@ -655,10 +656,10 @@ def test_find_ui_quotes_the_pages_own_words_for_what_a_deletion_removes() -> Non
     # Delete crewmate only unbinds; Mate describes it from the page's own
     # notice, never from a guess that it wipes chats and notes for good.
     for locale, want in (
-        ("en", "Deleting a crewmate only unbinds it from new sessions."),
+        ("en", "Deleting a mate only unbinds it from new sessions."),
         ("zh-CN", None),
     ):
-        d = ui_index.find_ui("delete a crewmate", locale)
+        d = ui_index.find_ui("delete a mate", locale)
         hit = next((r for r in d.get("results", []) if r["id"] == "agents.delete"), None)
         assert hit is not None, d
         assert hit["caution"] is True
@@ -728,15 +729,10 @@ def _steps(lid: str, placement: str) -> list[dict[str, Any]]:
 
 
 def _pointing(lid: str, placement: str) -> list[dict[str, Any]]:
-    """The steps after a Crewmates control's preview gate, which opens every one."""
+    """A Crewmates control's steps; none opens on a preview gate."""
     steps = _steps(lid, placement)
-    assert steps[0] == {
-        "id": f"{placement}:gate:preview_flag:mc-preview-crew",
-        "kind": "gate",
-        "gate": "preview_flag:mc-preview-crew",
-        "setting_id": "developer.crewmates",
-    }
-    return steps[1:]
+    assert all(s.get("kind") != "gate" for s in steps)
+    return steps
 
 
 def test_delete_crewmate_walks_through_the_editor_and_never_finishes_on_its_own() -> None:
@@ -752,11 +748,7 @@ def test_delete_crewmate_walks_through_the_editor_and_never_finishes_on_its_own(
     assert steps[-1]["caution"] is True
 
 
-def test_crewmate_memory_and_model_walk_through_the_editor() -> None:
-    memory = _steps("agents.manage-memory", "any")
-    assert memory[0]["selection"] == "crewmate_editor_open"
-    assert memory[1]["location"] == "agents.section-place"
-    assert memory[-1]["requires"] == ["crewmate_memory_manageable"]
+def test_crewmate_model_walks_through_the_editor() -> None:
     model = _steps("agents.model", "any")
     assert [s["location"] for s in model] == [
         "agents.crew-list",

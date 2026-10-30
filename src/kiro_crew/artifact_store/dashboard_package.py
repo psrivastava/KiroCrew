@@ -2,7 +2,7 @@
 
 A dashboard artifact's content is not a document but a PACKAGE: a JSON object
 holding ``bound_to`` (whose dashboard this is), ``model`` (the data types and
-field shapes the page may render), ``view`` (the blocks that render them) and
+field shapes the page may render), ``view`` (the page that renders them) and
 ``theme`` (tokens, optional CSS). Values never live here. They stay in the crew
 log and reach the page through the fold / bus / controller path, so a package is
 small, stable, and versioned only when the layout itself changes.
@@ -15,12 +15,11 @@ Three rules follow from that and are enforced here rather than at each caller:
   ``kind="dashboard"`` write. Both the dashboard tool path and a plain
   ``artifact_update`` funnel through the store, so neither can write a package
   the other would refuse.
-* **Closed vocabularies.** A model field's ``type`` must be in
-  :func:`data_type_catalog` and a view block's ``type`` in
-  :func:`view_block_catalog`; every key inside either is named by its catalog
-  entry and an unknown one is refused. Both catalogs are STUBS with a starter
-  set -- the data line owns the first, the display line the second -- and
-  replacing a stub moves the validator with it.
+* **A closed vocabulary.** A model field's ``type`` must be in
+  :func:`data_type_catalog`, every key inside a field is named by its catalog
+  entry, and an unknown one is refused. The view is one agent-written page,
+  ``view.html``; a stored view of ``blocks`` is read as the page it
+  becomes (:func:`_blocks_as_html`), and the next write stores the page.
 * **A version means a layout change.** :func:`layout_changed` compares the
   canonical ``model`` + ``view`` + ``theme`` of two packages, and the store
   snapshots a dashboard write only when that comparison says yes. ``bound_to``
@@ -37,12 +36,13 @@ artifact write path already renders as a 400 rather than a 500.
 from __future__ import annotations
 
 import hashlib
+import html as _html
 import json
 import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from dataclasses import field as _dc_field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Final
 
 from kiro_crew.artifact_store.model import ArtifactValidationError
 
@@ -55,12 +55,36 @@ if TYPE_CHECKING:  # pragma: no cover - a type-only import, so no cycle at run t
 #: of a prose document to this kind would store content no reader can parse.
 DASHBOARD_KIND = "dashboard"
 
-#: Hard cap on a stored package, well under the artifact content cap. A package
-#: is layout: a figure this size is already a sign that values leaked into it.
-MAX_PACKAGE_BYTES = 256 * 1024
+#: Cap on an agent-written ``view.html`` page, in bytes of UTF-8.
+#:
+#: The FRAME's own ceiling, :data:`kiro_crew.dashboard_frame.MAX_PAGE_BYTES`, so a page
+#: a package can hold is always a page the frame will draw. Mirrored rather than
+#: imported, because this module is on the artifact write path and must stay cheap to
+#: import; ``test_the_page_cap_is_the_frames_own`` pins the two equal.
+#:
+#: The cap bounds what a page COSTS to store, send and draw. It does not detect values
+#: baked into the layout: a page that inlines a client-side library is several MB with
+#: no data in it, so size cannot tell the two apart. The structural rules are what keep
+#: values out: every field names its source, every binding must be a declared field,
+#: the controller pushes only declared fields, and value-shaped keys are refused.
+MAX_VIEW_HTML_BYTES = 3 * 1024 * 1024
+
+#: Hard cap on a stored package, in bytes of its STORED form, well under the artifact
+#: content cap.
+#:
+#: Sized so a page at :data:`MAX_VIEW_HTML_BYTES` fits once escaped. The stored form is
+#: JSON, which writes a quote, a backslash or a line break in the page as two bytes, so
+#: the page can take up to twice its own size there (other control characters escape
+#: longer, and HTML has no use for them). The 128 KiB on top is the room for the rest
+#: of the package -- model, theme and structure -- as a page had beside it before. The
+#: whole package is still measured against this one number, so a model and theme near
+#: their own caps can need more, and then the refusal below names the limit. This cap
+#: also bounds the decode, which runs before any validator. The reader applies the same
+#: number to a stored package, so the cap can be raised but not lowered while packages
+#: written under a larger one are still stored: those would stop loading.
+MAX_PACKAGE_BYTES = 2 * MAX_VIEW_HTML_BYTES + 128 * 1024
 
 MAX_MODEL_FIELDS = 64
-MAX_VIEW_BLOCKS = 48
 MAX_THEME_TOKENS = 64
 MAX_THEME_CSS_BYTES = 32 * 1024
 #: Cap on a human-readable string inside the package (a label, a title, a unit).
@@ -75,8 +99,6 @@ MAX_LABEL_LEN = 120
 _BOUND_TO_RE = re.compile(r"\A(?:crewmate|session):[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 #: A model field name: an identifier the view and the fold both spell the same way.
 _FIELD_NAME_RE = re.compile(r"\A[a-z][a-z0-9_]{0,63}\Z")
-#: A view block id: unique within the view, and the key the controller pushes to.
-_BLOCK_ID_RE = re.compile(r"\A[a-z][a-z0-9_-]{0,63}\Z")
 #: A theme token: a CSS custom property name, so the page can inject it as one.
 _THEME_TOKEN_RE = re.compile(r"\A--[a-z][a-z0-9-]{0,63}\Z")
 #: A theme token's value: printable, single-line, no CSS statement punctuation --
@@ -110,8 +132,6 @@ _PATH_RE = re.compile(r"\A[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)*\Z")
 
 #: The keys every model field carries, whatever its type.
 _UNIVERSAL_FIELD_KEYS = ("type", "source", "label", "description")
-#: The keys every view block carries, whatever its type.
-_UNIVERSAL_BLOCK_KEYS = ("id", "type", "fields", "title")
 
 
 # --------------------------------------------------------------------------- #
@@ -157,17 +177,9 @@ def _a_choice_list(v: Any) -> list[str]:
     return out
 
 
-def _a_span(v: Any) -> int:
-    if isinstance(v, bool) or not isinstance(v, int):
-        raise ValueError(f"must be a whole number of columns, got {type(v).__name__}")
-    if v < 1 or v > 12:
-        raise ValueError("must be between 1 and 12 columns")
-    return v
-
-
 # --------------------------------------------------------------------------- #
-# The two catalogs. STUBS: a starter set so the package line is testable end to
-# end. Each is ONE function, so filling it in is a single edit and the validator
+# The data type catalog. A STUB: a starter set so the package line is testable end
+# to end. It is ONE function, so filling it in is a single edit and the validator
 # follows -- see data/INTERFACE.md.
 # --------------------------------------------------------------------------- #
 
@@ -185,17 +197,6 @@ class FieldType:
     name: str
     summary: str
     required: Mapping[str, Callable[[Any], Any]] = _dc_field(default_factory=dict)
-    optional: Mapping[str, Callable[[Any], Any]] = _dc_field(default_factory=dict)
-
-
-@dataclass(frozen=True)
-class BlockType:
-    """One admissible ``view.blocks[*].type``, and how many model fields it reads."""
-
-    name: str
-    summary: str
-    min_fields: int = 1
-    max_fields: int = 16
     optional: Mapping[str, Callable[[Any], Any]] = _dc_field(default_factory=dict)
 
 
@@ -218,33 +219,14 @@ _STUB_DATA_TYPES: tuple[FieldType, ...] = (
         required={"choices": _a_choice_list},
     ),
     FieldType(name="bool", summary="a yes/no flag"),
-)
-
-#: STUB -- the display line owns this table.
-_STUB_BLOCK_TYPES: tuple[BlockType, ...] = (
-    BlockType(
-        name="stat",
-        summary="one field as a large number",
-        min_fields=1,
-        max_fields=1,
-        optional={"span": _a_span},
-    ),
-    BlockType(
-        name="table",
-        summary="fields as columns of a table",
-        optional={"span": _a_span},
-    ),
-    BlockType(
-        name="list",
-        summary="fields as rows of a plain list",
-        optional={"span": _a_span},
-    ),
-    BlockType(
-        name="timeline",
-        summary="fields ordered by a timestamp",
-        max_fields=8,
-        optional={"span": _a_span},
-    ),
+    # The two a PAGE needs and a host-drawn block never did. A fold's value is often a
+    # list of rows or a nested record -- `worktree.boards`, `work.items` -- and the
+    # catalog without them can express a count of a tree but not the tree, so the first
+    # page that draws one has no field to bind. Admitted with no shape keys: the write
+    # path does not check a fold's own structure, and a shape declared here would be a
+    # promise about bytes nothing validates.
+    FieldType(name="array", summary="a list of rows, walked by the page's own script"),
+    FieldType(name="object", summary="a nested record, walked by the page's own script"),
 )
 
 
@@ -259,15 +241,6 @@ def data_type_catalog() -> Mapping[str, FieldType]:
     return {t.name: t for t in _STUB_DATA_TYPES}
 
 
-def view_block_catalog() -> Mapping[str, BlockType]:
-    """The block types a ``view`` may place, by type name.
-
-    Same contract as :func:`data_type_catalog`, for the other half of the
-    package: a stub starter set the display line replaces.
-    """
-    return {b.name: b for b in _STUB_BLOCK_TYPES}
-
-
 # --------------------------------------------------------------------------- #
 # Validation
 # --------------------------------------------------------------------------- #
@@ -275,6 +248,43 @@ def view_block_catalog() -> Mapping[str, BlockType]:
 
 def _refuse(path: str, reason: str) -> ArtifactValidationError:
     return ArtifactValidationError(f"dashboard package: {path}: {reason}")
+
+
+def _refuse_credential_shaped_name(name: str) -> None:
+    """Refuse a field name the credential redactor would rewrite.
+
+    A field NAME travels further than its value. Values are scrubbed on the way
+    out; the names are served in the package's ``fields`` list and written into
+    the page's data island, so a name shaped like a token is published in clear
+    by the one surface that redacts everything else. :data:`_FIELD_NAME_RE` does
+    not stop that -- a lower-case fine-grained-PAT shape fits inside
+    ``[a-z][a-z0-9_]{0,63}`` with room to spare.
+
+    The gate is the REDACTOR ITSELF rather than a second copy of its patterns:
+    the name goes through the same shim every egress site uses, and a name that
+    comes back changed is refused. So a loaded companion's extra credential and
+    cookie patterns apply here too, and a pattern added there cannot leave this
+    check behind.
+
+    Refused at VALIDATION, which is upstream of every reader: the serving path,
+    the data island and the field push all take the package as given, so one
+    refusal here covers all of them without each having to remember.
+
+    The refusal names the field by its REDACTED spelling. An error string is
+    logged, and echoing back the thing just identified as credential-shaped
+    would put it exactly where this check exists to keep it out of.
+    """
+    from kiro_crew.platform.context import redact_via_context
+
+    redacted = redact_via_context(name)
+    if redacted == name:
+        return
+    raise _refuse(
+        f"model.types.{redacted}",
+        "is shaped like a credential, so it is refused as a field NAME. Field "
+        "names are served in the package's field list and written into the "
+        "page's data island, where only values are redacted -- rename the field",
+    )
 
 
 #: An unpaired UTF-16 surrogate. ``"\ud800"`` is a well-formed JSON escape, so
@@ -373,7 +383,7 @@ def _apply(
 
 
 def fold_names() -> frozenset[str]:
-    """The crew-log folds a field may read, as the template manifest defines them.
+    """The crew-log folds a PACKAGE field may read.
 
     Imported lazily and read through this one function rather than copied: a fold
     added to ``crew_log.projection`` has to be readable from a package without a
@@ -382,10 +392,15 @@ def fold_names() -> frozenset[str]:
     because ``dashboard_templates.manifest`` reaches the projection and the
     template parity checker, and the artifact store should not carry that graph
     just to validate a string.
-    """
-    from kiro_crew.dashboard_templates.manifest import FOLD_NAMES
 
-    return frozenset(FOLD_NAMES)
+    ``PACKAGE_FOLD_NAMES`` rather than the template set, because the two surfaces
+    have different readers and this gate is about reachability: a package's page is
+    drawn by ``member_dashboard_fields.LivePage``, which READS a tree-keyed fold, and
+    a template is rendered by a feed that reaches a fold only by its bus scope.
+    """
+    from kiro_crew.dashboard_templates.manifest import PACKAGE_FOLD_NAMES
+
+    return frozenset(PACKAGE_FOLD_NAMES)
 
 
 def _validate_source(raw: Any, path: str) -> dict[str, Any]:
@@ -442,6 +457,103 @@ def validate_bound_to(raw: Any) -> str:
     return raw
 
 
+def binding_refusal(bound_to: Any, *, crew: str = "", slot: str = "") -> str:
+    """``""`` when this caller owns the dashboard *bound_to* names; else why it does not.
+
+    THE OWNER GATE, as a comparison with no request and no store read, so every write
+    path can ask it and a test can enumerate the answers. The caller's identity is
+    resolved by whoever holds the request -- the crew comes from the session's own
+    binding and never from a body -- and only the comparison is here. A crewmate
+    binding resolves the caller's slug through the roster, because the binding stores a
+    slug and a name is not one.
+
+    A refusal is RETURNED rather than raised, and it is a sentence rather than a code,
+    because the party that reads it is a worker agent that can act on it: the useful
+    thing to say is whose dashboard this is and what to do instead, and an exception
+    would be rendered as a 500 by every caller that answers a validation error with a
+    400.
+
+    Both binding scopes are answered, and a caller that can prove neither identity is
+    refused rather than allowed: a gate whose default is "no identity, no objection"
+    is not a gate.
+    """
+    # EVERY NAME IN THIS SENTENCE IS REDACTED FIRST, because the sentence is returned
+    # to a caller and served as an HTTP body.
+    #
+    # `_BOUND_TO_RE` accepts a name shaped like a GitLab PAT or a Slack bot token, so a
+    # package whose binding is such a string has that string put back into the refusal
+    # and sent out. Done HERE, in the one function that composes these messages, rather
+    # than at each route that returns one: the write gate, the named GET and the bound
+    # GET all read this string, and a guard added per call site is how the second and
+    # third of them would have been missed.
+    from kiro_crew.platform.context import redact_via_context
+
+    def safe(value: str) -> str:
+        return redact_via_context(value) if value else value
+
+    try:
+        binding = validate_bound_to(bound_to)
+    except ArtifactValidationError as exc:
+        # The validation error quotes the offending value, so it is redacted too: a
+        # binding can fail validation for a reason that has nothing to do with its
+        # shape -- a missing scope -- while still being credential-shaped.
+        return safe(str(exc))
+    scope, _, name = binding.partition(":")
+    if scope == "session":
+        if slot and slot == name:
+            return ""
+        return (
+            f"this dashboard belongs to the session {safe(name)!r} and you are writing "
+            f"from {safe(slot) or 'no session'}. Report your work with work_report; the "
+            "fold carries it to the page."
+        )
+    # A crewmate binding. The slug is compared, not the display name, because the
+    # binding stores a slug and slugification is lossy -- comparing names would let
+    # two configured names that differ only in case each pass for the other's page.
+    #
+    if crew:
+        from kiro_crew import members as members_mod
+
+        try:
+            # EXACTLY ONE CREWMATE MAY OWN THIS SLUG, asked before the comparison below
+            # can pick between two of them.
+            #
+            # Slugification is lossy, so a hand-edited roster holding both `Atlas` and
+            # `atlas` derives one slug from two names -- and comparing the caller's slug
+            # to the binding's then authorizes EITHER of them for the other's page.
+            #
+            # `_member_names_for_slug` is the roster's own answer to this question, the
+            # one `_crewmate_binding_refusal` and `member_dashboard._resolve` already
+            # ask, so the count and the refusal here are not a fourth implementation of
+            # the rule. Ambiguity REFUSES and never picks: the remedy is a person
+            # renaming one of them, which is what the serve-time refusal already says.
+            from kiro_crew.config.loader import KiroCrewConfig
+            from kiro_crew.dashboard.handlers.members import _member_names_for_slug
+
+            cfg = KiroCrewConfig.load()
+            owners = _member_names_for_slug(cfg, name)
+            if len(owners) > 1:
+                return (
+                    f"the dashboard binding {safe(name)!r} is a slug more than one "
+                    "crewmate resolves to, so no writer can be shown to own it and a "
+                    "read of it is refused 'dashboard_slug_ambiguous'. Nothing was "
+                    "written: ask the person to rename one of them."
+                )
+            if owners and members_mod.member_slug(crew, cfg) == name:
+                return ""
+        except Exception:
+            # An unslugifiable caller, or a roster this process could not read, cannot
+            # be shown to own anything. That is the same answer as a mismatch and is
+            # reported as one -- a read that failed authorizes nothing.
+            pass
+    return (
+        f"this dashboard belongs to {safe(name)!r} and you are "
+        f"{safe(crew) or 'not a crew member'}. A dashboard is written by the crewmate "
+        "it is bound to; report your work with work_report instead, and the fold "
+        "carries it to the page."
+    )
+
+
 def _validate_model(raw: Any) -> dict[str, Any]:
     model = _an_object(raw, "model")
     _check_keys(model, "model", ("types",))
@@ -465,6 +577,7 @@ def _validate_model(raw: Any) -> dict[str, Any]:
                 "is not a field name: lowercase letters, digits and '_', "
                 "starting with a letter, at most 64 characters",
             )
+        _refuse_credential_shaped_name(name)
         spec = _an_object(raw_types[name], path)
         type_name = spec.get("type")
         if not isinstance(type_name, str) or not type_name:
@@ -499,90 +612,178 @@ def _validate_model(raw: Any) -> dict[str, Any]:
     return {"types": fields}
 
 
-def _validate_view(raw: Any, declared_fields: Mapping[str, Any]) -> dict[str, Any]:
-    view = _an_object(raw, "view")
-    _check_keys(view, "view", ("blocks",))
-    raw_blocks = view.get("blocks")
+#: A text binding in an agent-written page, in either quote an author may have typed.
+#:
+#: MIRRORS :data:`kiro_crew.dashboard_frame.BINDING_ATTRIBUTE`, pinned equal by test.
+#: Matched with a regex rather than parsed, because this check runs on the artifact
+#: write path and pulling in the html parser there would put it behind every caller of
+#: :mod:`kiro_crew.artifacts`. The cost is a page that MENTIONS the attribute in its own
+#: prose being read as binding it -- a refusal the author can act on, where the parse's
+#: own cost would be paid by every artifact write in the product.
+#: The attribute name a page binds a field with, as :data:`_HTML_BINDING_RE` reads it.
+_BINDING_RUN = "data-dashboard-field"
+_HTML_BINDING_RE = re.compile(
+    r"data-dashboard-field\s*=\s*(?:\"([^\"]*)\"|'([^']*)'|([^\s\"'>=`]+))"
+)
+
+
+def _page_too_large(size: int, *, at_least: bool = False) -> str:
+    """Why a page of *size* bytes is refused: the one sentence both size checks give."""
+    measured = f"at least {size}" if at_least else str(size)
+    return (
+        f"is {measured} bytes, over the {MAX_VIEW_HTML_BYTES}-byte limit for a page -- "
+        "inline less into it, and keep values out of it: they belong in the crew "
+        "log and reach the page through the fold / bus / controller path"
+    )
+
+
+def _validate_view_html(raw: Any, declared_fields: Mapping[str, Any]) -> str:
+    """One agent-written page, or raise saying why it is not one.
+
+    What is NOT checked here is the point of the shape: the markup is free, the script
+    is free, and nothing in this function looks for a dangerous construct. Containment
+    is :mod:`kiro_crew.dashboard_frame` -- ``default-src 'none'``, ``connect-src
+    'none'``, no dynamic-exec primitive, ``allow-scripts`` and nothing else over an
+    opaque origin -- and a page cannot loosen a policy by being written differently. A
+    denylist here would be a second, weaker gate that an author would read as the real
+    one.
+
+    What IS checked is the author's own mistake, while the author is still present.
+    """
+    if not isinstance(raw, str):
+        raise _refuse("view.html", f"must be a string of HTML, got {type(raw).__name__}")
+    if not raw.strip():
+        raise _refuse(
+            "view.html",
+            "is empty: write the page's inline HTML, binding each field with "
+            "data-dashboard-field or reading it from window.kirocrew.subscribe",
+        )
+    size = len(raw.encode("utf-8"))
+    if size > MAX_VIEW_HTML_BYTES:
+        raise _refuse("view.html", _page_too_large(size))
+    # The frame's own refusals, asked here so the author meets them at save time rather
+    # than seeing a page that renders wrong. Imported lazily: this module is imported by
+    # `kiro_crew.artifacts` and must stay cheap.
+    from kiro_crew import dashboard_frame
+
+    try:
+        dashboard_frame.validate_page(raw)
+    except dashboard_frame.PageError as exc:
+        raise _refuse("view.html", str(exc)) from None
+    bound = sorted({(a or b or c) for a, b, c in _HTML_BINDING_RE.findall(raw)})
+    unknown = [name for name in bound if name not in declared_fields]
+    if unknown:
+        # REDACTED BEFORE IT IS ECHOED, the same rule a DECLARED name gets in
+        # `_refuse_credential_shaped_name`. A name reaches this branch precisely
+        # because the model does not declare it, so it never passed that check -- and
+        # this refusal is returned to its sender as an HTTP error body, which is one of
+        # the places echoing a credential-shaped name would put it. Redaction is
+        # identity on an ordinary name, so the author still reads which field to fix.
+        from kiro_crew.platform.context import redact_via_context
+
+        safe = sorted(redact_via_context(name) for name in unknown)
+        raise _refuse(
+            "view.html",
+            f"binds {safe}, which model.types does not declare "
+            f"(declared: {sorted(declared_fields)}). The model is also the list of "
+            "fields the controller will push, so a name only the page knows is a cell "
+            "nothing ever fills",
+        )
+    return raw
+
+
+def _migrated_text(text: str) -> str:
+    """*text* as page text that no binding scan reads as a binding.
+
+    REDACTED FIRST, on the raw text: escaping rewrites quotes and angle brackets, and
+    a credential written inside them (a quoted ``Authorization`` header) does not
+    match the page's own redaction pass once escaped. Then escaped, and only the run
+    ``data-dashboard-field`` written with ``&#45;`` for its hyphens: a browser shows
+    the same text, and a label that spells the run out is shown rather than read as a
+    cell bound to a field.
+    """
+    from kiro_crew.platform.context import redact_via_context
+
+    safe = _html.escape(redact_via_context(text))
+    return safe.replace(_BINDING_RUN, _BINDING_RUN.replace("-", "&#45;"))
+
+
+def _blocks_as_html(raw_blocks: Any, declared_fields: Mapping[str, Any]) -> str:
+    """A stored view of ``blocks``, as its page.
+
+    ONE WAY. A saved block layout is read as this page, and every write stores the
+    page, so ``blocks`` goes into a package and never comes out of one. Each block
+    becomes a ``section`` holding its ``title`` and one row per field it read: the
+    field's ``label`` (or its name) and an empty ``data-dashboard-field`` cell the host
+    fills as text. Nothing about a block's ``type`` is kept; the page is a plain
+    list the crewmate can redraw. Every title and label is written as text
+    (:func:`_migrated_text`), so none can read as a binding, and the result goes
+    through :func:`_validate_view_html` like any page, so a block naming a field the
+    model does not declare is refused there.
+
+    The page is measured as it is built, so a layout whose page would pass
+    :data:`MAX_VIEW_HTML_BYTES` is refused with that limit's own sentence before the
+    whole page is held in memory.
+    """
     if not isinstance(raw_blocks, list):
         raise _refuse("view.blocks", f"must be a list, got {type(raw_blocks).__name__}")
-    if not raw_blocks:
-        raise _refuse("view.blocks", "must place at least one block")
-    if len(raw_blocks) > MAX_VIEW_BLOCKS:
-        raise _refuse(
-            "view.blocks",
-            f"places {len(raw_blocks)} blocks; at most {MAX_VIEW_BLOCKS} are allowed",
-        )
-    catalog = view_block_catalog()
-    blocks: list[dict[str, Any]] = []
-    seen_ids: list[str] = []
+    sections: list[str] = []
+    size = 0
     for index, raw_block in enumerate(raw_blocks):
-        path = f"view.blocks[{index}]"
-        block = _an_object(raw_block, path)
-        block_id = block.get("id")
-        if not isinstance(block_id, str) or _BLOCK_ID_RE.fullmatch(block_id) is None:
-            raise _refuse(
-                f"{path}.id",
-                "is required and must be lowercase letters, digits, '_' or '-', "
-                "starting with a letter",
+        block = _an_object(raw_block, f"view.blocks[{index}]")
+        title = block.get("title")
+        head = f"<h2>{_migrated_text(title)}</h2>" if isinstance(title, str) and title else ""
+        names = block.get("fields", [])
+        if not isinstance(names, list) or not all(isinstance(n, str) for n in names):
+            raise _refuse(f"view.blocks[{index}].fields", "must be a list of model field names")
+        rows: list[str] = []
+        for name in names:
+            field = declared_fields.get(name)
+            label = field.get("label") if isinstance(field, Mapping) else None
+            shown = label if isinstance(label, str) and label else name
+            row = (
+                f"<div><dt>{_migrated_text(shown)}</dt>"
+                f'<dd data-dashboard-field="{_html.escape(name)}"></dd></div>'
             )
-        if block_id in seen_ids:
-            raise _refuse(f"{path}.id", f"{block_id!r} is used by an earlier block")
-        seen_ids.append(block_id)
-        type_name = block.get("type")
-        if not isinstance(type_name, str) or not type_name:
-            raise _refuse(f"{path}.type", "is required and must be a block type name")
-        entry = catalog.get(type_name)
-        if entry is None:
-            raise _refuse(
-                f"{path}.type",
-                f"unknown block type {type_name!r}: the catalog holds {sorted(catalog)}",
+            size += len(row.encode("utf-8"))
+            if size > MAX_VIEW_HTML_BYTES:
+                raise _refuse("view.html", _page_too_large(size, at_least=True))
+            rows.append(row)
+        sections.append(f"<section>{head}<dl>{''.join(rows)}</dl></section>")
+    return "".join(sections)
+
+
+def _validate_view(raw: Any, declared_fields: Mapping[str, Any]) -> dict[str, Any]:
+    view = _an_object(raw, "view")
+    _check_keys(view, "view", ("blocks", "html"))
+    # EXACTLY ONE. Two views has no answer to "what does this page look like", and
+    # drawing one while ignoring the other picks for the author silently -- when the
+    # half that was ignored is the half they were editing.
+    if "html" in view and "blocks" in view:
+        raise _refuse("view", "must hold only 'html', the page; this one also holds 'blocks'")
+    if "blocks" in view:
+        return {
+            "html": _validate_view_html(
+                _blocks_as_html(view["blocks"], declared_fields), declared_fields
             )
-        _check_keys(block, path, (*_UNIVERSAL_BLOCK_KEYS, *entry.optional))
-        raw_names = block.get("fields")
-        if not isinstance(raw_names, list):
-            raise _refuse(
-                f"{path}.fields",
-                f"is required and must be a list of model field names, got "
-                f"{type(raw_names).__name__}",
-            )
-        names: list[str] = []
-        for name in raw_names:
-            if not isinstance(name, str):
-                raise _refuse(
-                    f"{path}.fields", f"every name must be a string, got {type(name).__name__}"
-                )
-            if name not in declared_fields:
-                raise _refuse(
-                    f"{path}.fields",
-                    f"names {name!r}, which model.types does not declare "
-                    f"(declared: {sorted(declared_fields)})",
-                )
-            if name in names:
-                raise _refuse(f"{path}.fields", f"names {name!r} twice")
-            names.append(name)
-        if not (entry.min_fields <= len(names) <= entry.max_fields):
-            raise _refuse(
-                f"{path}.fields",
-                f"a {type_name!r} block reads between {entry.min_fields} and "
-                f"{entry.max_fields} fields (this one names {len(names)})",
-            )
-        out: dict[str, Any] = {"id": block_id, "type": type_name, "fields": names}
-        if "title" in block:
-            try:
-                out["title"] = _a_label(block["title"])
-            except ValueError as exc:
-                raise _refuse(f"{path}.title", str(exc)) from None
-        _apply(entry.optional, block, out, path, required=False)
-        blocks.append(out)
-    return {"blocks": blocks}
+        }
+    if "html" not in view:
+        raise _refuse(
+            "view",
+            "must hold 'html': the page, binding each field with data-dashboard-field "
+            "or reading it from window.kirocrew.subscribe",
+        )
+    return {"html": _validate_view_html(view["html"], declared_fields)}
 
 
 def _validate_theme(raw: Any) -> dict[str, Any]:
     theme = _an_object(raw, "theme")
     _check_keys(theme, "theme", ("tokens", "css"))
+    # A missing ``tokens`` is the empty set: an MCP client can drop an empty object
+    # from a tool call, so ``{"tokens": {}}`` may arrive as ``{}``.
     raw_tokens = theme.get("tokens")
     if raw_tokens is None:
-        raise _refuse("theme.tokens", "is required (an empty object is fine)")
+        raw_tokens = {}
     tokens_obj = _an_object(raw_tokens, "theme.tokens")
     if len(tokens_obj) > MAX_THEME_TOKENS:
         raise _refuse(
@@ -619,24 +820,77 @@ def _validate_theme(raw: Any) -> dict[str, Any]:
         # so a fetching construct cannot load -- it would fail silently and read
         # as a style that does not apply. Refusing it here says why instead.
         lowered = css.lower()
-        for construct in ("@import", "url(", "<script", "</style", "javascript:"):
+        for construct in ("@import", "<script", "</style", "javascript:"):
             if construct in lowered:
                 raise _refuse(
                     "theme.css",
                     f"must not contain {construct!r}: the page iframe has no network "
                     "and takes no agent-authored code",
                 )
+        if _theme_fetches(lowered):
+            raise _refuse("theme.css", THEME_URL_REFUSAL)
         out["css"] = css
     return out
+
+
+#: Why ``theme.css`` refuses a ``url()`` that is not an inline ``data:`` URL.
+THEME_URL_REFUSAL: Final[str] = (
+    "must not contain a url() with an address: the page iframe has no network, so it "
+    "would load nothing. A texture, pattern or wallpaper can be an inline data: URL "
+    'instead -- url("data:image/svg+xml,...") or a base64 image -- which needs no '
+    "network"
+)
+
+
+def _theme_fetches(lowered: str) -> bool:
+    """Whether lower-cased theme CSS holds a ``url(`` that is not an inline ``data:`` URL.
+
+    A ``data:`` URL carries its bytes with it, so it reaches no network and the frame's
+    ``img-src data:`` admits it; any other address is a fetch the frame refuses. One
+    linear pass: the text is the agent's, so no backtracking pattern runs over it.
+    """
+    at = 0
+    while True:
+        start = lowered.find("url(", at)
+        if start < 0:
+            return False
+        cursor = start + 4
+        while cursor < len(lowered) and lowered[cursor] in " \t\r\n\f\"'":
+            cursor += 1
+        if not lowered.startswith("data:", cursor):
+            return True
+        # Resume past the whole data URL: its own bytes can hold a ``url(#id)`` (an SVG
+        # gradient or pattern reference), which points inside the data, not at an address.
+        quote = next((c for c in lowered[start + 4 : cursor] if c in "\"'"), "")
+        end = lowered.find(quote, cursor) if quote else lowered.find(")", cursor)
+        if end < 0:
+            return False
+        at = end + 1
+
+
+def theme_stylesheet(raw: Any) -> str:
+    """The package's ``theme`` as one stylesheet: its tokens on ``:root``, then its css.
+
+    Checked by the same validator the write gate runs, so what reaches a ``<style>``
+    element is only what the gate accepts: a token value holds no ``;``, ``{``, ``}``,
+    ``<`` or ``>``, and the css holds no ``</style``, so neither can close the element
+    or open a rule of its own. Raises :class:`~kiro_crew.artifact_store.model.ArtifactValidationError` for a theme the
+    gate would refuse, such as one written under an older validator.
+    """
+    theme = _validate_theme(raw)
+    tokens = "".join(f"{name}:{value};" for name, value in theme["tokens"].items())
+    parts = [f":root{{{tokens}}}"] if tokens else []
+    if theme.get("css"):
+        parts.append(theme["css"])
+    return "\n".join(parts)
 
 
 def validate_package(raw: Any) -> dict[str, Any]:
     """Return the CANONICAL form of a dashboard package, or raise saying why not.
 
     Canonical means: the five top-level keys in a fixed order, model fields and
-    theme tokens in sorted key order, each field and block holding only the keys
-    its catalog entry names, and view blocks in the order the author placed them
-    (that order is the layout). Two packages that mean the same thing therefore
+    theme tokens in sorted key order, each field holding only the keys its catalog
+    entry names, and the view as its one page. Two packages that mean the same thing therefore
     serialize to the same bytes, which is what makes
     :func:`layout_changed` able to answer by comparison.
     """
@@ -650,11 +904,12 @@ def validate_package(raw: Any) -> dict[str, Any]:
         raise _refuse("model", "is required")
     if "view" not in package:
         raise _refuse("view", "is required")
-    if "theme" not in package:
-        raise _refuse("theme", "is required (an empty 'tokens' object is fine)")
     model = _validate_model(package["model"])
     view = _validate_view(package["view"], model["types"])
-    theme = _validate_theme(package["theme"])
+    # A missing theme is the empty one, stored canonically as ``{"tokens": {}}``: an
+    # MCP client can drop ``{"tokens": {}}`` before it reaches the gateway.
+    raw_theme = package.get("theme")
+    theme = _validate_theme({"tokens": {}} if raw_theme is None else raw_theme)
     return {
         "kind": DASHBOARD_KIND,
         "bound_to": bound_to,
@@ -662,6 +917,53 @@ def validate_package(raw: Any) -> dict[str, Any]:
         "view": view,
         "theme": theme,
     }
+
+
+#: How a field's source is spelled for a reader: the fold and the dotted path it walks,
+#: or the key the owner writes itself.
+SOURCE_FOLD_PREFIX = "fold:"
+SOURCE_CUSTOM_PREFIX = "custom:"
+
+
+def subscribed_fields(package: Mapping[str, Any]) -> dict[str, str]:
+    """Every field this page may be sent, by name, each with where its value comes from.
+
+    THE ALLOWLIST, and the reason it is one function rather than a rule each caller
+    applies: the controller asks it what may be pushed, and the write gate has already
+    validated the page's bindings against the same table. A field the model does not
+    declare therefore cannot reach the page by either route -- it is not pushed, and a
+    binding naming it is refused at save time.
+
+    The source is a STRING for a reader -- a log line, a refusal, an evidence file --
+    spelled ``fold:<fold>.<path>`` or ``custom:<key>``. The caller that needs to
+    subscribe reads ``package["model"]["types"]`` itself; collapsing a fold and a path
+    into one string and splitting it again would be a second grammar for something the
+    package already says in two fields.
+
+    *package* must be CANONICAL -- the output of :func:`validate_package` or
+    :func:`parse_package` -- because a field with no validated ``source`` has no answer
+    here and this function does not re-validate one.
+    """
+    types = (package.get("model") or {}).get("types")
+    if not isinstance(types, Mapping):
+        return {}
+    out: dict[str, str] = {}
+    for name in sorted(types):
+        spec = types[name]
+        source = spec.get("source") if isinstance(spec, Mapping) else None
+        if not isinstance(source, Mapping):
+            continue
+        if source.get("agentic") is True:
+            # Keyed by the FIELD NAME, which is what the agentic fold stores a value
+            # under. There is no second key to carry, so a reader seeing
+            # ``custom:boards`` knows both the source kind and the key.
+            out[name] = f"{SOURCE_CUSTOM_PREFIX}{name}"
+            continue
+        fold = str(source.get("fold") or "")
+        path = str(source.get("path") or "")
+        if fold and path:
+            out[name] = f"{SOURCE_FOLD_PREFIX}{fold}.{path}"
+    return out
 
 
 def _decode_package(content: str) -> Any:
@@ -696,8 +998,8 @@ def _decode_package(content: str) -> Any:
         raise _refuse("package", f"is not valid JSON: {exc}") from None
     except RecursionError:
         # The byte cap above bounds a package's SIZE, not its DEPTH, and the two
-        # come apart: a quarter-megabyte of ``[`` is small enough to pass the cap
-        # and deep enough that the decoder runs out of stack. ``RecursionError``
+        # come apart: a few thousand ``[`` are small enough to pass the cap and
+        # deep enough that the decoder runs out of stack. ``RecursionError``
         # is a ``RuntimeError``, so the ``ValueError`` arm does not see it, and
         # letting it escape turns a refusable package into a 500 at every caller
         # that answers an ``ArtifactValidationError`` with a 400.
@@ -835,6 +1137,23 @@ class BindingLookupIncomplete(ArtifactValidationError):
     """
 
 
+class BindingAmbiguous(BindingLookupIncomplete):
+    """Two stored packages name the same binding, so WHICH one is unproven.
+
+    A SUBCLASS, and the inheritance is the point rather than taxonomy: every caller
+    that already handles "I could not prove there is no package here" needs the same
+    answer for "I found two", and both are the absence of a single provable one. So no
+    caller changes, and a caller that wants to tell them apart can.
+
+    Raised rather than picking the first seen. The choice would be arbitrary -- the
+    listing's order is the store's, not a statement about which package is the live one
+    -- and a reader cannot tell an arbitrary pick from a correct one. The two packages
+    are bound to the same crewmate, so neither shows a stranger's work; what it costs is
+    determinism, and a dashboard that silently swaps page when a library is relisted is
+    worse than one that says the binding is ambiguous and names both.
+    """
+
+
 def resolve_bound_slug(bound_to: str, *, store: "ArtifactStore | None" = None) -> str | None:
     """The slug of the dashboard artifact bound to ``bound_to``, or ``None``.
 
@@ -867,8 +1186,20 @@ def resolve_bound_slug(bound_to: str, *, store: "ArtifactStore | None" = None) -
     layout the current validator rejects -- an older schema, or a write that did not
     finish -- is still FOUND and reported broken by the caller that reads its content.
 
-    A match returns as soon as it is seen, so an unreadable record never hides a
-    package that was found after it.
+    THE SCAN DOES NOT STOP AT THE FIRST MATCH. One binding may name one package, and
+    proving that takes reading the rest: a second claimant raises
+    :class:`BindingAmbiguous`, and an unreadable record met AFTER a match raises
+    :class:`BindingLookupIncomplete`, because that record could be the second claimant
+    and so uniqueness is exactly what went unproven. An unreadable record met BEFORE
+    the match is the same fact for the same reason, which is why the count is kept
+    across the whole scan rather than reset.
+
+    A LIVE-BACKED record is not a candidate at all. Its bytes are a file's current
+    contents, which nothing in the artifact API gates, so it must not be considered
+    this crewmate's page even to the extent of claiming the binding -- a page an
+    ungated writer controls would otherwise take the binding away from the real one and
+    turn a resolvable dashboard into an ambiguous or refused read. A COPY with
+    provenance (``source_copy_only``) owns its bytes and is an ordinary candidate.
     """
     bound_to = validate_bound_to(bound_to)
     if store is None:
@@ -879,20 +1210,37 @@ def resolve_bound_slug(bound_to: str, *, store: "ArtifactStore | None" = None) -
 
     records = store.list(kind=DASHBOARD_KIND)
     unread = 0
+    found = ""
     for art in records[:MAX_BINDING_SCAN]:
+        # A LIVE POINTER is skipped before it is even opened: the artifact serves a
+        # file's current bytes, which no artifact-API gate stands in front of, so this
+        # record cannot be the package bound anywhere. Skipped rather than counted as
+        # unread, because nothing about it is unknown -- what it is is disqualifying.
+        if str(getattr(art, "source_path", "") or "") and not bool(
+            getattr(art, "source_copy_only", False)
+        ):
+            continue
         try:
             loaded = store.get(art.slug)
             raw = _decode_package(loaded.content or "")
         except (ArtifactError, OSError):
             # Counted rather than skipped. A record that cannot be opened or decoded
-            # may BE the one bound here -- that is precisely what could not be read.
+            # may BE the one bound here -- that is precisely what could not be read --
+            # and once a match is in hand it may be the SECOND one, which is the same
+            # unproven answer seen from the other side.
             unread += 1
             continue
         # The query is validated, so an equal string is a well-formed binding: a
         # record whose own ``bound_to`` is malformed cannot match one and needs no
         # separate check here.
         if isinstance(raw, Mapping) and raw.get("bound_to") == bound_to:
-            return loaded.slug
+            if found:
+                raise BindingAmbiguous(
+                    f"dashboard package: binding: {found!r} and {loaded.slug!r} are both "
+                    f"bound to {bound_to!r}, so which one this names is unproven. There "
+                    "is one package per crewmate or slot: delete or rebind one of them"
+                )
+            found = loaded.slug
     if len(records) > MAX_BINDING_SCAN:
         raise BindingLookupIncomplete(
             f"dashboard package: binding: {len(records)} dashboard artifacts are stored "
@@ -901,9 +1249,17 @@ def resolve_bound_slug(bound_to: str, *, store: "ArtifactStore | None" = None) -
             "or slot, so this many is a library to prune, not a lookup to widen"
         )
     if unread:
+        # ONE SENTENCE FOR TWO READINGS, because the fact is one: a record that could
+        # not be read may be the package bound here (so ``None`` is unproven) or a
+        # second one bound here (so the match is unproven). Which of the two it would
+        # have been is precisely what could not be determined.
         raise BindingLookupIncomplete(
             f"dashboard package: binding: {unread} of {len(records)} dashboard "
-            f"artifacts could not be read, so nothing proves none of them is bound to "
-            f"{bound_to!r}"
+            f"artifacts could not be read, so nothing proves "
+            + (
+                f"{found!r} is the only one bound to {bound_to!r}"
+                if found
+                else f"none of them is bound to {bound_to!r}"
+            )
         )
-    return None
+    return found or None

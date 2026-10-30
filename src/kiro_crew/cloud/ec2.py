@@ -81,7 +81,7 @@ _REGION_SPEC = FieldSpec(name="region", type=str, max_len=32, pattern=_REGION_RE
 # The profile charset ('+' admitted for IAM Identity Center derived names,
 # leading '-' excluded so a value is never option-shaped, \Z anchor)
 # is deploy/profiles.py's PROFILE_SPEC, aliased rather than re-spelled here
-# (same idiom as deploy/handlers.py; cloud/ already depends on deploy via the
+# (same idiom as deploy/handlers_sites.py; cloud/ already depends on deploy via the
 # shared aws-bin resolver in cloud/aws.py).
 _PROFILE_SPEC = profiles_mod.PROFILE_SPEC
 _CIDR_RE = re.compile(r"^\d{1,3}(\.\d{1,3}){3}/\d{1,2}\Z")
@@ -122,6 +122,26 @@ EXTRA_PACKAGES_MAX_LEN = 256
 def validate_ami_id(ami_id: str) -> str:
     """Return ``ami_id`` if it is a well-formed EC2 image id, else raise."""
     return validate_field(ami_id, _AMI_ID_SPEC) or ""
+
+
+# `--ssm-kms-key`: a FULL KMS key ARN, the one key the instance role is
+# granted for encrypted Session Manager. Aliases, wildcards, other services and
+# bare key ids are refused: the value becomes an IAM Resource, so it must name
+# exactly one key. Key ids are UUIDs or multi-Region `mrk-<hex>` ids. Only the
+# `aws` partition: the boundary and its KMS ceiling are `arn:aws` ARNs, so a
+# China or GovCloud key would be capped to nothing. The template's SsmKmsKeyArn
+# AllowedPattern mirrors this.
+_SSM_KMS_KEY_RE = re.compile(
+    r"^arn:aws:kms:[a-z]{2}(-[a-z]+)+-[0-9]:[0-9]{12}:key/(mrk-[0-9a-f]{32}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\Z"
+)
+_SSM_KMS_KEY_SPEC = FieldSpec(
+    name="ssm-kms-key", type=str, required=True, max_len=128, pattern=_SSM_KMS_KEY_RE
+)
+
+
+def validate_ssm_kms_key_arn(arn: str) -> str:
+    """Return ``arn`` if it is one full KMS key ARN, else raise ValidationError."""
+    return validate_field(arn, _SSM_KMS_KEY_SPEC) or ""
 
 
 def normalize_extra_packages(raw: str) -> str:
@@ -671,6 +691,17 @@ def resolve_public_ref(repo: str = "") -> str:
     return ""
 
 
+def _account_of_policy_arn(arn: str) -> str:
+    """The account id field of an IAM policy ARN (``arn:aws:iam::<account>:policy/...``)."""
+    parts = arn.split(":")
+    if len(parts) < 6 or not re.fullmatch(r"[0-9]{12}", parts[4]):
+        raise aws.AWSError(
+            f"could not read the account id from the boundary ARN {arn!r}",
+            action="iam:GetPolicy",
+        )
+    return parts[4]
+
+
 def build_deploy_argv(
     *,
     tag: str,
@@ -686,6 +717,8 @@ def build_deploy_argv(
     source_key: str = "",
     ami_id: str = "",
     extra_packages: str = "",
+    ssm_kms_key_arn: str = "",
+    extra_managed_policy_arns: tuple[str, ...] = (),
 ) -> list[str]:
     """Assemble the exact ``aws cloudformation deploy`` argv (also the dry-run output).
 
@@ -695,7 +728,11 @@ def build_deploy_argv(
     InstanceRole is capped by it instead of a per-launch CFN-authored boundary.
 
     ``ami_id`` / ``extra_packages`` (``--ami`` / ``--extra-packages``) are
-    emitted only when set, so a stock launch's argv is unchanged.
+    emitted only when set, so a stock launch's argv is unchanged. The same holds
+    for ``ssm_kms_key_arn`` (``--ssm-kms-key``): set, it adds ``SsmKmsKeyArn``
+    and the caller passes the KMS-session boundary ARN; unset, nothing changes.
+    ``extra_managed_policy_arns`` (the edition's ``cloud_instance_policy``) fills
+    ``ExtraManagedPolicyArns`` only when non-empty, for the same reason.
     """
     overrides = [
         f"InstanceType={tier.instance_type}",
@@ -721,6 +758,10 @@ def build_deploy_argv(
         overrides.append(f"CustomAmiId={ami_id}")
     if extra_packages:
         overrides.append(f"ExtraPackages={extra_packages}")
+    if ssm_kms_key_arn:
+        overrides.append(f"SsmKmsKeyArn={ssm_kms_key_arn}")
+    if extra_managed_policy_arns:
+        overrides.append(f"ExtraManagedPolicyArns={','.join(extra_managed_policy_arns)}")
     return [
         "cloudformation",
         "deploy",
@@ -754,6 +795,7 @@ def deploy(
     proc_sink: Optional[Any] = None,
     ami_id: str = "",
     extra_packages: str = "",
+    ssm_kms_key_arn: str = "",
 ) -> DeployResult:
     """Provision (or update) the KiroCrew stack. Idempotent by stack name.
 
@@ -767,6 +809,10 @@ def deploy(
     a background thread can terminate the child on Ctrl+C. ``ami_id`` and
     ``extra_packages`` customize the box (see :func:`validate_ami_id` and
     :func:`normalize_extra_packages`); empty means the stock image and packages.
+    ``ssm_kms_key_arn`` (``--ssm-kms-key``, see :func:`validate_ssm_kms_key_arn`)
+    opts in to encrypted Session Manager: the role gets the opt-in KMS-session
+    boundary and an inline grant on exactly that key. Empty means the default
+    boundary and no KMS grant, byte-identical to a launch before the flag existed.
     """
     if not dry_run:
         aws.assert_human_action("cloudformation:CreateStack")
@@ -784,8 +830,17 @@ def deploy(
     if ami_id:
         ami_id = validate_ami_id(ami_id)
     extra_packages = normalize_extra_packages(extra_packages)
+    if ssm_kms_key_arn:
+        ssm_kms_key_arn = validate_ssm_kms_key_arn(ssm_kms_key_arn)
 
+    from kiro_crew.cloud import host_policy
     from kiro_crew.cloud import source as source_mod
+
+    # Check the edition's instance-role additions before anything reaches AWS: an
+    # invalid descriptor, or one that cannot be read, refuses the launch, dry run
+    # included. Every later read refuses the same way, so none can launch an
+    # instance without the required policies.
+    host_policy.instance_policy()
 
     if ship_source is None:
         ship_source = source_mod.find_repo_root() is not None
@@ -818,6 +873,8 @@ def deploy(
             source_key=f"{tag}/kirocrew-src.tar.gz" if ship_source else "",
             ami_id=ami_id,
             extra_packages=extra_packages,
+            ssm_kms_key_arn=ssm_kms_key_arn,
+            extra_managed_policy_arns=tuple(host_policy.managed_policy_arns("<account>")),
         )
         return DeployResult(
             tag=tag,
@@ -837,7 +894,19 @@ def deploy(
     # InstanceRole is capped by it. Done before the source upload so a
     # boundary-create failure (e.g. missing iam:CreatePolicy) surfaces before we
     # ship anything to S3.
-    boundary_arn = source_mod.ensure_instance_boundary(profile, region)
+    #
+    # `--ssm-kms-key` selects the opt-in KMS-session boundary instead;
+    # without it the default boundary is the only one named, created or read.
+    if ssm_kms_key_arn:
+        boundary_arn = source_mod.ensure_instance_kms_boundary(profile, region)
+    else:
+        boundary_arn = source_mod.ensure_instance_boundary(profile, region)
+    # The edition's host policies, in the account the boundary ARN names (the one
+    # this launch resolved). Read once, before anything is uploaded, so the argv
+    # below cannot disagree with the check at the top or fail after the upload.
+    extra_managed_policy_arns = tuple(
+        host_policy.managed_policy_arns(_account_of_policy_arn(boundary_arn))
+    )
 
     # Package + upload the local source so the box installs from S3 (no GitHub
     # access needed). Fall back to a git clone only if source shipping is off.
@@ -889,6 +958,8 @@ def deploy(
         source_key=source_key,
         ami_id=ami_id,
         extra_packages=extra_packages,
+        ssm_kms_key_arn=ssm_kms_key_arn,
+        extra_managed_policy_arns=extra_managed_policy_arns,
     )
     # `cloudformation deploy` blocks until the stack settles (WaitCondition gates
     # on the gateway being healthy). "No changes" exits 0 with a message on reuse.
@@ -907,6 +978,15 @@ def deploy(
         if failures:
             lines = "; ".join(f"{f['resource']}: {f['reason']}" for f in failures[:4])
             detail = f" — root cause: {lines}"
+        # A denied attach of the edition's host policies means the second
+        # launcher policy was never applied. CloudFormation reports it only in
+        # the stack events, so name the one step that fixes it; the dashboard
+        # launch shows this same message.
+        if extra_managed_policy_arns and "iam:AttachRolePolicy" in (err + detail):
+            detail += (
+                " — this build attaches host policies to the instance role: apply the "
+                "second launcher policy from `kirocrew cloud iam-policy --host-policies`"
+            )
         _cleanup_uploaded_source()
         raise aws.AWSError(
             f"cloudformation deploy failed: {err.strip()[:200]}{hint}{detail}",

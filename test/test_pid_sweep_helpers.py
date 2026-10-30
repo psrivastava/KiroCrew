@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import os
-import signal
 import sys
 import time
+from collections.abc import Iterator
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 
@@ -27,6 +27,44 @@ _linux_only = pytest.mark.skipif(
     sys.platform != "linux",
     reason="Linux /proc spawn-grace semantics; non-Linux uses separate reaping",
 )
+
+
+@pytest.fixture(autouse=True)
+def _signals_go_through_os_kill(_floor_monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Give the sweep's probe and kill seams their POSIX meaning on every host.
+
+    ``session_pid`` probes and signals through ``platform_compat``. On POSIX those
+    helpers call ``os.kill``, so the ``os.kill`` fakes below stand in for them; on
+    Windows they call OpenProcess and ``taskkill``, so the same fakes changed nothing
+    and a test read, or signalled, the host's real process table. A test that
+    reaches a signal without faking ``os.kill`` now fails instead, also when the
+    sweep's own ``except Exception`` swallows the refusal.
+    """
+    unfaked: list[int] = []
+
+    def signal_pid(pid: int, sig: int) -> None:
+        if not isinstance(os.kill, Mock):
+            unfaked.append(pid)
+            raise AssertionError(f"this test would signal real PID {pid}; fake os.kill")
+        os.kill(pid, sig)
+
+    def liveness(pid: int) -> str:
+        try:
+            signal_pid(pid, 0)
+        except ProcessLookupError:
+            return platform_compat.PID_DEAD
+        except PermissionError:
+            return platform_compat.PID_UNSIGNALABLE
+        return platform_compat.PID_ALIVE
+
+    _floor_monkeypatch.setattr(platform_compat, "pid_liveness", liveness)
+    _floor_monkeypatch.setattr(
+        platform_compat, "pid_exists", lambda pid: liveness(pid) != platform_compat.PID_DEAD
+    )
+    _floor_monkeypatch.setattr(platform_compat, "kill_pid", signal_pid)
+    _floor_monkeypatch.setattr(platform_compat, "kill_process_tree", signal_pid)
+    yield
+    assert not unfaked, f"reached a real signal for PIDs {unfaked}"
 
 
 @pytest.fixture()
@@ -66,7 +104,7 @@ class TestKillPidTree:
 
         assert total == 1
         assert root_killed is True
-        assert (99999, signal.SIGKILL) in kills
+        assert (99999, platform_compat.SIGKILL) in kills
 
     def test_returns_root_killed_false_when_not_kiro(self) -> None:
         from kiro_crew.session_pid import _kill_pid_tree
@@ -399,6 +437,11 @@ class TestSweepKillsASandboxedRoot:
                 "kiro_crew.session_pid.platform_compat.kill_pid",
                 side_effect=lambda pid, sig: signalled.append(pid),
             ),
+            # The root's kill on Windows, where it also reaps the tree.
+            patch(
+                "kiro_crew.session_pid.platform_compat.kill_process_tree",
+                side_effect=lambda pid, sig: signalled.append(pid),
+            ),
             patch("kiro_crew.acp.client._get_child_pids", return_value=list(children or ())),
             patch("kiro_crew.session_pid._is_our_descendant", return_value=True),
         ):
@@ -713,6 +756,23 @@ class TestProtectedPidSweepShield:
 # ── Spawn grace period tests (Fix A) ──────────────────────────────────────────
 
 
+class _ModuleClock:
+    """Stand-in for ``session_pid.time`` whose ``time()`` is frozen at *now*.
+
+    Replacing the module's own ``time`` reference keeps the frozen clock local
+    to ``session_pid``; every other attribute resolves to the real module.
+    """
+
+    def __init__(self, now: float) -> None:
+        self._now = now
+
+    def time(self) -> float:
+        return self._now
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(time, name)
+
+
 class TestPidAgeSeconds:
     """Tests for _pid_age_seconds using a fake proc_root."""
 
@@ -824,6 +884,7 @@ class TestPidAgeSeconds:
 
         with (
             patch("kiro_crew.session_pid.sys.platform", "darwin"),
+            patch("kiro_crew.session_pid.platform_compat.IS_WINDOWS", False),
             patch("kiro_crew.session_pid.platform_compat.get_process_start_id", return_value=None),
         ):
             assert _pid_age_seconds(1234) is None
@@ -834,6 +895,7 @@ class TestPidAgeSeconds:
         now = 1_000_000.0
         with (
             patch("kiro_crew.session_pid.sys.platform", "darwin"),
+            patch("kiro_crew.session_pid.platform_compat.IS_WINDOWS", False),
             patch(
                 "kiro_crew.session_pid.platform_compat.get_process_start_id",
                 return_value=f"{now - 42.5:.6f}",
@@ -841,6 +903,62 @@ class TestPidAgeSeconds:
             patch("kiro_crew.session_pid.time.time", return_value=now),
         ):
             assert _pid_age_seconds(1234) == pytest.approx(42.5)
+
+    def test_windows_without_a_start_id_returns_none(self) -> None:
+        """Windows: no readable creation FILETIME → None (treated as young)."""
+        from kiro_crew.session_pid import _pid_age_seconds
+
+        with (
+            patch("kiro_crew.session_pid.platform_compat.IS_WINDOWS", True),
+            patch("kiro_crew.session_pid.platform_compat.get_process_start_id", return_value=None),
+        ):
+            assert _pid_age_seconds(1234) is None
+
+    def test_windows_derives_age_from_filetime(self) -> None:
+        """Windows: the creation FILETIME is converted through its own epoch.
+
+        ``get_process_start_id`` returns the creation FILETIME as decimal text
+        in 100-ns units since 1601-01-01, NOT Unix seconds. The age must apply
+        both the unit scale and the epoch shift; a naive ``time.time() -
+        float(start_id)`` (the darwin arm) would be wrong by ~11.6 billion
+        seconds, so this pins the correct arithmetic.
+        """
+        from kiro_crew.session_pid import (
+            _FILETIME_TICKS_PER_SECOND,
+            _FILETIME_UNIX_EPOCH_OFFSET_SECONDS,
+            _pid_age_seconds,
+        )
+
+        now = 1_700_000_000.0  # a plausible Unix instant
+        age_desired = 42.5
+        unix_start = now - age_desired
+        # Encode that Unix instant back as a Windows creation FILETIME string.
+        filetime = int(
+            (unix_start + _FILETIME_UNIX_EPOCH_OFFSET_SECONDS) * _FILETIME_TICKS_PER_SECOND
+        )
+
+        with (
+            patch("kiro_crew.session_pid.platform_compat.IS_WINDOWS", True),
+            patch(
+                "kiro_crew.session_pid.platform_compat.get_process_start_id",
+                return_value=str(filetime),
+            ),
+            patch("kiro_crew.session_pid.time", _ModuleClock(now)),
+        ):
+            assert _pid_age_seconds(1234) == pytest.approx(age_desired, abs=1e-3)
+
+    def test_windows_non_numeric_filetime_returns_none(self) -> None:
+        """Windows: a non-numeric FILETIME token → None, not a crash."""
+        from kiro_crew.session_pid import _pid_age_seconds
+
+        with (
+            patch("kiro_crew.session_pid.platform_compat.IS_WINDOWS", True),
+            patch(
+                "kiro_crew.session_pid.platform_compat.get_process_start_id",
+                return_value="not-a-number",
+            ),
+        ):
+            assert _pid_age_seconds(1234) is None
 
 
 class TestPidInSpawnGrace:
@@ -856,15 +974,34 @@ class TestPidInSpawnGrace:
 
         with (
             patch("kiro_crew.session_pid.sys.platform", "darwin"),
+            patch("kiro_crew.session_pid.platform_compat.IS_WINDOWS", False),
             patch("kiro_crew.session_pid._pid_age_seconds", return_value=30.0),
         ):
             assert _pid_in_spawn_grace(12345) is True
 
-    def test_windows_returns_false(self) -> None:
-        """Windows: no age source — grace not applicable, sweep proceeds."""
+    def test_windows_young_pid_returns_true(self) -> None:
+        """Windows: grace DOES apply — a young pid is protected.
+
+        The orphan sweep must not SIGKILL a provider still inside its
+        multi-second spawn window on Windows; grace applies cross-platform,
+        now that an age is derivable from the creation ``FILETIME``.
+        """
         from kiro_crew.session_pid import _pid_in_spawn_grace
 
-        with patch("kiro_crew.session_pid.platform_compat.IS_WINDOWS", True):
+        with (
+            patch("kiro_crew.session_pid.platform_compat.IS_WINDOWS", True),
+            patch("kiro_crew.session_pid._pid_age_seconds", return_value=30.0),
+        ):
+            assert _pid_in_spawn_grace(12345) is True
+
+    def test_windows_old_pid_returns_false(self) -> None:
+        """Windows: a pid older than the grace is sweepable (age ≥ threshold)."""
+        from kiro_crew.session_pid import _pid_in_spawn_grace
+
+        with (
+            patch("kiro_crew.session_pid.platform_compat.IS_WINDOWS", True),
+            patch("kiro_crew.session_pid._pid_age_seconds", return_value=300.0),
+        ):
             assert _pid_in_spawn_grace(12345) is False
 
     @_linux_only
@@ -956,6 +1093,7 @@ class TestSweepGraceIntegration:
             patch("os.kill"),  # alive
             patch("kiro_crew.session_pid._is_managed_agent_process", return_value=True),
             patch("kiro_crew.session_pid.sys.platform", "darwin"),
+            patch("kiro_crew.session_pid.platform_compat.IS_WINDOWS", False),
             # Older than SWEEP_SPAWN_GRACE_SECONDS → grace does not protect it.
             patch("kiro_crew.session_pid._pid_age_seconds", return_value=9999.0),
             patch("kiro_crew.acp.client._get_child_pids", return_value=[]),
@@ -977,6 +1115,7 @@ class TestSweepGraceIntegration:
             patch("os.kill"),  # alive
             patch("kiro_crew.session_pid._is_managed_agent_process", return_value=True),
             patch("kiro_crew.session_pid.sys.platform", "darwin"),
+            patch("kiro_crew.session_pid.platform_compat.IS_WINDOWS", False),
             patch("kiro_crew.session_pid._pid_age_seconds", return_value=5.0),
             patch("kiro_crew.acp.client._get_child_pids", return_value=[]),
         ):

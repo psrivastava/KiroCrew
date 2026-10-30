@@ -43,8 +43,11 @@ export interface MemberSignals {
   needsYou: boolean
   /** The DM thread has a message the user has not seen. */
   unread: boolean
-  /** An auto-nudge loop is armed on the member's slot and active. */
+  /** On watch: the member will act again without being asked -- an active
+   *  monitor loop on its slot, or its heartbeat on. */
   patrolling: boolean
+  /** The member holds at least one goal. */
+  goal: boolean
 }
 
 export type MemberStatusFilter = 'working' | 'needs_you' | 'unread' | 'patrolling'
@@ -90,11 +93,6 @@ export interface RosterQuery {
   source: MemberSourceFilter
   status: ReadonlySet<MemberStatusFilter>
   sort: MemberSort
-  /** The default crew's name (top-level `default_agent`). It is listed whatever
-   *  its record says — see `listedByDefault`. `''` while unknown; `null` when
-   *  the lookup FAILED, which turns the hide rule off so the default crew is
-   *  never hidden by a read error. */
-  defaultAgent: string | null
   /** The crewmate open in the thread, if any. It stays listed while open, so a
    *  hidden row the user reached through the search does not vanish from the
    *  roster under its own chat when the search is cleared. */
@@ -103,15 +101,14 @@ export interface RosterQuery {
 
 interface RosterRowLike {
   name: string; display_name?: string; starred?: boolean; source?: unknown; last_active_ts?: number
-  last_chat_ts?: number
-  dashboard_created?: unknown; has_dm_message?: unknown; last_message?: unknown
+  dashboard_created?: unknown; has_dm_message?: unknown; has_user_dm_message?: unknown; last_message?: unknown
   kiro_agent?: unknown
 }
 
 /** What the roster row RENDERS as its title: the display label when set, the
  *  name otherwise. Sort and search go through the same accessor so the list
  *  the user reads is the list these functions order and narrow. */
-function rowLabel(m: RosterRowLike): string {
+export function rowLabel(m: RosterRowLike): string {
   return m.display_name?.trim() || m.name
 }
 
@@ -129,32 +126,41 @@ function matchesSearch(m: RosterRowLike, needle: string): boolean {
   )
 }
 
-/** Whether the roster lists a row WITHOUT being asked for it: a crew the
- *  user has actually chatted with (`last_chat_ts`, recorded server-side when
- *  the person sends it a message in its DM or in a normal chat), one the
- *  user starred, or Mate, the first crewmate the product creates, which is
- *  listed from the start. A crew that only ran in the background -- a cron, a
- *  wake, a sub-agent, a dispatched worker -- or that an app drove is hidden
- *  until the search reaches it, the default crew included.
+/** The reserved main member every install carries. Not a crewmate the person
+ *  created, and listed only once the person has talked to it. */
+const RESERVED_DEFAULT_MEMBER = 'default'
+
+/** Whether the roster lists a row WITHOUT being asked for it:
  *
- *  A row from an older gateway carries no `last_chat_ts`, and keeps that
- *  gateway's rule (DM thread holds a message, created on the dashboard, the
- *  default crew): hiding on an absent field would blank the roster on a
- *  mixed-version deploy. `defaultAgent === null` (the lookup failed) lists
- *  every such row, since that rule cannot tell which row it must never hide. */
-export function listedByDefault(m: RosterRowLike, defaultAgent: string | null): boolean {
+ *  - one the user starred;
+ *  - Mate, the first crewmate the product creates, listed from the start so
+ *    its welcome has a row to open;
+ *  - the reserved `default` member, only once its thread holds a message the
+ *    PERSON sent (`has_user_dm_message`): a welcome, a scheduled run, an
+ *    auto-nudge or a relayed message does not list it;
+ *  - a crewmate the person created (`dashboard_created`: on the Crewmates
+ *    page, or by approving Mate's `crewmate.create` / `crewmate.import` card),
+ *    even while its chat is empty and was never opened;
+ *  - any other row (template-derived, synced, app-made, legacy built-ins) once
+ *    its DM thread holds a message (`has_dm_message`), whoever sent it.
+ *
+ *  A conversation the product made on its own is otherwise not listed, as a
+ *  messages app lists no empty thread; the search still reaches it, and the
+ *  open one is listed while open (`chosen`).
+ *
+ *  An older gateway sends neither `dashboard_created` nor `has_dm_message`
+ *  nor `has_user_dm_message`: a row missing `has_user_dm_message` keeps the
+ *  `has_dm_message` rule, and a row missing `has_dm_message` is listed, since
+ *  hiding on an absent field would blank the roster on a mixed-version deploy. */
+export function listedByDefault(m: RosterRowLike): boolean {
   if (m.starred === true) return true
-  // Mate, the first crewmate the product creates, is listed from the start.
   if (isAssistantMember(m)) return true
-  if (typeof m.last_chat_ts === 'number') return m.last_chat_ts > 0
-  if (defaultAgent === null) return true
-  if (defaultAgent !== '' && m.name === defaultAgent) return true
-  if (m.dashboard_created === undefined && m.has_dm_message === undefined) return true
-  return (
-    m.has_dm_message === true ||
-    m.dashboard_created === true ||
-    (typeof m.last_message === 'string' && m.last_message.trim() !== '')
-  )
+  if (m.name === RESERVED_DEFAULT_MEMBER && m.has_user_dm_message !== undefined) {
+    return m.has_user_dm_message === true
+  }
+  if (m.name !== RESERVED_DEFAULT_MEMBER && m.dashboard_created === true) return true
+  if (m.has_dm_message === undefined) return true
+  return m.has_dm_message === true
 }
 
 /** Whether the roster shows this row for `query`, before the star / origin /
@@ -163,11 +169,11 @@ export function listedByDefault(m: RosterRowLike, defaultAgent: string | null): 
  *  listed row it misses does not. */
 export function rosterShows(
   m: RosterRowLike,
-  query: Pick<RosterQuery, 'search' | 'defaultAgent' | 'chosen'>,
+  query: Pick<RosterQuery, 'search' | 'chosen'>,
 ): boolean {
   const q = query.search.trim().toLowerCase()
   if (q) return matchesSearch(m, q)
-  return listedByDefault(m, query.defaultAgent) || (!!query.chosen && m.name === query.chosen)
+  return listedByDefault(m) || (!!query.chosen && m.name === query.chosen)
 }
 
 /** The rows the roster is ABOUT for `query`: every row listed by default plus
@@ -178,26 +184,25 @@ export function rosterShows(
  *  hidden rows it surfaces. */
 export function rosterPopulation<M extends RosterRowLike>(
   members: readonly M[],
-  query: Pick<RosterQuery, 'search' | 'defaultAgent' | 'chosen'>,
+  query: Pick<RosterQuery, 'search' | 'chosen'>,
 ): M[] {
   const q = query.search.trim().toLowerCase()
   return members.filter(
     (m) =>
-      listedByDefault(m, query.defaultAgent) ||
+      listedByDefault(m) ||
       (!!query.chosen && m.name === query.chosen) ||
       (q !== '' && matchesSearch(m, q)),
   )
 }
 
-/** A row's place in the Recent order: the user's own last message
- *  (`last_chat_ts`), never a background turn. An older gateway's row, which
- *  has no such field, falls back to its `last_active_ts`. */
+/** A row's place in the Recent order: the last message in its DM thread,
+ *  whoever sent it (`last_active_ts`, the crew log's fold). */
 export function chatRecency(m: RosterRowLike): number {
-  return (typeof m.last_chat_ts === 'number' ? m.last_chat_ts : m.last_active_ts) ?? 0
+  return m.last_active_ts ?? 0
 }
 
-/** Most-recently-CHATTED first (like any IM member list); never-chatted
- *  members fall to the bottom alphabetically. `name` is a plain locale-aware
+/** Newest conversation first (like any messages app); threads with no
+ *  message fall to the bottom alphabetically. `name` is a plain locale-aware
  *  sort over the DISPLAYED label, since that is the text the user scans. */
 export function sortRoster<M extends RosterRowLike>(members: readonly M[], sort: MemberSort): M[] {
   const out = [...members]
@@ -253,4 +258,11 @@ export function countByFilter<M extends RosterRowLike>(
     for (const f of SOURCE_FILTERS) if (matchesSource(m, f)) out.source[f] += 1
   }
   return out
+}
+
+/** No crewmate beyond the always-present `default` row. The first crewmate
+ *  (key `mate`) IS a crewmate, so a roster holding it is not empty: the page
+ *  opens it instead. An unread roster (`undefined`) is not empty either. */
+export function hasNoCrewmates(rows: readonly { name: string }[] | undefined): boolean {
+  return Array.isArray(rows) && rows.every(r => r.name === 'default')
 }

@@ -22,6 +22,7 @@ if TYPE_CHECKING:
         _VIA_PROXY_SUFFIX,
         AUDIT_CLAIMED_KEY,
         PROBE_PATHS,
+        bind_request_forwarded,
         check_host,
         check_origin,
         current_context,
@@ -30,6 +31,7 @@ if TYPE_CHECKING:
         is_proxied_request,
         logger,
         mark_audit_claimed,
+        published_relay_caller,
         safe_context_call,
         sel,
         sel_is_warm,
@@ -61,6 +63,12 @@ def audit_actor(request: web.Request, caller: str) -> str:
     label, over-warning is the safe direction: it never files a forwarded action
     as the person's own.
 
+    The suffix is the older of two spellings of the same fact. The uniform one
+    is ``metadata["forwarded"]``, recorded from the same predicate on every
+    request-bound row, handlers' own included; see ``_VIA_PROXY_SUFFIX`` for
+    what a missing key means. The suffix stays so the readers already keyed on
+    it keep working.
+
     Its known limit is the same one :func:`origin.is_direct_local_request`
     documents: a forwarder that strips every forwarding header is invisible
     here. This makes the ordinary product paths distinguishable, which is what
@@ -76,9 +84,19 @@ def audit_actor(request: web.Request, caller: str) -> str:
     label, ``<caller>:<app>``, so it is never filed as the app's own client. A
     request that carries no claim (the claim is ``""`` for the dashboard user,
     absent before token auth runs) keeps ``caller``.
+
+    A request the Kiro relay delivered is filed under the relayed person,
+    ``relay:<Kiro user ID>``, in place of ``caller``, and still carries the proxy
+    suffix: the relay names who, and the suffix says it arrived through a
+    forwarder.
     """
     request_app = request.get("app", "")
     actor = caller
+    relay_caller = published_relay_caller(request)
+    if relay_caller is not None:
+        # A relay-delivered request names its person: the relay verified them, so
+        # the record says who rather than the label the chain was built with.
+        actor = relay_caller.audit_label
     if isinstance(request_app, str) and request_app:
         actor = f"{caller}:{request_app}" if request.get("internal_auth") is True else request_app
     return f"{actor}{_VIA_PROXY_SUFFIX}" if is_proxied_request(request) else actor
@@ -127,6 +145,7 @@ async def _audit_denied(caller: str, request: web.Request, error: str) -> None:
     def _write() -> None:
         sel().log_api_access(
             caller=actor,
+            forwarded=is_proxied_request(request),
             operation=f"{request.method} {request.path}",
             outcome="denied",
             resources=request.path,
@@ -202,6 +221,13 @@ def _make_deny_audit_middleware(caller: str) -> Callable:
         request: web.Request,
         handler: object,
     ) -> web.StreamResponse:
+        # Bound for the whole request, every method and path, so a handler's own
+        # ``log_api_access`` row records the same ``forwarded`` verdict the audit
+        # layers pass explicitly (see ``sel_request_provenance``).
+        with bind_request_forwarded(is_proxied_request(request)):
+            return await _audited(request, handler)
+
+    async def _audited(request: web.Request, handler: object) -> web.StreamResponse:
         try:
             return await handler(request)  # type: ignore[operator]
         except web.HTTPException as exc:

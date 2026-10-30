@@ -89,7 +89,9 @@ SCREENS = frozenset({"first_linked_ancestor", "is_link_or_junction", "is_reparse
 #: ``open_lock_file_for_sweep`` is the same shape -- it opens the lock by name
 #: (``os.open`` on POSIX, ``CreateFileW`` on Windows) past the one-hop reach -- so
 #: the orphan-lock sweep's screen-then-open site survives the ratchet only while
-#: it too is named here.
+#: it too is named here. Every by-name lock-sidecar open in the package calls
+#: ``open_create_or_existing`` directly, so naming it keeps each of those sites a
+#: USE exactly as the ``os.open`` it stands in for.
 PRIMITIVES = frozenset(
     {
         "open_create_or_existing",
@@ -180,8 +182,8 @@ RESOLVER_DEPTH = 1
 CONTROL_MODULES = (
     "acp/prompt_blocks.py",
     "apps/builtins/auto_improvement/backend/clone_setup.py",
-    "apps/builtins/aws_control/backend/backup.py",
-    "apps/builtins/issue_radar/backend/crew_store.py",
+    "apps/builtins/aws_control/backend/backup_parts/conversations.py",
+    "apps/builtins/issue_radar/backend/crew_store_unit_order.py",
     "apps/plugin_import.py",
     "dashboard/handlers/themes.py",
     "image_artifacts.py",
@@ -195,7 +197,7 @@ CONTROL_MODULES = (
 #: holding, not by being important.
 HELD_SITES = frozenset(
     {
-        ("apps/builtins/issue_radar/backend/crew_store.py", "_write_unit_order"),
+        ("apps/builtins/issue_radar/backend/crew_store_unit_order.py", "_write_unit_order"),
     }
 )
 
@@ -209,7 +211,10 @@ RELEASE_CALL = "_release_held"
 #: cannot satisfy, which is why these are numbers and a named member rather than a
 #: second copy of the lists.
 MIN_CONTROL_MODULES = 10
-REQUIRED_HELD_SITE = ("apps/builtins/issue_radar/backend/crew_store.py", "_write_unit_order")
+REQUIRED_HELD_SITE = (
+    "apps/builtins/issue_radar/backend/crew_store_unit_order.py",
+    "_write_unit_order",
+)
 
 
 def test_the_gates_own_lists_are_not_shrunk() -> None:

@@ -19,10 +19,13 @@ vi.mock('../../api/client', () => ({
     memberActivity: vi.fn(() => Promise.resolve({ slug: '', member: '', capped: false, entries: [] })),
     memberBriefing: vi.fn(() => Promise.resolve({ slug: '', member: '', supported: true, text: '', updated_ts: null, redacted: false, truncated: false })),
     sessionCrewLogProjections: vi.fn(() => Promise.resolve({ folds: {}, resolved: true, writesDrained: true })),
-    memberPanel: vi.fn(() => Promise.resolve({ panel: null, html: null })),
     autonudgeList: vi.fn(() => Promise.resolve({ enabled: true, loops: [] })),
+    autonudgeForSlot: vi.fn(() => Promise.resolve({ enabled: true, loop: null })),
+    monitorForSlot: vi.fn(() => Promise.resolve({ enabled: true, monitor: null })),
     // reuse_current off: the run path, not the copy path.
     kirocrewConfig: vi.fn(() => Promise.resolve({})),
+    // The member's chat runs on this machine, so Run in terminal may open a local tab.
+    chatSlotEnvironment: vi.fn(() => Promise.resolve({ profile: null, profiles: [] })),
   },
 }))
 
@@ -51,7 +54,6 @@ vi.mock('../../utils/terminalRegistry', () => ({
   getTerminalShell: () => undefined,
   getTerminalFenceShells: () => ({}),
 }))
-vi.mock('../../hooks/useDevMode', () => ({ useDevMode: () => false }))
 
 /* The thread pane renders a REAL Run-in-terminal button, so the request carries
  * whatever scope the page provides around its chat. */

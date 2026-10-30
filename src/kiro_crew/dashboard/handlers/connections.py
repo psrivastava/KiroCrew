@@ -190,6 +190,25 @@ def _approval_superseded(error: str, code: str) -> web.Response:
     return web.json_response({"error": error, "code": code}, status=409)
 
 
+def _log_relay_outcome(server: str, outcome: str, status: int | None = None) -> None:
+    """Write one gateway-log line per relay outcome.
+
+    The audit log alone leaves an operator unable to tell a refused paste from
+    a spent listener or a failed token exchange. ``server`` has already passed
+    the name check; the return address, code and state are never logged.
+    """
+    suffix = "" if status is None else f" status={status}"
+    if outcome == "delivered":
+        logger.info(
+            "MCP OAuth relay for %s: code delivered to the local callback%s; "
+            "the MCP client finishes the token exchange",
+            server,
+            suffix,
+        )
+    else:
+        logger.warning("MCP OAuth relay for %s: %s%s", server, outcome, suffix)
+
+
 async def api_mcp_oauth_relay(request: web.Request) -> web.Response:
     """POST /api/mcp/oauth/relay — deliver a failed browser redirect locally."""
     from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
@@ -226,6 +245,7 @@ async def api_mcp_oauth_relay(request: web.Request) -> web.Response:
         return _bad_request("invalid server", "invalid_server")
     callback = _validated_loopback_return_address(body.get("redirect_url"))
     if callback is None:
+        _log_relay_outcome(server, "refused the pasted return address")
         return _bad_request(
             "invalid loopback return address",
             "invalid_loopback_return_address",
@@ -240,6 +260,7 @@ async def api_mcp_oauth_relay(request: web.Request) -> web.Response:
         # fresh listener on the same port never saw the verifier. Answering with
         # the delivery-failure message below would blame the paste for an
         # approval that is simply spent.
+        _log_relay_outcome(server, "no local callback listener (approval spent)")
         sel().log_api_access(
             caller="dashboard",
             operation="mcp_oauth_callback_relay",
@@ -250,7 +271,8 @@ async def api_mcp_oauth_relay(request: web.Request) -> web.Response:
             "the approval this return address belongs to is no longer live",
             "approval_superseded",
         )
-    except (asyncio.TimeoutError, OSError, ValueError):
+    except (asyncio.TimeoutError, OSError, ValueError) as exc:
+        _log_relay_outcome(server, f"local callback unreachable ({type(exc).__name__})")
         sel().log_api_access(
             caller="dashboard",
             operation="mcp_oauth_callback_relay",
@@ -263,6 +285,7 @@ async def api_mcp_oauth_relay(request: web.Request) -> web.Response:
         )
 
     if callback_status >= 400:
+        _log_relay_outcome(server, "local callback rejected the return address", callback_status)
         sel().log_api_access(
             caller="dashboard",
             operation="mcp_oauth_callback_relay",
@@ -274,6 +297,7 @@ async def api_mcp_oauth_relay(request: web.Request) -> web.Response:
             "oauth_callback_rejected",
         )
 
+    _log_relay_outcome(server, "delivered", callback_status)
     sel().log_api_access(
         caller="dashboard",
         operation="mcp_oauth_callback_relay",
@@ -602,7 +626,7 @@ async def api_connections_status(request: web.Request) -> web.Response:
     # a route no expiry path anticipated; cheap enough to run per request because
     # liveness is a returncode read, not I/O.
     await expire_dead_mints()
-    statuses = await collect_connection_statuses()
+    statuses = await collect_connection_statuses(_open_project_dirs(request.app.get("state")))
     return web.json_response({"schema_version": _STATUS_SCHEMA_VERSION, "connections": statuses})
 
 
@@ -848,6 +872,7 @@ async def api_connections_disconnect(request: web.Request) -> web.Response:
             "grantSharedWith": list(scope.grant_shared_with),
             "grantCensusIncomplete": scope.census_incomplete,
             "grantCensusUnreadable": list(scope.census_unreadable),
+            "agentSpecRewritten": scope.agent_spec_rewritten,
         }
     )
 
@@ -886,8 +911,8 @@ async def api_connections_premint(request: web.Request) -> web.Response:
 
     # Off the loop: the scan reads the user's MCP config and stats kiro-cli's OAuth
     # artifact directory, either of which can sit on a network mount where a stat is
-    # unbounded. warm.py routes the same call through a thread for this reason and
-    # pins it with a drift guard.
+    # unbounded. warm_runtime's table_flow and rearms route the same call through a thread for
+    # this reason, pinned by test/test_connections_warm_off_loop.py.
     candidates, audit_recorded = await asyncio.to_thread(_audited_mintable_providers)
     slugs = [str(provider["slug"]) for provider in candidates]
     if not slugs:
@@ -1005,7 +1030,7 @@ def _oauth_client_configured(provider: Provider) -> bool:
     return bool(oauth_client_view(provider, config=config, vault_names=names).get("configured"))
 
 
-async def _refresh_client_projections(slug: str) -> bool:
+async def _refresh_client_projections(slug: str) -> bool | None:
     """Bring every runtime projection of ``slug``'s client in line with the record.
 
     The vault and config.json are the source of truth; the emitted agent spec and
@@ -1017,7 +1042,12 @@ async def _refresh_client_projections(slug: str) -> bool:
     would otherwise merge straight back; (2) rebuild the agent spec so the next
     session reads the new client (or none).
 
-    Returns False when the scope scrub or the spec rebuild failed. The caller reports that as an
+    Returns True when every projection is refreshed, and None when the record and
+    scopes are clean but the rebuild declined to write the spec (this instance may
+    not write the shared agent home): the caller answers success, audits it, and
+    says ``agent_spec_rewritten: false``, because that decline repeats on every
+    call and a 500 would never clear. Returns False when the scope scrub or the
+    spec rebuild failed. The caller reports that as an
     error rather than success: the RECORD is committed (and stays committed --
     reverting the source to match a stale projection would keep the retired
     credential authoritative, the opposite of what the operator asked), but a
@@ -1052,12 +1082,19 @@ async def _refresh_client_projections(slug: str) -> bool:
         )
         return False
     try:
-        from kiro_crew.agent import rebuild_agent_config  # circular at module scope
+        from kiro_crew.agent import rebuild_agent_config_reporting  # circular at module scope
 
-        await asyncio.to_thread(rebuild_agent_config)
+        _spec_path, wrote = await asyncio.to_thread(rebuild_agent_config_reporting)
     except Exception:  # noqa: BLE001 -- reported to the caller, see docstring
         logger.warning("rebuild_agent_config failed after an OAuth client change", exc_info=True)
         return False
+    if not wrote:
+        logger.warning(
+            "agent spec was not rewritten after an OAuth client change for %s: this instance "
+            "may not write the shared agent home",
+            slug,
+        )
+        return None
     return True
 
 
@@ -1250,6 +1287,8 @@ async def api_connections_oauth_client_put(request: web.Request) -> web.Response
 
     slug = str(provider["slug"])
 
+    spec_rewritten = [True]
+
     async def _mutate() -> web.Response | None:
         async with _OAUTH_CLIENT_MUTATION:
             failure = await _write_oauth_client(
@@ -1257,7 +1296,9 @@ async def api_connections_oauth_client_put(request: web.Request) -> web.Response
             )
             if failure is not None:
                 return failure
-            if not await _refresh_client_projections(slug):
+            refreshed = await _refresh_client_projections(slug)
+            spec_rewritten[0] = refreshed is True
+            if refreshed is False:
                 views_now = await asyncio.to_thread(_oauth_client_views)
                 return _projection_stale_response(
                     slug, next((v for v in views_now if v.get("slug") == slug), None)
@@ -1290,7 +1331,9 @@ async def api_connections_oauth_client_put(request: web.Request) -> web.Response
     )
     views = await asyncio.to_thread(_oauth_client_views)
     current = next((v for v in views if v.get("slug") == slug), None)
-    return web.json_response({"ok": True, "client": current})
+    return web.json_response(
+        {"ok": True, "client": current, "agent_spec_rewritten": spec_rewritten[0]}
+    )
 
 
 async def api_connections_oauth_client_delete(request: web.Request) -> web.Response:
@@ -1328,6 +1371,8 @@ async def api_connections_oauth_client_delete(request: web.Request) -> web.Respo
         del clients[slug]
         return cfg
 
+    spec_rewritten = [True]
+
     async def _mutate() -> web.Response | None:
         async with _OAUTH_CLIENT_MUTATION:
             # Same order and the same rollback as the PUT: the vault half goes
@@ -1350,7 +1395,9 @@ async def api_connections_oauth_client_delete(request: web.Request) -> web.Respo
                     {"error": "could not write config.json", "code": "config_write_failed"},
                     status=500,
                 )
-            if not await _refresh_client_projections(slug):
+            refreshed = await _refresh_client_projections(slug)
+            spec_rewritten[0] = refreshed is True
+            if refreshed is False:
                 views_now = await asyncio.to_thread(_oauth_client_views)
                 return _projection_stale_response(
                     slug, next((v for v in views_now if v.get("slug") == slug), None)
@@ -1370,4 +1417,6 @@ async def api_connections_oauth_client_delete(request: web.Request) -> web.Respo
     )
     views = await asyncio.to_thread(_oauth_client_views)
     current = next((v for v in views if v.get("slug") == slug), None)
-    return web.json_response({"ok": True, "client": current})
+    return web.json_response(
+        {"ok": True, "client": current, "agent_spec_rewritten": spec_rewritten[0]}
+    )

@@ -145,15 +145,42 @@ async def _json_body(request: web.Request) -> dict[str, Any]:
 
 
 #: Operations that put something in front of the person, or change what they
-#: see, on their word: only a turn they sent may. ``member.rename_self`` is a
-#: crewmate taking the name the user gave it, so a wake or the hidden welcome
-#: kickoff cannot pick one.
+#: see, on their word: only a turn they sent may. ``member.update_self`` is a
+#: crewmate taking the name, description or face the user just gave it, and
+#: ``member.propose_self`` a crewmate asking the user for more through a card
+#: (:mod:`handlers.member_self`), so a wake or the hidden welcome kickoff cannot
+#: pick either.
 _USER_TURN_OPERATIONS = frozenset(
-    {"guide.start", "guide.observe", "cards.propose", "member.rename_self"}
+    {
+        "guide.start",
+        "guide.observe",
+        "cards.propose",
+        "member.update_self",
+        "member.propose_self",
+    }
 )
 
 
-async def _resolve_agent_caller(request: web.Request, operation: str) -> tuple[str, str]:
+#: Request mark :func:`_resolve_agent_caller` sets when it admitted a turn the
+#: user did not send, because it runs in the calling crewmate's own thread.
+REQ_OWN_GOAL_TURN = "own_goal_turn"
+
+
+def _is_crewmate_thread(slot: Any) -> bool:
+    """Whether *slot* is a crewmate's own pinned thread (its DM slot)."""
+    from kiro_crew import members as members_mod
+
+    agent = getattr(slot, "agent", "")
+    return (
+        getattr(slot, "mode", "") == members_mod.DM_SLOT_MODE
+        and isinstance(agent, str)
+        and bool(agent)
+    )
+
+
+async def _resolve_agent_caller(
+    request: web.Request, operation: str, *, own_goal: bool = False
+) -> tuple[str, str]:
     """The verified caller's ``(slot_key, session_key)``. Raises :class:`GuideError`.
 
     The session the request names must be one the transport attests
@@ -168,12 +195,20 @@ async def _resolve_agent_caller(request: web.Request, operation: str) -> tuple[s
     (``_turn_channel_narrowed``) are what the gateway recorded when the turn
     started. An operation that puts something in front of the person (a guide
     or a change card), asks the person's tab what it shows (an observation, which
-    a timeout turns into a change to their running guide) or renames the calling
-    crewmate (:data:`_USER_TURN_OPERATIONS`) also needs the turn to be
+    a timeout turns into a change to their running guide) or changes the calling
+    crewmate's own record (:data:`_USER_TURN_OPERATIONS`) also needs the turn to be
     one the person sent (``_turn_user_sent``): a loop wake, a cron or app
     injection, a ``session_send`` and a sub-agent completion are refused with
     403 ``not_user_turn``, and so is a user's turn once any text that is not the
     user's was steered into it (``chat_delivery.steer_into_running_turn``).
+
+    *own_goal* lets one caller (``member.propose_self``) also admit a turn
+    the user did not send when it runs in the crewmate's own thread (a check-in,
+    a sub-agent's result coming back, a goal-setup nudge): a card only proposes
+    and the user's button decides, so the crewmate may put its own goal,
+    milestones and check-ins in front of the user whenever its work calls for
+    it. It then marks the request (:data:`REQ_OWN_GOAL_TURN`) so the route keeps
+    that turn to those cards.
     """
     from kiro_crew.dashboard.handlers._shared import _read_session_key
     from kiro_crew.dashboard.session_control import (
@@ -239,6 +274,9 @@ async def _resolve_agent_caller(request: web.Request, operation: str) -> tuple[s
             "this message came from a messaging channel, not the dashboard",
         )
     if operation in _USER_TURN_OPERATIONS and getattr(slot, "_turn_user_sent", False) is not True:
+        if own_goal and _is_crewmate_thread(slot):
+            request[REQ_OWN_GOAL_TURN] = True
+            return slot_key, sk
         _audit(sk, operation, "denied", "not a user turn")
         raise GuideError(
             403,
@@ -313,65 +351,6 @@ async def api_guide_agent_status(request: web.Request) -> web.Response:
     except GuideError as exc:
         return _refusal(exc)
     return web.json_response(guide)
-
-
-async def api_guide_agent_rename_self(request: web.Request) -> web.Response:
-    """POST /api/guide/agent/rename — the calling crewmate renames itself.
-
-    The member is the one whose pinned thread the verified caller's slot is,
-    never a name from the body: the body carries only the new display name. Like
-    every agent-half route it admits only a turn running in the caller's
-    dashboard slot that did not come from a messaging channel
-    (:func:`_resolve_agent_caller`); renaming is also one of the
-    :data:`_USER_TURN_OPERATIONS`, so that turn must be one the user sent. A
-    channel message, a schedule, a subagent or an app cannot rename anyone.
-    """
-    from kiro_crew import members as members_mod
-
-    try:
-        slot_key, sk = await _resolve_agent_caller(request, "member.rename_self")
-        body = await _json_body(request)
-    except GuideError as exc:
-        return _refusal(exc)
-    slot = request.app["state"].get_slot(slot_key)
-    member = getattr(slot, "agent", "") if slot is not None else ""
-    if (
-        slot is None
-        or getattr(slot, "mode", "") != members_mod.DM_SLOT_MODE
-        or not isinstance(member, str)
-        or not member
-    ):
-        _audit(sk, "member.rename_self", "denied", "not a crewmate thread")
-        return _deny(403, "not_a_crewmate", "only a crewmate, in its own chat, can rename itself")
-    from kiro_crew.memory_stores import (
-        MemberAlreadyExists,
-        MemberApprovalConflict,
-        UnknownMemoryStore,
-    )
-
-    try:
-        # The store the caller's thread runs on: a crewmate deleted and created
-        # again under the same key has another, and its row is not this turn's.
-        thread_store = getattr(slot, "memory_store", "") or "default"
-        name = await asyncio.to_thread(
-            members_mod.rename_member_display,
-            member,
-            body.get("name"),
-            expected_store=str(thread_store),
-        )
-    except members_mod.SelfRenameError as exc:
-        _audit(sk, "member.rename_self", "denied", exc.code)
-        status = 403 if exc.code == "not_a_crewmate" else 400
-        return _deny(status, exc.code, str(exc))
-    except (UnknownMemoryStore, MemberAlreadyExists, MemberApprovalConflict):
-        # The crewmate's row cannot be published from here, e.g. one declared only
-        # in ``config.local.json``: a refusal the model can say, never a 500.
-        _audit(sk, "member.rename_self", "denied", "member_not_writable")
-        return _deny(
-            409, "member_not_writable", "this crewmate's settings cannot be changed from the chat"
-        )
-    _audit(sk, "member.rename_self", "ok")
-    return web.json_response({"ok": True, "member": member, "display_name": name})
 
 
 async def api_guide_agent_cancel(request: web.Request) -> web.Response:
@@ -803,7 +782,6 @@ def register_guide_routes(app: web.Application) -> None:
     app.router.add_post("/api/guide/agent/start", api_guide_agent_start)
     app.router.add_get("/api/guide/agent/status", api_guide_agent_status)
     app.router.add_post("/api/guide/agent/cancel", api_guide_agent_cancel)
-    app.router.add_post("/api/guide/agent/rename", api_guide_agent_rename_self)
     app.router.add_post("/api/guide/agent/observe", api_guide_agent_observe)
     app.router.add_get("/api/guide/agent/language", api_guide_agent_language)
     app.router.add_get("/api/guide/pending", api_guide_pending)

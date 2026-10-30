@@ -17,10 +17,12 @@
  * on both ends. Non-embedded (top-level) dashboards mount this as a no-op.
  */
 import { useEffect } from 'react'
-import { useAppDispatch } from '../store'
+import { useAppDispatch, useAppStore } from '../store'
 import { setHostModel, type HostModel } from '../store/instancesSlice'
 import { isEmbeddedPane } from '../lib/embedded'
 import { setFocusModeEnabled } from '../hooks/useFocusMode'
+import { noteClipboardRelayHost, PANE_CLIPBOARD_VERSION } from '../lib/paneClipboardRelay'
+import { noteHostOrigin, setHostElectronReader } from '../lib/hostRelay'
 
 const MAC_INSET_CLASS = 'embedded-mac-inset'
 const WIN_INSET_CLASS = 'embedded-win-inset'
@@ -123,9 +125,14 @@ export function parseHostModel(data: unknown): HostModel | null {
 
 export default function EmbeddedHostBridge() {
   const dispatch = useAppDispatch()
+  const store = useAppStore()
 
   useEffect(() => {
     if (!isEmbeddedPane()) return
+
+    // The pop-out controls ask whether the hub is the desktop app. They read
+    // the stored host model through this getter, so the value has one home.
+    setHostElectronReader(() => store.getState().instances.host?.electron === true)
 
     // Stop re-announcing ONLY on the parent's distinct `mc-embedded-ack`, not on
     // a host model. The parent broadcasts its model to every warm pane on any
@@ -176,6 +183,15 @@ export default function EmbeddedHostBridge() {
       const model = parseHostModel(e.data)
       if (!model) return
       dispatch(setHostModel(model))
+      // Where the tab bar's switch / pin / stable-order relays go: exactly the
+      // origin this model came from, never '*'.
+      noteHostOrigin(e.origin)
+      // Whether this host performs image copies for us, and where to ask. Read
+      // off the raw payload: it is a pane-side capability, not header state.
+      noteClipboardRelayHost(
+        e.origin,
+        (e.data as { clipboardRelay?: unknown }).clipboardRelay === PANE_CLIPBOARD_VERSION,
+      )
       document.documentElement.classList.toggle(MAC_INSET_CLASS, model.macInset)
       document.documentElement.classList.toggle(WIN_INSET_CLASS, model.winInset)
       // Adopt the host's zoom-aware reserve; without one the pane's own :root
@@ -213,9 +229,11 @@ export default function EmbeddedHostBridge() {
       document.documentElement.classList.remove(WIN_INSET_CLASS)
       document.documentElement.style.removeProperty(WIN_CAPTION_RESERVE_PROP)
       setFocusModeEnabled(false, { echo: false })
+      noteClipboardRelayHost(null, false)
+      setHostElectronReader(null)
       dispatch(setHostModel(null))
     }
-  }, [dispatch])
+  }, [dispatch, store])
 
   return null
 }

@@ -69,6 +69,7 @@ CANONICAL: dict[str, dict] = {
         "previous_parent": {"slot": "chat-3", "sid": "acp-sess-former"},
     },
     "session/released": {"previous_parent": {"slot": "chat-9", "sid": "acp-sess-adopter"}},
+    "session/spawned": {"child": {"slot": "chat-12"}},
     "turn/started": {"turn": 3, "actor": "user", "depth": 0, "message_seq": 11, "attempt": 2},
     "turn/refused": {"turn": 4, "actor": "cron", "reason": "gateway_closing", "depth": 1},
     "turn/completed": {
@@ -108,6 +109,19 @@ CANONICAL: dict[str, dict] = {
         "chars": 4000,
         "tokens": 1000,
         "tokens_estimated": True,
+    },
+    "context/measured": {
+        "turn": 3,
+        "turn_id": "e-01",
+        "breakdown": {
+            "schema": 1,
+            "categories": {"history": 4000, "toolSpecs": 2865},
+            "model_calls": 1,
+            "total_chars": 6865,
+            "compacted": True,
+            "history": {"user": 3990, "assistant": 5, "thinking": 5, "compaction_summary": 0},
+        },
+        "ttft": {"total_ms": 2870, "setup_ms": 59, "model_ms": 1534},
     },
     "step/started": {"turn": 3, "step": 1},
     "step/completed": {"turn": 3, "step": 1, "ms": 900},
@@ -238,6 +252,14 @@ CANONICAL: dict[str, dict] = {
         "event": "progress: scoped tests green",
         "event_kind": "report",
     },
+    "work/charged": {
+        "slot": "dashboard:3",
+        "by": "dashboard:9",
+        "source": "turn",
+        "closer": "acp-worker:41",
+        "credits": 0.25,
+        "duration_ms": 1200,
+    },
     "panel/published": {
         "template": "default",
         "data": {"cycle": 47, "waiting_on_you": 1, "holding": 6},
@@ -293,7 +315,39 @@ CANONICAL: dict[str, dict] = {
         "mid": "m-7f3b",
     },
     "guide/started": {"guide_id": "g_0a1b2c3d4e5f"},
+    "dashboard/goal_recorded": {
+        "goals": [{"text": "Keep the docs current"}],
+        "milestones": [
+            {
+                "text": "Fixes proposed",
+                "target": "3",
+                "current": "4 fixes proposed",
+                "at": "2026-10-18T21:36:00+00:00",
+            }
+        ],
+    },
+    "dashboard/waiting_changed": {
+        "items": [
+            {
+                "kind": "options",
+                "text": "Open a PR for the docs fix?",
+                "options": ["Open the PR", "Not yet"],
+                "asked_at": "2026-10-18T18:40:00+00:00",
+            }
+        ]
+    },
+    "dashboard/custom_value": {
+        "type": "stock_check",
+        "data": {"symbol": "AMZN", "price": 187.4, "checked_at": "2026-10-26T18:00:00+00:00"},
+        "writer": "cron:stock-poll",
+        "member": "trader",
+        "crew_key": "9f2c" + "0" * 60,
+    },
     "guide/finished": {"guide_id": "g_0a1b2c3d4e5f", "status": "completed"},
+    # A whole working set lost at once: of sixteen listed tabs none comes back, and
+    # all sixteen stay in the reopen seed. ``kept`` counts the SET rather than this
+    # one tab, which is what lets a reader tell that case from one bad transcript.
+    "session/unrestored": {"listed": 16, "restored": 0, "kept": 16},
 }
 
 
@@ -363,7 +417,29 @@ def test_every_type_written_today_is_declared_and_nothing_else_is():
     # The five past that are the change cards and guide offers: each proposal is
     # a row of the conversation, and ``card/*`` / ``guide/*`` record the proposal and
     # every outcome in the same session's history.
-    assert len(SESSION_ENTRY_TYPES) == 43
+    #
+    # Two past those joined most recently. The session tree's ``session/spawned`` is
+    # written on the CREATOR's log at session_create time so a child's creating edge
+    # survives a restart before the child's first turn writes a log of its own.
+    #
+    # ``session/unrestored`` is the open-tab registry's own record. It joins for the
+    # reason the agentic pair does -- this log is its ONLY record -- and the gap it
+    # covers is the sharpest of the set: a tab the startup restore lists and cannot
+    # show has nothing to show anywhere else. No ``session/closed``, because the
+    # gateway did not stop serving the session; no delete, because nothing was
+    # deleted; and the restore's own warning goes to a gateway log that rotates away.
+    #
+    # The two past that are a crewmate's own record for its Dashboard page:
+    # ``dashboard/goal_recorded`` and ``dashboard/waiting_changed``, snapshots the gateway
+    # appends when the goal record or the "waiting on you" list changes.
+    #
+    # The one past those is ``context/measured``: the agent engine's own measurement of
+    # a turn's context, which the ``usage`` fold attaches to that turn's composition row.
+    #
+    # The one past that is ``dashboard/custom_value``: a record a script cron appends
+    # for its crewmate through the record door, which the ``custom`` fold keeps the
+    # latest of per type.
+    assert len(SESSION_ENTRY_TYPES) == 50
     # Nine types the vocabulary owns that nothing writes. Declaring one would state
     # a shape no writer produces, and the first emitter to land would have to
     # satisfy a contract written without it. They pass through undeclared instead.
@@ -432,6 +508,9 @@ def test_only_a_vocabulary_the_writer_clamps_is_enforced():
         ("radar/recorded", "phase"),
         ("radar/recorded", "scope"),
         ("radar/recorded", "event_kind"),
+        # The relay sets ``source`` from its own closer-type table, so no other value
+        # can reach the entry.
+        ("work/charged", "source"),
         # The work ledger clamps every one of these before it builds the entry:
         # the vocabularies are declared beside the type and the writer imports
         # them, so the closed enum and the writer's refusal are one set.
@@ -466,7 +545,7 @@ def test_only_a_vocabulary_the_writer_clamps_is_enforced():
 #: The append primitives in :mod:`kiro_crew.crew_log.emit` and its durable writer,
 #: each mapped to the index of the positional argument that names the entry type.
 #:
-#: Keyed on the CALLEE rather than on any type-shaped literal, because emit.py also
+#: Keyed on the CALLEE rather than on any type-shaped literal, because emit_turn.py also
 #: hands an entry type to helpers that append nothing -- ``_entry_line_fits`` is
 #: given ``"plan/updated"`` to measure a line -- and counting those would report a
 #: type as emitted at a site that never appends.
@@ -525,8 +604,8 @@ def _types_the_writers_append() -> dict[str, bool]:
         # one non-ignorable append is all it takes to stop a folding reader.
         skippable[entry_type] = skippable.get(entry_type, True) and ignorable
 
-    for module in (emit, writer_mod, store_mod):
-        tree = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
+    for path in _writer_files():
+        tree = ast.parse(path.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
             if isinstance(node, ast.Call):
                 keywords = {item.arg: item.value for item in node.keywords if item.arg}
@@ -552,6 +631,17 @@ def _types_the_writers_append() -> dict[str, bool]:
     return skippable
 
 
+def _writer_files():
+    """The writers' source files: the emitter facade with its ``emit_*.py`` owners, its
+    durable writer, the work relay that appends copies into a board's log, and the store
+    facade with its ``store_*.py`` owners, where the crash-repair closer lives."""
+    crew_log_dir = Path(emit.__file__).parent
+    emit_files = sorted(crew_log_dir.glob("emit*.py"))
+    store_files = sorted(Path(store_mod.__file__).parent.glob("store*.py"))
+    relay = crew_log_dir / "work_relay.py"
+    return [*emit_files, Path(writer_mod.__file__), relay, *store_files]
+
+
 def _walk(fields):
     for field in fields:
         yield field
@@ -562,10 +652,7 @@ def _types_with_a_producing_site():
     # Read the writers rather than restating their list: a type is emitted when a
     # producing module names it. This holds the closed-enum rule to code that
     # exists, so wiring a resolver cannot quietly leave an unenforceable set behind.
-    sources = [
-        Path(module.__file__).read_text(encoding="utf-8")
-        for module in (emit, writer_mod, store_mod)
-    ]
+    sources = [path.read_text(encoding="utf-8") for path in _writer_files()]
     for spec_type in SESSION_ENTRY_TYPES:
         if any(f'"{spec_type}"' in text for text in sources):
             yield spec_type

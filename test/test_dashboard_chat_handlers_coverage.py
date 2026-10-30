@@ -395,12 +395,17 @@ class TestTryLiveModelSwitch:
 
 
 class TestBroadcastContextReset:
-    def test_no_provider_sends_a_zeroed_reset(self):
+    def test_no_provider_reset_carries_no_counts(self):
+        # No provider on the cold-reset path: no measurement to send, so the
+        # frame carries only {slot, reset}. The reducer keeps its stored `used`
+        # and the meter derives the percentage against the new model's window.
         state = _state()
         ch._broadcast_context_reset(state, "s1", None)
         state.broadcast_context_usage.assert_called_once()
         _, payload = state.broadcast_context_usage.call_args.args
-        assert payload == {"slot": "s1", "pct": 0.0, "reset": True}
+        assert payload == {"slot": "s1", "reset": True}
+        assert "pct" not in payload
+        assert "used_tokens" not in payload
 
     def test_live_provider_payload_carries_rebased_stats(self):
         state = _state()
@@ -415,12 +420,53 @@ class TestBroadcastContextReset:
         assert payload["slot"] == "s1"
         assert payload["pct"] == 7.2
         assert payload["reset"] is True
+        # A rebase that resolved the new window ships it, and the recomputed pct
+        # rides along as a real reading.
+        assert payload["window_tokens"] == 200_000
+
+    def test_live_provider_unknown_window_carries_used_not_pct(self):
+        # A rebase onto a model whose window is NOT yet known: window 0, but the
+        # transcript (and so `used`) is unchanged. The frame carries `used_tokens`
+        # and neither `pct` nor `window_tokens`, so the meter derives the
+        # percentage from `used` against the new model's window instead of
+        # pairing the old percentage with it.
+        state = _state()
+        provider = MagicMock()
+        provider.context_usage_pct = MagicMock(return_value=0.0)
+        provider.context_window_tokens = MagicMock(return_value=0)
+        provider.context_used_tokens = MagicMock(return_value=120_000)
+
+        ch._broadcast_context_reset(state, "s1", provider)
+
+        _, payload = state.broadcast_context_usage.call_args.args
+        assert payload == {"slot": "s1", "reset": True, "used_tokens": 120_000}
+        assert "pct" not in payload
+        assert "window_tokens" not in payload
+
+    def test_live_provider_unknown_window_and_used_clears(self):
+        # A percentage-only backend: neither a known window nor a `used` count.
+        # There is no honest number for the new window, so the frame carries no
+        # counts and the reducer clears the reading rather than guess.
+        state = _state()
+        provider = MagicMock()
+        provider.context_usage_pct = MagicMock(return_value=42.0)
+        provider.context_window_tokens = MagicMock(return_value=0)
+        provider.context_used_tokens = MagicMock(return_value=0)
+
+        ch._broadcast_context_reset(state, "s1", provider)
+
+        _, payload = state.broadcast_context_usage.call_args.args
+        assert payload == {"slot": "s1", "reset": True}
+        assert "pct" not in payload
+        assert "used_tokens" not in payload
 
     def test_broadcast_failure_is_swallowed(self):
         state = _state()
         state.broadcast_context_usage = MagicMock(side_effect=RuntimeError("no clients"))
         # Must not raise: a failed broadcast cannot fail the model switch.
         ch._broadcast_context_reset(state, "s1", None)
+        _, payload = state.broadcast_context_usage.call_args.args
+        assert (payload["slot"], payload["reset"]) == ("s1", True)
 
 
 # ── _redact_followup_item ────────────────────────────────────────────────────
@@ -878,6 +924,20 @@ class TestQueueCancel:
         assert payload["queue_id"] == qid
         state.push_slots_update.assert_called_once()
 
+    @pytest.mark.asyncio
+    async def test_a_send_already_in_the_conversation_is_not_cancelled(self, _sel):
+        # Its row is in the transcript already: dropping only the entry would
+        # leave the message there and give the text back to send twice.
+        slot = _ChatSlot("s1")
+        qid = slot.queue_append("orig")
+        slot._queue[0]["_responsive_row"] = slot.append("user", "orig", "msg msg-u")
+        state = _state(slot)
+        status, body = await self._delete(state, "s1", qid)
+        assert status == 409
+        assert body["code"] == "queue_item_already_sent"
+        assert [item["id"] for item in slot._queue] == [qid]
+        state.broadcast_ws.assert_not_called()
+
 
 class TestQueueEdit:
     async def _patch(self, state, name, qid, payload):
@@ -908,6 +968,20 @@ class TestQueueEdit:
         qid = slot.queue_append("orig")
         status, _ = await self._patch(_state(slot), "s1", qid, {"content": 5})
         assert status == 400
+
+    @pytest.mark.asyncio
+    async def test_a_send_already_in_the_conversation_is_not_edited(self, _sel):
+        # A waiting send whose row was written where it was sent is part of the
+        # conversation; editing only its entry would leave the old row and add
+        # a second one at the drain.
+        slot = _ChatSlot("s1")
+        qid = slot.queue_append("orig")
+        slot._queue[0]["_responsive_row"] = slot.append("user", "orig", "msg msg-u")
+        status, body = await self._patch(_state(slot), "s1", qid, {"content": "changed"})
+        assert status == 409
+        assert body["code"] == "queue_item_already_sent"
+        assert slot._queue[0]["content"] == "orig"
+        assert [m["content"] for m in slot.messages if m["role"] == "user"] == ["orig"]
 
     @pytest.mark.asyncio
     async def test_unknown_queue_id_is_404(self, _sel):

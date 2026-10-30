@@ -20,7 +20,8 @@ from types import ModuleType
 
 from kiro_crew import _sqlite_compat
 
-# Every module that binds a module-level ``sqlite3`` name from the resolver.
+# Every module whose module-level ``sqlite3`` is the resolver's binding (the backup
+# facade serves the one its conversation-export part binds).
 IMPORT_SITES = (
     "kiro_crew._sqlite_compat",
     "kiro_crew.vector_memory",
@@ -28,10 +29,14 @@ IMPORT_SITES = (
     "kiro_crew.snapshot_redact",
     "kiro_crew.portability",
     "kiro_crew.knowledge.store",
+    "kiro_crew.knowledge.store_parts.fulltext_index",
+    "kiro_crew.knowledge.store_parts.schema_migrations",
+    "kiro_crew.knowledge.store_parts.source_rows",
     "kiro_crew.knowledge.retrieval",
     "kiro_crew.metrics.inventory_gauges",
     "kiro_crew.dashboard.handlers.kiro_usage_api",
     "kiro_crew.apps.builtins.aws_control.backend.backup",
+    "kiro_crew.apps.builtins.aws_control.backend.backup_parts.conversations",
 )
 
 REPO_SRC = Path(__file__).resolve().parents[1] / "src"
@@ -131,10 +136,11 @@ def test_the_idiom_lives_in_exactly_one_file():
 SHARED_DATABASE_OPENERS = (
     "memory_stores.py",
     "metrics/inventory_gauges.py",
-    "dashboard/handlers/cron.py",
+    "dashboard/handlers/cron_lessons.py",
     "kiro_cli.py",
-    "kiro_prerequisite.py",
-    "apps/builtins/aws_control/backend/backup.py",
+    "kiro_prerequisite_identity.py",
+    "kiro_prerequisite_identity_store.py",
+    "apps/builtins/aws_control/backend/backup_parts/conversations.py",
     "dashboard/handlers/kiro_usage_api.py",
 )
 

@@ -142,7 +142,6 @@ class TestStopHandlerIdempotent:
         request.match_info = {"slot": "test-slot"}
         request.query = {}
 
-        # Mock SEL logging and _reject_pending_approvals
         with patch("kiro_crew.dashboard.chat_handlers.sel") as mock_sel:
             mock_sel.return_value.log_tool_invocation = MagicMock()
             mock_sel.return_value.log = MagicMock()
@@ -566,7 +565,7 @@ class TestStopCardTeardownRace:
     """A turn tearing down must not strand the stop card at "stopping".
 
     `_finish_queue_cycle` (chat_runner.py) drives `_stopping = False` when the
-    queue drains, which the setter in state.py maps to `_stop_state = "idle"`.
+    queue drains, which the setter in state_parts/chat_slot.py maps to `_stop_state = "idle"`.
     That write races the soft-stop budget: when it landed before the escalation
     callback ran, the callback's old `_stop_state` gate bailed and the card was
     never settled. Observed against a live gateway as a stop card pulsing for

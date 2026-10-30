@@ -20,6 +20,11 @@
 //
 // The decision logic lives in a plain async tick() so tests can drive it with a
 // stubbed probe and no timers; start()/stop() only wrap the interval.
+//
+// A suspend is not a failure. A probe that settles more than two intervals after
+// it started was held up by the host, not the backend (a probe in flight when the
+// host sleeps fails on wake); it is logged and not counted. The run it interrupts
+// is kept, so a backend that was already failing still trips on its next failure.
 
 /**
  * @param {object} o
@@ -32,6 +37,8 @@
  * @param {() => boolean} [o.isWindowAlive]       false => stop (window closed)
  * @param {number} [o.failureThreshold=3]         consecutive failures before firing
  * @param {number} [o.intervalMs=10000]           poll cadence
+ * @param {() => number} [o.now=Date.now]         wall clock (counts a host
+ *                                                suspend), injectable for tests
  * @param {(fn: Function, ms: number) => any} [o.setIntervalFn]
  * @param {(h: any) => void} [o.clearIntervalFn]
  * @param {(msg: string) => void} [o.log]
@@ -45,6 +52,7 @@ function createLivenessMonitor({
   isWindowAlive = () => true,
   failureThreshold = 3,
   intervalMs = 10_000,
+  now = Date.now,
   setIntervalFn = setInterval,
   clearIntervalFn = clearInterval,
   log = () => {},
@@ -53,6 +61,11 @@ function createLivenessMonitor({
   let fired = false; // onUnresponsive already fired for the current episode
   let inFlight = false; // a probe is still outstanding (don't overlap)
   let timer = null;
+  // Bumped by stop(). A probe still outstanding when its monitor is stopped
+  // settles into a newer generation and is dropped: a caller that stops the
+  // monitor before stopping the gateway on purpose must not have that probe's
+  // failure read as a wedge and recovered.
+  let generation = 0;
 
   async function tick() {
     // Once we've fired, we pause until the caller stop()s us and starts a fresh
@@ -64,14 +77,27 @@ function createLivenessMonitor({
     }
     if (inFlight) return; // previous probe slower than the interval; skip
     inFlight = true;
+    const startedAt = now();
+    const tickGeneration = generation;
     try {
       await probe();
+      if (tickGeneration !== generation) return;
       if (consecutiveFailures > 0) {
         log(`backend responsive again after ${consecutiveFailures} failed probe(s)`);
         try { onRecovered(); } catch (e) { log(`onRecovered threw: ${e && e.message}`); }
       }
       consecutiveFailures = 0;
     } catch {
+      if (tickGeneration !== generation) return;
+      // The probe is bounded below one interval, so one that settles more
+      // than two intervals after it started was held up by the host, not the
+      // backend: the host slept (or this process stalled) while it was in
+      // flight, so its failure says nothing about the backend.
+      const heldMs = now() - startedAt;
+      if (heldMs > 2 * intervalMs) {
+        log(`backend probe failed after ${Math.round(heldMs / 1000)}s across a suspend; not counted`);
+        return;
+      }
       consecutiveFailures += 1;
       log(`backend probe failed (${consecutiveFailures}/${failureThreshold})`);
       if (consecutiveFailures >= failureThreshold && !fired) {
@@ -80,7 +106,8 @@ function createLivenessMonitor({
         try { onUnresponsive(); } catch (e) { log(`onUnresponsive threw: ${e && e.message}`); }
       }
     } finally {
-      inFlight = false;
+      // A restarted monitor owns inFlight now (start() reset it).
+      if (tickGeneration === generation) inFlight = false;
     }
   }
 
@@ -95,6 +122,7 @@ function createLivenessMonitor({
   }
 
   function stop() {
+    generation += 1;
     if (timer) {
       clearIntervalFn(timer);
       timer = null;

@@ -20,10 +20,25 @@ const MAX_KIRO_BONUS_DAYS_LEFT = 3_650
  */
 export type KiroUsageState =
   | KiroCreditUsage
+  | KiroAccountOnly
   | 'none'
-  | 'api-key'
   | 'signin-required'
   | null
+
+/**
+ * A sign-in with no balance (`reason: account_unproven`): the whoami names
+ * the provider and no user, so only the account type is known. The gateway
+ * publishes this state only when email and start URL are absent, so the type
+ * is the one field it carries.
+ */
+export interface KiroAccountOnly {
+  accountOnly: true
+  accountType?: string
+}
+
+/** True for the signed-in-account-without-a-balance state. */
+export const isAccountOnly = (state: unknown): state is KiroAccountOnly =>
+  typeof state === 'object' && state !== null && (state as { accountOnly?: unknown }).accountOnly === true
 
 export function parseKiroUsagePayload(d: { usage?: KiroUsagePayload } | undefined): KiroUsageState {
   const u: KiroUsagePayload = d?.usage || {}
@@ -95,15 +110,61 @@ export function parseKiroUsagePayload(d: { usage?: KiroUsagePayload } | undefine
   // No reading (kiro-cli absent, or neither the API nor the /usage scrape
   // produced a plan) -> 'none': on the Kiro backend a dash whose modal carries
   // the Refresh that can fill it, so the segment stays on screen; on any other
-  // harness shell/topbar/kiroUsageReadout.tsx hides the segment (see isKiroBackend). API-key auth -> terminal "not
-  // available for this auth type" (a dash with that reason; for this account
-  // type the state is permanent, not a warming cache). No readable Kiro
-  // credential -> also terminal, with its remedy named: sign in again. Empty
-  // cache (Kiro warming) -> spinner.
+  // harness shell/topbar/kiroUsageReadout.tsx hides the segment (see
+  // isKiroBackend). No readable Kiro credential -> terminal, with its remedy
+  // named: sign in again. Empty cache (Kiro warming) -> spinner. API-key auth
+  // is not a terminal state: the /usage scrape returns the real balance for it
+  // just as it does for an SSO sign-in, so it resolves to a reading.
   if (u.available === false) {
-    if (u.reason === 'api_key_auth') return 'api-key' as const
     if (u.reason === 'signin_required') return 'signin-required' as const
+    if (u.reason === 'account_unproven') {
+      const type = u.account_type
+      return { accountOnly: true, accountType: typeof type === 'string' && type ? type : undefined }
+    }
     return 'none' as const
   }
   return null
+}
+
+/** Fast poll while the reading has not settled; the steady cadence once it has. */
+export const KIRO_USAGE_WARMING_POLL_MS = 2_500
+export const KIRO_USAGE_STEADY_POLL_MS = 30_000
+
+/**
+ * How often the credit pill should re-poll `/api/sessions/usage`, given the last
+ * settled state and whether the last read errored.
+ *
+ * The gateway serves the reading from a cache that the GET itself warms in the
+ * background: a reopen hits an empty cache (`null`) and, before kiro-cli
+ * readiness is verified, a 503 the query surfaces as an error with no data. At
+ * the steady cadence each of those unsettled reads costs a full interval before
+ * the next poll sees the warmed value, so the pill sits "checking" for roughly
+ * two intervals after a reopen. Polling fast while the state is unsettled
+ * collapses that wait to a couple of seconds; a settled state — a real reading,
+ * or a terminal `none` / `api-key` / `signin-required` the next poll would not
+ * change — drops back to the steady cadence so a resolved pill is not polled
+ * every few seconds forever.
+ *
+ * `null` is the warming cache. `isError` is the pre-readiness 503 (and any other
+ * failed read): the query holds no data, so `state` is `null` there too, but it
+ * is called out explicitly because an errored read is exactly the boot condition
+ * this acceleration targets.
+ *
+ * The fast cadence is bounded by `settledReads`, the number of reads the query
+ * has finished so far (data plus error updates). A reopen settles within a few
+ * reads; a state that never settles — a signed-out kiro-cli's standing 503, a
+ * gateway that is down, a cache that stays empty — or a pill that had a reading
+ * and then starts failing is past the cap, so it falls back to the steady
+ * cadence instead of polling 12x faster for as long as the tab is open.
+ */
+export const KIRO_USAGE_WARMING_MAX_READS = 12
+
+export function kiroUsageRefetchInterval(
+  state: KiroUsageState,
+  isError: boolean,
+  settledReads: number,
+): number {
+  if (settledReads >= KIRO_USAGE_WARMING_MAX_READS) return KIRO_USAGE_STEADY_POLL_MS
+  if (isError || state === null) return KIRO_USAGE_WARMING_POLL_MS
+  return KIRO_USAGE_STEADY_POLL_MS
 }

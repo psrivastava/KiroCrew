@@ -109,17 +109,18 @@ describe('the facade composition', () => {
   // The owner hooks in the order the facade calls them. Each sits where its block sat
   // before the owners were extracted, which is what keeps React's effect order.
   const CALL_ORDER = [
-    'useSessionSources', 'useDebouncedSessionSearch', 'useSessionRename', 'useSessionAutoTitle', 'useSidebarLane',
-    'useSessionFilterState', 'useSessionStatusFilters', 'useHistoryPane', 'usePinnedSessionOrder',
+    'useSessionSources', 'useDebouncedSessionSearch', 'useSessionRename', 'useSessionAutoTitle', 'useSessionSort', 'useSidebarLane',
+    'useSessionFilterState', 'useSessionStatusFilters', 'useHistoryPane', 'useSessionCleanup', 'useBulkModelSwitch', 'usePinnedSessionOrder',
+    'useManualSessionOrder',
     'useStaleCollapse', 'useFolderSort', 'useFolderRename', 'useSidebarTags',
-    'useBoardColumns', 'useSidebarResize', 'usePinnedOrderAuthority', 'useColumnPopover', 'useBoardColumnMutations',
+    'useSidebarModels', 'useBoardColumns', 'useSidebarResize', 'useFullTitlesOnScrollSetting', 'usePinnedOrderAuthority', 'useColumnPopover', 'useBoardColumnMutations',
     'useColumnMatches', 'useFolderVisibility', 'useStaleMoveWatcher', 'useSearchMatches',
     'useCollapsedCrews', 'useCollapsedCrewSpaces', 'useCrewEnable', 'useHoverHold', 'useLineageAvailable', 'useHoverPinLiveness', 'useStaleNarrowBridge',
-    'useFolderFilterReveal', 'useConductorLane', 'useLaneCycle', 'useShortcutOrder',
-    'useFolderFilterRows', 'useFolderMutations', 'useHoldPinnedHeaderOnCollapse', 'useBoardFolderCollapse',
+    'useFolderFilterReveal', 'useConductorLane', 'useLaneCycle', 'useSidebarScrollPeek', 'useShortcutOrder',
+    'useFolderFilterRows', 'useFolderMutations', 'useHoldPinnedHeaderOnCollapse', 'useRowAnimSettled', 'useBoardFolderCollapse',
     'useNativeSessionDrag', 'useFolderDropOps',
     'useFolderTree', 'useSidebarReveal', 'useSidebarMoveUndo', 'useSidebarDragHandlers',
-    'useFolderChatCreate', 'useSessionCreate', 'usePinnedKeyboardReorder', 'useRootFolderLanes',
+    'useFolderChatCreate', 'useSessionCreate', 'usePinnedKeyboardReorder', 'useManualKeyboardReorder', 'useRootFolderLanes',
   ]
 
   it('calls every owner hook once, in the pinned order', () => {
@@ -143,13 +144,13 @@ describe('browser-storage keys', () => {
   // Event names share the prefix but are not storage keys.
   const EVENTS = new Set(['mc-config-changed'])
 
-  it('are declared in ./persistence, bar the four status-filter keys', () => {
+  it('are declared in ./persistence, bar the five status-filter keys', () => {
     const elsewhere: string[] = []
     for (const [name, text] of [...ownerSource, ['ChatSidebar', facadeSource] as const]) {
       if (name === 'persistence') continue
       for (const key of keyLiterals(text)) {
         if (EVENTS.has(key)) continue
-        if (name === 'filters' && /^mc-session-(unread|running|pinned|recent)-only$/.test(key)) continue
+        if (name === 'filters' && /^mc-session-(unread|running|pinned|recent|crew)-only$/.test(key)) continue
         elsewhere.push(`${name}: ${key}`)
       }
     }

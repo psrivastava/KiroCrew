@@ -188,6 +188,9 @@ def inject_workflow_result(
                 slot.invalidate_source_links()
                 slot._dismissed_hydrated = False
                 note_crew_log_class(state, slot)
+                from kiro_crew.dashboard.transcript_binding import bind_transcript
+
+                bind_transcript(state, slot)
             slot.title = f"Workflow: {snapshot.get('name') or run_id}"
 
         # Dedup: don't double-inject the same result on a re-fire.
@@ -266,7 +269,7 @@ def _seed_turn_timeout(slot: Any, meta: Optional[dict]) -> None:
     unhydrated, so its saves carry the on-disk value forward instead of
     replacing it with "follow the global".
     """
-    from kiro_crew.dashboard.slot_persistence.metadata_codec import _validate_turn_timeout_secs
+    from kiro_crew.dashboard.slot_persistence.metadata_values import _validate_turn_timeout_secs
 
     if meta is None:
         slot.turn_timeout_secs = None

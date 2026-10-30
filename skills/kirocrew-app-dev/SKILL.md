@@ -91,10 +91,12 @@ my-app/
 | `resources` | Omit from `app.json`; declare app resources with `agents`, `skills`, `sops`, and `mcpServers` | `resources` is install/registry ownership metadata (`"gateway"` or `"app"`), not an app-manifest resource array |
 | `ui.entry` | Use an ESM `.mjs` bundle; `.js` is also served | HTML is not in the app UI static-file allowlist |
 | `ui.pages[].iconUrl` | Use an app-relative image path for a custom icon | `ui.pages[].icon` also works for supported host Lucide names and falls back to `Package` |
+| `ui.loading.layout` | Optional: `"page"` (default), `"rail"`, `"centered"` or `"split"`, e.g. `"loading": { "layout": "rail" }`. Pick the one closest to your first paint | The dashboard shows nothing for 300 ms, then this placeholder shape until the bundle mounts. It is a closed set the host draws; no custom markup or CSS. Anything else, including `"Rail"`, falls back to `"page"` |
 | `displayName` | Required | Gateway uses it for UI display |
 | `version` | Semver string | Used by the App Store registry to compute `updateAvailable` |
 | `crons[].timezone` | IANA zone name; omit it only when the hour is zone-agnostic | An empty timezone falls back to the gateway config's zone and then to **UTC**, so `"cron_expr": "0 6 * * *"` without it fires at 06:00 UTC — the wrong calendar day for most users. A per-USER zone is not manifest data: pass `timezone=` to `ctx.cron.add_job` instead |
 | `crons[].skip_dates` | Zero-padded `YYYY-MM-DD`, evaluated in `timezone` | `"2026-1-1"` parses but never matches the padded fire-time rendering, so the skip silently does nothing. Both fields are rejected at manifest validation, not at fire time |
+| `crons[].timeout` / `crons[].timeout_secs` | Set both on a `script` cron that runs longer than 30s, e.g. `"timeout": 60, "timeout_secs": 65` | Omitted, a script is killed at 30s and a command at 300s. `timeout_secs` must cover `timeout` plus 5s of cleanup; a pair the cron SDK would refuse is rejected at manifest validation |
 
 ## Lifecycle and Resource Registration (CRITICAL)
 
@@ -343,6 +345,11 @@ _jsx('button', {
 | Show a loading/error state when config is unavailable | Show cryptic error messages |
 | Read app state through an app-owned API or `/api/apps/MY-APP/config` | Derive arbitrary absolute data-home paths in UI code |
 
+When app UI moves, or draws a live figure such as a gauge or a diagram, the
+`living-ui` skill's rules apply to it too. An app may bundle that skill's
+toolkit, `toolkit/living-ui.js`, instead of inlining its helper blocks. The file
+exports nothing, so end the app's copy with `export { LivingUI };` and import it.
+
 ### Available Gateway APIs
 
 | Endpoint | Method | Returns |
@@ -430,7 +437,7 @@ they can: throttling. That breaks your app, not just its polling.
 
 Put install-wide schedules in the `crons` array of `app.json`. The gateway
 reconciles that array through `register_app_crons_with_service`
-(`src/kiro_crew/apps/bridges.py`) at enable and gateway startup. Registration is
+(`src/kiro_crew/apps/bridges_crons.py`) at enable and gateway startup. Registration is
 add-if-absent under one store lock, keyed by cron name.
 
 A schedule derived from user configuration may instead use `ctx.cron` / CronSDK;
@@ -476,7 +483,7 @@ and use the phase offset for anything longer.
 ### Bounded concurrency
 
 The scheduler will not overlap a job with itself: the due-scan skips any job
-that holds a run claim (`is_running`, `src/kiro_crew/cron.py`), so a slow run
+that holds a run claim (`is_running`, `src/kiro_crew/cron_service/service/run_registry.py`), so a slow run
 delays its own next tick rather than doubling up. What is not bounded is what
 you do inside one run. There is no per-app cap on sessions or subagents today;
 per-app quotas are still a draft phase in
@@ -541,7 +548,7 @@ in its result instead of raising, so read the result rather than assuming.
 - `scripts/uninstall.sh` must always stop background work and remove anything
   the app registered outside its own directory. **User state is a separate
   decision and is not yours to make.** Uninstall preserves app data by default
-  (`keep_data = True` in `src/kiro_crew/apps/routes.py`, flipped only by an
+  (`keep_data = True` in `src/kiro_crew/apps/routes_uninstall.py`, flipped only by an
   explicit `purge_data` request), and that choice reaches your script as
   `PURGE_DATA` / `KEEP_DATA` in its environment. So delete state files only
   under `PURGE_DATA=1`, and leave them untouched under `KEEP_DATA=1`. A script

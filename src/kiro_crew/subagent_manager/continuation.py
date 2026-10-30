@@ -98,7 +98,7 @@ class ContinuationCoordinator(ManagerComponent):
             sid = unit_for_session_key(self._manager._sessions, info.parent_session_key)
             if not sid:
                 return
-            setattr(info, "_crew_log_followup_asked", (sid, crew_log_emit.live_turn(sid)))
+            setattr(info, "_crew_log_followup_asked", (sid, *crew_log_emit.asking_turn(sid)))
         except Exception:
             _logger.debug("crew log: pinning a follow-up origin failed", exc_info=True)
 
@@ -368,7 +368,7 @@ class ContinuationCoordinator(ManagerComponent):
         cwd: str = "",
         _preassigned_id: str = "",
         _memory_mode: str | None = None,
-        _crew_log_asked: "tuple[str, int] | None" = None,
+        _crew_log_asked: "tuple[str, int, int] | None" = None,
     ) -> SubagentInfo | None:
         """Dispatch a follow-up *task* into conversation *conv_id* (sync callers).
 
@@ -416,7 +416,7 @@ class ContinuationCoordinator(ManagerComponent):
         cwd: str = "",
         _preassigned_id: str = "",
         _memory_mode: str | None = None,
-        _crew_log_asked: "tuple[str, int] | None" = None,
+        _crew_log_asked: "tuple[str, int, int] | None" = None,
     ) -> SubagentInfo | None:
         """:meth:`continue_conversation_impl` for event-loop callers: the same
         prelude, then ``spawn_async`` (write-before-ack with the store write on
@@ -506,7 +506,7 @@ class ContinuationCoordinator(ManagerComponent):
         cwd: str = "",
         _preassigned_id: str = "",
         _memory_mode: str | None = None,
-        _crew_log_asked: "tuple[str, int] | None" = None,
+        _crew_log_asked: "tuple[str, int, int] | None" = None,
         *,
         _execution_context=None,
         _captured_state=...,
@@ -678,6 +678,26 @@ class ContinuationCoordinator(ManagerComponent):
             if _captured_state is ...
             else self._inherited_context_groups_impl(conv_id, state=_captured_state)
         )
+        # A continuation is another turn of the SAME run, so it keeps the model
+        # the caller pinned at spawn and the effort that went with it, unless the
+        # caller names a model. Only the caller's own pin is kept: a model the run
+        # took from ``agent.role_models['subagent']`` or from a ``model.route``
+        # tier is not one (``requested_model`` records the effective pin and holds
+        # both), so it resolves again, as it does for a run still in memory. After
+        # a gateway restart the run is gone from memory and state.json holds what
+        # the spawn recorded.
+        if original is not None:
+            run_model, run_effort = original.model or "", original.reasoning_effort
+        else:
+            recorded = (read_state(conv_id) or {}) if _captured_state is ... else _captured_state
+            run_model = str(recorded.get("pinned_model") or "")
+            run_effort = str(recorded.get("reasoning_effort") or "")
+        # Effort follows the model (rfc-worker-model-inheritance, rule 4): the
+        # run's effort was chosen for the run's model, so a caller who names a
+        # model gets that model's own effort resolution instead.
+        named_model = bool(model)
+        if not named_model and run_model:
+            model = run_model
         delegation = (
             original.delegation
             if original is not None
@@ -716,6 +736,7 @@ class ContinuationCoordinator(ManagerComponent):
             parent_session_key=parent_session_key,
             agent=agent,
             model=model,
+            reasoning_effort="" if named_model else run_effort,
             max_turns=max_turns,
             keep=True,
             cwd=cwd,
@@ -988,12 +1009,21 @@ class ContinuationCoordinator(ManagerComponent):
         completion event through the normal ``_on_done`` path — the parent
         must not wait forever on an event that is not coming.
 
-        Hard-bounded and manager-owned: gives up at the manager's run timeout
+        Hard-bounded and manager-owned: gives up at the run's captured timeout
         plus a margin, and the task is registered in ``_followup_watchers`` so
         ``cancel_all()`` cancels it — a watcher must never dispatch a fresh
         run into a shutting-down gateway.
         """
-        deadline = time.monotonic() + self._manager._default_timeout + 300
+        # A follow-up can be queued before `_run_impl` captures this run's
+        # deadline, while spawn approval or a queued start still holds the run.
+        # Timing from the manager default at that point starts this clock ahead
+        # of the run's own and can expire the message while the run is still
+        # inside its deadline. Polling is already this watcher's ownership
+        # model; shutdown cancels the manager-owned task, and a terminal run
+        # needs no capture to dispatch.
+        while info.timeout_secs == 0 and not info.done and self._manager._default_timeout > 0:
+            await asyncio.sleep(self._manager._FOLLOWUP_POLL_SECS)
+        deadline = time.monotonic() + (info.timeout_secs or self._manager._default_timeout) + 300
         while time.monotonic() < deadline:
             if info.done and info.id not in self._manager._tasks:
                 break
@@ -1052,26 +1082,60 @@ class ContinuationCoordinator(ManagerComponent):
             # announce-and-drop for pending messages.
             return
         task = "\n\n---\n\n".join(messages)
-        # Finalization may hold the conversation for a beat after the task is
-        # popped (shielded report); retry a bounded number of times.
-        for _attempt in range(self._manager._FOLLOWUP_BUSY_RETRIES):
-            child = await self._manager.continue_conversation_async(
-                info.id,
-                task,
-                parent_session_key=info.parent_session_key,
-                agent=info.agent,
-                # The turn that asked for this follow-up, pinned when it was
-                # queued. This dispatch runs after the continued run finished, so
-                # the asking ordinal is not readable here. Several queued messages
-                # merge into one continuation, and the pin holds one turn, so for a
-                # merged dispatch this is the turn that asked LAST; each individual
-                # ask is recorded at its own turn as `subagent/steered`.
-                _crew_log_asked=getattr(info, "_crew_log_followup_asked", None),
+        # A continuation run executes on its root conversation, so the follow-up is a
+        # continuation of the root: dispatched by the root id, it shares the root's busy
+        # check and claim instead of keying its own.
+        conversation_id = (
+            self._persistence.subagent_id_from_conversation_key(info.conversation_key or "")
+            or info.id
+        )
+        # By the root id the dispatch would not claim the run it follows up, and a
+        # dashboard retry of that run checks only that run's own claim (claim_retry).
+        # So the follow-up claims it as well, as a continuation by its id does, and
+        # settles it with the dispatch's outcome: a retry and a follow-up of one run
+        # stay mutually exclusive whichever comes first.
+        followed: SubagentInfo | None = None
+        child: SubagentInfo | None = None
+        err = ""
+        if conversation_id != info.id and self._manager._agents.get(info.id) is info:
+            followed, child = self._manager._claim_continuation(
+                info.id, task, info.parent_session_key
             )
-            err = "spawn_failed" if child is None else str(getattr(child, "error", "") or "")
-            if not err.startswith("conversation_busy"):
-                break
-            await asyncio.sleep(self._manager._FOLLOWUP_BUSY_RETRY_SECS)
+            if child is not None:
+                followed = None  # refused: the claim belongs to whoever holds it
+                err = str(child.error or "")
+        attempts = self._manager._FOLLOWUP_BUSY_RETRIES if child is None else 0
+        # Only a dispatch in flight counts as a start of unknown outcome. A cancel in the
+        # sleep between busy attempts settles with the last refusal, which releases the
+        # claim, so a later retry of the followed-up run is not refused for nothing.
+        raised = False
+        try:
+            # Finalization may hold the conversation for a beat after the task is
+            # popped (shielded report); retry a bounded number of times.
+            for _attempt in range(attempts):
+                raised = True
+                child = await self._manager.continue_conversation_async(
+                    conversation_id,
+                    task,
+                    parent_session_key=info.parent_session_key,
+                    agent=info.agent,
+                    # The turn that asked for this follow-up, pinned when it was
+                    # queued. This dispatch runs after the continued run finished, so
+                    # the asking ordinal is not readable here. Several queued messages
+                    # merge into one continuation, and the pin holds one turn, so for
+                    # a merged dispatch this is the turn that asked LAST; each
+                    # individual ask is recorded at its own turn as `subagent/steered`.
+                    _crew_log_asked=getattr(info, "_crew_log_followup_asked", None),
+                )
+                raised = False
+                err = "spawn_failed" if child is None else str(getattr(child, "error", "") or "")
+                if not err.startswith("conversation_busy"):
+                    break
+                await asyncio.sleep(self._manager._FOLLOWUP_BUSY_RETRY_SECS)
+        finally:
+            if followed is not None:
+                # Held only when the claim above was granted; a refused claim is its holder's.
+                self._manager._settle_continuation(info.id, followed, child, raised=raised)
         if err:
             logger.warning("follow_up delivery for %s failed: %s", info.id, err.split(":", 1)[0])
             self._manager._audit_followup(info, "followup_failed")
@@ -1184,8 +1248,31 @@ class ContinuationCoordinator(ManagerComponent):
             self._persistence.forget_live_run_state(conv_id)
 
     @staticmethod
-    def _release_disk_sync(conv_id: str, sid: str, provider_label: str) -> None:
+    def _release_answer(sid: str, provider_label: str, disposed: bool) -> tuple[bool, str]:
+        """What a release answers once both halves have run.
+
+        ``not_disposed`` keeps ``ok`` true: Crew did forget the conversation and
+        demote ``keep``. It only says the backend's session was not deleted, so
+        a later continue may still resume it. Nothing here deletes a store that
+        Crew does not own.
+        """
+        if not sid:
+            return False, "conversation_gone: nothing to release"
+        if not disposed:
+            return True, (
+                f"not_disposed: Crew forgot this conversation, but its {provider_label} "
+                "session was not deleted, so a later continue may still resume it"
+            )
+        return True, "released"
+
+    @staticmethod
+    def _release_disk_sync(conv_id: str, sid: str, provider_label: str) -> bool:
         """The disk half of a release: demote ``keep``, then delete session files.
+
+        Returns whether the session files were disposed (``True`` when there
+        was no sid to dispose). A backend that owns its own session store has
+        no delete route here, so its release answers ``False`` and the caller
+        reports ``not_disposed`` instead of ``released``.
 
         Demoting the persisted source of truth matters: with the disk fallback in
         place, a stale ``keep=True`` would re-warm the continuable cache after
@@ -1203,11 +1290,12 @@ class ContinuationCoordinator(ManagerComponent):
         except Exception:
             logger.debug("release: failed to demote state for %s", conv_id, exc_info=True)
         if not sid:
-            return
+            return True
         try:
-            _cleanup_session_files_sync(sid, provider_label)
+            return bool(_cleanup_session_files_sync(sid, provider_label))
         except Exception:
             logger.debug("release_conversation: file cleanup failed", exc_info=True)
+            return False
 
     def release_conversation_impl(self, conv_id: str) -> tuple[bool, str]:
         """Release conversation *conv_id*: forget the sid and delete files.
@@ -1220,11 +1308,9 @@ class ContinuationCoordinator(ManagerComponent):
         if prefix[0] is False:
             return prefix
         sid, provider_label, original = prefix
-        self._release_disk_sync(conv_id, sid, provider_label)
+        disposed = self._release_disk_sync(conv_id, sid, provider_label)
         self._release_forget_live_state(conv_id, original)
-        if not sid:
-            return False, "conversation_gone: nothing to release"
-        return True, "released"
+        return self._release_answer(sid, provider_label, disposed)
 
     async def release_conversation_async_impl(self, conv_id: str) -> tuple[bool, str]:
         """:meth:`release_conversation_impl` for event-loop callers.
@@ -1264,10 +1350,8 @@ class ContinuationCoordinator(ManagerComponent):
                 logger.debug("release: disk half failed for %s: %r", conv_id, fut.exception())
 
         worker.add_done_callback(_settled)
-        await asyncio.shield(worker)
-        if not sid:
-            return False, "conversation_gone: nothing to release"
-        return True, "released"
+        disposed = await asyncio.shield(worker)
+        return self._release_answer(sid, provider_label, disposed)
 
     async def _sweep_conversations_async_impl(self, now: float) -> None:
         """Reaper hook: expire continuable conversations idle past TTL.

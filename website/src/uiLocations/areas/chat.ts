@@ -68,7 +68,7 @@ export const LOCATIONS = {
       },
     ],
   },
-  // The New button in the sessions sidebar header (ChatSidebar). Its visible
+  // The New button in the sessions sidebar header (chat-sidebar/SidebarHeader.tsx). Its visible
   // text switches between "New" and "Creating…" and is hidden in a narrow
   // header, so the label is the static accessible name; "New chat" is its title.
   // Drawn in the sidebar, so it is reached exactly like Older Sessions.
@@ -108,10 +108,12 @@ export const LOCATIONS = {
       },
     ],
   },
-  // The chat pane's empty state (ChatPage), drawn only while no session is
-  // open there: a different site, label and host from the sidebar button.
+  // The chat pane's empty state (ChatEmptyState), drawn only while no session is
+  // open there: a different site, label and host from the sidebar button. In a
+  // popout whose session was closed elsewhere it reads "Start a new chat here".
   'chat.start-new-chat': {
     kind: 'button',
+    label: { from: 'text', key: 'pages.chatPage.start_a_new_chat' },
     terms: {
       en: ['new conversation', 'start a conversation', 'begin a chat', 'create a chat'],
       'zh-CN': ['新对话', '新聊天', '开始对话', '新建对话'],
@@ -152,7 +154,8 @@ export const LOCATIONS = {
         { kind: 'condition', id: 'session_open' },
         // The shelf unmounts with a collapsed message box (ChatInput).
         { kind: 'shown_by', location: 'composer.expand', when: 'composer_collapsed' },
-        { kind: 'condition', id: 'no_response_running' },
+        // No `no_response_running`: a pick during a response is taken and
+        // applied from the next message (ModelChip), so the chip is never disabled.
       ],
     }],
   },
@@ -211,7 +214,7 @@ export const LOCATIONS = {
       requires: [{ kind: 'viewport', value: 'desktop' }, { kind: 'condition', id: 'session_open' }],
     }],
   },
-  // The chat header's side-panel opener (ChatPage), drawn only while the panel
+  // The chat header's side-panel opener (ChatTitleOverlay), drawn only while the panel
   // is closed; the panel's own header carries the close button. Desktop: the
   // phone's top bar replaces this header.
   'chat.side-panel-open': {

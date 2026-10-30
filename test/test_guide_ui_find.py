@@ -487,14 +487,13 @@ def test_a_create_question_is_guided_even_though_mate_could_create_it(
 def test_one_label_in_several_places_is_guided_to_the_features_own_page(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # "New crewmate" is drawn on Customize and on the Crewmates page. The
-    # Crewmates page is still behind its preview, which this tab does not show
-    # as on, so the tie is not settled on it: the user is asked which one,
-    # never sent to the first-ranked Customize button either.
-    out = _next_for(monkeypatch, "Where do I create a new crewmate?")
+    # "New mate" is drawn on Customize and on the Mates page. The Mates page
+    # has no preview in front of it, so the tie settles on the feature's own
+    # page, never on the first-ranked Customize button.
+    out = _next_for(monkeypatch, "Where do I create a new mate?")
     assert out["ambiguous"] is True and out["tied"] >= 2
     assert out["results"][0]["id"] == "agents.add"
-    assert out["next"] == mcp_guide._AMBIGUOUS_NO_GUIDE_NOTE
+    assert out["next"].startswith("members.add-menu.new has a guide_ref")
 
 
 def test_ties_are_one_guide_only_for_the_same_location_or_the_same_target() -> None:
@@ -907,7 +906,7 @@ def test_another_name_of_a_control_becomes_the_label_the_page_shows() -> None:
 def test_a_find_for_a_planned_control_becomes_its_walk() -> None:
     assert ui_index.planned_find(
         {
-            "label": "Delete crewmate",
+            "label": "Delete mate",
             "route": "/capabilities?tab=crews",
             "location_id": "agents.delete",
         }
@@ -918,9 +917,9 @@ def test_a_find_for_a_planned_control_becomes_its_walk() -> None:
         "id": "ui.show",
         "params": {"location_id": "members.add-menu.new"},
     }
-    assert ui_index.planned_find({"label": "New crewmate"}) is None
+    assert ui_index.planned_find({"label": "New mate"}) is None
     # A page the plan does not walk is not this control.
-    assert ui_index.planned_find({"label": "Delete crewmate", "route": "/members"}) is None
+    assert ui_index.planned_find({"label": "Delete mate", "route": "/members"}) is None
     # A control with no plan stays a find.
     assert ui_index.planned_find({"label": "Add Custom"}) is None
 
@@ -938,8 +937,8 @@ def test_route_compatibility_compares_the_tab_the_route_names() -> None:
 
 def test_a_control_on_another_tab_is_never_bound_or_walked() -> None:
     for label, lid in (
-        ("Manage memory", "agents.manage-memory"),
-        ("Delete crewmate", "agents.delete"),
+        ("Edit default model", "agents.model"),
+        ("Delete mate", "agents.delete"),
     ):
         asked = {"label": label, "route": "/capabilities?tab=mcp"}
         assert ui_index.authoritative_find(dict(asked)) == asked
@@ -973,21 +972,19 @@ def test_guide_start_turns_a_find_for_a_planned_control_into_its_walk(
         [
             {
                 "id": "ui.find",
-                "params": {"label": "Manage memory", "route": "/capabilities?tab=crews"},
+                "params": {"label": "Edit default model", "route": "/capabilities?tab=crews"},
                 "note": "n",
             }
         ]
     )
-    assert out == [
-        {"id": "ui.show", "params": {"location_id": "agents.manage-memory"}, "note": "n"}
-    ]
+    assert out == [{"id": "ui.show", "params": {"location_id": "agents.model"}, "note": "n"}]
 
 
 def test_a_page_is_reached_by_its_planned_opener_or_its_rail_entry_else_in_words() -> None:
-    (dev,) = [r for r in _results("developer page") if r["id"] == "page.developer"]
-    assert dev["guide_ref"] == {
+    (bell,) = [r for r in _results("notifications page") if r["id"] == "page.notifications"]
+    assert bell["guide_ref"] == {
         "action_id": "ui.show",
-        "params": {"location_id": "shell.developer"},
+        "params": {"location_id": "shell.notifications"},
     }
     # Logs has no entry anywhere to point at, and a guide never opens a page:
     # no find is handed out, and one the agent writes itself is refused.

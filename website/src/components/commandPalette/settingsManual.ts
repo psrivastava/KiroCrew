@@ -31,7 +31,7 @@ export function connectionsOAuthClientEntryId(slug: string): string {
  * Contract per entry: entries are KEY-ONLY (the i18n gate forbids English
  * prose literals in hand-written source). Generation resolves `label` (and
  * `description`) from the English catalogs — the registry is an English
- * search corpus — and SecurityPanel.tsx carries a
+ * search corpus — and each SecurityPanel section owner (SecurityPanel*.tsx) carries a
  * `data-setting-label={i18nT('<labelKey>')}` anchor on the section's wrapper
  * so deep-link highlighting (useSettingHighlight) finds the element in any
  * locale.
@@ -53,6 +53,7 @@ export const SETTINGS_MANUAL: ManualSettingEntry[] = [
     labelKey: 'pages.developer.featurePreviewsTab.decisions_tool_args',
     descriptionKey: 'pages.developer.featurePreviewsTab.decisions_tool_args_desc',
     tab: 'developer',
+    params: { sub: 'feature-previews' },
     type: 'toggle',
     occurrence: 1,
   },
@@ -61,6 +62,7 @@ export const SETTINGS_MANUAL: ManualSettingEntry[] = [
     labelKey: 'pages.developer.featurePreviewsTab.decisions_compaction',
     descriptionKey: 'pages.developer.featurePreviewsTab.decisions_compaction_desc',
     tab: 'developer',
+    params: { sub: 'feature-previews' },
     type: 'toggle',
     occurrence: 1,
   },
@@ -69,6 +71,7 @@ export const SETTINGS_MANUAL: ManualSettingEntry[] = [
     labelKey: 'pages.developer.featurePreviewsTab.decisions_memory_text',
     descriptionKey: 'pages.developer.featurePreviewsTab.decisions_memory_text_desc',
     tab: 'developer',
+    params: { sub: 'feature-previews' },
     type: 'toggle',
     occurrence: 1,
   },

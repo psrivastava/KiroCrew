@@ -32,7 +32,7 @@ session subprocess runs with the chat slot's project directory as its working
 directory. On the Claude Code backend, which does not read an agent spec's
 `resources` array, the gateway loads the global root explicitly —
 `steering_target_admissible` and `_load_steering_resources` in
-`src/kiro_crew/context.py` glob the agent config's
+`src/kiro_crew/context_assembly/agent_spec.py` glob the agent config's
 `file://.kiro/steering/**/*.md` resource against `$HOME`.
 
 A workspace file therefore needs a project bound to the chat slot. With no
@@ -83,7 +83,10 @@ declares nothing) and lives in a root that session loads.
 The Steering files tab reads, creates, edits and deletes these documents. The
 inclusion mode is a segmented control in the editor, and the rewrite happens
 server-side so your body text is preserved byte for byte. An entry that is a
-symlink is listed and readable but never editable, and a workspace write must
+symlink is listed and readable but never editable. A symlink that points
+outside the folders the dashboard may read (for global steering, outside your
+home folder) is listed as "linked, not shown": sessions can still load it, but
+the dashboard never opens it or shows where it points. A workspace write must
 echo the project it was listed under — a chat slot's project can move, and a
 delete issued from a stale listing would otherwise unlink the same-named file in
 a different project.
@@ -133,6 +136,10 @@ tool call before it runs, or block it outright.
 | `PreToolUse` | before a tool runs | allows the tool |
 | `PostToolUse` | after a tool ran | nothing |
 | `Stop` | the turn ends | usually nothing — but see the continuation contract below |
+
+A spawned sub-agent fires `AgentSpawn` (on a new session) and `UserPromptSubmit`
+(with the task its parent wrote) before its prompt is sent, and their exit-0
+stdout is added to that prompt the same way.
 
 `PreToolUse` is the only event whose exit code can decide anything — and only
 on the path where the gateway is the one approving the call:
@@ -282,6 +289,12 @@ chat, a channel thread); `subagent_id` and `parent_session_key` appear only on
 an event a spawned subagent fired. To tell a person's turn from a subagent's,
 check for `subagent_id`, not `parent_session_key`.
 
+An agent spec's own `hooks` that Kiro Crew runs for a KAS chat session also get
+the session's ACP id, as `KIRO_SESSION_ID` in the environment and
+`acp_session_id` on stdin, the same `KIRO_SESSION_ID` kiro-cli gives them. Before
+the session has an id, both are left out. Hooks-page hooks and subagent events do
+not get it.
+
 **A hook does not inherit the gateway's environment.** The gateway process holds
 provider keys and tokens, so a hook subprocess gets an allowlisted slice instead
 — `PATH`, the home and temp directories, locale, TLS trust, and `KIROCREW_HOME`.
@@ -398,6 +411,18 @@ Off stays off through autoimport too. A script under `~/.kiro/hooks` is normally
 picked up on its own, so a hook you switched off by naming that script would come
 back as a fresh discovery on autoimport's default event. The script named by a
 hook you switched off is left out of that scan.
+
+The Hooks page shows each of these hooks. In the **ACP Agent Hooks** table,
+after the hooks kiro-cli was handed, every hook in `agent.kiro_hooks` that was
+accepted but left out gets a row with no order number and the `never fires` mark.
+Under its command the row says why: kiro-cli has no event for the trigger, it
+cannot run an `agent` action, or the hook is set to `enabled: false` or
+`confirm: true` (and its script is also left out of the scan). The reason comes
+from the same function that builds the kiro-cli spec
+(`hook_document_unsent_reason`). The rows are read from `config.json` as it is
+now, while the rows above them are the spec as last written, so an edit you have
+not refreshed yet shows on this list first. A hook that fails validation is not
+listed; the log and the security event log name it.
 
 The standalone hook-file wrapper `{"version": "v1", "hooks": [...]}` is a file
 format, not a spec value, and is rejected.

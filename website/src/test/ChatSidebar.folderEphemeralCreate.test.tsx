@@ -105,7 +105,7 @@ const folders: ChatFolder[] = [{ id: FOLDER_ID, name: 'CDF', order: 0, collapsed
 function renderSidebar() {
   const store = createTestStore({
     dashboard: {
-      status: {}, connected: false, slots: [], approvalMode: 'normal',
+      status: {}, connected: true, slots: [], approvalMode: 'normal',
       channelTrusted: false, refreshTrigger: 0, unreadSlots: [], updateProgress: null,
       subagentRunning: {}, subagentDetails: {}, subagentText: {},
       sessionDefaultColor: null, sessionColorsMode: 'tint', sessionColorsPalette: 'horizon', sessionColorsIntensity: 'clear',
@@ -161,7 +161,9 @@ describe('folder menu: private chat creation', () => {
     expect(call[ARG_MEMORY_MODE]).toBe('incognito')
     expect(call[ARG_FOLDER_ID]).toBe(FOLDER_ID)
     expect(call[ARG_MODE]).toBe('')
-    expect(call[ARG_AGENT]).toBe(DEFAULT_AGENT)
+    // Agent-less: the roster's default crewmate is not the default for a new
+    // session; the server stamps the default custom agent (a template).
+    expect(call[ARG_AGENT]).toBeUndefined()
   })
 
   it('temporary creates with memory_mode "temporary" in the folder', async () => {

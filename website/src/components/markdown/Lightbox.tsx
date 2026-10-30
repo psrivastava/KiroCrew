@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react'
+import React, { useCallback, useContext, useEffect, useRef, useState } from 'react'
 import { Check, Copy, Download, MoreHorizontal, Minus, Plus, Search, X } from 'lucide-react'
 import Clickable from '../Clickable'
 import { DOUBLE_TAP_MS, DOUBLE_TAP_SLOP, DOUBLE_TAP_ZOOM, usePinchZoom } from '../../hooks/usePinchZoom'
@@ -11,9 +11,14 @@ import {
 } from '../ui/dropdown-menu'
 import { i18nT } from '../../i18n/t'
 import { fmtNumber } from '../../i18n/format'
+import { useLocalCrewHidden } from '../overlayRoot'
 import { overlayCaptionClearancePx } from '../../lib/electron'
+import { ReactReduxContext } from 'react-redux'
+import { setActiveId } from '../../store/instancesSlice'
 
-type LightboxImage = { src: string; alt: string }
+/** `filename` is the name Download saves under when the URL does not carry it
+ *  (an outbox file whose name has no extension, say); see `lightboxFilename`. */
+type LightboxImage = { src: string; alt: string; filename?: string }
 type LightboxDetail = { images: LightboxImage[]; index: number }
 
 /** `margin-top` that drops the top-anchored toolbar (and the "copied" pill under
@@ -68,6 +73,7 @@ const LIGHTBOX_COPY_FLASH_MS = 2500
  *  as `/api/file-raw?path=<abs>`, so prefer the basename of that path; for
  *  other URLs fall back to the pathname basename, then the alt text. */
 function lightboxFilename(image: LightboxImage): string {
+  if (image.filename) return image.filename
   try {
     const u = new URL(image.src, window.location.href)
     const p = u.searchParams.get('path')
@@ -109,18 +115,39 @@ function copyLightboxImage(image: LightboxImage): Promise<boolean> {
   return copyImageToClipboard(fetchLightboxBlob(image).then(imageBlobToPng))
 }
 
-/** Build the lightbox payload for an image click. The set is "all images
- *  inside the nearest [data-image-scope] ancestor"; for markdown messages
- *  that's a MarkdownRenderer instance (one per chat message), and for the
- *  chat-input thumbnail strip it's the strip's outer div. */
+function lightboxImageOf(el: HTMLImageElement): LightboxImage {
+  const filename = el.dataset.lightboxFilename
+  return filename ? { src: el.src, alt: el.alt, filename } : { src: el.src, alt: el.alt }
+}
+
+/** Build the lightbox payload for an image click.
+ *
+ *  An image marked `data-lightbox-turn` is message content: a reply's markdown
+ *  image or a `file_send` card's preview. Those two render as SEPARATE
+ *  transcript rows (the card is its own `file` row, outside the reply's
+ *  MarkdownRenderer), so their shared set is every such image inside the
+ *  nearest `[data-image-turn]` ancestor, which is the transcript's wrapper for
+ *  one display item (a whole turn, or one loose row).
+ *
+ *  Otherwise, and wherever no turn wrapper exists (a surface that renders a
+ *  bare MarkdownRenderer), the set is "all images inside the nearest
+ *  [data-image-scope] ancestor": a MarkdownRenderer instance, the chat-input
+ *  thumbnail strip, or a tool call's thumbnail strip. */
 export function dispatchLightbox(target: HTMLImageElement): void {
-  const scope = target.closest('[data-image-scope]') as HTMLElement | null
-  let detail: LightboxDetail = { images: [{ src: target.src, alt: target.alt }], index: 0 }
+  const turn = target.hasAttribute('data-lightbox-turn')
+    ? target.closest('[data-image-turn]') as HTMLElement | null
+    : null
+  const scope = turn ?? target.closest('[data-image-scope]') as HTMLElement | null
+  const selector = turn ? 'img[data-lightbox-image][data-lightbox-turn]' : 'img[data-lightbox-image]'
+  let detail: LightboxDetail = { images: [lightboxImageOf(target)], index: 0 }
   if (scope) {
-    const els = Array.from(scope.querySelectorAll<HTMLImageElement>('img[data-lightbox-image]'))
+    // A turn keeps its folded working steps mounted (inert, `data-collapsed`);
+    // their images are out of view, so they stay out of the set.
+    const els = Array.from(scope.querySelectorAll<HTMLImageElement>(selector))
+      .filter(el => el === target || !turn || !el.closest('[inert],[data-collapsed="true"]'))
     if (els.length > 0) {
       detail = {
-        images: els.map(el => ({ src: el.src, alt: el.alt })),
+        images: els.map(lightboxImageOf),
         index: Math.max(0, els.indexOf(target)),
       }
     }
@@ -133,6 +160,14 @@ export function dispatchLightbox(target: HTMLImageElement): void {
  *  (clamped at the ends). Accepts both the structured { images, index }
  *  payload and the legacy { src, alt } single-image shape. */
 export function Lightbox() {
+  // Behind a remote Crew the viewer is hidden with its Crew (components/overlayRoot)
+  // and its keys belong to the Crew in front; the image and zoom survive.
+  const crewHidden = useLocalCrewHidden()
+  const crewHiddenRef = useRef(crewHidden)
+  crewHiddenRef.current = crewHidden
+  // Read through the context so a viewer rendered without a store (isolated
+  // tests) still works; there is no Crew to switch then.
+  const store = useContext(ReactReduxContext)?.store
   const [state, setState] = useState<LightboxDetail | null>(null)
   // A fresh mirror of `state`, so handlers subscribed once per open — the global
   // keydown listener's download shortcut, and the paging gesture's read of the
@@ -492,6 +527,9 @@ export function Lightbox() {
     const handler = (e: Event) => {
       const detail = (e as CustomEvent).detail as Partial<LightboxDetail> & Partial<LightboxImage> | undefined
       if (!detail) { setState(null); return }
+      // An image opened from content that stays on screen across a switch (a
+      // Radix dialog) while this viewer is hidden: show the local Crew it opens in.
+      if (crewHiddenRef.current) store?.dispatch(setActiveId(null))
       if (Array.isArray(detail.images) && detail.images.length > 0) {
         const raw = Number.isInteger(detail.index) ? (detail.index as number) : 0
         const idx = Math.max(0, Math.min(raw, detail.images.length - 1))
@@ -502,7 +540,7 @@ export function Lightbox() {
     }
     window.addEventListener('lightbox', handler)
     return () => window.removeEventListener('lightbox', handler)
-  }, [])
+  }, [store])
   const isOpen = state !== null
   // Reset the zoom whenever the lightbox opens/closes or the shown image
   // changes, so each image starts fit-to-screen rather than inheriting the
@@ -532,7 +570,7 @@ export function Lightbox() {
   // off-screen. Runs post-layout, so offsetWidth already reflects the new box.
   useEffect(() => { setPan(p => (zoom <= LIGHTBOX_ZOOM_MIN ? { x: 0, y: 0 } : clampPan(p.x, p.y))) }, [zoom, clampPan, setPan])
   useEffect(() => {
-    if (!isOpen) return
+    if (!isOpen || crewHidden) return
     const onKey = (e: KeyboardEvent) => {
       // While the actions menu is open it owns Escape (close the menu) and the
       // arrows (move between items). This capture-phase listener runs first, so
@@ -543,6 +581,12 @@ export function Lightbox() {
       if (e.key === 'Escape') {
         if (menuOpen) return
         e.preventDefault()
+        // Consume the event so it reaches no bubble-phase host handler. A host
+        // that checks `defaultPrevented` (the Modal family) is already spared by
+        // preventDefault, but the artifact panel's Escape handler
+        // (ArtifactPanel/MarkdownPanel) does not — so without this the Escape
+        // that closes this viewer also closes the underlying artifact (#20630).
+        e.stopPropagation()
         setState(null)
       } else if (e.key === 'ArrowLeft') {
         if (menuOpen) return
@@ -588,7 +632,7 @@ export function Lightbox() {
     // modal open and Escape closes only the viewer.
     window.addEventListener('keydown', onKey, true)
     return () => window.removeEventListener('keydown', onKey, true)
-  }, [isOpen, zoomIn, zoomOut, setZoom, copyCurrentImage])
+  }, [isOpen, crewHidden, zoomIn, zoomOut, setZoom, copyCurrentImage])
   if (!state) return null
   const img = state.images[state.index]
   const zoomed = zoom > LIGHTBOX_ZOOM_MIN

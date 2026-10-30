@@ -81,6 +81,26 @@ const PAUSED_STATUS_KEY: Record<string, string> = {
 /** The three editable fields, as every write of the form sends them. */
 type LoopFields = { message: string; idle_secs: number; max_cycles: number }
 
+/** A save the store refused because the goal changed (or the gateway reloaded it)
+ *  since the form read its baseline: the 409 `goal_stale_baseline`. */
+class StaleGoalBaseline extends Error {}
+
+/** A refused first fire after Start loop (#23803), per slot. The created loop
+ *  re-keys the popover onto its id (`SessionAutomationPopover`), which REMOUNTS
+ *  it, and the websocket frame for the create can do that before the fire even
+ *  answers. So the refusal is published here, and the mounted instance for that
+ *  loop adopts it whenever it lands. It is dropped when that popover closes or
+ *  the notice is dismissed. */
+const startRefusals = new Map<string, { loopId: string, message: string }>()
+const startRefusalListeners = new Set<() => void>()
+function holdStartRefusal(slotKey: string, loopId: string, message: string) {
+  startRefusals.set(slotKey, { loopId, message })
+  startRefusalListeners.forEach(listener => listener())
+}
+function dropStartRefusal(slotKey: string, loopId: string | undefined) {
+  if (startRefusals.get(slotKey)?.loopId === loopId) startRefusals.delete(slotKey)
+}
+
 /** One armed script cron owned by this chat slot. */
 interface SlotWatch {
   id: string
@@ -107,7 +127,12 @@ export default function AutoNudgePopover({ slotKey, loop, open, onOpenChange, on
   /* Two-step on the clear only. The erase is irreversible and sits beside the
      primary CTA, so one press asks and the second performs. */
   const [confirmClear, setConfirmClear] = useState(false)
+  /** "Run first cycle now" on the create form (#23803). Unchecked by default:
+   *  Start loop then waits one interval, as before. */
+  const [runFirstNow, setRunFirstNow] = useState(false)
   const [error, setError] = useState('')
+  /** A refused first fire this instance adopted (see `startRefusals`). */
+  const adoptedRefusal = useRef('')
   // Watches armed on this slot, read through the SHARED `cron-jobs` query rather
   // than a private fetch. That key is invalidated by the websocket hook, so a
   // watch deleted or paused elsewhere disappears from an open popover instead of
@@ -170,6 +195,54 @@ export default function AutoNudgePopover({ slotKey, loop, open, onOpenChange, on
     loop ? { message: loop.message || defaultMsg(), idle_secs: loop.idle_secs || 60, max_cycles: loop.max_cycles || 0 } : null,
   )
 
+  /* The goal baseline: the `goal_token` of the stored goal the form's text
+     was seeded from, sent back as `expect_fingerprint` on a save that carries the
+     goal, so the store refuses (409) a save over a goal another writer saved
+     meanwhile. Read at open from the slot route rather than off `loop`: the
+     record here is often a websocket frame, which carries no token. A read that
+     finds the stored goal already different from the seeded text records ''
+     (a baseline that never matches), because the form then shows a goal that is
+     not the stored one and a save from it must be refused, not land. No token at
+     all (an older gateway, a failed read) leaves the save unfenced.
+     `baselineGen` drops a read that a newer read or a landed write overtook. */
+  const goalBaseline = useRef<{ loopId: string, token: string } | null>(null)
+  const baselineGen = useRef(0)
+
+  /** Read the stored goal's token for `loopId`. `expectedMessage` is the text the
+   *  form was seeded from; `null` adopts whatever is stored, which is what a 409
+   *  wants: the reader has been told, so their next save replaces it. */
+  function readGoalBaseline(loopId: string, expectedMessage: string | null): void {
+    const gen = ++baselineGen.current
+    goalBaseline.current = null
+    void (async () => {
+      try {
+        const resp = await fetch(`/api/autonudge/slot/${encodeURIComponent(slotKey)}`)
+        if (!resp?.ok) return
+        const data = await resp.json().catch(() => ({}))
+        const stored = data?.loop
+        if (gen !== baselineGen.current) return
+        if (!stored || stored.id !== loopId || typeof stored.goal_token !== 'string' || !stored.goal_token) return
+        goalBaseline.current = {
+          loopId,
+          token: expectedMessage === null || stored.message === expectedMessage ? stored.goal_token : '',
+        }
+      } catch {
+        // No baseline: the save goes out unfenced.
+      }
+    })()
+  }
+
+  /** A write landed: its answer names the goal the form now holds. Only a write
+   *  that carried the goal moves the baseline; adopting the token on a cadence-only
+   *  save would bless a goal another writer stored that the form never showed. */
+  function adoptBaseline(written: AutoNudgeLoop | null | undefined, fieldsSent: Partial<LoopFields> | null) {
+    if (!fieldsSent || !('message' in fieldsSent)) return
+    baselineGen.current++
+    goalBaseline.current = written?.id && typeof written.goal_token === 'string' && written.goal_token
+      ? { loopId: written.id, token: written.goal_token }
+      : null
+  }
+
   // Compute the draft to persist for the current field state, or null to drop
   // the slot: the blank / pristine-default case stores nothing so an emptied or
   // untouched popover never pins the template. (Only reached when no loop is
@@ -202,9 +275,9 @@ export default function AutoNudgePopover({ slotKey, loop, open, onOpenChange, on
   // One read seeds all three fields. Runs in an effect (not render) so the
   // render itself performs no storage read/write.
   useEffect(() => {
-    if (!open) return
+    if (!open) { dropStartRefusal(slotKey, loop?.id); adoptedRefusal.current = ''; return }
     hasEdited.current = false
-    setError('')
+    setError(adoptedRefusal.current)
     // A pending confirmation must not survive a close: reopening later would
     // put a primed erase under the next press.
     setConfirmClear(false)
@@ -215,7 +288,16 @@ export default function AutoNudgePopover({ slotKey, loop, open, onOpenChange, on
       setIdleInput(String(loop.idle_secs || 60))
       setMaxCyclesInput(String(loop.max_cycles || 0))
       seeded.current = { message: loop.message || defaultMsg(), idle_secs: loop.idle_secs || 60, max_cycles: loop.max_cycles || 0 }
+      // A popover that cannot write (crew/member mode) has nothing to fence.
+      if (writeDisabled) {
+        baselineGen.current++
+        goalBaseline.current = null
+      } else {
+        readGoalBaseline(loop.id, loop.message)
+      }
     } else {
+      baselineGen.current++
+      goalBaseline.current = null
       const remembered = loadGoalDraft(slotKey)
       setMessage(remembered ? remembered.message : defaultMsg())
       setIdleInput(String(remembered ? remembered.idleSecs : 60))
@@ -226,6 +308,24 @@ export default function AutoNudgePopover({ slotKey, loop, open, onOpenChange, on
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps -- open-edge seed only; loop/slotKey are read fresh each open
   }, [open])
+
+  // Adopt a refused first fire held for THIS loop, now or when it lands. Runs
+  // after the open-edge reset above, so a fresh mount ends on the refusal.
+  // Taken out of the store once adopted, and kept in a ref so StrictMode's
+  // second effect pass (the open-edge reset runs again) still shows it.
+  const loopId = loop?.id
+  useEffect(() => {
+    const adopt = () => {
+      const held = startRefusals.get(slotKey)
+      if (!held || held.loopId !== loopId) return
+      dropStartRefusal(slotKey, loopId)
+      adoptedRefusal.current = held.message
+      setError(held.message)
+    }
+    adopt()
+    startRefusalListeners.add(adopt)
+    return () => { startRefusalListeners.delete(adopt) }
+  }, [slotKey, loopId])
 
   // Flush a pending debounced edit synchronously when the popover closes OR
   // unmounts while open, so edits within the last DRAFT_SAVE_DEBOUNCE_MS
@@ -319,7 +419,15 @@ export default function AutoNudgePopover({ slotKey, loop, open, onOpenChange, on
         ? { method }
         : { method, headers: JSON_HEADERS, body: JSON.stringify(body) })
       const data = await resp.json().catch(() => ({}))
-      if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`)
+      if (!resp.ok) {
+        // Worded here, not by the server's English: this is the one refusal the
+        // reader is meant to act on in place, so it names the control that saves
+        // (whose name also says it nudges) in the reader's language.
+        if (resp.status === 409 && data.code === 'goal_stale_baseline') {
+          throw new StaleGoalBaseline(i18nT('components.autoNudgePopover.goal_stale_baseline', { action: playName }))
+        }
+        throw new Error(data.error || `HTTP ${resp.status}`)
+      }
       return data.loop
     },
     onSuccess: () => {
@@ -395,6 +503,7 @@ export default function AutoNudgePopover({ slotKey, loop, open, onOpenChange, on
    *  their baseline, since the record may hold another writer's value for them. */
   async function writeLoop(write: { url: string, method: 'PATCH' | 'POST', body: unknown }, fieldsSent: Partial<LoopFields> | null): Promise<AutoNudgeLoop> {
     const written = await loopWrite.mutateAsync(write)
+    adoptBaseline(written, fieldsSent)
     if (fieldsSent) adoptStored(written, fieldsSent)
     onChange(written)
     return written
@@ -441,25 +550,55 @@ export default function AutoNudgePopover({ slotKey, loop, open, onOpenChange, on
   function play() {
     if (!loop) return
     const fields = editedFields()
-    const body = loop.active ? fields : { ...fields, active: true }
+    const edits = loop.active ? fields : { ...fields, active: true }
     return runControl(async () => {
-      const written = body ? await writeLoop({ url: `/api/autonudge/${loop.id}`, method: 'PATCH', body }, fields) : null
+      let body: Record<string, unknown> | null = edits
+      // Not awaited: a press that beats the open read (or a read that never
+      // answers) saves unfenced rather than hanging.
+      const baseline = goalBaseline.current
+      if (body && 'message' in body && baseline && baseline.loopId === loop.id) {
+        body = { ...body, expect_fingerprint: baseline.token }
+      }
+      let written: AutoNudgeLoop | null = null
+      try {
+        written = body ? await writeLoop({ url: `/api/autonudge/${loop.id}`, method: 'PATCH', body }, fields) : null
+      } catch (e: unknown) {
+        // The text stays in the form. Re-read what is stored now, so the
+        // reader's next press replaces it, as the refusal tells them.
+        if (e instanceof StaleGoalBaseline) readGoalBaseline(loop.id, null)
+        throw e
+      }
       // A legacy stub without the record's id has nothing to fire on.
       await fireNow(written?.id ? written : loop)
     })
   }
 
-  /** Play with no loop: create and start it from the form, NO fire (product
-   *  owner, 2026-10-01): the first nudge goes out after `idle_secs`, or when
-   *  the user presses Play on the running loop. The write's hand-off re-keys
-   *  the popover onto the created id; a refused create lands in this notice. */
+  /** Play with no loop: create and start it from the form. By default NO fire
+   *  (product owner, 2026-10-01): the first nudge goes out after `idle_secs`,
+   *  or when the user presses Play on the running loop. With "Run first cycle
+   *  now" ticked (#23803) the created loop is then fired through the same
+   *  route Nudge now uses, so its refusals (a turn in flight) still apply.
+   *  The fire goes out BEFORE the hand-off, because the hand-off re-keys and
+   *  remounts the popover onto the created id: a refused create lands in this
+   *  notice, and a refused fire reaches the remounted one via `startRefusals`. */
   function startNow() {
     const fields = formFields()
     return runControl(async () => {
-      await writeLoop(
-        { url: '/api/autonudge', method: 'POST', body: { slot_key: slotKey, ...fields } },
-        fields,
-      )
+      const created = await loopWrite.mutateAsync({ url: '/api/autonudge', method: 'POST', body: { slot_key: slotKey, ...fields } })
+      let refusal = ''
+      if (runFirstNow && created?.id) {
+        try {
+          await loopWrite.mutateAsync({ url: `/api/autonudge/${created.id}/fire`, method: 'POST' })
+        } catch (e: unknown) {
+          refusal = e instanceof Error ? e.message : String(e)
+          holdStartRefusal(slotKey, created.id, refusal)
+        }
+      }
+      adoptBaseline(created, fields)
+      adoptStored(created, fields)
+      onChange(created)
+      if (refusal) throw new Error(refusal)
+      if (runFirstNow && created?.id) onFired(created)
     })
   }
 
@@ -573,7 +712,7 @@ export default function AutoNudgePopover({ slotKey, loop, open, onOpenChange, on
           className={`h-8 px-2 rounded-lg text-[12px] font-mono flex items-center gap-1 cursor-pointer transition-all bg-transparent border-none shrink-0 whitespace-nowrap ${
             loop?.active
               ? interrupted
-                ? 'text-warn hover:text-warn hover:bg-warn/10'
+                ? 'text-warn hover:text-warn-text hover:bg-warn/10'
                 : 'text-accent hover:text-accent hover:bg-accent/10 animate-pulse'
               : 'text-muted hover:text-text hover:bg-bg-hover'
           }`}
@@ -619,10 +758,10 @@ export default function AutoNudgePopover({ slotKey, loop, open, onOpenChange, on
             data-testid="auto-nudge-status"
             className={`mb-2 rounded-md border px-2 py-1.5 text-[11px] leading-relaxed ${
               runsNow && !waitingOnPerson
-                ? writeDisabled ? 'border-border bg-bg text-muted' : 'border-ok/30 bg-ok-subtle text-ok-fg'
+                ? writeDisabled ? 'border-border bg-bg text-muted' : 'border-ok/30 bg-ok-subtle text-ok-text'
                 : finished
-                  ? 'border-info/30 bg-info-subtle text-info'
-                  : 'border-warn/30 bg-warn-subtle text-warn-fg'
+                  ? 'border-info/30 bg-info-subtle text-info-text'
+                  : 'border-warn/30 bg-warn-subtle text-warn-text'
             }`}
           >
             {doneLine?.check && <Check size={12} className="lucide-inline mr-1" aria-hidden data-testid="auto-nudge-done-check" />}
@@ -655,7 +794,7 @@ export default function AutoNudgePopover({ slotKey, loop, open, onOpenChange, on
                 every reader now lands on, this sentence is the only cost cue
                 the surface carries, and dropping its colour weakened that cue
                 in the same change that made the surface the default. */}
-            <p role="note" className="mb-2 rounded-md border border-warn/30 bg-warn-subtle px-2 py-1.5 text-[11px] text-warn-fg">
+            <p role="note" className="mb-2 rounded-md border border-warn/30 bg-warn-subtle px-2 py-1.5 text-[11px] text-warn-text">
               {i18nT('components.sessionAutomationPopover.legacy_notice')}
             </p>
           </>
@@ -846,7 +985,7 @@ export default function AutoNudgePopover({ slotKey, loop, open, onOpenChange, on
           className="mb-2"
           testId="auto-nudge-error"
           message={error}
-          onDismiss={() => setError('')}
+          onDismiss={() => { adoptedRefusal.current = ''; setError('') }}
         />
 
         {/* THE ACTION ROW (product owner, 2026-10-01). While a loop exists it is
@@ -924,7 +1063,18 @@ export default function AutoNudgePopover({ slotKey, loop, open, onOpenChange, on
             </div>
           </div>
         ) : (
-          <div className="flex items-center justify-end gap-2" data-testid="auto-nudge-actions">
+          <div className="flex items-center justify-between gap-2" data-testid="auto-nudge-actions">
+            <label className="flex items-center gap-1.5 text-muted text-[11px] cursor-pointer">
+              <input
+                type="checkbox"
+                aria-label={i18nT('components.autoNudgePopover.run_first_cycle_now')}
+                data-testid="auto-nudge-run-first-now"
+                checked={runFirstNow}
+                disabled={saving || writeDisabled}
+                onChange={e => setRunFirstNow(e.target.checked)}
+              />
+              {i18nT('components.autoNudgePopover.run_first_cycle_now')}
+            </label>
             <div className="flex items-center gap-2" data-testid="auto-nudge-controls">
               <Btn
                 type="button"

@@ -25,6 +25,7 @@ from kiro_crew.mcp_gateway import gatewayd as gw
 from kiro_crew.mcp_gateway import transport
 from kiro_crew.mcp_gateway.backend import Backend, _PendingRequest
 from kiro_crew.mcp_gateway.pool import BackendPool, PoolKey
+from kiro_crew.testing.wait import finished
 
 pytestmark = pytest.mark.xdist_group("mcp_gateway")
 
@@ -86,7 +87,6 @@ class TestCancelInFlight:
     async def test_cancel_sends_notifications_for_in_flight_requests(self):
         """cancel_in_flight_for_stub sends MCP notifications/cancelled."""
         backend = _make_mock_backend()
-        # Simulate in-flight requests
         backend._pending_requests = {
             "gw-1-1": _PendingRequest(stub_uuid="stub-A", original_id=1, method="tools/call"),
             "gw-1-2": _PendingRequest(stub_uuid="stub-A", original_id=2, method="tools/call"),
@@ -104,7 +104,6 @@ class TestCancelInFlight:
         assert len(cancelled) == 2
         assert "gw-1-1" in cancelled
         assert "gw-1-2" in cancelled
-        # Verify the notification format
         assert all(w["method"] == "notifications/cancelled" for w in written)
         assert written[0]["params"]["requestId"] in ("gw-1-1", "gw-1-2")
 
@@ -564,12 +563,13 @@ class TestDetachOnCancelFailure:
         call = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
                 "params": {"name": "x"}}
 
-        await asyncio.wait_for(
+        await finished(
             gw._handle_connection(
                 _FakeReader([register, call]), _FakeWriter(), pool=_FakePool(),
                 resolver=object(), socket_path=Path("/tmp/leak.sock"),
                 hot_keys=None,
             ),
+            "the connection handler returning",
             timeout=5.0,
         )
 

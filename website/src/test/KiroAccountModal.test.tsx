@@ -6,8 +6,11 @@ import KiroAccountModal, { type KiroAccountUsage } from '../components/KiroAccou
 import { api } from '../api/client'
 import type { KiroCreditUsage } from '../api/client'
 import type { KiroUsageState } from '../api/kiroUsage'
+import { parseKiroUsagePayload } from '../api/kiroUsage'
+import { providerLabelFromWire } from '../components/kasProviderLabel'
 import { installSoftNavigate, __resetNavSeamForTests } from '../utils/errorReport'
 import { renderWithProviders } from './helpers'
+import { i18nT } from '../i18n/t'
 
 const { KIRO_USAGE_EMPTY } = vi.hoisted(() => ({
   KIRO_USAGE_EMPTY: {
@@ -105,6 +108,14 @@ describe('KiroAccountModal', () => {
     expect(manage).toHaveAttribute('href', 'https://app.kiro.dev/settings/account')
     expect(manage).toHaveAttribute('target', '_blank')
     expect(manage).toHaveAttribute('rel', 'noopener noreferrer')
+  })
+
+  it('names the subscription on the link to the Kiro plan page (#23812)', () => {
+    // Someone looking to cancel or change a plan scans for "subscription"; the
+    // link is the only way from Kiro Crew to that page, so it must say so.
+    renderWithProviders(<KiroAccountModal open onClose={vi.fn()} usage={BASE_USAGE} />)
+    const manage = screen.getByRole('link', { name: 'Manage account & subscription' })
+    expect(manage).toHaveAttribute('href', 'https://app.kiro.dev/settings/account')
   })
 
   describe('run-out forecast', () => {
@@ -234,7 +245,7 @@ describe('KiroAccountModal', () => {
       <KiroAccountModal
         open
         onClose={vi.fn()}
-        usage={{ ...BASE_USAGE, email: undefined, account: undefined }}
+        usage={{ ...BASE_USAGE, email: undefined, account: undefined, accountType: undefined }}
       />,
     )
 
@@ -276,6 +287,108 @@ describe('KiroAccountModal', () => {
     )
 
     expect(await screen.findByText('Signed in with Social login')).toBeInTheDocument()
+  })
+
+  // An external identity provider sign-in: whoami answers
+  // {"accountType":"ExternalIdP","email":""}, so the published reading carries
+  // an account type and no name. The pill renders, and the unavailable notice
+  // does not replace it.
+  it('shows the provider of an account that reports a type and no name', async () => {
+    const usage = parseKiroUsagePayload({
+      usage: {
+        credits_used: 2480.1,
+        credits_plan: 10000,
+        credits_overage: 0,
+        source: 'text',
+        account_type: 'ExternalIdP',
+      },
+    })
+    renderWithProviders(<KiroAccountModal open onClose={vi.fn()} usage={usage} />)
+
+    expect(await screen.findByText('Signed in with Company SSO')).toBeInTheDocument()
+    expect(screen.queryByText('Account details unavailable')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Show email' })).not.toBeInTheDocument()
+    expect(screen.getByText(/Remaining credit balance/)).toBeInTheDocument()
+  })
+
+  // One name for one provider: the modal labels an external identity provider
+  // with the sign-in flow's own mapping, whatever spelling whoami used.
+  it.each(['ExternalIdP', 'ExternalIdp', 'External-IdP'])(
+    'labels %s with the sign-in flow provider name',
+    async (accountType) => {
+      const usage = parseKiroUsagePayload({
+        usage: { available: false, reason: 'account_unproven', account_type: accountType },
+      })
+      renderWithProviders(<KiroAccountModal open onClose={vi.fn()} usage={usage} />)
+
+      expect(
+        await screen.findByText(`Signed in with ${providerLabelFromWire('ExternalIdp')}`),
+      ).toBeInTheDocument()
+    },
+  )
+
+  // The notice names the provider through the badge's own mapping, so the two
+  // can never disagree: a state that ever carries another type names that type
+  // in both places, not "Company SSO" under a different badge.
+  it('names the same provider in the notice as in the badge', async () => {
+    const usage = parseKiroUsagePayload({
+      usage: { available: false, reason: 'account_unproven', account_type: 'IamIdentityCenter' },
+    })
+    renderWithProviders(<KiroAccountModal open onClose={vi.fn()} usage={usage} />)
+
+    const provider = i18nT('app.iam_identity_center')
+    expect(await screen.findByText(`Signed in with ${provider}`)).toBeInTheDocument()
+    expect(
+      screen.getByText(i18nT('components.kiroAccountModal.credit_usage_sign_in_type', { provider })),
+    ).toBeInTheDocument()
+  })
+
+  // The gateway cannot tie a reading to this sign-in (nothing names the user,
+  // only the provider): it reports who is signed in and no balance. That holds
+  // until the sign-in changes, so the modal says so from the first view and
+  // offers no Refresh, which would only answer the same.
+  it('shows the account and the sign-in-type notice with no Refresh', async () => {
+    const usage = parseKiroUsagePayload({
+      usage: { available: false, reason: 'account_unproven', account_type: 'ExternalIdP' },
+    })
+    // The state carries the account type and nothing else: the gateway
+    // publishes it only when no field names the user.
+    expect(usage).toEqual({ accountOnly: true, accountType: 'ExternalIdP' })
+    renderWithProviders(<KiroAccountModal open onClose={vi.fn()} usage={usage} />)
+
+    expect(await screen.findByText('Signed in with Company SSO')).toBeInTheDocument()
+    expect(screen.queryByText('Account details unavailable')).not.toBeInTheDocument()
+    const notice = i18nT('components.kiroAccountModal.credit_usage_sign_in_type', { provider: 'Company SSO' })
+    expect(screen.getByText(notice)).toBeInTheDocument()
+    // The notice names the provider the badge shows and the one cause the
+    // gateway can prove: kiro-cli reports no user for this sign-in. It promises
+    // nothing about what a fresh sign-in or the account page would show; the
+    // Manage account link still stands below it.
+    expect(notice).toContain('this Company SSO sign-in')
+    expect(notice).toContain('kiro-cli doesn’t report which user is signed in')
+    expect(notice).not.toContain('signing in again')
+    expect(notice).not.toContain(i18nT('app.manage_account'))
+    expect(screen.getByRole('link', { name: new RegExp(i18nT('app.manage_account')) })).toBeInTheDocument()
+    expect(screen.queryByText('Could not read your balance.')).not.toBeInTheDocument()
+    expect(screen.queryByText('No balance reading is available for this account yet.')).not.toBeInTheDocument()
+    expect(screen.queryByText(/Remaining credit balance/)).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /Refresh/ })).not.toBeInTheDocument()
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  })
+
+  // The gateway always sends the type for this state. A state that arrives
+  // without one still names a provider in the notice, so the sentence never
+  // reads "this  sign-in".
+  it('names Company SSO in the notice when the state carries no type', async () => {
+    const usage = parseKiroUsagePayload({ usage: { available: false, reason: 'account_unproven' } })
+    expect(usage).toEqual({ accountOnly: true, accountType: undefined })
+    renderWithProviders(<KiroAccountModal open onClose={vi.fn()} usage={usage} />)
+
+    const notice = i18nT('components.kiroAccountModal.credit_usage_sign_in_type', {
+      provider: providerLabelFromWire('externalidp'),
+    })
+    expect(notice).toContain('this Company SSO sign-in')
+    expect(await screen.findByText(notice)).toBeInTheDocument()
   })
 
   it('renders independent identity and usage failure states', async () => {
@@ -322,20 +435,6 @@ describe('KiroAccountModal', () => {
     expect(screen.queryByText('Account details unavailable')).not.toBeInTheDocument()
   })
 
-  it('explains API-key auth instead of spinning or claiming a generic failure', async () => {
-    // 'api-key' is terminal by construction: the usage API needs an SSO/OIDC
-    // token that auth type never has (#5728). The panel must say so — not spin,
-    // and not show the generic unavailable line that reads as a transient error.
-    renderWithProviders(<KiroAccountModal open onClose={vi.fn()} usage="api-key" />)
-
-    expect(
-      await screen.findByText('Credit usage isn’t available for API key authentication'),
-    ).toBeInTheDocument()
-    expect(screen.queryByText('Could not read your balance.')).not.toBeInTheDocument()
-    expect(screen.queryByText('Checking account…')).not.toBeInTheDocument()
-    expect(screen.queryByLabelText('Checking credit usage')).not.toBeInTheDocument()
-  })
-
   it('tells the user to sign in again and offers no Refresh for it', async () => {
     // 'signin-required' is terminal until the user re-authenticates. The /usage
     // read needs the same sign-in, so a Refresh here could only fail again.
@@ -369,21 +468,16 @@ describe('KiroAccountModal', () => {
   })
 
   it('leaves the hand-off off the state that reports a configuration, not a failure', async () => {
-    // 'api-key' describes how the account is set up; there is no error for the
-    // agent to act on, so it keeps the passive notice. This pins the split — a
-    // blanket migration would put a recovery button next to a line that needs
-    // no recovery.
-    for (const usage of ['api-key'] as const) {
-      const { unmount } = renderWithProviders(
-        <KiroAccountModal open onClose={vi.fn()} usage={usage} />,
-      )
+    // An account-only sign-in (a provider named, no user) describes how the
+    // account is set up; there is no error for the agent to act on, so it keeps
+    // the passive notice. This pins the split — a blanket migration would put a
+    // recovery button next to a line that needs no recovery.
+    const usage = { accountOnly: true, accountType: 'ExternalIdP' } as const
+    renderWithProviders(<KiroAccountModal open onClose={vi.fn()} usage={usage} />)
 
-      expect(
-        screen.queryByRole('button', { name: /Ask the agent/i }),
-      ).not.toBeInTheDocument()
-
-      unmount()
-    }
+    expect(
+      screen.queryByRole('button', { name: /Ask the agent/i }),
+    ).not.toBeInTheDocument()
   })
 
   it('calls onClose from the accessible close control', async () => {
@@ -440,6 +534,19 @@ describe('KiroAccountModal refresh', () => {
     refreshMock.mockReset()
   })
 
+  // A refresh out of a failed read that comes back account_unproven adds no
+  // outcome notice of its own: the state it lands in carries its notice.
+  it('adds no outcome notice when a refresh returns account_unproven', async () => {
+    const payload = { available: false, reason: 'account_unproven', account_type: 'ExternalIdP' }
+    refreshMock.mockResolvedValue({ usage: payload })
+    renderWithProviders(<KiroAccountModal open onClose={vi.fn()} usage="failed" />)
+    const dialog = await screen.findByRole('dialog', { name: 'Kiro Account' })
+    fireEvent.click(within(dialog).getByRole('button', REFRESH))
+    await waitFor(() => expect(refreshMock).toHaveBeenCalledTimes(1))
+    expect(await within(dialog).findByRole('button', REFRESH)).toBeEnabled()
+    expect(within(dialog).getAllByRole('alert')).toHaveLength(1)
+  })
+
   it('reports an unreadable gateway config through ErrorNotice and retries the config read', async () => {
     // The top bar could not learn which harness runs, so nothing about the
     // balance is established. The failure takes the shared error surface with
@@ -487,9 +594,9 @@ describe('KiroAccountModal refresh', () => {
       expect(screen.getByRole('button', REFRESH)).toBeEnabled()
       unmount()
     }
-    // API-key auth has no credit readout to refresh; an expired sign-in would
-    // fail again; a loading cache has nothing to refresh yet.
-    for (const usage of ['api-key', 'signin-required', null] as const) {
+    // An expired sign-in would fail again; a loading cache has nothing to
+    // refresh yet.
+    for (const usage of ['signin-required', null] as const) {
       const { unmount } = renderWithProviders(<KiroAccountModal open onClose={vi.fn()} usage={usage} />)
       expect(screen.queryByRole('button', REFRESH)).not.toBeInTheDocument()
       unmount()
@@ -524,6 +631,41 @@ describe('KiroAccountModal refresh', () => {
 
     settle({ usage: { credits_plan: 1000, credits_used: 41 } })
     await screen.findByRole('progressbar', { name: 'Kiro credit usage' })
+  })
+
+  // #23655: the label swap used to resize the button while `transition-all`
+  // animated it, which left a second, stale button painted over it on mobile
+  // WebKit. Both labels now always occupy the button, so its width never
+  // depends on the state, and only colors transition.
+  it('keeps one button the same size while it flips to refreshing and back (#23655)', async () => {
+    let settle: (v: { usage: Record<string, unknown> }) => void = () => {}
+    refreshMock.mockImplementation(() => new Promise(resolve => { settle = resolve }))
+    renderWithProviders(<QueryFedModal initial={{ ...BASE_USAGE }} />)
+    const dialog = await screen.findByRole('dialog', { name: 'Kiro Account' })
+    const labels = [i18nT('components.kiroAccountModal.refresh_balance'), i18nT('components.kiroAccountModal.refreshing_balance')]
+    // Every label the button can show sits in it, and only the shown one is
+    // visible and named.
+    const expectSized = (button: HTMLElement, shown: string) => {
+      expect(button.className).not.toMatch(/\btransition-all\b/)
+      expect(button.className).toMatch(/\btransition-colors\b/)
+      for (const text of labels) {
+        const span = within(button).getByText(text)
+        const hidden = text !== shown
+        expect(span.classList.contains('invisible')).toBe(hidden)
+        expect(span.getAttribute('aria-hidden') === 'true').toBe(hidden)
+      }
+    }
+
+    const idle = within(dialog).getByRole('button', REFRESH)
+    expectSized(idle, labels[0])
+    fireEvent.click(idle)
+    const pending = await within(dialog).findByRole('button', REFRESHING)
+    expect(pending).toBe(idle)
+    expectSized(pending, labels[1])
+
+    settle({ usage: { credits_plan: 1000, credits_used: 41 } })
+    const settled = await within(dialog).findByRole('button', REFRESH)
+    expectSized(settled, labels[0])
   })
 
   it('renders the meter from the refreshed payload and keeps Refresh beside it', async () => {

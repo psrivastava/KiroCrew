@@ -81,11 +81,12 @@ class KiroHarness(MembershipHarness):
         # search, and importing it at module scope would make this package part
         # of that module's import cycle.
         from kiro_crew.acp.client import _resolve_kiro_bin_for_spawn, kiro_cli_not_found_message
+        from kiro_crew.acp.kiro_cli_missing import AcpKiroCliMissing
         from kiro_crew.acp.session_handle import AcpRuntimeError
 
         kiro_bin = await _resolve_kiro_bin_for_spawn(environ=dict(ctx.environ), home=ctx.home)
         if not kiro_bin:
-            raise AcpRuntimeError(
+            raise AcpKiroCliMissing(
                 await asyncio.to_thread(
                     kiro_cli_not_found_message, environ=dict(ctx.environ), home=ctx.home
                 )
@@ -111,6 +112,15 @@ class KiroHarness(MembershipHarness):
         try:
             await asyncio.to_thread(agent_mod.require_fork_governance, ctx.agent, ctx.work_dir)
         except ForkGovernanceUnresolved as exc:
+            raise AcpRuntimeError(str(exc)) from exc
+        # kiro-cli honours the spec file's own grants before Crew's gate, and Crew
+        # never rewrites a crew-bound spec it does not own, so a start on one the
+        # ceiling would narrow is refused.
+        try:
+            await asyncio.to_thread(
+                agent_mod.require_shared_template_within_ceiling, ctx.agent, ACP_BACKEND_KIRO
+            )
+        except agent_mod.SharedTemplateOverCeiling as exc:
             raise AcpRuntimeError(str(exc)) from exc
         # kiro-cli resolves ``--agent`` against ``ctx.work_dir`` first, so a checkout
         # that declares a managed agent name would run its own copy in place of the

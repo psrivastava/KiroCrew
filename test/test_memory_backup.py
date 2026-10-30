@@ -35,6 +35,7 @@ import pytest
 from conftest import make_dir_link
 from kiro_crew import memory_backup as mb
 from kiro_crew.memory_stores import DEFAULT_MEMORY_STORE, resolve_store_path
+from kiro_crew.testing.wait import wait_until
 from kiro_crew.vector_memory import VectorMemoryStore
 
 pytestmark = pytest.mark.xdist_group("memory_backup")
@@ -124,8 +125,10 @@ def seeded_memory_db(tmp_path_factory: pytest.TempPathFactory) -> Path:
             store.close()
         db_file = resolve_store_path(DEFAULT_MEMORY_STORE)
     # Closing the last handle checkpointed the WAL, so the one file IS the database.
-    # A sidecar left behind would mean the copy below silently drops rows.
-    assert not Path(f"{db_file}-wal").exists()
+    # A -wal with content left behind would mean the copy below silently drops rows;
+    # the store keeps an emptied -wal on close (sqlite_wal.keep_wal_on_close).
+    wal = Path(f"{db_file}-wal")
+    assert not wal.exists() or wal.stat().st_size == 0
     assert _rows(db_file) == _SEED_ROWS
     return db_file
 
@@ -311,7 +314,9 @@ class TestABackupIsConsistentUnderALiveWriter:
                     "project.between_backups", "committed", 1.0, "user_explicit"
                 )
                 second_result = executor.submit(mb.backup_store, src, now=stamp)
-                first, second = first_result.result(timeout=10), second_result.result(timeout=10)
+                wait_until(first_result.done)
+                wait_until(second_result.done)
+                first, second = first_result.result(), second_result.result()
 
         assert first is not None and second is not None and first != second
         assert {_rows(first), _rows(second)} == {20, 21}
@@ -360,10 +365,12 @@ class TestABackupIsConsistentUnderALiveWriter:
                 try:
                     assert second_ready.wait(timeout=10)
                     with pytest.raises(mb.MemoryBackupFailed, match="first backup interrupted"):
-                        failed.result(timeout=10)
+                        wait_until(failed.done)
+                        failed.result()
                 finally:
                     let_second_finish.set()
-                backup = surviving.result(timeout=10)
+                wait_until(surviving.done)
+                backup = surviving.result()
 
         assert backup is not None and backup.exists()
         assert len(stages) == 2 and stages[0] != stages[1]
@@ -1129,7 +1136,12 @@ class TestRestoreIsNonDestructive:
 
         mb.restore_from_backup(backup, DEFAULT_MEMORY_STORE)
         mb.apply_pending_member_restores()
-        aside = list(src.parent.glob("memory.db.superseded.*"))
+        # The closed store's emptied -wal and its -shm go aside with the file they belong to.
+        aside = [
+            p
+            for p in src.parent.glob("memory.db.superseded.*")
+            if not p.name.endswith(("-wal", "-shm"))
+        ]
         assert len(aside) == 1
         assert aside[0].read_bytes() == b"this is not a sqlite database"
 

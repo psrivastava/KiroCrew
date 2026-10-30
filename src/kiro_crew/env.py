@@ -12,9 +12,11 @@ import shutil
 import stat
 import subprocess
 import sys
+import sysconfig
 import threading
 from collections.abc import Iterable, Mapping, MutableMapping
 from pathlib import Path
+from typing import Any
 
 from kiro_crew import platform_compat
 from kiro_crew.config.paths import data_home, peek_data_home
@@ -47,6 +49,10 @@ _EXTRA_PATH_DIRS = (
     "{home}/.volta/bin",
     "/opt/homebrew/bin",  # Apple Silicon Homebrew node / global npm bins
     "/usr/local/bin",  # Intel Homebrew + pkg-installer symlink dir
+    # n's node dir is also its ``npm i -g`` bin, so a global adapter lands here.
+    # Last, so a ``node`` the Homebrew dirs above already resolve keeps winning.
+    "{home}/n/bin",
+    "{home}/.n/bin",
 )
 
 
@@ -150,12 +156,23 @@ def _warn_rejected_bin_dir(raw: object, source: str) -> None:
 def _validated_bin_dirs(values: object, source: str) -> list[str]:
     """Validate an operator-supplied LIST of bin directories, dropping bad ones.
 
-    ``~`` is expanded first (a config file is where a human writes
-    ``~/.pixi/bin``), then each entry passes the same
-    :func:`_validated_bin_dir` gate as this module's own well-known dirs — one
-    absolute directory, no path separator, no NUL. A rejected entry is dropped
-    rather than failing the whole list: one typo must not cost an operator every
-    other directory they declared, nor abort PATH construction for every spawn.
+    ``~`` is expanded first (:func:`os.path.expanduser`, so ``~/.pixi/bin`` and a
+    ``~otheruser/bin`` both resolve the way an operator expects), then each entry
+    passes the same :func:`_validated_bin_dir` gate as this module's own
+    well-known dirs — one absolute directory, no path separator, no NUL. A
+    rejected entry is dropped rather than failing the whole list: one typo must
+    not cost an operator every other directory they declared, nor abort PATH
+    construction for every spawn.
+
+    A ``~otheruser`` prefix makes :func:`os.path.expanduser` call
+    ``pwd.getpwnam`` (POSIX) / the SAM database (Windows) SYNCHRONOUSLY, which on
+    an LDAP/SSSD/AD-backed host can block for as long as the directory service
+    takes to answer. That is tolerable on the paths that reach this at startup or
+    off the event loop, but NOT on the gateway's live ``.env`` PATH hot-reload,
+    which runs on the loop -- so that one caller expands and validates its
+    additions OFF the loop first (see :func:`extend_process_path` and
+    ``config.live.ConfigWatch._cycle``), and nothing on the loop reaches this
+    with an unexpanded ``~otheruser`` entry.
 
     *values* is typed ``object`` because both sources are hand-editable and can
     legally parse as something other than a list of strings.
@@ -236,8 +253,71 @@ def _extra_mcp_path_dirs() -> list[str]:
     ]
 
 
+def prepare_env_path_additions(value: str) -> tuple[str, ...]:
+    """Expand and validate a ``.env`` ``PATH`` line into absolute dirs to ADD.
+
+    The part of :func:`extend_process_path` that does NOT touch ``os.environ``,
+    split out so a caller on the event loop can run it OFF the loop. Each entry
+    goes through the absolute-directory gate the other operator lists use
+    (:func:`_validated_bin_dirs`, so ``~``/``~otheruser`` expands via
+    :func:`os.path.expanduser` and a relative or unexpanded entry such as
+    ``$HOME/bin`` is dropped with a warning), then is deduped in declared order.
+
+    This is where the only call that can BLOCK lives: a ``~otheruser`` entry
+    makes ``os.path.expanduser`` call ``pwd.getpwnam`` / the SAM database
+    synchronously, which an LDAP/SSSD/AD lookup can stall. The gateway's live
+    ``.env`` hot-reload (``config.live.ConfigWatch._cycle``) therefore calls THIS
+    off the loop and hands the result to :func:`extend_process_path`, so the only
+    work left on the loop is the ``os.environ`` mutation. Pure: no ``os.environ``
+    write, so it is safe to run in a worker thread.
+    """
+    wanted = [entry for entry in value.split(os.pathsep) if entry.strip()]
+    return tuple(_dedup_dirs(_validated_bin_dirs(wanted, ".env PATH")))
+
+
+def extend_process_path(value: str, *, prepared: tuple[str, ...] | None = None) -> None:
+    """Append the directories of a data-home ``.env`` ``PATH`` line to this process's ``PATH``.
+
+    The ``.env`` loader seeds the environment with ``setdefault``, and a process
+    always has a ``PATH``, so this key cannot be applied the way every other one
+    is. The line is read as directories to ADD, never as a replacement: each
+    entry goes through :func:`prepare_env_path_additions` (``~``/``~otheruser``
+    expands, a relative or unexpanded entry such as ``$HOME/bin`` is dropped with
+    a warning), and lands behind the ``PATH`` the process already has, so it can
+    add a launcher but never shadow a system tool. The existing string is kept
+    byte for byte and an entry it already holds is skipped, so the repeated loads
+    of the file do not grow it.
+
+    *prepared* lets a caller that already ran :func:`prepare_env_path_additions`
+    OFF the event loop pass its result in, so the expand/validate step -- the one
+    that can block on a ``~otheruser`` directory-service lookup -- is not repeated
+    on the loop; only the ``os.environ`` mutation here runs on it. When omitted,
+    the expansion runs inline, which is what the boot and off-loop dashboard
+    callers want. A *prepared* value must be the result of
+    :func:`prepare_env_path_additions` over this same *value*.
+
+    Nothing else about the environment widens. An agent child still receives its
+    environment through the launch tail's scrub, and the terminal completion
+    probe still filters this ``PATH`` through its ownership check.
+    """
+    additions = prepare_env_path_additions(value) if prepared is None else prepared
+    current = os.environ.get("PATH") or os.defpath
+    held = _dedup_dirs(current.split(os.pathsep))
+    merged = _dedup_dirs([*held, *additions])
+    if len(merged) > len(held):
+        os.environ["PATH"] = os.pathsep.join([current, *merged[len(held) :]])
+
+
 # --- node build toolchain -----------------------------------------------------
-#
+
+# nvm's roots, both layouts: ``~/.nvm``, then the XDG root its installer picks
+# when ``XDG_CONFIG_HOME`` is set (:func:`_xdg_config_dir`). ``~/.nvm`` comes
+# first, so a host holding both roots searches it first. The one list every nvm
+# lookup derives from: the version globs below, :func:`nvm_dirs` (the root that
+# holds ``nvm.sh``) and :func:`nvm_version_bin_dirs`.
+_NVM_ROOTS = ("{home}/.nvm", "{xdg_config}/nvm")
+_NVM_VERSION_GLOBS = tuple(f"{root}/versions/node/*/bin" for root in _NVM_ROOTS)
+
 # Directories a Node VERSION MANAGER installs a real ``node``/``npm`` into.
 # Deliberately NARROW and separate from ``_EXTRA_PATH_DIRS``: that list is a
 # broad "where might an MCP binary live" search path (it includes
@@ -253,8 +333,8 @@ _NODE_MANAGER_GLOBS = (
     "{mise_data}/installs/node/*/bin",
     # asdf's nodejs plugin.
     "{home}/.asdf/installs/nodejs/*/bin",
-    # nvm.
-    "{home}/.nvm/versions/node/*/bin",
+    # nvm, both roots, in :data:`_NVM_ROOTS` order.
+    *_NVM_VERSION_GLOBS,
     # fnm, both layouts: XDG default and legacy ``~/.fnm``.
     "{home}/.local/share/fnm/node-versions/*/installation/bin",
     "{home}/.fnm/node-versions/*/installation/bin",
@@ -272,7 +352,7 @@ _NODE_MANAGER_GLOBS = (
     "{home}/.fnm/node-versions/*/bin",
 )
 # Shim / single-dir managers, which have no per-version path to glob.
-# Two of these (mise shims, volta) also appear in ``_EXTRA_PATH_DIRS`` above.
+# Every one of these also appears in ``_EXTRA_PATH_DIRS`` above.
 # The repetition is deliberate, not an oversight: that list is the broad
 # MCP-binary search path and this one is the narrow build toolchain, and entries
 # here are additionally gated on actually containing an executable ``node``. If
@@ -321,6 +401,50 @@ def mise_data_dir(home: str) -> str:
     return os.path.join(base, "mise")
 
 
+def _xdg_config_dir(home: str) -> str:
+    """The XDG config dir: ``XDG_CONFIG_HOME`` when absolute, else ``~/.config``.
+
+    A relative value is ignored, as the XDG Base Directory spec requires: taken
+    as given it would glob against the gateway's cwd and could put a
+    cwd-relative entry on a spawned subprocess's PATH.
+    """
+    xdg = os.environ.get("XDG_CONFIG_HOME", "")
+    return xdg if os.path.isabs(xdg) else os.path.join(home, ".config")
+
+
+def nvm_dirs() -> tuple[str, ...]:
+    """nvm's candidate root dirs (:data:`_NVM_ROOTS`), ``~/.nvm`` first.
+
+    For a caller that needs nvm's ROOT rather than a version's ``bin`` -- the
+    app backend sources ``<root>/nvm.sh`` when ``NVM_DIR`` is unset. Neither dir
+    is checked for existence: the caller probes for the file it needs.
+    """
+    home = os.path.expanduser("~")
+    xdg_config = _xdg_config_dir(home)
+    return tuple(
+        os.path.normpath(root.format(home=home, xdg_config=xdg_config)) for root in _NVM_ROOTS
+    )
+
+
+def nvm_version_bin_dirs() -> tuple[str, ...]:
+    """Every existing nvm version ``bin`` dir, across both roots.
+
+    The same scan :func:`node_all_bin_dirs` runs for nvm: root order
+    (:data:`_NVM_ROOTS`), then newest version first within each root. For a
+    builtin app that keeps its own Node search list and needs nvm's share of it.
+    """
+    home = os.path.expanduser("~")
+    return tuple(
+        _manager_version_bin_dirs(
+            home,
+            "",  # nvm's globs never reference {mise_data}
+            _xdg_config_dir(home),
+            all_versions=True,
+            patterns=_NVM_VERSION_GLOBS,
+        )
+    )
+
+
 def _has_node(d: Path) -> bool:
     """True when *d* holds an executable ``node``.
 
@@ -348,8 +472,18 @@ def _node_version_key(name: str) -> tuple[int, tuple[int, ...], str]:
     return (0, (), name)
 
 
-def _manager_version_bin_dirs(home: str, mise_data: str, *, all_versions: bool) -> list[str]:
+def _manager_version_bin_dirs(
+    home: str,
+    mise_data: str,
+    xdg_config: str,
+    *,
+    all_versions: bool,
+    patterns: tuple[str, ...] = _NODE_MANAGER_GLOBS,
+) -> list[str]:
     """Scan the per-version manager roots (:data:`_NODE_MANAGER_GLOBS`).
+
+    *patterns* narrows the scan to a subset of those globs
+    (:func:`nvm_version_bin_dirs` passes nvm's), with the same ordering.
 
     The two callers need DIFFERENT policies, chosen deliberately:
 
@@ -368,8 +502,10 @@ def _manager_version_bin_dirs(home: str, mise_data: str, *, all_versions: bool) 
     (:func:`_node_version_key`: numeric versions outrank alias names).
     """
     out: list[str] = []
-    for pattern in _NODE_MANAGER_GLOBS:
-        root, _, leaf = pattern.format(home=home, mise_data=mise_data).partition("/*")
+    for pattern in patterns:
+        root, _, leaf = pattern.format(
+            home=home, mise_data=mise_data, xdg_config=xdg_config
+        ).partition("/*")
         keep = Path.is_dir if all_versions else _has_node
         try:
             matches = sorted(
@@ -422,7 +558,8 @@ def node_bin_dirs() -> tuple[str, ...]:
        after installing/locating node. Preferred over a bare filesystem scan
        because it names the version that script decided on.
     3. The highest version found under each per-version manager root
-       (mise / asdf / nvm / fnm).
+       (mise / asdf / nvm / fnm; nvm under both ``~/.nvm`` and the XDG config
+       dir).
     4. Shim dirs (mise shims, volta, n).
     5. Standalone Node trees -- the glibc-2.17 build ``ensure-node.sh`` unpacks
        into the data home (:data:`_NODE_TREE_DATA_HOME_DIRS`), then a
@@ -461,7 +598,9 @@ def node_bin_dirs() -> tuple[str, ...]:
     if marker:
         ordered.append(marker)
 
-    ordered.extend(_manager_version_bin_dirs(home, mise_data, all_versions=False))
+    ordered.extend(
+        _manager_version_bin_dirs(home, mise_data, _xdg_config_dir(home), all_versions=False)
+    )
 
     ordered.extend(d.format(home=home, mise_data=mise_data) for d in _NODE_MANAGER_DIRS)
     # Under a KIROCREW_HOME override data_home() mkdirs, so it can raise on an
@@ -522,18 +661,19 @@ def _homebrew_keg_node_bin_dirs() -> list[str]:
 
 
 @functools.lru_cache(maxsize=1)
-def _node_all_bin_dirs(home: str, mise_data: str) -> tuple[str, ...]:
+def _node_all_bin_dirs(home: str, mise_data: str, xdg_config: str) -> tuple[str, ...]:
     """Cached body of :func:`node_all_bin_dirs`, keyed on its inputs.
 
-    Keyed on ``(home, mise_data)`` — matching the retired helper's ``home``
-    keying — so a caller under a different HOME (tests patching
-    ``expanduser``) gets a fresh scan instead of the previous key's dirs,
-    while the steady-state gateway still globs exactly once.
+    Keyed on every root the globs format (``home``, ``mise_data``,
+    ``xdg_config``) — matching the retired helper's ``home`` keying — so a
+    caller under a different HOME or config dir (tests patching ``expanduser``
+    or ``XDG_CONFIG_HOME``) gets a fresh scan instead of the previous key's
+    dirs, while the steady-state gateway still globs exactly once.
     """
     out: list[str] = []
     seen: set[str] = set()
     for d in (
-        *_manager_version_bin_dirs(home, mise_data, all_versions=True),
+        *_manager_version_bin_dirs(home, mise_data, xdg_config, all_versions=True),
         *_homebrew_keg_node_bin_dirs(),
     ):
         d = os.path.normpath(d)
@@ -575,7 +715,7 @@ def node_all_bin_dirs() -> tuple[str, ...]:
     ever needs re-discovery without one.
     """
     home = os.path.expanduser("~")
-    return _node_all_bin_dirs(home, mise_data_dir(home))
+    return _node_all_bin_dirs(home, mise_data_dir(home), _xdg_config_dir(home))
 
 
 def node_augmented_path(base_path: str = "") -> str:
@@ -777,6 +917,23 @@ def _managed_browser_cli_dirs() -> list[str]:
     return [value for entry in entries if (value := _validated_bin_dir(str(entry)))]
 
 
+def _windows_toolbox_bin_dir(resolved_home: str, pinned_home: str | None) -> str | None:
+    """Builder Toolbox's Windows bin dir, ``%LOCALAPPDATA%\\Toolbox\\bin``.
+
+    On Windows Toolbox does not use ``~/.toolbox/bin``: its install guide puts
+    every tool (``claude``, ``kiro-cli``, ...) under ``%LOCALAPPDATA%\\Toolbox\\bin``
+    and has the user add that to their own PATH, which a gateway started before
+    that edit (or by a launcher that does not read it) never sees. So the Agent
+    Harness probe reported a Toolbox-installed Claude Code as not installed.
+
+    ``LOCALAPPDATA`` names the account running this process, so a caller that
+    pinned another account's *pinned_home* gets that home's ``AppData\\Local``.
+    """
+    local = os.environ.get("LOCALAPPDATA", "") if pinned_home is None else ""
+    base = local or os.path.join(resolved_home, "AppData", "Local")
+    return _validated_bin_dir(os.path.join(base, "Toolbox", "bin"))
+
+
 def augmented_path(base_path: str = "", *, home: str | None = None) -> str:
     """Return *base_path* prepended with well-known MCP binary directories.
 
@@ -790,13 +947,17 @@ def augmented_path(base_path: str = "", *, home: str | None = None) -> str:
     sync.
 
     On Windows a launched (non-shell) gateway inherits a ``PATH`` that does
-    not include the venv's ``Scripts\\`` directory, so ``shutil.which`` fails
-    to resolve the ``kirocrew`` / ``kirocrew-core`` console-script wrappers
-    pip generated for MCP-server spawn. Append ``sys.executable``'s parent
-    directory as the LAST entry so the running interpreter's own
-    console-scripts (``Scripts\\`` on Windows, ``bin/`` on POSIX) are always
-    discoverable. Last, not first: the interpreter dir also contains
-    ``python``/``pip``, and placing it ahead of ``base_path`` would silently
+    not include the interpreter's console-scripts directory, so
+    ``shutil.which`` fails to resolve the ``kirocrew`` / ``kirocrew-core``
+    wrappers pip generated for MCP-server spawn, or the bundled ``uv`` /
+    ``uvx``. Append ``sys.executable``'s parent and then the interpreter's
+    ``sysconfig`` scripts directory as the LAST entries, so its own console
+    scripts are always discoverable. In a venv (``Scripts\\`` on Windows,
+    ``bin/`` on POSIX) and in a POSIX python-build-standalone tree they are
+    one directory. The Windows desktop backend is a python-build-standalone
+    tree with ``python.exe`` at its root and its console scripts in
+    ``Scripts\\``, so there they differ. Last, not first: the interpreter dir
+    also contains ``python``/``pip``, and placing it ahead of ``base_path`` would silently
     rebind a user MCP spec's bare ``"command": "python"`` (and the spawned
     agent's own ``python``/``pip`` shell calls) to the gateway's venv
     interpreter. As a pure fallback it resolves only names found nowhere
@@ -822,10 +983,39 @@ def augmented_path(base_path: str = "", *, home: str | None = None) -> str:
         for d in _EXTRA_PATH_DIRS
         if (e := _validated_bin_dir(d.format(home=resolved_home, mise_data=mise_data)))
     ]
-    extra += _node_all_bin_dirs(resolved_home, mise_data)
+    if platform_compat.IS_WINDOWS and (
+        toolbox_bin := _windows_toolbox_bin_dir(resolved_home, home)
+    ):
+        extra.append(toolbox_bin)
+    extra += _node_all_bin_dirs(resolved_home, mise_data, _xdg_config_dir(resolved_home))
     parts = extra + ([base_path] if base_path else [])
-    parts.append(str(Path(sys.executable).parent))
+    parts.extend(_interpreter_script_dirs())
     return os.pathsep.join(parts)
+
+
+def _interpreter_script_dirs() -> list[str]:
+    """The running interpreter's own directory, then its console-scripts directory.
+
+    One entry when they are the same directory (a venv, POSIX
+    python-build-standalone); two on the Windows desktop backend, where
+    ``python.exe`` sits at the tree root and pip installs ``uv.exe`` and the
+    ``kirocrew`` wrappers into ``Scripts\\``.
+    """
+    dirs = [str(Path(sys.executable).parent)]
+    scripts = _INTERPRETER_SCRIPTS_DIR
+    same = os.path.normcase(os.path.normpath(scripts)) == os.path.normcase(
+        os.path.normpath(dirs[0])
+    )
+    if scripts and os.path.isabs(scripts) and not same:
+        dirs.append(scripts)
+    return dirs
+
+
+#: The interpreter's console-scripts directory, read once at import. It
+#: depends only on ``sys.prefix``, which does not change at runtime, and
+#: ``sysconfig.get_path`` runs ``os.path.expanduser`` over its result, so a
+#: per-call read would follow whatever home the caller is pinning.
+_INTERPRETER_SCRIPTS_DIR = sysconfig.get_path("scripts") or ""
 
 
 #: How many directories :func:`describe_search_path` names before truncating.
@@ -1074,6 +1264,27 @@ def resolved_command_casing(path: str | None) -> str:
     return path[: -len(name)] + matches[0]
 
 
+def saved_command_casing(path: str) -> str:
+    """Heal a saved absolute command whose only flaw is a PATHEXT extension.
+
+    Builds before :func:`resolved_command_casing` existed persisted
+    ``shutil.which`` results such as ``...\\demo-mcp.EXE`` as absolute
+    commands, and every resolver accepts an existing absolute command verbatim,
+    so the spelling never healed. This repairs only that signature: the stem
+    matches the on-disk entry exactly and the extension differs in case alone.
+    Any other spelling, a stem written in different case included, is the
+    operator's own and is returned unchanged.
+    """
+    repaired = resolved_command_casing(path)
+    if repaired == path:
+        return path
+    stem, ext = os.path.splitext(os.path.basename(path))
+    new_stem, new_ext = os.path.splitext(os.path.basename(repaired))
+    if stem == new_stem and ext != new_ext:
+        return repaired
+    return path
+
+
 def mcp_runtime_path(base_path: str = "") -> str:
     """Contributed MCP directories, then :func:`augmented_path` unchanged.
 
@@ -1115,7 +1326,7 @@ def mcp_runtime_path(base_path: str = "") -> str:
 #   ELF/Mach-O binary in the spawn chain, the sandbox wrapper included.
 # * The ``PYTHON`` namespace matters because Kiro Crew's Linux sandbox launcher
 #   IS a Python process: ``sandbox.namespace_argv`` returns
-#   ``[sys.executable, "-I", "-S", <generated script>, *argv]`` (sandbox.py), and
+#   ``[sys.executable, "-I", "-S", <generated script>, *argv]`` (sandbox_argv.py), and
 #   that interpreter starts with the env we hand ``Popen``. A declared
 #   ``PYTHONPATH`` carrying ``sitecustomize.py`` — or a shadowing ``os.py`` —
 #   would be imported at interpreter startup, i.e. before ``unshare`` and before
@@ -1418,6 +1629,41 @@ def emit_env(env: dict) -> dict:
     return out
 
 
+#: The variables a stdio MCP ``args`` element may reference. Only home and
+#: login-name spellings: kiro-cli expands ``${VAR}`` in a declared ``env`` map
+#: but never in ``args``, so a launch path written as ``${HOME}/...`` reaches
+#: the child literally. Any wider set would put an arbitrary variable's VALUE on
+#: argv (world-readable through ``/proc/<pid>/cmdline``) and into the emitted
+#: agent spec, which agents can write -- a spec naming
+#: ``${AWS_SECRET_ACCESS_KEY}`` must stay a literal.
+_SPEC_ARG_VARS = frozenset({"HOME", "USER", "LOGNAME", "USERPROFILE", "USERNAME"})
+
+
+def expand_spec_args(args: Any, *, server: str | None = None) -> Any:
+    """Resolve home and login-name references in a stdio MCP spec's ``args``.
+
+    Delegates to the gateway's declared-env expander (one grammar, one miss
+    rule) with a source view holding only :data:`_SPEC_ARG_VARS`, so every
+    other name is a miss and stays literal. A set-but-empty variable is left
+    out of that view too, so ``${HOME}/x`` never collapses to ``/x``. Plain
+    text substitution; nothing is ever handed to a shell. The import is
+    function-local because the rewriter imports this module.
+
+    Returns a NEW list for a list input, leaving the caller's (often a source
+    config's own) untouched. Non-string elements and a non-list ``args`` pass
+    through verbatim, so a malformed spec keeps its own error.
+    """
+    if not isinstance(args, list):
+        return args
+    from kiro_crew.mcp_gateway.rewriter import _expand_env_placeholders
+
+    source = {name: value for name in _SPEC_ARG_VARS if (value := os.environ.get(name))}
+    return [
+        _expand_env_placeholders(a, source=source, server=server) if isinstance(a, str) else a
+        for a in args
+    ]
+
+
 @functools.lru_cache(maxsize=1)
 def _mise_bin() -> str | None:
     """Locate the ``mise`` binary in a non-login (daemon) context.
@@ -1486,7 +1732,7 @@ def activate_mise(env: MutableMapping[str, str] | None = None) -> list[str]:
         proc = subprocess.run(
             [mise, "env", "--json"],
             capture_output=True,
-            text=True,
+            **UTF8_TEXT,
             timeout=10,
             env=dict(target),
             cwd=str(Path.home()),

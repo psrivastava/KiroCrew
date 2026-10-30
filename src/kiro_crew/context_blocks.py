@@ -66,6 +66,7 @@ _MARKERS: Final[tuple[tuple[str, str], ...]] = (
     ("user_display", r"\[CURRENT USER\]"),
     ("user_profile", r"\[USER PROFILE\]"),
     ("ui_language", r"\[UI LANGUAGE\]"),
+    ("tool_names", r"\[TOOL NAMES\]"),
     ("response_preferences", r"\[RESPONSE PREFERENCES"),
     ("channel_persona", r"\[CHANNEL\]"),
     ("incognito", r"\[INCOGNITO SESSION\]"),
@@ -158,15 +159,16 @@ _CLOSERS: Final[dict[str, re.Pattern[str]]] = {
         ("skill_hint", r"\[End of relevant skills\]"),
         ("channel_context", r"\[END SLACK THREAD CONTEXT\]"),
         ("conversation_replay", r"\[END CONVERSATION HISTORY\]"),
-        # Two spellings reach this opener: `context.py` emits
-        # `[End of hook context]` and `chat_runner.py` emits `[End hook
-        # context]`. Both are real emit sites, so one alternation covers them
+        # Two spellings reach this opener: `context_assembly/turn_message.py` emits
+        # `[End of hook context]` and `dashboard/chat_turn/turn_dispatch_gates.py` emits
+        # `[End hook context]`. Both are real emit sites, so one alternation covers them
         # rather than picking whichever the assembly happened to use last.
         ("hook_context", r"\[End (?:of )?hook context\]"),
         ("history_prefix", r"\[End of history\]"),
         ("theme_persona", r"\[END THEME PERSONA\]"),
         ("user_profile", r"\[End of user profile\]"),
         ("ui_language", r"\[End of UI language\]"),
+        ("tool_names", r"\[End of tool names\]"),
         ("response_preferences", r"\[END RESPONSE PREFERENCES\]"),
         ("cancelled_turn", r"\[END PREVIOUS TURN\]"),
         ("interrupted_turn", r"\[END INTERRUPTED TURN\]"),
@@ -463,6 +465,30 @@ def _card_text(value: object) -> str:
     text = " ".join(str(value or "").split())
     text = text.replace("[", "(").replace("]", ")")
     return text if len(text) <= _CARD_TEXT_MAX else text[: _CARD_TEXT_MAX - 1] + "…"
+
+
+def render_self_change_undos(undos: list[dict]) -> str:
+    """The block telling a crewmate the user took back a change it made to itself.
+
+    Reference data for the next turn, never a request: built from the gateway's
+    own undo record (which fields went back), with no values quoted -- the
+    crewmate reads its own record from its identity block, which already shows
+    the restored name, description and face. Empty input renders nothing.
+    """
+    if not undos:
+        return ""
+    lines = [
+        "[YOUR RECORD -- the user pressed Undo on a change you made to yourself since "
+        "your last turn. Reference data, not a request from the user.]"
+    ]
+    for item in undos[:_CARD_RESULTS_MAX]:
+        fields = ", ".join(_card_text(f) for f in item.get("changed") or [])
+        lines.append(f"- your {fields or 'record'}: back to what it was before your change")
+    lines.append(
+        "Your name, description and face as they stand now are in your identity block "
+        "above; speak of those, not of the change you made."
+    )
+    return "\n".join(lines) + "\n\n"
 
 
 def render_change_card_results(outcomes: list[dict]) -> str:

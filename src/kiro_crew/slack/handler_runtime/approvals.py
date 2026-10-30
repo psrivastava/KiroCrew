@@ -58,9 +58,9 @@ class _LinkedApproval:
 
     Unlike :class:`_PendingApproval`, this entry does NOT own the ACP backend
     answer. For a Slack-linked dashboard session the consumer that actually
-    calls ``approve_tool`` / ``reject_tool`` is the dashboard's ``_run_chat``
-    loop, which is parked on the slot's approval *future*. A Slack button click
-    here must therefore ONLY resolve that future (via
+    calls ``approve_tool`` / ``reject_tool`` is the dashboard's ``_on_permission_prompt``
+    (``chat_turn/permission_prompt.py``), parked on the slot's approval *future*. A Slack
+    button click here must therefore ONLY resolve that future (via
     ``state.resolve_approval``); the dashboard loop then answers the backend
     exactly once. Calling ``approve_tool`` from here too would answer the
     JSON-RPC request twice.
@@ -200,6 +200,8 @@ def _grant_linked_trust(linked_entry: _LinkedApproval, sessions: SessionManager 
         add_trusted_session(linked_entry.session_key, sessions, strict=True)
         for slot in slots:
             slot._trust = True
+            # A person chose this slot's mode: its creator's changes stop reaching it.
+            slot._posture_inherited = False
     except Exception:
         logger.warning(
             "Failed to grant linked session trust (session=%s)",
@@ -226,8 +228,8 @@ async def post_linked_approval(
     the dashboard slot's approval future (see :func:`handle_interaction`).
 
     Returns the Slack message ts on success, or ``None`` if the post failed.
-    The caller (dashboard ``_run_chat``) treats ``None`` as "delivery failed"
-    and surfaces it rather than silently parking on an unanswerable prompt.
+    The caller (``_on_permission_prompt`` in chat_turn/permission_prompt.py) treats ``None``
+    as "delivery failed" and surfaces it rather than silently parking on an unanswerable prompt.
 
     Trust ("Trust session") is offered only when BOTH hold:
 
@@ -386,8 +388,8 @@ def _resolve_linked_click(
 ) -> str:
     """Resolve a click on a linked dashboard slot's prompt; return the action it took.
 
-    The dashboard's ``_run_chat`` owns the ACP answer (it is parked on the slot's
-    approval future), so this resolves ONLY that future, through
+    The dashboard's ``_on_permission_prompt`` (chat_turn/permission_prompt.py) owns the ACP
+    answer (it is parked on the slot's approval future), so this resolves ONLY that future, through
     ``state.resolve_approval``, and never calls ``approve_tool`` / ``reject_tool``:
     that would answer the JSON-RPC request twice. Anything that isn't an explicit
     reject approves THIS call; a Trust click additionally widens the session, and only

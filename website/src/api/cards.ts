@@ -20,8 +20,13 @@ export const CARD_KINDS = [
   'schedule.create',
   'schedule.update',
   'crewmate.create',
+  'crewmate.import',
   'crewmate.update',
   'crewmate.capabilities',
+  'crewmate.goal',
+  'crewmate.key_results',
+  'crewmate.check_ins',
+  'crewmate.dashboard_page',
   'template.update',
   'mcp.install',
   'mcp.add_custom',
@@ -30,6 +35,9 @@ export const CARD_KINDS = [
   'secret.save',
   'trust.app',
   'denied_command',
+  'folder.steering',
+  'workflow.save',
+  'workflow.update',
 ] as const
 export type CardKind = typeof CARD_KINDS[number]
 
@@ -44,14 +52,36 @@ export interface CardChange {
   after?: unknown
   add?: unknown[]
   remove?: unknown[]
+  /** A `goal` row: which goal, by the number the Goals tab shows. */
+  number?: number
+  /** A capabilities card's plain line for one addition, worded by the dashboard. */
+  addition?: CardAddition
+  /** A raw row a card with plain lines keeps behind its Details. */
+  detail?: boolean
 }
 
-/** A body field the gateway cannot know at proposal time. `user` is typed by
- *  the person (a secret's value); `step` is a field an earlier step's real
- *  response returned. The step's body carries a `{{...}}` placeholder there. */
+/** One thing a capabilities card gives a crewmate's worker. */
+export type CardAddition =
+  | {
+    kind: 'server'
+    name: string
+    /** `gateway`: already running here; `registry`: installed from the MCP registry; `card`: set up by the card. */
+    origin: 'gateway' | 'registry' | 'card'
+    registry_id?: string
+    /** Tools that run without asking, after the governance ceiling. */
+    auto_approve: string[]
+    /** The draft grants the whole server: every tool runs without asking. */
+    auto_approve_all?: boolean
+  }
+  | { kind: 'skill'; name: string }
+
+/** A value the gateway cannot know at proposal time. `user` is typed by the
+ *  person (a secret's value); `step` is a field an earlier step's real response
+ *  returned. The step's body carries a `{{...}}` placeholder there, or, for a
+ *  `step` fill with `in: 'path'`, its path does (one segment). */
 export type CardFill =
   | { field: string; source: 'user' }
-  | { field: string; source: 'step'; step: number; key: string }
+  | { field: string; source: 'step'; step: number; key: string; in?: 'path' }
 
 export interface CardPlanStep {
   method: string
@@ -134,6 +164,33 @@ export const cardsApi = {
     const { post, j } = apiTransport
     return post(cardPath(card.id, 'dismiss')).then(j).then(unwrap)
   },
+  /** Hand the gateway one `.crewmate` file; it answers with the ONE pending
+   *  `crewmate.import` card it raised, or refuses the file and raises none.
+   *  The bytes go unchanged as `application/zip`, which is not a CORS-simple
+   *  type, so no other page can post here unasked. */
+  importCrewmate: async (file: Blob): Promise<Card | null> => {
+    const r = await fetch('/api/members/import', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/zip', 'X-Session-Key': 'dashboard:ui' },
+      body: file,
+    })
+    return apiTransport.j(r).then(unwrap)
+  },
+  /** Every file a live import card's `.crewmate` file brings, as text (the picture as a data URL). */
+  importFiles: async (sha256: string): Promise<CrewmateImportFiles> => {
+    const { get, j } = apiTransport
+    return await get(`/api/members/import/${encodeURIComponent(sha256)}/files`).then(j) as CrewmateImportFiles
+  },
+}
+
+/** The reserved card slot of the crewmate dropdown's Import from file. */
+export const CREWMATE_IMPORT_SLOT = 'owner:crewmate-import'
+
+/** `GET /api/members/import/{sha256}/files`: skill files by skill then path, scripts by file. */
+export interface CrewmateImportFiles {
+  skills: Record<string, Record<string, string>>
+  scripts: Record<string, string>
+  avatar?: string
 }
 
 /** The headers that tie ONE real request to the plan step it executes.
@@ -210,7 +267,18 @@ export function mergeCard(list: readonly Card[] | undefined, c: Card): Card[] {
 }
 
 /** Fold one owner `card_update` frame into that slot's cards cache. */
+/** The Workflows tab's library query, which a workflow card's save changes. */
+export const WORKFLOW_DEFINITIONS_QUERY_KEY = ['workflow-definitions'] as const
+
+/** Whether *card* is a workflow-library card that has written to the library. */
+export function wroteWorkflowLibrary(card: Pick<Card, 'kind' | 'status'>): boolean {
+  return card.kind.startsWith('workflow.') && (card.status === 'applied' || card.status === 'partial')
+}
+
 export function applyCardUpdate(queryClient: QueryClient, card: unknown): void {
   if (!isCard(card)) return
   queryClient.setQueryData<Card[]>(cardsQueryKey(card.slot_key), prev => mergeCard(prev, card))
+  // The library list is cached without expiry; a save another tab pressed must
+  // show there without a reload.
+  if (wroteWorkflowLibrary(card)) void queryClient.invalidateQueries({ queryKey: WORKFLOW_DEFINITIONS_QUERY_KEY })
 }

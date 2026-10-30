@@ -12,13 +12,6 @@
       overflow-wrap: break-word; }
     .wkb-ttl i { font-style: normal; color: var(--muted, #7f7f88);
       font-weight: 400; padding: 0 2px; }
-    .wkb-fresh { flex: 0 0 auto; display: inline-flex; align-items: center; gap: 6px;
-      font-size: 10.5px; font-weight: 600; padding: 3px 9px 3px 7px; border-radius: 999px;
-      background: var(--ok-subtle, rgba(34,197,94,.12)); color: var(--ok, #22c55e);
-      white-space: nowrap; }
-    .wkb-fresh b { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
-    .wkb-fresh.is-stale { background: var(--warn-subtle, rgba(234,179,8,.12));
-      color: var(--warn, #eab308); }
 
     .wkb-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 14px;
       font-size: 11px; color: var(--muted, #7f7f88); margin-top: 7px; }
@@ -112,7 +105,6 @@
 
   <div class="wkb-top">
     <h2 class="wkb-ttl"><span data-i18n="title">Work board</span> <i>&middot;</i> <span data-dashboard-field="goal">&mdash;</span></h2>
-    <span class="wkb-fresh" id="wkb-fresh"><b></b><span>&mdash;</span></span>
   </div>
 
   <div class="wkb-meta">
@@ -142,6 +134,7 @@
   <div class="wkb-note">
     <span data-dashboard-field="items">&mdash;</span> <span data-i18n="note_on_board">on the board,</span>
     <span data-dashboard-field="omitted">&mdash;</span> <span data-i18n="note_not_shown">not shown (list truncated).</span>
+    <span data-dashboard-field="forgotten" hidden></span>
   </div>
 
   <script>
@@ -174,8 +167,7 @@
         board_no_item: 'This board carries no item yet.',
         hl_of: ' of ', hl_accepted: ' items accepted. ',
         hl_waits_one: ' waits on your verdict, ', hl_waits_many: ' wait on your verdict, ',
-        hl_worker: ' still with a worker.',
-        stale: 'Stale', fresh: 'Fresh'
+        hl_worker: ' still with a worker.'
       },
       'zh-CN': {
         title: '\u5de5\u4f5c\u770b\u677f',
@@ -198,8 +190,7 @@
         board_no_item: '\u6b64\u770b\u677f\u8fd8\u6ca1\u6709\u4efb\u4f55\u4e8b\u9879\u3002',
         hl_of: ' / ', hl_accepted: ' \u9879\u5df2\u63a5\u53d7\u3002',
         hl_waits_one: ' \u9879\u5f85\u4f60\u88c1\u5b9a\uff0c', hl_waits_many: ' \u9879\u5f85\u4f60\u88c1\u5b9a\uff0c',
-        hl_worker: ' \u9879\u4ecd\u5728\u6267\u884c\u4e2d\u3002',
-        stale: '\u5df2\u8fc7\u671f', fresh: '\u6700\u65b0'
+        hl_worker: ' \u9879\u4ecd\u5728\u6267\u884c\u4e2d\u3002'
       }
     };
     function locale() {
@@ -316,6 +307,26 @@
       return t;
     }
 
+    //: The closed items the fold no longer holds, counted per closing state. The fold
+    //: keeps only open items and the newest closed ones, so a whole-board number adds
+    //: these to what ``items`` holds; a round's numbers do not, since a forgotten item
+    //: carries no round here.
+    function forgotten() {
+      var f = fields().forgotten;
+      var g = f && typeof f === 'object' ? f : {};
+      function n(k) { var v = num(g[k]); return v !== null && v > 0 ? Math.floor(v) : 0; }
+      return { items: n('items'), acc: n('accepted'), shut: n('rejected') + n('abandoned') };
+    }
+
+    function boardTally(list) {
+      var t = tally(list), gone = forgotten();
+      t.acc += gone.acc;
+      t.shut += gone.shut;
+      return t;
+    }
+
+    function boardTotal(list) { return list.length + forgotten().items; }
+
     //: One highlighted card, for the case that wants the reader: something waiting on
     //: a verdict first, then anything carrying a failed one. Neither present, nothing
     //: is highlighted -- a board with no call to make should not invent one.
@@ -349,7 +360,7 @@
       if (!host) return;
       host.textContent = '';
       host.setAttribute('viewBox', '0 0 100 8');
-      stack(host, list.length, tally(list), 8);
+      stack(host, boardTotal(list), boardTally(list), 8);
     }
 
     function swatch(colour) {
@@ -469,7 +480,7 @@
       var host = document.getElementById('wkb-board');
       if (!host) return;
       host.textContent = '';
-      var counts = tally(list), star = starOf(list);
+      var counts = boardTally(list), star = starOf(list);
       for (var c = 0; c < COLS.length; c++) {
         var key = COLS[c][0];
         var col = el('div', 'wkb-col');
@@ -500,30 +511,20 @@
       var out = document.getElementById('wkb-head');
       if (!out) return;
       out.textContent = '';
-      if (!list.length) {
+      if (!boardTotal(list)) {
         out.textContent = i18n('board_no_item');
         return;
       }
-      var t = tally(list);
+      var t = boardTally(list);
       function bold(v) { return el('b', null, String(v)); }
       out.appendChild(bold(t.acc));
       out.appendChild(document.createTextNode(i18n('hl_of')));
-      out.appendChild(bold(list.length));
+      out.appendChild(bold(boardTotal(list)));
       out.appendChild(document.createTextNode(i18n('hl_accepted')));
       out.appendChild(bold(t.await));
       out.appendChild(document.createTextNode(i18n(t.await === 1 ? 'hl_waits_one' : 'hl_waits_many')));
       out.appendChild(bold(t.prog));
       out.appendChild(document.createTextNode(i18n('hl_worker')));
-    }
-
-    function drawFreshness() {
-      var api = window.kirocrew || {};
-      var node = document.getElementById('wkb-fresh');
-      if (!node) return;
-      node.className = 'wkb-fresh' + (api.stale ? ' is-stale' : '');
-      var seq = num(api.seq);
-      node.lastChild.textContent = i18n(api.stale ? 'stale' : 'fresh') +
-        ' \u00b7 seq ' + (seq === null ? DASH : seq);
     }
 
     function render() {
@@ -543,9 +544,9 @@
       put('last_entry_at', stamp(f.last_entry_at, true));
 
       var list = items();
-      put('items', i18n(list.length === 1 ? 'item_one' : 'item_many', { n: list.length }));
+      var total = boardTotal(list);
+      put('items', i18n(total === 1 ? 'item_one' : 'item_many', { n: total }));
 
-      drawFreshness();
       drawHeadline(list);
       drawStrip(list);
       drawRounds(list);

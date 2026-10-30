@@ -82,6 +82,35 @@ def _compress_assistant_message(text: str) -> str:
 # walked past.
 _TURN_OPENER_ROLES = frozenset({"user", "nudge", "subagent"})
 
+# Prefix that marks a mid-turn steer inside a restored turn's partial output.
+_STEER_LABEL = "[Steered mid-turn]"
+
+# The ``meta.steerState`` of a steer the turn never took: its teardown moved it to
+# the queue, where it runs as its own turn (``STEER_STATE_REQUEUED`` in the
+# dashboard's chat delivery). Spelled here because this layer does not import the
+# dashboard; a test pins the two together.
+_STEER_STATE_REQUEUED = "requeued"
+# The ``meta.steerState`` of a steer the person took back before the turn read it
+# (``STEER_STATE_RETRACTED``, same reason for the spelling): it never reached the
+# turn either.
+_STEER_STATE_RETRACTED = "retracted"
+_STEER_STATES_NOT_TAKEN = frozenset({_STEER_STATE_REQUEUED, _STEER_STATE_RETRACTED})
+
+
+def _is_steer_row(row: dict) -> bool:
+    """Whether *row* is a mid-turn steer: a ``user`` row whose ``meta.steer`` is True,
+    or a ``nudge`` row with it (a monitor loop's wake steered into the turn).
+
+    A steer is delivered into a turn that is already running, so it never opens a
+    turn even though its role is one that otherwise does.
+    """
+    meta = row.get("meta")
+    return (
+        row.get("role") in ("user", "nudge")
+        and isinstance(meta, dict)
+        and meta.get("steer") is True
+    )
+
 
 def _interrupted_opener_kind(row: dict) -> str:
     """A short name for the automated delivery that opened an interrupted turn."""
@@ -122,6 +151,11 @@ def build_interrupted_turn_preamble(
     turn-in-flight marker restores its opener after a restart). Walk back from
     *current* -- the resume row this turn is running, excluded -- to the row that
     opened the interrupted turn, collecting the assistant text it had streamed.
+    A mid-turn steer (:func:`_is_steer_row`) is walked past rather than taken as
+    the opener, and is carried in the partial output, in the order it was sent,
+    under ``[Steered mid-turn]`` -- unless its ``steerState`` is ``requeued``,
+    which means the turn never took it and it runs as its own turn, or
+    ``retracted``, which means the person took it back before the turn read it.
     Returns "" when no opener is found. The caller mints the result AFTER the
     prompt's egress scrub (its markers are in ``_STRUCTURAL_MARKER_RES``); the
     payload is scrubbed here instead.
@@ -136,7 +170,7 @@ def build_interrupted_turn_preamble(
     for i in range(end - 1, -1, -1):
         role = messages[i].get("role")
         meta = messages[i].get("meta")
-        if role in _TURN_OPENER_ROLES or (
+        if (role in _TURN_OPENER_ROLES and not _is_steer_row(messages[i])) or (
             role == "inject"
             and isinstance(meta, dict)
             and meta.get("injectKind") in opener_inject_kinds
@@ -148,16 +182,46 @@ def build_interrupted_turn_preamble(
     user_text = str(messages[opener_idx].get("content") or "").strip()
     if not user_text:
         return ""
-    assistant_parts = [
-        str(m.get("content") or "").strip()
-        for m in messages[opener_idx + 1 : end]
-        if m.get("role") == "assistant" and str(m.get("content") or "").strip()
-    ]
+    # *assist_cap* bounds the assistant text alone, measured as if its chunks were
+    # joined on their own, so a turn with no steer is cut exactly where it always
+    # was. A steer line never spends that budget: a redirect the user sent after a
+    # long stream is the line the model most needs, and a head cut would drop it.
+    assistant_parts: list[str] = []
+    assist_used = 0
+    assist_full = False
+    last_assist = -1
+    for m in messages[opener_idx + 1 : end]:
+        text = str(m.get("content") or "").strip()
+        if not text:
+            continue
+        if m.get("role") == "assistant":
+            if assist_full:
+                continue
+            start = assist_used + (1 if last_assist >= 0 else 0)
+            if start + len(text) <= assist_cap:
+                assistant_parts.append(text)
+                assist_used = start + len(text)
+                last_assist = len(assistant_parts) - 1
+                continue
+            assist_full = True
+            keep = assist_cap - start
+            if keep >= 0:
+                assistant_parts.append(text[:keep] + "… [truncated]")
+            else:
+                # The cap fell on the separator itself: the kept text ends with the
+                # previous chunk, so the marker closes that chunk.
+                assistant_parts[last_assist] += "… [truncated]"
+        elif _is_steer_row(m) and m["meta"].get("steerState") not in _STEER_STATES_NOT_TAKEN:
+            # A requeued steer did not redirect this turn: it waits in the queue as
+            # its own turn, or the user dismissed it. Carrying it would have the
+            # model act on it here and again when it drains. A taken-back steer
+            # never reached the turn at all.
+            if len(text) > user_cap:
+                text = text[:user_cap] + "… [truncated]"
+            assistant_parts.append(f"{_STEER_LABEL} {text}")
     assistant_text = "\n".join(assistant_parts)
     if len(user_text) > user_cap:
         user_text = user_text[:user_cap] + "… [truncated]"
-    if len(assistant_text) > assist_cap:
-        assistant_text = assistant_text[:assist_cap] + "… [truncated]"
     # The frame is minted outside the prompt's egress scrub, so its payload is
     # scrubbed here: a transcript row must not carry a structural marker past it.
     from kiro_crew import context as ctx  # circular import: the facade imports this owner
@@ -224,6 +288,17 @@ _REPLAY_INJECT_MAX_ROWS = (
 
 _REPLAY_CONVERSATION_MAX_ROWS = 500
 
+#: ``meta.notice`` on a conductor context cap notice row. A trim writes none
+#: (``dashboard/chat_turn/context_cap.py``), but a transcript may still hold one, and
+#: no replay carries it: the trimmed session learns of its trim from its seed.
+CONTEXT_CAP_NOTICE = "context_cap"
+
+
+def is_context_cap_notice(row: dict) -> bool:
+    """Whether *row* is the conductor context cap's notice row."""
+    meta = row.get("meta")
+    return isinstance(meta, dict) and meta.get("notice") == CONTEXT_CAP_NOTICE
+
 
 def _replay_identity(row: dict) -> tuple | None:
     """Delivery identity, never a global text-equality deduplication key."""
@@ -240,16 +315,31 @@ def _replay_identity(row: dict) -> tuple | None:
     return None
 
 
-def _merge_replay_rows(disk: list[dict], pending: list[dict], current: dict | None) -> list[dict]:
-    """Reconcile one snapshot before quota selection, budgeting and formatting."""
+def _merge_replay_rows(
+    disk: list[dict],
+    pending: list[dict],
+    current: dict | None,
+    excluded: list[dict] | None = None,
+) -> list[dict]:
+    """Reconcile one snapshot before quota selection, budgeting and formatting.
+
+    *excluded* rows are left out of both sides, by object and by delivery
+    identity: a Regenerate's previous reply stays in the window and on disk
+    while the turn re-asks its question, and must not reach the replay as an
+    answer to nothing.
+    """
     from kiro_crew.history import transcript_sort_key
 
     current_id = _replay_identity(current) if current is not None else None
+    excluded_objs = {id(row) for row in excluded or ()}
+    excluded_ids = {i for i in (_replay_identity(row) for row in excluded or ()) if i is not None}
     rows: list[dict] = []
     positions: dict[tuple, deque[int]] = defaultdict(deque)
     for row in disk:
         identity = _replay_identity(row)
         if current_id is not None and identity == current_id:
+            continue
+        if identity is not None and identity in excluded_ids:
             continue
         if identity is not None:
             positions[identity].append(len(rows))
@@ -257,6 +347,8 @@ def _merge_replay_rows(disk: list[dict], pending: list[dict], current: dict | No
     for row in pending:
         identity = _replay_identity(row)
         if row is current or (current_id is not None and identity == current_id):
+            continue
+        if id(row) in excluded_objs or (identity is not None and identity in excluded_ids):
             continue
         matches = positions.get(identity) if identity is not None else None
         if matches:
@@ -278,6 +370,8 @@ _RECALL_FALLBACK_MAX_ROWS = 20
 def _quota_tail(messages: list[dict], *, conv_max: int, inject_max: int) -> list[dict]:
     """The newest rows under separate conversation and ``inject`` row quotas, oldest first.
 
+    A steer the person took back (``steerState: retracted``) is left out.
+
     A role-filtered tail slice lets a run of ``inject`` rows longer than the bound be
     the entire read, so conversation disappears. Counting the two quotas separately
     lets notes reach the model without competing with user/assistant turns for the
@@ -296,6 +390,10 @@ def _quota_tail(messages: list[dict], *, conv_max: int, inject_max: int) -> list
     conv = inj = 0
     for m in reversed(messages):
         role = m["role"]
+        if _is_steer_row(m) and m["meta"].get("steerState") == _STEER_STATE_RETRACTED:
+            # Taken back before the turn read it: it was never part of the
+            # conversation, and its text was cleared when it was taken back.
+            continue
         if role == "inject":
             if inj >= inject_max:
                 continue
@@ -313,12 +411,18 @@ def _quota_tail(messages: list[dict], *, conv_max: int, inject_max: int) -> list
     return kept
 
 
-def replay_text(messages: list[dict], model_window: int | None) -> str:
+def replay_text(
+    messages: list[dict], model_window: int | None, *, budget_chars: int = _REPLAY_BUDGET_CHARS
+) -> str:
     """The tail-heavy replay of *messages* within the window-scaled replay budget.
 
     Keeps as many recent messages as fit, newest first. ``inject`` rows are clipped
     to a per-row ceiling and spend their own share of the budget, so conversation is
     never starved by breadcrumbs. Returned unredacted; the caller redacts.
+
+    *budget_chars* is the budget at the reference window: ``_REPLAY_BUDGET_CHARS``
+    for every cold start but the conductor context cap's trim, which passes a
+    larger one.
     """
     # Replay is a separate, existing tail-history allowance, not background
     # capacity. Preserve small-window replay limits; larger windows cannot
@@ -327,7 +431,7 @@ def replay_text(messages: list[dict], model_window: int | None) -> str:
         0.2,
         min(1.0, _budgets._effective_window(model_window) / _budgets._REFERENCE_WINDOW_TOKENS),
     )
-    replay_budget = round(_REPLAY_BUDGET_CHARS * factor)
+    replay_budget = round(budget_chars * factor)
     inject_cap = max(1, min(replay_budget, round(_REPLAY_INJECT_CAP_CHARS * factor)))
 
     # Reserved so conversation cannot be starved by breadcrumbs: inject rows spend
@@ -435,7 +539,9 @@ def cancelled_turn_preamble(recent: list[dict], *, user_cap: int, assist_cap: in
     """The ``[PREVIOUS TURN WAS CANCELLED …]`` restore for *recent* rows, or ``""``.
 
     Scans backwards for a ``stop_event`` marker, then takes the user message
-    immediately before it plus any assistant text in between.
+    immediately before it plus any assistant text in between. A steer the person
+    took back (``steerState: retracted``) keeps its row with its text cleared and
+    is stepped past, so *recent* must carry each row's ``meta``.
     """
     if not recent:
         return ""
@@ -466,9 +572,13 @@ def cancelled_turn_preamble(recent: list[dict], *, user_cap: int, assist_cap: in
     search_end = stop_idx if stop_idx >= 0 else len(recent)
     user_idx = -1
     for i in range(search_end - 1, -1, -1):
-        if recent[i].get("role") == "user":
-            user_idx = i
-            break
+        row = recent[i]
+        if row.get("role") != "user":
+            continue
+        if _is_steer_row(row) and row["meta"].get("steerState") == _STEER_STATE_RETRACTED:
+            continue
+        user_idx = i
+        break
     if user_idx < 0:
         return ""
     # Collect any assistant text between user_idx and the boundary.

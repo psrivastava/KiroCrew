@@ -262,8 +262,19 @@ class TestWhatDashboardFieldsReturns:
         rows = {row["field"]: row for row in self._listing()["fields"]}
         manifest = json.loads((BUILTIN / "project-report/manifest.json").read_text())
         for name, spec in manifest["fields"].items():
-            want = {k: v for k, v in spec.items() if k != "source"}
+            # `upkeep` is prose for the crewmate's upkeep skill, not part of the shape.
+            want = {k: v for k, v in spec.items() if k not in ("source", "upkeep")}
             assert rows[name]["schema"] == want, name
+
+    def test_an_agentic_row_carries_its_upkeep_and_a_fold_row_does_not(self) -> None:
+        rows = {row["field"]: row for row in self._listing()["fields"]}
+        shipped = _builtin("project-report").fields["verdict"].upkeep
+        assert rows["verdict"]["upkeep"] == {
+            "means": shipped.means,
+            "when": shipped.when,
+            "how": shipped.how,
+        }
+        assert "upkeep" not in rows["items"]
 
     def test_an_agentic_field_carries_its_current_value(self) -> None:
         rows = {row["field"]: row for row in self._listing()["fields"]}
@@ -298,17 +309,50 @@ class TestWhatDashboardFieldsReturns:
 
 class TestTheTurnBlock:
     def test_the_block_names_the_template_and_its_agentic_fields(self) -> None:
+        from kiro_crew.dashboard_templates import instance
+
+        # An ADOPTED page: an unadopted one shows the suggestions page and offers no fields.
+        instance.adopt("code-reviewer", "project-report")
         block = dashboard_agentic.turn_block("code-reviewer")
         version = _builtin("project-report").version
         assert block.startswith("[DASHBOARD]\n"), block
         assert f"template project-report v{version}" in block
-        # Which readers see it: the tab draws it only with the feature preview on.
-        assert "'Dynamic Dashboard' Feature Preview on" in block
+        # Every reader sees the tab, so the block names no switch.
+        assert "Feature Preview" not in block
         assert "Fields you write: ci, for_you, verdict." in block
         assert "mistake" not in block.lower(), "the mistake book stays behind dashboard_fields"
         assert len(block.splitlines()) <= 4
 
+    def test_an_unadopted_crewmate_is_told_its_tab_shows_the_suggestions_page(self) -> None:
+        # The website draws the suggestions page, not the generic default, for a
+        # crewmate that adopted nothing; the block must not describe a page nobody sees.
+        block = dashboard_agentic.turn_block("code-reviewer")
+        assert "shows the suggestions page" in block, block
+        # The block rides every turn: progress goes on a page, built when there is
+        # work to report.
+        assert "when you have work to report, build your page" in " ".join(block.split())
+        # Writes to the default would land on a page nobody sees: no fields, no upkeep.
+        assert "Fields you write" not in block
+        assert "Upkeep:" not in block
+
+    def test_an_adopted_page_keeps_the_plain_line(self) -> None:
+        from kiro_crew.dashboard_templates import instance
+
+        instance.adopt("code-reviewer", "project-report")
+        block = dashboard_agentic.turn_block("code-reviewer")
+        assert "suggestions page" not in block, block
+        assert "Your Dashboard tab shows template project-report" in block
+
+    def test_the_page_named_for_the_crewmate_keeps_the_plain_line(self) -> None:
+        block = dashboard_agentic.turn_block("kirocrew-conductor")
+        assert "suggestions page" not in block, block
+        assert "Your Dashboard tab shows template kirocrew-conductor" in block
+
     def test_the_member_section_carries_the_block(self) -> None:
+        from kiro_crew.dashboard_templates import instance
+
+        # An ADOPTED page: an unadopted one shows the suggestions page and offers no fields.
+        instance.adopt("code-reviewer", "project-report")
         from kiro_crew.config.loader import KiroCrewAgentConfig, KiroCrewConfig
         from kiro_crew.context_assembly.member import build_member_section
 

@@ -5,12 +5,13 @@ A lesson is a ``lesson.*`` semantic row whose value is either the mapping
 below reads both without guessing. The readers here decide which rows count as
 lesson population, which reach a prompt and in which tier and order, which rows
 a contradiction sweep or a delete may address, and they fetch through the
-store's locked helpers. The write path, ``VectorMemoryStore.write_lesson``, stays
-on the store and uses the same codec.
+store's locked helpers. The write path, ``VectorMemoryStore.write_lesson``, lives
+in ``lesson_write`` and uses the same codec.
 """
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import math
@@ -18,7 +19,7 @@ import re
 import statistics
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from kiro_crew import context_omissions
 from kiro_crew.embeddings import PRIORITY_INTERACTIVE
@@ -833,8 +834,15 @@ def delete_lesson(
     repo_scope: str | None = None,
     *,
     exact: bool = False,
+    keep_one: bool = False,
 ) -> bool:
     """Delete lessons whose value contains rule_substring.
+
+    *keep_one* deletes only the EXTRA copies: matched rows are grouped by their
+    whole stored row (see ``_keep_one_identity``),
+    the oldest row of each group (``created_at``, then ``key``) stays, and the
+    rest go. Two different lessons never share a group, so a broad substring
+    cannot remove the last copy of any lesson in this mode.
 
     Substring matching on the rule text is deliberate: a user targets a
     lesson by a fragment of its rule rather than retyping the whole thing.
@@ -865,6 +873,7 @@ def delete_lesson(
     scope_selective = repo_scope is not None
     wanted_scope = canonical_scope(repo_scope) if scope_selective else None
     wanted_text = rule_substring.lower().strip()
+    matched: list[tuple[dict[str, Any], str]] = []
     for e in store.get_lessons():
         val = json.loads(e["value_json"])
         # Match against the rendered lesson text so a mapping-shaped row is
@@ -894,9 +903,70 @@ def delete_lesson(
                 continue
             if canonical_scope(_lesson_scope(val)) != wanted_scope:
                 continue
-        store.delete_semantic(e["key"], "user_explicit")
-        deleted = True
+        if not keep_one:
+            store.delete_semantic(e["key"], "user_explicit")
+            deleted = True
+            continue
+        matched.append((e, _keep_one_identity(val)))
+    if keep_one:
+        # Only rows the prompt can serve take part. A row outside its validity
+        # window, superseded or otherwise withheld is never the survivor (the
+        # lesson would vanish from prompts with an active copy deleted) and is
+        # never removed here either.
+        servable = {r["key"] for r in store._eligible_rows([m[0] for m in matched], "directive")}
+        matched = [m for m in matched if m[0]["key"] in servable]
+        # A row's record metadata (validity window, subject, scope facets) is
+        # part of the lesson as well: two rows that differ in any of it are not
+        # copies, so a copy valid for longer is never traded for one that expires.
+        facets = {
+            r["key"]: json.dumps(r.get("record_metadata") or {}, sort_keys=True)
+            for r in store.with_record_metadata([m[0] for m in matched])
+        }
+        groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        for e, identity in matched:
+            groups.setdefault((identity, facets[e["key"]]), []).append(e)
+        for rows in groups.values():
+            rows.sort(key=lambda r: (str(r.get("created_at") or ""), str(r["key"])))
+            if len(rows) < 2:
+                continue
+            # The rows are a snapshot. A survivor whose body differs from the
+            # snapshot (a clause attached, a re-tier) may not be a copy of the
+            # others, so the group is left alone; each extra is a
+            # COMPARE-AND-DELETE on the body read here, so a copy enriched
+            # since is kept, not tombstoned.
+            survivor = store.get_semantic(rows[0]["key"])
+            if survivor is None or survivor.get("value_json") != rows[0]["value_json"]:
+                continue
+            for extra in rows[1:]:
+                if store.delete_semantic(
+                    extra["key"], "user_explicit", expect_value_json=extra["value_json"]
+                ):
+                    deleted = True
     return deleted
+
+
+def _keep_one_identity(val: object) -> str:
+    """What makes two stored lesson rows copies of one lesson for ``keep_one``.
+
+    The WHOLE stored value, not a chosen subset of its fields: any stored
+    difference (a NOT-clause, a tier, a scope, a field added later) makes two
+    rows different lessons, so ``keep_one`` never removes one. Only the rule
+    and clause text compare case-insensitively with edge whitespace ignored,
+    and an admissible scope compares canonically, matching how a plain delete
+    and the write path read them. A rule that itself contains the clause
+    separator stays apart from a rule plus a clause, since their stored values
+    differ.
+    """
+    if not isinstance(val, dict):
+        return json.dumps(["text", str(val).lower().strip()])
+    # An absent field and a null one read the same on every path.
+    norm = {k: v for k, v in val.items() if v is not None}
+    for field in ("rule", "negative"):
+        if isinstance(norm.get(field), str):
+            norm[field] = norm[field].lower().strip()
+    if "repo_scope" in norm and not _lesson_scope_unusable(val):
+        norm["repo_scope"] = canonical_scope(_lesson_scope(val))
+    return json.dumps(["value", norm], sort_keys=True, default=repr)
 
 
 def get_lessons_context(
@@ -1169,23 +1239,48 @@ def _renderable_entries(
     lesson_rows: list[dict], project_dir: str | Path | None
 ) -> list[tuple[dict, str]]:
     """``(row, text)`` for every row that renders and is in scope for *project_dir*."""
+    # The rendered text and scope are pure functions of the stored row, and
+    # deriving them (JSON decode plus the volatile-fact regexes) is most of a
+    # warm render. Memoize them only when the whole population fits the memo:
+    # a repeated scan wider than an LRU bound has a hit rate of exactly zero.
+    render = (
+        _lesson_render_fields
+        if len(lesson_rows) <= _LESSON_RENDER_CACHE_SIZE
+        else _lesson_render_fields.__wrapped__
+    )
     entries: list[tuple[dict, str]] = []
     for row in lesson_rows:
-        try:
-            decoded = json.loads(row["value_json"])
-        except (TypeError, ValueError, RecursionError):
+        rendered = render(row["key"], row["value_json"])
+        if rendered is None:
             # One unreadable row must not fail every context build; the key
             # names the row to repair, the value is left out of the log.
             logger.warning("Skipping lesson %r: stored value_json does not decode", row["key"])
             continue
-        text = _renderable_lesson_text(decoded, row["key"])
+        text, scope = rendered
         if not text:
             continue
-        scope = _lesson_scope(decoded)
         if scope and not project_scope_satisfied(scope, project_dir):
             continue
         entries.append((row, text))
     return entries
+
+
+#: Entries in the lesson render memo. Keyed by ``(key, value_json)``; an entry
+#: retains only the rendered text and scope, so the bound is in rows.
+_LESSON_RENDER_CACHE_SIZE = 16_384
+
+
+@functools.lru_cache(maxsize=_LESSON_RENDER_CACHE_SIZE)
+def _lesson_render_fields(key: str, value_json: object) -> tuple[str, str | None] | None:
+    """``(text, scope)`` for one stored lesson, or ``None`` when it does not decode."""
+    try:
+        decoded = json.loads(value_json)  # type: ignore[arg-type]
+    except (TypeError, ValueError, RecursionError):
+        return None
+    text = _renderable_lesson_text(decoded, key)
+    if not text:
+        return ("", None)
+    return (text, _lesson_scope(decoded))
 
 
 #: Request words in ``lesson_keywords``' stop list and words of two letters or

@@ -25,7 +25,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 from aiohttp import web
 
@@ -86,6 +86,15 @@ async def _json_response_off_loop(payload: Any, *, status: int = 200) -> web.Res
 
     text = await asyncio.to_thread(_redact_and_serialize)
     return web.Response(text=text, status=status, content_type="application/json")
+
+
+def _workflow_worker_keys(run_id: str) -> tuple[str, ...]:
+    """The keys a run's worker sessions sit under (``wf:<run>:<n>`` and its kin).
+
+    Bound to the run's admitted budget at attach, so a worker's ``spawn_run`` is
+    charged to the person who started the workflow (``AdmissionService._binding``).
+    """
+    return tuple(f"{prefix}:{run_id}" for prefix in ("wf", "wf-pool", "wf-unpooled", "wf-worker"))
 
 
 def _svc(request: web.Request):
@@ -257,6 +266,9 @@ async def api_workflow_definitions_create(request: web.Request) -> web.Response:
     source_format = body.get("format", "python")
     if source_format not in ("python", "task-plan"):
         return _error("format is invalid", "workflow_format_invalid", 400)
+    exact_slug = body.get("exact_slug", False)
+    if not isinstance(exact_slug, bool):
+        return _error("exact_slug must be a boolean", "workflow_exact_slug_invalid", 400)
     try:
         out = await asyncio.to_thread(
             svc.save_definition,
@@ -267,6 +279,7 @@ async def api_workflow_definitions_create(request: web.Request) -> web.Response:
             ),
             slug=body.get("slug", "") if isinstance(body.get("slug"), str) else "",
             source_format=source_format,
+            exact_slug=exact_slug,
             **lineage_kwargs,
         )
     except Exception:
@@ -274,6 +287,8 @@ async def api_workflow_definitions_create(request: web.Request) -> web.Response:
         return _error("could not save workflow", "workflow_definition_write_failed", 500)
     if out.get("ok"):
         return web.json_response(_redact_obj(out), status=201)
+    if out.get("slug_taken"):
+        return _error("that command is already a saved workflow", "workflow_slug_taken", 409)
     return web.json_response(
         {
             "error": _redact_obj(out.get("error") or "invalid workflow"),
@@ -406,19 +421,26 @@ async def api_workflow_definition_run(request: web.Request) -> web.Response:
     if isinstance(budget_total, bool) or not isinstance(budget_total, int):
         budget_total = None
     try:
-        out = await svc.start_definition(
-            request.match_info.get("workflow_ref", ""),
-            input_text=input_text,
-            args=body.get("args") if isinstance(body.get("args"), dict) else {},
-            author=session_key,
-            session_key=session_key,
-            expected_store=request.get("workflow_expected_store"),
-            budget_total=budget_total,
-            timeout_secs=_opt_int(body.get("timeout_secs")),
+        out = await _start_admitted(
+            request,
+            svc,
+            ("definition_run", request.match_info.get("workflow_ref", ""), body),
+            lambda: svc.start_definition(
+                request.match_info.get("workflow_ref", ""),
+                input_text=input_text,
+                args=body.get("args") if isinstance(body.get("args"), dict) else {},
+                author=session_key,
+                session_key=session_key,
+                expected_store=request.get("workflow_expected_store"),
+                budget_total=budget_total,
+                timeout_secs=_opt_int(body.get("timeout_secs")),
+            ),
         )
     except Exception:
         logger.exception("saved workflow start failed")
         return _error("could not start saved workflow", "workflow_definition_start_failed", 500)
+    if isinstance(out, web.Response):
+        return out
     if "run_id" in out:
         return web.json_response(_redact_obj(out))
     error = _redact_obj(out.get("error") or "could not start saved workflow")
@@ -477,6 +499,56 @@ def _opt_int(value: Any) -> Optional[int]:
     return value
 
 
+async def _admit_workflow_run(request: web.Request, svc: Any, body: object) -> Any:
+    """Fair admission (Shared Crew) for a workflow run: it starts now or is refused."""
+    from kiro_crew.shared_crew.admission import OperationKind
+    from kiro_crew.shared_crew.admission_entry import admit_background_run, workflow_probe
+
+    return await admit_background_run(
+        request,
+        operation=OperationKind.WORKFLOW,
+        session_key=request.headers.get("X-Session-Key", "") or "workflow",
+        probe=workflow_probe(svc),
+        cancel=getattr(svc, "cancel", None),
+        body=body,
+    )
+
+
+async def _start_admitted(
+    request: web.Request,
+    svc: Any,
+    body: object,
+    start: Callable[[], Awaitable[dict[str, Any]]],
+) -> dict[str, Any] | web.Response:
+    """Start a workflow run under fair admission (Shared Crew): now, or refused.
+
+    Returns the refusal response, or the start's own result. An admitted start
+    that produced no run gives its slot back.
+    """
+    from kiro_crew.shared_crew.containment import principal_scope
+
+    run_admission = await _admit_workflow_run(request, svc, body)
+    if run_admission.rejected:
+        return run_admission.refusal_response()
+    if run_admission.replayed:
+        from kiro_crew.shared_crew.admission_entry import background_replay_response
+
+        return background_replay_response(run_admission)
+    try:
+        with principal_scope(None if run_admission.work is None else run_admission.work.budget_key):
+            out = await start()
+    except BaseException:
+        await run_admission.abandon()
+        raise
+    if "run_id" in out:
+        await run_admission.attach_child(
+            str(out["run_id"]), also=_workflow_worker_keys(str(out["run_id"]))
+        )
+    else:
+        await run_admission.abandon()
+    return out
+
+
 async def api_workflow_run(request: web.Request) -> web.Response:
     """POST /api/workflows/run — launch a background run, return its run_id."""
     # Owner identity is a property of a dashboard-user request: ``app == ""`` is
@@ -511,20 +583,37 @@ async def api_workflow_run(request: web.Request) -> web.Response:
     refusal = await _private_memory_refusal(request, "workflow.run")
     if refusal is not None:
         return refusal
+    from kiro_crew.shared_crew.containment import principal_scope
+
+    run_admission = await _admit_workflow_run(request, svc, body)
+    if run_admission.rejected:
+        return run_admission.refusal_response()
+    if run_admission.replayed:
+        from kiro_crew.shared_crew.admission_entry import background_replay_response
+
+        return background_replay_response(run_admission)
     try:
-        out = await svc.start(
-            source,
-            name=body.get("name", "") or "",
-            args=body.get("args") if isinstance(body.get("args"), dict) else {},
-            author=request.headers.get("X-Session-Key", ""),
-            session_key=request.headers.get("X-Session-Key", ""),
-            expected_store=request.get("workflow_expected_store"),
-            budget_total=budget_total,
-            timeout_secs=_opt_int(body.get("timeout_secs")),
-        )
+        with principal_scope(None if run_admission.work is None else run_admission.work.budget_key):
+            out = await svc.start(
+                source,
+                name=body.get("name", "") or "",
+                args=body.get("args") if isinstance(body.get("args"), dict) else {},
+                author=request.headers.get("X-Session-Key", ""),
+                session_key=request.headers.get("X-Session-Key", ""),
+                expected_store=request.get("workflow_expected_store"),
+                budget_total=budget_total,
+                timeout_secs=_opt_int(body.get("timeout_secs")),
+            )
     except Exception:
         logger.exception("workflow run failed")
+        await run_admission.abandon()
         return _error("could not start workflow", "workflow_run_failed", 500)
+    if "run_id" in out:
+        await run_admission.attach_child(
+            str(out["run_id"]), also=_workflow_worker_keys(str(out["run_id"]))
+        )
+    else:
+        await run_admission.abandon()
     status = 200 if "run_id" in out else 400
     return web.json_response(_redact_obj(out), status=status)
 
@@ -569,19 +658,26 @@ async def api_workflow_run_intent(request: web.Request) -> web.Response:
     if refusal is not None:
         return refusal
     try:
-        out = await svc.start_from_intent(
-            intent,
-            name=body.get("name", "") or "",
-            args=body.get("args") if isinstance(body.get("args"), dict) else {},
-            author=request.headers.get("X-Session-Key", ""),
-            session_key=request.headers.get("X-Session-Key", ""),
-            expected_store=request.get("workflow_expected_store"),
-            budget_total=budget_total,
-            timeout_secs=_opt_int(body.get("timeout_secs")),
+        out = await _start_admitted(
+            request,
+            svc,
+            body,
+            lambda: svc.start_from_intent(
+                intent,
+                name=body.get("name", "") or "",
+                args=body.get("args") if isinstance(body.get("args"), dict) else {},
+                author=request.headers.get("X-Session-Key", ""),
+                session_key=request.headers.get("X-Session-Key", ""),
+                expected_store=request.get("workflow_expected_store"),
+                budget_total=budget_total,
+                timeout_secs=_opt_int(body.get("timeout_secs")),
+            ),
         )
     except Exception:
         logger.exception("workflow run_intent failed")
         return _error("could not start workflow", "workflow_run_intent_failed", 500)
+    if isinstance(out, web.Response):
+        return out
     status = 200 if "run_id" in out else 400
     return web.json_response(_redact_obj(out), status=status)
 
@@ -755,16 +851,23 @@ async def api_workflow_run_rerun(request: web.Request) -> web.Response:
     if refusal is not None:
         return refusal
     try:
-        out = await svc.rerun_subtree(
-            run_id,
-            from_index,
-            source=edited_source,
-            caller_session=request.headers.get("X-Session-Key", ""),
-            owner=request.get("app") == "" and request.get("internal_auth") is not True,
+        out = await _start_admitted(
+            request,
+            svc,
+            ("rerun", run_id, body),
+            lambda: svc.rerun_subtree(
+                run_id,
+                from_index,
+                source=edited_source,
+                caller_session=request.headers.get("X-Session-Key", ""),
+                owner=request.get("app") == "" and request.get("internal_auth") is not True,
+            ),
         )
     except Exception:
         logger.exception("workflow rerun failed")
         return _error("could not rerun workflow", "workflow_rerun_failed", 500)
+    if isinstance(out, web.Response):
+        return out
     # 400 on validation error (bad edited script), 404 when the run is missing.
     if "run_id" in out:
         status = 200

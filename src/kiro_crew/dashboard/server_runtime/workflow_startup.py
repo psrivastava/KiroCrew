@@ -29,6 +29,7 @@ async def _initialize_workflow_service(state: DashboardState) -> None:
     try:
         from kiro_crew.dashboard.handlers import workflows as wf_handlers
         from kiro_crew.dashboard.workflow_inject import inject_bound_workflow_result
+        from kiro_crew.dashboard.workflow_session_port import WorkflowSessionPort
         from kiro_crew.security import redact_credentials, redact_exfiltration_urls
         from kiro_crew.workflows.service import WorkflowService
 
@@ -134,6 +135,7 @@ async def _initialize_workflow_service(state: DashboardState) -> None:
             now_fn=lambda: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             concurrency=_wf_concurrency,
             nudge_authorizer=_wf_nudge_authorizer,
+            session_port=WorkflowSessionPort(state),
             timeout_secs=_wf_timeout_secs,
         )
         # Cancellation cannot stop a to_thread worker. Even if the factory
@@ -152,6 +154,9 @@ async def _initialize_workflow_service(state: DashboardState) -> None:
         state.workflow_service = service
         state.workflow_startup_status = "ready"
         logger.info("WorkflowService ready (run ceiling=%ss)", service.timeout_secs)
+        # The chats of runs the restart ended were promised a result on
+        # completion; each gets the failure through the normal completion notice.
+        service.registry.notify_runs_ended_by_restart()
     except asyncio.CancelledError:
         state.workflow_startup_status = "stopped" if state.workflow_startup_stopping else "failed"
         raise

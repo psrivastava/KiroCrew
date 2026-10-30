@@ -24,7 +24,7 @@ If the dashboard doesn't load after setup:
 
 ### Chat (`/chat`)
 
-Multi-session parallel chat with full Markdown rendering, syntax-highlighted code blocks, Mermaid diagrams, and clickable file paths. A confirmed local file link in an agent reply opens that file in the chat side panel; a `:line` suffix opens the file at that line instead of navigating the browser back to Chat.
+Multi-session parallel chat with full Markdown rendering, syntax-highlighted code blocks, Mermaid diagrams, and clickable file paths. A confirmed local file link in an agent reply opens that file in the chat side panel; a `:line` suffix opens the file at that line instead of navigating the browser back to Chat. A link that leaves the dashboard (a web page, or an editor or mail link) always goes where it points: when its text is a file path (a repo file linked to its GitHub page, say), clicking it opens the link, not the local file, and the path is not turned into a clickable path chip. A reply can also offer a file it wrote as a one-click **Open file** chip under the reply, with a hidden `<!-- kirocrew:open-file path="/abs/path" -->` marker (absolute paths only). The chip opens nothing by itself: a click opens the file in the side panel exactly as clicking its path does. To get one after each note, ask your agent (for example in its instructions) to add the marker for the files it writes.
 
 - **Multiple tabs**: each tab runs its own agent session in parallel.
 - **Agent selection**: pick an agent before starting a chat, or switch mid-session.
@@ -60,15 +60,15 @@ Settings uses tabbed panels for Overview, Imports, Agent Harness, Chat, Display,
 
 ### Customize (`/capabilities`)
 
-Tabbed management for crewmates, custom agents, MCP connections, skills, the knowledge library, steering, hooks, prompts, and workflow libraries. `/agents`, `/connections` and `/knowledge` redirect here.
+Tabbed management for mates, custom agents, MCP connections, skills, the knowledge library, steering, hooks, prompts, and workflow libraries. `/agents`, `/connections` and `/knowledge` redirect here.
 
 ### Schedule (`/schedule`)
 
 Create and manage cron jobs, organize them in folders, and switch between list, calendar, and execution views.
 
-### Developer (`/developer`)
+### Developer (`/settings/developer`)
 
-Tabbed developer views for logs, system metrics, telemetry, storage, MCP pooling, memory, configuration, debug tools, and the session archive. The former standalone `/system` page is the System tab here. The agent backend lives in **Settings → Agent Harness**; an old `/developer?tab=agent-backend` link forwards there.
+**Settings → Developer** lists its pages beside the content: Feature Previews first, then the developer views for logs, system metrics, telemetry, storage, MCP pooling, memory, configuration, debug tools, and the session archive (`/settings/developer/<page>`, e.g. `/settings/developer/system`). Every page is always listed. An old `/developer?tab=<page>` link redirects to the same page here, and `/developer?tab=agent-backend` forwards to **Settings → Agent Harness**.
 
 ### Logs (`/logs`)
 
@@ -119,6 +119,18 @@ receive its ready frame leaves the existing owner in place and also closes the
 failed candidate without waiting indefinitely on its transport; a reconnect
 with no live owner (a reload) always converges, even while the shell is
 streaming output continuously.
+
+**Detached shells.** A shell keeps running while no browser is attached, through
+a reload, a dropped network or a sleeping laptop, and the next connection
+reattaches to it. Once it has been detached for `dashboard.terminal.orphan_timeout_s`
+seconds (default `43200`, 12 hours; values below `60` count as `60`), the gateway
+ends the shell and every process it started, logs a warning, records a
+`terminal.session.reap` security event and posts a "Terminal closed" bell note.
+When a new terminal would exceed `dashboard.terminal.max_sessions`, the shell
+that has had no browser attached the longest (at least a minute) is ended the
+same way to make room, so shells left behind on another device cannot block new
+terminals. A gateway restart also ends every shell. Run work that must outlive either inside
+`tmux` or `screen`.
 
 **Selection toolbar.** Highlighting text in a terminal shows a floating toolbar with **Send to chat** and **Copy**. Send to chat appends the selection to the chat composer draft (never overwrites the draft, never auto-sends), annotated with a `Terminal output (path):` header — using the live `cwd` value when the backend has reported one, else the terminal's spawn directory — and wrapped in a code fence so the agent reads it as literal output. Copy places the raw selection on the clipboard.
 

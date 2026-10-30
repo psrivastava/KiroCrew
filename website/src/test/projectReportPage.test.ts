@@ -93,18 +93,19 @@ function mount(
     agentic?: string[]
     seq?: number
     locale?: string
+    last_user_at?: string
   } = {},
 ) {
   ;(window as unknown as { kirocrew: unknown }).kirocrew = {
     fields,
     agentic: extra.agentic ?? ['ci', 'for_you', 'verdict'],
     seq: extra.seq ?? 412,
-    stale: false,
     missing: [],
     written_at: extra.written_at ?? {},
     // The host sets this only when the reader has a non-English UI locale; an absent
     // key is the English default, which is what every existing case above relies on.
     ...(extra.locale === undefined ? {} : { locale: extra.locale }),
+    ...(extra.last_user_at === undefined ? {} : { last_user_at: extra.last_user_at }),
   }
   document.body.replaceChildren(
     ...new DOMParser().parseFromString(MARKUP, 'text/html').body.childNodes,
@@ -122,10 +123,14 @@ function mount(
  * hears and re-renders from. Only this second thing can show that a refresh leaves
  * an expanded row expanded, because only this second thing has the state to lose.
  */
-function refresh(fields: Record<string, unknown>, extra: { written_at?: Record<string, string> } = {}) {
+function refresh(
+  fields: Record<string, unknown>,
+  extra: { written_at?: Record<string, string>; last_user_at?: string } = {},
+) {
   const api = (window as unknown as { kirocrew: Record<string, unknown> }).kirocrew
   api.fields = fields
   if (extra.written_at) api.written_at = extra.written_at
+  if (extra.last_user_at !== undefined) api.last_user_at = extra.last_user_at
   window.dispatchEvent(new MessageEvent('message', { data: { type: 'kirocrew:fields' } }))
 }
 
@@ -174,10 +179,10 @@ describe('project-report: the page the gateway ships', () => {
       expect(text('.pr-vd-block')).toContain('A maintainer clears it')
     })
 
-    it('marks the line as the crewmate\'s own', () => {
+    it('marks the line as the mate\'s own', () => {
       // A reader deciding whether to act on a judgment is entitled to know it is one.
       mount(live, { written_at: { verdict: iso(1) } })
-      expect(text('.pr-vd-meta')).toContain('crewmate wrote this')
+      expect(text('.pr-vd-meta')).toContain('mate wrote this')
     })
 
     it.each([
@@ -341,7 +346,7 @@ describe('project-report: the page the gateway ships', () => {
   })
 
   // ----------------------------------------------------------------- change 3
-  describe('idle time and the stale band', () => {
+  describe('idle time, with no stale band', () => {
     const base = {
       omitted: 0,
       series: [],
@@ -415,17 +420,14 @@ describe('project-report: the page the gateway ships', () => {
       expect(quietOf()).toHaveLength(0)
     })
 
-    it('raises a band when the fold itself has stopped advancing', () => {
-      // The difference between "working" and "dead", which a page of intact numbers
-      // cannot otherwise show.
-      mount({ ...base, last_entry_at: iso(100), items: [board([task()])] })
-      expect(text('.pr-stale')).toContain('No new entry for 1h40m')
-      expect(text('.pr-stale')).toContain('last-known reading')
-    })
-
-    it('names the fold seq in the band, so the reading can be placed', () => {
+    it('raises no band when the fold itself has stopped advancing', () => {
+      // The person is shown no staleness message: a crewmate whose record stopped
+      // moving is its own news, told in its turn block, not a band on this page.
       mount({ ...base, last_entry_at: iso(100), items: [board([task()])] }, { seq: 412 })
-      expect(text('.pr-stale')).toContain('fold seq 412')
+      expect(document.querySelector('.pr-stale')).toBeNull()
+      expect(document.body.textContent ?? '').not.toContain('No new entry')
+      expect(document.body.textContent ?? '').not.toContain('last-known reading')
+      expect(document.body.textContent ?? '').not.toContain('fold seq')
     })
 
     it('raises no band while the fold is advancing', () => {
@@ -441,10 +443,9 @@ describe('project-report: the page the gateway ships', () => {
     })
   })
 
-  // The three bands are above the numbers they qualify, which is the only order that
-  // works: a reader who learns the page is dead should learn it before reading a
-  // number off it.
-  it('puts the stale band, the verdict and the lanes above the view', () => {
+  // The verdict and the lanes are above the numbers they qualify, and no stale band
+  // sits above them, even for a fold that has gone quiet.
+  it('puts the verdict and the lanes above the view, with no stale band', () => {
     mount({
       items: [board([task({ pr: '1', last_report_at: iso(5) })])],
       omitted: 0,
@@ -457,7 +458,7 @@ describe('project-report: the page the gateway ships', () => {
     const order = all('.pr-stale, .pr-vd, .pr-lanes, #pr-view').map((n) =>
       n.id === 'pr-view' ? 'view' : n.className,
     )
-    expect(order).toEqual(['pr-stale', 'pr-vd', 'pr-lanes', 'view'])
+    expect(order).toEqual(['pr-vd', 'pr-lanes', 'view'])
   })
   // ----------------------------------------------------------------- change 4
   describe('the task drawer', () => {
@@ -672,21 +673,24 @@ describe('project-report: the page the gateway ships', () => {
   })
 
   // ------------------------------------------------- live state, flash, and hold
-  describe('the live indicator', () => {
+  describe('no live indicator', () => {
     const base = { items: [board([task()])], omitted: 0, series: [], for_you: [] }
 
-    it('says Live and names when the page last read', () => {
-      mount({ ...base, last_entry_at: iso(2) })
-      expect(document.querySelector('.pr-live')?.getAttribute('data-live')).toBe('true')
-      expect(text('.pr-live')).toContain('Live')
-      expect(text('.pr-live')).toMatch(/Updated \d\d:\d\d/)
+    it('draws no Live dot or Updated time, fresh or quiet', () => {
+      // The person sees no freshness message in either direction.
+      for (const at of [iso(2), iso(100)]) {
+        mount({ ...base, last_entry_at: at })
+        expect(document.querySelector('.pr-live')).toBeNull()
+        expect(document.querySelector('.pr-stale')).toBeNull()
+        expect(document.body.textContent ?? '').not.toContain('No new entry')
+      }
     })
 
     it('reads one clock, so a committed screenshot is reproducible', () => {
       // The page must not mix `Date.now()` with `new Date()`. Both answer the same
       // thing in a browser and part company in the evidence harness, which pins
       // `Date.now` to its fixture's instant -- so a page mixing them renders a
-      // different "Updated" on every shoot and the committed images differ byte for
+      // different reading on every shoot and the committed images differ byte for
       // byte. Asserted on the SOURCE because a fake timer here patches both.
       // COMMENTS STRIPPED FIRST. The line above this one quotes the forbidden form
       // in order to explain it, and a scan counting that would report the page's own
@@ -697,20 +701,12 @@ describe('project-report: the page the gateway ships', () => {
         .join('\n')
       const bare = code.match(/new Date\(\s*\)/g) || []
       expect(bare, 'a bare `new Date()` reads the real clock past the pin').toEqual([])
-      // THE CONTROL. Without it an empty result also means the pattern is wrong, and
+      // THE CONTROL. Without it an empty result also means the scan read nothing, and
       // a scan that matches nothing anywhere passes this case forever.
-      expect(code.match(/new Date\(Date\.now\(\)\)/g) || [], 'the pattern matches nothing')
-        .toHaveLength(1)
+      expect(code.match(/Date\.now\(\)/g) || [], 'the page reads no clock at all')
+        .not.toHaveLength(0)
     })
 
-    it('stops claiming Live once nothing is arriving', () => {
-      // Read from the same stamp the stale band is raised from, so the dot and the
-      // band cannot disagree about whether the page is being fed.
-      mount({ ...base, last_entry_at: iso(100) })
-      expect(document.querySelector('.pr-live')?.getAttribute('data-live')).toBe('false')
-      expect(text('.pr-live')).toContain('No new entry')
-      expect(document.querySelector('.pr-stale')).toBeTruthy()
-    })
   })
 
   describe('the host writes the same elements this page does', () => {
@@ -828,15 +824,16 @@ describe('project-report: the page the gateway ships', () => {
     // and it is on screen the moment a fresh crewmate writes anything.
     it('says just now without a suffix', () => {
       mount({ items: [], last_entry_at: '2026-10-04T17:11:30Z' })
-      expect(text('.pr-live')).toContain('just now')
-      expect(text('.pr-live'), 'reads "just now ago"').not.toContain('just now ago')
+      const cell = '[data-dashboard-field="last_entry_at"]'
+      expect(text(cell)).toContain('just now')
+      expect(text(cell), 'reads "just now ago"').not.toContain('just now ago')
     })
 
     it('still says ago for a real length', () => {
       // The control: without it, deleting the suffix everywhere would pass the case
       // above while making every other reading tenseless.
       mount({ items: [], last_entry_at: '2026-10-04T16:00:00Z' })
-      expect(text('.pr-live')).toContain('1h12m ago')
+      expect(text('[data-dashboard-field="last_entry_at"]')).toContain('1h12m ago')
     })
 
     it('keeps the quiet chip a bare length', () => {
@@ -939,7 +936,54 @@ describe('project-report: the page the gateway ships', () => {
     })
   })
 
-  describe('a crewmate with no workstream', () => {
+  describe('what needs you counts open items only', () => {
+    // A worker's last word outlives the conductor's close: an item whose worker asked
+    // and which the conductor then accepted, rejected or abandoned still reads
+    // `question` or `blocked`. Counted by status alone, every such item stayed under
+    // Needs you and the number only grew. The fold's own `needs_you` counts open items
+    // only, and the page must too: it raises the fold's count to the rows it draws, so
+    // a page drawing the closed rows would put them back in the number.
+    const closed = ['accepted', 'rejected', 'abandoned'].flatMap((state) =>
+      ['question', 'blocked'].map((status) =>
+        task({ item_id: `${state}-${status}`, title: `${state} ${status}`, state, status }),
+      ),
+    )
+    const fields = () => ({
+      items: [
+        board(
+          [
+            task({ item_id: 'q', title: 'open question', status: 'question', summary: 'which?' }),
+            task({ item_id: 'b', title: 'open blocked', status: 'blocked', summary: 'no key' }),
+            task({ item_id: 'p', title: 'open progress', status: 'progress' }),
+            ...closed,
+          ],
+          // What the fold reports for this board: the two open items that wait.
+          { needs_you: 2, open: 3, accepted: 2 },
+        ),
+      ],
+      omitted: 0,
+      series: [],
+      for_you: [],
+      last_entry_at: iso(3),
+    })
+
+    it('draws a card for an open question and an open blocker, and nothing closed', () => {
+      mount(fields())
+      const titles = all('.pr-todo-i .pr-todo-x > b').map((n) => n.textContent)
+      expect(titles.sort()).toEqual(['open blocked', 'open question'])
+    })
+
+    it('counts the same two in the header and on the KPI card', () => {
+      mount(fields())
+      expect(text('#pr-sentence')).toContain('2 need you')
+      const card = all('.pr-kpi').find(
+        (n) => n.querySelector('.pr-kpi-label')?.textContent === 'Needs you',
+      )
+      expect(own(card?.querySelector('.pr-kpi-v'))).toBe('2')
+    })
+  })
+
+  describe('a mate with no workstream', () => {
     // THE BUG the lead found on the pod: the header counted "1 needs you" while the
     // body under it said "No workstream yet. Nothing needs you". Two numbers from one
     // page disagreeing, and the one a reader can ACT on was the wrong one.
@@ -1079,6 +1123,336 @@ describe('project-report: the page the gateway ships', () => {
     })
   })
 
+  // ------------------------- cards asked before the person wrote in the chat fold
+  describe('cards asked before the person wrote in the chat', () => {
+    // A reply typed in the chat, an option clicked there and a steer into the running
+    // turn never pass through this page. The host says when the person last spoke in
+    // the chat (`last_user_at`), so cards the crewmate wrote BEFORE that fold under
+    // Asked before you wrote in chat, not asking the reader, until it writes the list
+    // again. The page cannot tell whether that message answered a card.
+    const WROTE = iso(10)
+    const cards = [
+      { text: 'Fix the CLI bubble?', ask: 'decide', options: ['Fix it', 'Leave it'], workstream: '' },
+      { text: 'Fix skill_search?', ask: 'decide', options: ['Fix it', 'Leave it'], workstream: '' },
+    ]
+    // One worker question beside the cards, so the KPI card is drawn and a count that
+    // dropped only the folded cards is told apart from one that dropped everything.
+    const page = (over: Record<string, unknown> = {}) => ({
+      items: [
+        board(
+          [task({ item_id: 'q1', title: 'which base?', status: 'question', last_report_at: iso(2) })],
+          { needs_you: 1 },
+        ),
+      ],
+      omitted: 0,
+      series: [],
+      for_you: cards,
+      last_entry_at: iso(3),
+      ...over,
+    })
+    const openCards = () => all('.pr-todo-i > .pr-todo-x > b').map((n) => n.textContent?.trim())
+    const folds = () => all('.pr-fold > summary').map((n) => n.textContent?.trim())
+    const sentLines = () => all('.pr-todo-sent').map((n) => n.textContent?.trim() ?? '')
+    const needsKpi = () => {
+      const card = all('.pr-kpi').find((k) => k.querySelector('.pr-kpi-label')?.textContent === 'Needs you')
+      return own(card?.querySelector('.pr-kpi-v'))
+    }
+    const needsSub = () => {
+      const card = all('.pr-kpi').find((k) => k.querySelector('.pr-kpi-label')?.textContent === 'Needs you')
+      return card?.querySelector('.pr-kpi-sub')?.textContent?.trim() ?? ''
+    }
+    const replied = { written_at: { for_you: WROTE }, last_user_at: iso(5) }
+
+    it('folds the cards written before the person wrote in chat under their own heading, saying why', () => {
+      mount(page(), replied)
+      expect(openCards()).toEqual(['which base?'])
+      // Picked nothing on the page, so they are not under Answered.
+      expect(folds()).toEqual(['Asked before you wrote in chat \u00b7 2'])
+      const lines = sentLines()
+      expect(lines).toHaveLength(2)
+      for (const line of lines) expect(line).toContain('\u2192 You wrote in chat after this was asked')
+    })
+
+    it('says in the header how many were asked before the person wrote in chat', () => {
+      mount(page(), replied)
+      expect(text('#pr-sentence')).toContain('1 needs you, 2 asked before you wrote in chat')
+      // Nothing is added when no card is folded by a message in the chat.
+      mount(page(), { written_at: { for_you: WROTE } })
+      expect(text('#pr-sentence')).not.toContain('asked before you wrote in chat')
+    })
+
+    it('says on the KPI card how many were asked before the person wrote in chat when nothing else needs the reader', () => {
+      const quiet = page({ items: [board([task({ item_id: 'p1', title: 'build it', status: 'progress' })])] })
+      mount(quiet, replied)
+      expect(needsKpi()).toBe('0')
+      expect(needsSub()).toBe('2 asked before you wrote in chat')
+      mount(quiet, { written_at: { for_you: WROTE } })
+      expect(needsSub()).toBe('2 of them raised by the mate')
+    })
+
+    it('takes them out of every Needs-you count, and only them', () => {
+      mount(page(), { written_at: { for_you: WROTE } })
+      expect(needsKpi()).toBe('3')
+      expect(text('#pr-sentence')).toContain('3 need you')
+      mount(page(), replied)
+      expect(needsKpi()).toBe('1')
+      expect(text('#pr-sentence')).toContain('1 needs you')
+      // None of the one left was raised by the crewmate, and nothing is "not shown".
+      expect(text('.pr-kpis')).not.toContain('raised by the mate')
+      expect(text('#pr-view')).not.toContain('more not shown')
+    })
+
+    it('still names the worker asks a truncated list could not show', () => {
+      // The fold counts three asks on the board and the page holds one of them. The two
+      // cards asked before the person wrote in chat are drawn but not counted, so they
+      // cannot stand in for the two asks the list dropped.
+      const truncated = page({
+        items: [
+          board(
+            [task({ item_id: 'q1', title: 'which base?', status: 'question', last_report_at: iso(2) })],
+            { needs_you: 3, tasks_omitted: 2 },
+          ),
+        ],
+      })
+      mount(truncated, replied)
+      expect(needsKpi()).toBe('3')
+      expect(text('#pr-view')).toContain('2 more not shown (list truncated)')
+    })
+
+    it('keeps asking when the mate wrote the list after the reply', () => {
+      mount(page(), { written_at: { for_you: iso(5) }, last_user_at: iso(10) })
+      expect(openCards()).toEqual(['which base?', 'Fix the CLI bubble?', 'Fix skill_search?'])
+      expect(folds()).toEqual([])
+    })
+
+    it('keeps asking when the reply and the list share a second', () => {
+      // The host sends both stamps at whole seconds, so a list written later in the
+      // same second as the reply reads as EQUAL to it, which does not fold the cards.
+      mount(page(), { written_at: { for_you: '2026-10-04T17:02:00+00:00' }, last_user_at: '2026-10-04T17:02:00+00:00' })
+      expect(openCards()).toHaveLength(3)
+      expect(folds()).toEqual([])
+    })
+
+    it('keeps asking when either stamp cannot be read', () => {
+      for (const extra of [
+        { written_at: { for_you: WROTE }, last_user_at: 'not a time' },
+        { written_at: { for_you: WROTE }, last_user_at: '' },
+        { written_at: { for_you: WROTE } },
+        { written_at: {}, last_user_at: iso(5) },
+        { written_at: { for_you: 'not a time' }, last_user_at: iso(5) },
+      ]) {
+        mount(page(), extra)
+        expect(openCards(), JSON.stringify(extra)).toHaveLength(3)
+        expect(text('#pr-sentence'), JSON.stringify(extra)).toContain('3 need you')
+      }
+    })
+
+    it('asks again once the mate writes the list after the reply', () => {
+      mount(page(), replied)
+      expect(openCards()).toHaveLength(1)
+      refresh(page(), { written_at: { for_you: iso(1) } })
+      expect(openCards()).toHaveLength(3)
+      expect(text('#pr-sentence')).toContain('3 need you')
+    })
+
+    it('unfolds a card on Show card until the next reply folds it again', () => {
+      mount(page(), replied)
+      const buttons = all('.pr-todo-sent button').map((b) => b.textContent)
+      expect(buttons).toEqual(['Show card', 'Show card'])
+      ;(all('.pr-todo-sent button')[0] as HTMLButtonElement).click()
+      expect(openCards()).toEqual(['which base?', 'Fix the CLI bubble?'])
+      expect(folds()).toEqual(['Asked before you wrote in chat \u00b7 1'])
+      expect(text('#pr-sentence')).toContain('2 need you, 1 asked before you wrote in chat')
+      // A refill with the same reply keeps the card the reader unfolded.
+      refresh(page())
+      expect(openCards()).toEqual(['which base?', 'Fix the CLI bubble?'])
+      // A newer reply folds it again.
+      refresh(page(), { last_user_at: iso(4) })
+      expect(openCards()).toEqual(['which base?'])
+      expect(folds()).toEqual(['Asked before you wrote in chat \u00b7 2'])
+    })
+
+    it('moves focus to the card Show card brings back, flashed and still saying the person wrote in chat after it', () => {
+      mount(page(), replied)
+      ;(all('.pr-todo-sent button')[0] as HTMLButtonElement).click()
+      const active = document.activeElement as HTMLElement
+      expect(active.classList.contains('pr-todo-i')).toBe(true)
+      expect(active.querySelector('.pr-todo-x > b')?.textContent).toBe('Fix the CLI bubble?')
+      expect(active.classList.contains('pr-flash')).toBe(true)
+      expect(active.tabIndex).toBe(-1)
+      expect(active.textContent).toContain('You wrote in chat after this was asked')
+      // Only the card brought back is marked, and the next render marks nothing.
+      expect(all('.pr-todo-i.pr-flash')).toHaveLength(1)
+      refresh(page())
+      expect(all('.pr-todo-i.pr-flash')).toHaveLength(0)
+    })
+
+    it('brings a card back on Show card without moving it, scrolling instantly under reduced motion', () => {
+      // The shared setup installs a writable matchMedia stub that never matches.
+      const realMatchMedia = window.matchMedia
+      // A folded row and a card report different tops, so a slide from one to the
+      // other would have an offset to animate.
+      const rect = vi.spyOn(Element.prototype, 'getBoundingClientRect').mockImplementation(function (this: Element) {
+        const top = this.classList.contains('pr-todo-sent') ? 400 : this.classList.contains('pr-todo-i') ? 100 : 0
+        return { top, bottom: top + 40, left: 0, right: 200, width: 200, height: 40, x: 0, y: top, toJSON: () => ({}) } as DOMRect
+      })
+      const scroll = vi.spyOn(Element.prototype, 'scrollIntoView')
+      try {
+        for (const reduce of [true, false]) {
+          window.matchMedia = ((query: string) => ({
+            matches: reduce && query === '(prefers-reduced-motion: reduce)',
+            media: query,
+            onchange: null,
+            addEventListener: () => {},
+            removeEventListener: () => {},
+            addListener: () => {},
+            removeListener: () => {},
+            dispatchEvent: () => false,
+          })) as unknown as typeof window.matchMedia
+          scroll.mockClear()
+          mount(page(), replied)
+          ;(all('.pr-todo-sent button')[0] as HTMLButtonElement).click()
+          const active = document.activeElement as HTMLElement
+          expect(active.classList.contains('pr-todo-i'), String(reduce)).toBe(true)
+          expect(active.classList.contains('pr-flash'), String(reduce)).toBe(true)
+          const style = active.getAttribute('style') ?? ''
+          expect(style, String(reduce)).not.toContain('transform')
+          expect(style, String(reduce)).not.toContain('transition')
+          expect(scroll).toHaveBeenCalledTimes(1)
+          expect(scroll).toHaveBeenCalledWith({ behavior: reduce ? 'auto' : 'smooth', block: 'nearest' })
+        }
+      } finally {
+        window.matchMedia = realMatchMedia
+        rect.mockRestore()
+        scroll.mockRestore()
+      }
+    })
+
+    it('folds a card brought back with Show card again on Hide card, focus on the fold heading', () => {
+      mount(page(), replied)
+      ;(all('.pr-todo-sent button')[0] as HTMLButtonElement).click()
+      // Only the card brought back carries Hide card.
+      const withHide = all('.pr-todo-i').filter((c) => c.querySelector('.pr-todo-again button'))
+      expect(withHide.map((c) => c.querySelector('.pr-todo-x > b')?.textContent)).toEqual(['Fix the CLI bubble?'])
+      const hide = all('.pr-todo-again button')
+      expect(hide.map((b) => b.textContent)).toEqual(['Hide card'])
+      expect((hide[0] as HTMLButtonElement).type).toBe('button')
+      ;(hide[0] as HTMLButtonElement).click()
+      expect(openCards()).toEqual(['which base?'])
+      expect(folds()).toEqual(['Asked before you wrote in chat \u00b7 2'])
+      expect(text('#pr-sentence')).toContain('1 needs you, 2 asked before you wrote in chat')
+      expect(all('.pr-todo-again')).toHaveLength(0)
+      // The clicked button is gone, so focus is on the heading of the fold the card went into.
+      const active = document.activeElement as HTMLElement
+      expect(active.tagName).toBe('SUMMARY')
+      expect(active.textContent).toBe('Asked before you wrote in chat \u00b7 2')
+      expect(active.parentElement?.querySelectorAll('.pr-todo-sent')).toHaveLength(2)
+      // A refill with the same reply keeps it folded.
+      refresh(page())
+      expect(openCards()).toEqual(['which base?'])
+      expect(folds()).toEqual(['Asked before you wrote in chat \u00b7 2'])
+    })
+
+    it('unfolds a card picked on the page and then sent, with one Undo', () => {
+      mount(page(), { written_at: { for_you: WROTE } })
+      const fix = all('.pr-todo-opt').find((b) => b.textContent === 'Fix it') as HTMLButtonElement
+      fix.click()
+      vi.advanceTimersByTime(200)
+      // The person sent what the button put in the chat box: that is a reply too.
+      refresh(page(), { last_user_at: iso(5) })
+      expect(sentLines()[0]).toContain('\u2192 Fix it')
+      // A card picked on the page keeps Undo under Answered; the one folded by the reply
+      // alone goes under Asked before you wrote in chat, with Show card.
+      expect(folds()).toEqual(['Answered \u00b7 1', 'Asked before you wrote in chat \u00b7 1'])
+      expect(sentLines()[1]).toContain('\u2192 You wrote in chat after this was asked')
+      expect(all('.pr-todo-sent button').map((b) => b.textContent)).toEqual(['Undo', 'Show card'])
+      ;(all('.pr-todo-sent button')[0] as HTMLButtonElement).click()
+      expect(openCards()).toContain('Fix the CLI bubble?')
+    })
+
+    it('folds every card on an unrelated reply the mate has not answered, each still on the page', () => {
+      // The person writes about something else and the crewmate has not written the
+      // list again yet: every card folds, and each stays drawn with its own text and its
+      // own Show card button, so none of them leaves the page.
+      mount(page(), replied)
+      expect(openCards()).toEqual(['which base?'])
+      expect(folds()).toEqual(['Asked before you wrote in chat \u00b7 2'])
+      const rows = all('.pr-todo-sent')
+      expect(rows.map((r) => r.querySelector('b')?.textContent)).toEqual(['Fix the CLI bubble?', 'Fix skill_search?'])
+      expect(rows.map((r) => r.querySelector('button')?.textContent)).toEqual(['Show card', 'Show card'])
+      // The crewmate's next write shows them asking.
+      refresh(page(), { written_at: { for_you: iso(1) } })
+      expect(openCards()).toEqual(['which base?', 'Fix the CLI bubble?', 'Fix skill_search?'])
+      expect(folds()).toEqual([])
+    })
+
+    it('says nothing is left to pick only when every folded card was picked on the page', () => {
+      const NOTHING = 'Nothing left to pick.'
+      // Every card folded by the chat reply alone: the crewmate may still ask again,
+      // so the desk does not say nothing is left.
+      mount({ items: [], for_you: cards }, replied)
+      expect(openCards()).toEqual([])
+      expect(folds()).toEqual(['Asked before you wrote in chat \u00b7 2'])
+      expect(text('#pr-view')).not.toContain(NOTHING)
+      // Every card picked on the page, and none folded by the chat: the line still shows.
+      mount({ items: [], for_you: cards }, { written_at: { for_you: WROTE } })
+      for (let n = 0; n < 2; n++) {
+        const fix = all('.pr-todo-opt').find((b) => b.textContent === 'Fix it') as HTMLButtonElement
+        fix.click()
+        vi.advanceTimersByTime(200)
+      }
+      expect(openCards()).toEqual([])
+      expect(folds()).toEqual(['Answered \u00b7 2'])
+      expect(text('#pr-view')).toContain(NOTHING)
+      // One card picked on the page and the other folded by a later message in the
+      // chat: nothing is open, but the folded one may still be asked again.
+      mount({ items: [], for_you: cards }, { written_at: { for_you: WROTE } })
+      ;(all('.pr-todo-opt').find((b) => b.textContent === 'Fix it') as HTMLButtonElement).click()
+      vi.advanceTimersByTime(200)
+      refresh({ items: [], for_you: cards }, { last_user_at: iso(5) })
+      expect(openCards()).toEqual([])
+      expect(folds()).toEqual(['Answered \u00b7 1', 'Asked before you wrote in chat \u00b7 1'])
+      expect(text('#pr-view')).not.toContain(NOTHING)
+    })
+
+    it('keeps a card asked before the person wrote in chat reachable on a page with no board', () => {
+      mount({ items: [], for_you: cards }, replied)
+      expect(folds()).toEqual(['Asked before you wrote in chat \u00b7 2'])
+      expect(all('.pr-todo-sent button')).toHaveLength(2)
+      expect(text('#pr-sentence')).toContain('0 need you, 2 asked before you wrote in chat')
+      expect(text('#pr-view')).not.toContain('Nothing needs you, and nothing has been spent')
+    })
+
+    it('words the line in the mate\u2019s language, else in the reader\u2019s', () => {
+      mount(
+        page({
+          verdict: {
+            words: { replied: 'Saw your reply', reopen: 'Bring back', in_chat: 'With the mate', hide: 'Put away' },
+          },
+        }),
+        replied,
+      )
+      expect(sentLines()[0]).toContain('\u2192 Saw your reply')
+      expect(text('.pr-todo-sent button')).toBe('Bring back')
+      expect(folds()).toEqual(['With the mate \u00b7 2'])
+      ;(all('.pr-todo-sent button')[0] as HTMLButtonElement).click()
+      expect(all('.pr-todo-again button').map((b) => b.textContent)).toEqual(['Put away'])
+      mount(page(), { ...replied, locale: 'zh-CN' })
+      // The zh-CN table defaults for word_replied, word_in_chat, word_reopen, word_hide
+      // and the header's in_chat_suffix.
+      expect(sentLines()[0]).toContain(
+        '\u8fd9\u6761\u63d0\u51fa\u540e\uff0c\u4f60\u5728\u804a\u5929\u91cc\u53d1\u8fc7\u6d88\u606f',
+      )
+      expect(folds()).toEqual(['\u5728\u4f60\u53d1\u804a\u5929\u6d88\u606f\u4e4b\u524d\u63d0\u51fa \u00b7 2'])
+      expect(text('.pr-todo-sent button')).toBe('\u663e\u793a\u5361\u7247')
+      expect(text('#pr-sentence')).toContain(
+        '\uff0c2 \u4e2a\u5728\u4f60\u53d1\u804a\u5929\u6d88\u606f\u4e4b\u524d\u63d0\u51fa',
+      )
+      ;(all('.pr-todo-sent button')[0] as HTMLButtonElement).click()
+      expect(all('.pr-todo-again button').map((b) => b.textContent)).toEqual(['\u6536\u8d77\u5361\u7247'])
+    })
+  })
+
   // ------------------------------------------------ the desk words follow the locale
   describe('the desk words default from the locale, overridden by the verdict', () => {
     // The desk's labels have per-locale defaults in the page's own I18N table, and a
@@ -1112,6 +1486,127 @@ describe('project-report: the page the gateway ships', () => {
     it('renders the English default word when the locale is en', () => {
       mount(deskFields(), { locale: 'en' })
       expect(ownButton()).toBe('Write my own')
+    })
+  })
+
+  // ------------------------------------------------- what the crewmate published
+  describe('the published block', () => {
+    const PANEL = JSON.parse(
+      readFileSync(
+        resolve(__dirname, '../../../test/fixtures/dashboard_templates/sample_panel.json'),
+        'utf-8',
+      ),
+    ).folds.panel.value
+    const published = PANEL.data as Record<string, unknown>
+    const card = () => document.querySelector('#pr-published-host .pr-pub')
+
+    it('draws every published key as text, each shape its own way', () => {
+      mount({ items: [], published })
+      const node = card()
+      expect(node, 'no published block was drawn').not.toBeNull()
+      expect(text('#pr-published-host .pr-card-t')).toBe('Release watch')
+      // A short scalar is a tile.
+      const tiles = all('#pr-published-host .pr-pub-tile').map((t) => t.textContent)
+      expect(tiles).toEqual(['phaserollout', 'open rulings2', 'healthyyes'])
+      // A long string is a paragraph.
+      expect(text('#pr-published-host .pr-pub-prose')).toContain('canary to settle')
+      // An array of objects is a table, columns unioned across rows.
+      const heads = all('#pr-published-host table.pr-pub-t th').map((t) => t.textContent)
+      expect(heads).toEqual(['name', 'state', 'hosts'])
+      expect(all('#pr-published-host table.pr-pub-t td').map((t) => t.textContent)).toContain('canary')
+      // An array of scalars is a list.
+      expect(all('#pr-published-host ul.pr-pub-l li').map((t) => t.textContent)).toEqual([
+        'canary alarm under review',
+        'one host failed its health check',
+      ])
+      // A nested object is key/value rows.
+      expect(all('#pr-published-host dl.pr-pub-kv dt').map((t) => t.textContent)).toEqual([
+        'rollout',
+        'approval',
+      ])
+      // Published order is kept: the section headings follow the keys.
+      expect(all('#pr-published-host .pr-pub-k').map((t) => t.textContent)).toEqual([
+        'summary',
+        'regions',
+        'blockers',
+        'roles',
+      ])
+    })
+
+    it('says the mate wrote it', () => {
+      mount({ items: [], published })
+      expect(text('#pr-published-host .pr-agent')).toBe('mate wrote this')
+      expect(text('[data-dashboard-field="published"]')).toBe('a board')
+    })
+
+    it('draws markup in a value as text, never as an element', () => {
+      const hostile = '<img src=x onerror="window.__pwned=1"><b>bold</b>'
+      mount({ items: [], published: { note: hostile, rows: [{ cell: hostile }], list: [hostile] } })
+      expect(document.querySelector('#pr-published-host img')).toBeNull()
+      expect(document.querySelector('#pr-published-host b')).toBeNull()
+      expect(card()?.textContent).toContain('<img src=x')
+    })
+
+    it('is hidden when the mate never published', () => {
+      for (const value of [undefined, {}, [], 'text']) {
+        mount({ items: [], published: value })
+        expect(card(), `a block was drawn for ${JSON.stringify(value)}`).toBeNull()
+        expect(document.getElementById('pr-published-host')?.childNodes.length).toBe(0)
+      }
+    })
+
+    it('leaves when a refresh drops the publish', () => {
+      mount({ items: [], published })
+      expect(card()).not.toBeNull()
+      refresh({ items: [], published: {} })
+      expect(card()).toBeNull()
+    })
+
+    it('says yes and no in the reader\'s language', () => {
+      mount({ items: [], published: { healthy: true, done: false } }, { locale: 'zh-CN' })
+      const tiles = all('#pr-published-host .pr-pub-tile dd').map((t) => t.textContent)
+      expect(tiles).toEqual(['\u662f', '\u5426'])
+    })
+
+    it('leaves the footer clause out when nothing was published', () => {
+      mount({ items: [board([task()])] })
+      expect((document.getElementById('pr-note-pub') as HTMLElement).style.display).toBe('none')
+      refresh({ items: [board([task()])], published })
+      expect((document.getElementById('pr-note-pub') as HTMLElement).style.display).toBe('')
+    })
+
+    it('caps a long table and says so', () => {
+      const rows = Array.from({ length: 150 }, (_, i) => ({ n: i }))
+      mount({ items: [], published: { rows } })
+      expect(all('#pr-published-host table.pr-pub-t tr')).toHaveLength(101)
+      expect(text('#pr-published-host .pr-pub-note')).toBe('showing 100 of 150')
+    })
+
+    it('says when it drops columns', () => {
+      const row = Object.fromEntries(Array.from({ length: 25 }, (_, i) => [`k${i}`, i]))
+      mount({ items: [], published: { rows: [row] } })
+      expect(all('#pr-published-host table.pr-pub-t th')).toHaveLength(20)
+      expect(text('#pr-published-host .pr-pub-note')).toBe('columns capped at 20')
+    })
+
+    it('says once that only a publish is shown, with no zero counters above it', () => {
+      const HINT = 'Below is what this mate last published.'
+      mount({ items: [], published })
+      expect(document.body.textContent).toContain(HINT)
+      expect(document.body.textContent).not.toContain('No workstream yet.')
+      expect((document.getElementById('pr-pills') as HTMLElement).style.display).toBe('none')
+      expect((document.getElementById('pr-sentence') as HTMLElement).style.display).toBe('none')
+      // With no publish the page is the ordinary empty page, counters included.
+      mount({ items: [] })
+      expect(document.body.textContent).not.toContain(HINT)
+      expect((document.getElementById('pr-pills') as HTMLElement).style.display).toBe('')
+    })
+
+    it('brings the counters back once tracked work arrives', () => {
+      mount({ items: [], published })
+      refresh({ items: [board([task()])], published })
+      expect((document.getElementById('pr-pills') as HTMLElement).style.display).toBe('')
+      expect((document.getElementById('pr-sentence') as HTMLElement).style.display).toBe('')
     })
   })
 })

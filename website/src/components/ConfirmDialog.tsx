@@ -57,6 +57,7 @@ interface PendingConfirm {
  */
 export function useConfirm(): {
   confirm: (opts: ConfirmOptions) => Promise<boolean>
+  cancel: () => void
   confirmDialog: ReactNode
   confirmOpen: boolean
 } {
@@ -113,10 +114,16 @@ export function useConfirm(): {
       }
     >
       {/* Full-contrast body: this line carries the consequence ("permanently
-          deletes bucket …"), which must not read quieter than the buttons. */}
-      {opts.body != null ? <p className="text-sm text-text m-0">{opts.body}</p> : null}
+          deletes bucket …"), which must not read quieter than the buttons.
+          Text renders as a paragraph; an element body may carry block content
+          (a list of what is lost), which a <p> cannot contain. */}
+      {opts.body == null ? null : typeof opts.body === 'string'
+        ? <p className="text-sm text-text m-0">{opts.body}</p>
+        : <div className="text-sm text-text">{opts.body}</div>}
     </Modal>
   ) : null
 
-  return { confirm, confirmDialog, confirmOpen: !!pending }
+  const cancel = useCallback(() => settle(false), [settle])
+
+  return { confirm, cancel, confirmDialog, confirmOpen: !!pending }
 }

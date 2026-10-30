@@ -18,11 +18,13 @@ key:
 | `label` | English label the panel renders |
 | `tab` | Settings tab the control lives on, e.g. `display` |
 | `route` | The finished link that opens and flashes the control |
-| `description` | The in-panel help text, when the control has one |
+| `description` | Help text the row shows on screen, when it has any |
+| `hint` | Help text behind the row's info tip, when it has any; not shown on the row |
 | `configKey` | The config key the control writes, when it maps to exactly one |
 
-Many controls carry no `description`, so treat it as a bonus signal and never as
-a required field.
+Many controls carry no `description` or `hint`, so treat them as bonus signals and
+never as required fields. Quote only `description` as text the row displays: a
+`hint` sits behind the row's info tip, so tell the user to open the tip for it.
 
 ## Using a route
 
@@ -63,7 +65,7 @@ know the address.
 ## Matching a request to a control
 
 A user describes a setting the way it reads on screen, not the way it is keyed.
-Match their phrasing against `label` first, then `description`, and prefer the
+Match their phrasing against `label` first, then `description` and `hint`, and prefer the
 entry whose `tab` fits what they were talking about — "the sidebar looks wrong"
 points at `display` long before it points at `chat`.
 
@@ -95,8 +97,11 @@ second form meeting a translated dashboard, not a stale registry.
 - Controls whose label is computed at runtime rather than written in the panel.
   They are skipped by generation, so a control missing from the file is not
   necessarily missing from the UI.
-- Everything outside Settings — the Developer page, Customize, and the
-  App Store each have their own routes and are not enumerated here.
+- Everything outside Settings — Customize and the App Store each have their
+  own routes and are not enumerated here. The developer views (logs, system,
+  MCP Management and the rest) are pages of Settings → Developer
+  (`/settings/developer/<page>`), but only their controls that the generator
+  indexes appear in the registry.
 - Config keys with no control at all. Those are set in `config.json` or with
   `kirocrew config`; see [configuration.md](configuration.md).
 

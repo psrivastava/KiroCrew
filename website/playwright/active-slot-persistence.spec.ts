@@ -28,6 +28,10 @@ async function seedTwoSessions(request: APIRequestContext) {
 test.describe('Active slot persistence across surface switches', () => {
   test.beforeEach(async ({ page, request }) => {
     await seedTwoSessions(request)
+    // The rail starts collapsed; this spec clicks its text labels.
+    await page.addInitScript(() => {
+      if (localStorage.getItem('mc-nav') === null) localStorage.setItem('mc-nav', '0')
+    })
     await page.goto('/chat', { waitUntil: 'domcontentloaded' })
     await expect(page.locator('.session-row').first()).toBeVisible({ timeout: 10000 })
   })
@@ -61,6 +65,12 @@ test.describe('Active slot persistence across surface switches', () => {
     // selected slot instead of falling back to the first row.
     await nav.getByText('Settings').click()
     await page.waitForURL('**/settings**')
+    // The address moves the moment the row is clicked; the chat page leaves the
+    // screen only when that route transition commits (react-router wraps it in
+    // startTransition). "Leaving /chat" means the sidebar is gone, so wait for
+    // that, not just the URL: a return clicked while chat is still mounted
+    // never unmounts the page and proves nothing about restoring the slot.
+    await expect(page.locator('.session-row')).toHaveCount(0, { timeout: 10000 })
 
     // Switch back to Sessions (the chat surface)
     await nav.getByText('Sessions').click()
@@ -119,7 +129,9 @@ test.describe('Active slot persistence across surface switches', () => {
       const measure = (): Promise<Geometry> =>
         page.evaluate(() => {
           const toggleEl = document.querySelector<HTMLElement>('button[aria-label="Show sessions sidebar"]')
-          const stripEl = document.querySelector<HTMLElement>('[data-testid="session-tab-strip"]')
+          // The scroller wraps the tablist: the tablist is a Reorder.Group sized to
+          // its tabs, and Framer's drag auto-scroll only scrolls an ancestor of it.
+          const stripEl = document.querySelector<HTMLElement>('[data-testid="session-tab-scroller"]')
           if (!toggleEl || !stripEl) throw new Error('toggle or strip missing')
           const t = toggleEl.getBoundingClientRect()
           const s = stripEl.getBoundingClientRect()
@@ -162,7 +174,7 @@ test.describe('Active slot persistence across surface switches', () => {
       // maxScroll is read from the settled geometry: the strip's clientWidth
       // shrinks as the inset animates in, so a value read earlier would be stale.
       expect(atStart.strip.maxScroll).toBeGreaterThan(0)
-      await strip.evaluate((element, left) => { element.scrollLeft = left }, atStart.strip.maxScroll)
+      await page.getByTestId('session-tab-scroller').evaluate((element, left) => { element.scrollLeft = left }, atStart.strip.maxScroll)
       const atEnd = await settleAndMeasure()
       expect(atEnd.strip.scrollLeft).toBe(atStart.strip.maxScroll)
       assertClearance(atEnd)

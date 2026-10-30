@@ -14,7 +14,7 @@ vi.mock('../hooks/useTheme', () => ({
 }))
 
 import ThemeExperienceLayer from '../components/ThemeExperienceLayer'
-import { OVERLAY_Z_MAX, THEME_DECOR_SLOT_ID, registerThemeDecorSlot, __resetThemeDecorSlot } from '../lib/themeDecorLayer'
+import { OVERLAY_Z_MAX, THEME_DECOR_SLOT_ID, registerThemeDecorBehindSlot, registerThemeDecorSlot, __resetThemeDecorSlot } from '../lib/themeDecorLayer'
 
 // The layer reads `instances.activeId` (it unmounts when a remote Crew is active),
 // so every mount needs a Redux Provider. Shim `render` through RTL's `wrapper`
@@ -374,12 +374,63 @@ describe('ThemeExperienceLayer', () => {
     }
   })
 
+  it('portals behind-layer overlays into the behind slot and keeps them click-through', () => {
+    const slot = document.createElement('div')
+    const behind = document.createElement('div')
+    document.body.append(slot, behind)
+    try {
+      registerThemeDecorSlot(slot)
+      registerThemeDecorBehindSlot(behind)
+      setTheme({
+        assets: {
+          overlays: [
+            { id: 'web', position: 'fullscreen', zIndex: 1, pointerEvents: true, layer: 'behind', trigger: 'continuous' },
+            { id: 'sign', position: 'top-right', zIndex: 2, pointerEvents: true, trigger: 'continuous' },
+          ],
+          hasAudio: false,
+          hasPersona: false,
+        },
+      })
+      render(<ThemeExperienceLayer />)
+      const under = frames(behind)
+      expect(under).toHaveLength(1)
+      expect(under[0].getAttribute('src')).toMatch(/\/overlay\/web$/)
+      // A stale descriptor asking for clicks on the behind layer is ignored.
+      expect(under[0].style.pointerEvents).toBe('none')
+      const above = frames(slot)
+      expect(above).toHaveLength(1)
+      expect(above[0].getAttribute('src')).toMatch(/\/overlay\/sign$/)
+      expect(above[0].style.pointerEvents).toBe('auto')
+    } finally {
+      slot.remove()
+      behind.remove()
+    }
+  })
+
   it('renders overlays inline when no shell has registered a slot (onboarding, bootstrap)', () => {
     setTheme({
       assets: { overlays: ['stars'], hasAudio: false, hasPersona: false },
     })
     const { container } = render(<ThemeExperienceLayer />)
     const fs = frames(container)
+    expect(fs).toHaveLength(1)
+    expect(fs[0].getAttribute('src')).toMatch(/\/overlay\/stars$/)
+  })
+
+  it('skips behind-layer overlays when no shell registered a behind slot (popout, embed)', () => {
+    setTheme({
+      assets: {
+        overlays: [
+          { id: 'web', position: 'fullscreen', zIndex: 1, pointerEvents: false, layer: 'behind', trigger: 'continuous' },
+          'stars',
+        ],
+        hasAudio: false,
+        hasPersona: false,
+      },
+    })
+    const { container } = render(<ThemeExperienceLayer />)
+    const fs = frames(container)
+    // Inline there is nothing on top to cover it, so the behind overlay would paint over the text.
     expect(fs).toHaveLength(1)
     expect(fs[0].getAttribute('src')).toMatch(/\/overlay\/stars$/)
   })
@@ -435,6 +486,79 @@ describe('ThemeExperienceLayer', () => {
     } finally {
       vi.useRealTimers()
     }
+  })
+
+  // Scrolling and typing are activity wherever they happen. The terminal (xterm)
+  // stops propagation of the keys and wheel events it consumes, so each case
+  // dispatches from an element whose own listener does exactly that.
+  describe('idle-<N>s activity', () => {
+    const idleAssets = {
+      overlays: [{ id: 'idler', position: 'center', zIndex: 20, pointerEvents: false, trigger: 'idle-5s' }],
+      hasAudio: false,
+      hasPersona: false,
+    }
+    const idlerSrc = '/api/theme/bikini-bottom/overlay/idler'
+    let swallower: HTMLElement
+    const spies: { mockRestore: () => void }[] = []
+    beforeEach(() => {
+      vi.useFakeTimers()
+      swallower = document.createElement('div')
+      for (const type of ['keydown', 'wheel', 'touchmove', 'pointerdown']) {
+        swallower.addEventListener(type, (e) => e.stopPropagation())
+      }
+      document.body.appendChild(swallower)
+    })
+    afterEach(() => {
+      spies.splice(0).forEach((spy) => spy.mockRestore())
+      swallower.remove()
+      vi.useRealTimers()
+    })
+
+    it.each([
+      ['a key press in the terminal', () => new KeyboardEvent('keydown', { key: 'a', bubbles: true })],
+      ['a wheel scroll inside a scroll container', () => new WheelEvent('wheel', { deltaY: 40, bubbles: true })],
+      ['a touch scroll', () => new Event('touchmove', { bubbles: true })],
+    ])('counts %s as activity', (_name, makeEvent) => {
+      setTheme({ assets: idleAssets })
+      const { container } = render(<ThemeExperienceLayer />)
+      const mounted = () => frames(container).some((f) => f.getAttribute('src') === idlerSrc)
+      act(() => { vi.advanceTimersByTime(3000) })
+      act(() => { swallower.dispatchEvent(makeEvent()) })
+      // 5s after mount, but only 2s after the input: still counting down.
+      act(() => { vi.advanceTimersByTime(2000) })
+      expect(mounted()).toBe(false)
+      act(() => { vi.advanceTimersByTime(3000) })
+      expect(mounted()).toBe(true)
+      // The same input hides a showing overlay.
+      act(() => { swallower.dispatchEvent(makeEvent()) })
+      expect(mounted()).toBe(false)
+    })
+
+    it('listens in the capture phase without blocking scrolling', () => {
+      const add = vi.spyOn(window, 'addEventListener')
+      spies.push(add)
+      setTheme({ assets: idleAssets })
+      render(<ThemeExperienceLayer />)
+      for (const type of ['keydown', 'pointerdown', 'wheel', 'touchmove']) {
+        expect(add).toHaveBeenCalledWith(type, expect.any(Function), { capture: true, passive: true })
+      }
+    })
+
+    // Wheel and touchmove fire many times a second: an input only records its
+    // time, and the countdown already running checks it when it comes due.
+    it('arms no timer per input during a burst of scrolling and typing', () => {
+      setTheme({ assets: idleAssets })
+      render(<ThemeExperienceLayer />)
+      const setTimeoutSpy = vi.spyOn(window, 'setTimeout')
+      spies.push(setTimeoutSpy)
+      act(() => {
+        for (let i = 0; i < 25; i++) {
+          window.dispatchEvent(new WheelEvent('wheel', { deltaY: 4 }))
+          window.dispatchEvent(new KeyboardEvent('keydown', { key: 'j' }))
+        }
+      })
+      expect(setTimeoutSpy).not.toHaveBeenCalled()
+    })
   })
 
   // ── §4.3 theme:state downlink ──

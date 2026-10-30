@@ -16,8 +16,9 @@
  *     row bodies, which is the whole-sidebar jank the boundary exists to stop.
  *
  * Render counts are unobservable from the DOM, so they are counted at the
- * row's own boundary: every SessionRow body renders exactly one pinned-session
- * `DndDroppable`, and a test-side wrapper around that real component records
+ * row's own boundary: every SessionRow body renders exactly one row-target
+ * `DndDroppable` (`pinned-session` on a pinned row, `manual-session` on any
+ * other), and a test-side wrapper around that real component records
  * each render by slot key. The wrapper re-renders only when the row body hands
  * it a new element, so its count is the row's body count. (A React `<Profiler>`
  * inside the row cannot stand in: dnd-kit's context re-runs the droppable's
@@ -76,7 +77,18 @@ vi.mock('framer-motion', async () => {
 
 // Count row-menu renders through the real components: the displacement test
 // below pins that a moved row does not rebuild its menus.
-const menuRenders = { dropdown: 0, contextContent: 0 }
+const menuRenders = { dropdown: 0, contextContent: 0, contextRoot: 0 }
+// Radix's own Root, below the shared wrapper: it re-renders whenever its
+// children change, which is what a rebuilt trigger element would cause.
+vi.mock('@radix-ui/react-context-menu', async (orig) => {
+  const React = await import('react')
+  const real = await orig<typeof import('@radix-ui/react-context-menu')>()
+  const Root = (props: React.ComponentProps<typeof real.Root>) => {
+    menuRenders.contextRoot++
+    return React.createElement(real.Root, props)
+  }
+  return { ...real, Root }
+})
 vi.mock('../components/ui/dropdown-menu', async (orig) => {
   const React = await import('react')
   const real = await orig<typeof import('../components/ui/dropdown-menu')>()
@@ -125,7 +137,9 @@ vi.mock('../components/dnd', async (orig) => {
   const React = await import('react')
   const real = await orig<typeof import('../components/dnd')>()
   const DndDroppable = (props: React.ComponentProps<typeof real.DndDroppable>) => {
-    if (props.data?.type === 'pinned-session') {
+    // A row's own target: `pinned-session` on a pinned row, `manual-session` on
+    // every other row, so each row body renders exactly one of the two.
+    if (props.data?.type === 'pinned-session' || props.data?.type === 'manual-session') {
       const key = String(props.data.key)
       counts[key] = (counts[key] || 0) + 1
     }
@@ -359,7 +373,8 @@ describe('chat sidebar — session row memo boundary', () => {
   // A displaced row re-renders for the layout spring, but nothing in its ⋯
   // dropdown or its context-menu content depends on position: those elements
   // are memoized and React skips them. Building them on every displacement is
-  // ~90% of a pin's render work in a 65-session sidebar.
+  // ~90% of a pin's render work in a 65-session sidebar. The context menu's
+  // Radix tree is skipped too, although the row element it wraps is rebuilt.
   it('a displaced row re-renders without rebuilding its menus', () => {
     const N = 20
     const initial = Array.from({ length: N }, (_, i) => slot(`m-${String(i).padStart(2, '0')}`))
@@ -374,6 +389,7 @@ describe('chat sidebar — session row memo boundary', () => {
     for (const k of Object.keys(counts)) delete counts[k]
     menuRenders.dropdown = 0
     menuRenders.contextContent = 0
+    menuRenders.contextRoot = 0
 
     act(() => { setters[setters.length - 1]([slot('m-new'), ...initial]) })
 
@@ -383,6 +399,9 @@ describe('chat sidebar — session row memo boundary', () => {
     // the new row's plus whatever the sidebar shell owns -- nowhere near one per
     // displaced row.
     expect(menuRenders.contextContent).toBe(1)
+    // The row's trigger element is new on every render; the context menu tree
+    // around it still renders only for the new row.
+    expect(menuRenders.contextRoot).toBe(1)
     expect(menuRenders.dropdown).toBeLessThan(N / 2)
   })
 })

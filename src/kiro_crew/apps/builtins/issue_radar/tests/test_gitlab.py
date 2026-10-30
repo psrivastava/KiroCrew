@@ -22,8 +22,10 @@ loud:
 from __future__ import annotations
 
 import inspect
+import json
 import re
 import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -119,6 +121,14 @@ class TestGitlabUrlParsing(unittest.TestCase):
         over = "a" * (gitlab_transport.GITLAB_MAX_SEGMENT_CHARS + 1)
         with self.assertRaises(RepoUrlError):
             gitlab_client.parse_gitlab_repo_url(f"https://gitlab.com/group/{over}")
+
+    def test_a_trailing_newline_cannot_escape_the_segment_bound(self):
+        # `$` also matches just before a final newline, so a bound anchored with it
+        # admits a segment one character past the maximum. `\Z` does not.
+        widest = "a" * gitlab_transport.GITLAB_MAX_SEGMENT_CHARS
+        self.assertIsNotNone(gitlab_transport.SEGMENT_RE.match(widest))
+        self.assertIsNone(gitlab_transport.SEGMENT_RE.match(f"{widest}\n"))
+        self.assertIsNone(gitlab_transport.SEGMENT_RE.match("a\n"))
 
     def test_the_two_bounds_together_cap_the_whole_parsed_value(self):
         # Neither bound alone caps what the parse returns: without the count bound the
@@ -836,42 +846,132 @@ class TestRefSummary(unittest.TestCase):
 
 
 class TestMrTimelineNotesFetch(unittest.TestCase):
-    """The MR timeline reads the notes endpoint ONCE.
+    """The MR timeline reads the discussions endpoint ONCE.
 
     GitLab keeps inline (diff) comments in the same notes stream, so the MR
     timeline both assembles the notes AND promotes the positioned ones.
     ``_assemble_timeline`` returns the notes it fetched so the promotion reuses
-    that one read instead of fetching ``{base}/notes`` a second time per
-    PR-detail load."""
+    that one read instead of fetching the notes a second time per PR-detail load.
+    The notes come from ``{base}/discussions``, because only that endpoint says
+    which discussion a note is in, and a reply is posted into the discussion."""
 
-    def test_notes_endpoint_is_hit_once(self):
+    DISCUSSION = "6a9c1750b37d513a43987b574953fceb50b03ce7"
+
+    def _discussions(self, *notes, discussion_id=None):
+        return [{"id": discussion_id or self.DISCUSSION, "individual_note": False, "notes": list(notes)}]
+
+    def _timeline(self, discussions, kind="pr"):
+        calls: list[str] = []
+
+        def fake_api(path, **kwargs):
+            calls.append(path)
+            if path.endswith("/discussions"):
+                return discussions
+            # resource_label_events / resource_state_events — empty is fine.
+            return []
+
+        reader = gitlab_client.list_pr_timeline if kind == "pr" else gitlab_client.list_issue_timeline
+        with mock.patch.object(gitlab_client, "_glab_api", side_effect=fake_api), \
+                mock.patch.object(gitlab_client, "list_repo_labels", return_value=[]):
+            events = reader("g", "p", 7, host="gitlab.com")
+        return events, calls
+
+    def test_discussions_endpoint_is_hit_once(self):
         note = {
             "id": 1, "system": False, "body": "inline!", "created_at": "2024-01-01T00:00:00Z",
             "author": {"username": "alice"},
             "position": {"new_path": "a.py", "new_line": 3},
         }
-        calls: list[str] = []
+        events, calls = self._timeline(self._discussions(note))
 
-        def fake_api(path, **kwargs):
-            calls.append(path)
-            # The notes path carries a query string (?order_by=…&sort=asc), so match
-            # on the endpoint before the query rather than the whole path.
-            if path.split("?")[0].endswith("/notes"):
-                return [note]
-            # resource_label_events / resource_state_events — empty is fine.
-            return []
-
-        with mock.patch.object(gitlab_client, "_glab_api", side_effect=fake_api), \
-                mock.patch.object(gitlab_client, "list_repo_labels", return_value=[]):
-            events = gitlab_client.list_pr_timeline("g", "p", 7, host="gitlab.com")
-
-        notes_calls = [p for p in calls if p.split("?")[0].endswith("/notes")]
-        self.assertEqual(len(notes_calls), 1, f"notes fetched {len(notes_calls)}x: {calls}")
+        discussion_calls = [p for p in calls if p.endswith("/discussions")]
+        self.assertEqual(len(discussion_calls), 1, f"fetched {len(discussion_calls)}x: {calls}")
+        self.assertFalse([p for p in calls if "/notes" in p], calls)
         # The positioned note is promoted to a single inline review_comment and the
         # plain-comment copy of it is dropped, so it shows once.
         kinds = [e["kind"] for e in events]
         self.assertEqual(kinds.count("review_comment"), 1)
+        # The inline entry keeps the note id, which keys the comment on the page.
+        inline = next(e for e in events if e["kind"] == "review_comment")
+        self.assertEqual(inline["id"], 1)
         self.assertNotIn("comment", kinds)
+        self.assertEqual(events[0]["thread_id"], self.DISCUSSION)
+
+    def test_every_note_carries_its_discussion_as_the_reply_handle(self):
+        first = {
+            "id": 1, "system": False, "body": "root", "created_at": "2024-01-01T00:00:00Z",
+            "author": {"username": "alice"},
+        }
+        reply = {**first, "id": 2, "body": "reply", "created_at": "2024-01-03T00:00:00Z"}
+        other = {**first, "id": 3, "body": "other", "created_at": "2024-01-02T00:00:00Z"}
+        discussions = [
+            *self._discussions(first, reply),
+            *self._discussions(other, discussion_id="ab" * 20),
+        ]
+        events, _ = self._timeline(discussions, kind="issue")
+        # Flattened across discussions and sorted oldest-first, as the notes
+        # endpoint served them.
+        self.assertEqual([e["body"] for e in events], ["root", "other", "reply"])
+        self.assertEqual(
+            [e["thread_id"] for e in events], [self.DISCUSSION, "ab" * 20, self.DISCUSSION]
+        )
+
+    def test_a_system_note_has_no_reply_handle(self):
+        system = {
+            "id": 4, "system": True, "body": "changed title from **a** to **b**",
+            "created_at": "2024-01-01T00:00:00Z", "author": {"username": "alice"},
+        }
+        events, _ = self._timeline(self._discussions(system), kind="issue")
+        self.assertEqual(events[0]["kind"], "renamed")
+        self.assertNotIn("thread_id", events[0])
+
+
+class TestTimelineLabelColours(unittest.TestCase):
+    """The timeline reads the project's label set only when an event lacks a colour.
+
+    A project with over a hundred labels pays two requests per full read of the
+    set, a large share of the burst that trips a GitLab rate limit, and each
+    label event already carries its label's colour.
+    """
+
+    LABELS = [{"name": "bug", "color": "#ff0000", "description": ""}]
+
+    def setUp(self):
+        self.calls: list[str] = []
+
+    def _fake_api(self, label_events=()):
+        def fake(path, **kwargs):
+            if kwargs.get("method", "GET") == "GET":
+                self.calls.append(path)
+            endpoint = path.split("?")[0]
+            if endpoint.endswith("/labels"):
+                return list(self.LABELS)
+            if endpoint.endswith("/resource_label_events"):
+                return list(label_events)
+            if endpoint.endswith("/issues/5"):
+                return {"iid": 5, "title": "t", "state": "opened", "labels": ["bug"]}
+            return []
+
+        return fake
+
+    def _label_reads(self) -> int:
+        return sum(1 for p in self.calls if p.split("?")[0].endswith("/labels"))
+
+    def test_timeline_skips_the_label_set_when_events_carry_colours(self):
+        event = {"action": "add", "label": {"name": "bug", "color": "#ff0000"}, "user": {"username": "a"}}
+        with mock.patch.object(gitlab_client, "_glab_api", side_effect=self._fake_api([event])):
+            events = gitlab_client.list_pr_timeline("g", "p", 7, host="gitlab.com")
+        self.assertEqual(self._label_reads(), 0, self.calls)
+        labeled = [e for e in events if e["kind"] == "labeled"]
+        self.assertEqual(labeled[0]["label"]["color"], "ff0000")
+
+    def test_timeline_reads_the_label_set_for_a_colourless_event(self):
+        event = {"action": "add", "label": {"name": "bug"}, "user": {"username": "a"}}
+        with mock.patch.object(gitlab_client, "_glab_api", side_effect=self._fake_api([event])):
+            events = gitlab_client.list_issue_timeline("g", "p", 5, host="gitlab.com")
+        self.assertEqual(self._label_reads(), 1, self.calls)
+        labeled = [e for e in events if e["kind"] == "labeled"]
+        self.assertEqual(labeled[0]["label"]["color"], "ff0000")
 
 
 class TestInvestigationNamespace(unittest.TestCase):
@@ -1017,6 +1117,98 @@ class TestListPagination(unittest.TestCase):
             with self.subTest(fn=fn.__name__):
                 path = self._path_for(lambda: fn("g", "p", host="gitlab.com"))
                 self.assertNotIn("per_page", path)
+
+
+class TestRateLimitBackoff(unittest.TestCase):
+    """A GitLab HTTP 429 is waited out, not surfaced on the first refusal.
+
+    Opening a busy project fans out into dozens of ``glab api`` calls, and a
+    self-managed instance's throttle trips on the burst; ``glab`` itself exits on
+    the first 429. Failing there blanks a whole pane (the activity timeline) for
+    a window that clears within seconds.
+    """
+
+    THROTTLED = subprocess.CompletedProcess([], 1, stdout="", stderr="glab: HTTP 429\n")
+
+    def _ok(self, rows):
+        return subprocess.CompletedProcess([], 0, stdout=json.dumps(rows), stderr="")
+
+    def _call(self, responses, *, paginate=False):
+        targets: list[str] = []
+        waits: list[float] = []
+        queue = list(responses)
+
+        def run(argv, **_kwargs):
+            targets.append(argv[2])
+            return queue.pop(0)
+
+        result = gitlab_transport.glab_api(
+            "projects/g%2Fp/merge_requests/1/notes",
+            host="gitlab.com",
+            timeout=5.0,
+            paginate=paginate,
+            method="GET",
+            body=None,
+            run=run,
+            page_size=2,
+            max_pages=10,
+            stderr_tail=lambda proc: (proc.stderr or "").strip(),
+            raise_if_auth_failure=lambda _tail, _host: None,
+            is_forbidden=gitlab_transport.is_forbidden,
+            sleep=waits.append,
+        )
+        return result, targets, waits
+
+    def test_throttled_request_is_resent_after_backing_off(self):
+        result, targets, waits = self._call([self.THROTTLED, self.THROTTLED, self._ok({"id": 1})])
+        self.assertEqual(result, {"id": 1})
+        self.assertEqual(len(targets), 3)
+        self.assertEqual(waits, [1.0, 2.0])
+
+    def test_throttled_page_is_resent_not_skipped(self):
+        result, targets, waits = self._call(
+            [self._ok([1, 2]), self.THROTTLED, self._ok([3])], paginate=True
+        )
+        self.assertEqual(result, [1, 2, 3])
+        self.assertEqual(
+            [re.findall(r"[?&]page=(\d+)", t) for t in targets], [["1"], ["2"], ["2"]]
+        )
+        self.assertEqual(waits, [1.0])
+
+    def test_pages_share_one_retry_budget(self):
+        result, _targets, waits = self._call(
+            [self.THROTTLED, self._ok([1, 2]), self.THROTTLED, self._ok([3])],
+            paginate=True,
+        )
+        self.assertEqual(result, [1, 2, 3])
+        self.assertEqual(waits, [1.0, 2.0])
+
+    def test_a_long_list_waits_at_most_the_budget_in_total(self):
+        with self.assertRaises(ProviderCliError) as ctx:
+            self._call(
+                [self.THROTTLED, self._ok([1, 2]), self.THROTTLED, self.THROTTLED, self.THROTTLED],
+                paginate=True,
+            )
+        self.assertIn("HTTP 429", str(ctx.exception))
+
+    def test_persistent_throttle_fails_with_an_actionable_message(self):
+        with self.assertRaises(ProviderCliError) as ctx:
+            self._call([self.THROTTLED] * 4)
+        message = str(ctx.exception)
+        self.assertIn("HTTP 429", message)
+        self.assertIn("try again in a minute", message)
+
+    def test_other_failures_are_not_retried(self):
+        # One queued response: a retry would pop an empty queue and raise
+        # IndexError instead of the ProviderCliError asserted here.
+        failed = subprocess.CompletedProcess([], 1, stdout="", stderr="glab: HTTP 500\n")
+        with self.assertRaises(ProviderCliError):
+            self._call([failed])
+
+    def test_rate_limit_classification(self):
+        self.assertTrue(gitlab_transport.is_rate_limited("glab: HTTP 429"))
+        self.assertTrue(gitlab_transport.is_rate_limited("429 Too Many Requests"))
+        self.assertFalse(gitlab_transport.is_rate_limited("glab: HTTP 500"))
 
 
 class TestMergeRequestSearchState(unittest.TestCase):
@@ -1271,6 +1463,7 @@ class TestClientParity(unittest.TestCase):
         "build_pr_search_query", "get_ref_summary",
         # Pull-request actions.
         "set_pr_state", "submit_pr_review", "add_issue_comment", "add_pr_comment",
+        "post_comment_batch",
         "merge_pull_request", "enable_auto_merge", "disable_auto_merge",
         "list_pr_workflow_runs",
         "cancel_workflow_run", "rerun_workflow_run",
@@ -1403,6 +1596,10 @@ class TestRoutesScopeEveryStoreCall(unittest.TestCase):
             "list_connected_repos", "set_repo_permissions", "remove_connected_repo",
             "read_repo_settings", "write_repo_settings", "add_setting_label",
             "add_connected_repo", "is_repo_connected",
+            # Followed GitLab groups live in config.json keyed by host + path;
+            # they own no per-repo tree to scope.
+            "list_gitlab_groups", "is_gitlab_group_added", "add_gitlab_group",
+            "remove_gitlab_group",
         }
         calls = [
             (path.name, name)

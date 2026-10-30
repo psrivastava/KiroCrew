@@ -16,7 +16,9 @@ ROOT = Path(__file__).resolve().parents[1]
 SKILL = ROOT / "src/kiro_crew/builtin_skills/kirocrew-dev/dashboard-template/SKILL.md"
 REFERENCE = ROOT / "src/kiro_crew/dashboard_templates/builtin/goal-board/template.html"
 BRIDGE = ROOT / "website/src/hooks/useFrameOpenLink.ts"
-DASHBOARD_HOST = ROOT / "website/src/pages/members/CrewDynamicDashboard.tsx"
+LINK_BRIDGE = ROOT / "website/src/hooks/useFrameLinkBridge.ts"
+#: Where the crewmate Dashboard page's grant is defined; the page re-exports it.
+DASHBOARD_HOST = ROOT / "website/src/lib/crewDashboardSandbox.ts"
 
 _REDUCED = re.compile(r"@media\s*\(prefers-reduced-motion:\s*reduce\)\s*\{(.*?)\}\s*\}", re.DOTALL)
 
@@ -91,9 +93,9 @@ def test_the_bridge_the_guide_names_is_the_one_the_host_honours() -> None:
     call = f"parent.postMessage({{ type: '{m.group(1)}', url: url }}, '*')"
     assert call in section
     assert call in REFERENCE.read_text(encoding="utf-8")
-    assert "useFrameOpenLink" in section and "PR_URL_RE" in section
+    assert "useFrameLinkBridge" in section and "http(s)" in section
     assert "hasGesture" in bridge and "right after a click" in section
-    assert "export const PR_URL_RE" in bridge
+    assert "export function webUrlOf" in LINK_BRIDGE.read_text(encoding="utf-8")
 
 
 def test_the_sandbox_the_guide_states_is_the_hosts() -> None:

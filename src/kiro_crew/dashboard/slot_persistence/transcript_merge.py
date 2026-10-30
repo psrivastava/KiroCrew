@@ -1,12 +1,14 @@
 """The bytes a dashboard save writes: frozen prefix, live window, foreign lines.
 
 A session file is a frozen prefix (the on-disk lines older than the in-memory
-window, never rewritten) followed by the window, re-serialized in full on every
-save. This module owns how those become one payload: reading and caching the
-prefix, finding the lines another writer appended into the window region and
-merging them back in time order, and archiving what a save drops -- the ambiguous
-dedup folds and a rewrite's truncated tail. ``_save_slot_to_history`` holds the
-transcript lock around it and does the atomic replace.
+window, whose count and order a save never changes) followed by the window,
+re-serialized in full on every save. This module owns how those become one
+payload: reading and caching the prefix, bounding the file-change copies the
+prefix's older rows carry, finding the lines another writer appended into the
+window region and merging them back in time order, and archiving what a save
+drops -- the ambiguous dedup folds, a rewrite's truncated tail, and the rows the
+file-change bound rewrote. ``_save_slot_to_history`` holds the transcript lock
+around it and does the atomic replace.
 
 New rules about what a save keeps from the file it replaces belong here.
 """
@@ -15,10 +17,13 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from collections import deque
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Callable
 
 from kiro_crew.chat_attachments import same_text_modulo_images
+from kiro_crew.config.loader import KiroCrewConfig
+from kiro_crew.dashboard import display_verdicts
 from kiro_crew.dashboard.state import _TRANSIENT_ROLES, row_mid
 from kiro_crew.history import _archive_lines, latest_transcript_ts, transcript_sort_key
 
@@ -28,6 +33,154 @@ if TYPE_CHECKING:
     from kiro_crew.dashboard.state import DashboardState, _ChatSlot
 
 logger = logging.getLogger("kiro_crew.dashboard.chat_persistence")
+
+# ``omitted_reason`` of a file-change entry whose before/after copies the
+# transcript bound dropped. The dashboard card reads it to say why the row has no
+# diff (``FileChangeChips.tsx``).
+FILE_CHANGES_OLDER_TURN = "older_turn"
+# Archive ``reason`` of the rows the bound rewrote, as they were before it. Not
+# ``rotate``, so the history reader never re-serves them as transcript rows.
+FILE_CHANGES_ARCHIVE_REASON = "file-changes"
+
+# A row carrying a non-empty ``file_changes`` list, and a non-empty before/after
+# string anywhere in it. Both match only an unescaped JSON key, never the same
+# words inside a string value (whose quotes are escaped), so they are cheap byte
+# pre-filters ahead of the one ``json.loads`` that decides.
+_FILE_CHANGES_ROW = re.compile(r'"file_changes"\s*:\s*\[\s*\{')
+_FILE_CHANGE_COPY = re.compile(r'"(?:before|after)"\s*:\s*"(?!")')
+
+
+def _is_file_change_row(entry: object) -> bool:
+    """Whether *entry* is a row whose ``meta.file_changes`` is a non-empty list."""
+    meta = entry.get("meta") if isinstance(entry, dict) else None
+    changes = meta.get("file_changes") if isinstance(meta, dict) else None
+    return isinstance(changes, list) and bool(changes)
+
+
+def _without_file_change_copies(line: str) -> str | None:
+    """*line* with its file-change copies dropped, or None to keep it as it is.
+
+    Each entry that still holds a before or after copy takes the shape the turn
+    budget already gives a path-only entry (``content_omitted``), plus
+    ``omitted_reason`` naming why. Its path and every other field stay. A line
+    that does not parse, or has no copy left to drop, is kept unchanged.
+    """
+    try:
+        row = json.loads(line)
+    except ValueError:
+        return None
+    if not _is_file_change_row(row):
+        return None
+    dropped = False
+    for entry in row["meta"]["file_changes"]:
+        if not isinstance(entry, dict) or not (entry.get("before") or entry.get("after")):
+            continue
+        entry.update(
+            before="",
+            after="",
+            truncated=True,
+            content_omitted=True,
+            omitted_reason=FILE_CHANGES_OLDER_TURN,
+        )
+        entry.pop("snapshot_limit_chars", None)
+        entry.pop("turn_budget_chars", None)
+        dropped = True
+    if not dropped:
+        return None
+    out = json.dumps(row)
+    return out + "\n" if line.endswith("\n") else out
+
+
+def compact_older_file_change_copies(
+    lines: list[str], *, keep_rows: int
+) -> tuple[list[str], list[str]]:
+    """Drop the file-change copies of every row older than the newest *keep_rows*.
+
+    Counts file-change rows from the end of *lines*: the newest *keep_rows* are
+    left as they are and every older one loses its before/after copies. Returns
+    the lines to write and the original text of each line it changed, in file
+    order. The line count and order never change, so every row offset another
+    reader holds stays valid.
+    """
+    out = list(lines)
+    originals: list[str] = []
+    seen = 0
+    for index in range(len(out) - 1, -1, -1):
+        line = out[index]
+        if not _FILE_CHANGES_ROW.search(line):
+            continue
+        seen += 1
+        if seen <= keep_rows or not _FILE_CHANGE_COPY.search(line):
+            continue
+        compacted = _without_file_change_copies(line)
+        if compacted is None:
+            continue
+        originals.append(line if line.endswith("\n") else line + "\n")
+        out[index] = compacted
+    originals.reverse()
+    return out, originals
+
+
+def _file_changes_keep_turns() -> int:
+    """``session.file_changes_keep_turns``, or its default when it cannot be read."""
+    try:
+        value = KiroCrewConfig.load().session.file_changes_keep_turns
+    except Exception:
+        logger.debug("Could not read session.file_changes_keep_turns", exc_info=True)
+        return KiroCrewConfig().session.file_changes_keep_turns
+    if isinstance(value, bool) or not isinstance(value, int):
+        return KiroCrewConfig().session.file_changes_keep_turns
+    return value
+
+
+def _file_change_prefix_bound(
+    state: DashboardState, history_key: str, window_entries: list[dict[str, Any]]
+) -> Callable[[list[str]], list[str]]:
+    """The bound a save applies to its frozen prefix when it reads it from disk.
+
+    The chat keeps whole copies for its newest ``session.file_changes_keep_turns``
+    file-change rows; 0 turns the bound off. Rows in the in-memory window are
+    never changed, so the window's own rows count first and the prefix keeps only
+    what is left. The setting is read inside the callable, so a save served from
+    the prefix cache reads no config.
+
+    The archive write is the precondition of the change: the callable hands back
+    the compacted lines only once the originals are in the session archive, and
+    the prefix as read when that write fails, so a failed archive costs a larger
+    file and never a row's only copy. Retried on the next save that re-reads the
+    prefix.
+    """
+
+    def bound(lines: list[str]) -> list[str]:
+        keep_turns = _file_changes_keep_turns()
+        if keep_turns <= 0:
+            return lines
+        in_window = sum(1 for e in window_entries if _is_file_change_row(e))
+        compacted, originals = compact_older_file_change_copies(
+            lines, keep_rows=max(0, keep_turns - in_window)
+        )
+        if not originals:
+            return lines
+        base = state.conversation_log._dir if state.conversation_log else None
+        try:
+            _archive_lines(history_key, originals, reason=FILE_CHANGES_ARCHIVE_REASON, base=base)
+        except Exception:
+            logger.warning(
+                "Keeping the file-change copies of %d older row(s) of %s: archiving them failed",
+                len(originals),
+                history_key,
+                exc_info=True,
+            )
+            return lines
+        logger.info(
+            "Dropped the file-change copies of %d row(s) older than the newest %d in %s",
+            len(originals),
+            keep_turns,
+            history_key,
+        )
+        return compacted
+
+    return bound
 
 
 def _diff_dropped_message_lines(old_lines: list[str], new_lines: list[str]) -> list[str]:
@@ -165,6 +318,53 @@ def _interleave_foreign_lines(
     return merged
 
 
+def _drop_carried_foreign(foreign: list[str], entries: list[dict]) -> list[str]:
+    """*foreign* without the lines one of *entries* now carries itself.
+
+    A cached foreign line can be a same-process row whose window copy reached
+    the slot only after the save that preserved it took its snapshot: a
+    workflow result appended live and durably while a Regenerate swap's
+    snapshot was held. Once the window carries it, re-emitting the cached line
+    beside the window's own serialization writes the row twice. Identity is the
+    scan's id tier (pass 0): an equal ``meta.mid`` corroborated by
+    ``(role, content)`` or ``ts``, each entry absorbing at most one line. An
+    id-less line is kept, as the scan keeps any line it cannot place.
+    """
+    if not foreign:
+        return foreign
+    by_mid: dict[str, list[dict]] = {}
+    for e in entries:
+        mid = row_mid(e)
+        if mid:
+            by_mid.setdefault(mid, []).append(e)
+    if not by_mid:
+        return foreign
+    kept: list[str] = []
+    for line in foreign:
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            kept.append(line)
+            continue
+        mid = row_mid(entry) if isinstance(entry, dict) else None
+        candidates = by_mid.get(mid) if mid else None
+        match = next(
+            (
+                e
+                for e in candidates or ()
+                if (entry.get("role"), entry.get("content", ""))
+                == (e.get("role"), e.get("content", ""))
+                or (entry.get("ts") and entry.get("ts") == e.get("ts"))
+            ),
+            None,
+        )
+        if match is None:
+            kept.append(line)
+        else:
+            candidates.remove(match)  # type: ignore[union-attr]
+    return kept
+
+
 def _frozen_prefix_and_foreign_appends(
     slot: _ChatSlot,
     path,
@@ -172,14 +372,28 @@ def _frozen_prefix_and_foreign_appends(
     window_entries: list[dict],
     *,
     collect_foreign: bool = True,
+    bound_prefix: Callable[[list[str]], list[str]] | None = None,
+    archive_dedup: Callable[[list[str]], object] | None = None,
+    retired_entries: list[dict] | None = None,
 ) -> tuple[str, list[str], list[str]]:
     """Return ``(frozen_prefix, foreign_lines, dedup_dropped)`` for a save.
 
-    ``frozen_prefix`` is the verbatim bytes of the first *disk_older* on-disk
-    message lines — the turns OLDER than the in-memory window. They are never
-    rewritten, so older history survives a restart that only loaded a recent
-    window. The bytes are cached on the slot keyed by ``(mtime, size,
-    disk_older)`` so a steady 5s flush is O(window) rather than O(file size).
+    ``retired_entries`` are the serialized rows a rewrite removes on purpose
+    (a Regenerate's previous reply). They take part in the identity scan as
+    extra candidates, so their disk copies are matched and dropped, but they
+    are never emitted. Every other window-region line the window does not
+    carry is still a foreign append and is kept. Without them a rewrite skips
+    the scan (``collect_foreign=False``), since a truncated tail and a foreign
+    append cannot be told apart.
+
+    ``frozen_prefix`` is the bytes of the first *disk_older* on-disk message
+    lines — the turns OLDER than the in-memory window. They keep their count and
+    order, so older history survives a restart that only loaded a recent window.
+    The one change a save makes to them is *bound_prefix*, applied when the
+    prefix is read from disk (never on the cached fast path): the transcript's
+    file-change bound (``_file_change_prefix_bound``). The bytes are cached on
+    the slot keyed by ``(mtime, size, disk_older)`` so a steady 5s flush is
+    O(window) rather than O(file size).
 
     ``foreign_lines`` are on-disk message lines in the WINDOW region (the bytes
     after the frozen prefix) that this slot's in-memory *window_entries* do NOT
@@ -220,8 +434,10 @@ def _frozen_prefix_and_foreign_appends(
     those two real events into one; the bounded, timestamp-first identity
     fixes it for id-less lines, and the ``meta.mid`` tier resolves it exactly
     for stamped lines (see also ``docs/system-specs/modules/history.md``).
-    ``dedup_dropped`` returns any fresh-``ts`` content-tiebreak drops so the
-    caller can route them through the archive — even the residual ambiguous
+    ``dedup_dropped`` returns any fresh-``ts`` content-tiebreak drops. With
+    *archive_dedup*, they are archived here first and returned only once that
+    write landed; when it raises they are kept in ``foreign_lines`` instead.
+    Without it, the caller routes them through the archive — even the residual ambiguous
     case (an id-less distinct message indistinguishable from an
     ``append_if_absent`` copy without a stable id) then loses no data
     permanently. A corroborated id-matched fold is NOT such a drop: the ids
@@ -255,16 +471,29 @@ def _frozen_prefix_and_foreign_appends(
         # cached foreign lines (a copy, so the caller cannot mutate the cache)
         # keeps the fast path non-destructive: the already-preserved
         # cross-process append is re-emitted instead of silently dropped. No
-        # scan runs, so there are no fresh dedup drops to archive.
-        return (cache[3], list(cache[4]), [])
+        # scan runs, so there are no fresh dedup drops to archive. A cached line
+        # the window now carries itself is left out (_drop_carried_foreign).
+        carriers = [*window_entries, *(retired_entries or ())]
+        return (cache[3], _drop_carried_foreign(list(cache[4]), carriers), [])
     try:
-        existing = path.read_text(encoding="utf-8").splitlines(keepends=True)
+        # Bytes, so a first line that is not UTF-8 (which the save is about to
+        # rewrite as CORRUPT) does not raise here; the rows decode strictly.
+        # Imported here: an owner's module scope may import only what the
+        # chat_persistence facade already does.
+        from kiro_crew.history_projection import _split_transcript_head
+
+        existing, head_undecodable = _split_transcript_head(path.read_bytes())
     except OSError:
         return ("", [], [])
-    if not existing or '"_type"' not in existing[0]:
+    # An undecodable first line is still the metadata line by position, so the
+    # rows after it stay in the frozen prefix rather than being dropped.
+    if not existing or ('"_type"' not in existing[0] and not head_undecodable):
         return ("", [], [])
     body = existing[1:]  # message lines only (metadata excluded)
-    prefix = "".join(body[:disk_older]) if disk_older > 0 else ""
+    prefix_lines = body[:disk_older] if disk_older > 0 else []
+    if bound_prefix is not None and prefix_lines:
+        prefix_lines = bound_prefix(prefix_lines)
+    prefix = "".join(prefix_lines)
     if not collect_foreign:
         # Rewrite (rewind / regenerate / fork) INTENTIONALLY truncates the
         # window, so a disk window-region line absent from the (truncated) window
@@ -312,6 +541,10 @@ def _frozen_prefix_and_foreign_appends(
     # genuine window line was mis-classified as a foreign append and DUPLICATED on
     # disk. The bounded multiset below matches them one-for-one regardless of
     # ``ts`` collisions.
+    # Retired rows are matched like window rows; a disk line they absorb is
+    # dropped exactly as a window row's own persisted copy is.
+    if retired_entries:
+        window_entries = [*window_entries, *retired_entries]
     mid_idx: dict[str, "deque[int]"] = {}
     exact_idx: dict[tuple[object, object, object], "deque[int]"] = {}
     ts_idx: dict[object, "deque[int]"] = {}
@@ -429,8 +662,10 @@ def _frozen_prefix_and_foreign_appends(
         if ts and _take(exact_idx.get((ts, role, content))):
             handled[_j] = True
 
-    foreign: list[str] = []
-    dedup_dropped: list[str] = []
+    # Disk positions ride along so a dedup drop whose archive fails can return
+    # to ``foreign`` in disk order (see below).
+    foreign_at: list[tuple[int, str]] = []
+    dedup_at: list[tuple[int, str]] = []
     # After the exact pass, an in-place EDIT (same ``ts``, changed content) is the
     # only legitimate reason to drop a still-unmatched disk line by ``ts`` alone.
     # But under COLLIDING timestamps a ts-only match is AMBIGUOUS: a foreign
@@ -470,7 +705,7 @@ def _frozen_prefix_and_foreign_appends(
         if handled[_j]:
             continue
         if mid_foreign[_j]:
-            foreign.append(norm)
+            foreign_at.append((_j, norm))
             continue
         # ts-match: an in-place edit keeps the ``ts`` but changes content, so the
         # window's version wins and the disk line is dropped silently — but ONLY
@@ -492,10 +727,29 @@ def _frozen_prefix_and_foreign_appends(
         # copy and is dropped silently to avoid archive spam.
         if _take(rc_idx.get((role, content))):
             if ts:
-                dedup_dropped.append(norm)
+                dedup_at.append((_j, norm))
             continue
         # genuinely foreign → preserve verbatim.
-        foreign.append(norm)
+        foreign_at.append((_j, norm))
+    # The archive is the precondition of dropping a dedup line: until it lands
+    # the transcript holds that line's only copy. When *archive_dedup* raises,
+    # the lines are kept as foreign, in disk order, so the payload carries them:
+    # a duplicate row at worst, never a lost one. Decided here, before the
+    # cache below, so a cached fast path re-emits the same kept lines.
+    if dedup_at and archive_dedup is not None:
+        try:
+            archive_dedup([line for _j, line in dedup_at])
+        except Exception:
+            logger.warning(
+                "Slot %s keeping %d foreign-dedup line(s): archiving them failed",
+                slot.key,
+                len(dedup_at),
+                exc_info=True,
+            )
+            foreign_at = sorted(foreign_at + dedup_at, key=lambda item: item[0])
+            dedup_at = []
+    foreign = [line for _j, line in foreign_at]
+    dedup_dropped = [line for _j, line in dedup_at]
     # Cache the frozen prefix AND the foreign lines together, keyed on the
     # as-read (mtime, size). If this save's atomic_write later fails, the file
     # on disk is unchanged, so a subsequent save that re-reads the same
@@ -528,11 +782,16 @@ def compose_payload(
     meta_str: str,
     *,
     rewrite: bool,
+    retired_rows: list[dict] | None = None,
 ) -> tuple[str, str, list[str]]:
     """The file a full save writes: ``(payload, frozen_prefix, foreign_lines)``.
 
     Called under the transcript lock. Archives the ambiguous dedup drops and, for a
     rewrite, the dropped window tail before the caller's atomic replace.
+
+    ``retired_rows`` names the rows a rewrite removes. With it, the rewrite keeps
+    the foreign-append scan, so a row another writer appended after the caller's
+    snapshot survives the rewrite instead of being dropped with the retired rows.
     """
     from kiro_crew.dashboard import chat_persistence as cp  # circular import: facade imports owners
 
@@ -569,25 +828,40 @@ def compose_payload(
         e for m in window if (e := build_entry(m, attachments=attachments)) is not None
     ]
     window_lines = [json.dumps(e) + "\n" for e in window_entries]
-    frozen_prefix, foreign_lines, dedup_dropped = _frozen_prefix_and_foreign_appends(
-        slot, path, disk_older, window_entries, collect_foreign=not rewrite
+    # Rows this transcript has not had its display verdicts recorded for; the
+    # save projects them once its write commits (display_verdicts).
+    display_verdicts.note_written_lines(history_key, window_lines)
+    # A rewrite archives every old line its payload does not repeat, so a bound
+    # applied on that save would archive the rewritten rows a second time; the
+    # next ordinary save applies it instead.
+    retired_entries = (
+        [e for m in retired_rows if (e := build_entry(m, attachments=attachments)) is not None]
+        if retired_rows is not None
+        else None
+    )
+    frozen_prefix, foreign_lines, _dedup_archived = _frozen_prefix_and_foreign_appends(
+        slot,
+        path,
+        disk_older,
+        window_entries,
+        collect_foreign=not rewrite or retired_entries is not None,
+        retired_entries=retired_entries,
+        bound_prefix=(
+            None if rewrite else _file_change_prefix_bound(state, history_key, window_entries)
+        ),
+        archive_dedup=lambda lines: _archive_lines(
+            history_key,
+            lines,
+            reason="foreign-dedup",
+            base=state.conversation_log._dir if state.conversation_log else None,
+        ),
     )
     # A fresh-``ts`` disk copy folded into the window by the bounded
     # (role, content) tiebreak is redundant with a window entry, so the
     # payload does not carry it. It is nonetheless the genuinely ambiguous
     # case (indistinguishable from a distinct same-content message without
-    # a stable per-message id), so archive it before the atomic replace so
-    # the trade-off loses no data permanently.
-    if dedup_dropped:
-        try:
-            base = state.conversation_log._dir if state.conversation_log else None
-            _archive_lines(history_key, dedup_dropped, reason="foreign-dedup", base=base)
-        except Exception:
-            logger.warning(
-                "Failed to archive foreign-dedup drops for %s",
-                history_key,
-                exc_info=True,
-            )
+    # a stable per-message id), so ``archive_dedup`` archives it before the
+    # atomic replace, and keeps it in ``foreign_lines`` when that fails.
     payload = (
         meta_str
         + frozen_prefix
@@ -616,12 +890,13 @@ def compose_payload(
     # nothing — and we skip the O(file) archive-diff read there to keep a
     # steady flush O(window). Both sides are passed as proper
     # per-line lists so the normalized-JSON diff matches the
-    # frozen-prefix lines (never archived).
+    # frozen-prefix lines (never archived). The archive is the precondition of
+    # the caller's replace, so a failed read or archive raises and nothing is
+    # written: the slot keeps ``_pending_rewrite`` and the next save retries.
     if rewrite and path.exists():
-        try:
-            old_lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
-            new_lines = payload.splitlines(keepends=True)
-            _archive_dropped_lines(state, history_key, old_lines, new_lines)
-        except Exception:
-            logger.warning("Failed to archive dropped lines for %s", history_key, exc_info=True)
+        from kiro_crew.history_projection import _split_transcript_bytes
+
+        old_lines = _split_transcript_bytes(path.read_bytes())
+        new_lines = payload.splitlines(keepends=True)
+        _archive_dropped_lines(state, history_key, old_lines, new_lines)
     return payload, frozen_prefix, foreign_lines

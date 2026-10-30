@@ -101,6 +101,17 @@ _ANSWERS: dict[str, str] = {
         "long it ran and what it cost"
     ),
     "class": "What KIND of session this log belongs to, over the log's whole life",
+    "otel_usage": (
+        "Whether this session opened and which closed agent_kind value it opened "
+        "under -- never the raw agent name, which the fold folds to that enum and "
+        "does not keep -- and how many turns it has started per actor: the counts "
+        "the OTel usage export reads to mint session and turn counters"
+    ),
+    "otel_session_tree": (
+        "How many creators stood above this session in the session tree when it "
+        "opened, and how many child sessions it has created -- the numbers the OTel "
+        "export reads to count sessions by tree depth and children by ordinal"
+    ),
     "outline": (
         "The conversation one row per turn: the first line the human typed and the "
         "reply the turn settled on, both clipped, with no injected context and no "
@@ -125,6 +136,30 @@ _ANSWERS: dict[str, str] = {
         "Every workstream this crewmate is running: each board's goal and counts, each "
         "task's result, and what each task cost its own worker session"
     ),
+    "goal": (
+        "This crewmate's goal record as the gateway last recorded it: its goals, each "
+        "milestone's target and latest reading, whether it is met, and the counts"
+    ),
+    "waiting": (
+        "What this crewmate waits on the person for: its open questions and the cards "
+        "still waiting on a button, newest first, with the count"
+    ),
+    "custom": (
+        "The latest record per type a script cron bound to this crewmate appended with "
+        "ctx.crew_log_append: the record's data, when it landed and which job wrote it"
+    ),
+    "workers": (
+        "The worker sessions this crewmate created: each one's task, whether it is "
+        "running, between turns, done, blocked, failed or closed, and what it last said"
+    ),
+    "worker": (
+        "One worker session's own row, the part of `workers` read from that worker's "
+        "own log; not bound by a page"
+    ),
+    "worktree": (
+        "The shape of a fleet: every work board the tree reaches, which board each one "
+        "hangs under, and which boards are its roots"
+    ),
 }
 
 
@@ -139,6 +174,33 @@ def _catalog() -> dict[str, dt.FoldType]:
     script asks about each one twice -- for its key kind and for its fields.
     """
     return {entry.name: entry for entry in dt.catalog()}
+
+
+def _manifest_fold_names() -> frozenset[str]:
+    """The folds a TEMPLATE block may actually BIND.
+
+    Imported here rather than at module scope because this script runs as a gate on a
+    checkout, and the manifest module pulls the template loader in with it; the two
+    callers below want the set, not the import.
+    """
+    from kiro_crew.dashboard_templates.manifest import FOLD_NAMES
+
+    return FOLD_NAMES
+
+
+def _package_fold_names() -> frozenset[str]:
+    """The folds a PACKAGE block may bind, which is a wider set.
+
+    The two surfaces have different readers, so they accept different bindings: a
+    package's page is drawn by ``member_dashboard_fields.LivePage``, which READS a
+    tree-keyed fold, and a template is rendered by a feed that reaches a fold only by
+    its bus scope. A fold only one of them can reach is advertised to only one of them,
+    and the catalogue has to say which -- dropping it outright would leave a package
+    author with no way to learn the fold exists.
+    """
+    from kiro_crew.dashboard_templates.manifest import PACKAGE_FOLD_NAMES
+
+    return PACKAGE_FOLD_NAMES
 
 
 def _field_rows(entry: dt.FoldType) -> list[dict[str, Any]]:
@@ -213,9 +275,45 @@ def catalogue() -> dict[str, Any]:
                 # fold answers about ONE conversation; a slot-keyed one answers about a
                 # workstream that outlived several, and is folded over every log the slot
                 # ran under -- so serving it under one session's id reports a part as the
-                # whole.
+                # whole. A TREE-keyed one answers about a whole fleet and is folded over
+                # the logs of every slot the tree reaches, so serving it under one slot
+                # reports one board as the tree.
+                #
+                # One lookup, in ``dashboard_types._keyed_by``. A second one here would
+                # have to be kept in the same order -- tree before slot before session,
+                # because a two-branch test reports a tree fold as session-keyed -- and
+                # the import-time key-kind guard makes a wrong answer unreachable only on
+                # the side that asks the guard's own sets.
                 "mode": entry.keyed_by,
-                "advertised": name not in proj.INTERNAL_PROJECTION_NAMES,
+                # ADVERTISED means "a composing agent is told it may bind this", which
+                # takes BOTH halves and neither implies the other.
+                #
+                # `INTERNAL_PROJECTION_NAMES` is the editorial half: `class` and
+                # `outline` are session-keyed and perfectly bindable, and are withheld
+                # anyway because they answer about the product rather than the crew.
+                #
+                # `manifest.FOLD_NAMES` is the mechanical half: it is the set the
+                # TEMPLATE save gate accepts a binding from, so a name outside it is a
+                # binding that surface would REFUSE. Read off that set rather than
+                # restated here, so the catalogue cannot promise a binding the gate
+                # turns down.
+                "advertised": (
+                    name not in proj.INTERNAL_PROJECTION_NAMES and name in _manifest_fold_names()
+                ),
+                # PACKAGE-ONLY: bindable, but on the other surface. A tree-keyed fold has
+                # no bus scope, so the template feed cannot reach it and the template
+                # gate refuses it -- while a package's page host reads it directly and
+                # the package gate admits it. Said rather than left as a bare `false`,
+                # because `advertised: false` alone reads as "not for you" to BOTH
+                # authors and a package author would never learn the fold is theirs to
+                # bind. Derived from the same two sets, so it cannot drift from either
+                # gate, and it is false for an editorially withheld fold: `class` and
+                # `outline` are bindable on neither surface.
+                "package_only": (
+                    name not in proj.INTERNAL_PROJECTION_NAMES
+                    and name not in _manifest_fold_names()
+                    and name in _package_fold_names()
+                ),
                 # ``None`` means every entry moves this fold -- whether the registry
                 # leaves ``affects`` unset or spells out the whole vocabulary, which is
                 # how ``status`` and ``class`` declare it.
@@ -261,7 +359,15 @@ def render_markdown(doc: dict[str, Any]) -> str:
         "",
         "A `session` fold answers about ONE conversation. A `slot` fold answers about a",
         "workstream that outlived several conversations and is folded over every log the",
-        "slot ran under.",
+        "slot ran under. A `tree` fold answers about a whole FLEET: it is keyed by a tree",
+        "root and folded over the logs of every slot the tree reaches, so it is the kind a",
+        "block binding a tree names. It cannot be pushed, because its value is stale when",
+        "any member's log grows and no bus scope covers that, so it belongs to the read on",
+        "a page load and on a refetch. That read belongs to the page host that draws a",
+        "dashboard PACKAGE, so a tree fold is marked *(package only)*: a package block may",
+        "bind it and a template block may not, because the feed that renders a template",
+        "reaches a fold by its bus scope and a tree fold has none. A fold marked",
+        "*(internal)* is bindable on neither surface.",
         "",
         "## Which fold answers what",
         "",
@@ -269,8 +375,13 @@ def render_markdown(doc: dict[str, Any]) -> str:
         "|---|---|---|",
     ]
     for fold in doc["folds"]:
-        internal = "" if fold["advertised"] else " *(internal)*"
-        lines.append(f"| `{fold['name']}`{internal} | {fold['mode']} | {fold['answers']} |")
+        if fold["advertised"]:
+            label = ""
+        elif fold["package_only"]:
+            label = " *(package only)*"
+        else:
+            label = " *(internal)*"
+        lines.append(f"| `{fold['name']}`{label} | {fold['mode']} | {fold['answers']} |")
     lines.append("")
 
     for fold in doc["folds"]:
@@ -372,7 +483,7 @@ def selftest() -> int:
     vocabulary = set(dt.describe()["field_types"]) | {UNKNOWN_TYPE}
     for fold in doc["folds"]:
         assert fold["fields"], f"{fold['name']} rendered no fields"
-        assert fold["mode"] in (dt.KEYED_BY_SESSION, dt.KEYED_BY_SLOT), fold
+        assert fold["mode"] in (dt.KEYED_BY_SESSION, dt.KEYED_BY_SLOT, dt.KEYED_BY_TREE), fold
         for row in fold["fields"]:
             # The MANIFEST's words, which is the whole point of rendering the catalog
             # rather than probing: a Python type name here would be one an author
@@ -389,6 +500,12 @@ def selftest() -> int:
     # empty list -- an empty list would read as "no entry moves it".
     status = next(fold for fold in doc["folds"] if fold["name"] == "status")
     assert status["affects"] is None, status
+
+    # The tree-keyed fold is the only one whose mode is neither of the original two, and
+    # a regression to ``session`` or ``slot`` is the silent one: it reads as a complete
+    # answer and sends a template author to key a whole fleet's tree by one conversation.
+    tree_names = [fold["name"] for fold in doc["folds"] if fold["mode"] == "tree"]
+    assert tree_names == list(proj.TREE_PROJECTION_NAMES), tree_names
 
     # Planted drift: one renamed field must change both renderings.
     mutated = json.loads(json.dumps(doc))

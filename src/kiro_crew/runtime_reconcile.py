@@ -963,6 +963,7 @@ class RuntimeReconciler:
     def _reconcile_dead(self, recorded: set[int]) -> tuple[int, int]:
         dead = 0
         forgotten = 0
+        failed = 0
         for pid in sorted(recorded):
             try:
                 if self._is_alive(pid) and not self._is_stranger(pid):
@@ -981,6 +982,7 @@ class RuntimeReconciler:
                     # A retraction that was this pass's to make and did not land.
                     # Counting it would report work that did not happen; the stale
                     # entry is re-detected and re-pruned on the next pass.
+                    failed += 1
                     logger.warning(
                         "runtime_reconcile: the record for pid=%s could not be retracted", pid
                     )
@@ -1014,7 +1016,14 @@ class RuntimeReconciler:
                 logger.debug("runtime_reconcile: could not notify for pid=%s", pid, exc_info=True)
         self._prune_notified(recorded)
         if dead:
-            logger.warning(
+            # WARNING only when this pass changed something or owed a change it
+            # could not make. A dead count made entirely of "not-mine" records is
+            # the same reading every tick for the gateway's life (there is no row
+            # here to remove), so at WARNING it is two lines per cleanup tick
+            # forever; the count still reaches the metric on every pass.
+            level = logging.WARNING if forgotten or failed else logging.DEBUG
+            logger.log(
+                level,
                 "runtime_reconcile owned_dead=%d forgotten=%d: records named processes "
                 "that are gone or whose pid now belongs to a stranger",
                 dead,
@@ -1116,8 +1125,10 @@ class RuntimeReconciler:
                     # slice and in no record, but it is not an agent runtime, so it
                     # leaves the population HERE rather than at a later condition:
                     # excluded before the list is built it is never counted in
-                    # ``unowned_alive``, never reaches ``_why_not_yet``, and never
-                    # collects a gate allow or a kill attribution naming it.
+                    # ``unowned_alive`` and never reaches ``_why_not_yet``, so it
+                    # writes none of the withheld-reason audit rows ``hold`` records.
+                    # It never reached the gate either way: ``_why_not_yet`` withholds
+                    # a non-harness pid before ``_authorize`` is asked.
                     #
                     # BOTH tests, because the marker describes a TREE and the argv
                     # test is per process. A harness can carry the marker two ways:
@@ -1133,7 +1144,8 @@ class RuntimeReconciler:
                     # So the population that leaves here is exactly the population
                     # ``_why_not_yet`` would withhold by name anyway: the kill arm's
                     # behaviour is unchanged, and what changes is that these pids
-                    # stop being counted, gated and attributed every pass. Both
+                    # stop being counted in ``unowned_alive`` and stop writing
+                    # withheld-reason audit rows every pass. Both
                     # error directions land on that same pre-existing behaviour -- a
                     # wider basename set excludes FEWER pids, and a tool named like
                     # a harness is not excluded at all.
@@ -1573,6 +1585,13 @@ def build_reconciler(
         predecessor gateway is a real dead record, but ``_untrack_session_pid``
         matches on the CALLING process's prefix and cannot remove anybody else's row
         -- those are the next gateway start's to clear, once its owner reads dead.
+        One predecessor is this process: the supervisor an in-app restart through
+        a supervising launcher leaves behind, a live ancestor whose image is not a
+        Python interpreter (:func:`platform_compat.is_exec_supervisor_of_this_process`).
+        Its rows were filed by this gateway's own previous image, and its owner
+        never reads dead while the supervisor lives, so they are retracted here as
+        this gateway's own. A live gateway ancestor still runs Python and keeps its
+        rows.
         And a pid known only to the MCP backend pidfile, to the app backend table
         or to the manager's in-memory union has no row in either tracking file: the
         MCP sweep owns the first, the app backend's spawn and stop paths the second,
@@ -1596,7 +1615,11 @@ def build_reconciler(
         entry = snapshot.get(pid)
         if entry is not None:
             owner, _token, row = entry
-            if not owner or owner == os.getpid():
+            if (
+                not owner
+                or owner == os.getpid()
+                or platform_compat.is_exec_supervisor_of_this_process(owner)
+            ):
                 mine = True
                 # The captured row, never the number: the untracker matches the
                 # ``<gw_pid>:<pid>`` prefix at any token and would take a

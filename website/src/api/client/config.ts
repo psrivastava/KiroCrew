@@ -37,6 +37,14 @@ export interface AcpBackendProbe {
   missing_components: string[]
   install_command: string
   /**
+   * Set only on a `'missing'` row whose binary DOES resolve but runs a release
+   * other than the one the gateway verified (GitHub Copilot CLI's pin): the
+   * release it found. The row then reads "Wrong version" rather than "Not
+   * installed", and `install_command` installs the verified release. OPTIONAL
+   * because a gateway that predates this field sends none.
+   */
+  found_version?: string
+  /**
    * Installed on disk, but the RUNNING gateway already resolved its absence and
    * cached that for the process's life — so a session started now would still
    * fail. Disables the option and says restart, rather than offering a control
@@ -84,6 +92,17 @@ export interface AcpBackendProbe {
    * panel like every other id on the card, and is `''` on a measured line.
    */
   capabilities?: {
+    id: string
+    available: boolean
+    measured?: boolean
+    unmeasured_reason?: string
+  }[]
+  /**
+   * The card's DETAIL lines: same entry shape as `capabilities`, real differences
+   * outside the curated core. The panel folds them behind a disclosure and keeps
+   * them out of the "supports N of M" count. OPTIONAL: an older gateway sends none.
+   */
+  details?: {
     id: string
     available: boolean
     measured?: boolean
@@ -155,6 +174,8 @@ export interface AcpBackendProbe {
   mcp?: {
     per_tool_deny: string
     costs_whole_server?: boolean
+    /** Servers that keep per-tool deny where the reach costs others whole. */
+    spared_servers?: string[]
     ineffective: string[]
   }
 }
@@ -164,15 +185,30 @@ export function createConfigEndpoints({ post, put, j, jfetch: fetch }: ClientTra
     // Agent config
     agentConfig: () => fetch('/api/agent/config').then(j),
     saveAgentConfig: (config: object) => put('/api/agent/config', { config }).then(j),
-    defaultAgent: () => fetch('/api/config/default-agent').then(j),
-    setDefaultAgent: (agent: string) => put('/api/config/default-agent', { agent }).then(j),
+    // One readout for both defaults: `default_agent` is the default crewmate,
+    // `default_template` the template a session runs when nothing names one
+    // (the effective name, a deleted template's fallback included).
+    // `overridden` says config.local.json pins the template, so a template
+    // write is refused; `override_path` names that file (owner only).
+    defaultAgent: () => fetch('/api/config/default-agent').then(j) as Promise<{ default_agent: string; default_template: string; overridden: boolean; override_path?: string }>,
+    /** The default for NEW SESSIONS is a template (`agent.default_agent`); a
+     *  crewmate alias sets the roster's default crewmate instead. `agent_kind`
+     *  names which the caller means when a template and a crewmate share a name. */
+    setDefaultAgent: (agent: string, agent_kind?: 'member' | 'template') =>
+      put('/api/config/default-agent', { agent, ...(agent_kind ? { agent_kind } : {}) }).then(j),
     kirocrewConfig: () => fetch('/api/config/kirocrew').then(j),
     saveKirocrewConfig: (agent: object) => put('/api/config/kirocrew', { agent }).then(j) as Promise<{ ok?: boolean; restart_required?: boolean; error?: string }>,
-    patchConfig: (path: string, value: unknown) => fetch('/api/config/kirocrew', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path, value }) }).then(j),
+    patchConfig: (path: string, value: unknown, opts?: { ifUnset?: boolean }) => fetch('/api/config/kirocrew', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path, value, ...(opts?.ifUnset ? { if_unset: true } : {}) }) }).then(j),
     // Owner-only, and absent (404) on an older gateway. Both of those reach the
     // caller as a rejection, which is the intended signal: "no probe information",
     // to be treated as fail-open rather than as a verdict.
-    acpBackends: () => fetch('/api/acp-backends').then(j) as Promise<{ backends: AcpBackendProbe[] }>,
+    // `kiro_selection_runs_on_kas`: `agent.acp_backend` is stored as Kiro CLI and
+    // sessions run it on KAS, so the Agent Harness panel offers to save KAS.
+    acpBackends: () =>
+      fetch('/api/acp-backends').then(j) as Promise<{
+        backends: AcpBackendProbe[]
+        kiro_selection_runs_on_kas?: boolean
+      }>,
     // Re-take ONE backend's verdict with this gateway's cached absence dropped first,
     // and answer with that backend's row in the shape `acpBackends` sends -- so the
     // caller splices it into the list it already holds rather than keeping a second

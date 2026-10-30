@@ -28,12 +28,18 @@ vi.mock('react-virtuoso', () => ({
 }))
 vi.mock('../api/client', () => ({
   api: {
+    // The composer's project pill reads the project's AWS profile binding.
+    projectAwsProfile: vi.fn().mockResolvedValue({ path: '/repo', profile: null, boundDir: null, profiles: [], status: null }),
     // Both slots: the created one must be listed or `switchSlot` cannot activate it.
     chatSlots: vi.fn().mockResolvedValue([
       { key: 'chat-1', messages: 1, running: false, mode: '', project: '/repo' },
       { key: 'chat-2', messages: 0, running: false, mode: '', project: '/repo-wt-limits' },
     ]),
     chatSlotDetail: vi.fn().mockResolvedValue({ messages: [], running: false, has_more: false, total: 0 }),
+    // The pane's unrestored-tabs notice reads this on arrival. Unmocked, the read
+    // FAILS and the notice says so -- correctly, but it is a second `role="alert"`
+    // in a file that asks for the only one.
+    chatSlotsUnrestored: vi.fn().mockResolvedValue({ reported: true, count: 0 }),
     sendChat: vi.fn().mockResolvedValue({ ok: true, json: () => Promise.resolve({ ok: true }) }),
     chatHistory: vi.fn().mockResolvedValue({ sessions: [] }),
     dashboardConfig: vi.fn().mockResolvedValue({}),
@@ -61,6 +67,9 @@ vi.mock('../api/client', () => ({
     // worktree-failure notice the assertions below look up by role.
     kirocrewConfig: vi.fn().mockResolvedValue({}),
     agentResolvedModel: vi.fn().mockResolvedValue({ pinned: false }),
+    // The composer's environment chip reads this on mount; unanswered, it
+    // fails and renders another `role="alert"`.
+    chatSlotEnvironment: vi.fn().mockResolvedValue({ profiles: [] }),
     // The composer's git probe, which decides between the worktree route and
     // the plain new-chat route on the card.
     projectGit: vi.fn().mockResolvedValue({ repo: true, branch: 'main' }),

@@ -2,7 +2,8 @@
 
 The project directory, the data home and a leftover legacy home, deployed cron
 scripts and installed skills against their sources, the ``kirocrew`` launcher on
-``PATH``, an editable install's source checkout, and the Python import path.
+``PATH``, an editable install's source checkout, the Python import path, and the
+timezone data the runtime resolves zones from.
 """
 
 from __future__ import annotations
@@ -10,7 +11,9 @@ from __future__ import annotations
 import os
 import shutil
 import sys
-from pathlib import Path
+import zoneinfo
+from datetime import datetime, timedelta, timezone
+from pathlib import Path, PurePosixPath
 
 from kiro_crew import cli_doctor
 from kiro_crew.doctor_checks import render
@@ -265,6 +268,61 @@ def _doctor_skill_currency(issues: list[str]) -> None:
         )
 
 
+#: Basename of Toolbox's shared dispatcher. Every Toolbox tool name on PATH is a
+#: link to it, and it picks the tool from the name it was invoked as.
+_TOOLBOX_DISPATCHER = "toolbox-exec"
+
+
+def _toolbox_launcher_runs_this_version(on_path: str) -> bool:
+    """Whether *on_path* is the Toolbox dispatcher and runs this install's version.
+
+    A path comparison cannot answer this for Toolbox: ``on_path`` resolves to the
+    one dispatcher every tool shares, never to this install's own binary. So when
+    THIS install is Toolbox-managed and ``on_path`` resolves to that dispatcher,
+    ask it: ``--version`` run through the PATH spelling (the dispatcher reads its
+    argv[0]) must print exactly this install's version line. Any other answer --
+    another version, a failed or timed-out run, unreadable output, a host that
+    cannot build the sandbox -- is False, so the caller keeps its warning.
+
+    The launcher is whatever ``which`` found first on PATH, so a file an agent
+    wrote into a PATH directory (an activated worktree venv, say) can reach this
+    point. It is run the way an agent-influenced command is: through the sandbox
+    chokepoint with a credential-scrubbed environment and the kernel resource
+    ceiling, never bare with this process's privileges.
+    """
+    import subprocess
+
+    from kiro_crew import env, version_line
+
+    if os.path.basename(os.path.realpath(on_path)) != _TOOLBOX_DISPATCHER:
+        return False
+    if not env.is_toolbox_install():
+        return False
+    sandbox = cli_doctor.sandbox
+    try:
+        wrapped, child_env, cleanup = sandbox.sandboxed_spawn_argv(
+            [on_path, "--version"], mode="strict", strip_python_env=True
+        )
+    except (RuntimeError, OSError):
+        return False
+    try:
+        result = sandbox.run_limited(
+            wrapped,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5,
+            env=child_env,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    finally:
+        if cleanup:
+            Path(cleanup).unlink(missing_ok=True)
+    return result.returncode == 0 and result.stdout.strip() == version_line()
+
+
 def _doctor_path_launcher() -> None:
     """Report which install the ``kirocrew`` command on PATH actually belongs to.
 
@@ -291,6 +349,11 @@ def _doctor_path_launcher() -> None:
     if not os.path.isabs(running) or os.path.realpath(on_path) == os.path.realpath(running):
         # Canonical spelling, matching the Data Home row and the comparison above.
         print(f"  kirocrew CLI: ✅ {os.path.realpath(on_path)}")
+        return
+    if _toolbox_launcher_runs_this_version(on_path):
+        # The realpath is Toolbox's shared dispatcher, so the PATH spelling is the
+        # one that names the tool.
+        print(f"  kirocrew CLI: ✅ {on_path} (Toolbox launcher, same version)")
         return
     print("  ⚠ kirocrew CLI on PATH belongs to a different install than this one.")
     # Paths are printed UNWRAPPED, one per line: a wrapped path cannot be copied
@@ -557,3 +620,79 @@ def _doctor_sqlite_fts5(issues: list[str]) -> None:
             issues.append("sqlite fts5")
     except Exception as exc:  # pragma: no cover - defensive
         print(f"  sqlite fts5: ⚠️  could not check ({exc})")
+
+
+# ── timezone data ─────────────────────────────────────────────────────────────
+# Cron expressions and clock-time ``at_time`` values resolve through stdlib
+# ``zoneinfo``, which uses whatever data it finds: a system zoneinfo tree on
+# macOS and most Linux hosts, the ``tzdata`` package where no tree exists
+# (Windows, and Linux hosts without the OS tzdata package). Stale
+# data still resolves every zone name, so nothing at save or fire time can tell
+# it apart from current data; a job just runs at the hour the old rule gives.
+#
+# The probe is behavioural because a system tree exposes no version the stdlib
+# can read. IANA tzdb 2026b keeps America/Vancouver on UTC-7 all year; older
+# data still moves it back to UTC-8 each November. A December instant in the
+# first winter under the new rule therefore separates data from 2026b on from
+# everything older.
+_TZ_PROBE_ZONE = "America/Vancouver"
+_TZ_PROBE_INSTANT = datetime(2026, 12, 1, 12, tzinfo=timezone.utc)
+_TZ_PROBE_OFFSET = timedelta(hours=-7)
+
+
+def _tz_probe_offset() -> timedelta | None:
+    """The probe zone's UTC offset at the probe instant, read fresh from disk.
+
+    ``ZoneInfo.no_cache`` bypasses the process-wide zone cache, so the answer
+    describes the data installed now. Raises ``ZoneInfoNotFoundError`` when no
+    installed data resolves the zone.
+    """
+    zone = zoneinfo.ZoneInfo.no_cache(_TZ_PROBE_ZONE)
+    return _TZ_PROBE_INSTANT.astimezone(zone).utcoffset()
+
+
+def _tz_data_from_system() -> bool:
+    """Whether the probe zone resolves from a system zoneinfo tree.
+
+    ``zoneinfo`` searches ``TZPATH`` first and falls back to the ``tzdata``
+    package only when no tree holds the zone, so a file on ``TZPATH`` is the
+    data in use and the system package is what needs updating.
+    """
+    parts = PurePosixPath(_TZ_PROBE_ZONE).parts
+    return any(Path(root, *parts).is_file() for root in zoneinfo.TZPATH)
+
+
+def _doctor_tz_data(issues: list[str]) -> None:
+    """Report whether the timezone data in use carries current rules.
+
+    A ``tz data`` row is printed either way. Out-of-date or missing data is an
+    issue, and the remedy names the source that supplies the data: the
+    operating system's timezone package, or the ``tzdata`` Python package. A
+    running gateway keeps every zone it already loaded until it restarts, so
+    the remedy ends with a restart.
+    """
+    try:
+        offset = _tz_probe_offset()
+    except (zoneinfo.ZoneInfoNotFoundError, ValueError, OSError):
+        print("  tz data:     ❌ no timezone data resolves America/Vancouver")
+        print("               A named timezone does not resolve, so a job cannot use one.")
+        if cli_doctor.pip_install_channel_available():
+            print(f"{render._INDENT}Fix: {cli_doctor.pip_install_command_for('tzdata')}")
+        print("               Or install the operating system's timezone data (tzdata).")
+        issues.append("timezone data missing")
+        return
+    if offset == _TZ_PROBE_OFFSET:
+        print("  tz data:     ✅ current (America/Vancouver stays UTC-7 in winter)")
+        return
+    print("  tz data:     ⚠️  out of date (older than IANA tzdb 2026b)")
+    print("               It still moves America/Vancouver back to UTC-8 on")
+    print("               2026-11-01, so a job in that zone runs an hour late.")
+    if _tz_data_from_system():
+        print("               Fix: update the operating system's timezone data")
+        print("               (the tzdata package), then restart the gateway.")
+    elif cli_doctor.pip_install_channel_available():
+        print(f"{render._INDENT}Fix: {cli_doctor.pip_install_command_for('-U', 'tzdata')}")
+        print("               then restart the gateway.")
+    else:
+        print("               Fix: update Kiro Crew, then restart the gateway.")
+    issues.append("timezone data out of date")

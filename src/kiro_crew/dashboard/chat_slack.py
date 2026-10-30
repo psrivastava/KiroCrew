@@ -444,7 +444,6 @@ async def link_slot_to_slack(
             if not permitted:
                 raise SlackLinkError(403, "channel_not_permitted", "channel is not permitted")
 
-        # Check if already linked
         existing_ts, existing_chan = state.sessions.get_slack_link(session_key)
         if existing_ts and existing_chan:
             try:
@@ -475,7 +474,7 @@ async def link_slot_to_slack(
             # → neutral default. Redaction runs on the full snippet text before
             # truncation so a truncation boundary can never split (and hide) a
             # credential. Slots initialize title to their raw key
-            # (state.py), so gate on display_title — a slot still showing
+            # (state_parts/chat_slot.py), so gate on display_title — a slot still showing
             # NEW_SESSION_TITLE has no real title, while cron/plan/handoff slots
             # (real titles, _titled unset) pass their title through.
             base = slot.title if slot.display_title != dashboard_state.NEW_SESSION_TITLE else ""
@@ -758,7 +757,15 @@ async def api_chat_slot_slack_link(request: web.Request) -> web.Response:
     if not slot:
         return web.json_response({"error": "not found"}, status=404)
 
-    body = await request.json() if request.content_length else {}
+    try:
+        body = await request.json() if request.content_length else {}
+    except (LookupError, RecursionError, ValueError):
+        return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
+    # Valid JSON that is not an object (a list, a string) would crash on .get().
+    if not isinstance(body, dict):
+        return web.json_response(
+            {"error": "body must be a JSON object", "code": "body_not_object"}, status=400
+        )
     raw_channel = body.get("channel", "")
     # When the caller supplies an existing thread_ts (challenge-and-redirect
     # auto-link from a Slack thread the user replied in), link to THAT thread
@@ -972,7 +979,7 @@ async def api_chat_slot_slack_pause(request: web.Request) -> web.Response:
     name = request.match_info.get("name") or request.match_info.get("slot", "")
     slot = state.get_slot(name) or state._slots.get(name)
     if not slot:
-        return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
+        return slot_not_found()
 
     try:
         body = await request.json()

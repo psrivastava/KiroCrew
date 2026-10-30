@@ -102,9 +102,9 @@ async def _off_loop(fn: Callable[..., "T"], *args: object) -> "T":
     """
     return await asyncio.get_running_loop().run_in_executor(subprocess_executor(), fn, *args)
 
-# (rc, stdout, stderr) — live.py's sandboxed subprocess chokepoint. Injected
+# (rc, stdout, stderr) — live_service.py's sandboxed subprocess chokepoint. Injected
 # rather than imported so every spawn stays audited through the one seam the
-# tests already patch, and so this module has no import cycle with live.py.
+# tests already patch, and so this module has no import cycle with live_service.py.
 RunCmd = Callable[..., Awaitable[tuple[int, str, str]]]
 T = TypeVar("T")
 #: ``shutil.which``-shaped tool lookup, injected for the same reason as the
@@ -133,6 +133,9 @@ Which = Callable[[str], "str | None"]
 #               (launchd)  the plist lacks KeepAlive=true or the expected
 #                          ExitTimeOut value for detached graceful restart
 STATUS_OK = "ok"
+#: The foreground gateway is the desktop app's: the CLI refuses to restart it,
+#: and the app restarts it itself.
+STATUS_DESKTOP_SUPERVISED = "desktop_app_supervised"
 
 
 class _UnsafeTargetValue(ValueError):
@@ -229,7 +232,7 @@ class SystemdBackend:
     adapter existed, including the wire codes the dashboard already maps
     (``no_systemd`` / ``no_user_unit``).
 
-    The drop-in path and renderer are INJECTED from ``live.py`` rather than
+    The drop-in path and renderer are INJECTED from ``live_service.py`` rather than
     reimplemented here. They are the seam a dozen existing tests patch
     (``monkeypatch.setattr(mod, "_dropin_path", ...)`` /
     ``"_dropin_content"``), and keeping them where the tests already point means
@@ -633,6 +636,21 @@ DetachedSpawn = Callable[[list[str]], None]
 #: replacement gateway would inherit? See :func:`default_confinement`.
 Confinement = Callable[[], "str | None"]
 
+#: ``(port) -> bool`` — does the desktop app supervise the gateway on *port*?
+#: See :func:`default_desktop_supervised`.
+DesktopSupervised = Callable[[int], bool]
+
+
+def default_desktop_supervised(port: int) -> bool:
+    """Whether the desktop app supervises the gateway on *port*.
+
+    The CLI's restart refuses that gateway, so a detached restart spawned for
+    it would change nothing (:func:`kiro_crew.cli_server_stop.desktop_app_supervisor`).
+    """
+    from kiro_crew.cli_server_stop import desktop_app_supervisor
+
+    return desktop_app_supervisor(port, explicit_port=True) is not None
+
 
 def default_confinement() -> "str | None":
     """Why a process spawned from here would inherit confinement, or ``None``.
@@ -650,23 +668,20 @@ def default_confinement() -> "str | None":
     Worse, the detached child shares the backend's scope, so a scope kill
     mid-restart could strand the host with NO gateway.
 
-    Detection is deny-by-default on the two purpose-built signals:
-
-    * ``KIROCREW_SANDBOX_ACTIVE`` — exported only by the namespace launcher /
-      seatbelt env prefix, i.e. only ever present INSIDE the sandbox.
-    * ``kirocrew-agents.slice`` in ``/proc/self/cgroup`` — the transient scope
-      ``cgroup_scope_argv`` places every backend in (Linux only; the file does
-      not exist elsewhere and an unreadable file is treated as unconfined,
-      matching hosts where the scope probe failed and no scope was applied).
+    Detection is deny-by-default and defers to the one confinement probe,
+    ``sandbox.agent_confinement_evidence()``: the ``KIROCREW_SANDBOX_ACTIVE``
+    marker, the ``kirocrew-agents.slice`` cgroup scope (Linux, matched against
+    ``_CGROUP_AGENTS_SLICE``), and the macOS Seatbelt verdict — all three
+    inherited by a spawned child. Routing through that single helper means a
+    renamed slice or a new marker moves in one place; this returns the
+    Dev-Fleet-specific reason so the restart gate's message names what a
+    replacement would inherit, while the probe owns the signals.
     """
-    if os.environ.get("KIROCREW_SANDBOX_ACTIVE"):
-        return "the Dev Fleet backend runs inside the Kiro Crew OS sandbox"
-    try:
-        cgroup = Path("/proc/self/cgroup").read_text(encoding="utf-8")
-    except OSError:
-        return None
-    if "kirocrew-agents.slice" in cgroup:
-        return "the Dev Fleet backend runs inside the kirocrew-agents cgroup scope"
+    from kiro_crew.sandbox import agent_confinement_evidence
+
+    evidence = agent_confinement_evidence()
+    if evidence is not None:
+        return f"the Dev Fleet backend is confined: {evidence}"
     return None
 
 
@@ -775,6 +790,7 @@ class ForegroundBackend:
                  read_launcher: ReadLauncher, pid_exists: PidExists,
                  spawn: DetachedSpawn = default_detached_spawn,
                  confinement: Confinement = default_confinement,
+                 desktop_supervised: DesktopSupervised = default_desktop_supervised,
                  ) -> None:
         self._marker_ports = marker_ports
         self._read_pid = read_pid
@@ -782,6 +798,7 @@ class ForegroundBackend:
         self._pid_exists = pid_exists
         self._spawn = spawn
         self._confinement = confinement
+        self._desktop_supervised = desktop_supervised
 
     # -- discovery --
     def _locate(self) -> "tuple[int, int] | None":
@@ -846,6 +863,10 @@ class ForegroundBackend:
                 return "no_foreground_gateway"
             if self._resolve_binary(located[0]) is None:
                 return "no_kirocrew_binary"
+            if self._desktop_supervised(located[0]):
+                # The detached restart would be refused, so spawning it would
+                # report a restart that never happens.
+                return STATUS_DESKTOP_SUPERVISED
             return STATUS_OK
 
         return await _off_loop(_probe)

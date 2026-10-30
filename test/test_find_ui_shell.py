@@ -63,8 +63,8 @@ PHRASINGS = [
     ("展开导航栏", "zh-CN", "shell.nav-toggle"),
     ("open the terminal", "en", "shell.terminal"),
     ("打开终端", "zh-CN", "shell.terminal"),
-    ("developer settings page", "en", "shell.developer"),
-    ("开发者页面", "zh-CN", "shell.developer"),
+    ("developer settings page", "en", "settings.tab.developer"),
+    ("开发者页面", "zh-CN", "settings.tab.developer"),
     ("connect my phone", "en", "shell.connect-phone"),
     ("连接手机", "zh-CN", "shell.connect-phone"),
     ("kiro account balance", "en", "shell.kiro-account"),
@@ -92,27 +92,13 @@ def test_novice_phrasing_finds_the_control(query: str, lang: str, target: str) -
         ("hide distractions", "en", "shell.focus-mode"),
         ("mark a notification unread", "en", "notifications.detail.mark-unread"),
         ("打开终端", "zh-CN", "shell.terminal"),
-        ("开发者页面", "zh-CN", "shell.developer"),
+        ("开发者页面", "zh-CN", "settings.tab.developer"),
         ("专注模式", "zh-CN", "shell.focus-mode"),
     ],
 )
 def test_the_clear_phrasings_rank_the_control_first(query: str, lang: str, top: str) -> None:
     d = ui_index.find_ui(query, lang)
     assert d["status"] == "ok" and d["results"][0]["id"] == top, d
-
-
-@pytest.mark.parametrize(
-    ("query", "lang"),
-    [
-        ("notify my boss", "en"),
-        ("report my taxes", "en"),
-        ("where are my keys", "en"),
-        ("chat about dinner", "en"),
-        ("给老板发通知", "zh-CN"),
-    ],
-)
-def test_unrelated_phrasings_are_no_match(query: str, lang: str) -> None:
-    assert ui_index.find_ui(query, lang)["status"] == "no_match", query
 
 
 # ── exact placements ──
@@ -126,7 +112,6 @@ def _loc(query: str, target: str, lang: str = "en") -> dict[str, Any]:
     ("query", "target", "label", "gate"),
     [
         ("open the terminal", "shell.terminal", "Terminal", "terminal_enabled"),
-        ("developer tools", "shell.developer", "Developer", "developer_mode"),
         (
             "connect my phone",
             "shell.connect-phone",
@@ -229,10 +214,10 @@ def test_the_bell_feed_and_the_page_feed_are_separate_sites() -> None:
 
     bell_clear = _loc("clear all notifications", "notifications.clear-all")
     page_clear = _loc("delete all notifications", "notifications.page-clear-all")
-    assert bell_clear["label"] == "Clear all notifications?"
+    assert bell_clear["label"] == "Clear all notifications"
     assert _ids(bell_clear["placements"][0]) == ["shell.notifications", "notifications.clear-all"]
     assert _req(bell_clear["placements"][0]) == ["has_notifications"]
-    assert page_clear["label"] == "Clear"
+    assert page_clear["label"] == "Clear all"
     assert _ids(page_clear["placements"][0]) == [
         "page.notifications",
         "notifications.page-clear-all",

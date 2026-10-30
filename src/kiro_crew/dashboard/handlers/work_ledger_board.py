@@ -48,6 +48,7 @@ from kiro_crew.dashboard.handlers.work_ledger import (
     _own_ledger,
     _refuse_if_dirty,
     _slot_closed,
+    _slot_looping,
     _slot_open,
     _slot_running,
     _tail_events,
@@ -140,12 +141,19 @@ def _parse_ts(raw: Any) -> datetime | None:
         return None
 
 
+#: Event kinds that answer a worker's question: the conductor's decision, and the
+#: person's own steer into that worker.
+_ANSWER_KINDS = frozenset({"decision", "steer"})
+
+
 def _is_outstanding(item: work_ledger.WorkItem, events: list[dict[str, Any]]) -> bool:
     """Whether this item is a question the conductor has not yet answered.
 
     A bare "has a decision" test is wrong: an item can be decided, sent back, and
     then ask something new, and the old decision must not silence the new question.
-    So the newest ``decision`` must be NEWER than the report that asked.
+    So the newest ``decision`` must be NEWER than the report that asked. A person's
+    ``steer`` newer than the ask answers it too: the person outranks the conductor,
+    and the worker already has the answer.
 
     Falls back to ``last_report_at`` when the asking report has aged off the event
     tail, and treats an unparseable or missing ask as outstanding — a question the
@@ -163,7 +171,7 @@ def _is_outstanding(item: work_ledger.WorkItem, events: list[dict[str, Any]]) ->
         if kind == "report" and event.get("status") == _ASKING_STATUS:
             if asked is None or stamp > asked:
                 asked = stamp
-        elif kind == "decision":
+        elif kind in _ANSWER_KINDS:
             if answered is None or stamp > answered:
                 answered = stamp
     if asked is None:
@@ -229,6 +237,52 @@ def _redact_deep(value: Any) -> Any:
     if isinstance(value, list):
         return [_redact_deep(item) for item in value]
     return value
+
+
+def task_records(
+    slot_key: str,
+) -> tuple[work_ledger.ConductorRecord | None, list[work_ledger.WorkItem]]:
+    """Return this slot's conductor and work items for gateway-owned readers.
+
+    The slot comes from server state, never caller input. Keeping this read on the
+    existing dashboard seam preserves the store's identity boundary.
+    """
+    return work_ledger.read_conductor(slot_key), work_ledger.list_work_items(slot_key)
+
+
+def work_item_is_terminal(state: object) -> bool:
+    """Whether a stored work-item state is terminal."""
+    return state in work_ledger.TERMINAL_ITEM_STATES
+
+
+def closed_items(slot_key: str) -> list[dict[str, Any]]:
+    """The closed items on thread *slot_key*'s own ledger, as this board reads them.
+
+    The gateway-side reader behind a crewmate's weekly and monthly goal reports:
+    the slot comes from the crewmate's own goal binding, never from a request, so
+    no caller names a ledger here. Each row is ``{closed_at, title, state,
+    summary}`` with ``closed_at`` parsed (rows without one are dropped) and every
+    string through the same egress redactor as the board payload. A thread that
+    owns no ledger, or whose key does not fold, has closed nothing. Blocking file IO.
+    """
+    try:
+        items = work_ledger.list_work_items(session_ledger.ledger_key(slot_key))
+    except (work_ledger.WorkLedgerError, OSError):
+        return []
+    rows: list[dict[str, Any]] = []
+    for item in items:
+        if not item.is_terminal:
+            continue
+        closed = work_ledger.parse_stamp(item.closed_at or "")
+        if closed is None:
+            continue
+        rows.append(
+            {
+                "closed_at": closed,
+                **_redact_deep({"title": item.title, "state": item.state, "summary": item.summary}),
+            }
+        )
+    return rows
 
 
 def _alive_of(state: DashboardState, worker_key: str) -> str:
@@ -316,6 +370,11 @@ async def api_work_ledger_board(request: web.Request) -> web.Response:
 
     state: DashboardState = request.app["state"]
     conductor_alive = _slot_open(state, key)
+    # The worker's transport, not the ledger: a report the harness never delivered.
+    # Read outside the board hold because it is not part of the ledger snapshot.
+    undelivered = await asyncio.to_thread(
+        lambda: {item.item_id: work_ledger.read_undelivered(key, item) for item in items}
+    )
 
     rows: list[dict[str, Any]] = []
     for item in items:
@@ -325,8 +384,10 @@ async def api_work_ledger_board(request: web.Request) -> web.Response:
             item,
             worker_running=_slot_running(state, item.worker_session_key or ""),
             worker_closed=_slot_closed(state, item.worker_session_key or ""),
+            worker_looping=_slot_looping(item.worker_session_key or ""),
         )
         row["acceptance_concrete"] = work_ledger.is_acceptance_concrete(item.acceptance)
+        row["report_undelivered"] = undelivered.get(item.item_id)
         row["events"] = _mask_events([event.to_dict() for event in event_tails[item.item_id]])
         rows.append(
             _project_item(

@@ -1,8 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, act } from '@testing-library/react'
-import { readFileSync } from 'node:fs'
-import { resolve } from 'node:path'
 import FollowUpBar, { FOLLOWUP_CHIP_DEBOUNCE_MS } from '../components/FollowUpBar'
+import { readIndexCss } from './indexCssSource'
 
 // jsdom polyfill: scroll-layout uses ResizeObserver to track when the chip
 // strip can scroll left/right.
@@ -188,6 +187,18 @@ describe('FollowUpBar', () => {
       // recovery at all.
       fireEvent.focus(screen.getByRole('button', { name: 'Go' }))
       expect(screen.getByRole('tooltip').textContent).toMatch(/double-click/i)
+    })
+
+    it('opens the chip tooltip below, off an approval card that sits above the chips', () => {
+      render(<FollowUpBar options={['Go']} picked={new Set()} onSelect={() => {}} onSend={() => {}} />)
+      // Mid-screen, so 'above' would fit and only the chosen side decides.
+      const chip = screen.getByRole('button', { name: 'Go' })
+      const rect = { top: 400, bottom: 420, left: 10, right: 60, width: 50, height: 20, x: 10, y: 400, toJSON: () => ({}) } as DOMRect
+      const spy = vi.spyOn(Element.prototype, 'getBoundingClientRect').mockReturnValue(rect)
+      chip.getClientRects = () => [rect] as unknown as DOMRectList
+      fireEvent.focus(chip)
+      expect(screen.getByRole('tooltip')).toHaveAttribute('data-placement', 'below')
+      spy.mockRestore()
     })
 
     it('names the ↑ send segment in the tooltip hint when the segment is visible', () => {
@@ -416,7 +427,7 @@ describe('FollowUpBar', () => {
     it('backs the cap class with a real max-width rule', () => {
       // jsdom does not load index.css, so the class assertions above would pass
       // with the rule deleted. Read the stylesheet directly.
-      const css = readFileSync(resolve(process.cwd(), 'src/index.css'), 'utf-8')
+      const css = readIndexCss()
       expect(css).toMatch(
         /\.followup-chip\s*\{[^}]*max-width:\s*min\(100%,\s*clamp\(18rem,\s*calc\(50% - 0\.1875rem\),\s*26rem\)\)/,
       )
@@ -434,7 +445,7 @@ describe('FollowUpBar', () => {
     // reshaped rule fails both tests below with this message instead of a
     // TypeError on a null match.
     const chipCapPreferred = (): { pct: number, halfGapRem: number } => {
-      const css = readFileSync(resolve(process.cwd(), 'src/index.css'), 'utf-8')
+      const css = readIndexCss()
       const m = css.match(/\.followup-chip\s*\{[^}]*calc\((\d+)% - ([\d.]+)rem\)/)
       expect(m, '.followup-chip must cap width relative to the row (calc(<pct>% - <half-gap>rem))').not.toBeNull()
       return { pct: Number(m![1]), halfGapRem: Number(m![2]) }

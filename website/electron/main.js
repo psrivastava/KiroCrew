@@ -38,6 +38,14 @@ const Store = require("electron-store");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const { createLaunchLog } = require("./launch-log");
+
+// First, so the stdio 'error' listeners are attached before anything writes to
+// the console: a write to a dead tty must not become an uncaughtException that
+// the safety net mirrors back to the same tty (#15950).
+const launchLog = createLaunchLog({
+  append: (entry) => fs.appendFileSync(gatewayLogPath(), entry),
+});
 
 const { findConfiguredDashboardPort } = require("./data-home");
 const { defaultedPort } = require("./gateway-auth-hint");
@@ -57,7 +65,8 @@ const {
 } = require("./host-config");
 const { isLocalGatewayEnabled } = require("./local-gateway");
 const { seedRenamedStore } = require("./store-rename");
-const { resolveHome, secretCandidates } = require("./home-dir");
+const { resolveHome } = require("./home-dir");
+const { internalSecretFor } = require("./local-token");
 const { identityFamily } = require("./instance-guard");
 const { isCCrew, ccrewAppName, CCREW_DEFAULT_PORT } = require("./ccrew-identity");
 const { describeSingletonLock } = require("./singleton-lock");
@@ -77,7 +86,9 @@ const {
   shutdownCrewCompanion,
   suspendCrewCompanion,
   resumeCrewCompanion,
+  hostsDashboard,
 } = require("./crew-companion/index");
+const { createDeepLinkHandler, installDeepLinks, installNavigateReady } = require("./deep-link-handler");
 
 // An update install stops the gateway and quits the app. Close the Crew
 // Companion overlay at dispatch so it does not float orphaned over the vanished
@@ -92,6 +103,10 @@ function reopenCrewCompanionAfterUpdate() {
   try { resumeCrewCompanion(); } catch { /* best effort */ }
 }
 const { createGatewaySupervisor } = require("./gateway-supervisor");
+const {
+  createShellBundleWatch,
+  promptRestartForPrunedBundle,
+} = require("./shell-bundle-watch");
 const { createWindowLifecycle } = require("./window-lifecycle");
 const { createIpcRegistrar } = require("./ipc-registrar");
 const { createDownloadExpectations } = require("./download-expectations");
@@ -114,9 +129,18 @@ const releaseEarlyBootGuard = installEarlyBootGuard({
 // Carry settings across the npm name rename before electron-store opens the
 // destination. Construction writes defaults, after which the seed could no
 // longer distinguish a first launch from an existing store.
-seedRenamedStore(app.getPath("userData"), {
+//
+// Capture whether this install already existed BEFORE either the rename-seed or
+// construction can create the file: a FRESH install gets the summon hotkey
+// opted OUT (globalHotkey "") just below, while an upgrading user keeps their
+// existing null (the auto-bound platform default) untouched. The seed carrying
+// legacy settings also counts as "not fresh".
+const storeConfigFile = path.join(app.getPath("userData"), "config.json");
+const storeFileExistedBeforeBoot = fs.existsSync(storeConfigFile);
+const renameSeedCarriedSettings = seedRenamedStore(app.getPath("userData"), {
   log: (message) => glog("store migration: " + message),
 });
+const isFreshInstall = !storeFileExistedBeforeBoot && !renameSeedCarriedSettings;
 
 const store = new Store({
   defaults: {
@@ -125,18 +149,35 @@ const store = new Store({
     remoteHosts: {},
     sshTimeoutMs: 20000,
     windowState: null,
-    globalHotkey: null,
+    globalHotkey: null, // system-wide summon accelerator: null = platform default, "" = disabled, string = custom (see global-hotkey.js). A fresh install is seeded "" below so the default hotkey is opt-in; an upgrading user keeps null.
     lastNudgedVersion: "",
     themeAccent: "",
     updateChannel: "",
     autoDownloadUpdates: true,
     runLocalGateway: true,
+    // "background" or "quit". See close-action.js.
+    closeAction: "background",
     linuxFrameless: null,
     // Written by gpu-crash-fallback.js when the GPU process dies at startup;
     // read before Chromium initializes on the next launch.
     gpuSoftwareFallback: null,
   },
 });
+
+// Opt the summon hotkey OUT for FRESH installs only. Before this, a null/unset
+// globalHotkey auto-bound the platform default (Cmd+Shift+K on macOS, which is
+// Slack's "compose a new message" chord) — a global accelerator is exclusive, so
+// the app swallowed it for every other program out of the box. New installs now
+// start with it disabled ("") and opt in deliberately. An UPGRADING user is left
+// at null and keeps the hotkey they already had, so nothing is yanked from under
+// them. Written once, at store creation; a later launch finds the file and skips.
+// The fresh-vs-upgrade decision is the pure planFreshInstallHotkeySeed() helper,
+// unit-tested in global-hotkey.test.js.
+const { planFreshInstallHotkeySeed } = require("./global-hotkey");
+const hotkeySeed = planFreshInstallHotkeySeed(store.get("globalHotkey"), isFreshInstall);
+if (hotkeySeed !== null) {
+  store.set("globalHotkey", hotkeySeed);
+}
 
 const KIROCREW_HOME = resolveHome();
 
@@ -229,46 +270,82 @@ function gatewayLogPath() {
   return path.join(directory, "gateway-launch.log");
 }
 
+// The console mirror stops once stdio is dead; see launch-log.js.
 function glog(line) {
-  const entry = "[" + new Date().toISOString() + "] " + line + "\n";
-  try {
-    fs.appendFileSync(gatewayLogPath(), entry);
-  } catch (error) {
-    // Preserve the diagnostic when the file sink itself is unavailable.
-    console.error(
-      "[gateway-launch] " + line + " (log write failed: "
-        + (error && error.message ? error.message : error) + ")",
-    );
-  }
+  launchLog.glog(line);
 }
 
 function gwarn(line) {
-  glog(line);
-  console.warn("[gateway-launch] " + line);
+  launchLog.gwarn(line);
 }
 
 function gerror(line) {
-  glog(line);
-  console.error("[gateway-launch] " + line);
+  launchLog.gerror(line);
 }
 
-function readInternalSecret() {
-  // Re-read on every call. The gateway rotates this secret across restarts, so
-  // caching turns a successful recovery into a stream of spurious 403s.
-  for (const candidate of secretCandidates()) {
-    try {
-      const value = fs.readFileSync(candidate, "utf8").trim();
-      if (value) return value;
-    } catch {
-      // Try the next platform-compatible home candidate.
-    }
-  }
-  return "";
+/**
+ * The X-Internal-Secret to send to `gatewayUrl`, or "" to send none.
+ *
+ * Only the entry the gateway published for the dialed listener counts
+ * (`internalSecretFor`), so the secret can authenticate only against the
+ * listener it is sent to. The home-wide `.local_secret` is never read here: it
+ * is a last-writer-wins slot, and a loopback port can be a tunnel's local end
+ * or another gateway, so sending it there could hand over a credential minted
+ * elsewhere.
+ *
+ * Re-read on every call. The gateway rotates this secret across restarts, so
+ * caching turns a successful recovery into a stream of spurious 403s.
+ *
+ * @param {string} gatewayUrl the URL the request is about to dial
+ * @returns {string}
+ */
+function readInternalSecret(gatewayUrl) {
+  return internalSecretFor({ gatewayUrl, home: resolveHome(), path, fs });
 }
 
 let isQuitting = false;
 let desktopMetricsRecorder = null;
 let windows = null;
+// The kirocrew:// deep-link handler (armed by the single-instance winner below).
+let deepLinks = null;
+
+/** The main window's dashboard view webContents, or null while there is none. */
+function mainDashboardContents() {
+  const win = windows && windows.getMainWindow();
+  if (!win || win.isDestroyed() || !win._mcView) return null;
+  const wc = win._mcView.webContents;
+  return wc && !wc.isDestroyed() ? wc : null;
+}
+
+/**
+ * Deliver a resolved kirocrew:// route to the main window, the one connected
+ * to this machine's gateway, which is where a slot key names a session. An
+ * empty route only raises it. A session route is sent only while the view
+ * serves the gateway's origin -- the Crew Companion's own routing check -- and
+ * the window is raised only then, so an undeliverable link moves nothing and
+ * stays held.
+ */
+function deliverDeepLink(route) {
+  if (!windows) return false;
+  if (!route) return windows.showMainWindow({ focus: true });
+  const wc = mainDashboardContents();
+  if (!wc || !hostsDashboard(wc, BACKEND_URL)) return false;
+  windows.showMainWindow({ focus: true });
+  wc.send("navigate", route);
+  return true;
+}
+
+// Whether a dashboard document has finished loading in this run, owned by the
+// GPU-crash fallback (the single-instance winner arms it below). The dead-
+// renderer dialog reads it to tell a renderer that never started from one
+// that crashed later.
+let dashboardLoaded = () => false;
+
+// The native-logging result, kept because its `tightenLiveLog` can only run once
+// Chromium has opened `--log-file` — which is after `app.whenReady`, in a
+// different scope from the pre-ready arming call. Null when this process is not
+// the lock winner and so never armed logging at all.
+let nativeLogging = null;
 
 let crashScan = null;
 // Separate from `crashScan` so a scan that failed is not retried on every call:
@@ -366,7 +443,7 @@ if (!app.requestSingleInstanceLock()) {
     log: glog,
   });
 
-  initNativeLogging({
+  nativeLogging = initNativeLogging({
     logsDir: path.dirname(gatewayLogPath()),
     appendSwitch: (name, value) => app.commandLine.appendSwitch(name, value),
     startCrashReporter: (options) => crashReporter.start(options),
@@ -398,7 +475,7 @@ if (!app.requestSingleInstanceLock()) {
   // `child-process-gone` listener that makes that decision, so a GPU process
   // that dies before the dashboard loads relaunches the app once in software
   // mode instead of letting Chromium abort it with no window and no log.
-  initGpuCrashFallback({
+  const gpuFallback = initGpuCrashFallback({
     app,
     store,
     backendUrl: BACKEND_URL,
@@ -406,16 +483,54 @@ if (!app.requestSingleInstanceLock()) {
     requestQuit,
     log: glog,
   });
+  dashboardLoaded = gpuFallback.dashboardLoaded;
 
-  app.on("second-instance", () => {
-    // Relaunch is explicit intent to see the existing window. The window owner
-    // cancels a pending fullscreen/tray hide before restore/show/focus.
+  // kirocrew:// deep links: bare `kirocrew://` raises the window and
+  // `kirocrew://chat?sid=<slot>` opens that session. A session link is held
+  // until the dashboard document reports `navigate-ready` (its `navigate`
+  // listener is mounted), so a link that LAUNCHED the app is applied once the
+  // SPA can take it. Registered here, before `whenReady`, because macOS
+  // delivers a launching URL through `open-url` during startup and drops it
+  // when no listener is attached.
+  deepLinks = createDeepLinkHandler({ deliver: deliverDeepLink, log: glog });
+  installDeepLinks({ app, handler: deepLinks, log: glog });
+  installNavigateReady({
+    app,
+    ipcMain,
+    handler: deepLinks,
+    isDashboardContents: (contents) => Boolean(contents) && contents === mainDashboardContents(),
+  });
+  // On Windows and Linux the URL that launched THIS instance is in its own
+  // argv; `second-instance` fires only for later launches. macOS argv carries
+  // no URL, so this finds nothing there.
+  deepLinks.handleArgv(process.argv);
+
+  app.on("second-instance", (_event, argv) => {
+    // On Windows and Linux a kirocrew:// link launches a second copy with the
+    // URL in argv; route to it. Otherwise a relaunch is explicit intent to see
+    // the existing window. The window owner cancels a pending fullscreen/tray
+    // hide before restore/show/focus.
+    if (deepLinks && deepLinks.handleArgv(argv)) return;
     windows?.showMainWindow({ focus: true });
   });
 }
 
 // Factories are created at module load, before any renderer can change settings.
 // In particular, the supervisor snapshots runLocalGateway once for this launch.
+// The shell-bundle watch is declared first because the supervisor reports
+// stale-bundle respawns to it, and it reads the supervisor's update handoff.
+const shellBundleWatch = createShellBundleWatch({
+  // Electron's unpatched fs: the patched one can answer for a deleted app.asar
+  // from its archive cache.
+  fs: require("original-fs"),
+  path,
+  processObj: process,
+  isPackaged: app.isPackaged,
+  isQuitting: () => isQuitting,
+  isUpdating: () => gateway.isInstallingUpdate(),
+  log: glog,
+  onPruned: () => promptRestartForPrunedBundle({ dialog, requestQuit, log: glog }),
+});
 const gateway = createGatewaySupervisor({
   app,
   store,
@@ -447,6 +562,8 @@ const gateway = createGatewaySupervisor({
   // process pins the answer into the successor's environment, so the port it
   // watches is the port the successor takes.
   predictLocalPort: () => fallbackLocalPort(store, glog),
+  // The respawned backend can be healthy while this app's own bundle is gone.
+  onStaleBundleRespawn: () => shellBundleWatch.checkNow(),
 });
 
 // Shared single-use registry of downloads the renderer explicitly asked for.
@@ -461,6 +578,8 @@ windows = createWindowLifecycle({
   backendUrl: BACKEND_URL,
   port: PORT,
   glog,
+  logPath: gatewayLogPath,
+  dashboardLoaded: () => dashboardLoaded(),
   readInternalSecret,
   mintLocalToken: (...args) => gateway.mintLocalToken(...args),
   fetchRemoteToken: (...args) => gateway.fetchRemoteToken(...args),
@@ -483,6 +602,7 @@ const ipcRegistrar = createIpcRegistrar({
   reopenCrewCompanionAfterUpdate,
   crashScan: scanCrashArtifacts,
   downloadExpectations,
+  readInternalSecret,
 });
 
 /**
@@ -609,6 +729,19 @@ app.whenReady().then(async () => {
     glog("power: could not watch for resume: " + (error && error.message));
   }
 
+  // Chromium has opened `--log-file` by now, so this is the moment the live log's
+  // mode can be asserted rather than assumed. The pre-create in
+  // `initNativeLogging` only holds if Chromium opened the inode it created; if it
+  // unlinked and recreated the path instead, the file is sitting at the process
+  // umask (0644) with the dashboard session token in it. Idempotent and
+  // fail-soft — it logs and returns false rather than throwing — so it is cheap
+  // enough to run unconditionally on every boot.
+  try {
+    nativeLogging?.tightenLiveLog();
+  } catch (error) {
+    glog("native log post-open chmod failed: " + (error && error.message));
+  }
+
   const frameDecision = windows.platform.linuxFrameDecision;
   if (frameDecision) {
     glog(
@@ -650,6 +783,9 @@ app.whenReady().then(async () => {
 
   await gateway.start();
   await gateway.connect(mainWindow);
+  // Armed for every launch mode, including a service-managed or adopted
+  // gateway, whose backend never reports a stale bundle to this process.
+  shellBundleWatch.start();
   // The gateway now answers and the dashboard is loading. After an upgrade, drop
   // the old build's cached copies and connect again: a fresh navigation replaces
   // the pending one, where a reload would replay the uncommitted splash.
@@ -695,6 +831,7 @@ app.whenReady().then(async () => {
 
 app.on("before-quit", () => {
   isQuitting = true;
+  shellBundleWatch.stop();
   // Flush the final metrics window before gateway teardown begins.
   try {
     desktopMetricsRecorder?.stop();

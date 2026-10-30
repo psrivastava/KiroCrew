@@ -122,12 +122,13 @@ transport, and **EC2** when the instance was provisioned by the cloud launcher.
 
 ## Turning one crew off
 
-Each crew in **Settings → Remote Crew** has an on/off switch beside its status.
-Off closes that crew's tunnel and keeps it closed: no click, auto-connect or
-gateway restart opens it again. Its sidebar group reads **Disabled** with an
-**Enable** button, and an open pane for it shows offline. Turning it back on
-reconnects it. The crew's settings are kept the whole time. Only the owner can
-flip the switch.
+Each crew in **Settings → Remote Crew** has a switch beside its status that reads
+**Connections: On** or **Connections: Off**. Off closes that crew's tunnel and
+keeps it closed: no click, auto-connect or gateway restart opens it again. Its
+sidebar group reads **Off** with an **Enable** button, and an open pane for it
+shows offline. A crew reached through it stays closed too, and connecting one
+names the crew that is off. Turning it back on reconnects it. The crew's
+settings are kept the whole time. Only the owner can flip the switch.
 
 ## Crews reached through another crew
 
@@ -241,10 +242,10 @@ confused. They are unrelated.
 |---|---|---|
 | **Kiro Crew** | The product. | Everywhere |
 | **Remote Crew** — spelled `instance` in config, routes and code (`instances.json`, `/api/instances`) | Another machine running its own gateway, reached over a tunnel. This page. | Settings → Remote Crew, the header switcher |
-| **Crew Member**, or **crewmate** | A named assistant you keep: its own workspace, memory, agent template and model, with a standing thread. Not a machine. | The Crew Members page — see [crew-members.md](crew-members.md) |
+| **Crew Member**, or **mate** | A named assistant you keep: its own workspace, memory, agent template and model, with a standing thread. Not a machine. | The Crew Members page — see [crew-members.md](crew-members.md) |
 | **Issue Radar crew** | An automation worker configured on a repository that claims an issue and moves it through the triage phases. Not a machine and not an assistant you chat with. | The Issue Radar Pipeline tab — see [issue-radar-pipeline.md](issue-radar-pipeline.md) |
 
-The short test: a Remote Crew is a **host**, a crewmate is an **assistant**,
+The short test: a Remote Crew is a **host**, a mate is an **assistant**,
 an Issue Radar crew is a **worker on a repo**.
 
 ## Tuning
@@ -256,6 +257,7 @@ over a normal link.
 |---|---|---|
 | `instances.enabled` | `false` | The opt-in. Read at startup, so changing it needs a restart. |
 | `instances.warm_set_cap` | `0` | How many panes stay warm at once. `0` tracks how many machines you have registered, so up to an internal ceiling nothing is evicted. A number you set is honoured exactly. |
+| `instances.default_destination` | `""` | The crew **Send a copy to** lists first, marked as the default. Empty means no default. A folder's own **Default destination crew** (Folder settings) overrides it for sessions in that folder. Nothing is sent until you click. |
 | `instances.tunnel_base_port` | `7778` | The first local loopback port handed out for a tunnel. |
 | `instances.ssh_compression` | `true` | Compresses the tunnel. The whole remote dashboard travels over it, so this usually wins; turn it off on a fast local link. |
 | `instances.connect_timeout_secs` | SSH 15s, SSM 25s | How long to wait for a tunnel to start accepting connections. Raise it for a host behind a jump host or `ProxyCommand`. |
@@ -299,4 +301,4 @@ reports the first broken link, which is usually the whole answer.
 - [Native SSM vs legacy SSH](https://github.com/kirodotdev/KiroCrew/blob/main/docs/guides/cloud-instance-ssm-vs-ssh.md) — how a cloud-launched machine is reached.
 - [Remote and mobile access](https://github.com/kirodotdev/KiroCrew/blob/main/docs/guides/remote-and-mobile.md) — installing and running a gateway on the far machine in the first place.
 - [dashboard.md](dashboard.md) — the dashboard the switcher sits in.
-- [crew-members.md](crew-members.md) — crewmates, which are not machines.
+- [crew-members.md](crew-members.md) — mates, which are not machines.

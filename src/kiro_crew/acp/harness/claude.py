@@ -30,6 +30,7 @@ from kiro_crew.agent_sdk.backends import (
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_NODE_ADAPTER_PACKAGES,
     ACP_BACKEND_PROCESS_NAMES,
+    ACP_BACKENDS_AGENT_STARTED_TURNS,
     NODE_ADAPTER_ENTRY_SEGMENTS,
     model_registry_namespace,
 )
@@ -226,11 +227,16 @@ class ClaudeLaunch(ProcessAdapter):
         session._claude_adapter_disk_version = await asyncio.to_thread(
             _claude_adapter_installed_version, argv
         )
-        # Per-session settings seed (permissions.defaultMode + the availableModels
-        # allowlist that unlocks the 1M-token window). It MUST run on the PRIMARY
-        # spawn path — not only the rare model-substitution retry — or a claude
-        # session collapses to the 200K default.
+        # Per-session settings seed: permissions.defaultMode, the served ``model``
+        # once the advertised cache is warm, and the availableModels allowlist when
+        # another settings source defines one. It MUST run on the PRIMARY spawn
+        # path — not only the rare model-substitution retry — or the session
+        # starts without them.
         await session._seed_session_settings()
+        # A Side Chat session carries deny rules for the host's sensitive paths in
+        # its session options; they are built here, off the loop, because the
+        # envelope that ships them is built synchronously at session/new.
+        await session._prepare_claude_side_read_denies()
         # Translate the agent spec into the session MCP array HERE, and only AFTER
         # the seed above: the array is withheld entirely unless Crew authored
         # settings.local.json, so resolving it first would read the ownership flag
@@ -240,6 +246,10 @@ class ClaudeLaunch(ProcessAdapter):
         # synchronous in-memory read, so the kiro construction path gains no
         # executor hop and no new failure mode (harness-parity H13).
         await session._prepare_session_mcp()
+        # Bound here rather than in AcpClient.__init__ for the same reason: the
+        # constructor is shared with kiro-cli.
+        if self.backend in ACP_BACKENDS_AGENT_STARTED_TURNS:
+            session._install_idle_reader()
         return SpawnPlan(
             argv=argv,
             spawn_label=launch_mod._adapter_spawn_label(

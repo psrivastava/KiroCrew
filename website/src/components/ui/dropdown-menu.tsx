@@ -9,6 +9,8 @@ import { MaybeGuideRevealScope } from '../../guide/GuideRevealScope'
 import type { GuideRevealScopeId } from '../../uiLocations/guidePlans.gen'
 import { createTriggerContext, heldGuard, ProbeHoldContext, useProbeHold, useProbeTarget, useTriggerRef } from '../../guide/probeRegistry'
 import { useGuideTrustRootAttrs } from '../../guide/trustRoot'
+import { MountAfterCommit, useCloseWhenCrewHidden, useOverlayRoot } from '../overlayRoot'
+import { quietNextFocus } from '../../lib/quietFocusReturn'
 
 type DropdownMenuProps = React.ComponentProps<typeof DropdownMenuPrimitive.Root> & {
   /**
@@ -29,6 +31,8 @@ type DropdownMenuProps = React.ComponentProps<typeof DropdownMenuPrimitive.Root>
 }
 
 const DropdownTriggerSink = createTriggerContext()
+/** The menu's trigger element, read by the content when it hands focus back. */
+const DropdownTriggerElement = React.createContext<(() => HTMLElement | null) | null>(null)
 
 /**
  * Radix `DropdownMenu.Root`, plus two rules.
@@ -71,12 +75,14 @@ function DropdownMenu({ open: openProp, defaultOpen, onOpenChange, modal: modalP
   const close = React.useCallback(() => handleOpenChange(false), [handleOpenChange])
 
   useCloseOnFileDrag(open && modal, close)
+  useCloseWhenCrewHidden(open, close)
 
   // A probe opens the menu through this state and closes it the same way.
   const trigger = React.useRef<HTMLElement | null>(null)
   const openRef = React.useRef(open)
   openRef.current = open
   const setTrigger = React.useCallback((el: HTMLElement | null) => { trigger.current = el }, [])
+  const getTrigger = React.useCallback(() => trigger.current, [])
   useProbeTarget(guideProbe ?? (!isControlled && !onOpenChange), {
     kind: 'popup',
     trigger: () => trigger.current,
@@ -93,9 +99,11 @@ function DropdownMenu({ open: openProp, defaultOpen, onOpenChange, modal: modalP
   return (
     <MaybeGuideRevealScope id={guideScope} open={open}>
       <DropdownTriggerSink.Provider value={setTrigger}>
-        <ProbeHoldContext.Provider value={probeHold.held}>
-          <DropdownMenuPrimitive.Root open={open} onOpenChange={handleOpenChange} modal={modal} {...rest} />
-        </ProbeHoldContext.Provider>
+        <DropdownTriggerElement.Provider value={getTrigger}>
+          <ProbeHoldContext.Provider value={probeHold.held}>
+            <DropdownMenuPrimitive.Root open={open} onOpenChange={handleOpenChange} modal={modal} {...rest} />
+          </ProbeHoldContext.Provider>
+        </DropdownTriggerElement.Provider>
       </DropdownTriggerSink.Provider>
     </MaybeGuideRevealScope>
   )
@@ -111,7 +119,15 @@ const DropdownMenuTrigger = React.forwardRef<
 })
 DropdownMenuTrigger.displayName = DropdownMenuPrimitive.Trigger.displayName
 const DropdownMenuGroup = DropdownMenuPrimitive.Group
-const DropdownMenuPortal = DropdownMenuPrimitive.Portal
+// Portals into the owning pane's overlay root, so content opened in the local
+// dashboard hides with it behind a remote Crew (see components/overlayRoot).
+function DropdownMenuPortal(props: React.ComponentProps<typeof DropdownMenuPrimitive.Portal>) {
+  return (
+    <MountAfterCommit>
+      <DropdownMenuPrimitive.Portal container={useOverlayRoot()} {...props} />
+    </MountAfterCommit>
+  )
+}
 const DropdownMenuRadioGroup = DropdownMenuPrimitive.RadioGroup
 
 type SubPhoneContextValue = { isPhone: boolean; expanded: boolean; toggle: () => void }
@@ -142,16 +158,26 @@ const DropdownMenuContent = React.forwardRef<
   React.ComponentPropsWithoutRef<typeof DropdownMenuPrimitive.Content>
 >(({ className, sideOffset = 4, onCloseAutoFocus, onFocusOutside, onInteractOutside, ...props }, ref) => {
   const held = React.useContext(ProbeHoldContext)
+  const getTrigger = React.useContext(DropdownTriggerElement)
   const trustRoot = useGuideTrustRootAttrs()
   // `onOpenAutoFocus` is not in Content's public props, but Radix reads it from them.
   const probeFocus = { onOpenAutoFocus: heldGuard<Event>(held, undefined) }
+  // Radix returns focus to the trigger right after this handler. After a
+  // pointer pick that return must not paint the keyboard ring (lib/quietFocusReturn).
+  // Armed before the caller's handler, so a caller that prevents the default
+  // and focuses the trigger itself gets the same quiet return; one that sends
+  // focus elsewhere never calls the trigger's focus() and is unaffected.
+  const closeAutoFocus = (e: Event) => {
+    quietNextFocus(getTrigger?.())
+    onCloseAutoFocus?.(e)
+  }
   return (
-  <DropdownMenuPrimitive.Portal>
+  <DropdownMenuPortal>
     <DropdownMenuPrimitive.Content
       ref={ref}
       sideOffset={sideOffset}
       {...probeFocus}
-      onCloseAutoFocus={heldGuard(held, onCloseAutoFocus)}
+      onCloseAutoFocus={heldGuard(held, closeAutoFocus)}
       onFocusOutside={heldGuard(held, onFocusOutside)}
       onInteractOutside={heldGuard(held, onInteractOutside)}
       {...trustRoot}
@@ -174,22 +200,42 @@ const DropdownMenuContent = React.forwardRef<
       )}
       {...props}
     />
-  </DropdownMenuPrimitive.Portal>
+  </DropdownMenuPortal>
   )
 })
 DropdownMenuContent.displayName = DropdownMenuPrimitive.Content.displayName
 
+/**
+ * `offline` dims a row whose action needs a live gateway.
+ *
+ * It is NOT Radix's `disabled`: that sets `data-[disabled]` (the weight above),
+ * takes the row out of the focus order and drops the tooltip with
+ * `pointer-events-none`, so a screen-reader user never learns the row exists or
+ * why it is inert. An offline row stays focusable and `aria-disabled`, keeps its
+ * offline tooltip and name (see `offlineProps`), and only reads as unavailable.
+ * The weight lives here rather than at each call site so one dim serves them
+ * all — the ratchet in `scripts/check-restyle-ratchet.mjs` asks for exactly that.
+ *
+ * It is composed AFTER `className`, which is the opposite of the usual order and
+ * load-bearing: `cn` is tailwind-merge, so the last class in a conflicting group
+ * wins. With `className` last, a caller that sets its own text colour — the
+ * `text-danger` delete rows — kept full-saturation red at 40% opacity while
+ * every sibling gated row went muted, i.e. the dim was silently half-applied on
+ * exactly the row where "unavailable" matters most. Dimming is the primitive's
+ * call to make once, so it outranks the call site here.
+ */
 const DropdownMenuItem = React.forwardRef<
   React.ComponentRef<typeof DropdownMenuPrimitive.Item>,
-  React.ComponentPropsWithoutRef<typeof DropdownMenuPrimitive.Item> & { inset?: boolean }
->(({ className, inset, ...props }, ref) => (
+  React.ComponentPropsWithoutRef<typeof DropdownMenuPrimitive.Item> & { inset?: boolean; offline?: boolean }
+>(({ className, inset, offline, ...props }, ref) => (
   <DropdownMenuPrimitive.Item
     ref={autoSiteRef((props as Record<string, unknown>)['data-ui-auto'], ref)}
     className={cn(
       'relative flex cursor-pointer select-none items-center gap-2 rounded-md px-3 py-1.5 text-[13px] outline-hidden transition-colors',
       'focus:bg-bg-hover data-[disabled]:pointer-events-none data-[disabled]:opacity-50',
       inset && 'pl-8',
-      className
+      className,
+      offline && 'text-muted opacity-40'
     )}
     {...props}
   />
@@ -301,7 +347,7 @@ const DropdownMenuSubContent = React.forwardRef<
     )
   }
   return (
-    <DropdownMenuPrimitive.Portal>
+    <DropdownMenuPortal>
       <DropdownMenuPrimitive.SubContent
         ref={ref}
         {...trustRoot}
@@ -314,7 +360,7 @@ const DropdownMenuSubContent = React.forwardRef<
       >
         {children}
       </DropdownMenuPrimitive.SubContent>
-    </DropdownMenuPrimitive.Portal>
+    </DropdownMenuPortal>
   )
 })
 DropdownMenuSubContent.displayName = DropdownMenuPrimitive.SubContent.displayName

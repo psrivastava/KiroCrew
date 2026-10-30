@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import sys
 
 from kiro_crew.acp import session_handle
 from kiro_crew.acp.mcp_session_report import (
@@ -72,6 +73,7 @@ class TestBuckets:
             "unresolved_refs": [],
             "no_tools": [],
             "no_tools_omitted": 0,
+            "pruned_omitted": 0,
             "ready": ["github-mcp"],
             "failed": [],
             "awaiting_auth": [],
@@ -106,6 +108,7 @@ class TestBuckets:
             "unresolved_refs": [],
             "no_tools": [],
             "no_tools_omitted": 0,
+            "pruned_omitted": 0,
             "ready": ["builder-mcp"],
             "failed": [],
             "awaiting_auth": [],
@@ -411,7 +414,11 @@ class TestEventOwnershipReachesTheReport:
     """
 
     def test_every_mcp_event_passes_the_frames_ownership_through(self):
-        src = inspect.getsource(session_handle)
+        # The facade and every owner its code moved to, as one text.
+        src = "\n".join(
+            inspect.getsource(sys.modules[name])
+            for name in (session_handle.__name__, *session_handle._SESSION_HANDLE_OWNERS)
+        )
         for kind in (
             "EVENT_MCP_OAUTH_REQUEST",
             "EVENT_MCP_SERVER_INITIALIZED",
@@ -445,9 +452,18 @@ class TestEventOwnershipReachesTheReport:
                 start = src.find(marker, start + 1)
 
     def test_every_runner_call_site_forwards_it_to_the_report(self):
+        from pathlib import Path
+
         from kiro_crew.dashboard import chat_runner
 
-        src = inspect.getsource(chat_runner)
+        src = "\n".join(
+            turn_file.read_text(encoding="utf-8")
+            for turn_file in [
+                *sorted(Path(chat_runner.__file__).with_name("chat_turn").glob("*.py")),
+                Path(chat_runner.__file__),
+            ]
+            if turn_file.name != "__init__.py"
+        )
         calls = src.count("_record_session_mcp_event(\n") - src.count(
             "def _record_session_mcp_event(\n"
         )

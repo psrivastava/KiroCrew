@@ -123,6 +123,7 @@ const mocks = vi.hoisted(() => ({
   chatTags: vi.fn(),
   tagColumns: vi.fn(),
   kirocrewConfig: vi.fn(),
+  patchConfig: vi.fn(),
 }))
 vi.mock('../api/client', () => ({
   SEARCH_MIN_CHARS: 2,
@@ -266,6 +267,7 @@ beforeEach(() => {
   mocks.chatTags.mockResolvedValue([])
   mocks.tagColumns.mockResolvedValue([])
   mocks.kirocrewConfig.mockResolvedValue({ dashboard: { recent_tint_count: 3 } })
+  mocks.patchConfig.mockResolvedValue({ ok: true })
 })
 afterEach(() => {
   vi.clearAllTimers()
@@ -482,6 +484,17 @@ describe('ChatSidebar — list-view folder header', () => {
     expect(notice.textContent).toContain('no longer exists')
   })
 
+  it('names the stale project directory when the create endpoint refuses the folder', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    // POST /api/chat/slots answers folder_project_invalid before any slot exists.
+    mocks.createChatSlot.mockRejectedValueOnce(new ApiError(400, 'invalid folder project: Project directory must be an existing directory'))
+    renderSidebar({ folders: [{ ...ALPHA, project_dir: '/renamed-away/proj' }] })
+    fireEvent.click(screen.getByLabelText('New chat in Alpha'))
+    const notice = await screen.findByTestId('folder-create-error-f1')
+    expect(notice.textContent).toContain('/renamed-away/proj')
+    expect(notice.textContent).toContain('no longer exists')
+  })
+
   it('clears the inline notice on the next successful create in the folder', async () => {
     vi.spyOn(console, 'error').mockImplementation(() => {})
     mocks.createChatSlot.mockRejectedValueOnce(new Error('no capacity'))
@@ -540,7 +553,24 @@ describe('ChatSidebar — sort and filter menu', () => {
     renderSidebar()
     await openFilterMenu()
     fireEvent.click(screen.getByText('A → Z'))
-    await waitFor(() => expect(localStorage.getItem('mc-session-sort')).toBe('name-asc'))
+    // Stored on the gateway, not in this browser.
+    await waitFor(() => expect(mocks.patchConfig).toHaveBeenCalledWith('dashboard.session_sort', 'name-asc'))
+    expect(localStorage.getItem('mc-session-sort')).toBeNull()
+  })
+
+  it('reports a refused sort save on its own notice, not the folder one', async () => {
+    mocks.patchConfig.mockRejectedValueOnce(new Error('failed to write config file'))
+    renderSidebar()
+    await openFilterMenu()
+    fireEvent.click(screen.getByText('A → Z'))
+    const notice = await screen.findByTestId('session-sort-error')
+    expect(notice.textContent).toContain('Sort update failed')
+    expect(notice.textContent).toContain('failed to write config file')
+    // Names the refused sort, the order the list is drawn on now, and the next step.
+    expect(notice.textContent).toContain(
+      '“A → Z” wasn’t saved, so the list is back on “Newest”. Pick it again to retry.',
+    )
+    expect(screen.queryByTestId('folder-action-error')).toBeNull()
   })
 
   it('restores every hidden folder in one action', async () => {

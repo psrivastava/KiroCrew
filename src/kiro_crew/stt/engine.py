@@ -15,7 +15,7 @@ worker of its own:
   started ``run_in_executor`` future cannot be cancelled, so a wedged model load
   would otherwise hold a general-purpose worker for the life of the process. What
   is NOT needed is the dedicated inference thread and priority queue
-  ``embeddings.py`` carries, because every request here is interactive: there is
+  ``embeddings_llama.py`` carries, because every request here is interactive: there is
   no bulk class that could starve one.
 - **It writes nothing to stdout.** ``print_progress=False`` and
   ``print_realtime=False`` suppress the progress writers; with both set, a load and
@@ -47,11 +47,12 @@ import asyncio
 import importlib.util
 import logging
 import math
+import os
 import platform
 import time
 import weakref
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 import numpy as np
 
@@ -64,19 +65,14 @@ from kiro_crew.stt.limits import (
     DECODE_ABORT_GRACE_SECS,
     DEFAULT_IDLE_EVICT_SECS,
     DEFAULT_TIMEOUT_SECS,
+    THREADS_AUTO,
+    THREADS_ENV,
+    parse_threads,
+    resolve_thread_count,
 )
 from kiro_crew.stt.vad import SAMPLE_RATE_HZ
 
 logger = logging.getLogger(__name__)
-
-#: Ceiling on the derived thread count. The count itself is host-derived; this
-#: only bounds EXTRAPOLATION above the widths that were measured. Decode-heavy
-#: models stop benefiting early (in-process ``base``, an 11s clip: 8 threads
-#: 0.96s, 16 1.13s, 24 1.18s, i.e. flat-to-worse), while encoder-heavy
-#: ``large-v3-turbo`` keeps gaining to 24 (6.26s / 5.13s / 4.81s). 16 is where
-#: both model shapes sit within 7% of their own best, so a 64- or 128-core host
-#: gets 16 rather than an untested 32+.
-THREAD_CEILING = 16
 
 #: Audio handed to a prewarm decode. whisper.cpp refuses a buffer shorter than
 #: 1000 ms, and the point of prewarming is to pay the graph allocation (measured
@@ -148,12 +144,28 @@ def available_cpus() -> int:
     return affinity_cpu_count() or 1
 
 
-def thread_count() -> int:
-    """Derive the recogniser's intra-op thread count from the host.
+#: Unusable ``KIROCREW_STT_THREADS`` values already logged, so a bad variable is
+#: reported once per process rather than on every session that asks for a count.
+_warned_thread_env: set[str] = set()
 
-    Half the available cores, bounded by :data:`THREAD_CEILING`.
 
-    Whisper decoding is autoregressive: thousands of tiny parallel regions, each
+def thread_count(configured: int = THREADS_AUTO, environ: Mapping[str, str] | None = None) -> int:
+    """The recogniser's intra-op thread count.
+
+    *configured* is ``stt.threads``. :data:`~kiro_crew.stt.limits.THREADS_ENV` in
+    *environ* (the process environment by default) outranks it when it parses; an
+    unusable value is logged once and ignored. A positive request is used as given,
+    clamped to ``[1, available_cpus()]``. :data:`~kiro_crew.stt.limits.THREADS_AUTO`
+    derives the count from the host: half the available cores, bounded by
+    :data:`~kiro_crew.stt.limits.THREAD_CEILING`.
+
+    An explicit count is not capped by :data:`~kiro_crew.stt.limits.THREAD_CEILING`. The ceiling bounds
+    extrapolation on hosts nobody measured; an operator who sets a count has
+    measured their own host. On a 128-core host, ``large-v3-turbo`` on an 11 s clip
+    took 3.7-4.2 s at 16 threads, 2.0 s at 32, 1.25 s at 64 and 1.1 s at 96.
+
+    The derived count stays conservative because whisper decoding is
+    autoregressive: thousands of tiny parallel regions, each
     ending in a barrier that completes only when its slowest worker arrives. Wide
     pools therefore cost latency per step rather than buying throughput, and on a
     host with other work (a Kiro Crew host runs the gateway and agent sessions
@@ -168,7 +180,22 @@ def thread_count() -> int:
     ranged 8.1-68.4s depending on background load. The headroom buys
     predictability first and mean latency second.
     """
-    return max(1, min(THREAD_CEILING, available_cpus() // 2))
+    requested = configured
+    source = os.environ if environ is None else environ
+    raw = source.get(THREADS_ENV, "")
+    if raw.strip():
+        parsed = parse_threads(raw)
+        if parsed is not None:
+            requested = parsed
+        elif raw not in _warned_thread_env:
+            _warned_thread_env.add(raw)
+            logger.warning(
+                "Ignoring %s=%r: expected 'auto' or a whole number of threads; using stt.threads",
+                THREADS_ENV,
+                raw,
+            )
+    cpus = available_cpus()
+    return resolve_thread_count(requested, cpus)
 
 
 def preview_audio_ctx(samples: int) -> int:
@@ -486,9 +513,11 @@ class WhisperEngine:
         self,
         idle_evict_secs: int = DEFAULT_IDLE_EVICT_SECS,
         timeout_secs: int = DEFAULT_TIMEOUT_SECS,
+        threads: int = THREADS_AUTO,
     ) -> None:
         self._idle_evict_secs = idle_evict_secs
         self._timeout_secs = timeout_secs
+        self._threads = threads
         self._model: Any | None = None
         self._key: LoadedKey | None = None
         self._warmed_key: LoadedKey | None = None
@@ -506,6 +535,9 @@ class WhisperEngine:
         #: 148 MB at the default and 1.6 GB at the largest, so two at once is what
         #: exhausts a host sized for one.
         self._load_future: "asyncio.Future[Any] | None" = None
+        #: Usage-marker writes in flight. Detached so a stalled filesystem never
+        #: holds a finished transcript; kept here so the loop cannot collect one.
+        self._stamp_tasks: set[asyncio.Task[None]] = set()
         # A native call can outlive its abort grace. Keep its future so retries
         # cannot allocate another large model while the retired one still runs.
         self._retired_decode: asyncio.Future | None = None
@@ -532,6 +564,19 @@ class WhisperEngine:
         self._idle_evict_secs = idle_evict_secs
         self._timeout_secs = timeout_secs
 
+    def set_threads(self, threads: int) -> None:
+        """Record ``stt.threads`` from current config.
+
+        Takes effect at the next :meth:`ensure_loaded`, not mid-decode: the count is
+        part of :class:`LoadedKey`, so a resident context built with another count no
+        longer matches and is rebuilt on the next request.
+        """
+        self._threads = threads
+
+    def thread_count(self) -> int:
+        """The thread count the next load would use, from this engine's setting."""
+        return thread_count(self._threads)
+
     def _locks(self) -> tuple[asyncio.Lock, asyncio.Lock]:
         if self._load_lock is None:
             self._load_lock = asyncio.Lock()
@@ -555,7 +600,14 @@ class WhisperEngine:
         if not probed.ok:
             return probed
 
-        model = models.resolve(model_name)
+        # Off the loop for the same reason as `probe` above: resolving the CUSTOM
+        # selection reads and validates `config.json` (see `models.resolve`), which is
+        # a synchronous stat + read on the gateway's single event loop, and this runs
+        # on the websocket handler's task. Offloaded unconditionally rather than only
+        # for the custom name -- the executor hop is microseconds beside the model
+        # load this precedes, and duplicating `resolve`'s own dispatch at every async
+        # call site is how one of them ends up keeping the blocking read.
+        model = await asyncio.to_thread(models.resolve, model_name)
         # The key is built from the path the model WOULD have, so residency can be
         # decided before the store is asked for it. That ordering is what makes the
         # store's digest check affordable: `ensure` verifies the file against its pin
@@ -563,7 +615,9 @@ class WhisperEngine:
         # largest) on the path this feature exists to make fast. Asked only when a
         # load is actually about to happen, the cost lands once per load -- which is
         # also exactly when an unverified file would take effect.
-        key = LoadedKey(str(models.model_path(model)), language, thread_count())
+        # Off the loop: for a custom model `model_path` resolves the path on disk.
+        key_path = await asyncio.to_thread(models.model_path, model)
+        key = LoadedKey(str(key_path), language, self.thread_count())
         load_lock, decode_lock = self._locks()
         # The LOAD lock spans the whole episode; the DECODE lock is taken only around
         # the context swap, and that narrower scope is load-bearing. `ensure` below
@@ -613,11 +667,21 @@ class WhisperEngine:
                     model.name, (time.monotonic() - hash_started) * 1000.0
                 )
             if path is None:
+                status = getattr(models.store(), "status", None) or {}
+                if status.get("refused") and status.get("model") == model.name:
+                    # Not "not downloaded": the bytes are present and pinned, and a
+                    # download would not help. The detail names the file and the remedy.
+                    return Availability(False, CODE_IMPORT_FAILED, str(status.get("error", "")))
                 return Availability(
                     False,
                     CODE_MODEL_MISSING,
                     f"speech model {model.name} is not downloaded",
                 )
+            # Load the file `ensure` vetted, not the one the key was built from
+            # before it ran: for a custom model the two can differ if the folder
+            # changed in between, and only the vetted one passed the hash.
+            if model.name == models.CUSTOM_MODEL and str(path) != key.model_path:
+                key = LoadedKey(str(path), key.language, key.n_threads)
             if self._load_future is not None and not self._load_future.done():
                 # A previous load timed out, released this lock and is STILL building
                 # its context. Starting a second one is how a host sized for one model
@@ -1022,6 +1086,15 @@ class WhisperEngine:
                 self._last_used = time.monotonic()
                 self._warmed_key = self._key
                 complete = True
+                if kind != telemetry.KIND_PREWARM and models.claim_usage_stamp():
+                    # Read by the boot prewarm gate (stt_hooks): a host that never
+                    # decodes does not pay for resident weights on every launch.
+                    # The claim is a clock read; the write is file I/O, so it runs
+                    # in a thread, once an hour per process, and is NOT awaited: a
+                    # stalled filesystem must not cost the transcript in hand.
+                    stamp = asyncio.create_task(asyncio.to_thread(models.write_usage_marker))
+                    self._stamp_tasks.add(stamp)
+                    stamp.add_done_callback(self._stamp_tasks.discard)
                 if should_abort():
                     return ""
                 # Only after the abort check: an aborted decode unwinds early, and its
@@ -1167,6 +1240,7 @@ _engine: WhisperEngine | None = None
 def shared_engine(
     idle_evict_secs: int | None = None,
     timeout_secs: int | None = None,
+    threads: int | None = None,
 ) -> WhisperEngine:
     """The process-wide recogniser.
 
@@ -1179,7 +1253,8 @@ def shared_engine(
     module defaults: defaulting to the constants would make every zero-argument
     caller silently a WRITER -- :func:`prewarm` and :func:`close` ask for the
     engine without opinions about its configuration, and would reset an operator's
-    configured window back to 600 s.
+    configured window back to 600 s. *threads* (``stt.threads``) follows the same
+    rule on its own, so a caller that knows only the thread setting can pass it.
     """
     global _engine
     if _engine is None:
@@ -1188,8 +1263,12 @@ def shared_engine(
                 DEFAULT_IDLE_EVICT_SECS if idle_evict_secs is None else idle_evict_secs
             ),
             timeout_secs=DEFAULT_TIMEOUT_SECS if timeout_secs is None else timeout_secs,
+            threads=THREADS_AUTO if threads is None else threads,
         )
-    elif idle_evict_secs is not None and timeout_secs is not None:
+        return _engine
+    if threads is not None:
+        _engine.set_threads(threads)
+    if idle_evict_secs is not None and timeout_secs is not None:
         # The window comes from config, which is read live. Without this the value
         # the FIRST caller happened to pass would stick for the life of the
         # process, so editing the setting would appear to do nothing until a

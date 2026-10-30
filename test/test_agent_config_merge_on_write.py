@@ -1,7 +1,7 @@
 """Merge-on-write semantics for the agent-config PUT.
 
 ``PUT /api/agent/config`` persists a whole-file snapshot the client read earlier,
-and ``apps/bridges.py::_register_mcp_servers`` writes app MCP bridges into that
+and ``apps/bridges_mcp.py::_register_mcp_servers`` writes app MCP bridges into that
 same file under its own flock. A registration landing between the client's read
 and its PUT was therefore silently clobbered.
 
@@ -303,7 +303,7 @@ async def test_app_bridge_registered_during_the_lock_wait_survives_the_put(tmp_p
     @contextlib.asynccontextmanager
     async def _registering_lock():
         # An app enable lands here: whole-file RMW of the installed spec, the
-        # shape apps/bridges.py::_register_mcp_servers performs under its flock.
+        # shape apps/bridges_mcp.py::_register_mcp_servers performs under its flock.
         data = json.loads(installed.read_text(encoding="utf-8"))
         data.setdefault("mcpServers", {})["demo:notes"] = {"command": "notes-mcp"}
         installed.write_text(json.dumps(data), encoding="utf-8")
@@ -350,7 +350,7 @@ async def test_app_deregistered_during_the_put_is_not_resurrected(tmp_path):
     @contextlib.contextmanager
     def _deregistering_lock(*, exclusive: bool = True, target=None):  # noqa: ANN001
         # An app disable commits here: the same whole-file RMW
-        # apps/bridges.py::_deregister_mcp_servers performs under this flock.
+        # apps/bridges_mcp.py::_deregister_mcp_servers performs under this flock.
         data = json.loads(installed.read_text(encoding="utf-8"))
         data.get("mcpServers", {}).pop("demo:notes", None)
         installed.write_text(json.dumps(data), encoding="utf-8")
@@ -672,7 +672,24 @@ async def test_a_managed_server_whose_gate_raises_is_deleted(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_an_edition_contributed_server_is_preserved(tmp_path):
+@pytest.mark.parametrize(
+    ("name", "command"),
+    [
+        pytest.param("internal-mcp", "i", id="test_an_edition_contributed_server_is_preserved"),
+        # The one shape that is BOTH host-set and namespaced: an edition may
+        # contribute a name containing ``:``, the only way a host-owned entry also
+        # looks app-owned (a managed name never contains one). Host ownership is
+        # proven from the contributed map alone, so ``vendor:tools`` survives
+        # although the installed app ``demo`` declares nothing of the sort -- the
+        # app-declared set being empty for this name cannot veto it.
+        pytest.param(
+            "vendor:tools",
+            "v",
+            id="test_a_namespaced_edition_extra_is_preserved_by_host_ownership",
+        ),
+    ],
+)
+async def test_an_edition_extra_is_preserved(tmp_path, name, command):
     """An edition extra is host-owned and always emitted, so it is preserved.
 
     ``build_agent_config`` merges every ``_extra_mcp_servers`` entry with no gate
@@ -684,35 +701,13 @@ async def test_an_edition_contributed_server_is_preserved(tmp_path):
     """
     response, written = await _put(
         tmp_path,
-        on_disk={"name": "kirocrew", "mcpServers": {"internal-mcp": {"command": "i"}}},
+        on_disk={"name": "kirocrew", "mcpServers": {name: {"command": command}}},
         submitted={"name": "kirocrew", "mcpServers": {}},
-        extra_managed={"internal-mcp": {"command": "i", "args": []}},
+        extra_managed={name: {"command": command, "args": []}},
     )
 
     assert response.status == 200
-    assert written["mcpServers"] == {"internal-mcp": {"command": "i"}}
-
-
-@pytest.mark.asyncio
-async def test_a_namespaced_edition_extra_is_preserved_by_host_ownership(tmp_path):
-    """The one shape that is BOTH host-set and namespaced: host ownership decides.
-
-    An edition may contribute a name containing ``:``, which is the only way a
-    host-owned entry also looks app-owned (a managed name never contains one).
-    Host ownership is proven from the contributed map alone, so ``vendor:tools``
-    survives although the installed app ``demo`` declares nothing of the sort --
-    the union does not require both sources to agree, and the app-declared set
-    being empty for this name cannot veto it.
-    """
-    response, written = await _put(
-        tmp_path,
-        on_disk={"name": "kirocrew", "mcpServers": {"vendor:tools": {"command": "v"}}},
-        submitted={"name": "kirocrew", "mcpServers": {}},
-        extra_managed={"vendor:tools": {"command": "v", "args": []}},
-    )
-
-    assert response.status == 200
-    assert written["mcpServers"] == {"vendor:tools": {"command": "v"}}
+    assert written["mcpServers"] == {name: {"command": command}}
 
 
 @pytest.mark.asyncio
@@ -906,8 +901,8 @@ async def test_absent_enabled_field_counts_as_enabled(tmp_path):
     """A legacy record with no ``enabled`` field is ENABLED, matching the manager.
 
     ``InstalledApp.from_dict`` reads ``bool(data.get("enabled", True))``
-    (manager.py:170) over a dataclass defaulting to ``enabled: bool = True``
-    (manager.py:114), so every other reader in the tree treats such a record as
+    (manager_records.py) over a dataclass defaulting to ``enabled: bool = True``
+    (``InstalledApp.enabled``), so every other reader in the tree treats such a record as
     running. Disagreeing here would delete the live bridges of an app the rest of
     the system considers enabled.
 
@@ -1027,7 +1022,19 @@ async def test_an_unstattable_apps_root_child_fails_the_put(tmp_path):
 
 @requires_symlinks
 @pytest.mark.asyncio
-async def test_a_dangling_app_root_link_fails_the_put(tmp_path):
+@pytest.mark.parametrize(
+    "shape",
+    [
+        pytest.param("broken_symlink", id="test_a_dangling_app_root_link_fails_the_put"),
+        # The sibling the dangling-link screen cannot reach. Here ``lstat`` succeeds
+        # AND ``stat`` succeeds -- the target is a real file -- so nothing raises and
+        # the only thing that is False is ``S_ISDIR``. A screen that skips every
+        # non-directory therefore reports the name as free, so the link-ish half
+        # must refuse too.
+        pytest.param("link_to_file", id="test_an_app_root_link_to_a_file_fails_the_put"),
+    ],
+)
+async def test_a_link_ish_app_root_fails_the_put(tmp_path, shape):
     """A DANGLING app-root link OCCUPIES the name, so it is unreadable, not absent.
 
     The child screen reached its skip through a single ``child.stat()``, which
@@ -1040,7 +1047,7 @@ async def test_a_dangling_app_root_link_fails_the_put(tmp_path):
     exists to refuse -- and it already refuses exactly this shape one position out,
     for ``installed.json``, via ``_require_present_shape``.
     """
-    await _assert_refused_and_intact(tmp_path, app_root_shape="broken_symlink")
+    await _assert_refused_and_intact(tmp_path, app_root_shape=shape)
 
 
 @pytest.mark.asyncio
@@ -1092,20 +1099,6 @@ def test_a_dangling_app_root_link_is_not_absence(tmp_path):
     ):
         _app_declared_server_names()
     assert "demo" in str(caught.value), "the refusal must name the entry it could not read"
-
-
-@requires_symlinks
-@pytest.mark.asyncio
-async def test_an_app_root_link_to_a_file_fails_the_put(tmp_path):
-    """A link-ish app root whose target RESOLVES to a file is still not absence.
-
-    The sibling the dangling-link screen cannot reach. Here ``lstat`` succeeds AND
-    ``stat`` succeeds -- the target is a real file -- so nothing raises and the only
-    thing that is False is ``S_ISDIR``. A screen that skips every non-directory
-    therefore reports the name as free. That is the cannot-read-becomes-not-owned
-    defect one shape over, so the link-ish half must refuse.
-    """
-    await _assert_refused_and_intact(tmp_path, app_root_shape="link_to_file")
 
 
 @pytest.mark.asyncio

@@ -177,6 +177,7 @@ export const QUOTED_OPERAND_CONFIRM_KEYS = [
   'apps.awsControl.page.forget_key_confirm', // key-name operand, quoted per locale
   'apps.codeReviewSage.components.learningRail.confirm_delete', // quoted since #4653
   'apps.crewCompanion.gallery.deleteConfirm', // ASCII quotes → locale pair #4821
+  'apps.issueRadar.views.crews.page.retire_confirm_title', // crew-name operand of the Retire crew confirmation, quoted per locale
   'apps.mdNotebook.row.deleteTitle', // already quoted; pin + fr NNBSP fix #5725
   'apps.meetings.list.deleteConfirm', // already quoted; pin + fr/it glyph fix #4821
   'apps.mochi.gallery.delete_confirm', // ASCII quotes → locale pair #4821
@@ -192,6 +193,9 @@ export const QUOTED_OPERAND_CONFIRM_KEYS = [
   'components.agentTemplateDetail.reset_confirm_title',
   'components.agentTemplateDetail.switch_confirm_body',
   'components.agentTemplateDetail.switch_confirm_title',
+  'crewEditorNext.band_remove_confirm_title', // ability-name operand of the Added-band remove confirmation
+  'components.remoteUpdate.confirm', // crew-name operand of the Update remote confirmation, quoted per locale
+  'components.remoteUpdate.confirm_hint', // same operand on the confirmation's explanation line
   // The code-execution grant's title AND body. #5725 quoted only the title, which left
   // the scope sentence one line under it reading as prose about every app (#6016).
   'components.appstore.trustAppModal.failed', // bare {{app}} #6016
@@ -207,6 +211,7 @@ export const QUOTED_OPERAND_CONFIRM_KEYS = [
   'pages.artifactDeployPage.remove_profile_confirm',
   'pages.artifactsPage.remove_artifact_confirm',
   'pages.chatSidebar.delete_folder_confirm',
+  'hooks.useSessionActions.close_confirm.reason_setting', // {{setting}} = the settings toggle's label, quoted per locale
   'pages.chatSidebar.unlink_source_link_confirm', // {{label}} = PR/Issue chip label, glyph-quoted per locale (UX #8072)
   'pages.devFleetPage.keeps_name_the_live_target_and_discards_the_stag', // cancel-branch body, bare {{name}}/{{staged}} #5725
   'pages.devFleetPage.keeps_this_checkout_the_live_target_and_discards', // cancel-branch body, bare {{staged}} #5725
@@ -281,7 +286,7 @@ export const CONFIRM_OPERAND_KEY_EXEMPTIONS: Record<string, string> = {
     + 'machine-formatted date from fmtDate, never user-supplied text',
   'pages.membersPage.create_unconfirmed':
     'not a confirmation prompt: a non-interactive outcome notice stating whether the named '
-    + 'crewmate was created; it offers no destructive action and the name identifies the '
+    + 'mate was created; it offers no destructive action and the name identifies the '
     + 'uncertain result that the user must check in the roster',
   'apps.awsControl.console.library_remove_confirm_slug':
     'the {{folder}} operand is an S3 key prefix rendered inside a <folder> tag as a '

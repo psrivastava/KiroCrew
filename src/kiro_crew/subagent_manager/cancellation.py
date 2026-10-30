@@ -224,6 +224,12 @@ class CancellationCoordinator(ManagerComponent):
                     # failure (with any partial result) even when the respawn
                     # itself could not happen.
                     info.done = True
+                    # Terminal flip that reports via ``_run_terminal_report``
+                    # below, after a claim/bookkeeping hop -- arm with the flip
+                    # so a sibling completion cannot read this member as
+                    # done-but-unarmed in that window. The report
+                    # machinery's own arm is an idempotent backstop.
+                    self._manager.arm_report_in_flight(info)
                     if reason == "context_overflow":
                         info.error = (
                             "agent context exceeded the model window and the dedicated-session "
@@ -297,6 +303,17 @@ class CancellationCoordinator(ManagerComponent):
                 # tombstone the reaper could not correct.
                 if not info.done and not info._reap_started and not info.reaped:
                     info.done = True
+                    # This arm is deliberately report-free (limbo-avoidance
+                    # only -- no finalize claim is taken, so no terminal report
+                    # will ever reach the completion consumer for this record).
+                    # No done-but-unreported hold needs arming or releasing
+                    # here: holds are armed only by the report machinery in the
+                    # same synchronous block that flips ``done`` (or immediately
+                    # before a safe-announce of an already-done record), so a
+                    # record reaching this arm with ``done`` still False can
+                    # never carry one -- ``batch_reports_in_flight`` ignores it
+                    # and a sibling completion keeps its ability to close the
+                    # wave with this member's line missing.
                     info.error = "cancelled"
                     info.elapsed = time.time() - info.started
                     if not info.user_stopped:
@@ -868,8 +885,8 @@ class CancellationCoordinator(ManagerComponent):
                     # that window may be carrying a person's decision (a spawn approval
                     # is the visible case), which a teardown has no standing to revoke
                     # for them. Stop-all keeps the wider behaviour: there the user asked
-                    # for exactly that, and the claimer's post-claim re-read refuses the
-                    # row it cancelled.
+                    # for exactly that, and the claimer's generation-fenced start write
+                    # is refused for the row it cancelled.
                     agent_id,
                     allow_admitted=False,
                 )
@@ -932,7 +949,9 @@ class CancellationCoordinator(ManagerComponent):
         Queue entries are removed before the first suspending await, so a stagger
         timer cannot start work after the user clicked Stop all. Agents parked on
         a spawn-approval prompt remain pending because that prompt has its own
-        explicit reject action.
+        explicit reject action. The running sweep also takes this parent's rows
+        whose start is in flight (``starting_claim_ids_for``) and stops each
+        through ``cancel``, which joins the start before it stops the run.
         """
         if not parent_session_key:
             return (0, 0)
@@ -954,8 +973,7 @@ class CancellationCoordinator(ManagerComponent):
         # rows meanwhile (``_refill_apply``), so a fetch queued on the writer
         # thread before this stop can neither put back a row it is cancelling
         # nor window a store-only row the pending read below would then skip.
-        stopping: dict[str, int] = self._manager.__dict__.setdefault("_stopping_parents", {})
-        stopping[parent_session_key] = stopping.get(parent_session_key, 0) + 1
+        self._hold_parent_refill(parent_session_key)
         try:
             # ``_stop_queued`` drops these window entries before its first await,
             # so a stagger timer cannot start a queued agent once the stop began.
@@ -979,18 +997,10 @@ class CancellationCoordinator(ManagerComponent):
                 parent_session_key,
             )
         finally:
-            if stopping.get(parent_session_key, 0) > 1:
-                stopping[parent_session_key] -= 1
-            else:
-                stopping.pop(parent_session_key, None)
-                # A pump pass that ran meanwhile windowed none of this parent's
-                # rows, so a row spawned after the passes read their ids could
-                # wait on disk beside a free slot with no pass due to bring it
-                # in. One more pass, on the next loop turn: after the running
-                # sweep below has taken its ids, so a row it starts is not
-                # reaped with them.
-                if not self._manager._shutting_down:
-                    asyncio.get_running_loop().call_soon(self._manager._drain_queue)
+            # The pump pass this schedules runs on the next loop turn: after the
+            # running sweep below has taken its ids, so a row it starts is not
+            # reaped with them.
+            self._release_parent_refill(parent_session_key)
             # Each row the pass stopped asked for the depth in its queued-stop
             # report. A pass that stopped none -- nothing was left, or it failed
             # or was cancelled first -- asks here, so a card whose count went
@@ -1009,12 +1019,79 @@ class CancellationCoordinator(ManagerComponent):
             and not info.queued
             and not _parked_at_spawn_approval(info)
         ]
+        # A row whose ``admitted -> starting`` write landed before the pending
+        # read has no ``_agents`` record yet and is no unstarted row either:
+        # ``cancel`` joins its start and stops what it registered.
+        running_ids.extend(
+            agent_id
+            for agent_id in self._manager._admission.starting_claim_ids_for(parent_session_key)
+            if agent_id not in running_ids
+        )
         results = await asyncio.gather(
             *(self._manager.cancel(agent_id) for agent_id in running_ids),
             return_exceptions=True,
         )
         running_stopped = sum(result is True for result in results)
         return (running_stopped, queued_stopped)
+
+    async def cancel_queued_impl(
+        self, agent_id: str, parent_session_key: str, *, stop_origin: str = ""
+    ) -> bool:
+        """Stop ONE spawn of *parent_session_key* that has not started; True if stopped.
+
+        For the parent itself, when it does not need work it queued: without
+        this the only way to stop a run the gate is still holding is Stop all
+        in the dashboard, and until it starts the run keeps the parent attached
+        (a reload refuses). The queued half of :meth:`cancel_for_parent_impl`
+        narrowed to one id: the same off-loop store phase (``_stop_queued``)
+        under the same refill hold, so the row is neither windowed back nor
+        started while its cancel is on the writer thread.
+
+        A row that started meanwhile is a live run and is left to the live
+        path: the answer is False and nothing is stopped. *stop_origin* names
+        who stopped it on the terminal report, so the parent's completion event
+        does not credit the user with a stop they never pressed.
+        """
+        if not agent_id or not parent_session_key:
+            return False
+        stopped = 0
+        self._hold_parent_refill(parent_session_key)
+        try:
+            stopped = await self._stop_queued(
+                [agent_id], parent_session_key, stop_origin=stop_origin
+            )
+        finally:
+            self._release_parent_refill(parent_session_key)
+            if not stopped:
+                self._republish_queue_depth(parent_session_key)
+        return stopped > 0
+
+    def _hold_parent_refill(self, parent_session_key: str) -> None:
+        """Keep the refill from windowing *parent_session_key*'s rows during a stop.
+
+        Counted, so overlapping stops of one parent hold it until the last one
+        lets go (:meth:`_release_parent_refill`).
+        """
+        stopping: dict[str, int] = self._manager.__dict__.setdefault("_stopping_parents", {})
+        stopping[parent_session_key] = stopping.get(parent_session_key, 0) + 1
+
+    def _release_parent_refill(self, parent_session_key: str) -> None:
+        """Let go of :meth:`_hold_parent_refill`; the last release schedules a pump pass.
+
+        A pump pass that ran during the hold windowed none of this parent's
+        rows, so a row spawned after the stop read its ids could wait on disk
+        beside a free slot with no pass due to bring it in. The pass runs on
+        the next loop turn, never inside the caller's own step.
+        """
+        import asyncio
+
+        stopping: dict[str, int] = self._manager.__dict__.setdefault("_stopping_parents", {})
+        if stopping.get(parent_session_key, 0) > 1:
+            stopping[parent_session_key] -= 1
+            return
+        stopping.pop(parent_session_key, None)
+        if not self._manager._shutting_down:
+            asyncio.get_running_loop().call_soon(self._manager._drain_queue)
 
     def note_teardown_snapshot(self, parent_session_key: str) -> None:
         """Open the fence for the store sweep of the parent-end cancel that
@@ -1245,7 +1322,9 @@ class CancellationCoordinator(ManagerComponent):
         except Exception:
             logger.debug("queue-depth re-emit failed after stop", exc_info=True)
 
-    async def _stop_queued(self, agent_ids: Sequence[str], parent_session_key: str) -> int:
+    async def _stop_queued(
+        self, agent_ids: Sequence[str], parent_session_key: str, *, stop_origin: str = ""
+    ) -> int:
         """Unqueue each id that is still waiting and report it stopped; count them.
 
         Every row's store cancel runs in ONE job on the store's writer thread
@@ -1275,13 +1354,14 @@ class CancellationCoordinator(ManagerComponent):
         Until that task has reported a row, the row is in neither ``_queue``
         nor ``_agents``, and nothing on the loop says a cancel of it is on the
         way. Every id of the job is filed in ``_batched_stops`` for that span,
-        and the two readers that would otherwise act on the row join its answer:
-        a single ``cancel`` (``cancel_impl``), which would report the row itself
-        and leave the batch, finding the row already cancelled, to report a
-        popped one again; and a claim whose post-claim re-read answered before
-        the cancel landed (``claim_and_start``), which would register the row
-        as a run the cancel then ends under it, counted once as queued and once
-        as running. Each id's parent (*parent_session_key*, whose rows the ids
+        and a single ``cancel`` of the row (``cancel_impl``) joins its answer
+        rather than reporting the row itself and leaving the batch, finding the
+        row already cancelled, to report a popped one again. A claim in flight
+        for the row needs no join: its start is one generation-fenced
+        ``admitted -> starting`` write (``claim_and_start``), so whichever of
+        the two lands first refuses the other, and a run the start registered
+        is a live one the running sweep reaps. Each id's parent
+        (*parent_session_key*, whose rows the ids
         are) is filed beside it in ``_batched_stop_parents``, for a third
         reader: a parent-end teardown's snapshot
         (``snapshot_teardown_children``), which reads ``_queue`` and
@@ -1309,7 +1389,9 @@ class CancellationCoordinator(ManagerComponent):
             if entries[agent_id] is None and agent_id in in_dispatch
         }
         if isinstance(outcomes, dict):
-            return self._report_stopped_rows(ids, entries, outcomes, undurable=undurable)
+            return self._report_stopped_rows(
+                ids, entries, outcomes, undurable=undurable, stop_origin=stop_origin
+            )
         posted = outcomes
         batched: dict[str, asyncio.Future[Any]] = self._manager.__dict__.setdefault(
             "_batched_stops", {}
@@ -1322,7 +1404,9 @@ class CancellationCoordinator(ManagerComponent):
 
         async def _apply() -> int:
             try:
-                return self._report_stopped_rows(ids, entries, await posted, joins, undurable)
+                return self._report_stopped_rows(
+                    ids, entries, await posted, joins, undurable, stop_origin=stop_origin
+                )
             finally:
                 # A batch that never answered (the store closed under it) has
                 # reported nothing, and a joined cancel learns exactly that.
@@ -1343,6 +1427,8 @@ class CancellationCoordinator(ManagerComponent):
         outcomes: Mapping[str, object],
         joins: Mapping[str, asyncio.Future[Any]] | None = None,
         undurable: Mapping[str, dict] | None = None,
+        *,
+        stop_origin: str = "",
     ) -> int:
         """Report each row the store phase stopped, count them, then raise any row error.
 
@@ -1356,7 +1442,8 @@ class CancellationCoordinator(ManagerComponent):
         earlier cancel reported first counts too, so the count does not depend
         on which of the two reported it. Each row's answer also resolves its
         *joins* future, which a single ``cancel`` of that row (``cancel_impl``)
-        or its claim (``claim_and_start``) may be waiting on.
+        or its claim (``claim_and_start``) may be waiting on. A non-empty
+        *stop_origin* names the stopper on each report whose row names none.
         """
         # Imported here: this helper is not an ``_impl`` and so keeps this
         # module's namespace, where the facade's ``logger`` is only a type hint.
@@ -1366,6 +1453,11 @@ class CancellationCoordinator(ManagerComponent):
             join = (joins or {}).get(agent_id)
             if join is not None and not join.done():
                 join.set_result(result)
+
+        def _named(params: dict) -> dict:
+            if stop_origin and not params.get("_stop_origin"):
+                return {**params, "_stop_origin": stop_origin}
+            return params
 
         stopped = 0
         failure: Exception | None = None
@@ -1377,7 +1469,7 @@ class CancellationCoordinator(ManagerComponent):
                 # whatever the store answered, it is stopped and gets its report.
                 stopped += 1
                 try:
-                    self._manager._report_queued_stop(taken)
+                    self._manager._report_queued_stop(_named(taken))
                 except Exception:
                     logger.warning(
                         "Reporting queued subagent %s stopped failed", agent_id, exc_info=True
@@ -1418,7 +1510,7 @@ class CancellationCoordinator(ManagerComponent):
                 continue
             stopped += 1
             try:
-                self._manager._report_queued_stop(row, row_settled=stored is not None)
+                self._manager._report_queued_stop(_named(row), row_settled=stored is not None)
             except Exception:
                 logger.warning(
                     "Reporting queued subagent %s stopped failed", agent_id, exc_info=True
@@ -1483,14 +1575,52 @@ class CancellationCoordinator(ManagerComponent):
             # registering. Unqueueing prevents startup; the synthetic terminal
             # report keeps its parent and batch accounting from waiting forever.
             # The store phase is taken here rather than inside ``_unqueue`` so
-            # the report knows whether this cancel landed (``row_settled``).
-            stored = self._manager._admission.taskq_cancel_queued(agent_id)
+            # the report knows whether this cancel landed (``row_settled``). A
+            # claim retained across a store outage has no run and no claimer in
+            # flight, so its ``starting`` row is taken here as unstarted work.
+            #
+            # A row whose start the claimer has in flight (``_starting_claims``,
+            # ``claim_and_start``) is reached here by Stop all's running sweep
+            # and the ``waits.py`` cascades as well as by a single Stop. Its
+            # store phase runs on the writer thread instead: a contended store
+            # must not stall the loop (``no-sync-store-call-from-a-coroutine``).
+            starting = self._manager._admission.starting_claim_of(agent_id)
+            if starting is None:
+                stored = self._manager._admission.taskq_cancel_queued(
+                    agent_id, retained=agent_id in self._manager._retained_claims
+                )
+            else:
+                stored = await self._manager._admission.taskq_cancel_queued_async(agent_id)
             queued = self._manager._unqueue(agent_id, stored=stored, store_cancelled=True)
             if queued is not None:
                 logger.info("Cancelled queued subagent %s before it started", agent_id)
                 self._manager._report_queued_stop(queued, row_settled=stored is not None)
                 return True
-            return False
+            # Nothing to cancel in the store and nothing in the window: the row
+            # may be one whose start the claimer has just taken in the store
+            # (``admitted -> starting``, ``claim_and_start``) and not yet
+            # registered -- the one gap between its store write and its
+            # ``_agents`` record. Such a start owes its answer in
+            # ``_starting_claims``; wait for it, then stop what it registered
+            # as the live run it is. A start that was refused meanwhile leaves
+            # nothing to stop here, as it never ran; one retained across a
+            # store outage is a retained claim, which the next cancel ends.
+            if starting is None:
+                return False
+            if await asyncio.shield(starting) or agent_id in self._manager._agents:
+                return await self._manager.cancel(agent_id)
+            # Not registered: the start was refused, released to ``retry_wait``
+            # or retained. Its row is unstarted work again, cancelled the same
+            # way, with the store phase still on the writer thread.
+            stored = await self._manager._admission.taskq_cancel_queued_async(
+                agent_id, retained=agent_id in self._manager._retained_claims
+            )
+            queued = self._manager._unqueue(agent_id, stored=stored, store_cancelled=True)
+            if queued is None:
+                return False
+            logger.info("Cancelled queued subagent %s before it started", agent_id)
+            self._manager._report_queued_stop(queued, row_settled=stored is not None)
+            return True
         if not info._reap_started:
             # The stamps below name THIS stop as the run's stopper. A reap already
             # in flight (a deadline, a parent end) owns the record, and the record

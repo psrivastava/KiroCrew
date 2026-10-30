@@ -15,7 +15,9 @@
  */
 import React, { createContext, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
 import { flushSync } from 'react-dom'
+import { OverlayPortal, useCloseWhenCrewHidden, useLocalCrewHidden } from './overlayRoot'
 import { noteInPlaceResize } from '../hooks/virtualizer/inPlaceResize'
+import { TOUCH_REPLAY_WINDOW_MS } from './InstantTip'
 import { Check, ChevronRight, Copy, Link2Off, Lock, Shield, TriangleAlert, X } from 'lucide-react'
 import { Trans } from 'react-i18next'
 import type { Element as HastElement, Root as HastRoot, RootContent, Text as HastText } from 'hast'
@@ -205,6 +207,28 @@ export interface AllowHold {
   workspace: string
   records: readonly BlockedLink[]
   outcome: 'allowed' | 'undone'
+  /** The card the host was allowed from. The reloaded reply reopens that
+   *  card id; when no block lists it, no card shows. */
+  cardId: string
+}
+
+/**
+ * The id of a blocked-link card. A card opens under the block holding the
+ * chip that opened it, so the id names that block as well as the host: one
+ * host blocked in four paragraphs has four possible cards, and one click
+ * opens one of them. The block part is `<rendered block>.<top-level block>`.
+ * Allow swaps an inline placeholder for an inline link, so the block keeps
+ * its place across the reload and the held card reopens under it.
+ */
+export function blockedLinkCardId(domain: string, block: string): string {
+  return `rx-link-${domain}~${block}`
+}
+
+/** The host a blocked-link card id names (a host never contains `~`). */
+export function blockedLinkCardDomain(id: string): string {
+  const rest = id.slice('rx-link-'.length)
+  const cut = rest.indexOf('~')
+  return cut < 0 ? rest : rest.slice(0, cut)
 }
 
 const EMPTY_HOLDS: ReadonlyMap<string, AllowHold> = new Map()
@@ -295,8 +319,8 @@ export function RedactionProvider({ credentials, blockedLinks, slotKey, replyKey
   // after Allow can rebuild the row) reopens that card, so Undo stays up.
   const [openId, setOpenId] = useState<string | null>(() => {
     const held = replyKey ? allowHolds.get(replyKey) : undefined
-    const domain = held ? held.keys().next().value : undefined
-    return domain ? `rx-link-${domain}` : null
+    const first = held ? held.values().next().value : undefined
+    return first ? first.cardId : null
   })
   const triggerRef = useRef<HTMLElement | null>(null)
   const close = useCallback(() => {
@@ -320,14 +344,19 @@ export function RedactionProvider({ credentials, blockedLinks, slotKey, replyKey
   const holds = useAllowHolds(replyKey)
   useEffect(() => {
     if (!replyKey) return
-    for (const domain of holds.keys()) if (openId !== `rx-link-${domain}`) setAllowHold(replyKey, domain, null)
+    for (const [domain, hold] of holds) if (openId !== hold.cardId) setAllowHold(replyKey, domain, null)
   }, [openId, replyKey, holds])
+  // The card is inline in the transcript (not portalled), so it stays mounted
+  // and comes back as it was on a Crew switch. Only the Escape key handler
+  // stands down while the local Crew is hidden, so Escape on the remote Crew
+  // cannot silently close a card the user left open.
+  const hidden = useLocalCrewHidden()
   useEffect(() => {
-    if (openId === null) return
+    if (openId === null || hidden) return
     const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') close() }
     document.addEventListener('keydown', onKey)
     return () => document.removeEventListener('keydown', onKey)
-  }, [openId, close])
+  }, [openId, close, hidden])
   const value = useMemo(() => {
     const map = new Map(credentials.map(r => [r.ordinal, r]))
     const first = credentials.length ? Math.min(...credentials.map(r => r.ordinal)) : -1
@@ -921,6 +950,187 @@ function TerminalAction({ title, note, command, label, primary = true, agentWrit
   )
 }
 
+// ── hover preview ────────────────────────────────────────────────────────
+
+/** How long a mouse rests on a marker before its preview opens, and how long
+ *  the preview stays after the mouse leaves, so it can cross into the panel. */
+export const PREVIEW_OPEN_MS = 300
+export const PREVIEW_CLOSE_MS = 200
+const PREVIEW_MAX_W = 340
+
+interface PreviewAnchor { left: number; top: number; below: boolean }
+
+function anchorFor(el: HTMLElement): PreviewAnchor {
+  const r = el.getBoundingClientRect()
+  const below = window.innerHeight - r.bottom >= 160 || r.top < 160
+  return { left: r.left, top: below ? r.bottom + 4 : r.top - 4, below }
+}
+
+/** Whether ``el`` still shows inside the window and inside ``scroller``, the
+ *  element that just scrolled, when that element holds it. */
+function markerInView(el: HTMLElement, scroller: EventTarget | null): boolean {
+  const r = el.getBoundingClientRect()
+  if (r.bottom < 0 || r.top > window.innerHeight) return false
+  if (scroller instanceof Element && scroller !== el && scroller.contains(el)) {
+    const box = scroller.getBoundingClientRect()
+    if (r.bottom < box.top || r.top > box.bottom) return false
+  }
+  return true
+}
+
+/**
+ * The hover/focus preview of one marker. It opens after a mouse rests on the
+ * marker, or at once on keyboard focus; a press (mouse, touch or pen) never
+ * opens it, so a tap still goes straight to the card. It stays hidden while
+ * the marker's card is open, since the card already says everything it says.
+ *
+ * The panel is read-only: it explains the marker and holds no control, so
+ * focus never enters it and no key on the marker is taken. A preview that
+ * keyboard focus opened stays while the mouse passes over and away; blur,
+ * Escape, or its marker scrolling out of view closes it. One the mouse opened
+ * keeps a short close delay so the pointer can cross into it to read.
+ *
+ * Not `useInstantTip`: that bubble closes on mouse leave, so the pointer
+ * cannot cross into it, and a focus-opened tip would close under a passing
+ * mouse. The touch-replay window is the shared one, so the two cannot drift on
+ * what counts as a tap.
+ */
+function useMarkerPreview(cardId: string) {
+  const { openId } = useRedactionUi()
+  const [open, setOpen] = useState(false)
+  const [anchor, setAnchor] = useState<PreviewAnchor | null>(null)
+  const zoneRef = useRef<HTMLElement | null>(null)
+  const buttonRef = useRef<HTMLButtonElement | null>(null)
+  const panelRef = useRef<HTMLDivElement | null>(null)
+  const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
+  // A press focuses the button too, and on touch that focus lands only after
+  // the tap ends; a focus this soon after a press must not open the preview.
+  const pressedAt = useRef(-Infinity)
+  // Set while keyboard focus holds the preview open; pointer leave ignores it.
+  const byFocus = useRef(false)
+  const shown = open && openId !== cardId
+  const panelId = `${cardId}-preview`
+
+  const cancel = () => clearTimeout(timer.current)
+  const cardOpen = useRef(false)
+  cardOpen.current = openId === cardId
+  const show = useCallback((viaFocus: boolean) => {
+    clearTimeout(timer.current)
+    if (cardOpen.current) return
+    if (viaFocus) byFocus.current = true
+    if (zoneRef.current) setAnchor(anchorFor(zoneRef.current))
+    setOpen(true)
+  }, [])
+  const hide = useCallback(() => { clearTimeout(timer.current); byFocus.current = false; setOpen(false) }, [])
+  // An opening card replaces the preview, so it is not waiting behind the
+  // card to reappear when the card closes.
+  useEffect(() => { if (openId === cardId) hide() }, [openId, cardId, hide])
+  const later = (fn: () => void, ms: number) => { clearTimeout(timer.current); timer.current = setTimeout(fn, ms) }
+  useEffect(() => () => clearTimeout(timer.current), [])
+  // Hide the preview when the local Crew is hidden, so the window key
+  // listener is unregistered before the remote Crew receives key events.
+  useCloseWhenCrewHidden(shown, hide)
+  // Keep the panel on its marker while the transcript scrolls under it, and
+  // close it once the marker scrolls out of view, so it never floats over
+  // unrelated content. Escape pressed anywhere closes it. While focus is on
+  // the marker the Escape is caught on the way down and stopped, so a drawer
+  // or dialog holding the transcript stays open and the first Escape closes
+  // only the preview. A preview opened by hover alone closes but lets the
+  // Escape through, so it still reaches the focused composer or dialog.
+  useEffect(() => {
+    if (!shown) return
+    const follow = (e: Event) => {
+      const el = zoneRef.current
+      if (!el) return
+      if (!markerInView(el, e.type === 'scroll' ? e.target : null)) { hide(); return }
+      setAnchor(anchorFor(el))
+    }
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return
+      if (buttonRef.current === document.activeElement) e.stopPropagation()
+      hide()
+    }
+    window.addEventListener('scroll', follow, true)
+    window.addEventListener('resize', follow)
+    window.addEventListener('keydown', onKey, true)
+    return () => {
+      window.removeEventListener('scroll', follow, true)
+      window.removeEventListener('resize', follow)
+      window.removeEventListener('keydown', onKey, true)
+    }
+  }, [shown, hide])
+
+  const isMouse = (e: React.PointerEvent) => e.pointerType === 'mouse'
+  const leave = (e: React.PointerEvent) => { if (isMouse(e) && !byFocus.current) later(hide, PREVIEW_CLOSE_MS) }
+
+  const zoneProps = {
+    onPointerEnter: (e: React.PointerEvent) => { if (isMouse(e)) later(() => show(false), PREVIEW_OPEN_MS) },
+    onPointerLeave: leave,
+    onPointerDown: () => { pressedAt.current = performance.now(); hide() },
+  }
+  const buttonProps = {
+    'aria-describedby': shown ? panelId : undefined,
+    onFocus: (e: React.FocusEvent) => {
+      if (performance.now() - pressedAt.current < TOUCH_REPLAY_WINDOW_MS) return
+      // Focus coming back from the closing card is not a reader arriving.
+      const from = e.relatedTarget
+      if (from instanceof Node && document.getElementById(cardId)?.contains(from)) return
+      show(true)
+    },
+    onBlur: () => hide(),
+  }
+  const panelProps = {
+    onPointerEnter: (e: React.PointerEvent) => { if (isMouse(e)) cancel() },
+    onPointerLeave: leave,
+  }
+  return { shown, anchor, panelId, zoneRef, buttonRef, panelRef, zoneProps, buttonProps, panelProps }
+}
+
+type MarkerPreview = ReturnType<typeof useMarkerPreview>
+
+/**
+ * The preview panel: what was removed and the rule in plain words. It is
+ * read-only. Every action stays on the marker's card, so the card's own
+ * confirmations and outcomes are the only path that does anything.
+ */
+function PreviewPanel({ preview, title, testId, children }: {
+  preview: MarkerPreview
+  title: string
+  testId: string
+  children: React.ReactNode
+}) {
+  // Clamp against the panel's real width, so a short panel near the right
+  // edge stays under its marker instead of moving by the full maximum width.
+  const [width, setWidth] = useState(PREVIEW_MAX_W)
+  useLayoutEffect(() => {
+    const w = preview.panelRef.current?.offsetWidth
+    if (w && w !== width) setWidth(w)
+  }, [preview.shown, preview.anchor, preview.panelRef, width])
+  if (!preview.shown || !preview.anchor) return null
+  const { anchor } = preview
+  return (
+    <OverlayPortal>
+      <div
+        ref={preview.panelRef}
+        id={preview.panelId}
+        role="tooltip"
+        data-testid={testId}
+        {...preview.panelProps}
+        className="fixed z-[130] w-max rounded-lg border border-border bg-bg-elevated p-2.5 text-[12px] leading-[18px] text-card-fg shadow-lg"
+        style={{
+          maxWidth: `min(${PREVIEW_MAX_W}px, calc(100vw - 16px))`,
+          left: Math.max(8, Math.min(anchor.left, window.innerWidth - width - 8)),
+          top: anchor.below ? anchor.top : undefined,
+          bottom: anchor.below ? undefined : window.innerHeight - anchor.top,
+        }}
+      >
+        <div className="mb-0.5 font-semibold [overflow-wrap:anywhere]">{title}</div>
+        <div data-testid="redaction-preview-body" className="[overflow-wrap:anywhere]">{children}</div>
+      </div>
+    </OverlayPortal>
+  )
+}
+
 // ── credential ───────────────────────────────────────────────────────────
 
 const SESSION_TOKEN_RULES = new Set(['aws_session_token'])
@@ -945,25 +1155,41 @@ function credentialMatched(rule: string): string {
 export function CredentialTag({ ordinal, placeholder }: { ordinal: number; placeholder: string }) {
   useLanguageGeneration()
   const { credentials, firstCredential, openId, toggle } = useRedactionUi()
+  const id = `rx-cred-${ordinal}`
+  const preview = useMarkerPreview(id)
   const record = credentials.get(ordinal)
   if (!record) return <>{placeholder}</>
-  const id = `rx-cred-${ordinal}`
+  const session = SESSION_TOKEN_RULES.has(record.rule)
   return (
     <>
       {record.label}
       <button
         type="button"
+        ref={el => { preview.zoneRef.current = el; preview.buttonRef.current = el }}
         data-testid="credential-tag"
         aria-expanded={openId === id}
         aria-controls={id}
         aria-label={i18nT('components.redaction.cred_tag_aria')}
+        {...preview.zoneProps}
+        {...preview.buttonProps}
         onClick={e => toggle(id, e.currentTarget)}
         className="relative inline-flex min-h-[18px] cursor-pointer items-center gap-1 whitespace-nowrap rounded-[5px] border border-info bg-info-subtle px-1.5 align-[-1px] font-sans text-[11px] leading-4 text-card-fg hover:bg-bg-hover max-[640px]:whitespace-normal [@media(hover:none)]:after:absolute [@media(hover:none)]:after:-inset-[13px] [@media(hover:none)]:after:content-['']"
       >
         <Lock size={12} aria-hidden="true" className="shrink-0" />
-        {i18nT(SESSION_TOKEN_RULES.has(record.rule) ? 'components.redaction.cred_tag_session' : 'components.redaction.cred_tag')}
+        {i18nT(session ? 'components.redaction.cred_tag_session' : 'components.redaction.cred_tag')}
         {ordinal === firstCredential && <span className="text-muted">· {i18nT('components.redaction.cred_why')}</span>}
       </button>
+      <PreviewPanel
+        preview={preview}
+        title={i18nT(session ? 'components.redaction.preview_session_title' : 'components.redaction.preview_cred_title')}
+        testId="credential-preview"
+      >
+        {credentialMatched(record.rule)}
+        <br />
+        {/* The security floor, said instead of offering a reveal: the value
+            was never saved, so nothing here can show it. */}
+        <span data-testid="credential-preview-floor">{i18nT('components.redaction.preview_cred_floor')}</span>
+      </PreviewPanel>
     </>
   )
 }
@@ -1163,33 +1389,53 @@ function linkReason(record: BlockedLink): string {
   }
 }
 
-/** The Blocked link chip standing where a suspicious URL was removed. */
-export function BlockedLinkChip({ domain, placeholder }: { domain: string; placeholder: string }) {
+/**
+ * The Blocked link chip standing where a suspicious URL was removed.
+ *
+ * The chip names the host and nothing else. The saved placeholder names only
+ * the host, a placeholder can have no record of its own, and the rendered
+ * text can hold more chips than the saved text has placeholders, so neither a
+ * record count nor a single record proves which record a chip stands for. The
+ * card explains each record of the host; with several it lists each under its
+ * own address.
+ *
+ * `block` names the top-level block holding it, so the card opens under that
+ * block alone. Chips of one host in one block share its card.
+ * `rehypeRedactionMarkers` is the only producer and always sets it.
+ */
+export function BlockedLinkChip({ domain, placeholder, block, tail = '' }: {
+  domain: string
+  placeholder: string
+  block: string
+  /** A query tail written right after the placeholder, which the chip takes
+   *  in (see `blockedLinkQueryTail`). Shown as text only when no chip is. */
+  tail?: string
+}) {
   useLanguageGeneration()
   const { blockedLinks, openId, toggle } = useRedactionUi()
+  const id = blockedLinkCardId(domain, block)
+  const preview = useMarkerPreview(id)
   const group = blockedLinksForDomain(blockedLinks, domain)
-  if (group.length === 0) return <>{placeholder}</>
-  const single = group.length === 1 ? group[0] : null
-  const id = `rx-link-${domain}`
+  if (group.length === 0) return <>{placeholder}{tail}</>
   return (
+    <>
     <span
+      ref={preview.zoneRef}
       role="group"
       aria-label={i18nT('components.redaction.link_tag')}
       data-testid="blocked-link-chip"
+      {...preview.zoneProps}
       className="inline-flex min-h-[26px] max-w-full cursor-default flex-wrap items-center gap-1.5 rounded-lg border border-dashed border-warn bg-warn-subtle py-0.5 pl-2 pr-1.5 align-middle text-[12px] leading-5 text-card-fg"
     >
       <Link2Off size={12} aria-hidden="true" className="shrink-0" />
       <span className="text-[10px] font-bold tracking-[.04em] text-warn [text-box:trim-both_cap_alphabetic]">{i18nT('components.redaction.link_tag')}</span>
-      <span className="break-all font-mono text-[12px] text-card-fg [text-box:trim-both_cap_alphabetic]" data-testid="blocked-link-target">
-        {single?.path != null ? `${domain}${escapeInvisibleChars(single.path)}` : domain}
-      </span>
-      {single && single.query_chars > 0 && (
-        <span className="text-muted [text-box:trim-both_cap_alphabetic]" data-testid="blocked-link-query">{i18nT('components.redaction.link_query', { chars: single.query_chars })}</span>
-      )}
+      <span className="break-all font-mono text-[12px] text-card-fg [text-box:trim-both_cap_alphabetic]" data-testid="blocked-link-target">{domain}</span>
       <button
         type="button"
+        ref={preview.buttonRef}
         aria-expanded={openId === id}
         aria-controls={id}
+        {...preview.buttonProps}
         onClick={e => toggle(id, e.currentTarget)}
         data-testid="blocked-link-inspect"
         className="relative inline-flex min-h-[18px] cursor-pointer items-center rounded-[5px] border border-warn bg-transparent px-1.5 text-[11px] leading-4 text-card-fg hover:bg-bg-hover [@media(hover:none)]:after:absolute [@media(hover:none)]:after:-inset-[13px] [@media(hover:none)]:after:content-['']"
@@ -1197,6 +1443,40 @@ export function BlockedLinkChip({ domain, placeholder }: { domain: string; place
         <span className="[text-box:trim-both_cap_alphabetic]">{i18nT('components.redaction.link_inspect')}</span>
       </button>
     </span>
+    {/* Beside the chip, not inside it: React events bubble out of a portal to
+        its React parent, and a press in the panel must not reach the chip. */}
+    <BlockedLinkPreview preview={preview} domain={domain} group={group} />
+    </>
+  )
+}
+
+/**
+ * What the chip's preview says: the rule in plain words for one address, or a
+ * pointer to the card when the host has several. It offers no action: opening
+ * a blocked link goes through the card's own confirmation and nowhere else.
+ */
+function BlockedLinkPreview({ preview, domain, group }: { preview: MarkerPreview; domain: string; group: readonly BlockedLink[] }) {
+  const single = group.length === 1 ? group[0] : null
+  return (
+    <PreviewPanel
+      preview={preview}
+      title={i18nT('components.redaction.preview_link_title', { host: domain })}
+      testId="blocked-link-preview"
+    >
+      {single ? (
+        <>
+          {/* A withheld address shows only the withheld sentence: it already
+              gives the reason, and the rule's sentence would repeat it. */}
+          {single.url === null ? (
+            <span data-testid="blocked-link-preview-withheld">
+              {i18nT(single.url_withheld === 'length' ? 'components.redaction.link_withheld_length' : 'components.redaction.link_withheld_credential')}
+            </span>
+          ) : linkReason(single)}
+        </>
+      ) : (
+        i18nT('components.redaction.preview_link_many')
+      )}
+    </PreviewPanel>
   )
 }
 
@@ -1218,7 +1498,7 @@ function MarkedUrl({ url }: { url: string }) {
 type Confirming = null | 'open' | 'allow'
 type Feedback = null | { kind: 'opened' } | { kind: 'allowed'; workspace: string } | { kind: 'undone' }
 
-function BlockedLinkEntry({ record, showTarget }: { record: BlockedLink; showTarget: boolean }) {
+function BlockedLinkEntry({ record, cardId }: { record: BlockedLink; cardId: string }) {
   const { slotKey, replyKey, messageTs, blockedLinks } = useRedactionUi()
   const hold = useAllowHolds(replyKey).get(record.domain)
   const [confirming, setConfirming] = useState<Confirming>(null)
@@ -1255,7 +1535,7 @@ function BlockedLinkEntry({ record, showTarget }: { record: BlockedLink; showTar
       setFeedback({ kind: 'allowed', workspace: res.workspace })
       // The reply reloads with this host's links shown as links again; the
       // hold keeps this card open over them with its Undo.
-      if (replyKey) setAllowHold(replyKey, record.domain, { workspace: res.workspace, records: blockedLinksForDomain(blockedLinks, record.domain), outcome: 'allowed' })
+      if (replyKey) setAllowHold(replyKey, record.domain, { workspace: res.workspace, records: blockedLinksForDomain(blockedLinks, record.domain), outcome: 'allowed', cardId })
       window.dispatchEvent(new CustomEvent('mc:redaction-hosts-changed', { detail: { slot: slotKey, messageTs } }))
     } catch {
       setError(i18nT('components.redaction.link_allow_failed'))
@@ -1276,11 +1556,9 @@ function BlockedLinkEntry({ record, showTarget }: { record: BlockedLink; showTar
   }
   return (
     <div data-testid="blocked-link-entry">
-      {showTarget && (
-        <div className="mt-1 font-mono text-[12px]" data-testid="blocked-link-entry-target">
-          {record.path != null ? `${record.domain}${escapeInvisibleChars(record.path)}` : record.domain}
-        </div>
-      )}
+      <div className="mt-1 font-mono text-[12px]" data-testid="blocked-link-entry-target">
+        {record.path != null ? `${record.domain}${escapeInvisibleChars(record.path)}` : record.domain}
+      </div>
       <div className="mb-2 mt-1 text-[13px] leading-5 text-card-fg">
         <Trans i18nKey="components.redaction.link_destination" components={{ host: <code className={CODE}>{record.domain}</code> }} />
         <br />
@@ -1373,16 +1651,21 @@ function BlockedLinkEntry({ record, showTarget }: { record: BlockedLink; showTar
   )
 }
 
-function BlockedLinkCard({ domain }: { domain: string }) {
+function BlockedLinkCard({ id }: { id: string }) {
   useLanguageGeneration()
   const { blockedLinks } = useRedactionUi()
+  const domain = blockedLinkCardDomain(id)
   const group = blockedLinksForDomain(blockedLinks, domain)
   if (group.length === 0) return null
+  // The host's distinct blocked links in this reply, in record order: nothing the
+  // reply carries ties a chip to one record, so no entry is put first, and a
+  // lone record is listed the same way, under its own address, with a title
+  // that speaks of the host's blocked links rather than "this link".
   return (
-    <CardShell id={`rx-link-${domain}`} title={i18nT('components.redaction.link_title')} testId="blocked-link-card">
+    <CardShell id={id} title={i18nT('components.redaction.link_title_host')} testId="blocked-link-card">
       {group.map((record, i) => (
         <div key={i} className={i > 0 ? 'mt-2 border-t border-border pt-2' : undefined}>
-          <BlockedLinkEntry record={record} showTarget={group.length > 1} />
+          <BlockedLinkEntry record={record} cardId={id} />
         </div>
       ))}
       <Foot>
@@ -1399,8 +1682,12 @@ export function RedactionCardSlot({ ids }: { ids: string }) {
   const list = ids.split(' ')
   // A held card this slot mounts with is the one already on screen before the
   // reload, so it shows without animating open again.
-  const [heldAtMount] = useState(() => openId !== null && list.includes(openId) && !!replyKey
-    && !!allowHolds.get(replyKey)?.has(openId.slice('rx-link-'.length)))
+  const [heldAtMount] = useState(() => {
+    if (openId === null || !list.includes(openId) || !replyKey) return false
+    const domain = blockedLinkCardDomain(openId)
+    const hold = allowHolds.get(replyKey)?.get(domain)
+    return hold?.cardId === openId
+  })
   // The coach follows the first block holding a removed value, before any card.
   const coach = coached && list.includes(`rx-cred-${firstCredential}`)
     ? <RedactionCoach count={credentials.size} slotKey={slotKey} />
@@ -1417,7 +1704,7 @@ export function RedactionCardSlot({ ids }: { ids: string }) {
       const record = credentials.get(Number(renderId.slice('rx-cred-'.length)))
       card = record ? <CredentialCard key={renderId} record={record} /> : null
     } else {
-      card = <BlockedLinkCard key={renderId} domain={renderId.slice('rx-link-'.length)} />
+      card = <BlockedLinkCard key={renderId} id={renderId} />
     }
   }
   if (!coach && !card) return null
@@ -1428,6 +1715,23 @@ export function RedactionCardSlot({ ids }: { ids: string }) {
 
 /** Every credential tag the redactor writes, in the order they occur. */
 export const CREDENTIAL_TAG_RE = /\[REDACTED: (?:encoded )?credential\]/g
+/**
+ * A query tail glued to the end of a blocked-link placeholder: `?` or `&`, a
+ * parameter name and `=`, then everything up to whitespace, an angle bracket,
+ * a quote or a square bracket (so a credential tag after it still renders and
+ * keeps its ordinal). This is what is left when a link is removed in parts,
+ * such as a presigned link split at `&X-Amz-Date`: the rest of the removed
+ * link, not prose of its own.
+ */
+const QUERY_TAIL_RE = /^[?&][A-Za-z0-9._~%+-]+=[^\s<>"'`[\]]*/
+
+/** The query tail right after a placeholder, without the sentence
+ *  punctuation that may close it, or '' when the text goes on otherwise. */
+export function blockedLinkQueryTail(after: string): string {
+  const m = QUERY_TAIL_RE.exec(after)
+  return m ? m[0].replace(/[.,;:!?)]+$/, '') : ''
+}
+
 /** A suspicious-URL placeholder, capturing its domain (a bracketed IPv6
  *  literal first, so the capture never stops inside `[::1]`). */
 export const BLOCKED_LINK_PLACEHOLDER_RE = /\[REDACTED: suspicious URL to (\[[^\]]+\]|[^\]]+)\]/g
@@ -1445,6 +1749,8 @@ export interface RedactionMarkers {
   held?: ReadonlySet<string>
   credentials: ReadonlyMap<number, CredentialRecord>
   base: number
+  /** The block's index in the message; see `rehypeRedactionMarkers`. */
+  block: number
 }
 
 function countCredentialTags(text: string): number {
@@ -1464,10 +1770,21 @@ function countCredentialTags(text: string): number {
  * injected -- a control inside an anchor would follow the anchor -- but the
  * tags there still count, so later ordinals stay aligned.
  */
-export function rehypeRedactionMarkers(options: { ordinals: ReadonlySet<number>; domains: ReadonlySet<string>; held?: ReadonlySet<string>; base: number }) {
-  const { ordinals, domains, held = new Set<string>(), base: start } = options
+export function rehypeRedactionMarkers(options: {
+  ordinals: ReadonlySet<number>
+  domains: ReadonlySet<string>
+  held?: ReadonlySet<string>
+  base: number
+  /** Which rendered block of the message this is, so card ids stay unique
+   *  across the reply's sub-documents. */
+  block: number
+}) {
+  const { ordinals, domains, held = new Set<string>(), base: start, block: blockIndex } = options
   return (tree: HastRoot) => {
     let next = start
+    // The current top-level block, counted before card slots are added.
+    let top = 0
+    const keyOf = () => `${blockIndex}.${top}`
     const walk = (parent: HastParent, mode: 'inject' | 'count', ids: string[]) => {
       const children = parent.children
       for (let i = 0; i < children.length; i++) {
@@ -1493,8 +1810,16 @@ export function rehypeRedactionMarkers(options: { ordinals: ReadonlySet<number>;
               pieces.push({ type: 'element', tagName: 'cred-tag', properties: { ordinal: String(ordinal), placeholder: m[0] }, children: [] })
               ids.push(`rx-cred-${ordinal}`)
             } else {
-              pieces.push({ type: 'element', tagName: 'blocked-link', properties: { domain: m[1], placeholder: m[0] }, children: [] })
-              ids.push(`rx-link-${m[1]}`)
+              // The chip takes in a query tail glued to its placeholder, so the
+              // rest of a link removed in parts does not run on beside it as
+              // text. It is never an anchor and never reaches the card. Display
+              // only: this redacts nothing, and the saved text keeps the tail.
+              const tail = blockedLinkQueryTail(child.value.slice(m.index + m[0].length))
+              pieces.push({ type: 'element', tagName: 'blocked-link', properties: { domain: m[1], placeholder: m[0], block: keyOf(), tail }, children: [] })
+              ids.push(blockedLinkCardId(m[1], keyOf()))
+              last = m.index + m[0].length + tail.length
+              MARKER_RE.lastIndex = last
+              continue
             }
             last = m.index + m[0].length
           }
@@ -1517,16 +1842,18 @@ export function rehypeRedactionMarkers(options: { ordinals: ReadonlySet<number>;
             continue
           }
         }
-        if (child.tagName === 'a') {
-          const domain = heldAnchorDomain(child.properties?.href, held)
-          if (domain !== null) ids.push(`rx-link-${domain}`)
+        if (child.tagName === 'a' || child.tagName === 'img') {
+          // A link or image to a host allowed from a still-open card keeps
+          // that card's slot: Allow turned the placeholder here into it.
+          const domain = heldAnchorDomain(child.tagName === 'a' ? child.properties?.href : child.properties?.src, held)
+          if (domain !== null) ids.push(blockedLinkCardId(domain, keyOf()))
         }
         const inert = child.tagName === 'a' || child.tagName === 'code'
         walk(child, mode === 'count' || inert ? 'count' : 'inject', ids)
       }
     }
     const root = tree.children
-    for (let i = 0; i < root.length; i++) {
+    for (let i = 0; i < root.length; i++, top++) {
       const block = root[i]
       const ids: string[] = []
       if (block.type === 'element') walk({ type: 'root', children: [block] } as HastRoot, 'inject', ids)

@@ -32,7 +32,9 @@ from kiro_crew.apps.registry_pipeline.checkout import (
     _rmtree_force_settled,
 )
 from kiro_crew.apps.registry_pipeline.git_targets import (
+    _GIT_FAILURE_CLASS_LABELS,
     _entry_git_url,
+    _git_output_is_auth_shaped,
     _git_target_is_unsupported,
     _loggable_git_transport_output,
     _looks_like_git_url,
@@ -54,7 +56,11 @@ from kiro_crew.apps.registry_pipeline.store_art import (
     _SAFE_BRANCH_RE,
     _prewarm_owner_tier_store_assets,
 )
-from kiro_crew.apps.registry_pipeline.subprocess_env import minimal_env
+from kiro_crew.apps.registry_pipeline.subprocess_env import (
+    _git_network_env,
+    _proxy_env_has_credentials,
+    minimal_env,
+)
 from kiro_crew.sandbox import (
     cgroup_scope_argv,
     create_subprocess_limited,
@@ -199,11 +205,77 @@ async def _owner_tier_confirmed(entry: dict[str, Any]) -> bool:
     return False
 
 
+# Registries whose latest index fetch failed because git refused the sign-in,
+# keyed by (public repo, branch). The fetch keeps returning ``None`` on failure
+# (callers and tests depend on that shape), so this travels beside it for the
+# refresh path to report. A refused sign-in is the one failure the user fixes
+# themselves, so it is the only one the dashboard names.
+_SIGN_IN_REFUSED: set[tuple[str, str]] = set()
+
+
+def _registry_sign_in_refused(repo: str, branch: str) -> bool:
+    """Whether the last fetch of *repo*@*branch* failed on a refused sign-in."""
+    return (_strip_git_target_userinfo(repo), branch) in _SIGN_IN_REFUSED
+
+
+def _load_index_entries_sync(
+    clone_path: Path, repo: str, branch: str
+) -> tuple[list[dict[str, Any]] | None, list[dict[str, Any]]]:
+    """Read the clone's index and scan its ``apps/`` tree — both blocking.
+
+    Return ``(index_entries, fallback_entries)``: the object entries of a
+    well-formed ``app-registry.json`` (``None`` when the file is absent,
+    unreadable or not a JSON list), and the ``apps/*/app.json`` fallback rows
+    (empty when the clone has none). The index probe governs which of the two
+    answers the caller reads — an EMPTY index list is a valid index result,
+    never a trigger to scan the fallback.
+
+    Blocking: every probe and read here is a filesystem call, so the caller
+    runs this in one ``asyncio.to_thread`` hop rather than probing on the event
+    loop. Read and decode errors propagate to the fetch's own handler.
+    """
+    index_path = clone_path / "app-registry.json"
+    if index_path.is_file():
+        try:
+            data = json.loads(index_path.read_text("utf-8"))
+            if isinstance(data, list):
+                # Keep only well-formed object entries — a malformed index
+                # item (e.g. a bare string) must never reach normalization.
+                return [item for item in data if isinstance(item, dict)], []
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+            pass
+
+    entries: list[dict[str, Any]] = []
+    apps_dir = clone_path / "apps"
+    if apps_dir.is_dir():
+        for app_dir in sorted(apps_dir.iterdir()):
+            if not app_dir.is_dir():
+                continue
+            if not (app_dir / "app.json").is_file():
+                continue
+            app_name = app_dir.name
+            if not app_name or app_name in (".", ".."):
+                continue
+            entries.append(
+                {
+                    "name": app_name,
+                    "repo": repo,
+                    "branch": branch,
+                    "subdirectory": f"apps/{app_name}",
+                }
+            )
+    return None, entries
+
+
 async def _fetch_external_registry_index(
     repo: str,
     branch: str,
 ) -> list[dict[str, Any]] | None:
     """Fetch app-registry.json from an external repo via a shallow git clone.
+
+    When the clone fails because git refused the sign-in, that is recorded for
+    :func:`_registry_sign_in_refused`; any later fetch of the same registry
+    clears the record first.
 
     *repo* is a git-cloneable URL (https/ssh/git/scp-style).  The repo is
     shallow-cloned into a throwaway temp directory.  If it contains an
@@ -227,6 +299,8 @@ async def _fetch_external_registry_index(
     - Read-only: only ``git clone`` (no write operations to the remote).
     - SEL audit (best-effort): start/outcome events logged when SEL is present.
     """
+    sign_in_key = (_strip_git_target_userinfo(repo), branch)
+    _SIGN_IN_REFUSED.discard(sign_in_key)
     # Input validation — reject values that could be used for command injection.
     if not _looks_like_git_url(repo):
         logger.warning("Rejecting non-cloneable external registry repo")
@@ -241,6 +315,9 @@ async def _fetch_external_registry_index(
     credential_target = repo
     git_url = _strip_git_target_userinfo(credential_target)
     credentialed_transport = credential_target != git_url
+    # A proxy URL holding a password is a credential too: it takes the split path,
+    # so no checkout-time filter inherits it (see `_proxy_env_has_credentials`).
+    isolate_transport = credentialed_transport or _proxy_env_has_credentials(git_url)
 
     # SEL audit: log external subprocess invocation for traceability (best-effort).
     def _sel_outcome(outcome: str) -> None:
@@ -264,21 +341,40 @@ async def _fetch_external_registry_index(
     try:
         tmp_root = await asyncio.to_thread(tempfile.mkdtemp, prefix="kirocrew-registry-")
         clone_path = Path(tmp_root)
-        if credentialed_transport:
+        if isolate_transport:
             # See `_git_fetch_branch`: a combined credentialed clone would let
             # checkout-time filters inherit the one-shot credential mapping.
             clone_path /= "branch"
+            fetch_log: list[str] = []
             err = await _git_fetch_branch(
                 git_url,
                 branch,
                 clone_path,
-                [],
+                fetch_log,
                 credential_target=credential_target,
                 clone_env=minimal_env(),
                 sandbox_mode=_context_clone_sandbox_mode(git_url),
             )
             if err is not None:
                 _sel_outcome("failed")
+                fetch_text = "\n".join(fetch_log)
+                sign_in_refused = _git_output_is_auth_shaped(fetch_text)
+                # The credentialed fetch already replaced git's output with a fixed
+                # label, so match the labels, not git's raw markers.
+                failure_class = next(
+                    (label for _, label in _GIT_FAILURE_CLASS_LABELS if label in fetch_text), ""
+                )
+                # A credentialed remote's output is never logged, only a fixed label.
+                logger.warning(
+                    "external registry clone failed: %s",
+                    (
+                        "git refused the sign-in"
+                        if sign_in_refused
+                        else failure_class or "unclassified git failure"
+                    ),
+                )
+                if sign_in_refused:
+                    _SIGN_IN_REFUSED.add(sign_in_key)
                 return None
         else:
             clone_cmd = [
@@ -304,7 +400,7 @@ async def _fetch_external_registry_index(
                 *sandboxed_cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                env=minimal_env(),
+                env=_git_network_env(minimal_env(), git_url),
                 start_new_session=platform_compat.IS_POSIX,
                 creationflags=platform_compat.CREATE_NEW_PROCESS_GROUP,
             )
@@ -314,44 +410,21 @@ async def _fetch_external_registry_index(
                 tail = _loggable_git_transport_output(text, credentialed=False)[-400:]
                 logger.warning("external registry clone failed: %r", tail)
                 _sel_outcome("failed")
+                if _git_output_is_auth_shaped(text):
+                    _SIGN_IN_REFUSED.add(sign_in_key)
                 return None
 
-        # Prefer an explicit app-registry.json index.
-        index_path = clone_path / "app-registry.json"
-        if index_path.is_file():
-            try:
-                data = json.loads(await asyncio.to_thread(index_path.read_text, "utf-8"))
-                if isinstance(data, list):
-                    # Keep only well-formed object entries — a malformed index
-                    # item (e.g. a bare string) must never reach normalization.
-                    _sel_outcome("success")
-                    return _credential_free_external_registry_entries(
-                        [item for item in data if isinstance(item, dict)]
-                    )
-            except (json.JSONDecodeError, OSError, UnicodeDecodeError):
-                pass
-
-        # Fallback: scan for apps/*/app.json
-        entries: list[dict[str, Any]] = []
-        apps_dir = clone_path / "apps"
-        if apps_dir.is_dir():
-            for app_dir in sorted(apps_dir.iterdir()):
-                if not app_dir.is_dir():
-                    continue
-                if not (app_dir / "app.json").is_file():
-                    continue
-                app_name = app_dir.name
-                if not app_name or app_name in (".", ".."):
-                    continue
-                entries.append(
-                    {
-                        "name": app_name,
-                        "repo": repo,
-                        "branch": branch,
-                        "subdirectory": f"apps/{app_name}",
-                    }
-                )
-        result = entries if entries else None
+        # Prefer an explicit app-registry.json index, then the apps/*/app.json
+        # fallback. Both walk the clone's disk, so they run in ONE
+        # asyncio.to_thread hop: a slow or network clone root stalls this
+        # fetch's worker thread, not every session's turn on the loop.
+        index_entries, fallback_entries = await asyncio.to_thread(
+            _load_index_entries_sync, clone_path, repo, branch
+        )
+        if index_entries is not None:
+            _sel_outcome("success")
+            return _credential_free_external_registry_entries(index_entries)
+        result = fallback_entries or None
         _sel_outcome("success" if result else "failed")
         return _credential_free_external_registry_entries(result) if result else None
 

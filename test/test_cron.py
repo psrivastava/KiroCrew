@@ -23,6 +23,8 @@ from kiro_crew.cron import (
     CronStoreUnreadable,
     _job_tz,
     _RunClaim,
+    apply_job_update,
+    build_job,
     compute_next_run_ts,
     cron_expr_matches,
     validate_cron_expr,
@@ -76,6 +78,27 @@ class TestValidateCronExpr:
         assert not validate_cron_expr("bad")
         assert not validate_cron_expr("* * *")
         assert not validate_cron_expr("")
+
+    def test_alias_valid(self) -> None:
+        assert validate_cron_expr("@daily")
+        assert validate_cron_expr("@yearly")
+        assert validate_cron_expr("@midnight")
+
+    def test_seconds_field_rejected(self) -> None:
+        # Six fields: croniter reads one, but is_due never fires a job twice
+        # in the same UTC minute, so the second run the expression advertises
+        # would never happen.
+        assert not validate_cron_expr("* * * * * *")
+        assert not validate_cron_expr("0 0 * * * *")
+
+    def test_seconds_expr_refused_at_create_and_update(self) -> None:
+        # The writers funnel through validate_cron_expr (fields.py); both
+        # creation and update must refuse the shape the scheduler cannot run.
+        with pytest.raises(ValueError, match="Invalid cron expression"):
+            build_job(name="t", message="m", cron_expr="* * * * * *")
+        job = build_job(name="t", message="m", cron_expr="*/5 * * * *")
+        with pytest.raises(ValueError, match="Invalid cron expression"):
+            apply_job_update(job, {"cron_expr": "* * * * * *"}, None)
 
 
 class TestCronService:
@@ -379,6 +402,39 @@ class TestCronService:
         svc.add_job(name="first", message="m", every_secs=300)
 
         assert [j.name for j in CronService(base_dir=tmp_path).list_jobs()] == ["first"]
+
+    def test_save_fsyncs_the_cron_store_and_directory(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A completed save requests both available durability steps."""
+        import kiro_crew.atomic_write as atomic_write_module
+
+        real_atomic_write = atomic_write_module.atomic_write
+        real_fsync_dir = atomic_write_module.fsync_dir
+        observed: dict[str, object] = {}
+        calls: list[str] = []
+
+        def recording_atomic_write(path: Path, content: str, **kwargs: object) -> None:
+            calls.append("atomic_write")
+            observed.update(kwargs)
+            real_atomic_write(path, content, **kwargs)
+
+        def recording_fsync_dir(path: Path | str, *, best_effort: bool = False) -> None:
+            calls.append("fsync_dir")
+            observed["fsync_dir"] = Path(path)
+            observed["best_effort"] = best_effort
+            real_fsync_dir(path, best_effort=best_effort)
+
+        monkeypatch.setattr(atomic_write_module, "atomic_write", recording_atomic_write)
+        monkeypatch.setattr(atomic_write_module, "fsync_dir", recording_fsync_dir)
+
+        svc = CronService(base_dir=tmp_path)
+        svc.add_job(name="durable", message="m", every_secs=300)
+
+        assert observed["fsync"] is True
+        assert observed["fsync_dir"] == tmp_path
+        assert observed["best_effort"] is True
+        assert calls == ["atomic_write", "fsync_dir"]
 
     def test_a_repaired_store_becomes_writable_again(self, tmp_path: Path) -> None:
         """NC2, third half. The refusal must not latch.
@@ -702,7 +758,8 @@ class TestTimerRestoreOnLoad:
         svc._running = True
         with patch.object(svc, "_arm_timer") as mock_arm:
             svc._load()
-            mock_arm.assert_called_once()
+            mock_arm.assert_called_once_with()
+        assert [(j.id, j.enabled) for j in svc._jobs] == [("abc123", True)]
 
     def test_load_paused_jobs_no_timer(self, tmp_path: Path) -> None:
         """Paused (disabled) jobs must NOT trigger _arm_timer."""
@@ -712,6 +769,8 @@ class TestTimerRestoreOnLoad:
         with patch.object(svc, "_arm_timer") as mock_arm:
             svc._load()
             mock_arm.assert_not_called()
+        # The job is loaded, so the missing arm comes from the enabled check.
+        assert [(j.id, j.enabled) for j in svc._jobs] == [("abc123", False)]
 
     def test_load_not_running_no_timer(self, tmp_path: Path) -> None:
         """Jobs loaded before start() must NOT trigger _arm_timer."""
@@ -720,6 +779,8 @@ class TestTimerRestoreOnLoad:
         with patch.object(svc, "_arm_timer") as mock_arm:
             svc._load()
             mock_arm.assert_not_called()
+        # The enabled job is loaded, so the missing arm comes from the running check.
+        assert [(j.id, j.enabled) for j in svc._jobs] == [("abc123", True)]
 
     def test_load_logs_restored_count(self, tmp_path: Path, caplog) -> None:
         """Log message must include the count of restored timers."""
@@ -762,7 +823,6 @@ class TestUserPausedState:
         job.last_run_ts = time.time()
         job.last_status = "ok"
         svc._merge_job_result(job)
-        # Reload and verify enabled was NOT persisted as False
         svc._load()
         reloaded = [j for j in svc._jobs if j.id == job.id][0]
         assert reloaded.enabled is True
@@ -776,7 +836,6 @@ class TestUserPausedState:
         job.last_run_ts = time.time()
         job.last_status = "ok"
         svc._merge_job_result(job)
-        # Reload and verify both enabled=False AND user_paused=True persisted
         svc._load()
         reloaded = [j for j in svc._jobs if j.id == job.id][0]
         assert reloaded.enabled is False
@@ -841,9 +900,11 @@ class TestJobCompletionRearmsTimer:
             patch.object(svc, "_execute_with_timeout", return_value=None),
             patch.object(svc, "_arm_timer") as mock_arm,
         ):
-            await svc._run_job_isolated(job, svc._claim_run(job.id, "scheduled"))
+            claim = svc._claim_run(job.id, "scheduled")
+            await svc._run_job_isolated(job, claim)
 
-        mock_arm.assert_called_once()
+        mock_arm.assert_called_once_with()
+        assert not svc._runs.holds(job.id, claim)
 
     @pytest.mark.asyncio
     async def test_run_job_isolated_does_not_rearm_a_stopped_service(
@@ -864,9 +925,12 @@ class TestJobCompletionRearmsTimer:
             patch.object(svc, "_execute_with_timeout", return_value=None),
             patch.object(svc, "_arm_timer") as mock_arm,
         ):
-            await svc._run_job_isolated(job, svc._claim_run(job.id, "scheduled"))
+            claim = svc._claim_run(job.id, "scheduled")
+            await svc._run_job_isolated(job, claim)
 
         mock_arm.assert_not_called()
+        # The run itself still finishes and releases its claim.
+        assert not svc._runs.holds(job.id, claim)
 
     @pytest.mark.asyncio
     async def test_completed_job_replaces_a_longer_sleeping_timer_task(
@@ -1191,7 +1255,6 @@ class TestFormatSchedule:
     def test_at_timestamp_today(self, monkeypatch, _utc_tz) -> None:
         from kiro_crew.cron import CronSchedule, format_schedule
 
-        # Mock "now" to Apr 10, job at 3PM same day
         fake_now = datetime(2026, 4, 10, 12, 0, tzinfo=timezone.utc)
         # Mock only covers now() and fromtimestamp() — extend if format_schedule evolves.
         monkeypatch.setattr("kiro_crew.cron.datetime", type("D", (datetime,), {
@@ -1206,7 +1269,6 @@ class TestFormatSchedule:
     def test_at_timestamp_future_date(self, monkeypatch, _utc_tz) -> None:
         from kiro_crew.cron import CronSchedule, format_schedule
 
-        # Mock "now" to Apr 10, job on Apr 17
         fake_now = datetime(2026, 4, 10, 12, 0, tzinfo=timezone.utc)
         # Mock only covers now() and fromtimestamp() — extend if format_schedule evolves.
         monkeypatch.setattr("kiro_crew.cron.datetime", type("D", (datetime,), {
@@ -1490,7 +1552,7 @@ class TestTimezoneScheduling:
 
     def test_job_tz_invalid_falls_back_to_utc(self) -> None:
         job = CronJob(id="j1", name="t", message="m", timezone="Fake/Zone")
-        assert _job_tz(job) == ZoneInfo("UTC")
+        assert _job_tz(job) is timezone.utc
 
     def test_compute_next_run_ts_with_timezone(self) -> None:
         """Job at 1pm Toronto should compute next fire at 17:00 UTC (EDT = UTC-4)."""

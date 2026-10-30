@@ -31,10 +31,10 @@ once at gateway startup and an unwrapped one would answer regardless of the opt-
 |--------|------|---------|
 | GET | `/health` | Whether a compiler and `git` exist on the host, so the UI can explain "Cmd+S does nothing" before the first compile rather than as a failure. Also carries `managed` — whether this platform has a pinned Tectonic build, whether one is installed, and the provisioning job's live state — so ONE poll drives both the warning banner and the install progress |
 | POST | `/compiler/provision` | Install the managed Tectonic compiler. **202 + poll `/health`**; idempotent (200 when already installed), 422 `compiler_unsupported_platform` where no pinned build exists. See Managed compiler |
-| GET | `/projects` | List papers (name, main-document mtime, whether a PDF exists) |
+| GET | `/projects` | List papers (display name, directory name, main-document mtime, whether a PDF exists) |
 | POST | `/projects` | Create a paper from the standard `article` template (or a supplied `template`) |
-| POST | `/projects/clone` | Shallow-clone a git remote as a paper. A repo with no `.tex` is rejected **and removed**, so the name is not held hostage by an unopenable project |
-| GET | `/project` | Resolved main document + file list + PDF presence |
+| POST | `/projects/clone` | Shallow-clone a git remote as a paper. A repo with no `.tex` is rejected **and removed**, so the name is not held hostage by an unopenable project. When the request names no folder, the paper's document title becomes its display name (see Naming a paper) |
+| GET | `/project` | Resolved display name + main document + file list + PDF presence |
 | DELETE | `/project` | Delete a paper and its tree. **500 `project_delete_incomplete`** when the tree survives the removal, rather than answering `ok: true` over a partial delete that leaves the name taken with no explanation |
 | GET | `/files` | The paper's file list |
 | GET | `/file` | Read one file as UTF-8 text |
@@ -42,6 +42,7 @@ once at gateway startup and an unwrapped one would answer regardless of the opt-
 | POST | `/file` | Create a file, refusing to clobber |
 | DELETE | `/file` | Delete a file; the main document is refused |
 | PUT | `/main` | Choose which `.tex` is the main document |
+| PUT | `/title` | Set the paper's display name, or clear it with an empty value and fall back to the directory name (see Naming a paper). **400** when `title` is missing or not a string — an explicit `""` is the clear, so an absent field must not be read as one. **409 `project_config_refused`** when `.papyrus.json` is a link or uncontained and cannot be written, rather than answering success over a rename that was not saved. **400** when `generation` is missing: it is the value the list row carried (`GET /projects` sends one per paper), and **409 `project_replaced`** answers a row loaded before its paper was deleted and recreated under the same name, so a stale list cannot rename the replacement |
 | POST | `/compile` | Compile and return `{ok, log, errors[], duration_ms}`. **422 on a failed compile, and the log/diagnostics still ride the response** — that payload is exactly what the user needs to fix the document. **422 `compiler_sandbox_unavailable`** is the distinct case where this host could not build an OS-level sandbox, so the compiler never ran (see Platform) |
 | GET | `/pdf` | Serve the compiled PDF (see Security) |
 | GET | `/git` | Branch, dirtiness, ahead/behind, recent commits — or `{is_git: false}` |
@@ -73,6 +74,59 @@ argv could read as an option. Normalization never launders a traversal into an
 accepted name — pinned by
 `test/test_papyrus_store.py::TestSafeProjectDir::test_normalize_does_not_make_a_traversal_safe`.
 
+The slug is lowercase ASCII on purpose, not by oversight: the name is a directory and
+a `git`/`pdflatex` argument, so it must mean one thing on every platform and
+filesystem, with no normalization form, case folding or case-insensitive collision to
+reason about. A name typed in another script (`论文`, `Отчет`, `München`) is therefore
+refused, and the refusal says why: create, clone and open answer a JSON 400
+`{"code": "invalid_project_name", "char": …}`, where `char` is the first character of
+the name as the user typed it (after NFC, before lowercasing) that the slug cannot
+hold, so `Отчет` reports the capital `О` they typed rather than a lowercase letter
+that looks like an allowed Latin `o`. A bidi override, zero-width or other invisible
+character is sent as its `U+XXXX` code point instead, so it cannot hide or reorder the
+message, and `char` is `""` when the name failed on its length or first character.
+The dashboard renders that code as the rule in the user's own language; the English
+`error` is for logs. A refused letter is shown with its script and code point
+(`“О” (Cyrillic letter, U+041E)`), because a Cyrillic or Greek capital renders exactly
+like the Latin one the rule allows, and the rule beside it is one clause
+(`Use lowercase a–z, 0–9, . - _`), its `. - _` tail joined by a no-break space between
+the characters and a word joiner after the hyphen so it never wraps mid-list. Pinned by `test/test_papyrus_store.py::TestProjectNameStaysAscii`
+and the `test_create_explains_*` tests in `test/test_papyrus_routes.py`.
+
+### Naming a paper
+
+That slug is the app's **identifier** — the `?name=` of every route, the PDF URL,
+the "last opened paper" pointer, the key of the paper's co-author session — and it
+is never renamed. For a cloned paper it is the last segment of the clone URL,
+which for an Overleaf remote is the project id, so on its own it shows the reader
+a string they never chose. A **display name** can therefore be set beside it: the
+name the user typed, held in `.papyrus.json`, else the directory name.
+`PUT /title` sets it and an empty value clears it.
+
+A clone is named once, when it is created. When `POST /projects/clone` succeeds
+and the request named no folder, the handler reads `\title{...}` from the main
+document's preamble (`doc_title.py`: one linear scan, no macro expansion, no
+`\input`) and saves it as the display name through the same path `PUT /title`
+uses, unless the repository's `.papyrus.json` already holds one. The document is
+read through `read_text_file`, so a path that leaves the paper is refused. A
+missing or refused title, or an unwritable `.papyrus.json`, leaves the directory
+name and never fails the clone. `gitops.clone` moves the clone into place and
+reads its generation in one step under the config lock, and the name is saved
+only if the folder still has that generation, so a paper deleted and created
+again under the same name meanwhile keeps its own name. A later edit to
+`\title{}` does not change the name, as for a paper created here.
+
+The name is **untrusted** — `.papyrus.json` can be shipped inside a cloned
+repository — so it is kept as plain text: `%` and a backslash are ordinary
+characters, while control **and format** characters (a bidi override in a name
+reorders the whole row) are removed, a line break or tab becoming a space. A name
+with nothing left is refused, and a refused stored name falls back to the
+directory name. It then
+takes the same redaction the compile log takes, and only then is length-capped —
+cutting first could split a credential into a fragment the redactor no longer
+recognizes. For the same reason a raw name longer than the sanitizer's work
+bound is no name at all rather than a cut prefix.
+
 ## Security model
 
 ### Caller authorization (owner only)
@@ -82,7 +136,7 @@ owner's private drafts, and the git routes run with the owner's own git credenti
 a caller who can reach any one route can read, overwrite or publish the owner's work.
 
 `_require_enabled` runs two checks in order. A disabled app answers 403 `app_disabled`
-to everyone. Then `require_owner_dashboard_request` (`dashboard/handlers/_shared.py`)
+to everyone. Then `require_owner_dashboard_request` (`dashboard/handlers/_shared_access.py`)
 lets only the owner through and answers everyone else with 403 `owner_only`, writing a
 SEL denial record named `papyrus.<route>`. The same wrapper covers all 19 routes, so a
 route added to `register_routes` cannot skip the gate.
@@ -116,7 +170,7 @@ external compiler, so two functions own every filesystem decision:
   app supports. `store.is_reparse_link` is the shared answer (used here and by
   `gitops`'s attributes guard) so the two cannot drift on which link types they
   cover; `os.path.isjunction` is 3.12+ and always `False` off Windows, resolved
-  once via `getattr` the same way `apps/manager.py` does.
+  once via `getattr` the same way `apps/manager_tree.py` does.
 
   The strictness is load-bearing. A check of the form
   `resolved != base_resolved and base_resolved not in resolved.parents` would let
@@ -171,6 +225,10 @@ input. `get_main_file` re-validates the configured value through `safe_child` on
 **every read** and ignores it on failure — without that, a hostile repo naming
 `../../etc/passwd.tex` would pivot through the PDF-serving route. Pinned by
 `test/test_papyrus_store.py::TestMainFile`.
+
+Its `title` key is untrusted for a second reason: it is **display text**, so a
+cloned repo can ship a name that lands in a dashboard table cell. It takes the
+treatment described in Naming a paper.
 
 ### The compiler is never given shell escape
 
@@ -228,6 +286,10 @@ app was a stdlib `ThreadingHTTPServer` on its own port using blocking
 - a timeout kills the whole **process tree** via
   `platform_compat.kill_process_tree_async` and then reaps it, so no zombie holds
   its pipes;
+- a cancel (the app stops, the gateway shuts down or restarts) kills and reaps the
+  tree too, through the shielded `platform_compat.kill_and_reap`, then lets the
+  cancel propagate. The child runs in its own session, so nothing else would stop
+  a compiler or `git` child once its caller stops awaiting it;
 - every synchronous filesystem call — the tree walk, file read/write, compiler
   discovery, the `.bst`/`.bib` search-path `rglob`, `installed.json` reads, and the
   managed-compiler probes behind `/health` and `/compiler/provision` — is offloaded
@@ -368,8 +430,9 @@ manual install path. `platform.machine()` normalization handles the
 `KIROCREW_PAPYRUS_TECTONIC_URL` overrides the download URL for a mirrored or
 air-gapped deployment. It must be `https://` (a `file://` or `http://` value is
 refused and logged), and the pin still has to match — an override changes **where**
-bytes come from, never **which** bytes are accepted. Logged URLs are redacted to
-scheme+host+path so a signed query string or userinfo never reaches a log.
+bytes come from, never **which** bytes are accepted. Logged and returned URLs are
+redacted to scheme+host, so a signed query string, userinfo or path token never
+reaches a log or the install banner.
 `KIROCREW_PAPYRUS_SKIP_TECTONIC_DOWNLOAD=1` refuses provisioning outright, which
 is how the test suite guarantees it never reaches the network.
 
@@ -440,9 +503,12 @@ immediately** and hands the work to a **daemon** thread: a transfer must not pin
 interpreter exit (a `ThreadPoolExecutor` or the loop's default executor joins its
 non-daemon workers at exit, so a Ctrl-C would hang for up to the HTTP timeout),
 and the default executor is also what the loop uses for DNS. One job at a time; a
-second click while one runs starts nothing. The sha256 is computed over the
-**stream**, so verification cannot be fooled by a file swapped between write and
-check, and the binary is `chmod`-ed and then `os.replace`-d into place, so it is
+second click while one runs starts nothing. The transfer is
+`asset_downloader.download_to`, the same one the embedding model and feature
+videos use: the sha256 is computed over the **stream**, and the archive reaches its
+path only once the digest matches, so extraction never sees unverified bytes.
+Redirects may change host (the release url 302s to GitHub's asset host) but never
+leave https. The binary is `chmod`-ed and then `os.replace`-d into place, so it is
 never observable at its final path without its exec bit.
 
 Every failure degrades cleanly and leaves the manual route working:
@@ -586,10 +652,16 @@ Two views behind one route:
   narrow rail, and that collapsed flag persists. The PDF column is capped at
   `PDF_MAX_VIEWPORT_SHARE` (half the viewport), and the co-author panel's ceiling
   yields to the tree and PDF so the editor keeps at least `MIN_EDITOR_WIDTH`
-  (280px). Whether the co-author panel is open persists too (`CHAT_OPEN_KEY`),
-  read and written only on a desktop viewport: on a narrow viewport the panel
-  covers the pane, so it opens closed and closing it there does not rewrite the
-  desktop layout.
+  (280px). Whenever Papyrus uses that desktop layout, the editor row also keeps
+  a 180px minimum. The editor row and co-author column are size-contained, so
+  editor content and a long transcript cannot enlarge the shared row. The status
+  bar and diagnostics remain non-shrinking siblings:
+  diagnostics are capped at 224px and scroll internally, while the shell's page
+  scroller keeps the lower workspace reachable when the window is shorter than
+  the combined stack. Whether the co-author panel is open persists too
+  (`CHAT_OPEN_KEY`), read and written only on a desktop viewport: on a narrow
+  viewport the panel covers the pane, so it opens closed and closing it there
+  does not rewrite the desktop layout.
 
 Dependency decisions, both deliberate:
 
@@ -625,8 +697,10 @@ navigating away from a dirty buffer therefore flushes it first:
   compiler reads the file off disk and would otherwise typeset the previous
   revision.
 - `closeProject` (the toolbar's **Papers** back button) awaits the same save
-  before tearing the workspace down. This is the gesture most likely to surprise:
-  the toolbar advertises "Editing {file} — unsaved" immediately beside the button.
+  before tearing the workspace down. The main-document picker already names a
+  clean main file, so the toolbar omits that duplicate label. A clean non-main file
+  still shows "Editing {file}", and any dirty buffer shows
+  "Editing {file} — unsaved" beside the button.
   If the flush **fails**, the workspace deliberately stays mounted and surfaces the
   error rather than discarding the very edits the flush exists to protect.
 
@@ -662,6 +736,40 @@ and its main document is injected via `api.chatSlotContext` — the
 `papyrus-writing` skill supplies the rest. Stale slot keys are pruned whenever the
 project list lands, because a name reused after a delete would otherwise
 resurrect the old paper's conversation.
+
+The embedded `ChatPage` renders the dashboard's ACTIVE slot, not a slot of its
+own. `CoAuthorPanel` calls `switchSlot` for the paper's slot key and shows the
+chat only while the active slot is that session (or its memory-mode
+replacement, below); until then it shows no chat. The switch is skipped only when the key is already active AND still in the slot
+list, since a session deleted while the panel was closed can still be the
+active slot. A remembered key whose session was deleted makes `switchSlot`
+reject with a 404, and the store then restores the previously active chat; the
+panel reports that 404, the page drops the key, and the panel offers "Start a
+session" instead of showing — and sending into — the other chat. Any other
+rejection (gateway down, 5xx) is shown in the panel's `ErrorNotice`, whose
+only action is "Try again"; it is never retried on its own. "Try again" always
+calls `switchSlot` again, even for a session that is active and listed, since a
+failed switch can leave its target active without the gateway having loaded it.
+
+While the chat is shown, the only change of the active slot the panel follows
+is a memory-mode switch. `runMemorySwitch` records the hand-over
+(`utils/slotSuccession.ts`: `recordSlotSuccession(from, next)`) before it
+makes the new session active, and forgets it if the switch is abandoned or
+fails, or the old session's delete is rejected. When the paper's slot then leaves the slot list, the page
+adopts the recorded replacement (re-injecting the paper's context into it). Any
+other active slot is never shown: if the paper's session is gone (a delete
+falling back to a neighbour, whenever that neighbour was created) the page
+drops the key; if it is still listed (a transcript link opened another chat)
+the panel makes the paper's session active again. A close of the paper's
+session (Ctrl+W, the sidebar) takes its row out of the list before the DELETE
+answers; the session is reported gone only once that close is confirmed in
+`dashboard.closingSlots`, so a rejected DELETE, which drops the hold and then
+lists the session again, leaves the paper's key in place and the panel makes
+it active again. A paper's slot that leaves the list without a close is never
+taken as deleted from the list alone: while the gateway labels its list partial
+(`dashboard.slotsListPartial`, a restart still restoring sessions) the panel
+waits, and otherwise it calls `switchSlot` again, whose 404 drops the key and
+whose success keeps the paper's session.
 
 When the session goes busy→idle the app re-reads the open file and recompiles: the
 agent edits on disk, so the pane the user is watching is stale until then. That
@@ -742,7 +850,7 @@ The Windows-specific contract lives in these places:
   `rmtree(..., ignore_errors=True)` would silently leave `.git/objects` behind
   while the handler answered `ok: true`, keeping the project name taken. Delete
   reports `project_delete_incomplete` if the tree survives.
-- **`PlatformConfig`** (`apps/manifest.py`) carries a `windows` row in
+- **`PlatformConfig`** (`apps/manifest_sections.py`) carries a `windows` row in
   `_OS_TO_PLATFORM`/`_PLATFORM_TO_OS`, so `"windows"` is expressible in a
   manifest and `current_os()` maps `"win32"` to it. The default stays
   `["macos", "linux"]`: an app opts in by naming `windows`.
@@ -766,6 +874,7 @@ that host reports `supported: false` and keeps the manual install path.
 | `.../papyrus/backend/tectonic.py` | The managed, digest-pinned Tectonic install (pins, safe extract, provisioning job) |
 | `.../papyrus/backend/gitops.py` | Clone/status/commit/push/pull, **and** the repo-config RCE denylist (19 `-c` overrides + the attributes pin + pack-program flags + `GIT_PROXY_COMMAND`) |
 | `.../papyrus/backend/routes.py` | aiohttp handlers + `register_routes` |
+| `.../papyrus/backend/doc_title.py` | Reads `\title{...}` from a cloned paper's main document, once, at clone time |
 | `src/kiro_crew/builtin_skills/papyrus-writing/SKILL.md` | Base skill: conduct, paper-quality principles, LaTeX house style, project path, compile workflow |
 | `.../builtin_skills/papyrus-make-fluent/SKILL.md` | Polish English as tracked suggestions |
 | `.../builtin_skills/papyrus-latex-comments/SKILL.md` | Comment layer — `\aicomment` margin notes |
@@ -789,8 +898,10 @@ that host reports `supported: false` and keeps the manual install path.
 |------|--------|
 | `test/test_papyrus_store.py` | Traversal/symlink/backslash/NUL defenses, project-name slug rule, **the `.git` refusal (any depth, any case) and the symlinked-project-entry refusal incl. the self-referential `-> .` case**, untrusted `.papyrus.json`, main-document discovery, bounded walk, file I/O |
 | `test/test_papyrus_latex.py` | Log parsing (incl. the two-bangs rule), the `-no-shell-escape` invariant, the pass sequence, timeout kill, compiler discovery + cache, env minimalism (incl. the Windows location hints, and that widening the allowlist admitted no secrets), the platform `os.pathsep` for `BSTINPUTS`, and that a sandbox refusal is reported rather than bypassed |
-| `test/test_papyrus_gitops.py` | URL allowlist + `--` placement, autostash flows incl. the kept stash and the raising-pull restore, auth classification, sandbox/resource-limit-wrapper routing, tree-kill, the repo-config denylist against real git, **that the attributes pin ends up LAST even when pre-seeded and is never written through a symlink**, and that a sandbox refusal becomes `GitSandboxUnavailable` |
+| `test/test_papyrus_gitops.py` | URL allowlist + `--` placement, autostash flows incl. the kept stash and the raising-pull restore, auth classification, sandbox/resource-limit-wrapper routing, tree-kill on timeout and on cancel, the repo-config denylist against real git, **that the attributes pin ends up LAST even when pre-seeded and is never written through a symlink**, that a sandbox refusal becomes `GitSandboxUnavailable`, and that `clone` returns the new paper's generation |
 | `test/test_papyrus_routes.py` | The `_require_enabled` gate on every registered route, name/path authorization, response contracts, PDF security headers, git status mapping, the provisioning endpoint (202/idempotent/unsupported/one-job) and its off-loop discipline |
+| `test/test_papyrus_routes_clone_title.py` | Clone-time naming: the document title becomes the display name, a shipped or requested name wins, a missing title or an unwritable `.papyrus.json` keeps the folder name without failing the clone, a paper deleted and recreated under the same name during the clone keeps its own name, a `main.tex` linking outside the paper is never read, and the title is redacted and capped |
+| `test/test_papyrus_doc_title.py` | The `\title{...}` parser: comments, look-alike commands, `\thanks`, line breaks, `~` as a space, escaped characters, and the inputs that give no title |
 | `test/test_papyrus_tectonic.py` | Platform→asset mapping incl. the arch-naming splits, digest-shape and mismatch/tamper refusal, tar **and** zip traversal + symlink + setuid + bomb refusal, the no-`filter` compatibility leg, atomic install + exec bit, unsupported-platform degradation, no partial install after a failure, that a user's own `pdflatex` still wins, cache reset after install, and daemon-thread/off-loop discipline |
 | `website/src/test/PapyrusLib.test.ts` | Tree building/flattening, artifact filter, word count, slot persistence + pruning |
 | `website/src/test/PapyrusDiagnostics.test.tsx` | Click/Enter-to-jump, non-interactive line-less rows, collapsed hints, no emoji |
@@ -798,7 +909,7 @@ that host reports `supported: false` and keeps the manual install path.
 | `website/src/test/PapyrusPdfPreview.test.tsx` | The preview embeds an `<iframe>` and never `<object>`/`<embed>` (the `object-src 'none'` block), the `key={src}` remount that makes a recompile visible, the persistent download affordance, and the pre-compile empty state |
 | `website/src/test/PapyrusEditorSeed.test.tsx` | Pierre document reseeding after an async file load while preserving the caret across local edits |
 | `website/src/test/PapyrusPageCoverage.test.tsx` | Compile, git, file-tree, and co-author workspace flows beyond the leave/flush guards |
-| `website/src/apps/papyrus/CoAuthorPanel.cov80.test.tsx` | Co-author body states, header actions, and slot switching across project changes |
+| `website/src/apps/papyrus/CoAuthorPanel.cov80.test.tsx` | Co-author body states, header actions, and activating the paper's slot (another chat made active, recorded replacement, deleted session, pending and failed close, gateway failure) |
 | `website/src/apps/papyrus/FileTree.cov80.test.tsx` | Artifact filtering, file glyphs, directory collapse, main-file protection, and the empty state |
 
 The backend tests live in the repo-level `test/` tree by convention. `setup.cfg`

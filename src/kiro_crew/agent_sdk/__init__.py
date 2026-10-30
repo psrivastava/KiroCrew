@@ -60,7 +60,8 @@ Design of record, including what each later phase moves in here:
 
 from __future__ import annotations
 
-from typing import Protocol
+from pathlib import Path
+from typing import TYPE_CHECKING, Protocol
 
 # One name, because one name has a consumer: the dashboard handler that serves
 # ``GET /api/acp-backends``. The record types and the per-id projection stay inside
@@ -88,6 +89,7 @@ from kiro_crew.agent_sdk.capabilities import (
     SessionCapabilities,
     capabilities_for,
     capabilities_of,
+    capture_prompt_timeout,
 )
 from kiro_crew.agent_sdk.context import (
     CONTEXT_EVENT_AGENT_CHANGED,
@@ -104,6 +106,7 @@ from kiro_crew.agent_sdk.drivers.acp import (
     finish_suspended_spawn,
     kas_engine_gap,
     kas_engine_unsupported_reason,
+    kas_engine_verdict,
 )
 from kiro_crew.agent_sdk.host_auth import (
     UNKNOWN_AGENT_AUTH,
@@ -114,6 +117,9 @@ from kiro_crew.agent_sdk.host_auth import (
     signs_in_separately,
 )
 from kiro_crew.agent_sdk.native_commands import NativeCommandBatch, run_kiro_native_commands
+
+if TYPE_CHECKING:
+    from kiro_crew.acp.managed_agent_shadow import AgentNameClaim
 
 
 def fits_tool_result(text: str, limit: int) -> bool:
@@ -132,6 +138,22 @@ def tool_row_text(text: str) -> str:
     return _scrub(text)
 
 
+def agents_dir_competing_claim(
+    agent: str, agents_dir: Path, own_file: Path
+) -> AgentNameClaim | None:
+    """A competing user-level claim or unverifiable scan, excluding the app's own file."""
+    from kiro_crew.acp.managed_agent_shadow import agents_dir_competing_claim as _claim
+
+    return _claim(agent, agents_dir, own_file)
+
+
+def session_start_concurrency() -> int:
+    """The configured ``agent.session_start_concurrency`` snapshot (off-loop caller)."""
+    from kiro_crew.acp.runtime_start import _resolve_session_start_concurrency as _resolve
+
+    return _resolve()
+
+
 TURN_STOP_REASON_CANCELLED = "cancelled"
 TURN_STOP_REASON_END_TURN = "end_turn"
 
@@ -144,7 +166,9 @@ class AgentTurnUsage(Protocol):
 
 
 __all__ = [
+    "session_start_concurrency",
     "tool_row_text",
+    "agents_dir_competing_claim",
     "ContextPromptProvider",
     "ContextStreamEvent",
     "CONTEXT_EVENT_AGENT_CHANGED",
@@ -160,6 +184,7 @@ __all__ = [
     "UNKNOWN_BACKEND_CAPABILITIES",
     "capabilities_for",
     "capabilities_of",
+    "capture_prompt_timeout",
     "card_payload",
     "UNKNOWN_AGENT_AUTH",
     "AgentAuthDeclaration",
@@ -182,6 +207,7 @@ __all__ = [
     "forget_for_recheck",
     "kas_engine_gap",
     "kas_engine_unsupported_reason",
+    "kas_engine_verdict",
     "probe_backend",
     "probe_backends",
     "run_kiro_native_commands",

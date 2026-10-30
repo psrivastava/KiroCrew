@@ -95,6 +95,19 @@ class SecretVault:
         plaintext = self._decrypt_entry(name, entries[name], key)
         return SecretValue(plaintext.decode("utf-8"))
 
+    def get_with_revision(self, name: str) -> Optional[tuple[SecretValue, str]]:
+        """The secret and its :func:`entry_revision`, read from one snapshot, or None.
+
+        Pairs with :meth:`delete_if_revision`: a reader that later deletes what it
+        read deletes only that entry, never one another writer stored since.
+        """
+        entries = self._load_entries()
+        if name not in entries:
+            return None
+        entry = entries[name]
+        plaintext = self._decrypt_entry(name, entry, self._get_or_create_key())
+        return SecretValue(plaintext.decode("utf-8")), entry_revision(entry)
+
     def get_many(self, names: list[str]) -> dict[str, Optional[SecretValue]]:
         """Batch-retrieve secrets, loading the store and key exactly once.
 
@@ -301,6 +314,61 @@ class SecretVault:
         self._write_store(_mutate)
         return deleted
 
+    def _replace_entry_sync(
+        self, name: str, value: str
+    ) -> tuple[Optional[dict[str, str]], dict[str, str]]:
+        """Store *value* under *name*; return ``(replaced_entry, written_entry)``.
+
+        Both entries are read inside the one store lock that performs the write,
+        so the pair describes exactly this write: *replaced_entry* is the
+        encrypted entry it displaced (``None`` when the name was absent) and
+        *written_entry* is the entry it stored. Handing both to
+        :meth:`_restore_entry_if_sync` undoes this write and nothing a later
+        writer stored. No plaintext of the replaced value leaves the store.
+        """
+        replaced: Optional[dict[str, str]] = None
+        written: dict[str, str] = {}
+
+        def _mutate(entries: dict) -> dict:
+            nonlocal replaced
+            current = entries.get(name)
+            replaced = dict(current) if isinstance(current, dict) else None
+            written.update(self._encrypt_entry(name, value.encode("utf-8")))
+            return {**entries, name: dict(written)}
+
+        self._write_store(_mutate)
+        return replaced, dict(written)
+
+    def _restore_entry_if_sync(
+        self,
+        name: str,
+        expected_entry: dict[str, str],
+        restored_entry: Optional[dict[str, str]],
+    ) -> bool:
+        """Put *restored_entry* back under *name* while it still holds *expected_entry*.
+
+        *restored_entry* ``None`` removes the name instead. The comparison is by
+        exact ciphertext identity (see :meth:`_compare_and_delete_sync`) and runs
+        under the same store lock as the write, so an entry another writer
+        stored since is never overwritten or removed. ``False`` when the stored
+        entry is absent or differs.
+        """
+        restored = False
+
+        def _mutate(entries: dict) -> dict:
+            nonlocal restored
+            if entries.get(name) != expected_entry:
+                return entries
+            restored = True
+            if restored_entry is None:
+                return {k: v for k, v in entries.items() if k != name}
+            return {**entries, name: dict(restored_entry)}
+
+        if not self._store_path.exists():
+            return False
+        self._write_store(_mutate)
+        return restored
+
     def list_names(self) -> list[str]:
         """Return all stored secret names."""
         return list(self._load_entries().keys())
@@ -484,7 +552,9 @@ class SecretVault:
         """
         self._config_dir.mkdir(parents=True, exist_ok=True)
         lock_path = self._store_path.with_name(".secrets.enc.lock")
-        lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_WRONLY, 0o600)
+        from kiro_crew.platform_compat import open_create_or_existing
+
+        lock_fd = open_create_or_existing(str(lock_path), os.O_WRONLY, 0o600)
         try:
             with file_lock(lock_fd, exclusive=True):
                 yield

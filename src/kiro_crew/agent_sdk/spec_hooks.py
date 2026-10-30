@@ -29,10 +29,11 @@ and KAS names its tools differently. On a PreToolUse permission request the turn
 loop therefore matches these hooks against
 :func:`spec_hook_tool_names` of the id KAS states for the call, not against the
 call's title; a call KAS names no tool for is matched on
-its title, as a Hooks-page hook is. A PostToolUse still sees the
-title, because KAS's tool-call frames carry no tool id. A PreToolUse matcher the
-table does not know is kept, matched against KAS's id as written, and warned about
-once.
+its title, as a Hooks-page hook is. A PostToolUse is matched the same way, on the id
+:func:`post_tool_hook_tool_id` gives the finished call: KAS's tool-call frame names no
+built-in tool, so that is the id the call's permission request stated, else KAS's
+shell tool for a call classified as a shell command. A tool matcher the table does
+not know is kept, matched against KAS's id as written, and warned about once.
 
 The result is cached by the field's content, so a spec that stays the same costs
 one conversion and logs its warnings once, not once per turn.
@@ -181,6 +182,74 @@ def spec_hook_tool_names(tool_id: str) -> tuple[str, ...] | None:
     return kas_tool_match_names(tool_id)
 
 
+def post_tool_hook_tool_id(provider: object, *, harness_tool_id: str, is_shell: bool) -> str:
+    """The tool id a finished call's PostToolUse spec hooks match on, or "".
+
+    kiro-cli matches a postToolUse hook against its own tool name. KAS's tool-call
+    frame names no built-in tool (its ``_meta.kiro.toolId`` is set for a few
+    non-built-in ones only) and titles the call in prose, so the title alone
+    meets no tool matcher a spec writes. The call is named by what the turn
+    learned of it instead: the id its permission request stated
+    (*harness_tool_id*), else, for a call the frame classified as a shell
+    command, KAS's shell tool, which :func:`spec_hook_tool_names` reads as
+    kiro-cli's ``execute_bash`` -- the one tool kiro-cli runs a command with.
+
+    "" on a backend whose harness runs the spec's hooks itself, and for a call
+    nothing names, which keeps the title matching it had.
+    """
+    if not capabilities_of(provider).crew_fires_spec_hooks:
+        return ""
+    if harness_tool_id:
+        return harness_tool_id
+    if not is_shell:
+        return ""
+    # circular import: see spec_hook_tool_names.
+    from kiro_crew.acp.kas_permissions import KAS_TOOL_IDS_BY_KIRO_TOOL
+
+    shell_ids = KAS_TOOL_IDS_BY_KIRO_TOOL.get("execute_bash") or ()
+    return shell_ids[0] if shell_ids else ""
+
+
+class PostToolIdentity(NamedTuple):
+    """What a finished call's PostToolUse hooks are matched on, kept per call.
+
+    The harness id (:func:`post_tool_hook_tool_id`), and the call's canonical tool
+    name and trusted MCP server, so a spec matcher written ``@server/tool`` meets an
+    MCP call by those forms as it does on PreToolUse
+    (``hooks.pre_tool_match_names``).
+    """
+
+    tool_id: str = ""
+    tool_identity: str = ""
+    mcp_server: str = ""
+
+
+def post_tool_identity(
+    provider: object,
+    event: object,
+    *,
+    is_shell: bool,
+    earlier: PostToolIdentity | None = None,
+) -> PostToolIdentity | None:
+    """*event*'s :class:`PostToolIdentity`, or ``None`` where Crew fires no spec hooks.
+
+    *event* is the call's ``tool_call`` frame or its permission request; a field
+    the event leaves empty keeps what *earlier* recorded for the same call.
+    """
+    if not capabilities_of(provider).crew_fires_spec_hooks:
+        return None
+    base = earlier or PostToolIdentity()
+    stated = getattr(event, "harness_tool_id", "") or ""
+    tool_id = post_tool_hook_tool_id(provider, harness_tool_id=stated, is_shell=is_shell)
+    identity = getattr(event, "tool_name", "") or ""
+    server = getattr(event, "mcp_server_name", "") or ""
+    return PostToolIdentity(
+        tool_id=tool_id or base.tool_id,
+        tool_identity=identity if isinstance(identity, str) and identity else base.tool_identity,
+        mcp_server=server if isinstance(server, str) and server else base.mcp_server,
+    )
+
+
 def _reject(agent_id: str, event: object, value: object, reason: str) -> None:
     """Warn about, and SEL-audit, a spec hook that will not run.
 
@@ -213,7 +282,7 @@ def _hook(agent_id: str, event: str, index: int, entry: dict, timeout: int) -> S
         _reject(agent_id, event, command, "invalid matcher")
         return None
     if (
-        event == HOOK_EVENT_PRE_TOOL_USE
+        event in _TOOL_EVENTS
         and isinstance(matcher, str)
         and matcher
         and not _matcher_names_a_kas_tool(matcher)
@@ -228,16 +297,6 @@ def _hook(agent_id: str, event: str, index: int, entry: dict, timeout: int) -> S
             agent_id,
             _diagnostic(matcher),
             _diagnostic(event),
-        )
-    if event == HOOK_EVENT_POST_TOOL_USE and isinstance(matcher, str) and matcher not in ("", "*"):
-        # A finished call reaches the turn loop with no harness tool id, so a
-        # PostToolUse is matched on the call's title, which a kiro-cli tool name
-        # rarely matches. Said once here rather than left to miss silently.
-        logger.warning(
-            "agent %r: spec postToolUse matcher %s is compared with the call's "
-            "title, since the harness names no tool on a finished call",
-            agent_id,
-            _diagnostic(matcher),
         )
     return ScriptHook(
         id=f"spec:{agent_id}:{event}:{index}",
@@ -383,7 +442,7 @@ def _agent_spec(agent_id: str, project_dir: str | None = None) -> dict[str, Any]
     # this module; resolved at call time like the other driver seams here.
     from kiro_crew.acp.kas_agents import agent_spec_absent, load_agent_spec
     from kiro_crew.acp.session_mcp import trusted_project_agent_spec
-    from kiro_crew.config.paths import kiro_agents_dir
+    from kiro_crew.config.paths import spec_dir_for
 
     if project_dir:
         declared, spec = trusted_project_agent_spec(agent_id, project_dir)
@@ -391,7 +450,7 @@ def _agent_spec(agent_id: str, project_dir: str | None = None) -> dict[str, Any]
             if spec is None:
                 raise ValueError(f"the project spec for agent {agent_id!r} could not be read")
             return spec
-    agents_dir = kiro_agents_dir()
+    agents_dir = spec_dir_for(agent_id)
     if agent_spec_absent(agents_dir, agent_id):
         return {}
     return load_agent_spec(agents_dir, agent_id)
@@ -425,6 +484,21 @@ def kas_spec_load_error(agents_dir: Path, agent_id: str) -> str | None:
     return None
 
 
+def withheld_project_spec_hooks(agent_id: str, project_dir: str | None) -> bool:
+    """Whether *project_dir*'s own spec for *agent_id* sets ``hooks`` that do not run.
+
+    The agent-SDK face of ``session_mcp.project_spec_hooks_withheld``, for the
+    session-start notice. ``False`` when there is no checkout (KAS).
+    """
+    if not project_dir:
+        return False
+    # circular import: the ACP layer imports the config loader, which sits below
+    # this module; resolved at call time like the other driver seams here.
+    from kiro_crew.acp.session_mcp import project_spec_hooks_withheld
+
+    return project_spec_hooks_withheld(agent_id, project_dir)
+
+
 def spec_project_dir(provider: object) -> str | None:
     """The checkout *provider*'s session resolves its agent spec against, or ``None``.
 
@@ -443,7 +517,7 @@ def spec_project_dir(provider: object) -> str | None:
 
 
 def crew_fired_spec_hooks(
-    agent_id: str, project_dir: str | None = None
+    agent_id: str, project_dir: str | None = None, *, translates_tools_settings: bool = False
 ) -> tuple[list[ScriptHook], list[str], int]:
     """The active agent spec's hooks as script hooks, the keys nothing carries, and
     how many ``confirm: true`` hooks are skipped.
@@ -453,7 +527,9 @@ def crew_fired_spec_hooks(
     are for the session-start notice: the spec keys a KAS session runs without, and
     the hooks that wait for a confirmation Crew cannot ask for. Raises when the spec
     cannot be read; the caller fails PreToolUse closed on that. *project_dir* is
-    :func:`spec_project_dir` of the session.
+    :func:`spec_project_dir` of the session. *translates_tools_settings* is true
+    only for a KAS session, the one backend that receives ``toolsSettings`` as
+    ``permissions`` rules.
     """
     # circular import: the ACP layer imports the config loader, which sits below
     # this module; resolved at call time like the other driver seams here.
@@ -461,7 +537,8 @@ def crew_fired_spec_hooks(
 
     spec = _agent_spec(agent_id, project_dir)
     hooks, unconfirmable = _convert(agent_id, spec)
-    return list(hooks), spec_keys_without_carrier(spec), unconfirmable
+    lost = spec_keys_without_carrier(spec, translates_tools_settings=translates_tools_settings)
+    return list(hooks), lost, unconfirmable
 
 
 def spec_hooks_run_nowhere(provider: object) -> bool:

@@ -6,6 +6,11 @@ export interface SendReceiptBody {
   queued?: boolean
   /** A steer-flagged send was injected into the running turn. */
   steered?: boolean
+  /** A crewmate DM send's priority path (`steered`, `queued`, `cancel_requested`,
+   *  `waiting_for_input`, `stopping`, `compacting`). Informational: `ok`,
+   *  `queued` and `steered` alone decide the receipt, so `steered` here is
+   *  the same success as a steer and the steer echo owns the one bubble. */
+  responsive?: string
   /** The server-minted stable id (`meta.mid`) of the user row this send
    *  appended. Present only on a confirmed immediate dispatch; the client
    *  stamps it onto the optimistic bubble so message-pinning works before the
@@ -67,12 +72,12 @@ const CHAT_ENDPOINT_PATH = '/api/chat'
  *  as interception would hand a delivered turn's payload back and re-send it
  *  (the #5672 duplicate class). Returns false when the final URL is unknown or
  *  unparseable — absence of evidence is not evidence the endpoint answered. */
-function redirectLandedOnEndpoint(url: string | undefined): boolean {
+function redirectLandedOnEndpoint(url: string | undefined, endpointPath: string): boolean {
   if (!url) return false
   try {
     // A relative or absolute URL both parse against the current location.
     const base = typeof location !== 'undefined' ? location.href : 'http://localhost/'
-    return new URL(url, base).pathname === CHAT_ENDPOINT_PATH
+    return new URL(url, base).pathname === new URL(endpointPath, base).pathname
   } catch {
     return false
   }
@@ -97,14 +102,21 @@ function redirectLandedOnEndpoint(url: string | undefined): boolean {
  *   - an HTML content type — the endpoint answers JSON on every path, refusals
  *     included, so `text/html` is a page (a login form), not a receipt.
  *
+ * `endpointPath` names the endpoint the request was sent to (the chat send by
+ * default); the embed's ask-answer POST passes its own, so both surfaces read
+ * one rule.
+ *
  * Deliberately NOT "the body would not parse". That is `unknown`'s case and it
  * stays exactly as it was: a TRUNCATED gateway reply to a POST that did run must
  * keep its silence, because handing the payload back there duplicates a
  * delivered turn (the regression #5672 fixed). Only a response the gateway
  * demonstrably did not write is reclassified.
  */
-function answeredByIntermediary(response: SendResponseLike): boolean {
-  if (response.redirected && !redirectLandedOnEndpoint(response.url)) return true
+export function answeredByIntermediary(
+  response: Pick<SendResponseLike, 'redirected' | 'url' | 'headers'>,
+  endpointPath: string = CHAT_ENDPOINT_PATH,
+): boolean {
+  if (response.redirected && !redirectLandedOnEndpoint(response.url, endpointPath)) return true
   const contentType = response.headers?.get('content-type') ?? ''
   return /^\s*text\/html\b/i.test(contentType)
 }

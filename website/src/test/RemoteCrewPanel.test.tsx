@@ -655,6 +655,43 @@ describe('RemoteCrewPanel', () => {
     expect(screen.queryByRole('button', { name: /Copy command/i })).not.toBeInTheDocument()
   })
 
+  it('names the credential_process helper the AWS CLI could not find', async () => {
+    vi.mocked(api.listInstances).mockResolvedValue({ active: true, warm_set_cap: 5, instances: [] })
+    vi.mocked(api.cloudLaunches).mockResolvedValue({ jobs: [] })
+    vi.mocked(api.cloudPreflight).mockResolvedValue({
+      ...PREFLIGHT_OK,
+      reachable: false,
+      account: '',
+      detail: "aws: [ERROR]: [Errno 2] No such file or directory: 'sso-cred-helper'",
+      credential_helper_missing: 'sso-cred-helper',
+    })
+    const u = userEvent.setup()
+    renderWithProviders(<RemoteCrewPanel />)
+    await u.click(await screen.findByRole('button', { name: /Set up a new one/i }))
+
+    expect(
+      await screen.findByText(/^Give sso-cred-helper its full path in the credential_process line.*could not find it on the gateway’s PATH/s),
+    ).toBeInTheDocument()
+    // The CLI failure renders through ErrorNotice with the agent hand-off.
+    const notice = screen.getByText(/^Give sso-cred-helper its full path/).closest('[role="alert"]') as HTMLElement
+    expect(notice).not.toBeNull()
+    expect(notice).toHaveTextContent(/No such file or directory: 'sso-cred-helper'/)
+    expect(within(notice).getByRole('button', { name: /Ask the agent/i })).toBeInTheDocument()
+    // The sentence leads; the CLI's own error sits on its own smaller,
+    // monospace line under it instead of running on in the same red paragraph.
+    const lead = screen.getByText(/^Give sso-cred-helper its full path/)
+    expect(lead).not.toHaveTextContent(/No such file or directory/)
+    const raw = within(notice).getByText("aws: [ERROR]: [Errno 2] No such file or directory: 'sso-cred-helper'")
+    expect(raw).not.toBe(lead)
+    expect(raw.className).toMatch(/\bfont-mono\b/)
+    // The row's warning circle is the only triangle.
+    const row = notice.closest('li') as HTMLElement
+    expect(row.querySelectorAll('.lucide-triangle-alert')).toHaveLength(1)
+    expect(notice.querySelector('.lucide-triangle-alert')).toBeNull()
+    // The plugin's install link belongs to the plugin row only.
+    expect(within(row).queryByRole('link', { name: /install page/ })).toBeNull()
+  })
+
   it('remembers the AWS profile across a remount and probes THAT account, not the default', async () => {
     // This panel unmounts when you visit another Settings section. Losing the
     // profile was worse than retyping: the committed value fell back to '', so the
@@ -819,7 +856,7 @@ describe('RemoteCrewPanel', () => {
   })
 
   it('shows the enable CTA when the feature is disabled (403)', async () => {
-    vi.mocked(api.listInstances).mockRejectedValue(new ApiError(403, 'instances feature is disabled'))
+    vi.mocked(api.listInstances).mockRejectedValue(new ApiError(403, 'instances feature is disabled', JSON.stringify({ error: 'instances feature is disabled', code: 'instances_disabled' })))
     vi.mocked(api.cloudLaunches).mockResolvedValue({ jobs: [] })
     renderWithProviders(<RemoteCrewPanel />)
     expect(await screen.findByText(/Remote crew management is off/i)).toBeInTheDocument()
@@ -844,7 +881,7 @@ describe('RemoteCrewPanel', () => {
     expect(screen.queryByRole('button', { name: /Enable remote crew management/i })).not.toBeInTheDocument()
 
     // After the 403 resolves: transitions directly to the disabled card.
-    rejectInstances(new ApiError(403, 'instances feature is disabled'))
+    rejectInstances(new ApiError(403, 'instances feature is disabled', JSON.stringify({ error: 'instances feature is disabled', code: 'instances_disabled' })))
     expect(await screen.findByText(/Remote crew management is off/i)).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: /Your crews/i })).not.toBeInTheDocument()
   })
@@ -1146,11 +1183,12 @@ describe('RemoteCrewPanel', () => {
     renderWithProviders(<RemoteCrewPanel />)
     await u.click(await screen.findByRole('button', { name: /Set up a new one/i }))
     // The failure is shown as a short human cause (never the raw exception
-    // text) and offers NO agent hand-off: a hand-off would unmount the form
-    // the user is about to submit.
+    // text) and offers the agent hand-off: the form keeps what the user typed,
+    // so the navigation loses nothing.
     const notice = await screen.findByText(/request to read this computer's Kiro sign-in failed/i)
     expect(notice.textContent).not.toMatch(/whoami timed out/)
-    expect(screen.queryByRole('button', { name: /Ask the agent/i })).toBeNull()
+    const alert = notice.closest('[role="alert"]') as HTMLElement
+    expect(within(alert).getByRole('button', { name: /Ask the agent/i })).toBeInTheDocument()
     // Nothing is known about this computer's sign-in, so NO radio renders
     // checked and Launch waits for the user to pick: a checked Builder ID
     // beside a gate that says "choose" would read as a choice already made,
@@ -1905,5 +1943,57 @@ describe('RemoteCrewPanel per-crew enable toggle', () => {
     await userEvent.setup().click(await screen.findByRole('switch', { name: 'dev-box-1 enabled' }))
     await waitFor(() => expect(api.connectInstance).toHaveBeenCalledWith('m1'))
     expect(api.updateInstance).toHaveBeenCalledWith('m1', { disabled: false })
+  })
+})
+
+describe('RemoteCrewPanel enabled after the gateway started', () => {
+  it('says enabled-but-not-active and mutes Connect until the restart', async () => {
+    vi.mocked(api.listInstances).mockResolvedValue({ active: false, warm_set_cap: 5, instances: [MANUAL_INSTANCE] })
+    vi.mocked(api.cloudLaunches).mockResolvedValue({ jobs: [] })
+    renderWithProviders(<RemoteCrewPanel />)
+
+    expect(await screen.findByText('dev-box-1')).toBeInTheDocument()
+    const banner = screen.getByText(/not active yet/).closest('[role="status"]') as HTMLElement
+    // #22104: say where to run the command and what works after; no "tunnel manager".
+    expect(banner.textContent).toBe(
+      'Remote crew management is on, but not active yet. Run kirocrew restart in a terminal on the computer this dashboard runs on, not on a remote crew. Then you can connect to your remote crews.',
+    )
+    expect(screen.queryByText(/Disabled in config/)).not.toBeInTheDocument()
+
+    // #23692: the button must agree with the banner. While not active yet, Connect
+    // is disabled (so a click cannot fail) and says why, instead of looking ready.
+    const connect = screen.getByRole('button', { name: /^Connect$/i })
+    expect(connect).toBeDisabled()
+    expect(connect).toHaveAttribute('title', expect.stringMatching(/restart/i))
+    expect(api.connectInstance).not.toHaveBeenCalled()
+
+    // The banner stays the one place the restart command appears.
+    expect(screen.getAllByText(/not active yet/)).toHaveLength(1)
+    expect(screen.getAllByText('kirocrew restart')).toHaveLength(1)
+  })
+
+  it('maps a 503 instances_manager_unavailable Connect failure to the restart hint', async () => {
+    // Distinct from the muted-while-not-active case above: the list reports
+    // active:true (so Connect is enabled and clickable), but the gateway's
+    // instance manager is gone, so the connect route rejects 503. The row must
+    // show the keyed restart hint, not the raw "instances manager not running".
+    vi.mocked(api.listInstances).mockResolvedValue({ active: true, warm_set_cap: 5, instances: [MANUAL_INSTANCE] })
+    vi.mocked(api.cloudLaunches).mockResolvedValue({ jobs: [] })
+    vi.mocked(api.connectInstance).mockRejectedValue(
+      new ApiError(
+        503,
+        'instances manager not running: restart the gateway (kirocrew restart) to start remote crews',
+        JSON.stringify({ error: 'instances manager not running', code: 'instances_manager_unavailable' }),
+      ),
+    )
+    renderWithProviders(<RemoteCrewPanel />)
+
+    expect(await screen.findByText('dev-box-1')).toBeInTheDocument()
+    const connect = screen.getByRole('button', { name: /^Connect$/i })
+    expect(connect).toBeEnabled()
+    await userEvent.setup().click(connect)
+
+    const alert = await screen.findByText('Connect to m1 failed: the gateway needs a restart first. See the note below.')
+    expect(alert.textContent).not.toContain('instances manager not running')
   })
 })

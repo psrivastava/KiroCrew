@@ -21,7 +21,6 @@ from collections.abc import Collection, Iterable, Sized
 from pathlib import Path
 from typing import Any
 
-from kiro_crew.agent_sdk.mcp_refs import RESERVED_TOOL_NAMESPACES
 from kiro_crew.atomic_write import atomic_write, open_access_control_source
 from kiro_crew.config.paths import kiro_home
 from kiro_crew.user_json import loads_user_json
@@ -267,8 +266,10 @@ ALWAYS_ON_BIN_MCP_SERVERS = (
     "kirocrew-core",
     "kirocrew-computer",
     "kirocrew-guide",
+    "kirocrew-mate",
 )
 OPT_IN_BIN_MCP_SERVERS = (
+    "kirocrew-secrets",
     "kirocrew-dashboard",
     "kirocrew-work",
     "kirocrew-crew-log",
@@ -309,9 +310,13 @@ CONTROL_PLANE_SERVERS = ("kirocrew-core", "kirocrew-cron")
 # under that name, and anything found there is necessarily the user's own: to be
 # left alone, not reclaimed on a technicality about how it happens to be spelled.
 #
-# ``kirocrew-guide`` is always on but is left out too: no install method ever
-# wrote it to the global file, so an entry there is the user's own.
-STALE_MANAGED_MCP_SERVERS = frozenset(ALWAYS_ON_BIN_MCP_SERVERS) - {"kirocrew-guide"}
+# ``kirocrew-guide`` and ``kirocrew-mate`` are always on but are left out too:
+# no install method ever wrote either to the global file, so an entry there is
+# the user's own.
+STALE_MANAGED_MCP_SERVERS = frozenset(ALWAYS_ON_BIN_MCP_SERVERS) - {
+    "kirocrew-guide",
+    "kirocrew-mate",
+}
 
 
 def _predecessor_mcp_names() -> frozenset[str]:
@@ -564,6 +569,12 @@ def prune_dangling_tool_refs(
     servers = config.get("mcpServers")
     if not isinstance(servers, dict):
         return []
+    # Imported lazily so a module-level ``from kiro_crew.mcp_cleanup import ...``
+    # (e.g. in the per-session MCP stub) does not drag in ``agent_sdk`` and its
+    # subtree just to reach this one function. ``RESERVED_TOOL_NAMESPACES`` has
+    # no other reader in this module.
+    from kiro_crew.agent_sdk.mcp_refs import RESERVED_TOOL_NAMESPACES
+
     _base = set(servers) | RESERVED_TOOL_NAMESPACES
     known = {
         "tools": _base | set(declared),

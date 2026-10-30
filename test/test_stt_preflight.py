@@ -109,6 +109,22 @@ class TestHostFlags:
         assert "i8mm" not in flags
         assert "sve" not in flags
 
+    def test_reads_the_arm_features_line_through_the_shared_reader(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """AArch64 goes through `embeddings._linux_aarch64_cpu_features`, the one
+        `Features` parser this repository keeps, as x86 does through its reader."""
+        seen: list[Path] = []
+        sentinel = frozenset({"from-the-shared-reader"})
+
+        def shared(path: Path) -> frozenset[str]:
+            seen.append(path)
+            return sentinel
+
+        monkeypatch.setattr("kiro_crew.embeddings._linux_aarch64_cpu_features", shared)
+        assert _flags(tmp_path, _GRAVITON2_CPUINFO, "aarch64", monkeypatch) is sentinel
+        assert seen == [tmp_path / "cpuinfo"]
+
     def test_arm_features_are_intersected_across_cores(self, tmp_path: Path, monkeypatch) -> None:
         two = _GRAVITON2_CPUINFO + "processor\t: 1\nFeatures\t: fp asimd aes\n"
         flags = _flags(tmp_path, two, "aarch64", monkeypatch)
@@ -190,6 +206,40 @@ class TestProbeNative:
             extension=_EXT, runner=_runner(0xC000001D), read_host_flags=False
         )
         assert v.code == preflight.CODE_UNSUPPORTED_CPU
+
+    @pytest.mark.parametrize(
+        ("system", "returncode"), [("Windows", 0xC000001D), ("Linux", -4), ("Darwin", -4)]
+    )
+    def test_the_refusal_points_at_another_provider_not_another_build(
+        self, monkeypatch, system: str, returncode: int
+    ) -> None:
+        """No build for an older CPU is published, so the refusal must not send the
+        reader to install one; it names Transcribe, says that audio leaves the
+        host and is billed, and names Off."""
+        monkeypatch.setattr(preflight.platform, "system", lambda: system)
+        v = preflight.probe_native(
+            extension=_EXT, runner=_runner(returncode), read_host_flags=False
+        )
+        assert v.code == preflight.CODE_UNSUPPORTED_CPU
+        assert "install a build" not in v.detail
+        assert "Amazon Transcribe" in v.detail
+        assert "sends the audio to AWS" in v.detail
+        assert "bills" in v.detail
+        assert "stt.provider" in v.detail
+        assert "stt.enabled" in v.detail
+        # A source rebuild is offered on every OS, scoped to a pip install: a
+        # desktop app's bundled interpreter is not one a user rebuilds into.
+        assert "installed with pip rather than the desktop app" in v.detail
+        assert "rebuild the speech runtime from source" in v.detail
+
+    def test_a_build_the_host_lacks_features_for_gets_the_same_remedy(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        flags = _flags(tmp_path, _BROADWELL_CPUINFO, "x86_64", monkeypatch)
+        v = preflight.probe_native(extension=_EXT, runner=_runner(0, _AVX512_BUILD), flags=flags)
+        assert v.code == preflight.CODE_UNSUPPORTED_CPU
+        assert "install a build" not in v.detail
+        assert v.detail.endswith(preflight._UNSUPPORTED_CPU_REMEDY)
 
     def test_another_fatal_signal_gets_its_own_code(self) -> None:
         v = preflight.probe_native(extension=_EXT, runner=_runner(-11), read_host_flags=False)

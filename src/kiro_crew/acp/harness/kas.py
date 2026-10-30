@@ -1,6 +1,11 @@
-"""The KAS relay, reached through kiro-cli's own ACP transport.
+"""The KAS engine: through kiro-cli's own ACP relay, or from Crew's own bundle.
 
-KAS shares kiro-cli's binary, but reports MCP readiness through session-scoped
+Two spawn routes, one harness. By default KAS shares kiro-cli's binary (the
+relay, :mod:`kiro_crew.acp.kas_transport`). With ``agent.kas_bundle`` on, the
+harness spawns the engine ``kirocrew kas install`` laid down under the data
+home (:mod:`kiro_crew.acp.kas_bundle`) with its own Node runtime, and no
+kiro-cli is involved. Every seam after the spawn is identical: the wire is the
+engine's either way. KAS reports MCP readiness through session-scoped
 ``_kiro/mcp/status`` and ``_kiro/tools/didChange`` snapshots.
 
 It takes no ``--agent`` flag, so the agent definition travels on every session
@@ -14,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import sys
 from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
@@ -25,6 +31,7 @@ from typing import Any
 # stub. Only the exception type is bound directly -- an exception class is
 # compared by identity, never substituted.
 from kiro_crew import agent as agent_mod
+from kiro_crew import sandbox as sandbox_mod
 from kiro_crew.acp import kas_agents as kas_agents_mod
 from kiro_crew.acp._dispatch import advertised_mode_origin
 from kiro_crew.acp.child_env_defaults import apply_child_env_defaults
@@ -42,7 +49,11 @@ from kiro_crew.acp.harness.base import (
 )
 from kiro_crew.acp.kas_agents import KasAgentTranslationError
 from kiro_crew.acp.kas_host_auth import answer_get_access_token, vault_holds_identity_off_loop
-from kiro_crew.acp.kas_transport import METHOD_KAS_AUTH_GET_ACCESS_TOKEN, build_kas_argv
+from kiro_crew.acp.kas_transport import (
+    METHOD_KAS_AUTH_GET_ACCESS_TOKEN,
+    build_kas_argv,
+    build_kas_bundle_argv,
+)
 from kiro_crew.acp.session_mcp import project_agent_spec
 from kiro_crew.acp.types import (
     ACP_BACKEND_KAS,
@@ -54,16 +65,94 @@ from kiro_crew.acp.types import (
 )
 from kiro_crew.agent import ForkGovernanceUnresolved
 from kiro_crew.config import paths as paths_mod
-from kiro_crew.kiro_cli import chat_sibling
+from kiro_crew.kiro_cli import chat_sibling, installed_kiro_cli_version
+from kiro_crew.mate_worker import MATE_WORKER_AGENT
 from kiro_crew.mcp_gateway import session_servers as session_servers_mod
+from kiro_crew.platform.tool_names import kas_verified_releases, kas_vocabulary_drift
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["PROTOCOL_VERSION_KAS", "KasHarness", "resolve_projected_spec"]
+__all__ = [
+    "PROTOCOL_VERSION_KAS",
+    "KasHarness",
+    "resolve_projected_spec",
+    "warn_kas_vocabulary_drift",
+]
+
+#: The kiro-cli release the tool-vocabulary drift warning was last logged for in
+#: this process, ``None`` before the first. One slot, not a set: the warning is
+#: said once per release, and the release a gateway sees changes only when
+#: kiro-cli is upgraded under it, so the slot is what "once per release" needs
+#: and is bounded by its own shape.
+_DRIFT_WARNED_VERSION: tuple[int, int, int] | None = None
+
+#: Oldest kiro-cli whose KAS applies a ``customAgents`` prompt: 2.33.1 ships KAS
+#: 0.66.58 (``kas/worker-kit-live.jsonl``, ``kas/markdown-agent-live.jsonl``).
+#: KAS 0.66.43 (kiro-cli 2.32.0) dropped the prompt of every custom agent.
+KAS_AGENT_PROMPT_MIN_KIRO_CLI: tuple[int, int, int] = (2, 33, 1)
+
+
+def kas_agent_prompt_issue(version: tuple[int, int, int] | None) -> str:
+    """The upgrade notice for a relay-route KAS on kiro-cli *version*, or ``""``.
+
+    Warn, never refuse: the chat still runs, without the agent's own prompt. An
+    unknown version says nothing, as for the steer floor (``steer_version_issue``).
+    """
+    if version is None or version >= KAS_AGENT_PROMPT_MIN_KIRO_CLI:
+        return ""
+    installed, minimum = (".".join(map(str, v)) for v in (version, KAS_AGENT_PROMPT_MIN_KIRO_CLI))
+    return (
+        f"kiro-cli {installed} is older than {minimum}, so KAS drops this agent's own "
+        "prompt and the chat runs without it. Update it: run 'kiro-cli update', "
+        "then restart Kiro Crew."
+    )
+
+
+def warn_kas_vocabulary_drift(version: tuple[int, int, int] | None) -> None:
+    """Say once per kiro-cli release, at KAS spawn, that the installed kiro-cli
+    is not one the KAS tool-vocabulary tables were measured on.
+
+    The mount direction fails silent on an id a different engine does not
+    recognise and the policy direction fails permissive on one the tables do
+    not know, so an operator relying on kiro-cli-spelled denies binding on KAS
+    should see the drift where sessions start, not only in a doctor command
+    they must run by hand. Same comparison as the doctor row
+    (``kas_vocabulary_drift``), on the same reading (the pinned binary's own
+    ``--version``: KAS reports no ``agentInfo.version`` on the wire). Lives on
+    this harness and nowhere shared (H13): the tables describe KAS only. An
+    unknown version is the doctor's "unknown" and says nothing.
+    """
+    global _DRIFT_WARNED_VERSION
+    drift = kas_vocabulary_drift(version)
+    if version is None or drift in ("", "unknown") or version == _DRIFT_WARNED_VERSION:
+        return
+    _DRIFT_WARNED_VERSION = version
+    logger.warning(
+        "kas backend: installed kiro-cli %s is %s the releases the KAS tool-name tables were "
+        "verified on (%s); a renamed, added or absent built-in would mount or be governed "
+        "under a name Crew does not know (kirocrew doctor reports the same; re-measure per "
+        "test/fixtures/kas_builtin_tool_ids.json and append the release to its "
+        "verified_kiro_cli_versions)",
+        ".".join(str(p) for p in version),
+        {"older": "older than", "newer": "newer than", "unverified": "not among"}[drift],
+        kas_verified_releases(),
+    )
+
 
 #: KAS numbers ACP revisions. It rejects the date-string spelling kiro-cli takes,
 #: so the TYPE here is part of the contract, not an encoding detail.
 PROTOCOL_VERSION_KAS = 1
+
+#: What a bundle spawn is logged under. The argv's program is a Node binary, which
+#: names no engine at all; this does.
+KAS_BUNDLE_SPAWN_LABEL = "kas-bundle"
+
+
+def _bundle_route_selected() -> bool:
+    """``agent.kas_bundle`` as configured. Blocking (reads config); call off the loop."""
+    from kiro_crew.config.loader import KiroCrewConfig
+
+    return bool(KiroCrewConfig.load().agent.kas_bundle)
 
 
 def _is_operator_override(binary: str, environ: Mapping[str, str]) -> bool:
@@ -114,12 +203,67 @@ def resolve_projected_spec(
 
     A project-only spec that exists but cannot be read raises
     :class:`KasAgentTranslationError`: there is no other spec of that name to run.
+    A name no spec declares at either level raises its subclass
+    :class:`~kiro_crew.acp.kas_agents.KasAgentSpecAbsent`, so a caller can say
+    what is missing rather than quote a failed file open.
     """
+    from kiro_crew.agent_files import is_mate_service_agent
+
+    if is_mate_service_agent(agent):
+        # The mate conductor and worker are generated into the crewmate folder,
+        # not the user level (``agent_files.MATE_SERVICE_AGENT_FILENAMES``), and
+        # read there FIRST: a spec an older build left at the user level is not
+        # the one the gateway governs.
+        service_dir = paths_mod.mate_agents_dir()
+        if not kas_agents_mod.agent_spec_absent(service_dir, agent):
+            return kas_agents_mod.load_agent_spec(service_dir, agent), service_dir
     if not kas_agents_mod.agent_spec_absent(agents_dir, agent):
-        return kas_agents_mod.load_agent_spec(agents_dir, agent), agents_dir
+        # A user-level template Crew does not own gets the servers the user approved
+        # for it merged here, at spawn, and never written into its file
+        # (``template_mcp_additions.merge_at_spawn``; a Crew-owned spec already
+        # carries them from its installer, so it comes back unchanged).
+        from kiro_crew.template_mcp_additions import merge_at_spawn
+
+        spec = merge_at_spawn(agent, kas_agents_mod.load_agent_spec(agents_dir, agent))
+        return spec, agents_dir
+    # Crewmate scope. A name the user level does NOT declare may be a crewmate's
+    # own config in ``~/.kiro/mates/agents/`` (``rfc-mate-owned-agent-config``
+    # §5.3): resolution reads this folder, the session agent picker does not, so
+    # the folder is the privacy boundary. It is a full custom-agent spec Crew
+    # wrote, trusted like a user-level one (not key-restricted like the untrusted
+    # project checkout below) because the governance ceiling re-applies at
+    # projection regardless. Checked BEFORE the project scope so a crewmate id
+    # never resolves to a same-named spec a checkout happens to carry; its prompt
+    # anchors to the crewmate folder.
+    mate_dir = paths_mod.mate_agents_dir()
+    if not kas_agents_mod.agent_spec_absent(mate_dir, agent):
+        from kiro_crew.mate_worker import drop_partial_platform_servers
+
+        mate_spec = kas_agents_mod.load_agent_spec(mate_dir, agent)
+        # A platform server switched on with no transport is never launched from
+        # here: the gateway supplies that server.
+        drop_partial_platform_servers(mate_spec)
+        # Trusted like a user-level spec, so its approved additions merge here too.
+        from kiro_crew.template_mcp_additions import merge_at_spawn
+
+        return merge_at_spawn(agent, mate_spec), mate_dir
     declared, project = project_agent_spec(agent, work_dir)
+    # Every branch below hands its spec through ``merge_at_spawn``: the servers the
+    # user approved for this template reach whichever spec KAS is given.
+    from kiro_crew.template_mcp_additions import merge_at_spawn
+
     if not declared:
-        return kas_agents_mod.load_agent_spec(agents_dir, agent), agents_dir
+        try:
+            return (
+                merge_at_spawn(agent, kas_agents_mod.load_agent_spec(agents_dir, agent)),
+                agents_dir,
+            )
+        except KasAgentTranslationError as exc:
+            # Asked again after the read failed, so a spec that appeared meanwhile
+            # and cannot be read keeps its own reason.
+            if kas_agents_mod.agent_spec_absent(agents_dir, agent):
+                raise kas_agents_mod.KasAgentSpecAbsent(agent, agents_dir) from exc
+            raise
     if project is None:
         raise KasAgentTranslationError(
             f"agent {agent!r} is declared by {work_dir}/.kiro/agents but that spec is unreadable"
@@ -142,9 +286,119 @@ def resolve_projected_spec(
             ", ".join(dropped),
         )
     spec = {k: project[k] for k in PROJECT_SPEC_HONOURED_KEYS if k in project}
+    # The checkout's keys are filtered above; the approved additions come from the
+    # user's own record, never from the checkout. The checkout's switch-off keys for
+    # an approved server (a mute, switched-off tools) are kept, and only those, and
+    # are layered onto the servers that one merge produced, so the record is read
+    # once and a server approved meanwhile cannot launch unmuted.
+    from kiro_crew.acp.session_mcp import _project_restrictions
+
+    spec = merge_at_spawn(agent, spec)
+    merged = spec.get("mcpServers")
+    if isinstance(merged, dict):
+        for name, kept in _project_restrictions(project).items():
+            if isinstance(merged.get(name), dict):
+                merged[name] = {**merged[name], **kept}
     if work_dir is None:  # unreachable: ``project_agent_spec`` declares nothing without one
         return spec, agents_dir
     return spec, paths_mod.project_agents_dir(work_dir)
+
+
+def _skill_scope_rules(
+    agent: str,
+    spec: dict[str, Any],
+    spec_dir: Path,
+    work_dir: str | Path | None,
+) -> tuple[dict[str, Any], ...]:
+    """The ``skill`` deny rules that give this KAS session its kiro-cli skill set.
+
+    KAS loads ``~/.kiro/skills`` and the workspace's ``.kiro/skills`` for every
+    session on top of the agent's ``resources``; kiro-cli under Crew loads only the
+    scope Crew resolves (``acp/kas_skill_scope.py``). A failure here costs the
+    narrowing, never the session: the extra skills are the user's own, and a
+    session that fails to start over them loses more than it protects.
+    """
+    from kiro_crew.acp import kas_skill_scope
+
+    try:
+        globs = kas_skill_scope.scope_globs(agent, spec, agents_dir=spec_dir, work_dir=work_dir)
+        return tuple(kas_skill_scope.skill_scope_rules(globs, work_dir=work_dir))
+    except Exception:  # see the docstring: degrade to the unscoped catalog
+        logger.warning(
+            "KAS skill scope for %r failed; the session loads KAS's default skill trees",
+            agent,
+            exc_info=True,
+        )
+        return ()
+
+
+def mate_worker_projection(
+    base: dict[str, Any], prompt_dir: Path, session_key: str
+) -> dict[str, Any]:
+    """The worker spec a crewmate's worker session on *session_key* is handed.
+
+    *base* is the source-defined ``kirocrew-mate-worker`` spec. KAS's own part is
+    the prompt, resolved the way KAS resolves every prompt; the kit is the
+    harness-neutral seam :func:`kiro_crew.mate_worker.worker_session_spec`, which
+    reads the crewmate from the session's own execution record. Blocking file
+    I/O; runs inside the projection's worker thread.
+    """
+    from kiro_crew.mate_worker import worker_session_spec
+
+    literal = dict(base)
+    literal["prompt"] = kas_agents_mod.resolve_prompt(
+        base, agent_id=MATE_WORKER_AGENT, agents_dir=prompt_dir
+    )
+    return worker_session_spec(literal, session_key)
+
+
+def _missing_agent_reason(agent: str, session_key: str) -> str:
+    """The reason a session cannot start on *agent*, which has no spec, for the user.
+
+    Names the Crew Member when *session_key* is one's DM thread, and the app the
+    agent came from when an installed app declares it (``apps.manager``). Blocking
+    file I/O, so it runs inside the projection's worker thread; it never raises,
+    because the reason replaces an error that is already being raised.
+    """
+    from kiro_crew.apps.manager import missing_agent_reason
+
+    member = ""
+    try:
+        from kiro_crew.config import KiroCrewConfig
+        from kiro_crew.members import member_identity_for_session
+
+        identity = member_identity_for_session(session_key)
+        if identity is not None:
+            row = KiroCrewConfig.load().agents.get(identity["name"])
+            member = (row.display_name if row is not None else "") or identity["name"]
+    except Exception:  # noqa: BLE001 - the member name is a label, never a gate
+        logger.debug("no member label for a missing agent %r", agent, exc_info=True)
+    try:
+        return missing_agent_reason(agent, member=member)
+    except Exception:  # noqa: BLE001 - same: fall back to the plain reason
+        logger.debug("no owner lookup for a missing agent %r", agent, exc_info=True)
+        return f'The agent "{agent}" can\'t start: its agent definition is missing.'
+
+
+def _kiro_cli_sandbox_owns_relay() -> bool:
+    """Whether kiro-cli's internal sandbox confines a KAS relay spawn on this host.
+
+    macOS only, while kiro-cli's switch is on: there the relay starts its seatbelt
+    before it spawns the KAS server, and nesting it inside Crew's seatbelt is the
+    EPERM that stops every session before ``initialize``.
+
+    Never on Windows, although ``wrap_argv`` hands the ``kiro`` backend to kiro-cli
+    there. Measured on Windows Server 2022 with kiro-cli 2.35.1 (KAS 0.66.70), with
+    the switch on and with it off: the relay spawned KAS as ``node ...
+    acp-server.js --transport=stdio --auth=acp-callback`` with no ``--sandbox``,
+    and the node process ran as the relay's own user and integrity level, with no
+    AppContainer and no restricted token, the same both ways. kiro-cli's Windows
+    sandbox is a launcher for tool commands that needs an elevated pool
+    registration first; it does not confine the KAS process. Claiming it would
+    audit an unconfined child as ``delegated`` and lift the no-backend refusal an
+    operator may have pinned. Reads the settings file, so call it off the loop.
+    """
+    return sys.platform == "darwin" and sandbox_mod.kiro_internal_sandbox_enabled()
 
 
 class KasHarness(MembershipHarness):
@@ -152,30 +406,81 @@ class KasHarness(MembershipHarness):
 
     backend = ACP_BACKEND_KAS
 
+    #: :func:`kas_agent_prompt_issue` for the process this harness last spawned:
+    #: set at each spawn, so it describes the engine running, not the one on disk.
+    agent_prompt_notice = ""
+
     # ── Seam 1: spawn ──
 
     async def resolve_spawn(self, ctx: SpawnContext) -> SpawnPlan:
-        """``kiro-cli`` in relay mode, with the auth owner decided per spawn.
+        """The engine's argv, on whichever route ``agent.kas_bundle`` selects.
 
-        No ``--agent`` and no ``--model``: KAS takes custom agents over the wire
-        in ``session/new``, not from a flag.
+        No ``--agent`` and no ``--model`` on either route: KAS takes custom agents
+        over the wire in ``session/new``, not from a flag.
 
-        Crew owns the credential when its own vault holds a signed-in identity,
-        and kiro-cli owns it otherwise. Deciding that per spawn is what makes a
-        dashboard sign-in or sign-out take effect on the next process, and the
-        answer rides on the plan so the reader loop answers the engine's callback
-        only on a process that was started expecting it to.
+        **Bundle** (``agent.kas_bundle`` true): Crew's own installed engine and
+        Node runtime, spawned directly. Crew is the auth owner unconditionally --
+        there is no kiro-cli whose store could answer instead -- so the plan
+        carries ``host_auth=True`` whatever the vault holds; an empty vault is the
+        engine's own sign-in failure at prompt time, which the runtime already
+        maps to a sign-in prompt. Nothing installed is a refusal that names the
+        install command, not a fallback to the relay: the operator chose the
+        route, and silently running a different one would make a kiro-cli
+        problem look like a bundle problem (or the reverse).
+
+        **Relay** (default): ``kiro-cli`` in relay mode. Crew owns the credential
+        when its own vault holds a signed-in identity, and kiro-cli owns it
+        otherwise. Deciding that per spawn is what makes a dashboard sign-in or
+        sign-out take effect on the next process, and the answer rides on the plan
+        so the reader loop answers the engine's callback only on a process that
+        was started expecting it to.
         """
         from kiro_crew.acp.client import _resolve_kiro_bin_for_spawn, kiro_cli_not_found_message
+        from kiro_crew.acp.kiro_cli_missing import AcpKiroCliMissing
         from kiro_crew.acp.session_handle import AcpRuntimeError
+
+        if await asyncio.to_thread(_bundle_route_selected):
+            # Imported here, not at module top: the installer module is the
+            # bundle route's alone, and this harness is imported on every KAS
+            # gateway whether or not that route is on.
+            from kiro_crew.acp import kas_bundle as kas_bundle_mod
+
+            bundle = await asyncio.to_thread(kas_bundle_mod.installed_bundle)
+            if bundle is None:
+                raise AcpRuntimeError(
+                    "agent.kas_bundle is on but no KAS engine bundle is installed under "
+                    f"{kas_bundle_mod.kas_engines_root()}. Run `kirocrew kas install`, or "
+                    "set agent.kas_bundle to false to use kiro-cli's relay."
+                )
+            logger.info(
+                "KAS auth owner=crew — spawning Crew's own engine bundle %s (node %s, agent=%s)",
+                bundle.version,
+                bundle.node_version or "?",
+                ctx.agent or "<none>",
+            )
+            # Crew's own engine: kiro-cli's release says nothing about it.
+            self.agent_prompt_notice = ""
+            return SpawnPlan(
+                argv=build_kas_bundle_argv(str(bundle.node_bin), str(bundle.acp_server)),
+                spawn_label=KAS_BUNDLE_SPAWN_LABEL,
+                stderr_label=KAS_BUNDLE_SPAWN_LABEL,
+                host_auth=True,
+            )
 
         kas_bin = await _resolve_kiro_bin_for_spawn(environ=dict(ctx.environ), home=ctx.home)
         if not kas_bin:
-            raise AcpRuntimeError(
+            raise AcpKiroCliMissing(
                 await asyncio.to_thread(
                     kiro_cli_not_found_message, environ=dict(ctx.environ), home=ctx.home
                 )
             )
+
+        # The vocabulary tables were measured on named releases; say so once per
+        # release when this is not one of them. Off the loop: one bounded
+        # ``--version`` spawn on the first call per binary, cached thereafter.
+        kiro_cli_version = await asyncio.to_thread(installed_kiro_cli_version)
+        warn_kas_vocabulary_drift(kiro_cli_version)
+        self.agent_prompt_notice = kas_agent_prompt_issue(kiro_cli_version)
 
         # Reads the vault off the loop and never raises.
         host_auth = await vault_holds_identity_off_loop()
@@ -202,7 +507,26 @@ class KasHarness(MembershipHarness):
                 os.path.basename(kas_bin),
                 ctx.agent or "<none>",
             )
-        return SpawnPlan(argv=build_kas_argv(kas_bin, host_auth=host_auth), host_auth=host_auth)
+        # Both relay entries (the launcher and the chat binary) are kiro-cli, so on
+        # macOS with its switch on, kiro-cli's seatbelt confines this process. Read
+        # per spawn, off the loop, like the switch itself. The bundle route above
+        # runs Node with no kiro-cli in the chain and never says so.
+        kiro_cli_sandbox = await asyncio.to_thread(_kiro_cli_sandbox_owns_relay)
+        if kiro_cli_sandbox:
+            # A delegated spawn never passes Crew's launcher, so its seals on the kiro
+            # agents tree, the data-home config leaves and the install tree do not
+            # hold; a workspace overlapping one is refused here, as the Kiro harness
+            # refuses it. Off the loop: it stats both sides.
+            overlap = await asyncio.to_thread(
+                sandbox_mod.delegated_workspace_exposes_sealed_target, ctx.work_dir
+            )
+            if overlap:
+                raise AcpRuntimeError(overlap)
+        return SpawnPlan(
+            argv=build_kas_argv(kas_bin, host_auth=host_auth),
+            host_auth=host_auth,
+            kiro_cli_internal_sandbox=kiro_cli_sandbox,
+        )
 
     def apply_spawn_env(
         self,
@@ -272,8 +596,18 @@ class KasHarness(MembershipHarness):
         handle.kas_auto_approved = kas_agents_mod.projected_auto_approved(
             custom_agents, active_agent
         )
+        # The built-ins the batch kept at ``ask`` that the spec granted: the
+        # session's permission requests for them are answered by Crew's gate
+        # after its own checks (``spec-builtin-grant`` tier).
+        handle.kas_crew_answered = kas_agents_mod.projected_crew_answered(
+            custom_agents, active_agent
+        )
+        handle.kas_crew_answered_commands = kas_agents_mod.projected_crew_answered_commands(
+            custom_agents, active_agent
+        )
         handle.kas_projected_agent = active_agent if custom_agents else ""
         handle.kas_registered_agents = list(custom_agents) if custom_agents else []
+        handle.kas_agent_prompt_notice = self.agent_prompt_notice if custom_agents else ""
 
     async def session_extras(
         self,
@@ -298,12 +632,18 @@ class KasHarness(MembershipHarness):
         failed translation would leave the session on KAS's own default mode,
         which for a restricted agent is a BROADER agent than the caller asked for.
         """
-        from kiro_crew.acp.session_handle import AcpRuntimeError
+        from kiro_crew.acp.session_handle import AcpAgentUnavailable, AcpRuntimeError
+        from kiro_crew.agent_sdk import kas_model_catalog
 
+        # The account this session's request will go out under: the engine takes
+        # its credential from the vault per call, so the ``model`` select it
+        # answers with is this account's catalog. Read before anything else, off
+        # the loop, and carried on the payload for the catalog recorder.
+        vault_identity = await asyncio.to_thread(kas_model_catalog.vault_identity)
         if not agent:
-            return SessionExtras()
+            return SessionExtras(vault_identity=vault_identity)
 
-        def _build() -> tuple[list[dict[str, Any]], Any]:
+        def _build() -> tuple[list[dict[str, Any]], Any, dict[str, Any]]:
             agent_mod.require_fork_governance(agent, work_dir)
             try:
                 agent_mod.ensure_agent_materialized(agent)
@@ -329,10 +669,43 @@ class KasHarness(MembershipHarness):
             # second read is removed rather than re-verified. Every other agent mirrors
             # nothing, has no snapshot, and is resolved nearest-first here.
             agents_dir = paths_mod.kiro_agents_dir()
+            # A session bound to an app's own agent projects that app's registered
+            # file, read by its path; a bound file that is gone refuses the session
+            # instead of falling back to a checkout's spec of the same name.
+            from kiro_crew.apps.agent_launch import AppAgentLaunchError, read_bound_app_spec
+
+            try:
+                bound = read_bound_app_spec(session_key, agent)
+            except AppAgentLaunchError as exc:
+                raise AcpAgentUnavailable(exc.detail, agent=agent) from exc
             if snapshot is not None and snapshot.spec is not None:
                 spec, prompt_dir = snapshot.spec, agents_dir
+            elif bound is not None:
+                from kiro_crew.template_mcp_additions import merge_at_spawn
+
+                spec, prompt_dir = merge_at_spawn(agent, bound), agents_dir
             else:
-                spec, prompt_dir = resolve_projected_spec(agents_dir, agent, work_dir)
+                try:
+                    spec, prompt_dir = resolve_projected_spec(agents_dir, agent, work_dir)
+                except kas_agents_mod.KasAgentSpecAbsent as exc:
+                    # Nothing defines the agent, so name what removed it (an app
+                    # switched off, usually) and the fix, rather than a file open
+                    # that failed. Still a refusal: there is no spec to run.
+                    raise AcpAgentUnavailable(
+                        _missing_agent_reason(agent, session_key), agent=agent
+                    ) from exc
+            if agent == MATE_WORKER_AGENT:
+                # A crewmate's worker: its source base plus that crewmate's own
+                # additions, governed as one spec, with its prompt as literal
+                # text that anchors to no directory.
+                from kiro_crew.mate_worker import WorkerKitUnreadable
+
+                try:
+                    spec = mate_worker_projection(spec, prompt_dir, session_key)
+                except WorkerKitUnreadable as exc:
+                    # Refused, never the bare base: what could not be read may
+                    # hold the crewmate's own limits.
+                    raise AcpAgentUnavailable(str(exc), agent=agent) from exc
             try:
                 # A session-injected server outranks an agent-declared one, so
                 # declaring both is a double registration. Only the caller holds
@@ -380,22 +753,30 @@ class KasHarness(MembershipHarness):
             # registered and reads nothing -- so the check that proves the consumed spec
             # did not change has to compare against this snapshot rather than against a
             # fresh read of the file.
-            return (
-                kas_agents_mod.build_kas_custom_agents(
-                    prompt_dir,
-                    agent,
-                    spec,
-                    stub_server_names=stubbed,
-                    member_dispatch=member_dispatch,
-                    crew_panel=crew_panel,
-                    session_key=session_key,
-                ),
-                snapshot,
+            custom_agents = kas_agents_mod.build_kas_custom_agents(
+                prompt_dir,
+                agent,
+                spec,
+                stub_server_names=stubbed,
+                member_dispatch=member_dispatch,
+                crew_panel=crew_panel,
+                session_key=session_key,
+                skill_scope_rules=_skill_scope_rules(agent, spec, prompt_dir, work_dir),
             )
+            # Resolved HERE, in this thread, for the runtime's hoist: the managed
+            # launch it stamps the session token onto comes from the ``kirocrew``
+            # launcher lookup, which probes the filesystem and PATH.
+            managed = kas_agents_mod.resolve_managed_entries(custom_agents, agent)
+            return custom_agents, snapshot, managed
 
         try:
-            built, built_from = await asyncio.to_thread(_build)
-            return SessionExtras(custom_agents=built, derived_spec_snapshot=built_from)
+            built, built_from, managed_entries = await asyncio.to_thread(_build)
+            return SessionExtras(
+                custom_agents=built,
+                derived_spec_snapshot=built_from,
+                vault_identity=vault_identity,
+                managed_entries=managed_entries,
+            )
         except ForkGovernanceUnresolved as exc:
             raise AcpRuntimeError(str(exc)) from exc
         except KasAgentTranslationError as exc:
@@ -444,9 +825,9 @@ class KasHarness(MembershipHarness):
             origin,
         )
         return (
-            f"Rename this crewmate's template: “{agent}” is reserved for a built-in "
-            "agent, so the crewmate's own prompt and tools would not run under it. "
-            "Both fixes are on the crewmate's Agent Template tab: for the crewmate's own "
+            f"Rename this mate's template: “{agent}” is reserved for a built-in "
+            "agent, so the mate's own prompt and tools would not run under it. "
+            "Both fixes are on the mate's Agent Template tab: for the mate's own "
             "copy, 'Save as new template…' under another name (it keeps its "
             "customizations) or 'Reset my changes'; for a shared template, the template "
             "picker at the top of the tab."

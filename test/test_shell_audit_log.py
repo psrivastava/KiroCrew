@@ -30,6 +30,7 @@ from kiro_crew.shell_audit_log import (
     rotate_shell_audit_log,
     shell_audit_log_path,
 )
+from kiro_crew.testing.wait import finished
 
 # One record in the shape the bundled hook writes: a single line -- a UTC stamp,
 # then " BASH: ", then the hook-event payload kiro-cli hands the hook on stdin
@@ -238,6 +239,7 @@ _OTHER_TICK_STEPS = (
     "_sweep_session_roots",
     "_sweep_sandbox_artifacts",
     "_sweep_session_pid_mappings",
+    "_sweep_session_token_mappings",
     "_sweep_member_pid_bindings",
     "_maybe_prune_pycache",
     "_sweep_periodic_pids",
@@ -259,7 +261,9 @@ def _service(shutdown: _Shutdown, rotate: Any, pool: ThreadPoolExecutor) -> Any:
         cleanup_orphaned_session_roots=lambda: 0,
         cleanup_stale_sandbox_profiles=lambda: 0,
         prune_session_pid_mappings=lambda: 0,
+        prune_session_token_mappings=lambda: 0,
         prune_member_pid_bindings=lambda: 0,
+        sweep_session_staging_temps=lambda: 0,
         rotate_shell_audit_log=rotate,
         prune_pycache=lambda: (0, 0),
         collect_active_pids=lambda sessions: (set(), True),
@@ -322,7 +326,7 @@ async def test_every_cleanup_tick_rotates_the_audit_log_off_the_loop() -> None:
             patch.object(SessionCleanup, "_adopt_idle_policy", adopt),
             patch.multiple(SessionCleanup, **{name: AsyncMock() for name in _OTHER_TICK_STEPS}),
         ):
-            await asyncio.wait_for(service._run_cleanup_ticks(0.01), timeout=10)
+            await finished(service._run_cleanup_ticks(0.01), "the tick loop stopping on shutdown")
     finally:
         pool.shutdown(wait=True)
 
@@ -355,7 +359,7 @@ async def test_a_rotation_that_raises_does_not_end_the_tick() -> None:
             patch.object(SessionCleanup, "_adopt_idle_policy", adopt),
             patch.multiple(SessionCleanup, **{name: AsyncMock() for name in _OTHER_TICK_STEPS}),
         ):
-            await asyncio.wait_for(service._run_cleanup_ticks(0.01), timeout=10)
+            await finished(service._run_cleanup_ticks(0.01), "the tick loop stopping on shutdown")
     finally:
         pool.shutdown(wait=True)
 

@@ -18,7 +18,6 @@ from slack_sdk.web import WebClient
 
 from kiro_crew import platform_compat, slack_manifest
 from kiro_crew.acp.client import KIRO_CLI_BIN
-from kiro_crew.atomic_write import atomic_write
 from kiro_crew.cli_chat import _ensure_default_agent_in_config
 from kiro_crew.config import KiroCrewConfig
 from kiro_crew.config.loader import (
@@ -37,17 +36,20 @@ from kiro_crew.config.loader import (
     normalize_workspace_path,
     read_config_text,
     read_env_text,
+    resolve_env_credential,
     unsandboxed_exec_declared,
     unsandboxed_exec_platform_default,
     update_config_locked,
 )
 from kiro_crew.constants import MIN_NODE_VERSION, format_node_version
 from kiro_crew.dashboard.urls import _resolve_hostname_bounded
+from kiro_crew.hidden_leaf_staging import EnvStagingRefused, publish_env
 from kiro_crew.sandbox import unavailable_kind
 from kiro_crew.secrets.migrate import _env_lock_path
 from kiro_crew.security import redact
 from kiro_crew.sel import sel
 from kiro_crew.skills import remove_retired_conductor_skill
+from kiro_crew.subprocess_utf8 import UTF8_TEXT
 from kiro_crew.validation import USER_ID_RE
 
 
@@ -71,8 +73,22 @@ def _get_alias() -> str:
     return alias
 
 
+def _manifest_features() -> frozenset[str]:
+    """The Slack Code switches the saved config turns on (none if it cannot load).
+
+    The CLI renders the SAME manifest the dashboard serves for this install, so an
+    existing app updated from either one asks Slack for the same scopes.
+    """
+    from kiro_crew.slack.features import manifest_features
+
+    try:
+        return manifest_features(KiroCrewConfig.load())
+    except Exception:
+        return frozenset()
+
+
 def _manifest(alias: str | None = None, output: str | None = None, url: bool = False) -> None:
-    """Render slack-manifest.yaml with the user's alias substituted."""
+    """Render slack-manifest.yaml with the user's alias and Slack Code switches."""
 
     alias = alias or _get_alias()
     if not slack_manifest.valid_alias(alias):
@@ -82,21 +98,32 @@ def _manifest(alias: str | None = None, output: str | None = None, url: bool = F
             file=sys.stderr,
         )
         sys.exit(1)
+    features = _manifest_features()
     try:
-        rendered = slack_manifest.render(alias)
+        rendered = slack_manifest.render(alias, features=features)
     except FileNotFoundError:
         print("❌ Cannot find slack-manifest.yaml", file=sys.stderr)
         sys.exit(1)
+    command = slack_manifest.slash_command(alias)
+    switches = ", ".join(f"slack.{f}" for f in slack_manifest.FEATURES if f in features)
+    hint = (
+        f"   Slash command: /{command} — the gateway answers it once slack.command matches:\n"
+        f"   kirocrew config set slack.command {command}\n"
+        f"   Slack Code switches rendered: {switches or 'none'}\n"
+    )
     if url:
         print("\n🔗 Click to create your Slack app:\n")
-        print(f"{slack_manifest.deep_link(alias)}\n")
+        print(f"{slack_manifest.deep_link(alias, features)}\n")
+        print(hint)
     elif output:
         out = Path(output)
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(rendered, encoding="utf-8")
         print(f"✅ Manifest written to {output} (name: KiroCrew-{alias})")
+        print(hint)
     else:
         print(rendered)
+        print(hint, file=sys.stderr)
 
 
 def _fix_shell_profiles() -> None:
@@ -194,6 +221,15 @@ def _find_electron_dir() -> Path | None:
     return None
 
 
+def _print_no_desktop_sources() -> None:
+    print("  ⚠️  Desktop app sources not found, so there is nothing to build.")
+    print("     If you are running the packaged desktop app, you already have it.")
+    print(
+        "     To build it from source, run setup from a source checkout "
+        "or run `make desktop` there."
+    )
+
+
 def _setup_electron() -> None:
     """Build and install the KiroCrew desktop app (macOS only)."""
     if platform.system() != "Darwin":
@@ -202,12 +238,7 @@ def _setup_electron() -> None:
 
     electron_dir = _find_electron_dir()
     if electron_dir is None:
-        print("  ⚠️  Desktop app sources not found, so there is nothing to build.")
-        print("     If you are running the packaged desktop app, you already have it.")
-        print(
-            "     To build it from source, run setup from a source checkout "
-            "or run `make desktop` there."
-        )
+        _print_no_desktop_sources()
         return
 
     if not shutil.which("node"):
@@ -220,7 +251,9 @@ def _setup_electron() -> None:
         ["npm", "install", "--no-audit", "--no-fund", "--loglevel=error"],
         cwd=str(electron_dir),
         capture_output=True,
-        text=True,
+        # npm and electron-builder are node programs: their pipes carry UTF-8,
+        # not the locale's code page.
+        **UTF8_TEXT,
         timeout=120,
     )
     if npm_install.returncode != 0:
@@ -233,7 +266,7 @@ def _setup_electron() -> None:
         ["npx", "electron-builder", "--mac", "--dir"],
         cwd=str(electron_dir),
         capture_output=True,
-        text=True,
+        **UTF8_TEXT,
         timeout=300,
     )
     if build.returncode != 0:
@@ -399,11 +432,17 @@ def _setup_impl(
     # 6. Desktop app (macOS only)
     if platform.system() == "Darwin":
         print("── Desktop App ──\n")
-        answer = input("  Install KiroCrew desktop app to ~/Applications? [Y/n]: ").strip().lower()
-        if answer in ("", "y", "yes"):
-            _setup_electron()
+        if _find_electron_dir() is None:
+            _print_no_desktop_sources()
+            print()
         else:
-            print("  ⏭  Skipped. Install later: kirocrew setup --electron-only\n")
+            answer = (
+                input("  Install Kiro Crew desktop app to ~/Applications? [Y/n]: ").strip().lower()
+            )
+            if answer in ("", "y", "yes"):
+                _setup_electron()
+            else:
+                print("  ⏭  Skipped. Install later: kirocrew setup --electron-only\n")
 
     # 7. Cloud (run KiroCrew on the user's own AWS EC2) — optional, delegated.
     _maybe_setup_cloud()
@@ -576,7 +615,13 @@ def _verify_slack_secret(key: str, token: str) -> tuple[bool | None, str]:
     itself makes at startup, so a token that passes here will connect at boot —
     and everything else with ``auth.test``.
 
+    A kept ``.env`` value that is a ``secret://`` reference is checked as the
+    vault secret it names; one that cannot be resolved is rejected without a
+    call to Slack.
     """
+    token = resolve_env_credential(key, token)
+    if not token:
+        return False, "the secret:// reference cannot be resolved from the vault"
     client = WebClient(token=token, timeout=_SLACK_VERIFY_TIMEOUT)
     try:
         if key == CRED_SLACK_APP_TOKEN:
@@ -611,7 +656,10 @@ def _verify_slack_owner_id(bot_token: str, owner_id: str) -> tuple[bool | None, 
             "not a member ID — 'C…' is a channel and 'B…' is a bot; yours starts "
             "with U (or W on Enterprise Grid), from your profile → ⋯ More → Copy member ID"
         )
-    client = WebClient(token=bot_token, timeout=_SLACK_VERIFY_TIMEOUT)
+    client = WebClient(
+        token=resolve_env_credential(CRED_SLACK_BOT_TOKEN, bot_token),
+        timeout=_SLACK_VERIFY_TIMEOUT,
+    )
     try:
         resp = client.users_info(user=owner_id)
     except SlackApiError as exc:
@@ -792,7 +840,7 @@ def _setup_slack_tokens() -> None:
     # the possibly-stale snapshot read before the prompts.
     cred_path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = _env_lock_path(cred_path)
-    lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    lock_fd = platform_compat.open_create_or_existing(lock_path, os.O_RDWR, 0o600)
     if not platform_compat.try_acquire_lock(lock_fd, exclusive=True):
         os.close(lock_fd)
         print(
@@ -841,22 +889,20 @@ def _setup_slack_tokens() -> None:
             else:
                 print(f"  ℹ️  Keeping the saved member ID {stale_owner}.\n")
         lines = [f"{k}={v}" for k, v in merged.items()]
-        # atomic_write with restrict_to_owner, not write_text + chmod(0o600): a
-        # bare chmod is a silent no-op for Windows ACLs, and applying any lockdown
-        # only AFTER the tokens are on disk leaves them readable through the
-        # directory's inherited DACL in the failure window. The helper locks its
-        # unique temp file down before any content reaches it and renames only on
-        # success, so the tokens never exist under a wider mode and a failure
-        # leaves the previous .env untouched. restrict_on_error="warn" matches the
-        # .env doctrine (enforce the lockdown, log a warning if it fails) and the
-        # dashboard credential writers: an ACL-refusing host still completes the
-        # wizard instead of aborting after the user typed their tokens.
-        atomic_write(
-            cred_path,
-            env_bom_prefix(cred_path) + "\n".join(lines) + "\n",
-            restrict_to_owner=True,
-            restrict_on_error="warn",
-        )
+        # publish_env, not write_text + chmod(0o600) or a plain atomic_write: a
+        # bare chmod is a silent no-op for Windows ACLs, and a plain atomic_write
+        # stages its temp beside .env, at a name no sandbox mask covers. The
+        # helper stages inside the masked staging directory, locks the temp down
+        # to its owner before any content reaches it and renames only on success,
+        # so the tokens never sit under a wider mode or an unmasked name, and a
+        # failure leaves the previous .env untouched. A refused lockdown of the
+        # temp file warns, as the dashboard credential writers do. An unusable
+        # staging directory refuses the save and prints its fix, not a traceback.
+        try:
+            publish_env(cred_path, env_bom_prefix(cred_path) + "\n".join(lines) + "\n")
+        except EnvStagingRefused as exc:
+            print(f"  ⚠  Nothing was saved. {exc}\n")
+            return
     finally:
         platform_compat.release_lock(lock_fd)
         os.close(lock_fd)
@@ -1086,7 +1132,10 @@ def _setup_slash_command() -> None:
     # way the validated loader degrades a mistyped field.
     current = coerce_config_field(slack_section or {}, "command", str, "kirocrew")
     # EOF keeps the current value (same reasoning as the workspace step).
-    raw = _input_or_skip(f"  Slash command name [{current}]: ") or ""
+    prompt = (
+        f"  Slash command name (must match your Slack app, e.g. kirocrew-<alias>) [{current}]: "
+    )
+    raw = _input_or_skip(prompt) or ""
     if raw:
         raw = raw.lstrip("/").strip()
     if not raw:

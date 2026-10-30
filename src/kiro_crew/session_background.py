@@ -25,9 +25,11 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 from kiro_crew.agent_discovery import warm_agent_specs
 from kiro_crew.agent_scratch import SharedScratchJoinError
+from kiro_crew.agent_sdk.kas_floor_wait import await_kas_floor_verdict
 from kiro_crew.agent_sdk.tool_search import ToolSearchSettings
 from kiro_crew.kiro_prerequisite import (
     identity_park_grace_remaining,
+    mark_identity_parked,
     pre_spawn_identity,
     spawn_pid,
     stamp_spawn_identity,
@@ -57,6 +59,8 @@ class _BackgroundSessionEntry(Protocol):
 
     provider: LLMProvider
     semaphore: asyncio.BoundedSemaphore
+    #: The task holding ``semaphore``, as ``_Session.turn_owner`` records it.
+    turn_owner: Any
     prompt_count: int
 
     def adopt_provider(self, provider: LLMProvider) -> None: ...
@@ -152,6 +156,10 @@ class BackgroundRuntimeState:
 
     runtime: _BackgroundRuntime | None = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    #: Single-flight guards for ``_ensure_background``, one per start priority,
+    #: so concurrent first users of ``_bg`` share one cold start.
+    ensure_foreground_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    ensure_background_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     draining: list[_BackgroundRuntime] = field(default_factory=list)
     #: The ``$KIROCREW_SCRATCH`` tree the sessions on the ``_bg`` runtime use,
     #: recorded from every runtime observed in the slot and handed to each
@@ -234,6 +242,16 @@ class _ProviderBgSession:
         self._sem_held = False
 
     @property
+    def provider(self) -> LLMProvider:
+        """The provider serving this handle, for attribution reads.
+
+        A turn's usage row passes this handle as ``model_source``; the
+        ``harness`` metric attribute unwraps it here to name the backend that
+        ran the turn. Read-only: turns still go through :meth:`prompt`.
+        """
+        return self._sess.provider
+
+    @property
     def session_id(self) -> str:
         try:
             return self._sess.provider.session_id
@@ -313,7 +331,36 @@ class BackgroundSessionRuntime:
 
         ``start_priority`` is the cold start's place in the queues: a caller a
         person is waiting on (``get_bg_session``) names its own.
+
+        Single-flight per priority: one cold start of each priority runs at a
+        time. A caller arriving while a start it may wait for is in flight
+        waits, then returns once the session is registered; it starts its own
+        only if that start failed. A ``BACKGROUND`` caller waits for an
+        in-flight start of either priority. A ``FOREGROUND`` caller waits only
+        for a ``FOREGROUND`` one: waiting behind a background start would queue
+        a person at background priority in ``_start_sem``. That is the one case
+        where two starts can overlap, and the loser is shut down at
+        registration.
         """
+        background_key = self._deps.background_key
+        async with self._owner._lock:
+            if self._owner._closing or background_key in self._owner._sessions:
+                return
+        foreground = self.state.ensure_foreground_lock
+        if start_priority is StartPriority.FOREGROUND:
+            async with foreground:
+                await self._ensure_background_single(start_priority=start_priority)
+            return
+        async with self.state.ensure_background_lock:
+            if foreground.locked():
+                # Wait out the in-flight foreground start without holding its
+                # lock across this caller's own start.
+                async with foreground:
+                    pass
+            await self._ensure_background_single(start_priority=start_priority)
+
+    async def _ensure_background_single(self, *, start_priority: StartPriority) -> None:
+        """Body of :meth:`_ensure_background`; caller holds its single-flight lock."""
         background_key = self._deps.background_key
         background_agent = self._deps.background_agent
         logger = self._deps.logger
@@ -323,6 +370,9 @@ class BackgroundSessionRuntime:
         # Create outside lock
         if not self._owner._provider_factory:
             return
+        # Before the permit: a defaulted KAS waits (bounded) for the kiro-cli
+        # floor, so this session starts on the backend the verdict chose.
+        await await_kas_floor_verdict()
         # The factory resolves the background agent's model pin SYNCHRONOUSLY
         # on the loop from the agent-spec snapshot, which at gateway start has
         # not been published yet (the first ``mc-discovery`` refresh is still
@@ -357,8 +407,15 @@ class BackgroundSessionRuntime:
                     getattr(self._owner, "spawn_identity_reader", None)
                 )
                 await provider.start()
-            except Exception:
-                logger.warning("Failed to create background session", exc_info=True)
+            except Exception as exc:
+                # No kiro-cli is the expected state right after a fresh install,
+                # and the dashboard answers it with its Set up Kiro page; the
+                # message already names the directories searched and the fix,
+                # so a traceback would only bury it.
+                if getattr(exc, "kiro_cli_missing", False) is True:
+                    logger.warning("Background session not started: %s", exc)
+                else:
+                    logger.warning("Failed to create background session", exc_info=True)
                 return
             # Best-effort spawn-account record; see flag_identity_stamp_mismatches.
             # A cancellation landing in this read would leak the started
@@ -392,7 +449,7 @@ class BackgroundSessionRuntime:
                         self._owner._sessions[background_key] = sess
                         self._owner._advance_session_generation(background_key)
                         try:
-                            await record_session_started(background_key)
+                            await record_session_started(background_key, provider)
                         except BaseException:
                             # Cancelled between registering and recording: roll the entry
                             # back so no claimant sees a session the caller is tearing
@@ -443,9 +500,10 @@ class BackgroundSessionRuntime:
         stays parked for the next pass; a failed kill also stays parked so the
         process is retried rather than orphaned. ``kill()`` is called even on an
         already-dead runtime so it can release PID bookkeeping. A runtime the
-        spawn-identity gate parked additionally keeps a kill grace on top of
-        the busy probe (see ``identity_park_grace_remaining``); backend-switch
-        parks carry no mark and keep their original timing.
+        spawn-identity gate or an ``agent.env`` change parked additionally keeps
+        a kill grace on top of the busy probe (see
+        ``identity_park_grace_remaining``); backend-switch parks carry no mark
+        and keep their original timing.
         """
         logger = self._deps.logger
         now = time.monotonic()
@@ -631,6 +689,35 @@ class BackgroundSessionRuntime:
             )
             return True
 
+    async def retire_for_agent_env_change(self) -> bool:
+        """Free the shared runtime's slot after an ``agent.env`` change.
+
+        The runtime is one long-lived process that every background and cron
+        session demuxes onto, and it carries the environment it was spawned with.
+        Left in its slot it would serve the old ``agent.env`` until it went
+        stale (up to the 6 h age ceiling). Freeing the slot makes the next
+        ``get_bg_session`` spawn a replacement that reads the new map.
+
+        The runtime is PARKED, busy or idle, never killed here: its in-flight
+        sessions finish on it, and the drain reap kills it once they have. It
+        carries the park grace, because ``get_bg_session`` pins the runtime under
+        the lock and only opens its init scope after releasing it, so an idle
+        reading taken in that window is wrong. Returns True when the slot was
+        freed.
+        """
+        async with self._bg_runtime_lock:
+            if self._owner._closing:
+                # Same gate as every other park: a shutdown has already swept
+                # past, so parking now would strand a shielded process.
+                return False
+            await self._owner._reap_drained_bg_runtimes_locked()
+            runtime = self._bg_runtime
+            if runtime is None:
+                return False
+            mark_identity_parked(runtime, time.monotonic())
+            await self._detach_bg_runtime_locked(runtime, "agent.env changed", park_only=True)
+            return True
+
     async def _provider_backed_bg_session(
         self, start_priority: StartPriority = StartPriority.BACKGROUND
     ) -> object:
@@ -673,6 +760,7 @@ class BackgroundSessionRuntime:
                 "session manager is closing; no background session"
             )
 
+        await await_kas_floor_verdict()
         if not self._owner._bg_backend_supports_runtime():
             # A cached runtime spawned under a previous runtime-capable backend
             # is unreachable from the branch below, so finish any deferred
@@ -910,10 +998,11 @@ class BackgroundSessionRuntime:
     async def _rss_recycle_reason(self, background_key: str) -> str | None:
         """The recycle reason when the background tree is at or over its ceiling.
 
-        The ceiling is ``session.watchdog_rss_max_mb`` when it is positive, else
-        ``BACKGROUND_RSS_FALLBACK_MB``: the per-session knob is off by default,
-        and this internal runtime is the one tree a transcript of oversized
-        records grows without bound, so it keeps a ceiling either way.
+        The ceiling is ``session.watchdog_rss_max_mb`` when it is positive and
+        below ``BACKGROUND_RSS_FALLBACK_MB``, else that fallback: the per-session
+        knob is sized for chat sessions with many MCP servers, while this
+        internal runtime is the one tree a transcript of oversized records grows
+        without bound, so it keeps its own lower ceiling either way.
         The RSS sweep in ``session_cleanup`` skips persistent keys and the
         background key is one, so this is the only path that compares this
         runtime's tree against that number. It belongs here rather than there
@@ -924,7 +1013,7 @@ class BackgroundSessionRuntime:
         context and prompt criteria decide the turn on their own.
         """
         ceiling = self._deps.rss_max_mb()
-        if ceiling <= 0:
+        if ceiling <= 0 or ceiling > BACKGROUND_RSS_FALLBACK_MB:
             ceiling = BACKGROUND_RSS_FALLBACK_MB
         # This module owns the background runtime: it spawns the provider, is the
         # one place that retires it, and the background key is a pool of one, so
@@ -947,7 +1036,13 @@ class BackgroundSessionRuntime:
             return None
         return f"tree rss={rss}MB exceeds {ceiling}MB"
 
-    async def recycle_background(self, *, context_overflowed: bool = False) -> None:
+    async def recycle_background(
+        self,
+        session_key: str | None = None,
+        *,
+        agent: str | None = None,
+        context_overflowed: bool = False,
+    ) -> None:
         """Recycle the persistent background provider when context is full.
 
         ``context_overflowed`` says the turn just taken was refused as too long
@@ -958,8 +1053,8 @@ class BackgroundSessionRuntime:
         last successful turn's, so the threshold below can keep a conversation
         every later turn will be refused on, until the gateway restarts.
         """
-        background_key = self._deps.background_key
-        background_agent = self._deps.background_agent
+        background_key = session_key or self._deps.background_key
+        background_agent = agent or self._deps.background_agent
         logger = self._deps.logger
         session = self._owner._sessions.get(background_key)
         if not session:
@@ -1076,6 +1171,9 @@ class BackgroundSessionRuntime:
                 )
         finally:
             session.semaphore.release()
+            # ``_reacquire_and_validate`` named this task the holder; the
+            # holding ends with this release.
+            session.turn_owner = None
 
     async def recycle_heartbeat(self) -> None:
         """Tear down the heartbeat session at the end of a cycle."""

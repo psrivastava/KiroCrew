@@ -23,6 +23,7 @@ from kiro_crew.dashboard.handlers import session_control as handlers_sc
 from kiro_crew.mcp_dashboard import TABLE
 from kiro_crew.mcp_tools.dashboard_client import DashboardRequest, InMemoryDashboardClient
 from kiro_crew.mcp_tools.table import Caller, ToolContext
+from kiro_crew.testing.wait import await_until, finished
 
 
 @pytest.fixture(autouse=True)
@@ -69,9 +70,13 @@ def _run_race(make_first, during, started: asyncio.Event, release: asyncio.Event
                     first.result()
                     raise AssertionError("first rename finished without reaching its save")
                 raise AssertionError("first rename never reached its save")
-            during_result = await asyncio.wait_for(during(), _RACE_STEP_TIMEOUT_S)
+            during_result = await finished(
+                during(), "the step run during the parked save", timeout=_RACE_STEP_TIMEOUT_S
+            )
             release.set()
-            first_result = await asyncio.wait_for(asyncio.shield(first), _RACE_STEP_TIMEOUT_S)
+            first_result = await await_until(
+                first, what="the first rename finishing its save", timeout=_RACE_STEP_TIMEOUT_S
+            )
             return first_result, during_result
         finally:
             release.set()
@@ -620,7 +625,7 @@ def test_an_overtaken_rename_replies_with_the_current_title(tmp_path, monkeypatc
 def test_a_channel_title_on_a_live_slot_renames_through_the_shared_helper(tmp_path, monkeypatch):
     """``rename_channel_title_live`` routes a live slot through
     ``apply_manual_title``, so a channel rename is final like a sidebar one."""
-    from kiro_crew.dashboard import channel_slots
+    from kiro_crew.dashboard import channel_slots, channel_titles
 
     calls: list = []
 
@@ -628,7 +633,7 @@ def test_a_channel_title_on_a_live_slot_renames_through_the_shared_helper(tmp_pa
         calls.append((slot.key, title))
         return True
 
-    monkeypatch.setattr(channel_slots, "apply_manual_title", _spy)
+    monkeypatch.setattr(channel_titles, "apply_manual_title", _spy)
     state = _make_state(tmp_path)
     state.get_or_create_slot("chat-2")
 
@@ -638,6 +643,35 @@ def test_a_channel_title_on_a_live_slot_renames_through_the_shared_helper(tmp_pa
 
     assert renamed is True
     assert calls == [("chat-2", "From Telegram")]
+
+
+def test_a_channel_rename_reaches_an_open_channel_born_slot(tmp_path, monkeypatch):
+    """A Slack-born tab runs on ``slack:<ts>`` (its ``linked_session_key``), not a
+    ``dashboard:`` key; the rename must land on it, or the tab's next save writes
+    its old title back over the transcript."""
+    from kiro_crew.dashboard import channel_slots, channel_titles
+
+    calls: list = []
+
+    async def _spy(state_, slot, title):
+        calls.append((slot.key, title))
+        return True
+
+    monkeypatch.setattr(channel_titles, "apply_manual_title", _spy)
+    state = _make_state(tmp_path)
+    state.get_or_create_slot("chat-2").linked_session_key = "slack:1700.1"
+    state.get_or_create_slot("chat-3")
+    # A workflow result tab injected into the same thread shares the key.
+    state.get_or_create_slot("chat-4").linked_session_key = "slack:1700.1"
+
+    renamed = asyncio.run(
+        channel_slots.rename_channel_title_live(state, "slack:1700.1", "From Slack")
+    )
+    missing = asyncio.run(channel_slots.rename_channel_title_live(state, "slack:1700.9", "No"))
+
+    assert renamed is True
+    assert missing is False
+    assert calls == [("chat-2", "From Slack"), ("chat-4", "From Slack")]
 
 
 def test_an_older_title_write_that_lands_last_writes_the_newest_title(tmp_path):

@@ -89,7 +89,13 @@ interface PeerSlot {
   key: string
   title?: string
   running?: boolean
+  /** The peer stamped this row a Crew Mode root (`crew_mode.stamp_rows` on its gateway). */
+  crew_mode_root?: boolean
+  /** On a peer's crew member: its root's key on that peer. */
+  crew_root?: string
   pending_approval?: boolean
+  /** An unanswered question card is waiting on the slot. */
+  needs_input?: boolean
   /** ISO-8601. Moves only when a turn starts or ends — the ranking/display rung. */
   last_turn_ts?: string
   /** ISO-8601 of the newest saved row of any role; advances on every streamed tool call. */
@@ -133,6 +139,12 @@ interface PeerSlot {
 export interface InstanceSessionRow {
   key: string
   title?: string
+  /** A Crew Mode root on the peer, kept so the sidebar's Crew Mode filter counts and
+   *  shows it like a local one. Only the literal `true` crosses the machine boundary. */
+  crew_mode_root?: boolean
+  /** The peer's root this row is a crew member of, kept (a string only) so the
+   *  person's lists leave a peer's crew members out as they leave local ones out. */
+  crew_root?: string
   /** The ISO ladder, forwarded raw. Deliberately NO `modified`: `slotActivityTs`
    *  collapses these three for ranking, the date-segment header and the row label
    *  alike, so a derived epoch field here would only be a second definition of the
@@ -144,6 +156,7 @@ export interface InstanceSessionRow {
   running: boolean
   messages: number
   pending_approval?: boolean
+  needs_input?: boolean
   /** The peer that OWNS this session — what makes the badge and remote activation
    *  fire, and the only thing `isPeerRow()` reads. Required here (not optional as
    *  on `Slot`) because a row this hook emits always came from some peer.
@@ -418,20 +431,24 @@ export function useInstanceSessions(
         rows.push({
           ...(parent ? { parent } : {}),
           ...(s.lineage_pending === true ? { lineage_pending: true } : {}),
+          ...(s.crew_mode_root === true ? { crew_mode_root: true } : {}),
+          ...(str(s.crew_root) ? { crew_root: s.crew_root } : {}),
           ...(str(s.folder_id) ? { peer_folder_id: s.folder_id } : {}),
           key: s.key,
           title: str(s.title),
           last_turn_ts: str(s.last_turn_ts),
-          last_ts: str(s.last_ts),
+          last_ts: str(s.last_ts), // last-ts: a peer instance's payload, not a local row
           created: str(s.created),
           agent: str(s.agent),
-          // An offline crew's row is a cached answer: its last `running` and
-          // `pending_approval` are not true now, so they are dropped.
+          // An offline crew's row is a cached answer: its last `running`,
+          // `pending_approval` and `needs_input` are not true now, so they are dropped.
           running: live && s.running === true,
           messages: 0,
           // Normalized like `running`: a truthy non-boolean from a peer would
-          // otherwise raise a pending-approval badge the peer never claimed.
+          // otherwise raise a pending-approval badge or a question the peer never
+          // claimed.
           pending_approval: live && s.pending_approval === true,
+          needs_input: live && s.needs_input === true,
           peer_id: inst.id,
           peer_name: name,
           row_identity: str(s.row_identity),

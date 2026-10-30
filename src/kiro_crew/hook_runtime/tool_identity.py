@@ -9,6 +9,8 @@ Composed onto ``kiro_crew.hooks``; see :mod:`kiro_crew.hook_runtime`.
 from __future__ import annotations
 
 import fnmatch
+import os
+import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -18,18 +20,25 @@ if TYPE_CHECKING:
         _BUILTIN_APP_AGENTS,
         _BUILTIN_APP_MCP_SERVERS,
         _BUILTIN_APP_NAMES,
+        _CODE_READ_ONLY_OPERATIONS,
+        _FIRST_PARTY_READ_ONLY_MCP_TOOLS,
         _GLOBAL_INLINE_FLAGS_RE,
-        _HOST_READ_ONLY_BUILTIN_ALIASES,
         _HOST_READ_ONLY_BUILTIN_TOOLS,
+        _HOST_SEARCH_BUILTIN_TOOLS,
         _TITLE_ONLY_GRANT_NOTED,
         _TITLE_ONLY_GRANT_NOTED_CAP,
+        _TITLE_TRUNCATION_MARKER,
         _TOOL_TITLE_PREFIXES,
         CORE_MCP_SERVER,
+        DEEPSEEK_READ_ONLY_TOOLS,
+        KIRO_TOOL_ALIASES,
         TOOL_AUTO_APPROVE,
         ToolHookResult,
         _bounded_pattern_search,
         logger,
         policy_aliases,
+        security,
+        target_paths,
     )
 
 
@@ -87,7 +96,7 @@ class ToolCall:
 
     #: The display title / pill label. For shell tools it may be an LLM-authored
     #: ``description`` rather than the literal command (``select_tool_title`` in
-    #: ``acp/_dispatch.py`` prefers ``description`` over ``command``), so it is
+    #: ``acp/_dispatch_parts/surfaced_text.py`` prefers ``description`` over ``command``), so it is
     #: UNTRUSTED for security decisions: every deny tier also runs against
     #: ``command`` when one is present, and a match on EITHER denies. Auto-approve
     #: stays keyed on the title only -- failing to auto-approve merely falls
@@ -162,6 +171,28 @@ class ToolCall:
     #: the read-only proof): another harness that stamps the same bare id is
     #: judged under that id alone, exactly as on main.
     kas_builtin_ids: bool = False
+    #: ``AcpEvent.spec_granted_builtins``: the built-ins the KAS session's own
+    #: agent spec grants that its KAS policy keeps at ``ask``, written by the
+    #: session handle from the projection it registered. Read by the
+    #: ``spec-builtin-grant`` tier only, after every deny tier and governance.
+    #: Empty (every other harness, a sub-session, a hand-built call) grants nothing.
+    spec_granted_builtins: frozenset[str] = frozenset()
+    #: ``AcpEvent.spec_granted_commands``: the KAS session's own agent's
+    #: ``toolsSettings.shell.allowedCommands`` as Python regexes, written the same
+    #: way. Read by the ``spec-builtin-grant`` tier only, against the recovered
+    #: ``command``. Empty grants nothing.
+    spec_granted_commands: tuple[str, ...] = ()
+    #: ``AcpEvent.harness_builtin_tool``: the kiro-cli read built-in a claude call
+    #: is for, from the name claude-agent-acp stamped on the tool_call frame. A
+    #: deny target, so a rule on ``web_fetch`` binds claude's WebFetch, and the
+    #: claude half of the read-only built-in proof. Never a grant.
+    harness_builtin_tool: str = ""
+    #: ``AcpEvent.deepseek_tool_name``: the DeepSeek Harness tool a call is for, as
+    #: its tool_call frame stated it. Read by the gate on a ``classifier_only``
+    #: (READ_ONLY) turn only: a deny target and a governance identity under both
+    #: its own name and its kiro-cli policy name, and the deepseek half of the
+    #: read-only built-in proof.
+    deepseek_tool_name: str = ""
     #: The ``spawn_run`` target the governance spawn policy judges.
     spawn_target: str = ""
     #: The agent that ACTUALLY ran (``read_effective_agent``), never the slot's
@@ -209,6 +240,12 @@ class ToolCall:
             "identity_trusted": bool(getattr(event, "mcp_identity_trusted", False)),
             "identity_unreadable": bool(getattr(event, "mcp_identity_unreadable", False)),
             "kas_builtin_ids": bool(getattr(event, "kas_builtin_ids", False)),
+            "spec_granted_builtins": _granted_names(getattr(event, "spec_granted_builtins", None)),
+            "spec_granted_commands": _granted_patterns(
+                getattr(event, "spec_granted_commands", None)
+            ),
+            "harness_builtin_tool": getattr(event, "harness_builtin_tool", "") or "",
+            "deepseek_tool_name": getattr(event, "deepseek_tool_name", "") or "",
             "spawn_target": getattr(event, "spawn_target", "") or "",
         }
         values.update(overrides)
@@ -232,8 +269,31 @@ class ToolCall:
             "mcp_identity_trusted": self.identity_trusted,
             "mcp_identity_unreadable": self.identity_unreadable,
             "kas_builtin_ids": self.kas_builtin_ids,
+            "spec_granted_builtins": self.spec_granted_builtins,
+            "spec_granted_commands": self.spec_granted_commands,
+            "harness_builtin_tool": self.harness_builtin_tool,
+            "deepseek_tool_name": self.deepseek_tool_name,
             "spawn_target": self.spawn_target,
         }
+
+
+def _granted_names(value: object) -> frozenset[str]:
+    """``AcpEvent.spec_granted_builtins`` as the frozenset the gate reads.
+
+    A test double or provider event without the field, or with anything that is
+    not a set of strings, yields the empty set: no grant.
+    """
+    if not isinstance(value, (set, frozenset, tuple, list)):
+        return frozenset()
+    return frozenset(n for n in value if isinstance(n, str) and n)
+
+
+def _granted_patterns(value: object) -> tuple[str, ...]:
+    """``AcpEvent.spec_granted_commands`` as the tuple the gate reads, read like
+    :func:`_granted_names`: anything that is not a sequence of strings grants nothing."""
+    if not isinstance(value, (tuple, list)):
+        return ()
+    return tuple(p for p in value if isinstance(p, str) and p)
 
 
 def hook_gate_kwargs(event: object, **overrides: Any) -> dict[str, Any]:
@@ -264,6 +324,22 @@ def hook_gate_kwargs(event: object, **overrides: Any) -> dict[str, Any]:
         )
     kwargs.update(overrides)
     return kwargs
+
+
+def _host_builtin_alias(mcp_tool_name: str, mcp_server_name: str) -> str:
+    """The spec spelling of a host built-in kiro-cli stamped under a short name.
+
+    ``read`` -> ``fs_read``, ``write`` -> ``fs_write``, ``shell`` -> ``execute_bash``
+    (:data:`kiro_crew.platform.tool_names.KIRO_TOOL_ALIASES`); ``""`` for any
+    other stamp. The deny rules, governance and the read-only proof all resolve a
+    stamp through this one call, so a rule written in the spec spelling reaches
+    the call the proof would judge. Built-ins only: kiro-cli stamps
+    ``mcpServerName`` on every MCP-served call, and a server's own tool called
+    ``read`` is not the host's file reader.
+    """
+    if mcp_server_name:
+        return ""
+    return KIRO_TOOL_ALIASES.get(mcp_tool_name, "")
 
 
 def _is_host_read_only_builtin(
@@ -301,20 +377,17 @@ def _is_host_read_only_builtin(
     (``kiro_tool_identity_meta`` in the engine) and is the one every
     ``mcp_server_name`` consumer in ``kiro_crew.hooks`` already rests on.
 
-    The stamped name is read through ``_HOST_READ_ONLY_BUILTIN_ALIASES`` first.
-    kiro-cli names its file-read built-in ``read`` (``fs_read`` is the alias it
-    still accepts in a spec), while the allowlist and ``BUILTIN_TOOL_SCOPES``
-    carry ``fs_read``; without the step a ``read`` call is unproven and a
-    ``READ_ONLY`` surface refuses every file read. The table holds only the
-    read-only aliases, so a ``write`` or ``shell`` stamp has no entry, is
-    tested under its own name, and is refused as before.
+    The stamped name is resolved through :func:`_host_builtin_alias` first:
+    kiro-cli stamps its file-read built-in ``read`` where the allowlist carries
+    ``fs_read``, and without the step a ``READ_ONLY`` surface refuses every file
+    read. The allowlist decides what the step may prove: ``write`` and ``shell``
+    resolve to names it does not hold and stay unproven.
     """
     if not mcp_identity_trusted:
         return False
     if mcp_server_name or not mcp_tool_name:
         return False
-    # A kiro-cli alias (``read``) reads under the name a rule is written in.
-    name = _HOST_READ_ONLY_BUILTIN_ALIASES.get(mcp_tool_name, mcp_tool_name)
+    name = _host_builtin_alias(mcp_tool_name, mcp_server_name) or mcp_tool_name
     if name in _HOST_READ_ONLY_BUILTIN_TOOLS:
         return True
     # A KAS built-in arrives under its own id (``read_file``, ``grep_search``;
@@ -333,11 +406,165 @@ def _is_host_read_only_builtin(
     return any(alias in _HOST_READ_ONLY_BUILTIN_TOOLS for alias in policy_aliases(mcp_tool_name))
 
 
+def _is_host_search_builtin_call(
+    mcp_tool_name: str,
+    mcp_server_name: str,
+    raw_params: object,
+    *,
+    mcp_identity_trusted: bool,
+) -> bool:
+    """True when a kiro-cli file-search call is proven to only read the files it names.
+
+    The interactive read-only tier's proof for the calls its kind allow-list cannot
+    take: kiro-cli stamps ``kind="search"`` on ``grep`` / ``glob`` and
+    ``kind="read"`` on every ``code`` call, a rewrite included, so neither kind says
+    what runs. What does is the identity kiro-cli stamped and the call's own
+    arguments, which are what the tool executes:
+
+    * the identity is host-trusted and names a built-in, by the same rule as
+      :func:`_is_host_read_only_builtin` (``mcp_identity_trusted``, no server);
+    * the tool is ``grep`` or ``glob`` (:data:`_HOST_SEARCH_BUILTIN_TOOLS`), or
+      ``code`` with an ``operation`` in :data:`_CODE_READ_ONLY_OPERATIONS`;
+    * every path argument is anchored (:func:`_search_root_anchored`: absolute,
+      ``~`` allowed, no ``$VAR`` that expands, a drive on Windows) and there is at
+      least one.
+      kiro-cli resolves a relative path, or none, against the session's folder,
+      while the sensitive-path keystone resolves it against the gateway's own, so
+      a ``../`` spelling of a guarded file could pass the keystone. kiro-cli asks
+      only for a search outside the session's folder, which names a path anyway;
+    * no path argument CONTAINS a sensitive location
+      (``security.path_contains_sensitive``). The keystone refuses a root that is
+      itself sensitive, but a search walks everything below its root, hidden
+      folders included (captured live, 2.35.1), so ``grep`` over the home folder
+      reads ``~/.ssh`` while its root names no credential. A check that stalls
+      counts as containing one;
+    * a ``glob`` pattern neither starts a new root nor climbs out of the one named
+      (absolute, ``~`` or a ``..`` segment), since kiro-cli joins it onto the root.
+
+    A call that fails any of these is not refused here; it reaches the prompt it
+    reached before.
+    """
+    if not mcp_identity_trusted or mcp_server_name or not isinstance(raw_params, Mapping):
+        return False
+    if mcp_tool_name == "code":
+        if raw_params.get("operation") not in _CODE_READ_ONLY_OPERATIONS:
+            return False
+    elif mcp_tool_name not in _HOST_SEARCH_BUILTIN_TOOLS:
+        return False
+    if mcp_tool_name == "glob":
+        pattern = raw_params.get("pattern")
+        if not isinstance(pattern, str) or _glob_pattern_leaves_root(pattern):
+            return False
+    paths = target_paths(raw_params)
+    if paths.truncated or not paths:
+        return False
+    return all(
+        _search_root_anchored(path) and not security.path_contains_sensitive(path) for path in paths
+    )
+
+
+def _search_root_anchored(path: str, pathmod: Any = os.path) -> bool:
+    """Whether a search root names one folder for kiro-cli and for the gate alike.
+
+    Absolute after ``~``. A ``$VAR`` that expands is refused: the sensitive-path
+    matcher expands variables and would judge a folder other than the literal one
+    the tool walks. On Windows the root must carry a drive, since ``\\x`` is
+    relative to each process's current drive. ``pathmod`` is ``os.path``; a test
+    passes ``ntpath`` to read a path the Windows way on any host.
+    """
+    if pathmod.expandvars(path) != path:
+        return False
+    expanded = pathmod.expanduser(path)
+    if not pathmod.isabs(expanded):
+        return False
+    return pathmod.__name__ != "ntpath" or bool(pathmod.splitdrive(expanded)[0])
+
+
+def _glob_pattern_leaves_root(pattern: str) -> bool:
+    """Whether a glob pattern names a root of its own or climbs out of the one given."""
+    if pattern.startswith("~") or os.path.isabs(pattern):
+        return True
+    # Both separators: kiro-cli on Windows reads either one.
+    return ".." in re.split(r"[\\/]", pattern)
+
+
+def _is_first_party_read_only_mcp_tool(
+    mcp_tool_name: str, mcp_server_name: str, *, mcp_identity_trusted: bool
+) -> bool:
+    """True when the host-trusted identity names one of Kiro Crew's OWN read-only MCP tools.
+
+    The MCP counterpart of :func:`_is_host_read_only_builtin`, with the same
+    positive provenance rule and the opposite server rule:
+
+    * ``mcp_identity_trusted`` -- the pair came from the ``_meta.kiro`` parse this
+      client made of the tool_call frame, never from an inline payload, a title or
+      a hand-built event. On a harness that stamps no identity the flag is False
+      and nothing is proven.
+    * ``mcp_server_name`` AND ``mcp_tool_name`` non-empty -- a trusted cache hit
+      on two empty strings is a built-in, not an MCP call, and matches nothing
+      here.
+    * the exact ``(server, tool)`` pair is in :data:`_FIRST_PARTY_READ_ONLY_MCP_TOOLS`,
+      compared byte for byte: ``memory_recall`` on any server but
+      :data:`CORE_MCP_SERVER` is some other server's tool and stays unproven, as
+      does a case or spacing variant of either half.
+
+    What this cannot see, like its built-in sibling: a backend that stamps a
+    server name the transport did not verify. The provenance flag proves the pair
+    came from the frame this client parsed, and the stamping contract belongs to
+    the harness.
+    """
+    if not mcp_identity_trusted:
+        return False
+    if not mcp_server_name or not mcp_tool_name:
+        return False
+    return (mcp_server_name, mcp_tool_name) in _FIRST_PARTY_READ_ONLY_MCP_TOOLS
+
+
+def _is_harness_read_only_builtin(harness_builtin_tool: str, mcp_server_name: str) -> bool:
+    """True when a claude call's adapter-stamped name maps to a read-only BUILT-IN.
+
+    ``harness_builtin_tool`` is filled only from the ``_meta.claudeCode.toolName``
+    claude-agent-acp stamped on the call's own tool_call frame
+    (``AcpEvent.harness_builtin_tool``), never from the permission payload or the
+    title. That name is the tool claude-agent-acp runs, so a write tool cannot
+    arrive under a read tool's name. A call with an MCP server behind it fails closed.
+    """
+    if mcp_server_name:
+        return False
+    return harness_builtin_tool in _HOST_READ_ONLY_BUILTIN_TOOLS
+
+
+def _is_deepseek_read_only_builtin(
+    deepseek_tool_name: str, mcp_server_name: str, raw_params: object
+) -> bool:
+    """True when a DeepSeek Harness call is one of its read built-ins, with its target named.
+
+    ``deepseek_tool_name`` is filled only from the name the call's own tool_call
+    frame stated (``AcpEvent.deepseek_tool_name``), never from the permission
+    payload. dsh dispatches the call to the tool registered under that name and
+    prefixes every MCP tool ``mcp__<server>__``, so a bare ``read`` is its own file
+    read. The call must also name what it reads (``DEEPSEEK_READ_ONLY_TOOLS``) as an
+    ABSOLUTE path, ``~`` allowed: dsh resolves a missing ``path`` (``grep``, ``glob``)
+    or a relative one against the session's work dir, while the sensitive-path and
+    ``filesystem.read`` checks resolve a relative path against the gateway's own, so
+    a ``../`` spelling of a guarded file would pass them. A call with an MCP server
+    behind it fails closed.
+    """
+    entry = DEEPSEEK_READ_ONLY_TOOLS.get(deepseek_tool_name)
+    if mcp_server_name or entry is None:
+        return False
+    policy_name, target_param, _owner = entry
+    target = raw_params.get(target_param) if isinstance(raw_params, dict) else None
+    if not isinstance(target, str) or not os.path.isabs(os.path.expanduser(target)):
+        return False
+    return policy_name in _HOST_READ_ONLY_BUILTIN_TOOLS
+
+
 def _app_owns_mcp_server(mcp_server_name: str, app: str) -> bool:
     """True when *mcp_server_name* is *app*'s OWN app-scoped MCP server.
 
     App-declared MCP servers are registered under the ``<app>:<server>`` key
-    (``apps/bridges.py`` ``_own_mcp_servers``), so the owning app is the segment
+    (``apps/bridges_agents.py`` ``_own_mcp_servers``), so the owning app is the segment
     before the first ``:``.  ``mcp_server_name`` is the trusted, NON-model-authored
     identity from ``_meta.kiro.mcpServerName`` (``AcpEvent.mcp_server_name``) —
     NOT the LLM-authored display title — so a forged shell/host title cannot spoof
@@ -582,6 +809,50 @@ def _normalize_tool_name(tool_name: str) -> str:
         if tool_name.startswith(prefix):
             return tool_name[len(prefix) :]
     return tool_name
+
+
+def untruncated_shell_title(tool_name: str, command: str | None) -> str:
+    """The title the deny tiers judge for a call whose raw *command* is known.
+
+    kiro-cli titles a shell call ``Running: <command>`` and cuts a long command
+    to its first 197 characters plus ``...``. The cut lands wherever character
+    197 falls, and a structural rule reads the end of what is left as the end of
+    the command: a push whose branch starts past the cut, its title ending
+    inside a ``--force-with-lease`` value, reads as a push that names no branch,
+    and the git-publish floor refuses a push that names one.
+
+    Only a cut-shaped title is rebuilt: without its display prefix it must be a
+    non-empty leading slice of *command*, shorter than *command*, followed by
+    ``...``. The slice length is not pinned to kiro-cli's 197, so a release that
+    moves the cut does not silently bring the over-block back. Such a title is
+    returned uncut -- the same display prefix followed by the whole command --
+    so a long command is judged exactly as a short one already is, and the
+    prefixed form still meets a deny glob written against it
+    (``Running: git push*``). Every character the cut title shows is in the
+    command, which the tiers judge anyway, so the only verdict the rebuild
+    removes is one that the cut's own end earns. The callers also judge the
+    title as sent, by the operator's own rules only
+    (``HookManager.operator_denied_regexes``), since an operator may have
+    written a rule against exactly the cut text kiro-cli displayed.
+
+    Every other title is returned unchanged and keeps its own verdict, including
+    one that begins the command without the marker (a model-authored
+    ``terraform apply`` over ``terraform apply -auto-approve``) and a slice
+    taken from anywhere but the start: judging it verbatim is what keeps a
+    dangerous title from hiding behind a benign command and keeps a rule that
+    matches the title alone firing. Without a recovered *command* -- a non-shell
+    tool, whose identifier is the title -- the title is returned unchanged too.
+    """
+    if not command:
+        return tool_name
+    shown = _normalize_tool_name(tool_name)
+    if not shown.endswith(_TITLE_TRUNCATION_MARKER):
+        return tool_name
+    kept = shown[: -len(_TITLE_TRUNCATION_MARKER)]
+    if not kept or len(kept) >= len(command) or not command.startswith(kept):
+        return tool_name
+    display_prefix = tool_name[: len(tool_name) - len(shown)]
+    return display_prefix + command
 
 
 def _context_matches(matcher: str, mode: str, context: str) -> bool:

@@ -188,9 +188,9 @@ class TestEpisodicMaxCountIsConsumed:
     def test_the_gateway_passes_the_configured_count_into_the_store(self) -> None:
         """Pinned at the call site: the field is only useful if boot threads it in."""
         source = Path(
-            live.__file__.replace("config/live.py", "slack/gateway.py").replace(
-                "config\\live.py", "slack\\gateway.py"
-            )
+            live.__file__.replace(
+                "config/live.py", "slack/gateway_runtime/service_boot.py"
+            ).replace("config\\live.py", "slack\\gateway_runtime\\service_boot.py")
         ).read_text(encoding="utf-8")
         assert "config=self._cfg" in source
 
@@ -620,7 +620,13 @@ class TestTelemetryRecorderRebuild:
         from kiro_crew.metrics import provider as provider_mod
 
         provider_mod.watch_config()
-        assert _one_sub("telemetry").prefixes == ("telemetry",)
+        # The harness settings feed the ``kirocrew.harness`` resource attribute,
+        # which only a rebuild can relabel.
+        assert provider_mod._RESOURCE_CONFIG_PATHS == ("agent.acp_backend", "agent.provider")
+        assert _one_sub("telemetry").prefixes == (
+            "telemetry",
+            *provider_mod._RESOURCE_CONFIG_PATHS,
+        )
 
     def test_watch_config_is_idempotent(self) -> None:
         """A re-entered boot path must not stack appliers that each rebuild."""

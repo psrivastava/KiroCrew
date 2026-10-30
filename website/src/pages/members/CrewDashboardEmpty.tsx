@@ -1,32 +1,31 @@
 import { useId } from 'react'
-import { ArrowRight, RefreshCw, Sparkles, Target } from 'lucide-react'
+import { LayoutDashboard, Sparkles, Target } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import CrewAvatar from '../../components/CrewAvatar'
 import { Btn } from '../../components/ui'
 
 /**
- * The Dashboard tab before the crewmate has published anything: the state every
- * new crewmate starts in, and the tab's largest surface while it lasts.
+ * The crewmate's Dashboard tab while no page is adopted: the SUGGESTIONS page.
  *
- * The crewmate speaks for itself -- its own avatar under a speech bubble -- because
- * nothing in the crew editor makes a crewmate publish. It publishes through
- * `panel_publish` when asked or on its own cycle, so the only honest next step is
- * asking it, and the bubble says so in the first person. The three prompts under it
- * are that ask, pre-written: each only lands in the member's chat box through
- * `onAct`, and the person sends it. No publish is triggered from this surface.
+ * A crewmate that never applied a page reads `state: "empty"` from its dashboard
+ * route. The gateway still composes the default template into that body, but the
+ * tab does not draw it: a page nobody chose, full of zeros, reads as the
+ * crewmate's dashboard when it is not one. The tab shows this instead.
  *
- * The prompts are a fixed set chosen to hold for any role and to land on what the
- * default panel template can draw (a few numbers, one conclusion, an update time):
- * the first gets a dashboard at all, the second makes it keep itself current, the
- * third lets the crewmate pick what matters. Deriving them from the crewmate's
- * schedules and sessions is a follow-up; this set is the fallback that follow-up
- * will keep.
+ * The crewmate speaks for itself -- its own avatar under a speech bubble --
+ * because the way to get a page is to ask it: it previews one with
+ * `dashboard_preview` and the person applies it. The prompts under the bubble
+ * are that ask, pre-written. Each only lands in the crewmate's chat box through
+ * `onAct`, and the person sends it; nothing is applied from this surface.
+ *
+ * First shipped in #18613 against the published-panel frame, and lost when
+ * #19659 deleted that frame. Ported here onto the Dynamic Dashboard.
  */
 
 /** The prompts, by full catalog key (spelled out so the dead-key scan sees each one) and glyph. Order is the order shown. */
 const PROMPTS = [
-  { key: 'pages.membersPage.dashboard_empty_prompt_publish', Icon: Sparkles },
-  { key: 'pages.membersPage.dashboard_empty_prompt_update', Icon: RefreshCw },
+  { key: 'pages.membersPage.dashboard_empty_prompt_set_up', Icon: Sparkles },
+  { key: 'pages.membersPage.dashboard_empty_prompt_choose', Icon: LayoutDashboard },
   { key: 'pages.membersPage.dashboard_empty_prompt_pick', Icon: Target },
 ] as const
 
@@ -55,7 +54,7 @@ export default function CrewDashboardEmpty({ member, displayName, avatar, onAct 
     <section
       className="h-full min-h-0 overflow-y-auto flex items-start justify-center p-6"
       aria-label={t('pages.membersPage.dashboard_empty_region', { name: displayName || member })}
-      data-testid="crew-webview-empty"
+      data-testid="crew-dashboard-suggestions"
     >
       <div className="my-auto w-full max-w-[480px] flex flex-col items-center gap-3.5">
         <div className="relative">
@@ -69,6 +68,9 @@ export default function CrewDashboardEmpty({ member, displayName, avatar, onAct 
             <p className="mt-1 text-[13px] leading-relaxed text-text">
               {t('pages.membersPage.dashboard_empty_bubble_body')}
             </p>
+            <p className="mt-1 text-[13px] leading-relaxed text-text">
+              {t('pages.membersPage.dashboard_empty_bubble_own_page')}
+            </p>
           </div>
           {/* The bubble's tail, pointing at the face: a rotated square whose two
               visible edges continue the bubble's border. */}
@@ -79,24 +81,42 @@ export default function CrewDashboardEmpty({ member, displayName, avatar, onAct 
         </div>
         <CrewAvatar seed={member} avatar={avatar} size={AVATAR_PX} />
         {onAct && (
-          <div className="mt-1.5 w-full" data-testid="crew-webview-empty-prompts">
-            <p id={leadId} className="mb-2 text-center text-[13px] text-muted">
+          <div className="mt-1.5 w-full" data-testid="crew-dashboard-suggestions-prompts">
+            {/* THE VOICE CHANGES HERE. The bubble above is the crewmate's "I"; the
+                prompts below are the PERSON's, written for them to send. A visible
+                heading naming who they are addressed to, and drafts drawn as the
+                person's own chat bubbles (a plain solid border: a dash read as "the
+                one you picked" in UX review), keep a first-time reader from taking
+                a prompt's "I" for the crewmate. The whole block sits on the SAME
+                centre axis as the bubble and the face above it: heading, lead and
+                cards are all centred. The cards fill nearly the whole column, so
+                pushing the block to one side only ever shows as two ragged lines
+                of prose, which reads as a layout slip rather than as "your side of
+                the chat". The person's voice is carried by the heading and the
+                solid-bordered card style alone, so the cards carry no chat-tail
+                corner either. */}
+            <p className="mb-1 text-center text-[13px] font-semibold text-text-strong">
+              {t('pages.membersPage.dashboard_empty_prompts_heading', { name: displayName || member })}
+            </p>
+            <p id={leadId} className="mb-2 text-center text-[12px] text-muted">
               {t('pages.membersPage.dashboard_empty_prompts_lead')}
             </p>
-            <ul className="m-0 flex list-none flex-col gap-2 p-0">
+            <ul className="m-0 flex list-none flex-col items-center gap-2 p-0">
               {PROMPTS.map(({ key, Icon }) => {
                 const text = t(key)
                 return (
-                  <li key={key}>
+                  <li key={key} className="w-[92%]">
                     <Btn
-                      className="w-full justify-start gap-2.5 rounded-[10px] px-3 py-2.5 text-left"
+                      type="button"
+                      className="user-bubble w-full items-start gap-2.5 rounded-xl border-border-strong bg-card px-3 py-2.5 text-left leading-relaxed text-card-fg hover:border-accent hover:bg-card focus-visible:outline-2 focus-visible:outline-accent"
                       onClick={() => onAct(text)}
                       aria-describedby={leadId}
-                      data-testid="crew-webview-empty-prompt"
+                      data-testid="crew-dashboard-suggestion"
                     >
-                      <Icon className="lucide-inline text-accent" aria-hidden="true" />
+                      <Icon className="lucide-inline mt-0.5 shrink-0 text-accent" aria-hidden="true" />
+                      {/* No trailing glyph: the whole card is the one control, and a
+                          return arrow or a pencil each read as a second target. */}
                       <span className="flex-1">{text}</span>
-                      <ArrowRight className="lucide-inline text-muted" aria-hidden="true" />
                     </Btn>
                   </li>
                 )

@@ -38,7 +38,7 @@ from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Mapping
 
-from kiro_crew import github_runner
+from kiro_crew import edition, github_runner
 from kiro_crew.dashboard.urls import is_loopback
 from kiro_crew.executors import subprocess_executor
 from kiro_crew.platform.context import redact_log_via_context
@@ -112,37 +112,83 @@ def _cli_path() -> str | None:
     cannot establish trusted provenance. POSIX keeps the stricter local check
     below; Windows reuses the shared executable validator, which reads the
     binary and parent ACLs because mode bits carry no useful signal there. A
-    refusal degrades exactly like a missing binary: the feature contributes
-    nothing and the documented ``dashboard.url`` fallback still works.
+    refusal degrades exactly like a missing binary for what runs: the feature
+    contributes nothing and the documented ``dashboard.url`` fallback still
+    works. What the operator is TOLD differs — see :func:`_refused_cli_path`.
     """
-    # getattr: os.geteuid does not exist on Windows, and tests exercise this
-    # path with IS_POSIX patched True on every platform.
     for candidate in _CLI_CANDIDATE_PATHS:
-        if not (os.path.isfile(candidate) and os.access(candidate, os.X_OK)):
+        if not _candidate_present(candidate):
             continue
-        validated = candidate
-        if IS_POSIX:
-            if not _posix_candidate_trusted(candidate):
-                logger.debug(
-                    "tailscale CLI at %s is in a location this deployment cannot "
-                    "trust; refusing to execute it (planted-binary defence). Use "
-                    "an explicit dashboard.url instead.",
-                    candidate,
-                )
-                continue
-        else:
-            try:
-                validated = github_runner.validate_provider_executable(candidate)
-            except ValueError as exc:
-                logger.debug(
-                    "tailscale CLI at %s failed executable trust validation: %s. "
-                    "Use an explicit dashboard.url instead.",
-                    candidate,
-                    exc,
-                )
-                continue
-        return validated
+        validated = _trusted_candidate(candidate)
+        if validated is not None:
+            return validated
     return None
+
+
+def _candidate_present(candidate: str) -> bool:
+    """Whether *candidate* is an executable file, trusted or not."""
+    return os.path.isfile(candidate) and os.access(candidate, os.X_OK)
+
+
+def _trusted_candidate(candidate: str) -> str | None:
+    """The path to execute for a present *candidate*, or ``None`` when refused."""
+    if IS_POSIX:
+        if not _posix_candidate_trusted(candidate):
+            logger.debug(
+                "tailscale CLI at %s is in a location this deployment cannot "
+                "trust; refusing to execute it (planted-binary defence). Use "
+                "an explicit dashboard.url instead.",
+                candidate,
+            )
+            return None
+        return candidate
+    try:
+        return github_runner.validate_provider_executable(candidate)
+    except ValueError as exc:
+        logger.debug(
+            "tailscale CLI at %s failed executable trust validation: %s. "
+            "Use an explicit dashboard.url instead.",
+            candidate,
+            exc,
+        )
+        return None
+
+
+def _refused_cli_path() -> str:
+    """The first vetted-location CLI that is present but refused, or ``""``.
+
+    :func:`_cli_path` treats a refused candidate exactly like a missing one,
+    which is right for what it executes and wrong for what the operator reads:
+    "install Tailscale" sends the owner of a user-owned install (Homebrew) to
+    download a product that is already running. This names the binary that was
+    found so a message can point at the remedy that works for it,
+    ``dashboard.url``. It only reports; nothing it returns is ever executed.
+    """
+    for candidate in _CLI_CANDIDATE_PATHS:
+        if _candidate_present(candidate) and _trusted_candidate(candidate) is None:
+            return candidate
+    return ""
+
+
+def refused_cli_detail() -> str:
+    """Why a present tailscale CLI is not run, or ``""`` when none was refused.
+
+    One sentence shared by the onboarding card and the ``kirocrew tailnet``
+    verbs, so every surface names the same binary and the same reason. Callers
+    append their own remedy, because "set ``dashboard.url``" means a different
+    next command on each surface.
+    """
+    return _refused_cli_sentence(_refused_cli_path())
+
+
+def _refused_cli_sentence(path: str) -> str:
+    """The :func:`refused_cli_detail` sentence for *path*, or ``""`` for none."""
+    if not path:
+        return ""
+    return (
+        f"Tailscale is installed at {path}, but that file or its folder can be "
+        "changed without administrator rights, so Kiro Crew will not run it."
+    )
 
 
 def _posix_candidate_trusted(candidate: str) -> bool:
@@ -335,6 +381,8 @@ class DaemonProbe:
     rendered as one "Tailscale not working":
 
     * ``installed=False`` — install Tailscale.
+    * ``installed=False`` with ``refused_cli`` set — Tailscale IS installed, at
+      a vetted path the ownership check refuses; set ``dashboard.url``.
     * ``reachable=False`` — the daemon is not answering; start it.
     * ``stopped=True`` — the daemon answers but Tailscale is stopped
       (``BackendState "Stopped"``, e.g. after ``tailscale down``); bring it up.
@@ -365,6 +413,11 @@ class DaemonProbe:
     #: because the remedy differs — start Tailscale, not sign in — and folding it
     #: into ``reachable`` would misname the state: the daemon IS answering.
     stopped: bool = False
+    #: Path of a CLI that sits at a vetted location but fails the planted-binary
+    #: check, so it is never run; ``""`` otherwise. ``installed`` stays ``False``
+    #: because nothing here can use it; this field keeps the remedy apart from a
+    #: machine with no Tailscale, and the card shows the path itself.
+    refused_cli: str = ""
     #: Login owning this machine, validated from ``Self.UserID`` -> ``User``.
     #: Kept server-side; the status API does not expose it to the renderer.
     login: str = ""
@@ -405,12 +458,17 @@ def probe_daemon() -> DaemonProbe:
     the allowlist.
     """
     if _cli_path() is None:
+        refused = _refused_cli_path()
         return DaemonProbe(
             name="",
             installed=False,
             reachable=False,
             logged_in=False,
-            detail="Tailscale is not installed in a standard location.",
+            detail=(
+                _refused_cli_sentence(refused)
+                or "Tailscale is not installed in a standard location."
+            ),
+            refused_cli=refused,
         )
     status, _transient = _run_json_detail(["status", "--json"])
     if not isinstance(status, dict):
@@ -491,6 +549,32 @@ def probe_daemon() -> DaemonProbe:
         peers_online=peers_online,
         https_enabled=https_enabled,
     )
+
+
+#: What every tailnet surface says when an enterprise policy does not turn it on.
+POLICY_OFF_DETAIL = "Tailnet is off by policy."
+
+
+def policy_off(*, audit_tool: str = "") -> bool:
+    """True in an enterprise build whose policy does not turn tailnet access on.
+
+    One boolean, ``capabilities.tailnet_origin``, asked of the policy layer alone
+    (``edition_locks.policy_permits``, RFC D3): a policy that permits it turns it on;
+    a silent or denying policy leaves it off. Local config, a local tier and the
+    environment cannot turn it on. No tailnet list and no Tailscale daemon is read
+    here. An ``oss`` build answers ``False`` without reading anything, and its
+    existing pin check (:func:`is_governance_pinned_off`) applies unchanged.
+
+    Pass *audit_tool* from an acting call so the answer is written to SEL; the
+    status card and other pure reads pass nothing. Publishing
+    (``tailnet_serve.publish``), origin derivation (:func:`resolve_tailnet_host`,
+    used by both gateway entry points) and its background recovery all ask here.
+    """
+    if not edition.is_enterprise():
+        return False
+    from kiro_crew.edition_locks import policy_permits
+
+    return not policy_permits("capabilities.tailnet_origin", audit_tool=audit_tool)
 
 
 def is_governance_pinned_off(*, audit_tool: str = "") -> bool:
@@ -602,6 +686,15 @@ async def resolve_tailnet_host(enabled: bool) -> str:
     """
     if not enabled:
         return ""
+    # Audited (SEL) off the event loop: resolving the ceiling and the SEL write
+    # both touch disk.
+    if await asyncio.to_thread(policy_off, audit_tool="tailnet_origin_resolve"):
+        logger.warning(
+            "dashboard.tailscale.enabled is on, but %s No tailnet origin was "
+            "derived and the Tailscale daemon was not consulted.",
+            POLICY_OFF_DETAIL,
+        )
+        return ""
     # Chokepoint (a) — THE ACTION. A ceiling pinning ``capabilities.tailnet_origin``
     # off stops the derivation itself, ahead of the daemon call: nothing is spawned
     # and no origin is contributed, so the pin closes both halves an administrator
@@ -703,6 +796,10 @@ async def _origin_governance_pinned(*, audit_tool: str = "") -> bool:
     """Evaluate the live governance ceiling off-loop, failing closed."""
 
     try:
+        # An enterprise policy that does not turn tailnet on is the same answer:
+        # recovery keeps waiting and adds no origin.
+        if await asyncio.to_thread(policy_off, audit_tool=audit_tool):
+            return True
         return await asyncio.to_thread(
             is_governance_pinned_off,
             audit_tool=audit_tool,
@@ -1177,6 +1274,61 @@ async def resolve_forwarded_peer(request: web.Request, trust: TailnetTrust) -> F
             _USER_LOGIN_HEADER,
             header_login[:64],
         )
+        return None
+    return ForwardedPeer(login=login, node=node, address=addr)
+
+
+def _direct_peer_candidate(request: web.Request, trust: TailnetTrust) -> str | None:
+    """The socket address of a tailnet peer that connected to this gateway directly.
+
+    The counterpart of :func:`_forwarded_peer_candidate` for a gateway bound to
+    its tailnet address with no local proxy in front. The address is the TCP
+    peer itself, never a header, so the only questions are whether identity
+    trust is on, whether the peer is a tailnet address, and whether it carries
+    no forwarding header. A non-loopback peer that sends any forwarding header
+    (``origin.is_proxied_request``) is a proxy on another node: its socket
+    address names the proxy device, not the person behind it, so it is never
+    attributed. No I/O.
+    """
+    from kiro_crew.dashboard.origin import is_proxied_request
+
+    if not trust.enforces_identity:
+        return None
+    remote = request.remote or ""
+    if not remote or is_loopback(remote):
+        return None
+    if is_proxied_request(request):
+        return None
+    try:
+        candidate = ipaddress.ip_address(remote)
+    except ValueError:
+        return None
+    if not any(candidate in net for net in _TAILNET_RANGES):
+        return None
+    return str(candidate)
+
+
+async def resolve_direct_peer(request: web.Request, trust: TailnetTrust) -> ForwardedPeer | None:
+    """Resolve a directly connected tailnet peer through the daemon, or ``None``.
+
+    Attribution only. The result never takes part in the session pin or the
+    login allowlist, which keep their existing behaviour for a direct
+    connection, so resolving it cannot admit or refuse a request. The daemon
+    call shares the forwarded path's cache and executor. A
+    ``Tailscale-User-Login`` header that disagrees with the daemon drops the
+    attribution, the same corroboration rule the forwarded path applies.
+    """
+    addr = _direct_peer_candidate(request, trust)
+    if addr is None:
+        return None
+    resolved = await asyncio.get_running_loop().run_in_executor(
+        subprocess_executor(), _whois_cached, addr
+    )
+    if resolved is None:
+        return None
+    login, node = resolved
+    header_login = (request.headers.get(_USER_LOGIN_HEADER) or "").strip()
+    if header_login and header_login.lower() != login.lower():
         return None
     return ForwardedPeer(login=login, node=node, address=addr)
 

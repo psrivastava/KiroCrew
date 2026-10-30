@@ -200,7 +200,8 @@ def test_the_session_control_rows_are_the_strict_rows() -> None:
 
     table = _dashboard_table()
     assert SESSION_CONTROL_TOOLS == table.names("strict")
-    assert {n for n in table.names() if n.startswith("session_")} == set(SESSION_CONTROL_TOOLS)
+    session_rows = {n for n in table.names() if n.startswith("session_") or n == "work_dispatch"}
+    assert session_rows == set(SESSION_CONTROL_TOOLS)
 
 
 def test_every_dashboard_row_is_well_formed() -> None:
@@ -240,10 +241,11 @@ def test_every_mcp_core_attribute_a_handler_reads_exists(domain: str) -> None:
     on a live tool call. This fails at collection time instead.
     """
     module = _domain(domain)
-    tree = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
+    members = (module, *map(importlib.import_module, getattr(module, "_OWNERS", ())))
     read: set[str] = {
         node.attr
-        for node in ast.walk(tree)
+        for member in members
+        for node in ast.walk(ast.parse(Path(member.__file__).read_text(encoding="utf-8")))
         if isinstance(node, ast.Attribute)
         and isinstance(node.value, ast.Name)
         and node.value.id == "mcp_core"
@@ -262,12 +264,16 @@ def test_no_unresolvable_free_names(domain: str) -> None:
     imports catch most of it; this catches the rest without executing handlers.
     """
     module = _domain(domain)
-    path = Path(module.__file__)
-    tree = ast.parse(path.read_text(encoding="utf-8"))
-    module_names = set(vars(module)) | set(dir(builtins))
+    members = (module, *map(importlib.import_module, getattr(module, "_OWNERS", ())))
+    functions = []
+    for member in members:
+        path = Path(member.__file__)
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        module_names = set(vars(member)) | set(dir(builtins))
+        functions += [(fn, module_names) for fn in tree.body]
 
     unresolved: dict[str, set[str]] = {}
-    for fn in tree.body:
+    for fn, module_names in functions:
         if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
         bound: set[str] = set()

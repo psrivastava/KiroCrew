@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import stat
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -23,6 +24,19 @@ from dashboard_owner_helpers import as_owner
 
 _STDIO = {"command": "npx", "args": ["-y", "@acme/weather-mcp"], "env": {"KEY": ""}}
 _REMOTE = {"url": "https://mcp.example.com/sse"}
+
+
+def _rebuild_that_writes(**kwargs) -> Path:
+    """A rebuild that wrote the spec: it reports the write the way the real one does."""
+    wrote_out = kwargs.get("_wrote_out")
+    if wrote_out is not None:
+        wrote_out.append(True)
+    return Path("/dev/null")
+
+
+def _rebuild_that_declines(**_kwargs) -> Path:
+    """A rebuild the shared-home guard refused: it returns the path and writes nothing."""
+    return Path("/dev/null")
 
 
 @pytest.fixture
@@ -45,7 +59,7 @@ def sandbox(fake_home, monkeypatch):
 
     import kiro_crew.agent as agent_mod
 
-    rebuild = MagicMock()
+    rebuild = MagicMock(side_effect=_rebuild_that_writes)
     monkeypatch.setattr(agent_mod, "rebuild_agent_config", rebuild)
 
     return SimpleNamespace(
@@ -110,7 +124,12 @@ class TestCustomAdd:
             resp = await client.post("/api/mcp/custom", json={"servers": {"weather": _STDIO}})
             assert resp.status == 200
             body = await resp.json()
-            assert body == {"ok": True, "added": ["weather"], "enabled": False}
+            assert body == {
+                "ok": True,
+                "added": ["weather"],
+                "enabled": False,
+                "agent_spec_rewritten": True,
+            }
             entry = _written(sandbox)["weather"]
             assert entry["command"] == "npx"
             assert entry["args"] == ["-y", "@acme/weather-mcp"]
@@ -373,7 +392,11 @@ class TestCustomUpdate:
         try:
             resp = await client.put("/api/mcp/custom/weather", json={"spec": _REMOTE})
             assert resp.status == 200
-            assert await resp.json() == {"ok": True, "name": "weather"}
+            assert await resp.json() == {
+                "ok": True,
+                "name": "weather",
+                "agent_spec_rewritten": True,
+            }
             written = _written(sandbox)["weather"]
             assert written["url"] == _REMOTE["url"]
             assert "command" not in written  # old stdio keys fully replaced
@@ -1276,3 +1299,115 @@ class TestOwnerSignInRecord:
             encoding="utf-8",
         )
         assert _owner_record() == {}
+
+
+# ---------------------------------------------------------------------------
+# A rebuild that does not write the spec is reported, not hidden
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestSpecNotRewritten:
+    async def test_add_reports_a_declined_rebuild(self, sandbox, fake_sel):
+        sandbox.rebuild.side_effect = _rebuild_that_declines
+        client = await _client()
+        try:
+            resp = await client.post("/api/mcp/custom", json={"servers": {"weather": _STDIO}})
+            assert resp.status == 200
+            body = await resp.json()
+            assert body["added"] == ["weather"]
+            assert body["agent_spec_rewritten"] is False
+            assert "weather" in _written(sandbox), "the saved server must stay saved"
+        finally:
+            await client.close()
+
+    async def test_update_reports_a_declined_rebuild(self, sandbox, fake_sel):
+        client = await _client()
+        try:
+            await client.post("/api/mcp/custom", json={"servers": {"weather": _STDIO}})
+            sandbox.rebuild.side_effect = _rebuild_that_declines
+            resp = await client.put("/api/mcp/custom/weather", json={"spec": _STDIO})
+            assert resp.status == 200
+            assert (await resp.json())["agent_spec_rewritten"] is False
+        finally:
+            await client.close()
+
+    async def test_add_reports_a_failed_rebuild(self, sandbox, fake_sel):
+        sandbox.rebuild.side_effect = RuntimeError("boom")
+        client = await _client()
+        try:
+            resp = await client.post("/api/mcp/custom", json={"servers": {"weather": _STDIO}})
+            assert resp.status == 200
+            assert (await resp.json())["agent_spec_rewritten"] is False
+        finally:
+            await client.close()
+
+
+@pytest.fixture
+def config_reads(sandbox, monkeypatch):
+    """Record (path, thread) for every attempted read of a sandboxed MCP config file.
+
+    A read is recorded BEFORE it runs, so a file that does not exist (the
+    collision scan's Kiro-global scope, say) still counts as touched.
+    """
+    real_read_text = Path.read_text
+    reads: list[tuple[Path, int]] = []
+
+    def recording_read_text(self, *args, **kwargs):
+        if self.suffix == ".json" and sandbox.home in self.parents:
+            reads.append((self, threading.get_ident()))
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", recording_read_text)
+    return reads
+
+
+@pytest.mark.asyncio
+class TestConfigReadOffTheLoop:
+    """The handlers read ``<data home>/mcp.json`` in a worker thread, not on the loop.
+
+    Each one reads under the MCP file lock, and the write in the same block is
+    already offloaded. A read on the loop stalled every session for as long as
+    a slow or network data home took to answer.
+    """
+
+    async def test_add_reads_the_config_off_the_loop(self, sandbox, fake_sel, config_reads):
+        sandbox.kirocrew_json.write_text(json.dumps({"mcpServers": {"kept": {"command": "x"}}}))
+        loop_thread = threading.get_ident()
+        client = await _client()
+        try:
+            resp = await client.post("/api/mcp/custom", json={"servers": {"weather": _STDIO}})
+            assert resp.status == 200
+        finally:
+            await client.close()
+        touched = {path for path, _ in config_reads}
+        assert sandbox.kirocrew_json in touched, "the add never loaded the config"
+        assert sandbox.home / "kiro.mcp.json" in touched, "the collision scan never ran"
+        on_loop = sorted({str(path) for path, thread in config_reads if thread == loop_thread})
+        assert on_loop == [], f"read on the event loop: {on_loop}"
+
+    async def test_get_reads_the_config_off_the_loop(self, sandbox, fake_sel, config_reads):
+        sandbox.kirocrew_json.write_text(json.dumps({"mcpServers": {"weather": _STDIO}}))
+        loop_thread = threading.get_ident()
+        client = await _client()
+        try:
+            resp = await client.get("/api/mcp/custom/weather")
+            assert resp.status == 200
+        finally:
+            await client.close()
+        assert sandbox.kirocrew_json in {path for path, _ in config_reads}
+        on_loop = sorted({str(path) for path, thread in config_reads if thread == loop_thread})
+        assert on_loop == [], f"read on the event loop: {on_loop}"
+
+    async def test_update_reads_the_config_off_the_loop(self, sandbox, fake_sel, config_reads):
+        sandbox.kirocrew_json.write_text(json.dumps({"mcpServers": {"weather": _STDIO}}))
+        loop_thread = threading.get_ident()
+        client = await _client()
+        try:
+            resp = await client.put("/api/mcp/custom/weather", json={"spec": _STDIO})
+            assert resp.status == 200
+        finally:
+            await client.close()
+        assert sandbox.kirocrew_json in {path for path, _ in config_reads}
+        on_loop = sorted({str(path) for path, thread in config_reads if thread == loop_thread})
+        assert on_loop == [], f"read on the event loop: {on_loop}"

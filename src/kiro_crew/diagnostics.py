@@ -36,14 +36,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote, urlencode
 
-from kiro_crew import __version__, platform_compat, release_channel
+from kiro_crew import __version__, agent_scratch, platform_compat, release_channel
 from kiro_crew.config.loader import config_dir
 from kiro_crew.kiro_cli import PATH_ONLY_INSTALL_NOTE, pin_kiro_cli
+from kiro_crew.platform import PlatformCompositionError, current_context, safe_context_call
 from kiro_crew.security import (
     is_sensitive_path,
     redact_credentials,
     redact_exfiltration_urls,
 )
+from kiro_crew.subprocess_utf8 import UTF8_TEXT
 from kiro_crew.validation import strip_hidden_unicode
 
 logger = logging.getLogger(__name__)
@@ -56,6 +58,9 @@ _ISSUE_NEW_URL = f"https://github.com/{_ISSUE_REPO}/issues/new"
 # the bundle (or, worse, the redaction pass).
 _MAX_CRASH_DUMPS = 5
 _MAX_IPS_REPORTS = 5
+# Same bound for the per-process kiro-cli chat logs read from agent scratch:
+# one per spawned process, so a host running many agents has many.
+_MAX_SCRATCH_CHAT_LOGS = 5
 # Keep only the newest N bundles in the output dir so a repeatedly-clicked
 # "Report a Problem" can't grow the diagnostics dir unbounded.
 _MAX_KEPT_BUNDLES = 10
@@ -347,7 +352,8 @@ def _kiro_log_dirs() -> list[Path]:
 
 
 def _usable_log(p: Path) -> bool:
-    return p.is_file() and not p.is_symlink()
+    # Link check first: `is_file()` follows a link (see `_usable_dir`).
+    return not p.is_symlink() and p.is_file()
 
 
 def _usable_dir(p: Path) -> bool:
@@ -366,8 +372,13 @@ def _usable_dir(p: Path) -> bool:
     ``SeCreateSymbolicLinkPrivilege``). A symlink-only guard is therefore open
     on exactly the platform where planting one is easiest, and what leaks
     through it is a bundle the user then attaches to a public issue.
+
+    The link check runs BEFORE ``is_dir()``, because ``is_dir()`` follows the
+    link to answer: on Windows, following a link whose target is a UNC share
+    opens an SMB connection that authenticates as this process, even when the
+    answer is then thrown away.
     """
-    return p.is_dir() and not platform_compat.is_link_or_junction(p)
+    return not platform_compat.is_link_or_junction(p) and p.is_dir()
 
 
 def _kiro_cli_chat_log() -> Path | None:
@@ -403,6 +414,38 @@ def _kiro_cli_extra_logs() -> list[Path]:
             # zip would carry two different `mcp.log` entries under one name.
             break
     return out
+
+
+def _scratch_kiro_chat_logs() -> list[Path]:
+    """Per-process kiro-cli chat logs under agent scratch, newest first.
+
+    On Linux and macOS ``agent_scratch.scratch_env`` pins the log of every
+    kiro-cli Kiro Crew spawns to ``<scratch root>/<dir>/kiro-log/kiro-chat.log``,
+    which none of :func:`_kiro_log_dirs`' shared candidates reach. Each directory
+    level must pass :func:`_usable_dir` and the log :func:`_usable_log`, so a
+    linked scratch dir or ``kiro-log`` is skipped rather than walked out of the
+    tree. Sorted by the log's mtime and capped at :data:`_MAX_SCRATCH_CHAT_LOGS`.
+    A dead process's directory is swept once it has been idle about an hour
+    (``agent_scratch.sweep_dead_scratch``), so its log is collectable until then.
+    """
+    root = agent_scratch.scratch_root()
+    if not _usable_dir(root):
+        return []
+    try:
+        children = list(root.iterdir())
+    except OSError:
+        return []
+    found: list[tuple[float, Path]] = []
+    for child in children:
+        log_dir = child / agent_scratch.KIRO_CLI_LOG_SUBDIR
+        log = log_dir / agent_scratch.KIRO_CLI_CHAT_LOG_NAME
+        try:
+            if _usable_dir(child) and _usable_dir(log_dir) and _usable_log(log):
+                found.append((log.lstat().st_mtime, log))
+        except OSError:
+            continue
+    found.sort(key=lambda entry: entry[0], reverse=True)
+    return [log for _, log in found[:_MAX_SCRATCH_CHAT_LOGS]]
 
 
 # ── Live log reader (kiro_cli_logs MCP tool) ─────────────────────────────────
@@ -967,22 +1010,56 @@ def _kiro_cli_version() -> str:
     Everything is contained: diagnostics must work precisely when the rest of
     the system is broken, so a raising lookup degrades like a failed spawn.
     """
+    # Deferred: the bundle module brings the agent-SDK pin with it, which this
+    # module -- imported on the dashboard's boot path -- does not need until a
+    # bundle is collected.
+    from kiro_crew.agent_sdk import kas_bundle
+
     try:
         binary, unpinned_exists = pin_kiro_cli()
         if binary is None:
             if unpinned_exists:
                 return f"not pinned ({PATH_ONLY_INSTALL_NOTE})"
+            if kas_bundle.kas_bundle_route():
+                # Absent AND not part of this installation: the selected harness
+                # runs Crew's own engine (``kas_engine:`` beside this line). A bare
+                # ``unavailable`` would read as the gap it is on the relay route.
+                return "unavailable (not used: KAS runs Kiro Crew's own engine bundle)"
             return "unavailable"
         out = subprocess.run(
             [binary, "--version"],
             capture_output=True,
-            text=True,
+            **UTF8_TEXT,
             timeout=5,
             check=False,
         )
         return (out.stdout or out.stderr).strip() or "unknown"
     except (OSError, subprocess.SubprocessError):
         return "unavailable"
+
+
+def _kas_engine_version() -> str:
+    """The engine line for ``versions.txt``: what the KAS bundle route runs, if selected.
+
+    ``not selected`` when the installation is on the relay route (or another
+    harness), so the kiro-cli line above it is the one that matters; on the bundle
+    route the installed engine with the release pin beside it, or ``not installed``
+    with the command, because a maintainer reading a bundle from such a host wants
+    the engine version where they would otherwise look for kiro-cli's. Contained
+    like the kiro-cli probe: a raising config read degrades to ``unknown``.
+    """
+    from kiro_crew.agent_sdk import kas_bundle
+
+    try:
+        if not kas_bundle.kas_bundle_route():
+            return "not selected"
+        engine = kas_bundle.installed_engine_label()
+        pin = kas_bundle.KAS_PIN_VERSION
+        if engine is None:
+            return f"not installed (release pins KAS {pin}; kirocrew kas install)"
+        return f"{engine} (release pins KAS {pin})"
+    except Exception:  # noqa: BLE001 - diagnostics must survive a broken setup
+        return "unknown"
 
 
 #: PEP 440 prerelease segment — see
@@ -1051,6 +1128,7 @@ def _versions_text(note: str, identity: release_channel.Provenance) -> str:
         f"channel: {identity.channel or 'unknown'}",
         f"channel_record: {identity.recorded or 'absent'}",
         f"kiro_cli_version: {_kiro_cli_version()}",
+        f"kas_engine: {_kas_engine_version()}",
         f"python: {platform.python_version()}",
         f"platform: {platform.platform()}",
         f"machine: {platform.machine()}",
@@ -1166,6 +1244,42 @@ def _issue_url(result: BundleResult, note: str, *, prefill: bool = True) -> str:
     return f"{_ISSUE_NEW_URL}?" + urlencode(params, quote_via=quote)
 
 
+def _tracker_issue_url(result: BundleResult, note: str, *, prefill: bool) -> str:
+    """The new-issue link for *result*: the edition's tracker, else the public one.
+
+    Reads the ``feedback`` CPP seam (``FeedbackTrackerProvider.report_issue_url``).
+    ``None`` -- the public Default -- keeps :func:`_issue_url`'s pre-filled GitHub
+    link byte-for-byte. A supplied URL REPLACES it rather than decorating it: the
+    public query string is GitHub's bug-report form and means nothing appended to
+    another tracker.
+
+    Fail-closed per the CPP contract: a ``PlatformCompositionError`` (a
+    non-standalone host whose companion does not compose) logs a warning and
+    returns an empty link, keeping the diagnostic bundle usable without a
+    standalone fallback. Any other adapter error, a non-string or an empty
+    string degrades to the public link through the normal fallback path.
+    """
+    try:
+        url = safe_context_call(
+            lambda: current_context().feedback.report_issue_url(result, note, prefill=prefill),
+            fallback=None,
+            log_message="edition feedback tracker unavailable; using the public tracker",
+        )
+    except PlatformCompositionError:
+        logger.warning("platform companion does not compose; skipping issue link")
+        return ""
+    if url is None:
+        return _issue_url(result, note, prefill=prefill)
+    if not isinstance(url, str) or not url.strip():
+        logger.warning(
+            "FeedbackTrackerProvider.report_issue_url() returned %s, expected a URL; "
+            "using the public tracker",
+            type(url).__name__,
+        )
+        return _issue_url(result, note, prefill=prefill)
+    return url
+
+
 def terminal_issue_url(result: BundleResult, note: str = "") -> str:
     """Issue link shaped for printing to a terminal rather than for a browser.
 
@@ -1174,9 +1288,10 @@ def terminal_issue_url(result: BundleResult, note: str = "") -> str:
     to stdout has no such guarantee — it gets selected into chat, captured from a
     shell tool, or relayed by an agent, and on those paths the pre-filled variant
     is replaced wholesale by ``[REDACTED: suspicious URL to github.com]``. This
-    variant trades the pre-filled body for a link that arrives intact.
+    variant trades the pre-filled body for a link that arrives intact. An edition
+    tracker gets the same ``prefill=False`` signal and owns keeping its query short.
     """
-    return _issue_url(result, note, prefill=False)
+    return _tracker_issue_url(result, note, prefill=False)
 
 
 def _prune_old_bundles(out_dir: Path, keep: int) -> None:
@@ -1257,6 +1372,9 @@ def collect_bundle(
         chat = _kiro_cli_chat_log()
         if chat is not None:
             text_sources.append(("kiro-chat.log", chat, True))
+        for log in _scratch_kiro_chat_logs():
+            # Named for its scratch dir: every per-process log is `kiro-chat.log`.
+            text_sources.append((f"kiro-chat/{log.parent.parent.name}.log", log, True))
         for extra in _kiro_cli_extra_logs():
             text_sources.append((f"kiro-cli-{extra.name}", extra, True))
 
@@ -1351,6 +1469,6 @@ def collect_bundle(
         zf.writestr("manifest.json", json.dumps(manifest, indent=2))
         result.included.append("manifest.json")
 
-    result.github_issue_url = _issue_url(result, note)
+    result.github_issue_url = _tracker_issue_url(result, note, prefill=True)
     _prune_old_bundles(out_dir, _MAX_KEPT_BUNDLES)
     return result

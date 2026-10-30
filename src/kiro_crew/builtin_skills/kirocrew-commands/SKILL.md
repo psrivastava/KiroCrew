@@ -127,6 +127,10 @@ Override with `PORT=` in `~/.kiro/crew/pods/<name>.env`.
 | `kirocrew chat -m "message"` | Single message (non-interactive) |
 | `kirocrew chat --model MODEL_ID` | Use a specific model (default `auto`; any id the model picker lists) |
 
+When `kirocrew chat` asks to run a tool, answer `y` to allow that call once or
+`n` to deny it, the same keys `kiro-cli chat` uses. `o` denies it and lets you
+type a reply to the agent instead. Anything else denies.
+
 ## Browsing (`browser` MCP tool, then `playwright-cli`)
 
 Browsing is not a `kirocrew` subcommand. Start with the **`browser` MCP tool**
@@ -145,7 +149,7 @@ and the full operate verbs. It must be on `PATH`; install via **Settings → Bro
 | `playwright-cli click <ref>` / `fill <ref> <text>` | Act on an element from a snapshot |
 | `playwright-cli screenshot [ref]` | Write a PNG, print its path. `[ref]` is an ELEMENT, not a path; do not pass `--filename` (it resolves against the CWD and is not auto-approved) |
 | `playwright-cli state-save` / `state-load <file>` | Save or restore a logged-in session. Bare `state-save` writes into the service's own directory; both a name and `state-load` prompt for approval, because each names a local path |
-| `playwright-cli attach --extension` | Drive the user's own running Chrome, with their logins |
+| `PLAYWRIGHT_MCP_ISOLATED=false playwright-cli attach --extension=chrome` | Drive the user's own running Chrome, with their logins |
 | `playwright-cli show --port <n> --host 127.0.0.1` | Serve the CLI's dashboard for the Browser panel |
 
 **Browsing workflow:** load the `web-browse`, `web-verify`, or `browser-auth`
@@ -224,6 +228,9 @@ writes.
 |---------|-------------|
 | `kirocrew spawn run "task"` | Spawn a background subagent (wait for result) |
 | `kirocrew spawn run --async "task"` | Fire-and-forget subagent |
+| `kirocrew spawn run --crew NAME "task"` | Run as a crew member (its memory and template); an unknown name is refused |
+| `kirocrew spawn run --agent NAME "task"` | Run under a named agent template; an unknown name is refused |
+| `kirocrew spawn run --model ID "task"` | Run on a model id; it outranks the member's and the template's pin |
 | `kirocrew spawn list` | List active subagents |
 
 ## Cron Jobs
@@ -342,7 +349,7 @@ keystone paths are still refused). The CLI is the stricter of the two.
 |---------|-------------|
 | `kirocrew app list` | List installed apps |
 | `kirocrew app install /path/to/app-dir` | Install app from local directory (needs app.json) |
-| `kirocrew app enable NAME` | Enable an installed app |
+| `kirocrew app enable NAME` | Enable an installed app (an app that asks to control your chats is allowed in the dashboard only) |
 | `kirocrew app disable NAME` | Disable an installed app |
 | `kirocrew app uninstall NAME` | Uninstall an app and preserve its data directory |
 | `kirocrew app uninstall NAME --purge-data` | Uninstall and explicitly delete the app data directory |
@@ -402,7 +409,6 @@ already-running app record -- restart it.
 | `kirocrew security events` | Show recent security event log entries (last 20) |
 | `kirocrew security events -n 50` | Show N entries |
 | `kirocrew security verify` | Verify security event log HMAC integrity |
-| `kirocrew file-delivery approve` | Finish a flagged-file delivery consent armed in the dashboard's Security panel (proves you are at the host) |
 | `kirocrew eval` | Run smoke test evaluation (~30s) |
 | `kirocrew eval memory_recall_basic` | Run specific scenario by name |
 | `kirocrew eval --all` | Run all scenarios (slow) |
@@ -459,7 +465,7 @@ resolved by the `aws` CLI and never stored by Kiro Crew. All verbs accept
 | `kirocrew cloud destroy` | Remove the instance and ALL its AWS resources |
 | `kirocrew cloud destroy --dry-run` | Show the delete command without running it |
 | `kirocrew cloud iam-policy` | Print the least-privilege IAM policy to apply |
-| `kirocrew cloud iam-boundary` | Pre-create the immutable permissions boundary (admin, one-time) |
+| `kirocrew cloud iam-boundary` | Pre-create the immutable EC2 + Fargate permissions boundaries (admin, one-time) |
 
 ## Tailnet (Tailscale)
 

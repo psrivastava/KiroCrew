@@ -26,13 +26,16 @@ from kiro_crew.apps.registry_pipeline import _FACADE
 from kiro_crew.apps.registry_pipeline.caches import (
     _expire_cache_file,
     _external_registry_cache_identity,
+    _installed_manifest_cache_path,
     _manifest_cache_path,
+    _manifest_negative_cache_path,
     _read_external_registry_cache,
 )
 from kiro_crew.apps.registry_pipeline.checkout import _communicate_with_timeout
 from kiro_crew.apps.registry_pipeline.git_targets import (
     _entry_git_url,
     _git_target_is_unsupported,
+    _git_url_host,
     _normalize_git_target,
     _public_registry_name,
     _same_git_target,
@@ -42,9 +45,14 @@ from kiro_crew.apps.registry_pipeline.indexes import (
     _apply_configured_branch,
     _fetch_and_cache_external_registry,
     _load_external_registries,
+    _registry_sign_in_refused,
 )
 from kiro_crew.apps.registry_pipeline.manifests import _resolve_manifest
-from kiro_crew.apps.registry_pipeline.sources import _effective_registries, _load_registry_file
+from kiro_crew.apps.registry_pipeline.sources import (
+    _edition_registry_rows,
+    _effective_registries,
+    _load_registry_file,
+)
 from kiro_crew.apps.registry_pipeline.store_art import _prewarm_owner_tier_store_assets
 from kiro_crew.apps.registry_pipeline.subprocess_env import _detect_probe_env
 from kiro_crew.sandbox import (
@@ -426,7 +434,9 @@ async def refresh_registries(repo: str | None = None) -> dict[str, Any]:
     Returns ``{ok, refreshed, failed, results, apps, lastSyncedAt}`` where
     ``ok`` is True only if every matched registry refreshed successfully and
     ``results`` carries the per-registry outcome so the UI can distinguish
-    "synced" from "sync failed, serving stale". When *repo* is supplied but
+    "synced" from "sync failed, serving stale"; a failed row whose clone git
+    refused for credentials also carries ``reason: "auth"`` and the ``host`` from
+    its configured URL, so the UI can name the fix and where it applies. When *repo* is supplied but
     matches no configured registry, returns ``ok: False`` with
     ``not_found: True`` so the route can map it to HTTP 404.
     """
@@ -470,7 +480,13 @@ async def refresh_registries(repo: str | None = None) -> dict[str, Any]:
         entries = await _fetch_and_cache_external_registry(reg)
         if entries is None:
             failed.append(display_name)
-            results.append({"name": display_name, "ok": False})
+            row: dict[str, Any] = {"name": display_name, "ok": False}
+            if _registry_sign_in_refused(reg.repo, reg.branch):
+                row["reason"] = "auth"
+                host = _git_url_host(reg.repo)
+                if host:
+                    row["host"] = host
+            results.append(row)
             continue
         # Expire per-app manifest caches so fresh display info is refetched
         # lazily on the next read (mtime expiry preserves the stale fallback).
@@ -478,6 +494,8 @@ async def refresh_registries(repo: str | None = None) -> dict[str, Any]:
         # derived from each row's FULL source coordinates, so a row whose
         # branch/repo changed in the new index expires the old coordinates'
         # cache (via the prior row) as well as priming a miss for the new ones.
+        # Each row's failed-fetch marker is expired with it, so a refresh
+        # retries a source whose last listing fetch failed.
         expire_paths: set[Path] = set()
         for e in (prior or []) + entries:
             if not isinstance(e, dict):
@@ -485,6 +503,8 @@ async def refresh_registries(repo: str | None = None) -> dict[str, Any]:
             entry_name = e.get("name")
             if isinstance(entry_name, str) and entry_name:
                 expire_paths.add(_manifest_cache_path(e))
+                expire_paths.add(_installed_manifest_cache_path(e))
+                expire_paths.add(_manifest_negative_cache_path(e))
         for cache_path in expire_paths:
             await asyncio.to_thread(_expire_cache_file, cache_path)
         # Prewarmed after the loop, and AFTER this expiry, so an owner-tier
@@ -628,11 +648,25 @@ async def _append_external_registry_apps(
         kept.append(entry)
     if not kept:
         return rows, set()
+    # Snapshot the index's version BEFORE the merge, which takes ``version`` from
+    # the app's own app.json -- and for an installed app that file is read from
+    # its persistent checkout, i.e. the tree that was installed, so it names the
+    # installed version until that checkout moves. The index is then the only
+    # listing input that has seen the registry's newer release.
+    index_versions = [e.get("version") for e in kept]
     resolved = await asyncio.gather(
         *[_resolve_manifest(e) for e in kept],
         return_exceptions=True,
     )
     kept = [r if isinstance(r, dict) else kept[i] for i, r in enumerate(resolved)]
+    for row, index_version in zip(kept, index_versions, strict=True):
+        # The index may only RAISE the version: a manifest fetched from the remote
+        # tip can be ahead of a lagging index, and that answer stands. An index
+        # value `_version_newer` cannot parse is never newer, so it is ignored.
+        if isinstance(index_version, str) and _version_newer(
+            index_version, row.get("version") or "0"
+        ):
+            row["version"] = index_version
     detected = await _detect_installed_probe(kept, installed_map)
     rows.extend(kept)
     return rows, detected
@@ -853,6 +887,16 @@ async def list_catalog_apps() -> list[dict[str, Any]]:
     install resolves by (which would point install-by-name at the wrong repo).
     A ``builtin`` row naming a builtin this build cannot register is dropped the
     same way, and keeps its reservation the same way.
+
+    Edition rows (the ``AppsLoader.registry_rows`` seam) are added to the
+    published list on the same ADD-only terms ``_load_registry_file`` adds them to
+    the seed: a catalog row or a bundled seed row wins a name collision, the first
+    of two edition rows sharing a name wins, and the filters below judge them like
+    any other row.
+    Replacing the seed with the catalog would otherwise drop every edition row
+    whenever the catalog is reachable. They carry no display copy of their own,
+    so like external rows they pay the manifest fetch, and they are probed with
+    ``detectInstalled`` -- the same treatment ``list_registry`` gives them.
     """
     # Off the event loop: the first call after a cache expiry does network I/O.
     rows = await asyncio.to_thread(official_catalog.list_catalog_rows)
@@ -862,6 +906,39 @@ async def list_catalog_apps() -> list[dict[str, Any]]:
     seed_by_name = {
         e["name"]: e for e in installable if isinstance(e, dict) and isinstance(e.get("name"), str)
     }
+    seen = {row.get("name") for row in rows}
+    rows = list(rows)
+    edition_rows: list[dict[str, Any]] = []
+    for row in await asyncio.to_thread(_edition_registry_rows):
+        name = row.get("name")
+        if name in seen:
+            continue
+        seen.add(name)
+        # Install-by-name resolves through ``_load_registry_file``, where a bundled
+        # seed row wins a same-name edition row. List the edition row only when it
+        # is the row its name installs, or its card would show one app and Install
+        # another. Its own names cannot simply be reserved: the merged seed already
+        # carries every surviving edition row, so that would drop them all.
+        seed = seed_by_name.get(name)
+        if seed is not None and seed != row:
+            continue
+        edition_rows.append(dict(row))
+    if edition_rows:
+        # An edition row is a bare ``app-registry.json`` row (name and source
+        # coordinates, no display copy), so it is dressed exactly as
+        # ``list_registry`` dresses it offline: the index author is snapshotted
+        # before the manifest merge overwrites ``author``, and display copy and
+        # ``version`` come from the app's own app.json.
+        for row in edition_rows:
+            row["_index_author"] = row.get("author")
+        resolved_edition = await asyncio.gather(
+            *[_resolve_manifest(row) for row in edition_rows],
+            return_exceptions=True,
+        )
+        edition_rows = [
+            r if isinstance(r, dict) else edition_rows[i] for i, r in enumerate(resolved_edition)
+        ]
+        rows.extend(edition_rows)
     installable_names = set(seed_by_name)
     # Reserve every catalog name BEFORE the git filter, plus every seed name, so
     # an external row can never shadow a catalog/seed name — including a catalog
@@ -916,7 +993,16 @@ async def list_catalog_apps() -> list[dict[str, Any]]:
 
     installed = await asyncio.to_thread(list_installed_apps)
     installed_map = {a["name"]: a for a in installed}
-    rows, detected = await _append_external_registry_apps(rows, reserved_names, installed_map)
+    # Probed like every seed row is offline, so an edition app installed outside
+    # the app manager reads installed on either path.
+    edition_names = {row.get("name") for row in edition_rows}
+    detected = await _detect_installed_probe(
+        [row for row in rows if row.get("name") in edition_names], installed_map
+    )
+    rows, external_detected = await _append_external_registry_apps(
+        rows, reserved_names, installed_map
+    )
+    detected |= external_detected
     trust_repositories = _trust_repository_bindings(rows, installed_map, resolved_repositories)
     return _apply_trust_fields(
         _enrich_with_install_status(rows, installed_map, detected),
@@ -1221,7 +1307,10 @@ def _resolve_install_entry(name: str) -> tuple[dict[str, Any] | None, str]:
     pinned_url = str(meta.get("sourceUrl", "") or "")
     if not pinned_url:
         try:
-            return get_registry_app(name), ""
+            # The install itself: one bad store-listing response must not
+            # refuse this click from memory without a real fetch attempt.
+            with official_catalog.install_attempt():
+                return get_registry_app(name), ""
         except official_catalog.CatalogUnavailable as exc:
             # A refusal, not an absence: report the cause so the user is not sent
             # looking for a missing app during a catalog outage.

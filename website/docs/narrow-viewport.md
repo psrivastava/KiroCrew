@@ -43,7 +43,7 @@ the difference is whether the heading can ever have a sibling above it:
   heading, and that panel returns `null` when nothing is pending — so the heading moves in
   and out of `:first-child` with the pending count, and a positional rule would make the
   gap depend on it. (A conditionally rendered `Modal` does NOT have this effect: it
-  `createPortal`s to `document.body` and never occupies a sibling slot.)
+  portals to the body-level overlay root and never occupies a sibling slot.)
 - **A heading that repeats within one tab** (`SettingsSection`, used many times per
   Settings tab; `LocalStorageDebug`'s section headings) keeps `mt-6`, because the gap
   between two sections is real, and pairs it with `first:mt-0`. The fragment adds no DOM
@@ -98,8 +98,7 @@ text label, keeps `HOVER_NONE_ACTION_BTN_CLS` / `HOVER_NONE_ACTIONS_ROW_CLS` and
 square, and an always-visible icon control takes `mc-touch-hit` (next entry).
 
 **An always-visible icon control gets its 44px from `mc-touch-hit`, not from padding.** The
-`mc-touch-hit` / `mc-touch-hit-y` / `mc-touch-hit-end` classes (`index.css`, the block after
-the `.scrollbar-overlay` coarse rule) add an invisible `::after` that extends only the hit
+`mc-touch-hit` / `mc-touch-hit-y` / `mc-touch-hit-end` classes (`src/styles/scrollbars-and-touch-hit.css`) add an invisible `::after` that extends only the hit
 area to 44px on each axis where the control is smaller, so drawn size and layout do not
 change; use them on header, top-bar and row kebabs, toggles and split-button segments (`-y`
 for a segment with neighbours on both sides, `-end` for the last segment, which grows away
@@ -129,7 +128,7 @@ Pinching magnifies a `position: fixed` / `h-dvh` layout whose scrollers are all
 visual viewport: topbar, composer and drawer leave at once and only a second pinch
 brings them back. Three mechanisms enforce it because no single one covers every
 engine — `maximum-scale=1, user-scalable=no` in `index.html` (Blink, Gecko), a root
-`html { touch-action: pan-x pan-y }` under `@media (pointer: coarse)` in `index.css`
+`html { touch-action: pan-x pan-y }` under `@media (pointer: coarse)` in `src/styles/highlights-and-page-zoom.css`
 (Blink's pinch and double-tap paths), and cancelling Safari's `gesturestart` in
 `utils/pageZoom.ts` (WebKit has ignored the viewport zoom keys for user gestures
 since iOS 10). Pointer-fine devices are untouched: ctrl+wheel and the trackpad pinch
@@ -145,7 +144,7 @@ one.
 full-viewport magnify overlays — the image viewer (`Lightbox` in
 `components/markdown/Lightbox.tsx`, exported through `MarkdownRenderer.tsx`), the
 diagram viewer (`DiagramLightbox.tsx`), and the
-screenshot viewer in `pages/AppDetailPage.tsx`. Each one needs its own gesture: a
+screenshot viewer in `pages/AppDetailPageArt.tsx`. Each one needs its own gesture: a
 diagram viewer without one is unmagnifiable by any gesture, because its content is
 fit-scaled vector whose labels are smallest at exactly the state it opens in. Checking the
 documented example is not enough — count the instances, because a rule reads as satisfied
@@ -279,11 +278,11 @@ gesture:
 
 | cell | who renders it | what is in it |
 |---|---|---|
-| leading (`auto`) | `App.tsx` | the crew switcher (when a remote crew exists) and downstream widgets (while they exist); usually empty. Not the update pill: beside a remote crew's chip + dropdown it was a third action, so on this page a pending update is the first item of the overflow menu (`UpdatePill variant="menu-item"`, same lifecycle label) |
-| centre (`minmax(0,1fr)`) | `ChatPage.tsx` through `pages/chat/page/MobileTopBar.tsx`, by `createPortal` into `#mobile-topbar-slot` | sessions toggle, then ONE control that is the session title with the menu chevron flush after it (`ChatHeaderMenu` `triggerLabel`); Rename and Regenerate title are items of that menu (`SessionActionsMenu` `onRename` / `onAutoTitle`), and it leads with "New chat in {folder}" (`ChatHeaderMenu` `newSessionHere`), which opens a sibling session in the on-screen session's folder with that folder's agent and project, and Rename swaps in the shared title editor. That menu leaves out its pop-out / focus-popped-out rows here (`omitPopout`): the trailing ⋯ menu is the phone's window menu and carries them, and the same row in two adjacent menus read as two different actions. Nothing else: the inline row's `InboundLinkChip` would be a third control, so a two-way link's actions are read from the session menu's Linked surfaces section |
-| trailing (`auto`, `.tb-trail`) | `App.tsx`, plus the same `MobileTopBar`'s portal into `#mobile-topbar-trail-slot` | exactly two: the bell, then the page's overflow menu (update when pending, pop out or focus the popped-out window, activity panel, split view). The update row reads `<status> — Open update settings`: a menu row is read as an action, and the row only navigates to Settings › About, so it names that outcome instead of implying a download or restart. The update row is a lazy chunk inside its own `ErrorBoundary`, so a chunk that fails to load costs the row, not the page (a rejection would otherwise reach the route boundary); the fallback is an inline `ErrorNotice` plus its `ErrorNoticeMenuItem` hand-off (`errors-use-error-notice`), never `null`, because this menu is the update's only phone home and a silent gap would hide the failure |
+| leading (`auto`) | `shell/topbar/shellHeader.tsx` | the crew switcher (when a remote crew exists) and downstream widgets (while they exist); usually empty. Not the update pill: beside a remote crew's chip + dropdown it was a third action, so on this page a pending update is the first item of the overflow menu (`UpdatePill variant="menu-item"`, same lifecycle label) |
+| centre (`minmax(0,1fr)`) | `pages/chat/page/SessionsSidebarChrome.tsx` through `pages/chat/page/MobileTopBar.tsx`, by `createPortal` into `#mobile-topbar-slot` | sessions toggle, then ONE control that is the session title with the menu chevron flush after it (`ChatHeaderMenu` `triggerLabel`); Rename and Regenerate title are items of that menu (`SessionActionsMenu` `onRename` / `onAutoTitle`), and it leads with "New chat in {folder}" (`ChatHeaderMenu` `newSessionHere`), which opens a sibling session in the on-screen session's folder with that folder's agent and project, and Rename swaps in the shared title editor. That menu leaves out its pop-out / focus-popped-out rows here (`omitPopout`): the trailing ⋯ menu is the phone's window menu and carries them, and the same row in two adjacent menus read as two different actions. Nothing else: the inline row's `InboundLinkChip` would be a third control, so a two-way link's actions are read from the session menu's Linked surfaces section |
+| trailing (`auto`, `.tb-trail`) | `shell/topbar/shellHeader.tsx`, plus the same `MobileTopBar`'s portal into `#mobile-topbar-trail-slot` | exactly two: the bell, then the page's overflow menu (update when pending, pop out or focus the popped-out window, activity panel, split view). The update row reads `<status> — Open update settings`: a menu row is read as an action, and the row only navigates to Settings › About, so it names that outcome instead of implying a download or restart. The update row is a lazy chunk inside its own `ErrorBoundary`, so a chunk that fails to load costs the row, not the page (a rejection would otherwise reach the route boundary); the fallback is an inline `ErrorNotice` plus its `ErrorNoticeMenuItem` hand-off (`errors-use-error-notice`), never `null`, because this menu is the update's only phone home and a silent gap would hide the failure |
 
-That is the `topbar-single` header variant (`index.css`), applied only while
+That is the `topbar-single` header variant (`src/styles/shell-chrome.css`), applied only while
 `isMobile && isChat`. **Its side cells are plain flex divs, not `.tb-left` /
 `.tb-right`.** Those two are inline-size containers for the collapse ladders, and
 a size container in an `auto` track has no content size to give, so it collapses
@@ -358,7 +357,7 @@ container already claims its own swipe via `data-owns-swipe`.
 
 The rail carries everything the nav drawer does except Connect-your-phone, which is
 moot on the phone itself: the Main rows and Library on top, the apps, then
-Developer (in developer mode), Terminal (which toggles the docked panel and closes
+Terminal (which toggles the docked panel and closes
 the drawer so the panel is not left behind it), Capabilities and Kiro Account, with
 Settings and Search pinned at the foot. `shell/nav/adaptiveMobileRail.tsx` places
 that secondary group: it stays pinned above Settings while the Apps list keeps
@@ -366,6 +365,21 @@ that secondary group: it stays pinned above Settings while the Apps list keeps
 the apps, behind a separator. The decision reads `stableRailHeight` — the tallest
 height seen at the current window width — so the on-screen keyboard or a browser
 toolbar shrinking the rail at the same width never moves the tiles.
+
+**The Mates page hosts the same drawer.** On a phone `/members` lands on a
+mate exactly as a wide window does, and its roster is a left drawer over the
+open chat: the same rail (App provides `MobileNavRailContext` on this route too)
+beside the roster aside, which is portaled into the drawer while a chat or team
+is open. A rightward drag or the header's back control reveals it, a leftward
+drag reveals the side panel (a full-width overlay that slides on `sidePanelX`),
+and each gesture is off while the other's panel is open. The drawer mints the
+same duplicate history entry, and a roster pick spends it FIRST, then opens the
+mate on the entry below (`consumeRosterDrawerEntry`), so Back never reopens
+the mate just left. With nothing open the roster is the page, the page
+binds nothing and claims no side, and the shell's nav-drawer swipe works there.
+With a mate or team open, or about to open, the page also shares the chat page's single top bar: `mobileSingle` covers it, so the shell drops its logo row and the page portals its thread header (drawer toggle, identity pill, panel toggle) into `#mobile-topbar-slot`, beside the bell. The page says which bar it needs through `MobileRosterBarContext`: `open` once a mate or team is on screen; `pending` while one is still being read (the landing, or a `?team=` link before the teams read answers); `roster` for the bare roster with no one to open (an empty roster, a failed read, a `?team=` link whose team does not resolve), which has no drawer and needs the bar's logo to reach the navigation, and on unmount. Every phone `/members` visit starts on the single bar and keeps it while the page is `pending`, because the page opens its mate from an effect and a bar keyed on the URL alone flashed the logo row for the frames before `?member=` landed. The bar does not change under a slow read: until the page reports `open` the shell's nav-drawer swipe stays on and the shell puts a nav-drawer toggle (the logo row's `Menu` glyph) in the slot, so the navigation is one swipe or one tap away and the bar is never empty. The page looks up the bar slot only once it reports `open`. In the bar the drawer toggle and the panel toggle are bare icons, as on the Sessions bar, and the identity pill drops its vertical padding so it stays as tall as the 32px controls beside it; over the pane they stay Glass chips. With no overflow menu to carry it, the update pill sits in the trailing cell before the bell, with its text shown in a pill capped at 88px that truncates, and asks the page before it leaves for Settings › About. The rail's Home control navigates with `replace` without closing the drawer
+when its host is not the chat page, since that close would pop the entry after
+the replace.
 
 **Haptics.** `lib/haptic.ts` makes one best-effort tap: `navigator.vibrate` on
 Android, the hidden switch-checkbox click on iOS where the `switch` attribute exists
@@ -422,7 +436,8 @@ data-owns-swipe={embedded ? undefined : 'left right'}
 Two kinds of surface need no attribute, and it is worth knowing why rather than
 copying:
 
-- **Anything portaled to `document.body`** is outside the shell entirely, so the
+- **Anything portaled to the body level** (`document.body` or the overlay root
+  under it, `src/components/overlayRoot.tsx`) is outside the shell entirely, so the
   gesture cannot reach it. That covers `Modal`, the notification sheet, and the
   collapsed-rail tooltips. A static read of the JSX suggests otherwise — the sheet is
   written inside the topbar — so check for `createPortal` before concluding a surface
@@ -547,6 +562,63 @@ A committed close therefore parks the phase at `'closing'`, not `'closed'`: the 
 still on screen and its mount predicate keys on `!== 'closed'`, so writing `'closed'`
 here would cut the slide short. That also matches what a tap-driven close already did,
 which is why the chrome derived from the phase does not change timing.
+
+### The desktop counterpart: a trackpad swipe on the Mates page
+
+Off the phone the Mates page plays a two-finger trackpad swipe as the same side-panel
+DRAG (`useMembersPageTrackpadSwipe` over `hooks/useTrackpadSwipe`): to the left the
+panel follows the fingers in and settles open on its Dashboard tab, to the right it
+follows them out. A trackpad sends `wheel` events, not touches, so the reader cuts the
+stream into runs and reports the fingers' summed `deltaX`; the page drives `sidePanelX`
+from it directly (no touch events are synthesized) and on lift-off applies the phone's
+release rule from `useDrawerSwipe`'s exported constants (`COMMIT_DRAG_SHARE` 20%,
+`COMMIT_VELOCITY` 0.4 px/ms, the speed read over the fingers' last 60ms) and the phone's
+`animateDrawer` settle. An opening swipe while a Profile schedule draft is at stake does
+not drag: it goes to `togglePanel`, whose guard asks before anything is committed. While
+the drag runs the panel is a sheet on the right edge driven by `sidePanelX`, and a spacer in the
+page row as wide as the sheet's visible part (`deskSpacerW`) moves the chat's right edge
+with it, so the chat narrows and widens with the fingers. On desktop the settle runs on
+the main thread (same curve and timing) so the spacer can read every frame; the phone
+keeps its compositor settle. Once it settles, the resting state is published through
+`togglePanel` / the strip's focus (only for a run that revealed the panel) / the strip's
+close, and the placement takes it back with no width transition, since the spacer
+already stands at the column's width. A run's owner is fixed by its first event: a vertical
+start, a pinch (`ctrlKey`), a run over content that can still scroll that way, and a
+direction with nothing to do are all left alone; a new run during a settle grabs the
+panel where it is presenting it and follows from there, as a phone's drag can; anything else is cancelled event by event, with
+`overscroll-behavior-x: contain` on the document root while it runs, so macOS's
+back/forward swipe does not start under it. The drag is released only on a real
+lift-off: a 100ms gap (read from the events' own timestamps, so a slow frame is not a
+lift), or the momentum tail's signature, three steps in a row each smaller than the last
+by a near-constant ratio. A finger that slows down or pauses for 60ms wobbles instead and
+keeps following 1:1, so a slow partial drag holds where it is and, on lift-off, falls
+back. Steps that may be the tail are held back and dropped once it is recognised, so the
+panel stops where the fingers left it; the rest of the run never drags again. A
+horizontal scroller is found through the event's composed path, so one inside a shadow
+root keeps its own scroll.
+Under reduced motion there is no live drag: a clear swipe switches once at the run's
+end. The Dashboard frame on this page relays its unowned horizontal runs (`relayWheel`,
+the wheel sibling of `relayTouches`, opt-in per host so the chat page's preview and the
+Command Center keep their back swipe); the frame relays only while armed, which the host
+does in answer to the frame's hello while its swipe listens and undoes when it stops (a
+phone-width window, a creation surface), so a run nobody acts on is never cancelled; a
+relayed run may only start the close, and only while the Dashboard tab is on screen. A static Dashboard page (sandbox without
+`allow-scripts`) runs no relay, so a swipe that starts over one is the frame's.
+
+In the macOS desktop app the release can be exact. The shell reads Chromium's
+`gestureScrollBegin` / `gestureScrollEnd` off the dashboard's WebContents `input-event`
+(`electron/scroll-touch.js`) and sends each change as `begin` or `end` through the preload's
+`onScrollTouch`; `lib/scrollTouch` subscribes. Once a phase has been heard, `end` releases the
+drag (`onDragEnd('lift', at)`, with `at` the lift-off, so the 60ms speed is the fingers' own),
+and a pause with the fingers still down no longer ends it, up to `FINGER_HOLD_MAX_MS`
+(1s, so a lost `end` cannot hold the panel). The gap and the momentum signature stay armed
+as the fallback, and a page that never hears a phase (a browser, Windows, Linux) behaves
+exactly as above. A remote crew's pane is a cross-origin iframe of InstancesViewport with no
+preload: its own document reads the wheels over it, and it asks its host for the phases
+(`mc-scroll-touch-watch`). The host accepts the request only from that pane's own iframe at
+its tunnel origin, holds one bridge subscription while any pane listens, and forwards each
+phase only to the pane on screen, addressed to its exact origin; the pane accepts a phase
+only from `window.parent` at the origin it asked, for its own watch id.
 
 ## A panel that gains a gesture must be bound LIVE to its offset
 

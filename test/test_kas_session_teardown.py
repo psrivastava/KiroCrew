@@ -27,6 +27,7 @@ from kiro_crew.acp.types import (
     METHOD_KAS_SESSION_DELETE,
     METHOD_SESSION_TERMINATE,
 )
+from kiro_crew.testing.wait import await_until, finished
 
 
 def _runtime(tmp_path, backend: str) -> AcpRuntime:
@@ -61,11 +62,22 @@ class TestTeardownIsStillBestEffort:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("backend", [ACP_BACKEND_KAS, ""])
-    async def test_a_dead_runtime_skips_the_round_trip(self, tmp_path, backend):
+    async def test_a_dead_runtime_skips_the_round_trip(self, tmp_path, backend, monkeypatch):
         runtime = _runtime(tmp_path, backend)
+        runtime._session_queues["sess-1"] = asyncio.Queue()
+        # A process is set, so being dead is the only reason to skip the send.
+        runtime._process = object()  # type: ignore[assignment]
         runtime._dead = True
-        # Never spawned, so a round-trip would raise rather than no-op.
+        sent: list[tuple] = []
+
+        async def record(*args, **_k):
+            sent.append(args)
+
+        monkeypatch.setattr(runtime, "_send_and_await", record)
+        monkeypatch.setattr(runtime, "send_notification", record)
         await runtime.terminate_session("sess-1")
+        assert sent == []
+        assert "sess-1" not in runtime._session_queues
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("backend", [ACP_BACKEND_KAS, ""])
@@ -151,7 +163,7 @@ class TestReadinessFailureLifetime:
 
         async def wait_mcp_ready(*_a, **_k):
             entered.set()
-            await asyncio.wait_for(asyncio.Event().wait(), timeout=10.0)
+            await asyncio.Event().wait()
 
         runtime, handle, send, sibling_queue = _readiness_subject(
             tmp_path,
@@ -161,14 +173,14 @@ class TestReadinessFailureLifetime:
         params = {"sessionId": "failed"} if resumed else {}
         task = asyncio.create_task(runtime._wait_managed_mcp(handle, params, "worker", 30.0, 0))
         try:
-            await asyncio.wait_for(entered.wait(), timeout=5.0)
+            await await_until(entered, timeout=5.0)
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
-                await asyncio.wait_for(task, timeout=5.0)
+                await await_until(task, timeout=5.0)
         finally:
             if not task.done():
                 task.cancel()
-            await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), timeout=5.0)
+            await finished(asyncio.gather(task, return_exceptions=True), "gather", timeout=5.0)
 
         _assert_readiness_cleanup(runtime, send, sibling_queue, resumed=resumed)
 

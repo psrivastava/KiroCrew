@@ -19,8 +19,8 @@ Three layers, each pinned where its defect would live:
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import math
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -33,10 +33,12 @@ from kiro_crew.config.loader import (
     KiroCrewConfig,
 )
 from kiro_crew.dashboard.chat import api_chat_slot_autocompact
+from kiro_crew.dashboard.chat_handlers import _autocompact_txn_lock
 from kiro_crew.dashboard.chat_persistence import _validate_autocompact_pct
 from kiro_crew.dashboard.chat_utils import slot_history_key
 from kiro_crew.dashboard.state import DashboardState, _ChatSlot
 from kiro_crew.session import SessionManager
+from kiro_crew.testing.wait import async_wait_until
 
 
 def _manager() -> SessionManager:
@@ -142,6 +144,45 @@ class TestAutocompactEndpoint:
             assert data["min"] == AUTOCOMPACT_PCT_MIN
             assert data["max"] == AUTOCOMPACT_PCT_MAX
             assert AUTOCOMPACT_PCT_MIN < data["global_pct"] <= AUTOCOMPACT_PCT_MAX
+
+    @pytest.mark.asyncio
+    async def test_get_names_a_live_self_compacting_backend(self) -> None:
+        """A live KAS session compacts on its own, so GET names it and the
+        popover can say the slider does not apply."""
+        slot = _ChatSlot("test")
+        state = _mock_state(slot)
+        state.sessions.get_provider.return_value = SimpleNamespace(
+            harness_managed_compaction_backend="kas"
+        )
+        async with TestClient(TestServer(_make_app(state))) as client:
+            data = await (await client.get("/api/chat/slots/test/autocompact")).json()
+        assert data["harness_managed"] == "kas"
+
+    @pytest.mark.asyncio
+    async def test_get_reports_none_for_a_live_crew_compacted_backend(self) -> None:
+        slot = _ChatSlot("test")
+        state = _mock_state(slot)
+        state.sessions.get_provider.return_value = SimpleNamespace(
+            harness_managed_compaction_backend=None
+        )
+        async with TestClient(TestServer(_make_app(state))) as client:
+            data = await (await client.get("/api/chat/slots/test/autocompact")).json()
+        assert data["harness_managed"] is None
+
+    @pytest.mark.asyncio
+    async def test_get_without_a_live_session_asks_the_backend_selector(self) -> None:
+        """No live session: the answer is for the backend the next session
+        starts on, from the same selector a new session uses."""
+        slot = _ChatSlot("test")
+        state = _mock_state(slot)
+        state.sessions.get_provider.return_value = None
+        with patch(
+            "kiro_crew.members.select_provider_backend",
+            return_value="kas",
+        ):
+            async with TestClient(TestServer(_make_app(state))) as client:
+                data = await (await client.get("/api/chat/slots/test/autocompact")).json()
+        assert data["harness_managed"] == "kas"
 
     @pytest.mark.asyncio
     async def test_post_sets_slot_and_live_session(self) -> None:
@@ -599,15 +640,19 @@ class TestConcurrentPostSerialization:
         state = _mock_state(slot)
         calls = 0
         second_done = asyncio.Event()
+        txn_lock = _autocompact_txn_lock(slot_history_key(slot))
 
         async def saver(*args: object, **kwargs: object) -> bool:
             nonlocal calls
             calls += 1
             if calls == 1:
-                # Hold the first request's persist open so the second can
-                # (absent serialization) run its whole transaction, then fail.
-                with contextlib.suppress(asyncio.TimeoutError):
-                    await asyncio.wait_for(second_done.wait(), 0.5)
+                # Hold the first request's persist open until the second request is
+                # parked on the slot's transaction lock -- or, absent serialization,
+                # has run its whole transaction -- then fail.
+                await async_wait_until(
+                    lambda: second_done.is_set() or bool(txn_lock._waiters),
+                    describe=lambda: f"second committed: {second_done.is_set()}",
+                )
                 raise OSError("disk full")
             second_done.set()
             return True

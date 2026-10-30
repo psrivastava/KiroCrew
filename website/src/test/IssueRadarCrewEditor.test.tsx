@@ -22,6 +22,8 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen, fireEvent, waitFor, within } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { i18nT } from '../i18n/t'
 
 /* ── Mocks: the api transport and the shared context ──
@@ -51,8 +53,8 @@ const AGENTS = [
 ]
 const MODELS = [
   { name: 'auto', description: '' },
-  { name: 'claude-opus-5', description: 'Deep reasoning' },
-  { name: 'gpt-5.6-sol', description: 'Fast' },
+  { name: 'claude-opus-5', description: 'Deep reasoning', rateMultiplier: 2.2 },
+  { name: 'gpt-5.6-sol', description: 'Fast', rateMultiplier: 0.4 },
 ]
 
 vi.mock('../hooks/useAgents', () => ({
@@ -84,6 +86,7 @@ vi.mock('../components/SimpleSelect', () => ({
     onChange,
     clearLabel,
     triggerFallback,
+    optionBadges,
     'aria-label': ariaLabel,
   }: {
     options: string[]
@@ -91,6 +94,7 @@ vi.mock('../components/SimpleSelect', () => ({
     onChange: (v: string) => void
     clearLabel?: string
     triggerFallback?: string
+    optionBadges?: ({ label: string; hint?: string } | undefined)[]
     'aria-label'?: string
   }) => {
     // Mirrors the real trigger: the selected row's own text, and `clearLabel`
@@ -123,16 +127,24 @@ vi.mock('../components/SimpleSelect', () => ({
               {clearLabel}
             </button>
           )}
-          {options.map(o => (
-            <button
-              key={o}
-              type="button"
-              role="option"
-              aria-selected={o === value}
-              onClick={() => onChange(o)}
-            >
-              {o}
-            </button>
+          {options.map((o, i) => (
+            <span key={o}>
+              <button
+                type="button"
+                role="option"
+                aria-selected={o === value}
+                onClick={() => onChange(o)}
+              >
+                {o}
+              </button>
+              {/* Beside the option, not inside it, so the option's accessible
+                  name stays the bare value the tests pick by. */}
+              {optionBadges?.[i] && (
+                <span data-testid={`stub-badge-${o}`} title={optionBadges[i]?.hint}>
+                  {optionBadges[i]?.label}
+                </span>
+              )}
+            </span>
           ))}
         </div>
       </div>
@@ -147,6 +159,7 @@ vi.mock('../apps/issue-radar/context', () => ({
 }))
 
 import CrewEditor from '../apps/issue-radar/components/CrewEditor'
+import { formatMultiplier } from '../components/ModelDropdownList'
 import { djb2, ghostVariantCount } from '../apps/issue-radar/components/CrewGhost'
 import type { Crew } from '../apps/issue-radar/api'
 
@@ -251,6 +264,7 @@ describe('CrewEditor — create mode', () => {
     // (rather than one key) is caught too.
     pick('crew-editor-agent', 'kirocrew-crew')
     pick('crew-editor-model', 'claude-opus-5')
+    pick('crew-editor-triage-model', 'gpt-5.6-sol')
     fireEvent.change(screen.getByTestId('crew-editor-prompt'), {
       target: { value: 'stay off the release branch' },
     })
@@ -271,6 +285,7 @@ describe('CrewEditor — create mode', () => {
       avatar_variant: null,
       agent: 'kirocrew-crew',
       model: 'claude-opus-5',
+      triage_model: 'gpt-5.6-sol',
       extra_prompt: 'stay off the release branch',
       labels: ['area: dashboard'],
       auto_resolve_conflicts: true,
@@ -491,6 +506,86 @@ describe('CrewEditor — the agent and model pickers', () => {
   })
 })
 
+describe('CrewEditor — the triage model picker', () => {
+  it('defaults to Off and offers the served model list', async () => {
+    await openCreate()
+    expect(trigger('crew-editor-triage-model')).toHaveTextContent(i18nT(`${K}.triage_model_off`))
+    expect(optionsOf('crew-editor-triage-model')).toEqual([
+      i18nT(`${K}.triage_model_off`),
+      'claude-opus-5',
+      'gpt-5.6-sol',
+    ])
+  })
+
+  it('leaves the work model out: as a triage model it is the same as Off', async () => {
+    renderEditor(CREW)
+    await screen.findByTestId('crew-editor')
+    expect(CREW.model).toBe('claude-opus-5')
+    expect(optionsOf('crew-editor-triage-model')).toEqual([
+      i18nT(`${K}.triage_model_off`),
+      'gpt-5.6-sol',
+    ])
+  })
+
+  it('shows each row its credit cost so the cheaper choice is visible', async () => {
+    await openCreate()
+    const triage = field('crew-editor-triage-model')
+    expect(triage.getByTestId('stub-badge-gpt-5.6-sol')).toHaveTextContent(formatMultiplier(0.4))
+    expect(triage.getByTestId('stub-badge-claude-opus-5')).toHaveTextContent(formatMultiplier(2.2))
+    expect(triage.getByTestId('stub-badge-gpt-5.6-sol')).toHaveAttribute(
+      'title',
+      i18nT('components.modelDropdownList.credit_multiplier', { value: formatMultiplier(0.4) }),
+    )
+  })
+
+  it('gives the Model picker the same badges, so the triage costs have a reference', async () => {
+    renderEditor(CREW)
+    await screen.findByTestId('crew-editor')
+    const model = field('crew-editor-model')
+    expect(model.getByTestId('stub-badge-claude-opus-5')).toHaveTextContent(formatMultiplier(2.2))
+    expect(model.getByTestId('stub-badge-gpt-5.6-sol')).toHaveTextContent(formatMultiplier(0.4))
+  })
+
+  it('gives a stored model the list no longer serves no cost badge', async () => {
+    renderEditor({ ...CREW, triage_model: 'retired-model' })
+    await screen.findByTestId('crew-editor')
+    expect(optionsOf('crew-editor-triage-model')).toContain('retired-model')
+    expect(field('crew-editor-triage-model').queryByTestId('stub-badge-retired-model')).toBeNull()
+  })
+
+  it('sends only the triage model when that is all that changed', async () => {
+    renderEditor(CREW)
+    await screen.findByTestId('crew-editor')
+    pick('crew-editor-triage-model', 'gpt-5.6-sol')
+    fireEvent.click(submitBtn())
+
+    await waitFor(() => expect(mockApi.updateCrew).toHaveBeenCalledTimes(1))
+    expect(mockApi.updateCrew).toHaveBeenCalledWith(ACTIVE, CREW.id, { triage_model: 'gpt-5.6-sol' })
+  })
+
+  it('switches triage off with an empty value', async () => {
+    renderEditor({ ...CREW, triage_model: 'gpt-5.6-sol' })
+    await screen.findByTestId('crew-editor')
+    pick('crew-editor-triage-model', i18nT(`${K}.triage_model_off`))
+    fireEvent.click(submitBtn())
+
+    await waitFor(() => expect(mockApi.updateCrew).toHaveBeenCalledTimes(1))
+    expect(mockApi.updateCrew).toHaveBeenCalledWith(ACTIVE, CREW.id, { triage_model: '' })
+  })
+
+  it('treats a record from a gateway without the field as Off', async () => {
+    // The fixture predates the field. Nothing changed, so nothing is sent: an
+    // absent field is not a pending edit.
+    expect('triage_model' in CREW).toBe(false)
+    renderEditor(CREW)
+    await screen.findByTestId('crew-editor')
+    expect(trigger('crew-editor-triage-model')).toHaveTextContent(i18nT(`${K}.triage_model_off`))
+    fireEvent.click(submitBtn())
+    await waitFor(() => expect(mockApi.updateCrew).toHaveBeenCalledTimes(1))
+    expect(mockApi.updateCrew).toHaveBeenCalledWith(ACTIVE, CREW.id, {})
+  })
+})
+
 describe('CrewEditor — the form survives what happens around it', () => {
   /** Escape, dispatched where Radix listens for it: DismissableLayer binds
    *  `keydown` on `document` with `{ capture: true }`, so a handler on the input
@@ -646,6 +741,31 @@ describe('CrewEditor — the close guard', () => {
 
     await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1))
     expect(guard()).not.toBeInTheDocument()
+  })
+})
+
+describe('CrewEditor — the idle wake shows the interval crews really use', () => {
+  it('matches the idle_secs the backend arms every crew loop with', async () => {
+    // REGRESSION (#25467): the field showed 120 while every crew loop is armed
+    // with `DEFAULT_IDLE_SECS = 300`. The number is read from the backend source,
+    // so a change on either side without the other fails here.
+    const src = readFileSync(
+      join(
+        __dirname, '..', '..', '..',
+        'src', 'kiro_crew', 'apps', 'builtins', 'issue_radar', 'backend',
+        'crew_runtime_session.py',
+      ),
+      'utf8',
+    )
+    const match = /^DEFAULT_IDLE_SECS = (\d+)$/m.exec(src)
+    expect(match).not.toBeNull()
+    const idleSecs = Number(match![1])
+
+    await openCreate()
+    expect(screen.getByTestId('crew-editor-backstop')).toHaveValue(String(idleSecs))
+    expect(
+      screen.getByText(i18nT(`${K}.backstop_fixed`, { seconds: idleSecs })),
+    ).toBeInTheDocument()
   })
 })
 

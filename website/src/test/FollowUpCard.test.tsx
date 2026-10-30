@@ -49,7 +49,18 @@ describe('FollowUpCard', () => {
   it('calls onAddToSession with the item', () => {
     const { onAddToSession } = setup()
     fireEvent.click(screen.getByRole('button', { name: /add to this session/i }))
-    expect(onAddToSession).toHaveBeenCalledWith(item())
+    expect(onAddToSession).toHaveBeenCalledWith(item(), 0)
+  })
+
+  it('passes the clicked item and its index to Start and Add', async () => {
+    const items = [item({ title: 'A' }), item({ title: 'B' }), item({ title: 'C' })]
+    const { onAddToSession, onStartInWorktree } = setup({ items })
+    fireEvent.click(screen.getAllByRole('button', { name: /start in new worktree/i })[1])
+    expect(onStartInWorktree).toHaveBeenCalledWith(items[1], 1)
+    // Every action is disabled while a start is pending.
+    await waitFor(() => expect(screen.getAllByRole('button', { name: /add to this session/i })[2]).toBeEnabled())
+    fireEvent.click(screen.getAllByRole('button', { name: /add to this session/i })[2])
+    expect(onAddToSession).toHaveBeenCalledWith(items[2], 2)
   })
 
   it('passes the item index to onSkip so siblings survive', () => {
@@ -76,7 +87,7 @@ describe('FollowUpCard', () => {
     expect(screen.queryByRole('button', { name: /start in new chat/i })).not.toBeInTheDocument()
     expect(screen.getByText('Both actions pre-fill the composer — nothing is sent until you press send.')).toBeInTheDocument()
     fireEvent.click(worktree)
-    expect(onStartInWorktree).toHaveBeenCalledWith(item())
+    expect(onStartInWorktree).toHaveBeenCalledWith(item(), 0)
     expect(onStartInNewChat).not.toHaveBeenCalled()
   })
 
@@ -90,7 +101,7 @@ describe('FollowUpCard', () => {
     // The in-session route stays available too.
     expect(screen.getByRole('button', { name: /add to this session/i })).not.toBeDisabled()
     fireEvent.click(newChat)
-    expect(onStartInNewChat).toHaveBeenCalledWith(item())
+    expect(onStartInNewChat).toHaveBeenCalledWith(item(), 0)
     expect(onStartInWorktree).not.toHaveBeenCalled()
   })
 
@@ -111,10 +122,36 @@ describe('FollowUpCard', () => {
     expect(newChat.getAttribute('title')).toContain('/repo')
     expect(newChat.getAttribute('title')).toMatch(/not a git repository/)
     fireEvent.click(newChat)
-    await waitFor(() => expect(onStartInNewChat).toHaveBeenCalledWith(item()))
+    await waitFor(() => expect(onStartInNewChat).toHaveBeenCalledWith(item(), 0))
     expect(onStartInWorktree).not.toHaveBeenCalled()
     expect(screen.getByText(/the new chat opens in this session's project directory/i)).toBeInTheDocument()
     expect(screen.queryByText(/unavailable|worktree|git/i)).not.toBeInTheDocument()
+  })
+
+  it('offers "Start in new chat" for a plain folder inside a repository rooted higher up', async () => {
+    // The probe says "in git", but the folder is not the work-tree root, so a
+    // worktree would branch the whole enclosing repository.
+    const { onStartInWorktree, onStartInNewChat } = setup({
+      projectDir: '/home/me/notes', projectIsRepo: true, enclosingRepoRoot: '/home/me',
+    })
+    expect(screen.queryByRole('button', { name: /start in new worktree/i })).not.toBeInTheDocument()
+    const newChat = screen.getByRole('button', { name: /start in new chat/i })
+    expect(newChat).not.toBeDisabled()
+    expect(newChat).toHaveAttribute(
+      'title',
+      'Open a new chat in /home/me/notes without a worktree, because it is inside the git repository at /home/me, not its root',
+    )
+    fireEvent.click(newChat)
+    await waitFor(() => expect(onStartInNewChat).toHaveBeenCalledWith(item(), 0))
+    expect(onStartInWorktree).not.toHaveBeenCalled()
+    expect(screen.getByText(/the new chat opens in this session's project directory/i)).toBeInTheDocument()
+  })
+
+  it('ignores an enclosing repository root when the session has no project dir', () => {
+    setup({ projectDir: undefined, enclosingRepoRoot: '/home/me' })
+    expect(screen.getByRole('button', { name: /start in new chat/i })).toHaveAttribute(
+      'title', 'Open a new chat without a worktree, because this session has no project directory',
+    )
   })
 
   it('renders a new-chat failure inline and lets the user retry', async () => {
@@ -262,6 +299,22 @@ describe('followup card reducers', () => {
     )
     const after = reducer(withCard, dismissFollowupItem({ slot: 'chat-1', index: 0 }))
     expect(after.followups['chat-1'].items.map(i => i.title)).toEqual(['B'])
+  })
+
+  it('dismissing with the item removes it even after another removal shifted its index', () => {
+    const [a, b, c] = [item({ title: 'A' }), item({ title: 'B' }), item({ title: 'C' })]
+    let s = reducer(initial, setFollowupCard({ slot: 'chat-1', items: [a, b, c], ts: 10 }))
+    // A start of C (rendered at index 2) is in flight when A is skipped.
+    s = reducer(s, dismissFollowupItem({ slot: 'chat-1', index: 0, ts: 10 }))
+    s = reducer(s, dismissFollowupItem({ slot: 'chat-1', index: 2, ts: 10, item: c }))
+    expect(s.followups['chat-1'].items).toEqual([b])
+  })
+
+  it('dismissing an item that is already gone removes nothing', () => {
+    const [a, b] = [item({ title: 'A' }), item({ title: 'B' })]
+    const s = reducer(initial, setFollowupCard({ slot: 'chat-1', items: [a, b], ts: 10 }))
+    const after = reducer(s, dismissFollowupItem({ slot: 'chat-1', index: 0, ts: 10, item: item({ title: 'Z' }) }))
+    expect(after.followups['chat-1'].items).toEqual([a, b])
   })
 
   it('dismissing the last item clears the card', () => {

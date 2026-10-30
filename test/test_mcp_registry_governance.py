@@ -26,7 +26,13 @@ from kiro_crew.kiro_cli import (
     signed_in_via_idc,
 )
 
-MANAGED = ("kirocrew-core", "kirocrew-cron", "kirocrew-guide", "kirocrew-computer")
+MANAGED = (
+    "kirocrew-core",
+    "kirocrew-cron",
+    "kirocrew-guide",
+    "kirocrew-mate",
+    "kirocrew-computer",
+)
 
 # ``kirocrew-computer`` carries a ``spec_gate`` and is therefore absent from an
 # emitted spec on any non-macOS host (and on macOS with the keystone off) -- see
@@ -60,16 +66,18 @@ def _point_config_at(tmp_path: Path, monkeypatch) -> None:
 
 
 class TestRegistryModeDeclaration:
-    def test_absent_key_is_not_registry_mode(self, tmp_path, monkeypatch):
-        """A personal install must emit today's spec byte-for-byte."""
-        _write_config(tmp_path, registry_mode=None)
+    @pytest.mark.parametrize(
+        "declared,expected",
+        [
+            # A personal install must emit today's spec byte-for-byte.
+            pytest.param(None, False, id="absent-key-is-not-registry-mode"),
+            pytest.param(True, True, id="declared-true-is-registry-mode"),
+        ],
+    )
+    def test_the_declaration_decides_registry_mode(self, tmp_path, monkeypatch, declared, expected):
+        _write_config(tmp_path, registry_mode=declared)
         _point_config_at(tmp_path, monkeypatch)
-        assert agent_mod._mcp_registry_mode() is False
-
-    def test_declared_true_is_registry_mode(self, tmp_path, monkeypatch):
-        _write_config(tmp_path, registry_mode=True)
-        _point_config_at(tmp_path, monkeypatch)
-        assert agent_mod._mcp_registry_mode() is True
+        assert agent_mod._mcp_registry_mode() is expected
 
     @pytest.mark.parametrize("junk", ["true", 1, [], {"a": 1}, None])
     def test_only_a_real_bool_counts(self, tmp_path, monkeypatch, junk):
@@ -94,33 +102,29 @@ class TestRegistryModeDeclaration:
         cfg = KiroCrewConfig.load()
         assert cfg.agent.mcp_registry_mode is True
 
-    def test_local_overlay_declaration_is_honoured(self, tmp_path, monkeypatch):
-        """`kirocrew config set --local` writes config.local.json, which deep-merges
-        OVER config.json. Reading only the base file would ignore a declaration made
-        the way the CLI advertises as upgrade-durable, emit no marker, and reproduce
-        the silent drop this change exists to prevent."""
-        _write_config(tmp_path, registry_mode=None)
+    @pytest.mark.parametrize(
+        "base,overlay",
+        [
+            # `kirocrew config set --local` writes config.local.json, which
+            # deep-merges OVER config.json. Reading only the base file would ignore
+            # a declaration made the way the CLI advertises as upgrade-durable, emit
+            # no marker, and reproduce the silent drop this mode exists to prevent.
+            pytest.param(None, True, id="local-overlay-declaration-is-honoured"),
+            # Precedence runs both ways: an overlay that disables it must win over a
+            # base file that enables it, or a host cannot switch the marker off.
+            pytest.param(True, False, id="local-overlay-can-turn-the-declaration-off"),
+        ],
+    )
+    def test_the_local_overlay_wins(self, tmp_path, monkeypatch, base, overlay):
+        _write_config(tmp_path, registry_mode=base)
         (tmp_path / "config.local.json").write_text(
-            json.dumps({"agent": {"mcp_registry_mode": True}}), encoding="utf-8"
+            json.dumps({"agent": {"mcp_registry_mode": overlay}}), encoding="utf-8"
         )
         monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
         monkeypatch.setattr(agent_mod, "_mc_config_path", lambda: tmp_path / "config.json")
         if hasattr(KiroCrewConfig.load, "cache_clear"):
             KiroCrewConfig.load.cache_clear()
-        assert agent_mod._mcp_registry_mode() is True
-
-    def test_local_overlay_can_turn_the_declaration_off(self, tmp_path, monkeypatch):
-        """Precedence runs both ways: an overlay that disables it must win over a
-        base file that enables it, or a host cannot switch the marker off."""
-        _write_config(tmp_path, registry_mode=True)
-        (tmp_path / "config.local.json").write_text(
-            json.dumps({"agent": {"mcp_registry_mode": False}}), encoding="utf-8"
-        )
-        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
-        monkeypatch.setattr(agent_mod, "_mc_config_path", lambda: tmp_path / "config.json")
-        if hasattr(KiroCrewConfig.load, "cache_clear"):
-            KiroCrewConfig.load.cache_clear()
-        assert agent_mod._mcp_registry_mode() is False
+        assert agent_mod._mcp_registry_mode() is overlay
 
 
 class TestIdentityProbeIsAudited:
@@ -220,21 +224,27 @@ class TestIdcDetection:
         con.commit()
         con.close()
 
-    def test_idc_rows_are_detected(self, tmp_path):
+    @pytest.mark.parametrize(
+        "keys,expected",
+        [
+            pytest.param(("auth.idc.start-url", "auth.idc.region"), True, id="idc-rows-detected"),
+            pytest.param(
+                ("telemetryClientId", "migration.kiro.completed"),
+                False,
+                id="builder-id-store-is-not-idc",
+            ),
+        ],
+    )
+    def test_the_stored_rows_decide_idc(self, tmp_path, keys, expected):
         db = kiro_cli_state_dbs("linux", tmp_path, {})[0]
-        self._make_db(db, ("auth.idc.start-url", "auth.idc.region"))
-        assert signed_in_via_idc("linux", tmp_path, {}) is True
-
-    def test_builder_id_store_is_not_idc(self, tmp_path):
-        db = kiro_cli_state_dbs("linux", tmp_path, {})[0]
-        self._make_db(db, ("telemetryClientId", "migration.kiro.completed"))
-        assert signed_in_via_idc("linux", tmp_path, {}) is False
+        self._make_db(db, keys)
+        assert signed_in_via_idc("linux", tmp_path, {}) is expected
 
     def test_absent_store_is_not_idc(self, tmp_path):
         assert signed_in_via_idc("linux", tmp_path, {}) is False
 
     def test_corrupt_store_is_not_idc(self, tmp_path):
-        """"Cannot tell" must never render as an enterprise diagnosis."""
+        """ "Cannot tell" must never render as an enterprise diagnosis."""
         db = kiro_cli_state_dbs("linux", tmp_path, {})[0]
         db.parent.mkdir(parents=True, exist_ok=True)
         db.write_bytes(b"not a database")
@@ -526,9 +536,7 @@ class TestDoctorSurvivesAMalformedSpec:
         """The fallback spawns kiro-cli; pin it so no test reaches a real binary."""
         _floor_monkeypatch.setattr(cli_doctor, "_doctor_whoami_governance", lambda: False)
 
-    @pytest.mark.parametrize(
-        "servers", ["not-a-dict", ["kirocrew-core"], 7, True, "", [], {}]
-    )
+    @pytest.mark.parametrize("servers", ["not-a-dict", ["kirocrew-core"], 7, True, "", [], {}])
     def test_non_dict_mcp_servers_does_not_crash(self, tmp_path, monkeypatch, capsys, servers):
         path = tmp_path / "kirocrew.json"
         path.write_text(json.dumps({"mcpServers": servers}), encoding="utf-8")

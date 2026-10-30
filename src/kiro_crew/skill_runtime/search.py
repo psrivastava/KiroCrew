@@ -3,8 +3,9 @@
 Ranks a query over metadata and bodies (the term index first, bounded direct
 reads for the rest), serves an exact key while a first walk is still running, and
 resolves ``$skillname`` tokens. The available set itself
-(``SkillsLoader.scoped_skills``) and exact reads (``read_scoped_skill``) stay in
-the facade with the other ``repo_scope`` gate sites.
+(``SkillsLoader.scoped_skills``) and exact reads (``read_scoped_skill``) live in
+``kiro_crew.skills_selection`` and ``kiro_crew.skills_body_reads``, with the other
+``repo_scope`` gate sites.
 """
 
 from __future__ import annotations
@@ -174,16 +175,20 @@ def _exact_read_while_building(
     if loader.catalog_status(project_dir) != "building" or not loader._safe_name(key):
         return None
     disabled_apps = loader._get_disabled_app_names()
-    for root in (loader._dir, *loader._extra_paths):
+    loader_roots = [loader._dir, *loader._extra_paths]
+    for root in loader_roots:
         candidate = root / key / "SKILL.md"
         if not candidate.is_file():
             continue
         # Precedence is the enumeration's: the first root holding the key wins,
         # so a refusal here is final rather than a reason to try a lower root.
-        if only is not None and not _catalog._matches_any(
-            str(candidate), _catalog._with_canonical_globs(only, project_dir)
-        ):
-            return None
+        if only is not None:
+            globs = _catalog._with_canonical_globs(only, project_dir)
+            if not (
+                _catalog._matches_any(str(candidate), globs)
+                or _catalog._alias_matches(candidate, globs, loader_roots)
+            ):
+                return None
         if disabled_apps and loader._owning_app(key, candidate) in disabled_apps:
             return None
         return loader.load_skill(

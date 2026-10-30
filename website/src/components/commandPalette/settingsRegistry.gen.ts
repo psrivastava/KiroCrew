@@ -26,7 +26,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "about.update-the-gateway-automatically",
     "label": "Update the gateway automatically",
     "labelKey": "pages.settings.aboutPanel.automatic_updates",
-    "description": "Installs a new release once no work is running and restarts the gateway, on installs that can update themselves.",
+    "description": "Restarts the gateway to install a new release once no work is running. When off, it stays on its current version.",
     "tab": "about",
     "type": "toggle",
     "occurrence": 1,
@@ -48,6 +48,20 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "type": "toggle",
     "occurrence": 1,
     "configKey": "dashboard.use_builtin_browser"
+  },
+  {
+    "id": "channels.agent-sessions-slack",
+    "label": "Agent sessions (Slack)",
+    "labelKey": "pages.settings.slackPanel.slackCode.agent_sessions",
+    "labelSuffix": "Slack",
+    "description": "Slack threads show a live status and title, and a Stop button that stops the agent's current reply.",
+    "tab": "channels",
+    "type": "toggle",
+    "occurrence": 1,
+    "params": {
+      "channel": "slack"
+    },
+    "configKey": "slack.agent_sessions"
   },
   {
     "id": "channels.allowed-emails-webex",
@@ -574,7 +588,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "label": "Owner Slack member ID (Slack)",
     "labelKey": "pages.settings.slackPanel.owner_slack_member_id",
     "labelSuffix": "Slack",
-    "description": "The one member who can always interact with the bot (KIROCREW_OWNER_ID). Starts with U or W.",
+    "description": "Your Slack member ID (KIROCREW_OWNER_ID): in Slack, open your profile, select ⋮, then Copy member ID. Starts with U or W.",
     "tab": "channels",
     "type": "input",
     "occurrence": 1,
@@ -587,7 +601,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "label": "Phase reactions (Slack)",
     "labelKey": "pages.settings.slackPanel.phase_reactions",
     "labelSuffix": "Slack",
-    "description": "Show phase-aware emoji reactions (queued → thinking → coding → done) on messages.",
+    "description": "Add 👀 to a message while it is answered (only where Slack shows no thread status) and 😱 if the turn fails.",
     "tab": "channels",
     "type": "toggle",
     "occurrence": 1,
@@ -814,7 +828,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "chat.auto-compact-threshold",
     "label": "Auto-Compact Threshold",
     "labelKey": "pages.settings.chatPanel.auto_compact_threshold",
-    "description": "Context usage % at which auto-compaction triggers. Lower = more frequent compaction, longer sessions",
+    "hint": "Context usage % at which auto-compaction triggers. Lower = more frequent compaction, longer sessions. Does not apply to KAS sessions, which compact on their own.",
     "tab": "chat",
     "type": "select",
     "occurrence": 1,
@@ -827,7 +841,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "chat.auto-open-git-in-side-panel",
     "label": "Auto-Open Git in Side Panel",
     "labelKey": "pages.settings.chatPanel.auto_open_git_panel",
-    "description": "Expand the side panel to the Git tab each time you start a chat in a git project. The Git tab is created either way.",
+    "hint": "Expand the side panel to the Git tab each time you start a chat in a git project. The Git tab is created either way.",
     "tab": "chat",
     "type": "toggle",
     "occurrence": 1,
@@ -839,7 +853,8 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "chat.auto-title-refresh-interval-turns",
     "label": "Auto-title refresh interval (turns)",
     "labelKey": "pages.settings.chatPanel.title_refresh_every_turns",
-    "description": "Re-checks an auto-generated session title at each interval of your turns and renames the session when its topic has moved. The shortest interval is 4 turns. A title you renamed yourself never changes. Default is the built-in schedule (turns 8 and 24). Each refresh uses tokens.",
+    "description": "Default is the built-in schedule (turns 8 and 24). Each refresh uses tokens.",
+    "hint": "Re-checks an auto-generated session title at each interval of your turns and renames the session when its topic has moved. The shortest interval is 4 turns. A title you renamed yourself never changes.",
     "tab": "chat",
     "type": "stepper",
     "occurrence": 1,
@@ -852,7 +867,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "chat.background-effort",
     "label": "Background Effort",
     "labelKey": "pages.settings.chatPanel.background_effort",
-    "description": "Applies only on reasoning-capable models. 'Model default' applies no override — this work does not inherit your Default Reasoning Effort.",
+    "hint": "Applies only on reasoning-capable models. 'Model default' applies no override — this work does not inherit your Default Reasoning Effort.",
     "tab": "chat",
     "type": "select",
     "occurrence": 1,
@@ -864,7 +879,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "chat.background-model",
     "label": "Background Model",
     "labelKey": "pages.settings.chatPanel.background_model",
-    "description": "'Auto' lets the provider pick — it does not inherit your Default Model. Pin a model to run this work on it.",
+    "hint": "'Auto' lets the provider pick — it does not inherit your Default Model. Pin a model to run this work on it.",
     "tab": "chat",
     "type": "select",
     "occurrence": 1,
@@ -876,7 +891,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "chat.compact-empty-folders",
     "label": "Compact Empty Folders",
     "labelKey": "pages.settings.chatPanel.compact_empty_folders",
-    "description": "A folder with no chats takes one row instead of two, and its New chat button moves onto the folder's own row",
+    "hint": "A folder with no chats takes one row instead of two, and its New chat button moves onto the folder's own row",
     "tab": "chat",
     "type": "toggle",
     "occurrence": 1,
@@ -888,7 +903,8 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "chat.compaction-time-limit-seconds",
     "label": "Compaction Time Limit (seconds)",
     "labelKey": "pages.settings.chatPanel.compaction_wait_budget",
-    "description": "Past this limit the session restarts, or a manual compaction reports that it timed out. Raise it if compaction on a large context regularly needs more than 300 seconds. Longest a compaction may run. 0 = default (300 s). Otherwise 60 to 3,600 s.",
+    "description": "Longest a compaction may run. 0 = default (300 s). Otherwise 60 to 3,600 s.",
+    "hint": "Past this limit the session restarts, or a manual compaction reports that it timed out. Raise it if compaction on a large context regularly needs more than 300 seconds.",
     "tab": "chat",
     "type": "input",
     "occurrence": 1,
@@ -912,7 +928,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "chat.completion-event-truncation",
     "label": "Completion Event Truncation",
     "labelKey": "pages.settings.chatPanel.completion_event_truncation",
-    "description": "Which part of a subagent's stream to keep when injecting its completion event into the parent session. Head preserves the start (default). Tail preserves the final summary. Both keeps a slice from each end with a marker between them.",
+    "hint": "Which part of a subagent's stream to keep when injecting its completion event into the parent session. Head preserves the start (default). Tail preserves the final summary. Both keeps a slice from each end with a marker between them.",
     "tab": "chat",
     "type": "select",
     "occurrence": 1,
@@ -924,7 +940,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "chat.confirm-before-closing-session",
     "label": "Confirm Before Closing Session",
     "labelKey": "pages.settings.chatPanel.confirm_before_closing_session",
-    "description": "Show a confirmation dialog when closing a session",
+    "hint": "Show a confirmation dialog when closing a session",
     "tab": "chat",
     "type": "toggle",
     "occurrence": 1,
@@ -936,7 +952,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "chat.content-width",
     "label": "Content Width",
     "labelKey": "pages.settings.chatPanel.content_width",
-    "description": "Compact is the original view. Comfortable and Full use more screen space.",
+    "hint": "Compact is the original view. Comfortable and Full use more screen space.",
     "tab": "chat",
     "type": "buttonGroup",
     "occurrence": 1,
@@ -948,7 +964,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "chat.content-filter-fallback-model",
     "label": "Content-filter fallback model",
     "labelKey": "pages.settings.chatPanel.refusal_fallback_model",
-    "description": "Auto retries on the model the provider suggests in its refusal, when it names one. The retry is announced in chat. Disabled shows the refusal as before.",
+    "hint": "Auto retries on the model the provider suggests in its refusal, when it names one. The retry is announced in chat. Disabled shows the refusal as before.",
     "tab": "chat",
     "type": "select",
     "occurrence": 1,
@@ -956,6 +972,18 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
       "sub": "models"
     },
     "configKey": "agent.refusal_fallback_model"
+  },
+  {
+    "id": "chat.copy-on-select",
+    "label": "Copy on select",
+    "labelKey": "pages.settings.chatPanel.copy_on_select",
+    "hint": "Copy text to the clipboard as soon as you select it in the conversation with the mouse. The Quote, Ask about this and Copy row still opens.",
+    "tab": "chat",
+    "type": "toggle",
+    "occurrence": 1,
+    "params": {
+      "sub": "transcript"
+    }
   },
   {
     "id": "chat.default-memory-mode",
@@ -974,7 +1002,8 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "chat.default-model",
     "label": "Default Model",
     "labelKey": "pages.settings.chatPanel.default_model",
-    "description": "Agents with their own configured model ignore this setting. 'Default' uses the model from the agent configuration, or the system default when none is configured. Changing this does not affect sessions that are already open. Which model new sessions start with when their agent pins none. Set a model per agent under Customize → Crewmates, or pick one inside a session to override it there.",
+    "description": "Which model new sessions start with when their agent pins none. Set a model per agent under Customize → Mates, or pick one inside a session to override it there.",
+    "hint": "Agents with their own configured model ignore this setting. 'Default' uses the model from the agent configuration, or the system default when none is configured. Changing this does not affect sessions that are already open.",
     "tab": "chat",
     "type": "select",
     "occurrence": 1,
@@ -995,10 +1024,24 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     }
   },
   {
+    "id": "chat.default-sidebar-folder-for-new-chats",
+    "label": "Default Sidebar Folder for New Chats",
+    "labelKey": "pages.settings.chatPanel.default_session_folder",
+    "description": "The sidebar folder new chats are filed into when you start one without choosing a folder. It groups chats in the sidebar; it is not a folder on disk.",
+    "hint": "The chat uses the folder's linked project and agent, as New chat in folder does.",
+    "tab": "chat",
+    "type": "select",
+    "occurrence": 1,
+    "params": {
+      "sub": "sessions"
+    },
+    "configKey": "dashboard.default_session_folder"
+  },
+  {
     "id": "chat.describe-your-role",
     "label": "Describe your role",
     "labelKey": "pages.settings.chatPanel.describe_your_role",
-    "description": "Kiro uses this description to adapt vocabulary and examples to your role.",
+    "hint": "Kiro uses this description to adapt vocabulary and examples to your role.",
     "tab": "chat",
     "type": "input",
     "occurrence": 1,
@@ -1022,7 +1065,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "chat.double-click-to-edit-your-messages",
     "label": "Double-click to edit your messages",
     "labelKey": "pages.settings.chatPanel.double_click_to_edit",
-    "description": "When off, a double-click on your message selects a word as in any text.",
+    "hint": "When off, a double-click on your message selects a word as in any text.",
     "tab": "chat",
     "type": "toggle",
     "occurrence": 1,
@@ -1034,7 +1077,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "chat.fallback-model",
     "label": "Fallback model",
     "labelKey": "pages.settings.chatPanel.fallback_model",
-    "description": "Auto (default) lets the backend route to an available model. A fallback swap is announced in chat and sticks until your model recovers. Disabled turns fallback off.",
+    "hint": "Auto (default) lets the backend route to an available model. A fallback swap is announced in chat and sticks until your model recovers. Disabled turns fallback off.",
     "tab": "chat",
     "type": "select",
     "occurrence": 1,
@@ -1047,7 +1090,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "chat.feature-tips",
     "label": "Feature Tips",
     "labelKey": "pages.settings.chatPanel.feature_tips",
-    "description": "Show occasional feature discovery tips above the composer while the agent is working",
+    "hint": "Show occasional feature discovery tips above the composer while the agent is working",
     "tab": "chat",
     "type": "toggle",
     "occurrence": 1,
@@ -1059,7 +1102,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "chat.file-change-chips",
     "label": "File Change Chips",
     "labelKey": "pages.settings.chatPanel.file_change_chips",
-    "description": "How file diff chips appear below assistant messages",
+    "hint": "How file diff chips appear below assistant messages",
     "tab": "chat",
     "type": "select",
     "occurrence": 1,
@@ -1083,7 +1126,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "chat.follow-up-bar-layout",
     "label": "Follow-Up Bar Layout",
     "labelKey": "pages.settings.chatPanel.follow_up_bar_layout",
-    "description": "Multiline wraps suggestions onto multiple rows. Single line keeps them on one horizontally-scrollable row.",
+    "hint": "Multiline wraps suggestions onto multiple rows. Single line keeps them on one horizontally-scrollable row.",
     "tab": "chat",
     "type": "buttonGroup",
     "occurrence": 1,
@@ -1095,13 +1138,38 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "chat.history-expanded",
     "label": "History Expanded",
     "labelKey": "pages.settings.chatPanel.history_expanded",
-    "description": "Expand history sidebar by default",
+    "hint": "Expand history sidebar by default",
     "tab": "chat",
     "type": "toggle",
     "occurrence": 1,
     "params": {
       "sub": "sessions"
     }
+  },
+  {
+    "id": "chat.jump-to-the-bottom-when-you-send",
+    "label": "Jump to the bottom when you send",
+    "labelKey": "pages.settings.chatPanel.scroll_on_send",
+    "hint": "When off, sending a message leaves the transcript where it is.",
+    "tab": "chat",
+    "type": "toggle",
+    "occurrence": 1,
+    "params": {
+      "sub": "transcript"
+    }
+  },
+  {
+    "id": "chat.keep-side-panel-open",
+    "label": "Keep Side Panel Open",
+    "labelKey": "pages.settings.chatPanel.side_panel_always_open",
+    "hint": "Opens the side panel in every chat, including new chats and after a reload. Closing it hides it until you switch chats. This setting does not apply on a phone.",
+    "tab": "chat",
+    "type": "toggle",
+    "occurrence": 1,
+    "params": {
+      "sub": "sidepanel"
+    },
+    "configKey": "dashboard.side_panel_always_open"
   },
   {
     "id": "chat.link-previews",
@@ -1131,7 +1199,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "chat.merge-queued-messages",
     "label": "Merge Queued Messages",
     "labelKey": "pages.settings.chatPanel.merge_queued_messages",
-    "description": "Combine follow-up messages into a single labeled prompt while the agent is busy",
+    "hint": "Combine follow-up messages into a single labeled prompt while the agent is busy",
     "tab": "chat",
     "type": "toggle",
     "occurrence": 1,
@@ -1143,7 +1211,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "chat.message-font-size",
     "label": "Message Font Size",
     "labelKey": "pages.settings.chatPanel.message_font_size",
-    "description": "Font size for the conversation, in every session: message text, code, tables, suggested replies and the message input. The Compact content width grows to match. Sidebar, session list and the rest of the interface are unaffected.",
+    "hint": "Font size for the conversation, in every session: message text, code, tables, suggested replies and the message input. The Compact content width grows to match. Sidebar, session list and the rest of the interface are unaffected.",
     "tab": "chat",
     "type": "stepper",
     "occurrence": 1,
@@ -1155,7 +1223,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "chat.minimap-location",
     "label": "Minimap location",
     "labelKey": "pages.settings.chatPanel.minimap_location",
-    "description": "When located on the right edge, the minimap replaces the scroll bar.",
+    "hint": "When located on the right edge, the minimap replaces the scroll bar.",
     "tab": "chat",
     "type": "buttonGroup",
     "occurrence": 1,
@@ -1167,7 +1235,8 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "chat.new-session-folders",
     "label": "New Session Folders",
     "labelKey": "pages.settings.chatPanel.session_folder_root",
-    "description": "Folders are named by date with a short random suffix, and only you can open them. ~ stands for your home folder. A chat started in a chat folder that has its own project keeps that project. Enter the full path of a folder that already exists. Each new chat gets its own new folder inside it and works there. Leave empty to turn this off.",
+    "description": "Enter the full path of a folder that already exists. Each new chat gets its own new folder inside it and works there. Leave empty to turn this off.",
+    "hint": "Folders are named by date with a short random suffix, and only you can open them. ~ stands for your home folder. A chat started in a chat folder that has its own project keeps that project.",
     "tab": "chat",
     "type": "input",
     "occurrence": 1,
@@ -1177,10 +1246,35 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "configKey": "dashboard.session_folder_root"
   },
   {
+    "id": "chat.open-sidebar-sessions-in-a-session-tab",
+    "label": "Open Sidebar Sessions in a Session Tab",
+    "labelKey": "pages.settings.chatPanel.sidebar_click_opens_tab",
+    "hint": "A click opens the session in its own session tab instead of replacing the active tab's session.",
+    "tab": "chat",
+    "type": "toggle",
+    "occurrence": 1,
+    "params": {
+      "sub": "sessions"
+    }
+  },
+  {
+    "id": "chat.pin-summary-in-side-panel",
+    "label": "Pin Summary in Side Panel",
+    "labelKey": "pages.settings.chatPanel.side_panel_pin_summary",
+    "hint": "Shows Summary as the first side panel tab. Whenever the panel opens, it shows Summary. Opening a file or another item still shows that item. Needs Session summaries on.",
+    "tab": "chat",
+    "type": "toggle",
+    "occurrence": 1,
+    "params": {
+      "sub": "sidepanel"
+    },
+    "configKey": "dashboard.side_panel_pin_summary"
+  },
+  {
     "id": "chat.pin-the-latest-turn",
     "label": "Pin the latest turn",
     "labelKey": "pages.settings.chatPanel.pin_last_prompt",
-    "description": "Keep the most recent turn visible as a sticky banner once it scrolls above the fold.",
+    "hint": "Keep the most recent turn visible as a sticky banner once it scrolls above the fold.",
     "tab": "chat",
     "type": "toggle",
     "occurrence": 1,
@@ -1216,7 +1310,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "chat.prevent-sleep-while-running",
     "label": "Prevent sleep while running",
     "labelKey": "pages.settings.chatPanel.prevent_sleep_while_running",
-    "description": "Keep your computer awake while a task is running",
+    "hint": "Keep your computer awake while a task is running. On some Windows laptops (Modern Standby), locking the screen can still let it sleep, so keep the screen on for long tasks.",
     "tab": "chat",
     "type": "toggle",
     "occurrence": 1,
@@ -1240,7 +1334,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "chat.response-verbosity",
     "label": "Response Verbosity",
     "labelKey": "pages.settings.chatPanel.response_verbosity",
-    "description": "How terse the agent's prose is. Concise trims filler and narration. Answer only gives just the answer in the plainest words, with detail when you ask. At every level, code, commands and error strings stay verbatim, security warnings still appear, and multi-step instructions stay complete.",
+    "hint": "How terse the agent's prose is. Concise trims filler and narration. Answer only gives just the answer in the plainest words, with detail when you ask. At every level, code, commands and error strings stay verbatim, security warnings still appear, and multi-step instructions stay complete.",
     "tab": "chat",
     "type": "select",
     "occurrence": 1,
@@ -1252,7 +1346,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "chat.restore-sessions",
     "label": "Restore Sessions",
     "labelKey": "pages.settings.chatPanel.restore_sessions",
-    "description": "Re-open recently active sessions on startup",
+    "hint": "Re-open recently active sessions on startup",
     "tab": "chat",
     "type": "toggle",
     "occurrence": 1,
@@ -1264,7 +1358,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "chat.restore-window",
     "label": "Restore Window",
     "labelKey": "pages.settings.chatPanel.restore_window",
-    "description": "Time window for session restoration",
+    "hint": "Time window for session restoration",
     "tab": "chat",
     "type": "select",
     "occurrence": 1,
@@ -1276,7 +1370,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "chat.selectable-models",
     "label": "Selectable Models",
     "labelKey": "pages.settings.chatPanel.selectable_models",
-    "description": "Choose which advertised models appear in Chat model pickers. Auto and an active session model always remain visible.",
+    "hint": "Choose which advertised models appear in Chat model pickers. Auto and an active session model always remain visible.",
     "tab": "chat",
     "type": "select",
     "occurrence": 1,
@@ -1301,7 +1395,8 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "chat.session-summaries",
     "label": "Session summaries",
     "labelKey": "pages.settings.chatPanel.session_summaries",
-    "description": "Summarize each session by intent. Uses tokens on turns that change the session.",
+    "description": "Uses tokens on turns that change the session.",
+    "hint": "Summarize each session by intent.",
     "tab": "chat",
     "type": "toggle",
     "occurrence": 1,
@@ -1313,7 +1408,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "chat.show-context-percentage",
     "label": "Show Context Percentage",
     "labelKey": "pages.settings.chatPanel.show_context_percentage",
-    "description": "Display usage percentage next to the context progress bar",
+    "hint": "Display usage percentage next to the context progress bar",
     "tab": "chat",
     "type": "toggle",
     "occurrence": 1,
@@ -1325,12 +1420,24 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "chat.show-context-tokens",
     "label": "Show Context Tokens",
     "labelKey": "pages.settings.chatPanel.show_token_usage",
-    "description": "Display used and total tokens next to the context progress bar",
+    "hint": "Display used and total tokens next to the context progress bar",
     "tab": "chat",
     "type": "toggle",
     "occurrence": 1,
     "params": {
       "sub": "transcript"
+    }
+  },
+  {
+    "id": "chat.show-full-titles-while-scrolling",
+    "label": "Show Full Titles While Scrolling",
+    "labelKey": "pages.settings.chatPanel.full_titles_on_scroll",
+    "hint": "While you scroll the session list, cut-off titles show in full",
+    "tab": "chat",
+    "type": "toggle",
+    "occurrence": 1,
+    "params": {
+      "sub": "sessions"
     }
   },
   {
@@ -1348,7 +1455,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "chat.show-thinking-inline",
     "label": "Show Thinking Inline",
     "labelKey": "pages.settings.chatPanel.show_thinking_inline",
-    "description": "Show intermediate reasoning text between tool calls instead of collapsing everything",
+    "hint": "Show intermediate reasoning text between tool calls instead of collapsing everything",
     "tab": "chat",
     "type": "toggle",
     "occurrence": 1,
@@ -1360,7 +1467,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "chat.show-timestamps",
     "label": "Show Timestamps",
     "labelKey": "pages.settings.chatPanel.show_timestamps",
-    "description": "Display time on each message",
+    "hint": "Display time on each message",
     "tab": "chat",
     "type": "toggle",
     "occurrence": 1,
@@ -1372,7 +1479,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "chat.simplified-tool-call-names",
     "label": "Simplified Tool Call Names",
     "labelKey": "pages.settings.chatPanel.simplified_tool_call_names",
-    "description": "When enabled, inline tool pills show simplified tool use purpose instead of the exact command being run",
+    "hint": "When enabled, inline tool pills show simplified tool use purpose instead of the exact command being run",
     "tab": "chat",
     "type": "toggle",
     "occurrence": 1,
@@ -1396,7 +1503,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "chat.spell-check-message-input",
     "label": "Spell Check Message Input",
     "labelKey": "pages.settings.chatPanel.spellcheck_input",
-    "description": "Underline misspelled words in the message input with a red squiggle. Turn it off to stop the red underlines while you type.",
+    "hint": "Underline misspelled words in the message input with a red squiggle. Turn it off to stop the red underlines while you type.",
     "tab": "chat",
     "type": "toggle",
     "occurrence": 1,
@@ -1408,7 +1515,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "chat.split-side-by-side-diffs",
     "label": "Split (side-by-side) diffs",
     "labelKey": "settings.chat.diffLayout.label",
-    "description": "Show old and new code in two columns; off shows one unified column. Changing it here or on any diff sets it everywhere.",
+    "hint": "Show old and new code in two columns; off shows one unified column. Changing it here or on any diff sets it everywhere.",
     "tab": "chat",
     "type": "toggle",
     "occurrence": 1,
@@ -1431,7 +1538,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "chat.style-markdown-while-typing",
     "label": "Style Markdown While Typing",
     "labelKey": "pages.settings.chatPanel.inline_markdown_input",
-    "description": "Show bold, italic, strikethrough and inline code in the message input as you type. Turning it on also switches the message input to a rich-text editor that is still in beta; turn this off to go back to the plain input. The markdown markers stay visible and the message you send is unchanged.",
+    "hint": "Show bold, italic, strikethrough and inline code in the message input as you type. Turning it on also switches the message input to a rich-text editor that is still in beta; turn this off to go back to the plain input. The markdown markers stay visible and the message you send is unchanged.",
     "tab": "chat",
     "type": "toggle",
     "occurrence": 1,
@@ -1443,7 +1550,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "chat.subagent-effort",
     "label": "Subagent Effort",
     "labelKey": "pages.settings.chatPanel.subagent_effort",
-    "description": "Applies only on reasoning-capable models. 'Model default' applies no override — this work does not inherit your Default Reasoning Effort.",
+    "hint": "Applies only on reasoning-capable models. 'Model default' applies no override — this work does not inherit your Default Reasoning Effort.",
     "tab": "chat",
     "type": "select",
     "occurrence": 1,
@@ -1455,7 +1562,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "chat.subagent-model",
     "label": "Subagent Model",
     "labelKey": "pages.settings.chatPanel.subagent_model",
-    "description": "'Auto' lets the provider pick — it does not inherit your Default Model. Pin a model to run this work on it.",
+    "hint": "'Auto' lets the provider pick — it does not inherit your Default Model. Pin a model to run this work on it.",
     "tab": "chat",
     "type": "select",
     "occurrence": 1,
@@ -1479,7 +1586,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "chat.technical-comfort",
     "label": "Technical Comfort",
     "labelKey": "pages.settings.chatPanel.technical_comfort",
-    "description": "Sets how deep explanations go — plain language vs. full technical detail",
+    "hint": "Sets how deep explanations go — plain language vs. full technical detail",
     "tab": "chat",
     "type": "select",
     "occurrence": 1,
@@ -1503,7 +1610,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "chat.text-streaming-style",
     "label": "Text Streaming Style",
     "labelKey": "pages.settings.chatPanel.text_streaming_style",
-    "description": "Immediate mode shows raw chunks as they arrive. Smooth mode buffers and fades text in at a steady pace.",
+    "hint": "Immediate mode shows raw chunks as they arrive. Smooth mode buffers and fades text in at a steady pace.",
     "tab": "chat",
     "type": "buttonGroup",
     "occurrence": 1,
@@ -1515,7 +1622,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "chat.tool-calls-start-expanded",
     "label": "Tool calls start expanded",
     "labelKey": "pages.settings.chatPanel.tool_calls_start_expanded",
-    "description": "Open tool call rows with their input and output showing, instead of collapsed. Rows you open or close by hand keep your choice.",
+    "hint": "Open tool call rows with their input and output showing, instead of collapsed. Rows you open or close by hand keep your choice.",
     "tab": "chat",
     "type": "toggle",
     "occurrence": 1,
@@ -1539,7 +1646,8 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "chat.turn-time-limit-seconds",
     "label": "Turn Time Limit (seconds)",
     "labelKey": "pages.settings.chatPanel.turn_time_limit",
-    "description": "A turn that reaches this limit stops and keeps the work already written to disk; resume it to continue. Raise it for long unattended turns such as full test suites. Applies from the next turn. Longest one chat turn may run before it is stopped. 300 to 86,400 s (24 h). Default 14,400 s (4 h).",
+    "description": "Longest one chat turn may run before it is stopped. 300 to 86,400 s (24 h). Default 14,400 s (4 h).",
+    "hint": "A turn that reaches this limit stops and keeps the work already written to disk; resume it to continue. Raise it for long unattended turns such as full test suites. Applies from the next turn.",
     "tab": "chat",
     "type": "input",
     "occurrence": 1,
@@ -1564,7 +1672,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "chat.widget-density",
     "label": "Widget Density",
     "labelKey": "pages.settings.chatPanel.widget_density",
-    "description": "How aggressively the agent uses inline widgets for visual content",
+    "hint": "How aggressively the agent uses inline widgets for visual content",
     "tab": "chat",
     "type": "select",
     "occurrence": 1,
@@ -1576,7 +1684,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "chat.your-role",
     "label": "Your Role",
     "labelKey": "pages.settings.chatPanel.your_role",
-    "description": "Kiro matches vocabulary and examples to your professional background",
+    "hint": "Kiro matches vocabulary and examples to your professional background",
     "tab": "chat",
     "type": "select",
     "occurrence": 1,
@@ -1624,7 +1732,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "computer-use.show-cursor-motion",
     "label": "Show cursor motion",
     "labelKey": "pages.settings.computerUsePanel.show_cursor_motion",
-    "description": "Draw a cursor that glides to each target and pulses when it clicks, so you can follow along on screen. Purely visual — it changes nothing about what the agent is allowed to do, and it only appears for clicks that move the real pointer.",
+    "hint": "Draw a cursor that glides to each target and pulses when it clicks, so you can follow along on screen. Purely visual — it changes nothing about what the agent is allowed to do, and it only appears for clicks that move the real pointer.",
     "tab": "computer-use",
     "type": "toggle",
     "occurrence": 1
@@ -1676,9 +1784,24 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "Client ID, client secret and redirect URI for a provider that needs a registered OAuth app"
   },
   {
+    "id": "developer.agent-harness-per-mate",
+    "label": "Agent harness per mate",
+    "labelKey": "pages.developer.featurePreviewsTab.crewmate_harness",
+    "description": "Adds an Agent harness setting to each mate's profile, so one mate can run on a different AI coding tool, such as Claude Code, with that tool's models, while the rest keep the default.",
+    "tab": "developer",
+    "type": "toggle",
+    "occurrence": 1,
+    "params": {
+      "sub": "feature-previews"
+    }
+  },
+  {
     "id": "developer.also-send-snippets-of-recalled-memories-so-jev-can-drop-the-ones-that-do-not-help",
     "labelKey": "pages.developer.featurePreviewsTab.decisions_memory_text",
     "tab": "developer",
+    "params": {
+      "sub": "feature-previews"
+    },
     "type": "toggle",
     "occurrence": 1,
     "label": "Also send snippets of recalled memories so Jev can drop the ones that do not help",
@@ -1688,6 +1811,9 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "developer.also-send-the-conversation-and-tool-call-inputs-so-jev-can-score-compaction",
     "labelKey": "pages.developer.featurePreviewsTab.decisions_compaction",
     "tab": "developer",
+    "params": {
+      "sub": "feature-previews"
+    },
     "type": "toggle",
     "occurrence": 1,
     "label": "Also send the conversation and tool-call inputs so Jev can score compaction",
@@ -1697,6 +1823,9 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "developer.also-send-tool-call-arguments-so-jev-can-flag-risky-calls",
     "labelKey": "pages.developer.featurePreviewsTab.decisions_tool_args",
     "tab": "developer",
+    "params": {
+      "sub": "feature-previews"
+    },
     "type": "toggle",
     "occurrence": 1,
     "label": "Also send tool-call arguments so Jev can flag risky calls",
@@ -1709,16 +1838,22 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "Publish an artifact to a public HTTPS URL in your own AWS account. Off by default: every deploy spends money in your account and serves the content on the open internet.",
     "tab": "developer",
     "type": "toggle",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "feature-previews"
+    }
   },
   {
     "id": "developer.automatic-cards-for-all-sessions",
     "label": "Automatic cards for all sessions",
     "labelKey": "commandCenter.automatic_cards",
-    "description": "Summaries of each session’s recent work and next steps.",
+    "description": "Summaries of each session’s recent work and next steps, shown on the All Dashboards page, which the Sessions list’s ⋮ menu opens. A model call writes each one, so they use model credits.",
     "tab": "developer",
     "type": "toggle",
     "occurrence": 1,
+    "params": {
+      "sub": "feature-previews"
+    },
     "configKey": "dashboard.dynamic_dashboard_cards"
   },
   {
@@ -1728,7 +1863,10 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "Adds “New chat on crew” to the create menu, which starts a session on a remote crew — another machine you have connected under Settings > Remote Crew — and shows each connected crew’s sessions in their own group in the Sessions list. Unfinished.",
     "tab": "developer",
     "type": "toggle",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "feature-previews"
+    }
   },
   {
     "id": "developer.composable-layout",
@@ -1737,16 +1875,10 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "Turns on an in-development, developer-only harness for a new layout mechanism. Nothing you can see changes yet: the mechanism has no page of its own, so this exists only so it can be built and tested behind a switch.",
     "tab": "developer",
     "type": "toggle",
-    "occurrence": 1
-  },
-  {
-    "id": "developer.crewmates",
-    "label": "Crewmates",
-    "labelKey": "pages.developer.featurePreviewsTab.crew_members",
-    "description": "The Crewmates page: every agent you have, each with its own thread. Still being built, so it is not offered until you turn this on.",
-    "tab": "developer",
-    "type": "toggle",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "feature-previews"
+    }
   },
   {
     "id": "developer.decisions-jev",
@@ -1755,25 +1887,10 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "A small, fast model makes quick calls for Kiro Crew, such as which of your skills fits your message. Pick the model below. If it is slow or does not answer, the built-in rule decides instead, so your reply is never held up.",
     "tab": "developer",
     "type": "toggle",
-    "occurrence": 1
-  },
-  {
-    "id": "developer.developer-mode",
-    "label": "Developer Mode",
-    "labelKey": "pages.settings.developerPanel.developer_mode",
-    "description": "Show Developer page in sidebar with Logs, System metrics, and Memory internals",
-    "tab": "developer",
-    "type": "toggle",
-    "occurrence": 1
-  },
-  {
-    "id": "developer.dynamic-dashboard",
-    "label": "Dynamic Dashboard",
-    "labelKey": "pages.developer.featurePreviewsTab.dashboard",
-    "description": "Turns on the in-development Dynamic Dashboard: a status row above the chat composer, a Dashboard view in the side panel and on a crewmate’s page, and an All Dashboards page. Its layout is still being designed, so it is not shown until you turn it on. Also holds the switch for automatic cards.",
-    "tab": "developer",
-    "type": "toggle",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "feature-previews"
+    }
   },
   {
     "id": "developer.earlier-conversation-one-decision-may-carry-in-characters",
@@ -1782,7 +1899,22 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "Earlier messages of yours and of the agent go with the question, newest first, up to this many characters. Tool output is never sent. Zero sends the message on its own, which is what the main Jev switch was agreed for, so a larger number sends more off the machine.",
     "tab": "developer",
     "type": "input",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "feature-previews"
+    }
+  },
+  {
+    "id": "developer.folder-conductor",
+    "label": "Folder conductor",
+    "labelKey": "pages.developer.featurePreviewsTab.folder_conductor",
+    "description": "Lifts the chat that started a folder's other chats to the top of that folder: an accent bar down its left edge and a small conductor tag beside the agent name. This changes the order of the Sessions list, so the list stays as it is until you turn it on. The folder menu's chat item is always there.",
+    "tab": "developer",
+    "type": "toggle",
+    "occurrence": 1,
+    "params": {
+      "sub": "feature-previews"
+    }
   },
   {
     "id": "developer.jev-api-key",
@@ -1791,7 +1923,10 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "Kept in this dashboard's secret store on the machine that runs Kiro Crew, never in config.json, and never shown again once you save it.",
     "tab": "developer",
     "type": "input",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "feature-previews"
+    }
   },
   {
     "id": "developer.model-for-the-small-model-judge",
@@ -1800,16 +1935,22 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "Only used when the judge above is the small model. Leave it on the judge agent's own model unless you want a cheaper one.",
     "tab": "developer",
     "type": "select",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "feature-previews"
+    }
   },
   {
-    "id": "developer.reply-threads-on-crewmate-chat-messages",
-    "label": "Reply threads on crewmate chat messages",
+    "id": "developer.reply-threads-on-mate-chat-messages",
+    "label": "Reply threads on mate chat messages",
     "labelKey": "pages.settings.crewmatesSection.reply_threads",
-    "description": "Let any message in a crewmate's chat carry its own reply thread, opened in the side panel while the chat stays visible. Off, the Reply in thread control is not offered and existing threads are hidden, not deleted.",
+    "hint": "Let any message in a mate's chat carry its own reply thread, opened in the side panel while the chat stays visible. Off, the Reply in thread control is not offered and existing threads are hidden, not deleted.",
     "tab": "developer",
     "type": "toggle",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "feature-previews"
+    }
   },
   {
     "id": "developer.run-a-local-gateway",
@@ -1818,16 +1959,46 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "Start a gateway on this machine. Leave it on unless this app's port already reaches a crew on another machine, or the app cannot connect the next time it opens, which is when this takes effect. That needs the crew saved for this port with “Set Remote Host…” in the Connection menu, plus a tunnel: tick “Keep an SSH tunnel to this crew open” there (macOS and Linux) or keep your own SSH tunnel running. Settings → Remote Crew connections stop when this is off, so they do not count.",
     "tab": "developer",
     "type": "toggle",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "feature-previews"
+    }
+  },
+  {
+    "id": "developer.run-kas-on-kiro-crew-s-own-engine",
+    "label": "Run KAS on Kiro Crew's own engine",
+    "labelKey": "pages.developer.kasBundleCard.toggle_label",
+    "description": "Uses the KAS engine version this Kiro Crew release was tested with, instead of the Kiro CLI. Applies to every new session on this Kiro Crew, not just this device. Signs in with your Kiro account from Settings → Agent Harness. Takes effect when Kiro Crew restarts.",
+    "tab": "developer",
+    "type": "toggle",
+    "occurrence": 1,
+    "params": {
+      "sub": "feature-previews"
+    }
+  },
+  {
+    "id": "developer.session-environments",
+    "label": "Session Environments",
+    "labelKey": "sessionEnvironments.title",
+    "description": "Shows the Session Environments settings. Existing chats stay on this machine; a chat moves only if you pick a profile for it before its first message.",
+    "tab": "developer",
+    "type": "toggle",
+    "occurrence": 1,
+    "params": {
+      "sub": "feature-previews"
+    }
   },
   {
     "id": "developer.webhooks",
     "label": "Webhooks",
     "labelKey": "pages.developer.featurePreviewsTab.webhooks",
-    "description": "Inbound webhook tokens, registered contexts, and run history. The API works; the page is not finished.",
+    "hint": "Inbound webhook tokens, registered contexts, and run history. The API works; the page is not finished.",
     "tab": "developer",
     "type": "toggle",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "feature-previews"
+    }
   },
   {
     "id": "developer.which-judge-answers",
@@ -1835,13 +2006,16 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "labelKey": "pages.developer.featurePreviewsTab.decisions_judge_provider",
     "tab": "developer",
     "type": "select",
-    "occurrence": 1
+    "occurrence": 1,
+    "params": {
+      "sub": "feature-previews"
+    }
   },
   {
     "id": "display.command-completion",
     "label": "Command completion",
     "labelKey": "pages.settings.displayPanel.terminal_completion",
-    "description": "Show the completion popup while typing in the Terminal. Enter runs the line you typed; to take a suggestion, press ↑/↓ then Enter, or Tab. Off hides the popup; your shell's own Tab completion still works.",
+    "hint": "Show the completion popup while typing in the Terminal. Enter runs the line you typed; to take a suggestion, press ↑/↓ then Enter, or Tab. Off hides the popup; your shell's own Tab completion still works.",
     "tab": "display",
     "type": "toggle",
     "occurrence": 1,
@@ -1854,7 +2028,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "display.cursor-style",
     "label": "Cursor style",
     "labelKey": "pages.settings.displayPanel.terminal_cursor_style",
-    "description": "Shape of the terminal cursor. Bar and underline leave the character under it visible.",
+    "hint": "Shape of the terminal cursor. Bar and underline leave the character under it visible.",
     "tab": "display",
     "type": "buttonGroup",
     "occurrence": 1,
@@ -1866,7 +2040,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "display.custom-font",
     "label": "Custom font",
     "labelKey": "pages.settings.displayPanel.custom_font_family",
-    "description": "The font the whole dashboard uses, including chat, the composer, and sidebar session and folder names. Pick one installed on the machine you view the dashboard from, or type any font name — a Nerd Font renders its glyphs and a programming font shows its ligatures.",
+    "hint": "The font the whole dashboard uses, including chat, the composer, and sidebar session and folder names. Pick one installed on the machine you view the dashboard from, or type any font name — a Nerd Font renders its glyphs and a programming font shows its ligatures.",
     "tab": "display",
     "type": "select",
     "occurrence": 1,
@@ -1890,7 +2064,8 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "display.default-shell",
     "label": "Default shell",
     "labelKey": "pages.settings.displayPanel.terminal_shell",
-    "description": "The shell the built-in terminal launches. An absolute path or a command on PATH. Leave empty to use the system default ($SHELL).",
+    "description": "An absolute path or a command on PATH. Leave empty to use the system default ($SHELL).",
+    "hint": "The shell the built-in terminal launches.",
     "tab": "display",
     "type": "input",
     "occurrence": 1,
@@ -1903,7 +2078,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "display.display-mode",
     "label": "Display Mode",
     "labelKey": "pages.settings.displayPanel.display_mode",
-    "description": "How the session color is applied to the row.",
+    "hint": "How the session color is applied to the row.",
     "tab": "display",
     "type": "buttonGroup",
     "occurrence": 1,
@@ -1915,7 +2090,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "display.enable-ligatures",
     "label": "Enable ligatures",
     "labelKey": "pages.settings.displayPanel.custom_font_ligatures",
-    "description": "Render programming ligatures (=>, !=, ->) when the custom font has them. Code and diffs in messages are unaffected.",
+    "hint": "Render programming ligatures (=>, !=, ->) when the custom font has them. Code and diffs in messages are unaffected.",
     "tab": "display",
     "type": "toggle",
     "occurrence": 1,
@@ -1924,10 +2099,22 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     }
   },
   {
+    "id": "display.external-terminal-app",
+    "label": "External terminal app",
+    "labelKey": "pages.settings.displayPanel.terminal_external_app",
+    "tab": "display",
+    "type": "select",
+    "occurrence": 1,
+    "params": {
+      "sub": "terminal"
+    },
+    "configKey": "dashboard.terminal.external_app"
+  },
+  {
     "id": "display.font",
     "label": "Font",
     "labelKey": "pages.settings.displayPanel.terminal_font_family",
-    "description": "Font for the built-in terminal. Pick one installed on the machine you view the dashboard from, or type any font name — a Nerd Font renders Powerline and prompt-theme glyphs.",
+    "hint": "Font for the built-in terminal. Pick one installed on the machine you view the dashboard from, or type any font name — a Nerd Font renders Powerline and prompt-theme glyphs.",
     "tab": "display",
     "type": "select",
     "occurrence": 1,
@@ -1939,7 +2126,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "display.font-family",
     "label": "Font Family",
     "labelKey": "pages.settings.displayPanel.font_family",
-    "description": "UI font family for the dashboard. Code font follows the active theme, except OpenDyslexic which supplies its own.",
+    "hint": "UI font family for the dashboard. Code font follows the active theme, except OpenDyslexic which supplies its own.",
     "tab": "display",
     "type": "buttonGroup",
     "occurrence": 1,
@@ -1951,7 +2138,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "display.font-size",
     "label": "Font size",
     "labelKey": "pages.settings.displayPanel.terminal_font_size",
-    "description": "Text size in the built-in terminal, measured in pixels.",
+    "hint": "Text size in the built-in terminal, measured in pixels.",
     "tab": "display",
     "type": "stepper",
     "occurrence": 1,
@@ -1963,7 +2150,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "display.highlight-recent-sessions",
     "label": "Highlight recent sessions",
     "labelKey": "pages.settings.displayPanel.highlight_recent_sessions",
-    "description": "Highlight the N most-recently-active sessions with a graded accent stripe (0 = off). Saved to your Kiro Crew config.",
+    "hint": "Highlight the N most-recently-active sessions with a graded accent stripe (0 = off). Saved to your Kiro Crew config.",
     "tab": "display",
     "type": "stepper",
     "occurrence": 1,
@@ -1975,7 +2162,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "display.intensity",
     "label": "Intensity",
     "labelKey": "pages.settings.displayPanel.intensity",
-    "description": "How visible the color tint is on sidebar rows.",
+    "hint": "How visible the color tint is on sidebar rows.",
     "tab": "display",
     "type": "buttonGroup",
     "occurrence": 1,
@@ -1987,7 +2174,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "display.interface",
     "label": "Interface",
     "labelKey": "pages.settings.displayPanel.interface",
-    "description": "Chat bubbles or CLI-style line-by-line output",
+    "hint": "Chat bubbles or CLI-style line-by-line output",
     "tab": "display",
     "type": "buttonGroup",
     "occurrence": 1,
@@ -1996,10 +2183,23 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     }
   },
   {
+    "id": "display.keep-running-in-the-background-after-closing-the-window",
+    "label": "Keep running in the background after closing the window",
+    "labelKey": "pages.settings.displayPanel.keep_running_when_window_closed",
+    "description": "Closing the window hides Kiro Crew and keeps your sessions and jobs running. Turn this off to make the close button quit the app. A gateway this app started stops with it, and a gateway it only connects to keeps running.",
+    "tab": "display",
+    "type": "toggle",
+    "occurrence": 1,
+    "params": {
+      "sub": "view"
+    },
+    "settingId": "display.keep-running-in-the-background-after-closing-the-window"
+  },
+  {
     "id": "display.language",
     "label": "Language",
     "labelKey": "settings.display.language.label",
-    "description": "Language for the dashboard interface.",
+    "hint": "Language for the dashboard interface.",
     "tab": "display",
     "type": "select",
     "occurrence": 1,
@@ -2011,7 +2211,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "display.mode",
     "label": "Mode",
     "labelKey": "pages.settings.displayPanel.mode",
-    "description": "Light or dark appearance for the dashboard",
+    "hint": "Light or dark appearance for the dashboard",
     "tab": "display",
     "type": "buttonGroup",
     "occurrence": 1,
@@ -2023,7 +2223,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "display.palette",
     "label": "Palette",
     "labelKey": "pages.settings.displayPanel.palette",
-    "description": "Choose a color palette for your sidebar sessions.",
+    "hint": "Choose a color palette for your sidebar sessions.",
     "tab": "display",
     "type": "buttonGroup",
     "occurrence": 1,
@@ -2045,10 +2245,22 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "configKey": "dashboard.terminal.reuse_current"
   },
   {
+    "id": "display.show-unread-dot-on-session-cards",
+    "label": "Show unread dot on session cards",
+    "labelKey": "pages.settings.displayPanel.show_unread_dot",
+    "tab": "display",
+    "type": "toggle",
+    "occurrence": 1,
+    "params": {
+      "sub": "sidebar"
+    },
+    "configKey": "dashboard.show_unread_dot"
+  },
+  {
     "id": "display.theme",
     "label": "Theme",
     "labelKey": "pages.settings.displayPanel.theme",
-    "description": "Select a theme for the dashboard",
+    "hint": "Select a theme for the dashboard",
     "tab": "display",
     "type": "select",
     "occurrence": 1,
@@ -2060,7 +2272,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "display.translucent-panels",
     "label": "Translucent panels",
     "labelKey": "pages.settings.displayPanel.translucent_panels",
-    "description": "Show the top bar, the tab bar, the message box, the suggestion chips and the search fields as frosted glass over the content that scrolls under them. Off, they are solid cards.",
+    "hint": "Show the top bar, the tab bar, the message box, the suggestion chips and the search fields as frosted glass over the content that scrolls under them. Off, they are solid cards.",
     "tab": "display",
     "type": "toggle",
     "occurrence": 1,
@@ -2083,7 +2295,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "instances.auto-connect-crews",
     "label": "Auto-connect crews",
     "labelKey": "pages.settings.remoteCrewPanel.auto_connect",
-    "description": "When on, opening the web app connects every crew automatically, and reconnects them when you come back to the tab. Turn off to connect a crew only when you switch to it.",
+    "hint": "When on, opening the web app connects every crew automatically, and reconnects them when you come back to the tab. Turn off to connect a crew only when you switch to it.",
     "tab": "instances",
     "type": "toggle",
     "occurrence": 1
@@ -2119,7 +2331,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "type": "select",
     "occurrence": 1,
     "label": "Conversation handoffs",
-    "description": "When a conversation finishes or pauses for your input"
+    "description": "When a conversation finishes and hands control back to you. Agent questions use the “Approvals and questions” sound instead."
   },
   {
     "id": "notifications.sound-category-cron",
@@ -2173,7 +2385,19 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "notifications.mark-sessions-unread-only-when-they-need-you",
     "label": "Mark sessions unread only when they need you",
     "labelKey": "pages.settings.notificationsPanel.unread_only_when_done_or_waiting",
-    "description": "A background session is marked unread when its agent finishes or waits on your answer, instead of on every new message.",
+    "hint": "A background session is marked unread when its agent finishes or waits on your answer, instead of on every new message.",
+    "tab": "notifications",
+    "type": "toggle",
+    "occurrence": 1,
+    "params": {
+      "sub": "alerts"
+    }
+  },
+  {
+    "id": "notifications.notify-me-even-when-kiro-crew-is-closed",
+    "label": "Notify me even when Kiro Crew is closed",
+    "labelKey": "pages.settings.notificationsPanel.push_toggle_label",
+    "description": "Sends alerts to this device even after you close Kiro Crew. System notifications stop once you close it.",
     "tab": "notifications",
     "type": "toggle",
     "occurrence": 1,
@@ -2185,7 +2409,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "notifications.notify-when-a-background-chat-finishes",
     "label": "Notify when a background chat finishes",
     "labelKey": "pages.settings.notificationsPanel.notify_when_a_background_chat_finishes",
-    "description": "Shows a system notification naming the chat that finished, but only while this window is minimized or behind another app.",
+    "hint": "Shows a system notification naming the chat that finished, but only while this window is minimized or behind another app.",
     "tab": "notifications",
     "type": "toggle",
     "occurrence": 1,
@@ -2220,7 +2444,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "notifications.show-a-banner-for-new-notifications",
     "label": "Show a banner for new notifications",
     "labelKey": "pages.settings.notificationsPanel.show_banner_for_new_notifications",
-    "description": "A card slides in under the top bar when a notification arrives, then tucks into the bell.",
+    "hint": "A card slides in under the top bar when a notification arrives, then tucks into the bell.",
     "tab": "notifications",
     "type": "toggle",
     "occurrence": 1,
@@ -2429,6 +2653,61 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "Add your own deny patterns (Python-compatible regex). These are enforced at {{productName}}'s PreToolUse gate alongside the built-in rules."
   },
   {
+    "id": "session-environments.coder-url",
+    "label": "Coder URL",
+    "labelKey": "sessionEnvironments.url",
+    "description": "Use the deployment URL without credentials, query parameters, or fragments, for example https://coder.example.com.",
+    "tab": "session-environments",
+    "type": "input",
+    "occurrence": 1,
+    "configKey": "session_environments.coder_url"
+  },
+  {
+    "id": "session-environments.default-for-new-chats",
+    "label": "Default for new chats",
+    "labelKey": "sessionEnvironments.defaultProfile",
+    "description": "New chats you start in the dashboard run here unless you pick another profile in the “Run this chat on” menu before the first message. Existing chats, scheduled jobs and channel conversations keep running where they do now.",
+    "tab": "session-environments",
+    "type": "select",
+    "occurrence": 1
+  },
+  {
+    "id": "session-environments.machine-size",
+    "label": "Machine size",
+    "labelKey": "sessionEnvironments.boxdSize",
+    "description": "A snapshot keeps the size it was saved with, so this applies only to profiles without one. Larger sizes bill more while the machine runs.",
+    "tab": "session-environments",
+    "type": "select",
+    "occurrence": 1
+  },
+  {
+    "id": "session-environments.secret-name-for-the-token-usually-sprites-token",
+    "label": "Secret name for the token (usually SPRITES_TOKEN)",
+    "labelKey": "sessionEnvironments.tokenSecret",
+    "description": "The name the token is stored under in Settings → Secrets. Change it only to use a different saved token.",
+    "tab": "session-environments",
+    "type": "input",
+    "occurrence": 1
+  },
+  {
+    "id": "session-environments.start-new-chats-on-a-profile",
+    "label": "Start new chats on a profile",
+    "labelKey": "sessionEnvironments.defaultEnabled",
+    "tab": "session-environments",
+    "type": "toggle",
+    "occurrence": 1,
+    "configKey": "session_environments.default_profile"
+  },
+  {
+    "id": "session-environments.stop-workspaces-when-kiro-crew-shuts-down",
+    "label": "Stop workspaces when Kiro Crew shuts down",
+    "labelKey": "sessionEnvironments.stopOnShutdown",
+    "tab": "session-environments",
+    "type": "toggle",
+    "occurrence": 1,
+    "configKey": "session_environments.stop_on_shutdown"
+  },
+  {
     "id": "shortcuts.enable-shortcuts",
     "label": "Enable shortcuts",
     "labelKey": "pages.settings.shortcutsPanel.enable_shortcuts",
@@ -2448,7 +2727,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "shortcuts.use-ctrl-not-option-for-chat-1-9",
     "label": "Use ⌃ Ctrl (not ⌥ Option) for chat 1–9",
     "labelKey": "pages.settings.shortcutsPanel.use_ctrl_not_option_for_chat_1_9",
-    "description": "Bind chat-tab switching to Ctrl+digit instead of Option+digit. Option+digit does not switch chats while a text field has focus.",
+    "hint": "Bind chat-tab switching to Ctrl+digit instead of Option+digit. Option+digit does not switch chats while a text field has focus.",
     "tab": "shortcuts",
     "type": "toggle",
     "occurrence": 1
@@ -2457,11 +2736,21 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "skills.auto-generate-skills-from-sessions",
     "label": "Auto-generate skills from sessions",
     "labelKey": "pages.settings.skillsPanel.auto_generate_skills_from_sessions",
-    "description": "Analyze each completed session and draft a reusable SKILL.md when the session demonstrates a recurring procedure — one a future session, working on a different target, would run again. Off by default. Drafts are staged to the pending queue on Customize → Skills for review — nothing goes live without your approval (see below).",
+    "hint": "Analyze each completed session and draft a reusable SKILL.md when the session demonstrates a recurring procedure — one a future session, working on a different target, would run again. Off by default. Drafts are staged to the pending queue on Customize → Skills for review — nothing goes live without your approval (see below).",
     "tab": "skills",
     "type": "toggle",
     "occurrence": 1,
     "configKey": "skills.auto_create_from_sessions"
+  },
+  {
+    "id": "skills.extra-skill-paths",
+    "label": "Extra skill paths",
+    "labelKey": "pages.settings.skillsPanel.extra_skill_paths",
+    "description": "Folders to load extra skills from, one path per line. Spaces around a path and blank lines are ignored. Skills found there are read-only, and a skill in your own skills folder wins on a duplicate name. Changes apply without a restart.",
+    "tab": "skills",
+    "type": "input",
+    "occurrence": 1,
+    "configKey": "skills.extra_paths"
   },
   {
     "id": "skills.require-approval-before-generated-skills-go-live",
@@ -2477,7 +2766,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "voice.auto-speak-responses",
     "label": "Auto-speak Responses",
     "labelKey": "pages.settings.voicePanel.auto_speak_responses",
-    "description": "Speak every assistant reply automatically",
+    "hint": "Speak every assistant reply automatically",
     "tab": "voice",
     "type": "toggle",
     "occurrence": 1
@@ -2486,7 +2775,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "voice.auto-submit-when-i-finish-speaking",
     "label": "Auto-submit when I finish speaking",
     "labelKey": "pages.settings.sttSettings.endpointing",
-    "description": "Use a fast model to detect when you've finished a complete request and send it automatically. Streaming providers only.",
+    "hint": "Use a fast model to detect when you've finished a complete request and send it automatically. Streaming providers only.",
     "tab": "voice",
     "type": "toggle",
     "occurrence": 1,
@@ -2496,7 +2785,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "voice.aws-profile-amazon-polly",
     "label": "AWS Profile (Amazon Polly)",
     "labelKey": "pages.settings.voicePanel.aws_profile_polly",
-    "description": "AWS credentials profile for Amazon Polly",
+    "hint": "AWS credentials profile for Amazon Polly",
     "tab": "voice",
     "type": "input",
     "occurrence": 1
@@ -2514,7 +2803,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "voice.aws-region-amazon-polly",
     "label": "AWS Region (Amazon Polly)",
     "labelKey": "pages.settings.voicePanel.aws_region_polly",
-    "description": "AWS region for Amazon Polly API",
+    "hint": "AWS region for Amazon Polly API",
     "tab": "voice",
     "type": "input",
     "occurrence": 1
@@ -2523,26 +2812,45 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "voice.aws-region-transcribe",
     "label": "AWS Region (Transcribe)",
     "labelKey": "pages.settings.sttSettings.aws_region_transcribe",
-    "description": "AWS region for Transcribe",
     "tab": "voice",
     "type": "input",
     "occurrence": 1
   },
   {
+    "id": "voice.custom-model-file",
+    "label": "Custom model file",
+    "labelKey": "pages.settings.sttSettings.custom_model_path",
+    "hint": "A wrong name is refused and nothing else changes. Only whisper.cpp .bin model files work.",
+    "tab": "voice",
+    "type": "input",
+    "occurrence": 1,
+    "configKey": "stt.custom_model_path"
+  },
+  {
     "id": "voice.custom-vocabulary",
     "label": "Custom vocabulary",
     "labelKey": "pages.settings.sttSettings.transcribe_vocabulary",
-    "description": "Names and terms you uploaded to Amazon Transcribe so dictation spells them right. Listed from the AWS profile and region above.",
+    "hint": "Names and terms you uploaded to Amazon Transcribe so dictation spells them right. Listed from the AWS profile and region above.",
     "tab": "voice",
     "type": "select",
     "occurrence": 1,
     "configKey": "stt.transcribe_vocabulary"
   },
   {
+    "id": "voice.decode-threads",
+    "label": "Decode threads",
+    "labelKey": "pages.settings.sttSettings.decode_threads",
+    "hint": "CPU threads the local model uses to recognise speech. Auto uses half of this machine's cores, at most 16. On a large machine with cores to spare, more threads finish each dictation sooner. A change applies at the next dictation, which reloads the model once.",
+    "tab": "voice",
+    "type": "select",
+    "occurrence": 1,
+    "configKey": "stt.threads"
+  },
+  {
     "id": "voice.dictation-panel",
     "label": "Dictation panel",
     "labelKey": "pages.settings.sttSettings.dictation_panel",
-    "description": "Show an animated panel while recording instead of the thin status bar. Falls back to the bar when the browser lacks WebGL2 or your system requests reduced motion.",
+    "hint": "Show an animated panel while recording instead of the thin status bar. Falls back to the bar when the browser lacks WebGL2 or your system requests reduced motion.",
     "tab": "voice",
     "type": "toggle",
     "occurrence": 1
@@ -2551,7 +2859,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "voice.enabled",
     "label": "Enabled",
     "labelKey": "pages.settings.sttSettings.enabled",
-    "description": "Transcribe voice into the message box when you click the mic",
+    "hint": "Transcribe voice into the message box when you click the mic",
     "tab": "voice",
     "type": "toggle",
     "occurrence": 1
@@ -2560,10 +2868,21 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "voice.engine",
     "label": "Engine",
     "labelKey": "pages.settings.voicePanel.engine",
-    "description": "Amazon Polly engine type",
+    "hint": "Amazon Polly engine type",
     "tab": "voice",
     "type": "select",
     "occurrence": 1
+  },
+  {
+    "id": "voice.file-fingerprint-sha-256",
+    "label": "File fingerprint (SHA-256)",
+    "labelKey": "pages.settings.sttSettings.custom_model_sha256",
+    "description": "Paste the SHA-256 shown on the file's download page. It checks the file is the one you downloaded.",
+    "hint": "A wrong value is refused and nothing else changes.",
+    "tab": "voice",
+    "type": "input",
+    "occurrence": 1,
+    "configKey": "stt.custom_model_sha256"
   },
   {
     "id": "voice.how-the-key-works",
@@ -2577,54 +2896,56 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "voice.language",
     "label": "Language",
     "labelKey": "pages.settings.sttSettings.language",
-    "description": "BCP-47 language code for speech recognition",
+    "hint": "BCP-47 language code for speech recognition",
     "tab": "voice",
     "type": "select",
     "occurrence": 1,
     "configKey": "stt.language_code"
   },
   {
+    "id": "voice.language-2",
+    "label": "Language",
+    "labelKey": "pages.settings.voicePanel.language",
+    "hint": "Language for spoken replies",
+    "tab": "voice",
+    "type": "select",
+    "occurrence": 2,
+    "settingId": "voice.language-2"
+  },
+  {
     "id": "voice.microphone",
     "label": "Microphone",
     "labelKey": "pages.settings.sttSettings.microphone",
-    "description": "Input device used to capture your voice",
+    "hint": "Input device used to capture your voice",
     "tab": "voice",
     "type": "select",
     "occurrence": 1
   },
   {
+    "id": "voice.mixed-languages",
+    "label": "Mixed languages",
+    "labelKey": "pages.settings.sttSettings.transcribe_languages",
+    "hint": "Languages people switch between in one recording, such as Vietnamese and English. With two or more picked, dictation detects the language of each part and transcribes it in that language. Streaming dictation only, one dialect per language.",
+    "tab": "voice",
+    "type": "select",
+    "occurrence": 1,
+    "configKey": "stt.transcribe_languages"
+  },
+  {
     "id": "voice.model",
     "label": "Model",
     "labelKey": "pages.settings.sttSettings.model",
-    "description": "Models download on demand. Select one and click Download now; the desktop app already includes every other runtime dependency.",
+    "hint": "Models download on demand. Select one and click Download now; the desktop app already includes every other runtime dependency.",
     "tab": "voice",
     "type": "select",
     "occurrence": 1,
     "configKey": "stt.model"
   },
   {
-    "id": "voice.piper-binary",
-    "label": "Piper Binary",
-    "labelKey": "pages.settings.voicePanel.piper_binary",
-    "description": "Path to the piper executable. Leave blank to auto-detect on PATH or in a ~/piper-venv install",
-    "tab": "voice",
-    "type": "input",
-    "occurrence": 1
-  },
-  {
-    "id": "voice.piper-model",
-    "label": "Piper Model",
-    "labelKey": "pages.settings.voicePanel.piper_model",
-    "description": "Path to the Piper voice model (.onnx). Required — download from huggingface.co/rhasspy/piper-voices",
-    "tab": "voice",
-    "type": "input",
-    "occurrence": 1
-  },
-  {
     "id": "voice.provider",
     "label": "Provider",
     "labelKey": "pages.settings.sttSettings.provider",
-    "description": "Local speech recognition runs on this machine and sends nothing anywhere. Transcribe uploads your audio to AWS.",
+    "hint": "Local speech recognition runs on this machine and sends nothing anywhere. Transcribe streams your audio to AWS.",
     "tab": "voice",
     "type": "select",
     "occurrence": 1,
@@ -2634,11 +2955,21 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "voice.provider-2",
     "label": "Provider",
     "labelKey": "pages.settings.voicePanel.provider",
-    "description": "The built-in engine needs no setup; Piper is offline with better quality; Amazon Polly uses AWS credentials + network",
+    "description": "The built-in engine needs no setup; Amazon Polly uses AWS credentials + network",
     "tab": "voice",
     "type": "select",
     "occurrence": 2,
     "settingId": "voice.provider-2"
+  },
+  {
+    "id": "voice.send-when-i-stop-recording",
+    "label": "Send when I stop recording",
+    "labelKey": "pages.settings.sttSettings.submit_on_release",
+    "hint": "Stopping sends the message. Shift-click the mic, or slide sideways on the phone, to keep a draft.",
+    "tab": "voice",
+    "type": "toggle",
+    "occurrence": 1,
+    "configKey": "stt.submit_on_release"
   },
   {
     "id": "voice.shortcut-key",
@@ -2652,7 +2983,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "voice.speed",
     "label": "Speed",
     "labelKey": "pages.settings.voicePanel.speed",
-    "description": "Speech rate for spoken replies (built-in engine)",
+    "hint": "Speech rate for spoken replies (built-in engine)",
     "tab": "voice",
     "type": "select",
     "occurrence": 1
@@ -2661,25 +2992,16 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "voice.speed-2",
     "label": "Speed",
     "labelKey": "pages.settings.voicePanel.speed",
-    "description": "Speech rate for spoken replies (Amazon Polly)",
+    "hint": "Speech rate for spoken replies (Amazon Polly)",
     "tab": "voice",
     "type": "select",
     "occurrence": 2
   },
   {
-    "id": "voice.speed-3",
-    "label": "Speed",
-    "labelKey": "pages.settings.voicePanel.speed",
-    "description": "Piper speech speed (length scale)",
-    "tab": "voice",
-    "type": "select",
-    "occurrence": 3
-  },
-  {
     "id": "voice.streaming",
     "label": "Streaming",
     "labelKey": "pages.settings.sttSettings.streaming",
-    "description": "Show the transcript in the input box as you speak, instead of only when you stop.",
+    "hint": "Show the transcript in the input box as you speak, instead of only when you stop.",
     "tab": "voice",
     "type": "toggle",
     "occurrence": 1,
@@ -2708,7 +3030,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "voice.use-a-key-to-start-dictation",
     "label": "Use a key to start dictation",
     "labelKey": "pages.settings.sttSettings.ptt_enabled",
-    "description": "Turn this off to stop a key from starting dictation — you can still dictate from the microphone button.",
+    "hint": "Turn this off to stop a key from starting dictation — you can still dictate from the microphone button.",
     "tab": "voice",
     "type": "toggle",
     "occurrence": 1
@@ -2717,7 +3039,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "voice.voice",
     "label": "Voice",
     "labelKey": "pages.settings.voicePanel.voice",
-    "description": "Voice from the host's built-in speech engine",
+    "hint": "Voice from the host's built-in speech engine",
     "tab": "voice",
     "type": "select",
     "occurrence": 1
@@ -2726,7 +3048,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "voice.voice-2",
     "label": "Voice",
     "labelKey": "pages.settings.voicePanel.voice",
-    "description": "Amazon Polly voice for TTS",
+    "hint": "Amazon Polly voice for TTS",
     "tab": "voice",
     "type": "select",
     "occurrence": 2

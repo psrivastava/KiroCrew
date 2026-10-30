@@ -66,13 +66,17 @@ _KNOWN_CONFIG_SECTIONS: frozenset = frozenset(
         "default_workspace",
         "memory_stores",
         "default_memory_store",
+        "apps",
         "stt",
         "computer_use",
+        "aws",
         "instances",
         "mcp_gateway",
         "mcp",
         "taskrunner",
         "watchdog",
+        "work_ledger",
+        "power",
         "resource_limits",
         "messaging",
         "cron_history",
@@ -82,6 +86,7 @@ _KNOWN_CONFIG_SECTIONS: frozenset = frozenset(
         "monitoring",
         "skills",
         "session_summary",
+        "session_environments",
         "telemetry",
         "snapshot_dir",
         "timezone",
@@ -150,7 +155,23 @@ _SECTION_KEYS_DELIBERATELY_DROPPED: dict = {
     "agent": frozenset({"dangerouslySkipPermissions", "yolo", "conductor_skill"}),
     # RENAMED: knowledge.auto_add_documents was auto_ingest_doc_links;
     # sections._read_auto_add_documents still reads the old spelling.
-    "knowledge": frozenset({"auto_ingest_doc_links"}),
+    # RETIRED: auto_discover_folder, auto_discover_dirname,
+    # auto_ingest_chunk_budget, auto_register_project_docs and max_sources all
+    # configured the automatic folder-registration paths, which are gone, so
+    # nothing reads any of them. They are not renames of a surviving
+    # field, so preserving them keeps dead settings in the file and lets the
+    # close-match warning offer an unrelated field (e.g.
+    # folder_ingest_chunk_budget) as a correction.
+    "knowledge": frozenset(
+        {
+            "auto_ingest_doc_links",
+            "auto_discover_folder",
+            "auto_discover_dirname",
+            "auto_ingest_chunk_budget",
+            "auto_register_project_docs",
+            "max_sources",
+        }
+    ),
     # RETIRED: the out-of-band installs the removed local STT providers needed.
     "stt": frozenset({"whisper_path", "mlx_model", "parakeet_model", "device"}),
 }
@@ -163,7 +184,7 @@ _SECTION_KEYS_DELIBERATELY_DROPPED: dict = {
 #: dropped on save just as ``agent.<key>`` was. Captured one level deeper, as
 #: ``{section: {record_name: {key: value}}}``. ``hooks`` is NOT here: it is
 #: emitted raw (``"hooks": self.hooks``) and round-trips whole.
-_RECORD_MAP_SECTIONS: frozenset = frozenset({"agents", "workspaces", "memory_stores"})
+_RECORD_MAP_SECTIONS: frozenset = frozenset({"agents", "workspaces", "memory_stores", "apps"})
 
 
 def _unknown_keys_of(raw: dict, obj: object, recognized_extra: frozenset) -> dict:

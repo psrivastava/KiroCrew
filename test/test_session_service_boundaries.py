@@ -153,12 +153,14 @@ async def test_hard_stop_orders_abort_reset_respawn_and_hook(cfg: KiroCrewConfig
     )
     manager._sessions["key"] = session
 
-    manager.clear_queue = MagicMock(side_effect=lambda _key: events.append("queue-cleared"))
+    manager.clear_queue = MagicMock(
+        side_effect=lambda _key, _owned_by=None: events.append("queue-cleared")
+    )
     manager._send_abort_for_session = AsyncMock(  # type: ignore[method-assign]
         side_effect=lambda *_: events.append("abort-sent")
     )
     manager.reset = AsyncMock(  # type: ignore[method-assign]
-        side_effect=lambda _key: events.append("session-reset")
+        side_effect=lambda _key, **_kw: events.append("session-reset")
     )
 
     async def eager_respawn(_key: str) -> None:
@@ -180,6 +182,8 @@ async def test_hard_stop_orders_abort_reset_respawn_and_hook(cfg: KiroCrewConfig
         outcome = await manager.stop_turn("key", force=True, on_hard=on_hard)
 
     assert outcome == "hard"
+    # The hard Stop's recycle stops the runs that share the process it kills.
+    manager.reset.assert_awaited_once_with("key", stop_shared_children=True)
     assert events == [
         "queue-cleared",
         "abort-sent",
@@ -320,6 +324,8 @@ async def test_remove_of_a_live_session_emits_no_close_edge(cfg: KiroCrewConfig)
         await manager.remove("key")
 
     on_closed.assert_not_called()
+    assert "key" not in manager._sessions, "the removal itself still ran"
+    provider.shutdown.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -334,3 +340,5 @@ async def test_remove_of_a_missing_key_emits_no_close_edge(cfg: KiroCrewConfig) 
         await manager.remove("missing")
 
     on_closed.assert_not_called()
+    assert manager.release_subagent_runtime.await_count == 0
+    assert not manager.has_session("missing")

@@ -145,6 +145,7 @@ from kiro_crew.connections import ownership  # noqa: E402
 from kiro_crew.connections import warm  # noqa: E402
 from kiro_crew.dashboard.handlers import connections  # noqa: E402
 from kiro_crew.dashboard.handlers import mcp as mcp_handlers  # noqa: E402
+from kiro_crew.testing.wait import await_until  # noqa: E402
 
 _ = pytest_asyncio
 
@@ -164,6 +165,14 @@ async def _no_lock():
 
 def _entry(name: str, url: str) -> types.SimpleNamespace:
     return types.SimpleNamespace(name=name, url=url)
+
+
+def _rebuild_that_writes(**kwargs) -> pathlib.Path:
+    """A rebuild that wrote the spec: it reports the write the way the real one does."""
+    wrote_out = kwargs.get("_wrote_out")
+    if wrote_out is not None:
+        wrote_out.append(True)
+    return pathlib.Path("/dev/null")
 
 
 def _wire(
@@ -232,7 +241,7 @@ def _wire(
 
     _purge.seen = scopes if scopes is not None else []  # type: ignore[attr-defined]
     monkeypatch.setattr(mcp_handlers, "_purge_server_config", _purge)
-    monkeypatch.setattr(agent_mod, "rebuild_agent_config", lambda: None)
+    monkeypatch.setattr(agent_mod, "rebuild_agent_config", _rebuild_that_writes)
     monkeypatch.setattr(connections, "sel", lambda: types.SimpleNamespace(log_api_access=_audit))
     if not real_rearm:
         seen_rearms = rearms if rearms is not None else []
@@ -307,7 +316,41 @@ async def test_disconnect_revokes_the_grant_and_removes_the_entry(
         "grantSharedWith": [],
         "grantCensusIncomplete": False,
         "grantCensusUnreadable": [],
+        "agentSpecRewritten": True,
     }
+    assert purged == [_SLUG]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "rebuild",
+    [
+        # The shared-home guard refused: the path comes back and nothing is written.
+        pytest.param(lambda **_: pathlib.Path("/dev/null"), id="declined"),
+        pytest.param(
+            lambda **_: (_ for _ in ()).throw(RuntimeError("boom")),
+            id="raised",
+        ),
+    ],
+)
+async def test_disconnect_reports_a_spec_rebuild_that_did_not_write(
+    monkeypatch: pytest.MonkeyPatch, rebuild
+) -> None:
+    """The entry is gone from the config, but new sessions may still load it."""
+    purged: list[str] = []
+    _wire(
+        monkeypatch,
+        removed=["token", "registration"],
+        surviving=[],
+        inventory=[_entry(_SLUG, _provider_url())],
+        purged=purged,
+    )
+    monkeypatch.setattr(agent_mod, "rebuild_agent_config", rebuild)
+
+    body = await _disconnect()
+
+    assert body["entryRemoved"] is True
+    assert body["agentSpecRewritten"] is False
     assert purged == [_SLUG]
 
 
@@ -906,7 +949,7 @@ async def test_disconnect_does_not_wait_for_the_rearm(
         task = registry[_SLUG]
         assert not task.done(), "the Disconnect awaited the re-arm it only had to schedule"
         release.set()
-        assert await asyncio.wait_for(task, timeout=5) == []
+        assert await await_until(task, what="task completed") == []
 
 
 @pytest.mark.asyncio
@@ -1872,7 +1915,7 @@ def test_the_mirror_strip_serializes_against_the_agent_files_own_lock(
 
     ``_purge_server_config`` does not only write mcp.json scopes: it strips the
     entry from ``<agents>/kirocrew.json`` too (``_remove_from_agent_file``), and
-    that file has a SECOND independent writer -- ``apps/bridges.py`` does
+    that file has a SECOND independent writer -- ``apps/bridges_mcp.py`` does
     whole-file read-modify-writes of it under ``bridges._mcp_lock``
     (``kirocrew.lock``). The MCP transaction lock the purge runs under is a
     DIFFERENT sidecar (``settings/mcp.lock``), so it excludes nothing here: an

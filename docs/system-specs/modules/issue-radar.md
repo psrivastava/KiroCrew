@@ -34,8 +34,9 @@ provider cannot be registered while the gate silently keeps comparing three.
 
 **Each client module is the stable composition façade for its provider.** The
 routes and tests continue to import `github_client`, `gitlab_client` and
-`azure_client`; those modules retain the protocol surface, exception aliases,
-the constants something actually binds, and patchable I/O chokepoints. A mirror
+`azure_client`; those modules carry the protocol surface, exception aliases,
+the constants something actually binds, and patchable I/O chokepoints (`github_client`
+and `azure_client` serve them from their owners, below). A mirror
 NOTHING binds is not part of that surface: the sibling that owns the value reads
 its own module global, so a façade copy is never the seam it resembles and
 patching it changes nothing. Binding means the façade's own code, a test that
@@ -46,10 +47,45 @@ the implementation boundaries explicit: `*_transport.py` owns URL, environment,
 request and pagination mechanics; `*_normalization.py` converts provider payloads
 into the shared GitHub-shaped records; and `github_queries.py` owns GitHub's
 GraphQL, dependency and search query plans. The façades inject their current
-bindings into those helpers so established monkeypatch seams remain authoritative.
+bindings into those helpers so established monkeypatch seams remain authoritative
+(for `github_client` and `azure_client`, their owners inject them, and the mirror
+keeps them patchable through the façade).
 The reviewed real `glab` and `az` process spawns remain in
-`gitlab_client._glab_run` and `azure_client._az_run`, respectively, which keeps
-the spawn-audit allowlist tied to the same security chokepoints.
+`gitlab_client._glab_run` and `azure_client_cli._az_run` (served as
+`azure_client._az_run`), respectively, which keeps the spawn-audit allowlist tied
+to the same security chokepoints.
+
+**`github_client` is a mirror façade over six owners.** Its code lives in the
+`github_client_*.py` siblings, one responsibility each, and the façade serves every
+name from the owner that binds it (`kiro_crew._facade_mirror`), so a patch of
+`github_client.<name>` reaches every owner holding that name, as it reached the one
+module. `github_client_cli` holds the exception aliases, the timeouts, the hardened
+`gh` spawn `_gh_run` and the REST runner `_run_gh_api`; `github_client_repo_reads`
+the repo access check, the issue lists and their change probe, the viewer's login
+and contributed repos, labels and members; `github_client_detail` issue detail,
+reference summaries, the issue and PR timeline, the dependency graph and the crew
+claim; `github_client_writes` the triage writes, the permission read that gates
+them, and every pull-request action, with the PR's workflow-run read that its CI
+actions and the failure watch use; `github_client_pulls` the PR lists, detail,
+checks, list-card enrichment and search; and `github_client_ci` the viewer's open-PR
+heads and each repo's recent workflow runs. New GitHub code goes to the owner of its
+responsibility, and an owner never imports the façade.
+
+**`azure_client` is a mirror façade over seven owners**, the same way. Its code lives in
+the `azure_client_*.py` siblings: `azure_client_cli` holds the exception aliases, the
+timeouts, the per-endpoint API versions and paging limits, the hardened `az` spawn
+`_az_run` and the `az devops invoke` runner `_az_invoke` with its paging;
+`azure_client_work_items` the project's GUID, the template's own state names, the
+signed-in identity, WIQL and the batched hydrate; `azure_client_repo_reads` the repo
+access check and permission read, the work-item lists and their change probe, tags as
+labels, members, the login and its default organization, and contributed repos;
+`azure_client_detail` work-item detail, reference summaries and the work-item and PR
+timelines; `azure_client_writes` the work-item triage writes and the issue and PR
+comments, whose bodies `_comment_text` redacts; `azure_client_pulls` the PR lists,
+detail with its mergeability and merge-strategy vocabulary, policy evaluations and
+builds read as checks, list-card enrichment and search; and `azure_client_pr_actions`
+close or reopen, review, merge, auto-complete and a PR's builds. New Azure DevOps code
+goes to the owner of its responsibility, and an owner never imports the façade.
 
 | | GitHub | GitLab | Azure DevOps |
 |---|---|---|---|
@@ -222,6 +258,7 @@ private `http_routes` module owns one responsibility:
 | `http_routes/issue_writes.py` | `/labels/apply`, `/issue/state`, `/issue/assignees` |
 | `http_routes/investigation.py` | `/investigation` (GET, PUT) |
 | `http_routes/pr_actions.py` | every `/pull/*` action, `/pull/runs`, `/pulls/bulk`, and the shared `_pr_action_preamble` / `_run_pr_action` |
+| `http_routes/gitlab_groups.py` | `/gitlab-groups` (GET, POST, DELETE) and `/gitlab-groups/review-requests` |
 
 The facade re-exports every name those modules define, so `routes.<name>` keeps
 resolving for the tests, for `crew_routes`' gate chain and for other modules' docs.
@@ -245,7 +282,7 @@ per-repo store-scoping rule.
 | GET | `/issues` | List open/closed issues (cached, paginated). `poll=1` takes the probe-gated path — see Client-Side List Polling. `first_page=1` (open only) takes the progressive first-paint fast path — see First Paint |
 | GET | `/issue` | Full issue detail + timeline |
 | GET | `/ref` | Compact summary of one referenced issue/PR (hover preview + issue-vs-PR resolution). One `gh` call, no timeline, short-TTL cache |
-| GET | `/deps` | The repo's dependency graph `{edges, nodes}` (edge = `{blocked, blocker, source: native\|inferred}`), scoped to the open issues. Serve-stale-revalidate-behind: a cache younger than `DEPS_CACHE_TTL_SEC` is served as-is, an older one is served immediately while ONE coalesced background rebuild per repo refreshes it (cancelled on app cleanup); only a never-synced repo or `refresh=1` rebuilds inline. Non-GitHub providers answer an empty graph, not an error. Inline rebuild failures are 502 `deps_issue_scope_unavailable` (open-issue scope unreadable) or `deps_fetch_failed` |
+| GET | `/deps` | The repo's dependency graph `{edges, nodes}` (edge = `{blocked, blocker, source: native\|inferred}`; node = `{kind, state, title}` plus an optional `blockers_unknown: true` that any writer, GitHub or GitLab, sets when it could not see every blocker of that node, and that every reader treats as "never draw ready"), scoped to the open issues. Serve-stale-revalidate-behind: a cache younger than `DEPS_CACHE_TTL_SEC` is served as-is, an older one is served immediately while ONE coalesced background rebuild per repo refreshes it (cancelled on app cleanup); only a never-synced repo or `refresh=1` rebuilds inline. GitHub and GitLab answer a graph (see "Graph tab by forge"); Azure and unknown providers answer an empty graph, not an error. Inline rebuild failures are 502 `deps_issue_scope_unavailable` (open-issue scope unreadable) or `deps_fetch_failed` on every forge; on GitLab only, a missing `glab` binary is `deps_cli_missing` and a missing session is `deps_auth_required` with a host-scoped `loginCommand` |
 | GET | `/labels` | Repo label set (cached with a **10-min TTL**; see "The label cache expires") |
 | GET | `/members` | Repo collaborators (authoritative API or fallback) |
 | GET | `/repos` | Connected repos list. Rows missing a cached `permissions` object (connected before permissions were tracked) are self-healed with a live `verify_repo_access`, run CONCURRENTLY under a bounded semaphore (`_REPO_HEAL_CONCURRENCY`) rather than one-at-a-time, since this gates app open; a single unreadable repo is skipped, not fatal |
@@ -272,11 +309,16 @@ per-repo store-scoping rule.
 | POST | `/pull/state` | Close or reopen a PR. Routed through the provider's PULL endpoint, not the issue endpoint — a merged PR's un-reopenability then comes from the provider instead of silently succeeding against the issue shadow |
 | POST | `/pull/review` | Submit a review (`approve` / `request_changes` / `comment`). Requires `head_sha` — a review is a verdict on a REVISION, so it rides as GitHub's `commit_id` / GitLab's `sha` and a force-push between render and click is refused rather than recorded. A body is required for the latter two (the provider rejects them bodyless). GitLab has no "request changes" verb, and Azure DevOps can bind NEITHER verdict to a revision, so each client REFUSES rather than degrading a verdict to a comment |
 | POST | `/pull/comment` | Post a conversation comment on a PR |
+| POST | `/comments` | Post the timeline composer's batch on one issue or PR (`target`: `issue` \| `pull`), gated like the other forge writes. Each item is a new comment or a reply carrying the `thread_id` the timeline row exposes (a GitHub review-comment id, a GitLab discussion id, an Azure DevOps thread id). On a GitLab merge request the batch is published as ONE review through draft notes, leaving drafts the user already had untouched; elsewhere items post in order and stop at the first failure, and the response reports which items posted so the unposted ones stay pending in the client |
 | POST | `/pull/merge` | Merge a PR now. Per-PR only — never bulk. Requires `head_sha`, sent as the provider's `sha` precondition so the merge is pinned to the reviewed commit. Cannot bypass a gate: the provider enforces branch protection on its own endpoint, and a refusal is mapped to a readable `merge_not_allowed` message. On GitHub it goes through the asynchronous merge API and answers only once the merge has landed; a merge still running after the wait is a 409 `merge_pending` |
 | POST | `/pull/auto-merge` | Arm or disarm the PROVIDER's own auto-merge, for a PR that is not mergeable yet. **GitHub and Azure DevOps only** — REFUSED on GitLab, where `merge_when_pipeline_succeeds` is a deferral modifier on the merge endpoint rather than an arm verb (see "GitLab auto-merge is REFUSED outright" below); the UI hides both controls there. Callers must send only rows that are not landable yet — the provider refuses an already-clean or already-merged PR, and the list row carries `mergeable_state` so the bulk bar can tell (see "Merge readiness is on the LIST row") |
 | GET | `/pull/runs` | The CI runs on a PR's head commit, each with its id plus server-computed `cancellable`/`rerunnable`, so the UI never offers an action the provider will refuse |
 | POST | `/pull/run` | Cancel or re-run one CI run (`failed_only` re-runs just the failed jobs) |
 | POST | `/pulls/bulk` | Apply ONE action to many PRs (`_BULK_PR_ACTIONS`: close, reopen, approve, comment, auto_merge, cancel_auto_merge; max `_BULK_PR_MAX` = 50). `approve` additionally requires a `head_shas` map keyed by PR number, covering EVERY number in the request (see rule 2). Sequential, because the PRs share one provider rate limit. Partial failure is reported per PR rather than failing the batch |
+| GET | `/gitlab-groups` | The followed GitLab groups as `[{host, path}]`. A local config read, no `glab` call — see "GitLab groups" |
+| POST | `/gitlab-groups` | Follow a GitLab group (owner only). Body `{group}`: a bare path (a gitlab.com group) or a pasted group link, whose host must be gitlab.com or in `dashboard.gitlab_hosts`. The path is validated, then one read-only `GET groups/:id` confirms it exists before it is stored; a malformed path is 400 `invalid_group` and an unknown group 404 `group_not_found`, and neither is stored. Answers `{host, path}` |
+| DELETE | `/gitlab-groups` | Stop following a group (owner only, `?host=&path=`). Local only |
+| GET | `/gitlab-groups/review-requests` | Open merge requests across a followed group and all its subgroups where the signed-in `glab` user is a requested reviewer: ONE paginated `groups/:id/merge_requests?…&reviewer_username=<me>&include_subgroups=true` search through the same query builder, username check and `PR_SEARCH_MAX` cap as `/pulls/search`, walking at most `GROUP_SEARCH_MAX_PAGES` pages, with `truncated` reported. Rows are bounded per field (see "GitLab groups"). A group that was never followed is 404 before any `glab` call. Every error carries a `code` (`group_not_found`, `group_forbidden`, `setup_required`, `no_login`, `provider_error`) |
 | GET/POST | `/crews` | List a repo's crews with their settings and on-duty/working/paused counts; POST creates a crew |
 | GET | `/crews/names` | Suggested names for a new crew |
 | GET/PUT | `/crews/settings` | Per-repo crew settings |
@@ -284,6 +326,99 @@ per-repo store-scoping rule.
 | GET | `/crew/fabric` | The crews pipeline view's whole payload (phases and items). Non-GitHub providers answer `items: []` |
 | PUT | `/crew/work` | Record one work-item step and its progress event (the write behind `issue_radar_crew_record`) |
 | POST | `/crew/pause` | Pause or resume a crew |
+
+**`website/src/apps/issue-radar/api.ts` holds the dashboard's calls to these
+routes** (`issueRadarApi`), plus the base path and the AI-language hint that
+`/issue-ai`, `/pull-ai` and `/recommendations` take. The crews pipeline view
+reads `/crew/fabric` through its own client,
+`website/src/apps/issue-radar/pipeline/api.ts`. `api.ts` is also the one import
+path the app's modules use for these calls and their shapes, and the one module
+id their specs mock. The shapes live in two owners that `api.ts` re-exports, and
+a new shape goes to the owner for its routes:
+`website/src/apps/issue-radar/apiTypes.ts` for the repo, issue and pull-request
+routes (with the error classes the calls throw and the `RepoRef` query and body
+helpers), and `website/src/apps/issue-radar/apiCrewTypes.ts` for the crew routes
+(the records, the phase classifications and the event kinds that mirror the
+backend crew store). Neither owner imports `api.ts`, and no other module of the
+app imports an owner, so a spec's mock of `api.ts` replaces every call
+`issueRadarApi` makes for every importer.
+`website/src/apps/issue-radar/api.owners.test.tsx` pins that shape.
+
+## GitLab groups
+
+A user who reviews across a large GitLab group follows the GROUP instead of
+connecting each project. **A followed group is a path, never a project list.**
+`config.json` gains a `gitlab_groups` array of `{host, path}` only. The key is
+absent until the first group is added, and removing the last group removes it
+again, so an install that never follows a group keeps its config byte for byte.
+There is no token and no per-group setting.
+
+The group's review requests are one group-scoped search, so new projects and
+subgroups appear without any reconnect. Each refresh is one paginated
+`groups/:id/merge_requests` read with `include_subgroups=true`, `scope=all`,
+`state=opened` and `reviewer_username` set to the signed-in `glab` user.
+`build_group_pr_search_query` adds `include_subgroups` to
+`build_pr_search_query`'s own parameters, so the state mapping and the username
+charset check are the per-project search's own. The walk stops at
+`GROUP_SEARCH_MAX_PAGES` (the pages `PR_SEARCH_MAX` plus its sentinel row need),
+not at the generic `_MAX_PAGES`.
+
+**A group row bounds every field it keeps**, because the rows come from every
+project in the tree:
+
+- A row carries only `number`, `title`, `url`, `project`, `author`, `updated_at`
+  and `truncated_fields`. There is no description, label list or reviewer list.
+- Each string has its own `GROUP_ROW_*_MAX` bound, and a field cut to its bound
+  is named in `truncated_fields`.
+- An over-long `url` is dropped to `''` rather than cut, since a shortened link
+  points somewhere else.
+- `project` is read from GitLab's `references.full`, falling back to `web_url`.
+
+**A group read answers 404 only for GitLab's 404.** It uses
+`_raise_if_group_missing` in place of the auth check, and that raises
+`ProviderNotFoundError` only when the stderr tail carries both `404` and "not
+found". A group path or username can contain `404` but never a space, so an
+outage on group `team404` stays a 502.
+
+The path is validated before it reaches a request:
+
+- It has 1 to `MAX_NAMESPACE_SEGMENTS` segments.
+- Each segment passes the same shape check as a project URL's segments.
+- `.`, `..` and GitLab's system paths (`groups`, `api`, `-`, …) are refused.
+- It is percent-encoded as GitLab's single `:id` parameter.
+
+A malformed path is refused before any call, so it can never widen into a broader
+query. The host must be gitlab.com or allowlisted in `dashboard.gitlab_hosts`, the
+same rule as connecting a project, and `_resolve_host` re-checks it at spawn.
+Following and unfollowing are owner only. The read route serves only a followed
+`host` + `path`, compared exactly: that comparison is its authorization gate, the
+counterpart of `is_repo_connected`.
+
+The UI has three parts, sharing one react-query entry (`lib/gitlabGroups.ts`):
+
+- The "GitLab groups" section of General settings follows and unfollows groups.
+  Each followed group gets a labelled Unfollow button, and the Settings rail
+  lists the section under General.
+- The "Review requests" dashboard lists each group's merge requests. A group's
+  count reads "more than N" when the list is capped, with a "See all on GitLab"
+  link to the same search in GitLab's own merge-request list (built from the
+  response's `login`). Every group has its own `ErrorNotice`, and each error code
+  maps to a sentence that says what to do. The list refreshes on the list
+  cadence, but never faster than `GROUP_REVIEWS_MIN_POLL_MS`, because one refresh
+  walks up to four pages.
+- `DashboardsSection` lists that dashboard only while at least one group is
+  followed, or while it is the page on screen.
+
+With no group followed, the only new request is the local list read: there is no
+review-request call, and the dashboards rail is unchanged.
+
+This covers review requests, the issue's primary use case. It does not
+materialise every project as a connected repo: a scheduled recursive subgroup
+walk would hit rate limits and pagination on 100+ projects, flood the repo list,
+and need a policy for per-repo settings as projects join and leave. Nor is it a
+host-wide reviewer search: the unit the issue asks to connect is a group, and on
+gitlab.com one account reviews across unrelated groups that a group view keeps
+apart.
 
 ## Recording findings
 
@@ -318,7 +453,7 @@ a raw HTTP call. An agent session holds no dashboard credential:
 
 - the access cookie is `httpOnly`, so the frontend cannot hand it to the agent;
 - `.local_secret` — needed for the `GET /api/token/local` bootstrap — is on the
-  sensitive-path list in `security/paths.py`, so the tool gate refuses an agent's
+  sensitive-path list in `security/paths_lists.py`, so the tool gate refuses an agent's
   reads of it. The OS sandbox does not hide it
   (`sandbox._CREW_SANDBOX_VISIBLE_LEAVES`), because in-sandbox MCP servers
   authenticate back to the dashboard with it; the tool gate is the only fence.
@@ -374,7 +509,7 @@ output.
 All data under `app_data_dir("issue-radar")` (typically `~/.kiro/crew/apps/issue-radar/data/`):
 
 ```
-config.json                         # Connected repos, per-repo settings
+config.json                         # Connected repos, per-repo settings, followed GitLab groups
 repos/<owner>/<repo>/
   issues-cache.json                 # Open issues (schema-versioned, + poll probe)
   issues-closed-cache.json          # Closed issues (capped at 100)
@@ -427,6 +562,21 @@ cache fails its route or aborts the remaining post-write cache repairs. The
 investigation record is deliberately excluded — it is the only copy of a user's
 findings, so reading a malformed root as "absent" would let the next write replace
 it.
+
+**Where the store's code lives.** `store.py` is a mirror façade
+(`kiro_crew._facade_mirror`): routes, tests and sibling modules still reach
+`store.<name>`, and a patch through it reaches every owner binding the name. The
+code is in six owners: `store_repos` (the data root, `config.json` and its lock, the
+provider-scoped directories, the connected repos with their name matching,
+permissions and settings, the watchers' per-repo state, and GitLab groups),
+`store_labels` (the label and member caches), `store_ai` (the AI triage and PR
+summary caches, label recommendations, the tagging queue, investigation records
+and the `now_iso` clock that stamps them), `store_deps` (the dependency-edge cache),
+`store_issues` (the issue list,
+detail and reference caches, and the write-through patches a triage write applies)
+and `store_pulls` (the PR list and detail caches). New storage goes to the owner of
+its responsibility. The crew store, `crew_store.py`, is a mirror façade over its own
+`crew_store_*` owners the same way; `crew_ledger_spec.md` beside the backend names them.
 
 ## Permissions
 
@@ -1049,12 +1199,74 @@ the parent RUN and needs its id.
   cache is regenerate-only by design — it renders the last explicitly generated
   proposal until the user presses "Recommend labels" again.
 
+## Graph tab by forge
+
+The Graph tab's `/deps` (`http_routes/deps.py`) dispatches on provider: GitHub keeps
+`github_client.fetch_dependency_edges` (native + inferred edges); GitLab uses
+`gitlab_queries.fetch_dependency_edges`, which reads `/projects/:id/issues/:iid/links`
+through `gitlab_client.list_issue_links` for every open issue (one request per issue, no
+page walk: the endpoint ignores `page`/`per_page` and returns the whole list; `relates_to`
+ignored, only `blocks` / `is_blocked_by` become edges, all `source="native"`), under a
+`ThreadPoolExecutor(_LINKS_WORKERS)` with a `_MAX_LINKS_CALLS` cap. Four rules keep
+that graph honest:
+
+- **One issue's failed `/links` call degrades that issue** (no edges; a `ProviderCliError`
+  at DEBUG, an exception the transport did not map, such as a bare `ValueError` from
+  `json.loads`, at WARNING with its type), but a
+  `ProviderSetupError` -- no `glab`, or no session for the host -- propagates, cancels
+  the pool's remaining work and reaches the route as a 502 (`deps_auth_required` for a
+  missing session, `deps_cli_missing` for a missing binary), because
+  every call would fail the same way and swallowing it would persist a complete-looking
+  empty graph as fresh for the cache TTL. The previous cache stays intact. The same
+  holds when MOST fetched issues fail for any reason (strictly more than
+  `_LINKS_FAILURE_RATIO` of the calls: host unreachable, de-listed, a 403 on the whole
+  project, rate limiting that set in partway): the fetcher raises `ProviderCliError`
+  with one WARNING instead of returning the survivors, so a host-wide outage never
+  overwrites the last good graph with a nearly empty one. A minority of failures still
+  returns the partial graph. Zero open issues is still an empty graph, not a failure.
+- **A link row is kept only when `references.relative` is `#<iid>`**, GitLab's form for
+  an issue in the project the request was made in. A cross-project link, or a row with
+  no references, is dropped rather than assumed local.
+- **The cap's overflow is counted and logged once per fetch** at WARNING (`N past
+  _MAX_LINKS_CALLS carry no edges`), so a truncated graph is distinguishable from a
+  complete one.
+- **Retention is bounded by `_MAX_DEPS_NODES`, `_MAX_DEPS_EDGES`, and
+  `_MAX_LINKS_PER_ISSUE`**, and an edge is kept only when BOTH its endpoints have a
+  node: a linked issue the node cap refuses takes its edge with it, so the frontend
+  never has to invent a missing endpoint (it would draw one as open, and a closed
+  blocker past the cap would then hold its dependents). Rows past a bound are dropped, the overflow counts are
+  logged once at WARNING (`serving the partial graph`), and the partial graph is
+  served, the same shape the GitHub fetcher takes at `DEPS_GRAPHQL_MAX_PAGES`. A
+  bound never turns into a refusal: a project past a cap gets the same partial graph
+  on every load, including its first, rather than a 502 no later load can clear.
+
+`blocks` / `is_blocked_by` link types exist only on GitLab Premium and Ultimate. On a Free
+or CE instance every `/links` row is `relates_to`, so the Graph tab is legitimately empty
+and that is indistinguishable from "no links" on the server side.
+
+Azure and any unknown provider are answered an empty graph by `/deps` without a rebuild;
+nothing is written to their cache.
+
+The Pipeline tab (`pipeline_routes.py`) is unchanged and still github.com-only: its files
+are keyed on `owner/repo` alone by the GitHub jobs that write them, so serving another
+forge from them would show a same-slug project the wrong repository's rows.
+
 ## Background Watcher
 
 An in-process asyncio loop (`watch.py`) polls opted-in repos every 60s for new
 issues (high-water mark in `watch-state.json`). Sends dashboard bell
 notifications via `state.notify`. Zero-LLM. Guarded by `is_app_enabled` — silent
 when disabled. Lifecycle hooks registered via `app.on_startup`/`on_cleanup`.
+
+The same loop drives the crew sweep, `crew_runtime.sweep_repo`. `crew_runtime.py`
+keeps the sweep and its unblock signals, and is a mirror façade
+(`kiro_crew._facade_mirror`) for the rest of the crew runtime:
+`crew_runtime_prompt` (the brief, the nudge and the turn prompt),
+`crew_runtime_session` (a crew's slot, minting its scoped auto-approve grant, launch
+and turn dispatch) and `crew_runtime_supervision` (trust reconciliation, the wake,
+the watchdog, the slot-close and app-disable hooks, and the revocation of a crew's
+execution and grants). New crew-runtime code goes to the owner of its
+responsibility.
 
 ## First Paint (progressive open-list load)
 

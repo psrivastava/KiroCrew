@@ -8,6 +8,7 @@ stub the import and the pip spawn — no real installs, no network.
 
 from __future__ import annotations
 
+import gc
 import importlib.util
 import subprocess
 from configparser import ConfigParser
@@ -104,6 +105,81 @@ def test_still_missing_after_heal_exits_without_looping(monkeypatch, capsys):
     assert imports == ["import", "import"]
     assert heals == ["heal"]
     assert "still failing" in capsys.readouterr().err
+
+
+def test_slim_mcp_start_heals_a_missing_dep_and_retries(monkeypatch):
+    """A stdio MCP server's slim start heals a stale install like the CLI does:
+    the import fails before the server reads stdin, so one heal and a retry
+    start it without ever importing the CLI."""
+    from kiro_crew import mcp_entry
+
+    calls: list[str] = []
+    ran: list[str] = []
+    monkeypatch.setattr(_bootstrap.sys, "argv", ["kirocrew", "mcp-guide"])
+    load = _fail_then_succeed(calls, lambda: ran.append("server"))
+    monkeypatch.setattr(mcp_entry, "slim_server", lambda argv: load())
+    monkeypatch.setattr(
+        _bootstrap, "_self_heal", lambda missing: calls.append(f"heal:{missing}") or True
+    )
+    monkeypatch.setattr(_bootstrap, "_import_cli", lambda: pytest.fail("CLI must not load"))
+    _bootstrap.main()
+    assert calls == ["import", "heal:defusedxml", "import"]
+    assert ran == ["server"]
+
+
+def test_slim_mcp_start_heal_failure_exits_with_guidance(monkeypatch, capsys):
+    from kiro_crew import mcp_entry
+
+    def _always_fail(argv):
+        raise ModuleNotFoundError("No module named 'defusedxml'", name="defusedxml")
+
+    monkeypatch.setattr(_bootstrap.sys, "argv", ["kirocrew", "mcp-guide"])
+    monkeypatch.setattr(mcp_entry, "slim_server", _always_fail)
+    monkeypatch.setattr(_bootstrap, "_self_heal", lambda missing: False)
+    with pytest.raises(SystemExit) as exc_info:
+        _bootstrap.main()
+    assert exc_info.value.code == 1
+    assert "pip install -e" in capsys.readouterr().err
+
+
+def test_non_mcp_argv_takes_the_cli_path(monkeypatch):
+    ran: list[str] = []
+    monkeypatch.setattr(_bootstrap.sys, "argv", ["kirocrew", "gateway"])
+    monkeypatch.setattr(_bootstrap, "_import_cli", lambda: lambda: ran.append("cli"))
+    try:
+        _bootstrap.main()
+    finally:
+        gc.enable()  # `gateway` leaves it off for run() to turn back on after bind
+    assert ran == ["cli"]
+
+
+@pytest.mark.parametrize(
+    "argv, gc_on_during_import",
+    [
+        pytest.param(["kirocrew", "gateway"], False, id="gateway"),
+        pytest.param(["kirocrew", "status"], True, id="other-command"),
+    ],
+)
+def test_gateway_imports_the_cli_with_cyclic_gc_off(monkeypatch, argv, gc_on_during_import):
+    """Only ``gateway`` imports its module graph with GC off; boot turns it back on after bind."""
+    seen: list[bool] = []
+
+    def _import():
+        seen.append(gc.isenabled())
+        return lambda: None
+
+    monkeypatch.setattr(_bootstrap.sys, "argv", argv)
+    monkeypatch.setattr(_bootstrap, "_import_cli", _import)
+    was_enabled = gc.isenabled()
+    gc.enable()
+    try:
+        _bootstrap.main()
+    finally:
+        if was_enabled:
+            gc.enable()
+        else:
+            gc.disable()
+    assert seen == [gc_on_during_import]
 
 
 # ── _self_heal ──

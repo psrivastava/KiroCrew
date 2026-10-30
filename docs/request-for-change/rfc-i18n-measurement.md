@@ -206,7 +206,7 @@ template literals that no catalog value can reach. `i18n-plural-codemod.mjs
 --check` is wired into `i18n:check` and guards *already-converted* keys against
 regression; it does not reach strings that were never catalog keys. Some of the
 40 construct LLM prompt text and fall outside the rule's scope, which governs
-user-facing strings (`website/src/components/CommentOverlay.tsx:224`),
+user-facing strings (`formatArtifactCommentsMessage` in `website/src/components/CommentOverlay.tsx`),
 but user-visible ones are not — `website/src/App.tsx:499`, `website/src/App.tsx:619`,
 `website/src/components/InlineCommentOverlay.tsx:171`,
 `website/src/components/ArtifactFolderDeleteDialog.tsx:41`.
@@ -220,12 +220,12 @@ native dialect has no ICU-style inline `select` — so the gender agreement
 is expressible only by hand-enumerating context keys.
 
 **No Cyrillic script-fallback alias.** `ru` is the only shipped non-Latin locale
-with no entry in `--script-fallbacks` (`website/src/index.css:118`), and
+with no entry in `--script-fallbacks` (`website/src/styles/design-tokens.css`), and
 `website/src/i18n/scriptFonts.test.ts:51-56` is structurally incapable of noticing, because it
 validates only the four aliases that exist.
 
 **One global `line-height: 1.55` and zero `:lang()` rules** in the entire
-stylesheet (`website/src/index.css:1061`). Devanagari and Bengali get
+stylesheet (the `body` rule in `website/src/index.css`). Devanagari and Bengali get
 Latin-calibrated leading, which is tighter than either script's matra/reph stack
 wants. No clipping measurement has been taken, so the size of the effect is
 unquantified.
@@ -242,7 +242,7 @@ exists, so the blast radius is unmeasured.
 served, and injected into the LLM prompt only. Native menus
 (`website/electron/app-menu.js`), tray (`createTray` in
 `website/electron/window-lifecycle.js`), and dialogs (`resolveGatewayConflict`
-in `website/electron/gateway-supervisor.js` and
+in `website/electron/runtime/gateway/holder-decision.js` and
 `offerRelocationIfUnupdatable` in `website/electron/main.js`) are hardcoded, as
 are update notifications (the `notifyUpdateFound` callback in `registerUpdater`
 in `website/electron/ipc-registrar.js`).

@@ -1,10 +1,11 @@
 import { useEffect, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { AlertCircle, AlertTriangle, Coins, ExternalLink, Eye, EyeOff, Gift, Loader2, RefreshCw, UserRound } from 'lucide-react'
+import { AlertCircle, AlertTriangle, Coins, ExternalLink, Eye, EyeOff, Gift, Info, Loader2, RefreshCw, UserRound } from 'lucide-react'
 
 import { api } from '../api/client'
 import type { KiroBonusCreditGrant, KiroCreditUsage, KiroUsageRefreshResponse } from '../api/client'
-import { parseKiroUsagePayload } from '../api/kiroUsage'
+import { isAccountOnly, parseKiroUsagePayload, type KiroAccountOnly } from '../api/kiroUsage'
+import { providerLabelFromWire } from './kasProviderLabel'
 import { forecastCreditRunOut } from '../api/creditForecast'
 import { providerUsageQuery } from '../api/providerUsageQuery'
 import { getAdapter } from '../providers/registry'
@@ -24,9 +25,7 @@ export type { KiroBonusCreditGrant, KiroCreditUsage }
  * cache warms, `'none'` when the gateway holds no reading (no plan from the API
  * and none from the scrape; the pill shows this state only on the Kiro backend,
  * where the Refresh below can fill it), `'failed'` when
- * the fetch itself failed with nothing cached, `'api-key'` when the account
- * authenticates with an API key (usage needs an SSO/OIDC token that auth type
- * never has, so the state is terminal by construction), `'signin-required'`
+ * the fetch itself failed with nothing cached, `'signin-required'`
  * when no live Kiro credential could be read, or `'config-unreadable'` when the
  * gateway holds no reading AND the config read that decides whether this is the
  * Kiro backend at all failed -- so nothing can be shown as a fact, and the read
@@ -36,22 +35,22 @@ export type { KiroBonusCreditGrant, KiroCreditUsage }
  */
 export type KiroAccountUsage =
   | KiroCreditUsage
+  | KiroAccountOnly
   | null
   | 'none'
   | 'failed'
-  | 'api-key'
   | 'signin-required'
   | 'config-unreadable'
 
 /** True only for an actual reading, so the sentinels cannot reach a field access. */
 const isUsageReading = (usage: KiroAccountUsage): usage is KiroCreditUsage =>
-  typeof usage === 'object' && usage !== null
+  typeof usage === 'object' && usage !== null && !isAccountOnly(usage)
 
 /**
- * The no-reading states a refresh can fill. `'api-key'` is excluded because that
- * auth type has no credit readout at all, and `'signin-required'` takes the
- * sign-in error surface before this is consulted: the `/usage` read needs the
- * same sign-in. `null` is still loading, so there is nothing to refresh yet.
+ * The no-reading states a refresh can fill. `'signin-required'` is excluded
+ * because it takes the sign-in error surface before this is consulted: the
+ * `/usage` read needs the same sign-in. `null` is still loading, so there is
+ * nothing to refresh yet.
  */
 const canRefreshUsage = (usage: KiroAccountUsage): boolean =>
   usage === 'failed' || usage === 'none' || usage === 'config-unreadable'
@@ -221,9 +220,13 @@ function accountProviderLabel(accountType?: string, startUrl?: string): string {
     ? i18nT('app.iam_identity_center')
     : rawType === 'BuilderId'
       ? i18nT('app.builder_id')
-      : rawType
-        ? humanizeProviderId(rawType)
-        : undefined
+      : rawType?.toLowerCase().replace(/[^a-z0-9]/g, '') === 'externalidp'
+        // The organization's own sign-in: the sign-in flow's plain-language
+        // name for it ("Company SSO"), never the protocol's.
+        ? providerLabelFromWire('externalidp')
+        : rawType
+          ? humanizeProviderId(rawType)
+          : undefined
 
   let issuerHost: string | undefined
   if (startUrl) {
@@ -292,12 +295,14 @@ function AccountIdentity({ usage }: { usage: KiroAccountUsage }) {
     })
   }
 
-  const email = isUsageReading(usage) ? usage.email : undefined
-  const account = isUsageReading(usage) ? usage.account : undefined
+  // A reading names the user and its provider; the account-only state names
+  // only the provider (its account type).
+  const reading = isUsageReading(usage) ? usage : undefined
+  const named = reading ?? (isAccountOnly(usage) ? usage : undefined)
+  const email = reading?.email
+  const account = reading?.account
   const identity = email || account
-  const provider = isUsageReading(usage)
-    ? accountProviderLabel(usage.accountType, usage.startUrl)
-    : ''
+  const provider = named ? accountProviderLabel(named.accountType, reading?.startUrl) : ''
 
   return (
     <div className="flex flex-col items-center px-4 py-3 text-center">
@@ -315,30 +320,35 @@ function AccountIdentity({ usage }: { usage: KiroAccountUsage }) {
           <div className="flex items-center justify-center gap-2 text-[13px] text-muted">
             <Loader2 className="lucide-inline animate-spin" /> {i18nT('components.kiroAccountModal.checking_account')}
           </div>
-        ) : !isUsageReading(usage) || !identity ? (
+        ) : !named || (!identity && !provider) ? (
           <div className="flex items-center justify-center gap-2 text-[13px] text-muted">
             <AlertCircle className="lucide-inline" /> {i18nT('components.kiroAccountModal.account_details_unavailable')}
           </div>
         ) : (
           <>
-            <div className="flex min-w-0 items-center justify-center gap-2">
-              <span
-                className={`min-w-0 truncate text-[16px] font-semibold leading-6 text-text-strong transition-[filter,opacity] duration-150 ${email && emailHidden ? 'select-none blur-[5px] opacity-60' : ''}`}
-                title={email && emailHidden ? undefined : identity}
-              >
-                {identity}
-              </span>
-              {email && (
-                <Clickable
-                  onClick={toggleEmailVisibility}
-                  className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full border border-border text-muted transition-colors hover:border-accent/35 hover:bg-accent/10 hover:text-accent focus-ring-accent"
-                  aria-label={i18nT(emailHidden ? 'components.kiroAccountModal.show_email' : 'components.kiroAccountModal.hide_email')}
-                  title={i18nT(emailHidden ? 'components.kiroAccountModal.show_email' : 'components.kiroAccountModal.hide_email')}
+            {/* The block renders on a name, a provider, or both: an account
+                whose whoami reports only its type (an external identity
+                provider sign-in) has a provider and no name to show. */}
+            {identity && (
+              <div className="flex min-w-0 items-center justify-center gap-2">
+                <span
+                  className={`min-w-0 truncate text-[16px] font-semibold leading-6 text-text-strong transition-[filter,opacity] duration-150 ${email && emailHidden ? 'select-none blur-[5px] opacity-60' : ''}`}
+                  title={email && emailHidden ? undefined : identity}
                 >
-                  {emailHidden ? <Eye className="lucide-inline" /> : <EyeOff className="lucide-inline" />}
-                </Clickable>
-              )}
-            </div>
+                  {identity}
+                </span>
+                {email && (
+                  <Clickable
+                    onClick={toggleEmailVisibility}
+                    className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full border border-border text-muted transition-colors hover:border-accent/35 hover:bg-accent/10 hover:text-accent focus-ring-accent"
+                    aria-label={i18nT(emailHidden ? 'components.kiroAccountModal.show_email' : 'components.kiroAccountModal.hide_email')}
+                    title={i18nT(emailHidden ? 'components.kiroAccountModal.show_email' : 'components.kiroAccountModal.hide_email')}
+                  >
+                    {emailHidden ? <Eye className="lucide-inline" /> : <EyeOff className="lucide-inline" />}
+                  </Clickable>
+                )}
+              </div>
+            )}
             {provider && (
               <div className="mt-2.5 inline-flex items-center rounded-full border border-border bg-bg px-2.5 py-1 text-[12px] text-muted">
                 {i18nT('app.signed_in_with', { provider })}
@@ -392,6 +402,11 @@ function useUsageRefresh() {
       if (res.skipped === 'scrape_parked') {
         const secs = typeof res.retry_after === 'number' ? res.retry_after : 0
         setNotice({ kind: 'parked', minutes: Math.max(1, Math.ceil(secs / 60)) })
+        return
+      }
+      if (isAccountOnly(parsed)) {
+        // The sign-in has no balance to show. That state carries its own
+        // notice and offers no Refresh, so the outcome adds nothing to it.
         return
       }
       if (!isUsageReading(parsed)) {
@@ -453,9 +468,8 @@ function RefreshButton({
   compact: boolean
 }) {
   // One verb for the one action, wherever the button sits.
-  const label = pending
-    ? i18nT('components.kiroAccountModal.refreshing_balance')
-    : i18nT('components.kiroAccountModal.refresh_balance')
+  const idleLabel = i18nT('components.kiroAccountModal.refresh_balance')
+  const pendingLabel = i18nT('components.kiroAccountModal.refreshing_balance')
   const shape = compact
     ? 'rounded-md border border-border bg-transparent px-2.5 py-1 text-[12px] font-medium text-muted hover:border-border-strong hover:text-text'
     : 'rounded-md bg-accent px-3 py-1.5 text-[13px] font-medium text-accent-fg hover:brightness-110'
@@ -465,12 +479,22 @@ function RefreshButton({
       onClick={onClick}
       disabled={pending || held}
       aria-busy={pending || undefined}
-      className={`inline-flex items-center gap-1.5 self-start transition-all disabled:cursor-default disabled:opacity-60 focus-ring-accent ${shape}`}
+      className={`inline-flex items-center gap-1.5 self-start transition-colors disabled:cursor-default disabled:opacity-60 focus-ring-accent ${shape}`}
     >
       {pending
         ? <Loader2 className="lucide-inline animate-spin" aria-hidden="true" />
         : <RefreshCw className="lucide-inline" aria-hidden="true" />}
-      {label}
+      {/* Both labels share one grid cell, so the button is as wide as the
+          longer one in every locale and keeps its size when the state flips.
+          Only the shown label is in the accessible name. */}
+      <span className="inline-grid text-left">
+        <span className={`col-start-1 row-start-1 ${pending ? 'invisible' : ''}`} aria-hidden={pending || undefined}>
+          {idleLabel}
+        </span>
+        <span className={`col-start-1 row-start-1 ${pending ? '' : 'invisible'}`} aria-hidden={!pending || undefined}>
+          {pendingLabel}
+        </span>
+      </span>
     </button>
   )
 }
@@ -534,6 +558,27 @@ function CreditUsage({ usage, onClose }: { usage: KiroAccountUsage; onClose: () 
       />
     )
   }
+  // The account-only state is a sign-in whose balance cannot be tied to the
+  // user (an external identity provider sign-in names its provider and no
+  // user). That holds until the sign-in changes, so it is a configuration the
+  // account is in, not a failure: the passive notice, and no Refresh, since
+  // another read of the same sign-in answers the same.
+  if (isAccountOnly(usage)) {
+    return (
+      <div className="flex items-center gap-2 rounded-lg border border-border bg-bg-elevated/40 p-3.5 text-[13px] text-muted">
+        {/* An info mark, not an alert: this is how the sign-in is set up. */}
+        <Info className="lucide-inline shrink-0" aria-hidden="true" />{' '}
+        {/* Names the provider the badge above shows (the same mapping), so
+            the notice reads as how this sign-in works rather than a fault in
+            it. The gateway always sends the type for this state; the
+            fallback only keeps the sentence whole if one ever arrives
+            without it. */}
+        {i18nT('components.kiroAccountModal.credit_usage_sign_in_type', {
+          provider: accountProviderLabel(usage.accountType) || providerLabelFromWire('externalidp'),
+        })}
+      </div>
+    )
+  }
   if (usage === 'failed' || usage === 'config-unreadable') {
     // One notice at a time: a refresh outcome REPLACES the standing notice
     // instead of stacking under it, so the box never carries two alerts. The
@@ -574,9 +619,7 @@ function CreditUsage({ usage, onClose }: { usage: KiroAccountUsage; onClose: () 
               {/* `none` reports that no reading exists yet, not that a read failed
                   (`failed`, above, says that), so its copy names the absence and
                   the Refresh under it is the way to fill it. */}
-              {i18nT(usage === 'api-key'
-                ? 'components.kiroAccountModal.credit_usage_api_key_auth'
-                : 'components.kiroAccountModal.credit_usage_no_reading')}
+              {i18nT('components.kiroAccountModal.credit_usage_no_reading')}
             </div>
           )}
         {/* Refresh sits directly under the notice that says there is no reading. */}

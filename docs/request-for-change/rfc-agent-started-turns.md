@@ -38,7 +38,7 @@ This RFC adds an **agent-started turn**: a reader that watches stdout between tu
 
 ### Current frame flow
 
-All readers below are `AcpClient` methods in `src/kiro_crew/acp/client.py`.
+All readers below are `AcpClient` methods: `_prompt_loop` in `src/kiro_crew/acp/client_turn.py`, the command and init waits in `src/kiro_crew/acp/client_transport.py`, and the compaction readers in `src/kiro_crew/acp/client_usage.py`.
 
 | When | Who reads stdout | What happens to a frame |
 |---|---|---|
@@ -47,13 +47,13 @@ All readers below are `AcpClient` methods in `src/kiro_crew/acp/client.py`.
 | Compaction | `wait_for_compaction`, `_drain_post_compaction_metadata` | Read outside `_turn_lock` |
 | Between turns | nobody | Frames sit in the pipe; the next `_prompt_loop` takes `_buffer` first (`_read_message`), then reads them as this turn's |
 
-Those five sites are every caller of `_read_message` in `client.py`. `_process_message` classifies any `session/update` as `"update"` with no turn attribution, and nothing on main reads `_meta["_claude/origin"]`.
+Those five sites are every caller of `_read_message` (`client_transport.py`) on `AcpClient`. `_process_message` classifies any `session/update` as `"update"` with no turn attribution, and nothing on main reads `_meta["_claude/origin"]`.
 
-`AcpSessionHandle` backends (kiro, KAS, codex; `ACP_BACKENDS_ACP_RUNTIME`, `src/kiro_crew/agent_sdk/backends.py`) do not misplace these frames: the pre-turn drain in `AcpSessionHandle.prompt()` (`src/kiro_crew/acp/session_handle.py`) discards them, counted in one warning, never shown. `AcpClient` backends (`ACP_BACKENDS_ACP_CLIENT_SPAWNABLE`, `backends.py`) have no drain.
+`AcpSessionHandle` backends (kiro, KAS, codex; `ACP_BACKENDS_ACP_RUNTIME`, `src/kiro_crew/agent_sdk/backends.py`) do not misplace these frames: the pre-turn drain in `AcpSessionHandle.prompt()` (`src/kiro_crew/acp/session_handle_turn.py`) discards them, counted in one warning, never shown. `AcpClient` backends (`ACP_BACKENDS_ACP_CLIENT_SPAWNABLE`, `backends.py`) have no drain.
 
 ### Why dropping is not enough
 
-[#17884](https://github.com/kirodotdev/KiroCrew/pull/17884) gave `AcpClient` a claude-only drain. Its review rounds showed that every frame type other than text carries a side effect the read loop runs: the SEL tool-invocation audit (`_maybe_audit_tool_call`, `client.py`), PreToolUse / PostToolUse hooks (`_maybe_fire_pre_tool_hooks`, `_maybe_fire_post_tool_hooks`), the per-harness tripwires, permission answers, MCP OAuth and init notices, config-option updates, usage tracking (`_track_usage_update`, `client.py`), background-launch tracking (`_note_background_launch`, `client.py`), the harness parity gate, and the 100-entry replay buffer bound (`AcpClient._buffer`). Its final form dropped only text chunks and left every other frame to the next turn. The [self-review](https://github.com/kirodotdev/KiroCrew/pull/17884#issuecomment-6052833639) rejected that: the model's reply is lost while its tool rows still render, and Claude's own session holds a reply the user never saw. #17884 is closed in favour of this RFC.
+[#17884](https://github.com/kirodotdev/KiroCrew/pull/17884) gave `AcpClient` a claude-only drain. Its review rounds showed that every frame type other than text carries a side effect the read loop runs: the SEL tool-invocation audit (`_maybe_audit_tool_call`, `client_tool_events.py`), PreToolUse / PostToolUse hooks (`_maybe_fire_pre_tool_hooks`, `_maybe_fire_post_tool_hooks`), the per-harness tripwires, permission answers, MCP OAuth and init notices, config-option updates, usage tracking (`_track_usage_update`, `client_usage.py`), background-launch tracking (`_note_background_launch`, `client_turn_control.py`), the harness parity gate, and the 100-entry replay buffer bound (`AcpClient._buffer`). Its final form dropped only text chunks and left every other frame to the next turn. The [self-review](https://github.com/kirodotdev/KiroCrew/pull/17884#issuecomment-6052833639) rejected that: the model's reply is lost while its tool rows still render, and Claude's own session holds a reply the user never saw. #17884 is closed in favour of this RFC.
 
 The lesson that shapes this design: a second reader that interprets frames has to re-implement the read loop. The reader proposed here interprets nothing. It only notices that a frame arrived and hands stdout to a real turn.
 
@@ -90,7 +90,7 @@ The reader holds `_turn_lock` until the callback has marked the slot busy (step 
 
 ### 2. The agent-started turn in the dashboard
 
-`on_agent_turn` runs synchronously on the event loop. It claims the slot the way a dispatched user turn does (compare `_start_next_queued_turn`, `src/kiro_crew/dashboard/chat_runner.py`): it sets `slot.running` and schedules `_run_chat` with a new `agent_started=True` flag and no message. `_run_chat` then holds the per-session semaphore for the turn, as every turn does. Only after `slot.running` is set does the reader release `_turn_lock`.
+`on_agent_turn` runs synchronously on the event loop. It claims the slot the way a dispatched user turn does (compare `_start_next_queued_turn`, `src/kiro_crew/dashboard/chat_turn/queue_drain.py`): it sets `slot.running` and schedules `_run_chat` with a new `agent_started=True` flag and no message. `_run_chat` then holds the per-session semaphore for the turn, as every turn does. Only after `slot.running` is set does the reader release `_turn_lock`.
 
 If `slot.running` is already set, the callback starts nothing and the frame stays in `_buffer`. Two kinds of turn can hold the slot at that moment, and the rule has to serve both:
 
@@ -121,7 +121,7 @@ The assistant row and its tool rows are written by the same code a user turn use
 
 ### 4. Notifications
 
-The turn ends through the normal turn-end path, so the unread badge and the turn sound fire the way they do for a finished user turn (`app-notifications.md`, "Unread badge" and "Sound events"). `_notify_autonudge_turn_end` (`chat_runner.py`) is skipped for an agent-started turn: a monitor or autonudge loop did not send its prompt, so the turn must not count as one of its cycles.
+The turn ends through the normal turn-end path, so the unread badge and the turn sound fire the way they do for a finished user turn (`app-notifications.md`, "Unread badge" and "Sound events"). `_notify_autonudge_turn_end` (`chat_turn/queue_cycle.py`) is skipped for an agent-started turn: a monitor or autonudge loop did not send its prompt, so the turn must not count as one of its cycles.
 
 ### 5. Slot busy accounting
 
@@ -131,7 +131,7 @@ The gap before the agent-started turn begins is already covered on claude: the h
 
 ### 6. A user message during the agent-started turn
 
-Per decision 3 (recommended: queue), a message sent while the agent-started turn runs takes the existing queued path, because `slot.running` is set. It runs when the agent-started turn ends. A message whose prompt was already written before the reader saw the first frame is the one case this design does not attribute. So is a user turn that claimed the slot before the frame arrived (§2). In both, that turn reads the agent-started frames as its own. Phase 0 found the adapter does not interleave the two: it queues the prompt behind the running cycle, so the cycle's frames arrive first and end with its origin `usage_update`, and the prompt's own reply follows.
+Per decision 3 (recommended: queue), a message sent while the agent-started turn runs takes the existing queued path, because `slot.running` is set. It runs when the agent-started turn ends. A Steer-mode send, the busy send button's default, tries the steer path first and falls back to the queue, because the client refuses steers while an agent-started turn reads. A message whose prompt was already written before the reader saw the first frame is the one case this design does not attribute. So is a user turn that claimed the slot before the frame arrived (§2). In both, that turn reads the agent-started frames as its own. Phase 0 found the adapter does not interleave the two: it queues the prompt behind the running cycle, so the cycle's frames arrive first and end with its origin `usage_update`, and the prompt's own reply follows.
 
 ### 7. Cancel and interrupt
 

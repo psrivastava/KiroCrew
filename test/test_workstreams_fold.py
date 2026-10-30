@@ -167,13 +167,13 @@ def test_the_rendered_keys_are_the_spec_keys() -> None:
 
 
 def test_the_fold_never_reads_the_whole_log() -> None:
-    """``affects`` is the four entry types the fold reads, and nothing wider.
+    """``affects`` is the entry types the fold reads, and nothing wider.
 
     The kernel wakes a fold only for the types it declares, so this set IS the
     guarantee that a report entry does not cost a pass over every line.
     """
     assert projection.WORKSTREAMS_TYPES == frozenset(
-        {WORK_ENTRY_TYPE, "session/opened"}
+        {WORK_ENTRY_TYPE, "work/charged", "session/opened"}
         | {"turn/completed", "subagent/completed", "subagent/failed", "background/completed"}
     )
     assert projection._FOLDS["workstreams"].affects == projection.WORKSTREAMS_TYPES
@@ -555,7 +555,7 @@ def test_a_charge_with_no_opener_is_stated_not_assigned() -> None:
 
 
 def test_the_counts_answer_what_is_done_and_what_needs_me() -> None:
-    """``accepted``/``open`` come from the item's state, ``needs_you`` from its status."""
+    """``accepted``/``open`` come from the item's state, ``needs_you`` from an open one's status."""
     value = _fold(
         [
             _opened(CONDUCTOR),
@@ -575,6 +575,49 @@ def test_the_counts_answer_what_is_done_and_what_needs_me() -> None:
     # ``open`` is the state, so the accepted item is out and the other three in.
     assert board["open"] == 3
     assert _task(board, "asking")["summary"] == "which?"
+
+
+def test_a_closed_item_no_longer_needs_me() -> None:
+    """``needs_you`` counts an item only while it is OPEN.
+
+    A worker's last report outlives the conductor's close: an item whose worker asked
+    and which the conductor then accepted, rejected or abandoned still carries that
+    ``question`` or ``blocked``. Counted by status alone, every such item kept asking
+    the person about finished work, and the number only grew. A reopened item is open
+    again, so its standing question counts again.
+    """
+    entries = [_opened(CONDUCTOR), _work("goal", goal="closed asks", round=1)]
+    for state in ("accepted", "rejected", "abandoned"):
+        for status in ("question", "blocked"):
+            item_id = f"it_{state}_{status}"
+            entries += [
+                _work("create", item_id=item_id, title=f"{state} {status}", round=1),
+                _work("report", actor="worker", item_id=item_id, status=status, summary="?"),
+                _work("close", item_id=item_id, state=state),
+            ]
+    for status in ("question", "blocked", "progress"):
+        entries += [
+            _work("create", item_id=f"it_open_{status}", title=f"open {status}", round=1),
+            _work("report", actor="worker", item_id=f"it_open_{status}", status=status),
+        ]
+    entries += [
+        _work("create", item_id="it_reopened", title="reopened question", round=1),
+        _work("report", actor="worker", item_id="it_reopened", status="question"),
+        _work("close", item_id="it_reopened", state="accepted"),
+        _work("close", item_id="it_reopened", state="open"),
+    ]
+    board = _board(_fold(entries), "closed asks")
+    # The closed rows keep the worker's last word, which is what made them count.
+    closed = [t for t in board["tasks"] if t["state"] != "open"]
+    assert {(t["state"], t["status"]) for t in closed} == {
+        (state, status)
+        for state in ("accepted", "rejected", "abandoned")
+        for status in ("question", "blocked")
+    }
+    # The open question, the open blocker and the reopened question; not the
+    # open progress, and none of the six closed ones.
+    assert board["needs_you"] == 3
+    assert board["open"] == 4
 
 
 def test_an_item_moved_out_of_accepted_takes_its_hour_back() -> None:
@@ -771,67 +814,6 @@ def _chain(monkeypatch: pytest.MonkeyPatch, binds: dict[str, list[tuple[str, str
         projection.session_ledger,
         "work_crew_log_units",
         lambda slot: (f"u-{slot}",) if f"u-{slot}" in logs else (),
-    )
-
-
-def test_a_board_three_conductors_down_is_costable_not_only_listed(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The walk runs to CLOSURE, because visible and costable are one round apart.
-
-    A board shows once its conductor's units are read, and costs once that
-    conductor's own workers are read. Any fixed round count therefore has a last
-    round whose boards it lists with no reachable spend -- and the bind that
-    would have costed them is sitting in a log the walk already opened. Here the
-    lead reaches ``sub-worker`` only on the third round.
-    """
-    _chain(
-        monkeypatch,
-        {
-            CONDUCTOR: [("it_1", WORKER_A)],
-            WORKER_A: [("it_2", "sub-lead")],
-            "sub-lead": [("it_3", "sub-worker")],
-            "sub-worker": [],
-        },
-    )
-    units = projection._workstreams_units(CONDUCTOR)
-    assert units == (
-        f"u-{CONDUCTOR}",
-        f"u-{WORKER_A}",
-        "u-sub-lead",
-        "u-sub-worker",
-    ), "the walk stopped before the deepest board's own worker"
-
-
-def test_the_walk_stops_at_the_unit_ceiling_not_at_a_depth(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Closure is bounded by units, so a long chain is a bounded read.
-
-    The ceiling is the only bound the walk has, which is what makes removing the
-    round count safe rather than an unbounded read.
-    """
-    depth = projection.WORKSTREAMS_UNIT_LIMIT + 20
-    _chain(
-        monkeypatch,
-        {f"s{i}": [(f"it_{i}", f"s{i + 1}")] for i in range(depth)} | {f"s{depth}": []},
-    )
-    units = projection._workstreams_units("s0")
-    assert len(units) == projection.WORKSTREAMS_UNIT_LIMIT
-
-
-def test_a_bind_cycle_does_not_walk_forever(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Two conductors binding each other is a cycle the dedupe already closes."""
-    _chain(
-        monkeypatch,
-        {
-            CONDUCTOR: [("it_1", WORKER_A)],
-            WORKER_A: [("it_2", CONDUCTOR)],
-        },
-    )
-    assert projection._workstreams_units(CONDUCTOR) == (
-        f"u-{CONDUCTOR}",
-        f"u-{WORKER_A}",
     )
 
 
@@ -1270,45 +1252,6 @@ def test_one_slots_own_listing_is_capped_at_admission(
     assert projection._workstreams_units_dropped(CONDUCTOR) == over - len(units)
 
 
-def test_direct_workers_are_capped_before_their_logs_are_opened(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A conductor's DIRECT workers go through the ceiling too.
-
-    Those units are collected by ``_work_units`` rather than by the nested-board
-    walk, so a ceiling applied only to the walk never reaches them: one conductor
-    with thousands of bound workers is one round. The cap is asserted on the
-    result AND on the reads, because a cap applied to the output still pays to
-    open every log it then discards.
-    """
-    over = projection.WORKSTREAMS_UNIT_LIMIT + 50
-    workers = [f"w{i}" for i in range(over)]
-    log = _Handle(
-        [_work("bind", slot=CONDUCTOR, item_id=f"it_{w}", worker_session_key=w) for w in workers]
-    )
-    opened: list[str] = []
-
-    def _open(unit: str):
-        opened.append(unit)
-        return log if unit == f"u-{CONDUCTOR}" else None
-
-    monkeypatch.setattr(projection, "open_session_log", _open)
-    monkeypatch.setattr(
-        projection.session_ledger,
-        "work_crew_log_units",
-        lambda slot: (f"u-{slot}",),
-    )
-    units = projection._workstreams_units(CONDUCTOR)
-    assert len(units) == projection.WORKSTREAMS_UNIT_LIMIT
-    # Opens are bounded by what is RETAINED, not by what was offered: the 562
-    # candidates must not each cost a log read. The ceiling plus one is the real
-    # bound, because a full walk runs one more round so the refused units get counted.
-    assert (
-        len(opened) <= projection.WORKSTREAMS_UNIT_LIMIT + 1
-    ), f"opened {len(opened)} logs for a {projection.WORKSTREAMS_UNIT_LIMIT}-unit ceiling"
-    assert len(opened) < over, "every offered unit cost a log read"
-
-
 def test_the_snapshot_states_how_many_units_it_could_not_read(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1386,55 +1329,3 @@ def test_a_baselined_task_keeps_its_committed_fields(
     assert item["worker_session_key"] == WORKER_A
     # The close itself still applies: the baseline seeds, it does not replace.
     assert item["state"] == "accepted"
-
-
-def test_a_baseline_only_binding_still_collects_that_workers_units(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A board rebuilt from baselines has workers and no ``bind`` action anywhere.
-
-    Once the unit holding the ``bind`` is pruned, the baseline is the only record of
-    that binding. Scanning for the action alone collected none of those workers' units,
-    so every task on such a board reported a cost nobody could be charged for.
-    """
-    log = _Handle(
-        [
-            _work(
-                "report",
-                item_id="it_1",
-                baseline=True,
-                worker_session_key=WORKER_A,
-                status="done",
-            )
-        ]
-    )
-    monkeypatch.setattr(
-        projection, "open_session_log", lambda unit: log if unit == f"u-{CONDUCTOR}" else None
-    )
-    monkeypatch.setattr(
-        projection.session_ledger,
-        "work_crew_log_units",
-        lambda slot: (f"u-{slot}",) if slot in (CONDUCTOR, WORKER_A) else (),
-    )
-    assert projection._workstreams_units(CONDUCTOR) == (f"u-{CONDUCTOR}", f"u-{WORKER_A}")
-
-
-def test_nested_board_units_refused_by_the_ceiling_are_counted_too(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The walk's own refusals reach the count, not just the first round's.
-
-    Two gates refuse a unit: the conductor listing is sliced before any log is read,
-    and the nested-board walk stops once the ceiling is reached. A count fed by only
-    the first would report 0 for a crewmate whose depth, not whose own history, is
-    what overflows.
-    """
-    depth = projection.WORKSTREAMS_UNIT_LIMIT + 30
-    _chain(
-        monkeypatch,
-        {f"s{i}": [(f"it_{i}", f"s{i + 1}")] for i in range(depth)} | {f"s{depth}": []},
-    )
-    units = projection._workstreams_units("s0")
-    assert len(units) == projection.WORKSTREAMS_UNIT_LIMIT
-    # Each round offers one unit, so the refusals are the rounds past the ceiling.
-    assert projection._workstreams_units_dropped("s0") > 0

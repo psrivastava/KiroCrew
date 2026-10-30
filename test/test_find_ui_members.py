@@ -36,11 +36,7 @@ def _conditions(placement: dict[str, Any]) -> list[str]:
 
 
 def _has_preview_flag(placement: dict[str, Any]) -> bool:
-    # The Crewmates preview prerequisite every control on the page carries.
-    return any(
-        r["kind"] == "preview_flag" and r.get("setting_id") == "developer.crewmates"
-        for r in placement["requires"]
-    )
+    return any(r["kind"] == "preview_flag" for r in placement["requires"])
 
 
 # (query, lang, id, path in the query's language, conditions)
@@ -50,7 +46,7 @@ _GOLDENS = [
         "make a new crewmate",
         "en",
         "members.new",
-        ["Crewmates", "New crewmate"],
+        ["Mates", "New mate"],
         ["no_crewmates"],
     ),
     ("新建队友", "zh-CN", "members.new", ["队友", "新建队友"], ["no_crewmates"]),
@@ -58,7 +54,7 @@ _GOLDENS = [
         "advanced crewmate setup",
         "en",
         "members.new-advanced",
-        ["Crewmates", "Advanced"],
+        ["Mates", "Advanced"],
         ["no_crewmates"],
     ),
     ("高级队友设置", "zh-CN", "members.new-advanced", ["队友", "高级"], ["no_crewmates"]),
@@ -66,15 +62,15 @@ _GOLDENS = [
     (
         "advanced crewmate setup",
         "en",
-        "members.add-menu.advanced",
-        ["Crewmates", "Add…", "Advanced"],
+        "members.add-menu",
+        ["Mates", "Add…"],
         ["has_crewmates"],
     ),
     (
         "高级队友设置",
         "zh-CN",
-        "members.add-menu.advanced",
-        ["队友", "添加…", "高级"],
+        "members.add-menu",
+        ["队友", "添加…"],
         ["has_crewmates"],
     ),
     ("添加队友", "zh-CN", "members.add-menu", ["队友", "添加…"], ["has_crewmates"]),
@@ -83,7 +79,7 @@ _GOLDENS = [
         "edit my crewmate",
         "en",
         "members.edit",
-        ["Crewmates", "Profile"],
+        ["Mates", "Profile"],
         ["crewmate_selected"],
     ),
     ("编辑队友", "zh-CN", "members.edit", ["队友", "资料卡"], ["crewmate_selected"]),
@@ -91,7 +87,7 @@ _GOLDENS = [
         "crewmate details",
         "en",
         "members.details",
-        ["Crewmates", "Dashboard & files"],
+        ["Mates", "Dashboard & files"],
         ["crewmate_selected", "crewmate_panel_not_docked"],
     ),
     (
@@ -102,13 +98,13 @@ _GOLDENS = [
         ["crewmate_selected", "crewmate_panel_not_docked"],
     ),
     # Customize > Crewmates.
-    ("add a new agent", "en", "agents.add", ["Customize", "Crewmates", "New crewmate"], []),
+    ("add a new agent", "en", "agents.add", ["Customize", "Mates", "New mate"], []),
     ("创建代理", "zh-CN", "agents.add", ["自定义", "队友", "新建队友"], []),
     (
         "create a crewmate",
         "en",
         "agents.create-first",
-        ["Customize", "Crewmates", "Create your first crewmate"],
+        ["Customize", "Mates", "Create your first mate"],
         ["no_crewmates"],
     ),
     (
@@ -122,28 +118,28 @@ _GOLDENS = [
         "change my crewmate's avatar",
         "en",
         "agents.edit-avatar",
-        ["Customize", "Crewmates", "Edit avatar"],
+        ["Customize", "Mates", "General", "Edit avatar"],
         ["crewmate_editor_open"],
     ),
     (
         "修改头像",
         "zh-CN",
         "agents.edit-avatar",
-        ["自定义", "队友", "编辑头像"],
+        ["自定义", "队友", "常规", "编辑头像"],
         ["crewmate_editor_open"],
     ),
     (
         "delete an agent",
         "en",
         "agents.delete",
-        ["Customize", "Crewmates", "Danger zone", "Delete crewmate"],
+        ["Customize", "Mates", "Danger Zone", "Delete mate"],
         ["crewmate_editor_open"],
     ),
     (
         "删除代理",
         "zh-CN",
         "agents.delete",
-        ["自定义", "队友", "危险操作区", "删除队友"],
+        ["自定义", "队友", "危险区域", "删除队友"],
         ["crewmate_editor_open"],
     ),
 ]
@@ -157,9 +153,8 @@ def test_crewmate_controls_are_found_with_their_path_and_state(
     (placement,) = hit["placements"]
     assert _path(placement) == path
     assert _conditions(placement) == conds
-    # Crewmates is still a preview: every control ON that page names the switch
-    # that shows it, and a crew control on Customize names none.
-    assert _has_preview_flag(placement) == placement["route"].startswith("/members")
+    # Crewmates needs no opt-in: no crew control names a preview switch.
+    assert not _has_preview_flag(placement)
 
 
 def test_creating_a_crewmate_names_every_host_and_the_state_that_draws_it() -> None:
@@ -176,7 +171,7 @@ def test_creating_a_crewmate_names_every_host_and_the_state_that_draws_it() -> N
 
 
 def test_menu_items_hang_under_the_add_menu() -> None:
-    for target in ("members.add-menu.advanced",):
+    for target in ("members.add-menu.new",):
         (p,) = ui_index.find_ui(target, "en")["results"][0]["placements"]
         assert [s["id"] for s in p["path"]] == ["page.members", "members.add-menu", target]
         assert p["path"][-1]["role"] == "target"

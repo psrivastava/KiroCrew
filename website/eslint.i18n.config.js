@@ -274,6 +274,13 @@ export default [
       // Key glyphs / key-cap names only (⌘ ⇧ ⌥ / Ctrl Win Alt) — a machine
       // grammar the OS parses, not translatable copy. Same rationale as above.
       'src/apps/mochi/src/shared/shortcut.ts',
+      // Two DOM `KeyboardEvent.key` protocol values ('Backspace'/'Delete') the
+      // composer's atomic @mention delete compares against (#18186) — physical
+      // key names, never rendered copy. Same key-name do-not-translate rationale
+      // as `shortcut.ts` above; the module is export-only (imports nothing, no DOM
+      // or render path), so the filename IS the boundary and its consumer
+      // `LexicalComposerInput.tsx` stays fully covered.
+      'src/components/domDeleteKeys.ts',
       // CSS text injected through <style>; a stylesheet is not translatable copy.
       'src/apps/spec-builder/inlineStyles.ts',
       // Inline `style.cssText` declarations for the fixed auth banners in
@@ -310,6 +317,18 @@ export default [
       // module parser-facing only, and keep it DOM-free, which is the property
       // that makes that easy to check.
       'src/hooks/themeCss.ts',
+      // The Paste CSS tab's parser and serialiser: every literal is stylesheet
+      // text (the `.dark` / `.light` block template, the placeholder's sample
+      // values) or a CSS pattern, handed to a CSS reader, never shown as words.
+      // The parse result carries property NAMES and counts, not sentences; the
+      // tab's messages are resolved from the catalog in `themeEditor.tsx`, which
+      // stays fully gated.
+      //
+      // Verified copy-free by the same mechanical boundary as `themeCss.ts`
+      // above: no `i18nT` / `useTranslation` import, no JSX, no DOM access.
+      // Stated as a false-negative class: copy added to THIS path will not be
+      // reported, so keep it data in, data out.
+      'src/lib/themeCssImport.ts',
       // The Kiro-ghost avatar generator's art tables. Every literal in the module
       // is SVG handed to the SVG parser: the shipped mark's `d` path data, the
       // per-part fragments built from it, and the hex tile colors. Translating any
@@ -327,6 +346,17 @@ export default [
       // user-visible copy ever added to THIS path will not be reported — keep the
       // module parser-facing only, and keep it DOM-free.
       'src/lib/kiroGhostAvatar.ts',
+      // The icon-tier pose composer, by the same boundary: its literals are the
+      // SVG group wrapper that puts a pose under the ghost's body motion
+      // (`<g class="kg-bob">…`) and a background fill — markup handed to the SVG
+      // parser, where a translated tag name renders a blank tile. It imports the
+      // pose art as raw text, imports no `i18nT` / `useTranslation`, and touches
+      // no DOM; every export is data in, SVG `string` out, consumed by the same
+      // fully gated `components/CrewAvatar.tsx` behind `alt=""` / `aria-hidden`.
+      //
+      // Same false-negative class as the ghost: copy added to THIS path is not
+      // reported, so keep it parser-facing and DOM-free.
+      'src/lib/avatarPoses.ts',
       // Same rationale, different convention: this app keeps its seed prompts in a
       // dedicated `lib/prompts.ts` rather than a `*Prompt.ts` file. Also prompt
       // payload sent over the wire, never rendered.
@@ -545,6 +575,28 @@ export default [
               // residue the general class shape already accepts, caught by the
               // en-XA render gate instead.
               String.raw`^(?!.*(?:^|\s)[a-z]+\s+[a-z]+(?:\s|$))(?=(?:^|.*\s)\[&[^\]\s]*\]:)(?:[\s\-a-z0-9:/().%#\[\]]|\[(?:&|@(?:media|supports)\()[^\]\s]*\])+$`,
+              // Tailwind IMPORTANT-MODIFIER clusters, e.g. the server-detail line
+              // under a failure notice in apps/issue-radar/views/GraphView.tsx:
+              // `block text-left font-mono !text-[10px] leading-snug !text-muted …`.
+              // `!text-…` is how a caller's class wins over a same-property class the
+              // shared component sets on the same element (ErrorNotice's
+              // `messagePlacement="below"` span sets `text-[12px] text-danger-text`
+              // itself; which of two same-property utilities applies is decided by
+              // stylesheet order, not class order). The general class shape forbids
+              // `!`, and such constants live at module level under ALL-CAPS names,
+              // so `i18n-strict` looks inside them.
+              //
+              // Deliberately NARROWER than "allow ! anywhere", on three axes:
+              // (a) the first lookahead rejects any two ADJACENT bare lowercase
+              // words, the prose shape (`save failed !text-muted`) that would
+              // otherwise ride in on a single important token; (b) the second
+              // lookahead requires at least one `!`-opened token, so the general
+              // class shape still owns every cluster without one; (c) `!` is
+              // admitted ONLY at the start of a token and ONLY when a letter
+              // follows it, so an exclamation mark closing a sentence (`Saved!`,
+              // `Try again!`) never matches: copy puts `!` after a word, a
+              // utility puts it before one.
+              String.raw`^(?!.*(?:^|\s)[a-z]+\s+[a-z]+(?:\s|$))(?=(?:^|.*\s)![a-z])(?:[\s\-a-z0-9:/().%#\[\]]|(?:^|(?<=\s))![a-z])+$`,
               // Tailwind ARBITRARY-VALUE clusters whose bracketed value carries a
               // comma or underscore, e.g. the notification glass surfaces in
               // components/notifications/NotificationFeed.tsx:
@@ -654,6 +706,12 @@ export default [
               // a shape UI copy takes — copy has spaces and capitals, which is what keeps
               // `['Save changes', 'Delete item']` reported.
               '^[a-z][a-z0-9]*(?:_[a-z0-9]+)+$',
+              // The same snake_case identifier with a numeric version suffix: a
+              // versioned wire token such as the `fold_delta.1` socket capability the
+              // tab declares in `/api/ws?caps=` (hooks/websocket/foldWatch.ts). It is
+              // sent to the gateway, never rendered. Copy never ends in `.<digits>`
+              // after an underscore-joined lowercase word, so no prose matches.
+              '^[a-z][a-z0-9]*(?:_[a-z0-9]+)+\\.[0-9]+$',
               // A `KeyboardEvent.code` SIDE-SPECIFIC MODIFIER identifier, i.e.
               // `AltRight`, `ControlLeft`, `MetaRight`, `ShiftLeft`. These are DOM
               // protocol values: they are compared against `e.code` and never
@@ -819,6 +877,14 @@ export default [
               // above. Matched with `startsWith` and sliced off before render;
               // byte-identical to HOOK_HALTED_RECOVERY_PREFIX in state.py.
               '^\\[Stop-hook nudge cap reached\\]$',
+              // The knowledge envelope's close marker, enumerated for the same
+              // closed-set reason. `expandKnowledgeBlock` writes it into the
+              // model-facing wire text and `splitKnowledgeEnvelope` finds it there
+              // to take the envelope off the queue card, so it is never shown and
+              // a translated marker would stop the split from finding it
+              // (`pages/chat/useKnowledgeFetch.ts`). Its open marker already
+              // matches the em-dash shape above.
+              '^\\[END KNOWLEDGE CONTEXT\\]$',
               // NOTE ON SHAPE: the plugin wraps every pattern as `^<pattern>$`
               // (`generateFullMatchRegExp`), so a pattern must describe the WHOLE
               // string. A prefix-only pattern like `^data:` becomes `^^data:$` and can
@@ -870,6 +936,10 @@ export default [
               // splits into `data:`, `;base64,` and `` — the first matches the data-URI
               // pattern above, the second needs this.
               '[;,]?base64,?$',
+              // The `U+` of Unicode code-point notation (`U+${hex}`), which every
+              // locale writes the same way. Only the bare two-character quasi is
+              // exempt, so no sentence can pass as one.
+              'U\\+$',
               // API paths with an optional query string: `/api/file-raw?path=`. The
               // `^[.~]?/` entry above cannot match these — the plugin full-anchors every
               // pattern, so a prefix-only one is inert.
@@ -911,13 +981,15 @@ export default [
               // the same reason and enforced there by `glossary.test.ts`: "GitLab" is
               // "GitLab" in every language, and a localized spelling would name a
               // product that does not exist. They reach the UI as the provider name in
-              // Issue Radar's connect picker and as the `{{provider}}` value
-              // interpolated into its refresh tooltips, so the bare brand is the whole
+              // Issue Radar's connect picker, as the `{{provider}}` value
+              // interpolated into its refresh tooltips, as the source provider's
+              // name in the pull-request panel header, and as the host name in the
+              // Session Environments readiness check, so the bare brand is the whole
               // literal. Whole-value-anchored like the entry above, so a sentence that
               // merely mentions a forge is still reported — only the bare name is
               // exempt, and the sentences AROUND it stayed in the catalog (that is
               // what `{{provider}}` is for).
-              '^(GitHub|GitLab|Azure DevOps)$',
+              '^(GitHub|GitLab|Azure DevOps|Bitbucket|Bitbucket Server|Gerrit)$',
               // The PPTX Maker chat-token KEYWORDS (`[Style: name]`,
               // `[Template: name]`). Enumerated and whole-value-anchored, exactly like
               // the modifier-key caps below: the agent prompts parse this literal
@@ -934,6 +1006,14 @@ export default [
               // presses, so translating it would mislabel their keyboard. Anchored and
               // enumerated, not a pattern: ordinary copy cannot match it.
               '^(Ctrl|Alt|Shift|Cmd|Win)$',
+              // A PyPI distribution name the optional-SDK card shows beside the
+              // install command (`OptionalSdkCard`'s `packageLabel`). It names the
+              // package the user installs, so it is do-not-translate on the same
+              // grounds as the key caps above. The lowercase names (`lark-oapi`,
+              // `neonize`) already pass as identifiers; this one carries an
+              // interior run of capitals no identifier pattern admits. Exact, not a
+              // shape: ordinary copy cannot match it.
+              '^PyJWT$',
               // Wire-protocol marker, not copy: the backend stamps `QUEUED:<fp>` onto a
               // `pr` value that was queued rather than drafted
               // (`spine/profile.py`: `return f"QUEUED:{fingerprint}"`), and the client only
@@ -1168,10 +1248,20 @@ export default [
               // `config.json`, not copy. Already exempt as an object property below; a
               // JSX attribute of the same name carries the same machine value.
               'path',
+              // The same dotted config path on the Settings* primitives
+              // (`configKey="session_environments.coder_url"`): the settings
+              // extractor reads it to deep-link the control, so it is a machine
+              // key. A section with an underscore escapes the dotted-token word
+              // shape, which is why the attribute itself is named here.
+              'configKey',
               'data-\\w+', 'aria-(hidden|live|orientation|current|haspopup)',
               'autoComplete', 'inputMode', 'enterKeyHint', 'spellCheck',
               'viewBox', 'xmlns', 'fill', 'stroke', 'd', 'points', 'transform',
               'encType', 'accept', 'pattern', 'lang', 'dir',
+              // `ErrorNotice`'s `noHandoffReason`: a sentence for the code reviewer
+              // saying why the notice has no agent hand-off. The component never
+              // renders it, so it is not copy.
+              'noHandoffReason',
             ],
           },
 
@@ -1285,6 +1375,22 @@ export default [
     },
   },
 
+  // Debug-only developer diagnostics, same class as `commitProfiler.tsx` above:
+  // `startDashboardLoadTiming` emits the Dashboard-tab load step timers (#20952)
+  // to the browser console and the User Timing panel for whoever is profiling,
+  // never to a user through the UI. The format of each line IS the interface
+  // (`[dashboard-timing] member:oncall step2-sandbox-post +18ms (t=42ms)`), so a
+  // localised copy would destroy the only property that makes it useful, exactly
+  // as it would for a `console.log`. Whole-file and scoped to this one module,
+  // which renders nothing and holds only these diagnostics; product copy added
+  // here later belongs in the catalog, not under this exemption.
+  {
+    files: ['src/lib/dashboardTiming.ts'],
+    rules: {
+      'i18next/no-literal-string': 'off',
+    },
+  },
+
   // A pure-CSS module: one template literal of scoped style rules (hover/focus
   // states inline styles cannot express) injected via a <style> tag. It contains
   // selectors and declarations, never user-visible copy. The Tailwind/CSS shape
@@ -1341,13 +1447,18 @@ export default [
   // into the calls to earn the callee exemption would duplicate its branch logic
   // three times — a worse module for a lint technicality.
   //
-  // Scoped to this one file for the same reason as the two above: the module is the
-  // SDK's protocol surface (event tables, hooks, provider) and holds no other prose.
-  // The pieces that DO render copy — `ChatEmbed`, `ChatPanel`, `ChatMessageList` —
-  // are separate files and stay covered. Copy added here later belongs in the
-  // catalog, not under this exemption; keep this module protocol-and-diagnostics.
+  // Scoped to these two files for the same reason as the two above: they are the
+  // SDK's protocol surface (event tables, hooks, provider, the permission-fenced
+  // client) and hold no other prose. `scopedApi.ts` is the half the barrel split
+  // out; its one flagged literal is the permission-denied diagnostic that quotes the
+  // API path the author must add to `permissions.api`, passed to
+  // `AppApiPermissionError` (a typed `Error` the send wire matches by class, so the
+  // `^(Type)?Error$` callee exemption does not reach it). The pieces that DO render
+  // copy — `ChatEmbed`, `ChatPanel`, `ChatMessageList` — are separate files and stay
+  // covered. Copy added here later belongs in the catalog, not under this
+  // exemption; keep these modules protocol-and-diagnostics.
   {
-    files: ['src/app-sdk/index.ts'],
+    files: ['src/app-sdk/index.ts', 'src/app-sdk/scopedApi.ts'],
     rules: {
       'i18next/no-literal-string': 'off',
     },
@@ -1606,6 +1717,21 @@ export default [
   // serialization-only.
   {
     files: ['src/utils/pasteTokens.ts'],
+    rules: {
+      'i18next/no-literal-string': 'off',
+    },
+  },
+
+  // SECRETS AUTHORIZE COMMAND ONLY, same "format IS the interface" category as
+  // `pasteTokens.ts` above: the two literals in this module are a CLI command and
+  // an MCP server grant name the owner types exactly as shown, so translating
+  // either makes the step impossible to complete. The sentence the owner reads
+  // around them is a separate, translated string
+  // (`settings.secrets.custom_authorize`) rendered by `SecretsPanel.tsx`, which
+  // shows the command verbatim in a `<code>` element. This module renders
+  // nothing and holds no prose; copy added here later belongs in the catalog.
+  {
+    files: ['src/pages/settings/secretsAuthorizeCommand.ts'],
     rules: {
       'i18next/no-literal-string': 'off',
     },

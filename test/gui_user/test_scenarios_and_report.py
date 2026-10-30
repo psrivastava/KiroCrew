@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -25,6 +26,7 @@ SEED_HOME_PY = Path(__file__).resolve().parents[2] / "scripts" / "gui-user-test"
 
 
 SHIPPED_SMOKE = {
+    "apps-discover-enable-notes",
     "apps-discover-enable-research-lab",
     "artifacts-library-table-and-kind-filter",
     "auth-sign-in-card-signed-out",
@@ -44,7 +46,7 @@ SHIPPED_SMOKE = {
     "search-everywhere-jump-to-setting",
     "sessions-new-chat",
     "settings-chat-toggle-show-timestamps",
-    "settings-developer-panel-dev-mode-toggle",
+    "settings-developer-panel-pages",
     "settings-search-jump-to-theme",
     "settings-security-docs-section",
     "settings-security-layers-section",
@@ -59,6 +61,7 @@ SHIPPED_SMOKE = {
     "taskrunner-projects-page-compose",
 }
 SHIPPED = SHIPPED_SMOKE | {
+    "chat-subagents-panel-empty",
     "crewmate-chat-clean",
     "crewmate-create-first",
     "crewmate-panel-tabs",
@@ -67,6 +70,8 @@ SHIPPED = SHIPPED_SMOKE | {
     "knowledge-add-folder-source-and-scan",
     "members-dm-hello",
     "members-private-memory-keeps-thread",
+    "members-roster-filter",
+    "schedule-add-cron-job",
 }
 
 
@@ -89,8 +94,8 @@ class TestShippedScenarios:
             assert s.max_steps <= 14, s.name
         smoke_steps = sum(s.max_steps for s in smoke)
         smoke_seconds = sum(s.max_seconds for s in smoke)
-        assert smoke_steps == 307, f"smoke max_steps total is {smoke_steps}; re-pin"
-        assert smoke_seconds == 8420, f"smoke max_seconds total is {smoke_seconds}; re-pin"
+        assert smoke_steps == 321, f"smoke max_steps total is {smoke_steps}; re-pin"
+        assert smoke_seconds == 8720, f"smoke max_seconds total is {smoke_seconds}; re-pin"
 
     def test_nightly_includes_smoke(self) -> None:
         nightly = scenarios.select(scenarios.load_all(SCENARIOS_DIR), tier="nightly")
@@ -166,6 +171,46 @@ class TestShippedScenarios:
         sc = scenarios.load_scenario(SCENARIOS_DIR / "chat-files-side-panel-browse.yaml")
         assert any(meta["title"] in step for step in sc.steps)
 
+    def test_scenarios_search_before_clicking_a_seeded_members_card(self) -> None:
+        # The Mates page lists a mate unasked only once its DM thread
+        # holds a message or the user starred it (rfc-session-template-vs-crewmate,
+        # rule 3); a seeded member's thread is empty at boot, so its card is
+        # reached through the roster search and nothing else. A scenario that
+        # tells the tester to click the card without searching first stalls on a
+        # roster that lists only `default` and Mate, so the search step must come
+        # before the first click, in every scenario that opens that page. The
+        # Capabilities > Mates pane is a different surface: it lists every
+        # config row, so a scenario on it has nothing to search for.
+        checked = 0
+        for path in sorted(SCENARIOS_DIR.glob("*.yaml")):
+            sc = scenarios.load_scenario(path)
+            if not sc.members or not any("Open the Mates page" in step for step in sc.steps):
+                continue
+            labels = list(sc.members) + [
+                " ".join(part.capitalize() for part in m.split("-")) for m in sc.members
+            ]
+            click_at = next(
+                (
+                    i
+                    for i, step in enumerate(sc.steps)
+                    if any(label in step for label in labels)
+                    and re.search(r"\b(click|find)\b", step, re.IGNORECASE)
+                    and "Search mates" not in step
+                ),
+                None,
+            )
+            if click_at is None:
+                continue
+            checked += 1
+            searched = any(
+                "Search mates" in step and any(m.split("-")[0] in step.lower() for m in sc.members)
+                for step in sc.steps[:click_at]
+            )
+            assert (
+                searched
+            ), f"{path.name}: step {click_at + 1} clicks a seeded member's card with no search step before it"
+        assert checked >= 5, f"only {checked} scenarios click a seeded member's card"
+
     def test_rich_seed_artifacts_are_the_ones_the_scenario_reads(self) -> None:
         # The Artifacts scenario names the three artifacts the `rich` seed ships and
         # narrows the table to the one markdown artifact by slug and kind. An
@@ -199,6 +244,32 @@ class TestShippedScenarios:
         )
         assert any(f'"v{version}"' in exp for exp in sc.expectations)
 
+    def test_fresh_target_scenarios_run_before_any_scenario_that_writes(self) -> None:
+        # The target boots once and nothing resets it. In file-name order the
+        # members-*/crewmate-* chats post crewmate notes and add crewmates
+        # before notifications-* and customize-tabs read an empty inbox and a
+        # one-card roster. The scenarios that read the boot state say so, and
+        # select() runs them first in every tier.
+        fresh = {
+            "capabilities-agents-list-and-open-editor",
+            "customize-tabs",
+            "notifications-bell-sheet-open-close",
+            "notifications-center-empty-state",
+        }
+        loaded = scenarios.load_all(SCENARIOS_DIR)
+        assert {s.name for s in loaded if s.fresh_target} == fresh
+        for tier in ("smoke", "nightly"):
+            run = scenarios.select(loaded, tier=tier)
+            flags = [s.fresh_target for s in run]
+            first_other = flags.index(False)
+            assert all(flags[:first_other]) and not any(flags[first_other:]), tier
+            scenarios.check_run_order(run)
+            # Each part keeps file-name order, so the rest of the run is unchanged.
+            rest = [s.name for s in run[first_other:]]
+            assert rest == sorted(rest), tier
+        picked = scenarios.select(loaded, names=["members-dm-hello", "customize-tabs"])
+        assert [s.name for s in picked] == ["customize-tabs", "members-dm-hello"]
+
     def test_explicit_name_selection(self) -> None:
         picked = scenarios.select(scenarios.load_all(SCENARIOS_DIR), names=["members-dm-hello"])
         assert [s.name for s in picked] == ["members-dm-hello"]
@@ -217,6 +288,27 @@ class TestShippedScenarios:
         # The catalog fields describe the scenario to people, not to the model.
         assert sc.user_story not in prompt
 
+    def test_a_retry_creates_a_new_name_not_the_first_attempts(self) -> None:
+        # The target boots once per run, so attempt 2 finds the crewmate attempt 1
+        # made. Asking it for the same name is refused as a duplicate and leaves
+        # a dirty "New crewmate" form for the next scenario (Leave site?).
+        sc = scenarios.load_scenario(SCENARIOS_DIR / "crewmate-create-first.yaml")
+        first, second = sc.task_prompt(1), sc.task_prompt(2)
+        assert scenarios.ATTEMPT_SUFFIX not in first + second
+        assert 'type exactly "Radar" in the "Name" field' in first
+        assert 'type exactly "Radar 2" in the "Name" field' in second
+        assert '"Radar 2" is visible' in second
+        assert sc.task_prompt() == first
+
+    def test_attempt_suffix(self) -> None:
+        assert [scenarios.attempt_suffix(n) for n in (0, 1, 2, 3)] == ["", "", " 2", " 3"]
+
+    def test_report_summary_carries_no_placeholder(self) -> None:
+        sc = scenarios.load_scenario(SCENARIOS_DIR / "crewmate-create-first.yaml")
+        res = harness.ScenarioResult.for_scenario(sc, "SKIPPED")
+        assert scenarios.ATTEMPT_SUFFIX not in res.summary
+        assert "named Radar with a job" in res.summary
+
     def test_every_shipped_scenario_is_classified(self) -> None:
         for sc in scenarios.load_all(SCENARIOS_DIR):
             assert sc.feature in scenarios.FEATURES
@@ -230,6 +322,7 @@ class TestShippedScenarios:
         assert {slug: [s.name for s in g] for slug, g in groups.items()} == {
             "chat": [
                 "chat-session-title",
+                "chat-subagents-panel-empty",
                 "chat-switch-seeded-sessions",
                 "chat-turn-stats-footer",
                 "sessions-new-chat",
@@ -248,6 +341,7 @@ class TestShippedScenarios:
                 "crewmate-reply-thread",
                 "members-dm-hello",
                 "members-private-memory-keeps-thread",
+                "members-roster-filter",
             ],
             "capabilities": [
                 "capabilities-agents-list-and-open-editor",
@@ -259,9 +353,12 @@ class TestShippedScenarios:
             "knowledge": ["knowledge-add-folder-source-and-scan"],
             "artifacts": ["artifacts-library-table-and-kind-filter"],
             "files": ["chat-files-side-panel-browse"],
-            "apps": ["apps-discover-enable-research-lab"],
+            "apps": ["apps-discover-enable-notes", "apps-discover-enable-research-lab"],
             "task-runner": ["taskrunner-projects-page-compose"],
-            "schedule": ["schedule-list-calendar-executions-views"],
+            "schedule": [
+                "schedule-add-cron-job",
+                "schedule-list-calendar-executions-views",
+            ],
             "notifications": [
                 "notifications-bell-sheet-open-close",
                 "notifications-center-empty-state",
@@ -269,7 +366,7 @@ class TestShippedScenarios:
             "auth": ["auth-sign-in-card-signed-out"],
             "settings": [
                 "settings-chat-toggle-show-timestamps",
-                "settings-developer-panel-dev-mode-toggle",
+                "settings-developer-panel-pages",
                 "settings-search-jump-to-theme",
                 "settings-shortcuts",
                 "settings-tab-rail-navigation",
@@ -309,13 +406,13 @@ class TestShippedScenarios:
         """The Feature Previews card carries two titles across the Crew Mode retirement; the steps name both."""
         sc = scenarios.load_scenario(SCENARIOS_DIR / "members-dm-hello.yaml")
         preview_step = next(
-            s for s in sc.steps if "preview" in s.lower() and "turn on" in s.lower()
+            s for s in sc.steps if "preview" in s.lower() and "make sure it is on" in s.lower()
         )
-        assert 'starts with "Crewmates"' in preview_step
+        assert 'starts with "Mates"' in preview_step
         assert (
             "Crew Members and Crew Mode" in preview_step
         )  # the older titles are still valid readings on older builds
-        assert any('"Crewmates" item appears in the left rail' in s for s in sc.steps)
+        assert any('"Mates" item is in the left rail' in s for s in sc.steps)
 
     def test_members_scenarios_hedge_the_card_label(self) -> None:
         """A seeded member has no display name, so its card shows the id; every members scenario says so."""
@@ -332,20 +429,133 @@ class TestShippedScenarios:
             assert not any('named "Nova Sky"' in s for s in sc.steps), name
 
     def test_crewmates_scenarios_name_the_current_preview_and_rail_label(self) -> None:
-        """Every scenario that turns on the Crewmates preview leads with today's card title and rail label."""
+        """Every scenario that meets the old Mates preview treats it as optional and names today's rail label.
+
+        Mates is always on, so a current build has no such switch; older
+        builds still do, and the step must hold on both.
+        """
         checked = 0
         for path in sorted(SCENARIOS_DIR.glob("*.yaml")):
             sc = scenarios.load_scenario(path)
-            preview_steps = [
-                s for s in sc.steps if "turn on the preview" in s.lower() and "Crew" in s
-            ]
+            preview_steps = [s for s in sc.steps if "Crew Members and Crew Mode" in s]
             for step in preview_steps:
                 checked += 1
-                assert 'starts with "Crewmates"' in step, (path.name, step)
-            rail_steps = [s for s in sc.steps if "item appears in the left rail" in s]
+                assert 'starts with "Mates"' in step, (path.name, step)
+                assert step.startswith("If the Feature Previews list has"), (path.name, step)
+                assert "turn on the preview" not in step.lower(), (path.name, step)
+            assert not any("item appears in the left rail" in s for s in sc.steps), path.name
+            rail_steps = [s for s in sc.steps if "item is in the left rail" in s]
             for step in rail_steps:
-                assert '"Crewmates" item appears in the left rail' in step, (path.name, step)
+                assert '"Mates" item is in the left rail' in step, (path.name, step)
         assert checked >= 5
+
+    def test_created_crewmate_speaks_first_with_no_user_greeting_bubble(self) -> None:
+        """A new crewmate's first turn is a hidden kickoff, so the only bubble is its reply.
+
+        The create sends ``first_greeting`` and the server starts the
+        mate's first turn from a kickoff that is never written to the
+        transcript (``mate_welcome``). No user bubble is drawn, so an
+        expectation that asks for one fails on every nightly.
+        """
+        sc = scenarios.load_scenario(SCENARIOS_DIR / "crewmate-create-first.yaml")
+        expectations = " ".join(sc.expectations)
+        assert "welcome to the team" not in expectations
+        assert "on your behalf" not in expectations
+        from kiro_crew.testing.fake_acp_backend import REPLY_TEXT
+
+        assert f'"{REPLY_TEXT}"' in expectations
+        assert "no bubble from you" in expectations
+
+    def test_customize_and_memory_scenarios_quote_the_shipped_labels(self) -> None:
+        """Each label these scenarios tell the tester to find is a string the UI ships.
+
+        A quoted label the dashboard does not draw fails the scenario on every
+        nightly, at a model-call cost, so the quote is read from the same en
+        catalog the page renders and the retired readings are refused.
+        """
+        locales = Path(__file__).resolve().parents[2] / "website/src/i18n/locales"
+        en = json.loads((locales / "en.json").read_text(encoding="utf-8"))
+        manual = json.loads((locales / "en.manual.json").read_text(encoding="utf-8"))
+        pages = en["pages"]
+        rail = manual["crewEditorNext"]
+
+        def text(name: str) -> str:
+            sc = scenarios.load_scenario(SCENARIOS_DIR / f"{name}.yaml")
+            return " ".join([*sc.steps, *sc.expectations])
+
+        new_crewmate = pages["kiroCrewAgentsPage"]["add_crew_member"]
+        editor = text("capabilities-agents-list-and-open-editor")
+        for label in (
+            new_crewmate,
+            pages["kiroCrewAgentsPage"]["filter_agents"],
+            manual["components"]["avatarBuilder"]["edit_avatar"],
+            *(rail[k] for k in ("section_general", "section_capabilities", "tab_approvals")),
+            *(rail[k] for k in ("tab_schedules", "tab_webhooks", "section_memory")),
+            rail["section_danger"],
+        ):
+            assert f'"{label}"' in editor, label
+        for retired in ("Add crewmate", "Chat with this crewmate", "Who it is", "Overview"):
+            assert retired not in editor, retired
+
+        customize = text("customize-tabs")
+        assert f'"{new_crewmate}"' in customize
+        assert f'"{pages["capabilitiesPage"]["agent_capabilities"]}"' in customize
+        assert "Add crewmate" not in customize
+        picker_step = next(s for s in customize.split(". ") if "New sessions use" in s)
+        assert "At its top" in picker_step, picker_step
+
+        memory = text("memory-open-browser-from-overview")
+        memory_tab = pages["overview"]["memoryTab"]
+        assert f'"{memory_tab["consolidation_idle_hours"]}"' in memory
+        assert f'"{memory_tab["memory_settings"]}"' in memory
+        assert f'"{pages["overview"]["memoryStoreCard"]["memory_store"]}"' in memory
+        assert "Consolidation idle" not in memory
+
+    def test_shortcuts_scenario_judges_everything_on_the_frame_it_lands_on(self) -> None:
+        """The harness judges every expectation on the last screenshot.
+
+        A scroll moves the Preferences switch off screen, so the scenario reads
+        the first frame only: the switch and the Chat Navigation rows under it.
+        """
+        sc = scenarios.load_scenario(SCENARIOS_DIR / "settings-shortcuts.yaml")
+        assert not any("scroll down" in s.lower() for s in sc.steps), sc.steps
+        assert any('"Enable shortcuts"' in e for e in sc.expectations), sc.expectations
+        assert any('"Chat Navigation"' in e for e in sc.expectations), sc.expectations
+        for exp in sc.expectations:
+            assert "screenshot taken" not in exp, exp
+            assert "Panel Navigation" not in exp, exp
+
+    def test_scenarios_name_the_dormant_row_by_its_shipped_sentence(self) -> None:
+        """The sleeping-session expander row is named by its shipped sentence.
+
+        A step or expectation naming the row must quote the exact en.json
+        sentence for a count of one so the tester looks for the right words.
+        """
+        en = json.loads(
+            (Path(__file__).resolve().parents[2] / "website/src/i18n/locales/en.json").read_text(
+                encoding="utf-8"
+            )
+        )["pages"]["chatSidebar"]
+        allowed = {
+            en[f"stale_collapse_row_{state}_one"].replace("{{count}}", "1")
+            for state in ("hidden", "shown")
+        }
+        # Derive the key adjective from the allowed set, e.g. "sleeping".
+        # Skip short words and generic ones shared across many labels.
+        generic = {"show", "hide", "count", "session", "sessions", "1"}
+        row_adj = {
+            w for label in allowed for w in label.lower().split() if w not in generic and len(w) > 3
+        }
+        checked = 0
+        for path in sorted(SCENARIOS_DIR.glob("*.yaml")):
+            sc = scenarios.load_scenario(path)
+            for text in [*sc.steps, *sc.expectations]:
+                assert "Dormant sessions" not in text, (path.name, text)
+                for quoted in text.split('"')[1::2]:
+                    if any(w in quoted.lower() for w in row_adj):
+                        checked += 1
+                        assert quoted in allowed, (path.name, quoted)
+        assert checked >= 3
 
 
 def _write(tmp_path: Path, name: str, doc: dict) -> Path:
@@ -374,7 +584,23 @@ class TestScenarioValidation:
         sc = scenarios.load_scenario(_write(tmp_path, "demo", _valid()))
         assert sc.members == ("nova-sky",) and sc.start_url == "/settings" and sc.seed == "rich"
         assert sc.feature == "settings" and sc.user_story.startswith("As a user")
-        assert sc.docs_url == ""
+        assert sc.docs_url == "" and sc.fresh_target is False
+
+    def test_runner_refuses_a_fresh_target_scenario_after_any_other(self, tmp_path: Path) -> None:
+        doc = _valid("fresh")
+        doc["preconditions"]["fresh_target"] = True
+        fresh = scenarios.load_scenario(_write(tmp_path, "fresh", doc))
+        other = scenarios.load_scenario(_write(tmp_path, "other", _valid("other")))
+        assert fresh.fresh_target and not other.fresh_target
+        scenarios.check_run_order([fresh, other])
+        with pytest.raises(scenarios.ScenarioError, match="fresh needs a fresh target"):
+            scenarios.check_run_order([other, fresh])
+        assert scenarios.select([other, fresh]) == [fresh, other]
+        # The runner's own check fires before it touches the model or the display,
+        # so a bare instance is enough.
+        runner = harness.Runner.__new__(harness.Runner)
+        with pytest.raises(scenarios.ScenarioError, match="fresh needs a fresh target"):
+            harness.Runner.run(runner, [other, fresh], retries=0)
 
     def test_docs_url_accepts_https_and_repo_docs_paths(self, tmp_path: Path) -> None:
         for url in (
@@ -424,6 +650,7 @@ class TestScenarioValidation:
             (lambda d: d.update(max_seconds=scenarios.MAX_SECONDS_CEILING + 1), "max_seconds"),
             (lambda d: d.update(max_seconds=True), "max_seconds"),
             (lambda d: d.update(bonus=1), "unknown keys"),
+            (lambda d: d["preconditions"].update(fresh_target="yes"), "fresh_target"),
             (lambda d: d["preconditions"].update(start_url="settings"), "start_url"),
             (lambda d: d["preconditions"].update(start_url="/x?token=1"), "start_url"),
             (lambda d: d["preconditions"].update(members=["Nova Sky"]), "members"),
@@ -679,7 +906,7 @@ class TestReport:
         md = report.render_features(catalog, _summary(), run_url="https://x/run")
         assert md.startswith("# GUI user-test feature catalog\n")
         assert (
-            f"_18 of {len(scenarios.FEATURES)} features covered · 40 scenarios (32 smoke / 8 nightly)._"
+            f"_18 of {len(scenarios.FEATURES)} features covered · 44 scenarios (33 smoke / 11 nightly)._"
             in md
         )
         assert (
@@ -786,3 +1013,217 @@ class TestScenarioResultCarriesTheCatalogFields:
         assert (res.name, res.tier, res.status) == ("members-dm-hello", "nightly", "SKIPPED")
         assert res.feature == "members" and res.user_story == sc.user_story
         assert res.attempts == []
+
+
+class TestSeededTitleReset:
+    """A scenario may rename a shared seeded session (``chat-session-title``
+    renames the pinned seeded welcome starter), and every scenario and
+    retry runs against ONE un-reseeded gateway, so a scenario that aborts
+    mid-flow can leak the rename into the next scenario's start state. The
+    harness restores the seeded titles before each attempt. These tests drive
+    the real ``urllib`` round-trip against a fake loopback gateway, so they fail
+    on a tree that has no reset and pass once it does.
+    """
+
+    #: The title the ``rich`` fixture seeds for the pinned starter session.
+    _FIXTURE_WELCOME_TITLE = "Welcome to KiroCrew"  # brand-ok: verbatim fixture title
+
+    #: The session cookie the harness sends. The link-token window does not
+    #: matter to it; a cookie that validates is all the reset needs.
+    _COOKIE = "mc_token_7788=sess.cookie.value"
+
+    @staticmethod
+    def _fake_gateway(slots: list[dict], cookie: str, *, reject_link_token: bool = False):
+        """A loopback HTTP server answering GET /api/chat/slots and
+        PATCH /api/chat/slots/{slot}/title, authenticating on the session
+        ``Cookie`` header, recording every applied rename.
+
+        ``reject_link_token=True`` additionally 401s any request carrying a
+        ``?token=`` query param, modelling the gateway AFTER the 5-minute link
+        window: this is what proves a reset keyed on the link token would fail
+        but one keyed on the session cookie still works.
+
+        Returns ``(base_url, patches, stop)``.
+        """
+        import socketserver
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        from urllib.parse import parse_qs, urlsplit
+
+        state = {s["key"]: dict(s) for s in slots}
+        patches: list[tuple[str, str]] = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *a):  # silence
+                return
+
+            def _auth_ok(self, parsed) -> bool:
+                if reject_link_token and parse_qs(parsed.query).get("token"):
+                    return False
+                return self.headers.get("Cookie", "") == cookie
+
+            def do_GET(self):  # noqa: N802
+                parsed = urlsplit(self.path)
+                if not self._auth_ok(parsed):
+                    self.send_response(401)
+                    self.end_headers()
+                    return
+                if parsed.path == "/api/chat/slots":
+                    body = json.dumps(list(state.values())).encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                self.send_response(404)
+                self.end_headers()
+
+            def do_PATCH(self):  # noqa: N802
+                parsed = urlsplit(self.path)
+                if not self._auth_ok(parsed):
+                    self.send_response(401)
+                    self.end_headers()
+                    return
+                prefix, _, suffix = parsed.path.partition("/api/chat/slots/")
+                if prefix or not suffix.endswith("/title"):
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                key = suffix[: -len("/title")]
+                length = int(self.headers.get("Content-Length", "0"))
+                payload = json.loads(self.rfile.read(length) or b"{}")
+                title = str(payload.get("title", ""))
+                if key not in state:
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                state[key]["title"] = title
+                patches.append((key, title))
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"ok": True, "title": title}).encode())
+
+        # Subclass with a server_bind that skips the socket.getfqdn lookup
+        # http.server does between bind() and listen() (testing-conventions.md;
+        # it can stall on macOS). Loopback-only and reached by URL, never a name.
+        class _LoopbackServer(ThreadingHTTPServer):
+            def server_bind(self) -> None:
+                socketserver.TCPServer.server_bind(self)
+                host, port = self.server_address[:2]
+                self.server_name = str(host)
+                self.server_port = int(port)
+
+        srv = _LoopbackServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        base_url = f"http://127.0.0.1:{srv.server_address[1]}"
+        return base_url, patches, srv.shutdown
+
+    def _runner(self, base_url: str, cookie: str) -> "harness.Runner":
+        # The reset path touches neither the model client nor the display, so
+        # bare objects stand in for them.
+        return harness.Runner(
+            object(),
+            object(),
+            base_url=base_url,
+            tool_mode="custom",
+            price_in=0.0,
+            price_out=0.0,
+            budget_usd=0.0,
+            out=Path("."),
+            dashboard_cookie=cookie,
+        )
+
+    def test_the_fixture_title_is_the_one_the_reset_restores(self) -> None:
+        # The reset target must match the title the rich fixture seeds, or it
+        # would "restore" the wrong name. Hold them equal here. The harness
+        # keys the map on the SLOT NAME the gateway lists, which startup restore
+        # derives from the ``dashboard_starter`` transcript stem by stripping
+        # ``dashboard_``; assert both the key and the title against that real
+        # mapping so neither can drift away from the gateway silently.
+        from kiro_crew.dashboard.slot_persistence.restore_inputs import (
+            _recent_session_slot_name,
+        )
+        from kiro_crew.history import ConversationLog
+        from kiro_crew.testing.fixtures import seeded_home
+
+        slot_name = _recent_session_slot_name("dashboard_starter")
+        assert slot_name == "starter"
+        assert slot_name in harness.SEEDED_SLOT_TITLES
+        with seeded_home("rich") as home:
+            meta = ConversationLog(base_dir=home / "sessions").get_metadata("dashboard_starter")
+        assert harness.SEEDED_SLOT_TITLES[slot_name] == meta["title"]
+
+    def test_renamed_seeded_title_is_restored_before_the_next_attempt(self) -> None:
+        # A prior scenario left the pinned starter renamed; a clean session is
+        # left untouched.
+        base_url, patches, stop = self._fake_gateway(
+            [
+                {"key": "starter", "title": "Welcome renamed by gui test"},
+                {"key": "research-notes", "title": "Research: MCP transport trade-offs"},
+            ],
+            self._COOKIE,
+        )
+        try:
+            self._runner(base_url, self._COOKIE).reset_seeded_titles()
+        finally:
+            stop()
+        # Exactly the drifted seeded title is restored; nothing else is touched.
+        assert patches == [("starter", self._FIXTURE_WELCOME_TITLE)]
+
+    def test_reset_works_after_the_link_token_window_has_closed(self) -> None:
+        # The whole point of authenticating with the session cookie rather than
+        # the boot link token: late in a run the 5-minute link window has
+        # closed, but the reset must still restore the title. The gateway here
+        # 401s any ?token= request yet honours the cookie.
+        base_url, patches, stop = self._fake_gateway(
+            [{"key": "starter", "title": "Welcome renamed by gui test"}],
+            self._COOKIE,
+            reject_link_token=True,
+        )
+        try:
+            self._runner(base_url, self._COOKIE).reset_seeded_titles()
+        finally:
+            stop()
+        assert patches == [("starter", self._FIXTURE_WELCOME_TITLE)]
+
+    def test_a_title_already_at_the_fixture_value_is_not_rewritten(self) -> None:
+        base_url, patches, stop = self._fake_gateway(
+            [{"key": "starter", "title": self._FIXTURE_WELCOME_TITLE}], self._COOKIE
+        )
+        try:
+            self._runner(base_url, self._COOKIE).reset_seeded_titles()
+        finally:
+            stop()
+        assert patches == []
+
+    def test_no_cookie_no_ops(self) -> None:
+        # Local reproduction without the cookie file: the reset must do nothing
+        # rather than raise, so a scenario still runs.
+        base_url, patches, stop = self._fake_gateway(
+            [{"key": "starter", "title": "Welcome renamed by gui test"}], self._COOKIE
+        )
+        try:
+            self._runner(base_url, "").reset_seeded_titles()
+        finally:
+            stop()
+        assert patches == []
+
+    def test_read_dashboard_cookie_parses_target_env(self, tmp_path: Path) -> None:
+        env = tmp_path / "target.env"
+        env.write_text(
+            "GUI_BASE_URL=http://127.0.0.1:7788\n"
+            "GUI_DASHBOARD_TOKEN=abc.def\n"
+            "GUI_DASHBOARD_COOKIE=mc_token_7788=sess.cookie\n",
+            encoding="utf-8",
+        )
+        assert harness.read_dashboard_cookie(env) == "mc_token_7788=sess.cookie"
+        assert harness.read_dashboard_cookie(None) == ""
+        assert harness.read_dashboard_cookie(tmp_path / "missing.env") == ""
+
+    def test_a_non_http_base_url_is_refused_not_opened(self) -> None:
+        # Defence in depth behind the scheme-restricted opener: a base URL that
+        # is not http(s) must never reach a handler that could read a file.
+        runner = self._runner("file:///etc", self._COOKIE)
+        with pytest.raises(ValueError, match="non-HTTP"):
+            runner._api_url("/api/chat/slots")

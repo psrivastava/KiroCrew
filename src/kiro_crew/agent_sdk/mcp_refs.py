@@ -59,6 +59,7 @@ exception would cost the session over a diagnostic.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from fnmatch import fnmatchcase
 from typing import Any
 
 from kiro_crew.agent_sdk.backends import ACP_BACKENDS_SPEC_SERVERS_OFF_WIRE
@@ -124,6 +125,54 @@ def parse_tools_refs(tools: Any) -> tuple[bool, list[str]]:
             seen.add(server)
             names.append(server)
     return grant_all, names
+
+
+#: Characters that make the tool part of an ``@server/<tool>`` ref a pattern
+#: rather than one tool's name.
+_TOOL_GLOB_CHARS = frozenset("*?[")
+
+
+def per_tool_grants(tools: Any, server: str) -> frozenset[str] | None:
+    """The tools a spec ``tools`` list grants on *server*, when it grants them one by one.
+
+    The companion of :func:`parse_tools_refs` for the narrower question "which of
+    this server's tools does the spec name", read with the same vocabulary. It
+    answers a set only when EVERY ref to *server* is an ``@server/<tool>`` naming
+    one tool. ``None`` means the spec grants the server as a whole, or not at all,
+    and nothing narrower can be read from it:
+
+    * ``*`` anywhere grants every defined server;
+    * a bare ``@server`` grants all of its tools;
+    * a tool part holding a glob character (``@server/*``, ``@server/artifact_*``)
+      names a pattern, which is read as the whole server rather than matched here;
+    * no ref to *server* at all leaves the mount to whoever decides it.
+
+    Never raises, for the same reason as :func:`parse_tools_refs`: the input is a
+    hand-editable file and the caller is answering a per-session question.
+    """
+    if not server:
+        return None
+    named: set[str] = set()
+    whole = False
+    prefix = f"{_MCP_PREFIX}{server}"
+    for item in tools if isinstance(tools, (list, tuple)) else ():
+        if not isinstance(item, str):
+            continue
+        if item == _GRANT_ALL:
+            return None
+        if item == prefix:
+            whole = True
+            continue
+        if not item.startswith(prefix + "/"):
+            continue
+        tool = item[len(prefix) + 1 :]
+        if not tool or _TOOL_GLOB_CHARS.intersection(tool):
+            whole = True
+            continue
+        named.add(tool)
+    if whole or not named:
+        return None
+    return frozenset(named)
 
 
 def wire_server_names(servers: Any) -> list[str]:
@@ -204,3 +253,33 @@ def unresolved_server_refs(spec: Any, wire_servers: Any, *, backend: str) -> lis
         for name in refs
         if name not in satisfied and name not in RESERVED_TOOL_NAMESPACES
     )
+
+
+def _canonical_grant_pattern(ref: str) -> str | None:
+    """An MCP entry's tool pattern; whole-server spellings select every tool."""
+    if not ref.startswith("@"):
+        return None
+    server, _, tool = ref[1:].partition("/")
+    if not server:
+        return None
+    return f"@{server}/{tool or '*'}"
+
+
+def _glob_hits(concrete: str, pattern: str) -> bool:
+    """Match as written or case-folded, conservatively counting either as a grant."""
+    return fnmatchcase(concrete, pattern) or fnmatchcase(concrete.casefold(), pattern.casefold())
+
+
+def entry_reaches(entry: str, ref: str) -> bool:
+    """Whether an approval or selector entry can grant *ref*.
+
+    MCP entries match their canonical tool pattern. Namespace-wide entries match
+    both the full ref and its bare verb. Matching more is the safe direction for
+    withholding grants, warning about unasked calls and hiding ineffective Remove.
+    """
+    pattern = _canonical_grant_pattern(entry)
+    ref = _canonical_grant_pattern(ref) or ref
+    if pattern is not None:
+        return _glob_hits(ref, pattern)
+    _, _, verb = ref.partition("/")
+    return _glob_hits(ref, entry) or (verb != "" and _glob_hits(verb, entry))

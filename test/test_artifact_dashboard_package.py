@@ -12,6 +12,8 @@ handler and a plain ``artifact_update`` all reach
 3. A revert restores layout and keeps the LIVE binding.
 4. An invalid package is refused on every write path, with a reason that names
    the rule.
+5. ``artifact_save`` -- the only save path an agent has -- reaches that gate at
+   all, and reaching it is all the tool layer does.
 """
 
 from __future__ import annotations
@@ -19,6 +21,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 
@@ -26,8 +29,31 @@ from kiro_crew.artifact_store import dashboard_package as dp
 from kiro_crew.artifact_store.records import ALLOWED_EVENT_TYPES
 from kiro_crew.artifact_store.rules import ALLOWED_KINDS, USER_SELECTABLE_KINDS
 from kiro_crew.artifacts import ArtifactStore, ArtifactValidationError
+from kiro_crew.validation import (
+    _ARTIFACT_KIND_RE,
+    ARTIFACT_LIST_SCHEMA,
+    ARTIFACT_SAVE_SCHEMA,
+    validate_tool_args,
+)
+
+
+def _owner_write(store: Any, slug: str, **kwargs: Any) -> Any:
+    """A dashboard content write under the record's CURRENT token.
+
+    ``ArtifactStore.update`` refuses a kind or content write on a record whose kind is
+    ``dashboard`` unless it names the read it was authorized against, and an absent
+    token is a refusal -- see
+    ``test_dashboard_package_owner_gate.TestAnUntokenedWriteCannotTakeADashboardOver``.
+    The route reads the slug before every write and hands the store that token; a test
+    playing the owner reads it here for the same reason.
+    """
+    token = store.get(slug, assign_token=True).content_token
+    return store.update(slug, snapshot_token=token, **kwargs)
+
 
 BOUND = "crewmate:mate"
+#: A root session's page.
+SESSION_BOUND = "session:mate-root"
 
 
 def package(
@@ -38,7 +64,10 @@ def package(
     tokens: dict[str, str] | None = None,
     css: str | None = None,
 ) -> dict[str, Any]:
-    """A valid package, with each part overridable so a test changes one thing."""
+    """A valid package, with each part overridable so a test changes one thing.
+
+    *blocks* writes the view as a stored view of blocks; the store reads it as its page.
+    """
     out: dict[str, Any] = {
         "kind": "dashboard",
         "bound_to": bound_to,
@@ -66,16 +95,17 @@ def package(
                 }
             )
         },
-        "view": {
-            "blocks": (
-                blocks
-                if blocks is not None
-                else [
-                    {"id": "prs", "type": "stat", "fields": ["open_prs"], "title": "Open PRs"},
-                    {"id": "runs", "type": "table", "fields": ["last_run", "lane"]},
-                ]
-            )
-        },
+        "view": (
+            {"blocks": blocks}
+            if blocks is not None
+            else {
+                "html": (
+                    '<h2 data-dashboard-field="open_prs"></h2>'
+                    '<p data-dashboard-field="last_run"></p>'
+                    '<p data-dashboard-field="lane"></p>'
+                )
+            }
+        ),
         "theme": {"tokens": tokens if tokens is not None else {"--panel-bg": "oklch(21% 0 0)"}},
     }
     if css is not None:
@@ -83,8 +113,68 @@ def package(
     return out
 
 
+#: A stored view of blocks.
+DEFAULT_BLOCKS: list[dict[str, Any]] = [
+    {"id": "prs", "type": "stat", "fields": ["open_prs"], "title": "Open PRs"},
+    {"id": "runs", "type": "table", "fields": ["last_run", "lane"]},
+]
+
+
+def _as_blocks(p: dict[str, Any]) -> list[dict[str, Any]]:
+    """Turn package *p*'s view into a saved block layout; its blocks."""
+    p["view"] = {"blocks": json.loads(json.dumps(DEFAULT_BLOCKS))}
+    return p["view"]["blocks"]
+
+
 def content(**kwargs: Any) -> str:
     return json.dumps(package(**kwargs))
+
+
+def _tool_kind_enum(tool: str) -> list[str]:
+    """The ``kind`` values the MCP tool *tool* advertises to an agent."""
+    from kiro_crew.mcp_tools.artifacts import schemas
+
+    for descriptor in schemas():
+        if descriptor["name"] == tool:
+            enum = descriptor["inputSchema"]["properties"]["kind"]["enum"]
+            assert isinstance(enum, list) and enum
+            return enum
+    raise AssertionError(f"no {tool} descriptor in the artifacts tool schemas")
+
+
+def _save_through_the_tool(
+    store: "ArtifactStore", args: dict[str, Any]
+) -> tuple[str, dict[str, Any]]:
+    """Run the real ``artifact_save`` handler against *store*.
+
+    The handler reaches the gateway, so the POST is the seam: this stands a real
+    :class:`ArtifactStore` behind it and renders a refusal the way the dashboard's
+    own handler does, as ``{"error": ...}``. That keeps the whole tool path under
+    test -- schema, handler, store, package validator -- rather than the schema
+    alone, which is the half that cannot tell a reachable kind from an advertised
+    one.
+    """
+    from kiro_crew import mcp_core
+    from kiro_crew.mcp_tools.artifacts import artifact_save
+
+    posted: dict[str, Any] = {}
+
+    def _fake_post(path: str, body: dict[str, Any] | None = None, **_kw: Any) -> dict[str, Any]:
+        assert path == "/api/artifacts", path
+        posted.update(body or {})
+        try:
+            art = store.create(
+                name=posted["name"], kind=posted.get("kind"), content=posted["content"]
+            )
+        except ArtifactValidationError as exc:
+            return {"error": str(exc)}
+        return {"slug": art.slug, "version": art.version, "name": art.name, "kind": art.kind}
+
+    with (
+        patch.object(mcp_core, "_post", side_effect=_fake_post),
+        patch.object(mcp_core, "_resolve_session_key", return_value=""),
+    ):
+        return artifact_save("artifact_save", args), posted
 
 
 @pytest.fixture
@@ -111,7 +201,7 @@ class TestSaveAndRead:
         parsed = dp.parse_package(read.content or "")
         assert parsed["bound_to"] == BOUND
         assert sorted(parsed["model"]["types"]) == ["lane", "last_run", "open_prs"]
-        assert [b["id"] for b in parsed["view"]["blocks"]] == ["prs", "runs"]
+        assert 'data-dashboard-field="open_prs"' in parsed["view"]["html"]
 
     def test_the_stored_bytes_are_canonical_not_the_authors(self, store) -> None:
         # Same package, keys shuffled and whitespace different: the stored form
@@ -130,6 +220,152 @@ class TestSaveAndRead:
         assert parsed["bound_to"] == BOUND
 
 
+class TestTheAgentToolMaySaveOne:
+    """``artifact_save`` is the only save path an agent has, so it has to reach the gate.
+
+    A package is composed by an agent, so the agent tool is what decides whether this
+    kind can be brought into being at all. Three lists stand between a call and the
+    store and all three have to carry the name: the tool's advertised enum, the kind
+    pattern the tool schema validates against, and the store's own ``ALLOWED_KINDS``.
+    A name missing from either of the first two refuses the call ``kind: invalid
+    format`` before the store sees the bytes, which is a refusal with no rule behind
+    it.
+
+    The second claim is what makes the first safe. Carrying the name is ALL the front
+    lists do -- what the bytes may be is the store's single gate in
+    ``dashboard_package``, so a body that is not a package is refused with the rule it
+    broke rather than stored under a kind the renderer would then have to parse.
+    """
+
+    def test_the_three_lists_agree_on_the_kind(self) -> None:
+        assert "dashboard" in ALLOWED_KINDS
+        assert _ARTIFACT_KIND_RE.fullmatch("dashboard") is not None
+        assert "dashboard" in _tool_kind_enum("artifact_save")
+        assert "dashboard" in _tool_kind_enum("artifact_list")
+
+    @pytest.mark.parametrize("tool", ["artifact_save", "artifact_list"])
+    def test_every_kind_the_tool_advertises_reaches_the_store(self, tool: str) -> None:
+        # Drift pin, and the direction matters. An enum entry the pattern or the
+        # store does not carry is advertised to every agent and then refused on
+        # use, which is a refusal naming no rule. The reverse is allowed:
+        # ``image`` needs a source_path the MCP save path never sends, so the
+        # pattern is deliberately wider than what the tool offers.
+        for kind in _tool_kind_enum(tool):
+            assert _ARTIFACT_KIND_RE.fullmatch(kind) is not None, kind
+            assert kind in ALLOWED_KINDS, kind
+
+    def test_the_tool_schema_takes_a_package(self) -> None:
+        cleaned = validate_tool_args(
+            {"name": "Mate dashboard", "content": content(), "kind": "dashboard"},
+            ARTIFACT_SAVE_SCHEMA,
+        )
+        assert cleaned["kind"] == "dashboard"
+
+    def test_the_list_filter_takes_the_kind_too(self) -> None:
+        # An agent that can create one has to be able to find it again.
+        cleaned = validate_tool_args({"kind": "dashboard"}, ARTIFACT_LIST_SCHEMA)
+        assert cleaned["kind"] == "dashboard"
+
+    def test_a_package_saved_through_the_tool_lands_as_a_package(self, store) -> None:
+        out, posted = _save_through_the_tool(
+            store, {"name": "Mate dashboard", "content": content(), "kind": "dashboard"}
+        )
+        # The handler forwards the kind rather than letting inference re-type a
+        # JSON body as plain ``json``, which would store the package under a kind
+        # nothing validates.
+        assert posted["kind"] == "dashboard"
+        assert out.startswith("Saved artifact: slug=")
+        stored = store.list(kind="dashboard")
+        assert len(stored) == 1
+        # Version 1 because that is what creating ANY artifact answers; there is no
+        # version 0 in this store. It is not an approval of anything, which is the
+        # next test.
+        assert stored[0].version == 1
+        assert dp.parse_package(store.get(stored[0].slug).content or "")["bound_to"] == BOUND
+
+    def test_a_save_is_a_write_and_never_a_persons_yes(self, store) -> None:
+        # Every version this store cuts appends a lifecycle event carrying the
+        # ACTOR, and the actor comes from how the request authenticated rather than
+        # from anything a caller spells. A tool save is an agent save, so no event
+        # it writes can read as a person's. Pinned here because "the package has a
+        # version" is the thing most easily misread as "someone said yes to it":
+        # what a version means is the display half's question, and nothing on this
+        # path answers it.
+        _save_through_the_tool(
+            store, {"name": "Mate dashboard", "content": content(), "kind": "dashboard"}
+        )
+        art = store.get(store.list(kind="dashboard")[0].slug)
+        events = list(getattr(art, "events", None) or [])
+        assert events, "a create records its own lifecycle event"
+        assert not [e for e in events if str(e.get("by") or "") == "user"]
+
+    def test_a_body_that_is_not_a_package_is_refused_with_its_reason(self, store) -> None:
+        out, _ = _save_through_the_tool(
+            store, {"name": "Prose", "content": "# a prose document", "kind": "dashboard"}
+        )
+        assert "is not valid JSON" in out
+        assert not store.list(kind="dashboard")
+
+    def test_a_package_carrying_values_is_refused_with_its_reason(self, store) -> None:
+        # The refusal an agent is most likely to earn: valid JSON, right shape,
+        # and values pasted into it. The rule it names is the one it broke.
+        p = package()
+        _as_blocks(p)[1]["data"] = [{"last_run": "now"}]
+        out, _ = _save_through_the_tool(
+            store, {"name": "With values", "content": json.dumps(p), "kind": "dashboard"}
+        )
+        assert "values stay in the crew log" in out
+        assert not store.list(kind="dashboard")
+
+    def test_the_tool_cannot_ask_for_a_linked_package(self, store) -> None:
+        # The serve path refuses a linked artifact because its bytes come from a
+        # file nothing gates. The tool schema has no source_path field at all, so
+        # the request cannot be spelled, and the store refuses it even if it were.
+        assert not any(f.name == "source_path" for f in ARTIFACT_SAVE_SCHEMA.fields)
+
+    def test_the_enum_tells_the_agent_every_key_the_package_needs(self) -> None:
+        # The description is the only place an agent learns what the content has
+        # to be, so a key missing from it is a refusal the agent cannot act on:
+        # it composes what it was told, the store refuses the result, and nothing
+        # in either half says which list is short.
+        from kiro_crew.mcp_tools.artifacts import schemas
+
+        save = next(s for s in schemas() if s["name"] == "artifact_save")
+        described = save["inputSchema"]["properties"]["kind"]["description"]
+        # The keys come from the VALIDATOR'S OWN canonical output, not from a list
+        # written again here: a second copy of the five keys in this file would
+        # drift from the gate exactly the way the description can.
+        for key in json.loads(dp.canonical_package_content(content())):
+            assert key in described, key
+        # And the rule behind the keys, which is the one a package most often breaks.
+        assert "values stay in the crew log" in described
+
+    def test_deleting_the_package_leaves_the_binding_unclaimed_again(self, store) -> None:
+        # THE UNDO, and it is the artifact store's own. A bound package changes
+        # what the member's write route checks against, so the step that ends that
+        # is the step that makes the binding unclaimed: deleting the artifact. The
+        # lookup every reader goes through answers None again, which is the answer
+        # it gives for a member that never had one, so a reader falls back to the
+        # template instance exactly as before the save.
+        out, _ = _save_through_the_tool(
+            store, {"name": "Mate dashboard", "content": content(), "kind": "dashboard"}
+        )
+        assert out.startswith("Saved artifact: slug=")
+        slug = store.list(kind="dashboard")[0].slug
+        assert dp.resolve_bound_slug(BOUND, store=store) == slug
+
+        assert store.delete(slug) is not False
+        assert dp.resolve_bound_slug(BOUND, store=store) is None
+        assert not store.list(kind="dashboard")
+
+    def test_an_agent_tool_kind_is_not_a_hand_pickable_one(self) -> None:
+        # The browser's type control is the one path a PERSON writes a kind on,
+        # and a prose document flipped to this kind stores content no reader can
+        # parse. The agent tool offering the kind does not make it one a person
+        # may pick: the two lists answer different questions.
+        assert "dashboard" not in USER_SELECTABLE_KINDS
+
+
 class TestWhereAValueComesFrom:
     """A field says who fills it, so a translation never has to guess."""
 
@@ -144,9 +380,16 @@ class TestWhereAValueComesFrom:
         assert types["last_run"]["source"] == {"fold": "status", "path": "last_run"}
 
     def test_the_fold_names_come_from_the_manifest_not_a_copy(self) -> None:
-        from kiro_crew.dashboard_templates.manifest import FOLD_NAMES
+        """Still the manifest module's own set and still not a copy; the set this gate
+        is defined by is now the PACKAGE one, because a package's page has a reader a
+        template's does not -- `member_dashboard_fields.LivePage` reads a tree-keyed
+        fold, and the template feed reaches a fold only by its bus scope."""
+        from kiro_crew.dashboard_templates.manifest import FOLD_NAMES, PACKAGE_FOLD_NAMES
 
-        assert dp.fold_names() == frozenset(FOLD_NAMES)
+        assert dp.fold_names() == frozenset(PACKAGE_FOLD_NAMES)
+        # And it is a SUPERSET of the template gate rather than a different list: the
+        # two surfaces answer one question, so a name neither can reach is in neither.
+        assert frozenset(FOLD_NAMES) < dp.fold_names()
 
     @pytest.mark.parametrize(
         "name",
@@ -212,7 +455,7 @@ class TestWhereAValueComesFrom:
         )
         assert art.source_path, "fixture precondition: it really is a live pointer"
         with pytest.raises(ArtifactValidationError, match="store-owned"):
-            store.update(art.slug, kind="dashboard", content=content())
+            _owner_write(store, art.slug, kind="dashboard", content=content())
 
     def test_a_dashboard_cannot_be_a_live_file_pointer(self, store, tmp_path) -> None:
         linked = tmp_path / "layout.json"
@@ -229,7 +472,7 @@ class TestWhereAValueComesFrom:
 
 class TestVersionOnlyOnLayoutChange:
     def test_rewriting_the_same_layout_creates_no_version(self, store, saved) -> None:
-        art = store.update(saved.slug, content=content(), snapshot=True)
+        art = _owner_write(store, saved.slug, content=content(), snapshot=True)
         assert art.version == 1
         assert store.list_versions(saved.slug) == [1]
         assert [e["type"] for e in art.events] == ["created"]
@@ -237,7 +480,8 @@ class TestVersionOnlyOnLayoutChange:
     def test_a_theme_change_creates_a_version_even_unasked(self, store, saved) -> None:
         # The browser PATCH path defaults snapshot to False; a real layout
         # change must still leave something to revert to.
-        art = store.update(
+        art = _owner_write(
+            store,
             saved.slug,
             content=content(tokens={"--panel-bg": "oklch(98% 0 0)"}),
             snapshot=False,
@@ -248,7 +492,7 @@ class TestVersionOnlyOnLayoutChange:
     def test_a_model_change_creates_a_version(self, store, saved) -> None:
         types = package()["model"]["types"]
         types["open_prs"]["unit"] = "PRs"
-        art = store.update(saved.slug, content=content(types=types))
+        art = _owner_write(store, saved.slug, content=content(types=types))
         assert art.version == 2
 
     def test_moving_a_field_from_a_fold_to_the_agent_creates_a_version(self, store, saved) -> None:
@@ -257,21 +501,105 @@ class TestVersionOnlyOnLayoutChange:
         # may land, so it needs history.
         types = package()["model"]["types"]
         types["open_prs"]["source"] = {"agentic": True}
-        art = store.update(saved.slug, content=content(types=types))
+        art = _owner_write(store, saved.slug, content=content(types=types))
         assert art.version == 2
 
-    def test_reordering_blocks_is_a_layout_change(self, store, saved) -> None:
-        flipped = [
-            {"id": "runs", "type": "table", "fields": ["last_run", "lane"]},
-            {"id": "prs", "type": "stat", "fields": ["open_prs"], "title": "Open PRs"},
-        ]
-        art = store.update(saved.slug, content=content(blocks=flipped))
+    def test_reordering_the_page_is_a_layout_change(self, store, saved) -> None:
+        flipped = package()
+        flipped["view"]["html"] = (
+            '<p data-dashboard-field="lane"></p><p data-dashboard-field="last_run"></p>'
+            '<h2 data-dashboard-field="open_prs"></h2>'
+        )
+        art = _owner_write(store, saved.slug, content=json.dumps(flipped))
         assert art.version == 2
+
+    @pytest.mark.parametrize("bound_to", [BOUND, SESSION_BOUND])
+    def test_a_saved_block_layout_becomes_its_page(self, store, bound_to: str) -> None:
+        """One way: blocks go in, and the stored view is the page they become."""
+        blocks = package(bound_to=bound_to, blocks=DEFAULT_BLOCKS)
+        art = store.create(name="Blocks", kind="dashboard", content=json.dumps(blocks))
+        view = json.loads(art.content)["view"]
+        assert list(view) == ["html"]
+        assert view["html"] == (
+            "<section><h2>Open PRs</h2><dl><div><dt>Open PRs</dt>"
+            '<dd data-dashboard-field="open_prs"></dd></div></dl></section>'
+            '<section><dl><div><dt>Last run</dt><dd data-dashboard-field="last_run"></dd></div>'
+            '<div><dt>Lane</dt><dd data-dashboard-field="lane"></dd></div></dl></section>'
+        )
+        # Read back, the stored package is already the page: nothing turns it back.
+        assert dp.parse_package(art.content)["view"] == view
+        assert "blocks" not in art.content
+
+    def test_restoring_a_version_saved_as_blocks_restores_its_page(self) -> None:
+        live = json.dumps(package())
+        old = json.dumps(package(blocks=DEFAULT_BLOCKS))
+        view = json.loads(dp.revert_package(live, old))["view"]
+        assert list(view) == ["html"] and 'data-dashboard-field="lane"' in view["html"]
+
+    @pytest.mark.parametrize("fields", [1, [1], "open_prs", {"a": 1}])
+    def test_a_block_whose_fields_are_not_names_is_refused(self, fields: Any) -> None:
+        p = package(blocks=[{"id": "x", "type": "stat", "fields": fields}])
+        with pytest.raises(ArtifactValidationError, match=r"view\.blocks\[0\]\.fields"):
+            dp.parse_package(json.dumps(p))
+
+    def test_a_label_that_spells_a_binding_is_shown_not_bound(self) -> None:
+        """A label reading like a binding stays text, so the version still restores."""
+        p = package(blocks=[{"id": "x", "type": "stat", "fields": ["open_prs"]}])
+        p["model"]["types"]["open_prs"]["label"] = 'data-dashboard-field="open_prs"'
+        html = dp.parse_package(json.dumps(p))["view"]["html"]
+        assert html.count("data-dashboard-field") == 1
+        assert (
+            json.loads(dp.revert_package(json.dumps(package()), json.dumps(p)))["view"]["html"]
+            == html
+        )
+
+    def test_a_credential_in_a_migrated_title_or_label_is_still_redacted(self) -> None:
+        """A hyphenated secret is masked in the stored page and stays masked when read."""
+        from kiro_crew.platform.context import redact_via_context
+
+        secret = "xoxb-" + "1234567890-1234567890123-" + "a" * 24
+        p = package(blocks=[{"id": "x", "type": "stat", "fields": ["open_prs"], "title": secret}])
+        p["model"]["types"]["open_prs"]["label"] = f"see {secret}"
+        html = dp.parse_package(json.dumps(p))["view"]["html"]
+        assert secret not in html
+        assert secret not in redact_via_context(html)
+        assert "see " in html
+
+    def test_a_quoted_header_in_a_migrated_label_is_redacted_before_escaping(self) -> None:
+        """Escaping turns a quote into ``&quot;``, which the page's pass does not read."""
+        from kiro_crew.platform.context import redact_via_context
+
+        opaque = "Q" * 32
+        header = '{"Authorization": "Bearer ' + opaque + '"}'
+        assert opaque not in redact_via_context(header)
+        p = package(blocks=[{"id": "x", "type": "stat", "fields": ["open_prs"], "title": header}])
+        p["model"]["types"]["open_prs"]["label"] = header
+        html = dp.parse_package(json.dumps(p))["view"]["html"]
+        assert opaque not in html
+
+    def test_a_layout_whose_page_passes_the_cap_is_refused_while_it_is_built(
+        self, monkeypatch
+    ) -> None:
+        """Refused at the page limit before the whole page is held, not after."""
+        built: list[int] = []
+        real = dp._migrated_text
+        monkeypatch.setattr(dp, "_migrated_text", lambda t: built.append(1) or real(t))
+        monkeypatch.setattr(dp, "MAX_VIEW_HTML_BYTES", 2_000)
+        p = package(blocks=[{"id": "x", "type": "list", "fields": ["open_prs"] * 5_000}])
+        with pytest.raises(ArtifactValidationError, match="over the 2000-byte limit for a page"):
+            dp.parse_package(json.dumps(p))
+        assert len(built) < 100
+
+    def test_a_block_title_and_label_are_written_as_text(self) -> None:
+        p = package(blocks=[{"id": "x", "type": "stat", "fields": ["open_prs"], "title": "<b>&"}])
+        p["model"]["types"]["open_prs"]["label"] = "<i>PRs</i>"
+        html = dp.parse_package(json.dumps(p))["view"]["html"]
+        assert "<h2>&lt;b&gt;&amp;</h2>" in html and "<dt>&lt;i&gt;PRs&lt;/i&gt;</dt>" in html
 
     def test_a_rebind_alone_creates_no_version_but_is_stored(self, store, saved) -> None:
         # bound_to says WHERE the page hangs, not what it looks like, and a
         # version exists so someone can go back to a LAYOUT.
-        art = store.update(saved.slug, content=content(bound_to="session:chat-7-1791007589"))
+        art = _owner_write(store, saved.slug, content=content(bound_to="session:chat-7-1791007589"))
         assert art.version == 1
         # Stored without a version, so the new binding is what a reader finds.
         parsed = dp.parse_package(store.get(saved.slug).content or "")
@@ -305,7 +633,7 @@ class TestARefusedWriteChangesNothing:
         assert changed != before.content, "the fixture did not change the layout"
 
         with pytest.raises(ArtifactValidationError, match="invalid event type"):
-            store.update(saved.slug, content=changed, event_type="bogus")
+            _owner_write(store, saved.slug, content=changed, event_type="bogus")
 
         after = store.get(saved.slug)
         assert after.content == before.content, "the refused content was persisted anyway"
@@ -324,7 +652,7 @@ class TestARefusedWriteChangesNothing:
         real. The refusal must not depend on that.
         """
         with pytest.raises(ArtifactValidationError, match="invalid event type"):
-            store.update(saved.slug, content=content(), event_type="bogus")
+            _owner_write(store, saved.slug, content=content(), event_type="bogus")
         assert store.get(saved.slug).version == 1
 
     def test_a_metadata_only_write_with_a_bogus_event_type_is_refused(self, store, saved) -> None:
@@ -354,7 +682,8 @@ class TestARefusedWriteChangesNothing:
 class TestRevertRestoresLayoutOnly:
     def test_revert_restores_the_layout_and_keeps_the_live_binding(self, store, saved) -> None:
         v1_tokens = {"--panel-bg": "oklch(21% 0 0)"}
-        v2 = store.update(
+        v2 = _owner_write(
+            store,
             saved.slug,
             content=content(bound_to="session:chat-9-1791", tokens={"--panel-bg": "red"}),
         )
@@ -365,7 +694,8 @@ class TestRevertRestoresLayoutOnly:
         # The revert flow as the handler drives it: read the target version,
         # PATCH its content back with event_type='reverted'.
         target = store.get(saved.slug, version=1)
-        art = store.update(
+        art = _owner_write(
+            store,
             saved.slug,
             content=target.content,
             event_type="reverted",
@@ -380,14 +710,75 @@ class TestRevertRestoresLayoutOnly:
         assert art.events[-1]["from_version"] == 1
 
     def test_reverting_to_an_identical_layout_creates_no_version(self, store, saved) -> None:
-        store.update(saved.slug, content=content(tokens={"--panel-bg": "red"}))
-        store.update(saved.slug, content=content())  # back to v1's layout by hand
+        _owner_write(store, saved.slug, content=content(tokens={"--panel-bg": "red"}))
+        _owner_write(store, saved.slug, content=content())  # back to v1's layout by hand
         before = store.get(saved.slug).version
         target = store.get(saved.slug, version=1)
-        art = store.update(
-            saved.slug, content=target.content, event_type="reverted", from_version=1, snapshot=True
+        art = _owner_write(
+            store,
+            saved.slug,
+            content=target.content,
+            event_type="reverted",
+            from_version=1,
+            snapshot=True,
         )
         assert art.version == before
+
+
+class TestAFieldNameIsNotAPlaceToHideACredential:
+    """A field NAME travels further than its value, so it needs the same gate.
+
+    Field VALUES are redacted on the way out. The names are not: they are served
+    in the package's `fields` list (`member_dashboard.py:865`) and written into
+    the page's data island, so a name shaped like a token is published in clear
+    by the one surface that scrubs everything else.
+
+    `_FIELD_NAME_RE` does not stop it. A lower-case fine-grained-PAT shape fits
+    inside `[a-z][a-z0-9_]{0,63}` with room to spare, and so does a `ghp_` shape.
+
+    The gate is the REDACTOR ITSELF rather than a second copy of its patterns:
+    run the name through the same shim every egress site uses and refuse if it
+    comes back changed. So a companion's extra patterns apply here too, and a
+    pattern added there cannot leave this check behind.
+    """
+
+    #: Assembled from parts on purpose. A literal token shape in the tree trips
+    #: GitHub's push protection, and the point here is the SHAPE, not a secret.
+    FINE_GRAINED = "github" + "_pat_" + "a1b2c3d4e5" * 4
+    CLASSIC = "ghp" + "_" + "a1b2c3d4e5" * 3
+
+    @pytest.mark.parametrize("shape", [FINE_GRAINED, CLASSIC])
+    def test_the_name_rule_alone_would_have_allowed_it(self, shape: str) -> None:
+        """Why the extra gate is needed and not redundant with the regex."""
+        assert dp._FIELD_NAME_RE.fullmatch(shape) is not None
+        assert len(shape) <= 64
+
+    @pytest.mark.parametrize("shape", [FINE_GRAINED, CLASSIC])
+    def test_a_credential_shaped_field_name_is_refused(
+        self, store: ArtifactStore, shape: str
+    ) -> None:
+        # ADDED to a valid model rather than replacing it, so the only thing
+        # wrong with this package is the one field name under test.
+        p = package()
+        p["model"]["types"][shape] = {
+            "type": "number",
+            "label": "PRs",
+            "source": {"agentic": True},
+        }
+        with pytest.raises(ArtifactValidationError) as exc:
+            store.create(name="Sneaky", kind="dashboard", content=json.dumps(p))
+        said = str(exc.value)
+        assert f"model.types.{shape}" in said or "credential" in said
+        # The refusal must not quote the name back in full: an error string is
+        # logged, and echoing the thing we just called credential-shaped would
+        # put it exactly where we are trying to keep it out of.
+        assert shape not in said
+
+    def test_an_ordinary_field_name_still_passes(self, store: ArtifactStore) -> None:
+        """The gate has to be narrow: it refuses what the redactor rewrites and
+        nothing else, so a normal model is unaffected."""
+        art = store.create(name="Fine", kind="dashboard", content=content())
+        assert art.slug
 
 
 class TestRejectInvalid:
@@ -448,26 +839,9 @@ class TestRejectInvalid:
                 id="agentic-false-is-not-a-source",
             ),
             pytest.param(
-                lambda p: p["view"]["blocks"][0].update({"type": "heatmap"}),
-                "unknown block type 'heatmap'",
-                id="unknown-block-type",
-            ),
-            pytest.param(
-                lambda p: p["view"]["blocks"][0].update({"fields": ["not_declared"]}),
+                lambda p: _as_blocks(p)[0].update({"fields": ["not_declared"]}),
                 "which model.types does not declare",
                 id="block-names-an-undeclared-field",
-            ),
-            pytest.param(
-                lambda p: p["view"]["blocks"][0].update({"fields": ["open_prs", "lane"]}),
-                "reads between 1 and 1 fields",
-                id="block-reads-too-many-fields",
-            ),
-            pytest.param(
-                lambda p: p["view"]["blocks"].append(
-                    {"id": "prs", "type": "stat", "fields": ["open_prs"]}
-                ),
-                "is used by an earlier block",
-                id="duplicate-block-id",
             ),
             pytest.param(
                 lambda p: p.update({"data": {"open_prs": 4}}),
@@ -480,7 +854,7 @@ class TestRejectInvalid:
                 id="a-value-on-a-field",
             ),
             pytest.param(
-                lambda p: p["view"]["blocks"][0].update({"rows": [1, 2]}),
+                lambda p: _as_blocks(p)[0].update({"rows": [1, 2]}),
                 "values stay in the crew log",
                 id="rows-on-a-block",
             ),
@@ -500,11 +874,6 @@ class TestRejectInvalid:
                 id="wrong-kind-inside-the-package",
             ),
             pytest.param(
-                lambda p: p.pop("theme"),
-                "theme: is required",
-                id="no-theme",
-            ),
-            pytest.param(
                 lambda p: p["theme"]["tokens"].update({"panel-bg": "red"}),
                 "is not a theme token",
                 id="token-is-not-a-custom-property",
@@ -520,13 +889,27 @@ class TestRejectInvalid:
                 id="css-fetches",
             ),
             pytest.param(
+                lambda p: p["theme"].update({"css": ".a{background:url( 'https://x/t.png')}"}),
+                "can be an inline data: URL instead",
+                id="css-url-with-an-address",
+            ),
+            pytest.param(
+                lambda p: p["theme"].update(
+                    {
+                        "css": '.a{background:url("data:image/png;base64,AA")} .b{background:url(t.png)}'
+                    }
+                ),
+                "can be an inline data: URL instead",
+                id="css-a-second-url-with-an-address",
+            ),
+            pytest.param(
                 lambda p: p["model"].update({"types": {}}),
                 "must declare at least one field",
                 id="empty-model",
             ),
             pytest.param(
-                lambda p: p["view"].update({"blocks": []}),
-                "must place at least one block",
+                lambda p: p.update({"view": {"blocks": []}}),
+                "view.html: is empty",
                 id="empty-view",
             ),
             pytest.param(
@@ -569,7 +952,7 @@ class TestRejectInvalid:
         p = package()
         mutate(p)
         with pytest.raises(ArtifactValidationError) as exc:
-            store.update(saved.slug, content=json.dumps(p))
+            _owner_write(store, saved.slug, content=json.dumps(p))
         assert expected in str(exc.value)
         # Refused means nothing was written.
         assert dp.parse_package(store.get(saved.slug).content or "") == dp.validate_package(
@@ -591,12 +974,18 @@ class TestRejectInvalid:
         with pytest.raises(ArtifactValidationError, match="must be an object"):
             store.create(name="Bad", kind="dashboard", content="[]")
 
-    def test_the_byte_cap_applies_to_the_stored_form_not_the_submitted_text(self, store) -> None:
+    def test_the_byte_cap_applies_to_the_stored_form_not_the_submitted_text(
+        self, store, monkeypatch
+    ) -> None:
         # Indentation is added by the store, so a layout can arrive under the
         # cap and be written over it. The caps that matter are the ones measured
         # on the bytes a write actually puts on disk, because an oversized
         # package is one this module's own reader refuses: the page would come
         # back blank with nothing refused at write time.
+        #
+        # The cap is SET between the two forms of one layout below. The real one
+        # is sized for a page that inlines a library, which this small page does not
+        # come near, and the property asked here is which form the cap is measured on.
         types = {
             f"f{i:05d}": {
                 "type": "enum",
@@ -607,14 +996,14 @@ class TestRejectInvalid:
             }
             for i in range(dp.MAX_MODEL_FIELDS)
         }
-        blocks = [
-            {"id": f"b{i:05d}", "type": "table", "fields": [f"f{i:05d}"]}
-            for i in range(dp.MAX_VIEW_BLOCKS)
-        ]
-        submitted = json.dumps(package(types=types, blocks=blocks), separators=(",", ":"))
-        # Every per-part cap is satisfied and the submitted text is under the
+        p = package(types=types)
+        p["view"] = {"html": "".join(f'<p data-dashboard-field="{name}"></p>' for name in types)}
+        submitted = json.dumps(p, separators=(",", ":"))
+        stored = dp.dump_package(dp.parse_package(submitted))
+        monkeypatch.setattr(dp, "MAX_PACKAGE_BYTES", len(submitted.encode("utf-8")))
+        # Every per-part cap is satisfied and the submitted text is at the
         # package cap, so nothing upstream of the serializer can refuse this.
-        assert len(submitted.encode("utf-8")) <= dp.MAX_PACKAGE_BYTES
+        assert len(stored.encode("utf-8")) > dp.MAX_PACKAGE_BYTES
         with pytest.raises(ArtifactValidationError, match="bytes once stored"):
             store.create(name="Indented over", kind="dashboard", content=submitted)
         # The revert path ends in the same serializer, so it refuses it too.
@@ -758,13 +1147,81 @@ class TestTheBindingLookup:
         with pytest.raises(dp.BindingLookupIncomplete, match="could not be read"):
             dp.resolve_bound_slug("session:member-atlas", store=store)
 
-    def test_an_unreadable_record_never_hides_a_package_that_is_found(
+    def test_an_unreadable_record_leaves_a_found_package_unproven(
         self, store, tmp_path, saved
     ) -> None:
-        # A match returns the moment it is seen, so refusing on unreadable records does
-        # not turn a successful lookup into an error.
+        """A match is not the end of the scan, because ONE binding names ONE package.
+
+        The lookup has to read the rest to know the match is unique, and a record it
+        could not open may be a SECOND claimant -- which is the same unproven answer as
+        a record that may be the only claimant, seen from the other side. So an
+        unreadable record refuses here too, and the sentence says which uniqueness went
+        unproven rather than reporting absence.
+
+        A caller that draws a page may answer this with the page it already has;
+        ``member_dashboard._bound_package_slug`` does exactly that. A caller that
+        VALIDATES A WRITE may not, which is why the refusal is the function's answer and
+        the fallback is the reader's.
+        """
         self._shredded(store, tmp_path)
-        assert dp.resolve_bound_slug(BOUND, store=store) == saved.slug
+        with pytest.raises(dp.BindingLookupIncomplete, match="is the only one bound to"):
+            dp.resolve_bound_slug(BOUND, store=store)
+        assert saved.slug
+
+    def test_two_packages_naming_one_binding_are_refused(self, store, saved) -> None:
+        """Picking the first seen would be arbitrary -- the listing order is the store's,
+        not a statement about which package is live -- and a reader cannot tell an
+        arbitrary pick from a correct one, so a relisted library would silently swap
+        which page a crewmate shows.
+
+        ``BindingAmbiguous`` is a SUBCLASS of ``BindingLookupIncomplete`` so that every
+        caller already handling "no provable package" handles this with no change.
+        """
+        second = store.create(name="Second", kind="dashboard", content=content(bound_to=BOUND))
+        with pytest.raises(dp.BindingAmbiguous) as refused:
+            dp.resolve_bound_slug(BOUND, store=store)
+        assert saved.slug in str(refused.value) and second.slug in str(refused.value)
+        assert isinstance(refused.value, dp.BindingLookupIncomplete)
+
+    def test_a_live_backed_record_cannot_claim_a_binding(self, store, saved) -> None:
+        """Its bytes are a file's current contents, which no artifact-API gate stands in
+        front of. Skipped before it is opened, so it can neither be mistaken for this
+        binding's package nor make the binding ambiguous -- an ungated writer would
+        otherwise turn a resolvable dashboard into a refused one.
+
+        DEFENCE IN DEPTH, and the test says so rather than implying the hole is open:
+        the write gate already refuses `kind="dashboard"` with a `source_path` ("a
+        dashboard package is store-owned ... a linked file is read back unvalidated"),
+        so such a record cannot be created through the API today. What this guards is a
+        record that predates that refusal or was written around it, which is why the
+        listing is stubbed -- `create` will not make one.
+        """
+        from types import SimpleNamespace
+
+        real = store.list(kind="dashboard")
+        assert [a.slug for a in real] == [saved.slug], "the fixture library is not what this needs"
+        listed = [
+            SimpleNamespace(slug="pointer", kind="dashboard", source_path="/elsewhere/p.json"),
+            *real,
+        ]
+        stub = SimpleNamespace(list=lambda kind=None, **_k: listed, get=store.get)
+        assert dp.resolve_bound_slug(BOUND, store=stub) == saved.slug
+
+    def test_a_copy_with_provenance_is_an_ordinary_candidate(self, store, saved) -> None:
+        """`source_copy_only` means the record owns its bytes and only RECORDS where
+        they came from, so the reason to skip a live pointer does not apply to it."""
+        from types import SimpleNamespace
+
+        listed = [
+            SimpleNamespace(
+                slug=saved.slug,
+                kind="dashboard",
+                source_path="/elsewhere/p.json",
+                source_copy_only=True,
+            )
+        ]
+        stub = SimpleNamespace(list=lambda kind=None, **_k: listed, get=store.get)
+        assert dp.resolve_bound_slug(BOUND, store=stub) == saved.slug
 
     def test_a_scan_the_cap_cut_short_refuses_to_say_absent(
         self, store, tmp_path, monkeypatch, saved
@@ -865,3 +1322,63 @@ class TestTheBindingLookup:
         # match: the binding still has to be the one asked for.
         self._corrupt(store, tmp_path, bound_to="session:member-atlas")
         assert dp.resolve_bound_slug(BOUND, store=store) == saved.slug
+
+
+class TestAMissingThemeIsTheEmptyTheme:
+    """An MCP client can drop ``{"tokens": {}}`` (an empty object) before it reaches the
+    gateway, so a missing theme, or a theme with no tokens, is stored canonically as the
+    empty token set rather than refused."""
+
+    @pytest.mark.parametrize(
+        ("edit", "css"),
+        [
+            pytest.param(lambda p: p.pop("theme"), None, id="no-theme"),
+            pytest.param(lambda p: p.update({"theme": None}), None, id="theme-null"),
+            pytest.param(lambda p: p.update({"theme": {}}), None, id="theme-empty"),
+            pytest.param(
+                lambda p: p.update({"theme": {"css": ".x{color:var(--text)}"}}),
+                ".x{color:var(--text)}",
+                id="css-no-tokens",
+            ),
+        ],
+    )
+    def test_it_is_stored_as_empty_tokens(self, edit: Any, css: str | None) -> None:
+        p = package()
+        edit(p)
+        theme = dp.validate_package(p)["theme"]
+        assert theme["tokens"] == {}
+        assert theme.get("css") == css
+        # Canonical either way: the stored bytes carry the empty token set.
+        stored = json.loads(dp.canonical_package_content(json.dumps(p)))
+        assert stored["theme"]["tokens"] == {}
+
+    def test_a_bad_token_value_is_still_refused(self) -> None:
+        p = package(tokens={"--panel-bg": "red; z-index:9"})
+        with pytest.raises(ArtifactValidationError, match="theme.tokens.--panel-bg"):
+            dp.validate_package(p)
+
+    def test_a_theme_that_is_not_an_object_is_still_refused(self) -> None:
+        p = package()
+        p["theme"] = "dark"
+        with pytest.raises(ArtifactValidationError, match="theme"):
+            dp.validate_package(p)
+
+
+def test_an_svg_data_url_with_an_internal_url_reference_is_kept() -> None:
+    """``url(%23g)`` inside an inline SVG points at a gradient in the data itself, so the
+    scan skips the whole data URL; an address after it is still refused."""
+    svg = (
+        "data:image/svg+xml,%3Csvg xmlns=%27x%27%3E%3Cdefs%3E%3ClinearGradient id=%27g%27/%3E"
+        "%3C/defs%3E%3Crect fill=%27url(%23g)%27/%3E%3C/svg%3E"
+    )
+    for quoted in (f'"{svg}"', f"'{svg}'"):
+        assert not dp._theme_fetches(f".wall{{background:url({quoted})}}")
+    assert dp._theme_fetches(f'.w{{background:url("{svg}")}} .b{{background:url(t.png)}}')
+
+
+def test_a_theme_texture_written_as_an_inline_data_url_is_kept() -> None:
+    """A data: URL carries its bytes, so it reaches no network and the frame admits it."""
+    p = package()
+    css = '.wall{background:url( "data:image/svg+xml,%3Csvg%20xmlns=%27x%27/%3E" )} .b{color:red}'
+    p["theme"].update({"css": css})
+    assert dp.validate_package(p)["theme"]["css"] == css

@@ -36,11 +36,13 @@ if TYPE_CHECKING:
         PostedOptions,
         _blocks_request_remote_media,
         _channel_delivery_key,
+        _cron_job_for,
         _deliver_channel_dm,
         _deliver_to_channel,
         _is_slack_ts,
         _sel,
         _send_to_channel_target,
+        body_not_object_error,
         build_options_blocks,
         dashboard_slot_key,
         format_overflow,
@@ -52,6 +54,7 @@ if TYPE_CHECKING:
         redact_for_display,
         remember_slack_options,
         slack_options_owner_key,
+        slot_history_key,
     )
 
 
@@ -61,8 +64,9 @@ def _redact_all(value: str) -> str:
     ``redact_for_display`` re-runs its redactor over each normalised form, so it
     needs the pair behind a single call rather than two sequential passes.
     """
-    value, _ = redact_exfiltration_urls(value)
-    value, _ = redact_credentials(value)
+    from kiro_crew.security import redact
+
+    value = redact(value)
     return value
 
 
@@ -132,15 +136,33 @@ def _resolve_session_target(
     # caller_session is "cron:{job_id}" or "cron:{job_id}:{run_id}" (stateless)
     if not caller_session.startswith("cron:"):
         return None, None
-    cron_id = caller_session.removeprefix("cron:").split(":")[0]
-    jobs = state.crons.list_jobs(include_disabled=True)
-    job = next((j for j in jobs if j.id == cron_id), None)
+    job = _cron_job_for(state, caller_session)
     if not job or not job.session_key:
         return None, None
     # session_key is e.g. "dashboard:chat-3-1712793600" but slot names
     # don't have the "dashboard:" prefix
     slot_key = job.session_key.removeprefix("dashboard:")
     return slot_key, job.name
+
+
+def _publishing_session_meta(state: DashboardState, session_key: str) -> dict[str, str] | None:
+    """The ``slot`` and ``history_key`` a bell note published by *session_key* links back to.
+
+    *session_key* must be the publisher's attested key (``attributable_session_key``),
+    never a request field, so a note can only name the session that published it. Only
+    the publisher's own slot counts: the banner treats a note whose ``slot`` is the chat
+    on screen as already shown there, which holds for the session that wrote it and for
+    no other, so a cron run with no tab of its own does not borrow its creator's.
+    ``history_key`` is the slot's transcript key, which is what resuming the session after
+    its tab closes needs: the bare slot name names no transcript. A slot the dashboard
+    does not hold yields ``None``: the note then carries no link rather than one to a
+    session the dashboard cannot show.
+    """
+    slot_key = dashboard_slot_key(session_key)
+    slot = state.get_slot(slot_key) if slot_key else None
+    if slot is None:
+        return None
+    return {"slot": slot_key, "history_key": slot_history_key(slot)}
 
 
 def _session_link_blocks(url: str) -> list[dict[str, Any]]:
@@ -275,6 +297,9 @@ async def api_delete_message(request: web.Request) -> web.Response:
         body = await request.json()
     except Exception:
         return web.json_response({"error": "invalid JSON"}, status=400)
+    not_object = body_not_object_error(body)
+    if not_object is not None:
+        return not_object
     channel = body.get("channel", "").strip()
     ts = body.get("ts", "").strip()
     if not channel or not ts:
@@ -286,8 +311,9 @@ async def api_delete_message(request: web.Request) -> web.Response:
         await slack.delete_message(channel, ts)
     except Exception as e:
         safe_error = str(e).split("\n")[0][:200]
-        safe_error, _ = redact_credentials(safe_error)
-        safe_error, _ = redact_exfiltration_urls(safe_error)
+        from kiro_crew.security import redact
+
+        safe_error = redact(safe_error)
         return web.json_response({"error": f"Delete failed: {safe_error}"}, status=502)
     return web.json_response({"ok": True})
 
@@ -324,6 +350,9 @@ async def api_update_message(request: web.Request) -> web.Response:
         body = await request.json()
     except Exception:
         return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
+    not_object = body_not_object_error(body)
+    if not_object is not None:
+        return not_object
     channel = body.get("channel", "")
     if not isinstance(channel, str):
         return web.json_response(
@@ -435,8 +464,9 @@ async def api_update_message(request: web.Request) -> web.Response:
         await slack.update_message(channel, ts, text, blocks)
     except Exception as e:
         safe_error = str(e).split("\n")[0][:200]
-        safe_error, _ = redact_credentials(safe_error)
-        safe_error, _ = redact_exfiltration_urls(safe_error)
+        from kiro_crew.security import redact
+
+        safe_error = redact(safe_error)
         return web.json_response(
             {"error": f"Update failed: {safe_error}", "code": "update_failed"}, status=502
         )
@@ -493,6 +523,9 @@ async def _read_send_message(
         body = await request.json()
     except Exception:
         return web.json_response({"error": "invalid JSON"}, status=400)
+    not_object = body_not_object_error(body)
+    if not_object is not None:
+        return not_object
     text = body.get("text", "").strip()
     if not text:
         return web.json_response({"error": "text required"}, status=400)
@@ -736,6 +769,56 @@ async def _read_send_message(
     )
 
 
+#: Longest sender name the source line carries; a chat title can be long.
+_SOURCE_NAME_MAX = 80
+
+
+def _proactive_source_line(
+    state: "DashboardState",
+    caller_session: str,
+    declared_session: str,
+    *,
+    is_cron_caller: bool,
+) -> str:
+    """``Sent by cron: <name>`` or ``Sent by chat: <title>``, or ``""``.
+
+    Read from the same identities the channel legs trust: a cron's validated
+    ``caller_session`` names its job, and any other caller is the attested
+    ``X-Session-Key``. Only a dashboard chat gets a line, because its title is
+    a name the user knows; a channel-born or unknown caller gets none.
+    """
+    if is_cron_caller:
+        try:
+            job = _cron_job_for(state, caller_session)
+        except Exception:
+            logger.warning("send_message: could not read cron jobs for the source line")
+            job = None
+        cron_id = caller_session.removeprefix("cron:").split(":")[0]
+        kind, name = "cron", (getattr(job, "name", "") if job is not None else "") or cron_id
+    elif declared_session.startswith("dashboard:"):
+        # Lazy: the facade rebinds this function onto its own globals, which do
+        # not carry this name.
+        from kiro_crew.dashboard.session_memory import session_title
+
+        info = session_title(declared_session, state.get_slot)
+        kind = "chat"
+        name = str(info["slot_key"] if info["untitled"] else info["title"])
+    else:
+        return ""
+    name = " ".join(str(name).split())
+    from kiro_crew.security import redact
+
+    name = redact(name)
+    if len(name) > _SOURCE_NAME_MAX:
+        name = name[: _SOURCE_NAME_MAX - 1].rstrip() + "…"
+    return f"Sent by {kind}: {name}" if name else ""
+
+
+def _with_source_line(text: str, source_line: str) -> str:
+    """*text* with *source_line* as its last paragraph, or *text* unchanged."""
+    return f"{text}\n\n{source_line}" if source_line else text
+
+
 async def _deliver_send_message_fallback(
     state: "DashboardState",
     body: dict,
@@ -763,7 +846,7 @@ async def _deliver_send_message_fallback(
 
     Each leg records what it reached on *outcome* as it goes.
     """
-    from kiro_crew.security import redact_credentials, redact_exfiltration_urls  # noqa: F811
+    from kiro_crew.security import redact
 
     # Snapshot before the suffix below: that sentence describes the BELL's
     # delivery, and a channel post is a real delivery, not the
@@ -773,14 +856,24 @@ async def _deliver_send_message_fallback(
     # path for one, not an edge case.
     channel_text = text
     if target_session and job_name:
-        safe_name, _ = redact_exfiltration_urls(job_name)
-        safe_name, _ = redact_credentials(safe_name)
+        safe_name = redact(job_name)
         title = f"⏰ {safe_name}"
         text += "\n\n_(session closed — delivered as notification)_"
     # Only an attested, non-app caller's key names the publishing crewmate
     # (``attributable_session_key``); a bare TCP or app-token header does not.
     member = await asyncio.to_thread(member_identity_for_session, attribution_session)
-    state.notify("agent", title, text, member=member)
+    # A message that offers [OPTIONS:] asks the user to choose, so it is not muted.
+    publisher = None if options else attribution_session or None
+    # The link back to the sender stays even then: a question is where it is needed most.
+    session_meta = _publishing_session_meta(state, attribution_session)
+    state.notify(
+        "agent",
+        title,
+        text,
+        meta=session_meta,
+        member=member,
+        publisher_session=publisher,
+    )
     # No widget on either channel path, so a parsed [OPTIONS:] trailer is
     # re-attached as a numbered list rather than dropped: the user still
     # learns the choices exist and can answer by typing one. Built from the
@@ -788,12 +881,18 @@ async def _deliver_send_message_fallback(
     # hoisted above both legs so neither mechanism drops it.
     if options:
         channel_text = f"{channel_text}\n\n{format_overflow(options, 0)}"
+    # Many sessions and crons share one owner DM, so a proactive message there
+    # says who sent it. The own-conversation leg below labels only a cron: a
+    # chat sending into its own conversation is that conversation talking.
+    source_line = _proactive_source_line(
+        state, caller_session, declared_session, is_cron_caller=is_cron_caller
+    )
     if channel_target:
         outcome.sent_channel, outcome.channel_code, outcome.channel_detail = (
             await _deliver_channel_dm(
                 state,
                 channel_target,
-                channel_text,
+                _with_source_line(channel_text, source_line),
                 # Vet on the CALLER's real identity so the fail-closed
                 # ``channels`` re-vet inside the leg resolves that caller's own
                 # profile rather than the permissive ``HOST_SESSION_KEY``
@@ -821,7 +920,7 @@ async def _deliver_send_message_fallback(
         outcome.sent_channel = await _deliver_to_channel(
             state,
             _channel_delivery_key(state, caller_session, declared_session),
-            channel_text,
+            _with_source_line(channel_text, source_line if is_cron_caller else ""),
             channel_type=channel_type,
         )
     # Opt-in "Open session" deep-link button: resolved (server-side) only
@@ -1159,11 +1258,10 @@ def _send_message_response(
     channel_type: str,
 ) -> web.Response:
     """The answer to a send whose legs have run: a failure, or where it was delivered."""
-    from kiro_crew.security import redact_credentials, redact_exfiltration_urls  # noqa: F811
+    from kiro_crew.security import redact
 
     if outcome.channel_code:
-        safe_detail, _ = redact_credentials(outcome.channel_detail)
-        safe_detail, _ = redact_exfiltration_urls(safe_detail)
+        safe_detail = redact(outcome.channel_detail)
         detail = f"{channel_target} delivery failed: {safe_detail}"
         # Both responses are spelled out inline, with a literal status and a
         # literal body, rather than sharing a hoisted dict or computing the
@@ -1186,8 +1284,7 @@ def _send_message_response(
             {"ok": False, "error": unconfirmed, "code": outcome.channel_code}, status=502
         )
     if outcome.slack_attempted and not outcome.sent_slack:
-        safe_error, _ = redact_credentials(outcome.slack_error)
-        safe_error, _ = redact_exfiltration_urls(safe_error)
+        safe_error = redact(outcome.slack_error)
         # An unknown outcome says so, so the caller checks the conversation
         # instead of sending a message that may already be there.
         if outcome.slack_failure == "unconfirmed":

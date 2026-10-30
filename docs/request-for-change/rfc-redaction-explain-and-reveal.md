@@ -233,8 +233,8 @@ source. Your messages are saved exactly as typed." Keep extra details under
 ### 3 · Suspicious links: blocked, but visible
 
 Keep a suspicious URL visible as a **Link blocked** chip, but never make it
-an anchor. Show the site name and path immediately, and the length of the
-query. *See link* opens a details card that explains why the link was blocked
+an anchor. Show the site name immediately, and nothing else (see the chip
+rule below). *See link* opens a details card that explains why the link was blocked
 and shows the full URL as text, with *Open once* and *Copy link* beside it.
 That card is the confirmation: nothing opens until the reader has the whole
 destination in front of them and clicks *Open once*, which opens it in a new
@@ -268,12 +268,41 @@ in the saved conversation instead of being destroyed, and anyone who can read
 that conversation can read the link.
 
 What is shown on the chip itself, before anyone asks, follows a stricter rule:
-**the chip shows only what the removers themselves would pass.** It would be
-wrong to assume the query is the dangerous part and the path is safe — a link
-can carry smuggled data in its path just as easily — so the path appears on
-the chip only when it passes the same checks that blocked the link; otherwise
-the chip shows the site name and the length of the query. The full address is
-shown only inside the details card, after the reader asks for it. There is one
+**the chip shows only what is proven about that chip, which is the site
+name.** The saved placeholder names the site and nothing else, so nothing ties
+a chip to one kept record. A placeholder can have no record of its own (a
+presigned link split at its query leaves a placeholder the removers never
+recorded), and the rendered text can hold more chips than the saved text has
+placeholders (an entity-encoded or backslash-escaped bracket renders to
+placeholder text), so neither a record count nor a single record proves which
+record a chip stands for. The chip therefore never shows a path or a query
+length, even when the host has exactly one record. The details card lists
+each record of the host under its own address, with its reason and actions,
+and a kept full address is shown only there, after the reader asks for it. A
+lone record is listed the same way as several: the card's title speaks of the
+host's blocked links in the reply ("Blocked links to this host in this reply")
+and never says "this link", because one record on the host does not prove it
+is the link clicked. Pairing placeholders with records is not a goal: proving
+that order cannot be made sound on the production redaction pipeline. The
+path a record carries (kept only when it passes the same checks that blocked
+the link, since a link can carry smuggled data in its path as easily as in its
+query) therefore appears only in that list, where no entry is presented as
+the link clicked.
+
+A link removed in parts can leave the rest of its query glued to the
+placeholder: a presigned link split at `&X-Amz-Date` is redacted up to the
+split, and `&X-Amz-Date=…&X-Amz-Signature=…` follows the placeholder as text.
+That tail is the rest of the removed link, not prose, so the renderer takes it
+into the chip: text that starts right after a placeholder with `?` or `&`, a
+parameter name and `=`, up to whitespace, an angle bracket, a quote or a
+square bracket, without the punctuation that closes a sentence. It is not
+shown beside the chip, it is never an anchor, and the card does not show it
+either. Anything else after a placeholder stays as written, and when the host
+has no record the placeholder and its tail stay as written text. The fold is
+display only and redacts nothing: the saved reply, a copied message and channel
+posts still carry the tail exactly as they do without it, and the redaction and
+the credential checks are unchanged. Removing the tail from the saved text is
+redactor work, tracked separately. There is one
 precedent for keeping a URL in meta: the consent link for a connected server
 (`oauth_url`) is preserved only when it passes two checks. Anything kept is
 still text an agent wrote, so the chip escapes it and never makes it an
@@ -330,6 +359,52 @@ phones, cards open from the bottom of the screen with Close always visible;
 tapping outside the card or pressing Esc closes it, then restores the user's
 previous focus and scroll position. Every control must provide a touch target
 of at least 44×44 points.
+
+### 4a · A preview before the card
+
+A reader who wants to know why something was removed should not have to open
+a card to find out. Resting the mouse on a lock tag or a Link blocked chip
+shows a small preview after a short delay; focusing the tag or the chip's
+*Inspect* button from the keyboard shows it at once. The preview says what
+was removed and the rule in plain words (the card's *Matched* or *Reason*
+sentence). The preview is read-only. It holds no control, focus never moves
+into it, and the marker itself still opens the card, so every action stays
+where its confirmation is:
+
+- **Credential.** In place of a reveal, the preview states the floor: the
+  value was never saved, so nothing on the page can show it.
+- **Blocked link, address kept.** The reason only. The preview never shows
+  the full address: as in §3, that appears only inside the card, after the
+  reader asks for it, and *Open once* stays on the card behind its own
+  confirmation.
+- **Blocked link, address withheld.** Only the card's withheld sentence (it
+  looked like a secret, or it was too long to keep), which already gives the
+  reason.
+- **Several links to one host.** A sentence telling the reader to select
+  *Inspect* to see each one and its reason.
+
+A press never opens the preview, so on a touch screen, where there is no
+hover, a tap keeps opening the card exactly as before. The preview opens only
+on a pointer whose type is mouse, and a focus that follows a press within the
+same touch-replay window the shared tooltip uses counts as part of the press.
+No key on the marker is taken: Tab moves on as it always did, so a reply with
+many markers costs a keyboard reader no extra stops, and the arrow keys,
+Alt+Arrow turn stepping included, reach the page unchanged. A preview that
+keyboard focus opened stays while the mouse passes over the marker and
+leaves; blur closes it. A preview the mouse opened keeps a short close delay
+so the pointer can cross into it to read. Either closes once its marker
+scrolls out of the window or the transcript scroller, so it never floats
+over unrelated text. Escape closes the preview; it is stopped only while
+focus is on the marker, so a drawer holding the transcript stays open, and a
+preview opened by hover alone closes and lets the Escape reach the focused
+composer or dialog. While the marker's card is open the preview stays
+hidden, because the card already says everything the preview would.
+
+The preview is not the shared tooltip primitive: that bubble closes on mouse
+leave, so the pointer cannot cross into it, and a focus-opened tip would
+close under a passing mouse. Real-device Safari and touch testing is not part
+of this step; the touch rule is covered by jsdom tests and a Chromium
+touch-emulation run.
 
 ### 5 · Three renderer rules, independent of any UI
 

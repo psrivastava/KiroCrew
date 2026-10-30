@@ -384,7 +384,7 @@ def shared_topo(tmp_path: Path) -> ProcessTopology:
     t.add(KIRO_CLI, SESSION_HOST)
     t.add(MCP_SERVER, KIRO_CLI)
     # The founder published; the co-tenant did not (a shared subagent session
-    # deliberately does not overwrite the mapping — subagent_manager/run.py
+    # deliberately does not overwrite the mapping — subagent_manager/run_turn.py
     # guards the publish on ``not use_session_sharing``). So line 1 stays the
     # founder's key for every reader that predates the tenant section, and the
     # section is what records the second session.
@@ -1232,14 +1232,18 @@ _REGISTERED_CALL_SITES: dict[str, str] = {
         "which from_env reads above its own cache so a warm-pool rekey stays "
         "visible"
     ),
-    "mcp_core.py": (
+    "mcp_core_parts/identity.py": (
         "stale-file cleanup glob only (assumes HOST pids) — its lenient "
         "resolver no longer carries a walk of its own and delegates to "
         "mcp_caller.resolve_own_identity; the STRICT path delegates to "
         "session_pid_sig.verify_session_pid (HMAC-verified, direct "
         "KIROCREW_HOST_PID lookup, no walk)"
     ),
-    "mcp_gateway/stub.py": "reader via CallerContext.from_env; register-time caller block — assumes HOST pids",
+    "mcp_gateway/stub.py": (
+        "warm-pool caller repair: polls until the claimed session's key resolves, then "
+        "re-sends the caller block stub_register builds — assumes HOST pids"
+    ),
+    "mcp_gateway/stub_register.py": "reader via CallerContext.from_env; register-time caller block — assumes HOST pids",
     "peer_resolve.py": (
         "reader: the SERVER-side /proc ancestry walk (extracted from "
         "mcp_gateway/gatewayd._resolve_peer_identity, which now delegates "
@@ -1248,10 +1252,10 @@ _REGISTERED_CALL_SITES: dict[str, str] = {
         "plus the host ancestor chain (gatewayd indexes the chain for "
         "claim-push matching); .txt reads via "
         "session_pid_sig.read_session_pid_txt (hardened, unsigned). Consumed "
-        "by gatewayd (stub register) and dashboard/token_auth (unix-socket "
+        "by gatewayd (stub register) and dashboard/token_auth_callers (unix-socket "
         "peer verification)"
     ),
-    "dashboard/token_auth.py": (
+    "dashboard/token_auth_callers.py": (
         "reader (via peer_resolve.resolve_peer_identity, no inline walk): "
         "kernel-attests internal-API requests arriving on the dashboard's "
         "AF_UNIX socket — SO_PEERCRED peer pid → host-namespace ancestry walk "
@@ -1272,6 +1276,10 @@ _REGISTERED_CALL_SITES: dict[str, str] = {
         "in a home the real gateway never writes"
     ),
     "session_pid.py": (
+        "docstring and comment reference only (no code reads): the startup sweep "
+        "names the session_pid_mappings prune it runs as its third pass"
+    ),
+    "session_pid_mappings.py": (
         "stale-file cleanup: globs session_pid_*.txt (+ .sig sidecars) for dead "
         "processes, and (age-bounded) session_token_*.sig mappings, whose "
         "token-hash filenames name no pid to probe"
@@ -1320,7 +1328,7 @@ def _src_root() -> Path:
 def test_session_pid_call_sites_are_registered() -> None:
     src = _src_root()
     found = {
-        str(p.relative_to(src))
+        p.relative_to(src).as_posix()
         for p in src.rglob("*.py")
         if _SESSION_PID_TOKEN.search(p.read_text(encoding="utf-8", errors="replace"))
     }
@@ -1389,10 +1397,10 @@ def test_reflexive_tools_route_through_the_strict_gate() -> None:
         if _REFLEXIVE_GATE_CALL.search(text):
             gated.add(rel)
 
-    # 1. The gate is the ONLY caller of the strict resolver. mcp_core.py hosts
-    #    both, plus the resolver's own internal consumers (diagnosis, the
+    # 1. The gate is the ONLY caller of the strict resolver. mcp_core_parts/identity.py
+    #    hosts both, plus the resolver's own internal consumers (diagnosis, the
     #    Slack identity classifier), so it is the single permitted file.
-    direct -= {"mcp_core.py"}
+    direct -= {"mcp_core_parts/identity.py"}
     assert not direct, (
         f"Direct _resolve_session_key_strict() call(s) outside mcp_core: "
         f"{sorted(direct)}.\n"
@@ -1404,7 +1412,7 @@ def test_reflexive_tools_route_through_the_strict_gate() -> None:
 
     # 2. Every module calling the gate is registered as reflexive, and every
     #    registered module still calls it — the set is data, not lore.
-    gated -= {"mcp_core.py"}
+    gated -= {"mcp_core_parts/identity.py", "mcp_core_parts/governance.py"}
     registered = set(REFLEXIVE_TOOL_MODULES)
     unregistered = gated - registered
     stale = registered - gated

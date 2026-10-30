@@ -16,7 +16,9 @@ import { postNativeNotification } from '../../lib/nativeNotify'
 import { normalizeRunSessionKey } from '../../apps/workflows/runModel'
 import { dashboardAutomationSlotKey } from '../../monitoring/automation'
 import { i18nT } from '../../i18n/t'
-import { attendArrival } from './attention'
+import { sessionDisplayTitle } from '../../utils/sessionDisplayTitle'
+import { attendArrival, isSlotOnScreen } from './attention'
+import { takeIdleRowRefresh } from './idleRowRefresh'
 import { refreshPullRequestsAfterTurn, refreshSessionControlStatusesAfterTurn } from './serverState'
 import type { FrameData } from './frames'
 
@@ -83,12 +85,17 @@ export function useTurnCompletion({ dispatch, queryClient, reconnectingRef }: Tu
         // and a silenced failure stalls it unseen. The unread badge is a
         // separate axis (criterion 7), exempt only for that failure.
         const muteSuppresses = muted && !completionNeedsInput && !turnErrored
+        // A Crew Mode worker's finished turn is its conductor's to read: no chime
+        // and no toast for the person. Gated like the mute above: a worker that
+        // paused on a question or errored has stopped, and until the conductor's
+        // own routing lands nothing else would say so, so those still sound.
+        const crewWorkerQuiet = !!soundSlot?.crew_root && !completionNeedsInput && !turnErrored
         completionNeedsAttention = shouldChimeOnTurnDone({
           slot: data.slot,
           reconnecting: reconnectingRef.current,
           continuing,
           needsInput: completionNeedsInput,
-        }) && !muteSuppresses
+        }) && !muteSuppresses && !crewWorkerQuiet
         // A live question card already requested audio. Keep its named
         // desktop toast eligible, but do not request a second chime.
         if (completionNeedsAttention && !questionPending) dispatchMcNotification(TURN_DONE_KIND)
@@ -100,8 +107,10 @@ export function useTurnCompletion({ dispatch, queryClient, reconnectingRef }: Tu
         reconnecting: reconnectingRef.current,
       })) {
         const doneSlot = data.slot as string
-        const doneTitle = store.getState().dashboard.slots
-          .find(s => s.key === doneSlot)?.title || doneSlot
+        // A session missing from the slot list keeps its key: its title is
+        // unknown, not absent.
+        const doneRow = store.getState().dashboard.slots.find(s => s.key === doneSlot)
+        const doneTitle = doneRow ? sessionDisplayTitle(doneRow) : doneSlot
         // A toast that reads "Response ready" while the agent is waiting
         // on the user misdescribes the handoff; two literal keys keep the
         // reference statically checkable (see check-i18n-keys.mjs).
@@ -134,10 +143,21 @@ export function useTurnCompletion({ dispatch, queryClient, reconnectingRef }: Tu
         if ((!muted || turnErrored) && (!memberThread || memberSpoke)) dispatch(markSlotUnread({ slot, ts: (data as { ts?: string }).ts || undefined }))
         dispatch(warmSlotCache(slot))
       })
-      if (data.slot) {
-        dispatch(setSlotStatusDetail({ slot: data.slot, kind: 'idle', ts: Date.now() }))
+      // A pane on screen that is not the Redux active slot -- the Crew Members
+      // DM thread is the standing case -- is reached by neither the off-screen
+      // warm above nor `refreshSlot` below, which declines any non-active slot.
+      // A reply row that never reduced live would stay missing until a page
+      // reload, so the turn end reconciles it to the server transcript the same
+      // way a reconnect does. Reconnect replays are skipped: catch-up warms them.
+      if (data.slot && !reconnectingRef.current && data.slot !== store.getState().chat.activeSlot && isSlotOnScreen(data.slot)) {
+        dispatch(warmSlotCache(data.slot))
       }
-      if (data.slot) dispatch(refreshSlot(data.slot))
+      if (data.slot) {
+        dispatch(setSlotStatusDetail({ slot: data.slot, kind: 'idle' }))
+      }
+      // The idle `slots` row that ended this same turn already dispatched this
+      // refresh (`useSlotListSync`); any other `_done` refreshes.
+      if (data.slot && !takeIdleRowRefresh(data.slot, data)) dispatch(refreshSlot(data.slot))
       if (data.slot) {
         const isActive = data.slot === store.getState().chat.activeSlot
         refreshPullRequestsAfterTurn(

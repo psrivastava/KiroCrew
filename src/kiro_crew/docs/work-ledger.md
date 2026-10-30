@@ -28,8 +28,8 @@ Fewer than two qualifying items means one long session is the better shape, and
 a conductor would only add overhead.
 
 To start one, open a session on the **`kirocrew-conductor`** agent (see
-[Agents](agents.md) for the per-session, per-thread and per-cron selectors) and
-give it the goal. Its operating procedure ships as the `goal-conductor` skill.
+[Agents](agents.md) for the per-session, per-thread and per-cron selectors), which
+is what a Crew Mode chat runs on, and give it the goal. Its operating procedure ships as the `goal-conductor` skill.
 `kirocrew-ledger-conductor` is a deprecated alias of the same spec, kept for one
 release so an existing session or cron that names the old string keeps resolving.
 
@@ -46,7 +46,7 @@ An item is the unit of dispatch. It holds:
 | `verdict` | conductor | the acceptance evaluator's answer |
 | `fails` | conductor | how many acceptance attempts came back `fail` |
 | `state` | conductor | `open`, or terminal: `accepted` / `rejected` / `abandoned` |
-| `status` | worker | `progress` / `done` / `blocked` / `question` |
+| `status` | worker | `progress` / `done` / `blocked` / `question`, and `reply` while `work_ledger.remote_dispatch` is on |
 | `reason` | worker | on `blocked` / `question`, when only a person can move it: `approval` / `needs_human` |
 | `summary` | worker | the worker's own account, up to 500 chars |
 | `artifacts` | worker | pointers to what it produced |
@@ -84,8 +84,8 @@ wherever a conductor runs, rather than discovering the refusal from a worker tha
 cannot report.
 
 **The acceptance condition is named before dispatch, not after.** It is one of
-three kinds: `pr_checks` (a pull request's checks are all green), `file` (a path
-exists), or `human_approval` (you accept it — legitimate for a design review,
+four kinds: `pr_checks` (a pull request's checks are all green), `pr_merged` (a
+pull request has merged), `file` (a path exists), or `human_approval` (you accept it — legitimate for a design review,
 and never machine-evaluated). There is deliberately no "run this command" kind,
 so "the tests pass" is expressed as `pr_checks` on the pull request that carries
 the work, and CI's verdict is the one that counts.
@@ -98,19 +98,23 @@ because a worker that could fill in its own bar could point it at somebody
 else's already-green pull request.
 
 Limits: 32 open items per conductor (an item in a terminal state -- accepted,
-rejected, abandoned -- stays on the board, listed and readable, and does not count
-toward the open cap) and 256 items stored per conductor in total, open and closed
-together, which is also the crew log fold's per-board ceiling, so a board is
-always folded whole. The stored bound is measured against `created_total`, a
-monotonic counter in the conductor header of every item the board has created over
-its life: each create bumps it under the conductor lock, deleting or losing an item
-record does not reclaim capacity, and a create is refused rather than counted when
-the header cannot be read. A rebuild from the crew log sets the counter to the
-records the rebuilt board holds. Closed items stay on the board until that stored
-bound; a board at it refuses further creates (`item_store_full`) until the finished
-ledger is purged (see "Cleaning up finished ledgers"). A conductor may dispatch a
-conductor only once — depth is capped at 2, so a second-level conductor's own
-children are workers. A worker holds one open item at a time.
+rejected, abandoned -- does not count toward the open cap). There is no limit on
+how many items a board creates over its life. Every item stays on the board, listed
+and readable. The crew log's fold, which feeds a crew's status and the pipeline
+board, keeps open items and
+the 32 most recently closed items whole and only counts older closed ones, so it is
+bounded by what is open, not by history. Those counts (the conductor header's
+`created_total`, and "N of M items accepted" in a crew's status) still cover every
+item the board ever created. A conductor may dispatch a
+conductor only once by default — depth is capped at 2, so a second-level
+conductor's own children are workers. An operator who runs a deeper
+organization raises the cap with `work_ledger.max_depth` (2 to 10); `work_ledger_read`
+reports the cap in force as `max_depth`, and a `depth_exceeded` refusal names
+the setting. Lowering the cap does not close ledgers that are already open: it
+refuses new ledgers and new items at the levels it removes. A bound lead's or
+conductor's `work_report` waits on an approval prompt unless the agent's allowed
+tools include `@kirocrew-work/work_report`, so a deeper run that nobody watches
+needs that entry for the parent to wake on its own. A worker holds one open item at a time.
 
 ## Other refusals
 
@@ -151,7 +155,7 @@ root conductor learns it has no parent.
 
 ## `work_report` — what a worker writes
 
-One call, four statuses:
+One call, four statuses, and a fifth under a Feature Preview:
 
 | `status` | Meaning | Who acts next |
 |---|---|---|
@@ -159,6 +163,7 @@ One call, four statuses:
 | `blocked` | an external dependency stopped the work | the conductor clears or re-plans around it |
 | `question` | a decision the conductor owns is needed | the conductor answers |
 | `done` | the worker claims acceptance is met | the conductor verifies |
+| `reply` | the worker's answer to a follow-up the conductor sent it; needs no evidence and claims nothing finished. Accepted only while `work_ledger.remote_dispatch` is `true` (default `false`, read on every call); with it off, `reply` is refused as an unknown status. Like any report it replaces the item's last status, and like `done` it leaves the next move with the conductor, so it is never flagged `stale` | the conductor relays it |
 
 **`blocked` and `question` differ by who must act.** That is why they are
 separate values and not one "stuck". A build the worker does not control is
@@ -175,7 +180,8 @@ the goal popover says it is waiting on you. A worker's new report releases it;
 the conductor's own writes do not.
 
 **A report is the only thing that wakes a conductor.** `blocked`, `question`
-and `done` pull its `work-ledger` loop forward to within seconds. `progress`
+and `done` (and `reply`, while `work_ledger.remote_dispatch` is on) pull its
+`work-ledger` loop forward to within seconds. `progress`
 does not, which is what makes a pause cheap: a worker that stops to wait reports
 `progress` and its conductor spends no turn hearing it. A worker turn that ends
 having reported nothing wakes nobody, and neither does a worker's session
@@ -183,6 +189,19 @@ closing. What covers a worker that crashed or went silent is the item's own
 `stale` and `orphaned` flags, read on the conductor's ordinary patrol tick;
 those also cover a worker whose process died with its session still open, which
 no wake ever did.
+
+**A report the harness never delivered is not silence.** When a worker's
+`work_report` or `work_brief` call fails before it reaches the ledger (KAS
+answers a tool name it cannot resolve with `Tool "work_report" is not
+available.` and never calls the server), the gateway sees the failed call in
+the worker's own turn and records it beside the item. The item then reads
+`report_undelivered: {tool, at}` on `work_ledger_read` (full and compact) and on
+the Crew board ("couldn't send its report", or "couldn't read its brief" for a
+failed `work_brief`), the conductor's watch is pulled forward, and the wake it
+delivers names the item with `reason=report_undelivered`. The flag is not a
+ledger write: the next `work_brief` or `work_report` call that gets through
+clears it. A conductor that sees it checks the worker's session and pull request
+and tells you what it finds, rather than calling the worker stalled.
 
 Reports belong at real milestones, not on a timer.
 `summary` is capped at 500 characters.
@@ -198,6 +217,17 @@ it says so, e.g. `{"tests": "not run: harness unavailable"}`.
 are wrong or oversized: a truncated pointer is a broken pointer, while prose cut
 at the cap still reads.
 
+## A person's steer
+
+An item can carry a `steer` event: the time, actor `person`, and the person's own
+text, redacted and cut to 500 characters. It records that the person typed into
+the crew member (the worker session) that holds the item, from a Crew Mode chat.
+`work_ledger_read` shows it in the item's events. A steer moves no field: status,
+acceptance and verdict stay where they were, and acceptance stays the evaluator's.
+A person's steer outranks the conductor's decision. The ledger write
+(`work_ledger_worker.record_person_steer_result`) is here; the way to type into a
+crew member, which calls it, lands with the Crew panel.
+
 ## Why `done` is a claim
 
 A worker's `done` never closes an item. The conductor reads its whole ledger
@@ -206,7 +236,10 @@ ready-to-evaluate batch — runs the acceptance evaluator against the item's own
 condition, and records the answer with `work_ledger_record` as a `verdict`:
 
 - `pass` / `fail` — final for that cycle.
-- `pending` — the condition is not true yet; keep waiting.
+- `pending` — the condition is not true yet; keep waiting, for at most 24 hours on
+  end. Past that the item reads `pending_overdue`, and the conductor asks you, the
+  way it reports a `refused` one: keep waiting, which starts a fresh 24 hours, or
+  drop the item. A `human_approval` bar is never overdue: it waits for your answer.
 - `refused` — the evaluator will not answer the condition as written, and no
   amount of waiting changes that. A **draft** pull request whose checks have not
   finished lands here, because a draft is the author's own "not ready" and a
@@ -227,16 +260,25 @@ or time budget they set. An item that fails acceptance three times is closed
 `rejected` and the rest keep going. A decision that needs a person parks only
 that item: the conductor asks about it and keeps patrolling the others.
 
-Spend is bounded in code, not only in the prompt. Each goal may create at most
-`item_cap` items, closed ones and every round's re-plans included. The default
-is 20; a `goal` write sets it (`item_cap`, 1 to 256). A `create` past it is
-refused `goal_item_cap_reached`, and the board writes nothing. That is a
-needs-human spend stop: the conductor pauses, asks the user, and raises
-`item_cap` if they agree. The loop is not stopped. Only a goal write with
-`new_goal=true` (a goal the user replaced) starts a new count; rewording the
-goal, moving the round or raising the cap keeps it. A board that never records
-a goal, such as a pipeline or security conductor's queue, has no goal cap. Two rounds in a row with nothing accepted also stop new dispatches
-until the user answers.
+Parallel work is bounded in code, not only in the prompt. Each goal may hold at
+most `concurrency_cap` items open at once. The default is 6; a `goal` write sets
+it (`concurrency_cap`, 1 to 32). A `create` past it is refused
+`goal_concurrency_cap_reached`, and the board writes nothing. That is not a
+stop: the next item that lands frees a seat, and the conductor asks the user
+only when it wants more running at once, raising `concurrency_cap` if they
+agree. Closed items never count toward it.
+
+The total is advisory. Each goal is expected to create at most `item_cap` items,
+closed ones and every round's re-plans included; the default is 20 and a `goal`
+write sets it (`item_cap`, 1 to 256). Nothing is refused past it. The read
+returns `goal_items_used` and `cap_exceeded` on the `conductor` block, compact
+reads included; the conductor puts `items used: N of <item_cap>` in every round
+report and, when `cap_exceeded` is true, tells the user the goal has spent past
+its line. Only a goal write with `new_goal=true` (a goal the user replaced)
+starts a new count; rewording the goal, moving the round or changing a cap
+keeps it. A board that never records a goal, such as a pipeline or security
+conductor's queue, has neither goal cap. Two rounds in a row with nothing
+accepted stop new dispatches until the user answers.
 
 ## Not the same as the session ledger, or subagents
 

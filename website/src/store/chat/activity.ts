@@ -7,7 +7,7 @@ import type { ChatMessage, ToolActivity } from '../../types'
 import { SPAWN_LAUNCH_MARKER } from '../../pages/chat/types'
 import { isAskAnsweredOutput } from '../../utils/askQuestionAnswers'
 import { ASK_QUESTION_SERVER, isAskQuestionToolName, MAX_TOOL_RESULT_CHARS } from '../../utils/askQuestionTool'
-import { persistActivityOpen, type ChatState } from './state'
+import { entryActivityOpen, persistActivityOpen, restoreSavedActivityOpen, type ChatState } from './state'
 import { clampToolOutput, isUnsafeKey, safeKey } from './wire'
 
 /** Write a clamped payload onto a tool-log entry as its `input`/`input_cut` or
@@ -36,8 +36,12 @@ export function loadSlotActivity(state: ChatState, key: string): void {
   // legacy cached values fall back to 'changes'.
   const legacyTab = (t: unknown) => t === 'tools' || t === 'nav' || t === 'files'
   state.activityTab = (cached?.activityTab && !legacyTab(cached.activityTab)) ? cached.activityTab : 'changes'
-  // Panel open/closed is per-chat; a chat we've never opened defaults to closed.
-  state.activityOpen = cached?.activityOpen ?? false
+  // Panel open/closed is per-chat; a chat we've never opened defaults to closed,
+  // and Keep side panel open opens a chat the switch moves to. Both callers run
+  // this while `activeSlot` still names the chat being left (pending) or already
+  // names the origin it fell back to (rejected), so `key !== activeSlot` is
+  // exactly "the chat changes".
+  state.activityOpen = entryActivityOpen(state, key !== state.activeSlot, cached)
 }
 
 /**
@@ -82,8 +86,54 @@ function applyToolOutputToMessages(
 }
 
 export const activityReducers = {
-  toggleActivity(state: ChatState) { state.activityOpen = !state.activityOpen; if (!state.activityOpen) state.focusToolCallId = null; persistActivityOpen(state.activeSlot, state.activityOpen) },
+  // A toggle is the user's own choice for the panel, so it also cancels a reopen
+  // the phone or embed hold is waiting to make (see `sidePanelReopenSlot`),
+  // including the one a switch in flight saved to give back if it fails (see
+  // `slotSwitchOrigin`), and before the setting's first report it keeps that
+  // report from opening the panel (see `sidePanelAlwaysOpenSetting`).
+  toggleActivity(state: ChatState) { state.activityOpen = !state.activityOpen; if (!state.activityOpen) state.focusToolCallId = null; state.sidePanelReopenSlot = null; if (state.slotSwitchOrigin) state.slotSwitchOrigin.sidePanelReopenSlot = null; if (state.sidePanelAlwaysOpenSetting === null) state.sidePanelAlwaysOpenSetting = true; persistActivityOpen(state.activeSlot, state.activityOpen) },
   openActivityPanel(state: ChatState) { state.activityOpen = true; persistActivityOpen(state.activeSlot, true) },
+  /** Turn Keep side panel open on or off (see `sidePanelAlwaysOpen`). Off puts
+   *  every chat back on its own saved choice. An off that only holds the setting
+   *  back (a phone, an embedded chat) keeps the chat whose open panel it closed
+   *  (`sidePanelReopenSlot`). A chat entered during the hold takes its place
+   *  (see `enterActiveSlot`). The on that lifts the hold opens that chat's
+   *  panel when it is still the current chat. Apart from that, on opens the
+   *  current chat's panel only when the user's `setting`
+   *  itself just turned on, read against the copy this store keeps
+   *  (`sidePanelAlwaysOpenSetting`), so lifting the hold does not reopen a panel
+   *  the user closed, and a turn-on made while no chat page was mounted still
+   *  counts. The first report of a setting that is on (a reload) opens it too,
+   *  unless the user toggled the panel before that report. A dispatch with no
+   *  `setting` (an embedded chat) leaves that copy as it is. A repeat of the
+   *  current value changes nothing. */
+  setSidePanelAlwaysOpen(state: ChatState, action: PayloadAction<{ on: boolean; setting?: boolean }>) {
+    const { on, setting } = action.payload
+    const settingTurnedOn = setting === true && !state.sidePanelAlwaysOpenSetting
+    if (setting !== undefined) state.sidePanelAlwaysOpenSetting = setting
+    // The setting itself turning off reopens nothing, also during a hold, and
+    // also for a switch in flight that saved a reopen to give back if it fails
+    // (see `slotSwitchOrigin`).
+    if (setting === false) { state.sidePanelReopenSlot = null; if (state.slotSwitchOrigin) state.slotSwitchOrigin.sidePanelReopenSlot = null }
+    // `!!`: a state built without the field (a partial store) is off, so an
+    // off arriving there changes nothing and must not reset any panel.
+    if (on === !!state.sidePanelAlwaysOpen) return
+    state.sidePanelAlwaysOpen = on
+    if (!on) {
+      const wasOpen = state.activityOpen
+      restoreSavedActivityOpen(state)
+      // A hold (the setting is still on) that just closed the chat's panel.
+      state.sidePanelReopenSlot = state.sidePanelAlwaysOpenSetting && wasOpen && !state.activityOpen ? state.activeSlot : null
+      return
+    }
+    const reopen = state.sidePanelReopenSlot === state.activeSlot
+    state.sidePanelReopenSlot = null
+    if ((settingTurnedOn || reopen) && state.activeSlot) state.activityOpen = true
+  },
+  /** Close the active slot's panel, whatever it was: for a switch that must land
+   *  on the chat even when the target slot remembers its panel open (a phone
+   *  opening a Crew Mode worker from the Workers sheet). */
+  closeActivityPanel(state: ChatState) { state.activityOpen = false; state.focusToolCallId = null; persistActivityOpen(state.activeSlot, false) },
   openActivityToTab(state: ChatState, action: PayloadAction<'changes' | 'issues' | 'subagents' | 'workflows' | 'logs' | 'links' | 'side' | 'artifacts'>) { state.activityOpen = true; state.activityTab = action.payload; state.activityTabRequest += 1; state.focusToolCallId = null; persistActivityOpen(state.activeSlot, true) },
   /** Tool details expand inline in the chat. This action signals the matching
    *  ToolCallLine pill to auto-expand and scroll into view. */
@@ -161,7 +211,7 @@ export const activityReducers = {
     if (action.payload.approval_type) entry.approval_type = action.payload.approval_type
     log.push(entry)
   },
-  sseToolResult(state: ChatState, action: PayloadAction<{ slot: string; output: string; tool_call_id?: string }>) {
+  sseToolResult(state: ChatState, action: PayloadAction<{ slot: string; output: string; tool_call_id?: string; final?: boolean }>) {
     const tid = action.payload.tool_call_id
     // Land the output on the tool MESSAGE's meta as well as the tool log, for
     // the one consumer that reads scrollback rather than the tool log: the
@@ -193,6 +243,23 @@ export const activityReducers = {
     } else if (tid && isAskAnsweredOutput(out)) {
       applyToolOutputToMessages(state, action.payload.slot, tid, out, true)
     }
+    // The live status line (`slotStatusDetail`) names the call that is
+    // running. Once that call RETURNS, the model is reading its result, so the
+    // line reads thinking until the next status frame -- on every surface that
+    // renders it (the sessions sidebar, the command palette, the crewmate DM
+    // pill), not only on the one that checks the tool log. Matched by the
+    // call's own id, so a result for an earlier call cannot flip the line while
+    // a later, parallel call is still running. A mid-stream frame
+    // (`final: false`) is not a return. Runs before the tool-log lookup below,
+    // which returns early for a slot with no log yet.
+    if (tid && action.payload.final !== false && !isUnsafeKey(action.payload.slot)) {
+      const statusKey = safeKey(action.payload.slot)
+      // Optional: a store built from a partial chat state carries no status map.
+      const status = state.slotStatusDetail?.[statusKey]
+      if (status?.kind === 'tool' && status.toolCallId === tid) {
+        state.slotStatusDetail[statusKey] = { kind: 'thinking' }
+      }
+    }
     const log = action.payload.slot !== state.activeSlot
       ? state.slotActivity[action.payload.slot]?.toolLog
       : state.toolLog
@@ -213,6 +280,16 @@ export const activityReducers = {
         if (log[i].type === 'tool' && (!tid || !log[i].tool_call_id)) { target = i; break }
       }
     }
-    if (target >= 0) setClampedField(log[target], 'output', action.payload.output)
+    if (target >= 0) {
+      setClampedField(log[target], 'output', action.payload.output)
+      // `final: false` is a mid-stream frame: the call is still running, so
+      // nothing that reads "has this call returned?" may count it. A frame
+      // without the field (an older server) keeps the old reading: returned.
+      // Once a call returned (`output_partial === false`) it stays returned,
+      // even if a late frame follows.
+      const entry = log[target]
+      if (action.payload.final !== false) entry.output_partial = false
+      else if (entry.output_partial === undefined || entry.output_partial) entry.output_partial = true
+    }
   },
 }

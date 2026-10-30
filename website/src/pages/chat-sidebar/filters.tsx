@@ -2,11 +2,12 @@
  *  and tag filter state, the Recent window, the status sets the chips count, and the
  *  unread auto-drain. */
 import { Circle, Zap, Pin, Clock } from 'lucide-react'
+import { KiroGhostMark } from '../../components/KiroGhostMark'
 import { useState, useCallback, useMemo, useEffect, useRef } from 'react'
 import { shallowEqual } from 'react-redux'
 import type { SessionFilterKey, Slot } from './types'
 import { safeSetItem } from '../../utils/safeStorage'
-import { readStoredHiddenFolders, HIDDEN_FOLDERS_LS_KEY, readStoredTagFilter, TAG_FILTER_LS_KEY, FOLDERS_SHELVED_LS_KEY, readStoredRecentWindow, RECENT_WINDOW_LS_KEY, UNREAD_HIDDEN_LS_KEY, RUNNING_HIDDEN_LS_KEY, PINNED_HIDDEN_LS_KEY } from './persistence'
+import { readStoredHiddenFolders, HIDDEN_FOLDERS_LS_KEY, readStoredTagFilter, TAG_FILTER_LS_KEY, FOLDERS_SHELVED_LS_KEY, GROUP_BY_KIND_LS_KEY, readStoredRecentWindow, RECENT_WINDOW_LS_KEY, UNREAD_HIDDEN_LS_KEY, RUNNING_HIDDEN_LS_KEY, PINNED_HIDDEN_LS_KEY, readStoredModelFilter, writeStoredModelFilter, type StoredModelFilter } from './persistence'
 import { useAppSelector } from '../../store'
 import { selectSidebarWorkflowActiveKeys, selectSidebarAutomationRunningKeys, selectSidebarStartedSubagentCounts, selectSidebarSubagentCounts, selectSidebarApprovalCounts } from '../../store/chatSlice'
 import { decomposeRecentWindow, type RecentUnit, clampRecentAmount, customRecentWindowMs, recentTickIntervalMs, isWithinRecentWindow } from '../recentWindow'
@@ -48,6 +49,14 @@ export const SESSION_FILTERS: SessionFilterDef[] = [
     key: 'recent', storageKey: 'mc-session-recent-only',
     color: 'var(--ok)',
     icon: (active) => <Clock size={12} className={active ? 'text-[var(--ok)]' : 'text-muted'} />,
+  },
+  {
+    // Crew Mode chats only: the roots the server stamps `crew_mode_root`. Their
+    // workers are never rows here, so there is nothing for a hide to drop.
+    key: 'crew', storageKey: 'mc-session-crew-only',
+    color: 'var(--accent)',
+    // The crew's own ghost on the gradient, the mark the root rows wear.
+    icon: (active) => <span className={`w-3 h-3 rounded-full grid place-items-center ${active ? 'crew-grad' : 'bg-aim-subtle text-aim'}`}><KiroGhostMark size={8} className="inline-block shrink-0" /></span>,
   },
 ]
 
@@ -155,6 +164,47 @@ export function useSessionFilterState() {
     setFilterTagIds(new Set())
     safeSetItem(TAG_FILTER_LS_KEY, '[]')
   }, [])
+  /** Model keys the list is narrowed to (a union, like tags), and whether the
+   *  selection is inverted. One state object so the direction can never outlive
+   *  the selection it applies to: clearing the keys drops the exclude flag too,
+   *  and the next model selected narrows the list, as it would after a reload.
+   *
+   *  A toggle also drops every stored key no session uses any more (`present`
+   *  is the menu's own row set, so the clicked row is always in it). The filter
+   *  ignores a stale key but, left stored, it would keep `exclude` alive with
+   *  nothing ticked on screen: tick X and X disappears, under a "Not X" chip. */
+  const [modelFilter, setModelFilter] = useState<StoredModelFilter>(readStoredModelFilter)
+  const filterModelKeys = modelFilter.keys
+  const filterModelsExcluded = modelFilter.exclude
+  const toggleModelFilter = useCallback((key: string, present: Iterable<string>) => {
+    setModelFilter(prev => {
+      const presentSet = new Set(present)
+      const keys = new Set([...prev.keys].filter(stored => presentSet.has(stored)))
+      // The direction survives only if it applied to something on screen
+      // BEFORE this tick; a direction carried by stale keys alone is dropped.
+      const hadSelection = keys.size > 0
+      if (keys.has(key)) keys.delete(key); else keys.add(key)
+      const next = { keys, exclude: prev.exclude && hadSelection && keys.size > 0 }
+      writeStoredModelFilter(next)
+      return next
+    })
+  }, [])
+  const setModelFilterExcluded = useCallback((exclude: boolean) => {
+    setModelFilter(prev => {
+      if (prev.exclude === exclude || prev.keys.size === 0) return prev
+      const next = { keys: prev.keys, exclude }
+      writeStoredModelFilter(next)
+      return next
+    })
+  }, [])
+  const clearModelFilter = useCallback(() => {
+    setModelFilter(prev => {
+      if (prev.keys.size === 0) return prev
+      const next = { keys: new Set<string>(), exclude: false }
+      writeStoredModelFilter(next)
+      return next
+    })
+  }, [])
   // Shelved = the Folders section is rolled up to its heading, so a long folder
   // list stops crowding the Filter and Sort rows. Purely cosmetic: shelving
   // changes nothing about which folders are hidden, and the heading keeps
@@ -164,6 +214,14 @@ export function useSessionFilterState() {
   })
   const toggleFoldersShelved = useCallback(() => {
     setFoldersShelved(v => { const next = !v; safeSetItem(FOLDERS_SHELVED_LS_KEY, next ? '1' : '0'); return next })
+  }, [])
+  // "Group by kind": split each list into Crew Mode / Normal / From Mates
+  // sections (./kindSections). A view option, not a filter: it hides nothing.
+  const [groupByKind, setGroupByKind] = useState(() => {
+    try { return localStorage.getItem(GROUP_BY_KIND_LS_KEY) === '1' } catch { return false }
+  })
+  const toggleGroupByKind = useCallback(() => {
+    setGroupByKind(v => { const next = !v; safeSetItem(GROUP_BY_KIND_LS_KEY, next ? '1' : '0'); return next })
   }, [])
   // Chips whose HIDE state is on: their matching rows are dropped from the list.
   // Include chips OR together ("unread or pinned"), but a hide is an AND over
@@ -282,8 +340,9 @@ export function useSessionFilterState() {
     activeFilters, filtersPaused, setAllFiltersPaused, clearAllFilters,
     filterHiddenFolders, setFilterHiddenFolders, toggleFolderFilter, unhideFolderChain,
     showAllFolders, filterTagIds, toggleTagFilter, clearTagFilter, foldersShelved, setFoldersShelved,
-    toggleFoldersShelved, toggleFilter, disableFilter, enableFilter,
+    toggleFoldersShelved, toggleFilter, disableFilter, enableFilter, groupByKind, toggleGroupByKind,
     hiddenFilters, toggleHideFilter, clearHiddenFilters,
+    filterModelKeys, filterModelsExcluded, toggleModelFilter, setModelFilterExcluded, clearModelFilter,
   }
 }
 
@@ -319,7 +378,6 @@ export function useSessionStatusFilters({ unreadSlots, activeFilters, filtersPau
     () => new Set(automationRunningKeys),
     [automationRunningKeys],
   )
-  // NOT dashboardSlice.subagentRunning — that only broadcasts on "done", not spawn.
   const subagentCounts = useAppSelector(selectSidebarSubagentCounts, shallowEqual)
   // Started children only: what the board's Working lane reads.
   const subagentStartedCounts = useAppSelector(selectSidebarStartedSubagentCounts, shallowEqual)

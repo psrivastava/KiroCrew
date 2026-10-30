@@ -16,6 +16,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from stray_line_helpers import cyclic_gc_quiesced  # noqa: F401 - fixture
 
 from kiro_crew import dashboard_agentic, dashboard_feed
 from kiro_crew.crew_log import entry_types, projection
@@ -205,6 +206,9 @@ class TestTheAgenticWrite:
         assert caught.value.code == "value_too_deep"
         assert str(dashboard_agentic.AGENTIC_VALUE_DEPTH) in str(caught.value)
 
+    # The 550-deep value drives ``copy.deepcopy`` to its recursion limit, so the
+    # cyclic collector is held off for the test (testing-conventions.md, RecursionError).
+    @pytest.mark.usefixtures("cyclic_gc_quiesced")
     def test_a_deep_value_inside_the_byte_cap_is_refused_before_the_fold_has_to_walk_it(
         self,
     ) -> None:
@@ -530,6 +534,20 @@ class TestTheAgenticFold:
     def test_another_entry_type_does_not_move_it(self) -> None:
         assert self.fold(entry("panel/published", {"template": "x", "data": {}}))["wrote"] == 0
 
+    def test_a_rewrite_of_an_unchanged_value_moves_its_stamp(self) -> None:
+        """A crewmate that writes the SAME ``for_you`` list again after a chat reply
+        still moves ``at``, which is what ``written_at.for_you`` reads, so the page
+        stops folding the cards the reply folded. Built directly rather than with
+        ``entry()``, which puts two entries 1 ms apart: the same whole second."""
+        cards = [{"text": "Fix the CLI bubble?", "ask": "decide", "options": ["Fix it"]}]
+        data = {"field": "for_you", "type": "array", "value": {"v": cards}}
+        first = Entry(type=AGENTIC, seq=1, time=1_759_000_000_000, src="gateway", data=data)
+        second = Entry(type=AGENTIC, seq=2, time=1_759_000_045_000, src="gateway", data=data)
+        read = self.fold(first, second)
+        assert read["fields"]["for_you"]["value"] == cards
+        assert read["fields"]["for_you"]["at"] == projection._panel_iso(second.time)
+        assert read["fields"]["for_you"]["at"] != projection._panel_iso(first.time)
+
 
 class TestTheMistakeBookFold:
     def fold(self, *entries: Entry) -> dict[str, Any]:
@@ -717,13 +735,130 @@ class TestTheFoldScope:
         an event, which reads as an empty fold."""
         assert dashboard_feed.scope_for("nope") == ""
 
-    def test_every_manifest_fold_name_has_a_scope(self) -> None:
+    def test_every_manifest_fold_name_is_keyed(self) -> None:
         """A template may declare any of them, so a name the manifest accepts and
-        this cannot key would be a dashboard that never fills."""
+        nothing can reach would be a dashboard that never fills.
+
+        UNIVERSAL, and it stays universal. A template is rendered by
+        ``member_dashboard._render``, whose feed reaches a fold only by its BUS SCOPE and
+        has no tree read -- so for this surface a scope IS reachability, and a set that
+        admitted a scopeless name would hand an operator writing a ``panel-templates``
+        page a binding that is missing on every read.
+        """
         from kiro_crew.dashboard_templates.manifest import FOLD_NAMES
 
         for name in FOLD_NAMES:
             assert dashboard_feed.scope_for(name), name
+
+    def test_a_package_fold_name_is_keyed_or_read_as_a_tree(self) -> None:
+        """The same invariant for the PACKAGE surface, which has the extra reader.
+
+        Reachability is the question for both sets; the surfaces differ in what can
+        reach a fold. A tree fold has no scope by design -- it joins the logs of many
+        slots, so its value is stale when any member's log grows and no event key could
+        say which -- and it is read instead (``read_tree_projection``, on a page load and
+        on a refetch), which ``member_dashboard_fields.LivePage`` does for a package's
+        page. A fold in neither family still fails here.
+        """
+        from kiro_crew.crew_log.projection import TREE_PROJECTION_NAMES
+        from kiro_crew.dashboard_templates.manifest import PACKAGE_FOLD_NAMES
+
+        for name in PACKAGE_FOLD_NAMES:
+            assert dashboard_feed.scope_for(name) or name in TREE_PROJECTION_NAMES, name
+
+    def test_a_template_binding_a_tree_fold_is_refused_at_parse(self) -> None:
+        """THE SET IS A GATE, so the refusal is asked of the gate and not of the set.
+
+        An operator writes a ``panel-templates`` page, binds a block to a tree fold and
+        the save gate is what has to say no. Admitting it would hand them a field
+        ``read_fields`` skips on every read -- the feed reaches a fold by its bus scope
+        and a tree fold has none -- so the block never fills and nothing on the page
+        says why.
+        """
+        from kiro_crew.crew_log.projection import TREE_PROJECTION_NAMES
+        from kiro_crew.dashboard_templates.manifest import ManifestError
+
+        for name in TREE_PROJECTION_NAMES:
+            with pytest.raises(ManifestError) as caught:
+                manifest(boards={"type": "number", "source": {"fold": name, "path": "a.b"}})
+            # Refused BY NAME, so the author is told which binding to change rather
+            # than being handed a manifest-wide "invalid".
+            assert name in str(caught.value), caught.value
+
+    def test_a_package_binding_the_same_tree_fold_is_accepted(self) -> None:
+        """The other side of the split, through the gate a PACKAGE actually passes.
+
+        The package surface keeps the binding this PR is for: its page is drawn by
+        ``member_dashboard_fields.LivePage``, which reads a tree fold. Asked of
+        ``dashboard_package``'s own validator because that is the gate a package goes
+        through -- a package never reaches ``parse_manifest``.
+        """
+        from kiro_crew.artifact_store import dashboard_package as dp
+        from kiro_crew.crew_log.projection import TREE_PROJECTION_NAMES
+
+        for name in TREE_PROJECTION_NAMES:
+            assert name in dp.fold_names(), (
+                f"{name} has a reader on the package surface, so a package binding it "
+                "must still be accepted"
+            )
+
+    def test_the_template_set_never_admits_a_scopeless_fold(self) -> None:
+        """THE SPLIT IS THE POINT, so it is pinned rather than left to the two loops.
+
+        One shared set is how a reader the package surface gained reached the template
+        surface, which never gained it. Re-merging them would admit every tree fold to
+        ``parse_manifest`` again, and the package loop above would still pass because
+        that set is a superset.
+        """
+        from kiro_crew.crew_log.projection import TREE_PROJECTION_NAMES
+        from kiro_crew.dashboard_templates.manifest import FOLD_NAMES, PACKAGE_FOLD_NAMES
+
+        assert TREE_PROJECTION_NAMES, "no tree fold is registered; this test guards none"
+        for name in TREE_PROJECTION_NAMES:
+            assert name not in FOLD_NAMES, (
+                f"{name} has no bus scope and no template reader, so a template "
+                "manifest binding it is a block that never fills"
+            )
+            assert name in PACKAGE_FOLD_NAMES, name
+        assert FOLD_NAMES < PACKAGE_FOLD_NAMES
+
+    def test_a_tree_fold_the_manifest_accepts_has_a_reader(self) -> None:
+        """The other half of the ratchet above, and the half that moves with this change.
+
+        A TREE-keyed fold is registered in the projection kernel and has no bus scope by
+        design, so the ONLY way a block bound to one ever fills is a read. While there
+        was no read path, the name was withheld from every gate -- a binding
+        the save gate admits and the feed can neither key nor read is a block that never
+        fills.
+
+        The read path lands here for the PACKAGE surface, so the name joins that
+        surface's set, and the invariant turns into its positive form: every tree fold
+        the package gate accepts must have a reader that resolves it. Stated as two concrete things rather than as a flag,
+        because a flag can be set while neither is true -- the kernel's read function
+        exists, and the page host actually calls it.
+        """
+        import inspect
+
+        from kiro_crew.crew_log import projection
+        from kiro_crew.dashboard.handlers import member_dashboard_fields as mdf
+        from kiro_crew.dashboard_templates.manifest import PACKAGE_FOLD_NAMES
+
+        assert projection.TREE_PROJECTION_NAMES, "no tree fold is registered; this test guards none"
+        for name in projection.TREE_PROJECTION_NAMES:
+            assert name in PACKAGE_FOLD_NAMES, (
+                f"{name} is a tree fold with a read path, so the package gate must "
+                "accept a block binding it"
+            )
+            # No scope, which is WHY it needs a read: a tree joins the logs of many
+            # slots, so no event key can say which one moved it.
+            assert dashboard_feed.scope_for(name) == "", name
+
+        # THE READER, named: the kernel's read function, and the page host that calls it.
+        assert callable(projection.read_tree_projection)
+        assert "read_tree_projection" in inspect.getsource(mdf.LivePage._read_trees), (
+            "LivePage._read_trees is the tree folds' only production reader; a tree "
+            "fold the gate accepts with nothing reading it fills from nowhere"
+        )
 
 
 class TestThePathWalk:
@@ -758,32 +893,12 @@ class TestTheFeed:
         assert read.fields["entries"] == 3
         assert read.seq == 11
 
-    def test_an_unwritten_agentic_field_is_absent_but_not_stale(self) -> None:
-        """ABSENT and STALE are different facts, and only one raises the band.
-
-        A cell the crewmate has never written is empty; the page dims it, which is
-        what `missing` is for. Stale means the values on screen are OLDER than the
-        record, which a cell nothing ever filled is not. Counting it raised the band
-        on every crewmate carrying an unwritten agentic field, permanently, about a
-        value nothing had yet produced -- and that includes the default page an
-        unadopted crewmate is served, whose agentic field no caller can fill.
-        """
-        made = self.feed("work")
-        made._accept("work", self.event({"conductor": {"entries": 3}}, 5, seq=11))
-        read = made.read(manifest())
-        assert "open_items" in read.missing, "the unwritten cell is not marked absent"
-        assert read.fields["entries"] == 3, "the fold-sourced field did not resolve"
-        assert read.stale is False, (
-            "an unwritten agentic field raised the stale band, so the page claims its "
-            "numbers are older than the record when they are current"
-        )
-
-    def test_a_fold_that_does_not_resolve_is_stale(self) -> None:
-        """The other half of the same rule: a fold value the feed could not read DOES
-        mean what is on screen is older than the record."""
-        made = self.feed("work")
-        read = made.read(manifest())
-        assert read.stale is True, "an unresolved fold did not raise the stale band"
+    @pytest.fixture(autouse=True)
+    def _no_earlier_reads(self) -> Any:
+        """Each case starts on a process that has resolved nothing on this slot."""
+        dashboard_feed.forget_resolved()
+        yield
+        dashboard_feed.forget_resolved()
 
     def test_an_older_revision_is_ignored(self) -> None:
         """``revision`` orders two values of one (key, fold) and ``seq`` cannot: a
@@ -807,15 +922,6 @@ class TestTheFeed:
         made._accept("work", SimpleNamespace(revision=9, seq=9, value="not a mapping"))
         made._accept("work", SimpleNamespace(revision=0, seq=9, value={"conductor": {}}))
         assert made.read(manifest()).fields["entries"] == 3
-
-    def test_an_unresolved_field_is_named_and_the_read_is_stale(self) -> None:
-        made = self.feed("work")
-        made._accept("work", self.event({"nothing": {}}, 5))
-        read = made.read(manifest())
-        # The two agentic fields are missing too: no agentic fold value was passed,
-        # and an agentic cell the crewmate has not written is not a zero.
-        assert read.missing == ["open_items", "risk_note", "entries"]
-        assert read.stale is True
 
     def test_an_agentic_field_comes_from_the_agentic_fold(self) -> None:
         read = self.feed("work").read(
@@ -1343,7 +1449,13 @@ class TestTheRealPackagePath:
         def _get(slug: str, **_kw: Any) -> Any:
             if get_raises is not None:
                 raise get_raises
-            return SimpleNamespace(slug=slug, content=content, version=version)
+            # A version a PERSON cut, which is what the older rule draws.
+            return SimpleNamespace(
+                slug=slug,
+                content=content,
+                version=version,
+                events=[{"by": "user", "type": "edited", "version": version}],
+            )
 
         monkeypatch.setattr(
             artifacts, "get_default_store", lambda: SimpleNamespace(get=_get), raising=False
@@ -1388,7 +1500,10 @@ class TestTheRealPackagePath:
         the case where none does.
         """
         from kiro_crew import dashboard_package
+        from kiro_crew.dashboard_templates import instance
 
+        # On a template page: a crewmate that adopted none is shown no page at all.
+        instance.adopt("atlas", "project-report")
         self.gate(monkeypatch, resolved=None)
         got = self.read()
         assert got.state == dashboard_package.STATE_LIVE
@@ -1461,26 +1576,21 @@ class TestTheRealPackagePath:
 
     # -- what a live package answers, with no Model to check against --------- #
 
-    def test_a_readable_package_is_live_and_carries_no_model(
+    def test_a_readable_package_is_live_and_carries_its_own_model(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A package that parses is ``live`` and brings NO manifest field specs.
+        """A package that parses is ``live`` and brings ITS OWN field specs.
 
-        The translation into field specs ships with the change that makes the display
-        read the same package, because that change is the first place its output is used
-        for anything: here, every package-bound write is refused before a Model would be
-        checked, so translating one would build a manifest and throw it away.
-
-        ``from_package`` is what the write route turns on, and it is PROVENANCE -- the
-        only thing this module can honestly say. What a package-sourced read means for a
-        write is the route's own decision, which is why the refusal lives there.
+        The page draws the package, so a write is checked against the same
+        ``package_manifest`` translation the page's controller subscribes by.
         """
         from kiro_crew import dashboard_package
 
         self.gate(monkeypatch)
         got = self.read()
         assert got.state == dashboard_package.STATE_LIVE
-        assert got.model is None
+        assert got.model is not None
+        assert got.model.manifest.id == "dashboard-package"
         assert got.from_package is True
         # The slug and the version still reach a person through the sentence, which is
         # what the refusal quotes.
@@ -1496,6 +1606,9 @@ class TestTheRealPackagePath:
         and answers ``live`` WITH a Model. Keying the write route's refusal on the state
         would refuse that too -- every write this product already serves.
         """
+        from kiro_crew.dashboard_templates import instance
+
+        instance.adopt("atlas", "project-report")
         self.gate(monkeypatch, resolved=None)
         got = self.read()
         assert got.model is not None
@@ -1547,7 +1660,7 @@ class TestTheRealGateAndStore:
             "kind": "dashboard",
             "bound_to": bound_to,
             "model": {"types": {"for_you": {"type": "text", "source": {"agentic": True}}}},
-            "view": {"blocks": [{"id": "fy", "type": "stat", "fields": ["for_you"]}]},
+            "view": {"html": '<p data-dashboard-field="for_you"></p>'},
             "theme": {"tokens": {"--panel-bg": "oklch(21% 0 0)"}},
         }
 
@@ -1560,13 +1673,20 @@ class TestTheRealGateAndStore:
         art = store.create(
             name="Atlas", kind="dashboard", content=json.dumps(self._package("crewmate:atlas"))
         )
+        # A version a PERSON cut, which is the page the older rule draws.
+        cut = self._package("crewmate:atlas")
+        cut["view"]["html"] = '<h2>For you</h2><p data-dashboard-field="for_you"></p>'
+        read = store.get(art.slug, assign_token=True)
+        store.update(
+            art.slug, content=json.dumps(cut), actor="user", snapshot_token=read.content_token
+        )
         got = dashboard_package.read_package_model("atlas")
         assert got.state == dashboard_package.STATE_LIVE
         # The STORED package is what was found, not the template a fall-through would
-        # have handed back: that is the thing this case is about, and ``from_package``
-        # is what says so now that a package read carries no Model.
+        # have handed back: that is the thing this case is about.
         assert got.from_package is True
-        assert got.model is None
+        assert got.model is not None
+        assert set(got.model.manifest.fields) == {"for_you"}
         assert art.slug in got.state_reason
 
     def test_a_package_the_validator_rejects_is_an_error_and_not_a_fall_through(
@@ -1649,7 +1769,9 @@ class TestTheRealGateAndStore:
         cases that DO refuse each name a record the listing proved is a dashboard.
         """
         from kiro_crew import dashboard_package
+        from kiro_crew.dashboard_templates import instance
 
+        instance.adopt("atlas", "project-report")
         store = self._store(monkeypatch, tmp_path)
         # A record of ANOTHER kind, damaged so its own metadata -- and therefore its
         # kind -- will not read. No dashboard package is stored for this member.
@@ -1725,8 +1847,8 @@ def test_a_written_value_reaches_a_page_that_declares_an_agentic_array():
     the SHIPPED default's own manifest off disk travels with them -- what belongs here
     is the mechanism, which is what this drives.
 
-    `stale` is asserted False in the same breath: a page showing a freshly written
-    value must not also claim its numbers are older than the record.
+    `unresolved` is asserted empty in the same breath: a page showing a freshly written
+    value must not also tell the crewmate one of its fields is broken.
     """
     from kiro_crew.dashboard_templates.manifest import parse_manifest
 
@@ -1749,8 +1871,8 @@ def test_a_written_value_reaches_a_page_that_declares_an_agentic_array():
     written = [{"what": "approve the plan", "who": "you"}]
     feed = dashboard_feed.DashboardFeed(slot="member-atlas")
     # The fold this template binds, seeded as the route's own `subscribe` would leave
-    # it. Without it the fold-sourced fields cannot resolve and the page IS stale --
-    # correctly -- which would make the stale assertion below pass for the wrong reason.
+    # it. Without it the fold-sourced fields cannot resolve -- correctly -- which would
+    # make the unresolved assertion below fail for the wrong reason.
     feed._cells["workstreams"] = dashboard_feed._Cell()
     feed._accept(
         "workstreams",
@@ -1758,15 +1880,15 @@ def test_a_written_value_reaches_a_page_that_declares_an_agentic_array():
             revision=1,
             seq=7,
             # Every path the manifest above binds, because a key absent here reads as a
-            # fold that did not resolve -- which IS the stale condition, and would make
-            # the assertion below pass for the wrong reason.
+            # fold that did not resolve, which would make the assertion below fail for
+            # the wrong reason.
             value={"items": []},
         ),
     )
     read = feed.read(shipped, {"fields": {"for_you": {"value": written}}})
     assert read.fields["for_you"] == written, "the written value does not reach the page"
     assert "for_you" not in read.missing, "a written field is still reported absent"
-    assert read.stale is False, "a page showing a just-written value claims it is old"
+    assert read.unresolved == {}, "a page showing a just-written value reports a broken field"
 
 
 def test_a_written_value_reaches_the_real_default_page():
@@ -1777,8 +1899,8 @@ def test_a_written_value_reaches_the_real_default_page():
     value its one agentic field receives. A fixture manifest would pin the mechanism
     while leaving the shipped default free to declare something the write cannot fill.
 
-    `stale` is asserted False in the same breath: a page showing a freshly written
-    value must not also claim its numbers are older than the record.
+    `unresolved` is asserted empty in the same breath: a page showing a freshly written
+    value must not also tell the crewmate one of its fields is broken.
     """
     import json as _json
 
@@ -1803,8 +1925,8 @@ def test_a_written_value_reaches_the_real_default_page():
     written = [{"what": "approve the plan", "who": "you"}]
     feed = dashboard_feed.DashboardFeed(slot="member-atlas")
     # The fold this template binds, seeded as the route's own `subscribe` would leave
-    # it. Without it the fold-sourced fields cannot resolve and the page IS stale --
-    # correctly -- which would make the stale assertion below pass for the wrong reason.
+    # it. Without it the fold-sourced fields cannot resolve -- correctly -- which would
+    # make the unresolved assertion below fail for the wrong reason.
     feed._cells["workstreams"] = dashboard_feed._Cell()
     feed._accept(
         "workstreams",
@@ -1812,8 +1934,8 @@ def test_a_written_value_reaches_the_real_default_page():
             revision=1,
             seq=7,
             # Every path the shipped manifest binds, because a key absent here reads as
-            # a fold that did not resolve -- which IS the stale condition, and would
-            # make the assertion below pass for the wrong reason.
+            # a fold that did not resolve, which would make the assertion below fail
+            # for the wrong reason.
             value={
                 "items": [],
                 "omitted": 0,
@@ -1822,7 +1944,14 @@ def test_a_written_value_reaches_the_real_default_page():
             },
         ),
     )
+    # The `panel` fold as a slot nobody published on renders it: an empty record and
+    # no owners. The page reads it as an empty object, which resolves.
+    feed._cells["panel"] = dashboard_feed._Cell()
+    feed._accept(
+        "panel",
+        SimpleNamespace(revision=1, seq=7, value={"template": "", "data": {}, "owners": {}}),
+    )
     read = feed.read(shipped, {"fields": {"for_you": {"value": written}}})
     assert read.fields["for_you"] == written, "the written value does not reach the page"
     assert "for_you" not in read.missing, "a written field is still reported absent"
-    assert read.stale is False, "a page showing a just-written value claims it is old"
+    assert read.unresolved == {}, "a page showing a just-written value reports a broken field"

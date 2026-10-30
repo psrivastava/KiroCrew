@@ -19,11 +19,12 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { forwardRef, useImperativeHandle, createRef } from 'react'
-import { render, screen, fireEvent, waitFor, act, within } from '@testing-library/react'
+import { render, screen, fireEvent, waitFor, act, within, createEvent } from '@testing-library/react'
 import { MemoryRouter, useLocation } from 'react-router-dom'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import type { PierreEditorHandle } from '../pierre'
 import { evictDocumentBodies } from '../hooks/usePanelTabs'
+import { LocalOverlayRoot } from '../components/overlayRoot'
 
 // ── CSS Custom Highlight API stub (must precede the dynamic import) ──────────
 const highlightRegistry = new Map<string, Range[]>()
@@ -305,6 +306,7 @@ describe('OverflowMenu Download', () => {
     fireEvent.click(screen.getByText('Download'))
     await waitFor(() => expect(fetch).toHaveBeenCalledWith(
       '/api/file-download?path=%2Ftmp%2Fnotes.md',
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
     ))
     expect(overflowError).not.toHaveBeenCalled()
     expect(window.alert).not.toHaveBeenCalled()
@@ -368,6 +370,13 @@ function mountPanel(opts: MountOpts = {}) {
 function openPanelMenu() {
   fireEvent.click(screen.getAllByTestId('markdown-panel-more-options')[0])
 }
+
+/** The panel inside the local Crew's overlay root, hidden as if a remote Crew were showing. */
+const behindCrew = (hidden: boolean, content: string) => (
+  <LocalOverlayRoot hidden={hidden}>
+    <MarkdownPanel embedded filePath="/tmp/notes.md" content={content} onContentChange={vi.fn()} onSave={vi.fn(async () => {})} onClose={vi.fn()} initialDiffMode={false} />
+  </LocalOverlayRoot>
+)
 
 /**
  * The unsaved-changes banner stays MOUNTED and animates its own row height
@@ -844,6 +853,26 @@ describe('MarkdownPanel — fullscreen overlay', () => {
     expect(screen.getByTitle('Click to copy path')).toHaveTextContent('/tmp/notes.md')
   })
 
+  it('hides while a remote Crew is showing and keeps its state for the return', async () => {
+    // The overlay root hides the overlay with the local pane; its Escape handler stands down.
+    const ui = (hidden: boolean) => behindCrew(hidden, '# Title\n')
+    const view = render(ui(false), { wrapper })
+    openPanelMenu()
+    fireEvent.click(screen.getByText('Full screen'))
+    const dialog = await screen.findByRole('dialog')
+    expect(dialog).toBeVisible()
+
+    view.rerender(ui(true))
+    expect(dialog).not.toBeVisible()
+    // Escape reaching the parent document must not exit a view nobody sees.
+    fireEvent.keyDown(document, { key: 'Escape' })
+    expect(screen.getByRole('dialog', { hidden: true })).toBe(dialog)
+
+    view.rerender(ui(false))
+    expect(screen.getByRole('dialog')).toBe(dialog)
+    expect(dialog).toBeVisible()
+  })
+
   it('closes the overlay and releases body scroll on Exit full screen', async () => {
     await goFullscreen()
     fireEvent.click(screen.getByLabelText('Exit full screen'))
@@ -924,6 +953,20 @@ describe('MarkdownPanel — preview find', () => {
 
   it('opens a find field scoped to the rendered preview', async () => {
     expect(await openFind()).toBeInTheDocument()
+  })
+
+  it('leaves Cmd+F alone while a remote Crew is showing', async () => {
+    const ui = (hidden: boolean) => behindCrew(hidden, 'alpha beta alpha gamma\n')
+    const view = render(ui(true), { wrapper })
+    await screen.findByText(/alpha beta alpha gamma/)
+    const ev = createEvent.keyDown(document, { key: 'f', metaKey: true })
+    fireEvent(document, ev)
+    expect(ev.defaultPrevented).toBe(false)
+    expect(screen.queryByLabelText('Find in document')).toBeNull()
+
+    view.rerender(ui(false))
+    fireEvent.keyDown(document, { key: 'f', metaKey: true })
+    expect(await screen.findByLabelText('Find in document')).toBeInTheDocument()
   })
 
   it('counts every match and paints them through the highlight registry', async () => {
@@ -1785,6 +1828,103 @@ describe('MarkdownPanel — comment hint banner', () => {
 })
 
 describe('MarkdownPanel — read-only working-tree diff (#9695)', () => {
+  it('renders a text diff for a JSON working-tree diff instead of a blank pane', async () => {
+    // JSON has a rich viewer, but it is text: the locked-diff tab must diff it.
+    vi.mocked(api.fileDiff).mockResolvedValue({ diff: 'x', original: '{"a": 1}\n', status: 'modified' } as never)
+    mountPanel({ filePath: '/tmp/settings/cli.json', content: '{"a": 2}\n', readOnly: true, initialDiffMode: true })
+    const view = await screen.findByTestId('pierre-diff')
+    expect(view.getAttribute('data-old')).toBe('{"a": 1}\n')
+    expect(view.getAttribute('data-new')).toBe('{"a": 2}\n')
+    // Locked to its diff, the read-only tab offers no way out of it.
+    expect(screen.queryByTestId('markdown-panel-diff-chip')).toBeNull()
+  })
+
+  it('opens a modified JSON file tab on its viewer, not a text diff', async () => {
+    vi.mocked(api.fileDiff).mockResolvedValue({ diff: 'x', original: '{"a": 1}\n', status: 'modified' } as never)
+    mountPanel({ filePath: '/tmp/settings/cli.json', content: '{"enableThinking": true}\n', initialDiffMode: undefined })
+    // The viewer has rendered, and the baseline is never requested, so no
+    // later diff response can switch the tab into diff mode.
+    await screen.findByText(/enableThinking/)
+    expect(api.fileDiff).not.toHaveBeenCalled()
+    expect(screen.queryByTestId('pierre-diff')).toBeNull()
+    expect(screen.queryByLabelText('Toggle diff view')).toBeNull()
+  })
+
+  it('offers a JSON file tab its diff from the overflow menu', async () => {
+    vi.mocked(api.fileDiff).mockResolvedValue({ diff: 'x', original: '{"a": 1}\n', status: 'modified' } as never)
+    mountPanel({ filePath: '/tmp/settings/cli.json', content: '{"a": 2}\n' })
+    openPanelMenu()
+    fireEvent.click(screen.getByRole('menuitemcheckbox', { name: 'Show changes' }))
+    const view = await screen.findByTestId('pierre-diff')
+    expect(view.getAttribute('data-old')).toBe('{"a": 1}\n')
+  })
+
+  it('shows a Diff view chip while a JSON tab is on its diff, and the chip returns it to the viewer', async () => {
+    vi.mocked(api.fileDiff).mockResolvedValue({ diff: 'x', original: '{"a": 1}\n', status: 'modified' } as never)
+    mountPanel({ filePath: '/tmp/settings/cli.json', content: '{"a": 2}\n' })
+    // On the viewer: no chip.
+    expect(screen.queryByTestId('markdown-panel-diff-chip')).toBeNull()
+    openPanelMenu()
+    fireEvent.click(screen.getByRole('menuitemcheckbox', { name: 'Show changes' }))
+    await screen.findByTestId('pierre-diff')
+    const chip = screen.getByRole('button', { name: 'Close diff view' })
+    expect(chip).toHaveTextContent('Diff view')
+    fireEvent.click(chip)
+    await waitFor(() => expect(screen.queryByTestId('pierre-diff')).toBeNull())
+    expect(screen.queryByTestId('markdown-panel-diff-chip')).toBeNull()
+  })
+
+  it('offers the same diff row in the fullscreen menu of a JSON file tab', async () => {
+    mountPanel({ filePath: '/tmp/settings/cli.json', content: '{"a": 2}\n' })
+    openPanelMenu()
+    fireEvent.click(screen.getByText('Full screen'))
+    const dialog = await screen.findByRole('dialog')
+    fireEvent.click(within(dialog).getByTestId('markdown-panel-more-options'))
+    expect(screen.getByRole('menuitemcheckbox', { name: 'Show changes' })).toHaveAttribute('aria-checked', 'false')
+  })
+
+  it('holds the fullscreen JSON diff until its baseline arrives, never showing the whole file as added', async () => {
+    let resolveDiff: (v: unknown) => void = () => {}
+    vi.mocked(api.fileDiff).mockReturnValue(new Promise(r => { resolveDiff = r }) as never)
+    mountPanel({ filePath: '/tmp/settings/cli.json', content: '{"a": 2}\n' })
+    openPanelMenu()
+    fireEvent.click(screen.getByText('Full screen'))
+    const dialog = await screen.findByRole('dialog')
+    fireEvent.click(within(dialog).getByTestId('markdown-panel-more-options'))
+    fireEvent.click(screen.getByRole('menuitemcheckbox', { name: 'Show changes' }))
+    // The baseline request is in flight: no diff may render against an empty original.
+    await waitFor(() => expect(api.fileDiff).toHaveBeenCalled())
+    expect(within(dialog).queryByTestId('pierre-diff')).toBeNull()
+    resolveDiff({ diff: 'x', original: '{"a": 1}\n', status: 'modified' })
+    const view = await within(dialog).findByTestId('pierre-diff')
+    expect(view.getAttribute('data-old')).toBe('{"a": 1}\n')
+    // The fullscreen header carries the same chip, which leaves the diff.
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Close diff view' }))
+    await waitFor(() => expect(within(dialog).queryByTestId('pierre-diff')).toBeNull())
+  })
+
+  it('keeps the fullscreen diff on screen while its baseline is refetched', async () => {
+    vi.mocked(api.fileDiff).mockResolvedValue({ diff: 'x', original: '{"a": 1}\n', status: 'modified' } as never)
+    mountPanel({ filePath: '/tmp/settings/cli.json', content: '{"a": 2}\n', initialDiffMode: true })
+    openPanelMenu()
+    fireEvent.click(screen.getByText('Full screen'))
+    const dialog = await screen.findByRole('dialog')
+    const view = await within(dialog).findByTestId('pierre-diff')
+    // A background refetch (window refocus, save) must not unmount the diff.
+    let resolveDiff: (v: unknown) => void = () => {}
+    vi.mocked(api.fileDiff).mockReturnValue(new Promise(r => { resolveDiff = r }) as never)
+    void qc.invalidateQueries({ queryKey: ['file-diff', '/tmp/settings/cli.json'] })
+    await waitFor(() => expect(api.fileDiff).toHaveBeenCalledTimes(2))
+    expect(within(dialog).getByTestId('pierre-diff')).toBe(view)
+    resolveDiff({ diff: 'x', original: '{"a": 1}\n', status: 'modified' })
+  })
+
+  it('keeps an image working-tree diff on its viewer, never a blank diff pane', async () => {
+    vi.mocked(api.fileDiff).mockResolvedValue({ diff: 'x', original: '', status: 'modified' } as never)
+    mountPanel({ filePath: '/tmp/logo.png', content: '', readOnly: true, initialDiffMode: true })
+    await waitFor(() => expect(screen.queryByTestId('pierre-diff')).toBeNull())
+    expect(screen.queryByText('No changes in this file')).toBeNull()
+  })
   it('locks a code file read-only: no editor, no Edit/Preview/Save, no diff toggle', async () => {
     // A .py file would normally open straight in the editor; readOnly must keep
     // it a non-editable view, so the wtdiff tab is never a second editable buffer.

@@ -26,7 +26,6 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { Provider } from 'react-redux'
 import { MemoryRouter, Routes, Route } from 'react-router-dom'
 import { createTestStore } from './helpers'
-import { PREVIEW_DASHBOARD, setPreviewFlag } from '../utils/previewFlags'
 import { ThemeProvider } from '../hooks/useTheme'
 
 // --- Stub the chat message components: AssistantMessage exposes the real
@@ -81,6 +80,7 @@ vi.mock('../hooks/virtualizer/useVirtualChat', () => ({
       getFollow: () => true,
       scrollToBottom: vi.fn(),
       mountIndex: vi.fn(),
+      retainRange: vi.fn(),
       measureRef: () => () => {},
       topSentinelRef: { current: null },
       bottomSentinelRef: { current: null },
@@ -121,6 +121,8 @@ vi.mock('../api/client', () => ({
       if (!(prop in apiMocks)) {
         apiMocks[prop] = vi.fn().mockResolvedValue(
           prop === 'chatSlotDetail' ? { messages: [], has_more: false, total: 0 }
+            // The side panel opens files only once the chat is confirmed local.
+            : prop === 'chatSlotEnvironment' ? { profile: null, profiles: [] }
             : prop === 'pendingQuestions' || prop === 'approvals' ? [] : {},
         )
       }
@@ -276,14 +278,11 @@ describe('ChatPage – opening a dock panel closes the find pane', () => {
     })
   })
 
-  it('draws no status-tile HUD above the composer, even with the Dynamic Dashboard preview on', async () => {
+  it('draws no status-tile HUD above the composer', async () => {
     localStorage.clear()
-    localStorage.setItem(PREVIEW_DASHBOARD, '1')
     renderChatPage({ withWorker: true })
     // A worker makes a team, which is exactly what used to raise the tiles.
     await act(async () => { await new Promise(resolve => setTimeout(resolve, 50)) })
-    expect(screen.queryByTestId('command-center-dock')).toBeNull()
-    act(() => { setPreviewFlag(PREVIEW_DASHBOARD, false) })
     expect(screen.queryByTestId('command-center-dock')).toBeNull()
   })
 })

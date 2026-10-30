@@ -27,11 +27,12 @@ import { AppIdentityProvider, useAppIdentity, type AppOrigin } from './identity'
 import { AppQueryClientProvider } from './appQueryClient'
 // The scoped-API layer, kept in its own module so it is NOT published on this
 // barrel -- see the header of ./scopedApi for why.
-import { useCtx, AppScopedApiProvider, type AppApi, type AppInfo } from './scopedApi'
+import { useCtx, AppScopedApiProvider, type AppApi, type AppInfo, type AppUpdate } from './scopedApi'
+import type { SlotPush } from './slotPush'
 // Re-exported as TYPES: the barrel<->vendor-stub parity gate counts value
 // exports, and a type vanishes at runtime, so an app author keeps these names
 // without the stub needing an entry it could not provide.
-export type { AppApi, AppApiError, AppInfo, AppPermissions } from './scopedApi'
+export type { AppApi, AppApiError, AppInfo, AppPermissions, AppUpdate } from './scopedApi'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -92,7 +93,7 @@ const WS_SLOT_SCOPED_EVENTS = new Set([
   // Voice
   'voice_chunk', 'voice_complete', 'voice_error',
   // Approvals and question cards
-  'approval', 'approval_resolved', 'question_card',
+  'approval', 'approval_resolved', 'question_card', 'elicitation_resolved',
   // Subagent lifecycle
   'subagent_spawn', 'subagent_done', 'subagent_tool', 'subagent_chunk',
   'subagent_snapshot', 'subagent_status', 'subagent_queued',
@@ -400,7 +401,9 @@ import React from 'react'
  */
 export function AppApiProvider({
   appName,
+  appDisplayName,
   appVersion = '0.0.0',
+  appUpdate,
   allowedApiPaths,
   allowedEvents,
   active = true,
@@ -408,11 +411,22 @@ export function AppApiProvider({
   navigateFn,
   notifyFn,
   sessionKey,
+  slotPush,
   origin = 'external',
   children,
 }: {
   appName: string
+  /**
+   * What the user calls this app (the manifest's display name). `appName` is
+   * the app's ID and stays the key for permissions, event scoping and the
+   * developer-facing warnings; this is only for copy shown to the USER -- the
+   * permission-denied refusal row names the app by it. Omitted, the id is used.
+   */
+  appDisplayName?: string
   appVersion?: string
+  /** Cached update state for this app, forwarded to the scoped layer, which
+   *  publishes it as `info.update`. Omitted when the host has no answer. */
+  appUpdate?: AppUpdate
   allowedApiPaths: string[]
   navigateFn: (path: string) => void
   /** Optional since the scoped layer defaults them; see AppScopedApiProvider. */
@@ -433,13 +447,17 @@ export function AppApiProvider({
    * provide the real key so the backend's restricted-session guard can run.
    */
   sessionKey?: string
+  /** The host's per-slot change signal; forwarded to the scoped layer. */
+  slotPush?: SlotPush
   origin?: AppOrigin
   children: ReactNode
 }) {
   const existing = useAppIdentity()
   const scoped = React.createElement(AppScopedApiProvider, {
     appName,
+    appDisplayName,
     appVersion,
+    appUpdate,
     allowedApiPaths,
     allowedEvents,
     active,
@@ -447,6 +465,7 @@ export function AppApiProvider({
     navigateFn,
     notifyFn,
     sessionKey,
+    slotPush,
     children,
   })
   if (existing) return scoped
@@ -472,6 +491,8 @@ export { default as ChatPanel } from './ChatPanel'
 // `[STEERING …]` without rendering our transcript components.
 export * from './protocol'
 export { default as ChatEmbed } from './ChatEmbed'
+// The keys `ChatEmbed`'s `hide` prop accepts; any other string is a type error.
+export type { ChatEmbedHideKey } from './chatEmbedHide'
 export { default as ChatMessageList } from './ChatMessageList'
 // The transcript's row registry, so an app can add a row type or replace one
 // instead of forking the message list.

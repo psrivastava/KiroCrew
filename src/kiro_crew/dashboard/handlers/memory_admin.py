@@ -49,6 +49,7 @@ from kiro_crew.memory_stores import (
     declared_store_names,
     owned_store_path,
 )
+from kiro_crew.validation import clamp_query_offset
 
 from ._shared import (
     _admin_store,
@@ -238,8 +239,9 @@ def _list_stores_blocking() -> list[dict[str, Any]]:
         # reserved so a new same-named member cannot claim the old memory), but
         # no route can read it: every content request fails the member lookup.
         # Listing it under the dead crew's name gives the picker a row whose
-        # every click is a 503, so the picker omits it; ``kirocrew memory scan``
-        # and ``doctor`` still see the record.
+        # every click is a 503, so the picker omits it. The record stays in
+        # ``memory_stores``, so ``kirocrew memory backups`` still lists it;
+        # ``memory backup`` and ``doctor`` cover living members' stores only.
         owner_id = getattr(record, "owner_member_id", "")
         if getattr(record, "memory_version", 1) == 2 and (
             not isinstance(owner_id, str) or owner_id not in living_ids
@@ -316,7 +318,8 @@ async def api_memory_retired(request: web.Request) -> web.Response:
     # first ``init()``.
     try:
         limit = min(int(request.query.get("limit", str(DEFAULT_RETIRED_PAGE))), MAX_RETIRED_PAGE)
-        offset = int(request.query.get("offset", "0"))
+        # Clamped before the store binds it: see ``clamp_query_offset``.
+        offset = clamp_query_offset(int(request.query.get("offset", "0")))
     except (ValueError, TypeError):
         return web.json_response(
             {"error": "limit/offset must be integers", "code": "invalid_pagination"}, status=400
@@ -327,9 +330,7 @@ async def api_memory_retired(request: web.Request) -> web.Response:
         return _store_unavailable(store)
     # Offload: the read serializes on the store's _db_lock, and a worker holding
     # it would otherwise block the gateway event loop here.
-    rows = await asyncio.to_thread(
-        vectors.get_retired_episodic, limit=max(1, limit), offset=max(0, offset)
-    )
+    rows = await asyncio.to_thread(vectors.get_retired_episodic, limit=max(1, limit), offset=offset)
     retired = [
         {
             "id": row.get("id"),

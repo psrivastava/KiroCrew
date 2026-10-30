@@ -146,8 +146,9 @@ jobs:
     timeout-minutes: 15
     steps:
       # The scan script, the withheld-verdict republisher, and the
-      # disposition gate the republisher shells out to -- plus the two sibling
-      # modules pr_status.py loads (_review_contract.py, green_age.py). sparse-
+      # disposition gate the republisher shells out to -- plus the modules
+      # pr_status.py loads (green_age.py and its owners pr_status_issue_links.py
+      # and pr_status_verdict.py, which loads _review_contract.py). sparse-
       # checkout with cone mode off is what makes a single-file path list legal,
       # and persist-credentials: false leaves no token in the worktree -- nothing
       # here runs git against the remote.
@@ -160,6 +161,8 @@ jobs:
             src/kiro_crew/builtin_skills/kirocrew-dev/kirocrew-prepare-pr/scripts/pr_status.py
             src/kiro_crew/builtin_skills/kirocrew-dev/kirocrew-prepare-pr/scripts/_review_contract.py
             src/kiro_crew/builtin_skills/kirocrew-dev/kirocrew-prepare-pr/scripts/green_age.py
+            src/kiro_crew/builtin_skills/kirocrew-dev/kirocrew-prepare-pr/scripts/pr_status_issue_links.py
+            src/kiro_crew/builtin_skills/kirocrew-dev/kirocrew-prepare-pr/scripts/pr_status_verdict.py
           sparse-checkout-cone-mode: false
           persist-credentials: false
 
@@ -394,6 +397,27 @@ jobs:
             newest_check="$(jq -r '.newest_completed_check_at // empty' <<<"$row")"
             newest_fail="$(jq -r '.newest_failed_check_at // empty' <<<"$row")"
 
+            # Newest human review submission or dismissal on the pull request.
+            # Readiness blocks on a changes-requested review of the head. A
+            # review reaches pr-readiness.yml through the Sensitive Change
+            # Review run it starts. This is the path for a review whose run
+            # never starts (a newer event on the same PR cancelled it while
+            # queued) and for a readiness run that is cancelled or cannot
+            # read. The success and
+            # failure arms count it against the same floor as check evidence in
+            # the pending arm -- the publication stamp minus
+            # publish_lag_seconds -- because a review landing inside the
+            # evaluate-to-publish gap pre-dates the stamp but was never read.
+            # The pending arm ignores it: a pending verdict already holds
+            # merge, and the check completion that resolves it re-reads the
+            # reviews. A missing timeline (the scan could not
+            # read it) is no evidence, never invented staleness.
+            newest_review="$(jq -r '.newest_review_at // empty' <<<"$row")"
+            review_epoch=0
+            if [ -n "$newest_review" ]; then
+              review_epoch="$(date -u -d "$newest_review" +%s 2>/dev/null || echo 0)"
+            fi
+
             # A rollup page the scan could not read leaves this evidence PARTIAL.
             # Evaluate anyway: missing evidence can only fail to prove a verdict
             # stale, never invent staleness, so the worst case is a rescue delayed
@@ -514,10 +538,20 @@ jobs:
                 # (see pending_min_age_seconds), which is what carries a
                 # rescue's own republish past the same check on the next tick.
                 if [ "$newest_epoch" -le $(( updated_epoch - publish_lag_seconds )) ]; then
-                  # No evidence. ONE status-description read classifies this
-                  # pending for both recoveries that depend on it.
+                  # No evidence. Both recoveries below are aged against
+                  # STALE_MINUTES, so a pending younger than that is left alone
+                  # BEFORE the status-description read: a young pending in the
+                  # shared pool costs no REST call per tick.
+                  if [ "$age" -lt "$stale_seconds" ]; then
+                    echo "PR #$number: PR Readiness pending for ${age}s at $sha but no" \
+                      "check completed within ${publish_lag_seconds}s of it being published;" \
+                      "a recompute would re-derive the same verdict, so not re-firing."
+                    continue
+                  fi
+                  # ONE status-description read classifies this pending for
+                  # both recoveries that depend on it.
                   rs_desc="$(readiness_description "$sha")"
-                  # A pending that an advisory lane owes this head a
+                  # A pending that an whole-design lane owes this head a
                   # verdict it withheld. A recompute of THIS aggregator cannot
                   # fix it -- the lane's check-run is already `success`, so the
                   # recompute re-derives the same named pending -- so instead of
@@ -548,8 +582,7 @@ jobs:
                   # newest completion -- is handled immediately, and adding the
                   # read to every pending to close the gap is the per-PR cost the
                   # sweep's GraphQL rebuild exists to avoid.
-                  if [ "$age" -ge "$stale_seconds" ] \
-                    && readiness_has_unpublished_verdict "$rs_desc"; then
+                  if readiness_has_unpublished_verdict "$rs_desc"; then
                     echo "PR #$number: PR Readiness names a withheld advisory verdict at $sha;" \
                       "re-running the owing lane(s) to republish it."
                     python3 .github/scripts/republish_withheld_verdict.py \
@@ -559,7 +592,7 @@ jobs:
                   # The one PENDING that still deserves an aggregator nudge here
                   # is the read-failure class, and it is aged against
                   # STALE_MINUTES, not the lag -- see the note above.
-                  if [ "$age" -lt "$stale_seconds" ] || ! readiness_is_read_failure "$rs_desc"; then
+                  if ! readiness_is_read_failure "$rs_desc"; then
                     echo "PR #$number: PR Readiness pending for ${age}s at $sha but no" \
                       "check completed within ${publish_lag_seconds}s of it being published;" \
                       "a recompute would re-derive the same verdict, so not re-firing."
@@ -609,6 +642,13 @@ jobs:
                 # the same second as the publish does not look like new evidence.
                 if [ "$newest_epoch" -gt $(( updated_epoch + 5 )) ]; then
                   reason="failure published at $updated_at but a check completed later at $newest_check"
+                elif [ "$age" -ge "$publish_lag_seconds" ] \
+                  && [ "$review_epoch" -gt $(( updated_epoch - publish_lag_seconds )) ]; then
+                  # Review evidence: an approval, a re-review or a dismissal can
+                  # clear a changes-requested red. Examined only once the verdict
+                  # is lag old, so the recompute's own republish lands past the
+                  # same review and the nudge fires once per review, not per tick.
+                  reason="failure published at $updated_at but a review was submitted or dismissed at $newest_review"
                 else
                   # Mode 5: COMMENT evidence. Since #6658 readiness also fails on
                   # a disposition-rule violation, so the verdict now depends on
@@ -708,6 +748,13 @@ jobs:
                 fi
                 if [ "$newest_fail_epoch" -gt $(( updated_epoch + 5 )) ]; then
                   reason="$state published at $updated_at but a check FAILED later at $newest_fail"
+                elif [ "$age" -ge "$publish_lag_seconds" ] \
+                  && [ "$review_epoch" -gt $(( updated_epoch - publish_lag_seconds )) ]; then
+                  # The PERMITTING direction: a changes-requested review after a
+                  # green verdict leaves the required status green over a head a
+                  # reviewer rejected. Same lag-old gate as the failure arm, so
+                  # each review is counted once.
+                  reason="$state published at $updated_at but a review was submitted or dismissed at $newest_review"
                 else
                   # Mode 5 in the PERMITTING direction, and this is the half that
                   # actually matters. A writer can post a rule-violating
@@ -777,8 +824,37 @@ jobs:
           [ -s "$stale_file" ] && stale_total="$(wc -l <"$stale_file" | tr -d ' ')"
           echo "Found $stale_total stale PR Readiness status(es); dispatching oldest-first."
 
+          # Skip set for the saturation-cancel loop. When a dispatched run is
+          # still QUEUED -- waiting for a runner -- the next sweep tick dispatches
+          # again into the same concurrency group, which GitHub cancels the queued
+          # run to satisfy: only one pending run is kept per group, regardless of
+          # cancel-in-progress. Build a set of (pr, sha) pairs that already have a
+          # queued or in-progress workflow_dispatch run and skip them.
+          #
+          # pr-readiness.yml stamps its run-name as "PR-wd-{pr}-{sha}" for
+          # workflow_dispatch events; display_title reflects that in the list
+          # endpoint response directly, with no per-run follow-up call. Active
+          # Paginated with --slurp across all pages so no active run is missed.
+          # Runs dispatched before run-name was on the default branch carry
+          # display_title: 'PR Readiness' and do not match; the first sweep tick
+          # after this merges behaves the old way for those. From the second tick
+          # on, newly dispatched runs carry PR-wd-{pr}-{sha} and the set is live.
+          active_wd_json="$(gh api \
+            "repos/$REPO/actions/workflows/pr-readiness.yml/runs?event=workflow_dispatch&per_page=100" \
+            --paginate --slurp 2>/dev/null)" \
+            || { echo "::warning::Failed to list active dispatch runs; active-run skip check disabled for this tick."; active_wd_json="[]"; }
+          active_wd_pairs="$(mktemp)"
+          jq -r '[.[].workflow_runs[]?
+                   | select(.status == "queued" or .status == "in_progress")
+                   | .display_title
+                   | select(test("^PR-wd-[0-9]+-[0-9a-f]{40}$"))
+                   | capture("^PR-wd-(?<pr>[0-9]+)-(?<sha>[0-9a-f]+)$")
+                   | "\(.pr)::\(.sha)"]
+                 | .[]' <<<"$active_wd_json" >>"$active_wd_pairs" || true
+
           dispatched=0
           skipped_cap=0
+          skipped_active=0
 
           # Second pass: dispatch OLDEST-stale-first (numeric sort ascending on
           # the staleness epoch in column 1). The longest-frozen PR is always
@@ -787,6 +863,12 @@ jobs:
             [ -n "$number" ] || continue
             if [ "$dispatched" -ge "$MAX_DISPATCH" ]; then
               skipped_cap=$(( skipped_cap + 1 ))
+              continue
+            fi
+            # Skip this pair if an active dispatch already covers it.
+            if grep -Fxq "${number}::${sha}" "$active_wd_pairs" 2>/dev/null; then
+              echo "PR #$number: a dispatch for $sha is already queued or in progress; skipping."
+              skipped_active=$(( skipped_active + 1 ))
               continue
             fi
             echo "PR #$number: PR Readiness $reason at $sha -> re-firing recompute."
@@ -798,6 +880,6 @@ jobs:
             fi
           done < <(sort -n -k1,1 "$stale_file")
 
-          rm -f "$stale_file"
+          rm -f "$stale_file" "$active_wd_pairs"
 
-          echo "Re-fired $dispatched recompute(s); $skipped_cap stale PR(s) deferred to next sweep by MAX_DISPATCH=$MAX_DISPATCH."
+          echo "Re-fired $dispatched recompute(s); $skipped_active stale PR(s) skipped (dispatch already active); $skipped_cap stale PR(s) deferred to next sweep by MAX_DISPATCH=$MAX_DISPATCH."

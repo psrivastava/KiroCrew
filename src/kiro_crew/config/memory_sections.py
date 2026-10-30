@@ -17,6 +17,13 @@ from kiro_crew.effort import EFFORT_LEVELS
 
 logger = logging.getLogger("kiro_crew.config.loader")
 
+#: Ceiling of ``memory.startup_recall_timeout_secs``. The dashboard's early embed
+#: keeps its own allowance above it, so a build never outwaits the embed it joined.
+STARTUP_RECALL_TIMEOUT_MAX_SECS = 10.0
+
+#: ``memory.kind_routing`` values; :mod:`kiro_crew.memory_kind_routing` says what each does.
+KIND_ROUTING_MODES = ("off", "shadow", "enforce")
+
 
 @dataclass
 class MemoryConfig:
@@ -46,9 +53,10 @@ class MemoryConfig:
             "CPU threads for an explicit memory query or user-started re-embedding. "
             "Defaults to 4, capped one core below the CPUs this process may run on -- "
             "never below one thread, so a single-core host still embeds -- to leave the "
-            "event loop a core wherever there is one to spare; 4 means that default, "
-            "so pinning threads where the process may use 4 or fewer CPUs takes "
-            "another number. Any other "
+            "event loop a core wherever there is one to spare, and 6 where the process "
+            "may use 12 or more CPUs; 4 means that default, "
+            "so 4 cannot be pinned where the process may use 4 or fewer, or 12 or "
+            "more CPUs (there a 4 runs 6; set 3 or 5 to stay low). Any other "
             "setting is honoured up to that count, which a CPU-set restriction "
             "(--cpuset-cpus, taskset) narrows; a CFS quota (--cpus, cpu.max) sets "
             "no mask and is not seen, while a limit a scheduler turns into an "
@@ -85,6 +93,25 @@ class MemoryConfig:
             "30-second pause and so runs hotter than the configured share. 1.0 runs "
             "flat out. Clamped to [0.05, 1.0]; a sweep a user explicitly starts from "
             "Settings is never paced.",
+        ),
+    )
+    embedding_idle_evict_secs: int = field(
+        default=3600,
+        metadata=_meta(
+            "Unload Embedding Model When Idle (seconds)",
+            "Seconds without any embedding before the embedding model is unloaded "
+            "from memory. The next search or memory write loads it again, which takes "
+            "a few seconds. 0 keeps the model loaded.",
+        ),
+    )
+    embedding_child_process: bool = field(
+        default=False,
+        metadata=_meta(
+            "Run Embeddings in a Child Process",
+            "Load the embedding model and run inference in a separate low-priority "
+            "process, so embedding work never competes with the gateway itself. Off "
+            "by default: the model runs inside the gateway. Takes effect at the next "
+            "model load.",
         ),
     )
     embed_model_url: str = field(
@@ -231,6 +258,39 @@ class MemoryConfig:
             "edits and deletions stay available.",
         ),
     )
+    writes_enabled: bool = field(
+        default=True,
+        metadata=_meta(
+            "Memory Writes Enabled",
+            "Off: no automatic memory writes (lessons, consolidation extraction, "
+            "task-runner lessons), the same writers Persistence Enabled stops, "
+            "while stored memory and lessons are still injected into new sessions "
+            "and memory_recall still answers. Incognito is unaffected. Explicit "
+            "dashboard edits and deletions stay available.",
+        ),
+    )
+    lesson_extraction_enabled: bool = field(
+        default=True,
+        metadata=_meta(
+            "Lesson Extraction Enabled",
+            "Off: history consolidation and the task runner save no extracted "
+            "lessons; every other memory write, learn_add and injection carry on.",
+        ),
+    )
+    kind_routing: str = field(
+        default="off",
+        metadata=_meta(
+            "Consolidation Kind Routing",
+            "Whether consolidation tags each project.* fact with a kind (fact, event "
+            "or state) and what it does with it. 'off' (default) keeps today's "
+            "prompt and writes. 'shadow' writes every fact as before and only "
+            "logs, within fixed size caps, what routing would do. 'enforce' skips a "
+            "state item (a PR, CI or branch status that GitHub, git or the work "
+            "ledger already holds) and writes facts and events as before. Stored "
+            "facts are never changed.",
+            enum=list(KIND_ROUTING_MODES),
+        ),
+    )
     inject_memory: bool = field(
         default=True,
         metadata=_meta(
@@ -269,6 +329,19 @@ class MemoryConfig:
             "Requires inject_memory.",
         ),
     )
+    startup_recall_timeout_secs: float = field(
+        default=1.0,
+        metadata=_meta(
+            "Session-Start Recall Wait (seconds)",
+            "How long a new dashboard chat's first message waits for its own "
+            "embedding, which the dashboard starts ahead of the session-start build, "
+            "beside session startup when the chat has to start its session. The "
+            "embedding ranks the memory activity and lessons the session starts with "
+            "by meaning; past the wait they are ranked by keyword. 0 turns the early "
+            "embedding off, and the build embeds the message itself, as on other "
+            "surfaces. Clamped to [0, 10].",
+        ),
+    )
     migrated: bool = field(
         default=False,
         metadata=_meta("Migrated", "Whether memory has been migrated to vector store."),
@@ -284,6 +357,39 @@ class MemoryConfig:
 #: widgets). ``svg`` is excluded because ``.svg`` is not in
 #: ``FileReader.SUPPORTED``.
 DEFAULT_AUTO_INGEST_ARTIFACT_KINDS = ["markdown", "text", "html", "json"]
+
+
+def memory_writes_off_key(memory: object) -> str | None:
+    """The config key that stops automatic memory writes, or None when writes run.
+
+    ``memory.persistence_enabled`` stops writes and injection together;
+    ``memory.writes_enabled`` stops writes alone. Every automatic writer gates on
+    this one answer, so the two switches cover the same writers. Read with
+    ``getattr`` so a partial config stand-in that predates a key counts it as on.
+    """
+    if not getattr(memory, "persistence_enabled", True):
+        return "memory.persistence_enabled"
+    if not getattr(memory, "writes_enabled", True):
+        return "memory.writes_enabled"
+    return None
+
+
+def kind_routing_mode_from(raw: object) -> str:
+    """A stored ``memory.kind_routing``, or the field default for anything unknown."""
+    if isinstance(raw, str) and raw in KIND_ROUTING_MODES:
+        return raw
+    return str(field_default(MemoryConfig, "kind_routing"))
+
+
+def lesson_extraction_enabled(memory: object) -> bool:
+    """Whether automatic lesson extraction may save lessons.
+
+    False when ``memory.lesson_extraction_enabled`` is off, or when automatic
+    writes are off as a whole.
+    """
+    return memory_writes_off_key(memory) is None and bool(
+        getattr(memory, "lesson_extraction_enabled", True)
+    )
 
 
 def _coerce_embedding_provider(raw: str) -> str:
@@ -411,8 +517,10 @@ class KnowledgeConfig:
         default_factory=list,
         metadata=_meta(
             "Doc-Ingest Host Allowlist",
-            "Exact hostnames whose links may be fetched by KIROCREW ITSELF and "
-            "ingested, for an edition that wires a server-side doc-link scanner. "
+            "Exact hostnames whose pages Kiro Crew ITSELF may fetch and ingest: "
+            "a web-page source added under Knowledge -> Add Source. https only, "
+            "port 443, no subdomain matching; the host must resolve to public "
+            "addresses and a redirect may not leave it. "
             "Empty = fetch nothing (SSRF-safe deny-by-default). This governs only "
             "that server-fetch path -- it does NOT gate 'Auto-Add Documents' "
             "above, where the agent has already fetched the content under its own "
@@ -695,7 +803,11 @@ class SkillsConfig:
             "Extra Skill Paths",
             "Additional directories to scan for skills. Supports ~ expansion. "
             "Skills from extra_paths are read-only (trigger matching + loading). "
-            "Local ~/.kiro/crew/skills/ takes precedence for duplicate names.",
+            "Local ~/.kiro/crew/skills/ takes precedence for duplicate names. "
+            "A skill folder linked into the skills directory from an outside "
+            "location is not followed through the link; to load it, add the "
+            "target's parent directory here. Otherwise it is skipped and a "
+            "warning naming the target is logged.",
         ),
     )
     project_skills_enabled: bool = field(

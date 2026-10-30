@@ -2,7 +2,7 @@
 
 Unit-level cover for :mod:`kiro_crew.dashboard.arrival_folders`. The handler's own
 use of it (both arrival routes, the late resolution, the mid-import repair) is
-pinned in ``test/test_session_transfer.py``; what is pinned HERE is the resolution
+pinned in ``test/test_session_transfer_landing.py``; what is pinned HERE is the resolution
 itself, and specifically the five folder-lifecycle constraints
 ``docs/request-for-change/rfc-arrival-provenance-filing.md`` §5 records. Each of
 those constraints is a real defect class in the folder lifecycle rather than in
@@ -808,6 +808,21 @@ async def test_a_placement_refused_under_the_lock_records_nothing(tmp_path, monk
     """
     from aiohttp.test_utils import TestClient, TestServer
     from chat_test_helpers import _make_folder_app, _make_state
+
+    # chat_handlers and chat_fork copy _unhide_folder from chat_folders when they are
+    # first imported, and the resume, slot-create and fork handlers read those copies.
+    # _make_folder_app imports kiro_crew.dashboard.chat, which loads both. If that
+    # first import happened under the patch below, the stub would stay in those
+    # modules after monkeypatch undoes the patch, and every later test on this
+    # worker would see its folders as deleted. Import them first so they hold the
+    # real function.
+    import kiro_crew.dashboard.chat  # noqa: F401
+    import kiro_crew.dashboard.chat_fork as chat_fork
+    import kiro_crew.dashboard.chat_handlers as chat_handlers
+    from kiro_crew.dashboard.chat_folders_records import _unhide_folder
+
+    assert chat_handlers._unhide_folder is _unhide_folder
+    assert chat_fork._unhide_folder is _unhide_folder
 
     monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
     monkeypatch.setattr(

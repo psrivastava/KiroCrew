@@ -11,7 +11,6 @@ from typing import Any, NamedTuple
 from kiro_crew.agent_spec_format import NATIVE_SKILL_ALIAS_PREFIX
 from kiro_crew.config.loader import (
     ResolvedBindings,
-    dispatch_kiro_agent,
     resolve_agent_bindings,
 )
 from kiro_crew.execution_context import (
@@ -103,16 +102,65 @@ def _source_of_view(name: str) -> str:
     return name if source is None else source
 
 
+def _member_record_agent(bound_kiro_agent: str, template_id: str) -> str:
+    """The agent a ``member`` record's chat runs.
+
+    The conductor when the member's CURRENT bound ``kiro_agent`` from config owns a
+    crewmate file (``mate_worker.member_record_template``), whatever older template
+    the record kept (a pre-conductor ``kirocrew-conductor``). Any other member runs
+    its recorded *template_id* through ``mate_worker.member_chat_agent``, so a
+    record naming the crewmate's own file still chats on the conductor and a
+    shared-agent crewmate keeps the agent its thread recorded. No record is
+    rewritten.
+    """
+    from kiro_crew.mate_worker import (
+        MATE_CONDUCTOR_AGENT,
+        member_chat_agent,
+        member_record_template,
+    )
+
+    if member_record_template(template_id, bound_kiro_agent) == MATE_CONDUCTOR_AGENT:
+        return MATE_CONDUCTOR_AGENT
+    return member_chat_agent(template_id)
+
+
 def resolve_session_agent_bindings(
-    resolver, config, session_key: str, agent_name: str | None, *project_dir
+    resolver,
+    config,
+    session_key: str,
+    agent_name: str | None,
+    *project_dir,
+    agent_kind: str = "",
 ) -> ResolvedBindings:
+    """Bindings for a session: its execution record when one exists, else the
+    slot's own name resolved in the namespace the slot was STAMPED in.
+
+    *agent_kind* is the slot's ``agent_kind`` (``"member"`` / ``"template"`` /
+    ``""``). It decides only the record-less resolve: a record carries its own
+    kind and stays authoritative. Without it a template-stamped slot whose name a
+    crewmate also uses resolves member-first and binds that crewmate's store and
+    pin to a chat that never picked it; the owner's create writes the record at
+    once, but a non-owner create (an app token) leaves the first send to resolve
+    from the stamp alone.
+    """
     execution = read_session_execution(session_key)
-    selected = agent_name or config.default_agent
+    # A crewmate's worker runs on its crewmate's backend: publishing the key here,
+    # on the read every turn and resume prefetch makes before allocating, is what
+    # the backend selection then reads (``members.select_provider_backend``).
+    from kiro_crew.mate_worker import note_worker_session
+
+    note_worker_session(session_key, execution)
+    # No name and no record is the default TEMPLATE, not the default crewmate
+    # alias: the resolver answers an empty name with that session.
+    selected = agent_name or ""
+    # The member's CURRENT bound ``kiro_agent`` from config, when its record names one.
+    bound_kiro_agent = ""
     if execution is not None:
         # Member display labels may change; the durable ID and store do not.
         if execution.member_id is not None and execution.selection_kind == "member":
             try:
-                selected, _ = member_config_for_id(config, execution.member_id)
+                selected, member_cfg = member_config_for_id(config, execution.member_id)
+                bound_kiro_agent = getattr(member_cfg, "kiro_agent", "") or ""
             except UnknownMemoryStore:
                 selected = execution.selection_name or execution.member_id
         else:
@@ -123,28 +171,29 @@ def resolve_session_agent_bindings(
         # crewmate as its template; answering against the CALLER's config
         # snapshot keeps this resolve consistent with the config it is given.
         execution = adopt_removed_synced_crewmate(execution, config)
+    if execution is not None:
+        kind_kwargs = {"selection_kind": execution.selection_kind, "execution_context": execution}
+    elif agent_kind in ("member", "template"):
+        kind_kwargs = {"selection_kind": agent_kind}
+    else:
+        kind_kwargs = {}
     try:
         bindings = resolver(
             config,
             selected,
             *project_dir,
             validate_memory_files=False,
-            **(
-                {"selection_kind": execution.selection_kind, "execution_context": execution}
-                if execution
-                else {}
-            ),
+            **kind_kwargs,
         )
     except StopIteration as exc:
         raise UnknownMemoryStore("Conversation agent selection is unavailable") from exc
     if execution is not None:
         bindings.memory_store_name = execution.store.store_id
-        # Both recorded kinds can need a skill-view repair. Only a MEMBER's
-        # template id came from a crewmate row that may hold a package filename;
-        # a template id is already the provider selection and must stay exact.
+        # Both recorded kinds can need a skill-view repair. A template id is
+        # already the provider selection and must stay exact.
         kiro_agent = _source_of_view(execution.template_id)
         if execution.selection_kind == "member":
-            kiro_agent = dispatch_kiro_agent(kiro_agent)
+            kiro_agent = _member_record_agent(bound_kiro_agent, kiro_agent)
         bindings.kiro_agent = kiro_agent
         bindings.execution_context = execution
     bindings.selection_revision = _revision(execution)
@@ -159,10 +208,11 @@ def record_provider_agent_switch(config, session_key, prior_agent, new_agent, pr
     selected.selection_revision = _revision(prior)
     if prior is not None:
         # A provider template event changes behavior, never the memory owner.
-        # A session with no member id (the ordinary chat, recorded as the default
-        # alias with kind "member") now selects the TEMPLATE, so its kind must say
-        # so too. Left as "member", the next turn resolves the template name in
-        # the member namespace, where an agent that is only a spec file (not a
+        # A session with no member id (an ordinary chat on the default template,
+        # or a legacy one recorded as the default alias with kind "member")
+        # selects the TEMPLATE, so its kind must say so too.
+        # Left as "member", the next turn resolves the template name in the
+        # member namespace, where an agent that is only a spec file (not a
         # config.agents key) is unresolvable, and the turn is refused.
         unowned = prior.member_id is None
         selected.execution_context = dataclass_replace(
@@ -180,11 +230,21 @@ def record_provider_agent_switch(config, session_key, prior_agent, new_agent, pr
     return record_agent_selection(session_key, new_agent, selected, vouch=prior is None)
 
 
+def _template_selection(bindings, kind: str) -> str:
+    """What a template session with no name of its own selected: its template.
+
+    A plain session is the default template; it reports no alias, so the
+    template it runs IS the selection, and recording it keeps the conversation
+    on that template even if a crewmate of the same name is discovered later.
+    """
+    return bindings.kiro_agent if kind == "template" else ""
+
+
 def record_agent_selection(
     session_key, agent_name, bindings, *, replace=False, memory_mode=None, vouch=False
 ):
     kind = getattr(bindings, "selection_kind", "")
-    selected = agent_name or bindings.resolved_alias
+    selected = agent_name or bindings.resolved_alias or _template_selection(bindings, kind)
     if kind not in ("member", "template") or not selected or not bindings.requested_resolved:
         return None
     prior = read_session_execution(session_key)

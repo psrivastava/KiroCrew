@@ -24,6 +24,7 @@ import logging
 from aiohttp import web
 
 from kiro_crew.dashboard.handlers import mcp as _mcp
+from kiro_crew.dashboard.handlers._shared import rebuild_agent_spec
 from kiro_crew.dashboard.handlers.mcp import (
     _find_server_spec_anywhere,
     _get_kirocrew_entry,
@@ -342,6 +343,14 @@ def _load_kirocrew_config_strict() -> dict | None:
     return data
 
 
+def _conflicting_names(names: dict[str, dict]) -> list[str]:
+    """The submitted names some config scope already holds, sorted.
+
+    Reads every scope's config file, so the caller runs it in a worker thread.
+    """
+    return sorted(n for n in names if _find_server_spec_anywhere(n) is not None)
+
+
 async def _record_owner_servers(entries: dict[str, dict]) -> None:
     """Record the owner's remote servers so the dashboard sign-in can reach them.
 
@@ -358,15 +367,13 @@ async def _record_owner_servers(entries: dict[str, dict]) -> None:
         logger.warning("could not record owner MCP servers %s", sorted(entries), exc_info=True)
 
 
-async def _rebuild_agent_config() -> None:
-    """Best-effort agent-config rebuild so changes load on the next session."""
-    try:
-        # circular import: kiro_crew.agent imports dashboard handlers.
-        from kiro_crew.agent import rebuild_agent_config
+async def _rebuild_agent_config() -> bool:
+    """Rebuild the agent spec so the change loads on the next session.
 
-        await asyncio.to_thread(rebuild_agent_config)
-    except Exception:
-        logger.warning("rebuild_agent_config failed after MCP custom write", exc_info=True)
+    True only when the spec was rewritten; the caller reports a False to the
+    dashboard instead of claiming the change is live.
+    """
+    return await asyncio.to_thread(rebuild_agent_spec, "MCP custom write")
 
 
 async def api_mcp_custom_add(request: web.Request) -> web.Response:
@@ -419,8 +426,10 @@ async def api_mcp_custom_add(request: web.Request) -> web.Response:
     async with _get_mcp_lock():
         # Load once, strictly: a malformed existing file must fail the
         # request, never be coerced to {} and overwritten (that would
-        # destroy every configured server "successfully").
-        data = _load_kirocrew_config_strict()
+        # destroy every configured server "successfully").  The read and the
+        # collision scan below are blocking file IO, so like the write they
+        # run in a worker thread while the lock is held.
+        data = await asyncio.to_thread(_load_kirocrew_config_strict)
         if data is None:
             sel().log_api_access(
                 caller="dashboard",
@@ -436,7 +445,7 @@ async def api_mcp_custom_add(request: web.Request) -> web.Response:
                 },
                 status=500,
             )
-        conflicts = sorted(n for n in cleaned if _find_server_spec_anywhere(n) is not None)
+        conflicts = await asyncio.to_thread(_conflicting_names, cleaned)
         if conflicts:
             sel().log_api_access(
                 caller="dashboard",
@@ -459,7 +468,7 @@ async def api_mcp_custom_add(request: web.Request) -> web.Response:
         await _mcp._offload_config_write(_mcp._atomic_write, _mcp._kirocrew_mcp_json(), data)
 
     await _record_owner_servers(cleaned)
-    await _rebuild_agent_config()
+    spec_rewritten = await _rebuild_agent_config()
 
     added = sorted(cleaned)
     sel().log_api_access(
@@ -469,7 +478,9 @@ async def api_mcp_custom_add(request: web.Request) -> web.Response:
         source="dashboard",
         resources=f"custom:{','.join(added)} enabled={enable}",
     )
-    return web.json_response({"ok": True, "added": added, "enabled": enable})
+    return web.json_response(
+        {"ok": True, "added": added, "enabled": enable, "agent_spec_rewritten": spec_rewritten}
+    )
 
 
 async def api_mcp_custom_get(request: web.Request) -> web.Response:
@@ -485,7 +496,7 @@ async def api_mcp_custom_get(request: web.Request) -> web.Response:
         return web.json_response({"error": f"invalid server name '{name[:64]}'"}, status=400)
 
     async with _get_mcp_lock():
-        entry = _get_kirocrew_entry(name)
+        entry = await asyncio.to_thread(_get_kirocrew_entry, name)
     if entry is None:
         return web.json_response({"error": f"server '{name}' not found"}, status=404)
 
@@ -551,7 +562,7 @@ async def api_mcp_custom_update(request: web.Request) -> web.Response:
     submitted = body.get("spec")
 
     async with _get_mcp_lock():
-        existing = _get_kirocrew_entry(name)
+        existing = await asyncio.to_thread(_get_kirocrew_entry, name)
         if existing is None:
             # Not in <data home>/mcp.json — either unknown, or managed by an
             # external scope this endpoint deliberately does not mutate.
@@ -628,7 +639,7 @@ async def api_mcp_custom_update(request: web.Request) -> web.Response:
         return web.json_response({"error": f"server '{name}' not found"}, status=404)
 
     await _record_owner_servers({name: spec})
-    await _rebuild_agent_config()
+    spec_rewritten = await _rebuild_agent_config()
 
     sel().log_api_access(
         caller="dashboard",
@@ -637,4 +648,4 @@ async def api_mcp_custom_update(request: web.Request) -> web.Response:
         source="dashboard",
         resources=f"custom:{name}",
     )
-    return web.json_response({"ok": True, "name": name})
+    return web.json_response({"ok": True, "name": name, "agent_spec_rewritten": spec_rewritten})

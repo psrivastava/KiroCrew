@@ -6,7 +6,7 @@ was later hoisted to a shared constant and added to chat_runner.py's
 queue-drain path, but the primary user-typed turn (chat_handlers.py), the
 cron injection path (handlers/messaging.py), the Slack/dashboard nudge path
 (slack/gateway.py:_handle_nudge), and the cron-script delivery path
-(slack/gateway.py:_deliver_script_result) remained unwrapped — depending on
+(slack/gateway_runtime/cron_exec.py:_deliver_script_result) remained unwrapped — depending on
 the inner ACP _DEFAULT_PROMPT_TIMEOUT (14400s) instead.
 
 This module verifies the cap value is correct AND that all helper-visible
@@ -29,13 +29,32 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+_CHAT_API = Path(__file__).resolve().parent.parent / "src" / "kiro_crew" / "dashboard" / "chat_api"
+_GATEWAY_RUNTIME = (
+    Path(__file__).resolve().parent.parent / "src" / "kiro_crew" / "slack" / "gateway_runtime"
+)
+
 # Source files known to contain ``_run_chat`` dispatches.  When a new
-# dispatch site lands in another file, add it here.
+# dispatch site lands in another file, add it here. The chat handlers and the
+# Slack gateway are scanned whole: each facade and every owner it composes.
 _DISPATCH_FILES = (
     "src/kiro_crew/dashboard/chat_handlers.py",
+    *(f"src/kiro_crew/dashboard/chat_api/{path.name}" for path in sorted(_CHAT_API.glob("*.py"))),
+    *sorted(
+        f"src/kiro_crew/dashboard/chat_turn/{_owner.name}"
+        for _owner in (
+            Path(__file__).resolve().parent.parent / "src/kiro_crew/dashboard/chat_turn"
+        ).glob("*.py")
+        if _owner.name != "__init__.py"
+    ),
     "src/kiro_crew/dashboard/chat_runner.py",
     "src/kiro_crew/dashboard/handlers/messaging.py",
+    "src/kiro_crew/dashboard/session_deliver.py",
     "src/kiro_crew/slack/gateway.py",
+    *(
+        f"src/kiro_crew/slack/gateway_runtime/{path.name}"
+        for path in sorted(_GATEWAY_RUNTIME.glob("*.py"))
+    ),
 )
 
 
@@ -45,7 +64,7 @@ def _src_root() -> Path:
 
 
 def test_cap_matches_inner_acp_prompt_timeout() -> None:
-    """CHAT_TURN_TIMEOUT must match acp/client.py:_DEFAULT_PROMPT_TIMEOUT.
+    """CHAT_TURN_TIMEOUT must match acp/client_timeouts.py:_DEFAULT_PROMPT_TIMEOUT.
 
     The dashboard layer's outer wall-clock cap should never bound below the
     transport layer's promised "longest legitimate turn" budget, otherwise
@@ -280,7 +299,7 @@ def _is_create_task_wrapped_run_chat_dispatch(node: ast.AST) -> bool:
 
 
 def test_dispatch_site_count_matches_expectation() -> None:
-    """Pin the expected number of helper-visible ``_run_chat`` sites at 7.
+    """Pin the expected number of helper-visible ``_run_chat`` sites at 4.
 
     If a new dispatch lands (or one is removed), this fails loudly so the
     contributor updates the PR description, the spec doc
@@ -299,8 +318,8 @@ def test_dispatch_site_count_matches_expectation() -> None:
             if "_run_chat(" in body:
                 total += 1
 
-    assert total == 7, (
-        f"Expected 7 helper-visible _run_chat dispatch sites, found {total}.  "
+    assert total == 4, (
+        f"Expected 4 helper-visible _run_chat dispatch sites, found {total}.  "
         "If you added or removed one, update:\n"
         "  - the PR description\n"
         "  - docs/system-specs/modules/learn-cron-dashboard.md (Per-turn timeout section)\n"

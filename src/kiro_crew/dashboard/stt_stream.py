@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import json
 import logging
 from typing import Any, AsyncIterator, Awaitable, Callable, Iterator
@@ -32,7 +33,9 @@ except ImportError:  # pragma: no cover — exercised by test_import_error_*
 
 from kiro_crew import aws_consent, stt
 from kiro_crew.config.loader import KiroCrewConfig
+from kiro_crew.config.sections import SttConfig
 from kiro_crew.dashboard.origin import check_origin, mark_audit_claimed
+from kiro_crew.extras import install_hint
 from kiro_crew.llm_helpers import run_bg_oneliner
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
@@ -53,6 +56,15 @@ PROVIDER_LOCAL = "local"
 # `apple` streams on-device via SpeechAnalyzer (macOS 26+), and `transcribe`
 # streams from AWS. The default is first.
 _STREAMING_PROVIDERS = (PROVIDER_LOCAL, "apple", "transcribe")
+
+
+def streaming_providers() -> tuple[str, ...]:
+    """Who may open ``/api/ws/stt``; see ``speech_providers.streaming_stt_names``."""
+    from kiro_crew import speech_providers
+
+    return speech_providers.streaming_stt_names(_STREAMING_PROVIDERS)
+
+
 # Cap per-WebSocket-frame size (128 KiB) — small enough to reject obvious
 # abuse, large enough for any reasonable 16 kHz PCM chunk cadence.
 _MAX_WS_MSG_SIZE = 128 * 1024
@@ -198,6 +210,10 @@ _MODEL_PROGRESS_INTERVAL_SECS = 2.0
 # being remapped, so one vocabulary covers the settings panel and the socket.
 _CODE_MAX_DURATION = "stt_max_duration_exceeded"
 _CODE_SESSION_FAILED = "stt_session_failed"
+# When the gateway's streaming gate refuses the WebSocket before the upgrade,
+# the client only sees a 503 — no error frame, no code. Sending an error frame
+# through the upgraded socket lets `STT_ERROR_KEY` map it to the right message.
+_CODE_STREAMING_DISABLED = "stt_streaming_disabled"
 # The one condition no existing code names: streaming Transcribe bills per audio
 # second, so the socket refuses without a recorded operator grant for this exact
 # profile+region. Distinct from `_CODE_SESSION_FAILED` because the fix is an
@@ -214,6 +230,10 @@ _CODE_VOCABULARY_REJECTED = "stt_transcribe_vocabulary_rejected"
 _CODE_AWS_ACCESS_DENIED = "stt_aws_access_denied"
 # The error type AWS returns for an authorization refusal.
 _AWS_ACCESS_DENIED_ERROR = "AccessDeniedException"
+# Mixed-language detection is configured, but the installed amazon-transcribe SDK
+# predates the parameters it needs. Distinct from `_CODE_SESSION_FAILED` because no
+# retry can help: the fix is upgrading the voice packages, or picking one language.
+_CODE_SDK_OUTDATED = "stt_transcribe_sdk_outdated"
 
 # ── Semantic endpointing (stt.endpointing, default off) ──
 # On each stable Transcribe `final`, a fast background model judges whether the
@@ -257,13 +277,15 @@ def _vocabulary_rejected(exc: BaseException, vocabulary: str) -> bool:
     service's ``BadRequestException`` (raised by ``start_stream_transcription``
     itself, before any audio is sent), and its message must name the vocabulary. A
     bad request for any other reason keeps the generic code, so an operator is
-    never sent to change a vocabulary that is not the problem.
+    never sent to change a vocabulary that is not the problem. The stem, not the
+    word: with mixed languages the vocabulary rides as ``VocabularyNames``, whose
+    refusals speak of "vocabularies".
     """
     if not vocabulary or _TranscribeBadRequest is None:
         return False
     if not isinstance(exc, _TranscribeBadRequest):
         return False
-    return "vocabulary" in str(getattr(exc, "message", "")).lower()
+    return "vocabular" in str(getattr(exc, "message", "")).lower()
 
 
 def _drop_task_result(task: "asyncio.Task[Any]") -> None:
@@ -648,6 +670,7 @@ async def _run_local_session(
             partial_interval_ms=cfg.stt.partial_interval_ms,
             idle_evict_secs=cfg.stt.idle_evict_secs,
             timeout_secs=cfg.stt.timeout_secs,
+            threads=cfg.stt.threads,
         )
 
     # The FIRST fatal cause wins. Both the duration cap and a failed send can end
@@ -756,7 +779,11 @@ async def _run_local_session(
     # fires when the user first reaches for the button. Streaming stays available on
     # the local provider, which is the whole feature; what is refused is the one
     # first-run window where it could only lose words.
-    pending = session.pending_download()
+    # Off the loop: `pending_download` resolves the model, and resolving the CUSTOM
+    # selection reads and validates `config.json` synchronously (see
+    # `models.resolve`). This runs on the websocket handler's task, so doing it
+    # inline stalled the gateway on the setting this feature adds.
+    pending = await asyncio.to_thread(session.pending_download)
     if pending is not None:
         await _send(
             {
@@ -789,7 +816,14 @@ async def _run_local_session(
     # visible one. Best-effort like every other pre-`ready` send. `pending_load` is
     # advisory (a concurrent session may change residency between the check and the
     # load), so this only ever adds or omits one announce — `prepare` still loads.
-    announced_load = session.pending_load()
+    #
+    # Off the loop for the same reason as `pending_download` above, and it is the
+    # same reason twice because it is the same call underneath: `pending_load`
+    # resolves the model too, and resolving the CUSTOM selection reads and validates
+    # `config.json` synchronously. `pending_download` returning None is exactly the
+    # path that reaches here, so leaving this one inline would have kept the stall
+    # this feature introduced on the cold-engine custom session.
+    announced_load = await asyncio.to_thread(session.pending_load)
     if announced_load:
         logger.info("Loading local speech model %s before first transcript", cfg.stt.model)
         await _send(
@@ -1152,6 +1186,50 @@ def _transcribe_start_failure(exc: Exception) -> tuple[str, str]:
     return "failed to start transcription", _CODE_SESSION_FAILED
 
 
+#: The ``start_stream_transcription`` keyword mixed-language detection needs. SDK
+#: 0.6.3 and later accept it; an older install raises ``TypeError`` on it.
+_IDENTIFY_MULTIPLE_LANGUAGES_KWARG = "identify_multiple_languages"
+
+
+def _client_identifies_languages(client: Any) -> bool:
+    """Whether *client*'s ``start_stream_transcription`` accepts mixed-language options.
+
+    Read from the method's own signature, so an outdated SDK is reported as the
+    package to upgrade instead of failing the stream with a ``TypeError`` that reads
+    as a service fault. A method taking ``**kwargs`` accepts it too.
+    """
+    try:
+        parameters = inspect.signature(client.start_stream_transcription).parameters
+    except (TypeError, ValueError):
+        return False
+    return _IDENTIFY_MULTIPLE_LANGUAGES_KWARG in parameters or any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values()
+    )
+
+
+def _transcribe_language_kwargs(stt_cfg: SttConfig) -> dict[str, Any]:
+    """The language and vocabulary arguments of a live Transcribe stream.
+
+    One language: ``language_code`` plus ``vocabulary_name``. Two or more
+    candidates (:attr:`SttConfig.transcribe_language_identification`): Amazon Transcribe
+    refuses a stream that names a ``LanguageCode`` beside
+    ``IdentifyMultipleLanguages``, so the code is None (the SDK then sends no header)
+    and a custom vocabulary travels as ``VocabularyNames``, the only vocabulary
+    parameter identification accepts. None, not ``""``, for an unset vocabulary: the
+    SDK omits the header only for None.
+    """
+    vocabulary = stt_cfg.transcribe_vocabulary or None
+    candidates = stt_cfg.transcribe_language_identification
+    if not candidates:
+        return {"language_code": stt_cfg.effective_language_code, "vocabulary_name": vocabulary}
+    return {
+        "language_code": None,
+        _IDENTIFY_MULTIPLE_LANGUAGES_KWARG: True,
+        "language_options": candidates,
+        "vocabulary_names": [vocabulary] if vocabulary else None,
+    }
+
+
 async def _run_apple_session(
     ws: web.WebSocketResponse,
     cfg: "KiroCrewConfig",
@@ -1176,6 +1254,58 @@ async def _run_apple_session(
             locale=cfg.stt.effective_language_code,
             sample_rate=STREAM_SAMPLE_RATE_HZ,
         )
+    await _drive_helper_session(
+        ws,
+        caller,
+        session,
+        endpointer,
+        start_failure_code=lambda: _apple_start_failure_code(cfg),
+        label="apple",
+    )
+
+
+async def _run_registered_session(
+    ws: web.WebSocketResponse,
+    cfg: "KiroCrewConfig",
+    request: web.Request,
+    caller: str,
+) -> None:
+    """Drive an edition provider's ``open_stream()`` session through the ``apple`` loop.
+
+    Same events, redaction, endpointer, cap and audit; a raise while opening is
+    audited as a setup failure.
+    """
+    from kiro_crew import speech_providers
+
+    with _audited_setup(caller):
+        provider = speech_providers.stt_provider(cfg.stt.provider)
+        if provider is None or not speech_providers.streams(provider):
+            raise RuntimeError(f"STT provider {cfg.stt.provider!r} cannot stream")
+        endpointer = _build_endpointer(ws, cfg, request)
+        session = provider.open_stream(cfg.stt)
+    await _drive_helper_session(
+        ws,
+        caller,
+        session,
+        endpointer,
+        start_failure_code=lambda: _CODE_SESSION_FAILED,
+        label=f"STT provider {cfg.stt.provider!r}",
+    )
+
+
+async def _drive_helper_session(
+    ws: web.WebSocketResponse,
+    caller: str,
+    session: Any,
+    endpointer: "_Endpointer | None",
+    *,
+    start_failure_code: Callable[[], str],
+    label: str,
+) -> None:
+    """Run one started-on-demand helper session to its end; see :func:`_run_apple_session`.
+
+    *session* has the ``SttStreamSession`` shape. *label* names it in the log.
+    """
     try:
         problem = await session.start()
     except BaseException:
@@ -1193,7 +1323,7 @@ async def _run_apple_session(
         _emit_end_audit(caller, outcome="error")
         raise
     if problem:
-        await _send_error(ws, problem, _apple_start_failure_code(cfg))
+        await _send_error(ws, problem, start_failure_code())
         await _close_and_end_audit(ws, caller, outcome="error")
         if endpointer is not None:
             await endpointer.aclose()
@@ -1311,7 +1441,7 @@ async def _run_apple_session(
                     # recording, with everything it says from here silently dropped —
                     # the same failure mode as swallowing an `error` event, reached
                     # through the write side instead of the read side.
-                    logger.warning("apple streaming helper stopped accepting audio")
+                    logger.warning("%s streaming helper stopped accepting audio", label)
                     _claim_fatal("error")
                     await _send_error(ws, "speech helper stopped", _CODE_SESSION_FAILED)
                     return
@@ -1344,7 +1474,7 @@ async def _run_apple_session(
             if not reader_cancelled_by_cap:
                 raise
     except Exception:
-        logger.exception("apple streaming STT session failed")
+        logger.exception("%s streaming STT session failed", label)
         outcome = "error"
     finally:
         # An EXPLICIT claim, not `deadline_task.done()`. Inferring from task state
@@ -1358,13 +1488,15 @@ async def _run_apple_session(
         # the next request may already own.
         deadline_task.cancel()
         if timed_out:
-            logger.info("apple streaming STT session hit the %ds cap", _MAX_STREAM_DURATION_SECS)
+            logger.info(
+                "%s streaming STT session hit the %ds cap", label, _MAX_STREAM_DURATION_SECS
+            )
         # Closing stdin is the helper's cue to finalize, so the trailing finals
         # arrive AFTER this — hence finish() before waiting on the relay.
         try:
             await session.finish()
         except Exception:
-            logger.warning("apple streaming helper did not finish cleanly", exc_info=True)
+            logger.warning("%s streaming helper did not finish cleanly", label, exc_info=True)
         try:
             await asyncio.wait_for(asyncio.shield(relay_task), timeout=3)
         except (asyncio.TimeoutError, Exception):
@@ -1461,7 +1593,13 @@ async def _relay_download_progress(
             # rather than on reaching this branch, so a socket where nothing is
             # loading announces nothing and keeps the short budget -- which is the
             # whole reason the two waits are told apart.
-            if not announced and pending_load():
+            #
+            # Off the loop, for the reason the caller offloaded its own pre-check
+            # (see the announce site): `pending_load` resolves the model, and
+            # resolving the CUSTOM selection reads and validates `config.json`
+            # synchronously. Guarded by `not announced` so the blocking read is
+            # paid at most once per relay, never on the announced steady state.
+            if not announced and await asyncio.to_thread(pending_load):
                 announced = True
                 logger.info("Local speech model load began after the pre-check saw it resident")
                 if not await send(
@@ -1507,9 +1645,21 @@ async def api_ws_stt(request: web.Request) -> web.WebSocketResponse:
         raise web.HTTPForbidden(text="WebSocket origin not allowed")
 
     cfg = KiroCrewConfig.load()
-    if not cfg.stt.enabled or cfg.stt.provider not in _STREAMING_PROVIDERS or not cfg.stt.streaming:
+    if (
+        not cfg.stt.enabled
+        or cfg.stt.provider not in streaming_providers()
+        or not cfg.stt.streaming
+    ):
+        # Complete the WebSocket upgrade so the client receives a typed error frame
+        # rather than a bare 503 it can only report as a generic 'connection' error.
+        # The guard audit records the refusal; no stt_stream_start is emitted, so
+        # no stt_stream_end is needed.
         _emit_guard_audit(request.remote or "unknown", outcome="unavailable")
-        raise web.HTTPServiceUnavailable(text="streaming STT not enabled")
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        await _send_error(ws, "streaming STT is not enabled", _CODE_STREAMING_DISABLED)
+        await ws.close()
+        return ws
 
     global _active_sessions
     if _active_sessions >= _MAX_CONCURRENT_SESSIONS:
@@ -1554,6 +1704,13 @@ async def api_ws_stt(request: web.Request) -> web.WebSocketResponse:
             await _run_apple_session(ws, cfg, request, caller)
             return ws
 
+        if cfg.stt.provider not in _STREAMING_PROVIDERS:
+            # An edition provider that declared ``streaming`` (the gate above
+            # admits no other non-built-in). Same client protocol and the same
+            # helper-session loop as ``apple``.
+            await _run_registered_session(ws, cfg, request, caller)
+            return ws
+
         if TranscribeStreamingClient is None:
             # amazon-transcribe not installed at gateway startup. Module-top
             # import fell back to None so the gateway could boot; surface a
@@ -1582,7 +1739,10 @@ async def api_ws_stt(request: web.Request) -> web.WebSocketResponse:
 
         try:
             profile = cfg.stt.transcribe_profile or None
-            resolver = _ProfileCredentialResolver(profile) if profile else None
+            # Off the loop, as the batch path does: its Session is the first boto3 use (~200 ms).
+            resolver = (
+                await asyncio.to_thread(_ProfileCredentialResolver, profile) if profile else None
+            )
             client = TranscribeStreamingClient(
                 region=cfg.stt.transcribe_region,
                 credential_resolver=resolver,
@@ -1598,15 +1758,27 @@ async def api_ws_stt(request: web.Request) -> web.WebSocketResponse:
             return ws
 
         vocabulary = cfg.stt.transcribe_vocabulary
+        if cfg.stt.transcribe_language_identification and not _client_identifies_languages(client):
+            # Mixed-language detection is configured but the installed SDK predates
+            # it. Refused before any audio is read, with the command that upgrades
+            # it in the log: the extra's pin installs a version that has it.
+            logger.warning(
+                "Mixed-language detection needs amazon-transcribe 0.6.3 or newer; %s",
+                install_hint("voice-aws"),
+            )
+            await _send_error(
+                ws, "amazon-transcribe is too old for mixed-language detection", _CODE_SDK_OUTDATED
+            )
+            await _close_and_end_audit(ws, caller, outcome="error")
+            return ws
         stream = None
         try:
             stream = await client.start_stream_transcription(
-                language_code=cfg.stt.effective_language_code,
+                # One language, or the candidates Amazon Transcribe identifies
+                # between, with the custom vocabulary in the matching parameter.
+                **_transcribe_language_kwargs(cfg.stt),
                 media_sample_rate_hz=STREAM_SAMPLE_RATE_HZ,
                 media_encoding="pcm",
-                # The operator's custom vocabulary, if one is chosen. None sends no
-                # vocabulary header at all.
-                vocabulary_name=vocabulary or None,
                 # Stabilization=high tells Transcribe to commit each word
                 # sooner, at the cost of slightly more downstream corrections.
                 # For interactive dictation this trades accuracy on the last
@@ -1632,14 +1804,15 @@ async def api_ws_stt(request: web.Request) -> web.WebSocketResponse:
             await _close_and_end_audit(ws, caller, outcome="error")
             return ws
 
-        # An EXPLICIT claim by the cap itself, the same discipline as the other two
-        # branches, and NOT `deadline_task.done()`. Inferring from task state is racy
-        # here: the cap ends the read loop between frames and may still be
-        # unwinding when the `finally` runs, so its `done()` can read False. A capped
-        # session would then be audited as a clean stop, which on the one metered
-        # provider is the distinction an operator most needs. Claimed before any
-        # awaiting work, so it cannot be missed.
-        capped = False
+        # An EXPLICIT claim, the same discipline as the other two branches, and NOT
+        # a task's `done()`. Inferring from task state is racy here: the cap ends the
+        # read loop between frames and the result-stream watcher by closing the
+        # socket, and either may still be unwinding when the `finally` runs, so its
+        # `done()` can read False. A capped session would then be audited as a clean
+        # stop, which on the one metered provider is the distinction an operator
+        # most needs. Claimed before any awaiting work, so it cannot be missed, and
+        # only the first claimant acts.
+        fatal_outcome: str | None = None
 
         # Enforce the bill-cap with a dedicated task, not an in-loop check.
         # `async for msg in ws` only yields on client data; aiohttp handles
@@ -1651,13 +1824,17 @@ async def api_ws_stt(request: web.Request) -> web.WebSocketResponse:
         reader_cancelled_by_cap = False
 
         async def _enforce_deadline() -> None:
-            nonlocal capped, reader_cancelled_by_cap
+            nonlocal fatal_outcome, reader_cancelled_by_cap
             await asyncio.sleep(_MAX_STREAM_DURATION_SECS)
             # A reader that already returned means a client `stop` owns the
             # teardown: a clean stop must not be re-labelled as the cap.
-            if ws.closed or (read_task is not None and read_task.done()):
+            if (
+                fatal_outcome is not None
+                or ws.closed
+                or (read_task is not None and read_task.done())
+            ):
                 return
-            capped = True
+            fatal_outcome = "timeout"
             # A server-initiated stop: end the read loop between frames so the
             # teardown ends the input stream and drains the trailing final to the
             # OPEN socket, then sends the cap's frame and closes. Closing here
@@ -1703,6 +1880,30 @@ async def api_ws_stt(request: web.Request) -> web.WebSocketResponse:
                 elif msg.type in (WSMsgType.CLOSE, WSMsgType.ERROR):
                     return
 
+        # Transcribe ends the result stream on its own when it refuses an audio
+        # event (a signature mismatch, 15 s without audio). The read loop would keep
+        # forwarding audio to it with the client still showing it is listening, so
+        # the session ends here. An exception's cause is logged by the drain below.
+        async def _watch_results(task: "asyncio.Task[Any]") -> None:
+            nonlocal fatal_outcome
+            try:
+                await asyncio.shield(task)
+            except Exception:
+                pass
+            if fatal_outcome is not None or ws.closed:
+                return
+            fatal_outcome = "error"
+            logger.warning("Amazon Transcribe ended the stream before the client stopped")
+            await _send_error(ws, "transcription stream ended", _CODE_SESSION_FAILED)
+            # Closing ends the read loop. Tolerated for the same reason `_send_error`
+            # tolerates a failed send: ws.close() can raise on a broken transport,
+            # and an unhandled exception here would surface as "Task exception was
+            # never retrieved".
+            try:
+                await ws.close()
+            except Exception:
+                pass
+
         # Wrap `send_json(ready)` + task creation in the cleanup `try`.
         # If any of these lines raises (most plausibly a client disconnect
         # during Transcribe cold-start), the finally must still run
@@ -1710,6 +1911,7 @@ async def api_ws_stt(request: web.Request) -> web.WebSocketResponse:
         # silently bills and counts against the concurrent-stream quota.
         handler_task = None
         deadline_task = None
+        watch_task = None
         read_task: asyncio.Task[None] | None = None
         # Build the endpointer once, before the try, so it is always bound in the
         # finally (a raise before assignment would otherwise NameError there).
@@ -1720,6 +1922,7 @@ async def api_ws_stt(request: web.Request) -> web.WebSocketResponse:
             handler = _make_handler(ws, endpointer)(stream.output_stream)
             handler_task = asyncio.create_task(handler.handle_events())
             deadline_task = asyncio.create_task(_enforce_deadline())
+            watch_task = asyncio.create_task(_watch_results(handler_task))
 
             read_task = asyncio.create_task(_read_audio())
             try:
@@ -1730,12 +1933,15 @@ async def api_ws_stt(request: web.Request) -> web.WebSocketResponse:
                 if not reader_cancelled_by_cap:
                     raise
         finally:
-            # Cancel first among the cleanup steps: it is the one thing that can still
-            # touch the socket, and leaving it live past cleanup would close a socket
-            # the next request may already own. Whether it FIRED is `capped`, claimed
-            # by the task itself.
+            # Cancel first among the cleanup steps: they are the only things that can
+            # still touch the socket, and leaving them live past cleanup would close a
+            # socket the next request may already own. The watcher also goes before
+            # `end_stream()`, whose normal completion of the result stream is not an
+            # early end. Whether either FIRED is `fatal_outcome`, claimed by the task.
             if deadline_task is not None:
                 deadline_task.cancel()
+            if watch_task is not None:
+                watch_task.cancel()
             try:
                 await stream.input_stream.end_stream()
             except Exception:
@@ -1775,14 +1981,14 @@ async def api_ws_stt(request: web.Request) -> web.WebSocketResponse:
                 await endpointer.aclose()
             # The cap's own frame goes out AFTER the trailing final the handler
             # drain just delivered, and before the audit and the close.
-            if capped and not ws.closed:
+            if fatal_outcome == "timeout" and not ws.closed:
                 await _send_error(ws, "max stream duration exceeded", _CODE_MAX_DURATION)
             # Audit BEFORE the close, for the reason documented on
             # _close_and_end_audit: ws.close() awaits the peer's close ack under
             # its own timeout, so a client that already went away would otherwise
             # hold stt_stream_end back for up to that long. The close is still
             # awaited right after, and still tolerates a broken transport.
-            _emit_end_audit(caller, outcome="timeout" if capped else "ok")
+            _emit_end_audit(caller, outcome=fatal_outcome or "ok")
             if not ws.closed:
                 try:
                     await ws.close()

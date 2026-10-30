@@ -423,9 +423,15 @@ test('a legacy configured default member keeps V1 while new members receive inde
     const promoted = await request.put('/api/config/default-agent', { data: { agent: name } })
     expect(promoted.ok(), await promoted.text()).toBeTruthy()
     expect(await promoted.json()).toMatchObject({ default_agent: name })
-    // No agent in this request: exercise the configured default selection,
-    // rather than pinning a member and accidentally bypassing that resolver.
-    const created = await request.post('/api/chat/slots', { data: { title: `Legacy memory setup ${name}` } })
+    // The roster's default crewmate is not what a plain session runs: a create
+    // with no agent is a template session on the default custom agent, not
+    // this member. Pin that, then open the legacy member by name.
+    const plain = await request.post('/api/chat/slots', { data: { title: `Plain session beside ${name}` } })
+    expect(plain.ok(), await plain.text()).toBeTruthy()
+    const plainSlot = await plain.json() as { key: string; agent: string; agent_kind?: string }
+    expect(plainSlot.agent).not.toBe(name)
+    expect(plainSlot.agent_kind).toBe('template')
+    const created = await request.post('/api/chat/slots', { data: { title: `Legacy memory setup ${name}`, agent: name } })
     expect(created.ok(), await created.text()).toBeTruthy()
     const slot = await created.json() as { key: string; agent: string }
     expect(slot.agent).toBe(name)
@@ -446,11 +452,11 @@ test('a legacy configured default member keeps V1 while new members receive inde
     expect(await rows(request, 'default', key)).toEqual(globalBefore)
 
     await page.goto(`/capabilities?tab=crews&crew=${encodeURIComponent(name)}`)
-    let editor = page.getByRole('dialog').filter({ has: page.getByTestId('crew-editor-identity') })
-    await expect(editor).toBeVisible()
-    await editor.getByRole('tab', { name: /^Workspace · Memory(?: Shared)?$/ }).click()
-    const guidance = editor.getByText('This crewmate keeps its current memory (V1). Its own memory (V2) is only available when creating a new crewmate.', { exact: true })
-    await expect(guidance).toBeVisible()
+    let editor = page.getByRole('dialog', { name: `Edit mate ${name}`, exact: true })
+    await expect(editor).toBeVisible({ timeout: 10000 })
+    await editor.getByTestId('next-rail-memory').click()
+    const guidance = editor.getByTestId('next-memory-status')
+    await expect(guidance).toHaveText('This mate keeps its current memory (V1). Its own memory (V2) is only available when creating a new mate.')
     await expect(editor.getByRole('button', { name: 'Create private memory', exact: true })).toHaveCount(0)
     await expect(editor.getByText(/This member cannot return to its previous memory/)).toHaveCount(0)
     await page.screenshot({ path: testInfo.outputPath('legacy-member-memory-v1-preserved.png'), fullPage: false, animations: 'disabled' })
@@ -464,30 +470,18 @@ test('a legacy configured default member keeps V1 while new members receive inde
     expect(await rows(request, store)).toEqual([])
     expect(await rows(request, 'default', key)).toEqual(globalBefore)
     await page.goto(`/capabilities?tab=crews&crew=${encodeURIComponent(newOwner.name)}`)
-    editor = page.getByRole('dialog').filter({ has: page.getByTestId('crew-editor-identity') })
-    await expect(editor).toBeVisible()
-    await editor.getByRole('tab', { name: /^Workspace · Memory(?: Shared)?$/ }).click()
-    await expect(editor.getByText('This crewmate has its own memory (V2).', { exact: true })).toBeVisible()
-    await expect(editor.getByRole('button', { name: 'Create private memory', exact: true })).toHaveCount(0)
-    await expect(editor.getByRole('button', { name: 'Manage memory', exact: true })).toBeEnabled()
-    // A new member is created on a workspace of its own, named after it.
+    editor = page.getByRole('dialog', { name: `Edit mate ${newOwner.name}`, exact: true })
+    await expect(editor).toBeVisible({ timeout: 10000 })
+    // A new member is created on a workspace of its own, named after it
+    // (General section, the one the editor opens on).
     const own = `member-${newOwner.name}`
-    const workspace = editor.getByRole('combobox', { name: 'Workspace', exact: true })
-    await expect(workspace).toContainText(own)
-    await workspace.click()
-    await page.getByRole('option', { name: 'extra', exact: true }).click()
-    const manage = editor.getByRole('button', { name: 'Manage memory', exact: true })
-    await expect(manage).toBeDisabled()
-    const disabledReason = editor.getByText('Save or discard changes first', { exact: true })
-    await disabledReason.scrollIntoViewIfNeeded()
-    await expect(disabledReason).toBeInViewport({ ratio: 1 })
-    await expect(manage).toBeInViewport({ ratio: 1 })
-    await page.screenshot({ path: testInfo.outputPath('member-memory-manage-disabled-draft.png'), fullPage: false, animations: 'disabled' })
-    await workspace.click()
-    await page.getByRole('option', { name: own, exact: true }).click()
-    await expect(manage).toBeEnabled()
-    await expect(disabledReason).toHaveCount(0)
-    await editor.getByRole('button', { name: 'Manage memory', exact: true }).click()
+    await expect(editor.getByRole('combobox', { name: 'Workspace', exact: true })).toContainText(own)
+    await editor.getByTestId('next-rail-memory').click()
+    await expect(editor.getByTestId('next-memory-status')).toHaveText('This mate has its own memory (V2).')
+    await expect(editor.getByRole('button', { name: 'Create private memory', exact: true })).toHaveCount(0)
+    // The editor's Memory section edits the member's own store in place; the
+    // standalone memory page shows the same store.
+    await page.goto(`/settings/overview?view=memory&store=${encodeURIComponent(store)}`)
     await expect(page.getByText(`Memory for ${newOwner.name}`, { exact: true })).toBeVisible()
     await expect(page.getByRole('button', { name: 'Copy memories', exact: true })).toBeEnabled()
     await page.screenshot({ path: testInfo.outputPath('new-member-memory-v2-empty.png'), fullPage: false, animations: 'disabled' })
@@ -564,15 +558,16 @@ test('intentional bad memory configuration shows unavailable, mismatch and a rea
     [fixture.mismatched_member, 'This member’s configured memory store belongs to another member. It cannot be used here.', 'member-memory-mismatched-binding.png'],
   ]) {
     await page.goto(`/capabilities?tab=crews&crew=${encodeURIComponent(name)}`)
-    const editor = page.getByRole('dialog').filter({ has: page.getByTestId('crew-editor-identity') })
-    await expect(editor).toBeVisible()
-    await editor.getByRole('tab', { name: /^Workspace · Memory(?: Shared)?$/ }).click()
-    const diagnostic = editor.getByText(`${message} Inspect the cause on the gateway: kirocrew doctor`, { exact: true })
-    await expect(diagnostic).toBeVisible()
+    const editor = page.getByRole('dialog', { name: `Edit mate ${name}`, exact: true })
+    await expect(editor).toBeVisible({ timeout: 10000 })
+    await editor.getByTestId('next-rail-memory').click()
+    const diagnostic = editor.getByTestId('next-memory-status')
+    await expect(diagnostic).toHaveText(`${message} Inspect the cause on the gateway: kirocrew doctor`)
     await diagnostic.scrollIntoViewIfNeeded()
     await expect(diagnostic).toBeInViewport({ ratio: 1 })
     await expect(editor.getByRole('button', { name: 'Create private memory', exact: true })).toHaveCount(0)
-    await expect(editor.getByRole('button', { name: 'Manage memory', exact: true })).toHaveCount(0)
+    // A broken binding shows only the diagnostic: none of the store's editors.
+    await expect(editor.getByTestId('next-memory-tab-memories')).toHaveCount(0)
     await page.screenshot({ path: testInfo.outputPath(screenshot), fullPage: false, animations: 'disabled' })
   }
 

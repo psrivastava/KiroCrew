@@ -75,7 +75,7 @@ from kiro_crew.session_lifecycle import (
     decline_stop,
     force_stop_keeping_others,
 )
-from kiro_crew.subagent_wait_reasons import DEFERRED_QUEUED_REASONS
+from kiro_crew.subagent_wait_reasons import DEFERRED_QUEUED_REASONS, stopped_before_start
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, no runtime import edge
     from kiro_crew.cron import CronService
@@ -395,10 +395,10 @@ def parse_dashboard_ttl(arg: str, *, parse_duration: DurationParser) -> int:
     ignored rather than making the whole argument unparseable.
 
     *parse_duration* supplies the duration vocabulary and is injected rather than
-    imported: it lives in ``dashboard/token_auth.py``, and ``kiro_crew.messaging``
+    imported: it lives in ``dashboard/token_auth_tokens.py``, and ``kiro_crew.messaging``
     imports nothing from ``kiro_crew.dashboard`` -- that one-way direction is what
     keeps the transport layer independent of the surfaces built on top of it.
-    Callers already import that module for ``generate_token``.
+    Callers already import its facade, ``dashboard/token_auth.py``, for ``generate_token``.
 
     Returns :data:`DEFAULT_DASHBOARD_TTL_SECS` when *arg* names no duration or the
     duration does not parse: a mistyped TTL should still hand the user a working
@@ -871,6 +871,8 @@ async def spawn_task_reply(
         # would stack a second clause on "was not started: ".
         reason = refusal.removeprefix("spawn refused: ").removeprefix("never started: ")
         return f"⚠️ Subagent `{info.id}` was not started: {_redact(reason)}"
+    if stopped_before_start(info):
+        return f"⚠️ Subagent `{info.id}` was stopped before it started; nothing ran."
     # A row the gate DEFERRED (memory floor, critical posture, paused cap) is
     # accepted under its id but not running, and may not run for a long time;
     # say so with the gate's own sentence instead of announcing a start. The
@@ -952,13 +954,10 @@ async def cron_remove_all_reply(
             return _cron_unreadable(exc)
     if not jobs:
         return "No cron jobs to remove."
-    # ``job.name`` is free-form user/LLM text reaching a chat reply and the
-    # persisted conversation log; ``job.id`` is a generated UUID and is left as-is.
-    lines = [f"- `{job.id}` — {_redact(job.name)}" for job in jobs]
     # One batch lock/reload/save, offloaded by the service itself, so a chat
     # gateway's loop is never parked on the store lock.
     try:
-        await cron_service.remove_jobs(
+        removed, _ = await cron_service.remove_jobs(
             [job.id for job in jobs],
             actor=caller or source or "system",
             source=source or "messaging",
@@ -967,6 +966,14 @@ async def cron_remove_all_reply(
         return _CRON_BUSY
     except CronStoreUnreadable as exc:
         return _cron_unreadable(exc)
+    # The listing above is cache-only; ``removed`` is what the store re-read
+    # and actually deleted, so only those jobs are reported.
+    gone = set(removed)
+    # ``job.name`` is free-form user/LLM text reaching a chat reply and the
+    # persisted conversation log; ``job.id`` is a generated UUID and is left as-is.
+    lines = [f"- `{job.id}` — {_redact(job.name)}" for job in jobs if job.id in gone]
+    if not lines:
+        return "No cron jobs to remove."
     return f"✅ Removed {len(lines)} cron job(s):\n" + "\n".join(lines)
 
 

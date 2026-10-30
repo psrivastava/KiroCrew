@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 from typing import TYPE_CHECKING
 
@@ -145,6 +146,77 @@ def _reclaim_deleted_member_crew_log(name: str, cfg: KiroCrewConfig) -> None:
         logger.info("crew delete: removed the crew log of %r", slug)
     else:
         logger.info("crew delete: the crew log of %r was not removed (%s)", slug, status)
+
+
+async def _remove_goal_check_ins(request: web.Request, name: str, cfg: KiroCrewConfig) -> None:
+    """Remove a deleted crewmate's goal check-in schedules. Never raises.
+
+    Each check-in is a gateway-owned job keyed ``goal-<cadence>:<slug>``
+    (``goal_reminder.MANAGED_PREFIXES``) and listed nowhere but its Goals tab,
+    so with the crewmate gone nothing would ever turn it off. *cfg* is the config
+    captured while the record was still in it, which the slug is resolved from;
+    a slug another live crew still derives keeps its schedules. The goal record
+    itself stays, like the rules file beside it.
+    """
+    state = request.app.get("state")
+    crons = getattr(state, "crons", None) if state is not None else None
+    if crons is None:
+        return
+    try:
+        from kiro_crew.dashboard import goal_reminder
+        from kiro_crew.members import member_slug
+
+        slug = member_slug(name, cfg)
+        if await asyncio.to_thread(_member_slug_is_claimed, slug):
+            return
+        for job in await goal_reminder.reminder_jobs(crons, slug):
+            await crons.remove_job_async(job.id, actor="dashboard", source="agent.delete")
+    except Exception:
+        logger.warning(
+            "crew delete: could not remove the goal check-ins of %r", name, exc_info=True
+        )
+
+
+def _reclaim_deleted_member_dashboard_lock(name: str, cfg: KiroCrewConfig) -> None:
+    """Remove the dashboard structure lock of a member the roster does not hold.
+
+    The lock lives in ``crew-panels/<slug>.dashboard-lock``, outside the member's own
+    tree, so nothing else in this teardown reaches it. Kept, it would lock a later
+    crewmate that derives the same slug to the deleted one's page.
+
+    Resolved and decided exactly as :func:`_reclaim_deleted_member_crew_log` is: the
+    slug from *cfg*, captured while the record still existed, and the removal only
+    while :func:`_member_slug_is_claimed` answers no. Call it while holding
+    ``memory_store_namespace_lock`` for the same reason: a live crewmate's lock is
+    the person's decision, and removing it would let that crewmate's agent change
+    the page. Best-effort and never raises, like the rest of the teardown.
+    """
+    try:
+        from kiro_crew.dashboard_templates import structure_lock_removal
+        from kiro_crew.members import member_slug
+
+        slug = member_slug(name, cfg)
+        removed = structure_lock_removal.remove_structure_lock(
+            slug, still_unclaimed=lambda: not _member_slug_is_claimed(slug)
+        )
+    except Exception:
+        logger.warning(
+            "crew delete: could not remove the dashboard lock of %r", name, exc_info=True
+        )
+        return
+    if removed:
+        logger.info("crew delete: removed the dashboard lock of %r", slug)
+    try:
+        from kiro_crew.dashboard import page_offer
+
+        # The asked-once page offer sits beside the lock in ``crew-panels``: kept, a
+        # later crewmate on the same slug would never be offered its own page.
+        if not _member_slug_is_claimed(slug):
+            page_offer.forget_asked(slug)
+    except Exception:
+        logger.warning(
+            "crew delete: could not remove the page offer record of %r", name, exc_info=True
+        )
 
 
 def _prune_private_copy_of_deleted_crew(crew: str, bound_template: str) -> bool:
@@ -338,6 +410,9 @@ async def api_kirocrew_agent_delete(request: web.Request) -> web.Response:
             # the config captured while the record was still in it, which is what
             # the slug has to be resolved from.
             _reclaim_deleted_member_crew_log(name, cfg)
+            # The person's dashboard structure lock, under the same hold and on the
+            # same slug: it sits in ``crew-panels``, which no other step here reaches.
+            _reclaim_deleted_member_dashboard_lock(name, cfg)
             return retired_store
 
         try:
@@ -371,6 +446,13 @@ async def api_kirocrew_agent_delete(request: web.Request) -> web.Response:
         # same-name recreation has already uploaded and committed a new
         # picture under the same digest stem.
         await _drained_to_thread(_remove_avatar_files, name)
+        await _remove_goal_check_ins(request, name, cfg)
+        # The git worktrees the crewmate's workers ran in go with it; one with
+        # uncommitted changes is kept, and its branches and the repositories'
+        # own checkouts are never touched.
+        from kiro_crew.crewmate_worktree import remove_for_member
+
+        await _drained_to_thread(remove_for_member, name, cfg)
         # Likewise the crew's private template copy: a copy the sidecar marks
         # private to THIS crew, and that the crew was bound to, has no reader
         # left once the record is gone — kept, it lists in the Agent Templates

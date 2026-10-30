@@ -48,9 +48,34 @@ tier, because the tier is the record of how big the work was judged to be and a
 reached full green and was then parked by a one-line product hold — every round of
 that work was discarded.
 
-The file-overlap gate's `--limit 500` is load-bearing because `gh pr list` returns
+The file-overlap gate's `--limit` is load-bearing because `gh pr list` returns
 30 rows by default. With 175+ open PRs the default silently checks about a sixth of
 them and the gate reads as passing.
+
+Raising the cap is not enough on its own, because the cap is a number someone has
+to keep ahead of the repo. The repo passed 500 open PRs (723 on 2026-10-12), so
+`--limit 500` began truncating silently in exactly the way the default does — a
+truncated scan is indistinguishable from a clean one. So the gate stops trusting a
+cap: it pages with cursors to the end and asserts the last page's `hasNextPage` is
+`false` (the command is in `references/ci.md`).
+
+Truncation has two axes, and the second one survives any cap. The PR list caps how
+many PRs you see; each PR's `files` connection separately caps how many of *its*
+files you see (`files(first: 100)`), and 12 open PRs exceed 100 files. A gate that
+only widened the outer cap would still miss an overlap hidden past file 100 of a
+large PR, so each PR's `files.pageInfo.hasNextPage` is checked too and a truncated
+one is re-read in full. At this repo's size the single-request form also 504s, which
+is why the gate pages with cursors instead of asking for one large page.
+
+The scripts need Python 3.12 or newer, and SKILL.md says so where the scripts are
+introduced. They carry PEP-604 annotations (`str | None`) that an older interpreter
+evaluates at class-definition time, so on a host whose `python3` is 3.9 the first
+script run dies with `unsupported operand type(s) for |: 'type' and 'NoneType'`
+before doing any work. The floor used to be asserted only inside the kirocrew
+profile's gate-check command, which runs well after Phase 0's first script call,
+so the reader met the crash before the requirement and read it as a broken script
+rather than a wrong interpreter. If `python3 -V` is below 3.12, use `python3.12`
+on PATH or the repo's `.venv/bin/python3.12` for every call in the skill.
 
 ## Why a red main gets its own PR, and the original PR waits
 
@@ -372,12 +397,9 @@ be named exempt with a reason, and every gate must name a target that exists. CI
 gaining a blocking scan therefore fails that test instead of surfacing as a review
 round on a later PR.
 
-Narrowing **within** a surface needs a real import graph, not a text scan, so
-`run_scoped_tests.py` deliberately does not attempt it. It only replaces the *other*
-surface's full suite with the cross-surface set `ci.yml` runs for a single-surface
-diff — measured at 350 backend files or 146 frontend specs, against 62k collected
-backend tests and ~1.4k frontend specs that are not worth re-running serially on ten
-inner-loop iterations for a signal CI produces on the merge ref anyway.
+Which tests the two test gates run, and why the full suites stay CI's job, is
+explained once, in `references/gate-floor.md` under "A test gate runs the RELATED
+set; the full suite is CI's".
 
 ## Why the extraction fallback must announce itself
 
@@ -385,6 +407,13 @@ inner-loop iterations for a signal CI produces on the merge ref anyway.
 the CI workflows they mirror. A silent fallback to those charters reintroduces
 exactly the drift the script prevents, so exit 40 requires a visible WARNING and a
 fix to the extractor rather than a quiet degradation.
+
+The workflows come from the base commit, but the extractor is whichever copy ran,
+usually the installed skill. When the base changes a workflow and the extractor in
+one commit, an install from before it fails parity although the base's own copy
+parses fine. So on a parity failure the script compares itself with the base
+commit's copy: when they differ it still exits 40, but names the base copy and the
+command that runs it. Neither the charters nor an extractor fix is the remedy then.
 
 The charter budgets are hand-copied from CI and that copy is what drifted before —
 the skill claimed ≤2 BLOCKING long after CI moved to 5.
@@ -416,16 +445,13 @@ unread. `needs-a-decision` puts the question where it will be answered and files
 nothing. `test/test_deferred_disposition_ratchet.py` enforces that every surface
 offering the first also offers the second.
 
-## Why every concern must be answered, including advisory ones
+## Why a BLOCK is never left unanswered
 
-`Design Review 🟡 CONCERNS` and `UX Review 🟡 CONCERNS` post their concern *and* pass
-the check. The readiness rollup will therefore never force an answer, and nothing
-else in the loop nags. To a human maintainer a silently ignored concern reads as
-"the author never looked at it", regardless of how green the checks are.
-
-Design Review owns the long-term-reversibility lens. It is advisory and reds only on
-a genuine `BLOCK`, but an irreversible choice it flags needs a written justification
-a reviewer can read — which is why it is fix-or-justify rather than a raw Medium.
+A lane BLOCK reds the check and holds readiness, so the loop sees it. The risk is
+the answer: a BLOCK that is neither fixed nor answered with a disposition reads to a
+maintainer as "the author never looked at it". Design Review owns the
+long-term-reversibility lens; an irreversible choice it blocks needs a fix or a
+written justification a reviewer can read.
 
 ## Why the disposition comment is scoped twice
 
@@ -481,6 +507,39 @@ The maintainer's auto-approval bot greps for the template's exact heading string
 `## What changed`, blocks workflow approval indefinitely. There is no bundled copy
 because the repo's file is the single source of truth and the skill always runs
 inside a checkout.
+
+## Why the body is published before the push
+
+The reason is correctness, not throughput, and it is about the lanes that read the
+description without subscribing to `edited`.
+
+`Design Review`, `UX Review` and `First Principles Review` are those lanes today. Each
+reads the title and description through a live `gh api` call inside its own run, so a
+description published after that read is one that run never sees: its verdict answers
+the earlier text until the next push or a re-run. Publishing first is what hands them
+the description they are going to be judged against.
+
+Do not reach for a throughput argument here, because there is not one. Several lanes do
+subscribe to `edited`, so a separate body edit starts them again — but each of those
+that can be superseded keys a per-pull-request `concurrency` group with
+`cancel-in-progress`, so whichever of the two actions lands second cancels what the
+first left running. `PR Readiness` is the deliberate exception, isolated per run so it
+is never cancelled, and it runs once per event in either order. So editing before the
+push and editing after it cost about the same in completed runs.
+
+The other condition stands on its own, and does not depend on the order. When the
+regenerated body is byte-identical there is nothing to publish, so the call is skipped.
+Publishing it anyway wastes a request for certain, and a whole fan-out if GitHub raises
+`edited` for a PATCH that changes nothing. Which of those it is has not been measured
+here, so skip the call but do not quote a saving for it.
+
+Which lanes sit in which group is a property of the workflows and changes with them,
+so read it from the `on:` blocks in `.github/workflows/` and the reviewer table in
+`docs/ci/ci-and-reviews.md` rather than from a list here. Two traps when you do:
+subscribing to `edited` and reading the description are independent, and a lane can do
+either without the other; and a fork pull request is reviewed instead by the `Fork *`
+lanes started after Fast Gate, of which the ones that read the description carry no
+`edited`.
 
 ## Why screenshots are attachments, not commits
 
@@ -584,8 +643,9 @@ nothing. A cron has no owning slot, so its tool calls hit a deny-by-default appr
 path and time out after 180s without a global auto-approve grant — and a denied tool
 inside a completed turn still records `last_status: ok`. A real PR watcher logged 101
 runs over 25 hours with 23 approval blocks, zero pushes, and a healthy-looking
-registry. Heartbeat runs under a strict name allowlist (`HEARTBEAT_SAFE_TOOLS`) with
-no shell and no `git push`, so it cannot amend a commit at all.
+registry. Heartbeat runs under a strict identity allowlist (`_heartbeat_approval`)
+with no write tool, and its read-only shell excludes every git subcommand, so it can
+read files but never amend or publish a commit.
 
 `monitor_watch` is exempted only for a pure-watch stretch because it never interprets
 comment bodies: it digests them only to notice a change, so it cannot tell whether a
@@ -603,17 +663,6 @@ both silent abandonment and duplicate poll drivers. Monitor cycles are not serve
 rounds, so a wall-clock bound must accompany the cycle budget. The execution
 procedure owns those budgets rather than a second copy here.
 
-## Why a pinned reviewer fleet hides a whole-design CONCERNS
-
-`pr_status.py` exits `20` on an unanswered CONCERNS only for a lane whose verdict it
-collected, and it collects a verdict only for a lane the run names: `verdicts[name]`
-is written inside `only is None or name in only`. The loop pins `--reviewers gpt,opus`
-so a lane that never posted cannot pass silently, which means Design, First Principles
-and UX are never collected and their CONCERNS never moves the exit code. The
-`Whole-design punchlines` block is printed every cycle on purpose and changes no exit
-code, so it is the place a CONCERNS for those lanes shows up; treat one there as the
-stop the exit code did not give.
-
 ## Why a hold heard after arming goes into the live loop
 
 The loop's message is re-injected verbatim every cycle, so it, not the chat, is what a
@@ -623,6 +672,29 @@ merge does not come back. Rewriting the live loop's message in place with
 `monitor_update(message=...)` on the turn the hold is heard puts the hold where every
 later cycle reads it.
 
+## Why the poll loop is gated, with `judge=False`
+
+A gated tick reads the whole pull request (`probes/gh_pr.py`): its state, head,
+mergeability, review decision, every check, and the newest comments and reviews by a
+digest of each whole body. A tick whose reading matches the last one starts no turn.
+Any change starts one turn, and only one: a pull-request reading never raises the
+kernel wake that buys a follow-up tick. `judge=False` keeps that rule exact, since no
+judge call can hold a change back or time out into a turn.
+
+What the reading cannot see waits for the quiet floor, a turn after 10 quiet ticks
+(about 50 minutes at 300 s): main moving in this PR's files without a conflict
+(`green_age.py` exit 30), a lane that never posts, and a finding the turn that
+carried it left unanswered. A lane edits its verdict comment in place, so an old one
+falls out of the reading, but the lane's check run finishes with the edit and wakes
+the loop. Comments from the loop's own account are left out, so a posted disposition
+does not wake it again.
+
+A merge or close ends a gated dashboard loop with the bell notice and no turn; only
+a Slack or Discord loop gets one last turn. So the Report goes out on the converged
+turn, and the `Merged` step runs only where that last turn exists. The decision is
+recorded in the `rfc-gated-pr-poll-loops` RFC
+([#22440](https://github.com/kirodotdev/KiroCrew/pull/22440)).
+
 ## How the profile resolves, and what its JSON carries
 
 Most-specific-wins: repo-root `.prepare-pr.toml` → Kiro Crew markers (auto-loads
@@ -631,3 +703,32 @@ has `setup[]`, `gates[]`, `reviewers[]` (each
 `{name, model, model_tier, contract, rubric}`), `rule_files[]`, `single_commit`,
 `base_branch`, and `readiness{status_context, defer_label}`.
 
+
+## Why a red on-demand macOS run counts as a concern
+
+`macOS Tests (on demand)` is not a required check, so a red one does not block
+readiness by itself. #12925 merged over its own red shard 2 and reddened that shard
+on every open PR, so SKILL.md's *Review-ready* treats a red run on the current head
+as a concern to fix or to show red on main.
+
+## Why `pr_status.py` and `push_guard.py` load their owners by path
+
+Both entry points are split by responsibility, so neither grows past the repository's
+2,000-line cap, and each stays the one path its callers run and its tests patch. A
+skill's scripts are synced out of the package, so each owner module is loaded from
+the script's own directory by path, never imported: nothing lands on `sys.path` or in
+`sys.modules`, and no bytecode is written.
+
+- `pr_status.py` re-exports every name its owners define: `pr_status_issue_links.py`
+  reads a body's issue references, and `pr_status_verdict.py` classifies the check rows
+  and decides readiness. Every name a test replaces, and every reader of one, stays in
+  `pr_status.py`.
+- `push_guard.py` rebinds every function its owners define onto its own globals through
+  a local twin of `kiro_crew._facade_compose.rebind`, which differs from it in one
+  statement, reading `__type_params__` with a default. Its owners hold functions only:
+  `push_guard_index.py` (the shared index), `push_guard_record.py` (the build record),
+  `push_guard_history.py` (the history checks), `push_guard_squash.py` (`--squash`) and
+  `push_guard_commit.py` (`--commit`, `--amend`).
+
+New work goes to the owner whose docstring names it, and a new responsibility gets an
+owner of its own. Copy the whole `scripts/` directory, never one file.

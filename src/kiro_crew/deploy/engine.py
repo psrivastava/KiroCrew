@@ -26,9 +26,10 @@ import secrets
 import shutil
 import subprocess
 import time
-from typing import Any, Optional
+from typing import Any, NamedTuple, Optional
 
 from kiro_crew.sandbox import cgroup_scope_argv, run_limited, wrap_argv
+from kiro_crew.subprocess_utf8 import UTF8_TEXT
 
 logger = logging.getLogger(__name__)
 
@@ -156,12 +157,33 @@ def resolve_aws_tool_bin(name: str) -> str:
     there is refused; the pair is cleared when that name passes in that dir, so
     repairing the install needs no restart.
     """
+    return resolve_aws_tool_bin_with_refusals(name)[0]
+
+
+class AwsToolRefusal(NamedTuple):
+    """One install-dir candidate the provenance check refused, and why."""
+
+    path: str
+    reason: str
+
+
+def resolve_aws_tool_bin_with_refusals(name: str) -> tuple[str, tuple[AwsToolRefusal, ...]]:
+    """:func:`resolve_aws_tool_bin`, plus the candidates THIS walk refused.
+
+    Same search, same validation and same :data:`_REFUSED_AWS_BIN_DIRS` updates;
+    the second element only reports what the walk already decided, so a caller
+    that has to explain a bare-name result can tell "nothing installed" from
+    "installed but refused" and name the refusal reason. The refusals come from
+    this call alone, never from the shared set, so a candidate removed since an
+    earlier walk is not reported.
+    """
+    refusals: list[AwsToolRefusal] = []
     env_path = os.environ.get("PATH", "")
     found = shutil.which(name, path=env_path) if env_path else None
     if found:
         # Same trust class as the pre-existing behaviour: execvp against the
         # inherited PATH already executed exactly this binary.
-        return found
+        return found, ()
     for directory in _AWS_BIN_DIRS:
         if not directory:
             continue
@@ -172,11 +194,12 @@ def resolve_aws_tool_bin(name: str) -> str:
 
         try:
             resolved = validate_provider_executable(found)
-        except ValueError:
+        except ValueError as exc:
             # This (name, dir) is out — for the argv head AND for the child's
             # PATH. Keyed by name too: a sibling name passing in this dir must not
             # clear THIS name's refusal.
             _REFUSED_AWS_BIN_DIRS.add((name, directory))
+            refusals.append(AwsToolRefusal(found, str(exc)))
             logger.warning(
                 "refusing %s at %s: failed provenance validation; trying the remaining "
                 "install dirs",
@@ -185,8 +208,8 @@ def resolve_aws_tool_bin(name: str) -> str:
             )
             continue
         _REFUSED_AWS_BIN_DIRS.discard((name, directory))
-        return resolved
-    return name
+        return resolved, tuple(refusals)
+    return name, tuple(refusals)
 
 
 def resolve_aws_bin() -> str:
@@ -354,7 +377,10 @@ def run_aws(
         proc = run_limited(  # noqa: S603 — fixed argv, no shell, sandbox-wrapped
             sandboxed,
             capture_output=True,
-            text=True,
+            # The CLI writes UTF-8 because it inherits the PYTHONUTF8=1 that
+            # ensure_utf8_console publishes, which aws-cli v1 and v2 honour.
+            # A locale decode would read that as the Windows ANSI code page.
+            **UTF8_TEXT,
             timeout=timeout,
             stdin=stdin_arg,
         )
@@ -389,10 +415,9 @@ def _trimmed_stderr(err: str, limit: int = 200) -> str:
 
     Callers may redact again at their own boundary; these passes are idempotent.
     """
-    from kiro_crew.security import redact_credentials, redact_exfiltration_urls
+    from kiro_crew.security import redact
 
-    text, _ = redact_credentials(err.strip())
-    text, _ = redact_exfiltration_urls(text)
+    text = redact(err.strip())
     return text[:limit]
 
 
@@ -650,6 +675,23 @@ def create_distribution(bucket: str, region: str, oac_id: str, site_id: str, pro
     return {"id": dist["Id"], "arn": dist["ARN"], "domain": dist["DomainName"]}
 
 
+#: The Sid of :func:`deny_insecure_transport_statement`, so a caller merging it into an
+#: existing policy can tell whether it is already there.
+DENY_INSECURE_TRANSPORT_SID = "KiroCrewDenyInsecureTransport"
+
+
+def deny_insecure_transport_statement(bucket: str, partition: str = "aws") -> dict:
+    """A bucket-policy statement that refuses every request not sent over TLS."""
+    return {
+        "Sid": DENY_INSECURE_TRANSPORT_SID,
+        "Effect": "Deny",
+        "Principal": "*",
+        "Action": "s3:*",
+        "Resource": [f"arn:{partition}:s3:::{bucket}", f"arn:{partition}:s3:::{bucket}/*"],
+        "Condition": {"Bool": {"aws:SecureTransport": "false"}},
+    }
+
+
 def put_oac_bucket_policy(bucket: str, distribution_arn: str, profile: str) -> None:
     """Write the OAC bucket policy pinning AWS:SourceArn — MUST run after create_distribution."""
     policy = {
@@ -679,6 +721,9 @@ def put_oac_bucket_policy(bucket: str, distribution_arn: str, profile: str) -> N
                     f"arn:aws:s3:::{bucket}/_quarantine/*",
                 ],
             },
+            # TLS only, as base-stack.yaml's DenyInsecureTransport. CloudFront OAC
+            # and the deploy's own AWS CLI calls both use HTTPS, so neither is denied.
+            deny_insecure_transport_statement(bucket),
         ],
     }
     _checked(
@@ -714,7 +759,8 @@ def deploy(site_id: str, src_dir: str, profile: str, region: str = DEFAULT_REGIO
     """Idempotent deploy of ``src_dir`` to the site ``site_id``. Returns a result dict.
 
     First deploy: create bucket → OAC → distribution → bucket-policy → sync → invalidate.
-    Re-deploy (site exists by tag): reuse bucket+distribution, just sync + invalidate.
+    Re-deploy (site exists by tag): reuse bucket+distribution, re-write the bucket
+    policy (so an existing site carries the current statements), sync + invalidate.
     """
     region = region or DEFAULT_REGION
     existing = find_site_by_tag(site_id, profile, region)
@@ -722,6 +768,8 @@ def deploy(site_id: str, src_dir: str, profile: str, region: str = DEFAULT_REGIO
     if existing and existing.get("bucket") and existing.get("distribution_id"):
         bucket = existing["bucket"]
         dist_id = existing["distribution_id"]
+        if existing.get("distribution_arn"):
+            put_oac_bucket_policy(bucket, existing["distribution_arn"], profile)
         sync_dir(src_dir, bucket, profile)
         invalidate(dist_id, profile)
         status, domain = distribution_status(dist_id, profile)

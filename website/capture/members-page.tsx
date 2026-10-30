@@ -30,8 +30,9 @@ import { ThemeProvider } from '../src/hooks/useTheme'
 import { initI18n } from '../src/i18n/all'
 import { store } from '../src/store'
 import { sseSlots } from '../src/store/dashboardSlice'
-import { appendSlotMessage, selectSlotMessages, sseChatMessage } from '../src/store/chatSlice'
+import { appendSlotMessage, selectSlotMessages, sseChatMessage, sseSideResult } from '../src/store/chatSlice'
 import { memberProjectionStore } from '../src/state/memberProjectionStore'
+import { installScrollReveal } from '../src/lib/scrollReveal'
 import '../src/index.css'
 
 /** The two store frames the capture script needs to fire AFTER the page is up
@@ -55,6 +56,14 @@ window.addEventListener('capture:frame', (e) => {
   // radar's turn has ended (the slots frame a stop delivers): the crewmate
   // reads idle, for a frame whose action follows a stop.
   if (d.kind === 'idle') store.dispatch(sseSlots([{ key: d.slot, title: 'Radar', messages: 4, running: false, mode: 'member', agent: 'radar' }]))
+  // No turn runs, but the gateway is preparing a message for the thread (the
+  // slots frame's `preparing`); `landed` is the frame that clears it, with the
+  // prepared reply arriving as an ordinary assistant row.
+  if (d.kind === 'preparing') store.dispatch(sseSlots([{ key: d.slot, title: 'Radar', messages: 4, running: false, preparing: true, mode: 'member', agent: 'radar' }] as never))
+  if (d.kind === 'landed') {
+    store.dispatch(sseChatMessage({ slot: d.slot, role: 'assistant', content: d.text ?? '', ts: new Date().toISOString() }))
+    store.dispatch(sseSlots([{ key: d.slot, title: 'Radar', messages: 5, running: false, preparing: false, mode: 'member', agent: 'radar' }] as never))
+  }
   // A pushed `member_projection` roster frame, the way the WebSocket delivers
   // one: this is how a crewmate's recency advances on the user's own send
   // without a roster refetch, so a recording of the Recent sort reordering has
@@ -66,6 +75,12 @@ window.addEventListener('capture:frame', (e) => {
       { name: d.slug, slug: d.slug, last_active_ts: d.ts ?? Date.now() / 1000 },
       d.seq ?? 5,
     )
+  }
+  // The side chat's result frames for a question asked by `/side`: the user
+  // row and the answer, the way the WebSocket delivers `side_result`.
+  if (d.kind === 'side-echo') {
+    store.dispatch(sseSideResult({ slot: d.slot, run_id: 'side-run-1', role: 'user', content: d.text ?? '' }))
+    store.dispatch(sseSideResult({ slot: d.slot, run_id: 'side-run-1', role: 'assistant', content: 'Two PRs merged since your last look: #4211 and #4213.', final: true }))
   }
   if (d.kind === 'steer-echo') {
     // The server echoes the sendId it received in the POST's meta; mirror that
@@ -176,10 +191,12 @@ function Elsewhere() {
 
 async function main() {
   await initI18n()
+  // As main.tsx does: the scroll-only scrollbar needs the attribute setter.
+  installScrollReveal()
   createRoot(document.getElementById('root')!).render(
     <Provider store={store}>
       <QueryClientProvider client={queryClient}>
-        {/* The drawer's CrewDashboardFrame reads useTheme(); without the
+        {/* The page reads useTheme(); without the
             provider the whole page throws on mount. */}
         <ThemeProvider>
         <MemoryRouter initialEntries={[route]}>

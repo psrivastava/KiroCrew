@@ -35,9 +35,10 @@ vi.mock('../api/client', () => ({
 }))
 
 import SessionTitleControl from '../pages/chat/SessionTitleControl'
+import { generateSlotTitle } from '../hooks/slotTitleGeneration'
 import { MOVE_UNDO_MS } from '../components/MoveUndoBar'
 import { api } from '../api/client'
-import { updateSlotPin } from '../store/dashboardSlice'
+import { sseSlotTitle, updateSlotPin } from '../store/dashboardSlice'
 
 const SLOT = 'pane-a'
 const TITLE = 'Alpha session'
@@ -167,6 +168,18 @@ describe('SessionTitleControl', () => {
   it.each([
     ['split-view pane header (compact)', true],
     ['single-session header', false],
+  ])('%s: the open editor has a name and says which keys save and cancel to a screen reader (#15808)', (_host, compact) => {
+    renderControl({ compact })
+    const input = openEditor()
+    expect(input).toHaveAccessibleName(`${TITLE} (rename session)`)
+    expect(input).toHaveAccessibleDescription('Enter saves · Esc cancels')
+    // The instruction is for assistive tech only; nothing is drawn beside the box.
+    expect(classes(screen.getByText('Enter saves · Esc cancels'))).toContain('sr-only')
+  })
+
+  it.each([
+    ['split-view pane header (compact)', true],
+    ['single-session header', false],
   ])('%s: the editor keeps the read-only title\'s type and box, so the header does not move when editing starts or ends', (_host, compact) => {
     renderControl({ compact })
     const pill = screen.getByRole('button', { name: RENAME }).parentElement!
@@ -253,6 +266,30 @@ describe('SessionTitleControl', () => {
     expect(api.renameSlot).toHaveBeenCalledWith(SLOT, TITLE)
     // One shot: used, it is gone.
     expect(screen.queryByRole('button', { name: /^Undo/ })).toBeNull()
+  })
+
+  it('names the Undo for an untitled session "Untitled session", never its key, and still restores the raw value (#20871)', async () => {
+    const { store } = renderControl()
+    act(() => { store.dispatch(sseSlotTitle({ key: SLOT, title: SLOT })) })
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: REGEN })) })
+    await waitFor(() => expect(storeTitle(store)).toBe('Generated title'))
+    const undo = await screen.findByRole('button', { name: 'Undo: Untitled session' })
+    expect(undo.getAttribute('title')).toBe('Untitled session')
+    await act(async () => { fireEvent.click(undo) })
+    expect(storeTitle(store)).toBe(SLOT)
+  })
+
+  it('types out a generated title that replaces the "Untitled session" label (#20871)', async () => {
+    const { store } = renderControl()
+    act(() => { store.dispatch(sseSlotTitle({ key: SLOT, title: SLOT })) })
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: REGEN })) })
+    await waitFor(() => expect(storeTitle(store)).toBe('Generated title'))
+    const trigger = screen.getByRole('button', { name: 'Generated title (rename session)' })
+    // Still typing: a strict prefix of the generated title is on screen.
+    const typed = trigger.textContent ?? ''
+    expect(typed.length).toBeLessThan('Generated title'.length)
+    expect('Generated title'.startsWith(typed)).toBe(true)
+    await waitFor(() => expect(trigger.textContent).toBe('Generated title'))
   })
 
   it('the Undo offer ends when the title moves on or the user starts another attempt', async () => {
@@ -417,6 +454,51 @@ describe('SessionTitleControl', () => {
     await act(async () => { fireEvent.click(screen.getByRole('button', { name: REGEN })) })
     await waitFor(() => expect(screen.getByRole('button', { name: REGEN })).toBeTruthy())
     expect(screen.queryByRole('button', { name: /^Undo/ })).toBeNull()
+  })
+
+  it('one slot open in two panes generates once, and both panes show the spinner', async () => {
+    let resolve!: (v: { title: string }) => void
+    vi.mocked(api.generateTitle).mockReturnValueOnce(new Promise((r) => { resolve = r }))
+    const store = makeStore()
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    render(
+      <QueryClientProvider client={qc}>
+        <Provider store={store}>
+          <div className="group/header"><SessionTitleControl slotKey={SLOT} title={TITLE} compact /></div>
+          <div className="group/header"><SessionTitleControl slotKey={SLOT} title={TITLE} compact /></div>
+        </Provider>
+      </QueryClientProvider>,
+    )
+    const [first] = screen.getAllByRole('button', { name: REGEN })
+    await act(async () => { fireEvent.click(first) })
+    // The other pane's button is gone too: it shows the spinner instead.
+    expect(screen.queryAllByRole('button', { name: REGEN })).toHaveLength(0)
+    expect(screen.getAllByText('Generating title…')).toHaveLength(2)
+    expect(api.generateTitle).toHaveBeenCalledTimes(1)
+    await act(async () => { resolve({ title: 'Done' }) })
+    await waitFor(() => expect(screen.queryAllByText('Generating title…')).toHaveLength(0))
+    expect(api.generateTitle).toHaveBeenCalledTimes(1)
+  })
+
+  it('a header press while a menu-started generation runs sends no second request', async () => {
+    let resolve!: (v: { title: string }) => void
+    vi.mocked(api.generateTitle).mockReturnValueOnce(new Promise((r) => { resolve = r }))
+    const store = makeStore()
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    render(
+      <QueryClientProvider client={qc}>
+        <Provider store={store}>
+          <div className="group/header"><SessionTitleControl slotKey={SLOT} title={TITLE} compact /></div>
+        </Provider>
+      </QueryClientProvider>,
+    )
+    let menuCall!: Promise<void> | null
+    await act(async () => { menuCall = generateSlotTitle(SLOT, store.dispatch) })
+    // The header shows the menu's generation and offers no second press.
+    expect(screen.queryAllByRole('button', { name: REGEN })).toHaveLength(0)
+    expect(screen.getByText('Generating title…')).toBeTruthy()
+    await act(async () => { resolve({ title: 'Done' }); await menuCall })
+    expect(api.generateTitle).toHaveBeenCalledTimes(1)
   })
 
   it('shows the spinner instead of the button while a title is generating', async () => {

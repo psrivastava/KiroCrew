@@ -59,6 +59,37 @@ export const KIROCREW_CONFIG_FIXTURE = {
   auto_update: true,
 }
 
+/**
+ * The same config with `agent.acp_backend` set to `kiro`, for a harness that
+ * photographs the Kiro credit surface (the top-bar credit pill and the Kiro
+ * Account modal). Unset, the backend resolves to the default harness, which is
+ * not kiro, and there a failed or empty usage read hides the pill and closes
+ * the modal, so those frames never render.
+ */
+export const KIRO_BACKEND_CONFIG_FIXTURE = {
+  ...KIROCREW_CONFIG_FIXTURE,
+  agent: { ...KIROCREW_CONFIG_FIXTURE.agent, acp_backend: 'kiro' },
+}
+
+/**
+ * The `GET /api/kas-bundle` body, matching `KasBundleStatus` in
+ * `website/src/api/client/onboarding.ts`: the route off and nothing installed.
+ *
+ * Named ahead of the catch-all because the KAS engine card on Settings >
+ * Developer > Feature Previews reads `status.progress.total` on render. Under
+ * the guessed `{}` that throws, and the section's error boundary drops the card,
+ * so a capture of that tab would show a page without it.
+ */
+export const KAS_BUNDLE_STATUS_FIXTURE = {
+  enabled: false,
+  pinned_version: '0.66.33',
+  runs_version: '0.66.33',
+  installed: null,
+  installing: false,
+  progress: { done: 0, total: 0 },
+  error: '',
+}
+
 /** The `/api/agent/config` body — the per-agent MCP view. */
 export const AGENT_CONFIG_FIXTURE = { name: 'kirocrew', mcpServers: {} }
 
@@ -203,6 +234,7 @@ export async function stubDashboardApi(page, opts = {}) {
     // KIROCREW_CONFIG_FIXTURE for why).
     if (path === '/api/config/kirocrew') return json(route, KIROCREW_CONFIG_FIXTURE)
     if (path === '/api/agent/config') return json(route, AGENT_CONFIG_FIXTURE)
+    if (path === '/api/kas-bundle') return json(route, KAS_BUNDLE_STATUS_FIXTURE)
     if (path === '/api/knowledge/stats') return json(route, KNOWLEDGE_STATS_FIXTURE)
     // Endpoints not worth naming individually: anything object-shaped gets {},
     // everything else gets []. Guessing wrong only costs an empty panel — in

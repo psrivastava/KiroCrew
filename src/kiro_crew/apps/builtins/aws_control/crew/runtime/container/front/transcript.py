@@ -38,7 +38,7 @@ thread is always ``dashboard``. Verified in the Kiro Crew wheel this image ships
 
 * ``dashboard/openai_compat.py:257`` takes the turn's ``id`` as the slot id and
   ``:296`` resolves it through ``state.get_or_create_slot``, which normalizes
-  with ``dashboard/state.py:_normalize_slot_key``.
+  with ``dashboard/state_parts/slot_directory.py:_normalize_slot_key``.
 * That function's docstring states the invariant a restart depends on:
   ``_safe_key(_history_key_for(key)) == f"dashboard_{key}"``. So the transcript
   stem is the slot key with a ``dashboard_`` prefix, and the file is
@@ -97,7 +97,7 @@ __all__ = [
 # module docstring for where this is established.
 THREAD_PREFIX = "dashboard"
 
-# Mirrors ``dashboard/state.py:_ascii_slot_key`` then the filename fold in
+# Mirrors ``dashboard/state_parts/slot_directory.py:_ascii_slot_key`` then the filename fold in
 # ``history.py:_safe_key`` (``re.ASCII`` pins ``\w`` to ``[a-zA-Z0-9_]``). Order
 # matters: the non-printable pass produces ``-``, which the filename fold keeps.
 _NON_PRINTABLE_RE = re.compile(r"[^\x20-\x7e]")
@@ -152,9 +152,10 @@ class S3TranscriptReader:
     boto3-shaped exceptions the tests would have to imitate here.
     """
 
-    def __init__(self, bucket: str, *, client=None) -> None:
+    def __init__(self, bucket: str, *, client=None, expected_owner: str | None = None) -> None:
         self._bucket = bucket
         self._client = client
+        self._expected_owner = expected_owner
 
     def _ensure_client(self):
         if self._client is None:
@@ -162,6 +163,12 @@ class S3TranscriptReader:
 
             self._client = boto3.client("s3")
         return self._client
+
+    def _owner(self) -> str:
+        """The task's own account, resolved once and sent as ``ExpectedBucketOwner``."""
+        if self._expected_owner is None:
+            self._expected_owner = objects.caller_account()
+        return self._expected_owner
 
     def get(self, key: str) -> bytes:
         """Fetch one object, bounded twice.
@@ -172,7 +179,9 @@ class S3TranscriptReader:
         A header is not a bound, which is the same reason the request-body limit on the
         turn route does not trust ``Content-Length`` either.
         """
-        resp = self._ensure_client().get_object(Bucket=self._bucket, Key=key)
+        resp = self._ensure_client().get_object(
+            Bucket=self._bucket, Key=key, ExpectedBucketOwner=self._owner()
+        )
         declared = resp.get("ContentLength")
         if isinstance(declared, int) and declared > MAX_TRANSCRIPT_BYTES:
             raise TranscriptTooLarge(
@@ -246,7 +255,7 @@ def is_fetchable_slot_id(slot_id: str) -> bool:
 def normalize_slot_key(slot_id: str) -> str:
     """Fold a turn's ``id`` exactly as the backend folds it into a slot key.
 
-    Mirrors ``dashboard/state.py:_normalize_slot_key``. The prefix stripping is
+    Mirrors ``dashboard/state_parts/slot_directory.py:_normalize_slot_key``. The prefix stripping is
     the part that matters here: ``id="dashboard_cust-1"`` reaches the SAME slot,
     and therefore the same transcript, as ``id="cust-1"``, so a fetch that
     skipped this step would miss the object for one of the two spellings and
@@ -329,7 +338,7 @@ def _resolve_transcript_key(reader: TranscriptReader, settings: Settings, stem: 
     digest = _digest_for_stem(index_raw, stem)
     if digest is None:
         # The committed index does not name this stem: a genuinely new conversation (an
-        # UNINDEXED stem, GPT's permitted absence). NOT a refusal -- the index exists and
+        # UNINDEXED stem, a permitted absence). NOT a refusal -- the index exists and
         # simply has no entry, which is the fresh-conversation case.
         return None
     return keys.blob_key(settings, digest)
@@ -363,7 +372,7 @@ def _committed_generation_id(pointer_raw: bytes) -> str:
 def _digest_for_stem(index_raw: bytes, stem: str) -> str | None:
     """The blob digest the committed index maps *stem* to, ``None`` when it names no stem.
 
-    Mirrors the index shape ``sidecar.backup._commit_transcript_index`` writes (a flat
+    Mirrors the index shape ``sidecar.backup_commit._commit_transcript_index`` writes (a flat
     ``stem -> digest`` object). Raises :class:`TranscriptUnavailable` when the index does not
     parse or maps the stem to a value that is not a blob digest -- the fail-closed direction,
     since a bad digest cannot name a blob and guessing past it serves the wrong conversation.
@@ -628,7 +637,9 @@ async def ensure_local_transcript(
         # rather than dropped: we cannot promise the conversation's history.
         raise TranscriptUnavailable(f"slot id does not map into the sessions dir: {stem!r}")
 
-    if _probe_local_entry(path):
+    # The probe opens and fstats the entry, so it runs off the event loop like every
+    # other filesystem step here; its refusals propagate out of the thread unchanged.
+    if await asyncio.to_thread(_probe_local_entry, path):
         # This task already served this conversation. The local copy leads S3 by
         # up to one backup interval, so re-fetching could only lose turns.
         logger.debug("transcript fetch: sid=%s already on disk; not re-fetching", stem)

@@ -305,11 +305,42 @@ _GIT_NEUTRALIZERS: list[tuple[str, str]] = [
     ("pull.verifySignatures", "false"),
     # Local/file transports exec the config-named pack programs directly —
     # GIT_ALLOW_PROTOCOL does not gate them because they are not a protocol.
-    # Every invocation here uses the literal remote name `origin`, so pinning
-    # these two keys restores git's own defaults over anything in .git/config.
+    # These two pins are NOT the guarantee: git keeps the FIRST value it reads
+    # for `remote.<name>.uploadpack`/`.receivepack`, and `.git/config` is read
+    # before any `-c`/GIT_CONFIG_* entry, so a vault-set value wins over them.
+    # The `--upload-pack`/`--receive-pack` flags from `_pack_program_args` are
+    # what closes it.
     ("remote.origin.uploadpack", "git-upload-pack"),
     ("remote.origin.receivepack", "git-receive-pack"),
 ]
+
+
+#: The remote-side program each subcommand would run, pinned by a command-line
+#: flag. The flag beats every config file for that invocation, whatever value
+#: the vault's ``.git/config`` sets and whichever remote is selected.
+_PACK_PROGRAM_FLAGS: dict[str, str] = {
+    "push": "--receive-pack=git-receive-pack",
+    "pull": "--upload-pack=git-upload-pack",
+    "fetch": "--upload-pack=git-upload-pack",
+    "ls-remote": "--upload-pack=git-upload-pack",
+    "clone": "--upload-pack=git-upload-pack",
+}
+
+
+def _pack_program_args(args: list[str]) -> list[str]:
+    """Insert the pack-program pin right after the subcommand, when it takes one.
+
+    Applied in :func:`run_git`, the one chokepoint every git call here passes
+    through, so a new remote-speaking call site cannot forget it. Only these
+    subcommands accept the flag; others (``status``, ``add``, a ``-c``-prefixed
+    ``merge``) are returned unchanged.
+    """
+    if not args:
+        return list(args)
+    flag = _PACK_PROGRAM_FLAGS.get(args[0])
+    if flag is None:
+        return list(args)
+    return [args[0], flag, *args[1:]]
 
 
 def _auth_env(pat: Optional[str]) -> dict[str, str]:
@@ -441,7 +472,7 @@ def _git_bin() -> str:
 #: helpers resolve from trusted system directories rather than an agent-writable
 #: entry inherited from the gateway's PATH. Two callers need it: git (ssh for
 #: ssh:// remotes, credential helpers, git-remote-*) and the file-manager reveal
-#: in `server.py` (`xdg-open` is a shell script that searches PATH for `gio`,
+#: in `server_host.py` (`xdg-open` is a shell script that searches PATH for `gio`,
 #: `gvfs-open`, `exo-open`, ...). POSIX only — on Windows (test runners) git's
 #: helpers live beside the install, so the inherited PATH is kept there.
 TRUSTED_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
@@ -494,7 +525,7 @@ async def run_git(
     proc = await asyncio.create_subprocess_exec(
         _git_bin(),
         *hook_off,
-        *args,
+        *_pack_program_args(args),
         cwd=cwd,
         env=env,
         stdout=asyncio.subprocess.PIPE,
@@ -616,6 +647,72 @@ async def _has_head(dir_: str) -> bool:
     """True when the repo has at least one commit."""
     code, _, _ = await run_git(["rev-parse", "--verify", "HEAD"], dir_, check=False)
     return code == 0
+
+
+def fetch_head_mtime_ms(gitdir: str) -> Optional[int]:
+    """When the checkout behind *gitdir* last fetched, as epoch ms; None if never.
+
+    Read from ``FETCH_HEAD``'s mtime: git rewrites that file on every ``fetch``
+    and ``pull``, whether or not anything new arrived, and nothing else writes
+    it, so it is the one marker a pull made outside the app always leaves. A
+    push leaves no such marker (the reflog is optional and ``gc`` rewrites it),
+    so a push-only flow is seen at the next fetch.
+
+    A plain stat, meant for a caller's worker thread: it runs on every
+    external-change poll, so it must start no git process. The mtime is only
+    ever a label's input, so nothing here guards it -- ``.git`` is
+    agent-writable and the caller clamps the value to now.
+    """
+    try:
+        st = os.stat(os.path.join(gitdir, "FETCH_HEAD"))
+    except OSError:
+        return None
+    return int(st.st_mtime * 1000)
+
+
+async def gitdir_is_trusted(dir_: str, trusted_gitdir: str) -> bool:
+    """Whether *dir_*'s ``.git`` still resolves to the git dir recorded at clone/attach.
+
+    The same pin :func:`sync` enforces before acting: a redirected ``.git``
+    pointer would otherwise have another repository's state read as this
+    vault's.
+    """
+    current = await _git_dir(dir_)
+    trusted_real = await asyncio.to_thread(os.path.realpath, trusted_gitdir)
+    return current is not None and current == trusted_real
+
+
+async def remote_is_trusted(dir_: str, trusted_remote: str) -> bool:
+    """Whether every configured origin URL (fetch and push) is still *trusted_remote*.
+
+    The vault's ``.git/config`` is agent-writable, so a prompt-injected agent
+    could repoint ``remote.origin.url`` (or add a ``pushurl``) at an attacker.
+    The trusted URL is persisted in vaults.json, behind the sensitive-path
+    floor; :func:`sync` refuses on a mismatch before it pushes, and the
+    external-sync check refuses before it reads the tracking ref.
+    """
+    trusted = _norm_remote(trusted_remote)
+    effective = await _all_origin_urls(dir_)
+    return bool(effective) and all(_norm_remote(u) == trusted for u in effective)
+
+
+async def head_is_fetched_tip(dir_: str) -> bool:
+    """True when HEAD is the remote-tracking ref of the checked-out branch.
+
+    The same ``remote_oid == local_oid`` observation :func:`sync` makes right
+    after its own fetch, which is what earns a clean-sync stamp there. Every
+    ``fetch`` and ``pull`` of the branch moves ``refs/remotes/origin/<branch>``,
+    so this is what the vault knows of its remote. The origin pin
+    (:func:`remote_is_trusted`) is the caller's job and runs first.
+    """
+    branch = await _current_branch(dir_)
+    if branch is None:
+        return False
+    code, out, _ = await run_git(
+        ["rev-parse", "HEAD", f"refs/remotes/origin/{validate_ref(branch)}"], dir_, check=False
+    )
+    oids = out.split()
+    return code == 0 and len(oids) == 2 and oids[0] == oids[1]
 
 
 async def clone_vault(
@@ -810,11 +907,11 @@ async def status(dir_: str, subfolder: Optional[str] = None) -> list[FileChange]
     # OWNERSHIP, NOT NAME SHAPE, is what authorizes hiding a file. `<name>.<32
     # hex>.tmp` is the shape this module PRODUCES; it is not a shape only this
     # module can produce. A user -- or another tool -- may genuinely create a
-    # file with that name, and an earlier revision of this filter excluded it on
-    # the shape alone. That file then vanished from the pending badge, from the
-    # commit, and from the remote, with nothing to tell anyone it had been
-    # dropped. Silently withholding unknown filesystem content from the user's
-    # own git repository is a worse failure than committing a stray temp.
+    # file with that name. Excluding it on the shape alone would make that file
+    # vanish from the pending badge, from the commit, and from the remote, with
+    # nothing to tell anyone it had been dropped. Silently withholding unknown
+    # filesystem content from the user's own git repository is a worse failure than
+    # committing a stray temp.
     #
     # So only `is_inflight_temp` may hide a path: a temp THIS process currently
     # knows it is publishing, registered for the whole stage-and-retry
@@ -1171,9 +1268,7 @@ async def sync(
         # there. The trusted URL is persisted in vaults.json, which is behind the
         # sensitive-path floor.
         if trusted_remote is not None:
-            trusted = _norm_remote(trusted_remote)
-            effective = await _all_origin_urls(dir_)
-            if not effective or any(_norm_remote(u) != trusted for u in effective):
+            if not await remote_is_trusted(dir_, trusted_remote):
                 raise GitError(
                     "this vault's git remote URL no longer matches the trusted URL it "
                     "was created with — refusing to sync to avoid pushing to an "
@@ -1185,9 +1280,7 @@ async def sync(
     # an unrelated same-origin checkout. Verify the canonical git dir still
     # matches the one recorded at attach/clone time.
     if trusted_gitdir is not None:
-        current_gitdir = await _git_dir(dir_)
-        trusted_real = await asyncio.to_thread(os.path.realpath, trusted_gitdir)
-        if current_gitdir is None or current_gitdir != trusted_real:
+        if not await gitdir_is_trusted(dir_, trusted_gitdir):
             raise GitError(
                 "this vault's .git location no longer matches where it was "
                 "created — refusing to sync to avoid acting on an unrelated "

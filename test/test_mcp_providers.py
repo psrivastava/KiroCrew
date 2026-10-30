@@ -11,6 +11,7 @@ import json
 
 import pytest
 
+from kiro_crew import http_proxy
 from kiro_crew.mcp_providers import official as official_mod
 from kiro_crew.mcp_providers.base import (
     McpSearchResult,
@@ -301,9 +302,9 @@ class TestSpecTranslation:
         )
 
     def test_runtime_args_precede_target_package_args_follow(self):
-        """Regression (review finding): runtime args fed to npx/uvx must come
-        BEFORE the package target and package args AFTER it — the v0 merge
-        passed runtime flags to the package and persisted the broken spec."""
+        """Runtime args fed to npx/uvx must come BEFORE the package target and
+        package args AFTER it — otherwise runtime flags reach the package and
+        the broken spec is persisted."""
         server = {
             "packages": [
                 {
@@ -526,6 +527,26 @@ class TestFetchJsonRead:
             await official_mod._fetch_json("https://registry.example/v0.1/servers")
 
     @pytest.mark.asyncio
+    async def test_non_utf8_body_surfaces_as_provider_unavailable(self, monkeypatch):
+        """A 200 body that is not UTF-8 is a provider failure, not a crash.
+
+        A captive portal or proxy interstitial in a legacy code page answers
+        200 with bytes that fail to decode. UnicodeDecodeError is a
+        ValueError, not a JSONDecodeError, so without its own clause it
+        escapes the callers, which catch only ProviderUnavailableError.
+        """
+        _serve(monkeypatch, b"<html>caf\xe9 portal</html>")
+
+        try:
+            await official_mod._fetch_json("https://registry.example/v0.1/servers")
+        except ProviderUnavailableError as exc:
+            assert isinstance(exc.__cause__, UnicodeDecodeError)
+        except Exception as exc:  # noqa: BLE001 - the escape is the bug under test
+            pytest.fail(f"undecodable body escaped as {exc!r}")
+        else:
+            pytest.fail("undecodable body was returned as a document")
+
+    @pytest.mark.asyncio
     async def test_env_proxy_is_passed_to_request(self, monkeypatch):
         """Behind an HTTP(S) proxy, the request is sent through it.
 
@@ -536,12 +557,12 @@ class TestFetchJsonRead:
         raw = json.dumps({"servers": []}).encode("utf-8")
         response = _serve(monkeypatch, raw)
         monkeypatch.setattr(
-            official_mod.urllib.request,
+            http_proxy.urllib.request,
             "getproxies",
             lambda: {"https": "http://proxy.example:3128"},
         )
         # Pinned so a bypass list on the host running the test cannot decide it.
-        monkeypatch.setattr(official_mod.urllib.request, "proxy_bypass", lambda _host: False)
+        monkeypatch.setattr(http_proxy.urllib.request, "proxy_bypass", lambda _host: False)
 
         await official_mod._fetch_json("https://registry.example/v0.1/servers")
 
@@ -569,6 +590,16 @@ class TestFetchJsonRead:
             monkeypatch.delenv(name.upper(), raising=False)
         monkeypatch.setenv("HTTPS_PROXY", "http://proxy.example:3128")
         monkeypatch.setenv("NO_PROXY", no_proxy)
+        monkeypatch.setattr(
+            http_proxy.urllib.request,
+            "getproxies",
+            http_proxy.urllib.request.getproxies_environment,
+        )
+        monkeypatch.setattr(
+            http_proxy.urllib.request,
+            "proxy_bypass",
+            http_proxy.urllib.request.proxy_bypass_environment,
+        )
         raw = json.dumps({"servers": []}).encode("utf-8")
         response = _serve(monkeypatch, raw)
 
@@ -581,7 +612,7 @@ class TestFetchJsonRead:
         """With no proxy configured, nothing changes — a direct request."""
         raw = json.dumps({"servers": []}).encode("utf-8")
         response = _serve(monkeypatch, raw)
-        monkeypatch.setattr(official_mod.urllib.request, "getproxies", lambda: {})
+        monkeypatch.setattr(http_proxy.urllib.request, "getproxies", lambda: {})
 
         await official_mod._fetch_json("https://registry.example/v0.1/servers")
 

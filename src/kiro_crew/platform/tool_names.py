@@ -13,7 +13,7 @@ the create/overwrite tool -- and also the capability name KAS files ``str_replac
 the family and none of the rest. So a name written for kiro-cli names less on KAS
 than it does on kiro-cli unless something translates it.
 
-Two readings live here, one per direction, and both are consumed:
+Three readings live here, and all are consumed:
 
 * :data:`KAS_TOOL_FAMILY_BY_KIRO_CLI_NAME` -- the MOUNT direction.
   ``kas_agents._project_tools`` carries each kiro-cli name with its family
@@ -24,6 +24,11 @@ Two readings live here, one per direction, and both are consumed:
   ``str_replace`` exactly where it binds to ``fs_write``. A mount widened in one
   vocabulary and a rule read in the other is how the operator's own control
   stops applying.
+* :data:`KIRO_TOOL_ALIASES` -- kiro-cli's OWN short spellings.
+  kiro-cli stamps ``shell``, ``read`` and ``write`` on the built-ins a spec and a
+  rule call ``execute_bash``, ``fs_read`` and ``fs_write``; the KAS projection
+  matches a spec entry under either spelling and ``hooks.on_tool_call`` reads a
+  stamp under the one a rule is written in.
 
 A LEAF on purpose: stdlib only, so both the ACP projection and the PreToolUse
 gate can import it with no cycle (``hooks`` cannot import from ``kiro_crew.acp``
@@ -79,9 +84,12 @@ def kas_vocabulary_drift(version: tuple[int, int, int] | None) -> str:
     ``"older"`` below the earliest verified release, ``"newer"`` above the
     latest, ``"unverified"`` for a release between two verified ones that was
     itself never measured; ``"unknown"`` when no version could be established.
-    The comparison ``kirocrew doctor`` reports as its advisory row. An
-    unverified release ships a KAS that may rename, add or lack a built-in; the
-    mount direction then fails silent and the policy direction fails permissive.
+    ONE comparison shared by ``kirocrew doctor`` (its advisory row) and the KAS
+    session start (a once-per-process warning), so the two surfaces cannot
+    disagree on what counts as drift. An unverified release ships a KAS that
+    may rename, add or lack a built-in; the mount direction then fails silent
+    and the policy direction fails permissive, which is why drift is worth
+    saying where an operator will see it without running a command.
     """
     if version is None:
         return "unknown"
@@ -149,6 +157,22 @@ KIRO_CLI_NAME_BY_KAS_TOOL: dict[str, str] = {
 #: reaches it, because an operator who denied writes denied deletes.
 POLICY_ALIAS_DENY_ONLY_IDS: frozenset[str] = frozenset({"delete_file"})
 
+#: kiro-cli's short spelling of a built-in -> the name a spec or a rule is written in.
+#:
+#: kiro-cli's legacy ``shell`` spec key, which is also the ``_meta.kiro.toolName``
+#: it stamps on its shell built-in (recorded live in
+#: ``test/fixtures/acp_frames/kiro/session.jsonl``), and the short ``read`` /
+#: ``write`` names KAS's own tool table classifies as ``fs_read`` / ``fs_write``.
+#: A value is only ever a name ``governance.BUILTIN_TOOL_SCOPES`` already governs:
+#: the deny rules, governance and the read-only proof all resolve a stamp through
+#: this table (``hooks._host_builtin_alias``), and the proof's own allowlist then
+#: decides what a resolved name may prove.
+KIRO_TOOL_ALIASES: dict[str, str] = {
+    "shell": "execute_bash",
+    "read": "fs_read",
+    "write": "fs_write",
+}
+
 
 def expand_kiro_cli_tool_names(entries: list[str]) -> list[str]:
     """*entries* with each kiro-cli built-in followed by its KAS family members.
@@ -208,6 +232,54 @@ _EXCLUSION_FAMILY_BY_KIRO_CLI_NAME: dict[str, tuple[str, ...]] = {
     )
     for kiro_cli_name in dict.fromkeys(KIRO_CLI_NAME_BY_KAS_TOOL.values())
 }
+
+
+#: DeepSeek Harness read-only built-in -> ``(kiro-cli policy name, target parameter)``.
+#:
+#: dsh's ACP bridge states the dispatched tool's own name as a ``tool_call`` frame's
+#: ``title`` and names nothing else about the call; every MCP tool it serves is
+#: ``mcp__<server>__<tool>``, so a bare name here is its own built-in (recorded live in
+#: ``test/fixtures/acp_frames/deepseek/side-read-only-live.jsonl``). The policy name is
+#: what a rule about the tool is written under. The target parameter is the argument
+#: naming what the tool reads. dsh resolves a missing (``grep``, ``glob``) or
+#: relative one against the session's work dir, which the gate cannot see, so only
+#: an absolute target is proved. The owner is the stock dsh package that registers
+#: the tool; the name proves the tool only on a session whose launch showed that
+#: package owns it (``agent_sdk.tool_gate.deepseek_read_only_owner_issue``).
+DEEPSEEK_READ_ONLY_TOOLS: dict[str, tuple[str, str, str]] = {
+    "read": ("fs_read", "file_path", "@deepseek-ai/dsh-tool-fs"),
+    "grep": ("grep", "path", "@deepseek-ai/dsh-tool-fs-search"),
+    "glob": ("glob", "path", "@deepseek-ai/dsh-tool-fs-search"),
+}
+
+
+def deepseek_policy_alias(tool_name: str) -> str:
+    """The kiro-cli policy name of a DeepSeek Harness read built-in, else ``""``."""
+    entry = DEEPSEEK_READ_ONLY_TOOLS.get(tool_name)
+    return entry[0] if entry else ""
+
+
+#: pi's read-only built-ins, by the bare name pi's gate extension states, -> the
+#: kiro-cli built-in that does the same job (``ls`` lists a directory, as
+#: ``fs_read`` does). For the pi Side Chat seam to map from.
+PI_READ_ONLY_BUILTINS: dict[str, str] = {
+    "read": "fs_read",
+    "grep": "grep",
+    "find": "glob",
+    "ls": "fs_read",
+}
+
+#: Every harness whose permission TITLE is its bare tool name -> that name's
+#: kiro-cli name, so governance asks the title and ``harness_builtin_tool`` as one
+#: tool. claude is not here: its permission title carries the arguments
+#: (``Read .env``), so it never equals a bare name. Only consulted once a seam
+#: has already stated ``harness_builtin_tool``; it proves nothing alone.
+HARNESS_READ_POLICY_NAMES: dict[str, str] = {**PI_READ_ONLY_BUILTINS}
+
+
+def is_harness_read_alias(native: str, builtin: str) -> bool:
+    """True when *native* is a harness's own name for the kiro-cli *builtin*."""
+    return bool(builtin) and HARNESS_READ_POLICY_NAMES.get(native) == builtin
 
 
 def policy_aliases(*identities: str) -> tuple[str, ...]:

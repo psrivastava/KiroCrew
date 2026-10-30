@@ -60,6 +60,13 @@ export const ImageVersionCtx = createContext<string | null>(null)
  *  that happens to contain `%XX` (which must be preserved verbatim). */
 export const MdSourceCtx = createContext<string | null>(null)
 
+/** The document line the block handed to ReactMarkdown starts on. The renderer
+ *  splits a document into blocks at code fences and parses each on its own, so
+ *  a node's `position.start.line` counts from its block. Text comments add this
+ *  offset through `data-block-start`; ImgWithFallback adds it from here, so an
+ *  image below a fence gets its document line. */
+export const MdBlockStartCtx = createContext(1)
+
 /**
  * Per-consumer override for rendered markdown LINKS.
  *
@@ -100,16 +107,26 @@ export const LinkUnfurlCtx = createContext<LinkUnfurl>({ enabled: false, live: f
  *
  * `InlineCode` consults it so a code span used as a link label —
  * ``[`https://example.com/x`](https://example.com/x)`` — stays inert instead of
- * becoming a click-to-copy chip. The chip's handler calls `preventDefault`, and
- * that cancels the anchor's default action from anywhere in propagation, so
- * without this the label copied and the link silently stopped navigating (a
- * regression from #4433, which gave non-path spans a primary-click copy).
+ * becoming a chip. Every chip's handler calls `preventDefault`, and that
+ * cancels the anchor's default action from anywhere in propagation, so without
+ * this the label copied (#5730, a regression from #4433, which gave non-path
+ * spans a primary-click copy) or, on a link to a web page whose label named a
+ * real local path, opened that path (#5745), and the link silently stopped
+ * navigating.
  *
  * Provided only where `MdAnchor` places `children` inside an `<a>`. The Jira and
  * forge chips render a parsed label instead of `children`, and a `LinkOverride`
  * owns its element outright, so neither needs it.
+ *
+ * The value says where the link goes. `'external'`: its href carries a scheme
+ * or is protocol-relative, so the click leaves the dashboard and the link wins
+ * over every chip, a confirmed path chip included. `'local'`: a root-relative,
+ * relative or fragment href. Such an href is often the very file the label
+ * names (``[`README.md`](README.md)``) and the anchor cannot always open it
+ * itself, so a confirmed path chip keeps the click there.
  */
-export const InsideLinkCtx = createContext(false)
+export type InsideLink = false | 'external' | 'local'
+export const InsideLinkCtx = createContext<InsideLink>(false)
 
 /**
  * Whether inline-code chips may issue stat probes.
@@ -207,3 +224,14 @@ export type SidebarFolderActions = {
   folders?: readonly { id: string; name: string; parent_id?: string }[]
 }
 export const SidebarFolderCtx = createContext<SidebarFolderActions>({})
+
+/**
+ * Where a paragraph's closed-session notices render: a block the paragraph
+ * draws right after itself, so a notice about a link or chip in mid-sentence
+ * sits BELOW the paragraph instead of inside it, and the sentence reads whole.
+ * `null` where no paragraph provides one (a tight list item, a heading, a
+ * table cell): the notice then renders inline, after the reference's own
+ * trailing punctuation. Provided by `MdParagraph` for a paragraph that holds a
+ * session reference, and only then, so other paragraphs keep their exact DOM.
+ */
+export const ParagraphNoticeSlotCtx = createContext<HTMLElement | null>(null)

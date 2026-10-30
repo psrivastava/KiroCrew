@@ -9,7 +9,6 @@ matching how add_source ingests the same file.
 
 from __future__ import annotations
 
-import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -19,6 +18,7 @@ from aiohttp.test_utils import TestClient, TestServer
 from kiro_crew.dashboard.handlers import knowledge as kh
 from kiro_crew.dashboard.handlers.knowledge import sync_source
 from kiro_crew.knowledge.store import KnowledgeStore
+from kiro_crew.testing.wait import async_wait_until
 
 
 @pytest.fixture()
@@ -38,7 +38,6 @@ def _make_app(store, pipeline=None):
         app["knowledge_pipeline"] = pipeline
     # No connector for local_file (matches production registration)
     app["knowledge_sync"] = MagicMock(get_connector=MagicMock(return_value=None))
-    app["knowledge_fetch_pool"] = MagicMock()
     app.router.add_post("/api/knowledge/sources/{id}/sync", sync_source)
     return app
 
@@ -51,18 +50,19 @@ async def _await_sync_status(store, source_id: str, want: str) -> str:
     on a loaded runner. Waiting for a NAMED status rather than "anything terminal"
     is deliberate: 'pending' is both the row's initial value AND the terminal
     outcome of a budget deferral, so a generic wait cannot tell "not started yet"
-    from "deferred". Returning the last-seen status keeps the caller's assertion
-    message truthful when the wait times out.
+    from "deferred". A wait that runs out fails naming the last-seen status.
     """
     status = None
-    for _ in range(200):
+
+    def _stamped() -> bool:
+        nonlocal status
         row = store.db.execute(
             "SELECT sync_status FROM sources WHERE id = ?", (source_id,)
         ).fetchone()
         status = row["sync_status"] if row else None
-        if status == want:
-            return status
-        await asyncio.sleep(0.01)
+        return status == want
+
+    await async_wait_until(_stamped, describe=lambda: f"sync_status is {status!r}, want {want!r}")
     return status
 
 
@@ -76,10 +76,8 @@ class TestSyncLocalFile:
         pipeline = MagicMock()
         pipeline.ingest_file = AsyncMock()
         # Guard: the agent URL-fetch path must NOT be used for local_file
-        fetch_spy = AsyncMock(
-            side_effect=AssertionError("local_file must not use fetch_url_content")
-        )
-        monkeypatch.setattr(kh, "fetch_url_content", fetch_spy)
+        fetch_spy = AsyncMock(side_effect=AssertionError("local_file must not use fetch_page"))
+        monkeypatch.setattr(kh, "fetch_page", fetch_spy)
 
         sid = store.add_source(name="doc.md", source_type="local_file", uri=str(test_file))
         # Simulate the prior buggy state (source left in error after a failed agent sync)

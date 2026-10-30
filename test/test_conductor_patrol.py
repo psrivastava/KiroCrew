@@ -5,7 +5,7 @@ Pins the four behaviours ``conductor_patrol`` exists for:
 * the first bind on a loop-less conductor arms ONE ``watch="work-ledger"`` loop
   through the real authorizer, as an outside arm, so a crew/member slot refuses
   it and no self-arm trust record is written;
-* a slot that already holds a loop -- active or stopped and retained -- is left
+* a slot that already holds an active loop, or one a person stopped, is left
   alone, so a second bind never stacks a second loop;
 * a refused arm is logged at WARNING and the bind still succeeds;
 * ``work_ledger_read`` flags each OPEN item ``unpatrolled`` while the conductor
@@ -30,7 +30,11 @@ from skill_script_helpers import load_skill_script
 
 from kiro_crew import autonudge, autonudge_authz, conductor_patrol
 from kiro_crew import work_ledger as wl
-from kiro_crew.autonudge import AutoNudgeService, MonitorUpdateConflict
+from kiro_crew.autonudge import (
+    SERVICE_SHUTTING_DOWN_MESSAGE,
+    AutoNudgeService,
+    MonitorUpdateConflict,
+)
 from kiro_crew.dashboard.handlers import work_ledger as routes
 from kiro_crew.monitoring.models import MonitorActionCompletion, MonitorActionDisposition
 
@@ -265,11 +269,14 @@ async def test_second_bind_does_not_arm_a_second_loop(svc, audits):
 async def test_a_stopped_retained_loop_is_left_alone(svc, audits):
     """A person's stop must not be revived by a later bind."""
     item_id = await _setup()
-    stopped = SimpleNamespace(id="kept", slot_key=CONDUCTOR, active=False)
+    stopped = SimpleNamespace(
+        id="kept", slot_key=CONDUCTOR, active=False, stopped_reason="", monitor=None
+    )
     svc.loops[CONDUCTOR] = stopped
     body = await _bind(item_id, WORKER)
 
-    assert body["patrol"] == conductor_patrol.EXISTING
+    assert body["patrol"] == conductor_patrol.REFUSED
+    assert body["patrol_reason"] == conductor_patrol.REASON_USER_STOPPED
     assert body["patrol_note"] == conductor_patrol.ARM_YOURSELF_NOTE
     assert svc.added == []
     assert svc.loops[CONDUCTOR] is stopped
@@ -289,7 +296,8 @@ async def test_a_person_stopped_default_patrol_is_left_alone(svc, audits):
     svc.loops[CONDUCTOR] = stopped
     body = await _bind(item_id, WORKER)
 
-    assert body["patrol"] == conductor_patrol.EXISTING
+    assert body["patrol"] == conductor_patrol.REFUSED
+    assert body["patrol_reason"] == conductor_patrol.REASON_USER_STOPPED
     assert body["patrol_note"] == conductor_patrol.ARM_YOURSELF_NOTE
     assert svc.loops[CONDUCTOR] is stopped
 
@@ -682,3 +690,94 @@ async def test_a_displaced_default_emits_no_fired_frame_after_its_wake(tmp_path)
         assert ("fired", default.id) not in events
     finally:
         svc.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_bind_after_shutdown_closed_admission_is_refused_before_add_and_still_commits(
+    tmp_path, monkeypatch, audits, caplog
+):
+    """The authorizer refuses a closed service before the ordinary admitted ``add``.
+
+    The bind still commits: the reply says ``refused`` and carries the arm-yourself
+    note. The service stays published through dashboard teardown, so a late bind can
+    still reach it. The expected shutdown refusal is logged at DEBUG rather than
+    WARNING.
+    """
+    real = AutoNudgeService(base_dir=tmp_path / "nudge")
+    monkeypatch.setattr(autonudge, "get_instance", lambda: real)
+    add = AsyncMock(side_effect=AssertionError("closed admission reached svc.add"))
+    monkeypatch.setattr(real, "add", add)
+    await real.shutdown()
+    item = await _setup()
+    caplog.set_level(logging.DEBUG, logger="kiro_crew.conductor_patrol")
+
+    body = await _bind(item, WORKER)
+
+    assert body["patrol"] == conductor_patrol.REFUSED
+    assert body["patrol_note"] == conductor_patrol.ARM_YOURSELF_NOTE
+    add.assert_not_awaited()
+    assert real.get_by_slot(CONDUCTOR) is None
+    patrol_logs = [r for r in caplog.records if r.name == "kiro_crew.conductor_patrol"]
+    assert [(r.levelno, r.getMessage()) for r in patrol_logs] == [
+        (logging.DEBUG, f"conductor patrol not armed for {CONDUCTOR}: auto-nudge is shutting down")
+    ]
+    assert [event["outcome"] for event in audits] == ["denied"]
+    assert audits[-1]["error"] == SERVICE_SHUTTING_DOWN_MESSAGE
+
+
+@pytest.mark.asyncio
+async def test_closed_admission_outranks_audit_unavailable_for_conductor_bind(
+    tmp_path, monkeypatch, caplog
+):
+    """The closed-service refusal wins before the critical invoked audit runs."""
+    real = AutoNudgeService(base_dir=tmp_path / "nudge")
+    monkeypatch.setattr(autonudge, "get_instance", lambda: real)
+    await real.shutdown()
+    assert real.accepting_mutations is False
+
+    def _unavailable_sel() -> Any:
+        raise OSError("SEL unavailable")
+
+    monkeypatch.setattr(autonudge_authz, "sel", _unavailable_sel)
+    item = await _setup()
+    caplog.set_level(logging.DEBUG, logger="kiro_crew.conductor_patrol")
+
+    body = await _bind(item, WORKER)
+
+    assert body["patrol"] == conductor_patrol.REFUSED
+    assert body["patrol_note"] == conductor_patrol.ARM_YOURSELF_NOTE
+    assert real.get_by_slot(CONDUCTOR) is None
+    patrol_logs = [r for r in caplog.records if r.name == "kiro_crew.conductor_patrol"]
+    assert [(r.levelno, r.getMessage()) for r in patrol_logs] == [
+        (logging.DEBUG, f"conductor patrol not armed for {CONDUCTOR}: auto-nudge is shutting down")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_an_audit_outage_that_races_closure_still_logs_its_refusal_at_warning(
+    tmp_path, monkeypatch, caplog
+):
+    """Only the canonical shutdown refusal drops to DEBUG. Admission that closes while
+    the critical invoked audit fails leaves the bind with the audit's own 503, which is
+    a fault and stays a WARNING."""
+    real = AutoNudgeService(base_dir=tmp_path / "nudge")
+    monkeypatch.setattr(autonudge, "get_instance", lambda: real)
+
+    def _closing_then_unavailable() -> Any:
+        # The gateway's stop closes admission while the audit is being written.
+        real._accepting_mutations = False
+        raise OSError("SEL unavailable")
+
+    monkeypatch.setattr(autonudge_authz, "sel", _closing_then_unavailable)
+    item = await _setup()
+    caplog.set_level(logging.DEBUG, logger="kiro_crew.conductor_patrol")
+
+    body = await _bind(item, WORKER)
+
+    assert body["patrol"] == conductor_patrol.REFUSED
+    assert real.accepting_mutations is False
+    assert real.get_by_slot(CONDUCTOR) is None
+    patrol_logs = [r for r in caplog.records if r.name == "kiro_crew.conductor_patrol"]
+    assert [r.levelno for r in patrol_logs] == [logging.WARNING]
+    assert "audit log unavailable" in patrol_logs[0].getMessage()
+    assert SERVICE_SHUTTING_DOWN_MESSAGE not in patrol_logs[0].getMessage()

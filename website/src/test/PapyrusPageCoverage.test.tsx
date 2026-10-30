@@ -108,16 +108,21 @@ vi.mock('../apps/papyrus/PapyrusEditor', async () => {
 
 vi.mock('../apps/papyrus/PdfPreview', () => ({ default: () => <div data-testid="pdf" /> }))
 
-// CoAuthorPanel mounts the whole ChatPage; only the three handlers the page passes
-// it are under test here.
+// CoAuthorPanel mounts the whole ChatPage; only the handlers the page passes it
+// are under test here.
 vi.mock('../apps/papyrus/CoAuthorPanel', () => ({
-  default: ({ onStartSession, onOpenFull, onClose }: {
+  default: ({ slotKey, onStartSession, onSessionGone, onSessionReplaced, onOpenFull, onClose }: {
+    slotKey: string | null
     onStartSession: () => void
+    onSessionGone: (slotKey: string) => void
+    onSessionReplaced: (oldKey: string, newKey: string) => void
     onOpenFull: () => void
     onClose: () => void
   }) => (
-    <div data-testid="co-author-panel">
+    <div data-testid="co-author-panel" data-slot={slotKey ?? ''}>
       <button type="button" onClick={onStartSession}>start session</button>
+      <button type="button" onClick={() => slotKey && onSessionGone(slotKey)}>session gone</button>
+      <button type="button" onClick={() => slotKey && onSessionReplaced(slotKey, 'replacement-slot')}>session replaced</button>
       <button type="button" onClick={onOpenFull}>open full chat</button>
       <button type="button" onClick={onClose}>close panel</button>
     </div>
@@ -326,6 +331,16 @@ describe('Papyrus compile', () => {
 })
 
 describe('Papyrus status bar and log pane', () => {
+  it('hides clean main-file status but shows its unsaved warning', async () => {
+    openWorkspace()
+    await workspaceReady()
+    expect(screen.queryByText(`Editing ${MAIN}`)).not.toBeInTheDocument()
+
+    makeDirty(`${BODY}\n% unsaved`)
+
+    expect(screen.getByText(`Editing ${MAIN} — unsaved`)).toBeInTheDocument()
+  })
+
   it('toggles the log pane and marks its pressed state', async () => {
     const { user } = openWorkspace()
     await workspaceReady()
@@ -415,12 +430,18 @@ describe('Papyrus file tree mutations', () => {
     const { user } = openWorkspace()
     await workspaceReady()
     await user.click(screen.getByRole('button', { name: CHAPTER }))
-    await screen.findByText(`Editing ${CHAPTER}`)
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: CHAPTER })).toHaveAttribute(
+        'aria-current', 'true',
+      ))
 
     await user.click(screen.getByRole('button', { name: `Delete ${CHAPTER}` }))
 
     await waitFor(() => expect(api.deleteFile).toHaveBeenCalledWith(PROJECT, CHAPTER))
-    expect(await screen.findByText(`Editing ${MAIN}`)).toBeInTheDocument()
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: `${MAIN} Main` })).toHaveAttribute(
+        'aria-current', 'true',
+      ))
   })
 
   it('does not delete when the confirmation is declined', async () => {
@@ -603,25 +624,42 @@ describe('Papyrus co-author session', () => {
     expect(await screen.findByTestId('co-author-panel')).toBeInTheDocument()
     await waitFor(() => expect(chat.createChatSlot).toHaveBeenCalled())
     expect(chat.createChatSlot.mock.calls[0]?.[4]).toBe('persistent')
-    // The paper's identity is handed to the agent silently, not typed by the user.
+    // The paper's identity is handed to the agent silently, not typed by the user, and its
+    // queue residency is bounded like every other in-repo /context caller's.
     await waitFor(() => expect(chat.chatSlotContext).toHaveBeenCalledWith(
       SLOT,
       expect.stringContaining(PROJECT),
-      { source: 'papyrus-co-author', ephemeral: true },
+      { source: 'papyrus-co-author', ephemeral: true, maxAge: 3600 },
     ))
     // ...and remembered, so reopening the paper reuses it.
     expect(localStorage.getItem(SLOT_KEY_PREFIX + PROJECT)).toBe(SLOT)
   })
 
-  it('reuses the remembered slot instead of minting another', async () => {
+  it('reuses the remembered slot instead of minting another, follows its replacement, and forgets it once gone', async () => {
     localStorage.setItem(SLOT_KEY_PREFIX + PROJECT, SLOT)
     const { user } = openWorkspace()
     await workspaceReady()
 
     await user.click(screen.getByRole('button', { name: /Co-author/ }))
 
-    expect(await screen.findByTestId('co-author-panel')).toBeInTheDocument()
+    expect(await screen.findByTestId('co-author-panel')).toHaveAttribute('data-slot', SLOT)
     expect(chat.createChatSlot).not.toHaveBeenCalled()
+
+    // The embedded chat replaced the session (a memory-mode pick): the paper
+    // remembers the new one and hands it the paper's context.
+    await user.click(screen.getByRole('button', { name: 'session replaced' }))
+    expect(screen.getByTestId('co-author-panel')).toHaveAttribute('data-slot', 'replacement-slot')
+    expect(localStorage.getItem(SLOT_KEY_PREFIX + PROJECT)).toBe('replacement-slot')
+    await waitFor(() => expect(chat.chatSlotContext).toHaveBeenCalledWith(
+      'replacement-slot', expect.stringContaining(PROJECT), expect.anything(),
+    ))
+
+    // The gateway no longer has that session: the paper drops it, so the panel
+    // offers a new one instead of trying the dead key on every open.
+    await user.click(screen.getByRole('button', { name: 'session gone' }))
+
+    expect(screen.getByTestId('co-author-panel')).toHaveAttribute('data-slot', '')
+    expect(localStorage.getItem(SLOT_KEY_PREFIX + PROJECT)).toBeNull()
   })
 
   it('reports a slot that could not be created', async () => {
@@ -650,9 +688,9 @@ describe('Papyrus co-author session', () => {
     await waitFor(() => expect(chat.chatSlotContext).toHaveBeenCalled())
   })
 
-  it('keeps the session when the silent context push fails', async () => {
-    // The context is a convenience for the agent, not something the user asked
-    // for — failing it must not tear down a working session or raise a banner.
+  it('keeps the session when the context push fails, and says so', async () => {
+    // The session must survive -- the context is a convenience, not something the user
+    // asked for. But `errors-use-error-notice` is blocking, so it cannot fail SILENTLY.
     chat.chatSlotContext.mockRejectedValue(new Error('context rejected'))
     const { user } = openWorkspace()
     await workspaceReady()
@@ -660,7 +698,7 @@ describe('Papyrus co-author session', () => {
     await user.click(screen.getByRole('button', { name: /Co-author/ }))
 
     await waitFor(() => expect(localStorage.getItem(SLOT_KEY_PREFIX + PROJECT)).toBe(SLOT))
-    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    expect(await screen.findByRole('alert')).toHaveTextContent(/next message/i)
   })
 
   it('closes the panel again', async () => {

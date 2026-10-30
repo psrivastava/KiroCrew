@@ -419,8 +419,8 @@ def open_create_or_existing(
     *flags* carries everything but the create bits (``O_RDWR``, ``O_NOFOLLOW``,
     ``O_APPEND``, ...). *dir_fd* makes the open descriptor-relative, so a caller
     that pinned the directory keeps its pin anchoring the open. Returns the raw
-    integer fd; the caller owns it. Shared by the SEL chain lock, the decision
-    log and the app-deps provisioning lock, which all hit the same race.
+    integer fd; the caller owns it. Every by-name lock-sidecar open in the
+    package goes through it, since each one can meet the same race.
     """
     name = os.fspath(path)
     try:
@@ -511,7 +511,8 @@ def try_acquire_lock_or_raise(fd: int, *, exclusive: bool = False) -> bool:
     filesystem that cannot lock at all (``ENOLCK``, ``EINVAL`` on some network
     mounts) as permanently busy. A caller that retries on busy would retry
     forever; this one raises that ``OSError`` instead. POSIX busy is
-    ``EWOULDBLOCK``/``EAGAIN``; Windows busy is ``EACCES``/``EDEADLOCK``.
+    ``EWOULDBLOCK``/``EAGAIN``, which Python raises as :class:`BlockingIOError`;
+    Windows busy is ``EACCES``/``EDEADLOCK``.
     """
     from kiro_crew.platform_compat import IS_POSIX
 
@@ -524,10 +525,6 @@ def try_acquire_lock_or_raise(fd: int, *, exclusive: bool = False) -> bool:
             return True
         except BlockingIOError:
             return False
-        except OSError as exc:
-            if exc.errno in (errno.EWOULDBLOCK, errno.EAGAIN):
-                return False
-            raise
     # msvcrt has no shared lock; LK_NBLCK is a non-blocking exclusive lock.
     try:
         os.lseek(fd, 0, os.SEEK_SET)

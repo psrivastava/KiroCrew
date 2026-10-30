@@ -60,7 +60,11 @@ concurrency:
 jobs:
   fork-gpt-review:
     name: Fork GPT 6.1 Review
-    runs-on: ubuntu-latest
+    # `kirocrew-runners` larger-runner group, targeted by GROUP not label; see
+    # "Larger runners for the review lanes and CodeQL" in
+    # docs/ci/ci-and-reviews.md.
+    runs-on:
+      group: kirocrew-runners
     # Must stay above the sum of the two PASS_WALLs plus setup, or this wall --
     # not the named pass timeout -- kills pass 2 and the job ends with no
     # verdict. The extra 30 min over that sum is the adjudication pass, which
@@ -102,7 +106,7 @@ jobs:
       # [BLOCK-MERGE] -- exactly the run that must not fail for an install
       # reason. Full rationale and exfil analysis: fork-opus-review.yml.
       - name: Harden runner (egress allowlist)
-        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
         with:
           egress-policy: block
           disable-telemetry: true
@@ -360,7 +364,9 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ steps.pr.outputs.base_sha }}
-          fetch-depth: 0
+          # Depth 1: the diff step fetches the head and the merge-base it
+          # needs, one commit each.
+          fetch-depth: 1
           persist-credentials: false
 
       - name: Extract base-ref AUTOSDE rules
@@ -375,6 +381,7 @@ jobs:
       # artifact — so a faked Stage 1 diff cannot mislead the review. It is read
       # as a DATA file only — never applied to or overlaid on the tree; nothing runs it.
       - name: Fetch authentic diff (data only — never applied to the tree)
+        id: authentic
         if: steps.pr.outputs.obsolete != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -387,7 +394,7 @@ jobs:
           set -uo pipefail
           # COMPLETE diff via git, NOT the compare API: the compare endpoint
           # truncates very large diffs, which would let a big fork PR slip a defect
-          # past the cap and still pass. Fetch the PR head history as OBJECTS only
+          # past the cap and still pass. Fetch the PR head as OBJECTS only
           # (never checked out — the working tree stays the trusted base, so no
           # fork file/symlink is materialized) and diff locally, which has no cap.
           # GitHub's git smart-HTTP transport authenticates with BASIC auth
@@ -398,16 +405,38 @@ jobs:
           # logged and the raw token stays masked.
           auth_b64="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')"
           echo "::add-mask::$auth_b64"  # mask the derived header so it can never surface in logs
+          # Pin to the exact CI-reviewed head SHA: fetch that one commit at
+          # depth 1, by SHA, and fail closed if it is missing.
           git -c http.extraheader="AUTHORIZATION: basic $auth_b64" \
-            fetch --no-tags --quiet origin "refs/pull/$PR/head" \
-            || { echo "::error::could not fetch PR head history for #$PR"; exit 1; }
-          # Pin to the exact CI-reviewed head SHA; fail closed if it is missing
-          # (e.g. the fork rewrote history out from under the review).
+            fetch --no-tags --quiet --depth=1 origin "$HEAD_SHA" \
+            || { echo "::error::could not fetch PR head $HEAD_SHA for #$PR"; exit 1; }
           if ! git cat-file -e "${HEAD_SHA}^{commit}" 2>/dev/null; then
             echo "::error::head SHA $HEAD_SHA not present after fetch; failing closed."
             exit 1
           fi
-          git diff --no-color "$BASE_SHA...$HEAD_SHA" > "$PATCH"
+          # Both commits are shallow, so git cannot find the merge-base a
+          # three-dot range needs. GitHub's compare API names it -- only its
+          # SHA is read; the diff still comes from git, uncapped. That commit
+          # is fetched at depth 1 and the diff is the two-dot
+          # MERGE_BASE..HEAD_SHA: two trees, no history, and the same diff the
+          # three-dot range from BASE_SHA gave on a full clone.
+          compare_base() { gh api "repos/$REPO/compare/$1...$2?per_page=1" --jq '.merge_base_commit.sha'; }
+          merge_base=""
+          for attempt in 1 2 3; do
+            merge_base="$(compare_base "$BASE_SHA" "$HEAD_SHA")" && break
+            sleep "$attempt"
+          done
+          if ! [[ "$merge_base" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::could not read the merge-base of $BASE_SHA and $HEAD_SHA; failing closed."
+            exit 1
+          fi
+          if ! git cat-file -e "${merge_base}^{commit}" 2>/dev/null; then
+            git -c http.extraheader="AUTHORIZATION: basic $auth_b64" \
+              fetch --no-tags --quiet --depth=1 origin "$merge_base" \
+              || { echo "::error::could not fetch merge-base $merge_base for #$PR"; exit 1; }
+          fi
+          echo "merge_base=$merge_base" >> "$GITHUB_OUTPUT"
+          git diff --no-color "$merge_base..$HEAD_SHA" > "$PATCH"
           # git diff has no API size cap, so an oversized diff is a real signal —
           # fail CLOSED rather than review only a prefix.
           if [ "$(wc -c < "$PATCH" 2>/dev/null || echo 0)" -gt 1000000 ]; then
@@ -415,7 +444,7 @@ jobs:
             exit 1
           fi
           if [ ! -s "$PATCH" ]; then
-            echo "::error::empty diff for $BASE_SHA...$HEAD_SHA; failing closed."
+            echo "::error::empty diff for $merge_base..$HEAD_SHA; failing closed."
             exit 1
           fi
           # The patch is deliberately NOT applied to the working tree. The checkout
@@ -583,6 +612,12 @@ jobs:
           # members of that table rather than top-level keys.
           sandbox_mode = "read-only"
 
+          # web_search is "disabled" because an absent key resolves to "cached",
+          # which offers the model a web-search tool this job's Bedrock identity
+          # is not allowed to call. The refused call ends the stream, and the
+          # pass fails closed with no verdict.
+          web_search = "disabled"
+
           # The credentials no longer live in the codex PROCESS environment at
           # all. codex talks to a loopback signing proxy that runs as a DIFFERENT
           # UID (`bedrock-signer`), holds the Bedrock credentials in its own
@@ -613,7 +648,7 @@ jobs:
 
       # Mint short-lived, Bedrock-only creds immediately before the model call,
       # via the SAME dedicated least-privilege role the same-repo GPT reviewer uses.
-      - uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         if: steps.human_override.outputs.active != 'true' && (steps.pr.outputs.obsolete != 'true')
         with:
           role-to-assume: ${{ secrets.AWS_CODEX_BEDROCK_ROLE_ARN }}
@@ -796,6 +831,20 @@ jobs:
           # away dies on a named timeout instead of mid-call on an expired
           # token, which reads as a model failure and buries the real cause.
           PASS_WALL: 55m
+          # The provider's own refusal line, verbatim from the CLI's error
+          # output including its line-leading "ERROR: " prefix. A refusal and
+          # a crash both arrive as rc != 0 or an empty pass file, but they
+          # mean opposite things: a crash is fixed by re-running, while a
+          # refusal is caused by what the diff IS and is empirically sticky
+          # across re-runs. This line is the only way to tell them apart.
+          # The fork lane hands the model more attacker-controlled text than
+          # the same-repo lane (the prompt embeds the fork author's title/body,
+          # and the reviewer echoes the diff -- which, for a PR touching this
+          # workflow, contains the signature verbatim), so the classification
+          # below matches it ANCHORED at line start and only in the TAIL of the
+          # captured stream. The text must stay free of regex metacharacters --
+          # it is interpolated into an anchored grep pattern.
+          REFUSAL_SIGNATURE: "ERROR: This request has been flagged for potentially high-risk cyber activity"
         # Pass 1 generates candidates; its output is never posted or gated
         # directly -- the falsification pass below emits the only verdict the
         # comment and gate consume. Mirrors codex-review.yml's two-pass design.
@@ -958,23 +1007,27 @@ jobs:
           here would silently drift out of date. (They are base-branch
           snapshots, so a PR cannot weaken the rules that govern it.)
 
-          Beyond those rules you may report ONLY the three RESIDUAL DEFECT
-          CLASSES that no YAML rule can encode, and only on changed lines:
+          Beyond those rules you may report a defect that no YAML rule can
+          encode, only on changed lines, and only when it passes the BLOCK BAR.
+          Three RESIDUAL DEFECT CLASSES name their Anchor:
             • a reachable security hole — injection, path traversal, auth
               bypass, credential exposure — with a concrete trigger you name
             • a crash, data-loss, or corruption bug
             • removal of a guard clause, validation, or error handling with no
               compensating replacement visible in the diff
-          Anything that is neither an AUTOSDE rule violation nor one of those
-          three is NOT A FINDING, however reasonable it looks. Do not invent a
-          rule. Do not generalise a rule into a neighbouring case it does not
-          name.
+          Any other defect that passes the BLOCK BAR (a concrete trigger, the
+          call path, an observable wrong outcome that reaches a user, an operator,
+          data or a security boundary) is reported with `Anchor: defect`. A
+          preference, a wording choice or a style point is not a defect. Do not
+          invent a rule. Do not generalise a rule into a neighbouring case it does
+          not name.
 
           PRECEDENCE — resolve every conflict in this order:
             1. An AUTOSDE rule whose file-patterns match a changed file. Its
                `blocking:` flag decides whether the finding blocks — including
                where the rule overlaps territory a linter owns.
-            2. Otherwise, the three residual defect classes above.
+            2. Otherwise, the three residual defect classes above, then any
+               other defect that passes the BLOCK BAR.
             3. Otherwise, silence.
           ══════════════════════════════════════════════════════════════════
 
@@ -1002,7 +1055,8 @@ jobs:
             echo "  code does — judge behavior from the diff."
             echo "- If the diff MATERIALLY DIVERGES from the stated purpose — it adds"
             echo "  or changes behavior the description never mentions, or omits"
-            echo "  something it promises — FLAG that divergence as an advisory FINDING."
+            echo "  something it promises — that divergence is a BLOCK only when it meets"
+            echo "  the BLOCK BAR (a trigger and an observable wrong outcome); else say nothing."
             echo "- UNDECLARED scope is THE fork attack vector: a plausible stated"
             echo "  change with an unrelated change smuggled in beside it. Look hardest"
             echo "  for a change to a SENSITIVE surface the description does not call"
@@ -1013,10 +1067,9 @@ jobs:
             echo "  change explicitly, naming the surface it touches."
             echo "- Do NOT downgrade an undeclared change for being small or plausible."
             echo "  If it carries a reachable security or data-loss consequence it BLOCKS"
-            echo "  under WHAT BLOCKS (2) exactly as any other such defect — the missing"
-            echo "  description never makes it advisory. Undeclared changes with no such"
-            echo "  reachable consequence stay advisory (do not invent a trigger to"
-            echo "  block a thin description)."
+            echo "  as any other such defect — the missing description never excuses it."
+            echo "  Undeclared changes with no such reachable consequence are not"
+            echo "  reported (do not invent a trigger to block a thin description)."
             echo "PR_INTENT_BEGIN::${NONCE}"
             if [ -s "$INTENT_FILE" ]; then
               cat "$INTENT_FILE"
@@ -1035,9 +1088,10 @@ jobs:
           # form survives any future change to what this lane checks out.
           rm -f codex-failed-passes
           : > codex-failed-passes
+          rm -f "$RUNNER_TEMP/codex-refused-passes"
           BASE_PROMPT="$(cat /tmp/fork-codex-prompt.md)"
           PROMPT=$(printf '%s\n\n%s\n' "$BASE_PROMPT" \
-            "DISCOVERY PASS: inspect the full current diff and report every candidate that meets the FINDING BAR. This is candidate generation, not the final verdict.")
+            "DISCOVERY PASS: inspect the full current diff and report every candidate that meets the BLOCK BAR. This is candidate generation, not the final verdict.")
 
           rm -f codex-pass-1.md
           rc=0
@@ -1047,12 +1101,26 @@ jobs:
           # credentials (zizmor github-env). The path is under RUNNER_TEMP
           # because the manifest that produced it was materialized from the
           # BASE commit, not from this checkout -- see "Install review CLI".
+          # The combined CLI stream is copied by tee into RUNNER_TEMP (never the
+          # checkout, so a PR cannot plant a symlink at its name) because a
+          # failed pass is classified below by the words of the provider --
+          # only the captured output can tell a refusal from a crash.
           timeout "$PASS_WALL" \
             "$RUNNER_TEMP/review-cli/node_modules/.bin/codex" exec \
             --output-last-message "codex-pass-1.md" \
-            "$PROMPT" || rc=$?
+            "$PROMPT" 2>&1 | tee "$RUNNER_TEMP/codex-pass-1-log.txt" || rc=$?
           if [ "$rc" -ne 0 ] || [ ! -s codex-pass-1.md ]; then
-            echo "::warning::GPT 6.1 fork review pass 1 did not complete (exit ${rc}); the verdict will fail closed."
+            # Anchored + tail-scoped on purpose: the provider emits the
+            # refusal line at column 0 as the final act of the stream, while an
+            # echoed copy of the signature (a diff hunk, quoted prose) is
+            # neither line-leading nor reliably last. The 4000-byte tail fits
+            # a single pipe buffer, so the grep cannot SIGPIPE the tail.
+            if tail -c 4000 "$RUNNER_TEMP/codex-pass-1-log.txt" | grep -q "^$REFUSAL_SIGNATURE"; then
+              echo "::warning::GPT 6.1 fork review pass 1 was refused by the provider (exit ${rc}); the verdict will name the refusal instead of advising a re-run."
+              printf ' 1' >> "$RUNNER_TEMP/codex-refused-passes"
+            else
+              echo "::warning::GPT 6.1 fork review pass 1 did not complete (exit ${rc}); the verdict will fail closed."
+            fi
             printf ' 1' >> codex-failed-passes
           fi
 
@@ -1060,7 +1128,7 @@ jobs:
       # discovery pass that consumes most of it used to leave pass 2 to die
       # mid-call on an expired security token, failing the gate closed with no
       # verdict. Keep in sync with codex-review.yml.
-      - uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         if: steps.human_override.outputs.active != 'true' && (steps.pr.outputs.obsolete != 'true')
         with:
           role-to-assume: ${{ secrets.AWS_CODEX_BEDROCK_ROLE_ARN }}
@@ -1126,6 +1194,11 @@ jobs:
           DISCOVERY_OUTPUT_MAX_BYTES: "50000"
           PASS_WALL: 55m
           HEAD: ${{ steps.pr.outputs.head_sha }}
+          # Same signature and same anchored/tail-scoped matching as the
+          # discovery pass: a failed pass carrying it was REFUSED, not
+          # crashed, and the verdict assembly below reports that as its own
+          # terminal state.
+          REFUSAL_SIGNATURE: "ERROR: This request has been flagged for potentially high-risk cyber activity"
         # Pass 2 tries to KILL pass 1's candidates and emits the only verdict the
         # comment and gate consume. Both calls are required: if either failed, no
         # verdict is published and the gate fails closed.
@@ -1172,24 +1245,82 @@ jobs:
 
           rm -f codex-pass-2.md
           rc=0
+          # Copied by tee into RUNNER_TEMP for the same reason as pass 1: the captured
+          # stream is what classifies a failed pass as refused vs crashed.
           timeout "$PASS_WALL" \
             "$RUNNER_TEMP/review-cli/node_modules/.bin/codex" exec \
             --output-last-message "codex-pass-2.md" \
-            "$PROMPT" || rc=$?
+            "$PROMPT" 2>&1 | tee "$RUNNER_TEMP/codex-pass-2-log.txt" || rc=$?
           if [ "$rc" -ne 0 ] || [ ! -s codex-pass-2.md ]; then
-            echo "::warning::GPT 6.1 fork review pass 2 did not complete (exit ${rc}); the verdict will fail closed."
+            if tail -c 4000 "$RUNNER_TEMP/codex-pass-2-log.txt" | grep -q "^$REFUSAL_SIGNATURE"; then
+              echo "::warning::GPT 6.1 fork review pass 2 was refused by the provider (exit ${rc}); the verdict will name the refusal instead of advising a re-run."
+              printf ' 2' >> "$RUNNER_TEMP/codex-refused-passes"
+            else
+              echo "::warning::GPT 6.1 fork review pass 2 did not complete (exit ${rc}); the verdict will fail closed."
+            fi
             failed_passes="${failed_passes} 2"
           fi
 
+          refused_passes="$(cat "$RUNNER_TEMP/codex-refused-passes" 2>/dev/null || true)"
+          refused="false"
           if [ -n "$failed_passes" ]; then
-            {
-              echo "> **Incomplete review:** pass(es)${failed_passes} did not complete."
-              echo
-              echo "The pass-2 verdict was not published because both calls are required. Re-run the workflow for a complete review."
-            } > codex-review-output.md
+            if [ -n "$refused_passes" ]; then
+              # A refusal is not a crash: the provider declined because of
+              # what the reviewed content IS, and measured refusals of this
+              # class recur identically across re-runs, so advising a re-run
+              # points the operator at a remedy that has never been observed
+              # to work. Publish a distinct terminal state -- it still carries
+              # no [GPT-REVIEWED] marker, so the gate still fails closed and a
+              # declined review can never read as an approval -- that names
+              # the refusal and routes to human adjudication. The refusal
+              # dominates a mixed failure (one pass refused, the other
+              # crashed) because the adjudication route is the reliable exit
+              # either way, while a re-run only helps if the refusal does not
+              # recur.
+              refused="true"
+              {
+                echo "> **Reviewer refused:** the provider declined to review the diff of this fork PR (pass(es)${refused_passes})."
+                echo
+                echo "The refusal is caused by the reviewed content, not by a transient failure, so a re-run is very unlikely to produce a verdict. A declined review is not an approval: a repository writer must adjudicate with \`/ai-review override gpt $HEAD <class>: <one-sentence reason>\`."
+              } > codex-review-output.md
+            else
+              {
+                echo "> **Incomplete review:** pass(es)${failed_passes} did not complete."
+                echo
+                echo "The pass-2 verdict was not published because both calls are required. Re-run the workflow for a complete review."
+              } > codex-review-output.md
+            fi
           else
             cp codex-pass-2.md codex-review-output.md
+            # A BLOCK states a trigger and an observable wrong outcome, or it is
+            # a PASS. Mirrors codex-review.yml.
+            # --- block substantiation (copied into every lane; pinned by test_block_substantiation.py) ---
+            block_substantiated() {
+              local text
+              text="$(cat)"
+              grep -Eiq '^[[:space:]]*([-*][[:space:]]+)?(\*\*)?Trigger:(\*\*)?[[:space:]]*[^[:space:]*]' <<< "$text" \
+                && grep -Eiq '^[[:space:]]*([-*][[:space:]]+)?(\*\*)?Outcome:(\*\*)?[[:space:]]*[^[:space:]*]' <<< "$text"
+            }
+            drop_unsubstantiated_block_marker() {
+              local file="$1" head="$2" kept
+              grep -Fq "[BLOCK-MERGE] $head" "$file" || return 0
+              block_substantiated < "$file" && return 0
+              kept="$(mktemp)"
+              grep -Fv "[BLOCK-MERGE] $head" "$file" > "$kept" || true
+              cat "$kept" > "$file"
+              rm -f "$kept"
+              echo dropped
+            }
+            # --- end block substantiation ---
+            if [ -n "$(drop_unsubstantiated_block_marker codex-review-output.md "$HEAD")" ]; then
+              echo "::warning title=Unsubstantiated BLOCK::GPT 6.1 emitted [BLOCK-MERGE] for $HEAD without a Trigger: line and an Outcome: line, so the BLOCK is treated as PASS."
+            fi
           fi
+          # The refusal classification travels as a step OUTPUT, never by
+          # re-grepping codex-review-output.md downstream: on the clean path
+          # that file is verbatim model prose, so a review that merely QUOTED
+          # a refusal phrase would otherwise reclassify a completed verdict.
+          echo "refused=$refused" >> "$GITHUB_OUTPUT"
 
           # Gate the adjudication pass below on the verdict THIS step produced,
           # so a clean PR never pays for it. Mirrors codex-review.yml.
@@ -1213,28 +1344,48 @@ jobs:
           sudo rm -f /tmp/bedrock-signer.env 2>/dev/null || true
           echo "signer stopped; credential file removed."
 
+      # The outbound scrub is `scripts/scope_redact.py`, staged from the BASE
+      # commit. A redactor taken from the change under review could
+      # rewrite the scrub of its own published output. Every model step after
+      # this one is read-only, so nothing can rewrite the staged copy.
+      - name: Stage the base-owned redactor
+        id: redactor
+        if: always() && steps.pr.outputs.obsolete != 'true'
+        env:
+          BASE_SHA: ${{ steps.pr.outputs.base_sha }}
+        run: |
+          set -uo pipefail
+          dir="${RUNNER_TEMP:-/tmp}/scope-redact"
+          # Remove before creating: a symlink at this path would redirect the write.
+          rm -rf "$dir"
+          mkdir -p "$dir"
+          dest="$dir/scope_redact.py"
+          git show "$BASE_SHA:scripts/scope_redact.py" > "$dest" 2>/dev/null || true
+          if [ ! -s "$dest" ]; then
+            echo "::error::scripts/scope_redact.py is missing or empty on the base commit ($BASE_SHA). Refusing to publish text no base-owned scrubber could redact."
+            exit 1
+          fi
+          echo "redactor=$dest" >> "$GITHUB_OUTPUT"
+
       - name: Redact credential shapes
         if: always() && steps.pr.outputs.obsolete != 'true'
+        env:
+          REDACTOR: ${{ steps.redactor.outputs.redactor }}
         run: |
           if [ -f codex-review-output.md ]; then
-            perl -i -pe 's/\b(?:AKIA|ASIA)[A-Z2-7]{16}\b/[REDACTED-AWS-KEY-ID]/g; s{arn:aws\S*}{[REDACTED-ARN]}g; s/\b[0-9]{12}\b/[REDACTED-ACCT]/g; s/(?i)(aws_secret_access_key|aws_session_token|x-amz-security-token)\s*[:=]\s*\S+/$1=[REDACTED]/g' codex-review-output.md
-            # Then redact the ACTUAL inherited credential VALUES, not just their
-            # shapes. An AWS secret access key is 40 characters of [A-Za-z0-9/+=]
-            # with no distinctive prefix, so a BARE value (no `name=` beside it)
-            # survives every shape rule above: it is not AKIA/ASIA, it is not a
-            # named key=value, and it is far short of the 200+ char base64 run the
-            # withhold filter looks for. Matching the value itself cannot be
-            # evaded by how the model chooses to print it. This runs before the
-            # comment step, so it protects the blocked, clear and unstamped paths
-            # alike rather than only the branch that surfaces an unstamped body.
-            for cred in AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_ACCESS_KEY_ID; do
-              val="$(printenv "$cred" 2>/dev/null || true)"
-              # Length guard, not just an emptiness guard: `\Q\E` on an empty
-              # string is an empty pattern that matches at EVERY position and
-              # would carpet the file with the marker.
-              [ "${#val}" -ge 16 ] || continue
-              CRED_VALUE="$val" perl -i -pe 's/\Q$ENV{CRED_VALUE}\E/[REDACTED-CREDENTIAL]/g' codex-review-output.md
-            done
+            # `--redact-env` also replaces the ACTUAL inherited credential VALUES. A bare
+            # AWS secret access key has no prefix and no `name=` beside it, so it survives
+            # every shape rule and is far short of the 200+ char run the withhold filter
+            # looks for. Matching the value cannot be evaded by how the model prints it,
+            # and the redactor reads it from the environment, never from a command line.
+            # No redactor, or a scrub that fails, is a refusal: the file is removed so
+            # no later `always()` step can publish it raw.
+            if [ -z "${REDACTOR:-}" ] || [ ! -s "$REDACTOR" ] \
+              || ! python3 "$REDACTOR" --mode text --redact-env AWS_SECRET_ACCESS_KEY --redact-env AWS_SESSION_TOKEN --redact-env AWS_ACCESS_KEY_ID codex-review-output.md; then
+              echo "::error::the base-owned redactor could not scrub codex-review-output.md. Refusing to publish it raw."
+              rm -f codex-review-output.md
+              exit 1
+            fi
           fi
 
       # ── ADJUDICATION ────────────────────────────────────────────────────────
@@ -1258,6 +1409,9 @@ jobs:
           # excluded, and why a fenced match must also STATE its consequence
           # chain (#8693). KEEP IN SYNC with that lane.
           SECURITY_RE: 'residual/security|credential|passwd|password|\bsecret|api[ _-]?key|access[ _-]?key|private[ _-]?key|signing[ _-]?key|AKIA|ASIA|bearer|(access|session|auth|api|security|refresh)[ _-]?token|\bjwt\b|\bcookie|authentic|authoriz|\bauthn\b|\bauthz\b|\bauth\b|privileg|escalat|sandbox|traversal|\.\./|symlink|exfil|\bssrf\b|\bcsrf\b|\bxss\b|injection|subprocess|os\.system|shell=True|\beval\(|\bexec\(|egress|\biam\b|\bkms\b|encrypt|decrypt|\bhmac\b|signature|\bsudo\b|chmod|world-readable|corrupt|data[ _-]?loss|lose[ _-]?data|data[ _-]?destr|irreversib|unrecoverab'
+          # The consequence-chain lines of a BLOCKING item: its Trigger: and
+          # Outcome: lines, or (older bodies) an arrow line.
+          CHAIN_RE: '->|→|^[[:space:]]*[-*]?[[:space:]]*(\*\*)?(Trigger|Outcome):'
         run: |
           set -uo pipefail
           rm -rf "$BLOCK_DIR" .review-adjudication
@@ -1265,11 +1419,10 @@ jobs:
 
           awk -v dir="$BLOCK_DIR" '
             function isblock(l) { return l ~ /^[[:space:]]*[-*]?[[:space:]]*(\*\*)?BLOCKING([^[:alnum:]]|$)/ }
-            function isfind(l)  { return l ~ /^[[:space:]]*[-*]?[[:space:]]*(\*\*)?FINDING([^[:alnum:]]|$)/ }
-            function ismark(l)  { return l ~ /^[[:space:]]*\[(GPT-REVIEWED|BLOCK-MERGE)\]/ }
+            function ismark(l)  { return l ~ /^[[:space:]]*\[(GPT-REVIEWED|BLOCK-MERGE)\]/ || l ~ /^[[:space:]]*[-*]?[[:space:]]*(\*\*)?Notes:/ }
             {
               if (isblock($0)) { n++; out = sprintf("%s/%03d.md", dir, n); print > out; next }
-              if (out != "" && (isfind($0) || ismark($0))) { close(out); out = ""; next }
+              if (out != "" && ismark($0)) { close(out); out = ""; next }
               if (out != "") print > out
             }
           ' codex-review-output.md
@@ -1353,8 +1506,8 @@ jobs:
             # The piped greps deliberately consume all input (no -q on the
             # downstream): under pipefail a -q short-circuit can SIGPIPE the
             # upstream grep and misread a real security finding as unfenced.
-            if grep -qE -- '->|→' "$f" \
-               && { grep -E -- '->|→' "$f" | grep -Ei "$SECURITY_RE" >/dev/null \
+            if grep -qE -- "$CHAIN_RE" "$f" \
+               && { grep -E -- "$CHAIN_RE" "$f" | grep -Ei "$SECURITY_RE" >/dev/null \
                     || grep -Ei '^[[:space:]]*[-*]?[[:space:]]*(\*\*)?Anchor:' "$f" | grep -Ei "$SECURITY_RE|\bsecurity\b|residual/|harness-parity|no-test-side-effects" >/dev/null; }; then
               fenced=$((fenced + 1))
               fenced_ids="$fenced_ids F$count"
@@ -1404,7 +1557,7 @@ jobs:
       # The OPUS Bedrock role -- the same dedicated least-privilege role
       # fork-opus-review.yml uses, in its region, assumed only here and only
       # after the codex CLI has finished.
-      - uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         if: >-
           steps.human_override.outputs.active != 'true'
           && (
@@ -1492,7 +1645,7 @@ jobs:
           || (steps.adj_input.outputs.fenced != '' && steps.adj_input.outputs.fenced != '0')
           )
           )
-        uses: anthropics/claude-code-action@97c53473391bff1901034d4b454b5bac7ab7a029 # v1.0.239
+        uses: anthropics/claude-code-action@2dca132ff0e0c4094ce6048b422c6915a071210b # v1.0.247
         with:
           use_bedrock: "true"
           github_token: ${{ secrets.GITHUB_TOKEN }}
@@ -1556,6 +1709,7 @@ jobs:
           always() && steps.pr.outputs.obsolete != 'true' &&
           steps.gpt_pass2.outputs.blocking == 'true'
         env:
+          REDACTOR: ${{ steps.redactor.outputs.redactor }}
           HEAD: ${{ steps.pr.outputs.head_sha }}
           EXEC_FILE: ${{ steps.adjudicate.outputs.execution_file }}
           COUNT: ${{ steps.adj_input.outputs.count }}
@@ -1583,7 +1737,14 @@ jobs:
             fi
             printf '%s\n' "$out" > codex-adjudication.md
           fi
-          perl -i -pe 's/\b(?:AKIA|ASIA)[A-Z2-7]{16}\b/[REDACTED-AWS-KEY-ID]/g; s{arn:aws\S*}{[REDACTED-ARN]}g; s/\b[0-9]{12}\b/[REDACTED-ACCT]/g; s/(?i)(aws_secret_access_key|aws_session_token|x-amz-security-token)\s*[:=]\s*\S+/$1=[REDACTED]/g' codex-adjudication.md
+          # No redactor, or a scrub that fails, is a refusal: the file is removed so
+          # no later `always()` step can publish it raw.
+          if [ -z "${REDACTOR:-}" ] || [ ! -s "$REDACTOR" ] \
+            || ! python3 "$REDACTOR" --mode text codex-adjudication.md; then
+            echo "::error::the base-owned redactor could not scrub codex-adjudication.md. Refusing to publish it raw."
+            rm -f codex-adjudication.md
+            exit 1
+          fi
 
           parse="$RUNNER_TEMP/adj-parse.md"
           sed -E 's/^[[:space:]]*//; s/^[-*][[:space:]]*//; s/\*\*//g; s/`//g' codex-adjudication.md > "$parse"
@@ -1634,7 +1795,7 @@ jobs:
                 note="Adjudication upheld $actual_uph of $total blocking finding(s); those must be resolved before merging."
               else
                 decision="cleared"
-                note="Adjudication downgraded all $total blocking finding(s) to advisory: the remedy each one requires is disproportionate to the harm it prevents."
+                note="Adjudication downgraded all $total blocking finding(s): the remedy each one requires is disproportionate to the harm it prevents."
               fi
             fi
           fi
@@ -1691,18 +1852,30 @@ jobs:
           OVERRIDE_SOURCE: ${{ steps.human_override.outputs.source }}
           ADJ_DECISION: ${{ steps.adj.outputs.decision }}
           ADJ_NOTE: ${{ steps.adj.outputs.note }}
+          REFUSED: ${{ steps.gpt_pass2.outputs.refused }}
         run: |
           set -uo pipefail
           [ -z "${PR:-}" ] && { echo "no PR resolved; skipping comment"; exit 0; }
           MARKER="<!-- codex-ai-review -->"
           kind="incomplete"; verdict="⚠️ review incomplete"; note=""
-          if [ -s codex-review-output.md ] && grep -Fq "[GPT-REVIEWED] $HEAD" codex-review-output.md; then
+          if [ "${REFUSED:-}" = "true" ]; then
+            # The provider REFUSED this diff -- a terminal state distinct from
+            # "incomplete": the refusal is caused by the reviewed content, so
+            # advising a re-run would prescribe a remedy that has never been
+            # observed to work for this class. The gate stays red either way.
+            # $REFUSED is the step output of the verdict assembly, never a grep of
+            # the review body: on the clean path that body is model prose, and
+            # a review merely QUOTING the refusal marker must not reclassify a
+            # completed verdict.
+            kind="refused"
+            verdict="⛔ reviewer refused this diff"
+          elif [ -s codex-review-output.md ] && grep -Fq "[GPT-REVIEWED] $HEAD" codex-review-output.md; then
             if grep -Fq "[BLOCK-MERGE] $HEAD" codex-review-output.md; then
               # Rendered from the SAME parsed decision the check-run acts on,
               # never from the adjudication prose.
               if [ "${ADJ_DECISION:-}" = "cleared" ]; then
                 kind="clear"; verdict="✅ no blocking findings (all downgraded on adjudication)"
-                note="Opus 5.5 adjudication downgraded every blocking finding to advisory. ${ADJ_NOTE:-} Read them as advice, not as merge conditions."
+                note="Opus 5.5 adjudication downgraded every blocking finding. Downgraded: the remedy each one needs is disproportionate to the harm it prevents. ${ADJ_NOTE:-}"
               else
                 kind="blocked"; verdict="🔴 changes requested (blocking)"
                 note="${ADJ_NOTE:-}"
@@ -1722,6 +1895,11 @@ jobs:
               echo
             fi
             if [ "$kind" = "blocked" ]; then
+              cat codex-review-output.md
+            elif [ "$kind" = "refused" ]; then
+              # The refused body is assembled in the falsification pass; show it
+              # directly. It carries no [GPT-REVIEWED] stamp so the upsert guard
+              # never PATCHes an existing verdict comment with it.
               cat codex-review-output.md
             elif [ "$kind" = "clear" ] && [ -s codex-review-output.md ]; then
               echo "<details>"
@@ -1829,7 +2007,7 @@ jobs:
             fi
           } > "${RUNNER_TEMP:-/tmp}/fork-codex-comment.md"
           # ONE publication primitive for every marker-comment write in this
-          # lane; test_ai_review_workflows.py pins it byte-identical across all
+          # lane; test_ai_review_workflows_comment_writes.py pins it byte-identical across all
           # of them, the way it already pins guarded_comment_upsert, so neither
           # the budget nor the honesty below can drift lane by lane.
           #
@@ -2058,7 +2236,7 @@ jobs:
           retry_comment_write() {
             local slot="$1" needle="$2" body_file="$3" target="$4"
             local attempt landed head_now ov_body
-            local occupied slot_ok slot_id mine_id slot_rc ov_rc
+            local occupied slot_ok slot_id mine_id slot_rc ov_rc head_rc
             shift 4
             # Two reads here answer two DIFFERENT questions, which is why they
             # match on two different needles.
@@ -2214,8 +2392,12 @@ jobs:
               # a body pre-image or a conditional write, and this API offers
               # neither an If-Match nor an edit history.
               if [ "$attempt" -gt 1 ]; then
-                if ! head_now="$(gh api "repos/$REPO/pulls/$PR" --jq '.head.sha' 2>/dev/null)" \
-                  || [ -z "$head_now" ]; then
+                head_rc=0
+                head_now="$(gh api "repos/$REPO/pulls/$PR" --jq '.head.sha' 2>"$READ_ERR_FILE")" || head_rc=$?
+                if [ "$head_rc" -ne 0 ] || [ -z "$head_now" ]; then
+                  if [ "$head_rc" -ne 0 ]; then
+                    note_read_failure "$head_rc" "reading this PR's current head to decide whether this write may be repeated" "$READ_ERR_FILE"
+                  fi
                   echo "Whether $HEAD is still this PR's head is unreadable, so this write was not repeated: a repeat can replace a newer head's verdict with a superseded one. Re-run this lane to publish this verdict."
                   retain_unpublished_verdict publication_unknown 1 "$needle" "$body_file" "$@"
                   return 1
@@ -2269,13 +2451,24 @@ jobs:
             return 1
           }
           # Guarded upsert (#8292, #8344): the shared function below is defined
-          # byte-identically in every review lane; test_ai_review_workflows.py
+          # byte-identically in every review lane; test_ai_review_workflows_comment_writes.py
           # pins all copies to one canonical body so the invariant cannot
           # drift lane by lane.
           guarded_comment_upsert() {
             local marker="$1" stamp="$2" lane="$3" out_file="$4"
             local matches existing lookup_ok pr_head="" attempt withhold="" write_rc
-            local verdict_read_rc superseded=""
+            # What reached the slot is recorded as the step output `publication`,
+            # because every arm below returns 0 and the write status would
+            # otherwise end with this function. The fork Opus and GPT finalize
+            # steps read it: a verdict computed for this head is a pass there only
+            # once it is in the slot. `published` is this run's body in the slot,
+            # `superseded` a head this PR has moved past, and `not_published` every
+            # other arm. That includes an earlier run's sample for this head, which
+            # the PR then shows instead of this run's verdict, and an override note
+            # a repeat stopped at: that note names no head the repeat can check, and
+            # an override for THIS head is answered by the finalize step's own
+            # override input.
+            local verdict_read_rc superseded="" publication="not_published"
             # Find the bot's existing marker comment (first match wins) and
             # capture its id. Author filter: only a github-actions[bot]
             # comment can match, so a PR commenter cannot plant the marker and
@@ -2361,6 +2554,7 @@ jobs:
                 # publishes the verdict that counts, so a record here would
                 # point a reader at a revision nobody is reviewing.
                 superseded=1
+                publication="superseded"
                 withhold="$HEAD is no longer this PR's head ($pr_head)"
               fi
             fi
@@ -2394,6 +2588,7 @@ jobs:
                 if [ -z "$superseded" ]; then
                   retain_unpublished_verdict withheld none "$stamp $HEAD" "$out_file"
                 fi
+                printf 'publication=%s\n' "$publication" >> "${GITHUB_OUTPUT:-/dev/null}"
                 return 0
               fi
               if [ -n "$existing" ] && [ "$existing" != "null" ]; then
@@ -2401,6 +2596,7 @@ jobs:
                 if [ -z "$superseded" ]; then
                   retain_unpublished_verdict withheld none "$stamp $HEAD" "$out_file"
                 fi
+                printf 'publication=%s\n' "$publication" >> "${GITHUB_OUTPUT:-/dev/null}"
                 return 0
               fi
               # The lookup SUCCEEDED and found nothing, so there is no verdict
@@ -2419,6 +2615,11 @@ jobs:
               else
                 echo "::error::$lane could not post its $HEAD notice, so this PR carries no $stamp comment at all.${READ_FAILURE_NOTE:+ Cause of the failed comment read: $READ_FAILURE_NOTE}"
               fi
+              case "$write_rc" in
+                0) publication="published" ;;
+                4) publication="superseded" ;;
+              esac
+              printf 'publication=%s\n' "$publication" >> "${GITHUB_OUTPUT:-/dev/null}"
               return 0
             fi
             if [ "$lookup_ok" -eq 1 ] && [ -n "$existing" ] && [ "$existing" != "null" ]; then
@@ -2458,6 +2659,11 @@ jobs:
                 echo "::error::$lane produced a verdict for $HEAD but could not publish it, so this run's verdict is not in the slot.${READ_FAILURE_NOTE:+ Cause of the failed comment read: $READ_FAILURE_NOTE}"
               fi
             fi
+            case "$write_rc" in
+              0) publication="published" ;;
+              4) publication="superseded" ;;
+            esac
+            printf 'publication=%s\n' "$publication" >> "${GITHUB_OUTPUT:-/dev/null}"
           }
           # An accepted human override replaces whatever body the review steps
           # left (they were skipped for it) with the override note, through the
@@ -2500,7 +2706,7 @@ jobs:
       - name: Retain this run's unpublished verdict
         if: always() && steps.pr.outputs.obsolete != 'true' && steps.post.outputs.retained_verdict_artifact != ''
         # NEVER fatal. A lane's conclusion is read by pr-readiness.yml, and for
-        # the three advisory labels ANY non-success conclusion is reported as
+        # the three whole-design labels ANY non-success conclusion is reported as
         # `<label> (BLOCK)` -- a judged-wrong verdict. So a transport flake here,
         # or an `if-no-files-found: error` on a directory that did not survive,
         # would invent a verdict nobody reached. Retention is evidence ABOUT a
@@ -2536,6 +2742,8 @@ jobs:
           OVERRIDE_ACTOR: ${{ steps.human_override.outputs.actor }}
           ADJ_DECISION: ${{ steps.adj.outputs.decision }}
           ADJ_NOTE: ${{ steps.adj.outputs.note }}
+          PUBLICATION: ${{ steps.post.outputs.publication }}
+          REFUSED: ${{ steps.gpt_pass2.outputs.refused }}
         run: |
           set -uo pipefail
           lane_text="$(printf 'Lane run: %s/%s/actions/runs/%s\n\n<!-- ai-review-fork-lane run=%s -->' \
@@ -2560,6 +2768,35 @@ jobs:
             fi
           fi
           summary="Fork AI review for $HEAD. See the PR comment for details. $extra"
+          # A refusal is its own terminal state, distinct from a crash. The
+          # refused comment body carries no [GPT-REVIEWED] stamp, so the stale-
+          # read guard withholds it whenever a comment for an earlier head exists;
+          # this check-run is then the only place the PR can learn the cause.
+          # Still fail CLOSED -- a declined review is not an approval -- but
+          # name the refusal and the remedy that can work instead of a re-run.
+          # $REFUSED is the step output of the verdict assembly for THIS run, never
+          # a grep of model prose.
+          if [ "${REFUSED:-}" = "true" ] && [ "$title" = "review incomplete" ]; then
+            conclusion="failure"; title="reviewer refused this diff"
+            summary="GPT 6.1 REFUSED to review $HEAD: the provider declined the request because of the content of the diff itself, and re-runs have not been observed to clear this class of refusal. Failing closed -- a declined review is not an approval. This needs human adjudication: a repository writer can comment '/ai-review override gpt $HEAD <class>: <one-sentence reason>'."
+          fi
+          # The output file proves a verdict was COMPUTED, never that it reached
+          # the PR. A slot still holding another head's verdict, or an earlier
+          # run's sample for this one, is what every stamp-freshness reader
+          # sees, so a pass also needs the post step's record that this run's
+          # verdict is in the slot. A missing record -- that step failed or
+          # never ran -- fails closed with it. `superseded` keeps the verdict's
+          # own conclusion, because the newer head's run answers for the PR
+          # there.
+          case "${PUBLICATION:-}" in
+            published | superseded) ;;
+            *)
+              if [ "$conclusion" = "success" ]; then
+                conclusion="failure"; title="verdict not published"
+                summary="This run reached a verdict for $HEAD, but it is not in this lane's PR comment (publication: ${PUBLICATION:-unrecorded}), so the PR does not show it. Re-run this lane to publish it."
+              fi
+              ;;
+          esac
           # An accepted human override is this run's verdict, whatever the review
           # steps left behind: they were skipped for it. VERDICT is reassigned so
           # no verdict-specific summary below applies to a review that never ran.

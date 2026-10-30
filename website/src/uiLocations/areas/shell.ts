@@ -70,33 +70,12 @@ export const LOCATIONS = {
       requires: [{ kind: 'condition', id: 'search_bar_unclaimed' }],
     }],
   },
-  // The rail's bottom block (App.tsx `navBody`) is ONE fragment the shell draws
+  // The rail's bottom block (navRail.tsx `navBody`) is ONE fragment the shell draws
   // either as the desktop rail or, on a phone, inside the nav drawer the menu
   // button opens. So each row below is one site with two placements: the
   // desktop rail, and the drawer under shell.mobile-menu (whose phone and
   // not-Sessions gates travel with it). The phone Sessions page's own drawer
   // rail is a different site and is not registered here.
-  'shell.developer': {
-    kind: 'button',
-    label: { from: 'attr', attr: 'label' },
-    terms: {
-      en: ['developer page', 'developer tools', 'dev tools', 'debug tools', 'logs page'],
-      'zh-CN': ['开发者页面', '开发者工具', '调试工具', '日志'],
-    },
-    placements: [
-      {
-        surface: 'shell', entry: 'rail',
-        requires: [
-          { kind: 'viewport', value: 'desktop' },
-          { kind: 'condition', id: 'developer_mode' },
-        ],
-      },
-      {
-        surface: 'shell', parent: 'shell.mobile-menu', entry: 'menu',
-        requires: [{ kind: 'condition', id: 'developer_mode' }],
-      },
-    ],
-  },
   // A toggle row: it opens or closes the docked terminal panel instead of navigating.
   'shell.terminal': {
     kind: 'toggle',

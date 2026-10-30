@@ -26,8 +26,23 @@ const { registerCaptureSurface } = require("../capture-trust");
 const { setRemoteHostConfig } = require("../host-config");
 const {
   WIN_CAPTION_RESERVE_CSS_PX,
+  WIN_CAPTION_OVERLAY_CSS_PX,
   winCaptionReserveForZoom,
+  winDragReserveForZoom,
 } = require("../runtime/window/chrome");
+
+// The gateway supervisor's source: the runtime/gateway/ owners that define code
+// these pins read, then the facade, as one text because the pins hold over all of
+// it.
+const SUPERVISOR_FILES = [
+  "runtime/gateway/home-lock.js",
+  "runtime/gateway/successor-handoff.js",
+  "runtime/gateway/failure-dialog.js",
+  "runtime/gateway/holder-decision.js",
+  "runtime/gateway/shutdown.js",
+  "runtime/gateway/reconnect.js",
+  "gateway-supervisor.js",
+];
 
 function validOptions(overrides = {}) {
   return {
@@ -55,8 +70,9 @@ describe("every token-bearing navigation stays on the configured origin", () => 
   // every existing user's unsent drafts, and the configured string is compared by
   // exact equality in several places. This scans the SOURCE rather than one call
   // path, so a site added later reddens too.
-  const SUPERVISOR = fs
-    .readFileSync(path.join(__dirname, "..", "gateway-supervisor.js"), "utf8")
+  const SUPERVISOR = SUPERVISOR_FILES
+    .map((file) => fs.readFileSync(path.join(__dirname, "..", file), "utf8"))
+    .join("\n")
     .replace(/\r\n/g, "\n");
 
   /** Lines composing a credential onto a base, with the 4 lines before each. */
@@ -126,10 +142,9 @@ describe("every token-bearing navigation stays on the configured origin", () => 
     // The boot navigation is the one token-bearing site outside this module, and
     // it addresses the URL it was configured with -- so the first document the
     // user sees is already on the origin every later navigation uses.
-    const supervisor = fs.readFileSync(
-      path.join(__dirname, "..", "gateway-supervisor.js"),
-      "utf8",
-    );
+    const supervisor = SUPERVISOR_FILES
+      .map((file) => fs.readFileSync(path.join(__dirname, "..", file), "utf8"))
+      .join("\n");
     assert.equal(
       /loopbackOrigin|tokenOrigin/.test(supervisor),
       false,
@@ -1104,6 +1119,7 @@ describe("dashboard window wiring order", () => {
       || entry.startsWith("view.set") || entry.startsWith("view.session") || entry.startsWith("win.set"));
     assert.deepEqual(events, [
       "view.on:did-finish-load",
+      "win.on:swipe",
       "win.on:closed",
       "win.on:resize",
       "win.on:closed",
@@ -1127,6 +1143,8 @@ describe("dashboard window wiring order", () => {
       "win.on:focus",
       "win.on:focus",
       "view.setWindowOpenHandler",
+      "view.on:will-navigate",
+      "view.on:will-redirect",
       "view.on:did-create-window",
       "view.session.onBeforeSendHeaders",
       "view.session.on:will-download",
@@ -1193,6 +1211,54 @@ describe("dashboard window wiring order", () => {
       assert.deepEqual(verdict, { action: "deny" }, "no in-app window for an external link");
     }
     assert.deepEqual(openedExternally, ["https://example.com/docs", "https://example.com/docs"]);
+  });
+
+  it("refuses a top-level navigation off the app origin, in the dashboard and its pop-outs", async (t) => {
+    const { viewContents, openedExternally } = await wireDashboardWindow(t, { platform: "darwin" });
+    const popout = { webContents: { ...recordingEmitter("child", []), setWindowOpenHandler() {} } };
+    viewContents.emit("did-create-window", popout);
+    const navigate = (contents, url) => {
+      let prevented = false;
+      contents.emit("will-navigate", { preventDefault: () => { prevented = true; } }, url);
+      return prevented;
+    };
+    for (const contents of [viewContents, popout.webContents]) {
+      // A pane on another loopback port promoting itself to the top frame.
+      assert.equal(navigate(contents, "http://localhost:5477/"), true);
+      assert.equal(navigate(contents, "http://127.0.0.1:5476/"), true);
+      assert.equal(navigate(contents, "https://example.com/"), true);
+      assert.equal(navigate(contents, "file:///etc/passwd"), true);
+      assert.equal(navigate(contents, "blob:http://localhost:5476/x"), true);
+      assert.equal(navigate(contents, "not a url"), true);
+      // The dashboard's own routes, and the token prompt's hand-off, still work.
+      assert.equal(navigate(contents, "http://localhost:5476/chat?x=1"), false);
+      assert.equal(navigate(contents, "http://localhost:5476/?token=t"), false);
+    }
+    assert.deepEqual(openedExternally, [], "a refused navigation opens nothing");
+  });
+
+  it("refuses a main-frame redirect off the app origin, in the dashboard and its pop-outs", async (t) => {
+    const { viewContents } = await wireDashboardWindow(t, { platform: "darwin" });
+    const popout = { webContents: { ...recordingEmitter("child", []), setWindowOpenHandler() {} } };
+    viewContents.emit("did-create-window", popout);
+    const redirect = (contents, url, isMainFrame = true) => {
+      let prevented = false;
+      contents.emit("will-redirect", { url, isMainFrame, preventDefault: () => { prevented = true; } });
+      return prevented;
+    };
+    for (const contents of [viewContents, popout.webContents]) {
+      assert.equal(redirect(contents, "https://sso.example/login"), true);
+      assert.equal(redirect(contents, "http://127.0.0.1:5476/"), true);
+      assert.equal(redirect(contents, "http://localhost:54760/"), true);
+      assert.equal(redirect(contents, "http://localhost:5476.evil.test/"), true);
+      // A pane iframe redirecting inside its own origin is not the dashboard's.
+      assert.equal(redirect(contents, "http://kirocrew.localhost:6000/x", false), false);
+      assert.equal(redirect(contents, "http://localhost:5476/chat?token=t"), false);
+      // No isMainFrame on the event: an unknown frame counts as main, so refused.
+      let unknownFrameRefused = false;
+      contents.emit("will-redirect", { url: "https://sso.example/login", preventDefault: () => { unknownFrameRefused = true; } });
+      assert.equal(unknownFrameRefused, true);
+    }
   });
 
   it("a framed window injects neither the drag band nor caption controls", async (t) => {
@@ -1377,6 +1443,7 @@ describe("window chrome controls", () => {
     };
 
     const reserveFor = (z) => Math.round(WIN_CAPTION_RESERVE_CSS_PX / z);
+    const dragReserveFor = (z) => Math.round(WIN_CAPTION_OVERLAY_CSS_PX / z);
 
     const stepped = lifecycle.chrome.stepZoom(sender, 1);
     assert.ok(stepped > 1, "a step-in raises the zoom factor");
@@ -1388,6 +1455,13 @@ describe("window chrome controls", () => {
     assert.ok(
       injected.some((c) => c.includes(`'--mc-win-caption-reserve', '${reserveFor(zoom)}px'`)),
       "the zoom-aware reserve var is pushed at the stepped-in zoom",
+    );
+    // The drag-strip inset rides the same push: 138/zoom CSS px, painting to a
+    // constant 138 DIP so the injected #electron-drag-bar stays off the caption
+    // buttons at the new zoom.
+    assert.ok(
+      injected.some((c) => c.includes(`'--mc-win-drag-reserve', '${dragReserveFor(zoom)}px'`)),
+      "the zoom-aware drag-reserve var is pushed at the stepped-in zoom",
     );
 
     painted.length = 0;
@@ -1402,6 +1476,13 @@ describe("window chrome controls", () => {
     assert.ok(
       injected.some((c) => c.includes("'--mc-win-caption-reserve', '178px'")),
       "the reserve grows below 100% zoom so it still clears the fixed-DIP buttons",
+    );
+    // The drag inset grows the same way (138/0.8 = 173) so the drag strip still
+    // clips short of the fixed-DIP caption buttons below 100% zoom.
+    assert.equal(dragReserveFor(0.8), 173);
+    assert.ok(
+      injected.some((c) => c.includes("'--mc-win-drag-reserve', '173px'")),
+      "the drag inset grows below 100% zoom so the drag strip stays off the buttons",
     );
   });
 
@@ -1424,6 +1505,22 @@ describe("window chrome controls", () => {
       reload.some((e) => e.includes("'--mc-win-caption-reserve', '142px'")),
       "a reload re-pushes the zoom-correct reserve with no theme gate",
     );
+    assert.ok(
+      reload.some((e) => e.includes("'--mc-win-drag-reserve', '138px'")),
+      "a reload re-pushes the zoom-correct drag inset too (same relay)",
+    );
+  });
+
+  it("winDragReserveForZoom paints the drag inset to a constant native width at every zoom", () => {
+    // The CSS-px drag inset is 138/zoom, so inset*zoom === 138 DIP regardless of
+    // zoom; a non-finite or non-positive zoom falls back to 1x.
+    for (const z of [0.5, 0.67, 0.8, 1, 1.25, 2]) {
+      assert.equal(winDragReserveForZoom(z), Math.round(WIN_CAPTION_OVERLAY_CSS_PX / z));
+    }
+    assert.equal(winDragReserveForZoom(1), WIN_CAPTION_OVERLAY_CSS_PX);
+    for (const bad of [undefined, null, NaN, Infinity, 0, -1]) {
+      assert.equal(winDragReserveForZoom(bad), WIN_CAPTION_OVERLAY_CSS_PX);
+    }
   });
 
   it("winCaptionReserveForZoom paints to a constant native width at every zoom", () => {
@@ -1622,5 +1719,82 @@ describe("gateway port prompt", () => {
       await settle();
       assert.deepEqual(ports, expected, `answer ${JSON.stringify(answer)}`);
     }
+  });
+});
+
+// ── Close button: background vs quit (#12204) ───────────────────────────────
+
+describe("main window close action", () => {
+  function closeHandlerBody() {
+    const start = SOURCE.indexOf('mainWindow.on("close", createCloseHandler({');
+    assert.notEqual(start, -1, "main window close handler must be built by createCloseHandler");
+    return SOURCE.slice(start, SOURCE.indexOf("\n    }));\n", start));
+  }
+
+  it("wires the close listener to the store, the tray hide, requestQuit and persist", () => {
+    // The sequence itself is exercised behaviourally in close-action.test.js;
+    // this pins that the main window feeds it the real effects.
+    const body = closeHandlerBody();
+    assert.match(body, /getAction: \(\) => getCloseAction\(store\)/);
+    assert.match(body, /cancelPendingTrayHide\(mainWindow\)/);
+    assert.match(body, /^\s*requestQuit,$/m);
+    assert.match(body, /hideToTray\(mainWindow, \{/);
+    assert.match(body, /persist\(\);/);
+  });
+
+  function facadeHarness(stored = {}) {
+    const data = { ...stored };
+    const writes = [];
+    const store = {
+      get: (key) => data[key],
+      set: (key, value) => { writes.push([key, value]); data[key] = value; },
+    };
+    const lifecycle = createWindowLifecycle(validOptions({ store }));
+    return { lifecycle, data, writes };
+  }
+
+  it("the facade reads and writes the stored choice, canonicalized", () => {
+    const h = facadeHarness();
+    assert.equal(h.lifecycle.closeAction.get(), "background", "an untouched install keeps running");
+    assert.equal(h.lifecycle.closeAction.set("quit"), "quit");
+    assert.equal(h.data.closeAction, "quit");
+    assert.equal(h.lifecycle.closeAction.get(), "quit");
+    assert.equal(h.lifecycle.closeAction.set("nonsense"), "background");
+    assert.equal(h.data.closeAction, "background");
+  });
+
+  it("the facade skips a write that changes nothing", () => {
+    const h = facadeHarness({ closeAction: "quit" });
+    h.lifecycle.closeAction.set("quit");
+    assert.deepEqual(h.writes, []);
+    h.lifecycle.closeAction.set("background");
+    assert.deepEqual(h.writes, [["closeAction", "background"]]);
+  });
+
+  it("the tray menu is unchanged: the setting lives only in Settings", () => {
+    const menus = [];
+    const lifecycle = createWindowLifecycle(validOptions({
+      electron: {
+        app: { name: "Kiro Crew", getVersion: () => "0.8.0", getPath: () => "/virtual/logs" },
+        Tray: class {
+          setToolTip() {}
+          setContextMenu() {}
+          on() {}
+        },
+        Menu: { buildFromTemplate: (template) => { menus.push(template); return { template }; } },
+        nativeImage: {
+          createFromPath: () => ({ resize: () => ({ fake: "icon" }), setTemplateImage() {} }),
+        },
+        shell: {},
+      },
+      store: { path: "/virtual/config.json", get: () => undefined, set() {} },
+      platform: "linux",
+      env: {},
+    }));
+    lifecycle.createTray();
+    assert.deepEqual(
+      menus[0].map((item) => item.label || item.type),
+      ["Show Kiro Crew", "separator", "New Connection Window…", "separator", "Open Config File", "separator", "Quit"],
+    );
   });
 });

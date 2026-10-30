@@ -11,18 +11,30 @@ import type { QueryClient } from '@tanstack/react-query'
 import { store, type AppDispatch } from '../../store'
 import { markSlotUnread } from '../../store/dashboardSlice'
 import { addNotification, removeNotificationByTs } from '../../store/notificationsSlice'
-import { resolveByApprovalId, sseActivityEvent, sseSubagentSpawn, sseSubagentDone } from '../../store/chatSlice'
+import { resolveByApprovalId, sseActivityEvent, sseSubagentSpawn, sseSubagentDone, markSubagentApprovalGone, reconcileGoneSubagent } from '../../store/chatSlice'
 import { dispatchMcNotification, dispatchLiveNotification, APPROVAL_KIND } from '../notificationEvent'
 import { loadUnreadOnAttention } from '../unreadOnAttention'
 import { approvalNotificationBody } from '../../lib/approvalNotificationBody'
 import { i18nT } from '../../i18n/t'
 import { api } from '../../api/client'
 import type { Notification } from '../../types'
-import { isSlotOnScreen } from './attention'
+import { sessionDisplayTitle } from '../../utils/sessionDisplayTitle'
+import { attendArrival, crewWorkerRoot, isSlotOnScreen } from './attention'
 import { recordInBoundedLog, resolvedSince } from './retiredIds'
 import type { FrameData } from './frames'
 
 type AuthorityApproval = Awaited<ReturnType<typeof api.approvals>>[number]
+
+/** Where a crew member's approval note points: its live conductor (`slot`), whose
+ *  approval card decides it, titled with the crew member's name. Undefined for
+ *  any other slot, whose note keeps its own slot and the tool line. */
+function crewApprovalTarget(slot: string): { slot: string; crew_member: string; title: string } | undefined {
+  const root = crewWorkerRoot(slot)
+  if (!root) return undefined
+  const member = store.getState().dashboard.slots.find(s => s.key === slot)
+  const name = member ? sessionDisplayTitle(member) : slot
+  return { slot: root, crew_member: slot, title: i18nT('components.crewMode.approval_title', { name }) }
+}
 
 export interface ApprovalRegistry {
   /** Reconcile against `GET /api/approvals`: retire every approval held
@@ -113,6 +125,14 @@ export function useApprovalRegistry(dispatch: AppDispatch, queryClient: QueryCli
             approval_type: resolvedType,
           }))
         }
+        if (id.startsWith('spawn:') && !outcomeKnown) {
+          // Retired with no known outcome (a reconnect found it gone): the
+          // same gone verdict a refused press records, so no surface keeps
+          // asking for the decision, settled by the spawn inventory.
+          const agentId = id.replace('spawn:', '')
+          dispatch(markSubagentApprovalGone({ id: agentId, approval_id: id }))
+          void dispatch(reconcileGoneSubagent({ slot: targetSlot, id: agentId, approval_id: id }))
+        }
         if (id.startsWith('spawn:') && outcomeKnown) {
           const agentId = id.replace('spawn:', '')
           if (approved) {
@@ -171,6 +191,7 @@ export function useApprovalRegistry(dispatch: AppDispatch, queryClient: QueryCli
             body: approvalNotificationBody(a.source, a.tool_input),
             ts: String(a.ts || Date.now() / 1000),
             approval_id: a.id,
+            ...crewApprovalTarget(slot),
           } as Notification))
           writeRow(a, slot)
         }
@@ -183,13 +204,25 @@ export function useApprovalRegistry(dispatch: AppDispatch, queryClient: QueryCli
             typeof data.slot === 'string' ? data.slot : '',
           )
         }
+        const approvalSlot = typeof data.slot === 'string' && data.slot ? data.slot : ''
+        // A Crew Mode crew member's approval is decided on its conductor's
+        // approval card, so every signal below points at the conductor: the
+        // unread mark lands on the conductor's row, and the note names the
+        // conductor as its slot (the banner stays quiet while it is on screen,
+        // `targetsCurrentView`) under the crew member's name.
+        const crewTarget = crewApprovalTarget(approvalSlot)
+        const noteSlot = crewTarget?.slot ?? approvalSlot
         // Approval-blocked chime: the agent is stuck until the user acts.
         // Suppressed during reconnect catch-up (same policy as turn-done).
         if (!reconnecting) {
           dispatchMcNotification(APPROVAL_KIND)
           // Blocked on the user: badge it under the done-or-waiting opt-in.
-          if (typeof data.slot === 'string' && data.slot && loadUnreadOnAttention() && !isSlotOnScreen(data.slot)) {
-            dispatch(markSlotUnread({ slot: data.slot }))
+          // A crew member's wait goes through the arrival rule on its conductor,
+          // so a window showing the conductor relays it as read to the others.
+          if (crewTarget && loadUnreadOnAttention()) {
+            attendArrival(noteSlot, undefined, reconnecting, slot => { dispatch(markSlotUnread({ slot })) })
+          } else if (noteSlot && loadUnreadOnAttention() && !isSlotOnScreen(noteSlot)) {
+            dispatch(markSlotUnread({ slot: noteSlot }))
           }
         }
         // No OS toast here. The addNotification below is what reaches the
@@ -203,7 +236,6 @@ export function useApprovalRegistry(dispatch: AppDispatch, queryClient: QueryCli
         // `targetsCurrentView` gate can tell "this chat is on screen" (the
         // inline permission card already shows it there) from "the user is
         // on another surface" (the banner is the interrupt).
-        const approvalSlot = typeof data.slot === 'string' && data.slot ? data.slot : ''
         const approvalNote = {
           kind: 'approval',
           title: i18nT('hooks.useWebSocket.tool_approval', { name: data.tool || i18nT('hooks.useWebSocket.unknown') }),
@@ -211,6 +243,7 @@ export function useApprovalRegistry(dispatch: AppDispatch, queryClient: QueryCli
           ts: String(data.ts || Date.now() / 1000),
           approval_id: data.id,
           ...(approvalSlot ? { slot: approvalSlot } : {}),
+          ...crewTarget,
         } as Notification
         dispatch(addNotification(approvalNote))
         // The in-app banner hears LIVE arrivals only, same as the

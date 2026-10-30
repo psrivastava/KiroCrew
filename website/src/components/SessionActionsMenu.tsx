@@ -1,6 +1,6 @@
 import * as React from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { Pencil, Circle, Pin, Locate, Link2, Tag as TagIcon, X, ExternalLink, Monitor, Undo2, RotateCw, PanelTop, Sparkles, GitFork, BellOff, Volume2, VolumeX } from 'lucide-react'
+import { Pencil, Circle, Pin, Locate, Link2, Hash, Check, MessagesSquare, Tag as TagIcon, X, Unlink, ExternalLink, Monitor, Undo2, RotateCw, PanelTop, Sparkles, GitFork, BellOff, Volume2, VolumeX } from 'lucide-react'
 import type { ChatFolder } from '../types'
 import FolderMoveSubmenu from './FolderMoveSubmenu'
 import ErrorNotice, { ErrorNoticeMenuItem } from './ErrorNotice'
@@ -17,14 +17,16 @@ import { DropdownMenuItem, DropdownMenuSeparator } from './ui/dropdown-menu'
 import { ContextMenuItem, ContextMenuSeparator } from './ui/context-menu'
 import { muteFlagErrorKey } from '../store/dashboardSlice'
 import { useAppSelector } from '../store'
-import { selectSlotSubagents } from '../store/chatSlice'
+import { selectSlotSubagentsActive } from '../store/chatSlice'
 import { useTagPopover } from '../hooks/useTagPopover'
 import { api } from '../api/client'
 import { useSessionActions } from '../hooks/useSessionActions'
+import { useCopyAck } from './FilePathMenu'
 import { useChatPopouts } from '../hooks/useChatPopouts'
 
 import { uiLocation } from '../uiLocations/uiLocation'
 import { i18nT } from '../i18n/t'
+import { slotRowByKey } from '../store/slotIndex'
 export interface SessionActionsMenuProps {
   /** Chooses the Radix primitive family; must match the enclosing menu. */
   variant: 'dropdown' | 'context'
@@ -61,9 +63,33 @@ export interface SessionActionsMenuProps {
    * hosts the fork button.
    */
   onDuplicate?: () => void
+  /**
+   * Stage a reference to THIS session in the active chat's composer — the
+   * discoverable form of the drag-a-session-into-the-composer gesture, matching
+   * exactly what that drop stages (a link, resolved by the agent on demand).
+   *
+   * Passed only by the sidebar row's menu, where "this session" is a DIFFERENT
+   * session than the open one. The header menu omits it: it acts on the active
+   * session itself, which `sessionRefBlockReason` refuses as a self-reference.
+   * Omitted (or undefined) means the row cannot stage one right now — no
+   * composer to land in, or an incognito/temporary/self target — and the item
+   * is not rendered, the same self-hiding other conditional rows use.
+   */
+  onReferenceInChat?: () => void
   /** A second, muted line under Close that says what the press reaches. It wraps,
    *  so on a phone, where this menu is the only close, nothing is cut off. */
   closeHint?: string
+  /** Overrides the close item's label (default "Close session"). An adopted
+   *  remote-crew row passes "Remove from this machine" here, because its ✕ removes
+   *  only this machine's copy — the session stays live on its peer — and the
+   *  default label would promise a durable close it never performs (#19958). */
+  closeLabel?: string
+  /** Render the close item in NEUTRAL colours instead of the destructive red.
+   *  Default false (a real close is destructive and reads red). An adopted
+   *  remote-crew row passes true: removing the local copy is NOT destructive —
+   *  the session keeps running on its peer — so the red danger styling would
+   *  signal an irreversible loss the action does not cause (#19958). */
+  closeNeutral?: boolean
   /** Extra items rendered in the top "informational" group (header-only today:
    *  the MCP-servers submenu). Generic so the shared menu stays surface-agnostic. */
   infoSlots?: React.ReactNode[]
@@ -123,12 +149,12 @@ export function collapseGroups<T>(groups: (T | false | null | undefined)[][]): T
  * with dividers auto-collapsing between them):
  *   [informational]  MCP servers ▸  (header only)
  *   [tab modifiers]  Rename · Mark read/unread · Pin · Move to folder ▸ · Tags…
- *   [nav / access]   Reveal in sidebar (header only) · Crew board (conductors only) · Copy link · Send a copy ▸ · Export to a file · Connected surfaces
+ *   [nav / access]   Reveal in sidebar (header only) · Crew board (conductors only) · Reference in chat (sidebar rows only) · Copy link · Copy session ID · Send a copy ▸ · Export for import (JSON) · Export as readable Markdown · Connected surfaces
  *   [colour]         colour swatches
  *   [close]          Close session
  */
 export default function SessionActionsMenu({
-  variant, slotKey, mode, onReveal, onRename, onAutoTitle, onOpenInNewTab, onDuplicate, closeHint, infoSlots, onColorPicked, sidebarOnScreen = false, omitPopout = false,
+  variant, slotKey, mode, onReveal, onRename, onAutoTitle, onOpenInNewTab, onDuplicate, onReferenceInChat, closeHint, closeLabel, closeNeutral = false, infoSlots, onColorPicked, sidebarOnScreen = false, omitPopout = false,
 }: SessionActionsMenuProps) {
   const Item = variant === 'context' ? ContextMenuItem : DropdownMenuItem
   const Separator = variant === 'context' ? ContextMenuSeparator : DropdownMenuSeparator
@@ -150,7 +176,7 @@ export default function SessionActionsMenu({
   // its behaviour). `unread` comes from dashboard.unreadSlots — the same source
   // toggleRead reads — and pin/folder/colour from the slot itself.
   const isUnread = useAppSelector(s => s.dashboard.unreadSlots.includes(slotKey))
-  const slot = useAppSelector(s => s.dashboard.slots.find(x => x.key === slotKey))
+  const slot = useAppSelector(s => slotRowByKey(s.dashboard.slots, slotKey))
   const isPinned = !!slot?.pinned
   const isMutesOpened = !!slot?.mutes_opened
   const isMuted = !!slot?.muted
@@ -163,6 +189,26 @@ export default function SessionActionsMenu({
   // and this is the only place that disagreement is said.
   const mutesOpenedError = useAppSelector(s => s.dashboard.slotMuteFlagError?.[muteFlagErrorKey('mutes_opened', slotKey)])
   const mutesOpenedErrorId = React.useId()
+  // "Copy session ID" acknowledges a successful copy in place through the
+  // shared copy-ack hook (the same one the file-path menu's Copy path uses):
+  // the item reads "Copied" with a check, then returns to its label. A stale
+  // resolution from an earlier press is dropped by the hook's attempt guard.
+  const { copyStatus: idCopyStatus, copyPath: copySessionId } = useCopyAck(slotKey)
+  // A refused copy (both clipboard layers) is said through ErrorNotice plus its
+  // menu hand-off, not only by the transient label. It stays on screen through
+  // retries and past the hook's acknowledgment window, and clears only once a
+  // copy succeeds: a retry that fails again re-sets the same `failed` status,
+  // so clearing before each press would hide the second failure.
+  const [copyIdFailed, setCopyIdFailed] = React.useState(false)
+  const copyIdErrorId = React.useId()
+  React.useEffect(() => {
+    if (idCopyStatus === 'failed') setCopyIdFailed(true)
+    else if (idCopyStatus === 'copied') setCopyIdFailed(false)
+  }, [idCopyStatus])
+  const onCopySessionId = () => { void copySessionId() }
+  const copyIdLabel = idCopyStatus === 'copied'
+    ? i18nT('components.sessionActionsMenu.copy_session_id_copied')
+    : i18nT('components.sessionActionsMenu.copy_session_id')
   const isRunning = !!slot?.running
   // The move-to submenu lists chat folders in the order the sidebar draws them.
   // A failed read (no body to draw from) is said once per screen, by the
@@ -177,10 +223,7 @@ export default function SessionActionsMenu({
   // would tear down their shared runtime) — mirror that in the disable so a
   // slot whose turn ended but whose children still run doesn't offer a click
   // the backend will 409.
-  const slotSubagents = useAppSelector(s => selectSlotSubagents(s, slotKey))
-  const hasActiveSubagents = Object.values(slotSubagents).some(
-    a => a.status === 'pending' || a.status === 'running' || a.status === 'tool',
-  )
+  const hasActiveSubagents = useAppSelector(s => selectSlotSubagentsActive(s, slotKey))
   const reloadBlocked = isRunning || hasActiveSubagents
   const currentFolderId = slot?.folder_id
   const colorIndex = slot?.color_index
@@ -385,22 +428,89 @@ export default function SessionActionsMenu({
           <Undo2 size={13} className="shrink-0 text-muted" /> {i18nT('components.sessionActionsMenu.bring_back_to_main')}
         </Item>
       ),
+      // Stage a reference to this session in the open chat's composer — the
+      // menu form of dragging the row into the composer. Self-hiding: the
+      // caller passes the handler only when a reference can be staged right now
+      // (a composer exists, and this is not an incognito/temporary/self target).
+      onReferenceInChat && (
+        <Item key="reference-in-chat" onSelect={onReferenceInChat}>
+          <MessagesSquare size={13} className="shrink-0 text-muted" /> {i18nT('components.sessionActionsMenu.reference_in_chat')}
+        </Item>
+      ),
       <Item key="copy" onSelect={() => copyLink(slotKey)}>
         <Link2 size={13} className="shrink-0 text-muted" /> {i18nT('components.sessionActionsMenu.copy_link')}
       </Item>,
+      // The bare session key (the `sid` hidden inside Copy link's URL), for
+      // pasting into a prompt or an issue. Its own `#` glyph, not another Copy
+      // glyph: the copy glyph already means Duplicate on this row and Copy text
+      // in the message footer, so a third overload would read as either.
+      <Item
+        key="copy-id"
+        // Keep the menu open on select so the acknowledgment is not taken off
+        // screen the instant it is earned, and a failure notice renders in
+        // place with its hand-off reachable; the label is announced politely.
+        onSelect={(e?: Event) => { e?.preventDefault?.(); onCopySessionId() }}
+      >
+        {idCopyStatus === 'copied'
+          ? <Check size={13} className="shrink-0 text-ok" aria-hidden="true" />
+          : <Hash size={13} className="shrink-0 text-muted" />}
+        {' '}
+        <span aria-live="polite" data-testid="session-menu-copy-id-label">{copyIdLabel}</span>
+      </Item>,
+      // Both clipboard layers refused, so the key never reached the clipboard:
+      // say so through ErrorNotice (the rule's in-menu form: a passive notice
+      // plus a hand-off item the roving focus reaches).
+      copyIdFailed && (
+        <React.Fragment key="copy-id-error">
+          <div className="max-w-[300px] px-2 py-1.5">
+            <ErrorNotice
+              id={copyIdErrorId}
+              variant="inline"
+              className="flex-wrap"
+              title={i18nT('components.sessionActionsMenu.copy_session_id_failed')}
+              message={i18nT('components.sessionActionsMenu.copy_session_id_failed_detail')}
+              messagePlacement="below"
+              testId="session-menu-copy-id-error"
+            />
+          </div>
+          <ErrorNoticeMenuItem
+            Item={Item}
+            message={i18nT('components.sessionActionsMenu.copy_session_id_failed_detail')}
+            describedBy={copyIdErrorId}
+          />
+          <Separator />
+        </React.Fragment>
+      ),
       // Copy this session to another Kiro Crew instance. Sits in nav/access
       // rather than the tab-modifier group above because it changes nothing
       // about this tab — the peer gets its own copy under its own key.
       // Self-hiding when no instances are configured.
-      <SendToInstanceSubmenu key="send-instance" slotKey={slotKey} variant={variant} />,
+      <SendToInstanceSubmenu
+        key="send-instance"
+        slotKey={slotKey}
+        variant={variant}
+        folderDefault={folders.find(f => f.id === currentFolderId)?.default_destination_crew}
+      />,
       // The same act with the live hop removed: a tunnel needs both machines up
       // and reachable at once, a file does not. Adjacent to the submenu above
       // so the two read as one choice about where the copy goes.
+      //
+      // Two rows, one per format. The JSON row keeps its original position as
+      // the established export: this change adds a format, it does not re-rank
+      // the existing one, and the Markdown row sits directly below it and
+      // directly above the Install row that reads the JSON file back.
       <ExportSessionItem
         key="export-file"
         slotKey={slotKey}
         Item={Item}
         memoryMode={slot?.memory_mode}
+      />,
+      <ExportSessionItem
+        key="export-file-md"
+        slotKey={slotKey}
+        Item={Item}
+        memoryMode={slot?.memory_mode}
+        format="md"
       />,
       // The reverse direction, and the reason it is here rather than in a global
       // menu: the file this reads is the file the row above writes, and a user
@@ -446,21 +556,31 @@ export default function SessionActionsMenu({
         )}
       </Item>,
     ],
-    // Close session — terminal, destructive
+    // Close session — terminal, destructive (red). An adopted remote-crew row
+    // passes closeNeutral: removing the local copy is reversible (the session
+    // stays live on its peer), so it renders in the menu's neutral colour AND
+    // with the Unlink glyph (not the ✕) — the glyph that reads "detach this
+    // machine's copy", distinct from the destructive close ✕ every other row
+    // shows, so the two actions never look like the same thing (#19958).
     [
-      <Item key="close" className="text-danger focus:text-danger" onSelect={() => close(slotKey)}>
-        {closeHint ? (
-          <>
-            <X size={13} className="self-start mt-0.5 shrink-0" />
-            <span className="flex min-w-0 flex-col">
-              <span>{i18nT('components.sessionActionsMenu.close_session')}</span>
-              <span className="max-w-[15rem] whitespace-normal text-[11px] leading-snug text-muted" data-testid="close-item-hint">{closeHint}</span>
-            </span>
-          </>
-        ) : (
-          <><X size={13} /> {i18nT('components.sessionActionsMenu.close_session')}</>
-        )}
-      </Item>,
+      (() => {
+        const CloseGlyph = closeNeutral ? Unlink : X
+        return (
+          <Item key="close" className={closeNeutral ? undefined : 'text-danger focus:text-danger'} onSelect={() => close(slotKey)}>
+            {closeHint ? (
+              <>
+                <CloseGlyph size={13} className="self-start mt-0.5 shrink-0" />
+                <span className="flex min-w-0 flex-col">
+                  <span>{closeLabel ?? i18nT('components.sessionActionsMenu.close_session')}</span>
+                  <span className="max-w-[15rem] whitespace-normal text-[11px] leading-snug text-muted" data-testid="close-item-hint">{closeHint}</span>
+                </span>
+              </>
+            ) : (
+              <><CloseGlyph size={13} /> {closeLabel ?? i18nT('components.sessionActionsMenu.close_session')}</>
+            )}
+          </Item>
+        )
+      })(),
     ],
   ])
 

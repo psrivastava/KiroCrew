@@ -1,12 +1,12 @@
 ---
 title: Work fold forgets closed items — bound a board by what is open, not by what it ever created
-status: draft
+status: accepted
 author: kirocrew agent session
 created: 2026-10-10
 last-audited: 2026-10-10
 audited-at: bf1723d3f
 doc-pr: 18982
-implementation-prs: []
+implementation-prs: [19068]
 tracking-issues: [18583]
 supersedes: []
 superseded-by: []
@@ -14,7 +14,7 @@ superseded-by: []
 
 # RFC: Work fold forgets closed items
 
-Status: draft. Nothing built. Every code reference below was read at `bf1723d3f`.
+Status: accepted. Implementation in [#19068](https://github.com/kirodotdev/KiroCrew/pull/19068); see the implementation note in §4.2. Every code reference below was read at `bf1723d3f`.
 
 This document lands on its own, before any implementation, because it removes a
 user-visible limit (a conductor board stops dispatching after 256 lifetime items)
@@ -25,7 +25,7 @@ so that one is not edited.
 ## 1. Problem
 
 A conductor board refuses its 257th `create` for good, even when only one item on it
-is still open. `_create_item` (`src/kiro_crew/work_ledger.py`) refuses with
+is still open. `_create_item` (`src/kiro_crew/work_ledger_writes.py`) refuses with
 `item_store_full` once `created_total >= MAX_STORED_ITEMS_PER_CONDUCTOR` (256,
 `work_vocab.WORK_STORED_ITEM_LIMIT`). The counter only climbs; closing an item gives
 nothing back. The only way out is `kirocrew ledger-sweep --purge`, run by a person,
@@ -44,7 +44,7 @@ units, read a unit at a time; it grows without a cap.
 The limit is the `work` **fold**: the projection that replays the log into one
 in-memory state per board. It keeps every item it has seen, closed ones included,
 each with up to `WORK_EVENT_LIMIT = 200` event lines of up to 500 characters. The
-fold-budget note in `crew_log/projection.py` measures the cap-state at **165.6 MiB**
+fold-budget note in `crew_log/projection_budget.py` measures the cap-state at **165.6 MiB**
 for 256 items x 200 events. So the fold caps itself at `WORK_ITEM_LIMIT` (=
 `WORK_STORED_ITEM_LIMIT`) and drops later creates into `omitted`, and the writer caps
 lifetime creates at the same number so the fold never has to drop one
@@ -86,7 +86,7 @@ the crew log; append-only is untouched.
 ### 4.1 Late entries for a closed item
 
 The writer refuses every action on a terminal item (`CODE_ITEM_CLOSED` in
-`work_ledger.py`; no reopen path exists in the writer). So no entry is **written**
+`work_ledger_records.py`; no reopen path exists in the writer). So no entry is **written**
 after a close. But entries are **folded** per unit, not in global time: a worker's
 `report` lives in the worker's own log, and the fold may reach that unit after the
 conductor's unit that holds the `close`. The fold already handles the reverse order
@@ -124,6 +124,15 @@ The writer's cache (`work-ledger/<slot>/items/`) must agree with the fold:
 the cache keeps the same set the fold keeps. Closed records past the recent window
 leave the cache. This removal runs in the server (rebuild, or the ledger-sweep's
 existing per-store maintenance), never as a side effect of a model's `create`.
+
+**Implementation note (#19068).** The implementation keeps every record in the
+writer's cache instead: only the fold forgets. A rebuild keeps a record the fold
+forgot, so no record is ever deleted to match the fold. This is the safer choice:
+each way of trimming the cache that review examined had a path that lost a record.
+The cost is that `list_work_items` still reads every record file under the board
+lock, so a board in the thousands of items reads more on each create. A trim or an
+open-count index is the follow-up if that cost shows up. Where §5 says "trim closed
+records past the window", the implementation does not.
 
 ## 5. What changes
 

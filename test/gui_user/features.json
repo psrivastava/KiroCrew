@@ -4,16 +4,16 @@
   "counts": {
     "smoke": 42,
     "nightly": 167,
-    "native-only": 12,
+    "native-only": 13,
     "needs-secret": 27,
-    "excluded": 22,
-    "total": 270
+    "excluded": 23,
+    "total": 272
   },
   "priorities": {
     "P0": 10,
     "P1": 35,
     "P2": 162,
-    "P3": 61
+    "P3": 63
   },
   "per_feature": {
     "chat": {
@@ -39,10 +39,10 @@
     },
     "sidebar": {
       "smoke": 5,
-      "nightly": 10,
+      "nightly": 9,
       "native-only": 0,
       "needs-secret": 1,
-      "excluded": 0
+      "excluded": 1
     },
     "navigation": {
       "smoke": 0,
@@ -235,8 +235,8 @@
     },
     "settings": {
       "smoke": 12,
-      "nightly": 28,
-      "native-only": 3,
+      "nightly": 29,
+      "native-only": 4,
       "needs-secret": 0,
       "excluded": 4
     },
@@ -460,22 +460,24 @@
     {
       "id": "chat-knowledge-picker-attach",
       "feature": "chat",
-      "title": "Attach knowledge sources from the composer picker",
+      "title": "Attach knowledge results with a prefix search in the composer",
       "user_story": "As a user, I want to pick knowledge items to include in a turn, so that the agent answers from my documents.",
       "start_url": "/chat",
-      "entry_path": "Composer > knowledge picker button > select item",
+      "entry_path": "Composer: type '@kb <query>' (or '@knowledge <query>' / '/kb <query>') and press Enter > KnowledgePicker results > tick a result > Inject Context",
       "preconditions": {
         "seed": "memory-populated",
         "members": [],
         "feature_flags": [],
-        "notes": "KnowledgePicker.tsx + useKnowledgeFetch.ts; needs indexed knowledge items."
+        "notes": "There is no picker button: KnowledgePicker.tsx mounts in ComposerDockView.tsx only after a prefix search (useKnowledgeFetch.ts). Needs indexed knowledge items. memory-populated seeds memory files only, no knowledge source, so the lane must add a source before a search can return results."
       },
       "runnable": "nightly",
       "estimated_steps": 4,
       "rationale": "Requires knowledge fixture and embedding status; web-only.",
       "source": [
         "website/src/pages/chat/KnowledgePicker.tsx",
-        "website/src/pages/chat/useKnowledgeFetch.ts"
+        "website/src/pages/chat/useKnowledgeFetch.ts",
+        "website/src/pages/ChatPage.tsx",
+        "website/src/pages/chat/page/ComposerDockView.tsx"
       ],
       "priority": "P2",
       "merged_from": [
@@ -503,6 +505,7 @@
         "website/src/pages/chat/pagination.ts",
         "website/src/pages/chat/EarlierMessagesBar.tsx",
         "website/src/pages/ChatPage.tsx",
+        "website/src/pages/chat/page/ChatTranscriptView.tsx",
         "src/kiro_crew/tests_fixtures/sessions-long-history/fixture.yaml",
         "docs/system-specs/modules/history.md"
       ],
@@ -519,19 +522,19 @@
       "title": "Inspect MCP tools available to the session",
       "user_story": "As a user, I want to see which MCP tools the session can call, so that I understand the agent's capabilities.",
       "start_url": "/chat",
-      "entry_path": "Chat footer > MCP info button > McpToolsPanel",
+      "entry_path": "Chat header: session title menu ('Session options') > MCP servers submenu > McpToolsPanel",
       "preconditions": {
         "seed": "connections-two",
         "members": [],
         "feature_flags": [],
-        "notes": "McpInfoButton.tsx opens McpToolsPanel.tsx; McpOAuthBanner appears when a server needs sign-in."
+        "notes": "McpToolsPanel.tsx renders inside the MCP servers submenu of the session options menu (ChatHeaderMenu.tsx); the chat footer has no MCP button. McpOAuthBanner appears when a server needs sign-in."
       },
       "runnable": "nightly",
       "estimated_steps": 3,
       "rationale": "Needs seeded MCP servers; OAuth completion is needs-secret and excluded from this record.",
       "source": [
         "website/src/pages/chat/McpToolsPanel.tsx",
-        "website/src/pages/chat/McpInfoButton.tsx",
+        "website/src/pages/chat/ChatHeaderMenu.tsx",
         "website/src/pages/chat/McpOAuthBanner.tsx"
       ],
       "priority": "P2",
@@ -647,27 +650,29 @@
     {
       "id": "chat-rewind",
       "feature": "chat",
-      "title": "Rewind",
+      "title": "Rewind a chat by editing a user message (Edit & Resend)",
       "user_story": "As a user, I want to drop the transcript back to an earlier turn, so that I can redo the conversation from that point.",
       "start_url": "/chat",
-      "entry_path": "Message action → Rewind",
+      "entry_path": "Hover a user message > More actions (or the pencil button where the row has no More menu) > Edit & Resend > edit the text > Send (replaces the replies below)",
       "preconditions": {
         "seed": "sessions-a-few",
         "members": [],
         "feature_flags": [],
-        "notes": "Session with ≥3 turns."
+        "notes": "Session with ≥3 turns. Only a user message offers it, an assistant reply has no Rewind action. The action row shows on hover, so hover before clicking. Send calls POST /api/chat/slots/{slot}/rewind (useMessageActions.handleEditResend)."
       },
       "runnable": "nightly",
       "estimated_steps": 3,
       "rationale": "Deterministic transcript mutation on a fixture session; visually verifiable by turn count.",
       "source": [
-        "docs/feature-map/README.md"
+        "docs/feature-map/README.md",
+        "website/src/pages/chat/UserMessage.tsx",
+        "website/src/pages/ChatPage.tsx"
       ],
       "priority": "P2",
       "merged_from": [
         "chat-rewind"
       ],
-      "component": ""
+      "component": "website/src/pages/chat/UserMessage.tsx"
     },
     {
       "id": "chat-session-summary",
@@ -1160,21 +1165,21 @@
     {
       "id": "sidebar-folders-history-and-archive",
       "feature": "sidebar",
-      "title": "Sidebar groups sessions under the Demos folder and History shows the closed Research notes session",
-      "user_story": "As a returning user, I want folders, pinned sessions and a History panel, so that I can find past work quickly.",
+      "title": "Sidebar groups sessions under the Demos folder and Older Sessions shows the closed 'Research: MCP transport trade-offs' session",
+      "user_story": "As a returning user, I want folders, pinned sessions and an Older Sessions pane, so that I can find past work quickly.",
       "start_url": "/chat",
-      "entry_path": "Sidebar sessions list > Demos folder > History panel",
+      "entry_path": "Sidebar sessions list > Demos folder > Older Sessions pane (clock icon, bottom of the sidebar)",
       "preconditions": {
         "seed": "rich",
         "members": [
           "nova-sky"
         ],
         "feature_flags": [],
-        "notes": "3 active slots (starter pinned, coder-demo, triage-demo in Demos) plus closed research-notes and an archive slice."
+        "notes": "3 active slots: the pinned starter session, and the Demos folder holding 'Fix empty-glob crash in list_sessions' (coder-demo) and 'Triage: cron runs twice per tick' (triage-demo), plus the closed session titled 'Research: MCP transport trade-offs' (research-notes) and an archive slice. The sidebar shows session titles, not slot names."
       },
       "runnable": "smoke",
       "estimated_steps": 3,
-      "rationale": "P0: this is the newly merged list-shell sidebar (folders, pinned rows, History pane) rendered read-only on the rich seed in ≤5 actions; the seed is designed for it.",
+      "rationale": "P0: this is the newly merged list-shell sidebar (folders, pinned rows, Older Sessions pane) rendered read-only on the rich seed in ≤5 actions; the seed is designed for it.",
       "source": [
         "src/kiro_crew/tests_fixtures/rich/README.md",
         "src/kiro_crew/tests_fixtures/rich/fixture.yaml"
@@ -1274,7 +1279,7 @@
         "seed": "minimal",
         "members": [],
         "feature_flags": [],
-        "notes": "Order = builtins.tsx registration order filtered by group; Notifications, Webhooks, Explore are hiddenFromNav; Members hidden unless mc-preview-crew=1."
+        "notes": "Order = builtins.tsx registration order filtered by group; Notifications, Webhooks, Explore are hiddenFromNav."
       },
       "runnable": "smoke",
       "estimated_steps": 1,
@@ -1520,34 +1525,6 @@
       "component": ""
     },
     {
-      "id": "sidebar-workspace-switcher-three-workspaces",
-      "feature": "sidebar",
-      "title": "Switch between default, review and research workspaces and see distinct memory and pinned sessions",
-      "user_story": "As a user with several projects, I want to switch workspace, so that memory and sessions scoped to it are what I see.",
-      "start_url": "/chat",
-      "entry_path": "Sidebar > workspace switcher",
-      "preconditions": {
-        "seed": "multi-workspace",
-        "members": [
-          "nova-sky"
-        ],
-        "feature_flags": [],
-        "notes": "One session per workspace selects a different agent; agent identity is per session."
-      },
-      "runnable": "nightly",
-      "estimated_steps": 4,
-      "rationale": "Config-driven UI with seeded differences; offline.",
-      "source": [
-        "src/kiro_crew/tests_fixtures/multi-workspace/fixture.yaml",
-        "src/kiro_crew/tests_fixtures/multi-workspace/config.json"
-      ],
-      "priority": "P2",
-      "merged_from": [
-        "sidebar-workspace-switcher-three-workspaces"
-      ],
-      "component": ""
-    },
-    {
       "id": "sidebar-connect-your-phone-modal",
       "feature": "sidebar",
       "title": "Open the Connect your phone dialog",
@@ -1572,6 +1549,34 @@
         "sidebar-connect-your-phone-modal"
       ],
       "component": "website/src/components/mobileConnectRenderers.tsx"
+    },
+    {
+      "id": "sidebar-workspace-switcher-three-workspaces",
+      "feature": "sidebar",
+      "title": "Switch between default, review and research workspaces and see distinct memory and pinned sessions",
+      "user_story": "As a user with several projects, I want to switch workspace, so that memory and sessions scoped to it are what I see.",
+      "start_url": "/chat",
+      "entry_path": "Sidebar > workspace switcher",
+      "preconditions": {
+        "seed": "multi-workspace",
+        "members": [
+          "nova-sky"
+        ],
+        "feature_flags": [],
+        "notes": "One session per workspace selects a different agent; agent identity is per session."
+      },
+      "runnable": "excluded",
+      "estimated_steps": 4,
+      "rationale": "Excluded: no workspace switcher exists on main. Named workspaces are edited in Developer > Config and picked per mate; the sidebar has no control that changes the active workspace.",
+      "source": [
+        "src/kiro_crew/tests_fixtures/multi-workspace/fixture.yaml",
+        "src/kiro_crew/tests_fixtures/multi-workspace/config.json"
+      ],
+      "priority": "P3",
+      "merged_from": [
+        "sidebar-workspace-switcher-three-workspaces"
+      ],
+      "component": ""
     },
     {
       "id": "capabilities-pin-tab-to-rail",
@@ -1946,7 +1951,7 @@
       "title": "Crew Members",
       "user_story": "As a crew operator, I want a durable DM thread per member with a docked side panel led by the crew's Dashboard tab, an auto-patrol badge on each roster row, and a filterable roster, so that I can supervise each crew in one place.",
       "start_url": "/members",
-      "entry_path": "Settings > Developer > Feature Previews > enable Crew Members; Rail > Crew Members (preview on) > roster filter input + activity chips > roster row (?member=<name> selects a row) > DM thread + docked side panel",
+      "entry_path": "Rail > Crew Members > roster filter input + activity chips > roster row (?member=<name> selects a row) > DM thread + docked side panel",
       "preconditions": {
         "seed": "rich",
         "members": [
@@ -1954,18 +1959,15 @@
           "beta",
           "gamma"
         ],
-        "feature_flags": [
-          "mc-preview-crew"
-        ],
-        "notes": "Fixture must define at least three crew members so the thread endpoint confirms a slot and the roster filter (rosterFilter.ts, activityDays.ts) has something to narrow; roster filters need starred and package-installed crews. Surface has slotMode 'member' and badge 'unread member threads'; page lazy-loaded; route stays registered even when the flag is off."
+        "feature_flags": [],
+        "notes": "Fixture must define at least three crew members so the thread endpoint confirms a slot and the roster filter (rosterFilter.ts, activityDays.ts) has something to narrow; roster filters need starred and package-installed crews. Surface has slotMode 'member' and badge 'unread member threads'; page lazy-loaded."
       },
       "runnable": "nightly",
       "estimated_steps": 6,
-      "rationale": "Preview-gated, multi-panel surface with several data dependencies; too many steps for the smoke lane but fully renderable on the fake backend. Roster+thread and roster-filter records are sub-steps of this one flow.",
+      "rationale": "Multi-panel surface with several data dependencies; too many steps for the smoke lane but fully renderable on the fake backend. Roster+thread and roster-filter records are sub-steps of this one flow.",
       "source": [
         "docs/feature-map/README.md",
         "website/src/surfaces/builtins.tsx",
-        "website/src/utils/previewFlags.ts",
         "website/src/App.tsx",
         "website/src/pages/members/MembersPage.tsx",
         "website/src/pages/members/rosterFilter.ts",
@@ -1982,19 +1984,17 @@
     {
       "id": "crewmate-reply-thread",
       "feature": "members",
-      "title": "Reply in thread on a crewmate's bubble opens the thread panel and the bubble gains a replies footer",
-      "user_story": "As a user talking to a crewmate, I want to ask about one thing it said in a reply thread on that message, so that the follow-up stays beside the message it is about instead of pushing the crewmate's findings up the main chat.",
+      "title": "Reply in thread on a mate's bubble opens the thread panel and the bubble gains a replies footer",
+      "user_story": "As a user talking to a mate, I want to ask about one thing it said in a reply thread on that message, so that the follow-up stays beside the message it is about instead of pushing the mate's findings up the main chat.",
       "start_url": "/settings",
-      "entry_path": "Settings > Developer > Feature Previews > enable Crew Members; Settings > Developer > Crewmates > enable Reply threads on crewmate chat messages; Rail > Crew Members > Nova Sky > send a message, get a reply > hover the reply bubble > Reply in thread > Thread panel (quoted parent, 'No replies yet') > send a reply in the panel",
+      "entry_path": "Settings > Developer > Mates > enable Reply threads on mate chat messages; Rail > Crew Members > Nova Sky > send a message, get a reply > hover the reply bubble > Reply in thread > Thread panel (quoted parent, 'No replies yet') > send a reply in the panel",
       "preconditions": {
         "seed": "rich",
         "members": [
           "nova-sky"
         ],
-        "feature_flags": [
-          "mc-preview-crew"
-        ],
-        "notes": "Threads exist only on a crewmate's chat (a member-mode slot); the fake ACP backend answers the main-chat message so a finished crewmate bubble carries the Reply in thread action, and answers the thread reply too, so the footer reads '1 reply' then '2 replies'. Replies live in the slot's .threads sidecar, never in the transcript."
+        "feature_flags": [],
+        "notes": "Threads exist only on a mate's chat (a member-mode slot); the fake ACP backend answers the main-chat message so a finished mate bubble carries the Reply in thread action, and answers the thread reply too, so the footer reads '1 reply' then '2 replies'. Replies live in the slot's .threads sidecar, never in the transcript."
       },
       "runnable": "nightly",
       "estimated_steps": 8,
@@ -2018,15 +2018,13 @@
       "title": "A member's DM thread survives leaving and returning; it keeps its history and still answers",
       "user_story": "As a crew operator, I want a member's direct-message thread to survive leaving and returning to the member, so that our earlier conversation and the member's ability to answer are not lost.",
       "start_url": "/settings",
-      "entry_path": "Settings > Developer > Feature Previews > enable Crew Members; Rail > Crew Members > Nova Sky > DM thread (send a message, get a reply) > leave to another rail item > back to Crew Members > Nova Sky > send again",
+      "entry_path": "Rail > Crew Members > Nova Sky > DM thread (send a message, get a reply) > leave to another rail item > back to Crew Members > Nova Sky > send again",
       "preconditions": {
         "seed": "rich",
         "members": [
           "nova-sky"
         ],
-        "feature_flags": [
-          "mc-preview-crew"
-        ],
+        "feature_flags": [],
         "notes": "The seeded member keeps its store; a member's memory is fixed at creation and its binding is immutable (PUT /api/agents changing memory_store returns 409 member_memory_immutable), so there is no store-switch control to touch. The check is that the DM thread persists across navigation and still answers on the fake ACP backend, which replies to both messages."
       },
       "runnable": "nightly",
@@ -2046,24 +2044,22 @@
     {
       "id": "sidebar-crew-members-create-menu-entry",
       "feature": "members",
-      "title": "Sidebar create menu 'Crew Members' routes by preview flag",
-      "user_story": "As a user, I want the Crew Members menu entry to open the page or the setting that enables it, so that I can find the feature either way.",
+      "title": "Mates rail row is there on a default install",
+      "user_story": "As a user, I want the Mates rail row on a fresh install, so that I can open the page without turning anything on.",
       "start_url": "/chat",
-      "entry_path": "ChatSidebar create (+) menu > Crew Members > lands on /members or Settings > Developer card",
+      "entry_path": "Rail row 'Mates' > lands on /members",
       "preconditions": {
         "seed": "minimal",
         "members": [],
-        "feature_flags": [
-          "mc-preview-crew"
-        ],
-        "notes": "Entry is always rendered; PREVIEW_CREW only decides destination (ChatSidebar.openCrewMembers). Run once with the flag on and once off."
+        "feature_flags": [],
+        "notes": "The sidebar New menu carries no Mates entry; the rail row is the page's door and needs no opt-in."
       },
       "runnable": "nightly",
       "estimated_steps": 3,
-      "rationale": "Two-branch navigation check starting from /chat, distinct from the members page flow; both branches run headless.",
+      "rationale": "Checks the ingress to the Mates page now that the create menu has no Mates entry; runs headless.",
       "source": [
-        "website/src/pages/ChatSidebar.tsx",
-        "website/src/utils/previewFlags.ts"
+        "website/src/shell/nav/appRail.tsx",
+        "website/src/surfaces/surfaceData.ts"
       ],
       "priority": "P2",
       "merged_from": [
@@ -2077,7 +2073,7 @@
       "title": "Crews",
       "user_story": "As an operator, I want to define named crews binding an agent, model and workspace with a custom avatar, so that I can pick the right worker per task.",
       "start_url": "/capabilities",
-      "entry_path": "Rail → Customize → Crewmates tab (?tab=crews)",
+      "entry_path": "Rail → Customize → Mates tab (?tab=crews)",
       "preconditions": {
         "seed": "rich",
         "members": [],
@@ -2099,10 +2095,10 @@
     {
       "id": "capabilities-crews-templates-skills-tabs",
       "feature": "capabilities",
-      "title": "Navigate Customize tabs: Crewmates, Custom agents, Skills",
+      "title": "Navigate Customize tabs: Mates, Custom agents, Skills",
       "user_story": "As a user, I want to manage crews, agent templates, and skills in one panel, so that agent configuration is centralized.",
       "start_url": "/capabilities",
-      "entry_path": "Rail > Customize (bottom group) > tabs Crewmates | Custom agents | Skills; /agents and /mc-agents redirect here",
+      "entry_path": "Rail > Customize (bottom group) > tabs Mates | Custom agents | Skills; /agents and /mc-agents redirect here",
       "preconditions": {
         "seed": "skills-custom",
         "members": [],
@@ -2131,7 +2127,7 @@
       "title": "Agent templates inside a crew's Template pane",
       "user_story": "As an operator, I want to inspect the harness-level agent definitions crews bind to, so that I understand what a crew actually runs.",
       "start_url": "/capabilities",
-      "entry_path": "Customize → Crewmates tab → open a crewmate → Template pane (the shared definitions live on the Custom agents tab)",
+      "entry_path": "Customize → Mates tab → open a mate → Template pane (the shared definitions live on the Custom agents tab)",
       "preconditions": {
         "seed": "minimal",
         "members": [],
@@ -2156,7 +2152,7 @@
       "title": "Crew appearance library",
       "user_story": "As an operator, I want a Library tab of appearance packs a crew can wear, with import and guarded delete, so that crews look distinct.",
       "start_url": "/capabilities",
-      "entry_path": "Customize → Crewmates → a crewmate → Edit avatar → Library",
+      "entry_path": "Customize → Mates → a mate → Edit avatar → Library",
       "preconditions": {
         "seed": "rich",
         "members": [],
@@ -2514,7 +2510,7 @@
         "seed": "memory-populated",
         "members": [],
         "feature_flags": [],
-        "notes": "DRILL_VIEWS in OverviewPage.tsx; KiroSignInCard and TunnelStatus appear on the hero."
+        "notes": "DRILL_VIEWS in OverviewPage.tsx; TunnelStatus appears on the hero. The Kiro sign-in card does not: it lives on Settings > Agent Harness."
       },
       "runnable": "smoke",
       "estimated_steps": 3,
@@ -2843,7 +2839,7 @@
           "nova-sky"
         ],
         "feature_flags": [],
-        "notes": "agent_fetch runs an LLM worker that needs outbound network."
+        "notes": "The gateway fetches the page itself, which needs outbound network and a host in knowledge.doc_ingest_hosts."
       },
       "runnable": "excluded",
       "estimated_steps": 4,
@@ -5449,7 +5445,7 @@
           "nova-sky"
         ],
         "feature_flags": [],
-        "notes": "The new window is a same-origin Chromium window on the Xvfb display (Playwright popup); setArtifactNavIntentHandler in App.tsx handles 'Ask agent to address' from the popout. Fallback: load /popout/artifact/queue-badge directly."
+        "notes": "The new window is a same-origin Chromium window on the Xvfb display (Playwright popup); setArtifactNavIntentHandler in App.tsx handles 'Draft a prompt in chat' from the popout. Fallback: load /popout/artifact/queue-badge directly."
       },
       "runnable": "nightly",
       "estimated_steps": 2,
@@ -5526,26 +5522,27 @@
     {
       "id": "kas-auth-sign-in-card-signed-out",
       "feature": "auth",
-      "title": "KasLoginGate sign-in card on Settings > Overview (signed-out state)",
+      "title": "Kiro sign-in card on Settings > Agent Harness (signed-out state)",
       "user_story": "As an operator, I want to see whether Kiro Crew holds a Kiro identity and how to sign in, so that I can fix a session that cannot start.",
-      "start_url": "/settings/overview",
-      "entry_path": "Settings > Overview > Kiro sign-in card",
+      "start_url": "/settings/agent",
+      "entry_path": "Settings > Agent Harness > scroll below the backend switch to the 'Kiro sign-in' card (deep link /settings/agent?highlight=key:kiro-sign-in)",
       "preconditions": {
         "seed": "minimal",
         "members": [
           "nova-sky"
         ],
         "feature_flags": [],
-        "notes": "No vault identity on the seeded home; KasLoginGate is not mounted at app root, the card embeds the same views. Reachable from Search Everywhere as overview.kiro-sign-in."
+        "notes": "No vault identity on the seeded home; KasLoginGate is not mounted at app root, the card embeds the same views. KiroSignInCard (pages/developer) mounts only inside the KAS row's detail on Agent Harness (AgentBackendTab.tsx), and only while KAS is an offered backend, so the seeded host must offer KAS. Settings > Overview carries only a one-line pointer (while KAS is the selected backend) and the card is not in Settings search. The shipped scenario auth-sign-in-card-signed-out drives the same card."
       },
       "runnable": "smoke",
       "estimated_steps": 2,
-      "rationale": "Newly merged UI. The card reads a local kas-login status and renders deterministically on a fresh home with no network; two actions (open Overview, assert card copy/CTA). Completing the sign-in itself (the embedded KAS login) needs a real external identity and is out of scope; the scenario asserts the card's states, not a finished login.",
+      "rationale": "Newly merged UI. The card reads a local kas-login status and renders deterministically on a fresh home with no network; two actions (open Agent Harness, assert card copy/CTA). Completing the sign-in itself (the embedded KAS login) needs a real external identity and is out of scope; the scenario asserts the card's states, not a finished login.",
       "source": [
         "docs/feature-map/README.md",
         "docs/system-specs/modules/kas-auth.md",
-        "website/src/components/commandPalette/settingsRegistry.gen.ts",
-        "website/src/pages/settings/KiroSignInCard.tsx"
+        "website/src/pages/developer/AgentBackendTab.tsx",
+        "website/src/pages/developer/KiroSignInCard.tsx",
+        "website/src/pages/developer/kiroSignInLink.ts"
       ],
       "priority": "P0",
       "merged_from": [
@@ -5554,7 +5551,7 @@
         "settings-overview-kiro-sign-in-flow",
         "standalone-kiro-sign-in"
       ],
-      "component": "website/src/pages/settings/KiroSignInCard.tsx"
+      "component": "website/src/pages/developer/KiroSignInCard.tsx"
     },
     {
       "id": "dashboard-token-login-gate",
@@ -5836,37 +5833,36 @@
       "component": "website/src/pages/settings/ChatPanel.tsx"
     },
     {
-      "id": "settings-developer-panel-dev-mode-toggle",
+      "id": "settings-developer-panel-pages",
       "feature": "settings",
-      "title": "Toggle Developer Mode and open the Developer page",
-      "user_story": "As a developer, I want to enable Developer Mode in Settings > Developer, so that the Developer page with logs and metrics appears in the sidebar.",
+      "title": "Browse the Settings > Developer pages",
+      "user_story": "As a developer, I want the feature previews and the internals pages (logs, metrics, memory graph) side by side in Settings > Developer, so that I can reach them without unlocking anything.",
       "start_url": "/settings/developer",
-      "entry_path": "Settings > System > Developer > Developer Mode toggle > Open developer page link",
+      "entry_path": "Settings > System > Developer > Feature Previews | Logs | System | ...",
       "preconditions": {
         "seed": "minimal",
         "members": [],
         "feature_flags": [],
-        "notes": "Stored in localStorage mc-dev-mode; dispatches mc-dev-mode-changed."
+        "notes": "Every page is listed; /developer?tab=<key> redirects here."
       },
       "runnable": "smoke",
       "estimated_steps": 3,
-      "rationale": "Local toggle with immediate sidebar effect; fully web-testable.",
+      "rationale": "Local navigation with an immediate result; fully web-testable.",
       "source": [
         "docs/feature-map/README.md",
         "website/src/App.tsx",
         "website/src/components/commandPalette/settingsRegistry.gen.ts",
         "website/src/pages/DeveloperPage.tsx",
         "website/src/pages/settings/DeveloperPanel.tsx",
-        "website/src/pages/settings/FeaturePreviewsSection.tsx",
-        "website/src/utils/previewFlags.ts"
+        "website/src/pages/settings/FeaturePreviewsSection.tsx"
       ],
       "priority": "P1",
       "merged_from": [
         "settings-developer",
         "settings-developer-mode-and-feature-previews",
-        "settings-developer-panel-dev-mode-toggle"
+        "settings-developer-panel-pages"
       ],
-      "component": "website/src/pages/DeveloperPage.tsx"
+      "component": "website/src/pages/settings/DeveloperPanel.tsx"
     },
     {
       "id": "settings-display",
@@ -5970,12 +5966,12 @@
       "title": "Settings › Overview",
       "user_story": "As a user, I want a health hero, stat cards and drill-ins to memory and usage, so that I see system state at a glance.",
       "start_url": "/settings",
-      "entry_path": "Sidebar > Settings (gear) > lands on Overview (segment-less /settings and /overview both resolve to /settings/overview); hero shows KiroSignInCard + TunnelStatus",
+      "entry_path": "Sidebar > Settings (gear) > lands on Overview (segment-less /settings and /overview both resolve to /settings/overview); hero shows TunnelStatus",
       "preconditions": {
         "seed": "rich",
         "members": [],
         "feature_flags": [],
-        "notes": "KiroSignInCard reads GET kas-login status; the fake backend should return an unauthenticated or stub-signed-in status. | Segment-less /settings resolves to the default tab; rail groups Preferences and System are rendered by SidePanelLayout."
+        "notes": "The Kiro sign-in card is not on Overview, it lives on Settings > Agent Harness (Overview shows a one-line pointer only while KAS is the selected backend). | Segment-less /settings resolves to the default tab; rail groups Preferences and System are rendered by SidePanelLayout."
       },
       "runnable": "smoke",
       "estimated_steps": 2,
@@ -5983,7 +5979,6 @@
       "source": [
         "docs/feature-map/README.md",
         "website/src/pages/settings/OverviewPanel.tsx",
-        "website/src/pages/settings/KiroSignInCard.tsx",
         "website/src/pages/SettingsPage.tsx"
       ],
       "priority": "P1",
@@ -6795,6 +6790,32 @@
       "component": "website/src/pages/settings/SttSettings.tsx"
     },
     {
+      "id": "settings-voice-stt-decode-threads",
+      "feature": "settings",
+      "title": "Set local speech-to-text decode threads",
+      "user_story": "As a dashboard user on a machine with many cores, I want to pick how many CPU threads the local speech model uses, so that dictation finishes sooner.",
+      "start_url": "/settings/voice",
+      "entry_path": "Settings > Voice > Fine-tuning > Decode threads select",
+      "preconditions": {
+        "seed": "minimal",
+        "members": [],
+        "feature_flags": [],
+        "notes": "Local provider only. Choices are sized to the gateway's cores; KIROCREW_STT_THREADS overrides the stored value and the panel says so."
+      },
+      "runnable": "nightly",
+      "estimated_steps": 3,
+      "rationale": "Control rendering and persistence are web-testable; decode speed is not asserted.",
+      "source": [
+        "website/src/pages/settings/SttSettings.tsx",
+        "website/src/components/commandPalette/settingsRegistry.gen.ts"
+      ],
+      "priority": "P2",
+      "merged_from": [
+        "settings-voice-stt-decode-threads"
+      ],
+      "component": "website/src/pages/settings/SttSettings.tsx"
+    },
+    {
       "id": "settings-voice-stt-enable-and-provider",
       "feature": "settings",
       "title": "Enable speech-to-text and pick provider",
@@ -6827,7 +6848,7 @@
     {
       "id": "settings-voice-tts-provider-select",
       "feature": "settings",
-      "title": "Switch TTS Provider (built-in / Piper / Amazon Polly)",
+      "title": "Switch TTS Provider (built-in / Amazon Polly)",
       "user_story": "As a dashboard user, I want to switch the TTS Provider in Settings > Voice, so that spoken replies use the engine I choose.",
       "start_url": "/settings/voice",
       "entry_path": "Settings > Voice > Provider select (TTS card)",
@@ -6835,7 +6856,7 @@
         "seed": "minimal",
         "members": [],
         "feature_flags": [],
-        "notes": "Selecting Polly reveals AWS profile/region inputs; Piper reveals binary/model paths."
+        "notes": "Selecting Polly reveals AWS profile/region inputs; the built-in engine reveals its voice and speed."
       },
       "runnable": "nightly",
       "estimated_steps": 4,
@@ -6951,6 +6972,33 @@
         "settings-developer-run-local-gateway-toggle"
       ],
       "component": "website/src/pages/settings/DeveloperPanel.tsx"
+    },
+    {
+      "id": "settings-display-keep-running-when-closed-toggle",
+      "feature": "settings",
+      "title": "Toggle Keep running in the background after closing the window",
+      "user_story": "As a desktop user who does not want the app left in the tray, I want the window close button to quit the app, so that closing the window ends it like other apps.",
+      "start_url": "/settings/display/view",
+      "entry_path": "Settings > Display > View > Desktop app > Keep running in the background after closing the window toggle",
+      "preconditions": {
+        "seed": "minimal",
+        "members": [],
+        "feature_flags": [],
+        "notes": "Section only renders in the desktop app's main window (local or remote gateway), because it controls that window's close button; connection windows do not show it. Takes effect on the next close."
+      },
+      "runnable": "native-only",
+      "estimated_steps": 4,
+      "rationale": "Desktop-app-only section; not degradable to web because it is hidden without Electron, and the behaviour is the native window close.",
+      "source": [
+        "website/src/pages/settings/DisplayPanel.tsx",
+        "website/src/hooks/useCloseAction.ts",
+        "website/electron/close-action.js"
+      ],
+      "priority": "P3",
+      "merged_from": [
+        "settings-display-keep-running-when-closed-toggle"
+      ],
+      "component": "website/src/pages/settings/DisplayPanel.tsx"
     },
     {
       "id": "settings-notifications-background-chat-finished",
@@ -7121,7 +7169,7 @@
         "seed": "minimal",
         "members": [],
         "feature_flags": [],
-        "notes": "Add and remove one user rule; file-delivery consent has no panel yet. | SECURITY_SECTIONS in SecurityPanel.tsx; approval mode also cycled by keyboard shortcut in App.tsx. | Rendered from GET /api/security/posture registry via PostureDisclosureRow."
+        "notes": "Add and remove one user rule. | SECURITY_SECTIONS in SecurityPanel.tsx; approval mode also cycled by keyboard shortcut in App.tsx. | Rendered from GET /api/security/posture registry via PostureDisclosureRow."
       },
       "runnable": "smoke",
       "estimated_steps": 3,
@@ -7414,14 +7462,12 @@
       "feature": "developer",
       "title": "Developer › Archive",
       "user_story": "As a developer, I want a consolidated session archive browser, so that I can inspect compacted history.",
-      "start_url": "/developer",
-      "entry_path": "Developer → archive tab (?tab=archive)",
+      "start_url": "/settings/developer",
+      "entry_path": "Settings → Developer → archive (/settings/developer/archive)",
       "preconditions": {
         "seed": "sessions-long-history",
         "members": [],
-        "feature_flags": [
-          "mc-dev-mode"
-        ],
+        "feature_flags": [],
         "notes": "Fixture includes at least one archive file."
       },
       "runnable": "nightly",
@@ -7441,14 +7487,12 @@
       "feature": "developer",
       "title": "Developer › Config",
       "user_story": "As a developer, I want raw Kiro Crew and agent config editors, so that I can fix a setting no panel exposes.",
-      "start_url": "/developer",
-      "entry_path": "Developer → config tab (?tab=config)",
+      "start_url": "/settings/developer",
+      "entry_path": "Settings → Developer → config (/settings/developer/config)",
       "preconditions": {
         "seed": "minimal",
         "members": [],
-        "feature_flags": [
-          "mc-dev-mode"
-        ],
+        "feature_flags": [],
         "notes": "Edit a harmless key and revert."
       },
       "runnable": "nightly",
@@ -7468,14 +7512,12 @@
       "feature": "developer",
       "title": "Developer › Debug tools",
       "user_story": "As a developer, I want diagnostic overlays such as the chat scroll inspector, so that I can debug layout issues.",
-      "start_url": "/developer",
-      "entry_path": "Developer → debug-tools tab (?tab=debug-tools)",
+      "start_url": "/settings/developer",
+      "entry_path": "Settings → Developer → debug-tools (/settings/developer/debug-tools)",
       "preconditions": {
         "seed": "sessions-a-few",
         "members": [],
-        "feature_flags": [
-          "mc-dev-mode"
-        ],
+        "feature_flags": [],
         "notes": ""
       },
       "runnable": "nightly",
@@ -7495,14 +7537,12 @@
       "feature": "developer",
       "title": "Developer › Logs",
       "user_story": "As a developer, I want a live gateway log stream with level control, so that I can debug in real time.",
-      "start_url": "/developer",
-      "entry_path": "Developer → logs tab (?tab=logs)",
+      "start_url": "/settings/developer",
+      "entry_path": "Settings → Developer → logs (/settings/developer/logs)",
       "preconditions": {
         "seed": "minimal",
         "members": [],
-        "feature_flags": [
-          "mc-dev-mode"
-        ],
+        "feature_flags": [],
         "notes": ""
       },
       "runnable": "nightly",
@@ -7520,45 +7560,43 @@
     {
       "id": "developer-mcp-pool",
       "feature": "developer",
-      "title": "Developer › MCP pool",
-      "user_story": "As a developer, I want MCP connection pool state and a probe, so that I can diagnose tool outages.",
-      "start_url": "/developer",
-      "entry_path": "Developer → mcp-pool tab (?tab=mcp-pool)",
+      "title": "Developer › MCP Management (tab key mcp-pool)",
+      "user_story": "As a developer, I want to see each MCP server's state, opt servers in to stubbing and read the sharing assessment, so that I can manage MCP connections and diagnose tool outages.",
+      "start_url": "/settings/developer",
+      "entry_path": "Settings → Developer → MCP Management (/settings/developer/mcp-pool) → Servers table with stub switches, and the Sharing assessment tab",
       "preconditions": {
         "seed": "connections-two",
         "members": [],
-        "feature_flags": [
-          "mc-dev-mode"
-        ],
-        "notes": ""
+        "feature_flags": [],
+        "notes": "The tab key is mcp-pool and its label is MCP Management (DeveloperPanel.tsx). Two views: Servers (columns Server, Used by, State, Stub; one stub switch per server) and Sharing assessment."
       },
       "runnable": "nightly",
       "estimated_steps": 3,
-      "rationale": "Active/scopes render from the connections fixture; probe is a local call.",
+      "rationale": "The tab reads the mcp-gateway status and servers endpoints; the assertions are the Servers table with its stub switches and the Sharing assessment view.",
       "source": [
-        "docs/feature-map/README.md"
+        "docs/feature-map/README.md",
+        "website/src/pages/DeveloperPage.tsx",
+        "website/src/pages/settings/McpManagement.tsx"
       ],
       "priority": "P2",
       "merged_from": [
         "developer-mcp-pool"
       ],
-      "component": ""
+      "component": "website/src/pages/settings/McpManagement.tsx"
     },
     {
       "id": "developer-memory-graph",
       "feature": "developer",
       "title": "Memory graph",
       "user_story": "As a developer, I want an entity/relation visualiser over the memory store plus every memory layer and saved lesson, so that I can debug and audit what the agent remembers.",
-      "start_url": "/developer",
-      "entry_path": "Developer → memory tab (?tab=memory)",
+      "start_url": "/settings/developer",
+      "entry_path": "Settings → Developer → memory (/settings/developer/memory)",
       "preconditions": {
         "seed": "memory-populated",
         "members": [
           "nova-sky"
         ],
-        "feature_flags": [
-          "mc-dev-mode"
-        ],
+        "feature_flags": [],
         "notes": "Canvas graph; assert node count rather than layout. Vector stores are absent by design; only markdown layers (preferences, projects, semantic, history) and three lessons in lessons.jsonl are seeded."
       },
       "runnable": "nightly",
@@ -7575,22 +7613,20 @@
         "developer-memory-graph",
         "developer-memory-tab-lessons-and-layers"
       ],
-      "component": "website/src/pages/DeveloperPage.tsx"
+      "component": "website/src/pages/settings/DeveloperPanel.tsx"
     },
     {
       "id": "developer-page-tabs",
       "feature": "developer",
-      "title": "Navigate the Developer page internals tabs",
+      "title": "Navigate the Settings > Developer internals pages",
       "user_story": "As a developer, I want logs, system, telemetry, storage, MCP pool, memory graph, config, debug tools, and archive in one place, so that I can diagnose the gateway.",
-      "start_url": "/developer",
-      "entry_path": "Enable dev mode → Rail bottom → Developer → tabs (logs, system, telemetry, storage, mcp-pool, memory, config, debug-tools, archive)",
+      "start_url": "/settings/developer",
+      "entry_path": "Settings → Developer → pages (logs, system, telemetry, storage, mcp-pool, memory, config, debug-tools, archive)",
       "preconditions": {
         "seed": "rich",
         "members": [],
-        "feature_flags": [
-          "mc-dev-mode"
-        ],
-        "notes": "Rail row only with mc-dev-mode=1 but route always resolves; MemoryGraphTab lazy; /logs also standalone."
+        "feature_flags": [],
+        "notes": "/developer?tab=<key> redirects to /settings/developer/<key>; MemoryGraphTab lazy; /logs also standalone."
       },
       "runnable": "nightly",
       "estimated_steps": 5,
@@ -7610,21 +7646,19 @@
       "merged_from": [
         "developer-page-tabs"
       ],
-      "component": "website/src/pages/DeveloperPage.tsx"
+      "component": "website/src/pages/settings/DeveloperPanel.tsx"
     },
     {
       "id": "developer-storage",
       "feature": "developer",
       "title": "Developer › Storage",
       "user_story": "As a developer, I want a raw localStorage inspector, so that I can debug client preferences.",
-      "start_url": "/developer",
-      "entry_path": "Developer → storage tab (?tab=storage)",
+      "start_url": "/settings/developer",
+      "entry_path": "Settings → Developer → storage (/settings/developer/storage)",
       "preconditions": {
         "seed": "minimal",
         "members": [],
-        "feature_flags": [
-          "mc-dev-mode"
-        ],
+        "feature_flags": [],
         "notes": ""
       },
       "runnable": "nightly",
@@ -7644,14 +7678,12 @@
       "feature": "developer",
       "title": "Developer › System",
       "user_story": "As a developer, I want host runtime, services, sessions and performance views, so that I can spot resource problems and reclaim session storage.",
-      "start_url": "/developer",
-      "entry_path": "Developer → system tab (?tab=system) → sub-tabs Sessions | Services | Performance → SessionStorageScreen",
+      "start_url": "/settings/developer",
+      "entry_path": "Settings → Developer → system (/settings/developer/system) → sub-tabs Sessions | Services | Performance → SessionStorageScreen",
       "preconditions": {
         "seed": "sessions-long-history",
         "members": [],
-        "feature_flags": [
-          "mc-dev-mode"
-        ],
+        "feature_flags": [],
         "notes": "Numbers vary; assert structure not values. pages/system/*; HostRuntimeCard shows host info. Deletion actions exist but only read-only inspection is exercised."
       },
       "runnable": "nightly",
@@ -7678,14 +7710,12 @@
       "feature": "developer",
       "title": "Developer › Telemetry",
       "user_story": "As a developer, I want startup timings and context traces, so that I can find slow paths.",
-      "start_url": "/developer",
-      "entry_path": "Developer → telemetry tab (?tab=telemetry)",
+      "start_url": "/settings/developer",
+      "entry_path": "Settings → Developer → telemetry (/settings/developer/telemetry)",
       "preconditions": {
         "seed": "minimal",
         "members": [],
-        "feature_flags": [
-          "mc-dev-mode"
-        ],
+        "feature_flags": [],
         "notes": ""
       },
       "runnable": "nightly",
@@ -7704,14 +7734,14 @@
       "id": "standalone-logs",
       "feature": "developer",
       "title": "Logs (full page)",
-      "user_story": "As an operator, I want a full-page log viewer, so that I can watch the gateway without dashboard chrome distraction.",
+      "user_story": "As an operator, I want a full-page log viewer at a stable URL, so that I can watch the gateway logs from one bookmark.",
       "start_url": "/logs",
       "entry_path": "Type /logs",
       "preconditions": {
         "seed": "minimal",
         "members": [],
         "feature_flags": [],
-        "notes": ""
+        "notes": "Renders inside the dashboard shell (App.tsx route), with its sidebar and rail; there is no chrome-less logs page or popout logs window."
       },
       "runnable": "nightly",
       "estimated_steps": 2,

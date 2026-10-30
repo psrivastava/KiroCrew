@@ -24,7 +24,8 @@
  * or the default does. Identity is never part of it — see
  * `lib/crewAvatarState.ts` — so a reacting crew still reads as the same crew.
  * A picture is static, and a pack brings its own per-state art; for both,
- * `state` only picks which drawing is served.
+ * `state` only picks which drawing is served. An icon (a shipped pose) has no
+ * reactions but does play the ghost's `working` body motion.
  *
  * Rendered as an `<img>` carrying a data URI rather than inlined SVG markup.
  * Two reasons, both load-bearing:
@@ -57,7 +58,16 @@ import {
   type AvatarSounds,
 } from '../lib/crewAvatarState'
 import { BUILTIN_PACK_ID } from '../lib/appearancePacks/library'
-import { DEFAULT_POSE_BG, poseDataUri } from '../lib/avatarPoses'
+import {
+  DEFAULT_POSE_BG,
+  iconMotionVars,
+  poseBodyDataUri,
+  poseEyesDataUri,
+  poseEyeVars,
+  poseDataUri,
+  resolvePoseBg,
+} from '../lib/avatarPoses'
+import './crewIconMotion.css'
 import PackAvatar from './appearancePacks/PackAvatar'
 
 /** Kiro's own ghost, built on the shipped mark. See `lib/kiroGhostAvatar.ts`. */
@@ -96,7 +106,8 @@ export type CrewAvatarOverride =
    *  picks. The whole override is `pose` + `bg`: the pose names one of the
    *  hand-drawn silhouettes (`lib/avatarPoses.ts`), `bg` is a `#rrggbb` painted
    *  behind it. No traits, no reactions — the pose is the whole face, and it is
-   *  how new crews are built. See `iconAvatarFrom`. */
+   *  how new crews are built; it does still play the ghost's working body
+   *  motion, which moves the pose without changing it. See `iconAvatarFrom`. */
   | { kind: 'icon'; pose: string; bg: string }
 
 const TILE_RE = /^#[0-9a-f]{6}$/
@@ -357,8 +368,9 @@ export default function CrewAvatar({
   // A reaction is the ghost's: `motionsFrom` is ghost-gated, and the tier guard
   // repeats that here so the DEFAULT motion cannot reach a served tier either —
   // the ghost drawn as a broken picture's fallback is a still face, not a crew
-  // reporting a turn it never ran. An icon is a static drawing like a picture,
-  // so it is excluded here too. Sounds are the other half of the reaction
+  // reporting a turn it never ran. An icon has no reaction layer either, so it
+  // is excluded here too (its working motion is not a reaction — see the icon
+  // branch below). Sounds are the other half of the reaction
   // layer and are deliberately NOT this component's business: they belong to
   // the state hook.
   const motions = useMemo(
@@ -422,7 +434,7 @@ export default function CrewAvatar({
       width={size}
       height={size}
       style={{ width: size, height: size }}
-      className={`shrink-0 rounded-md border border-border bg-bg-elevated ${className}`}
+      className={`shrink-0 rounded-full border border-border bg-bg-elevated ${className}`}
     />
   )
 
@@ -430,6 +442,56 @@ export default function CrewAvatar({
   // a data URI exactly like a pinned-trait ghost — nothing is fetched, so there
   // is no load-failure path and no fallback to latch. It wins over the served
   // tiers because a record is only ever one kind; the readers are exclusive.
+  //
+  // It takes WORKING, not the reaction: a pose has no reaction layer (`motions`
+  // is nulled for it above), but "at work" is body motion that only moves the
+  // drawing, and a crew that is working must read as working on every tier
+  // that composes its own art. The `working` intensity is the ghost's knob and
+  // is not forwarded: a pose has one amplitude (`avatarPoses.ICON_WORKING`).
+  // `done` / `error` with no reaction draw the still frame.
+  //
+  // The working icon is NOT an animated SVG. The tile is this element's own
+  // background and stays still. Two still images, the silhouette and its eyes,
+  // are moved by page CSS (`crewIconMotion.css`): the body chain moves both, and
+  // the eyes add their own blink and glance, like the ghost tier. An animation
+  // inside an image's SVG is re-rastered every frame, and iOS Safari re-rastered
+  // it in pieces, so the head, the tail and one eye drew out of step. A still
+  // raster moved by transforms is never repainted in parts.
+  // Both icon branches paint the same tile behind the art, so the still frame
+  // and the moving one match before the image has decoded.
+  const iconTile = icon ? resolvePoseBg(icon.bg) : undefined
+  if (icon && shownState === 'working') {
+    return (
+      <span
+        aria-hidden="true"
+        data-testid="crew-icon-motion"
+        style={{
+          ...iconMotionVars(),
+          width: size,
+          height: size,
+          backgroundColor: iconTile,
+        }}
+        className={`crew-icon-motion shrink-0 rounded-full border border-border ${className}`}
+      >
+        <span className="crew-icon-fit">
+          <span className="crew-icon-sway">
+            <span className="crew-icon-bob">
+              <span className="crew-icon-sq">
+                <img src={poseBodyDataUri(icon.pose)} alt="" width={size} height={size} />
+                <span className="crew-icon-eyes" data-testid="crew-icon-eyes">
+                  <span className="crew-icon-look">
+                    <span className="crew-icon-blink" style={poseEyeVars(icon.pose)}>
+                      <img src={poseEyesDataUri(icon.pose)} alt="" width={size} height={size} />
+                    </span>
+                  </span>
+                </span>
+              </span>
+            </span>
+          </span>
+        </span>
+      </span>
+    )
+  }
   if (icon) {
     return (
       <img
@@ -438,8 +500,8 @@ export default function CrewAvatar({
         aria-hidden="true"
         width={size}
         height={size}
-        style={{ width: size, height: size }}
-        className={`shrink-0 rounded-md border border-border bg-bg-elevated ${className}`}
+        style={{ width: size, height: size, backgroundColor: iconTile }}
+        className={`shrink-0 rounded-full border border-border ${className}`}
       />
     )
   }
@@ -484,12 +546,22 @@ export default function CrewAvatar({
         }}
         // object-cover: the client crops square before upload, but an old or
         // hand-placed file may not be — cover keeps the tile's rhythm either way.
-        className={`shrink-0 rounded-md border border-border bg-bg-elevated object-cover ${className}`}
+        className={`shrink-0 rounded-full border border-border bg-bg-elevated object-cover ${className}`}
       />
     )
   }
 
   return ghost
+}
+
+/**
+ * The element that draws an avatar's frame (its border and round corner) inside
+ * `host`. A working icon draws its frame on the motion root, and the image inside
+ * it has none; every other tier draws it on its one image. The root is listed
+ * first because `querySelector` returns the first match in document order.
+ */
+export function avatarFrameIn(host: ParentNode): HTMLElement | null {
+  return host.querySelector<HTMLElement>('[data-testid="crew-icon-motion"], img')
 }
 
 /** The name-derived traits for a seed — the builder's pre-fill, its "reset to

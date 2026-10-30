@@ -6,7 +6,7 @@
 > approach — so a reviewer can understand the delta at a glance, and so the fork
 > can be re-based on future upstream pulls without re-deriving intent.
 >
-> **Branch:** `main` · **Fork base:** upstream commit `150605b8e` (synced 2026-10-12;
+> **Branch:** `main` · **Fork base:** upstream commit `bde5de12e` (synced 2026-10-30;
 > originally forked at `64f3b5811`). Every upstream sync is recorded in §9.
 
 ---
@@ -98,8 +98,8 @@ own non-nestable OS sandbox, and let that sandbox own the isolation.
 
 | Seam | What it does |
 |---|---|
-| `ACP_BACKENDS_SKIP_CREW_SEATBELT_MACOS` | New capability set, `{claude}` only; `agent_sdk/backends.py`, re-exported via `acp_backends.py` + `acp/types.py` |
-| `wrap_argv` / `wrap_argv_async` | New `skip_crew_seatbelt_macos` param; a **darwin-only** branch env-scrubs and returns WITHOUT the seatbelt |
+| `ACP_BACKENDS_SKIP_CREW_SEATBELT_MACOS` | New capability set, `{claude}` only; `agent_sdk/backends_launch.py` (beside `ACP_BACKENDS_INTERNAL_SANDBOX`), re-exported via `agent_sdk/backends.py`, `acp_backends.py` + `acp/types.py`; classified off-the-wire in `scripts/check_harness_parity.py` `HARNESS_EXEMPT_SETS` |
+| `wrap_argv` (`sandbox_wrap.py`) / `wrap_argv_async` (`sandbox_spawn.py`) | New `skip_crew_seatbelt_macos` param; a **darwin-only** branch env-scrubs and returns WITHOUT the seatbelt |
 | `acp/launch.py` | Passes the flag by set membership at the shared ACP spawn (moved out of `acp/client.py` upstream) |
 
 Deliberately a **separate** set from `ACP_BACKENDS_INTERNAL_SANDBOX` (harness-
@@ -200,8 +200,10 @@ able to share it).
   to a native claude session, which has no CCrew transcript/history record.
 
 ### 4.5 Endpoints & routes
-Handlers in `src/kiro_crew/dashboard/handlers/sessions.py`, registered in
-`src/kiro_crew/dashboard/routes/system.py`:
+Handlers in `src/kiro_crew/dashboard/handlers/claude_sessions.py` (CCrew-owned
+module, imported by `handlers/__init__.py`), registered in
+`src/kiro_crew/dashboard/routes/system.py`. `SessionManager.remember_resume_sid`
+lives in `session_parts/links.py`, bound in `session.py`:
 - `GET  /api/claude-sessions` — list (reader + overlay merge)
 - `PATCH  /api/claude-sessions/{uuid}` — set overlay (title/pin/tags/color)
 - `POST /api/claude-sessions/{uuid}/open` — seed resume sid onto a slot
@@ -373,6 +375,44 @@ parity and logo-glyph tests, and record the entry below.
 - **Other fallout:** <behavior changes, renamed APIs, new specs to read>.
 - **Verified:** <tests/builds run and results>. **Not run:** <what and why>.
 ```
+
+### 2026-10-30 — `bde5de12e` (branch `sync/upstream-2026-10-30`)
+- **Range:** `150605b8e..bde5de12e`, 3397 upstream commits; no new CCrew commits
+  since the previous sync.
+- **Conflicts:** 24 files (12 locale catalogs + 12 code/test files). Upstream
+  split several modules into facades and owner modules, so CCrew changes moved:
+  - `ACP_BACKENDS_SKIP_CREW_SEATBELT_MACOS` (§2.2): `agent_sdk/backends.py` →
+    `agent_sdk/backends_launch.py`, re-exported from `backends.py`; classified
+    in `scripts/check_harness_parity.py` `HARNESS_EXEMPT_SETS` (upstream's new
+    X-capture gate requires every `ACP_BACKENDS_*` set to be classified).
+  - seatbelt skip branch: `sandbox.py` `wrap_argv` → `sandbox_wrap.py`;
+    `wrap_argv_async` option → `sandbox_spawn.py`.
+  - `remember_resume_sid`: `session.py` → `session_parts/links.py`, bound on
+    `SessionManager` in `session.py`.
+  - Claude CLI session handlers (§4.5): `dashboard/handlers/sessions.py` (now a
+    facade) → new CCrew-owned `dashboard/handlers/claude_sessions.py`.
+  - backend card "Crew sandbox stands down": union of kiro-cli, KAS relay and
+    Claude sets; `test_backend_cards.py` expects `{kiro, kas, claude}`.
+  - mobile-nav logo tint: `App.tsx` → `shell/topbar/shellHeader.tsx`.
+  - `BackendChip` and `ClaudeCliSessions` re-inserted in upstream's new
+    `ChatInput.tsx` / `ChatSidebar.tsx`.
+  - `test/gateway-env.test.js`: upstream's file plus CCrew's `KIROCREW_HOME`
+    and `KIROCREW_PROFILE=standalone` expectations.
+  - Locale catalogs: both sides kept (`claudeCliSessions` + `lockedByPolicyBadge`).
+- **Other fallout:** upstream added `build.protocols` (`kirocrew://`) to the
+  Electron `package.json`; dropped for CCrew (§2.3) and `deep-link.test.js`
+  now asserts CCrew does not claim the scheme. A CCrew comment in
+  `build-desktop.sh` reworded to pass upstream's new voice-runtime packaging pin.
+  Every CCrew-added line from the previous base was checked against the merged
+  tree; only the deliberately rewritten ones above differ.
+- **Verified:** backend reinstalled; flake8 + black clean on touched files;
+  harness-parity gate clean; CCrew/ACP/sandbox tests 305 passed + 60 files
+  pinning the touched modules 2238 passed. Frontend `npm ci`, type check and
+  build clean, staged; i18n/glyph/CCrew tests 120 passed. Electron suite all
+  green except 3 that fail identically on pure upstream
+  (`ipc-registrar.test.js` governance clear, `window-lifecycle.test.js` wiring
+  order, `gateway-shim-tree-kill.test.js` `spawn EPERM` in the agent sandbox).
+- **Not run:** full suite (CI), `mypy --platform linux`, a live Claude turn.
 
 ### 2026-10-12 — `150605b8e` (branch `sync/upstream-2026-10-12`)
 - **Range:** `8fe49bd54..150605b8e`, 642 upstream commits; no new CCrew commits

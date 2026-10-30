@@ -40,6 +40,8 @@ logger = logging.getLogger(__name__)
 MISSING_EXTRA_HINT = (
     f"The WhatsApp channel needs its optional dependency: {extras.install_hint('whatsapp')}"
 )
+# What Settings shows for the same gap (see extras.missing_at_start_status).
+MISSING_EXTRA_STATUS = extras.missing_at_start_status("neonize")
 
 STATE_UNPAIRED = "unpaired"
 STATE_PAIRING = "pairing"
@@ -47,6 +49,10 @@ STATE_CONNECTED = "connected"
 STATE_LOGGED_OUT = "logged_out"
 STATE_BANNED = "banned"
 STATE_ERROR = "error"
+#: The lifecycle states that mean the link is broken. Every other non-connected
+#: state (``unpaired``, ``pairing``) is a step the operator still has to take,
+#: so its detail is an instruction rather than a failure.
+FAILED_STATES = frozenset({STATE_LOGGED_OUT, STATE_BANNED, STATE_ERROR})
 
 _INTER_CHUNK_DELAY_S = 0.4
 
@@ -117,8 +123,8 @@ def _wav_seconds(data: bytes) -> int:
     WhatsApp draws a voice note's duration from ``AudioMessage.seconds`` and
     labels it ``0:00`` without one. neonize derives that figure by shelling out to
     ``ffmpeg``, which this channel cannot require, so the one container the
-    bundled speech synthesis emits is read from its own header instead: Piper
-    writes PCM WAV, and frames divided by the frame rate is the whole answer.
+    bundled speech synthesis emits is read from its own header instead: the
+    system engine writes PCM WAV, and frames divided by the frame rate is the whole answer.
     Any other container (a Polly MP3) answers 0, which costs the label alone.
 
     A header parse over an in-memory buffer, so it holds no descriptor and does

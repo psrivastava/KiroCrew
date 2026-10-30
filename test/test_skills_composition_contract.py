@@ -1,8 +1,8 @@
 """Composition contract between ``SkillsLoader`` and ``skill_runtime``.
 
-``kiro_crew.skills`` keeps the loader's state, its locks and the code repository
-guards pin to ``skills.py`` by path, and delegates the rest of its rules to the
-modules under ``kiro_crew.skill_runtime``. What this file pins is what callers of
+``kiro_crew.skills`` keeps the loader's state and its locks, binds the code repository
+guards pin by path from its ``skills_*`` owner modules, and delegates the rest of its
+rules to the modules under ``kiro_crew.skill_runtime``. What this file pins is what callers of
 the loader observe independently of where each rule lives:
 
 * the class keeps every member it had, with the same kind and signature, and the
@@ -16,7 +16,7 @@ the loader observe independently of where each rule lives:
   anchored on their own file;
 * the source-keyed guards stay satisfied by construction: no runtime module holds
   a link-screen site, a sensitive-resolved-path call or a redactor call, so the
-  registries naming ``skills.py`` still describe the code, and the ``repo_scope``
+  registries naming the ``skills_*`` owners still describe the code, and the ``repo_scope``
   normalisation rule is re-applied to the moved read sites;
 * the one-slug-space allocator, the descriptor-pinned pending read, the HTML
   body refusal and the usage-ledger alias fold behave as the facade documents them.
@@ -67,7 +67,7 @@ RUNTIME_MODULES = frozenset(
 #: Facade bindings that tests REBIND to change what the loader does, and which
 #: moved code consumes. Runtime code reads each through ``kiro_crew.skills`` at
 #: call time. ``os`` is rebound too, but only around ``installed_skill_currency``,
-#: which stays in the facade; runtime code reads ``os`` directly.
+#: which lives in ``skills_builtin_provenance``; runtime code reads ``os`` directly.
 FACADE_SEAMS = frozenset(
     {
         "PINNED_SKILL_BODIES_CAP",
@@ -133,7 +133,7 @@ _LOADER_MEMBERS = {
         _scoped_entries _served_key_by_realpath _snapshot_admitted_roots
         _trusted_project_key _usage_fields _user_first _validate_and_redact_candidate
         _versions_root _vet_unconfined_path
-        approve_pending_skill approve_pending_skill_checked approve_pending_update
+        approve_pending_as_read approve_pending_skill_checked
         approve_pending_update_checked archive_auto_skill catalog_project_skills
         catalog_status close confined_triggered create_auto_skill create_skill credit_skill_reads
         delete_skill dismiss_all_pending dismiss_pending_skill dismiss_pending_slugs
@@ -202,7 +202,7 @@ _LOADER_SIGNATURES = {
     "_max_triggered_now": "(self) -> 'int'",
     "_on_config_change": "(self, change: \"'live.ConfigChange'\") -> 'None'",
     "_owned_hint": "(self, skill_file: 'Path') -> 'bool'",
-    "_owning_app": "(self, name: 'str', skill_file: 'Path') -> 'str | None'",
+    "_owning_app": "(self, name: 'str', skill_file: 'Path', within: 'str | None' = None) -> 'str | None'",
     "_parse_frontmatter": "(path: 'Path') -> 'dict[str, str]'",
     "_parse_frontmatter_text": "(content: 'str') -> 'dict[str, str]'",
     "_pending_root": "(self) -> 'Path'",
@@ -215,7 +215,7 @@ _LOADER_SIGNATURES = {
     "_read_exact_key": "(self, key: 'str', *, only: 'list[str] | None', project_dir: 'str | Path | None', max_bytes: 'int') -> '_ExactRead'",
     "_read_global_skill_text": "(self, path: 'Path', max_bytes: 'int | None', *, canonical_root: 'str | None' = None, refusal_reasons: 'list[str] | None' = None) -> 'str | None'",
     "_readable_frontmatter": "(self, path: 'Path', *, within: 'str | None', mtime: 'float | None' = None, canonical_root: 'str | None' = None) -> 'dict[str, str] | None'",
-    "_read_pending_meta": "(self, slug: 'str') -> 'dict'",
+    "_read_pending_meta": "(self, slug: 'str', pdir: 'Path | None' = None) -> 'dict'",
     "_recency_boost": "(self, path_str: 'str', fingerprint: 'str' = '') -> 'float'",
     "_record_use": "(self, key: 'str') -> 'None'",
     "_redact_deep": "(self, obj: 'object') -> 'object'",
@@ -242,10 +242,9 @@ _LOADER_SIGNATURES = {
     "_vet_unconfined_path": "(self, path: 'Path') -> 'bool'",
     "_versions_root": "(self, target_slug: 'str') -> 'Path'",
     "_write_skill_md": "(skill_file: 'Path', content: 'str', *, dir_fd: 'int | None') -> 'bool'",
-    "approve_pending_skill": "(self, slug: 'str') -> 'str | None'",
-    "approve_pending_skill_checked": "(self, slug: 'str') -> 'str'",
-    "approve_pending_update": "(self, slug: 'str') -> 'str | None'",
-    "approve_pending_update_checked": "(self, slug: 'str') -> 'str'",
+    "approve_pending_as_read": "(self, slug: 'str', content_sha256: 'str') -> 'str'",
+    "approve_pending_skill_checked": "(self, slug: 'str', *, src: 'Path | None' = None) -> 'str'",
+    "approve_pending_update_checked": "(self, slug: 'str', *, src: 'Path | None' = None) -> 'str'",
     "archive_auto_skill": "(self, name: 'str') -> 'bool'",
     "catalog_project_skills": "(self, project_dir: 'str | Path') -> 'list[dict]'",
     "catalog_status": "(self, project_dir: 'str | Path | None' = None) -> 'str'",
@@ -263,7 +262,7 @@ _LOADER_SIGNATURES = {
     "get_auto_skill_version": "(self, name: 'str') -> 'int'",
     "get_context": "(self, budget: 'int | None' = None, only: 'list[str] | None' = None, project_dir: 'str | Path | None' = None, project_body_budget: 'int | None' = None, *, discovery_only: 'bool' = False, required_parts_out: 'list[str] | None' = None) -> 'str'",
     "get_pending_skill": "(self, slug: 'str') -> 'dict | None'",
-    "get_triggered_skills": "(self, text: 'str', project_dir: 'str | Path | None' = None, *, select: 'Callable[[], list[str] | None] | None' = None) -> 'list[str]'",
+    "get_triggered_skills": "(self, text: 'str', project_dir: 'str | Path | None' = None, *, select: 'Callable[[], list[str] | None] | None' = None, unusable: 'Collection[str]' = ()) -> 'list[str]'",
     "has_dollar_candidate": "(text: 'str') -> 'bool'",
     "is_auto_generated": "(self, name: 'str') -> 'bool'",
     "list_archived_auto_skills": "(self) -> 'list[dict]'",
@@ -272,7 +271,7 @@ _LOADER_SIGNATURES = {
     "list_skills": "(self, project_dir: 'str | Path | None' = None, *, _entries: 'list[_ScopedSkillEntry] | None' = None) -> 'list[dict]'",
     "load_skill": "(self, name: 'str', project_dir: 'str | Path | None' = None, *, max_bytes: 'int | None' = None, refusal_reasons: 'list[str] | None' = None) -> 'str | None'",
     "pending_candidate_is_staged": "(self, slug: 'str') -> 'bool'",
-    "preview_pending_update": "(self, slug: 'str') -> 'dict | None'",
+    "preview_pending_update": "(self, slug: 'str', *, candidate: 'tuple[str, dict] | None' = None) -> 'dict | None'",
     "prune_pending": "(self, ttl_days: 'int', *, now: 'float | None' = None) -> 'int'",
     "read_auto_skill_body": "(self, name: 'str') -> 'str | None'",
     "read_scoped_skill": "(self, key: 'str', *, only: 'list[str] | None' = None, project_dir: 'str | Path | None' = None, max_bytes: 'int' = 99000) -> 'str | None'",
@@ -918,7 +917,7 @@ def _repo_scope_violations(source: str) -> list[str]:
     """``test_frontmatter``'s repo_scope normalisation rule, applied to any source.
 
     Every read that feeds the gate strips the value, and every gate call passes one
-    of the normalised spellings. The read-only guard scans ``skills.py`` by path;
+    of the normalised spellings. The read-only guard scans the ``skills_*`` owners by path;
     this carries the same rule to the read sites that moved.
     """
     reads = re.findall(r'"repo_scope":\s*meta\.get\("repo_scope"[^\n]*', source)
@@ -931,10 +930,11 @@ def _repo_scope_violations(source: str) -> list[str]:
 
 
 class TestSourceKeyedGuards:
-    """Registries that name ``skills.py`` stay true because nothing they count moved."""
+    """Registries that name the ``skills_*`` owners stay true because no runtime module
+    holds what they count."""
 
     def test_no_runtime_module_screens_a_path_for_links(self) -> None:
-        """The link-screen baseline keys its sites to ``skills.py``; a screen in a
+        """The link-screen baseline keys its sites to the ``skills_*`` owners; a screen in a
         runtime module would be a site that baseline cannot name."""
         for stem, source in _runtime_sources().items():
             assert [name for _line, name in _called_names(source) if name in SCREENS] == [], stem
@@ -946,12 +946,12 @@ class TestSourceKeyedGuards:
         ]
 
     def test_no_runtime_module_calls_the_resolved_path_gate(self) -> None:
-        """The gate's reviewed caller list counts two calls in ``skills.py``."""
+        """The gate's reviewed caller list counts two calls in ``skills_discovery.py``."""
         for stem, source in _runtime_sources().items():
             assert "is_sensitive_resolved_path" not in [name for _l, name in _called_names(source)]
 
     def test_no_runtime_module_calls_a_redactor(self) -> None:
-        """Pending detail and promotion stay in ``skills.py``, the module the
+        """Pending detail and promotion live in ``skills_review.py``, the module the
         redaction-sink registry names; a redactor call here would be an unregistered
         sink, and even prose spelling one trips the registry's drift guard."""
         for stem, source in _runtime_sources().items():

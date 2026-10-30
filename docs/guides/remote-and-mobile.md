@@ -28,7 +28,7 @@ Four parts, in the order you will need them:
   declares `"node": ">=22.12.0"`; `kirocrew doctor` fails below Node 22.12.0, and startup logs a warning.
 - **RAM**: there is no single published floor, because the footprint scales with
   concurrent sessions, spawned subagents, and MCP servers. Two figures from the
-  code give you the shape of it: `acp/runtime.py` recycles a long-lived
+  code give you the shape of it: `acp/runtime_liveness.py` recycles a long-lived
   multiplexed backend once it passes 500 MiB RSS
   (`_DEFAULT_MAX_RSS_MB = 500.0`), and the embedding model is loaded in-process
   from a ~610MB GGUF file. Measure your own steady state, then leave headroom:
@@ -92,7 +92,7 @@ granted to whatever launched it, so a Linux VPS cannot serve it at all
 ([imessage-integration.md](../../src/kiro_crew/docs/imessage-integration.md)).
 **WhatsApp** runs anywhere, but it is not in the base install: it needs the
 optional `neonize` dependency (`pip install ".[whatsapp]"`) and a one-time device
-pairing from **Settings → Channels → WhatsApp**, so reach the remote dashboard
+pairing from **Settings → Messaging Channels → WhatsApp**, so reach the remote dashboard
 first (part 2 below) and scan the rotating code from there
 ([whatsapp-integration.md](../../src/kiro_crew/docs/whatsapp-integration.md)).
 
@@ -138,7 +138,7 @@ tmux survives an SSH disconnect but does **not** auto-restart on crash or
 auto-start on reboot. Move to [a real service](#3-keep-it-alive-as-a-service)
 once the smoke test passes, and **kill the tmux session first**: only one
 gateway can own the dashboard port, which defaults to `5476`
-(`config/loader.py` `_DEFAULT_PORT`, overridable with the `KIROCREW_PORT`
+(`config/loader_credentials.py` `_DEFAULT_PORT`, overridable with the `KIROCREW_PORT`
 environment variable). Two gateways on one port means the second one fails to
 bind.
 
@@ -192,7 +192,7 @@ What matters, and where it lives:
 | Config | `~/.kiro/crew/config.json` | Model preferences, dashboard settings, and integration config. The sync overwrites the remote copy, then patches `dashboard.url`; inspect it for legacy inline credentials before copying |
 | Skills | `~/.kiro/crew/skills/` | Custom skill definitions |
 | Tasks | `~/.kiro/crew/tasks/` | Task runner state |
-| Webhook hooks | `~/.kiro/crew/hooks.json`, `hooks/` | Script-hook definitions (`hooks.py` `ScriptHookStore`) and their scripts |
+| Webhook hooks | `~/.kiro/crew/hooks.json`, `hooks/` | Script-hook definitions (`hook_runtime/script_hooks.py` `ScriptHookStore`) and their scripts |
 | Cron jobs | `~/.kiro/crew/crons.json` | Scheduled recurring jobs (`cron.py`). Once copied, the jobs run on both hosts unless you pause them on one |
 | Dashboard metadata | `~/.kiro/crew/folders.json`, `tags.json`, `tag_boards.json`, `autonudge.json` | Sidebar folders, tag vocabulary, kanban columns and auto-nudge state |
 
@@ -212,7 +212,7 @@ What NOT to carry over:
 
 - `~/.kiro/crew/kiro_pids.txt`, `kiro_session_pids.txt`, and the
   `session_pid_<pid>.txt` / `.sig` sidecars: live PID tracking
-  (`session_pid.py`), meaningless on another host and actively misleading if
+  (`session_pid_tracking.py`), meaningless on another host and actively misleading if
   copied.
 - `~/.kiro/crew/security_events.jsonl`: the tamper-evident SEL audit chain
   (`sel.py`); it belongs to the host that wrote it.
@@ -246,6 +246,13 @@ the token-auth middleware unconditionally, so a wider bind never exposes an
 unauthenticated surface beyond the three token-free liveness probes
 (`/api/health`, `/api/live`, `/api/ready`).
 
+A governance policy can narrow both: the `bind_address` list refuses a
+`KIROCREW_BIND` address it does not name (the gateway then binds `127.0.0.1`),
+and the `dashboard_origins` list drops an extra origin it does not name. An
+enterprise build allows neither until a policy names it. Tailnet access there
+follows the policy's `capabilities.tailnet_origin` alone: until a policy turns it
+on, `kirocrew tailnet up` and the dashboard card say "Tailnet is off by policy".
+
 Everything below therefore works by putting something in front of loopback.
 
 ### SSH tunnel (laptop)
@@ -264,7 +271,7 @@ ssh -fN -L 7779:localhost:7779 user@your-host.example.com   # background
 
 Pass `-C` to enable SSH transport compression. A hand-rolled tunnel gets no
 compression by default, while Kiro Crew's own tunnel manager turns it on for
-exactly this traffic (`src/kiro_crew/instances/ssh_tunnel_manager.py`): the
+exactly this traffic (`src/kiro_crew/instances/ssh_tunnel_manager_child_text.py`): the
 forwarded stream carries the dashboard SPA bundle plus all API/WS payloads,
 which are highly compressible, and the gateway does not gzip at the HTTP layer.
 
@@ -397,6 +404,15 @@ the same and the difference is the whole security story:
   permissions cannot be silently escalated by the dashboard. If the publish is
   refused, the card and command print what Tailscale itself said rather than a
   generic failure.
+
+  The Tailscale CLI is run only from its standard install locations, and only
+  when the binary and its folder need administrator rights to change, so no
+  other program can swap in a fake one. A Homebrew install on macOS usually
+  belongs to your own account, so it is refused: the card says Tailscale is
+  installed but will not be run, and `tailnet up` and `tailnet status` name the
+  refused binary. For that setup, publish the dashboard with `tailscale serve`
+  yourself, set `dashboard.url` to the exact address your browser opens, and
+  restart Kiro Crew.
 
   `kirocrew tailnet status` shows the three things that are independently
   required — whether the setting is on, whether a MagicDNS name resolves right
@@ -616,7 +632,7 @@ desktop-style command menu first.
 ### Session duration
 
 Three clocks. The first two are signed into the access token payload
-(`dashboard/token_auth.py`), the third into the refresh cookie
+(`dashboard/token_auth_tokens.py`), the third into the refresh cookie
 (`dashboard/refresh_tokens.py`):
 
 | Clock | Value | What it governs |
@@ -644,7 +660,7 @@ expiry**: open the dashboard at least once a month and you need never mint
 another link.
 
 The access-session numbers still govern the initial mint. The chat-command
-default is 1 hour (`ttl = 3600` in `slack/events.py` and `slack/handler_runtime/commands.py`);
+default is 1 hour (`ttl = 3600` in `slack/events_slash.py` and `slack/handler_runtime/commands.py`);
 pass a duration to raise it (`/kirocrew dashboard 6h`,
 `/kirocrew dashboard 20h`). `parse_duration` accepts `<N>h` or `<N>m` and clamps
 to the 20-hour ceiling, so asking for more silently gets you 20 hours rather than
@@ -748,15 +764,17 @@ notifications are never served from disk.
 **Two current limits**, documented here so they read as boundaries rather than
 bugs:
 
-- **Notifications need the app open.** The dashboard raises them through the
-  foreground `Notification` constructor
-  ([`website/src/hooks/useNativeNotification.ts`](../../website/src/hooks/useNativeNotification.ts))
-  and there is no Web Push subscription, so nothing arrives while the installed
-  app is closed or backgrounded. On iOS that constructor is unavailable inside an
-  installed PWA at all — notifications there require
-  `ServiceWorkerRegistration.showNotification()`. Tracked in
-  [issue #2267](https://github.com/kirodotdev/KiroCrew/issues/2267); the Android
-  symptom is [issue #1828](https://github.com/kirodotdev/KiroCrew/issues/1828).
+- **A closed app gets notifications only through Web Push.** Turn on
+  Settings → Notifications → Desktop alerts → **Notify me even when Kiro Crew is
+  closed** on each
+  device. The dashboard then registers a Web Push subscription, and every
+  delivered note that is not muted or passive also arrives while the installed
+  app is closed or backgrounded. Web Push needs the dashboard served over HTTPS;
+  on iOS it needs iOS 18.4 or later and the app added to the Home Screen. With
+  the toggle off, notifications need the app open. In page banners go through
+  `ServiceWorkerRegistration.showNotification()`, which an installed iOS PWA
+  and Android Chrome require
+  ([issue #1828](https://github.com/kirodotdev/KiroCrew/issues/1828)).
 - **Pinch zoom is off.** The installed app behaves like an application, not a
   web page: two-finger pinch and double-tap no longer scale the shell. **To
   magnify, use the OS display-zoom setting** (iOS: Settings → Display &

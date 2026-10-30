@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react';
 import { Wrench, Shield, Save, Check, X as XIcon } from 'lucide-react';
 import { SendBtn, Badge } from '../../components/ui';
 import DetailPanel from '../../components/DetailPanel';
+import ErrorNotice from '../../components/ErrorNotice';
 import type { TaskDetail } from '../../types';
 
 import { i18nT } from '../../i18n/t'
@@ -143,9 +144,8 @@ export default function TaskDetailPanel({ task, allTasks = [], onClose, onRetry,
           <div className="text-[13px] leading-relaxed whitespace-pre-wrap">{task.description}</div>
         )}
 
-        {task.error && (
-          <div className="p-2.5 bg-danger/10 border border-danger/20 rounded-md text-[12px] text-danger">{task.error}</div>
-        )}
+        {/* No hand-off: this panel's title, description and dependency edits, and the page's pendingEdits for other tasks, are local until Save. */}
+        <ErrorNotice message={task.error} />
         {task.result && (
           <div className="p-2.5 bg-bg-elevated border rounded-md text-[12px] text-text whitespace-pre-wrap max-h-[300px] overflow-auto" style={{ borderColor: 'color-mix(in srgb, var(--ok) 45%, transparent)' }}>{task.result}</div>
         )}
@@ -191,8 +191,8 @@ export default function TaskDetailPanel({ task, allTasks = [], onClose, onRetry,
           <div className="p-2.5 bg-bg-elevated border rounded-md text-[12px]" style={{ borderColor: 'color-mix(in srgb, var(--warn) 45%, transparent)' }}>
             <div className="text-text mb-2">{task.force_approval ? i18nT('pages.aidlc.taskDetailPanel.this_gate_blocks_force_approval_true') : i18nT('pages.aidlc.taskDetailPanel.requires_approval_before_execution_2')}</div>
             <div className="flex gap-2">
-              <button className="px-3 py-1.5 rounded-md bg-ok text-white text-[12px] font-semibold cursor-pointer border-none hover:opacity-80 transition-all" onClick={() => onApprove('approve')}><Check className="lucide-inline" /> {i18nT('pages.aidlc.taskDetailPanel.approve')}</button>
-              <button className="px-3 py-1.5 rounded-md bg-danger text-white text-[12px] font-semibold cursor-pointer border-none hover:opacity-80 transition-all" onClick={() => onApprove('reject')}><XIcon className="lucide-inline" /> {i18nT('pages.aidlc.taskDetailPanel.deny')}</button>
+              <button className="px-3 py-1.5 rounded-md bg-ok text-ok-fg text-[12px] font-semibold cursor-pointer border-none hover:opacity-80 transition-all" onClick={() => onApprove('approve')}><Check className="lucide-inline" /> {i18nT('pages.aidlc.taskDetailPanel.approve')}</button>
+              <button className="px-3 py-1.5 rounded-md bg-danger text-danger-fg text-[12px] font-semibold cursor-pointer border-none hover:opacity-80 transition-all" onClick={() => onApprove('reject')}><XIcon className="lucide-inline" /> {i18nT('pages.aidlc.taskDetailPanel.deny')}</button>
             </div>
           </div>
         )}

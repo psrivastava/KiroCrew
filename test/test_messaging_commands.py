@@ -517,7 +517,11 @@ class TestLayering:
     #: ``kiro_crew.slack`` transitively, so a RUNTIME import of either -- at any
     #: nesting depth -- is the ``messaging -> slack`` edge in disguise. Typing-only
     #: imports under ``if TYPE_CHECKING:`` are the sanctioned way to name them.
-    _DUCK_TYPED_SERVICES = ("kiro_crew.subagent", "kiro_crew.taskrunner")
+    _DUCK_TYPED_SERVICES = (
+        "kiro_crew.subagent",
+        "kiro_crew.taskrunner",
+        "kiro_crew.taskrunner_parts",
+    )
 
     def test_the_duck_typed_services_are_never_imported_at_runtime(self) -> None:
         """A deferred in-function import is still an edge: the channel ``spawn``
@@ -695,6 +699,17 @@ class TestSpawn:
         )
         reply = await spawn_task_reply("do it", manager) or ""
         assert reply.startswith("⚠️ Subagent `r2` was not started: waiting for memory")
+
+    @pytest.mark.asyncio
+    async def test_a_spawn_stopped_before_it_started_is_not_announced(self) -> None:
+        """Stopped while it waited: queued, done and user-stopped with no error.
+        Nothing runs, so the reply must not announce a start."""
+        manager = MagicMock(max_concurrent=2)
+        manager.spawn.return_value = SimpleNamespace(
+            id="s1", queued=True, done=True, user_stopped=True, error=""
+        )
+        reply = await spawn_task_reply("do it", manager) or ""
+        assert reply == "⚠️ Subagent `s1` was stopped before it started; nothing ran."
 
     @pytest.mark.asyncio
     async def test_an_empty_argument_declines(self) -> None:

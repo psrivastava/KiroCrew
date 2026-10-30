@@ -33,6 +33,7 @@ import chatReducer, {
   clearUndeletableHistory,
   createSlot,
   deleteHistorySession,
+  clearHistorySessions,
   deleteSlot,
   fetchHistory,
   finalizeAssistant,
@@ -70,6 +71,7 @@ import { SPAWN_LAUNCH_MARKER } from '../pages/chat/types'
 import { ASK_ANSWERED_HEADER, ASK_QUESTION_SERVER, MAX_TOOL_RESULT_CHARS } from '../utils/askQuestionTool'
 import type { ChatMessage, ChatSlot } from '../types'
 import type { RootState } from '../store'
+import { reduceResume } from './resumeLanded'
 import { __resetErrorJournalForTests, recordError } from '../utils/errorReport'
 
 const apiMock = vi.hoisted(() => ({
@@ -79,6 +81,7 @@ const apiMock = vi.hoisted(() => ({
   createChatSlot: vi.fn(),
   deleteChatSlot: vi.fn(),
   deleteSession: vi.fn(),
+  clearSessions: vi.fn(),
   resumeChatSlot: vi.fn(),
   sessions: vi.fn(),
   setSlotColor: vi.fn(),
@@ -1681,6 +1684,63 @@ describe('chatSlice thunks', () => {
     expect(chat(store).history).toEqual([])
   })
 
+  // "Delete all". The gateway answers a partial clear with 200 and
+  // `ok: false`, so the thunk must read the body, not just the status: both a
+  // refused request and a 200 shortfall land on the same refused-delete notice.
+  it('records nothing when Delete all left nothing behind', async () => {
+    apiMock.clearSessions.mockResolvedValueOnce({ ok: true, cleared: 2, skipped: 0, failed: 0, undeletable: [] })
+    const store = makeStore()
+    await store.dispatch(clearHistorySessions())
+    expect(chat(store).undeletableHistory).toBeNull()
+    // The clear is scoped to the rows the user_only listing shows.
+    expect(apiMock.clearSessions).toHaveBeenCalledWith(true)
+  })
+
+  it('names the rows a 200 Delete all left behind and counts the failed ones', async () => {
+    apiMock.sessions.mockResolvedValue({ sessions: [{ key: 'h1', title: 'Nightly digest' }, { key: 'h2' }], has_more: false })
+    apiMock.clearSessions.mockResolvedValueOnce({
+      ok: false,
+      cleared: 0,
+      skipped: 0,
+      failed: 2,
+      undeletable: [
+        { id: 'h1', code: 'cron_ownership_unknown' },
+        { id: 'gone', code: 'ledger_exclusion_unwritable' },
+      ],
+    })
+    const store = makeStore()
+    await store.dispatch(fetchHistory(false))
+    await store.dispatch(clearHistorySessions())
+    expect(chat(store).undeletableHistory).toEqual({
+      key: '',
+      title: '',
+      code: '',
+      bulk: {
+        left: 4,
+        cleared: 0,
+        rows: [
+          { key: 'h1', title: 'Nightly digest', code: 'cron_ownership_unknown' },
+          { key: 'gone', title: '', code: 'ledger_exclusion_unwritable' },
+        ],
+      },
+    })
+  })
+
+  it('records a refused Delete all by code and clears it on the next attempt', async () => {
+    apiMock.clearSessions.mockRejectedValueOnce(Object.assign(new Error('conflict'), {
+      status: 409,
+      body: JSON.stringify({ ok: false, error: 'busy', code: 'cron_store_busy', cleared: 0 }),
+    }))
+    const store = makeStore()
+    await store.dispatch(clearHistorySessions())
+    expect(chat(store).undeletableHistory).toEqual({
+      key: '', title: '', code: 'cron_store_busy', bulk: { left: null, cleared: 0, rows: [] },
+    })
+    apiMock.clearSessions.mockResolvedValueOnce({ ok: true, cleared: 0, skipped: 0, failed: 0, undeletable: [] })
+    await store.dispatch(clearHistorySessions())
+    expect(chat(store).undeletableHistory).toBeNull()
+  })
+
   // The older-page REQUEST is exercised at the reducer boundary rather than
   // through `loadOlderMessages()`: the thunk dispatches `pending` (which sets
   // `loadingOlder`) before its payload creator reads that same flag as a
@@ -1690,14 +1750,14 @@ describe('chatSlice thunks', () => {
     let s = chatReducer(initial, setActiveSlot('A'))
     // Arm the cursor the way a resume does: one resident message out of ten, so
     // nine remain above it. Each page then carries the next cursor itself.
-    s = chatReducer(s, lifecycle('chat/resumeFromHistory/fulfilled', 'A', {
+    s = reduceResume(chatReducer, s, {
       ok: true,
       key: 'A',
       nextBefore: 9,
       messages: [msg({ role: 'user', content: 'newest', ts: '9' })],
       hasMore: true,
       total: 10,
-    }))
+    }, 'req-1', { key: 'A', title: 'A' })
     expect(s.slotOldestIndex).toBe(9)
     s = chatReducer(s, lifecycle('chat/loadOlder/pending', 'A', undefined))
     expect(s.loadingOlder).toBe(true)

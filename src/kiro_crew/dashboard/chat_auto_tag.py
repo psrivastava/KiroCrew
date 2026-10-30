@@ -13,7 +13,10 @@ Two passes, in order:
    auto-title uses, so it stays serialized and on the cheap background model)
    asks for up to ``_TOPIC_TAG_MAX`` short topic tags from the first user
    message. This pass never takes a session above ``MAX_TAGS_PER_SESSION``
-   tags; the cap is applied here, on the server, not by the model's reply.
+   tags; the cap is applied here, on the server, not by the model's reply. With an
+   explicit ``dashboard.language`` the tags are written in that language (the
+   ``{language}`` slot of ``_TOPIC_PROMPT_TEMPLATE``); unset, the model mirrors the
+   message as before.
 """
 
 from __future__ import annotations
@@ -35,7 +38,7 @@ from kiro_crew.dashboard.chat_tags import (
     persist_tags_snapshot_unlocked,
     tags_write_lock,
 )
-from kiro_crew.dashboard.chat_title import _titling_messages
+from kiro_crew.dashboard.chat_title import _titling_messages, _ui_language
 from kiro_crew.dashboard.chat_utils import slot_history_key
 from kiro_crew.llm_helpers import run_bg_oneliner
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
@@ -86,6 +89,23 @@ _TOPIC_PROMPT_TEMPLATE = (
     "lowercase words naming the kind of work, such as debugging, code review or "
     "oncall. Do not repeat the project or repository name. No numbering, no '#', "
     "no explanation. Reply with exactly NONE when the topic is unclear.\n"
+    "{language}"
+)
+
+# Filled into the ``{language}`` slot of ``_TOPIC_PROMPT_TEMPLATE`` when the
+# workspace has an explicit UI language. A tag is persisted and rendered beside
+# chrome in that language, so it follows the configured tag and not the language of
+# the message (``chat_title._TITLE_LANGUAGE_TEMPLATE``). ``NONE`` is the parser's
+# control word (``_parse_topic_tags`` drops it), so a translation of it would be
+# stored as a tag; the line keeps it literal.
+_LANGUAGE_TEMPLATE = (
+    "\nWrite each tag in the language of BCP-47 tag {lang}. That is the language the "
+    "dashboard around the tag is rendered in, so the tag must be in it even when the "
+    "message is in another language. Keep code, identifiers and product names "
+    "verbatim. For a language written without spaces between words (zh, ja, th, ...), "
+    "1-3 words means roughly 2-8 characters.\n"
+    "NONE is a control word, not a tag: reply with the literal ASCII NONE, never a "
+    "translation of it.\n"
 )
 
 
@@ -117,9 +137,9 @@ async def maybe_auto_tag(state: Any, slot: Any) -> None:
 
 
 async def _auto_tag_inner(state: Any, slot: Any) -> None:
-    # Note: no slot-kind guard needed here — the only call site
-    # (chat_handlers message path) fires exclusively for dashboard chat
-    # slots, same as ``_maybe_auto_title``. Slot keys are BARE names; the
+    # Note: no slot-kind guard needed here — both call sites (the composer's
+    # send path and ``session_send``'s run arm) fire exclusively for dashboard
+    # chat slots. Slot keys are BARE names; the
     # ``dashboard:`` prefix exists only on the derived session key
     # (``dashboard:{slot.key}``), never on ``slot.key`` itself.
     # Read the message and pin the transcript it belongs to before the first
@@ -133,6 +153,23 @@ async def _auto_tag_inner(state: Any, slot: Any) -> None:
     ):
         return
     await _maybe_topic_tags(state, slot, message, history_key)
+
+
+async def apply_label_tag(state: Any, slot: Any, name: str) -> bool:
+    """Add the fixed sidebar label *name* to *slot*, creating the tag if needed.
+
+    The same resolve-or-create, persist and broadcast path the project tag takes,
+    for a label the GATEWAY chooses (never a model), so no grant check applies.
+    It leaves the auto-tag once-flag alone: the first message still runs the
+    project and topic passes. Never raises; ``False`` when nothing was written.
+    """
+    try:
+        return await _apply_tag_names(
+            state, slot, [name], cap=None, model_chosen=False, claim_auto_tag=False
+        )
+    except Exception:
+        logger.debug("apply_label_tag: failed", exc_info=True)
+        return False
 
 
 def _normalize_tag_name(name: str) -> str:
@@ -231,7 +268,13 @@ async def _maybe_topic_tags(state: Any, slot: Any, message: str, history_key: st
     if not await _topic_tags_enabled():
         return
     count = min(_TOPIC_TAG_MAX, room)
-    prompt = _TOPIC_PROMPT_TEMPLATE.format(message=message, count=count)
+    # Off-loop: the language lookup stats and reads the config file.
+    ui_language = await asyncio.to_thread(_ui_language)
+    prompt = _TOPIC_PROMPT_TEMPLATE.format(
+        message=message,
+        count=count,
+        language=_LANGUAGE_TEMPLATE.format(lang=ui_language) if ui_language else "",
+    )
     try:
         text = await run_bg_oneliner(
             state.sessions,
@@ -268,6 +311,7 @@ async def _apply_tag_names(
     cap: int | None,
     model_chosen: bool,
     expected_history_key: str | None = None,
+    claim_auto_tag: bool = True,
 ) -> bool:
     """Resolve-or-create each name and add it to *slot*, under the tags lock.
 
@@ -280,8 +324,10 @@ async def _apply_tag_names(
     lock, the lock an owner's grant change holds, so a change that lands first
     is the one enforced. ``expected_history_key`` is the transcript the names
     were chosen for; when the slot is bound to another one by now, nothing is
-    written. Returns ``False`` when the write was rolled back, so a later pass
-    must not run on this slot.
+    written. ``claim_auto_tag`` False leaves the slot's once-flag alone, for a
+    label applied at birth (:func:`apply_label_tag`) that must not stand in for
+    the project and topic passes the first message still runs. Returns ``False``
+    when the write was rolled back, so a later pass must not run on this slot.
     """
     async with tags_write_lock(state):
         history_key = slot_history_key(slot)
@@ -319,7 +365,6 @@ async def _apply_tag_names(
         if room <= 0:
             return True
 
-        # Build case-insensitive lookup
         existing_by_lower: dict[str, dict] = {}
         for t in state._tags:
             name_lower = (t.get("name") or "").lower()
@@ -377,7 +422,8 @@ async def _apply_tag_names(
         # auto-tag, silently re-adding a tag the user removed.
         slot.tags = current_tags + to_add
         written_tags_revision = _bump_slot_tags_revision(slot)
-        slot._auto_tagged = True
+        if claim_auto_tag:
+            slot._auto_tagged = True
         # Auto-tagging is asynchronous.  Pin the history target at the point
         # the metadata is applied so a concurrent session rebind cannot make
         # this background task write its tag onto a different transcript.
@@ -397,7 +443,8 @@ async def _apply_tag_names(
             if slot.tags_revision == written_tags_revision:
                 slot.tags = [value for value in slot.tags if value not in to_add]
                 _bump_slot_tags_revision(slot)
-            slot._auto_tagged = False
+            if claim_auto_tag:
+                slot._auto_tagged = False
             push = getattr(state, "push_slots_update", None)
             if push is not None:
                 try:

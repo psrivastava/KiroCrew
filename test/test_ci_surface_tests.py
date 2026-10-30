@@ -26,6 +26,11 @@ import pytest
 # spread across workers and each worker re-pays that scan -- measured at 5 workers x 40-75s
 # per full run for this file alone. Grouping keeps the cache single-copy per run.
 pytestmark = pytest.mark.xdist_group(name="tree_scan_test_ci_surface_tests")
+
+#: ``test_posix_scope_is_unfiltered`` collects the backend scope twice, 40 s of CPU
+#: alone on a fast host. Eight times that is over the ``tree_scan`` group default
+#: (``TREE_SCAN_TIMEOUT_SECS`` in ``conftest.py``), so it carries its own budget.
+POSIX_SCOPE_TIMEOUT_SECS = 360
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _SCRIPT = _REPO_ROOT / "scripts" / "ci-surface-tests.py"
 
@@ -87,7 +92,7 @@ _BACKEND_GUARDS = (
     # src/kiro_crew/apps/builtins was added to _BACKEND_ROOTS.
     "src/kiro_crew/apps/builtins/design_critique/tests/test_manifest.py",
     "src/kiro_crew/apps/builtins/crew_companion/tests/test_manifest.py",
-    "src/kiro_crew/apps/builtins/ops_mission_control/tests/test_routes.py",
+    "src/kiro_crew/apps/builtins/ops_mission_control/tests/test_routes_claim_and_slot.py",
 )
 
 _FRONTEND_GUARDS = (
@@ -167,8 +172,8 @@ def test_setup_cfg_carries_non_ascii_so_its_read_must_pin_utf8() -> None:
     encoding load-bearing DO hold everywhere, and this asserts both -- so the
     guard cannot rot silently on the runners that never feel it.
 
-    Deliberately not a repo-wide "missing encoding=" rule. `cross-platform.yml`
-    documents why it ships none (a line regex breaks on nested and multi-line
+    Deliberately not a repo-wide "missing encoding=" rule. The `Cross-Platform
+    Portability` step of `pr-policy.yml` documents why it ships none (a line regex breaks on nested and multi-line
     calls), and an AST version means editing `.github/workflows/**`. This stays
     the size of the defect.
     """
@@ -345,7 +350,7 @@ def test_own_surface_config_references_stay_single_surface(selector, tmp_path) -
 # ---------------------------------------------------------------------------
 #
 # The reduced target list is passed to pytest as EXPLICIT file arguments, and an
-# explicit argument bypasses conftest's Windows `collect_ignore`. So a POSIX-only
+# explicit argument bypasses conftest's Windows ignore hook. So a POSIX-only
 # suite that reaches this list gets collected on the Windows shards and fails
 # there -- on every diff that takes the reduced scope, which is any
 # frontend-only diff. The suites below are the ones observed failing that way.
@@ -355,6 +360,8 @@ _IGNORE_LIST = _REPO_ROOT / "test" / "windows-collect-ignore.txt"
 _OBSERVED_WINDOWS_FAILURES = (
     "test_acp_client.py",
     "test_deploy_web_handlers.py",
+    "test_deploy_web_handlers_manifest_reaper.py",
+    "test_deploy_web_handlers_webapp.py",
     "test_dev_fleet_app.py",
     "test_pid_lifecycle.py",
     "test_sandbox_argv.py",
@@ -376,13 +383,18 @@ def test_ignore_list_exists_and_is_non_empty() -> None:
 def test_ignore_list_matches_the_names_conftest_previously_inlined() -> None:
     """The extraction into a file must be lossless.
 
-    conftest's `collect_ignore` branch only executes on Windows, so a parsing
+    conftest applies the list only on Windows, so a parsing
     typo here would silently re-enable a suite that fails at import on win32 and
     would not be caught on a POSIX dev machine. Pin the exact set.
 
     ``test_harness.py`` left this set when the gateway harness became
     cross-platform (reader thread instead of ``selectors`` on a pipe, tree kill
     instead of ``terminate_pgid``); it now runs on the Windows shards.
+    ``test_stop_kill_cancel.py``, the three ``test_theme_install*.py`` parts and
+    ``test_file_office_preview.py`` left it once their blockers were gone: the
+    kill-path tests skip their POSIX-only cases themselves, theme packs are served
+    on Windows, and the file schema accepts a drive-letter path. They run on the
+    Windows shards too.
 
     ``test_pod_windows_boot.py`` is the one entry here for a reason other than a
     POSIX assumption: it boots a real pod under Task Scheduler, needs a built
@@ -397,34 +409,95 @@ def test_ignore_list_matches_the_names_conftest_previously_inlined() -> None:
     no-op on NTFS so the stub is never the ``gh`` that resolves. Listing the module
     is how a POSIX-only-by-design suite is stated here; a class-level ``skipif``
     would leave a marker that proves nothing on that shard either.
+
+    ``test_ci_fork_windows_scope_posix.py`` is listed for the same reason: it runs
+    ci.yml's fork Windows scope step under bash inside a throwaway git checkout.
     """
     assert _ignore_names() == {
+        "test_ci_fork_windows_scope_posix.py",
         "test_macos_pool_ceiling_posix.py",
         "test_sandbox_argv.py",
+        "test_sandbox_argv_launcher_plan.py",
+        "test_sandbox_argv_profile.py",
+        "test_sandbox_argv_resource_ceilings.py",
+        "test_sandbox_argv_spawn.py",
         "test_sandbox_cc_mode.py",
         "test_sandbox_hardlink_scan.py",
         "test_sandbox_md_notebook_carveout.py",
         "test_sandbox_nested_tier.py",
         "test_pid_lifecycle.py",
-        "test_pid_sweep_helpers.py",
+        "test_pid_lifecycle_browser_daemon.py",
+        "test_pid_lifecycle_orphan_cleanup.py",
+        "test_pid_lifecycle_process_sweeps.py",
+        "test_pid_lifecycle_provider_tree.py",
+        "test_pid_lifecycle_teardown.py",
+        "test_pid_lifecycle_tracking_integrity.py",
         "test_process_tree_kill.py",
         "test_source_providers.py",
+        "test_source_providers_app_contributors.py",
+        "test_source_providers_chip_status.py",
+        "test_source_providers_endpoints.py",
+        "test_source_providers_fetch_cache.py",
+        "test_source_providers_fetch_capacity.py",
+        "test_source_providers_gitlab_host.py",
+        "test_source_providers_issues.py",
+        "test_source_providers_jira.py",
+        "test_source_providers_mutations.py",
+        "test_source_providers_payloads.py",
+        "test_source_providers_provider_cli.py",
+        "test_source_providers_reviews.py",
         "test_terminal_handler.py",
+        "test_terminal_handler_child_process.py",
+        "test_terminal_handler_completion.py",
+        "test_terminal_handler_pty_integration.py",
+        "test_terminal_handler_pty_writes.py",
+        "test_terminal_handler_session_routes.py",
+        "test_terminal_handler_session_state.py",
+        "test_terminal_handler_ws.py",
         "test_acp_client.py",
-        "test_stop_kill_cancel.py",
+        "test_acp_client_binary_resolution.py",
+        "test_acp_client_commands.py",
+        "test_acp_client_compaction.py",
+        "test_acp_client_inbound.py",
+        "test_acp_client_model_entitlement.py",
+        "test_acp_client_model_substitution.py",
+        "test_acp_client_process_lifecycle.py",
+        "test_acp_client_prompt_turn.py",
+        "test_acp_client_session_setup.py",
+        "test_acp_client_settings_restore.py",
+        "test_acp_client_spawn.py",
+        "test_acp_client_stale_turn.py",
+        "test_acp_client_tool_call_updates.py",
+        "test_acp_client_tool_events.py",
+        "test_acp_client_tool_hooks.py",
+        "test_acp_client_transient_errors.py",
         "test_app_backend_stale_reap.py",
         "test_env.py",
         "test_outbox_notify_broadcast.py",
         "test_outbox_binary.py",
         "test_deploy_web_handlers.py",
+        "test_deploy_web_handlers_manifest_reaper.py",
+        "test_deploy_web_handlers_webapp.py",
         "test_snapshot.py",
-        "test_theme_install.py",
+        "test_snapshot_notification_copy_branch.py",
+        "test_snapshot_notification_merge_branch.py",
         "test_webapp_preview.py",
         "test_file_raw.py",
         "test_file_download.py",
-        "test_file_office_preview.py",
         "test_dashboard_file_io.py",
         "test_dev_fleet_app.py",
+        "test_dev_fleet_app_make_live.py",
+        "test_dev_fleet_app_make_live_cutover.py",
+        "test_dev_fleet_app_trusted_helpers.py",
+        "test_dev_fleet_app_context.py",
+        "test_dev_fleet_app_prune.py",
+        "test_dev_fleet_app_fleet_cache.py",
+        "test_dev_fleet_app_teardown.py",
+        "test_dev_fleet_app_foreground.py",
+        "test_dev_fleet_app_pull_build.py",
+        "test_dev_fleet_app_worktrees.py",
+        "test_dev_fleet_app_sync.py",
+        "test_dev_fleet_app_guards.py",
         "test_pod_windows_boot.py",
     }
 
@@ -438,7 +511,7 @@ def test_every_ignored_suite_exists() -> None:
 def test_conftest_and_selector_read_the_same_ignore_list(selector) -> None:
     """One file, two readers -- so the two cannot drift apart.
 
-    conftest builds `collect_ignore` from it for the recursive path; the selector
+    conftest's ignore hook reads it for the recursive path; the selector
     filters it out of the explicit-argument path. If a future change re-inlines
     either copy, this fails.
     """
@@ -462,6 +535,7 @@ def test_windows_scope_names_nothing_on_the_ignore_list(selector, monkeypatch) -
     assert not offenders, f"Windows scope names uncollectable suites: {offenders}"
 
 
+@pytest.mark.timeout(POSIX_SCOPE_TIMEOUT_SECS)
 def test_posix_scope_is_unfiltered(selector, monkeypatch) -> None:
     """The filter is Windows-only -- POSIX coverage must not shrink."""
     monkeypatch.setattr(selector, "_is_windows", lambda: False)
@@ -495,10 +569,12 @@ def test_missing_ignore_list_fails_open(selector, tmp_path) -> None:
 def test_explicit_cli_target_bypasses_collect_ignore(tmp_path) -> None:
     """Why the filter lives in the selector and not only in conftest.
 
-    pytest honours `collect_ignore` when it RECURSES into a directory and ignores
-    it when the file is named on the command line. That asymmetry is the entire
-    bug, so pin it: if a future pytest starts honouring `collect_ignore` for
-    explicit arguments, this fails and the selector-side filter can be dropped.
+    pytest honours a conftest's `collect_ignore` list, and its
+    ``pytest_ignore_collect`` hook -- the form ``test/conftest.py`` applies the
+    platform list through -- when it RECURSES into a directory, and neither when the
+    file is named on the command line. That asymmetry is the entire bug, so pin it
+    for both forms: if a future pytest starts honouring either for explicit
+    arguments, this fails and the selector-side filter can be dropped.
     """
     import os
     import subprocess
@@ -506,10 +582,14 @@ def test_explicit_cli_target_bypasses_collect_ignore(tmp_path) -> None:
 
     suite = tmp_path / "t"
     suite.mkdir()
-    (suite / "conftest.py").write_text('collect_ignore = ["test_boom.py"]\n', encoding="utf-8")
-    (suite / "test_boom.py").write_text(
-        'raise RuntimeError("import-time failure")\n', encoding="utf-8"
+    (suite / "conftest.py").write_text(
+        'collect_ignore = ["test_boom.py"]\n\n\n'
+        "def pytest_ignore_collect(collection_path, config):\n"
+        "    return True if collection_path.name == 'test_boom_hook.py' else None\n",
+        encoding="utf-8",
     )
+    for name in ("test_boom.py", "test_boom_hook.py"):
+        (suite / name).write_text('raise RuntimeError("import-time failure")\n', encoding="utf-8")
     (suite / "test_ok.py").write_text("def test_ok():\n    assert True\n", encoding="utf-8")
 
     def run(*target: str) -> int:
@@ -543,11 +623,12 @@ def test_explicit_cli_target_bypasses_collect_ignore(tmp_path) -> None:
             encoding="utf-8",
         ).returncode
 
-    assert run(str(suite)) == 0, "recursive collection should honour collect_ignore"
-    assert run(str(suite / "test_boom.py")) != 0, (
-        "explicit argument now honours collect_ignore -- the selector-side "
-        "filter may no longer be required"
-    )
+    assert run(str(suite)) == 0, "recursive collection should honour both ignore forms"
+    for name in ("test_boom.py", "test_boom_hook.py"):
+        assert run(str(suite / name)) != 0, (
+            f"explicit argument {name} is now ignored -- the selector-side "
+            "filter may no longer be required"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -563,9 +644,9 @@ def _seed(path: Path, text: str) -> None:
 def test_windows_filter_is_scoped_to_the_test_root(tmp_path, monkeypatch) -> None:
     """The ignore list governs ``test/`` only, so the filter must too.
 
-    The list holds BARE filenames and ``test/conftest.py`` resolves its
-    ``collect_ignore`` entries relative to its own directory -- so the exclusion
-    covers ``test/<name>`` and nothing else. Matching the emitted paths on their
+    The list holds BARE filenames and ``test/conftest.py``'s ignore hook matches a
+    listed name only directly under ``test/`` -- so the exclusion covers
+    ``test/<name>`` and nothing else. Matching the emitted paths on their
     basename instead also drops a same-named suite under ``transfer/`` or the
     apps-builtins tree, which no conftest excludes and Windows collects fine.
     That is a silently skipped cross-surface guard, which is the one outcome
@@ -599,7 +680,7 @@ def test_windows_filter_is_scoped_to_the_test_root(tmp_path, monkeypatch) -> Non
     ), "the POSIX-only suite conftest names must still be filtered out"
     assert app_suite in selected, (
         "a same-named suite outside test/ is not covered by conftest's "
-        f"collect_ignore and must keep running on Windows; got {selected}"
+        f"ignore hook and must keep running on Windows; got {selected}"
     )
 
 

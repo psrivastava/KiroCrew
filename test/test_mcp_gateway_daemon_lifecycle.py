@@ -34,11 +34,13 @@ from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+from git_maintenance_helpers import git_maintenance_off_entries
 
 from kiro_crew import code_fingerprint as cf
 from kiro_crew.mcp_gateway import gatewayd as gw
 from kiro_crew.mcp_gateway import manager as mgr
 from kiro_crew.subprocess_utf8 import UTF8_TEXT
+from kiro_crew.testing.wait import async_wait_until, await_until, finished
 
 _POSIX_ONLY = pytest.mark.skipif(sys.platform == "win32", reason="/proc and unix sockets")
 
@@ -93,6 +95,7 @@ class TestCodeFingerprint:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, real_git_fingerprint: None
     ) -> None:
         env = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "HOME": str(tmp_path)}
+        env.update(git_maintenance_off_entries(env))
         pkg = tmp_path / "pkg"
         pkg.mkdir()
         (pkg / "a.py").write_text("x = 1\n", encoding="utf-8")
@@ -163,17 +166,29 @@ class TestCodeFingerprint:
         monkeypatch.setattr(cf.subprocess, "run", fake_run)
         monkeypatch.setenv("GIT_EXTERNAL_DIFF", "/tmp/evil")
         monkeypatch.setenv("GIT_CONFIG_PARAMETERS", "'diff.external=/tmp/evil'")
+        # The repo-driver preflight has its own real-repo tests; here it is clean.
+        monkeypatch.setattr(
+            "kiro_crew.platform.update_governance.repo_exec_driver_reason", lambda *_a, **_k: ""
+        )
         assert cf._git_fingerprint(tmp_path) == "abc"
         assert len(seen) == 2
         for argv, env in seen:
             assert argv[0] == "/usr/bin/git"
             assert env["GIT_CONFIG_GLOBAL"] == os.devnull
             assert env["GIT_CONFIG_NOSYSTEM"] == "1"
+            # Beside those three, only the shared exec-key pins (GIT_CONFIG_COUNT/KEY_n/VALUE_n).
             assert not any(
                 k.startswith("GIT_")
                 and k not in ("GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM", "GIT_TERMINAL_PROMPT")
+                and k != "GIT_CONFIG_COUNT"
+                and not k.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"))
                 for k in env
             )
+            pins = {
+                env[f"GIT_CONFIG_KEY_{i}"]: env[f"GIT_CONFIG_VALUE_{i}"]
+                for i in range(int(env["GIT_CONFIG_COUNT"]))
+            }
+            assert pins["diff.external"] == "" and pins["core.fsmonitor"] == "false"
             assert "core.pager=cat" in argv
         diff_argv = seen[1][0]
         assert "--no-ext-diff" in diff_argv and "--no-textconv" in diff_argv
@@ -260,7 +275,7 @@ class TestOwnerLivenessSweeper:
         await asyncio.sleep(0.05)
         assert not stop.is_set(), "a live owner must not stop the daemon"
         alive["v"] = False
-        await asyncio.wait_for(stop.wait(), timeout=5)
+        await await_until(stop)
         await task
 
     @pytest.mark.asyncio
@@ -274,7 +289,7 @@ class TestOwnerLivenessSweeper:
         await asyncio.sleep(0.05)
         assert not stop.is_set()
         start["v"] = "7777"  # same PID number, different process
-        await asyncio.wait_for(stop.wait(), timeout=5)
+        await await_until(stop)
         await task
 
     @pytest.mark.asyncio
@@ -303,7 +318,7 @@ class TestOwnerLivenessSweeper:
         stop = asyncio.Event()
         monkeypatch.setattr(gw, "_process_start_time", lambda pid: None)
         monkeypatch.setattr(gw, "_pid_exists", lambda pid: True)
-        await asyncio.wait_for(gw._owner_liveness_sweeper(4242, 0.01, stop), timeout=5)
+        await finished(gw._owner_liveness_sweeper(4242, 0.01, stop), "owner liveness sweeper")
         assert not stop.is_set()
 
     @pytest.mark.asyncio
@@ -322,7 +337,7 @@ class TestOwnerLivenessSweeper:
         stop = asyncio.Event()
         monkeypatch.setattr(gw, "_process_start_time", lambda pid: None)
         monkeypatch.setattr(gw, "_pid_exists", lambda pid: False)
-        await asyncio.wait_for(gw._owner_liveness_sweeper(4242, 0.01, stop), timeout=5)
+        await finished(gw._owner_liveness_sweeper(4242, 0.01, stop), "owner liveness sweeper")
         assert stop.is_set(), "a daemon whose owner is already gone must not serve on"
 
     @pytest.mark.asyncio
@@ -337,7 +352,7 @@ class TestOwnerLivenessSweeper:
         stop = asyncio.Event()
         monkeypatch.setattr(gw, "_process_start_time", lambda pid: None)
         monkeypatch.setattr(gw, "_pid_exists", lambda pid: False)
-        await asyncio.wait_for(gw._owner_liveness_sweeper(4242, 3600.0, stop), timeout=5)
+        await finished(gw._owner_liveness_sweeper(4242, 3600.0, stop), "owner liveness sweeper")
         assert stop.is_set()
 
     def test_the_manager_names_itself_as_owner(self, tmp_path: Path) -> None:
@@ -402,15 +417,14 @@ async def test_a_real_daemon_exits_when_its_owner_dies(
         start_new_session=True,
     )
     try:
-        from kiro_crew.mcp_gateway import transport
-
-        deadline = asyncio.get_running_loop().time() + 60
-        while not await asyncio.to_thread(transport.endpoint_exists, sock):
-            assert asyncio.get_running_loop().time() < deadline, "daemon never bound"
-            await asyncio.sleep(0.05)
         from kiro_crew.mcp_gateway.daemon_control import describe_daemon
 
-        info = await asyncio.to_thread(describe_daemon, sock)
+        info = await async_wait_until(
+            lambda: describe_daemon(sock),
+            timeout=60,
+            off_loop=True,
+            describe=lambda: f"daemon {daemon.pid} on {sock}; returncode={daemon.returncode}",
+        )
         assert info is not None
         assert info.owner_pid == owner.pid
         assert info.pid == daemon.pid

@@ -78,9 +78,10 @@ from kiro_crew.mcp_core import (
     _resolve_session_key,
     require_strict_session_key,
 )
+from kiro_crew.mcp_instructions import GUIDE as _INSTRUCTIONS
 from kiro_crew.mcp_shared import call_tool_with_logging, run_mcp_stdio_loop
 from kiro_crew.platform import redact_via_context as redact
-from kiro_crew.validation import MAX_SHORT_STRING, MCP_GUIDE_SCHEMAS, validate_tool_args
+from kiro_crew.validation import MCP_GUIDE_SCHEMAS, validate_tool_args
 
 logger = logging.getLogger(__name__)
 
@@ -223,8 +224,8 @@ def _tool_definitions() -> list[dict[str, Any]]:
             "description": (
                 "List the change-card kinds you can propose (settings, schedules, "
                 "crewmates, capabilities, templates, MCP servers, connections, "
-                "secrets, app trust, denied commands), each with its params schema "
-                "and which fields the user may edit on the card."
+                "secrets, app trust, denied commands, saved workflows), each with "
+                "its params schema and which fields the user may edit on the card."
             ),
             "inputSchema": {"type": "object", "properties": {}},
         },
@@ -233,7 +234,9 @@ def _tool_definitions() -> list[dict[str, Any]]:
             "description": (
                 "Search the Settings page for a setting to change, e.g. 'shorter "
                 "replies' or 'restore sessions'. Returns up to 10 matches: "
-                "setting_id, label, path (the Settings click path), description, tab, "
+                "setting_id, label, path (the Settings click path), description "
+                "(help text the row shows), hint (help text behind the row's info "
+                "tip, never shown on the row; only when the row has one), tab, "
                 "writable (whether a "
                 "setting.change card can change it), current_value and "
                 "allowed_values; a list setting adds value_type 'string_list' "
@@ -330,25 +333,6 @@ def _tool_definitions() -> list[dict[str, Any]]:
             },
         },
         {
-            "name": "rename_self",
-            "description": (
-                "Change the name the user sees for you, in this chat, the roster "
-                "and the sidebar. Call it only when the user has just told you what "
-                "they want to call you; never on your own initiative and never to "
-                "rename anyone else. Pass the name exactly as they gave it. Only a "
-                "crewmate in its own chat can call it, from a message the user sent "
-                "in the dashboard."
-            ),
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string", "minLength": 1, "maxLength": MAX_SHORT_STRING}
-                },
-                "required": ["name"],
-                "additionalProperties": False,
-            },
-        },
-        {
             "name": "search_docs",
             "description": (
                 "Search the Kiro Crew user documentation for how a feature works or "
@@ -373,7 +357,9 @@ def _tool_definitions() -> list[dict[str, Any]]:
             "name": "find_ui",
             "description": (
                 "Find where something is in the dashboard, e.g. 'older sessions' or "
-                "'较早的会话'. Call it first for every where-is or how-do-I-find question "
+                "'较早的会话'. Call it first for every where-is or how-do-I-find question, "
+                "with no text before the call (no 'let me check the layout first': the "
+                "user sees every word), "
                 "and quote only what it returns: never guess or recall a location. Pass the user's words as `query` and the language of "
                 "their words as `lang` (e.g. 'zh-CN') when known. Labels and paths "
                 "come back in the language the user's dashboard shows "
@@ -425,7 +411,7 @@ def _tool_definitions() -> list[dict[str, Any]]:
                 "offscreen, hidden, unmounted, disabled, ambiguous, unknown, with "
                 "observed_at), or not_observed when their tab did not answer; it "
                 "never reads page text. A result may also carry blocker: "
-                "gate_off (a setting such as developer mode is off; setting_id "
+                "gate_off (a setting such as a feature preview is off; setting_id "
                 "names it, or is null when no setting turns it on), "
                 "needs_selection (the user must first open one item, e.g. a "
                 "crewmate, named in selection), "
@@ -1247,7 +1233,6 @@ _TOOL_NAMES = frozenset(
         "diagnose_settings",
         "propose_change",
         "get_change_status",
-        "rename_self",
     }
 )
 
@@ -1326,20 +1311,6 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
         d = _get(path, session_key=sk)
         return _error_for(name, d) or _render(d)
 
-    if name == "rename_self":
-        d = _post("/api/guide/agent/rename", {"name": args.get("name")}, session_key=sk)
-        refused = _error_for(name, d)
-        if refused:
-            return f"{refused}\nYour name did not change; do not say it did."
-        return _render(
-            {
-                **d,
-                "next": "Your name now shows as "
-                + str(d.get("display_name") or "")
-                + " everywhere in the dashboard. Answer to it from now on.",
-            }
-        )
-
     if name == "guide_list_actions":
         d = _get("/api/guide/agent/actions", session_key=sk)
         return _error_for(name, d) or _render({"actions": d.get("actions") or []})
@@ -1402,6 +1373,7 @@ def run_mcp_server() -> None:
         _list_tools,
         _call_tool,
         advertise_caller_identity=ADVERTISE_CALLER_IDENTITY,
+        instructions=_INSTRUCTIONS,
     )
 
 

@@ -63,6 +63,8 @@ def _mock_provider_factory():
 async def _started_manager(cfg):
     mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
     await mgr.start_pool()
+    # The background session starts on first use; these tests act on a live one.
+    await mgr._ensure_background()
     return mgr
 
 
@@ -147,6 +149,24 @@ class TestZeroFallsBackToTheBackgroundCeiling:
 
         provider.shutdown.assert_not_awaited()
         assert mgr._sessions[BACKGROUND_KEY].provider is provider
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_the_shipped_default_keeps_the_lower_background_ceiling(self, caplog):
+        """The chat-session default sits above the background fallback; the
+        background runtime still recycles at the fallback."""
+        cfg = KiroCrewConfig()
+        cfg.session.timeout_secs = 2
+        assert cfg.session.watchdog_rss_max_mb > BACKGROUND_RSS_FALLBACK_MB
+        mgr = await _started_manager(cfg)
+        provider = mgr._sessions[BACKGROUND_KEY].provider
+
+        with patch("kiro_crew.session.get_session_rss_mb", return_value=1890):
+            with caplog.at_level("INFO", logger="kiro_crew.session"):
+                await mgr.recycle_background()
+
+        provider.shutdown.assert_awaited_once()
+        assert f"tree rss=1890MB exceeds {BACKGROUND_RSS_FALLBACK_MB}MB" in caplog.text
         await mgr.close_all()
 
 

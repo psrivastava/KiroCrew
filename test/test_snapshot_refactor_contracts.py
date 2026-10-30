@@ -119,6 +119,8 @@ FACADE_NAMES = frozenset(
         "_copy_notifications",
         "_copy_tree_no_overwrite",
         "_copytree_safe",
+        "_core_file_not_installed",
+        "_cron_rewrite_in_place",
         "_data_filter",
         "_default_snapshot_dir",
         "_dir_flags_nofollow",
@@ -129,6 +131,7 @@ FACADE_NAMES = frozenset(
         "_escape_one",
         "_estimate_selected_bytes",
         "_fsize",
+        "_install_core_file_if_absent",
         "_install_locked_document",
         "_install_notifications",
         "_is_gateway_running",
@@ -144,6 +147,7 @@ FACADE_NAMES = frozenset(
         "_never_ships",
         "_notification_key",
         "_print_manifest",
+        "_read_cron_store_once",
         "_redacted_upload_copy",
         "_redactor",
         "_refuse_corrupt_source_databases",
@@ -175,6 +179,7 @@ FACADE_NAMES = frozenset(
         "_usable_cron_shape",
         "_validate_identifier",
         "_want",
+        "_write_merged_crons",
         "closing",
         "dataclass",
         "datetime",
@@ -273,6 +278,16 @@ def test_the_snapshot_command_line_is_unchanged() -> None:
             "_StoreTrueAction",
         ),
         (("--to",), "to", None, None, None, None, argparse.SUPPRESS, "_StoreAction"),
+        (
+            ("--max-archive-gib",),
+            "max_archive_gib",
+            None,
+            None,
+            None,
+            None,
+            snap._MAX_ARCHIVE_GIB_HELP,
+            "_StoreAction",
+        ),
     ]
 
 
@@ -305,6 +320,16 @@ def test_the_restore_command_line_is_unchanged() -> None:
             "descriptor. Without this the restore is refused there rather than run with a "
             "destination an ancestor swap could redirect.",
             "_StoreTrueAction",
+        ),
+        (
+            ("--max-archive-gib",),
+            "max_archive_gib",
+            None,
+            None,
+            None,
+            None,
+            snap._MAX_ARCHIVE_GIB_HELP,
+            "_StoreAction",
         ),
     ]
 

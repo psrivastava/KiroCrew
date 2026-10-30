@@ -156,6 +156,26 @@ describe('useInstanceSessions', () => {
     expect(byKey.get('lead')).not.toHaveProperty('parent')
   })
 
+  it('keeps a peer Crew Mode root as one, and only the literal true', async () => {
+    instanceChatSlotsMock.mockResolvedValue([
+      { key: 'crew', title: 'Crew chat', crew_mode_root: true },
+      { key: 'member', title: 'A crew member', crew_root: 'crew' },
+      { key: 'plain', title: 'Plain' },
+      { key: 'loose', title: 'Loose', crew_mode_root: 'yes', crew_root: 7 },
+    ])
+    const { result } = renderInstanceSessions(true, [CONNECTED])
+    await waitFor(() => expect(result.current.rows).toHaveLength(4))
+    const byKey = new Map(result.current.rows.map(r => [r.key, r]))
+    expect(byKey.get('crew')?.crew_mode_root).toBe(true)
+    // A crew member's root key crosses as a string only, so the person's lists can
+    // leave a peer's crew members out the way they leave local ones out.
+    expect(byKey.get('member')?.crew_root).toBe('crew')
+    expect(byKey.get('plain')).not.toHaveProperty('crew_mode_root')
+    expect(byKey.get('plain')).not.toHaveProperty('crew_root')
+    expect(byKey.get('loose')).not.toHaveProperty('crew_mode_root')
+    expect(byKey.get('loose')).not.toHaveProperty('crew_root')
+  })
+
   it('drops a citation with no string half instead of letting the lane dereference it', async () => {
     instanceChatSlotsMock.mockResolvedValue([
       { key: 'a', parent: 'lead' },
@@ -305,6 +325,7 @@ describe('useInstanceSessions', () => {
         agent: 42 as unknown as string,
         created: ['nope'] as unknown as string,
         pending_approval: {} as unknown as boolean,
+        needs_input: 'yes' as unknown as boolean,
         last_turn_ts: '2026-08-31T14:00:00Z',
       },
     ])
@@ -315,8 +336,9 @@ describe('useInstanceSessions', () => {
     expect(row.title).toBeUndefined()
     expect(row.agent).toBeUndefined()
     expect(row.created).toBeUndefined()
-    // A truthy non-boolean must not raise a badge the peer never claimed.
+    // A truthy non-boolean must not raise a badge or a question the peer never claimed.
     expect(row.pending_approval).toBe(false)
+    expect(row.needs_input).toBe(false)
     // The one well-formed field still lands.
     expect(row.last_turn_ts).toBe('2026-08-31T14:00:00Z')
   })
@@ -345,7 +367,7 @@ describe('useInstanceSessions', () => {
   })
 
   it('keeps a crew\'s last rows after it disconnects, and stops asking it', async () => {
-    instanceChatSlotsMock.mockResolvedValue([{ key: 'chat-1', title: 'cached row', running: true, pending_approval: true }])
+    instanceChatSlotsMock.mockResolvedValue([{ key: 'chat-1', title: 'cached row', running: true, pending_approval: true, needs_input: true }])
     const { result, rerender } = renderHook(
       ({ list }: { list: unknown[] }) => useInstanceSessions(true, list as InstanceView[]),
       { wrapper, initialProps: { list: [CONNECTED] } },
@@ -354,12 +376,14 @@ describe('useInstanceSessions', () => {
     const calls = instanceChatSlotsMock.mock.calls.length
 
     expect(result.current.rows[0].running).toBe(true)
+    expect(result.current.rows[0].needs_input).toBe(true)
 
     rerender({ list: [{ ...CONNECTED, status: { state: 'disconnected' } }] })
     expect(result.current.rows.map(r => r.title)).toEqual(['cached row'])
     // A cached answer carries no live state.
     expect(result.current.rows[0].running).toBe(false)
     expect(result.current.rows[0].pending_approval).toBe(false)
+    expect(result.current.rows[0].needs_input).toBe(false)
     expect(result.current.failed).toEqual([])
     expect(instanceChatSlotsMock.mock.calls.length).toBe(calls)
   })

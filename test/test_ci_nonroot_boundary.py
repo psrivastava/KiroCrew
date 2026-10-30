@@ -14,6 +14,12 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 _ACTION_REF = "./.github/actions/run-as-runner"
 _CI_SHELL = "/usr/local/bin/ci-shell {0}"
 _LARGE = "${{ needs.changes.outputs.linux_runner_large || 'ubuntu-latest' }}"
+# A hosted lane that stays off the CodeBuild fleet but takes the organization's
+# larger-runner group where it can reach one.
+_GROUP_LINUX_ELSE_HOSTED = (
+    "${{ github.repository == 'kirodotdev/KiroCrew' "
+    "&& 'kirocrew-linux-4-core' || 'ubuntu-latest' }}"
+)
 
 
 @pytest.fixture(scope="module")
@@ -99,6 +105,7 @@ def test_all_linux_shards_and_memory_heavy_jobs_use_large(jobs):
         assert jobs[name]["runs-on"] == _LARGE
     backend = jobs["backend-test"]
     assert backend["strategy"] == {
+        "max-parallel": "${{ startsWith(needs.changes.outputs.linux_runner_large, 'codebuild-') && 8 || 4 }}",
         "fail-fast": False,
         "matrix": {"python-version": ["3.12"], "group": list(range(1, 9))},
     }
@@ -198,8 +205,12 @@ def test_unproved_namespace_gui_and_task_scheduler_jobs_stay_hosted(workflow, na
     job = yaml.safe_load((_REPO_ROOT / ".github/workflows" / workflow).read_text(encoding="utf-8"))[
         "jobs"
     ][name]
-    assert "codebuild" not in job["runs-on"]
-    assert "linux_runner" not in job["runs-on"] and "windows_runner" not in job["runs-on"]
+    # Rendered, never indexed: a `runs-on` that names a group is a mapping, and
+    # `in` on a mapping tests its KEYS -- so an unrendered check passes for every
+    # possible group name and stops being a check at all.
+    runs_on = str(job["runs-on"])
+    assert "codebuild" not in runs_on
+    assert "linux_runner" not in runs_on and "windows_runner" not in runs_on
 
 
 def test_private_namespace_lane_is_the_only_e2e_step_left_hosted(jobs):
@@ -208,7 +219,11 @@ def test_private_namespace_lane_is_the_only_e2e_step_left_hosted(jobs):
     `e2e-private-namespace` owns the AppArmor sysctl and private-workflow test.
     """
     hosted = jobs["e2e-private-namespace"]
-    assert hosted["runs-on"] == "ubuntu-latest"
+    # An ordinary hosted VM either way: the organization's larger-runner group
+    # in this repository, the standard image in a fork, which cannot reach an
+    # organization group. The fork branch is pinned too, since dropping it
+    # would leave fork runs queued for a label no runner there carries.
+    assert hosted["runs-on"] == _GROUP_LINUX_ELSE_HOSTED
     assert "changes" not in hosted["needs"]
     runs = [step.get("run", "") for step in hosted["steps"]]
     assert "sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0" in runs

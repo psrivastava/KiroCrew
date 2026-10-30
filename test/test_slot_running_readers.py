@@ -23,6 +23,8 @@ _BUSY_HELPERS: dict[str, frozenset[str]] = {
     "_switch_target_busy": frozenset({"running"}),
     # Member Fresh start: the slot's task or the session's turn.
     "_turn_busy": frozenset({"running"}),
+    # A failed create's newborn retraction: keeps a slot a turn has reserved.
+    "_retract_failed_newborn": frozenset({"running"}),
 }
 
 
@@ -125,59 +127,120 @@ def test_running_and_turn_running_slot_readers_are_enumerated() -> None:
         **{
             site: reservation
             for site in {
-                # A crewmate's first greeting must not land on a slot a send has
-                # already reserved, so it reads the reservation, not the turn.
+                # A crewmate's first greeting (Mate's, or a new crewmate's goal
+                # question) must not land on a slot a send has already reserved,
+                # so it reads the reservation, not the turn.
                 ("mate_welcome.py", "maybe_start_first_greeting"),
+                # A goal check-in skips its run rather than land on a slot a send
+                # has already reserved; it asks again after reading the ledger.
+                ("goal_reminder.py", "_idle_thread"),
+                # A worker report or the upgrade notice waits for the crewmate's
+                # thread to be free, reservation included.
+                ("mate_thread_wakes.py", "_idle"),
                 ("chat_folders.py", "api_chat_slot_mode"),
-                ("chat_handlers.py", "_switch_target_busy"),
-                ("handlers/members.py", "_turn_busy"),
-                ("handlers/members.py", "_turn_ends_within"),
+                ("chat_api/slot_guards.py", "_switch_target_busy"),
+                # The create's retraction of a newborn it answers with a
+                # failure, through _retract_failed_newborn: it reads the
+                # RESERVATION, because a turn that started on the slot during
+                # the create's awaits keeps it.
+                ("chat_api/slot_create.py", "_retract_failed_newborn"),
+                ("chat_api/slot_create.py", "api_chat_slot_create"),
+                ("handlers/members_thread_turns.py", "_turn_busy"),
+                ("handlers/members_thread_turns.py", "_turn_ends_within"),
                 # The agent route's transaction; the in-turn /agent command shares it.
-                ("chat_handlers.py", "switch_slot_agent"),
-                ("chat_api/slot_detail.py", "api_chat_slot_detail"),
-                ("chat_handlers.py", "api_chat_slot_interrupt"),
-                ("chat_handlers.py", "api_chat_slot_model"),
-                ("chat_handlers.py", "api_chat_slot_note"),
-                ("chat_handlers.py", "api_chat_slot_reasoning_effort"),
+                ("chat_api/agent_switch.py", "switch_slot_agent"),
+                ("chat_api/turn_stop.py", "api_chat_slot_interrupt"),
+                ("chat_api/slot_model.py", "api_chat_slot_model"),
+                ("chat_api/slot_note.py", "api_chat_slot_note"),
+                # The project route arms a deferred reset when a start carrying
+                # the old cwd is already in flight; slot.running (the
+                # reservation) catches a cold-starting turn no provider has
+                # registered yet.
+                ("chat_api/session_relaunch.py", "api_chat_slot_project"),
+                ("chat_api/slot_effort.py", "api_chat_slot_reasoning_effort"),
+                # Reload refuses a reserved slot or sibling alias through
+                # _switch_target_busy, as the session_reload verb does.
+                ("chat_api/session_relaunch.py", "api_chat_slot_reload"),
+                # A crewmate's worker reload waits for a reserved worker slot the
+                # same way, through _switch_target_busy.
+                ("crewmate_worker_reload.py", "_is_busy"),
+                # A crewmate's harness change reloads its DM chat the same way,
+                # refusing the save while that slot is reserved.
+                ("agent_admin/crew_update.py", "api_kirocrew_agent_update"),
                 ("chat_api/slot_lifecycle.py", "api_chat_slot_reset_conversation"),
+                # Image repair rebuilds the session through the shared
+                # reload_slot_session path, so it refuses a reserved slot via
+                # _slot_replaced_while_queued before re-issuing the turn, the
+                # same reservation read reset_conversation and reload make.
+                ("chat_api/slot_lifecycle.py", "api_chat_slot_repair_images"),
                 ("chat_api/resume.py", "api_chat_slot_resume"),
-                ("chat_handlers.py", "api_chat_slot_workspace"),
+                ("chat_api/session_relaunch.py", "api_chat_slot_workspace"),
                 ("chat_api/slot_lifecycle.py", "api_chat_slots_cleanup"),
-                ("chat_handlers.py", "api_chat_slots_model"),
-                ("chat_handlers.py", "continue_slot_turn"),
-                ("chat_handlers.py", "stop_slot_turn"),
+                ("chat_api/slot_model.py", "api_chat_slots_model"),
+                ("chat_api/continue_turn.py", "continue_slot_turn"),
+                ("chat_api/turn_stop.py", "stop_slot_turn"),
+                # Stop settlement wakes retained priority only on an unreserved slot.
+                ("chat_api/turn_stop.py", "_make_stop_resolver"),
                 ("chat_rewind.py", "api_chat_slot_rewind"),
                 # The memory-ready queue drain starts a turn only on a slot no
                 # dispatch has reserved, the same guard the dispatch routes take.
-                ("chat_runner.py", "_drain_parked_queues"),
-                ("chat_runner.py", "_eager_spawn"),
-                ("chat_runner.py", "_prefetch_ttl"),
+                ("chat_turn/queue_drain.py", "_drain_parked_queues"),
+                # An injector starts an idle slot's queued head only on a slot no
+                # dispatch has reserved.
+                ("chat_turn/queue_drain.py", "idle_slot_admits_drain"),
+                # The hand-off for a dispatch that never ran a turn's tail: that
+                # task has ended, so this reads a send's reservation.
+                ("chat_turn/queue_cycle.py", "_hand_off_unstarted_turn"),
+                ("chat_turn/eager_spawn.py", "_eager_spawn"),
+                ("chat_turn/eager_spawn.py", "_prefetch_ttl"),
                 ("handlers/autonudge.py", "api_autonudge_fire"),
-                ("handlers/mcp_apps.py", "api_mcp_apps_message"),
-                ("handlers/members.py", "api_member_fresh_start"),
-                ("handlers/members.py", "api_member_thread"),
-                ("handlers/members.py", "api_members"),
-                ("handlers/messaging.py", "api_send_message"),
-                ("session_control.py", "create_session"),
+                # A native-card answer steers into the turn only when one runs;
+                # on a reserved-but-not-executing slot slot.running is still
+                # true, so this reads the reservation like the routes above. No
+                # running turn -> it reports unavailable and the embed hands the
+                # answer back.
+                ("handlers/slot_question.py", "api_chat_slot_question_steer"),
+                ("handlers/members_thread_turns.py", "api_member_fresh_start"),
+                ("handlers/members_thread.py", "api_member_thread"),
+                ("handlers/members_roster.py", "api_members"),
+                # The session-side delivery entry point: idle queues and drains,
+                # a reserved slot gets the queue or a steer.
+                ("session_deliver.py", "deliver"),
+                # A peer's steer needs a running turn to cut into.
+                ("session_deliver.py", "_deliver_peer"),
+                ("session_control_parts/session_create.py", "create_session"),
                 # The roster verb. Reservation state, like `read_messages` beside
                 # it and for the same reason: it reports whether a session is
                 # working so a patrol knows whether to wait.
-                ("session_control.py", "created_session_status"),
-                ("session_control.py", "read_messages"),
+                ("session_control_parts/session_status.py", "created_session_status"),
+                ("session_control_parts/session_status.py", "read_messages"),
                 # The summary verb reports liveness beside the digest for the
                 # same reason `read_messages` does.
-                ("session_control.py", "read_summary"),
-                ("session_control.py", "send_to_target"),
+                ("session_control_parts/session_status.py", "read_summary"),
+                ("session_control_parts/session_messaging.py", "send_to_target"),
                 # Pre-pick idle check via _switch_target_busy (idle-only tool contract).
-                ("session_control.py", "set_model_target"),
+                ("session_control_parts/model_switch.py", "set_model_target"),
+                # A pick waiting for a channel turn's end is left to the slot's
+                # own dashboard turn from the moment a send reserves the slot.
+                ("session_control_parts/model_switch.py", "land_model_pick_after_channel_turn"),
+                ("state_parts/session_events.py", "wire_session_release_listener"),
                 ("openai_compat.py", "api_completions"),
                 # Idle-only teardown: the same pre-lock and in-lock probe via
                 # _switch_target_busy, so a reserved slot between stages is busy.
-                ("session_control.py", "reload_target"),
+                ("session_control_parts/turn_control.py", "reload_target"),
                 # The idle sweep never picks or pops a slot holding a reservation.
                 ("slot_retention.py", "_still_idle_check"),
                 ("slot_retention.py", "select_idle_slot_keys"),
-                ("state.py", "_ChatSlot.enqueue_or_run_prompt"),
+                ("state_parts/chat_slot.py", "_ChatSlot.enqueue_or_run_prompt"),
+                # A return brief must not start or publish after a send has
+                # reserved the slot, even before its model turn begins.
+                ("warm_task_brief.py", "_run_warm_task_brief"),
+                # A worker holding a reservation is in-flight work for the
+                # thread that created it, even before its model turn begins.
+                ("warm_task_brief.py", "_running_workers"),
+                ("warm_task_brief.py", "_settled"),
+                ("warm_task_brief.py", "_still_current"),
+                ("warm_task_brief.py", "_wait_for_idle_turn"),
                 ("ws.py", "_handle_slot_focused"),
             }
         },
@@ -188,19 +251,28 @@ def test_running_and_turn_running_slot_readers_are_enumerated() -> None:
                 ("chat_slack.py", "drain_slack_backfill"),
                 # The synthesis outage re-check fires only on an idle slot: a
                 # running TURN, not a reservation, is what it must not overlap.
-                ("chat_runner.py", "_arm_synthesis_recheck"),
+                ("chat_turn/queue_cycle.py", "_arm_synthesis_recheck"),
                 # A guide or card tool call is admitted only from the turn this
                 # slot is executing; a reservation has no tool call yet.
                 ("handlers/guide.py", "_resolve_agent_caller"),
+                # A responsive steer needs a turn executing now; a reserved
+                # slot keeps the queue path.
+                ("responsive_chat.py", "_steer_ready"),
                 ("slot_projection.py", "SlotProjection.to_dict"),
                 ("slot_registry.py", "SlotRegistry.running_session_keys"),
-                ("state.py", "_ChatSlot.running"),
+                ("state_parts/chat_slot.py", "_ChatSlot.running"),
             }
         },
         **{
             site: both
             for site in {
-                ("chat_handlers.py", "api_chat"),
+                # The side panel's steer into a Crew Mode worker: a RUNNING turn takes
+                # it as a steer, and only an unreserved slot has its queued text
+                # started now, the composer's own two questions.
+                ("handlers/crew_workers.py", "_deliver_as_person"),
+                ("chat_api/slot_detail.py", "api_chat_slot_detail"),
+                ("chat_api/chat_send.py", "_api_chat_send"),
+                ("responsive_chat.py", "accept"),
                 ("chat_regenerate.py", "_destructive_history_busy"),
                 ("chat_regenerate.py", "api_chat_slot_edit_resend"),
                 ("chat_regenerate.py", "api_chat_slot_regenerate"),
@@ -212,16 +284,18 @@ def test_running_and_turn_running_slot_readers_are_enumerated() -> None:
     assert publishers == {
         # A crewmate's first-open greeting: a gateway-authored turn, started the
         # way api_send_message starts one (spawn_guarded_turn, then slot.task).
-        ("mate_welcome.py", "_dispatch_greeting"),
-        ("chat_handlers.py", "api_chat"),
+        # The Daily Goal Reminder's hidden turn shares the same publisher.
+        ("mate_welcome.py", "dispatch_hidden_turn"),
+        ("chat_api/chat_send.py", "_api_chat_send"),
         ("chat_regenerate.py", "api_chat_slot_edit_resend"),
         ("chat_regenerate.py", "api_chat_slot_regenerate"),
         ("chat_rewind.py", "api_chat_slot_rewind"),
-        ("chat_runner.py", "_launch_synthesis"),
-        ("chat_runner.py", "_start_next_queued_turn"),
-        ("handlers/mcp_apps.py", "api_mcp_apps_message"),
-        ("handlers/messaging.py", "api_send_message"),
+        ("chat_turn/queue_cycle.py", "_launch_synthesis"),
+        # The cycle end of a dispatch that never ran a turn's tail holds the
+        # floor the way the synthesis launch does.
+        ("chat_turn/queue_cycle.py", "_hand_off_unstarted_turn"),
+        ("chat_turn/queue_drain.py", "_start_next_queued_turn"),
         ("handlers/taskrunner.py", "api_taskrunner_to_chat"),
         ("openai_compat.py", "api_completions"),
-        ("state.py", "_ChatSlot.enqueue_or_run_prompt"),
+        ("state_parts/chat_slot.py", "_ChatSlot.enqueue_or_run_prompt"),
     }

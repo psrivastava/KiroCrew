@@ -1,18 +1,18 @@
 # Capturing a harness's `/compact` evidence
 
-`ACP_BACKENDS_COMPACT` in `src/kiro_crew/agent_sdk/backends.py` decides whether Kiro
+`ACP_BACKENDS_COMPACT` in `src/kiro_crew/agent_sdk/backends_turns.py` decides whether Kiro
 Crew offers a manual `/compact` on a backend at all. A harness joins that set on a
 DRIVEN capture, never on its source: the bar opencode and goose met is a live session
 whose `usage_update.used` was seen to fall below its pre-compact peak.
 
-pi is outside the set today, and not because it lacks the feature. It finishes a
-compaction inline according to its own code — pi-acp intercepts the command in
-`prompt()` — and it has never been driven: it answered `Authentication required` on the
-host where the note was written. Source says what the code WOULD do. A capture says what the harness DID, and for a
+Source says what the code WOULD do. A capture says what the harness DID, and for a
 membership whose wrong answer makes `wait_for_compaction` report a completion that
-never happened, only the second counts.
+never happened, only the second counts. pi joined the set on a capture taken with the
+script below (`test/fixtures/acp_frames/pi/compact-live.jsonl`); its source had said
+inline all along, and the drive confirmed it.
 
-This guide is how anyone holding a credential closes that gap in one command.
+This guide is how anyone with a harness that can reach a model takes that capture in one
+command.
 
 ```
 python3 scripts/capture_acp_compaction.py --harness pi
@@ -39,7 +39,7 @@ give you is a harness that can reach a model.
 **A locally served model is the cheapest way to satisfy that, and it needs no
 credential at all.** Both existing corpora were captured that way: the goose fixtures
 were driven against a model served locally with no provider key involved, and the pi
-fixtures against an Ollama model named in pi's own `models.json`. A local model also
+fixtures against a scripted OpenAI-compatible endpoint on the loopback interface named in pi's own `models.json`. A local model also
 keeps a provider catalog out of the frames, which is one of the marker classes a
 fixture is refused for.
 
@@ -47,7 +47,7 @@ fixture is refused for.
 |---|---|---|---|
 | goose | `curl -fsSL https://raw.githubusercontent.com/block/goose/main/download_cli.sh \| bash` | A provider. `goose configure` in a terminal names one and stores its key; the key lands in the OS keyring, or in `~/.config/goose/secrets.yaml` when `GOOSE_DISABLE_KEYRING` selects file storage. A locally served model is named as the provider instead and needs no key. `GOOSE_PROVIDER` / `GOOSE_MODEL` in the environment select one without touching the config. | `GOOSE_BIN` points at the binary. `XDG_CONFIG_HOME` relocates the whole config tree, secrets included — useful for a scratch capture. |
 | pi | `npm i -g pi-acp @earendil-works/pi-coding-agent` (both halves: the adapter Crew spawns and the agent it spawns) | A sign-in or a local model. `pi` in a terminal, then its `/login`, writes `~/.pi/agent/auth.json`; or name a locally served model in `~/.pi/agent/models.json` and skip sign-in entirely. | `PI_ACP_BIN` points at the adapter's entry script, `PI_ACP_PI_COMMAND` at the agent. `PI_CODING_AGENT_DIR` relocates pi's whole agent directory. |
-| opencode | `npm i -g opencode-ai` | `opencode auth login`, or a local model in the project's `opencode.json`. | `OPENCODE_BIN` points at the binary. |
+| opencode | `npm i -g opencode-ai@1` | `opencode auth login`, or a local model in the project's `opencode.json`. | `OPENCODE_BIN` points at the binary. The launch refuses a binary outside the tested major 1. |
 
 opencode is in that table on purpose: it is already a member, so driving it is the
 control run. If the script reports `COMPACTED` for opencode on your host, the script
@@ -153,9 +153,10 @@ a file whose growth turns were trimmed.
 
 ## Landing the evidence
 
-A `COMPACTED` capture for pi changes one membership and the several places that
-record its absence. Work through them in order; the tests are what stop a half-done
-move.
+A `COMPACTED` capture for a harness changes one membership and the several places that
+record its absence. Steps 1-3 use pi's paths as the worked example; steps 4-6 are the
+checklist for whichever harness you drove. Work through them in order; the tests are
+what stop a half-done move.
 
 **1. The fixture.** Move the reviewed capture in and generate its snapshot:
 
@@ -171,7 +172,7 @@ Commit the `.jsonl` and the generated `.expected.json` together.
 row per file and a short section per thing a capture establishes. Add both: the row names
 the frame classes, the section names what the `used` series shows.
 
-**3. The capability sets.** In `src/kiro_crew/agent_sdk/backends.py`:
+**3. The capability sets.** In `src/kiro_crew/agent_sdk/backends_turns.py`:
 
 - add the id to `ACP_BACKENDS_COMPACT`;
 - add it to `ACP_BACKENDS_INLINE_COMPACTION` as well **if** the compaction finished
@@ -187,57 +188,72 @@ the frame classes, the section names what the `used` series shows.
   is a member.
 
 **4. The backend card's unmeasured cell.** The Settings > Agent Harness card renders
-three marks per line — available, not available, and NOT MEASURED — and the third one is
-the only per-harness table in `src/kiro_crew/agent_sdk/backend_cards.py`:
-`DECLARED_UNMEASURED`. It holds one entry, pi's `manual_compact` cell, citing
-`ACP_BACKENDS_COMPACT`'s own words. A capture is what that cell was waiting for, so
-delete the entry for the harness you drove.
+three marks per line — available, not available, and NOT MEASURED — and the third one
+comes from the only per-harness table in `src/kiro_crew/agent_sdk/backend_cards.py`:
+`DECLARED_UNMEASURED`. It is empty on main, so every card is measured today. If your
+harness had an entry there, delete it: a capture is what that cell was waiting for. If
+it had none, there is nothing to do here.
 
-Three tests in `test/test_backend_cards.py` hold this together, and each fails for a
+Four tests in `test/test_backend_cards.py` keep the table honest, and each fails for a
 different half-done move:
 
-- an entry naming a MEMBER is stale, so leaving it in place after step 3 fails outright —
-  the table may soften a negative, never overrule a membership;
-- every entry must be supported by the deciding set's comment, which names the harness
-  and says the gap is evidence;
-- one test asserts the unmeasured cells are exactly the declared ones. pi's cell is the
-  only one, so removing it means editing that assertion, and the card then has no
-  unmeasured cell.
+- `test_no_declared_unmeasured_entry_names_a_member` — an entry naming a member of the
+  deciding set is stale, so leaving one in place after step 3 fails outright;
+- `test_every_declared_unmeasured_entry_is_supported_by_the_set_comment` — an entry
+  must be backed by the deciding set's comment, which names the harness;
+- `test_every_declared_unmeasured_entry_names_a_real_cell` — an entry must name a line
+  the card really renders;
+- `test_every_cell_on_every_card_is_measured` — asserts the unmeasured cells are the
+  empty set, so it is the one to edit if an entry ever has to be added rather than
+  removed.
 
-`website/scripts/capture-agent-backend-unmeasured.mjs` captures the screenshots that show
-the three marks side by side, and its header names pi as the unmeasured cell and keeps
-goose's pre-capture rows. Update that prose and its pi rows to the card the capture
-produces.
+`website/scripts/capture-agent-backend-unmeasured.mjs` captures the screenshots that
+show the three marks side by side. Its header says `DECLARED_UNMEASURED` is empty and
+keeps the pi and goose rows as each card read before its capture. Leave it alone unless
+your harness gave up an unmeasured cell, in which case keep its pre-capture rows beside
+those and say so in the header.
 
 The frontend needs nothing. `unmeasured_reason` is a machine code labelled in
 `website/src/pages/developer/AgentBackendTab.tsx` and its test drives a stub payload, so
 neither knows which harness carries the cell.
 
-**5. The tests that pin today's answer.** Each one fails until it is moved, which is the
-design:
+**5. The tests that pin the membership.** Each one fails until it is moved, which is
+the design:
 
-- `test/test_manual_compact_gate.py` — an exact-set equality on `ACP_BACKENDS_COMPACT`
-  plus an explicit `not in` assertion for pi;
-- `test/test_acp_capability_sets_leaf.py` — a second exact-set equality on the same set;
-- `test/test_compaction_other_backends.py` — `test_pi_waits_for_a_capture` (the
-  test that says what the bar is), the `UNCLASSIFIED` frozenset and its reason comment,
-  `test_pi_is_the_unclassified_case_today`, and the refusal-arm assertion that
-  names pi as the unclassified example. pi is the only entry, so `UNCLASSIFIED` empties
-  out — the arm itself stays covered by the unknown-id case beside it;
-- `test/test_acp_goose_backend.py` — a block asserting goose's membership in the
-  compaction sets, with the capture named in its docstring;
-- `test/test_agent_sdk_capabilities.py` — no edit expected: it asserts
+- `test/test_manual_compact_gate.py` —
+  `TestCompactCapabilitySet::test_membership_is_the_harnesses_that_answer_the_prompt`
+  is an exact-set equality on `ACP_BACKENDS_COMPACT`. Add the harness to the set and to
+  the docstring that says why each member is in. If the file pins the harness's
+  provider with a `manual_compact_unsupported_backend` check (as
+  `test_deepseek_acp_provider_names_itself` does for the one harness outside), flip it
+  to the passing form that `test_pi_acp_provider_passes` shows;
+- `test/test_acp_capability_sets_leaf.py` — `test_membership_is_unchanged_by_the_move`
+  is a second exact-set equality on the same set;
+- `test/test_compaction_other_backends.py` — add a pair to
+  `TestTheHarnessThatWasDrivenAndProved`, shaped like `test_pi_can_serve_a_manual_compact`
+  and `test_pi_finishes_inside_the_prompt_turn`: one asserts the manual membership, the
+  other the inline membership and `capabilities_for(...).compacts_inline`, if step 3 added
+  it. If the harness was listed in `TestEveryKnownBackendIsClassified.UNCLASSIFIED`,
+  remove it there; that set is empty on main, and the refusal arm stays covered by the
+  unknown-id case in `TestTheRefusalTextSaysWhatHappens`;
+- the harness's own backend test, when it has one — `test/test_acp_goose_backend.py`'s
+  `test_goose_compacts_inline_on_a_driven_capture` is the shape: it asserts both
+  memberships and names the capture in its docstring;
+- `test/test_agent_sdk_capabilities.py` — no edit expected.
+  `test_inline_compaction_is_a_subset_of_manual_compaction` asserts
   `ACP_BACKENDS_INLINE_COMPACTION` is a subset of `ACP_BACKENDS_COMPACT` and of
   `ACP_BACKENDS_KNOWN`. Run it; a subset break there means step 3 added the inline
   membership without the manual one.
 
-**6. The specs.** Two record the current exclusion in prose:
+**6. The specs.** Two record each harness's compaction answer in prose:
 
 - `docs/system-specs/modules/agent-host-contract.md` — the Compaction row of the
-  per-harness table. The pi cell calls its exclusion "conservative rather than
-  evidenced"; a capture is exactly the evidence that sentence was waiting for.
+  per-harness table. Write the harness's cell the way the pi, goose and copilot cells
+  read: where `/compact` runs, what ends the turn, which sets it joins, and the `used`
+  series and fixture path the capture found.
 - `docs/system-specs/modules/session.md` — the compaction-set section, which lists the
-  members and states the capture bar.
+  members of `ACP_BACKENDS_COMPACT` and how they divide by where the done signal lands.
+  Add the harness to that list and to the matching side of the division.
 
 **7. The full local gate**, because the sets are read across the boundary:
 

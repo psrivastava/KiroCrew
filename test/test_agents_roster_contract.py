@@ -4,7 +4,7 @@ Building each row with ``{**dataclasses.asdict(agent_cfg)}`` would make its
 response contract "every field ``KiroCrewAgentConfig`` has, plus every field
 anyone adds later", automatically — a field added by someone who never looked
 at this endpoint would ship to the browser by omission. Both row sources use an
-explicit allowlist instead, mirroring the rule ``handlers/members.py`` already
+explicit allowlist instead, mirroring the rule ``handlers/members_roster.py`` already
 documents for ``GET /api/members``.
 
 These tests are the half that keeps it converted. The key set is pinned as a
@@ -36,7 +36,8 @@ from kiro_crew.dashboard.handlers.agents import (
 )
 
 # The EXACT key set every row carries, from BOTH sources (the ``cfg.agents``
-# rows and the project-scope rows). ``name`` and ``scope`` are handler-added;
+# rows and the project-scope rows). ``name``, ``scope`` and ``owns_mate_file``
+# are handler-added;
 # the rest are allowlisted record fields. Changing this set is a
 # network-boundary contract change: check the frontend consumers first
 # (``website/src/components/AgentSelector.tsx`` declares the ``KiroCrewAgent``
@@ -45,6 +46,7 @@ ROSTER_ROW_KEYS = frozenset(
     {
         "name",
         "scope",
+        "owns_mate_file",
         "kiro_agent",
         "workspace",
         "memory_store",
@@ -59,6 +61,9 @@ ROSTER_ROW_KEYS = frozenset(
     }
 )
 
+# The keys the handler writes rather than copies off the record.
+HANDLER_ADDED_KEYS = frozenset({"name", "scope", "owns_mate_file"})
+
 # Record fields deliberately withheld, each verified to have no consumer in
 # ``website/src``: the two watchdog windows and the compaction default are
 # backend session knobs the roster does not render, ``telegram_account`` is
@@ -69,6 +74,9 @@ ROSTER_ROW_KEYS = frozenset(
 WITHHELD_RECORD_FIELDS = frozenset(
     {
         "member_id",
+        # A crewmate's harness pin: read only by the owner, through
+        # GET /api/agents/resolved-model, never on this roster.
+        "acp_backend",
         "watchdog_tool_stall_suspect_secs",
         "watchdog_tool_stall_hard_cap_secs",
         # Per-agent compaction default: read by the session manager and shown
@@ -79,6 +87,16 @@ WITHHELD_RECORD_FIELDS = frozenset(
         # Shipped on GET /api/members (the profile card's own read), not here:
         # the crew editor echoes this row back, and must not round-trip it.
         "approval_mode",
+        # Same home and same reason: the profile card's dispatched-worker pair,
+        # read by `session_create`, which the crew editor never shows.
+        "worker_model",
+        "worker_reasoning_effort",
+        # The .crewmate provenance stamp (rfc-crewmate-share.md §5.4 step 5):
+        # written once by the import's create, rendered by nothing yet.
+        "imported",
+        # Same home and same reason: the profile card's Dynamic capabilities
+        # preview switch (``kiro_crew.crewmate_dynamic_capabilities``).
+        "dynamic_capabilities",
     }
 )
 
@@ -117,6 +135,8 @@ def _seed_config_with_every_field_set() -> dict:
                 "watchdog_tool_stall_suspect_secs": 111.0,
                 "watchdog_tool_stall_hard_cap_secs": 222.0,
                 "telegram_account": "probe-telegram-binding",
+                "worker_model": "probe-worker-model",
+                "worker_reasoning_effort": "low",
             },
         },
         "default_agent": "roster-probe",
@@ -154,6 +174,7 @@ class TestRosterRowKeySet:
         # to distinctive non-default values.
         assert not (set(row) & WITHHELD_RECORD_FIELDS)
         assert "probe-telegram-binding" not in json.dumps(row)
+        assert "probe-worker-model" not in json.dumps(row)
 
     @pytest.mark.asyncio
     async def test_project_row_ships_the_same_key_set(self, monkeypatch, tmp_path: Path) -> None:
@@ -199,7 +220,7 @@ class TestRosterRowKeySet:
         The row-level tests cover ``redact=`` directly; this one covers the
         WIRING -- that the handler reads the caller class off the request at all.
         A middleware sets ``request["app"]``, which is what ``token_auth`` does
-        for a verified app token and what ``members.py::_deny_app_caller`` reads.
+        for a verified app token and what ``members_access.py::_deny_app_caller`` reads.
         """
         probe = "AKIAIOSFODNN7EXAMPLE"
         seed = _seed_config_with_every_field_set()
@@ -249,7 +270,7 @@ class TestRosterRowIsAnAllowlistNotASpread:
         # stop classifying anything and let the next added field through.
         assert WITHHELD_RECORD_FIELDS <= record_fields
         # And the allowlist must not claim a record field that does not exist.
-        assert ROSTER_ROW_KEYS - {"name", "scope"} <= record_fields
+        assert ROSTER_ROW_KEYS - HANDLER_ADDED_KEYS <= record_fields
 
     def test_an_attribute_the_allowlist_does_not_name_is_dropped(self) -> None:
         """Behavioral proof, not just a literal comparison.
@@ -291,7 +312,12 @@ class TestUnshowableValuesAreMasked:
     """The read half: nothing that cannot be shown verbatim leaves as content."""
 
     PROBE = "AKIAIOSFODNN7EXAMPLE"
-    UNCOERCED_BY_LOADER = ("kiro_agent", "workspace", "memory_store", "description", "source")
+    # The five declared-``str`` record fields a roster row ships besides the
+    # ones with their own inline guard. The loader now pins all of them to
+    # their default on a non-string (``_safe_str``), so the mask below is
+    # defence in depth for a record built some other way, which is why the
+    # test plants the object with ``object.__setattr__`` rather than a load.
+    MASKED_STR_FIELDS = ("kiro_agent", "workspace", "memory_store", "description", "source")
     # ``avatar`` is the ONE structured value a row ships, so the uniform
     # string sweeps below do not apply to it: it is shape-allowlisted by
     # ``_safe_avatar`` with masking confined to user-authored ``traits``
@@ -299,7 +325,7 @@ class TestUnshowableValuesAreMasked:
     # ``TestAvatarIsShapeAllowlistedNotMasked``. Excluded here rather than
     # softening these assertions, so the rule for every other field stays
     # "the sentinel, exactly".
-    RECORD_FIELDS_SHIPPED = tuple(sorted(ROSTER_ROW_KEYS - {"name", "scope", "avatar"}))
+    RECORD_FIELDS_SHIPPED = tuple(sorted(ROSTER_ROW_KEYS - HANDLER_ADDED_KEYS - {"avatar"}))
 
     def _full(self) -> KiroCrewAgentConfig:
         return KiroCrewAgentConfig(
@@ -326,9 +352,9 @@ class TestUnshowableValuesAreMasked:
             assert _carries_mask(row[field]), f"{field} should be the sentinel"
 
     @pytest.mark.parametrize("redact", [False, True])
-    @pytest.mark.parametrize("field", UNCOERCED_BY_LOADER)
+    @pytest.mark.parametrize("field", MASKED_STR_FIELDS)
     def test_a_non_string_is_masked_not_emptied(self, field: str, redact: bool) -> None:
-        """The loader lets an object through five declared-`str` fields.
+        """A non-string that reaches a row is masked, whatever put it there.
 
         Masking rather than coercing to `""` is what lets the write-side rule
         PRESERVE it: an echoed `""` would read as a genuine edit and overwrite the
@@ -344,16 +370,21 @@ class TestUnshowableValuesAreMasked:
         """`dict[str, object]` is honest about exactly one field, not a loophole.
 
         Every value is a `str` but `avatar`, which is a `dict` the dashboard needs
-        verbatim. Asserting the exception BY NAME means a second structured field
-        cannot appear without this test failing.
+        verbatim, and `owns_mate_file`, a handler-computed `bool`. Asserting the
+        exceptions BY NAME means another non-string field cannot appear without
+        this test failing.
         """
         cfg = KiroCrewAgentConfig()
         object.__setattr__(cfg, "description", {"nested": "object"})
         for redact in (False, True):
             row = _agent_roster_row("probe", "global", cfg, redact=redact)
             assert isinstance(row["avatar"], dict)
+            assert row["owns_mate_file"] is False
             non_str = {k for k, v in row.items() if not isinstance(v, str)}
-            assert non_str == {"avatar"}, f"unexpected structured value(s): {non_str}"
+            assert non_str == {
+                "avatar",
+                "owns_mate_file",
+            }, f"unexpected non-string value(s): {non_str}"
 
     def test_owner_keeps_name_addressable_but_app_token_does_not_need_it(self) -> None:
         """``name`` survives only where something can actually address it.

@@ -643,6 +643,43 @@ describe('RemoteCrewPanel — AWS prerequisites', () => {
     expect(await screen.findByRole('button', { name: /Copied/ })).toBeInTheDocument()
   })
 
+  it('names the second policy when the edition attaches host policies', async () => {
+    // The main policy has no room for the host-policy grant, so a user who copies
+    // only it would launch into a denied attach; the gateway's notice says so.
+    vi.mocked(api.listInstances).mockResolvedValue(list([]))
+    vi.mocked(api.cloudPreflight).mockResolvedValue({ ...PREFLIGHT_OK, cloudformation_reachable: false })
+    vi.mocked(api.cloudIamPolicy).mockResolvedValue({
+      policy: '{"Version":"2012-10-17"}',
+      host_policies: '{"Version":"2012-10-17","Statement":[]}',
+      host_policies_notice: 'apply a second policy: kirocrew cloud iam-policy --host-policies',
+    })
+    const u = setup()
+    renderWithProviders(<RemoteCrewPanel />)
+    await openSetupTab(u)
+
+    await u.click(await screen.findByRole('button', { name: /Copy policy JSON/ }))
+    await waitFor(() => expect(copyToClipboard).toHaveBeenCalledWith('{"Version":"2012-10-17"}'))
+    // Status beside the button, not an error: the copy succeeded.
+    const notice = await screen.findByText(/iam-policy --host-policies/)
+    expect(notice).toHaveAttribute('role', 'status')
+    expect(notice.closest('[role="alert"]')).toBeNull()
+  })
+
+  it('shows a second policy the gateway could not build as an error', async () => {
+    vi.mocked(api.listInstances).mockResolvedValue(list([]))
+    vi.mocked(api.cloudPreflight).mockResolvedValue({ ...PREFLIGHT_OK, cloudformation_reachable: false })
+    vi.mocked(api.cloudIamPolicy).mockResolvedValue({
+      policy: '{"Version":"2012-10-17"}',
+      host_policies_error: "the edition's instance-role policy is invalid",
+    })
+    const u = setup()
+    renderWithProviders(<RemoteCrewPanel />)
+    await openSetupTab(u)
+
+    await u.click(await screen.findByRole('button', { name: /Copy policy JSON/ }))
+    expect(await screen.findByText(/instance-role policy is invalid/)).toBeInTheDocument()
+  })
+
   it('surfaces a failure to fetch the IAM policy rather than silently copying nothing', async () => {
     vi.mocked(api.listInstances).mockResolvedValue(list([]))
     vi.mocked(api.cloudPreflight).mockResolvedValue({ ...PREFLIGHT_OK, cloudformation_reachable: false })
@@ -785,7 +822,7 @@ describe('RemoteCrewPanel — launching', () => {
 
 describe('RemoteCrewPanel — disabled feature gate', () => {
   it('enables the feature, reports progress, then asks for a restart', async () => {
-    vi.mocked(api.listInstances).mockRejectedValue(new ApiError(403, 'instances feature is disabled'))
+    vi.mocked(api.listInstances).mockRejectedValue(new ApiError(403, 'instances feature is disabled', JSON.stringify({ error: 'instances feature is disabled', code: 'instances_disabled' })))
     let release: (v: unknown) => void = () => {}
     vi.mocked(api.patchConfig).mockReturnValue(new Promise(r => { release = r }) as never)
     const u = setup()
@@ -803,7 +840,7 @@ describe('RemoteCrewPanel — disabled feature gate', () => {
   })
 
   it('surfaces a failure to write the config', async () => {
-    vi.mocked(api.listInstances).mockRejectedValue(new ApiError(403, 'instances feature is disabled'))
+    vi.mocked(api.listInstances).mockRejectedValue(new ApiError(403, 'instances feature is disabled', JSON.stringify({ error: 'instances feature is disabled', code: 'instances_disabled' })))
     vi.mocked(api.patchConfig).mockRejectedValue(new ApiError(423, 'config is locked'))
     const u = setup()
     renderWithProviders(<RemoteCrewPanel />)
@@ -812,8 +849,18 @@ describe('RemoteCrewPanel — disabled feature gate', () => {
     expect(await screen.findByText(/config is locked/, undefined, { timeout: 5_000 })).toBeInTheDocument()
   })
 
+  it('keys the disabled card on the instances_disabled code, not on the message text', async () => {
+    // A 403 that says "disabled" without the code is not the feature gate: it
+    // shows as a load error. The code alone opens the enable card.
+    vi.mocked(api.listInstances).mockRejectedValue(new ApiError(403, 'account disabled by policy'))
+    const first = renderWithProviders(<RemoteCrewPanel />)
+    expect(await screen.findByText('account disabled by policy', undefined, { timeout: 5_000 })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /Enable remote crew management/ })).not.toBeInTheDocument()
+    first.unmount()
+  })
+
   it('treats a non-403 failure as a load error, not a disabled feature', async () => {
-    // Only a 403 mentioning "disabled" is the gate. Any other failure must keep
+    // Only the instances_disabled 403 is the gate. Any other failure must keep
     // the panel intact so the user is not told to enable something already on.
     vi.mocked(api.listInstances).mockRejectedValue(new ApiError(403, 'owner only'))
     const u = setup()

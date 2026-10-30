@@ -64,12 +64,13 @@ class TestMemberRulesStorage:
         write_member_rules(CREW, member=CREW, text="Never merge PRs.\nAsk before spending money.")
         assert read_member_rules(CREW, CREW) == "Never merge PRs.\nAsk before spending money."
 
-    def test_rules_live_inside_the_trust_subtree(self):
+    def test_rules_live_inside_the_member_records_leaf(self):
         """The rules ARE the boundary the member must not rewrite for itself,
-        so they cannot sit inside the agent-writable member dir."""
+        so they sit in the gateway-only leaf, never the agent-writable member dir."""
         write_member_rules(CREW, member=CREW, text="rule")
         path = member_rules_path(CREW)
-        assert "trust" in path.parts
+        assert "member-records" in path.parts
+        assert "trust" not in path.parts
         assert path.is_file()
         assert not (member_dir(CREW) / path.name).exists()
 
@@ -581,6 +582,24 @@ class TestMemberSectionInjection:
         assert "[MEMBER IDENTITY]" in full
         assert "Never merge PRs." in full
 
+    def test_upkeep_pointer_reinjected_after_compaction(self, tmp_path):
+        """The pointer rides the member section, so a compaction cannot drop it."""
+        from kiro_crew import dashboard_upkeep
+        from kiro_crew.dashboard_templates import instance
+
+        # An ADOPTED page: an unadopted one shows the suggestions page and offers no upkeep.
+        instance.adopt("code-reviewer", "project-report")
+        with patch("kiro_crew.context.KiroCrewConfig.load", return_value=_fake_config()):
+            full, _ = _builder(tmp_path).build_message(
+                "hello again",
+                False,  # not a new session
+                "dashboard:member-code-reviewer",
+                agent=CREW,
+                member=CREW,
+                needs_reinjection=True,
+            )
+        assert dashboard_upkeep.POINTER in full
+
     def test_minimal_member_reinjection_withholds_member_section(self, tmp_path):
         write_member_rules(CREW, member=CREW, text="Never merge PRs.")
         with patch("kiro_crew.context.KiroCrewConfig.load", return_value=_fake_config()):
@@ -828,7 +847,7 @@ class TestMemberSectionInjection:
             assert "members" in ctx  # briefing path points inside the members root
 
     def test_behavior_layer_carries_the_working_protocol(self):
-        # The five protocol clauses the design fixed; a rewrite that drops one
+        # The six protocol clauses the design fixed; a rewrite that drops one
         # should fail here by name, not by silent omission.
         for needle in (
             "not a Q&A bot",
@@ -836,6 +855,7 @@ class TestMemberSectionInjection:
             "escalate ONLY at a true wall",
             "ZERO context",
             "quiet cycle is a successful cycle",
+            "Every word you write as text is shown to the user",
             "[CURRENT ASSIGNMENT]",
         ):
             assert needle in _MEMBER_HOW_YOU_WORK, needle

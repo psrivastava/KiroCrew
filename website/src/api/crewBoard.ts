@@ -18,8 +18,9 @@
 export type WorkItemState = 'open' | 'accepted' | 'rejected' | 'abandoned'
 
 /** What the worker last said about itself — the worker's column. `null` before
- *  its first report, which is not the same as "fine". */
-export type WorkReportStatus = 'progress' | 'done' | 'blocked' | 'question' | null
+ *  its first report, which is not the same as "fine". `reply` is written only
+ *  while the `work_ledger.remote_dispatch` preview is on. */
+export type WorkReportStatus = 'progress' | 'done' | 'blocked' | 'question' | 'reply' | null
 
 /** `accept_eval.py`'s own five values, carried through without translation. */
 export type WorkVerdict = 'pass' | 'fail' | 'pending' | 'refused' | 'error' | null
@@ -62,12 +63,19 @@ export interface WorkBoardItem {
   last_report_at: string | null
   created_at: string
   closed_at: string | null
+  /** When the conductor last answered with `decide`. A decision at or after the
+   *  last report hands a blocked or question item back to the worker. */
+  decided_at: string | null
   /** Nothing is left to read this item's reports. */
   orphaned: boolean
   /** The move is with the worker and it has gone quiet. */
   stale: boolean
   /** The bar is one `accept_eval.py` can actually evaluate. */
   acceptance_concrete: boolean
+  /** The worker's last `work_report` / `work_brief` call never reached the
+   *  ledger (the harness could not deliver it) and nothing has landed since.
+   *  Derived from the worker's transport, not something it wrote. */
+  report_undelivered?: { tool: 'work_report' | 'work_brief'; at: string } | null
   /** A question with no NEWER answering decision. Lifts the row into the band. */
   outstanding: boolean
   terminal: boolean

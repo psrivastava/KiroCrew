@@ -17,9 +17,10 @@ vi.mock('@radix-ui/react-popover', async () => await import('./__mocks__/@radix-
 import { screen } from '@testing-library/react'
 import ChatInput from '../components/ChatInput'
 import { createTestStore, renderWithProviders } from './helpers'
+import { readIndexCss } from './indexCssSource'
 import type { RootState } from '../store'
 
-const INDEX_CSS = readFileSync(resolve(process.cwd(), 'src/index.css'), 'utf-8')
+const INDEX_CSS = readIndexCss()
 const CHAT_INPUT_SRC = readFileSync(resolve(process.cwd(), 'src/components/ChatInput.tsx'), 'utf-8')
 // The composer's owners under chat-input/ carry its markup too: a focus form must
 // not come back through any of them.
@@ -122,7 +123,7 @@ describe('composer liquid glass', () => {
     // second line under the pane.
     // Neither the shelf nor the fade is its own stacking context: the
     // `z-index: -1` layer resolves against the dock's input-area wrapper
-    // (ChatPage's `relative z-10 dock-inert`), so it sits BEHIND the pane's
+    // (ComposerDockView's `relative z-10 dock-inert`), so it sits BEHIND the pane's
     // shadow (a fade painted over the shadow whitened it out part-way and left
     // a bright band under the pane), above the transcript and below the chips;
     // that wrapper is also its containing block, so it spans the dock root --
@@ -246,7 +247,7 @@ describe('composer liquid glass', () => {
     // read as a white frame, not as light (issue #18314).
     expect(INDEX_CSS).toContain('.glass-accent { --glass-tint: color-mix(in srgb, var(--accent) 14%, var(--glass-tint-step)); --glass-band: color-mix(in srgb, var(--accent) 14%, var(--glass-band-plain)); }')
     expect(INDEX_CSS).toContain('.glass-warn { --glass-tint: color-mix(in srgb, var(--warn) 12%, var(--glass-tint-step)); --glass-band: color-mix(in srgb, var(--warn) 12%, var(--glass-band-plain)); }')
-    // The top bar's readout capsule while the gateway is offline (App.tsx).
+    // The top bar's readout capsule while the gateway is offline (shellHeader.tsx).
     expect(INDEX_CSS).toContain('.glass-danger { --glass-tint: color-mix(in srgb, var(--danger) 12%, var(--glass-tint-step)); --glass-band: color-mix(in srgb, var(--danger) 12%, var(--glass-band-plain)); }')
     // The neutral steps leave the band alone.
     expect(INDEX_CSS).toContain('.glass-faded { --glass-tint: color-mix(in srgb, var(--glass-tint-step) 55%, transparent); }')

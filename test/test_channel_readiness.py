@@ -36,6 +36,12 @@ class TestDescriptorData:
             "MICROSOFT_APP_ID",
             "MICROSOFT_APP_PASSWORD",
         }
+        # The Teams tenant is restart-relevant but NOT a readiness credential:
+        # an unset tenant is the supported multi-tenant mode, so it must not
+        # read as missing. It lives in restart_credentials, which the live-reload
+        # matcher unions in but readiness ignores.
+        assert by_name["teams"].restart_credentials == ("MICROSOFT_APP_TENANT_ID",)
+        assert "MICROSOFT_APP_TENANT_ID" not in by_name["teams"].credentials
         assert set(by_name["slack"].credentials) == {"SLACK_APP_TOKEN", "SLACK_BOT_TOKEN"}
 
     def test_imessage_declares_no_credential_because_it_has_none(self) -> None:
@@ -65,6 +71,20 @@ class TestReadiness:
             )
         }
         assert rows["telegram"].ready is True
+
+    def test_teams_is_ready_without_a_tenant_multi_tenant_mode(self) -> None:
+        # Tenant unset is the supported multi-tenant mode, so Teams with its app
+        # id and password is READY even though no tenant is set -- the tenant is
+        # a restart_credentials entry, not a readiness credential.
+        rows = {
+            r.channel_type: r
+            for r in channel_readiness(
+                _cfg(teams=SimpleNamespace(enabled=True, app_id="")),
+                {"MICROSOFT_APP_ID": "app", "MICROSOFT_APP_PASSWORD": "pw"},
+            )
+        }
+        assert rows["teams"].ready is True
+        assert "MICROSOFT_APP_TENANT_ID" not in rows["teams"].missing_credentials
 
     def test_a_two_credential_channel_reports_only_what_is_missing(self) -> None:
         rows = {
@@ -275,11 +295,16 @@ def _credentials_the_gateway_requires() -> dict[str, set[str]]:
 
     import kiro_crew as kiro_crew_pkg
 
-    src = (Path(kiro_crew_pkg.__file__).parent / "slack" / "gateway.py").read_text(encoding="utf-8")
-    tree = ast.parse(src)
+    # The facade and the owners it composes (the hoists live in
+    # gateway_runtime/channel_boot.py), read as one.
+    facade = Path(kiro_crew_pkg.__file__).parent / "slack" / "gateway.py"
+    trees = [
+        ast.parse(path.read_text(encoding="utf-8"))
+        for path in (facade, *sorted((facade.parent / "gateway_runtime").glob("*.py")))
+    ]
     cred_of: dict[str, str] = {}
     required: dict[str, set[str]] = {}
-    for node in ast.walk(tree):
+    for node in (node for tree in trees for node in ast.walk(tree)):
         if not isinstance(node, ast.Assign) or len(node.targets) != 1:
             continue
         name = getattr(node.targets[0], "attr", None)

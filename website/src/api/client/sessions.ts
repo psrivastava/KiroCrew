@@ -91,6 +91,11 @@ export function createSessionsEndpoints({ get, post, del, j, jfetch: fetch, jCre
     claudeSessionDelete: (uuid: string) =>
       fetch('/api/claude-sessions/' + encodeURIComponent(uuid), { method: 'DELETE' }).then(j) as Promise<{ uuid: string; deleted: boolean }>,
     sessionsSearch: (q: string, limit = 50) => fetch('/api/sessions/search?q=' + encodeURIComponent(q) + '&limit=' + limit).then(j),
+    // Every transcript, open or closed, minted under one short name (`chat-7`),
+    // oldest first. A slot number is reused across gateway generations, so one
+    // name can match several.
+    sessionsNamed: (name: string) => fetch('/api/sessions?limit=200&name=' + encodeURIComponent(name))
+      .then(j) as Promise<{ sessions: Array<{ key: string; title?: string }> }>,
   }
 
   const historyDetail = {
@@ -101,7 +106,7 @@ export function createSessionsEndpoints({ get, post, del, j, jfetch: fetch, jCre
     sessionMeta: (key: string) => fetch('/api/sessions/' + encodeURIComponent(key) + '/meta')
       .then(r => (r.status === 404 ? null : j(r))) as Promise<{ key: string; title?: string } | null>,
     deleteSession: (key: string) => del('/api/sessions/' + encodeURIComponent(key)).then(j),
-    clearSessions: () => del('/api/sessions').then(j),
+    clearSessions: (userOnly = false) => del('/api/sessions' + (userOnly ? '?user_only=1' : '')).then(j),
   }
 
   const crewBoard = {

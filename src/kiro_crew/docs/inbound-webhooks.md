@@ -15,7 +15,7 @@ behind one per-device switch:
 
 **Settings > Developer > Feature Previews** — switch **Webhooks** on. A
 **Webhooks** row appears in the sidebar immediately (and an "Open Webhooks"
-link on the feature's own card). Developer Mode is NOT required.
+link on the feature's own card).
 
 Nothing about the API changes either way — tokens, the kill switch, and delivery
 all behave the same whether the page is visible or not. The one consequence is
@@ -369,6 +369,13 @@ This is the same model subagents use, and it is why the `sessionKey` is a routin
 key rather than a handle: two calls with the same `sessionKey` are two unrelated
 turns, not a thread. Anything the second turn needs to know, the first turn has
 to have written down.
+
+Before the first prompt of a new session, the run waits up to 30 seconds for
+every MCP server the agent spec declares to report that it started, failed or
+needs authorization. Nobody can reconnect a slow server by hand in a webhook
+run. A run that still lacks a declared server ends with outcome `degraded`
+instead of `completed`, and its detail names the server. The run list and the
+notification show it, so you can see which run to retry.
 
 When the turn ends, the result is redacted for credentials and exfiltration URLs
 before it leaves the gateway. Delivery, when `deliver` is true, is a dashboard

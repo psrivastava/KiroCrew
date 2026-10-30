@@ -44,6 +44,24 @@ logger = logging.getLogger("kiro_crew.acp.runtime")
 _COLD_START_MAX_CONCURRENT = 2
 
 
+def _refuse_without_containment() -> None:
+    """Fail closed when Shared Crew's hard-limit mode finds containment missing.
+
+    The backstop under every runtime spawn and ``session/new``, including entry
+    points that never reach the fair admission gate: with
+    ``dashboard.shared_crew.hard_limits`` on and the last containment probe
+    refusing, no runtime starts. An in-memory read; with the mode off, or no
+    probe yet, it does nothing.
+    """
+    try:
+        from kiro_crew.shared_crew.containment import ContainmentUnavailable, hard_mode_refusal
+    except Exception:  # pragma: no cover - import failure never blocks a start
+        return
+    reason = hard_mode_refusal()
+    if reason is not None:
+        raise ContainmentUnavailable(reason)
+
+
 class _ColdStartAdmission:
     """Loop-affine admission state for runtime spawn + initialize.
 
@@ -66,6 +84,7 @@ class _ColdStartAdmission:
     async def acquire(self, priority: StartPriority) -> float:
         from kiro_crew.acp.runtime import time
 
+        _refuse_without_containment()
         started = time.monotonic()
         await self.semaphore.acquire(priority)
         return (time.monotonic() - started) * 1000.0
@@ -244,6 +263,7 @@ class SessionStartGate:
     async def acquire(self, priority: StartPriority = StartPriority.BACKGROUND) -> "StartPermit":
         from kiro_crew.acp.runtime import time
 
+        _refuse_without_containment()
         started = time.monotonic()
         await self.semaphore.acquire(priority)
         return StartPermit(self, (time.monotonic() - started) * 1000.0, priority)
@@ -643,7 +663,7 @@ def _resolve_session_start_timeout() -> float:
     """Snapshot ``agent.session_start_timeout_secs`` from config.
 
     Function-level import (mirrors ``_load_watchdog_settings`` in
-    session_handle.py) avoids the config -> dashboard -> acp import cycle;
+    session_handle_watchdog.py) avoids the config -> dashboard -> acp import cycle;
     any failure falls back to the built-in default rather than breaking a
     runtime. The loader clamps the on-disk value to
     [SESSION_START_TIMEOUT_MIN, SESSION_START_TIMEOUT_MAX]; the ``max`` here

@@ -66,6 +66,16 @@ export interface ChatConfig {
    *  <name>" affordance those folders have, so it is the user's call rather than
    *  something a client with no stored config inherits. */
   hideEmptyFolderBody: boolean
+  /** While the session list scrolls, titles the rows clip are shown in full
+   *  in a floating layer over them; rows keep their width (desktop only).
+   *  Off by default. */
+  fullTitlesOnScroll: boolean
+  /** Opt in to a plain click on a sidebar session giving it its own session
+   *  tab, as the row menu's "Open in a session tab" does, instead of replacing
+   *  the session in the active tab. Default false: the replace is what keeps
+   *  the tab strip hidden until a user asks for a second tab, so a client with
+   *  no stored config keeps it. */
+  sidebarClickOpensTab: boolean
   /** Which pane edge hosts the turn minimap. The right-edge variant replaces
    *  the native scrollbar while the rail is shown. */
   minimapSide: MinimapSide
@@ -87,6 +97,10 @@ export interface ChatConfig {
    *  than something a client with no stored config inherits. The pencil button
    *  is the edit path either way. */
   doubleClickToEdit: boolean
+  /** Move the transcript to the bottom when you send (#25754). Default true.
+   *  When false a send leaves the view where it is; following a streaming reply
+   *  while you are already at the bottom is unchanged. */
+  scrollOnSend: boolean
   /** Fade split-view panes that do not hold keyboard focus. Default true. When
    *  false every pane stays at full brightness; the focused pane's accent
    *  border still marks where keyboard input goes. */
@@ -118,7 +132,7 @@ const LS_KEY = 'mc-chat-config'
  *  it. The sidebar's view toggle persists this flag BEFORE creating its first
  *  column, so a deliberate board user always has an explicit `true` stored and
  *  is unaffected by the default. */
-const DEFAULTS: ChatConfig = { historyExpanded: true, showTimestamps: true, showTurnStats: true, sendOnEnter: 'enter', collapseAllSteps: true, confirmCloseSession: false, simplifiedToolNames: true, contentWidth: 'compact', tagColumnsEnabled: false, fileChipStyle: 'expanded', followUpLayout: 'scroll', streamMode: 'smooth', showContextPct: false, showContextTokens: false, pinLastPrompt: true, hideEmptyFolderBody: false, spellcheck: true, inlineMarkdown: false, showFullPastes: false, toolCallsStartExpanded: false, doubleClickToEdit: false, dimInactivePanes: true, minimapSide: 'left', messageFontSize: DEFAULT_MESSAGE_FONT_SIZE }
+const DEFAULTS: ChatConfig = { historyExpanded: true, showTimestamps: true, showTurnStats: true, sendOnEnter: 'enter', collapseAllSteps: true, confirmCloseSession: false, simplifiedToolNames: true, contentWidth: 'compact', tagColumnsEnabled: false, fileChipStyle: 'expanded', followUpLayout: 'scroll', streamMode: 'smooth', showContextPct: false, showContextTokens: false, pinLastPrompt: true, hideEmptyFolderBody: false, sidebarClickOpensTab: false, spellcheck: true, inlineMarkdown: false, showFullPastes: false, toolCallsStartExpanded: false, doubleClickToEdit: false, scrollOnSend: true, dimInactivePanes: true, minimapSide: 'left', messageFontSize: DEFAULT_MESSAGE_FONT_SIZE, fullTitlesOnScroll: false }
 
 const clampMessageFontSize = (n: number): number =>
   Math.max(MIN_MESSAGE_FONT_SIZE, Math.min(MAX_MESSAGE_FONT_SIZE, Math.round(n)))
@@ -162,6 +176,10 @@ export function loadChatConfig(): ChatConfig {
     // Coerced, not trusted: a stored non-boolean would otherwise make the empty
     // folder shape depend on a truthy string.
     if (typeof cfg.hideEmptyFolderBody !== 'boolean') cfg.hideEmptyFolderBody = false
+    if (typeof cfg.fullTitlesOnScroll !== 'boolean') cfg.fullTitlesOnScroll = false
+    // Coerced, not trusted: a stored non-boolean must not decide whether a
+    // sidebar click opens a tab.
+    if (typeof cfg.sidebarClickOpensTab !== 'boolean') cfg.sidebarClickOpensTab = false
     // Coerced, not trusted: a stored non-boolean would otherwise let a truthy
     // string turn off paste collapsing, which is the main-thread guard for a
     // very large paste.
@@ -170,6 +188,7 @@ export function loadChatConfig(): ChatConfig {
     // Coerced, not trusted: a stored non-boolean must not attach the
     // double-click gesture that replaces word selection on the bubble.
     if (typeof cfg.doubleClickToEdit !== 'boolean') cfg.doubleClickToEdit = false
+    if (typeof cfg.scrollOnSend !== 'boolean') cfg.scrollOnSend = true
     if (typeof cfg.dimInactivePanes !== 'boolean') cfg.dimInactivePanes = true
     if (cfg.minimapSide !== 'left' && cfg.minimapSide !== 'right') cfg.minimapSide = 'left'
     cfg.messageFontSize = typeof cfg.messageFontSize === 'number' ? clampMessageFontSize(cfg.messageFontSize) : DEFAULT_MESSAGE_FONT_SIZE
@@ -344,9 +363,13 @@ export interface DashboardConfig {
   link_patterns: { pattern: string; url: string }[]
   mcp_app_panel: boolean
   auto_open_git_panel: boolean
+  side_panel_always_open?: boolean
+  side_panel_pin_summary?: boolean
   session_card_source_links: boolean
   /** Directory each new chat gets its own fresh folder under; '' = off. */
   session_folder_root?: string
+  /** Sidebar folder ID new chats are filed into when started without one; '' = unfiled. */
+  default_session_folder?: string
   folder_suggestions_enabled: boolean
   topic_tags_enabled?: boolean
   model_picker_hidden_models: string[]

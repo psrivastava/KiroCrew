@@ -11,6 +11,7 @@ import { findReport } from '../utils/errorReport'
 import ErrorNotice, { ErrorNoticeMenuItem } from './ErrorNotice'
 import { DropdownMenuSub, DropdownMenuSubTrigger, DropdownMenuSubContent, DropdownMenuItem, DropdownMenuSeparator } from './ui/dropdown-menu'
 import { ContextMenuSub, ContextMenuSubTrigger, ContextMenuSubContent, ContextMenuItem, ContextMenuSeparator } from './ui/context-menu'
+import { slotRowByKey } from '../store/slotIndex'
 
 type SourceLink = NonNullable<ChatSlot['source_links']>[number]
 const unlinkKey = (slotKey: string) => ['unlink-source-link', slotKey]
@@ -90,7 +91,7 @@ export default function SourceLinksSubmenu({ slotKey, variant }: {
   const errorId = useId()
   const connected = useConnected()
   const store = useAppStore()
-  const slot = useAppSelector(s => s.dashboard.slots.find(x => x.key === slotKey))
+  const slot = useAppSelector(s => slotRowByKey(s.dashboard.slots, slotKey))
   const links = slot?.source_links ?? []
   const total = slot?.source_links_total
   // Stable identity of the session CURRENTLY behind ``slotKey``. It must change
@@ -221,10 +222,13 @@ export default function SourceLinksSubmenu({ slotKey, variant }: {
   const error = unlinkError ?? allLinks.error
   const rawError = error instanceof Error ? error.message : String(error ?? '')
   // A walk that stopped on a failure says how far it got inside the same
-  // alert, so the count reaches the notice's report and the hand-off.
+  // alert, so the count reaches the notice's report and the hand-off. The
+  // retry line names where to retry instead of the generic "Could not hide.
+  // Try again.", which read as contradicting the count before it. It names
+  // this menu rather than "Hide all", because one chip left hides that entry.
   const message = unlinkError
     ? walkStopped
-      ? `${i18nT('pages.chatSidebar.hide_all_source_links_stopped', { done: walkStopped.done, n: walkStopped.total })} ${i18nT('pages.chatSidebar.unlink_source_link_failed')}`
+      ? `${i18nT('pages.chatSidebar.hide_all_source_links_stopped', { done: walkStopped.done, n: walkStopped.total })} ${i18nT('pages.chatSidebar.hide_all_source_links_retry')}`
       : i18nT('pages.chatSidebar.unlink_source_link_failed')
     : allLinks.error ? i18nT('pages.chatSidebar.source_links_expand_failed') : null
   const shown = allLinks.data ?? links

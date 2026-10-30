@@ -8,7 +8,8 @@
 import { fileURLToPath, URL } from 'node:url'
 import { defineConfig, type Plugin } from 'vite'
 /// <reference types="vitest" />
-import react from '@vitejs/plugin-react'
+import react, { reactCompilerPreset } from '@vitejs/plugin-react'
+import babel from '@rolldown/plugin-babel'
 import tailwindcss from '@tailwindcss/vite'
 import { readFileSync, writeFileSync, existsSync, readdirSync } from 'fs'
 import { execSync } from 'child_process'
@@ -24,6 +25,7 @@ import { precompressPlugin } from './scripts/precompress.mjs'
 import { atomicPublishPlugin } from './scripts/publish-dist.mjs'
 import { uiAutoStampPlugin } from './scripts/lib/ui-auto-stamp.mjs'
 import { CONTEXT_SINGLETON_DEDUPE } from './vite.shared'
+import { REACT_COMPILER_OPTIONS, reactCompilerIdFilter } from './react-compiler.config.mjs'
 import { resolveBuildBase, vendorImportMap, withoutServiceWorker } from './scripts/lib/basePath.mjs'
 import {
   parseBrandingConfig,
@@ -34,6 +36,16 @@ import {
 
 /** Shape produced by parseBrandingConfig (editionShell.mjs is untyped .mjs). */
 type EditionBranding = { title?: string; themeColor?: string }
+
+/**
+ * The React Compiler Babel pass, scoped to the listed files. An empty list
+ * adds no plugin, so no module goes through Babel.
+ */
+function reactCompilerPlugins() {
+  const include = reactCompilerIdFilter(fileURLToPath(new URL('.', import.meta.url)))
+  if (!include) return []
+  return [babel({ include, presets: [reactCompilerPreset(REACT_COMPILER_OPTIONS)] })]
+}
 
 const pkg = JSON.parse(readFileSync('./package.json', 'utf-8'))
 const backendPort = process.env.KIROCREW_PORT || 5476
@@ -300,6 +312,74 @@ function swVersionPlugin(): Plugin {
       } catch (e: unknown) {
         // Only tolerate sw.js not existing (library mode, test builds).
         // Anything else is a real bug — surface it.
+        if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e
+      }
+    },
+  }
+}
+
+/**
+ * Post-build plugin: writes `build-id.json` into the build's output dir,
+ * stamping the build identity of the SPA bundle. Runs during `vite build`
+ * only (not the dev server). It writes into the RESOLVED `config.build.outDir`
+ * so the stamp rides atomicPublishPlugin's scratch-and-publish (see below),
+ * and the file is staged into the Python package by the same
+ * `cp -R website/dist ...` every packaging path already runs.
+ *
+ * WHY: the gateway serves a gitignored, build-copied `dist/`. Nothing verifies
+ * that the served bundle matches the backend it belongs to, so a restart that
+ * did not rebuild/copy the frontend serves an OLD bundle silently. The backend
+ * reads this stamp at startup and warns (never shuts down) when the dist was
+ * built from a different website/ tree than the running backend — see
+ * src/kiro_crew/dashboard/stale_bundle_guard.py.
+ *
+ * `buildId` reuses the exact identity swVersionPlugin computes
+ * (`${pkg.version}-${gitShortSha}`) for display; `websiteTree` is the compared
+ * identity. If git is unavailable or website/ is dirty, `websiteTree` is "" and
+ * the backend guard skips silently rather than false-warning.
+ */
+function buildIdPlugin(): Plugin {
+  // The resolved outDir, captured in configResolved: atomicPublishPlugin
+  // (enforce: 'post') builds into a scratch sibling of the live dist and
+  // publishes it in its own post-order closeBundle, AFTER this hook runs. A
+  // hardcoded `dist/build-id.json` would stamp the OLD live tree, which the
+  // scratch publish then replaces with an unstamped bundle — the stamp would
+  // never reach the published dist and the backend guard would silently skip.
+  // Writing into config.build.outDir (the scratch dir) means the stamp rides
+  // the atomic publish, exactly as swVersionPlugin stamps sw.js.
+  let outDir = ''
+  let configRoot = ''
+  return {
+    name: 'kirocrew-build-id',
+    apply: 'build',
+    configResolved(config) {
+      configRoot = config.root
+      outDir = path.resolve(config.root, config.build.outDir)
+    },
+    closeBundle() {
+      const outPath = path.resolve(outDir, 'build-id.json')
+      // Short SHA for the human-facing id, matching swVersionPlugin's
+      // `${version}-${shortSha}` scheme. The compared identity is the git tree
+      // id of website/ (HEAD:website) -- the same one
+      // frontend._write_build_source_fingerprint records -- so a backend-only
+      // commit does not make this bundle look stale. Stamped ONLY when website/
+      // is clean: a dirty build compiled content HEAD:website does not
+      // describe. An empty websiteTree (dirty tree, or git unavailable) tells
+      // the backend guard to skip rather than warn.
+      let sha = ''
+      let websiteTree = ''
+      try {
+        const repoRoot = path.resolve(configRoot, '..')
+        sha = execSync('git rev-parse HEAD', { cwd: repoRoot, encoding: 'utf-8' }).trim()
+        const dirty = execSync('git status --porcelain -- website', { cwd: repoRoot, encoding: 'utf-8' }).trim()
+        if (!dirty) websiteTree = execSync('git rev-parse HEAD:website', { cwd: repoRoot, encoding: 'utf-8' }).trim()
+      } catch {}
+      const buildId = sha ? `${pkg.version}-${sha.slice(0, 7)}` : pkg.version
+      try {
+        writeFileSync(outPath, JSON.stringify({ buildId, websiteTree }, null, 2) + '\n')
+      } catch (e: unknown) {
+        // outDir missing (library mode, test builds) is the only tolerated
+        // case; anything else is a real bug — surface it.
         if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e
       }
     },
@@ -698,7 +778,11 @@ export default defineConfig({
       readFile: (f: string) => readFileSync(f, 'utf-8'),
       exists: existsSync,
     }),
-    react(), tokenProxyPlugin(), appImportMapPlugin(), vendorRuntimePlugin(), excalidrawFontsPlugin(), swVersionPlugin(), editionExtensionPlugin(), editionLanguagesPlugin(), tailwindcss(), bundleReportPlugin(), appWindowUrls(), precompressPlugin(), atomicPublishPlugin()],
+    // React Compiler on the opt-in list in react-compiler.config.mjs only, so
+    // the Babel pass costs per listed file instead of per module. After the
+    // stamp (it reads source offsets), before react() (it needs JSX intact).
+    ...reactCompilerPlugins(),
+    react(), tokenProxyPlugin(), appImportMapPlugin(), vendorRuntimePlugin(), excalidrawFontsPlugin(), swVersionPlugin(), buildIdPlugin(), editionExtensionPlugin(), editionLanguagesPlugin(), tailwindcss(), bundleReportPlugin(), appWindowUrls(), precompressPlugin(), atomicPublishPlugin()],
   // Worker bundles do not inherit `plugins`; the hljs worker needs the edition
   // languages module (see editionLanguagesPlugin).
   worker: { plugins: () => [editionLanguagesPlugin()] },

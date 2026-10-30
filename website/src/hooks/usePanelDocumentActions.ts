@@ -8,7 +8,7 @@ import { clearInlineDraft, getInlineDraft, type usePanelTabs } from './usePanelT
 import { i18nT } from '../i18n/t'
 import type { Artifact } from '../types'
 import { fetchFileRead, fileReadQueryKey, FILE_READ_STALE_MS, isPartialRead } from '../utils/fileReadQuery'
-import { dashboardPreviewTargetFromRef } from '../utils/dashboardPreview'
+import { announceDashboardPreviewOpened, dashboardPreviewRef, dashboardPreviewTargetFromRef } from '../utils/dashboardPreview'
 import { errMessage } from '../utils/thunkError'
 import { optsForReplace } from '../pages/chat/replaceGuard'
 
@@ -70,12 +70,12 @@ export function usePanelDocumentActions({ tabsCtl, slotRef, queryClient, showAct
           // The shared fetch carries the backend's binary verdict with the text
           // (from the `X-File-Binary` header), so the tab knows whether it has
           // a buffer to edit at all.
-          queryFn: ({ signal }) => fetchFileRead(filePath, signal),
+          queryFn: ({ signal }) => fetchFileRead(filePath, signal, slot),
           staleTime: FILE_READ_STALE_MS,
         }),
         queryClient.prefetchQuery({
           queryKey: ['file-diff', filePath],
-          queryFn: () => api.fileDiff(filePath),
+          queryFn: () => api.fileDiff(filePath, slot),
         }),
       ])
       const { text, ok, status, binary } = read
@@ -113,12 +113,12 @@ export function usePanelDocumentActions({ tabsCtl, slotRef, queryClient, showAct
       const [read] = await Promise.all([
         queryClient.fetchQuery({
           queryKey: fileReadQueryKey(filePath),
-          queryFn: ({ signal }) => fetchFileRead(filePath, signal),
+          queryFn: ({ signal }) => fetchFileRead(filePath, signal, slot),
           staleTime: FILE_READ_STALE_MS,
         }),
         queryClient.prefetchQuery({
           queryKey: ['file-diff', filePath],
-          queryFn: () => api.fileDiff(filePath),
+          queryFn: () => api.fileDiff(filePath, slot),
         }),
       ])
       const { text, ok, status, binary } = read
@@ -154,11 +154,19 @@ export function usePanelDocumentActions({ tabsCtl, slotRef, queryClient, showAct
         // The roster's own name when it is cached and unambiguous; the slug otherwise.
         const named = (queryClient.getQueryData<MemberRosterRow[]>(MEMBERS_ROSTER_QUERY_KEY) ?? []).filter(r => r.slug === preview.slug)
         name = named.length === 1 ? named[0].name : preview.slug
+      } else if (preview.kind === 'member-name') {
+        // The page link names the crew, not the slug: no slug to key on, so every
+        // open crewmate read is re-read. The panel resolves the slug from the roster.
+        void queryClient.invalidateQueries({ queryKey: ['member-dashboard'] })
+        name = preview.member
       } else {
         void queryClient.invalidateQueries({ queryKey: ['session-dashboard', preview.slot] })
         name = i18nT('commandCenter.title')
       }
       tabsCtl.openArtifact({ slug, kind: 'html', title: i18nT('pages.chat.dashboardPreviewPanel.tab_title', { name }) }, '', slot)
+      // A panel already open on this reference may have handed its last preview
+      // over to the live page; this puts it back on the staged one.
+      announceDashboardPreviewOpened(dashboardPreviewRef(preview))
       onOpened?.()
       return
     }
@@ -208,7 +216,8 @@ export function usePanelDocumentActions({ tabsCtl, slotRef, queryClient, showAct
     // draft we reconcile must be the one that owned this save, not whatever slot
     // is active when the write resolves.
     const requestSlot = slotRef.current ?? ''
-    const res = await fetch('/api/file-write', {
+    // Names the chat, so the gateway refuses a write for one that runs remotely.
+    const res = await fetch('/api/file-write' + (requestSlot ? '?slot=' + encodeURIComponent(requestSlot) : ''), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ path: filePath, content }),

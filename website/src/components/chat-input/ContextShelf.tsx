@@ -13,6 +13,8 @@ import { usePressActivation } from '../../hooks/usePressActivation'
 import { useActionShortcutHint } from '../../hooks/useActionShortcutHint'
 import { IS_MAC } from '../../hooks/useKeyboardShortcuts'
 import type { ChatInputProps } from './props'
+import type { MemorySource } from '../../lib/agentMemorySource'
+import { withMemorySource } from '../../utils/agentLabel'
 import type { useAutoCompactThreshold } from './autoCompact'
 import { uiLocation } from '../../uiLocations/uiLocation'
 import { useGuidePredicate } from '../../guide/guidePredicates'
@@ -148,10 +150,11 @@ export function SessionControlChips({ sessionControls, shelfCompact, onSessionCo
  *  would pin `var(--mono)`, which Settings → Display → Font Family writes only
  *  for OpenDyslexic, so for every other family it would make the shelf ignore
  *  the user's typeface. */
-export function AgentChip({ agentName, agentLabel, agentIsInheritedDefault, agentSource, isRunning, shelfCompact, onAgentClick }: {
+export function AgentChip({ agentName, agentLabel, agentIsInheritedDefault, agentMemory, agentSource, isRunning, shelfCompact, onAgentClick }: {
   agentName: string
   agentLabel?: string
   agentIsInheritedDefault?: boolean
+  agentMemory?: MemorySource | null
   agentSource?: string
   isRunning: boolean
   shelfCompact: boolean
@@ -165,11 +168,15 @@ export function AgentChip({ agentName, agentLabel, agentIsInheritedDefault, agen
   // because the marker alone reads as opaque. No glyph, no
   // layout change -- text on demand. A pinned chip keeps the plain
   // switch hint; it has nothing to explain.
+  // A same-name crewmate and custom agent read alike, so the chip says which
+  // memory this session runs on, in the visible text and the spoken name both.
+  // Null for every other agent, which leaves both unchanged.
+  const spokenName = withMemorySource(agentName, agentMemory ?? null)
   const label = isRunning
     ? i18nT('components.chatInput.stop_the_current_response_to_switch_agents')
     : agentIsInheritedDefault
-      ? i18nT('components.chatInput.agent_inherited_default', { name: agentName })
-      : i18nT('components.chatInput.agent', { name: agentName })
+      ? i18nT('components.chatInput.agent_inherited_default', { name: spokenName })
+      : i18nT('components.chatInput.agent', { name: spokenName })
   // The chip is the only visible place an agent switch happens, so it is where
   // the keyboard route to the same switch gets taught: a second tooltip line
   // naming the cycle chords. Spelled by a catalog string per platform, so it
@@ -191,17 +198,18 @@ export function AgentChip({ agentName, agentLabel, agentIsInheritedDefault, agen
       aria-keyshortcuts={!isRunning && nextHint ? nextHint.ariaKeyshortcuts : undefined}
     >
       <Bot size={13} className="shrink-0 opacity-70" />
-      {!shelfCompact && <span className="truncate max-w-[160px]">{agentLabel ?? agentName}</span>}
+      {!shelfCompact && <span className="truncate max-w-[160px]">{withMemorySource(agentLabel ?? agentName, agentMemory ?? null)}</span>}
     </button>
   )
 }
 
 /** The context-window readout and its popover (usage, model, the per-session
  *  auto-compact threshold). */
-export function ContextUsageControl({ contextPct, contextUsedTokens, contextWindowTokens, showContextPct, showContextTokens, shelfCompact, modelName, ctxPopoverOpen, setCtxPopoverOpen, ctxWrapRef, autoCompactThreshold }: {
+export function ContextUsageControl({ contextPct, contextUsedTokens, contextWindowTokens, derivePctFromUsed, showContextPct, showContextTokens, shelfCompact, modelName, ctxPopoverOpen, setCtxPopoverOpen, ctxWrapRef, autoCompactThreshold }: {
   contextPct: number
   contextUsedTokens?: number
   contextWindowTokens?: number
+  derivePctFromUsed?: boolean
   showContextPct?: boolean
   showContextTokens?: boolean
   shelfCompact: boolean
@@ -218,36 +226,50 @@ export function ContextUsageControl({ contextPct, contextUsedTokens, contextWind
   const agentDefaultSource = autoCompact?.agent_pct != null
     ? i18nT('components.chatInput.agent_default_source', { agent: autoCompact.agent ?? '' })
     : undefined
-  const pct = Math.round(contextPct)
   const win = contextWindowTokens || 0
-  const used = contextUsedTokens != null ? contextUsedTokens : (win ? Math.round((pct / 100) * win) : 0)
+  const used = contextUsedTokens != null ? contextUsedTokens : (win ? Math.round((contextPct / 100) * win) : 0)
+  // Only on a model switch does the stored entry carry `used` with NO measured
+  // window (the reducer drops the stale pct and window, keeps `used`): the
+  // caller signals that shape with `derivePctFromUsed`, and the percentage is
+  // derived from `used` against the window this control resolved, so the old
+  // model's percentage never pairs with the new model's window. On every other
+  // frame the backend's reported `contextPct` is used exactly as before — a
+  // backend whose percentage is not simply `used / window` (overhead counted,
+  // or a percentage backfilled against tokens) keeps rendering its own number.
+  const effectivePct = derivePctFromUsed && contextUsedTokens != null && win > 0
+    ? (used / win) * 100
+    : contextPct
   const remaining = win ? Math.max(win - used, 0) : 0
   const approx = contextUsedTokens == null
-  const pctColor = contextColor(contextPct)
+  const pctColor = contextColor(effectivePct)
   const showAnyReadout = !!(showContextPct || showContextTokens)
   // Graceful degrade: on a narrow shelf, collapse to the percentage
   // alone (or tokens, if that's the only segment enabled) so the
   // readout never crowds out the agent/model controls.
   const readout = shelfCompact
-    ? composeContextReadout(contextPct, used, win, { approx, showPct: showContextPct, showTokens: !!showContextTokens && !showContextPct })
-    : composeContextReadout(contextPct, used, win, { approx, showPct: showContextPct, showTokens: showContextTokens })
+    ? composeContextReadout(effectivePct, used, win, { approx, showPct: showContextPct, showTokens: !!showContextTokens && !showContextPct })
+    : composeContextReadout(effectivePct, used, win, { approx, showPct: showContextPct, showTokens: showContextTokens })
+  // Opens on the mouse press (usePressActivation); keyboard and touch on click.
+  // `useContextPopover`'s outside-press dismiss skips `ctxWrapRef`, which holds
+  // this button, so a press while open toggles it closed.
+  const bindPress = usePressActivation()
   return (
   <div ref={ctxWrapRef} className="relative flex items-center">
     <button
       className={`inline-flex items-center h-7 px-2.5 rounded-md transition-colors border-none cursor-pointer ${ctxPopoverOpen ? 'bg-[color-mix(in_srgb,var(--bg-elevated)_84%,var(--text))]' : 'bg-transparent hover:bg-[color-mix(in_srgb,var(--bg-elevated)_84%,var(--text))]'}`}
-      onClick={() => setCtxPopoverOpen(o => !o)}
-      title={contextTip(contextPct)}
+      {...bindPress(() => setCtxPopoverOpen(o => !o))}
+      title={contextTip(effectivePct)}
       aria-label={i18nT('components.chatInput.context_usage')}
       {...uiLocation('composer.context-usage')}
     >
-      <ContextBar pct={contextPct} width={40} height={3} />
+      <ContextBar pct={effectivePct} width={40} height={3} />
       {showAnyReadout && <span className="text-[11px] ml-1.5 tabular-nums whitespace-nowrap" style={{ color: pctColor }}>{readout}</span>}
     </button>
     {ctxPopoverOpen && (
       <div className="absolute bottom-full right-0 mb-1 z-[60] w-52 rounded-xl border border-border bg-bg-elevated shadow-xl p-3 animate-slide-up">
                 <div className="flex items-center justify-between mb-2">
                   <span className="text-[11px] font-semibold text-text">{i18nT('components.chatInput.context_window')}</span>
-                  <span className="text-[12px] font-mono font-bold" style={{ color: pctColor }}>{fmtPercent(contextPctClamped(contextPct) / 100)}</span>
+                  <span className="text-[12px] font-mono font-bold" style={{ color: pctColor }}>{fmtPercent(contextPctClamped(effectivePct) / 100)}</span>
                 </div>
                 <div className="flex flex-col gap-1 text-[11px] font-mono">
                   <div className="flex justify-between"><span className="text-muted">{i18nT('components.chatInput.used')}</span><span className="text-text">{approx ? '~' : ''}{fmtTokens(used)}</span></div>
@@ -320,6 +342,11 @@ export function ContextUsageControl({ contextPct, contextUsedTokens, contextWind
                           : i18nT('components.chatInput.following_global', { pct: Math.round(autoCompact.global_pct) })}
                       </div>
                     )}
+                    {autoCompact.harness_managed && (
+                      <div className="mt-1 text-[10px] text-muted" data-testid="autocompact-harness-managed-note">
+                        {i18nT('components.chatInput.harness_managed_note', { backend: autoCompact.harness_managed.toUpperCase() })}
+                      </div>
+                    )}
                   </div>
                 )}
         </div>
@@ -331,7 +358,7 @@ export function ContextUsageControl({ contextPct, contextUsedTokens, contextWind
 /** The model chip. It names the level in force beside the model; the level is
  *  CHANGED inside the model picker the chip opens (model and effort are one
  *  control, docs/decisions/2026-06-14-chat-composer-model-and-effort-are-one-control.md). */
-export function ModelChip({ modelName, modelIsJevRouted, modelIsInheritedDefault, modelIsAutoChosen, reasoningEffort, effortIsDefault, hasEffort, isRunning, shelfCompact, shelfTiny, composerControl, modelChipPressedFromComposerRef, onModelClick }: {
+export function ModelChip({ modelName, modelIsJevRouted, modelIsInheritedDefault, modelIsAutoChosen, reasoningEffort, effortIsDefault, hasEffort, isRunning, shelfTiny, composerControl, modelChipPressedFromComposerRef, onModelClick }: {
   modelName: string
   modelIsJevRouted?: boolean
   modelIsInheritedDefault?: boolean
@@ -340,7 +367,6 @@ export function ModelChip({ modelName, modelIsJevRouted, modelIsInheritedDefault
   effortIsDefault: boolean
   hasEffort?: boolean
   isRunning: boolean
-  shelfCompact: boolean
   shelfTiny: boolean
   composerControl: () => ComposerControl | null
   /** Owned by the composer, so a press outlives a remount of the chip exactly as it did. */
@@ -355,20 +381,27 @@ export function ModelChip({ modelName, modelIsJevRouted, modelIsInheritedDefault
   const effortShown = effortIsDefault
     ? i18nT('components.reasoningEffortDropdown.default_with_level', { level: effortLabel(reasoningEffort || '') })
     : effortLabel(reasoningEffort || '')
-  // The chip is disabled while a response runs: a guide to it says so.
+  // The chip stays enabled while a response runs -- a pick then is committed
+  // and applied from the next message (the gateway answers `deferred: true`;
+  // the running reply finishes on the model it started with), the project
+  // chip's contract. The predicate is still reported from here because the
+  // send control's location requires it; it no longer gates this chip.
   useGuidePredicate('no_response_running', !isRunning)
   const effortSuffix = hasEffort
     ? ` · ${i18nT('components.reasoningEffortDropdown.reasoning_effort')}: ${effortShown}`
     : ''
-  const modelChipLabel = `${isRunning
-    ? i18nT('components.chatInput.stop_the_current_response_to_switch_model')
-    : modelIsJevRouted
-      ? i18nT('pages.chatPage.model_auto_jev_description')
-      : modelIsInheritedDefault
-        ? i18nT('components.chatInput.model_inherited_default', { name: modelName })
-        : modelIsAutoChosen
-          ? `${i18nT('components.chatInput.model_2', { name: modelName })} · ${i18nT('components.jobForm.auto')}`
-          : i18nT('components.chatInput.model_2', { name: modelName })}${effortSuffix}`
+  const modelChipName = modelIsJevRouted
+    ? i18nT('pages.chatPage.model_auto_jev_description')
+    : modelIsInheritedDefault
+      ? i18nT('components.chatInput.model_inherited_default', { name: modelName })
+      : modelIsAutoChosen
+        ? `${i18nT('components.chatInput.model_2', { name: modelName })} · ${i18nT('components.jobForm.auto')}`
+        : i18nT('components.chatInput.model_2', { name: modelName })
+  // While a response runs the name is followed by the one line that matters
+  // then: a pick applies from the next message, as the project chip says.
+  const modelChipLabel = `${modelChipName}${effortSuffix}${isRunning
+    ? `\n${i18nT('components.chatInput.model_switch_applies_next_turn')}`
+    : ''}`
   // Opens on the mouse press (usePressActivation); keyboard and touch on click.
   const bindPress = usePressActivation()
   const press = bindPress<HTMLButtonElement>(el => {
@@ -388,13 +421,11 @@ export function ModelChip({ modelName, modelIsJevRouted, modelIsInheritedDefault
       press.onPointerDown(e)
     }}
     onClick={press.onClick}
-    disabled={isRunning}
     data-testid="composer-model-chip"
     {...uiLocation('chat.model-picker')}
-    // Inherited default: mirror the agent chip -- ` · default` marker on
-    // the label, and the explanation on hover (title) AND keyboard
-    // focus / screen readers (aria-label), because a bare served id
-    // reads exactly like a pin. A pinned chip keeps the plain hint.
+    // Inherited default: the explanation rides on hover (title) AND keyboard
+    // focus / screen readers (aria-label); the chip itself shows only the id.
+    // A pinned chip keeps the plain hint.
     // The effort level rides along on both: `aria-label` REPLACES the
     // chip's content in the accessible name, so without it a screen
     // reader never hears the level the chip shows, and the tooltip is
@@ -409,30 +440,27 @@ export function ModelChip({ modelName, modelIsJevRouted, modelIsInheritedDefault
         ellipsize its own tail, never the marker beside it. A routed chip
         takes NO marker -- its label is already the policy, and a second
         word next to it would be a marker on a name that is not a model.
-        So the two unpinned states differ by KIND (a policy vs an id with
-        a marker), not by two adjectives a reader has to tell apart. */}
-    {!modelIsJevRouted && (modelIsInheritedDefault || modelIsAutoChosen) && (
+        A model the user picked for themselves -- a pin, or the default
+        they set -- takes no marker either: the id already names the
+        model they chose, and the hover / accessible name above still
+        says it is the inherited default. Only `auto` is marked, because
+        there the id is one the user never chose. */}
+    {!modelIsJevRouted && !modelIsInheritedDefault && modelIsAutoChosen && (
       <>
         <span className="opacity-30 select-none shrink-0" aria-hidden="true">·</span>
-        <span className="opacity-60 shrink-0">{modelIsInheritedDefault
-          ? i18nT('components.agentSelector.default')
-          : i18nT('components.jobForm.auto')}</span>
+        <span className="opacity-60 shrink-0">{i18nT('components.jobForm.auto')}</span>
       </>
     )}
-    {/* A default and an override show the same level, and a glance
-        at "High" alone could not tell which one set it. So the chip
-        says so where there is room -- the picker's own "Default ·
-        High" -- and keeps the bare level only in a compact shelf,
-        where the hover / accessible name above still carries it.
-        An inherited-default MODEL already put one "Default" on the
-        chip; a second, meaning the effort, right after it would be
-        the same word twice for two unrelated facts, so that chip
-        keeps the bare level as well (the name above still says
-        "Reasoning effort: Default · High"). */}
-    {hasEffort && !shelfTiny && (
+    {/* The chip shows the concrete level in force and never the word
+        "Default": whether a default or an override set it is not
+        something the user needs at a glance, and the hover / accessible
+        name above still says which. With no level known (the model
+        decides), there is nothing concrete to show, so the segment is
+        left out. */}
+    {hasEffort && !shelfTiny && !!reasoningEffort && (
       <>
         <span className="opacity-30 select-none shrink-0" aria-hidden="true">·</span>
-        <span className="opacity-60 shrink-0">{shelfCompact || modelIsInheritedDefault ? effortLabel(reasoningEffort || '') : effortShown}</span>
+        <span className="opacity-60 shrink-0">{effortLabel(reasoningEffort)}</span>
       </>
     )}
   </button>

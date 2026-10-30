@@ -87,10 +87,9 @@ MAX_ACTIONS_BYTES = 64 * 1024
 STEP_UI = "ui"
 STEP_COMMIT = "commit"
 
-#: The create-a-crewmate form's own field caps (``MeetCrewmatesFlow.tsx``
-#: ``JOB_MAX`` / ``NAME_MAX``). A pre-fill longer than the field it lands in is a
-#: draft the user can see but not reproduce or edit back to, so a guide never
-#: proposes one.
+#: Caps on a guide's pre-filled name and goal: a proposal short enough to read
+#: at a glance in the New crewmate card's Name and "Goal"
+#: fields, which accept at least this much (they set no shorter limit).
 _GOAL_MAX_CHARS = 200
 _NAME_MAX_CHARS = 24
 _SETTING_ID_MAX_CHARS = 200
@@ -110,8 +109,8 @@ FIND_ROLES = ("button", "link", "menuitem", "tab", "switch", "checkbox", "textbo
 TRUST_ROOT_ROUTES = ("/settings/security", "/settings/computer-use", "/settings/secrets")
 #: An English name that deletes or removes something: a ``ui.find`` of it
 #: carries ``caution`` (the panel's warning, and the press alone never ends
-#: the step), whatever the agent passed. ``REMOVAL_LABEL_RE`` in
-#: ``website/scripts/lib/ui-index.mjs`` is the same rule for the auto tier.
+#: the step), whatever the agent passed. ``CAUTION_LABEL_RE`` in
+#: ``website/scripts/lib/ui-index-auto.mjs`` is the same rule for the auto tier.
 REMOVAL_LABEL_RE = re.compile(
     r"\b(?:delete|remove|uninstall|erase|reset|wipe|purge|destroy)\b"
     r"|\bclear\s+(?:all|data|everything|history|cache|memory)\b",
@@ -383,18 +382,14 @@ ACTIONS: dict[str, ActionDef] = {
     ),
     ACTION_CREWMATE_CREATE: ActionDef(
         id=ACTION_CREWMATE_CREATE,
-        title="Create a crewmate",
+        title="Create a mate",
         description=(
-            "Open the create-a-crewmate flow with an optional name and goal "
-            "pre-filled, then point at the goal, the name and the Create button. "
-            "Nothing is created until the user clicks Create; completion reports "
-            "the new crewmate's id."
+            "Open the New mate card with an optional name and goal "
+            "pre-filled, then point at its Create button. Nothing is created "
+            "until the user clicks Create; completion reports the new "
+            "mate's id."
         ),
-        steps=(
-            StepDef("goal", STEP_UI),
-            StepDef("name", STEP_UI),
-            StepDef("create", STEP_COMMIT),
-        ),
+        steps=(StepDef("create", STEP_COMMIT),),
         params_schema={
             "type": "object",
             "properties": {

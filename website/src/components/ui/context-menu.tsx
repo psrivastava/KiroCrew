@@ -1,10 +1,12 @@
 import * as React from 'react'
 import { useGuideTrustRootAttrs } from '../../guide/trustRoot'
 import * as ContextMenuPrimitive from '@radix-ui/react-context-menu'
+import { Slot } from '@radix-ui/react-slot'
 import { cn } from '../../lib/utils'
 import { useCloseOnFileDrag } from '../../hooks/useCloseOnFileDrag'
 import { useIsTouchDevice } from '../../hooks/useIsTouchDevice'
 import { PhoneSubContentDiv, PhoneSubTriggerDiv, usePhoneSubState } from './phoneSubmenu'
+import { MountAfterCommit, useCloseWhenCrewHidden, useOverlayRoot } from '../overlayRoot'
 
 /**
  * A context menu opens on a right-click, so no caller drives it: `open` is
@@ -30,12 +32,62 @@ function ContextMenu({ onOpenChange, modal = true, ...rest }: ContextMenuProps) 
   const close = React.useCallback(() => handleOpenChange(false), [handleOpenChange])
 
   useCloseOnFileDrag(open && modal, close)
+  useCloseWhenCrewHidden(open, close)
 
   return <ContextMenuPrimitive.Root open={open} onOpenChange={handleOpenChange} modal={modal} {...rest} />
 }
 const ContextMenuTrigger = ContextMenuPrimitive.Trigger
+
+const StableTriggerChild = React.createContext<React.ReactElement | null>(null)
+
+/**
+ * The trigger's child as seen by Radix: one element that never changes. The
+ * real element arrives through context, and `Slot` merges the trigger's props
+ * and ref onto it exactly as `ContextMenuTrigger asChild` would.
+ */
+const StableTriggerOutlet = React.forwardRef<HTMLElement, React.HTMLAttributes<HTMLElement>>(
+  function StableTriggerOutlet(props, ref) {
+    return <Slot ref={ref} {...props}>{React.useContext(StableTriggerChild)}</Slot>
+  },
+)
+const STABLE_TRIGGER_OUTLET = <StableTriggerOutlet />
+
+/**
+ * `<ContextMenu><ContextMenuTrigger asChild>{children}</ContextMenuTrigger>{content}</ContextMenu>`
+ * for a trigger element that is rebuilt on every render of its owner, such as
+ * a sidebar row. Radix's Root, Menu and Popper layers re-render whenever their
+ * children prop changes, and the trigger child is a new element each time, so
+ * every row render also re-rendered about a dozen menu components and
+ * re-attached the Popper anchor. Here the menu tree is built once per change of
+ * `content`; a new `children` re-renders only the outlet that
+ * hands it to the trigger. The DOM, the handlers on the element and the
+ * keyboard, right-click and focus behaviour are the same as the plain form.
+ * Pass a referentially stable `content` (memoized by the caller): a new
+ * element on every render rebuilds the tree each time and saves nothing.
+ */
+function ContextMenuStableTrigger({ children, content }: {
+  children: React.ReactElement
+  content: React.ReactNode
+}) {
+  const menu = React.useMemo(() => (
+    <ContextMenu>
+      <ContextMenuTrigger asChild>{STABLE_TRIGGER_OUTLET}</ContextMenuTrigger>
+      {content}
+    </ContextMenu>
+  ), [content])
+  return <StableTriggerChild.Provider value={children}>{menu}</StableTriggerChild.Provider>
+}
+
 const ContextMenuGroup = ContextMenuPrimitive.Group
-const ContextMenuPortal = ContextMenuPrimitive.Portal
+// Portals into the owning pane's overlay root, so content opened in the local
+// dashboard hides with it behind a remote Crew (see components/overlayRoot).
+function ContextMenuPortal(props: React.ComponentProps<typeof ContextMenuPrimitive.Portal>) {
+  return (
+    <MountAfterCommit>
+      <ContextMenuPrimitive.Portal container={useOverlayRoot()} {...props} />
+    </MountAfterCommit>
+  )
+}
 const ContextMenuRadioGroup = ContextMenuPrimitive.RadioGroup
 
 type ContextSubPhoneContextValue = { isPhone: boolean; expanded: boolean; toggle: () => void }
@@ -65,7 +117,7 @@ const ContextMenuContent = React.forwardRef<
 >(({ className, ...props }, ref) => {
   const trustRoot = useGuideTrustRootAttrs()
   return (
-  <ContextMenuPrimitive.Portal>
+  <ContextMenuPortal>
     <ContextMenuPrimitive.Content
       ref={ref}
       {...trustRoot}
@@ -88,22 +140,38 @@ const ContextMenuContent = React.forwardRef<
       )}
       {...props}
     />
-  </ContextMenuPrimitive.Portal>
+  </ContextMenuPortal>
   )
 })
 ContextMenuContent.displayName = ContextMenuPrimitive.Content.displayName
 
+/**
+ * `offline` dims a row whose action needs a live gateway — the same prop, the
+ * same weight and the same composition order as `DropdownMenuItem`, which
+ * documents the reasoning in full.
+ *
+ * It exists on BOTH families because one caller renders one list of rows through
+ * either of them: `renderFolderMenuItems` picks the family from its `variant`, so
+ * the folder ⋯-menu and the right-click menu are the same rows. A dim on only the
+ * dropdown would leave the context menu presenting the identical gateway writes at
+ * full weight.
+ *
+ * Composed AFTER `className` on purpose: `cn` is tailwind-merge, so the last class
+ * in a conflicting group wins, and with `className` last the `text-danger` delete
+ * row would keep full-saturation red at 40% opacity while its siblings went muted.
+ */
 const ContextMenuItem = React.forwardRef<
   React.ComponentRef<typeof ContextMenuPrimitive.Item>,
-  React.ComponentPropsWithoutRef<typeof ContextMenuPrimitive.Item> & { inset?: boolean }
->(({ className, inset, ...props }, ref) => (
+  React.ComponentPropsWithoutRef<typeof ContextMenuPrimitive.Item> & { inset?: boolean; offline?: boolean }
+>(({ className, inset, offline, ...props }, ref) => (
   <ContextMenuPrimitive.Item
     ref={ref}
     className={cn(
       'relative flex cursor-pointer select-none items-center gap-2 rounded-md px-3 py-1.5 text-[13px] outline-hidden transition-colors',
       'focus:bg-bg-hover data-[disabled]:pointer-events-none data-[disabled]:opacity-50',
       inset && 'pl-8',
-      className
+      className,
+      offline && 'text-muted opacity-40'
     )}
     {...props}
   />
@@ -214,7 +282,7 @@ const ContextMenuSubContent = React.forwardRef<
     )
   }
   return (
-    <ContextMenuPrimitive.Portal>
+    <ContextMenuPortal>
       <ContextMenuPrimitive.SubContent
         ref={ref}
         {...trustRoot}
@@ -227,7 +295,7 @@ const ContextMenuSubContent = React.forwardRef<
       >
         {children}
       </ContextMenuPrimitive.SubContent>
-    </ContextMenuPrimitive.Portal>
+    </ContextMenuPortal>
   )
 })
 ContextMenuSubContent.displayName = ContextMenuPrimitive.SubContent.displayName
@@ -235,6 +303,7 @@ ContextMenuSubContent.displayName = ContextMenuPrimitive.SubContent.displayName
 export {
   ContextMenu,
   ContextMenuTrigger,
+  ContextMenuStableTrigger,
   ContextMenuContent,
   ContextMenuItem,
   ContextMenuLabel,

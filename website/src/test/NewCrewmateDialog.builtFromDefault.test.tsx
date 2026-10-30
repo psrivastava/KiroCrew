@@ -1,22 +1,12 @@
 /**
- * "Built from" is a DEFAULT, not a required pick — the shipped behaviour after
- * the two create doors converged on `NewCrewmateDialog`.
+ * Create never asks for a template: `NewCrewmateDialog` offers none, and every
+ * new mate starts on the built-in `kirocrew` agent as its starting binding (the
+ * server gives it its own, source-free file at create).
  *
- * Before this, create (through the crew manager's editor sheet) opened with no
- * template selected and REFUSED to submit until one was chosen — the #1684
- * guard, pinned by the now-deleted `KiroCrewAgentsPage.templateRequired.test.tsx`.
- * The accepted `rfc-crewmates-launch.md` rules the New crewmate dialog's
- * **Built from** field is "the default agent or a custom agent" — a default,
- * not a required pick. So converging both doors on this dialog retires that
- * guard: a crew created without touching **Built from** is built from the
- * default `kirocrew` agent, exactly as the Crewmates page already behaved.
- *
- * This pins that shipped behaviour (the positive inverse of the deleted guard):
- * creating with only a name issues the POST — it is NOT blocked — and sends
- * `kiro_agent: 'kirocrew'`. If someone restored a required-template refusal in
- * the dialog, `createKirocrewAgent` would never be called and the first
- * assertion fails; if the `builtFrom || BUILTIN_AGENT` fallback were dropped,
- * the `kiro_agent` assertion fails.
+ * Creating with only a name issues the POST -- it is NOT blocked -- and sends
+ * `kiro_agent: 'kirocrew'`. A restored required-template refusal (#1684) would
+ * leave `createKirocrewAgent` uncalled and fail the first assertion; a dropped
+ * `DEFAULT_CREWMATE_TEMPLATE` would fail the `kiro_agent` one.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react'
@@ -61,7 +51,7 @@ function renderDialog() {
 
 const nameInput = () => screen.getByLabelText('Name') as HTMLInputElement
 
-describe('NewCrewmateDialog — Built from is a default, not a required pick', () => {
+describe('NewCrewmateDialog — no template to pick; every mate starts on the built-in agent', () => {
   beforeEach(() => { mockApi.createKirocrewAgent.mockClear() })
   afterEach(() => { vi.restoreAllMocks(); cleanup() })
 
@@ -79,7 +69,7 @@ describe('NewCrewmateDialog — Built from is a default, not a required pick', (
     )
   })
 
-  it('asks for a workspace of the crewmate\'s own unless Advanced names one to share', async () => {
+  it('asks for a workspace of the mate\'s own unless Advanced names one to share', async () => {
     renderDialog()
     fireEvent.change(nameInput(), { target: { value: 'researcher' } })
     fireEvent.click(screen.getByTestId('crewmate-create-submit'))
@@ -90,6 +80,16 @@ describe('NewCrewmateDialog — Built from is a default, not a required pick', (
     expect(mockApi.createKirocrewAgent).toHaveBeenCalledWith(
       expect.objectContaining({ workspace: '' }),
     )
+  })
+
+  it('the card never names a template, folded or unfolded', async () => {
+    renderDialog()
+    const form = screen.getByTestId('crewmate-create-form')
+    expect(form).not.toHaveTextContent(/kirocrew/i)
+    fireEvent.click(screen.getByTestId('crewmate-create-advanced-toggle'))
+    expect(await screen.findByRole('textbox', { name: 'Goal' })).toBeInTheDocument()
+    expect(screen.queryByRole('combobox', { name: 'Built from' })).toBeNull()
+    expect(form).not.toHaveTextContent(/kirocrew/i)
   })
 
   it('still refuses a BLANK name — client-side name validation is independent of the retired template guard', async () => {

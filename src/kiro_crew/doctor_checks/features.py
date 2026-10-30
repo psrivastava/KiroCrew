@@ -49,8 +49,12 @@ def _os_fix_hint(mac: str, linux: str, windows: str | None = None) -> str:
 # desktop matrix ships; on any other ISA the fetch is refused and the second
 # clause is the remedy), and ``/usr/local/bin`` is both a real
 # ``_FFMPEG_CANDIDATE_DIRS`` entry and the conventional manual-install prefix.
+# Where the Speech-to-Text controls live in the dashboard: a section of the Voice
+# tab, not a tab of its own. The labels are the English catalog's
+# ``settings.tabs.voice.label`` and ``pages.settings.voicePanel.speech_to_text``.
+_STT_SETTINGS_PATH = "Settings → Voice → Speech-to-Text"
 _FFMPEG_LINUX_HINT = (
-    "download the audio decoder from the dashboard (Settings → Speech-to-Text), "
+    f"download the audio decoder from the dashboard ({_STT_SETTINGS_PATH}), "
     "or install ffmpeg into /usr/local/bin"
 )
 
@@ -77,7 +81,7 @@ def _doctor_vector_memory(issues: list[str]) -> None:
         # Designed degradation, not a defect: no vendored native libs exist for
         # this platform (e.g. linux/armv7l or win32/arm64 — Intel Macs are NOT
         # an example, darwin/x86_64 maps to the shipped macos_x86_64) and
-        # embeddings.py documents the keyword-search fallback. Nothing for the
+        # embeddings_native.py documents the keyword-search fallback. Nothing for the
         # user to fix — don't fail.
         print(
             "  runtime:     ⏹ unsupported platform "
@@ -186,7 +190,7 @@ def _doctor_speech_to_text(cfg: KiroCrewConfig, issues: list[str]) -> None:
     stt_active = cfg.stt.enabled
 
     if not stt_active:
-        print("  status:      ⏹ disabled (enable from dashboard → Settings → Speech-to-Text)")
+        print(f"  status:      ⏹ disabled (enable from dashboard → {_STT_SETTINGS_PATH})")
     else:
         print(f"  provider:    ✅ {cfg.stt.provider}")
 

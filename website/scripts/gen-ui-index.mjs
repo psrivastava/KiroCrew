@@ -47,7 +47,7 @@
  * generated locations), the shared prerequisite vocabulary in
  * `src/uiLocations/conditions.ts`, the guide registry when a descriptor carries
  * a guide binding, and the 12 shipped catalogs. The pure logic is
- * `scripts/lib/ui-index.mjs`.
+ * `scripts/lib/ui-index.mjs` and the owners it re-exports.
  *
  * `--check` regenerates in memory and byte-compares the COMMITTED index only;
  * it writes nothing (except `--auto-out`), so it is safe in CI and in
@@ -306,10 +306,9 @@ const settingsTabs = adapter('src/pages/SettingsPage.tsx', { container: 'buildTa
 const capabilityTabs = adapter('src/pages/CapabilitiesPage.tsx', { container: 'tabs' })
 // Other SidePanelLayout pages whose tabs are a literal list, keyed by the
 // surface (rail page) they belong to: `tab.<surface>.<key>` at `/<surface>?tab=<key>`.
-const pageTabs = {
-  developer: adapter('src/pages/DeveloperPage.tsx', { container: 'buildTabs' }),
-}
+const pageTabs = {}
 const settingsSubs = {
+  developer: adapter('src/pages/settings/DeveloperPanel.tsx', { container: 'railItems' }),
   chat: adapter('src/pages/settings/ChatPanel.tsx', { container: 'railItems' }),
   display: adapter('src/pages/settings/DisplayPanel.tsx', { container: 'railItems' }),
   notifications: adapter('src/pages/settings/NotificationsPanel.tsx', { container: 'railItems' }),
@@ -574,7 +573,7 @@ function writeReport(file) {
 /**
  * The auto tier's inputs: every core candidate with one static label key,
  * mapped to the ONE indexed page (and, when proven, tab) whose module graph
- * reaches its file. See buildPageMap in scripts/lib/ui-index.mjs.
+ * reaches its file. See buildPageMap in scripts/lib/ui-index-auto.mjs.
  */
 function planAutoCandidates(index) {
   const files = new Set(sources.keys())

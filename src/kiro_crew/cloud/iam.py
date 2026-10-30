@@ -16,6 +16,7 @@ CloudFormation needs.
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 from kiro_crew.cloud import aws
@@ -116,6 +117,23 @@ def boundary_policy_document(account: str = "*") -> dict[str, Any]:
     immutable across every region the operator launches in. ``account="*"`` yields
     the fully-wildcard form used only for display/tests; the real create path
     passes the resolved 12-digit account id.
+
+    An edition's ``cloud_instance_policy`` statements (see
+    :mod:`kiro_crew.cloud.host_policy`) are appended after the two built-in ones.
+    With none, the document is exactly :func:`base_boundary_policy_document`.
+    """
+    from kiro_crew.cloud import host_policy
+
+    doc = base_boundary_policy_document(account)
+    doc["Statement"].extend(host_policy.boundary_statements())
+    return doc
+
+
+def base_boundary_policy_document(account: str = "*") -> dict[str, Any]:
+    """The instance boundary with no edition statements: SSM core + the source read.
+
+    Every account that launched before an edition added statements holds this
+    document, which is why :func:`previous_boundary_documents` names it.
     """
     return {
         "Version": "2012-10-17",
@@ -143,6 +161,83 @@ def boundary_policy_document(account: str = "*") -> dict[str, Any]:
 def boundary_policy_json(account: str = "*") -> str:
     """The boundary document as compact JSON (what ``iam create-policy`` receives)."""
     return json.dumps(boundary_policy_document(account))
+
+
+def previous_boundary_documents(account: str = "*") -> list[dict[str, Any]]:
+    """Earlier contents of the instance boundary that an admin may upgrade in place.
+
+    Only the document this launcher itself would have created before the edition
+    added statements, and only when it differs from today's. ``kirocrew cloud
+    iam-boundary --upgrade`` re-versions a boundary whose content is exactly one of
+    these and refuses anything else, so a boundary someone edited by hand is never
+    overwritten.
+    """
+    base = base_boundary_policy_document(account)
+    return [base] if base != boundary_policy_document(account) else []
+
+
+#: The OPT-IN instance boundary for orgs that pin a KMS key for Session Manager
+#: (``kirocrew cloud launch --ssm-kms-key``). A launch without that flag
+#: never names, creates or reads it: every default launch keeps
+#: :data:`BOUNDARY_NAME`, so the default ceiling is unchanged. Same contract as
+#: the base boundary: one content-fixed policy per account, created once, verified
+#: on reuse, never re-versioned.
+KMS_BOUNDARY_NAME = "kirocrew-ec2-kms-boundary"
+
+#: The one KMS action the on-box SSM agent performs for an encrypted session: it
+#: decrypts the session data key the client generated. The agent calls KMS
+#: directly with the instance role, so the request carries no ``kms:ViaService``;
+#: what marks it as a Session Manager call is its encryption context, which always
+#: holds ``aws:ssm:SessionId`` and ``aws:ssm:TargetId`` (the instance id).
+SSM_KMS_ACTIONS = ("kms:Decrypt",)
+SSM_SESSION_CONTEXT_KEY = "kms:EncryptionContext:aws:ssm:SessionId"
+SSM_TARGET_CONTEXT_KEY = "kms:EncryptionContext:aws:ssm:TargetId"
+
+
+def kms_boundary_arn(account: str) -> str:
+    """ARN of the shared, create-once KMS-session instance boundary."""
+    return f"arn:aws:iam::{account}:policy/{KMS_BOUNDARY_NAME}"
+
+
+def kms_boundary_policy_document(account: str = "*") -> dict[str, Any]:
+    """The base instance boundary plus ONE statement: Session Manager's KMS decrypt.
+
+    The extra statement is a CEILING, so it is content-fixed and names no key:
+    the key is the operator's, differs per launch, and a boundary that named it
+    would have to be re-versioned per key, which the launcher must never be able
+    to do. It is still narrow: ``kms:Decrypt`` only, on key ARNs only (never
+    aliases), and only for a ciphertext whose encryption context carries both
+    Session Manager keys, so it cannot decrypt a Parameter Store SecureString or
+    any other service's data. The GRANT is the role's inline policy in the
+    template, which names the one key ARN passed at launch and pins the target to
+    the stack's own instance.
+    """
+    return _with_session_kms(boundary_policy_document(account))
+
+
+def previous_kms_boundary_documents(account: str = "*") -> list[dict[str, Any]]:
+    """Earlier contents of the KMS-session boundary an admin may upgrade in place.
+
+    The same rule as :func:`previous_boundary_documents`, for the opt-in boundary.
+    """
+    base = _with_session_kms(base_boundary_policy_document(account))
+    return [base] if base != kms_boundary_policy_document(account) else []
+
+
+def _with_session_kms(doc: dict[str, Any]) -> dict[str, Any]:
+    """*doc* with Session Manager's KMS decrypt appended (see the KMS boundary)."""
+    doc["Statement"].append(
+        {
+            "Sid": "SsmSessionKms",
+            "Effect": "Allow",
+            "Action": list(SSM_KMS_ACTIONS),
+            "Resource": "arn:aws:kms:*:*:key/*",
+            "Condition": {
+                "Null": {SSM_SESSION_CONTEXT_KEY: "false", SSM_TARGET_CONTEXT_KEY: "false"}
+            },
+        }
+    )
+    return doc
 
 
 #: The Fargate TASK role's permissions boundary. A SECOND boundary rather than a reuse
@@ -266,6 +361,51 @@ def crew_exec_boundary_policy_json() -> str:
 STACK_PREFIX = "kirocrew-"
 
 
+def host_policy_document() -> dict[str, Any] | None:
+    """The launcher-policy addendum for an edition's host policies, or ``None``.
+
+    A SECOND customer-managed policy, applied beside :func:`policy_document`, that
+    lets the launcher attach (and on teardown detach) exactly the edition's
+    ``cloud_instance_policy`` ARNs. ``None`` when the edition adds none, so a
+    build without them needs one policy, as before.
+
+    Separate for two reasons. The main policy is within a few dozen characters of
+    IAM's 6,144-character cap, so it has no room for another statement. And the
+    grant must reach only roles the boundary caps, which the main attach
+    statement does not limit itself to: here the resource is the role path ALONE
+    (never ``LEGACY_ROLE_ARN``, whose root-path roles may predate the boundary)
+    and the role must carry the ``kirocrew:managed`` tag, which only a
+    boundary-gated ``CreateRole`` by the launcher applies. A policy attached to a
+    role without the boundary would run uncapped. The account is ``*`` so one
+    printed document works in any account, like the main policy.
+    """
+    from kiro_crew.cloud import host_policy
+
+    arns = host_policy.managed_policy_arns("*")
+    if not arns:
+        return None
+    return {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Sid": "IamAttachHostPoliciesForInstance",
+                "Effect": "Allow",
+                "Action": ["iam:AttachRolePolicy", "iam:DetachRolePolicy"],
+                "Resource": INSTANCE_ROLE_ARN,
+                # Tag-gated like IamPutRolePolicyAndTagRoleOnManaged: a role at
+                # this path that someone created out-of-band, without our
+                # boundary, does not carry the tag, so it cannot be given these
+                # policies. Ours is tagged at CreateRole, before CloudFormation
+                # attaches managed policies.
+                "Condition": {
+                    "ArnEquals": {"iam:PolicyARN": arns},
+                    "StringEquals": {f"aws:ResourceTag/{MANAGED_TAG_KEY}": "true"},
+                },
+            }
+        ],
+    }
+
+
 def policy_document() -> dict[str, Any]:
     """Return the least-privilege customer-managed policy for the launcher."""
     statements: list[dict[str, Any]] = [
@@ -344,6 +484,12 @@ def policy_document() -> dict[str, Any]:
                 "ssm:DescribeAssociation",
                 "ssm:ListAssociations",
                 "route53:ListHostedZonesByVPC",
+                # Session/instance status reads (see the note further down).
+                "ssm:DescribeInstanceInformation",
+                "ssm:DescribeSessions",
+                "ssm:GetConnectionStatus",
+                "ssm:GetCommandInvocation",
+                "sts:GetCallerIdentity",
             ],
             "Resource": "*",
         },
@@ -485,12 +631,21 @@ def policy_document() -> dict[str, Any]:
             # ARN pattern (the account id is a `*` so one printed policy works in
             # any account); StringEquals does literal matching and would never
             # match a real boundary ARN, denying CreateRole entirely.
+            #
+            # Two EXACT names, no wildcard: the base boundary every default launch
+            # uses, and the opt-in KMS-session boundary (`--ssm-kms-key`). Both
+            # are content-fixed and created only by IamInstanceBoundaryCreateOnce.
             "Sid": "IamCreateRoleWithBoundary",
             "Effect": "Allow",
             "Action": ["iam:CreateRole"],
             "Resource": INSTANCE_ROLE_ARN,
             "Condition": {
-                "ArnLike": {"iam:PermissionsBoundary": f"arn:aws:iam::*:policy/{BOUNDARY_NAME}"}
+                "ArnLike": {
+                    "iam:PermissionsBoundary": [
+                        f"arn:aws:iam::*:policy/{BOUNDARY_NAME}",
+                        f"arn:aws:iam::*:policy/{KMS_BOUNDARY_NAME}",
+                    ]
+                }
             },
         },
         {
@@ -632,12 +787,27 @@ def policy_document() -> dict[str, Any]:
             ],
         },
         {
+            # The opt-in KMS-session boundary is READ only: an admin creates it
+            # (`kirocrew cloud iam-boundary --ssm-kms`). A CreatePolicy grant here
+            # would leave the name claimable in every account that never opts in,
+            # and a leaked launcher credential could then author a permissive
+            # policy at it and create a role capped by that (CreateRole accepts
+            # this name). The two reads let a --ssm-kms-key launch verify the
+            # admin-made boundary's content before using it.
+            "Sid": "IamKmsBoundaryRead",
+            "Effect": "Allow",
+            "Action": ["iam:GetPolicy", "iam:GetPolicyVersion"],
+            "Resource": f"arn:aws:iam::*:policy/{KMS_BOUNDARY_NAME}",
+        },
+        {
             # Attach/detach are split out and constrained by iam:PolicyARN to the
             # SINGLE AWS-managed policy the template attaches
             # (AmazonSSMManagedInstanceCore). Without this condition, a holder of
             # the launcher policy could AttachRolePolicy AdministratorAccess onto
             # a kirocrew-ec2-* role and pass it to EC2 — a full escalation. The
             # allowlist is a hard cap: no other managed policy can be attached.
+            # An edition's host policies are granted by host_policy_document, a
+            # separate addendum, never here.
             "Sid": "IamAttachManagedPolicyForInstance",
             "Effect": "Allow",
             "Action": [
@@ -803,37 +973,31 @@ def policy_document() -> dict[str, Any]:
                 "arn:aws:ssm:*:*:session/*",
             ],
         },
-        {
-            # Read-only session/instance status the launcher actually uses. These
-            # Describe*/Get* calls are read-only and not usefully resource-scoped.
-            #
-            # NB: ssm:TerminateSession / ssm:ResumeSession are NOT granted — the
-            # launcher never calls them (the local session-manager-plugin child
-            # owns port-forward teardown; nothing in cloud/ issues
-            # `aws ssm terminate-session`/`resume-session`). Granting them on `*`
-            # would let a leaked launcher credential disrupt UNRELATED SSM sessions
-            # account-wide, and they can't be usefully scoped to caller-owned
-            # sessions here — so we simply drop them (least privilege).
-            #
-            # GetCommandInvocation is the ONLY command-history read granted, and
-            # only because run_command() must poll a send-command's result. We do
-            # NOT grant ListCommandInvocations (never called by the launcher):
-            # narrowing the command-history read surface limits how easily a
-            # leaked launcher credential could enumerate + recover the dashboard
-            # token that mint_token transits through send-command output (that
-            # token is already TTL-short and loopback-only; this shrinks the
-            # discovery path further). The agent chokepoint additionally denies
-            # GetCommandInvocation from an agent session (see cloud.aws).
-            "Sid": "SsmStatusRead",
-            "Effect": "Allow",
-            "Action": [
-                "ssm:DescribeInstanceInformation",
-                "ssm:DescribeSessions",
-                "ssm:GetConnectionStatus",
-                "ssm:GetCommandInvocation",
-            ],
-            "Resource": "*",
-        },
+        # The session/instance status reads and sts:GetCallerIdentity sit in
+        # CloudFormationAndResourceDiscovery: same Effect, Resource "*", no
+        # Condition, so one statement is permission-neutral and keeps the policy
+        # under the 6,144 cap. Notes on the status reads:
+        #
+        #   Read-only session/instance status the launcher actually uses. These
+        #   Describe*/Get* calls are read-only and not usefully resource-scoped.
+        #
+        #   NB: ssm:TerminateSession / ssm:ResumeSession are NOT granted — the
+        #   launcher never calls them (the local session-manager-plugin child
+        #   owns port-forward teardown; nothing in cloud/ issues
+        #   `aws ssm terminate-session`/`resume-session`). Granting them on `*`
+        #   would let a leaked launcher credential disrupt UNRELATED SSM sessions
+        #   account-wide, and they can't be usefully scoped to caller-owned
+        #   sessions here — so we simply drop them (least privilege).
+        #
+        #   GetCommandInvocation is the ONLY command-history read granted, and
+        #   only because run_command() must poll a send-command's result. We do
+        #   NOT grant ListCommandInvocations (never called by the launcher):
+        #   narrowing the command-history read surface limits how easily a
+        #   leaked launcher credential could enumerate + recover the dashboard
+        #   token that mint_token transits through send-command output (that
+        #   token is already TTL-short and loopback-only; this shrinks the
+        #   discovery path further). The agent chokepoint additionally denies
+        #   GetCommandInvocation from an agent session (see cloud.aws).
         {
             "Sid": "SsmAmi",
             "Effect": "Allow",
@@ -858,12 +1022,6 @@ def policy_document() -> dict[str, Any]:
                 "arn:aws:s3:::kirocrew-src-*",
                 "arn:aws:s3:::kirocrew-src-*/*",
             ],
-        },
-        {
-            "Sid": "Identity",
-            "Effect": "Allow",
-            "Action": ["sts:GetCallerIdentity"],
-            "Resource": "*",
         },
         {
             # ec2:Describe* includes DescribeInstanceAttribute, which returns an
@@ -905,6 +1063,35 @@ def policy_json() -> str:
     return json.dumps(policy_document(), indent=2)
 
 
+# The AWS CLI's report of a program it could not exec, e.g.
+# ``aws: [ERROR]: [Errno 2] No such file or directory: 'sso-cred-helper'``. Only a bare
+# name is captured: a name with a path separator was not looked up on PATH, so the
+# PATH advice below would be wrong for it.
+_MISSING_PROGRAM_RE = re.compile(r"\[Errno 2\] No such file or directory: (['\"])([^'\"/\\\s]+)\1")
+
+
+def missing_credential_helper(stderr: str) -> str:
+    """The bare program name an ``aws`` call could not find, or "".
+
+    During credential resolution the program the CLI runs by name is the profile's
+    ``credential_process`` command, which it looks up on its own PATH. A
+    GUI-launched gateway hands it a minimal PATH, so a helper installed in a
+    per-user directory is not found even though the profile works in a terminal.
+    """
+    match = _MISSING_PROGRAM_RE.search(stderr or "")
+    return match.group(2) if match else ""
+
+
+def credential_helper_hint(name: str) -> str:
+    """What to do when the profile's ``credential_process`` helper is not found."""
+    return (
+        f"The AWS CLI could not find `{name}` on the gateway's PATH. This is usually "
+        "the program the profile's credential_process runs: set an absolute path for "
+        f"it in your AWS config (credential_process = /full/path/to/{name} ...), then "
+        "retry."
+    )
+
+
 def reachability_check(profile: str, region: str = "") -> dict[str, Any]:
     """Read-only reachability (NOT full verification).
 
@@ -921,13 +1108,20 @@ def reachability_check(profile: str, region: str = "") -> dict[str, Any]:
         "ssm_reachable": False,
         "note": "",
         "detail": "",
+        "credential_helper_missing": "",
     }
     rc, out, err = aws.run_aws(["sts", "get-caller-identity", "--output", "json"], profile, region)
     if rc != 0:
         result["detail"] = (err or "could not resolve credentials").strip()[:300]
+        helper = missing_credential_helper(err)
+        result["credential_helper_missing"] = helper
         result["note"] = aws.env_credentials_hint() or (
-            "Profile did not resolve — run `aws configure sso --profile <name>` "
-            "(or `aws configure --profile <name>`) and retry."
+            credential_helper_hint(helper)
+            if helper
+            else (
+                "Profile did not resolve — run `aws configure sso --profile <name>` "
+                "(or `aws configure --profile <name>`) and retry."
+            )
         )
         return result
     try:

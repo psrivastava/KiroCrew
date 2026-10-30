@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
+import sys
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -179,30 +181,81 @@ def _request(body: dict) -> tuple[Any, MagicMock]:
     return request, mgr
 
 
+def _real_request(body: dict) -> tuple[Any, Any]:
+    """Like ``_request``, but on a real manager whose runs never start."""
+    mgr = _mgr()
+    mgr._run = AsyncMock()  # type: ignore[method-assign]
+    state = SimpleNamespace(subagents=mgr, conversation_log=MagicMock())
+    request = MagicMock()
+    request.app = {"state": state}
+    request.headers = {}
+
+    async def _json() -> dict:
+        return body
+
+    request.json = _json
+    return request, mgr
+
+
 class TestSpawnEndpoint:
     @pytest.mark.asyncio
-    async def test_a_selectable_backend_reaches_spawn(self, selectable):
+    @pytest.mark.parametrize(
+        "name, reaches",
+        [
+            pytest.param("claude", "claude", id="test_a_selectable_backend_reaches_spawn"),
+            pytest.param("kiro", "", id="test_kiro_is_spelled_by_name_and_reaches_spawn_as_its_id"),
+            # The fixture's install probe cannot decide for codex; that must not block.
+            pytest.param("codex", "codex", id="test_a_probe_that_could_not_decide_does_not_block"),
+        ],
+    )
+    async def test_an_admitted_backend_reaches_spawn(self, selectable, name, reaches):
         from kiro_crew.dashboard.handlers.messaging import api_spawn
 
-        request, mgr = _request({"task": "x", "backend": "claude"})
-        await api_spawn(request)
-        assert mgr.spawn.call_args.kwargs["backend"] == "claude"
+        request, mgr = _real_request({"task": "x", "backend": name})
+        resp = await api_spawn(request)
+        assert mgr.get(json.loads(resp.text)["id"]).backend == reaches
 
     @pytest.mark.asyncio
-    async def test_kiro_is_spelled_by_name_and_reaches_spawn_as_its_id(self, selectable):
-        from kiro_crew.dashboard.handlers.messaging import api_spawn
+    async def test_the_parent_scope_is_read_before_the_backend_probe(
+        self, selectable, monkeypatch, tmp_path
+    ):
+        """The parent's session ends while the route awaits its backend probe:
+        the spawn still carries the project scope the parent had when it asked."""
+        from kiro_crew import subagent
+        from kiro_crew.dashboard.handlers import messaging
 
-        request, mgr = _request({"task": "x", "backend": "kiro"})
-        await api_spawn(request)
-        assert mgr.spawn.call_args.kwargs["backend"] == ""
+        live = [str(tmp_path)]
+        monkeypatch.setattr(
+            subagent,
+            "_parent_project_resolver",
+            lambda key: list(live) if key == "dashboard:p" else [],
+        )
+        real_probe = messaging._requested_backend
+
+        async def _probe_then_end_parent(raw):
+            live.clear()
+            return await real_probe(raw)
+
+        monkeypatch.setattr(messaging, "_requested_backend", _probe_then_end_parent)
+
+        async def _persistent(*_a):
+            return "persistent"
+
+        monkeypatch.setattr(messaging, "_spawn_request_memory_mode", _persistent)
+        request, mgr = _request({"task": "x", "backend": "claude", "parent_session": "dashboard:p"})
+        request.app["state"]._slots = {}
+        response = await messaging.api_spawn(request)
+        assert response.status == 200, response.text
+        assert not live, "the backend probe did not run"
+        assert mgr.spawn.call_args.kwargs["_parent_project_dirs"] == [str(tmp_path)]
 
     @pytest.mark.asyncio
     async def test_no_backend_reaches_spawn_as_none(self, selectable):
         from kiro_crew.dashboard.handlers.messaging import api_spawn
 
-        request, mgr = _request({"task": "x"})
-        await api_spawn(request)
-        assert mgr.spawn.call_args.kwargs["backend"] is None
+        request, mgr = _real_request({"task": "x"})
+        resp = await api_spawn(request)
+        assert mgr.get(json.loads(resp.text)["id"]).backend is None
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("name", ["goose", "nonesuch"])
@@ -254,14 +307,6 @@ class TestSpawnEndpoint:
         payload = json.loads(resp.body)
         assert payload["code"] == "backend_restart_required"
         assert "kas" not in payload["backends"]
-
-    @pytest.mark.asyncio
-    async def test_a_probe_that_could_not_decide_does_not_block(self, selectable):
-        from kiro_crew.dashboard.handlers.messaging import api_spawn
-
-        request, mgr = _request({"task": "x", "backend": "codex"})
-        await api_spawn(request)
-        assert mgr.spawn.call_args.kwargs["backend"] == "codex"
 
 
 # ── The manager ───────────────────────────────────────────────────────────────
@@ -433,7 +478,10 @@ class TestWarmPool:
     def test_a_backend_override_skips_the_warm_pool(self):
         from kiro_crew import session_allocation
 
-        src = inspect.getsource(session_allocation)
+        src = "".join(
+            inspect.getsource(sys.modules[name])
+            for name in (session_allocation.__name__, *session_allocation._ALLOCATION_OWNERS)
+        )
         assert 'pool_decision = "bypass_backend_override"' in src
         assert 'extra_factory_kwargs.get("backend_override") is not None' in src
 
@@ -472,7 +520,10 @@ class TestSuccessorsKeepTheBackend:
     def test_registration_stamps_the_backend_the_session_started_on(self):
         from kiro_crew import session_allocation
 
-        src = inspect.getsource(session_allocation)
+        src = "".join(
+            inspect.getsource(sys.modules[name])
+            for name in (session_allocation.__name__, *session_allocation._ALLOCATION_OWNERS)
+        )
         assert 'session.backend_override = extra_factory_kwargs.get("backend_override")' in src
 
 
@@ -480,13 +531,15 @@ class TestSuccessorsKeepTheBackend:
 
 
 class TestEffortVerdict:
-    def test_a_backend_that_advertises_its_effort_gets_no_verdict(self):
-        # Pi reports its levels at session/new; the registry cannot judge them,
-        # so neither line may be printed -- a "dropped" there was a false report.
+    @pytest.mark.parametrize("backend", ["pi", "goose", "opencode"])
+    def test_a_backend_that_advertises_its_effort_gets_no_verdict(self, backend):
+        # These report their levels at session/new (goose per model); the registry
+        # cannot judge them, so neither line may be printed -- a "dropped" there
+        # would be a false report.
         from kiro_crew.subagent import effort_applied_note, effort_drop_reason
 
-        assert effort_drop_reason("pi-model", "high", backend="pi") == ""
-        assert effort_applied_note("pi-model", "high", backend="pi") == ""
+        assert effort_drop_reason("some-model", "high", backend=backend) == ""
+        assert effort_applied_note("some-model", "high", backend=backend) == ""
 
     def test_the_applied_note_names_the_channel_the_backend_uses(self, monkeypatch):
         # kiro-cli reads the level from cli.json; an adapter harness gets it as a
@@ -498,13 +551,17 @@ class TestEffortVerdict:
         monkeypatch.setattr(subagent, "model_supports_effort", lambda m: True)
         codex = subagent.effort_applied_note("gpt-5", "high", backend="codex")
         assert codex == f"gpt-5 → config option {effort_config_option_id('codex')}"
+        # KAS is kiro-family but reads no cli.json; its level rides
+        # ``effortLevel``, so the receipt must not name a file it never opens.
+        kas = subagent.effort_applied_note("gpt-5", "high", backend="kas")
+        assert kas == f"gpt-5 → config option {effort_config_option_id('kas')}"
         kiro = subagent.effort_applied_note("gpt-5", "high", backend="")
         assert kiro.endswith(".effort") and "config option" not in kiro
         assert subagent.effort_applied_note("gpt-5", "high") == kiro
 
-    @pytest.mark.parametrize("backend", ["opencode", "goose"])
+    @pytest.mark.parametrize("backend", ["some-harness-nobody-registered"])
     def test_a_backend_that_takes_no_effort_is_reported_dropped(self, monkeypatch, backend):
-        # Neither cli.json nor a config option reaches these harnesses: the level
+        # Neither cli.json nor a config option reaches such a harness: the level
         # is never sent, so the receipt must say dropped, not applied.
         from kiro_crew import subagent
 
@@ -608,36 +665,24 @@ class TestFollowUps:
     async def test_a_retry_runs_on_the_original_backend(self):
         from kiro_crew.dashboard.handlers.messaging import api_spawn_retry
         from kiro_crew.execution_context import ExecutionContext, MemoryStoreRef
+        from kiro_crew.subagent import SubagentInfo
 
-        old = SimpleNamespace(
+        mgr = _mgr()
+        mgr._run = AsyncMock()  # type: ignore[method-assign]
+        mgr._agents["a1"] = SubagentInfo(
             id="a1",
             task="t",
             _raw_task="t",
             parent_session_key="dash:1",
-            agent="",
-            max_turns=0,
-            cwd="",
-            model="",
-            reasoning_effort="",
             backend="claude",
-            approval_mode="",
-            silent=False,
-            delegation={},
-            include_memory=True,
-            include_lessons=True,
-            include_project=True,
-            memory_store="",
-            crew="",
             done=True,
-            outcome="failed",
+            error="boom",
             execution_context=ExecutionContext(None, MemoryStoreRef("default"), "template", "k"),
         )
-        mgr = MagicMock()
-        mgr.get.return_value = old
-        mgr.spawn.return_value = SimpleNamespace(id="a2", done=False, error="")
         request = MagicMock()
         request.app = {"state": SimpleNamespace(subagents=mgr)}
         request.headers = {}
         request.match_info = {"agent_id": "a1"}
-        await api_spawn_retry(request)
-        assert mgr.spawn.call_args.kwargs["backend"] == "claude"
+        resp = await api_spawn_retry(request)
+        retried = mgr.get(json.loads(resp.text)["id"])
+        assert retried.backend == "claude"

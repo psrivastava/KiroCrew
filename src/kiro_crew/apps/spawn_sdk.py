@@ -25,6 +25,7 @@ from typing import Awaitable, Callable
 from kiro_crew.agent_discovery import is_internal_agent_spec, list_agents
 from kiro_crew.sel import sel
 from kiro_crew.subagent_manager.admission.types import TASK_STORE_UNAVAILABLE_CODE
+from kiro_crew.subagent_wait_reasons import stopped_before_start
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +57,23 @@ def _audit_spawn_denied(app: str, agent: str, reason: str) -> None:
 #: can resolve that app's OWN profile (blast-radius containment), not just the
 #: policy ceiling. An empty id means the host declined.
 SpawnImpl = Callable[[str, str, bool, str, str], Awaitable[str]]
+
+
+def _app_spawn_model(app: str, agent: str) -> str:
+    """The user's ``apps.<name>.model`` for a spawn that picked no model, or ``""``.
+
+    ``""`` -- no setting, an agent that pins its own model, or a config that could
+    not be read -- leaves the spawn on the model it runs on without the setting.
+    Blocking (config load and agent JSON reads): call off the loop. Never raises.
+    """
+    try:
+        # Lazy: this SDK module imports no config at load time.
+        from kiro_crew.config.loader import KiroCrewConfig, resolve_app_spawn_model
+
+        return resolve_app_spawn_model(KiroCrewConfig.load(), app, agent)
+    except Exception:  # noqa: BLE001 — an unreadable setting must not refuse the spawn
+        logger.warning("Could not read the model setting for app %r", app, exc_info=True)
+        return ""
 
 
 class SpawnError(RuntimeError):
@@ -129,7 +147,9 @@ class SpawnSDK:
         bypassed. The parameter keeps its ``""`` default only so the failure is a
         loud raise here rather than a TypeError. ``model`` overrides the agent's
         default model for this run — unattended work is where users most want a
-        cheaper model, since nobody is present to weigh cost against quality.
+        cheaper model, since nobody is present to weigh cost against quality. With
+        no ``model``, the user's own ``apps.<name>.model`` setting applies unless
+        the agent pins a model.
         """
         if not task.strip():
             raise SpawnError("spawn task is empty")
@@ -215,6 +235,10 @@ def build_spawn_impl(subagents: object) -> SpawnImpl:
             )
             _audit_spawn_denied(app, agent, reason)
             raise SpawnError(reason)
+        # An explicit per-spawn model wins; with none, the app's own model setting
+        # applies unless the agent pins a model of its own.
+        if not model:
+            model = await asyncio.to_thread(_app_spawn_model, app, agent)
         # ``app`` is forwarded so SubagentManager.spawn can resolve the calling
         # app's per-app governance profile — a profile that denies
         # ``capabilities.spawn`` for this app must win even when the policy
@@ -231,11 +255,31 @@ def build_spawn_impl(subagents: object) -> SpawnImpl:
         )
         # Event-loop caller: the durable row is written on the store's writer
         # thread (``spawn_async``); a manager double without it spawns inline.
+        # Shared Crew fair admission: the spawn is a child charged to the app's
+        # bounded system principal; a refusal is a host decline.
+        from kiro_crew.shared_crew.admission_entry import admit_app_spawn
+        from kiro_crew.shared_crew.containment import principal_scope
+
+        admission = await admit_app_spawn(subagents, app)
+        if admission.rejected:
+            reason = admission.reason.value if admission.reason is not None else "refused"
+            raise SpawnError(
+                f"fair admission refused the spawn for app {app!r} ({reason})", declined=True
+            )
         spawn_async = getattr(subagents, "spawn_async", None)
-        if inspect.iscoroutinefunction(spawn_async):
-            info = await spawn_async(task, **spawn_kwargs)
+        try:
+            with principal_scope(None if admission.work is None else admission.work.budget_key):
+                if inspect.iscoroutinefunction(spawn_async):
+                    info = await spawn_async(task, **spawn_kwargs)
+                else:
+                    info = subagents.spawn(task, **spawn_kwargs)  # type: ignore[attr-defined]
+        except BaseException:
+            await admission.abandon()
+            raise
+        if info is None or bool(info.error) or not info.id:
+            await admission.abandon()
         else:
-            info = subagents.spawn(task, **spawn_kwargs)  # type: ignore[attr-defined]
+            await admission.attach_child(str(info.id), session_key=f"subagent:{info.id}")
         if info is None:
             return ""
         if getattr(info, "error", ""):
@@ -252,6 +296,10 @@ def build_spawn_impl(subagents: object) -> SpawnImpl:
             # fault no cooldown fixes, raised undeclined.
             declined = str(getattr(info, "error_code", "")) == TASK_STORE_UNAVAILABLE_CODE
             raise SpawnError(str(info.error), declined=declined)
+        if stopped_before_start(info):
+            # Stopped while it waited: its id never runs or finishes, so handing
+            # it back would leave the app polling a run that does not exist.
+            raise SpawnError("the spawn was stopped before it started; nothing ran")
         return str(getattr(info, "id", "") or "")
 
     # Ride the probe on the impl callable rather than adding a second parameter

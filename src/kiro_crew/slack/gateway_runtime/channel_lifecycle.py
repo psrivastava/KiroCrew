@@ -1,13 +1,13 @@
 """The channel transports' lifecycle after the orchestrator is built.
 
 The connect-time ``channels`` governance gate every transport start passes, the
-governed Slack socket connect, the live-config appliers (in-process restart of one
-channel, the Slack hot-field applier), the boot-time re-hoist from the config
-watcher, readiness badges, and the replay of the durable inbound spool.
+governed Slack socket connect, the live-config appliers (in-process restart of
+one channel, the Slack hot-field applier, the default-agent applier), the
+boot-time re-hoist from the config watcher, readiness badges, and the replay of
+the durable inbound spool.
 
 The per-channel hoists, ``_register_config_appliers`` and
-``_start_channel_transports`` stay in the facade: the hot-reload and readiness
-audits parse them there.
+``_start_channel_transports`` are in ``channel_boot``.
 
 Composed by :mod:`kiro_crew.slack.gateway`, whose globals its functions run on;
 see :mod:`kiro_crew.slack.gateway_runtime`.
@@ -19,6 +19,9 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from kiro_crew.slack.gateway import (
+        CRED_OWNER_ID,
+        CRED_SLACK_APP_TOKEN,
+        CRED_SLACK_BOT_TOKEN,
         HOST_SESSION_KEY,
         ChannelDescriptor,
         ChannelHistory,
@@ -331,9 +334,27 @@ async def _on_channel_config_change(self: GatewayOrchestrator, change: ConfigCha
     deferred: set[str] = set()
     for desc in bootable:
         if desc.channel_type in degraded:
+            # Defer this channel's section paths AND any synthetic
+            # ``credentials.<KEY>`` path for a credential it owns: the credential
+            # path lives in its own namespace, not under the section, so
+            # ``change.under`` alone would miss a ``.env`` rotation for a channel
+            # whose section is degraded -- leaving it neither restarted nor
+            # retried, stranding the transport on the old token until a full
+            # restart. The watcher replays the deferred paths once the section
+            # validates.
             deferred.update(change.under(desc.channel_type))
+            deferred.update(
+                f"{live.CREDENTIAL_CHANGE_PREFIX}.{k}"
+                for k in registry.changed_credential_keys(desc, change.changed)
+            )
             continue
+        # A boot-key change (``config.json``) and a credential change (``.env``,
+        # dispatched as a synthetic ``credentials.<KEY>`` path) both restart the
+        # channel: a live transport cannot adopt a new token or endpoint, and
+        # ``restart_channel`` re-reads ``cfg.load_credentials`` on the way back
+        # up, so the reconnected channel authenticates with the new credential.
         keys = registry.changed_boot_keys(desc, change.changed)
+        keys = keys | registry.changed_credential_keys(desc, change.changed)
         if keys:
             to_restart.append((desc.channel_type, keys))
     if not to_restart:
@@ -436,7 +457,13 @@ async def restart_channel(
         if cfg is None:
             cfg = live.snapshot() or await asyncio.to_thread(KiroCrewConfig.load)
         assert cfg is not None
-        creds = await asyncio.to_thread(cfg.load_credentials)
+        # propagate=False: this runs POST-BOOT on a channel reconnect, off the
+        # event loop. Boot already seeded os.environ, and the live watcher owns
+        # every mutation since. Re-seeding here via setdefault could restore a
+        # credential the watcher just popped (an external .env removal racing
+        # this reconnect), silently undoing the removal -- so this read only
+        # resolves the map it needs and leaves os.environ to the applier.
+        creds = await asyncio.to_thread(cfg.load_credentials, propagate=False)
         if cfg is not self._cfg:
             setattr(self._cfg, channel_type, getattr(cfg, channel_type))
         getattr(self, f"_hoist_{channel_type}")(cfg, creds)
@@ -474,7 +501,29 @@ async def restart_channel(
             self._forget_superseded_start(channel_type, client)
             return None
         self._channel_handles[channel_type] = client
+        # Published only now, under the lock and past the generation check: a
+        # start superseded mid-connect never exposed its webhook handler, so a
+        # request captured in that window cannot reach a client being discarded.
+        self._publish_teams_webhook({channel_type: client})
         return client
+
+
+def _publish_teams_webhook(self: GatewayOrchestrator, handles: dict) -> None:
+    """Bind ``state.teams_on_activity`` to the ACCEPTED Teams client, if any.
+
+    Teams' inbound route is pre-registered and dispatches to this late-bound
+    handler. ``maybe_start_teams`` deliberately does not bind it, because it runs
+    before the connect completes and a credential-triggered restart can be
+    superseded mid-connect; binding there would let a webhook captured in that
+    window be accepted by a client the host then discards. The host calls this
+    once a client is the stored handle: after boot's ``start_channels`` and after
+    a restart passes its generation check. Until then the route answers 503.
+    """
+    client = handles.get("teams")
+    state = getattr(self, "dashboard_state", None)
+    on_activity = getattr(client, "on_activity", None)
+    if state is not None and on_activity is not None:
+        state.teams_on_activity = on_activity
 
 
 def _forget_superseded_start(self: GatewayOrchestrator, channel_type: str, client: object) -> None:
@@ -526,6 +575,16 @@ async def _close_channel_locked(self: GatewayOrchestrator, channel_type: str) ->
                     exc_info=True,
                 )
     setattr(self, f"_{channel_type}_client", None)
+    # Teams' inbound webhook route is pre-registered and OUTLIVES the client: it
+    # dispatches to the late-bound ``state.teams_on_activity``, so a closed Teams
+    # client whose handler stays bound would keep validating and running turns
+    # for authenticated, allow-listed senders after its credential was removed.
+    # Clear the late-bound handler on close so the route has nothing to call
+    # until a restart rebinds it (the client itself also 503s once closed).
+    if channel_type == "teams":
+        state = getattr(self, "dashboard_state", None)
+        if state is not None and getattr(state, "teams_on_activity", None) is not None:
+            state.teams_on_activity = None
     self._channel_restart_gen[channel_type] = self._channel_restart_gen.get(channel_type, 0) + 1
 
 
@@ -562,6 +621,42 @@ async def _on_slack_config_change(self: GatewayOrchestrator, change: ConfigChang
     from kiro_crew.slack import handler as slack_handler
 
     new = change.new
+    # Slack's tokens live in ``.env`` / the vault, and its socket client is
+    # host-managed (``_connect_slack``), so unlike every other channel there is
+    # no in-process restart path that can re-authenticate it with a rotated
+    # token. The owner id is read once at construction into ``_owner_id`` and
+    # the owner allowlist, so a replaced or removed owner keeps authorizing the
+    # previous one until the next start. A ``.env`` edit to either is surfaced
+    # as the watcher's synthetic ``credentials.<KEY>`` path; apply what can be
+    # applied live below, but tell the operator the new token or owner needs a
+    # gateway restart, the same honest fallback as ``slack.command``.
+    # Matched by canonical environment-entry name, the same rule as
+    # ``registry.changed_credential_keys``: on Windows ``os.environ`` is
+    # case-insensitive, so a lowercase ``slack_bot_token`` line rotates the same
+    # entry Slack authenticates with, and a literal-case match would skip the
+    # notice. The names logged are the declared constants.
+    from kiro_crew.config.loader import _env_name_key
+
+    cred_prefix = live.CREDENTIAL_CHANGE_PREFIX + "."
+    changed_canon = {
+        _env_name_key(p[len(cred_prefix) :])
+        for p in change.under(live.CREDENTIAL_CHANGE_PREFIX)
+        if p.startswith(cred_prefix)
+    }
+    slack_cred_keys = sorted(
+        k
+        for k in (CRED_SLACK_APP_TOKEN, CRED_SLACK_BOT_TOKEN, CRED_OWNER_ID)
+        if _env_name_key(k) in changed_canon
+    )
+    if slack_cred_keys:
+        # nosemgrep: python.lang.security.audit.logging.logger-credential-leak.python-logger-credential-disclosure -- the format names a token, its argument is the KEY name only (never a credential value)
+        logger.warning(
+            "Slack credential(s) changed in .env (%s); Slack's socket connection and "
+            "owner authorization are fixed at gateway start and keep the previous "
+            "token and owner until the next start. "
+            "Run `kirocrew restart` to apply the new Slack token or owner.",
+            ", ".join(slack_cred_keys),
+        )
     slack_paths = change.under("slack")
     if slack_paths and "slack" in new.degraded_sections:
         # Deferred, not dropped: the watcher retries these paths once the
@@ -637,6 +732,33 @@ async def _on_slack_config_change(self: GatewayOrchestrator, change: ConfigChang
         )
 
 
+def _on_default_agent_config_change(self: GatewayOrchestrator, change: ConfigChange) -> None:
+    """Make a reloaded ``agent.default_agent`` the agent a new thread in Slack starts on.
+
+    The handler caches the agent a thread with no ``!ta`` / ``!agent`` override
+    starts on. This applier writes that cache for a change made by any other
+    writer (the dashboard, ``kirocrew config set``, an editor); ``!agent`` sets it
+    itself right after its own write, and the watcher then applies the same value.
+
+    A DISCARDED ``agent`` section holds defaults, and adopting those would drop
+    the configured agent: the configured default stays in force and this path is
+    raised as :class:`ConfigDeferred`, retried until the section validates.
+
+    It is its own subscription, apart from :func:`_on_slack_config_change`. The
+    watcher merges the paths a subscription defers with those it already holds
+    stale, so a deferral raised from the Slack applier would keep the Slack paths
+    stale for as long as the ``agent`` section stays discarded, and the Slack work
+    (an authorization audit record, the enterprise-id reload) would run again on
+    every tick.
+    """
+    from kiro_crew.slack import handler as slack_handler
+
+    new = change.new
+    if "agent" in new.degraded_sections:
+        raise ConfigDeferred(change.under("agent.default_agent"))
+    slack_handler.adopt_default_agent(new.agent.default_agent)
+
+
 async def _adopt_channel_sections_from_watcher(
     self: GatewayOrchestrator, boot: "tuple[ChannelDescriptor, ...]"
 ) -> dict[str, str]:
@@ -649,7 +771,13 @@ async def _adopt_channel_sections_from_watcher(
     pass :meth:`_adopt_channel_section_from_watcher` runs ahead of each
     start.
     """
-    creds = await asyncio.to_thread(self._cfg.load_credentials)
+    # propagate=False: this runs during _start_channel_transports, several
+    # awaited steps AFTER the live watcher is armed, so it is effectively a
+    # post-boot read. The primary boot seed already propagated .env into
+    # os.environ (run_gateway -> orchestrator init); re-seeding here via
+    # setdefault could restore a credential the watcher just popped (an external
+    # .env removal racing channel start), silently undoing the removal.
+    creds = await asyncio.to_thread(self._cfg.load_credentials, propagate=False)
     for desc in boot:
         self._adopt_channel_section_from_watcher(desc, creds)
     return creds
@@ -762,7 +890,10 @@ def _badge_unready_channels(
         if state is None:
             return
         bootable_types = {d.channel_type for d in bootable}
-        creds = self._cfg.load_credentials()
+        # propagate=False: a post-boot readiness read only needs the resolved
+        # map; re-seeding os.environ here could restore a credential the live
+        # watcher just popped (see restart_channel for the same reason).
+        creds = self._cfg.load_credentials(propagate=False)
         for row in channel_readiness(self._cfg, creds):
             if row.channel_type not in bootable_types or row.ready or not row.enabled:
                 continue

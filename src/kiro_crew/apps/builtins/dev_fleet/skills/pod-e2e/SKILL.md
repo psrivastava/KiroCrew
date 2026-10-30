@@ -52,7 +52,7 @@ systemd part -- so they are the portable choice, and the only one on a host that
 denies you the bus.
 
 ```
-pod_up     {"worktree": "<wt>"}   -> prose: port, base_url, token (+ttl)
+pod_up     {"worktree": "<wt>"}   -> prose: port, base_url, token (+ its two limits)
 pod_status {"worktree": "<wt>"}   -> status + port + health
 pod_ls     {}                     -> every pod active on this host
 pod_down   {"worktree": "<wt>"}   -> stopped, HOME reclaimed
@@ -87,6 +87,14 @@ curl -s "$base_url/api/<anything>?token=$token"      # backend API
 #    live gateway untouched
 kirocrew pod down <wt>
 ```
+
+The token is a link with two limits. The pod accepts the raw token for 5 minutes,
+and the first request that carries it opens a session, kept in a cookie, that lasts
+2h (`ttl` in the JSON is that session lifetime). So use the token straight away and
+drive the pod with the session: keep curl's cookie jar from that first request
+(`curl -c jar -b jar ...`) or let Playwright keep its context. A `?token=` sent after
+the window is refused with `403 token expired`; `pod_up` (or `kirocrew pod token
+<wt>`) on the running pod leaves it running and returns a fresh token.
 
 Other verbs: `ls` (list running pods) · `status <wt>` · `token <wt>` · `url <wt>`
 · `logs <wt>` · `provision <wt>`. Run `kirocrew pod --help` for the full list.
@@ -224,9 +232,9 @@ A missing or malformed handle is refused before any phase runs, naming the field
 that is wrong.
 
 **It does not run the worktree's test suite.** There is no pytest phase, on
-purpose: the suite is ~62k tests that need no pod, CI runs it on the merge ref,
-and a full local fan-out on a shared box costs far more than the browser check
-this harness exists for. Run the tests your change actually touches yourself,
+purpose: the suite is large and none of it needs a pod, CI runs it on the merge
+ref, and a full local fan-out on a shared box costs far more than the browser
+check this harness exists for. Run the tests your change actually touches yourself,
 in the worktree (see the `kirocrew-worktree-dev` skill), and let CI own the
 full suite.
 
@@ -335,6 +343,51 @@ feature you're testing. The runner handles this automatically:
 
 Pass `--no-suppress-first-run` to let those modals appear (only if testing the
 onboarding flow itself).
+
+### Feature flags off by default — seed them ON before boot
+
+A pod home boots from the **product defaults**, so an opt-in feature is OFF in
+a pod exactly as it is on a fresh install. The one that bites a spec is the
+Remote Crew panel: `instances.enabled` defaults to `false`, so
+`GET /api/instances` answers `403` and `RemoteCrewPanel` renders the
+"Multi-instance management is off" card instead of its tabs — a spec that
+drives the **Set up a new one** launch form times out on a locator that never
+mounts. `instances.enabled` is **restart-marked** (the SSH manager and the CSP
+`frame-src` relaxation initialize at startup), so a spec cannot turn it on via
+the settings API against the running pod; the flag has to be in the home's
+`config.json` **before** boot.
+
+`pod up --seed <dir>` is the mechanism: a `--seed` argument that is a PATH (it
+has a separator, or starts with `~` or `.`) contributes just that directory's
+sanitized `config.json` to the fresh home. So point it at a one-file dir that
+enables the flag:
+
+```bash
+D=$(mktemp -d); printf '{"instances":{"enabled":true}}' > "$D/config.json"
+kirocrew pod up <wt> --seed "$D" --json          # Set-up tab reachable
+```
+
+To then drive a spec against that pod with the harness, pass its handle to
+`pod-e2e.sh --handle-json` — build that file exactly as the
+"Running the suite when you cannot reach the bus" section above describes
+(it needs the `health` code from `kirocrew pod status <wt> --json`, which
+`pod up --json` does not emit).
+
+This does NOT change the shipped product default — the seed only affects this
+one pod's home. The same recipe works for any flag off by default, with two
+exceptions the pod seed floor enforces: a self-activating channel in
+`SEED_DISABLED_SECTIONS` (tunnel, telegram, discord, …) is forced back off so a
+seeded home cannot answer real people as the operator's bot, and the agent
+sandbox floor (`agent.sandbox`, `agent.sandbox_allow_unsandboxed_exec`,
+`agent.sandbox_allow_no_isolation`) is reset so a seeded config cannot unconfine
+the pod's agent — seeding either of those is silently overridden.
+
+> **A pod inherits the host's AWS profile.** `build_pod_env` passes the real
+> `HOME` and every `AWS_*` variable into the pod (pods run agent turns), so on
+> a machine with an AWS profile the Remote Crew launch form is backed by real
+> credentials. A spec must only **render** the Set-up form (assert it mounts),
+> never **submit** it — submitting could start a real remote crew billed to the
+> operator's account.
 
 ## PRIMARY USE — dev agent delegates to a QA agent
 

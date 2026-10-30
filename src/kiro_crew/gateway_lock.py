@@ -163,8 +163,7 @@ LOCK_FILENAME = "gateway.lock"
 LIVE_HOLDER_EXIT_CODE = 78
 
 # How many times ``acquire`` re-opens the lock path and re-takes the home
-# anchor, and how many times :func:`_anchor_holder_or_nobody` re-probes an
-# anchor that read as held. It bounds two transient causes: the inode
+# anchor. It bounds two transient causes: the inode
 # ``acquire`` locked differing from the inode the path names, and the home
 # anchor being held for the two syscalls :func:`_home_is_anchored` needs for
 # its non-destructive probe. Either clearing takes microseconds, while a real
@@ -1301,27 +1300,18 @@ def _anchor_holder_or_nobody(home: Path, path: Path) -> LockHolder:
     cannot be measured, the same indeterminate answer the lock file's own
     unnameable-holder case produces.
 
-    An anchored reading is a candidate, not a verdict. Another non-destructive
-    reader (a ``stop`` beside a ``cli_perf`` probe) holds the anchor for two
-    syscalls, and two such readers on an idle home can each see the other's
-    hold. The anchor is therefore re-probed up to ``_IDENTITY_ATTEMPTS`` times,
-    ``_RETRY_BACKOFF_SECS`` apart, and only a home that reads anchored on every
-    attempt goes on to the owner lookup: a passing reader has released within
-    one backoff, an incumbent never does. A single free reading is positive
-    evidence and returns ``nobody`` at once. A :class:`LockProbeError` from the
-    probe itself (an unopenable home, an unmeasurable filesystem) is a different
-    fact and propagates on the attempt that raised it.
+    The anchor is read once. :func:`_home_is_anchored` probes it shared, so
+    another non-destructive reader (a ``stop`` beside a ``cli_perf`` probe)
+    never reads as a holder, and an anchored reading is an exclusive hold: the
+    one a gateway takes in ``acquire`` and keeps until it releases.
 
     Probing the anchor can create and remove one throwaway directory inside
     *home* to tell an unsupported directory lock from a held one. That is a
     write, but it disturbs no holder, which is the sense in which this oracle
     is non-destructive.
     """
-    for attempt in range(_IDENTITY_ATTEMPTS):
-        if attempt:
-            time.sleep(_RETRY_BACKOFF_SECS)
-        if not _home_is_anchored(home, path):
-            return _NO_HOLDER
+    if not _home_is_anchored(home, path):
+        return _NO_HOLDER
     owner = platform_compat.flock_owner_pid(home)
     if owner is not None and platform_compat.pid_exists(owner):
         return LockHolder(pid=owner, alive=True, source="home_anchor")
@@ -1346,13 +1336,25 @@ def _lock_is_held(fd: int, path: Path) -> bool:
     caller's no-follow descriptor (see the module docstring), so the inode
     probed is the one classified, and the caller closes it.
 
+    POSIX takes the lock shared, which only an exclusive hold refuses: the
+    gateway holds ``gateway.lock`` exclusive for its whole life, so a held lock
+    still reads as held, while two readers probing an idle home at once (a
+    ``stop`` beside a ``cli_perf`` probe) both get it and neither reads the
+    other as a holder. ``msvcrt`` has no shared lock, so Windows still probes
+    exclusive. There two colliding readers can still see each other: the
+    second reads held and, with no owner surface, falls to the stamp. An
+    unreadable or empty stamp (the first reader's lock hides it) is
+    :class:`LockProbeError` with ``held=True``, which that reader's release
+    ends two syscalls later; a stamp is believed only for a live pid, the
+    same trust a held lock already gives it. Nothing is retried for this.
+
     The probe window itself is the one this process could win a race against a
     gateway acquiring at the same instant; it is microseconds wide and the
     gateway's own refusal names this pid, which is the same exposure the
     ``cli_perf`` probe carries.
     """
     try:
-        if platform_compat.try_acquire_lock(fd, exclusive=True):
+        if platform_compat.try_acquire_lock(fd, exclusive=False):
             platform_compat.release_lock(fd)
             return False
         return True
@@ -1368,15 +1370,16 @@ _WRITE_DENIED_ERRNOS = frozenset({errno.EACCES, errno.EPERM, errno.EROFS})
 def _open_probe_descriptor(path: Path) -> int:
     """Open the existing lock file for :func:`lock_holder`'s probe, never through a link.
 
-    POSIX opens read-write with ``O_NOFOLLOW``: some filesystems emulate
-    ``flock`` with record locks (Linux NFS without ``local_lock``), and an
-    exclusive record lock needs a descriptor open for writing, so a read-only
-    probe would read every free lock as held. No ``O_NONBLOCK``, as for every
-    read-write open of the lock (a lease break is waited out), and no
-    ``O_CREAT``: the probe never makes the file. A file this user cannot open
-    for writing (``EACCES``, ``EPERM`` or ``EROFS``: a ``0400`` lock left by
-    another account, a read-only filesystem) is probed through a read-only
-    descriptor instead. Windows opens read-only through
+    POSIX opens read-write with ``O_NOFOLLOW``. The lock does not need it: the
+    probe is shared, and where ``flock`` is emulated with record locks (Linux
+    NFS without ``local_lock``) a shared record lock needs only a descriptor
+    open for reading. The open does: a FIFO swapped in after the ``lstat``
+    never blocks a read-write open, so it needs no ``O_NONBLOCK``, which would
+    fail a lease break at once instead of waiting it out. No ``O_CREAT``: the
+    probe never makes the file. A file this user cannot open for writing
+    (``EACCES``, ``EPERM`` or ``EROFS``: a ``0400`` lock left by another
+    account, a read-only filesystem) is probed through a non-blocking
+    read-only descriptor instead, which the shared probe locks as well. Windows opens read-only through
     ``open_file_no_reparse(links_only=True)``, refusing only a reparse point
     that is a link. The caller still classifies the descriptor with ``fstat``.
     """
@@ -1461,10 +1464,13 @@ def _directory_locks_supported(
 def _home_is_anchored(home: Path, path: Path) -> bool:
     """True iff something holds the exclusive ``flock`` on *home* itself.
 
-    Non-destructive: a free directory is unlocked again immediately. Windows,
-    an absent home, or positively unsupported directory locks report False.
-    Other failures to open or measure the home raise :class:`LockProbeError`,
-    because callers must not read missing evidence as nobody running.
+    The probe takes the anchor shared, which only an exclusive hold refuses:
+    two readers probing at once both get it, so neither reads the other as a
+    holder. Non-destructive: a free directory is unlocked again immediately.
+    Windows, an absent home, or positively unsupported directory locks report
+    False. Other failures to open or measure the home raise
+    :class:`LockProbeError`, because callers must not read missing evidence as
+    nobody running.
     """
     if platform_compat.IS_WINDOWS:
         return False
@@ -1475,7 +1481,7 @@ def _home_is_anchored(home: Path, path: Path) -> bool:
     except OSError as exc:
         raise LockProbeError(path, exc) from exc
     try:
-        if platform_compat.try_acquire_lock(fd, exclusive=True):
+        if platform_compat.try_acquire_lock(fd, exclusive=False):
             platform_compat.release_lock(fd)
             return False
     finally:

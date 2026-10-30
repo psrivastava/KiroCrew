@@ -24,6 +24,7 @@ import time
 from typing import TYPE_CHECKING, Any, cast
 
 from kiro_crew import runtime_death
+from kiro_crew.agent_sdk.drivers.acp_vocab import is_user_worded_failure
 from kiro_crew.context import session_store_for_turn
 from kiro_crew.dashboard.chat_utils import (
     expire_slack_options,
@@ -35,6 +36,7 @@ from kiro_crew.hooks import HOOK_REPLY, TOOL_AUTO_APPROVE, TOOL_DENY, hook_gate_
 from kiro_crew.llm_helpers import save_conversation_turn_off_loop
 from kiro_crew.memory_stores import UnknownMemoryStore
 from kiro_crew.messaging import auto_title, turn_ceiling
+from kiro_crew.messaging.dashboard_live import DashboardLiveRenderer, TeeRenderer
 from kiro_crew.messaging.dispatch import (
     admit_inbound_callback,
     build_directive_consumer,
@@ -53,6 +55,10 @@ from kiro_crew.platform import current_context
 from kiro_crew.security import redact, redact_local_paths
 from kiro_crew.sel import sel
 from kiro_crew.session_allocation import SessionClosingError
+from kiro_crew.slack.agent_sessions.fence import fenced_turn
+from kiro_crew.slack.channel_crew import resolve_channel_crew
+from kiro_crew.slack.channel_policy import channel_refusal
+from kiro_crew.slack.format import escape_mrkdwn
 from kiro_crew.slack.handler import (
     _get_default_agent,
     _hydrate_conv_flags,
@@ -74,11 +80,12 @@ from kiro_crew.slack.handler import (
 from kiro_crew.slack.renderer import PARTIAL_TURN_MARKER
 from kiro_crew.slack.renderer import SlackApprovalDecider
 from kiro_crew.slack.renderer import SlackApprovalDecider as _APPROVAL_REGISTRY
-from kiro_crew.slack.renderer import SlackRenderer
+from kiro_crew.slack.renderer import SlackRenderer, _display_safe
 from kiro_crew.slack.thread_parent import (
     ThreadParent,
     fetch_thread_parent,
     has_prior_turns,
+    is_cron_owned,
     is_slack_born,
     parent_prompt_text,
     record_thread_parent,
@@ -114,6 +121,49 @@ logger = logging.getLogger(__name__)
 #: or "kirocrew"``) and the many ``agent="kirocrew"`` call sites.
 _DEFAULT_KIROCREW_AGENT = "kirocrew"
 
+#: Generic reply for a failed transport turn whose error text is not meant for
+#: the user (see ``_transport_error_text``).
+_TRANSPORT_ERROR_TEXT = "🔧 Something went wrong (transport path). Please try again."
+
+#: Longest error detail posted to Slack, the cap the native path applies to its
+#: ``UnknownMemoryStore`` refusal.
+_TRANSPORT_ERROR_DETAIL_MAX_CHARS = 1000
+
+
+def _redacted_error_detail(exc: BaseException) -> str:
+    """``str(exc)`` redacted, truncated and made inert as Slack markup.
+
+    Redaction runs before truncation so a cut can never leave the head of a
+    credential or path that the full-string passes would have matched. The
+    credential scan reads what Slack DISPLAYS as well as the bytes
+    (``_display_safe``): ``AKIA*<rest>*`` matches no pattern as written, yet
+    Slack renders the emphasis away and shows an intact key. The text
+    comes from outside Kiro Crew (a provider error can echo arbitrary input), so
+    Slack's entity characters are escaped last: ``<!channel>`` or ``<@U…>`` in it
+    must show as text, not notify anyone. Escaping after the cut means the cut can
+    never split an escape sequence.
+    """
+    detail = _display_safe(redact_local_paths(redact(str(exc)))[0])
+    return escape_mrkdwn(detail[:_TRANSPORT_ERROR_DETAIL_MAX_CHARS])
+
+
+def _transport_error_text(exc: BaseException) -> str:
+    """User-facing reply for a failed transport turn.
+
+    A classified backend ``AcpError`` (see ``is_user_worded_failure``) carries a
+    user-readable reason, for example a usage limit that retrying cannot fix, so
+    that reason is shown under the same ``❌`` prefix the native path uses. The
+    message can still quote a host path or a credential from the backend, so it
+    goes through the same redaction and length cap as the ``UnknownMemoryStore``
+    refusal. Every other failure, including an unclassified ``AcpError``, keeps
+    the generic retry text, because its message is internal detail.
+    """
+    if isinstance(exc, UnknownMemoryStore):
+        return _redacted_error_detail(exc)
+    if is_user_worded_failure(exc):
+        return f"❌ {_redacted_error_detail(exc)}"
+    return _TRANSPORT_ERROR_TEXT
+
 
 async def _refresh_dashboard_tab(session_key: str) -> None:
     """Push freshly-written transcript lines into an open dashboard tab.
@@ -146,6 +196,51 @@ async def _refresh_dashboard_tab(session_key: str) -> None:
             session_key,
             exc_info=True,
         )
+
+
+def _dashboard_live_view(
+    session_key: str,
+    conversation_log: ConversationLog | None,
+    *,
+    user_logged: bool,
+    provenance: dict[str, Any],
+) -> DashboardLiveRenderer | None:
+    """The live dashboard view for this turn, or ``None`` when there is none.
+
+    A thread whose conversation has a dashboard tab shows the turn there as it
+    runs: the tool steps and streamed text a dashboard turn shows, instead of
+    "Thinking..." until the reply lands. ``None`` -- the turn runs exactly as it
+    would without a dashboard -- when the gateway has no dashboard
+    (``--slack-only``), when nothing is persisted for this conversation (no
+    transcript, or an incognito/temporary thread), when the user's row did not
+    land at receipt (*user_logged*: the steps would be recorded above the
+    question they answer), or when the dashboard half cannot be loaded. Whether
+    the conversation has an OPEN tab is asked per event.
+    """
+    if conversation_log is None or not user_logged or _is_slack_restricted(session_key):
+        return None
+    try:
+        state = get_dashboard_state()
+        if state is None:
+            return None
+        # Function-local for the reason given in ``_refresh_dashboard_tab``.
+        from kiro_crew.dashboard.channel_live import ChannelLiveSink
+
+        sink = ChannelLiveSink(
+            state,
+            session_key,
+            conversation_log,
+            # Re-asked before every frame and write, like the transport's own
+            # writes: an ``!incognito`` landing mid-turn stops the live view.
+            allowed=lambda: not _is_slack_restricted(session_key),
+            provenance=provenance,
+        )
+    except Exception:
+        logger.debug(
+            "transport_dispatch: no dashboard live view session=%s", session_key, exc_info=True
+        )
+        return None
+    return DashboardLiveRenderer(sink)
 
 
 def flat_dm_session_key(channel: str, thread_ts: str | None, *, enabled: bool) -> str | None:
@@ -181,6 +276,7 @@ def flat_dm_session_key(channel: str, thread_ts: str | None, *, enabled: bool) -
     return f"{SLACK_NAMESPACE}:{channel}"
 
 
+@fenced_turn
 async def handle_message_transport(
     slack: SlackClientOps,
     sessions: SessionManager,
@@ -205,11 +301,16 @@ async def handle_message_transport(
     from_trusted_bot: bool = False,
     dm_single_session: bool = False,
     start_priority: StartPriority = StartPriority.BACKGROUND,
+    spool_text: str | None = None,
+    spool_attachments: int = 0,
 ) -> None:
     """Drive a Slack message through the new transport path end-to-end.
 
     ``start_priority``: as for ``handler.handle_message`` (rule:
     ``kiro_crew.start_priority``).
+
+    ``spool_text`` / ``spool_attachments``: as for ``handler.handle_message`` --
+    the pre-ingestion message the shutdown spool records instead of *text*.
 
     This replaces handle_message when the feature flag is on. It uses
     TurnDriver + SlackRenderer instead of the inline stream loop.
@@ -222,7 +323,7 @@ async def handle_message_transport(
     """
     Stats().inc_message_received()
     _t0 = time.monotonic()
-    inbound_text = text
+    inbound_text = text if spool_text is None else spool_text
     # Same key discipline as native handle_message: reply_ts is the bare Slack
     # thread timestamp (posting + thread-index key); session_key is the
     # canonical namespaced form (registry, conversation log, thread overrides
@@ -322,7 +423,9 @@ async def handle_message_transport(
     # Inbound channels-governance gate (off-loop), same as native handle_message:
     # a ``channels`` policy that denies ``slack`` drops the message before any
     # processing. Default build (no policy) permits — behavior unchanged.
-    if not await channel_inbound_permitted("slack"):
+    if not (
+        await channel_inbound_permitted("slack") and not channel_refusal(channel, caller=user_id)
+    ):
         logger.info("slack inbound (transport) dropped: denied by channels governance policy")
         return
 
@@ -348,6 +451,7 @@ async def handle_message_transport(
         user_id=user_id,
         thread_id=reply_ts,
         message_id=msg_ts,
+        attachments_dropped=spool_attachments,
     )
     if not await admit_inbound_callback(
         sessions,
@@ -513,6 +617,9 @@ async def handle_message_transport(
     # The turn's driver, for the finally: it records whether the backend
     # compacted the session, on every exit path.
     driver: TurnDriver | None = None
+    # This turn's live dashboard view, for the except and finally: its step writes
+    # are settled before any reply write there, and stopped once the turn ends.
+    _live: DashboardLiveRenderer | None = None
     # This turn's thread-replies read; its watermark moves in the finally.
     _thread_replies: ThreadReplies | None = None
 
@@ -596,8 +703,24 @@ async def handle_message_transport(
             or _get_default_agent()
             or _DEFAULT_KIROCREW_AGENT
         )
+        # A channel bound to a Crew agent RECORD runs as that record: its
+        # kiro_agent as the mode, its name as crew_agent, its workspace as cwd
+        # (slack/channel_crew.py). Only when the selected agent IS the channel's
+        # binding -- a thread value equal to it is that binding restored from the
+        # transcript header by ``_hydrate_thread_overrides`` -- and the session is
+        # Slack's own: a dashboard-linked session keeps its slot's project.
+        # ``_agent`` stays the record's name for the transcript header and the
+        # context builder.
+        _channel_crew = (
+            await asyncio.to_thread(resolve_channel_crew, agent_override)
+            if agent_override and _agent == agent_override and is_slack_born(session_key)
+            else None
+        )
+        _alloc: dict[str, Any] = (
+            _channel_crew.allocation_kwargs() if _channel_crew else {"agent": _agent}
+        )
         client, is_new, resumed = await sessions.get_or_create(
-            session_key, agent=_agent, channel_id=channel, start_priority=start_priority
+            session_key, channel_id=channel, start_priority=start_priority, **_alloc
         )
         _acquired = True
         # Authorize the outbound-image root, which only exists once the provider
@@ -606,8 +729,14 @@ async def handle_message_transport(
         # `files_outbound=True` advertises it: an agent that writes
         # `![chart](/tmp/chart.png)` ships the raw path as text. The root is the
         # provider's own resolved cwd, which is what bounds extraction to files
-        # the session may read. Mirrors the Discord dispatcher.
-        renderer.authorize_upload_root(client.cwd)
+        # the session may read. Mirrors the Discord dispatcher. The runtime's own
+        # `$KIROCREW_SCRATCH` goes beside it: that is where the agent is told to
+        # stage screenshots, and it is never under the cwd. Read defensively, like
+        # the other channels: a client without it must cost the scratch root,
+        # never the turn.
+        renderer.authorize_upload_root(
+            client.cwd, scratch_root=str(getattr(client, "work_scratch_dir", None) or "")
+        )
         # Expire AGAIN, now that the turn is serialized. The pass above (just
         # before the turn machinery) runs before `get_or_create` waits its turn,
         # so two messages arriving together both clear the control while it is
@@ -659,19 +788,28 @@ async def handle_message_transport(
         # answering an agent's DM, a reply under a cron post -- otherwise opens a
         # session knowing only the reply. Read once, on a fresh session with no
         # prior turns; recorded BEFORE the receipt row below so the transcript
-        # shows it above the reply. See ``slack/thread_parent.py``.
+        # shows it above the reply. A cron-owned thread reads it for the prompt
+        # only, on any fresh session. See ``slack/thread_parent.py``.
         _thread_parent: ThreadParent | None = None
         # One transcript read serves the parent and the thread-replies checks.
         _prior: bool | None = None
+        _slack_born = is_slack_born(session_key)
         if (
             is_new
             and not resumed
             and thread_ts
             and thread_ts != msg_ts
-            and is_slack_born(session_key)
-            and not (_prior := await has_prior_turns(conversation_log, session_key))
+            and (
+                is_cron_owned(session_key)
+                or (
+                    _slack_born
+                    and not (_prior := await has_prior_turns(conversation_log, session_key))
+                )
+            )
         ):
-            _record_parent = bool(conversation_log and not _is_slack_restricted(session_key))
+            _record_parent = bool(
+                conversation_log and _slack_born and not _is_slack_restricted(session_key)
+            )
             _thread_parent = await fetch_thread_parent(
                 slack, channel, thread_ts, with_author=_record_parent
             )
@@ -823,9 +961,17 @@ async def handle_message_transport(
             return ""
 
         # ── Drive the turn (renderer already started above) ──
+        # The Slack renderer gets every event first and exactly as before; an open
+        # dashboard tab bound to this thread gets the same turn live behind it.
+        _live = _dashboard_live_view(
+            session_key,
+            conversation_log,
+            user_logged=_logged_user_turn,
+            provenance={"source_thread": session_key, "source_user": user_id, "agent": _agent},
+        )
         driver = TurnDriver(
             client,
-            renderer,
+            TeeRenderer(renderer, _live) if _live is not None else renderer,
             approval_mode=approval_mode,
             decider=decider,
             # Preserve native handle_message's auto_approve_subagent_spawn hook:
@@ -854,6 +1000,8 @@ async def handle_message_transport(
             audit_session_key=session_key,
             audit_agent=_agent or "kirocrew",
             closing_gate=turn_ceiling.gate(session_key, lambda: sessions.begin_turn(session_key)),
+            undelivered_watch_key=session_key,
+            event_tap=_live.observe if _live is not None else None,
         )
         # The thread's owner as of the moment the turn starts producing output.
         # A dashboard link landing during the run moves the conversation to a
@@ -917,6 +1065,15 @@ async def handle_message_transport(
 
         renderer.stamp_options = _persist_and_stamp
         accumulated = await driver.run(full_message)
+        if _live is not None:
+            # A stream that ended without a terminal sent no DONE to settle on,
+            # and the reply is written below.
+            await _live.settle()
+        if not driver.completion_observed:
+            # No terminal, so no ``on_done``: the reply the renderer holds goes
+            # out here, or the thread would show nothing of a reply the
+            # transcript records.
+            await renderer.release_held_text()
 
         # ── Post-turn bookkeeping ──
         # The turn ended without raising (we have `accumulated`), so book its
@@ -1180,6 +1337,7 @@ async def handle_message_transport(
                     user_id=user_id,
                     thread_id=reply_ts,
                     message_id=msg_ts,
+                    attachments_dropped=spool_attachments,
                 ),
             )
         with contextlib.suppress(Exception):
@@ -1195,12 +1353,21 @@ async def handle_message_transport(
         # the reader did not get the answer: book a failure rather than leave an
         # unrecorded verdict hole. A finalized turn keeps its normal accounting.
         # Then re-raise: a cancellation must always propagate.
+        #
+        # The renderer holds the reply until ``on_done``, which a cancelled turn
+        # (``!stop``) never reaches: release what the model wrote first, so the
+        # thread shows it as it did when replies streamed live. Never raises.
+        if renderer is not None:
+            await renderer.release_held_text()
         if client and _acquired and renderer is not None and not renderer.turn_finalized:
             with contextlib.suppress(Exception):
                 await sessions.record_failure(session_key)
                 Stats().inc_message_failed()
         raise
     except Exception as exc:
+        if _live is not None:
+            # The partial rescue below writes the reply; the steps go first.
+            await _live.settle()
         logger.exception("transport_dispatch: error handling message")
         Stats().inc_message_failed()
         if client and _acquired:
@@ -1219,10 +1386,8 @@ async def handle_message_transport(
         # ── Rescue partial progress ──
         # A transient backend fault (the "died before streaming started" class,
         # a dropped stream) leaves the user row on disk and everything the model
-        # already produced in memory only. Nothing persisted it, so each retry
-        # re-read a transcript that ended at the question and started over: a
-        # 28-minute outage on 2026-09-02 burned five identical attempts that each
-        # re-derived the same ticket ids before dying again.
+        # already produced in memory only. Unpersisted, each retry re-reads a
+        # transcript that ends at the question and redoes the same work.
         #
         # Persisting the partial reply makes the next attempt resume — it reads
         # what was already established instead of rediscovering it. Guarded so
@@ -1254,8 +1419,8 @@ async def handle_message_transport(
         #     flock and ON the loop it single-shots and drops the row.
         #   * its own try/except: a disk failure here must not replace the real
         #     exception in the log with a bookkeeping one.
-        # Persist only what Slack CONFIRMED it showed. ``SlackRenderer`` batches on
-        # an edit throttle, so the text the model has produced runs routinely ahead
+        # Persist only what Slack CONFIRMED it showed. ``SlackRenderer`` holds the
+        # reply until the turn ends, so the text the model has produced runs ahead
         # of the text the user has seen; a rescue that persisted the former would
         # record unseen output as established fact, and the retry would build on
         # something that was never on screen. ``delivered_text`` is the renderer's
@@ -1271,13 +1436,11 @@ async def handle_message_transport(
         # throttled, replaced wholesale, or truncated. Slack is the one renderer
         # that keeps a per-append record of what the API acknowledged, so it is
         # the one place a rescue can persist shown text rather than produced text.
-        # A throttled flush can be holding a trailing word back so a timer tick
-        # cannot tear one in half. That hold is released by ``on_done`` or at a
-        # ``wait`` boundary -- neither of which a dying turn reaches -- so it is
-        # released here, before the ledger is read, or the rescued transcript
-        # would end one word short of what the model established.
+        # The renderer holds the reply until ``on_done``, which a dying turn
+        # never reaches, so it is released here, before the ledger is read, or
+        # the rescued transcript would miss what the model last established.
         if renderer is not None:
-            await renderer.release_held_word()
+            await renderer.release_held_text()
         _shown = renderer.delivered_text if renderer is not None else ""
         # ``strip`` decides EMPTINESS only. What gets persisted is ``_shown``
         # verbatim: leading indentation is content in a transcript — a fenced block
@@ -1317,7 +1480,7 @@ async def handle_message_transport(
         # setup (A trusts B, B trusts A) an error reply is itself a
         # bot-authored event the peer admits, so replying would open an
         # unbounded error-reply ping-pong. Mirrors the native path's guard in
-        # handler.py (from_trusted_bot and _had_error). The thread STATUS is
+        # handler_runtime/delivery.py (from_trusted_bot and _had_error). The thread STATUS is
         # cleared unconditionally — skipping it would leave a stale "working"
         # status pinned to the thread forever.
         if from_trusted_bot:
@@ -1326,15 +1489,7 @@ async def handle_message_transport(
             )
         else:
             try:
-                await slack.post_message(
-                    channel,
-                    (
-                        redact_local_paths(redact(str(exc)))[0][:1000]
-                        if isinstance(exc, UnknownMemoryStore)
-                        else "🔧 Something went wrong (transport path). Please try again."
-                    ),
-                    post_thread_ts,
-                )
+                await slack.post_message(channel, _transport_error_text(exc), post_thread_ts)
             except Exception:
                 pass
         try:
@@ -1342,6 +1497,9 @@ async def handle_message_transport(
         except Exception:
             pass
     finally:
+        if _live is not None:
+            # Nothing the live view still holds may land after this turn.
+            _live.abandon()
         # An approval window the driver never awaited -- the blocks went out and
         # the turn then ended before the decider -- has no wait of its own to close
         # it, so a later click would resolve a future nobody reads while the user
@@ -1380,14 +1538,31 @@ async def handle_message_transport(
         # wedge every later message in that conversation (and its queue drain)
         # until the gateway restarts, not merely lose this turn. Same guard as
         # Discord's dispatcher and the shared pipeline.
-        if renderer is not None:
-            try:
-                await renderer.close()
-            except Exception:
-                logger.warning(
-                    "Slack: renderer.close failed session=%s",
-                    session_key,
-                    exc_info=True,
-                )
-        if _acquired:
-            sessions.release(session_key)
+        #
+        # The release sits in a ``finally`` around the teardown, not after it:
+        # ``close()`` now awaits (it clears the thread status on a cancelled
+        # turn), so a ``!stop`` cancelling this task mid-close raises
+        # ``CancelledError`` -- which is not an ``Exception`` and would escape
+        # the guard below, skipping the release and leaking the semaphore. The
+        # ``finally`` gives the permit back on every exit path, matching the
+        # shared pipeline's own release guard.
+        try:
+            if renderer is not None:
+                try:
+                    await renderer.close()
+                except Exception:
+                    logger.warning(
+                        "Slack: renderer.close failed session=%s",
+                        session_key,
+                        exc_info=True,
+                    )
+        finally:
+            if _acquired:
+                sessions.release(session_key)
+                # The release is what ends the turn for an open dashboard tab
+                # bound to this thread (it reads the lease as the turn running),
+                # and a release raises no slots push of its own. Refresh once
+                # more AFTER it, or the tab keeps showing the finished turn as
+                # running until the next background pass. Best-effort; never
+                # raises.
+                await _refresh_dashboard_tab(session_key)

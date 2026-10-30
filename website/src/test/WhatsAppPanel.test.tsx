@@ -99,13 +99,51 @@ describe('WhatsAppPanel — status', () => {
   })
 
   it('renders WHY the channel is down, not just that it is', async () => {
-    seed({ connected: false, state: 'unpaired', connect_error: 'error: dial tcp timeout' })
+    seed({
+      connected: false,
+      state: 'unpaired',
+      connect_error: 'error: dial tcp timeout',
+      connect_failed: true,
+    })
     renderWithProviders(<WhatsAppPanel />)
     await waitFor(() =>
       expect(screen.getByTestId('whatsapp-connect-error')).toHaveTextContent(
         'error: dial tcp timeout',
       ),
     )
+    expect(screen.queryByTestId('whatsapp-connect-hint')).toBeNull()
+  })
+
+  it('reads the failure verdict from connect_failed, not from the text', async () => {
+    // A failure whose detail carries no lifecycle prefix still renders as one.
+    seed({ connected: false, state: 'unpaired', connect_error: 'socket refused', connect_failed: true })
+    const { unmount } = renderWithProviders(<WhatsAppPanel />)
+    await waitFor(() =>
+      expect(screen.getByTestId('whatsapp-connect-error')).toHaveTextContent('socket refused'),
+    )
+    unmount()
+
+    // Text shaped like a failure is a hint when the gateway says it is not one.
+    seed({ connected: false, state: 'error', connect_error: 'error: dial tcp timeout', connect_failed: false })
+    renderWithProviders(<WhatsAppPanel />)
+    await waitFor(() =>
+      expect(screen.getByTestId('whatsapp-connect-hint')).toHaveTextContent('error: dial tcp timeout'),
+    )
+    expect(screen.queryByTestId('whatsapp-connect-error')).toBeNull()
+  })
+
+  it('shows the pairing instruction as a hint, not an error', async () => {
+    seed({
+      connected: false,
+      state: 'pairing',
+      connect_error: 'pairing: scan the QR code from your phone',
+      connect_failed: false,
+    })
+    renderWithProviders(<WhatsAppPanel />)
+    await waitFor(() =>
+      expect(screen.getByTestId('whatsapp-connect-hint')).toHaveTextContent('scan the QR code'),
+    )
+    expect(screen.queryByTestId('whatsapp-connect-error')).toBeNull()
   })
 
   it('says nothing about a failure when the channel is up', async () => {
@@ -120,6 +158,47 @@ describe('WhatsAppPanel — status', () => {
     renderWithProviders(<WhatsAppPanel />)
     // The panel must say something rather than render an empty pane.
     await waitFor(() => expect(document.body.textContent).toBeTruthy())
+  })
+})
+
+describe('WhatsAppPanel — the neonize dependency', () => {
+  // What the gateway leaves in `connect_error` (MISSING_EXTRA_HINT): a bare pip
+  // line that may target another interpreter.
+  const RAW_HINT = 'The WhatsApp channel needs its optional dependency: pip install neonize==0.4.3.post0'
+  const CMD = '/opt/gw/bin/python -m pip install neonize==0.4.3.post0'
+  const missing = {
+    connected: false,
+    state: 'unpaired' as const,
+    connect_error: RAW_HINT,
+    connect_failed: true,
+    sdk_installed: false,
+  }
+
+  it('shows the command naming the gateway interpreter, not the raw hint', async () => {
+    seed({ ...missing, sdk_install_supported: true, sdk_install_command: CMD })
+    renderWithProviders(<WhatsAppPanel />)
+    await waitFor(() => expect(screen.getByTestId('sdk-install-command')).toHaveTextContent(CMD))
+    expect(screen.queryByTestId('whatsapp-connect-error')).toBeNull()
+    // Not the restart advice either: a restart is a dead end until it is installed.
+    expect(screen.queryByTestId('whatsapp-connect-hint')).toBeNull()
+    expect(document.body.textContent?.replaceAll(CMD, '')).not.toContain('pip install')
+  })
+
+  it('says an in-place install is unavailable when the gateway cannot pip', async () => {
+    seed({ ...missing, sdk_install_supported: false, sdk_install_command: '' })
+    renderWithProviders(<WhatsAppPanel />)
+    await waitFor(() =>
+      expect(screen.getByText(/cannot install extra packages, so neonize cannot be added here/)).toBeInTheDocument(),
+    )
+    expect(screen.queryByTestId('sdk-install-command')).toBeNull()
+    expect(document.body.textContent).not.toContain('pip install')
+  })
+
+  it('keeps showing connect_error from a gateway that predates the SDK fields', async () => {
+    seed({ connected: false, state: 'unpaired', connect_error: RAW_HINT, connect_failed: true })
+    renderWithProviders(<WhatsAppPanel />)
+    await waitFor(() => expect(screen.getByTestId('whatsapp-connect-error')).toHaveTextContent('neonize'))
+    expect(screen.queryByTestId('sdk-install-command')).toBeNull()
   })
 })
 
@@ -396,6 +475,42 @@ describe('WhatsAppPanel: groups', () => {
     await waitFor(() =>
       expect(save).toHaveBeenCalledWith({
         groups: [{ ...GROUP, mode: 'rules', rules: 'Answer 3D printing questions' }],
+      }),
+    )
+  })
+
+  // A cooldown of 0 means "no rate limit at all", so an emptied field must put
+  // the stored value back rather than reach the gate as `Number('')`, which is 0.
+  it.each(['', '   '])(
+    'puts the stored cooldown back when the field is cleared (%j)',
+    async cleared => {
+      const save = vi
+        .spyOn(api, 'saveWhatsAppConfig')
+        .mockResolvedValue({ ok: true, restart_required: false })
+      seed({ groups: [{ ...GROUP, mode: 'rules' }] })
+      renderWithProviders(<WhatsAppPanel />)
+      const field = (await screen.findByLabelText(
+        'Seconds between unprompted replies',
+      )) as HTMLInputElement
+      fireEvent.change(field, { target: { value: cleared } })
+      fireEvent.blur(field)
+      await waitFor(() => expect(field.value).toBe('120'))
+      expect(save).not.toHaveBeenCalled()
+    },
+  )
+
+  it('still commits a cooldown the operator typed, including an explicit 0', async () => {
+    const save = vi
+      .spyOn(api, 'saveWhatsAppConfig')
+      .mockResolvedValue({ ok: true, restart_required: false })
+    seed({ groups: [{ ...GROUP, mode: 'rules' }] })
+    renderWithProviders(<WhatsAppPanel />)
+    const field = await screen.findByLabelText('Seconds between unprompted replies')
+    fireEvent.change(field, { target: { value: '0' } })
+    fireEvent.blur(field)
+    await waitFor(() =>
+      expect(save).toHaveBeenCalledWith({
+        groups: [{ ...GROUP, mode: 'rules', cooldown_s: 0 }],
       }),
     )
   })

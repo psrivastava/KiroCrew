@@ -2,13 +2,30 @@ import { useCallback, useEffect, useState, type MutableRefObject } from 'react'
 import type { NavigateFunction } from 'react-router-dom'
 
 import { api } from '../../../api/client'
+import { apiErrorCode } from '../../../api/apiError'
 import { settingsPath } from '../../../components/settingsPath'
+import { useContinuePress } from '../../../hooks/useContinuePress'
 import { SETTINGS_DEFAULT_MODEL_ID, SETTINGS_TURN_TIME_LIMIT_HIGHLIGHT } from '../../../hooks/useSettingHighlight'
 import { useAppSelector } from '../../../store'
+import { i18nT } from '../../../i18n/t'
 import { selectContinuable, selectTrailingSendUnconfirmed, selectTurnInterrupted } from '../../../store/chatSlice'
 import type { ChatMessage } from '../../../types'
 import { KIRO_SIGN_IN_PATH } from '../../developer/kiroSignInLink'
-import { featureRequestRefusalIsNewest, sessionStartRepeatIsNewest } from '../transcriptRenderers'
+import type { CapabilityFix, FreshSessionState, RepairImagesState } from '../ErrorCard'
+import { newestErrorOwnsRecovery } from '../transcriptRenderers'
+
+/** A slot's repair-images state and the error row it was pressed for. */
+interface RepairImagesEntry { state: RepairImagesState; row: string }
+
+/** Identity of the transcript's newest error row ('' when there is none):
+ *  its timestamp and text, which survive older history being prepended. */
+function newestErrorRowKey(messages: readonly ChatMessage[]): string {
+  for (let j = messages.length - 1; j >= 0; j--) {
+    const m = messages[j]
+    if (m.role === 'error') return JSON.stringify([m.ts ?? null, m.content])
+  }
+  return ''
+}
 
 interface TurnRecoveryOptions {
   activeSlot: string | null
@@ -19,7 +36,7 @@ interface TurnRecoveryOptions {
   anchorModelBtn: (rect: DOMRect, trigger?: HTMLElement | null) => void
   setModelDropdown: (open: boolean) => void
   modelPickerReturnsFocusRef: MutableRefObject<boolean>
-  showRefusedPress: (action: 'continue', e: unknown) => void
+  showRefusedPress: (action: 'continue' | 'fresh_session' | 'repair_images', e: unknown) => void
 }
 
 /**
@@ -61,23 +78,19 @@ export function useTurnRecovery({
   // The footer's plain running indicator yields while the newest send is a
   // bubble whose receipt never came (see `selectTrailingSendUnconfirmed`).
   const sendUnconfirmed = useAppSelector(selectTrailingSendUnconfirmed)
-  const [continuing, setContinuing] = useState(false)
+  // The press and its spinner are `useContinuePress`, owned once with the panes.
   // Why the refusal is rendered rather than logged: the server re-checks under
   // the slot lock and can refuse a press the client believed was available
   // (`slot_running`, `slot_subagents_running`, an approval still pending). Left
   // in the console, that refusal reached the user as the button flicking to
   // disabled and straight back — a control that promises recovery and then says
   // nothing at all. `showRefusedPress` is the shared surface for exactly that.
-  useEffect(() => { setContinuing(false) }, [activeSlot])
-  // The turn taking over is the success signal; clear the spinner then.
-  useEffect(() => { if (continuing && slotRunning) setContinuing(false) }, [continuing, slotRunning])
-  // Backstop: a request that neither starts a turn nor rejects must not strand
-  // the button in a disabled state. Mirrors the regenerate safety timeout.
-  useEffect(() => {
-    if (!continuing) return
-    const t = setTimeout(() => { setContinuing(false) }, 30_000)
-    return () => clearTimeout(t)
-  }, [continuing])
+  const { continuing, press: handleContinue } = useContinuePress({
+    slot: activeSlot,
+    turnRunning: slotRunning,
+    continuable,
+    onRefused: (e) => showRefusedPress('continue', e),
+  })
   // Fix affordances on a model-entitlement error row. The picker is the same
   // portal the composer's model chip opens, anchored to that chip so it lands
   // where the user already knows to look; when the chip is not on screen (a
@@ -110,45 +123,147 @@ export function useTurnRecovery({
   const openTurnLimitSetting = useCallback(() => {
     navigate(settingsPath({ tab: 'chat', sub: 'advanced', highlight: SETTINGS_TURN_TIME_LIMIT_HIGHLIGHT }))
   }, [navigate])
-  // A `materialization_changed` row's fix: the member's Capabilities pane in
-  // the crew editor, where the changed agent file is reviewed and saved.
-  const openMemberCapabilities = useCallback((member: string) => {
-    navigate(`/capabilities?tab=crews&crew=${encodeURIComponent(member)}&pane=capabilities`)
+  // A capability refusal row's fix: the member's Approvals section in the
+  // crewmate editor, where a changed agent file is reviewed and saved
+  // (`pane=capabilities` is the link's stable spelling), or the editor itself,
+  // whose Built from field picks the agent (`foreign_private_copy`,
+  // `parent_identity_changed`).
+  const openMemberCapabilities = useCallback((member: string, fix: CapabilityFix = 'capabilities') => {
+    const pane = fix === 'capabilities' ? '&pane=capabilities' : ''
+    navigate(`/capabilities?tab=crews&crew=${encodeURIComponent(member)}${pane}`)
   }, [navigate])
-  // The non-inference exit for a feature request the plan could not afford
-  // (#13342) is decided per row in the shared row set, from the row alone: the
-  // user row the header's "Request a Feature" action sent carries the flow's
-  // stamp in its `meta`, so the form is offered on that turn's own refusal,
-  // while a usage limit in an ordinary chat, or after the user typed on in
-  // this one, keeps today's card. The card withholds Resume on that refusal
-  // because a retry replays the rejection; the composer must not urge it
-  // beneath the same card, so its Resume and "press Resume" hint yield too
-  // (same rule, same row).
-  const featureRequestRefused = featureRequestRefusalIsNewest(messages)
-  // Same rule for a session start that failed twice in a row: the card has
-  // withheld Resume (a third press re-runs the same start, and the server
-  // refuses it with `session_start_repeat`) and names the remedy, so the
-  // composer must not urge the press beneath it. Typing still works and is
-  // what resets the count.
-  const sessionStartRepeated = sessionStartRepeatIsNewest(messages)
+  // The newest error row can be one whose card has withheld Resume and names a
+  // remedy of its own: the issue form for the seeded feature-request turn the
+  // plan could not afford (#13342), the restart hint for a session start that
+  // failed twice, a fresh session for a conversation too big for the model, a
+  // refused app-owned agent turn. A retry replays the same rejection, so a
+  // composer beneath the card saying "press Resume" would argue with it; its
+  // Resume and hint yield too. Typing still works. One predicate spells the
+  // set (`newestErrorOwnsRecovery`), and the panes read the same one.
+  const cardOwnsRecovery = newestErrorOwnsRecovery(messages)
 
-  const handleContinue = useCallback(() => {
-    if (!activeSlot || continuing || !continuable) return
-    setContinuing(true)
-    // No optimistic transcript mutation: the backend appends the continuation as
-    // an `inject` row and the WS `slots` update flips `running`, so the UI
-    // converges from the server. Nothing to roll back on failure.
-    api.continueSlot(activeSlot).catch((e: unknown) => {
-      showRefusedPress('continue', e)
-      setContinuing(false)
+  // The fix on a `context_overflow` row: drop the native conversation so the
+  // next message starts a fresh one from a text summary of this chat. One entry
+  // per slot, so a request that settles after the user switched tabs (or
+  // pressed in another tab) only ever writes its own slot's state. The server
+  // refuses (409) while a turn or sub-agent runs; that refusal is rendered by
+  // the shared refused-press surface, like Continue's.
+  const [freshSessionBySlot, setFreshSessionBySlot] = useState<Readonly<Record<string, FreshSessionState>>>({})
+  const setSlotFreshSession = useCallback((slot: string, state: FreshSessionState) => {
+    setFreshSessionBySlot(prev => {
+      if ((prev[slot] ?? 'idle') === state) return prev
+      const next = { ...prev }
+      if (state === 'idle') delete next[slot]
+      else next[slot] = state
+      return next
     })
-  }, [activeSlot, continuing, continuable, showRefusedPress])
+  }, [])
+  const freshSession: FreshSessionState = (activeSlot && freshSessionBySlot[activeSlot]) || 'idle'
+  const handleFreshSession = useCallback(() => {
+    if (!activeSlot || freshSession !== 'idle' || slotRunning) return
+    const slot = activeSlot
+    setSlotFreshSession(slot, 'pending')
+    api.resetConversation(slot).then(
+      () => setSlotFreshSession(slot, 'done'),
+      (e: unknown) => {
+        showRefusedPress('fresh_session', e)
+        setSlotFreshSession(slot, 'idle')
+      },
+    )
+  }, [activeSlot, freshSession, slotRunning, showRefusedPress, setSlotFreshSession])
+  // A new turn on the active slot (the user sent again) starts its state over.
+  useEffect(() => { if (slotRunning && activeSlot) setSlotFreshSession(activeSlot, 'idle') }, [slotRunning, activeSlot, setSlotFreshSession])
+
+  // Repair-images recovery, per-slot like fresh-session above: the server
+  // downscales the oversized images in the transcript and re-issues the
+  // interrupted turn. It refuses (409) while a turn or sub-agent runs; that
+  // refusal is rendered by the shared refused-press surface.
+  //
+  // Each slot's state belongs to the error row it was pressed for: a resumed
+  // turn can hit another oversized image and append a NEWER image_repair row,
+  // and that row must start at `idle` with its own Repair / fresh-session
+  // actions instead of inheriting the previous repair's `done`.
+  const newestErrorRow = newestErrorRowKey(messages)
+  const [repairImagesBySlot, setRepairImagesBySlot] = useState<Readonly<Record<string, RepairImagesEntry>>>({})
+  const setSlotRepairImages = useCallback((slot: string, state: RepairImagesState, row = '') => {
+    setRepairImagesBySlot(prev => {
+      const cur = prev[slot]
+      if (state === 'idle') {
+        if (!cur) return prev
+        const next = { ...prev }
+        delete next[slot]
+        return next
+      }
+      if (cur && cur.state === state && cur.row === row) return prev
+      return { ...prev, [slot]: { state, row } }
+    })
+  }, [])
+  const repairEntry = activeSlot ? repairImagesBySlot[activeSlot] : undefined
+  const repairImages: RepairImagesState = repairEntry && repairEntry.row === newestErrorRow ? repairEntry.state : 'idle'
+  const handleRepairImages = useCallback(() => {
+    if (!activeSlot || repairImages !== 'idle' || slotRunning) return
+    const slot = activeSlot
+    const row = newestErrorRow
+    setSlotRepairImages(slot, 'pending', row)
+    api.repairImages(slot).then(
+      (res) => {
+        // Only claim a repair when the server actually rewrote the transcript.
+        // repaired=false means there was nothing over the cap (or no transcript
+        // to repair): say nothing and fall back to idle so the re-issued turn's
+        // own state shows, rather than a false "images repaired" line. When a
+        // real repair happened but the turn did not re-issue (resumed=false: a
+        // turn started racing), keep a Resume affordance instead of claiming
+        // the reply is running.
+        if (!res.repaired) setSlotRepairImages(slot, 'idle')
+        else setSlotRepairImages(slot, res.resumed ? 'done' : 'done_not_resumed', row)
+      },
+      (e: unknown) => {
+        // Only the backup-exists refusal is a permanent dead end: a prior
+        // `.pre-image-repair.bak` sidecar blocks a second repair and only a
+        // manual file move clears it, so the card drops into `failed` and
+        // offers a fresh session. Every OTHER refusal — the generic
+        // `image_repair_failed` (a moved transcript, an unverifiable scan, an
+        // OSError) and the transient reload 409s (`turn_in_flight`,
+        // `session_rebound`, `slot_subagents_running`) — can clear on a retry,
+        // so the button stays pressable (`idle`) and the shared refused-press
+        // notice carries the specific reason.
+        const code = apiErrorCode(e)
+        // An Incognito / Temporary chat is refused before any teardown, since
+        // its reload erases the history the repair would rewrite: the same dead
+        // end, with its own reason on the card.
+        const notPersistent = code === 'image_repair_not_persistent'
+        const deadEnd = code === 'image_repair_backup_exists' || notPersistent
+        // The failed card carries its own plain-language reason, so a raw
+        // refused-press notice on top would be a second message about the same
+        // thing: suppress it for the dead end. For the genuine repair failure
+        // (`image_repair_failed`: a moved transcript, an unverifiable scan, an
+        // OSError) the raw backend text is not actionable, so show the friendly
+        // localized line (the one repair is NOT used up — a failed attempt does
+        // not count). But a transient reload 409 (`turn_in_flight`,
+        // `slot_subagents_running`, `session_rebound`) names a specific, acted-on
+        // state, so pass its own message through rather than hiding it behind the
+        // generic "something went wrong".
+        if (!deadEnd) {
+          const transient = code && code !== 'image_repair_failed'
+          const notice = transient
+            ? (e instanceof Error && e.message ? e : new Error(String(e)))
+            : new Error(i18nT('pages.chat.errorCard.repair_images_retry_hint'))
+          showRefusedPress('repair_images', notice)
+        }
+        setSlotRepairImages(slot, notPersistent ? 'failed_not_persistent' : deadEnd ? 'failed' : 'idle', row)
+      },
+    )
+  }, [activeSlot, repairImages, newestErrorRow, slotRunning, showRefusedPress, setSlotRepairImages])
+  useEffect(() => { if (slotRunning && activeSlot) setSlotRepairImages(activeSlot, 'idle') }, [slotRunning, activeSlot, setSlotRepairImages])
+
   // (The newest-error index that gates the Continue button is derived inside
   // the shared row set from the transcript it is handed -- see
   // transcriptRenderers.tsx `lastErrorIndex`.)
   return {
     continuable, interrupted, sendUnconfirmed, continuing, handleContinue,
     openModelPickerFromError, openDefaultModelSetting, openKiroSignIn, openMemberCapabilities, openTurnLimitSetting,
-    featureRequestRefused, sessionStartRepeated,
+    cardOwnsRecovery,
+    freshSession, handleFreshSession,
+    repairImages, handleRepairImages,
   }
 }

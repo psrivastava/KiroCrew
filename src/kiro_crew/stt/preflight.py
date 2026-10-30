@@ -319,11 +319,11 @@ def binary_identity() -> _BinaryIdentity | None:
 def host_flags(cpuinfo_path: Path | None = None) -> frozenset[str] | None:
     """The CPU feature tokens the kernel reports, lower-cased, or ``None``.
 
-    Linux only. x86-64 goes through :func:`kiro_crew.embeddings._linux_x86_64_cpu_flags`,
-    the reader the embedding runtime already uses against the same ggml/SIGILL
+    Linux only. x86-64 goes through :func:`kiro_crew.embeddings._linux_x86_64_cpu_flags`
+    and AArch64 through :func:`kiro_crew.embeddings._linux_aarch64_cpu_features`,
+    the readers the embedding runtime already uses against the same ggml/SIGILL
     threat (features shared by EVERY visible core, ``sse3`` added beside ``pni``),
-    so this repository keeps one x86 cpuinfo parser. AArch64 has no reader there;
-    its ``Features`` line is intersected across cores here the same way.
+    so this repository keeps one cpuinfo parser per architecture.
 
     ``None`` means "unknown", and an unknown host is never refused on -- the
     subprocess probe is the evidence that stands on its own on every platform;
@@ -345,24 +345,16 @@ def host_flags(cpuinfo_path: Path | None = None) -> frozenset[str] | None:
 
         return _linux_x86_64_cpu_flags(path)
     if not machine.startswith(("aarch64", "arm64")):
-        # The `Features` reader below is an AArch64 reader: a 32-bit ARM kernel
+        # The `Features` reader is an AArch64 reader: a 32-bit ARM kernel
         # (`armv7l`, or an `armv8l` userspace) spells `neon` where the 64-bit
         # kernel spells `asimd`, so a source-built recogniser that runs fine
         # would be refused on a spelling. Any architecture without a reader is
         # "unknown", and an unknown host is never refused on.
         return None
-    try:
-        cpuinfo = path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return None
-    per_cpu: list[frozenset[str]] = []
-    for line in cpuinfo.splitlines():
-        key, sep, value = line.partition(":")
-        if sep and key.strip().lower() == "features":
-            per_cpu.append(frozenset(tok.lower() for tok in value.split()))
-    if not per_cpu:
-        return None
-    return frozenset.intersection(*per_cpu)
+    # Same circular import as above.
+    from kiro_crew.embeddings import _linux_aarch64_cpu_features
+
+    return _linux_aarch64_cpu_features(path)
 
 
 def missing_features(
@@ -389,7 +381,7 @@ def _run_probe_child(timeout: float, extension: str) -> tuple[int | None, str, s
 
     ``-I`` (isolated: no ``''`` on ``sys.path``, no ``PYTHON*`` env, no user site)
     so nothing in whatever directory the gateway was started from can shadow the
-    extension -- the same "nothing to shadow" reasoning as ``sandbox.py``'s probe
+    extension -- the same "nothing to shadow" reasoning as ``sandbox_probe.py``'s probe
     shim. ``-S`` on top of it, because ``-I`` still imports ``site`` at startup and
     ``site`` executes every ``import`` line of every ``.pth`` file in the
     interpreter's site-packages -- a directory written by whoever installs into
@@ -444,6 +436,24 @@ def _classify_exit(returncode: int) -> str | None:
     return None
 
 
+#: The closing sentences of a ``CODE_UNSUPPORTED_CPU`` refusal: what to do now.
+#:
+#: No published build is offered because none fits: PyPI ships one recogniser
+#: wheel per Python and platform, and every desktop app bundles that one into an
+#: interpreter the user does not rebuild packages into. A pip install can be
+#: rebuilt from source, which compiles the recogniser for the CPU it runs on, so
+#: that remedy is offered on every OS but only for a pip install. Another
+#: provider is named, never chosen for the user: Amazon Transcribe sends the
+#: audio to AWS and bills the account, so the sentence says so.
+_UNSUPPORTED_CPU_REMEDY = (
+    "Pick Amazon Transcribe as the provider (stt.provider), which sends the audio "
+    "to AWS and bills your AWS account, or turn speech-to-text off (stt.enabled). "
+    "If Kiro Crew was installed with pip rather than the desktop app, you can "
+    "instead rebuild the speech runtime from source here (needs a C++ compiler "
+    "and CMake), which builds it for this CPU"
+)
+
+
 def _build_features(info: str) -> tuple[str, ...]:
     """The ``KEY = 1`` names in a system-info string, via the capabilities parser."""
     flags, _sections = capabilities._parse(info)
@@ -487,8 +497,7 @@ def probe_native(
                 CODE_UNSUPPORTED_CPU,
                 "the speech runtime raised Illegal instruction on this CPU before any "
                 "model was loaded: the installed build was compiled for instructions "
-                f"this machine ({platform.machine()}) does not have. Turn speech-to-text "
-                "off (stt.enabled), or install a build made for this CPU",
+                f"this machine ({platform.machine()}) does not have. " + _UNSUPPORTED_CPU_REMEDY,
             )
         if code == CODE_NATIVE_PROBE_CRASHED:
             return Verdict(
@@ -514,8 +523,7 @@ def probe_native(
             "the installed speech runtime was built for "
             + ", ".join(lacking)
             + f", which this CPU ({platform.machine()}) does not have; loading it "
-            "would stop the gateway with Illegal instruction. Turn speech-to-text "
-            "off (stt.enabled), or install a build made for this CPU",
+            "would stop the gateway with Illegal instruction. " + _UNSUPPORTED_CPU_REMEDY,
             raw=out.strip(),
         )
     return Verdict(True, raw=out.strip())

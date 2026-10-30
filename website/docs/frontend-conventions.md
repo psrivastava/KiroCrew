@@ -39,6 +39,16 @@ commit that touches it. The API needs Chrome/Edge 105, Safari 17.2 or Firefox
 140; older browsers paint no highlight, while match counting and stepping to
 the current match keep working (`utils/domHighlight.ts`).
 
+Pierre draws a fenced code block into a shadow root. A `TreeWalker` never
+enters it, and a document selection reports a drag inside it as collapsed.
+`utils/pierreShadow.ts` therefore reads the block's source lines for the preview
+find, which needs no API newer than the one above, and resolves a selection with
+`Selection.getComposedRanges`, which needs Chrome/Edge 137, Safari 17 or
+Firefox 142; older browsers open no selection toolbar over a code block.
+`SelectionToolbar` takes such a selection only from a host that passes
+`codeSelection` (the file panel's markdown preview), because the other hosts'
+comment anchors cannot resolve it.
+
 ## Shared components
 
 `src/components/ui.tsx` is the primitive set. Compose from it rather than
@@ -214,6 +224,7 @@ and every other concern has one owner under `components/markdown/`.
 | `markdown/streamingEffects.ts` | the streaming tail's glow, reveal and caret |
 | `markdown/linkBoundaryRepair.ts` | the source-level link repairs gated on remark's own parse: CJK autolink boundaries and refused link destinations |
 | `markdown/elements.tsx` | the restyle-only element overrides and the sanitizer-derived attribute forwarding they share (`sp` / `spa`) |
+| `markdown/typography.ts` | the heading, list, table-cell and inline-run class strings `markdown/elements.tsx` and the Office preview's `OfficeBlockList` (`FileRenderers.tsx`) both render; `markdownTypographyParity.test.tsx` pins the two surfaces to it |
 | `markdown/InlineCode.tsx`, `markdown/copyFeedback.tsx` | the inline-code chips (path, session, work item, sidebar folder (`FolderChip`), copy) and the copy outcome every chip shares |
 | `markdown/MarkdownTable.tsx` | a table, its Markdown / CSV copy row, and the Widen / Narrow toggle |
 | `markdown/useMarkdownTableColumns.tsx` | resizable table columns (the second `ColumnResizer` consumer) |
@@ -225,11 +236,59 @@ and every other concern has one owner under `components/markdown/`.
 Imports run one way. The facade imports the owners, and nothing under
 `components/markdown/` imports the facade: a module that did would receive the
 stub in every spec that mocks the renderer. Consumers keep importing from the
-facade for the same reason. Three things must stay in the facade's own text: the
+facade for the same reason. The one exception is `markdown/typography.ts`, which
+`FileRenderers.tsx` imports directly: it is plain data with no imports of its
+own, and reading it through the facade would hand the Office preview the
+renderer's stub in every spec that mocks the renderer. Three things must stay in the facade's own text: the
 seven remark/rehype package imports (`test/test_source_providers.py` pins that
 set against the backend converter), `import '../utils/hljs'`
 (`hljsCoreOnly.test.ts`), and the two lines the i18n added-line gate counts, in
 `MdAnchor` and `stripStrayToolUseTags`.
+
+### The file panel, the chat pane and the browser panel
+
+`components/MarkdownPanel.tsx` (a side-panel file tab), `components/ChatPane.tsx`
+(one chat session in split view or a mate's chat) and
+`components/WebPreviewPanel.tsx` (the Browser tab) are facades over sibling owners
+in `components/`. Each facade keeps its module id, its default export and every
+named export: hosts import it, and the specs that mount a host mock it by that id,
+so a consumer never imports an owner. Imports run one way, from the facade to its
+owners. Each owner hook is called once per render at a fixed place in its facade,
+so the panel's effects keep one order.
+
+| Owner | Holds |
+|---|---|
+| `MarkdownPanel.tsx` | `Props`, the panel and its two layouts (side panel, full screen), the edit, save, close and navigate guards, comment drafts and their anchor highlight, the line reveal |
+| `MarkdownPanelHeader.tsx` | the header's controls: the breadcrumb, the artifact and knowledge toggles, the ⋯ menu |
+| `useMarkdownPanelFileState.ts` | the file's knowledge-library and artifact-library state |
+| `MarkdownPanelBody.tsx` | the body's blocks: comment hint, missing-file banner, empty-diff notice, diff view, comment overlay, find bar |
+| `markdownPanelSourcePos.ts` | where a selection sits in the source (`resolveSourcePos`, `findCoords`) |
+| `useMarkdownPanelFind.ts` | the CSS Custom Highlight registry and preview find (Cmd+F) |
+| `useMarkdownPanelDisk.ts` | the disk truth (the panel's reads, the catch-up latch, the watch, the missing-file retry, the last-copy rescue) and the working-tree diff against HEAD |
+| `useImageBoxComments.tsx` | image box comments: the box draft and its typed text (`useImageBoxDraft`), and the host the rendered images read plus the box composer (`useImageBoxHost`) |
+| `useCommentHint.ts` | who sees the comment hint, with which wording, and its New badge |
+| `ChatPane.tsx` | the pane's layout and dock, its store reads, the follow-up chips, the queue-card actions, and the transcript mount (`transcript={{ … }}`) |
+| `ChatPaneProps.ts` | the props interface and `PaneLeading` |
+| `useChatPaneDraft.ts` | the pane-local composer draft, parked and restored per slot |
+| `useChatPaneUploads.ts` | uploads, drops, and their per-slot notices |
+| `useChatPanePickers.ts`, `ChatPanePickerMenus.tsx` | the agent and model pickers' data and actions, and their two portaled menus |
+| `useChatPaneSend.ts` | send, steer, the slash commands the pane intercepts, the message quote, the question card's one-click answer (its 404 fallback, `onFallbackSend`, stays in `ChatPane.tsx`) |
+| `useChatPaneTurnControl.ts` | the Stop press protocol and the run-state reconciliation |
+| `useChatPaneContinue.ts` | the pane's side of Resume: the composer's and the newest error row's offer for the pane's own slot, and the notice when the gateway refuses it. The press and its spinner are `hooks/useContinuePress.ts`, the one ChatPage's `useTurnRecovery` uses too |
+| `ChatPaneTranscript.tsx` | the transcript row set and the rows above the first message |
+| `WebPreviewPanel.tsx` | the panel: address bar, frame, device presets, liveness probe, launcher, the CLI browser view |
+| `webPreviewPanelUrl.ts` | what a target may be: URL coercion, the loopback and embed rules, the self-origin check, the session feed (`setSessionPreviewUrl`, `setSessionPreviewPending`) |
+| `useWebPreviewPanelAnnotate.ts` | Annotate: per-slot notes on picks in the native page |
+| `WebPreviewPanelNativeSurface.tsx` | the native browse surface |
+
+New work for a responsibility in the table goes to its owner, and work that
+belongs to none of them starts in the facade. Two kinds of line stay in a
+facade's own text: the ones the i18n added-line gate counts (the comment-highlight
+paint rules in `MarkdownPanel.tsx`; `DEVICE_PRESETS` and `RELOAD_PARAM` in
+`WebPreviewPanel.tsx`), and the constructs a source-reading spec pins there (in
+`ChatPane.tsx` the transcript and dock wiring and the question card's
+`onFallbackSend` with `answerRejectedMessage`; in `MarkdownPanel.tsx` the reveal
+effect, the header's `onToggleDiffSplit` call site and the `pathBasename` use).
 
 ### Which switcher
 
@@ -258,6 +317,80 @@ stays behind every tab label while crossing between segments.
 A navigation rail sits in `TABS_RAIL_ROW_CLASS` (rail, rule, then content). The
 rule is load-bearing rather than decoration: it is the only thing telling a
 navigation rail apart from a filter pill, and the System page stacks both.
+
+### The About, Chat and MCP settings panels
+
+`pages/settings/AboutPanel.tsx` (Settings ▸ About), `pages/settings/ChatPanel.tsx`
+(Settings ▸ Chat) and `pages/settings/McpManagement.tsx` (Settings ▸ Developer ▸
+MCP Management) are facades over sibling owners in `pages/settings/`. Each facade keeps its
+module id and every export, so hosts and the specs that mock a panel keep naming the
+facade. Nothing outside a panel's own files imports one of its owners, and no owner
+imports its facade; the only edges between owners are `AboutPanelGatewayUpdate.tsx` to
+`AboutPanelUpdateFlow.tsx`, the three `useChatPanel*` hooks to `chatPanelOptions.ts`, and
+the two MCP views to `mcpManagementModel.ts`. A facade calls each owner hook once per
+render, in a fixed place among its own hooks, so each panel registers its hooks in one
+fixed order.
+
+| Owner | Holds |
+|---|---|
+| `AboutPanel.tsx` | the panel: the identity hero and both channel switchers, the desktop update card and its errors (`UPDATE_ERROR_KEYS`), the auto-download and auto-update switches |
+| `AboutPanelUpdateFlow.tsx` | `InAppUpdateFlow` (arm, approve on the host, apply), `AgentUpdateRequestCard`, `RestartGatewayButton`, `copyCommand` |
+| `AboutPanelGatewayUpdate.tsx` | a gateway install's update flow: its state hook, the Updates card body, the apply confirm |
+| `ChatPanel.tsx` | the rail (`railItems`), every page's `case` with its controls, the save-error banner, the composer, About-you and session toggles' state |
+| `chatPanelOptions.ts` | option tables, bounds and the config shapes the controls read |
+| `ChatPanelLinkPatternsEditor.tsx` | the `dashboard.link_patterns` rule editor |
+| `useChatPanelDashboard.ts` | the `dashboardConfig` read and writes, Feature Tips and the feature-video readout |
+| `useChatPanelTypedFields.ts` | the draft-backed number and path fields (Advanced, Sessions) |
+| `useChatPanelModels.ts` | the Model page: fallback models, defaults, selectable models, the agent-pin notice, per-role rows |
+| `McpManagement.tsx` | the page: the view tabs, the sharing and pre-resolve cards, the servers table, the Share all list |
+| `mcpManagementModel.ts` | wire types, error-key tables, the row-state derivation and the sharing-evidence verdict |
+| `McpManagementLaunchReview.tsx` | a row's share button, its Details (the agents that declare it), and its hint |
+| `McpManagementAssessment.tsx` | the Sharing assessment view and its Measure control |
+
+New work for a responsibility in the table goes to its owner, and work that belongs
+to none of them starts in the facade. Three kinds of construct stay in a facade's own
+text, because a generator or a gate reads them there: every Settings* primitive and
+settings-search anchor (`website/scripts/settingsExtract.ts` maps files by name), the
+Chat rail's `railItems` (`website/scripts/gen-ui-index.mjs`), and the lines the i18n
+and unit-literal added-line gates count. The tier labels and the contrary-tier set
+that `test/test_mcp_shareability_frontend_parity.py` pins live in
+`mcpManagementModel.ts`.
+
+### The Security and Remote Crew settings panels
+
+`pages/settings/SecurityPanel.tsx` (Settings ▸ Security) and
+`pages/settings/RemoteCrewPanel.tsx` (Settings ▸ Remote Crew) are facades over sibling
+owners in `pages/settings/`, with the same contract as the panels above: each facade
+keeps its module id and re-exports every name callers import from it, nothing outside
+a panel's own files imports one of its owners, and no owner imports its facade. Every
+component moved whole, so each one registers its hooks in its BASE order.
+
+| Owner | Holds |
+|---|---|
+| `SecurityPanel.tsx` | the rail: `SECURITY_SECTIONS`, `SECTION_LABEL_KEY` (read by `gen-ui-index.mjs`), `SECTION_GROUP_KEY`, the rail summaries, the panel, and the Documentation section |
+| `SecurityPanelPosture.tsx` | Live security posture, and the status row and chip the tailnet card reuses |
+| `SecurityPanelApprovals.tsx` | the ad-hoc auto-approve duration card |
+| `SecurityPanelDeniedCommands.tsx` | Denied commands: the built-in rules by category, the custom deny patterns, the pinned and floor tooltip keys |
+| `SecurityPanelTailnet.tsx` | the tailnet origin card and `TAILNET_STATE_KEY`, which the rail summary reads |
+| `SecurityPanelTrust.tsx` | third-party app trust grants, per-registry Git-identity trust grants, and their failure messages |
+| `SecurityPanelRedaction.tsx` | the credential-redaction switch, the allowed long-query hosts, `RedactionSection` |
+| `SecurityPanelLayers.tsx` | the defense-in-depth layer registry (`FEATURES` and its catalog keys) and its section |
+| `SecurityPanelGovernance.tsx` | the governance-policy viewer, its scope labels and planes, the central-distribution block |
+| `RemoteCrewPanel.tsx` | the panel component: both tabs, every query and mutation, the launch form |
+| `remoteCrewPanelModel.ts` | launch-job predicates, the remembered launch-form keys, the size tiers, the sign-in failure sentences |
+| `RemoteCrewPanelLaunch.tsx` | the setup tab's size, provisioner and prerequisite cards, the launch progress card, the sign-in block |
+| `RemoteCrewPanelCrewRow.tsx` | one crew row (badges, lifecycle actions, inline edit) and the fargate turn-API URL field |
+
+The edges between owners are `SecurityPanelTailnet.tsx` to `SecurityPanelPosture.tsx`,
+`SecurityPanelGovernance.tsx` to `SecurityPanelDeniedCommands.tsx`,
+`SecurityPanelDeniedCommands.tsx` to `SecurityPanelTrust.tsx`, and the two Remote Crew
+component owners to `remoteCrewPanelModel.ts` (with `RemoteCrewPanelCrewRow.tsx` to
+`RemoteCrewPanelLaunch.tsx` for the sign-in block). Unlike the panels above, these
+owners keep their own Settings* primitives and settings-search anchors: each `.tsx`
+owner is mapped to its facade's tab in `PANEL_TAB_MAP`
+(`website/scripts/settingsExtract.ts`), so the extractor and the manual-anchor check
+read them where they are. The size tiers `test/test_cloud_sizes_ui_parity.py` pins
+live in `remoteCrewPanelModel.ts`.
 
 ## Accessibility
 
@@ -301,6 +434,12 @@ Rules:
   [Keyboard isolation](#keyboard-isolation-dialogs-and-the-overlays-above-them).
 - Dynamic content that updates in place (streaming messages, notifications) uses
   `aria-live="polite"`.
+- A navigation rail (a column of buttons that each open a section or page) gives the
+  row of the open destination `aria-current="page"` and no other row. A class or an
+  inline style alone paints the row, and assistive technology cannot read it. A list
+  that has opened nothing yet, such as the phone's root list in `SidePanelLayout`,
+  has no current row. The open row of a list inside one view takes
+  `aria-current="true"`.
 - Do not use a raw `<button>`. Use `Btn` / `SendBtn` / `IconButton` (which carry
   the styling), or `Clickable` for a div-based control.
 
@@ -328,7 +467,8 @@ portal, so what decides coverage is where a component sits in JSX:
 <Modal open={open} onClose={close} title="…">
   …
   <SimpleSelect … />   {/* COVERED: a React descendant. Its popup portals to    */}
-</Modal>                {/* document.body at z-[9999], and is still covered,     */}
+</Modal>                {/* the body-level overlay root at z-[9999], and is      */}
+                        {/* still covered,                                        */}
                         {/* because coverage is about the React tree.            */}
 {pickerOpen && (
   <ProjectPicker … />   {/* NOT COVERED: a React SIBLING. It paints above the    */}
@@ -336,13 +476,14 @@ portal, so what decides coverage is where a component sits in JSX:
                         {/* on its dispatch path, so it needs its OWN boundary.  */}
 ```
 
-Both of those overlays portal to `document.body` and both paint above the dialog
+Both of those overlays portal to the body-level overlay root (see *Floating
+layers and Crew switches* below) and both paint above the dialog
 at the same `z-[9999]`. Only one of them is inside the boundary. **Sharing a
 stacking context is a paint-order fact and implies nothing about event
 routing** — conflating the two is what kept #6833 open, so do not reason about
 coverage from a z-index.
 
-A dialog rendered inside the App root rather than portalled to `document.body`
+A dialog rendered inside the App root rather than portalled to the body level
 shares the shell's stacking context, so it uses the `z-[65]` band: above the chat
 chrome (at most `z-[63]`) and below the `z-[100]` shell takeover layer, which a tie
 would otherwise cover by document order. `src/components/AppRootDialogZIndex.test.tsx`
@@ -363,7 +504,7 @@ const isolateKeys = (e: React.KeyboardEvent) => {
   if (e.key === 'Escape') { ime.claimKey(e); return }
   e.stopPropagation()
 }
-return createPortal(<div onKeyDown={isolateKeys} …>…</div>, document.body)
+return <OverlayPortal><div onKeyDown={isolateKeys} …>…</div></OverlayPortal>
 ```
 
 Three properties of that guard are load-bearing:
@@ -462,6 +603,25 @@ payloads. Widening that regex or its key scope is a security change — the same
 constant also decides which paths are treated as local file reads, so the two
 decisions must stay on the one exported copy in `urlTransform.ts`.
 
+A root-relative image (`/images/a.png`) inside a previewed file (a
+`BasePathCtx` is set) is tried as an absolute path first, then against each
+directory above the file, nearest first, up to eight levels
+(`siteRootImageCandidates`). The leading `/` there usually names the root of the
+repository or site the markdown belongs to — GitHub, Zenn and Docusaurus all
+write images that way (issue #23623) — and nothing in the file says where that
+root is. A same-named image in a nearer directory therefore wins over one at
+the real root. Every candidate still goes through `/api/file-raw`, so the fallback
+reads nothing the absolute path could not already ask for. When every candidate
+fails, the broken-image fallback names and probes the path as written, as it
+does for any other image, so its "no longer exists" wording speaks for that path
+alone. That fallback states the failure through an inline `ErrorNotice` beside
+a chip that copies the on-disk path. The notice offers no agent hand-off: the
+renderer also previews unsaved drafts (the meeting note's Preview), and the
+navigation would unmount one. Every surface that
+provides `BasePathCtx` gets this (the file preview, the file explorer, the
+meeting notes sidebar); outside them (chat, artifacts) a leading-slash path
+stays absolute only.
+
 To SHOW a gateway path's file name, use `pathBasename` (and
 `stripTrailingSeparators` for a directory) from `utils/pathBasename.ts`, never
 `.split('/').pop()`: a Windows gateway reports `C:\repo\a.ts`, which a `/`-only
@@ -540,6 +700,26 @@ connection and peer owners) as arguments and never imports the facade; outside
 `src/hooks/websocket/` only the facade imports an owner, and owners import each
 other only along the edges `src/test/useWebSocket.ownership.test.ts` lists.
 
+`src/types/index.ts` is the one import path for the shared types it serves, most
+of them the shapes of REST and `/api/ws` payloads. That file declares nothing. It
+re-exports each owner below with an explicit `export type { … } from` list
+(`isolatedModules` is on, so a plain `export { … }` of a type does not compile).
+A new type for one of these areas goes to its owner and gets a line in that
+owner's list; `src/types/index.owners.test.tsx` fails until it has one. No owner
+imports the facade. An owner that needs another owner's type imports it with
+`import type` from that owner and imports nothing else, and nothing outside the
+family imports an owner. A module beside them in `src/types/` that is not named
+`index.<area>.ts` is not an owner and keeps its own import path.
+
+| Owner (`src/types/`) | Holds |
+|---|---|
+| `index.gateway.ts` | the status push (`StatusData`), the update check, host metrics, session storage and its inventory, and each connected crew's version, capabilities, approval state and remote update |
+| `index.jobs.ts` | scheduled jobs (`CronJob`), task-runner projects and their steps, dynamic-workflow runs |
+| `index.capabilities.ts` | lessons and memory stores, skills and their budget, steering files, skill and MCP discovery, configured MCP servers and their scopes |
+| `index.chat.ts` | the chat slot row (`ChatSlot`) with its turn identity and the `chat_done` payload, its todo list, MCP report and channel links; sidebar folders, tags and board lanes; transcript messages and the slot detail read; subagent and tool activity; content blocks; notifications and their channels; approvals; history session rows |
+| `index.sources.ts` | pull requests, issues, the source provider id, an app repository's contributors |
+| `index.artifacts.ts` | artifacts and their publication, publishing providers, forks, remote listings, session docs, folders, events, comments, web-app metadata |
+
 Redux Toolkit (`src/store/index.ts`) holds the cross-page shell state in **four**
 slices:
 
@@ -591,12 +771,10 @@ is finalized within the same scope, so an untouched row resolves back to its bas
 object and keeps its identity.
 
 This is a convention for new and touched code, not a description of the current
-store. Two dashboard collections still assign wholesale and are known gaps rather
-than counterexamples: `sseSubagentStatus` rebuilds its `agents` array every frame,
-and `sseStatus` replaces `state.status` as a whole object that several panels
-subscribe to entirely. Converting them is worthwhile but is its own change —
-`state.status` in particular needs its consumers narrowed first, or the merge buys
-nothing.
+store. One dashboard collection still assigns wholesale and is a known gap rather
+than a counterexample: `sseStatus` replaces `state.status` as a whole object that
+several panels subscribe to entirely. Converting it is worthwhile but is its own
+change: its consumers need narrowing first, or the merge buys nothing.
 
 Two habits belong to the same concern:
 
@@ -620,9 +798,9 @@ Two habits belong to the same concern:
   win whatever order Tailwind emits the rules in) plus `motion-reduce:animate-none`,
   or keep it static. `src/test/idleAnimations.test.ts` pins the top-bar and rail
   indicators.
-- Do NOT add a new CSS `@keyframes`. The existing ones in `index.css` back
-  specific low-level effects (skeleton pulse, caret blink, indeterminate
-  progress); a new component animation goes through Framer Motion.
+- Do NOT add a new CSS `@keyframes`. The existing ones in the `src/styles/`
+  partials back specific low-level effects (skeleton pulse, caret blink,
+  indeterminate progress); a new component animation goes through Framer Motion.
 - **Hover PAINTS; it never moves or resizes.** A hover state may change colour,
   border, brightness or shadow, but not `scale` or `translate` — growing a row
   under the cursor nudges its neighbours and reads as a layout change rather
@@ -681,13 +859,62 @@ files own it:
   `@utility` blocks. Adding a utility for a new token means adding one
   `--color-<token>: var(--<token>)` line here; `scripts/check-phantom-classes.mjs`
   compiles against this file to catch a utility whose token was never declared.
-- `src/index.css` — the entry. It imports Tailwind's theme and Preflight into
-  their cascade layers and emits `@tailwind utilities` UNLAYERED (see the header
-  comment there: the component CSS below it was written against v3's unlayered
-  utilities and must keep competing with them on plain specificity), lists the
-  template sources with `@source`, and restores three v3 Preflight defaults as
-  token-backed base rules (default border colour `var(--border)`, placeholder
-  colour `var(--muted)`, `cursor: pointer` on enabled buttons).
+- `src/index.css` — the entry, read top to bottom in cascade order. First the
+  Tailwind header: it imports Tailwind's theme and Preflight into their cascade
+  layers, emits `@tailwind utilities` UNLAYERED (see the header comment there:
+  the component CSS after it was written against v3's unlayered utilities and
+  must keep competing with them on plain specificity), and lists the template
+  sources with `@source`. Then the Preflight compensation, three v3 Preflight
+  defaults restored as token-backed base rules (default border colour
+  `var(--border)`, placeholder colour `var(--muted)`, `cursor: pointer` on
+  enabled buttons). Then the imports of `font-faces.css`, `design-tokens.css` and
+  `theme-palettes.css`; then the `@layer base` element defaults (box model, the
+  global `:focus-visible` ring, the reduced-motion cut, the scroll-only
+  scrollbar)
+  and, unlayered, the ambient backdrop and the app-icon tints; then the imports
+  of the other eight partials. Tailwind inlines each `@import` where it stands,
+  so the import order IS the cascade order: never reorder the imports, and put a
+  new rule in the partial that owns its surface.
+- `src/styles/*.css` — the partials `index.css` imports, listed here in import
+  order. Each is one contiguous slice of the cascade, so some also hold a
+  neighbouring rule that has no file of its own; those strays are named:
+  - `font-faces.css` owns every `@font-face`: the script-fallback and
+    straight-quote aliases, the brand faces and OpenDyslexic.
+  - `design-tokens.css` owns the custom properties every theme shares and the
+    default dark and light palette.
+  - `theme-palettes.css` owns one `[data-theme]` block pair per named theme.
+  - `chat-transcript.css` owns what a chat message paints and how it streams in.
+    Strays: the composer's prompt-optimize overlay and approval glow, the update
+    card's indeterminate progress bar, `.animate-shimmer`, the custom-font
+    ligature toggle, the Kiro-theme overrides of nav, session-row and shell
+    chrome, and the workspace-tree token mapping.
+  - `scrollbars-and-touch-hit.css` owns the horizontal edge-fade mask for code
+    and diff blocks and the 44px touch hit areas. Strays: the send-button sweep (`.btn-sweep`), the card
+    hover glow (`.card-glow`) and the stat top-line accent (`.stat-accent`).
+  - `shell-chrome.css` owns the top bar and its collapse ladder, the frameless
+    Electron window chrome and focus mode. Stray: `.scrollbar-none`.
+  - `focus-and-state-cues.css` owns the scroll-edge fades, the skeleton shimmer,
+    the focus rings and the swatch hover cue. Strays: table striping, the
+    follow-up chip width cap, the skill-load heading sizes and the highlight.js
+    colours.
+  - `sidebar-and-side-panel.css` owns session and folder rows, the list dock and
+    the side-panel tab strip. Strays: the inline lucide icon size and the
+    panel-icon pane morph.
+  - `highlights-and-page-zoom.css` owns search, find and comment highlights and
+    the coarse-pointer rules that stop page zoom. Strays: the artifact toolbar
+    button heights and the mobile sessions-drawer width.
+  - `liquid-glass.css` owns the glass material and every solid fallback
+    (no `backdrop-filter`, reduced transparency, more contrast). Strays: the
+    settings icon-tile and goal-mark tokens, the dock pass-through and the
+    global reduced-motion transition reset.
+  - `content-fit.css` owns the rules that make content fit its box: font-metric
+    compensation on the nav rail, the crew-chip cut edge, image and spacer
+    reservations, the pane-dim token and the markdown-table breakout.
+
+  `cli-mode.css`, `message-font-size.css` and `crew-notes.css` in the same
+  directory are imported by `main.tsx` instead. A test that measures the
+  stylesheet's source text reads it through `src/test/indexCssSource.ts`
+  (`readIndexCss()`), which splices every partial in at its import.
 
 The build runs through `@tailwindcss/vite`; there is no PostCSS config. A
 downstream edition's sources are added to the content scan by
@@ -697,13 +924,40 @@ Utility names follow Tailwind v4: `outline-hidden` (not `outline-none`) is the
 accessible outline suppressor, `backdrop-blur-xs` is the 4px blur, and the
 `shadcn/ui` primitives animate through `tw-animate-css`.
 
-Colors come from CSS custom properties defined in `src/index.css`, including the
+Colors come from CSS custom properties defined in `src/styles/design-tokens.css`
+and `src/styles/theme-palettes.css`, including the
 semantic roles `--aim`, `--clarify`, and the `--diff-*` family. Never a hardcoded
 `#hex` / `rgb()` / `rgba()` literal, and never a raw palette class
 (`text-green-500`, `bg-amber-400`): state colors are `text-ok` / `text-warn` /
 `text-danger` / `text-info`, and a running state is `text-accent`. See
 [theming-contract](theming-contract.md) for the variable set, the stable class
 hooks, and the checkers.
+
+No scrollbar is visible at rest, anywhere in the dashboard
+([decision](../../docs/decisions/2026-10-23-scrollbars-are-never-always-visible.md)).
+A scroll box either hides its scrollbar entirely (`scrollbar-none`: the sidebar
+lanes, the nav rail, the tab strips) or shows a thin thumb only while it is being
+scrolled, in a column it reserves anyway so the reveal moves no content. The
+second form is the default and needs no class: the base layer in `index.css`
+keeps the 6px WebKit column with a transparent thumb and paints it under
+`[data-scrolling]`, which `lib/scrollReveal.ts` sets on the scrolling element
+and clears after a short linger (Firefox takes the same two states through
+`scrollbar-width: thin` and `scrollbar-color`, fenced behind the `-moz-appearance`
+probe because Blink drops the pseudo-elements once those are set). Never add a
+`::-webkit-scrollbar-thumb` colour or a `scrollbar-color` whose selector lacks
+`[data-scrolling]`, never `scrollbar-width: auto`, and never a hover-revealed
+thumb: the pointer rests over the chat transcript most of the time, so hover is
+"at rest" there. The global rule and the document scroll listener both stop at a
+shadow boundary; Pierre's code, diff and tree surfaces are reached through
+`unsafeCSS` keyed on the same attribute (`PIERRE_SCROLL_REVEAL_CSS`, folded into
+both option factories in `src/pierre/config.ts`, and the tree's
+`PIERRE_TREE_STATE_ROW_CSS`), and `scrollReveal` attaches to those hosts' shadow
+roots itself (`SHADOW_SCROLL_HOSTS`). When a box's edge does not make it obvious
+that it scrolls, the cue is an edge-fade mask (`.edge-fade-x`, `useScrollEdges`)
+or a "more below" affordance (`MORE_BELOW_MASK`, `JumpToBottomButton`), never a
+resting thumb. `src/test/scrollbarRevealOnly.test.ts` scans `src/` for every
+shape that paints one at rest and measures the revealed thumb's contrast per
+theme; the `no-scrollbar-at-rest` rule in `AUTOSDE.yaml` blocks it in review.
 
 Three of those rules are enforced by `@shadcn/lint` inside the blocking
 `eslint src/ --max-warnings 0` gate (configured in `eslint.config.js`, the
@@ -761,9 +1015,10 @@ Built-in themes are picked in Settings, Display tab, and the choice syncs across
 instances. Each theme has a dark and a light block, and the default theme's
 `data-theme` is the bare `dark` / `light` rather than a prefixed slug.
 
-Shared CSS utilities in `index.css`: `.top-bar-pill`, `.topbar-glass`,
-`.scroll-shadow`, `.table-striped`, `.skeleton`, `.focus-ring`. A theme change
-crossfades through a `transition` on `body`.
+Shared CSS utilities: `.top-bar-pill` and `.topbar-glass`
+(`src/styles/shell-chrome.css`), `.scroll-shadow`, `.table-striped`, `.skeleton`
+and `.focus-ring` (`src/styles/focus-and-state-cues.css`). A theme change
+crossfades through a `transition` on `body` (`src/index.css`).
 
 ## Large file-pair diffs
 
@@ -823,3 +1078,29 @@ icons from a downstream edition instead of editing the seed maps.
 The Crew editor's Capabilities pane and its draft, preview and save contract are
 specified in [crew mode](../../docs/system-specs/modules/crew-mode.md) (*Crew
 capability drafts*).
+
+## Floating layers and Crew switches
+
+Switching to a remote Crew hides the local dashboard without unmounting it, so
+a floating layer must not portal straight to `document.body` (lint refuses
+`createPortal(…, document.body)` and Radix imports outside `components/ui/`).
+`src/components/overlayRoot.tsx` is the reference; in short:
+
+- Portal through `<OverlayPortal>` or `useOverlayRoot()`. Inside the local pane
+  that resolves to a body-level container hidden with the pane; anywhere else it
+  is `document.body`.
+- A switch counts as a click outside for layers that hold no input: the shared
+  Radix menus, context menus and selects close (`useCloseWhenCrewHidden`). A new
+  shared Radix wrapper passes `container={useOverlayRoot()}` inside
+  `MountAfterCommit`, then either closes the same way or, if it can hold input,
+  stays mounted and refuses dismissal while hidden (`standDownWhileHidden`, as
+  popovers do). A popover is modal only inside a Radix dialog.
+- Every other layer stays mounted and hidden, and hiding stops painting, not
+  listening. Required: every document- or window-level key handler of a layer
+  rendered under `<OverlayPortal>` that commits, discards or claims a key reads
+  `useLocalCrewHidden()` and stands down while it is true (as `Modal`,
+  `useDialogFocusTrap`, `useListKeyboardNav` and `useMenuKeyboard` do).
+  `src/test/overlayKeyGuard.inventory.test.ts` lists every such listener and
+  fails on a new one until it is guarded or exempted with a reason.
+- A Radix dialog and what it opens stay on `document.body` across a switch
+  (`GlobalOverlayScope`), as does the notification banner.

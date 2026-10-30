@@ -17,6 +17,7 @@ if TYPE_CHECKING:
         _FILE_KINDS_MAX_PATHS,
         _FILE_READ_BINARY_EXTS,
         _FILE_READ_SNIFF_BYTES,
+        _path_probe_stall_key,
         _PathProbeBusy,
         _probe_busy_response,
         _probe_request_path,
@@ -291,6 +292,54 @@ class _OpenedFile(NamedTuple):
     data: bytes
 
 
+def _open_refusal(denied: _OpenDenied, *, tool_name: str) -> _OpenRefusal:
+    """Audit one :func:`_open_checked_file` refusal and build its response.
+
+    The one mapping of the open-and-check codes onto the whole-read envelope's
+    SEL vocabulary and response bodies, shared by :func:`_open_checked` and by
+    the streamed ``/api/file-download``, so the two cannot drift apart.
+    """
+
+    def _log(outcome: str, res: str, error: str = "") -> None:
+        kw = {"error": error} if error else {}
+        _sel().log_tool_invocation(
+            session_key="dashboard",
+            tool_name=tool_name,
+            outcome=outcome,
+            resources=res,
+            **kw,
+        )
+
+    code, res = denied.code, denied.path
+    if code == "invalid_path":
+        _log("denied", res)
+        return _OpenRefusal(web.json_response({"error": "invalid or forbidden path"}, status=400))
+    if code == "sensitive_path":
+        _log("denied", res, "sensitive_path")
+        return _OpenRefusal(web.json_response({"error": "sensitive path blocked"}, status=403))
+    if code == "not_found":
+        _log("not_found", res)
+        return _OpenRefusal(web.json_response({"error": "not found"}, status=404))
+    if code == "symlink_refused":
+        _log("denied", res, "symlink_rejected")
+        return _OpenRefusal(web.json_response({"error": "symlinks not allowed"}, status=403))
+    if code == "file_too_large":
+        # Reachable only through a caller that passes fstat_cap; mapped so
+        # a policy refusal can never masquerade as the 500 below.
+        _log("denied", res, "file_too_large")
+        return _OpenRefusal(
+            web.json_response({"error": "file too large", "code": "file_too_large"}, status=413)
+        )
+    # read_failed: the residual code. (The whole-read envelope's own size
+    # guard is its bounded read, because an fstat pre-check races a
+    # concurrent writer while reading at most cap+1 bytes bounds memory
+    # unconditionally -- the same shape as _load_sheet_payload's guard.)
+    _log("failure", res)
+    return _OpenRefusal(
+        web.json_response({"error": "cannot read file", "code": "read_failed"}, status=500)
+    )
+
+
 def _open_checked(
     raw_path: str,
     *,
@@ -337,36 +386,7 @@ def _open_checked(
 
     checked = _open_checked_file(raw_path, tool_name=tool_name)
     if isinstance(checked, _OpenDenied):
-        code, res = checked.code, checked.path
-        if code == "invalid_path":
-            _log("denied", res)
-            return _OpenRefusal(
-                web.json_response({"error": "invalid or forbidden path"}, status=400)
-            )
-        if code == "sensitive_path":
-            _log("denied", res, "sensitive_path")
-            return _OpenRefusal(web.json_response({"error": "sensitive path blocked"}, status=403))
-        if code == "not_found":
-            _log("not_found", res)
-            return _OpenRefusal(web.json_response({"error": "not found"}, status=404))
-        if code == "symlink_refused":
-            _log("denied", res, "symlink_rejected")
-            return _OpenRefusal(web.json_response({"error": "symlinks not allowed"}, status=403))
-        if code == "file_too_large":
-            # Reachable only through a caller that passes fstat_cap; mapped so
-            # a policy refusal can never masquerade as the 500 below.
-            _log("denied", res, "file_too_large")
-            return _OpenRefusal(
-                web.json_response({"error": "file too large", "code": "file_too_large"}, status=413)
-            )
-        # read_failed: the residual code. (This envelope's own size guard is
-        # the bounded read below, because an fstat pre-check races a
-        # concurrent writer while reading at most cap+1 bytes bounds memory
-        # unconditionally -- the same shape as _load_sheet_payload's guard.)
-        _log("failure", res)
-        return _OpenRefusal(
-            web.json_response({"error": "cannot read file", "code": "read_failed"}, status=500)
-        )
+        return _open_refusal(checked, tool_name=tool_name)
 
     path = checked.path
     try:
@@ -410,6 +430,34 @@ def _resolve_project_relative(raw: str) -> tuple[str, str | None]:
     if not (candidate == resolved_proj or candidate.startswith(resolved_proj + os.sep)):
         return "", "outside_project"
     return candidate, None
+
+
+def _project_relative_stall_path(raw: str) -> str:
+    """The path :func:`_resolve_project_relative` touches for *raw*, for the probe's stall key.
+
+    A path it passes through unchanged is its own key, as before. A relative
+    one is resolved inside the project directory, so it is charged to that
+    directory: two resolves stuck on a dead project mount then refuse the next
+    one. ``""`` (no key) when no project directory is set, since that answer
+    touches no filesystem. Lexical, so it runs on the event loop.
+    """
+    if not raw or raw.startswith(("/", "~", "\\")) or ntpath.splitdrive(raw)[0]:
+        return raw
+    return os.environ.get("KIROCREW_PROJECT_DIR", "")
+
+
+def _batch_stall_path(raws: list[str]) -> str:
+    """The stall path for :func:`_classify_request_paths` over *raws*, or ``""``.
+
+    The batch is keyed only when every path in it falls under ONE stall key;
+    then that key is exactly the mount the hop can wedge on. A batch spanning
+    several mounts gets no key: keying it on any one path (the first, say)
+    would let two batches stuck on a dead mount listed third refuse a healthy
+    mount listed first, on every route. Such a batch stays bounded by the pool.
+    """
+    paths = [_project_relative_stall_path(raw) for raw in raws]
+    keys = {_path_probe_stall_key((p,)) for p in paths}
+    return paths[0] if len(keys) == 1 else ""
 
 
 def _classify_request_paths(raws: list[str]) -> list[tuple[str, str, str]]:
@@ -489,7 +537,9 @@ async def api_file_kinds(request: web.Request) -> web.Response:
     if not unique:
         return web.json_response({"kinds": {}})
     try:
-        verdicts = await _run_path_probe(_classify_request_paths, unique)
+        verdicts = await _run_path_probe(
+            _classify_request_paths, unique, stall_path=_batch_stall_path(unique)
+        )
     except _PathProbeBusy:
         return _probe_busy_response(resource=f"{len(unique)} paths", tool_name="file_read")
     sel = _sel()

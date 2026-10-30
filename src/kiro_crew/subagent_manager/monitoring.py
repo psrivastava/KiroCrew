@@ -33,6 +33,18 @@ _START_QUEUE_MAX_SECS = 1800.0
 #: ``subagent_timeout_secs``: the startup watchdog stops looking once a PID exists.
 _FIRST_PROMPT_SILENT_SECS = 300.0
 
+#: Longest the learned settled map goes without a re-read when no run recorded a
+#: settled reading. Readings age out of it (``SETTLED_SAMPLE_MAX_AGE_SECS``), and
+#: the host whose figure has gone stale is exactly the one that records nothing new
+#: (its dedicated starts are held back), so time alone must also re-read the log.
+_SETTLED_REREAD_SECS = 3600.0
+
+#: Longest the boot orphan sweep holds its notices for the gateway's release
+#: (``hold_orphan_notices``). Long enough for a cautious boot, whose staggered
+#: startup pauses come before the dashboard restores its tabs; short enough that a
+#: dashboard that never comes up still has the owner DM digest sent within minutes.
+_ORPHAN_NOTICE_HOLD_SECS = 300.0
+
 
 if TYPE_CHECKING:
     from kiro_crew import taskq as _taskq
@@ -42,6 +54,7 @@ if TYPE_CHECKING:
         _CLK_TCK,
         _REAPER_INTERVAL,
         _SUPPRESS_CEILING,
+        ORPHAN_NOTICE_OWED,
         OUTCOME_FAILED,
         OUTCOME_INTERRUPTED,
         OUTCOME_OK,
@@ -51,6 +64,7 @@ if TYPE_CHECKING:
         VERDICT_UNKNOWN,
         VERDICT_WORKING,
         LivenessOracle,
+        SubagentDelivery,
         SubagentInfo,
         _attributed_count,
         _cost_bucket,
@@ -77,6 +91,36 @@ if TYPE_CHECKING:
         time,
         write_tombstone,
     )
+
+
+#: Longest ``last_tool`` an orphan's notice and its tombstone keep. The title is
+#: backend-authored (a shell tool's is the whole command) and the tombstone a queued
+#: notice owes rides the slot ledger in memory until the notice drains; the ledger's
+#: entry cap bounds how many records it holds, not how large each one is.
+_ORPHAN_LAST_TOOL_CHARS = 80
+
+
+def orphan_carried_fields(state: dict) -> dict[str, Any]:
+    """The fields of a restart orphan's tombstone that come from its run record.
+
+    Bounded where they are built, because the record outlives this call: a type
+    that is not the one the run's writer stores reads as absent (``pid`` ``None``,
+    ``turns`` 0, ``last_tool`` empty), and ``last_tool`` is flattened to one line,
+    redacted over the whole value, then cut to :data:`_ORPHAN_LAST_TOOL_CHARS`.
+    """
+    # Imported here, as ``orphan_resume_hint`` below does.
+    from ..security import redact_and_truncate
+
+    pid, turns, tool = state.get("pid"), state.get("turns"), state.get("last_tool")
+    return {
+        "pid": pid if type(pid) is int else None,
+        "turns": turns if type(turns) is int else 0,
+        "last_tool": (
+            redact_and_truncate(" ".join(tool.split()), _ORPHAN_LAST_TOOL_CHARS)
+            if isinstance(tool, str)
+            else ""
+        ),
+    }
 
 
 def orphan_resume_hint(agent_id: str, state: dict) -> str:
@@ -114,7 +158,9 @@ def orphan_resume_hint(agent_id: str, state: dict) -> str:
         # ``bind_component_globals`` rebinds onto ``subagent``'s namespace.
         from ..security import redact_and_truncate
 
-        last_tool = redact_and_truncate(" ".join(str(state.get("last_tool") or "").split()), 80)
+        last_tool = redact_and_truncate(
+            " ".join(str(state.get("last_tool") or "").split()), _ORPHAN_LAST_TOOL_CHARS
+        )
         progress = f"It had completed {turns} turn(s)"
         if last_tool:
             progress += f"; its last tool call was `{last_tool}`"
@@ -323,7 +369,7 @@ class OrphanStallMonitor(ManagerComponent):
         arrived while a pass was running.
 
         A request landing mid-sweep is a run that just parked and wrote a NEW
-        ``retry_at`` (``run.py``'s dependency park), while the pass in flight
+        ``retry_at`` (``run_yields.py``'s dependency park), while the pass in flight
         arms from the deadline it has already read. Without the extra pass that
         scope's instant is armed by nobody and every waiter behind it waits for
         the 60s reaper sweep. Coalescing here, in the SAME task, because the
@@ -430,7 +476,19 @@ class OrphanStallMonitor(ManagerComponent):
         A surviving ``result.txt`` is classified further by
         :func:`tombstone_recovery_action`: a whole answer, or a fragment the
         restart cut off mid-turn.
+
+        Every orphan's process is ended before any notice goes out. On a manager
+        built with ``hold_orphan_notices`` the notices then wait for
+        :meth:`release_orphan_notices`: the gateway calls it once the dashboard
+        has restored the tabs they are injected into, and before that every
+        notice would find no tab and fall back to the owner DM. The wait is
+        bounded by ``_ORPHAN_NOTICE_HOLD_SECS``. Released or timed out, the
+        notices then go out by the rules below, the digest DM included. A sweep
+        cancelled while it waits writes no tombstone, so the next start
+        announces those runs.
         """
+        from kiro_crew.subagent_manager.monitoring import _ORPHAN_NOTICE_HOLD_SECS
+
         try:
             await self._manager._end_leaked_processes()
         except Exception:
@@ -442,22 +500,10 @@ class OrphanStallMonitor(ManagerComponent):
                 return
             logger.info("Reconciling %d orphaned subagent(s)", len(orphans))
             processed = 0
-            # DM-fallback messages are DIGESTED: collected across the whole
-            # scan and delivered as ONE message at the end — a restart with N
-            # in-flight agents must never produce N pings. (The session-
-            # injection path batches naturally via the parent slot's pending-
-            # failures drain.)
-            dm_pending: list[str] = []
-            # Written after the scan: a DM-bound notice's tombstone waits for the
-            # digest DM below, and a run whose notifier raised is tombstoned with them.
-            held_tombstones: list[tuple[str, dict[str, Any]]] = []
-
-            def _tombstone_unless_present(agent_id: str, fields: dict[str, Any]) -> None:
-                from kiro_crew.subagent_persistence import read_tombstone
-
-                if read_tombstone(agent_id) is None:
-                    write_tombstone(agent_id, **fields)
-
+            # What each orphan's notice and tombstone are built from, collected
+            # while its process is ended so that no process waits on the notice
+            # hold below.
+            reconciled: list[tuple[str, dict, bool, dict[str, Any]]] = []
             for state in orphans:
                 agent_id = state.get("id", "")
                 if not agent_id or agent_id in self._manager._agents:
@@ -482,9 +528,7 @@ class OrphanStallMonitor(ManagerComponent):
                     tombstone: dict[str, Any] = {
                         "cause": "gateway_restart",
                         "recovery_action": recovery,
-                        "pid": pid,
-                        "turns": state.get("turns", 0),
-                        "last_tool": state.get("last_tool", ""),
+                        **orphan_carried_fields(state),
                         # A run that finished is completed, whichever reader
                         # asks: the panel, this notice and the task queue.
                         **({"outcome": "completed"} if result_is_whole(state) else {}),
@@ -503,38 +547,72 @@ class OrphanStallMonitor(ManagerComponent):
                         pid,
                         has_result,
                     )
-                    # Notify user about the orphaned agent. Injection happens
-                    # per-orphan (it rides the parent slot's batched pending-
-                    # failures queue); DM fallback is deferred to the digest.
-                    try:
-                        undelivered = await self._manager._notify_orphan(
-                            agent_id, state, has_result
-                        )
-                        if undelivered:
-                            dm_pending.append(undelivered)
-                            held_tombstones.append((agent_id, tombstone))
-                        else:
-                            # A slot took the notice: _notify_orphan writes its
-                            # delivered tombstone after the injection. When none
-                            # landed, this boot's own is written, as before.
-                            try:
-                                await asyncio.to_thread(
-                                    _tombstone_unless_present, agent_id, tombstone
-                                )
-                            except Exception:
-                                logger.debug(
-                                    "Failed to tombstone orphan %s", agent_id, exc_info=True
-                                )
-                    except Exception:
-                        logger.debug("Notification failed for orphan %s", agent_id, exc_info=True)
-                        # A notifier that raises would raise again at every start,
-                        # so the run is tombstoned as before, after the scan; only a
-                        # process that dies first leaves it to the next start.
-                        held_tombstones.append((agent_id, tombstone))
+                    reconciled.append((agent_id, state, has_result, tombstone))
                 except Exception:
                     logger.warning("Failed to reconcile orphan %s", agent_id, exc_info=True)
 
                 # Rate limit: yield to event loop every 50 entries
+                processed += 1
+                if processed % 50 == 0:
+                    await asyncio.sleep(0)
+
+            gate = getattr(self._manager, "_orphan_notice_gate", None)
+            if reconciled and gate is not None and not gate.is_set():
+                try:
+                    await asyncio.wait_for(gate.wait(), timeout=_ORPHAN_NOTICE_HOLD_SECS)
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "Orphan notices held %.0fs with no release from the gateway; "
+                        "sending them to the tabs back so far and the owner DM",
+                        _ORPHAN_NOTICE_HOLD_SECS,
+                    )
+
+            # DM-fallback messages are DIGESTED: collected across the whole
+            # scan and delivered as ONE message at the end — a restart with N
+            # in-flight agents must never produce N pings. (The session-
+            # injection path batches naturally via the parent slot's pending-
+            # failures drain.)
+            dm_pending: list[str] = []
+            # Written after the scan: a DM-bound notice's tombstone waits for the
+            # digest DM below, and a run whose notifier raised is tombstoned with them.
+            held_tombstones: list[tuple[str, dict[str, Any]]] = []
+
+            def _tombstone_unless_present(agent_id: str, fields: dict[str, Any]) -> None:
+                from kiro_crew.subagent_persistence import read_tombstone
+
+                if read_tombstone(agent_id) is None:
+                    write_tombstone(agent_id, **fields)
+
+            for agent_id, state, has_result, tombstone in reconciled:
+                # Notify user about the orphaned agent. Injection happens
+                # per-orphan (it rides the parent slot's batched pending-
+                # failures queue); DM fallback is deferred to the digest.
+                try:
+                    undelivered = await self._manager._notify_orphan(agent_id, state, has_result)
+                    if undelivered == ORPHAN_NOTICE_OWED:
+                        # Queued for the parent agent with its tombstone, which
+                        # the drain of the notice writes: no DM and no write here.
+                        pass
+                    elif undelivered:
+                        dm_pending.append(undelivered)
+                        held_tombstones.append((agent_id, tombstone))
+                    else:
+                        # A slot took the notice: _notify_orphan writes its
+                        # delivered tombstone after the injection. When none
+                        # landed, this boot's own is written, as before.
+                        try:
+                            await asyncio.to_thread(_tombstone_unless_present, agent_id, tombstone)
+                        except Exception:
+                            logger.debug("Failed to tombstone orphan %s", agent_id, exc_info=True)
+                except Exception:
+                    logger.debug("Notification failed for orphan %s", agent_id, exc_info=True)
+                    # A notifier that raises would raise again at every start,
+                    # so the run is tombstoned as before, after the scan; only a
+                    # process that dies first leaves it to the next start.
+                    held_tombstones.append((agent_id, tombstone))
+
+                # The same yield as the scan above: a notice for a parent with no
+                # tab awaits nothing.
                 processed += 1
                 if processed % 50 == 0:
                     await asyncio.sleep(0)
@@ -736,7 +814,9 @@ class OrphanStallMonitor(ManagerComponent):
         """Notify user about an orphaned subagent.
 
         1. Try session injection if parent session still exists (delivered
-           messages return ``None``).
+           messages return ``None``; a notice the slot queued together with
+           its tombstone returns ``ORPHAN_NOTICE_OWED``, and the drain of the
+           notice writes that tombstone).
         2. Otherwise return the redacted message so the caller can batch all
            undelivered notifications into a SINGLE digest DM — never N pings.
 
@@ -786,11 +866,17 @@ class OrphanStallMonitor(ManagerComponent):
             )
             if resume:
                 lines.append(resume)
+        # The task preview is cut at 100 characters, so a worktree the task text
+        # names is cut with it. The run's recorded working directory is the whole
+        # path, and it is what the parent needs to find the run's files again.
+        cwd = state.get("cwd")
+        worktree = [f"Worktree: `{cwd}`"] if isinstance(cwd, str) and cwd.strip() else []
         msg = "\n".join(
             [
                 SUBAGENT_COMPLETION_PREFIX,
                 f"Agent `{agent_id}` {glyph} {note}",
                 f"Task: {task_preview}",
+                *worktree,
                 *lines,
             ]
         )
@@ -811,25 +897,38 @@ class OrphanStallMonitor(ManagerComponent):
         # parent keeps its channel session key while its tab is open, and with no
         # tab the digest DM below is the only surface.
         if has_dashboard_surface(parent_session):
+            # The record a notice leaves once the parent agent has it. It is written
+            # after the notice, so no earlier tombstone carries the outcome forward:
+            # it is stated here. The slot ledger holds it in memory until the notice
+            # drains, so its fields are bounded as they are built.
+            fields = {
+                "recovery_action": "delivered",
+                **orphan_carried_fields(state),
+                **({"outcome": "completed"} if result_is_whole(state) else {}),
+            }
             try:
+                # A gateway that queues the notice in memory takes the record as a
+                # debt the drain settles, so a restart before then leaves the run to
+                # the next start.
                 injected = await self._manager._try_inject_orphan_notification(
-                    parent_session, msg, row_meta
+                    parent_session,
+                    msg,
+                    row_meta,
+                    delivery=SubagentDelivery(
+                        agent_id, 0.0, 0.0, tombstone={"cause": "gateway_restart", **fields}
+                    ),
                 )
+                if injected == ORPHAN_NOTICE_OWED:
+                    # No tombstone exists yet (the scan writes one only after a
+                    # notice is recorded), and the drain of the queued notice
+                    # writes the one it owes, so none is written here.
+                    return ORPHAN_NOTICE_OWED
                 if injected:
                     # Update tombstone recovery_action
                     try:
                         # Off the loop, same reason as the reconciliation write.
                         await asyncio.to_thread(
-                            write_tombstone,
-                            agent_id,
-                            cause="gateway_restart",
-                            recovery_action="delivered",
-                            pid=state.get("pid"),
-                            turns=state.get("turns", 0),
-                            last_tool=state.get("last_tool", ""),
-                            # Written after the notice, so no earlier tombstone
-                            # carries the outcome forward: it is stated here.
-                            **({"outcome": "completed"} if result_is_whole(state) else {}),
+                            write_tombstone, agent_id, cause="gateway_restart", **fields
                         )
                     except Exception:
                         pass
@@ -841,14 +940,20 @@ class OrphanStallMonitor(ManagerComponent):
         return msg
 
     async def _try_inject_orphan_notification_impl(
-        self, parent_session: str, msg: str, meta: dict | None = None
-    ) -> bool:
+        self,
+        parent_session: str,
+        msg: str,
+        meta: dict | None = None,
+        delivery: "SubagentDelivery | None" = None,
+    ) -> bool | str:
         """Try to inject a message into the parent dashboard session.
 
         Delegates to the gateway-wired ``on_orphan_notify`` callback, which
         appends the (already-redacted) message to the parent slot's transcript
         and queues it into ``slot._pending_subagent_failures`` so the LLM
-        learns about the orphan on its next turn. Returns True if delivered.
+        learns about the orphan on its next turn. Returns True if delivered,
+        and ``ORPHAN_NOTICE_OWED`` when the callback also took *delivery*, the
+        tombstone the queued notice owes.
 
         ``meta`` carries the structured completion facts for the dashboard card
         so the orphan row renders without re-parsing its prose header.
@@ -856,7 +961,13 @@ class OrphanStallMonitor(ManagerComponent):
         if self._manager._on_orphan_notify is None:
             return False
         try:
-            delivered = bool(await self._manager._on_orphan_notify(parent_session, msg, meta))
+            if delivery is None:
+                verdict = await self._manager._on_orphan_notify(parent_session, msg, meta)
+            else:
+                verdict = await self._manager._on_orphan_notify(
+                    parent_session, msg, meta, delivery=delivery
+                )
+            delivered = bool(verdict)
         except Exception:
             logger.debug("on_orphan_notify raised for %s", parent_session, exc_info=True)
             return False
@@ -870,6 +981,8 @@ class OrphanStallMonitor(ManagerComponent):
                 )
             except Exception:
                 logger.debug("SEL audit for orphan injection failed", exc_info=True)
+        if delivered and verdict == ORPHAN_NOTICE_OWED:
+            return ORPHAN_NOTICE_OWED
         return delivered
 
     async def _send_orphan_slack_dm_impl(self, msg: str) -> None:
@@ -886,7 +999,10 @@ class OrphanStallMonitor(ManagerComponent):
                     return
             except Exception:
                 logger.debug("on_orphan_dm raised", exc_info=True)
-        logger.warning("Orphan notification (no delivery channel wired): %s", msg[:200])
+        # The log line is the only copy of the notice here, so it carries all of
+        # it: the result path and worktree sit past the first 200 characters. The
+        # caller redacts each notice before it reaches this method.
+        logger.warning("Orphan notification (no delivery channel wired): %s", msg)
 
     def _live_shared_count_impl(self, pid: int | None, agents: "list[SubagentInfo]") -> int:
         """Count live session-shared subagents sharing runtime *pid* (>= 1).
@@ -1011,7 +1127,9 @@ class OrphanStallMonitor(ManagerComponent):
             return  # never sampled (e.g. finished before the first reaper sweep)
         try:
             append_cost_sample(
-                _cost_bucket(info.agent, info.execution_context),
+                _cost_bucket(
+                    info.agent, info.execution_context, remote=bool(info._remote_workspace)
+                ),
                 info.peak_rss_gb,
                 info.peak_cpu_cores,
                 shared=bool(info._session_sharing),
@@ -1030,22 +1148,53 @@ class OrphanStallMonitor(ManagerComponent):
         sweep -- and the admission gate only ever reads the map it leaves. The
         map is replaced whole, never mutated, so a reader on the loop sees one
         consistent version. An incomplete read (a refused or unreadable record)
-        keeps every figure it did not see, folded under the bucket bound. Runs
-        only after a run recorded a settled reading (or once at start): nothing
-        else changes what the per-bucket window holds.
+        or a failed one keeps the figures it could not confirm, folded under the
+        bucket bound, but only while the map rests on a read younger than
+        ``SETTLED_SAMPLE_MAX_AGE_SECS``: past that, every reading behind a kept
+        figure has expired, so the map is rebuilt from what this read saw. Runs
+        after a run recorded a settled reading (or once at start), and otherwise
+        every ``_SETTLED_REREAD_SECS``: readings expire with time, so the map
+        changes even when no run records anything.
         """
-        if not self._manager._learned_settled_dirty:
+        # Imported here: this method runs on the ``subagent`` facade's globals.
+        from kiro_crew.subagent_cost import SETTLED_SAMPLE_MAX_AGE_SECS
+        from kiro_crew.subagent_manager.monitoring import _SETTLED_REREAD_SECS
+
+        mono = time.monotonic()
+        last = self._manager._learned_settled_read_mono
+        if (
+            not self._manager._learned_settled_dirty
+            and last is not None
+            and mono - last < _SETTLED_REREAD_SECS
+        ):
             return
         self._manager._learned_settled_dirty = False
+        self._manager._learned_settled_read_mono = mono
         try:
-            costs, complete = read_learned_costs_checked("settled_gb", dedicated_only=True)
+            costs, complete = read_learned_costs_checked(
+                "settled_gb",
+                dedicated_only=True,
+                max_age_secs=SETTLED_SAMPLE_MAX_AGE_SECS,
+                now=time.time(),
+            )
         except Exception:
+            costs, complete = None, False
             logger.debug("learned settled RSS unreadable; keeping the previous map", exc_info=True)
+        # When the oldest read the map may still hold figures from was taken.
+        basis = self._manager._learned_settled_basis_mono
+        if complete:
+            self._manager._learned_settled_basis_mono = mono
+            self._manager._learned_settled_gb = dict(costs or {})
             return
-        held = self._manager._learned_settled_gb
-        self._manager._learned_settled_gb = (
-            dict(costs) if complete else cap_buckets({**held, **costs})
-        )
+        if basis is not None and mono - basis >= SETTLED_SAMPLE_MAX_AGE_SECS:
+            self._manager._learned_settled_basis_mono = mono
+            self._manager._learned_settled_gb = cap_buckets(dict(costs or {}))
+            return
+        if basis is None:
+            self._manager._learned_settled_basis_mono = mono
+        if costs is not None:
+            held = self._manager._learned_settled_gb
+            self._manager._learned_settled_gb = cap_buckets({**held, **costs})
 
     async def _reaper_loop_impl(self) -> None:
         """Periodically force-kill subagents that exceed the timeout.
@@ -1105,15 +1254,18 @@ class OrphanStallMonitor(ManagerComponent):
             except Exception:
                 logger.debug("Reaper: learned settled RSS refresh failed", exc_info=True)
             # Wave liveness backstop: reconcile waves wedged by submissions
-            # lost before the process boundary (see _sweep_stuck_waves).
+            # lost before the process boundary (see _sweep_stuck_waves). The
+            # progress stamps are monotonic readings, so the sweep takes
+            # ``mono_now``, not ``now``.
             try:
-                await self._manager._sweep_stuck_waves_async(now)
+                await self._manager._sweep_stuck_waves_async(mono_now)
             except Exception:
                 logger.debug("Reaper: stuck-wave sweep failed", exc_info=True)
             # Digest hold deadline: release completed wave results that a
-            # straggler (or a hung member) has been withholding.
+            # straggler (or a hung member) has been withholding. The hold stamp
+            # is a monotonic reading, so the sweep takes ``mono_now``, not ``now``.
             try:
-                await self._manager._sweep_digest_holds_async(now)
+                await self._manager._sweep_digest_holds_async(mono_now)
             except Exception:
                 logger.debug("Reaper: digest-hold sweep failed", exc_info=True)
             try:
@@ -1170,7 +1322,6 @@ class OrphanStallMonitor(ManagerComponent):
             for agent_id, info in list(self._manager._agents.items()):
                 if info.done or info._ending_claimed:
                     continue
-                elapsed = mono_now - info._started_mono
                 # Startup watchdog: a subagent that entered execution but is
                 # still on turn 0 with no runtime PID after the startup window
                 # is wedged in startup (e.g. a hung provider/ACP handshake that
@@ -1245,12 +1396,29 @@ class OrphanStallMonitor(ManagerComponent):
                 # (users close it from the UX), so we always fall through to
                 # the wall-clock check below.
                 await self._manager._maybe_flag_stall(agent_id, info, now)
-                if elapsed <= self._manager._default_timeout:
+                exec_started = info._exec_started_mono
+                if exec_started is None:
+                    # Not executing: parked at spawn approval, approved and
+                    # waiting to be admitted into startup, or between the two
+                    # attempts of a context-overflow cancel recovery, which
+                    # clears the clock before the replacement waits for capacity.
+                    # The clock is the registration age on the monotonic clock,
+                    # like every other duration the reaper reads. A run parked before its
+                    # first start has captured no deadline and is bounded by the
+                    # live default; a run between attempts keeps the deadline it
+                    # captured, so a reload during that wait cannot cut it.
+                    # ``_force_reap`` words a parked reap as the parked state it
+                    # is, not as an execution deadline.
+                    elapsed = mono_now - info._started_mono
+                else:
+                    elapsed = mono_now - exec_started
+                deadline = info.timeout_secs or self._manager._default_timeout
+                if elapsed <= deadline:
                     continue
                 logger.warning(
                     "Reaper: subagent %s exceeded %ds (ran %.0fs), force-killing",
                     agent_id,
-                    self._manager._default_timeout,
+                    deadline,
                     elapsed,
                 )
                 try:
@@ -1319,9 +1487,11 @@ class OrphanStallMonitor(ManagerComponent):
             gate_mark, queued_ms = info._gate_wait_started_mono, info._start_queue_wait_mono_ms
         # Queued for a permit: the clock reads as it stood when the wait began.
         clock_now = gate_mark if gate_mark is not None else now
-        starting = clock_now - exec_started - queued_ms / 1000.0
+        # Prompt hooks are Crew's work, not the start's: off the clock.
+        starting = clock_now - exec_started - queued_ms / 1000.0 - info._prompt_hooks_secs
         return (
-            info.turns == 0
+            not info._prompt_hooks_running
+            and info.turns == 0
             and info._pid is None
             and info._first_stream_started is None
             and starting > self._stamped_startup_deadline(info)
@@ -1350,6 +1520,7 @@ class OrphanStallMonitor(ManagerComponent):
             and not self._manager._in_startup(info)
             and info._gate_wait_started is None
             and not info._awaiting_approval
+            and not info._prompt_hooks_running
             and self._idle_since_activity(info, now, mono_now) > _FIRST_PROMPT_SILENT_SECS
         )
 
@@ -1508,7 +1679,8 @@ class OrphanStallMonitor(ManagerComponent):
         # A subagent blocked on a human tool-approval prompt is healthy, not
         # stalled — the permission request bumps `turns` before the approval
         # wait, so without this a slow approval would be mislabelled idle.
-        if info._awaiting_approval:
+        # Its prompt-start hooks are running: Crew's wait, not the runtime's.
+        if info._awaiting_approval or info._prompt_hooks_running:
             return
         idle = now - info.last_activity
         if not info.stalled and idle > self._manager._stall_idle_secs:

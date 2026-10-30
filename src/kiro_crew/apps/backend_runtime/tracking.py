@@ -198,7 +198,9 @@ def _await_inflight_spawn(app_name: str, timeout: float = 20.0) -> AppProcess | 
         safe = re.sub(r"[^A-Za-z0-9._-]", "_", app_name) or "_"
         lock_dir = config_dir() / "app_backend_locks"
         lock_dir.mkdir(parents=True, exist_ok=True)
-        _probe_fd = os.open(str(lock_dir / f"{safe}.lock"), os.O_CREAT | os.O_RDWR, 0o644)
+        _probe_fd = platform_compat.open_create_or_existing(
+            str(lock_dir / f"{safe}.lock"), os.O_RDWR, 0o644
+        )
         try:
             if platform_compat.try_acquire_lock(_probe_fd, exclusive=True):
                 owner_gone = True
@@ -324,7 +326,7 @@ def get_app_backend_port(app_name: str) -> int | None:
 def health_reconcile_lock() -> Any:
     """The serialization every writer of an app's MCP + agent state must hold.
 
-    Exported for ``apps/bridges.py``, which acquires it around its mcp.json and agent
+    Exported for ``apps/bridges_mcp_config.py``, which acquires it around its mcp.json and agent
     materialization so a lifecycle registration and a health transition cannot interleave
     their decisions. Held re-entrantly: the health path already owns it before it calls
     into those writers.
@@ -349,7 +351,7 @@ def app_backend_lifecycle_flock(app_name: str) -> Iterator[None]:
     safe = re.sub(r"[^A-Za-z0-9._-]", "_", app_name) or "_"
     lock_dir = config_dir() / "app_backend_locks"
     lock_dir.mkdir(parents=True, exist_ok=True)
-    fd = os.open(str(lock_dir / f"{safe}.lock"), os.O_CREAT | os.O_RDWR, 0o644)
+    fd = platform_compat.open_create_or_existing(str(lock_dir / f"{safe}.lock"), os.O_RDWR, 0o644)
     try:
         with platform_compat.flock_exclusive(fd):
             yield

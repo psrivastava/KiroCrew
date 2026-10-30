@@ -49,8 +49,8 @@ This module defines a **namespaced, versioned, typed** protocol extension:
    that never advertises is pooled all the same, and simply never receives an
    identity -- pooled and identity-blind, which is worse than either alone.
    The "refuse to pool an unadvertised backend" behaviour described in earlier
-   revisions of this docstring was never implemented; ``rewriter.py`` records
-   the same fact next to ``UNPOOLABLE_SERVERS``, which is empty and remains the
+   revisions of this docstring was never implemented; ``rewriter_spec.py`` records
+   the same fact next to ``UNPOOLABLE_SERVERS``, which lists only credential vendors and remains the
    only mechanism of its kind. A backend that cannot consume the block must be
    listed there.
 
@@ -489,8 +489,8 @@ def _mapping_answers(mapping: Any) -> bool:
     the same-uid, agent-writable config dir, so any process could otherwise
     plant a two-line file at a nearer ancestor pid and halt the walk short of
     the kiro-cli ancestor that holds the real mapping. ``REFUSAL_RECYCLED`` is
-    the same shape without the planting: the sweep deliberately leaves a stale
-    file on disk for every live recycled pid.
+    the same shape without the planting: a live recycled pid's stale file sits
+    on disk until the periodic sweep retracts it.
 
     Not stopping is only half of it. The caller records that it passed such a
     record, so a chain that ends with no key at all still refuses rather than
@@ -614,6 +614,16 @@ class CallerContext:
     #: (the Toolbox-shim report took three wrong diagnoses to find it). Diagnostic text,
     #: never a credential; empty everywhere else.
     identity_denial: str = ""
+    #: The harness ACP ``toolCallId`` for this call, carried in the
+    #: gateway-authored caller block. It is the identifier the approval gate keys
+    #: its grant by, so it is the correlation key between an approval and the MCP
+    #: execution that redeems it. The harness carries that id to the backend as
+    #: the ``tools/call`` ``_meta.progressToken``, which the gateway promotes
+    #: into this field — so this is the SAME value as ``progressToken``, read
+    #: from one place, NOT an independent source. Empty when the request carried
+    #: no progress token; a call with no correlation id is refused fail-closed
+    #: rather than silently sent.
+    tool_call_id: str = ""
 
     @classmethod
     def from_meta(cls, meta: Any) -> "CallerContext | None":
@@ -646,6 +656,7 @@ class CallerContext:
             raw=MappingProxyType(dict(block)),
             session_token=str(block.get("sessionToken") or ""),
             identity_denial=str(block.get("identityDenial") or ""),
+            tool_call_id=str(block.get("toolCallId") or ""),
         )
 
     @classmethod
@@ -754,6 +765,8 @@ def build_caller_meta(ctx: CallerContext) -> dict[str, Any]:
         meta[CALLER_META_KEY]["sessionToken"] = ctx.session_token
     if ctx.identity_denial:
         meta[CALLER_META_KEY]["identityDenial"] = ctx.identity_denial
+    if ctx.tool_call_id:
+        meta[CALLER_META_KEY]["toolCallId"] = ctx.tool_call_id
     return meta
 
 
@@ -823,8 +836,8 @@ def tenant_nonce_from_meta(meta: Any) -> str:
 # sets it at its own start), so behavior is unchanged.
 #
 # Trust: in the pooled topology gatewayd strips any stub-supplied
-# ``kirocrew.caller`` block from every inbound frame (``backend.py``
-# strip-on-forward + the initialize forge guard) and injects its own, built
+# ``kirocrew.caller`` block from every inbound frame (``backend_stubs.py``
+# strip-on-forward + the ``backend_handshake.py`` initialize forge guard) and injects its own, built
 # from the uid-gated claim-push at ``rekey()`` — so a block seen here is
 # gateway-authored. In the non-pooled stdio topology no client sends the
 # block and this stays ``None`` (callers fall back to env/HMAC-pid sources).
@@ -853,6 +866,19 @@ def current_caller() -> "CallerContext | None":
     resolution paths.
     """
     return _CURRENT_CALLER.get()
+
+
+_CURRENT_TOOL_CALL_ID: ContextVar[str] = ContextVar("kirocrew_current_tool_call_id", default="")
+
+
+def set_current_tool_call_id(tool_call_id: str) -> None:
+    """Install the harness-generated correlation id for the current MCP call."""
+    _CURRENT_TOOL_CALL_ID.set(tool_call_id)
+
+
+def current_tool_call_id() -> str:
+    """Return the current MCP call's harness-generated correlation id, if any."""
+    return _CURRENT_TOOL_CALL_ID.get()
 
 
 # Held in its own slot rather than on ``CallerContext`` because the case it

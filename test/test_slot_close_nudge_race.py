@@ -273,6 +273,68 @@ async def test_failed_persist_gives_the_session_its_clock_back(tmp_path, monkeyp
     svc.stop()
 
 
+class _SteppedTime:
+    """The ``time`` module with ``time()`` stepped by *step* seconds; every other name is real.
+
+    Bound as a module's own ``time``, never over the stdlib clock, so the event loop and
+    every other module keep the real one.
+    """
+
+    def __init__(self, step: float) -> None:
+        self._step = step
+
+    def time(self) -> float:
+        return time.time() + self._step
+
+    def __getattr__(self, name: str):
+        return getattr(time, name)
+
+
+@pytest.mark.parametrize("step", [0.0, 7200.0], ids=["no_step", "forward_step"])
+@pytest.mark.asyncio
+async def test_failed_persist_restores_the_budget_the_timer_reads_as_left(
+    tmp_path, monkeypatch, step
+) -> None:
+    """The replacement carries the remaining budget as the timer reads it.
+
+    The loop is 30 minutes into a 3 hour budget. Read as ``time.time() - created_ts``,
+    a 2 hour forward step leaves the replacement 30 minutes instead of 2.5 hours.
+    """
+    from kiro_crew.autonudge_service.model import runtime_budget_exceeded
+
+    state = _state_with_slot(tmp_path)
+    svc = await _service(tmp_path, monkeypatch)
+    loop = await svc.add(NAME, "check the PR", idle_secs=300, max_runtime_secs=10800)
+    # Every second that really passes from here on comes out of the budget the timer
+    # reads as left, so the bound below is taken relative to the span measured here.
+    started = time.monotonic()
+    loop.created_ts = time.time() - 1800
+    runtime_budget_exceeded(loop)  # the timer's read in this process
+
+    async def _persist(*_a, **_kw) -> None:
+        raise RuntimeError("disk wedged")
+
+    monkeypatch.setattr(handlers, "save_slot_off_loop", _persist)
+    from kiro_crew.autonudge_service import model, mutations
+
+    # The close path's components read ``time`` through the chat_handlers facade.
+    for module in (handlers, model, mutations):
+        monkeypatch.setattr(module, "time", _SteppedTime(step))
+    try:
+        resp = await handlers.api_chat_slot_delete(_Req(state, NAME))
+        spent = time.monotonic() - started
+
+        assert resp.status == 500
+        replacement = svc.get_by_slot(NAME)
+        assert replacement is not None, "the restored session was left with no clock"
+        # 9000 s are left at the timer's read. The wall step may take none of them; the
+        # seconds this test spent may, plus the one the restore's int() can drop.
+        left = replacement.max_runtime_secs
+        assert 9000 - spent - 1 <= left <= 9000, f"{left} s of the 9000 s left were restored"
+    finally:
+        svc.stop()
+
+
 @pytest.mark.asyncio
 async def test_structured_rollback_rechecks_the_restored_slot_generation(
     tmp_path, monkeypatch
@@ -893,3 +955,61 @@ async def test_a_deliberate_close_still_succeeds_when_the_removed_edge_write_is_
     assert (
         state.get_slot(NAME) is None
     ), "the close must still remove the slot when the edge is dropped"
+
+
+@pytest.mark.asyncio
+async def test_close_after_drain_before_gateway_unpublish_aborts_with_active_row_intact(
+    tmp_path, monkeypatch
+) -> None:
+    """A teardown-window close cannot mistake the active loop for no loop."""
+    _LOST_RUN_SECS = 60.0
+
+    async def bounded(awaitable, what: str):
+        try:
+            return await asyncio.wait_for(awaitable, timeout=_LOST_RUN_SECS)
+        except asyncio.TimeoutError:
+            pytest.fail(f"{what} did not finish within the {_LOST_RUN_SECS:.0f}s lost-run ceiling")
+
+    state = _state_with_slot(tmp_path)
+    slot = state.get_slot(NAME)
+    assert slot is not None
+    svc = await _service(tmp_path, monkeypatch)
+    try:
+        loop = await bounded(
+            svc.add(NAME, "check the PR", idle_secs=300, max_cycles=24),
+            "the teardown-window loop arm",
+        )
+        await bounded(svc.shutdown(), "the AutoNudge durability drain")
+        assert (
+            autonudge.get_instance() is svc
+        ), "shutdown withdrew the singleton while the dashboard can still close slots"
+
+        response = await bounded(
+            handlers.api_chat_slot_delete(_Req(state, NAME)),
+            "the teardown-window slot close",
+        )
+
+        assert response.status == 500
+        assert json.loads(response.body)["code"] == "nudge_retire_failed"
+        assert state.get_slot(NAME) is slot, "the refused close persisted the slot as closed"
+        assert slot.is_closing is False
+        live = svc.get_by_slot(NAME)
+        assert live is loop and live.active, "the refusal lost the active in-memory loop"
+        metadata = await bounded(
+            asyncio.to_thread(
+                state.conversation_log.get_metadata,
+                f"dashboard:{NAME}",
+            ),
+            "the open transcript metadata read",
+        )
+        assert not metadata.get(
+            "closed"
+        ), "the refused close wrote a closed transcript beside an active loop"
+        restored = AutoNudgeService(base_dir=tmp_path)
+        await bounded(asyncio.to_thread(restored._load), "the durable loop-row read")
+        persisted = restored.get_by_slot(NAME)
+        assert (
+            persisted is not None and persisted.active
+        ), "the shutdown refusal did not preserve the durable active loop row"
+    finally:
+        svc.stop()

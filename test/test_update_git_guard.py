@@ -138,7 +138,7 @@ class TestUpdateCheckGitGuard:
         # "run `kirocrew update`" message instead of running git status/pull
         # and failing. `kirocrew update` (unlike this endpoint) dispatches on
         # install layout and handles wheel/cli.sh installs correctly, so it is
-        # the right redirect — see cli_server.py::_update().
+        # the right redirect — see cli_server_update.py::_update().
         monkeypatch.setenv("KIROCREW_PROJECT_DIR", str(tmp_path))
 
         def _boom(*a, **k):  # pragma: no cover - must not be called
@@ -347,6 +347,15 @@ class TestUpdateCheckGitGuard:
             return _Proc()
 
         monkeypatch.setattr(updates.asyncio, "create_subprocess_exec", _fake_exec)
+        # The git path's network fetch runs through the shared isolated helper,
+        # so count that as "git was invoked" too; it reports a failed fetch.
+        monkeypatch.setattr(updates, "upstream_remote_and_branch", lambda _p: ("origin", "main"))
+
+        async def _fetch(*a, **k):
+            called["n"] += 1
+            return None
+
+        monkeypatch.setattr(updates, "fetch_and_pin_upstream", _fetch)
         asyncio.run(updates._do_update_check())
         assert called["n"] >= 1
 
@@ -370,5 +379,14 @@ class TestUpdateCheckGitGuard:
             return _Proc()
 
         monkeypatch.setattr(updates.asyncio, "create_subprocess_exec", _fake_exec)
+        # The git path's network fetch runs through the shared isolated helper,
+        # so count that as "git was invoked" too; it reports a failed fetch.
+        monkeypatch.setattr(updates, "upstream_remote_and_branch", lambda _p: ("origin", "main"))
+
+        async def _fetch(*a, **k):
+            called["n"] += 1
+            return None
+
+        monkeypatch.setattr(updates, "fetch_and_pin_upstream", _fetch)
         asyncio.run(updates._do_update_check())
         assert called["n"] >= 1  # git WAS invoked when .git exists

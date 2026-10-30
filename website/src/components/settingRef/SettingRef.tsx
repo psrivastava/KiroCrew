@@ -8,18 +8,20 @@
  * - Unknown/malicious key: plain <code>, NO link
  */
 import { Link, useNavigate } from 'react-router-dom'
-import type { MouseEvent } from 'react'
+import type { MouseEvent, ReactElement } from 'react'
 import { Settings, Terminal } from 'lucide-react'
 import { Popover, PopoverContent, PopoverTrigger } from '../ui/popover'
 import { resolveSettingRef } from './resolveSettingRef'
 import type { SchemaEntry } from './resolveSettingRef'
 import type { SettingEntry } from '../commandPalette/settingsTypes'
 import { useConfigSchema } from './useConfigSchema'
+import { LockedByPolicyBadge, schemaLockedByPolicy } from './LockedByPolicyBadge'
 import { i18nT } from '../../i18n/t'
 import { toPathSegment, SUBNAV_PARAM, SUBNAV_LEGACY_PARAMS } from '../subNavParams'
 import { settingsPath } from '../settingsPath'
-import { CopyCommandButton } from './CopyCommandButton'
+import { CopyCommandButton, ConfigSetCommandRow } from './CopyCommandButton'
 import { useGuardedLeave } from '../NavigationLeaveGuard'
+import { useConfigSetHintsV1 } from '../../hooks/useGatewayPlatform'
 
 export interface SettingRefProps {
   /** The dotted config key (e.g. 'telemetry.beacon_enabled') or env var name. */
@@ -34,7 +36,7 @@ export interface SettingRefProps {
   valuePlaceholder?: string
 }
 
-import { ENV_SHELLS, cliValuePlaceholder, configSetCommand, VALID_ENV_KEY } from './envShellCommands'
+import { ENV_SHELLS, VALID_ENV_KEY } from './envShellCommands'
 import type { EnvIntent } from './envShellCommands'
 
 /**
@@ -76,6 +78,9 @@ export function SettingRef({ configKey, kind = 'config', schemaIndex: schemaInde
   // Use internal hook when no explicit schemaIndex prop is provided.
   // Hook is always called (React rules) but its result is only used when prop is absent.
   const hookSchema = useConfigSchema()
+  // The launcher prefixes the gateway resolved, read from the status the gate already
+  // cached; undefined for an older gateway, a non-owner, or a status not yet loaded.
+  const configSetHints = useConfigSetHintsV1()
   // When schemaIndexProp is passed (tests), treat it as the loaded schema.
   // When absent, use hook result (Map | undefined).
   const schemaIndex = schemaIndexProp !== undefined ? schemaIndexProp : hookSchema
@@ -133,6 +138,9 @@ export function SettingRef({ configKey, kind = 'config', schemaIndex: schemaInde
 
   // Config key mode: resolve against registry + schema
   const resolution = resolveSettingRef(configKey, schemaIndex)
+  // An enterprise build ignores this local value; the badge says so beside the chip.
+  const locked = schemaLockedByPolicy(configKey, schemaIndex)
+  const withLock = (chip: ReactElement) => (locked ? <>{chip} <LockedByPolicyBadge /></> : chip)
 
   if (resolution.mode === 'ui') {
     const route = buildSettingsRoute(resolution.entry, configKey)
@@ -146,7 +154,7 @@ export function SettingRef({ configKey, kind = 'config', schemaIndex: schemaInde
       e.preventDefault()
       guardedLeave(() => navigate(route), route)
     }
-    return (
+    return withLock(
       <Link
         to={route}
         onClick={onClick}
@@ -160,9 +168,7 @@ export function SettingRef({ configKey, kind = 'config', schemaIndex: schemaInde
   }
 
   if (resolution.mode === 'file') {
-    const placeholder = cliValuePlaceholder(resolution.schemaEntry.type, valuePlaceholder)
-    const cliCommand = configSetCommand(configKey, placeholder)
-    return (
+    return withLock(
       <Popover>
         <PopoverTrigger asChild>
           <button
@@ -174,15 +180,25 @@ export function SettingRef({ configKey, kind = 'config', schemaIndex: schemaInde
             <code>{configKey}</code>
           </button>
         </PopoverTrigger>
-        <PopoverContent className="w-72 p-3">
-          <p className="text-xs text-muted mb-2">{i18nT('components.settingRef.fileOnlyDescription')}</p>
-          <div className="flex items-center gap-1 mb-1.5">
-            <code className="text-xs bg-bg px-1.5 py-1 rounded border border-border block font-mono break-all flex-1">
-              {cliCommand}
-            </code>
-            <CopyCommandButton text={cliCommand} />
-          </div>
-          <p className="text-[11px] text-muted">{i18nT('components.settingRef.orEditConfigJson')}</p>
+        <PopoverContent className="w-96 max-w-[90vw] p-3">
+          {locked ? (
+            // A set command would only store a value this build ignores.
+            <p className="text-xs text-muted">{i18nT('components.lockedByPolicyBadge.tooltip')}</p>
+          ) : (
+            <>
+              <p className="text-xs text-muted mb-2">{i18nT('components.settingRef.fileOnlyDescription')}</p>
+              <div className="mb-1.5">
+                <ConfigSetCommandRow
+                  configKey={configKey}
+                  schemaType={resolution.schemaEntry.type}
+                  initialValue={valuePlaceholder === 'value' ? undefined : valuePlaceholder}
+                  valuePlaceholder={valuePlaceholder}
+                  hints={configSetHints}
+                />
+              </div>
+              <p className="text-[11px] text-muted">{i18nT('components.settingRef.orEditConfigJson')}</p>
+            </>
+          )}
         </PopoverContent>
       </Popover>
     )

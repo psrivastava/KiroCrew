@@ -26,7 +26,7 @@ Three layers sit beneath Kiro Crew, and the distinction matters:
    `<project>/.kiro/agents/`) tell the default harness *how* to behave: system
    prompt, enabled tools, MCP servers. With the default backend Kiro Crew runs
    `kiro-cli acp --agent <name>` and generates its own `kirocrew.json` there
-   (`agent.py`); other harnesses receive the equivalent projection through the
+   (`agent_parts/spec_rebuild.py`); other harnesses receive the equivalent projection through the
    ACP provider seam.
 3. **Kiro Crew** is the gateway: a single asyncio process that multiplexes
    surfaces onto the selected harness and adds everything a runtime deliberately
@@ -321,7 +321,7 @@ a surface a human is watching keeps its session, a background job must not.
 
 `kiro_crew.shutdown_event` (an `asyncio.Event`) is the process-wide signal; every
 background loop waits on it so Ctrl-C wakes them immediately instead of at the
-next poll. `_shutdown()` in `slack/gateway.py` then tears down in a deliberate
+next poll. `_shutdown()` in `slack/gateway_runtime/exit_path.py` then tears down in a deliberate
 order, and the order is load-bearing:
 
 1. Stop the work that must not outlive the process or spend the shutdown
@@ -495,8 +495,8 @@ defines extension-point Protocols (`interfaces.py`) and ships a `Default*`
 adapter for each; `PlatformContext` (`context.py`) is the frozen bundle read via
 `current_context()`. The core never imports a companion edition and never
 branches on which edition is running. Same package, same boot:
-`security_authority.py` holds the ADD-only deny floor and `governance.py` holds
-the ceiling evaluator, which dispatches by control archetype and is
+`security_authority.py` holds the ADD-only deny floor and `governance.py` (with its
+`governance_parts/` owners) holds the ceiling evaluator, which dispatches by control archetype and is
 scope-name-agnostic (adding a scope is a `SCOPE_CATALOG` data change).
 
 Spec: [`../system-specs/modules/platform-context.md`](../system-specs/modules/platform-context.md).
@@ -704,7 +704,7 @@ detail; this table is only an index.
 |---|---|---|
 | ACP client (JSON-RPC transport to kiro-cli) | `src/kiro_crew/acp/` | [acp-client.md](../system-specs/modules/acp-client.md) |
 | App Kit platform contracts | `src/kiro_crew/apps/` | [app-kit-platform.md](../system-specs/modules/app-kit-platform.md) |
-| Artifacts (persisted generated UI) | `src/kiro_crew/artifacts.py`, `artifact_store/` | [artifacts.md](../system-specs/modules/artifacts.md) |
+| Artifacts (persisted generated UI) | `src/kiro_crew/artifacts.py` (and its `artifacts_*` owner modules), `artifact_store/` | [artifacts.md](../system-specs/modules/artifacts.md) |
 | Browser automation auth layer | `src/kiro_crew/browser/` | [browser.md](../system-specs/modules/browser.md) |
 | Channel history buffer | `src/kiro_crew/channel_history.py` | [channel-history.md](../system-specs/modules/channel-history.md) |
 | CLI surface | `src/kiro_crew/cli.py` | [cli.md](../system-specs/modules/cli.md) |
@@ -712,7 +712,7 @@ detail; this table is only an index.
 | Computer use (desktop GUI automation) | `src/kiro_crew/computer_use/` | [computer-use.md](../system-specs/modules/computer-use.md) |
 | Configuration (dataclasses, loader, schema) | `src/kiro_crew/config/` | [config.md](../system-specs/modules/config.md) |
 | Dev Fleet app | `src/kiro_crew/apps/builtins/dev_fleet/` | [dev-fleet.md](../system-specs/modules/dev-fleet.md) |
-| Governance model (POLICY ∩ PROFILE) | `src/kiro_crew/platform/governance.py` | [governance.md](../system-specs/modules/governance.md) |
+| Governance model (POLICY ∩ PROFILE) | `src/kiro_crew/platform/governance.py` + `governance_parts/` | [governance.md](../system-specs/modules/governance.md) |
 | Heartbeat (periodic background tasks) | `src/kiro_crew/heartbeat.py` | [heartbeat.md](../system-specs/modules/heartbeat.md) |
 | Conversation history (JSONL + consolidation) | `src/kiro_crew/history.py` | [history.md](../system-specs/modules/history.md) |
 | Instances (multi-instance over SSH) | `src/kiro_crew/instances/` | [instances.md](../system-specs/modules/instances.md) |
@@ -737,9 +737,9 @@ detail; this table is only an index.
 | Session manager (pool, expiry, compaction) | `src/kiro_crew/session.py` | [session.md](../system-specs/modules/session.md) |
 | Side conversations | `src/kiro_crew/dashboard/side_state.py` | [side.md](../system-specs/modules/side.md) |
 | Slack gateway and handler | `src/kiro_crew/slack/` | [slack-gateway.md](../system-specs/modules/slack-gateway.md) |
-| Subagents (parallel background agents) | `src/kiro_crew/subagent.py` | [subagent.md](../system-specs/modules/subagent.md) |
+| Subagents (parallel background agents) | `src/kiro_crew/subagent.py`, `subagent_parts/`, `subagent_manager/` | [subagent.md](../system-specs/modules/subagent.md) |
 | Task state machine | `src/kiro_crew/task.py` | [task.md](../system-specs/modules/task.md) |
-| TaskRunner (spec to plan to execution) | `src/kiro_crew/taskrunner.py` | [taskrunner.md](../system-specs/modules/taskrunner.md) |
+| TaskRunner (spec to plan to execution) | `src/kiro_crew/taskrunner.py` + `taskrunner_parts/` | [taskrunner.md](../system-specs/modules/taskrunner.md) |
 | Themes | `src/kiro_crew/dashboard/handlers/themes.py` | [themes.md](../system-specs/modules/themes.md) |
 | Third-party account connections | `src/kiro_crew/connections/` | [connections.md](../system-specs/modules/connections.md) |
 

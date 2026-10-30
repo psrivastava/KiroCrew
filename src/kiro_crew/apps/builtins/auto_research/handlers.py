@@ -577,8 +577,10 @@ async def _handle_report(request: web.Request) -> web.Response:
     if not storage._validate_campaign_id(cid):
         return web.json_response({"error": "Invalid campaign ID"}, status=400)
     lifecycle._audit("campaign_report", cid)
+    # FINDINGS.md grows every cycle, so read it off the event loop.
+    text = await asyncio.to_thread(publication._read_report, cid)
     # FINDINGS.md is agent-authored — redact before serving to the dashboard.
-    report = untrusted._redact_finding({"v": publication._read_report(cid)})["v"]
+    report = untrusted._redact_finding({"v": text})["v"]
     return web.json_response({"report": report})
 
 
@@ -796,7 +798,11 @@ async def _handle_report_status(request: web.Request) -> web.Response:
     slug = row["report_artifact_slug"]
     if not slug:
         return web.json_response({"slug": None})
-    return web.json_response({"slug": publication._live_report_slug(slug, cid)})
+    # In a thread like the row read above it: the existence probe opens the
+    # artifact store, and for an artifact saved before event logs existed that
+    # read writes back a backfilled history, syncing it to the device.
+    live = await asyncio.to_thread(publication._live_report_slug, slug, cid)
+    return web.json_response({"slug": live})
 
 
 async def _handle_to_artifact(request: web.Request) -> web.Response:

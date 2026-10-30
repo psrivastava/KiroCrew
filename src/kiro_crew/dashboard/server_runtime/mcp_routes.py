@@ -132,6 +132,12 @@ def _register_mcp_routes(app: web.Application) -> None:
     # (``handlers/spawn_resume.py``), registered before ``{agent_id}`` so
     # ``/api/spawn/lanes`` and ``/api/spawn/adaptive`` are not read as run ids.
     setup_spawn_resume_routes(app)
+    # The caller's own memory footprint, for ``resource_status``; a literal
+    # segment, so it too precedes ``{agent_id}``.
+    app.router.add_get(
+        "/api/spawn/session-memory",
+        _deferred("session_memory_scope", "api_spawn_session_memory"),
+    )
     app.router.add_get("/api/spawn/{agent_id}", handlers.api_spawn_status)
     app.router.add_delete("/api/spawn/{agent_id}", handlers.api_spawn_delete)
     app.router.add_post("/api/spawn/{agent_id}/retry", handlers.api_spawn_retry)
@@ -149,6 +155,19 @@ def _register_mcp_routes(app: web.Application) -> None:
     app.router.add_post("/api/work-ledger/report", _deferred_work_ledger("api_work_report"))
     app.router.add_post(
         "/api/work-ledger/rebuild", _deferred_work_ledger("api_work_ledger_rebuild")
+    )
+    # Mediated-secret egress (kirocrew-secrets MCP tool). Both are MCP-only, loopback
+    # + gateway-IPC-secret callers — no browser posts to them (they are in
+    # ``_STRICT_INTERNAL_API_PATHS``). The capability endpoint redeems the single-use
+    # approval grant; the request endpoint does the host-side vault read + SSRF-pinned
+    # egress and always withholds the origin's response.
+    app.router.add_post(
+        "/api/mediated-secret-capability",
+        _deferred("mediated_secrets", "api_mediated_secret_capability"),
+    )
+    app.router.add_post(
+        "/api/mediated-secret-request",
+        _deferred("mediated_secrets", "api_mediated_secret_request"),
     )
     # The Crew page's masked read of a conductor's work ledger (RFC Phase 4).
     # Deliberately NOT in ``_STRICT_INTERNAL_API_PATHS``: a browser is its only
@@ -180,7 +199,7 @@ def _register_mcp_routes(app: web.Application) -> None:
     # calling the module's own `register_agent_panel_routes`: that call would
     # import the module at boot, which is what the boot-path rule forbids for an
     # optional subsystem. The paths are duplicated from that function, and
-    # `test_agent_panel_routes` pins both spellings against each other.
+    # `test_agent_panel_routes_allocation` pins both spellings against each other.
     app.router.add_get(
         "/api/agent-panel/templates", _deferred("agent_panel", "api_agent_panel_templates")
     )
@@ -197,6 +216,9 @@ def _register_mcp_routes(app: web.Application) -> None:
     app.router.add_post(
         "/api/agent-panel/dashboard/write", _deferred("agent_panel", "api_dashboard_write")
     )
+    app.router.add_post(
+        "/api/agent-panel/dashboard/save", _deferred("agent_panel", "api_dashboard_save")
+    )
     app.router.add_get(
         "/api/agent-panel/dashboard/types", _deferred("agent_panel", "api_dashboard_types")
     )
@@ -212,7 +234,16 @@ def _register_mcp_routes(app: web.Application) -> None:
     app.router.add_post(
         "/api/agent-panel/dashboard/rollback", _deferred("agent_panel", "api_dashboard_rollback")
     )
+    app.router.add_get(
+        "/api/agent-panel/dashboard/snapshot", _deferred("agent_panel", "api_dashboard_snapshot")
+    )
+    app.router.add_post(
+        "/api/agent-panel/dashboard/record", _deferred("agent_panel", "api_dashboard_record")
+    )
     app.router.add_get("/api/members/{slug}/panel", _deferred("agent_panel", "api_member_panel"))
+    # The installed app's record door: an app token reaches it only through its
+    # ``permissions.api`` grant, and the handler admits nothing else.
+    app.router.add_post("/api/member-records/{slug}", _deferred("agent_panel", "api_member_record"))
     # The crewmate's dynamic dashboard. Registered through the deferred binder for the
     # reason the panel's routes are: calling the module's own
     # `register_member_dashboard_routes` would import it at boot, which the boot-path
@@ -221,6 +252,25 @@ def _register_mcp_routes(app: web.Application) -> None:
     # other.
     app.router.add_get(
         "/api/members/{slug}/dashboard", _deferred("member_dashboard", "api_member_dashboard")
+    )
+    app.router.add_post(
+        "/api/members/{slug}/dashboard/lock",
+        _deferred("member_dashboard", "api_member_dashboard_lock"),
+    )
+    # The gap refetch: a page that cannot place a patch in order asks for the whole
+    # read. A strict suffix of the ``/dashboard`` read path, separated by METHOD, so
+    # the resolver needs no ordering between them.
+    app.router.add_post(
+        "/api/members/{slug}/dashboard/refetch",
+        _deferred("member_dashboard", "api_member_dashboard_refetch"),
+    )
+    app.router.add_post(
+        "/api/members/{slug}/dashboard/preview/apply",
+        _deferred("member_dashboard", "api_member_dashboard_preview_apply"),
+    )
+    app.router.add_post(
+        "/api/members/{slug}/dashboard/preview/discard",
+        _deferred("member_dashboard", "api_member_dashboard_preview_discard"),
     )
     # UI guides (``kirocrew-guide``). The agent half is MCP-only and sits under
     # the strict "/api/guide/agent" prefix; the browser half is cookie-authed and
@@ -232,7 +282,6 @@ def _register_mcp_routes(app: web.Application) -> None:
         ("POST", "/api/guide/agent/start", "api_guide_agent_start"),
         ("GET", "/api/guide/agent/status", "api_guide_agent_status"),
         ("POST", "/api/guide/agent/cancel", "api_guide_agent_cancel"),
-        ("POST", "/api/guide/agent/rename", "api_guide_agent_rename_self"),
         ("POST", "/api/guide/agent/observe", "api_guide_agent_observe"),
         ("GET", "/api/guide/agent/language", "api_guide_agent_language"),
         ("GET", "/api/guide/pending", "api_guide_pending"),
@@ -247,6 +296,84 @@ def _register_mcp_routes(app: web.Application) -> None:
         ("POST", "/api/guide/observe", "api_guide_observe"),
     ):
         app.router.add_route(_method, _path, _deferred("guide", _name))
+    # A crewmate's own record (``kirocrew-mate``). Same split again: the agent
+    # half (update_self, the card-backed asks) is MCP-only under the strict
+    # "/api/member/self" prefix; the undo is the user's click, owner-only cookie
+    # auth, deliberately OFF that prefix under the member's own "/api/members/{slug}".
+    for _method, _path, _name in (
+        ("POST", "/api/member/self/update", "api_member_self_update"),
+        ("POST", "/api/member/self/propose", "api_member_self_propose"),
+        ("POST", "/api/members/{slug}/self-changes/{change_id}/undo", "api_member_self_undo"),
+    ):
+        app.router.add_route(_method, _path, _deferred("member_self", _name))
+    # The crewmate's capability catalog (``find_capabilities``), MCP-only under
+    # the same strict prefix.
+    app.router.add_post(
+        "/api/member/self/capabilities",
+        _deferred("member_capability_catalog", "api_member_self_capabilities"),
+    )
+    # A crewmate's goals (``member_goals``). The Goals tab's half is owner-only
+    # cookie auth under the member's own "/api/members/{slug}"; the crewmate's
+    # half (the kirocrew-mate goal tools) is MCP-only under the strict
+    # "/api/member/self" prefix, like update_self.
+    for _method, _path, _name in (
+        ("GET", "/api/members/{slug}/goals", "api_member_goals_get"),
+        (
+            "DELETE",
+            "/api/members/{slug}/goals/key-results/{kr_id}",
+            "api_member_goals_key_result_delete",
+        ),
+        (
+            "POST",
+            "/api/members/{slug}/goals/key-results/{kr_id}/restore",
+            "api_member_goals_key_result_restore",
+        ),
+        (
+            "DELETE",
+            "/api/members/{slug}/goals/items/{goal_id}",
+            "api_member_goals_goal_delete",
+        ),
+        (
+            "POST",
+            "/api/members/{slug}/goals/items/{goal_id}/restore",
+            "api_member_goals_goal_restore",
+        ),
+        ("POST", "/api/member/self/goals/read", "api_member_self_goals_read"),
+        ("POST", "/api/member/self/goals/key-result", "api_member_self_key_result"),
+        ("POST", "/api/member/self/goals/report", "api_member_self_goal_report"),
+        ("POST", "/api/member/self/notes", "api_member_self_notes"),
+    ):
+        app.router.add_route(_method, _path, _deferred("member_goals", _name))
+    # Spelled with ``add_put``: the ``crewmate.goal``, ``crewmate.key_results``
+    # and ``crewmate.check_ins`` cards apply and undo through these routes, and
+    # the card hook's route list is pinned against them.
+    app.router.add_put(
+        "/api/members/{slug}/goals/long-term",
+        _deferred("member_goals", "api_member_goals_long_term"),
+    )
+    app.router.add_put(
+        "/api/members/{slug}/goals/key-results",
+        _deferred("member_goals", "api_member_goals_key_results"),
+    )
+    app.router.add_put(
+        "/api/members/{slug}/goals/schedules",
+        _deferred("member_goals", "api_member_goals_schedules"),
+    )
+    # A ``crewmate.import`` card's file step writes (and its Undo takes back) the
+    # carried files; card steps only, owner only.
+    app.router.add_post(
+        "/api/members/{slug}/import-files",
+        _deferred("crewmate_import_files", "api_member_import_files"),
+    )
+    app.router.add_delete(
+        "/api/members/{slug}/import-files",
+        _deferred("crewmate_import_files", "api_member_import_files_undo"),
+    )
+    # The ``crewmate.dashboard_page`` card's yes: it wakes the crewmate to write its page.
+    app.router.add_post(
+        "/api/members/{slug}/dashboard/page-offer",
+        _deferred("member_page_offer", "api_member_page_offer"),
+    )
     # Change cards. Same split as the guide: the agent half is MCP-only under the
     # strict "/api/cards/agent" prefix, the browser half is owner-only cookie auth.
     # The paths are duplicated from ``change_cards.register_change_card_routes``,
@@ -262,10 +389,30 @@ def _register_mcp_routes(app: web.Application) -> None:
         ("POST", "/api/cards/{card_id}/preview", "api_cards_preview"),
         ("POST", "/api/cards/{card_id}/cancel", "api_cards_cancel"),
         ("POST", "/api/cards/{card_id}/dismiss", "api_cards_dismiss"),
+        ("POST", "/api/members/import", "api_members_import"),
+        ("GET", "/api/members/import/{sha256}/files", "api_members_import_files"),
     ):
         app.router.add_route(_method, _path, _deferred("change_cards", _name))
     app.router.add_get(
         "/api/chat/slots/{slot}/dashboard", _deferred("member_dashboard", "api_session_dashboard")
+    )
+    # A Crew Mode root's workers for its side panel, under the same owner-only,
+    # no-app gate as the root's dashboard read above.
+    app.router.add_get(
+        "/api/chat/slots/{slot}/crew-workers", _deferred("crew_workers", "api_crew_workers")
+    )
+    app.router.add_post(
+        "/api/chat/slots/{slot}/crew-workers/{worker}/steer",
+        _deferred("crew_workers", "api_crew_worker_steer"),
+    )
+    # The conductor's approval card: a worker's pending tool approval, decided by the
+    # dashboard owner through the per-slot approve route on the WORKER slot.
+    app.router.add_post(
+        "/api/chat/slots/{slot}/crew-workers/{worker}/approve",
+        _deferred("crew_workers", "api_crew_worker_approve"),
+    )
+    app.router.add_get(
+        "/api/chat/slots/{slot}/crew-timeline", _deferred("crew_workers", "api_crew_timeline")
     )
     app.router.add_get("/api/crons", handlers.api_crons)
     app.router.add_post("/api/crons", handlers.api_crons_create)
@@ -322,8 +469,16 @@ def _register_mcp_routes(app: web.Application) -> None:
         "/api/session-control/retry", _deferred("session_control", "api_session_control_retry")
     )
     app.router.add_post(
+        "/api/session-control/continue",
+        _deferred("session_control", "api_session_control_continue"),
+    )
+    app.router.add_post(
         "/api/session-control/set-model",
         _deferred("session_control", "api_session_control_set_model"),
+    )
+    app.router.add_post(
+        "/api/session-control/set-color",
+        _deferred("session_control", "api_session_control_set_color"),
     )
     app.router.add_post(
         "/api/session-control/reload",
@@ -334,10 +489,18 @@ def _register_mcp_routes(app: web.Application) -> None:
         _deferred("session_control", "api_session_control_rename"),
     )
     app.router.add_post(
+        "/api/session-control/generate-title",
+        _deferred("session_control", "api_session_control_generate_title"),
+    )
+    app.router.add_post(
         "/api/session-control/close", _deferred("session_control", "api_session_control_close")
     )
     app.router.add_post(
         "/api/session-control/revive", _deferred("session_control", "api_session_control_revive")
+    )
+    app.router.add_get(
+        "/api/session-control/history",
+        _deferred("session_control", "api_session_control_history"),
     )
     app.router.add_post(
         "/api/session-control/send", _deferred("session_control", "api_session_control_send")
@@ -352,6 +515,10 @@ def _register_mcp_routes(app: web.Application) -> None:
     )
     app.router.add_post(
         "/api/session-control/adopt", _deferred("session_control", "api_session_control_adopt")
+    )
+    app.router.add_post(
+        "/api/session-control/handoff",
+        _deferred("session_control", "api_session_control_handoff"),
     )
     app.router.add_post(
         "/api/session-control/release",
@@ -408,6 +575,11 @@ def _register_mcp_routes(app: web.Application) -> None:
     # dashboard-less state simply has no owner sockets to deliver to.
     app.router.add_post("/api/computer-use/frame", handlers.api_computer_use_frame)
     app.router.add_post("/api/session-keepalive", handlers.api_session_keepalive)
+    # Chinese dictionary words for an mcp-core session search: the gateway holds
+    # the host's one copy of the dictionary. In _STRICT_INTERNAL_API_PATHS, and the
+    # handler re-checks loopback and the secret itself. Deferred so the boot path
+    # never imports the segmenter.
+    app.router.add_post("/api/search/segment", _deferred("search_segment", "api_search_segment"))
     app.router.add_post("/api/session-directive", handlers.api_session_directive)
     app.router.add_get("/api/session-tool-policy", handlers.api_session_tool_policy)
     app.router.add_post("/api/slack-profile", handlers.api_slack_profile)

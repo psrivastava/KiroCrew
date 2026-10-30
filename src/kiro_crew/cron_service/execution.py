@@ -56,7 +56,8 @@ def _pool_queue_allowance(job: CronJob | None) -> int:
     armed, spending an execution budget it has no allowance to cover; the fix
     for that belongs at the gate's dispatch, not in a wider deadline here, since
     widening would also delay the wedged-delivery backstop for runs that never
-    queue at all. See the gate sites in slack/gateway.py.
+    queue at all. See the gate sites in slack/gateway_runtime/cron_fire.py and
+    cron_exec.py.
     """
     if job is None:
         return 0
@@ -170,8 +171,45 @@ def run_parks_one_shot(job: CronJob) -> bool:
     return not job.run_never_started or job.refusal_cannot_clear
 
 
+def auto_pause_failed_one_shot(job: CronJob, last_status: str | None) -> None:
+    """Auto-pause ``job`` when this run is a failed ``delete_after_run`` one-shot.
+
+    The one copy of the rule. A one-shot whose run failed (``last_status`` is
+    ``error``: an error, a timeout, a cancel or a reap) is kept and auto-paused
+    instead of consumed. The pause is execution-owned, so ``apply_run_record``
+    persists it under the generation fence. A fire-time denial and a run whose
+    payload never started are not failed runs and keep their own handling. A job
+    already auto-paused is left alone, so the transition is audited once.
+    """
+    if not job.delete_after_run or last_status != "error" or job.auto_paused:
+        return
+    if job.fire_time_denied or job.run_never_started:
+        return
+    job.enabled, job.auto_paused = False, True
+    job._audit_pause_change("auto_paused")
+
+
+def interruption_note(*, dispatched: bool) -> str:
+    """The history row's error text for a run the cron service stopped.
+
+    ``dispatched`` is whether ``_execute`` had started this run (reset its
+    outcome fields). A run stopped before that -- in its jitter wait, or in
+    the in-flight marker write -- ran nothing, and the row says so.
+    """
+    if dispatched:
+        return "Interrupted: the cron service stopped before this run finished"
+    return "Interrupted: the cron service stopped before this run started"
+
+
 def close_run(
-    job: CronJob, *, started_at: float, generation: int, being_cancelled: bool
+    job: CronJob,
+    *,
+    started_at: float,
+    generation: int,
+    being_cancelled: bool,
+    prior_status: str | None = None,
+    prior_error: str | None = None,
+    dispatched: bool = True,
 ) -> tuple[CronJob, str, str | None]:
     """Write a finished run's own terminal fields on ``job``; return its frozen record.
 
@@ -179,6 +217,15 @@ def close_run(
     applies, the history row's status, and the result this run produced (None
     when it produced none). The caller takes it while the run still holds its
     claim -- see :meth:`CronService._run_job_isolated`.
+
+    ``being_cancelled`` is a run ``stop()`` cancelled: it set no cancel or reap
+    flag, so it reaches this path. When it has no outcome of its own -- stopped
+    before ``_execute`` (``dispatched`` false: the job still holds the previous
+    run's fields) or before its callback set a status -- its row is
+    ``cancelled``, and ``last_status`` / ``last_error`` go back to
+    ``prior_status`` / ``prior_error``, what the job held when the run began,
+    so the registry is not handed a blank status or a stale error as this
+    run's. A stopped run that had already recorded its outcome keeps it.
     """
     # For 'every' jobs, use started_at to prevent cumulative drift.
     # `_execute` bound this run's retry count to the `last_run_ts` it
@@ -195,7 +242,21 @@ def close_run(
     # what let the fire-time deny and script Skip paths keep a result.
     if (job.command or job.script) and not being_cancelled:
         job.clear_carried_result()
-    status = "success" if job.last_status == "ok" else "failure"
+    if being_cancelled and (not dispatched or job.last_status is None):
+        # Same rule as the retry telemetry (see apply_run_record): a run that
+        # never ended on its own leaves the last completed run's values intact.
+        # A run whose callback had already recorded its outcome (a failed
+        # command cancelled while its failure alert goes out) keeps that one.
+        # Not for a one-shot that had started: the merge decides its consume
+        # or park from this run's last_status, and a restored "error" from an
+        # earlier run would leave a started one-shot neither consumed nor
+        # parked, so its payload would run again.
+        if not (dispatched and job.schedule.kind == "at"):
+            job.last_status = prior_status
+            job.last_error = prior_error
+        status = "cancelled"
+    else:
+        status = "success" if job.last_status == "ok" else "failure"
     # Attribute last_result to this run only if the run actually
     # produced it (set_run_result sets the marker). Reading it
     # unconditionally recorded the PREVIOUS run's result as this
@@ -214,6 +275,19 @@ def close_run(
     # discard this record; a run whose record already landed does.
     terminal.run_generation = generation
     return terminal, status, run_result
+
+
+def pause_changed_since_start(target: CronJob, auto_paused_at_start: bool | None) -> bool:
+    """Whether the store's ``auto_paused`` moved while a run was in flight.
+
+    ``target`` is the store's copy; ``auto_paused_at_start`` is what the run
+    saw when it started (:attr:`CronJob.auto_paused_at_start`). A difference
+    is another writer's (a ``cron resume`` that lifted the pause), or this
+    run's own pause already on the shared in-memory job; either way the store
+    already holds the pause state to keep. None (nothing stamped) is never a
+    change.
+    """
+    return auto_paused_at_start is not None and target.auto_paused != auto_paused_at_start
 
 
 def apply_run_record(target: CronJob, run: CronJob) -> None:
@@ -240,10 +314,16 @@ def apply_run_record(target: CronJob, run: CronJob) -> None:
     # its reset on success), so propagate it for every job — unlike
     # `enabled`, which must not be clobbered for recurring jobs. Also
     # reflect it into the disk copy's derived `enabled` so the next
-    # reader sees the pause before a reload re-derives it.
-    target.auto_paused = run.auto_paused
-    if run.auto_paused and not target.user_paused:
-        target.enabled = False
+    # reader sees the pause before a reload re-derives it. Not when the
+    # store's pause changed while the run was in flight: that is a
+    # resume (or another writer's pause), and the run, which started
+    # from the old state, must not write it back. The failure count
+    # goes with it, or the resume's fresh attempts are lost.
+    keep_pause = pause_changed_since_start(target, run.auto_paused_at_start)
+    if not keep_pause:
+        target.auto_paused = run.auto_paused
+        if run.auto_paused and not target.user_paused:
+            target.enabled = False
     target.last_result = run.last_result
     # Both stamp fields travel WITH last_result. The merge's _sync()
     # replaced the job list with the disk copies, so target is a
@@ -259,7 +339,8 @@ def apply_run_record(target: CronJob, run: CronJob) -> None:
     target.last_posted_at = run.last_posted_at
     target.last_failure_hash = run.last_failure_hash
     target.last_failure_at = run.last_failure_at
-    target.consecutive_failures = run.consecutive_failures
+    if not keep_pause:
+        target.consecutive_failures = run.consecutive_failures
     # Same shape as the other runtime->disk copies on this call: a
     # field `_execute` sets on the in-memory `run` is invisible after
     # reload unless copied here explicitly. A cancelled run never

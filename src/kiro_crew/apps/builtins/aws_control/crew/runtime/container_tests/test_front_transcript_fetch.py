@@ -39,6 +39,11 @@ from .test_front_proxy import _free_port, backend, env  # noqa: F401 - fixtures
 
 TURN = "/c/crew/v1/chat/completions"
 
+#: The turn route authenticates its caller now, so these tests carry the secret.
+#: What each one asserts is unchanged: that the transcript fetch happens, and in
+#: which order relative to the backend seeing the turn.
+AUTH = {"X-SMC-Control-Secret": "CTRL"}
+
 # A body long enough that a truncating bug is visible, and carrying a distinctive
 # string so a test can prove it never reaches a log line.
 SECRET_LINE = "customer-said-something-private"
@@ -153,7 +158,7 @@ def make_settings(backend_env, *, bucket: str | None = "smc-bucket", prefix: str
         backend_run_dir=run_dir,
         front_port=8080,
         route_prefix="/c/crew",
-        control_secret=None,
+        control_secret="CTRL",
         data_home=data_home,
         config_dir=data_home,
         crew_name="crew",
@@ -188,7 +193,7 @@ async def drive(settings, reader, payload: dict) -> httpx.Response:
     app = build_app(settings, transcript_reader=reader)
     client = httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://front")
     try:
-        return await client.post(TURN, json=payload)
+        return await client.post(TURN, json=payload, headers=AUTH)
     finally:
         await client.aclose()
         backend_client = getattr(app.state, "backend_client", None)
@@ -200,7 +205,7 @@ async def drive_stream(settings, reader, payload: dict) -> tuple[int, str]:
     app = build_app(settings, transcript_reader=reader)
     client = httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://front")
     try:
-        async with client.stream("POST", TURN, json=payload) as resp:
+        async with client.stream("POST", TURN, json=payload, headers=AUTH) as resp:
             body = b"".join([chunk async for chunk in resp.aiter_bytes()])
             return resp.status_code, body.decode("utf-8")
     finally:
@@ -308,6 +313,38 @@ def test_a_transcript_on_disk_is_neither_refetched_nor_overwritten(tmp_path: Pat
     assert path.read_bytes() == newer, "the newer local transcript was rolled backwards"
     assert reader.gets == [], "S3 was consulted for a conversation already on disk"
     assert outcome.action == "present"
+
+
+def test_the_on_disk_probe_runs_off_the_event_loop(tmp_path: Path, monkeypatch) -> None:
+    """The probe opens and fstats the entry, so it must not run on the loop.
+
+    It runs on every turn, inside the slot lock, and every other filesystem step
+    of the fetch already runs in a thread. On the loop, one slow disk would stall
+    every OTHER conversation's turn behind this one. The probe is wrapped, not
+    replaced, so its link and shape refusals still decide the outcome.
+    """
+    settings = local_settings(tmp_path)
+    settings.sessions_dir.mkdir(parents=True)
+    (settings.sessions_dir / "dashboard_cust-1.jsonl").write_bytes(TRANSCRIPT_BODY)
+
+    real_probe = transcript._probe_local_entry
+    ran_on_a_loop: list[bool] = []
+
+    def recording_probe(path: Path) -> bool:
+        try:
+            asyncio.get_running_loop()
+            ran_on_a_loop.append(True)
+        except RuntimeError:
+            ran_on_a_loop.append(False)
+        return real_probe(path)
+
+    monkeypatch.setattr(transcript, "_probe_local_entry", recording_probe)
+    reader = FakeReader()
+    outcome = asyncio.run(transcript.ensure_local_transcript(settings, "cust-1", reader=reader))
+
+    assert ran_on_a_loop == [False], "the on-disk probe ran on the event loop"
+    assert outcome.action == "present"
+    assert reader.gets == []
 
 
 def test_a_transcript_that_appears_mid_fetch_is_not_clobbered(tmp_path: Path) -> None:
@@ -501,8 +538,8 @@ async def test_two_concurrent_turns_on_one_slot_fetch_once(env) -> None:
     client = httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://front")
     try:
         r1, r2 = await asyncio.gather(
-            client.post(TURN, json={"model": "crew", "id": "cust-9", "messages": []}),
-            client.post(TURN, json={"model": "crew", "id": "cust-9", "messages": []}),
+            client.post(TURN, json={"model": "crew", "id": "cust-9", "messages": []}, headers=AUTH),
+            client.post(TURN, json={"model": "crew", "id": "cust-9", "messages": []}, headers=AUTH),
         )
     finally:
         await client.aclose()

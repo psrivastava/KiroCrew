@@ -64,9 +64,9 @@ def test_the_bound_block_the_page_lists_is_what_select_crew_returns(doc_text: st
     ), "the page says the empty call returns the roster plus a top-level default_agent"
     for field in ("kiro_agent", "workspace", "memory_store", "model"):
         assert f"`{field}`" in doc_text, f"the page no longer names the bound field {field}"
-    src = (Path(__file__).parent.parent / "src" / "kiro_crew" / "mcp_core.py").read_text(
-        encoding="utf-8"
-    )
+    src = (
+        Path(__file__).parent.parent / "src" / "kiro_crew" / "mcp_core_parts" / "crew.py"
+    ).read_text(encoding="utf-8")
     assert '"model": cfg.agents[crew].model,' in src, (
         "the page says `model` is the configured pin verbatim; _do_select_crew no "
         "longer reads it straight off the crew record"
@@ -113,9 +113,9 @@ def test_the_config_fields_the_page_names_are_still_on_the_crew_record(doc_text:
         assert f"`{field}`" in doc_text
 
 
-def test_the_self_rename_tool_the_page_names_is_still_declared(doc_text: str) -> None:
-    """§Editing tells the reader a crewmate renames itself with `rename_self`."""
-    from kiro_crew import mcp_guide
+def test_the_self_change_tool_the_page_names_is_still_declared(doc_text: str) -> None:
+    """§Editing tells the reader a crewmate renames itself with `update_self`."""
+    from kiro_crew import mcp_mate
 
-    assert "rename_self" in {tool["name"] for tool in mcp_guide._list_tools()}
-    assert "`rename_self`" in doc_text
+    assert "update_self" in {tool["name"] for tool in mcp_mate._list_tools()}
+    assert "`update_self`" in doc_text

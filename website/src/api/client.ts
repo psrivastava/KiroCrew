@@ -15,7 +15,7 @@
  * those modules own are re-exported below, so every import path is unchanged.
  */
 import { installSessionExpiryHandler } from './sessionExpirySignal'
-import { ApiError, friendlyErrText, toApiError } from './apiError'
+import { ApiError, friendlyErrText, toApiError, AcceptedBodyUnreadable } from './apiError'
 import { refreshOnce, __resetRefreshOnceForTests } from './refreshOnce'
 import {
   STALE_OWNER_SESSION_CODE,
@@ -81,7 +81,10 @@ export type {
   UsageSeriesPayload,
 } from './client/telemetry'
 export type {
+  ConfigSetHintsV1,
+  ConfigSetShellId,
   KiroPrerequisiteStatus,
+  KasBundleStatus,
   KasLoginStatus,
   KasLoginDeviceSession,
   KasLoginPollResult,
@@ -100,10 +103,7 @@ export type {
   DeniedCommandRule,
   DeniedUserRule,
   AwsConsentStatus,
-  FileDeliveryGrant,
-  FileDeliveryConsentStatus,
   CredentialRedactionState,
-  ArmedFileDeliveryConsent,
   DeniedCommandsData,
   GovernanceScopeDetail,
   GovernanceScope,
@@ -163,15 +163,20 @@ export type {
   McpShareReason,
   McpShareRecommendation,
   McpMeasureProgress,
+  McpGatewayFootprint,
   McpManagedServer,
 } from './client/mcp'
 export type {
+  CrewmateExportChoices,
+  CrewmateExportPreview,
   MemberRosterRow,
   MemberActivityEntry,
-  MemberRecap,
+  MemberGoals,
+  MemberGoal,
+  GoalKeyResult,
+  GoalSchedules,
+  GoalReport,
   CrewTeam,
-  CrewPanelData,
-  CrewPanelMeta,
   DashboardFieldSpec,
   DashboardManifest,
 } from './client/agents'
@@ -189,6 +194,7 @@ export type {
 export type { SkillScriptValidation } from './client/skills'
 export { SKILLS_TIMEOUT_MS } from './client/skills'
 export { FILE_SEARCH_TIMEOUT_MS, BROWSE_FILES_TIMEOUT_MS } from './client/files'
+export type { ProjectAwsProfile } from './client/files'
 export type {
   ConnectionMintState,
   ConnectionStatus,
@@ -238,6 +244,10 @@ export type {
 export type {
   SlackConfigData,
   SlackConfigSave,
+  SlackCapability,
+  SlackCodeSwitchKey,
+  SlackManifestChange,
+  SlackManifestStatus,
   DiscordConfigData,
   TelegramConfigData,
   DiscordConfigSave,
@@ -779,7 +789,7 @@ export { STALE_OWNER_SESSION_CODE }
  * every existing consumer, and every test that mocks `../api/client`, is
  * unchanged by the move.
  */
-export { ApiError, friendlyErrText, toApiError }
+export { ApiError, friendlyErrText, toApiError, AcceptedBodyUnreadable }
 
 /**
  * Whether *e* is a failure the user can only clear by signing back in.
@@ -911,6 +921,96 @@ function sendResponseAuthRecovery(r: Response): Response {
   return r
 }
 
+export interface SessionEnvironmentProfile {
+  id: string
+  name: string
+  provider: string
+  workdir: string
+  /** Template name, what tells two profiles apart; older gateways omit it. */
+  template?: string
+}
+
+export interface RemoteDirListing {
+  root: string
+  path: string
+  entries: { name: string; dir: boolean }[]
+  truncated: boolean
+}
+
+export interface RemoteFileContent {
+  root: string
+  path: string
+  content: string
+  binary: boolean
+  truncated: boolean
+}
+
+export interface RemoteEnvironmentHealth {
+  state: 'running' | 'stopped' | 'unavailable' | 'not_created'
+  workspace?: string
+  workdir?: string
+  error?: string
+  stats?: {
+    arch: string
+    cpus: number
+    load?: number[]
+    memory?: { total_bytes: number; available_bytes: number }
+    disk?: { total_bytes: number; free_bytes: number }
+    uptime_s?: number
+  }
+}
+
+/** `withheld`: the 'strict' agent sandbox lends no gateway login to remote sessions.
+ *  `unsupported`: a Windows gateway lends no git login to remote sessions yet. */
+export type GitLoginStatus = 'signed_in' | 'not_signed_in' | 'unchecked' | 'withheld' | 'unsupported'
+
+export interface SessionEnvironmentsCheck {
+  coder: { ok: boolean; owner?: string; error?: string }
+  profiles: { id: string; ok: boolean; error?: string }[]
+  /** Per saved Sprites profile: API token saved and accepted. Older gateways omit it. */
+  sprites?: { id: string; ok: boolean; error?: string }[]
+  /** Per saved boxd profile: CLI installed and signed in. Older gateways omit it. */
+  boxd?: { id: string; ok: boolean; error?: string }[]
+  /** Absent from a gateway that predates the git rows. */
+  git?: Record<string, GitLoginStatus>
+}
+
+export interface SessionEnvironmentWorkspace {
+  workspace: string
+  /** Older gateways omit it; those rows are Coder workspaces. */
+  provider?: 'coder' | 'sprites' | 'boxd'
+  slot: string
+  /** The profile the chat is bound to; empty when unknown. */
+  profile?: string
+  state: string
+  template: string
+  created_at: string
+  /** Set once the owning session is archived: when the workspace is deleted. */
+  deletion_due_at: string
+}
+
+/** Provider-neutral stages of a remote session's start, in order. */
+export type SessionEnvironmentStartStage = 'checking' | 'provisioning' | 'connecting' | 'starting_agent'
+
+export interface SlotEnvironment {
+  profile: string | null
+  profiles: SessionEnvironmentProfile[]
+  /** True once the session has a message: its environment can no longer change. */
+  locked?: boolean
+  /** A runtime in this gateway is attached to the remote workspace. */
+  attached?: boolean
+  /** Set while this session's environment is starting in THIS gateway. */
+  starting?: {
+    stage: SessionEnvironmentStartStage
+    stage_elapsed_s: number
+    elapsed_s: number
+    /** Every stage this start has entered, in order. Older gateways omit it. */
+    entered?: SessionEnvironmentStartStage[]
+    /** The gateway already had this session attached: an engine restart. */
+    reconnect?: boolean
+  } | null
+}
+
 /**
  * A non-2xx this endpoint's caller handles itself, identified by the denial it
  * IS rather than by the status it arrives with.
@@ -937,13 +1037,37 @@ const parseJson = async (r: Response, benign?: BenignDenial, nullOn204 = false) 
   // exactly as it did when this was its own copy of the body.
   if (nullOn204 && r.status === 204) return null
   if (!r.ok) {
-    const errText = await r.text()
+    // The status is the verdict; the body is only its explanation. A non-2xx
+    // whose body read is cut must still surface as an `ApiError` (a refusal,
+    // with the status line as the fallback reason) -- never as a raw network
+    // rejection, which the acceptance-receipt wires have to treat as
+    // indeterminate and would show as "delivery unconfirmed" instead of an
+    // error. The app-sdk's `jsonFetch` keeps the same guard.
+    const errText = await r.text().catch(() => r.statusText)
     throw apiFailure(r, errText, benign)
   }
   return r.json()
 }
 
 const j = (r: Response) => parseJson(r)
+
+/**
+ * `j()` for acceptance-receipt endpoints (a side-panel turn): the same auth
+ * recovery and `ApiError` for a non-2xx, but a body-read failure AFTER a 2xx
+ * is wrapped in `AcceptedBodyUnreadable`, so "accepted, receipt lost" stays
+ * distinguishable from a request that never left (both would otherwise
+ * surface as a `TypeError`/`SyntaxError`).
+ */
+const jAccepted = async (r: Response) => {
+  if (!r.ok) return parseJson(r)
+  checkSessionExpired(r)
+  removeAuthBanner()
+  try {
+    return await r.json()
+  } catch (e) {
+    throw new AcceptedBodyUnreadable(e, r)
+  }
+}
 
 /**
  * Nullable variant of j(): preserves auth recovery + ApiError semantics but
@@ -996,6 +1120,16 @@ const jInstancesDisabled = (r: Response) => parseJson(r, INSTANCES_DISABLED)
  */
 const CREW_BOARD_NO_LEDGER: BenignDenial = { status: 404, code: 'no_ledger' }
 const jCrewBoard = (r: Response) => parseJson(r, CREW_BOARD_NO_LEDGER)
+
+/**
+ * The third: a remote-artifact provider answering `scope_unsupported` for a
+ * browse scope it does not list. The `/artifacts` page treats it as "try the
+ * next scope", not a failure, and probes every discovery provider on each load,
+ * so journaling it would file one error report per load for a provider that
+ * works. Any other browse failure, including a different 400, journals normally.
+ */
+const REMOTE_SCOPE_UNSUPPORTED: BenignDenial = { status: 400, code: 'scope_unsupported' }
+const jRemoteBrowse = (r: Response) => parseJson(r, REMOTE_SCOPE_UNSUPPORTED)
 
 /** Add transport failures that have no HTTP Response to the same journal as apiFailure.
  *
@@ -1192,8 +1326,9 @@ export interface KiroBonusCreditGrantPayload {
 export interface KiroUsagePayload {
   available?: boolean
   /**
-   * Why usage is unavailable when `available` is false (`api_key_auth` or
-   * `signin_required`); absent when the gateway simply holds no reading.
+   * Why usage is unavailable when `available` is false (`signin_required`, or
+   * `account_unproven` when the account is named but its reading could not be
+   * tied to it); absent when the gateway simply holds no reading.
    */
   reason?: string
   credits_used?: number
@@ -1252,6 +1387,7 @@ const transport: ClientTransport = {
   del,
   patch,
   j,
+  jAccepted,
   jNullable,
   jInstancesDisabled,
   jfetch,
@@ -1435,7 +1571,7 @@ export const api = {
         `?scope=${encodeURIComponent(opts?.scope ?? 'mine')}` +
         (opts?.q ? `&q=${encodeURIComponent(opts.q)}` : '') +
         (opts?.pageToken ? `&pageToken=${encodeURIComponent(opts.pageToken)}` : ''),
-    ).then(j),
+    ).then(jRemoteBrowse),
   ...artifacts.remoteAndComments,
   ...browserAndComputerUse.hostAutomation,
   ...decisions.consentRead,

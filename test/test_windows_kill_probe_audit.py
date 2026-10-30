@@ -23,8 +23,8 @@ calls in general. The tree carries many raw POSIX call sites (``fcntl``,
 majority are legitimately POSIX-gated implementation detail; auditing them all
 here would bury this signal in noise. General portability is governed by the
 ``platform_compat`` shim table in
-``docs/system-specs/common/platform-compat.md``, the ``cross-platform.yml``
-added-line gate, and review. What makes signal-0 special is that getting it
+``docs/system-specs/common/platform-compat.md``, the ``Cross-Platform Portability``
+added-line gate in ``pr-policy.yml``, and review. What makes signal-0 special is that getting it
 wrong is *destructive* rather than merely unavailable — and the CI gate only
 inspects lines a PR adds, so a probe that arrives by a file move or a rebase is
 invisible to it. This test reads the whole tree on every run.
@@ -53,8 +53,8 @@ GATED_PROBES: dict[str, str] = {
     # platform_compat IS the shim — its POSIX branch is the real implementation
     # that every other caller is supposed to route through, and it is reached
     # only under `if IS_POSIX`.
-    "platform_compat.py::pid_exists": "the shim's own POSIX branch (under IS_POSIX)",
-    "platform_compat.py::pid_liveness": "the shim's own POSIX branch (under IS_POSIX)",
+    "platform_compat_liveness.py::pid_exists": "the shim's own POSIX branch (under IS_POSIX)",
+    "platform_compat_liveness.py::pid_liveness": "the shim's own POSIX branch (under IS_POSIX)",
 }
 
 

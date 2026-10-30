@@ -79,9 +79,21 @@ watches. The before/after example is in testing-conventions.md § Rules.
 
 `ignore_errors=True` also **hides** a cleanup that could not finish, so it is not proof
 of anything. The floor helps, but it is not your discipline: the rootdir conftest redirects
-`tempfile`'s base per run, removes it, and **reports** residue — as a warning today, fatal
-under `KIROCREW_TMP_RESIDUE_STRICT=1`. So a leak of yours will not necessarily turn CI red;
-clean up anyway. (Staged rollout and its owner: testing-conventions.md § Rules.)
+`tempfile`'s base per run, removes it, and **reports** residue. CI's `Backend Tests*` jobs
+set `KIROCREW_TMP_RESIDUE_STRICT=1`, so a leak of yours turns that shard red; a local run
+only warns unless you set it. Need a data home? Use the conftest's per-test `KIROCREW_HOME`
+pin, not a private temp home: a background worker can re-create a home you removed.
+(Details: testing-conventions.md § Rules.)
+
+Running the suite from a Kiro Crew agent needs no setup. The agent's shell inherits the
+live `KIROCREW_HOME`, and the rootdir conftest sees `KIROCREW_SCRATCH` beside it and gives
+the run its own home under `$TMPDIR` (the agent's scratch, reclaimed by the gateway)
+instead of refusing. Do not make a home under `/tmp/<name>`, and do not fake `HOME`: a
+fake `HOME` makes uv, npm and pip rebuild their caches under it, 10k+ inodes per run, and
+nothing an agent may run can delete it afterwards. If a harness must fake `HOME`, keep
+the caches shared: `XDG_CACHE_HOME=<real home>/.cache UV_CACHE_DIR=<real home>/.cache/uv
+npm_config_cache=<real home>/.npm` on the commands the harness itself runs. The conftest
+keeps only its own bytecode and hypothesis caches on the real home.
 
 Why it earns a guard: `/tmp` is often a tmpfs with a fixed **inode** budget
 (1,048,576 on the hosts this was measured on) and it returns `ENOSPC` to every other
@@ -109,7 +121,7 @@ Six shapes escape the env var:
   resolves `spool_path()` on the loop and hands it to the task, so the worker reads a
   location fixed at boot. Resolve every environment-derived input of a detached task on
   the calling side before detaching, or give the test a handle it can await.
-- **What a closed loop leaves behind.** pytest-asyncio 0.20 ends the loop with a bare
+- **What a closed loop leaves behind.** pytest-asyncio 0.21 ends the loop with a bare
   `loop.close()`. A pending task's coroutine then gets `GeneratorExit` at garbage
   collection, so its `finally` blocks run *then* (`_run_chat`'s queue cycle reaches a
   sync `KiroCrewConfig.load()`); a default-executor job (`to_thread`) is abandoned
@@ -127,8 +139,9 @@ Six shapes escape the env var:
 - **Import-time from `config_dir()`** (`subagent_persistence._SUBAGENTS_DIR`): the var
   is read after the module captured the path. Each has its own autouse pin. A
   **collection-time probe** is the same shape one step earlier: a module-level
-  `_can_spawn()` used by a `skipif` runs before any pin and read the REAL
-  `config.json`; run such probes under an empty `KIROCREW_HOME`.
+  probe used by a `skipif` (`_sandbox_can_spawn()` in `test/test_app_backend.py`)
+  runs before any pin and would read the REAL `config.json`; run such probes under
+  an empty `KIROCREW_HOME`.
 - **Import-time from `Path.home()`**: `~/.kiro` is *kiro-cli's* home, machine-wide and
   shared with the real installed agent — `~/.kiro/settings/mcp.json` is the live
   agent's MCP server list. `_isolate_shared_kiro_paths` redirects these from a table,
@@ -325,10 +338,10 @@ file driving `spawn` takes `pytestmark = pytest.mark.usefixtures("healthy_host_m
 and `test_subagent_spawn_host_pin.py` fails when a new one does not. The guard it
 pins, and why it stays transparent for the parser's own tests, are in
 testing-conventions § Determinism 1. Both the fixture and its ratchet are
-`test/`-only — `healthy_host_memory` lives in `test/conftest.py`, and
-`test_subagent_spawn_host_pin.py` scans `test/*.py` non-recursively. An in-package
-app suite cannot request the fixture and is not swept, so a test there that drives
-`SubagentManager.spawn` must pin the floor reading itself.
+`test/`-only — `healthy_host_memory` lives in `test/conftest_opt_in.py`, bound by
+`test/conftest.py`, and `test_subagent_spawn_host_pin.py` scans `test/*.py`
+non-recursively. An in-package app suite cannot request the fixture and is not
+swept, so a test there that drives `SubagentManager.spawn` must pin the floor reading itself.
 
 One more, for tests of a **single-flight or coalescing** path ("N concurrent readers
 share ONE scan"): the property only holds for readers that arrive WHILE the shared
@@ -422,7 +435,9 @@ The recurring wins, in order of leverage:
    tests land on; five full runs measured eighteen ratchet modules each re-scanning on
    3–5 workers, ~22 CPU-minutes per run. Add
    `pytestmark = pytest.mark.xdist_group(name="tree_scan_<module>")` — one group per
-   file, never one shared group — and the scan runs once per run.
+   file, never one shared group — and the scan runs once per run. The group also
+   carries the tree-scan timeout: `test/conftest.py` gives every test in a `tree_scan`
+   group with no timeout of its own 300 s instead of the suite's 120 s.
 
 **After any speedup, mutate the production code the test covers and confirm the test
 still FAILS.** A test made faster by checking less is a regression. Restore from a copy

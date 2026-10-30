@@ -116,7 +116,7 @@ It has to be its own file because every other place a decision could land is a
 TAIL. The status file's `events_tail` is bounded by schema and rewritten whole
 each cycle. The session ledger keeps `_MAX_EVENTS` = 100 events on disk and
 `session_ledger_read` returns only the newest `_MAX_EVENT_TAIL` = 20 (both in
-`session_ledger.py`; the injected `[work ledger]` block carries no events at
+`session_ledger_layout.py`; the injected `[work ledger]` block carries no events at
 all). A patrol writes at least one event per cycle, so a decision recorded in
 cycle 3 of a 40-cycle run is off the readable tail by about cycle 23 and off
 disk long before the `max_cycles=960` patrol ends. Tails answer "what just
@@ -271,17 +271,20 @@ never relabel it success in the friction report.
    artifact you have to remember to create is one that gets created at the end of
    the run, which is the one moment its contents no longer exist (see "What you
    write down, and when").
-4. Arm the patrol with `monitor_start` using an interval near 90 seconds, an
-   explicit `max_cycles=960`, and an explicit `max_runtime_secs=259200`. **Patrol
-   with `monitor_start`, never `wait`.** If live work needs a larger or renewed
-   bound, raise it with `monitor_update` before it expires; `monitor_start` is
-   create-only. Call `autonudge_stop` yourself when the exit condition fires —
-   coasting into the cycle cap is a failure, not a finish. That ~90s interval is
-   also what sizes your panel's stale window: `BOARD_STALE_AFTER_SECONDS` in
-   `kiro_crew.dashboard.handlers.agent_panel` is about ten of these intervals, so a
-   board reads stale only after the log has been quiet across many cycles rather
-   than after one quiet cycle. Change the cadence here and that constant needs the
-   same look.
+4. Arm the patrol with `monitor_start` using an explicit `interval_secs=90`, an
+   explicit `max_cycles=960`, and an explicit `max_runtime_secs=86400`. **Patrol
+   with `monitor_start`, never `wait`.** The interval times `max_cycles` must
+   cover `max_runtime_secs`, so the runtime, not the cycle cap, ends the loop. If
+   live work needs a larger or renewed bound, raise `max_cycles` and
+   `max_runtime_secs` together with `monitor_update` before either expires, under
+   the same rule; `max_cycles` counts the loop's whole life and the server caps it
+   at 1000. `monitor_start` is create-only. Call `autonudge_stop` yourself when
+   the exit condition fires — coasting into a bound is a failure, not a finish.
+   That ~90s interval is also what sizes your panel's stale window:
+   `BOARD_STALE_AFTER_SECONDS` in `kiro_crew.dashboard.handlers.agent_panel` is
+   about ten of these intervals, so a board reads stale only after the log has
+   been quiet across many cycles rather than after one quiet cycle. Change the
+   cadence here and that constant needs the same look.
 
 Standing patrol instruction template (keep it CURRENT — steering edits go here
 via `monitor_update`, see "Live steering"):
@@ -318,12 +321,12 @@ via `monitor_update`, see "Live steering"):
 
 ## Your panel: publish JUDGMENTS, never numbers
 
-The Dashboard tab beside your chat draws this panel while the "Dynamic Dashboard"
-Feature Preview is off, which is the default. With the preview on, it draws the
-crewmate's own dashboard instead, where an item reaches the reader only through an
-agentic field written with `dashboard_write` (it appears under "Needs you" with the
-act it needs). So publish every item under `you` here, and also write it to the
-dashboard field for readers who turned the preview on.
+The Dashboard tab beside your chat draws the page you have, where an item reaches
+the reader only through an agentic field written with `dashboard_write` (on
+`project-report` it appears under "Needs you" with the act it needs). So publish
+every item under `you` here, and also write it to the Dashboard tab's field when
+your `[DASHBOARD]` block names one; with no such block you have no page yet, and
+the write is refused.
 
 `panel_publish` and `dashboard_write` belong to the `@kirocrew-panel` server,
 which is mounted only on a crew member's own chat session (with `agent.crew_panel`

@@ -70,8 +70,10 @@ MAIN_ROUTES = [
     ("POST", "/pull/merge", "_handle_pull_merge"),
     ("POST", "/pull/auto-merge", "_handle_pull_auto_merge"),
     ("GET", "/pull/runs", "_handle_pull_runs"),
+    ("GET", "/ci-runs", "_handle_ci_runs"),
     ("POST", "/pull/run", "_handle_pull_run_action"),
     ("POST", "/pulls/bulk", "_handle_pulls_bulk"),
+    ("POST", "/comments", "_handle_comments"),
     ("GET", "/investigation", "_handle_get_investigation"),
     ("PUT", "/investigation", "_handle_put_investigation"),
     ("GET", "/recommendations", "_handle_get_recommendations"),
@@ -80,6 +82,10 @@ MAIN_ROUTES = [
     ("GET", "/tagging", "_handle_get_tagging"),
     ("POST", "/tagging", "_handle_generate_tagging"),
     ("POST", "/labels/apply-bulk", "_handle_labels_apply_bulk"),
+    ("GET", "/gitlab-groups", "_handle_gitlab_groups"),
+    ("POST", "/gitlab-groups", "_handle_add_gitlab_group"),
+    ("DELETE", "/gitlab-groups", "_handle_remove_gitlab_group"),
+    ("GET", "/gitlab-groups/review-requests", "_handle_gitlab_group_reviews"),
 ]
 TAIL_ROUTES = [
     ("GET", "/crews"),

@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest'
-import { readFileSync } from 'node:fs'
+import { readFileSync, readdirSync } from 'node:fs'
 import { resolve } from 'node:path'
+import { readIndexCss } from './indexCssSource'
 
 /**
  * The composer dock is one positioned box floating over the bottom of the
@@ -25,10 +26,21 @@ import { resolve } from 'node:path'
  * the comparison BETWEEN them.
  */
 const SRC = (p: string) => readFileSync(resolve(__dirname, '..', p), 'utf8')
-const CHAT_PAGE = SRC('pages/ChatPage.tsx')
+// ChatPage composes owners under pages/chat/page/ (and its useChatPage* siblings), so the pins read the page and those owners.
+const CHAT_PAGE = [
+  SRC('pages/ChatPage.tsx'),
+  ...readdirSync(resolve(__dirname, '..', 'pages/chat/page'))
+    .filter(f => /\.tsx?$/.test(f) && !/\.test\./.test(f))
+    .sort()
+    .map(f => SRC(`pages/chat/page/${f}`)),
+  ...readdirSync(resolve(__dirname, '..', 'pages'))
+    .filter(f => /^useChatPage.*\.ts$/.test(f) && !/\.test\./.test(f))
+    .sort()
+    .map(f => SRC(`pages/${f}`)),
+].join('\n')
 
 /** The dock root: the one positioned box that floats over the scroller. */
-const DOCK = /<div ref=\{dockRef\} className="([^"]*)" style=\{\{ right: dockGutter \}\} data-testid="composer-dock-root">/.exec(CHAT_PAGE)
+const DOCK = /<div ref=\{dockRef\} className="([^"]*)" style=\{\{ right: dockGutter \}\} data-testid="composer-dock-root"[^>]*>/.exec(CHAT_PAGE)
 /** The composer's own layer. A bar at or above it would paint over the input box,
  *  and QueueStack's -OVERLAP fuse would surface ON TOP of the composer. */
 const COMPOSER_Z = /<div ref=\{inputAreaRef\} className="relative z-(\d+) dock-inert">/.exec(CHAT_PAGE)
@@ -105,11 +117,11 @@ describe('composer dock layering', () => {
     expect(STACK![1]).toMatch(/\bdock-inert\b/)
     expect(STACK![1]).not.toMatch(/\bpointer-events-auto\b/)
     expect(CHAT_PAGE).toMatch(/<div ref=\{inputAreaRef\} className="relative z-\d+ dock-inert">/)
-    expect(SRC('index.css')).toMatch(/\.dock-inert\{pointer-events:none\}\.dock-inert>\*\{pointer-events:auto\}/)
+    expect(readIndexCss()).toMatch(/\.dock-inert\{pointer-events:none\}\.dock-inert>\*\{pointer-events:auto\}/)
     // The stack is a scroll box: while it overflows its cap, its own scrollbar
     // must be a hit target, and a scrollbar belongs to the box, not a child. The
     // band observer marks the crossing and the stylesheet lifts the pass-through.
-    expect(SRC('index.css')).toMatch(/\.dock-inert\[data-overflowing="true"\]\{pointer-events:auto\}/)
+    expect(readIndexCss()).toMatch(/\.dock-inert\[data-overflowing="true"\]\{pointer-events:auto\}/)
     expect(SRC('pages/chat/useChatPageTranscriptController.tsx')).toMatch(/el\.dataset\.overflowing = el\.scrollHeight > el\.clientHeight \? 'true' : 'false'/)
   })
 })

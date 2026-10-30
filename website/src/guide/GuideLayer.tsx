@@ -21,16 +21,17 @@
  * takes focus on its own.
  */
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
-import { createPortal } from 'react-dom'
+import { OverlayPortal } from '../components/overlayRoot'
 import { useTranslation } from 'react-i18next'
 import { useLocation, useNavigate } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
 import { motion, useReducedMotion } from 'framer-motion'
 import { AlertTriangle, ArrowDown, ArrowLeft, ArrowRight, ArrowUp, Compass, Loader2, X } from 'lucide-react'
-import { GUIDE_LAYER_SELECTOR } from './probeRegistry'
+import { openModalDialog } from './openModalDialog'
 import { Btn, IconButton } from '../components/ui'
 import ErrorNotice from '../components/ErrorNotice'
 import { useGuardedLeave } from '../components/NavigationLeaveGuard'
+import { memberSlugOfSlot } from '../hooks/unreadOnAttention'
 import { membersRosterQuery } from '../api/membersQuery'
 import type { MemberRosterRow } from '../api/client'
 import { GUIDE_ONLY_WITH_ITEMS } from '../uiLocations/guidePlans.gen'
@@ -280,16 +281,9 @@ export function keepClearBoxes(viewport: Viewport, root: Document = document): B
   return out
 }
 
-/** A page dialog that is modal right now (never the guide's own layer). */
-export function openModalDialog(root: Document = document): Element | null {
-  // The topmost one: dialogs portal to the end of the body, so a confirm
-  // opened from inside another dialog comes after it and covers it.
-  const open = Array.from(root.querySelectorAll('[role="dialog"][aria-modal="true"], [role="alertdialog"][aria-modal="true"]'))
-  for (let i = open.length - 1; i >= 0; i--) {
-    if (!open[i].closest(GUIDE_LAYER_SELECTOR)) return open[i]
-  }
-  return null
-}
+// Lives in its own module so `paneVisibility` can share it; re-exported here for
+// the guide's existing callers.
+export { openModalDialog }
 
 /**
  * Whether an open page modal hides *el*: the target is outside the dialog and
@@ -592,7 +586,7 @@ function GuidePanel({ rect, obstacles, reserved, label, reduceMotion, panelRef, 
     }
   }
   style.maxHeight = Math.max(0, viewport.height - 2 * PANEL_MARGIN)
-  return createPortal(
+  return <OverlayPortal>
     <motion.div
       ref={ref}
       role="region"
@@ -609,9 +603,8 @@ function GuidePanel({ rect, obstacles, reserved, label, reduceMotion, panelRef, 
       style={style}
     >
       {children}
-    </motion.div>,
-    document.body,
-  )
+    </motion.div>
+  </OverlayPortal>
 }
 
 const ARROW_ICONS = { up: ArrowUp, down: ArrowDown, left: ArrowLeft, right: ArrowRight } as const
@@ -741,16 +734,8 @@ function FindMissing({ query, findKey, reason }: { query: FindQuery; findKey: st
 /** Where the finish chip's way back leads: the chat the guide was offered in. */
 export type GuideReturn = { kind: 'chat'; to: string }
 
-/**
- * A crewmate thread's slot key (`member-<slug>`, or `member-<slug>.memory-<store>`
- * once the crewmate has a private memory store) -> that slug; anything else
- * -> null. Mirrors the gateway's `member_slot_key` (members.py): the prefix,
- * the slug pattern, and the store suffix that belongs to the SLOT, not the slug.
- */
-const MEMBER_SLOT_KEY = /^member-([a-z0-9](?:[a-z0-9-]{0,78}[a-z0-9])?)(?:\.memory-.+)?$/
-export function memberSlugOfSlot(slotKey: string): string | null {
-  return MEMBER_SLOT_KEY.exec(slotKey)?.[1] ?? null
-}
+// Re-exported for the callers and tests that read it from here.
+export { memberSlugOfSlot }
 
 const toMember = (name: string): GuideReturn => ({ kind: 'chat', to: `/members?member=${encodeURIComponent(name)}` })
 
@@ -1460,8 +1445,8 @@ export default function GuideLayer() {
       {/* One status region for the whole life of the layer, so the end of a
           guide is announced into a region that already exists. Silent on the
           slot's own chat, whose result line announces it instead. */}
-      {createPortal(<div role="status" aria-live="polite" className="sr-only" data-testid="guide-finished-status">{announced}</div>, document.body)}
-      {body && anchor && createPortal(<GuideArrow rect={anchor} also={view?.step ? pickAlternativeRects(view.step, { width: window.innerWidth, height: window.innerHeight }) : []} obstacles={obstacles} reduceMotion={reduceMotion} />, document.body)}
+      <OverlayPortal><div role="status" aria-live="polite" className="sr-only" data-testid="guide-finished-status">{announced}</div></OverlayPortal>
+      {body && anchor && <OverlayPortal><GuideArrow rect={anchor} also={view?.step ? pickAlternativeRects(view.step, { width: window.innerWidth, height: window.innerHeight }) : []} obstacles={obstacles} reduceMotion={reduceMotion} /></OverlayPortal>}
       {body && (
         <GuidePanel rect={anchor} obstacles={obstacles} reserved={reserved} label={label} reduceMotion={reduceMotion} panelRef={panelEl} onFocus={onPanelFocus} onBlur={onPanelBlur} wide={!!announced}>
           {body}

@@ -78,7 +78,7 @@ from kiro_crew.dashboard.chat_handlers import deny_non_dashboard_caller
 from kiro_crew.git_config_hooks import ConfigHookScanError, config_hook_disable_args_sandboxed
 from kiro_crew.git_worktree_scope import worktree_probe_failure_is_empty_scope
 from kiro_crew.loop_lock import LoopBoundLock
-from kiro_crew.sandbox import run_limited, sandboxed_spawn_argv
+from kiro_crew.sandbox import LAUNCHER_EXEC_FAILURE_RE, run_limited, sandboxed_spawn_argv
 from kiro_crew.security import is_sensitive_path
 from kiro_crew.sel import sel
 from kiro_crew.subprocess_utf8 import utf8_path_stdout, utf8_stdout
@@ -132,7 +132,7 @@ _MAX_DIR_SLUG = 60
 # Repo-local config keys that would hand git a program to run during checkout.
 # `-c` cannot generically disable these (the driver name is arbitrary), so a repo
 # declaring one is refused outright — see `_checkout_filter`.
-_FILTER_KEY_RE = re.compile(r"^filter\.(?P<name>.+)\.(process|smudge|clean)$", re.IGNORECASE)
+_FILTER_KEY_RE = re.compile(r"^filter\.(?P<name>.*)\.(process|smudge|clean)$", re.IGNORECASE)
 
 # Returned instead of a key name when a config scope could not be read at all.
 # Treated as "refuse": an unreadable scope cannot be proven filter-free.
@@ -283,7 +283,7 @@ def _run_git(
 
 
 def _launcher_failure_line(stderr: str) -> str:
-    """The sandbox launcher's FATAL line in *stderr*, or ``""`` when it did not fail.
+    """The sandbox launcher's refusal line in *stderr*, or ``""`` when it did not refuse.
 
     Line-wise and WARNING-aware, and both properties are load-bearing.
 
@@ -298,10 +298,18 @@ def _launcher_failure_line(stderr: str) -> str:
 
     Scanning per line rather than only the head also catches the opposite order: a
     real fatal line that an advisory happens to precede.
+
+    A command the kernel would not exec is not a refusal either. The launcher built
+    the sandbox and git could not start inside it, so answering "this host has no OS
+    sandbox backend" would name the wrong cause on a host that has one. The line is
+    left as git's stderr, and the caller reports the failed call as it reports any
+    other git failure.
     """
     for line in stderr.splitlines():
-        if line.startswith(_SANDBOX_LAUNCHER_PREFIX) and not line.startswith(
-            _SANDBOX_LAUNCHER_WARNING_PREFIX
+        if (
+            line.startswith(_SANDBOX_LAUNCHER_PREFIX)
+            and not line.startswith(_SANDBOX_LAUNCHER_WARNING_PREFIX)
+            and not LAUNCHER_EXEC_FAILURE_RE.match(line)
         ):
             return line.strip()
     return ""
@@ -821,9 +829,15 @@ def _match_allowed_root(candidate: str, roots: list[str]) -> str | None:
     differently-cased but identical path would be refused. The prefix test is
     ``os.sep``-terminated, so ``/repo-evil`` does not pass as inside ``/repo``.
     """
-    probe = os.path.normcase(candidate)
+    # ``normcase`` neither adds nor strips Windows' ``\\?\`` prefix, and a
+    # ``realpath``-ed root can carry it while the caller's candidate does not; the
+    # prefix is folded off both sides first so the lone prefix is not read as an
+    # escape. Lexical only.
+    from kiro_crew.platform_compat import strip_extended_length_prefix
+
+    probe = os.path.normcase(strip_extended_length_prefix(candidate))
     for root in roots:
-        normalized = os.path.normcase(root)
+        normalized = os.path.normcase(strip_extended_length_prefix(root))
         if probe == normalized or probe.startswith(normalized.rstrip(os.sep) + os.sep):
             return root
     return None

@@ -45,6 +45,25 @@ what gets sent for something no gate here ever saw.
 upload, and each one exists because the reply text is not trustworthy input -- a
 prompt-injected agent chooses what it writes:
 
+* a containment check against the approved roots (:func:`approved_roots`):
+  the provider's working directory the channel authorized, plus the browser
+  CLI's own output directory. Anywhere else -- ``![x](~/Pictures/id.png)`` --
+  is refused before a single metadata probe, because "any readable raster on
+  the host" is not what the reader of a chat channel agreed to receive. The
+  browser directory is admitted because it holds only what ``playwright-cli``
+  wrote while the agent drove it, and because the gateway pins that directory
+  under its data home (:func:`kiro_crew.browser_cli.snapshots.snapshot_dir`)
+  rather than under any working directory, so a screenshot the agent was asked
+  to send could otherwise never be sent inline -- and admitting it grants
+  nothing the explicit ``file_send`` tool does not already deliver from that
+  same directory. The read below is pinned to whichever root admitted the
+  path, so a linked ancestor inside one root cannot reach outside it -- and the
+  browser root is pinned by its CANONICAL spelling (real data home, literal
+  leaf), so replacing the snapshot directory itself with a link admits nothing.
+  A channel that passes it also admits the session's own ``$KIROCREW_SCRATCH``
+  directory (:func:`session_scratch_root`), where the agent is told to stage
+  screenshots: one allocation under the managed scratch root, pinned the same
+  canonical way, never the managed root or another runtime's allocation
 * a denylist check (:func:`kiro_crew.security.is_sensitive_path`), so
   ``![x](~/.aws/credentials)`` cannot be turned into an upload
 * a refusal to follow a symlink, so the bytes come from the inode the written
@@ -82,16 +101,19 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from kiro_crew.agent_scratch import scratch_root as managed_scratch_root
+from kiro_crew.browser_cli.snapshots import snapshot_dir
 from kiro_crew.hooks import (
     FileTooLargeError,
     is_unc_shape,
     safe_read_file_bytes_nolink,
+    screen_windows_linked_ancestors,
     unc_probe_allowed,
 )
 from kiro_crew.messaging.raster import SNIFF_BYTES, sniff_raster_mime
 from kiro_crew.messaging.split import iter_fence_spans
 from kiro_crew.platform import binary_content_is_flagged
-from kiro_crew.platform_compat import first_linked_ancestor, is_link_or_junction
+from kiro_crew.platform_compat import is_link_or_junction
 from kiro_crew.security import (
     is_sensitive_path,
     redact_credentials,
@@ -398,12 +420,16 @@ def _walk_destination(rest: str) -> tuple[str | None, int]:
     """
     depth = 1
     out: list[str] = []
+    # Indices into `out` of characters that arrived escaped, so the finish can
+    # tell a `\>` in the path from the `>` that closes a `<...>` wrap.
+    escaped: set[int] = set()
     i = 0
     while i < len(rest):
         ch = rest[i]
         if ch == "\\" and i + 1 < len(rest) and rest[i + 1] in _MD_ESCAPABLE:
             # A real markdown escape: keep the escapee, and never let it move the
             # paren depth.
+            escaped.add(len(out))
             out.append(rest[i + 1])
             i += 2
             continue
@@ -414,23 +440,54 @@ def _walk_destination(rest: str) -> tuple[str | None, int]:
         elif ch == ")":
             depth -= 1
             if depth == 0:
-                return _finish_destination("".join(out)), i + 1
+                return _finish_destination("".join(out), escaped), i + 1
         out.append(ch)
         i += 1
     return None, 0
 
 
-def _finish_destination(raw: str) -> str | None:
-    """Strip the optional ``<...>`` wrapper or trailing ``"title"`` from *raw*."""
+def angle_wrap_close(markup: str, start: int, limit: int) -> int:
+    """Index of the first unescaped ``>`` in ``markup[start:limit]``, or ``-1``.
+
+    *markup* is RAW markdown and *start* is just past a destination's opening
+    ``<``. A backslash before a character in :data:`_MD_ESCAPABLE` makes the pair
+    one token, so the ``\\>`` the composer writes for a ``>`` in a path never
+    closes the wrap -- the same tokenisation :func:`_walk_destination` uses, so a
+    caller that cuts the raw markup closes the wrap where the scanner did.
+    """
+    i = start
+    while i < limit:
+        ch = markup[i]
+        if ch == "\\" and i + 1 < limit and markup[i + 1] in _MD_ESCAPABLE:
+            i += 2
+            continue
+        if ch == ">":
+            return i
+        i += 1
+    return -1
+
+
+def _finish_destination(raw: str, escaped: set[int] | frozenset[int] = frozenset()) -> str | None:
+    """Strip the optional ``<...>`` wrapper or trailing ``"title"`` from *raw*.
+
+    *escaped* holds the indices of *raw* whose character arrived backslash-escaped;
+    an escaped ``>`` is part of the path, never the close of a ``<...>`` wrap.
+    """
     if "\r" in raw or "\n" in raw:
         return None
     dest = raw.strip()
+    lead = len(raw) - len(raw.lstrip())
     # `<...>` is markdown's explicit way to write a destination containing spaces
     # (`![c](</tmp/generated images/c.png>)`). Unwrap it and DON'T split on
     # whitespace: inside the brackets a space is part of the path, not the
     # separator before a `"title"`.
     if dest.startswith("<"):
-        end = dest.find(">")
+        # The wrap closes at the first UNESCAPED `>`, as in CommonMark: the
+        # composer writes a `>` in the path as `\>` (a POSIX data home `a>b`).
+        end = next(
+            (j for j, ch in enumerate(dest) if ch == ">" and j + lead not in escaped),
+            -1,
+        )
         if end == -1:
             return None  # unterminated -- don't guess at the path
         dest = dest[1:end].strip()
@@ -785,6 +842,121 @@ def _payload_is_flagged(data: bytes) -> bool:
         return True
 
 
+@dataclass(frozen=True)
+class ApprovedRoot:
+    """One directory an outbound reference may name, and how its read is pinned.
+
+    ``lexical`` is the spelling a destination is compared against, as the agent
+    sees it. ``read_root`` is what the descriptor-pinned read must contain the
+    opened file in, and ``read_root_is_canonical`` says whether that spelling is
+    handed over literally (already resolved here) or resolved by the read.
+    """
+
+    lexical: str
+    read_root: str
+    read_root_is_canonical: bool = False
+
+
+def session_scratch_root(scratch_root: str) -> ApprovedRoot | None:
+    """The session's own ``$KIROCREW_SCRATCH`` directory as a root, or ``None``.
+
+    *scratch_root* is the directory the runtime serving the session exposes as
+    ``$KIROCREW_SCRATCH`` (``providers.base.Provider.work_scratch_dir``), handed
+    over by the channel dispatcher. The agent is told to stage screenshots there,
+    and it is never inside a working directory, so without this root no image the
+    agent staged as instructed could travel inline.
+
+    Admitted only when it is ONE allocation: an absolute, existing directory that
+    is not itself a link or junction, whose parent resolves to the managed scratch
+    root (``agent_scratch.scratch_root``). Anything wider -- the managed root
+    itself, the data home, ``/`` -- or anything elsewhere answers ``None``, so a
+    wrong value can only lose this root, never widen it to another runtime's
+    scratch.
+
+    The read pin is CANONICAL, like the browser root's: the parent resolved, the
+    allocation's leaf kept literal, so a link swapped in at the leaf after this
+    check resolves the opened file outside the pin instead of moving the pin.
+    """
+    if not scratch_root or not os.path.isabs(scratch_root):
+        return None
+    lexical = os.path.abspath(scratch_root)
+    path = Path(lexical)
+    try:
+        if is_link_or_junction(path) or not path.is_dir():
+            return None
+        parent = os.path.realpath(path.parent)
+        if parent != os.path.realpath(managed_scratch_root()):
+            return None
+    except (OSError, ValueError):
+        return None
+    return ApprovedRoot(
+        lexical=lexical,
+        read_root=os.path.join(parent, path.name),
+        read_root_is_canonical=True,
+    )
+
+
+def approved_roots(within_root: str, scratch_root: str = "") -> tuple[ApprovedRoot, ...]:
+    """The directories an outbound reference may name, authorized first.
+
+    *within_root* is the provider's resolved working directory, handed over by
+    the channel dispatcher once the provider is acquired; its read pin is
+    unchanged from before the browser root existed. The browser CLI's output
+    directory comes second: the gateway forces every ``playwright-cli``
+    invocation to write there (``PLAYWRIGHT_MCP_OUTPUT_DIR``), so it is the one
+    place a screenshot the agent just took can be, and it is never inside a
+    working directory by construction.
+
+    The browser root's read pin is CANONICAL: the data home around it resolved
+    (a ``/home`` alias or a dotfile manager's link to the data home is an
+    ordinary layout), the ``playwright-snapshots`` leaf kept literal and never
+    followed. The read compares the opened descriptor's real path against that
+    literal spelling, so a snapshot directory replaced by a link -- at rest or
+    swapped in after this call -- resolves the file somewhere else and fails the
+    comparison instead of moving the boundary there with it. The cwd keeps its
+    resolved-by-the-read pin because a linked working directory is the layout
+    it was authorized with.
+
+    The session's own scratch directory comes last, and only when
+    *scratch_root* passes :func:`session_scratch_root`.
+
+    An empty *within_root* contributes nothing, so neither the browser root nor
+    the scratch root ever stands in for an authorization the dispatcher withheld.
+    """
+    if not within_root:
+        return ()
+    snap = snapshot_dir()
+    roots = (
+        ApprovedRoot(lexical=os.path.abspath(within_root), read_root=within_root),
+        ApprovedRoot(
+            lexical=os.path.abspath(snap),
+            read_root=os.path.join(os.path.realpath(snap.parent), snap.name),
+            read_root_is_canonical=True,
+        ),
+    )
+    scratch = session_scratch_root(scratch_root)
+    return roots if scratch is None else (*roots, scratch)
+
+
+def containing_root(path: Path, within_root: str, scratch_root: str = "") -> ApprovedRoot | None:
+    """The approved root that lexically contains *path*, or ``None``.
+
+    Lexical on purpose: ``abspath`` collapses ``..`` so a traversal spelling
+    cannot land inside a root it names, and nothing here follows a link. The
+    link cases belong to the read that follows, which is pinned to the root
+    returned here and rechecks the opened descriptor's real path against it.
+    """
+    target = os.path.abspath(path)
+    for root in approved_roots(within_root, scratch_root):
+        try:
+            if os.path.commonpath((target, root.lexical)) == root.lexical:
+                return root
+        except ValueError:
+            # Different drives on Windows: not inside this root.
+            continue
+    return None
+
+
 def _inspect(
     dest: str,
     path: Path,
@@ -792,6 +964,7 @@ def _inspect(
     budget: int,
     max_file_bytes: int | None,
     within_root: str | None,
+    scratch_root: str = "",
 ) -> OutboundFile | Rejection:
     """Decide whether *path* can be uploaded; return the file OR a rejection.
 
@@ -813,12 +986,13 @@ def _inspect(
         read_cap = max_file_bytes
         over_reason = REASON_OVER_FILE_BYTES
         over_detail = f"larger than this channel's {max_file_bytes}-byte per-file limit"
+    root: ApprovedRoot | None = None
     if within_root is not None:
         try:
-            root = os.path.abspath(within_root)
-            if not within_root or os.path.commonpath((os.path.abspath(path), root)) != root:
-                return Rejection(dest, REASON_SENSITIVE, "outside the approved workspace")
+            root = containing_root(path, within_root, scratch_root)
         except (OSError, ValueError):
+            root = None
+        if root is None:
             return Rejection(dest, REASON_SENSITIVE, "outside the approved workspace")
     try:
         # A linked ANCESTOR defeats local_destination's lexical UNC screen:
@@ -829,31 +1003,49 @@ def _inspect(
         # before the is_symlink() lstat. Lives here, not in local_destination,
         # to keep that function's documented lexical-only contract intact.
         # Windows-only for the same reason as the UNC gate: on POSIX stat-ing
-        # through a symlink is harmless. The reply matches the leaf case on
-        # purpose -- which ancestor is a link is filesystem layout the caller
-        # supplied a path to guess at. Reference wiring:
-        # dashboard/handlers/themes.py::_resolve_local_source.
-        if os.name == "nt" and first_linked_ancestor(path) is not None:
-            return Rejection(dest, REASON_SYMLINK, "symlinks are not uploaded")
+        # through a symlink is harmless. The shared screen rewrites a local
+        # linked prefix to its vetted target and refuses UNC, device,
+        # drive-relative and `..`-climbing targets. Every check below runs on
+        # the REWRITTEN ``probe``, never through the link; ``path`` stays the
+        # provenance the caller wrote. The pinned read still holds the bytes
+        # to the approved root, so a junction leading out of it is refused
+        # there. The reply matches the leaf case on purpose -- which ancestor
+        # is a link is filesystem layout the caller supplied a path to guess
+        # at.
+        probe = path
+        if os.name == "nt":
+            screened = screen_windows_linked_ancestors(path)
+            if screened is None:
+                return Rejection(dest, REASON_SYMLINK, "symlinks are not uploaded")
+            probe = screened
         # The LEAF gets the junction-aware check the walk deliberately
         # excludes. The all-platform is_symlink() refusal below is lstat-only
         # (junction-blind) and runs after is_sensitive_path, whose candidate
         # forms resolve the leaf too -- so on Windows the leaf must be
         # screened here, before the first resolving call. lstat-based, never
         # follows.
-        if os.name == "nt" and is_link_or_junction(path):
+        if os.name == "nt" and is_link_or_junction(probe):
             return Rejection(dest, REASON_SYMLINK, "symlinks are not uploaded")
-        if is_sensitive_path(str(path)):
+        if is_sensitive_path(str(probe)):
             return Rejection(dest, REASON_SENSITIVE, "reading this location is blocked")
-        if path.is_symlink():
+        if probe.is_symlink():
             # Refused rather than resolved: the bytes below must come from the
             # inode this path names, not from wherever a link points now.
             return Rejection(dest, REASON_SYMLINK, "symlinks are not uploaded")
-        if not path.is_file():
+        if not probe.is_file():
             return Rejection(dest, REASON_MISSING, "no such file")
         try:
+            # Pinned to the root that admitted the path, not to the authorized
+            # cwd alone: a screenshot under the browser root must be contained
+            # by THAT root at the descriptor, or a linked ancestor inside it
+            # could hand over bytes from anywhere. The browser root's pin is
+            # its canonical spelling, so the snapshot directory itself being a
+            # link moves the file out of the pin rather than the pin to it.
             data = safe_read_file_bytes_nolink(
-                str(path), within_root=within_root, max_bytes=read_cap
+                str(probe),
+                within_root=root.read_root if root is not None else None,
+                within_root_is_canonical=root.read_root_is_canonical if root is not None else False,
+                max_bytes=read_cap,
             )
         except FileTooLargeError:
             return Rejection(dest, over_reason, over_detail)
@@ -1020,13 +1212,21 @@ def upload_filename(file: "OutboundFile", index: int = 0) -> str:
 
 
 def extract_local_refs(
-    text: str, *, limits: ExtractLimits | None = None, within_root: str | None = None
+    text: str,
+    *,
+    limits: ExtractLimits | None = None,
+    within_root: str | None = None,
+    scratch_root: str = "",
 ) -> ExtractResult:
     """Pull local raster references out of *text* for a transport to upload.
 
     Returns the text to send, the files to send with it, and a reason for every
     reference that could not be sent. Never raises: the reply must go out even if
     every reference in it turns out to be unusable.
+
+    *scratch_root* is the session's own ``$KIROCREW_SCRATCH`` directory, admitted
+    beside *within_root* only as :func:`session_scratch_root` allows; empty adds
+    nothing.
     """
     lim = limits or ExtractLimits()
     refs = iter_local_refs(text)
@@ -1059,6 +1259,7 @@ def extract_local_refs(
             lim.max_total_bytes - total_bytes,
             lim.max_file_bytes,
             within_root,
+            scratch_root,
         )
         if isinstance(outcome, Rejection):
             # A rejected reference keeps its markup, so the path stays visible.
@@ -1145,7 +1346,11 @@ def _apply_cuts(text: str, cuts: list[tuple[int, int]]) -> str:
 
 
 async def extract_local_refs_off_loop(
-    text: str, *, within_root: str, limits: ExtractLimits | None = None
+    text: str,
+    *,
+    within_root: str,
+    limits: ExtractLimits | None = None,
+    scratch_root: str = "",
 ) -> ExtractResult:
     """Async form of :func:`extract_local_refs`, run off the event loop.
 
@@ -1160,4 +1365,10 @@ async def extract_local_refs_off_loop(
     recover a wedged kernel resource, and this work is short and
     filesystem-bound with no reason to queue behind it.
     """
-    return await asyncio.to_thread(extract_local_refs, text, limits=limits, within_root=within_root)
+    return await asyncio.to_thread(
+        extract_local_refs,
+        text,
+        limits=limits,
+        within_root=within_root,
+        scratch_root=scratch_root,
+    )

@@ -259,7 +259,13 @@ def _open_contained_nofollow(base: Path, target: Path) -> int:
     backed by symlink creation being privileged there; junction swaps of
     the DATA dir are separately caught by _PinnedDir.verify.
     """
-    rel_parts = target.relative_to(base).parts
+    # Windows' ``\\?\`` prefix folded off both sides first, so a resolve that
+    # kept it on one operand is not read as an escape. Lexical only.
+    rel_parts = (
+        platform_compat.strip_extended_length_prefix(target)
+        .relative_to(platform_compat.strip_extended_length_prefix(base))
+        .parts
+    )
     if not rel_parts:
         raise OSError("requirements path resolves to the app root itself")
     if not pinned_fs.supports_pinned_walk():
@@ -547,7 +553,7 @@ def provision_app_deps(app_name: str, root: Path) -> str:
         # there - an app pointing data/ at another app's tree would have
         # this provisioning swap attacker-chosen dependencies into the
         # victim's dir (the same shape the uninstall purge refuses in
-        # manager.py). The gateway creates data/ as a real directory, so a
+        # manager_uninstall.py). The gateway creates data/ as a real directory, so a
         # link is never legitimate: refuse before touching anything through
         # it.
         if platform_compat.is_link_or_junction(deps_parent):

@@ -261,8 +261,16 @@ def _session_source(session_key: str) -> str:
     return telemetry_channel_of(session_key)
 
 
-async def record_session_started(session_key: str) -> None:
+async def record_session_started(session_key: str, provider: object = None) -> None:
     """Record one session start; never raises.
+
+    *provider* is the provider the registry entry was just built around. It
+    labels the counter with that session's EFFECTIVE ``harness``
+    (:func:`kiro_crew.metrics.harness.harness_of`), so a per-session or
+    per-agent ``acp_backend`` override shows up as its own harness rather than
+    the install default the ``kirocrew.harness`` resource attribute carries.
+    ``None`` labels it ``unknown``. Only the counter carries it: the duration
+    histogram does not, yet.
 
     The start time goes into an in-memory table keyed by session key. The crumb on
     disk is written on a worker thread, awaited before returning. The table is
@@ -335,8 +343,15 @@ async def record_session_started(session_key: str) -> None:
     # denominator every session-scoped rate is read against.
     try:
         from kiro_crew.metrics.events import emit_counter
+        from kiro_crew.metrics.harness import ATTR_HARNESS, harness_of
 
-        emit_counter(SESSION_STARTED_COUNTER, {"session_source": _session_source(session_key)})
+        emit_counter(
+            SESSION_STARTED_COUNTER,
+            {
+                "session_source": _session_source(session_key),
+                ATTR_HARNESS: harness_of(provider),
+            },
+        )
     except Exception:
         logger.debug("session started counter failed", exc_info=True)
 
@@ -513,6 +528,17 @@ def _owner_still_running(pid: object, start_id: object) -> bool:
     REUSE, and only when both sides of the comparison are actually available --
     including reuse of THIS process's own pid, which a container restart turns
     from a freak collision into the normal case.
+
+    One live, identity-matching owner is NOT running its sessions: the supervisor
+    an in-app restart through a supervising launcher leaves behind. The restart
+    ``os.execv``s the launcher, which runs the new gateway as a supervised child,
+    so the old pid stays alive with its start identity unchanged -- now running the
+    launcher, with every session the old image held gone. A crumb it wrote is a
+    casualty, not a live session, and reading the supervisor as its owner would
+    keep it on disk for as long as the supervisor lives. That supervisor is a live
+    ancestor whose image is not a Python interpreter
+    (``platform_compat.is_exec_supervisor_of_this_process``); a live gateway
+    ancestor still runs Python and keeps its crumbs.
     """
     if not isinstance(pid, int) or pid <= 0:
         # A crumb from before ownership was recorded. It cannot be attributed, so
@@ -537,6 +563,10 @@ def _owner_still_running(pid: object, start_id: object) -> bool:
 
         if not platform_compat.pid_exists(pid):
             return False  # definitively gone: a casualty to be reported
+        if platform_compat.is_exec_supervisor_of_this_process(pid):
+            # This gateway's own previous image, exec-ed into the launcher that
+            # supervises this process: its sessions ended with the exec.
+            return False
         live_start_id = platform_compat.get_process_start_id(pid)
     except Exception:
         return True

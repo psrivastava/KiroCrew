@@ -9,7 +9,6 @@
  * unchanged. The owner map is in website/docs/frontend-conventions.md.
  */
 import React, { useContext, memo, useEffect, useLayoutEffect, useMemo, useCallback, useRef, useState } from 'react'
-import { GitPullRequest } from 'lucide-react'
 import { capWhitespaceRuns, rehypeBoundRawDepth } from '../utils/markdownDepthBound'
 import { REMARK_BASE_PLUGINS } from './markdown/remarkBase'
 import { canonicalChatHref, chatHrefSid, namesASession } from '../utils/sessionKeys'
@@ -32,12 +31,10 @@ import { safeHttpUrl } from '../lib/safeUrl'
 import { useLinkMeta, type LinkMeta } from '../lib/linkMeta'
 import { LinkChip, LinkCard } from './LinkPreview'
 import { parseSourceLinkUrl, forgeChipLabel, type PullRequestLink } from '../utils/pullRequestLinks'
-import { sourceProviderMeta } from '../utils/sourceProviderMeta'
 import { JiraHostsCtx } from '../lib/jiraHosts'
 import { rearmConfigScanBudget } from '../utils/autolinkRules'
 import JiraLogo from './icons/JiraLogo'
-import GithubLogo from './icons/GithubLogo'
-import GitlabLogo from './icons/GitlabLogo'
+import SourceProviderMark from './SourceProviderMark'
 import DiffBlock from './DiffBlock'
 import ErrorNotice from './ErrorNotice'
 import {
@@ -63,6 +60,7 @@ import { useLanguageGeneration } from '../i18n/useLanguageGeneration'
 import { CodeBlock } from './CodeBlock'
 import { ExcalidrawBlock } from './ExcalidrawBlock'
 import WidgetFrame from './WidgetFrame'
+import MarkdownWidget from './MarkdownWidget'
 import WidgetPlaceholder from './WidgetPlaceholder'
 import { i18nT } from '../i18n/t'
 import { toDate } from '../i18n/format'
@@ -73,10 +71,13 @@ import {
   LinkOverrideCtx,
   LinkUnfurlCtx,
   MdSourceCtx,
+  MdBlockStartCtx,
+  ParagraphNoticeSlotCtx,
   PathActionCtx,
   PathProbeCtx,
   ReadOnlyCodeCtx,
   SessionActionCtx,
+  type InsideLink,
   type LinkUnfurl,
   type PathActions,
   type SessionActions,
@@ -85,7 +86,7 @@ import { artifactSlugFromHref, classifySessionLink, soleLinkInParagraph, useSess
 import { dashboardPreviewRef, dashboardPreviewTargetFromHref } from '../utils/dashboardPreview'
 import { ClosedSessionNotice } from './markdown/ClosedSessionNotice'
 import { activatePath, usePathResolution } from './markdown/pathReferences'
-import { ELEMENT_OVERRIDES, sp } from './markdown/elements'
+import { ELEMENT_OVERRIDES, sp, textOf } from './markdown/elements'
 import { InlineCode } from './markdown/InlineCode'
 import { MarkdownTable } from './markdown/MarkdownTable'
 import { ImgWithFallback } from './markdown/ImgWithFallback'
@@ -93,7 +94,7 @@ import { DeferredMedia, MdSourceEl } from './markdown/remoteMedia'
 import { MermaidBlock } from './markdown/MermaidBlock'
 import { isGenericLang, looksLikeMarkdown } from './markdown/markdownSniff'
 import { ALLOWED_TAGS, VERBATIM_CONTENT_TAGS, rehypeSanitize, remarkVerbatimUnknownTags } from './markdown/sanitize'
-import { rehypeMarkFencedCode, rehypeSourcepos, rehypeStableRootKeys, rehypeUnwrapBlocks, remarkSoftBreaks } from './markdown/treeTransforms'
+import { holdsSessionRef, rehypeMarkFencedCode, rehypeSessionRefPunctuation, rehypeSourcepos, rehypeStableRootKeys, rehypeUnwrapBlocks, remarkSoftBreaks, SESSION_REF_TRAILING } from './markdown/treeTransforms'
 import { GLOW_TAIL_CHARS, REVEAL_IDLE_SETTLE_MS, rehypeStreamingCaret, rehypeStreamingGlow, rehypeStreamingReveal } from './markdown/streamingEffects'
 import { closeCjkAutolinkBoundaries, encodeRefusedLinkDestinations } from './markdown/linkBoundaryRepair'
 import { guideUntrusted } from '../guide/guideMarkers'
@@ -109,12 +110,21 @@ export { rehypeSanitize, remarkVerbatimUnknownTags } from './markdown/sanitize'
 export { rehypeStableRootKeys } from './markdown/treeTransforms'
 export { dispatchLightbox, Lightbox } from './markdown/Lightbox'
 
+/** A leading URL scheme (`https:`, `mailto:`, `vscode:`), RFC 3986 spelling. */
+const URL_SCHEME_RE = /^[a-z][a-z\d+.-]*:/i
+
 /** Default markdown anchor, unless a `LinkOverrideCtx` provider claims the href.
  *
  * Extracted from the inline `MD_COMPONENTS.a` so it can read context (it is a
  * component, so hooks are legal here). Only ALLOWED_PROTOCOLS links (editor
  * schemes) keep in-place navigation; everything else opens in a new tab. */
-function MdAnchor({ node, href, children }: React.AnchorHTMLAttributes<HTMLAnchorElement> & ExtraProps) {
+type MdAnchorProps = React.AnchorHTMLAttributes<HTMLAnchorElement> & ExtraProps & {
+  /** Sentence punctuation that followed a session link, moved here by
+   *  `rehypeSessionRefPunctuation` so it renders before the inline notice. */
+  [SESSION_REF_TRAILING]?: string
+}
+
+function MdAnchor({ node, href, children, [SESSION_REF_TRAILING]: trailing }: MdAnchorProps) {
   const override = useContext(LinkOverrideCtx)
   const probeEnabled = useContext(PathProbeCtx)
   const actions = useContext(PathActionCtx)
@@ -157,6 +167,10 @@ function MdAnchor({ node, href, children }: React.AnchorHTMLAttributes<HTMLAncho
       if (!decodedHref.startsWith('//')) localHref = decodedHref
     } catch { /* keep it a normal link */ }
   }
+  // Where the link goes, for the code spans in its label (`InsideLinkCtx`): a
+  // scheme or a protocol-relative `//host` leaves the dashboard; anything else
+  // is a local address.
+  const linkKind: InsideLink = href && (URL_SCHEME_RE.test(href) || href.startsWith('//')) ? 'external' : 'local'
   // Decoded but NOT narrowed to root-relative: the app mints its own share links
   // absolute, and the recognizer's origin check is what refuses a foreign one.
   let sessionCandidate: string | null = null
@@ -193,7 +207,9 @@ function MdAnchor({ node, href, children }: React.AnchorHTMLAttributes<HTMLAncho
   // A closed session the page can resume counts too (`useSessionChip`): its
   // background probe can turn a `?sid=` the open roster does not hold into a live,
   // resumable chip, so this — not the roster alone — is the switchable case.
-  const sessionLink = useSessionChip(sessionHrefSid, sessionActions)
+  // The label is what the reader sees standing for the session, so a notice
+  // about it says "the old run" rather than a key the prose never showed.
+  const sessionLink = useSessionChip(sessionHrefSid, sessionActions, sessionHrefSid ? textOf(children) : undefined)
   // ONE classification drives the hover text, so the anchor never resolves the
   // key a second time of its own — a second copy drifts, and that drift is the
   // false "not open" tooltip (#18036). `classifySessionLink` reports `not-open`
@@ -285,11 +301,15 @@ function MdAnchor({ node, href, children }: React.AnchorHTMLAttributes<HTMLAncho
   // re-enter the normal inline-code ladder (click-to-copy, and for session-key
   // or confirmed-path shaped spans, their usual chips), pinned by the
   // rejected-destinations tests.
-  if (!href) return <span {...sp(node)}>{children}</span>
-  if (claimed) return <>{claimed}</>
+  // Punctuation `rehypeSessionRefPunctuation` lifted off the text after a
+  // session link is the sentence's own; whatever this anchor renders as, it
+  // goes back right after it, so no branch can swallow a full stop.
+  const keep = (el: React.ReactElement) => (trailing ? <>{el}{trailing}</> : el)
+  if (!href) return keep(<span {...sp(node)}>{children}</span>)
+  if (claimed) return keep(<>{claimed}</>)
   if (source?.provider === 'jira') {
     const jira = source
-    return (
+    return keep(
       <span className="group inline-flex max-w-full items-center gap-1 rounded-md border border-border/60 bg-accent/10 px-1.5 py-px align-baseline text-[13px] mc-md-ref-chip transition-colors hover:border-border hover:bg-accent/20 focus-within:border-border">
         <a
           href={jira.url}
@@ -301,14 +321,12 @@ function MdAnchor({ node, href, children }: React.AnchorHTMLAttributes<HTMLAncho
           <JiraLogo size={12} className="shrink-0" />
           <span className="truncate max-w-[24ch]">{`${jira.repo}-${jira.number}`}</span>
         </a>
-      </span>
+      </span>,
     )
   }
   const forgeLabel = source ? forgeChipLabel(source) : null
   if (source && forgeLabel) {
-    const forgeMeta = sourceProviderMeta(source.provider)
-    const ForgeIcon = forgeMeta.icon
-    return (
+    return keep(
       <span className="group inline-flex max-w-full items-center gap-1 rounded-md border border-border/60 bg-accent/10 px-1.5 py-px align-baseline text-[13px] mc-md-ref-chip transition-colors hover:border-border hover:bg-accent/20 focus-within:border-border">
         <a
           href={href}
@@ -317,26 +335,19 @@ function MdAnchor({ node, href, children }: React.AnchorHTMLAttributes<HTMLAncho
           title={href}
           className="inline-flex min-w-0 items-center gap-1.5 text-text no-underline focus-ring"
         >
-          {forgeMeta.logo === 'github'
-            ? <GithubLogo size={12} className="shrink-0" />
-            : forgeMeta.logo === 'gitlab'
-              ? <GitlabLogo size={12} className="shrink-0" />
-              : ForgeIcon
-                // A registered provider's own mark, when its descriptor ships one.
-                ? <ForgeIcon size={12} className="shrink-0" />
-                // A registered provider with no bundled logo uses the neutral
-                // glyph rather than borrowing GitLab's mark.
-                : <GitPullRequest className="lucide-inline shrink-0" />}
+          {/* The provider's logo, a registered provider's own mark, or the one
+              neutral glyph every source-link surface shares. */}
+          <SourceProviderMark provider={source.provider} size={12} />
           <span className="truncate max-w-[32ch]">{forgeLabel}</span>
         </a>
-      </span>
+      </span>,
     )
   }
   if (target && meta) {
-    return (
+    return keep(
       <LinkChip meta={meta} href={target}>
-        <InsideLinkCtx.Provider value={true}>{children}</InsideLinkCtx.Provider>
-      </LinkChip>
+        <InsideLinkCtx.Provider value={linkKind}>{children}</InsideLinkCtx.Provider>
+      </LinkChip>,
     )
   }
   let ext = false
@@ -375,7 +386,7 @@ function MdAnchor({ node, href, children }: React.AnchorHTMLAttributes<HTMLAncho
         ? 'text-muted'
         : 'text-accent underline underline-offset-2 decoration-accent/40 hover:decoration-accent'}
     >
-      <InsideLinkCtx.Provider value={true}>{children}</InsideLinkCtx.Provider>
+      <InsideLinkCtx.Provider value={linkKind}>{children}</InsideLinkCtx.Provider>
       {/* The not-open explanation reaches touch / keyboard / AT users as a
           visually-hidden description APPENDED to the anchor's accessible name —
           a native `title` renders only on mouse hover, so without this the muted
@@ -390,7 +401,11 @@ function MdAnchor({ node, href, children }: React.AnchorHTMLAttributes<HTMLAncho
         <span className="sr-only">{` (${i18nT('components.markdownRenderer.session_closed_link_disabled')})`}</span>
       )}
     </a>
-    <ClosedSessionNotice failure={sessionLink?.failure} name={sessionLink?.key ?? ''} />
+    {/* The sentence's own punctuation, before the notice: "See the old run."
+        keeps its full stop beside the link, and the notice follows the
+        sentence instead of splitting it. */}
+    {trailing}
+    <ClosedSessionNotice failure={sessionLink?.failure} name={sessionLink?.title ?? ''} />
     {reveal.error && (
       <ErrorNotice variant="inline" className="ml-1.5 align-baseline" message={reveal.error} askAgent onDismiss={reveal.clear} testId="md-link-reveal-error" />
     )}
@@ -453,7 +468,26 @@ function MdParagraph({ node, children }: React.HTMLAttributes<HTMLParagraphEleme
     )
   }
   if (unfurl && meta) return <LinkCard meta={meta} href={unfurl} />
+  // A paragraph holding a session reference draws a slot right after itself,
+  // where that reference's closed-session notice renders (`ClosedSessionNotice`
+  // portals into it). Below the paragraph, the notice leaves the sentence whole
+  // whether the reference ends it or sits mid-sentence. Only such a paragraph
+  // gets the slot, so every other paragraph keeps its exact DOM.
+  if (holdsSessionRef(node)) return <ParagraphWithNoticeSlot node={node}>{children}</ParagraphWithNoticeSlot>
   return <p {...sp(node)} className="my-1 leading-6">{children}</p>
+}
+
+function ParagraphWithNoticeSlot({ node, children }: { node?: HastElement; children?: React.ReactNode }) {
+  // State, not a ref: the slot element must exist before a notice can portal
+  // into it, and the provider's value has to change once it does.
+  const [slot, setSlot] = useState<HTMLElement | null>(null)
+  return (
+    <ParagraphNoticeSlotCtx.Provider value={slot}>
+      <p {...sp(node)} className="my-1 leading-6">{children}</p>
+      {/* A `div` so the notices stack as blocks; empty, it takes no height. */}
+      <div ref={setSlot} data-paragraph-notices="" />
+    </ParagraphNoticeSlotCtx.Provider>
+  )
 }
 
 /**
@@ -495,7 +529,8 @@ const MD_COMPONENTS = {
     // rule as FENCE_OPEN (useBlockAssembler) / fixCodeFences.
     const match = /language-(\S+)/.exec(className || '')
     const lang = match?.[1]
-    const codeStr = String(children).replace(/\n$/, '')
+    // An empty fence has no children; String(undefined) would show "undefined".
+    const codeStr = String(children ?? '').replace(/\n$/, '')
 
     // `rehypeRedactionMarkers` stamps the ordinal of this block's first
     // credential tag when it holds any this reply has a record for. It is
@@ -505,6 +540,12 @@ const MD_COMPONENTS = {
     if (lang === 'mermaid') return <MermaidBlock code={codeStr} />
     if (lang === 'excalidraw') return <ExcalidrawBlock code={codeStr} />
 
+    // No `sourceStartLine` here: top-level fences never reach react-markdown
+    // (the block assembler extracts them first — see `renderBlock`'s 'code'
+    // case, which is the commentable path). A fence that DOES land here is
+    // nested (blockquote / list), where block-relative sourcepos does not map
+    // to a document line without the block-offset dance — so nested fences
+    // stay non-commentable rather than growing a gutter that can't anchor.
     return <CodeBlock code={codeStr} lang={lang} complete={true} />
   },
   pre({ children }) { return <>{children}</> },
@@ -538,7 +579,15 @@ const MD_COMPONENTS = {
   // keys are added through the assertion below rather than inline — react-markdown
   // resolves the component by tag name at runtime regardless of the static type.
   'blocked-link'({ node }: { node?: HastElement }) {
-    return <BlockedLinkChip domain={String(node?.properties?.domain ?? '')} placeholder={String(node?.properties?.placeholder ?? '')} />
+    const p = node?.properties
+    return (
+      <BlockedLinkChip
+        domain={String(p?.domain ?? '')}
+        placeholder={String(p?.placeholder ?? '')}
+        block={String(p?.block ?? '')}
+        tail={String(p?.tail ?? '')}
+      />
+    )
   },
   'cred-tag'({ node }: { node?: HastElement }) {
     return <CredentialTag ordinal={Number(node?.properties?.ordinal)} placeholder={String(node?.properties?.placeholder ?? '')} />
@@ -591,12 +640,14 @@ const REMARK_PLUGINS: PluggableList = [
 // `rehypeBoundRawDepth` sits ahead of `rehypeRaw`: raw HTML that would nest
 // past the depth bound is downgraded to text before rehype-raw's recursive
 // hast conversion can overflow on it.
-const REHYPE_PLUGINS: PluggableList = [rehypeBoundRawDepth, [rehypeRaw, { passThrough: ['math', 'inlineMath'] }], rehypeMarkFencedCode, rehypeUnwrapBlocks, rehypeSanitize, rehypeKatex]
+// `rehypeSessionRefPunctuation` runs after the sanitizer so the marker it
+// stamps is the only one a session reference can carry into `MdAnchor` / `InlineCode`.
+const REHYPE_PLUGINS: PluggableList = [rehypeBoundRawDepth, [rehypeRaw, { passThrough: ['math', 'inlineMath'] }], rehypeMarkFencedCode, rehypeUnwrapBlocks, rehypeSanitize, rehypeSessionRefPunctuation, rehypeKatex]
 
 // User-message variant: base remark chain plus soft-break → hard-break.
 const REMARK_PLUGINS_WITH_BREAKS: PluggableList = [...REMARK_PLUGINS, remarkSoftBreaks]
 
-const REHYPE_PLUGINS_WITH_SOURCEPOS: PluggableList = [rehypeBoundRawDepth, [rehypeRaw, { passThrough: ['math', 'inlineMath'] }], rehypeMarkFencedCode, rehypeUnwrapBlocks, rehypeSanitize, rehypeKatex, rehypeSourcepos]
+const REHYPE_PLUGINS_WITH_SOURCEPOS: PluggableList = [rehypeBoundRawDepth, [rehypeRaw, { passThrough: ['math', 'inlineMath'] }], rehypeMarkFencedCode, rehypeUnwrapBlocks, rehypeSanitize, rehypeSessionRefPunctuation, rehypeKatex, rehypeSourcepos]
 // NOTE: remark plugin config is shared via REMARK_PLUGINS above (singleDollarTextMath:
 // false). The sourcepos variant only differs in the rehype chain.
 
@@ -642,9 +693,11 @@ export function fixCodeFences(s: string): string {
     return num + '\\.' + trail
   })
   // Ensure blank line before opening fences that are glued to preceding text.
-  // The info string is the whole backtick-free line, including attributes and
-  // a leading space, matching FENCE_OPEN in useBlockAssembler.
-  s = s.replace(/([^\n])(\n?)(```[^`\n]*\n)/g, (_, pre, nl, fence) =>
+  // The info string may be a tag (FENCE_OPEN's tag rule in useBlockAssembler,
+  // after optional whitespace) plus an optional `{...}` attribute block, and
+  // nothing more: a ``` run followed by more words is a mid-sentence mention,
+  // and moving it onto its own line would open a fence over the prose after it.
+  s = s.replace(/([^\n])(\n?)(```(?:[ \t]*[^`\s]+)?(?:[ \t]+\{[^`\n]*\})?[ \t\r]*\n)/g, (_, pre, nl, fence) =>
     nl ? pre + nl + fence : pre + '\n\n' + fence
   )
   // Split closing fences glued to trailing text: ```358KB → ```\n358KB
@@ -656,6 +709,14 @@ export function fixCodeFences(s: string): string {
   // Split opening fences glued to uppercase text
   s = s.replace(/```([A-Z])/g, '```\n$1')
   return s
+}
+
+/** An HTML element tag: `<div`, `<svg`, `</p>`, `<br/>`. Comments and `<` in text do not match. */
+const HTML_ELEMENT_RE = /<\/?[a-zA-Z][\w-]*(?:\s[^<>]*)?\/?>/
+
+/** Whether a widget body is markdown rather than HTML: it has text and no element tag. */
+function isMarkdownWidgetBody(body: string): boolean {
+  return body.trim().length > 0 && !HTML_ELEMENT_RE.test(body)
 }
 
 const MCWIDGET_STRIP_RE = /<mcwidget[\s\S]*?<\/mcwidget>|<mcwidget[\s\S]*$/g
@@ -841,7 +902,9 @@ const MarkdownBlock = memo(function MarkdownBlock({ content, sourcePos, startLin
       </ReactMarkdown>
     </MdSourceCtx.Provider>
   )
-  const body = sourcePos ? <div data-block-start={startLine ?? 1}>{md}</div> : md
+  const body = sourcePos
+    ? <div data-block-start={startLine ?? 1}><MdBlockStartCtx.Provider value={startLine ?? 1}>{md}</MdBlockStartCtx.Provider></div>
+    : md
   // The provider carries no DOM node, so sourcepos / lightbox scoping upstream
   // is unaffected. It is the only way MdAnchor / MdParagraph — which react-markdown
   // instantiates deep inside its own tree — can see the gate.
@@ -980,9 +1043,13 @@ function BlockRenderer({ block, prevBlock, onFileOpen, sourcePos, messageTs, slo
       const foldKey = slotKey != null && messageTs != null && block.startLine != null
         ? `${slotKey}:${messageTs}:${block.startLine}`
         : undefined
-      const node = collapseDiffs
-        ? <FoldableDiffBlock code={block.content} complete={block.complete} onFileOpen={onFileOpen} pathHint={pathHint} foldKey={foldKey} />
-        : <DiffBlock code={block.content} complete={block.complete} onFileOpen={onFileOpen} pathHint={pathHint} />
+      // A finalized fence that never closed may have swallowed the rest of the
+      // reply, so the chat must not leave it folded: the same chip stays
+      // mounted, opens itself and says why it looks wrong.
+      const node = !collapseDiffs
+        ? <DiffBlock code={block.content} complete={block.complete} onFileOpen={onFileOpen} pathHint={pathHint} />
+        : <FoldableDiffBlock code={block.content} complete={block.complete} onFileOpen={onFileOpen} pathHint={pathHint} foldKey={foldKey}
+            warning={block.unclosed ? i18nT('components.markdownRenderer.unclosed_diff_warning') : undefined} />
       // Smooth mode: wrap so the block height eases as lines arrive. The wrapper
       // is mounted for the whole message lifecycle (smooth is constant) so the
       // child never remounts when streaming flips to complete.
@@ -1016,17 +1083,29 @@ function BlockRenderer({ block, prevBlock, onFileOpen, sourcePos, messageTs, slo
       // Raw scratch editor edits a local copy that is never written back, so a
       // pencil there lets someone edit the block and then Approve the ORIGINAL
       // command while looking at their edit. Plain CodeBlock keeps copy only.
+      // `sourceStartLine` (the block's first content line in the raw source)
+      // is the handle line-anchored code commenting keys on — see
+      // codeComments.ts. Only meaningful where source positions are on
+      // (artifact pages); chat renders without them and stays inert.
       const node = readOnlyCode || readOnlyCodeCtx
         ? <CodeBlock code={block.content} lang={block.language} complete={block.complete} />
-        : <EditableCodeBlock code={block.content} lang={block.language} complete={block.complete} />
+        : <EditableCodeBlock code={block.content} lang={block.language} complete={block.complete} sourceStartLine={sourcePos ? block.startLine : undefined} />
       // Height-grow only — streaming code renders as one plain <pre> text node
       // so per-line content animation isn't applied here.
       return smooth ? <SmoothResize enabled={!block.complete}>{node}</SmoothResize> : node
     }
     case 'widget':
-      return block.complete
-        ? <WidgetFrame html={block.content} title={block.language} slug={block.slug} messageTs={messageTs} slotKey={slotKey} />
-        : <WidgetPlaceholder title={block.language} />
+      if (!block.complete) return <WidgetPlaceholder title={block.language} />
+      // A widget whose body holds no HTML element is markdown an agent wrapped in
+      // the widget tag (a "Task board" table, say). Drawn in the frame it reads as
+      // raw `**` and `|` text, so it is rendered as the markdown it is, under its title.
+      // The title row keeps the widget's artifact link and star (`MarkdownWidget`).
+      if (isMarkdownWidgetBody(block.content)) {
+        return <MarkdownWidget body={block.content} title={block.language} slug={block.slug} messageTs={messageTs} slotKey={slotKey}>
+          <MarkdownBlock content={block.content.trim()} sourcePos={false} startLine={block.startLine} glow={false} smooth={false} softBreaks={softBreaks} live={false} unfurl={unfurl} markers={markers} />
+        </MarkdownWidget>
+      }
+      return <WidgetFrame html={block.content} title={block.language} slug={block.slug} messageTs={messageTs} slotKey={slotKey} />
     case 'markdown':
       // `live` = this block is the streaming tail (see MarkdownRenderer). ORed
       // with the block's own `complete` flag so a provisional block is treated
@@ -1037,7 +1116,6 @@ function BlockRenderer({ block, prevBlock, onFileOpen, sourcePos, messageTs, slo
 
 export default memo(function MarkdownRenderer({ content, streaming = false, onFileOpen, onFolderOpen, onArtifactOpen, onSessionOpen, sessions, activeSession, rawMode = false, sourcePos = false, messageTs, slotKey, glow = false, smooth, softBreaks = false, compactImages = false, linkPreviews = false, collapseDiffs = false, mdCardToggle = false, readOnlyCode = false, blockedLinks, redactions, redactionCoach = false }: { content: string; streaming?: boolean; onFileOpen?: (path: string, opts?: { line?: number; endLine?: number }) => void; onFolderOpen?: (path: string) => void; onArtifactOpen?: (slug: string) => void; onSessionOpen?: (key: string) => void; sessions?: ReadonlyMap<string, string>; activeSession?: string; rawMode?: boolean; sourcePos?: boolean; messageTs?: string; slotKey?: string; glow?: boolean; smooth?: boolean; softBreaks?: boolean; compactImages?: boolean; linkPreviews?: boolean; /** Chat transcript only: render a ```diff fence collapsed to a chip. Off everywhere else, where the patch IS the content rather than a retelling of it. */ collapseDiffs?: boolean; /** Chat transcript only: give a ```markdown content card a Formatted | Raw view toggle. Off everywhere else, where the fence IS the source being shown. */ mdCardToggle?: boolean; /** Render fenced code with the plain CodeBlock (copy only) instead of EditableCodeBlock. For content the reader must not be able to alter in place -- an approval's command beside its Approve control. */ readOnlyCode?: boolean; /** Raw `meta.blocked_links` off the assistant message — the step-3 suspicious-URL records this message's redaction placeholders render from. Validated here; absent/malformed leaves every placeholder as plain text. */ blockedLinks?: unknown; /** Raw `meta.redactions` off the assistant message: one record per credential placeholder, validated here. */ redactions?: unknown; /** This reply is the session's first with removed values: show the one-time coach after its first such block. */ redactionCoach?: boolean }) {
   useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
-  const blocks = useBlockAssembler(content, streaming)
   // One message = one config-rule scan pool. The blocks below each mount their
   // OWN remark tree, so the rearm cannot live at the plugin's tree entry — a
   // fence-heavy message would restore the pool once per block and multiply the
@@ -1127,6 +1205,11 @@ export default memo(function MarkdownRenderer({ content, streaming = false, onFi
     [ownBlocked, heldDomains, holds],
   )
   const credentialRecords = useMemo(() => normalizeCredentialRecords(redactions), [redactions])
+  // A redaction card's id names the rendered block holding its chip, and an
+  // allowed host's card reopens by that id after the reply reloads, unsplit.
+  // So a reply carrying any redaction record is never split into paragraph
+  // pieces: its block numbering must match the reloaded render.
+  const blocks = useBlockAssembler(content, streaming, blockedRecords.length === 0 && credentialRecords.length === 0)
   const blockedDomains = useMemo(() => new Set(blockedRecords.map(r => r.domain)), [blockedRecords])
   const credentialMap = useMemo(() => new Map(credentialRecords.map(r => [r.ordinal, r])), [credentialRecords])
   const credentialOrdinals = useMemo(() => new Set(credentialMap.keys()), [credentialMap])
@@ -1169,13 +1252,41 @@ export default memo(function MarkdownRenderer({ content, streaming = false, onFi
     for (let i = blocks.length - 1; i >= 0; i--) if (blocks[i].type === 'markdown') return i
     return -1
   }, [blocks])
+  // The block each renderer reads as its predecessor. A diff takes its path
+  // hint from the last lines of the markdown before it, so when that markdown
+  // was split into paragraph pieces, the predecessor is the whole source
+  // block rebuilt from its pieces, blank lines included, not the last piece.
+  // Only a diff reads its predecessor, so only a diff gets the rebuild; doing
+  // it for every piece would cost O(pieces^2) on each streamed frame.
+  const prevBlocks = useMemo(() => blocks.map((b, i) => {
+    const prev = blocks[i - 1]
+    if (b.type !== 'diff' || !prev?.split) return prev
+    let first = i - 1
+    while (first > 0 && blocks[first - 1].split?.from === prev.split.from) first--
+    let text = blocks[first].content
+    for (let k = first + 1; k < i; k++) {
+      const gap = blocks[k].startLine! - blocks[k - 1].startLine! - blocks[k - 1].content.split('\n').length
+      text += '\n'.repeat(gap + 1) + blocks[k].content
+    }
+    return { ...prev, content: text }
+  }), [blocks])
+  // First block of the live tail. The assembler splits the open markdown block
+  // into paragraph pieces while streaming; all of them stay `live` (no link
+  // unfurl mid-stream, as for the unsplit block), and only the last one glows.
+  const liveFromIdx = useMemo(() => {
+    if (lastMarkdownIdx < 0) return -1
+    const from = blocks[lastMarkdownIdx].split?.from
+    let i = lastMarkdownIdx
+    if (from != null) while (i > 0 && blocks[i - 1].split?.from === from) i--
+    return i
+  }, [blocks, lastMarkdownIdx])
   // Each block renders its own sub-document, so the credential ordinal its
   // first tag carries is the count of tags in every block before it.
   const blockMarkers = useMemo<Array<RedactionMarkers | undefined>>(() => {
     if (credentialOrdinals.size === 0 && blockedDomains.size === 0) return blocks.map(() => undefined)
     let base = 0
-    return blocks.map(b => {
-      const m: RedactionMarkers = { ordinals: credentialOrdinals, domains: blockedDomains, held: heldDomains, credentials: credentialMap, base }
+    return blocks.map((b, block) => {
+      const m: RedactionMarkers = { ordinals: credentialOrdinals, domains: blockedDomains, held: heldDomains, credentials: credentialMap, base, block }
       base += countCredentialTags(b.content)
       return m
     })
@@ -1275,8 +1386,11 @@ export default memo(function MarkdownRenderer({ content, streaming = false, onFi
           // startLine (e.g. extracted widgets). The "idx-" prefix avoids
           // collision with real startLine numbers.
           <BlockRenderer
-            key={block.startLine != null ? `line-${block.startLine}` : `idx-${i}`}
-            block={block} prevBlock={blocks[i - 1]} onFileOpen={onFileOpen} sourcePos={sourcePos}
+            // A paragraph piece keys on its source block and index, so it
+            // survives lines above it being reclassified and the end of the
+            // stream; piece 0 shares the unsplit block's key.
+            key={block.split ? (block.split.part ? `line-${block.split.from}.${block.split.part}` : `line-${block.split.from}`) : block.startLine != null ? `line-${block.startLine}` : `idx-${i}`}
+            block={block} prevBlock={prevBlocks[i]} onFileOpen={onFileOpen} sourcePos={sourcePos}
             messageTs={messageTs}
             slotKey={slotKey}
             glow={glow && i === lastMarkdownIdx}
@@ -1285,7 +1399,7 @@ export default memo(function MarkdownRenderer({ content, streaming = false, onFi
             // and the shimmer can never disagree about which block is still
             // being typed. `streaming` rather than `glow` because a caller may
             // render a streaming transcript without asking for the shimmer.
-            live={streaming && i === lastMarkdownIdx}
+            live={streaming && liveFromIdx >= 0 && i >= liveFromIdx && block.type === 'markdown'}
             unfurl={linkPreviews}
             smooth={smooth}
             softBreaks={softBreaks}

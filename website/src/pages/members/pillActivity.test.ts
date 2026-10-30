@@ -13,7 +13,7 @@ const labelOf = (d: ToolStatusDetail): string => {
 const base: PillActivityInput = {
   streamState: 'idle',
   detail: undefined,
-  toolReturned: false,
+  quietEnd: false,
   running: false,
   delegatedOnly: false,
   labelOf,
@@ -72,8 +72,8 @@ describe('resolvePillActivity', () => {
       .toEqual({ kind: 'thinking', text: 'Thinking…' })
   })
 
-  it('a returned tool call reads as thinking — the model is reading the result', () => {
-    expect(resolvePillActivity({ ...base, streamState: 'tool_running', detail: tool('old purpose'), toolReturned: true, running: true }))
+  it('the quiet nothing_to_do end reads as thinking — it never names itself', () => {
+    expect(resolvePillActivity({ ...base, streamState: 'tool_running', detail: tool('old purpose'), quietEnd: true, running: true }))
       .toEqual({ kind: 'thinking', text: 'Thinking…' })
   })
 
@@ -91,6 +91,12 @@ describe('resolvePillActivity', () => {
   it('compacting and stopping name themselves, whatever the status says', () => {
     expect(resolvePillActivity({ ...base, streamState: 'compacting', detail: tool('x'), running: true })).toEqual({ kind: 'compacting' })
     expect(resolvePillActivity({ ...base, streamState: 'stopping', detail: tool('x'), running: true })).toEqual({ kind: 'stopping' })
+  })
+
+  it("the slots frame's stopping flag reads as stopping too (a Stop from another tab never reaches the stream state)", () => {
+    expect(resolvePillActivity({ ...base, streamState: 'tool_running', detail: tool('x'), running: true, stopping: true })).toEqual({ kind: 'stopping' })
+    // Compacting still outranks it, as it outranks the stream state's own stopping.
+    expect(resolvePillActivity({ ...base, streamState: 'compacting', detail: tool('x'), running: true, stopping: true })).toEqual({ kind: 'compacting' })
   })
 
   it('busy with no status yet is working, or delegated when only sub-agents run', () => {

@@ -65,6 +65,19 @@ SYSTEM_CHANNELS: dict[str, str] = {
     # A dashboard terminal shell that exited with a non-zero code; its tab
     # closed with it, so the note is where the code is left to read.
     "system.terminal": _DEFAULT_PRIORITY,
+    # A crewmate's message in its DM thread (dashboard/member_message_notes.py).
+    # Its own channel so the user can mute crewmate chatter without muting
+    # system.agent; the note keeps kind "agent", as system.monitor's do.
+    # Passive: the note lands in the bell without a banner, sound or OS toast
+    # until the user raises the channel in Settings -> Notifications.
+    "system.member": "passive",
+    # An installed app has a newer version published. Its own channel for the
+    # same reason system.monitor has one: this is the one system note a user
+    # may reasonably never want, and without a channel of its own it would
+    # fall back to system.agent, where muting it also mutes the notes agents
+    # write for a human decision. Default priority -- nothing is blocked, the
+    # app keeps working on the version it has.
+    "system.apps": _DEFAULT_PRIORITY,
 }
 
 # The channel the gateway's monitor-loop stop/finish notices use. Their legacy
@@ -112,6 +125,9 @@ _RESERVED_NOTE_KEYS = frozenset(
         # app push forwards from its request body) must not be able to forge
         # a crewmate's face onto a note.
         "member",
+        # Which session published the note; set only by gateway handlers from an
+        # attested key, and read by the delivery sink for that session's mute.
+        "publisher_session",
         # Sink/frontend-owned status fields: a caller must not be able to
         # pre-suppress or pre-acknowledge a note it is pushing.
         "silenced",
@@ -172,6 +188,10 @@ class NotificationPayload:
     # the gateway from the caller's verified session key; never caller-supplied.
     member: dict[str, str] | None = None
     meta: dict[str, Any] = field(default_factory=dict)
+    # Session key of the session that published the note, from the caller's
+    # attested key; never caller-supplied. The delivery sink reads it to apply
+    # that session's mute and drops it, so it is not stored or broadcast.
+    publisher_session: str | None = None
 
     def validate(self) -> None:
         """Raise :class:`NotificationValidationError` on any schema violation."""
@@ -285,6 +305,10 @@ class NotificationPayload:
             raise NotificationValidationError(
                 "member must be {slug, name} with non-empty string values"
             )
+        if self.publisher_session is not None and (
+            not isinstance(self.publisher_session, str) or not self.publisher_session
+        ):
+            raise NotificationValidationError("publisher_session must be a non-empty string")
 
 
 def _channel_for_kind(kind: str) -> str:
@@ -307,6 +331,7 @@ def payload_from_legacy(
     actions: list[dict[str, Any]] | None = None,
     channel: str | None = None,
     member: dict[str, str] | None = None,
+    publisher_session: str | None = None,
 ) -> NotificationPayload:
     """Build a v2 payload from the legacy ``notify(kind, ...)`` call shape.
 
@@ -360,6 +385,7 @@ def payload_from_legacy(
         url=url,
         actions=actions,
         member=member,
+        publisher_session=publisher_session,
         meta=dict(meta) if meta else {},
     )
 
@@ -458,6 +484,7 @@ class NotificationBus:
             ("icon", payload.icon),
             ("ttl", payload.ttl),
             ("member", payload.member),
+            ("publisher_session", payload.publisher_session),
         ):
             if value is not None:
                 note[key] = value

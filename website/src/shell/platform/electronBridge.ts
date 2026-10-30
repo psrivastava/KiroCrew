@@ -20,10 +20,12 @@ export function setNativeBadgeCount(count: number): void {
   api?.setBadgeCount?.(count)
 }
 
-/** The View > DevTools menu follows developer mode. */
-export function setNativeDevMode(on: boolean): void {
+/** Show the View > Toggle Developer Tools menu item. A desktop shell older
+ *  than this dashboard builds that item hidden and reveals it only on this
+ *  call, so the shell sends it once at startup. */
+export function showNativeDevTools(): void {
   const electronAPI = window.electronAPI
-  electronAPI?.setDevMode?.(on)
+  electronAPI?.setDevMode?.(true)
 }
 
 /**
@@ -51,6 +53,20 @@ export function subscribeNativeFocusModeToggle(onToggle: () => void): (() => voi
 }
 
 /**
+ * One route-history step the main process relays from a macOS swipe (mouse
+ * software such as Logitech's Options sends Back/Forward as swipes).
+ * Accepts only -1 (Back) and 1 (Forward). Returns the unsubscribe, or nothing
+ * outside the desktop app.
+ */
+export function subscribeNativeHistoryStep(onStep: (delta: -1 | 1) => void): (() => void) | undefined {
+  const electronAPI = window.electronAPI
+  if (!electronAPI?.onHistoryStep) return
+  return electronAPI.onHistoryStep(delta => {
+    if (delta === -1 || delta === 1) onStep(delta)
+  })
+}
+
+/**
  * macOS fullscreen hides the native traffic lights, so the header's 84px
  * clearance inset drops while fullscreen (mac-fullscreen class on the root).
  * Native traffic lights sit over the consolidated 42px header, so there is no
@@ -59,11 +75,18 @@ export function subscribeNativeFocusModeToggle(onToggle: () => void): (() => voi
  */
 export function useMacFullscreen() {
   const [macFullscreen, setMacFullscreen] = useState(false)
+  // On a notched built-in display macOS places the fullscreen window below the
+  // menu bar, so the menu bar never covers the header and no band is kept.
+  // The shell says so per event; a shell that does not keeps the band.
+  const [menuBarOverlap, setMenuBarOverlap] = useState(true)
   const [zoomFactor, setZoomFactor] = useState(1)
   useEffect(() => {
     if (!isMacElectron) return
-    const api = (window as { electronAPI?: { onFullScreenChanged?: (cb: (fs: boolean) => void) => () => void } }).electronAPI
-    return api?.onFullScreenChanged?.(setMacFullscreen)
+    const api = (window as { electronAPI?: { onFullScreenChanged?: (cb: (fs: boolean, menuBarOverlap?: boolean) => void) => () => void } }).electronAPI
+    return api?.onFullScreenChanged?.((fs, overlap) => {
+      setMacFullscreen(fs)
+      setMenuBarOverlap(overlap !== false)
+    })
   }, [])
   // The strip AppKit keeps at the top of a fullscreen window is measured in
   // screen points, while the reserve is laid out in CSS px, which native zoom
@@ -81,6 +104,8 @@ export function useMacFullscreen() {
   }, [macFullscreen])
   const macInset = isMacElectron && !macFullscreen
   // CSS px kept clear above the header, so the header sits below that strip.
-  const topReservePx = macFullscreen ? Math.round(MAC_FULLSCREEN_TOP_RESERVE_PX / zoomFactor) : 0
+  const topReservePx = macFullscreen && menuBarOverlap
+    ? Math.round(MAC_FULLSCREEN_TOP_RESERVE_PX / zoomFactor)
+    : 0
   return { macFullscreen, macInset, topReservePx }
 }

@@ -22,6 +22,8 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Optional
 
+from kiro_crew.strict_json import json_portable
+
 from . import WorkflowEvent
 
 # Run lifecycle states (also the values surfaced to the UI / MCP status tool).
@@ -291,6 +293,9 @@ class RunHandle:
     def from_store_json(cls, obj: dict) -> "RunHandle":
         from kiro_crew.execution_context import execution_from_record
 
+        # A run stored before records were kept strict JSON can hold Infinity/NaN,
+        # which Python reads back but the dashboard cannot parse.
+        obj = json_portable(obj)
         status = obj.get("status", STATUS_FINISHED)
         error = obj.get("error")
         derived_from = obj.get("derived_from") or {}
@@ -356,6 +361,10 @@ class RunRegistry:
         # Persist live runs at most every N events (terminal state always flushes),
         # so a long fan-out run doesn't write its file on every single event.
         self._save_every = 5
+        # Runs a load found still ``running`` and failed: the restart ended them
+        # before any terminal transition could notify their chats. Drained once by
+        # :meth:`notify_runs_ended_by_restart`.
+        self._ended_by_restart: list[RunHandle] = []
 
     # --- wiring (set by the gateway at startup) ---
     def set_on_done(self, cb: Optional[OnDoneFn]) -> None:
@@ -496,7 +505,7 @@ class RunRegistry:
         h = self._runs.get(run_id)
         if h is None:
             return
-        h.agent_results[call_index] = result
+        h.agent_results[call_index] = json_portable(result)
         if fingerprint:
             h.agent_fingerprints[call_index] = fingerprint
         if error or not ok:
@@ -509,7 +518,7 @@ class RunRegistry:
         if h is None or h.status not in ACTIVE_STATUSES:
             return None  # idempotent: only the first terminal transition counts
         h.status = status
-        h.result = result
+        h.result = json_portable(result)
         h.error = error
         return h
 
@@ -519,6 +528,19 @@ class RunRegistry:
                 self._on_done(run_id, handle.snapshot(include_events=False))
             except Exception:  # noqa: BLE001
                 pass
+
+    def notify_runs_ended_by_restart(self) -> None:
+        """Send each run a load failed for the restart its completion notice, once.
+
+        The load runs before the host can deliver a notice, so the host calls this
+        after it publishes the service. The load writes the failed status back, so
+        a later load reads the run as terminal and never collects it again. A run
+        its host reopened since the load is active and is skipped.
+        """
+        handles, self._ended_by_restart = self._ended_by_restart, []
+        for handle in handles:
+            if handle.status not in ACTIVE_STATUSES:
+                self._notify_done(handle.run_id, handle)
 
     def mark_terminal(
         self, run_id: str, status: str, *, result: Any = None, error: Optional[str] = None
@@ -682,6 +704,7 @@ class RunRegistry:
             # survive the writeback.
             if obj.get("status") == STATUS_RUNNING:
                 self._persist(handle)
+                self._ended_by_restart.append(handle)
         self._evict()
         return loaded
 
@@ -717,6 +740,7 @@ class RunRegistry:
                 loaded += 1
                 if obj.get("status") == STATUS_RUNNING:
                     await self.persist_async(handle.run_id)
+                    self._ended_by_restart.append(handle)
             # Same oldest-terminal eviction as the sync API, but await deletion
             # through the per-run write queue instead of doing disk I/O on-loop.
             await self._evict_async()
@@ -839,7 +863,7 @@ async def start_background_run(
             # while the run was executing, and a terminal path that hands back a
             # partial (or empty) map must not erase them.
             if agent_results:
-                handle.agent_results.update(agent_results)
+                handle.agent_results.update(json_portable(agent_results))
         except asyncio.CancelledError:
             await registry.mark_terminal_async(run_id, STATUS_CANCELLED, error="cancelled")
             raise

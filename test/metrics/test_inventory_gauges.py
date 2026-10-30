@@ -523,6 +523,295 @@ def test_mcp_first_party_set_is_the_installer_constant_not_a_local_copy():
 
 
 # ---------------------------------------------------------------------------
+# raw readers — registered webhooks
+# ---------------------------------------------------------------------------
+
+
+def _hooks_home(monkeypatch, tmp_path):
+    """Point the registrations path at *tmp_path* and return the hooks.json path.
+
+    ``webhooks.context_registrations_path`` imports ``data_home`` inside its body,
+    so the patch has to land on the owning module rather than on a name bound
+    into ``webhooks``.
+    """
+    from kiro_crew.config import paths
+
+    monkeypatch.setattr(paths, "data_home", lambda: tmp_path)
+    return tmp_path / "hooks.json"
+
+
+def _registration(summary="did a thing"):
+    return {"context_summary": summary, "registered_at": 1_700_000_000.0}
+
+
+def test_registered_webhooks_counts_the_registrations(tmp_path, monkeypatch):
+    path = _hooks_home(monkeypatch, tmp_path)
+    path.write_text(
+        json.dumps({"alpha": _registration(), "beta": _registration("another")}),
+        encoding="utf-8",
+    )
+    assert ig.read_registered_webhooks() == 2
+
+
+def test_registered_webhooks_ignores_the_script_hook_store_sharing_the_file(tmp_path, monkeypatch):
+    """``hooks.json`` is shared with ``ScriptHookStore``, whose ``hooks`` key
+    holds a LIST. Counting its entries would report script hooks as webhooks."""
+    path = _hooks_home(monkeypatch, tmp_path)
+    path.write_text(
+        json.dumps(
+            {
+                "hooks": [{"id": "s1", "command": "echo"}, {"id": "s2", "command": "ls"}],
+                "alpha": _registration(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert ig.read_registered_webhooks() == 1
+
+
+def test_registered_webhooks_missing_file_is_a_genuine_zero(tmp_path, monkeypatch):
+    """An install that uses no webhooks has no file, and that is a real 0 -- not
+    a fault, or every such install sits permanently in the broken bucket."""
+    ig.reset_for_testing()
+    try:
+        _hooks_home(monkeypatch, tmp_path)
+        assert ig.read_registered_webhooks() == 0
+        assert ig.read_probe_failures() == {}
+    finally:
+        ig.reset_for_testing()
+
+
+def test_registered_webhooks_empty_object_is_a_genuine_zero(tmp_path, monkeypatch):
+    ig.reset_for_testing()
+    try:
+        path = _hooks_home(monkeypatch, tmp_path)
+        path.write_text("{}", encoding="utf-8")
+        assert ig.read_registered_webhooks() == 0
+        assert ig.read_probe_failures() == {}
+    finally:
+        ig.reset_for_testing()
+
+
+def test_registered_webhooks_corrupt_file_is_a_gap_AND_a_counted_fault(tmp_path, monkeypatch):
+    """Same fault/gap split ``crons.json`` draws: a 0 would claim nobody
+    registered a hook, and a silent gap is indistinguishable from a host that
+    stopped exporting."""
+    ig.reset_for_testing()
+    try:
+        path = _hooks_home(monkeypatch, tmp_path)
+        path.write_text("{not json", encoding="utf-8")
+        assert ig.read_registered_webhooks() is None
+        assert ig.read_probe_failures() == {ig.PROBE_WEBHOOKS: 1}
+    finally:
+        ig.reset_for_testing()
+
+
+def test_registered_webhooks_corrupt_file_warns_once_across_export_intervals(
+    tmp_path, monkeypatch, caplog
+):
+    """The probe runs every export interval. A file that stays corrupt is reported
+    once, by the probe's own warn-once note, not once per read by the webhook store's
+    reader, which would also call ``hooks.json`` the "webhook store"."""
+    ig.reset_for_testing()
+    try:
+        path = _hooks_home(monkeypatch, tmp_path)
+        path.write_text("{not json", encoding="utf-8")
+        with caplog.at_level(logging.DEBUG):
+            for _ in range(3):
+                assert ig.read_registered_webhooks() is None
+        warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        assert len(warnings) == 1, warnings
+        assert repr(ig.PROBE_WEBHOOKS) in warnings[0]
+        assert ig.read_probe_failures() == {ig.PROBE_WEBHOOKS: 3}
+    finally:
+        ig.reset_for_testing()
+
+
+def test_registered_webhooks_callback_never_raises_on_a_corrupt_file(tmp_path, monkeypatch):
+    """End to end through a real pipeline: the fault is published as DATA and the
+    exporter keeps running -- a raise in an observable callback would spam the SDK
+    every export interval."""
+    ig.reset_for_testing()
+    try:
+        path = _hooks_home(monkeypatch, tmp_path)
+        path.write_text("[1, 2", encoding="utf-8")
+        metrics = _collect()
+        assert (
+            ig.GAUGE_WEBHOOKS_REGISTERED not in metrics or not metrics[ig.GAUGE_WEBHOOKS_REGISTERED]
+        )
+        failures = {dp.attributes["probe"]: dp.value for dp in metrics[ig.GAUGE_PROBE_FAILURES]}
+        assert failures.get(ig.PROBE_WEBHOOKS) == 1, f"webhook fault not published: {failures}"
+    finally:
+        ig.reset_for_testing()
+
+
+def test_registered_webhooks_top_level_non_object_holds_no_registrations(tmp_path, monkeypatch):
+    """A list parses, so it is not a fault -- it simply carries no registrations."""
+    ig.reset_for_testing()
+    try:
+        path = _hooks_home(monkeypatch, tmp_path)
+        path.write_text("[]", encoding="utf-8")
+        assert ig.read_registered_webhooks() == 0
+        assert ig.read_probe_failures() == {}
+    finally:
+        ig.reset_for_testing()
+
+
+def test_registered_webhook_count_agrees_with_the_dashboard_listing(tmp_path, monkeypatch):
+    """The gauge and the surface a user reads must not disagree on what counts as
+    a registration, which is why both reduce through the same owner."""
+    from kiro_crew.dashboard.handlers import hooks_webhook_intake as intake
+
+    path = _hooks_home(monkeypatch, tmp_path)
+    monkeypatch.setattr(intake, "_HOOK_STORE_PATH", path, raising=False)
+    path.write_text(
+        json.dumps(
+            {
+                "alpha": _registration(),
+                "beta": {"summary": "legacy field name"},
+                "hooks": [{"id": "s1", "command": "echo"}],
+                "gamma": "not a registration",
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert ig.read_registered_webhooks() == len(intake._read_hook_registrations()) == 2
+
+
+def test_no_hook_identifier_or_summary_is_restated_in_this_module():
+    """The shape test has one owner, so renaming a registration field reaches the
+    gauge and the dashboard together rather than leaving the gauge to count by a
+    rule only it still applies."""
+    import inspect
+
+    source = inspect.getsource(ig.read_registered_webhooks)
+    assert "registered_context_count" in source
+    assert "context_summary" not in source
+
+
+# ---------------------------------------------------------------------------
+# raw readers -- members (crewmates the person created)
+# ---------------------------------------------------------------------------
+
+
+def _roster_config(agents):
+    """A real ``KiroCrewConfig`` whose ``agents`` are real crew records."""
+    from kiro_crew.config.loader import KiroCrewConfig
+    from kiro_crew.config.sections_session import KiroCrewAgentConfig
+
+    cfg = KiroCrewConfig()
+    cfg.agents = {
+        name: KiroCrewAgentConfig(kiro_agent="kirocrew", **fields)
+        for name, fields in agents.items()
+    }
+    return cfg
+
+
+def _read_members_with(cfg):
+    from kiro_crew.config.loader import KiroCrewConfig
+
+    with patch.object(KiroCrewConfig, "load", return_value=cfg):
+        return ig.read_members()
+
+
+def test_members_empty_roster_is_a_genuine_zero():
+    assert _read_members_with(_roster_config({})) == 0
+
+
+def test_members_counts_only_crewmates_the_person_created():
+    cfg = _roster_config(
+        {
+            "atlas": {"source": "kirocrew", "member_id": "atlas"},
+            "Dr. Eggbot": {"source": "kirocrew", "member_id": "dr-eggbot"},
+            "nova": {"source": "kirocrew", "member_id": "nova-2"},
+            # Shipped with the product, not made by the person.
+            "mate": {"source": "builtin", "member_id": "mate"},
+            # Written by the package sync.
+            "kirocrew-oncall": {"source": "package", "member_id": "oncall"},
+            # A legacy crew-manager row with no member memory allocated.
+            "legacy": {"source": "kirocrew"},
+            "blank-id": {"source": "kirocrew", "member_id": "   "},
+            # The reserved main member is never a created crewmate.
+            "default": {"source": "kirocrew", "member_id": "default"},
+        }
+    )
+    assert _read_members_with(cfg) == 3
+
+
+def test_members_skips_a_row_the_roster_cannot_address():
+    """A name or member id the roster drops never reaches the count either."""
+    cfg = _roster_config(
+        {
+            "atlas": {"source": "kirocrew", "member_id": "atlas"},
+            # member_slug refuses an id that is not a slug, so the roster skips it.
+            "broken": {"source": "kirocrew", "member_id": "Not A Slug!"},
+            # Not a dispatchable member name.
+            "": {"source": "kirocrew", "member_id": "empty"},
+        }
+    )
+    assert _read_members_with(cfg) == 1
+
+
+def test_members_count_agrees_with_the_roster_dashboard_created_rule():
+    """The gauge and the Crewmates roster share ONE predicate, so they cannot drift."""
+    import inspect
+
+    from kiro_crew.dashboard.handlers import members_roster
+
+    assert "is_person_created_crewmate" in inspect.getsource(members_roster.api_members)
+    assert "count_person_created_crewmates" in inspect.getsource(ig.read_members)
+
+
+def test_members_unreadable_config_is_a_gap_and_a_counted_fault():
+    """A config read that raises yields no observation, never a crash or a fake 0."""
+    from kiro_crew.config.loader import KiroCrewConfig
+
+    ig.reset_for_testing()
+    try:
+        with patch.object(KiroCrewConfig, "load", side_effect=OSError("unreadable")):
+            metrics = _collect()
+        assert ig.GAUGE_MEMBERS not in metrics or not metrics[ig.GAUGE_MEMBERS]
+        failures = {dp.attributes["probe"]: dp.value for dp in metrics[ig.GAUGE_PROBE_FAILURES]}
+        assert failures.get(ig.PROBE_MEMBERS) == 1, f"members fault not published: {failures}"
+    finally:
+        ig.reset_for_testing()
+
+
+def test_members_half_read_config_is_a_gap_not_a_false_count():
+    """An unreadable base or overlay file must not publish a short count.
+
+    The loader keeps going on a file it cannot parse, so the crewmates in that
+    file are simply absent from ``agents``; counting them would report a false
+    decrease (often a false 0) as data.
+    """
+    for flag in ("_base_unreadable", "_overlay_unreadable"):
+        cfg = _roster_config({"atlas": {"source": "kirocrew", "member_id": "atlas"}})
+        setattr(cfg, flag, True)
+        ig.reset_for_testing()
+        try:
+            assert _read_members_with(cfg) is None, flag
+            assert ig.read_probe_failures() == {ig.PROBE_MEMBERS: 1}, flag
+        finally:
+            ig.reset_for_testing()
+
+
+def test_members_publishes_a_bare_count_with_no_name_attribute():
+    secret = "acme-secret-crewmate"
+    cfg = _roster_config({secret: {"source": "kirocrew", "member_id": "acme"}})
+    from kiro_crew.config.loader import KiroCrewConfig
+
+    ig.reset_for_testing()
+    try:
+        with patch.object(KiroCrewConfig, "load", return_value=cfg):
+            metrics = _collect()
+        (point,) = metrics[ig.GAUGE_MEMBERS]
+        assert point.value == 1
+        assert dict(point.attributes or {}) == {}
+    finally:
+        ig.reset_for_testing()
+
+
+# ---------------------------------------------------------------------------
 # OTEL registration + collection
 # ---------------------------------------------------------------------------
 
@@ -563,6 +852,8 @@ def test_collection_yields_every_instrument_with_the_expected_shape():
             return_value={ig.MCP_CLASS_FIRST_PARTY: 4, ig.MCP_CLASS_THIRD_PARTY: 1},
         ),
         patch.object(ig, "read_config_toggles", return_value={"beacon": 1, "stt": 0}),
+        patch.object(ig, "read_registered_webhooks", return_value=5),
+        patch.object(ig, "read_members", return_value=7),
     ):
         metrics = _collect()
 
@@ -598,6 +889,18 @@ def test_collection_yields_every_instrument_with_the_expected_shape():
 
     toggles = {dp.attributes["key"]: dp.value for dp in metrics[ig.GAUGE_CONFIG_TOGGLE]}
     assert toggles == {"beacon": 1, "stt": 0}
+
+    # Same rule as the two store-backed counts above: the number of registered
+    # hooks rides in the value, and no hook id, session key or context summary
+    # becomes an attribute -- each is agent-chosen free text.
+    (hooks,) = metrics[ig.GAUGE_WEBHOOKS_REGISTERED]
+    assert hooks.value == 5
+    assert dict(hooks.attributes or {}) == {}
+
+    # The Mates count rides in the value too; no crewmate name or id is an attribute.
+    (members,) = metrics[ig.GAUGE_MEMBERS]
+    assert members.value == 7
+    assert dict(members.attributes or {}) == {}
 
 
 def test_no_mcp_server_name_reaches_any_attribute():
@@ -787,7 +1090,8 @@ def test_reporter_claim_is_unconditional():
 
     from kiro_crew.slack import gateway as gateway_mod
 
-    tree = ast.parse(Path(gateway_mod.__file__).read_text(encoding="utf-8"))
+    gateway_path = Path(gateway_mod.__file__)
+    paths = [gateway_path, *sorted((gateway_path.parent / "gateway_runtime").glob("*.py"))]
     branching = (ast.If, ast.IfExp, ast.For, ast.AsyncFor, ast.While, ast.Match)
     sites: list[tuple[str, bool]] = []
 
@@ -806,7 +1110,8 @@ def test_reporter_claim_is_unconditional():
                 sites.append((func, branched))
             _walk(child, func, branched or isinstance(child, branching))
 
-    _walk(tree, "<module>", False)
+    for path in paths:
+        _walk(ast.parse(path.read_text(encoding="utf-8")), "<module>", False)
 
     assert sites == [("run", False)], (
         "mark_install_reporter() must be called exactly once, unconditionally, from "

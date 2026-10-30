@@ -7,10 +7,10 @@ import ErrorNotice from '../../components/ErrorNotice'
 import InfoTip from '../../components/InfoTip'
 import SimpleSelect from '../../components/SimpleSelect'
 // The crew editor's create dialog, shared the way the Crewmates dialog shares it.
-import { WorkspaceModal } from '../KiroCrewAgentsPage'
+import { WorkspaceModal } from '../../components/crew/crewFields'
 import { useProvider } from '../../providers'
 import { useSidePanelLeaveGuard } from '../../components/SidePanelLayout'
-import { DEFAULT_CREWMATE_HIGHLIGHT_ANCHOR } from '../../hooks/useSettingHighlight'
+import { AGENT_SANDBOX_HIGHLIGHT_ANCHOR, DEFAULT_CREWMATE_HIGHLIGHT_ANCHOR } from '../../hooks/useSettingHighlight'
 import { useAppDispatch } from '../../store'
 import { triggerRefresh } from '../../store/dashboardSlice'
 
@@ -226,7 +226,7 @@ function CfgToggle({ label, path, value, hint, onSave }: { label: string; path: 
   useEffect(() => { setLocal(value) }, [value])
   return (
     <CfgRow label={label} hint={hint} ok={ok}>
-      <button className={`h-7 min-w-[120px] px-2 py-0.5 rounded text-[13px] font-mono ${local ? 'bg-ok/15 text-ok border border-ok/30' : 'bg-bg-elevated text-muted border border-border'}`} onClick={() => { markDirty(); const v = !local; setLocal(v); onSave(path, v) }}>
+      <button className={`h-7 min-w-[120px] px-2 py-0.5 rounded text-[13px] font-mono ${local ? 'bg-ok/15 text-ok-text border border-ok/30' : 'bg-bg-elevated text-muted border border-border'}`} onClick={() => { markDirty(); const v = !local; setLocal(v); onSave(path, v) }}>
         {local ? 'on' : 'off'}
       </button>
     </CfgRow>
@@ -376,12 +376,11 @@ export default function KiroCrewCfgTab() {
             </tbody>
           </table>
         )}
-        {/* The Settings-side writer of the default crewmate. The Crewmates tab
-            only marks it with a badge; the chat composer's ★ writes the same
-            setting but only for the agent a session is bound to, and the picker
-            withholds covered crewmates unless dashboard.crewmates_in_agent_picker is on — so without
-            this row a user with several crewmates could not pick which one new
-            sessions start as.
+        {/* The Settings-side writer of the ROSTER's default crewmate: the badge
+            on the Crewmates page, the undeletable row, the one `select_crew`
+            keeps for itself. It is not what a new session runs — that is the
+            default custom agent, which the chat composer's ★ (Default for new
+            sessions) writes to `agent.default_agent` — and the hint says so.
             Rendered whenever any crewmate exists — the roster badge deep-links
             here even with one, so the anchor must be on the page for the ring
             to land (a one-option select is a true statement, not a trap). */}
@@ -402,7 +401,7 @@ export default function KiroCrewCfgTab() {
               path="agent.default_agent"
               value={cfg.default_agent}
               options={agents.map(([name]) => name)}
-              hint={i18nT('pages.overview.kiroCrewCfgTab.default_crewmate_hint')}
+              hint={i18nT('pages.overview.kiroCrewCfgTab.default_crewmate_hint_badge')}
               onSave={(_path, name) => { setDefaultErr(''); defaultMut.mutate(name) }}
             />
             {/* No hand-off: it navigates to the chat and unmounts this page, and
@@ -492,7 +491,10 @@ export default function KiroCrewCfgTab() {
           <div className={readonlyCls}><span className="text-muted"><Lock className="lucide-inline" /> {i18nT('pages.overview.kiroCrewCfgTab.provider')}</span><span className="text-text font-mono text-[13px]">{cfg.agent.provider}</span></div>
           <CfgSelect key={`approval-${rev}`} label={i18nT('pages.overview.kiroCrewCfgTab.approval_mode')} path="agent.approval_mode" value={cfg.agent.approval_mode} options={['auto', 'interactive']} hint={i18nT('pages.overview.kiroCrewCfgTab.immediate_auto_approves_all_tools_interactive_as')} onSave={save} />
           <CfgNumber key={`timeout-${rev}`} label={i18nT('pages.overview.kiroCrewCfgTab.session_timeout')} path="session.timeout_secs" value={cfg.session.timeout_secs} suffix="s" min={60} max={86400} hint={i18nT('pages.overview.kiroCrewCfgTab.takes_effect_on_next_session_range_60_86400s')} onSave={save} />
+          {/* Anchored for Settings → Session Environments' strict-sandbox link (AGENT_SANDBOX_PATH). */}
+          <div data-setting-key={AGENT_SANDBOX_HIGHLIGHT_ANCHOR}>
           <CfgSelect key={`sandbox-${rev}`} label={i18nT('pages.overview.kiroCrewCfgTab.sandbox')} path="agent.sandbox" value={cfg.agent.sandbox} options={['auto', 'strict', 'off']} hint={i18nT('pages.overview.kiroCrewCfgTab.applies_to_sessions_started_after_the_change')} onSave={save} />
+          </div>
           <div className={readonlyCls}><span className="text-muted"><Lock className="lucide-inline" /> {i18nT('pages.overview.kiroCrewCfgTab.embedding_provider')}</span><span className="text-text font-mono text-[13px]">{cfg.memory.embedding_provider}</span></div>
           <CfgToggle key={`autoupdate-${rev}`} label={i18nT('pages.overview.kiroCrewCfgTab.auto_update')} path="auto_update" value={cfg.auto_update} hint={i18nT('pages.overview.kiroCrewCfgTab.next_update_check_cycle')} onSave={save} />
           <CfgToggle key={`toolsearch-${rev}`} label={i18nT('pages.overview.kiroCrewCfgTab.mcp_tool_search')} path="agent.tool_search" value={cfg.agent.tool_search ?? true} hint={i18nT('pages.overview.kiroCrewCfgTab.enable_dynamic_mcp_tool_discovery_via_kiro_cli_t')} onSave={save} />
@@ -507,7 +509,7 @@ export default function KiroCrewCfgTab() {
 /**
  * The two run-time editors Settings > Agent Harness hosts: Subagent Settings
  * and Warm Pool. They read and write the same `['kirocrewConfig']` cache as the
- * Developer page's config tab, so an edit on either surface shows on the other.
+ * Settings > Developer > Config page, so an edit on either surface shows on the other.
  */
 export function AgentRunSettings() {
   const provider = useProvider()

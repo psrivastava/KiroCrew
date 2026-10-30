@@ -4,8 +4,8 @@ Validation (key shape, allowlist, confidence, decoded emptiness, size, encoding
 and injection screening), the reject audit, the insert-if-absent and delete
 writes, facet stamping, and every reader that ranks or renders facts and
 preferences for a prompt. The conflict-resolving write transaction,
-``VectorMemoryStore._write_semantic``, stays on the store because member
-consolidation joins it; ``write_value`` validates and routes into it.
+``VectorMemoryStore._write_semantic``, lives in ``vector_memory_semantic_write`` because
+member consolidation joins it; ``write_value`` validates and routes into it.
 """
 
 from __future__ import annotations
@@ -14,7 +14,9 @@ import json
 import logging
 import re
 import struct
-from dataclasses import dataclass
+import sys
+import threading
+from dataclasses import dataclass, field
 from fnmatch import fnmatch
 from typing import TYPE_CHECKING, Any
 
@@ -23,8 +25,10 @@ from kiro_crew import memory_record_metadata as record_meta
 from kiro_crew import memory_schema, memory_v2
 from kiro_crew.embeddings import PRIORITY_BULK, PRIORITY_INTERACTIVE
 from kiro_crew.lesson_validation import order_by_request_relevance
+from kiro_crew.user_json import strict_json_equal
 from kiro_crew.validation import ALLOWED_LESSON_CATEGORIES
 from kiro_crew.vector_memory_runtime import lessons as _lessons
+from kiro_crew.vector_memory_runtime import term_index as _term_index
 from kiro_crew.vector_memory_runtime import text_scoring as _text_scoring
 from kiro_crew.vector_memory_runtime.embedding import _RecallQuery
 
@@ -69,26 +73,152 @@ class _SemanticScoringSet:
     rows: tuple[dict[str, object], ...]
     generation: int
     data_version: int
+    # Query-independent work derived from ``rows`` on first use and kept for the
+    # set's lifetime: the row token sets (keyed on the text itself, so a label
+    # that moves with an identity edit simply misses; byte-capped) and, per
+    # query width, the rows' own embedding blobs with their norms. Both are pure
+    # functions of ``rows``, which is immutable, so nothing invalidates them but
+    # the set being replaced.
+    derived: dict = field(default_factory=dict, compare=False, repr=False)
 
 
-def _strict_json_equal(a: object, b: object) -> bool:
-    """Type-strict equality over decoded JSON: 1 != True, 1 != 1.0.
+#: Bytes the per-set row-token memo may retain. Past it, rows are tokenized
+#: per call exactly as without the memo, so the bound costs speed, never results.
+_SCORING_TOKEN_MEMO_MAX_BYTES = 64 * 1024 * 1024
 
-    Python's == conflates bool with int (and int with float), so a decoded
-    compare alone would treat an existing ``1`` and a submitted ``true`` as
-    unchanged and silently retain the stale value. Requiring identical types
-    errs toward "changed", which routes to an update or conflict proposal --
-    never a silent skip.
+
+def _token_entry_bytes(text: str, tokens: frozenset[str]) -> int:
+    """Upper estimate of what one memo entry retains: the key text, the set, its strings."""
+    return sys.getsizeof(text) + sys.getsizeof(tokens) + sum(sys.getsizeof(t) for t in tokens)
+
+
+def _scoring_row_tokens(scoring: _SemanticScoringSet):
+    """Row tokenizer memoized for exactly this scoring set's population.
+
+    The module-level LRU cannot serve a scan wider than its bound (it thrashes
+    to a zero hit rate), so a resident set owns its own memo, sized in bytes
+    by ``_SCORING_TOKEN_MEMO_MAX_BYTES`` rather than in entries: a token set
+    can retain many times its text.
     """
-    if type(a) is not type(b):
-        return False
-    if isinstance(a, dict):
-        assert isinstance(b, dict)
-        return a.keys() == b.keys() and all(_strict_json_equal(a[k], b[k]) for k in a)
-    if isinstance(a, list):
-        assert isinstance(b, list)
-        return len(a) == len(b) and all(map(_strict_json_equal, a, b))
-    return a == b
+    memo: dict[str, frozenset[str]] = scoring.derived.setdefault("tokens", {})
+    uncached = _text_scoring._row_stem_tokens_uncached
+    derived = scoring.derived
+
+    def row_tokens(text: str) -> frozenset[str]:
+        tokens = memo.get(text)
+        if tokens is None:
+            tokens = uncached(text)
+            used = derived.get("token_bytes", 0)
+            if used < _SCORING_TOKEN_MEMO_MAX_BYTES:
+                derived["token_bytes"] = used + _token_entry_bytes(text, tokens)
+                memo[text] = tokens
+        return tokens
+
+    return row_tokens
+
+
+def _scoring_term_index(store: VectorMemoryStore, scoring: _SemanticScoringSet, identities):
+    """``(index, key texts)`` for the set, built on first use; ``None`` without one.
+
+    Texts ``2i`` and ``2i + 1`` of the :class:`~term_index.RowTermIndex` are row
+    ``i``'s key text and lowercased value, the two texts the V1 loop scores. A
+    value is fixed for the set's lifetime; a key text also reads the row's
+    identity, so the key texts indexed are kept and the loop tokenizes one that
+    has changed since. One build per set:
+    concurrent first builds wait for it rather than each stemming every row.
+    ``None`` without numpy or past :data:`~term_index.MAX_TERM_IDS`, and the
+    loop keeps the per-text memo.
+    """
+    from kiro_crew import vector_memory as vm  # circular import: the facade imports this module
+
+    if not vm._HAS_NUMPY:
+        return None
+    derived = scoring.derived
+    if "term_index" in derived:
+        return derived["term_index"]
+    with derived.setdefault("term_index_lock", threading.Lock()):
+        if "term_index" not in derived:
+            texts: list[str] = []
+            key_texts: list[str] = []
+            for raw in scoring.rows:
+                key = str(raw["key"])
+                identity = identities.get(key)
+                label = (
+                    key
+                    if identity is None
+                    else store._fact_label({"key": key, "identity": identity})
+                )
+                key_texts.append(label.replace("_", " ").replace(".", " "))
+                texts.append(key_texts[-1])
+                texts.append(str(raw["value_json"]).lower())
+            index = _term_index.RowTermIndex.build(texts, vm.np)
+            derived["term_index"] = None if index is None else (index, tuple(key_texts))
+    return derived["term_index"]
+
+
+# Rows widened to float64 at a time when scoring against the resident matrix.
+_COSINE_CHUNK_ROWS = 128
+
+
+def _scoring_cosines(scoring: _SemanticScoringSet, query_embedding: list[float] | None):
+    """Cosine of every row against the query, or ``None`` without numpy.
+
+    Bit-identical to ``_stored_similarity_scorer``'s numpy rung: the same
+    float64 1-D dot per row and the same per-row ``np.linalg.norm``, 0.0 for a
+    missing or other-width vector. Only the query-independent part moves: the
+    matching blobs are collected once per set and width and their norms
+    computed once. A
+    batched mat-vec would be faster still but sums in a different order, which
+    changes the last bits of every score (measured on a real store: 1,228 cosine
+    and 861 score differences across 1,000 recalls), so it is not used.
+    """
+    from kiro_crew import vector_memory as vm  # circular import: the facade imports this module
+
+    if not vm._HAS_NUMPY or not query_embedding:
+        return None
+    np = vm.np
+    q = np.asarray(query_embedding, dtype=np.float64)
+    q_norm = float(np.linalg.norm(q))
+    sims = [0.0] * len(scoring.rows)
+    if not q_norm:
+        return sims
+    width = len(q)
+    cached = scoring.derived.get(("vectors", width))
+    if cached is None:
+        index: list[int] = []
+        blobs: list[bytes] = []
+        for i, row in enumerate(scoring.rows):
+            blob = row.get("embedding")
+            if isinstance(blob, bytes) and len(blob) == width * 4:
+                index.append(i)
+                blobs.append(blob)
+        norms = [
+            float(np.linalg.norm(np.frombuffer(blob, dtype=np.float32).astype(np.float64)))
+            for blob in blobs
+        ]
+        # The blobs are the rows' own bytes objects, not a copy: only one
+        # chunk is ever widened at a time, so the set retains no second copy
+        # of the embeddings.
+        cached = scoring.derived[("vectors", width)] = (index, blobs, norms)
+    index, blobs, norms = cached
+    for start in range(0, len(index), _COSINE_CHUNK_ROWS):
+        chunk = blobs[start : start + _COSINE_CHUNK_ROWS]
+        wide = np.frombuffer(b"".join(chunk), dtype=np.float32).reshape(len(chunk), width)
+        wide = wide.astype(np.float64)
+        for offset, vec in enumerate(wide):
+            row_norm = norms[start + offset]
+            denom = row_norm * q_norm
+            sims[index[start + offset]] = float(vec @ q) / denom if denom else 0.0
+    return sims
+
+
+#: Type-strict equality over decoded JSON: 1 != True, 1 != 1.0. The shared
+#: comparator in :mod:`kiro_crew.user_json`, bound here under the name this
+#: module always exported. A decoded compare with ``==`` alone would treat an
+#: existing ``1`` and a submitted ``true`` as unchanged and silently retain the
+#: stale value; requiring identical types errs toward "changed", which routes to
+#: an update or conflict proposal -- never a silent skip.
+_strict_json_equal = strict_json_equal
 
 
 def _json_value_equal(a: str, b: str) -> bool:
@@ -101,9 +231,10 @@ def _json_value_equal(a: str, b: str) -> bool:
     """
     if a == b:
         return True
-    # A deeply nested value can exhaust the recursion limit in the decoded
-    # compare; treating that as "changed" routes it to an update or conflict
-    # proposal rather than aborting the write, which errs on the safe side.
+    # The compare itself walks an explicit stack, but ``json.loads`` can still
+    # exhaust the recursion limit on a value nested past it; treating that as
+    # "changed" routes it to an update or conflict proposal rather than
+    # aborting the write, which errs on the safe side.
     try:
         return _strict_json_equal(json.loads(a), json.loads(b))
     except (TypeError, ValueError, RecursionError):
@@ -227,11 +358,13 @@ def validate_semantic(
         cat = value.get("category")
         raw_negative = value.get("negative")
         raw_scope = value.get("repo_scope")
+        raw_writer = value.get("written_by")
         if (
-            set(value.keys()) <= {"rule", "category", "negative", "repo_scope"}
+            set(value.keys()) <= {"rule", "category", "negative", "repo_scope", "written_by"}
             and (cat is None or (isinstance(cat, str) and cat in ALLOWED_LESSON_CATEGORIES))
             and (raw_negative is None or isinstance(raw_negative, str))
             and (raw_scope is None or isinstance(raw_scope, str))
+            and (raw_writer is None or isinstance(raw_writer, dict))
         ):
             raw_rule = value["rule"]  # _lesson_fields guarantees a str
             if isinstance(raw_negative, str):
@@ -247,6 +380,10 @@ def validate_semantic(
             # caller with a JSONL fallback reported it saved.
             if isinstance(raw_scope, str):
                 size_basis = f"{size_basis}{_lessons._LESSON_NEGATIVE_SEP}{raw_scope}"
+            # The writer label is measured at its full serialized size, so it is
+            # never an unmeasured byte either.
+            if isinstance(raw_writer, dict):
+                size_basis = f"{size_basis}{json.dumps(raw_writer, ensure_ascii=False)}"
     # json.dumps(..., ensure_ascii=False) accepts a lone surrogate (and so
     # does json.loads, so an LLM payload can carry one), but the result
     # cannot be UTF-8 encoded -- neither here nor by SQLite. Reject it as
@@ -297,8 +434,21 @@ def log_reject_event(
     store._log_event(code.value, "semantic", key, None, snippet, source)
 
 
+#: The ``semantic_memory`` view's columns on the crew schema, in its order
+#: (``memory_schema.CREW_SCHEMA_SQL``), for a keyed read of the table under it.
+_V1_SEMANTIC_COLUMNS = (
+    "key, value_json, confidence, source, created_at, updated_at, is_deleted, embedding"
+)
+
+
 def get_all_semantic(
-    store: VectorMemoryStore, limit: int | None = None, offset: int = 0, *, q: str = ""
+    store: VectorMemoryStore,
+    limit: int | None = None,
+    offset: int = 0,
+    *,
+    q: str = "",
+    after_key: str | None = None,
+    exclude_lessons: bool = False,
 ) -> list[dict]:
     """Get active semantic memory entries.
 
@@ -310,17 +460,45 @@ def get_all_semantic(
 
     Optional ``q`` matches literal Unicode text in keys and decoded values
     before pagination. Omitting it keeps the existing unfiltered read path.
+
+    ``after_key`` returns only rows whose key sorts after it, so a caller can
+    walk the table in key order one bounded page at a time (keyset paging).
+    ``exclude_lessons`` leaves out ``lesson.*`` rows, for a reader that draws
+    lessons from :func:`get_lessons` and would otherwise spend its window on
+    them. Either one asks for a read in KEY-INDEX order: the liveness and kind
+    tests are written ``+is_deleted`` / ``+kind`` so SQLite walks the unique key
+    index and stops at ``limit``, instead of collecting every live row through
+    the ``is_deleted`` or ``kind`` index and sorting them all to keep a page
+    The rows and their order are the same either way.
     """
     query = _text_scoring._normalize_memory_search_query(q)
-    sql = "SELECT * FROM semantic_memory WHERE is_deleted = 0"
-    if store.algorithm_version == "v2":
+    keyed = after_key is not None or exclude_lessons
+    live = "+is_deleted = 0" if keyed else "is_deleted = 0"
+    sql = f"SELECT * FROM semantic_memory WHERE {live}"
+    if keyed and store.algorithm_version != "v2" and store._sem_rel != "semantic_memory":
+        # A v1 store on the crew schema reads ``semantic_memory`` as a VIEW over
+        # ``memory_items`` whose ``kind IN (...)`` test steers the plan onto the kind
+        # index. Read the table itself, in the view's columns, with that test unindexed.
+        sql = (
+            f"SELECT {_V1_SEMANTIC_COLUMNS} FROM {store._sem_rel} WHERE {live}{store._sem_guard}"
+        ).replace(" AND kind ", " AND +kind ")
+    elif store.algorithm_version == "v2":
         # Compatibility views intentionally omit facets. Private lifecycle readers
         # need the canonical row so an explicit copy keeps its visible provenance.
-        sql = f"SELECT * FROM {store._sem_rel} WHERE is_deleted = 0" f"{store._sem_guard}"
+        sql = f"SELECT * FROM {store._sem_rel} WHERE {live}{store._sem_guard}"
+        if keyed:
+            # The kind guard is an IN test too, and would steer the plan onto the
+            # kind index the same way the liveness test does.
+            sql = sql.replace(" AND kind ", " AND +kind ")
     params: tuple = ()
     if query:
         sql += " AND (memory_text_contains(key, ?, 0) OR memory_text_contains(value_json, ?, 1))"
         params = (query, query)
+    if exclude_lessons:
+        sql += " AND key NOT LIKE 'lesson.%'"
+    if after_key is not None:
+        sql += " AND key > ?"
+        params += (after_key,)
     sql += " ORDER BY key"
     if limit is not None:
         sql += " LIMIT ? OFFSET ?"
@@ -461,15 +639,8 @@ def write_value(
         metadata = record_meta.normalize_metadata(metadata) if metadata is not None else None
     except ValueError as exc:
         return (vm.SemanticRejectCode.CONFLICT, str(exc))
-    if metadata and metadata.get("subject") and metadata.get("predicate"):
-        with store._db_lock:
-            identity = store.db.execute(
-                "SELECT record_id FROM memory_record_meta WHERE scope=? AND subject=? "
-                "AND predicate=? AND status='active' AND kind IN ('fact','directive')",
-                (metadata.get("scope", ""), metadata["subject"], metadata["predicate"]),
-            ).fetchone()
-        if identity:
-            key = identity[0].removeprefix("key:")
+    with store._db_lock:
+        key = record_meta.identity_key(store.db, key, metadata)
     conflict = store._write_semantic(
         key,
         value_json,
@@ -694,8 +865,8 @@ def delete_semantic(
         # A forget writes its audit event best-effort AFTER committing the
         # tombstone, through the shared helper -- an unavailable event table
         # must not fail a forget. Only the supersede branch inlines the INSERT
-        # inside the transaction, where losing the winner/reason is the data
-        # loss this change exists to prevent.
+        # inside the transaction, where losing the winner/reason is data
+        # loss.
         store._log_event("delete", "semantic", key, row["value_json"], new_value, source)
     return True
 
@@ -764,11 +935,14 @@ def semantic_candidates_v1(
     else:
         with store._db_lock:
             store._check_recall_query(recall_query)
-            all_rows = store._fetch_all_locked(
-                "SELECT key, value_json, updated_at, embedding, source FROM semantic_memory "
-                "WHERE is_deleted = 0 AND key NOT LIKE 'lesson.%'",
-                scan="semantic",
-            )
+            all_rows = [
+                dict(row)
+                for row in store._fetch_all_locked(
+                    "SELECT key, value_json, updated_at, embedding, source FROM semantic_memory "
+                    "WHERE is_deleted = 0 AND key NOT LIKE 'lesson.%'",
+                    scan="semantic",
+                )
+            ]
 
     # Stored write-time vectors only — one embed per request (the query),
     # same as the lessons path. Re-embedding every row here was an
@@ -778,20 +952,39 @@ def semantic_candidates_v1(
     similarity = store._stored_similarity_scorer(query_embedding)
     query_has_vector = query_embedding is not None
 
-    # Both token sets depend only on the row's own text, so re-deriving
-    # them per query is the bulk of a warm call — but only a scan that
-    # fits the cache can hit it, so the width decides which form runs.
-    # Two entries per row: one for the key, one for the value.
-    row_tokens = _text_scoring._row_stem_tokens_for_scan(2 * len(all_rows))
-
     identities = store._fact_identities()
     scored_rows: list[tuple[float, dict]] = []
-    for raw in store._eligible_rows(all_rows, "fact"):
-        r = dict(raw)
-        if r["key"] in identities:
-            r["identity"] = identities[r["key"]]
-        key_words = row_tokens(store._fact_label(r).replace("_", " ").replace(".", " "))
-        val_words = row_tokens(r["value_json"].lower())
+    # The two rungs differ only in where row tokens and cosines come from; the
+    # scoring below is shared. A resident set derives both once per set, so a
+    # warm query pays one dot and one set intersection per row. A per-call scan
+    # tokenizes through the module memo only when the scan fits it (two entries
+    # per row: one for the key, one for the value) and scores vectors per row.
+    cosines: list[float] | None = None
+    if scoring is not None:
+        row_tokens = _scoring_row_tokens(scoring)
+        if query_has_vector:
+            cosines = _scoring_cosines(scoring, query_embedding)
+    else:
+        row_tokens = _text_scoring._row_stem_tokens_for_scan(2 * len(all_rows))
+
+    blocked = store._ineligible_ids()
+    indexed = _scoring_term_index(store, scoring, identities) if scoring is not None else None
+    hits = indexed[0].query(query_words) if indexed is not None else None
+    for i, raw in enumerate(all_rows):
+        key = raw["key"]
+        if blocked and record_meta.record_id_for("fact", key) in blocked:
+            continue
+        identity = identities.get(key)
+        label = key if identity is None else store._fact_label({"key": key, "identity": identity})
+        key_text = label.replace("_", " ").replace(".", " ")
+        if hits is not None and indexed is not None and indexed[1][i] == key_text:
+            # The query's terms in each text, which is all the scoring below
+            # reads of them: intersecting with query_words again changes nothing.
+            key_words = hits.matched(2 * i)
+            val_words = hits.matched(2 * i + 1)
+        else:
+            key_words = row_tokens(key_text)
+            val_words = row_tokens(raw["value_json"].lower())
         key_overlap = len(query_words & key_words)
         val_overlap = len(query_words & val_words)
         kw_raw = key_overlap * 3 + val_overlap
@@ -805,11 +998,15 @@ def semantic_candidates_v1(
         # query_has_vector=True below, so a negative raw cosine would
         # otherwise reach _hybrid_score's weighted sum instead of the
         # keyword-only floor a merely-dissimilar row should get.
-        vec_score = max(0.0, similarity(r))
+        vec_score = max(0.0, cosines[i] if cosines is not None else similarity(raw))
 
         score = _text_scoring._hybrid_score(kw_score, vec_score, query_has_vector=query_has_vector)
 
         if score > 0:
+            # Copy only the rows returned: a resident row is shared state.
+            r = dict(raw)
+            if identity is not None:
+                r["identity"] = identity
             r["retrieval"] = {
                 "reason": "v1_hybrid_match",
                 "score": score,
@@ -1016,7 +1213,7 @@ def get_semantic_context(
         # query path above.
         rows = store._fetch_all_locked(
             "SELECT key, value_json FROM semantic_memory WHERE is_deleted = 0 "
-            "AND key NOT LIKE 'lesson.%' ORDER BY updated_at DESC LIMIT ?",
+            "AND key NOT LIKE 'lesson.%' ORDER BY updated_at DESC, key LIMIT ?",
             (max_rows,),
         )
     if facts_only:
@@ -1031,13 +1228,14 @@ def get_semantic_context(
             val = json.loads(r["value_json"])
         except (json.JSONDecodeError, TypeError):
             val = r["value_json"]
-        # Format complex values as JSON, simple values as-is
-        val_str = json.dumps(val) if isinstance(val, (dict, list)) else str(val)
+        # Format complex values as JSON, simple values as-is. Non-ASCII stays
+        # as written, as in the preferences block: an escaped "\uac00" costs six
+        # characters of the cap for one the model reads.
+        val_str = json.dumps(val, ensure_ascii=False) if isinstance(val, (dict, list)) else str(val)
         line = f"{store._fact_label(dict(r))}: {val_str}"
         if total + len(line) > cap:
-            if store.algorithm_version == "v2":
-                continue
-            break
+            # Skip a line that does not fit; a shorter, lower-ranked one may.
+            continue
         lines.append(line)
         total += len(line) + 1
     if not lines:

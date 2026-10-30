@@ -72,12 +72,19 @@ export interface PillActivityInput {
   /** The slot's live status line (`slotStatusDetail[slot]`), `undefined`
    *  before the first status frame. */
   detail: SlotStatusDetail | undefined
-  /** The tool call `detail` describes has already returned its output. */
-  toolReturned: boolean
+  /** The open call is the quiet `nothing_to_do` end, which never names itself.
+   *  A call that has RETURNED needs no input here: the store moves the status
+   *  line to thinking when its result arrives (`sseToolResult`). */
+  quietEnd: boolean
   /** The slots frame's own busy flag (main turn OR sub-agents). */
   running: boolean
   /** Sub-agents are running while the main turn is not. */
   delegatedOnly: boolean
+  /** The slots frame's own stopping flag: a Stop that reaches this host only
+   *  as the frame (pressed in another tab, or on a background slot), which
+   *  the stream state does not carry. Folded with `streamState === 'stopping'`
+   *  so every reader of this seam names that moment the same way. */
+  stopping?: boolean
   /** The shared label seam — `toolStatusLabel` bound to the user's
    *  `simplifiedToolNames` preference and the UI language. Injected so this
    *  module stays pure and the test can pin what it hands the seam. */
@@ -103,10 +110,10 @@ const THINKING: ToolStatusDetail = { kind: 'thinking' }
 
 /** Resolve the one line the pill shows from the slot's live readings. */
 export function resolvePillActivity(input: PillActivityInput): PillActivity {
-  const { streamState, detail, toolReturned, running, delegatedOnly, labelOf } = input
+  const { streamState, detail, quietEnd, running, delegatedOnly, stopping = false, labelOf } = input
   // The run-state phases the status seam has no word for.
   if (streamState === 'compacting') return { kind: 'compacting' }
-  if (streamState === 'stopping') return { kind: 'stopping' }
+  if (streamState === 'stopping' || stopping) return { kind: 'stopping' }
   // Busy is either signal: the slots frame's flag or a run state that has
   // not settled. A stale status from the last turn is never painted on a
   // resting slot.
@@ -114,7 +121,7 @@ export function resolvePillActivity(input: PillActivityInput): PillActivity {
   if (!busy) return { kind: 'idle' }
   switch (detail?.kind) {
     case 'tool': {
-      if (toolReturned) return { kind: 'thinking', text: clampActivityText(labelOf(THINKING)) }
+      if (quietEnd) return { kind: 'thinking', text: clampActivityText(labelOf(THINKING)) }
       const label = labelOf(detail)
       return label
         ? { kind: 'tool', text: clampActivityText(label), fullText: label.replace(/\s+/g, ' ').trim() }

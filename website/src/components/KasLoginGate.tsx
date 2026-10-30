@@ -1,4 +1,4 @@
-import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from 'react'
+import { createContext, useCallback, useContext, useEffect, useRef, useState, type ReactNode } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   AlertTriangle,
@@ -28,8 +28,11 @@ import {
 } from './OnboardingChapterShell'
 import GithubLogo from './icons/GithubLogo'
 import { Btn } from './ui'
+import { readCompanySignIn, rememberCompanySignIn } from '../utils/companySignIn'
 import ErrorNotice from './ErrorNotice'
 import { copyToClipboard } from '../utils/clipboard'
+import { clearCachedModels } from '../providers/adapters/acp'
+import { providerLabel, type KasLoginProvider } from './kasProviderLabel'
 
 import { i18nT } from '../i18n/t'
 
@@ -82,48 +85,9 @@ function openAuthTab(url: string): void {
   }
 }
 
-/**
- * Wire identifiers for the sign-in providers the gateway accepts. Sent verbatim
- * in the POST body — never catalog values, because a translated identifier is
- * not a protocol token.
- */
-export type KasLoginProvider = 'google' | 'github' | 'builder_id' | 'idc'
-
 // Extra begin-device fields the `idc` provider needs (the company's IAM Identity
 // Center access-portal URL, plus an optional region); other providers send none.
 export type KasLoginExtra = { start_url?: string; region?: string }
-
-// Display name for the provider a sign-in is running under (the device view's
-// eyebrow interpolates it). Routed through the catalog like every other label
-// so locales that transliterate brand names can.
-function providerLabel(provider: KasLoginProvider): string {
-  switch (provider) {
-    case 'google':
-      return i18nT('components.kasLogin.provider_google')
-    case 'github':
-      return i18nT('components.kasLogin.provider_github')
-    case 'builder_id':
-      return i18nT('components.kasLogin.provider_builder_id')
-    case 'idc':
-      return i18nT('components.kasLogin.provider_company_sso')
-  }
-}
-
-/**
- * Display name for the provider a STORED sign-in reports. The gateway spells
- * it as the governance classification the token carries ('Google' | 'Github' |
- * 'BuilderId' | 'Enterprise' | 'ExternalIdp'), not as the chooser's wire
- * identifiers, so the mapping is by loose match; anything unrecognised is shown
- * verbatim rather than mislabelled as a provider it is not.
- */
-export function providerLabelFromWire(stored: string | null | undefined): string {
-  const key = (stored ?? '').toLowerCase()
-  if (key === 'google') return providerLabel('google')
-  if (key === 'github') return providerLabel('github')
-  if (key === 'builderid' || key === 'builder_id') return providerLabel('builder_id')
-  if (key === 'enterprise' || key === 'idc' || key === 'externalidp') return providerLabel('idc')
-  return stored ?? ''
-}
 
 /**
  * Which chrome the flow renders in. `gate` is the full-screen door (scrim +
@@ -288,8 +252,10 @@ function Chooser({
   // beginning immediately: the portal URL is per-company, so there is nothing to
   // start until the user supplies it.
   const [ssoOpen, setSsoOpen] = useState(false)
-  const [startUrl, setStartUrl] = useState('')
-  const [region, setRegion] = useState('')
+  // Seeded from the last company sign-in submitted on this browser, so a reload
+  // or gateway restart does not hand back an empty field.
+  const [startUrl, setStartUrl] = useState(() => readCompanySignIn().startUrl)
+  const [region, setRegion] = useState(() => readCompanySignIn().region)
   const startUrlReady = startUrl.trim().length > 0
   const chrome = useChrome()
   return (
@@ -348,6 +314,7 @@ function Chooser({
             onSubmit={(e) => {
               e.preventDefault()
               if (!startUrlReady || busy) return
+              rememberCompanySignIn(startUrl, region)
               onPick('idc', {
                 start_url: startUrl.trim(),
                 ...(region.trim() ? { region: region.trim() } : {}),
@@ -655,7 +622,7 @@ function SignInProblem({
         panelFootnote: i18nT('components.kasLogin.aside_footnote'),
       }}
     >
-      <div className={`${chrome.tile} bg-danger/10 text-danger`}>
+      <div className={`${chrome.tile} bg-danger/10 text-danger-text`}>
         <AlertTriangle className="lucide-inline" />
       </div>
       <p className={`${chrome.afterTile} ${chrome.eyebrow.replace('text-accent', 'text-danger')}`}>
@@ -848,11 +815,26 @@ function KasLoginFlow({
   // Success is observed, not returned: the poll answering 'authorized' means
   // the gateway now holds a token, so re-read status (the single authority on
   // `authenticated`) and drop the session.
+  // The model list belongs to the account: on the KAS bundle route the gateway
+  // forgets the previous account's catalog the moment a sign-in lands, and
+  // `['available-models']` is refetched only on a session spawn (global
+  // `staleTime: Infinity`), so without this the picker keeps showing the
+  // previous account's models and prices. Drop localStorage first, then reset,
+  // the same pair the Agent Harness switch uses. Called from BOTH places a
+  // sign-in is confirmed: the poll answering 'authorized', and a cancel whose
+  // fresh status read finds the credential already stored (the poll is detached
+  // by then and never reports 'authorized' for it).
+  const forgetModelList = useCallback(() => {
+    clearCachedModels()
+    void queryClient.resetQueries({ queryKey: ['available-models'] })
+  }, [queryClient])
+
   const authorized = pollQuery.data?.status === 'authorized'
   const authorizedCode = pollQuery.data?.code
   useEffect(() => {
     if (!authorized) return
     void queryClient.invalidateQueries({ queryKey: QUERY_KEY })
+    forgetModelList()
     // A switch whose old slot could not be removed is a sign-in that landed AND
     // a failure the user has to act on: the previous account still wins by slot
     // priority, so the re-read status will keep showing it. Kept as a notice
@@ -862,7 +844,7 @@ function KasLoginFlow({
     setSession(null)
     setFellBack(false)
     setReauth(false)
-  }, [authorized, authorizedCode, queryClient])
+  }, [authorized, authorizedCode, forgetModelList, queryClient])
 
   // Loopback degradation: a listener nobody reached (timeout — the browser is
   // not on this machine) or that failed before persisting a token restarts the
@@ -905,6 +887,10 @@ function KasLoginFlow({
     try {
       const fresh = await api.kasLoginStatus()
       queryClient.setQueryData(QUERY_KEY, fresh)
+      // A sign-in that landed under the cancel is still a sign-in: the model
+      // list is the new account's now, and the poll that would have dropped the
+      // old one is already detached.
+      if (fresh.authenticated) forgetModelList()
       return fresh.authenticated ? 'signed_in' : 'signed_out'
     } catch {
       return 'unknown'
@@ -966,7 +952,7 @@ function KasLoginFlow({
           panelFootnote: i18nT('components.kasLogin.aside_footnote'),
         }}
       >
-        <div className={`${chrome.tile} bg-danger/10 text-danger`}>
+        <div className={`${chrome.tile} bg-danger/10 text-danger-text`}>
           <AlertTriangle className="lucide-inline" />
         </div>
         <h1 className={`${chrome.afterTile} ${chrome.headline}`}>

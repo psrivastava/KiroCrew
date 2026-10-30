@@ -73,7 +73,7 @@ describe('AssistantMessage row with Quote offered', () => {
     expect(rowLabels()[3]).toBe('More actions')
   })
 
-  it('beside Reply in thread (a crewmate chat) the row is Reply, Copy, More and Quote is in More', () => {
+  it('beside Reply in thread (a mate chat) the row is Reply, Copy, More and Quote is in More', () => {
     const onQuote = vi.fn()
     render(<AssistantMessage content={LONG} isStreaming={false} slotRunning={false} onReplyInThread={() => {}} onQuoteMessage={onQuote} />)
     expect(rowLabels()).toEqual(['Reply in thread', 'Copy', 'More actions'])
@@ -218,5 +218,41 @@ describe('AssistantMessage on a touch device', () => {
     const box = dock.parentElement as HTMLElement
     expect(parseFloat(box.style.top)).toBeGreaterThan(30)
     expect(parseFloat(box.style.top)).toBeLessThan(700)
+  })
+})
+
+/**
+ * The chat `copyOnSelect` setting reaches the reply's selection row: a mouse
+ * drag over the reply copies it, and the row still opens.
+ */
+describe('AssistantMessage copy on select', () => {
+  beforeEach(() => {
+    if (!Range.prototype.getBoundingClientRect) {
+      Range.prototype.getBoundingClientRect = () => new DOMRect(10, 10, 100, 20)
+    }
+  })
+  afterEach(() => { window.getSelection()?.removeAllRanges() })
+
+  const dragOverReply = () => {
+    const range = document.createRange()
+    range.selectNodeContents(screen.getByTestId('md'))
+    window.getSelection()!.removeAllRanges()
+    window.getSelection()!.addRange(range)
+    act(() => { document.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, clientX: 40, clientY: 20 })) })
+    act(() => { vi.advanceTimersByTime(60) })
+  }
+
+  it('copies a mouse selection when the setting is on', () => {
+    render(<AssistantMessage content={LONG} isStreaming={false} slotRunning={false} onQuote={() => {}} onAsk={() => {}} copyOnSelect />)
+    dragOverReply()
+    expect(copyToClipboard).toHaveBeenCalledWith(LONG)
+    expect(screen.getByRole('button', { name: 'Quote' })).toBeInTheDocument()
+  })
+
+  it('only opens the row when the setting is off', () => {
+    render(<AssistantMessage content={LONG} isStreaming={false} slotRunning={false} onQuote={() => {}} onAsk={() => {}} />)
+    dragOverReply()
+    expect(screen.getByRole('button', { name: 'Quote' })).toBeInTheDocument()
+    expect(copyToClipboard).not.toHaveBeenCalled()
   })
 })

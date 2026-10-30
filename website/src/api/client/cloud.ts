@@ -42,11 +42,35 @@ export interface CloudPreflight {
   ssm_reachable: boolean
   note: string
   detail: string
+  /** The bare program name the AWS CLI could not find while resolving
+   *  credentials (usually the profile's `credential_process` command), or "". */
+  credential_helper_missing?: string
   session_manager_plugin: boolean
   /** Copy-pasteable install command for the GATEWAY's platform, resolved
    *  server-side (the browser cannot know that host's OS). "" when the platform
-   *  has no one-liner. */
+   *  has no one-liner. When the plugin was found but refused, this is the
+   *  command that clears the refusal instead, or "" when none is known. */
   session_manager_plugin_command?: string
+  /** Where the gateway found a plugin it refused to run, or "". */
+  session_manager_plugin_refused_path?: string
+  /** The provenance check's reason for that refusal, server-authored, or "". */
+  session_manager_plugin_refused_reason?: string
+  /** The kind of refusal, so the row can say it in the reader's language:
+   *  'other_owner', 'world_writable', 'root_gateway', 'strict_policy', or ""
+   *  when no kind covers it (the row then shows the English reason). */
+  session_manager_plugin_refused_code?: string
+  /** For 'other_owner': the owning account's login name on the gateway's host,
+   *  or "" when that uid names no account there. */
+  session_manager_plugin_refused_owner?: string
+  /** For 'other_owner': the owning account's uid; otherwise null. */
+  session_manager_plugin_refused_owner_uid?: number | null
+  /** The same five fields for an `aws` CLI the gateway found and refused, set
+   *  only when credentials did not resolve. No command: none is known to clear it. */
+  aws_cli_refused_path?: string
+  aws_cli_refused_reason?: string
+  aws_cli_refused_code?: string
+  aws_cli_refused_owner?: string
+  aws_cli_refused_owner_uid?: number | null
 }
 
 /** One remote-instance provisioner the gateway offers, from
@@ -172,7 +196,15 @@ export function createCloudEndpoints({ get, post, del, j }: ClientTransport) {
       const s = p.toString()
       return get('/api/cloud/preflight' + (s ? '?' + s : '')).then(j) as Promise<CloudPreflight>
     },
-    cloudIamPolicy: () => get('/api/cloud/iam-policy').then(j) as Promise<{ policy: string }>,
+    // `host_policies` is a second launcher policy, present only when the edition
+    // attaches host policies to each instance role; `host_policies_notice` says how
+    // to apply it, `host_policies_error` why it could not be built.
+    cloudIamPolicy: () => get('/api/cloud/iam-policy').then(j) as Promise<{
+      policy: string
+      host_policies?: string
+      host_policies_notice?: string
+      host_policies_error?: string
+    }>,
     // Which provisioners this gateway offers. Answers on every platform (a Windows
     // host still lists the POSIX-only built-in, and refuses the launch itself), so
     // the setup tab can pick a form before it knows whether a launch would be

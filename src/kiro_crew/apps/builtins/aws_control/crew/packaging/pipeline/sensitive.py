@@ -12,7 +12,7 @@ import re
 from pathlib import Path, PurePosixPath
 
 #: Sensitive locations, for the standalone case where ``kiro_crew.security`` is not
-#: importable. Ported from ``security/paths.py:_SENSITIVE_HOME_DIRS``.
+#: importable. Ported from ``security/paths_lists.py:_SENSITIVE_HOME_DIRS``.
 #:
 #: This list exists because the alternative was worse. A fence conditional on an import is skipped
 #: entirely when the import failed, on the reasoning that reading the agent spec is the
@@ -38,6 +38,7 @@ _SENSITIVE_RELATIVE_DIRS = (
     ".claude/.credentials.json",
     ".codex/auth.json",
     ".config/gcloud",
+    ".copilot/config.json",
     ".config/goose/secrets.yaml",
     ".docker/config.json",
     ".dsh/.credentials.yaml",

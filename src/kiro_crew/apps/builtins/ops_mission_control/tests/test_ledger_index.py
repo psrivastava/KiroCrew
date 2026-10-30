@@ -7,15 +7,15 @@ scales:
 1. **Import is incremental.** A second import of an unchanged ledger must embed nothing.
    This is the whole difference between a 100k-entry ledger being usable and being a
    multi-hour stall on every dispatch cycle.
-2. **Embedding is deferred and batched.** One sweep per import, not one inference per
-   row.
+2. **Embedding is deferred.** Import writes NULL-vector rows and runs no sweep; the
+   gateway's paced repair loop embeds them.
 3. **Import is merge-only.** It must never tombstone a row another writer owns.
 4. **Nothing is fatal.** A broken store, a bad row, or a failed sweep degrades to "no
    semantic search", never to a failed cycle.
 
 A fake store is used rather than a real SQLite/FAISS pair: these assertions are about
-*how the adaptor calls the store*, and a fake is the only way to assert "embedded
-exactly once" or "never called with preserve_existing=False".
+*how the adaptor calls the store*, and a fake is the only way to assert "never
+sweeps" or "never called with preserve_existing=False".
 """
 
 from __future__ import annotations
@@ -25,6 +25,7 @@ import shutil
 import tempfile
 import time
 import unittest
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 from unittest import mock
@@ -57,7 +58,6 @@ class _FakeStore:
         if self._fail_backfill:
             raise RuntimeError("model unavailable")
         self.backfill_calls += 1
-        self.backfill_paced = pace
         return len(self.texts)
 
     def search_episodic(self, **kw: Any) -> list[dict]:
@@ -109,16 +109,11 @@ class TestIncrementalImport(_Env):
 
         first = ledger_index.import_pending(store)
         self.assertEqual(first["written"], 20)
-        self.assertEqual(store.backfill_calls, 1, "one batched sweep, not 20")
-        self.assertTrue(
-            store.backfill_paced,
-            "the only caller is the ledger-hygiene cron, which blocks but is "
-            "unattended, so the whole-corpus sweep must stay paced",
-        )
+        self.assertEqual(store.backfill_calls, 0, "the gateway repair loop embeds, not import")
 
         second = ledger_index.import_pending(store)
         self.assertEqual(second["written"], 0, "an unchanged ledger must re-embed nothing")
-        self.assertEqual(store.backfill_calls, 1, "no second sweep when nothing was written")
+        self.assertEqual(store.backfill_calls, 0, "import never runs an embedding sweep")
         self.assertEqual(len(store.writes), 20, "the store was not touched again")
 
     def test_only_new_entries_are_imported(self) -> None:
@@ -334,18 +329,21 @@ class TestNeverFatal(_Env):
         result = ledger_index.import_pending(_FakeStore(fail_write=True))
         self.assertEqual(result["written"], 0)
 
-    def test_a_failed_embedding_sweep_leaves_rows_written(self) -> None:
-        """Rows stay keyword-searchable; only vector search waits for the model."""
+    def test_import_writes_rows_without_an_embedding_sweep(self) -> None:
+        """Rows stay keyword-searchable with a NULL vector; the gateway's repair loop
+        embeds them later. The import must not call the sweep (its store has no
+        ``embed_fn``, so the sweep could only report 0) nor report an ``embedded``
+        count it cannot produce."""
         self._seed(2)
         store = _FakeStore(fail_backfill=True)
         result = ledger_index.import_pending(store)
-        self.assertEqual(result["written"], 2)
-        self.assertEqual(result["embedded"], 0)
+        self.assertEqual(result, {"scanned": 2, "written": 2, "skipped": 0})
+        self.assertEqual(store.backfill_calls, 0)
 
     def test_an_empty_ledger_is_a_quiet_noop(self) -> None:
         store = _FakeStore()
         result = ledger_index.import_pending(store)
-        self.assertEqual(result, {"scanned": 0, "written": 0, "skipped": 0, "embedded": 0})
+        self.assertEqual(result, {"scanned": 0, "written": 0, "skipped": 0})
         self.assertEqual(store.backfill_calls, 0)
 
 
@@ -385,13 +383,13 @@ class TestScale(_Env):
         for _ in range(4):
             total += ledger_index.import_pending(store, limit=500)["written"]
         self.assertEqual(total, 2000)
-        self.assertEqual(store.backfill_calls, 4, "one sweep per batch, not per row")
+        self.assertEqual(store.backfill_calls, 0, "import never runs an embedding sweep")
 
         # The property that matters: a full re-import after everything is indexed
         # costs zero embeddings.
         again = ledger_index.import_pending(store, limit=500)
         self.assertEqual(again["written"], 0)
-        self.assertEqual(store.backfill_calls, 4, "no extra sweep")
+        self.assertEqual(store.backfill_calls, 0, "no sweep")
 
     def test_cursor_stays_proportional_to_entry_count(self) -> None:
         """The cursor is the scaling risk: it must hold ids, never texts."""
@@ -476,32 +474,75 @@ class TestSemanticRecallWiring(_Env):
             store.close()
         return store, literal, semantic
 
-    def test_production_dispatch_uses_a_bounded_query_vector(self) -> None:
-        """Different wording wins semantically without an unbounded queue wait."""
+    def _dispatch_with_bounded_query_vector(
+        self, clock: Callable[[], float] = time.monotonic
+    ) -> None:
+        """Run production dispatch once and check the query vector's deadline.
+
+        The checks run AFTER dispatch, never inside the fake embedder:
+        ``_attach_similar_safely`` treats any embedder exception as "no vector" and
+        falls back to keyword recall, so a failed check raised inside the fake would
+        surface only as the literal match ranking first.
+        """
         from kiro_crew.apps.builtins.ops_mission_control.backend import dispatch
         from kiro_crew.embeddings import PRIORITY_INTERACTIVE, embedding_work
 
         store, _literal, semantic = self._real_store_with_semantic_pair()
-        self.assertEqual(dispatch._SIMILAR_QUERY_TIMEOUT_SECS, 5.0)
+        timeout = dispatch._SIMILAR_QUERY_TIMEOUT_SECS
+        self.assertEqual(timeout, 5.0)
+        calls: list[tuple[str, int, float | None, float]] = []
 
         def _query_vector(text: str, priority: int) -> list[float]:
             work = embedding_work.get()
-            self.assertIsNotNone(work, "dispatch must carry an explicit embedding deadline")
-            assert work is not None
-            remaining = work.deadline - time.monotonic()
-            self.assertGreater(remaining, 0.0)
-            self.assertLessEqual(remaining, dispatch._SIMILAR_QUERY_TIMEOUT_SECS)
-            self.assertEqual(priority, PRIORITY_INTERACTIVE)
-            self.assertEqual(text, "database outage")
+            calls.append((text, priority, None if work is None else work.deadline, clock()))
             return [1.0, 0.0]
 
+        before = clock()
         with mock.patch.object(store, "_try_embed", side_effect=_query_vector):
             with mock.patch("kiro_crew.vector_memory.VectorMemoryStore", return_value=store):
                 claimed = self._claimed(title="database outage", resource="")
                 dispatch._attach_similar_safely(claimed)
 
+        self.assertEqual(len(calls), 1, "the query is embedded exactly once")
+        text, priority, deadline, called_at = calls[0]
+        self.assertEqual(text, "database outage")
+        self.assertEqual(priority, PRIORITY_INTERACTIVE)
+        self.assertIsNotNone(deadline, "dispatch must carry an explicit embedding deadline")
+        assert deadline is not None
+        self.assertGreater(deadline, called_at, "the deadline is still ahead at the call")
+        # Compare the deadline with the same `clock + timeout` sum dispatch computes,
+        # not `deadline - now` with `timeout`: that subtraction can come out a few ulps
+        # above 5.0 when the clock has not ticked (Windows) near a power of two.
+        self.assertGreaterEqual(deadline, before + timeout)
+        self.assertLessEqual(deadline, called_at + timeout)
+
         self.assertTrue(claimed.similar)
         self.assertEqual(claimed.similar[0].entry_id, semantic.entry_id)
+
+    def test_production_dispatch_uses_a_bounded_query_vector(self) -> None:
+        """Different wording wins semantically without an unbounded queue wait."""
+        self._dispatch_with_bounded_query_vector()
+
+    def test_bounded_query_vector_check_holds_on_a_still_clock(self) -> None:
+        """A clock that does not tick, at a float edge, still passes the deadline checks.
+
+        Python 3.12 on Windows reads ``time.monotonic`` from a ~15.6 ms tick, so
+        dispatch and the check often read the same value. At 1019.003 s,
+        ``(t + 5.0) - t`` is 5.000000000000114, so a ``deadline - now <= 5.0``
+        check fails there even though dispatch set the deadline exactly 5 s out.
+        """
+        import pytest
+
+        from kiro_crew.apps.builtins.ops_mission_control.backend import dispatch
+        from kiro_crew.testing.clock import ManualClock
+
+        clock = ManualClock(monotonic_start=1019.003)
+        still = clock.monotonic()
+        self.assertEqual(clock.monotonic(), still, "probe: the clock does not tick")
+        self.assertGreater((still + 5.0) - still, 5.0, "probe: this value is an edge")
+        with pytest.MonkeyPatch.context() as mp:
+            clock.install(mp, dispatch)
+            self._dispatch_with_bounded_query_vector(clock.monotonic)
 
     def test_cold_embedder_keeps_keyword_fallback(self) -> None:
         """No query vector is an ordinary bounded fallback, not a failed claim."""
@@ -626,7 +667,7 @@ class TestLedgerMutationsAreLocked(_Env):
         """Drive the exact interleaving deterministically: a new entry is appended DURING
         hygiene's read, in the window `_write_all` would otherwise clobber.
 
-        A real thread race would be flaky; patching `read_entries_for_update` (the
+        A real thread race would be flaky; patching `_read_counted_for_update` (the
         mutation-path read hygiene starts from) to append-then-return reproduces it every
         run. The lock does not prevent the interleaving here (same process, re-entrant
         open) — the assertion is that the appended entry SURVIVES, which it cannot if
@@ -638,17 +679,17 @@ class TestLedgerMutationsAreLocked(_Env):
         ledger.upsert(LedgerEntry.create(pattern="original", fix="f"))
         latecomer = LedgerEntry.create(pattern="arrived during hygiene", fix="f2")
 
-        real_read = ledger.read_entries_for_update
+        real_read = ledger._read_counted_for_update
         fired = {"done": False}
 
         def read_then_append():
-            rows = real_read()
+            read = real_read()
             if not fired["done"]:
                 fired["done"] = True
                 ledger._append(latecomer)  # the concurrent POST
-            return rows
+            return read
 
-        with mock.patch.object(ledger, "read_entries_for_update", read_then_append):
+        with mock.patch.object(ledger, "_read_counted_for_update", read_then_append):
             ledger.hygiene()
 
         patterns = {e.pattern for e in ledger.read_entries()}
@@ -667,8 +708,13 @@ class TestLedgerMutationsAreLocked(_Env):
 
         from kiro_crew.apps.builtins.ops_mission_control.backend import ledger
 
-        for fn in (ledger.upsert, ledger.record_use, ledger.record_miss, ledger.remove,
-                   ledger.hygiene):
+        for fn in (
+            ledger.upsert,
+            ledger.record_use,
+            ledger.record_miss,
+            ledger.remove,
+            ledger.hygiene,
+        ):
             src = inspect.getsource(fn)
             self.assertIn(
                 "_LedgerLock()",

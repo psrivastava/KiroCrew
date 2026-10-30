@@ -46,7 +46,6 @@ from kiro_crew.messaging.turn_ceiling import (
     surface_of,
 )
 from kiro_crew.session import SessionManager
-from kiro_crew.slack.renderer import _split_trailing_word
 
 # ───────────────────────── behaviour ─────────────────────────
 
@@ -758,16 +757,19 @@ class TestDiscardingTheConversationReleasesTheLatch:
             ceiling.reset(key)
 
 
-class _HoldbackRenderer:
-    """A renderer double that keeps the product's OWN streaming contract.
+def _split_trailing_word(text: str) -> tuple[str, str]:
+    """Split off the run after the last whitespace, for the holdback double below."""
+    cut = max(text.rfind(" "), text.rfind("\n")) + 1
+    return text[:cut], text[cut:]
 
-    An append is final on the wire, so a throttled flush holds the trailing word
-    back rather than risk appending half of one. The rule here IS the Slack
-    renderer's ``_split_trailing_word``, imported rather than restated, so the
-    double cannot drift into a friendlier contract than production has. Only the
-    final flush in ``on_done`` releases a held tail; ``close()`` tears the turn
-    down and flushes nothing, which is exactly what production's ``close()``
-    does.
+
+class _HoldbackRenderer:
+    """A renderer double with the strictest streaming contract a channel may have.
+
+    An append is final on the wire, so a streaming renderer may hold the
+    trailing word back rather than risk appending half of one, and release it
+    only at the final flush in ``on_done``; ``close()`` tears the turn down and
+    flushes nothing. A notice must arrive whole even through such a renderer.
     """
 
     def __init__(self, *, fail_on_done: bool = False) -> None:
@@ -929,22 +931,27 @@ class TestTheNoticeDoesNotAnswerItsOwnReflection:
 GATED = {
     "messaging/dispatch.py",
     "slack/transport_dispatch.py",
-    "slack/handler.py",
-    "telegram/transport_dispatch.py",
+    "slack/handler_runtime/turn.py",
+    "telegram/dispatch/turn_engine.py",
 }
 
 #: Turn sites that must NOT compose the ceiling, each with the reason. A reason
 #: is required because an unexplained exemption is how a channel goes unbounded.
 EXEMPT = {
-    "dashboard/chat_runner.py": (
+    "dashboard/chat_turn/turn_dispatch_gates.py": (
         "dashboard turns are driven by a human watching and clicking through them"
     ),
-    "slack/gateway.py": (
+    "dashboard/chat_turn/turn_entry.py": (
+        "dashboard turns are driven by a human watching and clicking through them"
+    ),
+    "slack/gateway_runtime/nudge_channel_fire.py": (
         "generates nudge turns rather than receiving them, and dispatches each "
         "through a channel's own gated dispatcher inside "
         "turn_ceiling.generated_turn, which is where the exemption is decided"
     ),
-    "session.py": "forwards to the gate's definition rather than opening a channel turn",
+    "session_parts/claims.py": (
+        "forwards to the gate's definition rather than opening a channel turn"
+    ),
 }
 
 
@@ -1061,7 +1068,7 @@ def test_every_exemption_states_a_reason() -> None:
 #:
 #: Slack is absent on purpose: its dispatcher builds its own driver and never
 #: consults ``delivery_is_muted``, so it has no substitute to miss.
-MUTE_AWARE = ("messaging/dispatch.py", "telegram/transport_dispatch.py")
+MUTE_AWARE = ("messaging/dispatch.py", "telegram/dispatch/turn_engine.py")
 
 
 def _muted_renderer_name(tree: ast.Module) -> str:
@@ -1118,7 +1125,12 @@ def test_a_gated_site_leaves_no_progress_block_behind(relative: str) -> None:
     if "_working_ts = await" not in text:
         return
     branch = _ceiling_branch_source(ast.parse(text))
-    assert "delete_message(channel, _working_ts)" in branch, (
+    # The Slack turn routes the delete through its shared helper, which deletes
+    # the same block (``_SlackTurn.clear_working_indicators`` reads ``_working_ts``).
+    assert (
+        "delete_message(channel, _working_ts)" in branch
+        or "turn.clear_working_indicators()" in branch
+    ), (
         f"{relative} posts a working block before the gate but its ceiling "
         "branch returns without deleting it"
     )

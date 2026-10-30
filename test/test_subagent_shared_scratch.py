@@ -606,6 +606,7 @@ class TestAnInheritingRuntimeJoinsTheMarkerOnceLive:
         calls: list[tuple[str, Path, int]] = []
         fake_scratch = SimpleNamespace(
             allocate_scratch=lambda _label: None,
+            drop_inherited_scratch_env=lambda env: (),
             shared_scratch_window=lambda path: path,
             record_owner=lambda path, pid: calls.append(("record", path, pid)) or "recorded",
             adopt_owner=lambda path, pid: calls.append(("adopt", path, pid)) or adopt_outcome,
@@ -746,17 +747,26 @@ class TestSpawnsOnBehalfOfAParent:
             p.cwd = ""
             return p
 
-        factory = MagicMock(side_effect=lambda *a, **kw: _provider())
+        built: list[MagicMock] = []
+
+        def _build(*_a: object, **_kw: object) -> MagicMock:
+            built.append(_provider())
+            return built[-1]
+
+        factory = MagicMock(side_effect=_build)
         with patch("kiro_crew.session.default_project_dir", return_value=""):
             mgr = SessionManager(cfg, provider_factory=factory)
-        mgr._drain_and_claim = AsyncMock(return_value=_provider())
+        pooled = _provider()
+        mgr._drain_and_claim = AsyncMock(return_value=pooled)
         mgr._schedule_replenish = MagicMock()
         tree = tmp_path / "scratch" / "runtime-abcdef01"
         try:
-            await mgr.get_or_create("subagent:s1", agent="kirocrew", shared_scratch=tree)
+            got = await mgr.get_or_create("subagent:s1", agent="kirocrew", shared_scratch=tree)
         finally:
             await mgr.close_all()
 
+        # The session runs on a freshly built provider, never the pooled one.
+        assert got[0] is built[0] and got[0] is not pooled
         mgr._drain_and_claim.assert_not_awaited()
         factory.assert_called_once()
         assert factory.call_args.kwargs["shared_scratch"] == tree
@@ -999,6 +1009,9 @@ class TestBgRuntimeSuccessorInheritsTheTree:
 
         assert ctor.call_count == 1
         assert ctor.call_args.kwargs["shared_scratch"] == tree
+        # The stale runtime drains while its successor takes the slot.
+        assert mgr._bg_runtime is fresh
+        assert mgr._draining_bg_runtimes == [stale]
         mgr._draining_bg_runtimes = []
         await mgr.close_all()
 
@@ -1034,6 +1047,7 @@ class TestBgRuntimeSuccessorInheritsTheTree:
 
         assert ctor.call_count == 1
         assert ctor.call_args.kwargs["shared_scratch"] == tree
+        assert mgr._bg_runtime is fresh
         await mgr.close_all()
 
     @pytest.mark.asyncio
@@ -1240,16 +1254,16 @@ class TestEveryProcessSpawnSeamIsAccountedFor:
         the parent-side collectors that feed the dedicated and pooled arms
         name the key too."""
         from kiro_crew import session_allocation
-        from kiro_crew.config import loader
+        from kiro_crew.config import loader_config
         from kiro_crew.providers import acp as acp_provider
-        from kiro_crew.subagent_manager import run as sub_run
+        from kiro_crew.subagent_manager import run_turn as sub_run
 
         assert '"shared_scratch": shared_scratch' in inspect.getsource(acp_provider.AcpProvider)
         assert 'kwargs["shared_scratch"]' in inspect.getsource(
             session_allocation._collect_parent_runtime_kwargs
         )
         assert 'extra_kwargs["shared_scratch"]' in inspect.getsource(sub_run)
-        assert "shared_scratch=shared_scratch" in inspect.getsource(loader)
+        assert "shared_scratch=shared_scratch" in inspect.getsource(loader_config)
 
     def test_the_standalone_list_names_only_files_that_still_construct(self) -> None:
         rels = {rel for rel, _ in self._constructions()}
