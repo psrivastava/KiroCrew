@@ -14,6 +14,10 @@ from kiro_crew.acp.client import AcpClient
 from kiro_crew.cron import CronJob, CronService
 from kiro_crew.heartbeat import _HEADER, HeartbeatService
 
+#: These tests fire cron jobs through the due-scan, which defers firings while
+#: the host's memory posture is critical (see ``ample_host_free_memory``).
+pytestmark = pytest.mark.usefixtures("ample_host_free_memory")
+
 
 async def _wait_for(predicate, timeout=5.0, interval=0.05):
     """Poll until predicate is true or timeout."""
@@ -69,6 +73,8 @@ class TestCronNonBlocking:
         await _wait_for(lambda: "ok" in executed)
         fail_job = next(j for j in svc._jobs if j.name == "fail")
         await _wait_for(lambda: fail_job.last_status == "error")
+        assert executed == ["ok"]
+        assert "boom" in (fail_job.last_error or "")
         await svc.stop()
 
     @pytest.mark.asyncio
@@ -90,11 +96,10 @@ class TestCronNonBlocking:
         # pre-run state — the disk assertion below would then read a store that
         # was never written. The task completes only after that offloaded merge
         # returns, making it the one signal that actually implies the write.
-        task = svc._running_tasks[job_id]
+        task = svc._claims[job_id].task
         await task
         assert svc._jobs[0].last_status == "ok"
 
-        # Reload from disk and verify
         svc2 = CronService(base_dir=tmp_path)
         svc2._load()
         assert svc2._jobs[0].last_status == "ok"
@@ -115,9 +120,9 @@ class TestCronNonBlocking:
 
         await svc._on_timer()
         job_id = svc._jobs[0].id
-        assert job_id in svc._running_tasks
+        assert svc._claims[job_id].task is not None
         gate.set()
-        await _wait_for(lambda: job_id not in svc._running_tasks)
+        await _wait_for(lambda: job_id not in svc._claims)
         await svc.stop()
 
 
@@ -128,7 +133,7 @@ class TestArmTimer:
     async def test_arm_timer_always_arms(self, tmp_path: Path) -> None:
         svc = CronService(base_dir=tmp_path)
         svc._running = True
-        svc._executing.add("some_job")
+        svc._claim_run("some_job", "scheduled")
 
         svc._arm_timer()
         assert svc._timer_task is not None
@@ -179,7 +184,6 @@ class TestHeartbeatParallel:
             await asyncio.sleep(0.5)
 
         svc = HeartbeatService(memory=MagicMock(), on_task=on_task)
-        # Write 3 tasks
         hb_path = tmp_path / "HEARTBEAT.md"
         hb_path.write_text(_HEADER + "- task1\n- task2\n- task3\n")
 

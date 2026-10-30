@@ -274,6 +274,9 @@ class TestTheFlagAlsoReachesOpenClients:
 
         await _drive(state, slot, _events(""))
 
+        rows = _tool_rows(slot)
+        assert rows, "the ordinary call still left its tool row"
+        assert not [r for r in rows if (r.get("meta") or {}).get(META_KEY)]
         assert not [
             c
             for c in state.broadcast_ws.call_args_list
@@ -625,7 +628,7 @@ class TestTheClaimIsReadWithTheKeyItWasWrittenUnder:
         monkeypatch.setattr(
             chat_persistence,
             "_prefetch_rehydrate_inputs",
-            lambda *a, **k: ({"linked_session_key": linked}, True, [{}], {}, None, None),
+            lambda *a, **k: ({"linked_session_key": linked}, True, [{}], {}, None, None, False),
         )
         monkeypatch.setattr(chat_persistence, "slot_closed_since", lambda *a, **k: False)
         monkeypatch.setattr(chat_persistence, "_deletion_during_read", lambda *a, **k: None)
@@ -665,7 +668,7 @@ class TestTheClaimIsReadWithTheKeyItWasWrittenUnder:
         monkeypatch.setattr(
             chat_persistence,
             "_prefetch_rehydrate_inputs",
-            lambda *a, **k: ({}, True, [{}], {}, None, None),
+            lambda *a, **k: ({}, True, [{}], {}, None, None, False),
         )
         monkeypatch.setattr(chat_persistence, "slot_closed_since", lambda *a, **k: False)
         monkeypatch.setattr(chat_persistence, "_deletion_during_read", lambda *a, **k: None)
@@ -761,7 +764,7 @@ class TestTargetedRehydrationRecoversToo:
         monkeypatch.setattr(
             chat_persistence,
             "_prefetch_rehydrate_inputs",
-            lambda *a, **k: ({"title": "t"}, True, [{}], {}, None, None),
+            lambda *a, **k: ({"title": "t"}, True, [{}], {}, None, None, False),
         )
         monkeypatch.setattr(chat_persistence, "slot_closed_since", lambda *a, **k: False)
         monkeypatch.setattr(chat_persistence, "_deletion_during_read", lambda *a, **k: None)
@@ -854,7 +857,7 @@ class TestNoAwaitSeparatesTheDeletionCheckFromTheBuild:
         monkeypatch.setattr(
             chat_persistence,
             "_prefetch_rehydrate_inputs",
-            lambda *a, **k: ({"title": "t"}, True, [{}], {}, None, None),
+            lambda *a, **k: ({"title": "t"}, True, [{}], {}, None, None, False),
         )
         monkeypatch.setattr(chat_persistence, "slot_closed_since", lambda *a, **k: False)
         monkeypatch.setattr(

@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from aiohttp import web
 from body_stream_helpers import attach_body
+from dashboard_owner_helpers import owner_claims
 
 from kiro_crew.platform.interfaces import McpScope
+from kiro_crew.testing.wait import await_until
 
 
 class _NoSyncLock:
@@ -31,10 +34,14 @@ def _make_request(body: dict) -> MagicMock:
     """
     state = MagicMock()
     state._background_tasks = set()
+    # ``POST /api/mcp/apply`` is owner-gated
+    # (``handlers._shared.require_owner_dashboard_request``): ``owner_id == ""``
+    # plus the signed local bootstrap subject is the standalone-local owner shape.
+    state.owner_id = ""
     request = MagicMock(spec=web.Request)
     request.app = {"state": state}
     attach_body(request, body)
-    return request
+    return owner_claims(request)
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +146,37 @@ class TestSetScopeEntry:
         assert not kpath.exists()
 
 
+# A hand-edited mcp.json saved in a legacy code page (Notepad "ANSI", any
+# latin-1 editor): one accented character is not valid UTF-8.
+_LATIN1_MCP_JSON = '{"mcpServers": {"x": {"command": "caf\xe9"}}}'.encode("latin-1")
+
+
+class TestLoadJsonOrEmptyUndecodable:
+    def test_non_utf8_file_reads_as_empty(self, tmp_path):
+        from kiro_crew.dashboard.handlers import mcp as mcp_mod
+
+        path = tmp_path / "mcp.json"
+        path.write_bytes(_LATIN1_MCP_JSON)
+        try:
+            data = mcp_mod._load_json_or_empty(path)
+        except UnicodeDecodeError as exc:
+            pytest.fail(f"an undecodable config escaped the helper: {exc!r}")
+        assert data == {}
+
+    def test_write_to_non_utf8_file_leaves_it_untouched(self, tmp_path, monkeypatch):
+        """Reading the file as empty must not let a writer replace it with
+        just the new entry: the JSONC check before every write still cannot
+        decode it, so the write is refused and the user's bytes stay."""
+        from kiro_crew.dashboard.handlers import mcp as mcp_mod
+
+        path = tmp_path / "mcp.json"
+        path.write_bytes(_LATIN1_MCP_JSON)
+        monkeypatch.setattr(mcp_mod, "_KIROCREW_MCP_JSON", path)
+        with pytest.raises(UnicodeDecodeError):
+            mcp_mod._set_kirocrew_entry("srv", enabled=True, spec={"command": "c"})
+        assert path.read_bytes() == _LATIN1_MCP_JSON
+
+
 # ---------------------------------------------------------------------------
 # api_mcp_apply: preservation rule + batched writes
 # ---------------------------------------------------------------------------
@@ -170,8 +208,11 @@ class TestApplyEndpoint:
             "_find_server_spec_anywhere",
             lambda name: ({"command": "slack", "args": []} if name == "slack-mcp" else None),
         )
-        # Stub rebuild_agent_config — we only care about file writes here.
-        monkeypatch.setattr("kiro_crew.dashboard.handlers.mcp.rebuild_agent_config", lambda: None)
+        # Stub the spec rebuild — we only care about file writes here.
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.handlers.mcp.rebuild_agent_config_reporting",
+            lambda: (Path(), True),
+        )
 
         # No-op the lock to simplify testing.
         class _NoLock:
@@ -231,7 +272,10 @@ class TestApplyEndpoint:
             lambda: MagicMock(**{"available.return_value": False}),
         )
 
-        monkeypatch.setattr("kiro_crew.dashboard.handlers.mcp.rebuild_agent_config", lambda: None)
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.handlers.mcp.rebuild_agent_config_reporting",
+            lambda: (Path(), True),
+        )
 
         class _NoLock:
             async def __aenter__(self):
@@ -252,6 +296,254 @@ class TestApplyEndpoint:
             assert "foo" not in data["mcpServers"], f"foo still in {p}"
 
     @pytest.mark.asyncio
+    async def test_ambiguous_uninstall_is_refused_before_any_side_effect(
+        self, tmp_path, monkeypatch
+    ):
+        """``team/foo`` and ``other:team/foo`` both alias to ``team-foo`` and
+        neither is keyed so: no scope can say which entry the row is. The whole
+        apply is refused as a request failure (409, an ``error`` the table shows
+        while keeping the pending change) BEFORE Phase 1 -- the companion package
+        is not uninstalled, no file changes, nothing is logged as an uninstall.
+        Red before Phase 0: the companion uninstall ran, the scope answered
+        ``ambiguous`` inside an ``ok: true`` response the table read as applied,
+        and ``mcp_uninstall`` was logged ``ok`` with both configurations kept."""
+        from kiro_crew.dashboard.handlers import mcp as mcp_mod
+
+        mc_path = tmp_path / "kirocrew.mcp.json"
+        kiro_path = tmp_path / "kiro_global.json"
+        cc_path = tmp_path / "cc_global.json"
+        mc_path.write_text(json.dumps({"mcpServers": {"other": {"command": "o"}}}))
+        kiro_path.write_text(
+            json.dumps(
+                {"mcpServers": {"team/foo": {"command": "a"}, "other:team/foo": {"command": "b"}}}
+            )
+        )
+        cc_path.write_text(json.dumps({"mcpServers": {}}))
+        before = {p: p.read_bytes() for p in (mc_path, kiro_path, cc_path)}
+        monkeypatch.setattr(mcp_mod, "_KIROCREW_MCP_JSON", mc_path)
+        monkeypatch.setattr(mcp_mod, "_GLOBAL_MCP_JSON", kiro_path)
+        monkeypatch.setattr(mcp_mod, "_extra_mcp_scopes", lambda: [McpScope("cc", cc_path, None)])
+        monkeypatch.setattr(mcp_mod, "kiro_agents_dir", lambda: tmp_path / "agents")
+        manager = MagicMock(**{"available.return_value": True})
+        manager.uninstall_mcp = AsyncMock(
+            side_effect=AssertionError("companion uninstall ran for a refused change")
+        )
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.handlers._shared._capability_manager", lambda: manager
+        )
+        rebuild = MagicMock(return_value=(Path(), True))
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.handlers.mcp.rebuild_agent_config_reporting", rebuild
+        )
+        sel = MagicMock()
+        monkeypatch.setattr(mcp_mod, "sel", lambda: sel)
+
+        class _NoLock:
+            async def __aenter__(self):
+                pass
+
+            async def __aexit__(self, *a):
+                pass
+
+        monkeypatch.setattr(mcp_mod, "_get_mcp_lock", lambda: _NoLock())
+
+        request = _make_request(
+            {
+                "changes": [
+                    {"name": "team-foo", "uninstall": True},
+                    {"name": "other", "uninstall": True},
+                ]
+            }
+        )
+        resp = await mcp_mod.api_mcp_apply(request)
+        assert resp.status == 409
+        body = json.loads(resp.body)
+        assert body["error"].startswith(
+            "apply refused: 'team-foo' is the alias of several entries in kiroGlobal"
+        )
+        assert body["ambiguous"] == {"team-foo": ["kiroGlobal"]}
+        assert body["code"] == "mcp_server_name_ambiguous"
+        assert "ok" not in body and "results" not in body
+        manager.uninstall_mcp.assert_not_called()
+        rebuild.assert_not_called()
+        # Nothing moved -- the second change in the same request included.
+        for p, raw in before.items():
+            assert p.read_bytes() == raw, p
+        ops = [c.kwargs.get("operation") for c in sel.log_api_access.call_args_list]
+        assert "mcp_uninstall" not in ops
+        assert ops == ["mcp_apply_rejected_ambiguous"]
+        assert sel.log_api_access.call_args.kwargs["outcome"] == "denied"
+
+    @pytest.mark.asyncio
+    async def test_an_ambiguous_scope_toggle_is_refused_before_any_write(
+        self, tmp_path, monkeypatch
+    ):
+        """The refusal covers every change, not only uninstalls: a scope toggle
+        whose name is the alias of several raw keys in the Kiro-global file is a
+        409 before the first scope write. Red under the uninstall-only pre-check:
+        the store write landed, the global answered ``ambiguous`` inside an
+        ``ok: true`` response, and the table cleared the pending change."""
+        from kiro_crew.dashboard.handlers import mcp as mcp_mod
+
+        mc_path = tmp_path / "kirocrew.mcp.json"
+        kiro_path = tmp_path / "kiro_global.json"
+        mc_path.write_text(json.dumps({"mcpServers": {}}))
+        kiro_path.write_text(
+            json.dumps(
+                {"mcpServers": {"team/foo": {"command": "a"}, "other:team/foo": {"command": "b"}}}
+            )
+        )
+        before = {p: p.read_bytes() for p in (mc_path, kiro_path)}
+        monkeypatch.setattr(mcp_mod, "_KIROCREW_MCP_JSON", mc_path)
+        monkeypatch.setattr(mcp_mod, "_GLOBAL_MCP_JSON", kiro_path)
+        monkeypatch.setattr(mcp_mod, "_extra_mcp_scopes", list)
+        monkeypatch.setattr(mcp_mod, "kiro_agents_dir", lambda: tmp_path / "agents")
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.handlers._shared._capability_manager",
+            lambda: MagicMock(**{"available.return_value": False}),
+        )
+        rebuild = MagicMock(return_value=(Path(), True))
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.handlers.mcp.rebuild_agent_config_reporting", rebuild
+        )
+        sel = MagicMock()
+        monkeypatch.setattr(mcp_mod, "sel", lambda: sel)
+
+        class _NoLock:
+            async def __aenter__(self):
+                pass
+
+            async def __aexit__(self, *a):
+                pass
+
+        monkeypatch.setattr(mcp_mod, "_get_mcp_lock", lambda: _NoLock())
+
+        request = _make_request(
+            {"changes": [{"name": "team-foo", "kirocrew": True, "kiroGlobal": True}]}
+        )
+        resp = await mcp_mod.api_mcp_apply(request)
+        assert resp.status == 409
+        body = json.loads(resp.body)
+        assert body["code"] == "mcp_server_name_ambiguous"
+        assert body["ambiguous"] == {"team-foo": ["kiroGlobal"]}
+        for p, raw in before.items():
+            assert p.read_bytes() == raw, p
+        rebuild.assert_not_called()
+        ops = [c.kwargs.get("operation") for c in sel.log_api_access.call_args_list]
+        assert ops == ["mcp_apply_rejected_ambiguous"]
+
+    @pytest.mark.asyncio
+    async def test_a_commented_scope_file_is_refused_before_any_write(self, tmp_path, monkeypatch):
+        """Writers emit plain JSON, so a scope file with comments would lose them:
+        the whole batch is a 409 before its first write, and no file changes."""
+        from kiro_crew.dashboard.handlers import mcp as mcp_mod
+
+        mc_path = tmp_path / "kirocrew.mcp.json"
+        kiro_path = tmp_path / "kiro_global.json"
+        mc_path.write_text(json.dumps({"mcpServers": {"srv": {"command": "a"}}}))
+        kiro_path.write_text('{\n  "mcpServers": {\n    // "parked": {"command": "p"}\n  }\n}\n')
+        before = {p: p.read_bytes() for p in (mc_path, kiro_path)}
+        monkeypatch.setattr(mcp_mod, "_KIROCREW_MCP_JSON", mc_path)
+        monkeypatch.setattr(mcp_mod, "_GLOBAL_MCP_JSON", kiro_path)
+        monkeypatch.setattr(mcp_mod, "_extra_mcp_scopes", list)
+        monkeypatch.setattr(mcp_mod, "kiro_agents_dir", lambda: tmp_path / "agents")
+        rebuild = MagicMock(return_value=(Path(), True))
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.handlers.mcp.rebuild_agent_config_reporting", rebuild
+        )
+        monkeypatch.setattr(mcp_mod, "sel", lambda: MagicMock())
+
+        request = _make_request(
+            {"changes": [{"name": "srv", "kirocrew": False, "kiroGlobal": True}]}
+        )
+        with pytest.raises(mcp_mod.McpConfigHasComments) as excinfo:
+            await mcp_mod.api_mcp_apply(request)
+
+        assert excinfo.value.status == 409
+        assert json.loads(excinfo.value.text)["code"] == mcp_mod.MCP_CONFIG_HAS_COMMENTS
+        for p, raw in before.items():
+            assert p.read_bytes() == raw, p
+        rebuild.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_config_edited_between_pin_and_purge_changes_nothing_about_the_removal(
+        self, tmp_path, monkeypatch
+    ):
+        """Phase 0 pins the raw key every scope holds for the row; Phase 2 removes
+        exactly those pinned entries and never resolves again. So an edit that
+        lands between the two -- here a second server ``other:team/foo`` whose
+        alias collides with the row -- cannot change what the request removes:
+        the pinned ``npm:@team/foo`` goes, the newcomer stays, the response reads
+        ``kiroGlobal: removed`` with no error and the uninstall is logged ``ok``.
+        Red under resolve-at-purge: the scope answered ``ambiguous`` after the
+        companion package was already gone, and the pinned entry stayed."""
+        from kiro_crew.dashboard.handlers import mcp as mcp_mod
+
+        mc_path = tmp_path / "kirocrew.mcp.json"
+        kiro_path = tmp_path / "kiro_global.json"
+        mc_path.write_text(json.dumps({"mcpServers": {}}))
+        kiro_path.write_text(json.dumps({"mcpServers": {"npm:@team/foo": {"command": "a"}}}))
+        monkeypatch.setattr(mcp_mod, "_KIROCREW_MCP_JSON", mc_path)
+        monkeypatch.setattr(mcp_mod, "_GLOBAL_MCP_JSON", kiro_path)
+        monkeypatch.setattr(mcp_mod, "_extra_mcp_scopes", list)
+        monkeypatch.setattr(mcp_mod, "kiro_agents_dir", lambda: tmp_path / "agents")
+
+        real_preflight = mcp_mod._preflight_change_keys
+
+        def pin_then_edit(names):
+            keys, ambiguous = real_preflight(names)
+            # The concurrent edit: a distinct server whose alias collides lands
+            # after the pin and before the purge.
+            kiro_path.write_text(
+                json.dumps(
+                    {
+                        "mcpServers": {
+                            "npm:@team/foo": {"command": "a"},
+                            "other:team/foo": {"command": "b"},
+                        }
+                    }
+                )
+            )
+            return keys, ambiguous
+
+        monkeypatch.setattr(mcp_mod, "_preflight_change_keys", pin_then_edit)
+        manager = MagicMock(**{"available.return_value": True})
+        manager.uninstall_mcp = AsyncMock(return_value=MagicMock(ok=True))
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.handlers._shared._capability_manager", lambda: manager
+        )
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.handlers.mcp.rebuild_agent_config_reporting",
+            lambda: (Path(), True),
+        )
+        sel = MagicMock()
+        monkeypatch.setattr(mcp_mod, "sel", lambda: sel)
+
+        class _NoLock:
+            async def __aenter__(self):
+                pass
+
+            async def __aexit__(self, *a):
+                pass
+
+        monkeypatch.setattr(mcp_mod, "_get_mcp_lock", lambda: _NoLock())
+
+        request = _make_request({"changes": [{"name": "team-foo", "uninstall": True}]})
+        resp = await mcp_mod.api_mcp_apply(request)
+        assert resp.status == 200
+        body = json.loads(resp.body)
+        (result,) = body["results"]
+        assert result["actions"] == {
+            "kirocrew": "noop",
+            "kiroGlobal": "removed",
+            "capability": "uninstalled",
+        }
+        assert "error" not in result
+        assert set(json.loads(kiro_path.read_text())["mcpServers"]) == {"other:team/foo"}
+        ops = [c.kwargs.get("operation") for c in sel.log_api_access.call_args_list]
+        assert ops == ["mcp_uninstall"]
+
+    @pytest.mark.asyncio
     async def test_calls_rebuild_agent_config_once(self, tmp_path, monkeypatch):
         from kiro_crew.dashboard.handlers import mcp as mcp_mod
 
@@ -268,8 +560,10 @@ class TestApplyEndpoint:
             lambda: MagicMock(**{"available.return_value": False}),
         )
 
-        rebuild = MagicMock()
-        monkeypatch.setattr("kiro_crew.dashboard.handlers.mcp.rebuild_agent_config", rebuild)
+        rebuild = MagicMock(return_value=(Path(), True))
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.handlers.mcp.rebuild_agent_config_reporting", rebuild
+        )
 
         class _NoLock:
             async def __aenter__(self):
@@ -296,6 +590,35 @@ class TestApplyEndpoint:
         assert body["applied"] == 3
         assert rebuild.call_count == 1  # rebuild called ONCE after all edits
         assert body["rebuild"]["ok"] is True
+
+    @pytest.mark.asyncio
+    async def test_a_declined_rebuild_reports_rebuild_not_ok(self, tmp_path, monkeypatch):
+        """The guard refused the write: the change is saved but not live, so say so."""
+        from kiro_crew.dashboard.handlers import mcp as mcp_mod
+        from kiro_crew.dashboard.handlers._shared import AGENT_SPEC_NOT_REWRITTEN
+
+        monkeypatch.setattr(mcp_mod, "_KIROCREW_MCP_JSON", tmp_path / "mc.json")
+        monkeypatch.setattr(mcp_mod, "_GLOBAL_MCP_JSON", tmp_path / "kiro.json")
+        monkeypatch.setattr(mcp_mod, "_extra_mcp_scopes", lambda: [])
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.handlers.mcp.rebuild_agent_config_reporting",
+            lambda: (Path(), False),
+        )
+
+        class _NoLock:
+            async def __aenter__(self):
+                pass
+
+            async def __aexit__(self, *a):
+                pass
+
+        monkeypatch.setattr(mcp_mod, "_get_mcp_lock", lambda: _NoLock())
+        monkeypatch.setattr(mcp_mod, "_find_server_spec_anywhere", lambda n: {"command": "x"})
+
+        request = _make_request({"changes": [{"name": "a", "kirocrew": True}]})
+        body = json.loads((await mcp_mod.api_mcp_apply(request)).body)
+        assert body["applied"] == 1
+        assert body["rebuild"] == {"ok": False, "error": AGENT_SPEC_NOT_REWRITTEN}
 
 
 # ---------------------------------------------------------------------------
@@ -347,8 +670,10 @@ class TestHostileNameRejection:
             lambda: pytest.fail("_capability_manager must not be reached for invalid name"),
         )
 
-        rebuild = MagicMock()
-        monkeypatch.setattr("kiro_crew.dashboard.handlers.mcp.rebuild_agent_config", rebuild)
+        rebuild = MagicMock(return_value=(Path(), True))
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.handlers.mcp.rebuild_agent_config_reporting", rebuild
+        )
 
         class _NoLock:
             async def __aenter__(self):
@@ -395,7 +720,10 @@ class TestHostileNameRejection:
             lambda: MagicMock(**{"available.return_value": False}),
         )
 
-        monkeypatch.setattr("kiro_crew.dashboard.handlers.mcp.rebuild_agent_config", lambda: None)
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.handlers.mcp.rebuild_agent_config_reporting",
+            lambda: (Path(), True),
+        )
 
         class _NoLock:
             async def __aenter__(self):
@@ -490,7 +818,10 @@ class TestApplyAcceptsAppProvidedName:
             "kiro_crew.dashboard.handlers._shared._capability_manager",
             lambda: MagicMock(**{"available.return_value": False}),
         )
-        monkeypatch.setattr("kiro_crew.dashboard.handlers.mcp.rebuild_agent_config", lambda: None)
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.handlers.mcp.rebuild_agent_config_reporting",
+            lambda: (Path(), True),
+        )
 
         class _NoLock:
             async def __aenter__(self):
@@ -529,9 +860,12 @@ def _make_stub_request(body: dict) -> MagicMock:
     state = SimpleNamespace(_mcp_gateway_apply_stub=None)
     request = MagicMock(spec=web.Request)
     request.app = {"state": state}
-    request.get = MagicMock(return_value="dashboard")
     attach_body(request, body)
-    return request
+    # ``POST /api/mcp-gateway/servers/stub`` is owner-gated
+    # (``handlers._shared.require_owner_dashboard_request``). ``state`` declares no
+    # ``owner_id``, which the predicate reads as the standalone-local shape, so the
+    # signed local bootstrap subject ``owner_claims`` installs IS the owner here.
+    return owner_claims(request)
 
 
 class TestApplyBodyCeiling:
@@ -587,7 +921,15 @@ class TestSetStubNameGate:
         monkeypatch.setattr(loader_mod, "config_path", lambda: cfg)
         monkeypatch.setattr(mcp_mod, "_local_overlay_section", lambda: {})
 
-        request = _make_stub_request({"name": "auto-improvement:auto-improvement", "stub": True})
+        from kiro_crew.mcp_gateway import launch_approval
+
+        name = "auto-improvement:auto-improvement"
+        expected_launch = launch_approval.launch_pair(
+            launch_approval.hash_command(name, []), launch_approval.env_fingerprint({})
+        )
+        request = _make_stub_request(
+            {"name": name, "stub": True, "expected_launch": expected_launch}
+        )
         resp = await mcp_mod.api_mcp_gateway_set_stub(request)
         body = json.loads(resp.body)
 
@@ -665,7 +1007,10 @@ class TestApplyBatchCap:
         monkeypatch.setattr(mcp_mod, "_KIROCREW_MCP_JSON", tmp_path / "kc.json")
         monkeypatch.setattr(mcp_mod, "_GLOBAL_MCP_JSON", tmp_path / "kiro.json")
         monkeypatch.setattr(mcp_mod, "_extra_mcp_scopes", lambda: [])
-        monkeypatch.setattr("kiro_crew.dashboard.handlers.mcp.rebuild_agent_config", lambda: None)
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.handlers.mcp.rebuild_agent_config_reporting",
+            lambda: (Path(), True),
+        )
 
         class _NoLock:
             async def __aenter__(self):
@@ -753,7 +1098,10 @@ class TestBoundedCapabilityManager:
         monkeypatch.setattr(mcp_mod, "_KIROCREW_MCP_JSON", tmp_path / "kc.json")
         monkeypatch.setattr(mcp_mod, "_GLOBAL_MCP_JSON", tmp_path / "kiro.json")
         monkeypatch.setattr(mcp_mod, "_extra_mcp_scopes", lambda: [])
-        monkeypatch.setattr("kiro_crew.dashboard.handlers.mcp.rebuild_agent_config", lambda: None)
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.handlers.mcp.rebuild_agent_config_reporting",
+            lambda: (Path(), True),
+        )
 
         class _NoLock:
             async def __aenter__(self):
@@ -793,7 +1141,10 @@ class TestBoundedCapabilityManager:
         monkeypatch.setattr(mcp_mod, "_KIROCREW_MCP_JSON", tmp_path / "kc.json")
         monkeypatch.setattr(mcp_mod, "_GLOBAL_MCP_JSON", tmp_path / "kiro.json")
         monkeypatch.setattr(mcp_mod, "_extra_mcp_scopes", lambda: [])
-        monkeypatch.setattr("kiro_crew.dashboard.handlers.mcp.rebuild_agent_config", lambda: None)
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.handlers.mcp.rebuild_agent_config_reporting",
+            lambda: (Path(), True),
+        )
         # Tiny budget so the hanging op blows the phase deadline immediately.
         from kiro_crew.platform import capability_bound
 
@@ -849,7 +1200,10 @@ class TestUninstallCrashWindowCleanup:
         monkeypatch.setattr(mcp_mod, "_KIROCREW_MCP_JSON", tmp_path / "kc.json")
         monkeypatch.setattr(mcp_mod, "_GLOBAL_MCP_JSON", kiro_path)
         monkeypatch.setattr(mcp_mod, "_extra_mcp_scopes", lambda: [])
-        monkeypatch.setattr("kiro_crew.dashboard.handlers.mcp.rebuild_agent_config", lambda: None)
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.handlers.mcp.rebuild_agent_config_reporting",
+            lambda: (Path(), True),
+        )
 
         class _NoLock:
             async def __aenter__(self):
@@ -914,7 +1268,10 @@ class TestUninstallCrashWindowCleanup:
         monkeypatch.setattr(mcp_mod, "_KIROCREW_MCP_JSON", tmp_path / "kc.json")
         monkeypatch.setattr(mcp_mod, "_GLOBAL_MCP_JSON", kiro_path)
         monkeypatch.setattr(mcp_mod, "_extra_mcp_scopes", lambda: [])
-        monkeypatch.setattr("kiro_crew.dashboard.handlers.mcp.rebuild_agent_config", lambda: None)
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.handlers.mcp.rebuild_agent_config_reporting",
+            lambda: (Path(), True),
+        )
         monkeypatch.setattr(capability_bound, "CAPABILITY_UNINSTALL_TIMEOUT", 0.01)
 
         class _NoLock:
@@ -978,7 +1335,10 @@ class TestUninstallCrashWindowCleanup:
         monkeypatch.setattr(mcp_mod, "_KIROCREW_MCP_JSON", tmp_path / "kc.json")
         monkeypatch.setattr(mcp_mod, "_GLOBAL_MCP_JSON", kiro_path)
         monkeypatch.setattr(mcp_mod, "_extra_mcp_scopes", lambda: [])
-        monkeypatch.setattr("kiro_crew.dashboard.handlers.mcp.rebuild_agent_config", lambda: None)
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.handlers.mcp.rebuild_agent_config_reporting",
+            lambda: (Path(), True),
+        )
 
         class _NoLock:
             async def __aenter__(self):
@@ -992,8 +1352,16 @@ class TestUninstallCrashWindowCleanup:
 
         # 'done' returns immediately (confirmed uninstalled); 'pending' blocks so
         # the gather is still awaiting Phase 1 when we cancel the outer task.
+        # 'done' raises a handshake as it returns, so the cancellation below is
+        # positioned by a state the production path reached, not by elapsed time:
+        # the prologue before the guaranteed-cleanup try (the bounded body read and
+        # the read-only preflight, which runs on a worker thread) is provably behind
+        # us, and Phase 1 is provably in flight.
+        done_confirmed = _asyncio.Event()
+
         async def _uninstall(server_id):
             if server_id == "done":
+                done_confirmed.set()
                 return MagicMock(ok=True, message="done")
             await _asyncio.sleep(10)  # still running at cancellation
             return MagicMock(ok=True, message="never")
@@ -1013,8 +1381,14 @@ class TestUninstallCrashWindowCleanup:
         )
 
         task = _asyncio.ensure_future(mcp_mod.api_mcp_apply(request))
-        # Let Phase 1 start and 'done' confirm, then cancel mid-Phase-1.
-        await _asyncio.sleep(0.05)
+        # The handshake, not a window. Its own bound is a hang guard, never a
+        # position, and it reports the PRECONDITION in those words so a failure
+        # here is never read as a missing purge.
+        try:
+            await await_until(done_confirmed, what="done confirmed before phase 1 exit")
+        except _asyncio.TimeoutError:  # pragma: no cover - guard
+            task.cancel()
+            pytest.fail("Phase 1 never confirmed 'done': the interleaving under test did not occur")
         task.cancel()
         with pytest.raises(_asyncio.CancelledError):
             await task
@@ -1045,7 +1419,10 @@ class TestUninstallCrashWindowCleanup:
         monkeypatch.setattr(mcp_mod, "_KIROCREW_MCP_JSON", tmp_path / "kc.json")
         monkeypatch.setattr(mcp_mod, "_GLOBAL_MCP_JSON", kiro_path)
         monkeypatch.setattr(mcp_mod, "_extra_mcp_scopes", lambda: [])
-        monkeypatch.setattr("kiro_crew.dashboard.handlers.mcp.rebuild_agent_config", lambda: None)
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.handlers.mcp.rebuild_agent_config_reporting",
+            lambda: (Path(), True),
+        )
 
         class _NoLock:
             async def __aenter__(self):
@@ -1061,9 +1438,9 @@ class TestUninstallCrashWindowCleanup:
         seen_threads: list[int] = []
         real_purge = mcp_mod._purge_server_config
 
-        def _spy_purge(name):
+        def _spy_purge(name, **kw):
             seen_threads.append(threading.get_ident())
-            return real_purge(name)
+            return real_purge(name, **kw)
 
         monkeypatch.setattr(mcp_mod, "_purge_server_config", _spy_purge)
 
@@ -1105,7 +1482,10 @@ class TestApplyMutex:
         monkeypatch.setattr(mcp_mod, "_KIROCREW_MCP_JSON", tmp_path / "kc.json")
         monkeypatch.setattr(mcp_mod, "_GLOBAL_MCP_JSON", tmp_path / "kiro.json")
         monkeypatch.setattr(mcp_mod, "_extra_mcp_scopes", lambda: [])
-        monkeypatch.setattr("kiro_crew.dashboard.handlers.mcp.rebuild_agent_config", lambda: None)
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.handlers.mcp.rebuild_agent_config_reporting",
+            lambda: (Path(), True),
+        )
         # Reset the module-global apply lock so a permit a crashed earlier test
         # left held can't leak in (LoopBoundLock rebinds per loop on its own).
         monkeypatch.setattr(mcp_mod, "_apply_lock", mcp_mod.LoopBoundLock())

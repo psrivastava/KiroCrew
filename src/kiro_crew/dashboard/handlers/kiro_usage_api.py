@@ -41,10 +41,10 @@ another product's store. Those may well be the same account, but nothing proves 
 and treating them as interchangeable is what served one Builder ID account's
 leftover token as a different Builder ID account's balance.
 
-Provenance-anchoring is what keeps the free API path available to every account
-class. Requiring an ARN instead would push all profile-less accounts onto the text
-scrape — which spends credits on every refresh, indefinitely, and hits the smallest
-quotas hardest.
+Provenance-anchoring is what keeps the API path available to every account class.
+Requiring an ARN instead would push all profile-less accounts onto the text scrape —
+a kiro-cli subprocess on every refresh, slower and lossier (recent kiro-cli prints
+no overage line) than the direct call this module makes.
 
 It is a read-only client: it reads the live bearer token that kiro-cli already
 maintains and makes one authenticated call. The JSON SSO cache files live under
@@ -94,7 +94,6 @@ import json
 import logging
 import math
 import re
-import sqlite3
 import ssl
 import time
 import urllib.error
@@ -104,6 +103,10 @@ from pathlib import Path
 from typing import NamedTuple
 
 from kiro_crew import hooks
+
+# The kiro-cli store is also read in this process through the shim; one SQLite
+# library keeps the other readers' locks when this connection closes.
+from kiro_crew._sqlite_compat import sqlite3
 from kiro_crew.identity_stores import Trust, sqlite_dbs
 
 logger = logging.getLogger(__name__)
@@ -137,14 +140,13 @@ _TOTAL_DEADLINE_SECS = 30
 # caller can tell an AUTH-CLASS failure (one a fresh sign-in fixes) from every
 # other reason the usage read came back empty.
 #
-# The distinction is not cosmetic. When the read fails and the billed ``/usage``
-# text scrape is opted out, the scrape-disabled message asserts the free API
-# "returned no plan for this account" and offers enabling the scrape as the
-# remedy. On a host whose stored credential has expired that is a false cause AND
-# a remedy that spends credits without being able to work, because the scrape is a
-# billed kiro-cli
-# chat turn that needs the same sign-in. Only these two states may be reported as
-# "sign in again"; everything else stays deliberately unclassified.
+# The distinction is not cosmetic. The ``/usage`` text scrape that follows a failed
+# read is a kiro-cli slash command over this same API, so it needs the same sign-in
+# and fails the same way when the stored credential has expired. Reporting that as
+# "the account has no credit plan" names a cause that did not happen; the one remedy
+# is a fresh sign-in, and the pill can only say so when the failure is known to be
+# auth-class. Only these two states may be reported as "sign in again"; everything
+# else stays deliberately unclassified.
 
 #: A candidate credential was accepted and usage was returned.
 AUTH_OK = "ok"
@@ -333,7 +335,7 @@ def _note_api_outcome(ok: bool, reason: str = "") -> None:
     if not _API_DEGRADED_WARNED:
         _API_DEGRADED_WARNED = True
         logger.warning(
-            "Kiro usage API degraded to text-scrape fallback (%s) — "
+            "Kiro usage API returned no reading (%s); "
             "overage will not be visible until the API path recovers",
             reason,
         )
@@ -383,7 +385,7 @@ def _unexpired(exp: object, now: datetime) -> bool:
     return _expiry_if_unexpired(exp, now) is not None
 
 
-def _token_from_json(read_id: str, now: datetime) -> tuple[str, datetime] | None:
+def _token_from_json(read_id: str, now: datetime) -> tuple[str, datetime, str | None] | None:
     """Return ``(accessToken, expiry)`` from a sanctioned JSON SSO cache read.
 
     The bytes are read via ``hooks.safe_read_file_internal`` (not a direct
@@ -405,10 +407,15 @@ def _token_from_json(read_id: str, now: datetime) -> tuple[str, datetime] | None
     if not isinstance(tok, str) or not tok:
         return None
     expiry = _expiry_if_unexpired(exp, now)
-    return (tok, expiry) if expiry is not None else None
+    if expiry is None:
+        return None
+    # IdC userId when the cache file carries it. Bounded; not a secret, not logged.
+    uid_raw = data.get("userId") or data.get("user_id")
+    user_id = uid_raw[:128] if isinstance(uid_raw, str) and uid_raw else None
+    return (tok, expiry, user_id)
 
 
-def _token_from_sqlite(db: Path, now: datetime) -> tuple[str, datetime] | None:
+def _token_from_sqlite(db: Path, now: datetime) -> tuple[str, datetime, str | None] | None:
     """Return ``(access_token, expiry)`` from a kiro-cli/amazon-q SQLite store.
 
     Opened read-only; the token value is never logged. This is the live token
@@ -464,7 +471,10 @@ def _token_from_sqlite(db: Path, now: datetime) -> tuple[str, datetime] | None:
                 # is never returned — the caller degrades to the text scrape.
                 if not hooks.emit_internal_read_audit(_SQLITE_AUDIT_READ_ID, "success"):
                     return None
-                return (tok, expiry)
+                # IdC userId when the blob carries it. Bounded; not a secret.
+                uid_raw = blob.get("userId") or blob.get("user_id")
+                user_id = uid_raw[:128] if isinstance(uid_raw, str) and uid_raw else None
+                return (tok, expiry, user_id)
         # Audit-on-every-outcome: the DB was opened, so record the access even
         # when it yielded no usable token (missing rows / malformed blob / query
         # failure) — otherwise an opened credential store would leave no trail.
@@ -486,15 +496,23 @@ class _Candidate(NamedTuple):
     caches and from other products' stores carry False — they may well be the
     same account, but nothing here proves it, so they are usable only when a
     matching ARN proves it independently.
+
+    ``user_id`` carries the IdC userId read from the token blob when the store
+    includes it (``userId`` / ``user_id`` key). It is an opaque identifier, not
+    a secret: bounded, never logged, used only to compare ownership against the
+    signed-in session's userId. ``None`` means the blob carried no userId — the
+    candidate is kept but ranked below one whose userId is proven to match.
     """
 
     token: str
     expiry: datetime
     from_cli_store: bool
+    user_id: str | None = None
 
 
 def _candidate_tokens() -> list[_Candidate]:
-    """Return all unexpired candidates to try, freshest expiry first (deduped).
+    """Return all unexpired candidates to try, kiro-cli's own store first, then
+    freshest expiry (deduped).
 
     Path order is deliberately NOT the ranking. Every enumerated source can hold
     a valid credential at the same time, so ordering by path meant a leftover
@@ -509,6 +527,13 @@ def _candidate_tokens() -> list[_Candidate]:
     ``fetch_usage_limits`` establishes ownership itself, by matching ARN or by
     provenance. Ties keep the original path precedence (``sorted`` is stable).
 
+    Provenance ranks above expiry. Two accounts entitled to one shared IdC
+    profile report the same ARN, so the ARN proof cannot tell them apart and
+    the first candidate to clear it wins. A token in kiro-cli's own store is
+    the signed-in account's credential by construction, so it goes first; a
+    fresher leftover in an SSO cache must not outrank it. Expiry breaks ties
+    within each provenance class.
+
     Multiple candidates are returned (not just the first) because "unexpired" is
     not the same as "accepted": an unexpired-but-rejected token must not shadow a
     working one. Expired tokens are skipped and token values are never logged.
@@ -518,17 +543,20 @@ def _candidate_tokens() -> list[_Candidate]:
     # Deduped by token value, keeping the latest expiry seen for it and ORing the
     # provenance: the same token can appear in more than one store, and if any of
     # them is kiro-cli's own store then it is kiro-cli's credential.
-    freshest: dict[str, tuple[datetime, bool]] = {}
+    freshest: dict[str, tuple[datetime, bool, str | None]] = {}
 
-    def _add(found: tuple[str, datetime] | None, *, from_cli_store: bool) -> None:
+    def _add(found: tuple[str, datetime, str | None] | None, *, from_cli_store: bool) -> None:
         if not found:
             return
-        tok, exp = found
+        tok, exp, uid = found
         current = freshest.get(tok)
         if current is None:
-            freshest[tok] = (exp, from_cli_store)
+            freshest[tok] = (exp, from_cli_store, uid)
         else:
-            freshest[tok] = (max(exp, current[0]), current[1] or from_cli_store)
+            cur_exp, cur_cli, cur_uid = current
+            # OR provenance; prefer first non-None userId (same token = same user).
+            freshest[tok] = (max(exp, cur_exp), cur_cli or from_cli_store,
+                             cur_uid if cur_uid is not None else uid)
 
     for read_id in _JSON_TOKEN_READ_IDS:
         _add(_token_from_json(read_id, now), from_cli_store=False)
@@ -536,15 +564,16 @@ def _candidate_tokens() -> list[_Candidate]:
         _add(_token_from_sqlite(db, now), from_cli_store=True)
     for db in _OTHER_SQLITE_DBS:
         _add(_token_from_sqlite(db, now), from_cli_store=False)
-    ranked = sorted(freshest.items(), key=lambda kv: kv[1][0], reverse=True)
-    return [_Candidate(tok, exp, own) for tok, (exp, own) in ranked]
+    # (from_cli_store, expiry) descending: own-store tokens first, freshest first.
+    ranked = sorted(freshest.items(), key=lambda kv: (kv[1][1], kv[1][0]), reverse=True)
+    return [_Candidate(tok, exp, own, uid) for tok, (exp, own, uid) in ranked]
 
 
 def _load_bearer_token() -> str | None:
-    """Return the single freshest available bearer token, or None.
+    """Return the first-ranked available bearer token, or None.
 
-    Thin convenience wrapper over :func:`_candidate_tokens` (first candidate,
-    which is the freshest-expiry one). It discards provenance and applies NO
+    Thin convenience wrapper over :func:`_candidate_tokens` (first candidate:
+    kiro-cli's own store first, then freshest expiry). It discards provenance and applies NO
     ownership proof, so it must not be used to choose the credential a request is
     made with — ``fetch_usage_limits`` uses :func:`_candidate_tokens` directly so
     it can check each candidate's account (by ARN or by provenance) and fall
@@ -913,6 +942,34 @@ def _map_response(data: dict) -> dict | None:
     return result
 
 
+#: Longest e-mail published, matching ``parse_whoami_output``'s bound.
+_MAX_EMAIL_CHARS = 254
+
+#: The ``_Attempt.reason`` of a request the service refused as malformed. The
+#: vault read retries once without ``isEmailRequired`` on exactly this answer.
+_EMAIL_REJECTED_REASON = "HTTP 400"
+
+
+def _user_email(data: object) -> str:
+    """``userInfo.email`` from a GetUsageLimits body asked with ``isEmailRequired``.
+
+    The body is untrusted: only a printable string with an ``@`` and within
+    :data:`_MAX_EMAIL_CHARS` is accepted, else ``""`` (the modal then shows the
+    profile name, as before).
+    """
+    info = data.get("userInfo") if isinstance(data, dict) else None
+    email = info.get("email") if isinstance(info, dict) else None
+    if (
+        isinstance(email, str)
+        and "@" in email
+        and len(email) <= _MAX_EMAIL_CHARS
+        and email.isprintable()
+        and not any(ch.isspace() for ch in email)
+    ):
+        return email
+    return ""
+
+
 class UsageResult(NamedTuple):
     """A usage read plus WHY it came back empty, when it did.
 
@@ -932,6 +989,86 @@ class UsageResult(NamedTuple):
 
     usage: dict | None
     auth_state: str
+
+
+class _Attempt(NamedTuple):
+    """One GetUsageLimits call with one credential.
+
+    ``result`` is set when the call is final for every credential: a mapped
+    reading, or a 200 whose body has no usable CREDIT breakdown (another token
+    would get the same body). Otherwise it is ``None`` and ``reason`` /
+    ``unauthorized`` say why this credential failed, so a caller holding more
+    candidates moves on.
+    """
+
+    result: UsageResult | None
+    reason: str = ""
+    unauthorized: bool = False
+
+
+def _get_usage(
+    token: str,
+    arn: str | None,
+    *,
+    name_anchor: str | None,
+    endpoint: str,
+    want_email: bool = False,
+) -> _Attempt:
+    """THE GetUsageLimits request and response mapping, for one credential.
+
+    Shared by :func:`fetch_usage_limits` (each discovered candidate) and
+    :func:`fetch_usage_limits_with_credential` (Crew's vault token), so the
+    payload, the 401-only ``AUTH_REJECTED`` rule and the CREDIT mapping have one
+    copy. ``arn`` goes in the payload; ``name_anchor`` is the anchor the
+    ListAvailableProfiles probe was asked about, which keys the display-name
+    cache. ``want_email`` asks the API for the account's e-mail
+    (``isEmailRequired``, as kiro-cli does) and maps ``userInfo.email`` onto
+    ``email``; only the vault path sets it, because there the credential is the
+    signed-in account's by construction and nothing else can name its address.
+    Raises nothing it does not raise today: callers wrap it.
+    """
+    payload: dict[str, object] = {"origin": "AI_EDITOR"}
+    if arn:
+        payload["profileArn"] = arn
+    if want_email:
+        payload["isEmailRequired"] = True
+    try:
+        r = _post(token, _TARGET_GET_USAGE, payload, endpoint=endpoint)
+    except _RequestError as e:
+        reason = f"request failed: {type(e).__name__}"
+        logger.debug("Kiro usage API %s", reason)
+        return _Attempt(None, reason)
+    if r.status_code != 200:
+        # Do not log the token, only the status. 401 only: see AUTH_REJECTED for
+        # why a 403 must not be read as an auth refusal.
+        reason = f"HTTP {r.status_code}"
+        logger.debug("Kiro usage API returned %s", reason)
+        return _Attempt(None, reason, unauthorized=r.status_code == 401)
+    try:
+        body = r.json()
+    except ValueError:
+        logger.debug("Kiro usage API returned a non-JSON body")
+        return _Attempt(None, "non-JSON body")
+    mapped = _map_response(body)
+    if mapped is None:
+        # A shape problem, not an auth one: another token would return the same
+        # body, so the caller stops here.
+        _note_api_outcome(False, "no usable CREDIT breakdown in response")
+        return _Attempt(UsageResult(None, AUTH_OTHER))
+    # WHO the plan belongs to: the profile display name the ARN probe cached.
+    # Absent for individual Builder ID accounts, which have no profile.
+    account = _account_name(token, name_anchor)
+    if account:
+        mapped["account"] = account
+    if want_email:
+        email = _user_email(body)
+        if email:
+            mapped["email"] = email
+    # Coupling metadata for the caller's identity check (private -- stripped
+    # before the payload is cached or served). None for individual accounts.
+    mapped["_profile_arn"] = arn
+    _note_api_outcome(True)
+    return _Attempt(UsageResult(mapped, AUTH_OK))
 
 
 def fetch_usage_limits(expected_arn: str | None) -> UsageResult:
@@ -966,8 +1103,8 @@ def fetch_usage_limits(expected_arn: str | None) -> UsageResult:
 
     The ``auth_state`` alongside it says whether that None was AUTH-CLASS -- see
     :data:`AUTH_NO_CREDENTIAL` and :data:`AUTH_REJECTED` -- so the caller can tell
-    the user to sign in again instead of reporting the account has no credit plan
-    and offering a remedy that spends credits. It is classified from the
+    the user to sign in again instead of reporting the account has no credit plan.
+    It is classified from the
     enumeration this function already performs: no store is read a second time,
     no new credential source is consulted, and nothing about who may read or
     refresh a token changes.
@@ -997,6 +1134,30 @@ def fetch_usage_limits(expected_arn: str | None) -> UsageResult:
     # GetUsageLimits hit the same regional host. Unknown/absent region stays
     # on the us-east-1 default (control 1: the URL is still a file literal).
     endpoint = _rts_endpoint(expected_arn)
+    # Apply IdC userId ownership filter when the signed-in user's userId is
+    # available from kiro-cli's own store. This is the third proof of ownership,
+    # beyond ARN-anchored and source-anchored: two accounts on the same IdC org
+    # can share a profile ARN, so the ARN proof cannot tell them apart. Comparing
+    # userId is the discriminating step.
+    #
+    # active_user_id comes from kiro-cli's own store token — it is the signed-in
+    # account's credential by construction, so its userId is the reference. When
+    # the blob carries no userId, active_user_id is None and no filtering is
+    # applied (today's behaviour is preserved rather than failing open).
+    # Anchor userId on the FIRST kiro-cli store candidate — never skip one
+    # whose blob carried no userId. The first from_cli_store token is the
+    # signed-in account's credential by construction (provenance + expiry
+    # ordering in _candidate_tokens). Skipping it to find a later store entry
+    # with a userId would anchor on the wrong identity.
+    active_user_id: str | None = None
+    for _c in candidates:
+        if _c.from_cli_store:
+            active_user_id = _c.user_id  # None means blob had no userId
+            break
+    if active_user_id is not None:
+        # Drop candidates whose userId is known and differs from the signed-in user.
+        candidates = [c for c in candidates
+                      if c.user_id is None or c.user_id == active_user_id]
     reason = "unknown"
     # Set when GetUsageLimits itself answers 401 for some candidate. Tracked
     # separately from ``reason`` (which is prose for the log) because it is the
@@ -1043,58 +1204,18 @@ def fetch_usage_limits(expected_arn: str | None) -> UsageResult:
                     "does not match the signed-in account"
                 )
                 continue
-            payload: dict[str, object] = {"origin": "AI_EDITOR"}
-            if arn:
-                payload["profileArn"] = arn
-            try:
-                r = _post(token, _TARGET_GET_USAGE, payload, endpoint=endpoint)
-            except _RequestError as e:
-                reason = f"request failed: {type(e).__name__}"
-                logger.debug("Kiro usage API %s", reason)
-                continue  # try the next candidate token
-            if r.status_code != 200:
-                # Fail over to the next token — do not log the token, only the status.
-                reason = f"HTTP {r.status_code}"
-                if r.status_code == 401:
-                    # The API refuses this credential. 401 only: see
-                    # AUTH_REJECTED for why a 403 must not be read this way.
-                    saw_unauthorized = True
-                logger.debug("Kiro usage API returned %s", reason)
-                continue
-            try:
-                body = r.json()
-            except ValueError:
-                reason = "non-JSON body"
-                logger.debug("Kiro usage API returned %s", reason)
-                continue
-            mapped = _map_response(body)
-            if mapped is not None:
-                # Tag the usage with WHO the plan belongs to (profile display
-                # name from the ListAvailableProfiles probe above). Absent for
-                # individual Builder ID accounts, which have no profile.
-                account = _account_name(token, expected_arn)
-                if account:
-                    mapped["account"] = account
-                # Coupling metadata for the caller's identity check (private —
-                # stripped before the payload is cached or served).
-                #
-                # These numbers now provably belong to the account kiro-cli is
-                # signed in as: no candidate with a different ARN could have
-                # reached this point. The ARN is still handed back because
-                # matching on ``None`` (both sides have no profile — a Builder ID
-                # account) is weaker than matching a specific ARN: two different
-                # Builder ID accounts both present no ARN, so that case is
-                # consistent but not proof of the same account. The caller's
-                # ``_identity_matches_account`` encodes exactly that distinction
-                # and is what decides whether an email may sit next to an overage
-                # figure.
-                mapped["_profile_arn"] = arn  # None for individual accounts
-                _note_api_outcome(True)
-                return UsageResult(mapped, AUTH_OK)
-            # A 200 with no usable CREDIT breakdown is a shape problem, not an auth
-            # one — another token would return the same body, so stop here.
-            _note_api_outcome(False, "no usable CREDIT breakdown in response")
-            return UsageResult(None, AUTH_OTHER)
+            # These numbers provably belong to the account kiro-cli is signed in
+            # as: no candidate with a different ARN could have reached this
+            # point. The ARN still rides back (see _get_usage) because matching
+            # on ``None`` -- two Builder ID accounts both present none -- is
+            # consistent but not proof; ``_identity_matches_account`` decides
+            # whether an email may sit next to an overage figure.
+            attempt = _get_usage(token, arn, name_anchor=expected_arn, endpoint=endpoint)
+            if attempt.result is not None:
+                return attempt.result
+            reason = attempt.reason
+            saw_unauthorized = saw_unauthorized or attempt.unauthorized
+            continue  # try the next candidate token
         except Exception:  # noqa: BLE001 — never let an unexpected shape escape
             # Any unforeseen parsing/attribute error for one token must not
             # propagate: it would make _fetch_usage_bg cache {"available": False}
@@ -1104,3 +1225,49 @@ def fetch_usage_limits(expected_arn: str | None) -> UsageResult:
             continue
     _note_api_outcome(False, f"all {len(candidates)} candidate credential(s) failed; last: {reason}")
     return UsageResult(None, AUTH_REJECTED if saw_unauthorized else AUTH_OTHER)
+
+
+def fetch_usage_limits_with_credential(token: str, profile_arn: str | None) -> UsageResult:
+    """Fetch credit usage with ONE caller-supplied credential. Synchronous (urllib).
+
+    The path for Kiro Crew's own sign-in vault, which needs no kiro-cli: the
+    caller resolves (and refreshes) the vault's access token and hands it here
+    with the profile ARN stored beside it. No credential store is enumerated, so
+    the ownership proofs :func:`fetch_usage_limits` applies to DISCOVERED
+    candidates do not arise -- a vault token is the signed-in Crew account's
+    credential by construction, the same provenance argument that admits a token
+    from kiro-cli's own store.
+
+    The stored ARN is used as-is. Without one (Builder ID, social) the
+    ListAvailableProfiles probe's first ARN is used when the token lists any,
+    which an enterprise identity stored without its ARN needs to avoid a 403.
+
+    Same contract as :func:`fetch_usage_limits`: never raises, never logs the
+    token, and the request/mapping is the one :func:`_get_usage` body.
+    """
+    if not token:
+        return UsageResult(None, AUTH_NO_CREDENTIAL)
+    endpoint = _rts_endpoint(profile_arn)
+    try:
+        arn = profile_arn or _list_profile_arn(token, endpoint=endpoint)
+        if profile_arn:
+            # Fills the display-name cache only; the stored ARN is the answer.
+            _list_profile_arn(token, expected_arn=profile_arn, endpoint=endpoint)
+        elif arn:
+            # A discovered ARN names its own region; send the read there.
+            endpoint = _rts_endpoint(arn)
+        attempt = _get_usage(
+            token, arn, name_anchor=profile_arn, endpoint=endpoint, want_email=True
+        )
+        if attempt.result is None and attempt.reason == _EMAIL_REJECTED_REASON:
+            # The e-mail is an extra, never a condition of the reading: a 400
+            # may be the service refusing ``isEmailRequired`` for this kind of
+            # sign-in, so ask once more without it before giving up.
+            attempt = _get_usage(token, arn, name_anchor=profile_arn, endpoint=endpoint)
+    except Exception:  # noqa: BLE001 - never let an unexpected shape escape
+        logger.debug("Kiro usage API: unexpected error for the vault credential", exc_info=True)
+        return UsageResult(None, AUTH_OTHER)
+    if attempt.result is not None:
+        return attempt.result
+    _note_api_outcome(False, f"vault credential failed: {attempt.reason}")
+    return UsageResult(None, AUTH_REJECTED if attempt.unauthorized else AUTH_OTHER)

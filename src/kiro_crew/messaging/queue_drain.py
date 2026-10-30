@@ -8,7 +8,7 @@ TRANSPORT. Every DM dispatcher is constructed with the orchestrator's single
 dropping the CHANNEL as well as the user. So a Telegram DM and a Discord DM to the
 same agent resolve to one session key, and therefore one queue.
 
-Two things therefore cannot live in any one channel's module.
+Three things therefore cannot live in any one channel's module.
 
 The first is the ownership predicate. A drain can only answer the entries its OWN
 channel recorded, because an entry from another transport carries no address it can
@@ -19,7 +19,15 @@ its reader are defined ONCE here rather than restated per module. A restated lit
 is a silent failure: one typo makes that channel's entries "not mine" to every drain,
 including its own, so they are unowned and stranded with nothing raising.
 
-The second is the wake. An entry set aside has already been accepted and receipted, so
+The second is WHOSE each entry is. ``/stop`` cancels one person's turn, so it may drop
+only that person's queued messages; under a unified scope the rest of the queue belongs
+to other people who are still waiting for an answer. Naming the principal takes the same
+neutral treatment as naming the channel and for a stronger reason: the caller has to
+compare every entry on the queue, including entries another transport recorded whose
+channel-specific fields it cannot read at all. So :data:`QUEUED_OWNER_KEY` and
+:func:`owner_token` live here too.
+
+The third is the wake. An entry set aside has already been accepted and receipted, so
 something must come back for it. Nothing did: a drain runs only from the tail of its
 own channel's turn, so a cross-transport entry waited for that transport to finish some
 unrelated turn, and waited forever if it went quiet.
@@ -32,6 +40,7 @@ chat id, room id and thread stays inside the channel that owns it, the same boun
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Awaitable, Callable, Iterable
 from contextlib import contextmanager
@@ -47,6 +56,30 @@ logger = logging.getLogger(__name__)
 #: Defined here and imported, never restated: see the module docstring for why a
 #: per-module copy of this string fails silently.
 QUEUED_CHANNEL_KEY = "queued_channel"
+
+#: Neutral key naming WHICH PRINCIPAL queued an entry -- one sender in one place --
+#: written by every producer beside :data:`QUEUED_CHANNEL_KEY`. The channel tag answers
+#: "which drain replies to this"; this answers "whose message is this", which is the
+#: question a partial clear asks. Neutral for the same reason: a caller clearing only
+#: its own entries must compare them all, including entries another transport recorded,
+#: and it cannot read a channel-specific origin field to do it.
+#:
+#: The value is opaque and built only by :func:`owner_token`, so the one place that
+#: decides what "the same principal" means is that function.
+QUEUED_OWNER_KEY = "queued_owner"
+
+#: Neutral key recording whether a PERSON sent a queue entry
+#: (``InboundMessage.person_origin``). A drain replays the entry later as a fresh turn,
+#: and that turn's start priority (:mod:`kiro_crew.start_priority`) is the entry's own:
+#: neither the finished turn's opener's nor assumed, because a gateway-built wake can
+#: reach the busy-queue path too. Written by :func:`person_tag`, read by
+#: :func:`entry_person_origin`.
+QUEUED_PERSON_KEY = "queued_person_origin"
+
+#: Separates the parts inside an owner token. A unit separator, because every part is an
+#: id, an email or a room name from a transport, and none of them can contain one -- so
+#: two different principals cannot collide by spelling their parts with the separator.
+_OWNER_SEP = "\x1f"
 
 #: "Drain everything you own on this session key." The only capability a peer
 #: channel is given, and the reason no address crosses this seam.
@@ -86,20 +119,96 @@ _PENDING: dict[str, set[str]] = {}
 #: for the next drain to act on: see the last round in :func:`drain_until_quiet`.
 _MAX_WAKE_ROUNDS = 8
 
+#: (channel type, session key) -> the one task waiting for that session's lease to come
+#: free so it can run that channel's drain. See :func:`drain_when_free`.
+_HELD_RETRIES: dict[tuple[str, str], asyncio.Task[None]] = {}
 
-def tag_entry(kwargs: dict[str, str], channel_type: str) -> dict[str, str]:
-    """Record *channel_type* as the producer of this queue entry, and return *kwargs*.
+#: First and longest pause between two looks at a held lease, in seconds. The pause
+#: doubles from the first to the longest, so a short holder (a dashboard turn) is
+#: followed closely and a long one (a cron run) costs one cheap check every few seconds.
+_HELD_POLL_FIRST_SECS = 0.25
+_HELD_POLL_MAX_SECS = 5.0
+
+#: How long one retry keeps waiting before it gives up and leaves the entries queued
+#: for the next drain of the session. Far longer than any healthy turn: a holding that
+#: outlasts it is the stale-session reaper's to end, not this wait's.
+_HELD_WAIT_LIMIT_SECS = 6 * 3600.0
+
+
+def owner_token(channel_type: str, sender_key: Iterable[object]) -> str:
+    """The opaque token naming the principal *sender_key* identifies on *channel_type*.
+
+    Pass the channel's own ``sender_key`` -- the tuple each transport already derives for
+    "who sent this and where the reply goes", the same comparison that decides whether
+    two queued messages may be collapsed into one turn. Ownership for a partial clear is
+    that identical question, so it reads the identical value rather than a second notion
+    of identity that could drift from it.
+
+    The channel name leads, so two transports that happen to spell a user id the same way
+    are still two principals. Built here rather than per channel so a producer and a
+    clear cannot disagree about the spelling.
+    """
+    return _OWNER_SEP.join((str(channel_type), *(str(part) for part in sender_key)))
+
+
+def tag_entry(kwargs: dict[str, str], channel_type: str, owner: str) -> dict[str, str]:
+    """Record *channel_type* and *owner* as this queue entry's producer, and return *kwargs*.
 
     Every producer enqueueing onto a shared session key calls this, including a drain
     re-enqueueing an entry it set aside -- that path passes the entry's own kwargs
-    straight back, so the tag rides along already and re-tagging it would be the one
+    straight back, so the tags ride along already and re-tagging them would be the one
     way a set-aside entry could change hands.
+
+    *owner* comes from :func:`owner_token` and is what lets ``/stop`` drop one person's
+    queued messages and leave everybody else's. It is REQUIRED, with no default: a
+    producer that cannot name its principal passes ``""`` and says so at its own call
+    site, because an empty token matches no caller and the entry it makes is one its
+    own sender can never withdraw. Defaulting it would make that the silent outcome of
+    forgetting the argument rather than a decision.
 
     Returns the same dict it was given so a producer can build and tag in one
     expression; the mutation is what matters.
     """
     kwargs[QUEUED_CHANNEL_KEY] = str(channel_type)
+    kwargs[QUEUED_OWNER_KEY] = str(owner)
     return kwargs
+
+
+def person_tag(person_origin: bool) -> dict[str, bool]:
+    """The queue-entry keyword argument recording whether a person sent the entry."""
+    return {QUEUED_PERSON_KEY: bool(person_origin)}
+
+
+def entry_person_origin(kwargs: dict) -> bool:
+    """Whether a person sent this queue entry. Absent reads False: an entry that does
+    not say so takes no person's start priority."""
+    return kwargs.get(QUEUED_PERSON_KEY) is True
+
+
+def entry_owner(kwargs: dict) -> str:
+    """Which principal queued this entry, or "" if it did not say.
+
+    Absent means a producer that does not record it. Such an entry is nobody's to drop:
+    it is left queued by every partial clear rather than guessed at, the same way an
+    untagged channel makes it nobody's to answer.
+    """
+    return str(kwargs.get(QUEUED_OWNER_KEY) or "")
+
+
+def entries_queued_by(owner: str) -> Callable[[dict], bool]:
+    """The predicate selecting exactly the entries *owner* queued.
+
+    Handed to ``SessionManager.clear_queue`` so the session layer decides nothing about
+    ownership and learns no field name: it holds the entries, the predicate reads them.
+
+    An empty *owner* selects NOTHING, deliberately: a caller that cannot name its
+    principal must clear nothing rather than everything, because "everything" here is
+    other people's unanswered messages. Whole-session teardown asks for that by passing
+    no predicate at all, which is a different request and reads as one at the call site.
+    """
+    if not owner:
+        return lambda _kwargs: False
+    return lambda kwargs: entry_owner(kwargs) == owner
 
 
 def entry_channel(kwargs: dict) -> str:
@@ -155,6 +264,14 @@ def reset_drains() -> None:
     _DRAINS.clear()
     _ACTIVE.clear()
     _PENDING.clear()
+    for task in _HELD_RETRIES.values():
+        if not task.done():
+            try:
+                task.cancel()
+            except RuntimeError:
+                # Its event loop is already closed, which ended the task with it.
+                pass
+    _HELD_RETRIES.clear()
 
 
 def _take_pending(channel_type: str, session_key: str) -> bool:
@@ -209,6 +326,15 @@ async def drain_until_quiet(
     sequence, and a channel that got the order wrong -- waking under its own queue lock,
     or outside its own marker -- would be a defect with no local symptom.
     """
+    if str(channel) in _ACTIVE.get(str(session_key), ()):
+        # This channel is already draining this session -- a turn tail reaching here
+        # while a ``drain_when_free`` retry of the same channel is still pumping. Two
+        # pumps on one queue race each other's replays into the lease the other just
+        # took, and the inner one's exit would drop the outer one's active marker.
+        # Retained instead, exactly as a refused peer wake is, so the running drain
+        # re-pumps for it before it lets go.
+        _PENDING.setdefault(str(session_key), set()).add(str(channel))
+        return
     with draining(channel, session_key):
         for round_no in range(1, _MAX_WAKE_ROUNDS + 1):
             foreign: set[str] = set()
@@ -244,7 +370,8 @@ def draining(channel_type: str, session_key: str) -> Iterator[None]:
 
     Read by :func:`wake_other_drains` to refuse a target already on the stack, which
     is what bounds the cascade. Reference-counted per channel is unnecessary: a
-    channel's drain is not re-entered on one session (its own pump loops instead).
+    channel's drain is not re-entered on one session -- :func:`drain_until_quiet`
+    retains a second entry as a pending wake instead of running it.
     """
     key = str(session_key)
     active = _ACTIVE.setdefault(key, set())
@@ -310,3 +437,74 @@ async def wake_other_drains(*, waker: str, session_key: str, channels: Iterable[
                 session_key,
                 exc_info=True,
             )
+
+
+def drain_when_free(*, channel: str, session_key: str, is_busy: Callable[[str], bool]) -> bool:
+    """Run *channel*'s drain on *session_key* once its lease is free.
+
+    For a drain that found the session held by another turn -- a dashboard, cron or
+    auto-nudge turn on the same key, or another channel's turn under a unified scope.
+    Replaying a queued entry into a held session only queues it again, so the drain
+    leaves its queue in order and calls this instead.
+
+    It waits on the lease itself rather than on a hook in whatever holds it. The
+    holder may end its holding without going through ``SessionManager.release`` (a
+    compaction, a recycle or a stop hands the permit back directly), and it may be a
+    turn no channel drain follows, so no release-side hook is reached on every path.
+
+    At most one retry waits per channel and session: a second call while one waits
+    returns False and schedules nothing. The waiting task drops itself from the
+    registry BEFORE it drains, so a drain that finds the lease taken again can
+    schedule the next retry. The drain is looked up when the lease frees, so a
+    dispatcher that restarted meanwhile is the one that answers, and an unregistered
+    channel is skipped. Returns whether a retry was scheduled.
+    """
+    slot = (str(channel), str(session_key))
+    if slot in _HELD_RETRIES:
+        return False
+    from kiro_crew.shared_crew.turn_gate import independent_turn
+
+    with independent_turn():
+        task = asyncio.ensure_future(_drain_after_hold(slot, is_busy))
+    _HELD_RETRIES[slot] = task
+
+    def _forget(done: asyncio.Task[None]) -> None:
+        if _HELD_RETRIES.get(slot) is done:
+            _HELD_RETRIES.pop(slot, None)
+
+    task.add_done_callback(_forget)
+    return True
+
+
+async def _drain_after_hold(slot: tuple[str, str], is_busy: Callable[[str], bool]) -> None:
+    """The wait behind :func:`drain_when_free`: back off until free, then drain once."""
+    channel, session_key = slot
+    delay = _HELD_POLL_FIRST_SECS
+    waited = 0.0
+    while is_busy(session_key):
+        if waited >= _HELD_WAIT_LIMIT_SECS:
+            logger.warning(
+                "%s: session=%s stayed held for %.0fs; its queued messages stay queued "
+                "for the next drain of this session",
+                channel,
+                session_key,
+                waited,
+            )
+            return
+        await asyncio.sleep(delay)
+        waited += delay
+        delay = min(delay * 2, _HELD_POLL_MAX_SECS)
+    if _HELD_RETRIES.get(slot) is asyncio.current_task():
+        _HELD_RETRIES.pop(slot, None)
+    drain = _DRAINS.get(channel)
+    if drain is None:
+        return
+    try:
+        await drain(session_key)
+    except Exception:
+        logger.warning(
+            "%s: the queue drain retried after a held lease failed for session=%s",
+            channel,
+            session_key,
+            exc_info=True,
+        )

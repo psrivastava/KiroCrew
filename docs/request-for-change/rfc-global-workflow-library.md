@@ -1,11 +1,11 @@
 ---
 title: Global Workflow System — reusable definitions and TaskRunner composition
-status: partial
+status: implemented
 revision: v2
 author: Kyle Seaman, with Codex
 created: 2026-08-25
-last-audited: 2026-09-05
-audited-at: 424efa423
+last-audited: 2026-10-06
+audited-at: 9348a25a34
 doc-pr: 5951
 implementation-prs: [5951]
 tracking-issues: []
@@ -14,8 +14,10 @@ superseded-by: []
 ---
 # RFC: Global Workflow System — reusable definitions and TaskRunner composition
 
-- Status: in-progress — nothing from this RFC is on `main`. RFC and
-  implementation are proposed together in PR #5951.
+- Status: implemented — reusable definitions, exact MCP and `/workflow`
+  invocation, the Customize > Workflows library UI, and TaskRunner `task-plan`
+  composition are on `main`. The shipped contract is
+  [`../system-specs/modules/workflows.md`](../system-specs/modules/workflows.md).
 - Author: Kyle Seaman, with Codex
 - Created: 2026-08-25
 - Audited against: `3407351dd`
@@ -336,8 +338,8 @@ Resolves `debug-login-flow`, starts its exact current source, and supplies
 `"reproduce with user 123"` as `ctx.args["input"]`.
 
 The dashboard dispatches the command locally before acquiring or forwarding to
-a harness (`src/kiro_crew/dashboard/chat_runner.py:4965-5003` in the implementation
-worktree). This is the critical harness-neutrality boundary: Kiro and KAS cannot
+a harness (`_handle_workflow_command` in `src/kiro_crew/dashboard/chat_turn/slash_commands.py`,
+called from `_turn_slash_gate`). This is the critical harness-neutrality boundary: Kiro and KAS cannot
 assign different meanings to the same saved name.
 
 One namespace command is preferred over registering each definition as its own

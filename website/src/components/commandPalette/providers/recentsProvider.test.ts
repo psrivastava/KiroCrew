@@ -1,7 +1,9 @@
 import { renderHook } from '@testing-library/react'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { ChatSlot } from '../../../types'
+import { resetCrewModeCatalog, setCrewModeCatalog } from '../../../lib/crewMode'
+import { slotRecency } from '../slotRecency'
 import {
   hasPlaceholderTitle,
   isEmptyNewSlot,
@@ -33,11 +35,15 @@ const mocks = vi.hoisted(() => ({
 vi.mock('../../../store', () => ({
   useAppDispatch: () => mocks.dispatch,
   useAppSelector: (selector: (state: MockState) => unknown) => selector(mocks.state),
+  useAppStore: () => ({ getState: () => mocks.state }),
 }))
 
 vi.mock('react-router-dom', () => ({
   useNavigate: () => mocks.navigate,
 }))
+
+const apiMock = vi.hoisted(() => ({ sessions: vi.fn() }))
+vi.mock('../../../api/client', () => ({ api: apiMock }))
 
 vi.mock('@tanstack/react-query', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@tanstack/react-query')>()
@@ -100,6 +106,26 @@ describe('isEmptyNewSlot', () => {
   })
 })
 
+describe('slotRecency', () => {
+  it('compares ISO and epoch-second values and reserves created for fallback', () => {
+    const newerEpochSeconds = Date.parse('2026-07-22T10:00:00Z') / 1000
+    expect(
+      slotRecency({
+        last_activity_ts: '2026-07-19T10:00:00Z',
+        last_ts: newerEpochSeconds,
+        created: '2026-07-25T10:00:00Z',
+      }),
+    ).toEqual({ timestamp: newerEpochSeconds, epoch: newerEpochSeconds * 1000 })
+    expect(
+      slotRecency({
+        last_activity_ts: 'invalid-activity',
+        last_ts: 'invalid-message',
+        created: '2026-07-18T10:00:00Z',
+      }).timestamp,
+    ).toBe('2026-07-18T10:00:00Z')
+  })
+})
+
 describe('prepareCurrentSlots — duplicate "+ New Session…" collapse', () => {
   it('keeps at most one empty-new slot when several are open', () => {
     const slots = [
@@ -139,7 +165,7 @@ describe('prepareCurrentSlots — duplicate "+ New Session…" collapse', () => 
     expect(ordered).toHaveLength(2)
   })
 
-  it('orders empty-new first, then pinned, then recency', () => {
+  it('orders empty-new first, then recency, with a pin claiming no place', () => {
     const slots = [
       slot({ key: 'old', title: 'Old', last_ts: '2026-07-20T10:00:00Z' }),
       slot({ key: 'pin', title: 'Pinned', pinned: true, last_ts: '2026-07-19T10:00:00Z' }),
@@ -147,7 +173,42 @@ describe('prepareCurrentSlots — duplicate "+ New Session…" collapse', () => 
       slot({ key: 'recent', title: 'Recent', last_ts: '2026-07-22T10:00:00Z' }),
     ]
     const { ordered } = prepareCurrentSlots(slots)
-    expect(ordered.map((s) => s.key)).toEqual(['new', 'pin', 'recent', 'old'])
+    // The pin is the oldest of the three and lands last. Floating it would open the
+    // switcher on a session the reader last touched days before the one above it.
+    expect(ordered.map((s) => s.key)).toEqual(['new', 'recent', 'old', 'pin'])
+  })
+
+  it('ranks a slot the wire sent an empty last_activity_ts for by its last message', () => {
+    // The WIRE shape, which every fixture above understates: `slot_projection`
+    // starts `last_activity_ts = ""` and emits the key unconditionally, so the
+    // field is PRESENT and empty rather than absent. A nullish ladder stops on it
+    // and reads neither fallback, which sank the session holding only the prompt
+    // the reader just sent — the single row this surface exists to return them to.
+    const slots = [
+      slot({ key: 'stale', title: 'Stale', last_activity_ts: '2026-07-19T10:00:00Z' }),
+      slot({ key: 'justsent', title: 'Just sent', last_activity_ts: '', last_ts: '2026-07-22T10:00:00Z' }),
+    ]
+    const { ordered } = prepareCurrentSlots(slots)
+    expect(ordered.map((s) => s.key)).toEqual(['justsent', 'stale'])
+  })
+
+  it('ranks by a newer last_ts when last_activity_ts is nonempty', () => {
+    const slots = [
+      slot({
+        key: 'new-prompt',
+        title: 'New prompt',
+        last_activity_ts: '2026-07-19T10:00:00Z',
+        last_ts: '2026-07-22T10:00:00Z',
+      }),
+      slot({
+        key: 'untouched',
+        title: 'Untouched',
+        last_activity_ts: '2026-07-20T10:00:00Z',
+        last_ts: '2026-07-20T10:00:00Z',
+      }),
+    ]
+    const { ordered } = prepareCurrentSlots(slots)
+    expect(ordered.map((s) => s.key)).toEqual(['new-prompt', 'untouched'])
   })
 
   it('handles the empty slot list', () => {
@@ -244,7 +305,8 @@ describe('sessionStatus — running detail', () => {
   it('surfaces the live tool call instead of the generic Thinking label', () => {
     expect(
       sessionStatus(slot({ running: true }), [], {
-        text: 'Running: read /workspace/src/app.ts',
+        kind: 'tool',
+        purpose: 'Running: read /workspace/src/app.ts',
       }),
     ).toMatchObject({
       style: 'dot',
@@ -264,7 +326,7 @@ describe('sessionStatus — running detail', () => {
   it('shows the raw tool title when simplifiedToolNames is off', () => {
     // Same preference the inline tool pill obeys, so the palette row and the
     // transcript agree instead of the row always showing the purpose.
-    const detail = { kind: 'tool', text: 'Reading the app entrypoint', toolName: 'fs_read /workspace/src/app.ts' }
+    const detail = { kind: 'tool' as const, purpose: 'Reading the app entrypoint', toolName: 'fs_read /workspace/src/app.ts' }
     expect(sessionStatus(slot({ running: true }), [], detail, false)).toMatchObject({
       label: 'fs_read /workspace/src/app.ts',
     })
@@ -291,7 +353,7 @@ describe('useRecentsProvider — live status bridge', () => {
     mocks.state.chat.slotStatusDetail = {
       dashboard_live: {
         kind: 'tool',
-        text: 'Running: read /workspace/src/app.ts',
+        purpose: 'Running: read /workspace/src/app.ts',
         ts: 123,
       },
     }
@@ -306,13 +368,33 @@ describe('useRecentsProvider — live status bridge', () => {
     })
   })
 
+  it('displays the newer last_ts when last_activity_ts is nonempty', async () => {
+    mocks.state.dashboard.slots = [
+      slot({
+        key: 'mixed',
+        last_activity_ts: '2026-07-19T10:00:00Z',
+        last_ts: '2026-07-22T10:00:00Z',
+      }),
+      slot({ key: 'message-only', last_ts: '2026-07-22T10:00:00Z' }),
+      slot({ key: 'activity-only', last_activity_ts: '2026-07-19T10:00:00Z' }),
+    ]
+
+    const { result } = renderHook(() => useRecentsProvider())
+    const rows = await result.current.search('')
+    const timestampFor = (key: string) =>
+      rows.find((row) => row.id === `recents:cur:${key}`)?.timestamp
+
+    expect(timestampFor('mixed')).toBe(timestampFor('message-only'))
+    expect(timestampFor('mixed')).not.toBe(timestampFor('activity-only'))
+  })
+
   it('renders the raw tool title when the user turned simplified tool names off', async () => {
     localStorage.setItem('mc-chat-config', JSON.stringify({ simplifiedToolNames: false }))
     mocks.state.dashboard.slots = [slot({ key: 'dashboard_live', running: true })]
     mocks.state.chat.slotStatusDetail = {
       dashboard_live: {
         kind: 'tool',
-        text: 'Reading the app entrypoint',
+        purpose: 'Reading the app entrypoint',
         toolName: 'fs_read /workspace/src/app.ts',
         ts: 123,
       },
@@ -408,5 +490,54 @@ describe('useRecentsProvider — Older dedupe against live slots', () => {
     expect(rows.filter((r) => r.id === 'recents:cur:chat-2-2')).toHaveLength(0)
     // ...and must NOT come back as an Older row.
     expect(rows.filter((r) => r.id === 'recents:old:dashboard_chat-2-2')).toHaveLength(0)
+  })
+
+  it('dedupes against a live Crew Mode worker the person\'s list leaves out', async () => {
+    // `currentKeys` is built from EVERY live row, not the person's list: a worker
+    // is left out of Current (its root's side panel shows it) and must not come
+    // back as an Older row while it is open.
+    mocks.state.dashboard.slots = [
+      slot({ key: 'chat-1-1', title: 'The crew chat', crew_mode_root: true }),
+      slot({ key: 'chat-2-2', title: 'A crew member', crew_root: 'chat-1-1' }),
+    ]
+    withHistory([{ key: 'dashboard_chat-2-2', title: 'A crew member', preview: 'x' }])
+
+    const { result } = renderHook(() => useRecentsProvider())
+    const rows = await result.current.search('')
+
+    expect(rows.filter((r) => r.id === 'recents:cur:chat-2-2')).toHaveLength(0)
+    expect(rows.filter((r) => r.id === 'recents:old:dashboard_chat-2-2')).toHaveLength(0)
+    expect(rows.filter((r) => r.id === 'recents:cur:chat-1-1')).toHaveLength(1)
+  })
+})
+
+/**
+ * The Older group reads the full History inventory, Crew Mode or not: closed
+ * channel conversations and subagent transcripts belong there, and `/api/sessions`
+ * has no crew signal, so `user_only` would drop those while keeping a closed crew
+ * worker. A live crew worker is kept out by the live-row dedupe above.
+ */
+describe('useRecentsProvider — Older is the full History inventory', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    mocks.state.dashboard.slots = []
+    mocks.state.dashboard.unreadSlots = []
+    mocks.state.chat.slotStatusDetail = {}
+    // Run the history queryFn for real; answer the others empty.
+    mocks.fetchQuery.mockImplementation(({ queryKey, queryFn }: { queryKey: unknown[]; queryFn: () => unknown }) =>
+      queryKey[2] === 'history' ? Promise.resolve(queryFn()) : Promise.resolve([]))
+    apiMock.sessions.mockResolvedValue({ sessions: [] })
+  })
+
+  afterEach(() => resetCrewModeCatalog())
+
+  it('reads the same full inventory on a Crew Mode gateway as on one without', async () => {
+    const { renderHook } = await import('@testing-library/react')
+    const { result } = renderHook(() => useRecentsProvider())
+    await result.current.search('')
+    expect(apiMock.sessions).toHaveBeenLastCalledWith(20, 0, true)
+    setCrewModeCatalog('kirocrew-conductor', ['kirocrew-conductor'])
+    await result.current.search('')
+    expect(apiMock.sessions).toHaveBeenLastCalledWith(20, 0, true)
   })
 })

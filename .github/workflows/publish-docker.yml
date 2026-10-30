@@ -40,7 +40,10 @@ on:
         required: true
         type: string
       version:
-        description: "Image version tag (matches the CDN version label)"
+        description: >-
+          Image version tag. It matches the CDN lanes' version label on a fresh
+          build; on a stable byte promotion the CDN lanes keep the candidate's
+          version while this tag is the released one.
         required: true
         type: string
       publish:
@@ -49,7 +52,10 @@ on:
         type: boolean
         default: true
       require_public_access:
-        description: "Require an anonymous pull to succeed after publishing"
+        description: >-
+          Require an anonymous pull to succeed after publishing. The check runs
+          only when github.repository_owner is kirodotdev; elsewhere this input
+          has no effect.
         required: false
         type: boolean
         default: false
@@ -66,8 +72,10 @@ on:
         default: false
       promote_digest:
         description: >-
-          Recorded attested manifest digest to promote. Used only when promote
-          is true; it never implicitly selects promotion or build mode.
+          Recorded attested manifest digest to promote. Must be
+          sha256:<64 lowercase hex> when promote is true and must be empty
+          otherwise: a non-empty value with promote=false fails the run. It
+          never implicitly selects promotion or build mode.
         required: false
         type: string
         default: ""
@@ -119,7 +127,7 @@ jobs:
 
       - name: Download wheel artifact
         if: ${{ !inputs.promote }}
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: ${{ inputs.wheel_artifact }}
           path: dist
@@ -134,7 +142,7 @@ jobs:
           find dist -type f ! -name '*.whl' -delete
           mapfile -t WHEELS < <(find dist -type f -name '*.whl')
           if [ "${#WHEELS[@]}" -ne 1 ]; then
-            echo "Expected exactly one wheel, found ${#WHEELS[@]}:"; printf '%s\n' "${WHEELS[@]}"; exit 1
+            echo "Expected exactly one wheel, found ${#WHEELS[@]}:"; printf '%s\n' ${WHEELS[@]+"${WHEELS[@]}"}; exit 1
           fi
           ls -la dist/
 
@@ -206,21 +214,18 @@ jobs:
         if: steps.existing.outputs.exists == 'false'
         uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
 
-      # Resolve the kiro-cli version BEFORE the build so (a) the Dockerfile
-      # can cross-check that the manifest did not move mid-build and (b) the
-      # resolved version lands in the dev.kirocrew.kiro-cli.version OCI
-      # label — an auditable record of the agent runtime a digest carries.
-      # The Dockerfile independently sha256-verifies the downloaded bytes
-      # against the manifest (fail-closed).
+      # Read the pinned kiro-cli version BEFORE the build so it lands in the
+      # dev.kirocrew.kiro-cli.version OCI label -- an auditable record of the
+      # agent runtime a digest carries. The Dockerfile installs the same pin
+      # (packaging/kiro-cli-version), sha256-verified against
+      # packaging/kiro-cli-sha256, and fails if the two disagree.
       - name: Resolve kiro-cli version
         if: steps.existing.outputs.exists == 'false' && !inputs.promote
         id: kirocli
         run: |
           set -euo pipefail
-          VERSION_RESOLVED=$(curl --proto '=https' --tlsv1.2 -fsSL \
-            "https://desktop-release.q.us-east-1.amazonaws.com/latest/manifest.json" \
-            | python3 -c 'import json,sys;print(json.load(sys.stdin)["version"])')
-          echo "Resolved kiro-cli ${VERSION_RESOLVED}"
+          VERSION_RESOLVED="$(tr -d '[:space:]' < packaging/kiro-cli-version)"
+          echo "Pinned kiro-cli ${VERSION_RESOLVED}"
           echo "version=${VERSION_RESOLVED}" >> "$GITHUB_OUTPUT"
 
       # Version tag ONLY here — channel aliases move after attestation.
@@ -230,7 +235,7 @@ jobs:
       - name: Build and push (version tag)
         if: steps.existing.outputs.exists == 'false' && !inputs.promote
         id: build
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: docker/Dockerfile

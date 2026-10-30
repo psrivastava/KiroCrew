@@ -17,12 +17,15 @@ from __future__ import annotations
 
 import logging
 import re
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
+from kiro_crew import __version__, code_fingerprint, platform_compat, release_channel
 from kiro_crew.cloud import aws, sizes
 from kiro_crew.deploy import profiles as profiles_mod
+from kiro_crew.subprocess_utf8 import UTF8_TEXT
 from kiro_crew.validation import FieldSpec, ValidationError, validate_field
 
 logger = logging.getLogger(__name__)
@@ -41,7 +44,6 @@ _FAILED_STATES = {
     "DELETE_FAILED",
     "UPDATE_ROLLBACK_FAILED",
 }
-_DELETE_DONE = "DELETE_COMPLETE"
 _DISCOVERABLE_STACK_STATES = sorted(
     _COMPLETE_STATES
     | _FAILED_STATES
@@ -79,7 +81,7 @@ _REGION_SPEC = FieldSpec(name="region", type=str, max_len=32, pattern=_REGION_RE
 # The profile charset ('+' admitted for IAM Identity Center derived names,
 # leading '-' excluded so a value is never option-shaped, \Z anchor)
 # is deploy/profiles.py's PROFILE_SPEC, aliased rather than re-spelled here
-# (same idiom as deploy/handlers.py; cloud/ already depends on deploy via the
+# (same idiom as deploy/handlers_sites.py; cloud/ already depends on deploy via the
 # shared aws-bin resolver in cloud/aws.py).
 _PROFILE_SPEC = profiles_mod.PROFILE_SPEC
 _CIDR_RE = re.compile(r"^\d{1,3}(\.\d{1,3}){3}/\d{1,2}\Z")
@@ -92,9 +94,81 @@ _REPO_RE = re.compile(r"^[A-Za-z0-9_.:/@+-]{1,255}\Z")
 _REPO_SPEC = FieldSpec(name="repo", type=str, max_len=255, pattern=_REPO_RE)
 _REF_RE = re.compile(r"^[A-Za-z0-9_./-]{1,128}\Z")
 _REF_SPEC = FieldSpec(name="ref", type=str, max_len=128, pattern=_REF_RE)
+#: Where the template's public-repo fallback clones from when no ``repo`` is
+#: passed: the ``KirocrewRepo`` default of ``kirocrew-ec2.yaml``, spelled here
+#: too because the release-tag probe below must ask the SAME remote the
+#: instance will clone (``test_cloud_ec2.py`` pins the two spellings together).
+PUBLIC_REPO_URL = "https://github.com/kirodotdev/KiroCrew.git"
+#: Budget for one ``git ls-remote`` round trip to that remote. A launch already
+#: waits minutes on CloudFormation, so a slow answer costs little; a hung one
+#: must not hang the launch, and a miss is never worse than today's ``main``.
+_REF_PROBE_TIMEOUT_SECONDS = 15.0
 # EC2 subnet ids are `subnet-` + 8 (EC2-Classic era) or 17 hex chars.
 _SUBNET_ID_RE = re.compile(r"^subnet-[0-9a-f]{8,17}\Z")
 _SUBNET_ID_SPEC = FieldSpec(name="subnet_id", type=str, max_len=24, pattern=_SUBNET_ID_RE)
+# `--ami`: EC2 image ids are `ami-` + 8 or 17 lowercase hex chars. Mirrored by
+# the template's CustomAmiId AllowedPattern.
+_AMI_ID_RE = re.compile(r"^ami-[0-9a-f]{8,17}\Z")
+_AMI_ID_SPEC = FieldSpec(name="ami", type=str, required=True, max_len=21, pattern=_AMI_ID_RE)
+# `--extra-packages`: each name is expanded into the root user-data script, so
+# the charset is an allowlist with no shell metacharacters, and a name must
+# start alphanumeric so it can never be read as a dnf option. The total-length
+# cap bounds the UserData growth (EC2's 16 KB decoded limit; the template's
+# ExtraPackages MaxLength mirrors EXTRA_PACKAGES_MAX_LEN).
+_EXTRA_PACKAGE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,99}\Z")
+EXTRA_PACKAGES_MAX_LEN = 256
+
+
+def validate_ami_id(ami_id: str) -> str:
+    """Return ``ami_id`` if it is a well-formed EC2 image id, else raise."""
+    return validate_field(ami_id, _AMI_ID_SPEC) or ""
+
+
+# `--ssm-kms-key`: a FULL KMS key ARN, the one key the instance role is
+# granted for encrypted Session Manager. Aliases, wildcards, other services and
+# bare key ids are refused: the value becomes an IAM Resource, so it must name
+# exactly one key. Key ids are UUIDs or multi-Region `mrk-<hex>` ids. Only the
+# `aws` partition: the boundary and its KMS ceiling are `arn:aws` ARNs, so a
+# China or GovCloud key would be capped to nothing. The template's SsmKmsKeyArn
+# AllowedPattern mirrors this.
+_SSM_KMS_KEY_RE = re.compile(
+    r"^arn:aws:kms:[a-z]{2}(-[a-z]+)+-[0-9]:[0-9]{12}:key/(mrk-[0-9a-f]{32}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\Z"
+)
+_SSM_KMS_KEY_SPEC = FieldSpec(
+    name="ssm-kms-key", type=str, required=True, max_len=128, pattern=_SSM_KMS_KEY_RE
+)
+
+
+def validate_ssm_kms_key_arn(arn: str) -> str:
+    """Return ``arn`` if it is one full KMS key ARN, else raise ValidationError."""
+    return validate_field(arn, _SSM_KMS_KEY_SPEC) or ""
+
+
+def normalize_extra_packages(raw: str) -> str:
+    """Validate a comma/space-separated package list; return it space-joined.
+
+    Duplicates are dropped (first occurrence wins). Raises
+    :class:`ValidationError` for any name outside the allowlist charset or a
+    joined value longer than :data:`EXTRA_PACKAGES_MAX_LEN`.
+    """
+    names: list[str] = []
+    for name in re.split(r"[, ]+", raw or ""):
+        if not name:
+            continue
+        if not _EXTRA_PACKAGE_RE.match(name):
+            raise ValidationError(
+                "extra_packages",
+                f"{name!r} is not a valid package name "
+                "(letters, digits and . _ + - only; must start with a letter or digit)",
+            )
+        if name not in names:
+            names.append(name)
+    joined = " ".join(names)
+    if len(joined) > EXTRA_PACKAGES_MAX_LEN:
+        raise ValidationError(
+            "extra_packages", f"list is {len(joined)} characters (at most {EXTRA_PACKAGES_MAX_LEN})"
+        )
+    return joined
 
 
 def _validate_cidr(cidr: str) -> str:
@@ -216,7 +290,7 @@ def azs_offering_instance_type(instance_type: str, profile: str, region: str) ->
 # us-east-1 there regardless of the launch region, so it is literal here too.
 _BOOTSTRAP_DOWNLOAD_HOSTS = (
     "desktop-release.q.us-east-1.amazonaws.com",  # kiro-cli musl build
-    "nodejs.org",  # Node >= NODE_MAJOR_MIN tarball
+    "nodejs.org",  # Node >= NODE_MIN tarball
 )
 
 
@@ -518,6 +592,116 @@ def _subnet_egress_kinds(vpc_id: str, profile: str, region: str) -> dict:
     return result
 
 
+def release_tag_exists(ref: str, repo: str = "") -> bool:
+    """Whether ``repo`` (default: the public repo) carries the tag ``ref``.
+
+    One ``git ls-remote --exit-code`` against the remote, with a short timeout,
+    run from the trusted git's own directory rather than the gateway's working
+    directory: the gateway may be sitting inside a repository the agent can
+    write to, and a ``.git/config`` there (``url.*.insteadOf`` onto an
+    ``ext::`` transport) would otherwise decide
+    what the probe runs. Repository-local config has no env switch — git finds
+    it by walking up from ``cwd`` — so ``GIT_CEILING_DIRECTORIES`` names that
+    same directory and the walk never climbs past it; the only ``.git/config``
+    git could then honour sits where the agent cannot write. Everything the
+    environment CAN switch off (inherited ``GIT_*``, global and system config,
+    the credential prompt) is :func:`code_fingerprint.hardened_git_env`, the
+    gateway's one hardened-git recipe. ``git`` itself comes from
+    :func:`platform_compat.trusted_git_bin`, never a bare ``PATH`` lookup: the
+    gateway's ``PATH`` can lead with an agent-writable directory, and a shim
+    there would run with the gateway's privileges on every packaged launch.
+    Any way of not getting a definite "yes" — no trusted ``git`` on this
+    machine, no network, a 128 from the remote, a timeout — answers ``False``:
+    the caller then keeps the template default rather than asking the instance
+    to clone a tag that may not be there, which would fail the boot inside the
+    stack.
+    """
+    git = platform_compat.trusted_git_bin()
+    if git is None:
+        logger.warning(
+            "no trusted git on this machine; cannot probe %s for tag %s",
+            repo or PUBLIC_REPO_URL,
+            ref,
+        )
+        return False
+    argv = [
+        git,
+        "ls-remote",
+        "--exit-code",
+        "--tags",
+        "--",
+        repo or PUBLIC_REPO_URL,
+        f"refs/tags/{ref}",
+    ]
+    trusted_dir = Path(git).resolve().parent
+    try:
+        proc = subprocess.run(
+            argv,
+            cwd=trusted_dir,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=_REF_PROBE_TIMEOUT_SECONDS,
+            env=code_fingerprint.hardened_git_env(GIT_CEILING_DIRECTORIES=str(trusted_dir)),
+            check=False,
+            **UTF8_TEXT,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.warning("could not probe %s for tag %s: %s", repo or PUBLIC_REPO_URL, ref, exc)
+        return False
+    if proc.returncode != 0:
+        logger.warning(
+            "tag %s not found on %s (git ls-remote exit %d)",
+            ref,
+            repo or PUBLIC_REPO_URL,
+            proc.returncode,
+        )
+        return False
+    return True
+
+
+def resolve_public_ref(repo: str = "") -> str:
+    """The git ref the public-repo clone should install for THIS build.
+
+    The template's ``KirocrewRef`` defaults to ``main``, which is right for a
+    checkout that ships its own source and wrong for a packaged install: the
+    instance then runs whatever ``main`` is while this machine runs a release,
+    and the remote-crew version gate (``apps.version.versions_compatible``)
+    refuses the pair on ``major.minor``. So a packaged install pins the first release tag
+    its own version names (:func:`release_channel.release_refs`, likeliest
+    first) that the remote confirms it has. Returns ``""`` — "let the template
+    default stand" — when no tag maps onto the version (a nightly) or the
+    remote carries none of them (a fork, a build stamped before its tag was
+    pushed, no network from here); the WARNING says which, and the launch
+    proceeds exactly as it does today.
+    """
+    refs = release_channel.release_refs()
+    if not refs:
+        logger.warning(
+            "no release tag maps onto Kiro Crew %s; the instance will run main", __version__
+        )
+        return ""
+    for ref in refs:
+        if release_tag_exists(ref, repo):
+            return ref
+    logger.warning(
+        "no release tag %s for Kiro Crew %s; the instance will run main",
+        " / ".join(refs),
+        __version__,
+    )
+    return ""
+
+
+def _account_of_policy_arn(arn: str) -> str:
+    """The account id field of an IAM policy ARN (``arn:aws:iam::<account>:policy/...``)."""
+    parts = arn.split(":")
+    if len(parts) < 6 or not re.fullmatch(r"[0-9]{12}", parts[4]):
+        raise aws.AWSError(
+            f"could not read the account id from the boundary ARN {arn!r}",
+            action="iam:GetPolicy",
+        )
+    return parts[4]
+
+
 def build_deploy_argv(
     *,
     tag: str,
@@ -531,6 +715,10 @@ def build_deploy_argv(
     allow_ssh_cidr: str = "",
     source_bucket: str = "",
     source_key: str = "",
+    ami_id: str = "",
+    extra_packages: str = "",
+    ssm_kms_key_arn: str = "",
+    extra_managed_policy_arns: tuple[str, ...] = (),
 ) -> list[str]:
     """Assemble the exact ``aws cloudformation deploy`` argv (also the dry-run output).
 
@@ -538,6 +726,13 @@ def build_deploy_argv(
     instance permissions boundary (``source.ensure_instance_boundary`` creates it
     once); it fills the template's ``PermissionsBoundaryArn`` parameter so the
     InstanceRole is capped by it instead of a per-launch CFN-authored boundary.
+
+    ``ami_id`` / ``extra_packages`` (``--ami`` / ``--extra-packages``) are
+    emitted only when set, so a stock launch's argv is unchanged. The same holds
+    for ``ssm_kms_key_arn`` (``--ssm-kms-key``): set, it adds ``SsmKmsKeyArn``
+    and the caller passes the KMS-session boundary ARN; unset, nothing changes.
+    ``extra_managed_policy_arns`` (the edition's ``cloud_instance_policy``) fills
+    ``ExtraManagedPolicyArns`` only when non-empty, for the same reason.
     """
     overrides = [
         f"InstanceType={tier.instance_type}",
@@ -559,6 +754,14 @@ def build_deploy_argv(
         overrides.append(f"KirocrewRef={ref}")
     if allow_ssh_cidr:
         overrides.append(f"AllowSshCidr={allow_ssh_cidr}")
+    if ami_id:
+        overrides.append(f"CustomAmiId={ami_id}")
+    if extra_packages:
+        overrides.append(f"ExtraPackages={extra_packages}")
+    if ssm_kms_key_arn:
+        overrides.append(f"SsmKmsKeyArn={ssm_kms_key_arn}")
+    if extra_managed_policy_arns:
+        overrides.append(f"ExtraManagedPolicyArns={','.join(extra_managed_policy_arns)}")
     return [
         "cloudformation",
         "deploy",
@@ -590,6 +793,9 @@ def deploy(
     disable_rollback: bool = False,
     dry_run: bool = False,
     proc_sink: Optional[Any] = None,
+    ami_id: str = "",
+    extra_packages: str = "",
+    ssm_kms_key_arn: str = "",
 ) -> DeployResult:
     """Provision (or update) the KiroCrew stack. Idempotent by stack name.
 
@@ -600,7 +806,13 @@ def deploy(
     :func:`resolve_explicit_subnet`) instead of auto-discovery. ``dry_run``
     returns the exact argv without calling AWS. ``proc_sink`` is forwarded to
     :func:`aws.run_aws` for the (long) deploy call so a caller running deploy on
-    a background thread can terminate the child on Ctrl+C.
+    a background thread can terminate the child on Ctrl+C. ``ami_id`` and
+    ``extra_packages`` customize the box (see :func:`validate_ami_id` and
+    :func:`normalize_extra_packages`); empty means the stock image and packages.
+    ``ssm_kms_key_arn`` (``--ssm-kms-key``, see :func:`validate_ssm_kms_key_arn`)
+    opts in to encrypted Session Manager: the role gets the opt-in KMS-session
+    boundary and an inline grant on exactly that key. Empty means the default
+    boundary and no KMS grant, byte-identical to a launch before the flag existed.
     """
     if not dry_run:
         aws.assert_human_action("cloudformation:CreateStack")
@@ -615,13 +827,33 @@ def deploy(
         repo = validate_field(repo, _REPO_SPEC) or ""
     if ref:
         ref = validate_field(ref, _REF_SPEC) or ""
+    if ami_id:
+        ami_id = validate_ami_id(ami_id)
+    extra_packages = normalize_extra_packages(extra_packages)
+    if ssm_kms_key_arn:
+        ssm_kms_key_arn = validate_ssm_kms_key_arn(ssm_kms_key_arn)
 
+    from kiro_crew.cloud import host_policy
     from kiro_crew.cloud import source as source_mod
+
+    # Check the edition's instance-role additions before anything reaches AWS: an
+    # invalid descriptor, or one that cannot be read, refuses the launch, dry run
+    # included. Every later read refuses the same way, so none can launch an
+    # instance without the required policies.
+    host_policy.instance_policy()
 
     if ship_source is None:
         ship_source = source_mod.find_repo_root() is not None
         if not ship_source:
             logger.info("no checkout found; the instance will clone the public repo")
+    # A public-repo clone with no explicit ref would install the template's
+    # `main`; pin this build's release tag instead so the instance can talk to
+    # this machine. The dry run stays offline (the probe is a network round
+    # trip), so its argv shows the ref only when the caller passed one.
+    if not ship_source and not ref and not dry_run:
+        ref = resolve_public_ref(repo)
+        if ref:
+            logger.info("the instance will install release tag %s", ref)
 
     if dry_run:
         # For the dry run we can't hit AWS for the VPC or account id, so show
@@ -639,6 +871,10 @@ def deploy(
             allow_ssh_cidr=allow_ssh_cidr,
             source_bucket="<auto>" if ship_source else "",
             source_key=f"{tag}/kirocrew-src.tar.gz" if ship_source else "",
+            ami_id=ami_id,
+            extra_packages=extra_packages,
+            ssm_kms_key_arn=ssm_kms_key_arn,
+            extra_managed_policy_arns=tuple(host_policy.managed_policy_arns("<account>")),
         )
         return DeployResult(
             tag=tag,
@@ -658,7 +894,19 @@ def deploy(
     # InstanceRole is capped by it. Done before the source upload so a
     # boundary-create failure (e.g. missing iam:CreatePolicy) surfaces before we
     # ship anything to S3.
-    boundary_arn = source_mod.ensure_instance_boundary(profile, region)
+    #
+    # `--ssm-kms-key` selects the opt-in KMS-session boundary instead;
+    # without it the default boundary is the only one named, created or read.
+    if ssm_kms_key_arn:
+        boundary_arn = source_mod.ensure_instance_kms_boundary(profile, region)
+    else:
+        boundary_arn = source_mod.ensure_instance_boundary(profile, region)
+    # The edition's host policies, in the account the boundary ARN names (the one
+    # this launch resolved). Read once, before anything is uploaded, so the argv
+    # below cannot disagree with the check at the top or fail after the upload.
+    extra_managed_policy_arns = tuple(
+        host_policy.managed_policy_arns(_account_of_policy_arn(boundary_arn))
+    )
 
     # Package + upload the local source so the box installs from S3 (no GitHub
     # access needed). Fall back to a git clone only if source shipping is off.
@@ -708,6 +956,10 @@ def deploy(
         allow_ssh_cidr=allow_ssh_cidr,
         source_bucket=source_bucket,
         source_key=source_key,
+        ami_id=ami_id,
+        extra_packages=extra_packages,
+        ssm_kms_key_arn=ssm_kms_key_arn,
+        extra_managed_policy_arns=extra_managed_policy_arns,
     )
     # `cloudformation deploy` blocks until the stack settles (WaitCondition gates
     # on the gateway being healthy). "No changes" exits 0 with a message on reuse.
@@ -726,6 +978,15 @@ def deploy(
         if failures:
             lines = "; ".join(f"{f['resource']}: {f['reason']}" for f in failures[:4])
             detail = f" — root cause: {lines}"
+        # A denied attach of the edition's host policies means the second
+        # launcher policy was never applied. CloudFormation reports it only in
+        # the stack events, so name the one step that fixes it; the dashboard
+        # launch shows this same message.
+        if extra_managed_policy_arns and "iam:AttachRolePolicy" in (err + detail):
+            detail += (
+                " — this build attaches host policies to the instance role: apply the "
+                "second launcher policy from `kirocrew cloud iam-policy --host-policies`"
+            )
         _cleanup_uploaded_source()
         raise aws.AWSError(
             f"cloudformation deploy failed: {err.strip()[:200]}{hint}{detail}",
@@ -1102,8 +1363,10 @@ def destroy(
     deleting an already-gone stack is a no-op success.
 
     ``dry_run`` returns the argv without calling AWS. When ``wait`` is true this
-    blocks until the stack reaches ``DELETE_COMPLETE`` (or raises on
-    ``DELETE_FAILED``).
+    blocks on :func:`wait_for_delete` and returns its verdict as ``destroyed``:
+    ``False`` means the wait did not confirm ``DELETE_COMPLETE``
+    (``DELETE_FAILED``, the timeout, or any other failed ``wait`` call). That
+    outcome is returned, never raised.
     """
     if not dry_run:
         aws.assert_human_action("cloudformation:DeleteStack")

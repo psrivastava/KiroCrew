@@ -83,6 +83,19 @@ class RefreshRejected(RefreshError):
     """
 
 
+class RefreshBlocked(RefreshError):
+    """The refresh could not even be ATTEMPTED: a local precondition is missing.
+
+    Raised from :meth:`KasToken.refresh_blocker` -- a refresh token with no
+    stored client credentials, an external IdP entry with no token endpoint.
+    Like :class:`RefreshRejected` it is permanent: nothing on this machine will
+    change between polls, so a retry cannot help and only a new sign-in writes
+    the missing input. Unlike it, no issuer was asked, so no marker is recorded
+    on the store. Readers that choose between "sign in again" and "try later"
+    treat both subclasses as the former.
+    """
+
+
 # The issuer statuses that mean "this grant is refused" rather than "try later".
 _REJECTED_STATUSES = frozenset({400, 401, 403})
 
@@ -141,7 +154,9 @@ async def ensure_fresh(
             # whole lock-file setup stays off the event loop.
             lock_path = store.lock_path(token.identity)
             lock_path.parent.mkdir(parents=True, exist_ok=True)
-            return os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+            from kiro_crew.platform_compat import open_create_or_existing
+
+            return open_create_or_existing(str(lock_path), os.O_RDWR, 0o600)
 
         fd = await asyncio.to_thread(_open_refresh_lock)
         try:
@@ -181,15 +196,18 @@ async def ensure_fresh(
 
 
 async def _refresh(token: KasToken, *, session: aiohttp.ClientSession) -> KasToken:
-    if not token.refresh_token:
-        raise RefreshError(f"no refresh token for identity {token.identity}")
+    # One gate for every local precondition, shared with whoever must REFUSE a token
+    # rather than refresh it (the crew container's vault seed). Spelling these out per
+    # branch is how the refuser and the refresher drift into disagreeing about which
+    # tokens are renewable.
+    blocker = token.refresh_blocker()
+    if blocker:
+        raise RefreshBlocked(blocker)
     if token.identity == "social":
         return await _refresh_social(token, session=session)
     if token.identity == "external_idp":
         return await _refresh_external_idp(token, session=session)
-    if token.identity in ("builder_id", "identity_center"):
-        return await _refresh_sso_oidc(token, session=session)
-    raise RefreshError(f"unknown identity for refresh: {token.identity}")
+    return await _refresh_sso_oidc(token, session=session)
 
 
 async def _refresh_social(token: KasToken, *, session: aiohttp.ClientSession) -> KasToken:
@@ -212,12 +230,11 @@ async def _refresh_social(token: KasToken, *, session: aiohttp.ClientSession) ->
         refresh_token=data.get("refreshToken") or token.refresh_token,
         profile_arn=profile_arn,
         region=token.region,
+        extra=dict(token.extra),
     )
 
 
 async def _refresh_sso_oidc(token: KasToken, *, session: aiohttp.ClientSession) -> KasToken:
-    if not (token.client_id and token.client_secret):
-        raise RefreshError("SSO-OIDC refresh needs stored client credentials")
     region = token.region or "us-east-1"
     url = f"{oidc_url(region)}/token"
     payload = {
@@ -241,21 +258,22 @@ async def _refresh_sso_oidc(token: KasToken, *, session: aiohttp.ClientSession) 
         region=region,
         client_id=token.client_id,
         client_secret=token.client_secret,
+        extra=dict(token.extra),
     )
 
 
 async def _refresh_external_idp(token: KasToken, *, session: aiohttp.ClientSession) -> KasToken:
-    if not token.token_endpoint:
-        raise RefreshError("external IdP refresh needs a token endpoint")
+    # Bound for the type checker, which cannot see that `refresh_blocker()` in `_refresh`
+    # already required it. Not a second precondition: the reason string lives there.
+    endpoint = token.token_endpoint
+    assert endpoint, "refresh_blocker() admits no external_idp token without an endpoint"
     form = {
         "grant_type": "refresh_token",
         "refresh_token": token.refresh_token or "",
     }
     if token.client_id:
         form["client_id"] = token.client_id
-    async with session.post(
-        token.token_endpoint, data=form, headers={"User-Agent": USER_AGENT}
-    ) as resp:
+    async with session.post(endpoint, data=form, headers={"User-Agent": USER_AGENT}) as resp:
         if resp.status != 200:
             body = await resp.text()
             raise _http_failure("external IdP", resp.status, body)
@@ -271,6 +289,7 @@ async def _refresh_external_idp(token: KasToken, *, session: aiohttp.ClientSessi
         auth_method="external_idp",
         client_id=token.client_id,
         token_endpoint=token.token_endpoint,
+        extra=dict(token.extra),
     )
 
 

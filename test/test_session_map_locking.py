@@ -120,6 +120,68 @@ class TestConcurrentMutation:
         assert errors == []
 
 
+class TestDeleteIfSid:
+    def test_reports_match_mismatch_and_absence(self, session_map):
+        key = "subagent:kept-run"
+        session_map.set(key, "rejected-sid")
+
+        assert session_map.delete_if_sid(key, "other-sid") == (
+            False,
+            "rejected-sid",
+        )
+        assert session_map.mapped_sid(key) == "rejected-sid"
+        assert session_map.delete_if_sid("subagent:absent", "rejected-sid") == (
+            False,
+            None,
+        )
+        assert session_map.delete_if_sid(key, "rejected-sid") == (
+            True,
+            "rejected-sid",
+        )
+        assert session_map.mapped_sid(key) == ""
+
+    def test_compare_and_delete_excludes_a_successor_writer(self, session_map):
+        key = "subagent:kept-run"
+        session_map.set(key, "rejected-sid")
+        compare_completed = threading.Event()
+        release_delete = threading.Event()
+        successor_written = threading.Event()
+        result: list[tuple[bool, str | None]] = []
+        real_remove = session_map._remove_entry
+
+        def held_remove(*args, **kwargs):
+            compare_completed.set()
+            assert release_delete.wait(timeout=10), "delete hold was not released"
+            return real_remove(*args, **kwargs)
+
+        def delete_rejected() -> None:
+            result.append(session_map.delete_if_sid(key, "rejected-sid"))
+
+        def write_successor() -> None:
+            session_map.set(key, "successor-sid")
+            successor_written.set()
+
+        with patch.object(session_map, "_remove_entry", side_effect=held_remove):
+            deleter = threading.Thread(target=delete_rejected)
+            deleter.start()
+            assert compare_completed.wait(timeout=10), "delete never completed its comparison"
+            successor = threading.Thread(target=write_successor)
+            successor.start()
+            try:
+                assert not successor_written.wait(
+                    timeout=0.5
+                ), "successor interleaved between the expected-SID comparison and delete"
+            finally:
+                release_delete.set()
+                deleter.join(timeout=10)
+                successor.join(timeout=10)
+
+        assert not deleter.is_alive() and not successor.is_alive()
+        assert result == [(True, "rejected-sid")]
+        assert successor_written.is_set()
+        assert session_map.mapped_sid(key) == "successor-sid"
+
+
 class TestBatchIsOneCriticalSection:
     """Property 2: a batch excludes other threads, not just extra writes."""
 
@@ -159,6 +221,8 @@ class TestBatchIsOneCriticalSection:
                 session_map.set("dashboard:b", "sid-b")
                 session_map.set_flag("dashboard:a", "temporary", True)
         assert write.call_count == 1
+        assert session_map.mapped_sids_by_key() == {"dashboard:a": "sid-a", "dashboard:b": "sid-b"}
+        assert session_map.get_flag("dashboard:a", "temporary") is True
 
     def test_lock_is_released_when_a_batch_raises(self, session_map):
         with pytest.raises(ValueError):
@@ -265,9 +329,9 @@ class TestLockHoldIsBounded:
                 )
             )
             mutator.start()
-            assert loop_side_done.wait(timeout=5), (
-                "a loop-side mutation blocked behind a worker thread's map file read"
-            )
+            assert loop_side_done.wait(
+                timeout=5
+            ), "a loop-side mutation blocked behind a worker thread's map file read"
             mutator.join(timeout=10)
         finally:
             release.set()
@@ -323,10 +387,44 @@ class TestLockHoldIsBounded:
         )
 
 
+def _owner_trees() -> list[ast.Module]:
+    """Every module ``SessionMap`` binds members from (``session_map._OWNERS``), parsed."""
+    trees = [
+        ast.parse((SRC / f"{owner.rpartition('.')[2]}.py").read_text(encoding="utf-8"))
+        for owner in session_map_mod._OWNERS
+    ]
+    assert trees, "SessionMap binds its members from owner modules beside the facade"
+    return trees
+
+
+def _family_tree() -> ast.Module:
+    """``session_map.py`` and every owner module, scanned as one module."""
+    facade = ast.parse((SRC / "session_map.py").read_text(encoding="utf-8"))
+    owners = [node for tree in _owner_trees() for node in tree.body]
+    return ast.Module(body=[*facade.body, *owners], type_ignores=[])
+
+
 def _session_map_class() -> ast.ClassDef:
     tree = ast.parse((SRC / "session_map.py").read_text(encoding="utf-8"))
     for node in tree.body:
         if isinstance(node, ast.ClassDef) and node.name == "SessionMap":
+            # The class binds an owner's function by name (``m = _owner.m``, or
+            # ``staticmethod(_owner.m)``), so those functions are its members: scan them.
+            names = {
+                target.id
+                for stmt in node.body
+                if isinstance(stmt, ast.Assign)
+                for target in stmt.targets
+                if isinstance(target, ast.Name)
+            }
+            bound = [
+                fn
+                for owner_tree in _owner_trees()
+                for fn in owner_tree.body
+                if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)) and fn.name in names
+            ]
+            assert bound, "no owner function was found to scan with the class"
+            node.body.extend(bound)
             return node
     raise AssertionError("SessionMap class not found")
 
@@ -433,7 +531,7 @@ class TestNoLockAcrossFlushAwait:
 
     def test_no_async_def_is_guarded(self):
         offenders = []
-        tree = ast.parse((SRC / "session_map.py").read_text(encoding="utf-8"))
+        tree = _family_tree()
         for fn in self._async_defs(tree):
             decorators = {d.id for d in fn.decorator_list if isinstance(d, ast.Name)}
             if "_guarded" in decorators:
@@ -447,14 +545,13 @@ class TestNoLockAcrossFlushAwait:
 
     def test_no_map_lock_block_awaits(self):
         offenders: list[str] = []
-        tree = ast.parse((SRC / "session_map.py").read_text(encoding="utf-8"))
+        tree = _family_tree()
         for fn in self._async_defs(tree):
             for node in ast.walk(fn):
                 if not isinstance(node, (ast.With, ast.AsyncWith)):
                     continue
                 holds_map_lock = any(
-                    isinstance(item.context_expr, ast.Name)
-                    and item.context_expr.id == "_MAP_LOCK"
+                    isinstance(item.context_expr, ast.Name) and item.context_expr.id == "_MAP_LOCK"
                     for item in node.items
                 )
                 if not holds_map_lock:

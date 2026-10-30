@@ -14,8 +14,9 @@ import pytest
 from aiohttp.test_utils import TestClient, TestServer
 from chat_test_helpers import _make_app, _make_state
 
-from kiro_crew.dashboard import chat_persistence
+from kiro_crew.dashboard import chat_persistence, chat_rewind
 from kiro_crew.dashboard.state import append_and_surface
+from kiro_crew.testing.wait import async_wait_until
 
 
 @pytest.fixture(autouse=True)
@@ -71,7 +72,6 @@ class TestRewindSlot:
             "dashboard:src", skip_if_busy=True
         )
         state.sessions.remove.assert_not_awaited()
-        # Cleanup runs
         if slot.task:
             slot.task.cancel()
 
@@ -147,7 +147,7 @@ class TestRewindSlot:
                 )
             )
             try:
-                await asyncio.wait_for(asyncio.to_thread(save_started.wait), timeout=1)
+                await async_wait_until(save_started.is_set, off_loop=True)
                 await asyncio.to_thread(state.flush_slot_now, slot)
                 fail_save.set()
                 resp = await request_task
@@ -305,9 +305,16 @@ class TestRewindSlot:
         state.sessions._session_map.get = MagicMock(return_value="")
 
         def _save_stamps_witnesses(
-            _state, saved_slot, msgs, *, expected_history_key, expected_disk_older_count
+            _state,
+            saved_slot,
+            msgs,
+            *,
+            expected_history_key,
+            expected_disk_older_count,
+            expected_slot_name,
         ):
             # Emulate the real save's post-write bookkeeping on the live slot.
+            assert expected_slot_name == "src", "the write must carry the slot's map key"
             saved_slot._pending_rewrite = False
             saved_slot._disk_window_len = len(msgs)
             saved_slot._disk_meta_observed = True
@@ -362,9 +369,16 @@ class TestRewindSlot:
         state.sessions.discard_conversation = AsyncMock(side_effect=_moves_the_boundary)
 
         def _record_pairing(
-            _state, saved_slot, msgs, *, expected_history_key, expected_disk_older_count
+            _state,
+            saved_slot,
+            msgs,
+            *,
+            expected_history_key,
+            expected_disk_older_count,
+            expected_slot_name,
         ):
             seen["boundary"] = expected_disk_older_count
+            seen["slot_name"] = expected_slot_name
             return True
 
         monkeypatch.setattr(
@@ -381,6 +395,9 @@ class TestRewindSlot:
 
         # The PRE-await boundary, not the one the worker would have read.
         assert seen["boundary"] == 0
+        # And the map key, so the commit boundary can tell a same-name
+        # replacement from this slot.
+        assert seen["slot_name"] == "src"
         assert slot._disk_older_count == 0  # the commit re-adopts it
         assert slot._disk_older_durable_count == 0  # and the durable base with it
         if slot.task:
@@ -1295,7 +1312,7 @@ class TestRewindSlot:
 
         fake_request.json = _json  # type: ignore[method-assign]
         handler_task = asyncio.create_task(api_chat_slot_rewind(fake_request))
-        await asyncio.wait_for(asyncio.to_thread(save_started.wait), timeout=2)
+        await async_wait_until(save_started.is_set, off_loop=True)
         handler_task.cancel()
         release.set()
         with pytest.raises(asyncio.CancelledError):
@@ -1304,10 +1321,7 @@ class TestRewindSlot:
         # The commit landed: truncated window plus the edited user row.
         assert [m["content"] for m in slot.messages] == ["edited first question"]
         # The reserved dispatch task still runs the edited prompt.
-        for _ in range(50):
-            if _mock_run_chat.await_count:
-                break
-            await asyncio.sleep(0.02)
+        await async_wait_until(lambda: _mock_run_chat.await_count > 0)
         _mock_run_chat.assert_awaited_once()
         assert _mock_run_chat.await_args.args[2] == "edited first question"
 
@@ -1361,7 +1375,7 @@ class TestRewindSlot:
 
         fake_request.json = _json  # type: ignore[method-assign]
         handler_task = asyncio.create_task(api_chat_slot_rewind(fake_request))
-        await asyncio.wait_for(asyncio.to_thread(save_started.wait), timeout=2)
+        await async_wait_until(save_started.is_set, off_loop=True)
         handler_task.cancel()
         release.set()
         with pytest.raises(asyncio.CancelledError):
@@ -1461,15 +1475,30 @@ class TestRewindSlot:
             pending.set_result(None)
 
     @pytest.mark.asyncio
-    async def test_rewind_empty_content_400(self, tmp_path):
+    @pytest.mark.parametrize(
+        "body",
+        [
+            pytest.param({"at_message_index": 0, "content": ""}, id="rewind_empty_content_400"),
+            pytest.param(
+                {"at_message_index": 99, "content": "x"}, id="rewind_index_out_of_range_400"
+            ),
+            # Booleans are int subclasses in Python -- reject them explicitly.
+            pytest.param(
+                {"at_message_index": True, "content": "x"}, id="rewind_bool_index_rejected"
+            ),
+            # Index pointing at an assistant message must be rejected.
+            pytest.param(
+                {"at_message_index": 1, "content": "x"}, id="rewind_assistant_index_rejected"
+            ),
+            pytest.param({"ts": "no-such-ts", "content": "x"}, id="rewind_unknown_ts_400"),
+        ],
+    )
+    async def test_rewind_bad_request_400(self, tmp_path, body):
         state = _make_state(tmp_path)
         _populate_slot(state)
         app = _make_app(state)
         async with TestClient(TestServer(app)) as client:
-            resp = await client.post(
-                "/api/chat/slots/src/rewind",
-                json={"at_message_index": 0, "content": ""},
-            )
+            resp = await client.post("/api/chat/slots/src/rewind", json=body)
             assert resp.status == 400
 
     @pytest.mark.asyncio
@@ -1499,18 +1528,6 @@ class TestRewindSlot:
                 assert resp.status == 400, f"expected 400 for content={bad_content!r}"
 
     @pytest.mark.asyncio
-    async def test_rewind_index_out_of_range_400(self, tmp_path):
-        state = _make_state(tmp_path)
-        _populate_slot(state)
-        app = _make_app(state)
-        async with TestClient(TestServer(app)) as client:
-            resp = await client.post(
-                "/api/chat/slots/src/rewind",
-                json={"at_message_index": 99, "content": "x"},
-            )
-            assert resp.status == 400
-
-    @pytest.mark.asyncio
     async def test_rewind_negative_index_400(self, tmp_path):
         state = _make_state(tmp_path)
         _populate_slot(state)
@@ -1519,44 +1536,6 @@ class TestRewindSlot:
             resp = await client.post(
                 "/api/chat/slots/src/rewind",
                 json={"at_message_index": -1, "content": "x"},
-            )
-            assert resp.status == 400
-
-    @pytest.mark.asyncio
-    async def test_rewind_bool_index_rejected(self, tmp_path):
-        """Booleans are int subclasses in Python — reject them explicitly."""
-        state = _make_state(tmp_path)
-        _populate_slot(state)
-        app = _make_app(state)
-        async with TestClient(TestServer(app)) as client:
-            resp = await client.post(
-                "/api/chat/slots/src/rewind",
-                json={"at_message_index": True, "content": "x"},
-            )
-            assert resp.status == 400
-
-    @pytest.mark.asyncio
-    async def test_rewind_assistant_index_rejected(self, tmp_path):
-        """Index pointing at an assistant message must be rejected."""
-        state = _make_state(tmp_path)
-        _populate_slot(state)
-        app = _make_app(state)
-        async with TestClient(TestServer(app)) as client:
-            resp = await client.post(
-                "/api/chat/slots/src/rewind",
-                json={"at_message_index": 1, "content": "x"},
-            )
-            assert resp.status == 400
-
-    @pytest.mark.asyncio
-    async def test_rewind_unknown_ts_400(self, tmp_path):
-        state = _make_state(tmp_path)
-        _populate_slot(state)
-        app = _make_app(state)
-        async with TestClient(TestServer(app)) as client:
-            resp = await client.post(
-                "/api/chat/slots/src/rewind",
-                json={"ts": "no-such-ts", "content": "x"},
             )
             assert resp.status == 400
 
@@ -1634,10 +1613,7 @@ class TestRewindSlot:
             assert resp.status == 200
 
         # Wait briefly for the create_task'd _run_chat to be picked up
-        for _ in range(20):
-            if _mock_run_chat.await_count > 0:
-                break
-            await asyncio.sleep(0.01)
+        await async_wait_until(lambda: _mock_run_chat.await_count > 0)
         _mock_run_chat.assert_awaited_once()
         args = _mock_run_chat.await_args.args
         # _run_chat(state, slot, content) — content should be stripped
@@ -1684,6 +1660,89 @@ class TestRewindSlot:
         # Cross-app access returns 404 (indistinguishable from a missing slot)
         # to prevent slot enumeration; SEL still records the true reason.
         assert resp.status == 404
+
+
+class TestRewindCommitBoundaryIdentity:
+    """POST /api/chat/slots/{slot}/rewind — what decides the truncating commit.
+
+    Rewind dispatches its rewrite onto a worker thread and the event loop is
+    free until that thread commits, so a same-name close-and-recreate can
+    republish the name in between. Such a replacement resumes the SAME
+    transcript, which leaves ``expected_history_key`` identical and the routing
+    pin satisfied, so only re-reading the slot map at the locked commit boundary
+    can refuse the write. Rewind has no loop-side identity check to fall back
+    on: the map is read once, when the handler resolves the slot.
+    """
+
+    @pytest.mark.asyncio
+    async def test_rewind_pins_the_truncating_write_to_its_transcript(self, tmp_path):
+        state = _make_state(tmp_path)
+        _populate_slot(state)
+        state.sessions._session_map.get = MagicMock(return_value="")
+
+        saved = MagicMock(return_value=True)
+        with patch.object(chat_rewind, "_save_slot_to_history", new=saved):
+            app = _make_app(state)
+            async with TestClient(TestServer(app)) as client:
+                resp = await client.post(
+                    "/api/chat/slots/src/rewind",
+                    json={"at_message_index": 0, "content": "edited first question"},
+                )
+                assert resp.status == 200
+
+        assert saved.call_count == 1
+        assert saved.call_args.kwargs["expected_history_key"] == chat_persistence.slot_history_key(
+            state.get_slot("src")
+        )
+        assert saved.call_args.kwargs["expected_slot_name"] == "src"
+
+    @pytest.mark.asyncio
+    async def test_rewind_skips_the_write_when_the_slot_is_recreated(self, tmp_path):
+        """A same-name recreate inside the locked write must refuse the rewrite.
+
+        Committing would land the rewound window on the transcript the
+        replacement adopted, and nothing reads it back: the replacement's own
+        saves carry the truncation forward. Refusing writes nothing and leaves
+        the live slot whole, so the person can rewind again.
+        """
+        state = _make_state(tmp_path)
+        slot = _populate_slot(state)
+        state.sessions._session_map.get = MagicMock(return_value="")
+        key = chat_persistence.slot_history_key(slot)
+        # A replacement resuming the SAME transcript: what a same-name recreate
+        # produces, and what makes the routing pin alone insufficient.
+        replacement = state.get_or_create_slot("srcb", linked_session_key=key)
+
+        real_status = state.conversation_log.get_metadata_status
+
+        def _swap_inside_the_locked_write(history_key):
+            if state._slots.get("src") is slot:
+                state._slots["src"] = replacement
+            return real_status(history_key)
+
+        with patch.object(
+            state.conversation_log,
+            "get_metadata_status",
+            side_effect=_swap_inside_the_locked_write,
+        ):
+            app = _make_app(state)
+            async with TestClient(TestServer(app)) as client:
+                resp = await client.post(
+                    "/api/chat/slots/src/rewind",
+                    json={"at_message_index": 0, "content": "edited first question"},
+                )
+                assert resp.status == 503
+                assert (await resp.json())["code"] == "rewind_save_failed"
+
+        assert state.conversation_log.get_metadata(key) == {}
+        assert [m["content"] for m in slot.messages] == [
+            "first question",
+            "first answer",
+            "second question",
+            "second answer",
+        ]
+        if slot.task:
+            slot.task.cancel()
 
 
 class TestRewindChainedHistory:

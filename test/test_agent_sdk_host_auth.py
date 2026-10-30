@@ -38,12 +38,15 @@ import sys
 from pathlib import Path
 
 import pytest
+from source_corpus import parsed_candidates
 
-from kiro_crew import acp_backends, security
+from kiro_crew import acp_backends, kiro_cli_bundle, security
 from kiro_crew.acp import types as acp_types
-from kiro_crew.agent_sdk import host_auth, tool_gate
+from kiro_crew.agent_sdk import host_auth, native_allow_stores, tool_gate
 from kiro_crew.agent_sdk.backends import ACP_BACKEND_KAS, ACP_BACKEND_KIRO
+from kiro_crew.doctor_checks import render
 from kiro_crew.security import paths as security_paths
+from kiro_crew.security import paths_targets
 from kiro_crew.subprocess_utf8 import UTF8_TEXT
 
 SRC = Path(__file__).resolve().parent.parent / "src"
@@ -75,9 +78,15 @@ _ALLOWED_STDLIB = frozenset(
     }
 )
 
-#: The only in-tree import allowed here: itself a stdlib-only leaf, and the module
-#: that supplies the backend ids this table is keyed by.
-_ALLOWED_IN_TREE = frozenset({"kiro_crew.agent_sdk.backends"})
+#: The only in-tree imports allowed here, each itself a stdlib-only leaf: the module
+#: that supplies the backend ids this table is keyed by, and the one that composes
+#: the kiro-cli sign-in command its remedy text names.
+_ALLOWED_IN_TREE = frozenset({"kiro_crew.agent_sdk.backends", "kiro_crew.kiro_cli_bundle"})
+
+#: Stdlib modules the sign-in-command leaf may import. Kept apart from the table's
+#: own list so that list does not widen to cover what only the leaf needs.
+_ALLOWED_BUNDLE_STDLIB = frozenset({"__future__", "collections.abc", "os", "shlex", "sys"})
+KIRO_CLI_BUNDLE_PY = SRC / "kiro_crew" / "kiro_cli_bundle.py"
 
 #: Packages whose arrival would close the cycle the leaf exists to avoid.
 _FORBIDDEN_IN_TREE = (
@@ -304,7 +313,7 @@ def test_the_logout_recycle_set_is_projected_not_copied() -> None:
     # Published as a FUNCTION and nowhere as an ``ACP_BACKENDS_*`` set. That naming is
     # harness vocabulary, whose home is the backends module, and a derived answer is
     # not vocabulary -- ``scripts/check_harness_parity.py`` fails on a set defined
-    # outside that module, and the set could not be defined inside it either (it
+    # outside that module and its owners, and the set could not be defined inside it either (it
     # supplies the ids this table is keyed by). Asserted so the alias does not come
     # back as a convenience.
     for module in (host_auth, acp_types, acp_backends):
@@ -326,7 +335,9 @@ def test_the_override_pairing_is_the_declaration_projection() -> None:
     relocated token is still fenced. The pairing has to name the same leaf the
     floor fences and the same variable the resolver reads -- it was a third
     hand-maintained copy of both."""
-    assert security_paths._OVERRIDE_ANCHORED_LEAVES == host_auth.override_anchored_leaves()
+    assert security_paths._OVERRIDE_ANCHORED_LEAVES == (
+        host_auth.override_anchored_leaves() + native_allow_stores.override_anchored_leaves()
+    )
     assert security._OVERRIDE_ANCHORED_LEAVES is security_paths._OVERRIDE_ANCHORED_LEAVES
     assert security_paths._OVERRIDE_ANCHORED_LEAVES, "no leaf is override-anchored; vacuous"
 
@@ -335,7 +346,7 @@ def test_every_anchored_variable_is_a_declared_override() -> None:
     """The resolver only resolves variables the declarations name, so a variable
     that appears in the pairing but not in that list anchors on a root nobody ever
     resolved -- an entry describing protection that does not exist."""
-    resolved = set(host_auth.home_override_env_vars())
+    resolved = set(paths_targets._ADAPTER_ROOT_ENVS)
     for leaf, env_vars, _under_root in security_paths._OVERRIDE_ANCHORED_LEAVES:
         for env_var in env_vars:
             assert env_var in resolved, (
@@ -455,7 +466,7 @@ def test_an_own_leaf_from_its_own_declaration_is_accepted() -> None:
 
 @pytest.mark.parametrize(
     "source",
-    [host_auth.ENTITLEMENT_OWN_CREDENTIAL_FILE],
+    [host_auth.ENTITLEMENT_OWN_CREDENTIAL_FILE, host_auth.ENTITLEMENT_HOST_VAULT],
 )
 def test_logout_recycling_is_refused_off_the_host_store(source: str) -> None:
     """A host logout says nothing about a store the harness never reads, so
@@ -581,10 +592,13 @@ def test_no_current_driver_implements_the_login_protocol() -> None:
     for a harness whose login Kiro Crew drives -- and none of them has one yet.
     """
     implementers: list[str] = []
-    for source in sorted(SRC.rglob("kiro_crew/**/*.py")):
+    # A matched class defines every protocol method, so only the files whose text
+    # holds all of their names are parsed.
+    for source, _text, tree in parsed_candidates(
+        require_all=sorted(_LOGIN_PROTOCOL_METHODS), skip_syntax_errors=False
+    ):
         if source == HOST_AUTH_PY:
             continue
-        tree = ast.parse(source.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
             if not isinstance(node, ast.ClassDef):
                 continue
@@ -609,7 +623,7 @@ def test_no_current_driver_implements_the_login_protocol() -> None:
 def _no_adapter_overrides(monkeypatch):
     """Clear every declared override so a developer machine that exports one
     cannot make a default-location assertion pass for the wrong reason."""
-    for env_var in host_auth.home_override_env_vars():
+    for env_var in paths_targets._ADAPTER_ROOT_ENVS:
         monkeypatch.delenv(env_var, raising=False)
     security._home_targets_cache.clear()
     yield
@@ -624,7 +638,7 @@ def test_the_resolved_root_key_is_still_hashable(_no_adapter_overrides, tmp_path
     roots = security._resolve_root_anchors(str(tmp_path))
     assert isinstance(hash(roots), int)
     assert isinstance(roots.adapter_roots, tuple)
-    assert {env for env, _root in roots.adapter_roots} == set(host_auth.home_override_env_vars())
+    assert {env for env, _root in roots.adapter_roots} == set(paths_targets._ADAPTER_ROOT_ENVS)
 
 
 def test_a_changed_declared_override_changes_the_key(monkeypatch, tmp_path) -> None:
@@ -771,18 +785,153 @@ def test_the_kiro_signed_out_message_is_unchanged() -> None:
     )
     assert host_auth.signed_out_message("") == expected
     # KAS may draw its access token from Crew's own vault (the dashboard's Kiro
-    # sign-in card, under Developer > Agent Backend) OR from kiro-cli's store,
+    # sign-in card, under Settings > Agent Harness) OR from kiro-cli's store,
     # and the formatter cannot see which one a process had, so its sentence
     # names both sign-ins rather than repeating kiro's. The kiro-cli remedy
     # stays in it verbatim.
     kas = host_auth.signed_out_message("kas")
     assert kas != expected
     assert "`kiro-cli login`" in kas
-    assert "Developer → Agent Backend → Kiro sign-in" in kas
+    assert "Settings → Agent Harness → Kiro sign-in" in kas
     assert "start a new chat" in kas
     # The standing (unprobed) remedy names the same two paths, in plain prose.
     remedy = host_auth.declaration_for("kas").sign_in_remedy
-    assert "Developer → Agent Backend → Kiro sign-in" in remedy and "kiro-cli login" in remedy
+    assert "Settings → Agent Harness → Kiro sign-in" in remedy and "kiro-cli login" in remedy
+
+
+# ---------------------------------------------------------------------------
+# The kiro-cli command named is the one this host's spawn runs
+# ---------------------------------------------------------------------------
+
+_BUNDLED_POSIX_DIR = "/Applications/Kiro Crew.app/Contents/Resources/kiro-cli"
+_BUNDLED_WINDOWS_DIR = r"C:\Program Files\Kiro Crew\resources\kiro-cli"
+
+
+def _gate_login_command(environ: dict, platform_name: str) -> str:
+    """The sign-in command the setup gate serves for the binary a spawn resolves."""
+    binary = kiro_cli_bundle.spawn_kiro_cli_binary(environ, platform_name)
+    login, _sso, _bundled = kiro_cli_bundle.login_commands(
+        binary, environ, windows=platform_name == "win32"
+    )
+    return login
+
+
+@pytest.mark.parametrize("backend", [ACP_BACKEND_KIRO, ACP_BACKEND_KAS])
+@pytest.mark.parametrize("platform_name", ["linux", "darwin", "win32"])
+def test_a_path_install_names_the_bare_sign_in_command(backend: str, platform_name: str) -> None:
+    """With no bundled copy and no override, the shell finds ``kiro-cli`` on PATH,
+    so both strings are the declared ones word for word."""
+    declaration = host_auth.declaration_for(backend)
+    environ = {"PATH": "/usr/bin"}
+    assert host_auth.sign_in_remedy(backend, environ, platform_name) == declaration.sign_in_remedy
+    assert (
+        host_auth.signed_out_message(backend, environ, platform_name)
+        == declaration.signed_out_message
+    )
+    assert kiro_cli_bundle.KIRO_CLI_LOGIN_COMMAND in declaration.sign_in_remedy
+
+
+@pytest.mark.parametrize("backend", [ACP_BACKEND_KIRO, ACP_BACKEND_KAS])
+@pytest.mark.parametrize(
+    ("platform_name", "bundled_dir", "entry"),
+    [
+        ("darwin", _BUNDLED_POSIX_DIR, "kiro-cli-chat"),
+        ("linux", "/opt/Kiro Crew/resources/kiro-cli", "kiro-cli-chat"),
+        ("win32", _BUNDLED_WINDOWS_DIR, "kiro-cli.exe"),
+    ],
+)
+def test_a_bundled_install_names_the_absolute_path_the_gate_serves(
+    backend: str, platform_name: str, bundled_dir: str, entry: str
+) -> None:
+    """The desktop app's bundled copy is not on the user's shell PATH, so a bare
+    ``kiro-cli login`` fails there with command-not-found. Both strings carry the
+    same absolute-path command the setup gate serves, in place of the bare one."""
+    environ = {"PATH": "/usr/bin", kiro_cli_bundle.BUNDLED_KIRO_DIR_ENV: bundled_dir}
+    command = _gate_login_command(environ, platform_name)
+    assert command != kiro_cli_bundle.KIRO_CLI_LOGIN_COMMAND
+    assert entry in command
+    if platform_name == "win32":
+        assert command.startswith("powershell.exe -NoProfile -Command ")
+    remedy = host_auth.sign_in_remedy(backend, environ, platform_name)
+    signed_out = host_auth.signed_out_message(backend, environ, platform_name)
+    for text in (remedy, signed_out):
+        assert command in text
+        assert text.count(command) == 1
+        assert f" {kiro_cli_bundle.KIRO_CLI_LOGIN_COMMAND} " not in text
+        assert f"`{kiro_cli_bundle.KIRO_CLI_LOGIN_COMMAND}`" not in text
+    # The rewritten remedy keeps the panel's plain-text rules.
+    assert "--" not in remedy
+    assert "`" not in remedy
+
+
+@pytest.mark.parametrize("backend", [ACP_BACKEND_KIRO, ACP_BACKEND_KAS])
+def test_doctor_prints_the_bundled_sign_in_command_on_one_line(
+    backend: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``kirocrew doctor`` wraps its details at 80 columns, and the default macOS
+    app path has a space in it. A break there would leave two halves that run as
+    nothing, so the command the signed-out row names is kept on one line."""
+    environ = {"PATH": "/usr/bin", kiro_cli_bundle.BUNDLED_KIRO_DIR_ENV: _BUNDLED_POSIX_DIR}
+    command = kiro_cli_bundle.spawn_login_command(environ, "darwin")
+    signed_out = host_auth.signed_out_message(backend, environ, "darwin")
+    assert " " in command and command in signed_out
+    render._print_wrapped(signed_out, keep=(command,))
+    lines = [line.strip() for line in capsys.readouterr().out.splitlines()]
+    assert any(command in line for line in lines), lines
+    assert " ".join(lines) == " ".join(signed_out.split())
+
+
+@pytest.mark.parametrize("bundled", [False, True])
+def test_an_off_path_override_keeps_the_bare_command(bundled: bool) -> None:
+    """An operator's ``KIROCREW_KIRO_BIN`` may name a binary that is gone, and the
+    spawn then runs an install directory or the bundled copy instead. The remedy
+    cannot stat which one ran, so it never names the override's path."""
+    environ = {"PATH": "/usr/bin", kiro_cli_bundle.KIRO_BIN_OVERRIDE_ENV: "/opt/gone/kiro-cli"}
+    if bundled:
+        environ[kiro_cli_bundle.BUNDLED_KIRO_DIR_ENV] = _BUNDLED_POSIX_DIR
+    declaration = host_auth.declaration_for(ACP_BACKEND_KIRO)
+    assert host_auth.sign_in_remedy(ACP_BACKEND_KIRO, environ, "linux") == (
+        declaration.sign_in_remedy
+    )
+    assert "/opt/gone" not in host_auth.signed_out_message(ACP_BACKEND_KIRO, environ, "linux")
+
+
+def test_an_override_on_path_keeps_the_bare_command() -> None:
+    """An override inside a PATH directory is what the shell already runs."""
+    environ = {
+        "PATH": "/usr/local/bin",
+        kiro_cli_bundle.KIRO_BIN_OVERRIDE_ENV: "/usr/local/bin/kiro-cli",
+    }
+    declaration = host_auth.declaration_for(ACP_BACKEND_KIRO)
+    assert host_auth.sign_in_remedy(ACP_BACKEND_KIRO, environ, "linux") == (
+        declaration.sign_in_remedy
+    )
+
+
+def test_a_harness_off_the_host_store_ignores_the_bundled_copy() -> None:
+    """Only a harness that signs in through kiro-cli names its command, so a bundled
+    kiro-cli says nothing about how any other harness signs in."""
+    environ = {kiro_cli_bundle.BUNDLED_KIRO_DIR_ENV: _BUNDLED_POSIX_DIR}
+    for declaration in (*host_auth.AGENT_AUTH_DECLARATIONS, host_auth.UNKNOWN_AGENT_AUTH):
+        if declaration.entitlement_source == host_auth.ENTITLEMENT_HOST_IDENTITY_STORE:
+            continue
+        backend = declaration.backend
+        if backend == ACP_BACKEND_KIRO:
+            # The unknown declaration's id is the empty string, which is kiro's.
+            continue
+        assert host_auth.sign_in_remedy(backend, environ, "darwin") == declaration.sign_in_remedy
+        assert (
+            host_auth.signed_out_message(backend, environ, "darwin")
+            == declaration.signed_out_message
+        )
+
+
+def test_the_sign_in_command_leaf_imports_only_the_stdlib() -> None:
+    """The table imports this leaf at module scope, so the leaf carries the same
+    stdlib-only rule, read from its source."""
+    imports = _module_scope_imports(ast.parse(KIRO_CLI_BUNDLE_PY.read_text(encoding="utf-8")))
+    assert imports, "parsed no module-scope imports; the gate would pass vacuously"
+    assert sorted(name for name in imports if name not in _ALLOWED_BUNDLE_STDLIB) == []
 
 
 @pytest.mark.parametrize("blank", ["", "   ", "\n\t"])
@@ -826,3 +975,49 @@ def test_every_entitlement_source_has_an_operator_facing_label() -> None:
         assert "_" not in label, f"{source!r} labels itself with a code identifier"
     for declaration in host_auth.AGENT_AUTH_DECLARATIONS:
         assert "_" not in host_auth.entitlement_label(declaration.backend)
+
+
+def test_the_host_vault_source_is_declared_and_labelled() -> None:
+    """The third source the module always anticipated, now that it exists.
+
+    The comment above :data:`ENTITLEMENT_LABELS` said a harness entitled some other
+    way "would add a third here, with its label, when it exists". Adding the
+    identifier without adding it to both the source set and the label map is the one
+    way to land a source that ``__post_init__`` refuses (unknown source) or that
+    doctor prints raw -- so both memberships are asserted, not just one.
+    """
+    assert host_auth.ENTITLEMENT_HOST_VAULT in host_auth.ENTITLEMENT_SOURCES
+    assert host_auth.ENTITLEMENT_HOST_VAULT in host_auth.ENTITLEMENT_LABELS
+    assert host_auth.ENTITLEMENT_HOST_VAULT not in (
+        host_auth.ENTITLEMENT_HOST_IDENTITY_STORE,
+        host_auth.ENTITLEMENT_OWN_CREDENTIAL_FILE,
+    )
+    # A harness entitled from Crew's vault signs in somewhere other than the host
+    # identity store, so the panel still shows its standing caveat: the operator has
+    # to put a key in the vault and map it, which is an action doctor has not
+    # measured.
+    for declaration in host_auth.AGENT_AUTH_DECLARATIONS:
+        if declaration.entitlement_source != host_auth.ENTITLEMENT_HOST_VAULT:
+            continue
+        assert host_auth.signs_in_separately(declaration.backend)
+        assert declaration.backend not in host_auth.backends_retired_by_host_logout()
+
+
+def test_a_host_vault_harness_names_the_config_surface_that_feeds_it() -> None:
+    """Its remedy must send the operator to the vault, not to the harness's own file.
+
+    ``sign_in_remedy`` is rendered VERBATIM in the backend panel and printed by
+    doctor, and for this source the action is Crew's own -- store a secret, map it
+    in config. A remedy inherited from the file-based harnesses would tell the
+    operator to write a credential file that the child mask now hides, which is
+    advice that cannot work.
+    """
+    declarations = [
+        d
+        for d in host_auth.AGENT_AUTH_DECLARATIONS
+        if d.entitlement_source == host_auth.ENTITLEMENT_HOST_VAULT
+    ]
+    assert declarations, "no harness declares the host-vault source; this would be vacuous"
+    for declaration in declarations:
+        for text in (declaration.sign_in_remedy, declaration.signed_out_message):
+            assert "Secrets" in text, declaration.backend

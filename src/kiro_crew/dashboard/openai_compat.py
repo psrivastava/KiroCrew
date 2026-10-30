@@ -25,13 +25,21 @@ from aiohttp import web
 from kiro_crew import members as members_mod
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.context import _neutralize_structural_markers
-from kiro_crew.dashboard.chat_runner import _run_chat
+from kiro_crew.dashboard.chat_handlers import write_sse_or_abort
+from kiro_crew.dashboard.chat_runner import TURN_FAILED_META, _run_chat
+from kiro_crew.dashboard.chat_utils import TRANSIENT_RETRY_KIND
 from kiro_crew.dashboard.kiro_readiness import reject_if_kiro_unverified
-from kiro_crew.dashboard.state import DashboardState, _normalize_slot_key
+from kiro_crew.dashboard.relay_archive import (
+    RELAY_ARCHIVE_CODE,
+    RELAY_ARCHIVE_ERROR,
+    is_relay_archive,
+)
+from kiro_crew.dashboard.slot_ownership import app_owns_slot_session
+from kiro_crew.dashboard.state import DashboardState, _normalize_slot_key, load_window_off_loop
 from kiro_crew.dashboard.turn_dispatch import chat_turn_timeout_secs
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
-from kiro_crew.validation import _AGENT_NAME_RE
+from kiro_crew.validation import _AGENT_NAME_RE, is_registered_agent_name
 
 logger = logging.getLogger(__name__)
 
@@ -128,14 +136,32 @@ def _redact(text: str) -> str:
     return text
 
 
+def _foreign_slot_response() -> web.Response:
+    """The one 403 for a slot the app may not drive.
+
+    Another app's slot and the app's own slot linked to a conversation it has no
+    claim on answer with this same body, so the reply does not tell an app which
+    of its slots carry a link.
+    """
+    return web.json_response(
+        {
+            "error": {
+                "message": "slot owned by another app",
+                "type": "forbidden",
+                "code": "slot_owned_by_another_app",
+            },
+            "code": "slot_owned_by_another_app",
+        },
+        status=403,
+    )
+
+
 async def api_completions(request: web.Request) -> web.StreamResponse:
     """POST /v1/chat/completions — OpenAI-compatible chat endpoint."""
-    # Unlike the dashboard, this endpoint has no transcript the caller reads: the
-    # collectors below pick up only `chunk`/`assistant` roles, so the `error` card
-    # an AcpAuthRequired turn appends is invisible and the request would return
-    # HTTP 200 with empty content — an SDK client cannot tell that apart from a
-    # model that legitimately said nothing. Fail closed until this endpoint
-    # translates AcpAuthRequired into an OpenAI-shaped error.
+    # Unlike the dashboard, this endpoint has no transcript the caller reads. A
+    # turn that ends on its `error` card answers the generic `turn_failed`
+    # (`_TurnOutcome`); a missing sign-in is refused here first, so the caller
+    # gets the code that names its fix instead of a failed turn.
     blocked = await reject_if_kiro_unverified(request)
     if blocked is not None:
         return web.json_response(
@@ -155,6 +181,24 @@ async def api_completions(request: web.Request) -> web.StreamResponse:
     except Exception:
         return web.json_response(
             {"error": {"message": "invalid JSON", "type": "invalid_request_error"}},
+            status=400,
+        )
+    from kiro_crew.dashboard.handlers._shared import body_not_object_error
+
+    if body_not_object_error(body) is not None:
+        # This route speaks the OpenAI error shape its clients parse, so the
+        # refusal keeps that shape. The shared code rides inside it, where an
+        # OpenAI client reads it, and at the top level, where every dashboard
+        # error carries its machine-readable code.
+        return web.json_response(
+            {
+                "error": {
+                    "message": "body must be a JSON object",
+                    "type": "invalid_request_error",
+                    "code": "body_not_object",
+                },
+                "code": "body_not_object",
+            },
             status=400,
         )
 
@@ -233,13 +277,7 @@ async def api_completions(request: web.Request) -> web.StreamResponse:
                     status=400,
                 )
 
-    # model maps to agent name — validate
     agent = model
-    if not _AGENT_NAME_RE.match(agent):
-        return web.json_response(
-            {"error": {"message": "invalid model/agent name", "type": "invalid_request_error"}},
-            status=400,
-        )
 
     prompt = _flatten_messages(messages)
     if not prompt:
@@ -260,36 +298,81 @@ async def api_completions(request: web.Request) -> web.StreamResponse:
             {"error": {"message": "id must be a string", "type": "invalid_request_error"}},
             status=400,
         )
-    if slot_id and not _AGENT_NAME_RE.match(slot_id):
+    normalized_slot_id = _normalize_slot_key(slot_id) if slot_id else ""
+    if request.get("app", "") and normalized_slot_id.casefold().startswith(
+        members_mod.DM_SLOT_KEY_PREFIX
+    ):
+        sel().log_api_access(
+            caller=request.get("app", ""),
+            operation="openai_compat.chat",
+            outcome="denied",
+            source="app_isolation",
+            resources=f"slot={normalized_slot_id}",
+            error="app cannot access member slots",
+        )
+        return web.json_response(
+            {
+                "error": {"message": "not found", "type": "invalid_request_error"},
+                "code": "not_found",
+            },
+            status=404,
+        )
+    existing_member_slot = None
+    if slot_id:
+        existing = state._slots.get(normalized_slot_id)
+        if existing and existing.mode == members_mod.DM_SLOT_MODE:
+            existing_member_slot = existing
+    if existing_member_slot is not None and not members_mod.is_dispatchable_member_name(
+        existing_member_slot.agent
+    ):
+        sel().log_api_access(
+            caller=request.remote or "",
+            operation="openai_compat.chat",
+            outcome="denied",
+            source="member_pin",
+            resources=f"slot={existing_member_slot.key}",
+            error="stored member pin is not dispatchable",
+        )
+        return web.json_response(
+            {
+                "error": {
+                    "message": "this thread's crew name cannot be dispatched",
+                    "type": "invalid_request_error",
+                    "code": "member_pin_mismatch",
+                },
+                "code": "member_pin_mismatch",
+            },
+            status=409,
+        )
+    if slot_id and not _AGENT_NAME_RE.fullmatch(slot_id) and existing_member_slot is None:
         return web.json_response(
             {"error": {"message": "invalid id (slot name)", "type": "invalid_request_error"}},
+            status=400,
+        )
+    member_pin_match = members_mod.member_pin_matches(
+        getattr(existing_member_slot, "mode", None),
+        getattr(existing_member_slot, "agent", None),
+        agent,
+    )
+    if (
+        not is_registered_agent_name(agent)
+        and not member_pin_match
+        # A configured free-form member name is a valid ``model``; an off-grammar
+        # string that is not a member is refused before any slot is created.
+        and not await asyncio.to_thread(members_mod.is_configured_dispatchable_member, agent)
+    ):
+        return web.json_response(
+            {"error": {"message": "invalid model/agent name", "type": "invalid_request_error"}},
             status=400,
         )
     completion_id = _make_id()
 
     if slot_id:
-        # App tokens get ONE uniform answer for the whole member-* space,
-        # BEFORE any existence check: an app can never own a member slot, so
-        # the reservation 409 for a missing key next to the ownership 404
-        # for an existing one would let an app enumerate member threads.
-        if request.get("app", "") and _normalize_slot_key(slot_id).startswith(
-            members_mod.DM_SLOT_KEY_PREFIX
-        ):
-            sel().log_api_access(
-                caller=request.get("app", ""),
-                operation="openai_compat.chat",
-                outcome="denied",
-                source="app_isolation",
-                resources=f"slot={slot_id}",
-                error="app cannot access member slots",
-            )
-            return web.json_response(
-                {
-                    "error": {"message": "not found", "type": "invalid_request_error"},
-                    "code": "not_found",
-                },
-                status=404,
-            )
+        # A thread restored as a sidebar row loads its window here, with the
+        # read off the loop, before the turn below appends to it; the slot is
+        # looked up again after the await.
+        if (_pending := state._slots.get(_normalize_slot_key(slot_id))) is not None:
+            await load_window_off_loop(_pending)
         # Membership must be checked on the canonical (filename-charset) key —
         # get_or_create_slot folds unsafe chars, so a raw slot_id may map to an
         # existing slot even when the raw string is absent from _slots.
@@ -314,45 +397,32 @@ async def api_completions(request: web.Request) -> web.StreamResponse:
                 },
                 status=409,
             )
-        # A remote-bound slot runs its turn on a connected peer and streams the
-        # reply over the dashboard WebSocket; this endpoint has no such channel —
-        # its collectors read only local `chunk`/`assistant` rows. Reaching the
-        # local dispatch chokepoint (`_run_chat`, keyed on `executor == "remote"`)
-        # would append the prompt and emit a WS-only `chat_done`, leaving this HTTP
-        # caller waiting forever on a turn the peer never received and history
-        # holding an unsent turn. Refuse BEFORE any mutation — keyed on
-        # `executor` (not `is_remote`) so a half-open binding is refused too,
-        # matching the chokepoint and the `api_chat` incomplete-binding guard. A
-        # freshly-created slot is always local, so this only rejects an existing
-        # remote-bound target.
-        if getattr(slot, "executor", "") == "remote":
+        # A relay archive is read-only. Reaching the local dispatch chokepoint
+        # (`_run_chat`) would append the prompt and emit a WS-only `chat_done`,
+        # leaving this HTTP caller waiting on a turn that never runs. Refuse
+        # BEFORE any mutation. A freshly-created slot is always local, so this
+        # only rejects an existing archive.
+        if is_relay_archive(slot):
             sel().log_api_access(
                 caller=request.remote or "",
                 operation="openai_compat.chat",
                 outcome="denied",
                 source="openai_compat",
                 resources=f"slot={slot_id}",
-                error="remote-bound slot not supported on OpenAI-compat endpoint",
+                error="relay archive is read-only",
             )
             return web.json_response(
                 {
                     "error": {
-                        "message": (
-                            "this session is bound to a remote crew; the "
-                            "OpenAI-compatible endpoint cannot relay remote turns"
-                        ),
+                        "message": RELAY_ARCHIVE_ERROR,
                         "type": "invalid_request_error",
-                        "code": "remote_slot_unsupported",
+                        "code": RELAY_ARCHIVE_CODE,
                     },
-                    "code": "remote_slot_unsupported",
+                    "code": RELAY_ARCHIVE_CODE,
                 },
                 status=409,
             )
-        # Busy check — prevent concurrent writes to the same slot. ``running``
-        # includes the outer Autopilot controller while no child turn occupies
-        # ``slot.task``; the pending marker keeps the same isolation after an
-        # authentication pause has ended that controller but before Stage N is
-        # settled and captured.
+        # Busy check — prevent concurrent writes to the same slot.
         if slot.running is True:
             sel().log_api_access(
                 caller=request.remote or "",
@@ -362,25 +432,6 @@ async def api_completions(request: web.Request) -> web.StreamResponse:
                 resources=f"slot={slot_id}",
                 error="slot busy",
             )
-            if (
-                slot.stage_boundary.stage is not None
-                and not slot.turn_running
-                and not slot._plan_cancelled
-            ):
-                return web.json_response(
-                    {
-                        "error": {
-                            "message": (
-                                f"slot {slot_id!r} is paused at an Autopilot stage gate; "
-                                "continue from the dashboard (Go)"
-                            ),
-                            "type": "slot_busy",
-                            "code": "stage_gate_paused",
-                        },
-                        "code": "stage_gate_paused",
-                    },
-                    status=409,
-                )
             return web.json_response(
                 {
                     "error": {
@@ -420,11 +471,6 @@ async def api_completions(request: web.Request) -> web.StreamResponse:
                 status=409,
             )
         if slot.mode == "member":
-            # Registry-drift fail-closed, mirroring the chat_send path: a
-            # deleted crew's thread must not dispatch — the resolver would
-            # fall back to the default agent and reply under the deleted
-            # member's identity (a caller sending the matching stale agent
-            # name passes the pin check above but still hits this).
             _member_cfg = await asyncio.to_thread(KiroCrewConfig.load)
             if slot.agent not in _member_cfg.agents:
                 sel().log_api_access(
@@ -446,11 +492,6 @@ async def api_completions(request: web.Request) -> web.StreamResponse:
                     },
                     status=409,
                 )
-            # Binding-drift fail-closed, also mirroring chat_send: a live
-            # member slot whose dm.json was deleted or corrupted must refuse
-            # the send — dispatching would persist a transcript that restore
-            # skips and thread-open refuses (orphaned the moment the slot
-            # dies). Same rare-send thread-IO budget as the registry check.
             if slot.key.startswith(members_mod.DM_SLOT_KEY_PREFIX):
                 _send_binding = await asyncio.to_thread(
                     members_mod.read_dm_binding_for_slot, slot.key
@@ -509,6 +550,8 @@ async def api_completions(request: web.Request) -> web.StreamResponse:
             )
         slot_name = f"oai-{completion_id}"
         slot = state.get_or_create_slot(slot_name)
+        # One request's slot, popped when it returns: nobody views its card.
+        slot._dashboard_card_exempt = True
 
     # App-Kit ownership enforcement — mirror chat_handlers.api_chat
     # Non-app callers (dashboard, CLI) have no app identity and legitimately
@@ -545,10 +588,22 @@ async def api_completions(request: web.Request) -> web.StreamResponse:
             )
             if slot_id and freshly_created:
                 state._slots.pop(slot.key, None)
-            return web.json_response(
-                {"error": {"message": "slot owned by another app", "type": "forbidden"}},
-                status=403,
+            return _foreign_slot_response()
+        # Owning the slot is not owning the conversation it runs on: a slot linked
+        # to a channel thread, or an unbound channel-origin slot, would take this
+        # turn into a session and transcript the app has no claim on. Same test as
+        # the per-slot checkpoint, and the same body as another app's slot, so the
+        # answer does not tell the app which of its slots carry a link.
+        if not app_owns_slot_session(request_app, slot):
+            sel().log_api_access(
+                caller=request_app,
+                operation="openai_compat.chat",
+                outcome="denied",
+                source="app_isolation",
+                resources=f"slot={slot.key}",
+                error="app does not own the session or transcript this slot uses",
             )
+            return _foreign_slot_response()
 
     # Drain stale pending from prior turns whose reader disconnected
     slot.drain()
@@ -611,6 +666,14 @@ async def api_completions(request: web.Request) -> web.StreamResponse:
                     slot,
                     prompt,
                     _directive_user_origin=is_dashboard_caller,
+                    # Named for the same reason ``api_chat`` names it: the actor
+                    # resolver's fallback is ``user``, so a dispatch that OBSERVED
+                    # an app and stayed silent records a person who never typed
+                    # anything -- and every consumer that asks "is a human
+                    # watching this turn" then gets the wrong answer. ``""`` is the
+                    # parameter's own default and reads as "not named", so a
+                    # dashboard caller is unchanged.
+                    _turn_actor="app" if request_app else "",
                 ),
                 timeout=chat_turn_timeout_secs(),
             )
@@ -628,6 +691,64 @@ async def api_completions(request: web.Request) -> web.StreamResponse:
             )
         else:
             return await _blocking_response(state, slot, completion_id, model, created, ephemeral)
+
+
+_SERVER_ERROR = {"error": {"message": "internal error", "type": "server_error"}}
+
+
+#: The ``code`` of a completion whose turn ended on its own error row.
+_TURN_FAILED_CODE = "turn_failed"
+
+
+class _TurnOutcome:
+    """Whether the rows read so far end the turn on an error, and which one.
+
+    A turn that cannot run still ends its cycle with a ``done`` row, which on
+    its own reads as an empty successful reply. Its failure is the ``error``
+    row the turn appended (the card the dashboard shows), so the readers below
+    feed every row through :meth:`observe` and answer the failure at ``done``.
+
+    An error row ends the turn unless reply text follows it: a retry notice
+    (``meta.kind == TRANSIENT_RETRY_KIND``) is not a failure, and an error the
+    turn recovered from is followed by the reply it went on to give. A row
+    from a turn that failed before it started (``meta.turn_failed``) holds,
+    whatever the queue behind it answers.
+    """
+
+    __slots__ = ("reason", "_pinned")
+
+    def __init__(self) -> None:
+        self.reason: str | None = None
+        self._pinned = False
+
+    def observe(self, msg: dict[str, Any]) -> None:
+        role = msg.get("role")
+        meta = msg.get("meta")
+        meta = meta if isinstance(meta, dict) else {}
+        if role == "error":
+            if meta.get("kind") == TRANSIENT_RETRY_KIND:
+                return
+            self.reason = _redact(str(msg.get("content") or "")).strip() or "the turn failed"
+            self._pinned = self._pinned or bool(meta.get(TURN_FAILED_META))
+        elif role in ("assistant", "chunk") and msg.get("content") and not self._pinned:
+            self.reason = None
+
+
+def _turn_failed_body(reason: str) -> dict[str, Any]:
+    """The OpenAI-shaped error for a turn that ended on its error row *reason*."""
+    return {
+        "error": {"message": reason, "type": "server_error", "code": _TURN_FAILED_CODE},
+        "code": _TURN_FAILED_CODE,
+    }
+
+
+async def _stream_server_error(
+    request: web.Request, resp: web.StreamResponse, body: dict[str, Any] = _SERVER_ERROR
+) -> web.StreamResponse:
+    """End an SSE completion with an error frame (*body*) and ``[DONE]``."""
+    await write_sse_or_abort(request, resp, f"data: {json.dumps(body)}\n\n".encode())
+    await write_sse_or_abort(request, resp, b"data: [DONE]\n\n")
+    return resp
 
 
 async def _stream_response(
@@ -649,9 +770,11 @@ async def _stream_response(
     try:
         _redact_buffer = ""
         _last_emitted_len = 0
+        outcome = _TurnOutcome()
         while True:
             pending = slot.drain()
             for msg in pending:
+                outcome.observe(msg)
                 if msg.get("cls") == "done":
                     # Flush remaining buffer
                     if _redact_buffer:
@@ -671,7 +794,14 @@ async def _stream_response(
                                     }
                                 ],
                             }
-                            await resp.write(f"data: {json.dumps(chunk)}\n\n".encode())
+                            await write_sse_or_abort(
+                                request, resp, f"data: {json.dumps(chunk)}\n\n".encode()
+                            )
+                    if outcome.reason is not None:
+                        # No ``finish_reason: stop``: the turn did not finish.
+                        return await _stream_server_error(
+                            request, resp, _turn_failed_body(outcome.reason)
+                        )
                     chunk = {
                         "id": completion_id,
                         "object": _OPENAI_OBJECT_CHUNK,
@@ -679,8 +809,10 @@ async def _stream_response(
                         "model": model,
                         "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
                     }
-                    await resp.write(f"data: {json.dumps(chunk)}\n\n".encode())
-                    await resp.write(b"data: [DONE]\n\n")
+                    await write_sse_or_abort(
+                        request, resp, f"data: {json.dumps(chunk)}\n\n".encode()
+                    )
+                    await write_sse_or_abort(request, resp, b"data: [DONE]\n\n")
                     return resp
 
                 # Stream assistant and chunk roles (token-level streaming)
@@ -712,7 +844,7 @@ async def _stream_response(
                         }
                     ],
                 }
-                await resp.write(f"data: {json.dumps(chunk)}\n\n".encode())
+                await write_sse_or_abort(request, resp, f"data: {json.dumps(chunk)}\n\n".encode())
 
             # Detect task failure — prevents infinite loop
             if slot.task and slot.task.done():
@@ -720,15 +852,12 @@ async def _stream_response(
                     slot.task.result()
                 except BaseException as exc:
                     logger.warning("chat task failed: %s", exc)
-                    err_data = {"error": {"message": "internal error", "type": "server_error"}}
-                    await resp.write(f"data: {json.dumps(err_data)}\n\n".encode())
-                    await resp.write(b"data: [DONE]\n\n")
-                    return resp
+                    return await _stream_server_error(request, resp)
 
             try:
                 await asyncio.wait_for(slot.event.wait(), timeout=30)
             except asyncio.TimeoutError:
-                await resp.write(b": keepalive\n\n")
+                await write_sse_or_abort(request, resp, b": keepalive\n\n")
     except (ConnectionResetError, asyncio.CancelledError):
         pass
     finally:
@@ -753,11 +882,25 @@ async def _blocking_response(
     counts at the slot layer.
     """
     collected: list[str] = []
+    outcome = _TurnOutcome()
 
     try:
         while True:
             pending = slot.drain()
             for msg in pending:
+                outcome.observe(msg)
+                if msg.get("cls") == "done" and outcome.reason is not None:
+                    return web.json_response(
+                        {
+                            "error": {
+                                "message": outcome.reason,
+                                "type": "server_error",
+                                "code": _TURN_FAILED_CODE,
+                            },
+                            "code": _TURN_FAILED_CODE,
+                        },
+                        status=502,
+                    )
                 if msg.get("cls") == "done":
                     content = _redact("".join(collected))
                     return web.json_response(
@@ -792,7 +935,14 @@ async def _blocking_response(
                 except BaseException as exc:
                     logger.warning("chat task failed: %s", exc)
                     return web.json_response(
-                        {"error": {"message": "internal error", "type": "server_error"}},
+                        {
+                            "error": {
+                                "message": "internal error",
+                                "type": "server_error",
+                                "code": "server_error",
+                            },
+                            "code": "server_error",
+                        },
                         status=500,
                     )
 

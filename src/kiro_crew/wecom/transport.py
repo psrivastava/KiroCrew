@@ -43,9 +43,13 @@ dispatched and in this order:
 from __future__ import annotations
 
 import logging
+import ntpath
+import posixpath
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Iterable
 from typing import Any
 
+from kiro_crew.messaging.outbound_files import OutboundFile
 from kiro_crew.messaging.tables import TABLE_POLICY_OFF
 from kiro_crew.messaging.transport import (
     ConfiguredChannelTarget,
@@ -56,12 +60,34 @@ from kiro_crew.messaging.transport import (
 from kiro_crew.sel import sel
 from kiro_crew.wecom.client import (
     CHAT_TYPE_SINGLE,
+    WECOM_MAX_REPLY_BYTES,
     WECOM_SAFE_REPLY_CHARS,
     WeComClient,
     WeComInbound,
 )
+from kiro_crew.wecom.media_upload import MAX_BYTES_BY_TYPE
 
 logger = logging.getLogger(__name__)
+
+
+# Upper bound on the number of LEARNED (non-roster) warm peers kept in
+# ``WeComTransport._warm_chats``. Warmth is only an availability HINT in
+# ``configured_targets``; it gates no send (``_may_push`` authorizes on the
+# roster alone), so evicting a learned peer loses nothing — it is re-learned the
+# moment it writes again. Without this bound an ``allow_all`` bot would
+# accumulate one entry per distinct org DMer for the life of the gateway. Roster
+# members (owner / allow-list) are exempt from this cap, so it bounds only the
+# learned subset.
+WECOM_WARM_CHATS_MAX = 512
+
+# Upper bound on the LENGTH of a learned userid retained as a ``_warm_chats`` key.
+# ``_dispatch_callback`` reads ``userid`` straight off the WS frame with no length
+# check, so under ``allow_all`` a peer could present a megabyte-long id; a count
+# cap alone would then still let 512 such keys hold arbitrary memory. A non-roster
+# userid longer than this is NOT stored as warm (the message is still served) — so
+# the bound holds on both the entry COUNT and each entry's SIZE. Roster identities
+# (owner / allow-list) are config-authored and bounded, so they are exempt.
+WECOM_MAX_RETAINED_USERID_LEN = 256
 
 
 class WeComSendError(RuntimeError):
@@ -105,9 +131,18 @@ WECOM_CAPABILITIES = TransportCapabilities(
     edit=True,
     reactions=False,
     files_inbound=True,
-    files_outbound=False,
     rich_blocks=False,
     threads=False,
+    # ``files_outbound`` gates ONE thing: whether a renderer pulls a local image
+    # reference out of a sealed reply segment and uploads it inline (the flag the
+    # Discord/Teams/Telegram renderers read before extracting). WeCom ships no such
+    # renderer extraction path, so the flag stays False and an inline reference
+    # keeps printing its path — the honest degradation. This is INDEPENDENT of the
+    # ``file_send`` document path this change adds: that path is gated by
+    # ``upload_destination.DOCUMENT_CHANNELS`` + the ``send_document`` verb, never
+    # by this flag, so declaring True here would be functionally inert while making
+    # the capability ledger claim an extraction WeCom does not do.
+    files_outbound=False,
     # Keep canonical tables: an adaptive representation can exceed the cap while
     # the only shorter raw candidate still contains a value that display-form
     # redaction would remove. That reason is independent of the overflow path the
@@ -118,6 +153,7 @@ WECOM_CAPABILITIES = TransportCapabilities(
     # against; ``truncate_utf8`` is the exact guard at the wire. A flat 20000-CHAR
     # cap was ~60 KB of Chinese text against a 20480-BYTE limit.
     max_message_chars=WECOM_SAFE_REPLY_CHARS,
+    max_message_bytes=WECOM_MAX_REPLY_BYTES,
     max_buttons=0,
     supports_proactive_send=True,
     # ``aibot_send_msg`` answers with no message id, so an empty return is SUCCESS
@@ -126,6 +162,46 @@ WECOM_CAPABILITIES = TransportCapabilities(
     # and repeat the same result on the next tick.
     returns_message_id=False,
 )
+
+
+#: Extension -> WeCom media ``type`` (aibot_upload_media_init body.type). Anything
+#: not mapped is an ordinary ``file``. An extension only maps to a richer type
+#: when both hold: WeCom's own ``type`` accepts that format, AND the file clears
+#: ``security.BINARY_MIME_ALLOWLIST`` in ``_gate_upload_file`` — a format the gate
+#: refuses never reaches here, so mapping it would be dead. WeCom's ``image`` type
+#: is JPG/PNG only, so gif/bmp/webp stay ``file`` (they are allowlisted, upload
+#: fine, and render as a downloadable file). WeCom ``voice`` is AMR-only and
+#: ``audio/amr`` is not allowlisted, so voice is unreachable and unmapped. Only
+#: the allowlisted video containers (mp4/webm) map to ``video``.
+_WECOM_TYPE_BY_EXT: dict[str, str] = {
+    # image — WeCom image type is JPG/PNG only
+    ".png": "image",
+    ".jpg": "image",
+    ".jpeg": "image",
+    # video — only the allowlisted containers
+    ".mp4": "video",
+    ".webm": "video",
+}
+
+
+def wecom_media_type_for(filename: str) -> str:
+    """The WeCom media ``type`` for *filename*, by extension; ``file`` by default."""
+    dot = filename.rfind(".")
+    ext = filename[dot:].lower() if dot != -1 else ""
+    return _WECOM_TYPE_BY_EXT.get(ext, "file")
+
+
+def _basename(path: str) -> str:
+    """Basename of *path* regardless of the OS that produced it.
+
+    ``OutboundFile.path`` is an OS-native path from the caller: a Windows send
+    yields a backslash path (``C:\\Users\\<user>\\file.pdf``), so splitting on
+    ``/`` alone (or the container's own ``posixpath``) would leave the whole
+    absolute path — disclosing the local username and directory layout to WeCom
+    in the upload's ``filename`` field. Strip both separators, whichever the
+    running OS uses, so only the leaf name is transmitted.
+    """
+    return posixpath.basename(ntpath.basename(path))
 
 
 class WeComTransport(MessagingTransport):
@@ -159,9 +235,28 @@ class WeComTransport(MessagingTransport):
         # WeCom's precondition for ``aibot_send_msg``. Learned from authorized
         # inbound only, so an unauthorized sender cannot make itself a target.
         # Same "warm first" shape Teams uses for its service URL and Weixin for
-        # its learned peers. A set, not a map: only 1:1 chats can be warm, because
-        # group traffic is refused inbound and so never becomes addressable.
-        self._warm_chats: set[str] = set()
+        # its learned peers. Only 1:1 chats can be warm, because group traffic is
+        # refused inbound and so never becomes addressable.
+        #
+        # A bounded ordered set (``OrderedDict`` used as an ordered set, values
+        # unused): under ``allow_all`` the key space is every org DMer ever, so an
+        # unbounded container would grow for the life of the gateway. The number
+        # of LEARNED (non-roster) peers is capped at ``WECOM_WARM_CHATS_MAX``,
+        # keeping only the most recent; roster members (owner / allow-list) are
+        # never evicted and do not count toward that cap (see ``note_warm_chat``).
+        # Keeping only recent learned peers costs nothing — warmth is a hint, not
+        # a gate (see ``_may_push``), and an evicted peer is re-learned the instant
+        # it writes again. The ``in`` membership tests and ``sorted(...)``
+        # iterations below read dict keys unchanged.
+        self._warm_chats: OrderedDict[str, None] = OrderedDict()
+        # Count of drop EVENTS on the warm-peer bound: learned peers evicted by the
+        # count cap, plus inbound frames whose over-length userid was not retained.
+        # Consumed by ``configured_targets``, which discloses the truncation on
+        # every snapshot while it is nonzero, so a truncated tail never reads as a
+        # population that never named those peers (rule
+        # a-bound-bounds-every-field-it-retains). It counts events, not distinct
+        # peers, so nothing operator-facing states it as a peer count.
+        self._warm_dropped = 0
 
     @property
     def client(self) -> WeComClient:
@@ -200,6 +295,14 @@ class WeComTransport(MessagingTransport):
                 removed = len(self._allowed - new_allowed)
                 self._allowed = new_allowed
                 logger.info("wecom: allow-list reloaded (+%d/-%d userid(s))", added, removed)
+                # Removing userids demotes those peers' retained warm entries from
+                # roster (exempt) to learned (capped). No trim is forced here: the
+                # next inbound's ``_prune_learned_peers_to_cap`` drops every excess
+                # entry in one pass (it is not one-at-a-time), so the learned set
+                # converges on the next DM. Until then it may sit transiently over
+                # the cap — harmless, since warmth is only an availability hint and
+                # is never a send gate. Keeping the trim here would be a second
+                # eviction site fixing nothing the inbound prune does not.
                 sel().log_api_access(
                     caller="config",
                     operation="wecom_transport.reconfigure",
@@ -252,6 +355,119 @@ class WeComTransport(MessagingTransport):
             # also mean failure.
             raise WeComSendError("WeCom proactive send failed (no live connection)")
         return ""
+
+    async def send_document(
+        self,
+        conversation_id: str,
+        document: OutboundFile,
+        *,
+        caption: str = "",
+        thread_id: str | None = None,
+    ) -> str | None:
+        """Deliver ONE file to *conversation_id* as native WeCom media.
+
+        The generic-file counterpart of :meth:`send_message`, resolved by
+        ``upload_destination.resolve_channel`` for the ``file_send`` MCP tool and
+        called by ``api_channel_upload_file`` with ``caption`` + ``thread_id``.
+        WeCom has no thread concept, so ``thread_id`` is accepted for the shared
+        transport contract and ignored. Runs the temporary-material upload
+        handshake (``upload_media``) then a proactive file send
+        (``send_file_proactive``) — the ``aibot_send_msg`` path, matching
+        :meth:`send_message`'s mirror/cron semantics.
+
+        A non-empty ``caption`` is delivered as a companion text push AFTER the
+        file lands (WeCom's media frame carries no text field, unlike
+        Telegram/Discord which fold the caption into the upload). It is
+        best-effort: the file is already delivered, so a failed caption push is
+        logged and does not turn a landed file into a reported failure — the
+        alternative, silently dropping the user's typed description, is what this
+        addresses.
+
+        Takes an :class:`OutboundFile` whose ``data`` the file_send gates already
+        validated; the upload uses those bytes, never re-opening the path.
+        ``conversation_id`` is the userid (see :meth:`resolve_conversation`).
+
+        Returns a non-empty marker (the WeCom ``media_id``, or ``"sent"``) on a
+        confirmed send — WeCom carries no message id (``returns_message_id=False``),
+        but the channel-upload caller treats a falsy return as a delivery failure,
+        so success must be non-empty — and ``None`` on a delivery failure, so the
+        caller falls back to its dashboard-link path.
+        """
+        if not conversation_id or not document.data:
+            return None
+        # Re-authorize at the send boundary, same as send_message: a persisted
+        # binding outlives the allow-list entry that justified it.
+        if not self._may_push(conversation_id):
+            logger.warning("wecom send_document: conversation not authorized")
+            return None
+        filename = _basename(document.path) or "file"
+        # Pick the WeCom media type by extension so an image renders as an image
+        # message and an mp4/webm as video — not all as a generic file. Only
+        # formats WeCom accepts AND `security.BINARY_MIME_ALLOWLIST` admits are
+        # mapped (JPG/PNG image, mp4/webm video); anything else, including gif and
+        # AMR voice, sends as an ordinary `file`.
+        wecom_type = wecom_media_type_for(filename)
+        # A rich type carries a tighter platform cap than `file` (image/voice 2 MB
+        # vs file/video 20 MB). A body that WeCom's image/video type would refuse
+        # for size still delivers as a downloadable `file`, so downgrade rather
+        # than fail the whole send — degrading to `file` is strictly better than
+        # the dashboard-link fallback the caller would otherwise report.
+        size = len(document.data)
+        type_cap = MAX_BYTES_BY_TYPE.get(wecom_type, MAX_BYTES_BY_TYPE["file"])
+        file_cap = MAX_BYTES_BY_TYPE["file"]
+        if wecom_type != "file" and type_cap < size <= file_cap:
+            wecom_type = "file"
+        try:
+            media_id = await self._client.upload_media(document.data, wecom_type, filename)
+            # Re-authorize AFTER the upload, before the push. The check above and
+            # the push below straddle the chunked upload handshake — a multi-second,
+            # multi-await window on a large body — and the allow-list can be
+            # replaced inside it by a live `reconfigure` (a departing/compromised
+            # userid revoked mid-upload). A media frame cannot be recalled once the
+            # ACK lands, so the authorization decision must be fresh at each send
+            # boundary, not carried across the upload.
+            if not self._may_push(conversation_id):
+                logger.warning("wecom send_document: conversation deauthorized during upload")
+                return None
+            if not await self._client.send_file_proactive(
+                conversation_id, media_id, media_type=wecom_type
+            ):
+                logger.warning("wecom send_document: proactive send not acknowledged")
+                return None
+        except Exception as exc:  # noqa: BLE001 — best-effort leg; caller falls back
+            # Never log the exception payload (may carry the path / errmsg); the
+            # class is enough for an operator, matching the client's own logging.
+            logger.warning("wecom send_document failed: %s", type(exc).__name__)
+            return None
+        # The caller's typed description rides alongside the file. WeCom's media
+        # frame (media_type:{media_id}) has no text field — unlike Telegram/Discord
+        # which fold the caption into the upload — so it must go as a separate
+        # aibot_send_msg text push. Best-effort AFTER the confirmed file send: the
+        # file already reached the user, so a dropped caption is logged and the
+        # send still counts as delivered. Dropping it silently (the prior
+        # behaviour) is what made the user's description vanish without a trace.
+        if caption:
+            # The caption is a SECOND delivery, past its own await (the file
+            # push + ACK), so it needs its own fresh authorization: the roster
+            # can be revoked between the file landing and this push, and the
+            # caption must not reach a recipient who lost access in that gap.
+            if not self._may_push(conversation_id):
+                logger.warning("wecom send_document: conversation deauthorized before caption")
+            else:
+                try:
+                    if not await self._client.send_proactive(conversation_id, caption):
+                        logger.warning("wecom send_document: caption push not acknowledged")
+                except Exception as exc:  # noqa: BLE001 — companion leg; file already sent
+                    logger.warning(
+                        "wecom send_document caption push failed: %s", type(exc).__name__
+                    )
+        # WeCom carries no message id on aibot_send_msg (returns_message_id=False),
+        # but the channel-upload caller treats a FALSY return (`""`/None) as a
+        # delivery failure (`if not mid`). A confirmed proactive send above IS a
+        # delivery, so return a non-empty marker — the media_id — rather than the
+        # empty string, which would be misread as "delivery_reported_no_message_id"
+        # even though the file already reached the user.
+        return media_id or "sent"
 
     async def resolve_conversation(self, user_id: str) -> str:
         # No addressable DM channel id; the userid is the logical conversation.
@@ -317,6 +533,22 @@ class WeComTransport(MessagingTransport):
                 if any(x.target_id == f"user:{chat_id}" for x in targets):
                     continue
                 targets.append(ConfiguredChannelTarget(f"user:{chat_id}", f"WeCom DM · {chat_id}"))
+        if self._warm_dropped:
+            # Say the overflow out loud in EVERY snapshot while it holds: the
+            # warm-peer bound has shed learned peers, so this list is a truncated
+            # tail, not every peer ever seen. Without the marker a reader cannot
+            # tell a capped list from one those peers never joined. Mirrors the
+            # weixin ``known_users_truncated`` sentinel. It is unavailable, so it
+            # is never a send target, and its label states truncation rather than
+            # a peer count (the tally counts drop events, not distinct peers).
+            targets.append(
+                ConfiguredChannelTarget(
+                    "wecom:warm-peers-overflow",
+                    f"WeCom · recent-peer list truncated at the {WECOM_WARM_CHATS_MAX}-peer cap",
+                    available=False,
+                    unavailable_reason="warm_peers_truncated",
+                )
+            )
         return targets
 
     async def resolve_configured_target(self, target_id: str) -> tuple[str, str | None] | None:
@@ -365,9 +597,103 @@ class WeComTransport(MessagingTransport):
         )
 
     def note_warm_chat(self, chat_id: str) -> None:
-        """Record that *chat_id* has written to the bot, so it can be pushed to."""
-        if chat_id:
-            self._warm_chats.add(chat_id)
+        """Record that *chat_id* has written to the bot, so it can be pushed to.
+
+        Maintains the bounded warm set: the peer is (re)inserted as the most
+        recent, and the number of LEARNED (non-roster) peers is held at
+        ``WECOM_WARM_CHATS_MAX`` by evicting the oldest learned peer. Evicting a
+        learned peer's warmth is harmless — it is only an availability hint in
+        ``configured_targets``, never an authorization check (``_may_push``), and
+        the peer is simply re-warmed when it writes again.
+
+        The cap bounds the LEARNED subset ALONE, independently of roster members
+        (the owner and allow-listed userids), for two reasons:
+
+        * A roster member is never evicted. ``configured_targets`` advertises
+          every roster identity whether or not it is warm and sets ``available``
+          from warmth, so evicting a roster member that has written would flip its
+          row to unavailable with the reason "none seen since this gateway
+          started" — false, and it disables the dashboard's mirror toggle for a
+          reachable, authorized DM.
+        * Roster warmth must not consume the learned-peer budget. If the cap
+          counted roster entries, a roster of >= the cap that has all written
+          would leave no room for any learned peer: every newly inserted learned
+          peer would be the only evictable entry and be dropped again at once, so
+          an active authorized peer could never appear in ``configured_targets``.
+          Counting only learned entries means a learned peer is evicted only when
+          a NEWER learned peer displaces it, never by roster warmth.
+
+        The roster is itself bounded by config size, so the whole map stays
+        bounded at roster-size + ``WECOM_WARM_CHATS_MAX``.
+        """
+        if not chat_id:
+            return
+        # Bound the retained key SIZE, not only the entry count: a non-roster
+        # userid longer than the cap is not stored as warm (the message is still
+        # served — this method's only job is the availability hint). Roster
+        # identities are config-authored and exempt. The omission is counted and
+        # disclosed by the ``configured_targets`` truncation marker alongside
+        # evictions, so a dropped peer is never silent.
+        if len(chat_id) > WECOM_MAX_RETAINED_USERID_LEN and not self._is_roster_member(chat_id):
+            self._warm_dropped += 1
+            return
+        self._warm_chats[chat_id] = None
+        self._warm_chats.move_to_end(chat_id)
+        self._prune_learned_peers_to_cap()
+
+    def _is_roster_member(self, chat_id: str) -> bool:
+        """Whether *chat_id* is a configured identity (the owner or allow-listed).
+
+        Roster membership — not ``allow_all`` — is what exempts a warm entry from
+        the cap: under ``allow_all`` every peer is authorized, so exempting on
+        authorization would exempt everyone and defeat the cap. Only identities
+        ``configured_targets`` advertises in their own right (and whose row's
+        ``available`` flag reads warmth) are exempt.
+        """
+        return bool(chat_id) and (chat_id == self._owner_id or chat_id in self._allowed)
+
+    def _prune_learned_peers_to_cap(self) -> int:
+        """Hold the LEARNED (non-roster) warm peers at ``WECOM_WARM_CHATS_MAX``.
+
+        Returns the number of entries dropped, so callers can account for the
+        drop — a bounded structure that silently sheds entries is exactly what
+        the ``a-bound-bounds-every-field-it-retains`` rule forbids, because under
+        ``allow_all`` the warm peers ARE the whole ``configured_targets`` list and
+        a silently shortened list is indistinguishable from one those users never
+        joined.
+
+        Counts only non-roster entries and removes the oldest ones (least-recent
+        first) until at most ``WECOM_WARM_CHATS_MAX`` remain. Roster entries are
+        neither counted nor removed, so roster warmth cannot push a learned peer
+        out and a just-inserted learned peer is dropped only when an OLDER learned
+        peer exists to displace instead.
+
+        Removes EVERY excess entry in one pass, not just one, so the learned set
+        converges to the cap from any starting state — in particular after a
+        ``reconfigure`` that shrinks the allow-list converts many retained roster
+        entries to learned ones at once. A one-at-a-time eviction on each inbound
+        would then never catch up (one added, one removed per message), leaving
+        the oversized set resident and scanned on every frame; dropping every
+        excess entry in one pass means the next inbound after such a shrink fully
+        converges the set.
+        """
+        learned = [c for c in self._warm_chats if not self._is_roster_member(c)]
+        # The length bound holds wherever a learned entry is retained, not only at
+        # insert: a roster member demoted by ``reconfigure`` was stored exempt, so
+        # an over-length one is shed here on its first pass as a learned entry.
+        oversized = [c for c in learned if len(c) > WECOM_MAX_RETAINED_USERID_LEN]
+        for chat_id in oversized:
+            del self._warm_chats[chat_id]
+        if oversized:
+            learned = [c for c in learned if len(c) <= WECOM_MAX_RETAINED_USERID_LEN]
+        excess = max(0, len(learned) - WECOM_WARM_CHATS_MAX)
+        # learned is in oldest-first order (OrderedDict iteration); drop the oldest
+        # `excess` of them.
+        for chat_id in learned[:excess]:
+            del self._warm_chats[chat_id]
+        dropped = len(oversized) + excess
+        self._warm_dropped += dropped
+        return dropped
 
     # -- Lifecycle ----------------------------------------------------------
     async def connect(self) -> None:
@@ -445,6 +771,8 @@ class WeComTransport(MessagingTransport):
         self.note_warm_chat(inbound.userid)
         if self._dispatch is not None:
             try:
+                # Received from a person: its start is FOREGROUND (kiro_crew.start_priority).
+                inbound.person_origin = True
                 await self._dispatch(inbound)
             except BaseException:
                 # The window records "delivered", and a turn that never completed was

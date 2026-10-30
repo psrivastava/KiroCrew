@@ -55,7 +55,8 @@ IFS=',' read -r -a members <<< "$GUI_MEMBERS"
 for m in "${members[@]}"; do
   [ -n "$m" ] && member_args+=(--member "$m")
 done
-KIROCREW_HOME="$HOME_DIR" python3 "$(dirname "$0")/seed_home.py" --fixture "$GUI_SEED" "${member_args[@]}"
+# The seed itself runs after 2c: the pinned starter session is seeded with
+# the sample project staged there as its project directory.
 
 # ---- 2b. sample notes folder for the Knowledge scenarios -------------------
 # The Knowledge "Add Source > Local Folder" form takes a typed absolute path
@@ -87,6 +88,21 @@ mkdir -m 0700 -- "$notes_root"
 mkdir -m 0700 -- "$GUI_NOTES_DIR"
 cp -- "$(dirname "$0")/knowledge-notes/"*.md "$GUI_NOTES_DIR/"
 echo "notes=$notes_root" >> "$GUI_OUT/target.paths"
+
+# ---- 2c. sample project for the Files scenario -----------------------------
+# The chat's Files view lists a session's project directory, and the fixture's
+# sessions carry none (a fixture cannot spell a path that only exists on the
+# machine it is seeded on). A small project tree -- a README beside a docs/
+# folder holding the same three notes -- is staged under the owned root above
+# (same marker, same teardown), and seed_home.py writes it into the metadata of
+# the pinned starter session (dashboard_starter.jsonl). Only that one gets it: the
+# other seeded chats keep reading as project-less conversations.
+GUI_PROJECT_DIR="$notes_root/sample-project"
+mkdir -m 0700 -- "$GUI_PROJECT_DIR" "$GUI_PROJECT_DIR/docs"
+cp -- "$(dirname "$0")/knowledge-notes/"*.md "$GUI_PROJECT_DIR/docs/"
+printf '# Sample project\n\nA small tree the GUI user test browses from the chat Files view.\n' > "$GUI_PROJECT_DIR/README.md"
+
+KIROCREW_HOME="$HOME_DIR" python3 "$(dirname "$0")/seed_home.py" --fixture "$GUI_SEED" "${member_args[@]}" --project "$GUI_PROJECT_DIR"
 
 # ---- 3. gateway ------------------------------------------------------------
 # Same shape as kiro_crew.testing.harness.spawn_feature_gateway (the E2E job's
@@ -138,6 +154,61 @@ if [ -n "${GITHUB_ACTIONS:-}" ]; then
   echo "::add-mask::$GUI_DASHBOARD_TOKEN"
 fi
 echo "gateway ready at $GUI_BASE_URL"
+
+# ---- 3b. session cookie for the harness's title reset ----------------------
+# The harness restores seeded session titles between scenarios through the
+# gateway, and that call must authenticate. The one-time ``?token=`` link token
+# is validated against a 5-minute window (LINK_WINDOW_SECS), so a reset run late
+# in a multi-hour run would start failing 401 and silently stop. Exchange the
+# link token NOW, while it is valid, for the long-lived session cookie
+# (``mc_token_<port>``, pinned to 127.0.0.1 like the harness, good for the
+# 20-hour session): one GET of ``/?token=`` returns it as a Set-Cookie. Append
+# the full ``name=value`` pair to the 0600 target.env as GUI_DASHBOARD_COOKIE;
+# it never enters $GITHUB_ENV or a command line, and the harness reads it from
+# the file. Best-effort: a failure here leaves the reset a no-op, not a boot
+# failure.
+umask 077
+cookie_line="$(GUI_BASE_URL="$GUI_BASE_URL" GUI_DASHBOARD_TOKEN="$GUI_DASHBOARD_TOKEN" python3 - <<'PYEOF'
+import os, urllib.error, urllib.request
+base = os.environ["GUI_BASE_URL"]
+token = os.environ["GUI_DASHBOARD_TOKEN"]
+# Only the HTTP handler: no file/ftp handler, and no redirect handler, so the
+# token response's Set-Cookie is read as-is (a 3xx raises HTTPError, which still
+# carries the headers) and nothing can be bounced off this loopback origin.
+opener = urllib.request.OpenerDirector()
+opener.add_handler(urllib.request.HTTPHandler())
+
+
+def _cookie_from(headers):
+    for key, value in headers:
+        if key.lower() == "set-cookie" and value.startswith("mc_token_"):
+            # "mc_token_<port>=<value>; Path=/; ..." -- keep the name=value pair.
+            return value.split(";", 1)[0].strip()
+    return None
+
+
+try:
+    try:
+        with opener.open(f"{base}/?token={token}", timeout=20) as resp:
+            cookie = _cookie_from(resp.getheaders())
+    except urllib.error.HTTPError as exc:
+        cookie = _cookie_from(exc.headers.items())
+    if cookie:
+        print("GUI_DASHBOARD_COOKIE=" + cookie)
+except Exception:
+    pass
+PYEOF
+)"
+umask 022
+if [ -n "$cookie_line" ]; then
+  printf '%s\n' "$cookie_line" >> "$GUI_OUT/target.env"
+  if [ -n "${GITHUB_ACTIONS:-}" ]; then
+    echo "::add-mask::${cookie_line#GUI_DASHBOARD_COOKIE=}"
+  fi
+  echo "captured gateway session cookie for the title reset"
+else
+  echo "::warning::could not capture the gateway session cookie; the GUI title reset will no-op" >&2
+fi
 
 # ---- 4. browser ------------------------------------------------------------
 CHROME="${GUI_CHROME:-}"

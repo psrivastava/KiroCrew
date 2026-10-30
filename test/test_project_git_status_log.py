@@ -14,6 +14,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
+from git_maintenance_helpers import git_maintenance_off_entries
 
 from conftest import make_dir_link
 from kiro_crew.dashboard.handlers import (
@@ -120,21 +121,28 @@ def outside_any_repo(tmp_path, discovery_stops_at_tmp_path) -> Path:
     return plain
 
 
+def _fixture_git_env() -> dict[str, str]:
+    """The suite's env with a fixed identity, no host config and auto maintenance off."""
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "T",
+        "GIT_AUTHOR_EMAIL": "t@example.com",
+        "GIT_COMMITTER_NAME": "T",
+        "GIT_COMMITTER_EMAIL": "t@example.com",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_SYSTEM": os.devnull,
+    }
+    env.update(git_maintenance_off_entries(env))
+    return env
+
+
 def _git(cwd, *args) -> None:
     subprocess.run(
         ["git", *args],
         cwd=str(cwd),
         check=True,
         capture_output=True,
-        env={
-            **os.environ,
-            "GIT_AUTHOR_NAME": "T",
-            "GIT_AUTHOR_EMAIL": "t@example.com",
-            "GIT_COMMITTER_NAME": "T",
-            "GIT_COMMITTER_EMAIL": "t@example.com",
-            "GIT_CONFIG_GLOBAL": os.devnull,
-            "GIT_CONFIG_SYSTEM": os.devnull,
-        },
+        env=_fixture_git_env(),
     )
 
 
@@ -799,6 +807,30 @@ class TestGitStatus:
         # Should have additions (2 new lines) and deletions (original line changed)
         assert "additions" in a or "deletions" in a
 
+    @pytest.mark.asyncio
+    async def test_repo_root_uses_the_path_aware_redactor(self, repo, mock_sel):
+        """``repoRoot`` is an absolute path, so it takes the same wrapper
+        ``/api/project/git`` uses rather than the bare credential detector.
+
+        Without this the two endpoints disagree: a macOS temp project root
+        survives on one and comes back ``[REDACTED: credential]`` on the other.
+        """
+        with patch(
+            "kiro_crew.dashboard.handlers.files._redact_project_path",
+            side_effect=lambda p: f"[{p}]",
+        ) as wrapper:
+            async with TestClient(TestServer(_make_app(str(repo)))) as client:
+                resp = await client.get(f"/api/project/git/status?path={repo}")
+                data = await resp.json()
+        # git reports the toplevel with forward slashes on Windows, so compare
+        # normalised paths rather than pinning a separator.
+        assert wrapper.call_count == 1
+        passed = wrapper.call_args.args[0]
+        assert os.path.normcase(os.path.normpath(passed)) == os.path.normcase(
+            os.path.realpath(str(repo))
+        )
+        assert data["repoRoot"] == f"[{passed}]"
+
 
 # ── /api/project/git/log tests ──
 
@@ -839,7 +871,6 @@ class TestGitLog:
     @pytest.mark.asyncio
     async def test_limit_parameter(self, repo, mock_sel):
         """limit=1 returns only 1 commit even if there are more."""
-        # Add a second commit
         (repo / "d.txt").write_text("x\n")
         _git(repo, "add", "d.txt")
         _git(repo, "commit", "-qm", "second commit")
@@ -860,6 +891,240 @@ class TestGitLog:
         # Should still work, just capped
         assert data["repo"] is True
         assert len(data["commits"]) >= 1
+
+
+class TestGitLogDiscoveryBoundary:
+    """The log route shares the status route's discovery classification.
+
+    Only Git's own not-a-repository verdict (or a vanished directory) is
+    ``200 {"repo": false, "commits": []}``. Every other failed discovery probe
+    is ``503 git_log_unavailable``, because an empty commit list is what an
+    unborn repository legitimately returns, so an outage spelled that way is
+    indistinguishable from "no history yet".
+    """
+
+    _UNAVAILABLE = {
+        "error": "Couldn't read the commit history.",
+        "code": "git_log_unavailable",
+    }
+
+    @pytest.mark.parametrize(
+        "stderr",
+        (
+            b"fatal: not a git repository (or any parent): .git",
+            b"fatal: not a git repository \xff",
+        ),
+    )
+    @pytest.mark.asyncio
+    async def test_explicit_not_a_repository_verdict_is_repo_false(
+        self, tmp_path, mock_sel, monkeypatch, stderr
+    ):
+        from kiro_crew.dashboard.handlers import files as files_mod
+
+        plain = tmp_path / "plain"
+        plain.mkdir()
+        seen: dict[str, object] = {}
+
+        def fake_popen(_argv, **kwargs):
+            seen.update(kwargs["env"])
+            seen["stdout"] = kwargs["stdout"]
+            seen["stderr"] = kwargs["stderr"]
+            return _ProbeProcess(128, stderr=stderr)
+
+        monkeypatch.setattr(files_mod, "popen_limited", fake_popen)
+        async with TestClient(TestServer(_make_app(str(plain)))) as client:
+            resp = await client.get(f"/api/project/git/log?path={plain}")
+            data = await resp.json()
+
+        assert resp.status == 200
+        assert data == {"repo": False, "commits": []}
+        # The verdict match reads Git's English diagnostic, so the probe pins
+        # the C locale exactly like the status route does.
+        assert seen["LC_ALL"] == "C"
+        assert seen["LANGUAGE"] == "C"
+        assert seen["stdout"] is subprocess.DEVNULL
+        assert seen["stderr"] is subprocess.PIPE
+
+    @pytest.mark.asyncio
+    async def test_real_non_repository_is_repo_false(self, outside_any_repo, mock_sel):
+        plain = outside_any_repo
+        async with TestClient(TestServer(_make_app(str(plain)))) as client:
+            resp = await client.get(f"/api/project/git/log?path={plain}")
+            data = await resp.json()
+        assert resp.status == 200
+        assert data == {"repo": False, "commits": []}
+
+    @pytest.mark.asyncio
+    async def test_probe_path_text_does_not_claim_repository_absence(
+        self, tmp_path, mock_sel, monkeypatch
+    ):
+        from kiro_crew.dashboard.handlers import files as files_mod
+
+        repo = tmp_path / "not a git repository"
+        repo.mkdir()
+        diagnostic = (
+            f"fatal: detected dubious ownership in repository at '{repo}'\n"
+        ).encode()
+        monkeypatch.setattr(
+            files_mod,
+            "popen_limited",
+            lambda *_args, **_kwargs: _ProbeProcess(128, stderr=diagnostic),
+        )
+
+        async with TestClient(TestServer(_make_app(str(repo)))) as client:
+            resp = await client.get(f"/api/project/git/log?path={repo}")
+            data = await resp.json()
+
+        assert resp.status == 503
+        assert data == self._UNAVAILABLE
+
+    @pytest.mark.parametrize("failure", ("sandbox", "spawn"))
+    @pytest.mark.asyncio
+    async def test_operational_probe_failure_is_unavailable(
+        self, repo, mock_sel, monkeypatch, failure
+    ):
+        from kiro_crew.dashboard.handlers import files as files_mod
+
+        if failure == "sandbox":
+
+            def refuse(*_args, **_kwargs):
+                raise RuntimeError("sandbox unavailable")
+
+            monkeypatch.setattr(files_mod, "sandboxed_spawn_argv", refuse)
+        else:
+            monkeypatch.setattr(
+                files_mod,
+                "popen_limited",
+                MagicMock(side_effect=OSError("git unavailable")),
+            )
+
+        async with TestClient(TestServer(_make_app(str(repo)))) as client:
+            resp = await client.get(f"/api/project/git/log?path={repo}")
+            data = await resp.json()
+
+        assert os.path.isdir(repo), "fixture directory unexpectedly vanished"
+        assert resp.status == 503
+        assert data == self._UNAVAILABLE
+
+    @pytest.mark.asyncio
+    async def test_probe_stderr_overflow_is_killed_and_unavailable(
+        self, repo, mock_sel, monkeypatch
+    ):
+        from kiro_crew.dashboard.handlers import files as files_mod
+
+        proc = _ProbeProcess(
+            128,
+            stderr=b"fatal: not a git repository " + b"x" * 4096,
+        )
+        monkeypatch.setattr(files_mod, "popen_limited", lambda *_args, **_kwargs: proc)
+
+        async with TestClient(TestServer(_make_app(str(repo)))) as client:
+            resp = await client.get(f"/api/project/git/log?path={repo}")
+            data = await resp.json()
+
+        assert resp.status == 503
+        assert data == self._UNAVAILABLE
+        assert proc.killed is True
+        assert proc.waited is True
+
+    @pytest.mark.asyncio
+    async def test_probe_timeout_is_unavailable(self, repo, mock_sel, monkeypatch):
+        from kiro_crew.dashboard.handlers import files as files_mod
+
+        real_run = files_mod._run_git_bounded
+
+        def killed_probe(args, **kwargs):
+            if args[-2:] == ["rev-parse", "--git-dir"]:
+                return -9, "", True
+            return real_run(args, **kwargs)
+
+        monkeypatch.setattr(files_mod, "_run_git_bounded", killed_probe)
+
+        async with TestClient(TestServer(_make_app(str(repo)))) as client:
+            resp = await client.get(f"/api/project/git/log?path={repo}")
+            data = await resp.json()
+
+        assert resp.status == 503
+        assert data == self._UNAVAILABLE
+
+    @pytest.mark.asyncio
+    async def test_corrupt_repository_config_is_unavailable(
+        self, repo, mock_sel, discovery_stops_at_tmp_path
+    ):
+        # Real Git, no mocks: a malformed ``.git/config`` makes discovery fail
+        # with ``fatal: bad config line`` -- a nonzero probe that is NOT the
+        # not-a-repository verdict, so it is an outage rather than absence.
+        (repo / ".git" / "config").write_text("[core\nbogus\n")
+        probe = subprocess.run(
+            ["git", "rev-parse", "--git-dir"],
+            cwd=str(repo),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            check=False,
+            env={**os.environ, "LC_ALL": "C", "LANGUAGE": "C"},
+        )
+        assert probe.returncode != 0
+        assert "not a git repository" not in probe.stderr.lower()
+
+        async with TestClient(TestServer(_make_app(str(repo)))) as client:
+            resp = await client.get(f"/api/project/git/log?path={repo}")
+            data = await resp.json()
+
+        assert resp.status == 503
+        assert data == self._UNAVAILABLE
+
+    @pytest.mark.asyncio
+    async def test_unborn_repository_is_a_repository_with_no_commits(
+        self, tmp_path, mock_sel, discovery_stops_at_tmp_path
+    ):
+        # Discovery succeeds and only ``git log`` fails (no HEAD yet): that is
+        # the genuinely empty history, kept distinct from the discovery outage.
+        project = tmp_path / "unborn"
+        project.mkdir()
+        _git(project, "init", "-q", "-b", "trunk")
+
+        async with TestClient(TestServer(_make_app(str(project)))) as client:
+            resp = await client.get(f"/api/project/git/log?path={project}")
+            data = await resp.json()
+
+        assert resp.status == 200
+        assert data == {"repo": True, "commits": []}
+
+    @pytest.mark.asyncio
+    async def test_vanished_directory_after_probe_failure_is_repo_false(
+        self, repo, mock_sel, monkeypatch
+    ):
+        from kiro_crew.dashboard.handlers import files as files_mod
+
+        def vanish_then_fail(*_args, **_kwargs):
+            _remove_tree(repo)
+            raise FileNotFoundError("cwd vanished")
+
+        monkeypatch.setattr(files_mod, "popen_limited", vanish_then_fail)
+        async with TestClient(TestServer(_make_app(str(repo)))) as client:
+            resp = await client.get(f"/api/project/git/log?path={repo}")
+            data = await resp.json()
+
+        assert resp.status == 200
+        assert data == {"repo": False, "commits": []}
+
+    def test_verdict_predicate_is_shared_by_both_routes(self):
+        from kiro_crew.dashboard.handlers import files as files_mod
+
+        assert files_mod._is_not_a_repo_verdict(
+            "fatal: not a git repository (or any parent): .git\n"
+        )
+        assert files_mod._is_not_a_repo_verdict(
+            "warning: something\n  FATAL: NOT A GIT REPOSITORY: /x\n"
+        )
+        assert not files_mod._is_not_a_repo_verdict("")
+        assert not files_mod._is_not_a_repo_verdict(
+            "fatal: detected dubious ownership in repository at '/not a git repository'"
+        )
+        assert not files_mod._is_not_a_repo_verdict(
+            "fatal: bad config line 1 in file .git/config"
+        )
 
 
 class TestFilterDriverRefusal:
@@ -1331,3 +1596,60 @@ class TestListingCap:
         assert resp.status == 200
         assert data["files"] == []
         assert "truncated" not in data
+
+
+class TestConfigDefinedHooks:
+    """A ``hook.<name>.command`` in the repo's config (git 2.54+) is not reached by
+    ``core.hooksPath``; ``status`` would run ``post-index-change`` on every poll."""
+
+    @staticmethod
+    def _plant(repo: Path, marker: Path) -> None:
+        _git(repo, "config", "hook.pwn.event", "post-index-change")
+        _git(repo, "config", "hook.pwn.command", f"echo pwn >> '{marker}' #")
+
+    @staticmethod
+    def _spy(monkeypatch) -> list[list[str]]:
+        from kiro_crew.dashboard.handlers import files as files_mod
+
+        seen: list[list[str]] = []
+        inner = files_mod.sandboxed_spawn_argv
+
+        def spy(argv, *a, **kw):
+            seen.append(list(argv))
+            return inner(argv, *a, **kw)
+
+        monkeypatch.setattr(files_mod, "sandboxed_spawn_argv", spy)
+        return seen
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("route, verb", [("status", "status"), ("log", "log")])
+    async def test_every_git_call_disables_the_hook(
+        self, repo, tmp_path, mock_sel, monkeypatch, route, verb
+    ):
+        marker = tmp_path / "marker"
+        self._plant(repo, marker)
+        (repo / "a.txt").write_text("changed\n")
+        seen = self._spy(monkeypatch)
+        async with TestClient(TestServer(_make_app(str(repo)))) as client:
+            resp = await client.get(f"/api/project/git/{route}?path={repo}")
+        assert resp.status == 200
+        runs = [a for a in seen if verb in a]
+        assert runs, seen
+        for argv in runs:
+            assert "hook.pwn.enabled=false" in argv, argv
+            assert argv.index("hook.pwn.enabled=false") < argv.index(verb)
+        assert not marker.exists()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("route", ["status", "log"])
+    async def test_scan_failure_is_unavailable(self, repo, mock_sel, monkeypatch, route):
+        from kiro_crew.dashboard.handlers import files as files_mod
+        from kiro_crew.git_config_hooks import ConfigHookScanError
+
+        def refuse(*a, **k):
+            raise ConfigHookScanError("refused")
+
+        monkeypatch.setattr(files_mod, "config_hook_disable_args_sandboxed", refuse)
+        async with TestClient(TestServer(_make_app(str(repo)))) as client:
+            resp = await client.get(f"/api/project/git/{route}?path={repo}")
+        assert resp.status == 503

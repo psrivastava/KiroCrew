@@ -98,6 +98,25 @@ describe('ProjectsPage', () => {
     expect(widths).toContain('33%')
   })
 
+  it('lists runs newest first by started_at, later row first on a tie', async () => {
+    const mk = (task_id: string, name: string, started_at: number): ProjectRun => ({
+      task_id, name, running: false, status: 'completed',
+      tasks: 1, completed: 1, failed: 0, skipped: 0, current_task: 1,
+      spec: '', spec_name: '', error: '', tokens_used: 0, replan_count: 0,
+      task_details: [], started_at, finished_at: 0,
+      work_dir: '', branch_name: '', spec_content: 'spec', lessons_learned: [],
+      commits: 0, original_input: '', source: 'text', groups: [],
+    })
+    // Wire order is insertion order, which need not match start time.
+    const runs = [mk('r-old', 'Oldest', 100), mk('r-new', 'Newest', 300), mk('r-mid', 'Middle', 200), mk('r-p1', 'PlanA', 0), mk('r-p2', 'PlanB', 0)]
+    const { api: mockApi } = await import('../api/client')
+    vi.mocked(mockApi.taskRunnerStatus).mockResolvedValue({ running: false, available: true, runs })
+    renderWithProviders(<ProjectsPage />)
+    await screen.findByText('Oldest')
+    const order = screen.getAllByRole('button', { name: /^Open project / }).map(el => el.getAttribute('aria-label'))
+    expect(order).toEqual(['Newest', 'Middle', 'Oldest', 'PlanB', 'PlanA'].map(n => `Open project ${n}`))
+  })
+
   it('renders compose textarea by default', () => {
     renderWithProviders(<ProjectsPage />)
     expect(screen.getByPlaceholderText('Describe your task...')).toBeInTheDocument()
@@ -729,10 +748,11 @@ describe('DagView', () => {
     expect(container.querySelectorAll('path[marker-end]').length).toBe(3)
   })
 
-  it('maps reviewing to "in progress" label', () => {
+  it('labels a reviewing card with the legend word for reviewing', () => {
     const reviewNode = [{ id: '1', title: 'Check', status: 'reviewing', priority: 'normal' }]
     renderWithProviders(<DagView nodes={reviewNode} edges={[]} onNodeClick={vi.fn()} />)
-    expect(screen.getByText('in progress')).toBeInTheDocument()
+    // Card word + legend row: the same catalog entry, so they cannot drift apart.
+    expect(screen.getAllByText('Reviewing')).toHaveLength(2)
   })
 
   it('shows fix icon for fix task type', () => {

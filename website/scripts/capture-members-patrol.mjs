@@ -125,8 +125,6 @@ async function openMembers(theme, { record = false } = {}) {
   await stubDashboardApi(page, {
     theme,
     slots: SLOTS,
-    // The Crew Members surface is preview-gated (`utils/previewFlags.ts`).
-    localStorageEntries: { 'mc-preview-crew': '1' },
     extra: async (path, route) => {
       if (path === '/api/members') {
         await json(route, { members: MEMBERS, default_agent: 'kirocrew' })
@@ -199,9 +197,8 @@ async function openMembers(theme, { record = false } = {}) {
 async function expectBadges(page, want) {
   await page.waitForFunction(
     (w) => {
-      const all = Array.from(document.querySelectorAll('[data-testid="member-patrol-dot"]'))
-      const active = all.filter((b) => b.getAttribute('data-state') === 'active').length
-      return all.length === w.active && active === w.active
+      const all = Array.from(document.querySelectorAll('[data-testid="member-loop-indicator"]'))
+      return all.length === w.active
     },
     want,
     { timeout: 15000 },

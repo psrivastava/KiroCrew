@@ -13,6 +13,8 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any
 
+import pytest
+
 from kiro_crew.messaging.link import (
     CHAT_TYPE_DIRECT,
     CHAT_TYPE_FORUM,
@@ -159,6 +161,74 @@ class TestShouldRotateGeneration:
         assert should_rotate_generation(last, now, daily_reset_hour=-1) is False
 
 
+class TestShouldRotateGenerationDst:
+    """The daily boundary is the configured local wall-clock hour, even on a 23h/25h day.
+
+    America/New_York springs forward on Mar 8 (02:00 EST -> 03:00 EDT) and
+    falls back on Nov 1 (02:00 EDT -> 01:00 EST) in 2026. The ordinary-day
+    cases are the control.
+    """
+
+    @staticmethod
+    def _ny(year: int, month: int, day: int, hour: int, minute: int = 0) -> float:
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+
+        zone = ZoneInfo("America/New_York")
+        return datetime(year, month, day, hour, minute, tzinfo=zone).timestamp()
+
+    @pytest.mark.parametrize(
+        ("last", "now", "hour", "expected"),
+        [
+            # Control: an ordinary 24h day.
+            ((2026, 10, 26, 23, 30), (2026, 10, 27, 5, 0), 0, True),
+            ((2026, 10, 27, 0, 30), (2026, 10, 27, 5, 0), 0, False),
+            ((2026, 10, 27, 0, 30), (2026, 10, 27, 5, 0), 1, True),
+            # Control: yesterday's boundary across a month end (day 0 normalizes).
+            ((2026, 2, 28, 3, 0), (2026, 3, 1, 0, 30), 4, True),
+            # Fall back: midnight already passed at 00:30 EDT, no second reset.
+            ((2026, 11, 1, 0, 30), (2026, 11, 1, 5, 0), 0, False),
+            # Fall back: yesterday's 23:00 passed before 23:30, so no reset at 05:00.
+            ((2026, 10, 31, 23, 30), (2026, 11, 1, 5, 0), 23, False),
+            # Spring forward: midnight lies between 23:30 and 05:00.
+            ((2026, 3, 7, 23, 30), (2026, 3, 8, 5, 0), 0, True),
+            # Spring forward: 01:00 lies between 00:30 and 05:00.
+            ((2026, 3, 8, 0, 30), (2026, 3, 8, 5, 0), 1, True),
+            # Fall back, reset hour 1 (the repeated hour): one reset across the night.
+            ((2026, 10, 31, 23, 30), (2026, 11, 1, 1, 30), 1, True),
+            ((2026, 11, 1, 1, 30), (2026, 11, 2, 0, 30), 1, False),
+            # Spring forward, reset hour 2 (the skipped hour): one reset across the gap.
+            ((2026, 3, 8, 1, 30), (2026, 3, 8, 3, 30), 2, True),
+            ((2026, 3, 8, 3, 30), (2026, 3, 9, 1, 0), 2, False),
+        ],
+        ids=[
+            "control-crossed-midnight",
+            "control-after-midnight",
+            "control-crossed-1am",
+            "control-yesterday-across-month-end",
+            "fall-back-no-second-reset",
+            "fall-back-yesterday-23h-already-passed",
+            "spring-forward-midnight",
+            "spring-forward-1am",
+            "fall-back-repeated-hour-resets",
+            "fall-back-repeated-hour-resets-once",
+            "spring-forward-skipped-hour-resets",
+            "spring-forward-skipped-hour-resets-once",
+        ],
+    )
+    def test_daily_boundary_is_local_wall_clock_hour(
+        self,
+        local_tz: Any,
+        last: tuple[int, ...],
+        now: tuple[int, ...],
+        hour: int,
+        expected: bool,
+    ) -> None:
+        local_tz("America/New_York")
+        result = should_rotate_generation(self._ny(*last), self._ny(*now), daily_reset_hour=hour)
+        assert result is expected
+
+
 class _Sessions:
     """The narrow session-manager surface :func:`bind_origin_mirror` touches."""
 
@@ -238,19 +308,37 @@ class TestBindOriginMirror:
         assert bind_origin_mirror(sess, key="k", location=_HERE) is False
         assert sess.mirror_links["k"] == chosen
 
-    def test_the_unrouted_slack_placeholder_does_not_block_the_bind(self) -> None:
-        """``set_channel`` writes the namespaced bucket into ``slack_channel_id``.
-
-        ``get_mirror_link`` synthesizes a Slack link from that field whenever no
-        explicit mirror row exists, so the first turn of every new channel session
-        reads one back. An empty thread is Slack's own clear sentinel and never
-        enters the reverse index, so nothing can be delivered through it — it is
-        bookkeeping, not a binding.
+    def test_the_first_turns_bucket_row_does_not_block_the_bind(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """``set_channel`` writes the namespaced bucket into ``slack_channel_id``
+        with no thread, so every new channel session carries that row on its first
+        turn. It is not a binding: an empty thread is Slack's own clear sentinel and
+        never enters the reverse index, so nothing can be delivered through it. The
+        STORE reads it as no mirror -- ``SessionMap.get_mirror_link`` never
+        synthesizes a Slack mirror without a thread -- so this reader carries no
+        copy of that rule and sees ``None``. A Slack binding that names a thread is
+        deliberate and is left alone like any other.
         """
+        from kiro_crew.session_map import SessionMap
+
+        monkeypatch.setattr("kiro_crew.session_map.config_dir", lambda: tmp_path)
+        store = SessionMap()
         sess = _Sessions()
-        sess.mirror_links["k"] = ChannelLink("slack", channel_id="discord:c1")
-        assert bind_origin_mirror(sess, key="k", location=_HERE) is True
-        assert sess.mirror_links["k"] == _HERE
+        sess.get_mirror_link = store.get_mirror_link  # type: ignore[method-assign]
+        sess.set_mirror_link = store.set_mirror_link  # type: ignore[method-assign]
+        key = "discord:kirocrew:direct:u1"
+        store.set_slack_link(key, "", "discord:u1")
+        assert store.get_mirror_link(key) is None
+        assert bind_origin_mirror(sess, key=key, location=_HERE) is True
+        assert store.get_mirror_link(key) == _HERE
+
+        threaded = "discord:kirocrew:direct:u2"
+        store.set_slack_link(threaded, "1786300000.000100", "C0OPS")
+        assert bind_origin_mirror(sess, key=threaded, location=_HERE) is False
+        assert store.get_mirror_link(threaded) == ChannelLink(
+            "slack", channel_id="C0OPS", thread_id="1786300000.000100"
+        )
 
     def test_a_unified_bucket_is_never_bound(self) -> None:
         """``dm_scope="unified"`` collapses every user's DMs into one bucket.
@@ -466,9 +554,8 @@ class TestUnbindReasonVocabulary:
         The planted sample proves the scanner fires at all.
         """
         import ast
-        from pathlib import Path
 
-        import kiro_crew
+        from source_corpus import parsed_candidates, src_root
 
         binding_calls = {
             "clear_mirror_link",
@@ -494,14 +581,82 @@ class TestUnbindReasonVocabulary:
         planted = ast.parse('s.clear_mirror_link(key, reason="made_up")\n')
         assert len(_bare_reasons(planted)) == 1, "the scanner does not fire"
 
-        pkg = Path(kiro_crew.__file__).resolve().parent
+        pkg = src_root()
+        # A flagged call names a binding method and passes ``reason=``, so only the
+        # files whose text holds both are parsed.
+        candidates = parsed_candidates(
+            require_all=("reason",), require_any=sorted(binding_calls), skip_syntax_errors=False
+        )
         offenders = [
             f"{path.relative_to(pkg)}:{line}"
-            for path in pkg.rglob("*.py")
+            for path, _text, tree in candidates
             if "_vendor" not in path.parts
-            for line in _bare_reasons(ast.parse(path.read_text(encoding="utf-8")))
+            for line in _bare_reasons(tree)
         ]
         assert not offenders, (
             "unbind reasons must come from messaging.link's UNBIND_REASON_* "
             f"constants, not bare literals: {offenders}"
         )
+
+
+class TestChannelLinkPrincipal:
+    """``ChannelLink.principal``: recorded beside the location, never part of it."""
+
+    def test_equality_is_the_location_alone(self) -> None:
+        """Every binding match in the map and the resume paths compares links by
+        value, so a recorded peer must not make one location read as two."""
+        bare = ChannelLink("discord", channel_id="dm-9")
+        recorded = ChannelLink("discord", channel_id="dm-9", principal="42")
+        other_peer = ChannelLink("discord", channel_id="dm-9", principal="77")
+        assert bare == recorded == other_peer
+        assert recorded != ChannelLink("discord", channel_id="dm-8", principal="42")
+
+    def test_the_record_serializes_only_when_present(self) -> None:
+        bare = ChannelLink("discord", channel_id="dm-9")
+        assert bare.to_dict() == {
+            "channel_type": "discord",
+            "channel_id": "dm-9",
+            "thread_id": None,
+        }
+        recorded = ChannelLink("discord", channel_id="dm-9", principal="42")
+        assert recorded.to_dict()["principal"] == "42"
+
+    def test_the_record_survives_a_round_trip(self) -> None:
+        recorded = ChannelLink("discord", channel_id="dm-9", principal="42")
+        back = ChannelLink.from_dict(recorded.to_dict())
+        assert back == recorded and back.principal == "42"
+
+    def test_a_row_written_without_the_field_reads_as_naming_nobody(self) -> None:
+        legacy = {"channel_type": "discord", "channel_id": "dm-9", "thread_id": None}
+        assert ChannelLink.from_dict(legacy).principal is None
+        # An empty string stored by any writer is the same absence, not a peer.
+        assert ChannelLink.from_dict({**legacy, "principal": ""}).principal is None
+
+    def test_the_admission_rides_with_the_record_and_outside_equality(self) -> None:
+        """The gateway's MAC over the row travels like the principal: emitted only
+        when set, read back verbatim, and never part of the location's identity."""
+        bare = ChannelLink("discord", channel_id="dm-9")
+        assert "admission" not in bare.to_dict()
+        signed = ChannelLink("discord", channel_id="dm-9", principal="42", admission="ab" * 32)
+        assert signed.to_dict()["admission"] == "ab" * 32
+        back = ChannelLink.from_dict(signed.to_dict())
+        assert back.admission == "ab" * 32 and back.principal == "42"
+        assert back == bare
+        assert ChannelLink.from_dict({**bare.to_dict(), "admission": ""}).admission is None
+
+    def test_same_row_is_the_whole_row_where_equality_is_the_location(self) -> None:
+        """A rollback's ownership guard asks "is this still the row I wrote?", and
+        two rows at one location under different admissions -- a re-link after a key
+        rotation -- are different rows even though they are the same binding."""
+        mine = ChannelLink("discord", channel_id="dm-9", principal="42", admission="ab" * 32)
+        refreshed = ChannelLink("discord", channel_id="dm-9", principal="42", admission="cd" * 32)
+        other_peer = ChannelLink("discord", channel_id="dm-9", principal="55", admission="ab" * 32)
+        bare = ChannelLink("discord", channel_id="dm-9")
+        assert mine == refreshed == other_peer == bare, "location equality is unchanged"
+        assert mine.same_row(ChannelLink.from_dict(mine.to_dict()))
+        assert bare.same_row(ChannelLink("discord", channel_id="dm-9"))
+        assert not mine.same_row(refreshed)
+        assert not mine.same_row(other_peer)
+        assert not mine.same_row(bare) and not bare.same_row(mine)
+        assert not mine.same_row(ChannelLink("discord", channel_id="dm-10", principal="42"))
+        assert not mine.same_row(None) and not mine.same_row(mine.to_dict())

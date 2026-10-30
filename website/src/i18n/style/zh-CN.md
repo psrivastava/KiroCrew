@@ -41,9 +41,9 @@ Authorities cited:
 - **Parentheses** never mix styles within one value — a half-width opener
   married to a full-width closer renders as `(…）`. Both halves belong in the
   same key.
-- **Quotes** are curly `" "`. Corner brackets `「 」` are not used. A quoted
+- **Quotes** are curly `“ ”`. Corner brackets `「 」` are not used. A quoted
   English UI label keeps its English inside Chinese quotes:
-  `请使用"From Spec"标签页`.
+  `请使用“From Spec”标签页`.
 - **CJK ↔ Latin spacing**: one ASCII space between a CJK character and an
   adjacent Latin letter, digit or `$`-prefixed number — `MCP 服务器`, `第 3 轮`.
   No space between CJK and full-width punctuation, and none between two CJK
@@ -67,25 +67,34 @@ Checked by `qa.test.ts` → `fullwidth-alphanumeric` (gates outright at zero).
 
 ## §2 Terminology
 
-Preferred renderings for product concepts. These are conventions, not CI gates —
-a reviewer should check consistency but context may require variation.
+Preferred renderings for product concepts. Rows marked † are gated by
+`zhStyle.test.ts` wherever the English carries the term; the rest are
+conventions a reviewer checks, and context may require variation.
 
 | English | Preferred | Avoid |
 |---|---|---|
 | session | 会话 | 进程, 对话 |
-| workspace | 工作区 | 工作空间, 工作台 |
+| workspace † | 工作区 | 工作空间, 工作台 |
 | artifact | 产物 | 工件, 制品 |
-| agent / subagent | 代理 / 子代理 | 智能体, 子智能体 |
+| agent / subagent † | 代理 / 子代理 | 智能体, 子智能体 |
 | skill | 技能 | 技巧 |
 | cron job / scheduled job | 定时任务 | 计划任务 |
-| thread | 话题 | 线程 (reads as OS thread) |
-| turn | 轮次 | 回合 |
+| thread † | 话题 | 线程 (reads as OS thread) |
+| turn † | 轮次 | 回合 |
 | message | 消息 | 信息 |
-| dashboard | 仪表板 | 仪表盘, 控制台 |
-| sidebar | 侧边栏 | 侧栏 |
+| dashboard † | 仪表板 | 仪表盘, 控制台 |
+| sidebar † | 侧边栏 | 侧栏 |
 | preferences | 偏好设置 | 偏好 |
-| pinned | 已置顶 | 已固定 |
-| resolved | 已解决 | 已处理 |
+| pinned † | 已置顶 | 已固定 |
+| resolved † | 已解决 | 已处理 |
+| usage † | 用量 | 使用量 |
+| effort (reasoning) † | 强度 | 投入度 |
+| reject † | 拒绝 | 驳回 |
+| WeCom † | 企业微信 | WeCom |
+
+† gates one Avoid rendering per row, the one `zhStyle.test.ts` `BANNED` lists (for
+example `工作空间`, `子智能体`, `仪表盘`); the other Avoid entries in those rows
+(`工作台`, `智能体`, `控制台`) are review conventions.
 
 **Sense splits** (context-dependent, both are correct):
 
@@ -103,8 +112,9 @@ a reviewer should check consistency but context may require variation.
 
 ## §3 Do not translate
 
-Product names stay in Latin script. The list is in `glossary.json` under `dnt`:
-`KiroCrew` / `Kiro Crew`, `Kiro`, `Slack`, `Discord`, `MCP`, `GitHub`, `Playwright`, etc.
+Product names stay in Latin script. The canonical list in `glossary.json` includes
+`KiroCrew`, `Kiro`, `Slack`, `Discord`, `MCP`, `GitHub`, `Playwright`, and others. The
+prose brand `Kiro Crew` also remains unchanged.
 
 Also stays in English: AWS service names, key legends (Enter, Shift, ⌘),
 `main`/`origin`/`HEAD`, paths, filenames, config keys, and `cron` (the syntax —
@@ -161,7 +171,11 @@ sentence. New copy must not add fragments: one key per sentence.
 | no leading/trailing space, no doubled space | `qa.test.ts` |
 | placeholder parity with English | `catalogParity.test.ts` |
 | correct CLDR plural categories (1: other) | `catalogParity.test.ts` |
+| no unreachable plural suffixes | `zhStyle.test.ts` |
+| selected terminology mappings | `zhStyle.test.ts` |
+| CJK punctuation, ellipsis, no corner brackets and mixed parentheses | `zhStyle.test.ts` |
+| no 您, 这将, doubled particles or three-的 clauses | `zhStyle.test.ts` |
 | do-not-translate terms present | `glossary.test.ts` |
 
-Everything in §1 (beyond what QA catches), §2 and §4 is review-only — the
-judgements a human has to make.
+The parts of §1, §2 and §4 not named above remain review-only — the judgements a
+human has to make.

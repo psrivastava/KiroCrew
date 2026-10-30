@@ -19,14 +19,20 @@ from kiro_crew import embeddings as emb
 def _memory_cfg(monkeypatch):
     """Drive the module's raw-config reader instead of writing a config file.
 
-    Also pins ``cpu_count``: both thread readers clamp to the machine's cores, so
-    a test asserting an explicit count is otherwise environment-dependent — it
-    passes on a 32-core dev host and fails on a 4-core CI runner. Tests that
-    exercise the clamp itself override this with their own value.
+    Also pins the core count: both thread readers clamp to it, so a test asserting
+    an explicit count is otherwise environment-dependent — it passes on a 32-core
+    dev host and fails on a 4-core CI runner. Tests that exercise the clamp itself
+    override this with their own value.
+
+    Both sources are pinned because which one answers is a platform property: the
+    interactive reader takes the CPU set where the platform has one, and a host
+    reports more cores than it allows its processes.
     """
     cfg: dict = {}
     monkeypatch.setattr(emb, "_read_memory_config", lambda: cfg)
     monkeypatch.setattr(emb.os, "cpu_count", lambda: 16)
+    if hasattr(emb.os, "sched_getaffinity"):
+        monkeypatch.setattr(emb.os, "sched_getaffinity", lambda pid: set(range(16)))
     return cfg
 
 
@@ -127,7 +133,8 @@ def test_one_pathological_row_cannot_park_the_sweep(_memory_cfg):
 def test_bulk_threads_default_to_one(_memory_cfg):
     _memory_cfg["embedding_threads"] = 4
     assert emb.bulk_embed_threads() == 1
-    assert emb._embed_threads() == 4
+    # 4 is the declared default, so the pinned 16-core host gets its large-host 6.
+    assert emb._embed_threads() == 6
 
 
 def test_explicit_zero_inherits_the_interactive_count(_memory_cfg):
@@ -149,13 +156,29 @@ def test_bulk_threads_override_is_honoured(_memory_cfg):
     _memory_cfg["embedding_threads"] = 4
     _memory_cfg["embedding_bulk_threads"] = 6
     assert emb.bulk_embed_threads() == 6
-    assert emb._embed_threads() == 4
+    assert emb._embed_threads() == 6
 
 
 def test_bulk_threads_clamped_to_cores(_memory_cfg, monkeypatch):
     monkeypatch.setattr(emb.os, "cpu_count", lambda: 8)
+    if hasattr(emb.os, "sched_getaffinity"):
+        monkeypatch.setattr(emb.os, "sched_getaffinity", lambda pid: set(range(8)))
     _memory_cfg["embedding_bulk_threads"] = 4096
     assert emb.bulk_embed_threads() == 8
+
+
+def test_bulk_threads_clamped_to_the_cpu_set(_memory_cfg, monkeypatch):
+    """A sweep gets what the process may use, not what the host reports.
+
+    Skipped where the platform has no affinity API -- a probe of ``os``, so a
+    reader that stopped consulting affinity fails here instead of skipping.
+    """
+    if not hasattr(emb.os, "sched_getaffinity"):
+        pytest.skip("this platform has no os.sched_getaffinity to narrow")
+    monkeypatch.setattr(emb.os, "cpu_count", lambda: 64)
+    monkeypatch.setattr(emb.os, "sched_getaffinity", lambda pid: {0, 1})
+    _memory_cfg["embedding_bulk_threads"] = 32
+    assert emb.bulk_embed_threads() == 2
 
 
 # ---------------------------------------------------------------------------

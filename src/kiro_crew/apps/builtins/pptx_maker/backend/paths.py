@@ -153,11 +153,21 @@ def deck_root() -> Path:
     """
     override = os.environ.get(DECK_ROOT_ENV)
     if override:
-        return Path(override).expanduser().resolve()
+        resolved = Path(override).expanduser().resolve()
+        logger.debug("deck root: from %s override -> %r", DECK_ROOT_ENV, resolved)
+        return resolved
     configured = read_engine_config().get("output_dir")
     if isinstance(configured, str) and configured.strip():
-        return Path(configured.strip()).expanduser().resolve()
-    return (Path.home() / ENGINE_DEFAULT_DECK_ROOT).resolve()
+        resolved = Path(configured.strip()).expanduser().resolve()
+        logger.debug("deck root: from engine config output_dir -> %r", resolved)
+        return resolved
+    # POSIX-oriented default: expands the user home and a relative sub-path. On
+    # Windows Path.home() and the separator differ, so logging which branch
+    # produced the root tells a reader whether this fallback ran or a configured
+    # value won — the resolution left no such signal before.
+    resolved = (Path.home() / ENGINE_DEFAULT_DECK_ROOT).resolve()
+    logger.debug("deck root: from home default -> %r", resolved)
+    return resolved
 
 
 def _contained(candidate: Path, root: Path) -> Path | None:
@@ -172,7 +182,11 @@ def _contained(candidate: Path, root: Path) -> Path | None:
         root_resolved = root.resolve()
     except OSError:
         return None
-    if resolved != root_resolved and root_resolved not in resolved.parents:
+    # Windows' ``\\?\`` prefix folded off both sides first, so one resolve
+    # keeping it is not read as an escape. Lexical only.
+    plain = platform_compat.strip_extended_length_prefix(resolved)
+    plain_root = platform_compat.strip_extended_length_prefix(root_resolved)
+    if plain != plain_root and plain_root not in plain.parents:
         return None
     if is_sensitive_path(str(resolved)):
         return None

@@ -15,6 +15,7 @@ import threading
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
+from kiro_crew import context_omissions
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.lesson_validation import (
     LESSON_APPLIES_ALWAYS,
@@ -35,6 +36,7 @@ from kiro_crew.project_scope import (
     scope_is_admissible,
     scope_selector_is_inadmissible,
 )
+from kiro_crew.vector_memory_constants import _contains_injection
 
 try:
     from kiro_crew.config.loader import config_dir as _config_dir
@@ -42,6 +44,12 @@ except ImportError:
     _config_dir = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
+
+
+def lesson_contains_injection(rule: object, negative: object = None) -> bool:
+    """Does the rule or its NOT-clause match the vector store's blocked patterns?"""
+    return any(isinstance(t, str) and _contains_injection(t) for t in (rule, negative))
+
 
 # ── Constants ──
 
@@ -104,6 +112,16 @@ _MAX_LESSONS_TOTAL = 200  # prune oldest when exceeded
 _PATH_LOCKS: dict[Path, threading.Lock] = {}
 _PATH_LOCKS_GUARD = threading.Lock()
 
+# Write generation per file, shared the same way. ``_write_all`` bumps it after every
+# write and each instance keys its parse cache on it, so a write through any instance
+# invalidates every other instance's cache. The file's mtime cannot do that alone: two
+# writes inside one timestamp tick leave it unchanged, and the stale instance would
+# keep serving, and on its next save write back, the rows from before the other write.
+# One int per written file, and every key is also a key of ``_PATH_LOCKS``, so it adds
+# no population of its own. Never evicted: a missing entry has to mean generation 0,
+# not a bump that was forgotten.
+_PATH_GENERATIONS: dict[Path, int] = {}
+
 
 def _lock_for(path: Path) -> threading.Lock:
     """Return the process-wide lock for *path*, creating it on first use."""
@@ -135,9 +153,21 @@ class Lesson:
     # from ``category``, ``ts`` or wording -- see
     # ``kiro_crew.lesson_validation.normalize_lesson_applies``.
     applies: str | None = None
+    # Who wrote this lesson, as the server derived it: the reduced principal
+    # ``shared_crew.memory_changes.writer_stamp`` builds (id, kind, display name).
+    # ``None`` for a lesson written before writers were recorded, or with no
+    # known person behind it. A label only; nothing gates on it.
+    written_by: dict[str, str] | None = None
 
 
 # ── Storage ──
+
+
+def _written_by_of(raw: object) -> dict[str, str] | None:
+    """A stored ``written_by`` read back; ``None`` when absent or damaged."""
+    from kiro_crew.shared_crew.memory_changes import stamp_of
+
+    return stamp_of(raw)
 
 
 def _serializable(lesson: Lesson) -> dict:
@@ -153,6 +183,8 @@ def _serializable(lesson: Lesson) -> dict:
     row = asdict(lesson)
     if row.get("applies") is None:
         row.pop("applies", None)
+    if row.get("written_by") is None:
+        row.pop("written_by", None)
     return row
 
 
@@ -196,6 +228,50 @@ def _prune_to_total(lessons: list[Lesson]) -> list[Lesson]:
         if len(drop) >= over:
             break
     return [lesson for index, lesson in enumerate(lessons) if index not in drop]
+
+
+def _conflicting_preference(new: Lesson, stored: Lesson, new_scope: str | None) -> bool:
+    """Whether *stored* is a preference that *new* replaces (newest wins).
+
+    Both rows are ``preference`` lessons in the same scope, and they share at
+    least half of the larger keyword set: the vector store's topic-overlap
+    rule (``vector_memory_runtime.lessons.lesson_keywords``), so both stores
+    call the same pair a conflict. A standing (``always``) row is never
+    replaced by a finding (``on_topic``), matching the vector store's tier rule.
+    """
+    if new.category != "preference" or stored.category != "preference":
+        return False
+    if canonical_scope(stored.repo_scope) != new_scope:
+        return False
+    if new.applies == LESSON_APPLIES_ON_TOPIC and stored.applies != LESSON_APPLIES_ON_TOPIC:
+        return False
+    from kiro_crew.vector_memory_runtime.lessons import lesson_keywords
+
+    new_words = lesson_keywords(new.rule.lower())
+    old_words = lesson_keywords(stored.rule.lower())
+    if not new_words or not old_words:
+        return False
+    return len(new_words & old_words) / max(len(new_words), len(old_words)) >= 0.5
+
+
+def _keep_one_identity(lesson: Lesson) -> str:
+    """What makes two JSONL rows copies of one lesson for ``remove(keep_one=True)``.
+
+    The whole row except its timestamp, not a chosen subset of its fields: any
+    stored difference (a NOT-clause, a tier, a scope, a category) makes two rows
+    different lessons. Only rule and clause text compare case-insensitively
+    with edge whitespace ignored, and an admissible scope compares canonically,
+    as a plain delete reads it. A value that is not text (a hand-edited file)
+    compares as stored, so it never matches a text row.
+    """
+    row = {k: v for k, v in asdict(lesson).items() if k != "ts" and v is not None}
+    for field in ("rule", "negative"):
+        if isinstance(row.get(field), str):
+            row[field] = row[field].lower().strip()
+    scope = lesson.repo_scope
+    if isinstance(scope, str) and scope_is_admissible(scope):
+        row["repo_scope"] = canonical_scope(scope)
+    return json.dumps(row, sort_keys=True)
 
 
 class LessonStore:
@@ -264,8 +340,8 @@ class LessonStore:
 
         self._memory_store_name = named_store_of_db(self._dir / "memory.db")
         self._lock = _lock_for(self._path)
-        # mtime-based cache: (mtime, lessons)
-        self._cache: tuple[float, list[Lesson]] | None = None
+        # Parse cache: ((write generation, st_mtime, st_size), lessons).
+        self._cache: tuple[tuple[int, float, int], list[Lesson]] | None = None
 
     @property
     def path(self) -> Path:
@@ -320,7 +396,21 @@ class LessonStore:
             mode=mode,
             newline="",
         )
+        # After the rename, so ``load_all`` can read the generation before it reads the
+        # file. The caller holds the path's lock, so two bumps of one path never race.
+        _PATH_GENERATIONS[self._path] = _PATH_GENERATIONS.get(self._path, 0) + 1
         self._cache = None  # invalidate
+
+    def _load_for_write(self) -> list[Lesson]:
+        """The rows a write builds on: parsed from the file, never taken from the cache.
+
+        The caller MUST hold ``self._lock``. A write made by this process moves the
+        generation ``load_all`` keys on, but a rewrite by another process (the CLI)
+        inside one timestamp tick that keeps the size changes nothing the key can see,
+        and writing the cached rows back would delete it.
+        """
+        self._cache = None
+        return self.load_all()
 
     @named_store_operation
     def save(self, lesson: Lesson) -> str:
@@ -339,7 +429,7 @@ class LessonStore:
         return self._insert_or_enrich(lesson, enrich=False)
 
     @named_store_operation
-    def save_or_enrich(self, lesson: Lesson) -> str:
+    def save_or_enrich(self, lesson: Lesson, *, superseded_out: list[str] | None = None) -> str:
         """Insert *lesson*, or attach its NOT-clause to the record holding the same
         rule, in ONE lock acquisition. Returns
         ``inserted``/``enriched``/``unchanged``/``refused``.
@@ -350,10 +440,16 @@ class LessonStore:
         Re-submitting a rule to attach a NOT-clause must not fall into the duplicate
         check, which matches on the rule alone: returning before looking at
         ``negative`` would drop the clause behind an HTTP 200.
-        """
-        return self._insert_or_enrich(lesson, enrich=True)
 
-    def _insert_or_enrich(self, lesson: Lesson, *, enrich: bool) -> str:
+        A ``preference`` insert also replaces the stored preferences it
+        conflicts with (newest wins, :func:`_conflicting_preference`). The rule
+        text of each replaced row is appended to *superseded_out* when given.
+        """
+        return self._insert_or_enrich(lesson, enrich=True, superseded_out=superseded_out)
+
+    def _insert_or_enrich(
+        self, lesson: Lesson, *, enrich: bool, superseded_out: list[str] | None = None
+    ) -> str:
         """Shared body for :meth:`save` and :meth:`save_or_enrich`.
 
         The single lock acquisition is the load-bearing part. Doing enrich and
@@ -381,6 +477,10 @@ class LessonStore:
         """
         if contains_volatile_lesson_fact(lesson.rule, lesson.negative):
             return "refused"
+        # The same blocked-content screen the vector store runs in validate_semantic,
+        # so text that store refuses is not stored here instead when it is absent.
+        if lesson_contains_injection(lesson.rule, lesson.negative):
+            return "refused"
         with self._lock:
             # A whitespace-only clause is no clause. Same defect as the vector store's:
             # `--negative "   "` is truthy, so it would replace a real stored clause
@@ -396,10 +496,10 @@ class LessonStore:
             # scope, and a non-string is refused before ``.strip()`` can raise,
             # because consolidation hands over a value the model produced.
             wanted_scope = canonical_scope(lesson.repo_scope)
-            # load_all() is called under the lock deliberately: it takes no lock of
-            # its own, so this is not a re-entrant acquisition on a non-reentrant
-            # Lock. Do NOT call save() from in here for the same reason.
-            existing = self.load_all()
+            # _load_for_write() reads under the lock deliberately: load_all() takes no
+            # lock of its own, so this is not a re-entrant acquisition on a
+            # non-reentrant Lock. Do NOT call save() from in here for the same reason.
+            existing = self._load_for_write()
             wanted = lesson.rule.lower().strip()
             updated: list[Lesson] = []
             matched = False
@@ -442,11 +542,31 @@ class LessonStore:
                         # edit followed by a failed write would leave the cache
                         # advertising a clause that was never persisted -- and that
                         # cache feeds context injection.
-                        updated.append(replace(le, negative=next_negative, repo_scope=next_scope))
+                        updated.append(
+                            replace(
+                                le,
+                                negative=next_negative,
+                                repo_scope=next_scope,
+                                written_by=lesson.written_by or le.written_by,
+                            )
+                        )
                     continue
                 updated.append(le)
             if outcome == "unchanged":
                 return outcome  # nothing to write; leave the file untouched
+            replaced: list[str] = []
+            if not matched and enrich:
+                # Newest wins: an explicit preference replaces the stored
+                # preferences it conflicts with, so two contradicting rules are
+                # never both in effect. Automatic writers (``save``) never reach
+                # this, and nothing but a preference is replaced.
+                kept: list[Lesson] = []
+                for le in updated:
+                    if _conflicting_preference(lesson, le, wanted_scope):
+                        replaced.append(le.rule)
+                    else:
+                        kept.append(le)
+                updated = kept
             if not matched:
                 # Insert the normalised clause too, so a whitespace-only one is stored
                 # as absent rather than as blanks.
@@ -472,14 +592,27 @@ class LessonStore:
                         )
                         return "refused"
             self._write_all(updated)
+        if superseded_out is not None:
+            superseded_out.extend(replaced)
         logger.info("%s lesson: %s", outcome.capitalize(), lesson.rule)
         return outcome
 
     @named_store_operation
     def remove(
-        self, rule_substring: str, repo_scope: str | None = None, *, exact: bool = False
+        self,
+        rule_substring: str,
+        repo_scope: str | None = None,
+        *,
+        exact: bool = False,
+        keep_one: bool = False,
     ) -> bool:
         """Remove lessons whose rule contains *rule_substring*. Returns True if any removed.
+
+        *keep_one* removes only the EXTRA copies: matched rows are grouped by
+        whole stored row (see ``_keep_one_identity``), the
+        first row of each group in file order (the oldest, since the file is
+        append-ordered) stays, and the rest go. Two different lessons never
+        share a group, so no lesson loses its last copy in this mode.
 
         Substring matching on the rule text is deliberate: a user targets a
         lesson by a fragment of its rule rather than retyping the whole thing
@@ -517,7 +650,7 @@ class LessonStore:
         if repo_scope is not None and scope_selector_is_inadmissible(repo_scope):
             raise ValueError(f"repo_scope does not name a usable scope: {repo_scope!r}")
         with self._lock:
-            lessons = self.load_all()
+            lessons = self._load_for_write()
             lower = rule_substring.lower()
             wanted_text = lower.strip()
             # A missing selector leaves scope out of the match. A present one --
@@ -548,7 +681,22 @@ class LessonStore:
                         return False
                 return True
 
-            kept = [le for le in lessons if not _matches(le)]
+            if keep_one:
+                # One survivor per lesson: rows are copies only when their
+                # whole stored row matches (see _keep_one_identity), so a copy
+                # that differs in any field is a different lesson and stays.
+                seen: set[str] = set()
+                kept = []
+                for le in lessons:
+                    if not _matches(le):
+                        kept.append(le)
+                        continue
+                    group = _keep_one_identity(le)
+                    if group not in seen:
+                        seen.add(group)
+                        kept.append(le)
+            else:
+                kept = [le for le in lessons if not _matches(le)]
             if len(kept) == len(lessons):
                 return False
             self._write_all(kept)
@@ -556,24 +704,43 @@ class LessonStore:
 
     @named_store_operation
     def load_all(self) -> list[Lesson]:
-        """Load all lessons from the JSONL file. Uses mtime-based caching."""
+        """Load all lessons from the JSONL file, cached per instance.
+
+        The cache is reused only while ``(write generation, st_mtime, st_size)`` is
+        unchanged (see ``_PATH_GENERATIONS``). The generation is read BEFORE the file:
+        ``_write_all`` bumps it after its rename, so a write that lands while this call
+        parses leaves the cache keyed to the older generation, and the next read parses
+        again.
+        """
         require_memory_ready(self._memory_store_name)
         if not self._path.exists():
             self._cache = None
             return []
+        generation = _PATH_GENERATIONS.get(self._path, 0)
         try:
-            mtime = self._path.stat().st_mtime
+            st = self._path.stat()
         except OSError:
             return []
-        if self._cache and self._cache[0] == mtime:
+        key = (generation, st.st_mtime, st.st_size)
+        if self._cache and self._cache[0] == key:
             return self._cache[1]
         lessons: list[Lesson] = []
-        for line in self._path.read_text().splitlines():
+        # Non-blank lines that do not read as a lesson, with their line numbers.
+        # Each one costs only itself; the warning below counts them.
+        unreadable: list[tuple[int, str]] = []
+        for lineno, line in enumerate(self._path.read_text().splitlines(), start=1):
             line = line.strip()
             if not line:
                 continue
             try:
                 data = json.loads(line)
+                # Valid JSON is not yet a lesson. A row that is not an object, or
+                # whose rule is not text, would raise at ``data.get`` below or at
+                # ``rule.lower()`` in every later save and remove, taking every
+                # other lesson in the file down with it.
+                if not isinstance(data, dict) or not isinstance(data.get("rule", ""), str):
+                    unreadable.append((lineno, line))
+                    continue
                 raw_scope = data.get("repo_scope")
                 # A PRESENT but unusable scope is not "applies everywhere": the row
                 # meant to be scoped and cannot say where, so it is dropped rather
@@ -582,6 +749,7 @@ class LessonStore:
                 if raw_scope is not None and (
                     not isinstance(raw_scope, str) or not raw_scope.strip()
                 ):
+                    unreadable.append((lineno, line))
                     continue
                 lessons.append(
                     Lesson(
@@ -600,11 +768,25 @@ class LessonStore:
                             and data["applies"].strip().lower() in LESSON_APPLIES_VALUES
                             else None
                         ),
+                        written_by=_written_by_of(data.get("written_by")),
                     )
                 )
             except (json.JSONDecodeError, KeyError):
+                unreadable.append((lineno, line))
                 continue
-        self._cache = (mtime, lessons)
+        if unreadable:
+            # The next save rewrites the file from the rows that loaded, so it drops
+            # these, as the cron store drops a skipped job record. This warning is
+            # the window to recover them, which is why it names their lines.
+            logger.warning(
+                "Skipped %d of %d rows in %s that do not read as a lesson (lines %s); "
+                "the next save removes them from the file",
+                len(unreadable),
+                len(unreadable) + len(lessons),
+                self._path,
+                ", ".join(str(n) for n, _ in unreadable[:5]),
+            )
+        self._cache = (key, lessons)
         return lessons
 
     def _applicable(self, lessons: list[Lesson], project_dir: str | Path | None) -> list[Lesson]:
@@ -703,6 +885,7 @@ class LessonStore:
         directive_block, _ = render_lesson_tier(
             ranked_directives,
             directive_room,
+            omission_kind=context_omissions.LESSON_RULES,
             header=(
                 "[Learned corrections — user-taught rules from past mistakes.\n"
                 "ALWAYS follow these. They override default behavior.]"
@@ -738,6 +921,7 @@ class LessonStore:
             # the next turn can act on rather than an absence it cannot see.
             experience_block = render_withheld_tier(
                 len(experience_entries),
+                omission_kind=context_omissions.LESSON_FINDINGS,
                 header="[Learned experience — past findings]",
                 footer="[End of learned experience]",
                 notice=(
@@ -752,6 +936,7 @@ class LessonStore:
             experience_block, _ = render_lesson_tier(
                 experiences,
                 experience_room,
+                omission_kind=context_omissions.LESSON_FINDINGS,
                 header=(
                     # "relevant ones first", matching the vector tier's wording, because
                     # ``order_by_request_relevance`` runs above: claiming "newest first"

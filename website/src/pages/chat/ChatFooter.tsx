@@ -1,5 +1,6 @@
 import { memo, useState, useEffect, useMemo, useRef, type ComponentType } from 'react'
-import { Hourglass } from 'lucide-react'
+import { Check, Circle, Hourglass, LoaderCircle, Minus } from 'lucide-react'
+import type { EnvironmentStart } from '../../components/sessionEnvironmentHooks'
 import { motion } from 'framer-motion'
 
 import { i18nT } from '../../i18n/t'
@@ -9,6 +10,7 @@ import { resolveThemeLoaderIcons } from '../../themeLoaderIcons'
 import { useOptionalTheme } from '../../hooks/useTheme'
 import ErrorBoundary from '../../components/ErrorBoundary'
 import { useLanguageGeneration } from '../../i18n/useLanguageGeneration'
+import { PackLoaderImage } from './PackLoaderImage'
 type StopState = 'idle' | 'soft_pending' | 'killing'
 
 /** One carousel beat — the cadence the .csb4 cross-fade was built around. */
@@ -97,13 +99,24 @@ type LoaderAssets = {
   loaderImages?: readonly string[]
 }
 
+/** One component per loader-image URL. The footer resolves its loader on every
+ *  render, and a fresh component type each time would remount the image in its
+ *  carousel slot: an animated image restarts, and a held still frame goes blank
+ *  until it is painted again. */
+const loaderImageIcons = new Map<string, ComponentType>()
+
 /** A theme-supplied loader image (raster art the pack ships). Decorative: no alt
  *  text, aria-hidden, same sizing class as the mascot poses so it drops into the
- *  carousel unchanged. */
+ *  carousel unchanged, and held on its first frame under reduced motion. */
 function loaderImageIcon(url: string): ComponentType {
-  return function LoaderImage() {
-    return <img className="kp" src={url} alt="" aria-hidden="true" draggable={false} />
+  let Icon = loaderImageIcons.get(url)
+  if (!Icon) {
+    Icon = function LoaderImage() {
+      return <PackLoaderImage className="kp" src={url} />
+    }
+    loaderImageIcons.set(url, Icon)
   }
+  return Icon
 }
 
 /** The installed-pack slug behind an active theme id, or undefined for a built-in. */
@@ -255,13 +268,26 @@ export function useStreamIdle(tick: number, active: boolean, ms: number = STREAM
   return active && idle
 }
 
-const ChatFooter = memo(function ChatFooter({ running, stopping, state, lastRole, regenerating, stopState, streamTick = 0 }: { running: boolean; stopping: boolean; state: string; lastRole: string; regenerating?: boolean; stopState?: StopState; streamTick?: number }) {
+/** `streamIdleMs` is how long `streamTick` must hold still before a quiet
+ *  stream counts as quiet. A live-socket host keeps the default; a POLLING host
+ *  (ChatEmbed) passes a window wider than its poll interval, because its tick
+ *  only advances once per poll and a shorter window would flash the indicator
+ *  between every two reads of a reply that is still arriving. */
+const ChatFooter = memo(function ChatFooter({ running, stopping, state, lastRole, regenerating, stopState, streamTick = 0, sendUnconfirmed = false, streamIdleMs = STREAM_IDLE_MS, statusLabel }: {
+  running: boolean; stopping: boolean; state: string; lastRole: string; regenerating?: boolean; stopState?: StopState; streamTick?: number; sendUnconfirmed?: boolean; streamIdleMs?: number
+  /** Replaces "Thinking…" while the turn is not yet thinking — a remote session
+   *  environment still starting (`useEnvironmentStartLabel`). */
+  statusLabel?: EnvironmentStart | null
+}) {
   useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const slug = useThemeSlug()
   const themeState = useOptionalTheme()
   const packSlug = packSlugOf(slug)
   const installedTheme = packSlug ? themeState?.customThemeDataMap.get(packSlug) : undefined
   const loader = resolveLoader(slug, installedTheme?.assets)
+  // Set when a loader image fails to load; a new theme brings new art, so retry it.
+  const [artFailed, setArtFailed] = useState(false)
+  useEffect(() => { setArtFailed(false) }, [slug])
   // Text is only ACTIVELY streaming while the slot says so AND chunks keep
   // arriving. `lastRole` alone cannot tell the two apart: the trailing
   // 'streaming' message is deliberately left unfinalized across a whole tool
@@ -269,7 +295,7 @@ const ChatFooter = memo(function ChatFooter({ running, stopping, state, lastRole
   // also goes quiet for seconds while it generates a tool call. Both looked like
   // "still streaming", so the loader stayed hidden with nothing else moving.
   const streamingText = lastRole === 'streaming' && state === 'streaming'
-  const streamQuiet = useStreamIdle(streamTick, streamingText)
+  const streamQuiet = useStreamIdle(streamTick, streamingText, streamIdleMs)
   // Hidden once the turn is inactive. While the turn RUNS the indicator shows for
   // thinking, tool calls, AND the gaps between steps: the backend keeps
   // slot.running true for the whole turn, so the post-tool gap stays covered
@@ -279,6 +305,15 @@ const ChatFooter = memo(function ChatFooter({ running, stopping, state, lastRole
   // the real blinking caret (.streaming-caret) there, and a second indicator
   // alongside it reads as two cursors.
   if (!regenerating && streamingText && !streamQuiet && stopState !== 'soft_pending' && stopState !== 'killing') return null
+  // ...and not while the newest send is a bubble whose receipt never came
+  // (`selectTrailingSendUnconfirmed`): that row already says "Delivery
+  // pending…" and the WARN notice under it says the delivery is unconfirmed,
+  // so "Thinking…" beneath both would claim the agent is working on a message
+  // nothing proves it received. Exactly the PLAIN running branch below yields;
+  // a stop in flight, a kill, a compaction or a regenerate is a different
+  // statement about the slot and still shows. The receipt or echo that finally
+  // confirms the row clears the mark, and the indicator returns by itself.
+  if (sendUnconfirmed && !regenerating && !stopping && state !== 'compacting' && stopState !== 'soft_pending' && stopState !== 'killing') return null
   // width from CSS var --mc-content-width
   return (
     <div data-testid="chat-footer" className={`px-4 mx-auto w-full py-1${regenerating ? '' : ' animate-slide-up'}`} style={{ maxWidth: 'var(--mc-content-width, 900px)' }}>
@@ -299,33 +334,81 @@ const ChatFooter = memo(function ChatFooter({ running, stopping, state, lastRole
         ) : !regenerating && state === 'compacting' ? (
           <span className="text-muted text-[13px] font-mono animate-pulse"><Hourglass className="lucide-inline" /> {i18nT('pages.chat.chatFooter.compacting')}</span>
         ) : (
-          // Both branches render THEME-SUPPLIED components (a whole replacement
-          // loader, or the icons the carousel cycles). A throwing one must not
-          // escape: unguarded it reaches the route-level ErrorBoundary and swaps
-          // the entire chat UI for the error card. The loader is decorative, so
-          // failing it closed to nothing is strictly better than losing the chat.
-          // `fallback={null}` is honoured explicitly (ErrorBoundary tests
-          // `'fallback' in props`), so this renders nothing rather than a card.
-          <ErrorBoundary fallback={null}>
-            {loader.kind === 'custom'
-              // The theme replaced the whole loader — it owns its size and motion.
-              ? <loader.Component />
-              : loader.kind === 'image'
-                // The pack shipped a single image — rendered on its own, self-
-                // animating if it's an animated WebP/APNG/GIF or SVG. Sized to a
-                // carousel slot (14px) with object-contain so an intrinsically
-                // large image cannot expand the footer band; decorative, so
-                // aria-hidden + no alt.
-                ? <img
-                    className="kp"
-                    src={loader.src}
-                    alt=""
-                    aria-hidden="true"
-                    draggable={false}
-                    style={{ width: 14, height: 14, objectFit: 'contain' }}
-                  />
-                : <SwapCarousel icons={loader.icons} />}
-          </ErrorBoundary>
+          // The ghost poses animate; the "Thinking…" label sits beside them so a
+          // first-time (sighted) user reads what the row means instead of guessing
+          // at bare glyphs (#19377). `role=status` + aria-label keep a stable
+          // accessible name for assistive tech (the pose art is aria-hidden), so
+          // the label is now visible to everyone, not screen-reader-only (#13779).
+          <div
+            className="inline-flex items-center gap-2"
+            role="status"
+            // The stage name only, not the ticking elapsed time, so assistive
+            // tech is not re-announced every second.
+            aria-label={statusLabel ? statusLabel.stage : i18nT('pages.chat.chatFooter.thinking')}
+          >
+            {/* A throwing theme loader must not reach the route-level boundary and
+                blank the chat; it renders nothing (the label alone then carries
+                the indicator). */}
+            {!artFailed && <span className="contents" onErrorCapture={() => setArtFailed(true)}>
+            <ErrorBoundary fallback={null}>
+              {loader.kind === 'custom'
+                // The theme replaced the whole loader — it owns its size and motion.
+                ? <loader.Component />
+                : loader.kind === 'image'
+                  // The pack shipped a single image — rendered on its own, self-
+                  // animating if it's an animated WebP/APNG/GIF or SVG, and held on
+                  // its first frame under reduced motion. Sized to a carousel slot
+                  // (14px) with object-contain so an intrinsically large image
+                  // cannot expand the footer band; decorative, so aria-hidden + no alt.
+                  ? <PackLoaderImage
+                      className="kp"
+                      src={loader.src}
+                      style={{ width: 14, height: 14, objectFit: 'contain' }}
+                    />
+                  : <SwapCarousel icons={loader.icons} />}
+            </ErrorBoundary>
+            </span>}
+            {/* A starting remote environment names its stage, with the elapsed
+                time, in place of "Thinking…". Either label is aria-hidden: the
+                status row's aria-label carries the accessible name. */}
+            {statusLabel
+              ? <span aria-hidden="true" className="text-muted text-[13px] font-mono tabular-nums">{statusLabel.label}</span>
+              : <span aria-hidden="true" className="text-muted text-[13px] font-mono">{i18nT('pages.chat.chatFooter.thinking')}</span>}
+          </div>
+        )}
+        {statusLabel && !stopping && stopState !== 'soft_pending' && stopState !== 'killing' && (
+          // The whole start, not just its current stage: which steps are done,
+          // which one is running and for how long, and what is still ahead.
+          <ol className="m-0 mt-2 p-0 list-none grid gap-1" data-testid="environment-start-steps">
+            {statusLabel.steps.map((step) => (
+              <li
+                key={step.key}
+                className={`flex items-center gap-2 text-[12.5px] ${step.state === 'current' ? 'text-text' : 'text-muted'} ${step.state === 'pending' || step.state === 'skipped' ? 'opacity-60' : ''}`}
+                aria-current={step.state === 'current' ? 'step' : undefined}
+              >
+                {step.state === 'done' ? (
+                  <Check className="lucide-inline shrink-0 text-ok" aria-hidden />
+                ) : step.state === 'current' ? (
+                  <LoaderCircle className="lucide-inline shrink-0 text-accent motion-safe:animate-spin" aria-hidden />
+                ) : step.state === 'skipped' ? (
+                  <Minus className="lucide-inline shrink-0" aria-hidden />
+                ) : (
+                  <Circle className="lucide-inline shrink-0" aria-hidden />
+                )}
+                <span>{step.label}</span>
+                {step.state === 'current' && <span className="tabular-nums text-muted">{statusLabel.elapsed}</span>}
+                <span className="sr-only">
+                  {step.state === 'done'
+                    ? i18nT('sessionEnvironments.picker.stepDone')
+                    : step.state === 'skipped'
+                      ? i18nT('sessionEnvironments.picker.stepSkipped')
+                      : step.state === 'pending'
+                        ? i18nT('sessionEnvironments.picker.stepPending')
+                        : ''}
+                </span>
+              </li>
+            ))}
+          </ol>
         )}
       </div>
     </div>

@@ -17,6 +17,7 @@ import dataclasses
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
+from dashboard_owner_helpers import as_owner
 
 from kiro_crew import security
 from kiro_crew.config.loader import KiroCrewConfig
@@ -119,7 +120,7 @@ def test_a_pattern_the_matcher_would_disable_is_not_published(monkeypatch) -> No
     # identically, so this fixture proves the same property — while keeping a live
     # ReDoS regex out of the source, where CodeQL's py/redos rightly flags one
     # (the catastrophic shapes stay pinned by `_CATASTROPHIC` in
-    # test_denied_commands_security.py, which is where the ReDoS budget lives).
+    # test_denied_commands_security_cost.py, which is where the ReDoS budget lives).
     unrunnable = "a|b"
     assert not security.is_safe_user_regex(unrunnable), "fixture is no longer unsafe"
 
@@ -268,7 +269,10 @@ def _make_app() -> web.Application:
     app.router.add_patch(
         "/api/security/denied-commands/builtins/{id}", api_denied_command_builtin_toggle
     )
-    return app
+    # The toggle is owner-gated
+    # (``handlers._shared.require_owner_dashboard_request``); ``as_owner`` supplies
+    # the claims the token-auth middleware normally publishes.
+    return as_owner(app)
 
 
 @pytest.mark.asyncio

@@ -32,28 +32,31 @@ marker fails closed.
 
 Platform coverage follows the ``stall_enrichment`` precedent -- Linux reads
 ``/proc`` directly and spawns no subprocess. macOS uses the ``ps`` snapshot in
-:mod:`kiro_crew.platform_compat`, which yields parent edges only, so every field
-that snapshot cannot carry is reported as ``None`` rather than guessed. Windows
-has neither source: the scan returns an empty roster whose ``degraded`` list
-says so.
+:mod:`kiro_crew.platform_compat` for parent edges and that module's libproc
+``phys_footprint`` reader for each node's ``rss_kb``; every other field is
+reported as ``None`` rather than guessed. Windows has neither source: the scan
+returns an empty roster whose ``degraded`` list says so.
 
 Environment exposure is a four-key allowlist (:data:`ENV_ALLOWLIST`) and nothing
 else, and it is omitted altogether unless a caller asks for it. Command lines go
 through the canonical credential redactor before they leave this module.
 
 The module is deliberately PURE: it imports no recorder and holds no background
-state. :func:`roster_diff` is the history hook the recorder drives; the caller
-owns the ring, the cadence and the storage.
+state. :func:`roster_diff` is the history hook the recorder drives and
+:class:`RateBaseline` is the rate equivalent; the caller owns the ring, the
+cadence and the storage.
 """
 
 from __future__ import annotations
 
 import os
 import sys
+import threading
 import time
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any, NamedTuple
 
 from kiro_crew import session_pid
 from kiro_crew.platform import context as platform_context
@@ -328,9 +331,10 @@ def _stat_fields(proc_root: Path, pid: int) -> list[str] | None:
     """``/proc/<pid>/stat`` fields from ``state`` onward, or ``None``.
 
     ``comm`` (field 2) is parenthesised and may itself contain spaces and
-    ``)``, so the split is on the LAST ``)`` -- the same parse
-    :mod:`kiro_crew.session_scope_reap` uses. Index 0 is then ``state``
-    (field 3), so field *N* is index *N - 3*.
+    ``)``, so the split is on the LAST ``)`` -- the split
+    :func:`kiro_crew.platform_compat.read_proc_stat` makes. Index 0 is then
+    ``state`` (field 3), so field *N* is index *N - 3*. The text read replaces
+    bytes that are not UTF-8, so a ``comm`` set to arbitrary bytes cannot raise.
     """
     raw = _read_text(proc_root / str(pid) / "stat")
     if raw is None:
@@ -721,6 +725,7 @@ def scan(
     tracked_owners_fn: Callable[[], dict[int, int]] | None = None,
     unreachable_orphan_fn: Callable[[int, bytes, set[int]], bool] | None = None,
     ps_snapshot_fn: Callable[[], dict[int, int] | None] | None = None,
+    footprint_fn: Callable[[int], int | None] | None = None,
     clk_tck: int | None = None,
 ) -> Roster:
     """One whole-family snapshot.
@@ -748,7 +753,12 @@ def scan(
         roster.degraded.append("windows: no /proc and no ps snapshot; all fields null")
         return roster
     if platform == "darwin":
-        return _scan_darwin(roster, owner_map=owner_map, ps_snapshot_fn=ps_snapshot_fn)
+        return _scan_darwin(
+            roster,
+            owner_map=owner_map,
+            ps_snapshot_fn=ps_snapshot_fn,
+            footprint_fn=footprint_fn,
+        )
     return _scan_linux(
         roster,
         prev=prev,
@@ -761,6 +771,170 @@ def scan(
         unreachable_orphan_fn=unreachable_orphan_fn,
         clk_tck=clk_tck,
     )
+
+
+# -- rate cadence ------------------------------------------------------------
+# Rates are deltas, so something has to hold the previous scan's counters.
+#
+# The diagnostic recorder owns the other periodic host sampling and its timer
+# would give the delta a fixed cadence, but it cannot afford this one: a scan of
+# 584 nodes measures ~1.6 s on the host this is built against, against that
+# recorder's 20 ms sample budget, and three samples over 200 ms pin its cadence
+# at 60 s for the rest of the run. A family scan registered there would report
+# its own cost as the host's and back the recorder off permanently -- trading
+# this gap for a worse one. A standing sampler of its own would instead spend a
+# large fraction of a core forever for a view that may never be opened.
+#
+# So the read path holds the state. That makes the cadence whatever the reader's
+# own calls happen to be, which is only meaningful inside bounds, and the two
+# below are those bounds.
+
+#: Widest gap between two reads that still yields a rate. A wider one stays
+#: arithmetically true and becomes practically misleading: it averages the whole
+#: gap, so a process pinned for the last ten seconds of an hour reads near zero
+#: -- the same "this host is idle" answer that a null already gives wrongly.
+MAX_RATE_GAP_SECS = 300.0
+
+#: Narrowest gap between two reads that still yields a rate. CPU is counted in
+#: clock ticks, 100 a second on a typical host, and one tick is
+#: ``100 / clk_tck / dt`` percent of a core: about 1% across a 1s gap, about 10%
+#: across 0.1s. The floor is what keeps that granularity down around a percent,
+#: so a figure reports load rather than where the tick boundary fell.
+MIN_RATE_GAP_SECS = 1.0
+
+
+def _rates_possible(platform: str) -> bool:
+    """Whether *platform*'s scan can produce rates at all.
+
+    Windows reads no counters and the macOS ``ps`` snapshot carries none, so on
+    both the rates are null for a reason no second read changes. Inviting a
+    reader to read again there would promise what the platform cannot deliver.
+    """
+    return not platform.startswith("win") and platform != "darwin"
+
+
+class _RateDecision(NamedTuple):
+    """What one read may difference against, and what it may leave behind.
+
+    ``hold`` is the part that is not obvious. A read refused for arriving too
+    soon must NOT replace the stored baseline: doing so restarts the window it
+    was too early for, so readers arriving faster than the floor would keep
+    resetting each other and never see a rate at all -- the very starvation the
+    rates exist to end. Every other outcome replaces the baseline, including the
+    too-old one, which must be replaced or nothing could recover from it.
+    """
+
+    prev: Roster | None
+    declined: str | None
+    hold: bool
+
+
+class RateBaseline:
+    """The cumulative counters from the previous scan, and the window they hold.
+
+    Caller-owned: an instance belongs to whoever reads rates, and this module
+    keeps none of its own, so a test drives its own gaps and its own cold start
+    with nothing process-wide involved.
+
+    Only the counters are retained, never the nodes: a roster's nodes carry argv
+    and environment strings for every process on the host, and a delta needs
+    none of them. The three retained dicts are keyed by pid and replaced whole
+    on each read, so the store is bounded by the same :data:`MAX_NODES` cap that
+    bounds a roster.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._prev: Roster | None = None
+
+    def take(self, now: float) -> _RateDecision:
+        """What *now*'s read may difference against, and the reason when nothing.
+
+        The gap is measured between the two scans' STARTS, since that is the
+        instant a roster stamps, so the advice returned on a cold start names
+        that instant rather than the moment a reader receives the answer -- a
+        whole-host scan takes seconds, and a reader waiting the full window from
+        when the response arrived would land outside it.
+
+        The reason is returned rather than logged because it is the answer to
+        the reader's question. A bare null says "no rate" and reads exactly like
+        "no load"; a null plus "first read" says which one it is.
+        """
+        with self._lock:
+            prev = self._prev
+        if prev is None:
+            return _RateDecision(
+                None,
+                (
+                    "cpu_pct and runq_wait_pct need two reads; this is the first, "
+                    f"so a second read between {MIN_RATE_GAP_SECS:.0f}s and "
+                    f"{MAX_RATE_GAP_SECS:.0f}s after this one STARTED carries rates"
+                ),
+                False,
+            )
+        gap = now - prev.monotonic
+        if gap < MIN_RATE_GAP_SECS:
+            return _RateDecision(
+                None,
+                (
+                    f"reads {gap:.1f}s apart: rates need at least "
+                    f"{MIN_RATE_GAP_SECS:.0f}s, below which clock-tick "
+                    "granularity dominates the figure"
+                ),
+                True,
+            )
+        if gap > MAX_RATE_GAP_SECS:
+            return _RateDecision(
+                None,
+                (
+                    f"previous read {gap:.0f}s old: past {MAX_RATE_GAP_SECS:.0f}s a "
+                    "rate averages the whole gap and hides a current spike"
+                ),
+                False,
+            )
+        return _RateDecision(prev, None, False)
+
+    def remember(self, roster: Roster) -> None:
+        """Keep *roster*'s counters as the baseline for the next read."""
+        with self._lock:
+            if self._prev is not None and roster.monotonic <= self._prev.monotonic:
+                # Concurrent reads finish out of order. Keeping the newer
+                # baseline stops a later read from differencing against a
+                # roster younger than itself, whose negative elapsed time
+                # declines every rate anyway.
+                return
+            self._prev = Roster(
+                ts=roster.ts,
+                monotonic=roster.monotonic,
+                platform=roster.platform,
+                cpu_ticks=dict(roster.cpu_ticks),
+                runq_ns=dict(roster.runq_ns),
+                starts=dict(roster.starts),
+            )
+
+
+def scan_with_rates(baseline: RateBaseline, **kwargs: Any) -> Roster:
+    """:func:`scan`, differenced against *baseline* so rates are real.
+
+    :func:`scan` is pure and retains nothing, so ``cpu_pct`` and
+    ``runq_wait_pct`` are ``None`` unless a caller supplies the previous roster.
+    *baseline* is where that roster lives, and it is the CALLER's: this module
+    keeps no copy of it, so the read path that wants rates is the thing that
+    holds the state, and its own call cadence is what the delta measures.
+
+    Rates arrive from the second read onward; a read that cannot produce them
+    appends the reason to ``degraded``.
+
+    ``gil_saturated_hint`` rides along, since it is gated on ``cpu_pct`` and is
+    therefore false whenever the rate is missing, however loaded the host is.
+    """
+    decision = baseline.take(time.monotonic())
+    roster = scan(decision.prev, **kwargs)
+    if not decision.hold:
+        baseline.remember(roster)
+    if decision.declined is not None and _rates_possible(roster.platform):
+        roster.degraded.append(decision.declined)
+    return roster
 
 
 def _resolve_owner(
@@ -819,12 +993,11 @@ def _scan_linux(
         return roster
 
     edges = _parent_edges(proc_root, pids)
-    # Read argv WHOLE, deliberately. An earlier revision cut it here to bound
-    # this transient whole-table map, and that cut is the same silent credential
-    # leak the retained fields had: a secret straddling it loses the pattern the
-    # redactor matches on. Two reviews weighed the pair and the memory concern
-    # was adjudicated disproportionate while the credential one was upheld, so
-    # the transient buffer stays unbounded and every cut happens AFTER redaction.
+    # Read argv WHOLE, deliberately. Cutting it here to bound this transient
+    # whole-table map is a silent credential leak: a secret straddling the cut
+    # loses the pattern the redactor matches on. The credential risk outweighs
+    # the memory one, so the transient buffer stays unbounded and every cut
+    # happens AFTER redaction.
     # What the roster RETAINS is still capped, by MAX_NODES and the field bounds.
     cmdlines = {pid: session_pid._pid_cmdline(pid, proc_root) for pid in edges}
     markers = {pid: session_pid._read_env_has_kirocrew_marker(pid, proc_root) for pid in edges}
@@ -1004,9 +1177,8 @@ def _build_linux_node(
     former = _as_str(past.get("former_owner"))
     if former is not None:
         # Bounded even though it arrives from a caller rather than from the
-        # process table. The Opus lane weighed this and dropped it, reasoning a
-        # recorder would only ever store an already-bounded owner label -- but
-        # that recorder does not exist yet, and one `_bounded` call is cheaper
+        # process table. A recorder may only ever store an already-bounded owner
+        # label, but that recorder does not exist yet, and one `_bounded` call is cheaper
         # than depending on a module nobody has written behaving well.
         former = _bounded(former, MAX_OWNER_CHARS, roster, "former owner label")
     futex = threads.futex_wait or 0
@@ -1124,8 +1296,9 @@ def _darwin_parent_edges() -> dict[int, int] | None:
     sanctioned layer and answers the same question.
 
     The trade is RSS: the ACP helper read ``rss=`` and this one reads
-    ``lstart=``, so macOS nodes report ``rss_kb`` as ``None``. Reported as a
-    missing field rather than papered over -- see the ``degraded`` note.
+    ``lstart=``, so this snapshot carries no memory column at all. ``rss_kb``
+    comes from :func:`_darwin_footprint_bytes` instead, an in-process libproc
+    read that spawns nothing, so no second ``ps`` is needed to fill it.
     """
     from kiro_crew import platform_compat
 
@@ -1139,11 +1312,43 @@ def _darwin_parent_edges() -> dict[int, int] | None:
     return {pid: row.ppid for pid, row in snapshot.items()}
 
 
+def _darwin_footprint_bytes(pid: int) -> int | None:
+    """*pid*'s macOS ``phys_footprint`` in bytes, or ``None`` when unreadable.
+
+    The platform layer's own reader, the one the runtime ceilings and the
+    Sessions panel already judge memory by. Imported and looked up when called,
+    as :func:`_darwin_parent_edges` does, so a patch of that reader is the
+    reader this reaches.
+    """
+    from kiro_crew import platform_compat
+
+    return platform_compat.proc_phys_footprint_bytes_for_pid(pid)
+
+
+def _darwin_rss_kb(pid: int, reader: Callable[[int], int | None], roster: Roster) -> int | None:
+    """*pid*'s footprint in KiB, or ``None`` with the failure counted.
+
+    The failure scope is this one node. A pid that exited after the snapshot,
+    or one libproc refuses, keeps its place in the roster with ``rss_kb`` null;
+    it never fails the scan or costs any other node its figure.
+    """
+    try:
+        footprint = reader(pid)
+    except Exception:  # noqa: BLE001 -- one node's figure, never the roster
+        roster.note_repeated("darwin footprint reader raised; rss_kb null")
+        return None
+    if footprint is None:
+        roster.note_repeated("darwin footprint unreadable; rss_kb null")
+        return None
+    return footprint // 1024
+
+
 def _scan_darwin(
     roster: Roster,
     *,
     owner_map: Mapping[int, str] | None,
     ps_snapshot_fn: Callable[[], dict[int, int] | None] | None,
+    footprint_fn: Callable[[int], int | None] | None = None,
 ) -> Roster:
     """macOS family, from a ``ps`` snapshot of parent edges.
 
@@ -1151,6 +1356,10 @@ def _scan_darwin(
     so family membership here is descent from the gateway alone -- there is no
     argv to match and no same-uid ``environ`` to read. Every field it cannot
     carry stays ``None``, and ``degraded`` says which ones and why.
+
+    ``rss_kb`` is the exception: each node's libproc ``phys_footprint`` in KiB,
+    read through *footprint_fn* (the platform reader when ``None``) after the
+    node cap, so the reads are bounded by the roster and not by the host.
     """
     parents = (ps_snapshot_fn or _darwin_parent_edges)()
     if parents is None:
@@ -1158,7 +1367,13 @@ def _scan_darwin(
         return roster
     roster.degraded.append(
         "darwin: ps snapshot carries pid/ppid only; state, threads, env, fds, "
-        "cwd, cmdline, rss and cpu are null"
+        "cwd, cmdline and cpu are null"
+    )
+    # Same key, different measure: the footprint counts pages ps RSS leaves out,
+    # so say which one this is before anyone compares it with a Linux node.
+    roster.degraded.append(
+        "darwin: rss_kb is the libproc phys_footprint, not a resident set; it "
+        "counts compressed and swapped pages, so it reads higher than ps RSS"
     )
     # Without the marker there is no ownership evidence, so no node here can earn
     # the orphan verdict -- and a reparented process is not a gateway descendant,
@@ -1180,6 +1395,7 @@ def _scan_darwin(
             f"node cap {MAX_NODES} reached: {len(family) - MAX_NODES} member(s) omitted"
         )
         family = family[:MAX_NODES]
+    read_footprint = footprint_fn or _darwin_footprint_bytes
     for pid in family:
         label = (owner_map or {}).get(pid)
         roster.nodes[pid] = ProcNode(
@@ -1187,6 +1403,7 @@ def _scan_darwin(
             ppid=parents.get(pid),
             kind="gateway" if pid == root else "other",
             owner=None if label is None else _bounded(label, MAX_OWNER_CHARS, roster, "owner"),
+            rss_kb=_darwin_rss_kb(pid, read_footprint, roster),
             family_reason="descendant",
         )
     return roster

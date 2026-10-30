@@ -6,6 +6,8 @@ matches, so a listing that omits either number leaves the user unable to weigh
 the decision the control asks them to make.
 """
 
+import json
+import time
 from pathlib import Path
 
 import pytest
@@ -56,6 +58,33 @@ class TestInjectOnTriggerField:
 
         assert [s["key"] for s in loader.list_skills() if s["inject_on_trigger"]] == bodies
         assert [s["key"] for s in loader.list_skills() if not s["inject_on_trigger"]] == pointers
+
+
+class TestCreatedAtField:
+    """The Skills list's Newest first sort reads only a RECORDED creation time."""
+
+    def test_frontmatter_created_at_is_a_unix_time(self, tmp_path: Path) -> None:
+        md = _write(tmp_path / "skills", "fresh")
+        md.write_text(
+            md.read_text().replace("---\nbody", "created_at: 2026-10-01T12:00:00+00:00\n---\nbody")
+        )
+        loader = SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False)
+        assert _one(loader, "fresh")["created_at"] == 1790856000.0
+
+    def test_a_naive_time_reads_as_utc(self, tmp_path: Path) -> None:
+        md = _write(tmp_path / "skills", "naive")
+        md.write_text(
+            md.read_text().replace("---\nbody", "created_at: 2026-10-01T12:00:00\n---\nbody")
+        )
+        loader = SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False)
+        assert _one(loader, "naive")["created_at"] == 1790856000.0
+
+    @pytest.mark.parametrize("extra", ["", "created_at: not-a-date\n"], ids=["absent", "malformed"])
+    def test_no_usable_time_is_none_not_the_file_mtime(self, tmp_path: Path, extra: str) -> None:
+        md = _write(tmp_path / "skills", "undated")
+        md.write_text(md.read_text().replace("---\nbody", f"{extra}---\nbody"))
+        loader = SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False)
+        assert _one(loader, "undated")["created_at"] is None
 
 
 class TestSetInjectOnTrigger:
@@ -274,6 +303,42 @@ class TestSizeAndDeliveries:
 
         assert _one(loader, "hot")["deliveries"] == 3
 
+    def test_last_used_at_is_the_latest_delivery_time(self, tmp_path: Path, opened) -> None:
+        """The Skills list shows how recently a skill was used and sorts by it."""
+        _write(tmp_path / "skills", "hot")
+        _write(tmp_path / "skills", "cold")
+        last_seen = time.time() - 3600
+        (tmp_path / "skill-usage.json").write_text(
+            json.dumps({"version": 1, "keys": {"hot": {"hits": 2, "last_seen": last_seen}}})
+        )
+        loader = opened(SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False))
+
+        assert _one(loader, "hot")["deliveries"] == 2
+        assert _one(loader, "hot")["last_used_at"] == last_seen
+        assert _one(loader, "cold")["last_used_at"] is None
+
+    @pytest.mark.parametrize(
+        "last_seen",
+        [
+            pytest.param(float("nan"), id="NaN"),
+            pytest.param(float("inf"), id="Infinity"),
+        ],
+    )
+    def test_a_non_finite_ledger_time_never_reaches_the_row(
+        self, tmp_path: Path, opened, last_seen: float
+    ) -> None:
+        # The ledger drops the entry when it loads, so the row reads as untracked.
+        _write(tmp_path / "skills", "hot")
+        (tmp_path / "skill-usage.json").write_text(
+            json.dumps({"version": 1, "keys": {"hot": {"hits": 2, "last_seen": last_seen}}})
+        )
+        loader = opened(SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False))
+
+        row = _one(loader, "hot")
+        assert row["deliveries"] is None
+        assert row["last_used_at"] is None
+        json.dumps(row, allow_nan=False)
+
     def test_an_opted_out_skill_stops_accruing(self, tmp_path: Path) -> None:
         """The figure freezes on opt-out, which the UI has to say out loud.
 
@@ -357,15 +422,19 @@ class TestListingStaysCheapOnTheEventLoop:
         path = _write(tmp_path / "skills", "one")
         loader = SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False)
         mtime = path.stat().st_mtime
+        config_path = tmp_path / "config.json"
+        config_path.write_text("{}")
 
         calls: list[str] = []
         real_stat = Path.stat
 
         def counting_stat(self: Path, *a: object, **kw: object) -> object:
-            calls.append(str(self))
+            if self == path:
+                calls.append(str(self))
             return real_stat(self, *a, **kw)  # type: ignore[arg-type]
 
         monkeypatch.setattr(Path, "stat", counting_stat)
+        config_path.stat()  # An unrelated config lookup must not invalidate this assertion.
         meta = loader._cached_frontmatter(path, mtime=mtime, within=None)
 
         assert meta["name"] == "one"

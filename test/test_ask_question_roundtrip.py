@@ -30,6 +30,7 @@ def _state() -> DashboardState:
     st = DashboardState.__new__(DashboardState)
     st._pending_questions = {}
     st._question_futures = {}
+    st._agent_asks = {}
     # A question records itself on its slot so the session reports needs_input,
     # so the stub owns a real slot map and a stubbed push — without them the
     # marker path would AttributeError instead of being exercised.
@@ -102,12 +103,19 @@ async def test_broadcasts_question_card_then_resolved() -> None:
         st.request_question("a2", "chat-7", _questions(), timeout=5),
     )
     kinds = [k for k, _ in st.broadcasts]  # type: ignore[attr-defined]
-    assert kinds == ["question_card", "question_card_resolved"]
+    # The shared decision frames (pending, then resolved) ride the same owner
+    # channel as the card, between the card and its retirement.
+    assert kinds == [
+        "question_card",
+        "shared_crew.decision",
+        "shared_crew.decision",
+        "question_card_resolved",
+    ]
     card = st.broadcasts[0][1]  # type: ignore[attr-defined]
     assert card["ask_id"] == "a2"
     assert card["slot"] == "chat-7"
-    # The resolved event carries the id so a stale one cannot clear a newer card.
-    assert st.broadcasts[1][1] == {"ask_id": "a2"}  # type: ignore[attr-defined]
+    # The resolved event carries identity and outcome for every other window.
+    assert st.broadcasts[-1][1] == {"ask_id": "a2", "reason": "answered"}  # type: ignore[attr-defined]
 
 
 @pytest.mark.asyncio
@@ -117,7 +125,10 @@ async def test_timeout_returns_none_and_clears_card() -> None:
     assert result is None
     assert st._pending_questions == {}
     # The card must be retracted, otherwise it stays clickable and 404s.
-    assert ("question_card_resolved", {"ask_id": "a3"}) in st.broadcasts  # type: ignore[attr-defined]
+    assert (
+        "question_card_resolved",
+        {"ask_id": "a3", "reason": "expired"},
+    ) in st.broadcasts  # type: ignore[attr-defined]
 
 
 @pytest.mark.asyncio
@@ -165,15 +176,16 @@ async def test_question_text_is_redacted_before_broadcast() -> None:
     leaky = _questions("Post to LEAKY_URL_SENTINEL please")
     leaky[0]["options"][0]["label"] = "LEAKY_CRED_SENTINEL"
 
-    with patch(
-        "kiro_crew.dashboard.state.redact_exfiltration_urls",
-        side_effect=lambda s: (
-            ("<url-redacted>", 1) if "LEAKY_URL_SENTINEL" in s else (s, 0)
+    with (
+        patch(
+            "kiro_crew.dashboard.state.redact_exfiltration_urls",
+            side_effect=lambda s: (("<url-redacted>", 1) if "LEAKY_URL_SENTINEL" in s else (s, 0)),
         ),
-    ), patch(
-        "kiro_crew.dashboard.state.redact_credentials",
-        side_effect=lambda s: (
-            ("<cred-redacted>", 1) if "LEAKY_CRED_SENTINEL" in s else (s, 0)
+        patch(
+            "kiro_crew.dashboard.state.redact_credentials",
+            side_effect=lambda s: (
+                ("<cred-redacted>", 1) if "LEAKY_CRED_SENTINEL" in s else (s, 0)
+            ),
         ),
     ):
         await st.request_question("a6", "chat-1", leaky, timeout=1)
@@ -193,12 +205,8 @@ def test_resolve_unknown_question_returns_false() -> None:
 @pytest.mark.asyncio
 async def test_cancel_questions_for_slot_only_targets_that_slot() -> None:
     st = _state()
-    task_a = asyncio.ensure_future(
-        st.request_question("mine", "chat-1", _questions(), timeout=30)
-    )
-    task_b = asyncio.ensure_future(
-        st.request_question("other", "chat-2", _questions(), timeout=30)
-    )
+    task_a = asyncio.ensure_future(st.request_question("mine", "chat-1", _questions(), timeout=30))
+    task_b = asyncio.ensure_future(st.request_question("other", "chat-2", _questions(), timeout=30))
     for _ in range(50):
         if len(st._question_futures) == 2:
             break
@@ -278,9 +286,7 @@ async def test_answer_handler_resolves_pending_question() -> None:
     from kiro_crew.dashboard.handlers.ask_question import api_ask_question_answer
 
     st = _state()
-    task = asyncio.ensure_future(
-        st.request_question("h1", "chat-1", _questions(), timeout=30)
-    )
+    task = asyncio.ensure_future(st.request_question("h1", "chat-1", _questions(), timeout=30))
     for _ in range(50):
         if "h1" in st._question_futures:
             break
@@ -323,9 +329,7 @@ async def test_answer_handler_coerces_nested_values_to_str() -> None:
     from kiro_crew.dashboard.handlers.ask_question import api_ask_question_answer
 
     st = _state()
-    task = asyncio.ensure_future(
-        st.request_question("h2", "chat-1", _questions(), timeout=30)
-    )
+    task = asyncio.ensure_future(st.request_question("h2", "chat-1", _questions(), timeout=30))
     for _ in range(50):
         if "h2" in st._question_futures:
             break
@@ -360,9 +364,7 @@ async def test_oversized_answer_is_rejected_not_truncated() -> None:
     from kiro_crew.validation import _ASK_MAX_ANSWER_LEN
 
     st = _state()
-    task = asyncio.ensure_future(
-        st.request_question("cap1", "chat-1", _questions(), timeout=30)
-    )
+    task = asyncio.ensure_future(st.request_question("cap1", "chat-1", _questions(), timeout=30))
     for _ in range(50):
         if "cap1" in st._question_futures:
             break
@@ -395,9 +397,7 @@ async def test_answer_at_the_limit_is_accepted() -> None:
     from kiro_crew.validation import _ASK_MAX_ANSWER_LEN
 
     st = _state()
-    task = asyncio.ensure_future(
-        st.request_question("cap2", "chat-1", _questions(), timeout=30)
-    )
+    task = asyncio.ensure_future(st.request_question("cap2", "chat-1", _questions(), timeout=30))
     for _ in range(50):
         if "cap2" in st._question_futures:
             break
@@ -442,9 +442,7 @@ async def test_dismissed_body_unblocks_with_no_answer() -> None:
     from kiro_crew.dashboard.handlers.ask_question import api_ask_question_answer
 
     st = _state()
-    task = asyncio.ensure_future(
-        st.request_question("h3", "chat-1", _questions(), timeout=30)
-    )
+    task = asyncio.ensure_future(st.request_question("h3", "chat-1", _questions(), timeout=30))
     for _ in range(50):
         if "h3" in st._question_futures:
             break
@@ -521,9 +519,7 @@ async def test_app_token_cannot_answer_a_question() -> None:
     from kiro_crew.dashboard.handlers.ask_question import api_ask_question_answer
 
     st = _state()
-    task = asyncio.ensure_future(
-        st.request_question("authz1", "chat-1", _questions(), timeout=30)
-    )
+    task = asyncio.ensure_future(st.request_question("authz1", "chat-1", _questions(), timeout=30))
     for _ in range(50):
         if "authz1" in st._question_futures:
             break
@@ -629,13 +625,21 @@ def test_unblock_pending_waits_releases_both_waits() -> None:
     slot = MagicMock()
     slot.key = "chat-1"
 
-    with patch(
-        "kiro_crew.dashboard.chat_handlers._reject_pending_approvals"
-    ) as rejected:
+    with patch("kiro_crew.dashboard.chat_handlers._reject_pending_approvals") as rejected:
         _unblock_pending_waits(state, slot)
 
     rejected.assert_called_once_with(slot)
     state.cancel_questions_for_slot.assert_called_once_with("chat-1")
+
+
+def _chat_handler_source() -> str:
+    """chat_handlers.py and the chat_api owners it composes, as one text."""
+    dashboard = Path(__file__).resolve().parents[1] / "src/kiro_crew/dashboard"
+    owners = sorted((dashboard / "chat_api").glob("[!_]*.py"))
+    assert owners, "no chat_api owner found beside chat_handlers.py"
+    return "\n".join(
+        path.read_text(encoding="utf-8") for path in [dashboard / "chat_handlers.py", *owners]
+    )
 
 
 def test_every_stop_path_uses_the_combined_chokepoint() -> None:
@@ -645,12 +649,7 @@ def test_every_stop_path_uses_the_combined_chokepoint() -> None:
     tests through the stop handlers — would still not catch a FOURTH path added
     later, which is precisely how this defect arose.
     """
-    from pathlib import Path
-
-    src = (
-        Path(__file__).resolve().parents[1]
-        / "src/kiro_crew/dashboard/chat_handlers.py"
-    ).read_text(encoding="utf-8")
+    src = _chat_handler_source()
 
     # The only permitted _reject_pending_approvals reference outside its own
     # definition is the one inside _unblock_pending_waits.
@@ -659,11 +658,7 @@ def test_every_stop_path_uses_the_combined_chokepoint() -> None:
     before, after = body
     # Its definition and docstring reference are fine; count real call sites in
     # the rest of the module (after the helper).
-    stray = [
-        ln
-        for ln in after.splitlines()
-        if "_reject_pending_approvals(slot)" in ln
-    ]
+    stray = [ln for ln in after.splitlines() if "_reject_pending_approvals(slot)" in ln]
     assert len(stray) == 1, (
         "every stop/interrupt/delete path must call _unblock_pending_waits, not "
         f"_reject_pending_approvals directly; stray call sites: {stray}"
@@ -714,9 +709,7 @@ async def test_non_owner_dashboard_token_cannot_answer() -> None:
 
     st = _state()
     st.owner_id = "U_OWNER"
-    task = asyncio.ensure_future(
-        st.request_question("ask-1", "chat-1", _questions(), timeout=30)
-    )
+    task = asyncio.ensure_future(st.request_question("ask-1", "chat-1", _questions(), timeout=30))
     for _ in range(50):
         if st._question_futures:
             break
@@ -747,9 +740,7 @@ async def test_configured_owner_is_allowed() -> None:
 
     st = _state()
     st.owner_id = "U_OWNER"
-    task = asyncio.ensure_future(
-        st.request_question("ask-2", "chat-1", _questions(), timeout=30)
-    )
+    task = asyncio.ensure_future(st.request_question("ask-2", "chat-1", _questions(), timeout=30))
     for _ in range(50):
         if st._question_futures:
             break
@@ -782,9 +773,7 @@ async def test_pending_endpoint_lists_unanswered_cards() -> None:
     from kiro_crew.dashboard.handlers.ask_question import api_ask_question_pending
 
     st = _state()
-    task = asyncio.ensure_future(
-        st.request_question("ask-3", "chat-7", _questions(), timeout=30)
-    )
+    task = asyncio.ensure_future(st.request_question("ask-3", "chat-7", _questions(), timeout=30))
     for _ in range(50):
         if st._question_futures:
             break
@@ -795,16 +784,18 @@ async def test_pending_endpoint_lists_unanswered_cards() -> None:
     _as_owner(request)
     resp = await api_ask_question_pending(request)
     assert resp.status == 200
-    rows = json.loads(resp.text)
+    payload = json.loads(resp.text)
+    rows = payload["pending"]
     assert [(r["ask_id"], r["slot"]) for r in rows] == [("ask-3", "chat-7")]
     assert rows[0]["questions"][0]["question"] == "Which approach?"
+    assert payload["resolved"] == {}
 
     st.resolve_question("ask-3", None)
     assert await task is None
 
     # Once resolved it must disappear, or a reload resurrects a dead card.
-    resp = await api_ask_question_pending(request)
-    assert json.loads(resp.text) == []
+    payload = json.loads((await api_ask_question_pending(request)).text)
+    assert payload == {"pending": [], "resolved": {"ask-3": "dismissed"}}
 
 
 @pytest.mark.asyncio
@@ -820,6 +811,35 @@ async def test_pending_endpoint_is_owner_only() -> None:
     assert resp.status == 403
 
 
+@pytest.mark.asyncio
+async def test_pending_endpoint_returns_recent_resolution_reason_to_owner_only() -> None:
+    from kiro_crew.dashboard.handlers.ask_question import api_ask_question_pending
+
+    st = _state()
+    task = asyncio.ensure_future(
+        st.request_question("ask-recent", "chat-1", _questions(), timeout=30)
+    )
+    for _ in range(50):
+        if "ask-recent" in st._question_futures:
+            break
+        await asyncio.sleep(0)
+    st.resolve_question("ask-recent", {"Which approach?": "Option A"})
+    assert await task == {"Which approach?": "Option A"}
+
+    owner = MagicMock()
+    owner.app = {"state": st}
+    _as_owner(owner)
+    payload = json.loads((await api_ask_question_pending(owner)).text)
+    assert payload["pending"] == []
+    assert payload["resolved"] == {"ask-recent": "answered"}
+
+    non_owner = MagicMock()
+    non_owner.app = {"state": st}
+    _as_owner(non_owner, user="U_SOMEONE_ELSE")
+    st.owner_id = "U_OWNER"
+    assert (await api_ask_question_pending(non_owner)).status == 403
+
+
 # ── Session resets release the blocking wait ──
 
 
@@ -833,10 +853,7 @@ def test_every_session_reset_goes_through_the_chokepoint() -> None:
     would not catch a SIXTH handler added later, which is exactly how the stop
     paths drifted before.
     """
-    src = (
-        Path(__file__).resolve().parents[1]
-        / "src/kiro_crew/dashboard/chat_handlers.py"
-    ).read_text(encoding="utf-8")
+    src = _chat_handler_source()
 
     body = src.split("async def _reset_slot_session", 1)
     assert len(body) == 2, "the reset chokepoint is gone"
@@ -866,9 +883,7 @@ async def test_reset_chokepoint_cancels_pending_questions() -> None:
         return True
 
     st.sessions.reset = _reset
-    task = asyncio.ensure_future(
-        st.request_question("ask-4", "chat-1", _questions(), timeout=30)
-    )
+    task = asyncio.ensure_future(st.request_question("ask-4", "chat-1", _questions(), timeout=30))
     for _ in range(50):
         if st._question_futures:
             break
@@ -896,21 +911,24 @@ async def test_question_events_go_only_to_owner_sockets() -> None:
     text, options, and ask_id.
     """
     st = _state()
-    task = asyncio.ensure_future(
-        st.request_question("ask-own", "chat-1", _questions(), timeout=30)
-    )
+    task = asyncio.ensure_future(st.request_question("ask-own", "chat-1", _questions(), timeout=30))
     for _ in range(50):
         if st._question_futures:
             break
         await asyncio.sleep(0)
 
-    assert [k for k, _ in st.broadcasts] == ["question_card"]
+    assert [k for k, _ in st.broadcasts] == ["question_card", "shared_crew.decision"]
     # The all-clients channel must stay untouched for both events.
     assert st.broadcasts_all == []  # type: ignore[attr-defined]
 
     st.resolve_question("ask-own", None)
     assert await task is None
-    assert [k for k, _ in st.broadcasts] == ["question_card", "question_card_resolved"]
+    assert [k for k, _ in st.broadcasts] == [
+        "question_card",
+        "shared_crew.decision",
+        "shared_crew.decision",
+        "question_card_resolved",
+    ]
     assert st.broadcasts_all == []  # type: ignore[attr-defined]
 
 
@@ -937,7 +955,7 @@ def test_broadcast_ws_owners_targets_the_owner_client_set() -> None:
 def test_question_window_stays_under_the_tool_stall_watchdog() -> None:
     """The wait must end before ACP declares the turn dead.
 
-    `acp/client.py::_TOOL_STALL_TIMEOUT` is armed once a tool call is dispatched,
+    `acp/client_timeouts.py::_TOOL_STALL_TIMEOUT` is armed once a tool call is dispatched,
     and a blocked ask_question emits no progress frames — so a window at or beyond
     that value lets the watchdog kill the turn, after which an answer has no turn
     left to return to. The ceiling was copied from the `wait` tool (1800s), which
@@ -973,14 +991,17 @@ async def test_questions_identical_after_redaction_are_rejected() -> None:
         }
     ]
 
-    with patch(
-        "kiro_crew.dashboard.state.redact_credentials",
-        side_effect=lambda s: (
-            ("Use <cred> now?", 1) if "LEAKY_CRED_SENTINEL" in s else (s, 0)
+    with (
+        patch(
+            "kiro_crew.dashboard.state.redact_credentials",
+            side_effect=lambda s: (
+                ("Use <cred> now?", 1) if "LEAKY_CRED_SENTINEL" in s else (s, 0)
+            ),
         ),
-    ), patch(
-        "kiro_crew.dashboard.state.redact_exfiltration_urls",
-        side_effect=lambda s: (s, 0),
+        patch(
+            "kiro_crew.dashboard.state.redact_exfiltration_urls",
+            side_effect=lambda s: (s, 0),
+        ),
     ):
         with pytest.raises(ValueError, match="after redaction"):
             await st.request_question("ask-collide", "chat-1", colliding, timeout=30)
@@ -1001,14 +1022,15 @@ async def test_option_labels_identical_after_redaction_are_rejected() -> None:
         {"label": "Deploy LEAKY_CRED_SENTINEL2", "description": "production"},
     ]
 
-    with patch(
-        "kiro_crew.dashboard.state.redact_credentials",
-        side_effect=lambda s: (
-            ("Deploy <cred>", 1) if "LEAKY_CRED_SENTINEL" in s else (s, 0)
+    with (
+        patch(
+            "kiro_crew.dashboard.state.redact_credentials",
+            side_effect=lambda s: (("Deploy <cred>", 1) if "LEAKY_CRED_SENTINEL" in s else (s, 0)),
         ),
-    ), patch(
-        "kiro_crew.dashboard.state.redact_exfiltration_urls",
-        side_effect=lambda s: (s, 0),
+        patch(
+            "kiro_crew.dashboard.state.redact_exfiltration_urls",
+            side_effect=lambda s: (s, 0),
+        ),
     ):
         with pytest.raises(ValueError, match="option labels.*after redaction"):
             await st.request_question("ask-option-collide", "chat-1", colliding, timeout=30)
@@ -1065,7 +1087,9 @@ async def test_pending_lists_a_stateless_card_so_a_reloaded_tab_can_re_render_it
     _as_owner(request)
     resp = await api_ask_question_pending(request)
     assert resp.status == 200
-    rows = json.loads(resp.text)
+    payload = json.loads(resp.text)
+    assert payload["resolved"] == {}
+    rows = payload["pending"]
     assert len(rows) == 1
     row = rows[0]
     # Identified by card_id, not ask_id: nothing is blocked on it, and the id is
@@ -1083,9 +1107,7 @@ async def test_pending_lists_blocking_and_stateless_together() -> None:
     st = _state()
     st._slots = {"chat-1": _ChatSlot("chat-1")}
     st.deliver_ws_owners = _AsyncNoop()  # type: ignore[method-assign]
-    task = asyncio.ensure_future(
-        st.request_question("p1", "chat-1", _questions(), timeout=30)
-    )
+    task = asyncio.ensure_future(st.request_question("p1", "chat-1", _questions(), timeout=30))
     for _ in range(50):
         if "p1" in st._question_futures:
             break
@@ -1095,7 +1117,8 @@ async def test_pending_lists_blocking_and_stateless_together() -> None:
     request = MagicMock()
     request.app = {"state": st}
     _as_owner(request)
-    rows = json.loads((await api_ask_question_pending(request)).text)
+    payload = json.loads((await api_ask_question_pending(request)).text)
+    rows = payload["pending"]
     # The blocking ask is listed once, from the wait registry — not duplicated by
     # the slot record it also writes.
     assert [r.get("ask_id") for r in rows].count("p1") == 1
@@ -1121,7 +1144,10 @@ async def test_pending_skips_a_status_only_record() -> None:
     request = MagicMock()
     request.app = {"state": st}
     _as_owner(request)
-    assert json.loads((await api_ask_question_pending(request)).text) == []
+    assert json.loads((await api_ask_question_pending(request)).text) == {
+        "pending": [],
+        "resolved": {},
+    }
 
 
 class _AsyncNoop:
@@ -1240,9 +1266,7 @@ async def test_dismiss_cannot_clear_a_blocking_question() -> None:
 
     st = _state()
     st._slots = {"chat-1": _ChatSlot("chat-1")}
-    task = asyncio.ensure_future(
-        st.request_question("d1", "chat-1", _questions(), timeout=30)
-    )
+    task = asyncio.ensure_future(st.request_question("d1", "chat-1", _questions(), timeout=30))
     for _ in range(50):
         if "d1" in st._question_futures:
             break
@@ -1349,8 +1373,9 @@ class TestErrorCodes:
 
     The prose is kept and keeps its meaning -- demoted to advisory, not removed
     -- so a client that only reads ``error`` is unaffected. Backend-only,
-    because neither consumer renders that prose: ``useWebSocket.ts`` awaits
-    ``api.pendingQuestions()`` without reading a failure body, and
+    because neither consumer renders that prose:
+    ``hooks/websocket/composerCards.ts`` awaits ``api.pendingQuestions()``
+    without reading a failure body, and
     ``resolveAskAfterSend.ts`` catches ``ApiError`` and branches on
     ``err.status === 404`` alone. ``POST /api/ask-question`` has no browser
     caller at all -- it is the MCP tool's leg, and that path decodes through
@@ -1376,9 +1401,7 @@ class TestErrorCodes:
         sys.path.insert(0, str(Path(__file__).resolve().parent))
         import test_error_code_contract as gate
 
-        return [
-            f for f in gate.scan() if f.path == "dashboard/handlers/ask_question.py"
-        ]
+        return [f for f in gate.scan() if f.path == "dashboard/handlers/ask_question.py"]
 
     def test_no_refusal_in_this_module_is_prose_only(self) -> None:
         missing = sorted(f.lineno for f in self._findings() if f.bucket == "missing_code")
@@ -1390,16 +1413,25 @@ class TestErrorCodes:
     def test_the_ratchet_can_actually_fail(self) -> None:
         """Self-check: a scan matching nothing would pass the assertion above vacuously.
 
-        20 = the count pinned after the owner-denial migration. The earlier drop
-        from 21: the non-owner ``403`` is not written out here — its ``{"error":
-        "forbidden", "code": "owner_only"}`` body is now produced by
-        ``handlers._shared._owner_denial_response``, which the module calls with
-        exactly that message and code. The WIRE contract is unchanged -- only the
-        literal moved, and it is still coded at its new home, which is why
-        ``test_no_refusal_in_this_module_is_prose_only`` stays empty.
+        38 = 37 plus the Crew Mode worker refusal (``crew_worker_asks_conductor``),
+        one response shared by both ask routes (``_crew_worker_refusal``). 37 = the
+        20 pinned after the owner-denial migration, the answer route's
+        ``answers_too_long`` and ``invalid_response_id``, one additional
+        reason-bearing ``question_not_found`` response, plus fourteen coded response sites for the blocking MCP
+        ``ask_question`` routes. The five audited authorization denials construct
+        their literal response at the call site while ``_denied`` only records the
+        shared SEL event, so every refusal remains visible to the universal
+        machine-code ratchet. Open also owns ``invalid_json``, ``invalid_body``,
+        ``slot_not_found``, ``invalid_questions``, ``duplicate_question_key``,
+        ``invalid_ask_id``, and ``agent_ask_capacity``; wait and withdraw each own
+        ``question_not_found`` because a genuinely missing ask is not an
+        authorization denial. Wait reads no body, so it has no ``invalid_body``.
+        The earlier drop from 21: the non-owner ``403`` is not written out here —
+        its ``{"error": "forbidden", "code": "owner_only"}`` body is produced by
+        ``handlers._shared._owner_denial_response``. The wire contract is unchanged.
         """
         coded = [f for f in self._findings() if f.bucket == "compliant"]
-        assert len(coded) == 20, f"scanner reached {len(coded)} coded sites, expected 20"
+        assert len(coded) == 38, f"scanner reached {len(coded)} coded sites, expected 38"
         assert all(f.code_value for f in coded)
 
     # -- POST /api/ask-question (the MCP tool's leg) --
@@ -1466,9 +1498,7 @@ class TestErrorCodes:
 
     @pytest.mark.asyncio
     async def test_an_invalid_question_payload(self) -> None:
-        status, body = await self._ask(
-            {"session_key": "dashboard:chat-1", "questions": []}
-        )
+        status, body = await self._ask({"session_key": "dashboard:chat-1", "questions": []})
         assert status == 400
         assert body["code"] == "invalid_questions"
 
@@ -1487,13 +1517,33 @@ class TestErrorCodes:
         assert status == 400
         assert body["code"] == "invalid_field_type"
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("raw", ["1e999", "-1e999"])
+    async def test_an_infinite_timeout_gets_the_same_code(self, raw) -> None:
+        """JSON reads ``1e999`` as an infinite float, which ``int`` cannot convert."""
+        body = json.loads('{"session_key": "dashboard:chat-1", "timeout_secs": %s}' % raw)
+        body["questions"] = _questions()
+        status, payload = await self._ask(body)
+        assert status == 400
+        assert payload == {"error": "timeout_secs must be an integer", "code": "invalid_field_type"}
+
     # -- POST /api/ask-question/{ask_id}/answer --
 
     @staticmethod
-    async def _answer(body, *, ask_id="ask-1", resolves=False, raises=False):
+    async def _answer(
+        body,
+        *,
+        ask_id="ask-1",
+        resolves=False,
+        raises=False,
+        resolution_reason=None,
+    ):
         from kiro_crew.dashboard.handlers.ask_question import api_ask_question_answer
+        from kiro_crew.dashboard.interaction_coordinator import QuestionCoordinator
 
         st = _state()
+        if resolution_reason:
+            QuestionCoordinator._record_resolution(st, ask_id, resolution_reason)
         st.resolve_question = MagicMock(return_value=resolves)
         request = MagicMock()
         request.app = {"state": st}
@@ -1529,9 +1579,7 @@ class TestErrorCodes:
     async def test_answer_with_an_over_long_question_key(self) -> None:
         from kiro_crew.validation import _ASK_MAX_QUESTION_LEN
 
-        status, body = await self._answer(
-            {"answers": {"q" * (_ASK_MAX_QUESTION_LEN + 1): "a"}}
-        )
+        status, body = await self._answer({"answers": {"q" * (_ASK_MAX_QUESTION_LEN + 1): "a"}})
         assert status == 400
         assert body["code"] == "question_key_too_long"
 
@@ -1542,17 +1590,108 @@ class TestErrorCodes:
         was cut. The code makes that refusal dispatchable."""
         from kiro_crew.validation import _ASK_MAX_ANSWER_LEN
 
-        status, body = await self._answer(
-            {"answers": {"q": "a" * (_ASK_MAX_ANSWER_LEN + 1)}}
-        )
+        status, body = await self._answer({"answers": {"q": "a" * (_ASK_MAX_ANSWER_LEN + 1)}})
         assert status == 400
         assert body["code"] == "answer_too_long"
 
+    @staticmethod
+    def _max_keys() -> list[str]:
+        from kiro_crew.validation import _ASK_MAX_QUESTION_LEN, _ASK_MAX_QUESTIONS
+
+        return [str(i).ljust(_ASK_MAX_QUESTION_LEN, "q") for i in range(_ASK_MAX_QUESTIONS)]
+
     @pytest.mark.asyncio
-    async def test_answering_a_question_that_is_gone(self) -> None:
+    async def test_max_size_questions_with_max_length_answers_are_accepted(self) -> None:
+        """Every input within the advertised per-field limits fits the tool row's cap."""
+        from kiro_crew.session_directive import MAX_TOOL_RESULT_CHARS
+        from kiro_crew.validation import _ASK_MAX_ANSWER_LEN, format_ask_answers
+
+        answers = {k: "a" * _ASK_MAX_ANSWER_LEN for k in self._max_keys()}
+        assert len(format_ask_answers(answers.items())) <= MAX_TOOL_RESULT_CHARS
+        status, body = await self._answer({"answers": answers}, resolves=True)
+        assert (status, body) == (200, {"ok": True})
+
+    @pytest.mark.asyncio
+    async def test_the_aggregate_guard_still_refuses_an_oversized_body(self) -> None:
+        """Within every per-field bound, yet JSON quoting doubles each answer past the cap."""
+        from kiro_crew.session_directive import MAX_TOOL_RESULT_CHARS
+        from kiro_crew.validation import _ASK_MAX_ANSWER_LEN, format_ask_answers
+
+        answers = {k: '"' * _ASK_MAX_ANSWER_LEN for k in self._max_keys()}
+        assert len(format_ask_answers(answers.items())) > MAX_TOOL_RESULT_CHARS
+        status, body = await self._answer({"answers": answers})
+        assert status == 400
+        assert body["code"] == "answers_too_long"
+
+    @pytest.mark.asyncio
+    async def test_answers_that_redaction_would_push_past_the_cap(self) -> None:
+        """Under the cap as typed, over it once each key id becomes a longer placeholder."""
+        from kiro_crew.session_directive import MAX_TOOL_RESULT_CHARS
+        from kiro_crew.validation import _ASK_MAX_ANSWER_LEN, format_ask_answers
+
+        key_id = "AKIA" + "ABCDEFGHIJKLMNOP"  # assembled so secret scanners do not flag a fake key
+        answer = (f"{key_id} " * 100)[:_ASK_MAX_ANSWER_LEN]
+        answers = {k: answer for k in self._max_keys()}
+        # As typed (before the scrub format_ask_answers applies) the set fits the cap.
+        as_typed = "\n".join(
+            ["User has answered your questions:"]
+            + [
+                f"{json.dumps(q, ensure_ascii=False)} -> {json.dumps(a, ensure_ascii=False)}"
+                for q, a in answers.items()
+            ]
+        )
+        assert len(as_typed) < MAX_TOOL_RESULT_CHARS
+        assert len(format_ask_answers(answers.items())) > MAX_TOOL_RESULT_CHARS
+        status, body = await self._answer({"answers": answers})
+        assert status == 400
+        assert body["code"] == "answers_too_long"
+
+    def test_the_measured_text_is_the_tool_result(self) -> None:
+        """The length check measures exactly what the MCP tool returns."""
+        from kiro_crew.mcp_tools.control import _format_ask_outcome
+        from kiro_crew.validation import format_ask_answers
+
+        answers = {'Say "hi"?': "yes\nno", "Pick one": "B"}
+        reply = {
+            "status": "answered",
+            "questions": [{"question": q} for q in answers],
+            "answers": answers,
+        }
+        assert format_ask_answers(answers.items()) == _format_ask_outcome(reply)
+
+    def test_the_answer_bound_is_derived_from_the_tool_row_cap(self) -> None:
+        """The per-answer limit leaves room for the header and max-length keys."""
+        from kiro_crew.session_directive import MAX_TOOL_RESULT_CHARS
+        from kiro_crew.validation import (
+            _ASK_ANSWERS_HEADER,
+            _ASK_MAX_ANSWER_LEN,
+            _ASK_MAX_QUESTION_LEN,
+            _ASK_MAX_QUESTIONS,
+        )
+
+        per_line = len('\n"" -> ""') + _ASK_MAX_QUESTION_LEN + _ASK_MAX_ANSWER_LEN
+        worst = len(_ASK_ANSWERS_HEADER) + _ASK_MAX_QUESTIONS * per_line
+        assert worst <= MAX_TOOL_RESULT_CHARS
+        assert worst + _ASK_MAX_QUESTIONS > MAX_TOOL_RESULT_CHARS, "the bound is not tight"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("reason", ["answered", "expired"])
+    async def test_answering_a_question_that_recently_ended_reports_why(self, reason: str) -> None:
+        status, body = await self._answer(
+            {"dismissed": True},
+            resolves=False,
+            resolution_reason=reason,
+        )
+        assert status == 404
+        assert body["code"] == "question_not_found"
+        assert body["reason"] == reason
+
+    @pytest.mark.asyncio
+    async def test_answering_an_unknown_question_omits_a_reason(self) -> None:
         status, body = await self._answer({"dismissed": True}, resolves=False)
         assert status == 404
         assert body["code"] == "question_not_found"
+        assert "reason" not in body
 
     # -- the behavioural ratchet --
 
@@ -1577,13 +1716,9 @@ class TestErrorCodes:
         seen.append(await self._answer(["answers"]))
         seen.append(await self._answer({"answers": {}}))
         seen.append(
-            await self._answer(
-                {"answers": {f"q{i}": "a" for i in range(_ASK_MAX_QUESTIONS + 1)}}
-            )
+            await self._answer({"answers": {f"q{i}": "a" for i in range(_ASK_MAX_QUESTIONS + 1)}})
         )
-        seen.append(
-            await self._answer({"answers": {"q": "a" * (_ASK_MAX_ANSWER_LEN + 1)}})
-        )
+        seen.append(await self._answer({"answers": {"q": "a" * (_ASK_MAX_ANSWER_LEN + 1)}}))
         seen.append(await self._answer({"dismissed": True}))
 
         for status, body in seen:

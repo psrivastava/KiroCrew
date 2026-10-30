@@ -164,7 +164,7 @@ describe('chat sidebar — goal-loop progress subtitle', () => {
     const slots = [{ key: 'k', title: 'loop', running: true, messages: 5, last_message: 'stale' }]
     const { getByText, queryByText } = renderSidebar(
       slots,
-      { activeSlot: 'k', goalLoops: { k: { cycle_count: 3, max_cycles: 24 } }, slotStatusDetail: { k: { text: 'Reading gateway.log' } } },
+      { activeSlot: 'k', goalLoops: { k: { cycle_count: 3, max_cycles: 24 } }, slotStatusDetail: { k: { kind: 'tool', purpose: 'Reading gateway.log' } } },
       { activeSlotProp: 'k' },
     )
     expect(getByText('Loop 3/24')).toBeTruthy()
@@ -233,7 +233,7 @@ describe('chat sidebar — structured monitor status', () => {
     const slots = [{ key: 'k', title: 'monitor', running: true, messages: 5 }]
     const { getByText, queryByText, container } = renderSidebar(slots, {
       automations: { k: structuredMonitor() },
-      slotStatusDetail: { k: { text: 'Reading gateway.log' } },
+      slotStatusDetail: { k: { kind: 'tool', purpose: 'Reading gateway.log' } },
     }, { activeSlotProp: 'k' })
 
     expect(getByText('Monitor · action running')).toBeTruthy()
@@ -266,7 +266,7 @@ describe('chat sidebar — structured monitor status', () => {
         action: { wakeInFlight: false, wakeDelivery: '' },
         latest: { classification: 'stable', reasonCode: 'no_change', observedAt: 1_800_000_000, decision: 'continue' },
       }) },
-      slotStatusDetail: { k: { text: 'Reading gateway.log' } },
+      slotStatusDetail: { k: { kind: 'tool', purpose: 'Reading gateway.log' } },
     }, { activeSlotProp: 'k' })
 
     expect(getByText(/Reading gateway\.log/)).toBeTruthy()
@@ -358,7 +358,7 @@ describe('chat sidebar — interrupted goal loop', () => {
     const slots = [{ key: 'k', title: 'loop', running: true, messages: 5, interrupted: false }]
     const { getByText, getByTitle, container } = renderSidebar(
       slots,
-      { activeSlot: 'k', goalLoops: { k: { cycle_count: 47, max_cycles: 72 } }, slotStatusDetail: { k: { text: 'Reading gateway.log' } } },
+      { activeSlot: 'k', goalLoops: { k: { cycle_count: 47, max_cycles: 72 } }, slotStatusDetail: { k: { kind: 'tool', purpose: 'Reading gateway.log' } } },
       { activeSlotProp: 'k' },
     )
     expect(getByText('Loop 47/72')).toBeTruthy()
@@ -403,7 +403,7 @@ describe('chat sidebar — interrupted ordinary session', () => {
   })
 
   it('drops the Resume instruction on a crew-bound row', () => {
-    // A remote-bound session has no local Continue (`remote_action_unsupported`),
+    // A relay archive has no Continue (`relay_archive_read_only`),
     // so the composer offers no Resume control — the row must not tell the user to
     // press one. The interruption marker itself still belongs there.
     const slots = [{
@@ -439,7 +439,7 @@ describe('chat sidebar — interrupted ordinary session', () => {
         interrupted: true, subagents_running: true, last_message: 'Delegating',
       },
       {
-        key: 'orchestrating', title: 'planning', running: false, messages: 5,
+        key: 'legacy-orchestrating', title: 'planning', running: false, messages: 5,
         interrupted: true, orchestrating: true, last_message: 'Planning',
       },
       {
@@ -455,8 +455,8 @@ describe('chat sidebar — interrupted ordinary session', () => {
     expect(container.querySelector('[data-session-row="plain"]')?.textContent).toContain('In progress')
     expect(container.querySelector('[data-session-row="loop"]')?.textContent).not.toContain('interrupted')
     expect(container.querySelector('[data-session-row="loop"]')?.textContent).toContain('In progress')
-    expect(container.querySelector('[data-session-row="orchestrating"]')?.textContent).not.toContain('Turn interrupted')
-    expect(container.querySelector('[data-session-row="orchestrating"]')?.textContent).toContain('In progress')
+    // A legacy orchestrating flag is not live work: the interruption still shows.
+    expect(container.querySelector('[data-session-row="legacy-orchestrating"]')?.textContent).toContain('Turn interrupted')
     expect(container.querySelector('[data-session-row="queued"]')?.textContent).not.toContain('Turn interrupted')
     expect(container.querySelector('[data-session-row="queued"]')?.textContent).toContain('In progress')
   })

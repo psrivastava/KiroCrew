@@ -2,7 +2,7 @@
 
 *Who this is for: the person who operates a Kiro Crew install and wants agents to read and update Asana work through Asana's hosted MCP server. Expected time: 10 minutes; longer if your Asana domain is in app "approval mode" and a super admin must approve the app.*
 
-Kiro Crew connects to the Asana V2 MCP server at `https://mcp.asana.com/v2/mcp`. Asana requires every MCP client to be pre-registered: "The V2 MCP server (`https://mcp.asana.com/v2/mcp`) requires OAuth 2.0 authentication with a registered client ID and client secret", and "Dynamic client registration is not supported with Asana's V2 MCP Server." You create that registration in Asana's developer console as an app of type **MCP app**. The older V1 beta server at `https://mcp.asana.com/sse` is deprecated and shuts down on 5 August 2026; do not use it.
+Kiro Crew connects to the Asana V2 MCP server at `https://mcp.asana.com/v2/mcp`. Asana requires every MCP client to be pre-registered: "The V2 MCP server (`https://mcp.asana.com/v2/mcp`) requires OAuth 2.0 authentication with a registered client ID and client secret", and "Dynamic client registration is not supported with Asana's V2 MCP Server." You create that registration in Asana's developer console as an app of type **MCP app**. The older V1 beta server at `https://mcp.asana.com/sse` was retired on 5 August 2026; do not use it.
 
 ## Before you start
 
@@ -73,7 +73,7 @@ Asana requires the secret at token exchange (`client_secret` is marked "required
 
 ## 6. Verify the connection
 
-1. Open **Capabilities → Connections**. The Asana card should read **Connect** instead of **Needs configuration**.
+1. Open **Customize → Connections**. The Asana card should read **Connect** instead of **Needs configuration**.
 2. Click **Connect**. An app.asana.com page opens. Sign in if prompted, review the request, and click **Allow**. The page shows the **App name** from step 1.3 and the account being authorized; if the wrong Asana account is shown, sign out of Asana in that browser first and start again from the card.
 3. Local installs return to the dashboard automatically; remote installs show the paste box described in section 2. If the browser instead shows a plain-text error before any consent page, Asana says that happens when "either the `client_id` or `redirect_uri` do not match": compare the Client ID on the card with the console, and the redirect URL with `http://127.0.0.1:48102/callback` character by character.
 4. The card should now read **Connected**.
@@ -92,7 +92,7 @@ Revoking: the user opens their Asana **Settings**, then the **Apps** tab, which 
 - Access tokens last one hour; Kiro Crew must refresh with the refresh token, and the refresh call also requires the client secret.
 - MCP-app tokens cannot call the standard Asana REST API; a second, standard API app is needed for that.
 - Distribution is per workspace; adding a new workspace later requires editing **Manage distribution**.
-- V1 beta compatibility ends on 5 August 2026: the `https://mcp.asana.com/sse` endpoint and the single shared "Asana MCP" app disappear. Any older Kiro Crew configuration pointing at `/sse` must be replaced by this registration.
+- V1 beta compatibility ended on 5 August 2026: the `https://mcp.asana.com/sse` endpoint and the single shared "Asana MCP" app are retired. Any older Kiro Crew configuration pointing at `/sse` must be replaced by this registration.
 - Admin control exists only on Enterprise+ and Legacy Enterprise; on other tiers, the only ways to stop the integration are the user's **Deauthorize** button, the operator's `oauth_revoke` call, or deleting the app in the developer console.
 - Asana treats tokens as opaque and says their format "may change without notice"; do not build any checks on token shape.
 - Asana's documentation does not state a limit on redirect URLs per app or on the number of apps a user may create.

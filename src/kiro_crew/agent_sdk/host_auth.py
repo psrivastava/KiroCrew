@@ -21,7 +21,7 @@ consumer                                      projection it reads
 ``agent_sdk.tool_gate`` own-leaf exclusion    :data:`AGENT_AUTH_DECLARATIONS`
 ``agent_sdk.backends`` logout-recycle set     :func:`backends_retired_by_host_logout`
 ``acp`` auth-required message                 :func:`signed_out_message`
-``cli_doctor`` sign-in row                    :func:`declaration_for`
+``doctor_checks.agents`` sign-in row          :func:`declaration_for`
 ``GET /api/acp-backends`` auth object         :func:`declaration_for`
 ============================================  ================================
 
@@ -38,8 +38,10 @@ Why this module is stdlib-only
 is imported very early -- which is precisely why it reads
 :mod:`kiro_crew.identity_stores`, a stdlib-only leaf, rather than anything
 heavier. This table has to sit on the same footing or the floor cannot read it
-without closing an import cycle. So the only non-stdlib import here is
-:mod:`kiro_crew.agent_sdk.backends`, itself stdlib-only, for the backend ids.
+without closing an import cycle. So the only non-stdlib imports here are
+:mod:`kiro_crew.agent_sdk.backends`, itself stdlib-only, for the backend ids, and
+:mod:`kiro_crew.kiro_cli_bundle`, also stdlib-only, for the kiro-cli sign-in
+command the remedy text names.
 ``test/test_agent_sdk_host_auth.py`` pins that: it walks this module's own
 module-scope imports against an allowlist AND spawns a cold interpreter to
 assert importing it pulls in no third-party module and none of
@@ -59,11 +61,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import PurePosixPath
-from typing import Dict, FrozenSet, Protocol, Tuple, runtime_checkable
+from typing import Dict, FrozenSet, Mapping, Optional, Protocol, Tuple, runtime_checkable
 
 from kiro_crew.agent_sdk.backends import (
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_CODEX,
+    ACP_BACKEND_COPILOT,
     ACP_BACKEND_DEEPSEEK,
     ACP_BACKEND_GOOSE,
     ACP_BACKEND_KAS,
@@ -72,10 +75,11 @@ from kiro_crew.agent_sdk.backends import (
     ACP_BACKEND_PI,
     ACP_BACKENDS_KNOWN,
 )
+from kiro_crew.kiro_cli_bundle import KIRO_CLI_LOGIN_COMMAND, spawn_login_command
 
 # ── Where a harness's entitlement comes from ──
-# Three named sources rather than a free string: the doctor row, the panel and the
-# logout policy all branch on this, and a typo'd fourth spelling would read as a
+# Named sources rather than a free string: the doctor row, the panel and the
+# logout policy all branch on this, and a typo'd spelling would read as a
 # harness nobody has an answer for instead of failing the parity test.
 
 #: Signed in through the HOST's own identity store -- the one ``kiro-cli login``
@@ -87,9 +91,23 @@ ENTITLEMENT_HOST_IDENTITY_STORE = "host_identity_store"
 #: itself. Kiro Crew never reads it and only ever checks that it exists.
 ENTITLEMENT_OWN_CREDENTIAL_FILE = "own_credential_file"
 
-# Two sources, because two are constructed. A harness whose entitlement arrives
+#: Entitled by a key Kiro Crew holds in ITS OWN secret vault and hands to the
+#: harness's process as an environment variable at spawn.
+#:
+#: The third source, and it is what lets a harness be enforced with NO carve-out in
+#: :attr:`AgentAuthDeclaration.adapter_own_leaves`: the key never has to be readable
+#: as a file inside the child's tree, so the credential leaves stay masked for the
+#: whole process tree instead of being spared for it. Only usable by a harness that
+#: (a) resolves a provider credential from its inherited environment and (b) keeps
+#: that class of variable away from the shells it spawns itself -- both properties of
+#: the harness, verified against it rather than assumed, which is why this is a
+#: declared source and not a flag any driver may set.
+ENTITLEMENT_HOST_VAULT = "host_vault"
+
+# Three sources, because three are constructed. A harness whose entitlement arrives
 # from the ambient cloud environment (an AWS profile, an instance role) rather than
-# from a file it owns would add a third here, with its label, when it exists.
+# from a file it owns or from Crew's vault would add a fourth here, with its label,
+# when it exists.
 
 #: Entitlement source -> what to call it in front of an operator.
 #:
@@ -101,12 +119,14 @@ ENTITLEMENT_OWN_CREDENTIAL_FILE = "own_credential_file"
 ENTITLEMENT_LABELS: Dict[str, str] = {
     ENTITLEMENT_HOST_IDENTITY_STORE: "kiro-cli's own sign-in",
     ENTITLEMENT_OWN_CREDENTIAL_FILE: "the harness's own credential file",
+    ENTITLEMENT_HOST_VAULT: "a key in Kiro Crew's secret vault",
 }
 
 ENTITLEMENT_SOURCES: FrozenSet[str] = frozenset(
     {
         ENTITLEMENT_HOST_IDENTITY_STORE,
         ENTITLEMENT_OWN_CREDENTIAL_FILE,
+        ENTITLEMENT_HOST_VAULT,
     }
 )
 
@@ -160,14 +180,27 @@ class AgentAuthDeclaration:
     #: EXFILTRATION -- a shell the model spawns inside the harness can read the file
     #: and send the secret somewhere. That is a real residual risk and it is carried
     #: knowingly, because the alternative is a harness that cannot sign in at all.
-    #: Four harnesses carry it today, and the maintainer weighed and accepted this
-    #: exact trade rather than it being an oversight. What bounds it is the
-    #: subset rule above: the exclusion can only re-open a file this same
-    #: declaration put on the floor, so no harness can reach another harness's
-    #: credential or anything the floor fences for a different reason.
+    #: Four harnesses carry it today -- codex, OpenCode, pi and goose -- and the
+    #: maintainer weighed and accepted this exact trade rather than it being an
+    #: oversight. What bounds it is the subset rule above: the exclusion can only
+    #: re-open a file this same declaration put on the floor, so no harness can reach
+    #: another harness's credential or anything the floor fences for a different
+    #: reason.
+    #:
+    #: It is NOT the only shape an enforced harness can take. A harness declaring
+    #: :data:`ENTITLEMENT_HOST_VAULT` is fed its key as an environment variable at
+    #: spawn and declares ``()`` here, so its credential leaves stay masked for the
+    #: whole process tree and the exfiltration path above does not exist for it. The
+    #: DeepSeek Harness is the first enforced harness of that shape: it resolves a
+    #: provider key from its inherited environment, and it scrubs every variable
+    #: whose NAME matches ``/KEY|PASSWORD|SECRET|TOKEN/i`` before spawning any child
+    #: of its own, so the key is invisible to the shells it runs. A harness that can
+    #: be entitled that way must be, rather than carrying a carve-out it does not
+    #: need.
     adapter_own_leaves: Tuple[str, ...]
 
-    #: What an operator DOES to sign this harness in. Rendered VERBATIM.
+    #: What an operator DOES to sign this harness in. Rendered VERBATIM, through
+    #: :func:`sign_in_remedy`, which names the kiro-cli command runnable here.
     #:
     #: States the ACTION and never the STATE, because most of the places it
     #: appears have taken no measurement: the backend panel shows it as a standing
@@ -191,7 +224,8 @@ class AgentAuthDeclaration:
     #: handed to a renderer that does no interpolation.
     sign_in_remedy: str
 
-    #: The message for a harness the host has EVIDENCE is signed out.
+    #: The message for a harness the host has EVIDENCE is signed out. Read through
+    #: :func:`signed_out_message`, for the same command rewrite.
     #:
     #: Used only on that evidence -- the auth-required raise sites, which reach it
     #: because the harness's own stderr said so, and the doctor row for the host
@@ -227,6 +261,19 @@ class AgentAuthDeclaration:
     #: re-spell where its file lands, never name a different file.
     override_relative_leaves: Tuple[str, ...] = ()
 
+    #: The phrase in this harness's OWN error text that means it cannot reach a
+    #: model until the operator signs it in or configures a provider.
+    #:
+    #: Matched case-insensitively as a substring of a JSON-RPC error's ``data`` and
+    #: ``message``. A match is the evidence :attr:`signed_out_message` needs, so the
+    #: client shows that message and does not retry: a respawn meets the same
+    #: missing configuration. The phrase is copied from a live capture of the
+    #: harness, never guessed, because a phrase that also appears in a transient
+    #: failure would turn a retryable error into a terminal one. Empty means the
+    #: harness's signed-out answers are already read by the shared auth vocabulary
+    #: (or have not been captured yet).
+    signed_out_signature: str = ""
+
     # There is deliberately NO field for re-exposing a file the mask hides.
     #
     # A re-exposure is an EDIT to the mask, and the rule this class exists to
@@ -257,6 +304,10 @@ class AgentAuthDeclaration:
             raise ValueError(f"{self.backend!r} declares no sign-in remedy")
         if not self.signed_out_message.strip():
             raise ValueError(f"{self.backend!r} declares no signed-out message")
+        if self.signed_out_signature and not self.signed_out_signature.strip():
+            # A blank phrase is a substring of every error, so it would make every
+            # failure of this harness terminal and hide its real cause.
+            raise ValueError(f"{self.backend!r} declares a blank signed-out signature")
         stray = tuple(
             leaf for leaf in self.adapter_own_leaves if leaf not in self.credential_leaves
         )
@@ -341,24 +392,30 @@ UNKNOWN_AGENT_AUTH = AgentAuthDeclaration(
 
 
 #: kiro-cli's action, and its signed-out statement, kept separate for the reason on
-#: the two fields. The statement is the string the auth-required path has always
-#: raised, unchanged: that path reaches it on the harness's own stderr evidence.
-_KIRO_REMEDY = "Run kiro-cli login in your terminal, then start a new chat."
+#: the two fields. The statement is the string the auth-required path raises: that
+#: path reaches it on the harness's own stderr evidence.
+#:
+#: Each names :data:`KIRO_CLI_LOGIN_COMMAND`, the form that works for a kiro-cli
+#: on the user's ``PATH``. :func:`sign_in_remedy` and :func:`signed_out_message`
+#: swap it for the absolute-path form when the spawn runs a copy the user's shell
+#: does not find, such as the desktop app's bundled one.
+_KIRO_REMEDY = f"Run {KIRO_CLI_LOGIN_COMMAND} in your terminal, then start a new chat."
 _KIRO_SIGNED_OUT = (
-    "kiro-cli is not logged in. Run `kiro-cli login` in your terminal, then start a new chat."
+    f"kiro-cli is not logged in. Run `{KIRO_CLI_LOGIN_COMMAND}` in your terminal, then "
+    "start a new chat."
 )
 # KAS can run under either auth owner -- Crew's own vault (the dashboard's Kiro
 # sign-in card) or kiro-cli's store -- and the formatter cannot see which one a
 # process had, so its messages name both remedies. Plain prose (no backticks, no
 # "--") in the remedy: the panel renders it as text.
 _KAS_REMEDY = (
-    "Sign in from Developer → Agent Backend → Kiro sign-in, or run kiro-cli login "
+    f"Sign in from Settings → Agent Harness → Kiro sign-in, or run {KIRO_CLI_LOGIN_COMMAND} "
     "in your terminal if kiro-cli owns the sign-in, then start a new chat."
 )
 _KAS_SIGNED_OUT = (
-    "Not signed in to Kiro. Sign in again from Developer → Agent Backend → Kiro sign-in, "
-    "or run `kiro-cli login` in your terminal if kiro-cli owns the sign-in, then start a "
-    "new chat."
+    "Not signed in to Kiro. Sign in again from Settings → Agent Harness → Kiro sign-in, "
+    f"or run `{KIRO_CLI_LOGIN_COMMAND}` in your terminal if kiro-cli owns the sign-in, "
+    "then start a new chat."
 )
 
 
@@ -529,16 +586,31 @@ AGENT_AUTH_DECLARATIONS: Tuple[AgentAuthDeclaration, ...] = (
             "needs no key: name it as the provider instead. Neither is checked here: "
             "the harness reads them."
         ),
+        # Names the keyring case because it is the one ``goose configure`` alone
+        # cannot fix. goose keeps keys in the OS keyring by default, and the
+        # sandboxed child cannot reach the session bus it lives behind (measured:
+        # ``busctl --user`` inside Crew's sandbox answers "Permission denied"). goose
+        # 1.52.0, driven live with no reachable bus, logs "Keyring unavailable. Using file
+        # storage for secrets.", reads only ``secrets.yaml``, and answers
+        # ``session/prompt`` with -32000 ``Authentication required``. With the key
+        # in ``secrets.yaml`` instead, the same run reaches its provider.
         signed_out_message=(
-            "goose has no provider configured. Run `goose configure` in your terminal "
-            "to set one up, or configure a locally served model, then start a new "
-            "chat."
+            "goose has no provider it can use here: none is configured, or its key "
+            "is in the system keyring, which Kiro Crew's sandbox cannot open. Run "
+            "`GOOSE_DISABLE_KEYRING=true goose configure` in your terminal so the key "
+            "is saved to goose's secrets.yaml, or configure a locally served model, "
+            "then start a new chat."
         ),
         # Excluded deliberately: it resolves its own provider secret, so a
         # ``kiro-cli logout`` says nothing about whether a running goose session can
         # still reach its model.
         host_logout_retires_children=False,
         entitlement_source=ENTITLEMENT_OWN_CREDENTIAL_FILE,
+        # goose 1.50.1 and 1.52.0, driven live with no provider configured, answer
+        # ``session/new`` with -32603 and ``Failed to resolve provider:
+        # Configuration value not found: GOOSE_PROVIDER``. No session opens, so no
+        # retry can help until ``goose configure`` has run.
+        signed_out_signature="Failed to resolve provider",
     ),
     AgentAuthDeclaration(
         backend=ACP_BACKEND_PI,
@@ -575,6 +647,13 @@ AGENT_AUTH_DECLARATIONS: Tuple[AgentAuthDeclaration, ...] = (
         # still authenticated.
         host_logout_retires_children=False,
         entitlement_source=ENTITLEMENT_OWN_CREDENTIAL_FILE,
+        # pi-acp 0.0.34, driven live with an empty pi home, answers ``session/new``
+        # with -32000 ``Authentication required: Configure an API key or log in
+        # with an OAuth provider.`` It raises that same text when pi lists no
+        # model or reports a 401/403, so no respawn helps until the operator signs
+        # in. The phrase is pi-acp's own, not the SDK's generic prefix, so no other
+        # harness's auth answer matches it.
+        signed_out_signature="Configure an API key or log in with an OAuth provider",
     ),
     AgentAuthDeclaration(
         backend=ACP_BACKEND_DEEPSEEK,
@@ -601,33 +680,121 @@ AGENT_AUTH_DECLARATIONS: Tuple[AgentAuthDeclaration, ...] = (
         # whether the right file is fenced under an override should not have to
         # re-derive which prefix this variable replaces.
         override_relative_leaves=(".credentials.yaml", ".env"),
-        # Nothing excluded from the mask, because no mask is applied: this harness's
-        # routing is ``UNVERIFIED``, so it is outside ``tool_gate.ENFORCED_ROUTINGS``,
-        # ``adapter_hidden_credential_dirs`` returns empty for it, and there is
-        # nothing to carve an exception out of. Declaring one anyway would be an
-        # assertion about a control that never runs. The leaves above still stand:
-        # they are what the READ GATE fences from the agent's own file tools, which is
-        # a separate control and does run.
+        # NOTHING excluded, and for this harness that is a positive choice rather than
+        # the absence of one. Its routing is ``VERIFIED_GATE_EXTENSION``, inside
+        # ``tool_gate.ENFORCED_ROUTINGS``, so ``adapter_hidden_credential_dirs``
+        # denies its child the whole read-gate floor -- both leaves above included --
+        # and an enforced harness that needs a FILE to authenticate has to carve one
+        # back out. This one does not need a file: its own credential layering resolves
+        # a provider key from the INHERITED PROCESS ENVIRONMENT first, above both files
+        # (verified against the installed harness: ``dsh-credentials-local`` documents
+        # inherited environment > ``$DSH_HOME/.credentials.yaml`` > ``<cwd>/.env`` >
+        # ``$DSH_HOME/.env``, and a credential reference IS an environment-variable
+        # name). So Crew hands it the key from its own vault instead
+        # (``agent.deepseek_env`` -> ``acp/client.py``) and both leaves stay masked for
+        # the WHOLE process tree.
+        #
+        # That is what closes the residual every other enforced harness carries. A
+        # carve-out removes the leaf for the whole sandboxed tree, and this harness
+        # ships a ``bash`` tool, so a command it runs could read its own provider key
+        # out of the spared file; the gate sees that command, but the read itself is
+        # one ``open()`` and the sensitive-path matcher is not the enforcement point.
+        # Feeding the key through the environment removes the file from the equation:
+        # the harness scrubs every inherited variable whose name matches
+        # ``/KEY|PASSWORD|SECRET|TOKEN/i`` before spawning ANY child of its own
+        # (``dsh-subprocess``'s ``scrubbedParentEnv``, used by both its bash and its
+        # terminal tools), and Crew REFUSES to inject a name outside that class for
+        # exactly that reason.
+        #
+        # One residual remains, named rather than closed, and MEASURED rather than
+        # argued. In the confined mode Crew pins, the harness runs each tool command
+        # inside its own per-call Landlock domain (``landlock-run``), and Landlock
+        # scopes ptrace-class access to a process's own domain or its children -- so
+        # ``cat /proc/<harness pid>/environ`` from the model's shell answers
+        # ``Permission denied`` (observed live, same uid, under Crew's sandbox wrap:
+        # every ancestor from the harness process up to the gateway refused, the
+        # gateway's own environ never carried the key, and ``env`` in the shell counted
+        # zero copies). What stands between the shell and the harness's environ is
+        # that per-call sandbox, and the harness's ``danger-full-access`` mode drops
+        # it -- so that mode is where the residual lives (not driven here: the
+        # harness refuses to compose that mode with this profile's defaults, so its
+        # read was not observed either way). Escalating to that mode is itself a
+        # ``session/request_permission`` this routing's gate sees, so the exposure is
+        # two gated steps rather than one ungated read.
         adapter_own_leaves=(),
         # States the ACTION only, and asserts no state, because for this harness
         # there may be no state to assert: a provider route pointed at a model served
         # on the operator's own machine needs no key at all.
         sign_in_remedy=(
-            "DeepSeek Harness holds its own provider key. Save one in its "
-            "configuration to reach a hosted model. A model served locally on this "
-            "machine needs no key: point a provider route at it instead. Neither is "
-            "checked here, because the harness reads them itself."
+            "DeepSeek Harness reaches a hosted model with a provider key Kiro Crew "
+            "holds for it. Save the key under Settings → Secrets, then map it in "
+            "agent.deepseek_env under the environment-variable name the provider "
+            "expects, such as DEEPSEEK_API_KEY. A model served locally on this "
+            "machine needs no key: point a provider route at it instead."
         ),
         signed_out_message=(
-            "DeepSeek Harness has no provider key. Save one in its configuration, or "
-            "point a provider route at a model served locally on this machine, then "
-            "start a new chat."
+            "DeepSeek Harness has no provider key. Save one under Settings > Secrets "
+            "and map it in `agent.deepseek_env` (for example "
+            "`DEEPSEEK_API_KEY: secret://my-dsh-key`), or point a provider route at a "
+            "model served locally on this machine, then start a new chat."
         ),
         # Excluded deliberately, and for this harness the reason is stronger than a
         # separate store: there is no host credential on the wire at all, so a
         # ``kiro-cli logout`` cannot bear on whether a running session still works.
+        # The vault this harness draws on is Crew's SECRET vault, which a kiro-cli
+        # logout does not touch either.
+        host_logout_retires_children=False,
+        entitlement_source=ENTITLEMENT_HOST_VAULT,
+        # dsh 0.1.5-rc.3, driven live with no key in its environment and an empty
+        # ``DSH_HOME``, opens the session and then answers the first
+        # ``session/prompt`` with -32603 ``... no API key for provider route
+        # "deepseek-official"; store DEEPSEEK_API_KEY ...``.
+        signed_out_signature="no API key for provider route",
+    ),
+    AgentAuthDeclaration(
+        backend=ACP_BACKEND_COPILOT,
+        # Copilot CLI resolves its GitHub credential in this order (its own
+        # authentication reference): ``COPILOT_GITHUB_TOKEN``, ``GH_TOKEN``,
+        # ``GITHUB_TOKEN``, the OS keychain under the service ``copilot-cli``, a
+        # PLAINTEXT ``config.json`` in its home when no keychain is reachable (which
+        # is the case inside Crew's sandbox, with no session bus), and last the
+        # GitHub CLI's own token. The plaintext file is the one leaf this harness
+        # itself STORES that a path can name, so it is the one on the floor; the
+        # keychain is fenced by the OS, and the GitHub CLI's store is that tool's.
+        credential_leaves=(".copilot/config.json",),
+        # ``COPILOT_HOME`` relocates the whole home (``copilot help environment``:
+        # "defaults to $HOME/.copilot"), so it stands in for the leaf's parent and
+        # the relocated file keeps only its final segment.
+        home_override_env_vars=("COPILOT_HOME",),
+        override_relative_leaves=("config.json",),
+        # The one leaf the mask must spare: this harness is enforced
+        # (``Routing.SESSION_CONFIG``), so the mask denies its child the whole
+        # credential floor, and the same file carries its settings and, without a
+        # keychain, its own token. The read gate still refuses the leaf to the
+        # AGENT's file tools, so the two controls cover different readers.
+        adapter_own_leaves=(".copilot/config.json",),
+        # Action only, and no state: a provider of the operator's own
+        # (``COPILOT_PROVIDER_BASE_URL``) needs no GitHub sign-in at all.
+        sign_in_remedy=(
+            "GitHub Copilot CLI signs in on its own — run copilot login in a "
+            "terminal, or sign the GitHub CLI in with gh auth login, which Copilot "
+            "CLI falls back to. A model provider of your own "
+            "(COPILOT_PROVIDER_BASE_URL) needs no GitHub sign-in."
+        ),
+        signed_out_message=(
+            "GitHub Copilot CLI is not signed in. Run `copilot login` in your "
+            "terminal (or `gh auth login`, which Copilot CLI falls back to), then "
+            "start a new chat."
+        ),
+        # Excluded deliberately: it signs in with a GitHub credential of its own, so a
+        # ``kiro-cli logout`` says nothing about whether a running session can still
+        # reach its model.
         host_logout_retires_children=False,
         entitlement_source=ENTITLEMENT_OWN_CREDENTIAL_FILE,
+        # Copilot CLI 1.0.100, driven live with an empty home (no stored token and no
+        # GitHub CLI to fall back to), answers ``session/new`` with -32000
+        # ``Authentication required`` and creates no session.
+        signed_out_signature="Authentication required",
     ),
 )
 
@@ -733,14 +900,75 @@ def backends_retired_by_host_logout() -> FrozenSet[str]:
     )
 
 
-def signed_out_message(backend: str) -> str:
+def _with_spawn_login_command(
+    declaration: AgentAuthDeclaration,
+    text: str,
+    environ: Optional[Mapping[str, str]],
+    platform_name: Optional[str],
+) -> str:
+    """*text* with the kiro-cli sign-in command this host's spawn actually needs.
+
+    Only a harness on the host identity store signs in through kiro-cli, so only
+    its text names :data:`KIRO_CLI_LOGIN_COMMAND`. When the spawn runs the desktop
+    app's bundled copy, which the user's shell would not find as ``kiro-cli``,
+    the bare command fails with command-not-found, so the absolute-path form the
+    setup gate serves replaces it. An operator's ``KIROCREW_KIRO_BIN`` keeps the
+    bare command (:func:`spawn_login_command` says why). Reads the environment
+    only, never the filesystem, so a message raised on the event loop stays cheap.
+    """
+    if declaration.entitlement_source != ENTITLEMENT_HOST_IDENTITY_STORE:
+        return text
+    command = spawn_login_command(environ, platform_name)
+    if command == KIRO_CLI_LOGIN_COMMAND:
+        return text
+    return text.replace(KIRO_CLI_LOGIN_COMMAND, command)
+
+
+def sign_in_remedy(
+    backend: str,
+    environ: Optional[Mapping[str, str]] = None,
+    platform_name: Optional[str] = None,
+) -> str:
+    """What an operator does to sign *backend* in, for the binary this host runs.
+
+    :attr:`AgentAuthDeclaration.sign_in_remedy` with the kiro-cli command made
+    runnable here (:func:`_with_spawn_login_command`). *environ* and
+    *platform_name* default to this process's own.
+    """
+    declaration = declaration_for(backend)
+    return _with_spawn_login_command(
+        declaration, declaration.sign_in_remedy, environ, platform_name
+    )
+
+
+def signed_out_message(
+    backend: str,
+    environ: Optional[Mapping[str, str]] = None,
+    platform_name: Optional[str] = None,
+) -> str:
     """The message for *backend* when the host has evidence it is signed out.
 
     Only for a caller holding that evidence -- the harness's own stderr, or the
     host identity store this core can read. Everywhere else,
-    :func:`sign_in_remedy` is the honest string.
+    :func:`sign_in_remedy` is the honest string. The kiro-cli command it names is
+    the one runnable here, as in :func:`sign_in_remedy`.
     """
-    return declaration_for(backend).signed_out_message
+    declaration = declaration_for(backend)
+    return _with_spawn_login_command(
+        declaration, declaration.signed_out_message, environ, platform_name
+    )
+
+
+def reports_signed_out(backend: str, text: str) -> bool:
+    """Whether *text* is *backend*'s own answer for "not signed in / not configured".
+
+    Reads only the phrase *backend* declares in
+    :attr:`AgentAuthDeclaration.signed_out_signature`, so one harness's wording
+    can never classify another harness's error. A True answer is the evidence
+    :func:`signed_out_message` asks for.
+    """
+    signature = declaration_for(backend).signed_out_signature
+    return bool(signature) and signature.casefold() in text.casefold()
 
 
 def entitlement_label(backend: str) -> str:
@@ -811,6 +1039,7 @@ __all__ = [
     "AgentAuthDeclaration",
     "AgentInteractiveLogin",
     "ENTITLEMENT_HOST_IDENTITY_STORE",
+    "ENTITLEMENT_HOST_VAULT",
     "ENTITLEMENT_LABELS",
     "ENTITLEMENT_OWN_CREDENTIAL_FILE",
     "ENTITLEMENT_SOURCES",
@@ -822,6 +1051,8 @@ __all__ = [
     "home_override_env_vars",
     "missing_declarations",
     "override_anchored_leaves",
+    "reports_signed_out",
+    "sign_in_remedy",
     "signed_out_message",
     "signs_in_separately",
 ]

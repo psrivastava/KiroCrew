@@ -28,18 +28,59 @@ import asyncio
 import os
 import subprocess
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+from git_maintenance_helpers import git_maintenance_off_entries
 
 from kiro_crew import code_fingerprint as cf
 from kiro_crew.mcp_gateway import gatewayd as gw
 from kiro_crew.mcp_gateway import manager as mgr
 from kiro_crew.subprocess_utf8 import UTF8_TEXT
+from kiro_crew.testing.wait import async_wait_until, await_until, finished
 
 _POSIX_ONLY = pytest.mark.skipif(sys.platform == "win32", reason="/proc and unix sockets")
+
+
+@pytest.fixture
+def real_git_fingerprint() -> Iterator[None]:
+    """Opt out of :func:`_no_git_fingerprint` for a test whose subject IS the git
+    branch: a scratch repository it built itself, or a child daemon whose real
+    fingerprint the test process must match. The cache is still cleared on both
+    sides so the real value is computed fresh and does not leak to a sibling."""
+    cf.code_fingerprint.cache_clear()
+    yield
+    cf.code_fingerprint.cache_clear()
+
+
+@pytest.fixture(autouse=True)
+def _no_git_fingerprint(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[None]:
+    """``code_fingerprint()`` without a git spawn, per test, cache isolated.
+
+    The cached fingerprint is of ``_PACKAGE_ROOT`` -- THIS checkout -- so a cold
+    read spawns ``git -C <checkout> rev-parse HEAD`` and ``git diff HEAD`` on the
+    developer's own repository with the pytest worker's cwd inherited, and which
+    test pays for it depends on run order (whoever reads first after a
+    ``cache_clear``). The tests in this module only need SOME stable fingerprint
+    (they compare it with itself, or check which thread computed it), so the
+    trusted-git resolver is pinned to "absent", which is the product's own
+    no-spawn arm: the mtime rule answers instead. The cache is cleared on both
+    sides so a pinned value neither reuses a real one nor leaks to a test that
+    must match a child daemon's real fingerprint -- those request
+    :func:`real_git_fingerprint`, which this fixture honours.
+    """
+    if "real_git_fingerprint" in request.fixturenames:
+        yield
+        return
+    monkeypatch.setattr(cf, "trusted_git_bin", lambda: None)
+    cf.code_fingerprint.cache_clear()
+    yield
+    cf.code_fingerprint.cache_clear()
 
 
 # ── 1. fingerprint ───────────────────────────────────────────────────────
@@ -50,11 +91,20 @@ class TestCodeFingerprint:
         assert cf.code_fingerprint() == cf.code_fingerprint()
         assert cf.code_fingerprint()
 
-    def test_a_git_tree_reports_head_and_a_digest_of_the_dirty_diff(self, tmp_path: Path) -> None:
+    def test_a_git_tree_reports_head_and_a_digest_of_the_dirty_diff(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, real_git_fingerprint: None
+    ) -> None:
         env = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "HOME": str(tmp_path)}
+        env.update(git_maintenance_off_entries(env))
         pkg = tmp_path / "pkg"
         pkg.mkdir()
         (pkg / "a.py").write_text("x = 1\n", encoding="utf-8")
+        # ``_git_fingerprint`` addresses the tree with ``-C`` and passes no ``cwd``,
+        # so every git it spawns inherits the process cwd. Pin that to the scratch
+        # repo for the test's duration: the inherited default is the pytest worker's
+        # cwd -- this checkout -- and a git aimed there by mistake would read (or
+        # write) the developer's own repository.
+        monkeypatch.chdir(tmp_path)
 
         def git(*args: str) -> None:
             subprocess.run(
@@ -73,6 +123,7 @@ class TestCodeFingerprint:
             ["git", "-C", str(tmp_path), "rev-parse", "HEAD"],
             capture_output=True,
             check=True,
+            cwd=tmp_path,
             env=env,
             **UTF8_TEXT,
         ).stdout.strip()
@@ -115,17 +166,29 @@ class TestCodeFingerprint:
         monkeypatch.setattr(cf.subprocess, "run", fake_run)
         monkeypatch.setenv("GIT_EXTERNAL_DIFF", "/tmp/evil")
         monkeypatch.setenv("GIT_CONFIG_PARAMETERS", "'diff.external=/tmp/evil'")
+        # The repo-driver preflight has its own real-repo tests; here it is clean.
+        monkeypatch.setattr(
+            "kiro_crew.platform.update_governance.repo_exec_driver_reason", lambda *_a, **_k: ""
+        )
         assert cf._git_fingerprint(tmp_path) == "abc"
         assert len(seen) == 2
         for argv, env in seen:
             assert argv[0] == "/usr/bin/git"
             assert env["GIT_CONFIG_GLOBAL"] == os.devnull
             assert env["GIT_CONFIG_NOSYSTEM"] == "1"
+            # Beside those three, only the shared exec-key pins (GIT_CONFIG_COUNT/KEY_n/VALUE_n).
             assert not any(
                 k.startswith("GIT_")
                 and k not in ("GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM", "GIT_TERMINAL_PROMPT")
+                and k != "GIT_CONFIG_COUNT"
+                and not k.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"))
                 for k in env
             )
+            pins = {
+                env[f"GIT_CONFIG_KEY_{i}"]: env[f"GIT_CONFIG_VALUE_{i}"]
+                for i in range(int(env["GIT_CONFIG_COUNT"]))
+            }
+            assert pins["diff.external"] == "" and pins["core.fsmonitor"] == "false"
             assert "core.pager=cat" in argv
         diff_argv = seen[1][0]
         assert "--no-ext-diff" in diff_argv and "--no-textconv" in diff_argv
@@ -170,7 +233,6 @@ class TestCodeFingerprint:
         import asyncio
         import threading
 
-        cf.code_fingerprint.cache_clear()
         seen: list[str] = []
         real = cf._git_fingerprint
 
@@ -179,13 +241,10 @@ class TestCodeFingerprint:
             return real(root)
 
         monkeypatch.setattr(cf, "_git_fingerprint", spy)
-        try:
-            warmed = await cf.warm_code_fingerprint()
-            assert seen and seen[0] != threading.main_thread().name
-            assert cf.code_fingerprint() == warmed
-            assert len(seen) == 1, "the sync read after warming is a cache hit"
-        finally:
-            cf.code_fingerprint.cache_clear()
+        warmed = await cf.warm_code_fingerprint()
+        assert seen and seen[0] != threading.main_thread().name
+        assert cf.code_fingerprint() == warmed
+        assert len(seen) == 1, "the sync read after warming is a cache hit"
         assert asyncio.get_running_loop() is not None
 
     def test_a_pycache_directory_does_not_change_the_answer(self, tmp_path: Path) -> None:
@@ -216,7 +275,7 @@ class TestOwnerLivenessSweeper:
         await asyncio.sleep(0.05)
         assert not stop.is_set(), "a live owner must not stop the daemon"
         alive["v"] = False
-        await asyncio.wait_for(stop.wait(), timeout=5)
+        await await_until(stop)
         await task
 
     @pytest.mark.asyncio
@@ -230,7 +289,7 @@ class TestOwnerLivenessSweeper:
         await asyncio.sleep(0.05)
         assert not stop.is_set()
         start["v"] = "7777"  # same PID number, different process
-        await asyncio.wait_for(stop.wait(), timeout=5)
+        await await_until(stop)
         await task
 
     @pytest.mark.asyncio
@@ -259,7 +318,7 @@ class TestOwnerLivenessSweeper:
         stop = asyncio.Event()
         monkeypatch.setattr(gw, "_process_start_time", lambda pid: None)
         monkeypatch.setattr(gw, "_pid_exists", lambda pid: True)
-        await asyncio.wait_for(gw._owner_liveness_sweeper(4242, 0.01, stop), timeout=5)
+        await finished(gw._owner_liveness_sweeper(4242, 0.01, stop), "owner liveness sweeper")
         assert not stop.is_set()
 
     @pytest.mark.asyncio
@@ -278,7 +337,7 @@ class TestOwnerLivenessSweeper:
         stop = asyncio.Event()
         monkeypatch.setattr(gw, "_process_start_time", lambda pid: None)
         monkeypatch.setattr(gw, "_pid_exists", lambda pid: False)
-        await asyncio.wait_for(gw._owner_liveness_sweeper(4242, 0.01, stop), timeout=5)
+        await finished(gw._owner_liveness_sweeper(4242, 0.01, stop), "owner liveness sweeper")
         assert stop.is_set(), "a daemon whose owner is already gone must not serve on"
 
     @pytest.mark.asyncio
@@ -293,7 +352,7 @@ class TestOwnerLivenessSweeper:
         stop = asyncio.Event()
         monkeypatch.setattr(gw, "_process_start_time", lambda pid: None)
         monkeypatch.setattr(gw, "_pid_exists", lambda pid: False)
-        await asyncio.wait_for(gw._owner_liveness_sweeper(4242, 3600.0, stop), timeout=5)
+        await finished(gw._owner_liveness_sweeper(4242, 3600.0, stop), "owner liveness sweeper")
         assert stop.is_set()
 
     def test_the_manager_names_itself_as_owner(self, tmp_path: Path) -> None:
@@ -307,7 +366,10 @@ class TestOwnerLivenessSweeper:
 @_POSIX_ONLY
 @pytest.mark.asyncio
 async def test_a_real_daemon_exits_when_its_owner_dies(
-    short_sock_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    short_sock_dir: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    real_git_fingerprint: None,
 ) -> None:
     """End to end: a throwaway owner process dies, the daemon follows it out.
 
@@ -355,15 +417,14 @@ async def test_a_real_daemon_exits_when_its_owner_dies(
         start_new_session=True,
     )
     try:
-        from kiro_crew.mcp_gateway import transport
-
-        deadline = asyncio.get_running_loop().time() + 60
-        while not await asyncio.to_thread(transport.endpoint_exists, sock):
-            assert asyncio.get_running_loop().time() < deadline, "daemon never bound"
-            await asyncio.sleep(0.05)
         from kiro_crew.mcp_gateway.daemon_control import describe_daemon
 
-        info = await asyncio.to_thread(describe_daemon, sock)
+        info = await async_wait_until(
+            lambda: describe_daemon(sock),
+            timeout=60,
+            off_loop=True,
+            describe=lambda: f"daemon {daemon.pid} on {sock}; returncode={daemon.returncode}",
+        )
         assert info is not None
         assert info.owner_pid == owner.pid
         assert info.pid == daemon.pid

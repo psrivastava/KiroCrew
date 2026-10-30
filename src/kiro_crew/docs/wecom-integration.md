@@ -11,13 +11,13 @@ stream back live.
 Like Telegram, the connection is outbound-only: Kiro Crew opens a secure
 WebSocket to WeCom, so there's no callback URL or open port to manage.
 
-## The easy way: just ask Kiro Crew
+## The easy way: use Settings
 
-You don't have to edit anything by hand. In any Kiro Crew session — the
-dashboard, Slack, or the CLI — say something like *"set up the WeCom channel."*
-Kiro Crew tells you where to create the WeCom AI bot, then writes your Bot ID and
-Secret into `~/.kiro/crew/.env` and `config.json` and restarts the gateway for
-you. You just paste the two values when it asks.
+Open **Settings → Messaging Channels → WeCom**. Paste the Bot ID and Secret and add the
+allowed userids there; the panel validates the credentials, stores them in
+`~/.kiro/crew/.env`, and writes the non-secret channel settings to `config.json`.
+Restart when the panel asks. Because both values are credentials, do not paste
+them into a chat message.
 
 Prefer to wire it up yourself? The manual steps are below.
 
@@ -65,7 +65,7 @@ AI-bot API; they are not wired up yet.
 - Authorized senders: the **owner** (`KIROCREW_OWNER_ID`) plus anyone listed in
   `allowed_users`. With no owner and an empty list, nobody gets in.
 - Whole-company access: set `"allow_all_users": true` (or flip **Allow all
-  organization members** in Settings → WeCom) to skip listing each userid.
+  organization members** in Settings → Messaging Channels → WeCom) to skip listing each userid.
   This is an explicit opt-in — an empty list never means "everyone" — and it
   works because a WeCom AI bot is only reachable inside your own org tenant.
   Messages without a userid are still dropped.
@@ -90,9 +90,14 @@ command in its own message to run it.
 Per-item ceilings follow WeCom's own: 10 MB per image, 20 MB per file (including an
 audio file you attach, which is transcribed locally), 10 items per message. A voice
 note has no size ceiling here because its bytes are never fetched — WeCom sends the
-transcript. Anything refused is reported rather than silently dropped. Sending a
-file *to* you is not wired up yet, so if the agent produces an image you'll get its
-path rather than the picture.
+transcript. Anything refused is reported rather than silently dropped.
+
+Files the agent sends you go out as native WeCom media. An explicit `file_send`
+(or a dashboard upload to a WeCom user) arrives as an image, voice note, video
+or file, with any caption sent as a separate text message right after it.
+WeCom's outbound ceilings apply: 2 MB per image or voice note, 20 MB per file or
+video. An image the agent only mentions inline in a reply is not uploaded, so
+for that you still get its path rather than the picture.
 
 ## Commands
 

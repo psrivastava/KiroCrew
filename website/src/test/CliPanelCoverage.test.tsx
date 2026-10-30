@@ -11,15 +11,24 @@
  * theme/font observers, and the teardown + delete-session exports.
  */
 import { describe, it, expect, vi, beforeAll, afterAll, beforeEach, afterEach } from 'vitest'
-import { screen, fireEvent, act, waitFor, cleanup } from '@testing-library/react'
+import { screen, fireEvent, act, waitFor, cleanup, within } from '@testing-library/react'
 import { renderWithProviders, renderHookWithProviders } from './helpers'
 import { i18nT } from '../i18n/t'
+import { askAgentPrompt } from '../components/AskAgentButton'
+import {
+  consumeChatHandoff,
+  installSoftNavigate,
+  recordError,
+  __resetErrorJournalForTests,
+  __resetNavSeamForTests,
+} from '../utils/errorReport'
 
 /* ── xterm stand-in ───────────────────────────────────────────────────────── */
 
 const xt = vi.hoisted(() => {
   interface FakeOptions {
     cursorBlink?: boolean
+    cursorStyle?: string
     fontSize?: number
     fontFamily?: string
     theme?: Record<string, string>
@@ -28,6 +37,10 @@ const xt = vi.hoisted(() => {
     static instances: FakeTerminal[] = []
     options: FakeOptions
     element: HTMLElement | undefined = undefined
+    /** xterm's helper textarea; its inline left/top stay unset until a render. */
+    textarea: HTMLTextAreaElement | undefined = undefined
+    /** The helper textarea's inline left/top at each focus() call. */
+    focusedAt: { left: string; top: string }[] = []
     /** Ordered log of every fontFamily write — proves the re-measure toggle. */
     fontFamilyWrites: string[] = []
     openCalls = 0
@@ -58,10 +71,20 @@ const xt = vi.hoisted(() => {
       const el = document.createElement('div')
       el.className = 'xterm'
       Object.defineProperty(el, 'offsetParent', { get: () => this.offsetParent, configurable: true })
+      const ta = document.createElement('textarea')
+      ta.className = 'xterm-helper-textarea'
+      el.appendChild(ta)
       container.appendChild(el)
       this.element = el
+      this.textarea = ta
     }
-    focus() { this.focusCalls += 1 }
+    pastes: string[] = []
+    paste(data: string) { this.pastes.push(data) }
+    focus() {
+      this.focusCalls += 1
+      this.textarea?.focus()
+      if (this.textarea) this.focusedAt.push({ left: this.textarea.style.left, top: this.textarea.style.top })
+    }
     dispose() { this.disposed = true }
     hasSelection() { return this.selection.length > 0 }
     getSelection() { return this.selection }
@@ -80,12 +103,21 @@ const xt = vi.hoisted(() => {
     fit = vi.fn()
     constructor() { FakeFitAddon.instances.push(this) }
   }
-  return { FakeTerminal, FakeFitAddon }
+  class FakeWebLinksAddon {
+    static instances: FakeWebLinksAddon[] = []
+    /** The activation handler CliPanel passed, or undefined for the addon default. */
+    handler: ((event: MouseEvent, uri: string) => void) | undefined
+    constructor(handler?: (event: MouseEvent, uri: string) => void) {
+      this.handler = handler
+      FakeWebLinksAddon.instances.push(this)
+    }
+  }
+  return { FakeTerminal, FakeFitAddon, FakeWebLinksAddon }
 })
 
 vi.mock('@xterm/xterm', () => ({ Terminal: xt.FakeTerminal }))
 vi.mock('@xterm/addon-fit', () => ({ FitAddon: xt.FakeFitAddon }))
-vi.mock('@xterm/addon-web-links', () => ({ WebLinksAddon: class {} }))
+vi.mock('@xterm/addon-web-links', () => ({ WebLinksAddon: xt.FakeWebLinksAddon }))
 
 const registry = vi.hoisted(() => ({
   ensureTerminalConnection: vi.fn(),
@@ -94,14 +126,20 @@ const registry = vi.hoisted(() => ({
   connStatus: { value: undefined as 'connected' | 'reconnecting' | 'disconnected' | undefined },
   manualRetry: { value: false },
   displaced: { value: false },
+  invalidCwd: { value: false },
+  wrongMachine: { value: false },
   useTerminalConnStatus: vi.fn<() => 'connected' | 'reconnecting' | 'disconnected' | undefined>(),
   useTerminalManualRetry: vi.fn<() => boolean>(),
   useTerminalDisplaced: vi.fn<() => boolean>(),
-  retryTerminalConnection: vi.fn<(id: string) => void>(),
+  useTerminalInvalidCwd: vi.fn<() => boolean>(),
+  useTerminalWrongMachine: vi.fn<() => boolean>(),
+  retryTerminalConnection: vi.fn<(id: string, manual?: boolean, cwd?: string) => void>(),
 }))
 registry.useTerminalConnStatus.mockImplementation(() => registry.connStatus.value)
 registry.useTerminalManualRetry.mockImplementation(() => registry.manualRetry.value)
 registry.useTerminalDisplaced.mockImplementation(() => registry.displaced.value)
+registry.useTerminalInvalidCwd.mockImplementation(() => registry.invalidCwd.value)
+registry.useTerminalWrongMachine.mockImplementation(() => registry.wrongMachine.value)
 vi.mock('../utils/terminalRegistry', () => registry)
 
 // Both children own their own xterm hooks and are covered by their own suites;
@@ -118,7 +156,7 @@ import CliPanel, {
   isThemeSignal,
   useDeleteTerminalSession,
 } from '../components/CliPanel'
-import { setTerminalFontSize, __resetTerminalFontStore } from '../hooks/useTerminalFont'
+import { setTerminalFontSize, setTerminalCursorStyle, __resetTerminalFontStore } from '../hooks/useTerminalFont'
 import { setTerminalCloseFailed, useTerminalCloseFailed } from '../hooks/useBottomTerminal'
 import { ansiPaletteFromVars } from '../utils/terminalPalette'
 
@@ -222,7 +260,7 @@ let seq = 0
 function nextId() { seq += 1; return `pty-${seq}` }
 
 const live = new Set<string>()
-function mount(props: Partial<{ sessionId: string; cwd: string; visible: boolean; onSendToChat: (t: string) => void }> = {}) {
+function mount(props: Partial<{ sessionId: string; cwd: string; visible: boolean; onSendToChat: (t: string) => void; deferOpen: boolean }> = {}) {
   const sessionId = props.sessionId ?? nextId()
   live.add(sessionId)
   const view = renderWithProviders(
@@ -231,6 +269,7 @@ function mount(props: Partial<{ sessionId: string; cwd: string; visible: boolean
       cwd={props.cwd}
       visible={props.visible ?? true}
       onSendToChat={props.onSendToChat}
+      deferOpen={props.deferOpen}
     />,
   )
   const term = xt.FakeTerminal.instances[xt.FakeTerminal.instances.length - 1]
@@ -262,6 +301,8 @@ beforeEach(() => {
   registry.connStatus.value = undefined
   registry.manualRetry.value = false
   registry.displaced.value = false
+  registry.invalidCwd.value = false
+  registry.wrongMachine.value = false
   xt.FakeTerminal.instances = []
   xt.FakeFitAddon.instances = []
   touch.value = false
@@ -292,10 +333,13 @@ describe('CliPanel mount', () => {
     expect(term.openCalls).toBe(1)
     expect(container.querySelector('.xterm')).not.toBeNull()
     expect(fit.fit).toHaveBeenCalled()
-    expect(registry.ensureTerminalConnection).toHaveBeenCalledWith(sessionId, term, fit, '/srv/app')
-    // A visible pane takes focus and is re-measured (monospace toggle + restore).
+    // The fifth and sixth arguments are the remote-workspace slot and the chat
+    // a local shell belongs to; this bare panel has neither.
+    expect(registry.ensureTerminalConnection).toHaveBeenCalledWith(sessionId, term, fit, '/srv/app', undefined, undefined)
+    // A visible pane takes focus. open() has just measured the cell, so no
+    // re-measure toggle follows it (that would render every row twice more).
     expect(term.focusCalls).toBe(1)
-    expect(term.fontFamilyWrites.slice(-2)).toEqual(['monospace', term.options.fontFamily])
+    expect(term.fontFamilyWrites).toEqual([])
   })
 
   it('loads the fit and web-links addons and seeds the theme from CSS custom properties', () => {
@@ -312,6 +356,22 @@ describe('CliPanel mount', () => {
       selectionBackground: '#313244',
       ...ansiPaletteFromVars(() => ''),
     })
+  })
+
+  it('opens a clicked terminal link by its own URL, never through a blank window', () => {
+    // The addon's default handler calls window.open() with no URL and then
+    // navigates the blank window. The desktop shell's window-open handler
+    // classifies that about:blank target as unsupported and denies it, so the
+    // click did nothing. Passing the URL lets the shell route it to the OS.
+    const { term } = mount()
+    const links = xt.FakeWebLinksAddon.instances[xt.FakeWebLinksAddon.instances.length - 1]
+    expect(term.addons).toContain(links)
+    expect(links.handler).toBeTypeOf('function')
+    const open = vi.fn(() => null)
+    vi.stubGlobal('open', open)
+    links.handler!(new MouseEvent('click'), 'https://example.com/docs')
+    expect(open).toHaveBeenCalledTimes(1)
+    expect(open).toHaveBeenCalledWith('https://example.com/docs', '_blank', 'noopener,noreferrer')
   })
 
   it('routes a theme variable into its ANSI slot', () => {
@@ -334,6 +394,150 @@ describe('CliPanel mount', () => {
     } finally {
       document.documentElement.style.removeProperty('--bg')
       document.documentElement.style.removeProperty('--text')
+    }
+  })
+
+  it('focuses a freshly opened terminal with its input inside the pane, not parked off-screen', () => {
+    // Before xterm's first render its helper textarea sits at the stylesheet's
+    // left:-9999em, 0x0. iPhone Safari reveals the focused field when the
+    // keyboard opens, so focusing it there left the new terminal under the
+    // keyboard on the first open.
+    const { term } = mount()
+    expect(term.focusedAt).toEqual([{ left: '0px', top: '0px' }])
+  })
+
+  it('leaves a rendered terminal input where xterm put it', () => {
+    const sessionId = nextId()
+    const first = mount({ sessionId })
+    first.term.textarea!.style.left = '18px'
+    first.term.textarea!.style.top = '36px'
+    cleanup()
+    const second = mount({ sessionId })
+    expect(second.term.focusedAt.at(-1)).toEqual({ left: '18px', top: '36px' })
+  })
+
+  it('holds a first-open terminal behind a focused stand-in, then opens xterm and hands focus and typed text over', () => {
+    const sessionId = nextId()
+    const view = mount({ sessionId, deferOpen: true })
+    const { term } = view
+    // The keyboard comes up on the stand-in; xterm is not built yet.
+    const proxy = screen.getByTestId('terminal-focus-proxy') as HTMLTextAreaElement
+    expect(document.activeElement).toBe(proxy)
+    expect(term.openCalls).toBe(0)
+    expect(term.focusCalls).toBe(0)
+    // A paste with a newline must not run a command: it is handed over as a paste.
+    fireEvent.change(proxy, { target: { value: 'ls\nrm' } })
+
+    view.rerender(<CliPanel sessionId={sessionId} visible deferOpen={false} />)
+    expect(term.openCalls).toBe(1)
+    expect(term.focusCalls).toBe(1)
+    expect(document.activeElement).toBe(term.textarea)
+    expect(term.pastes).toEqual(['ls\nrm'])
+    expect(screen.queryByTestId('terminal-focus-proxy')).toBeNull()
+  })
+
+  it('does not take the focus back when the user moved to another field during the hold', () => {
+    const sessionId = nextId()
+    const composer = document.createElement('textarea')
+    document.body.append(composer)
+    try {
+      const view = mount({ sessionId, deferOpen: true })
+      act(() => composer.focus())
+      view.rerender(<CliPanel sessionId={sessionId} visible deferOpen={false} />)
+      expect(view.term.openCalls).toBe(1)
+      expect(view.term.focusCalls).toBe(0)
+      expect(document.activeElement).toBe(composer)
+    } finally { composer.remove() }
+  })
+
+  it('focuses a tab that was held while hidden when the user switches to it', () => {
+    const sessionId = nextId()
+    const chip = document.createElement('button')
+    document.body.append(chip)
+    try {
+      const view = mount({ sessionId, deferOpen: true, visible: false })
+      view.rerender(<CliPanel sessionId={sessionId} visible={false} deferOpen={false} />)
+      expect(view.term.openCalls).toBe(1)
+      act(() => chip.focus()) // the tab chip the user taps
+      view.rerender(<CliPanel sessionId={sessionId} visible deferOpen={false} />)
+      expect(view.term.focusCalls).toBe(1)
+    } finally { chip.remove() }
+  })
+
+  it('focuses an already-opened terminal straight away even while its host holds new ones', () => {
+    const sessionId = nextId()
+    mount({ sessionId })
+    cleanup()
+    const again = mount({ sessionId, deferOpen: true })
+    expect(screen.queryByTestId('terminal-focus-proxy')).toBeNull()
+    expect(again.term.focusCalls).toBeGreaterThan(0)
+    expect(document.activeElement).toBe(again.term.textarea)
+  })
+
+  it('prefers the dedicated --term-* surface variables over the general ones', () => {
+    // A theme pack that sets --term-* colours the terminal surface independently
+    // of the agent chat background (--bg) and text (--text).
+    document.documentElement.style.setProperty('--bg', '#101010')
+    document.documentElement.style.setProperty('--text', '#f0f0f0')
+    document.documentElement.style.setProperty('--accent', '#111111')
+    document.documentElement.style.setProperty('--accent-subtle', '#222222')
+    document.documentElement.style.setProperty('--term-bg', '#001122')
+    document.documentElement.style.setProperty('--term-fg', '#aabbcc')
+    document.documentElement.style.setProperty('--term-cursor', '#ddeeff')
+    document.documentElement.style.setProperty('--term-selection', '#334455')
+    try {
+      const { term } = mount()
+      expect(term.options.theme?.background).toBe('#001122')
+      expect(term.options.theme?.foreground).toBe('#aabbcc')
+      expect(term.options.theme?.cursor).toBe('#ddeeff')
+      expect(term.options.theme?.selectionBackground).toBe('#334455')
+    } finally {
+      for (const v of ['--bg', '--text', '--accent', '--accent-subtle',
+        '--term-bg', '--term-fg', '--term-cursor', '--term-selection']) {
+        document.documentElement.style.removeProperty(v)
+      }
+    }
+  })
+
+  it('falls back to --bg/--text/--accent/--accent-subtle when no --term-* is set', () => {
+    // A pack written before the --term-* variables existed, or one that omits
+    // them, keeps today's terminal colours.
+    document.documentElement.style.setProperty('--bg', '#101010')
+    document.documentElement.style.setProperty('--text', '#f0f0f0')
+    document.documentElement.style.setProperty('--accent', '#111111')
+    document.documentElement.style.setProperty('--accent-subtle', '#222222')
+    try {
+      const { term } = mount()
+      expect(term.options.theme?.background).toBe('#101010')
+      expect(term.options.theme?.foreground).toBe('#f0f0f0')
+      expect(term.options.theme?.cursor).toBe('#111111')
+      expect(term.options.theme?.selectionBackground).toBe('#222222')
+    } finally {
+      for (const v of ['--bg', '--text', '--accent', '--accent-subtle']) {
+        document.documentElement.style.removeProperty(v)
+      }
+    }
+  })
+
+  it('orders the ANSI extremes by the terminal polarity, not the app polarity', () => {
+    // A dark app with a light terminal is the case --term-bg/--term-fg exist
+    // for. The ANSI black/white ends and the bright ramp must follow the
+    // TERMINAL's own colours; keying them off the app's --bg/--text would put
+    // ANSI white near #eee on a light terminal and render it invisible.
+    document.documentElement.style.setProperty('--bg', '#111111')
+    document.documentElement.style.setProperty('--text', '#eeeeee')
+    document.documentElement.style.setProperty('--term-bg', '#fafafa')
+    document.documentElement.style.setProperty('--term-fg', '#222222')
+    try {
+      const { term } = mount()
+      const theme = term.options.theme as Record<string, string>
+      // white is the light end: the terminal's own light background, not --text.
+      expect(theme.white).toBe('#fafafa')
+      expect(theme.black).toBe('#222222')
+    } finally {
+      for (const v of ['--bg', '--text', '--term-bg', '--term-fg']) {
+        document.documentElement.style.removeProperty(v)
+      }
     }
   })
 
@@ -427,6 +631,90 @@ describe('CliPanel disconnected banner', () => {
     expect(registry.retryTerminalConnection).toHaveBeenCalledWith(sessionId)
   })
 
+  it('says why a refused shell was not opened instead of a bare disconnect', () => {
+    registry.connStatus.value = 'disconnected'
+    registry.wrongMachine.value = true
+    mount({ cwd: '/w' })
+    const banner = screen.getByTestId('cli-panel-disconnected')
+    expect(banner).toHaveTextContent(i18nT('components.cliPanel.wrong_machine_message'))
+    expect(screen.queryByText(DISCONNECTED_LABEL)).toBeNull()
+    // Every redial meets the same refusal, so no Reconnect; the hand-off stays.
+    expect(screen.queryByRole('button', { name: RECONNECT_LABEL })).toBeNull()
+    expect(within(banner).getByRole('button', { name: /Ask the agent/ })).toBeInTheDocument()
+  })
+
+  it('shows the localized invalid-cwd error immediately and allows explicit recovery', () => {
+    registry.connStatus.value = 'disconnected'
+    registry.invalidCwd.value = true
+    const cwd = '/work/another-workspace/long-directory-name-without-spaces/removed-project'
+    const { sessionId, rerender } = mount({ cwd })
+    const message = i18nT('components.cliPanel.invalid_cwd_message', { cwd })
+    expect(message).not.toBe('components.cliPanel.invalid_cwd_message')
+    expect(message).toContain(cwd)
+    expect(screen.getByTestId('cli-panel-disconnected')).toHaveTextContent(message)
+    expect(screen.getByTestId('cli-panel-disconnected')).toHaveAttribute('role', 'alert')
+    expect(screen.queryByText(DISCONNECTED_LABEL)).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: RECONNECT_LABEL }))
+    expect(registry.retryTerminalConnection).toHaveBeenCalledWith(sessionId)
+
+    registry.invalidCwd.value = false
+    registry.connStatus.value = 'reconnecting'
+    registry.manualRetry.value = true
+    rerender(<CliPanel sessionId={sessionId} cwd={cwd} visible />)
+    expect(screen.queryByText(message)).toBeNull()
+    expect(screen.getByText(RECONNECTING_LABEL)).toBeInTheDocument()
+    registry.connStatus.value = 'connected'
+    registry.manualRetry.value = false
+    rerender(<CliPanel sessionId={sessionId} cwd={cwd} visible />)
+    expect(screen.queryByTestId('cli-panel-disconnected')).toBeNull()
+  })
+
+  it('keeps one contextual hand-off and both recovery controls outside the refused-path text', () => {
+    registry.connStatus.value = 'disconnected'
+    registry.invalidCwd.value = true
+    const cwd = `/work/${'long-directory-without-spaces/'.repeat(12)}removed-project`
+    const message = i18nT('components.cliPanel.invalid_cwd_message', { cwd })
+    __resetErrorJournalForTests()
+    __resetNavSeamForTests()
+    const navigate = vi.fn()
+    installSoftNavigate(navigate)
+    try {
+      const report = recordError({
+        source: 'system', message, code: 'terminal_invalid_cwd',
+        endpoint: '/api/ws/terminal/refused-workspace',
+      })
+      const { sessionId } = mount({ cwd })
+      const notice = screen.getByTestId('cli-panel-disconnected')
+      const text = within(notice).getByText(message)
+      const handoff = within(notice).getByRole('button', { name: /ask the agent/i })
+      const reconnect = screen.getByRole('button', { name: RECONNECT_LABEL })
+      const startingDirectory = screen.getByRole('button', {
+        name: i18nT('components.cliPanel.use_starting_directory'),
+      })
+      expect(text.textContent).toBe(message)
+      expect(text.contains(handoff)).toBe(false)
+      expect(text.contains(reconnect)).toBe(false)
+      expect(text.contains(startingDirectory)).toBe(false)
+      expect(within(notice).getAllByRole('button')).toEqual([handoff])
+      expect(reconnect.parentElement).toBe(startingDirectory.parentElement)
+      expect(reconnect.parentElement!.contains(handoff)).toBe(false)
+      expect(within(notice.parentElement!).getAllByRole('button')).toHaveLength(3)
+
+      fireEvent.click(reconnect)
+      fireEvent.click(startingDirectory)
+      expect(registry.retryTerminalConnection.mock.calls).toEqual([
+        [sessionId], [sessionId, true, ''],
+      ])
+      fireEvent.click(handoff)
+      expect(navigate.mock.calls).toEqual([['/chat']])
+      expect(consumeChatHandoff()).toBe(askAgentPrompt(report))
+      expect(consumeChatHandoff()).toBeNull()
+    } finally {
+      __resetErrorJournalForTests()
+      __resetNavSeamForTests()
+    }
+  })
+
   it('shows the Reconnecting… banner with a disabled button during a MANUAL retry', () => {
     // The user clicked Reconnect and the dial is in flight: manualRetry is set
     // while the status is 'reconnecting'.
@@ -435,6 +723,24 @@ describe('CliPanel disconnected banner', () => {
     mount()
     expect(screen.getByRole('status')).toHaveTextContent(RECONNECTING_LABEL)
     expect(screen.getByRole('button', { name: RECONNECT_LABEL })).toBeDisabled()
+  })
+
+  it('offers the starting directory only when the requested directory was refused', () => {
+    registry.connStatus.value = 'disconnected'
+    registry.invalidCwd.value = true
+    const { sessionId, rerender } = mount({ cwd: '/missing/project' })
+    const label = i18nT('components.cliPanel.use_starting_directory')
+    expect(label).not.toBe('components.cliPanel.use_starting_directory')
+    // The tooltip says where the shell opens, since the button cannot show the path.
+    expect(screen.getByRole('button', { name: label })).toHaveAttribute(
+      'title', expect.stringContaining('dashboard.terminal.cwd'),
+    )
+    fireEvent.click(screen.getByRole('button', { name: label }))
+    expect(registry.retryTerminalConnection).toHaveBeenCalledWith(sessionId, true, '')
+
+    registry.invalidCwd.value = false
+    rerender(<CliPanel sessionId={sessionId} cwd="/missing/project" visible />)
+    expect(screen.queryByRole('button', { name: label })).toBeNull()
   })
 
   it('returns to the disconnected presentation when a manual retry fails', () => {
@@ -705,7 +1011,7 @@ describe('CliPanel copy action', () => {
     const copyBtn = screen.getByRole('button', { name: COPY_LABEL })
     copyBtn.focus()
     await act(async () => { fireEvent.click(copyBtn) })
-    expect(document.querySelector('textarea')).toBeNull()
+    expect(document.querySelector('textarea:not(.xterm-helper-textarea)')).toBeNull()
     expect(document.activeElement).toBe(copyBtn)
   })
 })
@@ -905,6 +1211,19 @@ describe('CliPanel theme and font sync', () => {
     expect(term.fontFamilyWrites).toHaveLength(writesBefore + 1)
     expect(fit.fit).not.toHaveBeenCalled()
   })
+
+  it('constructs a terminal with the default block cursor', () => {
+    const { term } = mount()
+    expect(term.options.cursorStyle).toBe('block')
+  })
+
+  it('pushes a cursor-style preference change onto every live terminal', () => {
+    const { term } = mount()
+    act(() => { setTerminalCursorStyle('bar') })
+    expect(term.options.cursorStyle).toBe('bar')
+    act(() => { setTerminalCursorStyle('underline') })
+    expect(term.options.cursorStyle).toBe('underline')
+  })
 })
 
 /* ── web font readiness ───────────────────────────────────────────────────── */
@@ -921,9 +1240,15 @@ describe('CliPanel web-font refit', () => {
 
   it('refits once the pending web fonts settle and after explicitly loading the terminal font', async () => {
     const load = vi.fn(() => Promise.resolve([]))
-    setFonts({ ready: Promise.resolve(), load })
+    // The terminal font is still loading when xterm opens, and has loaded by
+    // the time `ready` settles: that change is what earns a re-measure.
+    let loaded = false
+    let settle!: () => void
+    const ready = new Promise<void>(r => { settle = r })
+    setFonts({ ready, load, check: () => loaded })
     const { term, fit } = mount()
-    await act(async () => { await Promise.resolve() })
+    loaded = true
+    await act(async () => { settle(); await Promise.resolve() })
     // The pre-loaded family must match the terminal's configured stack — the
     // previous implementation hardcoded 'JetBrains Mono', which silently
     // missed any custom Terminal Font Family (Nerd Fonts, OpenDyslexicMono,

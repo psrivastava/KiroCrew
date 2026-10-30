@@ -35,6 +35,13 @@ _TS = "1780088134.952549"
 _CALLER = "dashboard:chat-1-1"
 
 
+def _slack_edits_only(_caller: str, transport: str, tool_name: str = "send_message") -> str | None:
+    """A ``channels`` policy double that permits only an ``update_message`` on Slack."""
+    if transport == "slack" and tool_name == "update_message":
+        return None
+    return f"{tool_name} via {transport} blocked by governance policy"
+
+
 # ── The advertisement ──
 
 
@@ -153,10 +160,13 @@ class TestUpdateMessageGates:
     def test_the_channels_vet_names_slack(self, caller) -> None:
         with (
             patch("kiro_crew.mcp_core._post") as post,
-            patch("kiro_crew.mcp_core._vet_channel_governance", return_value=None) as vet,
+            patch(
+                "kiro_crew.mcp_core._vet_channel_governance", side_effect=_slack_edits_only
+            ) as vet,
         ):
             post.return_value = {"ok": True}
-            _call_tool("update_message", {"channel": _CHANNEL, "ts": _TS, "text": "done"})
+            result = _call_tool("update_message", {"channel": _CHANNEL, "ts": _TS, "text": "done"})
+        assert not result.startswith("Error:"), result
         assert [call.args[1] for call in vet.call_args_list] == ["slack"]
         # The persisted governance record must name the edit, not a send that
         # never happened.
@@ -331,6 +341,31 @@ class TestUpdateMessageEndpoint:
             assert resp.status == 200
         sent_blocks = slack.update_message.await_args.args[3]
         assert "AKIAIOSFODNN7EXAMPLE" not in str(sent_blocks)
+
+    @pytest.mark.asyncio
+    async def test_remote_media_blocks_are_refused_on_edit(self) -> None:
+        """The edit path carries the same server-fetched-media boundary as send:
+        without it an agent could send clean blocks and EDIT remote media in —
+        Slack fetches Block Kit media regardless of unfurl flags."""
+        slack = _slack()
+        async with TestClient(TestServer(_make_app(_mock_state(slack)))) as client:
+            resp = await client.post(
+                "/api/update-message",
+                json={
+                    "channel": _CHANNEL,
+                    "ts": _TS,
+                    "blocks": [
+                        {
+                            "type": "image",
+                            "image_url": "https://attacker.example/pixel",
+                            "alt_text": "x",
+                        }
+                    ],
+                },
+            )
+            assert resp.status == 400
+            assert (await resp.json()).get("code") == "blocks_remote_media_disabled"
+        slack.update_message.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_a_markup_split_credential_in_blocks_is_redacted(self) -> None:

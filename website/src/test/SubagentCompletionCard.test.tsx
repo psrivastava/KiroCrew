@@ -74,10 +74,16 @@ describe('subagentCompletion parsing/detection', () => {
     // invented blank separator is what previously let the payload loss pass.
     const shapes: [string, string, string, string][] = [
       [
-        'Agent `53e3e5eb` ⚠️ orphaned by gateway restart',
+        'Agent `53e3e5eb` ✅ finished before gateway restart',
         'Result saved at: `/home/u/.kiro/crew/subagents/53e3e5eb/result.txt`\nUse the read tool to retrieve it.',
+        'ok',
+        'finished before gateway restart',
+      ],
+      [
+        'Agent `53e3e5eb` ⚠️ cut off mid-turn by gateway restart',
+        'Partial output saved at: `/home/u/.kiro/crew/subagents/53e3e5eb/result.txt`',
         'interrupted',
-        'orphaned by gateway restart',
+        'cut off mid-turn by gateway restart',
       ],
       [
         'Agent `53e3e5eb` ❌ lost to gateway restart',
@@ -238,6 +244,22 @@ describe('SubagentCompletionCard rendering', () => {
     expect(screen.getByText(`${'x'.repeat(120)}…`)).toBeTruthy()
   })
 
+  it('keeps an emoji whole when the headline cut lands mid-surrogate-pair', () => {
+    // 119 ASCII + 😀 (two UTF-16 units) straddles the 120-unit cap: a plain
+    // .slice(0, 120) keeps the emoji's lone high surrogate, which renders as
+    // U+FFFD. sliceCodePoints moves the end edge back off the pair, so the cut
+    // lands at 119 and the label ends cleanly in '…'.
+    const task = 'x'.repeat(119) + '😀' + 'y'.repeat(20)
+    const emojiTask = SINGLE.replace('Add TWO short UI labels to the GERMAN (de) catalog', task)
+    renderWithProviders(<SubagentCompletionCard message={msg(emojiTask)} />, { store: store() })
+    const shown = screen.getByText(`${'x'.repeat(119)}…`)
+    expect(shown).toBeTruthy()
+    // No lone surrogate reached the DOM.
+    const hasLoneSurrogate = (s: string) =>
+      /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/.test(s)
+    expect(hasLoneSurrogate(shown.textContent || '')).toBe(false)
+  })
+
   it('leaves a task that fits unmarked', () => {
     renderWithProviders(<SubagentCompletionCard message={msg()} />, { store: store() })
     expect(screen.getByText('Add TWO short UI labels to the GERMAN (de) catalog')).toBeTruthy()
@@ -279,21 +301,20 @@ describe('SubagentCompletionCard rendering', () => {
     expect(screen.queryByTitle('Open in the Subagents panel')).toBeNull()
   })
 
-  it('renders a restart orphan as a warning, expanded, with where the result landed', () => {
+  it('renders a run the restart cut off as a warning, expanded, with where its partial landed', () => {
     // No blank line before the payload — exactly as _notify_orphan composes it.
     const orphan = [
       '[Subagent completion event]',
-      'Agent `53e3e5eb` ⚠️ orphaned by gateway restart',
+      'Agent `53e3e5eb` ⚠️ cut off mid-turn by gateway restart',
       'Task: Add TWO short UI labels to the GERMAN (de) catalog',
-      'Result saved at: `/home/u/.kiro/crew/subagents/53e3e5eb/result.txt`',
-      'Use the read tool to retrieve it.',
+      'Partial output saved at: `/home/u/.kiro/crew/subagents/53e3e5eb/result.txt`',
     ].join('\n')
     renderWithProviders(<SubagentCompletionCard message={msg(orphan)} />, { store: store() })
     expect(screen.getByTestId('glyph-interrupted')).toBeTruthy()
     expect(screen.getByText('Interrupted')).toBeTruthy()
     // Opens expanded: the reader's next question is where the result went.
     expect(screen.getByText('Hide details')).toBeTruthy()
-    expect(screen.getByText(/orphaned by gateway restart/)).toBeTruthy()
+    expect(screen.getByText(/cut off mid-turn by gateway restart/)).toBeTruthy()
     expect(screen.getByText(/result\.txt/)).toBeTruthy()
   })
 
@@ -400,7 +421,7 @@ describe('structured meta path (the #1792 fix)', () => {
   it('carries an orphan note from meta into the payload', () => {
     const orphan = [
       '[Subagent completion event]',
-      'Agent `53e3e5eb` ⚠️ orphaned by gateway restart',
+      'Agent `53e3e5eb` ✅ finished before gateway restart',
       'Task: catalog work',
       'Result saved at: `/home/u/.kiro/crew/subagents/53e3e5eb/result.txt`',
     ].join('\n')
@@ -408,15 +429,15 @@ describe('structured meta path (the #1792 fix)', () => {
       subagentCompletion: {
         kind: 'single',
         agentId: '53e3e5eb',
-        outcome: 'interrupted',
+        outcome: 'ok',
         task: 'catalog work',
-        note: 'orphaned by gateway restart',
+        note: 'finished before gateway restart',
       },
     })!
     expect(p.kind).toBe('single')
     if (p.kind !== 'single') return
-    expect(p.outcome).toBe('interrupted')
-    expect(p.body).toContain('orphaned by gateway restart')
+    expect(p.outcome).toBe('ok')
+    expect(p.body).toContain('finished before gateway restart')
     // The result-path line survives via the no-blank-line agent split.
     expect(p.body).toContain('result.txt')
   })
@@ -499,12 +520,11 @@ describe('card containment', () => {
     // Focusable is not enough: pre-fix the only indicator was the UA
     // :focus-visible outline, which the card root's overflow-hidden clips to
     // a hairline on the top edge alone — an INSET ring is the one indicator
-    // its own clipping cannot swallow (WCAG 2.4.7). Each class is pinned
-    // literally — dropping any one silently removes the indicator.
-    expect(body.classList.contains('focus-visible:outline-hidden')).toBe(true)
-    expect(body.classList.contains('focus-visible:ring-2')).toBe(true)
-    expect(body.classList.contains('focus-visible:ring-inset')).toBe(true)
-    expect(body.classList.contains('focus-visible:ring-accent')).toBe(true)
+    // its own clipping cannot swallow (WCAG 2.4.7). The shared
+    // `focus-ring-accent-inset` utility paints that inset ring plus an opaque
+    // `--text-strong` hairline so it also clears WCAG 1.4.11's 3:1 non-text
+    // contrast in every theme (issue #4428); dropping it removes the indicator.
+    expect(body.classList.contains('focus-ring-accent-inset')).toBe(true)
   })
 })
 

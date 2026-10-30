@@ -27,6 +27,7 @@ import kiro_crew.dashboard.handlers.steering as steering_mod
 from kiro_crew.dashboard.handlers._shared import active_project_dir, active_project_state
 from kiro_crew.dashboard.handlers.steering import (
     _STEERING_META_MAX_CHARS,
+    MAX_STEERING_NAME_BYTES,
     STEERING_FILE_MAX_BYTES,
     STEERING_INCLUSION_DEFAULT,
     STEERING_INCLUSION_MODES,
@@ -65,10 +66,18 @@ def _write_steering(root: Path, rel: str, body: str = "# Title\nrules\n") -> Pat
     return path
 
 
+#: The subject ``_make_app``'s identity middleware presents, and the id ``_state``
+#: reports as its owner. Steering writes are owner-only, so a suite about file
+#: resolution and content handling models the owner's own session.
+_OWNER_SUBJECT = "U0OWNER0000"
+
+
 def _state(project: str | Path | None = None, *, restricted: bool = False):
     """A MagicMock DashboardState exposing one slot with a project dir."""
     slot = MagicMock(project=str(project) if project else "", is_restricted=restricted)
-    return MagicMock(_slots={"default": slot}, _restricted_keys=set())
+    return MagicMock(
+        _slots={"default": slot}, _restricted_keys=set(), owner_id=_OWNER_SUBJECT
+    )
 
 
 def _project_headers(project: str | Path) -> dict[str, str]:
@@ -80,8 +89,22 @@ def _project_headers(project: str | Path) -> dict[str, str]:
     return {STEERING_PROJECT_HEADER: _project_key(Path(project))}
 
 
+@web.middleware
+async def _owner_identity(request, handler):
+    """What ``token_auth`` publishes for the owner's own dashboard session.
+
+    Without it these requests carry no dashboard-user claim at all, and the
+    owner gate on the write routes refuses them before the assertion each test is
+    about. The restricted-session rows are unaffected: ``_blocked`` runs first and
+    still answers for a restricted tab, owner or not.
+    """
+    request["user"] = _OWNER_SUBJECT
+    request["app"] = ""
+    return await handler(request)
+
+
 def _make_app(state):
-    app = web.Application()
+    app = web.Application(middlewares=[_owner_identity])
     app["state"] = state
     app.router.add_get("/api/steering", api_steering)
     app.router.add_post("/api/steering", api_steering_create)
@@ -465,6 +488,7 @@ class TestLinkedEntries:
         entry = by_key["user/conventions.md"]
         assert entry["linked"] is True
         assert entry["editable"] is False
+        assert entry["readable"] is True
         # The description comes from the TARGET's head, and the resolved
         # target travels with the entry (home collapsed to ``~``). Display
         # paths are OS-native, so fold the separator before comparing.
@@ -488,10 +512,88 @@ class TestLinkedEntries:
         assert [f["key"] for f in out["files"]] == []
         assert "nope" not in json.dumps(out)
 
-    def test_link_escaping_home_stays_hidden(self, fake_home, tmp_path):
-        outside = tmp_path / "outside.md"
+    def test_link_escaping_home_lists_by_name_only(self, fake_home, tmp_path):
+        """kiro-cli loads a link wherever it points, so the tab lists it.
+
+        The entry names the link and nothing about its target: no target path,
+        size or head metadata, and ``readable`` is False.
+        """
+        outside = tmp_path / "workplace" / "outside.md"
+        outside.parent.mkdir()
+        outside.write_text("# Outside heading\nbody-token-xyz\n", encoding="utf-8")
+        self._link(fake_home, "outside.md", outside)
+
+        out = list_steering_blocking(None)
+        assert [f["key"] for f in out["files"]] == ["user/outside.md"]
+        entry = out["files"][0]
+        assert entry["linked"] is True
+        assert entry["editable"] is False
+        assert entry["readable"] is False
+        assert entry["target"] == ""
+        assert entry["size"] == 0
+        assert entry["description"] == ""
+        dumped = json.dumps(out)
+        assert "Outside heading" not in dumped
+        assert "body-token-xyz" not in dumped
+        assert str(outside.parent) not in dumped
+
+    def test_link_escaping_home_never_opens_or_stats_target(
+        self, fake_home, tmp_path, monkeypatch
+    ):
+        """The outside target is judged from its resolved path, never touched."""
+        outside = tmp_path / "workplace" / "outside.md"
+        outside.parent.mkdir()
         outside.write_text("# Outside\n", encoding="utf-8")
         self._link(fake_home, "outside.md", outside)
+        touched: list[str] = []
+        real_stat = Path.stat
+        real_open = os.open
+
+        def spy_stat(self, *args, **kwargs):
+            if Path(self) == outside:
+                touched.append("stat")
+            return real_stat(self, *args, **kwargs)
+
+        def spy_open(path, *args, **kwargs):
+            if Path(path) == outside:
+                touched.append("open")
+            return real_open(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "stat", spy_stat)
+        monkeypatch.setattr(os, "open", spy_open)
+        assert [f["key"] for f in list_steering_blocking(None)["files"]] == ["user/outside.md"]
+        assert touched == []
+
+    def test_link_to_the_trust_base_itself_stays_hidden(self, fake_home):
+        """A link to $HOME is a directory inside the base, not an outside file."""
+        root = fake_home / ".kiro" / "steering"
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "home.md").symlink_to(fake_home, target_is_directory=True)
+        assert list_steering_blocking(None)["files"] == []
+
+    @pytest.mark.asyncio
+    async def test_read_endpoint_refuses_link_escaping_home(self, fake_home, tmp_path):
+        outside = tmp_path / "outside.md"
+        outside.write_text("# Outside\nbody-token-xyz\n", encoding="utf-8")
+        self._link(fake_home, "outside.md", outside)
+        async with TestClient(TestServer(_make_app(_state()))) as client:
+            resp = await client.get("/api/steering/user/outside.md")
+            assert resp.status == 404
+            assert "body-token-xyz" not in await resp.text()
+
+    def test_link_to_sensitive_target_outside_home_stays_hidden(
+        self, fake_home, tmp_path, monkeypatch
+    ):
+        secret = tmp_path / "vault" / "secret.md"
+        secret.parent.mkdir()
+        secret.write_text("key\n", encoding="utf-8")
+        self._link(fake_home, "innocent.md", secret)
+        real = steering_mod.is_sensitive_path
+        monkeypatch.setattr(
+            steering_mod,
+            "is_sensitive_path",
+            lambda p, *a, **k: Path(p) == secret.resolve() or real(p, *a, **k),
+        )
         assert list_steering_blocking(None)["files"] == []
 
     def test_dangling_link_stays_hidden(self, fake_home):
@@ -528,7 +630,7 @@ class TestLinkedEntries:
         # The target itself is also a plain listed document.
         assert by_key["workspace/shared/conventions.md"]["linked"] is False
 
-    def test_workspace_link_to_project_file_outside_root_stays_hidden(self, fake_home, tmp_path):
+    def test_workspace_link_to_project_file_outside_root_is_never_read(self, fake_home, tmp_path):
         """A repository-committed link must not read project files through steering.
 
         ``workspace`` has no session loader following links (kiro-cli reads the
@@ -544,12 +646,16 @@ class TestLinkedEntries:
         root.mkdir(parents=True)
         (root / "leak.md").symlink_to(env)
         out = list_steering_blocking(proj)
-        assert [f["key"] for f in out["files"]] == []
+        # Listed by name only: the target is outside the steering root, so its
+        # bytes, path and size never reach the response.
+        assert [(f["key"], f["readable"], f["target"]) for f in out["files"]] == [
+            ("workspace/leak.md", False, "")
+        ]
         assert "nope" not in json.dumps(out)
         assert resolve_steering_file("workspace/leak.md", proj, follow_links=True) is None
 
-    def test_workspace_link_escaping_project_stays_hidden(self, fake_home, tmp_path):
-        """A link out of the project entirely (into $HOME) is likewise hidden."""
+    def test_workspace_link_escaping_project_lists_by_name_only(self, fake_home, tmp_path):
+        """A link out of the project (into $HOME) is listed, never read."""
         notes = fake_home / ".config" / "notes.md"
         notes.parent.mkdir(parents=True)
         notes.write_text("home file a repo link must not reach\n", encoding="utf-8")
@@ -557,8 +663,11 @@ class TestLinkedEntries:
         root = proj / ".kiro" / "steering"
         root.mkdir(parents=True)
         (root / "notes.md").symlink_to(notes)
-        entries = list_steering_blocking(proj)["files"]
-        assert [f["key"] for f in entries] == []
+        out = list_steering_blocking(proj)
+        assert [f["key"] for f in out["files"]] == ["workspace/notes.md"]
+        entry = out["files"][0]
+        assert (entry["readable"], entry["editable"], entry["target"]) == (False, False, "")
+        assert "must not reach" not in json.dumps(out)
         assert resolve_steering_file("workspace/notes.md", proj, follow_links=True) is None
 
     @pytest.mark.asyncio
@@ -634,7 +743,9 @@ class TestProjectResolution:
             f"slot{i}": MagicMock(project=str(p), is_restricted=False)
             for i, p in enumerate(projects)
         }
-        return MagicMock(_slots=slots, _restricted_keys=set())
+        return MagicMock(
+            _slots=slots, _restricted_keys=set(), owner_id=_OWNER_SUBJECT
+        )
 
     def test_single_shared_project_is_used(self, fake_home, tmp_path):
         proj = tmp_path / "proj"
@@ -695,7 +806,9 @@ class TestProjectStateReason:
             f"slot{i}": MagicMock(project=str(p), is_restricted=False)
             for i, p in enumerate(projects)
         }
-        return MagicMock(_slots=slots, _restricted_keys=set())
+        return MagicMock(
+            _slots=slots, _restricted_keys=set(), owner_id=_OWNER_SUBJECT
+        )
 
     def test_single_slot_with_project_is_set(self, fake_home, tmp_path):
         proj = tmp_path / "proj"
@@ -1549,3 +1662,40 @@ class TestProjectPrecondition:
             resp = await client.get("/api/steering/workspace/api.md")
             assert resp.status == 200
             assert (await resp.json())["content"] == "# body\n"
+
+
+# ── Name length bound ──
+#
+# ``_safe_rel_name`` screens the character set but not the length, so a long name
+# would reach the write and the host would refuse the joined path for its length
+# (POSIX ENAMETOOLONG; a Windows host without LongPathsEnabled a bare
+# FileNotFoundError from CreateFileW), surfacing as an uncoded 500. The create
+# bounds the byte length first and answers a coded 400 on every host.
+
+
+class TestNameLengthBound:
+    @pytest.mark.asyncio
+    async def test_over_budget_name_is_coded_400(self, fake_home):
+        long_name = "a" * (MAX_STEERING_NAME_BYTES + 1)
+        async with TestClient(TestServer(_make_app(_state()))) as client:
+            resp = await client.post(
+                "/api/steering", json={"name": long_name, "content": "x"}
+            )
+            assert resp.status == 400
+            data = await resp.json()
+        assert data["code"] == "name_too_long"
+        # Nothing written: the refusal precedes the create.
+        assert not (fake_home / ".kiro" / "steering" / f"{long_name}.md").exists()
+
+    @pytest.mark.asyncio
+    async def test_at_budget_name_is_created(self, fake_home):
+        # "<stem>.md" exactly at the budget is accepted and written.
+        stem = "b" * (MAX_STEERING_NAME_BYTES - len(".md"))
+        async with TestClient(TestServer(_make_app(_state()))) as client:
+            resp = await client.post(
+                "/api/steering", json={"name": stem, "content": "# ok\n"}
+            )
+            assert resp.status == 200
+            key = (await resp.json())["key"]
+        assert key == f"user/{stem}.md"
+        assert (fake_home / ".kiro" / "steering" / f"{stem}.md").read_text() == "# ok\n"

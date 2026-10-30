@@ -270,7 +270,8 @@ class TestPowerShellExpressionInvocation:
         # collected names are inert built-ins, so `_program_refusal` returns
         # None and `name_grant_refusal` auto-approves. With the guard, the
         # WALK refuses and no downstream check ever runs.
-        assert name_grant._program_names_line(r"& (Get-Content .\program.txt) echo") is None
+        with pytest.raises(name_grant._Unmodelled):
+            name_grant._program_names_line(r"& (Get-Content .\program.txt) echo")
         # Pin that the walk output IS what the exploit relies on when the
         # guard is absent: the two names the walk WOULD collect are both inert.
         # A repair that leaves the walk returning them but refuses "for another
@@ -278,6 +279,28 @@ class TestPowerShellExpressionInvocation:
         # this pins the class rather than one downstream tier's answer.
         for name in ("Get-Content", "echo"):
             assert name.lower() in name_grant._WINDOWS_INERT_BUILTINS
+
+    @pytest.mark.parametrize(
+        "command,part",
+        [
+            (r"& (Get-Content .\p.txt) echo", "the call operator '&' before the expression '('"),
+            (r". $env:SCRIPT", "the dot-source operator '.' before the expression '$env:SCRIPT'"),
+            ("$env:COMSPEC /c x", "the expression '$env:COMSPEC' in a command position"),
+            ("echo ok; <# c #> evil", "a PowerShell <# ... #> block comment"),
+            ("FOO=bar echo x", "'FOO=', which PowerShell reads as a command"),
+        ],
+    )
+    def test_the_refusal_names_the_windows_part(self, win, command, part):
+        refusal = name_grant.name_grant_refusal(command)
+        assert refusal is not None
+        assert refusal.code == name_grant.UNTOKENIZABLE
+        assert part in refusal.detail
+
+    def test_a_scriptblock_assignment_value_is_never_shown(self, win):
+        refusal = name_grant.name_grant_refusal('{$p="s3cret"} x')
+        assert refusal is not None
+        assert "the expression '{$p=' in a command position" in refusal.detail
+        assert "s3cret" not in refusal.detail
 
     @pytest.mark.parametrize(
         "command,expected",
@@ -1024,6 +1047,24 @@ class TestAbsolutePathsNative:
         assert paths is not None
         assert len(paths) == len(platform_compat._POWERSHELL_USER_PROFILES)
         assert all(os.path.splitdrive(p)[0] for p in paths)
+
+
+class TestAgentWritableRootContainment:
+    """``_within`` on the host's own path flavour, so it runs on every platform."""
+
+    def test_a_drive_root_contains_every_path_below_it(self, tmp_path):
+        # A project dir at a drive root (`H:\`, or `/`) keeps its trailing separator;
+        # `root + os.sep` would then prefix nothing, and a program planted anywhere
+        # below it would be honoured on its name alone.
+        inside = os.path.normcase(str(tmp_path / "repo" / "bin" / "tool"))
+        drive_root = os.path.normcase(os.path.splitdrive(str(tmp_path))[0] + os.sep)
+        assert name_grant._within(inside, (drive_root,)) is True
+
+    def test_a_sibling_of_a_root_is_not_inside_it(self, tmp_path):
+        root = os.path.normcase(str(tmp_path / "workspace"))
+        assert name_grant._within(root + "-other" + os.sep + "tool", (root,)) is False
+        assert name_grant._within(root + os.sep + "tool", (root,)) is True
+        assert name_grant._within(root, (root,)) is True
 
 
 class TestOffLoop:

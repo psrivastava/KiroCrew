@@ -22,7 +22,7 @@ nothing, so the page rendered the interactive median and called it the system's
 health. There was also no way to see how many background turns had run at all.
 
 **The shared boundary is the usage row, not the ACP turn.** The obvious
-candidate was ``acp/session_handle.py::SessionHandle._run_turn``, which every
+candidate was ``acp/session_handle_turn.py::AcpSessionHandle._run_turn``, which every
 ACP-backed surface really does cross. It was rejected: the handle knows only its
 ACP ``sessionId``, not the Kiro Crew session key this metric must group by, and
 an ``AcpClient``-backed session (the claude_code backend) never reaches it at
@@ -46,6 +46,7 @@ from __future__ import annotations
 import logging
 
 from kiro_crew.messaging.link import telemetry_channel_of
+from kiro_crew.metrics.harness import ATTR_HARNESS, HARNESS_UNKNOWN
 from kiro_crew.metrics.provider import get_recorder
 
 logger = logging.getLogger(__name__)
@@ -176,8 +177,20 @@ def emit_turn_duration(
     elapsed_ms: int | float | None = None,
     model: str = "",
     provider: str = "",
+    harness: str = HARNESS_UNKNOWN,
 ) -> None:
     """Emit one ``kirocrew.turn.duration`` sample (best-effort, never raises).
+
+    ``harness`` is the EFFECTIVE harness of the session that ran the turn, as
+    :func:`kiro_crew.metrics.harness.harness_of` resolved it from the live
+    provider at the emit site. It is always sent, and a caller that passes
+    nothing is recorded as ``unknown``. It is written as given: ``harness_of``
+    already maps every input into
+    :data:`~kiro_crew.metrics.harness.HARNESS_VALUES`, so the set stays closed
+    without a second check here. ``provider``
+    cannot answer "which harness" (``acp`` covers kiro-cli, Codex and others),
+    which is why this is a separate attribute. Only this instrument carries it
+    for now; the usage family below does not.
 
     ``duration_ms`` is the provider-reported duration and ``elapsed_ms`` the
     locally measured wall clock; the first non-zero wins. Both are needed
@@ -196,8 +209,8 @@ def emit_turn_duration(
     the transport namespace for a channel key, a local label for the rest,
     ``other`` for a shape it does not recognise. Deliberately NOT
     ``validation.infer_use_case``, whose output also gates an artifact check
-    (``handlers/artifacts.py``) — a metric must not be the reason an
-    authorization-adjacent mapping grows a case.
+    (``handlers/artifacts_parts/record_serialization.py``) — a metric must not be
+    the reason an authorization-adjacent mapping grows a case.
 
     Caveat on what the wall clock measures: ``elapsed_ms`` runs from the start
     of the turn, so a turn parked on an interactive tool-approval prompt counts
@@ -225,6 +238,7 @@ def emit_turn_duration(
     except Exception:
         pass
     attrs.update(_model_attrs(model, provider))
+    attrs[ATTR_HARNESS] = harness
     try:
         get_recorder().histogram(TURN_METRIC, value, unit="ms", attrs=attrs)
     except Exception:

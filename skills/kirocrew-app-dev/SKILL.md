@@ -1,11 +1,11 @@
 ---
 name: kirocrew-app-dev
-description: "Build, package, and publish KiroCrew external apps. Covers app.json manifest, UI components, crons, skills, self-healing install, git publishing, and common pitfalls."
+description: "Build, package, and publish Kiro Crew external apps. Covers app.json manifests, UI components, crons, skills, lifecycle hooks, development mode, registry publishing, and common pitfalls."
 ---
 
-# KiroCrew App Development
+# Kiro Crew App Development
 
-Guide for building external KiroCrew apps that work reliably across KiroCrew versions without depending on buggy lifecycle hooks or skill scanner behavior.
+Guide for building external Kiro Crew apps against the current App Kit manifest, lifecycle, UI SDK, and registry contracts. The canonical field and API references live in [App Kit](../../docs/app-kit/README.md).
 
 ## When to Use
 
@@ -25,7 +25,7 @@ my-app/
 │   └── my-skill/
 │       └── SKILL.md      # Skill spec
 ├── scripts/
-│   ├── install.sh        # Optional accelerator (NOT required)
+│   ├── install.sh        # Optional registry-install setup hook
 │   └── uninstall.sh      # Cleanup script
 └── README.md             # Optional docs
 ```
@@ -46,7 +46,7 @@ my-app/
   "crons": [
     {
       "name": "my-cron",
-      "message": "FIRST (self-heal, run these bash commands silently): ... THEN do the actual work.",
+      "message": "Run the scheduled app workflow.",
       "every": 900,
       "silent": true,
       "persistent_session": false
@@ -60,22 +60,24 @@ my-app/
     }
   ],
   "permissions": {
+    "api": ["/api/apps/my-app/config", "/api/chat", "/api/chat/*"],
     "mcpTools": ["local_knowledge_search", "send_message"],
-    "network": true
+    "network": true,
+    "cron": true
   },
   "ui": {
     "entry": "index.mjs",
     "pages": [
       {
-        "route": "/my-app",
+        "route": "/apps/my-app",
         "label": "My App",
         "iconUrl": "icon.svg"
       }
     ]
   },
   "setup": {
-    "onInstall": "scripts/install.sh",
-    "onUninstall": "scripts/uninstall.sh"
+    "onInstall": "bash scripts/install.sh",
+    "onUninstall": "bash scripts/uninstall.sh"
   }
 }
 ```
@@ -84,41 +86,41 @@ my-app/
 
 | Field | Rule | Why |
 |-------|------|-----|
-| `skills` | Use string paths `["skills/my-skill"]` | Object format `[{name, path}]` breaks — parser stringifies dicts |
-| `permissions` | Must be an **object** with keys `api` / `events` / `mcpTools` / `storage` / `network` / `memory` / `cron` — not a flat list | `AppManifest.from_dict` only calls `Permissions.from_dict` when the value is a dict; a list silently parses to an empty `Permissions()`, granting nothing |
-| `resources` | Must be array of strings `["tool1", "tool2"]` | Object format or nested arrays break resource resolution |
-| `ui.entry` | Must be `.mjs` ESM module | `.html` not in allowed extensions |
-| `ui.pages[].iconUrl` | Use `icon.svg` file path | String `icon` field only works for builtin apps |
+| `skills` | Prefer canonical string paths `["skills/my-skill"]` | Legacy object entries with `path` or `name` are normalized by `AppManifest.from_dict`, but the public manifest schema is `string[]` |
+| `permissions` | Must be an **object**; supported grants are `api`, `events`, `mcpTools`, `storage`, `network`, `memory`, `cron`, `sessionApproval`, `spawn`, `jobs`, and `exposeToApps` | A non-object parses to empty permissions, and malformed capability grants fail closed |
+| `resources` | Omit from `app.json`; declare app resources with `agents`, `skills`, `sops`, and `mcpServers` | `resources` is install/registry ownership metadata (`"gateway"` or `"app"`), not an app-manifest resource array |
+| `ui.entry` | Use an ESM `.mjs` bundle; `.js` is also served | HTML is not in the app UI static-file allowlist |
+| `ui.pages[].iconUrl` | Use an app-relative image path for a custom icon | `ui.pages[].icon` also works for supported host Lucide names and falls back to `Package` |
+| `ui.loading.layout` | Optional: `"page"` (default), `"rail"`, `"centered"` or `"split"`, e.g. `"loading": { "layout": "rail" }`. Pick the one closest to your first paint | The dashboard shows nothing for 300 ms, then this placeholder shape until the bundle mounts. It is a closed set the host draws; no custom markup or CSS. Anything else, including `"Rail"`, falls back to `"page"` |
 | `displayName` | Required | Gateway uses it for UI display |
-| `version` | Semver string | Used by update-check crons for comparison |
+| `version` | Semver string | Used by the App Store registry to compute `updateAvailable` |
 | `crons[].timezone` | IANA zone name; omit it only when the hour is zone-agnostic | An empty timezone falls back to the gateway config's zone and then to **UTC**, so `"cron_expr": "0 6 * * *"` without it fires at 06:00 UTC — the wrong calendar day for most users. A per-USER zone is not manifest data: pass `timezone=` to `ctx.cron.add_job` instead |
 | `crons[].skip_dates` | Zero-padded `YYYY-MM-DD`, evaluated in `timezone` | `"2026-1-1"` parses but never matches the padded fire-time rendering, so the skip silently does nothing. Both fields are rejected at manifest validation, not at fire time |
+| `crons[].timeout` / `crons[].timeout_secs` | Set both on a `script` cron that runs longer than 30s, e.g. `"timeout": 60, "timeout_secs": 65` | Omitted, a script is killed at 30s and a command at 300s. `timeout_secs` must cover `timeout` plus 5s of cleanup; a pair the cron SDK would refuse is rejected at manifest validation |
 
-## Self-Healing Pattern (CRITICAL)
+## Lifecycle and Resource Registration (CRITICAL)
 
-**Never depend on:**
-- `onInstall` hook firing (unreliable across KiroCrew versions)
-- `_register_skills` parsing correctly (flat namespace bug)
-- Manual user intervention post-install
+Do not make a cron mutate the installed app tree or create skill links. When an
+app is enabled, the gateway registers its declared agents, skills, SOPs, MCP
+servers, and crons; gateway startup reconciles enabled app resources again.
 
-**Instead, make the cron self-heal on first run:**
+Lifecycle scripts have explicit scope:
 
-```
-"message": "FIRST (self-heal, run these bash commands silently):
-  (1) Skill symlink: if ~/.kiro/crew/skills/MY-SKILL/SKILL.md does not exist,
-      run: ln -sfn ~/.kiro/crew/apps/MY-APP/skills/MY-SKILL ~/.kiro/crew/skills/MY-SKILL
-  (2) State dir: mkdir -p ~/.kiro/crew/workspace/MY-APP && [ -f ~/.kiro/crew/workspace/MY-APP/state.json ] || echo '{}' > ~/.kiro/crew/workspace/MY-APP/state.json
-  (3) Config for UI: mkdir -p ~/.kiro/crew/apps/MY-APP/data && [ -f ~/.kiro/crew/apps/MY-APP/data/config.json ] || echo '{...resolved paths...}' > ~/.kiro/crew/apps/MY-APP/data/config.json
-  THEN do the actual work..."
-```
+- A local-path `kirocrew app install <dir>` copies the app but intentionally does
+  not run `setup.onInstall`; build the local source before installing it.
+- A registry install runs `setup.onInstall` in the cloned source before copying
+  it into the data home. Keep that hook idempotent.
+- `setup.onEnable` / `onDisable` run around enablement, and `onUninstall` is only
+  for external state Kiro Crew cannot remove itself.
 
-**Keep install.sh as an optional accelerator** — users who want instant setup can run it manually, but the app works without it within one cron cycle.
+Keep runtime data under the app's `data/` directory. The gateway owns registered
+resource links and scheduler entries; app code must not recreate them manually.
 
 ## UI Development
 
 ### Design System
 
-All Kiro Crew apps MUST use the same visual language for consistency. Colors come
+Kiro Crew apps should default to the host visual language. Colors come
 from the theme tokens (`var(--accent)` and friends) — see "Don't Reinvent the
 Dashboard" below, which is the normative rule. The hex values here are the legacy
 palette, kept for apps that predate the tokens and as the fallback inside
@@ -127,7 +129,7 @@ one only when a deliberate custom style is the point.
 
 | Element | Style |
 |---------|-------|
-| **Styling method** | Inline `style={}` objects. NO Tailwind classes. |
+| **Styling method** | Prefer `@kirocrew/app-sdk/ui` components and theme tokens; CSS, host utility classes, or inline styles are all valid. |
 | **Primary accent** | `var(--accent)` (legacy: `#7c3aed`) |
 | **Light accent bg** | legacy `#e8d5f5` |
 | **Success color** | `#047857` (green) |
@@ -166,16 +168,17 @@ _jsx('button', {
 
 ### Reference Implementation
 
-For a working example, look at the bundled builtin apps under
-`src/kiro_crew/apps/builtins/` — they follow the same manifest, UI, and cron
-patterns described here and are a good starting point to copy from.
+For a working example, use `docs/app-kit/examples/`, which contains installable
+external-app patterns. Builtins under `src/kiro_crew/apps/builtins/` are useful
+for UI idioms, but their backend and lifecycle contracts differ from external
+apps.
 
 Visual mock of the target style:
 
 ```html
 <!--
-  This is what a KiroCrew app header + card should look like.
-  Copy this pattern exactly — colors, spacing, border-radius, font sizes.
+  Legacy geometry reference for a Kiro Crew app header and card.
+  Use host components and theme tokens instead of copying the hardcoded colors.
 -->
 <div style="max-width:1200px; margin:0 auto; padding:16px; font-family:system-ui; color:#e2e8f0; background:#1a1b26">
 
@@ -228,38 +231,27 @@ Key visual rules from the mock:
 ```javascript
 import { useState, useEffect } from 'react'
 import { jsx as _jsx, jsxs as _jsxs, Fragment as _Fragment } from 'react/jsx-runtime'
-import { useNavigate } from '@kirocrew/app-sdk'
-
-let STATE_PATH = ''
-let APP_VERSION = ''
-let CONFIG_MISSING = false
-const _configReady = fetch('/api/apps/MY-APP/config').then(r => r.ok ? r.json() : null).then(cfg => {
-  if (cfg && cfg.statePath) { STATE_PATH = cfg.statePath }
-  else { CONFIG_MISSING = true }
-}).then(() => {
-  const appJsonPath = STATE_PATH.replace('/workspace/MY-APP/state.json', '/apps/MY-APP/app.json')
-  return fetch('/api/file-read?path=' + encodeURIComponent(appJsonPath))
-    .then(r => r.ok ? r.text() : null)
-    .then(t => { if (t) { try { APP_VERSION = JSON.parse(t).version || '' } catch {} } })
-}).catch(() => { CONFIG_MISSING = true })
+import { useAppApi, useAppInfo, useNavigate } from '@kirocrew/app-sdk'
 
 export default function MyApp() {
   const [state, setState] = useState({})
   const [loading, setLoading] = useState(true)
+  const api = useAppApi()
+  const { version: appVersion } = useAppInfo()
   const navigate = useNavigate()
 
   useEffect(() => {
     async function load() {
-      await _configReady
-      if (!STATE_PATH) { /* show initializing message */ return }
-      const resp = await fetch('/api/file-read?path=' + encodeURIComponent(STATE_PATH))
-      if (resp.ok) setState(JSON.parse(await resp.text()))
-      setLoading(false)
+      try {
+        setState(await api.get('/api/apps/MY-APP/config'))
+      } finally {
+        setLoading(false)
+      }
     }
     load()
     const interval = setInterval(load, 30000) // 30s polling
     return () => clearInterval(interval)
-  }, [])
+  }, [api])
 
   // ... render UI
 }
@@ -267,17 +259,16 @@ export default function MyApp() {
 
 ### Version Source (IMPORTANT)
 
-**Read version from `app.json` via `/api/file-read`**, not from `data/config.json` (stale install-time value) and not from `/api/apps/MY-APP` (requires session auth the iframe doesn't have).
+Read the installed manifest version from `useAppInfo()`. The host mounts external
+apps inside `AppApiProvider` and supplies `{name, version, permissions, active}`;
+apps are not iframes and do not need to derive absolute data-home paths.
 
 ```javascript
-// After _configReady resolves and you know the app path:
-const appJsonPath = '/Users/.../.kiro/crew/apps/my-app/app.json'
-fetch('/api/file-read?path=' + encodeURIComponent(appJsonPath))
-  .then(r => r.ok ? r.text() : null)
-  .then(t => { if (t) APP_VERSION = JSON.parse(t).version })
+const { version: appVersion } = useAppInfo()
 ```
 
-Derive the path from `STATE_PATH` (replace `workspace/my-app/state.json` with `apps/my-app/app.json`) or hardcode it based on the app name.
+Do not cache a version in `data/config.json`, hardcode a user-specific install
+path, or bypass the scoped SDK with `/api/file-read` just to read `app.json`.
 
 ### Header Layout Pattern
 
@@ -311,7 +302,7 @@ _jsxs('div', {
 
 ### Background Actions (MANDATORY)
 
-**All buttons that trigger agent work MUST run in the background** via `POST /api/chat?ws=1`. NEVER navigate to `/chat` for automated actions — the user should stay on the app page.
+**All buttons that trigger agent work MUST run in the background** through the permission-scoped `useAppApi()` client and `POST /api/chat?ws=1`. NEVER navigate to `/chat` for automated actions — the user should stay on the app page.
 
 ```javascript
 // Refresh button (background)
@@ -319,10 +310,9 @@ _jsx('button', {
   disabled: refreshing,
   onClick: async () => {
     setRefreshing(true)
-    await fetch('/api/chat?ws=1', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message: 'Run the workflow...', slot: 'my-app-refresh' })
+    await api.post('/api/chat?ws=1', {
+      message: 'Run the workflow...',
+      slot: 'my-app-refresh'
     }).catch(() => {})
     setTimeout(() => setRefreshing(false), 5000)
   },
@@ -330,13 +320,12 @@ _jsx('button', {
   children: refreshing ? '↻ Running…' : '↻ Refresh'
 })
 
-// Version pill (background update check)
+// Version link (host-managed update details)
 _jsx('button', {
-  disabled: checking,
-  onClick: () => { /* POST to /api/chat?ws=1 with update-check slot */ },
-  title: 'Check for updates',
-  style: { background: 'none', color: 'var(--muted)', border: 'none', padding: '2px 6px', fontSize: '10px', cursor: checking ? 'default' : 'pointer' },
-  children: checking ? 'checking...' : `v${appVersion || '?'}`
+  onClick: () => navigate('/apps/detail/my-app'),
+  title: 'Open App Store details',
+  style: { background: 'none', color: 'var(--muted)', border: 'none', padding: '2px 6px', fontSize: '10px', cursor: 'pointer' },
+  children: `v${appVersion || '?'}`
 })
 ```
 
@@ -346,27 +335,34 @@ _jsx('button', {
 
 | Do | Don't |
 |----|-------|
-| Use inline `style={}` objects everywhere | Use Tailwind classes |
-| Use 30s polling via `setInterval` + `/api/file-read` | Use `/api/file-watch` SSE (overwrites React state on connect) |
+| Prefer host components and theme tokens | Assume inline styles or Tailwind are mandatory |
+| Use `useAppApi()` with an app-owned route or config endpoint | Bypass the permission-scoped SDK with raw `fetch` |
 | Use `useNavigate()` from `@kirocrew/app-sdk` for navigation | Use `window.location` (causes full reload) |
 | Use theme vars for backgrounds/text/borders | Hardcode hex for theme-dependent colors |
 | Use theme tokens (`var(--accent)`) for accent elements | Hardcode `#7c3aed` outside a `var(--accent, …)` fallback |
-| Read version from `app.json` via `/api/file-read` | Read version from `data/config.json` (stale) or `/api/apps/MY-APP` (needs session auth) |
-| Run background work via `POST /api/chat?ws=1` | Navigate to `/chat` for automated actions |
-| Show "initializing" state when config missing | Show cryptic error messages |
-| Read state from file via `/api/file-read?path=...` | Use non-existent endpoints like `/api/files/read` |
+| Read version from `useAppInfo()` | Read version from `data/config.json` or derive an absolute install path |
+| Run background work through `useAppApi().post('/api/chat?ws=1', ...)` | Navigate to `/chat` for automated actions |
+| Show a loading/error state when config is unavailable | Show cryptic error messages |
+| Read app state through an app-owned API or `/api/apps/MY-APP/config` | Derive arbitrary absolute data-home paths in UI code |
+
+When app UI moves, or draws a live figure such as a gauge or a diagram, the
+`living-ui` skill's rules apply to it too. An app may bundle that skill's
+toolkit, `toolkit/living-ui.js`, instead of inlining its helper blocks. The file
+exports nothing, so end the app's copy with `export { LivingUI };` and import it.
 
 ### Available Gateway APIs
 
 | Endpoint | Method | Returns |
 |----------|--------|---------|
-| `/api/apps/MY-APP` | GET | Full manifest JSON — requires session auth (NOT usable from app iframe) |
-| `/api/apps/MY-APP/config` | GET | JSON from `data/config.json` (no auth needed, but version is stale) |
-| `/api/file-read?path=...` | GET | text/plain file content |
+| `/api/apps/MY-APP` | GET | Full manifest JSON through authenticated, permission-scoped app access |
+| `/api/apps/MY-APP/config` | GET/PUT | App-owned JSON config; declare it in `permissions.api` |
+| `/api/project/tree` | GET | Active-project tree when declared in `permissions.api` |
 | `/api/chat?ws=1` | POST | Launches agent work in background slot |
 | `/api/file-watch` | GET (SSE) | Live file change stream (avoid — see above) |
 
-**No directory listing API exists.** Use a `_index.json` manifest file if you need to list files.
+`/api/project/tree` lists the active project when the app declares that API
+permission. For an app-owned data directory, keep a bounded `_index.json` instead
+of asking for arbitrary filesystem traversal.
 
 ### Available Imports (via shared import map)
 
@@ -385,10 +381,12 @@ _jsx('button', {
 
 ### Interactive Elements (Chat Launch)
 
-Only for actions requiring human interaction:
+For actions requiring human interaction, use the supported launcher rather than
+writing the host's private global directly:
+
 ```javascript
-window.__mc_chat_launch = { message: "Your prompt here", ts: Date.now() }
-navigate('/chat')
+const { openChat } = useChatLauncher()
+openChat({ message: 'Your prompt here', autoSend: false })
 ```
 
 ### Interactive Widgets (data-action)
@@ -420,16 +418,13 @@ Before sending any DM:
 
 ### Silent by Default
 
-Set `"silent": true` in cron config. Only use `send_message` with `session="slack"` when there is a genuine new development the user needs to act on.
+Set `"silent": true` in cron config. Use `send_message` only for a genuine new development the user needs to act on; do not hardcode `session="slack"` unless the app is explicitly Slack-only.
 
 ### Cron Message Structure
 
-```
-FIRST (self-heal): [bootstrap commands]
-THEN: [actual workflow description]
-```
-
-Keep the self-heal idempotent — every command should be a no-op if already done (use `[ -f ... ] ||` guards).
+Keep the cron prompt focused on the scheduled work. Resource registration and
+lifecycle setup belong to the gateway and declared hooks, not shell bootstrap
+commands embedded in an agent prompt.
 
 ## Background work and downstream services
 
@@ -438,19 +433,17 @@ watching. Get the cadence wrong and the owner of that service sees load from
 every install at once, cannot tell which app it is, and fixes it the only way
 they can: throttling. That breaks your app, not just its polling.
 
-### Declare every cron in the manifest, never from a handler
+### Declare static crons in the manifest; use CronSDK for dynamic schedules
 
-Put each schedule in the `crons` array of `app.json`. The gateway reconciles
-that array into the live scheduler through `register_app_crons_with_service`
-(`src/kiro_crew/apps/bridges.py`), which runs at app enable and again on gateway
-startup (`src/kiro_crew/apps/hooks_integration.py`). Registration is
-add-if-absent under a single store lock, keyed by the cron `name`, so enable,
-restart and reinstall converge on the same set of jobs instead of stacking
-duplicates.
+Put install-wide schedules in the `crons` array of `app.json`. The gateway
+reconciles that array through `register_app_crons_with_service`
+(`src/kiro_crew/apps/bridges_crons.py`) at enable and gateway startup. Registration is
+add-if-absent under one store lock, keyed by cron name.
 
-A handler that writes to the cron store itself gets none of that. Nothing
-reconciles those jobs, nobody reading the manifest or the review diff can see
-what will run, and the disable path below cannot take them away.
+A schedule derived from user configuration may instead use `ctx.cron` / CronSDK;
+those jobs remain app-namespaced and are removed by app teardown. Never write the
+cron store directly. Declare `permissions.cron` for either form, and keep dynamic
+schedule configuration visible in the app UI and README.
 
 ### Cadence: a 5-minute floor, push over polling
 
@@ -461,9 +454,12 @@ what will run, and the disable path below cannot take them away.
 | Poll only where no push path exists, and then at the coarsest cadence the feature tolerates | A stale panel is a smaller cost than an app the service owner has to block |
 
 **A 5-minute schedule gets no jitter from the platform, so add your own.**
-`_compute_jitter` (`src/kiro_crew/cron.py`) returns `0.0` for `every` under
-3600s and for any `cron_expr` whose minute field contains `/`, `,` or `*`;
-only hourly schedules get spread (0 to 5 minutes) and daily ones (0 to 59).
+`compute_jitter` (`src/kiro_crew/cron_service/schedule.py`; `cron.py` only
+aliases it as `_compute_jitter`) returns `0.0` for a `strict_schedule` job, a
+one-shot `at` job, `every` under 3600s, and any `cron_expr` whose minute field
+expands (via croniter) to `*` or to more than one value, so ranges, lists and
+steps all count; only hourly schedules get spread (0 to 5 minutes) and daily
+ones (0 to 59).
 Nothing spreads a 5-minute job, so anything that makes it overdue on many
 machines at once (a released app update, a gateway restart, a fleet coming back
 after an outage) fires it immediately on all of them and lands as one
@@ -487,10 +483,10 @@ and use the phase offset for anything longer.
 ### Bounded concurrency
 
 The scheduler will not overlap a job with itself: the due-scan skips any job
-whose id is in `_executing` (`src/kiro_crew/cron.py`), so a slow run delays its
-own next tick rather than doubling up. What is not bounded is what you do inside
-one run. There is no per-app cap on sessions or subagents today; per-app quotas
-are still a draft phase in
+that holds a run claim (`is_running`, `src/kiro_crew/cron_service/service/run_registry.py`), so a slow run
+delays its own next tick rather than doubling up. What is not bounded is what
+you do inside one run. There is no per-app cap on sessions or subagents today;
+per-app quotas are still a draft phase in
 `docs/request-for-change/rfc-app-sandbox-isolation.md`. So a tick that fans out
 one agent session per work item is your bug, paid for by the user's machine and
 the service you called.
@@ -535,18 +531,16 @@ users actually decide.
 
 ### Disable and uninstall must stop everything
 
-Disable removes an app's cron jobs, but only when the manifest declares the
-`cron` permission: the disable path in
-`src/kiro_crew/apps/hooks_integration.py` gates cleanup on `permissions.cron`
-being truthy. That gate is a platform gap, tracked in
-[issue #10997](https://github.com/kirodotdev/KiroCrew/issues/10997) and recorded
-here at symptom level because the fix belongs in the gateway, not in a skill.
-Until it lands, an app
-that schedules work without declaring that permission keeps firing after the
-user disables it, which is the worst outcome in this whole section: load with no
-owner and no off switch.
+Disable removes every cron job the app owns (`created_by="app:<name>"`),
+whether or not the manifest declares `permissions.cron`: `_cleanup_app_crons`
+in `src/kiro_crew/apps/hooks_integration.py` is keyed off the running cron
+service, not the grant (#13788, which closed
+[issue #10997](https://github.com/kirodotdev/KiroCrew/issues/10997)). When the
+cron store is busy or unreadable, disable reports `cron_cleanup: failed ...`
+in its result instead of raising, so read the result rather than assuming.
 
-- Declare `permissions.cron` if you ship any cron at all.
+- Declare `permissions.cron` if you ship any cron at all. Install, update and
+  self-registration refuse a manifest whose `crons` is non-empty without it.
 - Keep `permissions` truthful both ways. Declare what you use, drop what you no
   longer use. Grants are read at the gateway boundary, never inferred from your
   code, so an over-broad block is a real grant and a missing one is a real
@@ -554,7 +548,7 @@ owner and no off switch.
 - `scripts/uninstall.sh` must always stop background work and remove anything
   the app registered outside its own directory. **User state is a separate
   decision and is not yours to make.** Uninstall preserves app data by default
-  (`keep_data = True` in `src/kiro_crew/apps/routes.py`, flipped only by an
+  (`keep_data = True` in `src/kiro_crew/apps/routes_uninstall.py`, flipped only by an
   explicit `purge_data` request), and that choice reaches your script as
   `PURGE_DATA` / `KEEP_DATA` in its environment. So delete state files only
   under `PURGE_DATA=1`, and leave them untouched under `KEEP_DATA=1`. A script
@@ -607,79 +601,31 @@ Display metadata (description, tags, author) comes from `app.json` in the app's 
 
 ### 3. Updates
 
-Updates are automatic via semver diff — bump `version` in `app.json`, push to the repo. Users with update-check crons see a banner in the UI.
+Bump `version` in the app repository and publish it. The App Store enriches the
+registry row with `installedVersion` and `updateAvailable`, then performs updates
+through its authenticated Update action (`POST /api/apps/{name}/update`).
 
-### Update-Check Cron Pattern
+### Host-Managed Update Pattern
 
-```json
-{
-  "name": "my-app-update-check",
-  "message": "Fetch remote app.json via git archive, compare version to installed. Write result to ~/.kiro/crew/workspace/my-app/update-status.json. Always silent.",
-  "every": 86400,
-  "silent": true,
-  "persistent_session": false
-}
-```
+Do not add an app-owned update-check cron or run `git archive --remote` against
+GitHub. The registry already compares semantic versions and the gateway owns the
+clone, admission, lifecycle, rollback, and resource re-registration steps. Link
+users to the App Store when an update action is needed.
 
 ## Self-Update & Refresh Pattern
 
-Apps should include a version check cron and UI elements for manual refresh and update. ALL actions run in the background — no navigation away from the app.
-
-### Update-Check Cron
-
-Add to `app.json` crons array:
-
-```json
-{
-  "name": "my-app-update-check",
-  "message": "Check if a newer version of MY-APP is available. READ-ONLY. Steps: (1) Remote version: run `git archive --remote=https://github.com/<org>/my-app main app.json | tar -xO` from $HOME. Parse 'version'. (2) Installed version: read ~/.kiro/crew/apps/my-app/app.json. (3) Compare semver. Write ONLY to ~/.kiro/crew/workspace/my-app/update-status.json: {checked:true, installedVersion, remoteVersion, updateAvailable:bool, checkedAt:ISO}. Silent.",
-  "every": 86400,
-  "silent": true,
-  "persistent_session": false
-}
-```
-
-### UI: Update Banner (Background)
-
-```javascript
-function UpdateBanner() {
-  const [update, setUpdate] = useState(null)
-  const [updating, setUpdating] = useState(false)
-
-  // Load update-status.json on mount
-  useEffect(() => { /* read update-status.json via /api/file-read */ }, [])
-
-  if (!update?.updateAvailable) return null
-
-  return _jsx('div', {
-    style: { background: '#e8d5f5', color: '#7c3aed', padding: '8px 14px', borderRadius: '9999px', marginBottom: '8px', fontSize: '12px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' },
-    children: _jsxs(_Fragment, { children: [
-      _jsx('span', { children: `Update available: v${update.installedVersion} → v${update.remoteVersion}` }),
-      _jsx('button', {
-        onClick: async () => {
-          setUpdating(true)
-          await fetch('/api/chat?ws=1', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ message: 'Update MY-APP...', slot: 'my-app-update' }) }).catch(() => {})
-          setTimeout(() => setUpdating(false), 10000)
-        },
-        disabled: updating,
-        style: { background: updating ? '#e5e7eb' : '#7c3aed', color: updating ? '#6b7280' : '#fff', border: 'none', padding: '4px 10px', borderRadius: '9999px', fontSize: '11px', fontWeight: 500, cursor: updating ? 'default' : 'pointer' },
-        children: updating ? 'Updating…' : 'Update Now'
-      })
-    ]})
-  })
-}
-```
+Use a background slot for app-specific refresh work, but leave app package updates
+to the App Store. An agent prompt must not replace the gateway's authenticated
+update transaction.
 
 ### Background Slot Pattern
 
 For any action that should run without navigating away from the app page, use `POST /api/chat?ws=1` with a named slot:
 
 ```javascript
-fetch('/api/chat?ws=1', {
-  method: 'POST',
-  headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify({ message: 'Do the thing...', slot: 'my-app-action-name' })
+api.post('/api/chat?ws=1', {
+  message: 'Do the thing...',
+  slot: 'my-app-action-name'
 })
 ```
 
@@ -690,11 +636,11 @@ fetch('/api/chat?ws=1', {
 
 ## Installation Flow (User Perspective)
 
-1. `kirocrew app install /path/to/my-app` — the CLI verb takes a local directory containing `app.json`. A git-hosted app is installed from the App Store / registry, which is the path that clones.
-2. Gateway restart: `kirocrew restart` (`kirocrew gateway restart` is not a command — `gateway` has flags, not subcommands). An agent cannot run it: the shell layer's self-protection argv floor refuses the invocation, so use the gateway-restart skill's scheduled-restart flow instead.
-3. App appears in sidebar immediately (if UI defined)
-4. First cron run (within `every` seconds) self-heals all setup
-5. UI transitions from "initializing" to functional
+1. `kirocrew app install /path/to/my-app` copies a local directory containing `app.json`; a registry install is initiated from the App Store and performs the clone.
+2. `kirocrew app enable my-app` grants activation and registers declared resources. A normal install/enable does not require a gateway restart.
+3. The enabled app page appears in the sidebar when `ui.pages` is declared.
+4. Manifest crons register with the scheduler; local installs intentionally skip `setup.onInstall`, while registry installs run it before copying the app.
+5. Use `kirocrew app dev my-app` during UI iteration instead of restarting the gateway.
 
 ## .gitignore (IMPORTANT)
 
@@ -709,46 +655,44 @@ installed.json
 data/
 ```
 
-The `data/` directory contains runtime config (`config.json`) with resolved paths and stale version info. Committing it causes version display bugs (showing install-time version) and path issues on other machines.
+The `data/` directory contains machine-local runtime config and user state. Do not store the app version there; `useAppInfo()` supplies the installed manifest version.
 
 ## Git Workflow for Installed Apps
 
-The installed app at `~/.kiro/crew/apps/MY-APP/` IS a git repo with origin pointing to the source repository. You can commit and push directly from there:
-
-```bash
-cd ~/.kiro/crew/apps/my-app && git add -A && git commit -m "message" && git push origin main
-```
-
-No separate workspace needed. The installed app IS the workspace.
+The installed directory under `~/.kiro/crew/apps/` is deployment output, not a
+Git workspace: the safe copy deliberately omits `.git`. Edit and commit in the
+source repository, then use the App Store Update/Sync action (or reinstall from
+the local source during development). Never commit or push from the installed
+copy.
 
 ## Common Pitfalls
 
 | Pitfall | Cause | Fix |
 |---------|-------|-----|
 | "no visual interface" in sidebar | Missing `ui.entry` or wrong extension | Use `.mjs` ESM with default export |
-| Skills don't load after install | Scanner only checks flat `~/.kiro/crew/skills/<name>/SKILL.md` | Self-heal symlink in cron |
-| UI shows stale data after app.json change | Browser caches manifest API response | Hard refresh |
-| `onInstall` doesn't run | KiroCrew lifecycle hook bug | Don't depend on it — self-heal instead |
+| Skills do not load after enable | Declared path is missing/escaping, or the app is still disabled | Use canonical string paths and inspect `skill_search`; the gateway owns namespaced and flat links |
+| UI or manifest changes do not appear | The installed copy is a snapshot of the source | Use App Store Sync/Update, or documented app dev mode for UI changes |
+| `onInstall` does not run for a local-path install | Local installs intentionally skip the registry build hook | Build locally before install; registry installs execute `setup.onInstall` |
 | SSE overwrites React state | `/api/file-watch` fires immediately on connect | Use polling instead |
 | Cron spams DMs | No dedup — same condition triggers every cycle | Track `last_notified` in state |
-| App icon doesn't show | Using `icon` string field | Use `iconUrl` pointing to SVG file |
-| Stale app after gateway restart | Gateway reads app.json live but session predates | Open new dashboard session |
-| Version shows "?" or old number | `/api/apps/MY-APP` needs auth, `config.json` is stale | Read `app.json` via `/api/file-read` |
+| App icon falls back to `Package` | Unsupported `ui.pages[].icon` name or bad `iconUrl` | Use a supported host Lucide name or a valid app-relative image path |
+| App changes disappear after update | Editing the installed snapshot or a dev symlink that safe-copy replaces | Edit the source, update/sync, and recreate any explicitly granted dev link |
+| Version shows "?" or an old number | Version was cached outside the host-provided app context | Read `useAppInfo().version` |
 | Install artifacts in git | `data/`, `.app_secret`, etc tracked | Add to `.gitignore`, `git rm --cached` |
-| Buttons navigate away from app | Using `navigate('/chat')` for automated work | Use `POST /api/chat?ws=1` background slots |
-| Refresh/update leaves app page | Using `window.__mc_chat_launch` + navigate | Background slot + disabled state + timeout |
-| Cron keeps firing after the user disables the app | App schedules work but never declares `permissions.cron` — the disable path gates cron cleanup on that grant | Declare `permissions.cron`, then verify disable leaves no job on the Schedule page |
+| Buttons navigate away from app | Using `navigate('/chat')` for automated work | Use permission-scoped `useAppApi().post('/api/chat?ws=1', ...)` |
+| Package update bypasses App Store safeguards | Asking an agent slot to rewrite the installed app | Use the authenticated App Store Update/Sync action |
+| Cron keeps firing after the user disables the app | Disable reported `cron_cleanup: failed` (cron store busy/unreadable) | Re-run disable, then verify no job remains on the Schedule page |
 | Every install hits the same service in the same minute | Sub-hourly schedules get zero jitter, so a rollout or restart syncs them | Add a stable per-install offset in your own state file, or go hourly or coarser and let the platform spread it |
 | Downstream service starts throttling the app | Unattributable polling load from every install | A 5-minute floor with no per-minute polling, push/webhook instead of polling, app-specific `User-Agent` |
 | One cron tick spawns dozens of agent sessions | Fan-out per work item, with no per-app quota to stop it | Bounded batch per tick plus a cursor in the state file |
 
 ## Testing Locally
 
-1. Place app in any directory
-2. Install: `kirocrew app install /path/to/my-app`
-3. Restart gateway: `kirocrew restart`
-4. Open fresh dashboard session
-5. Verify: UI loads, cron runs self-heal, skill appears in `/skills` list
+1. Build the app in its source directory.
+2. Install: `kirocrew app install /path/to/my-app`.
+3. Enable: `kirocrew app enable my-app`.
+4. Verify the UI, declared cron jobs on the Schedule page, and the namespaced skill through `skill_search`.
+5. For UI iteration, enable `kirocrew app dev my-app`; no gateway restart is required.
 
 ## Versioning Convention
 
@@ -782,9 +726,11 @@ process — but the contract DIFFERS from builtins (`auto_research` etc.):
   app's UI with `Cache-Control: no-store` and watches its `ui/` dir; changes
   broadcast `app_reload` and the dashboard hot-swaps the app in ~1s. The flag
   lives in `installed.json` and toggles live.
-- To edit in your source tree, symlink the installed UI dir to source:
+- To edit in your source tree, symlink the installed UI dir to source, then
+  explicitly grant that out-of-install root:
   `mv ~/.kiro/crew/apps/<n>/ui ~/.kiro/crew/apps/<n>/ui.bak && ln -s <src>/ui ~/.kiro/crew/apps/<n>/ui`
-  (serving containment check and the dev watcher both follow symlinks).
+  followed by `kirocrew app dev <n> --confirm-out-of-install-root`. That
+  confirmation is a human security decision; agents must not supply it.
   On native Windows use a directory junction instead (PowerShell):
   `Rename-Item "$env:USERPROFILE\.kiro\crew\apps\<n>\ui" ui.bak; New-Item -ItemType Junction -Path "$env:USERPROFILE\.kiro\crew\apps\<n>\ui" -Target "<src>\ui"`
   (`pathlib` resolves junctions the same way, so serving and the watcher work;
@@ -797,9 +743,10 @@ process — but the contract DIFFERS from builtins (`auto_research` etc.):
   frozen snapshot: hot reload stops, UI goes stale, no error. Symptom:
   `ls -l ~/.kiro/crew/apps/<n>/ui` shows a real dir, not a link. Fix: re-create
   the symlink after ANY install/update, and re-check dev mode is still on.
-- Same clobber applies to locally-edited SHIPPED skills: installed skill files
-  under `~/.kiro/crew/skills/` re-sync from the KiroCrew package on update —
-  durable skill changes must land in the repo (`skills/` in the KiroCrew source).
+- Same clobber applies to locally edited shipped skills: installed skill files
+  under `~/.kiro/crew/skills/` re-sync from the Kiro Crew package on update.
+  Durable bundled-skill changes belong in `src/kiro_crew/builtin_skills/`;
+  top-level `skills/` is checkout-only guidance.
 - Validate `.mjs` before relying on a reload: `node --check ui/index.mjs` —
   a parse error surfaces only as "Failed to load <App>: Unexpected token".
 - Avoid deep `_jsx` nesting in one expression; prefer small named components.
@@ -845,10 +792,9 @@ grouping come for free and stay consistent with the main chat.
   convention). The embed polls `/api/chat/slots/<key>` (1s while running, 5s
   idle) and POSTs to `/api/chat`.
 - **Manifest permissions (silent-failure trap):** the SDK gates fetches by the
-  app's `permissions.api` allowlist. ChatEmbed needs `"/api/chat"` +
-  `"/api/chat/*"`; if your users click Approve/Trust on tool cards you ALSO need
-  `"/api/approvals"` + `"/api/approvals/*"` — without it the button 403s with no
-  visible error.
+  app's `permissions.api` allowlist. ChatEmbed needs `"/api/chat"` and
+  `"/api/chat/*"`; its Approve/Trust controls use the slot-scoped
+  `/api/chat/slots/{slot}/approve` route covered by that wildcard.
 - Chrome and scroll are props, not CSS overrides. Pass `frameless` to drop the
   bordered card, title strip and input-row border so the embed sits flush inside
   your own card, and `startAtBottom` to jump to the newest turn immediately and
@@ -856,10 +802,9 @@ grouping come for free and stay consistent with the main chat.
   when they return). Do NOT reach for `!important` overrides on the embed's
   Tailwind classes or hand-roll a scroll keeper: those couple you to host DOM
   internals the repo has never promised.
-- **Still missing — tracked in issue #510:** permission cards do not render
-  inside the embed, so a worker slot your app owns cannot ask the user to
-  approve a tool from there. That is why such slots tend to be blanket-trusted;
-  treat the trust level as a deliberate decision, not a default.
+- Permission cards render inside ChatEmbed and route Approve, Reject, and Trust
+  through the slot-scoped approval endpoint. Keep attended worker slots
+  interactive instead of granting blanket trust merely to avoid a dead card.
 - Rendering agent messages yourself instead of using `ChatEmbed`? An agent puts
   follow-up choices and steer acknowledgements inline in its prose
   (`[OPTIONS: a | b]`, `[STEERING steer-<id>: …]`). Parse them with the SDK's
@@ -869,36 +814,53 @@ grouping come for free and stay consistent with the main chat.
 
 ## Worker Slots — apps that own agent sessions
 
-**Stopgap — tracked in issue #509** (a supported `acquire_worker_slot(app,
-project, trust=…)` helper): these are underscore-private slot internals, not a
-promised API. Until #509 lands they are the only mechanism, but treat this
-recipe as scaffolding — re-check it against the SDK when you update an app.
-
 If your app creates chat slots for background/worker agents (spec writers,
-researchers), stamp these attributes — and re-stamp on EVERY acquisition, not
-just creation, because gateway restarts and other code paths (e.g. ChatEmbed's
-own POST) can recreate slots without them:
+researchers), acquire them through `kiro_crew.apps.worker_slots`:
 
-- `slot._app = "<app-name>"` — keeps the session out of the main chat sidebar.
-- **Trust — grant it BOUNDED, never blanket-forever.** Approval prompts render
-  ONLY in the main chat UI, so an untrusted worker inside an app embed stalls
-  silently on its first shell command — but the fix is a *scoped* grant, not a
-  permanent one:
-  - *Preferred:* pattern-scoped trust via `slot._trusted_patterns` (supported
-    by `chat_runner`) — allowlist only the tool/command shapes your worker
-    actually needs.
-  - *If you must use blanket `slot._trust = True`:* time-box it. Mirror the
-    in-repo precedent (`auto_research`: 24h TTL, then trust expires and
-    re-authorization re-grants it) rather than re-stamping `True`
-    unconditionally forever. A permanent unscoped auto-approve worker silently
-    exempts a growing class of sessions from the interactive-approval layer —
-    a security regression that compounds as apps adopt the pattern.
-  - Always SEL-audit the grant, whichever form it takes.
-- `slot.project = <working_dir>` — sets the CLI process cwd (chat_runner runs
-  `cwd=slot.project`). Without it the agent prefixes every command with
-  `cd <long-path> && …`, which turns every tool pill in the transcript into
-  identical truncated noise; with it, commands are relative and readable, and
-  the worker inherits project-scoped steering files.
+```python
+from kiro_crew.apps.worker_slots import WorkerSlotTimeout, acquire_worker_slot
+
+try:
+    async with await acquire_worker_slot(
+        state, "<app-name>", "<app-name>-<entity>",
+        project=working_dir,
+        trusted_patterns=["npm test"],   # or trust=True; both expire
+        trust_ttl_secs=3600,             # at most 24h
+        timeout=30,                      # seconds to wait for a free slot
+    ) as lease:
+        ...  # drive lease.slot
+except WorkerSlotTimeout as exc:
+    ...  # tell the user the worker is busy; str(exc) says why
+```
+
+- **Re-stamped on every acquire.** The helper sets the slot's app owner (keeps
+  it out of the main chat sidebar) and its working directory every time, so a
+  slot another path created first (ChatEmbed's own POST, for one) is fixed on
+  the next acquire. Acquire again rather than reusing a slot object you kept.
+- **One at a time by default.** Each app may hold 1 lease at once, and one
+  slot key is leased by one lease at a time across all apps. A further acquire
+  waits up to `timeout` seconds, then raises `WorkerSlotTimeout` naming the
+  app, the limit and the wait. A slot owned by another app raises
+  `ValueError`, and so does a chat a person or a cron job opened; pick keys
+  prefixed with your app name. A lease whose slot was
+  deleted is freed by the next acquire. Call
+  `set_worker_slot_limit("<app-name>", n)` once at startup if your app really
+  runs several workers side by side. The limit lives in the gateway process
+  and starts fresh after a restart.
+- **Trust is bounded.** Attended workers should use ChatEmbed's approval cards
+  and pass no trust. For an unattended worker prefer `trusted_patterns` (only
+  the command shapes it needs) over blanket `trust=True`. Blanket trust is an
+  audited, expiring scoped grant, never the session's own trust flag, so
+  subagents the worker spawns do not inherit it. Either grant is withdrawn
+  when the lease is released or after `trust_ttl_secs` (default 1h, at most
+  24h), whichever is first. A grant whose audit cannot be written is not made:
+  check `lease.trust_granted`. A grant the slot already had is left alone.
+- **Working directory.** `project` becomes the CLI process cwd, so commands
+  are relative and readable and the worker inherits project-scoped steering
+  files.
+
+Do not stamp `slot._app`, `slot._trust`, `slot._trust_scope`,
+`slot._trusted_patterns` or `slot.project` by hand: they are private, and the helper is the supported way.
 
 ## Positioning — your app is NOT in an iframe
 
@@ -923,7 +885,7 @@ and use `position: absolute; inset: 0` for the overlay.
 
 ## Graduating an External App to a Builtin
 
-When an app proves out and should ship with KiroCrew, port it into the repo —
+When an app proves out and should ship with Kiro Crew, port it into the repo —
 the contracts CHANGE on both sides. Template: `src/kiro_crew/apps/builtins/issue_radar/`.
 
 - Layout: `src/kiro_crew/apps/builtins/<snake_name>/` with `app.json`,
@@ -949,4 +911,14 @@ the contracts CHANGE on both sides. Template: `src/kiro_crew/apps/builtins/issue
   to the app root), registered at enable-time.
 - Keep `defaultEnabled: false`; users opt in via the App Store.
 - Full worktree + build-gate discipline applies (see the kirocrew-worktree-dev
-  skill) — this is now KiroCrew source.
+  skill) — this is now Kiro Crew source.
+- **Tests**: the suite under `tests/` follows the repo's test rules — the
+  [writing-tests](../../src/kiro_crew/builtin_skills/kirocrew-dev/writing-tests/SKILL.md)
+  skill and the
+  [Determinism contract](../../docs/system-specs/common/testing-conventions.md#determinism-contract-read-this-first).
+  The rootdir `conftest.py` floor applies there (plus the app's own `tests/conftest.py`
+  where one exists), not `test/conftest.py`, and the helpers under `test/` are not on
+  your import path: take shared test support from
+  `kiro_crew.testing`, which ships in the package (`kiro_crew.testing.clock`, `.wait`,
+  `.ids` and `.links`), and the rootdir's `manual_clock`, `seeded_rng` and `local_tz`
+  fixtures.

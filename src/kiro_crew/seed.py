@@ -1,9 +1,9 @@
-"""``kirocrew seed`` — copy a hand-authored fixture into ``$KIROCREW_HOME``.
+"""``kirocrew gateway --seed FIXTURE`` — copy a hand-authored fixture into ``$KIROCREW_HOME``.
 
 Fixtures ship as package data at ``src/kiro_crew/tests_fixtures/<name>/``.
 Each fixture is a valid ``KIROCREW_HOME`` tree with a ``fixture.yaml``
 declaring ``schema-version``. Shipping inside the package is what lets
-``kirocrew seed`` work after ``pip`` installs the wheel into
+``kirocrew gateway --seed`` work after ``pip`` installs the wheel into
 ``site-packages/kiro_crew/`` (a source-tree-relative path walk would
 not find ``<repo>/test/fixtures/`` from there).
 """
@@ -153,7 +153,7 @@ def fixture_summary(name: str) -> str:
 def _resolve_fixture(name: str) -> Path:
     """Return the path to fixture ``name``, or raise ``SeedError``.
 
-    Rejects path-traversal attempts (``--fixture ../../.ssh``) before
+    Rejects path-traversal attempts (``--seed ../../.ssh``) before
     ``shutil.copytree`` ever sees the path. Multiple gates are needed because
     each alone is bypassable:
 
@@ -581,8 +581,9 @@ def _protected_homes() -> set[Path]:
     purpose: seeding requires ``$KIROCREW_HOME`` to be set, so ``config_dir()``
     would return that override itself and the guardrail equality check would
     always fire. The guardrail must compare against the DEFAULT (non-override)
-    homes. Extracted as a helper so tests can monkeypatch ``Path.home()`` via
-    ``$HOME`` and exercise the guardrail on synthetic default-home paths.
+    homes. Extracted as a helper so tests can monkeypatch ``Path.home()``
+    directly (``$HOME`` alone does not reach it on Windows) and exercise the
+    guardrail on synthetic default-home paths.
     """
     homes: set[Path] = set()
     for home in (_default_home(), _legacy_home()):

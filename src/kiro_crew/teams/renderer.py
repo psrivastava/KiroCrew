@@ -54,10 +54,12 @@ from kiro_crew.messaging.renderer import (
     Renderer,
     _default_redactor,
     apply_options_cap,
+    count_redaction_tags,
     new_approval_nonce,
+    redaction_notice,
     split_options_trailer,
 )
-from kiro_crew.messaging.split import split_markdown_safe
+from kiro_crew.messaging.split import bounded_for_delivery, split_markdown_safe
 from kiro_crew.messaging.tables import TABLE_POLICY_CARDS
 from kiro_crew.messaging.transport import TransportCapabilities
 from kiro_crew.sel import sel
@@ -86,7 +88,7 @@ _PROGRESS_THROTTLE_S = 3.0
 
 #: How often the typing indicator is re-posted while a turn runs. A Teams typing
 #: activity expires after a few seconds; the reference middleware refreshes every
-#: 2 s. Teams' per-thread budget is 7 requests/second, so this spends ~1% of it.
+#: 2 s. Teams' per-thread budget is 7 requests/second, so this spends about 4% of it.
 _TYPING_REFRESH_S = 4.0
 
 _ERROR_TEXT = "⚠️ Something went wrong — please try again."
@@ -226,6 +228,8 @@ class TeamsRenderer(Renderer):
         # directory. Absolute or nothing -- a relative root is no boundary at all.
         self._upload_root = upload_root if os.path.isabs(upload_root) else ""
         self._upload_root_resolved = bool(self._upload_root)
+        # The session's own scratch directory (``authorize_scratch_root``).
+        self._scratch_root = ""
 
     def authorize_upload_root(self, root: str) -> None:
         """Authorize the provider's resolved cwd as the extraction boundary.
@@ -236,6 +240,16 @@ class TeamsRenderer(Renderer):
         """
         self._upload_root = root if os.path.isabs(root) else ""
         self._upload_root_resolved = True
+
+    def authorize_scratch_root(self, scratch_root: str) -> None:
+        """Record the session's own ``$KIROCREW_SCRATCH`` directory.
+
+        Set by the dispatcher once the provider exists. It only ever counts beside
+        an approved cwd (extraction never runs without one), and extraction
+        re-checks that it is one allocation under the managed scratch root
+        (``outbound_files.session_scratch_root``) before it counts.
+        """
+        self._scratch_root = scratch_root if os.path.isabs(scratch_root) else ""
 
     # -- lifecycle ----------------------------------------------------------
     async def on_turn_start(self) -> None:
@@ -377,8 +391,20 @@ class TeamsRenderer(Renderer):
         # Overflow past max_buttons is appended to the body as a numbered list by
         # the shared cap, so the user still learns those choices exist.
         content, kept = apply_options_cap(content, choices, self.capabilities)
+        # Re-bound: the splitter declines to cut when no budget is clean and
+        # answers with the text whole, and this transport truncates a larger
+        # payload after every scan has run, so the tail would go unseen.
         chunks = await asyncio.to_thread(
-            split_markdown_safe, content, self.capabilities.max_message_chars
+            split_markdown_safe,
+            content,
+            self.capabilities.max_message_chars,
+            redactor=_default_redactor,
+        )
+        chunks = await asyncio.to_thread(
+            bounded_for_delivery,
+            chunks,
+            self.capabilities.max_message_chars,
+            _default_redactor,
         ) or ([] if (kept or files) else ["…"])
         for index, chunk in enumerate(chunks):
             # Reuse the progress bubble for the first chunk so a turn that showed
@@ -409,6 +435,29 @@ class TeamsRenderer(Renderer):
             # After the text, so an image lands next to the prose that introduced
             # it rather than above the answer it belongs to.
             await self._send_inline_images(files)
+        # Counted over the chunks that SHIPPED, not the source they were cut from:
+        # a boundary repair can add a placeholder of its own, and a reply whose only
+        # redaction came from one would otherwise announce none.
+        cred_count, url_count = count_redaction_tags("\n".join(chunks))
+        if cred_count or url_count:
+            # The answer above carries a redaction placeholder, so a follow-up
+            # notice tells the reader the text was rewritten. Counted over the
+            # DELIVERED body (a failed chunk raises out of the loop above, so
+            # reaching here means the text shipped), and best-effort by the
+            # shared contract: the answer is already out, so a failed notice
+            # send is logged, never raised. Posted before the options card so
+            # the card stays adjacent to the choices it asks about.
+            try:
+                await self._client.send_message(
+                    self._conversation_id,
+                    redaction_notice(cred_count, url_count),
+                    self._service_url,
+                )
+            except Exception:
+                logger.warning(
+                    "teams: could not deliver the redaction notice (answer already sent)",
+                    exc_info=True,
+                )
         if kept:
             # Chips ride their own card AFTER the answer, so a failed answer
             # delivery above never leaves buttons floating with nothing to act on.
@@ -613,7 +662,10 @@ class TeamsRenderer(Renderer):
             return text, []
         try:
             result = await extract_local_refs_off_loop(
-                text, within_root=root, limits=TEAMS_UPLOAD_LIMITS
+                text,
+                within_root=root,
+                limits=TEAMS_UPLOAD_LIMITS,
+                scratch_root=self._scratch_root,
             )
         except Exception:
             logger.warning("Teams: outbound file extraction failed", exc_info=True)
@@ -718,7 +770,10 @@ class TeamsRenderer(Renderer):
         # so the note has no bound of its own and a single over-cap activity would
         # be refused whole -- losing the only record that the image went missing.
         chunks = await asyncio.to_thread(
-            split_markdown_safe, safe, self.capabilities.max_message_chars
+            split_markdown_safe,
+            safe,
+            self.capabilities.max_message_chars,
+            redactor=_default_redactor,
         )
         for chunk in chunks:
             try:

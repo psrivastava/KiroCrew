@@ -90,7 +90,7 @@ describe('Spec Builder at narrow widths', () => {
     // Each costs width a phone has none of and does nothing without a pointer:
     // the shell's rail splitter and the detail's own document divider.
     expect(await src('Workspace.tsx')).toMatch(/\{!isMobile && \(\s*<ColumnSplitter/)
-    expect(await src('SpecDetail.tsx')).toMatch(/cursor-col-resize[^`]*\$\{isMobile \? 'hidden' : ''\}/)
+    expect(await src('SpecDetail.tsx')).toMatch(/<ResizeHandle[\s\S]*?className=\{isMobile \? 'hidden' : undefined\}/)
   })
 
   it('hands the chat the full width and keeps the document reachable', async () => {
@@ -139,8 +139,10 @@ describe('Spec Builder at narrow widths', () => {
     // Measured in the real build at 390px: the header row is 414px wide, and the
     // pane's `overflow-hidden` clips `Approve → Tasks` (left 321, right 414) with
     // no way to scroll to it. Exposing the header is not enough on its own.
-    expect(s, 'the header must wrap while narrow')
-      .toMatch(/isMobile && !fullscreen \? 'flex-wrap min-h-\[52px\] py-1\.5' : 'h-\[52px\]'/)
+    // A default-width docs column at 1440px is just as crowded, so the wrap
+    // applies at every width now, not only while narrow.
+    expect(s, 'the header must wrap')
+      .toMatch(/"flex flex-wrap gap-1\.5 items-center min-h-\[52px\] py-1\.5 /)
   })
 
   it('bounds the stacked column in vh, since a percentage would not resolve', async () => {

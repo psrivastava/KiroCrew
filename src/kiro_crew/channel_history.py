@@ -87,7 +87,6 @@ class ChannelHistory:
             new_buf: deque[HistoryEntry] = deque(buf, maxlen=self._observe_max_entries)
             self._channels[channel_id] = new_buf
 
-        # Load persisted history from disk
         self._load_observe(channel_id)
 
     def unset_observe(self, channel_id: str) -> None:
@@ -106,7 +105,14 @@ class ChannelHistory:
             except OSError:
                 logger.warning("Failed to remove history file %s", path, exc_info=True)
 
-    def push(self, channel_id: str, user: str, text: str, thread_ts: str | None = None, msg_ts: str | None = None) -> None:
+    def push(
+        self,
+        channel_id: str,
+        user: str,
+        text: str,
+        thread_ts: str | None = None,
+        msg_ts: str | None = None,
+    ) -> None:
         """Record a message in the channel buffer.
 
         Called on every message event in the gateway, not just @mentions.
@@ -128,7 +134,9 @@ class ChannelHistory:
 
         # Build entry — observe channels use wall clock for persistence
         wall_ts = time.time() if is_observe else None
-        entry = HistoryEntry(user=user, text=text, thread_ts=thread_ts, msg_ts=msg_ts, wall_ts=wall_ts)
+        entry = HistoryEntry(
+            user=user, text=text, thread_ts=thread_ts, msg_ts=msg_ts, wall_ts=wall_ts
+        )
         buf.append(entry)
 
         # Persist to disk for observe channels
@@ -227,8 +235,10 @@ class ChannelHistory:
         path = self._observe_path(channel_id)
         if path is None:
             return
+        from kiro_crew.owner_only_files import ensure_directory, owner_only_opener_for
+
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
+            ensure_directory(path.parent)  # 0700 inside the data home
             line = json.dumps(
                 {
                     "user": entry.user,
@@ -239,7 +249,10 @@ class ChannelHistory:
                 },
                 ensure_ascii=False,
             )
-            with path.open("a", encoding="utf-8") as f:
+            # Channel messages: 0600 from creation inside the data home (an
+            # existing file keeps its mode; the startup sweep tightens one an
+            # older version left). A history_dir outside the home is unchanged.
+            with open(path, "a", encoding="utf-8", opener=owner_only_opener_for(path)) as f:
                 f.write(line + "\n")
         except OSError:
             logger.warning("Failed to append to history file %s", path, exc_info=True)
@@ -268,6 +281,9 @@ class ChannelHistory:
                         data = json.loads(raw)
                     except json.JSONDecodeError:
                         logger.warning("Corrupt JSONL line %d in %s — skipping", line_no, path)
+                        continue
+                    if not isinstance(data, dict):
+                        logger.warning("Non-object JSONL line %d in %s — skipping", line_no, path)
                         continue
                     wall_ts = data.get("ts")
                     if wall_ts is None:

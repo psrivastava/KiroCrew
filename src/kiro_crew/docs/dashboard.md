@@ -24,15 +24,16 @@ If the dashboard doesn't load after setup:
 
 ### Chat (`/chat`)
 
-Multi-session parallel chat with full Markdown rendering, syntax-highlighted code blocks, Mermaid diagrams, and clickable file paths. A confirmed local file link in an agent reply opens that file in the chat side panel; a `:line` suffix opens the file at that line instead of navigating the browser back to Chat.
+Multi-session parallel chat with full Markdown rendering, syntax-highlighted code blocks, Mermaid diagrams, and clickable file paths. A confirmed local file link in an agent reply opens that file in the chat side panel; a `:line` suffix opens the file at that line instead of navigating the browser back to Chat. A link that leaves the dashboard (a web page, or an editor or mail link) always goes where it points: when its text is a file path (a repo file linked to its GitHub page, say), clicking it opens the link, not the local file, and the path is not turned into a clickable path chip. A reply can also offer a file it wrote as a one-click **Open file** chip under the reply, with a hidden `<!-- kirocrew:open-file path="/abs/path" -->` marker (absolute paths only). The chip opens nothing by itself: a click opens the file in the side panel exactly as clicking its path does. To get one after each note, ask your agent (for example in its instructions) to add the marker for the files it writes.
 
 - **Multiple tabs**: each tab runs its own agent session in parallel.
 - **Agent selection**: pick an agent before starting a chat, or switch mid-session.
-- **Session history**: closed sessions appear in the collapsible history sidebar.
-- **Resume**: click a history item to restore the full conversation.
+- **Session history**: closed sessions appear under **Older Sessions**, the collapsible footer at the bottom of the Sessions list on the left. Click the footer to expand it.
+- **Resume**: click a session under Older Sessions to restore the full conversation.
 - **Notifications**: click a notification to view it in the main pane.
 - **Auto-titles**: sessions get auto-generated titles after a few turns.
-- **Edit & resend**: edit and resend previous user messages with history preserved.
+- **Rename a session**: choose **Rename** from a sidebar row's `⋮` menu (or right-click the row), double-click the bold title in the row, or click the title in the session header. A name you set is kept: background title refreshes skip it, and only **Regenerate title** replaces it. **Regenerate title** sits on the session header (on hover) and in a sidebar row's `⋮` menu, so a stale name can be refreshed without opening the session.
+- **Edit & resend**: edit and resend previous user messages with history preserved. From an empty composer, ⌘↑ (macOS) or Ctrl+↑ opens the last user message for editing.
 - **Fork session**: fork a session into a new tab with full context carried over.
 - **Regenerate replies**: regenerate assistant replies with variant history navigation.
 - **Prompt history**: ↑/↓ arrow keys navigate through previous prompts.
@@ -46,6 +47,7 @@ Multi-session parallel chat with full Markdown rendering, syntax-highlighted cod
 - **Memory mode**: per-session choice — persistent (default), incognito (blocks learn_add), or temporary (no memory consolidation).
 - **Merge queued messages**: optionally merge queued messages into a single prompt.
 - **Cooperative stop**: soft-stop sends cancel first, falls back to hard kill after budget (preserves session state).
+- **Turn time limit per session**: a turn stops when it reaches the turn time limit, **Turn Time Limit** under Settings → Chat → Advanced (4 hours by default). To give one session a different limit, open its session menu (the `⋮` on its sidebar row, or right-click the row) and pick a value under **Turn time limit**. The card a stopped turn leaves has the same choice under **Change turn time limit** → **This session**, beside the link to the Settings field for all sessions. The limit applies from the session's next turn, other sessions keep the Settings value, and **Same as all sessions** returns the session to it. The card says which limit stopped the turn and where to change it.
 - **Tool input preview**: expandable tool input display in approval cards.
 - **File upload**: on desktop, use **Upload file** from the `+` menu or drop a file into Chat. On a phone or other touch device, tap `+` to open the native system Files picker directly. Both paths accept images and regular files such as `.zip`, `.csv`, and `.docx`.
 - **Folder management**: create, rename, and organize sessions into sidebar folders with indent borders.
@@ -54,19 +56,19 @@ Multi-session parallel chat with full Markdown rendering, syntax-highlighted cod
 
 ### Settings (`/settings/*`)
 
-Settings uses tabbed panels for Overview, Imports, Chat, Display, Voice, Notifications, Shortcuts, Skills, Channels, Browser, Computer Use, Webhooks, Instances, Privacy, Security, Connections, Secrets, Developer, Releases, and About. `/overview` redirects to `/settings/overview`.
+Settings uses tabbed panels for Overview, Imports, Agent Harness, Chat, Display, Voice, Notifications, Shortcuts, Skills, Channels, Browser, Computer Use, Webhooks, Remote Crew, Privacy, Security, Connections, Secrets, Developer, Releases, and About. `/overview` redirects to `/settings/overview`.
 
-### Agent Capabilities (`/capabilities`)
+### Customize (`/capabilities`)
 
-Tabbed management for crews, agent templates, MCP connections, skills, the knowledge library, steering, hooks, prompts, and workflow libraries. `/agents`, `/connections` and `/knowledge` redirect here.
+Tabbed management for mates, custom agents, MCP connections, skills, the knowledge library, steering, hooks, prompts, and workflow libraries. `/agents`, `/connections` and `/knowledge` redirect here.
 
 ### Schedule (`/schedule`)
 
 Create and manage cron jobs, organize them in folders, and switch between list, calendar, and execution views.
 
-### Developer (`/developer`)
+### Developer (`/settings/developer`)
 
-Tabbed developer views for logs, system metrics, telemetry, storage, MCP pooling, memory, configuration, the agent backend, debug tools, and the session archive. The former standalone `/system` page is now the System tab here.
+**Settings → Developer** lists its pages beside the content: Feature Previews first, then the developer views for logs, system metrics, telemetry, storage, MCP pooling, memory, configuration, debug tools, and the session archive (`/settings/developer/<page>`, e.g. `/settings/developer/system`). Every page is always listed. An old `/developer?tab=<page>` link redirects to the same page here, and `/developer?tab=agent-backend` forwards to **Settings → Agent Harness**.
 
 ### Logs (`/logs`)
 
@@ -117,6 +119,18 @@ receive its ready frame leaves the existing owner in place and also closes the
 failed candidate without waiting indefinitely on its transport; a reconnect
 with no live owner (a reload) always converges, even while the shell is
 streaming output continuously.
+
+**Detached shells.** A shell keeps running while no browser is attached, through
+a reload, a dropped network or a sleeping laptop, and the next connection
+reattaches to it. Once it has been detached for `dashboard.terminal.orphan_timeout_s`
+seconds (default `43200`, 12 hours; values below `60` count as `60`), the gateway
+ends the shell and every process it started, logs a warning, records a
+`terminal.session.reap` security event and posts a "Terminal closed" bell note.
+When a new terminal would exceed `dashboard.terminal.max_sessions`, the shell
+that has had no browser attached the longest (at least a minute) is ended the
+same way to make room, so shells left behind on another device cannot block new
+terminals. A gateway restart also ends every shell. Run work that must outlive either inside
+`tmux` or `screen`.
 
 **Selection toolbar.** Highlighting text in a terminal shows a floating toolbar with **Send to chat** and **Copy**. Send to chat appends the selection to the chat composer draft (never overwrites the draft, never auto-sends), annotated with a `Terminal output (path):` header — using the live `cwd` value when the backend has reported one, else the terminal's spawn directory — and wrapped in a code fence so the agent reads it as literal output. Copy places the raw selection on the clipboard.
 

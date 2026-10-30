@@ -590,7 +590,6 @@ class TestRelayWsCredentialStripping:
                 pass
 
             def recv(self, n):
-                # Return a valid 101 handshake.
                 return b"HTTP/1.1 101 Switching\r\nUpgrade: websocket\r\n\r\n"
 
             def close(self):
@@ -636,7 +635,9 @@ class TestRelayWsHandshakeSanitization:
             b"\r\n"
         )
 
-        up_a, up_b = socket.socketpair()
+        # up_d is what the relay sees as the upstream socket; the feeder plays
+        # the dev server on up_c.
+        up_c, up_d = socket.socketpair()
         down_a, down_b = socket.socketpair()
 
         p = _make_probe(
@@ -644,37 +645,23 @@ class TestRelayWsHandshakeSanitization:
             connection=down_a,
         )
 
-        def feed_upstream():
-            # Feed the handshake response, then close to end the pump.
-            up_b.sendall(handshake_response)
-            time.sleep(0.05)
-            up_b.close()
-
-        feeder = threading.Thread(target=feed_upstream, daemon=True)
-        feeder.start()
-
-        with patch.object(server.socket, "create_connection", return_value=up_b):
-            # Cannot use up_b for both create_connection and the feeder.
-            # Instead, use a wrapper that separates the send side.
-            pass
-
-        # Redo: create_connection returns up_b, which the relay reads from.
-        # We write into up_a (the other end of the pair).
-        up_c, up_d = socket.socketpair()
-
         def feed_up():
+            # Ordered by the bytes, not a sleep: take the relay's upgrade
+            # request first, so up_c is never closed under the relay's write;
+            # then answer and half-close, so the pump reads handshake-then-EOF.
+            _read_relay_request(up_c)
             up_c.sendall(handshake_response)
-            time.sleep(0.05)
-            up_c.close()
+            up_c.shutdown(socket.SHUT_WR)
 
-        # up_d is what relay sees as the upstream socket.
         t_feed = threading.Thread(target=feed_up, daemon=True)
         t_feed.start()
 
         with patch.object(server.socket, "create_connection", return_value=up_d):
             p._relay_ws()
 
-        t_feed.join(timeout=2)
+        t_feed.join(timeout=_PUMP_LOST_RUN_SECS)
+        assert not t_feed.is_alive(), "the feeder never finished"
+        up_c.close()
 
         # Read what was sent to the downstream (client) side.
         down_a.close()
@@ -832,6 +819,9 @@ class TestRelayWsPumpSendallError:
         )
 
         def feed():
+            # Take the relay's request first so up_a is not closed under its write,
+            # which would end the relay before the pump this test covers.
+            _read_relay_request(up_a)
             up_a.sendall(handshake)
             time.sleep(0.05)
             up_a.sendall(b"frame data that will fail on dst sendall")
@@ -864,6 +854,8 @@ class TestRelayWsPumpSendallError:
         )
 
         def feed_then_break():
+            # Same ordering as above: the request first, then the answer.
+            _read_relay_request(up_a)
             up_a.sendall(handshake)
             time.sleep(0.05)
             # RST the connection so recv on up_b raises or returns empty.
@@ -885,6 +877,41 @@ class TestRelayWsPumpSendallError:
         down_b.close()
 
 
+#: Lost-run bound for each read and join the pump test unblocks itself. A passing run
+#: moves a few dozen bytes across a socketpair, and its call measured under 0.01 s in
+#: every repeat, so this only ends a broken run, by name, well inside the suite's 120 s
+#: timeout.
+_PUMP_LOST_RUN_SECS = 10.0
+
+
+def _recv_until(sock: socket.socket, complete, what: str) -> bytes:
+    """Read ``sock`` until ``complete(received)`` holds; fail by name if it never does."""
+    received = b""
+    sock.settimeout(_PUMP_LOST_RUN_SECS)
+    while not complete(received):
+        try:
+            chunk = sock.recv(4096)
+        except TimeoutError:
+            raise AssertionError(
+                f"{what}: nothing more arrived within {_PUMP_LOST_RUN_SECS}s; "
+                f"received {received!r}"
+            ) from None
+        assert chunk, f"{what}: the peer closed first; received {received!r}"
+        received += chunk
+    return received
+
+
+def _read_relay_request(sock: socket.socket) -> bytes:
+    """Play the dev server's first move: read the relay's upgrade request.
+
+    The relay writes its request upstream before it reads the handshake. A feeder
+    that answers and closes without reading races that write, and on a loaded
+    runner the relay hits a closed peer and returns before sending anything
+    downstream. Reading the request first orders the two by the bytes.
+    """
+    return _recv_until(sock, lambda got: b"\r\n\r\n" in got, "the relay's upgrade request")
+
+
 class TestRelayWsPump:
     """The bidirectional pump forwards frames and exits on hangup."""
 
@@ -898,22 +925,13 @@ class TestRelayWsPump:
         down_a, down_b = socket.socketpair()
 
         handshake = b"HTTP/1.1 101 OK\r\nUpgrade: websocket\r\n\r\n"
+        upstream_frame = b"hello from upstream"
+        client_frame = b"hello from client"
 
         p = _make_probe(
             headers={"Upgrade": "websocket", "Sec-WebSocket-Key": "k"},
             connection=down_a,
         )
-
-        def feed_handshake_then_frame():
-            # Feed the handshake, wait for pump to start, then send a frame.
-            up_a.sendall(handshake)
-            time.sleep(0.1)
-            up_a.sendall(b"hello from upstream")
-            time.sleep(0.1)
-            up_a.close()
-
-        feeder = threading.Thread(target=feed_handshake_then_frame, daemon=True)
-        feeder.start()
 
         def run_relay():
             with patch.object(server.socket, "create_connection", return_value=up_b):
@@ -921,29 +939,45 @@ class TestRelayWsPump:
 
         relay_thread = threading.Thread(target=run_relay, daemon=True)
         relay_thread.start()
+        try:
+            # Each step waits for the one before it to be observed, never for a
+            # duration. Upstream answers only the upgrade request it received, and
+            # sends its frame only once the client holds the whole relayed
+            # handshake, so the relay has finished reading the handshake and the
+            # frame can only reach the client through the pump. Sent any earlier,
+            # the frame can reach a late-starting relay in the same read as the
+            # handshake, and the client's handshake read then takes it too.
+            _recv_until(up_a, lambda got: b"\r\n\r\n" in got, "the relayed upgrade request")
+            up_a.sendall(handshake)
+            relayed = _recv_until(down_b, lambda got: b"\r\n\r\n" in got, "the relayed handshake")
+            # Bytes after the header are frame data, however the reads split them.
+            _head, _, early = relayed.partition(b"\r\n\r\n")
 
-        # Read the handshake from the client side first.
-        down_b.settimeout(2)
-        handshake_received = b""
-        while b"\r\n\r\n" not in handshake_received:
-            handshake_received += down_b.recv(4096)
+            up_a.sendall(upstream_frame)
+            forwarded = early + _recv_until(
+                down_b,
+                lambda got: len(early + got) >= len(upstream_frame),
+                "the upstream frame",
+            )
+            assert forwarded == upstream_frame
 
-        # Now read the forwarded frame.
-        frame_data = down_b.recv(4096)
-        assert frame_data == b"hello from upstream"
+            down_b.sendall(client_frame)
+            assert (
+                _recv_until(up_a, lambda got: len(got) >= len(client_frame), "the client frame")
+                == client_frame
+            )
 
-        # Send a frame from the "client" side back upstream.
-        down_b.sendall(b"hello from client")
-        # The relay forwards it to up_b, which comes out on up_a — but up_a
-        # may already be closed by the feeder. The point is the relay exits
-        # cleanly when up_a closes.
-        relay_thread.join(timeout=3)
-        feeder.join(timeout=1)
-        assert not relay_thread.is_alive()
-
-        # Cleanup.
-        down_a.close()
-        down_b.close()
+            # Upstream hangs up: the pump must end.
+            up_a.close()
+            relay_thread.join(_PUMP_LOST_RUN_SECS)
+            assert (
+                not relay_thread.is_alive()
+            ), f"the pump was still running {_PUMP_LOST_RUN_SECS}s after the upstream hangup"
+        finally:
+            # Closing both ends also ends a pump a failed assertion left running.
+            up_a.close()
+            down_a.close()
+            down_b.close()
 
 
 class TestRelayWsIdleCap:
@@ -1008,10 +1042,11 @@ class TestRelayWsRestAfterHandshake:
         )
 
         def feed():
-            # Send handshake + trailing frame, then close to end the pump.
+            # Take the relay's request, send handshake + trailing frame, then
+            # half-close to end the pump -- ordered by the bytes.
+            _read_relay_request(up_a)
             up_a.sendall(handshake_plus_frame)
-            time.sleep(0.05)
-            up_a.close()
+            up_a.shutdown(socket.SHUT_WR)
 
         feeder = threading.Thread(target=feed, daemon=True)
         feeder.start()
@@ -1019,7 +1054,9 @@ class TestRelayWsRestAfterHandshake:
         with patch.object(server.socket, "create_connection", return_value=up_b):
             p._relay_ws()
 
-        feeder.join(timeout=2)
+        feeder.join(timeout=_PUMP_LOST_RUN_SECS)
+        assert not feeder.is_alive(), "the feeder never finished"
+        up_a.close()
 
         # Read everything the client side received.
         down_a.close()
@@ -1093,9 +1130,7 @@ class TestStartInjectProxy:
     def test_bind_failure_returns_none(self):
         """If this fails: a socket bind failure (port conflict) causes an unhandled
         exception, crashing the caller instead of returning a safe fallback."""
-        with patch.object(
-            server, "ThreadingHTTPServer", side_effect=OSError("addr in use")
-        ):
+        with patch.object(server, "_Server", side_effect=OSError("addr in use")):
             srv, url = server._start_inject_proxy("http://127.0.0.1:3000")
         assert srv is None
         assert url == ""

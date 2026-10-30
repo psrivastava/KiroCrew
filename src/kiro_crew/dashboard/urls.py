@@ -31,12 +31,21 @@ _DEFAULT_PORT = 5476
 _BIND_LOCAL = "127.0.0.1"
 _BIND_ALL = "0.0.0.0"
 
-# Loopback hostnames that all resolve to the same machine but are *distinct
+# Loopback host NAMES that all resolve to the same machine but are *distinct
 # browser origins* (origin = scheme://host:port). The dashboard SPA stores user
 # settings (theme, zoom, layout, ...) in per-origin localStorage, so a user who
 # reaches the dashboard on more than one of these names gets a separate, empty
 # settings bucket each time — settings appear to "reset". We canonicalize
 # navigations among this set onto a single host (see should_canonicalize_host).
+#
+# The literal addresses are here because this gateway holds BOTH loopback
+# families on its port (see _start_secondary_loopback_site): every name and
+# literal in this set therefore reaches the same listener, so converging them is
+# a spelling change and nothing more. The credential question is handled where it
+# actually arises -- a request CARRYING one is never redirected at all, whatever
+# it names, because a 302 preserves the query (see should_canonicalize_host). That
+# gate does not depend on which families are bound, which matters because the
+# second bind is best-effort and degrades.
 _CANONICALIZABLE_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost", "kirocrew.localhost"})
 
 
@@ -220,6 +229,62 @@ def dashboard_origin(url: str) -> str:
     return f"{scheme}://{host}:{port}" if port else f"{scheme}://{host}"
 
 
+def dashboard_link_origin(dashboard_url: str, tunnel_url: str = "") -> str:
+    """Browser-facing origin for a Slack->dashboard link, or ``""``.
+
+    The one place that decides tunnel-vs-dashboard for an outbound dashboard
+    link: the live *tunnel_url* when the caller opted into ``slack.use_tunnel_url``
+    and a tunnel is connected, otherwise the configured dashboard origin. Shared
+    by :func:`kiro_crew.dashboard.chat_backfill.session_deep_link` and
+    :func:`kiro_crew.slack.allowlist.send_dashboard_link` so the two cannot drift
+    on which origin a Slack->dashboard link points at.
+
+    *tunnel_url* is used as-is (only a trailing slash trimmed) rather than
+    re-parsed, because it is process-internal state set by the tunnel manager.
+    Returns ``""`` when neither yields a usable origin (``dashboard_origin``
+    already yields ``""`` for an empty, malformed, or non-HTTP URL); a caller
+    then omits the link or falls back to a host:port form of its own.
+    """
+    if tunnel_url:
+        return tunnel_url.rstrip("/")
+    return dashboard_origin(dashboard_url or "")
+
+
+def tunnel_origin_if_opted_in(use_tunnel_url: bool) -> str:
+    """The live tunnel URL when *use_tunnel_url* is set, otherwise ``""``.
+
+    Folds the ``slack.use_tunnel_url ? get_tunnel_url() : ""`` decision that each
+    Slack->dashboard link call site otherwise copy-pastes (``chat_mirror``,
+    ``chat_slack``, ``send_message``'s ``_resolve_session_link_url``), so the
+    "should this link point off-host?" choice lives in ONE place beside
+    :func:`dashboard_link_origin` instead of being re-spelled -- and re-risked --
+    at every site. The result feeds straight into ``dashboard_link_origin`` /
+    ``session_deep_link`` as their *tunnel_url* argument (``""`` there means "use
+    the configured dashboard origin"), so an opted-out caller, or an opted-in one
+    with no tunnel connected, both correctly fall back to the dashboard origin.
+
+    ``get_tunnel_url`` is imported lazily so this module (loaded at gateway boot)
+    does not pull in the tunnel manager, matching the deferred-import style the
+    call sites already use.
+    """
+    if not slack_tunnel_opt_in(use_tunnel_url):
+        return ""
+    from kiro_crew.tunnel import get_tunnel_url
+
+    return get_tunnel_url()
+
+
+def slack_tunnel_opt_in(use_tunnel_url: bool) -> bool:
+    """``slack.use_tunnel_url`` as read; an enterprise build reads it as off.
+
+    The opt-in is a local switch that can point links at, and provision, a public
+    tunnel, so it shares the ``tunnel`` lock (RFC D3, ``kiro_crew.edition_locks``).
+    """
+    from kiro_crew.edition_locks import local_enable_locked
+
+    return use_tunnel_url and not local_enable_locked("tunnel")
+
+
 # ---------------------------------------------------------------------------
 # Remote-proxy detection (OSS: no managed proxy)
 # ---------------------------------------------------------------------------
@@ -317,8 +382,34 @@ def bind_address_for(local_only: bool) -> str:
                 _ENV_BIND,
                 override,
             )
-            return override
-    return _BIND_LOCAL if local_only else _BIND_ALL
+            return _governed_bind(override)
+    return _governed_bind(_BIND_LOCAL if local_only else _BIND_ALL)
+
+
+def _governed_bind(address: str) -> str:
+    """*address*, or loopback when the ``bind_address`` policy refuses it.
+
+    ``127.0.0.1`` is the floor and is never asked. Any other address is asked as its
+    canonical IP text (``edition_locks.policy_permits``): in an enterprise build only
+    a policy that names it can widen the bind (RFC D3), and an ``oss`` build with no
+    policy naming the key binds as before. Fail-closed: an error binds loopback.
+    """
+    if address == _BIND_LOCAL:
+        return address
+    from kiro_crew.edition_locks import policy_permits
+
+    try:
+        item = str(ipaddress.ip_address(address))
+    except ValueError:
+        item = address
+    if policy_permits("bind_address", item, audit_tool="gateway_bind"):
+        return address
+    logger.warning(
+        "bind address %s is not permitted by governance (bind_address); binding %s",
+        address,
+        _BIND_LOCAL,
+    )
+    return _BIND_LOCAL
 
 
 # ---------------------------------------------------------------------------
@@ -369,19 +460,27 @@ def should_canonicalize_host(
     *,
     method: str,
     sec_fetch_dest: str | None,
+    carries_credential: bool = False,
 ) -> bool:
     """Return True if a request should be 302-redirected to *canonical_host*.
 
-    Converges loopback aliases (127.0.0.1 / localhost / kirocrew.localhost) onto
-    a single origin so the SPA's per-origin localStorage settings are not split
-    across hostnames (see _CANONICALIZABLE_LOOPBACK_HOSTS). Conservative on every
-    axis so it can never touch a request that isn't a same-machine top-level
-    page navigation:
+    Converges the loopback names AND literals (localhost / kirocrew.localhost /
+    127.0.0.1 / ::1) onto a single origin so the SPA's per-origin localStorage
+    settings are not split across spellings. Converging the literals is safe
+    because this gateway holds both loopback families on its port, so every
+    spelling in that set reaches the same listener (see
+    _CANONICALIZABLE_LOOPBACK_HOSTS). Conservative on every axis so it can never
+    touch a request that isn't a same-machine top-level page navigation:
 
     * only GET/HEAD (never a mutating request),
     * only true top-level document navigations (``Sec-Fetch-Dest: document`` —
       absent/empty/websocket/XHR are left alone, so APIs and WebSockets and
       sub-resource fetches are never redirected),
+    * only when the request carries no credential: a 302 preserves the query, so
+      redirecting a ``?token=`` navigation would hand that bearer to whatever
+      answers the canonical name. The caller decides what counts as a credential;
+      a request bearing one is served where it was sent, and the settings bucket
+      loses a redirect it was never entitled to at that price,
     * only when both the request host and the canonical host are in the
       canonicalizable loopback set (real hostnames / reverse-proxy vhosts are
       never redirected),
@@ -393,6 +492,8 @@ def should_canonicalize_host(
     if method not in ("GET", "HEAD"):
         return False
     if sec_fetch_dest != "document":
+        return False
+    if carries_credential:
         return False
     host = _host_without_port(request_host or "")
     if host not in _CANONICALIZABLE_LOOPBACK_HOSTS:
@@ -478,8 +579,11 @@ def build_allowed_origins(
     origins: set[str] = {
         f"http://127.0.0.1:{port}",
         f"http://localhost:{port}",
+        f"http://[::1]:{port}",
         f"http://kirocrew.localhost:{port}",
     }
+    # Each also as a browser sends it (``dashboard_origin`` drops port 80).
+    origins |= {dashboard_origin(o) for o in origins}
     if os.environ.get("KIROCREW_HOME"):
         origins.add("http://localhost:3000")
         origins.add("http://127.0.0.1:3000")
@@ -518,7 +622,90 @@ def build_allowed_origins(
             origins.add(f"http://localhost:{_p}")
             origins.add(f"http://[::1]:{_p}")
             origins.add(f"http://kirocrew.localhost:{_p}")
-    return origins
+    return _governed_origins(origins, port, tailnet_host)
+
+
+def origin_policy_item(origin: str) -> str:
+    """The ``dashboard_origins`` item for *origin*: the host it will really trust.
+
+    ``build_allowed_hosts`` trusts ``urlparse(origin).hostname``, so the policy is
+    asked about that host, never the raw text: ``https://evil.com/.example.com``
+    is asked as ``https://evil.com``, and so is ``https://evil.com:bad``.
+    """
+    canonical = dashboard_origin(origin)
+    if canonical:
+        return canonical
+    try:
+        parsed = urlparse(_ensure_scheme(origin))
+        host = parsed.hostname
+    except ValueError:
+        host = None
+    if host:
+        return f"{parsed.scheme}://[{host}]" if ":" in host else f"{parsed.scheme}://{host}"
+    return origin
+
+
+def origin_permitted(origin: str, *, audit_tool: str = "") -> bool:
+    """Whether the ``dashboard_origins`` policy lets *origin* be trusted.
+
+    Asked about :func:`origin_policy_item`. An item that is not exactly
+    ``scheme://host[:port]`` cannot be matched, so while a policy governs the key it
+    is refused rather than read as a deny-list miss (fail-closed).
+    """
+    from kiro_crew.edition_locks import audit_refusal, policy_governs, policy_permits
+    from kiro_crew.platform.governance_parts.matching import _ORIGIN_ITEM_RE, _origin_form
+
+    item = origin_policy_item(origin)
+    if not _ORIGIN_ITEM_RE.match(_origin_form(item)) and policy_governs("dashboard_origins"):
+        if audit_tool:
+            audit_refusal(audit_tool, "dashboard_origins", item, "not an origin")
+        return False
+    return policy_permits("dashboard_origins", item, audit_tool=audit_tool)
+
+
+def _governed_origins(origins: set[str], port: int, tailnet_host: str) -> set[str]:
+    """*origins* without the extras the ``dashboard_origins`` policy refuses.
+
+    This machine's loopback origins on the bound *port* are the floor and are never
+    asked. The tailnet origin answers to ``capabilities.tailnet_origin``
+    (``dashboard/tailnet.py``; off in an enterprise build), so it is not asked twice. Every
+    other origin is asked by its own text (``edition_locks.policy_permits``): in an
+    enterprise build none passes unless a policy names it (RFC D3); an ``oss`` build
+    with no policy naming the key keeps every origin, as before.
+    """
+    floor = {
+        f"http://127.0.0.1:{port}",
+        f"http://localhost:{port}",
+        f"http://[::1]:{port}",
+        f"http://kirocrew.localhost:{port}",
+    }
+    floor |= {dashboard_origin(o) for o in floor}
+    if tailnet_host:
+        floor.add(f"https://{tailnet_host}")
+    extras = sorted(origins - floor)
+    if not extras:
+        return origins
+    refused = {o for o in extras if not origin_permitted(o, audit_tool="dashboard_origin")}
+    if refused:
+        logger.warning(
+            "dashboard origins not permitted by governance (dashboard_origins): %s",
+            ", ".join(sorted(refused)),
+        )
+    approved = set(extras) - refused
+    return (origins - set(extras)) | {stored_origin(o) for o in approved}
+
+
+def stored_origin(origin: str) -> str:
+    """The spelling an approved extra *origin* is kept in ``allowed_origins``.
+
+    In an enterprise build that is :func:`origin_policy_item`, the item the policy
+    approved and the form a browser sends. ``check_origin`` matches a non-loopback
+    Origin exactly there, so a configured ``https://Crew.Example.com:443`` is kept as
+    ``https://crew.example.com``. An ``oss`` build keeps the text as configured.
+    """
+    from kiro_crew import edition
+
+    return origin_policy_item(origin) if edition.is_enterprise() else origin
 
 
 def build_allowed_hosts(allowed_origins: set[str]) -> set[str]:

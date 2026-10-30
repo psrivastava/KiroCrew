@@ -18,6 +18,7 @@ from unittest.mock import MagicMock
 
 import pytest
 from chat_test_helpers import _make_state
+from test_handler_turn import SLACK_TURN_FUNCTIONS
 
 from kiro_crew.dashboard.chat_utils import (
     mint_options_token,
@@ -133,11 +134,15 @@ class TestTheTurnIsDurableBeforeItsControlGoesOut:
         Asserted on indentation because that is precisely what went wrong -- the
         block was correct, its scope was not.
         """
-        import inspect
+        from pathlib import Path
 
         from kiro_crew.slack import gateway
 
-        src = inspect.getsource(gateway)
+        # The persist this pins is the AutoNudge channel turn's, which the facade
+        # composes from this owner, one indent level shallower than the class body
+        # it was written in: the bound below is 24 less those 4 columns.
+        owner = Path(gateway.__file__).parent / "gateway_runtime" / "nudge_channel_fire.py"
+        src = owner.read_text(encoding="utf-8")
         persist = src.find("await save_conversation_turn_off_loop(\n", src.find("subagent"))
         assert persist != -1, "the subagent turn must still be persisted"
 
@@ -146,7 +151,7 @@ class TestTheTurnIsDurableBeforeItsControlGoesOut:
         assert guard != -1, "the persist must stay guarded on conv_log"
         line_start = src.rfind("\n", 0, guard) + 1
         indent = guard - line_start
-        assert indent <= 24, (
+        assert indent <= 20, (
             f"the persist guard is indented {indent} spaces; deeper than the "
             "per-attempt level means it sits inside the Slack-only branch and "
             "non-Slack subagent completions are never written"
@@ -165,10 +170,10 @@ class TestTheTurnIsDurableBeforeItsControlGoesOut:
 
         from kiro_crew.slack import handler
 
-        src = inspect.getsource(handler.handle_message)
-        assert "if options and thread_ts" not in src, (
-            "gating the token mint on thread_ts strands every root-thread control"
-        )
+        src = "".join(inspect.getsource(getattr(handler, n)) for n in SLACK_TURN_FUNCTIONS)
+        assert (
+            "if options and thread_ts" not in src
+        ), "gating the token mint on thread_ts strands every root-thread control"
         mint = src.find("mint_options_token")
         assert mint != -1, "the footer must still mint a token"
         window = src[mint : mint + 220]
@@ -190,7 +195,7 @@ class TestTheTurnIsDurableBeforeItsControlGoesOut:
 
         from kiro_crew.slack import handler
 
-        src = inspect.getsource(handler.handle_message)
+        src = "".join(inspect.getsource(getattr(handler, n)) for n in SLACK_TURN_FUNCTIONS)
         persist = src.find("save_conversation_turn_off_loop(")
         mint = src.find("mint_options_token")
         assert persist != -1, "the turn must still be persisted in handle_message"
@@ -223,9 +228,9 @@ class TestTheTurnIsDurableBeforeItsControlGoesOut:
         # The queued second turn lands.
         await save_conversation_turn_off_loop(log, OWNER, "next question", "answered")
 
-        assert await options_control_is_stale(state, token, THREAD) is True, (
-            "the first control is superseded and its clicks must be refused"
-        )
+        assert (
+            await options_control_is_stale(state, token, THREAD) is True
+        ), "the first control is superseded and its clicks must be refused"
         # Contrast, and the reason the fix is not cosmetic: minting by re-reading
         # the tail HERE names the second turn, and the same superseded control
         # then reads as live.
@@ -251,34 +256,45 @@ class TestTheAnswerGoesToTheConversationThatAsked:
         conversation that never asked the question. The token already names the
         asker; the pin must come from there.
         """
+        import importlib
         import inspect
 
         from kiro_crew.slack import interactions
 
-        src = inspect.getsource(interactions)
-        assert src.count("_asker = decode_options_token(") == 2, (
-            "both click paths must read the asker from the control's own token"
+        # The facade and every owner its handlers moved to.
+        src = "\n".join(
+            inspect.getsource(importlib.import_module(name))
+            for name in (interactions.__name__, *interactions._OWNERS)
         )
-        assert "slack_options_linked_slot" not in src, (
-            "pinning the thread's CURRENT owner reintroduces the handover bug"
-        )
-        assert src.count("route_pinned=_route_pinned") == 2, (
-            "both dispatches must pass the pin through to routing"
-        )
+        # One answer path now serves the click and the "Choose several..." modal.
+        assert (
+            src.count("_asker = decode_options_token(") == 1
+        ), "the answer path must read the asker from the control's own token"
+        assert (
+            "slack_options_linked_slot" not in src
+        ), "pinning the thread's CURRENT owner reintroduces the handover bug"
+        assert (
+            src.count("route_pinned=_route_pinned") == 1
+        ), "the dispatch must pass the pin through to routing"
 
     def test_an_untokened_control_pins_nothing(self):
         """No token means no claim about the destination, so keep today's routing.
 
         Refusing instead would strand every control posted before this shipped.
         """
+        import importlib
         import inspect
 
         from kiro_crew.slack import interactions
 
-        src = inspect.getsource(interactions)
-        assert src.count("_route_pinned = _asker_key is not None") == 2, (
-            "the pin must be conditional on a token being present"
+        # The facade and every owner its handlers moved to.
+        src = "\n".join(
+            inspect.getsource(importlib.import_module(name))
+            for name in (interactions.__name__, *interactions._OWNERS)
         )
+        assert (
+            src.count("_route_pinned = _asker_key is not None") == 1
+        ), "the pin must be conditional on a token being present"
 
     def test_a_pinned_answer_never_claims_the_thread(self):
         """Routing the answer must not rewrite who OWNS the thread.
@@ -290,23 +306,28 @@ class TestTheAnswerGoesToTheConversationThatAsked:
         prevent, in the opposite direction.
 
         Structural rather than end-to-end: the gate sits ~50 lines inside
-        ``handle_message``'s try block, past ``sessions.get_or_create``, so
+        ``_run_turn``'s try block, past ``sessions.get_or_create``, so
         reaching it needs the whole turn pipeline stood up. What broke was the
         GATE, so the gate is what this pins.
         """
         import inspect
+        from pathlib import Path
 
         from kiro_crew.slack import handler
 
-        src = inspect.getsource(handler)
-        assert "if thread_owner_key is None and not route_pinned:" in src, (
-            "a pinned answer must never claim the thread, however empty the index"
+        # The facade and the handler_runtime owners its turn runs in, as one text.
+        src = inspect.getsource(handler) + "".join(
+            path.read_text(encoding="utf-8")
+            for path in sorted((Path(handler.__file__).parent / "handler_runtime").glob("*.py"))
         )
+        assert (
+            "if thread_owner_key is None and not route_pinned:" in src
+        ), "a pinned answer must never claim the thread, however empty the index"
         # The old spelling steered the claim off a variable the pin path
         # deliberately falsified to None, which is why the claim fired.
-        assert "if not linked_session_key:\n" not in src, (
-            "the claim must not read the falsified mirror value"
-        )
+        assert (
+            "if not linked_session_key:\n" not in src
+        ), "the claim must not read the falsified mirror value"
 
 
 class TestTheRuleItself:

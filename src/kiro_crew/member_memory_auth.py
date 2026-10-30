@@ -6,17 +6,104 @@ Member memory is routed by a captured record, not process ancestry or proof toke
 
 from __future__ import annotations
 
+import logging
 import os
+import re
 import sys
+import time
+from dataclasses import dataclass
 from typing import Any
 
 from kiro_crew import platform_compat
+from kiro_crew.config.paths import config_dir
 from kiro_crew.execution_context import (
     bind_session_execution,
     execution_for_store,
     read_session_execution,
 )
 from kiro_crew.session_token_sig import verify_session_token
+
+logger = logging.getLogger(__name__)
+
+# Legacy per-pid member-memory binding records:
+# ``<crew home>/member-memory-bindings/pids/<pid>.json`` and
+# ``<pid>.namespace.json``. A removed routing path wrote one per agent process
+# and deleted none, and no sweep ever collected them, so they accumulate for the
+# install's life -- measured on an operator host at 165,975 files spanning nine
+# days and 24 MB of directory inode, of which 165,816 named no live process.
+# Nothing in this version writes the directory; this is the collector it never
+# had.
+_LEGACY_PID_BINDING_DIR = ("member-memory-bindings", "pids")
+_LEGACY_PID_BINDING_NAME_RE = re.compile(r"^(\d+)\.(?:json|namespace\.json)$")
+# A record is only ever removed when it is BOTH older than this AND names no
+# live process. Age alone would race a just-written record; a dead pid alone
+# would delete a record whose pid number has been recycled away from the process
+# that owns it while that owner is still running under a re-read. Requiring both
+# is what makes the prune safe against pid reuse in either direction.
+_LEGACY_PID_BINDING_MIN_AGE_SECS = 24 * 3600.0
+# Per-pass deletion budget. The first pass on a host that has accumulated for
+# weeks would otherwise be a six-figure unlink run inside one maintenance-pool
+# task; the sweep repeats on a bounded cadence, so a backlog drains over several
+# passes instead of monopolising one.
+_LEGACY_PID_BINDING_PRUNE_BUDGET = 2000
+
+
+def prune_legacy_member_pid_bindings(
+    *,
+    budget: int = _LEGACY_PID_BINDING_PRUNE_BUDGET,
+    min_age_secs: float = _LEGACY_PID_BINDING_MIN_AGE_SECS,
+) -> int:
+    """Delete aged per-pid binding records whose pid names no live process.
+
+    Blocking filesystem work: callers on an event loop MUST offload it (the
+    periodic sweep runs it on the maintenance executor). Returns the number of
+    records removed; 0 when the directory is absent, which is the normal state on
+    an install that never ran the path that wrote it.
+    """
+    root = config_dir().joinpath(*_LEGACY_PID_BINDING_DIR)
+    cutoff = time.time() - max(0.0, float(min_age_secs))
+    removed = 0
+    try:
+        scan = os.scandir(root)
+    except (OSError, ValueError):
+        return 0
+    with scan:
+        for entry in scan:
+            if removed >= max(0, int(budget)):
+                break
+            match = _LEGACY_PID_BINDING_NAME_RE.match(entry.name)
+            if match is None:
+                # An unrecognised name is left alone: this sweep owns exactly the
+                # record shape it can attribute to a pid, and a directory the
+                # operator or a later version put something else in is not its
+                # to empty.
+                continue
+            try:
+                # follow_symlinks=False on BOTH the stat and the unlink scope:
+                # the directory is agent-writable, so a planted link must not
+                # redirect either the age reading or the deletion.
+                if entry.is_symlink() or entry.stat(follow_symlinks=False).st_mtime >= cutoff:
+                    continue
+            except OSError:
+                continue
+            try:
+                pid = int(match.group(1))
+            except ValueError:
+                continue
+            if platform_compat.pid_exists(pid):
+                continue
+            try:
+                os.unlink(entry.path)
+            except OSError:
+                continue
+            removed += 1
+    if removed:
+        logger.info(
+            "Pruned %d stale per-pid member-memory binding record(s) from %s",
+            removed,
+            root,
+        )
+    return removed
 
 
 def read_private_session_store(session_key: str) -> str | None:
@@ -34,7 +121,13 @@ def bind_private_session_store(session_key: str, memory_store: str) -> None:
         if current.store.store_id != memory_store or current.member_id is None:
             raise ValueError("The session already has another memory binding")
         return
-    bind_session_execution(session_key, execution_for_store(memory_store))
+    # Establishing, so it vouches. The store arrives as this function's ARGUMENT from
+    # trusted gateway code -- never read back from the session's own record -- and the
+    # early return above refuses to rebind a session that already has a record, so it
+    # cannot re-point an existing session at a peer's store. Without the
+    # vouch the session is published but unvouched, and its own-store dispatch is then
+    # refused with "cannot verify delegation within the caller's memory assignment".
+    bind_session_execution(session_key, execution_for_store(memory_store), vouch=True)
 
 
 def private_memory_store_for_session(session_key: str | None) -> str:
@@ -57,6 +150,11 @@ def protected_member_session_for_pid(peer_pid: int, *, home: Any | None = None) 
     narrow hook so host integrations can provide a process identity without
     coupling that resolver to memory routing.  The default implementation has
     no member-memory authority and therefore returns no identity.
+
+    Host overrides must return ``None`` when a binding is missing *or*
+    unreadable (for example a Seatbelt deny). Return ``""`` only for an
+    explicit invalid/revoked record — callers treat a blank string as a hard
+    refusal that must not fall through to ``KIROCREW_SESSION_KEY``.
     """
     del peer_pid, home
     return None
@@ -128,17 +226,53 @@ def require_memory_consolidation_session_key(session_key: str, expected_store: s
         raise ValueError("Consolidation session does not match the store")
 
 
-def local_owner_bootstrap_allowed(request: Any) -> bool:
-    """Require positive host provenance regardless of installed memory stores."""
+@dataclass(frozen=True)
+class LocalOwnerProvenance:
+    """Positive host provenance of a caller admitted to the local owner-token mint.
+
+    ``app`` names the app whose gateway-spawned backend owns the calling process,
+    read from the backend registry; it is ``None`` for an ordinary host process
+    the registry does not know. The mint stamps it into its audit record, so an
+    owner token minted by an app is attributed to that app. It is NOT a token
+    claim: an ``app``-scoped token is refused by the owner-dashboard check, so
+    carrying it in the token would withdraw the capability this admission grants.
+    """
+
+    app: str | None = None
+
+
+def local_owner_bootstrap_provenance(request: Any) -> LocalOwnerProvenance | None:
+    """Positive host provenance of the caller, or ``None`` when it is refused.
+
+    Admission is unchanged from the boolean gate: a kernel-identified peer with
+    a readable process incarnation that is either an ordinary host process or a
+    live backend this gateway spawned. The backend registry is consulted first
+    so that a spawned backend is attributed by name even where it also passes as
+    a host process (an unsandboxed backend shares the gateway's namespaces); the
+    order changes what is RECORDED, never what is admitted.
+    """
     try:
         pid = _request_peer_pid(request)
-        return bool(
-            isinstance(pid, int)
-            and platform_compat.get_process_start_id(pid)
-            and (_verified_host_process(pid) or _gateway_spawned_app_backend(pid))
-        )
+        if not (isinstance(pid, int) and platform_compat.get_process_start_id(pid)):
+            return None
+        try:
+            app = _gateway_spawned_app_backend(pid)
+        except Exception:
+            # A registry that cannot answer names no app; the host leg below still
+            # decides admission exactly as it does for a caller no backend owns.
+            app = None
+        if app:
+            return LocalOwnerProvenance(app=str(app))
+        if _verified_host_process(pid):
+            return LocalOwnerProvenance()
+        return None
     except Exception:
-        return False
+        return None
+
+
+def local_owner_bootstrap_allowed(request: Any) -> bool:
+    """Require positive host provenance regardless of installed memory stores."""
+    return local_owner_bootstrap_provenance(request) is not None
 
 
 def _verified_host_process(pid: int) -> bool:
@@ -150,13 +284,18 @@ def _verified_host_process(pid: int) -> bool:
     return sys.platform == "win32"
 
 
-def _gateway_spawned_app_backend(pid: int) -> bool:
-    """Recognize a live app backend launched and tracked by this gateway."""
+def _gateway_spawned_app_backend(pid: int) -> str | None:
+    """Name the live app backend launched and tracked by this gateway that owns *pid*.
+
+    ``None`` when no spawned backend owns the process, and when the backend
+    registry cannot be imported at all: an unanswerable question is a refusal of
+    this leg, never an admission.
+    """
     try:
-        from kiro_crew.apps.backend import spawned_backend_owns_pid
+        from kiro_crew.apps.backend import spawned_backend_owner
     except Exception:
-        return False
-    return spawned_backend_owns_pid(pid)
+        return None
+    return spawned_backend_owner(pid)
 
 
 def _request_peer_pid(request: Any) -> int | None:

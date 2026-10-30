@@ -13,6 +13,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from body_stream_helpers import attach_json_body
 
 from kiro_crew import artifacts as art_mod
 from kiro_crew.artifacts import ArtifactStore
@@ -44,7 +45,7 @@ def _req(
     r.match_info = match or {}
     r.query = {}
     r._restricted = restricted
-    r.read = AsyncMock(return_value=json.dumps(body).encode() if isinstance(body, dict) else b"")
+    attach_json_body(r, json.dumps(body).encode() if isinstance(body, dict) else b"")
     r.app = {"state": MagicMock()}
     return r
 
@@ -206,7 +207,7 @@ class TestDeleteAndList:
     @pytest.mark.asyncio
     async def test_get_anchor_includes_prefix_suffix(self, store):
         # Regression: the local GET serializer must echo prefix/suffix so the
-        # markdown overlay can disambiguate a repeated quote — rangeForAnchor
+        # markdown overlay can disambiguate a repeated quote — rangesForAnchor
         # matches on quote+prefix+suffix and ignores the offsets. Without these
         # a comment on a later occurrence highlights the first match. Must match
         # the remote serializer (_serialize_remote_comment).

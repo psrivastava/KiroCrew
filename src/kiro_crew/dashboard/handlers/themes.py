@@ -38,6 +38,7 @@ from typing import Any
 from aiohttp import web
 
 from kiro_crew.atomic_write import atomic_write
+from kiro_crew.dashboard.conditional_get import conditional_response, weak_content_etag
 from kiro_crew.dashboard.theme_validate import (
     _THEME_ASSET_CSP,
     _THEME_ASSET_CT,
@@ -69,14 +70,15 @@ from kiro_crew.hooks import (
     FileTooLargeError,
     is_unc_shape,
     safe_read_file_bytes_nolink,
+    screen_windows_linked_ancestors,
     unc_probe_allowed,
 )
 from kiro_crew.pinned_fs import fd_real_path
 from kiro_crew.platform_compat import (
     IS_WINDOWS,
-    first_linked_ancestor,
     is_link_or_junction,
     pin_directory,
+    rmtree_force,
 )
 from kiro_crew.sandbox import (
     SandboxUnavailableError,
@@ -102,6 +104,10 @@ def _list_themes_sync() -> list[dict[str, Any]]:
         for f in themes_path.glob("*.json"):
             try:
                 data = json.loads(f.read_text(encoding="utf-8"))
+                # Valid JSON that is not an object (a list, a number) is skipped
+                # like a corrupt file, so one bad file never fails the whole list.
+                if not isinstance(data, dict):
+                    continue
                 result.append(
                     {
                         "slug": f.stem,
@@ -110,7 +116,7 @@ def _list_themes_sync() -> list[dict[str, Any]]:
                         "created_at": data.get("created_at", ""),
                     }
                 )
-            except (json.JSONDecodeError, OSError):
+            except (json.JSONDecodeError, UnicodeDecodeError, OSError):
                 continue
         # Installed themes are directories (<slug>/) carrying a theme.json.
         # Dot-prefixed dirs are transient install staging/backup snapshots
@@ -125,7 +131,9 @@ def _list_themes_sync() -> list[dict[str, Any]]:
                 continue
             try:
                 m = json.loads(mpath.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, OSError):
+            except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+                continue
+            if not isinstance(m, dict):
                 continue
             result.append(
                 {
@@ -242,10 +250,15 @@ def _resolve_local_source(path_str: str) -> tuple[Path | None, str | None]:
         # real guard is `is_sensitive_path` on the RESOLVED path below -- so
         # gating this keeps macOS installs from `/tmp` and `/var` (symlinks to
         # `/private/*`) working, which an unconditional walk would refuse.
+        # The shared screen rewrites a local linked prefix to its vetted target
+        # and refuses UNC, device, drive-relative and `..`-climbing targets;
+        # every check below runs on the REWRITTEN path, never through the link.
         # The reply matches the leaf case on purpose: which ancestor is a link
         # is filesystem layout, and the caller supplied a path to guess at it.
-        if first_linked_ancestor(p) is not None:
+        screened = screen_windows_linked_ancestors(p)
+        if screened is None:
             return None, "local path must not be a symlink"
+        p = screened
     # Root junction: `Path.is_symlink()` is False for a Windows junction, so a
     # junction as the pack ROOT would pass an islink-only check and be resolved
     # through -- the same predicate gap the copy walk closes for subdirectories.
@@ -750,7 +763,7 @@ def _do_install(stype: Any, source: dict[str, Any]) -> tuple[dict[str, Any] | No
     finally:
         if source_fd >= 0:
             os.close(source_fd)
-        shutil.rmtree(tmp_root, ignore_errors=True)
+        rmtree_force(tmp_root)
 
 
 def _audit_theme_install_governance(
@@ -922,7 +935,9 @@ async def api_theme_detail(request: web.Request) -> web.Response:
             with _theme_install_lock(safe_slug):
                 try:
                     existing = json.loads(target.read_text("utf-8"))
-                except (json.JSONDecodeError, OSError):
+                except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+                    existing = {}
+                if not isinstance(existing, dict):
                     existing = {}
                 td = {
                     "name": name,
@@ -949,7 +964,7 @@ async def api_theme_detail(request: web.Request) -> web.Response:
                 discovery_executor(), target.read_text, "utf-8"
             )
             data = json.loads(raw)
-        except (json.JSONDecodeError, OSError):
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError):
             return web.json_response({"error": "failed to read theme"}, status=500)
         return web.json_response(data)
     if dir_is_dir:
@@ -1000,18 +1015,9 @@ async def api_theme_detail(request: web.Request) -> web.Response:
 #
 # Static assets are served with a strict Content-Type + ``nosniff``; overlay and
 # topbar HTML get a locked-down CSP (they run in sandboxed iframes, §8.2). All
-# routes resolve the requested path *within* the theme directory (no traversal).
-
-def _theme_html_response(text: str) -> web.Response:
-    """Serve overlay/topbar HTML with the sandbox CSP + nosniff."""
-    return web.Response(
-        text=text,
-        content_type="text/html",
-        headers={
-            "Content-Security-Policy": _THEME_OVERLAY_CSP,
-            "X-Content-Type-Options": "nosniff",
-        },
-    )
+# routes resolve the requested path *within* the theme directory (no traversal),
+# and all three routes answer through ``_theme_asset_response`` so the
+# validator / 304 contract is the same for every byte a pack serves.
 
 
 async def api_theme_asset(request: web.Request) -> web.Response:
@@ -1039,13 +1045,41 @@ async def api_theme_asset(request: web.Request) -> web.Response:
     )
     if body is None:
         return web.json_response({"error": "not found"}, status=404)
-    return web.Response(
-        body=body,
-        content_type=ct,
-        headers={
-            "X-Content-Type-Options": "nosniff",
-            "Content-Security-Policy": _THEME_ASSET_CSP,
-        },
+    return _theme_asset_response(request, body, ct)
+
+
+# Fonts, overrides.css and branding images are fetched on EVERY dashboard load;
+# without a validator the browser re-downloads each full body every time. The
+# validator is a digest of the bytes just read, so a reinstall under the same
+# slug (the pack directory is replaced in place) changes it and a stale cached
+# copy is never revalidated as fresh. ``must-revalidate`` + ``max-age=0`` keeps
+# the browser asking; a matching ``If-None-Match`` turns the answer into a
+# header-only 304.
+_THEME_ASSET_CACHE_CONTROL = "private, max-age=0, must-revalidate"
+
+
+def _theme_asset_response(
+    request: web.Request,
+    body: bytes,
+    content_type: str,
+    *,
+    csp: str = _THEME_ASSET_CSP,
+    charset: str | None = None,
+) -> web.Response:
+    """200 with the body, or 304 when the client already holds these bytes.
+
+    Both answers carry the same ETag / Cache-Control and the same ``nosniff``
+    + CSP headers, so a 304 never relaxes what the 200 promised. Overlay and
+    topbar HTML pass their sandbox CSP via ``csp``.
+    """
+    return conditional_response(
+        request,
+        body,
+        content_type,
+        etag=weak_content_etag(body),
+        cache_control=_THEME_ASSET_CACHE_CONTROL,
+        extra_headers={"Content-Security-Policy": csp},
+        charset=charset,
     )
 
 
@@ -1074,7 +1108,9 @@ async def api_theme_overlay(request: web.Request) -> web.Response:
     )
     if raw is None:
         return web.json_response({"error": "not found"}, status=404)
-    return _theme_html_response(raw.decode("utf-8", errors="replace"))
+    return _theme_asset_response(
+        request, raw, "text/html", csp=_THEME_OVERLAY_CSP, charset="utf-8"
+    )
 
 
 async def api_theme_topbar(request: web.Request) -> web.Response:
@@ -1102,4 +1138,6 @@ async def api_theme_topbar(request: web.Request) -> web.Response:
     )
     if raw is None:
         return web.json_response({"error": "not found"}, status=404)
-    return _theme_html_response(raw.decode("utf-8", errors="replace"))
+    return _theme_asset_response(
+        request, raw, "text/html", csp=_THEME_OVERLAY_CSP, charset="utf-8"
+    )

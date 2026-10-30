@@ -1,13 +1,13 @@
 ---
 name: self-nudge-loop
-description: Build a reactive same-session autonomy loop using KiroCrew's AutoNudgeService. One long-lived dashboard session keeps working toward a goal — when its turn completes and no user input arrives within idle_secs, the service auto-injects a nudge message into the SAME session. Survives tab close, logout, and gateway restart. Use when user says "continuous improvement session", "keep going on its own", "same session loop", "self-nudge", "north star loop", or wants one persistent session that auto-resumes whenever idle. NOT for fresh-session crons, parallel work, or external-system callbacks.
+description: Build a deadline-preserving same-session autonomy loop using Kiro Crew's AutoNudgeService. One long-lived session keeps working toward a goal; each completed loop turn schedules the next nudge, while user turns defer but do not reset that deadline. Survives tab close, logout, and gateway restart. Use when user says "continuous improvement session", "keep going on its own", "same session loop", "self-nudge", or "north star loop". NOT for fresh-session crons, parallel work, or external-system callbacks.
 tags: [skill, kirocrew, autonudge, autonomy, loop]
 ---
 
 # Self-Nudge Loop
 
 ## Overview
-`AutoNudgeService` (in `kiro_crew.autonudge`) keeps a single dashboard chat slot working toward a goal by re-feeding a nudge message every time the slot goes idle. Unlike `cron_add`, the nudge runs IN the same slot — warm memory, same tools, same conversation history. State persists across gateway restarts via `~/.kiro/crew/autonudge.json`.
+`AutoNudgeService` (in `kiro_crew.autonudge`) keeps a single chat session working toward a goal by re-feeding a nudge on its persisted deadline, deferred while a user turn is active. Unlike `cron_add`, the nudge runs in the same session — warm memory, same tools, same conversation history. State persists across gateway restarts via `~/.kiro/crew/autonudge.json`.
 
 ## Usage
 Use when the user wants:
@@ -33,7 +33,7 @@ When disabled, the REST API returns 503 and the UI popover surfaces the error.
 
 ## Core Concepts
 
-**Reactive idle timer** — after every `HOOK_EVENT_STOP` (turn completes), the service arms a per-slot `asyncio` timer for `idle_secs`. If a user message arrives, timer cancels (user wins). If the timer fires, the configured nudge is injected into the slot as a distinctively-styled `msg msg-nudge` bubble and `_run_chat` processes it normally.
+**Deadline-preserving timer** — after a loop turn completes, the service stores an absolute `next_due_ts` and arms a per-slot timer. A user turn cancels the pending timer task so it cannot race the human, but does not move the deadline; when that turn ends, the timer resumes toward the same deadline and may fire shortly afterward if already due. A delivered loop turn starts the next full interval from that turn's end.
 
 **Three files the agent owns** (convention, not enforced):
 | File | Role |
@@ -43,13 +43,13 @@ When disabled, the REST API returns 503 and the UI popover surfaces the error.
 | `tasks.md` | Active checklist. Agent checks off / adds items each cycle. |
 
 **Kill switches (any of the below):**
-- The looping agent itself calls the `autonudge_stop` MCP tool — preferred, works from inside the loop with no ID lookup needed. The tool identifies the current slot from `KIROCREW_SESSION_KEY` and deletes the bound loop.
-- Click the **Stop loop** button in the UI popover.
+- The looping agent itself calls the session-bound `autonudge_stop` MCP tool — preferred, with no loop ID or token handling needed. Ordinary prompt loops are removed; structured monitor records follow their own retained-stop contract.
+- In the UI popover, click the Pause icon button (named "Pause loop") to deactivate the loop. To delete it for good, Pause first, then click **Clear stopped goal** and confirm.
 - Create the configured `STOP` sentinel file — next cycle halts.
 - `max_cycles` reached — loop deactivates (not removed, so you can resume).
 - `DELETE /api/autonudge/{loop_id}` or `autonudge_svc.remove(id)`.
 
-**Warning:** a STOP sentinel file is ONLY checked if the loop was created with a non-empty `stop_sentinel_path`. If the path is empty, the sentinel file is ignored and nudges keep firing. A path pointing at a sensitive location is refused at arm time, and a persisted path is re-homed onto the current data home on reload — silently dropped if it cannot be repaired. Prefer the `autonudge_stop` MCP tool for in-loop halting.
+**Warning:** a STOP sentinel file is ONLY checked if the loop has a non-empty `stop_sentinel_path`. When a UI or REST arm leaves it blank on a live dashboard or channel slot, the service fills in a per-session default, `<workspace>/.stop-<slot>`, and replaces `{{STOP_FILE}}` in the nudge message with that path on every send. Set the field explicitly over REST to use a custom path. If the stored path is empty, the sentinel file is ignored and nudges keep firing. A path pointing at a sensitive location is refused at arm time, and a persisted path is re-homed onto the current data home on reload — silently dropped if it cannot be repaired. Prefer the `autonudge_stop` MCP tool for in-loop halting.
 
 **Overlap with `babysit`:** the bundled **babysit** skill is the `monitor_*`-native
 guide for same-session loops and is the one to reach for when the job is watching a
@@ -57,38 +57,40 @@ PR, a CI run, a ticket, or a deployment. This skill covers the scaffolded
 goal/roadmap/tasks pattern and the raw service surface underneath it. Use one
 vocabulary: `interval_secs` and `max_cycles` as the MCP tools name them.
 
-**Restart survival** — on `AutoNudgeService.start()`, loops marked `active:true` in `~/.kiro/crew/autonudge.json` are reloaded and their idle timers re-armed. No catch-up fire — timer starts fresh from zero after restart.
+**Restart survival** — on `AutoNudgeService.start()`, loops marked `active:true` in `~/.kiro/crew/autonudge.json` are reloaded and re-armed from their persisted `next_due_ts`. A lost best-effort deadline write degrades to one fresh interval after restart; the normal path does not reset the countdown.
 
 ## How to start a loop
 
 **From an agent session (preferred):** call the MCP tools. `monitor_start(message,
-interval_secs?, max_cycles?)` arms a loop on the calling session,
-`monitor_update(message?, interval_secs?, max_cycles?)` revises it in place without
-losing its cycle count, and `autonudge_stop()` halts it. No token handling is
-involved. The tool's `interval_secs` (default 300) is stored as the loop's
-`idle_secs`; the raw REST/dataclass field defaults to 60.
+interval_secs?, gate?, max_cycles?, max_runtime_secs?, banner?)` arms a loop on the
+calling session, `monitor_update(message?, interval_secs?, max_cycles?,
+max_runtime_secs?)` revises it in place without losing its cycle count, and
+`autonudge_stop()` halts it. No token handling is involved. The tool's
+`interval_secs` (default 300) is stored as the loop's `idle_secs`; the raw
+REST/dataclass field defaults to 60.
 
-`max_cycles` defaults to 24 through `monitor_start` and to 0 (unlimited) on the raw
-REST surface. Reaching the cap is a runaway backstop, not a successful finish: check
-the exit condition every cycle and call `autonudge_stop` deliberately.
+`monitor_start` defaults to 24 delivered cycles and a 14,400-second wall-clock
+budget; use explicit positive finite bounds for unattended work. Raw REST defaults
+both bounds to 0 (unlimited). Reaching either bound is a runaway backstop, not a
+successful finish: check the exit condition every cycle and call `autonudge_stop`
+deliberately.
 
 **From the UI:**
 1. Click the `🎯 Set a goal` (bullseye) icon in the chat composer toolbar (lit green when active, dim when off).
-2. In the popover: paste your nudge message, set idle seconds (min 15, default 60), set max cycles (0 = unlimited), click **Start loop**.
+2. In the popover: paste your nudge message, set idle seconds (min 15, default 60), set max cycles (0 = unlimited), then click the Play icon button (named "Start loop").
 3. Close the popover. Loop runs in the background. Icon stays lit across tab closes / logins.
 
-**From an external script or when debugging (REST):**
+**From an external script or when debugging (REST, human-operated only):**
 
-`/api/autonudge` is a **user-scoped** endpoint — it requires a Bearer-style token, not the `X-Internal-Secret` header that loopback MCP tools use. Two-step bootstrap:
+`/api/autonudge` is a **user-scoped** endpoint. Agents should use the MCP tools
+above and must not read, print, or request local-secret/token material. If a human
+needs the raw REST surface, obtain a short-lived dashboard token in a private
+terminal (for example with `kirocrew token`) and keep it out of chat and logs:
 
 ```bash
-# 1. Exchange the local-machine secret for a user token (loopback only).
-SECRET=$(cat ~/.kiro/crew/.local_secret)
-TOKEN=$(curl -sf -H "X-Local-Secret: $SECRET" \
-  "http://127.0.0.1:5476/api/token/local?ttl=1h" \
-  | python3 -c 'import json,sys;print(json.load(sys.stdin)["token"])')
+# Human-controlled terminal only. Obtain this without exposing it to an agent.
+TOKEN='<short-lived dashboard token>'
 
-# 2. Arm the loop with ?token=$TOKEN (query param; cookie also works in browsers).
 curl -sf -X POST "http://127.0.0.1:5476/api/autonudge?token=$TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -96,12 +98,13 @@ curl -sf -X POST "http://127.0.0.1:5476/api/autonudge?token=$TOKEN" \
     "message": "Read ~/project/north_star.md, pick next task, execute.",
     "idle_secs": 60,
     "max_cycles": 30,
+    "max_runtime_secs": 14400,
     "stop_sentinel_path": "/home/user/project/STOP"
   }'
 ```
 
 Common 403 traps (all have the same error body `{"error":"Token required"}`):
-- Forgetting the `?token=…` query param. `/api/autonudge` does **not** accept `X-Internal-Secret` auth — that header only grants machine-auth for a narrow allowlist (`/api/send-message`, `/api/hooks/agent`, `/api/outbox/notify`, `/api/slack/upload-file`, `/api/spawn`, `/api/lessons`, `/api/taskrunner`) defined in `dashboard/server.py`.
+- Forgetting the `?token=…` query param. The `/api/autonudge` arm/list/edit/delete routes do **not** accept `X-Internal-Secret` auth; they require the dashboard owner (`_require_monitor_owner` in `dashboard/handlers/autonudge.py`). Which paths accept the machine secret is defined by `_STRICT_INTERNAL_API_PATHS` / `_MIXED_INTERNAL_API_PATHS` in `dashboard/server.py`.
 - Calling `/api/token/local` without `X-Local-Secret` — the endpoint is in `_BYPASS_EXACT` (no token needed) but still validates the machine secret via HMAC compare. Missing/wrong secret → `{"error":"invalid secret"}` 403.
 - Non-loopback source. Token issuance and most internal paths require `is_loopback(request.remote)` regardless of auth material.
 
@@ -113,11 +116,11 @@ Endpoints:
 | GET | `/api/token/local` | `X-Local-Secret` header, loopback only | issue a user token for local bootstrap |
 | GET | `/api/autonudge` | `?token=…` | list all loops |
 | GET | `/api/autonudge/slot/{slot_key}` | `?token=…` | loop bound to slot (or null) |
-| POST | `/api/autonudge` | `?token=…` | start/replace a loop |
+| POST | `/api/autonudge` | `?token=…` | start a loop; 409 if the slot already has any automation record |
 | PATCH | `/api/autonudge/{loop_id}` | `?token=…` | edit message / idle / active |
 | DELETE | `/api/autonudge/{loop_id}` | `?token=…` | stop and remove |
 
-**Preferred path for agents: use the `autonudge_stop` MCP tool** for self-halt (reads `KIROCREW_SESSION_KEY`, looks up the bound loop, DELETEs it — no token handling needed on your side). The REST flow above is for external scripts, new-loop arming, and debugging.
+**Preferred path for agents: use the `autonudge_stop` MCP tool** for self-halt (emits a stop directive the session applies to its own bound loop — no token handling needed on your side; the tool reply is a request, not confirmation). The REST flow above is for external scripts, new-loop arming, and debugging.
 
 ## Per-cycle agent behaviour (to put in your nudge message)
 
@@ -138,11 +141,11 @@ Good nudges tell the agent to:
 
 **No kill switch in the nudge text** — user ends up hunting the loop id. Always instruct the agent to check a STOP sentinel.
 
-**Expecting catch-up fires across restart** — timer resets to zero on restart. If the gateway was down when the nudge should have fired, it waits `idle_secs` again before firing. Design around this, don't rely on strict cadence.
+**Expecting the interval to reset across restart** — the persisted `next_due_ts` normally survives and is re-armed. A fresh interval occurs only when the best-effort deadline write was lost. Do not depend on a restart to postpone a due cycle.
 
 **Agent re-pings the same blocker every cycle** — explicitly tell it to post a blocker ONCE, then stay silent until it clears.
 
-**Multiple loops on same slot** — the service enforces one-loop-per-slot. Starting a new one replaces the old one.
+**Multiple loops on the same slot** — the service enforces one automation per session. `monitor_start` is create-only and refuses while an active loop or structured monitor exists; revise the bound prompt loop with `monitor_update` instead of re-arming it.
 
 ---
 
@@ -175,27 +178,29 @@ When all true: agent posts the DoD checklist with ticks, calls `autonudge_stop(r
 | Failure | Mitigation (REQUIRED) |
 |---|---|
 | **Context-window overflow after ~100 cycles** (each nudge+reply adds ~170 B; session SIGTERMs at `ContentWindowOverflow`) | `max_cycles: 30` per arming. Re-arm manually for more. |
-| **STOP sentinel ignored** when `stop_sentinel_path` is `""` at loop start — service fires even when agent halts | Never leave `stop_sentinel_path` blank. Point it at a real path (even if the file doesn't exist yet). |
+| **STOP file does not stop before delivery** when no service sentinel was configured | UI arming has no stop-file input, but the service gives the loop its own default stop file; put `{{STOP_FILE}}` in the nudge so the loop knows that path, and still check it in the nudge and call `autonudge_stop`. Raw REST callers may set `stop_sentinel_path` to a custom path. |
 | **Credential-file leak** via urllib `ValueError` echoing raw cookie-jar contents (e.g. `~/.config/<app>/credentials`) into transcripts | Use `http.cookiejar.MozillaCookieJar(path).load()` + urllib opener, OR `curl -b <cookie-jar>`. Scrub auth-path exceptions to `type(e).__name__` only. |
 
 ### 3. kanban-md integration (optional but recommended)
 
 If the project has a `kanban-md` board, the nudge MUST instruct the agent to drive it via the CLI (atomic `flock`ed writes), never via `strReplace` on task `.md` files.
 
-Minimal kanban-md ops the agent needs:
+Minimal kanban-md ops the agent needs (keep `loop-<project>` unchanged across cycles):
 
 ```bash
 BOARD=<abs path to board dir>
-kanban-md --dir $BOARD list --status todo --json   # read
-kanban-md --dir $BOARD pick --assignee loop-<n>    # atomic claim next unblocked todo
-kanban-md --dir $BOARD show <id>                   # read spec
-kanban-md --dir $BOARD edit <id> --add-body "…"    # append progress note
-kanban-md --dir $BOARD handoff <id> --notes "…"    # move to review + notes
+kanban-md --dir $BOARD list --status todo --json                       # read
+kanban-md --dir $BOARD list --claimed-by loop-<project> --json         # resume a held card if any
+kanban-md --dir $BOARD pick --claim loop-<project> --status todo        # only if no held card
+kanban-md --dir $BOARD edit <id> --block "…" --release                # held card is blocked: mark it, drop the claim, pick instead
+kanban-md --dir $BOARD show <id>                                      # read spec
+kanban-md --dir $BOARD edit <id> --claim loop-<project> --append-body "…" # append progress note
+kanban-md --dir $BOARD handoff <id> --claim loop-<project> --note "…" --release # move to review + release
 ```
 
 ### 4. Hardened nudge template
 
-Replace `<PROJECT>`, `<ANCHOR>`, `<STOP_PATH>`, and `<BOARD_PATH>` for your project. This template encodes all failure mitigations above.
+Replace `<PROJECT>`, `<project>`, `<ANCHOR>`, `<STOP_PATH>`, and `<BOARD_PATH>` for your project. This template encodes all failure mitigations above.
 
 ```
 Continue the <PROJECT> loop.
@@ -207,8 +212,8 @@ STOP / EXIT CHECKS (every cycle, in order, before anything else):
 
 BOARD (skip this block if the project has no kanban-md board):
 3. `kanban-md --dir <BOARD_PATH> list --status todo --json` — read todo column.
-4. `kanban-md --dir <BOARD_PATH> pick --assignee loop-<cycle_n>` — atomic claim of next unblocked todo.
-5. If pick returns nothing and a dep-met backlog card exists, promote: `kanban-md --dir <BOARD_PATH> move <id> --status todo` then pick.
+4. `kanban-md --dir <BOARD_PATH> list --claimed-by loop-<project> --json` — resume a held card if any; if the held card is blocked, `kanban-md --dir <BOARD_PATH> edit <id> --block "<reason>" --release` (drops the claim so this scan stops returning it) and pick instead; otherwise `kanban-md --dir <BOARD_PATH> pick --claim loop-<project> --status todo`. Keep the same project claimant every cycle.
+5. If pick returns nothing and a dep-met backlog card exists, promote: `kanban-md --dir <BOARD_PATH> move <id> todo` then pick.
 6. If everything blocked AND you already posted a blocker this arming: autonudge_stop(reason="all blocked") and stop.
 
 EXECUTE (≤5 tool calls per cycle, hard cap):
@@ -218,30 +223,28 @@ EXECUTE (≤5 tool calls per cycle, hard cap):
 10. Cookie-jar auth: http.cookiejar.MozillaCookieJar(path).load() + urllib opener, OR `curl -b <cookie-jar> -f -s`. NEVER read a credential/cookie file as text. NEVER echo cookie contents in any error — scrub exceptions to type(e).__name__.
 
 RECORD:
-11. Append progress to the claimed card (kanban-md edit --add-body) or to the anchor doc's Cycle Log section.
-12. **DM the owner a tick via `send_message`** (owner DM is default — no channel arg). Template:
-    `🎯 <PROJECT> cycle-<n> · <task-id>  Done: <1-line>  Next: <1-line>  Status: <col>`
-    Exactly one DM per productive cycle. Skip on halted / no-op cycles.
-13. If task complete: handoff to Review (NOT Done — human approves Done).
+11. Append progress to the claimed card (`kanban-md --dir <BOARD_PATH> edit <id> --claim loop-<project> --append-body "<note>"`) or to the anchor doc's Cycle Log section.
+12. Notify only on a real phase boundary, blocker, threshold crossing, or completion. Use `send_message` with the intended destination when conversational delivery is required; an omitted destination produces a dashboard notification, not an owner DM. Do not emit a routine per-cycle tick.
+13. If task complete: `kanban-md --dir <BOARD_PATH> handoff <id> --claim loop-<project> --note "<summary>" --release` to Review (NOT Done — human approves Done). `--release` drops the claim so the next cycle does not resume a card already in Review.
 
 STAY SILENT in the chat panel unless:
 - Phase boundary reached / DoD met (then autonudge_stop + summary).
 - Hard blocker needs user decision.
 - STOP sentinel tripped.
-(send_message DMs to the owner are expected every productive cycle — that is the progress channel, not the chat.)
 
 One cycle = one step. Compound cycles build features.
 ```
 
 ### 5. Arming checklist (do not skip)
 
-Before clicking 🎯 "Set a goal" → Start loop:
+Before clicking 🎯 "Set a goal" → the Play icon button ("Start loop"):
 
 - [ ] Anchor doc (`LOOP.md`) exists with a Definition of Done section. (Run `scaffold.sh` in this skill dir to generate a hardened template in one command.)
 - [ ] STOP sentinel absent: `ls <STOP_PATH>` says "No such file".
-- [ ] Popover fields: nudge (from template), `idle_secs=60`, `max_cycles=30`, `stop_sentinel_path=<STOP_PATH>` — **no blank fields**.
-- [ ] If arming via REST instead of the UI: remember the two-step token flow — `GET /api/token/local` with `X-Local-Secret` header first, then `POST /api/autonudge?token=…`. `X-Internal-Secret` alone **will not work** (returns 403 `Token required`).
-- [ ] Auth fresh if the loop touches authenticated APIs: re-export cookies / refresh credentials as needed.
+- [ ] Popover fields: Goal description (the nudge, from the template), Seconds between nudges `60`, and a finite Max cycles such as 30. The popover has no stop-file input; the service assigns a default stop file, which `{{STOP_FILE}}` in the nudge names. The nudge itself must still check its stop path and call `autonudge_stop`.
+- [ ] If arming with `monitor_start`, set positive finite `max_cycles` and `max_runtime_secs`; use `monitor_update` rather than a second arm when the instruction changes.
+- [ ] If a human is arming via REST, keep the dashboard token in their private terminal and optionally set `stop_sentinel_path`; agents must not read local-secret or cookie files.
+- [ ] If the loop touches authenticated APIs, the user must establish or refresh access through the supported client; never copy credential contents into the nudge or transcript.
 
 ### 6. Ten invariants every loop must respect
 
@@ -254,4 +257,4 @@ Before clicking 🎯 "Set a goal" → Start loop:
 7. One cycle, one step. Compound cycles build features.
 8. Human approval required for Done. Loop only moves cards to Review.
 9. `max_cycles: 30` cap every arming — this recipe's own recommendation, not a code default (`monitor_start` defaults to 24, the raw surface to 0 = unlimited). Re-arm manually for more.
-10. `stop_sentinel_path` never blank at loop start.
+10. Every nudge checks an explicit halt condition and calls `autonudge_stop`; UI and REST arming get a default `stop_sentinel_path`, and only raw REST arming can set a custom one.

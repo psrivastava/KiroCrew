@@ -11,9 +11,10 @@
 import { describe, it, expect } from 'vitest'
 import { render } from '@testing-library/react'
 
-import CrewAvatar, { ghostTraitsFrom, seededTraits } from '../components/CrewAvatar'
+import CrewAvatar, { ghostTraitsFrom, seededTraits, avatarFrameIn } from '../components/CrewAvatar'
 import type { CrewAvatarOverride } from '../components/CrewAvatar'
 import { ghostDataUri, type KiroGhostTraits } from '../lib/kiroGhostAvatar'
+import { iconMotionVars, poseBodyDataUri, poseDataUri, poseEyeVars, poseEyesDataUri } from '../lib/avatarPoses'
 import {
   AVATAR_STATES,
   MOTION_DEFAULTS,
@@ -310,6 +311,98 @@ describe('CrewAvatar renders the state it is told', () => {
     // Back-compat: MembersPage shipped `working` before `state` existed.
     const legacy = render(<CrewAvatar seed={SEED} avatar={avatar} working="subtle" />)
     expect(src(legacy.container)).toBe(ghostDataUri(PINNED, 'subtle'))
+  })
+
+  it('plays the working body motion on an icon at one amplitude, whatever intensity is asked', () => {
+    // An icon has no reaction layer, but "at work" is body motion that only
+    // moves the pose — so it must read as working beside a ghost. The ghost's
+    // intensity knob is not the icon's: a dense roster asks `subtle` and the
+    // icon still moves at the one amplitude it draws.
+    const icon: CrewAvatarOverride = { kind: 'icon', pose: 'pose-3', bg: '#25679d' }
+    const cases = [
+      <CrewAvatar key="bare" seed={SEED} avatar={icon} state="working" />,
+      <CrewAvatar key="subtle" seed={SEED} avatar={icon} state="working" working="subtle" />,
+      <CrewAvatar key="full" seed={SEED} avatar={icon} state="working" working="full" />,
+      // The legacy bare `working` spelling reaches the icon too.
+      <CrewAvatar key="legacy" seed={SEED} avatar={icon} working="subtle" />,
+    ]
+    for (const el of cases) {
+      const { container, unmount } = render(el)
+      const root = container.querySelector('[data-testid="crew-icon-motion"]') as HTMLElement
+      expect(root.style.getPropertyValue('--crew-icon-secs')).toBe(iconMotionVars()['--crew-icon-secs'])
+      unmount()
+    }
+  })
+
+  it('moves a working icon body and eyes inside one transform chain, over a still tile', () => {
+    // An SVG that animates itself is re-rastered every frame, in pieces on iOS.
+    // So the tile is the root's own background, and two still images, the
+    // silhouette and its eyes, sit inside the same body-motion wrappers. Only
+    // the eyes add a blink and a glance, as the ghost tier's eyes do.
+    const icon: CrewAvatarOverride = { kind: 'icon', pose: 'pose-3', bg: '#25679d' }
+    for (const size of [20, 28, 40, 64, 96]) {
+      const { container, unmount } = render(
+        <CrewAvatar seed={SEED} avatar={icon} state="working" size={size} />,
+      )
+      const root = container.querySelector('[data-testid="crew-icon-motion"]') as HTMLElement
+      expect(root.style.width).toBe(`${size}px`)
+      expect(root.style.backgroundColor).toBe('#25679d')
+      const imgs = root.querySelectorAll('img')
+      expect(imgs).toHaveLength(2)
+      expect(imgs[0].getAttribute('src')).toBe(poseBodyDataUri('pose-3'))
+      expect(imgs[1].getAttribute('src')).toBe(poseEyesDataUri('pose-3'))
+      const chainOf = (img: Element) => {
+        const chain: string[] = []
+        for (let n = img.parentElement; n && n !== root; n = n.parentElement) chain.push(n.className)
+        return chain
+      }
+      // The body is the innermost child of the four motion wrappers, in order.
+      const body = ['crew-icon-sq', 'crew-icon-bob', 'crew-icon-sway', 'crew-icon-fit']
+      expect(chainOf(imgs[0])).toEqual(body)
+      // The eyes ride the SAME chain, with their own blink and glance inside it.
+      expect(chainOf(imgs[1])).toEqual(['crew-icon-blink', 'crew-icon-look', 'crew-icon-eyes', ...body])
+      const blink = imgs[1].parentElement as HTMLElement
+      expect(blink.style.getPropertyValue('--crew-icon-eye-y')).toBe(poseEyeVars('pose-3')['--crew-icon-eye-y'])
+      // Nothing inside either image animates, and nothing above the fit moves the tile.
+      for (const img of imgs) expect(decodeURIComponent(img.getAttribute('src')!)).not.toContain('<style')
+      expect(root.className).not.toMatch(/crew-icon-(sway|bob|sq)/)
+      unmount()
+    }
+  })
+
+  it('names the frame a working icon draws its border on, and the one image of every other tier', () => {
+    // A flight that counter-scales "the face's border" must find the element
+    // that carries it: the motion root for a working icon, not its bare image.
+    const icon: CrewAvatarOverride = { kind: 'icon', pose: 'pose-3', bg: '#25679d' }
+    const moving = render(<CrewAvatar seed={SEED} avatar={icon} state="working" />)
+    const root = moving.container.querySelector('[data-testid="crew-icon-motion"]')
+    expect(avatarFrameIn(moving.container)).toBe(root)
+    expect(avatarFrameIn(moving.container)?.className).toMatch(/\bborder\b/)
+    moving.unmount()
+    const still = render(<CrewAvatar seed={SEED} avatar={icon} />)
+    expect(avatarFrameIn(still.container)).toBe(still.container.querySelector('img'))
+    still.unmount()
+  })
+
+  it('paints the same tile behind a still and a moving icon', () => {
+    const icon: CrewAvatarOverride = { kind: 'icon', pose: 'pose-3', bg: '#25679d' }
+    const still = render(<CrewAvatar seed={SEED} avatar={icon} />)
+    const stillBg = (still.container.querySelector('img') as HTMLElement).style.backgroundColor
+    still.unmount()
+    const moving = render(<CrewAvatar seed={SEED} avatar={icon} state="working" />)
+    const movingBg = (moving.container.querySelector('[data-testid="crew-icon-motion"]') as HTMLElement).style.backgroundColor
+    expect(stillBg).toBe('#25679d')
+    expect(movingBg).toBe(stillBg)
+  })
+
+  it('draws an icon still for every state but working — it has no reactions', () => {
+    const icon = { kind: 'icon', pose: 'pose-3', bg: '#25679d', motions: { done: 'bounce' } }
+    for (const state of AVATAR_STATES) {
+      if (state === 'working') continue
+      const { container, unmount } = render(<CrewAvatar seed={SEED} avatar={icon} state={state} />)
+      expect(src(container)).toBe(poseDataUri('pose-3', '#25679d'))
+      unmount()
+    }
   })
 
   it('serves a picture unchanged for every state — a picture is static', () => {

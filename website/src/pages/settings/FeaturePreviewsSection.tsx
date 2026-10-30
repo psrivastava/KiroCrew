@@ -3,8 +3,12 @@ import { ArrowRight } from 'lucide-react'
 
 import { SettingsSection, SettingsCard, SettingsToggle } from '../../components/settings'
 import { FeaturePreviewIntroButton, type FeaturePreviewIntro } from '../../components/FeaturePreviewIntroDialog'
-import { usePreviewFlag } from '../../hooks/usePreviewFlag'
-import { PREVIEW_CREW, PREVIEW_INSTANCE_SESSIONS, PREVIEW_REMOTE_CREW_CHAT, PREVIEW_WEBHOOKS, setPreviewFlag } from '../../utils/previewFlags'
+import { usePreviewFlag, useRemoteCrewChat } from '../../hooks/usePreviewFlag'
+import { PREVIEW_ARTIFACT_DEPLOY, PREVIEW_CREWMATE_HARNESS, PREVIEW_FOLDER_CONDUCTOR, PREVIEW_LAYOUT_HARNESS, PREVIEW_SESSION_ENVIRONMENTS, PREVIEW_WEBHOOKS, setPreviewFlag, setRemoteCrewChat } from '../../utils/previewFlags'
+import ErrorBoundary from '../../components/ErrorBoundary'
+import { KasBundleCard } from '../developer/KasBundleCard'
+import { KIRO_SIGN_IN_BACKEND } from '../developer/kiroSignInLink'
+import { useConfigSchema } from '../../components/settingRef/useConfigSchema'
 import { DecisionsCard } from './DecisionsCard'
 import { i18nT } from '../../i18n/t'
 
@@ -13,12 +17,9 @@ import { i18nT } from '../../i18n/t'
  * Settings > Developer > Feature Previews — opt in to surfaces that ship in the
  * bundle but are not released yet (see `utils/previewFlags.ts`).
  *
- * Formerly its own tab on the standalone Developer page (`/developer`). It moved
- * here because the switch that HOLDS an unreleased feature belongs next to the
- * switch that REVEALS the developer tooling (Developer Mode, one section up):
- * both are consent gates, and a reader looking for "how do I turn the unfinished
- * thing on" looks in Settings, not on an internals page they first have to
- * unlock. `DeveloperPage.tsx` redirects the old
+ * The first page of the Developer tab's SubNav (`DeveloperPanel.tsx`), above
+ * the internals pages: a reader looking for "how do I turn the unfinished
+ * thing on" finds it first. `DeveloperPage.tsx` redirects the old
  * `/developer?tab=feature-previews` link here.
  *
  * The USER-FACING copy says "features" and "pages", never "surfaces": `Surface`
@@ -26,8 +27,7 @@ import { i18nT } from '../../i18n/t'
  * toggle. The component and catalog keys keep the code vocabulary on purpose —
  * they name the mechanism, not the copy. The catalog keys also keep their
  * historical `pages.developer.featurePreviewsTab.*` namespace: renaming seven
- * keys across fourteen catalogs buys no user-visible change, and the section
- * itself still describes the developer-tooling gate it started as.
+ * keys across fourteen catalogs buys no user-visible change.
  *
  * ONE CARD PER FEATURE, and everything that belongs to a feature lives inside
  * its card: the headline, the sentence explaining what state it is in, its
@@ -99,26 +99,10 @@ function webhooksIntro(): FeaturePreviewIntro {
   }
 }
 
-/** Crew Members: the `/members` page, the flag's only door. */
-function crewIntro(): FeaturePreviewIntro {
-  return {
-    summary: i18nT('pages.developer.featurePreviewsTab.intro.crew_summary'),
-    whereToFind: i18nT('pages.developer.featurePreviewsTab.intro.crew_where'),
-    media: [
-      {
-        kind: 'image',
-        light: `${MEDIA_BASE}/crew-members-light.png`,
-        dark: `${MEDIA_BASE}/crew-members-dark.png`,
-        caption: i18nT('pages.developer.featurePreviewsTab.intro.crew_media_members'),
-      },
-    ],
-  }
-}
-
 /**
  * `data-setting-key` anchor on the section wrapper, for
- * `?highlight=key:<this>` — the redirect target of the old Developer-page tab
- * (`DeveloperPage.tsx`). Not a config path and not a registry entry: it only
+ * `?highlight=key:<this>` — what the old `/developer?tab=feature-previews`
+ * link redirects to (`DeveloperPage.tsx`). Not a config path and not a registry entry: it only
  * exists so useSettingHighlight's direct DOM lookup can ring the whole section.
  * Neither the settings extractor (which reads `configKey` props on Settings*
  * primitives) nor the SettingRef call-site guard (which scans `<SettingRef>`)
@@ -128,10 +112,18 @@ function crewIntro(): FeaturePreviewIntro {
 export const FEATURE_PREVIEWS_HIGHLIGHT_ANCHOR = 'feature-previews-section'
 export function FeaturePreviewsSection() {
   const navigate = useNavigate()
+  const artifactDeploy = usePreviewFlag(PREVIEW_ARTIFACT_DEPLOY)
   const webhooks = usePreviewFlag(PREVIEW_WEBHOOKS)
-  const crew = usePreviewFlag(PREVIEW_CREW)
-  const remoteCrewChat = usePreviewFlag(PREVIEW_REMOTE_CREW_CHAT)
-  const instanceSessions = usePreviewFlag(PREVIEW_INSTANCE_SESSIONS)
+  const remoteCrewChat = useRemoteCrewChat()
+  const layoutHarness = usePreviewFlag(PREVIEW_LAYOUT_HARNESS)
+  const folderConductor = usePreviewFlag(PREVIEW_FOLDER_CONDUCTOR)
+  const crewmateHarness = usePreviewFlag(PREVIEW_CREWMATE_HARNESS)
+  const sessionEnvironments = usePreviewFlag(PREVIEW_SESSION_ENVIRONMENTS)
+  // The KAS engine card is for a deployment that can select KAS at all: the same
+  // gate its old mount used, read from the schema's `agent.acp_backend` enum. An
+  // unanswered schema hides nothing, as on the harness tab.
+  const acpBackends = useConfigSchema()?.get('agent.acp_backend')?.enum
+  const kasOffered = !acpBackends || acpBackends.includes(KIRO_SIGN_IN_BACKEND)
 
   return (
     // The wrapper exists for the legacy redirect: `?highlight=key:<anchor>`
@@ -150,10 +142,35 @@ export function FeaturePreviewsSection() {
       <p className="text-[13px] text-muted mb-2">
         {i18nT('pages.settings.developerPanel.feature_previews_desc')}
       </p>
+      {/* Artifact Deploy ships without a "See what it looks like" intro: the
+          capture pipeline shoots a running pod, and the deploy surface's own
+          screens need a registered AWS profile to show anything real. A card with
+          a toggle and an ingress link is honest; a capture of an empty console
+          would not be worth the media it costs. */}
+      <SettingsCard>
+        <SettingsToggle
+          label={i18nT('pages.developer.featurePreviewsTab.artifact_deploy')}
+          description={i18nT('pages.developer.featurePreviewsTab.artifact_deploy_desc')}
+          checked={artifactDeploy}
+          onChange={v => setPreviewFlag(PREVIEW_ARTIFACT_DEPLOY, v)}
+        />
+        <div className="flex flex-wrap items-center gap-x-4 pt-1">
+          {artifactDeploy && (
+            <button
+              type="button"
+              onClick={() => navigate('/deploy')}
+              className="inline-flex items-center gap-1.5 text-[13px] font-medium text-accent bg-transparent border-none cursor-pointer px-0 py-1 hover:underline"
+            >
+              {i18nT('pages.developer.featurePreviewsTab.open_artifact_deploy')}
+              <ArrowRight size={13} aria-hidden="true" />
+            </button>
+          )}
+        </div>
+      </SettingsCard>
       <SettingsCard>
         <SettingsToggle
           label={i18nT('pages.developer.featurePreviewsTab.webhooks')}
-          description={i18nT('pages.developer.featurePreviewsTab.inbound_webhook_tokens_registered_contexts_and_r')}
+          hint={i18nT('pages.developer.featurePreviewsTab.inbound_webhook_tokens_registered_contexts_and_r')}
           checked={webhooks}
           onChange={v => setPreviewFlag(PREVIEW_WEBHOOKS, v)}
         />
@@ -184,45 +201,15 @@ export function FeaturePreviewsSection() {
           )}
         </div>
       </SettingsCard>
-      {/* One card, one flag, one door: the Crew Members page (`/members`) and its
-          rail item. Crew Mode — the second door this card used to name — retired
-          in favour of that page; the sidebar create menu keeps a "Crew Members"
-          entry that opens the page, or lands HERE with this card ringed while the
-          flag is still off (`ChatSidebar.openCrewMembers`).
+      {/* A chat dispatched to another MACHINE over the instances tunnel.
 
-          NO ingress button here, deliberately, unlike the webhooks card above. That
-          one needs its link because `/webhooks` is `hiddenFromNav` and the card is
-          its ONLY door. Crew Members is not: flipping this switch puts the row back
-          on the rail in the same tick (`usePreviewFlagRevision`), so a link here
-          would be a second spelling of a door the user can already see — and one
-          that costs a catalog key in twelve languages permanently. */}
-      <SettingsCard>
-        <SettingsToggle
-          label={i18nT('pages.developer.featurePreviewsTab.crew_members')}
-          description={i18nT('pages.developer.featurePreviewsTab.crew_members_desc')}
-          checked={crew}
-          onChange={v => setPreviewFlag(PREVIEW_CREW, v)}
-        />
-        {/* "See what it looks like" is not an ingress: it shows the page instead of
-            opening it, which is what a reader deciding whether to flip the switch
-            needs BEFORE flipping it. */}
-        <div className="pt-1">
-          <FeaturePreviewIntroButton
-            title={i18nT('pages.developer.featurePreviewsTab.crew_members')}
-            intro={crewIntro()}
-            checked={crew}
-            onChange={v => setPreviewFlag(PREVIEW_CREW, v)}
-          />
-        </div>
-      </SettingsCard>
-      {/* A SEPARATE card from Crew Members above, because the word names two
-          unrelated things: that flag holds the Crew Members page, this one holds
-          a chat dispatched to another MACHINE over the instances tunnel. One card
-          each keeps a reader from flipping the wrong switch.
+          ONE card for both halves of that feature: starting a chat on a crew and
+          listing that crew's sessions in the sidebar. They were two switches, and
+          one on with the other off let a user open a chat on a crew and then find
+          no crew group to return to it from.
 
-          NO ingress button, for the same reason as the crew card: turning it on
-          puts the create-menu entry back in the same tick, and that menu is
-          already in front of the user.
+          NO ingress button: turning it on puts the create-menu entry back in the
+          same tick, and that menu is already in front of the user.
 
           NO "See what it looks like" yet either, and that is the missing-capture rule, not
           an omission: the entry it adds only renders while a tunnel to a second
@@ -236,24 +223,81 @@ export function FeaturePreviewsSection() {
           label={i18nT('pages.developer.featurePreviewsTab.chat_on_a_crew')}
           description={i18nT('pages.developer.featurePreviewsTab.chat_on_a_crew_desc')}
           checked={remoteCrewChat}
-          onChange={v => setPreviewFlag(PREVIEW_REMOTE_CREW_CHAT, v)}
+          onChange={v => setRemoteCrewChat(v)}
         />
       </SettingsCard>
-      {/* Adjacent to the card above and still SEPARATE from it, because the two
-          point opposite ways across the same tunnel: that flag DISPATCHES a chat
-          to another machine, this one LISTS the sessions that machine already
-          owns. Sharing a card would imply flipping one gets the other.
+      {/* Dev-only MECHANISM preview, not a shippable surface: the composable-layout
+          mechanism (placement-driven renderer + scope + editor) being built beside
+          the Members page. This card is the FLAG PLUMBING only — the switch exists so
+          the mechanism can be built and tested behind a per-device gate.
 
-          NO ingress button, and for a different reason than the crew cards: they
-          omit it because their door is already on screen, whereas this preview
-          has no page of its own at all — it changes the Sessions list every user
-          is already looking at, so the toggle IS the whole affordance. */}
+          NO ingress button, on purpose: unlike the webhooks card, this preview has no
+          routable door in the bundle yet, so a link here would point at a route that
+          does not exist. It follows the toggle-only shape of "Chat on a crew" above —
+          an honest switch with no door to promise. Add a "See what it looks like" intro
+          and/or an ingress the day the feature lands a real capture and route. */}
       <SettingsCard>
         <SettingsToggle
-          label={i18nT('pages.developer.featurePreviewsTab.remote_instance_sessions')}
-          description={i18nT('pages.developer.featurePreviewsTab.merge_a_connected_remote_instances_live_sessions')}
-          checked={instanceSessions}
-          onChange={v => setPreviewFlag(PREVIEW_INSTANCE_SESSIONS, v)}
+          label={i18nT('pages.developer.featurePreviewsTab.layout_harness')}
+          description={i18nT('pages.developer.featurePreviewsTab.layout_harness_desc')}
+          checked={layoutHarness}
+          onChange={v => setPreviewFlag(PREVIEW_LAYOUT_HARNESS, v)}
+        />
+      </SettingsCard>
+      {/* A folder drawn around the session that conducts it: that card pinned
+          first inside the folder, with an accent bar and a `conductor` tag.
+
+          Flagged for the reason the others here are not: it is not a DOOR. The
+          cards above hold a page or a menu entry a reader can decline to open,
+          so shipping them visible costs nobody anything; this one re-orders a
+          list people read every day and there is nothing to decline. Held until
+          it has been lived with.
+
+          NO ingress button: turning it on redraws the Sessions list in the same
+          tick, and a link here would point at a list already on screen. NO "See
+          what it looks like" either -- the layout is still settling and a
+          capture would be stale by the next change, which is the same rule the
+          Dynamic Dashboard card above follows. */}
+      <SettingsCard>
+        <SettingsToggle
+          label={i18nT('pages.developer.featurePreviewsTab.folder_conductor')}
+          description={i18nT('pages.developer.featurePreviewsTab.folder_conductor_desc')}
+          checked={folderConductor}
+          onChange={v => setPreviewFlag(PREVIEW_FOLDER_CONDUCTOR, v)}
+        />
+      </SettingsCard>
+      {/* A crewmate's own harness: the Harness row on each crewmate's profile
+          Settings page. NO ingress button: the row appears on a profile the reader
+          already opens, and there is no one page to link to. */}
+      <SettingsCard>
+        <SettingsToggle
+          label={i18nT('pages.developer.featurePreviewsTab.crewmate_harness')}
+          description={i18nT('pages.developer.featurePreviewsTab.crewmate_harness_desc')}
+          checked={crewmateHarness}
+          onChange={v => setPreviewFlag(PREVIEW_CREWMATE_HARNESS, v)}
+        />
+      </SettingsCard>
+      {/* The built-in KAS engine (`agent.kas_bundle`), the whole card: its switch
+          and the Install button for the pinned engine. It lives here, not on the
+          KAS harness row, while the route is in shadow testing, so the one click
+          that moves every new session onto an engine still being tested is not in
+          plain view of every KAS user. Unlike the cards above, the switch is a
+          server config value, not a per-device flag; the card writes it through
+          the same config PATCH it always did. Isolated so a throwing card cannot
+          take the section down. */}
+      {kasOffered && (
+        <SettingsCard>
+          <ErrorBoundary scope="feature-preview-kas-bundle" fallback={null}>
+            <KasBundleCard />
+          </ErrorBoundary>
+        </SettingsCard>
+      )}
+      <SettingsCard>
+        <SettingsToggle
+          label={i18nT('sessionEnvironments.title')}
+          description={i18nT('sessionEnvironments.description')}
+          checked={sessionEnvironments}
+          onChange={value => setPreviewFlag(PREVIEW_SESSION_ENVIRONMENTS, value)}
         />
       </SettingsCard>
       {/* LAST, and the only card here whose switch is not a per-device flag: it

@@ -81,7 +81,8 @@ from kiro_crew.computer_use.types import (
     PolicyConfig,
     PolicyStateError,
 )
-from kiro_crew.config.loader import computer_use_state_path
+from kiro_crew.config.loader import computer_use_state_path, read_config_text
+from kiro_crew.edition_locks import LOCKED_BY_POLICY
 from kiro_crew.executors import subprocess_executor
 
 logger = logging.getLogger(__name__)
@@ -138,7 +139,7 @@ ERR_DISPATCH_FAILED = "Error: computer use failed unexpectedly"
 class StateCorruptError(Exception):
     """A settings file exists but is unreadable/not-a-dict — refuse to mutate it.
 
-    Mirrors ``handlers/security.py::ConfigCorruptError``, for the same reason: a
+    Mirrors ``handlers/security_audit.py::ConfigCorruptError``, for the same reason: a
     mutation that read a corrupt keystone as ``{}`` and wrote it back would
     silently reset the operator's allow-list and blocked-app additions, and one
     that read a corrupt ``config.json`` as ``{}`` would replace the user's entire
@@ -151,9 +152,10 @@ class StateCorruptError(Exception):
 def _sel():
     """Late-binding ``sel()`` for test monkeypatch compatibility.
 
-    The function-local import is the deliberate circular-import exception every
-    sibling handler uses (``core.py``, ``sessions.py``, ``files.py``, ``cron.py``,
-    ``memory.py``, ``agents.py``, ``hooks.py``, ``prompts.py``): this module is
+    The function-local import is the deliberate circular-import exception every sibling
+    handler uses (``core_security.py``, ``sessions_parts/app_scope.py``, ``files.py``,
+    ``cron_shared.py``, ``memory.py``, ``agents.py``, ``hooks_scripts.py``,
+    ``prompts_caller_gates.py``): this module is
     imported BY ``handlers/__init__``, so a top-level ``from .. import sel`` would
     be a cycle. Resolving the package attribute per call is also what lets a test
     monkeypatch ``handlers.sel`` and have it take effect here.
@@ -188,7 +190,7 @@ def _audit(
 async def _off_loop(fn):
     """Run a blocking (filesystem / governance-resolution) callable in a thread.
 
-    Same rationale as ``handlers/security.py::_run_off_loop``: reading the
+    Same rationale as ``handlers/security_audit.py::_run_off_loop``: reading the
     keystone and resolving governance profiles both walk the filesystem, and a
     slow or stalled FS must not freeze the gateway's sole event loop.
 
@@ -391,6 +393,7 @@ def _snapshot() -> dict[str, Any]:
 
     return {
         "enabled": enable_state.is_enabled(state),
+        "locked_by_policy": enable_state.locked_by_policy(),
         "supported": supported,
         "platform": platform_id,
         "reason": reason,
@@ -412,10 +415,9 @@ def _snapshot() -> dict[str, Any]:
         # operator set no restriction — and the panel must be able to tell the two
         # apart rather than presenting a confidently empty allow-list.
         "policy_error": policy_error,
-        # There is deliberately NO ``read_only`` / governance-lock field here, and no
-        # ``409`` on the PUT. Computer use is one operator opt-in on the keystone:
-        # ``SCOPE_CATALOG`` carries no ``computer_use*`` row, so there is no ceiling
-        # to report and nothing for the panel to grey out.
+        # ``locked_by_policy`` above is the only governance field: the one on/off
+        # ``capabilities.computer_use`` row (``enable_state.locked_by_policy``).
+        # Nothing finer is governed, so there is nothing else to grey out.
         # The write boundary that DOES hold is the app-token gate on the PUT (an app
         # token can never write the keystone); see ``api_computer_use_config_save``.
         # Ceilings, so the panel's number inputs bound themselves from the server
@@ -463,7 +465,7 @@ def _read_config_strict() -> dict:
     if not path.exists():
         return {}
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(read_config_text(path))
     except (OSError, json.JSONDecodeError) as exc:
         raise StateCorruptError(f"config.json is not readable as a JSON object: {exc}") from exc
     if not isinstance(data, dict):
@@ -557,13 +559,12 @@ async def api_computer_use_config_save(request: web.Request) -> web.Response:
     cannot), so without this gate an agent that can author an app manifest could read
     its own ``.app_secret``, mint an app token and flip ``enabled: true`` on its own
     desktop automation. Same guard as ``handlers/kiro_prerequisite.py`` and
-    ``handlers/messaging.py``'s notification push.
+    ``messaging_api/agent_push.py``'s notification push.
 
-    **There is no governance ceiling on this route, and therefore no 409.** Computer
-    use is one operator opt-in: ``SCOPE_CATALOG`` carries no ``computer_use*`` row, so
-    there is nothing that can forbid a widening request (there is no ``status=409`` in
-    this module) — see ``docs/system-specs/modules/governance.md`` for why computer
-    use is deliberately ungoverned. Other outcomes: ``400`` for a malformed body or an
+    **The one governance refusal is ``409 locked_by_policy``** for ``enabled: true``
+    while the ``capabilities.computer_use`` row keeps the feature off
+    (``enable_state.locked_by_policy``); nothing finer is governed — see
+    ``docs/system-specs/modules/governance.md``. Other outcomes: ``400`` for a malformed body or an
     out-of-range value, ``403`` for an app token (above), and ``500`` for a corrupt
     keystone or ``config.json``, which is left byte-identical rather than clobbered
     (``StateCorruptError``, the ``ConfigCorruptError`` precedent).
@@ -584,6 +585,18 @@ async def api_computer_use_config_save(request: web.Request) -> web.Response:
             {"error": "dashboard user required", "code": "dashboard_user_required"},
             status=403,
         )
+    # After the app-token refusal above, so an app token keeps its own
+    # ``dashboard_user_required`` answer: the keystone is the owner's switch,
+    # and a dashboard user who is not the owner may not flip it either.
+    # Body-scope import, like the sibling gates in this package
+    # (``connections.py``, ``mcp_apps.py``, ``files.py``): ``source_providers``
+    # reaches back into sibling handler modules, so importing the helper at
+    # module scope from here would close a cycle.
+    from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+
+    owner_denied = await require_owner_dashboard_request(request, "computer_use.config_save")
+    if owner_denied is not None:
+        return owner_denied
 
     try:
         body = await request.json()
@@ -607,6 +620,13 @@ async def api_computer_use_config_save(request: web.Request) -> web.Response:
             return web.json_response(
                 {"error": "enabled must be a boolean", "code": "invalid_field_type"},
                 status=400,
+            )
+        if body["enabled"] and await _off_loop(
+            lambda: enable_state.locked_by_policy(audit_tool="computer_use_enable")
+        ):
+            _audit(request, operation=OP_CONFIG_SAVE, outcome="denied", resources="enabled=locked")
+            return web.json_response(
+                {"error": LOCKED_BY_POLICY, "code": "locked_by_policy"}, status=409
             )
         state_patch[STATE_KEY_ENABLED] = body["enabled"]
     for key in _APP_LIST_KEYS:
@@ -668,9 +688,8 @@ async def api_computer_use_config_save(request: web.Request) -> web.Response:
             status=400,
         )
 
-    # No governance step here, deliberately: the computer-use governance model
-    # (and the 409 it would have returned) does not exist. The write boundary
-    # that DOES hold is the app-token gate at the top of this handler.
+    # The only governance step is the ``locked_by_policy`` 409 in the validation
+    # above. The write boundary that also holds is the app-token gate at the top.
 
     # ── Write ──
     # Read the CURRENT enable before mutating, so the session reset below fires only
@@ -756,6 +775,8 @@ async def api_computer_use_config_save(request: web.Request) -> web.Response:
     # are read per call and need no restart, and re-saving the same value must not
     # tear down the user's session.
     sessions_reset = 0
+    # None when the enable did not change, so no rebuild ran to report on.
+    spec_rewritten: bool | None = None
     if STATE_KEY_ENABLED in state_patch and state_patch[STATE_KEY_ENABLED] != enabled_before:
         # REBUILD THE AGENT SPEC FIRST. The enable is also a spec-emission gate
         # (``agent._computer_use_spec_gate``): while it is off the server is not in
@@ -775,24 +796,21 @@ async def api_computer_use_config_save(request: web.Request) -> web.Response:
         # its own acquisition, and ``rebuild_agent_config`` never takes this lock,
         # so this cannot self-deadlock.
         #
-        # A rebuild failure must not fail the SAVE: the write already landed and
-        # was audited. The fallback is the un-rebuilt spec — the tool surface
-        # appears on the next gateway start.
+        # A rebuild that fails or declines to write must not fail the SAVE: the
+        # write already landed and was audited. The response says the spec was
+        # not rewritten; the tool surface then appears on the next gateway start.
         #
-        # The import is function-local and must STAY function-local, which is not
-        # a style choice: it makes the name resolve at CALL time, so
-        # ``kiro_crew.agent`` is the single place a test can substitute the
-        # rebuild. Hoisting it to module scope binds the name here at import time,
-        # and the test guard that keeps the suite from rewriting the operator's
-        # real ``~/.kiro/agents`` would silently stop reaching this call site.
+        # ``rebuild_agent_spec`` resolves ``kiro_crew.agent`` at CALL time, so that
+        # module is the single place a test can substitute the rebuild, and the
+        # test guard that keeps the suite from rewriting the operator's real
+        # ``~/.kiro/agents`` reaches this call site.
         # Pinned by ``test_patching_the_agent_module_REACHES_the_handler``.
-        try:
-            from kiro_crew.agent import rebuild_agent_config
+        from kiro_crew.dashboard.handlers._shared import rebuild_agent_spec
 
-            async with _get_config_lock():
-                await asyncio.to_thread(rebuild_agent_config)
-        except Exception:
-            logger.exception("computer-use enable saved, but agent config rebuild failed")
+        async with _get_config_lock():
+            spec_rewritten = await asyncio.to_thread(
+                rebuild_agent_spec, "computer-use enable change"
+            )
 
         from kiro_crew.dashboard.handlers.sessions import _reset_all_sessions
 
@@ -806,6 +824,8 @@ async def api_computer_use_config_save(request: web.Request) -> web.Response:
 
     payload = await _full_payload()
     payload["sessions_reset"] = sessions_reset
+    if spec_rewritten is not None:
+        payload["agent_spec_rewritten"] = spec_rewritten
     return web.json_response(payload)
 
 

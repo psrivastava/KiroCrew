@@ -21,6 +21,7 @@ import asyncio
 import inspect
 import logging
 import os
+import shutil
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -30,10 +31,65 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer, make_mocked_request
 
-from conftest import requires_symlinks
+from conftest import make_dir_link, requires_symlinks
 from kiro_crew.dashboard import server as srv
+from kiro_crew.platform_compat import unlink_link_or_junction
+from kiro_crew.testing import wait
+from kiro_crew.testing.clock import ManualClock
+from kiro_crew.testing.wait import async_wait_until
 
 # ── helpers ─────────────────────────────────────────────────────────────
+
+
+async def _sweep_once_released(path: Path, *, timeout: float | None = None) -> None:
+    """Remove ``path`` once the server has let go of the file it served from it.
+
+    ``web.FileResponse`` closes its file on an executor thread after the client
+    already holds the body, and Windows refuses to unlink a file any handle still
+    holds (``[WinError 32]``). So the sweep retries on ``PermissionError`` under a
+    bounded deadline, off the loop so the server's close can run, and fails by name,
+    chained to the last ``PermissionError``, if the handle is never released.
+    """
+
+    def _swept() -> bool:
+        shutil.rmtree(path)
+        return True
+
+    await async_wait_until(
+        _swept,
+        timeout=timeout,
+        ignoring=(PermissionError,),
+        off_loop=True,
+        describe=lambda: f"{path} exists={path.exists()}",
+    )
+
+
+@pytest.fixture
+def virtual_wait_clock(monkeypatch):
+    """Drive ``kiro_crew.testing.wait``'s deadline and evaluation bound in the test.
+
+    ``async_wait_until`` reaches its deadline through a :class:`ManualClock`, so a
+    timeout passes in virtual time at no wall-clock cost. Its per-evaluation bound,
+    which times each ``off_loop=True`` call against the real clock, is replaced with
+    one that awaits the evaluation to completion: the test's predicate is an instant
+    mock, so running it inline removes any dependence on how fast a worker thread
+    schedules. The verdict is then fixed by the mock, never by runner speed.
+    """
+    clock = ManualClock(monotonic_start=0.0)
+    real_asyncio_sleep = asyncio.sleep
+
+    async def virtual_asyncio_sleep(seconds: float) -> None:
+        clock.sleep(seconds)
+        await real_asyncio_sleep(0)
+
+    async def run_to_completion(awaitable, bound, predicate=None):
+        return await awaitable
+
+    monkeypatch.setattr(wait, "_monotonic", clock.monotonic)
+    monkeypatch.setattr(wait, "_sleep", clock.sleep)
+    monkeypatch.setattr(wait, "_asyncio_sleep", virtual_asyncio_sleep)
+    monkeypatch.setattr(wait, "_bounded", run_to_completion)
+    return clock
 
 
 class _FakeInhibitor:
@@ -86,9 +142,7 @@ class TestShouldPreventSleep:
         assert await srv._should_prevent_sleep(_state(sessions=MagicMock()), 0) is False
 
     @pytest.mark.asyncio
-    async def test_opt_out_allows_sleep_without_consulting_sessions(
-        self, monkeypatch
-    ) -> None:
+    async def test_opt_out_allows_sleep_without_consulting_sessions(self, monkeypatch) -> None:
         loader = MagicMock()
         loader.load.return_value = _cfg(prevent_sleep=False)
         monkeypatch.setattr(srv, "KiroCrewConfig", loader)
@@ -119,9 +173,7 @@ class TestShouldPreventSleep:
         loader = MagicMock()
         loader.load.return_value = _cfg(prevent_sleep=True)
         monkeypatch.setattr(srv, "KiroCrewConfig", loader)
-        sessions = MagicMock(
-            any_active_turn=MagicMock(side_effect=RuntimeError("map busy"))
-        )
+        sessions = MagicMock(any_active_turn=MagicMock(side_effect=RuntimeError("map busy")))
 
         assert await srv._should_prevent_sleep(_state(sessions=sessions), 0) is False
 
@@ -130,9 +182,7 @@ class TestShouldPreventSleep:
 
 
 class TestExtraFrameAncestors:
-    def test_out_of_range_stashed_port_is_rejected_not_trusted(
-        self, monkeypatch
-    ) -> None:
+    def test_out_of_range_stashed_port_is_rejected_not_trusted(self, monkeypatch) -> None:
         """A digits-only but out-of-range stashed claim must not become an origin.
 
         ``0`` and ``70000`` pass ``.isdigit()``, so only the range check stops
@@ -197,13 +247,12 @@ class TestDiscoverAppWindowEntries:
 
 class TestWindowEntryHandler:
     @pytest.mark.asyncio
-    async def test_handler_serves_the_file_bound_at_registration(
-        self, tmp_path
-    ) -> None:
-        entry = tmp_path / "board.html"
+    async def test_handler_serves_the_file_bound_at_registration(self, tmp_path) -> None:
+        entry = tmp_path / "src" / "apps" / "papyrus" / "board.html"
+        entry.parent.mkdir(parents=True)
         entry.write_text("<h1>board</h1>", encoding="utf-8")
         app = web.Application()
-        app.router.add_get("/w.html", srv._window_entry_handler(entry))
+        app.router.add_get("/w.html", srv._window_entry_handler(tmp_path, "papyrus/board.html"))
 
         async with TestClient(TestServer(app)) as client:
             resp = await client.get("/w.html")
@@ -211,9 +260,80 @@ class TestWindowEntryHandler:
             assert await resp.text() == "<h1>board</h1>"
 
     @pytest.mark.asyncio
-    async def test_app_window_entries_are_registered_as_get_routes(
-        self, tmp_path
+    async def test_handler_follows_a_re_pointed_dist(self, tmp_path) -> None:
+        """A window route resolves the served dist per request, not at registration.
+
+        Staging re-points ``static/dist`` at a fresh copy and sweeps the old one;
+        a route pinned to the old copy at startup would 404 from then on.
+        """
+        for name, body in (("old", "<h1>old</h1>"), ("new", "<h1>new</h1>")):
+            entry = tmp_path / name / "src" / "apps" / "papyrus" / "board.html"
+            entry.parent.mkdir(parents=True)
+            entry.write_text(body, encoding="utf-8")
+        served = tmp_path / "served"
+        make_dir_link(served, tmp_path / "old")
+        app = web.Application()
+        app.router.add_get("/w.html", srv._window_entry_handler(served, "papyrus/board.html"))
+
+        async with TestClient(TestServer(app)) as client:
+            assert await (await client.get("/w.html")).text() == "<h1>old</h1>"
+            unlink_link_or_junction(served)
+            make_dir_link(served, tmp_path / "new")
+            await _sweep_once_released(tmp_path / "old")
+            resp = await client.get("/w.html")
+            assert resp.status == 200
+            assert await resp.text() == "<h1>new</h1>"
+
+    @pytest.mark.asyncio
+    async def test_sweep_waits_out_a_handle_released_late(self, tmp_path, monkeypatch) -> None:
+        """A sharing violation that clears is retried until the tree is gone."""
+        old = tmp_path / "old"
+        (old / "sub").mkdir(parents=True)
+        (old / "sub" / "board.html").write_text("x", encoding="utf-8")
+        real_rmtree = shutil.rmtree
+        calls: list[Path] = []
+
+        def held_twice(path, *args, **kwargs):
+            calls.append(Path(path))
+            if len(calls) <= 2:
+                raise PermissionError(32, "being used by another process")
+            return real_rmtree(path, *args, **kwargs)
+
+        monkeypatch.setattr(shutil, "rmtree", held_twice)
+
+        await _sweep_once_released(old)
+
+        assert not old.exists()
+        assert calls == [old, old, old]
+
+    @pytest.mark.asyncio
+    async def test_sweep_fails_by_name_when_the_handle_is_never_released(
+        self, tmp_path, monkeypatch, virtual_wait_clock
     ) -> None:
+        """A handle that never closes is a leak: the sweep must not swallow it.
+
+        The wait's deadline runs on a manual clock and each evaluation runs inline,
+        so the only thing that decides the verdict is the always-raising ``rmtree``
+        mock: the sweep reaches the deadline and fails with its "still false"
+        message, chained to the ``PermissionError``, at no wall-clock cost.
+        """
+        old = tmp_path / "old"
+        old.mkdir()
+
+        def always_held(path, *args, ignore_errors=False, **kwargs):
+            if not ignore_errors:
+                raise PermissionError(32, "being used by another process")
+
+        monkeypatch.setattr(shutil, "rmtree", always_held)
+
+        with pytest.raises(AssertionError, match="still false") as excinfo:
+            await _sweep_once_released(old, timeout=0.2)
+
+        assert isinstance(excinfo.value.__cause__, PermissionError)
+        assert old.exists()
+
+    @pytest.mark.asyncio
+    async def test_app_window_entries_are_registered_as_get_routes(self, tmp_path) -> None:
         """``_register_dist_static_routes`` must mount every discovered window.
 
         A missing mount is not a small failure: the request falls through to the
@@ -234,12 +354,7 @@ class TestWindowEntryHandler:
         assert f"/{srv.APP_WINDOW_URL_PREFIX}/papyrus/editor.html" in canonical
         # App Store brand assets: without this mount the builtin app icons and
         # hero images fall through to the SPA shell and render as placeholders.
-        prefixes = {
-            r.get_info().get("prefix")
-            for r in app.router.resources()
-            if r.get_info().get("prefix")
-        }
-        assert "/app-assets" in prefixes
+        assert "/app-assets/{tail}" in canonical
 
 
 # ── _precompute_telemetry ────────────────────────
@@ -248,24 +363,31 @@ class TestWindowEntryHandler:
 class TestPrecomputeTelemetry:
     """Telemetry is best-effort: no individual failure may abort startup."""
 
-    def test_every_stage_failure_is_swallowed(self, monkeypatch) -> None:
+    def test_every_stage_failure_is_swallowed(self, monkeypatch, caplog) -> None:
         import kiro_crew.dashboard.handlers_system as hs
 
-        monkeypatch.setattr(
-            hs, "_get_owner_hash", MagicMock(side_effect=RuntimeError("no owner"))
-        )
+        monkeypatch.setattr(hs, "_get_owner_hash", MagicMock(side_effect=RuntimeError("no owner")))
         monkeypatch.setattr(
             hs, "_get_static_system_info", MagicMock(side_effect=RuntimeError("no os"))
         )
+        telemetry = MagicMock()
+        telemetry.record_event.side_effect = RuntimeError("sink down")
         monkeypatch.setattr(
-            srv, "current_context", MagicMock(side_effect=RuntimeError("no context"))
+            srv, "current_context", MagicMock(return_value=SimpleNamespace(telemetry=telemetry))
         )
 
-        srv._precompute_telemetry(_state())  # must not raise
+        with caplog.at_level(logging.WARNING, logger=srv.logger.name):
+            srv._precompute_telemetry(_state())  # must not raise
 
-    def test_gateway_start_event_carries_the_precomputed_fields(
-        self, monkeypatch
-    ) -> None:
+        telemetry.record_event.assert_called_once_with(
+            "gateway_start", {"owner_id_hash": "unknown", "os_type": "", "arch": ""}
+        )
+        assert [r.getMessage() for r in caplog.records if r.name == srv.logger.name] == [
+            "Failed to pre-compute owner hash",
+            "Failed to pre-compute system info",
+        ]
+
+    def test_gateway_start_event_carries_the_precomputed_fields(self, monkeypatch) -> None:
         import kiro_crew.dashboard.handlers_system as hs
 
         monkeypatch.setattr(hs, "_get_owner_hash", MagicMock(return_value="hash-1"))
@@ -321,9 +443,7 @@ class TestWriteSecretFileDescriptorCleanup:
         assert closed, "the open descriptor must be closed on the failure path"
         assert not secret_path.exists()
 
-    def test_close_failure_does_not_mask_the_original_error(
-        self, tmp_path, monkeypatch
-    ) -> None:
+    def test_close_failure_does_not_mask_the_original_error(self, tmp_path, monkeypatch) -> None:
         secret_path = tmp_path / ".local_secret"
         monkeypatch.setattr(
             srv.platform_compat,
@@ -379,7 +499,7 @@ class TestClaimedDashboardSlots:
 # ── _apply_startup_yolo ─────────────────────────────────────────────────
 
 
-def test_startup_yolo_survives_a_failing_duration_seed(monkeypatch) -> None:
+def test_startup_yolo_survives_a_failing_duration_seed(monkeypatch, caplog) -> None:
     """A broken ``yolo_duration`` seed must not abort the rest of startup."""
     monkeypatch.setattr(
         srv, "apply_config_duration", MagicMock(side_effect=RuntimeError("bad policy"))
@@ -388,9 +508,13 @@ def test_startup_yolo_survives_a_failing_duration_seed(monkeypatch) -> None:
     monkeypatch.setattr(srv, "grant_declared_yolo", granted)
     cfg = SimpleNamespace(agent=SimpleNamespace(dangerously_skip_permissions=False))
 
-    srv._apply_startup_yolo(_state(), cfg)
+    with caplog.at_level(logging.WARNING, logger=srv.logger.name):
+        srv._apply_startup_yolo(_state(), cfg)
 
     # Opt-out config: the seed failure is logged, and no grant is attempted.
+    assert [r.getMessage() for r in caplog.records if r.name == srv.logger.name] == [
+        "Could not apply the configured YOLO duration"
+    ]
     assert not granted.called
 
 
@@ -400,7 +524,9 @@ def test_startup_yolo_survives_a_failing_duration_seed(monkeypatch) -> None:
 class TestReviveIntendedInstances:
     @pytest.mark.asyncio
     async def test_no_intent_means_no_connect_attempt(self) -> None:
-        registry = MagicMock(list=MagicMock(return_value=[SimpleNamespace(id="a", was_connected=False)]))
+        registry = MagicMock(
+            list=MagicMock(return_value=[SimpleNamespace(id="a", was_connected=False)])
+        )
         manager = MagicMock(connect=AsyncMock())
 
         await srv._revive_intended_instances(registry, manager)
@@ -408,23 +534,21 @@ class TestReviveIntendedInstances:
         assert not manager.connect.called
 
     @pytest.mark.asyncio
-    async def test_one_failing_host_does_not_abort_the_rest(self) -> None:
+    async def test_one_failing_host_does_not_abort_the_rest(self, caplog) -> None:
         """Per-instance isolation is the whole point: a down host must leave its
         own tab in an error state without stopping the other revivals."""
         registry = MagicMock(
             list=MagicMock(
                 return_value=[
-                    SimpleNamespace(id="boom", was_connected=True),
-                    SimpleNamespace(id="degraded", was_connected=True),
-                    SimpleNamespace(id="ok", was_connected=True),
+                    SimpleNamespace(id="boom", was_connected=True, disabled=False),
+                    SimpleNamespace(id="degraded", was_connected=True, disabled=False),
+                    SimpleNamespace(id="ok", was_connected=True, disabled=False),
                 ]
             )
         )
         results = {
             "boom": RuntimeError("ssh refused"),
-            "degraded": SimpleNamespace(
-                state=srv.TunnelState.ERROR, error="auth required"
-            ),
+            "degraded": SimpleNamespace(state=srv.TunnelState.ERROR, error="auth required"),
             "ok": SimpleNamespace(state=srv.TunnelState.CONNECTED, error=""),
         }
 
@@ -436,12 +560,21 @@ class TestReviveIntendedInstances:
 
         manager = MagicMock(connect=AsyncMock(side_effect=_connect))
 
-        await srv._revive_intended_instances(registry, manager)
+        with caplog.at_level(logging.INFO, logger=srv.logger.name):
+            await srv._revive_intended_instances(registry, manager)
 
         assert [c.args[0] for c in manager.connect.await_args_list] == [
             "boom",
             "degraded",
             "ok",
+        ]
+        # Each host's own outcome is reported, the failure included.
+        logged = [r.getMessage() for r in caplog.records if r.name == srv.logger.name]
+        assert logged == [
+            "Auto-reconnecting 3 instance(s) on startup",
+            "Startup auto-reconnect of boom failed",
+            "Startup auto-reconnect of degraded did not connect (error): auth required",
+            "Auto-reconnected instance ok",
         ]
 
 
@@ -510,8 +643,15 @@ class TestConnectionsWarmLifecycle:
             assert kick in source
             # The kick must run strictly AFTER the listener binds: an on_startup hook (or
             # any pre-bind call) puts the scavenge's deferred import in front of the bind,
-            # which no-new-work-on-gateway-boot-path forbids.
-            assert source.index("_start_site(site, port)") < source.index(kick)
+            # which no-new-work-on-gateway-boot-path forbids. The serving step differs per
+            # entrypoint: start_dashboard listens on its pre-reserved socket via SockSite
+            # ("await site.start()"); start_api_server binds via _start_site.
+            serving = (
+                "_start_site(site, port)"
+                if "_start_site(site, port)" in source
+                else "await site.start()"
+            )
+            assert source.index(serving) < source.index(kick)
 
 
 # ── _register_browser_view_cleanup ──────────────────────────────────────
@@ -578,9 +718,19 @@ class TestPreventSleepShutdown:
     @pytest.mark.asyncio
     async def test_nothing_armed_is_a_clean_no_op(self) -> None:
         app = web.Application()
-        srv._register_prevent_sleep_shutdown(app, _state())
+        state = _state()
+        srv._register_prevent_sleep_shutdown(app, state)
+        ran: list[str] = []
 
-        await _run_cleanup(app)  # neither task nor inhibitor exists yet
+        async def _later_hook(_app: web.Application) -> None:
+            ran.append("later")
+
+        app.on_cleanup.append(_later_hook)
+
+        await _run_cleanup(app)
+
+        assert ran == ["later"]
+        assert vars(state) == {"_background_tasks": set()}
 
     @pytest.mark.asyncio
     async def test_cancels_the_poll_and_releases_the_os_block(self) -> None:
@@ -606,11 +756,19 @@ class TestPreventSleepShutdown:
         """``on_cleanup`` hooks run in sequence and a raise aborts the rest, so a
         stubborn OS inhibitor must never propagate."""
         app = web.Application()
-        srv._register_prevent_sleep_shutdown(
-            app, _state(_sleep_inhibitor=_FakeInhibitor(raise_on=False))
-        )
+        inhibitor = _FakeInhibitor(raise_on=False)
+        srv._register_prevent_sleep_shutdown(app, _state(_sleep_inhibitor=inhibitor))
+        ran: list[str] = []
+
+        async def _later_hook(_app: web.Application) -> None:
+            ran.append("later")
+
+        app.on_cleanup.append(_later_hook)
 
         await _run_cleanup(app)
+
+        assert inhibitor.states == [False]
+        assert ran == ["later"]
 
 
 # ── _arm_prevent_sleep_poll ─────────────────────────────────────────────
@@ -631,9 +789,7 @@ class TestArmPreventSleepPoll:
         return state
 
     @pytest.mark.asyncio
-    async def test_poll_applies_the_predicate_then_releases_on_cancel(
-        self, monkeypatch
-    ) -> None:
+    async def test_poll_applies_the_predicate_then_releases_on_cancel(self, monkeypatch) -> None:
         polled = asyncio.Event()
 
         async def _should(_state_arg: Any, _port: int) -> bool:
@@ -685,9 +841,7 @@ class TestArmPreventSleepPoll:
         inhibitor = _FakeInhibitor()
         with caplog.at_level(logging.ERROR, logger=srv.logger.name):
             state = self._arm(monkeypatch, inhibitor, interval="not-a-number")
-            result = await asyncio.gather(
-                state._prevent_sleep_task, return_exceptions=True
-            )
+            result = await asyncio.gather(state._prevent_sleep_task, return_exceptions=True)
             await asyncio.sleep(0)  # let the done-callback run
 
         assert isinstance(result[0], TypeError)
@@ -801,9 +955,7 @@ class TestStartApiServerResidualPaths:
             lambda token: token.removeprefix("signed:"),
         )
 
-        runner, _state_obj = await _start_api(
-            tmp_path, monkeypatch, subagents=subagents
-        )
+        runner, _state_obj = await _start_api(tmp_path, monkeypatch, subagents=subagents)
         try:
             secret = (tmp_path / ".local_secret").read_text(encoding="utf-8").strip()
             # Drive the app through the in-process harness rather than the
@@ -835,9 +987,7 @@ class TestStartApiServerResidualPaths:
         assert "spawn exploded" in errors[-1]["error"]
 
     @pytest.mark.asyncio
-    async def test_a_successful_api_call_is_audited_as_ok(
-        self, tmp_path, monkeypatch
-    ) -> None:
+    async def test_a_successful_api_call_is_audited_as_ok(self, tmp_path, monkeypatch) -> None:
         """The success arm of the audit must record the call, not only failures.
 
         (The middleware's non-``/api/`` pass-through is unreachable on this
@@ -853,9 +1003,7 @@ class TestStartApiServerResidualPaths:
             # In-process harness, not the production listener -- see the sibling
             # test above for why.
             async with TestClient(TestServer(runner.app)) as client:
-                resp = await client.get(
-                    "/api/crons", headers={"X-Internal-Secret": secret}
-                )
+                resp = await client.get("/api/crons", headers={"X-Internal-Secret": secret})
                 assert resp.status == 200
         finally:
             await runner.cleanup()

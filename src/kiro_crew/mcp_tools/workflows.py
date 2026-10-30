@@ -60,15 +60,21 @@ def schemas() -> list[dict[str, Any]]:
         {
             "name": "workflow_run",
             "description": (
-                "★ THE tool for 'use a dynamic workflow to …' / 'run a workflow' / any "
-                "multi-phase, monitorable, restartable agent orchestration. PREFER THIS "
-                "over spawn_sub_agents for such requests. Just pass `intent` (the user's "
-                "goal in plain words) and it authors + launches the workflow in one step "
-                "— do NOT hand-roll the orchestration with spawn tools. Returns a run_id "
-                "immediately; the run streams to the Workflows dashboard tab and its "
-                "result is injected back into this chat on completion. Monitor with "
-                "workflow_status / workflow_result; restart parts with "
-                "workflow_rerun_subtree."
+                "Run a DYNAMIC WORKFLOW: a sandboxed script that orchestrates agents "
+                "in phases, streams to the Workflows dashboard tab, and can be "
+                "restarted from any step. Choose it yourself, without waiting for the "
+                "user to name it, when a task has several dependent phases or many "
+                "independent pieces AND a failed piece should re-run without redoing "
+                "the rest (e.g. research many sources, then synthesize; one audit "
+                "applied across many files). A single task needs neither; a one-shot "
+                "fan-out whose results you need only once fits spawn_run. Pass a saved "
+                "slug as `workflow`, or `intent` (the goal in plain words) to author "
+                "+ launch in one step — do not hand-roll the "
+                "same orchestration with spawn tools. Returns a run_id immediately; "
+                "the result is injected back into this chat on completion. Monitor "
+                "with workflow_status / workflow_result; restart parts with "
+                "workflow_rerun_subtree. Check workflow_library_list for a saved "
+                "workflow before authoring a new one."
             ),
             "inputSchema": {
                 "type": "object",
@@ -80,7 +86,11 @@ def schemas() -> list[dict[str, Any]]:
                     },
                     "input": {
                         "type": "string",
-                        "description": "Free-form input exposed as ctx.args['input']",
+                        "description": (
+                            "Free-form input exposed as ctx.args['input']. Used only "
+                            "with workflow; with source or intent it is dropped, so "
+                            "pass values in args instead"
+                        ),
                     },
                     "intent": {
                         "type": "string",
@@ -102,7 +112,9 @@ def schemas() -> list[dict[str, Any]]:
             "name": "workflow_library_list",
             "description": (
                 "List reusable workflows explicitly saved in the global Kiro Crew library. "
-                "Pass search to find local workflows relevant to a new request before authoring."
+                "Pass search to find local workflows relevant to a new request before authoring. "
+                "To save one or revise a saved one, ask the user with "
+                "propose_change(kind='workflow.save' or 'workflow.update')."
             ),
             "inputSchema": {
                 "type": "object",
@@ -352,12 +364,28 @@ def workflow_status(name: str, args: dict[str, Any]) -> str:
     # to the dashboard/chat (credentials + exfiltration URLs).
     safe_err = _redact_obj(d["error"]) if d.get("error") else ""
     safe_name = _redact_obj(d.get("name") or "—")
+    # The same two counts the [Workflow completion event] reports. A run whose
+    # every agent call failed still ends ``finished``, so without them a later
+    # status read looks clean. Positive ints only: a clean run's line is unchanged.
+    warnings = ""
+    error_count = d.get("agent_error_count")
+    if _positive_int(error_count):
+        warnings += f"; {error_count} agent call(s) failed (see `agent_errors` in workflow_result)"
+    partial_count = d.get("partial_result_count")
+    if _positive_int(partial_count):
+        warnings += f"; {partial_count} agent result(s) preserved (see `partial_results` in workflow_result)"
     return _wf_return(
         "workflow_status",
         f"Run `{d.get('run_id')}` ({safe_name}): **{d.get('status')}** "
-        f"— {d.get('event_count', 0)} events" + (f"; error: {safe_err}" if safe_err else ""),
+        f"— {d.get('event_count', 0)} events"
+        + (f"; error: {safe_err}" if safe_err else "")
+        + warnings,
         session_key=session_key,
     )
+
+
+def _positive_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
 
 def workflow_result(name: str, args: dict[str, Any]) -> str:

@@ -29,6 +29,7 @@ from kiro_crew.config.live import ConfigWatch
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.session import SessionManager, _watchdog_handle_of
 from kiro_crew.session_cleanup import SessionCleanup
+from kiro_crew.testing.wait import finished
 
 
 def _make_cfg(
@@ -91,6 +92,8 @@ _TICK_SWEEPS = (
     "_sweep_session_roots",
     "_sweep_sandbox_artifacts",
     "_sweep_session_pid_mappings",
+    "_sweep_session_token_mappings",
+    "_sweep_shell_audit_log",
     "_maybe_prune_pycache",
     "_sweep_periodic_pids",
     "_sweep_untracked_mcps",
@@ -109,6 +112,8 @@ class TestSubscription:
             "agents",
             "workspaces",
             "default_workspace",
+            "aws",
+            "apps",
         )
         assert mgr._config_sub is subs[0]
 
@@ -188,6 +193,7 @@ class TestAdoptOnChange:
             "agent.role_efforts.background",
             "agent.tool_search",
             "agent.sandbox",
+            "agent.env.HTTPS_PROXY",
             "session.pool_size",
             "session.pool_agent",
             "session.pool_ttl_secs",
@@ -424,9 +430,11 @@ class TestCleanupLoopRereadsPolicy:
         mgr, _ = _make_manager(timeout_secs=30)
         cleanup = mgr._cleanup_boundary()
         with patch.object(cleanup._deps.logger, "warning") as warn:
-            cleanup._adopt_idle_policy()
-            cleanup._adopt_idle_policy()
-            cleanup._adopt_idle_policy()
+            timeouts = []
+            for _ in range(3):
+                cleanup._adopt_idle_policy()
+                timeouts.append(cleanup.state.idle_timeout)
+        assert timeouts == [60, 60, 60]  # every tick still clamps; only the log is once
         assert warn.call_count == 1
 
     @pytest.mark.asyncio
@@ -450,7 +458,7 @@ class TestCleanupLoopRereadsPolicy:
             patch.object(SessionCleanup, "_adopt_idle_policy", side_effect=adopt),
             patch.multiple(SessionCleanup, **quiet),
         ):
-            await asyncio.wait_for(cleanup._run_cleanup_ticks(0.01), timeout=5)
+            await finished(cleanup._run_cleanup_ticks(0.01), "the tick loop stopping on shutdown")
         assert calls >= 3
 
     @pytest.mark.asyncio
@@ -506,7 +514,9 @@ class TestCleanupLoopRereadsPolicy:
                 patch.object(SessionCleanup, "_adopt_idle_policy", side_effect=adopt),
                 patch.multiple(SessionCleanup, **quiet),
             ):
-                await asyncio.wait_for(cleanup._run_cleanup_ticks(0.01), timeout=5)
+                await finished(
+                    cleanup._run_cleanup_ticks(0.01), "the tick loop stopping on shutdown"
+                )
         finally:
             pool.shutdown(wait=True)
 
@@ -516,6 +526,58 @@ class TestCleanupLoopRereadsPolicy:
             "unlinks paths a same-uid agent can plant on, so it belongs on the "
             "maintenance executor"
         )
+
+    @pytest.mark.asyncio
+    async def test_the_tick_prunes_session_token_mappings_off_the_loop(self) -> None:
+        """The session-token mapping prune runs on the tick, on the maintenance pool.
+
+        ``cleanup_orphaned_sessions`` reaches the same prune only at startup and
+        shutdown, so without the tick a gateway that keeps running holds one
+        ``session_token_*.sig`` file per session it has started.
+        """
+        mgr, _ = _make_manager()
+        cleanup = mgr._cleanup_boundary()
+        signal = asyncio.Event()
+        loop_thread = threading.get_ident()
+        ran_on: list[int] = []
+
+        def prune() -> int:
+            ran_on.append(threading.get_ident())
+            return 2
+
+        ticks = 0
+
+        def adopt() -> float:
+            nonlocal ticks
+            ticks += 1
+            if ticks >= 3:
+                signal.set()
+            return 0.01
+
+        quiet = {
+            name: AsyncMock() for name in _TICK_SWEEPS if name != "_sweep_session_token_mappings"
+        }
+        mgr._watchdog = MagicMock(tick=AsyncMock())
+        pool = ThreadPoolExecutor(max_workers=1)
+        cleanup._deps = replace(
+            cleanup._deps,
+            prune_session_token_mappings=prune,
+            get_maintenance_executor=lambda: pool,
+        )
+        try:
+            with (
+                patch("kiro_crew.session.shutdown_event", signal),
+                patch.object(SessionCleanup, "_adopt_idle_policy", side_effect=adopt),
+                patch.multiple(SessionCleanup, **quiet),
+            ):
+                await finished(
+                    cleanup._run_cleanup_ticks(0.01), "the tick loop stopping on shutdown"
+                )
+        finally:
+            pool.shutdown(wait=True)
+
+        assert ran_on, "the cleanup tick never pruned the session token mappings"
+        assert loop_thread not in ran_on, "the token-mapping prune ran on the event-loop thread"
 
 
 class _FakeHandle:

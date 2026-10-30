@@ -11,6 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from kiro_crew import platform_compat
 from kiro_crew import resource_status as rs
 
 
@@ -24,6 +25,31 @@ def _cfg(pressure: float, critical: float) -> SimpleNamespace:
     )
 
 
+@pytest.fixture(autouse=True)
+def _unmeasurable_slice(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Default every case here to a slice whose task count cannot be read.
+
+    ``probe`` reads the real host's agent slice, so without this default the
+    memory assertions would turn on whatever the machine running them happens to
+    hold: a host sitting above the tight ratio makes an "ample memory is silent"
+    case emit a task line and fail. The cases that exercise the task figure patch
+    it themselves, and those that exercise the READ call
+    :data:`_REAL_SLICE_PROBE`, captured past this default.
+    """
+    monkeypatch.setattr(rs, "_read_agent_slice_tasks", lambda: (-1, -1, -1))
+    # The pull tool also reads the spawn gate's own figure; pin it clear of any
+    # floor so a tool case never turns on the CI host's free memory.
+    monkeypatch.setattr(rs, "_read_spawn_floor_figure", lambda _min_gb: (32.0, ""))
+    # And the learned settled figures from the cost log: none, a fresh install.
+    monkeypatch.setattr(rs, "_read_learned_settled", lambda: {})
+
+
+#: The genuine probe, bound at import before the autouse default can replace it.
+_REAL_SLICE_PROBE = rs._read_agent_slice_tasks
+#: The genuine cost-log reader, bound the same way.
+_REAL_LEARNED_SETTLED = rs._read_learned_settled
+
+
 # ── _classify ────────────────────────────────────────────────────────────────
 
 
@@ -32,7 +58,7 @@ def _cfg(pressure: float, critical: float) -> SimpleNamespace:
     [
         (16.0, rs.POSTURE_AMPLE),
         (4.01, rs.POSTURE_AMPLE),
-        (4.0, rs.POSTURE_TIGHT),   # boundary: <= pressure
+        (4.0, rs.POSTURE_TIGHT),  # boundary: <= pressure
         (2.5, rs.POSTURE_TIGHT),
         (2.0, rs.POSTURE_CRITICAL),  # boundary: <= critical
         (0.5, rs.POSTURE_CRITICAL),
@@ -163,6 +189,201 @@ def test_tool_dispatch_returns_report(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "Guidance:" in out
 
 
+# ── temp-directory headroom ─────────────────────────────────────────────────────
+
+
+def _headroom(space: float, inode_pct: float, inodes: int, root: str = "/tmp") -> rs.TempHeadroom:
+    return rs.TempHeadroom(root, space, inode_pct, inodes)
+
+
+@pytest.mark.parametrize(
+    "space,inode_pct,inodes,expected",
+    [
+        (80.0, 90.0, 500_000, None),
+        (5.0, 90.0, 500_000, "LOW on space,"),
+        # The observed failure: bytes to spare, inodes gone.
+        (86.0, 2.0, 20_000, "LOW on inodes,"),
+        # A small tmpfs above 10% can still be a few hundred dirs from failure.
+        (86.0, 40.0, 900, "LOW on inodes,"),
+        (1.0, 1.0, 10, "LOW on space and inodes,"),
+    ],
+)
+def test_temp_headroom_text_names_what_is_low(
+    space: float, inode_pct: float, inodes: int, expected: str | None
+) -> None:
+    text = _headroom(space, inode_pct, inodes).text()
+    if expected is None:
+        assert "LOW" not in text
+    else:
+        assert text.startswith(expected)
+    assert f"({inodes} inodes)" in text
+
+
+def test_temp_headroom_reads_statvfs(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A plain namespace: ``os.statvfs`` and its result type do not exist on Windows.
+    fake = SimpleNamespace(f_blocks=1000, f_bavail=50, f_files=2000, f_favail=200)
+    monkeypatch.setattr(rs.os, "statvfs", lambda root: fake, raising=False)
+    reading = rs.temp_headroom("/somewhere")
+    assert reading == rs.TempHeadroom("/somewhere", 5.0, 10.0, 200)
+
+
+def test_temp_headroom_without_inode_accounting_is_not_low(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = SimpleNamespace(f_blocks=1000, f_bavail=900, f_files=0, f_favail=0)
+    monkeypatch.setattr(rs.os, "statvfs", lambda root: fake, raising=False)
+    reading = rs.temp_headroom("/btrfs")
+    assert reading is not None and not reading.low
+    # The placeholder count is never shown as a measured figure.
+    assert reading.text() == "90% space free, no inode limit"
+
+
+def test_temp_headroom_unmeasurable_is_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _gone(root: str) -> None:
+        raise FileNotFoundError(root)
+
+    monkeypatch.setattr(rs.os, "statvfs", _gone, raising=False)
+    assert rs.temp_headroom("/missing") is None
+    monkeypatch.delattr(rs.os, "statvfs", raising=False)
+    assert rs.temp_headroom("/tmp") is None
+
+
+def _fake_devices(monkeypatch: pytest.MonkeyPatch, devices: dict[str, int]) -> None:
+    def _stat(path: str) -> SimpleNamespace:
+        if path not in devices:
+            raise FileNotFoundError(path)
+        return SimpleNamespace(st_dev=devices[path], st_mode=0o040000)
+
+    monkeypatch.setattr(rs.os, "stat", _stat)
+
+
+def test_temp_roots_lists_tmpdir_on_another_device(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(rs.sys, "platform", "linux")
+    monkeypatch.setattr(rs.tempfile, "gettempdir", lambda: "/scratch/run-1")
+    _fake_devices(monkeypatch, {"/tmp": 1, "/scratch/run-1": 2})
+    assert rs.temp_roots() == ["/tmp", "/scratch/run-1"]
+
+
+def test_temp_roots_keeps_configured_dir_when_gettempdir_skips_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    configured = tmp_path / "configured-temp"
+    configured.mkdir()
+    monkeypatch.setattr(rs.sys, "platform", "linux")
+    monkeypatch.setenv("TMPDIR", str(configured))
+    monkeypatch.delenv("TEMP", raising=False)
+    monkeypatch.delenv("TMP", raising=False)
+    monkeypatch.setattr(rs.tempfile, "gettempdir", lambda: "/tmp")
+    _fake_devices(monkeypatch, {"/tmp": 1, str(configured): 2})
+
+    assert rs.temp_roots() == ["/tmp", str(configured)]
+
+
+def test_temp_roots_drops_tmpdir_on_the_same_device(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(rs.sys, "platform", "linux")
+    monkeypatch.setattr(rs.tempfile, "gettempdir", lambda: "/tmp/sub")
+    _fake_devices(monkeypatch, {"/tmp": 1, "/tmp/sub": 1})
+    assert rs.temp_roots() == ["/tmp"]
+
+
+def test_temp_roots_on_windows_is_the_temp_dir_alone(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(rs.sys, "platform", "win32")
+    monkeypatch.setattr(rs.tempfile, "gettempdir", lambda: "C:\\Temp")
+    _fake_devices(monkeypatch, {"/tmp": 1, "C:\\Temp": 2})
+    assert rs.temp_roots() == ["C:\\Temp"]
+
+
+def test_temp_roots_survives_no_usable_tempdir(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _none() -> str:
+        raise FileNotFoundError("no usable temporary directory")
+
+    monkeypatch.setattr(rs.sys, "platform", "linux")
+    monkeypatch.setattr(rs.tempfile, "gettempdir", _none)
+    _fake_devices(monkeypatch, {"/tmp": 1})
+    assert rs.temp_roots() == ["/tmp"]
+
+
+def test_temp_headroom_lines_guide_away_from_a_low_root(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    readings = {
+        "/tmp": _headroom(86.0, 2.0, 20_000),
+        "/scratch": _headroom(70.0, 90.0, 10**6, root="/scratch"),
+    }
+    monkeypatch.setattr(rs, "temp_roots", lambda: list(readings))
+    monkeypatch.setattr(rs, "temp_headroom", readings.get)
+    monkeypatch.setenv("KIROCREW_SCRATCH", "/scratch")
+    _fake_devices(monkeypatch, {"/tmp": 1, "/scratch": 2})
+    joined = "\n".join(rs.temp_headroom_lines())
+    assert "  /tmp: LOW on inodes," in joined
+    assert "  /scratch: 70% space free" in joined
+    assert "temp space is low on /tmp." in joined and "use $KIROCREW_SCRATCH instead" in joined
+
+
+@pytest.mark.parametrize(
+    "scratch,devices",
+    [
+        # Scratch on the low device: sending work there would fail the same way.
+        ("/scratch", {"/scratch": 1}),
+        # No scratch dir in this process.
+        ("", {"/scratch": 1}),
+        # Scratch named but gone.
+        ("/gone", {"/scratch": 1}),
+        # Scratch on another device that is itself low.
+        ("/other", {"/scratch": 1, "/other": 2}),
+    ],
+)
+def test_temp_guidance_never_points_at_a_low_device(
+    monkeypatch: pytest.MonkeyPatch, scratch: str, devices: dict[str, int]
+) -> None:
+    low = _headroom(86.0, 2.0, 20_000, root="/scratch")
+    monkeypatch.setattr(rs, "temp_roots", lambda: ["/scratch"])
+    monkeypatch.setattr(rs, "temp_headroom", lambda root: low)
+    monkeypatch.setenv("KIROCREW_SCRATCH", scratch)
+    _fake_devices(monkeypatch, devices)
+    joined = "\n".join(rs.temp_headroom_lines())
+    assert "$KIROCREW_SCRATCH" not in joined
+    assert "free space there or use a filesystem that is not low." in joined
+
+
+def test_temp_headroom_lines_healthy_has_no_guidance(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(rs, "temp_roots", lambda: ["/tmp"])
+    monkeypatch.setattr(rs, "temp_headroom", lambda root: _headroom(80.0, 90.0, 10**6))
+    lines = rs.temp_headroom_lines()
+    assert lines[0] == "Temp space (advisory):"
+    assert not any("Guidance" in line for line in lines)
+
+
+def test_temp_headroom_lines_empty_when_nothing_measurable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(rs, "temp_roots", lambda: ["/tmp"])
+    monkeypatch.setattr(rs, "temp_headroom", lambda root: None)
+    assert rs.temp_headroom_lines() == []
+
+
+def test_tool_dispatch_appends_temp_space_after_memory_guidance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from kiro_crew import mcp_core
+
+    fake = rs.ResourceStatus(
+        available_gb=30.0,
+        cpu_count=8,
+        load_per_cpu=0.5,
+        posture=rs.POSTURE_AMPLE,
+        pressure_gb=4.0,
+        critical_gb=2.0,
+    )
+    monkeypatch.setattr(rs, "probe", lambda cfg=None: fake)
+    monkeypatch.setattr(rs, "temp_roots", lambda: ["/tmp"])
+    monkeypatch.setattr(rs, "temp_headroom", lambda root: _headroom(86.0, 2.0, 20_000))
+    monkeypatch.delenv("KIROCREW_SCRATCH", raising=False)
+    out = mcp_core._call_tool_inner("resource_status", {})
+    assert out.index("ample headroom") < out.index("Temp space (advisory):")
+    assert "temp space is low on /tmp." in out
+
+
 # ── review-round fixes: off-switch, invariant clamp, schema registration ──────
 
 
@@ -172,7 +393,7 @@ def test_off_switch_disables_line_not_posture(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setattr(rs, "_read_available_gb", lambda: 1.0)
     status = rs.probe(_cfg(0.0, 2.0))
     assert status.posture == rs.POSTURE_CRITICAL
-    assert status.context_line() == ""            # line suppressed
+    assert status.context_line() == ""  # line suppressed
     assert "CRITICAL" in "\n".join(status.summary_lines())  # tool still honest
 
 
@@ -194,9 +415,9 @@ def test_tool_registered_and_rejects_stray_args() -> None:
 
     assert "resource_status" in MCP_CORE_SCHEMAS
     schema = MCP_CORE_SCHEMAS["resource_status"]
-    assert validate_tool_args({}, schema) == {}          # zero-arg call is valid
+    assert validate_tool_args({}, schema) == {}  # zero-arg call is valid
     with pytest.raises(ValidationError):
-        validate_tool_args({"bogus": 1}, schema)          # stray arg rejected
+        validate_tool_args({"bogus": 1}, schema)  # stray arg rejected
 
 
 # ── prewarm_allowance: host-derived cap on idle pre-warmed sessions ─────────
@@ -205,8 +426,8 @@ def test_tool_registered_and_rejects_stray_args() -> None:
 @pytest.mark.parametrize(
     "avail,expected",
     [
-        (0.5, 0),   # critical band: no idle agent process at all
-        (2.0, 0),   # inclusive, like _classify
+        (0.5, 0),  # critical band: no idle agent process at all
+        (2.0, 0),  # inclusive, like _classify
         (2.01, 1),  # tight band: one
         (4.0, 1),
         (4.01, 3),  # ample: the historical fixed cap
@@ -220,9 +441,9 @@ def test_prewarm_allowance_bands(avail: float, expected: int) -> None:
 @pytest.mark.parametrize(
     "avail,expected",
     [
-        (6.0, 0),    # under the tuned critical band
-        (8.0, 0),    # inclusive, like _classify
-        (8.01, 1),   # tuned tight band
+        (6.0, 0),  # under the tuned critical band
+        (8.0, 0),  # inclusive, like _classify
+        (8.01, 1),  # tuned tight band
         (16.0, 1),
         (16.01, 3),  # ample on the tuned scale
         (64.0, 3),
@@ -274,8 +495,756 @@ def test_prewarm_allowance_tracks_the_advisory_thresholds() -> None:
     reads CRITICAL pre-warms nothing and one that reads TIGHT pre-warms one."""
     defaults = _cfg(rs._DEFAULT_PRESSURE_GB, rs._DEFAULT_CRITICAL_GB)
     assert rs.prewarm_allowance(rs._DEFAULT_CRITICAL_GB - 0.01, defaults) == 0
-    assert rs._classify(rs._DEFAULT_CRITICAL_GB - 0.01, rs._DEFAULT_PRESSURE_GB,
-                        rs._DEFAULT_CRITICAL_GB) == rs.POSTURE_CRITICAL
+    assert (
+        rs._classify(
+            rs._DEFAULT_CRITICAL_GB - 0.01, rs._DEFAULT_PRESSURE_GB, rs._DEFAULT_CRITICAL_GB
+        )
+        == rs.POSTURE_CRITICAL
+    )
     assert rs.prewarm_allowance(rs._DEFAULT_PRESSURE_GB - 0.01, defaults) == 1
-    assert rs._classify(rs._DEFAULT_PRESSURE_GB - 0.01, rs._DEFAULT_PRESSURE_GB,
-                        rs._DEFAULT_CRITICAL_GB) == rs.POSTURE_TIGHT
+    assert (
+        rs._classify(
+            rs._DEFAULT_PRESSURE_GB - 0.01, rs._DEFAULT_PRESSURE_GB, rs._DEFAULT_CRITICAL_GB
+        )
+        == rs.POSTURE_TIGHT
+    )
+
+
+# ── agent-slice task ceiling ─────────────────────────────────────────────────
+#
+# The slice's pids ceiling is the one whose breach fails fork for every agent
+# under that slice at once, so these cases cover the read, the tight band, both
+# render paths, and the invariance the design promises: reported, never gated.
+
+_TOKEN = "kirocrew-agents-abc123def456.slice"
+
+
+def _slice_tree(
+    tmp_path,
+    current: str = "29500\n",
+    limit: str = "32768\n",
+    *,
+    own: str | None = "22000\n",
+    token: str = _TOKEN,
+):
+    """Build a fake agent-slice cgroup tree; returns its directory."""
+    slice_dir = tmp_path / "kirocrew-agents.slice"
+    slice_dir.mkdir()
+    (slice_dir / "pids.current").write_text(current, encoding="utf-8")
+    (slice_dir / "pids.max").write_text(limit, encoding="utf-8")
+    if own is not None:
+        child = slice_dir / token
+        child.mkdir()
+        (child / "pids.current").write_text(own, encoding="utf-8")
+    return slice_dir
+
+
+def _patch_slice(monkeypatch, slice_dir, token: str = _TOKEN) -> None:
+    """Point the probe at a fake tree, through the real cgroup reader."""
+    from kiro_crew import sandbox
+
+    monkeypatch.setattr(sandbox, "_agents_slice_cgroup_dir", lambda: slice_dir)
+    monkeypatch.setattr(sandbox, "_agents_slice_name", lambda: token)
+
+
+def _tasks(monkeypatch, current: int, limit: int, own: int = -1):
+    """Stub the task figures directly, for the render and gate cases."""
+    monkeypatch.setattr(rs, "_read_agent_slice_tasks", lambda: (current, limit, own))
+
+
+def test_slice_tasks_read_from_cgroup(tmp_path, monkeypatch) -> None:
+    """All three figures come from the real single-value cgroup reader."""
+    _patch_slice(monkeypatch, _slice_tree(tmp_path))
+    assert _REAL_SLICE_PROBE() == (29500, 32768, 22000)
+
+
+def test_slice_tasks_max_sentinel_means_no_ceiling(tmp_path, monkeypatch) -> None:
+    """``pids.max`` holding ``max`` is a slice with no wall, reported as 0."""
+    _patch_slice(monkeypatch, _slice_tree(tmp_path, limit="max\n"))
+    current, limit, _own = _REAL_SLICE_PROBE()
+    assert (current, limit) == (29500, 0)
+
+
+def test_slice_tasks_unreadable_ceiling_is_not_an_absent_one(tmp_path, monkeypatch) -> None:
+    """A ceiling that cannot be read must not be published as "no ceiling".
+
+    A slice released between the directory check and this read fails the read,
+    and reporting that as an absent limit is a reassurance nothing measured. The
+    two answers are kept distinct: ``0`` is the kernel's sentinel, ``-1`` is a
+    failure.
+    """
+    slice_dir = _slice_tree(tmp_path)
+    (slice_dir / "pids.max").unlink()
+    _patch_slice(monkeypatch, slice_dir)
+    current, limit, _own = _REAL_SLICE_PROBE()
+    assert current == 29500
+    assert limit == -1
+
+
+def test_slice_tasks_unparseable_ceiling_is_unreadable(tmp_path, monkeypatch) -> None:
+    """Content that is neither the sentinel nor digits reads as unknown."""
+    _patch_slice(monkeypatch, _slice_tree(tmp_path, limit="not-a-number\n"))
+    _current, limit, _own = _REAL_SLICE_PROBE()
+    assert limit == -1
+
+
+def test_slice_tasks_absent_slice_is_unknown(monkeypatch) -> None:
+    """No slice directory (not Linux, no delegation) reads as unknown, not zero."""
+    from kiro_crew import sandbox
+
+    monkeypatch.setattr(sandbox, "_agents_slice_cgroup_dir", lambda: None)
+    assert _REAL_SLICE_PROBE() == (-1, -1, -1)
+
+
+def test_slice_tasks_degraded_token_leaves_own_unattributed(tmp_path, monkeypatch) -> None:
+    """Without a per-instance child, this install's share is unknown.
+
+    The aggregate still reads, because the ceiling is the shared slice's; what
+    cannot be claimed is a share of it, so ``own`` stays -1 rather than taking
+    credit for a co-resident gateway's tasks.
+    """
+    slice_dir = _slice_tree(tmp_path)
+    _patch_slice(monkeypatch, slice_dir, token="kirocrew-agents.slice")
+    current, limit, own = _REAL_SLICE_PROBE()
+    assert (current, limit) == (29500, 32768)
+    assert own == -1
+
+
+def test_slice_tasks_released_child_is_a_true_zero(tmp_path, monkeypatch) -> None:
+    """An install with no live scope holds no tasks; systemd drops the directory."""
+    _patch_slice(monkeypatch, _slice_tree(tmp_path, own=None))
+    assert _REAL_SLICE_PROBE() == (29500, 32768, 0)
+
+
+def test_slice_tasks_unreadable_child_count_is_unknown(tmp_path, monkeypatch) -> None:
+    """A child directory whose count will not parse is unknown, not zero."""
+    _patch_slice(monkeypatch, _slice_tree(tmp_path, own="not-a-number\n"))
+    assert _REAL_SLICE_PROBE() == (29500, 32768, -1)
+
+
+def test_slice_tasks_probe_never_raises(monkeypatch) -> None:
+    """Any failure inside the probe degrades to unknown; it must never raise."""
+    from kiro_crew import sandbox
+
+    def _boom():
+        raise RuntimeError("cgroup gone")
+
+    monkeypatch.setattr(sandbox, "_agents_slice_cgroup_dir", _boom)
+    assert _REAL_SLICE_PROBE() == (-1, -1, -1)
+
+
+@pytest.mark.parametrize(
+    "current,limit,tight",
+    [
+        (29492, 32768, True),  # boundary: exactly the 90% ratio
+        (29491, 32768, False),  # one task below it
+        (32768, 32768, True),
+        (1000, 32768, False),
+        (29500, 0, False),  # no ceiling → nothing to approach
+        (-1, 32768, False),  # unreadable count raises nothing
+        (29500, -1, False),  # unreadable ceiling raises nothing
+    ],
+)
+def test_slice_tasks_tight_band(current: int, limit: int, tight: bool) -> None:
+    status = rs.ResourceStatus(
+        available_gb=32.0,
+        cpu_count=8,
+        load_per_cpu=0.1,
+        posture=rs.POSTURE_AMPLE,
+        pressure_gb=4.0,
+        critical_gb=2.0,
+        slice_tasks=current,
+        slice_tasks_limit=limit,
+    )
+    assert status.slice_tasks_tight is tight
+
+
+def test_slice_tasks_text_shapes(monkeypatch) -> None:
+    """The one reading both surfaces print, in its four shapes."""
+    _tasks(monkeypatch, 29500, 32768, 22000)
+    text = rs.probe(_cfg(4.0, 2.0)).slice_tasks_text()
+    assert text == "29500 of 32768 tasks (90%), this instance 22000"
+    _tasks(monkeypatch, 29500, 0, -1)
+    assert rs.probe(_cfg(4.0, 2.0)).slice_tasks_text() == "29500 tasks, no ceiling set"
+    # An unreadable ceiling reads differently from an absent one, so a released
+    # slice is never printed as a slice without a limit.
+    _tasks(monkeypatch, 29500, -1, -1)
+    assert rs.probe(_cfg(4.0, 2.0)).slice_tasks_text() == "29500 tasks, ceiling unreadable"
+    _tasks(monkeypatch, -1, -1, -1)
+    assert rs.probe(_cfg(4.0, 2.0)).slice_tasks_text() == ""
+
+
+def test_tasks_tight_raises_the_line_on_ample_memory(monkeypatch) -> None:
+    """The case the memory figure cannot express: plenty of RAM, no pids left."""
+    monkeypatch.setattr(rs, "_read_available_gb", lambda: 32.0)
+    _tasks(monkeypatch, 31000, 32768, 22000)
+    status = rs.probe(_cfg(4.0, 2.0))
+    line = status.context_line()
+    assert status.posture == rs.POSTURE_AMPLE
+    assert line.startswith("[RESOURCES]")
+    assert "task" in line
+    assert "31000 of 32768" in line
+    # The line must not borrow the memory advisory's wording for a host with 32 GB
+    # free: a reader acting on "memory is tight" would shed the wrong resource.
+    assert "CRITICALLY" not in line
+    assert "memory is tight" not in line
+    assert "memory is fine" in line
+
+
+def test_tasks_tight_never_claims_memory_it_could_not_read(monkeypatch) -> None:
+    """An unreadable memory probe is not a clean bill of health for memory.
+
+    ``unknown`` is not under pressure, so the task-only line is the branch that
+    renders; it must report memory as unreadable rather than fine, because a
+    reader told memory is fine stops considering it as the constraint.
+    """
+    monkeypatch.setattr(rs, "_read_available_gb", lambda: -1.0)
+    _tasks(monkeypatch, 31000, 32768, 22000)
+    status = rs.probe(_cfg(4.0, 2.0))
+    line = status.context_line()
+    assert status.posture == rs.POSTURE_UNKNOWN
+    assert "31000 of 32768" in line
+    assert "memory is fine" not in line
+    assert "unreadable" in line
+
+
+def test_under_pressure_stays_memory_only(monkeypatch) -> None:
+    """A full slice with ample memory is not memory pressure.
+
+    ``under_pressure`` is what several callers read as "memory is short", so a
+    task count must never set it, however tight the slice is.
+    """
+    monkeypatch.setattr(rs, "_read_available_gb", lambda: 32.0)
+    _tasks(monkeypatch, 32768, 32768, 32768)
+    status = rs.probe(_cfg(4.0, 2.0))
+    assert status.slice_tasks_tight is True
+    assert status.under_pressure is False
+
+
+def test_tasks_tight_rides_the_memory_line_as_a_clause(monkeypatch) -> None:
+    monkeypatch.setattr(rs, "_read_available_gb", lambda: 1.0)
+    _tasks(monkeypatch, 31000, 32768, 22000)
+    line = rs.probe(_cfg(4.0, 2.0)).context_line()
+    assert "CRITICALLY" in line  # the memory advisory is intact
+    assert "also near its task ceiling" in line
+
+
+def test_tasks_clause_absent_when_below_the_band(monkeypatch) -> None:
+    monkeypatch.setattr(rs, "_read_available_gb", lambda: 1.0)
+    _tasks(monkeypatch, 1000, 32768, 500)
+    line = rs.probe(_cfg(4.0, 2.0)).context_line()
+    assert "CRITICALLY" in line
+    assert "task" not in line
+
+
+def test_off_switch_also_suppresses_the_task_line(monkeypatch) -> None:
+    """``pressure_gb == 0`` is one off switch for the injected line, not two."""
+    monkeypatch.setattr(rs, "_read_available_gb", lambda: 32.0)
+    _tasks(monkeypatch, 32768, 32768, 22000)
+    status = rs.probe(_cfg(0.0, 0.0))
+    assert status.context_line() == ""
+    # The pull tool stays honest while the injected line is off.
+    assert "TIGHT" in "\n".join(status.summary_lines())
+
+
+def test_summary_lines_carry_the_task_reading(monkeypatch) -> None:
+    monkeypatch.setattr(rs, "_read_available_gb", lambda: 32.0)
+    _tasks(monkeypatch, 31000, 32768, 22000)
+    joined = "\n".join(rs.probe(_cfg(4.0, 2.0)).summary_lines())
+    assert "Agent slice tasks: 31000 of 32768 tasks (95%), this instance 22000" in joined
+    assert "TIGHT" in joined  # the band marker on the task line
+
+
+def test_summary_lines_omit_an_unmeasurable_slice(monkeypatch) -> None:
+    """A host with no cgroup task ceiling gets no line at all, not 'unknown'."""
+    monkeypatch.setattr(rs, "_read_available_gb", lambda: 32.0)
+    _tasks(monkeypatch, -1, -1, -1)
+    joined = "\n".join(rs.probe(_cfg(4.0, 2.0)).summary_lines())
+    assert "Agent slice tasks" not in joined
+
+
+def test_task_count_never_gates_admission(monkeypatch) -> None:
+    """Reported, never gated: a full slice with ample memory still admits."""
+    monkeypatch.setattr(rs, "_read_available_gb", lambda: 32.0)
+    _tasks(monkeypatch, 32768, 32768, 32768)
+    decision = rs.admission_check(_cfg(4.0, 2.0))
+    assert decision.admitted is True
+    assert decision.posture == rs.POSTURE_AMPLE
+    assert decision.reason == ""
+
+
+def test_task_count_never_shrinks_prewarm(monkeypatch) -> None:
+    monkeypatch.setattr(rs, "_read_available_gb", lambda: 32.0)
+    _tasks(monkeypatch, 32768, 32768, 32768)
+    assert rs.prewarm_allowance(cfg=_cfg(4.0, 2.0)) == rs.PREWARM_MAX_LIVE
+
+
+def test_task_count_does_not_move_the_posture(monkeypatch) -> None:
+    """The posture is a memory scalar at any task count."""
+    monkeypatch.setattr(rs, "_read_available_gb", lambda: 32.0)
+    for current in (0, 16000, 32768):
+        _tasks(monkeypatch, current, 32768, current)
+        assert rs.probe(_cfg(4.0, 2.0)).posture == rs.POSTURE_AMPLE
+
+
+# ── slice ownership SLI (unowned-alive / owned-dead) ──
+
+
+class TestSliceOwnership:
+    """Both faults are alarms at any value above zero, and an unreadable slice
+    is not an all-clear."""
+
+    @staticmethod
+    def _alive(live: set[int]):
+        return lambda pid: pid in live
+
+    def test_a_process_nothing_claims_is_counted_as_leaked(self) -> None:
+        out = rs.slice_ownership(
+            [10, 11], slice_pids=[10, 11, 12], pid_alive=self._alive({10, 11, 12})
+        )
+        assert out.unowned_alive == 1
+        assert out.owned_dead == 0
+        assert out.healthy is False
+
+    def test_a_claim_on_a_pid_that_is_not_running_is_counted_as_stale(self) -> None:
+        out = rs.slice_ownership([10, 99], slice_pids=[10], pid_alive=self._alive({10}))
+        assert out.owned_dead == 1
+        assert out.unowned_alive == 0
+        assert out.healthy is False
+
+    def test_a_stale_claim_outside_the_slice_is_still_counted(self) -> None:
+        """Intersecting the claims with the slice first would hide exactly the
+        claims that have outlived their process -- once the scope is released
+        such a pid is absent from the slice."""
+        out = rs.slice_ownership([4242], slice_pids=[], pid_alive=self._alive(set()))
+        assert out.owned_dead == 1
+
+    def test_a_fully_accounted_slice_is_healthy(self) -> None:
+        out = rs.slice_ownership([10, 11], slice_pids=[10, 11], pid_alive=self._alive({10, 11}))
+        assert (out.unowned_alive, out.owned_dead, out.owned_alive) == (0, 0, 2)
+        assert out.healthy is True
+
+    def test_an_empty_slice_with_no_claims_is_healthy(self) -> None:
+        out = rs.slice_ownership([], slice_pids=[], pid_alive=self._alive(set()))
+        assert out.healthy is True
+        assert out.owned_alive == 0
+
+    def test_an_unreadable_slice_reports_minus_one_and_is_not_healthy(self) -> None:
+        """A host whose slice cannot be enumerated has not been shown to be
+        clean, so it must not publish zeros."""
+        out = rs.slice_ownership([10], slice_pids=None, pid_alive=self._alive({10}))
+        # slice_pids=None takes the real probe; on a host without the slice it is
+        # unreadable, and on one WITH it the counts are real but never negative.
+        if not out.readable:
+            assert (out.unowned_alive, out.owned_dead, out.owned_alive) == (-1, -1, -1)
+            assert out.healthy is False
+        else:
+            assert out.unowned_alive >= 0 and out.owned_dead >= 0
+
+    def test_a_claimed_pid_alive_outside_the_slice_counts_as_owned_alive(self) -> None:
+        out = rs.slice_ownership([77], slice_pids=[], pid_alive=self._alive({77}))
+        assert (out.owned_alive, out.owned_dead, out.unowned_alive) == (1, 0, 0)
+        assert out.healthy is True
+
+    def test_a_raising_liveness_probe_degrades_instead_of_propagating(self) -> None:
+        def boom(_pid: int) -> bool:
+            raise OSError("proc went away")
+
+        out = rs.slice_ownership([10], slice_pids=[10], pid_alive=boom)
+        assert out.readable is False
+        assert out.healthy is False
+
+    def test_the_payload_carries_every_field_a_reader_needs(self) -> None:
+        out = rs.slice_ownership([10, 99], slice_pids=[10, 12], pid_alive=self._alive({10, 12}))
+        assert out.as_dict() == {
+            "unowned_alive": 1,
+            "owned_dead": 1,
+            "owned_alive": 1,
+            "readable": True,
+            "healthy": False,
+        }
+
+
+# ── macOS kernel memory pressure: reported beside the posture, never in it ────
+
+
+def _pressure(monkeypatch: pytest.MonkeyPatch, level: int | None) -> None:
+    monkeypatch.setattr(platform_compat, "memory_pressure_level", lambda: level)
+
+
+def test_probe_carries_the_level_without_moving_the_posture(monkeypatch) -> None:
+    monkeypatch.setattr(rs, "_read_available_gb", lambda: 8.0)
+    _pressure(monkeypatch, platform_compat.MEMORY_PRESSURE_WARN)
+    status = rs.probe(_cfg(4.0, 2.0))
+    assert status.memory_pressure_level == platform_compat.MEMORY_PRESSURE_WARN
+    assert status.memory_pressure_held is True
+    assert status.posture == rs.POSTURE_AMPLE
+
+
+def test_ample_figure_under_pressure_still_injects_a_line(monkeypatch) -> None:
+    monkeypatch.setattr(rs, "_read_available_gb", lambda: 8.0)
+    _pressure(monkeypatch, platform_compat.MEMORY_PRESSURE_WARN)
+    line = rs.probe(_cfg(4.0, 2.0)).context_line()
+    assert line.startswith("[RESOURCES] Host memory reads ~8.0 GB free")
+    assert "macOS reports memory pressure (WARN)" in line
+    assert rs.PRESSURE_QUEUE_NOTE in line
+
+
+def test_pressure_rides_a_tight_line_as_a_clause(monkeypatch) -> None:
+    monkeypatch.setattr(rs, "_read_available_gb", lambda: 3.0)
+    _pressure(monkeypatch, platform_compat.MEMORY_PRESSURE_CRITICAL)
+    line = rs.probe(_cfg(4.0, 2.0)).context_line()
+    assert line.startswith("[RESOURCES] Host memory is tight")
+    assert "macOS reports memory pressure (CRITICAL)" in line
+
+
+@pytest.mark.parametrize("level", [None, 1])
+def test_no_pressure_line_without_pressure(monkeypatch, level) -> None:
+    monkeypatch.setattr(rs, "_read_available_gb", lambda: 8.0)
+    _pressure(monkeypatch, level)
+    assert rs.probe(_cfg(4.0, 2.0)).context_line() == ""
+
+
+def test_the_off_switch_also_silences_the_pressure_line(monkeypatch) -> None:
+    monkeypatch.setattr(rs, "_read_available_gb", lambda: 8.0)
+    _pressure(monkeypatch, platform_compat.MEMORY_PRESSURE_WARN)
+    assert rs.probe(_cfg(0.0, 2.0)).context_line() == ""
+
+
+def test_summary_reports_the_level_only_where_it_is_read(monkeypatch) -> None:
+    monkeypatch.setattr(rs, "_read_available_gb", lambda: 8.0)
+    _pressure(monkeypatch, platform_compat.MEMORY_PRESSURE_WARN)
+    lines = rs.probe(_cfg(4.0, 2.0)).summary_lines()
+    assert f"  Kernel memory pressure: WARN — {rs.PRESSURE_QUEUE_NOTE}" in lines
+    _pressure(monkeypatch, platform_compat.MEMORY_PRESSURE_NORMAL)
+    assert "  Kernel memory pressure: NORMAL" in rs.probe(_cfg(4.0, 2.0)).summary_lines()
+    _pressure(monkeypatch, None)
+    lines = rs.probe(_cfg(4.0, 2.0)).summary_lines()
+    assert not any("Kernel memory pressure" in line for line in lines)
+
+
+def test_tool_guidance_never_says_heavy_work_is_fine_under_pressure(monkeypatch) -> None:
+    from kiro_crew import mcp_core
+
+    fake = rs.ResourceStatus(
+        available_gb=8.0,
+        cpu_count=8,
+        load_per_cpu=0.5,
+        posture=rs.POSTURE_AMPLE,
+        pressure_gb=4.0,
+        critical_gb=2.0,
+        memory_pressure_level=platform_compat.MEMORY_PRESSURE_WARN,
+    )
+    monkeypatch.setattr(rs, "probe", lambda cfg=None: fake)
+    out = mcp_core._call_tool_inner("resource_status", {})
+    assert "Posture: AMPLE" in out
+    assert "Kernel memory pressure: WARN" in out
+    assert "Guidance: macOS reports memory pressure — prefer the lighter path" in out
+    # The queue note is said once, on the level line, not again in the guidance.
+    assert out.count(rs.PRESSURE_QUEUE_NOTE) == 1
+    assert "nothing is reserved" not in out
+
+
+@pytest.mark.parametrize("level", [2, 4])
+def test_prewarm_bands_ignore_the_level(monkeypatch, level: int) -> None:
+    """The hold is the subagent gate's rule, read at the eager-spawn admission
+    with its other conditions (``chat_runner._pressure_hold_blocks_prewarm``);
+    the host-derived allowance itself stays figure-based."""
+    monkeypatch.setattr(rs, "_read_available_gb", lambda: 32.0)
+    _pressure(monkeypatch, level)
+    assert rs.prewarm_allowance(cfg=_cfg(4.0, 2.0)) == rs.PREWARM_MAX_LIVE
+
+
+def test_an_unreadable_figure_under_pressure_still_injects_a_line(monkeypatch) -> None:
+    monkeypatch.setattr(rs, "_read_available_gb", lambda: -1.0)
+    _pressure(monkeypatch, platform_compat.MEMORY_PRESSURE_WARN)
+    line = rs.probe(_cfg(4.0, 2.0)).context_line()
+    assert line.startswith("[RESOURCES] Host memory reads an unreadable figure")
+    assert "macOS reports memory pressure (WARN)" in line
+
+
+def test_an_unreadable_level_on_macos_is_reported_once(monkeypatch, caplog) -> None:
+    """None fails open, so a sysctl macOS stopped answering would silently turn
+    the hold off; it must be said, once per process."""
+    monkeypatch.setattr(rs, "_read_available_gb", lambda: 8.0)
+    monkeypatch.setattr(rs, "_pressure_unreadable_reported", False)
+    monkeypatch.setattr(platform_compat, "IS_MACOS", True)
+    _pressure(monkeypatch, None)
+    with caplog.at_level("WARNING", logger="kiro_crew.resource_status"):
+        rs.probe(_cfg(4.0, 2.0))
+        rs.probe(_cfg(4.0, 2.0))
+        rs.read_memory_pressure_level()
+    said = [r for r in caplog.records if "memory-pressure level is unreadable" in r.getMessage()]
+    assert len(said) == 1
+
+
+def test_an_unknown_level_off_macos_says_nothing(monkeypatch, caplog) -> None:
+    monkeypatch.setattr(rs, "_read_available_gb", lambda: 8.0)
+    monkeypatch.setattr(rs, "_pressure_unreadable_reported", False)
+    monkeypatch.setattr(platform_compat, "IS_MACOS", False)
+    _pressure(monkeypatch, None)
+    with caplog.at_level("WARNING", logger="kiro_crew.resource_status"):
+        rs.probe(_cfg(4.0, 2.0))
+    assert not any("memory-pressure level" in r.getMessage() for r in caplog.records)
+
+
+def _gateway_status(free_gb, posture):
+    return rs.ResourceStatus(
+        available_gb=free_gb,
+        cpu_count=8,
+        load_per_cpu=None,
+        posture=posture,
+        pressure_gb=4.0,
+        critical_gb=1.0,
+    )
+
+
+@pytest.mark.parametrize("free_gb", [3.0, 0.5])
+def test_a_remote_session_line_scopes_the_reading_to_the_gateway(free_gb):
+    """A remote session's builds run elsewhere: no "run targeted tests" advice."""
+    posture = rs.POSTURE_CRITICAL if free_gb <= 1.0 else rs.POSTURE_TIGHT
+    status = _gateway_status(free_gb, posture)
+    local = status.context_line()
+    remote = status.context_line(remote=True)
+    assert "targeted tests" in local or "CRITICALLY" in local
+    assert remote.startswith("[RESOURCES] The gateway machine")
+    assert "this does not measure" in remote and "targeted tests" not in remote
+    assert f"~{free_gb:.1f} GB free" in remote
+
+
+def test_a_clear_gateway_keeps_a_remote_session_silent():
+    assert _gateway_status(20.0, rs.POSTURE_AMPLE).context_line(remote=True) == ""
+
+
+_GIB = 1024**3
+
+
+def _status(free_gb):
+    if free_gb <= 1.0:
+        posture = rs.POSTURE_CRITICAL
+    elif free_gb <= 4.0:
+        posture = rs.POSTURE_TIGHT
+    else:
+        posture = rs.POSTURE_AMPLE
+    return _gateway_status(free_gb, posture)
+
+
+def test_a_healthy_workspace_reading_is_reported_beside_a_tight_gateway():
+    line = _status(3.0).context_line(remote=True, workspace_memory=(12 * _GIB, 16 * _GIB))
+    assert "The gateway machine" in line and "~3.0 GB free" in line
+    assert "~12.0 of 16 GB free" in line
+    assert "not limited by the gateway" in line
+    assert "targeted tests" not in line and "does not measure" not in line
+
+
+def test_a_tight_workspace_raises_the_line_even_with_a_healthy_gateway():
+    line = _status(20.0).context_line(remote=True, workspace_memory=(2 * _GIB, 8 * _GIB))
+    assert line.startswith("[RESOURCES] Your remote workspace machine is tight")
+    assert "~2.0 of 8.0 GB free" in line and "targeted tests" in line
+    assert "gateway machine" not in line
+
+
+def test_a_small_workspace_total_keeps_its_decimal():
+    # A 512 MiB container must not read "of 0 GB".
+    line = _status(20.0).context_line(remote=True, workspace_memory=(int(0.1 * _GIB), _GIB // 2))
+    assert "~0.1 of 0.5 GB free" in line
+
+
+def test_a_tight_slice_beside_a_tight_workspace_names_the_gateway_machine():
+    import dataclasses
+
+    status = dataclasses.replace(_status(20.0), slice_tasks=32000, slice_tasks_limit=32768)
+    assert status.slice_tasks_tight
+    line = status.context_line(remote=True, workspace_memory=(2 * _GIB, 8 * _GIB))
+    # The cgroup reading is the gateway's, not the workspace's the line led with.
+    assert "workspace machine is tight" in line
+    assert "On the gateway machine, the agent slice is also near its task ceiling" in line
+    # Gateway tight too: the line still ends on the workspace sentence, so the
+    # slice sentence must still name its machine.
+    pressed = dataclasses.replace(_status(3.0), slice_tasks=32000, slice_tasks_limit=32768)
+    both = pressed.context_line(remote=True, workspace_memory=(2 * _GIB, 8 * _GIB))
+    assert both.endswith(pressed._tasks_clause(name_gateway=True))
+    assert "On the gateway machine, the agent slice is also near its task ceiling" in both
+
+
+def test_an_idle_small_workspace_gets_no_build_advice():
+    # 3 of 4 GB free is below the gateway's 4 GB floor but a quarter of nothing
+    # is used: the workspace is judged on its own size.
+    line = _status(20.0).context_line(remote=True, workspace_memory=(3 * _GIB, 4 * _GIB))
+    assert line == ""
+    tight = _status(20.0).context_line(remote=True, workspace_memory=(int(0.8 * _GIB), 4 * _GIB))
+    assert "workspace machine is tight" in tight and "targeted tests" in tight
+
+
+def test_both_tight_reports_each_machine_with_its_own_advice():
+    line = _status(3.0).context_line(remote=True, workspace_memory=(1 * _GIB, 8 * _GIB))
+    assert "The gateway machine" in line and "sub-agent waves small" in line
+    assert "workspace machine is tight" in line and "targeted tests" in line
+
+
+def test_both_healthy_stays_silent():
+    assert _status(20.0).context_line(remote=True, workspace_memory=(12 * _GIB, 16 * _GIB)) == ""
+    assert _status(20.0).context_line(remote=True) == ""
+
+
+# ── the spawn floor ─────────────────────────────────────────────────────────
+
+
+def _spawn_cfg(floor: float, cost: float = 0.5) -> SimpleNamespace:
+    return SimpleNamespace(agent=SimpleNamespace(spawn_min_memory_gb=floor, subagent_cost_gb=cost))
+
+
+def _gate_figure(monkeypatch: pytest.MonkeyPatch, avail: float, cause: str = "") -> list[float]:
+    asked: list[float] = []
+
+    def read(min_gb: float) -> tuple[float, str]:
+        asked.append(min_gb)
+        return avail, cause
+
+    monkeypatch.setattr(rs, "_read_spawn_floor_figure", read)
+    return asked
+
+
+def test_spawn_floor_prices_starts_with_the_gate_helpers(monkeypatch) -> None:
+    from kiro_crew.subagent import _UNLEARNED_DEDICATED_START_GB, _shared_start_price_gb
+
+    asked = _gate_figure(monkeypatch, 8.0)
+    reading = rs.spawn_floor_reading(_spawn_cfg(2.0))
+    assert reading.floor_gb == 2.0
+    # Nothing learned: the gate prices a start at the unlearned figure, not
+    # the lower ``subagent_cost_gb``.
+    assert reading.min_start_gb == pytest.approx(
+        2.0 + _shared_start_price_gb(_UNLEARNED_DEDICATED_START_GB)
+    )
+    # The gate's figure is read against the cheapest bar, as the gate reads it.
+    assert asked == [pytest.approx(reading.min_start_gb)]
+    assert not reading.blocked
+    assert "BLOCKED" not in reading.summary_line()
+
+
+def test_a_fresh_install_is_blocked_between_the_cost_bar_and_the_gate_bar(monkeypatch) -> None:
+    """Floor 2 GB, cost 0.5, nothing learned: the gate's bar is 2.65 GB, so
+    2.4 GB holds every start even though it clears floor + shared(cost)."""
+    _gate_figure(monkeypatch, 2.4)
+    reading = rs.spawn_floor_reading(_spawn_cfg(2.0))
+    assert reading.blocked
+    assert "BLOCKED" in reading.summary_line()
+
+
+def test_a_learned_lighter_bucket_lowers_the_bar_to_its_price(monkeypatch) -> None:
+    from kiro_crew.subagent import _shared_start_price_gb
+
+    monkeypatch.setattr(rs, "_read_learned_settled", lambda: {"kirocrew": 0.8, "heavy": 1.6})
+    _gate_figure(monkeypatch, 8.0)
+    reading = rs.spawn_floor_reading(_spawn_cfg(2.0))
+    assert reading.min_start_gb == pytest.approx(2.0 + _shared_start_price_gb(0.8))
+
+
+def test_a_remote_bucket_never_sets_the_local_bar(monkeypatch) -> None:
+    from kiro_crew.subagent import (
+        _UNLEARNED_DEDICATED_START_GB,
+        REMOTE_COST_BUCKET_SUFFIX,
+        _shared_start_price_gb,
+    )
+
+    monkeypatch.setattr(
+        rs, "_read_learned_settled", lambda: {"kirocrew" + REMOTE_COST_BUCKET_SUFFIX: 0.3}
+    )
+    _gate_figure(monkeypatch, 8.0)
+    reading = rs.spawn_floor_reading(_spawn_cfg(2.0))
+    assert reading.min_start_gb == pytest.approx(
+        2.0 + _shared_start_price_gb(_UNLEARNED_DEDICATED_START_GB)
+    )
+
+
+def test_an_unreadable_cost_log_falls_back_to_the_configured_cost(monkeypatch) -> None:
+    from kiro_crew.subagent import _shared_start_price_gb
+
+    monkeypatch.setattr(rs, "_read_learned_settled", lambda: None)
+    _gate_figure(monkeypatch, 8.0)
+    reading = rs.spawn_floor_reading(_spawn_cfg(2.0))
+    assert reading.min_start_gb == pytest.approx(2.0 + _shared_start_price_gb(0.5))
+
+
+def test_an_incomplete_cost_log_read_falls_back_to_the_configured_cost(monkeypatch) -> None:
+    """A partial read may miss a figure the manager still holds, so it must not
+    raise the bar to the unlearned price."""
+    from kiro_crew import subagent_cost
+    from kiro_crew.subagent import _shared_start_price_gb
+
+    monkeypatch.setattr(rs, "_read_learned_settled", _REAL_LEARNED_SETTLED)
+    monkeypatch.setattr(subagent_cost, "read_learned_costs_checked", lambda *a, **k: ({}, False))
+    assert rs._read_learned_settled() is None
+    _gate_figure(monkeypatch, 8.0)
+    reading = rs.spawn_floor_reading(_spawn_cfg(2.0))
+    assert reading.min_start_gb == pytest.approx(2.0 + _shared_start_price_gb(0.5))
+
+
+def test_a_floor_above_the_gate_figure_is_blocked(monkeypatch) -> None:
+    """The reported case: a 4 GB floor with ~3.3 GB available holds every start."""
+    _gate_figure(monkeypatch, 3.3)
+    reading = rs.spawn_floor_reading(_spawn_cfg(4.0))
+    assert reading.blocked
+    assert "BLOCKED: new top-level subagents wait in the queue" in reading.summary_line()
+    assert "the gate reads 3.3 GB" in reading.blocked_sentence()
+    # Scoped to top-level starts: a running subagent's shared nested start
+    # skips its own start charge, so it can clear a lower bar.
+    assert "new top-level subagents cannot start now" in reading.blocked_sentence()
+
+
+def test_a_remote_caller_takes_no_reading_and_is_never_blocked(monkeypatch) -> None:
+    """The gate prices a remote session's children without the floor
+    (``remote_child``), so the tool must not report the floor as holding them."""
+    asked = _gate_figure(monkeypatch, 0.5)
+    reading = rs.spawn_floor_reading(_spawn_cfg(4.0), remote=True)
+    assert asked == []
+    assert not reading.blocked
+    assert reading.blocked_sentence() == ""
+    assert "not applied to this session's subagents" in reading.summary_line()
+
+
+def test_a_disabled_floor_takes_no_reading(monkeypatch) -> None:
+    asked = _gate_figure(monkeypatch, 0.1)
+    reading = rs.spawn_floor_reading(_spawn_cfg(0.0))
+    assert asked == []
+    assert not reading.blocked
+    assert reading.summary_line() == "  Subagent spawn floor: off (agent.spawn_min_memory_gb is 0)"
+
+
+def test_an_unmeasurable_gate_figure_fails_open_like_the_gate(monkeypatch) -> None:
+    _gate_figure(monkeypatch, -1.0)
+    reading = rs.spawn_floor_reading(_spawn_cfg(2.0))
+    assert not reading.blocked
+    assert "starts are not held" in reading.summary_line()
+
+
+def test_an_unreadable_cgroup_usage_is_blocked_with_its_cause(monkeypatch) -> None:
+    from kiro_crew.subagent import MEMORY_CAUSE_CGROUP_USAGE_UNREADABLE
+
+    _gate_figure(monkeypatch, 0.0, MEMORY_CAUSE_CGROUP_USAGE_UNREADABLE)
+    reading = rs.spawn_floor_reading(_spawn_cfg(2.0))
+    assert reading.blocked
+    assert "usage is unreadable" in reading.blocked_sentence()
+
+
+def test_tool_says_spawning_is_blocked_on_an_ample_posture(monkeypatch) -> None:
+    """End to end through the tool: AMPLE on the posture's figure, while the
+    gate's own figure misses the floor, must not read as ample headroom."""
+    from kiro_crew import mcp_core
+
+    fake = rs.ResourceStatus(
+        available_gb=8.0,
+        cpu_count=8,
+        load_per_cpu=0.5,
+        posture=rs.POSTURE_AMPLE,
+        pressure_gb=4.0,
+        critical_gb=2.0,
+    )
+    monkeypatch.setattr(rs, "probe", lambda cfg=None: fake)
+    monkeypatch.setattr(rs, "_load_config", lambda: _spawn_cfg(4.0))
+    _gate_figure(monkeypatch, 3.3)
+    out = mcp_core._call_tool_inner("resource_status", {})
+    assert "Posture: AMPLE" in out
+    assert "Subagent spawn floor: 4 GB must stay free after a start" in out
+    assert "Guidance: new top-level subagents cannot start now" in out
+    assert "ample headroom" not in out

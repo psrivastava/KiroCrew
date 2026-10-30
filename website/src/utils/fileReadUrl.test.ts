@@ -4,6 +4,9 @@ import {
   fileDownloadUrl,
   fileStreamUrl,
   fileOfficePreviewUrl,
+  fileOfficeSlidesUrl,
+  fileOfficeSlideUrl,
+  partialDownloadName,
 } from './fileReadUrl'
 
 // The four builders carry the client half of the contract that a path holding
@@ -24,6 +27,7 @@ const builders: Array<[string, (p: string) => string, string]> = [
   ['fileDownloadUrl', fileDownloadUrl, '/api/file-download'],
   ['fileStreamUrl', fileStreamUrl, '/api/file-stream'],
   ['fileOfficePreviewUrl', fileOfficePreviewUrl, '/api/file-office-preview'],
+  ['fileOfficeSlidesUrl', fileOfficeSlidesUrl, '/api/file-office-slides'],
 ]
 
 describe('file endpoint URL builders', () => {
@@ -54,5 +58,47 @@ describe('file endpoint URL builders', () => {
       '/api/file-read?path=' + encodeURIComponent('notes/One on one (2026).md') + '&resolve=1',
     )
     expect(fileReadUrl(RESERVED)).not.toContain('resolve=1')
+  })
+
+  it('fileOfficeSlideUrl appends the slide number after the encoded path and resolve flag', () => {
+    const url = fileOfficeSlideUrl('decks/Q3 (draft) #2.pptx', 7)
+    expect(url).toBe(
+      '/api/file-office-slide?path=' + encodeURIComponent('decks/Q3 (draft) #2.pptx') + '&resolve=1&n=7',
+    )
+    const params = new URL(fileOfficeSlideUrl(RESERVED, 12), 'http://localhost').searchParams
+    expect(params.get('path')).toBe(RESERVED)
+    expect(params.get('n')).toBe('12')
+    expect(params.get('resolve')).toBeNull()
+    expect(params.get('digest')).toBeNull()
+    const pinned = new URL(fileOfficeSlideUrl(RESERVED, 12, 'f'.repeat(64)), 'http://localhost').searchParams
+    expect(pinned.get('digest')).toBe('f'.repeat(64))
+    expect(pinned.get('n')).toBe('12')
+  })
+})
+
+describe('partialDownloadName', () => {
+  it('inserts .partial before the extension so the OS keeps the file type', () => {
+    expect(partialDownloadName('/home/u/release-checklist.md')).toBe('release-checklist.partial.md')
+    expect(partialDownloadName('b.md')).toBe('b.partial.md')
+    expect(partialDownloadName('/a/b/data.json')).toBe('data.partial.json')
+  })
+
+  it('inserts before the LAST extension of a multi-dot name', () => {
+    expect(partialDownloadName('archive.tar.gz')).toBe('archive.tar.partial.gz')
+  })
+
+  it('appends when there is no extension to preserve', () => {
+    expect(partialDownloadName('Makefile')).toBe('Makefile.partial')
+    expect(partialDownloadName('/etc/hosts')).toBe('hosts.partial')
+  })
+
+  it('treats a leading dot as a dotfile marker, not an extension', () => {
+    // `.env` is the whole name, not a stem of `` with extension `env`.
+    expect(partialDownloadName('.env')).toBe('.env.partial')
+    expect(partialDownloadName('/home/u/.bashrc')).toBe('.bashrc.partial')
+  })
+
+  it('appends for a trailing-dot name rather than splitting on the empty extension', () => {
+    expect(partialDownloadName('weird.')).toBe('weird..partial')
   })
 })

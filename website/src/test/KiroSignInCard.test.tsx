@@ -62,19 +62,18 @@ describe('KiroSignInCard', () => {
     kasLoginBeginDevice.mockClear()
   })
 
-  it('deep-links to the Developer page on the Agent Backend tab, ringing the card, and is not a Settings search entry', () => {
+  it('deep-links to Settings > Agent Harness, ringing the card, and is not a Settings search entry', () => {
     // The chat error row navigates to KIRO_SIGN_IN_PATH; the route must open the
-    // Developer page on the tab that renders the card (pinned end to end in
-    // DeveloperPage.kiroSignIn.test.tsx) and carry the card's own anchor, so the
+    // Settings tab that renders the card (pinned end to end in
+    // SettingsPage.agentHarness.test.tsx) and carry the card's own anchor, so the
     // reader lands ON the card below the long switch card rather than hunting.
     expect(KIRO_SIGN_IN_HIGHLIGHT_ANCHOR).toBe('kiro-sign-in')
     // The colon is percent-encoded so the route constant carries no prose-shaped
     // quasi; URLSearchParams decodes it back to `key:kiro-sign-in` on read.
-    expect(KIRO_SIGN_IN_PATH).toBe('/developer?tab=agent-backend&highlight=key%3Akiro-sign-in')
+    expect(KIRO_SIGN_IN_PATH).toBe('/settings/agent?highlight=key%3Akiro-sign-in')
     expect(new URL(KIRO_SIGN_IN_PATH, 'http://x').searchParams.get('highlight')).toBe(`key:${KIRO_SIGN_IN_HIGHLIGHT_ANCHOR}`)
-    // KAS is a Developer Mode preview; indexing its sign-in into Settings search
-    // would advertise it as an ordinary preference and route to a Settings tab
-    // that no longer renders it.
+    // The card only applies to the KAS backend; indexing its sign-in into
+    // Settings search would advertise it as a step every user needs.
     expect(SETTINGS_MANUAL.some(e => e.labelKey === 'pages.developer.kiroSignInCard.title')).toBe(false)
     expect(SETTINGS_MANUAL.some(e => e.id === 'overview.kiro-sign-in')).toBe(false)
   })
@@ -96,7 +95,7 @@ describe('KiroSignInCard', () => {
     // The card sits under a switch that also lists Kiro CLI, so the one sentence
     // must name the backend this identity is for and say the other's login is
     // untouched -- otherwise "this account" and the Kiro CLI option read alike.
-    expect(intro).toHaveTextContent('KAS (kiro-agent)')
+    expect(intro).toHaveTextContent('Kiro Agent')
     expect(intro).toHaveTextContent('Kiro CLI keeps its own kiro-cli login')
     expect(screen.getByRole('button', { name: 'Continue with Google' })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Continue with GitHub' })).toBeInTheDocument()
@@ -118,7 +117,13 @@ describe('KiroSignInCard', () => {
 
   it('signed in: shows a token-free summary with sign-out, and sign-out calls the API with the slot', async () => {
     kasLoginStatus.mockResolvedValue(SIGNED_IN)
-    renderWithProviders(<KiroSignInCard />)
+    localStorage.setItem(
+      'kc.acp.models.v1',
+      JSON.stringify({ ts: 0, models: [{ name: 'auto', description: '' }] }),
+    )
+    const { queryClient } = renderWithProviders(<KiroSignInCard />)
+    queryClient.setQueryData(['available-models', 'acp'], [{ name: 'auto' }, { name: 'account-a-model' }])
+    const reset = vi.spyOn(queryClient, 'resetQueries')
     const summary = await screen.findByTestId('kiro-sign-in-summary')
     expect(summary).toHaveAttribute('data-lapsed', 'false')
     expect(screen.getByTestId('kiro-sign-in-state')).toHaveTextContent('Signed in with Google')
@@ -132,6 +137,10 @@ describe('KiroSignInCard', () => {
     kasLoginStatus.mockResolvedValue(SIGNED_OUT)
     fireEvent.click(screen.getByTestId('kiro-sign-in-logout'))
     await waitFor(() => expect(kasLoginLogout).toHaveBeenCalledWith('social'))
+    // The model list was the signed-out account's: both frontend caches drop with it.
+    await waitFor(() => expect(reset).toHaveBeenCalledWith({ queryKey: ['available-models'] }))
+    expect(queryClient.getQueryData(['available-models', 'acp'])).toBeUndefined()
+    expect(localStorage.getItem('kc.acp.models.v1')).toBeNull()
     // The status re-read now says signed out, which unmounts the summary; the
     // "applies to processes started from now on" note lives on the card, so
     // it is still there beside the chooser the user now sees.
@@ -226,6 +235,47 @@ describe('KiroSignInCard', () => {
     expect(warning).toHaveTextContent('previous sign-in could not be removed')
     expect(await screen.findByTestId('kiro-sign-in-summary')).toBeInTheDocument()
     vi.mocked(api.kasLoginPoll).mockResolvedValue({ status: 'pending' })
+  })
+
+  it('an authorized sign-in drops the model list the previous account was served', async () => {
+    kasLoginStatus.mockResolvedValue(SIGNED_OUT)
+    vi.mocked(api.kasLoginPoll).mockResolvedValue({ status: 'authorized' })
+    localStorage.setItem(
+      'kc.acp.models.v1',
+      JSON.stringify({ ts: 0, models: [{ name: 'auto', description: '' }] }),
+    )
+    const { queryClient } = renderWithProviders(<KiroSignInCard />)
+    queryClient.setQueryData(['available-models', 'acp'], [{ name: 'auto' }, { name: 'account-a-model' }])
+    const reset = vi.spyOn(queryClient, 'resetQueries')
+    fireEvent.click(await screen.findByRole('button', { name: 'Continue with GitHub' }))
+    await waitFor(() => expect(reset).toHaveBeenCalledWith({ queryKey: ['available-models'] }))
+    expect(queryClient.getQueryData(['available-models', 'acp'])).toBeUndefined()
+    expect(localStorage.getItem('kc.acp.models.v1')).toBeNull()
+    vi.mocked(api.kasLoginPoll).mockResolvedValue({ status: 'pending' })
+  })
+
+  it('a cancel that finds the sign-in already landed drops the previous account\'s model list too', async () => {
+    // The poll never answers 'authorized' here: the user backs out while the
+    // credential is being stored, and only the cancel's fresh status read sees
+    // it. The model caches must still drop, the same as on the poll path.
+    kasLoginStatus.mockResolvedValue(SIGNED_OUT)
+    localStorage.setItem(
+      'kc.acp.models.v1',
+      JSON.stringify({ ts: 0, models: [{ name: 'auto', description: '' }] }),
+    )
+    const { queryClient } = renderWithProviders(<KiroSignInCard />)
+    queryClient.setQueryData(['available-models', 'acp'], [{ name: 'auto' }, { name: 'account-a-model' }])
+    const reset = vi.spyOn(queryClient, 'resetQueries')
+    fireEvent.click(await screen.findByRole('button', { name: 'Continue with GitHub' }))
+    const cancel = await screen.findByRole('button', { name: 'Use a different sign-in' })
+    expect(reset).not.toHaveBeenCalledWith({ queryKey: ['available-models'] })
+    kasLoginStatus.mockResolvedValue(SIGNED_IN)
+    fireEvent.click(cancel)
+    await waitFor(() => expect(api.kasLoginCancel).toHaveBeenCalled())
+    await waitFor(() => expect(reset).toHaveBeenCalledWith({ queryKey: ['available-models'] }))
+    expect(queryClient.getQueryData(['available-models', 'acp'])).toBeUndefined()
+    expect(localStorage.getItem('kc.acp.models.v1')).toBeNull()
+    expect(await screen.findByTestId('kiro-sign-in-summary')).toBeInTheDocument()
   })
 
   it('the embedded chrome hands failures to the agent where the gate cannot', async () => {

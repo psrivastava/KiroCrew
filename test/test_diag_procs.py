@@ -13,13 +13,17 @@ test that this works; no conftest shim is needed.
 
 from __future__ import annotations
 
+import contextlib
 import json
+import subprocess
 import sys
+from collections.abc import Callable, Iterator
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
-from kiro_crew import platform_compat, session_pid
+from kiro_crew import platform_compat, platform_compat_proctable, session_pid
 from kiro_crew.diag import procs
 
 NUL = b"\x00"
@@ -28,6 +32,29 @@ NUL = b"\x00"
 def nul_argv(*tokens: bytes) -> bytes:
     """Argv in the NUL-separated shape ``/proc/<pid>/cmdline`` uses."""
     return NUL.join(tokens) + NUL
+
+
+# One fixed monotonic reading, shared by both scans of a rate test. Every rate is
+# a counter delta over the gap between two rosters' stamps, and a test that ages
+# a stored roster by hand is asking for a gap of exactly that length. Taking the
+# same reading twice is what delivers it.
+SCAN_MONOTONIC = 10_000.0
+
+
+@contextlib.contextmanager
+def pinned_clock(reading: float) -> Iterator[None]:
+    """Hold the clock one scan stamps its roster with at *reading*.
+
+    ``procs.scan`` reads ``time.monotonic()`` itself, so the later of two scans
+    stamps whatever the wall clock says when it runs. Any real time the runner
+    spends between the two scans is then added to the gap the rate divides by,
+    which shrinks every rate below what the test set up -- on a slow or shared
+    runner by far more than a tight tolerance allows. Pinning the reading makes
+    the hand-aged window the whole window, so the arithmetic is the same on
+    every runner.
+    """
+    with mock.patch.object(procs.time, "monotonic", return_value=reading):
+        yield
 
 
 # -- the family under test ---------------------------------------------------
@@ -130,12 +157,22 @@ class FakeProcTable:
             wchan = wchans[offset] if offset < len(wchans) else wchans[-1]
             (tdir / "wchan").write_text(wchan, encoding="utf-8")
 
-    def scan(self, prev: procs.Roster | None = None, **kwargs: object) -> procs.Roster:
+    def scan(
+        self,
+        prev: procs.Roster | None = None,
+        *,
+        monotonic: float | None = None,
+        **kwargs: object,
+    ) -> procs.Roster:
         """Scan this table with every production seam replaced by a stub.
 
         ``clk_tck`` is passed explicitly because Windows has no
         ``os.sysconf``: without it every cpu and age figure read ``None`` on a
         Windows runner and the delta tests failed there while passing on Linux.
+
+        Pass *monotonic* to pin the reading this scan stamps its roster with;
+        a rate test passes the same one to both of its scans. See
+        :func:`pinned_clock`.
         """
         params: dict[str, object] = {
             "proc_root": self.root,
@@ -148,7 +185,39 @@ class FakeProcTable:
             "unreachable_orphan_fn": lambda pid, cmdline, tracked: False,
         }
         params.update(kwargs)
-        return procs.scan(prev, **params)  # type: ignore[arg-type]
+        if monotonic is None:
+            return procs.scan(prev, **params)  # type: ignore[arg-type]
+        with pinned_clock(monotonic):
+            return procs.scan(prev, **params)  # type: ignore[arg-type]
+
+    def scan_rated(
+        self,
+        baseline: "procs.RateBaseline",
+        *,
+        monotonic: float | None = None,
+        **kwargs: object,
+    ) -> procs.Roster:
+        """Scan through the read path that keeps the previous roster itself.
+
+        The same stubs as :meth:`scan`, so the only difference under test is who
+        holds the counters between two reads. *monotonic* pins the reading as it
+        does there.
+        """
+        params: dict[str, object] = {
+            "proc_root": self.root,
+            "platform_name": "linux",
+            "gateway_pid": GATEWAY,
+            "clk_tck": self.clk_tck,
+            "subreaper_pids_fn": lambda: {1},
+            "tracked_pids_fn": set,
+            "tracked_owners_fn": dict,
+            "unreachable_orphan_fn": lambda pid, cmdline, tracked: False,
+        }
+        params.update(kwargs)
+        if monotonic is None:
+            return procs.scan_with_rates(baseline, **params)
+        with pinned_clock(monotonic):
+            return procs.scan_with_rates(baseline, **params)
 
 
 @pytest.fixture
@@ -486,7 +555,7 @@ def test_cpu_and_runq_percentages_are_deltas_between_two_scans(tmp_path: Path) -
     table.add(GATEWAY, OUTSIDER, cmdline=GATEWAY_ARGV, env=dict(MARKER))
     table.add(CHAT, GATEWAY, cmdline=CHAT_ARGV, env=dict(MARKER), utime=0, runq_ns=0)
 
-    first = table.scan()
+    first = table.scan(monotonic=SCAN_MONOTONIC)
     # Move the first scan's clock back so the second scan sees a known 10s gap
     # instead of the microseconds two back-to-back scans really take.
     first.monotonic -= 10.0
@@ -500,7 +569,7 @@ def test_cpu_and_runq_percentages_are_deltas_between_two_scans(tmp_path: Path) -
         utime=table.clk_tck * 5,
         runq_ns=2_000_000_000,
     )
-    second = table.scan(first)
+    second = table.scan(first, monotonic=SCAN_MONOTONIC)
 
     assert second.nodes[CHAT].cpu_pct == pytest.approx(50.0, abs=1.0)
     assert second.nodes[CHAT].runq_wait_pct == pytest.approx(20.0, abs=1.0)
@@ -537,7 +606,7 @@ def test_gil_hint_fires_on_a_pinned_python_process_with_futex_waiters(
     table.add(
         CHAT, GATEWAY, cmdline=argv, env=dict(MARKER), thread_states=states, thread_wchans=wchans
     )
-    first = table.scan()
+    first = table.scan(monotonic=SCAN_MONOTONIC)
     first.monotonic -= 10.0
     table.add(
         CHAT,
@@ -548,7 +617,7 @@ def test_gil_hint_fires_on_a_pinned_python_process_with_futex_waiters(
         thread_wchans=wchans,
         utime=table.clk_tck * 9,
     )
-    second = table.scan(first)
+    second = table.scan(first, monotonic=SCAN_MONOTONIC)
 
     node = second.nodes[CHAT]
     assert node.threads.futex_wait == 2
@@ -569,7 +638,7 @@ def test_gil_hint_stays_off_without_futex_waiters(tmp_path: Path) -> None:
     table.add(
         CHAT, GATEWAY, cmdline=argv, env=dict(MARKER), thread_states=states, thread_wchans=wchans
     )
-    first = table.scan()
+    first = table.scan(monotonic=SCAN_MONOTONIC)
     first.monotonic -= 10.0
     table.add(
         CHAT,
@@ -580,7 +649,7 @@ def test_gil_hint_stays_off_without_futex_waiters(tmp_path: Path) -> None:
         thread_wchans=wchans,
         utime=table.clk_tck * 9,
     )
-    second = table.scan(first)
+    second = table.scan(first, monotonic=SCAN_MONOTONIC)
 
     assert second.nodes[CHAT].cpu_pct == pytest.approx(90.0, abs=1.0)
     assert second.nodes[CHAT].gil_saturated_hint is False
@@ -681,7 +750,7 @@ def test_an_unchanged_process_still_gets_its_rate(tmp_path: Path) -> None:
     table = FakeProcTable(tmp_path / "proc")
     table.add(GATEWAY, OUTSIDER, cmdline=GATEWAY_ARGV, env=dict(MARKER))
     table.add(CHAT, GATEWAY, cmdline=CHAT_ARGV, env=dict(MARKER), utime=0, age_secs=500.0)
-    first = table.scan()
+    first = table.scan(monotonic=SCAN_MONOTONIC)
     first.monotonic -= 10.0
     table.add(
         CHAT,
@@ -691,7 +760,7 @@ def test_an_unchanged_process_still_gets_its_rate(tmp_path: Path) -> None:
         utime=table.clk_tck * 5,
         age_secs=500.0,
     )
-    second = table.scan(first)
+    second = table.scan(first, monotonic=SCAN_MONOTONIC)
     assert second.nodes[CHAT].cpu_pct == pytest.approx(50.0, abs=1.0)
     assert not any("pid recycled" in n for n in second.degraded_report())
 
@@ -851,22 +920,27 @@ def test_darwin_uses_the_sanctioned_ps_snapshot() -> None:
     """
     parents = {GATEWAY: OUTSIDER, CHAT: GATEWAY, BROWSER: CHAT, OUTSIDER: 1, 4242: 1}
 
+    # The footprint reader is injected too. These pids are invented, and on a
+    # Mac the platform reader would measure whatever real process holds them.
     roster = procs.scan(
         platform_name="darwin",
         gateway_pid=GATEWAY,
         ps_snapshot_fn=lambda: parents,
+        footprint_fn=lambda pid: None,
     )
 
     assert set(roster.nodes) == {GATEWAY, CHAT, BROWSER}
     assert 4242 not in roster.nodes, "a sibling outside the gateway tree is not family"
     assert roster.nodes[GATEWAY].kind == "gateway"
     assert roster.nodes[CHAT].ppid == GATEWAY
-    # Everything the snapshot cannot carry is null, and the roster says so --
-    # including rss, which this snapshot reads no column for.
+    # Everything the snapshot cannot carry is null, and the roster says so.
+    # rss_kb is null here only because the injected reader answers None; the
+    # footprint tests below fill it.
     assert roster.nodes[CHAT].state is None
     assert roster.nodes[CHAT].cmdline == ""
     assert roster.nodes[CHAT].env == {}
     assert roster.nodes[CHAT].rss_kb is None
+    assert roster.nodes[CHAT].cpu_pct is None
     assert roster.nodes[CHAT].threads.count is None
     assert any("carries pid/ppid only" in note for note in roster.degraded_report())
     # orphans: 0 on macOS must read as UNMEASURED, never as a measured zero.
@@ -893,6 +967,120 @@ def test_the_darwin_adapter_reads_the_real_snapshot_row_field(monkeypatch) -> No
     edges = procs._darwin_parent_edges()
 
     assert edges == {GATEWAY: OUTSIDER, CHAT: GATEWAY}, "the adapter must read `ppid`"
+
+
+def _recording(calls: list[str], name: str, result: object = None) -> Callable[..., object]:
+    """A stand-in that records it was reached and answers *result*.
+
+    It records rather than raises on purpose. The footprint read sits inside a
+    blind ``except``, so a raising tripwire reached from there would be
+    swallowed into a null ``rss_kb`` -- the very value these tests expect.
+    """
+
+    def stand_in(*_args: object, **_kwargs: object) -> object:
+        calls.append(name)
+        return result
+
+    return stand_in
+
+
+def test_darwin_rss_kb_comes_from_the_platform_footprint_reader(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The default reader is the platform's ``phys_footprint``, floored to KiB.
+
+    Patched on the facade, so this goes through the production seam rather
+    than an injected one. None of the byte counts is a whole KiB and two of
+    them round up, so neither rounding nor ceiling reproduces the floor.
+    """
+    parents = {GATEWAY: OUTSIDER, CHAT: GATEWAY, BROWSER: CHAT, OUTSIDER: 1}
+    footprints = {GATEWAY: 5_000_000, CHAT: 1_049_000, BROWSER: 2_047}
+    monkeypatch.setattr(
+        platform_compat, "proc_phys_footprint_bytes_for_pid", footprints.get, raising=True
+    )
+
+    first = procs.scan(platform_name="darwin", gateway_pid=GATEWAY, ps_snapshot_fn=lambda: parents)
+    # A second scan against the first gives a rate every chance to appear.
+    roster = procs.scan(
+        first, platform_name="darwin", gateway_pid=GATEWAY, ps_snapshot_fn=lambda: parents
+    )
+
+    rss = {pid: node.rss_kb for pid, node in roster.nodes.items()}
+    assert rss == {GATEWAY: 4882, CHAT: 1024, BROWSER: 1}
+    assert not any("footprint" in category for category in roster.degraded_counts)
+    assert any("not a resident set" in note for note in roster.degraded_report())
+    # Memory is the only field this fills; cpu stays null on macOS.
+    assert all(node.cpu_pct is None for node in roster.nodes.values())
+
+
+def test_darwin_footprint_failures_leave_rss_null_and_keep_the_roster(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One unreadable or raising read nulls that node's ``rss_kb`` and nothing else.
+
+    Every other route to a memory figure is a recorder, so a fallback to
+    ``ps`` or to the generic RSS reader fails here as a call, whatever number
+    it would have produced.
+    """
+    parents = {GATEWAY: OUTSIDER, CHAT: GATEWAY, BROWSER: CHAT, RUNNER: GATEWAY, OUTSIDER: 1}
+
+    def reader(pid: int) -> int | None:
+        if pid == CHAT:
+            return None
+        if pid == BROWSER:
+            raise OSError("proc_pid_rusage failed")
+        return {GATEWAY: 8_192, RUNNER: 10_000}[pid]
+
+    monkeypatch.setattr(platform_compat, "proc_phys_footprint_bytes_for_pid", reader, raising=True)
+    other_sources: list[str] = []
+    monkeypatch.setattr(subprocess, "Popen", _recording(other_sources, "Popen"), raising=True)
+    for name, result in (
+        ("trusted_system_bin", "/bin/ps"),
+        ("proc_rss_bytes_for_pid", 7 * 1024 * 1024),
+        ("_posix_process_snapshot", None),
+    ):
+        monkeypatch.setattr(
+            platform_compat, name, _recording(other_sources, name, result), raising=True
+        )
+
+    roster = procs.scan(platform_name="darwin", gateway_pid=GATEWAY, ps_snapshot_fn=lambda: parents)
+
+    assert set(roster.nodes) == {GATEWAY, CHAT, BROWSER, RUNNER}
+    rss = {pid: node.rss_kb for pid, node in roster.nodes.items()}
+    assert rss == {GATEWAY: 8, CHAT: None, BROWSER: None, RUNNER: 9}
+    assert roster.degraded_counts["darwin footprint unreadable; rss_kb null"] == 1
+    assert roster.degraded_counts["darwin footprint reader raised; rss_kb null"] == 1
+    assert other_sources == [], "rss must come from the footprint reader alone"
+
+
+def test_darwin_footprint_seam_overrides_the_platform_reader(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An injected *footprint_fn* REPLACES the platform reader; it is no fallback.
+
+    Off macOS the platform reader answers None, so a scan that read it first
+    and used the injected reader only on None would pass an equality check
+    alone. Every binding of the real reader is therefore a recorder answering
+    a figure of its own: reaching any of them fails, and so does using its
+    answer.
+    """
+    parents = {GATEWAY: OUTSIDER, CHAT: GATEWAY, OUTSIDER: 1}
+    real_reads: list[str] = []
+    for module in (platform_compat, platform_compat_proctable):
+        for name in ("proc_phys_footprint_bytes_for_pid", "_darwin_process_phys_footprint_bytes"):
+            stand_in = _recording(real_reads, f"{module.__name__}.{name}", 900 * 1024 * 1024)
+            monkeypatch.setattr(module, name, stand_in, raising=True)
+    injected = {GATEWAY: 3_000, CHAT: 70_000}
+
+    roster = procs.scan(
+        platform_name="darwin",
+        gateway_pid=GATEWAY,
+        ps_snapshot_fn=lambda: parents,
+        footprint_fn=injected.get,
+    )
+
+    assert real_reads == [], "the injected reader must stand in for the real one"
+    assert {pid: node.rss_kb for pid, node in roster.nodes.items()} == {GATEWAY: 2, CHAT: 68}
 
 
 def test_darwin_reports_an_unavailable_ps_rather_than_an_empty_family() -> None:
@@ -976,3 +1164,260 @@ def test_the_module_exposes_nothing_that_signals_or_writes() -> None:
     source = Path(procs.__file__).read_text(encoding="utf-8")
     for banned in ("os.kill", "pidfd_send_signal", "killpg", "SIGKILL", "SIGTERM"):
         assert banned not in source, banned
+
+
+# -- rates through the read path ---------------------------------------------
+# scan() is pure and every test above hands it a previous roster by hand. These
+# cover the read path instead, which has to keep that roster itself, because a
+# caller that keeps none gets null rates and a gil hint that cannot fire.
+
+
+#: Slack for a float rate compared against its nominal ceiling. The window under
+#: a rate is a difference of monotonic readings that were aged by hand, and two
+#: readings of one coarse-clock tick do not cancel exactly once a constant has
+#: been subtracted from one of them; the quotient can overshoot by ~1e-12.
+_FLOAT_SLACK = 1e-6
+
+
+def _age_baseline(baseline: "procs.RateBaseline", seconds: float) -> None:
+    """Age the stored baseline, as the delta tests age a roster by hand."""
+    stored = baseline._prev
+    assert stored is not None, "nothing stored to age"
+    stored.monotonic -= seconds
+
+
+def test_a_first_read_declines_rates_and_names_the_reason(family: FakeProcTable) -> None:
+    """A cold start reports null, but never a null the reader has to interpret.
+
+    A bare null reads exactly like an idle host, which is the wrong answer the
+    rates exist to prevent. The reason travels with it.
+    """
+    roster = family.scan_rated(procs.RateBaseline())
+
+    assert roster.nodes[CHAT].cpu_pct is None
+    assert roster.nodes[CHAT].runq_wait_pct is None
+    assert any("two reads" in note for note in roster.degraded_report())
+
+
+def test_a_second_read_carries_real_cpu_and_runq_rates(tmp_path: Path) -> None:
+    """The read path produces the deltas with no caller holding a roster."""
+    table = FakeProcTable(tmp_path / "proc")
+    table.add(GATEWAY, OUTSIDER, cmdline=GATEWAY_ARGV, env=dict(MARKER))
+    table.add(CHAT, GATEWAY, cmdline=CHAT_ARGV, env=dict(MARKER), utime=0, runq_ns=0)
+
+    baseline = procs.RateBaseline()
+    first = table.scan_rated(baseline, monotonic=SCAN_MONOTONIC)
+    assert first.nodes[CHAT].cpu_pct is None
+    _age_baseline(baseline, 10.0)
+
+    # 5 CPU-seconds of user time and 2 seconds of run-queue wait over 10s wall.
+    table.add(
+        CHAT,
+        GATEWAY,
+        cmdline=CHAT_ARGV,
+        env=dict(MARKER),
+        utime=table.clk_tck * 5,
+        runq_ns=2_000_000_000,
+    )
+    second = table.scan_rated(baseline, monotonic=SCAN_MONOTONIC)
+
+    assert second.nodes[CHAT].cpu_pct == pytest.approx(50.0, abs=1.0)
+    assert second.nodes[CHAT].runq_wait_pct == pytest.approx(20.0, abs=1.0)
+    assert not any("two reads" in note for note in second.degraded_report())
+
+
+def test_a_stale_baseline_declines_the_rate_instead_of_averaging_the_gap(
+    tmp_path: Path,
+) -> None:
+    """Past the window the quotient is true and misleading.
+
+    It averages the whole gap, so a process pinned for the last seconds of an
+    hour reads near zero -- the same "idle" answer as the null.
+    """
+    table = FakeProcTable(tmp_path / "proc")
+    table.add(GATEWAY, OUTSIDER, cmdline=GATEWAY_ARGV, env=dict(MARKER))
+    table.add(CHAT, GATEWAY, cmdline=CHAT_ARGV, env=dict(MARKER), utime=0, runq_ns=0)
+
+    baseline = procs.RateBaseline()
+    table.scan_rated(baseline)
+    _age_baseline(baseline, procs.MAX_RATE_GAP_SECS + 60.0)
+
+    table.add(
+        CHAT,
+        GATEWAY,
+        cmdline=CHAT_ARGV,
+        env=dict(MARKER),
+        utime=table.clk_tck * 30,
+        runq_ns=5_000_000_000,
+    )
+    second = table.scan_rated(baseline)
+
+    assert second.nodes[CHAT].cpu_pct is None
+    assert second.nodes[CHAT].runq_wait_pct is None
+    assert any("averages the whole gap" in note for note in second.degraded_report())
+
+
+def test_two_reads_too_close_together_decline_the_rate(tmp_path: Path) -> None:
+    """Below the floor, clock-tick granularity dominates the figure."""
+    table = FakeProcTable(tmp_path / "proc")
+    table.add(GATEWAY, OUTSIDER, cmdline=GATEWAY_ARGV, env=dict(MARKER))
+    table.add(CHAT, GATEWAY, cmdline=CHAT_ARGV, env=dict(MARKER), utime=0, runq_ns=0)
+
+    baseline = procs.RateBaseline()
+    # The CLOCK IS PINNED and the gap is set by hand, like the sibling reads above.
+    # Two unpinned back-to-back calls are a fraction of a second apart on a fast
+    # machine and so below the floor -- but they also write a fake /proc tree to
+    # disk between them, so on a slow runner more than MIN_RATE_GAP_SECS of real
+    # time elapses, a rate IS computed, and this test fails for being run somewhere
+    # slow rather than for the behaviour it names. Pinning makes the gap the
+    # subject: 0.5s is below the floor on every machine.
+    table.scan_rated(baseline, monotonic=SCAN_MONOTONIC)
+    _age_baseline(baseline, 0.5)
+    table.add(CHAT, GATEWAY, cmdline=CHAT_ARGV, env=dict(MARKER), utime=table.clk_tck * 5)
+    second = table.scan_rated(baseline, monotonic=SCAN_MONOTONIC)
+
+    assert second.nodes[CHAT].cpu_pct is None
+    assert any("at least" in note for note in second.degraded_report())
+    assert any("reads 0.5s apart" in note for note in second.degraded_report())
+
+
+def test_a_read_refused_as_too_soon_does_not_restart_the_window(tmp_path: Path) -> None:
+    """A refused read must leave the baseline alone, or readers starve each other.
+
+    Replacing it would restart the very window the read was too early for, so
+    readers arriving faster than the floor -- two sessions calling the tool, or a
+    poller beside one -- would reset each other forever and none would ever see a
+    rate. That is the starvation these figures exist to end, so it is checked two
+    ways: the baseline is untouched, and a later read still recovers a real rate.
+    """
+    table = FakeProcTable(tmp_path / "proc")
+    table.add(GATEWAY, OUTSIDER, cmdline=GATEWAY_ARGV, env=dict(MARKER))
+    table.add(CHAT, GATEWAY, cmdline=CHAT_ARGV, env=dict(MARKER), utime=0, runq_ns=0)
+
+    # Every read is pinned to one clock reading, so the hand-aged windows are
+    # the whole window. Unpinned, the second read's gap is 0.8s plus however
+    # long the runner takes to finish the first scan and start the second, which
+    # on a loaded runner crosses the 1s floor and admits the read under test.
+    baseline = procs.RateBaseline()
+    table.scan_rated(baseline, monotonic=SCAN_MONOTONIC)
+    _age_baseline(baseline, 0.8)
+    stored = baseline._prev
+    assert stored is not None
+    pinned = stored.monotonic
+
+    refused = table.scan_rated(baseline, monotonic=SCAN_MONOTONIC)
+    assert refused.nodes[CHAT].cpu_pct is None, "0.8s apart is under the floor"
+    assert baseline._prev is not None
+    assert baseline._prev.monotonic == pinned, "the refused read replaced the baseline"
+
+    # 0.8s + 0.6s clears the 1s floor. Had the refused read replaced the
+    # baseline, only the 0.6s would remain and this read would be refused too.
+    # 0.7 CPU-seconds and 0.14s of run-queue wait over exactly that 1.4s window.
+    _age_baseline(baseline, 0.6)
+    table.add(
+        CHAT,
+        GATEWAY,
+        cmdline=CHAT_ARGV,
+        env=dict(MARKER),
+        utime=table.clk_tck * 7 // 10,
+        runq_ns=140_000_000,
+    )
+    recovered = table.scan_rated(baseline, monotonic=SCAN_MONOTONIC)
+
+    assert recovered.nodes[CHAT].cpu_pct == pytest.approx(50.0, abs=_FLOAT_SLACK)
+    assert recovered.nodes[CHAT].runq_wait_pct == pytest.approx(10.0, abs=_FLOAT_SLACK)
+
+
+def test_a_read_refused_as_too_old_does_replace_the_baseline(tmp_path: Path) -> None:
+    """The stale case is the opposite: keeping it would make recovery impossible."""
+    table = FakeProcTable(tmp_path / "proc")
+    table.add(GATEWAY, OUTSIDER, cmdline=GATEWAY_ARGV, env=dict(MARKER))
+    table.add(CHAT, GATEWAY, cmdline=CHAT_ARGV, env=dict(MARKER), utime=0, runq_ns=0)
+
+    baseline = procs.RateBaseline()
+    table.scan_rated(baseline)
+    _age_baseline(baseline, procs.MAX_RATE_GAP_SECS + 60.0)
+    stale = baseline._prev
+    assert stale is not None
+    pinned = stale.monotonic
+
+    table.scan_rated(baseline)
+
+    assert baseline._prev is not None
+    assert baseline._prev.monotonic > pinned, "a stale baseline must be replaced"
+
+
+def test_the_gil_hint_can_fire_through_the_read_path(tmp_path: Path) -> None:
+    """The hint is gated on cpu_pct, so the read path is what makes it reachable."""
+    table = FakeProcTable(tmp_path / "proc")
+    table.add(GATEWAY, OUTSIDER, cmdline=GATEWAY_ARGV, env=dict(MARKER))
+    argv = nul_argv(b"/v/bin/python3", b"worker.py")
+    states = ("R", "S", "S")
+    wchans = ("0", "futex_wait_queue_me", "futex_wait_queue_me")
+
+    table.add(
+        CHAT, GATEWAY, cmdline=argv, env=dict(MARKER), thread_states=states, thread_wchans=wchans
+    )
+    baseline = procs.RateBaseline()
+    first = table.scan_rated(baseline, monotonic=SCAN_MONOTONIC)
+    assert first.nodes[CHAT].gil_saturated_hint is False, "no rate, so no hint"
+    _age_baseline(baseline, 10.0)
+
+    table.add(
+        CHAT,
+        GATEWAY,
+        cmdline=argv,
+        env=dict(MARKER),
+        thread_states=states,
+        thread_wchans=wchans,
+        utime=table.clk_tck * 9,
+    )
+    second = table.scan_rated(baseline, monotonic=SCAN_MONOTONIC)
+
+    node = second.nodes[CHAT]
+    assert node.cpu_pct == pytest.approx(90.0, abs=1.0)
+    assert node.gil_saturated_hint is True
+    assert node.gil_hint_basis is not None
+
+
+def test_the_baseline_keeps_counters_and_not_process_nodes(family: FakeProcTable) -> None:
+    """Retaining the nodes would hold argv and environment for every host process."""
+    baseline = procs.RateBaseline()
+    roster = family.scan_rated(baseline)
+
+    stored = baseline._prev
+    assert stored is not None
+    assert stored.nodes == {}
+    assert stored.cpu_ticks == roster.cpu_ticks
+    assert stored.runq_ns == roster.runq_ns
+    assert stored.starts == roster.starts
+
+
+def test_an_older_roster_does_not_replace_a_newer_baseline(family: FakeProcTable) -> None:
+    """Concurrent reads finish out of order, and the newer counters must win.
+
+    A baseline younger than the read differencing against it yields a negative
+    elapsed time, which declines every rate on the host.
+    """
+    baseline = procs.RateBaseline()
+    newer = family.scan_rated(baseline)
+
+    baseline.remember(procs.Roster(ts=1.0, monotonic=newer.monotonic - 5.0, platform="linux"))
+
+    stored = baseline._prev
+    assert stored is not None
+    assert stored.monotonic == newer.monotonic
+
+
+@pytest.mark.parametrize(
+    ("platform_name", "extra"),
+    [("win32", {}), ("darwin", {"ps_snapshot_fn": lambda: None})],
+)
+def test_a_platform_without_counters_is_not_told_to_read_again(
+    family: FakeProcTable, platform_name: str, extra: dict[str, object]
+) -> None:
+    """Neither platform reads the counters, so a second read changes nothing there."""
+    roster = family.scan_rated(procs.RateBaseline(), platform_name=platform_name, **extra)
+
+    assert roster.platform == platform_name
+    assert not any("two reads" in note for note in roster.degraded_report())

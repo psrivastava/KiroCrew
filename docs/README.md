@@ -20,9 +20,11 @@ New here? Start with [guides/install.md](guides/install.md), then
 | [app-kit/](app-kit/README.md) | Building apps that run inside Kiro Crew (third-party developer docs). |
 | [system-specs/](system-specs/README.md) | Change-control contracts. The doc a code change MUST update in the same commit. |
 | [request-for-change/](request-for-change/README.md) | Proposals and decision records for large or contested changes, plus the dated implementation plans that execute them under [plans/](request-for-change/plans/README.md). |
+| [decisions/](decisions/README.md) | The append-only record of product and design decisions a person on the team made. One immutable file per decision; grep it before changing a user-facing label, placement or behaviour. |
 | [blog/](blog/README.md) | Essays on direction and design philosophy. Arguments, not contracts. |
 | [reference/](reference/README.md) | A mirror of upstream kiro-cli documentation, with named local exceptions. |
 | [task-specs/](task-specs/README.md) | Archived per-task specs. Not current context. |
+| `../.kiro/specs/` (repo root) | Archived feature specs from the repo's own Spec Builder runs. Each file's `Status` marker says what it is; not current context. Spec Builder writes live specs to `<project>/.kiro/specs/` in the user's project, not here. |
 
 ## The rule for changing docs
 
@@ -42,8 +44,9 @@ commit**. Concretely:
    history; the doc states current behavior in present tense.
 5. **Run the gate:** `./scripts/docs-lint.sh`. It fails on a broken internal link, a
    doc no index reaches, a directory with no index, a code comment citing a doc that
-   does not exist, a renamed doc whose filename is hardcoded in code, and a git
-   conflict marker left at the start of a line. It walks four trees: this one,
+   does not exist, a renamed doc whose filename is hardcoded in code, a git
+   conflict marker left at the start of a line, and a section link (`#anchor`) in
+   this tree that no heading or `<a id>` produces. It walks four trees: this one,
    the packaged [`../src/kiro_crew/docs/`](../src/kiro_crew/docs/README.md),
    [`../website/docs/`](../website/docs/README.md), and the markdown a builtin app
    ships under `src/kiro_crew/apps/builtins/`. That fourth tree is link-checked and

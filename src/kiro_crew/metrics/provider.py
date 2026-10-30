@@ -32,6 +32,7 @@ import`` note there.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import importlib.util
 import logging
 import os
@@ -40,10 +41,13 @@ import threading
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple, Optional
+from urllib.parse import urlsplit
 
 from kiro_crew import __version__, beacon
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.config.paths import config_dir
+from kiro_crew.metrics import harness as _harness
+from kiro_crew.metrics import otlp_governance
 from kiro_crew.metrics.recorder import MetricsRecorder
 from kiro_crew.platform.context import (
     PlatformCompositionError,
@@ -52,7 +56,7 @@ from kiro_crew.platform.context import (
 )
 
 if TYPE_CHECKING:  # real types for annotations; never imported at runtime
-    from collections.abc import Iterable
+    from collections.abc import Callable, Iterable
 
     from opentelemetry.sdk.metrics import MeterProvider as _MeterProviderT
     from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader as _ReaderT
@@ -194,16 +198,47 @@ _ATTR_OTHER = "other"
 # 30s, and any sample above the top bound has its percentile floored at that
 # bound.
 _FAST_BUCKETS_MS: list[float] = [
-    0.5, 1, 2, 5, 10, 25, 50, 100, 250, 500,
-    1000, 2500, 5000, 10000, 30000, 60000,
+    0.5,
+    1,
+    2,
+    5,
+    10,
+    25,
+    50,
+    100,
+    250,
+    500,
+    1000,
+    2500,
+    5000,
+    10000,
+    30000,
+    60000,
 ]
 
 # Milliseconds through ~1 minute — session startup and other cold-start work.
 # Sized for startup, which spans a 0.5ms set_model phase through 15-25s cold
 # spawns.
 _STARTUP_BUCKETS_MS: list[float] = [
-    1, 5, 10, 25, 50, 100, 250, 500, 1000, 2000, 3000,
-    5000, 7500, 10000, 15000, 20000, 30000, 45000, 60000,
+    1,
+    5,
+    10,
+    25,
+    50,
+    100,
+    250,
+    500,
+    1000,
+    2000,
+    3000,
+    5000,
+    7500,
+    10000,
+    15000,
+    20000,
+    30000,
+    45000,
+    60000,
 ]
 
 # One second through one hour — agent turns. A turn is an entire agent loop
@@ -212,9 +247,25 @@ _STARTUP_BUCKETS_MS: list[float] = [
 # multi-minute turn is not floored into an overflow bucket. Resolution is
 # deliberately densest between 1 and 10 minutes, where turns actually land.
 _TURN_BUCKETS_MS: list[float] = [
-    1000, 2500, 5000, 10000, 20000, 30000, 45000, 60000, 90000,
-    120000, 180000, 300000, 450000, 600000, 900000, 1200000,
-    1800000, 2700000, 3600000,
+    1000,
+    2500,
+    5000,
+    10000,
+    20000,
+    30000,
+    45000,
+    60000,
+    90000,
+    120000,
+    180000,
+    300000,
+    450000,
+    600000,
+    900000,
+    1200000,
+    1800000,
+    2700000,
+    3600000,
 ]
 
 # Watchdog idle-at-decision. The watchdog consults the oracle from
@@ -225,8 +276,23 @@ _TURN_BUCKETS_MS: list[float] = [
 # distribution is meant to tune. Sub-minute bounds exist because tests and
 # per-agent overrides can legitimately act earlier than the default 60s gate.
 _WATCHDOG_IDLE_BUCKETS_MS: list[float] = [
-    1000, 5000, 15000, 30000, 60000, 120000, 180000, 300000, 450000,
-    600000, 900000, 1800000, 3600000, 5400000, 7200000, 10800000, 14400000,
+    1000,
+    5000,
+    15000,
+    30000,
+    60000,
+    120000,
+    180000,
+    300000,
+    450000,
+    600000,
+    900000,
+    1800000,
+    3600000,
+    5400000,
+    7200000,
+    10800000,
+    14400000,
 ]
 
 # Sub-ms through one hour — a single tool round-trip. The widest span of any
@@ -236,9 +302,27 @@ _WATCHDOG_IDLE_BUCKETS_MS: list[float] = [
 # dominate the population by count, and the ceiling matches _TURN_BUCKETS_MS
 # because a tool call cannot outlive the turn that contains it.
 _TOOL_CALL_BUCKETS_MS: list[float] = [
-    0.5, 1, 2, 5, 10, 25, 50, 100, 250, 500,
-    1000, 2500, 5000, 10000, 30000, 60000,
-    120000, 300000, 600000, 1800000, 3600000,
+    0.5,
+    1,
+    2,
+    5,
+    10,
+    25,
+    50,
+    100,
+    250,
+    500,
+    1000,
+    2500,
+    5000,
+    10000,
+    30000,
+    60000,
+    120000,
+    300000,
+    600000,
+    1800000,
+    3600000,
 ]
 
 # One second through one week — session lifetime. Sessions are the only
@@ -250,9 +334,23 @@ _TOOL_CALL_BUCKETS_MS: list[float] = [
 # the short-lived teardown paths (unclaimed, destroyed) are a real population
 # whose distribution would otherwise collapse onto one boundary.
 _SESSION_BUCKETS_MS: list[float] = [
-    1000, 5000, 15000, 30000, 60000, 300000, 900000, 1800000,
-    3600000, 7200000, 14400000, 28800000, 43200000,
-    86400000, 172800000, 259200000, 604800000,
+    1000,
+    5000,
+    15000,
+    30000,
+    60000,
+    300000,
+    900000,
+    1800000,
+    3600000,
+    7200000,
+    14400000,
+    28800000,
+    43200000,
+    86400000,
+    172800000,
+    259200000,
+    604800000,
 ]
 
 # Instrument name -> boundaries. This map is the COMPLETE set of kirocrew
@@ -265,8 +363,9 @@ _SESSION_BUCKETS_MS: list[float] = [
 # default 10s-ceiling boundaries. `test/metrics/test_provider_bucket_views.py`
 # fails when a histogram metric name in the source has no entry here — add the
 # instrument to this map when you add the metric. All values are ms — the
-# dashboard's generic aggregation reports every histogram under *_ms keys, so
-# a non-ms instrument would surface 1000x off there. A histogram that is NOT a
+# dashboard's generic aggregation reports a histogram under *_ms keys unless its
+# emitting module declares a non-millisecond unit for it, so a non-ms instrument
+# registered here would surface 1000x off there. A histogram that is NOT a
 # duration therefore belongs in `_HISTOGRAM_BUCKETS_BY_UNIT` below, whose
 # instruments the dashboard reads under unit-neutral keys instead.
 _HISTOGRAM_BUCKETS_MS: dict[str, list[float]] = {
@@ -306,6 +405,18 @@ _HISTOGRAM_BUCKETS_MS: dict[str, list[float]] = {
     # seconds.
     "kirocrew.embed.queue_wait": _FAST_BUCKETS_MS,
     "kirocrew.embed.inference": _FAST_BUCKETS_MS,
+    # Event-loop lag per adaptive-controller sample. Healthy is sub-millisecond
+    # to a few ms; a stall that trips the controller is 250ms to seconds, and
+    # _FAST_BUCKETS_MS (0.5ms..60s) resolves both ends.
+    "kirocrew.loop.lag_ms": _FAST_BUCKETS_MS,
+    # Observed round-trip of an escalated liveness probe the daemon ANSWERED.
+    # Its range is 0-20s: the fast 2s ping missed first, but that miss can be an
+    # instant connect refusal rather than a 2s timeout, so a local escalated
+    # round-trip can answer well under 2s, while a saturated one runs up to the
+    # _LIVENESS_ESCALATED_TIMEOUT_SECS (20s) cap. _FAST_BUCKETS_MS (0.5ms..60s)
+    # keeps resolution across that whole span and leaves headroom above the cap
+    # rather than flooring the tail into +Inf.
+    "kirocrew.mcp_gateway.liveness.escalated_latency_ms": _FAST_BUCKETS_MS,
 }
 
 # Per-turn billed amount. Calibrated against 17,240 real per-turn credit rows
@@ -317,8 +428,22 @@ _HISTOGRAM_BUCKETS_MS: dict[str, list[float]] = {
 # overflow artifact `_HISTOGRAM_BUCKETS_MS` documents), and credit pricing is not
 # ours to hold still.
 _CREDIT_BUCKETS: list[float] = [
-    0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5,
-    10, 25, 50, 100, 250, 500, 1000, 2500,
+    0.025,
+    0.05,
+    0.1,
+    0.25,
+    0.5,
+    1,
+    2.5,
+    5,
+    10,
+    25,
+    50,
+    100,
+    250,
+    500,
+    1000,
+    2500,
 ]
 
 # The same shape in dollars, one decade lower: a claude_code turn bills
@@ -330,15 +455,91 @@ _CREDIT_BUCKETS: list[float] = [
 # instead, and worth re-checking against real rows once a claude_code host
 # reports.
 _USD_BUCKETS: list[float] = [
-    0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25,
-    0.5, 1, 2.5, 5, 10, 25, 50, 100,
+    0.001,
+    0.0025,
+    0.005,
+    0.01,
+    0.025,
+    0.05,
+    0.1,
+    0.25,
+    0.5,
+    1,
+    2.5,
+    5,
+    10,
+    25,
+    50,
+    100,
+]
+
+# Resident set of one kirocrew process, in BYTES because that is the unit the
+# reader returns and converting at the emitter would make the boundary array and
+# the instrument disagree. Base-2 bounds so each one is a recognisable memory
+# size rather than a rounded decade.
+#
+# Density sits between 256 MiB and 4 GiB: that is where a gateway and a
+# tool-heavy agent process actually live, and it is the region where the answer
+# to "is the fleet near its memory ceiling" changes. The bottom bound is below
+# any Python process that has finished importing, and the top is well above the
+# largest process seen, because a sample outside the explicit range has its
+# percentile floored or capped at the nearest bound (the overflow artifact
+# `_HISTOGRAM_BUCKETS_MS` documents) and host memory is not ours to hold still.
+_RSS_BUCKETS_BYTES: list[float] = [
+    32 * 1024**2,
+    64 * 1024**2,
+    128 * 1024**2,
+    192 * 1024**2,
+    256 * 1024**2,
+    384 * 1024**2,
+    512 * 1024**2,
+    768 * 1024**2,
+    1024**3,
+    1536 * 1024**2,
+    2 * 1024**3,
+    3 * 1024**3,
+    4 * 1024**3,
+    6 * 1024**3,
+    8 * 1024**3,
+    16 * 1024**3,
+]
+
+# Share of the whole machine burned by one process: a dimensionless ratio where
+# 1.0 is every logical core saturated.
+#
+# Dense at the BOTTOM, which is the opposite of the amount arrays above and is
+# the whole point. A CPython process is mostly one runnable thread, so on a
+# 32-core host a fully busy process measures about 0.03 — put another way, the
+# entire interesting range on a large host sits inside what a linear array would
+# call its first bucket. Bounds above 1.0 are kept because
+# :func:`process_gauges.cpu_utilization` deliberately does not clamp: nothing
+# samples the clock and the kernel's accounting at the same instant, so a
+# saturated process can measure marginally over 1.0, and a bound above it keeps
+# that readable as "pegged" instead of silently capping the top percentile.
+_CPU_RATIO_BUCKETS: list[float] = [
+    0.001,
+    0.0025,
+    0.005,
+    0.01,
+    0.02,
+    0.04,
+    0.06,
+    0.08,
+    0.1,
+    0.15,
+    0.25,
+    0.4,
+    0.6,
+    0.8,
+    1.0,
+    1.25,
 ]
 
 # Non-duration histograms: instrument name -> boundaries, in the instrument's
 # OWN unit. A SEPARATE map from _HISTOGRAM_BUCKETS_MS on purpose — that map's
 # contract is "all values are ms", which the dashboard's generic aggregation
-# relies on when it reports every histogram under `*_ms` keys, and adding a
-# credit or a dollar amount to it would make both the contract and the reported
+# relies on when it reports a histogram under `*_ms` keys by default, and adding
+# a credit or a dollar amount to it would make both the contract and the reported
 # key a lie. `test_provider_bucket_views.py` guards the split in both
 # directions off the emitted `unit=`, NOT off the name suffix: nothing here is a
 # millisecond instrument, nothing there is anything else, and every histogram
@@ -346,12 +547,20 @@ _USD_BUCKETS: list[float] = [
 # be the wrong test — `kirocrew.embed.queue_wait` and `.inference` above are ms
 # and do not carry it, which is the whole reason the guard reads units.
 #
-# The dashboard reads these two under unit-neutral keys (see
-# `handlers/telemetry.py`'s turn block), which is what keeps them out of the
-# `*_ms` surface.
+# The dashboard reads every entry here under unit-neutral keys rather than
+# `*_ms` ones. It resolves which names those are from the emitting module's own
+# unit declaration (`events.NON_MS_HISTOGRAM_UNITS`, merged in
+# `handlers/telemetry.py` the same way lifetime-total gauge names are), so a new
+# entry below is not silently reported as a duration.
 _HISTOGRAM_BUCKETS_BY_UNIT: dict[str, list[float]] = {
     "kirocrew.turn.credits": _CREDIT_BUCKETS,
     "kirocrew.turn.cost_usd": _USD_BUCKETS,
+    # Sampled at the adaptive controller's existing tick. A gauge of the same
+    # quantity ships beside each of these; the histogram exists because a gauge
+    # merged across instances keeps only min, max and mean, so a fleet-wide
+    # percentile is not recoverable from it at any storage layer.
+    "kirocrew.process.memory.rss_sampled": _RSS_BUCKETS_BYTES,
+    "kirocrew.process.cpu.utilization": _CPU_RATIO_BUCKETS,
 }
 
 
@@ -381,13 +590,18 @@ _provider: Optional["_MeterProviderT"] = None
 # counter and histogram, so the recheck is rate-limited: at most one re-resolve
 # per _CONSENT_RECHECK_SECS. That bounds how long an out-of-band change goes
 # unnoticed without charging the hot path, which sees only a monotonic compare.
-# A caller that must not wait (the dashboard's own PATCH route) calls shutdown()
-# instead and gets the rebuild on the very next metric.
+# A config write inside the gateway does not wait: the config-watcher applier
+# (``watch_config``) calls shutdown() and the next metric rebuilds.
 _CONSENT_RECHECK_SECS = 30.0
 # Consent the live recorder was built with, and when it was last verified.
 # ``None`` means "no live recorder", so the next call builds rather than compares.
 _built_consent: Optional[bool] = None
 _consent_checked_at = 0.0
+# The ``agent.acp_backend`` / ``agent.provider`` pair the live recorder's
+# ``kirocrew.harness`` resource attribute was read from (see ``_agent_key``).
+# The consent worker compares it too, so a process that registers no config
+# watcher (the MCP gateway daemon) still relabels after a harness switch.
+_built_agent_key: object = None
 # Bumped whenever the live recorder is dropped. An off-thread rebuild captures it
 # and refuses to install if it moved, so a disable that lands mid-build cannot be
 # undone by the build finishing afterwards.
@@ -446,8 +660,40 @@ def _default_metrics_dir() -> Path:
     return config_dir() / "metrics"
 
 
-def _resource_attributes() -> "dict[str, str | int]":
+#: Resource attribute naming which Kiro Crew process published a series, for the
+#: processes that need telling apart. Only the MCP gateway daemon sets it today;
+#: every other process leaves it ABSENT, so their resources (and series) are
+#: unchanged. Without it the daemon's ``kirocrew.process.*`` gauges carry the same
+#: resource keys as the main process's and differ only in ``process.pid``.
+RESOURCE_ATTR_PROCESS_ROLE = "kirocrew.process.role"
+#: Its only value: the MCP gateway daemon. A second role gets its own flag (and
+#: a closed set) when a second process has a caller for it.
+PROCESS_ROLE_GATEWAYD = "gatewayd"
+
+_is_gatewayd = False
+
+
+def mark_gatewayd_process() -> None:
+    """Stamp every resource this process builds from now on as the gateway daemon.
+
+    Called once, by gatewayd, before its first ``get_recorder()``: a resource is
+    built once per recorder, and a role that appears mid-life reads downstream
+    as a new series set.
+    """
+    global _is_gatewayd
+    _is_gatewayd = True
+
+
+def _resource_attributes(harness: str) -> "dict[str, str | int]":
     """Resource attributes for the MeterProvider.
+
+    *harness* is the install's configured default harness, already mapped to
+    its closed value by :func:`kiro_crew.metrics.harness.set_configured`.
+    Required: :func:`_build_recorder`, the only caller, has just loaded the
+    config, so every exported series carries ``kirocrew.harness``. It sits beside ``kirocrew.process.role``
+    because it is the same kind of label: one value per process, read once per
+    recorder. A config change to ``agent.acp_backend`` or ``agent.provider``
+    rebuilds the recorder (:func:`watch_config`), so the label follows it.
 
     A resource attribute becomes a LABEL on every series this process exports,
     which cuts both ways: it is the only place fleet-level GROUP BYs can come
@@ -534,6 +780,9 @@ def _resource_attributes() -> "dict[str, str | int]":
         attrs["process.pid"] = int(os.getpid())
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("process.pid resource attr unavailable: %s", exc)
+    if _is_gatewayd:
+        attrs[RESOURCE_ATTR_PROCESS_ROLE] = PROCESS_ROLE_GATEWAYD
+    attrs[_harness.RESOURCE_ATTR_HARNESS] = harness
     try:
         attrs["service.version"] = beacon.release(__version__)
     except Exception as exc:  # pragma: no cover - defensive
@@ -544,9 +793,7 @@ def _resource_attributes() -> "dict[str, str | int]":
         machine = platform.machine().lower()
         attrs["host.arch"] = _ARCH_BY_MACHINE.get(machine, _ATTR_OTHER)
         runtime = platform.python_implementation().lower()
-        attrs["process.runtime.name"] = (
-            runtime if runtime in _KNOWN_RUNTIME_NAMES else _ATTR_OTHER
-        )
+        attrs["process.runtime.name"] = runtime if runtime in _KNOWN_RUNTIME_NAMES else _ATTR_OTHER
         # beacon.python_minor() owns the major.minor clamp and records why the
         # patch level is dropped; a second spelling here would be a rule with
         # two owners.
@@ -575,6 +822,23 @@ class _Build(NamedTuple):
     recorder: MetricsRecorder
     provider: Optional["_MeterProviderT"]
     consent: Optional[bool]
+    agent_key: object = None
+
+
+def _agent_key(cfg: object) -> object:
+    """The config values the ``kirocrew.harness`` resource is built from; never raises.
+
+    The raw ``agent.acp_backend`` / ``agent.provider`` pair of a loaded config,
+    compared as-is, so a recheck can tell the resource is stale without mapping
+    it. ``None`` when the agent section cannot be read.
+    """
+    try:
+        agent = getattr(cfg, "agent", None)
+        if agent is None:
+            return None
+        return (getattr(agent, "acp_backend", None), getattr(agent, "provider", None))
+    except Exception:
+        return None
 
 
 def _build_recorder() -> _Build:
@@ -589,27 +853,29 @@ def _build_recorder() -> _Build:
     # it unset there would make every recheck window see a difference and rebuild
     # a no-op recorder in a loop.
     try:
-        cfg = KiroCrewConfig.load().telemetry
+        full_cfg = KiroCrewConfig.load()
+        cfg = full_cfg.telemetry
     except Exception as exc:
         logger.warning("telemetry config load failed; metrics disabled: %s", exc)
         # Unknown rather than False: the next successful read re-resolves once.
         return _Build(MetricsRecorder(None), None, None)
 
     consent = _consent_enabled(cfg)
+    agent_key = _agent_key(full_cfg)
     if not consent:
-        return _Build(MetricsRecorder(None), None, consent)
+        return _Build(MetricsRecorder(None), None, consent, agent_key)
 
     if not _OTEL_AVAILABLE:
         # opentelemetry missing from the env closure. Degrade to the
         # no-op recorder instead of ever reaching this point via a crash.
         logger.warning("opentelemetry not installed; telemetry disabled")
-        return _Build(MetricsRecorder(None), None, consent)
+        return _Build(MetricsRecorder(None), None, consent, agent_key)
 
     # Consent granted — now pay for the SDK import (deferred from module scope
     # so the default-off path never does).
     if not _load_otel():
         logger.warning("opentelemetry not importable; telemetry disabled")
-        return _Build(MetricsRecorder(None), None, consent)
+        return _Build(MetricsRecorder(None), None, consent, agent_key)
 
     # Resolve egress destinations BEFORE any reader is started. Two reasons:
     # the seam belongs to the edition and a PlatformCompositionError from it must
@@ -627,11 +893,7 @@ def _build_recorder() -> _Build:
     # the life of the process even though metrics are "disabled".
     started_readers: list = []
     try:
-        directory = (
-            Path(cfg.local_dir).expanduser()
-            if cfg.local_dir
-            else _default_metrics_dir()
-        )
+        directory = Path(cfg.local_dir).expanduser() if cfg.local_dir else _default_metrics_dir()
         started_readers.append(
             PeriodicExportingMetricReader(
                 JsonlMetricExporter(
@@ -668,7 +930,12 @@ def _build_recorder() -> _Build:
             beacon.install_id(create=True)
         except Exception:
             logger.debug("install id mint failed", exc_info=True)
-        resource_attrs = _resource_attributes()
+        # Read from the SAME load as the telemetry section, so a rebuild after a
+        # config change labels the new resource with the new harness. Also
+        # records the Claude Code seam for the per-session ``harness`` point
+        # attribute, so the two never disagree about it.
+        harness = _harness.set_configured(getattr(full_cfg, "agent", None))
+        resource_attrs = _resource_attributes(harness)
         provider = MeterProvider(
             metric_readers=started_readers,
             resource=Resource.create(resource_attrs),
@@ -726,7 +993,48 @@ def _build_recorder() -> _Build:
             register_inventory_gauges(meter)
         except Exception:
             logger.warning("inventory gauges unavailable", exc_info=True)
-        return _Build(MetricsRecorder(meter), provider, consent)
+        # Crew log health: the write-behind's backlog and the eager fold queue depth.
+        # Same consent gate, same observable-callback contract, and its OWN try for the
+        # same reason: these read the crew log write-behind and the fold queue, and a
+        # fault there must not take the other two sets dark. Their callbacks never BUILD
+        # either one -- they read it only if it is already loaded -- so a collection on a
+        # process that has committed no entry observes nothing rather than starting a
+        # subsystem.
+        #
+        # This import is also what makes ``crew_log.bus``'s subscriber-error counter
+        # live: that one resolves this module from ``sys.modules`` instead of importing
+        # it, because it can run on a crew log write thread. See
+        # ``crew_log_health.bus_subscriber_error``.
+        try:
+            from kiro_crew.metrics.crew_log_health import (
+                register_crew_log_health_instruments,
+            )
+
+            register_crew_log_health_instruments(meter)
+        except Exception:
+            logger.warning("crew log health instruments unavailable", exc_info=True)
+        # The session-tree roots gauge rides the same consent gate and the same
+        # observable-callback contract. Its source is crew_log's session-tree
+        # projection (read on the SDK's collect thread), so it lives in its own
+        # crew-log module rather than in inventory_gauges; its OWN try keeps a failure
+        # reading the tree from costing the inventory or process gauges.
+        try:
+            from kiro_crew.crew_log.otel_session_tree_roots import register_session_tree_gauge
+
+            register_session_tree_gauge(meter)
+        except Exception:
+            logger.warning("session-tree gauge unavailable", exc_info=True)
+        # MCP gateway pool gauges: same consent gate and callback contract, in
+        # their OWN try for the same reason as the sets above. They observe only
+        # in the process that bound a pool (gatewayd); everywhere else the
+        # callbacks return before reading anything, so no series is published.
+        try:
+            from kiro_crew.metrics.mcp_gateway_gauges import register_mcp_gateway_gauges
+
+            register_mcp_gateway_gauges(meter)
+        except Exception:
+            logger.warning("mcp gateway gauges unavailable", exc_info=True)
+        return _Build(MetricsRecorder(meter), provider, consent, agent_key)
     except Exception as exc:
         logger.warning("telemetry init failed; metrics disabled: %s", exc)
         # Reap EVERY reader already started, not just the first: an egress
@@ -736,7 +1044,7 @@ def _build_recorder() -> _Build:
         # Off this thread, because a reader shutdown performs a final export and
         # joins its ticker with the SDK's 30s default.
         _reap_readers_detached(started_readers)
-        return _Build(MetricsRecorder(None), None, consent)
+        return _Build(MetricsRecorder(None), None, consent, agent_key)
 
 
 def _egress_degraded() -> tuple:
@@ -785,11 +1093,69 @@ def otlp_egress_active(cfg: "TelemetryConfig") -> bool:
     raised INSIDE an implementation still propagates: only an absent attribute is
     read as no-destinations.
     """
-    provider = current_context().telemetry
+    provider = _telemetry_provider()
     resolve = getattr(provider, "otlp_destinations", None)
     if resolve is None:
         return False
-    return bool(_filter_metric_destinations(resolve(cfg)))
+    locked_cfg = _edition_locked_view(cfg)
+    if locked_cfg is None:
+        return False
+    return bool(_filter_metric_destinations(resolve(locked_cfg)))
+
+
+def _edition_locked_view(cfg: "TelemetryConfig") -> "Optional[TelemetryConfig]":
+    """*cfg* as a provider may read it in this build, or ``None`` for no egress at all.
+
+    An enterprise build blanks ``otlp_endpoint`` (:mod:`kiro_crew.edition_locks`,
+    RFC D3): no governance key names an OTLP host yet, so no remote rule allowed the
+    local value. Done here, before any provider sees it, so an edition's own
+    provider cannot read the local endpoint either; destinations it declares itself
+    stay. A config this cannot copy answers ``None`` rather than pass the value on.
+    """
+    from kiro_crew.edition_locks import local_enable_locked
+
+    if not getattr(cfg, "otlp_endpoint", "") or not local_enable_locked("telemetry.otlp_hosts"):
+        return cfg
+    if not dataclasses.is_dataclass(cfg) or isinstance(cfg, type):
+        return None
+    return dataclasses.replace(cfg, otlp_endpoint="")
+
+
+#: A process that does not install a platform context names where its telemetry
+#: provider comes from here (see :func:`use_telemetry_provider`). ``None`` -- every
+#: process that boots the platform -- reads ``current_context().telemetry``.
+_provider_factory: "Optional[Callable[[], object]]" = None
+_provider_memo: Optional[object] = None
+_provider_lock = threading.Lock()
+
+
+def use_telemetry_provider(factory: "Optional[Callable[[], object]]") -> None:
+    """Resolve OTLP destinations through *factory* instead of the platform context.
+
+    For a process that never runs ``boot_platform`` (the MCP gateway daemon). On a
+    non-standalone profile ``current_context()`` raises there, so without this its
+    metrics never leave the local sink. The factory is called lazily, at most once
+    successfully, and only from a recorder build that already passed the consent
+    gate -- so an off-consent process never composes anything. A factory that
+    raises is retried on the next build and costs only egress, never collection.
+    ``None`` restores the platform-context path.
+    """
+    global _provider_factory, _provider_memo
+    with _provider_lock:
+        _provider_factory = factory
+        _provider_memo = None
+
+
+def _telemetry_provider() -> object:
+    """The telemetry provider whose ``otlp_destinations`` this process honours."""
+    global _provider_memo
+    factory = _provider_factory
+    if factory is None:
+        return current_context().telemetry
+    with _provider_lock:
+        if _provider_memo is None:
+            _provider_memo = factory()
+        return _provider_memo
 
 
 def _filter_metric_destinations(
@@ -812,6 +1178,51 @@ def _filter_metric_destinations(
     return tuple(kept)
 
 
+def _policy_redactor() -> "Callable[[str], str] | None":
+    """The redaction OTLP SEL rows go through when this process has no context.
+
+    ``None`` -- the SEL's own ``redact_via_context`` -- whenever a context exists.
+    Without one, the composed companion provider's ``governance_redact``.
+    """
+    try:
+        current_context()
+        return None
+    except PlatformCompositionError:
+        pass
+    try:
+        redact = getattr(_telemetry_provider(), "governance_redact", None)
+    except Exception:
+        return None
+    return redact if callable(redact) else None
+
+
+def _policy_ceiling() -> object | None:
+    """The policy ceiling OTLP export is held to in this process, or ``None``.
+
+    The platform context's, when the process has one. A process that never boots
+    the platform on a non-standalone profile (the MCP gateway daemon) has none; its
+    composed companion provider carries the companion's ceiling instead
+    (``bootstrap.compose_telemetry_provider``), and before composition it has no
+    destinations at all.
+
+    ``otlp_governance.UNEVALUABLE`` when neither answers: the context failed to
+    compose and the provider carries no ceiling of its own (for instance a
+    standalone daemon whose policy could not be read). Every host is refused then;
+    a failure to load the policy is not the absence of one.
+    """
+    try:
+        return getattr(current_context(), "governance", None)
+    except PlatformCompositionError:
+        pass
+    try:
+        provider = _telemetry_provider()
+    except Exception:
+        return otlp_governance.UNEVALUABLE
+    if not hasattr(provider, "governance_ceiling"):
+        return otlp_governance.UNEVALUABLE
+    return getattr(provider, "governance_ceiling", None)
+
+
 def _otlp_destinations(cfg: "TelemetryConfig") -> "tuple[OtlpDestination, ...]":
     """Resolve the metric egress destinations the active edition supplies.
 
@@ -824,10 +1235,18 @@ def _otlp_destinations(cfg: "TelemetryConfig") -> "tuple[OtlpDestination, ...]":
     Lenient by design, unlike :func:`otlp_egress_active`: on this path an
     unresolvable provider must not export, so it contributes nothing and
     collection continues local-only.
+
+    An enterprise build hands every provider a blank ``otlp_endpoint``
+    (:mod:`kiro_crew.edition_locks`, RFC D3): the local value names no host a
+    remote rule allowed. Destinations the edition's own provider declares stay.
     """
+    locked_cfg = _edition_locked_view(cfg)
+    if locked_cfg is None:
+        return ()
+    cfg = locked_cfg
     try:
         supplied = safe_context_call(
-            lambda: current_context().telemetry.otlp_destinations(cfg),
+            lambda: _telemetry_provider().otlp_destinations(cfg),  # type: ignore[attr-defined]
             # A raising provider contributes NOTHING, but it must not do so
             # quietly: safe_context_call's own log_message is debug-level, and a
             # default install collects WARNING and above, so relying on it alone
@@ -849,7 +1268,37 @@ def _otlp_destinations(cfg: "TelemetryConfig") -> "tuple[OtlpDestination, ...]":
         logger.warning("platform context unavailable; OTLP egress disabled (local-only)")
         return ()
 
-    return _filter_metric_destinations(supplied)
+    # The policy's ``otlp_hosts`` list narrows what is BUILT, audited here, and
+    # ``gate_exporter`` re-checks each export. Deliberately not applied in
+    # ``otlp_egress_active``: that answers whether enabling collection could ever
+    # send metrics off the machine, and a host refused today may be permitted later.
+    kept = _filter_metric_destinations(supplied)
+    if not kept:
+        # Nothing to hold to a policy; and resolving the ceiling could compose a
+        # companion the provider read above just failed to compose.
+        return ()
+    return otlp_governance.governed_destinations(
+        kept, _policy_ceiling(), audit=True, redact=_policy_redactor()
+    )
+
+
+_FOREIGN_SIGNAL_ROUTES = (("/v1/traces", "traces"), ("/v1/logs", "logs"))
+
+
+def _foreign_signal_route(endpoint: str) -> Optional[str]:
+    """Name the non-metrics OTLP signal *endpoint*'s path addresses, else None.
+
+    Matches the standard OTLP/HTTP signal suffixes on the URL PATH only, so a
+    host name or query string containing ``traces`` is never mistaken for one.
+    """
+    try:
+        path = urlsplit(str(endpoint).strip()).path.rstrip("/").lower()
+    except ValueError:
+        return None
+    for suffix, signal in _FOREIGN_SIGNAL_ROUTES:
+        if path.endswith(suffix):
+            return signal
+    return None
 
 
 def _build_otlp_reader(dest: "OtlpDestination", cfg: object) -> Optional["_ReaderT"]:
@@ -876,6 +1325,21 @@ def _build_otlp_reader(dest: "OtlpDestination", cfg: object) -> Optional["_Reade
     (:func:`kiro_crew.metrics.temporality.otlp_preference`).
     """
     endpoint = dest.endpoint
+    # This core emits the metrics signal only. An endpoint whose path is another
+    # signal's OTLP route (a tracing backend's /v1/traces, e.g. Langfuse) would
+    # otherwise fail silently: the collector rejects every metric batch and no
+    # trace ever arrives, which reads as broken rather than unsupported. Warn
+    # once, by destination NAME (the URL can carry credentials), and keep the
+    # reader -- the operator's configuration is not overridden.
+    foreign = _foreign_signal_route(endpoint)
+    if foreign is not None:
+        logger.warning(
+            "OTLP destination %r points at an OTLP %s route, but Kiro Crew exports "
+            "metrics only (no %s); use the collector's /v1/metrics URL",
+            dest.name,
+            foreign,
+            foreign,
+        )
     # Callable directly (not only via _build_recorder), so make sure the lazily
     # imported SDK symbols this needs are bound.
     if not _load_otel():
@@ -921,12 +1385,14 @@ def _build_otlp_reader(dest: "OtlpDestination", cfg: object) -> Optional["_Reade
             # separate field on the descriptor.
             kwargs["session"] = dest.session
         exporter = OTLPMetricExporter(**kwargs)
+        # Every later export is held to the policy in force THEN, so a runtime
+        # policy install stops a running reader without waiting for a rebuild.
+        otlp_governance.gate_exporter(
+            exporter, endpoint, _policy_ceiling, redact=_policy_redactor()
+        )
         return PeriodicExportingMetricReader(
             exporter,
-            export_interval_millis=float(
-                getattr(cfg, "export_interval_seconds", 60)
-            )
-            * 1000.0,
+            export_interval_millis=float(getattr(cfg, "export_interval_seconds", 60)) * 1000.0,
         )
     except Exception:
         # Constructor errors may echo the credential-bearing endpoint in their
@@ -941,10 +1407,11 @@ def _build_otlp_reader(dest: "OtlpDestination", cfg: object) -> Optional["_Reade
 def _install_locked(built: _Build) -> None:
     """Publish a finished build. Call under ``_lock``."""
     global _recorder, _provider, _initialized, _built_consent, _consent_checked_at
-    global _ever_built
+    global _ever_built, _built_agent_key
     _recorder = built.recorder
     _provider = built.provider
     _built_consent = built.consent
+    _built_agent_key = built.agent_key
     _initialized = True
     _consent_checked_at = time.monotonic()
     _ever_built = True
@@ -958,12 +1425,21 @@ def _consent_worker(generation: int) -> None:
     actually changed (~14ms) — and "the file changed" is precisely when this runs,
     so the read cannot happen on the caller's thread. ``get_recorder()`` is called
     on the event loop by the route-latency middleware for every request.
+
+    The same read also catches a moved ``agent.acp_backend`` / ``agent.provider``
+    under a live recorder: its ``kirocrew.harness`` resource attribute is fixed
+    for the provider's life, so a change rebuilds it. The gateway also gets that
+    rebuild from ``watch_config``; a process that registers no watcher (the MCP
+    gateway daemon, through ``recheck_consent``) gets it only from here.
     """
     global _consent_checked_at, _check_in_flight, _recorder, _initialized
     global _built_consent
     try:
+        agent_key: object = None
         try:
-            consent: Optional[bool] = _consent_enabled(KiroCrewConfig.load().telemetry)
+            full_cfg = KiroCrewConfig.load()
+            consent: Optional[bool] = _consent_enabled(full_cfg.telemetry)
+            agent_key = _agent_key(full_cfg)
         except Exception as exc:
             # Losing the ability to READ the setting is not withdrawal. Keep the
             # live recorder and try again after the next window.
@@ -983,9 +1459,17 @@ def _consent_worker(generation: int) -> None:
             # Stamp even when the read failed, so an unreadable config cannot turn
             # every metric call into a fresh read.
             _consent_checked_at = time.monotonic()
-            if consent is None or consent == _built_consent:
+            if consent is None:
                 return
-            logger.info("telemetry consent changed on disk; rebuilding recorder")
+            # The harness only labels a live recorder; a disabled one has no
+            # resource to relabel.
+            harness_moved = bool(consent) and agent_key != _built_agent_key
+            if consent == _built_consent and not harness_moved:
+                return
+            if harness_moved and consent == _built_consent:
+                logger.info("configured harness changed on disk; rebuilding recorder")
+            else:
+                logger.info("telemetry consent changed on disk; rebuilding recorder")
             doomed = _take_provider_locked()
             # Serve a no-op from here on: withdrawal is complete at this point, and
             # an opt-in has nothing to serve until the build lands.
@@ -1051,12 +1535,13 @@ def get_recorder() -> MetricsRecorder:
 
     The recheck is eventual by design — up to ``_CONSENT_RECHECK_SECS`` — so the
     extra thread hop changes nothing an observer can distinguish. A caller that
-    changed the setting itself calls ``shutdown()`` to skip the wait.
+    changed the setting in-process reaches ``shutdown()`` through the config
+    watcher (``watch_config``) and skips the wait.
     """
     global _recorder, _initialized, _built_consent
     # Snapshot into a local: the guard below spans a Python call, so re-reading the
     # global to return it would race a concurrent shutdown() — which the config
-    # route runs on an asyncio.to_thread worker — and hand back None from a
+    # watcher runs on an asyncio.to_thread worker — and hand back None from a
     # non-Optional signature.
     rec = _recorder
     if _initialized and rec is not None and not _consent_recheck_due():
@@ -1081,6 +1566,29 @@ def get_recorder() -> MetricsRecorder:
     return _recorder
 
 
+def recheck_consent() -> None:
+    """Re-read ``telemetry.enabled`` now, whatever the recheck window says.
+
+    For a process whose only periodic caller is a timer (the MCP gateway
+    daemon's consent sweeper). ``get_recorder()`` rechecks only once the window
+    has elapsed since the worker's last stamp, and the worker stamps AFTER its
+    config read; a timer that ticks once per window therefore lands just short
+    of it and sees a recheck only every other tick. Calling this from the timer
+    makes every tick a real recheck, so a withdrawal is applied within one tick
+    interval plus the read.
+
+    Never reads config or builds on the calling thread: a live recorder hands
+    the read to the same worker ``get_recorder()`` uses (one at a time; a check
+    already in flight is not doubled). Without a live recorder this is
+    ``get_recorder()``.
+    """
+    with _lock:
+        if _initialized and _recorder is not None:
+            _schedule_consent_check_locked()
+            return
+    get_recorder()
+
+
 def _consent_recheck_due() -> bool:
     """Whether the recheck window has elapsed. Cheap enough for the hot path."""
     return (time.monotonic() - _consent_checked_at) >= _CONSENT_RECHECK_SECS
@@ -1103,9 +1611,7 @@ def _reap_readers_detached(readers: list) -> None:
             except Exception:  # noqa: BLE001 - best-effort cleanup
                 logger.debug("metric reader shutdown after init failure failed", exc_info=True)
 
-    threading.Thread(
-        target=_reap, name="kirocrew-telemetry-reap", daemon=True
-    ).start()
+    threading.Thread(target=_reap, name="kirocrew-telemetry-reap", daemon=True).start()
 
 
 def _take_provider_locked() -> Optional["_MeterProviderT"]:
@@ -1119,11 +1625,13 @@ def _take_provider_locked() -> Optional["_MeterProviderT"]:
     flushes it after the lock is released.
     """
     global _recorder, _initialized, _provider, _built_consent, _build_generation
+    global _built_agent_key
     doomed = _provider
     _provider = None
     _recorder = None
     _initialized = False
     _built_consent = None
+    _built_agent_key = None
     # Any rebuild started before this point is now stale.
     _build_generation += 1
     return doomed
@@ -1158,7 +1666,7 @@ def shutdown() -> None:
     without waiting out the recheck window.
 
     The flush runs on the CALLER's thread (so process teardown and the config
-    route — which calls this via ``asyncio.to_thread`` — both get a completed
+    watcher — which calls this via ``asyncio.to_thread`` — both get a completed
     flush) but NOT under ``_lock``: holding it across the flush would stall any
     concurrent ``get_recorder()`` on the event loop for the whole 30s deadline.
     """
@@ -1223,19 +1731,36 @@ def reset_for_testing() -> None:
     guarantees every test starts from a state with no worker able to mutate
     module globals underneath it.
     """
-    global _ever_built
+    global _ever_built, _is_gatewayd
     shutdown()
     _wait_for_in_flight_consent_worker()
     with _lock:
         _ever_built = False
+    # A process-level provider override and role (a gatewayd entry point run
+    # in-process) are state too; the next test starts from neither.
+    use_telemetry_provider(None)
+    _is_gatewayd = False
+    _harness.reset_for_testing()
 
 
 #: The registered telemetry applier, kept so ``watch_config`` stays idempotent.
 _config_sub: object = None
 
 
+#: The config paths outside ``telemetry`` that a recorder reads at build time:
+#: the ``kirocrew.harness`` resource attribute. A resource is fixed for the life
+#: of a MeterProvider, so the only way to relabel is the same rebuild a
+#: ``telemetry.*`` change takes. Both are live (not restart-marked) settings.
+_RESOURCE_CONFIG_PATHS: tuple[str, ...] = ("agent.acp_backend", "agent.provider")
+
+
 async def _on_config_change(change: object) -> None:
     """Rebuild the recorder whenever anything under ``telemetry`` moves.
+
+    Also on a change to :data:`_RESOURCE_CONFIG_PATHS`: the default harness is a
+    resource attribute, and a resource cannot change under a live provider.
+    Downstream that reads as a new series set from the change on, which is the
+    honest reading of an install that switched harness.
 
     The consent worker re-resolves only ``enabled``, on a 30-second window, so
     every other field in the section (``local_dir``, ``retention_days``,
@@ -1265,4 +1790,6 @@ def watch_config() -> None:
         return
     from kiro_crew.config import live
 
-    _config_sub = live.subscribe("telemetry", callback=_on_config_change, name="telemetry")
+    _config_sub = live.subscribe(
+        "telemetry", *_RESOURCE_CONFIG_PATHS, callback=_on_config_change, name="telemetry"
+    )

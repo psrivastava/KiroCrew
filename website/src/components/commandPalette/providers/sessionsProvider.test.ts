@@ -118,16 +118,56 @@ describe('createSessionsProvider — result mapping', () => {
     }
   })
 
-  it('falls back to the session key when the title is missing', async () => {
+  it('shows "Untitled session", never the key, for an untitled hit; actions keep the key (#20879)', async () => {
     const fetchSessions = vi.fn(
-      async (): Promise<SessionSearchResponse> => ({ sessions: [{ key: 'abc123' }] }),
+      async (): Promise<SessionSearchResponse> => ({
+        sessions: [
+          { key: 'chat-9-1785440411' },
+          { key: 'chat-8-1785440400', title: 'chat-8-1785440400' },
+          { key: 's-named', title: 'Named work' },
+        ],
+      }),
+    )
+    const { d, openSession } = deps({ fetchSessions })
+    const results = await createSessionsProvider(d).search('')
+    expect(results.map(r => r.title)).toEqual(['Untitled session', 'Untitled session', 'Named work'])
+    // Two untitled rows stay distinct: each one's key leads its subtitle.
+    expect(results.map(r => r.subtitle)).toEqual(['chat-9-1785440411', 'chat-8-1785440400', undefined])
+    // Open and copy still carry the old {key, title || key} payload.
+    expect(results[0].enter).toEqual({ kind: 'open-session', sessionKey: 'chat-9-1785440411', title: 'chat-9-1785440411' })
+    results[0].onActivate?.()
+    expect(openSession).toHaveBeenCalledWith({ key: 'chat-9-1785440411', title: 'chat-9-1785440411', instanceId: undefined })
+  })
+
+  it('ranks an untitled hit by its key as before, with highlights inside the shown label', async () => {
+    const fetchSessions = vi.fn(
+      async (): Promise<SessionSearchResponse> => ({
+        sessions: [{ key: 'chat-9-1785440411' }],
+      }),
     )
     const { d } = deps({ fetchSessions })
-    const p = createSessionsProvider(d)
+    // The key's match ends past the 16th character, beyond the shown label.
+    const [r] = await createSessionsProvider(d).search('440411')
+    expect(r.title).toBe('Untitled session')
+    // Scored on the key, as before, so the order does not change ...
+    expect(r.score).toBeGreaterThan(0)
+    // ... but no highlight points at a character the row does not show.
+    expect(r.indices.every(i => i < r.title.length)).toBe(true)
+    // The key line shows why it matched, with the query highlighted there.
+    expect(r.subtitle).toBe('chat-9-1785440411')
+    expect(r.subtitleIndices).toEqual([11, 12, 13, 14, 15, 16])
+  })
 
-    const [r] = await p.search('abc')
-    expect(r.title).toBe('abc123')
-    expect(r.subtitle).toBeUndefined()
+  it('keeps the snippet, not the key, as an untitled body hit\'s subtitle', async () => {
+    const fetchSessions = vi.fn(
+      async (): Promise<SessionSearchResponse> => ({
+        sessions: [{ key: 'chat-9-1785440411', snippet: 'fix the grid', agent: 'kirocrew' }],
+      }),
+    )
+    const { d } = deps({ fetchSessions })
+    const [r] = await createSessionsProvider(d).search('grid')
+    expect(r.title).toBe('Untitled session')
+    expect(r.subtitle).toBe('fix the grid')
   })
 
   it('keeps non-matching backend hits (neutral score) rather than dropping them', async () => {
@@ -303,6 +343,62 @@ describe('createSessionsProvider — backend relevance order is the score tiebre
     expect(results[0].score).toBeGreaterThan(0)
     // The remaining body-only rows keep their backend order between themselves.
     expect(results.slice(1).map(r => r.title)).toEqual(['Unrelated alpha', 'Unrelated beta'])
+  })
+})
+
+describe('createSessionsProvider — open sessions rank above history (issue #21290)', () => {
+  const fixture = async (): Promise<SessionSearchResponse> => ({
+    sessions: [
+      { key: 'old-best', title: 'grid' },
+      { key: 'old-body', title: 'Unrelated', snippet: 'grid in body' },
+      { key: 'open-weak', title: 'my grid notes' },
+      { key: 'open-body', title: 'Other', snippet: 'grid again' },
+      { key: 'open-body', title: 'Remote twin', snippet: 'grid', instance_id: 'i', instance_name: 'peer' },
+    ],
+  })
+  const isOpenSession = (key: string) => key.startsWith('open-')
+
+  it('puts open hits first, even over a better history title match', async () => {
+    const { d } = deps({ fetchSessions: vi.fn(fixture) })
+    const results = await createSessionsProvider({ ...d, isOpenSession }).search('grid')
+    expect(results.map(r => r.title)).toEqual([
+      'my grid notes', 'Other', 'grid', 'Unrelated', 'Remote twin',
+    ])
+  })
+
+  it('never counts a remote row as open, even when its key matches a local open one', async () => {
+    const { d } = deps({ fetchSessions: vi.fn(fixture) })
+    const results = await createSessionsProvider({ ...d, isOpenSession }).search('grid')
+    const remoteAt = results.findIndex(r => r.title === 'Remote twin')
+    expect(remoteAt).toBeGreaterThan(results.findIndex(r => r.title === 'grid'))
+  })
+
+  it('matches a dashboard history key against its live slot key', async () => {
+    // The search returns `dashboard_chat-1-1`; the open slot is `chat-1-1`.
+    const fetchSessions = vi.fn(
+      async (): Promise<SessionSearchResponse> => ({
+        sessions: [
+          { key: 'dashboard_chat-old', title: 'grid' },
+          { key: 'dashboard_chat-1-1', title: 'my grid notes' },
+        ],
+      }),
+    )
+    const { d } = deps({ fetchSessions })
+    const open = new Set(['chat-1-1'])
+    const results = await createSessionsProvider({ ...d, isOpenSession: k => open.has(k) }).search('grid')
+    expect(results.map(r => r.title)).toEqual(['my grid notes', 'grid'])
+  })
+
+  it('keeps the old order when no open-session check is given', async () => {
+    const { d } = deps({ fetchSessions: vi.fn(fixture) })
+    const results = await createSessionsProvider(d).search('grid')
+    expect(results[0].title).toBe('grid')
+  })
+
+  it('leaves the empty-query listing in backend order', async () => {
+    const { d } = deps({ fetchSessions: vi.fn(fixture) })
+    const results = await createSessionsProvider({ ...d, isOpenSession }).search('')
+    expect(results.map(r => r.title)).toEqual(['grid', 'Unrelated', 'my grid notes', 'Other', 'Remote twin'])
   })
 })
 

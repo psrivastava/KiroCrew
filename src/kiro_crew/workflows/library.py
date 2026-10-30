@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, List, Optional
 
 from kiro_crew import platform_compat
+from kiro_crew.atomic_write import replace_with_retry
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.slugs import slug_hash_fallback
 from kiro_crew.workflows.store import default_workflow_library_dir
@@ -47,6 +48,10 @@ class SensitiveWorkflowSourceError(ValueError):
     """Raised when persistence redaction would change executable source."""
 
 
+class WorkflowSlugTakenError(ValueError):
+    """Raised when a create that must keep its exact slug finds it already used."""
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -67,6 +72,15 @@ def _slugify(value: str) -> str:
     words = _WORD_RE.findall(value.lower())
     slug = "-".join(words)[:_MAX_SLUG_LENGTH].strip("-")
     return slug or slug_hash_fallback(value, "workflow")
+
+
+def derived_slug(name: str) -> str:
+    """The slug :meth:`WorkflowDefinitionLibrary.create` gives *name* when no slug is asked for.
+
+    The same redaction and slugification the create applies, before any ``-2``
+    suffix, so a caller can show the ``/workflow`` command a name saves under.
+    """
+    return _slugify(str(_redact(str(_redact(name)))))
 
 
 def _source_hash(source: str) -> str:
@@ -136,7 +150,7 @@ class WorkflowDefinitionLibrary:
         try:
             temp_path.write_text(payload, encoding="utf-8")
             platform_compat.restrict_to_owner(temp_path)
-            os.replace(temp_path, path)
+            replace_with_retry(temp_path, path)
         except Exception:
             try:
                 temp_path.unlink(missing_ok=True)
@@ -170,8 +184,43 @@ class WorkflowDefinitionLibrary:
         slug: str = "",
         derived_from: Optional[dict[str, Any]] = None,
         source_format: str = SOURCE_FORMAT_PYTHON,
+        exact_slug: bool = False,
     ) -> dict[str, Any]:
-        """Create a definition with its own identity, even for identical source."""
+        """Create a definition with its own identity, even for identical source.
+
+        A used slug normally gets a ``-2`` style suffix. With *exact_slug* the
+        create raises :class:`WorkflowSlugTakenError` instead, so a caller that
+        already showed ``/workflow <slug>`` never saves under another command.
+        The slug check and the write share the cross-process revisions lock.
+        """
+        platform_compat.make_owner_only_dir(self._library_dir)
+        lock_path = self._library_dir / ".revisions.lock"
+        fd = platform_compat.open_create_or_existing(lock_path, os.O_RDWR, 0o600)
+        try:
+            with platform_compat.file_lock(fd, exclusive=True, wait=True):
+                return self._create_unlocked(
+                    source=source,
+                    name=name,
+                    description=description,
+                    slug=slug,
+                    derived_from=derived_from,
+                    source_format=source_format,
+                    exact_slug=exact_slug,
+                )
+        finally:
+            os.close(fd)
+
+    def _create_unlocked(
+        self,
+        *,
+        source: str,
+        name: str,
+        description: str,
+        slug: str,
+        derived_from: Optional[dict[str, Any]],
+        source_format: str,
+        exact_slug: bool,
+    ) -> dict[str, Any]:
         if source_format not in SOURCE_FORMATS:
             raise ValueError(f"unsupported workflow source format: {source_format}")
         content_hash = _source_hash(source)
@@ -183,10 +232,13 @@ class WorkflowDefinitionLibrary:
         # Redact before slugification lowercases the input, or a real secret in
         # a name/explicit slug could be transformed into an unrecognized value.
         safe_slug_source = str(_redact(slug or safe_name))
+        unique_slug = self._unique_slug(safe_slug_source)
+        if exact_slug and unique_slug != _slugify(safe_slug_source):
+            raise WorkflowSlugTakenError(f"'{_slugify(safe_slug_source)}' is already a workflow")
         definition: dict[str, Any] = {
             "schema_version": _SCHEMA_VERSION,
             "id": workflow_id,
-            "slug": self._unique_slug(safe_slug_source),
+            "slug": unique_slug,
             "name": safe_name,
             "description": safe_description,
             "format": source_format,
@@ -212,6 +264,35 @@ class WorkflowDefinitionLibrary:
         slug: Optional[str] = None,
     ) -> Optional[dict[str, Any]]:
         """Append a revision, or return ``None`` on missing/stale definitions."""
+        # Each service has its own in-process lock.  The definition library is
+        # shared by gateway and adapted harness processes, so the read, revision
+        # check, and replacement must also share a cross-process lock.
+        platform_compat.make_owner_only_dir(self._library_dir)
+        lock_path = self._library_dir / ".revisions.lock"
+        fd = platform_compat.open_create_or_existing(lock_path, os.O_RDWR, 0o600)
+        try:
+            with platform_compat.file_lock(fd, exclusive=True, wait=True):
+                return self._update_unlocked(
+                    workflow_id,
+                    source=source,
+                    expected_revision=expected_revision,
+                    name=name,
+                    description=description,
+                    slug=slug,
+                )
+        finally:
+            os.close(fd)
+
+    def _update_unlocked(
+        self,
+        workflow_id: str,
+        *,
+        source: str,
+        expected_revision: int,
+        name: Optional[str] = None,
+        description: Optional[str] = None,
+        slug: Optional[str] = None,
+    ) -> Optional[dict[str, Any]]:
         current = self.get(workflow_id)
         if current is None or current.get("revision") != expected_revision:
             return None

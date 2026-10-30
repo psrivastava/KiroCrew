@@ -18,10 +18,10 @@
  * off disk, so compiling an unsaved buffer would silently typeset the previous
  * revision. That is why `saveAndCompile` awaits the save before it compiles.
  */
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { AlertTriangle, ArrowDownToLine, ArrowLeft, ArrowUpFromLine, FileDown, Loader2, MessageSquare, Play, Sparkles, TerminalSquare, ChevronDown, ChevronUp } from 'lucide-react'
+import { AlertTriangle, ArrowDownToLine, ArrowLeft, ArrowUpFromLine, FileDown, Loader2, MessageSquare, Play, Sparkles, TerminalSquare, ChevronDown, ChevronRight, ChevronUp } from 'lucide-react'
 import { AnimatePresence, motion } from 'framer-motion'
 import { Btn } from '../../components/ui'
 import ErrorNotice from '../../components/ErrorNotice'
@@ -36,9 +36,18 @@ import type { ChatSlot } from '../../types'
 import { papyrusApi, pdfUrl, type Diagnostic } from './api'
 import { companionContextLines, DEFAULT_MAIN_FILE } from './companionPrompt'
 import {
-  countDiagnostics, countWords, gitBranchLabel, loadLastProject, loadSlot,
+  countDiagnostics, countWords, forgetSlot, gitBranchLabel, loadLastProject, loadSlot,
   saveLastProject, saveSlot, texFiles,
+  TREE_WIDTH_KEY, TREE_COLLAPSED_KEY, DEFAULT_TREE_WIDTH, MIN_TREE_WIDTH, MAX_TREE_WIDTH,
+  COLLAPSED_TREE_WIDTH,
+  PDF_WIDTH_KEY, MIN_PDF_WIDTH, maxPdfWidth, defaultPdfWidth,
+  CHAT_WIDTH_KEY, DEFAULT_CHAT_WIDTH, MIN_CHAT_WIDTH, MAX_CHAT_WIDTH, CHAT_OPEN_KEY,
+  maxChatWidth, projectQueryKey,
 } from './lib'
+import { loadColumnWidth, loadColumnCollapsed } from '../../lib/columnWidth'
+import { safeSetItem } from '../../utils/safeStorage'
+import { useColumnResize, type CollapseConfig } from '../../hooks/useColumnResize'
+import ResizeHandle from '../../components/ResizeHandle'
 import ProjectList from './ProjectList'
 import FileTree from './FileTree'
 import PapyrusEditor, { type PapyrusEditorHandle } from './PapyrusEditor'
@@ -49,8 +58,55 @@ import CoAuthorPanel from './CoAuthorPanel'
 import { i18nT } from '../../i18n/t'
 import { fmtUnit } from '../../i18n/format'
 
-/** Width of the source column, as a percentage of the workspace. */
-const SOURCE_PANE_PERCENT = 50
+// Module-level so the hooks' memoised resolvers aren't invalidated every render.
+const loadTreeWidth = () => loadColumnWidth(
+  TREE_WIDTH_KEY, MIN_TREE_WIDTH, MAX_TREE_WIDTH, DEFAULT_TREE_WIDTH,
+)
+const loadTreeCollapsed = () => loadColumnCollapsed(TREE_COLLAPSED_KEY)
+// The window's width as an external store, the idiom `useIsMobile` uses for the
+// breakpoint (that module warns against exporting anything more, since ~31 suites
+// partial-mock it). Only the PDF column reads it: its ceiling is a share of the
+// window, so the ceiling has to follow a window the author resizes mid-session.
+const subscribeViewportWidth = (onChange: () => void) => {
+  window.addEventListener('resize', onChange)
+  window.addEventListener('orientationchange', onChange)
+  return () => {
+    window.removeEventListener('resize', onChange)
+    window.removeEventListener('orientationchange', onChange)
+  }
+}
+const readViewportWidth = () => (typeof window === 'undefined' ? 0 : window.innerWidth)
+// A server render has no window; `maxPdfWidth` reads 0 as "cannot measure".
+const readServerViewportWidth = () => 0
+// Bounded by the share too, so a width stored on a wide monitor is DISCARDED
+// rather than restored when the paper reopens on a laptop — `loadColumnWidth`
+// drops an out-of-range value instead of clamping it, which is what keeps a
+// 900px preview saved on a 2560px screen from arriving on a 1280px one. The
+// fallback it lands on is bounded by the same share (`defaultPdfWidth`), since
+// `loadColumnWidth` hands a fallback back untouched.
+const loadPdfWidth = () => {
+  const viewport = readViewportWidth()
+  return loadColumnWidth(
+    PDF_WIDTH_KEY, MIN_PDF_WIDTH, maxPdfWidth(viewport), defaultPdfWidth(viewport),
+  )
+}
+const loadChatWidth = () => loadColumnWidth(
+  CHAT_WIDTH_KEY, MIN_CHAT_WIDTH, MAX_CHAT_WIDTH, DEFAULT_CHAT_WIDTH,
+)
+// Reuses the persisted-flag reader (stored '1', absent or anything else = false),
+// so an author who has never opened the co-author panel still arrives with it
+// closed, exactly as before.
+const loadChatOpen = () => loadColumnCollapsed(CHAT_OPEN_KEY)
+
+/** The tree collapses to a strip carrying only its expand button.
+ *
+ * `whenNarrow` is deliberately NOT set: on a phone the tree is not a column at
+ * all — it is a top disclosure bar reserving no horizontal space — so there is
+ * no squeeze for a strip to relieve, and the strip would add a second, competing
+ * affordance beside the bar. */
+const TREE_COLLAPSE: CollapseConfig = {
+  width: COLLAPSED_TREE_WIDTH, storageKey: TREE_COLLAPSED_KEY,
+}
 
 const MS_PER_SECOND = 1000
 
@@ -69,9 +125,6 @@ function compileDurationLabel(ms: number): string {
     ? fmtUnit(ms, 'millisecond', { maximumFractionDigits: 0 })
     : fmtUnit(ms / MS_PER_SECOND, 'second', { maximumFractionDigits: 1 })
 }
-
-/** Width of the co-author panel when open. */
-const CHAT_PANEL_WIDTH = 420
 
 /**
  * Rejection reason when a mutation aborts because the buffer could not be saved.
@@ -114,8 +167,14 @@ export default function PapyrusPage() {
   const [hasPdf, setHasPdf] = useState(false)
   const [compileMs, setCompileMs] = useState<number | null>(null)
   const [cursor, setCursor] = useState({ line: 1, column: 1 })
-  const [chatOpen, setChatOpen] = useState(false)
   const isMobile = useIsMobile()
+  // The stored flag is a DESKTOP preference, following `useColumnResize.persist`,
+  // which guards its own collapsed-flag write with `!narrowMode` so that a phone
+  // visit does not come back as a collapsed rail on the next desktop session.
+  // Arriving narrow therefore ignores the flag and opens closed: the co-author
+  // panel owns the whole pane while narrow, so an imported desktop flag would hide
+  // the editor and the PDF behind a panel never opened on that device.
+  const [chatOpen, setChatOpen] = useState(() => (isMobile ? false : loadChatOpen()))
   // Four surfaces competed for one row: a 50% source column holding a 176px
   // `w-44` file tree beside the editor, a PDF column, and a 420px co-author
   // panel that alone exceeds a phone viewport. At 390px the editor -- the pane
@@ -124,9 +183,46 @@ export default function PapyrusPage() {
   // and the co-author panel owns the pane when it is open.
   const [treeOpen, setTreeOpen] = useState(false)
   const narrowChat = isMobile && chatOpen
+  // Three drag splitters, each owning one column's width (the editor takes what
+  // is left, so it is never the pane a drag shrinks to nothing). The PDF and
+  // co-author grips sit on their column's LEFT edge, hence `edge: 'left'`: there,
+  // dragging left GROWS the column, and the hook flips the pointer delta so
+  // every caller doesn't hand-roll the same minus sign.
+  const viewportWidth = useSyncExternalStore(
+    subscribeViewportWidth, readViewportWidth, readServerViewportWidth,
+  )
+  // One value for the resolver and for the grip's `aria-valuemax`, so the range a
+  // screen reader announces is the range the drag actually enforces.
+  const pdfMax = maxPdfWidth(viewportWidth)
+  const tree = useColumnResize(
+    TREE_WIDTH_KEY, loadTreeWidth, MIN_TREE_WIDTH, MAX_TREE_WIDTH,
+    TREE_COLLAPSE, loadTreeCollapsed,
+  )
+  const pdf = useColumnResize(
+    PDF_WIDTH_KEY, loadPdfWidth, MIN_PDF_WIDTH, pdfMax,
+    undefined, undefined, 'left',
+  )
+  // The co-author ceiling tracks the room the tree and preview leave, so the
+  // panel yields instead of the editor. `tree.width` is already the strip width
+  // while collapsed, so collapsing the tree hands the room straight over.
+  const chatMax = maxChatWidth(viewportWidth, tree.width, pdf.width)
+  const chat = useColumnResize(
+    CHAT_WIDTH_KEY, loadChatWidth, MIN_CHAT_WIDTH, chatMax,
+    undefined, undefined, 'left',
+  )
+  // The width RENDERED, which is not `chat.width`: the hook clamps only what a
+  // drag or an arrow key produces, so a width stored beside a narrow preview
+  // still arrives whole when the panel reopens beside a wide one. Applying the
+  // ceiling here is what covers the four ways the panel becomes visible — mount,
+  // the toolbar toggle, returning from a narrow viewport, switching paper — none
+  // of which is a drag.
+  const chatWidth = Math.min(chat.width, chatMax)
   const [slotKey, setSlotKey] = useState<string | null>(null)
   const [slotCreating, setSlotCreating] = useState(false)
   const [error, setError] = useState('')
+  // Separate from `error` because the two differ in SEVERITY, not just wording: `error`
+  // reports a failed user action, this reports a declined convenience the user can redo.
+  const [contextError, setContextError] = useState<string | null>(null)
   // The file whose on-disk copy diverged from an unsaved buffer (a co-author edit
   // arriving while the user was typing). Blocks saves until reconciled — see
   // `reloadOpenFile`'s no-flush branch and `resolveConflict`.
@@ -155,17 +251,23 @@ export default function PapyrusPage() {
   // Re-entry guard for save-and-compile. In a ref so the Cmd+S handler passed to
   // The editor keeps a stable identity across compile cycles.
   const compilingRef = useRef(false)
+  // The breakpoint, mirrored in a ref. The paper-switch effect has to know whether
+  // it is narrow before restoring the stored co-author preference, but it resets the
+  // buffer, the diagnostics and the compile output — so taking `isMobile` as a
+  // dependency would replay that whole reset every time the viewport crosses 768px.
+  const isMobileRef = useRef(isMobile)
 
   useEffect(() => { bufferFileRef.current = currentFile }, [currentFile])
   useEffect(() => { dirtyRef.current = dirty }, [dirty])
   useEffect(() => { conflictFileRef.current = conflictFile }, [conflictFile])
   useEffect(() => { bufferRef.current = buffer }, [buffer])
+  useEffect(() => { isMobileRef.current = isMobile }, [isMobile])
   useEffect(() => { saveLastProject(project) }, [project])
 
   // ── Project metadata ──────────────────────────────────────────────────────
 
   const projectQuery = useQuery({
-    queryKey: ['papyrus', 'project', project],
+    queryKey: projectQueryKey(project as string),
     queryFn: () => papyrusApi.getProject(project as string),
     enabled: !!project,
     retry: false,
@@ -274,7 +376,7 @@ export default function PapyrusPage() {
   })
 
   const invalidateFiles = useCallback(
-    () => queryClient.invalidateQueries({ queryKey: ['papyrus', 'project', project] }),
+    () => queryClient.invalidateQueries({ queryKey: projectQueryKey(project as string) }),
     [queryClient, project],
   )
 
@@ -576,6 +678,28 @@ export default function PapyrusPage() {
     onError: (err: Error) => setError(err.message),
   })
 
+  // Routed through React Query like every other mutation on this page, so the request is
+  // retried, deduped and observable rather than a bare floating promise.
+  // Counts context pushes, so only the NEWEST one's result may set or clear the notice: a late
+  // success from a superseded session must not retract the current session's failure.
+  const contextRequestSeq = useRef(0)
+  const injectContextMut = useMutation({
+    mutationFn: (vars: { slotKey: string; seq: number }) =>
+      api.chatSlotContext(vars.slotKey, companionContext(), {
+        source: 'papyrus-co-author', ephemeral: true, maxAge: 3600,
+      }),
+    onSuccess: (_d: unknown, vars: { slotKey: string; seq: number }) => {
+      if (vars.seq === contextRequestSeq.current) setContextError(null)
+    },
+    // EVERY rejection reaches the user: silence left the session open with no document
+    // context and no way to know, and every cause shares the one actionable remedy.
+    onError: (_e: unknown, vars: { slotKey: string; seq: number }) => {
+      if (vars.seq !== contextRequestSeq.current) return
+      setContextError(i18nT('apps.papyrus.workspace.context_not_attached'))
+    },
+  })
+  const injectContext = injectContextMut.mutate
+
   // ── Git ───────────────────────────────────────────────────────────────────
 
   const gitQuery = useQuery({
@@ -642,6 +766,10 @@ export default function PapyrusPage() {
   // Adopt the remembered slot for this paper as soon as the project changes.
   useEffect(() => {
     setSlotKey(project ? loadSlot(project) : null)
+    // The notice names the paper it was raised on; a pending push for the old paper is
+    // superseded too, so its late result cannot raise or clear the next paper's notice.
+    contextRequestSeq.current += 1
+    setContextError(null)
   }, [project])
 
   /** Build the silent context that tells the agent which paper it is working on.
@@ -650,7 +778,6 @@ export default function PapyrusPage() {
   const companionContext = useCallback(() => {
     return companionContextLines(project ?? '', mainFile).join('\n')
   }, [project, mainFile])
-
   const startSession = useCallback(async () => {
     if (!project || slotCreating) return
     setSlotCreating(true)
@@ -660,6 +787,7 @@ export default function PapyrusPage() {
       const created = await api.createChatSlot(
         undefined, undefined, undefined, undefined, 'persistent',
         i18nT('apps.papyrus.workspace.session_title', { name: project }),
+        undefined, undefined, undefined, true,
       )
       const key = created.key as string
       dispatch(addSlotOptimistic({
@@ -668,9 +796,8 @@ export default function PapyrusPage() {
         messages: 0,
         running: false,
       } as ChatSlot))
-      api.chatSlotContext(key, companionContext(), {
-        source: 'papyrus-co-author', ephemeral: true,
-      }).catch(() => undefined)
+      contextRequestSeq.current += 1
+      injectContext({ slotKey: key, seq: contextRequestSeq.current })
       dispatch(fetchSlots())
       saveSlot(project, key)
       setSlotKey(key)
@@ -679,7 +806,26 @@ export default function PapyrusPage() {
     } finally {
       setSlotCreating(false)
     }
-  }, [project, slotCreating, dispatch, companionContext])
+  }, [project, slotCreating, dispatch, injectContext])
+
+  // The remembered session no longer exists on the gateway (deleted or archived
+  // from the sessions list). Forget it so the panel offers "Start a session"
+  // instead of trying the dead key again on every open of this paper. Only the
+  // key that failed is dropped: a newer session started meanwhile is kept.
+  const forgetGoneSession = useCallback((gone: string) => {
+    if (project && loadSlot(project) === gone) forgetSlot(project)
+    setSlotKey(current => (current === gone ? null : current))
+  }, [project])
+
+  // The embedded chat replaced the paper's session with a new one (picking a
+  // memory mode does this): remember the new session for the paper, and hand it
+  // the paper's context, which the replacement does not carry over.
+  const adoptReplacedSession = useCallback((old: string, next: string) => {
+    if (project && loadSlot(project) === old) saveSlot(project, next)
+    setSlotKey(current => (current === old ? next : current))
+    contextRequestSeq.current += 1
+    injectContext({ slotKey: next, seq: contextRequestSeq.current })
+  }, [project, injectContext])
 
   const toggleChat = useCallback(() => {
     setChatOpen(open => {
@@ -688,6 +834,35 @@ export default function PapyrusPage() {
     })
   }, [slotKey, startSession])
 
+  // Persist the open state from HERE rather than from the toolbar toggle, because
+  // three separate paths change it: that toggle, the panel's own close button,
+  // and leaving a paper. Writing it in the toggle would remember only the first,
+  // so a panel dismissed with its close button would come back open.
+  // Which side of the breakpoint the last run saw, so that widening can be told
+  // apart from a toggle. `useIsMobile` tracks the viewport live, so a window drag
+  // across 768px re-runs this effect on its own.
+  const wasMobileRef = useRef(isMobile)
+  useEffect(() => {
+    const wasMobile = wasMobileRef.current
+    wasMobileRef.current = isMobile
+    // Desktop only, the same rule `useColumnResize.persist` applies to its own
+    // flag: dismissing the panel on a phone -- where it covers the pane, so
+    // closing it is how the author gets back to the text -- must not rewrite the
+    // width-and-open layout chosen on a desktop.
+    if (isMobile) return
+    // Arriving from narrow, `chatOpen` is the closed state the mount read forced,
+    // NOT a decision about the desktop layout: writing it would erase the stored
+    // preference the moment a window crosses the breakpoint. Read the preference
+    // back instead, which is what the paper-switch reset does for the same reason.
+    if (wasMobile) {
+      setChatOpen(loadChatOpen())
+      return
+    }
+    // safeSetItem never throws — a blocked store just means the panel state
+    // applies for this session only.
+    safeSetItem(CHAT_OPEN_KEY, chatOpen ? '1' : '0')
+  }, [chatOpen, isMobile])
+
   // When the co-author finishes a turn, re-read the open file and recompile: the
   // agent edits the paper on disk, so the pane the user is watching is stale until
   // this runs. Keyed on the busy->idle transition rather than on a `chat_done`
@@ -695,6 +870,8 @@ export default function PapyrusPage() {
   // single answer to "is this session working" and already merges every signal
   // that decides it (stream state, sub-agents, the slots snapshot).
   const coAuthorBusy = useAppSelector(state => selectComposerBusy(state, slotKey))
+  // NO AUTO-RETRACTION ON A TURN. A turn does not attach the paper, so clearing on one told a
+  // user who typed anything at all that the co-author had it. The notice stands until dismissed.
   const prevBusyRef = useRef(false)
   useEffect(() => {
     const wasBusy = prevBusyRef.current
@@ -801,7 +978,14 @@ export default function PapyrusPage() {
     setCompileLog('')
     setHasPdf(false)
     setCompileMs(null)
-    setChatOpen(false)
+    // Back to the SAVED preference, not a hard `false`. Leaving a paper is not a
+    // decision to close the co-author: forcing `false` here would both overwrite
+    // the stored flag and leave the next paper opening closed, which is the exact
+    // layout loss persisting it was meant to fix. The panel is not rendered while
+    // no paper is open, so this is invisible until the next one opens. Narrow reads
+    // `false` for the same reason the mount read does — the preference is a desktop
+    // one, and switching papers on a phone must not import it.
+    setChatOpen(isMobileRef.current ? false : loadChatOpen())
   }, [project, flushBuffer])
 
   const openProject = useCallback((name: string) => {
@@ -841,14 +1025,24 @@ export default function PapyrusPage() {
   }
 
   return (
-    <div className="flex flex-col flex-1 min-h-0" data-testid="papyrus-workspace">
+    <div
+      className={`flex flex-col flex-1 ${isMobile ? 'min-h-0' : ''}`}
+      data-testid="papyrus-workspace"
+    >
       {/* Toolbar */}
       <div className="flex flex-wrap items-center gap-2 px-3 py-2 border-b border-border bg-card shrink-0">
         <Btn onClick={closeProject}>
           <ArrowLeft className="lucide-inline" />
           {i18nT('apps.papyrus.workspace.papers')}
         </Btn>
-        <span className="text-[13px] font-medium text-text-strong truncate max-w-[12rem]">{project}</span>
+        {/* The paper's resolved title, matching the row that opened it — NOT the
+            directory name, which is the app's key and reads as an id for a
+            cloned paper. `||` rather than `??`: the fallback must also catch a
+            title that resolved to the empty string, and a header is not the
+            place to render `undefined`. */}
+        <span className="text-[13px] font-medium text-text-strong truncate max-w-[12rem]">
+          {detail?.title || project}
+        </span>
 
         {/* The picker is a `<button>` now, not a `<select>`, and HTML-AAM
             computes a button's accessible name from its own content — a
@@ -862,25 +1056,48 @@ export default function PapyrusPage() {
             `MAX_PROJECT_FILES`), so they are nested paths sharing a common
             prefix — a Radix Select's first-letter typeahead cannot separate
             `chapters/01.tex` from `chapters/02.tex`. */}
-        <span className="flex items-center gap-1.5 text-[12px] text-muted">
-          {i18nT('apps.papyrus.workspace.main_document')}
-          <SearchableSelect
-            options={mainOptions}
-            value={mainFile}
-            onChange={file => setMainMutation.mutate(file)}
-            disabled={setMainMutation.isPending || mainCandidates.length === 0}
-            aria-label={i18nT('apps.papyrus.workspace.main_document')}
-            // The trigger is `w-full`, so it needs a definite flex basis in this
-            // wrapping toolbar; a path too long for it truncates inside the span.
-            style={{ flex: '0 0 14rem' }}
-          />
+        {/* `max-w-full` + `flex-wrap`: on a narrow screen (320px leaves ~296px
+            inside the toolbar) the label and the 224px select do not fit side by
+            side, so the group is capped at the row and the select drops under
+            its label instead of pushing the row sideways. */}
+        <span className="flex flex-wrap items-center gap-1.5 shrink-0 max-w-full text-[12px] text-muted">
+          {/* `whitespace-nowrap`: the label is a flex item beside a select of
+              fixed width, so every bit of squeeze landed on the text — which
+              broke "Main document" across two lines and grew the whole toolbar
+              row. Refusing the break makes the toolbar wrap this group as a unit
+              instead, which is what `flex-wrap` is for. */}
+          <span className="whitespace-nowrap">
+            {i18nT('apps.papyrus.workspace.main_document')}
+          </span>
+          {/* The select's width lives HERE, as a definite `width` on a wrapper,
+              and NOT as a `flex-basis` on the trigger.
+
+              The trigger is `w-full`, so it needs its width from somewhere. When
+              that somewhere was `flex: 0 0 14rem` on the trigger itself, this
+              span sized to the trigger's TEXT (measured at 202px against 315px
+              of content) and the 224px trigger painted 113px past the span, over
+              the file status beside it — a percentage width is circular
+              while the parent is being measured, so the basis never reached the
+              parent's intrinsic size. A definite width on a plain wrapper is not
+              circular, so the span measures the full group. */}
+          <span className="flex w-56 max-w-full shrink-0">
+            <SearchableSelect
+              options={mainOptions}
+              value={mainFile}
+              onChange={file => setMainMutation.mutate(file)}
+              disabled={setMainMutation.isPending || mainCandidates.length === 0}
+              aria-label={i18nT('apps.papyrus.workspace.main_document')}
+            />
+          </span>
         </span>
 
-        <span className="text-[12px] text-muted truncate">
-          {dirty
-            ? i18nT('apps.papyrus.workspace.editing_unsaved', { file: currentFile })
-            : i18nT('apps.papyrus.workspace.editing', { file: currentFile })}
-        </span>
+        {currentFile && (dirty || currentFile !== mainFile) && (
+          <span className="text-[12px] text-muted truncate">
+            {dirty
+              ? i18nT('apps.papyrus.workspace.editing_unsaved', { file: currentFile })
+              : i18nT('apps.papyrus.workspace.editing', { file: currentFile })}
+          </span>
+        )}
 
         {hasConflict && (
           // The conflict has to be VISIBLE and have an exit. A silent read-only editor
@@ -965,12 +1182,13 @@ export default function PapyrusPage() {
       <ErrorNotice className="mx-3 mt-2 animate-rise" message={error} onDismiss={() => setError('')} />
 
       {/* Workspace */}
-      <div className={`flex flex-1 min-h-0 ${isMobile ? 'flex-col' : ''}`}>
-        {/* Source column: file tree + editor + status bar (+ diagnostics) */}
-        <div
-          className={`flex flex-col min-h-0 min-w-0 ${isMobile ? 'flex-1' : ''} ${narrowChat ? 'hidden' : ''}`}
-          style={{ width: isMobile ? '100%' : `${SOURCE_PANE_PERCENT}%` }}
-        >
+      <div className={`flex flex-1 ${isMobile ? 'min-h-0 flex-col' : ''}`}>
+        {/* Source column: file tree + editor + status bar (+ diagnostics).
+            `flex-1` on desktop rather than a fixed share: the PDF and co-author
+            columns own persisted widths, so the editor takes what is left and a
+            wider window grows the text being written instead of rescaling a
+            preview the user just sized. */}
+        <div className={`flex flex-col flex-1 min-w-0 ${isMobile ? 'min-h-0' : ''} ${narrowChat ? 'hidden' : ''}`}>
           {/* Narrow: the tree is reached from the TOP, so it reserves no
               horizontal space and the editor gets the full width. */}
           {isMobile && (
@@ -983,22 +1201,60 @@ export default function PapyrusPage() {
               {i18nT('apps.papyrus.fileTree.files')}
             </Btn>
           )}
-          <div className={`flex flex-1 min-h-0 ${isMobile ? 'flex-col' : ''}`}>
+          <div className={`flex flex-1 ${isMobile ? 'min-h-0 flex-col' : 'min-h-[180px] [contain:size]'}`}>
             {/* Height-bounded while stacked, or the tree pushes the editor off
                 the pane. `vh` rather than a percentage: no ancestor here has a
                 definite height, so a percentage max-height would not resolve. */}
-            <div className={`min-h-0 ${isMobile
-              ? `w-full shrink-0 max-h-[40vh] overflow-y-auto ${treeOpen ? '' : 'hidden'}`
-              : 'w-44 shrink-0'}`}>
-              <FileTree
-                files={files}
-                currentFile={currentFile}
-                mainFile={mainFile}
-                onOpenFile={openFile}
-                onCreateFile={onCreateFileClick}
-                onDeleteFile={onDeleteFileClick}
-              />
+            <div
+              className={`min-h-0 ${isMobile
+                ? `w-full shrink-0 max-h-[40vh] overflow-y-auto ${treeOpen ? '' : 'hidden'}`
+                : 'shrink-0 overflow-hidden'}`}
+              style={{ width: isMobile ? undefined : tree.width }}
+            >
+              {/* Collapsed: a strip holding ONLY the reopen button. The tree
+                  itself is not rendered narrow — at 28px its rows would be
+                  unreadable rather than compact, and the strip has to stay
+                  reachable by pointer for users who collapsed it by dragging.
+                  The button reuses the existing Files label, since the strip
+                  introduces no new text. */}
+              {!isMobile && tree.collapsed ? (
+                <Btn
+                  onClick={tree.expand}
+                  aria-label={i18nT('apps.papyrus.fileTree.files')}
+                  aria-expanded={false}
+                  className="w-full justify-center rounded-none border-0 px-0 py-2"
+                >
+                  <ChevronRight className="lucide-inline" />
+                </Btn>
+              ) : (
+                <FileTree
+                  files={files}
+                  currentFile={currentFile}
+                  mainFile={mainFile}
+                  onOpenFile={openFile}
+                  onCreateFile={onCreateFileClick}
+                  onDeleteFile={onDeleteFileClick}
+                />
+              )}
             </div>
+            {/* Drag handle — resize the tree, or drag well past its minimum to
+                collapse it to the strip. Absent while narrow: there the tree is
+                a top drawer, not a column, so there is no vertical edge to grip. */}
+            {!isMobile && (
+              <ResizeHandle
+                handleProps={tree.handleProps}
+                label={i18nT('pages.chat.fileBrowserRail.resize')}
+                onNudge={tree.nudge}
+                // The collapsed rail is 28px, outside the [120, 420] range the
+                // grip advertises — announcing it would put `aria-valuenow`
+                // below `aria-valuemin`, which a screen reader reads out as-is.
+                // ARIA has no way to say "this range, or one detached value", so
+                // report the minimum: the position an outward drag resolves to.
+                value={tree.collapsed ? MIN_TREE_WIDTH : tree.width}
+                min={MIN_TREE_WIDTH}
+                max={MAX_TREE_WIDTH}
+              />
+            )}
             <div className="flex-1 min-w-0 min-h-0">
               <PapyrusEditor
                 ref={editorRef}
@@ -1076,13 +1332,15 @@ export default function PapyrusPage() {
                 animate={{ height: 'auto', opacity: 1 }}
                 exit={{ height: 0, opacity: 0 }}
                 transition={{ duration: 0.16 }}
-                className="border-t border-border bg-card overflow-hidden shrink-0 max-h-56"
+                className="border-t border-border bg-card overflow-hidden shrink-0"
               >
-                <DiagnosticsList
-                  diagnostics={diagnostics}
-                  log={compileLog}
-                  onJumpToLine={line => editorRef.current?.jumpToLine(line)}
-                />
+                <div className="max-h-56 overflow-x-hidden overflow-y-auto">
+                  <DiagnosticsList
+                    diagnostics={diagnostics}
+                    log={compileLog}
+                    onJumpToLine={line => editorRef.current?.jumpToLine(line)}
+                  />
+                </div>
               </motion.div>
             )}
           </AnimatePresence>
@@ -1091,11 +1349,40 @@ export default function PapyrusPage() {
         {/* PDF column. Stacked under the source while narrow, with a `vh` height
             bound so it cannot push the editor off the pane -- a percentage would
             not resolve against these ancestors. The divider turns with the axis. */}
-        <div className={`flex flex-col min-w-0 min-h-0 ${isMobile
-          ? `w-full shrink-0 max-h-[45vh] border-t border-border ${narrowChat ? 'hidden' : ''}`
-          : 'flex-1 border-l border-border'}`}>
+        {/* Drag handle — resize the PDF preview. On its LEFT edge, so dragging
+            left widens the preview and the editor gives up the space. */}
+        {!isMobile && (
+          <ResizeHandle
+            handleProps={pdf.handleProps}
+            label={i18nT('apps.specBuilder.components.specDetail.resize_document_panel')}
+            onNudge={pdf.nudge}
+            value={pdf.width}
+            min={MIN_PDF_WIDTH}
+            max={pdfMax}
+          />
+        )}
+        <div
+          className={`flex flex-col min-w-0 min-h-0 ${isMobile
+            ? `w-full shrink-0 max-h-[45vh] border-t border-border ${narrowChat ? 'hidden' : ''}`
+            : 'shrink-0 border-l border-border'}`}
+          style={{ width: isMobile ? undefined : pdf.width }}
+        >
           <PdfPreview src={pdfSrc} downloadName={`${project}.pdf`} />
         </div>
+
+        {/* Drag handle — resize the co-author panel. Inside the same `chatOpen`
+            gate as the panel: a grip for a panel that is not on screen would be
+            a tab stop onto nothing. */}
+        {chatOpen && !isMobile && (
+          <ResizeHandle
+            handleProps={chat.handleProps}
+            label={i18nT('pages.chat.sidePanel.resize_panel')}
+            onNudge={chat.nudge}
+            value={chatWidth}
+            min={MIN_CHAT_WIDTH}
+            max={chatMax}
+          />
+        )}
 
         {/* Co-author column */}
         <AnimatePresence initial={false}>
@@ -1103,23 +1390,47 @@ export default function PapyrusPage() {
             <motion.div
               key="co-author"
               initial={{ width: 0, opacity: 0 }}
-              animate={{ width: isMobile ? '100%' : CHAT_PANEL_WIDTH, opacity: 1 }}
+              animate={{ width: isMobile ? '100%' : chatWidth, opacity: 1 }}
               exit={{ width: 0, opacity: 0 }}
-              transition={{ duration: 0.18 }}
-              className={`min-h-0 overflow-hidden ${isMobile ? 'flex-1' : 'shrink-0'}`}
+              // No easing while dragging: the open/close animation would chase
+              // every pointer move, so the panel lags the grip by ~180ms and the
+              // drag reads as broken. It stays animated for the open/close it was
+              // written for.
+              transition={{ duration: chat.dragging ? 0 : 0.18 }}
+              className={`min-h-0 overflow-hidden ${isMobile ? 'flex-1' : 'shrink-0 [contain:size]'}`}
             >
               {/* BOTH widths have to move together. This wrapper is animated and
                   content-sized, so a percentage on the child alone resolves
                   against a box that hugs its own content -- the panel would come
                   out narrower than the pixel width it replaced, not wider. */}
-              <div style={{ width: isMobile ? '100%' : CHAT_PANEL_WIDTH }} className="h-full min-h-0">
-                <CoAuthorPanel
-                  slotKey={slotKey}
-                  creating={slotCreating}
-                  onStartSession={startSession}
-                  onOpenFull={openFullChat}
-                  onClose={() => setChatOpen(false)}
+              <div
+                style={{ width: isMobile ? '100%' : chatWidth }}
+                className="flex h-full min-h-0 flex-col"
+              >
+                {/* IN THIS COLUMN: the action that fails is "Start a session" here, so a page-top
+                    banner puts the report a column away from the control that produced it.
+                    No hand-off: this page holds an editable buffer and `askAgent` navigates away,
+                    unmounting it, so the offer would risk unsaved edits to save nothing. */}
+                <ErrorNotice
+                  className="mb-2 animate-rise"
+                  message={contextError}
+                  title={i18nT('apps.papyrus.workspace.context_notice_title')}
+                  onDismiss={() => setContextError(null)}
                 />
+                {/* The panel sizes against THIS box, not the column: its own `h-full` measured the
+                    whole column, so the notice's height pushed the composer past a clipped edge --
+                    hiding the input the notice tells the reader to type into. */}
+                <div className="min-h-0 flex-1">
+                  <CoAuthorPanel
+                    slotKey={slotKey}
+                    creating={slotCreating}
+                    onStartSession={startSession}
+                    onSessionGone={forgetGoneSession}
+                    onSessionReplaced={adoptReplacedSession}
+                    onOpenFull={openFullChat}
+                    onClose={() => setChatOpen(false)}
+                  />
+                </div>
               </div>
             </motion.div>
           )}

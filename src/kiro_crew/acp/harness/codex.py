@@ -71,18 +71,16 @@ is why this harness has no ordering constraint the claude one has. ``read-only``
 still permits passive READS; ACP v1 has no way to require a prompt for those, and
 what makes the residual gap survivable is that mask.
 
-The session array is the whole tool surface, and the adapter will not check it
------------------------------------------------------------------------------
+The session array is the whole tool surface, and one bad element costs all of it
+--------------------------------------------------------------------------------
 codex reads no agent spec, so ``session/new``'s ``mcpServers`` is everything the
-session will ever have. The adapter does not validate it: an element whose
-transport it declared unsupported is ACCEPTED, and ``session/new`` returns a normal
-sessionId. Captured live -- ``mcpCapabilities`` advertising ``sse: false``, an
-``sse`` element sent anyway, session created; a control element typed
-``nonsense-type`` created one too.
+session will ever have. Since 2.3.0 the adapter validates that array against the
+ACP schema and fails the WHOLE ``session/new`` over one element it will not take:
+an ``sse`` element while ``mcpCapabilities`` advertises ``sse: false``, or a
+control element typed ``nonsense-type``. Up to 2.2.2 a bare one was ACCEPTED and
+never wired, a session running with a tool the operator declared simply absent.
 
-That failure mode is silence, which is why the narrowing matters. There is no error
-for anyone to see and no frame to react to -- just a session running with a server
-that was never wired, so a tool the operator declared is simply absent.
+Either way the narrowing matters.
 :meth:`CodexHarness.session_mcp_servers` is therefore the ONLY thing standing
 between the array Crew composed and an array the adapter will honour, narrowed
 against the capabilities THIS session's handshake reported.
@@ -130,6 +128,7 @@ from pathlib import Path
 from typing import Any
 
 from kiro_crew import acp_tool_gate
+from kiro_crew.acp.codex_sqlite import SQLITE_HOME_ENV, seed_private_state
 from kiro_crew.acp.harness._common import MembershipHarness
 from kiro_crew.acp.harness.base import (
     NotificationAliases,
@@ -157,6 +156,10 @@ logger = logging.getLogger(__name__)
 #: claude's today: a divergence should be a one-line edit here rather than a silent
 #: downgrade of whichever harness moved first.
 PROTOCOL_VERSION_CODEX = 1
+
+
+#: Where ``codex`` keeps its SQLite databases; defaults to ``CODEX_HOME``.
+_SQLITE_HOME_ENV = SQLITE_HOME_ENV
 
 
 def _sandbox_wrapper_generations(sandbox_mode: str) -> int:
@@ -239,8 +242,8 @@ class CodexHarness(MembershipHarness):
 
         codex-acp takes no argv of its own: any invocation enters stdio-server mode
         and blocks on stdin. So there is no ``--agent`` (the adapter reads no
-        ``~/.kiro/agents/<name>.json``; the session's whole MCP surface arrives in
-        the ``session/new`` array instead) and no ``--model`` (the model is chosen
+        ``~/.kiro/agents/<name>.json``; everything Crew mounts on the session
+        arrives in the ``session/new`` array instead) and no ``--model`` (the model is chosen
         per session over ``session/set_config_option``, so pinning one at process
         start would apply it to every session on this process).
 
@@ -276,14 +279,32 @@ class CodexHarness(MembershipHarness):
         wrapper_generations = await asyncio.to_thread(
             _sandbox_wrapper_generations, ctx.sandbox_mode
         )
+        # Every ``codex app-server`` opens the same SQLite files by default and
+        # they lock each other out: Codex Desktop plus a Crew runtime fail new
+        # sessions with ``database is locked``. So each runtime gets its own
+        # CODEX_SQLITE_HOME (the runtime's per-process scratch dir). Only the
+        # databases move: config, auth and the thread rollouts stay in CODEX_HOME,
+        # and a thread resumes from its rollout (measured on codex 0.159), so
+        # spawn_continue still works across runtimes. Seed the private index
+        # from a completed SQLite snapshot so a large rollout history does not
+        # need rebuilding at every start. Each process still owns its database.
+        # An operator-supplied location reaches the child without preparation.
         return SpawnPlan(
             argv=list(argv),
             rss_depth=self.CORE_RSS_DEPTH + wrapper_generations,
             extra_hidden_dirs=hidden,
             extra_expose_files=expose,
+            private_state_env=None if ctx.environ.get(_SQLITE_HOME_ENV) else _SQLITE_HOME_ENV,
+            private_state_seed=seed_private_state,
         )
 
-    def apply_spawn_env(self, env: dict[str, str]) -> None:
+    def apply_spawn_env(
+        self,
+        env: dict[str, str],
+        *,
+        spawned_binary: str | None = None,
+        cli_owned_auth: bool = False,
+    ) -> None:
         """Take kiro-cli's API key OUT of the child's environment.
 
         A foreign adapter must never receive it, and removing it is the positive
@@ -327,6 +348,10 @@ class CodexHarness(MembershipHarness):
         from kiro_crew.config import loader as loader_mod
 
         loader_mod.strip_kiro_cli_api_key(env)
+        # codex-acp otherwise drops session entries whose names occur in global
+        # config. That keeps an unbound global dashboard server in place of the
+        # gateway's verified mount, on both session/new and session/load.
+        env["DISABLE_MCP_CONFIG_FILTERING"] = "true"
 
     @property
     def verifies_agent_activation(self) -> bool:
@@ -356,6 +381,7 @@ class CodexHarness(MembershipHarness):
         work_dir: str | Path | None,
         mcp_gateway_overlay: Any = None,
         member_dispatch: bool = False,
+        crew_panel: bool = False,
         session_key: str = "",
     ) -> SessionExtras:
         """Empty. codex has no custom-agent channel to register anything on.
@@ -460,7 +486,7 @@ class CodexHarness(MembershipHarness):
         instead, and what it does with it is the fact this policy records.
 
         **What ``session/close`` does, measured.** The adapter drops the session from
-        its local map and unsubscribes the Codex thread. Captured live against
+        its local map and unsubscribes the Codex thread. Measured on
         codex-acp 1.11.0, with ``session/set_config_option`` on the same sessionId as
         the liveness oracle:
 

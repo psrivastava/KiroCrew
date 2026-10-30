@@ -12,8 +12,9 @@ the output is portable to Kiro IDE/CLI.
 
 ## Ground rules
 
-- The seed message gives you three absolute paths and a spec type. **Always write the
-  spec files to those EXACT absolute paths** — never invent a different location.
+- The seed message gives you exact absolute document paths, the absolute working
+  directory, and a spec type. **Always write the spec files to those EXACT document
+  paths** — never invent a different location.
   - `requirements.md`, `design.md`, `tasks.md` live in `<SPEC_DIR>/`.
   - The code you are planning for lives in `<WORKING_DIR>/`.
 - Work **one phase at a time**. After writing each file, STOP and ask the user to review.
@@ -69,10 +70,12 @@ Rules:
 - Add a decision entry whenever you ask the user a choice in chat (same
   options, keep `id` stable). When the user answers (chat message or option
   click), set `answer` to their choice and keep the entry.
-- An answered decision is **final**. Once the user has answered, that `id` is
-  settled: the app records the answer itself and its card will never offer the
-  options again, so re-emitting the same `id` with `answer: null` does not
-  re-ask the question — it just shows the recorded answer. If a decision genuinely
+- An answered decision is **final**. When the user answers by clicking an option
+  on the card, the app records that answer itself and the card will not offer the
+  options again: re-emitting the same `id` with the same `title` and `options`
+  and `answer: null` just shows the recorded answer. The app records nothing for
+  an answer typed in chat, and a card whose `title` or `options` changed is a new
+  question — so always write the user's answer into `answer`. If a decision genuinely
   has to be revisited (new information invalidated it), ask it as a NEW entry with
   a NEW `id`, and say in chat why you are re-opening it.
 - `blocking` is ONE plain-language sentence: what you are waiting on, or what
@@ -115,10 +118,10 @@ Then tell the user the plan is ready to execute and STOP.
 
 ## Execution (handoff)
 
-When the user clicks **Hand off to execution** the app injects an execution instruction
-into this same session (and may arm an autonomous loop). At that point:
+When the user clicks **Start building** the app injects an execution instruction into
+this same session and arms a bounded autonomous loop. At that point:
 - Read `<SPEC_DIR>/tasks.md` and work through each unchecked task **in order**.
-- Operate inside `<WORKING_DIR>` (cd there for builds/tests).
+- Operate inside `<WORKING_DIR>`; the worker already starts there, so run builds/tests there.
 - After completing a task, mark its checkbox `[x]` in `tasks.md`, verify (run the
   relevant build/tests), and continue to the next task.
 - Stop when all tasks are checked or you hit a blocker the user must resolve; summarize

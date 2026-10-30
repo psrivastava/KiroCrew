@@ -12,7 +12,7 @@ import { test, expect, Page } from '@playwright/test'
  * PR #2884 aligned them by hand-matching two DIFFERENT padding budgets that
  * happen to sum to the same 44px offset below each card's own hairline: the
  * rail spends `8 + 2 + 24 + 10`, the footer spends `14 + 16 + 14`. The two
- * rows live in different components (App.tsx vs ChatSidebar.tsx) with different
+ * rows live in different components (App.tsx vs chat-sidebar/HistoryPane.tsx) with different
  * DOM (icon + links vs clock + label + chevron), so there is no shared token
  * to derive one from the other — the only thing that ties them is the rendered
  * screen y, and only a browser can see that.
@@ -53,6 +53,8 @@ type Measurement = { probe: Probe | null; missing: string[] }
 async function primeBrowser(page: Page) {
   await page.addInitScript(() => {
     localStorage.setItem('mc-onboarded', '1')
+    // The rail starts collapsed; this spec measures the expanded rail.
+    localStorage.setItem('mc-nav', '0')
   })
   // Wide enough that the nav rail stays expanded (its community row is hidden
   // under max-h-0 while collapsed) and tall enough that both cards sit on the

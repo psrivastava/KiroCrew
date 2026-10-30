@@ -23,6 +23,19 @@ const vm = require("node:vm");
 const { createWindowLifecycle } = require("../window-lifecycle");
 const { fileShellPageBasename } = require("../splash-history");
 
+// The gateway supervisor's source: the runtime/gateway/ owners that define code
+// these pins read, then the facade, as one text because the pins hold over all of
+// it.
+const SUPERVISOR_FILES = [
+  "runtime/gateway/home-lock.js",
+  "runtime/gateway/successor-handoff.js",
+  "runtime/gateway/failure-dialog.js",
+  "runtime/gateway/holder-decision.js",
+  "runtime/gateway/shutdown.js",
+  "runtime/gateway/reconnect.js",
+  "gateway-supervisor.js",
+];
+
 const LOADING_HTML = fs.readFileSync(path.join(__dirname, "..", "loading.html"), "utf8");
 const PRELOAD_JS = fs.readFileSync(path.join(__dirname, "..", "preload.js"), "utf8");
 const WINDOW_LIFECYCLE_JS = fs.readFileSync(path.join(__dirname, "..", "window-lifecycle.js"), "utf8");
@@ -67,7 +80,7 @@ function lifecycleFor({ platform, sender, frameless = false }) {
     store: { get: (key) => (key === "linuxFrameless" ? frameless : null) },
     backendUrl: "http://localhost:5476",
     port: 5476,
-    fetchLocalToken: async () => "",
+    mintLocalToken: async () => "",
     fetchRemoteToken: async () => ({ token: "" }),
     requestQuit: () => {},
     connectWindow: async () => {},
@@ -271,15 +284,19 @@ describe("loading.html carries its own close control", () => {
     );
   });
 
-  // The status line under the close button stays as the base splash draws it:
-  // bare text on the backdrop, no surface of its own. The accent surface
-  // belongs to the exit block alone, and only #closeWin is the bordered pill,
-  // so nothing else at the bottom-centre reads as a second control.
-  it("the status line declares no surface; only the exit block and the button do", () => {
+  // The status line under the close button gets the same accent surface as the
+  // exit block, for the same reason: a ghost drifting under white ink erases
+  // the words. It must still not read as a second control, so only #closeWin is
+  // the bordered pill: the status line draws no border and is not pill-shaped.
+  it("the status line paints an accent surface but never looks like the button", () => {
     const status = LOADING_HTML.match(/#status\s*\{([^}]*)\}/);
     assert.ok(status, "#status must have a style rule");
-    assert.doesNotMatch(status[1], /background/, "#status paints no background of its own");
-    assert.doesNotMatch(status[1], /border-radius/, "#status has no corners to round");
+    assert.match(
+      status[1],
+      /background:\s*color-mix\(in srgb, var\(--accent\)/,
+      "#status must declare a background derived from the accent token",
+    );
+    assert.doesNotMatch(status[1], /border-radius:\s*999px/, "#status is not a pill");
     assert.doesNotMatch(status[1], /(^|[^-])border:/, "#status must not draw a border");
 
     const button = LOADING_HTML.match(/#closeWin\s*\{([^}]*)\}/);
@@ -321,7 +338,9 @@ describe("loading.html carries its own close control", () => {
 // is a loadFile query rather than a status-string match (UI copy is brittle)
 // or an IPC send (the splash loads asynchronously and can miss one).
 describe("loading.html reveals the exit on reconnect, and on a cold boot only after a stall", () => {
-  const SUPERVISOR_JS = fs.readFileSync(path.join(__dirname, "..", "gateway-supervisor.js"), "utf8");
+  const SUPERVISOR_JS = SUPERVISOR_FILES
+    .map((file) => fs.readFileSync(path.join(__dirname, "..", file), "utf8"))
+    .join("\n");
   const fnBody = (name) => {
     const m = SUPERVISOR_JS.match(
       new RegExp(`(?:async )?function ${name}\\([\\s\\S]*?\\n  \\}`),
@@ -388,7 +407,9 @@ describe("loading.html reveals the exit on reconnect, and on a cold boot only af
 // aborts its connection attempt. The supervisor stamps `primary=1` on the
 // main window's splash and the page words its hint from that flag.
 describe("the supervisor marks the main window's splash as primary", () => {
-  const SUPERVISOR_JS = fs.readFileSync(path.join(__dirname, "..", "gateway-supervisor.js"), "utf8");
+  const SUPERVISOR_JS = SUPERVISOR_FILES
+    .map((file) => fs.readFileSync(path.join(__dirname, "..", file), "utf8"))
+    .join("\n");
 
   // splashQuery evaluated as written, with mainWindow() and the two query
   // constants supplied, so the assertions are about its behaviour.

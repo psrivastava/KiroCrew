@@ -24,12 +24,15 @@ beforeEach(() => {
  *  before reading it, so exactly one `getComputedStyle(el)` happens per pass —
  *  which makes it the cheapest observable proxy for "did this call measure?".
  *  Counting the twin's own reads would not distinguish a pass from the
- *  caret-follow read, which is deliberately outside the memo. */
+ *  caret-follow read, which is deliberately outside the memo.
+ *
+ *  PSEUDO reads do not count: a pass over an empty composer also asks for the
+ *  element's `::placeholder` style, and that is one pass, not two. */
 function countMeasures(ta: HTMLTextAreaElement) {
   const state = { measures: 0 }
   const real = window.getComputedStyle.bind(window)
   vi.spyOn(window, 'getComputedStyle').mockImplementation(((el: Element, pseudo?: string | null) => {
-    if (el === ta) state.measures++
+    if (el === ta && !pseudo) state.measures++
     return real(el as Element, pseudo ?? undefined)
   }) as typeof window.getComputedStyle)
   return state
@@ -106,6 +109,26 @@ describe('composer auto-size measurement memo', () => {
     expect(state.measures).toBe(0)
   })
 
+  it('re-measures when the PLACEHOLDER swaps at an unchanged value (#9016)', () => {
+    // An empty composer is sized from its placeholder, and the hint is now held
+    // to one line while the status sentences still wrap. A swap between them at
+    // an unchanged (empty) value therefore changes the right height, and no
+    // other path can see it: the value effect's deps do not move and the width
+    // observer returns early. Without this the box keeps the one-line height and
+    // clips the sentence's second line, which is #9979 finding 4 all over again.
+    const { rerender } = renderWithProviders(<ChatInput value="" onChange={vi.fn()} onSend={vi.fn()} />)
+    const ta = screen.getByRole('textbox') as HTMLTextAreaElement
+    const state = countMeasures(ta)
+
+    rerender(<ChatInput value="" onChange={vi.fn()} onSend={vi.fn()} connected={false} />)
+    expect(ta.placeholder).toMatch(/will not send/i)
+    expect(state.measures).toBe(1)
+
+    // Same placeholder again: the memo makes the second pass a no-op.
+    rerender(<ChatInput value="" onChange={vi.fn()} onSend={vi.fn()} connected={false} spellCheck />)
+    expect(state.measures).toBe(1)
+  })
+
   it('re-measures when the box is resized from outside, with no keystroke (#9979)', () => {
     // happy-dom has no ResizeObserver; install one the test can fire by hand,
     // recording what the composer observes. The composer needs it at mount.
@@ -119,6 +142,11 @@ describe('composer auto-size measurement memo', () => {
       disconnect() { instances.delete(this) }
     } as unknown as typeof ResizeObserver
     vi.stubGlobal('ResizeObserver', RO)
+    // The re-measure runs on the frame after the notification, not inside the
+    // callback (a height write there resizes the observed element again in the
+    // same frame), so frames run when `fire` says so.
+    const frames: FrameRequestCallback[] = []
+    const raf = vi.spyOn(window, 'requestAnimationFrame').mockImplementation((cb) => { frames.push(cb); return frames.length })
     try {
       renderWithProviders(<Harness initial="wrapped text" />)
       const ta = screen.getByRole('textbox') as HTMLTextAreaElement
@@ -126,10 +154,14 @@ describe('composer auto-size measurement memo', () => {
       expect(mine.length).toBeGreaterThan(0)
       let width = 600
       Object.defineProperty(ta, 'clientWidth', { configurable: true, get: () => width })
+      frames.splice(0)
       const state = countMeasures(ta)
       // Only the observer(s) watching the textarea fire — the shelf and control
       // row observers are not what this case is about.
-      const fire = () => { for (const i of mine) i.cb([], {} as ResizeObserver) }
+      const fire = () => {
+        for (const i of mine) i.cb([], {} as ResizeObserver)
+        for (const frame of frames.splice(0)) frame(0)
+      }
 
       // The observer baselined the width at mount (happy-dom: 0), so the first
       // notification at 600 IS a width change: one measurement, no keystroke.
@@ -147,6 +179,7 @@ describe('composer auto-size measurement memo', () => {
       fire()
       expect(state.measures).toBe(2)
     } finally {
+      raf.mockRestore()
       vi.unstubAllGlobals()
     }
   })

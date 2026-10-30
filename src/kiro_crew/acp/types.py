@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re as _re
 from dataclasses import dataclass, field
 from typing import Any
@@ -16,6 +17,7 @@ from typing import Any
 from kiro_crew.acp_backends import (  # noqa: F401 - re-exported for existing importers
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_CODEX,
+    ACP_BACKEND_COPILOT,
     ACP_BACKEND_DEEPSEEK,
     ACP_BACKEND_GOOSE,
     ACP_BACKEND_KAS,
@@ -28,37 +30,63 @@ from kiro_crew.acp_backends import (  # noqa: F401 - re-exported for existing im
     ACP_BACKENDS_CLIENT_META_SETTINGS,
     ACP_BACKENDS_COMPACT,
     ACP_BACKENDS_CONTEXT_RECYCLE,
+    ACP_BACKENDS_EFFORT_FROM_ADVERTISED_OPTION,
+    ACP_BACKENDS_EFFORT_OVERLAY,
     ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION,
+    ACP_BACKENDS_FORK_AT_MESSAGE,
     ACP_BACKENDS_HARNESS_MANAGED_COMPACTION,
     ACP_BACKENDS_HARNESS_OWNED_SESSIONS,
+    ACP_BACKENDS_HOOKS_LIST,
     ACP_BACKENDS_HOST_AUTH_CALLBACK,
     ACP_BACKENDS_INLINE_COMPACTION,
     ACP_BACKENDS_INTERNAL_SANDBOX,
+    ACP_BACKENDS_KIRO_FAMILY,
     ACP_BACKENDS_KIRO_SLASH_COMMANDS,
     ACP_BACKENDS_KNOWN,
     ACP_BACKENDS_LOAD_WITHOUT_MODES,
     ACP_BACKENDS_MARKDOWN_AGENT_SPECS,
+    ACP_BACKENDS_MATE_WORKER_KIT,
+    ACP_BACKENDS_MATE_WORKER_PROMPT_IN_CONTEXT,
+    ACP_BACKENDS_MATE_WORKER_TOOL_LIMITS,
     ACP_BACKENDS_MCP_CONFIG_HOT_RELOAD,
+    ACP_BACKENDS_MCP_WIRE_REINJECT,
     ACP_BACKENDS_MEMBER_CAPABILITIES,
     ACP_BACKENDS_MEMBER_DISPATCH,
+    ACP_BACKENDS_MEMBER_PANEL,
+    ACP_BACKENDS_MEMBER_TOOL_LIMITS,
     ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS,
     ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION,
+    ACP_BACKENDS_OPEN_EXTERNAL_URL,
+    ACP_BACKENDS_PERMISSION_KIND_FROM_TOOL_CALL,
     ACP_BACKENDS_POD_HOME_REMAP,
+    ACP_BACKENDS_PRUNE_UNSTARTABLE_MCP,
+    ACP_BACKENDS_REPORT_USAGE,
     ACP_BACKENDS_RESUME_WITHOUT_LOAD,
     ACP_BACKENDS_SEED_LOCAL_SETTINGS,
+    ACP_BACKENDS_SERIAL_SESSION_STARTS,
     ACP_BACKENDS_SESSION_EVICTION,
     ACP_BACKENDS_SESSION_MCP_ARRAY,
     ACP_BACKENDS_SESSION_SHARING,
     ACP_BACKENDS_SKIP_CREW_SEATBELT_MACOS,
     ACP_BACKENDS_SPEC_SERVERS_OFF_WIRE,
     ACP_BACKENDS_STEER,
+    ACP_BACKENDS_STEER_CONCURRENT_PROMPT,
+    ACP_BACKENDS_STEER_RETRACT,
+    ACP_BACKENDS_STEERING_REQUEST,
     ACP_BACKENDS_STRUCTURED_REFUSAL,
     ACP_BACKENDS_TOOL_SEARCH_OVERLAY,
+    ACP_BACKENDS_UNATTRIBUTED_TERMINAL_ERROR,
+    ACP_BACKENDS_UNMARKED_COMPACTION_PAIR,
     ACP_BACKENDS_USER_LEVEL_AGENT_SPECS_ONLY,
     effort_config_option_id,
+    effort_config_option_value,
     model_registry_namespace,
     overlay_project_scope,
     selectable_backends,
+)
+from kiro_crew.agent_sdk.backends import (  # noqa: F401 - re-exported for importers
+    escape_user_message_markup,
+    wrap_user_message,
 )
 
 # Declared per harness rather than listed as a capability set: whether a
@@ -72,6 +100,8 @@ from kiro_crew.agent_sdk.host_auth import (  # noqa: E402,F401 - re-exported for
 from kiro_crew.recovery.ladder import (  # noqa: E402 - see the re-export note above
     SESSION_RECOVERY_MAX_ATTEMPTS,
 )
+
+logger = logging.getLogger(__name__)
 
 # ── ACP Event Kinds ──
 
@@ -90,6 +120,15 @@ EVENT_TOOL_RESULT = "tool_result"
 #: ``unknown`` for an outcome the stream did report.
 TERMINAL_TOOL_STATUSES = frozenset({"completed", "failed", "cancelled", "canceled", "refused"})
 EVENT_PERMISSION_REQUEST = "permission_request"
+#: An MCP server's elicitation, turned around by the harness as a server->client
+#: request (``METHOD_ELICITATION_CREATE`` or ``METHOD_KAS_MCP_ELICITATION``).
+#: Carries :attr:`AcpEvent.elicitation`; the consumer answers it through the
+#: driver's ``answer_elicitation``. Yielded only to a consumer that declared it
+#: can put the ask to a person (``accepts_elicitation``); every other consumer's
+#: request is declined by the driver before it would be yielded, so no consumer
+#: that never heard of this kind can leave the tool call hanging. See
+#: :mod:`kiro_crew.acp.elicitation`.
+EVENT_ELICITATION_REQUEST = "elicitation_request"
 EVENT_COMPLETE = "complete"
 EVENT_COMPACTION_STATUS = "compaction_status"
 EVENT_CLEAR_STATUS = "clear_status"
@@ -105,6 +144,11 @@ EVENT_SUBAGENT_ACTIVITY = "subagent_activity"
 EVENT_STEER_QUEUED = "steer_queued"
 EVENT_STEER_CONSUMED = "steer_consumed"
 EVENT_STEER_CLEARED = "steer_cleared"
+#: kiro-cli dropped every steer it was still holding, unread, because
+#: ``_session/steer/clear`` asked it to (``AgentExecutionUserMessageCleared``).
+#: Not KAS's ``steering_cleared``, which arrives after a turn ends and names steers
+#: the turn already read (``EVENT_STEER_CLEARED``).
+EVENT_STEER_DROPPED = "steer_dropped"
 #: A typed :class:`StructuredStatus` from the EXECUTION LAYER (the versioned
 #: ``kirocrew/status`` extension on a routed ``session/update`` frame, or the
 #: watchdog's own post-stall classification). Never derived from model text —
@@ -121,9 +165,62 @@ METHOD_SET_MODE = "session/set_mode"
 METHOD_PROMPT = "session/prompt"
 METHOD_CANCEL = "session/cancel"
 METHOD_REQUEST_PERMISSION = "session/request_permission"
+#: Standard ACP client method: the agent asks the client to put an MCP server's
+#: elicitation to the person. Fields flat on ``params`` (``mode``, ``message``,
+#: ``requestedSchema`` or ``elicitationId`` + ``url``) next to ``sessionId`` and
+#: ``toolCallId``. Answered ``{"action": ..., "content"?: ...}``.
+METHOD_ELICITATION_CREATE = "elicitation/create"
 METHOD_SESSION_UPDATE = "session/update"
 METHOD_METADATA = "_kiro.dev/metadata"
 METHOD_COMMANDS_EXECUTE = "_kiro.dev/commands/execute"
+# The ``_session/steering`` request codex-acp and claude-agent-acp
+# (``ACP_BACKENDS_STEERING_REQUEST``) take a user's mid-turn message on, and the
+# outcomes that decide delivery.
+METHOD_SESSION_STEERING = "_session/steering"
+STEERING_INJECTED = "injected"
+STEERING_STARTED_NEW_TURN = "startedNewTurn"
+# Bounds on what a session holds for steers it has sent and not settled: at most
+# this many at once, each at most this long. A steer past either bound takes the
+# caller's queue path instead, which has its own limits.
+MAX_STEERING_ANSWERS = 16
+MAX_STEERING_TEXT_CHARS = 64_000
+# How long a steer waits for the adapter's answer. The dashboard composer awaits
+# the steer inside its send request, which the browser aborts after 10s
+# (``SEND_ABORT_MS``), so an answer slower than this sends the steer down the
+# caller's queue path instead of leaving the request to time out.
+STEERING_ANSWER_WAIT_SECS = 8.0
+# kiro-cli's request to drop every steer it holds and has not yet handed to the
+# turn (``ACP_BACKENDS_STEER_RETRACT``), and how long its answer is waited for.
+# The answer comes from kiro-cli's request handler, not from the turn, so a
+# healthy session answers in milliseconds.
+METHOD_SESSION_STEER_CLEAR = "_session/steer/clear"
+STEER_CLEAR_ANSWER_WAIT_SECS = 5.0
+
+
+def steering_outcome(result: object) -> str:
+    """The ``outcome`` of a ``_session/steering`` answer; "" for any other shape.
+
+    The answer is adapter-authored JSON: a result that is not an object is read as
+    no outcome (undelivered) rather than trusted to have ``.get``.
+    """
+    if not isinstance(result, dict):
+        return ""
+    outcome = result.get("outcome")
+    return outcome if isinstance(outcome, str) else ""
+
+
+def steering_advertised(init_resp: object) -> bool:
+    """Whether an ``initialize`` result advertises the ``_session/steering`` request.
+
+    The extension is advertised at the TOP level of the result, as
+    ``_meta.steering.supported``, a sibling of ``agentCapabilities``. Only a
+    literal ``true`` counts.
+    """
+    meta = init_resp.get("_meta") if isinstance(init_resp, dict) else None
+    steering = meta.get("steering") if isinstance(meta, dict) else None
+    return isinstance(steering, dict) and steering.get("supported") is True
+
+
 METHOD_SESSION_LOAD = "session/load"
 #: The other standard restore verb, for an agent that keeps sessions but does not
 #: implement full loading: it restores the session WITHOUT replaying the previous
@@ -131,6 +228,9 @@ METHOD_SESSION_LOAD = "session/load"
 #: which is why one membership set (``ACP_BACKENDS_RESUME_WITHOUT_LOAD``) decides
 #: which of the two a harness is sent rather than each having a restore path.
 METHOD_SESSION_RESUME = "session/resume"
+#: Copies a stored session into a new one and answers the new ``sessionId``; the
+#: source is left untouched. Advertised as ``sessionCapabilities.fork``.
+METHOD_SESSION_FORK = "session/fork"
 # kiro-cli extension: evict a session from the multiplexed process, freeing its
 # transcript/context + reaping its MCP children. Without this the shared
 # kiro-cli process retains every session's state for its whole lifetime, so RSS
@@ -143,16 +243,34 @@ METHOD_SESSION_TERMINATE = "_kiro.dev/session/terminate"
 #: ``terminate`` exists for, and the record is what would otherwise accumulate.
 #: Takes the same ``{"sessionId": ...}`` params and is idempotent.
 METHOD_KAS_SESSION_DELETE = "_kiro/session/delete"
+#: KAS's manual compaction verb. A REQUEST with ``{"sessionId": ...}`` params,
+#: answered ``{"success": bool}`` once the summary is committed; a successful run
+#: emits ``summarization_completed`` before the answer. It is how a user's
+#: ``/compact`` reaches KAS: sent as ``session/prompt`` text the model just writes a
+#: summary and the context does not shrink. Advertised in ``initialize``'s
+#: ``_meta.kiro.extensionMethods`` and forwarded by kiro-cli's relay.
+METHOD_KAS_SESSION_COMPACT = "_kiro/session/compact"
+#: KAS's in-place rewind to before a user message. A REQUEST with
+#: ``{"sessionId", "messageId"}`` (the id KAS reports for a prompt as a
+#: ``user_message_id_assigned`` session_info_update), answered
+#: ``{"success": bool, "affectedFiles": [...], "totalFiles": int}``. It appends a
+#: ``tombstone`` row that hides that message and everything after it from the
+#: model, and restores files that write tools in the hidden range changed. Refused
+#: while a turn runs. Not listed in ``extensionMethods``: the engine announces it
+#: as ``_meta.kiro.checkpoints``. Driven live against kiro-cli 2.32.0's relay: the
+#: model's next answer left the reverted prompt out.
+METHOD_KAS_CHECKPOINT_REVERT = "_kiro/checkpoint/revertMultiple"
 #: The STANDARD ACP evict verb, for a host that implements it. codex-acp does: it
 #: drops the session from its local map and unsubscribes the Codex thread, so the
 #: sessionId stops answering while the thread's own record survives on the Codex
 #: side -- the same evict-not-delete shape as kiro-cli's ``terminate``. A REQUEST,
 #: answered with ``{}``; sent as a notification the adapter ignores it and the
 #: session stays resident, which is the leak this verb exists to close. Also
-#: idempotent: closing an already-closed id answers ``{}`` again. Measured live
-#: against codex-acp 1.11.0; the gated test
+#: idempotent: closing an already-closed id answers ``{}`` again. Measured on
+#: codex-acp 1.11.0; the gated test
 #: ``test_codex_session_mcp.py::test_real_codex_acp_session_close_evicts`` re-runs
-#: that measurement on every install that has the adapter.
+#: that measurement on every install that has the adapter, and the lane pins
+#: its release in ``test/real_adapters/package.json``.
 METHOD_SESSION_CLOSE = "session/close"
 METHOD_COMPACTION_STATUS = "_kiro.dev/compaction/status"
 METHOD_CLEAR_STATUS = "_kiro.dev/clear/status"
@@ -160,8 +278,35 @@ METHOD_AGENT_SWITCHED = "_kiro.dev/agent/switched"
 METHOD_MCP_OAUTH_REQUEST = "_kiro.dev/mcp/oauth_request"
 METHOD_MCP_SERVER_INITIALIZED = "_kiro.dev/mcp/server_initialized"
 METHOD_MCP_SERVER_INIT_FAILURE = "_kiro.dev/mcp/server_init_failure"
+#: Appended to a session-start timeout's MCP progress when EVERY server the
+#: session put on the wire has reported READY -- a roster member that reported
+#: an init failure is named in the ``failed:`` bucket instead, and then the
+#: stall may well be in it. The count before it covers only the session-injected
+#: roster -- on kiro-cli the broker stubs Kiro Crew injects -- not the agent
+#: spec's own servers and not the backend's session-start steps after MCP init;
+#: without this note a complete count read as "MCP is up, so MCP is the
+#: problem". The fraction already says every server reported, so the note adds
+#: only the conclusion. One string for both start paths
+#: (``AcpRuntime._mcp_init_progress`` and ``AcpClient._mcp_timeout_progress``)
+#: so their messages cannot drift.
+MCP_ROSTER_COMPLETE_NOTE = "the stall is later in session startup, not in those servers"
 METHOD_KAS_MCP_STATUS = "_kiro/mcp/status"
 METHOD_KAS_TOOLS_CHANGED = "_kiro/tools/didChange"
+#: The client-side reset KAS runs an explicit MCP sign-in through. With
+#: ``startOAuth`` true the engine keeps its OAuth callback listener open for the
+#: whole connect attempt; the ``authorizationUrl`` on a failed ``_kiro/mcp/status``
+#: entry comes from a passive attempt whose listener is already closed.
+METHOD_KAS_MCP_RESET_SERVER = "_kiro/mcp/resetServer"
+#: Engine -> client request carrying the consent URL of that sign-in. It names
+#: neither the session nor the server.
+METHOD_KAS_OPEN_EXTERNAL_URL = "_kiro/openExternalUrl"
+#: KAS's spelling of ``elicitation/create``: the engine turns an MCP server's
+#: elicitation around as this server->client request, with the elicitation
+#: fields NESTED under ``params.elicitation`` next to ``sessionId`` and
+#: ``toolCallId``. Same answer shape as the standard method. A client that does
+#: not answer (a -32601) makes the engine report ``cancel`` to the server, so the
+#: elicitation-gated tool fails silently rather than asking.
+METHOD_KAS_MCP_ELICITATION = "_kiro/mcp/elicitation"
 METHOD_SUBAGENT_LIST_UPDATE = "_kiro.dev/subagent/list_update"
 METHOD_KIRO_SESSION_UPDATE = "_kiro.dev/session/update"
 METHOD_SET_CONFIG_OPTION = "session/set_config_option"
@@ -189,27 +334,45 @@ KIRO_TOOL_TODO_LIST = "todo_list"
 TODO_TASKS_MAX = 200
 # Per-task text cap — keeps one pathological entry from bloating every payload.
 TODO_TEXT_MAX = 500
+# Per-task id cap. kiro-cli numbers its tasks ("1", "2", ...), but the id is
+# provider-authored and is retained per row (in the snapshot, in a person's
+# override, in a cold-start pin), so it is bounded like the text.
+TODO_ID_MAX = 64
 
 # Capabilities we advertise during `initialize`.
 #
-# Nothing is advertised that has no inbound handler. Kiro Crew serves exactly one
-# server-initiated request, `session/request_permission`; everything else reaches
-# `_reject_unknown_server_request` and comes back `-32601 method not found`.
+# Nothing is advertised that has no inbound handler. Kiro Crew serves two
+# server-initiated requests on every harness, `session/request_permission` and
+# `elicitation/create`; everything else reaches `_reject_unknown_server_request`
+# and comes back `-32601 method not found`.
 #
-# `elicitation` was declared here as a forward-bet on kiro-cli routing an MCP
-# server's `elicitation/create` out over ACP. It is withdrawn because the bet is
-# not free, which is what the bet assumed. A client that sees the capability
-# routes its human-in-the-loop prompts through `elicitation/create` INSTEAD of
-# falling back to `session/request_permission` -- codex-acp gates exactly that
-# way on `clientCapabilities.elicitation.form` -- so declaring a capability we do
-# not serve does not sit inert waiting for a handler. It replaces a path that
-# works with one that returns an error, and the client reads that error as a
-# cancellation of the tool call the human was approving.
-#
-# So the declaration goes back to honest, and every affected client returns to the
-# fallback that already works. Re-add the key in the same change that registers a
-# handler for it, never before: `test_acp_client_capabilities.py` fails if the two
-# drift apart again.
+# `elicitation` is declared because both drivers answer it (see
+# :mod:`kiro_crew.acp.elicitation`). The declaration is what makes a standard
+# ACP harness forward an MCP server's elicitation at all: the schema marks
+# `elicitation/create` as gated on this capability, so without the key the ask
+# never leaves the agent. It is not inert either way, which is why it is never
+# declared ahead of the handler and `test_acp_client_capabilities.py` pins the
+# two together. It does not move TOOL APPROVALS: codex-acp
+# (`@agentclientprotocol/codex-acp`, `src/CodexElicitationHandler.ts`) recognises
+# a tool approval as a message-only form and routes it through
+# `session/request_permission` whatever the client declared
+# (`shouldUseAcpElicitation` returns false for a message-only form); only a
+# form WITH fields and a URL ask consult `clientCapabilities.elicitation`, and
+# those are the asks this handler renders. Measured, not only read:
+# `test_codex_session_mcp_approval.py` drives the pinned codex-acp with
+# this very dict declared and sees the command approval arrive as
+# `session/request_permission` (the live fixture
+# `codex/command-approval-elicitation-declared-live.jsonl`). Codex's own command
+# approvals never pass through its elicitation handler at all
+# (`handleCommandExecution` -> `requestPermission`). Without the key codex
+# answers a URL ask through `session/request_permission` and cancels a form
+# with fields. opencode's ACP server routes tool permissions through
+# `requestPermission` and never calls the SDK's `unstable_createElicitation`;
+# pi's gated `bash` call is measured in `test_pi_real_adapter.py` under Crew's
+# own handshake and arrives as `session/request_permission`; kiro-cli, KAS,
+# claude-agent-acp and goose never send `elicitation/create`. Both modes are
+# declared because both are rendered: a form from the requested schema, and a
+# URL the person is sent to.
 #
 # `fs` and `terminal` stay false for the same reason, and always have: Kiro Crew
 # does not serve the agent's file or terminal requests over ACP -- the agent uses
@@ -218,7 +381,19 @@ TODO_TEXT_MAX = 500
 ACP_CLIENT_CAPABILITIES: dict = {
     "fs": {"readTextFile": False, "writeTextFile": False},
     "terminal": False,
+    "elicitation": {"form": {}, "url": {}},
 }
+
+# The variable kiro-cli reads to name the application driving it, and the name
+# Crew gives. kiro-cli puts it on the user-agent of EVERY request it sends to its
+# own model backend (``clientApp/<value>``), which is the only place a
+# backend-side record can tell a Crew-driven request apart. ``clientInfo.name``
+# in ``initialize`` does not reach there: kiro-cli keeps that in its telemetry and
+# on the ``AWS_EXECUTION_ENV`` of the tools it spawns, never on its own requests.
+# ``acp.client.CLIENT_NAME`` (``clientInfo.name``) is this same constant, so one
+# filter string (``clientApp/kirocrew``, ``acp-client/kirocrew``) finds Crew on both.
+KIRO_CLI_CLIENT_APPLICATION_ENV = "KIRO_CLI_CLIENT_APPLICATION"
+KIRO_CLI_CLIENT_APPLICATION = "kirocrew"
 
 # ── ACP Backend Identifiers ──
 # DEFINED in :mod:`kiro_crew.acp_backends` and re-exported from the import block
@@ -260,6 +435,7 @@ PROVIDER_LABEL_OPENCODE = "opencode"
 PROVIDER_LABEL_PI = "pi"
 PROVIDER_LABEL_GOOSE = "goose"
 PROVIDER_LABEL_DEEPSEEK = "deepseek"
+PROVIDER_LABEL_COPILOT = "copilot"
 
 #: Backend id -> its label. The mapping is what ``provider_label`` resolves
 #: through, so a harness's label and the answer a session persists under are one
@@ -279,17 +455,36 @@ PROVIDER_LABEL_BY_BACKEND: dict = {
     ACP_BACKEND_PI: PROVIDER_LABEL_PI,
     ACP_BACKEND_GOOSE: PROVIDER_LABEL_GOOSE,
     ACP_BACKEND_DEEPSEEK: PROVIDER_LABEL_DEEPSEEK,
+    ACP_BACKEND_COPILOT: PROVIDER_LABEL_COPILOT,
 }
 
 # KAS reads only fs.readTextFile / fs.writeTextFile / terminal from the top
 # level of clientCapabilities; every other capability it honours lives under
 # _meta.kiro. The ones there are CALLBACK capabilities — KAS calls back into the
-# client to service them — and Kiro Crew implements none, so leaving them
-# undeclared (= false) is correct rather than a gap. Only the settings channel
-# is opened, because that is how a client selects KAS feature flags.
+# client to service them. The settings channel is opened because that is how a
+# client selects KAS feature flags; ``openExternalUrl`` is covered below.
+#
+# ``hooks`` stays undeclared although ``acp/kas_wire.py`` serves all three of its
+# methods. Kiro Crew's own turn loop already fires every hook event this surface
+# can serve for a KAS session, and its PreToolUse can BLOCK a tool on exit 2;
+# announcing would run each hook twice and hand the agent a path whose output is
+# only a context note.
+#
+# ``openExternalUrl`` is declared because it is the only channel an MCP OAuth
+# consent URL reaches the client on: without it the engine has nowhere to send
+# the link of a sign-in Crew starts with ``_kiro/mcp/resetServer``, and a remote
+# OAuth server never connects.
+#
+# ``secretStorage`` is NOT in this constant. By default the engine holds the
+# resulting grant in its own memory and Crew never stores an MCP token. Only with
+# ``agent.kas_persist_mcp_sign_in`` on does the spawn add it to a copy of this
+# declaration (``acp/kas_secret_storage.py``): Crew then keeps each server's
+# ``client`` and ``tokens`` in a dedicated encrypted vault under ``kas/``, never the
+# Secrets vault, and serves them back only on the engine's own pipe. Every other
+# callback stays undeclared (= false).
 KAS_CLIENT_CAPABILITIES: dict = {
     **ACP_CLIENT_CAPABILITIES,
-    "_meta": {"kiro": {"settings": {}}},
+    "_meta": {"kiro": {"settings": {}, "openExternalUrl": True}},
 }
 
 # ── Claude backend permission modes ──
@@ -384,6 +579,9 @@ STOP_REASON_CONTENT_FILTERED_WIRE = "CONTENT_FILTERED"
 # a done-but-missing-frame turn (which acks and completes normally). The
 # dashboard routes this to reset+resume+continue-nudge auto-recovery.
 STOP_REASON_STALE_RECOVER = "stale_recover"
+# Signalled by the session handle when the backend never finished the turn within
+# the turn ceiling: no complete frame arrived, so the turn's text is cut off.
+STOP_REASON_TIMEOUT = "timeout"
 # Signalled by the per-session watchdog when an in-flight tool was judged dead
 # / stuck / UNKNOWN-past-budget and the session was cancelled. Kept in the
 # "error:" family so callers without a dedicated branch fall back to the
@@ -397,6 +595,12 @@ STOP_REASON_TOOL_STALL = "error: tool stall"
 # it deliberately triggers NO retry — the user-visible compaction notice
 # already explains what happened, and this only releases the slot.
 STOP_REASON_COMPACTION_FAILED = "error: compaction failed"
+# Signalled by the session handle when a session/cancel got no ack within the
+# cancel grace window and the runtime is still up: the caller is unblocked with
+# this completion and the runtime is kept for its other sessions. Kept in the
+# "error:" family, so it classifies as ``failed``; to the caller that sent the
+# cancel it is that cancel, left unanswered.
+STOP_REASON_CANCEL_UNACKED = "error: cancel unacked"
 
 # ── Stop-reason classes ──
 #
@@ -610,6 +814,12 @@ class TurnUsage:
     Carried on AcpEvent (EVENT_COMPLETE). Each provider fills the dimensions it
     bills in and leaves the rest at 0: claude_code/bedrock fill token counts +
     cost_usd, kiro (acp) fills credits. Consumers read whichever is non-zero.
+
+    ``num_turns`` is the number of model calls the turn made and
+    ``context_sum_tokens`` the context-window occupancy reported after each of
+    them, added up: the volume of context the turn's calls carried. kiro-cli
+    fills both from its per-call ``_kiro.dev/metadata`` frames (see
+    ``AcpPromptStats.note_metadata_frame``); they are not billed token counts.
     """
 
     input_tokens: int = 0
@@ -620,6 +830,7 @@ class TurnUsage:
     credits: float = 0.0
     num_turns: int = 0
     duration_ms: int = 0
+    context_sum_tokens: int = 0
 
 
 def _normalize_to_kebab(name: str) -> str:
@@ -695,10 +906,29 @@ def _command_from_tool_params(params: dict) -> str | None:
             parts.append(f"--region {region}")
         parameters = params.get("parameters")
         if isinstance(parameters, dict) and parameters:
-            try:
-                parts.append(json.dumps(parameters, sort_keys=True))
-            except (TypeError, ValueError):
-                parts.append(str(parameters))
+            # The backend chooses this shape, so the encoder can be pushed past
+            # its recursion ceiling, and ``RecursionError`` is a
+            # ``RuntimeError``: unguarded it escapes into the hook gate and the
+            # skill-read note, which read this property while the turn runs, and
+            # kills the turn. The helper carries the unencodable-value arm
+            # verbatim: a value whose repr still holds the real bytes stays
+            # scannable. Imported here rather than at module scope because
+            # ``_dispatch`` imports THIS module.
+            from kiro_crew.acp._dispatch import (
+                UNSERIALISABLE_SIBLING_VALUE,
+                _dumps_degraded,
+            )
+
+            rendered = _dumps_degraded(parameters, sort_keys=True)
+            # A refusal leaves a placeholder where the payload was, and the
+            # parameters tail is the only place a smuggled command
+            # (``ssm send-command`` and its ``commands``) appears. Returning the
+            # command without it would hand the security checks a string that
+            # reads as complete, so fail closed instead: no command means the
+            # caller's deny-by-default arm refuses the call.
+            if rendered == UNSERIALISABLE_SIBLING_VALUE:
+                return None
+            parts.append(rendered)
         positional = params.get("positional_args")
         if isinstance(positional, list) and positional:
             parts.append(" ".join(str(p) for p in positional))
@@ -760,6 +990,11 @@ class AcpEvent:
     #: carried no result payload; a measured empty payload has byte length 0.
     tool_output_digest: str = ""
     tool_output_bytes: int = -1
+    #: ``(fingerprint, section)`` for every credential redacted from the result,
+    #: from ``security.credential_sources.tool_output_fingerprints``. Keyed
+    #: digests only: the dashboard uses them to name where a credential in a
+    #: later reply came from, and the value itself is never carried.
+    tool_output_credentials: tuple[tuple[str, str | None], ...] = ()
     tool_final: bool = False  # True when this tool_result is the final (status=completed) update
     #: The backend's own status on this ``tool_call_update``, verbatim and
     #: unmapped: ``completed``, ``failed``, and whatever else it sends.
@@ -778,6 +1013,12 @@ class AcpEvent:
     # MCP OAuth notification fields (EVENT_MCP_OAUTH_REQUEST):
     server_name: str = ""
     oauth_url: str = ""
+    #: The parsed ask of an ``EVENT_ELICITATION_REQUEST``, as
+    #: ``ElicitationRequest.as_dict()`` renders it for a card: ``mode``,
+    #: ``message``, the ``fields`` of a form or the ``url`` of a URL ask, plus
+    #: ``request_id`` and ``tool_call_id``. ``request_id`` and ``tool_call_id``
+    #: on the event itself carry the same ids. None on every other kind.
+    elicitation: dict[str, Any] | None = None
     #: True when this text chunk is a backend CONTROL NOTICE that arrived as
     #: ordinary assistant text -- today only the claude adapter's compaction
     #: notices, which it emits as plain ``agent_message_chunk`` content with no
@@ -791,6 +1032,19 @@ class AcpEvent:
     #: layer: a consumer that re-parsed the text would be re-deciding a protocol
     #: question it does not own.
     control_notice: bool = False
+    #: True when this ``agent_message_chunk`` named no ``messageId``. Provenance
+    #: only, and only meaningful for a harness in
+    #: ``ACP_BACKENDS_UNATTRIBUTED_TERMINAL_ERROR``: there model text always names
+    #: its item and the adapter's own chunks never do, so the missing id is what
+    #: tells a provider failure written as text apart from the model's answer
+    #: (``AcpSessionHandle._run_turn``). Other harnesses leave the id off model
+    #: text too, and nothing reads the flag for them.
+    unattributed: bool = False
+    #: The backend's id for the model message a text chunk belongs to, from the
+    #: chunk's ``messageId``. claude-agent-acp stamps the provider's API message
+    #: id here, which is what its ``session/fork`` accepts as a fork point. Empty
+    #: when the frame carried none.
+    message_id: str = ""
     #: True when this event was SYNTHESIZED by the client rather than read off a
     #: backend frame. Only the claude compaction terminal sets it: an automatic
     #: compaction sends no terminal of its own, so one is manufactured once the
@@ -806,9 +1060,12 @@ class AcpEvent:
     #: several sessions on one runtime (see ``JsonRpcMessage.fanout_no_owner``).
     #: A consumer must not read such an event as ITS OWN activity -- it is
     #: another tenant's traffic. Set by the roster broadcast (which never names
-    #: an owner) and by the MCP registration notifications when the frame did
-    #: not name this session -- a registration frame MAY carry a
-    #: ``params.sessionId``, and one that does is owned by the session it names.
+    #: an owner), by the compaction, clear and agent-switch notices and the steer
+    #: echoes when their frame was fanned out, and by the MCP registration
+    #: notifications when the frame did not name this session -- a registration
+    #: frame MAY carry a ``params.sessionId``, and one that does is owned by the
+    #: session it names. A ``session/update`` names its session by protocol and is
+    #: routed to it, so its events leave the flag clear.
     #: The same event kind reached through a routed ``session/update`` (the KAS
     #: sub-agent lifecycle path) leaves it False, because that frame belongs to
     #: exactly one session.
@@ -834,6 +1091,11 @@ class AcpEvent:
     #: classification (cache hit), not the miss-default False.
     raw_params_trusted: bool = False
     shell_classified: bool = False
+    #: spawn_target: the agent a KAS sub-agent spawn will start, read from the
+    #: engine-written ``_meta.kiro.consent.resource`` of a consent-classified
+    #: request (``_dispatch.kas_consent_tool``). Empty on every other event. The
+    #: hook gate vets it against ``capabilities.spawn`` before anything is asked.
+    spawn_target: str = ""
     #: tool_identity_trusted: tool_name below came from a provenance-verified
     #: adapter-authored identity channel, never a title or inline fallback.
     #: Security gates must require this flag in addition to a recognized name.
@@ -847,6 +1109,34 @@ class AcpEvent:
     #: fails CLOSED (identity not counted as verified) instead of silently
     #: passing on non-emptiness alone.
     mcp_identity_trusted: bool = False
+    #: mcp_identity_unreadable: the frame PRESENTED an MCP identity half the
+    #: name bound refused (``tool_surface.mcp_identity_unreadable``) -- on the
+    #: preceding tool_call frame (carried per scoped toolCallId) or on this
+    #: permission frame's own ``mcpTool.identity``. Not the same as naming no
+    #: identity: the call names a tool Crew cannot retain, so the exact per-tool
+    #: deny that name is under cannot be checked, and every site that answers a
+    #: permission request refuses it outright instead of judging it by title.
+    mcp_identity_unreadable: bool = False
+    #: kas_builtin_ids: this permission event was built for a member of
+    #: ``ACP_BACKENDS_PERMISSION_KIND_FROM_TOOL_CALL`` (KAS), so a bare built-in
+    #: ``tool_name`` is a KAS id (``read_file``) that ``platform.tool_names``
+    #: maps to its kiro-cli policy name. False on every other harness, whose
+    #: bare ids the gate reads under their own name only.
+    kas_builtin_ids: bool = False
+    #: spec_granted_builtins: on a KAS session's OWN permission request (never a
+    #: sub-session's), the built-ins the active agent's spec grants that the KAS
+    #: policy keeps at ``ask`` (``AcpSessionHandle.kas_crew_answered``). Written by
+    #: the session handle from the projection it registered, never from the
+    #: frame. The gate's ``spec-builtin-grant`` tier reads it, after every deny
+    #: tier and governance, and approves only a host-identified built-in it names.
+    #: Empty everywhere else, which grants nothing.
+    spec_granted_builtins: frozenset[str] = frozenset()
+    #: spec_granted_commands: on the same requests, the agent's
+    #: ``toolsSettings.shell.allowedCommands`` as Python regexes
+    #: (``AcpSessionHandle.kas_crew_answered_commands``), written the same way. The
+    #: ``spec-builtin-grant`` tier approves a shell call whose recovered command
+    #: fullmatches one. Empty everywhere else, which grants nothing.
+    spec_granted_commands: tuple[str, ...] = ()
     # Canonical, NON-model-authored tool identity from adapter-authored
     # ``_meta.kiro`` or ``_meta.goose`` (see ``_dispatch._kiro_tool_name``).
     # ``title`` is LLM-authored prose — for shell tools ``select_tool_title``
@@ -858,6 +1148,27 @@ class AcpEvent:
     # callers that gate on these get no match).
     tool_name: str = ""
     mcp_server_name: str = ""
+    #: The tool id a harness states on a ``session/request_permission`` in
+    #: ``_meta.kiro.toolId`` (KAS: ``run_command`` for a shell command). Set only
+    #: on a permission event, and only from that engine-written field, never from
+    #: the title or the model's arguments. Empty when the frame carries none.
+    harness_tool_id: str = ""
+    #: The kiro-cli read built-in (``fs_read``, ``web_fetch``, ...) a claude
+    #: permission request is for, mapped from the ``_meta.claudeCode.toolName``
+    #: claude-agent-acp stamped on the preceding ``tool_call`` frame. Set only on
+    #: a permission event and only from that cached stamp; empty on every other
+    #: backend and for every other tool.
+    harness_builtin_tool: str = ""
+    #: The DeepSeek Harness tool a permission request is for (``read``, ``bash``),
+    #: as the preceding ``tool_call`` frame stated it in ``title``. Set only on a
+    #: deepseek permission event, only from that cached name, and empty when a
+    #: second ``tool_call`` frame named the same id differently in the turn; empty
+    #: on every other backend.
+    deepseek_tool_name: str = ""
+    #: Why a DeepSeek Harness READ_ONLY turn refuses this request outright: its
+    #: launch did not prove stock dsh registers the read tools. Set only on a
+    #: deepseek permission event; empty once proved and on every other backend.
+    deepseek_read_only_issue: str = ""
     # Diff content block fields — authoritative before/after text from kiro-cli
     # for write tools. Used by chat_runner to derive the "before" snapshot
     # without a racy disk read (the write has already landed by the time the
@@ -1087,6 +1398,14 @@ class AcpPromptStats:
     # delta'd against. SESSION state: survives ``carry_over()`` like the
     # context fields, or every turn would re-bill the whole session's spend.
     cost_session_usd: float = 0.0
+    # The ACP session ``cost_session_usd`` was measured on. Lets a restore of
+    # that SAME session keep the baseline (see ``restore_cost_session``).
+    cost_baseline_sid: str = ""
+    # True while the adapter's counter holds spend Crew never saw: a restored
+    # session's ledger is brought back from the harness's own transcript, so
+    # its first reading includes everything billed before this process. The
+    # next reading is adopted as the baseline and bills nothing.
+    cost_baseline_unknown: bool = False
     # True while ``context_pct`` reads 0.0 only because a compaction dropped the
     # counts and no fresh telemetry has re-derived them. Distinguishes "the
     # transcript is empty" from "the transcript's size is unknown" — the two are
@@ -1102,6 +1421,22 @@ class AcpPromptStats:
     # this turn, so ``carry_over()`` drops it -- a refusal that survived into
     # the next turn would brand an ordinary answer as declined.
     refusal: "RefusalInfo | None" = None
+    # The KAS engine's own measurement of this turn (``kas_profile`` module): the
+    # context breakdown and time to first token. PER-TURN, dropped by
+    # ``carry_over()``, so a replayed or late frame cannot reach a later turn.
+    kas_profile: "dict[str, Any] | None" = None
+    # The context-window occupancy, in tokens, after each model call this turn,
+    # kept as a running sum, the number of readings and the first reading (see
+    # ``note_metadata_frame``). Fixed size however many calls the turn makes.
+    # PER-TURN: ``carry_over()`` drops all three.
+    call_context_sum: int = 0
+    call_readings: int = 0
+    first_call_reading: int = 0
+    # Credit entries the turn's ``meteringUsage`` listed. kiro-cli lists one per
+    # model call, which is how ``to_turn_usage`` tells a reading that belongs to
+    # no call (the frame sent when a session opens) from one that does.
+    # PER-TURN like ``credits``.
+    metered_calls: int = 0
 
     def carry_over(self) -> "AcpPromptStats":
         """Return fresh per-turn stats carrying this turn's context state.
@@ -1117,6 +1452,8 @@ class AcpPromptStats:
             context_tokens_from_usage=self.context_tokens_from_usage,
             context_pct_unknown=self.context_pct_unknown,
             cost_session_usd=self.cost_session_usd,
+            cost_baseline_sid=self.cost_baseline_sid,
+            cost_baseline_unknown=self.cost_baseline_unknown,
         )
 
     def reset_context_state(self) -> None:
@@ -1150,6 +1487,7 @@ class AcpPromptStats:
         # under-count the first turns (any new reading below the stale baseline
         # only survives via the monotonic reset guard).
         self.cost_session_usd = 0.0
+        self.cost_baseline_unknown = False
 
     def note_pct_reported(self) -> None:
         """Mark ``context_pct`` as backed by real telemetry.
@@ -1177,20 +1515,71 @@ class AcpPromptStats:
             return STOP_REASON_REFUSAL, self.refusal
         return stop_reason, None
 
+    def begin_cost_session(self, session_id: str) -> None:
+        """Start the cost baseline for a session this process just created.
+
+        A ``session/new`` opens a fresh ledger in the adapter, so its counter
+        starts at zero and every later reading is spend Crew can see.
+        """
+        self.cost_session_usd = 0.0
+        self.cost_baseline_sid = session_id or ""
+        self.cost_baseline_unknown = False
+
+    def restore_cost_session(self, session_id: str) -> None:
+        """Set the cost baseline for a session restored by load or resume.
+
+        The claude harness restores a resumed session's cost ledger from its
+        own transcript, so the counter does NOT restart at zero: it carries the
+        session's whole lifetime spend. A baseline measured on this same session
+        (the adapter process restarted under a live client) still describes
+        that ledger and is kept. Any other baseline -- a fresh client after a
+        gateway restart, or one measured on a different session -- cannot, so
+        the next reading is adopted as the baseline instead of billed.
+        """
+        sid = session_id or ""
+        if sid and sid == self.cost_baseline_sid and not self.cost_baseline_unknown:
+            return
+        self.cost_session_usd = 0.0
+        self.cost_baseline_sid = sid
+        self.cost_baseline_unknown = True
+
     def apply_cost_cumulative(self, cumulative: float) -> None:
         """Fold a session-cumulative cost reading into the per-turn delta.
 
         The adapter reports cost as a running session total, so the per-turn
-        figure is the movement since the last reading. Monotonic guard: a
-        reading BELOW the stored baseline means the adapter's counter reset
-        (process restart) — the new total is then entirely spend since the
-        reset, so it is taken whole rather than producing a negative delta.
-        The caller validates the value (finite, non-negative) at the
+        figure is the movement since the last reading. Two readings carry spend
+        Crew cannot attribute, and both bill nothing and rebase:
+
+        - the first reading after ``restore_cost_session`` found no usable
+          baseline: it includes spend billed before this process;
+        - a reading BELOW the stored baseline: the ledger was restored to a
+          total Crew never saw, so taking it whole would re-bill the lifetime.
+
+        Under-counting one turn is bounded; re-billing a session's lifetime is
+        not. Each case logs a WARNING so a gap in the usage rows explains
+        itself. The caller validates the value (finite, non-negative) at the
         ``parse_usage_cost`` chokepoint.
         """
+        if self.cost_baseline_unknown:
+            logger.warning(
+                "cost baseline unknown for restored session %s: adopting "
+                "cumulative $%.6f as the baseline; this reading bills $0",
+                self.cost_baseline_sid or "(unknown)",
+                cumulative,
+            )
+            self.cost_baseline_unknown = False
+            self.cost_session_usd = cumulative
+            return
         delta = cumulative - self.cost_session_usd
         if delta < 0:
-            delta = cumulative
+            logger.warning(
+                "cost cumulative for session %s fell from $%.6f to $%.6f: "
+                "rebasing; this reading bills $0",
+                self.cost_baseline_sid or "(unknown)",
+                self.cost_session_usd,
+                cumulative,
+            )
+            delta = 0.0
         self.cost_usd += delta
         self.cost_session_usd = cumulative
 
@@ -1214,6 +1603,38 @@ class AcpPromptStats:
         self.cache_read_tokens += int(cache_read_tokens)
         self.cache_write_tokens += int(cache_write_tokens)
 
+    def note_metadata_frame(self, pct: float | None, metering: object) -> None:
+        """Record what one ``_kiro.dev/metadata`` frame says about the turn's calls.
+
+        kiro-cli sends one frame after every model call, carrying the
+        ``contextUsagePercentage`` that call left, and closes the turn with a
+        frame whose ``meteringUsage`` lists one credit entry per call and
+        repeats the last percentage. So a frame with metering is counted by its
+        credit entries and its percentage is not recorded a second time; any
+        other frame records one call's context in tokens.
+
+        ``pct`` is the caller's sanitized percentage, ``None`` when the frame had
+        none. A reading needs a known window, so with the window unknown the
+        turn still counts its metered calls but sums no context. A real
+        ``usage_update`` makes the meter authoritative and the percentage is not
+        applied, so nothing is recorded from it either. Shared by the
+        ``AcpClient`` and ``AcpSessionHandle`` metadata trackers, called after
+        the percentage has been applied, so the two paths cannot drift.
+        """
+        if isinstance(metering, list):
+            self.metered_calls += sum(
+                1 for entry in metering if isinstance(entry, dict) and entry.get("unit") == "credit"
+            )
+            return
+        if pct is None or self.context_tokens_from_usage:
+            return
+        if self.context_window_tokens > 0:
+            reading = round(self.context_window_tokens * pct / 100.0)
+            if self.call_readings == 0:
+                self.first_call_reading = reading
+            self.call_context_sum += reading
+            self.call_readings += 1
+
     def to_turn_usage(self) -> "TurnUsage":
         """One ``TurnUsage`` carrying every billing dimension this turn filled.
 
@@ -1221,10 +1642,24 @@ class AcpPromptStats:
         ``EVENT_COMPLETE`` construction site uses this instead of hand-filling
         fields, so a backend that bills in cost/tokens (the claude seam) and
         one that bills in credits (kiro) both surface whatever they reported.
-        A backend that sends neither cost nor token counts leaves the new
-        dimensions at their zero defaults, so the result is byte-identical to
-        ``TurnUsage(credits=...)`` (harness parity).
+        A backend that sends neither cost, token counts nor per-call metadata
+        leaves those dimensions at their zero defaults, so the result is
+        byte-identical to ``TurnUsage(credits=...)`` (harness parity).
+
+        The model-call count and context sum come from ``note_metadata_frame``.
+        A turn that recorded exactly one reading more than it metered calls
+        leaves out its first reading: that is the frame a session sends when it
+        opens, which arrives ahead of the first call and measures no call. Any
+        other mismatch keeps every reading, and so does a turn that ended before
+        its metering frame arrived (a cancelled first turn then counts the
+        session-open reading). A turn that compacts mid-way records kiro-cli's
+        post-compaction report like a call's reading, so its sum is approximate.
         """
+        context_sum = self.call_context_sum
+        readings = self.call_readings
+        if self.metered_calls and readings == self.metered_calls + 1:
+            context_sum -= self.first_call_reading
+            readings -= 1
         return TurnUsage(
             input_tokens=self.input_tokens,
             output_tokens=self.output_tokens,
@@ -1233,6 +1668,8 @@ class AcpPromptStats:
             cache_creation_tokens=self.cache_write_tokens,
             cost_usd=self.cost_usd,
             credits=self.credits,
+            num_turns=self.metered_calls or readings,
+            context_sum_tokens=context_sum,
         )
 
     @staticmethod
@@ -1266,8 +1703,8 @@ class AcpPromptStats:
         counts. No-op once a real usage_update has
         set authoritative counts. ``model_id`` is the caller's resolved id (the
         kiro-agent ``currentModelId``, else the user-picked alias). Resolves the
-        window through ``model_registry.model_window`` (kiro-list cache >
-        registry > heuristic) and only backfills a KNOWN window, leaving 0 for a
+        window through ``model_registry.model_window`` (operator window > kiro-list
+        cache > registry > heuristic) and only backfills a KNOWN window, leaving 0 for a
         genuinely-unknown model so the frontend's own authoritative window drives
         the meter. A real ``usage_update.size`` always wins. A surviving
         ``context_window_tokens`` (e.g. kept across a compaction reset — the

@@ -50,7 +50,7 @@ def _req(body: dict | None = None, match_info: dict | None = None) -> web.Reques
         "POST",
         "/api/workspaces",
         match_info=match_info or {},
-        headers={"Content-Length": str(len(raw))},
+        headers={"Content-Length": str(len(raw)), "Content-Type": "application/json"},
         payload=BodyStreamPayload(raw),
         app=app,
     )
@@ -688,7 +688,7 @@ class TestInLockRecheck:
         """The copy is STAGED after all validation and only installed inside
         the locked mutate once its checks pass: a create that loses the race
         must not have mutated the destination directory, and must clean its
-        staged tree off the loop (review rounds 2-3)."""
+        staged tree off the loop."""
         (tmp_path / "workspace").mkdir()
         (tmp_path / "workspace" / "notes.md").write_text("source content", encoding="utf-8")
         stale = _cfg()  # "staging" absent -> handler checks pass, copy runs

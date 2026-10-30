@@ -1,8 +1,8 @@
 # Durable Run Coordinator Implementation Plan
 
-> **Obsolete plan — do not read the checkboxes as in-flight work.** 0 of 53 steps
-> are done and `RunCoordinator` has zero hits in `src/` and `test/`, and none
-> will be executed: its RFC
+> **Obsolete plan — do not read the checkboxes as in-flight work.** 0 of 52
+> checklist steps are done and `RunCoordinator` has zero hits in `src/` and
+> `test/`, and none will be executed: its RFC
 > [`../rfc-durable-run-coordinator.md`](../rfc-durable-run-coordinator.md) is
 > `superseded` by
 > [`../rfc-overload-resilience.md`](../rfc-overload-resilience.md), which ships
@@ -135,7 +135,7 @@ exceptions.
 - Create: `src/kiro_crew/run_coordinator/memory.py`
 - Create: `src/kiro_crew/run_coordinator/__init__.py`
 - Create: `test/test_run_coordinator_contract.py`
-- Modify: `src/kiro_crew/subagent.py` (`SubagentManager.__init__`, for the optional
+- Modify: `src/kiro_crew/subagent_parts/manager.py` (`SubagentManager.__init__`, for the optional
   `coordinator=` injection)
 - Modify: `docs/request-for-change/rfc-durable-run-coordinator.md`
 

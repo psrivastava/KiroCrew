@@ -29,6 +29,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import threading
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -76,6 +78,15 @@ DEFAULT_STALE_AFTER_SECS = 2 * 60 * 60
 _CONFIG_MAX_CLAIMS = "max_claims_per_cycle"
 _CONFIG_STALE_AFTER = "stale_after_secs"
 _CONFIG_NEEDS_HUMAN_STALE_AFTER = "needs_human_stale_after_secs"
+
+# Query inference is optional dispatch enrichment, so it gets the same short
+# admission budget as a fresh prompt build rather than the embedder's general
+# 30-second interactive default. The prompt-build context manager is private to
+# that lifecycle, so dispatch carries the same contract locally. A cold model
+# returns None immediately and loads in the background; queued work may wait
+# only inside this deadline, while native inference already running cannot be
+# interrupted and may finish after it.
+_SIMILAR_QUERY_TIMEOUT_SECS = 5.0
 
 #: Total characters of provider evidence rendered into one investigation brief.
 #:
@@ -224,14 +235,51 @@ def _attach_similar_safely(claimed: ClaimedIncident) -> None:
     store_obj = None
     try:
         from kiro_crew.config.loader import KiroCrewConfig
+        from kiro_crew.embeddings import (
+            PRIORITY_INTERACTIVE,
+            EmbeddingWork,
+            embedding_work,
+            make_sync_embed_fn,
+        )
         from kiro_crew.vector_memory import VectorMemoryStore
 
         # Constructed per call, matching the convention in cli_commands/onboarding_import:
         # there is no shared singleton, and holding one open across cycles would keep a
         # SQLite handle alive for a feature that may never be used on this install.
-        store_obj = VectorMemoryStore(embedding_dim=KiroCrewConfig.load().memory.embedding_dim)
+        cfg = KiroCrewConfig.load()
+        store_obj = VectorMemoryStore(embedding_dim=cfg.memory.embedding_dim, config=cfg)
+        # One-shot read: bind the shared callable, but no lazy factory. If the
+        # model is cold the callable kicks its background load and returns None;
+        # this store closes after the keyword fallback and has no later work for
+        # a factory to serve.
+        store_obj.embed_fn = make_sync_embed_fn()
         store_obj.init()
-        attach_similar_lessons(claimed, store_obj)
+
+        query = _similar_query(claimed)
+        query_embedding = None
+        inherited_work = embedding_work.get()
+        deadline = time.monotonic() + _SIMILAR_QUERY_TIMEOUT_SECS
+        if inherited_work is not None:
+            deadline = min(deadline, inherited_work.deadline)
+        work = EmbeddingWork(
+            deadline=deadline,
+            cancelled=(
+                inherited_work.cancelled if inherited_work is not None else threading.Event()
+            ),
+            priority=PRIORITY_INTERACTIVE,
+        )
+        token = embedding_work.set(work)
+        try:
+            if query:
+                query_embedding = store_obj._try_embed(query, PRIORITY_INTERACTIVE)
+        except Exception:  # noqa: BLE001 — keyword recall remains useful without a vector
+            logger.debug(
+                "ops-mission-control: query embedding unavailable; using keyword recall",
+                exc_info=True,
+            )
+        finally:
+            embedding_work.reset(token)
+        attach_similar_lessons(claimed, store_obj, query_embedding=query_embedding)
     except Exception:  # noqa: BLE001 — no store, or a broken one, is a supported state
         logger.debug(
             "ops-mission-control: semantic recall unavailable; fingerprint matches stand",
@@ -246,7 +294,11 @@ def _attach_similar_safely(claimed: ClaimedIncident) -> None:
 
 
 def attach_similar_lessons(
-    claimed: ClaimedIncident, store: Any, *, limit: int = 3
+    claimed: ClaimedIncident,
+    store: Any,
+    *,
+    limit: int = 3,
+    query_embedding: list[float] | None = None,
 ) -> ClaimedIncident:
     """Attach semantically similar ledger entries that the fingerprint missed.
 
@@ -266,13 +318,18 @@ def attach_similar_lessons(
     """
     if store is None:
         return claimed
-    query = f"{claimed.incident.signal.title} {claimed.incident.signal.resource}".strip()
+    query = _similar_query(claimed)
     if not query:
         return claimed
     try:
         from kiro_crew.apps.builtins.ops_mission_control.backend import ledger_index
 
-        rows = ledger_index.search_similar(store, query, limit=limit + len(claimed.matches))
+        rows = ledger_index.search_similar(
+            store,
+            query,
+            limit=limit + len(claimed.matches),
+            query_embedding=query_embedding,
+        )
     except Exception:  # noqa: BLE001 — semantic recall is additive, never required
         logger.exception("ops-mission-control: similar-lesson lookup failed")
         return claimed
@@ -301,6 +358,11 @@ def attach_similar_lessons(
             break
     claimed.similar = found
     return claimed
+
+
+def _similar_query(claimed: ClaimedIncident) -> str:
+    """Text whose vector and keyword fallback must describe the same incident."""
+    return f"{claimed.incident.signal.title} {claimed.incident.signal.resource}".strip()
 
 
 def attach_ledger_matches(incident: Incident) -> ClaimedIncident:
@@ -500,7 +562,7 @@ def verify_pending_actions(
             # the mutation was abandoned before it wrote, so nothing is half-applied and
             # the only cost is this annotation, which the next verification pass redoes.
             # The store staying strict and this caller staying tolerant are the same
-            # decision seen from two ends, not a contradiction. Found in review (GPT 5.6).
+            # decision seen from two ends, not a contradiction.
             logger.debug(
                 "ops-mission-control: could not record verification for %s",
                 incident.incident_id,
@@ -526,7 +588,8 @@ def _record_verification_misses(incident: Incident) -> None:
 
     Charged to every entry in ``ledger_matches`` rather than to a single "the one we
     used", because nothing records which match the investigation actually applied
-    (``Incident.proposed_action`` is declared and never assigned). Attributing the miss to
+    (``Incident.proposed_action`` records the proposed action, not which
+    ledger match was applied). Attributing the miss to
     a guess would be worse than attributing it to all of them: ``MAX_MATCHES_PER_SIGNAL``
     is 3, so the blast radius is bounded, and a match that keeps being shown for a failure
     that keeps coming back has genuinely not earned the fast path either.
@@ -622,7 +685,7 @@ async def run_cycle(
         # Slack pin mirror, the desktop notifications and the cycle's SEL entry. This
         # function is ordered specifically so a later fault cannot cost an earlier step
         # ("a Slack outage can never cost us a claim"), and a maintenance pass that reruns
-        # every heartbeat is the clearest case of that rule. Found in review.
+        # every heartbeat is the clearest case of that rule.
         logger.warning(
             "ops-mission-control: proposal expiry skipped, dispatch index I/O failed",
             exc_info=True,
@@ -645,7 +708,7 @@ async def run_cycle(
     # heartbeat, so run inline it freezes the whole loop — chat turn and liveness heartbeat
     # included — for up to 10s. `_login_cache` is only a mitigation: `resolve_shift` wraps each
     # source in `asyncio.wait_for`, and a timeout cancels the awaiter while the worker keeps
-    # running, so the cache may still be cold here. Found in review.
+    # running, so the cache may still be cold here.
     tiers = await asyncio.to_thread(rotation.tier_states, shift)
     if not tiers.get(rotation.TIER_ON_SHIFT, True):
         return CycleResult(skipped_reason="off shift — on_shift tier is disarmed")
@@ -682,9 +745,7 @@ async def run_cycle(
     # the heartbeat. Measured elsewhere in this app at 42ms/1k and 188ms/5k incidents, so on a
     # busy install this stalled the loop on every cycle.
     #
-    # `routes.py` was swept for exactly this class last round and this file was not — the
-    # narrowness my own guard test was written to prevent, one module over. The guard now
-    # covers `dispatch.py` too. Found in review.
+    # The guard test that keeps this class out of `routes.py` covers `dispatch.py` too.
     index = await asyncio.to_thread(store.read_index)
     # A signal is "owned" only by an OPEN incident. A closed one (resolved/escalated) must
     # not suppress a fresh firing — `signal.id` is stable for the alarm's lifetime, so
@@ -707,7 +768,7 @@ async def run_cycle(
     limit = (
         max_claims
         if max_claims is not None
-        else _config_int(_CONFIG_MAX_CLAIMS, DEFAULT_MAX_CLAIMS_PER_CYCLE)
+        else await asyncio.to_thread(_config_int, _CONFIG_MAX_CLAIMS, DEFAULT_MAX_CLAIMS_PER_CYCLE)
     )
 
     claimed: list[ClaimedIncident] = []
@@ -725,7 +786,7 @@ async def run_cycle(
             # in this same loop are durably on disk, so escaping here means an in-flight
             # investigation nobody is ever told about -- and it made the maintenance-pass
             # guard below unreachable on any install with something firing, which is the
-            # only install where it matters. Found in review (Design Review, Fable 5).
+            # only install where it matters.
             #
             # `break`, not `continue`: whatever stopped this claim will stop every
             # remaining one the same way, so continuing only repeats the failure per
@@ -762,18 +823,18 @@ async def run_cycle(
     # - signals whose `_claim_one` returned None (another instance won the race — it acks
     #   its own copy in its own cycle).
     #
-    # Acking ids rather than the whole batch is what makes the per-cycle cap safe: before,
-    # a burst larger than `limit` had its remainder destroyed by the very poll that
+    # Acking ids rather than the whole batch is what makes the per-cycle cap safe: acking the
+    # batch would destroy the remainder of a burst larger than `limit` in the very poll that
     # delivered it.
     # Ack what we claimed THIS cycle **and** everything an open incident already owns.
     #
-    # `owned` ids are filtered out of `candidates` above, so they are never claimed and — with
-    # only the `claimed` set acked — never left the spool. A sender that redelivers while an
-    # investigation is in flight (Alertmanager repeats every group_interval; a webhook script
-    # retries) therefore accumulated copies of a signal already being worked, and on a full
-    # 200-entry spool those evicted a NEW unclaimed alert. Found in review, and the same shape
-    # as the manual-claim gap one round earlier: every place a signal becomes or already IS
-    # durable has to acknowledge it, not just the place that claims it.
+    # `owned` ids are filtered out of `candidates` above, so they are never claimed; with
+    # only the `claimed` set acked they would never leave the spool. A sender that redelivers
+    # while an investigation is in flight (Alertmanager repeats every group_interval; a
+    # webhook script retries) would then accumulate copies of a signal already being worked,
+    # and on a full 200-entry spool those would evict a NEW unclaimed alert. The manual claim
+    # has the same shape: every place a signal becomes or already IS durable has to
+    # acknowledge it, not just the place that claims it.
     #
     # Safe by the same argument the durability rule rests on: an id in `owned` has an incident
     # on disk, so dropping the spooled copy loses nothing — and if that incident later goes
@@ -790,14 +851,16 @@ async def run_cycle(
     # absence means anything at all.
     verifications = await asyncio.to_thread(verify_pending_actions, signals, registry.poll_health())
 
-    stale_after = _config_int(_CONFIG_STALE_AFTER, DEFAULT_STALE_AFTER_SECS)
+    stale_after = await asyncio.to_thread(
+        _config_int, _CONFIG_STALE_AFTER, DEFAULT_STALE_AFTER_SECS
+    )
     try:
         released = await asyncio.to_thread(
             store.sweep_stale,
             stale_after,
             # 0 / unset means "derive from the working threshold", which is what
             # ``sweep_stale`` does for ``None``.
-            _config_int(_CONFIG_NEEDS_HUMAN_STALE_AFTER, 0) or None,
+            (await asyncio.to_thread(_config_int, _CONFIG_NEEDS_HUMAN_STALE_AFTER, 0)) or None,
         )
     except OSError:
         # Same policy and same breadth as the proposal expiry above: any

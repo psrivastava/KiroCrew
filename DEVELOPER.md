@@ -6,8 +6,8 @@
 > approach — so a reviewer can understand the delta at a glance, and so the fork
 > can be re-based on future upstream pulls without re-deriving intent.
 >
-> **Branch:** `ccrew-claude-codex` · **Fork base:** upstream commit `64f3b5811`
-> (`fix(test): drop the stale 501-until-diag premise from test_mcp_debug (#12865)`).
+> **Branch:** `main` · **Fork base:** upstream commit `bde5de12e` (synced 2026-10-30;
+> originally forked at `64f3b5811`). Every upstream sync is recorded in §9.
 
 ---
 
@@ -62,7 +62,7 @@ the two apps never collide:
 |---|---|---|---|
 | `app.name` (→ lock + userData) | "Kiro Crew" | "CCrew" | `main.js` (`ccrewAppName()`) |
 | Default data home | `~/.kiro/crew` | `~/.ccrew` | `home-dir.js` (`canonicalHome`) |
-| Default gateway port | 5476 | 5490 | `main.js` (`resolvePort`) |
+| Default gateway port | 5476 | 5490 | `main.js` (`resolvePort` → `host-config.js` `selectLaunchPort({ defaultPort })`) |
 | Windows AppUserModelID | `com.amazon.kiro.crew` | `com.ccrew.app` | `main.js` |
 
 An explicit `KIROCREW_HOME` override still wins over the CCrew default. A plain
@@ -98,9 +98,9 @@ own non-nestable OS sandbox, and let that sandbox own the isolation.
 
 | Seam | What it does |
 |---|---|
-| `ACP_BACKENDS_SKIP_CREW_SEATBELT_MACOS` | New capability set, `{claude}` only; `agent_sdk/backends.py`, re-exported via `acp_backends.py` + `acp/types.py` |
-| `wrap_argv` / `wrap_argv_async` | New `skip_crew_seatbelt_macos` param; a **darwin-only** branch env-scrubs and returns WITHOUT the seatbelt |
-| `acp/client.py` | Passes the flag by set membership at the Claude spawn |
+| `ACP_BACKENDS_SKIP_CREW_SEATBELT_MACOS` | New capability set, `{claude}` only; `agent_sdk/backends_launch.py` (beside `ACP_BACKENDS_INTERNAL_SANDBOX`), re-exported via `agent_sdk/backends.py`, `acp_backends.py` + `acp/types.py`; classified off-the-wire in `scripts/check_harness_parity.py` `HARNESS_EXEMPT_SETS` |
+| `wrap_argv` (`sandbox_wrap.py`) / `wrap_argv_async` (`sandbox_spawn.py`) | New `skip_crew_seatbelt_macos` param; a **darwin-only** branch env-scrubs and returns WITHOUT the seatbelt |
+| `acp/launch.py` | Passes the flag by set membership at the shared ACP spawn (moved out of `acp/client.py` upstream) |
 
 Deliberately a **separate** set from `ACP_BACKENDS_INTERNAL_SANDBOX` (harness-
 parity H6, one set per capability): that set carries the Windows no-backend
@@ -118,6 +118,24 @@ this via the existing "Crew sandbox stands down" note (no new i18n key).
 Inert off macOS: Linux namespace isolation and the Windows no-backend policy are
 unchanged.
 
+### 2.3 Updates: never from the upstream feed
+
+Upstream's desktop updater follows `https://updates.crew.kiro.dev/feed`, which
+serves **upstream Kiro Crew** builds. Left alone it would download one in the
+background and, on install, replace `CCrew.app` with upstream's app.
+
+| Path | CCrew behaviour | Where |
+|---|---|---|
+| Desktop (Electron) updater | Under the CCrew identity (`isCCrew()`, i.e. a `CCREW=1` build) the install reads as **externally managed**: the updater is never armed and the feed is never contacted. About shows "Updates are managed by CCrew (rebuild from the fork)". A real `EXTERNALLY-MANAGED` marker still wins. | `website/electron/auto-update.js` (`isCCrewBuild`, `CCREW_UPDATE_OWNER`); tests in `test/auto-update.managed.test.js` |
+| Desktop backend self-update | Already off: the `.app` is stamped `dmg` and defers to the Electron updater above. | `platform/update_capability.py` |
+| Dev checkout (`./ccrew.sh`) | `auto_update` stays on but only ever fast-resets to the **tracked** remote, i.e. `origin` = `psrivastava/KiroCrew`. It refuses when the tree is dirty or ahead of `origin`, so local work is never reset away. Never set a branch to track `upstream`. | `slack/gateway_runtime/update_apply.py` |
+
+To update CCrew: sync upstream (§9), rebuild (§8.1), and replace the `.app`.
+
+Also kept out of the CCrew app for coexistence: upstream's `kirocrew://` URL
+scheme registration (`build.protocols` in `website/electron/package.json`). If
+CCrew registered it too, CCrew.app could take KiroCrew's deep links.
+
 ---
 
 ## 3. UI features added
@@ -126,7 +144,10 @@ unchanged.
 The sidebar ghost glyph is a raster `logo.png` (purple), so it can't be recolored
 by a token. A `.ccrew-logo-tint` CSS class hue-rotates it to lime on both glyph
 `<img>` sites. Reversible, no new asset.
-- `website/src/index.css` (`.ccrew-logo-tint`), applied in `website/src/App.tsx`.
+- `website/src/index.css` (`.ccrew-logo-tint`), applied in `website/src/App.tsx`
+  (`MobileNavGlyph`) and `website/src/shell/nav/railChrome.tsx` (`RailHeaderGlyph`).
+- Claude-session API methods live in `website/src/api/client/sessions.ts`
+  (upstream split `api/client.ts` into per-domain modules).
 
 ### 3.2 Active-backend chip
 The chat only ever showed the **agent-spec name** ("default") — never the ACP
@@ -197,8 +218,10 @@ able to share it).
   to a native claude session, which has no CCrew transcript/history record.
 
 ### 4.5 Endpoints & routes
-Handlers in `src/kiro_crew/dashboard/handlers/sessions.py`, registered in
-`src/kiro_crew/dashboard/routes/system.py`:
+Handlers in `src/kiro_crew/dashboard/handlers/claude_sessions.py` (CCrew-owned
+module, imported by `handlers/__init__.py`), registered in
+`src/kiro_crew/dashboard/routes/system.py`. `SessionManager.remember_resume_sid`
+lives in `session_parts/links.py`, bound in `session.py`:
 - `GET  /api/claude-sessions` — list (reader + overlay merge)
 - `PATCH  /api/claude-sessions/{uuid}` — set overlay (title/pin/tags/color)
 - `POST /api/claude-sessions/{uuid}/open` — seed resume sid onto a slot
@@ -339,3 +362,117 @@ or **System Settings → Privacy & Security → "Open Anyway"** on the first
 blocked launch. Because CCrew has its own bundle id (`com.ccrew.app`), name,
 data home (`~/.ccrew`) and port (5490), it installs and runs **side by side**
 with an installed KiroCrew — neither replaces the other.
+
+---
+
+## 9. Upstream merge log
+
+One entry per upstream sync, newest first. Append a new entry in the same
+commit as the merge, and bump the **Fork base** line at the top of this file.
+
+**How to sync** (remote `upstream` = `kirodotdev/KiroCrew`):
+
+```bash
+git fetch upstream
+git checkout -b sync/upstream-<YYYY-MM-DD> main
+git merge upstream/main          # resolve; never squash — keep both parents
+```
+
+Where upstream moved code that CCrew edited, take upstream's new structure and
+re-apply the CCrew change at the new location, then update the "Where" cells in
+§2–§4. Translation conflicts are almost always sibling keys added at the same
+spot: keep both and fix the comma. Then run the checks in §5/§8 plus the i18n
+parity and logo-glyph tests, and record the entry below.
+
+**Entry template:**
+
+```markdown
+### YYYY-MM-DD — `<upstream sha>` (merge `<merge sha>`, PR #N)
+- **Range:** `<old base>..<new base>`, N upstream commits; CCrew side had M commits.
+- **Conflicts:** N files. Relocated CCrew changes: <file → new file, …>.
+- **Other fallout:** <behavior changes, renamed APIs, new specs to read>.
+- **Verified:** <tests/builds run and results>. **Not run:** <what and why>.
+```
+
+### 2026-10-30 — `bde5de12e` (branch `sync/upstream-2026-10-30`)
+- **Range:** `150605b8e..bde5de12e`, 3397 upstream commits; no new CCrew commits
+  since the previous sync.
+- **Conflicts:** 24 files (12 locale catalogs + 12 code/test files). Upstream
+  split several modules into facades and owner modules, so CCrew changes moved:
+  - `ACP_BACKENDS_SKIP_CREW_SEATBELT_MACOS` (§2.2): `agent_sdk/backends.py` →
+    `agent_sdk/backends_launch.py`, re-exported from `backends.py`; classified
+    in `scripts/check_harness_parity.py` `HARNESS_EXEMPT_SETS` (upstream's new
+    X-capture gate requires every `ACP_BACKENDS_*` set to be classified).
+  - seatbelt skip branch: `sandbox.py` `wrap_argv` → `sandbox_wrap.py`;
+    `wrap_argv_async` option → `sandbox_spawn.py`.
+  - `remember_resume_sid`: `session.py` → `session_parts/links.py`, bound on
+    `SessionManager` in `session.py`.
+  - Claude CLI session handlers (§4.5): `dashboard/handlers/sessions.py` (now a
+    facade) → new CCrew-owned `dashboard/handlers/claude_sessions.py`.
+  - backend card "Crew sandbox stands down": union of kiro-cli, KAS relay and
+    Claude sets; `test_backend_cards.py` expects `{kiro, kas, claude}`.
+  - mobile-nav logo tint: `App.tsx` → `shell/topbar/shellHeader.tsx`.
+  - `BackendChip` and `ClaudeCliSessions` re-inserted in upstream's new
+    `ChatInput.tsx` / `ChatSidebar.tsx`.
+  - `test/gateway-env.test.js`: upstream's file plus CCrew's `KIROCREW_HOME`
+    and `KIROCREW_PROFILE=standalone` expectations.
+  - Locale catalogs: both sides kept (`claudeCliSessions` + `lockedByPolicyBadge`).
+- **Other fallout:** upstream added `build.protocols` (`kirocrew://`) to the
+  Electron `package.json`; dropped for CCrew (§2.3) and `deep-link.test.js`
+  now asserts CCrew does not claim the scheme. A CCrew comment in
+  `build-desktop.sh` reworded to pass upstream's new voice-runtime packaging pin.
+  Every CCrew-added line from the previous base was checked against the merged
+  tree; only the deliberately rewritten ones above differ.
+- **Verified:** backend reinstalled; flake8 + black clean on touched files;
+  harness-parity gate clean; CCrew/ACP/sandbox tests 305 passed + 60 files
+  pinning the touched modules 2238 passed. Frontend `npm ci`, type check and
+  build clean, staged; i18n/glyph/CCrew tests 120 passed. Electron suite all
+  green except 3 that fail identically on pure upstream
+  (`ipc-registrar.test.js` governance clear, `window-lifecycle.test.js` wiring
+  order, `gateway-shim-tree-kill.test.js` `spawn EPERM` in the agent sandbox).
+- **Not run:** full suite (CI), `mypy --platform linux`, a live Claude turn.
+
+### 2026-10-12 — `150605b8e` (branch `sync/upstream-2026-10-12`)
+- **Range:** `8fe49bd54..150605b8e`, 642 upstream commits; no new CCrew commits
+  since the previous sync.
+- **Conflicts:** 1 file, `website/electron/test/gateway-env.test.js` — both
+  sides appended a test at the same spot (CCrew's KIROCREW_HOME spawn-env pin,
+  upstream's bundled-Python env isolation); kept both. No CCrew change needed
+  relocating: the §2.2 seatbelt seam, `api/client/sessions.ts`, the logo tint
+  and `ccrew-identity.js` all merged cleanly.
+- **Other fallout:** upstream's `buildGatewayEnvironment` now takes
+  `(env, { bundled, platform })`; the CCrew `KIROCREW_HOME` key still reaches
+  the spawn env.
+- **Verified:** backend reinstalled; flake8 clean on the seatbelt seam files;
+  ACP launch/spawn, sandbox argv, backend-card, harness-parity and Claude-session
+  tests 466 passed / 10 skipped. Frontend `npm ci`, type check and build clean,
+  staged into `src/kiro_crew/static/dist`; i18n parity + glyph + CCrew tests 115
+  passed. Electron suite 2593 passed / 2 failed / 4 skipped — both failures are
+  in files identical to upstream (`download-handler.test.js` reserved-path case;
+  `gateway-shim-tree-kill.test.js` `spawn EPERM` under the agent sandbox).
+- **Not run:** full suite (CI), `mypy --platform linux`, black gate (the system
+  `python3` has no black), desktop `.app` build.
+
+### 2026-10-08 — `8fe49bd54` (merge `7174ddaaa`, branch `sync/upstream-2026-10-08`)
+- **Range:** `64f3b5811..8fe49bd54`, 2275 upstream commits; CCrew side had 22
+  commits (through PR #4).
+- **Conflicts:** 18 files. Upstream had moved code CCrew edited, so the CCrew
+  changes were re-applied in the new locations:
+  - macOS Claude sandbox skip (PR #4, §2.2): `acp/client.py` → `acp/launch.py`
+    (shared ACP spawn moved there).
+  - Claude CLI session API methods (§4.5): `website/src/api/client.ts` →
+    `website/src/api/client/sessions.ts` (per-domain client split).
+  - Sidebar glyph tint (§3.1): `App.tsx` → `website/src/shell/nav/railChrome.tsx`.
+  - Default port 5490 (§2): small addition to upstream's new
+    `website/electron/host-config.js`, passed from `main.js`.
+  - Electron app name and packaged-files list: same files (`main.js`,
+    `package.json`), both sides kept.
+  - Translation catalogs (12 locales + pseudo-locale): both sides kept; all
+    still parse as JSON.
+- **Verified:** backend reinstalled into `.venv`; flake8 + black clean on edited
+  files; Claude-session, sandbox, backend-card, harness-parity and ACP launch
+  tests 437 passed / 10 skipped. Frontend type check clean, `npm run build`
+  staged into `src/kiro_crew/static/dist`; i18n parity + logo-glyph tests (121)
+  passed. Electron host-config + CCrew identity tests 118 passed / 2 skipped.
+- **Not run:** full test suite (CI), `mypy --platform linux`, desktop `.app`
+  build (must run from a terminal, §8).

@@ -37,6 +37,8 @@ from pathlib import Path
 
 from kiro_crew import platform_compat, sandbox
 from kiro_crew.config.loader import config_dir
+from kiro_crew.json_line import parse_json_object_line
+from kiro_crew.subprocess_utf8 import UTF8_TEXT
 
 logger = logging.getLogger(__name__)
 
@@ -113,7 +115,7 @@ def _sdk_path() -> str | None:
         out = subprocess.run(
             ["/usr/bin/xcrun", "--show-sdk-path"],
             capture_output=True,
-            text=True,
+            **UTF8_TEXT,
             timeout=10,
             env=_build_env(),
         )
@@ -272,7 +274,7 @@ def _swiftc() -> str | None:
         out = subprocess.run(
             ["/usr/bin/xcrun", "--find", "swiftc"],
             capture_output=True,
-            text=True,
+            **UTF8_TEXT,
             timeout=10,
             env=_build_env(),
         )
@@ -462,7 +464,7 @@ def _build_helper(name: str, source: str, *, build: bool = True) -> str | None:
         return None
 
     cache = _cache_dir()
-    # 0o700, matching the other two `run/` writers (`sandbox.py::_ensure_run_dir`).
+    # 0o700, matching the other two `run/` writers (`sandbox_argv.py::_ensure_run_dir`).
     # BEFORE the cache-hit early return on purpose: placed after it, the repair
     # would never run in the steady state — the directory holding an executable
     # the gateway runs would stay at whatever the umask gave it. `exist_ok` does
@@ -516,7 +518,7 @@ def _build_helper(name: str, source: str, *, build: bool = True) -> str | None:
             # the SDK implicitly and nothing may redirect the toolchain.
             [swiftc, "-O", "-parse-as-library", "-sdk", sdk, str(src), "-o", tmp_out],
             capture_output=True,
-            text=True,
+            **UTF8_TEXT,
             timeout=180,
             env=_build_env(),
         )
@@ -615,8 +617,8 @@ async def _to_native_audio(
 
     # The native fast path hands *audio_path* to the Swift helper BY VALUE, and
     # a descriptor path (``/dev/fd/N``) names a descriptor of THIS process —
-    # useless to the helper, whose own fd table does not hold N (GPT review
-    # r23: a native-suffix import would fail with a 502). The remux below is
+    # useless to the helper, whose own fd table does not hold N (a native-suffix
+    # import would fail with a 502). The remux below is
     # the materializing path: its FFmpeg child inherits the descriptor via the
     # spawn seam and writes a NAMED temp file the helper can open.
     if _dev_fd_number(audio_path) is None and _input_suffix(audio_path) in _NATIVE_AUDIO_SUFFIXES:
@@ -648,7 +650,7 @@ async def _to_native_audio(
     # return above hands the original file over and the framework fails
     # loudly), while WITH a decoder the ``-t``-bounded conversion below must
     # never run on an input whose duration is over — or UNKNOWN. ``None``
-    # refuses too (GPT review r27): a transient probe cause (a load spike that
+    # refuses too: a transient probe cause (a load spike that
     # clears before the remux) is not covered by the aligned-budget argument,
     # and proceeding would transcribe a silently truncated prefix.
     try:
@@ -701,7 +703,7 @@ async def _to_native_audio(
                 "1",
                 # Bounds the temp file as well as the conversion itself: a large
                 # low-bitrate input could otherwise expand into a multi-gigabyte
-                # WAV and exhaust the temp volume (GPT review r23). This is the
+                # WAV and exhaust the temp volume. This is the
                 # ceiling ``batch_duration_cap_secs`` reports for the Apple lane,
                 # so the meetings import refuses over-cap recordings loudly
                 # BEFORE this truncation could ever bite.
@@ -783,6 +785,8 @@ async def transcribe(
 ) -> tuple[str | None, dict]:
     """Transcribe *audio_path* on device. Returns ``(text_or_None, metrics)``.
 
+    ``text`` is None only when the run FAILED (and ``metrics`` then carries an
+    ``error`` key); a recording the framework heard no speech in is ``""``.
     ``metrics`` always carries what the run reported (``transcribe_secs``,
     ``audio_secs``, resolved ``locale``) or an ``error`` key — callers surface it in
     diagnostics rather than re-deriving timings.
@@ -799,7 +803,7 @@ async def transcribe(
         native_path, is_temp = await _to_native_audio(audio_path, probe_timeout_secs=timeout_secs)
     except TranscriptionRefusedError as exc:
         # Loud, user-actionable refusal — never a transcript that silently
-        # omits everything past the ceiling (GPT review r26/r27): over-cap
+        # omits everything past the ceiling: over-cap
         # AND duration-unverified inputs both stop here, before conversion.
         return None, {"error": str(exc)}
     # When `is_temp` is true this invocation owns the transcode temp from here
@@ -860,8 +864,11 @@ async def transcribe(
     if proc.returncode != 0 or "error" in payload:
         return None, payload if "error" in payload else {"error": "speech helper failed"}
 
-    text = str(payload.get("text", "")).strip()
-    return (text or None), payload
+    # A helper that exited cleanly with no ``error`` and an empty ``text`` heard
+    # nothing: that is a transcript of silence, not a failure, so it stays ``""``.
+    # None is reserved for the error returns above, every one of which also
+    # carries an ``error`` key in the metrics.
+    return str(payload.get("text", "")).strip(), payload
 
 
 async def inventory() -> dict:
@@ -1037,13 +1044,11 @@ class StreamingSession:
                 text = line.decode(errors="replace").strip()
                 if not text:
                     continue
-                try:
-                    event = json.loads(text)
-                except json.JSONDecodeError:
+                event = parse_json_object_line(text)
+                if event is None:
                     logger.debug("apple_speech: unparseable helper line: %s", text[:120])
                     continue
-                if isinstance(event, dict):
-                    await self._queue.put(event)
+                await self._queue.put(event)
         except (OSError, asyncio.CancelledError):
             pass
         finally:

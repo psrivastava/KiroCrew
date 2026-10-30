@@ -38,6 +38,7 @@ from kiro_crew.apps.builtins.ops_mission_control.backend.providers.base import (
     ActionResult,
     TruncatedSignals,
 )
+from kiro_crew.platform.context import redact_via_context
 from kiro_crew.platform_compat import kill_and_reap
 from kiro_crew.sandbox import (
     create_subprocess_limited,
@@ -127,11 +128,19 @@ class GitHubIssuesAdapter:
 
     # -- SignalSource ------------------------------------------------------
 
-    async def poll(self) -> list[Signal]:
+    def _poll_inputs(self) -> tuple[bool, str, list[str]]:
+        """``(configured, repo, labels)`` in one call, for one hop off the loop.
+
+        Each read opens ``config.json`` and ``configured()`` also walks PATH for ``gh``.
+        """
         if not self.configured():
+            return False, "", []
+        return True, config_value(PROVIDER_ID, "repo"), config_list(PROVIDER_ID, "labels")
+
+    async def poll(self) -> list[Signal]:
+        ok, repo, labels = await asyncio.to_thread(self._poll_inputs)
+        if not ok:
             return []
-        repo = config_value(PROVIDER_ID, "repo")
-        labels = config_list(PROVIDER_ID, "labels")
 
         args = [
             "issue",
@@ -154,7 +163,12 @@ class GitHubIssuesAdapter:
 
         rc, stdout, stderr = await _run_gh(args)
         if rc != 0:
-            raise RuntimeError(f"gh issue list failed: {stderr.strip()[:200]}")
+            # Redact the FULL stream, then keep the TAIL: `gh` prints its error
+            # last, and a bound applied before redaction can cut a credential
+            # into a fragment no redaction regex matches. The context shim, not
+            # `security.redact`, so a loaded companion's extra patterns apply on
+            # this dashboard-bound text (same as `routes._safe_outbound`).
+            raise RuntimeError(f"gh issue list failed: {redact_via_context(stderr.strip())[-200:]}")
         try:
             issues = json.loads(stdout or "[]")
         except json.JSONDecodeError as exc:
@@ -214,7 +228,7 @@ class GitHubIssuesAdapter:
         return frozenset({ACTION_RESOLVE, ACTION_COMMENT})
 
     async def execute(self, signal: Signal, action: str, payload: dict[str, Any]) -> ActionResult:
-        if not self.configured():
+        if not await asyncio.to_thread(self.configured):
             return ActionResult(ok=False, action=action, error="github-issues is not configured")
         repo = signal.labels.get("repo", "")
         number = signal.labels.get("issue_number", "")
@@ -231,5 +245,7 @@ class GitHubIssuesAdapter:
 
         rc, _stdout, stderr = await _run_gh(args)
         if rc != 0:
-            return ActionResult(ok=False, action=action, error=stderr.strip()[:200])
+            return ActionResult(
+                ok=False, action=action, error=redact_via_context(stderr.strip())[-200:]
+            )
         return ActionResult(ok=True, action=action, detail=f"github {action} {repo}#{number}")

@@ -22,6 +22,7 @@ subprocess is spawned and the real data home is never touched.
 
 import asyncio
 import json
+import os
 import shutil
 import tempfile
 import time
@@ -29,13 +30,16 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import pytest
 from aiohttp import web
 from aiohttp.test_utils import make_mocked_request
+from off_loop_helpers import off_loop
 
 from kiro_crew.apps.builtins.issue_radar.backend import crew_runtime as cr
 from kiro_crew.apps.builtins.issue_radar.backend import crew_store as cs
 from kiro_crew.apps.builtins.issue_radar.backend import github_client as gh
 from kiro_crew.apps.builtins.issue_radar.backend import provider, routes, store
+from kiro_crew.crew_log import projection as crew_log_projection
 
 OWNER, REPO = "o", "r"
 
@@ -57,6 +61,22 @@ class DepsCacheStoreTest(unittest.TestCase):
         self.assertEqual(out["edges"], edges)
         self.assertEqual(out["nodes"]["5"]["title"], "blocker")
         self.assertGreater(out["fetched_at"], 0.0)
+
+    def test_blockers_unknown_survives_the_round_trip_and_only_as_true(self):
+        # The GitLab fetcher flags a node whose own links were never read. The
+        # cache normalizer must keep that flag or the node comes back as a
+        # falsely-"ready" one on every read; anything but a literal True is
+        # dropped so a hand-edited "yes" cannot smuggle it in.
+        nodes = {
+            "5": {"kind": "issue", "state": "open", "title": "walked"},
+            "7": {"kind": "issue", "state": "open", "title": "past cap", "blockers_unknown": True},
+            "9": {"kind": "issue", "state": "open", "title": "junk", "blockers_unknown": "yes"},
+        }
+        store.write_deps_cache(OWNER, REPO, [], nodes, root=self.root, fetched_at=time.time())
+        out = store.read_deps_cache(OWNER, REPO, self.root)
+        self.assertNotIn("blockers_unknown", out["nodes"]["5"])
+        self.assertIs(out["nodes"]["7"]["blockers_unknown"], True)
+        self.assertNotIn("blockers_unknown", out["nodes"]["9"])
 
     def test_absent_cache_is_a_miss(self):
         self.assertIsNone(store.read_deps_cache(OWNER, REPO, self.root))
@@ -936,18 +956,47 @@ class DepsHandlerTest(unittest.TestCase):
         self.assertEqual(res.status, 502)
 
     def test_a_non_github_key_gets_an_empty_graph_without_a_fetch(self):
-        # M1 is GitHub-native. A GitLab key returns an empty graph rather than an
-        # error, so the frontend can call /deps uniformly.
+        # GitLab now fetches real edges via gitlab_queries.fetch_dependency_edges.
+        # Azure (and unknown providers) return an empty graph without a fetch.
+        from kiro_crew.apps.builtins.issue_radar.backend import gitlab_queries
+
         with (
             mock.patch.object(store, "is_repo_connected", return_value=True),
-            mock.patch.object(gh, "fetch_dependency_edges") as fetch,
+            mock.patch.object(store, "read_deps_cache", side_effect=[None, None]),
+            mock.patch.object(routes, "_load_open_issues_for_reco", return_value=[]),
+            mock.patch.object(store, "write_deps_cache"),
+            mock.patch.object(
+                gitlab_queries, "fetch_dependency_edges", return_value=([], {})
+            ) as gl_fetch,
+            mock.patch.object(gh, "fetch_dependency_edges") as gh_fetch,
         ):
             res = asyncio.run(_call("owner=o&repo=r&provider=gitlab&host=gitlab.com"))
         self.assertEqual(res.status, 200)
         body = _body(res)
         self.assertEqual(body["provider"], "gitlab")
         self.assertEqual(body["edges"], [])
-        fetch.assert_not_called()
+        # GitLab now uses its own fetcher, not the GitHub one.
+        gl_fetch.assert_called_once()
+        gh_fetch.assert_not_called()
+
+    def test_azure_key_gets_empty_graph_without_a_fetch(self):
+        # Azure DevOps: no fetch, empty graph (same as the old "non-GitHub" behavior).
+        from kiro_crew.apps.builtins.issue_radar.backend import gitlab_queries
+
+        with (
+            mock.patch.object(store, "is_repo_connected", return_value=True),
+            mock.patch.object(store, "read_deps_cache", side_effect=[None, None]),
+            mock.patch.object(store, "write_deps_cache"),
+            mock.patch.object(gitlab_queries, "fetch_dependency_edges") as gl_fetch,
+            mock.patch.object(gh, "fetch_dependency_edges") as gh_fetch,
+        ):
+            res = asyncio.run(_call("owner=o&repo=r&provider=azure&host=dev.azure.com"))
+        self.assertEqual(res.status, 200)
+        body = _body(res)
+        self.assertEqual(body["provider"], "azure")
+        self.assertEqual(body["edges"], [])
+        gl_fetch.assert_not_called()
+        gh_fetch.assert_not_called()
 
 
 # ── /deps serve-stale background revalidation ───────────────────
@@ -1339,11 +1388,59 @@ class SweepDepUnblockTest(unittest.IsolatedAsyncioTestCase):
     """End-to-end through ``sweep_repo``: the last blocker closing wakes the crew
     exactly once, and a still-open blocker does not."""
 
+    @pytest.fixture(autouse=True)
+    def _per_test_dirs(self, tmp_path):
+        """Hand ``setUp`` pytest's per-test directory for the radar store root.
+
+        Neither directory this class writes is one it creates and removes itself. Its
+        background writers (the crew-log eager fold, the radar store's ``mkdir`` on
+        every read) can still touch a directory after the test's own cleanup has
+        removed it, which re-creates it as temp residue. pytest owns ``tmp_path`` and
+        the conftest stops the fold worker before its pins lift.
+        """
+        self._tmp_path = tmp_path
+
     def setUp(self):
-        self._tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self._tmp.cleanup)
-        self.root = Path(self._tmp.name)
+        self.root = self._tmp_path / "radar-root"
+        self.root.mkdir()
         self.key = provider.key_from_parts(OWNER, REPO)
+        # A crew's ledger is the fold of its own crew log, so seeding a work item
+        # records into the unit its slot runs on, as the write route does.
+        from kiro_crew.crew_log import emit as crew_log_emit
+
+        # The crew log lands in the rootdir conftest's per-test KIROCREW_HOME pin, not
+        # in a home of this test's own. The eager fold worker resolves the home when it
+        # folds, and the conftest stops that worker before its pin lifts.
+        env = mock.patch.dict(os.environ, {"KIROCREW_CREW_LOG": "1"})
+        env.start()
+        self.addCleanup(env.stop)
+        crew_log_emit.reset_caches()
+        crew_log_projection.forget_slot_folds()
+        self.addCleanup(crew_log_projection.forget_slot_folds)
+        self.addCleanup(crew_log_emit.reset_caches)
+        self.addCleanup(crew_log_emit.drain_for_shutdown, 2.0)
+
+    def _seed_item(self, crew_id: str, number: int, phase: str) -> None:
+        from kiro_crew.crew_log.schema import KIND_SESSION
+        from kiro_crew.crew_log.store import CrewLog
+
+        sid = f"acp-{crew_id}"
+        CrewLog.create(
+            KIND_SESSION, sid, owner="owner", agent="kirocrew", slot=cs.slot_key_for(crew_id)
+        )
+        # Off the event loop, as production makes it (``off_loop`` says why).
+        off_loop(
+            cs.commit_work_progress,
+            OWNER,
+            REPO,
+            crew_id,
+            number,
+            {"phase": phase},
+            "claim",
+            "seeded",
+            root=self.root,
+            session_id=sid,
+        )
 
     def _client(self):
         client = mock.Mock()
@@ -1373,7 +1470,7 @@ class SweepDepUnblockTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_fires_once_when_the_last_blocker_closes(self):
         crew = cs.create_crew(OWNER, REPO, {"name": "Andromeda", "unattended": True}, self.root)
-        cs.upsert_work_item(OWNER, REPO, crew["id"], 2201, {"phase": "awaiting-reply"}, self.root)
+        self._seed_item(crew["id"], 2201, "awaiting-reply")
 
         # Seed: the blocker is still open.
         self._write_graph("open")
@@ -1402,7 +1499,7 @@ class SweepDepUnblockTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_does_not_fire_while_a_blocker_remains_open(self):
         crew = cs.create_crew(OWNER, REPO, {"name": "Andromeda", "unattended": True}, self.root)
-        cs.upsert_work_item(OWNER, REPO, crew["id"], 2201, {"phase": "awaiting-reply"}, self.root)
+        self._seed_item(crew["id"], 2201, "awaiting-reply")
         # Two blockers; only one closes.
         store.write_deps_cache(
             OWNER,
@@ -1520,9 +1617,20 @@ class SweepDepsRefreshTest(unittest.TestCase):
         write.assert_called_once()
         self.assertIs(out, stored)
 
-    def test_a_non_github_provider_stays_a_plain_cache_read(self):
-        with mock.patch.object(cr.store, "read_deps_cache", return_value=None):
+    def test_a_non_github_provider_is_never_fed_to_the_sweep(self):
+        # Opt A / "crew signals GitHub-only" non-goal: the sweep acts on GitHub
+        # issues alone. Even when the GitLab /deps route has cached a graph —
+        # here an EDGELESS one, the exact shape that reads as zero open blockers
+        # and would fire a false 1→0 unlock on a still-blocked issue — the sweep
+        # returns None (unknown) and never even reads that cache.
+        edgeless_gitlab = {"edges": [], "nodes": {}, "fetched_at": time.time()}
+        with (
+            mock.patch.object(cr.store, "read_deps_cache", return_value=edgeless_gitlab) as read,
+            mock.patch.object(gh, "fetch_dependency_edges") as fetch,
+        ):
             self.assertIsNone(cr._read_or_refresh_deps(self._key("gitlab"), None))
+        read.assert_not_called()
+        fetch.assert_not_called()
 
     def test_a_refresh_failure_keeps_the_stale_graph(self):
         stale = {"edges": [], "nodes": {}, "fetched_at": time.time() - 99999}

@@ -1,6 +1,28 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { screen, fireEvent, waitFor, within } from '@testing-library/react'
-import { renderWithProviders } from '../../test/helpers'
+import { renderWithProviders as renderUnderHost } from '../../test/helpers'
+import { AppIdentityProvider } from '../../app-sdk/identity'
+
+/**
+ * The page under its own app identity, the way `BuiltinAppRoute` mounts it.
+ *
+ * The page's queries are keyed through the host, which prefixes them with the
+ * appId it publishes on this context. Rendering bare leaves that context empty,
+ * the keys resolve unprefixed, and every assertion in this file would then be
+ * measuring a cache layout the product never has. Wrapping in the helper rather
+ * than at each call site means a test added later gets the identity too.
+ */
+function renderWithProviders(
+  ui: React.ReactElement,
+  options?: Parameters<typeof renderUnderHost>[1],
+) {
+  return renderUnderHost(
+    <AppIdentityProvider appId="aws-control" origin="builtin">
+      {ui}
+    </AppIdentityProvider>,
+    options,
+  )
+}
 
 // Controllable viewport switch: the shell branches on useIsNarrowViewport.
 // Mock BOTH exports — a partial mock leaves the sibling undefined (module's
@@ -11,6 +33,7 @@ vi.mock('../../hooks/useIsMobile', () => ({
   useIsMobile: () => narrowViewport,
 }))
 import { i18nT } from '../../i18n/t'
+import { namedCeiling } from '../../test/namedCeiling'
 import { fmtNumber, fmtBytes, fmtCurrency } from '../../i18n/format'
 import type {
   AwsAccountsResponse, AvailableProfilesResponse, DriveStatus, SharesResponse,
@@ -715,6 +738,19 @@ describe('DrivePaneGate', () => {
     expect(screen.queryByTestId('rail-meta')).toBeNull()
   })
 
+  it('the setup card names the region the drive status searched (#24913)', async () => {
+    vi.mocked(awsControlApi.drive).mockResolvedValue({ exists: false, searched_region: 'eu-central-1' })
+    atFiles()
+
+    // Chained: accounts resolve, then the drive query runs, then the setup card mounts.
+    const setup = await screen.findByTestId(
+      'capability-drive-setup', {}, namedCeiling('DRIVE_SETUP_READY', 5000),
+    )
+    expect(within(setup).getByTestId('drive-searched-region')).toHaveTextContent(
+      i18nT('apps.awsControl.console.setup_searched_region', { region: 'eu-central-1' }),
+    )
+  })
+
   it('the gate covers every drive pane, not just Files', async () => {
     vi.mocked(awsControlApi.drive).mockResolvedValue({ exists: false })
     atFiles()
@@ -1285,8 +1321,8 @@ describe('add accounts', () => {
     await waitFor(() => {
       expect(awsControlApi.registerProfiles).toHaveBeenCalledWith(['staging'])
     })
-    // Invalidating the ['aws-control','accounts'] key must trigger a refetch so
-    // the newly registered profile appears without a manual Refresh.
+    // Invalidating the accounts key must trigger a refetch so the newly
+    // registered profile appears without a manual Refresh.
     await waitFor(() => {
       expect(awsControlApi.accounts).toHaveBeenCalledTimes(2)
     })

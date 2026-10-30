@@ -9,9 +9,9 @@ tags: [skill, kirocrew, monitor, babysit]
 # Babysit
 
 General-purpose monitoring: this skill works without a Kiro Crew checkout or
-prepare-pr installed. It owns loop mechanics, not a repository's repair policy.
+kirocrew-prepare-pr installed. It owns loop mechanics, not a repository's repair policy.
 For Kiro Crew PR CI AI comments ONLY, MUST load
-[prepare-pr: Review repair routing](../prepare-pr/SKILL.md#review-repair-routing)
+[kirocrew-prepare-pr: Review repair routing](../kirocrew-prepare-pr/SKILL.md#review-repair-routing)
 before any fix. That procedure requires model-pinned repair subagents; parent
 self-fixing does not satisfy it. Prepare-pr owns that repo's local reviewers,
 PR gates, dispositions and publication rules. Do not require it for other work.
@@ -27,7 +27,8 @@ On Webex, use the finite legacy path even for a supported pull request.
 |---|---|
 | User is waiting, total work under 30 minutes | Bounded in-turn `wait` + poll |
 | One supported pull request, readiness decided by typed provider facts | `monitor_watch` |
-| Generic comments/advisory findings, or a required final report or notification | Finite `monitor_start` with `gate=false` |
+| PR comments/advisory findings | Finite `monitor_start`, `judge: false` |
+| A required final turn, or acting on silence | Finite `monitor_start`, `gate=false` |
 | Act on a schedule, multiple subjects, unsupported ticket or deployment | Finite `monitor_start` |
 | Fresh-session work needing no approval-bound tools | `cron_add` |
 | Post-merge cleanup after verified merge | Script cron, roughly every 5 minutes |
@@ -36,8 +37,17 @@ On Webex, use the finite legacy path even for a supported pull request.
 Never use an agent cron or `HEARTBEAT.md` to fix and push review findings. Cron
 has no owning chat slot's trust and can time out at tool approval while still
 recording `last_status: ok`; heartbeat's allowlist has no shell or push.
-The bundled `pr_watch.py` script remains for existing jobs only; do not copy or
-register it for new babysit work. Use one session-owned driver, not two watchers.
+For work that should run outside this session with fresh context, or where
+monitor tools are unavailable (cron and webhook sessions), append a checklist
+entry to `HEARTBEAT.md` with `kiro_crew.heartbeat.append_heartbeat_task(entry)`;
+never edit the file directly, because the helper shares the service's
+cross-process lock. Include `HEARTBEAT_KEEP` to keep a task for another cycle, and
+omit it when the task is complete.
+Use one session-owned driver, not two watchers.
+
+A gated `monitor_start` hands its whole pull-request reading, comment and review
+bodies included, to the wake judge, so `wake_when` may name prose. No
+judge lane: only an unchanged subject is free.
 
 An installation can set how firmly this table's facts-decided row points at the
 structured path. With `monitoring.prefer_structured_arming` on, `monitor_watch` is
@@ -45,9 +55,21 @@ this gateway's default for a supported pull request and the prompt loop is the
 exception; off (the default) the table reads as written. The setting changes what
 the two tool descriptions say and refuses neither tool, so the row that matters
 never moves: evidence the typed provider cannot see -- generic comments, advisory
-findings, a required final report -- is `monitor_start` with `gate=false` in
-either position. Read the descriptions you were given rather than assuming a
-position.
+findings, a required final report -- stays on `monitor_start` in either
+position. Read the descriptions you were given rather than assuming a position.
+
+### In-turn wait and poll
+
+For a user who is waiting and work that fits in about 30 minutes, stay in this
+turn rather than arming a loop:
+
+1. Make the change and publish it (push the revision, submit the review).
+2. `wait(seconds=300, reason="Waiting for <what> on <target>")`.
+3. Read the host state below; fix and publish again within your authorization, or
+   report done when it is clean.
+4. Stop with an open-findings report when three settled polls read the same
+   progress key with no push between them (the stall tripwire below), or the
+   30 minutes run out.
 
 ### Structured pull-request watch
 
@@ -71,13 +93,13 @@ monitor_watch(kind=<kind>, target=<full PR URL>, objective="review_ready",
               wake_instructions=<actions and exit>)
 ```
 
-Inspect the schema for positive `max_agent_turns`, `max_tokens` and
-`max_provider_errors` budgets. Ordinary unchanged/pending/retry/terminal probes
+Inspect the schema: positive `max_tokens`/`max_provider_errors`, and
+`max_agent_turns` where 0 = no wake cap. Ordinary unchanged/pending/retry/terminal probes
 spend no agent turn; a new actionable fingerprint wakes the owning session at
 most once with a bounded summary. Fetch logs, comments or diffs only when needed
 on that wake. The token cap applies only when usage is reported;
-`token_usage_known` exposes that gap, while runtime and completed-turn caps
-remain hard fallbacks. Provider errors are bounded too. GitLab uses installed
+`token_usage_known` exposes that gap; runtime always caps, turns only if
+set positive. Provider errors are bounded too. GitLab uses installed
 `glab` credentials, Azure DevOps uses `az login` or the protected
 `AZURE_DEVOPS_EXT_PAT`, and Bitbucket may use the protected `BITBUCKET_EMAIL`
 plus `BITBUCKET_API_TOKEN`. A setup or authentication refusal is authoritative;
@@ -91,12 +113,12 @@ Its retained session-bound state is authoritative.
 
 A terminal success uses zero model turns, so a structured watch does not create
 a final reporting turn. If the user requires a final report or notification even
-when no action is needed, use the finite legacy path.
+when no action is needed, use the finite legacy path with `gate=false`.
 
 Typed providers do not observe generic issue/pull-request comments or advisory
 review findings outside their canonical review and check facts. When readiness
-depends on those, call the finite legacy path directly with `gate=false`; a typed
-fingerprint cannot stand in for missing evidence.
+depends on those, call the finite legacy path directly; a typed fingerprint
+cannot stand in for missing evidence.
 
 Use `monitor_update` without an id for cadence, positive budgets or
 `wake_instructions`: these preserve the comparison baseline. Changing `target`
@@ -111,21 +133,21 @@ explicit restart action. Never erase that evidence or retry the refusal.
 
 ```text
 monitor_start({
-  "message": "Watch https://github.com/kirodotdev/KiroCrew/pull/123. On each injected cycle, inspect current review comments and checks. Act only on a real change. Kiro Crew AI repairs MUST follow prepare-pr Review repair routing with model-pinned subagents and parent verification; commit and push only if authorized. If ready, terminal, blocked, stopped by the user or out of budget, report the outcome and any open findings, then call autonudge_stop with a reason.",
+  "message": "Watch https://github.com/kirodotdev/KiroCrew/pull/123. On each injected cycle, inspect current review comments and checks. Act only on a real change. Kiro Crew AI repairs MUST follow kirocrew-prepare-pr Review repair routing with model-pinned subagents and parent verification; commit and push only if authorized. If ready, terminal, blocked, stopped by the user or out of budget, report the outcome and any open findings, then call autonudge_stop with a reason.",
   "interval_secs": 300,
-  "max_cycles": 24,
+  "max_cycles": 48,
   "max_runtime_secs": 14400,
-  "gate": false
+  "judge": false
 })
 ```
 
-Replace the example URL with the real target. Keep `gate: false`: provider-fact
-gating cannot observe generic comments or advisory findings and could suppress
-a cycle while that evidence waits. All three limits must be positive and finite;
-never use `0` for unlimited work. Every delivered legacy cycle is a full model
-turn even if nothing changed. Name the readiness conditions below by reference
-rather than copying their text into the message: a copy inside the instruction
-drifts from the list it duplicates while still reading as authoritative.
+Replace the example URL with the real target. Gated, an unchanged pull request
+costs no turn; a change to its reading, comments included, wakes it once. All
+three limits must be positive and finite; never use `0` for unlimited work.
+Every delivered cycle is a full model turn. Name the readiness conditions below
+by reference rather than copying their text into the message: a copy inside the
+instruction drifts from the list it duplicates while still reading as
+authoritative.
 Follow the execution steps below.
 
 ### Same-session timer
@@ -141,13 +163,17 @@ bound and no blanket grant: normal PreToolUse governance and approvals apply.
 A rejected or timed-out approval is a stall, not success or permission to loosen
 security. Fix, commit and push only within the user's authorization.
 
-- Naming exactly ONE public GitHub PR by full URL in `message` can select
-  observation gating; a bare number or owner/repo shorthand cannot.
+- Name ONE public GitHub PR by full URL in `message` to select gating. A
+  bare `PR <n>` gates only if this session already named its URL.
+- A conductor patrolling workers it dispatched on work-ledger items arms
+  `monitor_start` with `watch="work-ledger"`: a quiet cycle costs no turn, and a
+  worker's blocked, question or done report wakes it within seconds.
 - `gate=true` is the default. Quiet subjects avoid turns, with eventual delivery
-  after enough quiet intervals. Use `gate=false` for generic comments/advisory
-  scans and duties that act despite silence, such as chasing a missing reviewer
-  or tracking a moving base. `max_cycles` counts DELIVERED turns, including
-  quiet-floor deliveries and fallbacks, not just useful changes.
+  after enough quiet intervals. A merge or close ends a gated loop with a notice,
+  no turn. Use `gate=false` for a required final turn or for acting on silence,
+  such as chasing a missing reviewer or tracking a moving base. `max_cycles`
+  counts DELIVERED turns, including quiet-floor deliveries and fallbacks, not
+  just useful changes.
 - A short `banner` keeps a long instruction out of stored transcript rows while
   the model receives it whole. Dashboard only; channel loops refuse it with 400.
   `monitor_update(banner="")` clears it.
@@ -156,8 +182,8 @@ security. Fix, commit and push only within the user's authorization.
   `target`, `objective`, `max_agent_turns`, `max_tokens`, `max_provider_errors`
   or `wake_instructions`. On Webex, stop and create a new finite loop instead.
 - One automation occupies a session. `monitor_start` is create-only; update an
-  active loop rather than replacing it. A budget-paused legacy loop resumes only
-  by raising the bound it reached with user authorization. Manual pauses and user
+  active loop rather than replacing it. A new arm replaces a cap/budget-stopped
+  legacy loop, only with user authorization. Manual pauses and user
   stops stay preserved; retained evidence needs the owner action above. Do not
   rearm merged/closed work as if it still needed repairs.
 
@@ -166,7 +192,7 @@ security. Fix, commit and push only within the user's authorization.
 1. Write a self-contained instruction naming subject, allowed actions, success,
    blocker/stall conditions and stop tool. Include worktree/branch and whether
    pushes are authorized. Pass positive cycle and runtime bounds. For Kiro Crew
-   preparation use prepare-pr's budget; never raise its cap yourself.
+   preparation use kirocrew-prepare-pr's budget; never raise its cap yourself.
 2. Load the MCP tool by exact `tool_search` ID before calling it. Report only
    that monitoring was REQUESTED and END YOUR TURN immediately. Application
    happens when the turn's result is processed, not synchronously with the call.
@@ -213,8 +239,7 @@ is never droppable; that revives the verdict it superseded. Two
 rows of ONE run are not a retry and both stay, because a workflow can publish a check
 run under its own job's display name. Finally,
 any completed row of a replaced round still reads as live, not only a cancelled one.
-The bundled `pr_status.py` does NOT yet follow this rule and can drop a live failure;
-issue #11832 tracks it.
+The bundled `pr_status.py` applies this rule.
 
 Green checks do not answer review threads or advisory findings. Establish once
 per repo what its reviewer check means, and repeat when its fleet changes:
@@ -254,48 +279,8 @@ stop with the blocking review quoted.
 
 ### Optional GitHub helper
 
-If prepare-pr is installed, run its complete script bundle from the TARGET repo,
-not the skill directory. Resolve an absolute `SKILL_DIR` first from the active
-installation; never use an unresolved default expansion as a path argument.
-
-```bash
-python3 "$SKILL_DIR/scripts/pr_status.py" <pr#> --json --reviewers <known-lanes>
-python3 "$SKILL_DIR/scripts/pr_findings.py" <pr#>
-python3 "$SKILL_DIR/scripts/green_age.py" --pr <pr#>
-```
-
-Pin a known fleet with `--reviewers` / `PREPARE_PR_REVIEWERS`; discovery mode only
-checks stamps it finds and cannot detect an absent lane. Set the repo's aggregate
-via `--readiness-context` / `PREPARE_PR_READINESS_CONTEXT` where needed. The scripts
-require sibling `_review_contract.py`; missing scripts are not permission to
-pretend the helper ran. Use the host interfaces above for general monitoring.
-
-- `0`: checks clean, but still apply the readiness conditions below.
-- `10`: genuinely running. End the cycle silently, without rereading bot bodies,
-  logs or diffs; it neither counts nor resets the stall streak.
-- `20`: use findings and the reason before acting. Terminal PR state means stop;
-  stale reviewer stamps can mean a comment-triggered bot has not posted yet,
-  not a code defect. `?`/JSON `null` threads mean unknown, never zero.
-- `2`: environment error, escalate rather than loop on it.
-
-`green_age.py` answers the separate question of whether a clean rollup still
-describes today's base: `0` fresh, `30` the base moved in files this PR also
-touches since the commit this head's CI ran on (an authorized sync, per the
-conflict rule above), `2` could not measure — which is neither fresh nor stale.
-`pr_status.py --json` carries the same reading in `advisory.green_age`, so a
-cycle that already polled does not need a second call. Keep it out of the stall
-key: on a busy repository the base moves constantly, and a commit count in the
-key would reset the streak forever.
-
-`--json` appends a last-line object without changing the exit code. Compare ONLY
-`progress_key` for stalls. Its `advisory` fields include unresolved threads,
-findings, stale/blocking reviewers and `elided_stamp_reviewers`. Report an elided
-stamp once per head as a lane-quality note, not a new blocker; the script already
-checks whether that shortened stamp matches the current head.
-
-Always use the target checkout even for a full PR URL: thread lookup also uses
-cwd, so a foreign checkout can mix two repositories. An unreadable/discarded CI
-rollup is an environment blocker, not a bug count or a passing empty list.
+If kirocrew-prepare-pr is installed, its `pr_status.py`, `pr_findings.py` and `green_age.py` read this state for you. Read
+[references/github-helper.md](references/github-helper.md) before the first run: it covers where to run them, their exit codes and the `progress_key` the stall tripwire compares.
 
 ### Readiness and handoff
 
@@ -313,12 +298,19 @@ For comment-aware legacy monitoring, declare review-ready only when all hold:
   an identical tree, and only the re-run separates those.
 - No conflict, behind-base state, draft or changes-requested hold remains, and
   where the optional helper is installed, `green_age.py` is not reporting exit 30.
-- No current-head finding lacks a disposition. For Kiro Crew, use prepare-pr's
+- No current-head finding lacks a disposition. For Kiro Crew, use kirocrew-prepare-pr's
   disposition contract rather than inventing a second ledger format.
 
 Never stop silently with an unanswered finding. A blocker, budget or user stop
 requires an open-findings handoff, not a success claim. Structured success proves
 only the provider facts above; it does not satisfy this comment-aware contract.
+
+## Durable work state
+
+Record the workstream's goal, phase and concrete `next` with
+`session_ledger_record`, and resume with `session_ledger_read`. Its `[work ledger]`
+snapshot is re-injected after a compaction and into each cycle, and it outranks
+your recollection of earlier cycles. The stall key below is a separate file.
 
 ## Stall tripwire
 

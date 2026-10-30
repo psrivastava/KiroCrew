@@ -1,6 +1,6 @@
 ---
 name: theme-pack-authoring
-description: Build, validate, and install Kiro Crew theme packs -- pack anatomy, the 56-variable palette, role-tagged fonts, the overrides.css allowlist (what installs vs what actually renders), and the install-verify cycle. Use when the user wants to create or edit a theme pack.
+description: Build, validate, and install Kiro Crew theme packs -- pack anatomy, the 60-variable palette, role-tagged fonts, the overrides.css allowlist (what installs vs what actually renders), and the install-verify cycle. Use when the user wants to create or edit a theme pack.
 triggers: theme pack, custom theme, theme.json, variables.json, overrides.css, install theme, theme font, dashboard theme, build a theme
 ---
 
@@ -16,7 +16,7 @@ real debugging time.
 ```
 my-theme/
 ├── theme.json          # manifest: slug, name, emoji, level, formatVersion, fonts[]
-├── variables.json      # dark + light palettes (56 allowlisted CSS vars)
+├── variables.json      # dark + light palettes (60 allowlisted CSS vars)
 ├── readme.md           # optional; attribution and notes
 ├── styles/
 │   ├── overrides.css   # optional; scoped structural CSS (see allowlist below)
@@ -51,7 +51,12 @@ a level-0 pack shipping a font is refused.
 from: `cloud`, `flower`, `heart`, `moon`, `sparkles`, `star`, `sun`, `zap`.
 Kiro Crew maps these names to bundled Lucide symbols and keeps the stock
 cross-fading carousel; packs cannot inject loader code or SVG through this field.
-Omit it to retain the default Kiro ghost poses.
+To ship your own loader art instead, put 1–8 `.png`/`.webp`/`.gif`/`.svg` files
+in `loader/` (Level 1): one renders alone, 2–8 are cycled, and they win over
+`loaderIcons`. With neither, the default Kiro ghost poses remain. Animated art
+(WebP/APNG/GIF, or SVG with its own animation) plays as authored, except under
+reduced motion: there Kiro Crew shows each image's first frame, held still, so
+make the first frame read as the loader at rest.
 
 ## Fonts — the role system (the ONLY supported route)
 
@@ -69,7 +74,9 @@ Omit it to retain the default Kiro ghost poses.
   `--theme-font-*` tokens, or `font`/`font-family` on `body`/`html`/`*`/`:root`
   are rejected at install and dropped at runtime (CSS-escape evasions included).
   A `font-family` on ONE allowlisted surface (e.g. `.topbar`) is fine.
-- Ship the font's license file in the pack source (OFL/Apache/MIT).
+- Ship the font's license as the pack's top-level `LICENSE`, `LICENSE.md` or
+  `LICENSE.txt` (OFL/Apache/MIT text). Any other name or location (`OFL.txt`,
+  `styles/fonts/OFL.txt`) is an unrecognized file and fails the install.
 - Only `"sans"` and `"mono"` are valid; a wrong role *string* (e.g. the CSS
   keyword `"monospace"`) is **rejected at install** with an error naming the
   font and the bad value. An already-installed pack whose role predates this
@@ -78,14 +85,15 @@ Omit it to retain the default Kiro ghost poses.
 
 ## variables.json — the palette
 
-Two blocks, `dark` and `light`, each holding up to **56 allowlisted variables**.
+Two blocks, `dark` and `light`, each holding up to **60 allowlisted variables**.
 Required minimum per block: `--bg`, `--text`, `--accent`. Unknown keys are
 REJECTED (install fails), so do not invent variables; the allowlist is
 `_THEME_CSS_VARS` in `kiro_crew/dashboard/theme_validate.py`.
 
 - To clone a built-in theme's palette, transcribe its block from
-  `website/src/index.css` (e.g. `[data-theme="kiro-dark"]`), keeping only
-  allowlisted vars.
+  `website/src/styles/theme-palettes.css` (e.g. `[data-theme="kiro-dark"]`;
+  the default `dark` / `light` blocks are in
+  `website/src/styles/design-tokens.css`), keeping only allowlisted vars.
 - `--accent-fg` and the four `--json-*` highlight colors (`--json-key`,
   `--json-str`, `--json-num`, `--json-bool`) are allowlisted — set them directly
   in `variables.json` like any other palette entry. No overrides.css workaround
@@ -93,12 +101,16 @@ REJECTED (install fails), so do not invent variables; the allowlist is
 - Two terminal hues (`--term-magenta`, `--term-cyan`) and the seven `--diff-*`
   vars are allowlisted too. The other fourteen terminal colors are derived from
   `--bg` / `--text` / `--danger` / `--ok` / `--warn` / `--info`, so a pack that
-  wants its own terminal palette sets only those two.
+  wants its own terminal palette sets only those two. To colour the terminal
+  surface itself independently of the agent chat, set `--term-bg`, `--term-fg`,
+  `--term-cursor` and `--term-selection`; each falls back to `--bg`, `--text`,
+  `--accent` and `--accent-subtle` respectively, so a pack that omits them keeps
+  today's terminal colors.
 
 ### Omitted tokens are derived from your palette
 
 You only have to declare the three required vars, so most packs omit most of the
-56. Those omissions are **derived from your own `--bg` / `--text` / `--accent`**
+60. Those omissions are **derived from your own `--bg` / `--text` / `--accent`**
 by `buildCustomThemeCss` (`website/src/hooks/themeCss.ts`) — they are not
 inherited from a built-in theme:
 
@@ -142,7 +154,8 @@ Two different filters run, and they disagree by design:
 
 - **Install** = denylist. Refuses known-bad: `@import`, external `url()`,
   `expression()`, font pins, `display:none`, viewport-covering `position:fixed`,
-  `z-index` > 9999, selectors touching `iframe`/`script`/`.token`/`[data-auth]`.
+  `z-index` > 9999, `pointer-events:none` on a non-decorative selector,
+  selectors touching `iframe`/`script`/`.token`/`[data-auth]`.
 - **Runtime** = allowlist, the real boundary. Only rules targeting these
   surfaces survive; EVERYTHING else is silently dropped at apply time:
   `body` (and `body::before/::after`), `button.primary`, `.topbar`, `.sidebar`,
@@ -172,14 +185,16 @@ not against the count of 6.
 
 Beyond `theme.json`, `variables.json`, `readme.md`, `styles/` and `LICENSE.txt`,
 the classifier also recognizes `branding/logo.{svg,png}`,
-`branding/favicon.{ico,png,svg}`, `branding/wordmark.{svg,png}` and
-`branding/preview.{png,webp}` at level 1, and `persona.md`, `overlays/*.html`,
+`branding/favicon.{ico,png,svg}`, `branding/wordmark.{svg,png}`,
+`branding/welcome.{svg,png,webp,gif}` and
+`branding/preview.{png,webp}` and `loader/*.{png,webp,gif,svg}` (max 8) at
+level 1, and `persona.md`, `overlays/*.html`,
 `topbar/{dark,light}.html`, `audio/manifest.json` and `audio/*.{mp3,ogg,wav}` at
 level 2. `styles/variables.json` is accepted as an alternative to the top-level
 file. Every path is classified against that fixed table, so an unrecognized file
 fails the install — do not park notes or scratch files in the pack (only VCS and
 LICENSE metadata is tolerated). Level-2 caps: at most 5 overlays, 2000 characters
-of `persona.md`, 48 characters of bot name.
+of `persona.md`. A `branding.botName` (Level 1) is truncated to 48 characters.
 
 ## Validate and install
 

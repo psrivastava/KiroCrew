@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+from named_cases_helpers import named_cases
 
 from kiro_crew.validation import (
     ARTIFACT_SAVE_SCHEMA,
@@ -17,6 +18,7 @@ from kiro_crew.validation import (
     SPAWN_RUN_SCHEMA,
     TASK_RUN_SCHEMA,
     FieldSpec,
+    JsonRpcEnvelopeError,
     McpTextContent,
     ValidationError,
     build_tool_response,
@@ -167,6 +169,49 @@ class TestSanitizeString:
         # Beside real script they survive.
         assert sanitize_string("\u0645\u200c\u062e") == "\u0645\u200c\u062e"
 
+    def test_composes_across_stripped_format_char(self):
+        assert sanitize_string("cafe\u00ad\u0301") == "caf\u00e9"
+
+    @pytest.mark.parametrize("hidden", ["\u00ad", "\ufeff", "\u200b", "\u202e"])
+    @pytest.mark.parametrize(
+        "base,mark",
+        [("e", "\u0301"), ("a", "\u0308"), ("n", "\u0303"), ("c", "\u0327")],
+    )
+    def test_idempotent_with_hidden_char_before_combining_mark(self, hidden, base, mark):
+        once = sanitize_string(f"x{base}{hidden}{mark}y")
+        assert sanitize_string(once) == once
+        assert once == normalize_unicode(f"x{base}{mark}y")
+
+    @pytest.mark.parametrize("ascii_after_nfc", ["\u212a", "\u037e", "\u1fef"])
+    def test_shaping_mark_dropped_when_nfc_makes_neighbour_ascii(self, ascii_after_nfc):
+        once = sanitize_string(f"AKIA{ascii_after_nfc}\u200dIOSFODNN7EXAMPLE")
+        assert "\u200d" not in once
+        assert sanitize_string(once) == once
+
+    @pytest.mark.parametrize("raw", ["x\u200d\u00a0", "\u00a0\u200dAKIA", "AKIA\u200d\u3000"])
+    def test_shaping_mark_dropped_when_edge_trim_leaves_ascii_neighbour(self, raw):
+        once = sanitize_string(raw)
+        assert "\u200d" not in once
+        assert sanitize_string(once) == once
+
+    def test_shaping_mark_kept_beside_non_ascii_edge(self):
+        assert sanitize_string("\u0645\u200c \u00a0") == "\u0645\u200c"
+        assert sanitize_string("\u3000\u200d\U0001f468") == "\u200d\U0001f468"
+
+    def test_edge_runs_need_one_strip_pass(self, monkeypatch):
+        import kiro_crew.validation as validation
+
+        calls = []
+        real = validation.strip_hidden_unicode
+
+        def counting(text):
+            calls.append(len(text))
+            return real(text)
+
+        monkeypatch.setattr(validation, "strip_hidden_unicode", counting)
+        assert sanitize_string("a" + " \u200d\u00a0" * 2000) == "a"
+        assert len(calls) == 1
+
 
 class TestSanitizeJsonValues:
     def test_strips_hidden_chars_from_nested_values_and_keys(self):
@@ -221,8 +266,17 @@ class TestValidateField:
         assert validate_field(None, FieldSpec("x", str, default="hi")) == "hi"
 
     def test_wrong_type(self):
+        # validate_field keeps its original contract: a number on a string
+        # field is a plain type error. The int->str repair for a re-typed
+        # numeric-looking string lives ONLY at the MCP tool-call entry points
+        # (see test_validation_numeric_string_coercion.py), not here, so the
+        # dashboard HTTP endpoints that go through this function are unchanged.
         with pytest.raises(ValidationError, match="expected str"):
             validate_field(123, FieldSpec("x", str))
+        with pytest.raises(ValidationError, match="expected str"):
+            validate_field(["a"], FieldSpec("x", str))
+        with pytest.raises(ValidationError, match="expected str"):
+            validate_field({"a": 1}, FieldSpec("x", str))
 
     def test_string_max_len(self):
         with pytest.raises(ValidationError, match="max length"):
@@ -482,9 +536,23 @@ class TestValidateJsonrpcRequest:
         with pytest.raises(ValidationError, match="must be a string"):
             validate_jsonrpc_request({"method": 123})
 
-    def test_non_dict_params_defaults(self):
-        _, _, params = validate_jsonrpc_request({"method": "x", "params": "bad"})
-        assert params == {}
+    def test_absent_or_null_params_read_as_empty(self):
+        assert validate_jsonrpc_request({"method": "x"})[2] == {}
+        assert validate_jsonrpc_request({"method": "x", "params": None})[2] == {}
+
+    @pytest.mark.parametrize("params", ["bad", [1], 5, True])
+    def test_non_object_params_are_refused_with_the_id_to_answer(self, params):
+        """Read as ``{}``, a ``tools/call`` with list params was served as a
+        call that named no tool; the refusal carries the id it is owed to."""
+        with pytest.raises(JsonRpcEnvelopeError) as excinfo:
+            validate_jsonrpc_request({"id": 4, "method": "tools/call", "params": params})
+        assert (excinfo.value.req_id, excinfo.value.method) == (4, "tools/call")
+        assert excinfo.value.invalid_params is True
+
+    def test_a_malformed_envelope_carries_its_id(self):
+        with pytest.raises(JsonRpcEnvelopeError) as excinfo:
+            validate_jsonrpc_request({"id": 5, "method": 123})
+        assert excinfo.value.req_id == 5 and excinfo.value.invalid_params is False
 
 
 # ── Response Schema ──
@@ -684,8 +752,13 @@ class TestSetProjectSchema:
             validate_tool_args({"path": "relative/path"}, SET_PROJECT_SCHEMA)
 
     def test_non_string_rejected(self):
+        # validate_tool_args does not coerce (coercion is applied only at the
+        # MCP entry point before this call), so a non-string path is a plain
+        # type error here, exactly as before.
         with pytest.raises(ValidationError, match="expected str"):
             validate_tool_args({"path": 42}, SET_PROJECT_SCHEMA)
+        with pytest.raises(ValidationError, match="expected str"):
+            validate_tool_args({"path": ["/abs/path"]}, SET_PROJECT_SCHEMA)
 
     def test_oversized_rejected(self):
         too_long = "/" + "a" * 4096
@@ -1112,64 +1185,59 @@ class TestFilePathShape:
     @pytest.mark.parametrize(
         "path",
         [
-            "/home/user/project/notes.md",
-            "~/project/notes.md",
-            "/tmp/a file with spaces.md",
+            *named_cases(
+                "test_accepts_posix_absolute",
+                "path",
+                [
+                    "/home/user/project/notes.md",
+                    "~/project/notes.md",
+                    "/tmp/a file with spaces.md",
+                ],
+            ),
+            *named_cases(
+                "test_accepts_urlreserved_and_punctuation",
+                "path",
+                [
+                    # Parentheses: the "Name (alias).md" convention a whole notes folder
+                    # can be built on, so one refused character 400s every file in it.
+                    "/home/user/notes/One on one/Ada Lovelace (ada).md",
+                    "/home/user/Desktop/AI Projects/(AI) Fluency Workshop/agenda.md",
+                    # Spaces and parentheses together, plus the URL-reserved characters
+                    # the client percent-encodes and the server therefore sees literally.
+                    "/home/user/notes/Q1 2026 (draft) #2.md",
+                    "/home/user/notes/is it done?.md",
+                    "/home/user/notes/a & b, c'd.md",
+                    "/home/user/notes/50% done [final]+1.md",
+                    r"C:\Users\me\One on one\Ada Lovelace (ada) #2.md",
+                    # Non-BMP: an emoji in a name is legal and carries no hazard.
+                    "/home/user/notes/ship \U0001f680.md",
+                ],
+            ),
+            *named_cases(
+                "test_accepts_shell_metacharacters",
+                "path",
+                [
+                    "/tmp/$evil",
+                    "/tmp/a;rm -rf b",
+                    "/tmp/a|b",
+                    "/tmp/a`b`",
+                    "/tmp/a*b?",
+                ],
+            ),
+            *named_cases(
+                "test_accepts_windows_absolute",
+                "path",
+                [
+                    r"C:\Users\me\workspace\notes.md",
+                    "C:/Users/me/workspace/notes.md",
+                    r"c:\lower\drive\letter.md",
+                    r"\\host\share\notes.md",
+                    r"C:\Users\me\a file with spaces.md",
+                ],
+            ),
         ],
     )
-    def test_accepts_posix_absolute(self, path):
-        assert self._accepts(path)
-
-    @pytest.mark.parametrize(
-        "path",
-        [
-            # Parentheses: the "Name (alias).md" convention a whole notes folder
-            # can be built on, so one refused character 400s every file in it.
-            "/home/user/notes/One on one/Ada Lovelace (ada).md",
-            "/home/user/Desktop/AI Projects/(AI) Fluency Workshop/agenda.md",
-            # Spaces and parentheses together, plus the URL-reserved characters
-            # the client percent-encodes and the server therefore sees literally.
-            "/home/user/notes/Q1 2026 (draft) #2.md",
-            "/home/user/notes/is it done?.md",
-            "/home/user/notes/a & b, c'd.md",
-            "/home/user/notes/50% done [final]+1.md",
-            r"C:\Users\me\One on one\Ada Lovelace (ada) #2.md",
-            # Non-BMP: an emoji in a name is legal and carries no hazard.
-            "/home/user/notes/ship \U0001f680.md",
-        ],
-    )
-    def test_accepts_urlreserved_and_punctuation(self, path):
-        assert self._accepts(path)
-
-    @pytest.mark.parametrize(
-        "path",
-        [
-            "/tmp/$evil",
-            "/tmp/a;rm -rf b",
-            "/tmp/a|b",
-            "/tmp/a`b`",
-            "/tmp/a*b?",
-        ],
-    )
-    def test_accepts_shell_metacharacters(self, path):
-        # A shell metacharacter is an ordinary filename character here: every
-        # subprocess in the file handlers is exec-form argv with no shell, and
-        # the security boundary is hooks.validate_file_path's realpath +
-        # is_sensitive_path below this gate. Refusing them bought nothing and
-        # cost legal files, so the refusal is not reinstated.
-        assert self._accepts(path)
-
-    @pytest.mark.parametrize(
-        "path",
-        [
-            r"C:\Users\me\workspace\notes.md",
-            "C:/Users/me/workspace/notes.md",
-            r"c:\lower\drive\letter.md",
-            r"\\host\share\notes.md",
-            r"C:\Users\me\a file with spaces.md",
-        ],
-    )
-    def test_accepts_windows_absolute(self, path):
+    def test_accepts_a_file_path_shape(self, path):
         assert self._accepts(path)
 
     @pytest.mark.parametrize(

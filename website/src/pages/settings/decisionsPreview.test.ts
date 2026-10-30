@@ -37,6 +37,8 @@ const OFF = {
   compaction: false,
   // And the recalled-memory scope.
   memoryText: false,
+  // And the wake-evidence scope.
+  nudgeEvidence: false,
   // And the prior-conversation ceiling reads 0, which is the least that can leave.
   historyBudget: 0,
 }
@@ -62,6 +64,9 @@ describe('readConsent', () => {
         compaction: false,
         // Nor to send the text of recalled memories.
         memoryText: false,
+        // Nor the evidence a waiting loop is watching, which comes from OTHER
+        // sessions and so is not covered by any yes about this one.
+        nudgeEvidence: false,
         // Nor does it consent to prior turns: an unmentioned ceiling is 0.
         historyBudget: 0,
       })
@@ -80,9 +85,17 @@ describe('readConsent', () => {
     // Independent fields: one granted must not read as the other.
     expect(readConsent({ ...base, tool_args: true }).memoryText).toBe(false)
     expect(readConsent({ ...base, memory_text: true }).toolArgs).toBe(false)
+    // The wake-evidence scope reads on the same terms, and is independent of every
+    // scope beside it: its rows come from sessions the loop WATCHES, so a yes about
+    // the owner's own conversation cannot stand for it.
+    expect(readConsent({ ...base, nudge_evidence: true }).nudgeEvidence).toBe(true)
+    expect(readConsent({ ...base, nudge_evidence: true }).compaction).toBe(false)
+    expect(readConsent({ ...base, compaction: true }).nudgeEvidence).toBe(false)
+    expect(readConsent({ ...base, tool_args: true }).nudgeEvidence).toBe(false)
     for (const sloppy of [undefined, false, 'true', 1, 0, null, [], {}]) {
       expect(readConsent({ ...base, tool_args: sloppy }).toolArgs).toBe(false)
       expect(readConsent({ ...base, memory_text: sloppy }).memoryText).toBe(false)
+      expect(readConsent({ ...base, nudge_evidence: sloppy }).nudgeEvidence).toBe(false)
     }
   })
 
@@ -146,6 +159,7 @@ describe('readDecisions', () => {
         toolArgs: false,
         compaction: false,
         memoryText: false,
+        nudgeEvidence: false,
         // Absent from this payload, so the ceiling reads as 0 — the shipped
         // default, and the least that can leave the machine.
         historyBudget: 0,
@@ -247,6 +261,9 @@ describe('the Decisions toggle has no configKey', () => {
  * for. The two rejections are the ones that would otherwise put a row on screen that
  * cannot be acted on: a row with no id has nothing to label and no panel to open, and
  * a status this build cannot read must not be allowed to claim a point is running.
+ *
+ * The lane rides along for the same reason: on the one point with two lanes, only the
+ * gateway knows which one would answer, so the reader carries the word it sent.
  */
 describe('readPoints', () => {
   it('reads the rows the gateway sent, in its order, id and all', () => {
@@ -259,15 +276,22 @@ describe('readPoints', () => {
         ],
       }),
     ).toEqual([
-      { id: 'skills.select', needsScope: null, status: 'active' },
-      { id: 'tool.risk', needsScope: 'tool_args', status: 'needs_scope' },
+      { id: 'skills.select', lane: null, needsScope: null, status: 'active' },
+      { id: 'tool.risk', lane: null, needsScope: 'tool_args', status: 'needs_scope' },
+    ])
+  })
+
+  it('carries the lane the gateway named, so the chip never re-derives it', () => {
+    const rows = readPoints({ points: [{ id: 'nudge.wake', status: 'active', lane: 'llm' }] })
+    expect(rows).toEqual([
+      { id: 'nudge.wake', lane: 'llm', needsScope: null, status: 'active' },
     ])
   })
 
   it('keeps a point this build has no label for, so a new one is never hidden', () => {
     const rows = readPoints({ points: [{ id: 'invented.point', status: 'active' }] })
     expect(rows).toEqual([
-      { id: 'invented.point', needsScope: null, status: 'active' },
+      { id: 'invented.point', lane: null, needsScope: null, status: 'active' },
     ])
   })
 
@@ -285,7 +309,7 @@ describe('readPoints', () => {
     // verbatim: the chip resolves it to OFF, and rewriting it here would lose the word
     // a reader greps the log for.
     expect(rows).toEqual([
-      { id: 'a.b', needsScope: null, status: 'invented' },
+      { id: 'a.b', lane: null, needsScope: null, status: 'invented' },
     ])
   })
 })

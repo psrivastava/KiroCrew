@@ -22,7 +22,8 @@ The fingerprint is derived from the package tree itself, in this order:
    under the package, mixed with the installed distribution version. A wheel
    install is immutable until it is replaced, and replacing it moves the mtimes.
 
-The value is opaque; the only contract is *equal iff the same code*. It is
+The value is opaque; the only contract is *equal iff the same code*, plus
+:func:`same_scheme`, which says whether two values came from the same rule. It is
 computed once per process and cached. The computation runs a ``git``
 subprocess or walks the package tree, so an async caller warms the cache with
 :func:`warm_code_fingerprint` (``asyncio.to_thread``) before the first
@@ -50,21 +51,40 @@ _PACKAGE_ROOT = Path(__file__).resolve().parent
 _MAX_FILES_WALKED = 20_000
 
 
-def _git_env() -> dict[str, str]:
-    """An environment in which git reads no configuration anyone could plant.
+def hardened_git_env(**pins: str) -> dict[str, str]:
+    """An environment in which git executes no program anyone could plant.
 
     This runs in the GATEWAY process, outside the sandbox, on a tree an agent
-    can write to. A ``diff.external`` / ``core.pager`` / hook in a repo,
-    global or system config, or a ``GIT_*`` variable in the inherited
-    environment, would have git run whatever it names with the gateway's
-    privileges. Repo-level config cannot be disabled by environment, so the
-    argv also pins the two settings a diff can execute (``--no-ext-diff``,
-    ``--no-textconv``) and the pager.
+    can write to. A ``diff.external`` / ``core.pager`` / ``core.fsmonitor`` /
+    hook in a repo, global or system config, or a ``GIT_*`` variable in the
+    inherited environment, would have git run whatever it names with the
+    gateway's privileges. Global and system config are switched off; the
+    repository's own config cannot be, so every fixed-name exec key in it is
+    pinned through ``GIT_CONFIG_*`` (``update_governance.git_neutralizer_env``),
+    and the argv pins the two settings a diff can execute (``--no-ext-diff``,
+    ``--no-textconv``). A repo-NAMED driver (``filter.<name>.clean``) has no
+    key to pin: a caller whose command can reach one refuses first with
+    ``update_governance.repo_exec_driver_reason``.
+
+    Shared by every gateway-side git probe (the cloud launcher's release-tag
+    probe reuses it) so the recipe lives once; ``pins`` adds a caller's own
+    ``GIT_*`` variables on top (a ``GIT_CEILING_DIRECTORIES`` bound, say).
     """
+    # Imported here, not at module top: the update seam imports far more than a
+    # startup fingerprint should pay for, and nothing else in this module needs it.
+    from kiro_crew.platform.update_governance import git_neutralizer_env
+
     env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
     env["GIT_CONFIG_GLOBAL"] = os.devnull
     env["GIT_CONFIG_NOSYSTEM"] = "1"
     env["GIT_TERMINAL_PROMPT"] = "0"
+    # The two lines above silence global and system config only. The REPO's own
+    # `.git/config` is still read, and a `core.fsmonitor` or `core.hooksPath`
+    # there is executed by the `git diff HEAD` below (measured on git 2.47:
+    # both ran). `GIT_CONFIG_*` outranks repo config, so the shared pins close
+    # every fixed-name exec key; repo-NAMED drivers are refused by the caller.
+    env.update(git_neutralizer_env())
+    env.update(pins)
     return env
 
 
@@ -77,7 +97,7 @@ def _git_fingerprint(root: Path) -> str | None:
     git = trusted_git_bin()
     if git is None:
         return None
-    env = _git_env()
+    env = hardened_git_env()
     try:
         head = subprocess.run(
             [git, "-C", str(root), "-c", "core.pager=cat", "rev-parse", "HEAD"],
@@ -90,6 +110,14 @@ def _git_fingerprint(root: Path) -> str | None:
         if head.returncode != 0 or not head.stdout.strip():
             return None
         sha = head.stdout.strip()
+        # The worktree diff below runs a repo-named `filter.<name>.clean` on
+        # every stat-dirty file, and no environment pin reaches a name the
+        # repository chose. Such a tree gets no git fingerprint; the mtime rule
+        # answers instead, which is the same fallback as "no trusted git".
+        from kiro_crew.platform.update_governance import repo_exec_driver_reason
+
+        if repo_exec_driver_reason(str(root)):
+            return None
         # Tracked-file changes only; an untracked scratch file is not code
         # the process runs differently for. The diff TEXT is digested, not
         # just its presence: two different uncommitted states of one HEAD
@@ -155,6 +183,16 @@ def _mtime_fingerprint(root: Path) -> str:
             break
     digest = hashlib.sha256(f"{dist}|{newest}".encode("utf-8")).hexdigest()[:24]
     return f"mtime:{digest}"
+
+
+def same_scheme(a: str, b: str) -> bool:
+    """Whether *a* and *b* were both made by the git rule or both by the mtime rule.
+
+    A source checkout answers with the git rule and a wheel or app build with
+    the mtime rule, so values from different rules name different installs.
+    They are never equal, and that says nothing about either one being stale.
+    """
+    return a.startswith("mtime:") == b.startswith("mtime:")
 
 
 @functools.lru_cache(maxsize=1)

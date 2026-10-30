@@ -1,4 +1,8 @@
-"""Running an app's own lifecycle scripts (``onEnable`` / ``onDisable`` / ``onUpdate`` / ``onUninstall``).
+"""Running an app's own lifecycle scripts (``onEnable`` / ``onDisable`` / ``onUninstall``).
+
+``setup.onInstall`` is run by the install transaction in ``registry_pipeline/install.py``,
+not here, and ``setup.onUpdate`` is declared but dispatched by nothing (see the
+declared-not-wired paragraph in ``docs/system-specs/modules/app-kit-platform.md``).
 
 Extracted out of ``apps/routes.py`` so that ``apps/teardown.py`` can run
 ``setup.onDisable`` as part of the ONE shared teardown. ``routes.py`` imports
@@ -26,7 +30,7 @@ from typing import Any
 from kiro_crew import platform_compat
 from kiro_crew.apps.execution import app_execution_denied
 from kiro_crew.apps.manager import apps_dir
-from kiro_crew.apps.registry import minimal_env
+from kiro_crew.apps.registry import NATIVE_WINDOWS_HOOK_REFUSAL, minimal_env
 from kiro_crew.sandbox import (
     cgroup_scope_argv,
     create_subprocess_limited,
@@ -51,7 +55,7 @@ async def run_lifecycle_script(
     extra_env: dict[str, str] | None = None,
     action: str = "lifecycle_script",
 ) -> dict[str, Any]:
-    """Run a lifecycle script (onEnable/onDisable/onUpdate/onUninstall) in the app directory.
+    """Run a lifecycle script (onEnable/onDisable/onUninstall) in the app directory.
 
     Returns dict with ``output`` (str) and ``failed`` (bool).
     """
@@ -68,6 +72,27 @@ async def run_lifecycle_script(
 
     if not app_root.is_dir():
         return {"output": f"app directory not found: {app_root}", "failed": True}
+
+    # Native-Windows policy: these lifecycle hooks are a POSIX-only capability.
+    # ``run_lifecycle_script`` runs ``onEnable`` / ``onDisable`` / ``onUninstall``
+    # through ``/bin/bash -c`` (``set -euo pipefail`` prepended), and native
+    # Windows has no ``/bin/bash``. Refuse before any spawn with a clear reason —
+    # the same shape as ``backend.py`` refusing an exec (shell launcher) backend
+    # on native Windows — rather than letting the spawn fail opaquely and read as
+    # the app's own script breaking. The reason reaches the user through the
+    # enable response's existing ``script_output`` field; the enable route's
+    # rollback rule is unchanged. (``onInstall`` runs in the install transaction
+    # in ``registry_pipeline/install.py``, a separate spawn site that applies the
+    # same refusal through ``_install_script_platform_refusal``.) On Linux and
+    # macOS nothing changes.
+    if script and not platform_compat.IS_POSIX:
+        logger.warning(
+            "App %s lifecycle action %s not run: lifecycle hooks are not "
+            "supported on native Windows",
+            app_name,
+            action,
+        )
+        return {"output": NATIVE_WINDOWS_HOOK_REFUSAL, "failed": True}
 
     safe_script = f"set -euo pipefail\n{script}"
     base_cmd = ["/bin/bash", "-c", safe_script]

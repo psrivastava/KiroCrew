@@ -2,10 +2,28 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from collections.abc import Sequence
 
+from kiro_crew import context_omissions, injection_receipts
+from kiro_crew._sqlite_compat import is_cjk_char, script_runs
 from kiro_crew.model_registry import MODEL_ID_LITERAL_PATTERN
+
+
+def utf8_encodable(value: str) -> bool:
+    """False for a string holding a lone surrogate (JSON-legal, UTF-8-illegal).
+
+    ``json.loads`` accepts a ``\\udXXX`` escape as a lone surrogate, but
+    ``str.encode()`` refuses it, so such a value crashes any path that hashes or
+    stores it as bytes. Callers screen it out before that point.
+    """
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
 
 _MODEL_ID_TOKEN_RE = rf"{MODEL_ID_LITERAL_PATTERN}" r"(?:\w|[.-](?=\w))*" r"(?!\w|[.-](?=\w))"
 _MODEL_CLAUSE_END_RE = (
@@ -88,6 +106,24 @@ LESSON_APPLIES_UNSTATED = "unstated"
 
 LESSON_APPLIES_VALUES = (LESSON_APPLIES_ALWAYS, LESSON_APPLIES_ON_TOPIC)
 
+#: The one instruction every model-facing write surface gives for choosing the
+#: tier: the ``learn_add`` schema description and the consolidation extraction
+#: prompt both read it from here, so the two writers ask the same question by
+#: construction rather than by review. Kept as prose the model reads verbatim.
+LESSON_APPLIES_INSTRUCTION = (
+    "Which startup tier this correction belongs to. YOU decide it from what the "
+    "user actually said, because nothing else can: 'always' is a standing rule "
+    "the user wants followed in every session regardless of topic (a permission, "
+    "a safety constraint, a style or workflow requirement); 'on_topic' is a past "
+    "finding worth having only when the task touches it (a troubleshooting "
+    "conclusion, a project detail, how one bug turned out). Standing rules share "
+    "a small startup budget, so filing a finding as 'always' spends room a real "
+    "rule needs, and filing a rule as 'on_topic' means it stops arriving unless "
+    "the task mentions it. Do not pick by wording: 'always' appears in both "
+    "kinds. Omit the field when you genuinely cannot tell -- the row is then "
+    "treated as a standing rule."
+)
+
 #: Why a JSONL lesson write was refused when the store is full rather than
 #: because of the value's content. The JSONL store answers both cases with the
 #: bare ``refused`` outcome it shares with :class:`LessonWriteOutcome`, so a route
@@ -150,6 +186,28 @@ def authored_lesson_applies(tier: object) -> str | None:
     return normalized if normalized in LESSON_APPLIES_VALUES else None
 
 
+def extracted_lesson_applies(tier: object, logger: logging.Logger) -> str | None:
+    """The tier a MODEL-extracted lesson stated, or ``None`` for unstated.
+
+    The write-side policy for a value the model, not a caller, authored -- shared
+    by every consolidation write path so it cannot drift between them. It runs
+    ``normalize_lesson_applies`` so a present-but-unrecognized value is still
+    audible (logged at warning), but it does not let that raise drop the lesson:
+    losing a correction the user actually made over a one-word slip costs more
+    than serving it as a standing rule, and unstated is the direction whose
+    mistake costs least. Only the closed-set reason is logged, never the
+    untrusted value.
+    """
+    try:
+        return normalize_lesson_applies(tier)
+    except ValueError:
+        logger.warning(
+            "Consolidation lesson names an unrecognized applies tier; "
+            "storing the lesson unstated"
+        )
+        return None
+
+
 def tighter_lesson_budget(*budgets: int) -> int:
     """The smallest positive budget among *budgets*; ``0`` when all are unbounded.
 
@@ -164,18 +222,55 @@ def tighter_lesson_budget(*budgets: int) -> int:
 _RELEVANCE_MIN_TOKEN = 3
 
 
+def split_cjk_word(word: str) -> tuple[list[str], set[str]]:
+    """Split *word* into its non-CJK pieces and the pairs of its CJK runs.
+
+    Chinese and Japanese are written without spaces, so a word-character split
+    keeps a whole sentence -- or a mixed run such as ``检查redis缓存`` -- as ONE
+    token that no other text shares. Each CJK run (the character set
+    ``script_runs`` shares with session search; Hangul is spaced and excluded)
+    instead yields its adjacent two-character pairs, and a one-character run
+    yields none, since a lone character is too common to be evidence. The
+    non-CJK pieces are returned for the caller's own length and stop-word rules.
+
+    A word with no CJK character comes back as itself with no pairs, so Latin
+    text tokenizes exactly as it would without this split.
+    """
+    if not any(is_cjk_char(ch) for ch in word):
+        return [word], set()
+    pieces: list[str] = []
+    pairs: set[str] = set()
+    for run, cjk in script_runs(word):
+        if cjk:
+            pairs.update(run[i : i + 2] for i in range(len(run) - 1))
+        else:
+            pieces.append(run)
+    return pieces, pairs
+
+
 def _relevance_tokens(text: str) -> frozenset[str]:
-    """Lowercase word tokens of length >= 3, for a cheap lexical overlap score."""
-    token, tokens = [], set()
+    """Lowercase tokens for a cheap lexical overlap score.
+
+    The result is a superset of the plain word split: every alphanumeric word
+    of length >= 3 is kept whole, and a word holding CJK text adds its non-CJK
+    pieces (same length rule) and the pairs of its CJK runs (``split_cjk_word``).
+    A word with no CJK character contributes only itself.
+    """
+    words, word = [], []
     for char in text.lower():
         if char.isalnum():
-            token.append(char)
+            word.append(char)
         else:
-            if len(token) >= _RELEVANCE_MIN_TOKEN:
-                tokens.add("".join(token))
-            token = []
-    if len(token) >= _RELEVANCE_MIN_TOKEN:
-        tokens.add("".join(token))
+            words.append("".join(word))
+            word = []
+    words.append("".join(word))
+    tokens: set[str] = set()
+    for candidate in words:
+        if len(candidate) >= _RELEVANCE_MIN_TOKEN:
+            tokens.add(candidate)
+        pieces, pairs = split_cjk_word(candidate)
+        tokens.update(piece for piece in pieces if len(piece) >= _RELEVANCE_MIN_TOKEN)
+        tokens |= pairs
     return frozenset(tokens)
 
 
@@ -236,7 +331,16 @@ def any_request_overlap(entries: Sequence[tuple[object, str]], query_text: str) 
     return any(wanted & _relevance_tokens(text) for _, text in entries)
 
 
-def render_withheld_tier(total: int, *, header: str, footer: str, notice: str) -> str:
+#: The injection-receipt tier each omission kind names (:mod:`kiro_crew.injection_receipts`).
+_RECEIPT_KIND = {
+    context_omissions.LESSON_RULES: injection_receipts.LESSONS,
+    context_omissions.LESSON_FINDINGS: injection_receipts.FINDINGS,
+}
+
+
+def render_withheld_tier(
+    total: int, *, header: str, footer: str, notice: str, omission_kind: str = ""
+) -> str:
     """Render a tier's FRAME with no entries, for a tier withheld on relevance.
 
     Not the same event as an overflow, so it does not share that wording: nothing
@@ -245,9 +349,16 @@ def render_withheld_tier(total: int, *, header: str, footer: str, notice: str) -
     silently absent block is indistinguishable from "this user has no findings",
     and that is the reading that stops anyone from going to look. *notice* takes
     ``total``.
+
+    *omission_kind* names the tier in the composition's omission record
+    (:mod:`kiro_crew.context_omissions`); empty records nothing.
     """
     if total <= 0:
         return ""
+    if omission_kind:
+        context_omissions.record(omission_kind, "relevance", omitted=total, total=total)
+        if omission_kind in _RECEIPT_KIND:
+            injection_receipts.record(_RECEIPT_KIND[omission_kind], (), omitted=total)
     return header + "\n" + footer + "\n" + notice.format(total=total) + "\n\n"
 
 
@@ -258,12 +369,15 @@ def render_lesson_tier(
     header: str,
     footer: str,
     omission: str,
+    omission_kind: str = "",
 ) -> tuple[str, int]:
     """Render one lesson tier within *budget* characters.
 
     Returns ``(block, omitted_count)``. *entries* are ``(row, text)`` pairs in the
     order they should be kept; *omission* is a format string taking ``count``,
-    ``total`` and ``limit``.
+    ``total`` and ``limit``. *omission_kind* names the tier in the composition's
+    omission record (:mod:`kiro_crew.context_omissions`), written from the same
+    count the notice states; empty records nothing.
 
     ``budget`` of ``0`` is unbounded. An empty tier renders ``""`` rather than an
     empty labelled block, so a user with no lessons of a kind sees no header for
@@ -280,6 +394,20 @@ def render_lesson_tier(
         return "", 0
     total = len(entries)
 
+    def note(kept: Sequence[tuple[object, str]], omitted: int) -> None:
+        if not omission_kind:
+            return
+        if omission_kind in _RECEIPT_KIND:
+            injection_receipts.record(
+                _RECEIPT_KIND[omission_kind], [row for row, _ in kept], omitted=omitted
+            )
+        if omitted:
+            context_omissions.record(
+                omission_kind, "budget", omitted=omitted, total=total, budget_chars=budget
+            )
+        else:
+            context_omissions.clear(omission_kind)
+
     def render(rows: Sequence[tuple[object, str]], omitted: int) -> str:
         # Byte shape is the SHIPPED one and is load-bearing: the block ends with a
         # single newline after its footer, and an omission notice follows the
@@ -295,6 +423,7 @@ def render_lesson_tier(
 
     full = render(entries, 0)
     if not budget or len(full) <= budget:
+        note(entries, 0)
         return full, 0
     # Reserve room for the notice at its widest (every entry omitted), so one
     # pass over the rows decides which prefix fits.
@@ -315,4 +444,5 @@ def render_lesson_tier(
             continue
         room -= line
         kept.append(entry)
+    note(kept, total - len(kept))
     return render(kept, total - len(kept)), total - len(kept)

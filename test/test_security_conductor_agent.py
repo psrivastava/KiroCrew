@@ -17,10 +17,34 @@ from kiro_crew.agent_files import (
     OWNED_KIRO_AGENT_FILES,
     SECURITY_CONDUCTOR_AGENT_FILENAME,
 )
+from kiro_crew.agent_sdk.drivers.acp import derived_agent_permissions
+from kiro_crew.kiro_cli import SPEC_PERMISSIONS_MIN_VERSION
+
+#: A release that accepts a spec ``permissions`` block, and one that refuses it,
+#: expressed against the floor so raising it cannot strand these tests.
+_ACCEPTS = SPEC_PERMISSIONS_MIN_VERSION
+_REFUSES = (SPEC_PERMISSIONS_MIN_VERSION[0], SPEC_PERMISSIONS_MIN_VERSION[1] - 1, 0)
+_INHERITED_PERMISSIONS = {"rules": [{"capability": "web_fetch", "effect": "deny"}]}
 
 
-def _stub_environment(tmp_path, monkeypatch, *, may_auto_approve=None) -> None:
+def _pin_spec_permissions_cli(monkeypatch, which):
+    """Pin what the shared writer gate believes the installed kiro-cli is.
+
+    ``_write_derived_permissions`` reads ``installed_kiro_cli_version``
+    function-locally from ``kiro_crew.kiro_cli``, so the patch lands there.
+    Without it CI's absent binary reads as "unknown" and the field is withheld,
+    failing a shared permissions assertion for a host reason. ``which`` is
+    ``"accepts"``, ``"refuses"`` or ``"unknown"``.
+    """
+    version = {"accepts": _ACCEPTS, "refuses": _REFUSES, "unknown": None}[which]
+    monkeypatch.setattr("kiro_crew.kiro_cli.installed_kiro_cli_version", lambda: version)
+
+
+def _stub_environment(
+    tmp_path, monkeypatch, *, may_auto_approve=None, cli_version="accepts"
+) -> None:
     monkeypatch.setattr(agent, "kiro_agents_dir_path", lambda: tmp_path)
+    _pin_spec_permissions_cli(monkeypatch, cli_version)
     monkeypatch.setattr(
         agent,
         "build_agent_config",
@@ -33,6 +57,7 @@ def _stub_environment(tmp_path, monkeypatch, *, may_auto_approve=None) -> None:
             },
             "tools": ["fs_write", "@kirocrew-core"],
             "allowedTools": ["@kirocrew-core"],
+            "permissions": _INHERITED_PERMISSIONS,
         },
     )
     monkeypatch.setattr(
@@ -44,8 +69,10 @@ def _stub_environment(tmp_path, monkeypatch, *, may_auto_approve=None) -> None:
 
 
 class TestSecurityConductorInstaller:
-    def _install(self, tmp_path, monkeypatch, *, may_auto_approve=None):
-        _stub_environment(tmp_path, monkeypatch, may_auto_approve=may_auto_approve)
+    def _install(self, tmp_path, monkeypatch, *, may_auto_approve=None, cli_version="accepts"):
+        _stub_environment(
+            tmp_path, monkeypatch, may_auto_approve=may_auto_approve, cli_version=cli_version
+        )
         agent._install_security_conductor_agent()
         return json.loads(
             (tmp_path / SECURITY_CONDUCTOR_AGENT_FILENAME).read_text(encoding="utf-8")
@@ -88,7 +115,7 @@ class TestSecurityConductorInstaller:
         prompt = " ".join(self._install(tmp_path, monkeypatch)["prompt"].split())
         for role in ("Auditor", "Verifier", "Fixer"):
             assert role in prompt, role
-        assert "prepare-pr" in prompt  # the fixer's own procedure
+        assert "kirocrew-prepare-pr" in prompt  # the fixer's own procedure
 
     def test_prompt_closes_a_child_once_its_item_is_terminal(self, tmp_path, monkeypatch):
         """Four child roles reach a terminal verdict and the loop is stopped for each
@@ -171,6 +198,9 @@ class TestSecurityConductorInstaller:
         allowed = set(data["allowedTools"])
         assert "@kirocrew-dashboard/session_create" in allowed
         assert "@kirocrew-dashboard/session_read_message" in allowed
+        # The roster read: narrower than the transcript read above, and asked on
+        # every unattended cycle, so it is granted rather than gated.
+        assert "@kirocrew-dashboard/session_status" in allowed
         assert "@kirocrew-dashboard/chat_folder_tree" in allowed
         assert "@kirocrew-dashboard/chat_folder_create" in allowed
         # Writes only the caller's own placement, so it sits on the
@@ -179,6 +209,10 @@ class TestSecurityConductorInstaller:
         assert "@kirocrew-dashboard/chat_folder_file_self" in allowed
         for gated in (
             "@kirocrew-dashboard/session_send",
+            # The fan-out write, withheld on session_send's own reason: the
+            # fan-out changes how many sessions ingested text reaches, not
+            # whether anything bounds what is sent.
+            "@kirocrew-dashboard/session_broadcast",
             "@kirocrew-dashboard/session_stop",
             "@kirocrew-dashboard/chat_folder_move_session",
             "@kirocrew-dashboard",
@@ -257,21 +291,27 @@ class TestSecurityConductorInstaller:
         assert "`<audit>/<agent>`" in text
 
     def test_mcp_servers_are_narrowed(self, tmp_path, monkeypatch):
-        """Only kirocrew-core and the hand-built dashboard entry ship; inherited
-        third-party servers are dropped from this spec."""
+        """kirocrew-core plus the hand-built dashboard and work entries the shared
+        conductor base mounts; inherited third-party servers are dropped."""
         data = self._install(tmp_path, monkeypatch)
-        assert set(data["mcpServers"]) == {"kirocrew-core", "kirocrew-dashboard"}
+        assert set(data["mcpServers"]) == {
+            "kirocrew-core",
+            "kirocrew-dashboard",
+            "kirocrew-work",
+        }
         assert data["mcpServers"]["kirocrew-dashboard"]["args"] == ["mcp-dashboard"]
+        assert data["mcpServers"]["kirocrew-work"]["args"] == ["mcp-work"]
 
-    def test_the_work_server_is_not_mounted(self, tmp_path, monkeypatch):
-        """The work-ledger flow belongs to ``kirocrew-conductor``, and no other
-        conductor mounts it. This agent's children report through the
-        ``security-conductor`` skill's ledger scripts, not the work ledger, so the
-        mount would grant a flow whose procedure this conductor does not run."""
+    def test_the_work_server_is_mounted_with_the_base_grants(self, tmp_path, monkeypatch):
+        """Every conductor records its items in the work ledger: each auditor,
+        verifier and fixer is a ledger row, and the skill's findings ledger stays
+        its detail. The conductor verbs are granted; the worker verbs are not."""
         data = self._install(tmp_path, monkeypatch)
-        assert "@kirocrew-work" not in data["tools"]
-        assert "kirocrew-work" not in data["mcpServers"]
-        assert not [ref for ref in data["allowedTools"] if "kirocrew-work" in ref]
+        assert "@kirocrew-work" in data["tools"]
+        work = [ref for ref in data["allowedTools"] if "kirocrew-work" in ref]
+        assert work == list(agent._CONDUCTOR_BASE_WORK_GRANTS)
+        assert agent._CONDUCTOR_WORK_LEDGER_PROTOCOL in data["prompt"]
+        assert data["prompt"].startswith(agent._SECURITY_CONDUCTOR_SYSTEM_PROMPT)
 
     def test_permissions_are_derived_from_the_filtered_grants(self, tmp_path, monkeypatch):
         """The KAS policy comes from the grant list AFTER the ceiling filtered
@@ -285,6 +325,29 @@ class TestSecurityConductorInstaller:
         rules = json.dumps(data["permissions"])
         assert "monitor_start" not in rules
         assert "monitor_update" in rules
+
+    def test_the_permissions_field_is_gated_on_the_installed_kiro_cli(self, tmp_path, monkeypatch):
+        """Written on an accepting release, withheld on a refusing or unknown one.
+
+        The security conductor spec gates its ``permissions`` write on the
+        installed kiro-cli, sharing the default spec's gate: a kiro-cli whose
+        schema predates the field would otherwise refuse the WHOLE spec and fall
+        back to broader default grants -- the worst place for that, since this
+        agent's children probe a fence and what it ingests is hostile by
+        assumption. ``allowedTools`` is untouched either way.
+        """
+        accepting = self._install(tmp_path, monkeypatch, cli_version="accepts")
+        assert accepting.get("permissions"), "an accepting CLI must get the block"
+        assert accepting["permissions"] != _INHERITED_PERMISSIONS
+        assert accepting["permissions"] == derived_agent_permissions(
+            accepting["allowedTools"], SECURITY_CONDUCTOR_AGENT_FILENAME
+        )
+        assert accepting["allowedTools"], "the grant list is never withheld"
+
+        for refusing in ("refuses", "unknown"):
+            data = self._install(tmp_path, monkeypatch, cli_version=refusing)
+            assert "permissions" not in data, f"{refusing} CLI must get no block"
+            assert data["allowedTools"], "the grant list is never withheld"
 
     def test_governed_host_withholds_and_audits(self, tmp_path, monkeypatch):
         """A ceiling that strips a grant must leave an audit record naming THIS

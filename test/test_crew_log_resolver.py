@@ -9,6 +9,7 @@ their site observed.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -451,11 +452,17 @@ def test_both_background_helpers_pin_the_owner_before_their_first_await():
     that moves the resolve back down would restore the bug silently.
     """
     import ast
+    import importlib
     import inspect
 
     from kiro_crew import llm_helpers
 
-    tree = ast.parse(inspect.getsource(llm_helpers))
+    # The facade and every owner module it is composed from, parsed as one tree.
+    modules = [llm_helpers, *map(importlib.import_module, llm_helpers._OWNERS)]
+    tree = ast.Module(
+        body=[node for mod in modules for node in ast.parse(inspect.getsource(mod)).body],
+        type_ignores=[],
+    )
     checked = []
     for node in ast.walk(tree):
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -622,6 +629,201 @@ def test_a_replayed_queued_child_is_repinned_with_an_unobserved_turn(monkeypatch
     assert emit.open_child_origin("queued-1") == (SESSION, 7)
 
 
+def test_a_replayed_queued_child_is_pinned_to_the_unit_that_asked(monkeypatch):
+    """A restart moves the parent onto a new unit; the row still names the old one.
+
+    The durable row carries the asking unit, turn and attempt (as a list once it
+    has been through JSON). Resolving the parent's unit at replay time would file
+    the child's spawn and closer in the successor's log, so a per-unit view would
+    move that child's spend onto a unit that never asked for it.
+    """
+    from kiro_crew.subagent_manager.admission.gate import _GateMixin
+
+    monkeypatch.setattr(resolve, "unit_for_session_key", lambda _sessions, _key: "successor")
+    stub = SimpleNamespace(_manager=SimpleNamespace(_sessions=None))
+    info = SimpleNamespace(id="queued-2", parent_session_key="slot-key")
+
+    _GateMixin._record_crew_log_dispatch(stub, info, from_queue=True, asked=[SESSION, 5, 2])
+    assert emit.open_child_origin("queued-2") == (SESSION, 5)
+    assert emit.child_origin_attempt("queued-2") == 2
+
+
+def test_a_dispatch_after_the_turn_s_closer_is_queued_names_no_turn(monkeypatch):
+    """A cron or hook dispatching while ``turn/completed`` waits for the writer.
+
+    That turn has ended. ``live_turn`` still reports it, because the tail repair
+    must stand down for a closer on its way, but the pin must not: the spawn would
+    be stamped with a turn that never asked for it, where the schema says a
+    dispatch with no asking turn has no ``turn``.
+    """
+    from kiro_crew.subagent_manager.admission.gate import _GateMixin
+
+    monkeypatch.setattr(resolve, "unit_for_session_key", lambda _sessions, _key: SESSION)
+    stub = SimpleNamespace(_manager=SimpleNamespace(_sessions=None))
+    info = SimpleNamespace(id="cron-1", parent_session_key="slot-key")
+
+    emit._tracker().begin(SESSION, 3)
+    release = emit._tracker().closing(SESSION, 3)
+    try:
+        assert emit.live_turn(SESSION) == 3, "the repair's reading is unchanged"
+        assert emit.asking_turn(SESSION) == (0, 0)
+        _GateMixin._record_crew_log_dispatch(stub, info, from_queue=False)
+        assert emit.open_child_origin("cron-1") == (SESSION, 0)
+    finally:
+        release()
+
+
+def test_a_child_of_a_rerun_turn_names_the_attempt_that_asked(monkeypatch):
+    """A regenerate reruns turn 4; its child must be told apart from the first try's.
+
+    ``turn/started`` is identified by ``(turn, attempt)``, so a ``subagent/spawned``
+    that carries only ``turn`` cannot be joined to the try that dispatched it.
+    """
+    from kiro_crew.subagent_manager.admission.gate import _GateMixin
+
+    monkeypatch.setattr(resolve, "unit_for_session_key", lambda _sessions, _key: SESSION)
+    stub = SimpleNamespace(_manager=SimpleNamespace(_sessions=None))
+    _open_session()
+    emit.on_turn_started(SESSION, 4, "user", attempt=2)
+    assert emit.flush()
+    assert emit.asking_turn(SESSION) == (4, 2)
+
+    info = SimpleNamespace(
+        id="rerun-1",
+        parent_session_key="slot-key",
+        run_agent="kirocrew",
+        model="",
+        task="",
+        include_memory=True,
+        include_lessons=True,
+        include_project=True,
+    )
+    _GateMixin._record_crew_log_dispatch(stub, info, from_queue=False)
+    _GateMixin._record_crew_log_spawn_started(stub, info)
+    assert emit.flush()
+    (spawned,) = _of("subagent/spawned")
+    assert (spawned["turn"], spawned["attempt"]) == (4, 2)
+
+
+def test_a_rerun_reads_as_unobserved_until_its_own_attempt_is_derived(monkeypatch):
+    """A rerun of an ordinal whose record is still open must not read the old try.
+
+    ``begin`` keeps an existing record, and the attempt is derived later on the
+    writer thread. A dispatch in between would be pinned to the earlier try.
+    """
+    jobs: list = []
+    monkeypatch.setattr(emit, "_submit", lambda job, *_a, **_k: jobs.append(job))
+    first = emit._tracker().begin(SESSION, 4)
+    emit._tracker().note_attempt(SESSION, 4, 1, first)
+
+    emit.on_turn_started(SESSION, 4, "user", attempt=2)
+    assert len(jobs) == 1, "the attempt is still owed to the queued job"
+    assert emit.asking_turn(SESSION) == (4, 0), "the earlier try's attempt leaked"
+
+
+def test_a_rerun_before_the_earlier_closer_lands_keeps_its_turn_and_attempt():
+    """A regenerate of turn 4 starts while try 1's closer is still queued.
+
+    Reusing try 1's record would leave it marked closer-owed, so the rerun would
+    read as having no asking turn, and try 1's release would then drop the record
+    try 2 is running on and take its attempt with it.
+    """
+    tracker = emit._tracker()
+    first = tracker.begin(SESSION, 4)
+    tracker.note_attempt(SESSION, 4, 1, first)
+    release_first = tracker.closing(SESSION, 4)
+
+    rerun = tracker.begin(SESSION, 4)
+    tracker.note_attempt(SESSION, 4, 2, rerun)
+    assert emit.asking_turn(SESSION) == (4, 2), "the rerun is the asking turn"
+
+    release_first()
+    assert emit.asking_turn(SESSION) == (4, 2), "try 1's release dropped try 2's record"
+    tracker.closing(SESSION, 4)()
+    assert emit.live_turn(SESSION) == 0, "try 2's own release closes it"
+
+
+def test_a_closer_that_found_no_record_cannot_drop_a_rerun_s_record():
+    """Handed over with no record to mark, then a rerun opens one before the release."""
+    tracker = emit._tracker()
+    release_unmarked = tracker.closing(SESSION, 5)
+    rerun = tracker.begin(SESSION, 5)
+    tracker.note_attempt(SESSION, 5, 2, rerun)
+    release_unmarked()
+    assert emit.asking_turn(SESSION) == (5, 2), "the release dropped a record it never marked"
+    tracker.closing(SESSION, 5)()
+    assert emit.live_turn(SESSION) == 0
+
+
+def test_an_earlier_start_s_job_cannot_stamp_a_rerun_s_record():
+    """Turn 4 ends and is regenerated while its first start job is still queued.
+
+    That job derives attempt 1. Stamping it on whatever record is live would hand the
+    rerun's children attempt 1, and a child's pin cannot be corrected afterwards.
+    """
+    tracker = emit._tracker()
+    first = tracker.begin(SESSION, 4)
+    tracker.closing(SESSION, 4)
+    rerun = tracker.begin(SESSION, 4)
+    assert rerun is not first
+    tracker.note_attempt(SESSION, 4, 1, first)
+    assert emit.asking_turn(SESSION) == (4, 0), "the first try's job stamped the rerun"
+    tracker.note_attempt(SESSION, 4, 2, rerun)
+    assert emit.asking_turn(SESSION) == (4, 2)
+
+
+def test_a_retried_start_job_keeps_the_attempt_it_derived(monkeypatch):
+    """The writer retries a failed append by running the same job again.
+
+    Deriving again would count the retry as a second try: ``turn/started`` and the
+    attempt a child is pinned with would both name a try that never ran.
+    """
+    jobs: list = []
+    appended: list[dict] = []
+    failures = [OSError("transient")]
+
+    class _Log:
+        def append(self, _kind, payload, **_kw):
+            if failures:
+                raise failures.pop()
+            appended.append(dict(payload))
+            return SimpleNamespace(seq=1)
+
+    monkeypatch.setattr(emit, "_submit", lambda job, *_a, **_k: jobs.append(job))
+    monkeypatch.setattr(emit, "_handle", lambda _sid: _Log())
+    monkeypatch.setattr(emit, "_note_eager", lambda *_a, **_k: None)
+    emit.on_turn_started(SESSION, 4, "user")
+    (job,) = jobs
+    with pytest.raises(OSError):
+        job()
+    job()
+    assert appended == [{"turn": 4, "actor": "user", "depth": 0}], "the retry wrote attempt 2"
+    assert emit.asking_turn(SESSION) == (4, 1)
+
+
+def test_an_over_long_unit_id_is_never_put_on_the_queued_row():
+    """The provider authors the id; the durable row must not carry an unbounded one."""
+    from kiro_crew.subagent_manager.admission.gate_reporting import crew_log_asking_origin
+
+    huge = "s" * (emit._MAX_SESSION_ID_CHARS + 1)
+    sessions = _Sessions({"dashboard:chat-7": _Provider(huge)})
+    assert crew_log_asking_origin(sessions, "dashboard:chat-7") is None
+    fits = "s" * emit._MAX_SESSION_ID_CHARS
+    sessions = _Sessions({"dashboard:chat-7": _Provider(fits)})
+    assert crew_log_asking_origin(sessions, "dashboard:chat-7") == (fits, 0, 0)
+
+
+def test_a_spawn_whose_attempt_was_not_observed_omits_it():
+    """Absent means unknown: the attempt is derived on the writer thread."""
+    _open_session()
+    emit.on_subagent_spawned(SESSION, 4, agent_id="ab12")
+    emit.on_subagent_spawned(SESSION, 0, agent_id="cd34", attempt=3)
+    assert emit.flush()
+    first, second = _of("subagent/spawned")
+    assert "attempt" not in first
+    assert "attempt" not in second and "turn" not in second, "no attempt without a turn"
+
+
 @pytest.mark.asyncio
 async def test_a_claim_the_store_cannot_take_is_pinned_before_the_row_is_left_queued(monkeypatch):
     """The asking turn is readable on THIS pass and on no later one.
@@ -666,8 +868,17 @@ async def test_a_claim_the_store_cannot_take_is_pinned_before_the_row_is_left_qu
             SESSION,
             6,
         ), "the row was left queued, so only this pass could pin the turn that asked"
+        row = store.get(info.id)
+        assert row is not None
+        assert list(row.params["_crew_log_asked"])[:2] == [SESSION, 6], (
+            "the durable row must name the asking unit, or a replay after a restart "
+            "files the child under the parent's next unit"
+        )
     finally:
         await mgr.cancel_all()
+        # ``cancel_all`` leaves the durable task queue the constructor opened
+        # (``tasks.db`` + ``-wal`` + ``-shm``) live; release it here.
+        mgr.close()
 
 
 @pytest.mark.asyncio
@@ -716,6 +927,9 @@ async def test_a_run_whose_memory_binding_cannot_be_persisted_records_no_spawn(m
         assert [e["agent_id"] for e in _of("subagent/spawned")] == ["folder-ok-1"]
     finally:
         await mgr.cancel_all()
+        # ``cancel_all`` leaves the durable task queue the constructor opened
+        # (``tasks.db`` + ``-wal`` + ``-shm``) live; release it here.
+        mgr.close()
 
 
 def test_a_plan_id_is_redacted_like_every_other_field_the_agent_authored(monkeypatch):
@@ -739,64 +953,6 @@ def test_a_plan_id_is_redacted_like_every_other_field_the_agent_authored(monkeyp
     leaked, ordinary = plan["items"]
     assert "ghp_" not in leaked["id"] and "REDACTED" in leaked["id"], leaked
     assert ordinary["id"] == "task-7", "redaction must not rewrite an ordinary id"
-
-
-def test_a_batch_the_writer_already_holds_still_reads_as_owed():
-    """The writer claims a session's entries by taking them OUT of the queue.
-
-    Between that claim and the last append of the batch, the entries behind the one
-    being written are still owed while none of them is in the queue -- so a caller
-    asking whether this process owes the session anything would be told no, and the
-    child repair would close a run whose real outcome is in the batch.
-    """
-    seen: list[bool] = []
-    queue_state: list[bool] = []
-
-    def _look_from_inside_the_batch() -> None:
-        queue_state.append(SESSION in emit._pending)
-        seen.append(emit._owes_entries(SESSION))
-
-    with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(emit, "_start_drain", lambda: None)
-        emit._buffer(SESSION, emit._PendingJob(_look_from_inside_the_batch, "looks"))
-        emit._buffer(SESSION, emit._PendingJob(lambda: None, "queued behind it"))
-        emit._drain_once()
-    assert queue_state == [False], "the batch was not claimed out of the queue"
-    assert seen == [True], "an entry claimed behind the running one was not owed"
-    assert not emit._owes_entries(SESSION), "the claim outlived the batch it was taken for"
-
-
-def test_a_pass_that_stopped_early_releases_what_it_never_reached():
-    """The claim a retained tail leaves behind, and why it must not be permanent.
-
-    A transient failure sends the rest of the batch back to the queue, so those
-    entries are owed twice: once as queued work, once as a claim this pass took and
-    never spent. The queue side clears itself when the retry lands. The claim side
-    clears only if the pass releases what it never reached on the way out -- and a
-    claim that outlives its batch makes the session owe something forever, which is
-    the answer the child repair reads to decide a run is still live.
-
-    The drain is held rather than left to the writer: a buffered entry is picked up
-    on its own within milliseconds, and a batch of one leaves nothing unattempted,
-    so a test that lets the writer run cannot reach this path at all.
-    """
-    failures = {"left": 1}
-
-    def _fail_once() -> None:
-        if failures["left"]:
-            failures["left"] -= 1
-            raise OSError("input/output error")
-
-    with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(emit, "_start_drain", lambda: None)
-        emit._buffer(SESSION, emit._PendingJob(_fail_once, "fails once"))
-        emit._buffer(SESSION, emit._PendingJob(lambda: None, "never reached"))
-        emit._drain_once()
-        assert failures["left"] == 0, "the injected failure never fired, so nothing was retained"
-        assert SESSION in emit._pending, "the tail was not retained, so this path was not taken"
-        assert SESSION not in emit._claimed_sessions, "a claim outlived the pass that took it"
-        emit._drain_once()
-    assert not emit._owes_entries(SESSION), "the session still owes something after both landed"
 
 
 def test_a_child_whose_closer_is_not_yet_handed_over_is_not_reported_gone():
@@ -833,7 +989,9 @@ def test_a_repair_is_not_blocked_by_its_own_job_being_the_one_in_flight(monkeypa
     A resume submits its open-and-repair work through the same writer, which claims
     a session's entries before running them. Counting the job that is asking would
     make every child look live on exactly the path the repair exists for, so the
-    dangling opener a torn-down writer left behind would never be closed.
+    dangling opener a torn-down writer left behind would never be closed. Submitted
+    from an event loop, so the job runs from the writer's claimed batch rather than
+    inline.
     """
     _open_session()
     monkeypatch.setattr(emit, "_child_liveness", lambda _agent_id: False)
@@ -843,7 +1001,10 @@ def test_a_repair_is_not_blocked_by_its_own_job_being_the_one_in_flight(monkeypa
         probe = emit._child_gone_probe(SESSION)
         answers.append(probe("ab12") if probe is not None else None)
 
-    emit._buffer(SESSION, emit._PendingJob(_ask_from_inside_the_batch, "repair asking"))
+    async def _submit() -> None:
+        emit._submit(_ask_from_inside_the_batch, "repair asking", SESSION)
+
+    asyncio.run(_submit())
     assert emit.flush(timeout=20.0)
     assert answers == [True], "the asking job was counted as debt against itself"
 
@@ -896,7 +1057,10 @@ def test_the_closer_is_handed_over_before_its_child_s_origin_pin_is_released():
         held.append(bool(emit.child_origin(kw["agent_id"])[0]))
         return real(session_id, **kw)
 
-    info = SimpleNamespace(id="ab12", elapsed=0.5, outcome="completed", error=None)
+    # `credits` stands in for the run accumulator the closer reads: a real
+    # `SubagentInfo` always carries it, so a stand-in that omits it would make this
+    # test fail on the attribute rather than on the ordering it exists to pin.
+    info = SimpleNamespace(id="ab12", elapsed=0.5, outcome="completed", error=None, credits=1.25)
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(emit, "on_subagent_completed", _spy)
         TerminalCoordinator._record_crew_log_terminal(SimpleNamespace(), info)
@@ -904,6 +1068,68 @@ def test_the_closer_is_handed_over_before_its_child_s_origin_pin_is_released():
     assert emit.child_origin("ab12")[0] == "", "the pin was not released afterwards"
     assert emit.flush(timeout=20.0)
     assert [d["agent_id"] for d in _of("subagent/completed")] == ["ab12"]
+
+
+def test_a_turn_still_pending_at_the_terminal_is_billed_in_the_closer():
+    """The closer carries the settled cost, the same figure the tombstone gets.
+
+    A terminal reached while the last turn's usage is still pending (a cancel
+    landing in the event consumer, a path that skips the run loop) settles it in
+    the report. Settled after the closer, ``subagent/completed`` under-reports the
+    child while the tombstone and the WS frame, built later from the same record,
+    carry the full figure.
+    """
+    from unittest.mock import MagicMock
+
+    from kiro_crew.acp.types import AcpPromptStats
+    from kiro_crew.subagent import SubagentInfo, _RunCreditAccounting
+    from kiro_crew.subagent_manager.terminal import TerminalCoordinator
+
+    _open_session()
+    emit.remember_child_origin("ab12", SESSION, 3)
+    assert emit.open_child_origin("ab12") == (SESSION, 3)
+
+    info = SubagentInfo(id="ab12", task="bill the last turn", credits=1.0)
+    runner = MagicMock(spec=[])
+    runner.last_prompt_stats = AcpPromptStats()
+    provider = MagicMock(spec=[])
+    provider._handle = runner
+    accounting = _RunCreditAccounting(info)
+    accounting.begin(provider)
+    runner.last_prompt_stats = AcpPromptStats(credits=0.5)
+    info._credit_accounting = accounting
+    info.elapsed = 0.5
+
+    async def _guarded(_info, **_kw):
+        return True
+
+    coordinator = SimpleNamespace(
+        _record_terminal_metric=lambda _info: None,
+        _manager=SimpleNamespace(
+            arm_report_in_flight=lambda _info: None,
+            consume_report_hold=lambda _batch, _id: None,
+        ),
+        _report_terminal_guarded_impl=_guarded,
+    )
+    coordinator._record_crew_log_terminal = lambda i: TerminalCoordinator._record_crew_log_terminal(
+        coordinator, i
+    )
+
+    asyncio.run(
+        TerminalCoordinator._report_terminal_impl(
+            coordinator,
+            info,
+            source="test",
+            injection_timeout_reason="",
+            mark_delivered_on_success=False,
+        )
+    )
+    assert info.credits == pytest.approx(1.5)
+    assert emit.flush()
+    (data,) = _of("subagent/completed")
+    assert data["credits"] == pytest.approx(
+        1.5
+    ), "the closer was written before the last turn settled"
 
 
 def test_a_plan_the_line_cannot_hold_records_a_prefix_not_a_subsequence():

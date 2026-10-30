@@ -71,8 +71,8 @@ describe('AboutPanel channel switcher', () => {
     // keeps both lanes rendered side by side, one click away.
     // Anchored names: the disclosure link in the same row is a <button> whose
     // label names BOTH channels, so an unanchored /stable/i matches it too.
-    const stable = screen.getByRole('button', { name: /^Stable$/ })
-    const insider = screen.getByRole('button', { name: /^Insider$/ })
+    const stable = screen.getByRole('radio', { name: /^Stable$/ })
+    const insider = screen.getByRole('radio', { name: /^Insider$/ })
     expect(switcher.contains(stable)).toBe(true)
     expect(switcher.contains(insider)).toBe(true)
     fireEvent.click(insider)
@@ -88,7 +88,7 @@ describe('AboutPanel channel switcher', () => {
     await screen.findByTestId('channel-switcher')
     // Re-pick the CURRENT lane -- onChange fires but the handler must not call
     // setChannel for a no-op selection.
-    fireEvent.click(screen.getByRole('button', { name: /^Stable$/ }))
+    fireEvent.click(screen.getByRole('radio', { name: /^Stable$/ }))
     await new Promise(r => setTimeout(r, 20))
     expect(setChannel).not.toHaveBeenCalled()
   })
@@ -103,5 +103,41 @@ describe('AboutPanel channel switcher', () => {
     })
     await screen.findByText('nightly')
     expect(screen.queryByTestId('channel-switcher')).toBeNull()
+    expect(screen.queryByTestId('locked-by-policy-badge')).toBeNull()
+  })
+
+  it('a channel set by policy shows the read-only row with the locked badge', async () => {
+    mountWithUpdateApi({
+      version: '0.1.0',
+      channel: 'stable',
+      stampedChannel: 'stable',
+      channelSwitchable: false,
+      channelLockedByPolicy: true,
+      packaged: true,
+    })
+    await screen.findByTestId('locked-by-policy-badge')
+    expect(screen.queryByTestId('channel-switcher')).toBeNull()
+  })
+
+  it('a build that cannot follow the policy channel names it and links its build', async () => {
+    mountWithUpdateApi({
+      version: '0.1.0-nightly.20261026',
+      channel: 'nightly',
+      stampedChannel: 'nightly',
+      channelSwitchable: false,
+      channelLockedByPolicy: true,
+      requiredChannel: 'stable',
+      packaged: true,
+      disabled: 'policy-channel',
+      downloadUrl: 'https://downloads.example.dev/desktop/stable/latest/KiroCrew.dmg',
+    })
+    const notice = await screen.findByTestId('updates-policy-channel')
+    expect(notice.textContent).toContain("This nightly build can't switch to stable updates")
+    expect(notice.textContent).toContain('Your settings, chats and files are kept.')
+    const link = notice.querySelector('a')
+    expect(link?.getAttribute('href')).toBe('https://downloads.example.dev/desktop/stable/latest/KiroCrew.dmg')
+    expect(link?.textContent).toBe('Install the stable app')
+    // The row names the installed lane and the requirement, not one for the other.
+    expect(screen.getByTestId('channel-requires').textContent).toBe('requires stable')
   })
 })

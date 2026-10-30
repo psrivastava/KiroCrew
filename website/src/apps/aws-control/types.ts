@@ -157,11 +157,12 @@ export interface DriveUsage {
 
 /**
  * Payload of `GET /drive/{account}`. Before the bucket is created the whole
- * body is `{exists:false}`; once created it also carries the bucket name, its
- * region and a (5-minute cached) usage report.
+ * body is `{exists:false, searched_region}` (the one region discovery looked
+ * in; absent from older backends); once created it also carries the bucket
+ * name, its region and a (5-minute cached) usage report.
  */
 export type DriveStatus =
-  | { exists: false }
+  | { exists: false; searched_region?: string }
   | {
       exists: true
       bucket: string
@@ -486,6 +487,12 @@ export interface InstallIdentity {
  * must read back as they set it, while this says whether asking for it achieves
  * anything on this host. A surface that reads only the grant shows transcripts
  * as scheduled while none are produced.
+ * `rememberedArchives` is, per kind, how many uploaded archives the install still
+ * holds a record of. A RECORD COUNT, not an inventory, and wrong in both directions:
+ * low because the record map is bounded and covers this install alone, high because
+ * retention deletes an object while its record stays. It says the one run line is not
+ * the whole list, never how many archives the drive holds. Absent from an older
+ * backend, which reads as unknown rather than zero.
  * `jobs` carries the in-flight and last-failed run per kind for this account.
  * `install` is this machine's own identity, always present.
  */
@@ -494,6 +501,7 @@ export interface BackupStatus {
   nightlySessions?: boolean
   nightlySessionsBlocked?: string | null
   runs: Partial<Record<BackupKind, BackupRun>>
+  rememberedArchives?: Partial<Record<BackupKind, number>>
   jobs?: Partial<Record<BackupKind, BackupJobState>>
   install: InstallIdentity
   remote: RemoteBackup | null
@@ -523,6 +531,8 @@ export interface BackupRunResult {
  * Result of `POST /backup/{account}/restore`. Nothing is hot-swapped: the
  * archive is downloaded to a local staging folder and `path` is where it landed.
  * `origin` and `install` echo whose archive was restored, resolved from the key.
+ * `recovered` is true when something else had written over the key and the
+ * bytes handed back are the version this install recorded uploading.
  */
 export interface BackupRestoreResult {
   downloaded: true
@@ -530,6 +540,7 @@ export interface BackupRestoreResult {
   bytes: number
   origin: BackupOrigin
   install: string
+  recovered: boolean
 }
 
 /** Payload of `GET /iam-policy` — the exact permissions to paste, as JSON text. */

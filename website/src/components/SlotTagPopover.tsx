@@ -9,8 +9,10 @@ import { useImeGuard } from '../hooks/useImeGuard'
 import { isTouchDevice } from '../utils/isTouchDevice'
 import { Input } from './ui'
 import ErrorNotice from './ErrorNotice'
+import { crudErrorMessage } from './tagMutationError'
 
 import { i18nT } from '../i18n/t'
+import { slotRowByKey } from '../store/slotIndex'
 
 /**
  * The topmost element at viewport point (x, y) that is NOT `backdrop` or one of
@@ -127,7 +129,7 @@ const readRejection = (error: unknown): RejectionPayload => {
  */
 export default function SlotTagPopover() {
   const { slotKey, close } = useTagPopover()
-  const slot = useAppSelector(s => (slotKey ? s.dashboard.slots.find(x => x.key === slotKey) : undefined))
+  const slot = useAppSelector(s => (slotKey ? slotRowByKey(s.dashboard.slots, slotKey) : undefined))
   const queryClient = useQueryClient()
   const ime = useImeGuard()
   const listRef = useRef<HTMLDivElement>(null)
@@ -138,8 +140,15 @@ export default function SlotTagPopover() {
       baseRevision ? api.setSlotTags(slot, nextTags, baseRevision) : api.setSlotTags(slot, nextTags),
   })
   const createTagMutation = useMutation({
-    mutationFn: (name: string) => api.createChatTag(name),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['chat-tags'] }),
+    mutationFn: ({ name }: { name: string; input: HTMLInputElement | null; draft: string }) => api.createChatTag(name),
+    onMutate: () => setWriteError(null),
+    onSuccess: (_data, { input, draft }) => {
+      // Clear the draft only once the tag exists, and only if the user has not
+      // typed something else meanwhile. A refused create keeps the text.
+      if (input && input.value === draft) input.value = ''
+      return queryClient.invalidateQueries({ queryKey: ['chat-tags'] })
+    },
+    onError: (error: unknown) => setWriteError(crudErrorMessage(error)),
   })
 
   // Optimistic overlay for the currently-open slot only. `pending` drives the
@@ -677,10 +686,10 @@ export default function SlotTagPopover() {
             {...ime.bindEnter<HTMLInputElement>({
               onEnter: () => {
                 const el = document.activeElement as HTMLInputElement | null
-                const name = (el?.value || '').trim()
+                const draft = el?.value || ''
+                const name = draft.trim()
                 if (!name) return
-                createTagMutation.mutate(name)
-                if (el) el.value = ''
+                createTagMutation.mutate({ name, input: el, draft })
               },
               onEscape: close,
               onBlur: () => {},

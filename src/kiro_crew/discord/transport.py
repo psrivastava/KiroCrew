@@ -26,6 +26,7 @@ from kiro_crew.discord.client import (
     DISCORD_CHUNK_LIMIT,
     DiscordClient,
     DiscordInbound,
+    SendPermission,
 )
 from kiro_crew.messaging.identity import channel_inbound_permitted
 from kiro_crew.messaging.outbound_files import OutboundFile
@@ -39,6 +40,12 @@ from kiro_crew.messaging.transport import (
 from kiro_crew.sel import sel
 
 logger = logging.getLogger(__name__)
+
+#: The thread kinds ``create_thread_from_message`` produces: an announcement
+#: thread (10) under an announcement channel, a public thread (11) otherwise.
+#: A private thread (12) is never opened by ``auto_thread``, so it is never
+#: re-admitted as one.
+_AUTO_THREAD_TYPES = frozenset({10, 11})
 
 
 def _coerce_snowflakes(value: object) -> frozenset[str] | None:
@@ -142,11 +149,21 @@ class DiscordTransport(MessagingTransport):
         # reload can replace those without dropping the threads this process
         # promoted at runtime (see ``reconfigure``).
         self._configured_threads: frozenset[str] = frozenset(self._allowed_threads)
+        # Thread ids an operator removed from ``allowed_thread_ids`` on a live
+        # reload. ``readmit_own_thread`` refuses them, so a revoked bot-opened
+        # thread does not come back on the next message. In memory only: a
+        # restart forgets it, like every other runtime grant here.
+        self._revoked_threads: set[str] = set()
         self._allowed_channels: frozenset[str] = frozenset(str(c) for c in allowed_channel_ids)
         self._auto_thread = auto_thread
         self._on_thread_created = on_thread_created
         self._dispatch = dispatch
         self.capabilities = DISCORD_CAPABILITIES
+        # The rosters live here, and the REST ladder's waits live in the client, so
+        # the client is handed the predicate rather than a copy of the rosters.
+        # Installed here and not in the gateway so a transport built anywhere -- a
+        # unit harness included -- carries the same mid-send contract.
+        client.still_permitted = self._still_may_send_to
 
     @property
     def client(self) -> DiscordClient:
@@ -169,7 +186,9 @@ class DiscordTransport(MessagingTransport):
         ``config.json`` and dropping it would strand every follow-up reply the
         user sends into it. A thread an operator REMOVES from the config is
         still dropped, so the reload narrows as intended; only ids this process
-        promoted itself survive.
+        promoted itself survive. A removed id is also remembered as revoked, so
+        ``readmit_own_thread`` cannot add it back until this process restarts
+        or the operator lists it again.
 
         Fails closed on shape: a field that is not a list keeps the PREVIOUS
         value and logs at WARNING, and ``auto_thread`` must be a bool. Allow-list
@@ -219,6 +238,8 @@ class DiscordTransport(MessagingTransport):
                 len(self._allowed_threads),
             )
         else:
+            dropped = self._configured_threads - threads
+            self._revoked_threads = (self._revoked_threads | dropped) - threads
             promoted = self._allowed_threads - self._configured_threads
             merged = set(threads) | promoted
             if merged != self._allowed_threads:
@@ -365,14 +386,31 @@ class DiscordTransport(MessagingTransport):
         recipient is exactly the case that must not be waved through: this is a
         network egress boundary, and the caller audits the refusal.
 
-        The one route that reaches that refusal is a ``unified`` DM bucket, whose
-        key names no peer by design. Refusing costs an unattended notice there and
-        is the correct trade: that bucket deliberately collapses SEVERAL peers into
-        one session, so nothing available to this seam establishes which of them the
-        link currently points at. Sessions under the default ``per-channel-peer``
-        scope carry their peer in the key and are unaffected. Serving it needs a
-        ``dm_channel_id -> user_id`` pairing persisted when the DM is opened, which
-        is a Discord-owned schema change.
+        Two routes name no peer in their session KEY. A dashboard-born session
+        mirrored into a DM is served anyway, from the record the GATEWAY wrote when
+        it admitted the mirror: the link carries the peer (``ChannelLink.principal``)
+        under a MAC the gateway alone can mint (``mirror_admission``, keyed from the
+        sandbox-masked token signing key over the session key and the whole
+        location), and the ladder hands that peer in here as *principal* only when
+        the MAC verifies. The session map is writable by in-sandbox code, so an
+        unsigned or rewritten row -- one pointed at another user's DM, or given
+        another user's name -- fails verification and is refused, and a key rotation
+        refuses every such mirror until it is re-linked. This transport's own pairing
+        (:meth:`direct_peer_of`) is read as well, as defense in depth: when the client
+        knows which user a channel belongs to and that disagrees with the record, the
+        record loses; when it knows nothing (a DM this process has not opened or seen,
+        the ordinary state right after a restart) the verified record stands, which is
+        what keeps this check admitting the mirror across a restart with no inbound
+        message. One residual is the REST ladder's own mid-send re-check
+        (:meth:`_still_may_send_to`), which reads the pairing alone: a send that hits
+        one of the ladder's waits before the pairing is re-learned is still refused
+        there, while a send that never waits is delivered. The
+        route that stays refused is a ``unified`` DM bucket bound from inside the
+        channel, whose link records no peer. Refusing costs an unattended notice
+        there and is the correct trade: that bucket deliberately collapses SEVERAL
+        peers into one session, so nothing available to this seam establishes which
+        of them the link currently points at. Sessions under the default
+        ``per-channel-peer`` scope carry their peer in the key and are unaffected.
         """
         if not conversation_id:
             return False
@@ -380,12 +418,157 @@ class DiscordTransport(MessagingTransport):
             return True
         return bool(principal) and principal in self._allowed
 
+    def _still_may_send_to(self, channel_id: str) -> SendPermission:
+        """May a channel the REST ladder already started sending to still be
+        written to? Fails closed. Installed on the client as
+        ``still_permitted``.
+
+        The ladder asks this after each of its own waits, holding a channel id and
+        nothing else, so this answers strictly what a channel id can settle and
+        refuses when even that much is missing. Three arms decide everything a
+        channel id can decide:
+
+        * an id on the thread roster, or on the shared-channel roster, passes --
+          the same sets ``receive`` gates inbound on and :meth:`may_send_to`
+          consults, so a destination an operator withdraws stops being written to
+          mid-send. Both CURRENT rosters are read first, so moving an id between
+          ``allowed_thread_ids`` and ``allowed_channel_ids`` reads as the
+          reclassification it is rather than as a withdrawal;
+        * an id paired with a DM peer is decided on THAT peer, so the roster is
+          asked about the one user the message would actually reach. Every writer of
+          that pairing is DM-gated, which is what makes the pairing's presence a
+          reliable statement that the id is a DM channel and not a guild one;
+        * anything left is REFUSED. An id on no roster is either withdrawn or never
+          admitted, and a DM channel whose peer is not derivable here -- the DM
+          roster is keyed by the peer's user id while a DM link persists the channel
+          id ``create_dm_channel`` returned, and the pairing is not re-derivable
+          synchronously -- cannot be told from a withdrawn one. At a network egress
+          boundary "cannot tell" reads as no. Asking instead whether the roster
+          admits ANYBODY would let one remaining peer authorize a different, revoked
+          one.
+
+        A refusing final arm is what keeps this short: an id no roster and no pairing
+        can place is refused by it, so a separate record of what was once admitted
+        would answer after the same refusal and change nothing.
+
+        The cost of that last arm is an unattended proactive DM whose destination was
+        read back from a link written before a restart, and which served one of the
+        ladder's waits: it is refused rather than delivered. The alternative is
+        delivering to a peer whose authorization may already be gone, which is the
+        thing this exists to stop. A caller that needs the send to survive can re-open
+        the DM through ``create_dm_channel``, which establishes the pairing.
+
+        Each refusal names its OWN ground, because only here can the two be told
+        apart: a peer the roster refuses is a withdrawal, while an id nothing
+        can place is a destination this process cannot attribute. The caller reports
+        whichever it is, so an operator reading a dropped notification is not told a
+        policy changed when none did.
+        """
+        if not channel_id:
+            return SendPermission.unattributable()
+        if channel_id in self._allowed_threads:
+            return SendPermission.allow()
+        if channel_id in self._allowed_channels:
+            return SendPermission.allow()
+        peer = self._client.cached_dm_recipient(channel_id)
+        if peer is not None:
+            if peer in self._allowed:
+                return SendPermission.allow()
+            return SendPermission.revoked()
+        return SendPermission.unattributable()
+
+    def direct_peer_of(self, conversation_id: str) -> str:
+        """The user this DM channel belongs to, from the client's own pairing alone.
+
+        A Discord DM link persists the channel id ``create_dm_channel`` returned,
+        which is unrelated to the user snowflake, so the peer has to come from the
+        record that call (and an authorized inbound DM or button press) leaves --
+        ``cached_dm_recipient``, the same pairing :meth:`_still_may_send_to`
+        decides on. Every writer of that pairing is DM-gated, so an answer is also
+        the statement that the id is a DM channel and not a guild one; a guild
+        channel or thread id is never paired and reads ``""``.
+
+        This is what the per-send recipient leg reads as defense in depth for a
+        dashboard-born session's mirror: the gateway-signed record on the link names
+        the peer, and when this pairing knows the channel too the two must agree --
+        a disagreement refuses the send, whatever the record says.
+
+        Session control's owner-DM predicate (``owner_dm_refusal``) reads the same
+        answer to place a dashboard tab's mirror as the owner's own DM, and refuses
+        on ``""``: a DM opened before a restart stays refused THERE until the
+        pairing is learned again, while the recipient leg below admits it.
+
+        In-process only, by the pairing's own contract: a DM opened before a
+        restart names nobody until the bot re-opens it or the peer writes into it,
+        and the reader treats ``""`` as "not on record" rather than as a
+        contradiction -- the verified record stands at the recipient leg, so a
+        restart costs no admission there (the mid-send re-check, which reads this
+        pairing alone, can still refuse a send that waits before it is re-learned).
+        """
+        if not conversation_id:
+            return ""
+        return self._client.cached_dm_recipient(conversation_id) or ""
+
     # -- Lifecycle ----------------------------------------------------------
     async def connect(self) -> None:
         await self._client.start()
 
     async def disconnect(self) -> None:
         await self._client.close()
+
+    # -- Restart recovery of auto-created threads ---------------------------
+    async def readmit_own_thread(self, thread_id: str, caller: str) -> bool:
+        """Re-admit a thread ``auto_thread`` opened before this process started.
+
+        An auto-created thread is admitted in memory only, so a restart forgets
+        it. Rather than persist that grant in a file local code could write,
+        the same decision is re-derived from Discord itself: the thread is
+        admitted again only when Discord reports that THIS bot opened it, as a
+        public or announcement thread (the only kinds
+        ``create_thread_from_message`` makes), under a channel that is in
+        ``allowed_channel_ids`` right now. That is exactly the set of threads
+        the running process would already hold, minus any whose parent channel
+        an operator has since removed, so nothing is admitted that the
+        pre-restart process would have refused.
+
+        ``caller`` must be on the user roster too, and both rosters are read
+        AFTER the lookup, so a reload that removes the sender or the parent
+        while the call is in flight refuses the grant. The grant is
+        SEL-audited like the original (``thread_reauthorized``) and pushed to
+        the dispatcher's copy through the same callback. Fails closed on an
+        unknown bot identity, a failed lookup or any mismatch. A thread an
+        operator removed from ``allowed_thread_ids`` on a live reload is
+        refused too (checked before and after the lookup), so a revocation
+        holds until the next restart.
+        """
+        if not thread_id or thread_id in self._allowed_threads:
+            return bool(thread_id)
+        if thread_id in self._revoked_threads:
+            return False
+        bot_user_id = getattr(self._client, "bot_user_id", "")
+        if not bot_user_id or not self._allowed_channels:
+            return False
+        origin = await self._client.thread_origin(thread_id)
+        if (
+            thread_id in self._revoked_threads
+            or caller not in self._allowed
+            or origin is None
+            or origin.channel_type not in _AUTO_THREAD_TYPES
+            or origin.owner_id != bot_user_id
+            or origin.parent_id not in self._allowed_channels
+        ):
+            return False
+        self._allowed_threads.add(thread_id)
+        sel().log_api_access(
+            caller=caller or "unknown",
+            operation="discord_transport.auto_thread",
+            outcome="thread_reauthorized",
+            source="discord",
+            resources=f"channel={origin.parent_id},thread={thread_id}",
+        )
+        if self._on_thread_created is not None:
+            self._on_thread_created(thread_id)
+        return True
 
     # -- Inbound adapter ----------------------------------------------------
     def authorize(self, msg: InboundMessage) -> bool:
@@ -498,14 +681,19 @@ class DiscordTransport(MessagingTransport):
                 if self._on_thread_created is not None:
                     self._on_thread_created(created)
             elif inbound.channel_id not in self._allowed_threads:
-                if inbound.user_id in self._allowed:
+                # Only an approved sender can cost a REST lookup here, so
+                # background chatter in unrelated threads stays network-free.
+                if inbound.user_id not in self._allowed:
+                    return
+                if not await self.readmit_own_thread(inbound.channel_id, inbound.user_id):
                     sel().log_api_access(
                         caller=inbound.user_id,
                         operation="discord_transport.receive",
                         outcome="denied_unapproved_thread",
                         source="discord",
                     )
-                return
+                    return
+                thread_id = inbound.channel_id
             else:
                 thread_id = inbound.channel_id
         msg = DiscordInboundMessage(
@@ -519,6 +707,13 @@ class DiscordTransport(MessagingTransport):
         )
         if not self.authorize(msg):
             return
+        if not inbound.guild_id:
+            # An authorized DM names its peer, and the reply goes to this same
+            # channel without ever opening it, so this is the one point the
+            # pairing can be learned for the inbound direction. Guild channels
+            # are excluded: their ids are decided by the channel rosters, not by
+            # a peer.
+            self._client.remember_dm_recipient(inbound.channel_id, inbound.user_id)
         if thread_id and not await self._client.is_thread_channel(thread_id):
             sel().log_api_access(
                 caller=inbound.user_id,
@@ -528,4 +723,6 @@ class DiscordTransport(MessagingTransport):
             )
             return
         if self._dispatch is not None:
+            # Received from a person: its start is FOREGROUND (kiro_crew.start_priority).
+            msg.person_origin = True
             await self._dispatch(msg)

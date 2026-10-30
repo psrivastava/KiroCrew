@@ -146,20 +146,17 @@ def test_monitor_creation_surface_is_durable_and_legacy_records_fail_closed() ->
     assert monitor_state_from_dict(legacy).creation_surface is MonitorCreationSurface.UNKNOWN
 
 
-def test_structured_monitor_cadence_must_be_a_positive_integer() -> None:
+@pytest.mark.parametrize("cadence_secs", [0, -1, True, "300"])
+def test_structured_monitor_cadence_must_be_a_positive_integer(cadence_secs) -> None:
     """Structured monitors cannot inherit legacy unlimited or malformed cadence values."""
-    for cadence_secs in (0, -1, True, "300"):
-        try:
-            MonitorState(
-                kind="github_pull_request",
-                target="owner/repo#123",
-                objective="review_ready",
-                created_ts=1_000.0,
-                cadence_secs=cadence_secs,
-            )
-        except ValueError:
-            continue
-        raise AssertionError(f"cadence_secs={cadence_secs!r} was accepted")
+    with pytest.raises(ValueError):
+        MonitorState(
+            kind="github_pull_request",
+            target="owner/repo#123",
+            objective="review_ready",
+            created_ts=1_000.0,
+            cadence_secs=cadence_secs,
+        )
 
 
 def test_wake_count_defaults_to_zero_and_rejects_negative_values() -> None:
@@ -375,6 +372,48 @@ def test_public_projection_exposes_only_safe_latest_classification_fields() -> N
     assert isinstance(passed, list)
     passed.append("mutated public copy")
     assert "mutated public copy" not in repr(state.last_observation)
+
+
+def test_public_projection_carries_the_displaced_check_bucket_when_present() -> None:
+    """A retained displaced row has to reach the surface a human actually reads.
+
+    Keeping the row out of the verdict and then dropping it from the projection loses
+    it exactly where it is needed: the inspect payload is where an operator looks to
+    see which row a suppressed wake was suppressed for.
+    """
+    observation: dict[str, object] = {
+        "blocking_review": "none",
+        "checks": {
+            "failed": [],
+            "passed": ["CI / test"],
+            "pending": [],
+            "unknown": [],
+            "superseded": ["CI / test"],
+        },
+        "checks_complete": True,
+        "draft": False,
+        "head_revision": "0123456789abcdef0123456789abcdef01234567",
+        "kind": "github_pull_request",
+        "mergeability": "mergeable",
+        "review_decision": "approved",
+        "review_threads_complete": True,
+        "state": "open",
+        "target": "github.com/owner/repo#123",
+        "unresolved_review_threads": 0,
+    }
+    state = MonitorState(
+        kind="github_pull_request",
+        target="owner/repo#123",
+        objective="review_ready",
+        created_ts=1_000.0,
+        last_observation=observation,
+        last_observation_status=MonitorObservationStatus.SUCCESS,
+        last_observation_reason_code="review_ready",
+    )
+
+    public = monitor_state_public_dict(state)
+
+    assert public["last_observation"] == observation
 
 
 def test_public_projection_backfills_legacy_check_completeness() -> None:
@@ -620,10 +659,23 @@ async def test_unknown_monitor_version_is_never_armed(tmp_path) -> None:
         ),
     )
 
+    due = loop.next_due_ts
+
     with patch.object(service, "_arm_timer") as arm_timer:
         service._arm_from_deadline(loop)
+        arm_timer.assert_not_called()
+        # The stored intent belongs to the newer gateway, so the refusal leaves it as is.
+        assert loop.active is True
+        assert loop.next_due_ts == due
 
-    arm_timer.assert_not_called()
+        # Control: the same loop at the version this gateway implements does arm, so
+        # the refusal above is the version check and not some earlier early return.
+        assert loop.monitor is not None
+        loop.monitor.version = MonitorState(
+            kind="github_pull_request", target="o/r#1", objective="review_ready", created_ts=0.0
+        ).version
+        service._arm_from_deadline(loop)
+        assert [c.args[0] for c in arm_timer.call_args_list] == [loop]
 
 
 def test_future_monitor_without_current_identity_is_inert_and_survives_rewrite(tmp_path) -> None:

@@ -23,10 +23,11 @@ import { useNavigate } from 'react-router-dom'
 
 import { api } from '../../../api/client'
 import { sendTurn } from '../../../chat-core/transport/sendTurn'
+import { ensureChatFolder } from '../../../utils/ensureChatFolder'
 import { settleSeedReceipt } from '../../../utils/seedReceipt'
 import { isMissingSlotError } from '../../../utils/thunkError'
 import { useAppDispatch } from '../../../store'
-import { createSlot, deleteSlot, switchSlot } from '../../../store/chatSlice'
+import { createSlot, deleteSlot, requestSlotFolderOpen, switchSlot } from '../../../store/chatSlice'
 
 /** One folder per target repository groups every session from its runs. */
 const FOLDER_PREFIX = 'Auto-Improve - '
@@ -139,14 +140,17 @@ async function saveRecord(key: string, patch: Partial<SessionRecord>): Promise<S
 }
 
 /** Resolve the "Auto-Improve - <repo>" folder id, creating it on first use.
- *  Matched by name because folders have no upsert endpoint. */
+ *  Matched by name because folders have no upsert endpoint. A rejected list or
+ *  create propagates untouched; a create that answers without an id throws, so the
+ *  `Promise<string>` contract holds without a silent `undefined` folder id. */
 async function resolveFolderId(repo: string): Promise<string> {
-  const name = `${FOLDER_PREFIX}${repo}`
-  const folders = (await api.chatFolders()) as Array<{ id: string; name: string }>
-  const existing = Array.isArray(folders) ? folders.find((f) => f.name === name) : undefined
-  if (existing?.id) return existing.id
-  const created = (await api.createChatFolder(name)) as { id: string }
-  return created.id
+  const id = await ensureChatFolder({
+    list: () => api.chatFolders(),
+    create: (name) => api.createChatFolder(name),
+    name: `${FOLDER_PREFIX}${repo}`,
+  })
+  if (!id) throw new Error('Chat folder create returned no id')
+  return id
 }
 
 // Whether a rejection means the slot is genuinely GONE (and so justifies opening
@@ -236,6 +240,7 @@ export function useAgentSession(): UseAgentSession {
             folder_id: folderId,
             title: truncate(title),
             memory_mode: 'persistent',
+            sessionFolder: false,
           }),
         ).unwrap()
         // The slot is persisted but not yet linked, so a failure before the seed
@@ -270,6 +275,9 @@ export function useAgentSession(): UseAgentSession {
           url,
         })
         await dispatch(switchSlot(slot.key)).unwrap().catch(() => {})
+        // The app's folder can be collapsed: open its path so the row of the
+        // session /chat opens on shows. Skipped when the switch did not hold.
+        dispatch(requestSlotFolderOpen({ key: slot.key, folder_id: slot.folder_id || folderId, onlyIfActive: true }))
         navigate('/chat')
         return record
       } catch (e) {

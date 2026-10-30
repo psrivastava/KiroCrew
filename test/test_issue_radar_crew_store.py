@@ -1,5 +1,6 @@
-"""Tests for the crew store — records, work items, the event ledger and the
-shared skip index.
+"""Tests for the Issue Radar crew store: crew records, per-repo settings, and the
+crew LEDGER -- work items, progress lines and the repository-shared skip index --
+which is a fold of ``radar/recorded`` crew log entries rather than files of its own.
 
 The coverage here is deliberately weighted toward the invariants whose failure is
 SILENT, because those are the ones that corrupt the claim protocol rather than
@@ -17,37 +18,53 @@ raising:
   * **Slot accounting.** Every unfinished item consumes a work slot, because a
     crew never holds an issue waiting for a human: one it cannot progress alone is
     recorded as a pass and its claim released.
-  * **Ledger dedupe.** Duplicate lines merge on read, so an append retried after a
-    crash does not double-report.
-  * **The skip index is repo-wide and first-writer-wins.** It is one file every
-    crew writes, so it must take the repo-wide lock — under a per-crew lock two
-    crews would each read an index that predates the other and drop a decision,
-    and the dropped issue silently goes back to being re-investigated by everyone.
-    Behavioural assertions cannot detect that: sequential calls see each other
-    whatever lock is held, so the lock test asserts WHICH file is locked.
+  * **One entry per update.** The item's delta, the line that explains it and the
+    skip row that indexes a pass ride on ONE appended entry, so no reader can see
+    one without the others and a crash cannot separate them.
+  * **The skip index is repo-wide and first-decision-wins.** It is a fold across
+    every crew of the repository, and the EARLIEST recorded decision on a number
+    stands whichever crew's log it sits in.
 
-Every test runs against a ``tmp_path`` root — the store threads ``root`` through
-every function for exactly this reason, so nothing here touches a real data home.
+Every test runs against a ``tmp_path`` root -- the store threads ``root`` through
+every crew-record function -- and against its own crew log data home, so nothing
+here touches a real data home. A crew's ledger lives in the crew log of the
+session its slot runs on, so a test that records creates that unit first
+(:func:`_unit`) and passes its id as ``session_id``, exactly as the write route does.
+
+This file pins the crew records, the per-repository settings, the work-item rules and
+the one entry an update appends: what it carries, the refusals that name why nothing
+was appended, the read-back that answers it, the fold across every unit a crew's slot
+ran under, a cleared field and a collapsed repeat. The fold's bounds live in
+``test_issue_radar_crew_store_fold_bounds.py``, progress lines and crew-level sweeps in
+``test_issue_radar_crew_store_progress_lines.py``, the shared skip index (the
+repo-wide, first-decision-wins invariant above, and the skip row a pass's one entry
+carries) in ``test_issue_radar_crew_store_skip_index.py``, the pre-projection carry in
+``test_issue_radar_crew_store_legacy_carry.py``, the writes refused against a record
+that cannot be proven in ``test_issue_radar_crew_store_write_refusal.py``, the
+unit-order file in ``test_issue_radar_crew_store_unit_order.py`` and non-finite numbers
+in ``test_issue_radar_crew_store_non_finite.py``; the shared crew and ledger helpers
+live in ``issue_radar_crew_store_helpers.py``.
 """
 
-import inspect
 import json
-import math
-import os
-import threading
-import time
-from contextlib import contextmanager
 
 import pytest
+from issue_radar_crew_store_helpers import (  # noqa: F401 -- the autouse fixture registers by import
+    OWNER,
+    REPO,
+    _crew,
+    _entries,
+    _isolated_crew_log,
+    _item,
+    _live_crew,
+    _record,
+    _tick,
+    _unit,
+)
 
 from kiro_crew.apps.builtins.issue_radar.backend import crew_store as cs
-
-OWNER, REPO = "kirodotdev", "KiroCrew"  # brand-ok: the repository name
-
-
-def _crew(root, name="Andromeda", **spec):
-    return cs.create_crew(OWNER, REPO, {"name": name, **spec}, root)
-
+from kiro_crew.crew_log import emit as crew_log_emit
+from kiro_crew.crew_log import projection as crew_log_projection
 
 # ── crews ───────────────────────────────────────────────────────────────────
 
@@ -65,6 +82,31 @@ def test_create_assigns_id_slot_key_and_seed(tmp_path):
     assert crew["auto_merge"] is True and crew["unattended"] is True
 
 
+def test_a_crew_id_in_use_anywhere_is_never_minted_again(tmp_path, monkeypatch):
+    """A crew's id names its slot, and a slot is a data-home-wide name the crew log
+    lists units by: two crews in different repositories with one id would fold each
+    other's ledgers into one record. Creation checks every repository's crew records
+    and the crew log's slot listing before an id is taken, so a clash cannot happen."""
+    other = cs.create_crew("someone", "elsewhere", {"name": "Twin"}, root=tmp_path)
+    from kiro_crew.apps.builtins.issue_radar.backend import store as radar_store
+
+    gitlab_root = radar_store.provider_root(
+        root=tmp_path, provider="gitlab", host="gitlab.example.org"
+    )
+    foreign = cs.create_crew("group", "project", {"name": "Far"}, root=gitlab_root)
+    assert gitlab_root != tmp_path and "@providers" in str(gitlab_root)
+    _unit("c_deadbeef")  # a slot the crew log knows, with no crew record anywhere
+    minted = iter([other["id"][2:], foreign["id"][2:], "deadbeef", "0badf00d"])
+    monkeypatch.setattr(cs.secrets, "token_hex", lambda n: next(minted))
+    crew = cs.create_crew(OWNER, REPO, {"name": "Third"}, root=tmp_path)
+    assert crew["id"] == "c_0badf00d", "the three ids in use were passed over"
+    # And the check runs from a provider subtree the same way: the legacy root's
+    # crews are seen from there.
+    minted = iter([other["id"][2:], "0badf00e"])
+    twin = cs.create_crew("group", "other", {"name": "Fourth"}, root=gitlab_root)
+    assert twin["id"] == "c_0badf00e"
+
+
 def test_duplicate_name_is_refused(tmp_path):
     _crew(tmp_path)
     with pytest.raises(cs.CrewStoreError, match="already taken"):
@@ -74,12 +116,12 @@ def test_duplicate_name_is_refused(tmp_path):
 @pytest.mark.parametrize(
     "bad_id",
     [
-        "/etc/policy",                 # absolute: pathlib DISCARDS the base
-        "../../../../etc/policy",      # relative traversal
-        "c_1234abcd/../../escape",     # valid prefix, then escapes
-        "C_1234ABCD",                  # generator emits lowercase hex only
-        "c_12345678901234",            # right prefix, wrong length
-        "c_zzzzzzzz",                  # right shape, not hex
+        "/etc/policy",  # absolute: pathlib DISCARDS the base
+        "../../../../etc/policy",  # relative traversal
+        "c_1234abcd/../../escape",  # valid prefix, then escapes
+        "C_1234ABCD",  # generator emits lowercase hex only
+        "c_12345678901234",  # right prefix, wrong length
+        "c_zzzzzzzz",  # right shape, not hex
         "",
     ],
 )
@@ -107,9 +149,10 @@ def test_a_minted_id_is_accepted_by_every_constructor(tmp_path):
     assert cs._crew_lock_path(OWNER, REPO, crew["id"], tmp_path).name.endswith(".lock")
     assert cs.work_item_path(OWNER, REPO, crew["id"], 7, tmp_path).is_absolute()
     # And the store's own directory is the parent — nothing escaped.
-    assert cs.crews_dir(OWNER, REPO, tmp_path) in cs.crew_path(
-        OWNER, REPO, crew["id"], tmp_path
-    ).parents
+    assert (
+        cs.crews_dir(OWNER, REPO, tmp_path)
+        in cs.crew_path(OWNER, REPO, crew["id"], tmp_path).parents
+    )
 
 
 def test_a_rename_takes_the_repo_wide_record_lock(tmp_path):
@@ -145,11 +188,12 @@ def test_a_rename_takes_the_repo_wide_record_lock(tmp_path):
         cs._records_lock_path = real_records
         cs._crew_lock_path = real_per_crew
 
-    assert locked == ["repo-wide"], (
-        f"a rename must take only the repo-wide record lock, took {locked}"
-    )
+    assert locked == [
+        "repo-wide"
+    ], f"a rename must take only the repo-wide record lock, took {locked}"
     assert sorted(c["name"] for c in cs.list_crews(OWNER, REPO, tmp_path)) == [
-        "Bode", "Cocoon",
+        "Bode",
+        "Cocoon",
     ]
 
 
@@ -246,7 +290,9 @@ def test_the_needs_human_label_is_configurable_and_trimmed(tmp_path):
     """A repo with its own triage vocabulary configures it, and the stored value is
     trimmed — a label with a leading space is a DIFFERENT label on the forge, so the
     person watching the queue would never see the issues the crew filed."""
-    stored = cs.write_settings(OWNER, REPO, {"needs_human_label": "  needs: maintainer  "}, tmp_path)
+    stored = cs.write_settings(
+        OWNER, REPO, {"needs_human_label": "  needs: maintainer  "}, tmp_path
+    )
     assert stored["needs_human_label"] == "needs: maintainer"
     assert cs.read_settings(OWNER, REPO, tmp_path)["needs_human_label"] == "needs: maintainer"
 
@@ -306,83 +352,57 @@ def test_a_settings_file_missing_the_needs_human_label_reads_the_default(tmp_pat
     assert got["needs_human_label"] == cs.DEFAULT_SETTINGS["needs_human_label"]
 
 
-# ── work items ──────────────────────────────────────────────────────────────
+# ── the ledger: work items ──────────────────────────────────────────────────
+#
+# Every write below is one ``radar/recorded`` entry appended to the crew's live
+# unit, and every read is the ``radar`` fold of that unit. The properties are the
+# ones the file store had; what changed is that they now hold by construction of
+# one append rather than by three files and three locks.
 
 
-def test_upsert_stamps_claimed_at_and_merges_per_field(tmp_path):
-    crew = _crew(tmp_path)
+def test_a_record_stamps_claimed_at_and_merges_per_field(tmp_path):
+    crew, sid = _live_crew(tmp_path)
     cid = crew["id"]
-    first = cs.upsert_work_item(
-        OWNER, REPO, cid, 2251, {"phase": "claimed", "next": "read the call sites"}, tmp_path
+    first = _item(
+        tmp_path, cid, sid, 2251, {"phase": "claimed", "next": "read the call sites"}, "claim"
     )
     assert first["claimed_at"]
     assert first["next"] == "read the call sites"
 
     # A patch carrying only `decision` must preserve `next`.
-    second = cs.upsert_work_item(OWNER, REPO, cid, 2251, {"decision": "fix it"}, tmp_path)
+    second = _item(tmp_path, cid, sid, 2251, {"decision": "fix it"})
     assert second["decision"] == "fix it"
     assert second["next"] == "read the call sites"
     assert second["claimed_at"] == first["claimed_at"]
 
 
-def test_the_stored_text_is_exactly_the_serialisation_of_the_returned_record(tmp_path):
-    """``serialize_work_item(returned)`` == the bytes on disk.
-
-    One serialisation, pinned from both ends, so a record and the text standing for
-    it cannot drift: the rollback in ``commit_work_progress`` restores a snapshot of
-    this text, and a second copy of the format is how such a restore silently starts
-    writing something a reader coerces differently. Read literally — ``newline=""``
-    and utf-8 — because the property is byte equality, and universal-newline
-    translation on either side would hide a real mismatch on Windows.
-    """
-    crew = _crew(tmp_path)
-    for patch in (
-        {"phase": "claimed", "next": "read the call sites"},
-        {"phase": "implementing", "why": "one-line fix", "tried_approach": "reverting"},
-        {},
-    ):
-        item = cs.upsert_work_item(OWNER, REPO, crew["id"], 2251, patch, tmp_path)
-        path = cs.work_item_path(OWNER, REPO, crew["id"], 2251, tmp_path)
-        with path.open("r", encoding="utf-8", newline="") as fh:
-            assert fh.read() == cs.serialize_work_item(item)
-
-
-def _backdate(tmp_path, cid, number, stamp="2020-01-01T00:00:00Z"):
-    """Force a stale ``last_progress_at`` on disk.
-
-    Without this the stamp assertions below are TOOTHLESS: ``_now_iso`` has
-    one-second resolution, so two writes inside the same second produce an equal
-    stamp whether the code guards it or not, and the "did not renew" test would
-    pass even with the guard deleted.
-    """
-    path = cs.work_item_path(OWNER, REPO, cid, number, tmp_path)
-    rec = json.loads(path.read_text())
-    rec["last_progress_at"] = stamp
-    path.write_text(json.dumps(rec))
-    return stamp
-
-
-def test_no_op_write_does_not_renew_the_claim(tmp_path):
+def test_a_no_op_write_does_not_renew_the_claim(tmp_path):
     """The TTL is measured from ``last_progress_at``. A write that carries no
     progress must leave it alone, or a dead crew holds its claim forever."""
-    crew = _crew(tmp_path)
+    crew, sid = _live_crew(tmp_path)
     cid = crew["id"]
-    cs.upsert_work_item(OWNER, REPO, cid, 2251, {"phase": "claimed"}, tmp_path)
-    stale = _backdate(tmp_path, cid, 2251)
+    stamp = _item(tmp_path, cid, sid, 2251, {"phase": "claimed"}, "claim")["last_progress_at"]
 
-    assert cs.upsert_work_item(OWNER, REPO, cid, 2251, {}, tmp_path)["last_progress_at"] == stale
+    _tick()
+    polled = _record(tmp_path, cid, sid, 2251, {}, "ci", "polled")
+    assert polled["item"]["last_progress_at"] == stamp
+    # The line itself carries a LATER stamp, which is what makes the assertion above
+    # bite: the write was distinguishable from the first and still did not renew.
+    assert polled["event"]["ts"] > stamp
     # Re-asserting the SAME phase is not progress either.
-    again = cs.upsert_work_item(OWNER, REPO, cid, 2251, {"phase": "claimed"}, tmp_path)
-    assert again["last_progress_at"] == stale
+    _tick()
+    assert (
+        _item(tmp_path, cid, sid, 2251, {"phase": "claimed"}, "claim")["last_progress_at"] == stamp
+    )
     # Nor is a field that carries no new information.
-    same_next = cs.upsert_work_item(OWNER, REPO, cid, 2251, {"next": ""}, tmp_path)
-    assert same_next["last_progress_at"] == stale
+    _tick()
+    assert _item(tmp_path, cid, sid, 2251, {"next": ""})["last_progress_at"] == stamp
 
 
 def test_real_progress_moves_the_stamp(tmp_path):
-    crew = _crew(tmp_path)
+    crew, sid = _live_crew(tmp_path)
     cid = crew["id"]
-    cs.upsert_work_item(OWNER, REPO, cid, 2251, {"phase": "claimed"}, tmp_path)
+    stamp = _item(tmp_path, cid, sid, 2251, {"phase": "claimed"}, "claim")["last_progress_at"]
 
     for patch in (
         {"phase": "implementing"},
@@ -392,97 +412,105 @@ def test_real_progress_moves_the_stamp(tmp_path):
         {"tried_approach": "pywin32"},
         {"phase": "skipped"},
     ):
-        stale = _backdate(tmp_path, cid, 2251)
-        got = cs.upsert_work_item(OWNER, REPO, cid, 2251, patch, tmp_path)
-        assert got["last_progress_at"] != stale, f"{patch} should count as progress"
+        _tick()
+        got = _item(tmp_path, cid, sid, 2251, patch)
+        assert got["last_progress_at"] != stamp, f"{patch} should count as progress"
+        stamp = got["last_progress_at"]
 
 
-def test_second_editing_item_is_refused(tmp_path):
-    crew = _crew(tmp_path)
+def test_second_editing_item_is_refused_and_nothing_is_appended(tmp_path):
+    crew, sid = _live_crew(tmp_path)
     cid = crew["id"]
-    cs.upsert_work_item(OWNER, REPO, cid, 2251, {"phase": "implementing"}, tmp_path)
+    _item(tmp_path, cid, sid, 2251, {"phase": "implementing"})
+    before = len(_entries(sid))
     with pytest.raises(cs.CrewStoreError, match="already editing"):
-        cs.upsert_work_item(OWNER, REPO, cid, 2264, {"phase": "implementing"}, tmp_path)
+        _item(tmp_path, cid, sid, 2264, {"phase": "implementing"})
+    # An append-only log cannot take a line back, so the refusal happens BEFORE the
+    # append: the refused update left no entry behind.
+    assert len(_entries(sid)) == before
+    assert cs.read_work_item(OWNER, REPO, cid, 2264, tmp_path) is None
 
 
 def test_editing_slot_frees_when_the_first_item_parks(tmp_path):
-    crew = _crew(tmp_path)
+    crew, sid = _live_crew(tmp_path)
     cid = crew["id"]
-    cs.upsert_work_item(OWNER, REPO, cid, 2251, {"phase": "implementing"}, tmp_path)
-    cs.upsert_work_item(OWNER, REPO, cid, 2251, {"phase": "awaiting-ci"}, tmp_path)
-    other = cs.upsert_work_item(OWNER, REPO, cid, 2264, {"phase": "implementing"}, tmp_path)
+    _item(tmp_path, cid, sid, 2251, {"phase": "implementing"})
+    _item(tmp_path, cid, sid, 2251, {"phase": "awaiting-ci"}, "ci")
+    other = _item(tmp_path, cid, sid, 2264, {"phase": "implementing"})
     assert other["phase"] == "implementing"
 
 
 def test_staying_in_an_editing_phase_is_not_a_second_editor(tmp_path):
-    crew = _crew(tmp_path)
+    crew, sid = _live_crew(tmp_path)
     cid = crew["id"]
-    cs.upsert_work_item(OWNER, REPO, cid, 2251, {"phase": "implementing"}, tmp_path)
-    again = cs.upsert_work_item(
-        OWNER, REPO, cid, 2251, {"phase": "implementing", "next": "keep going"}, tmp_path
-    )
+    _item(tmp_path, cid, sid, 2251, {"phase": "implementing"})
+    again = _item(tmp_path, cid, sid, 2251, {"phase": "implementing", "next": "keep going"})
     assert again["next"] == "keep going"
 
 
 def test_unknown_phase_is_refused(tmp_path):
-    crew = _crew(tmp_path)
+    crew, sid = _live_crew(tmp_path)
     with pytest.raises(cs.CrewStoreError, match="unknown phase"):
-        cs.upsert_work_item(OWNER, REPO, crew["id"], 1, {"phase": "vibing"}, tmp_path)
+        _item(tmp_path, crew["id"], sid, 1, {"phase": "vibing"})
+    assert _entries(sid) == []
 
 
 def test_every_unfinished_item_consumes_a_slot(tmp_path):
     """No phase is exempt any more. A crew that needs a human records a PASS, which
-    is terminal and frees the slot — it does not sit on one holding the issue."""
-    crew = _crew(tmp_path)
+    is terminal and frees the slot -- it does not sit on one holding the issue."""
+    crew, sid = _live_crew(tmp_path)
     cid = crew["id"]
-    cs.upsert_work_item(OWNER, REPO, cid, 1, {"phase": "awaiting-ci"}, tmp_path)
-    cs.upsert_work_item(OWNER, REPO, cid, 2, {"phase": "awaiting-reply"}, tmp_path)
+    _item(tmp_path, cid, sid, 1, {"phase": "awaiting-ci"}, "ci")
+    _item(tmp_path, cid, sid, 2, {"phase": "awaiting-reply"}, "reply")
     assert cs.open_slot_count(OWNER, REPO, cid, tmp_path) == 2
-    cs.upsert_work_item(OWNER, REPO, cid, 2, {"phase": "skipped"}, tmp_path)
+    _item(tmp_path, cid, sid, 2, {"phase": "skipped"}, "skip")
     assert cs.open_slot_count(OWNER, REPO, cid, tmp_path) == 1
 
 
 def test_escalated_is_no_longer_a_phase(tmp_path):
     """The store is the choke point every writer passes through, so refusing it here
-    is what stops a stale caller — an older nudge, another installation's marker, a
-    crew resuming from a pre-change ledger — parking an issue on a human again."""
-    crew = _crew(tmp_path)
+    is what stops a stale caller -- an older nudge, another installation's marker, a
+    crew resuming from a pre-change ledger -- parking an issue on a human again."""
+    crew, sid = _live_crew(tmp_path)
     assert "escalated" not in cs.PHASES
     with pytest.raises(cs.CrewStoreError, match="unknown phase"):
-        cs.upsert_work_item(OWNER, REPO, crew["id"], 1, {"phase": "escalated"}, tmp_path)
+        _item(tmp_path, crew["id"], sid, 1, {"phase": "escalated"})
 
 
 def test_escalate_is_no_longer_an_event_kind(tmp_path):
-    crew = _crew(tmp_path)
+    crew, sid = _live_crew(tmp_path)
     assert "escalate" not in cs.EVENT_KINDS
     with pytest.raises(cs.CrewStoreError, match="unknown event kind"):
-        cs.append_event(OWNER, REPO, crew["id"], 1, "escalate", "asking the owner", tmp_path)
+        _record(tmp_path, crew["id"], sid, 1, {}, "escalate", "asking the owner")
 
 
-def test_a_stale_escalation_payload_is_dropped_rather_than_stored(tmp_path):
-    """The record is assembled field by field, so an unknown key in a patch is
-    dropped — the same discipline as every other unknown field.
+def test_a_stale_escalation_payload_is_dropped_rather_than_recorded(tmp_path):
+    """The entry is assembled field by field, so an unknown key in a patch is
+    dropped -- the same discipline as every other unknown field.
 
-    Pinned because the write is a MERGE: if the field came back, a crew resuming from
-    a pre-change ledger would carry an unanswerable question on its work item, and
-    the surface would have something to render a "waiting on a human" card from.
+    Pinned because the fold is a MERGE: if the field came back, a crew resuming
+    from a pre-change ledger would carry an unanswerable question on its work item,
+    and the surface would have something to render a "waiting on a human" card from.
     """
-    crew = _crew(tmp_path)
-    item = cs.upsert_work_item(
-        OWNER, REPO, crew["id"], 1,
-        {"phase": "claimed", "escalation": {"question": "which behaviour?"}},
+    crew, sid = _live_crew(tmp_path)
+    item = _item(
         tmp_path,
+        crew["id"],
+        sid,
+        1,
+        {"phase": "claimed", "escalation": {"question": "which behaviour?"}},
+        "claim",
     )
     assert "escalation" not in item
-    stored = json.loads(cs.work_item_path(OWNER, REPO, crew["id"], 1, tmp_path).read_text())
-    assert "escalation" not in stored
+    (entry,) = _entries(sid)
+    assert "escalation" not in entry.data
 
 
 def test_terminal_phase_frees_the_slot_and_stamps_finished(tmp_path):
-    crew = _crew(tmp_path)
+    crew, sid = _live_crew(tmp_path)
     cid = crew["id"]
-    cs.upsert_work_item(OWNER, REPO, cid, 1, {"phase": "implementing"}, tmp_path)
-    done = cs.upsert_work_item(OWNER, REPO, cid, 1, {"phase": "resolved"}, tmp_path)
+    _item(tmp_path, cid, sid, 1, {"phase": "implementing"})
+    done = _item(tmp_path, cid, sid, 1, {"phase": "resolved"}, "merge")
     assert done["finished_at"]
     assert cs.open_slot_count(OWNER, REPO, cid, tmp_path) == 0
 
@@ -490,18 +518,16 @@ def test_terminal_phase_frees_the_slot_and_stamps_finished(tmp_path):
 def test_reopening_clears_the_finish_stamp_so_the_next_one_counts(tmp_path):
     """A reopened issue's SECOND resolution is stamped at its own time.
 
-    REGRESSION: `finished_at` was written only when it was empty, so it recorded
-    the FIRST time this item ever went terminal and nothing cleared it. An issue
-    that was resolved, reopened and handled again by the same crew reuses this
-    item, so it stayed stamped in the past — putting the new resolution outside
+    REGRESSION (file store): `finished_at` was written only when it was empty, so it
+    recorded the FIRST time this item ever went terminal and nothing cleared it. An
+    issue that was resolved, reopened and handled again by the same crew reuses
+    this item, so it stayed stamped in the past -- putting the new resolution outside
     the `resolved24h` window and under-reporting work the crew had just done.
     """
-    crew = _crew(tmp_path)
+    crew, sid = _live_crew(tmp_path)
     cid = crew["id"]
-    cs.upsert_work_item(OWNER, REPO, cid, 1, {"phase": "implementing"}, tmp_path)
-    first = cs.upsert_work_item(
-        OWNER, REPO, cid, 1, {"phase": "resolved", "outcome": "merged in #9"}, tmp_path
-    )
+    _item(tmp_path, cid, sid, 1, {"phase": "implementing", "next": "land it"})
+    first = _item(tmp_path, cid, sid, 1, {"phase": "resolved", "outcome": "merged in #9"}, "merge")
     first_stamp = first["finished_at"]
     assert first_stamp
     assert first["outcome"] == "merged in #9"
@@ -509,1126 +535,467 @@ def test_reopening_clears_the_finish_stamp_so_the_next_one_counts(tmp_path):
     # Reopened: back to a live phase. NO field describing a finished result may
     # survive, or the item reads as finished while it is demonstrably being worked
     # again. `outcome` is asserted here as well as `finished_at` because the two
-    # were reported as separate defects — clearing one and keeping the other still
+    # were reported as separate defects -- clearing one and keeping the other still
     # leaves the ledger asserting a terminal result on active work.
-    live = cs.upsert_work_item(OWNER, REPO, cid, 1, {"phase": "implementing"}, tmp_path)
+    _tick()
+    live = _item(tmp_path, cid, sid, 1, {"phase": "implementing"})
     assert live["finished_at"] is None, "a reopened item still claims it finished"
     assert live["outcome"] is None, "a reopened item still carries its old outcome"
-    # Durable, not just in the returned dict — the stat card reads the file.
-    stored = json.loads(cs.work_item_path(OWNER, REPO, cid, 1, tmp_path).read_text())
+    # Folded, not just in the returned dict -- the stat card reads the fold.
+    stored = cs.read_work_item(OWNER, REPO, cid, 1, tmp_path)
     assert stored["finished_at"] is None
     assert stored["outcome"] is None
 
     # The crew's memory of what it already ruled out must NOT be cleared with it:
     # losing that makes it retry approaches it had rejected.
-    assert live["next"] == first["next"]
+    assert live["next"] == first["next"] == "land it"
 
-    again = cs.upsert_work_item(OWNER, REPO, cid, 1, {"phase": "resolved"}, tmp_path)
+    _tick()
+    again = _item(tmp_path, cid, sid, 1, {"phase": "resolved"}, "merge")
     assert again["finished_at"], "the second resolution was never stamped"
-    assert again["finished_at"] >= first_stamp
+    assert again["finished_at"] > first_stamp
 
 
 def test_tried_entries_append_rather_than_replace(tmp_path):
-    crew = _crew(tmp_path)
+    crew, sid = _live_crew(tmp_path)
     cid = crew["id"]
-    cs.upsert_work_item(
-        OWNER, REPO, cid, 1,
-        {"tried_approach": "hasattr guard", "tried_rejected_because": "loses the ACL"},
+    _item(
         tmp_path,
+        cid,
+        sid,
+        1,
+        {"tried_approach": "hasattr guard", "tried_rejected_because": "loses the ACL"},
     )
-    second = cs.upsert_work_item(OWNER, REPO, cid, 1, {"tried_approach": "pywin32"}, tmp_path)
+    second = _item(tmp_path, cid, sid, 1, {"tried_approach": "pywin32"})
     assert [t["approach"] for t in second["tried"]] == ["hasattr guard", "pywin32"]
     assert second["tried"][0]["rejected_because"] == "loses the ACL"
 
 
 def test_work_items_are_scoped_per_crew(tmp_path):
-    a = _crew(tmp_path, name="Andromeda")
-    b = _crew(tmp_path, name="Whirlpool")
-    cs.upsert_work_item(OWNER, REPO, a["id"], 2251, {"phase": "implementing"}, tmp_path)
-    # Same issue number, different crew — must not collide, and must not trip the
+    a, sid_a = _live_crew(tmp_path, name="Andromeda")
+    b, sid_b = _live_crew(tmp_path, name="Whirlpool")
+    _item(tmp_path, a["id"], sid_a, 2251, {"phase": "implementing"})
+    # Same issue number, different crew -- must not collide, and must not trip the
     # one-editor rule, which is per crew.
-    cs.upsert_work_item(OWNER, REPO, b["id"], 2251, {"phase": "implementing"}, tmp_path)
+    _item(tmp_path, b["id"], sid_b, 2251, {"phase": "implementing"})
     assert cs.read_work_item(OWNER, REPO, a["id"], 2251, tmp_path)["crew_id"] == a["id"]
     assert cs.read_work_item(OWNER, REPO, b["id"], 2251, tmp_path)["crew_id"] == b["id"]
 
 
-# ── event ledger ────────────────────────────────────────────────────────────
+# ── the ledger: one entry per update ────────────────────────────────────────
 
 
-def test_events_read_newest_first_and_filter_by_crew(tmp_path):
-    a = _crew(tmp_path, name="Andromeda")
-    b = _crew(tmp_path, name="Whirlpool")
-    cs.append_event(OWNER, REPO, a["id"], 1, "claim", "claimed", tmp_path)
-    cs.append_event(OWNER, REPO, b["id"], 2, "ci", "CI round 3", tmp_path)
-    all_events = cs.read_events(OWNER, REPO, tmp_path)
-    assert [e["kind"] for e in all_events] == ["ci", "claim"]
-    mine = cs.read_events(OWNER, REPO, tmp_path, crew_id=a["id"])
-    assert [e["kind"] for e in mine] == ["claim"]
-
-
-def test_duplicate_event_lines_collapse_on_read(tmp_path):
-    crew = _crew(tmp_path)
-    entry = cs.append_event(OWNER, REPO, crew["id"], 1, "claim", "claimed", tmp_path)
-    # Simulate an append retried after a crash: the same content-addressed id.
-    with open(cs.events_path(OWNER, REPO, tmp_path), "a", encoding="utf-8") as fd:
-        fd.write(json.dumps(entry) + "\n")
-    assert len(cs.read_events(OWNER, REPO, tmp_path)) == 1
-
-
-def test_malformed_line_does_not_hide_the_history_before_it(tmp_path):
-    crew = _crew(tmp_path)
-    cs.append_event(OWNER, REPO, crew["id"], 1, "claim", "claimed", tmp_path)
-    with open(cs.events_path(OWNER, REPO, tmp_path), "a", encoding="utf-8") as fd:
-        fd.write("{ this is a torn tail\n")
-    events = cs.read_events(OWNER, REPO, tmp_path)
-    assert [e["kind"] for e in events] == ["claim"]
-
-
-def test_unknown_event_kind_is_refused(tmp_path):
-    crew = _crew(tmp_path)
-    with pytest.raises(cs.CrewStoreError, match="unknown event kind"):
-        cs.append_event(OWNER, REPO, crew["id"], 1, "vibes", "…", tmp_path)
-
-
-# ── crew-level lines (a step that belongs to no issue) ──────────────────────
-#
-# The invariant these protect is the one the feature exists for: a crew that
-# checked the queue and took nothing must be able to SAY so. Before this, the
-# only way to record the cycle was to attribute it to an issue the crew never
-# acted on, so the ledger either lied or stayed silent. Both directions of the
-# pairing are asserted, because a crew-level kind carrying a number is the same
-# false attribution written the other way round.
-
-
-def test_a_crew_level_line_omits_the_number_entirely(tmp_path):
-    crew = _crew(tmp_path)
-    result = cs.record_crew_checkpoint(OWNER, REPO, crew["id"], "queue empty", tmp_path)
-    entry = result["event"]
-    # Absent, NOT zero: a `0` is indistinguishable from a real issue number in
-    # every filter and join that keys on this field.
-    assert "number" not in entry
-    stored = cs.read_events(OWNER, REPO, tmp_path)
-    assert len(stored) == 1
-    assert "number" not in stored[0]
-    assert (stored[0]["kind"], stored[0]["text"]) == ("sweep", "queue empty")
-
-
-def test_an_item_kind_without_a_number_is_refused(tmp_path):
-    # Asserted on the shared builder, which is where the pairing lives: the public
-    # issue-line writer types `number` as `int`, so this case cannot reach it.
-    with pytest.raises(cs.CrewStoreError, match="needs an issue number"):
-        cs._event_entry("c_1", None, "claim", "claimed")
-
-
-def test_a_crew_level_kind_with_a_number_is_refused(tmp_path):
-    crew = _crew(tmp_path)
-    with pytest.raises(cs.CrewStoreError, match="takes no issue number"):
-        cs.append_event(OWNER, REPO, crew["id"], 7, "sweep", "queue empty", tmp_path)
-
-
-def test_only_one_writer_shapes_a_numberless_line(tmp_path):
-    """`append_event` must NOT be a second way to write a crew-level line.
-
-    Coalescing has to read the crew's tail and decide whether to append at all,
-    under one lock hold, so the crew-level path cannot delegate to
-    `append_event`. That left two writers for the same shape, one of which no
-    production code called -- so the issue-line writer now requires a number and
-    the pairing check in the shared builder refuses a crew-level kind through it.
-    """
-    crew = _crew(tmp_path)
-    with pytest.raises(cs.CrewStoreError, match="takes no issue number"):
-        cs.append_event(OWNER, REPO, crew["id"], 1, cs.CREW_LEVEL_EVENT_KIND, "x", tmp_path)
-    # And the one legitimate writer still produces the same shape the builder makes.
-    built = cs._event_entry(crew["id"], None, cs.CREW_LEVEL_EVENT_KIND, "queue empty")
-    written = cs.record_crew_checkpoint(
-        OWNER, REPO, crew["id"], "queue empty", tmp_path
-    )["event"]
-    assert set(built) == set(written)
-
-
-def test_a_numbered_line_keeps_its_historical_id(tmp_path):
-    """The id formula for a NUMBERED line must not have changed.
-
-    It is content-addressed and drives merge-on-read dedupe, so a new formula
-    would give every existing line a fresh id and silently defeat the dedupe for
-    the whole ledger. Asserted against the literal formula rather than against a
-    golden string so the test does not need a frozen clock.
-    """
-    crew = _crew(tmp_path)
-    entry = cs.append_event(OWNER, REPO, crew["id"], 4, "claim", "claimed", tmp_path)
-    assert entry["id"] == cs._event_id(entry["ts"], crew["id"], 4, "claim", "claimed")
-    # And the two families cannot collide: the numberless variant renders the
-    # number as the empty string, which no real number produces.
-    assert cs._event_id(entry["ts"], crew["id"], None, "sweep", "x") != cs._event_id(
-        entry["ts"], crew["id"], 0, "sweep", "x"
+def test_one_call_appends_exactly_one_entry_carrying_only_what_it_set(tmp_path):
+    """The whole update is ONE line, which is what makes it crash-atomic."""
+    crew, sid = _live_crew(tmp_path)
+    cid = crew["id"]
+    _record(
+        tmp_path,
+        cid,
+        sid,
+        2251,
+        {
+            "phase": "implementing",
+            "next": "add the Windows branch",
+            "tried_approach": "hasattr guard",
+            "tried_rejected_because": "loses the ACL",
+            "branch": "fix/2251",
+            "pr_number": 2271,
+            "ci_state": {"state": "running", "round": 3},
+            "labels_applied": ["claimed", 7, "auto-fix"],
+        },
+        "implement",
+        "started",
     )
 
+    (entry,) = _entries(sid)
+    data = entry.data
+    assert data["crew_id"] == cid and data["owner"] == OWNER and data["repo"] == REPO
+    assert data["number"] == 2251 and data["phase"] == "implementing"
+    assert data["tried"] == {"approach": "hasattr guard", "rejected_because": "loses the ACL"}
+    assert data["ci_state"] == {"state": "running", "round": 3}
+    assert data["labels_applied"] == ["claimed", "auto-fix"], "a non-string label is dropped"
+    assert (data["event"], data["event_kind"]) == ("started", "implement")
+    # Only the fields this call SET: an omitted field means "unchanged", and writing
+    # it as null or empty would make the fold clear a value the caller never touched.
+    for absent in ("why", "decision", "worktree", "base_sha", "outcome", "skip", "carried"):
+        assert absent not in data
 
-def test_record_crew_checkpoint_writes_one_line_and_no_item(tmp_path):
-    crew = _crew(tmp_path)
-    result = cs.record_crew_checkpoint(
-        OWNER, REPO, crew["id"], "checked 42 open issues, took none", tmp_path
+
+def test_record_then_fold_is_a_round_trip(tmp_path):
+    """Every field a call sets comes back out of the fold that reads the entry."""
+    crew, sid = _live_crew(tmp_path)
+    cid = crew["id"]
+    result = _record(
+        tmp_path,
+        cid,
+        sid,
+        2251,
+        {
+            "phase": "awaiting-ci",
+            "decision": "fix the guard",
+            "why": "the test already fails",
+            "next": "watch round 3",
+            "worktree": "/w/2251",
+            "branch": "fix/2251",
+            "base_sha": "abc123",
+            "pr_number": 2271,
+            "claim_comment_id": 9911,
+            "ci_state": {"state": "running", "round": 3},
+            "labels_applied": ["claimed"],
+        },
+        "ci",
+        "opened the pull request",
     )
-    # Same envelope as commit_work_progress, so the write route answers one shape.
-    assert {"item", "event", "skip"} <= set(result)
-    assert result["item"] is None and result["skip"] is None
-    assert result["event"]["kind"] == "sweep"
-    assert result["coalesced"] is False
-    # No work item was created, so nothing consumes a work slot.
-    assert cs.list_work_items(OWNER, REPO, crew["id"], tmp_path) == []
+    item = cs.read_work_item(OWNER, REPO, cid, 2251, tmp_path)
+    assert item == result["item"]
+    assert item["phase"] == "awaiting-ci"
+    assert (item["decision"], item["why"], item["next"]) == (
+        "fix the guard",
+        "the test already fails",
+        "watch round 3",
+    )
+    assert (item["worktree"], item["branch"], item["base_sha"]) == ("/w/2251", "fix/2251", "abc123")
+    assert (item["pr_number"], item["claim_comment_id"]) == (2271, 9911)
+    assert item["ci_state"] == {"state": "running", "round": 3}
+    assert item["labels_applied"] == ["claimed"]
+    assert item["claimed_at"] == item["last_progress_at"]
+    assert item["finished_at"] is None and item["outcome"] is None
+    line = result["event"]
+    assert (line["kind"], line["text"], line["number"], line["phase"]) == (
+        "ci",
+        "opened the pull request",
+        2251,
+        "awaiting-ci",
+    )
+    assert cs.read_ledger(OWNER, REPO, cid, tmp_path)["phase_lines"]["2251"] == [
+        {"phase": "awaiting-ci", "at": line["ts"]}
+    ]
 
 
-def test_consecutive_sweeps_coalesce_instead_of_running_away(tmp_path):
-    """An idle crew must not bury its own work log.
+def test_the_answer_is_the_line_the_log_holds(tmp_path):
+    """The write answers with the entry AS THE FILE HOLDS IT, not an approximation.
 
-    A sweep is a recurring latest-value fact and the crew is nudged on a timer, so
-    one line per cycle would be an unbounded run. Every ledger read is capped and
-    drops the OLDEST line first, so a few hundred idle cycles would push the real
-    history out of the log the feature exists to make honest.
+    The line's id is content-addressed over its timestamp, and that timestamp comes
+    off the log's own clock when the writer appends -- so an answer stamped on this
+    side would name an id no reader could find. The writer is drained first and the
+    landed entry read back, which ``durable`` reports.
     """
+    crew, sid = _live_crew(tmp_path)
+    cid = crew["id"]
+    result = _record(tmp_path, cid, sid, 7, {"phase": "claimed"}, "claim", "took #7")
+    assert result["durable"] is True
+    (stored,) = cs.read_events(OWNER, REPO, tmp_path, crew_id=cid)
+    assert stored == result["event"]
+    assert cs.read_work_item(OWNER, REPO, cid, 7, tmp_path) == result["item"]
+
+
+def test_a_write_without_a_live_session_is_refused_by_name(tmp_path):
+    """No unit, no record -- and the refusal names the condition, so the route can
+    answer 409 ``crew_log_unavailable`` instead of a generic conflict."""
     crew = _crew(tmp_path)
-    first = cs.record_crew_checkpoint(OWNER, REPO, crew["id"], "queue empty", tmp_path)
-    again = cs.record_crew_checkpoint(OWNER, REPO, crew["id"], "still empty", tmp_path)
+    cid = crew["id"]
+    with pytest.raises(cs.CrewLedgerUnavailable, match="no live session"):
+        _record(tmp_path, cid, "", 7, {"phase": "claimed"}, "claim", "took #7")
+    # A live session whose crew log does not exist yet (created on its first turn).
+    with pytest.raises(cs.CrewLedgerUnavailable, match="first turn"):
+        _record(tmp_path, cid, "acp-never-ran", 7, {"phase": "claimed"}, "claim", "took #7")
+    with pytest.raises(cs.CrewLedgerUnavailable):
+        cs.record_crew_checkpoint(OWNER, REPO, cid, "queue empty", tmp_path, session_id="")
+    assert isinstance(cs.CrewLedgerUnavailable("x"), cs.CrewStoreError)
 
-    assert first["coalesced"] is False
-    assert again["coalesced"] is True
-    # The SECOND call is answered with the FIRST line, so the timestamp marks when
-    # the idle stretch began rather than when it was last observed.
-    assert again["event"]["id"] == first["event"]["id"]
-    assert again["event"]["text"] == "queue empty"
-    assert len(cs.read_events(OWNER, REPO, tmp_path)) == 1
+
+def test_a_crew_log_that_is_switched_off_refuses_the_write(tmp_path, monkeypatch):
+    crew, sid = _live_crew(tmp_path)
+    monkeypatch.setenv(crew_log_emit.CREW_LOG_ENV, "0")
+    crew_log_emit.reset_caches()
+    with pytest.raises(cs.CrewLedgerUnavailable, match=crew_log_emit.CREW_LOG_ENV):
+        _record(tmp_path, crew["id"], sid, 7, {"phase": "claimed"}, "claim", "took #7")
 
 
-def test_a_sweep_after_real_work_is_written(tmp_path):
-    # Coalescing keys on the crew's newest line, so the transition back into idle
-    # is recorded -- otherwise the guard would swallow every sweep after the first.
+def test_an_update_that_cannot_fit_one_entry_is_refused_before_anything_is_appended(tmp_path):
+    crew, sid = _live_crew(tmp_path)
+    cid = crew["id"]
+    _item(tmp_path, cid, sid, 7, {"phase": "claimed"}, "claim")
+    before = _entries(sid)
+    with pytest.raises(cs.CrewLedgerEntryTooLarge):
+        _item(tmp_path, cid, sid, 7, {"next": "x" * (100 * 1024)})
+    assert _entries(sid) == before
+    assert isinstance(cs.CrewLedgerEntryTooLarge("x"), cs.CrewStoreError)
+
+
+def test_a_crew_with_no_crew_log_reads_as_the_empty_record(tmp_path):
+    """The read path fails closed to NOTHING, never raises: it runs on every cycle."""
     crew = _crew(tmp_path)
-    cs.record_crew_checkpoint(OWNER, REPO, crew["id"], "queue empty", tmp_path)
-    cs.append_event(OWNER, REPO, crew["id"], 7, "claim", "took #7", tmp_path)
-    third = cs.record_crew_checkpoint(OWNER, REPO, crew["id"], "empty again", tmp_path)
-
-    assert third["coalesced"] is False
-    assert [e["kind"] for e in cs.read_events(OWNER, REPO, tmp_path)] == ["sweep", "claim", "sweep"]
-
-
-def test_a_sweep_blocked_on_the_lock_is_stamped_after_the_line_it_follows(tmp_path):
-    """File order and timestamp order must agree, so the two readers agree.
-
-    They disagree when it does not: :func:`_latest_crew_event` walks the file
-    backwards, so it keeps coalescing onto a trailing sweep, while the crew page
-    sorts by ``ts`` and never surfaces that sweep as the newest line. The idle
-    stretch then stays hidden for as long as the crew keeps idling -- exactly what
-    the ongoing-stretch wording exists to show. A writer that stamped its entry and
-    THEN blocked on the lock produced that inversion, so the stamp is taken under
-    the hold.
-    """
-    crew = _crew(tmp_path)
-    lock_path = cs.crews_dir(OWNER, REPO, tmp_path) / "events.lock"
-    started = threading.Event()
-
-    def _sweep():
-        started.set()
-        cs.record_crew_checkpoint(OWNER, REPO, crew["id"], "queue empty", tmp_path)
-
-    worker = threading.Thread(target=_sweep)
-    with open(lock_path, "w") as fd:
-        with cs.platform_compat.file_lock(fd.fileno(), exclusive=True):
-            worker.start()
-            assert started.wait(5)
-            # The sweep is now waiting on this hold. Append the numbered line that
-            # won the race: a stamp taken before the wait would predate it.
-            time.sleep(0.05)
-            cs._write_event_line(
-                OWNER, REPO, cs._event_entry(crew["id"], 7, "claim", "took #7"), tmp_path
-            )
-    worker.join(5)
-    assert not worker.is_alive()
-
-    # read_events is newest-first, so the sweep -- appended last -- comes first and
-    # must carry the LATER stamp.
-    stored = cs.read_events(OWNER, REPO, tmp_path)
-    assert [e["kind"] for e in stored] == ["sweep", "claim"]
-    assert stored[0]["ts"] >= stored[1]["ts"]
-
-
-def test_a_pause_does_not_break_the_fold_because_liveness_is_not_evidenced(tmp_path):
-    """Coalescing is deliberately blind to pause state -- see the docstring.
-
-    An earlier revision stamped ``paused_at`` and refused to fold across it, to stop
-    the page claiming an unbroken "checking since" run over a stop. That claim is
-    gone: the row now renders as a past instant, so the fold has nothing to protect,
-    and the field was removed rather than kept to cover one of the three stop modes
-    while a crash and a lost timer stayed uncovered. This pins the simpler rule so
-    it is not re-complicated without a reason.
-    """
-    crew = _crew(tmp_path)
-    first = cs.record_crew_checkpoint(OWNER, REPO, crew["id"], "queue empty", tmp_path)
-    cs.set_crew_paused(OWNER, REPO, crew["id"], True, "operator stopped it", tmp_path)
-    cs.set_crew_paused(OWNER, REPO, crew["id"], False, "", tmp_path)
-    after = cs.record_crew_checkpoint(OWNER, REPO, crew["id"], "empty again", tmp_path)
-
-    assert first["coalesced"] is False
-    assert after["coalesced"] is True
-    assert after["event"]["id"] == first["event"]["id"]
-    assert len(cs.read_events(OWNER, REPO, tmp_path)) == 1
-    # The record carries no pause timestamp: the field is gone, not merely unused.
-    assert "paused_at" not in cs.read_crew(OWNER, REPO, crew["id"], tmp_path)
-
-
-def test_one_crews_sweep_does_not_coalesce_anothers(tmp_path):
-    # The ledger file is repo-wide, so the tail read must be crew-scoped or one
-    # crew's idle line would silently swallow another crew's.
-    a = _crew(tmp_path, name="Andromeda")
-    b = _crew(tmp_path, name="Whirlpool")
-    cs.record_crew_checkpoint(OWNER, REPO, a["id"], "a is empty", tmp_path)
-    theirs = cs.record_crew_checkpoint(OWNER, REPO, b["id"], "b is empty", tmp_path)
-
-    assert theirs["coalesced"] is False
-    assert len(cs.read_events(OWNER, REPO, tmp_path)) == 2
-
-
-def test_the_checkpoint_writer_takes_no_kind_so_a_wrong_one_is_unrepresentable(tmp_path):
-    """The refusal became structural, which is why the guard that raised is gone.
-
-    An earlier revision took an ``event_kind`` and raised on anything but the
-    crew-level one. The route already 400s a non-crew-level kind on the numberless
-    path, so the argument could only ever carry the one value -- passing it existed
-    to be re-checked. Now the constant is written directly and a caller has nothing
-    to get wrong. The number/kind pairing is still enforced, in ``_event_entry``,
-    which the tests above cover in both directions.
-    """
-    crew = _crew(tmp_path)
-    assert "event_kind" not in inspect.signature(cs.record_crew_checkpoint).parameters
-    written = cs.record_crew_checkpoint(OWNER, REPO, crew["id"], "queue empty", tmp_path)
-    assert written["event"]["kind"] == cs.CREW_LEVEL_EVENT_KIND
-
-
-# ── phase classification ────────────────────────────────────────────────────
-
-
-def test_the_two_phase_classifications_do_not_coincide(tmp_path):
-    """This is the point of keeping two separate sets rather than a flag."""
-    # awaiting-ci: occupies a slot, is NOT ttl-active, is NOT editing.
-    assert "awaiting-ci" not in cs.TTL_ACTIVE_PHASES
-    assert "awaiting-ci" not in cs.EDITING_PHASES
-    assert "awaiting-ci" not in cs.TERMINAL_PHASES
-    # addressing-review: editing, but NOT ttl-active — an open pull request stands
-    # in for a heartbeat, so the claim does not age against it.
-    assert "addressing-review" in cs.EDITING_PHASES
-    assert "addressing-review" not in cs.TTL_ACTIVE_PHASES
-    # implementing: both ttl-active and editing, and slot-occupying.
-    assert "implementing" in cs.TTL_ACTIVE_PHASES
-    assert "implementing" in cs.EDITING_PHASES
-
-
-# ── shared skip index ───────────────────────────────────────────────────────
-
-
-def test_a_skip_is_readable_by_number_and_by_predicate(tmp_path):
-    crew = _crew(tmp_path)
-    entry, created = cs.record_skip(
-        OWNER, REPO, 42, "needs an owner decision on the data model",
-        "needs-design", crew["id"], tmp_path,
-    )
-    assert created is True
-    assert entry["number"] == 42
-    assert entry["scope"] == "needs-design"
-    assert entry["crew_id"] == crew["id"]
-    assert entry["decided_at"]
-    # Keyed by the STRING form, because that is what a JSON object key is — a
-    # reader that looked up the int would miss every entry.
-    assert set(cs.read_skips(OWNER, REPO, tmp_path)) == {"42"}
-    assert cs.is_skipped(OWNER, REPO, 42, tmp_path) is True
-    assert cs.is_skipped(OWNER, REPO, 43, tmp_path) is False
-
-
-def test_re_skipping_keeps_the_first_crews_reason(tmp_path):
-    """First-writer-wins, because the first reason is the audit trail.
-
-    Two crews reaching the same pass is normal; the record a human reads when
-    asking why an issue keeps being passed over must be the one that was actually
-    decided first, not whichever crew wrote most recently.
-    """
-    first = _crew(tmp_path, "Andromeda")
-    second = _crew(tmp_path, "Whirlpool")
-    cs.record_skip(OWNER, REPO, 42, "first reason", "architecture", first["id"], tmp_path)
-    returned, created = cs.record_skip(
-        OWNER, REPO, 42, "second reason", "duplicate", second["id"], tmp_path
-    )
-    # The first element is what now STANDS, so the second crew can see its own
-    # reason was not the one kept — and `created` says the write was a no-op.
-    assert created is False
-    assert returned["reason"] == "first reason"
-    assert returned["scope"] == "architecture"
-    assert returned["crew_id"] == first["id"]
-    stored = cs.read_skips(OWNER, REPO, tmp_path)
-    assert list(stored) == ["42"]
-    assert stored["42"]["reason"] == "first reason"
-    assert stored["42"]["crew_id"] == first["id"]
-
-
-@pytest.mark.parametrize("scope", ["needs-decision", "needs-investigation"])
-def test_a_needs_human_pass_is_accepted_and_indexed(tmp_path, scope):
-    """The two scopes that replace holding an issue for a human.
-
-    They have to survive :func:`coerce_skip_scope` verbatim rather than land in
-    ``other``: the scope is how the recent-skip list — and a person reading the
-    index — tells "this fleet does not do architecture work" from "somebody needs to
-    answer a question", and collapsing them loses the only signal that says a human
-    owes something back.
-    """
-    crew = _crew(tmp_path)
-    assert scope in cs.SKIP_SCOPES
-    assert cs.coerce_skip_scope(scope) == scope
-    entry, _created = cs.record_skip(
-        OWNER, REPO, 42, "needs the owner's call", scope, crew["id"], tmp_path
-    )
-    assert entry["scope"] == scope
-    assert cs.read_skips(OWNER, REPO, tmp_path)["42"]["scope"] == scope
-    assert cs.is_skipped(OWNER, REPO, 42, tmp_path) is True
-    assert cs.recent_skips(OWNER, REPO, tmp_path)[0]["scope"] == scope
-
-
-@pytest.mark.parametrize(
-    "given", ["needs_design", "NEEDS-DESIGN-ISH", "", None, "vibes", 7]
-)
-def test_an_unknown_scope_coerces_to_other(tmp_path, given):
-    """Coerced, never refused.
-
-    Refusing would cost the whole skip record for a bad filter label, and a pass
-    that fails to record is the exact duplicated investigation this index removes.
-    """
-    crew = _crew(tmp_path)
-    entry, _created = cs.record_skip(OWNER, REPO, 42, "why", given, crew["id"], tmp_path)
-    assert entry["scope"] == "other"
-    assert cs.read_skips(OWNER, REPO, tmp_path)["42"]["scope"] == "other"
-
-
-def test_a_known_scope_survives_case_and_padding(tmp_path):
-    crew = _crew(tmp_path)
-    entry, _created = cs.record_skip(
-        OWNER, REPO, 42, "why", "  Already-Fixed ", crew["id"], tmp_path
-    )
-    assert entry["scope"] == "already-fixed"
-
-
-def test_record_skip_reports_whether_this_call_created_the_entry(tmp_path):
-    """``created`` is decided under the lock, and it is the only honest source.
-
-    A caller cannot work this out for itself, and that is the point: the index is
-    repo-wide and first-writer-wins, so two crews passing on one number with the
-    SAME reason and scope produce a standing entry that both of them would
-    recognise as their own. Matching the stored fields against what was supplied —
-    or pre-reading the index and finding the number absent — says "I wrote this" to
-    both of them, and the loser then un-indexes the winner's committed decision when
-    its own request fails. Only the call that actually inserted the entry may report
-    creation.
-    """
-    author = _crew(tmp_path, "Andromeda")
-    other = _crew(tmp_path, "Whirlpool")
-
-    entry, created = cs.record_skip(
-        OWNER, REPO, 42, "not reproducible on main", "not-reproducible", author["id"], tmp_path
-    )
-    assert created is True
-
-    # Byte-identical arguments, and still not this call's entry to claim.
-    again, created_again = cs.record_skip(
-        OWNER, REPO, 42, "not reproducible on main", "not-reproducible", author["id"], tmp_path
-    )
-    assert created_again is False
-    assert again == entry
-
-    # A different crew reaching the same conclusion is the same answer.
-    _third, created_third = cs.record_skip(
-        OWNER, REPO, 42, "not reproducible on main", "not-reproducible", other["id"], tmp_path
-    )
-    assert created_third is False
-
-    # A number nobody has passed on yet is a creation again, so the flag tracks the
-    # write rather than being pinned False after the first call.
-    _fresh, created_fresh = cs.record_skip(
-        OWNER, REPO, 43, "duplicate of #42", "duplicate", author["id"], tmp_path
-    )
-    assert created_fresh is True
-
-
-def test_recent_skips_are_newest_first_and_bounded(tmp_path):
-    crew = _crew(tmp_path)
-    for number in range(1, 6):
-        cs.record_skip(OWNER, REPO, number, f"reason {number}", "other", crew["id"], tmp_path)
-    rows = cs.recent_skips(OWNER, REPO, tmp_path, limit=3)
-    assert [r["number"] for r in rows] == [5, 4, 3]
-
-
-def test_a_malformed_index_reads_as_empty_rather_than_raising(tmp_path):
-    # Consulted on the path where a crew decides whether to investigate: a torn
-    # file must cost one wasted investigation, not stop the crew.
-    _crew(tmp_path)
-    cs.skips_path(OWNER, REPO, tmp_path).write_text("{ not json")
+    cid = crew["id"]
+    assert cs.crew_log_units(OWNER, REPO, cid, tmp_path) == ()
+    ledger = cs.read_ledger(OWNER, REPO, cid, tmp_path)
+    assert (ledger["items"], ledger["events"], ledger["skips"]) == ([], [], {})
+    assert ledger["counts"] == {"open": 0, "evicted_items": 0, "evicted_skips": 0}
+    assert cs.list_work_items(OWNER, REPO, cid, tmp_path) == []
+    assert cs.read_events(OWNER, REPO, tmp_path) == []
     assert cs.read_skips(OWNER, REPO, tmp_path) == {}
     assert cs.is_skipped(OWNER, REPO, 42, tmp_path) is False
 
 
-def test_an_entry_whose_number_was_stored_as_a_string_still_reads_back_as_an_int(tmp_path):
-    # `skipped_numbers` is built from this field, so a string here would drop the
-    # issue out of the membership test every crew runs before investigating.
-    _crew(tmp_path)
-    cs.skips_path(OWNER, REPO, tmp_path).write_text(
-        json.dumps({"42": {"number": "42", "reason": "r", "scope": "other", "crew_id": "c"}})
+def test_a_crew_folds_across_every_unit_its_slot_ran_under(tmp_path):
+    """A slot owns one ACP session id at a time, so a crew that restarted has its
+    record spread over units; a read that did not join them would answer with
+    whichever part of the work happened to land in the newest session."""
+    crew, first = _live_crew(tmp_path)
+    cid = crew["id"]
+    _item(tmp_path, cid, first, 7, {"phase": "claimed", "next": "read it"}, "claim")
+    _tick()
+    second = _unit(cid)
+    later = _item(tmp_path, cid, second, 7, {"phase": "implementing"})
+
+    assert later["next"] == "read it", "the earlier unit's fields were not joined"
+    assert later["phase"] == "implementing"
+    assert [e["kind"] for e in cs.read_events(OWNER, REPO, tmp_path, crew_id=cid)] == [
+        "implement",
+        "claim",
+    ]
+    assert cs.crew_log_units(OWNER, REPO, cid, tmp_path) == (first, second)
+    # The LIVE unit applies last whatever the header clocks say.
+    assert cs.crew_log_units(OWNER, REPO, cid, tmp_path, live_session_id=first) == (second, first)
+    # One entry per unit: the second write did not re-state the first unit's record.
+    assert len(_entries(first)) == 1 and len(_entries(second)) == 1
+
+
+def test_a_read_continued_from_its_checkpoint_equals_a_cold_fold(tmp_path):
+    crew, sid = _live_crew(tmp_path)
+    cid = crew["id"]
+    for number, phase in ((7, "claimed"), (9, "investigating"), (7, "implementing")):
+        _item(tmp_path, cid, sid, number, {"phase": phase}, "claim")
+        warm = cs.read_ledger(OWNER, REPO, cid, tmp_path)
+        crew_log_projection.forget_slot_folds()
+        assert cs.read_ledger(OWNER, REPO, cid, tmp_path) == warm
+
+
+def test_the_clearable_fields_are_one_list_everywhere():
+    """The entry type declares the list; the store re-exports it; validation spells
+    it out for the tool schema's enum. Three spellings, one pin."""
+    from kiro_crew import validation
+    from kiro_crew.crew_log.entry_types import RADAR_CLEARABLE_FIELDS
+
+    assert tuple(cs.CLEARABLE_FIELDS) == tuple(RADAR_CLEARABLE_FIELDS)
+    assert frozenset(cs.CLEARABLE_FIELDS) == validation._ISSUE_RADAR_CREW_CLEARABLE_FIELDS
+    assert "phase" not in cs.CLEARABLE_FIELDS, "a phase moves, it is never emptied"
+
+
+def test_an_append_the_writer_refused_raises_instead_of_answering(tmp_path, monkeypatch):
+    """The writer drains and the entry is not in the log: it was refused. A refusal
+    is not a commit -- the write raises, the caller is told, and the fold shows
+    nothing. Synthesizing an answer is reserved for a writer still holding the
+    entry past the flush budget."""
+    from kiro_crew.crew_log import emit as crew_log_emit
+
+    crew, sid = _live_crew(tmp_path)
+    cid = crew["id"]
+    monkeypatch.setattr(crew_log_emit, "on_radar_recorded", lambda *_a, **_k: None)
+    with pytest.raises(cs.CrewLedgerNotRecorded):
+        _record(tmp_path, cid, sid, 2251, {"phase": "claimed"}, "claim", "took it")
+    assert cs.list_work_items(OWNER, REPO, cid, tmp_path) == []
+    assert _entries(sid) == []
+
+
+def test_a_log_gone_at_read_back_is_a_refusal_not_a_record(tmp_path, monkeypatch):
+    """The writer drains, but the session's log cannot be opened when the entry is
+    read back -- deleted under the write. The write cannot show the entry exists, so
+    it raises rather than handing the caller a synthetic record; the synthetic
+    answer is made only while the writer still holds the entry."""
+    crew, sid = _live_crew(tmp_path)
+    cid = crew["id"]
+    projection = cs._projection()
+    monkeypatch.setattr(projection, "open_session_log", lambda unit: None)  # the log vanished
+    with pytest.raises(cs.CrewLedgerNotRecorded):
+        _record(tmp_path, cid, sid, 2251, {"phase": "claimed"}, "claim", "took it")
+
+
+def test_a_read_back_that_fails_once_does_not_turn_a_landed_entry_into_a_refusal(
+    tmp_path, monkeypatch
+):
+    """A transient failure reading the entry back is retried once; the second read
+    finds the landed entry and the write answers it as durable."""
+    crew, sid = _live_crew(tmp_path)
+    cid = crew["id"]
+    projection = cs._projection()
+    real_open = projection.open_session_log
+    real_recorded = crew_log_emit.on_radar_recorded
+    failures = {"left": 0}
+
+    def recorded(*a, **k):
+        real_recorded(*a, **k)
+        failures["left"] = 1  # armed AFTER the append: the next read is the read-back
+
+    class _FlakyHandle:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def iter_from(self, *a, **k):
+            if failures["left"]:
+                failures["left"] -= 1
+                raise OSError("transient")
+            return self._inner.iter_from(*a, **k)
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+    monkeypatch.setattr(crew_log_emit, "on_radar_recorded", recorded)
+    monkeypatch.setattr(projection, "open_session_log", lambda unit: _FlakyHandle(real_open(unit)))
+    res = _record(tmp_path, cid, sid, 2251, {"phase": "claimed"}, "claim", "took it")
+    assert res["durable"] is True and failures["left"] == 0
+    assert len(_entries(sid)) == 1
+
+
+def test_an_explicit_null_clears_a_field_instead_of_being_dropped(tmp_path):
+    """``pr_number: null`` has always meant "no pull request any more". A typed
+    entry field cannot hold a null, so the writer carries the cleared names in
+    ``clear`` and the fold empties them -- an omitted field still means unchanged."""
+    crew, sid = _live_crew(tmp_path)
+    cid = crew["id"]
+    _item(
+        tmp_path,
+        cid,
+        sid,
+        2251,
+        {
+            "pr_number": 2271,
+            "claim_comment_id": 9911,
+            "decision": "fix it",
+            "ci_state": {"round": 3},
+            "labels_applied": ["claimed"],
+            "outcome": "merged",
+        },
     )
-    assert cs.read_skips(OWNER, REPO, tmp_path)["42"]["number"] == 42
+    cleared = _item(
+        tmp_path,
+        cid,
+        sid,
+        2251,
+        {
+            "pr_number": None,
+            "claim_comment_id": None,
+            "decision": None,
+            "ci_state": None,
+            "labels_applied": None,
+            "outcome": None,
+        },
+    )
+    assert cleared["pr_number"] is None and cleared["claim_comment_id"] is None
+    assert cleared["decision"] == ""
+    assert cleared["ci_state"] == {} and cleared["labels_applied"] == []
+    assert cleared["outcome"] is None
+    # Durable: the fold re-reads the same answer.
+    assert cs.read_work_item(OWNER, REPO, cid, 2251, tmp_path)["pr_number"] is None
+    # Carried as names, not as nulls -- the entry type refuses a typed null.
+    last = _entries(sid)[-1].data
+    assert sorted(last["clear"]) == sorted(
+        ["pr_number", "claim_comment_id", "decision", "ci_state", "labels_applied", "outcome"]
+    )
+    assert "pr_number" not in last
+    # An update that names nothing to clear carries no ``clear`` at all.
+    _item(tmp_path, cid, sid, 2251, {"next": "rebase"})
+    assert "clear" not in _entries(sid)[-1].data
+    # A clear and a set in ONE update: the set wins.
+    both = _item(tmp_path, cid, sid, 2251, {"pr_number": 2300})
+    assert both["pr_number"] == 2300
 
 
-def _inode(path):
-    try:
-        return os.stat(path).st_ino
-    except OSError:
-        return None
+def test_two_updates_with_the_same_line_but_different_fields_both_fold(tmp_path):
+    """The collapse of a repeated entry keys on the whole update, not on the line's
+    display identity: two same-millisecond calls with equal event text but
+    different patches must both apply, while an exact repeat applies once."""
+    from kiro_crew.crew_log import projection as crew_log
+    from kiro_crew.crew_log.schema import Entry
 
+    def entry(seq, data):
+        return Entry(
+            type=cs.LEDGER_ENTRY_TYPE, seq=seq, time=1_789_000_000_000, src="gateway", data=data
+        )
 
-def test_the_skip_index_write_takes_the_repo_wide_lock(tmp_path, monkeypatch):
-    """WHICH file is locked, not merely that the write works.
-
-    A behavioural assertion cannot detect the wrong lock here: two sequential
-    ``record_skip`` calls in one test see each other's writes whatever lock is
-    held, so a per-crew lock passes every functional test and only loses a
-    decision under real concurrency. So this spies on the fd handed to
-    ``file_lock`` and identifies the file by inode.
-    """
-    crew = _crew(tmp_path)
-    real_lock = cs.platform_compat.file_lock
-    locked: list[int] = []
-
-    @contextmanager
-    def _spy(fd, exclusive=False):
-        locked.append(os.fstat(fd).st_ino)
-        with real_lock(fd, exclusive=exclusive):
-            yield
-
-    monkeypatch.setattr(cs.platform_compat, "file_lock", _spy)
-    cs.record_skip(OWNER, REPO, 42, "why", "other", crew["id"], tmp_path)
-
-    records_lock = _inode(cs._records_lock_path(OWNER, REPO, tmp_path))
-    assert records_lock is not None
-    # Exactly the repo-wide lock: not the crew's, and not nothing.
-    assert locked == [records_lock]
-    assert _inode(cs._crew_lock_path(OWNER, REPO, crew["id"], tmp_path)) not in locked
-
-
-# ── one crew's pass cannot be erased by another crew's rollback ─────────────
-#
-# `record_skip` taking the repo-wide lock makes ONE write of the index atomic. It
-# does NOT make a crew's OWNERSHIP of an entry outlive that write, and
-# `commit_work_progress` needs exactly that: it may un-index the entry later, when
-# its ledger append fails.
-#
-# The crew lock cannot supply it. The index is repo-wide and the crew lock is
-# per-crew, so two crews passing on ONE issue hold two DIFFERENT crew locks and are
-# serialised against each other by nothing: the second finds the first's entry,
-# reports no creation of its own, commits its item and its ledger line against it,
-# and the first's rollback then deletes it. The fleet is left with an issue that
-# reads as un-passed while a crew's own item and log say it passed on it — so every
-# crew re-investigates an issue somebody decided about, which is the most expensive
-# mistake this store can make.
-#
-# So `commit_work_progress` holds `_skip_lock_path` for the ONE issue number from
-# before the index write until after the rollback. Per-number and not repo-wide
-# because only two transactions contending for the SAME entry can do this to each
-# other; the tests below assert both halves of that — the same number blocks, a
-# different number does not.
-
-#: Every wait is bounded, so a lock that cannot be got FAILS a test rather than
-#: hanging it.
-_JOIN_TIMEOUT = 15.0
-
-#: How long a write that is expected to be BLOCKED is given to prove it is not.
-#: A pass that is not serialised lands in milliseconds, so this is three orders of
-#: magnitude of headroom, and it is only ever paid on the assertion path.
-_BLOCKED_FOR = 0.5
-
-#: How long a write that is expected to go STRAIGHT THROUGH is given to land.
-_UNBLOCKED_WITHIN = 5.0
-
-#: How long a parked transaction waits to be released. It MUST exceed every probe
-#: budget above: a park that expires on its own commits, drops the lock, and lets a
-#: probe that was genuinely blocked complete just inside its own deadline — which
-#: passes the test against the very bug it is there to catch. Proven, not guessed:
-#: with both budgets at 15s a repo-wide mutant of the hold passed this file.
-_PARK_FOR = 60.0
-
-
-def _pass_body(**over):
-    """The arguments for one crew's pass, so two calls can be made byte-identical."""
-    body = {
-        "patch": {"phase": "skipped"},
-        "event_kind": "skip",
-        "event_text": "passing on it",
-        "skip_reason": "needs an owner decision",
-        "skip_scope": "needs-decision",
+    base = {
+        "crew_id": "c_0a1b2c3d",
+        "owner": OWNER,
+        "repo": REPO,
+        "number": 7,
+        "event": "progress",
+        "event_kind": "ci",
     }
-    body.update(over)
-    return body
+    first = {**base, "pr_number": 100}
+    second = {**base, "next": "watch round 2"}  # same ms, same text, other fields
+    value = crew_log.fold("radar", [entry(1, first), entry(2, second), entry(3, dict(second))])
+    (item,) = value["items"]
+    assert item["pr_number"] == 100, "the first update folded"
+    assert item["next"] == "watch round 2", "the second update folded too"
+    # The exact repeat (entry 3) was applied once: one line for the two identical ones.
+    assert len(value["events"]) == 2
+    # And a repeated ``tried`` is the tell that a repeat was applied twice.
+    tried = {**base, "tried": {"approach": "hasattr guard", "rejected_because": "loses the ACL"}}
+    value = crew_log.fold("radar", [entry(1, tried), entry(2, dict(tried))])
+    assert [t["approach"] for t in value["items"][0]["tried"]] == ["hasattr guard"]
 
 
-def _pass(root, crew_id, number, **over):
-    body = _pass_body(**over)
-    return cs.commit_work_progress(
-        OWNER, REPO, crew_id, number,
-        body["patch"], body["event_kind"], body["event_text"],
-        skip_reason=body["skip_reason"], skip_scope=body["skip_scope"], root=root,
+def test_a_retried_update_stamped_later_is_still_applied_once():
+    """A write whose append landed but whose read-back was refused is answered 503 and
+    sent again; the retry is the same update stamped seconds later. Its line id
+    carries the stamp, so the repeat check keys on the payload alone: the update and
+    its event apply once, and a re-applied ``tried`` does not list twice."""
+    from kiro_crew.crew_log import projection as crew_log
+    from kiro_crew.crew_log.schema import Entry
+
+    data = {
+        "crew_id": "c_0a1b2c3d",
+        "owner": OWNER,
+        "repo": REPO,
+        "number": 7,
+        "event": "pywin32 is out",
+        "event_kind": "implement",
+        "tried": {"approach": "pywin32", "rejected_because": "no wheel"},
+    }
+    first = Entry(
+        type=cs.LEDGER_ENTRY_TYPE, seq=1, time=1_789_000_000_000, src="gateway", data=data
     )
+    retry = Entry(
+        type=cs.LEDGER_ENTRY_TYPE, seq=2, time=1_789_000_007_000, src="gateway", data=dict(data)
+    )
+    value = crew_log.fold("radar", [first, retry])
+    assert len(value["events"]) == 1, "one line for the update and its retry"
+    assert [t["approach"] for t in value["items"][0]["tried"]] == ["pywin32"]
 
 
-def test_a_lock_that_cannot_be_acquired_still_rolls_the_item_back(tmp_path, monkeypatch):
-    """Acquiring the skip lock is a step, so its failure must roll back like one.
+def test_an_identical_update_after_an_intervening_one_is_a_new_update():
+    """The repeat check compares against the item's LAST applied update only. An
+    item that returns to an earlier state with identical fields after other updates
+    is recording a new transition, and it applies -- a history-wide check would
+    silently drop it. A retry is the next update for its item, so the narrow check
+    still catches it."""
+    from kiro_crew.crew_log import projection as crew_log
+    from kiro_crew.crew_log.schema import Entry
 
-    REGRESSION: the acquisition sat OUTSIDE the rollback-protected ``try``. By then
-    the work item is already written, so an exception here — the lock is one more
-    open descriptor, and fd exhaustion or a permission fault raises — escaped past
-    the rollback and left the item changed with neither its skip-index entry nor its
-    ledger event. That torn state is the single outcome this transaction exists to
-    prevent, and it was reachable without any concurrency at all.
+    base = {"crew_id": "c_0a1b2c3d", "owner": OWNER, "repo": REPO, "number": 7}
+    blocked = {**base, "phase": "awaiting-ci", "event": "waiting on CI", "event_kind": "ci"}
+    working = {**base, "phase": "implementing", "event": "CI green, back on it", "event_kind": "ci"}
 
-    Asserted on the DURABLE item, because the rollback's whole purpose is what the
-    next reader sees on disk.
-    """
-    crew = _crew(tmp_path, "Andromeda")
-    cid = crew["id"]
-    cs.upsert_work_item(OWNER, REPO, cid, 7, {"phase": "investigating"}, tmp_path)
-
-    def _cannot_open_another_descriptor(owner, repo, number, root=None):
-        raise OSError(24, "Too many open files")
-
-    monkeypatch.setattr(cs, "_skip_lock", _cannot_open_another_descriptor)
-
-    with pytest.raises(OSError):
-        cs.commit_work_progress(
-            OWNER, REPO, cid, 7,
-            {"phase": "skipped"},
-            skip_reason="needs a design decision",
-            skip_scope="needs-design",
-            event_kind="skip",
-            event_text="passed on #7",
-            root=tmp_path,
+    def entry(seq, data):
+        return Entry(
+            type=cs.LEDGER_ENTRY_TYPE,
+            seq=seq,
+            time=1_789_000_000_000 + seq * 1000,
+            src="gateway",
+            data=dict(data),
         )
 
-    # The phase must be what it was, not the half-applied "skipped".
-    item = json.loads(cs.work_item_path(OWNER, REPO, cid, 7, tmp_path).read_text())
-    assert item["phase"] == "investigating", (
-        "the item kept a skipped phase whose index entry and ledger line never landed"
-    )
-    # And nothing partial anywhere else: no index entry, no event.
-    assert 7 not in cs.read_skips(OWNER, REPO, tmp_path).get("skipped_numbers", [])
-
-
-def test_a_rollback_cannot_erase_a_pass_another_crew_committed_on_the_same_issue(
-    tmp_path, monkeypatch
-):
-    """The interleaving in full: two DIFFERENT crews, ONE issue, first ledger fails.
-
-    The author indexes #7 and then fails at its ledger line. Whirlpool passes on the
-    SAME issue inside that window. Under a per-crew hold Whirlpool's ``record_skip``
-    finds the author's entry, reports no creation, and its item and ledger line
-    commit against it — and then the author's rollback deletes that entry, because
-    the entry is still byte-for-byte the one the author inserted. Nothing readable
-    distinguishes an adopter from an absence, so no comparison can catch this; only
-    making Whirlpool WAIT can.
-
-    Asserts the surviving entry is the COMMITTED one and that it is still there.
-    Both halves matter: an empty index is the bug, and an index still naming the
-    crew whose transaction failed would be a different one.
-    """
-    author = _crew(tmp_path, "Andromeda")
-    other = _crew(tmp_path, "Whirlpool")
-    real_append = cs.append_event
-    indexed = threading.Event()
-    other_committed = threading.Event()
-
-    def _fail_only_the_authors_ledger_line(
-        owner, repo, crew_id, number, kind, text, root=None, **kwargs
-    ):
-        if crew_id != author["id"]:
-            return real_append(owner, repo, crew_id, number, kind, text, root, **kwargs)
-        indexed.set()
-        # Bounded: with the hold in place the other crew CANNOT commit here, so this
-        # times out and the transaction goes on to fail either way.
-        other_committed.wait(timeout=_BLOCKED_FOR)
-        raise OSError("no space left on device")
-
-    monkeypatch.setattr(cs, "append_event", _fail_only_the_authors_ledger_line)
-
-    def _the_other_crews_pass():
-        # Only after the author's entry is in the index, so this is strictly the
-        # second writer — the position the bug needs.
-        if not indexed.wait(timeout=_JOIN_TIMEOUT):
-            return
-        _pass(tmp_path, other["id"], 7, skip_reason="already fixed upstream",
-              skip_scope="already-fixed", event_text="passing on #7")
-        other_committed.set()
-
-    thread = threading.Thread(target=_the_other_crews_pass, daemon=True)
-    thread.start()
-    with pytest.raises(OSError):
-        _pass(tmp_path, author["id"], 7, event_text="passing on #7")
-    thread.join(timeout=_JOIN_TIMEOUT)
-    assert not thread.is_alive(), "the other crew's pass never completed"
-
-    standing = cs.read_skips(OWNER, REPO, tmp_path)
-    assert list(standing) == ["7"], "the committed pass was un-indexed by the failed one"
-    assert standing["7"]["crew_id"] == other["id"]
-    assert standing["7"]["reason"] == "already fixed upstream"
-    # And it really did COMMIT — the entry above is backed by an item and a line.
-    item = cs.read_work_item(OWNER, REPO, other["id"], 7, tmp_path)
-    assert item is not None and item["phase"] == "skipped"
-    assert [e["crew_id"] for e in cs.read_events(OWNER, REPO, tmp_path)] == [other["id"]]
-    # The failed transaction left nothing of its own behind.
-    assert cs.read_work_item(OWNER, REPO, author["id"], 7, tmp_path) is None
-
-
-def test_a_failed_pass_does_not_erase_the_entry_it_adopted(tmp_path, monkeypatch):
-    """A re-skip that fails must leave the FIRST crew's entry alone.
-
-    The mirror of the test above, and the reason ``created`` gates the un-index at
-    all. Both calls supply byte-identical reason and scope, so the standing entry
-    matches what the second crew would have written and a field comparison reads as
-    "mine"; only the flag ``record_skip`` returns from inside its own lock says
-    otherwise.
-    """
-    author = _crew(tmp_path, "Andromeda")
-    other = _crew(tmp_path, "Whirlpool")
-    _pass(tmp_path, author["id"], 7)
-
-    monkeypatch.setattr(
-        cs, "append_event",
-        lambda *a, **k: (_ for _ in ()).throw(OSError("no space left on device")),
-    )
-    with pytest.raises(OSError):
-        _pass(tmp_path, other["id"], 7)   # byte-identical arguments
-
-    standing = cs.read_skips(OWNER, REPO, tmp_path)
-    assert list(standing) == ["7"], "a re-skip's rollback removed somebody else's entry"
-    assert standing["7"]["crew_id"] == author["id"]
-    assert standing["7"]["reason"] == "needs an owner decision"
-    assert cs.read_work_item(OWNER, REPO, other["id"], 7, tmp_path) is None
-
-
-def test_the_skip_hold_spans_the_ledger_write_and_is_scoped_to_the_one_issue(
-    tmp_path, monkeypatch
-):
-    """Both halves of the hold, from the outside: same issue blocks, another does not.
-
-    The outcome alone cannot show either one — a sequential pair of passes sees each
-    other's writes whatever is held — so this parks a transaction at its ledger write
-    and drives two competing passes from the test's own threads.
-
-    A pass on the SAME issue must not be able to commit, because the parked
-    transaction can still withdraw the entry it would commit against. A pass on a
-    DIFFERENT issue must go straight through: it contends for no entry this
-    transaction owns, and parking it would put every crew in the repo behind one
-    transaction's slowest write.
-    """
-    author = _crew(tmp_path, "Andromeda")
-    other = _crew(tmp_path, "Whirlpool")
-    third = _crew(tmp_path, "Bode")
-    real_append = cs.append_event
-    inside = threading.Event()
-    release = threading.Event()
-
-    def _park_at_the_ledger_write(
-        owner, repo, crew_id, number, kind, text, root=None, **kwargs
-    ):
-        if crew_id != author["id"]:
-            return real_append(owner, repo, crew_id, number, kind, text, root, **kwargs)
-        inside.set()
-        release.wait(timeout=_PARK_FOR)
-        return real_append(owner, repo, crew_id, number, kind, text, root, **kwargs)
-
-    monkeypatch.setattr(cs, "append_event", _park_at_the_ledger_write)
-
-    def _probe(crew_id, number, started, done):
-        started.set()
-        _pass(tmp_path, crew_id, number, event_text=f"passing on #{number}")
-        done.set()
-
-    same = {"started": threading.Event(), "done": threading.Event()}
-    elsewhere = {"started": threading.Event(), "done": threading.Event()}
-    parked = threading.Thread(
-        target=lambda: _pass(tmp_path, author["id"], 7, event_text="passing on #7"),
-        daemon=True,
-    )
-    parked.start()
-    assert inside.wait(timeout=_JOIN_TIMEOUT), "the transaction never reached its ledger write"
-
-    same_thread = threading.Thread(
-        target=_probe, args=(other["id"], 7, same["started"], same["done"]), daemon=True
-    )
-    elsewhere_thread = threading.Thread(
-        target=_probe, args=(third["id"], 99, elsewhere["started"], elsewhere["done"]),
-        daemon=True,
-    )
-    try:
-        same_thread.start()
-        assert same["started"].wait(timeout=_JOIN_TIMEOUT)
-        assert not same["done"].wait(timeout=_BLOCKED_FOR), (
-            "a pass on the SAME issue committed while the parked transaction could "
-            "still roll the entry back — the hold does not span the ledger write"
-        )
-
-        elsewhere_thread.start()
-        assert elsewhere["done"].wait(timeout=_UNBLOCKED_WITHIN), (
-            "a pass on a DIFFERENT issue was parked behind this one — the hold is "
-            "repo-wide rather than per-issue"
-        )
-    finally:
-        # A failing assertion must not leave the parked transaction holding a lock
-        # for the rest of this worker's run.
-        release.set()
-
-    for thread in (parked, same_thread, elsewhere_thread):
-        thread.join(timeout=_JOIN_TIMEOUT)
-        assert not thread.is_alive()
-
-    # Everything committed once the hold was released, and #7 kept the first
-    # decision: the hold ORDERS the passes, it does not lose any of them.
-    standing = cs.read_skips(OWNER, REPO, tmp_path)
-    assert sorted(standing) == ["7", "99"]
-    assert standing["7"]["crew_id"] == author["id"]
-    assert standing["99"]["crew_id"] == third["id"]
-
-
-# ── a file in the crews directory that is not a crew ────────────────────────
-#
-# The directory holds `settings.json` and `skipped.json` beside the records.
-# Excluding siblings BY NAME meant the first recorded skip was read as a crew:
-# it carries no `id`, so the watchdog launched a session keyed `crew-None` and,
-# because `unattended` defaults on, handed that phantom trust. The gate is the
-# crew-id SHAPE now, so any sibling added later is excluded without anyone
-# remembering to extend a list.
-
-
-def test_sibling_files_are_never_enumerated_as_crews(tmp_path):
-    crew = _crew(tmp_path)
-    d = cs.crews_dir(OWNER, REPO, tmp_path)
-    (d / "settings.json").write_text('{"claim_ttl_hours": 48}')
-    (d / "skipped.json").write_text('{"12": {"number": 12, "reason": "dup"}}')
-    # A plausible future sibling: the point is that nobody has to add it here.
-    (d / "index.json").write_text("{}")
-
-    listed = cs.list_crews(OWNER, REPO, tmp_path)
-
-    assert [c["id"] for c in listed] == [crew["id"]]
-    assert all(c.get("id") for c in listed), "a record with no id was enumerated"
-
-
-def test_recording_a_skip_does_not_create_a_phantom_crew(tmp_path):
-    crew = _crew(tmp_path)
-    before = [c["id"] for c in cs.list_crews(OWNER, REPO, tmp_path)]
-    cs.record_skip(OWNER, REPO, 12, "duplicate of #11", "duplicate", crew["id"], tmp_path)
-    after = [c["id"] for c in cs.list_crews(OWNER, REPO, tmp_path)]
-    assert after == before
-
-
-# ── non-finite numbers ──────────────────────────────────────────────────────
-#
-# Python's `json` decodes `Infinity`, `-Infinity` and `NaN` by default, and it
-# also produces them from a literal that looks ordinary: `1e309` overflows to
-# `inf` SILENTLY. `int()` accepts neither (`OverflowError` / `ValueError`), so
-# every numeric coercion in this store is a crash the store's contract does not
-# allow — a malformed STORED value must read as the default.
-#
-# Storing one instead of crashing would be worse, not better, which is why none of
-# these tests asserts a clamp: `json.dumps` writes a bare `Infinity`, which is not
-# JSON, so a single poisoned record makes the whole payload unparseable for the
-# dashboard — and a bound compared against it (`open_count >= inf`) is simply False
-# for every count, so the cap disappears without raising anything.
-
-#: Every literal a JSON body or a stored file can carry that decodes non-finite.
-#: `1e309` is here because it is the one that arrives without anybody writing
-#: `Infinity`: it is the shape a real overflow takes.
-NON_FINITE_LITERALS = ("1e309", "-1e309", "Infinity", "-Infinity", "NaN")
-
-
-@pytest.mark.parametrize("literal", ["47.9", "0.5", "-1.5", "2.000001"])
-def test_a_fractional_ttl_is_refused_rather_than_truncated(tmp_path, literal):
-    """A value the operator never asked for must not be stored silently.
-
-    REGRESSION: ``_finite_int`` ended in a bare ``int(value)``, which TRUNCATES, so
-    ``47.9`` stored as ``47`` and the form reported success. That is the same silent
-    substitution the frontend's ``Number.isInteger`` guard refuses one layer up —
-    refusing in both places means neither can invent a value on its own.
-
-    Asserted through the PATCH path: the previous value has to stand, exactly as it
-    does for a non-finite number or an over-long ``commit_trailer``.
-    """
-    cs.write_settings(OWNER, REPO, {"claim_ttl_hours": 48}, tmp_path)
-
-    cs.write_settings(OWNER, REPO, {"claim_ttl_hours": float(literal)}, tmp_path)
-
-    got = cs.read_settings(OWNER, REPO, tmp_path)
-    assert got["claim_ttl_hours"] == 48, "a fractional TTL was truncated into the record"
-
-
-def test_an_integral_float_is_still_accepted(tmp_path):
-    """``48.0`` carries no fraction, so refusing it would reject valid JSON.
-
-    The bound is "not an integer", not "not an int": a JSON number round-tripped
-    through a float is the ordinary shape a browser sends.
-    """
-    cs.write_settings(OWNER, REPO, {"claim_ttl_hours": 12}, tmp_path)
-
-    cs.write_settings(OWNER, REPO, {"claim_ttl_hours": 36.0}, tmp_path)
-
-    got = cs.read_settings(OWNER, REPO, tmp_path)
-    assert got["claim_ttl_hours"] == 36, "an integral float was refused"
-
-
-@pytest.mark.parametrize("literal", NON_FINITE_LITERALS)
-def test_a_non_finite_stored_ttl_reads_as_the_default(tmp_path, literal):
-    """The store's contract: a malformed stored value reads as the default.
-
-    Reachable without a request — a settings file is an ordinary JSON file in the
-    data home, so it can be hand-edited or restored from a backup.
-    """
-    path = cs.settings_path(OWNER, REPO, tmp_path)
-    path.write_text('{"schema": 1, "claim_ttl_hours": %s}' % literal)
-    assert json.loads(path.read_text())["claim_ttl_hours"] != 48, "literal decoded finite"
-
-    got = cs.read_settings(OWNER, REPO, tmp_path)
-
-    assert got["claim_ttl_hours"] == cs.DEFAULT_SETTINGS["claim_ttl_hours"]
-
-
-@pytest.mark.parametrize("literal", NON_FINITE_LITERALS)
-def test_a_non_finite_ttl_patch_leaves_the_stored_value_alone(tmp_path, literal):
-    """Same discipline as an over-long ``commit_trailer``: the value is dropped and
-    the previous one stands, rather than the write raising."""
-    cs.write_settings(OWNER, REPO, {"claim_ttl_hours": 12}, tmp_path)
-
-    stored = cs.write_settings(
-        OWNER, REPO, {"claim_ttl_hours": json.loads(literal)}, tmp_path
-    )
-
-    assert stored["claim_ttl_hours"] == 12
-    assert cs.read_settings(OWNER, REPO, tmp_path)["claim_ttl_hours"] == 12
-    # And the file it wrote is still JSON — `json.dumps` would have emitted a bare
-    # `Infinity`, which no strict parser reads.
-    _assert_strict_json(cs.settings_path(OWNER, REPO, tmp_path))
-
-
-@pytest.mark.parametrize("literal", NON_FINITE_LITERALS)
-def test_a_non_finite_max_open_is_ignored_like_any_out_of_range_value(tmp_path, literal):
-    crew = _crew(tmp_path)
-    updated = cs.update_crew(
-        OWNER, REPO, crew["id"], {"max_open": json.loads(literal)}, tmp_path
-    )
-    assert updated["max_open"] == cs._DEFAULT_CREW["max_open"]
-
-
-@pytest.mark.parametrize("literal", NON_FINITE_LITERALS)
-def test_a_non_finite_avatar_variant_stores_as_none(tmp_path, literal):
-    """``None`` is what this field already stores for a non-number, so a non-finite
-    number joins that case rather than getting a rule of its own."""
-    crew = _crew(tmp_path, avatar_variant=json.loads(literal))
-    assert crew["avatar_variant"] is None
-    updated = cs.update_crew(
-        OWNER, REPO, crew["id"], {"avatar_variant": json.loads(literal)}, tmp_path
-    )
-    assert updated["avatar_variant"] is None
-
-
-@pytest.mark.parametrize("field", ("pr_number", "claim_comment_id"))
-@pytest.mark.parametrize("literal", NON_FINITE_LITERALS)
-def test_a_non_finite_work_item_number_stores_as_none(tmp_path, field, literal):
-    crew = _crew(tmp_path)
-    item = cs.upsert_work_item(
-        OWNER, REPO, crew["id"], 2251, {field: json.loads(literal)}, tmp_path
-    )
-    assert item[field] is None
-    _assert_strict_json(cs.work_item_path(OWNER, REPO, crew["id"], 2251, tmp_path))
-
-
-def test_a_hand_edited_crew_record_cannot_defeat_the_slot_cap(tmp_path):
-    """The read side, and the reason it matters more than the write side.
-
-    Nothing in the app COMPARES against ``max_open`` with an exception to raise:
-    the crew's brief renders it as prose and the page tests ``open >= max_open``,
-    which is False for every count once the value is ``inf``. So an unchecked read
-    does not crash — it silently removes the cap.
-    """
-    crew = _crew(tmp_path)
-    _poison(cs.crew_path(OWNER, REPO, crew["id"], tmp_path), "max_open", "1e309")
-
-    got = cs.read_crew(OWNER, REPO, crew["id"], tmp_path)
-
-    assert got is not None
-    assert got["max_open"] == cs._DEFAULT_CREW["max_open"]
-    assert 99 >= got["max_open"], "the cap must be a number a count can exceed"
-    assert [c["max_open"] for c in cs.list_crews(OWNER, REPO, tmp_path)] == [
-        cs._DEFAULT_CREW["max_open"]
+    value = crew_log.fold("radar", [entry(1, blocked), entry(2, working), entry(3, blocked)])
+    (item,) = value["items"]
+    assert item["phase"] == "awaiting-ci", "the return to awaiting-ci applied"
+    assert [e["text"] for e in value["events"]] == [
+        "waiting on CI",
+        "CI green, back on it",
+        "waiting on CI",
     ]
-
-
-def test_a_hand_edited_crew_record_stays_serialisable(tmp_path):
-    """One poisoned record must not take the page down for every crew: ``GET /crews``
-    returns them all in one body, and a bare ``Infinity`` in it is not JSON."""
-    crew = _crew(tmp_path)
-    _poison(cs.crew_path(OWNER, REPO, crew["id"], tmp_path), "avatar_variant", "NaN")
-
-    got = cs.read_crew(OWNER, REPO, crew["id"], tmp_path)
-
-    assert got is not None
-    assert got["avatar_variant"] is None
-    # Strict, because `json.loads` would accept the `NaN` this asserts is gone.
-    json.loads(json.dumps(got), parse_constant=_reject_constant)
-
-
-def test_a_hand_edited_pr_number_is_not_written_back(tmp_path):
-    """A carried-forward value is re-serialised by the next write, so leaving it
-    alone would make the corruption permanent rather than transient."""
-    crew = _crew(tmp_path)
-    cs.upsert_work_item(OWNER, REPO, crew["id"], 2251, {"pr_number": 2271}, tmp_path)
-    path = cs.work_item_path(OWNER, REPO, crew["id"], 2251, tmp_path)
-    _poison(path, "pr_number", "1e309")
-
-    item = cs.upsert_work_item(OWNER, REPO, crew["id"], 2251, {"next": "rebase"}, tmp_path)
-
-    assert item["pr_number"] is None
-    _assert_strict_json(path)
-
-
-def test_legitimate_numbers_still_round_trip(tmp_path):
-    """The guard must not cost a valid value. Every field hardened above, with a
-    number a real caller sends."""
-    cs.write_settings(OWNER, REPO, {"claim_ttl_hours": 72}, tmp_path)
-    assert cs.read_settings(OWNER, REPO, tmp_path)["claim_ttl_hours"] == 72
-
-    crew = _crew(tmp_path, max_open=5, avatar_variant=2)
-    assert (crew["max_open"], crew["avatar_variant"]) == (5, 2)
-    reread = cs.read_crew(OWNER, REPO, crew["id"], tmp_path)
-    assert reread is not None
-    assert (reread["max_open"], reread["avatar_variant"]) == (5, 2)
-
-    item = cs.upsert_work_item(
-        OWNER, REPO, crew["id"], 2251,
-        {"pr_number": 2271, "claim_comment_id": 9911}, tmp_path,
+    # And a retry of that last update (same payload, next in line) is still one update.
+    value = crew_log.fold(
+        "radar", [entry(1, blocked), entry(2, working), entry(3, blocked), entry(4, blocked)]
     )
-    assert (item["pr_number"], item["claim_comment_id"]) == (2271, 9911)
-    # The carry-forward path preserves them too — a later write must not blank a
-    # field it was not given.
-    carried = cs.upsert_work_item(OWNER, REPO, crew["id"], 2251, {"next": "rebase"}, tmp_path)
-    assert (carried["pr_number"], carried["claim_comment_id"]) == (2271, 9911)
-    # The bound still rejects a finite out-of-range value, unchanged.
-    assert cs.update_crew(OWNER, REPO, crew["id"], {"max_open": 21}, tmp_path)["max_open"] == 5
-
-
-def _reject_constant(name: str):
-    raise AssertionError(f"non-finite constant {name} survived into the payload")
-
-
-def _poison(path, field: str, literal: str) -> None:
-    """Rewrite *field* in the JSON at *path* to the raw non-finite *literal*.
-
-    Through the FILE, because that is the only way such a value gets onto a record:
-    nothing in the store can write one. Through a sentinel rather than a textual
-    substitution on the old value, so the edit cannot land on another field that
-    happens to hold the same digits.
-    """
-    raw = {**json.loads(path.read_text()), field: "__poison__"}
-    path.write_text(json.dumps(raw).replace('"__poison__"', literal))
-    assert not math.isfinite(json.loads(path.read_text())[field]), "fixture is finite"
-
-
-def _assert_strict_json(path) -> None:
-    """The file parses under a decoder that refuses ``Infinity``/``NaN``.
-
-    ``json.loads`` ACCEPTS all three by default, so a plain re-read would pass on a
-    file no strict parser — including the dashboard's ``JSON.parse`` — can read.
-    """
-    json.loads(path.read_text(), parse_constant=_reject_constant)
-
-
-def test_a_write_that_does_not_move_the_item_leaves_phase_off_the_event_line(tmp_path):
-    """`phase` on an event line means an ENTRY into that phase, so a no-move write
-    must not carry one.
-
-    The fabric measures an open dwell from the MOST RECENT entry into the current
-    phase, which is what a review pass legitimately restarts. Stamping the
-    phase on every write makes each CI round -- which lands `ci_state` while the
-    item sits still in `awaiting-ci` -- look like a fresh entry, so an item parked
-    for hours reads as minutes old and never surfaces as stalled. The item polled
-    most often is the one whose stall would be hidden best, which is the exact
-    inversion of what the view is for.
-    """
-    crew = _crew(tmp_path)
-    cid = crew["id"]
-
-    entered = cs.commit_work_progress(
-        OWNER, REPO, cid, 7301, {"phase": "awaiting-ci"}, "ci", "round 1", root=tmp_path
-    )
-    assert entered["event"].get("phase") == "awaiting-ci", "an entry must be recorded"
-
-    for round_no in (2, 3):
-        polled = cs.commit_work_progress(
-            OWNER, REPO, cid, 7301,
-            {"ci_state": "pending", "ci_round": round_no},
-            "ci", f"round {round_no}", root=tmp_path,
-        )
-        assert "phase" not in polled["event"], (
-            "a write that did not move the item must not claim a phase entry "
-            f"(round {round_no} did)"
-        )
-
-    moved = cs.commit_work_progress(
-        OWNER, REPO, cid, 7301, {"phase": "implementing"}, "implement", "fix", root=tmp_path
-    )
-    assert moved["event"].get("phase") == "implementing", "a real move must be recorded"
-
-    # And a genuine RE-entry still records, so a round-trip keeps restarting the clock.
-    back = cs.commit_work_progress(
-        OWNER, REPO, cid, 7301, {"phase": "awaiting-ci"}, "ci", "round 4", root=tmp_path
-    )
-    assert back["event"].get("phase") == "awaiting-ci", "a re-entry must be recorded"
-
-    phases = [
-        ev.get("phase")
-        for ev in cs.read_events(OWNER, REPO, tmp_path, crew_id=cid)
-        if ev.get("number") == 7301
-    ]
-    assert [p for p in phases if p] == [
-        "awaiting-ci",
-        "implementing",
-        "awaiting-ci",
-    ], f"only entries should carry a phase, got {phases}"
-
-
-def test_a_wrong_shaped_item_file_does_not_break_the_next_write(tmp_path):
-    """A corrupted item file must not turn every later write into a 500.
-
-    The phase-entry check reads the pre-write snapshot to decide whether the item
-    moved. That file can hold any JSON shape once something has hand-edited or
-    truncated it, and a non-empty list or a bare string is TRUTHY -- so a truthiness
-    guard would hand `.get` a list and raise AttributeError, which is not a JSON
-    error and so escapes the decode suppression. The write would 500, the rollback
-    would restore the same bad bytes, and every retry would fail identically: the
-    item becomes permanently unwritable.
-    """
-    crew = _crew(tmp_path)
-    cid = crew["id"]
-    cs.commit_work_progress(
-        OWNER, REPO, cid, 7422, {"phase": "claimed"}, "claim", "mine", root=tmp_path
-    )
-
-    path = cs.work_item_path(OWNER, REPO, cid, 7422, tmp_path)
-    for corrupt in ('[1, 2]', '"just a string"', '17', '[]'):
-        path.write_text(corrupt, encoding="utf-8")
-        out = cs.commit_work_progress(
-            OWNER, REPO, cid, 7422,
-            {"phase": "implementing"}, "implement", "still writable", root=tmp_path,
-        )
-        assert out["item"]["phase"] == "implementing", f"write failed after {corrupt}"
-        # An unreadable snapshot is treated as "no previous phase", so the entry IS
-        # recorded -- the safe direction, since a missing entry loses the phase change.
-        assert out["event"].get("phase") == "implementing", (
-            f"a phase entry must still be recorded when the snapshot is {corrupt}"
-        )
+    assert len(value["events"]) == 3

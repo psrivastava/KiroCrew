@@ -244,7 +244,6 @@ class TestCronDedup:
         before = time.time()
         _run_callback(gw, job, stream_result="error: token expired")
         gw.slack.post_blocks.assert_called_once()
-        # Verify reminder prefix in the posted text
         posted_text = gw.slack.post_blocks.call_args
         assert "⚠️" in str(posted_text)
         # Dedup state should reset after successful reminder delivery
@@ -303,7 +302,6 @@ class TestCronFailureDedup:
         gw.slack.post_message = AsyncMock()
         job = _make_job()
         _run_callback_raising(gw, job, RuntimeError("boom"))
-        # First failure always posts to Slack
         assert gw.slack.post_message.await_count == 1
         # The framework-level failure DM names the machine hostname so
         # multi-gateway setups can tell which machine's session failed.
@@ -356,7 +354,6 @@ class TestCronFailureDedup:
         assert job.consecutive_failures == 2
         job.last_failure_at -= 3601
         _run_callback_raising(gw, job, exc)
-        # Re-alerted after window expired
         assert gw.slack.post_message.await_count == 2
         # Counter continues from the suppressed count (3) and the re-alert message
         # should reflect the persistent-failure variant.
@@ -373,7 +370,6 @@ class TestCronFailureDedup:
         job = _make_job()
         _run_callback_raising(gw, job, RuntimeError("boom"))
         assert job.last_failure_hash != ""
-        # Successful run clears failure dedup state
         _run_callback(gw, job, stream_result="recovered")
         assert job.last_failure_hash == ""
         assert job.consecutive_failures == 0
@@ -554,7 +550,7 @@ class TestCronFailurePersistence:
         with patch.object(svc, "_execute", side_effect=_hang), patch(
             "kiro_crew.cron._JOB_TIMEOUT_SECS", 0.05
         ):
-            asyncio.run(svc._run_job_isolated(job))
+            asyncio.run(svc._run_job_isolated(job, svc._claim_run(job.id, "scheduled")))
         svc2 = CronService(base_dir=tmp_path)
         svc2._load()
         assert svc2._jobs[0].last_failure_hash == ""

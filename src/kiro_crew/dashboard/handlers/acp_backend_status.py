@@ -169,19 +169,23 @@ def _row(state: Any, selectable: set) -> Dict[str, Any]:
     than holding a second, differently-shaped notion of a row -- and a field added
     to one verb cannot go missing from the other.
     """
+    from kiro_crew.acp_backends import backend_to_stored
     from kiro_crew.agent_sdk import (
         INSTALLED,
         MISSING,
         card_payload,
-        declaration_for,
         signs_in_separately,
     )
+    from kiro_crew.agent_sdk.backends import ACP_BACKENDS_INDEPENDENT_SETUP
+    from kiro_crew.agent_sdk.host_auth import sign_in_remedy
 
-    auth = declaration_for(state.backend)
     return {
-        "id": state.backend,
+        # The config-file spelling, so a row id is exactly what the panel PATCHes
+        # into ``agent.acp_backend`` (Kiro CLI is ``"kiro"``, never ``""``).
+        "id": backend_to_stored(state.backend),
         "policy_id": state.policy_id,
         "selectable": state.backend in selectable,
+        "independent_setup": state.backend in ACP_BACKENDS_INDEPENDENT_SETUP,
         "installed": state.installed,
         # Enforced here, not just by the probes: the contract makes this
         # non-empty ONLY for a MISSING verdict, so an UNKNOWN row can
@@ -190,6 +194,10 @@ def _row(state: Any, selectable: set) -> Dict[str, Any]:
             list(state.missing_components) if state.installed == MISSING else []
         ),
         "install_command": state.install_command,
+        # The release a resolving binary runs when it is not the verified one
+        # (``BackendInstallState.found_version``); MISSING-only, like the
+        # components it explains, so the panel shows "Wrong version" for it.
+        "found_version": state.found_version if state.installed == MISSING else "",
         # Clamped to a MISSING-free verdict for the same reason as
         # ``missing_components`` above: "installed but the running gateway
         # cannot use it yet" is only meaningful once the components are
@@ -209,7 +217,7 @@ def _row(state: Any, selectable: set) -> Dict[str, Any]:
         # identifier has no frontend reader and is not sent -- a field can
         # return with its first consumer.
         "auth": {
-            "sign_in_remedy": auth.sign_in_remedy,
+            "sign_in_remedy": sign_in_remedy(state.backend),
             "signs_in_separately": signs_in_separately(state.backend),
         },
         # The card. Every line is keyed by a machine id whose LABEL is the
@@ -258,16 +266,31 @@ async def api_acp_backend_status(request: web.Request) -> web.Response:
     if denial is not None:
         return denial
     backends = await asyncio.to_thread(_snapshot)
-    return web.json_response({"backends": backends})
+    runs_on_kas = await asyncio.to_thread(_kiro_selection_runs_on_kas)
+    # ``kiro_selection_runs_on_kas``: the stored pick is Kiro CLI and sessions run it
+    # on KAS (``agent_sdk.backends.KIRO_SELECTION_BACKEND``). The panel offers the
+    # one-click save of KAS on it, so the setting says what runs.
+    return web.json_response({"backends": backends, "kiro_selection_runs_on_kas": runs_on_kas})
+
+
+def _kiro_selection_runs_on_kas() -> bool:
+    """BLOCKING. ``False`` on any failure: the offer is optional, the panel is not."""
+    try:
+        from kiro_crew.kiro_on_kas_notice import kiro_selection_runs_on_kas
+
+        return kiro_selection_runs_on_kas()
+    except Exception:
+        logger.debug("could not read whether Kiro CLI runs on KAS", exc_info=True)
+        return False
 
 
 async def api_acp_backend_recheck(request: web.Request) -> web.Response:
     """POST /api/acp-backends/recheck -- re-probe ONE backend, cache cleared first.
 
-    The body names the backend: ``{"backend": "<id>"}``. The kiro backend is the
-    empty string in this vocabulary and is a REAL value, so an absent key and
-    ``""`` cannot be told apart by truthiness -- the key's PRESENCE is what is
-    checked.
+    The body names the backend: ``{"backend": "<id>"}``, in the row-id (config
+    file) vocabulary, where Kiro CLI is ``"kiro"``. The runtime id ``""`` is also
+    accepted for Kiro CLI, so an absent key and ``""`` cannot be told apart by
+    truthiness -- the key's PRESENCE is what is checked.
 
     The id is validated against ``ACP_BACKENDS_KNOWN`` before anything is cleared or
     probed. Not defensive tidying: an unvalidated id would be a caller-chosen key
@@ -300,9 +323,15 @@ async def api_acp_backend_recheck(request: web.Request) -> web.Response:
     # from -- so the id set and the allowlist the PATCH validates against come
     # from one place. The SDK is not asked for it because its only answer would
     # be ``probe_backends()``, which probes all eight to learn eight names.
-    from kiro_crew.acp_backends import ACP_BACKENDS_KNOWN
+    from kiro_crew.acp_backends import (
+        ACP_BACKEND_KIRO,
+        ACP_BACKENDS_KNOWN,
+        STORED_BACKEND_KIRO,
+    )
     from kiro_crew.agent_sdk import forget_for_recheck
 
+    if backend == STORED_BACKEND_KIRO:
+        backend = ACP_BACKEND_KIRO
     if not isinstance(backend, str) or backend not in ACP_BACKENDS_KNOWN:
         return web.json_response(
             {"error": _UNKNOWN_BACKEND_MESSAGE, "code": _CODE_UNKNOWN_BACKEND},
@@ -313,6 +342,30 @@ async def api_acp_backend_recheck(request: web.Request) -> web.Response:
     forget_for_recheck(backend)
     row = await asyncio.to_thread(_recheck, backend)
 
+    # The configured harness may have been installed after the initial config
+    # PATCH. This owner-requested POST is the first state-derived opportunity to
+    # persist first-run completion once the fresh probe says it is usable. GET
+    # remains read-only; a failed marker write is a retryable partial success.
+    from kiro_crew.kiro_prerequisite import KiroPrerequisiteService
+
+    prerequisite = request.app.get("kiro_prerequisite_service")
+    marker_write_failed = False
+    if (
+        isinstance(prerequisite, KiroPrerequisiteService)
+        and not prerequisite.initial_setup_complete
+    ):
+        from kiro_crew.config.loader import KiroCrewConfig
+
+        configured = await asyncio.to_thread(KiroCrewConfig.load)
+        if configured.agent.acp_backend == backend:
+            try:
+                await prerequisite.record_independent_backend_setup(backend)
+            except Exception:
+                logger.warning(
+                    "Could not record independent backend setup on re-check", exc_info=True
+                )
+                marker_write_failed = True
+
     caller = str(request.get("user") or "")
     audit_caller = str(request.get("app") or caller or "unknown")
 
@@ -320,9 +373,10 @@ async def api_acp_backend_recheck(request: web.Request) -> web.Response:
         sel().log_api_access(
             caller=audit_caller,
             operation=_AUDIT_RECHECK_OPERATION,
-            outcome="success",
+            outcome="error" if marker_write_failed else "success",
             source="dashboard",
             resources=backend or "kiro",
+            error=("setup_marker_write_failed" if marker_write_failed else ""),
         )
 
     # AFTER the work, not before it. Auditing first would record a success for a
@@ -337,4 +391,18 @@ async def api_acp_backend_recheck(request: web.Request) -> web.Response:
         # The answer is already computed and is what the operator asked for.
         logger.debug("Could not audit ACP backend re-check", exc_info=True)
 
+    if marker_write_failed:
+        # The fresh probe row rides along on the failure: the re-probe itself
+        # succeeded and only the marker write did not, so a client that dropped
+        # ``row`` here would re-paint the stale pre-install verdict under a
+        # "could not check" line. The client applies it exactly as it does the
+        # 200 body and still shows this marker-write message.
+        return web.json_response(
+            {
+                "error": "Agent check completed, but setup completion could not be recorded. Press Check again.",
+                "code": "setup_marker_write_failed",
+                "backend": row,
+            },
+            status=503,
+        )
     return web.json_response({"backend": row})

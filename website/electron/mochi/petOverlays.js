@@ -31,6 +31,10 @@
 const { app, BrowserWindow, ipcMain, screen } = require("electron");
 const fs = require("fs");
 const path = require("path");
+const {
+  createAppWindowErrorLatch,
+  isAppWindowErrorResponse,
+} = require("../app-window-error-latch");
 const { mochiPageUrl } = require("./pageUrl");
 
 /** ~60fps. Same value for the hitbox poll and the drag poll, as upstream. */
@@ -69,65 +73,18 @@ const DRAG_SAFETY_MS = 10_000;
 // recovery path, living inside the loop that owns target/switch state — so there
 // is no provider seam, no retry budget, and no superseded-window race to guard.
 
-/** True for ANY gateway error page on the main frame (4xx/5xx) — the signal to
- * hide, since an error body is a completed navigation, not a did-fail-load. */
-function isOverlayErrorPage(httpResponseCode) {
-  return typeof httpResponseCode === "number" && httpResponseCode >= 400;
-}
-
 /**
- * Overlays hidden because their last main-frame navigation was a gateway error
- * page, so the load-finished handler knows NOT to reveal them and the reconcile
- * tick knows which to re-arm. A WeakSet so a closed/GC'd window drops out on its
- * own and never pins a dead BrowserWindow.
- * @type {WeakSet<object>}
+ * The shared latch owns HTTP/transport classification and blanked-window state.
+ * Mochi owns the visible consequence: a failed full-display overlay is hidden.
  */
-const overlayBlanked = new WeakSet();
-
-/**
- * React to a completed main-frame navigation: an error page (>=400) latches the
- * overlay as blanked and hides it so it can never cover the display; any other
- * status clears the latch. Reloading is NOT done here — the reconcile tick owns
- * it (rearmBlankedOverlays), so there is no async work and no switch race.
- */
-function handleOverlayNavigation(win, httpResponseCode) {
-  if (win.isDestroyed()) return;
-  if (isOverlayErrorPage(httpResponseCode)) {
-    overlayBlanked.add(win);
-    win.hide();
-  } else {
-    overlayBlanked.delete(win);
-  }
-}
-
-// Chromium's own code for a navigation that was superseded by a newer one. It
-// fires on EVERY overlay whose loadURL is replaced by a re-arm, and the page it
-// leaves behind is the previous document, not an error page.
-const ERR_ABORTED = -3;
-
-/**
- * React to a main-frame load that FAILED at the transport (`did-fail-load`):
- * the gateway is unreachable, DNS is down, the tunnel is gone. Chromium then
- * commits its own error document, which the next `did-finish-load` would reveal
- * exactly like a pet page — an opaque full-display window with no close target,
- * the same trap the >=400 latch exists for. Hide and latch it; the reconcile
- * tick re-arms it when a target answers again. Sub-frame failures and aborted
- * (superseded) loads leave the pet page in place, so they must not hide it.
- */
-function handleOverlayLoadFailure(win, errorCode, isMainFrame) {
-  if (win.isDestroyed()) return;
-  if (isMainFrame === false || errorCode === ERR_ABORTED) return;
-  overlayBlanked.add(win);
-  win.hide();
-}
+const overlayErrorLatch = createAppWindowErrorLatch({ onBlank: (win) => win.hide() });
+const handleOverlayNavigation = overlayErrorLatch.handleNavigation;
+const handleOverlayLoadFailure = overlayErrorLatch.handleLoadFailure;
 
 /** True when any live overlay is currently hidden on an error page, so the host
  * only re-mints a token when there is actually one to heal. */
 function hasBlankedOverlay() {
-  for (const win of overlays.values()) {
-    if (!win.isDestroyed() && overlayBlanked.has(win)) return true;
-  }
-  return false;
+  return overlayErrorLatch.hasBlanked(overlays.values());
 }
 
 /**
@@ -144,14 +101,11 @@ function hasBlankedOverlay() {
 function rearmBlankedOverlays(baseUrl, token, viaCookie = false) {
   if (!baseUrl || (!token && !viaCookie)) return;
   const pageToken = viaCookie ? "" : token;
-  for (const [, win] of overlays) {
-    if (win.isDestroyed() || !overlayBlanked.has(win)) continue;
-    // Refresh the shared target so overlays built LATER for other displays load
-    // the same fresh origin + token.
-    currentBaseUrl = baseUrl;
-    currentToken = pageToken;
+  currentBaseUrl = baseUrl;
+  currentToken = pageToken;
+  overlayErrorLatch.rearm(overlays.values(), (win) => {
     win.loadURL(mochiPageUrl(currentBaseUrl, "pet.html", pageToken));
-  }
+  });
 }
 
 // ── Overlay registry (broadcastService.ts, overlay half) ───────────────────
@@ -212,7 +166,7 @@ let displayListenersBound = false;
 let petWindowsHidden = false;
 
 function canRevealOverlay(win) {
-  return !petWindowsHidden && !overlayBlanked.has(win);
+  return !petWindowsHidden && !overlayErrorLatch.isBlanked(win);
 }
 
 function setPetWindowsHidden(hidden) {
@@ -357,6 +311,33 @@ function clampLocal(localX, localY, bounds) {
   };
 }
 
+// ── Click-through state ───────────────────────────────────────────────────
+
+/**
+ * Make an overlay click-through. Every click-through call goes through here.
+ *
+ * Off Windows the overlay keeps `forward: true`, as upstream did.
+ *
+ * On Windows `forward` is NOT used (#23345). Electron implements it there by
+ * re-posting every mouse move to the overlay's Chromium widget, and Chromium
+ * answers each one by setting the cursor for the transparent page. The
+ * dashboard window shares the same UI thread, so its I-beam/hand and the
+ * overlay's arrow took turns on every move: the cursor flickered over text and
+ * buttons whenever Mochi was on.
+ *
+ * Mochi does not need the forwarded moves. Whether the pointer is over the pet,
+ * bubble or menu is decided in the MAIN process from
+ * `screen.getCursorScreenPoint()` (startHitPoll), and the overlay is made fully
+ * interactive (setIgnoreMouseEvents(false)) for the pet, the open menu and a
+ * drag before the renderer needs any mouse event.
+ *
+ * Read `process.platform` at call time so tests can switch it per case.
+ */
+function setClickThrough(win) {
+  if (process.platform === "win32") win.setIgnoreMouseEvents(true);
+  else win.setIgnoreMouseEvents(true, { forward: true });
+}
+
 // ── The handoff ───────────────────────────────────────────────────────────
 
 /**
@@ -372,7 +353,7 @@ function transferPetToDisplay(targetDisplayId, localX, localY, isDragging = fals
     if (oldWin && !oldWin.isDestroyed()) {
       oldWin.webContents.send("mochi-pet:set-active", false);
       if (!isDragging) {
-        oldWin.setIgnoreMouseEvents(true, { forward: true });
+        setClickThrough(oldWin);
       }
     }
   }
@@ -491,7 +472,7 @@ function stopDragPolling() {
   // display. The hitbox poll switches the active overlay back once the renderer
   // reports a real rectangle.
   for (const win of overlays.values()) {
-    if (!win.isDestroyed()) win.setIgnoreMouseEvents(true, { forward: true });
+    if (!win.isDestroyed()) setClickThrough(win);
   }
   lastIgnoreState = true;
 }
@@ -511,7 +492,7 @@ function startHitPoll() {
       // Safety net: an interactive overlay with no known hitbox swallows every
       // click on the display — the worst failure this module can produce.
       if (!lastIgnoreState) {
-        win.setIgnoreMouseEvents(true, { forward: true });
+        setClickThrough(win);
         lastIgnoreState = true;
       }
       return;
@@ -530,7 +511,7 @@ function startHitPoll() {
 
     if (shouldIgnore !== lastIgnoreState) {
       lastIgnoreState = shouldIgnore;
-      if (shouldIgnore) win.setIgnoreMouseEvents(true, { forward: true });
+      if (shouldIgnore) setClickThrough(win);
       else win.setIgnoreMouseEvents(false);
     }
   }, POLL_MS);
@@ -598,7 +579,7 @@ function bindIpc() {
     // false below.
     for (const [id, win] of overlays) {
       if (!win.isDestroyed() && id !== activeDisplayId) {
-        win.setIgnoreMouseEvents(true, { forward: true });
+        setClickThrough(win);
       }
     }
     lastIgnoreState = false;
@@ -608,7 +589,7 @@ function bindIpc() {
   ipcMain.on("mochi-pet:ignore-mouse", (_e, ignore) => {
     const win = activeDisplayId !== null ? overlays.get(activeDisplayId) : null;
     if (!win || win.isDestroyed()) return;
-    if (ignore) win.setIgnoreMouseEvents(true, { forward: true });
+    if (ignore) setClickThrough(win);
     else win.setIgnoreMouseEvents(false);
     lastIgnoreState = !!ignore;
   });
@@ -710,8 +691,11 @@ function createOverlayForDisplay(display) {
     },
   });
 
-  win.setFocusable(false);
-  win.setIgnoreMouseEvents(true, { forward: true });
+  // Not on Windows: there a non-activatable window has every mouse button-down
+  // eaten by Chromium's WM_MOUSEACTIVATE handler (MA_NOACTIVATEANDEAT), so the pet
+  // could never be clicked or dragged. acceptFirstMouse is the macOS-only analogue.
+  if (process.platform !== "win32") win.setFocusable(false);
+  setClickThrough(win);
   win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
   // INVISIBLE TO SCREEN CAPTURE (macOS NSWindowSharingNone, Windows
   // WDA_EXCLUDEFROMCAPTURE; no-op elsewhere). This window covers a whole display,
@@ -1098,7 +1082,7 @@ module.exports = {
   _clampLocal: clampLocal,
   _findNearestDisplay: findNearestDisplay,
   // Exported for tests: the error-page recovery policy + navigation handler.
-  _isOverlayErrorPage: isOverlayErrorPage,
+  _isOverlayErrorPage: isAppWindowErrorResponse,
   _handleOverlayNavigation: handleOverlayNavigation,
   _handleOverlayLoadFailure: handleOverlayLoadFailure,
   // Exported for tests: overlay-map lifecycle (identity-checked cleanup).

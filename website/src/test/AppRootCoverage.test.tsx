@@ -9,7 +9,7 @@
  *   segment's error / no-totals branches
  * - the Kiro credits modal with a bonus pool and a signed-in identity
  * - the notification popover's pointer-outside and route-change dismissals
- * - developer mode and the Electron native-menu navigation bridge
+ * - the old /developer route and the Electron native-menu bridges
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { act, screen, fireEvent, waitFor, within } from '@testing-library/react'
@@ -54,6 +54,7 @@ vi.mock('../api/client', () => ({
     applyUpdate: vi.fn().mockResolvedValue({}),
     cancelUpdate: vi.fn().mockResolvedValue({}),
     setAutoUpdate: vi.fn().mockResolvedValue({}),
+    kirocrewConfig: vi.fn().mockResolvedValue({ auto_update: true }),
   },
   isAuthBannerShown: vi.fn(() => false),
   ApiError: class ApiError extends Error {},
@@ -117,6 +118,7 @@ beforeEach(() => {
   vi.mocked(api.applyUpdate).mockResolvedValue({} as never)
   vi.mocked(api.cancelUpdate).mockResolvedValue({} as never)
   vi.mocked(api.setAutoUpdate).mockResolvedValue({} as never)
+  vi.mocked(api.kirocrewConfig).mockResolvedValue({ auto_update: true } as never)
   vi.mocked(api.system).mockResolvedValue({ mem_used_gb: 4, mem_total_gb: 16, cpu_pct: 25, disk_total_gb: 100, disk_free_gb: 60 } as never)
   vi.mocked(api.sessionsUsage).mockResolvedValue({ usage: { available: false } } as never)
 })
@@ -209,12 +211,16 @@ describe('App — changelog modal controls', () => {
   it('persists the auto-update preference from the changelog switch', async () => {
     renderShell()
     const dialog = await changelogDialog()
-    const toggle = within(dialog).getByRole('switch', { name: 'Auto-update on restart' })
+    const toggle = await within(dialog).findByRole('switch', { name: 'Update the gateway automatically' })
+    // Held until the saved value has been read.
+    await waitFor(() => expect(toggle).not.toHaveAttribute('aria-disabled'))
     expect(toggle.getAttribute('aria-checked')).toBe('true')
 
+    // The gateway now holds what it was sent, as the re-read after the save shows.
+    vi.mocked(api.kirocrewConfig).mockResolvedValue({ auto_update: false } as never)
     fireEvent.click(toggle)
     await waitFor(() => expect(api.setAutoUpdate).toHaveBeenCalledWith(false))
-    expect(toggle.getAttribute('aria-checked')).toBe('false')
+    await waitFor(() => expect(toggle.getAttribute('aria-checked')).toBe('false'))
   })
 })
 
@@ -372,12 +378,12 @@ describe('App — system metrics segment', () => {
     localStorage.setItem('mc-topbar-metrics', '1')
   })
 
-  it('shows an unavailable pill when the metrics fetch fails, and hides on click', async () => {
+  it('shows an unavailable notice when the metrics fetch fails, and hides on click', async () => {
     vi.mocked(api.system).mockRejectedValue(new Error('probe unreachable'))
     renderWithProviders(<App />, { route: '/chat' })
 
-    const pill = await screen.findByText('metrics unavailable')
-    fireEvent.click(pill)
+    expect(await screen.findByText('metrics unavailable')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'System metrics' }))
     await waitFor(() => expect(localStorage.getItem('mc-topbar-metrics')).toBe('0'))
     expect(screen.queryByText('metrics unavailable')).toBeNull()
   })
@@ -388,10 +394,9 @@ describe('App — system metrics segment', () => {
     } as never)
     renderWithProviders(<App />, { route: '/chat' })
 
-    const cpu = await screen.findByTitle('CPU: unavailable')
-    expect(cpu.textContent).toContain('—')
-    expect(screen.getByTitle('Memory: unavailable').textContent).toContain('—')
-    expect(screen.getByTitle('Disk: unavailable').textContent).toContain('—')
+    expect(await screen.findByText('CPU —')).toBeInTheDocument()
+    expect(screen.getByText('MEM —')).toBeInTheDocument()
+    expect(screen.getByText('DSK —')).toBeInTheDocument()
   })
 })
 
@@ -411,7 +416,7 @@ describe('App — Kiro credits modal', () => {
     vi.mocked(api.sessionsUsage).mockResolvedValue(usageWithBonus('https://example.awsapps.com/start') as never)
     renderWithProviders(<App />, { route: '/chat' })
 
-    fireEvent.click(await screen.findByTitle(/Kiro credit usage/))
+    fireEvent.click(await screen.findByTitle(/Kiro account & credits/))
     const dialog = await screen.findByRole('dialog')
     // Plan pool: the progressbar tracks the plan only, not bonus grants.
     expect(within(dialog).getByText('KIRO POWER')).toBeInTheDocument()
@@ -431,7 +436,7 @@ describe('App — Kiro credits modal', () => {
     vi.mocked(api.sessionsUsage).mockResolvedValue(usageWithBonus('not-a-url', 'IamIdentityCenter') as never)
     renderWithProviders(<App />, { route: '/chat' })
 
-    fireEvent.click(await screen.findByTitle(/Kiro credit usage/))
+    fireEvent.click(await screen.findByTitle(/Kiro account & credits/))
     const dialog = await screen.findByRole('dialog')
     expect(within(dialog).getByText('Signed in with IAM Identity Center')).toBeInTheDocument()
   })
@@ -478,12 +483,13 @@ describe('App — notification popover dismissal', () => {
 describe('App — Electron bridges', () => {
   beforeEach(() => { localStorage.setItem('mc-last-version', '0.4.0') })
 
-  it('relays the boot dev-mode state to the native shell', async () => {
+  it('asks the native shell to show its Developer Tools menu item at boot', async () => {
     const setDevMode = vi.fn()
     setElectronBridge({ setDevMode })
     renderWithProviders(<App />, { route: '/chat' })
     await screen.findByTestId('chat-page')
-    expect(setDevMode).toHaveBeenCalledWith(false)
+    expect(setDevMode).toHaveBeenCalledWith(true)
+    expect(setDevMode).not.toHaveBeenCalledWith(false)
   })
 
   it('routes a plain in-app path from the native menu and ignores a host-relative one', async () => {
@@ -519,32 +525,22 @@ describe('App — Electron bridges', () => {
   })
 })
 
-describe('App — developer mode', () => {
+describe('App — Developer page route', () => {
   beforeEach(() => { localStorage.setItem('mc-last-version', '0.4.0') })
 
-  it('adds the Developer rail entry with an unseen dot, then clears it on visit', async () => {
-    renderWithProviders(<App />, { route: '/chat' })
-    await screen.findByTestId('chat-page')
-    expect(screen.queryByRole('button', { name: 'Developer' })).toBeNull()
-
-    act(() => { window.dispatchEvent(new CustomEvent('mc-dev-mode-changed', { detail: true })) })
-
-    const devRow = await screen.findByRole('button', { name: 'Developer' })
-    expect(devRow.querySelector('.animate-pulse')).toBeTruthy()
-
-    fireEvent.click(devRow)
-    await screen.findByTestId('developer-page')
-    expect(devRow.querySelector('.animate-pulse')).toBeNull()
+  it('has no Developer rail entry, even with the old dev-mode key set', async () => {
+    localStorage.setItem('mc-dev-mode', '1')
+    try {
+      renderWithProviders(<App />, { route: '/chat' })
+      await screen.findByTestId('chat-page')
+      expect(screen.queryByRole('button', { name: 'Developer' })).toBeNull()
+    } finally {
+      localStorage.removeItem('mc-dev-mode')
+    }
   })
 
-  it('drops the Developer rail entry when developer mode is switched back off', async () => {
-    renderWithProviders(<App />, { route: '/chat' })
-    await screen.findByTestId('chat-page')
-
-    act(() => { window.dispatchEvent(new CustomEvent('mc-dev-mode-changed', { detail: true })) })
-    expect(await screen.findByRole('button', { name: 'Developer' })).toBeInTheDocument()
-
-    act(() => { window.dispatchEvent(new CustomEvent('mc-dev-mode-changed', { detail: false })) })
-    await waitFor(() => expect(screen.queryByRole('button', { name: 'Developer' })).toBeNull())
+  it('still serves the old /developer route', async () => {
+    renderWithProviders(<App />, { route: '/developer' })
+    expect(await screen.findByTestId('developer-page')).toBeInTheDocument()
   })
 })

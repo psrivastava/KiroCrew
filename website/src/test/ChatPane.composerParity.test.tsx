@@ -25,7 +25,7 @@ const engine = {
   download: null, sampleRef: { current: {} }, switchDevice: vi.fn(), deviceSwitchIsLive: false,
 }
 vi.mock('../hooks/useVoiceInput', () => ({ useVoiceInput: () => engine, voiceInputSupported: true }))
-vi.mock('../hooks/usePushToTalk', () => ({ usePushToTalk: () => undefined }))
+vi.mock('../hooks/usePushToTalk', () => ({ usePushToTalk: () => ({ config: { enabled: false, mode: 'hybrid', binding: { code: 'AltRight' }, holdMs: 500 }, phase: 'idle', holding: false }) }))
 vi.mock('react-virtuoso', () => ({
   Virtuoso: ({ data, itemContent }: { data?: unknown[]; itemContent: (index: number, item: unknown) => ReactNode }) => (
     <div data-testid="virtuoso">{data?.map((d: unknown, i: number) => <div key={i}>{itemContent(i, d)}</div>)}</div>
@@ -47,7 +47,6 @@ vi.mock('../api/client', () => ({
     fileSearch: vi.fn().mockResolvedValue({ root: '/repo', results: [] }),
     chatSlotAgent: vi.fn().mockResolvedValue(undefined),
     dashboardConfig: vi.fn().mockResolvedValue({ quick_send: false }),
-    planAction: vi.fn().mockResolvedValue({ ok: true }),
     sttConfig: vi.fn().mockResolvedValue({ enabled: true, available: true, streaming: false, dictation_panel: true, provider: 'local' }),
   },
   SEARCH_MIN_CHARS: 2,
@@ -113,7 +112,7 @@ async function renderPane() {
   return store
 }
 
-const mic = () => screen.getByRole('button', { name: 'Voice input' })
+const mic = () => screen.getByRole('button', { name: /^Voice input/ })
 
 beforeEach(() => { localStorage.clear(); engine.start.mockClear() })
 

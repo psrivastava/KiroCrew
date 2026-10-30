@@ -33,12 +33,13 @@ The administrator sets two things on the Kiro profile (Kiro console → Settings
 Shared settings): an MCP on/off toggle, and an **MCP Registry URL** pointing at a
 registry JSON file listing the allow-listed servers.
 
-With a registry URL configured, the client is in **registry access mode**, and
-its filter is *symmetric*:
+With a registry URL configured, the client is in **registry access mode**. The
+filter is symmetric for entries in the agent spec; Kiro CLI 2.6.0 and later can
+also load personal `mcp.json` servers alongside the registry-managed set:
 
-| Access mode | Entries that connect | Entries that are dropped |
+| Access mode | Agent-spec entries that connect | Agent-spec entries that are dropped |
 |---|---|---|
-| registry (a registry URL is set) | only entries carrying `"type": "registry"` that resolve to a catalog entry **of the same name** | everything else |
+| registry (a registry URL is set) | entries carrying `"type": "registry"` that resolve to a catalog entry **of the same name** | ordinary, non-registry entries in the agent spec |
 | non-registry (no registry URL) | ordinary entries | entries carrying `"type": "registry"` |
 
 Two consequences worth internalising:
@@ -50,6 +51,15 @@ Two consequences worth internalising:
   pointer into the catalog", and only `env`, `headers` and `timeout` are carried
   over from your entry as overrides. The `command` in a registry-type entry is
   not what launches.
+
+Registry servers a user installs from Kiro IDE or the Kiro CLI land in
+`~/.kiro/settings/mcp.json` as bare pointers, `{"type": "registry"}` with no
+`command` or `url`. Kiro Crew carries each pointer into the `kirocrew` agent spec
+unchanged, so kiro-cli resolves it there exactly as it does for its own sessions,
+and the dashboard lists it as **Not verified** rather than starting it (Kiro Crew
+cannot read the catalog). A pointer goes through the same tool-ref and
+auto-approve rules as any other user server. Sessions on the Claude and KAS
+backends still withhold every marked entry.
 
 Governance also **fails closed**: if the client cannot reach the governance API,
 MCP is disabled entirely rather than falling open.
@@ -72,7 +82,15 @@ distinguishes a governed account from an ungoverned one. Leave the setting
 are the ones dropped.
 
 Verify with `kirocrew doctor`, which grows an `MCP Governance (enterprise)`
-section whenever the local identity came from Identity Center.
+section when the local identity is one an administrator's registry can govern
+(an IAM Identity Center or API-key sign-in), when `agent.mcp_registry_mode` is
+set, or when registry-marked entries are present. The identity comes from the
+`auth.idc.*` rows in kiro-cli's local store or a `KIRO_API_KEY`. Some kiro-cli
+builds sign an Identity Center user in without writing those rows, so before
+telling you to turn registry mode off, doctor asks `kiro-cli whoami` for the
+account type. If whoami cannot answer either, the section says the identity is
+unknown and asks you to check with `kiro-cli whoami`, rather than assuming a
+personal account.
 
 ### 2. Have the administrator allow-list the servers
 
@@ -83,7 +101,7 @@ Kiro Crew needs three servers, and they must appear in the registry file under
 |---|---|
 | `kirocrew-core` | `spawn_run`, `learn_add`, artifacts, knowledge, monitoring — the bulk of the product |
 | `kirocrew-cron` | every scheduled job (`cron_add` and the whole cron surface) |
-| `kirocrew-computer` | desktop automation (inert unless separately enabled, but still filtered) |
+| `kirocrew-computer` | desktop automation on supported macOS and Windows hosts (inert unless separately enabled, but still filtered) |
 
 The registry file format is a subset of the MCP registry standard's server
 schema. Each entry needs a `packages` entry describing how to launch the server,
@@ -91,7 +109,10 @@ and — because all three Kiro Crew servers live behind one package — a
 `packageArguments` entry naming the subcommand. For a `pypi` package the client
 derives `uvx <identifier> <packageArguments>`, so an entry without the argument
 launches `uvx kirocrew` with no subcommand, which prints CLI help instead of
-speaking MCP and fails the handshake:
+speaking MCP and fails the handshake. Kiro Crew releases are not published to
+the public Python Package Index; the `pypi` example below therefore requires
+your organisation to mirror the matching `kirocrew` wheel into the Python index
+that `uvx` uses:
 
 ```json
 {
@@ -99,7 +120,7 @@ speaking MCP and fails the handshake:
     {
       "name": "kirocrew-core",
       "description": "Kiro Crew orchestration: subagents, memory, artifacts, monitoring",
-      "version": "0.3.0",
+      "version": "<fleet version>",
       "packages": [
         {
           "registryType": "pypi",
@@ -112,7 +133,7 @@ speaking MCP and fails the handshake:
     {
       "name": "kirocrew-cron",
       "description": "Kiro Crew scheduled jobs",
-      "version": "0.3.0",
+      "version": "<fleet version>",
       "packages": [
         {
           "registryType": "pypi",
@@ -124,8 +145,8 @@ speaking MCP and fails the handshake:
     },
     {
       "name": "kirocrew-computer",
-      "description": "Kiro Crew desktop automation (macOS, opt-in)",
-      "version": "0.3.0",
+      "description": "Kiro Crew desktop automation (macOS/Windows, opt-in)",
+      "version": "<fleet version>",
       "packages": [
         {
           "registryType": "pypi",
@@ -150,13 +171,47 @@ process, reached through subcommands (`kirocrew mcp-core`, `mcp-cron`,
 A registry-type entry hands the launch decision to the catalog: the client
 resolves the package and, when a locally installed server's version differs from
 the registry's, relaunches it at the registry's version. For a `pypi` entry that
-means `uvx` fetching Kiro Crew from PyPI into its own ephemeral environment — so
-the process serving your MCP tools can be a *different* Kiro Crew from the
-gateway serving your dashboard. Your `env` overrides (including `KIROCREW_HOME`)
-do flow through, which keeps the data home aligned, but the code does not.
+means `uvx` fetching Kiro Crew into its own ephemeral environment from its
+configured Python index. Because the project is not on public PyPI, that route
+works only when your organisation mirrors the wheel and version into an index
+visible to `uvx`. The process serving your MCP tools can then still be a
+*different* Kiro Crew from the gateway serving your dashboard. Your `env`
+overrides (including `KIROCREW_HOME`) do flow through, which keeps the data home
+aligned, but the code does not.
 
 Keep the registry `version` in step with your fleet's installed version. If your
 organisation pins Kiro Crew centrally, that pin now governs the MCP side too.
+
+## Known limitation: registry mode cannot work on the KAS backend
+
+Everything above is about Kiro CLI, which reads your agent spec off disk and so
+sees the `"type": "registry"` marker Kiro Crew writes into it. The KAS backend
+(`kiro-agent`) reads no spec: Kiro Crew projects the agent over the wire on
+`session/new`, and that wire schema has no slot for `type`. The marker is dropped
+in transit, the host therefore sees every server as unmarked, and in registry
+access mode it filters all of them out — Kiro Crew's own control plane included.
+
+What you see is a session that starts and chats normally with no MCP tools at
+all: no `spawn_run`, no `cron_add`, no `learn_add`, no artifacts, knowledge or
+monitoring, and no error from the host explaining it. Declaring registry mode
+does not fix it there, because the marker it writes cannot reach the filter.
+
+Kiro Crew makes the failure visible rather than silent. Projecting an agent onto
+that backend under registry mode logs a warning naming exactly this, and the
+servers your spec declares are withheld with a line each instead of being sent to
+be dropped downstream. Until the wire schema carries `type`:
+
+- run a registry-governed profile on Kiro CLI, where the marker is read from disk
+  and the servers survive;
+- or, on an install whose profile is not actually registry-governed, turn the
+  declaration off with `kirocrew config set agent.mcp_registry_mode false` — the
+  filter only runs when the administrator has set a registry URL, so a host
+  outside that profile loses nothing by not claiming to be governed.
+
+A muted server is dropped on the same wire for a similar reason: the schema
+accepts `"disabled": true` and then discards it, so Kiro Crew does not declare a
+muted server to that backend at all. The mute is honoured; it is simply honoured
+by omission.
 
 ## Version floor
 
@@ -243,10 +298,11 @@ the authority narrowed by it: allow-lists intersect, deny-lists union, a strictn
 level takes the stricter value. A subordinate cannot repeal by omission either — a
 scope it simply leaves out keeps the authority's value.
 
-Two values a subordinate sets are kept only when the authority left them empty:
+One value a subordinate sets is kept only when the authority left it empty:
 `updates.source` (where both name one, the authority's glob stands — two globs have no
-expressible intersection) and `channels.posture` (the authority's posture wins; a
-subordinate posture is not yet folded). A `min_version`
+expressible intersection). `channels.posture` folds leaf by leaf: where both tiers
+set the same leaf, an id must be allowed by both; a leaf only the subordinate sets
+is added as a further restriction. A `min_version`
 floor does fold: the higher of the two wins. A
 `~/.kiro/crew/security_policy.json` that cannot be used (unreadable, not JSON, or
 a document the schema rejects) beneath a central document is skipped with one
@@ -418,7 +474,7 @@ host runs under whatever local policy it has, which may be none.
 One document governing every host is the widest blast radius in this model, so
 plan the retraction before the first rollout.
 
-A time-boxed local override (a dated `break_glass` grant an authority document could issue to a lower tier) was designed for this change and **withdrawn before merge**: a channel by which a local document outranks the fleet ceiling is the override this ladder exists to remove, and the reviewed design carried its own expiry-handling and cache-trust defects. Recovery from a bad central push is by re-publishing a good document at the source. The override is tracked as the follow-up issue [#9106](https://github.com/kirodotdev/KiroCrew/issues/9106), not shipped here.
+Recovery from a bad central push is by re-publishing a good document at the source: no local document outranks the fleet ceiling. See [Loading + precedence](../system-specs/modules/governance.md#loading--precedence) in the governance spec.
 
 A running fleet is better protected than a restarting one, and the difference
 matters when you plan:
@@ -444,8 +500,9 @@ policy: `require_policy_signature` in the operator-controlled
 `admission_policy.json`, which demands one on *every* policy tier, the fetched one
 included.
 
-The trust key lives in that same file, under `trust_keys` keyed by the policy's
-`identity.issuer`. Both live there rather than in the policy for the same reason: a
+The trust key lives in that same file, keyed by the policy's `identity.issuer`:
+under `trust_public_keys` as a base64 Ed25519 **public** key (recommended), or under
+`trust_keys` as a shared HMAC secret. Both live there rather than in the policy for the same reason: a
 document must not be the authority on whether it has to be authentic, since an
 attacker rewriting the policy would simply clear such a flag — and
 `admission_policy.json` is on the protected floor the agent cannot write.
@@ -456,11 +513,15 @@ file does not invalidate it while changing any value does.
 
 Two limitations, stated plainly:
 
-- **The primitive is symmetric HMAC-SHA256.** Any host that can verify a
-  signature holds a secret that can also *produce* one, so this detects an
-  endpoint or transport that tampered with the document — not a host that decided
-  to forge its own. It raises the bar; it is not a public-key attestation. An
-  asymmetric verify swaps in behind the same helper if that changes.
+- **`trust_keys` is symmetric HMAC-SHA256.** Any host that can verify such a
+  signature holds a secret that can also *produce* one, so it detects an endpoint
+  or transport that tampered with the document — not a host that decided to forge
+  its own. `trust_public_keys` is the public-key answer: the host holds only the
+  public half and the private half stays with whoever signs. An issuer listed in
+  `trust_public_keys` is verified with Ed25519 alone; its `trust_keys` entry is no
+  longer consulted, even when the public-key value is a `null` or empty
+  placeholder: every policy from that issuer then reads as unverified, and is
+  refused when `require_policy_signature` is set.
 - **No signing runbook ships.** There is no `kirocrew policy sign`, no key
   distribution tooling and no rotation procedure; you compute the signature and
   place the key yourself. `require_policy_signature` on a fleet with no matching
@@ -468,6 +529,19 @@ Two limitations, stated plainly:
   `false` — as [the example policy](assets/security-policy.example.json) does — is
   a reasonable starting point when the endpoint is already an authenticated,
   TLS-fronted internal service.
+
+**Moving an issuer from HMAC to Ed25519.** The order matters, because provisioning
+the public key immediately un-verifies every still-HMAC-signed document cached for
+that issuer:
+
+1. Re-sign the policy with the Ed25519 private key (the signature is the base64 of
+   the 64-byte signature over the canonical payload) and publish it.
+2. Confirm every host has fetched the re-signed document.
+3. Add `trust_public_keys[<issuer>]` (base64 of the raw 32-byte public key) to
+   `admission_policy.json`.
+4. Delete the issuer's `trust_keys` entry. Step 3 already stops it being used for
+   policy documents; deleting it removes the secret from the host. Keep it if the
+   same name also signs plugin manifests, which still verify through `trust_keys`.
 
 ### What is not included
 
@@ -502,6 +576,6 @@ So you do not plan around capabilities that are not here:
   policy with a `distribution` block filled in, to copy from.
 - [../../src/kiro_crew/docs/troubleshooting.md](../../src/kiro_crew/docs/troubleshooting.md)
   — the user-facing "MCP tools not working" checklist.
-- Kiro's own documentation: `https://kiro.dev/docs/enterprise/governance/mcp/`
-  (administrator setup) and `https://kiro.dev/docs/mcp/registry/` (registry mode
-  and registry-type overrides).
+- Kiro's own documentation: [Enterprise MCP governance](https://kiro.dev/docs/enterprise/governance/mcp/)
+  (administrator setup) and [MCP registry mode](https://kiro.dev/docs/mcp/registry/)
+  (registry mode and registry-type overrides).

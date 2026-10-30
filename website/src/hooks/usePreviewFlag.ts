@@ -1,6 +1,8 @@
 import { useEffect, useState } from 'react'
 
-import { PREVIEW_FLAG_EVENT, PREVIEW_FLAG_PREFIX, readPreviewFlag } from '../utils/previewFlags'
+import {
+  PREVIEW_FLAG_EVENT, PREVIEW_FLAG_PREFIX, PREVIEW_INSTANCE_SESSIONS, PREVIEW_REMOTE_CREW_CHAT, readPreviewFlag,
+} from '../utils/previewFlags'
 import type { PreviewFlagChange } from '../utils/previewFlags'
 
 /**
@@ -12,7 +14,7 @@ import type { PreviewFlagChange } from '../utils/previewFlags'
  * and a user who just enabled a surface would conclude the toggle is broken.
  *
  * Updates on the same-tab `mc-preview-flag-changed` event and on cross-tab
- * `storage` events, mirroring `useDevMode`.
+ * `storage` events.
  */
 export function usePreviewFlag(flag: string): boolean {
   const [on, setOn] = useState(() => readPreviewFlag(flag))
@@ -35,6 +37,13 @@ export function usePreviewFlag(flag: string): boolean {
     }
   }, [flag])
   return on
+}
+
+/** The one "Chat on a crew" switch. The retired instance-sessions key counts as ON too. */
+export function useRemoteCrewChat(): boolean {
+  const current = usePreviewFlag(PREVIEW_REMOTE_CREW_CHAT)
+  const legacy = usePreviewFlag(PREVIEW_INSTANCE_SESSIONS)
+  return current || legacy
 }
 
 /**

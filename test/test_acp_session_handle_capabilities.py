@@ -280,16 +280,20 @@ async def test_kas_still_sends_exactly_one_config_write():
     add two doomed writes after a failure that is already terminal, and would
     turn a refusal into a silent stay-on-default where today it raises -- so the
     dashboard would report a switch KAS never made.
+
+    The id is in KAS's own spelling. A claude_code spelling is changed to it
+    before the write (covered in test_kas_model_verb.py).
     """
     assert ACP_BACKEND_KAS not in ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION
     handle = _make_handle(ACP_BACKEND_KAS)
     writes = _Writes()
     handle.set_config_option = writes  # type: ignore[method-assign]
+    kas_id = "claude-opus-4.8"
 
-    await handle.set_model(_THREE_RUNG)
+    await handle.set_model(kas_id)
 
-    assert writes.calls == [(MODEL_CONFIG_ID, _THREE_RUNG)]
-    assert handle.model == _THREE_RUNG
+    assert writes.calls == [(MODEL_CONFIG_ID, kas_id)]
+    assert handle.model == kas_id
     _mock(handle).send_request.assert_not_called()
 
 
@@ -317,6 +321,8 @@ async def test_kiro_still_uses_the_set_model_request():
     handle = _make_handle(ACP_BACKEND_KIRO)
     writes = _Writes()
     handle.set_config_option = writes  # type: ignore[method-assign]
+    # The request is awaited, so the double answers it the way kiro-cli does.
+    handle._queue.put_nowait(JsonRpcMessage(id=1, result={}))
 
     await handle.set_model("some-model")
 
@@ -512,11 +518,15 @@ def test_both_drivers_classify_a_config_option_rejection_alike():
     handle_src = inspect.getsource(AcpSessionHandle._push_model_config_option)
     for shared in (
         "unknown config option",
-        "_is_config_value_rejection(exc, MODEL_CONFIG_ID)",
+        "_is_config_value_rejection(",
         "_push_model_via_effort_split(",
     ):
         assert shared in client_src, f"client lost {shared!r}"
         assert shared in handle_src, f"handle lost {shared!r}"
+    # Both hand the classifier their OWN backend, so a harness's declared refusal
+    # text (``model_refusal_phrase``) is read on the pooled path as on the direct one.
+    assert "_is_config_value_rejection(exc, MODEL_CONFIG_ID, self.backend)" in client_src
+    assert "exc, MODEL_CONFIG_ID, self._runtime.acp_backend" in handle_src
 
     # Neither copy may grow a branch the other lacks: an extra `in lowered` test on
     # one side is a rejection the other still re-raises on.

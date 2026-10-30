@@ -107,6 +107,58 @@ test("restart after firing re-arms for a new episode", async () => {
   m.stop();
 });
 
+test("a probe still outstanding when the monitor stops is dropped, not read as a wedge", async () => {
+  // A caller stops the monitor and then stops the gateway on purpose: the
+  // probe that was already in flight fails because of that stop, and must not
+  // trip recovery on the gateway being stopped.
+  const events = [];
+  let rejectProbe;
+  let probes = 0;
+  const m = createLivenessMonitor({
+    probe: () => {
+      probes += 1;
+      if (probes < 3) return Promise.reject(new Error("unresponsive"));
+      return new Promise((_resolve, reject) => { rejectProbe = reject; });
+    },
+    onUnresponsive: () => events.push("unresponsive"),
+    onRecovered: () => events.push("recovered"),
+    failureThreshold: 3,
+    log: () => {},
+  });
+  await m.tick(); // 1
+  await m.tick(); // 2
+  const third = m.tick(); // outstanding
+  m.stop();
+  rejectProbe(new Error("connection refused"));
+  await third;
+  assert.deepStrictEqual(events, []);
+  assert.strictEqual(m.getState().fired, false);
+  assert.strictEqual(m.getState().consecutiveFailures, 2, "the dropped probe is not counted");
+});
+
+test("a probe that resolves after the monitor stops emits nothing", async () => {
+  const events = [];
+  let resolveProbe;
+  let probes = 0;
+  const m = createLivenessMonitor({
+    probe: () => {
+      probes += 1;
+      if (probes < 2) return Promise.reject(new Error("unresponsive"));
+      return new Promise((resolve) => { resolveProbe = resolve; });
+    },
+    onUnresponsive: () => events.push("unresponsive"),
+    onRecovered: () => events.push("recovered"),
+    failureThreshold: 3,
+    log: () => {},
+  });
+  await m.tick(); // 1 failure
+  const second = m.tick();
+  m.stop();
+  resolveProbe();
+  await second;
+  assert.deepStrictEqual(events, []);
+});
+
 // ---------------------------------------------------------------------------
 // The probe the monitor polls WITH. Field report (Windows desktop, 0.6.x): a
 // gateway whose event loop lagged 1-9s under a full test run answered every
@@ -208,4 +260,62 @@ test("the supervisor polls liveness with the wider probe, not the boot poll's ch
   const body = source.slice(start, source.indexOf("livenessMonitor.start();", start));
   assert.match(body, /probe:\s*createBackendProbe\(\{\s*httpMod:\s*http,\s*url:\s*HEALTH_URL\s*\}\)/);
   assert.doesNotMatch(body, /probe:\s*\(\)\s*=>\s*checkBackend\(/);
+});
+
+// A host suspend, on an injected wall clock: each planned probe holds for
+// `heldMs` before it settles. A probe in flight when the host sleeps fails on
+// wake, so its rejection lands the whole sleep after it started.
+function suspendHarness(plan) {
+  const clock = { t: 0 };
+  const events = [];
+  const m = createLivenessMonitor({
+    probe: () => {
+      const { ok, heldMs } = plan.shift();
+      clock.t += heldMs;
+      return ok ? Promise.resolve() : Promise.reject(new Error("unresponsive"));
+    },
+    onUnresponsive: () => events.push("unresponsive"),
+    now: () => clock.t,
+    intervalMs: 10_000,
+    log: () => {},
+  });
+  return { m, events };
+}
+
+const slept = { ok: false, heldMs: 600_000 }; // in flight through a 10-minute sleep
+const timedOut = { ok: false, heldMs: 8_000 }; // failed at the probe's own budget
+
+test("a probe failure held across a host suspend is not counted", async () => {
+  const { m, events } = suspendHarness([slept, slept, slept]);
+  for (let k = 0; k < 3; k++) await m.tick();
+  assert.deepStrictEqual(events, []);
+  assert.strictEqual(m.getState().consecutiveFailures, 0);
+});
+
+test("a real hang still trips on its third failure", async () => {
+  const { m, events } = suspendHarness([timedOut, timedOut, timedOut]);
+  await m.tick();
+  await m.tick();
+  assert.deepStrictEqual(events, []);
+  await m.tick();
+  assert.deepStrictEqual(events, ["unresponsive"]);
+});
+
+test("a suspend neither counts nor resets a run of real failures", async () => {
+  const { m, events } = suspendHarness([timedOut, timedOut, slept, timedOut]);
+  for (let k = 0; k < 3; k++) await m.tick();
+  assert.deepStrictEqual(events, []);
+  assert.strictEqual(m.getState().consecutiveFailures, 2);
+  await m.tick();
+  assert.deepStrictEqual(events, ["unresponsive"]);
+});
+
+test("a failure is read as a suspend only past two intervals", async () => {
+  const atBound = { ok: false, heldMs: 20_000 };
+  const pastBound = { ok: false, heldMs: 20_001 };
+  const { m } = suspendHarness([atBound, pastBound]);
+  await m.tick();
+  assert.strictEqual(m.getState().consecutiveFailures, 1);
+  await m.tick();
+  assert.strictEqual(m.getState().consecutiveFailures, 1);
 });

@@ -22,8 +22,10 @@ loud:
 from __future__ import annotations
 
 import inspect
+import json
 import re
 import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -35,6 +37,7 @@ from kiro_crew.apps.builtins.issue_radar.backend import (
     azure_client,
     github_client,
     gitlab_client,
+    gitlab_transport,
     provider,
     routes,
     store,
@@ -61,6 +64,87 @@ class TestGitlabUrlParsing(unittest.TestCase):
             gitlab_client.parse_gitlab_repo_url("https://gitlab.com/a/b/c/proj"),
             ("gitlab.com", "a/b/c", "proj"),
         )
+
+    def test_namespace_at_gitlabs_nesting_ceiling_is_accepted(self):
+        # The maximum must not refuse a namespace GitLab itself creates, so the
+        # boundary case parses. Depth comes from the bound rather than being
+        # written down again, and the count is measured off the PARSED namespace.
+        depth = gitlab_transport.MAX_NAMESPACE_SEGMENTS
+        namespace = "/".join(f"g{level}" for level in range(depth))
+        host, owner, repo = gitlab_client.parse_gitlab_repo_url(
+            f"https://gitlab.com/{namespace}/proj"
+        )
+        self.assertEqual((host, repo), ("gitlab.com", "proj"))
+        self.assertEqual(len(owner.split("/")), depth)
+
+    def test_namespace_one_level_past_the_ceiling_is_refused(self):
+        # The COUNT is bounded, not only each segment's shape: every segment here
+        # satisfies SEGMENT_RE and none is a traversal, so shape checks alone admit
+        # this URL and only the maximum refuses it.
+        namespace = "/".join(
+            f"g{level}" for level in range(gitlab_transport.MAX_NAMESPACE_SEGMENTS + 1)
+        )
+        with self.assertRaises(RepoUrlError):
+            gitlab_client.parse_gitlab_repo_url(f"https://gitlab.com/{namespace}/proj")
+
+    def test_namespace_ceiling_is_derived_from_gitlabs_ancestor_limit(self):
+        # ``ancestors.count`` excludes the group itself, so the legal path is the
+        # ancestors GitLab permits plus the group they are ancestors of.
+        self.assertEqual(
+            gitlab_transport.MAX_NAMESPACE_SEGMENTS,
+            gitlab_transport.GITLAB_MAX_GROUP_ANCESTORS + 1,
+        )
+
+    def test_segment_at_gitlabs_length_ceiling_is_accepted(self):
+        # A segment as long as GitLab's own `URL_MAX_LENGTH` must still parse, so the
+        # size bound does not refuse a group GitLab creates. The width is taken from
+        # the constant and measured back off the PARSED namespace.
+        width = gitlab_transport.GITLAB_MAX_SEGMENT_CHARS
+        host, owner, repo = gitlab_client.parse_gitlab_repo_url(
+            f"https://gitlab.com/{'a' * width}/proj"
+        )
+        self.assertEqual((host, repo), ("gitlab.com", "proj"))
+        self.assertEqual(len(owner), width)
+
+    def test_segment_one_character_past_the_length_ceiling_is_refused(self):
+        # COUNT and SIZE are separate dimensions: this URL has one group, so the
+        # nesting bound reads `len(parts) - 1 == 1` and passes it, and the character
+        # class admits every byte. Only the length bound refuses it.
+        over = "a" * (gitlab_transport.GITLAB_MAX_SEGMENT_CHARS + 1)
+        with self.assertRaises(RepoUrlError):
+            gitlab_client.parse_gitlab_repo_url(f"https://gitlab.com/{over}/proj")
+
+    def test_project_segment_is_bounded_too(self):
+        # The project is the other field the parse retains, and `project_path` puts it
+        # in the same argv element as the namespace, so its size is bounded on the
+        # same admission path rather than only the namespace's.
+        over = "a" * (gitlab_transport.GITLAB_MAX_SEGMENT_CHARS + 1)
+        with self.assertRaises(RepoUrlError):
+            gitlab_client.parse_gitlab_repo_url(f"https://gitlab.com/group/{over}")
+
+    def test_a_trailing_newline_cannot_escape_the_segment_bound(self):
+        # `$` also matches just before a final newline, so a bound anchored with it
+        # admits a segment one character past the maximum. `\Z` does not.
+        widest = "a" * gitlab_transport.GITLAB_MAX_SEGMENT_CHARS
+        self.assertIsNotNone(gitlab_transport.SEGMENT_RE.match(widest))
+        self.assertIsNone(gitlab_transport.SEGMENT_RE.match(f"{widest}\n"))
+        self.assertIsNone(gitlab_transport.SEGMENT_RE.match("a\n"))
+
+    def test_the_two_bounds_together_cap_the_whole_parsed_value(self):
+        # Neither bound alone caps what the parse returns: without the count bound the
+        # depth grows, without the size bound one segment does. Together they put a
+        # ceiling on `owner/repo`, which is what one argv element has to hold.
+        # Linux caps a single argv element at MAX_ARG_STRLEN; this is that consumer's
+        # limit, not a restatement of either bound.
+        max_arg_strlen = 131072
+        segments = gitlab_transport.MAX_NAMESPACE_SEGMENTS
+        width = gitlab_transport.GITLAB_MAX_SEGMENT_CHARS
+        widest = "/".join("a" * width for _ in range(segments))
+        _, owner, repo = gitlab_client.parse_gitlab_repo_url(
+            f"https://gitlab.com/{widest}/{'p' * width}"
+        )
+        self.assertEqual(len(owner.split("/")), segments)
+        self.assertLess(len(f"{owner}/{repo}"), max_arg_strlen)
 
     def test_deep_page_urls_resolve_to_the_project(self):
         # Users paste whatever tab they are on.
@@ -762,42 +846,132 @@ class TestRefSummary(unittest.TestCase):
 
 
 class TestMrTimelineNotesFetch(unittest.TestCase):
-    """The MR timeline reads the notes endpoint ONCE.
+    """The MR timeline reads the discussions endpoint ONCE.
 
     GitLab keeps inline (diff) comments in the same notes stream, so the MR
     timeline both assembles the notes AND promotes the positioned ones.
     ``_assemble_timeline`` returns the notes it fetched so the promotion reuses
-    that one read instead of fetching ``{base}/notes`` a second time per
-    PR-detail load."""
+    that one read instead of fetching the notes a second time per PR-detail load.
+    The notes come from ``{base}/discussions``, because only that endpoint says
+    which discussion a note is in, and a reply is posted into the discussion."""
 
-    def test_notes_endpoint_is_hit_once(self):
+    DISCUSSION = "6a9c1750b37d513a43987b574953fceb50b03ce7"
+
+    def _discussions(self, *notes, discussion_id=None):
+        return [{"id": discussion_id or self.DISCUSSION, "individual_note": False, "notes": list(notes)}]
+
+    def _timeline(self, discussions, kind="pr"):
+        calls: list[str] = []
+
+        def fake_api(path, **kwargs):
+            calls.append(path)
+            if path.endswith("/discussions"):
+                return discussions
+            # resource_label_events / resource_state_events — empty is fine.
+            return []
+
+        reader = gitlab_client.list_pr_timeline if kind == "pr" else gitlab_client.list_issue_timeline
+        with mock.patch.object(gitlab_client, "_glab_api", side_effect=fake_api), \
+                mock.patch.object(gitlab_client, "list_repo_labels", return_value=[]):
+            events = reader("g", "p", 7, host="gitlab.com")
+        return events, calls
+
+    def test_discussions_endpoint_is_hit_once(self):
         note = {
             "id": 1, "system": False, "body": "inline!", "created_at": "2024-01-01T00:00:00Z",
             "author": {"username": "alice"},
             "position": {"new_path": "a.py", "new_line": 3},
         }
-        calls: list[str] = []
+        events, calls = self._timeline(self._discussions(note))
 
-        def fake_api(path, **kwargs):
-            calls.append(path)
-            # The notes path carries a query string (?order_by=…&sort=asc), so match
-            # on the endpoint before the query rather than the whole path.
-            if path.split("?")[0].endswith("/notes"):
-                return [note]
-            # resource_label_events / resource_state_events — empty is fine.
-            return []
-
-        with mock.patch.object(gitlab_client, "_glab_api", side_effect=fake_api), \
-                mock.patch.object(gitlab_client, "list_repo_labels", return_value=[]):
-            events = gitlab_client.list_pr_timeline("g", "p", 7, host="gitlab.com")
-
-        notes_calls = [p for p in calls if p.split("?")[0].endswith("/notes")]
-        self.assertEqual(len(notes_calls), 1, f"notes fetched {len(notes_calls)}x: {calls}")
+        discussion_calls = [p for p in calls if p.endswith("/discussions")]
+        self.assertEqual(len(discussion_calls), 1, f"fetched {len(discussion_calls)}x: {calls}")
+        self.assertFalse([p for p in calls if "/notes" in p], calls)
         # The positioned note is promoted to a single inline review_comment and the
         # plain-comment copy of it is dropped, so it shows once.
         kinds = [e["kind"] for e in events]
         self.assertEqual(kinds.count("review_comment"), 1)
+        # The inline entry keeps the note id, which keys the comment on the page.
+        inline = next(e for e in events if e["kind"] == "review_comment")
+        self.assertEqual(inline["id"], 1)
         self.assertNotIn("comment", kinds)
+        self.assertEqual(events[0]["thread_id"], self.DISCUSSION)
+
+    def test_every_note_carries_its_discussion_as_the_reply_handle(self):
+        first = {
+            "id": 1, "system": False, "body": "root", "created_at": "2024-01-01T00:00:00Z",
+            "author": {"username": "alice"},
+        }
+        reply = {**first, "id": 2, "body": "reply", "created_at": "2024-01-03T00:00:00Z"}
+        other = {**first, "id": 3, "body": "other", "created_at": "2024-01-02T00:00:00Z"}
+        discussions = [
+            *self._discussions(first, reply),
+            *self._discussions(other, discussion_id="ab" * 20),
+        ]
+        events, _ = self._timeline(discussions, kind="issue")
+        # Flattened across discussions and sorted oldest-first, as the notes
+        # endpoint served them.
+        self.assertEqual([e["body"] for e in events], ["root", "other", "reply"])
+        self.assertEqual(
+            [e["thread_id"] for e in events], [self.DISCUSSION, "ab" * 20, self.DISCUSSION]
+        )
+
+    def test_a_system_note_has_no_reply_handle(self):
+        system = {
+            "id": 4, "system": True, "body": "changed title from **a** to **b**",
+            "created_at": "2024-01-01T00:00:00Z", "author": {"username": "alice"},
+        }
+        events, _ = self._timeline(self._discussions(system), kind="issue")
+        self.assertEqual(events[0]["kind"], "renamed")
+        self.assertNotIn("thread_id", events[0])
+
+
+class TestTimelineLabelColours(unittest.TestCase):
+    """The timeline reads the project's label set only when an event lacks a colour.
+
+    A project with over a hundred labels pays two requests per full read of the
+    set, a large share of the burst that trips a GitLab rate limit, and each
+    label event already carries its label's colour.
+    """
+
+    LABELS = [{"name": "bug", "color": "#ff0000", "description": ""}]
+
+    def setUp(self):
+        self.calls: list[str] = []
+
+    def _fake_api(self, label_events=()):
+        def fake(path, **kwargs):
+            if kwargs.get("method", "GET") == "GET":
+                self.calls.append(path)
+            endpoint = path.split("?")[0]
+            if endpoint.endswith("/labels"):
+                return list(self.LABELS)
+            if endpoint.endswith("/resource_label_events"):
+                return list(label_events)
+            if endpoint.endswith("/issues/5"):
+                return {"iid": 5, "title": "t", "state": "opened", "labels": ["bug"]}
+            return []
+
+        return fake
+
+    def _label_reads(self) -> int:
+        return sum(1 for p in self.calls if p.split("?")[0].endswith("/labels"))
+
+    def test_timeline_skips_the_label_set_when_events_carry_colours(self):
+        event = {"action": "add", "label": {"name": "bug", "color": "#ff0000"}, "user": {"username": "a"}}
+        with mock.patch.object(gitlab_client, "_glab_api", side_effect=self._fake_api([event])):
+            events = gitlab_client.list_pr_timeline("g", "p", 7, host="gitlab.com")
+        self.assertEqual(self._label_reads(), 0, self.calls)
+        labeled = [e for e in events if e["kind"] == "labeled"]
+        self.assertEqual(labeled[0]["label"]["color"], "ff0000")
+
+    def test_timeline_reads_the_label_set_for_a_colourless_event(self):
+        event = {"action": "add", "label": {"name": "bug"}, "user": {"username": "a"}}
+        with mock.patch.object(gitlab_client, "_glab_api", side_effect=self._fake_api([event])):
+            events = gitlab_client.list_issue_timeline("g", "p", 5, host="gitlab.com")
+        self.assertEqual(self._label_reads(), 1, self.calls)
+        labeled = [e for e in events if e["kind"] == "labeled"]
+        self.assertEqual(labeled[0]["label"]["color"], "ff0000")
 
 
 class TestInvestigationNamespace(unittest.TestCase):
@@ -943,6 +1117,98 @@ class TestListPagination(unittest.TestCase):
             with self.subTest(fn=fn.__name__):
                 path = self._path_for(lambda: fn("g", "p", host="gitlab.com"))
                 self.assertNotIn("per_page", path)
+
+
+class TestRateLimitBackoff(unittest.TestCase):
+    """A GitLab HTTP 429 is waited out, not surfaced on the first refusal.
+
+    Opening a busy project fans out into dozens of ``glab api`` calls, and a
+    self-managed instance's throttle trips on the burst; ``glab`` itself exits on
+    the first 429. Failing there blanks a whole pane (the activity timeline) for
+    a window that clears within seconds.
+    """
+
+    THROTTLED = subprocess.CompletedProcess([], 1, stdout="", stderr="glab: HTTP 429\n")
+
+    def _ok(self, rows):
+        return subprocess.CompletedProcess([], 0, stdout=json.dumps(rows), stderr="")
+
+    def _call(self, responses, *, paginate=False):
+        targets: list[str] = []
+        waits: list[float] = []
+        queue = list(responses)
+
+        def run(argv, **_kwargs):
+            targets.append(argv[2])
+            return queue.pop(0)
+
+        result = gitlab_transport.glab_api(
+            "projects/g%2Fp/merge_requests/1/notes",
+            host="gitlab.com",
+            timeout=5.0,
+            paginate=paginate,
+            method="GET",
+            body=None,
+            run=run,
+            page_size=2,
+            max_pages=10,
+            stderr_tail=lambda proc: (proc.stderr or "").strip(),
+            raise_if_auth_failure=lambda _tail, _host: None,
+            is_forbidden=gitlab_transport.is_forbidden,
+            sleep=waits.append,
+        )
+        return result, targets, waits
+
+    def test_throttled_request_is_resent_after_backing_off(self):
+        result, targets, waits = self._call([self.THROTTLED, self.THROTTLED, self._ok({"id": 1})])
+        self.assertEqual(result, {"id": 1})
+        self.assertEqual(len(targets), 3)
+        self.assertEqual(waits, [1.0, 2.0])
+
+    def test_throttled_page_is_resent_not_skipped(self):
+        result, targets, waits = self._call(
+            [self._ok([1, 2]), self.THROTTLED, self._ok([3])], paginate=True
+        )
+        self.assertEqual(result, [1, 2, 3])
+        self.assertEqual(
+            [re.findall(r"[?&]page=(\d+)", t) for t in targets], [["1"], ["2"], ["2"]]
+        )
+        self.assertEqual(waits, [1.0])
+
+    def test_pages_share_one_retry_budget(self):
+        result, _targets, waits = self._call(
+            [self.THROTTLED, self._ok([1, 2]), self.THROTTLED, self._ok([3])],
+            paginate=True,
+        )
+        self.assertEqual(result, [1, 2, 3])
+        self.assertEqual(waits, [1.0, 2.0])
+
+    def test_a_long_list_waits_at_most_the_budget_in_total(self):
+        with self.assertRaises(ProviderCliError) as ctx:
+            self._call(
+                [self.THROTTLED, self._ok([1, 2]), self.THROTTLED, self.THROTTLED, self.THROTTLED],
+                paginate=True,
+            )
+        self.assertIn("HTTP 429", str(ctx.exception))
+
+    def test_persistent_throttle_fails_with_an_actionable_message(self):
+        with self.assertRaises(ProviderCliError) as ctx:
+            self._call([self.THROTTLED] * 4)
+        message = str(ctx.exception)
+        self.assertIn("HTTP 429", message)
+        self.assertIn("try again in a minute", message)
+
+    def test_other_failures_are_not_retried(self):
+        # One queued response: a retry would pop an empty queue and raise
+        # IndexError instead of the ProviderCliError asserted here.
+        failed = subprocess.CompletedProcess([], 1, stdout="", stderr="glab: HTTP 500\n")
+        with self.assertRaises(ProviderCliError):
+            self._call([failed])
+
+    def test_rate_limit_classification(self):
+        self.assertTrue(gitlab_transport.is_rate_limited("glab: HTTP 429"))
+        self.assertTrue(gitlab_transport.is_rate_limited("429 Too Many Requests"))
+        self.assertFalse(gitlab_transport.is_rate_limited("glab: HTTP 500"))
 
 
 class TestMergeRequestSearchState(unittest.TestCase):
@@ -1109,6 +1375,31 @@ class TestProviderDispatch(unittest.TestCase):
         self.assertEqual(key.web_url(), "https://gitlab.acme.internal/g/sub/p")
 
 
+class TestContributedReposRowContract(unittest.TestCase):
+    """The connect picker reads every provider's rows through ONE contract:
+    keyed and labelled by ``full_name``, dated by ``last_contributed_at``.
+    GitLab rows once carried neither, so the picker rendered nameless rows whose
+    tick toggled the shared key ``undefined``."""
+
+    def test_rows_carry_full_name_and_last_contributed_at(self):
+        rows = [
+            {"path_with_namespace": "grp/sub/proj", "last_activity_at": "2999-01-02T03:04:05Z",
+             "visibility": "private"},
+            {"path_with_namespace": "grp/other", "last_activity_at": "2999-01-01T00:00:00Z",
+             "visibility": "public"},
+        ]
+        with mock.patch.object(gitlab_client, "_glab_api", return_value=rows):
+            out, truncated = gitlab_client.list_contributed_repos("me", host="gitlab.com")
+        self.assertFalse(truncated)
+        self.assertEqual([r["full_name"] for r in out], ["grp/sub/proj", "grp/other"])
+        self.assertEqual(out[0]["owner"], "grp/sub")
+        self.assertEqual(out[0]["repo"], "proj")
+        self.assertEqual(out[0]["last_contributed_at"], "2999-01-02T03:04:05Z")
+        # Every row key the GitHub client promises, so the route needs no branching.
+        gh_keys = {"owner", "repo", "full_name", "last_contributed_at"}
+        self.assertTrue(gh_keys <= set(out[1]))
+
+
 class TestClientParity(unittest.TestCase):
     """EVERY client module must expose the same surface.
 
@@ -1172,6 +1463,7 @@ class TestClientParity(unittest.TestCase):
         "build_pr_search_query", "get_ref_summary",
         # Pull-request actions.
         "set_pr_state", "submit_pr_review", "add_issue_comment", "add_pr_comment",
+        "post_comment_batch",
         "merge_pull_request", "enable_auto_merge", "disable_auto_merge",
         "list_pr_workflow_runs",
         "cancel_workflow_run", "rerun_workflow_run",
@@ -1285,18 +1577,42 @@ class TestRoutesScopeEveryStoreCall(unittest.TestCase):
         issues -- a bug with no error and no visible symptom except wrong data. The
         only ``store`` functions allowed to be called directly are the
         config-identity ones, which are keyed by provider+host instead of by root.
+
+        Scanned: ``routes.py`` and every ``http_routes`` module its handlers are
+        composed from, enumerated from the package directory so a new owner is
+        scanned without an edit here.
         """
-        source = Path(inspect.getfile(routes)).read_text(encoding="utf-8")
+        facade = Path(inspect.getfile(routes))
+        paths = [facade, *sorted((facade.parent / "http_routes").rglob("*.py"))]
+        # Not vacuous: the per-repo handlers live in the scanned files.
+        for fn in (
+            routes._handle_issues,
+            routes._handle_pull_ai,
+            routes._run_pr_action,
+            routes._rebuild_deps,
+        ):
+            self.assertIn(Path(inspect.getsourcefile(fn) or ""), paths, fn.__name__)
         allowed = {
             "list_connected_repos", "set_repo_permissions", "remove_connected_repo",
             "read_repo_settings", "write_repo_settings", "add_setting_label",
             "add_connected_repo", "is_repo_connected",
+            # Followed GitLab groups live in config.json keyed by host + path;
+            # they own no per-repo tree to scope.
+            "list_gitlab_groups", "is_gitlab_group_added", "add_gitlab_group",
+            "remove_gitlab_group",
         }
-        offenders = [
-            name
-            for name in re.findall(r"asyncio\.to_thread\(\s*store\.([a-z_]+)", source)
-            if name not in allowed
+        calls = [
+            (path.name, name)
+            for path in paths
+            for name in re.findall(
+                r"asyncio\.to_thread\(\s*store\.([a-z_]+)", path.read_text(encoding="utf-8")
+            )
         ]
+        # A floor on what the scan must find: the repositories handlers' direct
+        # config-identity reads. Fewer means the scan stopped reaching the code
+        # that makes these calls, and an empty scan would pass on nothing.
+        self.assertGreaterEqual(len(calls), 2, f"store calls found: {calls}")
+        offenders = [f"{file}: {name}" for file, name in calls if name not in allowed]
         self.assertEqual(offenders, [], f"unscoped per-repo store calls: {offenders}")
 
 

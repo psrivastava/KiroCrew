@@ -18,15 +18,26 @@ event must survive, in order:
    command surface);
 4. **group gate**: group chats are dropped unless configured, then gated by
    mode/mention/cooldown (:mod:`kiro_crew.whatsapp.group_gate`);
-5. **authorize**: deny-by-default DM policy (``self`` default) with SEL audit
-   on every denial;
+5. **authorize**: deny-by-default, with SEL audit on every denial. A DM is
+   judged by ``dm_policy`` (``self`` default). A GROUP message is judged by the
+   per-sender allowlist, exactly as every other channel judges group traffic:
+   the linked account always passes, any other member must be listed on the
+   group's allowlist (the group entry's own ``allowed_wa_ids`` when it has one,
+   else the global ``allowed_wa_ids``), and an empty list admits nobody but the
+   operator. The
+   group gate above decides whether the agent may SPEAK in the group; this step
+   decides whether the PERSON may make it speak, and it runs for mention,
+   reply and rules-mode unprompted turns alike, so an unlisted member cannot
+   trigger a reply of any kind. ``dm_policy`` is deliberately not consulted for
+   a group: ``open`` would re-admit every member of a configured group;
 6. **media fetch**, and only here, and only for an INDIVIDUALLY admitted sender.
    Downloading before this point would let anyone who can message the number
    trigger an authenticated fetch on the operator's host with no authorization
-   behind it. Step 5 answers that for a DM but not for a group, where it
-   authorizes the conversation surface rather than the sender, so the fetch takes
-   its own test (:meth:`WhatsAppTransport._may_fetch_media`): the linked account
-   or an explicitly allowed number, never ``dm_policy`` alone.
+   behind it. Step 5 answers that for a DM through ``dm_policy``; a group sender
+   takes the same individual test again at the fetch
+   (:meth:`WhatsAppTransport._may_fetch_media`), so the download stays gated on
+   the linked account or an explicitly allowed number even if a future caller
+   reaches the fetch by another path.
 
 Capabilities (personal account over the Web protocol): the reply streams by
 editing one bubble, because this protocol exposes an edit where the Business
@@ -49,6 +60,7 @@ the Business Cloud API there is no 24-hour window, so
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from collections import OrderedDict
@@ -133,6 +145,36 @@ DM_POLICY_OPEN = "open"
 DM_POLICY_DISABLED = "disabled"
 
 
+def _group_allowlists(groups: list[dict]) -> dict[str, frozenset[str]]:
+    """Each configured group's OWN allowlist, keyed by normalized group JID.
+
+    Only a group whose coerced entry carries ``allowed_wa_ids`` appears here; a
+    group without one is absent, which is what sends its senders to the global
+    list. Keyed exactly as :class:`GroupGate` keys its entries (``normalize_jid``,
+    the later entry winning on a collision), so the entry that decides whether
+    the agent may speak in a group is the same entry that decides who may make
+    it speak there. Frozen and rebuilt wholesale, like the global allowlist, so
+    an in-flight decision never sees a mutation.
+    """
+    per_group: dict[str, frozenset[str] | None] = {}
+    for entry in groups:
+        jid = normalize_jid(str(entry.get("jid", "")))
+        if not jid:
+            continue
+        if "allowed_wa_ids" not in entry:
+            per_group[jid] = None
+        else:
+            # A present value that is not a list admits nobody (fail closed),
+            # never the wider global list.
+            wa_ids = entry["allowed_wa_ids"]
+            per_group[jid] = frozenset(
+                normalize_jid(wa_id_to_user_jid(w))
+                for w in (wa_ids if isinstance(wa_ids, list) else [])
+                if str(w).strip()
+            )
+    return {jid: allowed for jid, allowed in per_group.items() if allowed is not None}
+
+
 class WhatsAppTransport(MessagingTransport):
     """WhatsApp personal-account transport (see module docstring)."""
 
@@ -169,6 +211,7 @@ class WhatsAppTransport(MessagingTransport):
         # cooldown clock) on every unrelated whatsapp write.
         self._group_rules: list[dict] = _coerce_whatsapp_groups(groups)
         self.group_gate = GroupGate(self._group_rules)
+        self._group_allowed = _group_allowlists(self._group_rules)
         self._clock = clock or time.time
         #: ``@lid`` alias -> phone JID, resolved once per sender (see
         #: ``_canonical_sender``). Confined to the gateway event loop like the
@@ -272,6 +315,7 @@ class WhatsAppTransport(MessagingTransport):
         if groups != self._group_rules:
             self._group_rules = groups
             self.group_gate = GroupGate(groups)
+            self._group_allowed = _group_allowlists(groups)
             logger.info("whatsapp: group rules reloaded (%d configured group(s))", len(groups))
             sel().log_api_access(
                 caller="config",
@@ -341,26 +385,50 @@ class WhatsAppTransport(MessagingTransport):
         """Whether this sender may cause bytes to be downloaded onto the host.
 
         A DM sender has already passed :meth:`authorize`, so the DM policy is the
-        operator's own answer there and this adds nothing. A GROUP member has not:
-        step 5 authorizes the group SURFACE, so membership alone would let anyone
-        in a configured group trigger an authenticated whole-blob fetch into the
-        gateway's heap at will. In ``rules`` mode an unaddressed message already
-        returns ``respond=True``, and the per-group cooldown does not bound it,
-        because the cooldown only starts once a reply actually delivered and a
-        sentinel-silenced turn never does.
+        operator's own answer there and this adds nothing. A GROUP member is
+        judged by :meth:`_group_sender_admitted` in step 5, and this asks the same
+        question again at the one point where bytes land on the host: the group
+        gate alone would let anyone in a configured group trigger an authenticated
+        whole-blob fetch into the gateway's heap at will, and in ``rules`` mode an
+        unaddressed message already returns ``respond=True`` with no cooldown
+        bounding it (the cooldown starts once a reply actually delivered, which a
+        sentinel-silenced turn never does). Re-asking here keeps the fetch closed
+        even if a future caller reaches it without passing step 5.
 
         Group media therefore requires INDIVIDUAL admission: the linked account,
-        or a number the operator listed. It deliberately does NOT consult
+        or a number the operator listed for THIS group (its own allowlist, else
+        the global one, exactly as step 5 reads it). It deliberately does NOT consult
         ``dm_policy``, because ``open`` resolves to "anyone with a user id" and
         would hand the capability straight back. Being admitted to the
         conversation is not being admitted to the machine.
         """
         if not is_group:
             return True
+        return self._group_sender_admitted(msg)
+
+    def _group_sender_admitted(self, msg: InboundMessage) -> bool:
+        """Per-sender admission for GROUP traffic: the linked account, or a
+        number on the group's allowlist. Deny by default.
+
+        The group's allowlist is its own ``groups[].allowed_wa_ids`` when the
+        entry has one, and the global ``allowed_wa_ids`` otherwise, so a number
+        can be admitted to one group without being admitted to every group. A
+        group's own list REPLACES the global one rather than adding to it, which
+        is what lets an operator keep a globally listed number out of a group.
+
+        The group gate decides whether the agent may speak in the group; this
+        decides whether the sender may make it speak. It is the same allowlist
+        every other channel applies to group traffic, and it is independent of
+        ``dm_policy`` on purpose: ``open`` means "anyone may DM", not "anyone in
+        a group I configured may drive my agent". An empty allowlist therefore
+        admits nobody but the operator, whatever the DM policy says.
+        """
         sender_jid = wa_id_to_user_jid(msg.user_id)
         if self._client.me.matches(sender_jid):
             return True
-        return normalize_jid(sender_jid) in self._allowed
+        own = self._group_allowed.get(normalize_jid(msg.conversation_id))
+        allowed = self._allowed if own is None else own
+        return normalize_jid(sender_jid) in allowed
 
     def may_send_to(
         self, conversation_id: str, thread_id: str | None = None, *, principal: str = ""
@@ -572,10 +640,23 @@ class WhatsAppTransport(MessagingTransport):
             is_mention=bool(verdict and not verdict.unprompted and is_group),
         )
 
-        # 5. Authorize. Group flow authorizes the *conversation surface*:
-        #    configured groups accept member questions (answer-only), so the
-        #    DM policy applies to DMs and to group steering, not group Q&A.
+        # 5. Authorize. A DM is judged by dm_policy. A group message is judged
+        #    by the per-sender allowlist (operator, or a listed number): the
+        #    group gate above only says the agent MAY speak here, it does not say
+        #    this PERSON may make it speak. Without this step every member of a
+        #    configured group who @-mentions, quotes or (in rules mode) merely
+        #    posts would drive a turn on the operator's host. Denied senders are
+        #    dropped silently with a SEL row, like every other channel.
         if is_group:
+            if not self._group_sender_admitted(msg):
+                sel().log_api_access(
+                    caller=msg.user_id or "unknown",
+                    operation="whatsapp_transport.authorize_group",
+                    outcome="denied",
+                    source="whatsapp",
+                )
+                logger.debug("whatsapp: group %s drop (sender not allowlisted)", chat)
+                return
             if verdict is not None and not verdict.may_steer:
                 if parse_command(text):
                     return  # commands from non-operators die silently
@@ -625,14 +706,24 @@ class WhatsAppTransport(MessagingTransport):
         self.pending_operator[id(msg)] = sender_is_operator
         self.pending_message_id[id(msg)] = message_id
         try:
+            # Received from a person: its start is FOREGROUND (kiro_crew.start_priority).
+            msg.person_origin = True
             await self._dispatch(msg)
         finally:
-            # The shared ingest hands path ownership to the caller.
-            cleanup(temp_paths)
             self.pending_verdicts.pop(id(msg), None)
             self.pending_operator.pop(id(msg), None)
             self.pending_message_id.pop(id(msg), None)
             self.pending_original.pop(id(msg), None)
+            # The shared ingest hands path ownership to the caller. Unlinked in a
+            # worker, last, so a cancel arriving during the await cannot skip the
+            # side-table pops above: TMPDIR is not guaranteed to be local disk.
+            if temp_paths:
+                try:
+                    await asyncio.to_thread(cleanup, temp_paths)
+                except RuntimeError:
+                    # The loop refused the work (executor already shut down), so no
+                    # worker owns it; deleting inline beats leaving decrypted media.
+                    cleanup(temp_paths)
 
     def _is_addressed(self, message: Any, chat: str, sender_is_operator: bool) -> bool:
         """Mentioned (@-tag of the linked account) or replying to the agent's

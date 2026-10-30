@@ -1,10 +1,10 @@
 ---
 title: Amend TENETS.md — add "Everything is an app" as tenet 8
-status: draft
+status: implemented
 author: zezhexu
 created: 2026-08-18
-last-audited: 2026-08-18
-audited-at: e6b06685e
+last-audited: 2026-09-22
+audited-at: 80bd0a81f
 doc-pr:
 implementation-prs: []
 tracking-issues: []
@@ -13,8 +13,8 @@ superseded-by: []
 ---
 # RFC: Amend TENETS.md — add "Everything is an app" as tenet 8
 
-- Status: draft — nothing merged. [`../../TENETS.md`](../../TENETS.md) carries seven
-  tenets on main.
+- Status: implemented — [`../../TENETS.md`](../../TENETS.md) carries
+  **Everything is an app** as tenet 8.
 - Author: zezhexu
 - Created: 2026-08-18
 - Related: [`rfc-everything-is-an-app.md`](rfc-everything-is-an-app.md), which
@@ -126,7 +126,8 @@ Two clauses will be quoted back at us. Both should be read as stated here.
 description.** It states what we owe an app so that "make it an app" cannot become
 a polite refusal. It does not claim parity exists today, and it says nothing about
 privilege in the other direction: an app's Python currently runs in the gateway
-process with full privileges (`src/kiro_crew/apps/module_loader.py:34-39`), which
+process with full privileges (`_warn_third_party_execution` in
+`src/kiro_crew/apps/module_loader.py`), which
 is a separate problem owned by
 [`rfc-app-sandbox-isolation.md`](rfc-app-sandbox-isolation.md). The gap between the
 obligation and today's behavior is inventoried in

@@ -2,13 +2,140 @@
 // No React, no component imports — safe to pull into any module or test.
 
 import { compareText } from '../../i18n/format'
-import type { Diagnostic, GitStatus } from './api'
+import { i18nT } from '../../i18n/t'
+import { refusedLetterParams } from '../../lib/scriptLabel'
+import { PapyrusApiError, type Diagnostic, type GitStatus } from './api'
 
 /** localStorage key holding the project the user last had open. */
 export const LAST_PROJECT_KEY = 'kc:papyrus:project'
 
+/** React Query key for the paper list. */
+export const PROJECTS_QUERY_KEY = ['papyrus', 'projects']
+
+/**
+ * React Query key for ONE paper's detail.
+ *
+ * Shared because the list and the workspace hold SEPARATE cache entries for the
+ * same paper, and the rename lives in the list while the title it changes is
+ * rendered by the workspace. Spelling the key out in both files is how they came
+ * to disagree: invalidating only the list left the renamed paper opening under
+ * its old name until a reload.
+ */
+export const projectQueryKey = (name: string): string[] => ['papyrus', 'project', name]
+
 /** localStorage key prefix mapping a project to its co-author chat slot. */
 export const SLOT_KEY_PREFIX = 'kc:papyrus:slot:'
+
+// Workspace column geometry. Four surfaces share one row (file tree, editor, PDF,
+// co-author), so each resizable column gets its OWN key: they hold different
+// shapes of content, and one key would mean dragging one silently resized the
+// others. Bounds are what keeps a drag from producing an unusable layout — the
+// editor is the pane carrying the text being written, so the PDF and co-author
+// maxima stop short of squeezing it out.
+
+/** File-tree column: persisted width, and the collapsed flag kept apart from it
+ *  so re-expanding returns the tree to the width the user chose. */
+export const TREE_WIDTH_KEY = 'kc:papyrus:tree-width'
+export const TREE_COLLAPSED_KEY = 'kc:papyrus:tree-collapsed'
+/** 176px = the `w-44` this replaced, so an existing user's layout is unchanged. */
+export const DEFAULT_TREE_WIDTH = 176
+export const MIN_TREE_WIDTH = 120
+export const MAX_TREE_WIDTH = 420
+/** Collapsed strip: wide enough for the expand button's hit target alone. */
+export const COLLAPSED_TREE_WIDTH = 28
+
+/** PDF preview column. Fixed-width with the grip on its LEFT edge, which leaves
+ *  the source column `flex-1` — so widening the window grows the editor rather
+ *  than scaling the preview the user just sized. */
+export const PDF_WIDTH_KEY = 'kc:papyrus:pdf-width'
+export const DEFAULT_PDF_WIDTH = 520
+export const MIN_PDF_WIDTH = 280
+/** The ceiling when the window cannot be measured (a test renderer with no
+ *  layout, a server render): the share below has nothing to divide, so fall back
+ *  to the widest preview a laptop can give without erasing the editor. */
+export const MAX_PDF_WIDTH = 900
+/** The ceiling is a SHARE of the window, not a pixel count.
+ *
+ *  Before this column became resizable the source pane was 50% and the preview
+ *  took the rest, so ANY fixed cap silently removes reach as the window grows: at
+ *  2560px a 900px cap stops the preview where the old layout gave it 1280, and
+ *  the surplus lands on an editor that has no grip of its own to give it back —
+ *  the preview is what the author drags, the editor only absorbs the remainder.
+ *  Half the window reproduces the old reach at every size, and the same rule cuts
+ *  the other way on a narrow one: a 1280px window caps the preview at 640 rather
+ *  than 900, so a drag can no longer crush the editor. */
+export const PDF_MAX_VIEWPORT_SHARE = 0.5
+export const maxPdfWidth = (viewportWidth: number): number => (
+  viewportWidth > 0
+    ? Math.max(MIN_PDF_WIDTH, Math.round(viewportWidth * PDF_MAX_VIEWPORT_SHARE))
+    : MAX_PDF_WIDTH
+)
+
+/** The starting width, bounded by the ceiling the window allows.
+ *
+ *  `loadColumnWidth` returns its fallback UNCHANGED — by design, since an
+ *  out-of-range stored value says more about stale bounds than about the width
+ *  the user wants. So the fallback has to arrive already legal: an unbounded 520
+ *  on a 900px window would render 70px past the 450px ceiling the grip announces
+ *  and the drag enforces, until the first drag pulled it back into range. */
+export const defaultPdfWidth = (viewportWidth: number): number => (
+  Math.min(maxPdfWidth(viewportWidth), DEFAULT_PDF_WIDTH)
+)
+
+/** Co-author column. The default is the width the panel opened at before it
+ *  became resizable. */
+export const CHAT_WIDTH_KEY = 'kc:papyrus:chat-width'
+export const DEFAULT_CHAT_WIDTH = 420
+export const MIN_CHAT_WIDTH = 280
+export const MAX_CHAT_WIDTH = 720
+
+/** The narrowest the editor may be squeezed to before the co-author panel gives
+ *  ground — the one bound the editor has, since it owns no grip and takes what
+ *  the other three columns leave.
+ *
+ *  280 is the minimum the two other CONTENT columns already use, and the
+ *  arithmetic leaves little choice: on a 1280px window with the tree and preview
+ *  at their defaults (176 + 520) the room left is 584px, and the co-author panel
+ *  cannot go under its own 280px minimum — so 304px is the most any floor can
+ *  actually be given. A floor of 400 would simply not be honoured.
+ *
+ *  It is a budget for the editor COLUMN: the three 6px grips are drawn in the
+ *  same row, so at the boundary the editor measures ~262px of text. */
+export const MIN_EDITOR_WIDTH = 280
+
+/** The co-author ceiling: its own maximum, or the room left beside the editor's
+ *  floor, whichever is smaller.
+ *
+ *  Persisting the open state turned a transient squeeze into the layout the
+ *  author lands in on every return — with the defaults on a 1280px window
+ *  (176 + 520 + 420 = 1116) the editor measured 164px. The panel is the column
+ *  to take it from: it is the last one opened, and the only one whose content
+ *  (a chat transcript) reads acceptably at its minimum.
+ *
+ *  Deliberately a CEILING applied where the width is consumed, not a discard on
+ *  load the way an out-of-range stored width is treated: the room here depends on
+ *  the other two columns, not only on the window, so a panel narrowed beside a
+ *  wide preview must come back at its full width once the preview is dragged in
+ *  or the tree collapsed. Yielding is not forgetting. */
+export const maxChatWidth = (
+  viewportWidth: number, treeWidth: number, pdfWidth: number,
+): number => (
+  viewportWidth > 0
+    ? Math.max(MIN_CHAT_WIDTH, Math.min(
+      MAX_CHAT_WIDTH, viewportWidth - treeWidth - pdfWidth - MIN_EDITOR_WIDTH,
+    ))
+    : MAX_CHAT_WIDTH
+)
+/** Whether the co-author panel is open. Persisting only the WIDTH still lost the
+ *  layout on every return to a paper: the panel came back closed, so the
+ *  workspace the author left was not the one restored. Absent means closed,
+ *  which is the state the panel has always opened at.
+ *
+ *  A DESKTOP preference, read and written only while the viewport is wide, the
+ *  same rule `useColumnResize.persist` applies to its own collapsed flag: while
+ *  narrow the panel covers the pane, so an imported desktop flag would hide the
+ *  editor and the PDF, and dismissing it there would rewrite a desktop layout. */
+export const CHAT_OPEN_KEY = 'kc:papyrus:chat-open'
 
 /** Suffixes hidden from the file tree — LaTeX build artifacts, never editable. */
 const ARTIFACT_SUFFIXES = [
@@ -166,6 +293,52 @@ export function gitBranchLabel(status: GitStatus | undefined): string {
   return `${status.branch || ''}${status.dirty ? '*' : ''}`
 }
 
+/**
+ * The text to show for a failed create or clone.
+ *
+ * A refused paper name answers `invalid_project_name`, with the character that
+ * stopped it when there was one (a name typed in another script stops at its
+ * first letter). That is explained in the app's language: the paper name is its
+ * folder name, so it stays a lowercase Latin slug on purpose, and the server's
+ * English sentence is only for logs. A refused LETTER is shown with its script
+ * and code point, because a Cyrillic or Greek capital renders exactly like the
+ * Latin one the rule allows. Any other failure keeps the server's text.
+ */
+export function projectErrorText(err: Error): string {
+  if (err instanceof PapyrusApiError && err.code === 'invalid_project_name') {
+    // `\p{L}` alone: the server only refuses a letter that is not lowercase a–z,
+    // so any single letter here is one the rule's Latin alphabet does not hold.
+    if (/^\p{L}$/u.test(err.char)) {
+      return i18nT('apps.papyrus.page.invalid_project_name_letter', refusedLetterParams(err.char))
+    }
+    return err.char
+      ? i18nT('apps.papyrus.page.invalid_project_name_char', { char: err.char })
+      : i18nT('apps.papyrus.page.invalid_project_name')
+  }
+  return err.message
+}
+
+/**
+ * The banner text for a refused rename. The server's `error` is English and
+ * names internals ("settings file"), so each `PUT /title` refusal `code` maps to
+ * a translated string; anything else (a network failure, an older backend) keeps
+ * its message.
+ */
+export function renameErrorText(err: Error, name: string): string {
+  if (err instanceof PapyrusApiError) {
+    switch (err.code) {
+      case 'title_rejected':
+        // `name` is the directory: what a cleared field shows again.
+        return i18nT('apps.papyrus.page.rename_title_rejected', { name })
+      case 'project_config_refused':
+        return i18nT('apps.papyrus.page.rename_config_refused')
+      case 'project_replaced':
+        return i18nT('apps.papyrus.page.rename_paper_replaced')
+    }
+  }
+  return err.message
+}
+
 /** Read the last-open project name from localStorage (never throws). */
 export function loadLastProject(): string | null {
   try {
@@ -200,6 +373,17 @@ export function saveSlot(project: string, slot: string): void {
     localStorage.setItem(SLOT_KEY_PREFIX + project, slot)
   } catch {
     /* storage blocked or full — a new slot is created next time instead */
+  }
+}
+
+/** Forget a project's co-author chat slot when the gateway no longer has that
+ *  session (never throws), so the paper is offered a new one instead of the
+ *  dead key being tried again on every open. */
+export function forgetSlot(project: string): void {
+  try {
+    localStorage.removeItem(SLOT_KEY_PREFIX + project)
+  } catch {
+    /* storage unavailable — nothing remembered to forget */
   }
 }
 

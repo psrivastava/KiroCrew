@@ -23,7 +23,7 @@ import {
   AlertCircle,
   Save,
 } from 'lucide-react'
-import { PanelRightSolid } from '../../components/icons/panels'
+import { SidePanelGlyph } from '../../components/SidePanelGlyph'
 import { api } from '../../api/client'
 import Modal from '../../components/Modal'
 import ErrorNotice from '../../components/ErrorNotice'
@@ -142,7 +142,7 @@ const WorkflowRunCard = memo(function WorkflowRunCard({
     // The Workflows panel is mounted for `activeSlot`, which split view never
     // moves with pane focus — so opening from a background pane must make this
     // card's session active first, or the panel belongs to another session.
-    if (slot && slot !== activeSlot) dispatch(switchSlot({ key: slot, announceOnMissing: true }))
+    if (slot && slot !== activeSlot) dispatch(switchSlot({ key: slot, announceOnMissing: true, gesture: true }))
     dispatch(openActivityToTab('workflows'))
   }
 
@@ -175,7 +175,7 @@ const WorkflowRunCard = memo(function WorkflowRunCard({
   }
 
   // Row geometry -- the px-4 gutter and the --mc-content-width clamp -- belongs to
-  // the HOST row wrapper, never to this card. ChatPage wraps every renderMessage
+  // the HOST row wrapper, never to this card. ChatTranscriptView wraps every renderMessage
   // result, and the shared registries wrap this card through ctx.row. Re-applying
   // it here nested one clamp inside another and inset the card by a second full
   // gutter, so it sat 20px right of every sibling row and 40px narrower.
@@ -222,7 +222,7 @@ const WorkflowRunCard = memo(function WorkflowRunCard({
               {runId} {i18nT('pages.chat.workflowRunCard.open_workflows_panel')}
             </div>
           </div>
-          <PanelRightSolid
+          <SidePanelGlyph
             size={14}
             className="text-muted shrink-0 mt-0.5 opacity-60 group-hover:opacity-100 transition-opacity"
           />

@@ -50,11 +50,28 @@ declare global {
     setThemeMode: (pref: string) => void
     setTitleBarOverlayTheme: (mode: string) => void
     setFocusModeChrome: (visible: boolean) => void
+    /** Watch how far the cursor travels OUTSIDE this window while a focus-mode
+     *  reveal is open. Fires the callback once — `true` past the dismissal
+     *  distance, `false` if the cursor came back inside — and returns an
+     *  unsubscribe that also disarms the main-process poll. Optional: absent in a
+     *  browser and on a shell older than the feature. */
+    watchCursorAway?: (cb: (away: boolean) => void) => (() => void) | undefined
     setDevMode: (enabled: boolean) => void
     getAppMenuItems: (id: string) => Promise<ElectronAppMenuItem[]>
     executeAppMenuItem: (id: string, index: number) => void
     onNavigate: (cb: (path: string) => void) => () => void
-    onFullScreenChanged: (cb: (isFullScreen: boolean) => void) => () => void
+    /** View > Toggle Focus Mode. Optional: absent on a shell older than the menu item. */
+    onToggleFocusMode?: (cb: () => void) => () => void
+    /** A macOS swipe the shell relays as one route-history step (-1 Back,
+     *  1 Forward). Optional: absent in a browser and on an older shell. */
+    onHistoryStep?: (cb: (delta: unknown) => void) => () => void
+    /** The trackpad's real finger-down (`begin`) and finger-up (`end`), from
+     *  Chromium's gesture-scroll events (macOS only). Optional: absent in a
+     *  browser and on an older shell. See lib/scrollTouch. */
+    onScrollTouch?: (cb: (phase: unknown) => void) => () => void
+    /** `menuBarOverlap` is false when macOS placed the fullscreen window below
+     *  the menu bar (a notched display), so no band needs keeping clear. */
+    onFullScreenChanged: (cb: (isFullScreen: boolean, menuBarOverlap: boolean) => void) => () => void
     setBadgeCount: (count: number) => void
     reportMicDenied: () => void
     reportMemorySample: (sample: ElectronMemorySample) => void
@@ -67,6 +84,21 @@ declare global {
   interface LocalGatewayAPI {
     get: () => Promise<boolean>
     set: (enabled: boolean) => Promise<boolean>
+  }
+
+  type CloseAction = 'background' | 'quit'
+
+  interface CloseActionAPI {
+    get: () => Promise<CloseAction>
+    set: (action: CloseAction) => Promise<CloseAction>
+  }
+
+  /** First-run setup's "connect to a crew on another machine" exit. `start`
+   *  opens the desktop app's remote-crew form; on "switching" the window is
+   *  about to leave this page for the crew's dashboard. */
+  interface RemoteCrewSetupAPI {
+    available: () => Promise<boolean>
+    start: () => Promise<'switching' | 'cancelled' | 'unavailable'>
   }
 
   interface CrashReportsAPI {
@@ -92,6 +124,17 @@ declare global {
 
   interface WslAPI {
     detect: () => Promise<WslDetectResult>
+  }
+
+  /**
+   * The OS-native folder chooser (desktop shell only). Neither call takes an
+   * argument: the dialog's options are fixed in the main process.
+   */
+  interface FolderPickAPI {
+    /** Whether this window's gateway runs on this machine, so a pick can work. */
+    available: () => Promise<boolean>
+    /** The chosen absolute folder, or null when the user cancels; rejects when no dialog could be shown. */
+    pick: () => Promise<string | null>
   }
 
   interface ZoomAPI {
@@ -202,12 +245,19 @@ declare global {
     phase?: 'check' | 'download' | 'install'
     code?: string
     httpStatus?: number
+    // Set with code 'gateway-still-running': the command that stops the
+    // gateway the install was refused for.
+    stopCommand?: string
     percent?: number
     bytesPerSecond?: number
     installHandoff?: 'windows-installer' | 'automatic-relaunch'
     laneVersion?: string
     runningAheadOfLane?: boolean | null
     replayed?: boolean
+    /** The main process's confirmed governance verdict — true only when the
+     *  local bundled gateway's policy provider was accepted via the three-gate
+     *  assertLocalDashboard check. False for remote (SSH-tunneled) gateways. */
+    policyGoverned?: boolean
   }
 
   interface UpdateInfo {
@@ -215,6 +265,10 @@ declare global {
     channel?: string
     stampedChannel?: string | null
     channelSwitchable?: boolean
+    // The organization's policy sets the channel (an enterprise build).
+    channelLockedByPolicy?: boolean
+    // The channel the policy requires, "" when none.
+    requiredChannel?: string
     channelPreference?: string
     autoDownload?: boolean
     platform?: string
@@ -225,6 +279,10 @@ declare global {
     updateCommand?: string
     laneVersion?: string
     runningAheadOfLane?: boolean | null
+    /** The main process's confirmed policy governance verdict — true only when
+     *  the local bundled gateway's policy provider was accepted via the
+     *  three-gate assertLocalDashboard check. */
+    policyGoverned?: boolean
   }
 
   interface UpdateResult {
@@ -241,14 +299,21 @@ declare global {
     getInfo?: () => Promise<(UpdateInfo & { lastState?: UpdateState | null }) | undefined>
     setChannel?: (channel: string) => Promise<UpdateResult>
     setAutoDownload?: (enabled: boolean) => Promise<UpdateResult>
+    /** Notify the main process that a security policy provider now governs (or
+     *  no longer governs) this install's updates. Fire-and-forget; no return.
+     *  Absent on shells that predate the feature. */
+    notifyPolicyGoverned?: (governed: boolean) => void
   }
 
   interface Window {
     kirocrew?: KiroCrewBridge
     electronAPI?: ElectronAPI
     localGatewayAPI?: LocalGatewayAPI
+    closeActionAPI?: CloseActionAPI
+    remoteCrewSetupAPI?: RemoteCrewSetupAPI
     crashReportsAPI?: CrashReportsAPI
     wslAPI?: WslAPI
+    folderPickAPI?: FolderPickAPI
     zoomAPI?: ZoomAPI
     browserAPI?: BrowserAPI
     updateAPI?: UpdateAPI

@@ -42,7 +42,6 @@ if (await skip.waitFor({ state: 'visible', timeout: 2500 }).then(() => true, () 
   await skip.waitFor({ state: 'hidden', timeout: 10000 })
 }
 await page.evaluate(async () => {
-  localStorage.setItem('mc-preview-crew', '1')
   localStorage.setItem('mc-lang', 'en')
   localStorage.setItem('mc-theme', 'dark')
   await fetch('/api/config/theme', {
@@ -55,7 +54,7 @@ await page.goto(`${BASE}/members`, { waitUntil: 'domcontentloaded' })
 const row = page.locator('#main-content li button', { hasText: MEMBER }).first()
 await row.waitFor({ state: 'visible', timeout: 20000 })
 await row.click()
-await page.getByTestId('member-title-row').waitFor({ state: 'visible', timeout: 10000 })
+await page.getByTestId('member-identity-pill').waitFor({ state: 'visible', timeout: 10000 })
 const drawer = page.getByTestId('member-crew-summary')
 if (!(await drawer.isVisible().catch(() => false))) await page.getByTestId('member-panel-toggle').click()
 await page.getByTestId('member-activity-days').waitFor({ state: 'visible', timeout: 15000 })

@@ -8,13 +8,13 @@ Webex needs no public URL and no webhooks: Kiro Crew registers a device with
 Webex and receives messages over an outbound WebSocket, so it works from
 behind a firewall or NAT. Replies finish as one or more messages split at the 7,000 UTF-8-byte transport cap, with a live status placeholder ("🤔 Thinking…" → "🔧 Running: …") while the agent works.
 
-## The easy way: just ask Kiro Crew
+## The easy way: use Settings
 
-You don't have to edit anything by hand. In any Kiro Crew session — the
-dashboard, Slack, or the CLI — say something like *"set up the Webex
-channel."* Kiro Crew walks you through creating the bot, then writes the token
-and your email into `~/.kiro/crew/.env` and `config.json` and restarts the
-gateway for you. You just hand it the bot token when it asks.
+Open **Settings → Messaging Channels → Webex**. Paste the bot token and add your Webex
+email there; the panel validates the token, stores the credential in
+`~/.kiro/crew/.env`, and writes the non-secret channel settings to `config.json`.
+Restart when the panel asks. Because the bot token is a credential, do not paste
+it into a chat message.
 
 Prefer to wire it up yourself? The manual steps are below.
 
@@ -83,6 +83,7 @@ and `/sessions` there lists the space's history rather than yours.
 | `/new` | Start a fresh, restart-safe conversation; its first turn adds it to `/sessions` |
 | `/compact` | Compress the conversation context |
 | `/model` | List the models this account can use, and pick one |
+| `/agent [name]` | Show the agent and the ones you can pick; `/agent <name>` switches, `/agent default` goes back |
 | `/sessions` | List this conversation's earlier sessions |
 | `/yolo on \| off \| renew` | Auto-approve every tool for a while |
 | `/link` | Resume mirroring dashboard replies here (on by default) |

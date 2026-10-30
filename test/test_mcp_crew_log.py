@@ -103,6 +103,19 @@ class TestTheToolSetIsRatcheted:
 
         assert server.PROJECTION_NAMES == PROJECTION_NAMES
 
+    def test_the_projection_schema_accepts_every_advertised_fold(self) -> None:
+        """Advertising a fold the validator refuses is worse than not advertising it.
+
+        The tool puts ``PROJECTION_NAMES`` straight into its ``inputSchema`` enum, so a
+        client reads the name as offered and then has its call rejected by the schema. The
+        two lists live in different modules because ``mcp_crew_log`` imports ``validation``,
+        which is exactly the shape that drifts -- so it is pinned here.
+        """
+        from kiro_crew.validation import CREW_LOG_PROJECTION_SCHEMA
+
+        name_field = next(spec for spec in CREW_LOG_PROJECTION_SCHEMA.fields if spec.name == "name")
+        assert name_field.allowed == frozenset(server.PROJECTION_NAMES)
+
     def test_the_caller_name_matches_the_one_the_endpoint_recognizes(self) -> None:
         from kiro_crew.dashboard.handlers.crew_log import CREW_LOG_MCP_CALLER
         from kiro_crew.dashboard.token_auth import KNOWN_INTERNAL_CALLERS
@@ -112,15 +125,21 @@ class TestTheToolSetIsRatcheted:
 
     def test_tools_are_advertised_while_the_flag_is_off(self, monkeypatch) -> None:
         """An agent must learn the flag state from a refusal, not a missing tool."""
-        monkeypatch.delenv("KIROCREW_CREW_LOG", raising=False)
+        monkeypatch.setenv("KIROCREW_CREW_LOG", "0")
         assert len(server._list_tools()) == 3
 
 
 class TestUnitResolution:
     def test_a_raw_unit_id_is_passed_through_untouched(self) -> None:
-        with patch.object(server, "_get", return_value=_page([_entry(1)])) as got:
-            _call("crew_log_read", unit=UNIT)
+        def fake_get(path: str, *a: Any, **k: Any) -> dict[str, Any]:
+            if f"/units/{UNIT}/page" in path:
+                return _page([_entry(1)])
+            return {"error": "not_found", "message": f"no route {path}"}
+
+        with patch.object(server, "_get", side_effect=fake_get) as got:
+            out = _call("crew_log_read", unit=UNIT)
         assert f"/units/{UNIT}/page" in got.call_args[0][0]
+        assert (out["unit"], out["returned"]) == (UNIT, 1)
 
     def test_a_slot_key_is_resolved_through_the_gateway(self) -> None:
         seen: list[str] = []
@@ -144,8 +163,17 @@ class TestUnitResolution:
 
     def test_self_resolves_through_the_strict_gate_and_sends_that_key(self) -> None:
         """``self`` is the caller's own key, resolved once and sent as itself."""
-        with patch.object(server, "_get", return_value={"unit": UNIT}) as got:
-            server._call_tool("crew_log_projection", {"unit": "self", "name": "status"})
+
+        def fake_get(path: str, *a: Any, session_key: str = "", **k: Any) -> dict[str, Any]:
+            if session_key != CALLER:
+                return {"error": "forbidden", "message": f"not {session_key!r}'s unit"}
+            return {"unit": UNIT}
+
+        with patch.object(server, "_get", side_effect=fake_get) as got:
+            out = json.loads(
+                server._call_tool("crew_log_projection", {"unit": "self", "name": "status"})
+            )
+        assert out == {"unit": UNIT}
         assert f"key={CALLER.replace(':', '%3A')}" in got.call_args_list[0][0][0]
         assert got.call_args_list[0].kwargs["session_key"] == CALLER
 
@@ -304,11 +332,14 @@ class TestEveryRequestCarriesTheStrictlyResolvedKey:
     def test_resolving_another_session_key_still_sends_the_callers_own(self) -> None:
         """Naming somebody else's key must not change WHOSE authority the read has."""
 
-        def fake_get(path: str, *a: Any, **k: Any) -> dict[str, Any]:
+        def fake_get(path: str, *a: Any, session_key: str = "", **k: Any) -> dict[str, Any]:
+            if session_key != CALLER:
+                return {"error": "forbidden", "message": f"not {session_key!r}'s unit"}
             return {"unit": UNIT} if "/resolve" in path else _page([_entry(1)])
 
         with patch.object(server, "_get", side_effect=fake_get) as got:
-            _call("crew_log_read", unit="chat-9-1789617503")
+            out = _call("crew_log_read", unit="chat-9-1789617503")
+        assert (out["unit"], out["returned"]) == (UNIT, 1)
         assert [c.kwargs.get("session_key") for c in got.call_args_list] == [CALLER, CALLER]
 
     @pytest.mark.parametrize(

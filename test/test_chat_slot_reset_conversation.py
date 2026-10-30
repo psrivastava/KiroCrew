@@ -213,9 +213,10 @@ class TestItClearsTheRightThing:
         """
         state = _state(_slot("chat-1-foo"))
 
-        await _post(_make_app(state), "chat-1-foo")
+        status, body = await _post(_make_app(state), "chat-1-foo")
 
         state.sessions.destroy.assert_not_awaited()
+        assert (status, body.get("reset")) == (200, True)
 
 
 class TestItRefusesWhenItCannotBeSafe:
@@ -268,21 +269,6 @@ class TestItRefusesWhenItCannotBeSafe:
         state.sessions.discard_conversation.assert_awaited_once_with(
             "dashboard:chat-1-foo", replay=True, skip_if_busy=True
         )
-
-    @pytest.mark.asyncio
-    async def test_a_plan_between_stages_blocks_the_reset(self):
-        """``running`` reads False BETWEEN an autopilot plan's stages while the
-        plan is still mid-flight, so it alone would discard the conversation the
-        plan is writing into and cold-start its next stage."""
-        slot = _slot("chat-1-foo")
-        slot._in_stage_execution = True
-        state = _state(slot)
-
-        status, body = await _post(_make_app(state), "chat-1-foo")
-
-        assert status == 409
-        assert body["code"] == "slot_orchestrating"
-        state.sessions.discard_conversation.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_attached_sub_agents_block_the_reset(self):

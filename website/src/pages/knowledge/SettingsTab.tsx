@@ -1,7 +1,8 @@
-import { useState, useEffect, useRef, useId, createContext, useContext } from 'react'
+import { useState, useId, createContext, useContext } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { api } from '../../api/client'
 import { useAvailableModels } from '../../hooks/useAvailableModels'
+import { EFFORT_LEVELS, effortLabel, modelSupportsEffort } from '../../lib/effort'
 import SimpleSelect from '../../components/SimpleSelect'
 import { SchemaRestartBadge } from '../../components/settingRef/RestartRequiredBadge'
 import { i18nT } from '../../i18n/t'
@@ -12,6 +13,9 @@ const EMBED_RATE_MIN = 0
 const EMBED_RATE_MAX = 10000
 const EMBED_RATE_DEFAULT = 120
 
+// Mirrors EXTRACTION_POOL_SIZE_MIN/MAX + the default on the backend
+// (config/section_builders.py clamp and handlers/core.py
+// _EDITABLE_CONFIG bounds).
 const POOL_SIZE_MIN = 1
 const POOL_SIZE_MAX = 10
 const POOL_SIZE_DEFAULT = 3
@@ -19,9 +23,18 @@ const POOL_SIZE_DEFAULT = 3
 /**
  * Knowledge Library settings tab — ingestion cost & performance controls.
  *
- * Fields: embedding rate limit, extraction model, extraction pool size.
- * Reads/writes via the same
- * PATCH /api/config/kirocrew endpoint as the Settings page.
+ * Fields: embedding rate limit, extraction model, extraction effort,
+ * extraction pool size. The effort select is disabled — with the same
+ * `effort_needs_reasoning_model` hint the Chat role rows use — when the model
+ * the pool will serve (the extraction model, falling back to the agent
+ * default) is KNOWN and cannot take effort, because the backend then ignores
+ * the pick. When the effective model cannot be determined yet (both
+ * selectors on 'auto') the select stays enabled and the row hint explains
+ * that the runtime-resolved model decides. '' on the effort select is the
+ * Default option: the pool then runs High effort —
+ * resolved server-side by llm_pool._get_workload_effort.
+ * Reads/writes via the same PATCH /api/config/kirocrew endpoint as the
+ * Settings page.
  */
 export function SettingsTab() {
   const qc = useQueryClient()
@@ -29,11 +42,13 @@ export function SettingsTab() {
 
   // ── Server config ──
   const cfgQ = useQuery<{
+    agent?: { model?: string }
     knowledge?: {
       auto_add_documents?: boolean
       auto_ingest_artifacts?: boolean
       embed_rate_limit?: number
       extraction_model?: string
+      extraction_effort?: string
       extraction_pool_size?: number
     }
   }>({
@@ -60,20 +75,18 @@ export function SettingsTab() {
   const [localEmbedRate, setLocalEmbedRate] = useState('')
   const [localPoolSize, setLocalPoolSize] = useState('')
 
-  const initRef = useRef(false)
-  useEffect(() => {
-    if (cfgQ.data && !initRef.current) {
-      initRef.current = true
-      setLocalEmbedRate(String(cfg?.embed_rate_limit ?? EMBED_RATE_DEFAULT))
-      setLocalPoolSize(String(cfg?.extraction_pool_size ?? POOL_SIZE_DEFAULT))
-    }
-  }, [cfgQ.data, cfg])
-
-  // ── Model dropdown ──
-  const availableModels = useAvailableModels()
-  const modelOptions = availableModels.map(m => m.name)
-  const currentModel = cfg?.extraction_model || 'auto'
-  if (!modelOptions.includes(currentModel)) modelOptions.unshift(currentModel)
+  // The served config seeds both rows ONCE, in the render that first has it.
+  // Setting state during render is React's shape for state derived from a value
+  // that just arrived: the component re-renders before anything commits, so the
+  // commit that enables the inputs is the one that shows the stored numbers.
+  // Seeding from an effect instead commits one frame where the inputs are
+  // enabled and empty, which a user can see and a test can land on.
+  const [seeded, setSeeded] = useState(false)
+  if (cfgQ.data && !seeded) {
+    setSeeded(true)
+    setLocalEmbedRate(String(cfg?.embed_rate_limit ?? EMBED_RATE_DEFAULT))
+    setLocalPoolSize(String(cfg?.extraction_pool_size ?? POOL_SIZE_DEFAULT))
+  }
 
   // ── Commit helpers ──
   function commitNumber(
@@ -96,6 +109,38 @@ export function SettingsTab() {
     }
     patchMut.mutate({ path, value: n })
   }
+
+  // ── Model dropdown ──
+  const availableModels = useAvailableModels()
+  const modelOptions = availableModels.map(m => m.name)
+  const currentModel = cfg?.extraction_model || 'auto'
+  if (!modelOptions.includes(currentModel)) modelOptions.unshift(currentModel)
+
+  // The pool serves `extraction_model`, or the agent default when it is
+  // 'auto' — same resolution the backend's per-worker gate applies. When the
+  // effective model is still undetermined (both selectors on 'auto') the
+  // select stays enabled: disabling it would suggest effort never applies,
+  // when in fact the runtime-resolved model decides. When the model IS known
+  // and cannot take effort the backend ignores the pick, so the select
+  // disables and the row hint says why instead of silently doing nothing.
+  const resolvedModel = currentModel !== 'auto' ? currentModel : cfgQ.data?.agent?.model
+  const modelKnown = !!resolvedModel && resolvedModel !== 'auto'
+  const effortSupported = modelSupportsEffort(resolvedModel)
+  const effortRowHint = !modelKnown
+    ? i18nT('pages.knowledge.settings.effort_model_unknown_hint')
+    : effortSupported
+      ? i18nT('pages.knowledge.settings.effort_hint')
+      : i18nT('pages.settings.chatPanel.effort_needs_reasoning_model')
+  const effortDisabled = disabled || (modelKnown && !effortSupported)
+
+  // ── Effort dropdowns ──
+  // Same workload-effort vocabulary as the Settings ▸ Chat role-effort rows;
+  // '' is the Default option (the pool runs High effort), labelled
+  // 'Default' (effortLabel). Index-paired labels: SimpleSelect matches by position.
+  // Strings, not the EFFORT_LEVELS literal union: cfg values come from a JSON
+  // payload and may hold anything.
+  const effortOptions: string[] = [...EFFORT_LEVELS]
+  const effortChoiceLabels = (): string[] => effortOptions.map(effortLabel)
 
   return (
     <div className="max-w-xl space-y-1 animate-rise">
@@ -171,6 +216,28 @@ export function SettingsTab() {
           aria-label={i18nT('pages.knowledge.settings.model_label')}
           disabled={disabled}
         />
+      </SettingRow>
+
+      {/* Extraction effort */}
+      <SettingRow
+        label={i18nT('pages.knowledge.settings.extraction_effort_label')}
+        description={effortRowHint}
+      >
+        {/* Same restart badge as the pool-size row: the pools read the config
+            once at startup, so a new effort value applies to workers spawned
+            after a restart, not to the live ones. */}
+        <div className="flex items-center gap-2">
+          <SimpleSelect
+            options={effortOptions}
+            optionLabels={effortChoiceLabels()}
+            value={cfg?.extraction_effort ?? ''}
+            onChange={v => patchMut.mutate({ path: 'knowledge.extraction_effort', value: v })}
+            aria-label={i18nT('pages.knowledge.settings.extraction_effort_label')}
+            triggerFallback={effortChoiceLabels()[effortOptions.indexOf(cfg?.extraction_effort ?? '')]}
+            disabled={effortDisabled}
+          />
+          <SchemaRestartBadge configKey="knowledge.extraction_effort" />
+        </div>
       </SettingRow>
 
       {/* Extraction pool size */}

@@ -2,21 +2,28 @@
 
 from __future__ import annotations
 
+import threading
+from types import SimpleNamespace
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
+from kiro_crew.dashboard import chat_handlers, chat_persistence
 from kiro_crew.dashboard.chat import api_chat_slot_reasoning_effort
+from kiro_crew.dashboard.chat_handlers import api_chat_slot_selection_capabilities
 from kiro_crew.dashboard.state import DashboardState, _ChatSlot
+from kiro_crew.providers.acp import AcpProvider
 
 
 def _make_app(state: DashboardState) -> web.Application:
     app = web.Application()
     app["state"] = state
-    app.router.add_post(
-        "/api/chat/slots/{slot}/reasoning-effort", api_chat_slot_reasoning_effort
+    app.router.add_post("/api/chat/slots/{slot}/reasoning-effort", api_chat_slot_reasoning_effort)
+    app.router.add_get(
+        "/api/chat/slots/{slot}/selection-capabilities", api_chat_slot_selection_capabilities
     )
     return app
 
@@ -35,7 +42,170 @@ def _mock_state(slot: _ChatSlot | None = None, provider: object = None) -> Dashb
     return state
 
 
+class TestSlotSelectionCapabilities:
+    @pytest.mark.asyncio
+    async def test_live_effort_levels_use_the_shared_cap(self, monkeypatch, caplog):
+        levels = [f"level{i:02d}" for i in range(33)]
+        monkeypatch.setattr(chat_handlers, "get_reasoning_effort_values", lambda: set(levels))
+        slot = _ChatSlot("test")
+        provider = MagicMock(spec=AcpProvider)
+        provider.capabilities = SimpleNamespace(backend="pi")
+        provider.supports_effort.return_value = True
+        provider.get_valid_effort_levels.return_value = levels
+        state = _mock_state(slot, provider)
+
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.get("/api/chat/slots/test/selection-capabilities")
+            data = await resp.json()
+
+        assert resp.status == 200
+        assert data["effort_levels"] == levels[:32]
+        assert "Dropped 1 local live effort capability level" in caplog.text
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("backend", "levels", "pair_ids"),
+        [
+            ("codex", ["low", "medium", "high"], True),
+            ("claude", ["low", "high"], False),
+            ("pi", ["off", "minimal", "high"], False),
+        ],
+    )
+    async def test_uses_the_live_acp_provider(self, backend, levels, pair_ids):
+        chat_handlers.register_reasoning_effort_values(levels)
+        slot = _ChatSlot("test")
+        provider = MagicMock(spec=AcpProvider)
+        provider.capabilities = SimpleNamespace(backend=backend)
+        provider.supports_effort.return_value = True
+        provider.get_valid_effort_levels.return_value = levels
+        state = _mock_state(slot, provider)
+
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.get("/api/chat/slots/test/selection-capabilities")
+            data = await resp.json()
+
+        assert resp.status == 200
+        assert data == {
+            "known": True,
+            "backend": backend,
+            "effort_supported": True,
+            "effort_levels": levels,
+            "model_effort_pair_ids": pair_ids,
+        }
+
+    @pytest.mark.asyncio
+    async def test_unknown_when_no_live_provider_exists(self, monkeypatch):
+        loop_thread = threading.get_ident()
+
+        def load_config():
+            assert threading.get_ident() != loop_thread
+            return SimpleNamespace(
+                agent=SimpleNamespace(acp_backend="codex", member_acp_backend="claude")
+            )
+
+        monkeypatch.setattr(
+            chat_handlers.KiroCrewConfig,
+            "load",
+            load_config,
+        )
+        state = _mock_state(_ChatSlot("test"))
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.get("/api/chat/slots/test/selection-capabilities")
+            data = await resp.json()
+
+        assert resp.status == 200
+        assert data == {"known": False, "backend": "codex", "model_effort_pair_ids": True}
+
+    @pytest.mark.asyncio
+    async def test_cold_member_session_uses_member_backend_for_pair_ids(self, monkeypatch):
+        monkeypatch.setattr(
+            chat_handlers.KiroCrewConfig,
+            "load",
+            lambda: SimpleNamespace(
+                agent=SimpleNamespace(acp_backend="claude", member_acp_backend="codex"),
+                agents={},
+            ),
+        )
+        state = _mock_state(_ChatSlot("member-test"))
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.get("/api/chat/slots/member-test/selection-capabilities")
+            data = await resp.json()
+
+        assert resp.status == 200
+        assert data == {"known": False, "backend": "codex", "model_effort_pair_ids": True}
+
+    @pytest.mark.asyncio
+    async def test_live_provider_can_report_effort_unsupported(self):
+        provider = MagicMock(spec=AcpProvider)
+        provider.capabilities = SimpleNamespace(backend="opencode")
+        provider.supports_effort.return_value = False
+        state = _mock_state(_ChatSlot("test"), provider)
+
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.get("/api/chat/slots/test/selection-capabilities")
+            data = await resp.json()
+
+        assert resp.status == 200
+        assert data == {
+            "known": True,
+            "backend": "opencode",
+            "effort_supported": False,
+            "effort_levels": [],
+            "model_effort_pair_ids": False,
+        }
+        provider.get_valid_effort_levels.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_kiro_uses_fallback_levels_when_effort_option_is_not_advertised(
+        self, monkeypatch
+    ):
+        provider = MagicMock(spec=AcpProvider)
+        provider.capabilities = SimpleNamespace(backend="kiro")
+        provider.supports_effort.return_value = True
+        provider.get_valid_effort_levels.return_value = []
+        monkeypatch.setattr(
+            chat_persistence, "_reasoning_effort_ordered", ["low", "medium", "high"]
+        )
+        state = _mock_state(_ChatSlot("test"), provider)
+
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.get("/api/chat/slots/test/selection-capabilities")
+            data = await resp.json()
+
+        assert resp.status == 200
+        assert data == {
+            "known": True,
+            "backend": "kiro",
+            "effort_supported": True,
+            "effort_levels": ["low", "medium", "high"],
+            "model_effort_pair_ids": False,
+        }
+
+
 class TestChatSlotReasoningEffort:
+    @pytest.mark.asyncio
+    async def test_marker_failure_refuses_dynamic_pick_before_slot_commit(self, monkeypatch):
+        chat_handlers.register_reasoning_effort_values(["minimal"])
+        monkeypatch.setattr(
+            chat_handlers,
+            "_remember_reasoning_effort_for_restore",
+            MagicMock(side_effect=ValueError("validated effort marker limit reached")),
+        )
+        slot = _ChatSlot("test")
+        state = _mock_state(slot)
+
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.post(
+                "/api/chat/slots/test/reasoning-effort",
+                json={"reasoning_effort": "minimal"},
+            )
+            data = await resp.json()
+
+        assert resp.status == 503
+        assert data["code"] == "effort_marker_unavailable"
+        assert slot.reasoning_effort == ""
+        state.sessions.reset.assert_not_awaited()
+
     @pytest.mark.asyncio
     @pytest.mark.parametrize("level", ["low", "medium", "high", "xhigh", "max"])
     async def test_set_valid_levels(self, level: str):
@@ -67,6 +237,116 @@ class TestChatSlotReasoningEffort:
             assert resp.status == 200
             assert slot.reasoning_effort == ""
             state.sessions.reset.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("level", ["", "high"])
+    async def test_codex_effort_pick_normalizes_legacy_pair_model(self, level):
+        slot = _ChatSlot("test")
+        slot.model = "gpt-6-sol[max]"
+        provider = MagicMock(spec=AcpProvider)
+        provider.capabilities = SimpleNamespace(backend="codex")
+        provider.supports_effort.return_value = True
+        provider.has_active_turn.return_value = False
+        provider.change_effort = AsyncMock(return_value=True)
+        provider.clear_effort = AsyncMock(return_value=True)
+        state = _mock_state(slot, provider)
+
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.post(
+                "/api/chat/slots/test/reasoning-effort",
+                json={"reasoning_effort": level},
+            )
+
+        assert resp.status == 200
+        assert slot.model == "gpt-6-sol"
+        assert slot.reasoning_effort == level
+
+    @pytest.mark.asyncio
+    async def test_a_same_level_pick_on_a_legacy_codex_pin_bumps_the_effort_generation(self):
+        # The legacy-suffix fold skips the fast path and the level write is a
+        # same-value one the setter does not count, so the bump must happen on
+        # the comparison. Mutation guard: gating the bump on `not legacy_base`.
+        slot = _ChatSlot("test")
+        slot.model = "gpt-6-sol[max]"
+        slot.reasoning_effort = "high"
+        before = slot._effort_pick_gen
+        provider = MagicMock(spec=AcpProvider)
+        provider.capabilities = SimpleNamespace(backend="codex")
+        provider.supports_effort.return_value = True
+        provider.has_active_turn.return_value = False
+        provider.change_effort = AsyncMock(return_value=True)
+        state = _mock_state(slot, provider)
+
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.post(
+                "/api/chat/slots/test/reasoning-effort",
+                json={"reasoning_effort": "high"},
+            )
+
+        assert resp.status == 200
+        assert slot.model == "gpt-6-sol"
+        assert slot._effort_pick_gen > before
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("global_backend", "member_backend", "expected_model"),
+        [
+            ("claude", "codex", "gpt-6-sol"),
+            ("codex", "claude", "gpt-6-sol[max]"),
+        ],
+    )
+    async def test_cold_member_effort_clear_uses_member_backend_for_legacy_pair(
+        self, monkeypatch, global_backend, member_backend, expected_model
+    ):
+        monkeypatch.setattr(
+            chat_handlers.KiroCrewConfig,
+            "load",
+            lambda: SimpleNamespace(
+                agent=SimpleNamespace(
+                    acp_backend=global_backend, member_acp_backend=member_backend
+                ),
+                agents={},
+            ),
+        )
+        slot = _ChatSlot("member-test")
+        slot.model = "gpt-6-sol[max]"
+        state = _mock_state(slot)
+
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.post(
+                "/api/chat/slots/member-test/reasoning-effort",
+                json={"reasoning_effort": ""},
+            )
+            data = await resp.json()
+
+        assert resp.status == 200
+        assert slot.model == expected_model
+        if member_backend == "codex":
+            assert data["model"] == expected_model
+        else:
+            assert "model" not in data
+
+    @pytest.mark.asyncio
+    async def test_other_backend_keeps_bracketed_model_id_on_effort_pick(self):
+        slot = _ChatSlot("test")
+        slot.model = "custom[max]"
+        provider = MagicMock(spec=AcpProvider)
+        provider.capabilities = SimpleNamespace(backend="pi")
+        provider.supports_effort.return_value = True
+        provider.has_active_turn.return_value = False
+        provider.change_effort = AsyncMock(return_value=True)
+        state = _mock_state(slot, provider)
+
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.post(
+                "/api/chat/slots/test/reasoning-effort",
+                json={"reasoning_effort": "high"},
+            )
+            data = await resp.json()
+
+        assert resp.status == 200
+        assert slot.model == "custom[max]"
+        assert "model" not in data
 
     @pytest.mark.asyncio
     async def test_reset_failure_keeps_committed_effort_and_reports_success(self):
@@ -236,15 +516,19 @@ class TestChatSlotReasoningEffort:
 
         state.sessions.reset = AsyncMock(side_effect=_reset)
         async with TestClient(TestServer(_make_app(state))) as client:
-            first = asyncio.create_task(client.post(
-                "/api/chat/slots/test/reasoning-effort",
-                json={"reasoning_effort": "low"},
-            ))
+            first = asyncio.create_task(
+                client.post(
+                    "/api/chat/slots/test/reasoning-effort",
+                    json={"reasoning_effort": "low"},
+                )
+            )
             await first_reset_started.wait()
-            second = asyncio.create_task(client.post(
-                "/api/chat/slots/test/reasoning-effort",
-                json={"reasoning_effort": "low"},
-            ))
+            second = asyncio.create_task(
+                client.post(
+                    "/api/chat/slots/test/reasoning-effort",
+                    json={"reasoning_effort": "low"},
+                )
+            )
             # Let the second request reach (and block on) the slot lock, then
             # let the first request's reset fail.
             await asyncio.sleep(0.05)
@@ -275,6 +559,49 @@ class TestChatSlotReasoningEffort:
             )
             assert resp.status == 200
             state.sessions.reset.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_re_picking_the_shown_level_still_bumps_the_effort_generation(self):
+        # A same-level pick is still the user's explicit choice: a pending
+        # session_set_model effort compares this generation at turn start and
+        # must yield to it. Mutation guard: returning before the bump.
+        slot = _ChatSlot("test")
+        slot.reasoning_effort = "medium"
+        before = slot._effort_pick_gen
+        state = _mock_state(slot)
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.post(
+                "/api/chat/slots/test/reasoning-effort",
+                json={"reasoning_effort": "medium"},
+            )
+            assert resp.status == 200
+        assert slot._effort_pick_gen > before
+        state.sessions.reset.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_same_effort_with_bare_model_skips_live_switch(self):
+        slot = _ChatSlot("test")
+        slot.model = "gpt-6-sol"
+        slot.reasoning_effort = "medium"
+        provider = MagicMock(spec=AcpProvider)
+        provider.capabilities = SimpleNamespace(backend="codex")
+        provider.supports_effort.return_value = True
+        provider.has_active_turn.return_value = False
+        provider.change_effort = AsyncMock(return_value=False)
+        state = _mock_state(slot, provider)
+
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.post(
+                "/api/chat/slots/test/reasoning-effort",
+                json={"reasoning_effort": "medium"},
+            )
+            data = await resp.json()
+
+        assert resp.status == 200
+        assert data == {"ok": True, "reasoning_effort": "medium"}
+        assert slot.model == "gpt-6-sol"
+        provider.change_effort.assert_not_awaited()
+        state.sessions.reset.assert_not_awaited()
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -352,6 +679,38 @@ class TestChatSlotReasoningEffortLiveProvider:
             provider.change_effort.assert_awaited_once_with("xhigh")
             # Live update succeeded → no session reset.
             state.sessions.reset.assert_not_called()
+            # The live level replaces the allocation's record, so a restart or
+            # reset successor starts on it (no workspace file carries it on KAS).
+            state.sessions.record_effort_override.assert_called_once_with(
+                chat_handlers.effective_session_key(slot), "xhigh"
+            )
+
+    @pytest.mark.asyncio
+    async def test_a_level_the_live_session_hides_is_refused_without_a_reset(self):
+        # A harness that is the authority on its own vocabulary hides a Crew level
+        # it has no value for. Refused up front: nothing persists, nothing is
+        # pushed, and the session is not reset into re-reading it.
+        from kiro_crew.providers.acp import AcpProvider
+
+        provider = MagicMock(spec=AcpProvider)
+        provider.supports_effort = MagicMock(return_value=True)
+        provider.has_active_turn = MagicMock(return_value=False)
+        provider.accepts_effort_level = MagicMock(return_value=False)
+        provider.change_effort = AsyncMock(return_value=True)
+        slot = _ChatSlot("test")
+        slot.reasoning_effort = "high"
+        state = _mock_state(slot, provider=provider)
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.post(
+                "/api/chat/slots/test/reasoning-effort",
+                json={"reasoning_effort": "medium"},
+            )
+            assert resp.status == 400
+            assert (await resp.json())["code"] == "effort_level_not_offered"
+            assert slot.reasoning_effort == "high"
+            provider.accepts_effort_level.assert_called_once_with("medium")
+            provider.change_effort.assert_not_awaited()
+            state.sessions.reset.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_live_clear_that_changed_nothing_commits_nothing_and_does_not_reset(self):
@@ -400,6 +759,10 @@ class TestChatSlotReasoningEffortLiveProvider:
             assert resp.status == 200
             provider.clear_effort.assert_awaited_once()
             state.sessions.reset.assert_not_called()
+            # Cleared live: the record is dropped, so a successor starts on the default.
+            state.sessions.record_effort_override.assert_called_once_with(
+                chat_handlers.effective_session_key(slot), ""
+            )
 
     @pytest.mark.asyncio
     async def test_live_clear_not_applied_live_falls_back_to_reset(self):
@@ -423,6 +786,7 @@ class TestChatSlotReasoningEffortLiveProvider:
             assert resp.status == 200
             provider.clear_effort.assert_awaited_once()
             state.sessions.reset.assert_awaited_once()
+            state.sessions.record_effort_override.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_non_effort_capable_model_persists_without_live_or_reset(self):
@@ -462,6 +826,7 @@ class TestChatSlotReasoningEffortLiveProvider:
             )
             assert resp.status == 200
             state.sessions.reset.assert_awaited_once()
+            state.sessions.record_effort_override.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_active_turn_defers_live_push(self):
@@ -492,6 +857,7 @@ class TestChatSlotReasoningEffortLiveProvider:
             provider.change_effort.assert_not_awaited()
             provider.clear_effort.assert_not_awaited()
             state.sessions.reset.assert_not_called()
+            state.sessions.record_effort_override.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_active_turn_defers_clear_too(self):
@@ -518,6 +884,7 @@ class TestChatSlotReasoningEffortLiveProvider:
             provider.change_effort.assert_not_awaited()
             provider.clear_effort.assert_not_awaited()
             state.sessions.reset.assert_not_called()
+            state.sessions.record_effort_override.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_no_active_turn_pushes_live(self):
@@ -549,6 +916,7 @@ class TestValidateReasoningEffortPersistence:
     @pytest.mark.parametrize("level", ["", "low", "medium", "high", "xhigh", "max"])
     def test_passes_through_allowlisted(self, level: str):
         from kiro_crew.dashboard.chat_persistence import _validate_reasoning_effort
+
         assert _validate_reasoning_effort(level) == level
 
     @pytest.mark.parametrize(
@@ -557,10 +925,43 @@ class TestValidateReasoningEffortPersistence:
     )
     def test_discards_disallowed(self, tampered: str):
         from kiro_crew.dashboard.chat_persistence import _validate_reasoning_effort
+
         assert _validate_reasoning_effort(tampered) == ""
 
     def test_discards_non_string(self):
         from kiro_crew.dashboard.chat_persistence import _validate_reasoning_effort
+
         assert _validate_reasoning_effort(5) == ""
         assert _validate_reasoning_effort(None) == ""
         assert _validate_reasoning_effort(["max"]) == ""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["selection-capabilities", "reasoning-effort"])
+async def test_unknown_crewmate_pin_is_absent_from_slot_refusals(route, monkeypatch, caplog):
+    from kiro_crew.config.loader import KiroCrewAgentConfig, KiroCrewConfig
+
+    secret = "sk-test-not-a-real-secret-0000"
+    cfg = KiroCrewConfig()
+    cfg.agents["atlas"] = KiroCrewAgentConfig(
+        member_id="atlas-0123456789ab", kiro_agent="atlas", acp_backend=secret
+    )
+    monkeypatch.setattr(chat_handlers.KiroCrewConfig, "load", lambda: cfg)
+    slot = _ChatSlot("member-atlas-0123456789ab", model="claude-opus-4.8[max]")
+    state = _mock_state(slot)
+    async with TestClient(TestServer(_make_app(state), host="127.0.0.1")) as client:
+        url = f"/api/chat/slots/{slot.key}/{route}"
+        response = (
+            await client.get(url)
+            if route == "selection-capabilities"
+            else await client.post(url, json={"reasoning_effort": "high"})
+        )
+        assert response.status == 409
+        text = await response.text()
+        data = await response.json()
+    assert data["code"] == "crewmate_harness_unavailable"
+    assert "an unknown harness" in data["error"]
+    assert secret not in text + caplog.text
+    assert cfg.agents["atlas"].acp_backend == secret
+    assert slot.reasoning_effort == ""
+    cast(AsyncMock, state.sessions.reset).assert_not_awaited()

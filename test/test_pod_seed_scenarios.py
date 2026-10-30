@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import sys
 from pathlib import Path
 
@@ -245,6 +246,217 @@ class TestSeedHomeFromScenario:
         (home / "config.json").write_text("{}")
         with pytest.raises(rt.PodError, match="unknown seed scenario"):
             rt.seed_home_from_scenario(cfg, "wt", "no-such-fixture")
+
+
+@pytest.mark.skipif(not IS_POSIX, reason="pods require POSIX descriptor traversal")
+class TestSeedCreateThenOpenRemovalWindow:
+    """Creating a directory and opening it are two syscalls, and a removal fits
+    between them. Each removal here is injected through ``os.mkdir``,
+    which creates the directory and removes it again, so the window is a fixture
+    rather than something to reproduce under load -- and, unlike patching
+    ``os.open``, it leaves the descriptor-relative branch the one under test."""
+
+    @staticmethod
+    def _vanishing_mkdir(leaf: str, *, once: bool, counter: list[int]):
+        real_mkdir = os.mkdir
+
+        def vanishing(name: object, mode: int = 0o777, *, dir_fd: int | None = None) -> None:
+            real_mkdir(name, mode, dir_fd=dir_fd)  # type: ignore[arg-type]
+            if name != leaf or (once and counter):
+                return
+            counter.append(1)
+            os.rmdir(name, dir_fd=dir_fd)  # type: ignore[arg-type]
+
+        return vanishing
+
+    def test_a_workspace_removed_between_its_mkdir_and_its_open_is_re_created(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """A removal between the two calls is an interleaving no ordering closes.
+
+        Tolerating only the `FileExistsError` half handles a concurrent writer and
+        not a concurrent remover, whose `ENOENT` escaped naming the bare relative
+        leaf `'workspace'`. The pair is re-run against the held home descriptor,
+        so the seed gets the directory it needs.
+        """
+        home = tmp_path / "home"
+        home.mkdir()
+        home_fd = os.open(home, rt.pinned_fs.dir_flags())
+        removals: list[int] = []
+        monkeypatch.setattr(
+            os, "mkdir", self._vanishing_mkdir("workspace", once=True, counter=removals)
+        )
+        try:
+            rt._prepare_seeded_home_fd(home_fd)
+        finally:
+            os.close(home_fd)
+        assert removals == [1], "the race did not happen, so the retry is not what passed"
+        assert (home / "workspace").is_dir()
+
+    def test_a_workspace_removed_on_every_attempt_reports_rather_than_spins(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """Exhaustion reports, at exactly the bound: a directory something keeps
+        removing is not a race being lost, and more attempts only delay the answer.
+        """
+        home = tmp_path / "home"
+        home.mkdir()
+        home_fd = os.open(home, rt.pinned_fs.dir_flags())
+        removals: list[int] = []
+        monkeypatch.setattr(
+            os, "mkdir", self._vanishing_mkdir("workspace", once=False, counter=removals)
+        )
+        try:
+            with pytest.raises(FileNotFoundError) as excinfo:
+                rt._prepare_seeded_home_fd(home_fd)
+        finally:
+            os.close(home_fd)
+        assert "removed between its creation and its open" in str(excinfo.value)
+        assert len(removals) == rt._CREATE_ATTEMPTS == 3
+
+    def test_a_met_workspace_that_vanishes_is_reported_not_re_created(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """The retry covers a directory this call made. A met one is reported.
+
+        On the restart path `workspace` holds the pod's own state; re-creating it
+        empty after a removal would boot the pod over the loss without a word, so
+        the loss is reported instead and the name is left absent.
+        """
+        home = tmp_path / "home"
+        home.mkdir()
+        workspace = home / "workspace"
+        workspace.mkdir()
+        (workspace / "state.txt").write_text("the pod's file\n", encoding="utf-8")
+        home_fd = os.open(home, rt.pinned_fs.dir_flags())
+        attempts: list[int] = []
+        real_mkdir = os.mkdir
+
+        def removing_the_met_directory(
+            name: object, mode: int = 0o777, *, dir_fd: int | None = None
+        ) -> None:
+            if name == "workspace":
+                attempts.append(1)
+                try:
+                    real_mkdir(name, mode, dir_fd=dir_fd)  # type: ignore[arg-type]
+                finally:
+                    if workspace.exists():
+                        (workspace / "state.txt").unlink()
+                        workspace.rmdir()
+                return
+            real_mkdir(name, mode, dir_fd=dir_fd)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(os, "mkdir", removing_the_met_directory)
+        try:
+            with pytest.raises(FileNotFoundError) as excinfo:
+                rt._prepare_seeded_home_fd(home_fd)
+        finally:
+            os.close(home_fd)
+        assert "already existed when this seed met it" in str(excinfo.value)
+        assert attempts == [1], "a met workspace's removal was re-attempted"
+        assert not workspace.exists(), "the met workspace was re-created empty"
+
+    def test_a_home_removed_under_its_held_fd_is_reported_at_once(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """Nothing can be created inside an unlinked directory, so no retry helps."""
+        home = tmp_path / "home"
+        home.mkdir()
+        home_fd = os.open(home, rt.pinned_fs.dir_flags())
+        attempts: list[int] = []
+        real_mkdir = os.mkdir
+
+        def removing_the_home(
+            name: object, mode: int = 0o777, *, dir_fd: int | None = None
+        ) -> None:
+            if name == "workspace":
+                attempts.append(1)
+                (home / "config.json").unlink()
+                os.rmdir(home)
+            real_mkdir(name, mode, dir_fd=dir_fd)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(os, "mkdir", removing_the_home)
+        try:
+            with pytest.raises(FileNotFoundError) as excinfo:
+                rt._prepare_seeded_home_fd(home_fd)
+        finally:
+            os.close(home_fd)
+        assert "pod home was removed" in str(excinfo.value)
+        assert attempts == [1]
+
+    def test_a_fresh_home_removed_between_its_mkdir_and_its_open_is_re_created(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """The same window at the home's own creation, driven through the seed."""
+        monkeypatch.setenv("KIROCREW_POD_ROOT", str(tmp_path / "pods"))
+        cfg = PodConfig.load()
+        home = cfg.home_dir("wt")
+        removals: list[int] = []
+        monkeypatch.setattr(
+            os, "mkdir", self._vanishing_mkdir(home.name, once=True, counter=removals)
+        )
+
+        assert rt.seed_home_from_scenario(cfg, "wt", "minimal") is True
+
+        assert removals == [1], "the race did not happen, so the retry is not what passed"
+        assert (home / "crons.json").is_file()
+
+    def test_a_met_home_that_vanishes_is_reported_with_the_real_cause(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """A removal mid-sequence is reported as one, not as a planted file.
+
+        The `ENOENT` here is caught and does name the home -- the defect is the
+        claim: "is not a plain directory" asserts a type the code did not observe,
+        and sends the operator after a file nothing planted. A met home holds a
+        prior seed's state, so it is also never re-created empty.
+        """
+        monkeypatch.setenv("KIROCREW_POD_ROOT", str(tmp_path / "pods"))
+        cfg = PodConfig.load()
+        home = cfg.home_dir("wt")
+        assert rt.seed_home_from_scenario(cfg, "wt", "minimal") is True
+        attempts: list[int] = []
+        real_mkdir = os.mkdir
+
+        def removing_the_met_home(
+            name: object, mode: int = 0o777, *, dir_fd: int | None = None
+        ) -> None:
+            if name == home.name and not attempts:
+                attempts.append(1)
+                try:
+                    real_mkdir(name, mode, dir_fd=dir_fd)  # type: ignore[arg-type]
+                finally:
+                    shutil.rmtree(home)
+                return
+            real_mkdir(name, mode, dir_fd=dir_fd)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(os, "mkdir", removing_the_met_home)
+        with pytest.raises(rt.PodError) as excinfo:
+            rt.seed_home_from_scenario(cfg, "wt", "minimal")
+        assert "already existed when this seed met it" in str(excinfo.value)
+        assert "is not a plain directory" not in str(excinfo.value)
+        assert attempts == [1], "a met home's removal was re-attempted"
+        assert not home.exists(), "the met home was re-created empty"
+
+    def test_a_pod_root_removed_under_its_pin_names_the_root_not_a_type(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """The other end of the same sequence: the root goes, so the mkdir has nowhere."""
+        monkeypatch.setenv("KIROCREW_POD_ROOT", str(tmp_path / "pods"))
+        cfg = PodConfig.load()
+        home = cfg.home_dir("wt")
+        real_mkdir = os.mkdir
+
+        def removing_the_root(
+            name: object, mode: int = 0o777, *, dir_fd: int | None = None
+        ) -> None:
+            if name == home.name:
+                os.rmdir(cfg.pod_root)
+            real_mkdir(name, mode, dir_fd=dir_fd)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(os, "mkdir", removing_the_root)
+        with pytest.raises(rt.PodError, match="pod root .* was removed"):
+            rt.seed_home_from_scenario(cfg, "wt", "minimal")
 
 
 @pytest.mark.skipif(not IS_POSIX, reason="pods require POSIX descriptor traversal")
@@ -600,3 +812,34 @@ class TestUpRefusesAnUnknownScenario:
         )
         with pytest.raises(SystemExit):
             pod_cli._up(PodConfig.load(), args)
+
+
+class TestSeedEnablesInstances:
+    """`pod up --seed <dir>` can make the Remote Crew Set-up tab reachable.
+
+    A fresh pod home boots with the product default `instances.enabled=false`,
+    so `GET /api/instances` answers 403 and `RemoteCrewPanel` renders the
+    "off" card instead of its tabs -- a pod-e2e spec driving the "Set up a new
+    one" launch form times out on a locator that never mounts. The flag is
+    restart-marked, so it cannot be flipped on a running gateway; a seed dir
+    whose `config.json` sets it ON is the supported way to reach the surface,
+    WITHOUT changing the shipped product default.
+    """
+
+    def test_sanitized_seed_config_keeps_instances_on(self, tmp_path: Path) -> None:
+        """A `--seed <dir>` whose config enables `instances` boots with it on.
+
+        `instances` is deliberately absent from `SEED_DISABLED_SECTIONS`, so the
+        public sanitizer the pod boot calls leaves a seeded `instances.enabled`
+        alone -- unlike a self-activating channel, which it forces off (pinned
+        for every section by `test_pod_env.py::test_forces_every_disabled_section_off`).
+        If `instances` is ever added to that tuple, a seeded enable stops
+        working and this fails loudly rather than as a mystifying pod-e2e
+        timeout.
+        """
+        (tmp_path / "config.json").write_text(json.dumps({"instances": {"enabled": True}}))
+        sanitized = rt.sanitized_seed_config(tmp_path)
+        assert sanitized is not None
+        assert (
+            sanitized["instances"]["enabled"] is True
+        ), "a seeded instances.enabled=true must survive the pod seed floor"

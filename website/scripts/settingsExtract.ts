@@ -3,8 +3,10 @@
  *
  * Parses `src/pages/settings/*.tsx` for JSX usages of settings primitives
  * (SettingsToggle, SettingsSelect, SettingsMultiSelect, SettingsInput,
- * SettingsStepper, SettingsButtonGroup) and extracts label + description +
- * primitive type.
+ * SettingsStepper, SettingsButtonGroup) and extracts label + description (the
+ * row's always-visible help) + hint (the text behind its info tip) + primitive
+ * type. The two help fields stay apart so no reader quotes tip prose as on-row
+ * copy.
  *
  * A label/description is read from EITHER form:
  *   - a string literal          `label="Zoom Level"`
@@ -27,16 +29,22 @@
 
 import * as fs from 'fs'
 import * as path from 'path'
+import { fileURLToPath } from 'url'
 import { SETTINGS_MANUAL } from '../src/components/commandPalette/settingsManual'
 import { settingsRoute } from '../src/components/commandPalette/settingsRoute'
 import type { ManualSettingEntry, SettingEntry, SettingPrimitiveType } from '../src/components/commandPalette/settingsTypes'
 
 export type { SettingEntry, SettingPrimitiveType }
 
+/** This module's directory, from `import.meta.url` so an ES-module runner (the
+ *  find_ui generator's in-memory freshness check) can load it as well as
+ *  vite-node and vitest. */
+const HERE = path.dirname(fileURLToPath(import.meta.url))
+
 /** English catalogs, in load order (manual wins) — mirrors `src/i18n/enCatalog.ts`. */
 const EN_CATALOG_PATHS = [
-  path.resolve(__dirname, '../src/i18n/locales/en.json'),
-  path.resolve(__dirname, '../src/i18n/locales/en.manual.json'),
+  path.resolve(HERE, '../src/i18n/locales/en.json'),
+  path.resolve(HERE, '../src/i18n/locales/en.manual.json'),
 ]
 
 /** Flatten a nested catalog into dotted leaf paths, matching i18next lookup. */
@@ -82,9 +90,7 @@ export function __resetCatalogCache(): void {
 /** Panel file → tab key mapping (derived from SettingsPage.tsx switch).
  *  Only panels that actually render inside a Settings tab are mapped — the
  *  fork is KiroACP-only and de-Amazoned, so upstream's Provider / Secretary /
- *  Sync / TaskKeeper panels are absent, and controls that live on the
- *  standalone Developer page rather than a Settings tab (e.g. McpManagement)
- *  are intentionally excluded to avoid dead deep-links.
+ *  Sync / TaskKeeper panels are absent.
  *
  *  Entries may carry `params` — extra query params the deep link needs for
  *  the panel to actually mount (the Channels tab is a list-detail view, so
@@ -101,18 +107,35 @@ export function __resetCatalogCache(): void {
 type PanelTargetSingle = string | { tab: string; params: Record<string, string>; labelSuffix?: string }
 type PanelTarget = PanelTargetSingle | PanelTargetSingle[]
 
+/** The Settings > Developer page the opt-in switches render on. */
+const DEVELOPER_PREVIEWS: PanelTargetSingle = { tab: 'developer', params: { sub: 'feature-previews' } }
+
 /** Exported for the coverage gate (settingsCoverage.test.ts): a panel file
  *  that renders Settings* primitives but is absent from this map is silently
  *  dropped from search, so the gate cross-checks every panel file against it. */
+
 export const PANEL_TAB_MAP: Record<string, PanelTarget> = {
   'OverviewPanel.tsx': 'overview',
   'ChatPanel.tsx': 'chat',
   'VoicePanel.tsx': 'voice',
   'DisplayPanel.tsx': 'display',
   'BrowserPanel.tsx': 'browser',
+  // The Browser tab's managed-browser and existing-browser sections, mounted by
+  // BrowserPanel. Mapped with it so a control either one gains stays indexed.
+  'ManagedBrowsersSection.tsx': 'browser',
+  'ConnectBrowserSection.tsx': 'browser',
   'ComputerUsePanel.tsx': 'computer-use',
   'InstancesPanel.tsx': 'instances',
   'SecurityPanel.tsx': 'security',
+  // SecurityPanel.tsx's section owners, mapped with it to the Security tab.
+  'SecurityPanelPosture.tsx': 'security',
+  'SecurityPanelApprovals.tsx': 'security',
+  'SecurityPanelDeniedCommands.tsx': 'security',
+  'SecurityPanelTailnet.tsx': 'security',
+  'SecurityPanelTrust.tsx': 'security',
+  'SecurityPanelRedaction.tsx': 'security',
+  'SecurityPanelLayers.tsx': 'security',
+  'SecurityPanelGovernance.tsx': 'security',
   'ConnectionsPanel.tsx': 'connections',
   'SecretsPanel.tsx': 'secrets',
   'NotificationsPanel.tsx': 'notifications',
@@ -131,6 +154,8 @@ export const PANEL_TAB_MAP: Record<string, PanelTarget> = {
   // (`channels.folder-name-2`) silently re-target a different channel's row
   // whenever a panel is added earlier in file order.
   'SlackPanel.tsx': { tab: 'channels', params: { channel: 'slack' }, labelSuffix: 'Slack' },
+  // The Slack Code card SlackPanel mounts (the registered switches).
+  'SlackCodePanel.tsx': { tab: 'channels', params: { channel: 'slack' }, labelSuffix: 'Slack' },
   'WebexPanel.tsx': { tab: 'channels', params: { channel: 'webex' }, labelSuffix: 'Webex' },
   // Standalone per-channel panels, mounted by ChannelsPanel behind their
   // channel= key exactly like WebexPanel.
@@ -149,12 +174,17 @@ export const PANEL_TAB_MAP: Record<string, PanelTarget> = {
     { tab: 'channels', params: { channel: 'wecom' }, labelSuffix: 'WeCom' },
   ],
   'DeveloperPanel.tsx': 'developer',
-  // The Feature Previews cards DeveloperPanel mounts. Indexed on purpose: the
-  // old Developer-page tab kept itself out of search so "webhooks" would not
-  // advertise a hidden page, but a control visible on a Settings pane that
+  // The Feature Previews cards DeveloperPanel mounts on its Feature Previews
+  // page. Indexed on purpose: a control visible on a Settings pane that
   // search cannot find is the coverage gap settingsCoverage.test.ts exists to
   // close — and the hit reaches the labelled opt-in switch, not the page.
-  'FeaturePreviewsSection.tsx': 'developer',
+  'FeaturePreviewsSection.tsx': DEVELOPER_PREVIEWS,
+  // The URL is offered only while its preview is enabled (settingsSearchCore).
+  'SessionEnvironmentsCard.tsx': 'session-environments',
+  // The Crewmates section DeveloperPanel mounts under Feature Previews: the
+  // server-side crewmate switches (reply threads today). Same tab, so a
+  // SettingRef to `dashboard.crewmate_threads` deep-links to the row.
+  'CrewmatesSection.tsx': DEVELOPER_PREVIEWS,
   // The Decisions (Jev) card, which FeaturePreviewsSection mounts. Its own file
   // because it is a list and a detail rather than one row, and mapped here for the
   // reason the section above is: a control on a Settings pane that search cannot
@@ -166,19 +196,52 @@ export const PANEL_TAB_MAP: Record<string, PanelTarget> = {
   // that knows the feature is denied. A control added here without being added
   // there would advertise a row the page does not draw — `settingsSearchGovernance`
   // asserts the two stay in step.
-  'DecisionsCard.tsx': 'developer',
+  'DecisionsCard.tsx': DEVELOPER_PREVIEWS,
   // The card's per-point DETAIL panel, split into its own module so the card can
   // stay synchronous while this rides a lazy boundary. Mapped to the same tab: a
   // control added to it belongs to the same deep link, and leaving it unmapped
   // would mean the extractor never looks at the file at all.
-  'DecisionsPointPanel.tsx': 'developer',
+  'DecisionsPointPanel.tsx': DEVELOPER_PREVIEWS,
   'AboutPanel.tsx': 'about',
+  // AboutPanel.tsx's owners (the in-app update step-up and request card; a gateway
+  // install's Updates card body). Mapped with it so a control either one gains stays
+  // indexed on the About tab.
+  'AboutPanelUpdateFlow.tsx': 'about',
+  'AboutPanelGatewayUpdate.tsx': 'about',
   'SttSettings.tsx': 'voice',
   // The `instances` tab mounts RemoteCrewPanel (SettingsPage.tsx), which also
   // renders InstancesPanel.tsx's AddInstanceForm — both files map to the same
   // tab so a primitive added to either lands on the right deep link.
   'RemoteCrewPanel.tsx': 'instances',
+  // RemoteCrewPanel.tsx's component owners (the setup tab's cards, one crew row).
+  'RemoteCrewPanelLaunch.tsx': 'instances',
+  'RemoteCrewPanelCrewRow.tsx': 'instances',
+  // Mounted from outside pages/settings, so each is also a root in panelRoots:
+  // ImportPanel mounts PortabilityTab, FeaturePreviewsSection the gateway-wide
+  // automatic-cards switch.
+  'PortabilityTab.tsx': 'imports',
+  'AutomaticCardSetting.tsx': DEVELOPER_PREVIEWS,
+  // The built-in KAS engine card, which FeaturePreviewsSection mounts from
+  // pages/developer: its `agent.kas_bundle` switch is a Developer-tab row.
+  'KasBundleCard.tsx': DEVELOPER_PREVIEWS,
+  // The per-app model rows ChatPanel's Model page mounts. Each row is labelled
+  // with the app's own name, a dynamic label the extractor skips, so the file
+  // yields no entry today; mapped so a static control added to it lands on the
+  // Model page's deep link.
+  'AppModelsSection.tsx': { tab: 'chat', params: { sub: 'models' } },
+  // The link-pattern rule editor ChatPanel's Transcript page mounts. Its row is indexed
+  // from the `<LinkPatternsEditor>` use in ChatPanel.tsx; mapped so a static control added
+  // to the editor lands on the Transcript page's deep link.
+  'ChatPanelLinkPatternsEditor.tsx': { tab: 'chat', params: { sub: 'transcript' } },
+  // The default-folder picker ChatPanel's Sessions page mounts.
+  'DefaultSessionFolderSetting.tsx': { tab: 'chat', params: { sub: 'sessions' } },
+  // The Web Push toggle NotificationsPanel's Desktop alerts page mounts.
+  'NotificationsPushSection.tsx': { tab: 'notifications', params: { sub: 'alerts' } },
 }
+
+/** Panels whose controls sit in `case '<sub>':` pages of a SettingsSubNav;
+ *  each entry gets `params.sub` from the case it is rendered under. */
+const SUBNAV_CASE_PANELS = new Set(['ChatPanel.tsx', 'DisplayPanel.tsx', 'NotificationsPanel.tsx', 'DeveloperPanel.tsx'])
 
 /** Map component name → our type enum. */
 const PRIMITIVE_MAP: Record<string, SettingPrimitiveType> = {
@@ -364,12 +427,25 @@ export function extractFromSource(
         continue
       }
       const labelKey = extractTranslationKeyProp(props, 'label')
+      // A row's help may sit on the always-visible `description`, behind the
+      // `hint` tip, or on both. The two are kept in separate fields so a reader
+      // can tell on-row copy from tip prose: `description` holds only what the
+      // row shows, `hint` only what its info tip shows. Readers that want all
+      // of a row's help (search, the palette subtitle) join them through
+      // `settingHelpText`.
       const description = extractStringProp(props, 'description')
+      const hint = extractStringProp(props, 'hint')
       const configKey = extractStringProp(props, 'configKey')
       const settingId = extractStringProp(props, 'settingId')
+      // A rail-hosting panel renders each page in a `case '<key>':` block;
+      // search must open that page or the highlight finds nothing.
+      const caseKey = SUBNAV_CASE_PANELS.has(path.basename(fileName))
+        ? [...source.slice(0, tagStartMatch.index).matchAll(/\bcase '([a-z0-9-]+)':/g)].pop()?.[1]
+        : undefined
       for (const target of targets) {
         const tab = typeof target === 'string' ? target : target.tab
-        const params = typeof target === 'string' ? undefined : target.params
+        const targetParams = typeof target === 'string' ? undefined : target.params
+        const params = caseKey ? { ...targetParams, sub: caseKey } : targetParams
         const suffix = typeof target === 'string' ? undefined : target.labelSuffix
         // Suffix only labelKey entries: highlighting resolves labelKey to the
         // rendered (un-suffixed) label, so DOM lookup still works. A literal
@@ -383,6 +459,7 @@ export function extractFromSource(
           ...(labelKey ? { labelKey } : {}),
           ...(suffix && labelKey ? { labelSuffix: suffix } : {}),
           description: description || undefined,
+          ...(hint ? { hint } : {}),
           tab,
           type: PRIMITIVE_MAP[primitiveName],
           occurrence: 1,
@@ -397,18 +474,39 @@ export function extractFromSource(
   return { entries, skipped }
 }
 
+/** A directory of panel files, or one `file` in `dir` that a panel mounts. */
+export interface ExtractRoot { dir: string; file?: string }
+
+/** Every place panel source lives, given website/src. A settings panel that
+ *  mounts a component from another pages/ directory adds it here, so the
+ *  registry and the coverage gate both scan it. */
+export function panelRoots(srcDir: string): ExtractRoot[] {
+  return [
+    { dir: path.join(srcDir, 'pages', 'settings') },
+    { dir: path.join(srcDir, 'pages', 'overview'), file: 'PortabilityTab.tsx' },
+    { dir: path.join(srcDir, 'pages', 'developer'), file: 'KasBundleCard.tsx' },
+    { dir: path.join(srcDir, 'pages', 'chat', 'command-center'), file: 'AutomaticCardSetting.tsx' },
+  ]
+}
+
+/** The panel files under `roots`, as full paths. A directory's files are
+ *  sorted so dedup suffix assignment is deterministic cross-platform
+ *  (readdirSync order is OS-dependent). */
+export function rootFiles(roots: ExtractRoot[]): string[] {
+  return roots.flatMap(({ dir, file }) =>
+    (file ? [file] : fs.readdirSync(dir).filter(f => f.endsWith('.tsx')).sort()).map(f => path.join(dir, f)),
+  )
+}
+
 /**
- * Extract settings from all panel files in the given directory.
- * Files are sorted alphabetically before processing so dedup suffix assignment
- * is deterministic cross-platform (Fix #3: readdirSync order is OS-dependent).
+ * Extract settings from all panel files under the given roots.
  */
-export function extractAll(settingsDir: string): { entries: SettingEntry[]; skipped: number } {
-  const files = fs.readdirSync(settingsDir).filter(f => f.endsWith('.tsx')).sort()
+export function extractAll(roots: ExtractRoot[]): { entries: SettingEntry[]; skipped: number } {
   let allEntries: SettingEntry[] = []
   let totalSkipped = 0
 
-  for (const file of files) {
-    const source = fs.readFileSync(path.join(settingsDir, file), 'utf-8')
+  for (const file of rootFiles(roots)) {
+    const source = fs.readFileSync(file, 'utf-8')
     const { entries, skipped } = extractFromSource(source, file)
     allEntries = allEntries.concat(entries)
     totalSkipped += skipped
@@ -519,8 +617,10 @@ export interface AgentSettingEntry {
   tab: string
   /** Prebuilt in-app link `/settings/<tab>[/<sub>]?…&highlight=…`, usable verbatim. */
   route: string
-  /** In-panel help text, when the control has any. */
+  /** Help text the row shows on screen, when it has any. Safe to quote as on-row copy. */
   description?: string
+  /** Help text behind the row's info tip, when it has any. Never shown on the row itself. */
+  hint?: string
   /** Schema key this control writes, when it maps to exactly one. */
   configKey?: string
 }
@@ -553,6 +653,7 @@ export function buildAgentRegistry(entries: SettingEntry[]): AgentSettingEntry[]
       entry.configKey ? { ...entry, id: `${HIGHLIGHT_KEY_PREFIX}${entry.configKey}` } : entry,
     ),
     ...(entry.description ? { description: entry.description } : {}),
+    ...(entry.hint ? { hint: entry.hint } : {}),
     ...(entry.configKey ? { configKey: entry.configKey } : {}),
   }))
 }

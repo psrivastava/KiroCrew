@@ -6,7 +6,7 @@ import asyncio
 import time
 import uuid
 
-from kiro_crew.agent_discovery import _read_agent_spec, spec_str
+from kiro_crew.agent_discovery import _read_agent_spec, served_provider_label, spec_str
 from kiro_crew.agent_spec_format import is_agent_spec_name, is_markdown_spec, spec_stem
 from kiro_crew.config.loader import _session_work_dir
 from kiro_crew.config.paths import project_agents_dir
@@ -158,7 +158,20 @@ class MemberSessionRunner(SessionAgentRunner):
             )
 
     async def _bounded_assignment(self, prompt, **kwargs):
-        task = asyncio.create_task(self._assignment(prompt, **kwargs))
+        # Shared Crew fair admission: an unattended assignment is charged to Crew
+        # automation; a refusal raises (``TurnRefused``) and the run reports it.
+        from kiro_crew.shared_crew.admission import OperationKind
+        from kiro_crew.shared_crew.turn_gate import run_admitted_or_raise
+
+        task = asyncio.create_task(
+            run_admitted_or_raise(
+                self._assignment(prompt, **kwargs),
+                session_key=f"auto-improvement:{self.role}",
+                text=prompt,
+                automation=True,
+                operation=OperationKind.BACKGROUND,
+            )
+        )
         try:
             while not task.done():
                 remaining = kwargs["timeout_s"] - (time.monotonic() - kwargs["t0"])
@@ -175,7 +188,7 @@ class MemberSessionRunner(SessionAgentRunner):
 
     async def _assignment(self, prompt, **kwargs):
         config, name, _member = await _io(crew.resolve_role, self.role, self.member_id)
-        execution = resolve_member_execution(config, name, app=store.APP_NAME)
+        execution = await _io(resolve_member_execution, config, name, app=store.APP_NAME)
         key = f"auto-improvement-{uuid.uuid4().hex}"
         # Pin the same default the provider factory uses, so omitted cwd cannot
         # bypass admission or resolve to a different workspace after the check.
@@ -217,6 +230,7 @@ class MemberSessionRunner(SessionAgentRunner):
                 memory_store=execution.store.store_id,
                 member=name,
                 execution_context=execution,
+                provider_type=served_provider_label(provider),
                 request_prefix_context=kwargs["append_system"],
             )
             logged_prompt = await _io(redact_via_context, prompt)
@@ -253,6 +267,10 @@ class MemberSessionRunner(SessionAgentRunner):
                     t0=kwargs["t0"],
                     max_turns=kwargs["max_turns"],
                     allowed_tools=kwargs["allowed_tools"],
+                    # Govern under the member's alias, not the shared template: a
+                    # task-scoped profile bound to the alias must hold here as it
+                    # does when the same member is driven from the dashboard.
+                    governance_agent=name,
                 )
             logged_text = await _io(redact_via_context, result.text)
             await _io(log.append, key, "assistant", logged_text, agent=name)

@@ -35,6 +35,8 @@ from pathlib import Path
 
 import pytest
 
+from kiro_crew import agent_panel
+from kiro_crew.crew_log.entry_types import SESSION_ENTRY_TYPES, validate_data
 from kiro_crew.crew_log.schema import (
     KIND_SESSION,
     MAX_ENTRY_BYTES,
@@ -55,15 +57,17 @@ SESSION_TYPES_DOC = _DOCS / "session-types.md"
 #: A live type's subsection heading: ``### `domain/action` ``.
 _SUBSECTION_RE = re.compile(r"^### `([a-z]+/[a-z_]+)`\s*$", re.MULTILINE)
 
-#: A summary-table row's first cell, which links to the subsection anchor.
-_SUMMARY_ROW_RE = re.compile(r"^\| \[`([a-z]+/[a-z_]+)`\]\(#[a-z]+\) \|", re.MULTILINE)
+#: A summary-table row's first cell, which links to the subsection anchor. The anchor
+#: keeps the action's underscores (`dashboard/agentic_value` -> `#dashboardagentic_value`),
+#: so it takes the same character class as the type.
+_SUMMARY_ROW_RE = re.compile(r"^\| \[`([a-z]+/[a-z_]+)`\]\(#[a-z_]+\) \|", re.MULTILINE)
 
 #: A fenced ``json`` block. Every one on this page is a single entry line.
 _JSON_BLOCK_RE = re.compile(r"^```json\n(.*?)\n```$", re.MULTILINE | re.DOTALL)
 
 #: The count the page's own prose claims. Pinned so adding a subsection without
 #: updating the page's opening line fails here rather than misleading a reader.
-EXPECTED_LIVE_TYPES = 29
+EXPECTED_LIVE_TYPES = 50
 
 #: The only two emitters that write a session entry. Kept as a literal rather than
 #: read from ``FIXED_SOURCES``, which holds the crew-side values too.
@@ -106,6 +110,15 @@ def test_summary_table_matches_the_subsections() -> None:
     assert set(_SUMMARY_ROW_RE.findall(_doc_text())) == set(_documented_types())
 
 
+def test_summary_table_lists_every_declared_session_type() -> None:
+    """The page lists exactly the session types this build declares.
+
+    The other checks compare the page with itself, so a type missing from both the
+    table and the subsections passes them all. This compares it with the registry.
+    """
+    assert set(_SUMMARY_ROW_RE.findall(_doc_text())) == set(SESSION_ENTRY_TYPES)
+
+
 def test_every_documented_type_has_an_example() -> None:
     """A type documented without an example is a contract nobody can copy."""
     example_types = {json.loads(block)["type"] for block in _json_examples()}
@@ -131,6 +144,7 @@ def test_example_would_be_accepted_as_a_session_entry(block: str) -> None:
     assert entry is not None
     require_data(entry.data)
     check_ownership(KIND_SESSION, entry.type, entry.src)
+    validate_data(KIND_SESSION, entry.type, entry.data)
     require_entry_line(serialize(entry.to_dict()))
 
 
@@ -149,6 +163,26 @@ def test_session_examples_carry_no_crew_only_envelope_fields(block: str) -> None
 
 
 @pytest.mark.parametrize("block", _json_examples())
+def test_example_crew_key_is_a_real_digest_width(block: str) -> None:
+    """A `crew_key` example must be as wide as the digest the code actually makes.
+
+    This page is copied from, and the reader's own ownership check compares the whole
+    digest, so a short example yields a record `api_member_panel` can never match --
+    the panel silently reads as another crew's. The page carried a 40-character value
+    where ``crew_key`` is a sha256 (64), and nothing caught it: every other example
+    test only parses the JSON, which a wrong-width hex string passes. Compared against
+    the live function rather than a literal 64, so changing the digest updates this
+    with it.
+    """
+    data = json.loads(block).get("data")
+    if not isinstance(data, dict) or "crew_key" not in data:
+        pytest.skip("this example has no crew_key")
+    assert len(str(data["crew_key"])) == len(
+        agent_panel.crew_key("any-crew")
+    ), "a crew_key example must be the width crew_key actually produces"
+
+
+@pytest.mark.parametrize("block", _json_examples())
 def test_session_examples_name_only_a_session_emitter(block: str) -> None:
     """``src`` on a session example is one of the two emitters that write one.
 
@@ -162,7 +196,7 @@ def test_session_examples_name_only_a_session_emitter(block: str) -> None:
 
 #: A summary row's type together with its ``Emitter`` cell (the third column).
 _EMITTER_CELL_RE = re.compile(
-    r"^\| \[`([a-z]+/[a-z_]+)`\]\(#[a-z]+\) \| [^|]*\| ([^|]*)\|", re.MULTILINE
+    r"^\| \[`([a-z]+/[a-z_]+)`\]\(#[a-z_]+\) \| [^|]*\| ([^|]*)\|", re.MULTILINE
 )
 
 
@@ -212,13 +246,27 @@ def _pending_types() -> list[str]:
     return [t for t, cell in _EMITTER_CELL_RE.findall(_doc_text()) if cell.strip().startswith("#")]
 
 
+def _emitter_definers(package: Path) -> frozenset[str]:
+    """The ``crew_log`` modules that define a module-level ``on_*`` emitter function."""
+    definers = frozenset(
+        path.name
+        for path in package.glob("*.py")
+        if re.search(r"^def on_[a-z_]+\(", path.read_text(encoding="utf-8"), re.MULTILINE)
+    )
+    assert any(
+        name == "emit.py" or name.startswith("emit_") for name in definers
+    ), f"the emitter definitions were not found: {sorted(definers)}"
+    return definers
+
+
 @functools.lru_cache(maxsize=1)
 def _emit_functions_called_in_the_tree() -> frozenset[str]:
     """Every ``on_*`` emitter function called under ``src/kiro_crew``.
 
-    A call site is what makes a type actually written. The emitter module is skipped
-    because it DEFINES these functions -- an emitter API with no caller writes nothing,
-    which is exactly the state a pending mark claims.
+    A call site is what makes a type actually written. The module that DEFINES these
+    functions is skipped -- an emitter API with no caller writes nothing, which is exactly
+    the state a pending mark claims -- and which module that is, is read off the package
+    rather than assumed, so the skip follows the definitions wherever they live.
 
     Read ONCE for the whole module rather than once per pending mark. The tree is
     ~1570 files and ~50 MiB, so scanning it per mark multiplies that by the number of
@@ -226,9 +274,10 @@ def _emit_functions_called_in_the_tree() -> frozenset[str]:
     Windows one.
     """
     root = Path(__file__).parent.parent / "src" / "kiro_crew"
+    definers = _emitter_definers(root / "crew_log")
     called: set[str] = set()
     for path in root.rglob("*.py"):
-        if path.parent.name == "crew_log" and path.name == "emit.py":
+        if path.parent.name == "crew_log" and path.name in definers:
             continue
         try:
             text = path.read_text(encoding="utf-8", errors="replace")

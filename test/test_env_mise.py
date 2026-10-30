@@ -11,10 +11,17 @@ from unittest.mock import Mock
 import pytest
 
 from kiro_crew import env
+from kiro_crew.subprocess_utf8 import UTF8_TEXT
 
 
 @pytest.fixture
-def mise_host(monkeypatch, tmp_path):
+def denied():
+    """Candidates whose ``stat`` is refused, as ``Path.is_file`` raises on 3.12."""
+    return set()
+
+
+@pytest.fixture
+def mise_host(monkeypatch, tmp_path, denied):
     """Model only the lookup filesystem; never run a host mise binary."""
     env._mise_bin.cache_clear()
     local = tmp_path / ".local" / "bin" / "mise"
@@ -32,6 +39,8 @@ def mise_host(monkeypatch, tmp_path):
 
         def is_file(self):
             probes.append(self)
+            if self in denied:
+                raise PermissionError(13, "Permission denied", str(self))
             return self in files
 
     real_access = os.access
@@ -89,6 +98,27 @@ def test_unusable_fallback_does_not_hide_next_candidate(mise_host, rejected):
     assert probes == [local, arm, intel]
 
 
+def test_denied_candidate_is_skipped_not_raised(mise_host, denied):
+    local, arm, intel, files, executable, probes, _ = mise_host
+    denied.update([local, arm])
+    files.add(intel)
+    executable.add(intel)
+    assert env._mise_bin() == str(intel)
+    assert probes == [local, arm, intel]
+
+
+def test_activation_is_a_noop_when_every_candidate_is_denied(monkeypatch, mise_host, denied):
+    local, arm, intel, _, _, probes, _ = mise_host
+    denied.update([local, arm, intel])
+    run = Mock()
+    monkeypatch.setattr(env.subprocess, "run", run)
+    target = {"PATH": os.environ["PATH"]}
+    assert env.activate_mise(target) == []
+    assert probes == [local, arm, intel]
+    run.assert_not_called()
+    assert target == {"PATH": os.environ["PATH"]}
+
+
 @pytest.mark.parametrize("platform", ["linux", "win32"])
 @pytest.mark.parametrize("local_present", [False, True])
 def test_other_platforms_keep_existing_lookup(monkeypatch, mise_host, platform, local_present):
@@ -121,7 +151,7 @@ def test_activation_uses_homebrew_binary_from_bare_path(monkeypatch, mise_host, 
     run.assert_called_once_with(
         [str(binary), "env", "--json"],
         capture_output=True,
-        text=True,
+        **UTF8_TEXT,
         timeout=10,
         env={"PATH": original_path, "KEEP": "unchanged"},
         cwd=str(env.Path.home()),

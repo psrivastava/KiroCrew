@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import queue
 import time
 from typing import Any
@@ -87,6 +88,81 @@ def test_plain_prompt_streams_reply_then_end_turn(monkeypatch):
     assert chunk["sessionUpdate"] == "agent_message_chunk"
     assert chunk["content"]["text"] == fake.REPLY_TEXT
     assert msgs[-1]["result"]["stopReason"] == "end_turn"
+
+
+def _naming_prompts() -> dict[str, str]:
+    """Every session-naming prompt the host really sends, built by its own code."""
+    from kiro_crew.dashboard import chat_title
+    from kiro_crew.messaging import auto_title
+
+    convo = [
+        {"role": "user", "content": "hello from the gui test"},
+        {"role": "assistant", "content": fake.REPLY_TEXT},
+    ]
+    dashboard = chat_title._build_title_prompt(convo)
+    refresh = chat_title._build_refresh_prompt(convo, "hello from the gui test")
+    assert dashboard is not None and refresh is not None
+    return {
+        "dashboard": dashboard,
+        "dashboard-refresh": refresh,
+        "channel": auto_title.build_title_prompt("hello from the gui test", fake.REPLY_TEXT),
+    }
+
+
+@pytest.mark.parametrize("kind", ["dashboard", "dashboard-refresh", "channel"])
+def test_naming_prompt_gets_the_skip_verdict_not_the_chat_reply(monkeypatch, kind):
+    buf = _capture(monkeypatch)
+    fake._handle(
+        {
+            "jsonrpc": "2.0",
+            "id": 40,
+            "method": "session/prompt",
+            "params": {
+                "sessionId": "s1",
+                "prompt": [{"type": "text", "text": _naming_prompts()[kind]}],
+            },
+        }
+    )
+    msgs = _messages(buf)
+    assert [m.get("method", "result") for m in msgs] == ["session/update", "result"]
+    assert msgs[0]["params"]["update"]["content"]["text"] == fake.NAMING_REPLY_TEXT
+    assert msgs[-1]["result"]["stopReason"] == "end_turn"
+
+
+def test_naming_opening_matches_the_one_the_prompts_are_built_from():
+    from kiro_crew.label_guard import NAMING_PROMPT_OPENING
+
+    assert fake.NAMING_PROMPT_OPENING == NAMING_PROMPT_OPENING
+
+
+def test_naming_reply_leaves_the_first_message_as_the_session_title():
+    """The fake's naming reply yields no model title, so the first message names it."""
+    from kiro_crew.dashboard import chat_title
+    from kiro_crew.messaging import auto_title
+
+    assert chat_title._validate_title_reply(fake.NAMING_REPLY_TEXT) == ""
+    assert auto_title.clean_title(fake.NAMING_REPLY_TEXT) == ""
+    # The chat reply, by contrast, passes as a title: what the fake must not send.
+    assert chat_title._validate_title_reply(fake.REPLY_TEXT) == fake.REPLY_TEXT
+    convo = [
+        {"role": "user", "content": "hello from the gui test"},
+        {"role": "assistant", "content": fake.REPLY_TEXT},
+    ]
+    assert chat_title._fallback_title_from_messages(convo) == "hello from the gui test"
+
+
+def test_a_chat_message_quoting_the_naming_opening_mid_text_gets_the_chat_reply(monkeypatch):
+    buf = _capture(monkeypatch)
+    text = f"please explain: {fake.NAMING_PROMPT_OPENING}"
+    fake._handle(
+        {
+            "jsonrpc": "2.0",
+            "id": 41,
+            "method": "session/prompt",
+            "params": {"sessionId": "s1", "prompt": [{"type": "text", "text": text}]},
+        }
+    )
+    assert _messages(buf)[0]["params"]["update"]["content"]["text"] == fake.REPLY_TEXT
 
 
 def test_tool_prompt_emits_tool_call_without_permission(monkeypatch):
@@ -193,6 +269,23 @@ def test_main_answers_readiness_probes(monkeypatch):
     monkeypatch.setattr(fake.sys, "argv", ["fake_acp_backend", "whoami"])
     fake.main()
     assert buf.getvalue().strip() == fake.FAKE_IDENTITY
+
+
+def test_main_answers_list_models_with_a_catalog(monkeypatch):
+    """``chat --list-models`` prints the fixed catalog in the shape ``api_models``
+    accepts: a dict whose ``models`` is a list of rows carrying ``model_name``.
+    A silent child here is a 503 behind the dashboard's model picker."""
+    buf = _capture(monkeypatch)
+    monkeypatch.setattr(
+        fake.sys,
+        "argv",
+        ["fake_acp_backend", "chat", "--list-models", "--format", "json", "--no-interactive"],
+    )
+    fake.main()
+    data = json.loads(buf.getvalue())
+    assert isinstance(data["models"], list) and data["models"]
+    assert all(row["model_name"] and row["model_id"] for row in data["models"])
+    assert data == fake.FAKE_MODEL_CATALOG
 
 
 def test_main_processes_messages_until_eof(monkeypatch):
@@ -386,6 +479,113 @@ def test_slow_lateack_acks_even_if_the_stream_ends_first(monkeypatch):
     # Inbox drained by the single consuming poll, yet the ack still lands.
     assert fake._INBOX.empty()
     assert _messages(buf)[-1]["result"]["stopReason"] == "cancelled"
+
+
+# [[SLOW_HOLD:<token>]]: a slow stream held after one chunk until released.
+
+
+@pytest.fixture
+def hold_dir(tmp_path, monkeypatch, fast_slow_stream):
+    """A release directory the fake reads, and a hold that polls without waiting.
+
+    The wait ceiling is cut to 5 s so a hold the code under test never releases
+    fails the turn by name instead of running out the 60 s production bound.
+    """
+    monkeypatch.setenv(fake.SLOW_HOLD_DIR_ENV, str(tmp_path))
+    monkeypatch.setattr(fake, "SLOW_HOLD_CHUNK_DELAY_SECS", 0)
+    monkeypatch.setattr(fake, "SLOW_HOLD_WAIT_SECS", 5.0)
+    monkeypatch.setattr(fake, "_POLL_INTERVAL_SECS", 0.001)
+    return tmp_path
+
+
+def _chunk_count(buf: io.StringIO) -> int:
+    return sum(1 for m in _messages(buf) if m.get("method") == "session/update")
+
+
+def test_slow_hold_waits_after_one_chunk_until_released(monkeypatch, fast_slow_stream):
+    """The hold is asked only once ``SLOW_HOLD_AFTER_CHUNKS`` chunks are out,
+    nothing streams while it answers False, and the stream resumes on True."""
+    monkeypatch.setattr(fake, "_POLL_INTERVAL_SECS", 0)
+    buf = _capture(monkeypatch)
+    seen: list[int] = []
+
+    def hold() -> bool:
+        seen.append(_chunk_count(buf))
+        return len(seen) == 3  # released on the third poll
+
+    assert fake._stream_slowly("s1", cancel_aware=True, hold=hold, delay=0) is False
+    assert seen == [fake.SLOW_HOLD_AFTER_CHUNKS] * 3
+    assert _chunk_count(buf) == fake.SLOW_CHUNKS
+
+
+def test_a_cancel_during_the_hold_ends_the_stream_as_cancelled(monkeypatch, fast_slow_stream):
+    monkeypatch.setattr(fake, "_POLL_INTERVAL_SECS", 0)
+    buf = _capture(monkeypatch)
+
+    def hold() -> bool:
+        # The cancel arrives while the stream is held; the hold never releases.
+        fake._INBOX.put(
+            {"jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": "s1"}}
+        )
+        return False
+
+    assert fake._stream_slowly("s1", cancel_aware=True, hold=hold, delay=0) is True
+    assert _chunk_count(buf) == fake.SLOW_HOLD_AFTER_CHUNKS
+
+
+def test_slow_hold_marker_waits_on_the_last_tokens_release_file(monkeypatch, hold_dir):
+    """Each marker line names a token; the last one holds, on the file of that
+    name in the hold directory. Released in advance, the turn streams it all."""
+    (hold_dir / "second").touch()
+    buf = _capture(monkeypatch)
+    text = f"{fake.slow_hold_trigger('first')}\n{fake.slow_hold_trigger('second')}"
+    fake._handle(_prompt(text))
+    assert _chunk_count(buf) == fake.SLOW_CHUNKS
+    assert _messages(buf)[-1]["result"]["stopReason"] == "end_turn"
+
+
+def test_a_hold_nobody_releases_fails_the_turn_by_name(monkeypatch, hold_dir):
+    monkeypatch.setattr(fake, "SLOW_HOLD_WAIT_SECS", 0)
+    buf = _capture(monkeypatch)
+    fake._handle(_prompt(fake.slow_hold_trigger("never")))
+    msgs = _messages(buf)
+    assert _chunk_count(buf) == fake.SLOW_HOLD_AFTER_CHUNKS
+    assert msgs[-1]["id"] == 100
+    assert "result" not in msgs[-1]
+    assert msgs[-1]["error"]["message"] == (
+        "fake ACP backend: slow hold 'never' was not released within 0s"
+    )
+
+
+def test_a_hold_without_its_directory_is_refused(monkeypatch, fast_slow_stream):
+    monkeypatch.delenv(fake.SLOW_HOLD_DIR_ENV, raising=False)
+    buf = _capture(monkeypatch)
+    fake._handle(_prompt(fake.slow_hold_trigger("tok")))
+    (msg,) = _messages(buf)
+    assert msg["error"]["message"] == (
+        f"fake ACP backend: a slow hold needs {fake.SLOW_HOLD_DIR_ENV}"
+    )
+
+
+def test_a_quoted_hold_marker_holds_nothing(monkeypatch):
+    """Line-anchored: a transcript quoting the prompt is not a hold."""
+    monkeypatch.delenv(fake.SLOW_HOLD_DIR_ENV, raising=False)
+    buf = _capture(monkeypatch)
+    fake._handle(_prompt(f"User: {fake.slow_hold_trigger('tok')}"))
+    msgs = _messages(buf)
+    assert "error" not in msgs[-1]
+    assert msgs[-1]["result"]["stopReason"] == "end_turn"
+
+
+def test_slow_hold_trigger_and_path_spell_the_marker_and_release_file():
+    assert fake.slow_hold_trigger("A-z_09") == "[[SLOW_HOLD:A-z_09]]"
+    assert fake.slow_hold_path("holds", "tok") == os.path.join("holds", "tok")
+
+
+@pytest.mark.parametrize("token", ["", "has space", "x" * 65, "a]]b", "../up"])
+def test_slow_hold_trigger_refuses_a_token_the_marker_cannot_carry(token):
+    with pytest.raises(ValueError, match="slow-hold token"):
+        fake.slow_hold_trigger(token)
 
 
 def _permission_answer(option_id: str) -> dict[str, Any]:

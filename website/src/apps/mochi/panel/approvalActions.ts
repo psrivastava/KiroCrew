@@ -6,7 +6,8 @@
  * `action in ("approve", "reject")` and 400s on anything else. So every approval
  * from the pet failed, and the failure was swallowed twice (no res.ok check plus a
  * bare catch) — the dialog closed, the pet said "approved", the agent stayed
- * blocked. Matching the dashboard's own mapping (website/src/components/ChatInput.tsx):
+ * blocked. Matching the dashboard's own mapping
+ * (website/src/components/chat-input/approval.ts):
  *
  *   approve / reject          → POST /api/approvals/{id}/{approve|reject}
  *   trust, trust_reads, …     → POST /api/chat/slots/{slot}/approve
@@ -15,6 +16,8 @@
  * Trust is not an approval verb: it answers this request AND widens the slot's
  * standing policy, which only the slot endpoint can do.
  */
+import { sliceCodePoints } from '../../../components/CommentOverlay'
+
 export type ApprovalUiAction = 'approve' | 'reject' | 'trust' | 'trust_reads' | string
 
 /** Which endpoint a decision has to go to. */
@@ -38,5 +41,5 @@ export function isGrant(uiAction: ApprovalUiAction): boolean {
 export function approvalLabel(tool: string, toolInput?: string, max = 72): string {
   const parts = [tool, toolInput].map(v => String(v || '').replace(/\s+/g, ' ').trim()).filter(Boolean)
   const line = parts.join(' ')
-  return line.length > max ? line.slice(0, max) + '…' : line
+  return line.length > max ? sliceCodePoints(line, 0, max) + '…' : line
 }

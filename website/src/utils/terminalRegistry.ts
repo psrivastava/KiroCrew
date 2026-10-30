@@ -12,8 +12,13 @@ import type { FitAddon } from '@xterm/addon-fit'
  * gated on this map -- see `getTerminalInputWs`.
  */
 const registry = new Map<string, WebSocket>()
-/** Per-session one-shot shell-ready listeners. */
-const readyListeners = new Map<string, Set<() => void>>()
+
+/** Per-session one-shot shell-ready or failed-handoff listeners. */
+interface ReadyListener {
+  onReady: () => void
+  onFailure?: () => void
+}
+const readyListeners = new Map<string, Set<ReadyListener>>()
 
 let _enabled = false
 const enabledListeners = new Set<() => void>()
@@ -84,6 +89,11 @@ function setSessionTitle(sessionId: string, title: string) {
   if (ls) for (const cb of ls) cb()
 }
 
+/** A session's live terminal title right now, for code outside render. */
+export function getTerminalTitle(sessionId: string): string | undefined {
+  return titles.get(sessionId)
+}
+
 /** React hook: a session's live terminal title (undefined until the first
  *  title frame arrives — callers fall back to the tab's default cwd title). */
 export function useTerminalTitle(sessionId: string): string | undefined {
@@ -104,7 +114,7 @@ export function registerTerminalWs(sessionId: string, ws: WebSocket) {
   const ls = readyListeners.get(sessionId)
   if (ls) {
     readyListeners.delete(sessionId)
-    for (const cb of ls) cb()
+    for (const listener of ls) listener.onReady()
   }
 }
 
@@ -117,28 +127,60 @@ export function getTerminalWs(sessionId: string): WebSocket | null {
   return ws && ws.readyState === WebSocket.OPEN ? ws : null
 }
 
+/** A shell that exited on its own, as the server reported it. `status` is null
+ *  when the exit code is unavailable. */
+export interface TerminalExit { status: number | null }
+
+/** Listeners for a shell that exited on its own. This module owns sockets, not
+ *  tabs, so tab owners subscribe and decide what closing means. */
+const exitListeners = new Set<(sessionId: string, exit: TerminalExit) => void>()
+
+/** Subscribe to shell exits. Returns an unsubscribe function. */
+export function onTerminalExit(
+  cb: (sessionId: string, exit: TerminalExit) => void,
+): () => void {
+  exitListeners.add(cb)
+  return () => { exitListeners.delete(cb) }
+}
+
 /**
- * Run `cb` once the given session's shell is ready for input — immediately if
- * it already is. Returns an unsubscribe fn (no-op once it fires). Used by
- * "Run in terminal" to keep command batches behind shell initialization.
+ * Settle once the shell is ready, startup reports an error, or its local connection
+ * is released. Known ready/refused outcomes fire immediately. Failure consumes
+ * the ready listener even without an onFailure callback, so a later manual retry
+ * cannot run an old command.
+ * Returns an unsubscribe fn (no-op once it fires).
  */
-export function onTerminalReady(sessionId: string, cb: () => void): () => void {
-  if (getTerminalWs(sessionId)) { cb(); return () => {} }
+export function onTerminalReady(
+  sessionId: string,
+  onReady: () => void,
+  onFailure?: () => void,
+): () => void {
+  const known = conns.get(sessionId)
+  if (known?.invalidCwd || known?.wrongMachine) { onFailure?.(); return () => {} }
+  if (getTerminalWs(sessionId)) { onReady(); return () => {} }
   let set = readyListeners.get(sessionId)
   if (!set) { set = new Set(); readyListeners.set(sessionId, set) }
-  set.add(cb)
-  return () => { set?.delete(cb) }
+  const listener = { onReady, onFailure }
+  set.add(listener)
+  return () => { set?.delete(listener) }
 }
 
 /**
  * Send a line of code to a specific terminal session. Returns false if that
- * session has no open socket.
+ * session has no open shell-ready socket. Commands confirmed verbatim can
+ * preserve trailing whitespace and an existing line terminator: trimming an
+ * escaped space changes shell syntax; an extra newline can answer a prompt.
  */
-export function sendToTerminalSession(sessionId: string, code: string): boolean {
+export function sendToTerminalSession(
+  sessionId: string, code: string, options?: { preserveTrailingWhitespace?: boolean },
+): boolean {
   const ws = getTerminalWs(sessionId)
   if (!ws) return false
   try {
-    ws.send(new TextEncoder().encode(code.trimEnd() + '\n'))
+    const input = options?.preserveTrailingWhitespace
+      ? code + (/[\r\n]$/.test(code) ? '' : '\n')
+      : code.trimEnd() + '\n'
+    ws.send(new TextEncoder().encode(input))
     return true
   } catch {
     return false
@@ -177,14 +219,16 @@ export function sendRawToTerminalSession(sessionId: string, data: string): boole
  * The WebSocket lives here (module scope), NOT in the TerminalView component,
  * so unmounting the terminal tab (activity-bar close, tab switch, chat switch,
  * route change) does NOT close the socket. The connection is created once per
- * session and torn down only on explicit tab close (disposeTerminalConnection,
- * called from CliPanel's disposeTerminalSession). Genuine socket drops
+ * session and torn down on explicit tab close or local ownership release to a
+ * popout (disposeTerminalConnection). Genuine socket drops
  * (reload/network/server) reconnect with backoff; the backend keeps the PTY
  * alive for the orphan-reaper window so a reconnect re-attaches. */
 
 const MAX_RETRIES = 10
 const BASE_DELAY_MS = 1000
 const MAX_DELAY_MS = 30_000
+// Paired with the terminal handler: the shell is gone, so do not redial.
+const TERMINAL_WS_CLOSE_SHELL_EXITED = 4001
 
 /** Coarse connection state a session's terminal view can render. */
 export type TerminalConnStatus = 'connected' | 'reconnecting' | 'disconnected'
@@ -193,11 +237,22 @@ interface Conn {
   term: Terminal
   fit: FitAddon
   cwd?: string | null
+  remoteSlot?: string
+  chatSlot?: string
   ws: WebSocket | null
   disposed: boolean
   retries: number
   reconnectTimer?: ReturnType<typeof setTimeout>
   status: TerminalConnStatus
+  /** A rejected open parks until the user explicitly retries. */
+  invalidCwd: boolean
+  /** The gateway refused to open this shell on that machine (`terminal_wrong_machine`):
+   *  the chat runs elsewhere. */
+  wrongMachine?: boolean
+  /** Consecutive `terminal_placement_unavailable` refusals. The refused socket
+   *  still opens (so `onopen` would reset `retries`); this carries the backoff
+   *  across them until a shell is ready. */
+  placementRefusals?: number
   /**
    * Set when the user clicked "Reconnect" and cleared the moment the socket
    * next resolves (connected) or the redial chain gives up (disconnected). It
@@ -349,6 +404,34 @@ export function useTerminalConnStatus(sessionId: string): TerminalConnStatus | u
   )
 }
 
+/** Whether the gateway refused to open this shell on its machine, published with the status. */
+export function useTerminalWrongMachine(sessionId: string): boolean {
+  return useSyncExternalStore(
+    (cb) => {
+      let s = statusListeners.get(sessionId)
+      if (!s) { s = new Set(); statusListeners.set(sessionId, s) }
+      s.add(cb)
+      return () => { s?.delete(cb) }
+    },
+    () => conns.get(sessionId)?.wrongMachine ?? false,
+    () => false,
+  )
+}
+
+/** Whether the requested cwd was rejected, published with the connection status. */
+export function useTerminalInvalidCwd(sessionId: string): boolean {
+  return useSyncExternalStore(
+    (cb) => {
+      let s = statusListeners.get(sessionId)
+      if (!s) { s = new Set(); statusListeners.set(sessionId, s) }
+      s.add(cb)
+      return () => { s?.delete(cb) }
+    },
+    () => conns.get(sessionId)?.invalidCwd ?? false,
+    () => false,
+  )
+}
+
 /**
  * Re-arm and immediately redial a session's connection: clears the retry
  * ceiling and any pending backoff timer, then dials at once. Used by the
@@ -359,15 +442,19 @@ export function useTerminalConnStatus(sessionId: string): TerminalConnStatus | u
  * as "Reconnecting…"; the automatic revive listeners pass false so transient
  * redials stay bannerless.
  */
-export function retryTerminalConnection(sessionId: string, manual = true): void {
+export function retryTerminalConnection(sessionId: string, manual = true, cwd?: string): void {
   const c = conns.get(sessionId)
   if (!c || c.disposed) return
-  // A displaced session was closed on purpose by the server; only the user
-  // takes it back. Automatic revives (online / tab foreground) must not, or a
-  // background tab regaining focus would silently displace the active window.
-  if (c.displaced) {
+  // Only the user re-arms a deliberate handoff or a rejected cwd. Automatic
+  // revives must neither displace another window nor retry an unchanged path.
+  if (c.displaced || c.invalidCwd || c.wrongMachine) {
     if (!manual) return
+    // Only explicit recovery from a refused directory can change the target.
+    // An empty override asks the server to use its terminal starting directory.
+    if (c.invalidCwd && cwd !== undefined) c.cwd = cwd
     c.displaced = false
+    c.invalidCwd = false
+    c.wrongMachine = false
     notifyStatus(sessionId)
   }
   if (manual) setManualRetry(sessionId, c)
@@ -380,9 +467,11 @@ export function retryTerminalConnection(sessionId: string, manual = true): void 
     // onclose redials promptly even if the chain was exhausted, and let it own
     // the dial.
     c.retries = 0
+    c.placementRefusals = 0
     return
   }
   c.retries = 0
+  c.placementRefusals = 0
   clearTimeout(c.reconnectTimer)
   c.reconnectTimer = undefined
   connect(sessionId, c)
@@ -408,7 +497,7 @@ if (typeof window !== 'undefined') {
 }
 
 function connect(sessionId: string, c: Conn) {
-  if (c.disposed) return
+  if (c.disposed || c.invalidCwd || c.wrongMachine) return
   if (c.retries >= MAX_RETRIES) {
     // Backoff exhausted: no further dial will happen until a revive event
     // (online / tab foreground) or a manual Reconnect re-arms it. This is the
@@ -419,7 +508,16 @@ function connect(sessionId: string, c: Conn) {
   }
   setConnStatus(sessionId, c, 'reconnecting')
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
-  const qs = c.cwd ? `?cwd=${encodeURIComponent(c.cwd)}` : ''
+  // A remote shell is resolved by the gateway from the chat slot; the local cwd
+  // does not apply, and the gateway refuses rather than falling back to local.
+  // A local shell opened for a chat names that chat, so the gateway can refuse
+  // it when the chat runs on a remote environment.
+  const query: Record<string, string> = c.remoteSlot
+    ? { remote_slot: c.remoteSlot }
+    : { ...(c.cwd ? { cwd: c.cwd } : {}), ...(c.chatSlot ? { slot: c.chatSlot } : {}) }
+  // `+` is how URLSearchParams spells a space; a literal `+` is already `%2B`.
+  const encoded = new URLSearchParams(query).toString().replace(/\+/g, '%20')
+  const qs = encoded ? `?${encoded}` : ''
   const ws = new WebSocket(`${proto}//${location.host}/api/ws/terminal/${sessionId}${qs}`)
   ws.binaryType = 'arraybuffer'
   c.ws = ws
@@ -448,7 +546,12 @@ function connect(sessionId: string, c: Conn) {
     if (typeof ev.data === 'string') {
       try {
         const m = JSON.parse(ev.data)
-        if (m && m.type === 'ready') {
+        if (m && m.type === 'exit') {
+          handleShellExit(sessionId, c, { status: typeof m.status === 'number' ? m.status : null })
+          return
+        }
+        if (m && m.type === 'ready' && !c.invalidCwd) {
+          c.placementRefusals = 0
           // Record the shell BEFORE registering: registerTerminalWs drains the
           // ready listeners synchronously, and Run-in-terminal's listener reads
           // the shell to decide how to hand over the snippet.
@@ -461,17 +564,42 @@ function connect(sessionId: string, c: Conn) {
         if (m && m.type === 'title' && typeof m.text === 'string') setSessionTitle(sessionId, m.text)
         if (m && m.type === 'cwd' && typeof m.path === 'string') cwds.set(sessionId, m.path)
         if (m && m.type === 'error' && m.code === 'displaced') c.displaced = true
+        if (m && m.type === 'error' && m.code === 'terminal_placement_unavailable') {
+          // Redial (Coder or the chat may be back soon), but back off: the
+          // refused socket opened, which reset `retries` to zero.
+          c.placementRefusals = (c.placementRefusals ?? 0) + 1
+          c.retries = c.placementRefusals - 1
+        }
+        if (m && m.type === 'error' && (m.code === 'terminal_invalid_cwd' || m.code === 'terminal_wrong_machine')) {
+          if (m.code === 'terminal_invalid_cwd') c.invalidCwd = true
+          else c.wrongMachine = true
+          clearTimeout(c.reconnectTimer)
+          c.reconnectTimer = undefined
+          unregisterTerminalWs(sessionId)
+          setConnStatus(sessionId, c, 'disconnected')
+        }
+        if (m && m.type === 'error') {
+          // A new socket may recover the terminal, but cannot inherit a command
+          // whose startup already failed. This also covers uncoded spawn errors
+          // and callers that subscribed without a failure callback.
+          const listeners = readyListeners.get(sessionId)
+          readyListeners.delete(sessionId)
+          if (listeners) for (const listener of listeners) listener.onFailure?.()
+        }
       } catch { /* ignore non-JSON control frames */ }
     }
   }
 
-  ws.onclose = () => {
+  ws.onclose = (ev) => {
     unregisterTerminalWs(sessionId)
     if (c.disposed) return
-    if (c.displaced) {
-      // The server handed this PTY to a newer window and closed us on purpose.
-      // Park instead of redialing: a redial would displace that window right
-      // back. The banner's Reconnect button is the way to take the terminal.
+    if (ev.code === TERMINAL_WS_CLOSE_SHELL_EXITED) {
+      // The exit frame can be lost to backpressure; the coded close cannot.
+      handleShellExit(sessionId, c, { status: null })
+      return
+    }
+    if (c.displaced || c.invalidCwd || c.wrongMachine) {
+      // A deliberate handoff, rejected cwd or refused machine needs an explicit user retry.
       clearTimeout(c.reconnectTimer)
       c.reconnectTimer = undefined
       setConnStatus(sessionId, c, 'disconnected')
@@ -494,6 +622,23 @@ function connect(sessionId: string, c: Conn) {
   ws.onerror = () => ws.close()
 }
 
+/** Publish one shell exit, whichever protocol signal arrives first, then
+ *  release the dead connection. */
+function handleShellExit(sessionId: string, c: Conn, exit: TerminalExit): void {
+  // Frame and coded close both land here; only the first one acts.
+  if (c.disposed) return
+  c.disposed = true
+  clearTimeout(c.reconnectTimer)
+  c.reconnectTimer = undefined
+  // Snapshot: a listener may unsubscribe itself while we iterate.
+  for (const cb of [...exitListeners]) {
+    try { cb(sessionId, exit) } catch { /* one bad listener must not strand the others */ }
+  }
+  // Release it even when no host had a tab for it, but not a replacement a
+  // listener installed under the same id.
+  if (conns.get(sessionId) === c) disposeTerminalConnection(sessionId)
+}
+
 /**
  * Ensure a persistent WebSocket exists for `sessionId`, wired to the given
  * (cached) xterm instance. Idempotent — safe to call on every TerminalView
@@ -501,9 +646,13 @@ function connect(sessionId: string, c: Conn) {
  */
 export function ensureTerminalConnection(
   sessionId: string, term: Terminal, fit: FitAddon, cwd?: string | null,
+  /** A chat slot whose REMOTE workspace this shell opens in (gateway-side `coder ssh`). */
+  remoteSlot?: string,
+  /** The chat a LOCAL shell was opened for, so the gateway checks its placement. */
+  chatSlot?: string,
 ): void {
   if (conns.has(sessionId)) return
-  const c: Conn = { term, fit, cwd, ws: null, disposed: false, retries: 0, status: 'reconnecting', manualRetry: false, displaced: false }
+  const c: Conn = { term, fit, cwd, remoteSlot, chatSlot, ws: null, disposed: false, retries: 0, status: 'reconnecting', invalidCwd: false, manualRetry: false, displaced: false }
   conns.set(sessionId, c)
   // Wire terminal I/O once (the term is cached for the session's lifetime;
   // its listeners are cleaned up by term.dispose() in destroyTerm).
@@ -516,23 +665,25 @@ export function ensureTerminalConnection(
   connect(sessionId, c)
 }
 
-/** Tear down a session's persistent connection (explicit tab close only). */
+/** Release a session's local connection on tab close or transfer to a popout. */
 export function disposeTerminalConnection(sessionId: string): void {
-  const c = conns.get(sessionId)
-  if (!c) return
-  c.disposed = true
-  clearTimeout(c.reconnectTimer)
-  if (c.ws) { c.ws.onclose = null; c.ws.close() }
-  conns.delete(sessionId)
-  unregisterTerminalWs(sessionId)
-  titles.delete(sessionId)
-  titleListeners.delete(sessionId)
-  cwds.delete(sessionId)
-  shells.delete(sessionId)
-  fenceShells.delete(sessionId)
-  statusListeners.delete(sessionId)
-  // Drop any pending onTerminalReady callbacks. They're normally drained by
-  // registerTerminalWs when the socket opens; if the tab is closed before the
-  // WS ever connects, they'd otherwise leak in readyListeners indefinitely.
+  // A waiter can precede the connection. Consume it before teardown, then
+  // report failure after cleanup so a callback can safely start a fresh wait.
+  const listeners = readyListeners.get(sessionId)
   readyListeners.delete(sessionId)
+  const c = conns.get(sessionId)
+  if (c) {
+    c.disposed = true
+    clearTimeout(c.reconnectTimer)
+    if (c.ws) { c.ws.onclose = null; c.ws.close() }
+    conns.delete(sessionId)
+    unregisterTerminalWs(sessionId)
+    titles.delete(sessionId)
+    titleListeners.delete(sessionId)
+    cwds.delete(sessionId)
+    shells.delete(sessionId)
+    fenceShells.delete(sessionId)
+    statusListeners.delete(sessionId)
+  }
+  if (listeners) for (const listener of listeners) listener.onFailure?.()
 }

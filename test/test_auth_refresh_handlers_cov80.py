@@ -305,6 +305,26 @@ async def test_me_401_without_an_authenticated_user() -> None:
 
 
 @pytest.mark.asyncio
+async def test_me_reports_the_published_principal_and_unknown_without_one() -> None:
+    from kiro_crew.shared_crew.contracts import (
+        ACTOR_REQUEST_KEY,
+        ActorContext,
+        Provenance,
+        Transport,
+    )
+    from kiro_crew.shared_crew.identity import tailnet_principal
+
+    alice = tailnet_principal("alice@example.com", "laptop", Provenance.TAILSCALE_SERVE)
+    request = _mk("GET", "/api/auth/me", user="local-app")
+    request[ACTOR_REQUEST_KEY] = ActorContext(
+        principal=alice, request_id="r", transport=Transport.HTTP
+    )
+    assert _body(await h.api_auth_me(request))["principal"] == alice.to_public_dict()
+    bare = _mk("GET", "/api/auth/me", user="local-app")
+    assert _body(await h.api_auth_me(bare))["principal"]["kind"] == "unknown"
+
+
+@pytest.mark.asyncio
 async def test_me_reports_both_expiries(state: RefreshStateManager) -> None:
     access = generate_token("alice", ttl_seconds=MAX_SESSION_TTL_SECS, register_nonce=False)
     refresh, _chain, _jti, refresh_exp = generate_refresh_token("alice")
@@ -1054,3 +1074,87 @@ async def test_logout_records_a_noop_when_the_access_cookie_was_not_revocable(
     request = _mk("POST", "/api/auth/logout", cookies={f"mc_token_{PORT}": "junk"})
     await h.api_auth_logout(request)
     assert ("", "access_cookie_revoked", "noop", "") in audit
+
+
+@pytest.mark.asyncio
+async def test_a_refused_rotation_leaves_an_audit_row_like_every_other_outcome(
+    state: RefreshStateManager, audit: list, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The one outcome caused by a storage fault must not be the one with no audit trail.
+
+    Every other end of this endpoint writes a ``refresh_token_use`` row -- ``ok``,
+    ``reuse_detected``, ``grace_replay``, ``invalid``, ``rate_limited``, and the reuse path's
+    own unpersisted case. The 503 for an unpersisted rotation logged only, so an owner
+    reconstructing "why did every session stop refreshing" from the audit trail saw nothing
+    at all for the requests that were actually refused.
+    """
+    token, chain_id, jti, _exp = generate_refresh_token("alice")
+
+    # Make the store's write fail, which is what drives the handler down the 503 branch.
+    monkeypatch.setattr(type(state), "mark_consumed", lambda self, *a, **kw: False, raising=True)
+
+    request = _mk(cookies={refresh_cookie_name(str(PORT)): token})
+    response = await h.api_auth_refresh(request)
+
+    assert response.status == 503, (
+        "the unpersisted rotation did not reach the refusal branch, so this pin is not "
+        f"exercising the case it names (status={response.status})"
+    )
+    assert _body(response)["code"] == "refresh_state_unavailable"
+
+    outcomes = [row[2] for row in audit if row[1] == "refresh_token_use"]
+    assert "rotation_not_persisted" in outcomes, (
+        "a refused rotation wrote no audit row, so the audit trail is silent about the one "
+        f"outcome an operator has to act on; rows seen={outcomes}"
+    )
+    assert not state.is_consumed(jti) and chain_id, (
+        "the refusal must leave the presented token unburned -- publishing nothing is the "
+        "whole point of the 503"
+    )
+
+
+@pytest.mark.asyncio
+async def test_logout_on_a_degraded_store_still_revokes_and_does_not_claim_success(
+    state: RefreshStateManager, audit: list, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A storage fault must not turn logout into a no-op that answers 200.
+
+    A degraded store makes `validate_refresh_token` fail closed, which sent logout down the
+    invalid-cookie arm: the chain was revoked neither on disk NOR in memory -- strictly worse
+    than before the degraded mark existed, when the in-memory revocation at least held for
+    the life of the process. The endpoint still answered `200 {"logged_out": true}`, and the
+    next write to succeed cleared the mark, after which the un-revoked cookie validated again
+    for the rest of its TTL. That is the replay the revocation exists to stop.
+    """
+    token, chain_id, _jti, _exp = generate_refresh_token("alice")
+
+    # Degrade the store the way a full disk does, without touching the endpoint's own code.
+    monkeypatch.setattr(
+        rt, "atomic_write", lambda *a, **kw: (_ for _ in ()).throw(OSError(28, "No space"))
+    )
+    state.mark_consumed(
+        "jti-forces-degrade",
+        chain_id="other-chain",
+        exp=time.time() + 86400,
+        ip="1.2.3.4",
+        replacement="{}",
+    )
+    assert state.degraded_reason(), "the store did not degrade, so this pin proves nothing"
+
+    request = _mk(path="/api/auth/logout", cookies={refresh_cookie_name(str(PORT)): token})
+    response = await h.api_auth_logout(request)
+
+    assert state.is_chain_revoked(chain_id), (
+        "the chain was not revoked even in memory, so this process keeps accepting a cookie "
+        "the user just logged out -- and a later successful write clears the degraded mark "
+        "that was the only thing refusing it"
+    )
+    assert response.status == 503, (
+        "logout reported success while the revocation record did not reach disk, so the "
+        f"caller believes a chain is dead that the next restart accepts (status={response.status})"
+    )
+    outcomes = [row[2] for row in audit if row[1] == "refresh_token_logout"]
+    assert "invalid_refresh" not in outcomes, (
+        "the audit row blames the cookie for what is a storage fault, which sends the "
+        f"operator looking in the wrong place; rows={outcomes}"
+    )

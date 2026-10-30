@@ -122,7 +122,7 @@ from typing import Any, Callable, Mapping, Sequence, TypeVar
 
 from kiro_crew import decisions as core
 from kiro_crew.decisions import log as _log
-from kiro_crew.decisions.points import MAX_KEY_CHARS
+from kiro_crew.decisions.points import MAX_KEY_CHARS, as_text
 from kiro_crew.decisions.types import Answer, Choice, Question
 
 logger = logging.getLogger(__name__)
@@ -155,9 +155,9 @@ MAX_MESSAGE_CHARS = 2000
 #: fragment is what answers it. Applied AFTER redaction — see :func:`scrubbed`.
 MAX_SNIPPET_CHARS = 200
 
-#: The two answers one candidate may carry. A Choice rather than a score because
-#: ``Choice`` is the only question type ``impl_jev`` speaks; the probability the
-#: threshold is applied to is the one the provider reports for the chosen option.
+#: The two answers one candidate may carry, as one two-option ``Choice``; the
+#: probability the threshold is applied to is the one the provider reports for
+#: the chosen option.
 KEEP_OPTION = "keep"
 DROP_OPTION = "drop"
 KEEP_OPTIONS = [KEEP_OPTION, DROP_OPTION]
@@ -215,6 +215,7 @@ def kept_memories(
     owner_turn: bool = False,
     still_watched: Callable[[], bool] | None = None,
     pending: list[tuple[dict[str, Any], int]] | None = None,
+    store: str | None = None,
 ) -> list[RowT] | None:
     """The memories the oracle would keep, or ``None`` to return all of *candidates*.
 
@@ -345,7 +346,7 @@ def kept_memories(
         if pending is not None:
             pending.append(
                 (
-                    build_outcome(baseline=rows, injected=injected, trace=trace),
+                    build_outcome(baseline=rows, injected=injected, trace=trace, store=store),
                     int((time.monotonic() - started) * 1000),
                 )
             )
@@ -424,7 +425,9 @@ async def keep_decision(
     if still_watched is not None and not still_watched():
         logger.debug("memory.recall: the surface went away before the call")
         return None
-    answers = await core.decide(POINT, state, questions, session_key=session_key, extra=extra)
+    answers = await core.decide(
+        POINT, state, questions, session_key=session_key, extra=extra, unclipped=text
+    )
     keys = read_answer(answers, rows)
     if keys is None:
         return None
@@ -478,14 +481,13 @@ def scrubbed(text: object, limit: int) -> str:
     Never raises: a redactor that fails yields nothing rather than unredacted
     text, which is the only safe direction for text about to leave the machine.
     """
-    raw = text if isinstance(text, str) else ("" if text is None else str(text))
+    raw = as_text(text)
     if not raw or limit <= 0:
         return ""
     try:
-        from kiro_crew.security import redact_credentials, redact_exfiltration_urls
+        from kiro_crew.security import redact
 
-        cleaned, _ = redact_credentials(raw)
-        cleaned, _ = redact_exfiltration_urls(cleaned)
+        cleaned = redact(raw)
     except Exception:
         # A scan that did not complete cannot clear text for the wire. Dropping
         # the snippet is a worse question, not a worse outcome: the gate would
@@ -676,8 +678,14 @@ def build_outcome(
     baseline: Sequence[Mapping[str, Any]],
     injected: Sequence[Mapping[str, Any]],
     trace: Mapping[str, Any],
+    store: str | None = None,
 ) -> dict[str, Any]:
     """Both arms of one turn as the fields the row and the publish hook share.
+
+    ``store`` is the memory store the recall ran against, carried onto the record
+    so the strip's id popover looks each id up in the RIGHT store rather than
+    always the default one. ``None`` -- an older producer or a caller that does not
+    know it -- is left as ``None`` here and read as the default store on the wire.
 
     The two lists are spelled ``baseline_keys`` and ``jev_keys`` rather than
     ``baseline`` and ``jev``, which is what keeps this record out of the skill
@@ -704,6 +712,7 @@ def build_outcome(
     jev_chars = injected_chars(injected)
     return {
         "turn_id": trace.get("turn_id"),
+        "store": store,
         "baseline_keys": baseline_keys,
         "jev_keys": jev_keys,
         "agree": set(baseline_keys) == set(jev_keys),
@@ -871,8 +880,13 @@ def keep_hook(
     owner_turn: bool,
     still_watched: Callable[[], bool] | None = None,
     pending: list[tuple[dict[str, Any], int]] | None = None,
+    store: str | None = None,
 ) -> Callable[[list[dict]], list[dict] | None]:
     """A ``keep=`` callable for ``VectorMemoryStore.recall``.
+
+    *store* is the name of the memory store this recall ran against. It is
+    threaded onto the outcome so the strip's id popover resolves each id in the
+    store it came from; ``None`` reads as the default store on the wire.
 
     The store owns the candidates and the response; this point owns the question. A
     callable is what keeps the two apart: the store hands over the rows it ranked and
@@ -893,6 +907,7 @@ def keep_hook(
             owner_turn=owner_turn,
             still_watched=still_watched,
             pending=pending,
+            store=store,
         )
 
     return keep

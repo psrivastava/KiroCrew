@@ -10,7 +10,7 @@ untouched:
   (timeout / process-died / prompt-busy)
 * hook verdicts on tool calls and permission requests, plus per-session trust
 * the defence-in-depth authorisation re-checks in ``handle_interaction``
-* small module-level helpers: ``_add_phase_reaction``, ``set_orch_cfg``
+* small module-level helpers: ``set_orch_cfg``
   provider validation, ``_handle_cron_command`` list rendering,
   ``_handle_run_command`` idle status, ``_resolve_agent_name`` project lookup.
 
@@ -33,6 +33,7 @@ import kiro_crew.voice_reply as voice_reply
 from conftest import MockSlackClient
 from kiro_crew.acp.client import AcpProcessDied, AcpPromptBusy, AcpTimeoutError
 from kiro_crew.acp.types import (
+    EVENT_COMPACTION_STATUS,
     EVENT_COMPLETE,
     EVENT_PERMISSION_REQUEST,
     EVENT_TEXT_CHUNK,
@@ -41,6 +42,7 @@ from kiro_crew.acp.types import (
 )
 from kiro_crew.cron import CronJob, CronSchedule
 from kiro_crew.hooks import TOOL_ALLOW, TOOL_AUTO_APPROVE, TOOL_DENY, ToolHookResult
+from kiro_crew.messaging import auto_title
 from kiro_crew.slack.handler import handle_interaction, handle_message
 from kiro_crew.task_models import Project, Task, TaskStatus
 from kiro_crew.task_reporter import build_status
@@ -48,6 +50,13 @@ from kiro_crew.task_reporter import build_status
 # ──────────────────────────────────────────────────────────────────────
 # doubles
 # ──────────────────────────────────────────────────────────────────────
+
+
+#: These tests exercise the SLACK side (thread renaming), not the record
+#: pin, so they pass the value production supplies when there is nothing to
+#: pin. ``maybe_auto_title`` requires it, which is what stops a call site
+#: from reading the record inside the task and reopening the window.
+_PRESENT_PIN = auto_title.RecordPin(auto_title.RECORD_PRESENT, "")
 
 
 class FakeProvider:
@@ -94,7 +103,7 @@ class FakeSessions:
         self.policies: dict[str, str] = {}
         self._session_map = None
 
-    async def get_or_create(self, key, agent=None, channel_id=None):
+    async def get_or_create(self, key, agent=None, channel_id=None, start_priority=None):
         self.keys_seen.append(key)
         was_new = self._is_new
         self._is_new = False
@@ -170,7 +179,7 @@ class FakeSessions:
     def dequeue(self, key):
         return None
 
-    def clear_queue(self, key):
+    def clear_queue(self, key, owned_by=None):
         pass
 
     async def stop_turn(self, key, *, force=False, on_soft=None, on_hard=None):
@@ -240,46 +249,6 @@ def _clean_approval_state():
 
 
 # ──────────────────────────────────────────────────────────────────────
-# _add_phase_reaction
-# ──────────────────────────────────────────────────────────────────────
-class TestAddPhaseReaction:
-    @pytest.mark.asyncio
-    async def test_suppressed_phase_adds_nothing(self, monkeypatch):
-        """A ``null`` sentinel in ``slack.reactions`` means "no emoji at all"."""
-        monkeypatch.setitem(h._PHASE_EMOJIS, "done", None)
-        slack = MockSlackClient()
-        await h._add_phase_reaction(slack, "C1", "m1", "done")
-        assert slack.actions == []
-
-    @pytest.mark.asyncio
-    async def test_configured_phase_is_added(self, monkeypatch):
-        monkeypatch.setitem(h._PHASE_EMOJIS, "done", "tada")
-        slack = MockSlackClient()
-        await h._add_phase_reaction(slack, "C1", "m1", "done")
-        assert slack.actions == [("react", {"channel": "C1", "ts": "m1", "emoji": "tada"})]
-
-    @pytest.mark.asyncio
-    async def test_unknown_phase_is_ignored(self):
-        """A phase with no entry at all resolves to None -> no API call."""
-        slack = MockSlackClient()
-        await h._add_phase_reaction(slack, "C1", "m1", "not-a-phase")
-        assert slack.actions == []
-
-
-# ──────────────────────────────────────────────────────────────────────
-# privacy modifiers
-# ──────────────────────────────────────────────────────────────────────
-class TestIncognitoModifierIdempotence:
-    @pytest.mark.asyncio
-    async def test_second_apply_is_a_no_op(self):
-        """``!incognito`` twice in one thread must not re-notify the user."""
-        h._mark_incognito("slack:t1")
-        slack = MockSlackClient()
-        await h._apply_incognito_modifier("slack:t1", "U1", "C1", slack, FakeSessions(), "t1")
-        assert slack.actions == []
-
-
-# ──────────────────────────────────────────────────────────────────────
 # set_orch_cfg — voice_reply provider validation
 # ──────────────────────────────────────────────────────────────────────
 class _Cfg:
@@ -303,8 +272,8 @@ class TestSetOrchCfgProviderValidation:
     def test_valid_provider_is_kept_and_enabled_implies_auto_reply(self, monkeypatch):
         monkeypatch.setattr(h, "_vc", h._VoiceConfig())
         monkeypatch.setattr(h, "_orch_cfg", None, raising=False)
-        h.set_orch_cfg(_Cfg({"enabled": True, "provider": "piper", "voice_id": "Amy"}))
-        assert h._vc.provider == "piper"
+        h.set_orch_cfg(_Cfg({"enabled": True, "provider": "polly", "voice_id": "Amy"}))
+        assert h._vc.provider == "polly"
         assert h._vc.global_enabled is True
         # auto_reply_to_voice defaults to the value of `enabled`.
         assert h._vc.auto_reply_to_voice is True
@@ -586,7 +555,14 @@ class TestAutoTitleToolRejection:
         sessions = _TitleSessions(provider)
         slack = MockSlackClient()
         await h._maybe_auto_title_slack(
-            slack, sessions, "C1", "slack:t1", None, "user text", "assistant text"
+            slack,
+            sessions,
+            "C1",
+            "slack:t1",
+            None,
+            "user text",
+            "assistant text",
+            pin=_PRESENT_PIN,
         )
         # The titling session is never allowed to run tools.
         assert provider.rejected == ["rq1"]
@@ -602,7 +578,14 @@ class TestAutoTitleToolRejection:
         )
         slack = MockSlackClient()
         await h._maybe_auto_title_slack(
-            slack, _TitleSessions(provider), "C1", "slack:t2", None, "hi", "hello"
+            slack,
+            _TitleSessions(provider),
+            "C1",
+            "slack:t2",
+            None,
+            "hi",
+            "hello",
+            pin=_PRESENT_PIN,
         )
         assert "slack:t2" not in h._titled_threads
         assert not [a for a in slack.actions if a[0] == "set_thread_title"]
@@ -637,7 +620,14 @@ class TestAutoTitleToolRejection:
                 lock.release()
                 inner = lock._bound()  # this loop's underlying asyncio.Lock
                 await h._maybe_auto_title_slack(
-                    slack, _TitleSessions(provider), "C1", session_key, None, "u", "a"
+                    slack,
+                    _TitleSessions(provider),
+                    "C1",
+                    session_key,
+                    None,
+                    "u",
+                    "a",
+                    pin=_PRESENT_PIN,
                 )
                 return lock, inner
 
@@ -1080,6 +1070,57 @@ class TestCompactionReinjection:
         assert sessions.failures, "the turn was recorded a failure"
         assert ledger["marks"] == 1 and ledger["armed"] is True
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("status", "marks"), [("completed", 1), ("failed", 0)])
+    async def test_a_backend_compaction_arms_the_flag_for_the_next_turn(self, status, marks):
+        # The backend compacted its own window mid-turn: the session-start context
+        # is gone even though this turn landed, so the next turn must send it.
+        sessions = FakeSessions(
+            FakeProvider(
+                [
+                    AcpEvent(kind=EVENT_TEXT_CHUNK, text="ok"),
+                    AcpEvent(kind=EVENT_COMPACTION_STATUS, text=status),
+                ]
+            )
+        )
+        ledger = _arm_reinjection(sessions)
+        ledger["armed"] = False
+        await handle_message(
+            MockSlackClient(),
+            sessions,
+            "C1",
+            "go",
+            None,
+            "m1",
+            "U1",
+            context_builder=_RecordingBuilder(),
+        )
+        assert sessions.failures == [], "the turn landed"
+        assert ledger["marks"] == marks and ledger["armed"] is bool(marks)
+
+    @pytest.mark.asyncio
+    async def test_a_backend_compaction_arms_the_flag_when_the_turn_then_dies(self):
+        sessions = FakeSessions(
+            FakeProvider(
+                [AcpEvent(kind=EVENT_COMPACTION_STATUS, text="completed")],
+                raises=AcpProcessDied("agent died"),
+            )
+        )
+        ledger = _arm_reinjection(sessions)
+        ledger["armed"] = False
+        await handle_message(
+            MockSlackClient(),
+            sessions,
+            "C1",
+            "go",
+            None,
+            "m1",
+            "U1",
+            context_builder=_RecordingBuilder(),
+        )
+        assert sessions.failures, "the turn was recorded a failure"
+        assert ledger["marks"] == 1 and ledger["armed"] is True
+
 
 class TestToolHookVerdicts:
     @pytest.mark.asyncio
@@ -1276,7 +1317,7 @@ class TestVoiceReply:
 
     @pytest.mark.asyncio
     async def test_missing_tts_backend_warns_the_opted_in_user(self, monkeypatch):
-        _voice_on(monkeypatch, global_enabled=True, provider="piper")
+        _voice_on(monkeypatch, global_enabled=True, provider="system")
         monkeypatch.setattr(h, "_tts_available", lambda **kw: False)
         slack = MockSlackClient()
         provider = FakeProvider([AcpEvent(kind=EVENT_TEXT_CHUNK, text=_LONG_ANSWER)])
@@ -1284,9 +1325,9 @@ class TestVoiceReply:
 
         eph = [a[1]["text"] for a in slack.actions if a[0] == "ephemeral"]
         assert len(eph) == 1
-        assert "provider=piper" in eph[0]
-        # piper-specific remediation, not the Polly one.
-        assert "piper_model" in eph[0]
+        assert "provider=system" in eph[0]
+        # The host-engine remediation, not the Polly one.
+        assert "espeak-ng" in eph[0]
         assert "ada credentials" not in eph[0]
 
     @pytest.mark.asyncio
@@ -1466,51 +1507,3 @@ class TestLinkedThreadRouting:
         assert handled is True
         assert slot.appended == [] and slot.queued == []
         assert "Not authorized." in _all_text(slack)
-
-
-# ──────────────────────────────────────────────────────────────────────
-# StatusReactionController — stall watchdog upgrade path
-# ──────────────────────────────────────────────────────────────────────
-class TestStallWatchdog:
-    @pytest.mark.asyncio
-    async def test_soft_then_hard_stall_emoji_replaces_not_stacks(self, monkeypatch):
-        monkeypatch.setattr(h, "_STALL_SOFT_SECS", 0.001)
-        monkeypatch.setattr(h, "_STALL_HARD_SECS", 0.005)
-        slack = MockSlackClient()
-        ctrl = h.StatusReactionController(slack, "C1", "m1")
-        ctrl.on_progress()
-        await asyncio.sleep(0.05)
-        reacts = [a[1]["emoji"] for a in slack.actions if a[0] == "react"]
-        unreacts = [a[1]["emoji"] for a in slack.actions if a[0] == "unreact"]
-        assert h._STALL_EMOJI_SOFT in reacts
-        assert h._STALL_EMOJI_HARD in reacts
-        # Upgrading to the hard emoji removes the soft one.
-        assert h._STALL_EMOJI_SOFT in unreacts
-        ctrl.finalize()
-        await asyncio.sleep(0)
-
-    @pytest.mark.asyncio
-    async def test_paused_watchdog_adds_nothing(self, monkeypatch):
-        monkeypatch.setattr(h, "_STALL_SOFT_SECS", 0.001)
-        monkeypatch.setattr(h, "_STALL_HARD_SECS", 0.005)
-        slack = MockSlackClient()
-        ctrl = h.StatusReactionController(slack, "C1", "m1")
-        ctrl.on_progress()
-        ctrl.pause_stall_watchdog()
-        await asyncio.sleep(0.05)
-        reacts = [a[1]["emoji"] for a in slack.actions if a[0] == "react"]
-        assert h._STALL_EMOJI_SOFT not in reacts
-        assert h._STALL_EMOJI_HARD not in reacts
-        ctrl.finalize()
-        await asyncio.sleep(0)
-
-    @pytest.mark.asyncio
-    async def test_disabled_controller_never_calls_slack(self):
-        slack = MockSlackClient()
-        ctrl = h.StatusReactionController(slack, "C1", "m1", enabled=False)
-        ctrl.set_phase("queued")
-        ctrl.on_progress()
-        ctrl.resume_stall_watchdog()
-        ctrl.finalize()
-        await asyncio.sleep(0.01)
-        assert slack.actions == []

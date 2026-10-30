@@ -15,6 +15,7 @@ const item = (over: Partial<FollowupItem> = {}): FollowupItem => ({
 function setup(props: Partial<React.ComponentProps<typeof FollowUpCard>> = {}) {
   const onAddToSession = vi.fn()
   const onStartInWorktree = vi.fn().mockResolvedValue(undefined)
+  const onStartInNewChat = vi.fn().mockResolvedValue(undefined)
   const onSkip = vi.fn()
   const utils = render(
     <FollowUpCard
@@ -22,11 +23,12 @@ function setup(props: Partial<React.ComponentProps<typeof FollowUpCard>> = {}) {
       projectDir="/repo"
       onAddToSession={onAddToSession}
       onStartInWorktree={onStartInWorktree}
+      onStartInNewChat={onStartInNewChat}
       onSkip={onSkip}
       {...props}
     />,
   )
-  return { onAddToSession, onStartInWorktree, onSkip, ...utils }
+  return { onAddToSession, onStartInWorktree, onStartInNewChat, onSkip, ...utils }
 }
 
 describe('FollowUpCard', () => {
@@ -47,7 +49,18 @@ describe('FollowUpCard', () => {
   it('calls onAddToSession with the item', () => {
     const { onAddToSession } = setup()
     fireEvent.click(screen.getByRole('button', { name: /add to this session/i }))
-    expect(onAddToSession).toHaveBeenCalledWith(item())
+    expect(onAddToSession).toHaveBeenCalledWith(item(), 0)
+  })
+
+  it('passes the clicked item and its index to Start and Add', async () => {
+    const items = [item({ title: 'A' }), item({ title: 'B' }), item({ title: 'C' })]
+    const { onAddToSession, onStartInWorktree } = setup({ items })
+    fireEvent.click(screen.getAllByRole('button', { name: /start in new worktree/i })[1])
+    expect(onStartInWorktree).toHaveBeenCalledWith(items[1], 1)
+    // Every action is disabled while a start is pending.
+    await waitFor(() => expect(screen.getAllByRole('button', { name: /add to this session/i })[2]).toBeEnabled())
+    fireEvent.click(screen.getAllByRole('button', { name: /add to this session/i })[2])
+    expect(onAddToSession).toHaveBeenCalledWith(items[2], 2)
   })
 
   it('passes the item index to onSkip so siblings survive', () => {
@@ -58,6 +71,7 @@ describe('FollowUpCard', () => {
         projectDir="/repo"
         onAddToSession={vi.fn()}
         onStartInWorktree={vi.fn()}
+        onStartInNewChat={vi.fn()}
         onSkip={onSkip}
       />,
     )
@@ -65,34 +79,107 @@ describe('FollowUpCard', () => {
     expect(onSkip).toHaveBeenCalledWith(1)
   })
 
-  it('disables the worktree action when the session has no project dir', () => {
-    setup({ projectDir: undefined })
-    expect(screen.getByRole('button', { name: /start in new worktree/i })).toBeDisabled()
-    // The in-session route stays available — it needs no repo.
-    expect(screen.getByRole('button', { name: /add to this session/i })).not.toBeDisabled()
-  })
-
-  it('demotes the disabled worktree button from the accent style so it does not read as the primary action', () => {
-    // A permanently-disabled button that keeps the accent background at 40%
-    // opacity still looks like the main CTA on a dark theme — users click it,
-    // meet a not-allowed cursor, and report a dead button. Unscoped sessions
-    // must render it in the secondary (bordered) look instead.
-    setup({ projectDir: undefined })
-    const worktree = screen.getByRole('button', { name: /start in new worktree/i })
-    expect(worktree.className).not.toContain('bg-accent')
-    expect(worktree.className).toContain('border-border')
-  })
-
-  it('keeps the accent style on the worktree button when the session is scoped', () => {
-    setup()
-    const worktree = screen.getByRole('button', { name: /start in new worktree/i })
+  it('keeps the worktree action, label and footer unchanged in a git repository', () => {
+    const { onStartInWorktree, onStartInNewChat } = setup({ projectIsRepo: true })
+    const worktree = screen.getByRole('button', { name: 'Start in new worktree' })
     expect(worktree.className).toContain('bg-accent')
+    expect(worktree).toHaveAttribute('title', 'Create a git worktree from /repo and open a new session there')
+    expect(screen.queryByRole('button', { name: /start in new chat/i })).not.toBeInTheDocument()
+    expect(screen.getByText('Both actions pre-fill the composer — nothing is sent until you press send.')).toBeInTheDocument()
+    fireEvent.click(worktree)
+    expect(onStartInWorktree).toHaveBeenCalledWith(item(), 0)
+    expect(onStartInNewChat).not.toHaveBeenCalled()
   })
 
-  it('explains the disabled worktree button in the footer instead of claiming both actions work', () => {
+  it('offers an enabled "Start in new chat" when the session has no project dir', () => {
+    const { onStartInWorktree, onStartInNewChat } = setup({ projectDir: undefined })
+    expect(screen.queryByRole('button', { name: /start in new worktree/i })).not.toBeInTheDocument()
+    const newChat = screen.getByRole('button', { name: /start in new chat/i })
+    expect(newChat).not.toBeDisabled()
+    // The spawn route is the primary action again, so it keeps the accent look.
+    expect(newChat.className).toContain('bg-accent')
+    // The in-session route stays available too.
+    expect(screen.getByRole('button', { name: /add to this session/i })).not.toBeDisabled()
+    fireEvent.click(newChat)
+    expect(onStartInNewChat).toHaveBeenCalledWith(item(), 0)
+    expect(onStartInWorktree).not.toHaveBeenCalled()
+  })
+
+  it('keeps the standard footer for an unscoped session, with no git terms', () => {
     setup({ projectDir: undefined })
-    expect(screen.getByText(/this session has no project directory/i)).toBeInTheDocument()
-    expect(screen.queryByText(/^both actions pre-fill/i)).not.toBeInTheDocument()
+    expect(screen.getByText('Both actions pre-fill the composer — nothing is sent until you press send.')).toBeInTheDocument()
+    expect(screen.queryByText(/unavailable|worktree|git/i)).not.toBeInTheDocument()
+  })
+
+  it('offers an enabled "Start in new chat" when the project is not a git repo', async () => {
+    const { onStartInWorktree, onStartInNewChat } = setup({ projectIsRepo: false })
+    expect(screen.queryByRole('button', { name: /start in new worktree/i })).not.toBeInTheDocument()
+    const newChat = screen.getByRole('button', { name: /start in new chat/i })
+    expect(newChat).not.toBeDisabled()
+    expect(newChat.className).toContain('bg-accent')
+    // The tooltip carries the reason; the always-visible footer says where the
+    // chat opens, in session terms.
+    expect(newChat.getAttribute('title')).toContain('/repo')
+    expect(newChat.getAttribute('title')).toMatch(/not a git repository/)
+    fireEvent.click(newChat)
+    await waitFor(() => expect(onStartInNewChat).toHaveBeenCalledWith(item(), 0))
+    expect(onStartInWorktree).not.toHaveBeenCalled()
+    expect(screen.getByText(/the new chat opens in this session's project directory/i)).toBeInTheDocument()
+    expect(screen.queryByText(/unavailable|worktree|git/i)).not.toBeInTheDocument()
+  })
+
+  it('offers "Start in new chat" for a plain folder inside a repository rooted higher up', async () => {
+    // The probe says "in git", but the folder is not the work-tree root, so a
+    // worktree would branch the whole enclosing repository.
+    const { onStartInWorktree, onStartInNewChat } = setup({
+      projectDir: '/home/me/notes', projectIsRepo: true, enclosingRepoRoot: '/home/me',
+    })
+    expect(screen.queryByRole('button', { name: /start in new worktree/i })).not.toBeInTheDocument()
+    const newChat = screen.getByRole('button', { name: /start in new chat/i })
+    expect(newChat).not.toBeDisabled()
+    expect(newChat).toHaveAttribute(
+      'title',
+      'Open a new chat in /home/me/notes without a worktree, because it is inside the git repository at /home/me, not its root',
+    )
+    fireEvent.click(newChat)
+    await waitFor(() => expect(onStartInNewChat).toHaveBeenCalledWith(item(), 0))
+    expect(onStartInWorktree).not.toHaveBeenCalled()
+    expect(screen.getByText(/the new chat opens in this session's project directory/i)).toBeInTheDocument()
+  })
+
+  it('ignores an enclosing repository root when the session has no project dir', () => {
+    setup({ projectDir: undefined, enclosingRepoRoot: '/home/me' })
+    expect(screen.getByRole('button', { name: /start in new chat/i })).toHaveAttribute(
+      'title', 'Open a new chat without a worktree, because this session has no project directory',
+    )
+  })
+
+  it('renders a new-chat failure inline and lets the user retry', async () => {
+    const onStartInNewChat = vi.fn().mockRejectedValue(new Error('The new chat could not be opened.'))
+    setup({ projectIsRepo: false, onStartInNewChat })
+    fireEvent.click(screen.getByRole('button', { name: /start in new chat/i }))
+    await waitFor(() => {
+      expect(screen.getByRole('alert')).toHaveTextContent('The new chat could not be opened.')
+    })
+    expect(screen.getByRole('button', { name: /start in new chat/i })).not.toBeDisabled()
+  })
+
+  it('does not open a second chat while one is being opened', async () => {
+    let release: (() => void) | undefined
+    const onStartInNewChat = vi.fn(() => new Promise<void>(res => { release = res }))
+    setup({ projectDir: undefined, onStartInNewChat })
+    const btn = screen.getByRole('button', { name: /start in new chat/i })
+    fireEvent.click(btn)
+    await waitFor(() => expect(screen.getByText(/opening chat/i)).toBeInTheDocument())
+    fireEvent.click(btn)
+    expect(onStartInNewChat).toHaveBeenCalledTimes(1)
+    release?.()
+  })
+
+  it('keeps the worktree action enabled while the repo probe is unresolved', () => {
+    // The server stays the backstop; an unknown probe must not suppress a real repo.
+    setup({ projectIsRepo: undefined })
+    expect(screen.getByRole('button', { name: /start in new worktree/i })).not.toBeDisabled()
   })
 
   it('renders the worktree failure inline instead of throwing', async () => {
@@ -125,7 +212,7 @@ describe('FollowUpCard', () => {
     const onStartInWorktree = vi.fn(() => new Promise<void>((_res, rej) => { reject = rej }))
     const a = item({ title: 'A' })
     const b = item({ title: 'B' })
-    const props = { projectDir: '/repo', onAddToSession: vi.fn(), onStartInWorktree, onSkip: vi.fn() }
+    const props = { projectDir: '/repo', onAddToSession: vi.fn(), onStartInWorktree, onStartInNewChat: vi.fn(), onSkip: vi.fn() }
     const { rerender } = render(<FollowUpCard items={[a, b]} {...props} />)
     fireEvent.click(screen.getAllByRole('button', { name: /start in new worktree/i })[0])
     await waitFor(() => expect(onStartInWorktree).toHaveBeenCalled())
@@ -147,6 +234,7 @@ describe('FollowUpCard', () => {
         projectDir="/repo"
         onAddToSession={vi.fn()}
         onStartInWorktree={onStartInWorktree}
+        onStartInNewChat={vi.fn()}
         onSkip={vi.fn()}
       />,
     )
@@ -158,6 +246,7 @@ describe('FollowUpCard', () => {
         projectDir="/repo"
         onAddToSession={vi.fn()}
         onStartInWorktree={onStartInWorktree}
+        onStartInNewChat={vi.fn()}
         onSkip={vi.fn()}
       />,
     )
@@ -210,6 +299,22 @@ describe('followup card reducers', () => {
     )
     const after = reducer(withCard, dismissFollowupItem({ slot: 'chat-1', index: 0 }))
     expect(after.followups['chat-1'].items.map(i => i.title)).toEqual(['B'])
+  })
+
+  it('dismissing with the item removes it even after another removal shifted its index', () => {
+    const [a, b, c] = [item({ title: 'A' }), item({ title: 'B' }), item({ title: 'C' })]
+    let s = reducer(initial, setFollowupCard({ slot: 'chat-1', items: [a, b, c], ts: 10 }))
+    // A start of C (rendered at index 2) is in flight when A is skipped.
+    s = reducer(s, dismissFollowupItem({ slot: 'chat-1', index: 0, ts: 10 }))
+    s = reducer(s, dismissFollowupItem({ slot: 'chat-1', index: 2, ts: 10, item: c }))
+    expect(s.followups['chat-1'].items).toEqual([b])
+  })
+
+  it('dismissing an item that is already gone removes nothing', () => {
+    const [a, b] = [item({ title: 'A' }), item({ title: 'B' })]
+    const s = reducer(initial, setFollowupCard({ slot: 'chat-1', items: [a, b], ts: 10 }))
+    const after = reducer(s, dismissFollowupItem({ slot: 'chat-1', index: 0, ts: 10, item: item({ title: 'Z' }) }))
+    expect(after.followups['chat-1'].items).toEqual([a, b])
   })
 
   it('dismissing the last item clears the card', () => {

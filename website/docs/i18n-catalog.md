@@ -49,14 +49,24 @@ each entry ships a prebuilt `route`, and that route highlights by
 resolves an English label against the rendered DOM and cannot match a translated
 dashboard.
 
+## Scope: the dashboard renderer
+
+The catalogs and their gates cover the dashboard renderer. Electron main-process
+and pre-dashboard chrome — the remote-crew prompt
+(`electron/runtime/gateway/remote-crew-prompt.js`), the main-process message boxes
+(gateway takeover, update and session-security dialogs), and the
+Linux window-caption `aria-label`s (`electron/runtime/window/linux-captions.js`) — is
+English-only, outside the catalogs and outside the i18n gates. Localizing it is a
+separate product request.
+
 ## Catalog structure
 
 Catalogs live in `src/i18n/locales/`:
 
 | File | Owner |
 |---|---|
-| `en.json` | **generated**. `node scripts/i18n-codemod.mjs` rewrites it wholesale. Never hand-edit. |
-| `en.manual.json` | hand-authored English with no source literal to extract, for example the language picker's own labels. |
+| `en.json` | extracted by `node scripts/i18n-codemod.mjs` and also maintained by hand (the `apps.<id>.manifest.*` blocks, feature namespaces such as `settingRef`). Add keys by hand or with `--merge`. A bare full run rebuilds the catalog from the sources, and the codemod refuses it when it would extract under three-quarters of the keys the catalog holds. |
+| `en.manual.json` | hand-authored English the codemod does not extract, for example the language picker's own labels and the welcome view's strings (`en.json` keeps an empty `welcomeView` shell). |
 | `<tag>.json` | one per translation. Its key set must match the English key set exactly. |
 | `en-XA.json` | generated pseudolocale, dev-only. Not a language. |
 
@@ -69,20 +79,33 @@ and unmirrored directional icons, so an RTL catalog would render correct text in
 visibly wrong shell. Adding one needs `dir="rtl"` plus a logical-property
 conversion (`ps-*`/`pe-*`, `start-*`/`end-*`) first, not just a catalog.
 
-Adding a language is a **data change**: three edits, no component or test changes.
+Adding a language is a **data change**: four edits, no component or test changes.
 
 1. `locales/<tag>.json`, with the same key set as `en.json` plus `en.manual.json`.
 2. One entry in `SUPPORTED_LANGUAGES` (`src/i18n/languages.ts`).
 3. One line in `AUTHORED_CATALOGS` (`src/i18n/catalogs.ts`, the module that owns
-   every catalog import; `src/i18n/all.ts` is the entry that registers them).
+   every static catalog import; `src/i18n/all.ts` is the eager entry that registers
+   them all up front, used by the catalog tests and the crew-companion / Mochi app
+   windows).
+4. One line in `AUTHORED_LOADERS` (`src/i18n/lazy.ts`, the browser entry `main.tsx`
+   boots through, which loads a catalog on demand), and the code in
+   `CATALOG_CHUNK_BUDGETS` (`scripts/check-bundle-size.mjs`) for its chunk.
 
 The parity tests generate their cases from `SUPPORTED_LANGUAGES` and read catalogs
 from the `CATALOGS` map in `src/i18n/catalogs.ts` (the map registration is fed
 from), so a new language automatically gets its
-key-parity, placeholder-preservation, and no-empty-value coverage. Miss one of the
-three edits and CI fails naming the gap; it cannot silently ship as English. There
+key-parity, placeholder-preservation, and no-empty-value coverage, and
+`src/i18n/lazy.test.ts` pins `AUTHORED_LOADERS` against the same map. Miss one of the
+four edits and CI fails naming the gap; it cannot silently ship as English. There
 is **no allowlist**, so every language lands in the same commit. That is what makes
 each new language add marginal cost to every subsequent i18n change.
+
+When a catalog chunk fails to load in the browser, the language does not switch:
+`ensureCatalog` resolves `false`, `changeLanguage` leaves i18next on the language
+it already renders, and the next request for that language fetches again. At boot,
+`main.tsx` switches i18next back to English before the first render when the stored
+language's chunk fails, so `i18next.language` never names a language the store
+cannot render; `LanguageProvider`'s mount effect then retries the stored language.
 
 Three code lists answer three different questions, and conflating them is a real
 bug (registering the pseudolocale made `en` ambiguous, so `en-GB` stopped
@@ -107,10 +130,8 @@ downstream editions: overriding one variable rebrands every catalog string,
 instead of forking 13 locale files through every upstream sync (see
 [extension-seams](extension-seams.md)).
 
-> The pre-existing catalog values were converted in batches (the full-catalog
-> diff exceeds the reviewable size limit). The conversion is complete; a
-> catalog-wide test in `productName.test.ts` pins that no value outside the
-> exceptions below carries the literal.
+A catalog-wide test in `productName.test.ts` pins that no value outside the
+exceptions below carries the literal.
 
 Authoring rules that follow:
 
@@ -246,7 +267,8 @@ wrong.
 
 ## Built-in app copy comes from Python, and is localised without touching it
 
-An app's `displayName`, `description`, `highlights[]` and `ui.pages[0].label` live in
+An app's `displayName`, `description`, `highlights[]`, `useCases[]`,
+`configuration[]`, and `ui.pages[0].label` live in
 `src/kiro_crew/apps/builtins/<app>/app.json` on the **Python** side, and the App Store
 components interpolate them raw. So they were English in every locale, and the nav rail
 read `Papyrus` while that app's own page header was translated.
@@ -254,7 +276,7 @@ read `Papyrus` while that app's own page header was translated.
 `src/components/appstore/appManifest.ts` holds `APP_MANIFEST_KEY`: one entry per
 built-in id, mapping each field to a catalog key under `apps.<camelId>.manifest.*`.
 Render through its resolvers — `appDisplayName`, `appDescription`, `appPageLabel`,
-`appHighlights` — never off the raw record.
+`appHighlights`, `appUseCases`, and `appConfiguration` — never off the raw record.
 
 **It is additive on purpose: `app.json` keeps its English.** The obvious design is VS
 Code's, a `%key%` placeholder inside the manifest, and it was rejected because it
@@ -273,9 +295,10 @@ prose, byte for byte.
 
 1. Edit `app.json` (or add the app under `builtins/<dir>/app.json`).
 2. Add the matching keys to `locales/en.json` under `apps.<camelId>.manifest.*`
-   (`display_name`, `description`, `page_label`, `highlight_1..N`) with values
-   **identical** to the manifest.
-3. Add the entry to `APP_MANIFEST_KEY`, one `highlights` key per bullet.
+   (`display_name`, `description`, `page_label`, `highlight_1..N`,
+   `use_case_1..N`, `configuration_1..N`) with values **identical** to the manifest.
+3. Add the entry to `APP_MANIFEST_KEY`, with one key per `highlights`, `useCases`,
+   and `configuration` item.
 4. Translate into the other eleven catalogs — `catalogParity.test.ts` is all-or-nothing.
 5. Run `npm run i18n:check`.
 
@@ -283,21 +306,23 @@ Two traps worth knowing before you debug them:
 
 - **These keys are NOT covered by `[key-refs]`.** The resolvers read
   `i18nT(k.displayName)` off a local, which `check-i18n-keys.mjs` cannot follow — it
-  reports `appManifest.ts: 0 -> 4` under the report-only `[dynamic-keys]`. Key existence
+  reports six call sites for `appManifest.ts` under the report-only `[dynamic-keys]`. Key existence
   is proved by `[manifest-sync]` instead. Do not read a green `[key-refs]` as coverage
   here.
-- **A `highlights` length mismatch is silent by design.** `appHighlights()` falls back to
-  the manifest's full English list rather than truncating, because losing a bullet is
-  worse than showing it untranslated. `[manifest-sync]` fails on the mismatch, and
-  `src/test/appManifest.test.ts` pins the count.
+- **A list-field length mismatch falls back by design.** `appHighlights()`,
+  `appUseCases()`, and `appConfiguration()` return the manifest's full English list
+  rather than truncating it. `src/test/appManifest.test.ts` pins the table lengths;
+  `[manifest-sync]` pins the English catalog counts and values.
 
 Third-party apps are deliberately out of scope: their copy is their author's to
 translate, so they fall through to whatever the manifest supplied. That fallthrough is
-also a **trust boundary** — `keysFor()` refuses to resolve when `_registry` is set, so a
-registry row that reuses a built-in id cannot wear the built-in's localised identity next
-to an Install button. `_registry` is attached server-side and cannot be forged by index
-content; `origin` can, which is why it is not the signal. Same ordering as `sourceLabel()`
-and `isVerified()` in `src/components/appstore/types.ts`.
+also a **trust boundary** — `keysFor()` resolves only when `_registry` is absent AND
+`origin === 'builtin'`. The two checks block different records: `_registry` (attached
+server-side, not forgeable by index content) blocks a registry row that reuses a built-in
+id, even when install-state enrichment lends it `origin: builtin`; `origin` blocks an
+installed third-party record, whose detail payload carries no `_registry`. Both are
+required. Same ordering as `sourceLabel()` and `isVerified()` in
+`src/components/appstore/types.ts`.
 
 ## Formatting follows the app language, not the browser
 
@@ -330,8 +355,8 @@ when you need explicit components instead.
 Available: `fmtNumber`, `fmtPercent`, `fmtCurrency`, `fmtUnit`, `fmtDuration`,
 `fmtCompact`, `fmtBytes`, `fmtDate`, `fmtTime`, `fmtDateTime`, `fmtDateNumeric`,
 `fmtTimeNumeric`, `fmtDateTimeNumeric`, `fmtDateFields`, `fmtWeekday`,
-`fmtRelative`, `fmtList`, `collator`, `compareText`, plus `activeLocale` and
-`toDate`.
+`fmtRelative`, `fmtList`, `fmtCredits`, `collator`, `compareText`, plus
+`activeLocale` and `toDate`.
 
 Bounded-monitor evidence follows the same seam. Probe, wake, agent-turn, token,
 provider-error, cadence, and budget values pass through `fmtNumber`; probe
@@ -363,6 +388,36 @@ A machine-parse site (an ISO timestamp sort, a filesystem path sort, a value fed
 to `Date.parse` on the other side) states its pin **in the code**, not in a
 registry a reviewer has to go look up.
 
+### An order two readers must agree on is a byte order, not a collation
+
+The sidebar's **By name** folder order is the standing example, and a deliberate
+one. `naturalNameCompare` in `src/utils/folderTree.ts` and `_chat_folder_natural_key`
+in `src/kiro_crew/mcp_dashboard.py` sort the same way, operation for operation:
+only ASCII `A`-`Z` is case-folded, runs of ASCII digits compare by value
+(`01.` < `02.` < `10.`), and every other character compares by UTF-16 code unit.
+Not `compareText`, not `Intl.Collator`, not Python's `locale.strxfrm`.
+
+The reason is parity, not indifference to locales. Two readers draw this list: the
+browser, and the `chat_folder_tree` MCP tool an agent reads before it picks a
+`before`/`after` anchor for `chat_folder_move`. If the two disagree on the sequence,
+the anchor lands in the wrong gap and the person watches a folder move to a place
+nobody chose. A locale collation on either side carries its own Unicode and CLDR
+tables, versioned with the browser or the interpreter, so the two would agree only
+by luck and drift apart on upgrade; the ASCII fold and code-unit order are the
+one comparison both sides can perform identically without a table. The shared
+fixture `test/fixtures/chat_folder_sibling_order.json` runs against both
+implementations, so the agreement is checked, not assumed.
+
+What this costs, knowingly: non-Latin and accented names sort by code unit, not by
+their language's alphabet — `é` after `z`, Cyrillic after Latin, `ß` and `İ`
+uncased — and mixed-script trees interleave by code point. A report that a
+non-Latin tree "sorts wrong" is this tradeoff, not a bug; the answer is not to
+switch one side to a collator. Changing the order means changing BOTH comparators
+and the shared fixture in one commit, and accepting that a collation the agent's
+side cannot reproduce byte for byte reopens the anchor problem. `Custom` (the
+stored positions) remains the order for anyone whose names the byte order serves
+badly.
+
 Two things a source scan cannot see: a pinned locale can still be the *wrong*
 locale, and `toFixed` / `String(n)` / `join(', ')` are not locale-aware APIs at
 all, so nothing syntactic detects them. Do not hand-format numbers: Latin digits
@@ -375,7 +430,7 @@ not formatting ones. It joins with `Intl.ListFormat` `type: 'unit'` rather than 
 hardcoded space, because narrow unit lists are space-joined in en/ru/fr,
 comma-joined in de, and joined with NOTHING in zh. `Intl.DurationFormat` would do
 all of this in one call and is deliberately unused: it is `undefined` on the
-Node 20 and Electron baseline.
+Node 22 floor.
 
 `fmtCompact` changes rendered WIDTH per locale (zh abbreviates on 万, de has no
 short form at these magnitudes), so a caller in tight chrome should confirm the
@@ -383,8 +438,9 @@ container tolerates it.
 
 ## Script fonts: keep the aliases first
 
-`index.css` declares `@font-face` aliases carrying `unicode-range` for Han,
-Kana, Hangul, Devanagari and Bengali, collects them into `--script-fallbacks` and
+`src/styles/font-faces.css` declares `@font-face` aliases carrying `unicode-range`
+for Han, Kana, Hangul, Devanagari and Bengali; `src/styles/design-tokens.css`
+collects them into `--script-fallbacks` and
 `--script-fallbacks-mono`, and puts **that token first** in `--font-body` and
 `--mono`. The range restriction is what makes this safe: the aliases are never
 consulted for Latin or general punctuation, so they cannot change Latin metrics

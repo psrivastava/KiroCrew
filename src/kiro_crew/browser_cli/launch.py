@@ -56,6 +56,7 @@ from pathlib import Path
 
 from kiro_crew import platform_compat
 from kiro_crew.atomic_write import atomic_write
+from kiro_crew.browser_cli import chromium_compat
 from kiro_crew.browser_cli.install import (
     ATTRIBUTION_REMEDY,
     SeamSupport,
@@ -181,7 +182,7 @@ def _warn_lifecycle_loss(support: SeamSupport, detail: str) -> None:
     """Report why the CLI's lifecycle environment was left unchanged.
 
     ``UNVERIFIED`` names the attribution that failed and what to do about it.
-    Only ``UNSUPPORTED`` -- both bundles read, a hook genuinely gone -- may
+    Only ``UNSUPPORTED`` -- a bundle read, its hook genuinely gone -- may
     describe the installed CLI, because only then was the CLI measured. One
     message for both claimed the capability gap either way, which sends the
     operator to upgrade a CLI whose bundles already carry both hooks.
@@ -373,8 +374,20 @@ def desired_config() -> dict[str, object]:
     Deliberately minimal: it names the engine and nothing else. Every key added
     here becomes a default an operator has to discover in order to override, and
     the engine is the only one the product's own install flow already decided.
+
+    The one exception is a host where that engine's default build cannot start:
+    a Linux libcups too old for the cached Chromium
+    (:func:`kiro_crew.browser_cli.chromium_compat.compatible_chromium_executable`).
+    There the config also pins ``launchOptions.executablePath`` to a cached build
+    that can, because the alternative is a browser that exits 127 on every
+    launch. The probe runs wherever the config is written -- once per gateway
+    start -- and it runs ``nm`` subprocesses, so event-loop callers MUST offload it.
     """
-    return {"browser": {"browserName": LAUNCH_ENGINE}}
+    browser: dict[str, object] = {"browserName": LAUNCH_ENGINE}
+    compatible = chromium_compat.compatible_chromium_executable()
+    if compatible is not None:
+        browser["launchOptions"] = {"executablePath": compatible}
+    return {"browser": browser}
 
 
 def write_config() -> Path | None:
@@ -411,7 +424,8 @@ def write_config() -> Path | None:
 def cli_env_overrides() -> dict[str, str]:
     """Environment additions pointing the CLI at :func:`launch_config_path`.
 
-    Empty when :data:`CONFIG_ENV` is already set in the environment. An operator
+    Empty when :data:`CONFIG_ENV` is already set in the environment to a path
+    other than :func:`launch_config_path`. An operator
     who named their own config file has made a deliberate choice -- a different
     engine, a pinned ``executablePath``, launch options for a container that
     cannot run the browser sandbox -- and silently replacing it would both
@@ -422,8 +436,14 @@ def cli_env_overrides() -> dict[str, str]:
     a path that does not exist is worse than leaving it on its own default: the
     CLI fails on the missing config instead of on the missing browser, which is a
     strictly less diagnosable error for the same broken outcome.
+
+    A value equal to :func:`launch_config_path` is ours, not the operator's: an
+    in-place restart re-execs the gateway with the environment the previous one
+    set, so skipping on it would leave the file -- and the old-libcups pin -- as
+    the previous version wrote them. That value is rewritten like an unset one.
     """
-    if os.environ.get(CONFIG_ENV, "").strip():
+    inherited = os.environ.get(CONFIG_ENV, "").strip()
+    if inherited and Path(inherited) != launch_config_path():
         return {}
     path = write_config()
     return {CONFIG_ENV: str(path)} if path is not None else {}
@@ -446,6 +466,15 @@ def browser_session_env(env: Mapping[str, str]) -> dict[str, str]:
     session from the pool (a non-empty ``extra_env`` is a pool bypass in
     :meth:`kiro_crew.session.SessionManager.get_or_create`). Uniqueness per
     process is the entire requirement; legibility is served by the prefix.
+
+    The panel browser names itself per SLOT instead
+    (``panel-<owner6>-<slot8>``, :mod:`kiro_crew.browser_cli.launcher`), and the
+    difference is not an inconsistency: a panel browser is launched for a slot
+    that already exists, so the slot is nameable at launch, while this name has
+    to exist before any session claims the process. The cost of the difference is
+    real and belongs to the sessions, not to this function -- sessions served by
+    one process share this browser, so one session's ``close`` shuts the others'
+    too, and an agent that needs its own must pass ``-s=``.
 
     Empty when the variable is already set to a name we did not generate, the
     same override doctrine as :func:`cli_env_overrides`: an operator who named a

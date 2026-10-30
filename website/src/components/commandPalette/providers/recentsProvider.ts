@@ -1,4 +1,5 @@
 import { createElement, useMemo } from 'react'
+import { selectPersonSlots } from '../../../store/dashboardSlice'
 import { MessageSquare, Clock } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
 import { useQueryClient } from '@tanstack/react-query'
@@ -6,14 +7,20 @@ import i18next from 'i18next'
 
 import { api } from '../../../api/client'
 import { useSimplifiedToolNames } from '../../../hooks/useSimplifiedToolNames'
-import { useAppDispatch, useAppSelector } from '../../../store'
-import { createSlot, resumeFromHistory, switchSlot } from '../../../store/chatSlice'
+import { useAppDispatch, useAppSelector, useAppStore } from '../../../store'
+import { selectSlotsWithLiveLastTs } from '../../../store/slotLastTs'
+import { resumeFromHistory, switchSlot } from '../../../store/chatSlice'
+import { createChatForView, showCreatedChat } from '../../../lib/createdChatView'
+import { useAskingNavigate } from '../../NavigationLeaveGuard'
+import { focusComposerForOpenedSession, focusComposerForResumedSession } from '../../../pages/chat/composerFocus'
 import type { ChatSlot, ChatFolder, CronJob } from '../../../types'
 import type { Result, ResourceProvider } from '../types'
-import { toolStatusLabel } from '../../../utils/toolStatusLabel'
+import { toolStatusLabel, type ToolStatusDetail } from '../../../utils/toolStatusLabel'
 
 import { i18nT } from '../../../i18n/t'
+import { sessionDisplayTitle } from '../../../utils/sessionDisplayTitle'
 import { fmtDateFields, fmtRelative, toDate } from '../../../i18n/format'
+import { slotRecency } from '../slotRecency'
 
 /**
  * Recents / quick-switcher — the unscoped empty-query default view. Unlike
@@ -67,10 +74,17 @@ export function isEmptyNewSlot(s: ChatSlot): boolean {
   return hasPlaceholderTitle(s) && (s.messages ?? 0) === 0
 }
 
-/** Order live slots (empty-new first, then pinned, then recency — matching
- * the sidebar with new-chat pinned to the top) and keep at most ONE empty-new
- * slot, the most recent, so the palette never shows duplicate
- * "+ New Session…" rows when several empty chats are open. */
+/** Order live slots (empty-new first, then pure recency) and keep at most ONE
+ * empty-new slot, the most recent, so the palette never shows duplicate
+ * "+ New Session…" rows when several empty chats are open.
+ *
+ * Pinning deliberately does NOT float a slot here, and that is the difference
+ * between this surface and the sidebar. A pin says "keep this reachable", which is
+ * an ordering instruction to a list the user browses; this list answers "what was
+ * I just in", and a pin from last week floating above today's work makes the
+ * switcher open on the one thing the reader cannot have meant. The pin still
+ * RENDERS on the row, so nothing about the mark is lost — only its claim on the
+ * top of a recency list. */
 export function prepareCurrentSlots(slots: ChatSlot[]): {
   ordered: ChatSlot[]
   hasEmptyNew: boolean
@@ -79,9 +93,6 @@ export function prepareCurrentSlots(slots: ChatSlot[]): {
     const na = isEmptyNewSlot(a) ? 0 : 1
     const nb = isEmptyNewSlot(b) ? 0 : 1
     if (na !== nb) return na - nb
-    const pa = a.pinned ? 0 : 1
-    const pb = b.pinned ? 0 : 1
-    if (pa !== pb) return pa - pb
     return recencyEpoch(b) - recencyEpoch(a)
   })
   let hasEmptyNew = false
@@ -155,12 +166,13 @@ function fmtRelativeTime(ts: string | number | undefined): string | undefined {
   return fmtDateFields(d, { year: 'numeric', month: 'short', day: 'numeric' })
 }
 
-/** Recency epoch (ms) for sorting live slots — last activity, else last msg, else created. */
-function recencyEpoch(slot: ChatSlot): number {
-  const t = slot.last_activity_ts ?? slot.last_ts ?? slot.created
-  if (!t) return 0
-  const ms = typeof t === 'number' ? (t as number) * 1000 : new Date(t).getTime()
-  return isNaN(ms) ? 0 : ms
+/** Recency epoch (ms) for sorting live slots.
+ *
+ * Activity and message timestamps are independent views of the transcript, so
+ * the later parseable value defines recency. Creation time applies only when
+ * neither message-derived timestamp parses. Numeric values are epoch seconds. */
+export function recencyEpoch(slot: ChatSlot): number {
+  return slotRecency(slot).epoch
 }
 
 function shortMsg(slot: ChatSlot): string {
@@ -180,7 +192,7 @@ function shortMsg(slot: ChatSlot): string {
 export function sessionStatus(
   slot: ChatSlot,
   unread: string[],
-  statusDetail?: { kind?: string; text?: string; toolName?: string },
+  statusDetail?: ToolStatusDetail,
   // Defaults to the ChatSettings default (on) so callers that don't care about
   // the preference keep the purpose-first behavior.
   simplifiedToolNames = true,
@@ -234,9 +246,18 @@ export function sessionStatus(
  */
 export function useRecentsProvider(): ResourceProvider {
   const dispatch = useAppDispatch()
+  // A store HANDLE for the current rows' post-switch focus: the palette has
+  // closed by the time a `switchSlot` settles, so only the store can still say
+  // which slot is active. Read, never subscribed.
+  const store = useAppStore()
   const navigate = useNavigate()
+  const askingNavigate = useAskingNavigate()
   const queryClient = useQueryClient()
-  const slots = useAppSelector((s) => s.dashboard.slots)
+  // The person's list: a Crew Mode root's workers are its side panel's to show.
+  const slots = useAppSelector(selectPersonSlots)
+  // Every live row, workers included: a worker is left out of Current, and must
+  // not come back as an Older history row either.
+  const liveSlots = useAppSelector(selectSlotsWithLiveLastTs)
   const unread = useAppSelector((s) => s.dashboard.unreadSlots)
   const slotStatusDetail = useAppSelector((s) => s.chat.slotStatusDetail ?? {})
   const simplifiedToolNames = useSimplifiedToolNames()
@@ -245,7 +266,7 @@ export function useRecentsProvider(): ResourceProvider {
     const { ordered: orderedSlots, hasEmptyNew } = prepareCurrentSlots(slots)
     // Dedupe Older against ALL live slots (not just rendered ones) so a
     // filtered-out empty duplicate can't resurface as a history row.
-    const currentKeys = new Set(slots.map((s) => normalizeKey(s.key)))
+    const currentKeys = new Set(liveSlots.map((s) => normalizeKey(s.key)))
 
     return {
       id: 'recents',
@@ -256,6 +277,10 @@ export function useRecentsProvider(): ResourceProvider {
           queryClient
             .fetchQuery<HistoryResponse>({
               queryKey: ['palette', 'recents', 'history'],
+              // The full inventory this list always read: closed channel conversations
+              // and subagent transcripts belong in Older. `/api/sessions` carries no
+              // crew signal yet, so a CLOSED Crew Mode worker is still an Older row
+              // until the history rows carry one; a live one is dropped above.
               queryFn: () => api.sessions(HISTORY_LIMIT, 0, true),
               staleTime: RECENTS_STALE_MS,
             })
@@ -279,7 +304,7 @@ export function useRecentsProvider(): ResourceProvider {
         const folderName = (fid?: string): string | undefined =>
           fid ? folders.find((f) => f.id === fid)?.name : undefined
 
-        // CURRENT — live slots (folder-labeled), ordered pinned-first + recency.
+        // CURRENT — live slots (folder-labeled), ordered by recency.
         const current: Result[] = orderedSlots.map((s) => {
           // Only an EMPTY untitled slot renders as the bare "+ New Session…"
           // create affordance (no agent line, status, preview, or timestamp).
@@ -290,7 +315,7 @@ export function useRecentsProvider(): ResourceProvider {
           return {
             id: `recents:cur:${s.key}`,
             providerId: 'recents',
-            title: s.title || s.key,
+            title: sessionDisplayTitle(s),
             subtitle: st.subtitle,
             icon: sessionIcon(),
             score: 0,
@@ -305,10 +330,16 @@ export function useRecentsProvider(): ResourceProvider {
             pinned: isNew ? undefined : s.pinned || undefined,
             folder: isNew ? undefined : folderName(s.folder_id),
             isNew: isNew || undefined,
-            timestamp: isNew ? undefined : fmtRelativeTime(s.last_activity_ts ?? s.last_ts),
+            timestamp: isNew ? undefined : fmtRelativeTime(slotRecency(s).timestamp),
             onActivate: () => {
-              dispatch(switchSlot({ key: s.key, announceOnMissing: true }))
+              // The slot is entered at `switchSlot.pending`, synchronously, and the
+              // composer's own autofocus skips a same-key open; the composer is
+              // focused once the switch has LANDED (#15732), never while the gateway
+              // round trip is still in flight -- a caret placed before that would
+              // file the keystrokes typed meanwhile under a slot a 404 then evicts.
+              const switched = dispatch(switchSlot({ key: s.key, announceOnMissing: true, gesture: true })).unwrap()
               navigate('/chat')
+              focusComposerForOpenedSession(switched, s.key, store)
             },
           }
         })
@@ -330,11 +361,11 @@ export function useRecentsProvider(): ResourceProvider {
             onActivate: () => {
               // Await the create BEFORE navigating: landing on /chat with no
               // active slot triggers ChatPage's auto-create, which would race
-              // this thunk into a duplicate session.
-              void dispatch(createSlot(undefined))
-                .unwrap()
+              // this thunk into a duplicate session. A failed create, or one
+              // the user moved away from, leaves the user where they are.
+              void createChatForView(dispatch, store.getState, { defaultFolder: true })
+                .then((view) => { showCreatedChat(view, askingNavigate) })
                 .catch(() => {})
-                .finally(() => navigate('/chat'))
             },
           })
         }
@@ -372,7 +403,7 @@ export function useRecentsProvider(): ResourceProvider {
           .map((s) => ({
             id: `recents:old:${s.key}`,
             providerId: 'recents',
-            title: s.title || s.key,
+            title: sessionDisplayTitle(s),
             subtitle: s.preview || undefined,
             icon: sessionIcon(),
             score: 0,
@@ -382,7 +413,12 @@ export function useRecentsProvider(): ResourceProvider {
             folder: folderName(s.folder_id),
             timestamp: fmtRelativeTime(s.modified),
             onActivate: () => {
-              void dispatch(resumeFromHistory({ key: s.key, title: s.title || s.key }))
+              // Same contract as the sessions provider's openSession: focus once
+              // the resume has entered the session, nothing on failure (#15732).
+              focusComposerForResumedSession(
+                dispatch(resumeFromHistory({ key: s.key, title: s.title || s.key })).unwrap(),
+                store,
+              )
               navigate('/chat')
             },
           }))
@@ -390,5 +426,5 @@ export function useRecentsProvider(): ResourceProvider {
         return [...current, ...planned, ...older]
       },
     }
-  }, [dispatch, navigate, queryClient, slots, unread, slotStatusDetail, simplifiedToolNames])
+  }, [dispatch, store, navigate, askingNavigate, queryClient, slots, liveSlots, unread, slotStatusDetail, simplifiedToolNames])
 }

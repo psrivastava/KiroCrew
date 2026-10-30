@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
+from dashboard_owner_helpers import as_owner
 
 from kiro_crew.dashboard.handlers import api_file_read
 
@@ -15,7 +16,7 @@ from kiro_crew.dashboard.handlers import api_file_read
 def _make_app() -> web.Application:
     app = web.Application()
     app.router.add_get("/api/file-read", api_file_read)
-    return app
+    return as_owner(app)
 
 
 @pytest.fixture()
@@ -89,8 +90,8 @@ class TestFileReadResolve:
                 resp = await client.get("/api/file-read?path=test.txt&resolve=1")
                 assert resp.status == 200
                 # Verify the resolved path (not "test.txt") was logged
-                calls = [str(c) for c in mock_sel.log_tool_invocation.call_args_list]
-                assert any(str(proj) in c for c in calls)
+                logged = [c.kwargs.get("resources") for c in mock_sel.log_tool_invocation.call_args_list]
+                assert any(str(proj) in str(r) for r in logged if r)
 
     @pytest.mark.asyncio
     async def test_resolve_rejects_traversal(self, tmp_path, mock_sel, home_patch):

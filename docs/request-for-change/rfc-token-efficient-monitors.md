@@ -1,10 +1,10 @@
 ---
 title: Token-efficient monitors — probe first, wake on change
-status: in-progress
+status: implemented
 author: kseam
 created: 2026-08-22
-last-audited: 2026-09-03
-audited-at: 904da553781c4e376df1df98598068b6e0391cf3
+last-audited: 2026-09-22
+audited-at: 80bd0a81f
 doc-pr:
 implementation-prs: [5180, 5181, 5182, 5183, 5184, 5185, 5186, 5305]
 tracking-issues: []
@@ -13,6 +13,12 @@ superseded-by: []
 ---
 
 # Token-efficient monitors — probe first, wake on change
+
+- Status: implemented. The durable controller, four pull-request provider
+  adapters, `monitor_watch` / `monitor_update` / `monitor_stop`, dashboard
+  controls and the babysit migration all ship. Current behaviour is owned by
+  [`../system-specs/modules/monitor-architecture.md`](../system-specs/modules/monitor-architecture.md)
+  and the implementation under `src/kiro_crew/monitoring/`.
 
 ## Summary
 
@@ -909,3 +915,40 @@ is distributed across the babysit skill, AutoNudge service, MCP control tools,
 session directive applier, dashboard and channel delivery paths, and dashboard
 goal-loop components. The implementation PRs must update the relevant system
 specifications in the same commit as each behavioral change.
+
+## Amendment: 2026-09-30 — the wake budget defaults to unlimited
+
+The `monitor_watch` call in the Decision section above shows
+`max_agent_turns=8`, and that number was also the shipped default and the only
+value a caller could reach. `DEFAULT_MONITOR_AGENT_TURNS` and
+`MAX_MONITOR_AGENT_TURNS` were both 8, so the parameter could be lowered and
+never raised, and the ceiling check in `MonitorBudgets.__post_init__` compared
+against the DEFAULT constant rather than the MAX one — so raising the maximum
+alone would not have opened the range either.
+
+The amended contract:
+
+- `max_agent_turns=0` means unlimited, matching the legacy prompt loop's
+  `max_cycles`, which has published 0 as unlimited since it shipped.
+- `0` is the default. A watch nobody configured carries no wake ceiling.
+- An explicit positive value is bounded by `MAX_MONITOR_AGENT_TURNS`, now 1000 —
+  the value the legacy prompt loop already publishes as its own cycle cap, so
+  the two reachable cycle caps agree on where a runaway backstop stops being a
+  plausible number.
+
+**A watch is still cost-bounded.** `max_runtime_secs` is unchanged and still
+defaults to 14400 seconds, and `max_tokens` and `max_provider_errors` are
+unchanged. Those three, not a count of wakes, are what stop a watch from
+spending without limit; all three continue to reject 0. A ceiling on wakes
+bounds how many times the subject may need its owner, which is a property of the
+subject rather than of what the watch costs — a pull request under review can
+legitimately need its owner more than eight times, and retiring the watch on the
+ninth reports a conclusion that was never reached.
+
+The stop notice on the exhausted-budget path said "Start a new watch with a
+larger budget to keep monitoring", advice no caller could follow while the
+default equalled the maximum. That copy is the reason to read 8 as an oversight
+rather than a policy.
+
+See [`../system-specs/modules/learn-cron-dashboard.md`](../system-specs/modules/learn-cron-dashboard.md)
+for the field's current description on the dashboard and MCP surfaces.

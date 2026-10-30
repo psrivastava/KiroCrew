@@ -37,8 +37,14 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from test_card_handshake_fields import live_init
 
-from kiro_crew.acp.client import AcpError, AcpToolGateUnroutable
+from kiro_crew.acp.client import (
+    CLIENT_NAME,
+    CLIENT_VERSION,
+    AcpError,
+    AcpToolGateUnroutable,
+)
 from kiro_crew.acp.harness import codex as harness_mod
 from kiro_crew.acp.harness import harness_for
 from kiro_crew.acp.harness.base import SpawnContext, TeardownPolicy
@@ -62,6 +68,7 @@ from kiro_crew.acp.types import (
     ACP_BACKENDS_KIRO_SLASH_COMMANDS,
     ACP_BACKENDS_SESSION_SHARING,
     ACP_BACKENDS_STEER,
+    ACP_BACKENDS_STEERING_REQUEST,
     METHOD_CANCEL,
     METHOD_SESSION_CLOSE,
     METHOD_SESSION_NEW,
@@ -73,8 +80,28 @@ from kiro_crew.agent_sdk.backends import (
     ACP_BACKENDS_SESSION_EVICTION,
     effort_config_option_id,
 )
+from kiro_crew.kiro_cli import SPEC_PERMISSIONS_MIN_VERSION
 from kiro_crew.providers.acp import AcpProvider
 from kiro_crew.providers.mirrors.registry import has_mirror
+
+
+@pytest.fixture(autouse=True)
+def _pinned_kiro_cli_version(monkeypatch):
+    """Pin the kiro-cli release the spec ``permissions`` gate believes is installed.
+
+    A runtime start here materialises the agent spec (``ensure_agent_materialized``
+    -> ``rebuild_agent_config`` -> ``_write_derived_permissions``), which reads
+    ``installed_kiro_cli_version`` function-locally from ``kiro_crew.kiro_cli``:
+    one real ``kiro-cli --version`` spawn per binary identity, process-cached, so
+    whichever test in the worker starts first pays it against the HOST's install
+    with the checkout as the child's cwd. Pinned to the floor release, as
+    ``test_agent.py`` and the generated-writer suites pin it.
+    """
+    monkeypatch.setattr(
+        "kiro_crew.kiro_cli.installed_kiro_cli_version",
+        lambda: SPEC_PERMISSIONS_MIN_VERSION,
+    )
+
 
 # ---------------------------------------------------------------------------
 # The fake peer
@@ -212,9 +239,12 @@ def _initialize_params(adapter: CodexHarness) -> dict[str, Any]:
 
     Assembled here rather than on the harness because the runtime owns
     ``clientInfo``: what a harness decides is the version and the capabilities.
+    ``CLIENT_NAME``/``CLIENT_VERSION`` are imported rather than spelled out so
+    this fixture keeps matching the real handshake; the version is the package's
+    and moves every release.
     """
     return {
-        "clientInfo": {"name": "kirocrew", "version": "0.1.2"},
+        "clientInfo": {"name": CLIENT_NAME, "version": CLIENT_VERSION},
         "protocolVersion": adapter.protocol_version,
         "clientCapabilities": adapter.client_capabilities,
     }
@@ -1105,23 +1135,30 @@ class TestTheEffortChannelIsReadFromItsOwnTable:
         )
 
     @pytest.mark.asyncio
-    async def test_the_kiro_family_still_takes_effort_from_its_overlay(self):
-        """The skip the runtime gate stands in for, held by the channel set instead."""
-        for backend in (ACP_BACKEND_KIRO, ACP_BACKEND_KAS):
-            provider = _effort_provider(backend, "claude-fable-5")
-            provider._effort_per_model = {"claude-fable-5": "high"}
-            await provider._apply_initial_effort()
-            provider._client.set_config_option.assert_not_awaited()
+    async def test_kiro_still_takes_effort_from_its_overlay(self):
+        """The skip the runtime gate stands in for, held by the channel set instead.
 
-    def test_codex_is_in_the_channel_set_and_the_kiro_family_is_not(self):
+        KAS is not part of this skip: it reads no overlay and takes effort as its
+        ``effortLevel`` config option (``test_acp_kas_effort``).
+        """
+        provider = _effort_provider(ACP_BACKEND_KIRO, "claude-fable-5")
+        provider._effort_per_model = {"claude-fable-5": "high"}
+        # A level resolves, so the missing push is the channel set's doing.
+        assert provider._resolve_effort() == "high"
+        await provider._apply_initial_effort()
+        provider._client.set_config_option.assert_not_awaited()
+
+    def test_codex_and_kas_are_in_the_channel_set_and_kiro_is_not(self):
         assert ACP_BACKEND_CODEX in ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION
-        assert not ({ACP_BACKEND_KIRO, ACP_BACKEND_KAS} & ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION)
+        assert ACP_BACKEND_KAS in ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION
+        assert ACP_BACKEND_KIRO not in ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION
 
 
 def _handle_on(backend: str) -> AcpSessionHandle:
-    """A handle whose runtime names *backend* -- the only thing these answers read."""
+    """A handle whose runtime names *backend*, on codex-acp 2.2.2's live handshake."""
     rt = MagicMock()
     rt.acp_backend = backend
+    rt.initialize_result = live_init("codex/steering-live.jsonl")
     return AcpSessionHandle("s1", asyncio.Queue(), rt)
 
 
@@ -1135,9 +1172,23 @@ class TestWhatTheHandleAdvertisesForCodex:
     and a model picker with nothing in it.
     """
 
-    def test_steer_is_not_advertised_for_a_host_outside_the_steer_set(self):
+    def test_codex_advertises_user_steer_over_its_own_steering_request(self):
+        """codex takes a user steer on ``_session/steering``, not kiro's verb.
+
+        This replaces a pin that codex must NOT advertise steer, whose reason was
+        that an advertised steer met ``-32601`` at the user's mid-turn correction.
+        The handle now speaks codex's own verb, which discharges that reason; the
+        refusal answer below stays off, for the reason its own test gives.
+        """
         assert ACP_BACKEND_CODEX not in ACP_BACKENDS_STEER
-        assert _handle_on(ACP_BACKEND_CODEX).supports_steer is False
+        assert ACP_BACKEND_CODEX in ACP_BACKENDS_STEERING_REQUEST
+        assert _handle_on(ACP_BACKEND_CODEX).supports_steer is True
+
+    def test_codex_does_not_advertise_refusal_steer(self):
+        """A deny notice keeps the recovery continuation: codex drops it with the turn."""
+        assert _handle_on(ACP_BACKEND_CODEX).supports_refusal_steer is False
+        for backend in (ACP_BACKEND_KIRO, ACP_BACKEND_KAS):
+            assert _handle_on(backend).supports_refusal_steer is True
 
     def test_the_kiro_family_still_advertises_steer(self):
         for backend in (ACP_BACKEND_KIRO, ACP_BACKEND_KAS):
@@ -1148,7 +1199,13 @@ class TestWhatTheHandleAdvertisesForCodex:
         for backend in (ACP_BACKEND_KIRO, ACP_BACKEND_KAS, ACP_BACKEND_CODEX):
             client = MagicMock()
             client.backend = backend
-            assert _handle_on(backend).supports_steer is (backend in ACP_BACKENDS_STEER)
+            client.supports_steer = backend in ACP_BACKENDS_STEER
+            # The refusal answer is the one both drivers share; the user-steer
+            # answer is wider on the handle by exactly the steering-request set.
+            assert _handle_on(backend).supports_refusal_steer is client.supports_steer
+            assert _handle_on(backend).supports_steer is (
+                backend in ACP_BACKENDS_STEER or backend in ACP_BACKENDS_STEERING_REQUEST
+            )
 
     def test_a_model_select_populates_the_picker_when_no_models_object_is_sent(self):
         """codex advertises its models as a ``model`` select, not as ``models``."""
@@ -1317,7 +1374,7 @@ class _ControlPlane:
                 return self._new_response
             return {}
 
-        async def _send_request(method, params):
+        async def _send_request(method, params, **_kw):
             self.methods.append(method)
             self.params.append(params)
             return 999
@@ -1431,6 +1488,28 @@ class TestTheRuntimeSendsCodexNoAgentMode:
             await rt.create_session(cwd="/w", agent="kirocrew")
 
         assert METHOD_SET_MODE in plane.methods
+
+
+class TestTheRuntimePersistsTheAdvertisedModelCacheForCodex:
+    @pytest.mark.asyncio
+    async def test_create_session_feeds_and_persists_once(self, monkeypatch):
+        """codex is in ACP_BACKENDS_ADVERTISED_MODEL_SELECTION, so the shared runtime
+        feeds the advertised-model cache and then offloads its persist after
+        session/new; the kiro side of the same gate is pinned in
+        test_acp_runtime_load_session.py."""
+        feed = MagicMock()
+        monkeypatch.setattr(AcpSessionHandle, "_feed_advertised_model_cache", feed)
+        spy = AsyncMock()
+        monkeypatch.setattr(AcpSessionHandle, "_persist_advertised_models_if_changed", spy)
+        rt = _codex_runtime()
+        plane = _ControlPlane(_codex_session_new_response())
+
+        with ExitStack() as stack:
+            plane.install(rt, stack)
+            await rt.create_session(cwd="/w", agent="kirocrew")
+
+        feed.assert_called_once()
+        spy.assert_awaited_once()
 
 
 class TestTheRuntimeArmsCodexPermissionRouting:

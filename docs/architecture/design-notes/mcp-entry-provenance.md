@@ -40,19 +40,22 @@ management). Both directions are fail-safe.
 
 ## Write resolution
 
-Every sync write to a shared file resolves to one of three outcomes
-(`mcp_provenance.resolve_write`); store-side management remains a necessary
-precondition — the marker narrows who may be rewritten, never widens it:
+Every sync write to a shared file resolves to one of three write actions
+(`mcp_provenance.resolve_write`): **create**, **rewrite**, or **decline**. The
+decline action has two reasons in the table below. Store-side management is
+required to stamp or rewrite an entry; an unmanaged name may still be created
+unmarked, and the marker never widens who may be rewritten:
 
 | on disk | store manages name | outcome |
 |---|---|---|
 | no entry at all | yes | **create** — written stamped |
-| any entry present | no | **leave alone** — add-only for a name we do not manage |
+| no entry at all | no | **create** — written unmarked, so no later rewrite is claimed |
+| any entry present | no | **decline** — add-only for a name we do not manage |
 | marked entry | yes | **rewrite** — propagation, gated on proof rather than a name |
 | unmarked entry present — including when its bytes already equal our emit | yes | **decline** — treated as the user's, preserved, divergence logged |
 | present but unparseable — a string, `null`, a list | yes | **decline** — it occupies the name and cannot carry a marker, so it is unmarked, i.e. the user's |
 
-There is deliberately no fourth outcome that stamps an unmarked entry whose
+There is deliberately no fourth action that stamps an unmarked entry whose
 content already matches our emit. See *Reclamation beats migration* below.
 
 Only true absence is a create, and it is signalled explicitly (`ABSENT`) rather
@@ -94,7 +97,11 @@ fix.
 **Re-establishing management on a legacy entry: Disconnect, then Connect.** The
 delete path removes the name from the shared file outright
 (`handlers/mcp.py`, `api_mcp_remove` / `api_mcp_server_detail`, both
-`data["mcpServers"].pop(name)` then `_write_mcp_json`). The name is then absent,
+`data["mcpServers"].pop(name)` then `_write_mcp_json`). That file is the kiro-global
+`~/.kiro/settings/mcp.json`: nothing in Crew removes an entry from the Claude Code
+sidecar `~/.mcp.json` (its registration only adds), so a legacy sidecar entry
+rejoins management only after the user deletes it from that file by hand. The name
+is then absent,
 so the next sync reaches the create branch and writes the entry **stamped**
 (`resolve_write`: `if on_disk is ABSENT: return stamp(candidate) ...`). Nothing
 special-cases legacy entries; they rejoin management through the ordinary

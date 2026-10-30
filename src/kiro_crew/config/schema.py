@@ -71,6 +71,9 @@ class ConfigEntry:
     # re-exec jail). Declared per field with ``_meta(..., restart=True)``; every
     # other field is hot-applied by the config watcher (``config.live``).
     requires_restart: bool = False
+    # The other non-null JSON types of a scalar union (``int | str`` gives
+    # type "integer" and ``("string",)`` here). Empty for a single-type field.
+    other_types: tuple[str, ...] = ()
 
 
 # ---------------------------------------------------------------------------
@@ -123,6 +126,17 @@ def _optional_inner(tp: type) -> tuple[type, bool]:
         if len(args) == 1 and len(typing.get_args(tp)) == 2:
             return args[0], True
     return tp, False
+
+
+def _scalar_union_types(tp: type) -> list[str] | None:
+    """JSON types of a union of two or more scalar annotations, else ``None``."""
+    origin = typing.get_origin(tp)
+    if origin is not typing.Union and getattr(origin, "__name__", "") != "UnionType":
+        return None
+    args = [a for a in typing.get_args(tp) if a is not type(None)]  # noqa: E721
+    if len(args) < 2 or any(a not in (int, str, float, bool) for a in args):
+        return None
+    return [_TYPE_MAP[a] for a in args]
 
 
 def _json_type_for_value(tp: type) -> str | list[str]:
@@ -184,6 +198,12 @@ def _build_field_schema(
         schema = _build_object_schema(tp)
         if nullable:
             schema["type"] = ["object", "null"]
+    elif (scalar_union := _scalar_union_types(tp)) is not None:
+        # ``int | str`` (an integer knob that also takes a keyword such as
+        # "auto"): both JSON types, so neither spelling is stripped to the
+        # default by validation. The first member leads, so a flattened entry
+        # still reads as the numeric type.
+        schema["type"] = scalar_union + (["null"] if nullable else [])
     else:
         json_type = _python_type_to_json(tp)
         # Emitting the plain single-type form when the field is not nullable
@@ -337,10 +357,12 @@ def _flatten_recurse(
     # the field accepts null.  Normalize to a single base type string plus a
     # ``nullable`` flag so downstream consumers (baseline emitter, UI, etc.)
     # continue to see a scalar type.
+    other_types: tuple[str, ...] = ()
     if isinstance(raw_type, list):
         non_null = [t for t in raw_type if t != "null"]
         nullable = "null" in raw_type
         node_type = non_null[0] if non_null else "null"
+        other_types = tuple(non_null[1:])
     else:
         node_type = raw_type
         nullable = False
@@ -374,6 +396,7 @@ def _flatten_recurse(
             default_value=default_value,
             nullable=nullable,
             requires_restart=requires_restart,
+            other_types=other_types,
         )
         out.append(entries_entry)
 

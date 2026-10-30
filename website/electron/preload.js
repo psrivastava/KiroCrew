@@ -1,5 +1,10 @@
 const { contextBridge, ipcRenderer, webUtils } = require("electron");
 
+// Live `watchCursorAway` subscriptions in this renderer; see that method.
+let cursorAwaySubscribers = 0;
+// Whether this document has sent `navigate-ready`; see `onNavigate`.
+let navigateReadySent = false;
+
 contextBridge.exposeInMainWorld("kirocrew", {
   platform: process.platform,
   isElectron: true,
@@ -29,6 +34,14 @@ contextBridge.exposeInMainWorld("kirocrew", {
   // are validated in the main process (handleWindowControl /
   // applyWindowControl).
   windowControl: (action) => ipcRenderer.send("window-control", String(action || "")),
+  // Announce a download the app is about to start, so the Electron shell's
+  // will-download handler auto-saves ONLY downloads the app explicitly asked
+  // for (the export path). Without a matching announcement a same-origin or
+  // blob download gets the normal Save dialog instead of a silent save. The
+  // main process keys the expectation by THIS frame's own origin; `filename`
+  // is the leaf name the download will carry. No-op (absent) in a plain
+  // browser, where downloadBlob falls back to the browser's own handling.
+  expectDownload: (filename) => ipcRenderer.send("download:expect", String(filename || "")),
 });
 
 contextBridge.exposeInMainWorld("electronAPI", {
@@ -70,7 +83,38 @@ contextBridge.exposeInMainWorld("electronAPI", {
   // coordinate, so the renderer cannot hide or move them itself — with the header
   // collapsed they would sit over the reclaimed content.
   setFocusModeChrome: (visible) => ipcRenderer.send("focus-mode-chrome", !!visible),
-  // Dev mode IPC: renderer signals main process to show/hide DevTools menu item.
+  // Focus mode: how far the cursor has travelled OUTSIDE this window, reduced to
+  // the single transition the reveal overlays care about. Call it once the
+  // pointer has left the window with an overlay open; the callback fires exactly
+  // once, with `true` when the cursor is far enough away that the overlay should
+  // be dismissed and `false` when it came back inside instead. Returns an
+  // unsubscribe that also disarms the main-process poll, so nothing polls while
+  // no overlay is waiting on an answer.
+  //
+  // This cannot be done in the page: the renderer gets no mouse events past a
+  // window edge, which is why the reveal's own dismissal has to round-trip
+  // through the main process at all. A plain browser has no bridge here.
+  //
+  // The main process keeps ONE watch per window, but several callers in this
+  // renderer can be waiting at once (the top bar, the rail, a pane relayed
+  // through this frame). So subscriptions are counted here: every subscribe
+  // (re-)arms the watch, and only the last unsubscribe disarms it -- one caller
+  // letting go must not cancel the answer another is still waiting for.
+  watchCursorAway: (cb) => {
+    const handler = (_e, away) => cb(!!away);
+    ipcRenderer.on("focus-mode:cursor-away", handler);
+    cursorAwaySubscribers += 1;
+    ipcRenderer.send("focus-mode-watch-cursor", true);
+    let live = true;
+    return () => {
+      if (!live) return;
+      live = false;
+      ipcRenderer.removeListener("focus-mode:cursor-away", handler);
+      cursorAwaySubscribers -= 1;
+      if (cursorAwaySubscribers === 0) ipcRenderer.send("focus-mode-watch-cursor", false);
+    };
+  },
+  // Renderer signals main process to show/hide the DevTools menu item.
   setDevMode: (enabled) => ipcRenderer.send("dev-mode-changed", !!enabled),
   // Windows custom titlebar: menu surfaces render in the dashboard so hover
   // can switch between them; command execution stays in the main process.
@@ -82,10 +126,47 @@ contextBridge.exposeInMainWorld("electronAPI", {
   onNavigate: (cb) => {
     const handler = (_e, path) => cb(path);
     ipcRenderer.on("navigate", handler);
+    // Tell the main process this document now has a `navigate` listener, so a
+    // kirocrew:// link it is holding goes to a listener instead of to nobody.
+    // Once per document: the SPA re-subscribes whenever its router callbacks
+    // change identity, and only the first subscription is news.
+    if (!navigateReadySent) {
+      navigateReadySent = true;
+      ipcRenderer.send("navigate-ready");
+    }
     return () => ipcRenderer.removeListener("navigate", handler);
   },
+  // View > Toggle Focus Mode: main.js asks the dashboard to flip focus mode,
+  // whose own toggle is hidden while it is on.
+  onToggleFocusMode: (cb) => {
+    const handler = () => cb();
+    ipcRenderer.on("focus-mode:toggle", handler);
+    return () => ipcRenderer.removeListener("focus-mode:toggle", handler);
+  },
+  // A macOS swipe main.js relays as one route-history step: -1 Back, 1 Forward
+  // (see swipe-history.js). The SPA takes it through its guarded history step.
+  onHistoryStep: (cb) => {
+    const handler = (_e, delta) => cb(delta);
+    ipcRenderer.on("history:step", handler);
+    return () => ipcRenderer.removeListener("history:step", handler);
+  },
+  // The trackpad's real finger-down ("begin") and finger-up ("end"), which
+  // main.js reads off Chromium's gesture-scroll events (see scroll-touch.js).
+  // macOS only; the page's swipe reader uses it to release a drag on the real
+  // lift-off. Anything but the two words is dropped here.
+  onScrollTouch: (cb) => {
+    const handler = (_e, phase) => {
+      if (phase === "begin" || phase === "end") cb(phase);
+    };
+    ipcRenderer.on("scroll-touch", handler);
+    return () => ipcRenderer.removeListener("scroll-touch", handler);
+  },
+  // Second argument: whether the macOS menu bar can slide over the window.
+  // Only an explicit `menuBarOverlap: false` from main turns it off, so a
+  // missing or malformed payload keeps the renderer's menu-bar band.
   onFullScreenChanged: (callback) => {
-    const handler = (_event, isFullScreen) => callback(!!isFullScreen);
+    const handler = (_event, isFullScreen, info) =>
+      callback(!!isFullScreen, !(info && info.menuBarOverlap === false));
     ipcRenderer.on("fullscreen-changed", handler);
     return () => ipcRenderer.removeListener("fullscreen-changed", handler);
   },
@@ -152,6 +233,16 @@ contextBridge.exposeInMainWorld("localGatewayAPI", {
   set: (enabled) => ipcRenderer.invoke("local-gateway:set", !!enabled),
 });
 
+// First-run setup's "connect to a crew on another machine" exit. `available`
+// resolves true only where `start` can work; `start` opens the remote-crew form
+// and resolves "switching", "cancelled" or "unavailable". Neither takes an
+// argument: the main process decides everything from the sender. Absent in
+// plain browsers, where setup has no local gateway to replace.
+contextBridge.exposeInMainWorld("remoteCrewSetupAPI", {
+  available: () => ipcRenderer.invoke("first-run:can-use-remote-crew"),
+  start: () => ipcRenderer.invoke("first-run:use-remote-crew"),
+});
+
 // Crash-artifact notice for the dashboard banner (CrashReportNotice).
 //
 // The app already captures a minidump and, on macOS, the OS writes an .ips
@@ -180,6 +271,14 @@ contextBridge.exposeInMainWorld("wslAPI", {
   detect: () => ipcRenderer.invoke("wsl:detect"),
 });
 
+// What the main window's close button does: "background" or "quit". The main
+// process returns the stored value only to the main window's own dashboard.
+// Absent in plain browsers and in the PWA.
+contextBridge.exposeInMainWorld("closeActionAPI", {
+  get: () => ipcRenderer.invoke("close-action:get"),
+  set: (action) => ipcRenderer.invoke("close-action:set", String(action || "")),
+});
+
 // File-open bridge for the chat path chip's "Open in editor" affordance. Hands
 // a filesystem PATH — never a URL scheme — to the main process, which validates
 // it and calls shell.openPath so the file opens in the OS default handler on the
@@ -188,6 +287,36 @@ contextBridge.exposeInMainWorld("wslAPI", {
 // hides the control, keeping the built-in viewer as the only path there.
 contextBridge.exposeInMainWorld("fileOpenAPI", {
   open: (filePath) => ipcRenderer.invoke("dashboard:open-file", String(filePath || "")),
+});
+
+// Native folder chooser for the project picker's "Open system folder picker"
+// button. Neither call passes anything to the main process: the dialog's
+// options are fixed there. `available()` resolves whether this window's gateway
+// runs on this machine (the main process answers false for a connection window
+// pointed at a remote gateway).
+// `pick()` invokes `dashboard:pick-folder`, which runs the same checks and opens
+// the dialog; it resolves the chosen absolute folder, or null when the user
+// cancels, and rejects when the shell refuses or no dialog could be shown.
+// Absent in a plain browser and in the PWA -- the picker hides the button there
+// and keeps its in-app browser as the only path.
+contextBridge.exposeInMainWorld("folderPickAPI", {
+  available: () => ipcRenderer.invoke("dashboard:can-pick-folder"),
+  pick: () => ipcRenderer.invoke("dashboard:pick-folder"),
+});
+
+// External terminal bridge for the Files tab's "Open in external terminal" row
+// and its Settings picker. `detect` resolves { apps: [{id, label}], capable },
+// the allowlisted terminal apps installed on this machine; for a window whose
+// gateway is not this machine's it resolves { apps: [], capable: false }, so the
+// row and the picker stay hidden there. `open` hands the main process the
+// opaque grant the gateway answered POST /api/terminal/external with, and
+// resolves { ok, app?, error? }; the main process redeems the grant at the
+// gateway and starts nothing without it, so no app name, path or argument
+// crosses this bridge. `open` rejects for a window whose gateway is not this
+// machine's. Absent in a plain browser and the PWA, where the row is hidden.
+contextBridge.exposeInMainWorld("externalTerminalAPI", {
+  detect: () => ipcRenderer.invoke("external-terminal:detect"),
+  open: (grant) => ipcRenderer.invoke("external-terminal:open", String(grant || "")),
 });
 
 // Native zoom bridge for the Settings > Display "Zoom Level" stepper.
@@ -292,4 +421,8 @@ contextBridge.exposeInMainWorld("updateAPI", {
   // Auto-download opt-out (Settings > About). ON by default: a discovered
   // update downloads in the background and installs on the next quit.
   setAutoDownload: (enabled) => ipcRenderer.invoke("update:set-auto-download", enabled),
+  // Notify the main process that a security policy provider now governs (or no
+  // longer governs) this install's updates. Called from useUpdateSubscription
+  // whenever update_bundled_by_app and update_managed_by align. Fire-and-forget.
+  notifyPolicyGoverned: (governed) => ipcRenderer.send("update:notify-policy-governed", governed),
 });

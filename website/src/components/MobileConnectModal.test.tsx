@@ -12,6 +12,8 @@
  *  3. the not-ready tailnet state routes to the real setup card instead of
  *     minting.
  */
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen, fireEvent, waitFor } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
@@ -72,18 +74,45 @@ describe('MobileConnectModal', () => {
     expect(mocks.tailnetMobileQr).toHaveBeenCalledTimes(1)
   })
 
+  it('shows the QR at its natural size so the browser never blurs its modules', async () => {
+    // A fixed 176px box squeezes a code of about 80 modules to roughly 2px a
+    // module, with smoothing, which is too small and soft for a phone camera.
+    mocks.tailnetMobileQr.mockResolvedValue({
+      url: 'https://host/?token=live',
+      image: 'data:image/png;base64,x',
+    })
+    mount(['tailnet_qr'])
+    fireEvent.click(await screen.findByText('Show QR code'))
+    const img = await screen.findByAltText('QR code for mobile access')
+    expect(img).not.toHaveAttribute('width')
+    expect(img).not.toHaveAttribute('height')
+    expect(img.className).toContain('[image-rendering:pixelated]')
+    expect(img.className).toContain('max-w-full')
+  })
+
   it('not-ready tailnet routes to setup instead of offering a mint', async () => {
     mocks.tailnetMobile.mockResolvedValue({ step: 'publish' })
     mount(['tailnet_qr'])
     await waitFor(() =>
       expect(
-        screen.getByText(/Remote access is not set up yet/),
+        screen.getByText(/Tailscale setup is not complete yet/),
       ).toBeInTheDocument(),
     )
     expect(screen.queryByText('Show QR code')).not.toBeInTheDocument()
   })
 
-  it('login_link mints only on click and shows the one-time URL', async () => {
+  it('a not-ready step after Tailscale is installed never says Tailscale is not set up', async () => {
+    // restart_gateway: Tailscale is installed, signed in and configured; only a
+    // gateway restart is left, so "not set up" would be false here.
+    mocks.tailnetMobile.mockResolvedValue({ step: 'restart_gateway' })
+    mount(['tailnet_qr'])
+    expect(
+      await screen.findByText(/Tailscale setup is not complete yet/),
+    ).toBeInTheDocument()
+    expect(screen.queryByText(/not set up/i)).not.toBeInTheDocument()
+  })
+
+  it('login_link mints only on click and shows the URL', async () => {
     mocks.mobileLoginLink.mockResolvedValue({ url: 'https://ext/?token=once', expires_in: 300 })
     mount(['login_link'])
     expect(mocks.mobileLoginLink).not.toHaveBeenCalled()
@@ -91,6 +120,91 @@ describe('MobileConnectModal', () => {
     await waitFor(() =>
       expect(screen.getByDisplayValue('https://ext/?token=once')).toBeInTheDocument(),
     )
+    // No image in the response (a failed encode): link only, no broken <img>.
+    expect(screen.queryByAltText('QR code for the sign-in link')).not.toBeInTheDocument()
+    expect(
+      screen.getByText(
+        'The link expires in about 5 minutes. Until then, anyone who has it can sign in.',
+      ),
+    ).toBeInTheDocument()
+  })
+
+  it('login_link shows the minted link as a QR code when the server sends one', async () => {
+    mocks.mobileLoginLink.mockResolvedValue({
+      url: 'https://ext/?token=once',
+      expires_in: 300,
+      image: 'data:image/png;base64,QUJD',
+    })
+    mount(['login_link'])
+    fireEvent.click(screen.getByText('Create sign-in link'))
+    const qr = await screen.findByAltText('QR code for the sign-in link')
+    expect(qr).toHaveAttribute('src', 'data:image/png;base64,QUJD')
+    expect(screen.getByDisplayValue('https://ext/?token=once')).toBeInTheDocument()
+    expect(
+      screen.getByText(
+        'The code and link expire in about 5 minutes. Until then, anyone who has them can sign in.',
+      ),
+    ).toBeInTheDocument()
+  })
+
+  it('states that sign-in links remain usable until expiry', async () => {
+    mocks.mobileLoginLink.mockResolvedValueOnce({
+      url: 'https://ext/?token=qr',
+      expires_in: 300,
+      image: 'data:image/png;base64,QUJD',
+    })
+    const qrView = mount(['login_link'])
+    fireEvent.click(screen.getByText('Create sign-in link'))
+    expect(
+      await screen.findByText(
+        'The code and link expire in about 5 minutes. Until then, anyone who has them can sign in.',
+      ),
+    ).toBeInTheDocument()
+    expect(screen.queryByText(/works? once/i)).not.toBeInTheDocument()
+    expect(screen.queryByText(/one-time/i)).not.toBeInTheDocument()
+    qrView.unmount()
+
+    mocks.mobileLoginLink.mockResolvedValueOnce({
+      url: 'https://ext/?token=link',
+      expires_in: 300,
+    })
+    mount(['login_link'])
+    fireEvent.click(screen.getByText('Create sign-in link'))
+    expect(
+      await screen.findByText(
+        'The link expires in about 5 minutes. Until then, anyone who has it can sign in.',
+      ),
+    ).toBeInTheDocument()
+    expect(screen.queryByText(/works? once/i)).not.toBeInTheDocument()
+    expect(screen.queryByText(/one-time/i)).not.toBeInTheDocument()
+  })
+
+  it('names the sign-in link and its QR code for screen readers without a one-time claim', async () => {
+    mocks.mobileLoginLink.mockResolvedValue({
+      url: 'https://ext/?token=once',
+      expires_in: 300,
+      image: 'data:image/png;base64,QUJD',
+    })
+    const linkOnly = mount(['login_link'])
+    fireEvent.click(screen.getByText('Create sign-in link'))
+    expect(await screen.findByAltText('QR code for the sign-in link')).toBeInTheDocument()
+    expect(screen.getByLabelText('Sign-in link')).toHaveValue('https://ext/?token=once')
+    expect(screen.queryByLabelText(/one-time/i)).not.toBeInTheDocument()
+    expect(screen.queryByAltText('QR code for mobile access')).not.toBeInTheDocument()
+    linkOnly.unmount()
+
+    // With both methods minted, the two codes must not announce the same name.
+    mocks.tailnetMobileQr.mockResolvedValue({
+      url: 'https://host/?token=live',
+      image: 'data:image/png;base64,x',
+    })
+    mount(['tailnet_qr', 'login_link'])
+    fireEvent.click(await screen.findByText('Show QR code'))
+    fireEvent.click(screen.getByText('Create sign-in link'))
+    const tailnetQr = await screen.findByAltText('QR code for mobile access')
+    const linkQr = await screen.findByAltText('QR code for the sign-in link')
+    expect(tailnetQr).not.toBe(linkQr)
+    expect(tailnetQr.getAttribute('alt')).not.toBe(linkQr.getAttribute('alt'))
   })
 
   it('an unrecognised kind renders nothing (forward compat with edition methods)', () => {
@@ -116,7 +230,7 @@ describe('MobileConnectModal', () => {
     mocks.tailnetMobile.mockResolvedValue({ step: 'publish' })
     const onClose = vi.fn()
     mount(['tailnet_qr'], onClose)
-    fireEvent.click(await screen.findByText(/Remote access is not set up yet/))
+    fireEvent.click(await screen.findByText(/Tailscale setup is not complete yet/))
     expect(onClose).toHaveBeenCalled()
   })
 
@@ -270,5 +384,107 @@ describe('MobileConnectModal — every built-in kind actually draws', () => {
     // Each built-in section's mint affordance is its proof of presence.
     const affordance = kind === 'tailnet_qr' ? 'Show QR code' : 'Create sign-in link'
     expect(await screen.findByText(affordance)).toBeInTheDocument()
+  })
+})
+
+describe('MobileConnectModal — paints above the chat chrome, below the takeovers', () => {
+  // The dialog opens from the sidebar while the chat page's sessions flyout can
+  // be expanded. That flyout and its drawer morph sit above the chat pane
+  // (`SessionFlyout.tsx`, z-[59]/z-[60]), the focus-peek rail toggle above them
+  // (z-[61]) and the focus-mode rail above that (inline zIndex 62), so a panel
+  // on the chat-pane ceiling (z-50) paints UNDER them. The component therefore
+  // splits into two sibling layers, the same split Modal.tsx uses: a z-50
+  // BACKDROP, which the desktop nav rail — a DOM-later z-50 sibling in the
+  // shell's stacking context — beats on the tie, keeping nav rows clickable
+  // while the dialog is open; and a pointer-events-none DIALOG LAYER above all
+  // of that chrome. The dialog layer must ALSO stay below the shell's z-[100]
+  // full-screen takeovers (`UpdateModal.tsx`'s "Installing update…" surface and
+  // friends): this component renders inside the App shell's `relative z-[1]`
+  // root — NOT on document.body where Modal.tsx portals — so a z-[100] here
+  // ties with the DOM-earlier takeovers and wins on document order, keeping a
+  // live QR on screen over the very surface meant to hide everything. jsdom
+  // does no painting, so this compares the layers the sources declare, which
+  // is the property paint order follows.
+  const readSource = (...parts: string[]) =>
+    readFileSync(join(__dirname, '..', ...parts), 'utf8')
+  const zLayers = (src: string) =>
+    [...src.matchAll(/\bz-(?:\[(\d+)\]|(\d+))(?![\w-])/g)].map(m => Number(m[1] ?? m[2]))
+  const dialogLayer = () => screen.getByRole('dialog').parentElement as HTMLElement
+  const dialogLayerZ = () => {
+    const layers = zLayers(dialogLayer().className)
+    expect(layers).toHaveLength(1)
+    return layers[0]
+  }
+  const backdropZ = () => {
+    const layers = zLayers(screen.getByRole('presentation').className)
+    expect(layers).toHaveLength(1)
+    return layers[0]
+  }
+
+  it('the dialog layer sits above every chat-chrome layer', () => {
+    mount(['login_link'])
+    const appSrc = ['App.tsx', 'shell/appShell.tsx', 'shell/topbar/shellHeader.tsx', 'shell/nav/navRail.tsx', 'shell/nav/navRow.tsx'].map(f => readSource(f)).join('\n')
+    // The sessions flyout and its drawer morph.
+    const flyout = zLayers(readSource('pages', 'chat', 'SessionFlyout.tsx'))
+    expect(flyout.length).toBeGreaterThan(0)
+    // The focus-peek layers (rail toggle included).
+    const peek = appSrc
+      .split('\n')
+      .filter(line => line.includes('focus-peek-'))
+      .flatMap(zLayers)
+    expect(peek.length).toBeGreaterThan(0)
+    // The focus-mode rail's INLINE zIndex — a style prop, invisible to the
+    // z-[N] scan, so read it from the rail's own style block and fail loudly
+    // if the block stops declaring one.
+    const railAt = appSrc.indexOf('focus-chrome-rail')
+    expect(railAt).toBeGreaterThan(-1)
+    const railInline = appSrc.slice(railAt, railAt + 2000).match(/zIndex:\s*(\d+)/)
+    expect(railInline).not.toBeNull()
+    const chrome = [...flyout, ...peek, Number(railInline![1])]
+    expect(dialogLayerZ()).toBeGreaterThan(Math.max(...chrome))
+  })
+
+  it('the dialog layer sits below the full-screen takeovers, which must hide a live QR', () => {
+    mount(['login_link'])
+    // UpdateModal's full-screen takeover (the "Installing update…" /
+    // install-failed surface) — the overlay that must cover everything,
+    // including an open panel. It is the HIGHEST `fixed inset-0 z-[N]` overlay
+    // UpdateModal declares: since #15776 that component ALSO renders a
+    // dismissible "update ready" dialog in the chat-chrome band (z-[65], the
+    // same layer as this one), so the takeover is specifically the top overlay,
+    // not every one. The dialog renders in the same shell stacking context
+    // DOM-later, so a tie or more would paint the panel — and its live QR/link —
+    // over the takeover and cover the install-failed card's "Back to dashboard"
+    // button.
+    const overlays = [
+      ...readSource('components', 'UpdateModal.tsx')
+        .matchAll(/fixed inset-0 z-\[(\d+)\]/g),
+    ].map(m => Number(m[1]))
+    expect(overlays.length).toBeGreaterThan(0)
+    const takeover = Math.max(...overlays)
+    expect(dialogLayerZ()).toBeLessThan(takeover)
+  })
+
+  it('clicks outside the panel pass through the dialog layer to what is underneath', () => {
+    mount(['login_link'])
+    // The layer swallows nothing (the document-level pointerdown handler sees
+    // every outside click on the real target); only the panel takes pointers.
+    expect(dialogLayer().className.split(/\s+/)).toContain('pointer-events-none')
+    expect(screen.getByRole('dialog').className.split(/\s+/)).toContain('pointer-events-auto')
+  })
+
+  it('the backdrop never outranks the desktop nav rail, so nav rows stay clickable', () => {
+    mount(['login_link'])
+    // The rail is the DOM-later sibling, so it wins a z tie; a backdrop above
+    // its z would hit-test every nav-row click, making a tab take two clicks
+    // (one to dismiss, one to navigate). Read the rail's OWN className line —
+    // and fail loudly if that line stops declaring a z.
+    const railLines = ['App.tsx', 'shell/appShell.tsx', 'shell/topbar/shellHeader.tsx', 'shell/nav/navRail.tsx', 'shell/nav/navRow.tsx'].map(f => readSource(f)).join('\n')
+      .split('\n')
+      .filter(line => line.includes('focus-chrome-rail') && line.includes('className='))
+    expect(railLines).toHaveLength(1)
+    const railZ = zLayers(railLines[0])
+    expect(railZ.length).toBeGreaterThan(0)
+    expect(backdropZ()).toBeLessThanOrEqual(Math.min(...railZ))
   })
 })

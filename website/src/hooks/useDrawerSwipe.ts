@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { animate, type MotionValue } from 'framer-motion'
 import { holdStreamingFlushes, releaseStreamingFlushes } from '../lib/streamHold'
 import { deepActiveElement } from '../utils/editableTarget'
+import { haptic } from '../lib/haptic'
 
 /**
  * Finger-tracking open/close gesture for a mobile edge panel — the sessions
@@ -89,9 +90,9 @@ const PLATFORM_EDGE = 24
  * than that takes, and it makes a slow deliberate pull feel like it snapped back
  * for no reason.
  */
-const COMMIT_DRAG_SHARE = 0.2
+export const COMMIT_DRAG_SHARE = 0.2
 /** Release faster than this (px/ms) commits regardless of how far it got. */
-const COMMIT_VELOCITY = 0.4
+export const COMMIT_VELOCITY = 0.4
 /**
  * Trailing window the release speed is measured over.
  *
@@ -105,7 +106,7 @@ const VELOCITY_WINDOW_MS = 100
 /** Shortest base the speed may be measured over. A finger that was still for
  *  most of the window and twitched once just before lifting would otherwise
  *  read as a hard throw off two adjacent samples. */
-const VELOCITY_MIN_SPAN_MS = 16
+export const VELOCITY_MIN_SPAN_MS = 16
 /** Samples retained for the window — 100ms at 60Hz is ~6, with headroom for a
  *  higher-rate digitizer and one baseline sample outside the window. */
 const VELOCITY_SAMPLES = 16
@@ -161,7 +162,7 @@ const CLICK_SWALLOW_MS = 350
  * curve did quiet it — but the real fault was that the drawer's travel was the
  * VIEWPORT width while the panel is narrower than that, so it left the screen at
  * ~90% of the slide and the deceleration played with nothing on it. With the
- * travel matched to the panel's own width (`DRAWER_UNCOVERED_PX` in ChatPage),
+ * travel matched to the panel's own width (`DRAWER_UNCOVERED_PX` in chat/page/sessionsDrawer.ts),
  * this curve stops snapping and the gentler one turns out to be the thing that
  * feels wrong: it decelerates 18x across its span where this one does ~100x, and
  * that contrast between a quick departure and a long glide into the edge IS the
@@ -1301,6 +1302,10 @@ export function useDrawerSwipe(
       // (a sibling instance's mutual exclusion) opens up now rather than in
       // ~300ms. `onSettle` still reports arrival, which is what may unmount.
       onCommitRef.current?.(target)
+      // Only a CHANGE of state taps: a release that lets the panel fall back to
+      // where it started is the gesture not happening, and the notch a real
+      // drawer makes when it seats is what this stands in for.
+      if (target !== startedOpen) haptic('light')
       settle(target ? 0 : closedOffset(), target, v)
     }
 

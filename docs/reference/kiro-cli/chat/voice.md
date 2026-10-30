@@ -4,7 +4,8 @@
 > own voice setup. The surrounding tree's do-not-author rule does not reach it.
 
 Kiro Crew supports hands-free interaction through voice input (speech-to-text)
-and voice output (text-to-speech). Both work in the dashboard and Slack.
+and voice output (text-to-speech). Input works in the dashboard and on supported
+messaging attachments; output works in the dashboard, Slack, and Telegram.
 
 ## Voice Input (Speech-to-Text)
 
@@ -30,11 +31,13 @@ a browser missing any of them falls back to recording the whole utterance with
 `MediaRecorder` and transcribing it on release (WebM/Opus preferred, MP4/OGG
 fallback).
 
-### Slack Voice Memos
+### Messaging Voice Notes
 
-When STT is enabled, voice memos sent in Slack threads are automatically
-transcribed. Kiro Crew processes the audio and responds to the transcribed text
-as if you had typed it.
+When STT is enabled, audio and voice attachments received through Slack, Discord,
+Teams, Telegram, Webex, WeCom, Weixin, and WhatsApp are automatically transcribed
+through the shared attachment path. Kiro Crew responds to the transcribed text as
+if it had been typed. A channel may impose its own attachment-size and media-type
+limits before transcription.
 
 ### Setup
 
@@ -47,17 +50,24 @@ gateway:
 pip install 'pywhispercpp>=1.5,<2'
 ```
 
-Source environments also need a system FFmpeg for WebM, M4A, and ogg/Opus; Kiro
-Crew deliberately does not execute packaged binaries from an agent-writable
-project venv. Desktop installers instead carry and verify their pinned decoder,
-so desktop users never install Homebrew, Winget, Apt, or FFmpeg. Prebuilt
-recognizer wheels cover Apple silicon
-macOS, glibc and musl Linux on x86_64 and arm64, and Windows. An Intel Mac has
-none, so `pip` builds from source there and needs a C++ toolchain plus CMake.
-Settings reports that as its own state, not as a missing extra.
+Compressed input still needs an authenticated FFmpeg decoder for WebM, M4A, and
+ogg/Opus. Desktop releases carry and verify a pinned decoder, except on Intel
+Macs, which use a system FFmpeg (`brew install ffmpeg`). A source install
+first checks fixed system locations and, if no usable binary exists, **Settings >
+Voice** offers a one-click download of the pinned audio-only FFmpeg executable
+into `<data home>/models/ffmpeg/`; its SHA-256 is verified before every execution.
+Kiro Crew deliberately does not execute a decoder from an agent-writable project
+venv. Platforms without a pinned artifact must install FFmpeg into one of the
+trusted system locations reported by `kirocrew doctor`.
+
+Prebuilt recognizer wheels cover Apple silicon macOS, glibc and musl Linux on
+x86_64 and arm64, and Windows. An Intel Mac has none, so `pip` builds from source
+there and needs a C++ toolchain plus CMake. Settings reports that as its own state,
+not as a missing extra.
 
 Then open **Settings > Voice**. The Speech-to-Text card reports whether the
-recognizer loaded and names the reason when it did not, and picks the model:
+recognizer and decoder loaded and names the reason when either did not, and it
+lets you pick the model:
 
 | Model | One-time download | Use it when |
 |-------|-------------------|-------------|
@@ -68,9 +78,9 @@ recognizer loaded and names the reason when it did not, and picks the model:
 
 Choose the model and click **Download now**. The download is verified against a
 pinned sha256 digest before it is used and is reused from disk after that.
-Nothing else needs installing by hand: there is no separate transcription
-program, provider-specific runtime, or system FFmpeg dependency. `kirocrew
-doctor` reports the recognizer, model, and bundled decoder.
+Once the recognizer and decoder are available, there is no separate transcription
+program or provider-specific runtime to install. `kirocrew doctor` reports the
+recognizer, model, and resolved decoder.
 
 The other two providers, the full setting list and the retired providers are in
 Kiro Crew's own [configuration reference](../../../../src/kiro_crew/docs/configuration.md).
@@ -102,14 +112,15 @@ extrapolating onto a 64-core host nobody measured.
 
 ## Voice Output (Text-to-Speech)
 
-Kiro Crew can speak responses aloud. Three providers are available, and the
+Kiro Crew can speak responses aloud. Two providers are available, and the
 default needs nothing installed:
 
 | Provider | What it needs | Notes |
 |---|---|---|
-| `system` (default) | nothing on macOS and Windows | The host's own engine: `say` on macOS, `System.Speech` through Windows PowerShell on Windows, `espeak-ng` on Linux when installed. Linux is the one platform where it can be missing; install `espeak-ng` (about 355 kB) or pick another provider. |
-| `piper` | the `piper` binary plus a voice model on disk | Best offline quality. `pip install piper-tts` publishes wheels for macOS, Linux and Windows x64. |
+| `system` (default) | nothing on macOS and Windows | The host's own engine: `say` on macOS, `System.Speech` through Windows PowerShell on Windows, `espeak-ng` (or legacy `espeak`) on Linux/BSD when installed. Linux is the one platform where it can be missing; install `espeak-ng` or pick another provider. |
 | `polly` | the `aws` CLI, AWS credentials, network | Paid AWS service, and it asks you to confirm the account first. |
+
+The `piper` provider was removed ([#23154](https://github.com/kirodotdev/KiroCrew/issues/23154)): its engine and voice models were installed unpinned and unverified, and the engine is GPL-licensed. A config that still names `piper`, or still carries `piper_model`, speaks with `system` and logs one warning per gateway start; set `provider` to `system` (or `polly`) in `config.json` to silence it. The `piper_*` keys are ignored and nothing on disk is removed; delete a Piper install or voice files yourself if you no longer want them.
 
 Two playback modes are available:
 
@@ -122,8 +133,8 @@ synthesizes each sentence as soon as it's complete.
 **How it works:**
 1. The assistant starts streaming a response.
 2. As each sentence completes (detected by `.` `!` `?` boundaries), it's sent
-   for synthesis. Polly streams sentence by sentence; the local providers
-   return one clip per request.
+   for synthesis. Polly streams sentence by sentence; the built-in engine
+   returns one clip per request.
 3. Audio chunks arrive via WebSocket and play sequentially.
 4. When the response finishes, any remaining text is spoken.
 
@@ -140,8 +151,8 @@ you can interrupt at any time by typing or speaking your next message.
 
 ### Manual Replay
 
-Hover over any assistant message (≥50 chars) and click the **Speak** button
-to hear it read aloud. This works independently of auto-speak.
+Open the **More actions** menu on any non-blank assistant reply and choose
+**Read aloud** to hear it. This works independently of auto-speak.
 
 ### Slack Voice Replies
 
@@ -160,7 +171,14 @@ The legacy `!voice` inline commands still work but are deprecated:
 | `!voice pitch +10%` | Adjust pitch (neural/standard engines only) |
 
 Voice replies are uploaded to the Slack thread alongside the text response.
-File format depends on the provider (MP3 for Polly, WAV for Piper).
+File format depends on the provider (MP3 for Polly, WAV for the built-in engine).
+
+### Telegram Voice Replies
+
+Set `telegram.voice_replies: true` for the default, or use `/voice on` and
+`/voice off` in one conversation to override it. Telegram always receives the
+text answer first; TTS is then delivered silently as a voice/audio message, so a
+synthesis failure never removes the usable text response.
 
 ### Configuration
 
@@ -182,11 +200,6 @@ Settings are in **Settings > Voice**, or directly in
     "aws_profile": "",
     "region": "",
 
-    "piper_binary": "",
-    "piper_model": "",
-    "piper_model_config": "",
-    "piper_length_scale": 1.0,
-
     "system_voice": ""
   }
 }
@@ -195,9 +208,9 @@ Settings are in **Settings > Voice**, or directly in
 | Setting | Default | Purpose |
 |---------|---------|---------|
 | `enabled` | `false` | Turn on voice replies for **every** Kiro Crew response (text-triggered). Also seeds the `auto_reply_to_voice` default — see below. |
-| `provider` | `"system"` | TTS backend: `"system"` (the host's built-in engine, nothing to install), `"piper"` (local, offline, better quality) or `"polly"` (AWS, cloud, and billed). An unrecognized value falls back to `system` with a warning logged: reaching for a paid service is not a choice a typo may make for you. If the key is ABSENT but `piper_model` is set, Piper is kept, so an existing Piper install is not silently downgraded on upgrade. |
+| `provider` | `"system"` | TTS backend: `"system"` (the host's built-in engine, nothing to install) or `"polly"` (AWS, cloud, and billed). An unrecognized value falls back to `system` with a warning logged: reaching for a paid service is not a choice a typo may make for you. The removed `"piper"`, or an absent key beside a leftover `piper_model`, also resolves to `system`, with one warning. |
 | `auto_reply_to_voice` | _follows `enabled`_ | **Voice-triggered**: when the user sends a voice memo, auto-respond with voice. Defaults to whatever `enabled` is — set explicitly to override. |
-| `rate` | `100%` | 50%–200%. Shared by `polly` and `system`; `piper` uses `piper_length_scale` instead |
+| `rate` | `100%` | 50%–200%. Shared by `polly` and `system` |
 | **Built-in-engine-specific** | | ignored by the other providers |
 | `system_voice` | _(OS default)_ | The engine's own voice selector: a voice name for `say` and Windows, a language code for `espeak-ng`. Pick one in **Settings > Voice** rather than typing it |
 | **Polly-specific** | | ignored by the other providers |
@@ -206,12 +219,6 @@ Settings are in **Settings > Voice**, or directly in
 | `pitch` | `+0%` | -20% to +20% (neural/standard only) |
 | `aws_profile` | _(empty)_ | AWS CLI profile; empty = default credentials |
 | `region` | _(empty)_ | AWS region for Polly; empty = CLI default |
-| **Piper-specific** | | ignored by the other providers |
-| `piper_binary` | _(auto-detect)_ | Path to `piper` CLI. Auto-detects `piper` on `PATH`, then the console script in `~/piper-venv` (`Scripts\piper.exe` on Windows, `bin/piper` elsewhere) |
-| `piper_model` | _(required)_ | Absolute path to a piper voice `.onnx` model |
-| `piper_model_config` | _(optional)_ | Path to `.onnx.json` config; piper auto-detects one next to the `.onnx` |
-| `piper_length_scale` | `1.0` | Speech speed. `<1` faster, `>1` slower |
-
 ### Voice-in → voice-out (symmetric voice)
 
 `auto_reply_to_voice` controls whether sending a Slack voice memo
@@ -226,8 +233,8 @@ You can also set `auto_reply_to_voice: true` explicitly while leaving
 `enabled: false` if you want voice **only** as a response to voice memos —
 i.e. text replies stay text, voice memos get a spoken reply.
 
-If TTS is **not configured** (missing `aws` CLI for Polly, missing binary or
-model for Piper), Kiro Crew posts a one-shot **ephemeral** explaining why and
+If TTS is **not configured** (missing `aws` CLI for Polly, or no built-in
+engine on the host), Kiro Crew posts a one-shot **ephemeral** explaining why and
 replies with text only. The ephemeral fires for every opt-in path —
 globally enabled, per-thread `!voice on`, or voice-memo auto-reply — so
 silent fallback never surprises the user.
@@ -264,42 +271,6 @@ Responses are cleaned for natural speech before synthesis:
      **AWS Profile** field (or set `"aws_profile": "polly"` in config.json).
   3. Leave the profile blank to use your default AWS CLI credentials
      (`~/.aws/credentials` default profile or environment variables).
-
-### Prerequisites — Piper (`provider: "piper"`)
-
-Piper is a local, offline neural TTS — no credentials, no network. Good when
-you can't or don't want to use Amazon Polly.
-
-1. **Install piper-tts** into a Python 3.11 venv (PyPI wheels don't yet
-   support Python 3.12):
-   ```bash
-   # Using mise, pyenv, or system python3.11:
-   python3.11 -m venv ~/piper-venv
-   ~/piper-venv/bin/pip install 'numpy<2' piper-tts
-   ```
-   The `~/piper-venv/bin/piper` path is auto-detected.
-
-2. **Download a voice model** from the
-   [Piper voices on HuggingFace](https://huggingface.co/rhasspy/piper-voices/tree/main):
-   ```bash
-   mkdir -p ~/piper
-   BASE="https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/lessac/medium"
-   curl -fsSL "$BASE/en_US-lessac-medium.onnx" -o ~/piper/en_US-lessac-medium.onnx
-   curl -fsSL "$BASE/en_US-lessac-medium.onnx.json" -o ~/piper/en_US-lessac-medium.onnx.json
-   ```
-
-3. **Set the config** in `~/.kiro/crew/config.json`:
-   ```json
-   "voice_reply": {
-     "enabled": true,
-     "provider": "piper",
-     "piper_model": "/home/<you>/piper/en_US-lessac-medium.onnx"
-   }
-   ```
-
-4. **ffmpeg is NOT required for Piper** (it outputs WAV directly that Slack
-   plays natively). ffmpeg is still needed for voice-memo *input*, whichever
-   speech-to-text provider is selected.
 
 - **ffmpeg** for audio stitching (replay/Slack uploads). Not needed for
   streaming playback in the dashboard.

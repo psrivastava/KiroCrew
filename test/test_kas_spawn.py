@@ -32,9 +32,11 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+from named_cases_helpers import named_cases
 
 from kiro_crew.acp import session_handle as sh
 from kiro_crew.acp.kas_host_auth import HostAuthCallbackError
@@ -260,24 +262,25 @@ class TestAuthOwnership:
 
 
 class TestSandboxClassification:
-    """KAS must not be declared to the sandbox as kiro-cli.
+    """KAS's relay route is declared to the sandbox as kiro-cli; its bundle route is not.
 
     ``wrap_argv`` skips Crew's own seatbelt when told the child is kiro-cli with
-    its internal sandbox on, because on macOS the two cannot nest. The relay DOES
-    spawn a kiro-cli binary now, which makes the claim look tempting -- and it is
-    wrong. kiro-cli spawns the KAS server with no ``--sandbox`` argument, and KAS
-    resolves an absent sandbox config to its no-op backend, so nothing starts an
-    OS sandbox inside. There is therefore nothing to nest (no EPERM risk) and
-    nothing to delegate to: this membership test fails OPEN, so claiming it would
-    skip Crew's seatbelt in favour of a layer that never exists and leave KAS
-    unconfined on macOS. False is the load-bearing answer, not the cautious one.
+    its internal sandbox on, because on macOS the two cannot nest. The relay
+    process IS kiro-cli, and kiro-cli starts that internal sandbox before it
+    spawns the KAS server as its child: left inside Crew's seatbelt, the relay
+    exits before ``initialize`` with ``sandbox initialization failed: Operation
+    not permitted`` (measured in the field on macOS). So the relay must take the
+    delegation kiro-cli takes. The bundle route runs Node with no kiro-cli in the
+    chain and no sandbox of its own, so claiming the delegation there would leave
+    KAS unconfined; ``test_harness_parity.py::test_kas_bundle_route_keeps_crew_sandbox``
+    pins that half through the same launch.
     """
 
     class _Abort(Exception):
         """Stops ``spawn`` at the sandbox call so no child is ever executed."""
 
-    @pytest.mark.asyncio
-    async def test_kas_is_not_classified_as_kiro_cli(self, kas_stub, tmp_path):
+    async def _wrap_kwargs(self, tmp_path, work_dir=None) -> dict[str, object]:
+        """Spawn KAS on the relay route and return what the sandbox wrap was asked."""
         captured: dict[str, object] = {}
 
         def fake_wrap(argv, **kwargs):
@@ -285,14 +288,96 @@ class TestSandboxClassification:
             raise self._Abort
 
         runtime = AcpRuntime(
-            work_dir=tmp_path / "sbx",
+            work_dir=work_dir or tmp_path / "sbx",
             sandbox_mode="off",
             acp_backend=ACP_BACKEND_KAS,
         )
         with patch("kiro_crew.acp.runtime.wrap_argv", side_effect=fake_wrap):
             with pytest.raises(self._Abort):
                 await runtime.spawn()
+        return captured
+
+    @pytest.mark.asyncio
+    async def test_kas_relay_is_classified_as_kiro_cli_where_its_sandbox_runs(
+        self, kas_stub, tmp_path
+    ):
+        with patch("kiro_crew.acp.harness.kas._kiro_cli_sandbox_owns_relay", return_value=True):
+            captured = await self._wrap_kwargs(tmp_path)
+        assert captured["is_kiro_cli"] is True
+
+    @pytest.mark.asyncio
+    async def test_kas_relay_keeps_crew_sandbox_where_kiro_cli_sandbox_is_off(
+        self, kas_stub, tmp_path
+    ):
+        """With the switch off (or on Linux) Crew's own layer wraps the relay.
+
+        So nothing that only a delegated spawn needs may refuse it: a workspace that
+        Crew's launcher would seal still starts, exactly as before KAS could delegate.
+        """
+        with patch("kiro_crew.acp.harness.kas._kiro_cli_sandbox_owns_relay", return_value=False):
+            captured = await self._wrap_kwargs(tmp_path, work_dir=kiro_agents_dir())
         assert captured["is_kiro_cli"] is False
+
+    @pytest.mark.asyncio
+    async def test_a_delegated_kas_relay_refuses_a_workspace_over_a_sealed_target(
+        self, kas_stub, tmp_path
+    ):
+        """The delegated spawn never passes Crew's launcher, so its seals do not hold.
+
+        A workspace that IS the kiro agents tree would let the agent rewrite the specs
+        the next spawn runs. The relay asks the same sealed-target check the Kiro
+        harness asks, with its own workspace, and refuses before any process exists:
+        the sandbox wrap is never reached. The check's own verdicts are pinned with
+        the Kiro harness; this pins that the KAS relay consults it.
+        """
+        captured: dict[str, object] = {}
+        asked: list[object] = []
+
+        def fake_wrap(argv, **kwargs):
+            captured.update(kwargs)
+            raise self._Abort
+
+        def sealed(work_dir):
+            asked.append(work_dir)
+            return "workspace overlaps the kiro agents directory"
+
+        runtime = AcpRuntime(
+            work_dir=kiro_agents_dir(),
+            sandbox_mode="off",
+            acp_backend=ACP_BACKEND_KAS,
+        )
+        with (
+            patch("kiro_crew.acp.harness.kas._kiro_cli_sandbox_owns_relay", return_value=True),
+            patch(
+                "kiro_crew.sandbox.delegated_workspace_exposes_sealed_target", side_effect=sealed
+            ),
+            patch("kiro_crew.acp.runtime.wrap_argv", side_effect=fake_wrap),
+        ):
+            with pytest.raises(sh.AcpRuntimeError, match="kiro agents directory"):
+                await runtime.spawn()
+        assert [str(w) for w in asked] == [str(kiro_agents_dir())]
+        assert captured == {}
+
+    @pytest.mark.parametrize(
+        ("platform", "switch_on", "owned"),
+        [
+            ("darwin", True, True),
+            ("darwin", False, False),
+            # Measured on Windows (kiro-cli 2.35.1): the relay's KAS child runs
+            # unconfined with the switch on or off, so the relay never claims it.
+            ("win32", True, False),
+            ("win32", False, False),
+            ("linux", True, False),
+        ],
+    )
+    def test_only_macos_with_the_switch_on_hands_the_relay_to_kiro_cli(
+        self, monkeypatch, platform, switch_on, owned
+    ):
+        from kiro_crew.acp.harness import kas as kas_mod
+
+        monkeypatch.setattr(kas_mod, "sys", SimpleNamespace(platform=platform))
+        monkeypatch.setattr("kiro_crew.sandbox.kiro_internal_sandbox_enabled", lambda: switch_on)
+        assert kas_mod._kiro_cli_sandbox_owns_relay() is owned
 
     @pytest.mark.asyncio
     async def test_kiro_still_classified_as_kiro_cli(self, tmp_path, monkeypatch):
@@ -319,7 +404,14 @@ class TestSandboxClassification:
 
 
 class TestCapabilities:
-    def test_kas_adds_the_kiro_settings_channel(self):
+    @pytest.mark.parametrize(
+        (),
+        [
+            *named_cases("test_kas_adds_the_kiro_settings_channel"),
+            *named_cases("test_the_settings_channel_is_still_open"),
+        ],
+    )
+    def test_the_kiro_settings_channel_is_announced(self):
         assert KAS_CLIENT_CAPABILITIES["_meta"]["kiro"]["settings"] == {}
 
     def test_kas_keeps_the_standard_top_level_declarations(self):
@@ -355,6 +447,11 @@ def send(obj):
 HOST_OWNED = "--auth-method" not in sys.argv[1:]
 CAPTURE = os.environ.get("KIROCREW_TEST_KAS_AUTH_CAPTURE")
 INIT_CAPTURE = os.environ.get("KIROCREW_TEST_KAS_INIT_CAPTURE")
+# Records what the relay would authenticate with from its own environment.
+KEY_CAPTURE = os.environ.get("KIROCREW_TEST_KAS_KEY_CAPTURE")
+if KEY_CAPTURE:
+    with open(KEY_CAPTURE, "w") as fh:
+        json.dump({"KIRO_API_KEY": os.environ.get("KIRO_API_KEY")}, fh)
 
 def ask_host_for_credential(stdin):
     send({"jsonrpc": "2.0", "id": 0, "method": "_kiro/auth/getAccessToken", "params": {}})
@@ -680,6 +777,50 @@ class TestKasInvocation:
             finally:
                 await runtime.kill()
         assert not capture.exists()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("vault_identity", "expected_key"),
+        [(False, "ksk-operator-key"), (True, None)],
+        ids=["cli-owned-keeps-key", "crew-owned-strips-key"],
+    )
+    async def test_api_key_reaches_only_a_cli_owned_relay(
+        self, kas_stub, tmp_path, monkeypatch, vault_identity, expected_key
+    ):
+        """End-to-end through the real spawn path: the child's own environment.
+
+        kiro-cli keeps no stored record of an API-key sign-in -- ``KIRO_API_KEY``
+        is the whole login -- so a cli-owned relay stripped of it dies at the
+        launcher's "You are not logged in" on an API-key-only host. A Crew-owned
+        relay must still lose it: the engine prefers an environment key over the
+        vault callback, which would outlive a dashboard sign-out.
+        """
+        capture = tmp_path / "key.json"
+        monkeypatch.setenv("KIROCREW_TEST_KAS_KEY_CAPTURE", str(capture))
+        monkeypatch.setenv("KIRO_API_KEY", "ksk-operator-key")
+
+        async def vault():
+            return vault_identity
+
+        async def fake_answer():
+            return {"accessToken": "t", "expiresAt": "2099-01-01T00:00:00+00:00"}
+
+        runtime = AcpRuntime(
+            work_dir=tmp_path / "ws-key",
+            sandbox_mode="off",
+            acp_backend=ACP_BACKEND_KAS,
+        )
+        with (
+            patch("kiro_crew.acp.harness.kas.vault_holds_identity_off_loop", side_effect=vault),
+            patch("kiro_crew.acp.harness.kas.answer_get_access_token", side_effect=fake_answer),
+        ):
+            try:
+                await runtime.spawn()
+                assert runtime.is_alive()
+                assert runtime._kas_host_auth is vault_identity
+            finally:
+                await runtime.kill()
+        assert json.loads(capture.read_text()) == {"KIRO_API_KEY": expected_key}
 
     @pytest.mark.asyncio
     async def test_spawn_argv_is_the_relay_invocation(self, kas_stub, tmp_path):

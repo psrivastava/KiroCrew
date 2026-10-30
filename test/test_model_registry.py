@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import os
 
+import pytest
+from named_cases_helpers import named_cases
+
 from kiro_crew import model_registry as mr
 
 
@@ -103,6 +106,8 @@ class TestModelRegistry:
         assert mr.model_window("deepseek-3.2") == 164_000
         assert mr.model_window("minimax-m2.5") == 196_000
         assert mr.model_window("minimax-m2.1") == 196_000
+        assert mr.model_window("minimax-m3") == 1_000_000
+        assert mr.model_window("minimax-m2.7") == 204_800
         assert mr.model_window("glm-5") == 200_000
         assert mr.model_window("gpt-5.6-sol") == 272_000
         assert mr.model_window("gpt-5.6-terra") == 272_000
@@ -110,8 +115,16 @@ class TestModelRegistry:
         assert mr.model_window("qwen3-coder-next") == 256_000
         assert mr.model_window("qwen3-coder-480b") == 256_000
         assert mr.model_window("glm-4.7-flash") == 128_000
-        for m in ("deepseek-3.2", "minimax-m2.5", "glm-5", "gpt-5.6-terra",
-                  "qwen3-coder-next", "glm-4.7-flash"):
+        for m in (
+            "deepseek-3.2",
+            "minimax-m2.5",
+            "minimax-m3",
+            "minimax-m2.7",
+            "glm-5",
+            "gpt-5.6-terra",
+            "qwen3-coder-next",
+            "glm-4.7-flash",
+        ):
             assert mr.has_known_window(m) is True
             assert mr.window_source(m) == "supplementary"
 
@@ -145,7 +158,9 @@ class TestModelRegistry:
         try:
             mr._KIRO_WINDOWS.clear()
             assert mr.model_window("auto") == 200_000  # stale registry literal
-            assert mr.model_window("unlisted-model-zzz") is None  # neither registry nor supplementary
+            assert (
+                mr.model_window("unlisted-model-zzz") is None
+            )  # neither registry nor supplementary
             # refresh does the in-memory update synchronously and returns True
             # when the cache changed (signalling the async caller to persist).
             changed = mr.refresh_kiro_windows(
@@ -161,8 +176,27 @@ class TestModelRegistry:
             assert mr.window_source("auto") == "kiro-list"
             assert mr.model_window("unlisted-model-zzz") == 272000
             assert mr.model_window("bad") is None  # 0 not cached
-            # A no-op refresh (same data) returns False — no persist needed.
-            assert mr.refresh_kiro_windows([{"model_id": "auto", "context_window_tokens": 1000000}]) is False
+            # A no-op refresh (same snapshot) returns False — no persist needed.
+            assert (
+                mr.refresh_kiro_windows(
+                    [
+                        {"model_id": "auto", "context_window_tokens": 1000000},
+                        {"model_id": "unlisted-model-zzz", "context_window_tokens": 272000},
+                    ]
+                )
+                is False
+            )
+            # The catalog is ground truth: a model absent from it is evicted.
+            assert (
+                mr.refresh_kiro_windows([{"model_id": "auto", "context_window_tokens": 1000000}])
+                is True
+            )
+            assert mr.model_window("unlisted-model-zzz") is None
+            # A snapshot with no usable window never wipes a good cache.
+            assert (
+                mr.refresh_kiro_windows([{"model_id": "bad", "context_window_tokens": 0}]) is False
+            )
+            assert mr.model_window("auto") == 1000000
             # persist is a separate step (offloaded to an executor by the caller).
             mr.persist_kiro_windows()
             assert (tmp_path / "model_windows.json").is_file()  # persisted
@@ -176,6 +210,55 @@ class TestModelRegistry:
         assert mr.supports_effort("auto") is None
         # unknown -> None
         assert mr.supports_effort("nonexistent") is None
+
+    def test_released_at_resolves_ids_and_is_none_when_undated(self):
+        assert mr.released_at("opus-4.8-1m") == "2026-05-28"
+        # acp-first fold: kiro's distinct Opus 4.6 keeps its own date.
+        assert mr.released_at("claude-opus-4.6") == "2026-02-05"
+        assert mr.released_at("auto") is None
+        assert mr.released_at("nonexistent") is None
+
+    def test_claude_code_bare_family_aliases_pass_through(self, monkeypatch):
+        # A bare family alias the claude backend advertised is sent UNCHANGED so
+        # Claude Code resolves it to its own current model, rather than being
+        # folded onto the registry's fixed versioned id (which goes stale on each
+        # release).
+        monkeypatch.setattr(
+            mr,
+            "_ADVERTISED_MODELS",
+            {"claude_code": ["default", "opus", "fable", "sonnet", "haiku", "claude-opus-4-8"]},
+        )
+        for alias in ("sonnet", "opus", "haiku", "fable"):
+            assert mr.to_provider_id(alias, "claude_code") == alias, alias
+        # The pass-through is claude_code ONLY: the kiro-family path uses
+        # to_acp_id, and to_provider_id on the acp namespace still resolves the
+        # registry alias to kiro's own id (where it has one).
+        assert mr.to_provider_id("opus", "acp") == "claude-opus-4.8"
+        assert mr.to_provider_id("sonnet", "acp") == "claude-sonnet-4.6"
+        # An explicit versioned id is untouched by the pass-through.
+        assert (
+            mr.to_provider_id("claude-opus-4.8", "claude_code")
+            == "global.anthropic.claude-opus-4-8[1m]"
+        )
+
+    def test_claude_code_alias_folds_when_not_advertised(self, monkeypatch):
+        # Cold cache: nothing was advertised, so the alias folds onto the
+        # registry's versioned provider id.
+        monkeypatch.setattr(mr, "_ADVERTISED_MODELS", {})
+        assert mr.to_provider_id("opus", "claude_code") == "global.anthropic.claude-opus-4-8[1m]"
+        assert (
+            mr.to_provider_id("sonnet", "claude_code") == "global.anthropic.claude-sonnet-4-6[1m]"
+        )
+
+    def test_claude_code_alias_folds_when_backend_advertises_only_versioned_ids(self, monkeypatch):
+        # A backend that advertises only versioned ids (e.g. a Bedrock deployment)
+        # does not advertise the bare alias, so the registry fold applies.
+        monkeypatch.setattr(
+            mr,
+            "_ADVERTISED_MODELS",
+            {"claude_code": ["global.anthropic.claude-opus-4-8[1m]"]},
+        )
+        assert mr.to_provider_id("opus", "claude_code") == "global.anthropic.claude-opus-4-8[1m]"
 
     def test_kiro_dotted_aliases_resolve(self):
         # AIM-managed agents ship kiro dotted ids; they must map deterministically
@@ -223,8 +306,7 @@ class TestModelRegistry:
     def test_fable_5_canonical_round_trip(self):
         # Fable 5 entry: canonical -> provider id -> canonical.
         assert (
-            mr.to_provider_id("fable-5-1m", "claude_code")
-            == "global.anthropic.claude-fable-5[1m]"
+            mr.to_provider_id("fable-5-1m", "claude_code") == "global.anthropic.claude-fable-5[1m]"
         )
         assert (
             mr.from_provider_id("global.anthropic.claude-fable-5[1m]", "claude_code")
@@ -256,7 +338,14 @@ class TestModelRegistry:
         assert mr.from_provider_id("claude-opus-4-7[1m]", "claude_code") == "opus-4.7-1m"
         assert mr.from_provider_id("claude-sonnet-4-6[1m]", "claude_code") == "sonnet-4.6-1m"
 
-    def test_fable_5_not_default(self):
+    @pytest.mark.parametrize(
+        (),
+        [
+            *named_cases("test_fable_5_not_default"),
+            *named_cases("test_default_canonical"),
+        ],
+    )
+    def test_the_claude_code_default_is_canonical(self):
         # Fable 5 is opt-in; Opus 4.8 stays default.
         assert mr.default("claude_code") == "opus-4.8-1m"
 
@@ -283,9 +372,6 @@ class TestModelRegistry:
         assert "global.anthropic.claude-sonnet-4-6[1m]" in ids
         # 'auto' maps to "" and is excluded from the allowlist.
         assert "" not in ids
-
-    def test_default_canonical(self):
-        assert mr.default("claude_code") == "opus-4.8-1m"
 
     def test_from_provider_id_reverse_lookup(self):
         assert (
@@ -374,10 +460,10 @@ class TestAcpProviderIds:
         # index still folds them for claude-agent-acp dropdown dedup/downgrade.
         cases = {
             # kiro id            acp canonical    window   cc fold (downgrade)
-            "claude-haiku-4.5":  ("haiku-4.5",    200_000, "sonnet-4.6-1m"),
-            "claude-sonnet-4.5": ("sonnet-4.5",   200_000, "sonnet-4.6-1m"),
-            "claude-sonnet-4":   ("sonnet-4",     200_000, "sonnet-4.6-1m"),
-            "claude-opus-4.6":   ("opus-4.6-1m", 1_000_000, "opus-4.8-1m"),
+            "claude-haiku-4.5": ("haiku-4.5", 200_000, "sonnet-4.6-1m"),
+            "claude-sonnet-4.5": ("sonnet-4.5", 200_000, "sonnet-4.6-1m"),
+            "claude-sonnet-4": ("sonnet-4", 200_000, "sonnet-4.6-1m"),
+            "claude-opus-4.6": ("opus-4.6-1m", 1_000_000, "opus-4.8-1m"),
         }
         for kiro_id, (acp_canon, win, cc_canon) in cases.items():
             assert mr.from_provider_id(kiro_id, "acp") == acp_canon, kiro_id
@@ -415,12 +501,14 @@ class TestCorruptRegistryFallback:
         # to the SAME provider id in the hardcoded fallback table, so the
         # corrupt-registry path (empty index) rescues any persisted cc_model to a
         # valid provider id instead of leaking a bare canonical key to Bedrock.
+        index = mr._CANONICAL_INDEX["claude_code"]
         for canonical, entry in mr._REGISTRY.items():
-            pid = entry.get("providers", {}).get("claude_code")
-            if pid is None:
+            if entry.get("providers", {}).get("claude_code") is None:
                 continue
             keys = [canonical, *entry.get("aliases", [])]
             for k in keys:
+                # An alias two rows list (bare "opus") resolves to the first row.
+                pid = mr._REGISTRY[index[k]]["providers"]["claude_code"]
                 assert k in mr._FALLBACK_PROVIDER_IDS, (
                     f"{k!r} missing from _FALLBACK_PROVIDER_IDS (corrupt-registry "
                     f"rescue would leak the bare key to Bedrock)"
@@ -530,6 +618,161 @@ class TestAdvertisedModelCache:
         assert mr.refresh_advertised_models("claude_code", []) is False
         assert mr.advertised_models("claude_code") == ["a"]
 
+    def test_refresh_refuses_an_over_long_id_and_says_so_once(self, monkeypatch, caplog):
+        # The id is REFUSED, not truncated: a truncated id names a different
+        # model, or none. The rest of the list is retained, and the overflow is
+        # said once so a shortened list is not read as "never advertised".
+        monkeypatch.setattr(mr, "_ADVERTISED_MODELS", {})
+        too_long = "x" * (mr.ADVERTISED_MODEL_ID_MAX_CHARS + 1)
+        at_limit = "y" * mr.ADVERTISED_MODEL_ID_MAX_CHARS
+        with caplog.at_level("WARNING", logger=mr.logger.name):
+            assert mr.refresh_advertised_models("acp", ["a", too_long, at_limit]) is True
+        assert mr.advertised_models("acp") == ["a", at_limit]
+        assert sum("refused 1 model id(s)" in r.message for r in caplog.records) == 1
+
+    def test_refresh_caps_the_count_at_the_shared_bound(self, monkeypatch, caplog):
+        monkeypatch.setattr(mr, "_ADVERTISED_MODELS", {})
+        ids = [f"m{i}" for i in range(mr.ADVERTISED_MODELS_MAX_IDS + 3)]
+        with caplog.at_level("WARNING", logger=mr.logger.name):
+            assert mr.refresh_advertised_models("acp", ids) is True
+        kept = mr.advertised_models("acp")
+        assert len(kept) == mr.ADVERTISED_MODELS_MAX_IDS
+        assert kept == ids[: mr.ADVERTISED_MODELS_MAX_IDS]
+        assert any("refused 3 model id(s)" in r.message for r in caplog.records)
+        # A duplicate past the cap is still the same id, not a new refusal.
+        caplog.clear()
+        with caplog.at_level("WARNING", logger=mr.logger.name):
+            assert mr.refresh_advertised_models("acp", ids[:5] + ids[:5]) is True
+        assert mr.advertised_models("acp") == ids[:5]
+        assert not caplog.records
+
+    def test_a_refused_id_is_not_readmitted_from_the_sidecar(self, monkeypatch, tmp_path, caplog):
+        # The persisted copy is the same population: an oversized or over-long
+        # entry written by another version must not bypass the refresh bound --
+        # and the loader says what it refused, once, like the refresh does, so a
+        # shortened list is not read as a backend that never named those ids.
+        import json
+
+        path = tmp_path / "pm.json"
+        too_long = "x" * (mr.ADVERTISED_MODEL_ID_MAX_CHARS + 1)
+        ids = [too_long] + [f"m{i}" for i in range(mr.ADVERTISED_MODELS_MAX_IDS + 2)]
+        path.write_text(json.dumps({"acp": ids + ["m0"]}), encoding="utf-8")
+        monkeypatch.setattr(mr, "_ADVERTISED_MODELS", {})
+        monkeypatch.setattr(mr, "_advertised_models_cache_path", lambda: path)
+        with caplog.at_level("WARNING", logger=mr.logger.name):
+            mr._load_advertised_models()
+        kept = mr.advertised_models("acp")
+        assert too_long not in kept
+        assert len(kept) == len(set(kept)) == mr.ADVERTISED_MODELS_MAX_IDS
+        # 1 over-long + 2 past the cap; the duplicate "m0" is neither.
+        assert (
+            sum("sidecar for acp refused 3 model id(s)" in r.message for r in caplog.records) == 1
+        )
+
+    def test_a_refused_window_row_is_not_readmitted_from_the_sidecar(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        # The window sidecar is loaded at import, so the bounds must exist before
+        # that load and be applied inside it: a pre-upgrade oversized file would
+        # otherwise retain every row and persist them all again. The overflow is
+        # said once, like every other store of these ids.
+        import json
+
+        path = tmp_path / "mw.json"
+        too_long = "x" * (mr.ADVERTISED_MODEL_ID_MAX_CHARS + 1)
+        data = {f"m{i}": 1000 for i in range(mr.ADVERTISED_MODELS_MAX_IDS + 2)}
+        data[too_long] = 1000
+        path.write_text(json.dumps(data), encoding="utf-8")
+        monkeypatch.setattr(mr, "_KIRO_WINDOWS", {})
+        monkeypatch.setattr(mr, "_kiro_windows_cache_path", lambda: path)
+        with caplog.at_level("WARNING", logger=mr.logger.name):
+            mr._load_kiro_windows()
+        assert too_long not in mr._KIRO_WINDOWS
+        assert len(mr._KIRO_WINDOWS) == mr.ADVERTISED_MODELS_MAX_IDS
+        assert sum("window sidecar refused 3 model id(s)" in r.message for r in caplog.records) == 1
+
+    def test_the_bounds_are_defined_before_the_import_time_loads(self):
+        # Both sidecar loaders run at import and read the bounds; a constant
+        # defined below the call would be a NameError at import, or a load that
+        # silently ran unbounded.
+        import inspect
+
+        src = inspect.getsource(mr)
+        bounds_at = src.index("ADVERTISED_MODELS_MAX_IDS = ")
+        assert bounds_at < src.index("\n_load_kiro_windows()")
+        assert bounds_at < src.index("\n_load_advertised_models()")
+
+    def test_one_admission_feeds_both_caches(self, monkeypatch, caplog):
+        # Two structures retaining one population (the catalog rows) take ONE
+        # admission answer: an id the count or length bound refuses gets no row
+        # in either cache, and the two hold exactly the same id set.
+        monkeypatch.setattr(mr, "_KIRO_WINDOWS", {})
+        monkeypatch.setattr(mr, "_ADVERTISED_MODELS", {})
+        too_long = "x" * (mr.ADVERTISED_MODEL_ID_MAX_CHARS + 1)
+        rows = [
+            {"model_id": f"m{i}", "model_name": f"m{i}", "context_window_tokens": 1000}
+            for i in range(mr.ADVERTISED_MODELS_MAX_IDS)
+        ]
+        rows.append({"model_id": "one-too-many", "context_window_tokens": 1000})
+        rows.append({"model_id": too_long, "context_window_tokens": 1000})
+        with caplog.at_level("WARNING", logger=mr.logger.name):
+            assert mr.refresh_kiro_catalog(rows, "acp") == (True, True)
+        assert set(mr._KIRO_WINDOWS) == set(mr.advertised_models("acp"))
+        assert len(mr._KIRO_WINDOWS) == mr.ADVERTISED_MODELS_MAX_IDS
+        assert "one-too-many" not in mr._KIRO_WINDOWS
+        assert "one-too-many" not in mr.advertised_models("acp")
+        assert too_long not in mr._KIRO_WINDOWS
+        # Said once for the snapshot, not once per cache.
+        assert sum("refused 2 model id(s)" in r.message for r in caplog.records) == 1
+        assert sum("refused" in r.message for r in caplog.records) == 1
+
+    def test_admission_keeps_an_id_without_a_window_and_evicts_the_stale(self, monkeypatch):
+        # Vocabulary does not depend on the window field: a row with no valid
+        # window is still a kiro id. And a full cache never refuses a NEW
+        # catalog id -- the snapshot replaces the cache, so the two stores
+        # cannot disagree about whether the newest model exists.
+        monkeypatch.setattr(
+            mr, "_KIRO_WINDOWS", {f"old{i}": 1 for i in range(mr.ADVERTISED_MODELS_MAX_IDS)}
+        )
+        monkeypatch.setattr(mr, "_ADVERTISED_MODELS", {})
+        rows = [
+            {"model_id": "new-model", "model_name": "new-model", "context_window_tokens": 272000},
+            {"model_id": "no-window", "model_name": "no-window"},
+        ]
+        assert mr.refresh_kiro_catalog(rows, "acp") == (True, True)
+        assert mr._KIRO_WINDOWS == {"new-model": 272000}
+        assert mr.advertised_models("acp") == ["new-model", "no-window"]
+
+    def test_admission_skips_malformed_rows_and_keeps_order(self):
+        rows = [
+            {"model_id": "a", "model_name": "a", "context_window_tokens": 10},
+            {"model_id": "b-id", "model_name": "b", "context_window_tokens": 20},
+            {"model_id": 3, "model_name": " "},
+            None,
+            {"model_name": "c"},
+        ]
+        ids, windows = mr.admit_catalog_rows(rows)
+        assert ids == ["a", "b-id", "b", "c"]
+        assert windows == {"a": 10, "b-id": 20, "b": 20}
+
+    def test_a_registered_model_is_never_folded_onto_a_different_one(self):
+        assert mr.registered_model_key("global.anthropic.claude-opus-4-8[1m]") == "opus-4.8-1m"
+        assert mr.registered_model_key("claude-opus-4.8") == "opus-4.8-1m"
+        assert mr.registered_model_key("claude-opus-4-8") == "opus-4.8"
+        assert mr.registered_model_key("openai.gpt-9-nova[high]") is None
+        assert mr.same_registered_model("claude-opus-4.8", "claude-opus-4-8") is False
+        assert (
+            mr.same_registered_model("global.anthropic.claude-opus-4-8[1m]", "claude-opus-4.8")
+            is True
+        )
+        # Unknown is not different.
+        assert mr.same_registered_model("openai.gpt-9-nova[high]", "claude-opus-4.8") is True
+        # A hand-typed case variant is the same registered model, not an unknown
+        # one -- otherwise the guard would wave the 200K pin onto the 1M id.
+        assert mr.registered_model_key("CLAUDE-OPUS-4-8") == "opus-4.8"
+        assert mr.registered_model_key("  Global.Anthropic.Claude-Opus-4-8[1M] ") == "opus-4.8-1m"
+        assert mr.same_registered_model("CLAUDE-OPUS-4-8", "claude-opus-4.8") is False
+
     def test_persist_round_trips(self, monkeypatch, tmp_path):
         monkeypatch.setattr(mr, "_ADVERTISED_MODELS", {})
         monkeypatch.setattr(mr, "_advertised_models_cache_path", lambda: tmp_path / "pm.json")
@@ -590,6 +833,36 @@ class TestAdvertisedModelCache:
         served = "global.anthropic.claude-opus-4-8[1m]"
         monkeypatch.setattr(mr, "_ADVERTISED_MODELS", {"claude_code": [served]})
         assert mr.resolve_wire_model_id(served, "claude_code") == served
+
+    def test_wire_id_folds_stored_id_onto_bare_family_alias(self, monkeypatch):
+        # An adapter can advertise the registry's bare family alias ("fable")
+        # instead of the dotted provider id a session stored. The two share no
+        # normalized key, so only the registry entry's own alias bridges them.
+        monkeypatch.setattr(
+            mr, "_ADVERTISED_MODELS", {"claude_code": ["default", "opus", "fable", "sonnet"]}
+        )
+        assert (
+            mr.resolve_wire_model_id("global.anthropic.claude-fable-5[1m]", "claude_code")
+            == "fable"
+        )
+        assert (
+            mr.resolve_wire_model_id("global.anthropic.claude-opus-4-8[1m]", "claude_code")
+            == "opus"
+        )
+
+    def test_wire_id_never_folds_onto_a_substitution_alias(self, monkeypatch):
+        # The Sonnet entry lists "claude-haiku-4.5" as an alias because the
+        # claude backend serves no Haiku. An adapter that DOES advertise it is
+        # serving a different model, so a stored Sonnet id must not fold onto it.
+        monkeypatch.setattr(mr, "_ADVERTISED_MODELS", {"claude_code": ["claude-haiku-4.5"]})
+        stored = "global.anthropic.claude-sonnet-4-6[1m]"
+        assert mr.resolve_wire_model_id(stored, "claude_code") == stored
+
+    def test_wire_id_family_alias_keeps_the_context_window(self, monkeypatch):
+        # "opus" is an alias of the 1M entry only; the 200K Opus must not fold onto it.
+        monkeypatch.setattr(mr, "_ADVERTISED_MODELS", {"claude_code": ["opus"]})
+        stored = "global.anthropic.claude-opus-4-8"
+        assert mr.resolve_wire_model_id(stored, "claude_code") == stored
 
     def test_to_provider_id_unknown_still_passes_through(self, monkeypatch):
         # Guard: the pure translation is unchanged — folding lives in
@@ -658,3 +931,76 @@ class TestImportDoesNotCreateTheDataHome:
         assert mr._advertised_models_cache_path() == data.resolve() / "provider_models.json"
         assert not data.exists(), "resolving a sidecar path must not create the home"
         assert mr._kiro_windows_cache_path().parent == paths.config_dir()
+
+
+_CLAUDE_5X_ROWS = [
+    # (key, its other spellings, claude_code id, acp id ('' where kiro-cli serves none), what
+    # claude-agent-acp 0.94.0 advertises)
+    (
+        "opus-5.5-1m",
+        ("claude-opus-5.5", "claude-opus-5-5", "claude-opus-5-5[1m]"),
+        "global.anthropic.claude-opus-5-5[1m]",
+        "claude-opus-5.5",
+        "opus",
+    ),
+    (
+        "sonnet-5.5-1m",
+        ("claude-sonnet-5.5", "claude-sonnet-5-5", "claude-sonnet-5-5[1m]"),
+        "global.anthropic.claude-sonnet-5-5[1m]",
+        "claude-sonnet-5.5",
+        "sonnet",
+    ),
+    (
+        "fable-5.1-1m",
+        ("claude-fable-5.1", "claude-fable-5-1", "claude-fable-5-1[1m]"),
+        "global.anthropic.claude-fable-5-1[1m]",
+        "",
+        "claude-fable-5-1[1m]",
+    ),
+]
+_CLAUDE_5X_IDS = [row[0] for row in _CLAUDE_5X_ROWS]
+
+
+class TestClaude55Rows:
+    @pytest.mark.parametrize("key, aliases, pid, acp_id, wire", _CLAUDE_5X_ROWS, ids=_CLAUDE_5X_IDS)
+    def test_every_spelling_resolves_to_its_own_1m_row(self, key, aliases, pid, acp_id, wire):
+        for pin in (key, *aliases):
+            assert mr.to_provider_id(pin, "claude_code") == pid, pin
+            assert mr.registered_model_key(pin) == key, pin
+            assert mr.supports_effort(pin) is True, pin
+            assert mr.model_window(pin) == 1_000_000, pin
+
+    @pytest.mark.parametrize("key, aliases, pid, acp_id, wire", _CLAUDE_5X_ROWS, ids=_CLAUDE_5X_IDS)
+    def test_every_spelling_sends_what_claude_agent_acp_0_94_advertises(
+        self, monkeypatch, key, aliases, pid, acp_id, wire
+    ):
+        advertised = ["default", "opus", "claude-fable-5-1[1m]", "sonnet", "haiku"]
+        monkeypatch.setattr(mr, "_ADVERTISED_MODELS", {"claude_code": advertised})
+        for pin in (key, *aliases):
+            stored = mr.to_provider_id(pin, "claude_code")
+            assert mr.resolve_wire_model_id(stored, "claude_code") == wire, pin
+
+    def test_advertised_fable_5_1_folds_onto_its_row(self):
+        assert mr.from_provider_id("claude-fable-5-1[1m]", "claude_code") == "fable-5.1-1m"
+
+    @pytest.mark.parametrize("key, aliases, pid, acp_id, wire", _CLAUDE_5X_ROWS, ids=_CLAUDE_5X_IDS)
+    def test_to_acp_id_gives_the_kiro_dotted_id_or_none(self, key, aliases, pid, acp_id, wire):
+        assert mr.to_acp_id(key) == acp_id
+
+    @pytest.mark.parametrize(
+        "pin",
+        [
+            "claude-fable-5.1",
+            "claude-fable-5-1",
+            "claude-fable-5-1[1m]",
+            "global.anthropic.claude-fable-5-1[1m]",
+        ],
+    )
+    def test_every_fable_5_1_spelling_lacks_an_acp_id(self, pin):
+        assert mr.lacks_acp_id(pin) is True
+
+    @pytest.mark.parametrize(
+        "pin", ["claude-opus-4.8", "claude-opus-5-5", "auto", "", "not-a-registered-model"]
+    )
+    def test_a_kiro_served_row_auto_or_an_unknown_id_does_not_lack_one(self, pin):
+        assert mr.lacks_acp_id(pin) is False

@@ -20,12 +20,14 @@ entries must not re-embed 100k rows. Two guards, in cost order:
    deleted cursor, a restored backup, a teammate's entry that arrived by merge).
 
 Embedding is **deferred**, not inline. ``write_episodic(defer_embedding=True)`` stores
-the row keyword-searchable immediately and leaves the vector NULL; one
-``backfill_missing_embeddings()`` sweep at the end embeds the batch and rebuilds FAISS
-once. Inline embedding costs ~0.4s per 2000-char chunk on CPU, so a 10k import would
-hold the caller for over an hour; deferral turns that into one batched pass. The tradeoff
-is real and documented upstream: a deferred row is absent from *vector* search until the
-sweep runs, so this module always runs it.
+the row keyword-searchable immediately and leaves the vector NULL. Inline embedding
+costs ~0.4s per 2000-char chunk on CPU, so a 10k import would hold the caller for over
+an hour. This module does **not** embed the deferred rows itself: the store it is handed
+has no ``embed_fn``, so a sweep here could only ever return 0. The gateway's paced
+member-memory repair loop (``slack/gateway.py`` ``_repair_member_memory``) binds its
+own embedder and backfills NULL vectors in the same on-disk store, a bounded batch per
+visit. The tradeoff is real: a deferred row is absent from *vector* search (it stays
+keyword-searchable) until that repair loop reaches it.
 
 Deferral also skips the store's similarity dedup (it needs a vector), which is exactly
 why the two guards above are this module's job rather than the store's.
@@ -132,11 +134,17 @@ def import_pending(store: Any, *, limit: int = MAX_PER_IMPORT) -> dict[str, int]
     real SQLite/FAISS pair, and so a caller that already holds the shared store does not
     open a second connection to the same files.
 
-    Returns counts: ``{"scanned", "written", "skipped", "embedded"}``. Never raises —
+    Returns counts: ``{"scanned", "written", "skipped"}``. Rows are written with a NULL
+    vector; the gateway's repair loop embeds them later (see the module docstring).
+    Entries a full store refused count in ``scanned`` but in neither ``written`` nor
+    ``skipped``, and stay off the cursor, so a later import
+    retries them once the cap is raised or an unrelated delete (an operator delete,
+    stale retirement) drops the active count below it; cap eviction by other writers
+    always leaves the count AT the cap. Never raises —
     the index is an enhancement to matching, and failing to build it must not fail the
     cycle that asked for it.
     """
-    result = {"scanned": 0, "written": 0, "skipped": 0, "embedded": 0}
+    result = {"scanned": 0, "written": 0, "skipped": 0}
     try:
         entries = ledger.read_entries()
     except Exception:  # noqa: BLE001 — a ledger fault is reported, never fatal here
@@ -159,50 +167,63 @@ def import_pending(store: Any, *, limit: int = MAX_PER_IMPORT) -> dict[str, int]
             result["skipped"] += 1
             continue
         try:
-            # deferred: the batch is embedded once by the sweep below.
+            # deferred: the gateway's repair loop embeds the row later.
             # preserve_existing: import is merge-only — it must never tombstone a row
             # another writer owns, which is what this flag exists for upstream.
-            wrote = store.write_episodic(
-                text,
-                tags=[SOURCE_TAG, f"confidence:{entry.confidence}", f"trust:{entry.trust}"],
-                importance=_importance(entry),
-                source="ops-ledger-import",
-                preserve_existing=True,
-                defer_embedding=True,
-            )
+            #
+            # The verdict comes from `write_episodic_outcome`, whose capacity
+            # refusal is decided inside the transaction that refused the row.
+            # A separate "is the store full?" probe after a falsy
+            # `write_episodic` would race a concurrent cap raise (`reconfigure`)
+            # or another writer's eviction, and a capacity refusal misread as a
+            # final one would be cursored and never retried.
+            kwargs: dict[str, Any] = {
+                "tags": [SOURCE_TAG, f"confidence:{entry.confidence}", f"trust:{entry.trust}"],
+                "importance": _importance(entry),
+                "source": "ops-ledger-import",
+                "preserve_existing": True,
+                "defer_embedding": True,
+            }
+            verdict = store.write_episodic_outcome(text, **kwargs)
+            outcome = str(getattr(verdict, "value", verdict))
         except Exception:  # noqa: BLE001 — one bad row must not abort the import
             logger.exception("ops-mission-control: failed to index ledger entry %s", entry.entry_id)
             continue
-        newly.add(entry.entry_id)
-        if wrote:
+        if outcome == "written":
+            newly.add(entry.entry_id)
             result["written"] += 1
-        else:
-            # Already present (the store's own prefix-dedup check) — cursor it so the
-            # next import does not pay for the round trip again.
-            result["skipped"] += 1
+            continue
+        if outcome == "at_capacity":
+            # Refused for capacity, not as a duplicate: leave it and every later
+            # entry off the cursor so the next import retries them; a cursored
+            # entry is never offered to the store again. Logged because the
+            # result counts alone read like a caught-up run.
+            logger.warning(
+                "ops-mission-control: ledger index paused, vector store is at its episodic"
+                " cap; %d ledger entries left pending for a later import"
+                " (raise memory.episodic_max_count to resume)",
+                len(pending) - len(newly),
+            )
+            break
+        # Already present (the store's own dedup check) or text the store will
+        # never accept -- cursor it so the next import does not pay for the
+        # round trip again.
+        newly.add(entry.entry_id)
+        result["skipped"] += 1
 
     if newly:
         _write_cursor(cursor | newly)
 
     if result["written"]:
-        try:
-            # PACED, even though a caller blocks on this: the only caller is the
-            # ledger-hygiene CRON (`routes.py:_handle_ledger_hygiene`, "Called by
-            # the ledger-hygiene cron"; no UI path reaches it). A cron holds the
-            # response open but nobody attends it, and the PR's rule is
-            # attendance, not blocking. Left unpaced this was a side door around
-            # the whole fix: the sweep is whole-corpus, so a post-migration
-            # backlog would be re-embedded flat out — at the full interactive
-            # thread count, since `pace=False` also selects the thread class — on
-            # the next daily tick.
-            result["embedded"] = int(store.backfill_missing_embeddings() or 0)
-        except Exception:  # noqa: BLE001 — rows stay keyword-searchable if this fails
-            logger.exception("ops-mission-control: embedding backfill failed")
+        # No embedding sweep here: the store the hygiene route hands over has no
+        # `embed_fn`, so `backfill_missing_embeddings()` would return 0 without
+        # embedding anything. The gateway's paced repair loop embeds these
+        # NULL-vector rows.
         sel().log_api_access(
             caller="core:ops-mission-control",
             operation="ledger_index_import",
             outcome="success",
-            resources=f"written={result['written']} embedded={result['embedded']}",
+            resources=f"written={result['written']}",
         )
     return result
 
@@ -224,7 +245,13 @@ def _importance(entry: LedgerEntry) -> float:
     return min(1.0, score)
 
 
-def search_similar(store: Any, query: str, *, limit: int = 5) -> list[dict]:
+def search_similar(
+    store: Any,
+    query: str,
+    *,
+    limit: int = 5,
+    query_embedding: list[float] | None = None,
+) -> list[dict]:
     """Ledger-derived memories similar to ``query``, most relevant first.
 
     Tag-filtered to ``SOURCE_TAG`` so an ops investigation searching for a failure does
@@ -239,6 +266,7 @@ def search_similar(store: Any, query: str, *, limit: int = 5) -> list[dict]:
     try:
         return list(
             store.search_episodic(
+                query_embedding=query_embedding,
                 query_text=query,
                 limit=limit,
                 tag_filter=[SOURCE_TAG],

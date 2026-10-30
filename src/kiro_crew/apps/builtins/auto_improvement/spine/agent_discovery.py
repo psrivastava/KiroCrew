@@ -56,9 +56,10 @@ from pathlib import Path
 from typing import Any, Callable
 
 from kiro_crew.llm_helpers import _extract_json_of_type
+from kiro_crew.owner_only_files import ensure_directory, owner_only_opener_for
 from kiro_crew.subprocess_utf8 import UTF8_TEXT
 
-from .git_safety import GIT_SAFE_CONFIG, require_pinned
+from .git_safety import GIT_SAFE_CONFIG, hook_off_args, require_pinned
 
 # How many agent-discovered surfaces to keep per cycle. The agent is asked for a small,
 # high-signal set (not an exhaustive audit) — each surface costs a full bounded
@@ -83,6 +84,8 @@ _LOW_VALUE_MARKERS = (
     "/routes.py",
     "/mcp_server.py",
     "/bridges.py",
+    "/bridges_",
+    "/apps/routes_",
     "/manifest",
 )
 # High-value substrings — pure logic likely to hold a unit-testable defect. Ranked first.
@@ -109,8 +112,8 @@ _HIGH_VALUE_MARKERS = (
 #: Trusted git config for host-side git over the agent-writable clone — same as the sibling
 #: helpers. Discovery's `diff`/`grep`/`log` run on the HOST over the clone the agent can edit,
 #: and `diff` (like `status`) consults+spawns `core.fsmonitor`; hooks run via `core.hooksPath`.
-#: `-c` overrides on OUR argv beat the repo config. Part of the D-120 hook-hardening class
-#: (Opus 5 review pressed on completeness across every host-side git helper). Raised by review.
+#: `-c` overrides on OUR argv beat the repo config. Part of the D-120 hook-hardening class,
+#: which covers every host-side git helper.
 _GIT_SAFE_CONFIG = GIT_SAFE_CONFIG
 
 
@@ -127,7 +130,7 @@ def _git(args: list[str], cwd: Path, timeout: float = 60.0) -> str:
     where = str(Path(cwd).absolute())
     try:
         proc = subprocess.run(
-            ["git", "-C", where, *_GIT_SAFE_CONFIG, *args],
+            ["git", "-C", where, *_GIT_SAFE_CONFIG, *hook_off_args(where), *args],
             capture_output=True,
             timeout=timeout,
             cwd=where,
@@ -244,6 +247,52 @@ def _module_name_for(rel: str) -> str:
     return stem
 
 
+#: Top-level folders that can hold an ``__init__.py`` but are never the source a
+#: discovery scan reads.
+_NOT_SOURCE_DIRS = frozenset({"tests", "test", "docs", "examples", "scripts", "build", "dist"})
+
+#: The prompt's words for a repo whose source folder could not be narrowed.
+REPO_ROOT_LABEL = "the repository root"
+
+
+def _packages_in(parent: Path) -> list[str]:
+    """Names of the importable packages directly under *parent*, sorted."""
+    try:
+        entries = sorted(parent.iterdir())
+    except OSError:
+        return []
+    return [
+        entry.name
+        for entry in entries
+        if entry.is_dir() and not entry.name.startswith(".") and (entry / "__init__.py").is_file()
+    ]
+
+
+def source_root(clone: Path) -> str:
+    """The repo-relative folder holding the target's Python source, or ``"."``.
+
+    ``src/kiro_crew`` first, so a scan of this repository reads what it always read.
+    Then a ``src/`` layout: its one package, or ``src`` itself when it holds none or
+    several. Then a flat layout: the one top-level package, skipping test, doc and
+    script folders. Anything else is the whole repository, so a layout this does not
+    recognise still gets read rather than pointed at a folder that does not exist.
+    """
+    root = Path(clone)
+    if (root / "src" / "kiro_crew").is_dir():
+        return "src/kiro_crew"
+    if (root / "src").is_dir():
+        packages = _packages_in(root / "src")
+        return f"src/{packages[0]}" if len(packages) == 1 else "src"
+    packages = [name for name in _packages_in(root) if name not in _NOT_SOURCE_DIRS]
+    return packages[0] if len(packages) == 1 else "."
+
+
+def _dependents_search_root(clone: Path) -> str:
+    """Where :func:`dependents_of` looks for importers: all of ``src`` when the repo has
+    one (a caller may live in a sibling package), else :func:`source_root`."""
+    return "src" if (Path(clone) / "src").is_dir() else source_root(clone)
+
+
 def dependents_of(clone: Path, changed: list[str], *, limit: int = 24) -> dict[str, list[str]]:
     """Map each changed file → the OTHER source files that import/reference its module
     (the "surrounding code that uses the new functionality"). A cheap dependency probe:
@@ -252,9 +301,7 @@ def dependents_of(clone: Path, changed: list[str], *, limit: int = 24) -> dict[s
     Not a precise import graph (no AST) — a deliberately cheap, dependency-direction hint so
     the agent knows which callers to read when judging whether a change broke a CONTRACT its
     users rely on. Capped so a hot module (imported everywhere) doesn't flood the prompt."""
-    src_dir = Path(clone) / "src"
-    if not src_dir.exists():
-        return {}
+    search_root = _dependents_search_root(clone)
     out: dict[str, list[str]] = {}
     for rel in changed:
         leaf = _module_name_for(rel)
@@ -262,7 +309,7 @@ def dependents_of(clone: Path, changed: list[str], *, limit: int = 24) -> dict[s
             continue
         # Find files that import this leaf (``import leaf`` / ``from … import leaf`` /
         # ``from …leaf import``). Exclude the file itself + tests.
-        res = _git_grep_imports(clone, leaf)
+        res = _git_grep_imports(clone, leaf, search_root)
         deps = [f for f in res if f != rel and not _is_test_path(f)]
         if deps:
             out[rel] = deps[:6]  # a handful of representative callers per changed file
@@ -271,12 +318,14 @@ def dependents_of(clone: Path, changed: list[str], *, limit: int = 24) -> dict[s
     return out
 
 
-def _git_grep_imports(clone: Path, leaf: str) -> list[str]:
-    """Repo-relative source files that mention ``leaf`` in an import statement. Uses
-    ``git grep`` (fast, respects tracked files); returns [] on any failure."""
+def _git_grep_imports(clone: Path, leaf: str, root: str = "src") -> list[str]:
+    """Repo-relative source files under *root* that mention ``leaf`` in an import
+    statement. Uses ``git grep`` (fast, respects tracked files); returns [] on any
+    failure."""
     # Match: `import leaf`, `import leaf as`, `from x import leaf`, `from x.leaf import`
     pattern = rf"(import|from).*\b{re.escape(leaf)}\b"
-    out = _git(["grep", "-lE", pattern, "--", "src/"], clone, timeout=60.0)
+    pathspec = "." if root == "." else f"{root}/"
+    out = _git(["grep", "-lE", pattern, "--", pathspec], clone, timeout=60.0)
     return [ln.strip() for ln in out.splitlines() if ln.strip().endswith(".py")]
 
 
@@ -350,8 +399,8 @@ def _normalize_surface(
     default_rule: str,
 ) -> dict | None:
     """Coerce one agent-emitted record into the canonical surface-dict shape
-    ``{target, rule, message, file, line, symbol, hypothesis}`` (identical to what
-    ``build_gate.discover_defect_surfaces`` returns), or None if it lacks a usable file.
+    ``{target, rule, message, file, line, symbol, hypothesis}`` (the shape
+    ``_candidate_from`` consumes), or None if it lacks a usable file.
 
     Defensive: the agent controls these strings, so we validate the file is a real
     repo-relative source path (and, when scoped, inside the change set) before trusting
@@ -506,7 +555,7 @@ def _build_prompt(
         )
     # SKIP-LIST: loci already terminal in the ledger (filed/committed/failed_gate/duplicate
     # …). Re-proposing them wastes a full investigation read + is dropped downstream by the
-    # dedup gate anyway, so tell the agent up front NOT to report them — it spends its 6-read
+    # dedup gate anyway, so tell the agent up front NOT to report them — it spends its 8-read
     # budget on genuinely NEW surfaces (operator: discovery re-emits already-terminal
     # candidates every cycle). Capped so a long ledger can't blow the prompt budget.
     skip_block = ""
@@ -569,9 +618,10 @@ def _diag_log(log_dir: Path | None, payload: dict) -> None:
         return
     try:
         log_dir = Path(log_dir)
-        log_dir.mkdir(parents=True, exist_ok=True)
+        ensure_directory(log_dir)
         line = json.dumps(payload, default=str)
-        with open(log_dir / "agent_discovery.log", "a", encoding="utf-8") as fh:
+        log_path = log_dir / "agent_discovery.log"
+        with open(log_path, "a", encoding="utf-8", opener=owner_only_opener_for(log_path)) as fh:
             fh.write(line + "\n")
     except Exception:  # noqa: BLE001 — logging must never break discovery
         pass
@@ -599,8 +649,8 @@ def discover_surfaces_via_agent(
     cycle — coverage rotates across all files over the loop's cycles (operator directive:
     do not limit the search space; rotate rather than cut).
 
-    Same return shape as ``build_gate.discover_defect_surfaces`` so the caller treats both
-    sources identically: ``{target, rule, message, file, line, symbol, hypothesis}``.
+    The surface dicts the caller (``_candidate_from``) consumes, in the shape every
+    discovery source emits: ``{target, rule, message, file, line, symbol, hypothesis}``.
 
     Args:
       runner: an AgentRunner / SessionAgentRunner (anything with ``.run(prompt, ...)``
@@ -658,8 +708,8 @@ def discover_surfaces_via_agent(
     # every focus file (rendered compactly as a priority slice + the rest).
     changed = prioritize_focus(all_changed, rotate=rotate)
     dependents = dependents_of(Path(clone), changed) if changed else {}
-    src_dir = Path(clone) / "src" / "kiro_crew"
-    src_label = "src/kiro_crew" if src_dir.exists() else "src"
+    root = source_root(Path(clone))
+    src_label = REPO_ROOT_LABEL if root == "." else root
     prompt = _build_prompt(
         src_label=src_label,
         changed=changed,

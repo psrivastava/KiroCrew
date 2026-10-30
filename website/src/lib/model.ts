@@ -98,7 +98,7 @@ export function displayModel(
   if (shown !== 'auto') return shown
   const inherited = normalizeModelKey(effective)
   if (!inherited || inherited === 'auto') return shown
-  const row = models.find(m => normalizeModelKey(m.name) === inherited)
+  const row = models.find(m => m.name === effective) ?? models.find(m => normalizeModelKey(m.name) === inherited)
   return row ? row.name : shown
 }
 
@@ -122,8 +122,11 @@ function displayPinnedModel(
   // normalized (dotted vs dashed, case) but `ModelDropdownList` highlights on
   // exact `activeModel === m.name`, so handing back the raw pin would show a
   // model in the chip that checks no row — e.g. a config pin `claude-opus-4.8`
-  // against an advertised `claude-opus-4-8`.
-  const match = models.find(m => normalizeModelKey(m.name) === key)
+  // against an advertised `claude-opus-4-8`. An exact id match wins first,
+  // because two distinct advertised ids can share one normalized key (e.g.
+  // `fable` and `claude-fable-5`), and the first normalized match would check
+  // the wrong row.
+  const match = models.find(m => m.name === pinned) ?? models.find(m => normalizeModelKey(m.name) === key)
   // Verdict says runnable: show it even when the list omits the row. There is no
   // row to highlight in that case, which is inherent — a filtered-out model
   // cannot be a picker row — and naming the user's actual pin beats naming
@@ -148,4 +151,33 @@ export function pinIsWithheld(pinned: string, shown: string): boolean {
   // without it "nothing pinned" would read as withheld and disable the row.
   if (!key || key === 'auto') return false
   return normalizeModelKey(shown) === 'auto'
+}
+
+/** The marker the composer chip puts beside the model it names.
+ *
+ *  `default` only when that model IS the Settings default and the slot takes it
+ *  from there: the session was served it, or a slot with no model of its own
+ *  resolved to it through an agent that pins nothing. `auto` when the session
+ *  was served a different model for a slot that picked Auto or holds a
+ *  withheld pin, i.e. a model chosen for the user. No marker otherwise: a pin,
+ *  an agent's own model, or a default this surface cannot see (`null`).
+ *
+ *  `shown` / `pinShown` are `displayModel` with and without `served_model`.
+ */
+export function modelChipMarker(
+  slotModel: string,
+  shown: string,
+  pinShown: string,
+  settingsDefault: string | null,
+  agentPinned = false,
+): 'default' | 'auto' | null {
+  const key = normalizeModelKey(shown)
+  if (!key || key === 'auto' || settingsDefault === null) return null
+  const slotKey = normalizeModelKey(slotModel)
+  const isDefault = !!settingsDefault && normalizeModelKey(settingsDefault) === key
+  if (key !== normalizeModelKey(pinShown)) {
+    if (isDefault) return 'default'
+    return slotKey ? 'auto' : null
+  }
+  return !slotKey && !agentPinned && isDefault ? 'default' : null
 }

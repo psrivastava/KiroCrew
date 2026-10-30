@@ -3,12 +3,13 @@ import { useQuery } from '@tanstack/react-query'
 import { FolderTree, Folder, File, GitBranch } from 'lucide-react'
 import Clickable from '../../components/Clickable'
 import { fileExplorerApi } from './api'
-import { basename, parentChain } from './utils'
+import { crumbLabel, parentChain } from './utils'
 import { useDebouncedValue } from './hooks'
 import type { GitInfo, TreeEntry } from './types'
 
 import { i18nT } from '../../i18n/t'
 import { useImeGuard } from '../../hooks/useImeGuard'
+import { usePointerMotion } from '../../hooks/usePointerMotion'
 interface PathBarProps {
   rootPath: string
   gitInfo: GitInfo | null
@@ -22,6 +23,9 @@ export default function PathBar({ rootPath, gitInfo, onChangeRoot, onNavigate }:
   const [draft, setDraft] = useState(rootPath)
   const [open, setOpen] = useState(false)
   const [activeIdx, setActiveIdx] = useState(-1)
+  // Hover picks a suggestion only on real pointer motion, so a list refreshed under
+  // a resting pointer leaves Enter committing the typed path.
+  const pointerMoved = usePointerMotion(open)
   const inputRef = useRef<HTMLInputElement>(null)
   const containerRef = useRef<HTMLDivElement>(null)
 
@@ -102,7 +106,7 @@ export default function PathBar({ rootPath, gitInfo, onChangeRoot, onNavigate }:
                     key={s.path}
                     className={'mc-fe-ac-row' + (i === activeIdx ? ' is-active' : '')}
                     onMouseDown={(e) => { e.preventDefault(); accept(s) }}
-                    onMouseEnter={() => setActiveIdx(i)}
+                    onMouseMove={(e) => { if (pointerMoved(e)) setActiveIdx(i) }}
                     role="option"
                     tabIndex={-1}
                     aria-selected={i === activeIdx}
@@ -121,7 +125,7 @@ export default function PathBar({ rootPath, gitInfo, onChangeRoot, onNavigate }:
               <span key={`seg${i}`}>
                 {i > 0 && <span className="mc-fe-bc-sep">/</span>}
                 <span className="mc-fe-bc" onClick={(e) => { e.stopPropagation(); onChangeRoot(s) }} role="button" tabIndex={0} onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.stopPropagation(); onChangeRoot(s) } }}>
-                  {i === 0 ? '/' : basename(s) || s}
+                  {i === 0 ? '/' : crumbLabel(s) || s}
                 </span>
               </span>
             ))}
