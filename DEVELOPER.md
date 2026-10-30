@@ -118,6 +118,24 @@ this via the existing "Crew sandbox stands down" note (no new i18n key).
 Inert off macOS: Linux namespace isolation and the Windows no-backend policy are
 unchanged.
 
+### 2.3 Updates: never from the upstream feed
+
+Upstream's desktop updater follows `https://updates.crew.kiro.dev/feed`, which
+serves **upstream Kiro Crew** builds. Left alone it would download one in the
+background and, on install, replace `CCrew.app` with upstream's app.
+
+| Path | CCrew behaviour | Where |
+|---|---|---|
+| Desktop (Electron) updater | Under the CCrew identity (`isCCrew()`, i.e. a `CCREW=1` build) the install reads as **externally managed**: the updater is never armed and the feed is never contacted. About shows "Updates are managed by CCrew (rebuild from the fork)". A real `EXTERNALLY-MANAGED` marker still wins. | `website/electron/auto-update.js` (`isCCrewBuild`, `CCREW_UPDATE_OWNER`); tests in `test/auto-update.managed.test.js` |
+| Desktop backend self-update | Already off: the `.app` is stamped `dmg` and defers to the Electron updater above. | `platform/update_capability.py` |
+| Dev checkout (`./ccrew.sh`) | `auto_update` stays on but only ever fast-resets to the **tracked** remote, i.e. `origin` = `psrivastava/KiroCrew`. It refuses when the tree is dirty or ahead of `origin`, so local work is never reset away. Never set a branch to track `upstream`. | `slack/gateway_runtime/update_apply.py` |
+
+To update CCrew: sync upstream (§9), rebuild (§8.1), and replace the `.app`.
+
+Also kept out of the CCrew app for coexistence: upstream's `kirocrew://` URL
+scheme registration (`build.protocols` in `website/electron/package.json`). If
+CCrew registered it too, CCrew.app could take KiroCrew's deep links.
+
 ---
 
 ## 3. UI features added

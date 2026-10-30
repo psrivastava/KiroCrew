@@ -21,6 +21,9 @@ function makeDeps(opts = {}) {
     // Externally-managed verdict. null (the default) = not managed, decided
     // here so no test's outcome depends on the host filesystem.
     externallyManaged = null,
+    // CCrew edition verdict. false (the default) = the upstream identity,
+    // decided here so no test's outcome depends on KIROCREW_CCREW in the env.
+    isCCrewBuild = false,
   } = opts;
   const calls = { setFeedURL: [], checkForUpdates: 0, downloadUpdate: 0, quitAndInstall: [] };
   const handlers = {};
@@ -56,6 +59,7 @@ function makeDeps(opts = {}) {
     // whatever the host filesystem happens to allow.
     probeBundleWritable: () => bundleWritable,
     externallyManaged,
+    isCCrewBuild: () => isCCrewBuild,
     feedBase: "https://cdn.example.dev/feed",
     onUpdateState: (s) => states.push(s),
     log: { info: () => {}, warn: () => {}, error: () => {} },

@@ -436,6 +436,9 @@ function isBundleContainerWritable(resourcesPath) {
 }
 
 const DEFAULT_FEED_BASE = "https://updates.crew.kiro.dev/feed";
+// Who owns updates for a CCrew install (shown in Settings > About): the fork is
+// rebuilt from source, never updated from the upstream feed.
+const CCREW_UPDATE_OWNER = "CCrew (rebuild from the fork)";
 const CHECK_INTERVAL_MS = 4 * 60 * 60 * 1000; // every 4h while running
 const LAUNCH_CHECK_DELAY_MS = 30 * 1000; // let startup settle first
 
@@ -985,6 +988,9 @@ function initAutoUpdate(deps) {
     // assertable in tests without a real marker file. undefined = read the
     // marker from disk; null = not managed; object = managed.
     externallyManaged = undefined,
+    // Whether this shell is the CCrew edition (ccrew-identity.js), injected so
+    // tests can assert the CCrew gate without a packaged manifest.
+    isCCrewBuild = () => require("./ccrew-identity").isCCrew(),
     // Electron's NATIVE autoUpdater, used only to observe
     // `before-quit-for-update` -- the signal that the platform installer has
     // actually taken over (see forceExitFailsafe). electron-updater drives it
@@ -1016,9 +1022,16 @@ function initAutoUpdate(deps) {
   // Externally-managed verdict. Resolved once and BEFORE getInfo() is defined,
   // for the same temporal-dead-zone reason as `linux` above: the early-return
   // stub below hands getInfo out, and getInfo reports the marker's metadata.
-  const managed = externallyManaged !== undefined
+  const markerVerdict = externallyManaged !== undefined
     ? externallyManaged
     : readExternallyManaged({ resourcesPath });
+  // CCrew: the feed above serves upstream Kiro Crew builds, so following it
+  // would replace this fork's app with upstream's. A CCrew install updates by
+  // rebuilding the fork, which is exactly the bare-marker case: someone else
+  // owns updates and gave us no command, so the updater is never armed and the
+  // feed is never contacted. A real marker on disk still wins.
+  const managed = markerVerdict
+    || (isCCrewBuild() ? { managedBy: CCREW_UPDATE_OWNER, updateCommand: "", checkCommand: "" } : null);
 
   // When the in-app UI is wired (onUpdateState provided), it owns the prompt;
   // the native dialog stays as the fallback for headless / no-renderer cases.

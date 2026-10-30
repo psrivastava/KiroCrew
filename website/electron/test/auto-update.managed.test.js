@@ -1264,3 +1264,36 @@ test("managed command env is CONSTRUCTED: nothing the shell reads as code is inh
   assert.match(src, /System32\\\\cmd\.exe`/, "managedShell() must pin the system cmd.exe on win32");
   assert.strictEqual(optsList[0].cwd, "/");
 });
+
+// ---------------------------------------------------------------------------
+// CCrew edition. The default feed serves upstream Kiro Crew builds, so a CCrew
+// app that followed it would be replaced by upstream's. Under the CCrew
+// identity the install reads as externally managed: never armed, feed never
+// contacted, About shows who owns updates.
+// ---------------------------------------------------------------------------
+
+test("CCrew build never arms the updater or contacts the upstream feed", () => {
+  const { deps, calls } = makeDeps({ isCCrewBuild: true });
+  const u = initAutoUpdate(deps);
+  assert.strictEqual(u.disabled, "externally-managed");
+  assert.strictEqual(calls.setFeedURL.length, 0, "the upstream feed must never be contacted");
+  assert.strictEqual(calls.checkForUpdates, 0);
+  assert.match(u.getInfo().managedBy, /CCrew/);
+  assert.strictEqual(u.getInfo().channelSwitchable, false);
+});
+
+test("a real EXTERNALLY-MANAGED marker still wins over the CCrew default", () => {
+  const { deps } = makeDeps({
+    isCCrewBuild: true,
+    externallyManaged: { managedBy: "internal-registry", updateCommand: "", checkCommand: "" },
+  });
+  assert.strictEqual(initAutoUpdate(deps).getInfo().managedBy, "internal-registry");
+});
+
+test("the upstream identity keeps its self-updating lane", () => {
+  const { deps } = makeDeps({ isCCrewBuild: false });
+  const u = initAutoUpdate(deps);
+  assert.strictEqual(u.disabled, undefined);
+  assert.strictEqual(u.getInfo().managedBy, "");
+});
+
