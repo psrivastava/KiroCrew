@@ -246,8 +246,7 @@ async def reset(
             # Order matters: the holder is recorded BEFORE its waiters are
             # woken, so the successor a woken waiter creates is already
             # shielded from the holder's late release.
-            self._orphan_turn_holder(key, session)
-            self._wake_turn_waiters(session)
+            self.retire_turn_permit(key, session)
             # Same event-loop tick as the pop, for the reason the clear_sid
             # call below documents: the awaits further down let a racing cold
             # start register a SUCCESSOR under this key, and recording the
@@ -463,9 +462,13 @@ async def remove(self: SessionLifecycleService, key: str) -> None:
         self._origin_links.pop(key, None)
         self.state.stop_requests.pop(key, None)
         self._discard_replay_gap(key)
-        self.state.orphaned_holders.pop(key, None)
+        # ``orphaned_holders`` is deliberately kept: a holder an earlier reset
+        # recorded still owes its late release, and dropping the record would
+        # let that release unlock the next session registered under the key.
         self._release_turn_ceiling(key, requested_key)
         if session is not None:
+            # Before the await below, in the same lock hold as the pop: see reset.
+            self.retire_turn_permit(key, session)
             # Same tick as the pop: see reset for why recording after the
             # teardown awaits would consume a successor's start.
             await record_session_ended(key, end_reason=END_REASON_REMOVED)
@@ -567,7 +570,8 @@ async def remove_if_unclaimed(self: SessionLifecycleService, key: str) -> bool:
             self._origin_links.pop(key, None)
             self.state.stop_requests.pop(key, None)
             self._discard_replay_gap(key)
-            self.state.orphaned_holders.pop(key, None)
+            # ``orphaned_holders`` is kept, as in ``remove``. The popped permit is
+            # idle (checked above), so there is no holder to record or waiter to wake.
             self._release_turn_ceiling(key, requested_key)
             # Same tick as the removal: see reset.
             await record_session_ended(key, end_reason=END_REASON_UNCLAIMED)
@@ -640,8 +644,11 @@ async def destroy(
         owner._compact_pending_verdict.pop(key, None)
         self.state.stop_requests.pop(key, None)
         self._discard_replay_gap(key)
-        self.state.orphaned_holders.pop(key, None)
+        # ``orphaned_holders`` is kept, as in ``remove``.
         self._release_turn_ceiling(key, requested_key)
+        if session is not None:
+            # Same lock hold as the pop, before any await: see reset.
+            self.retire_turn_permit(key, session)
         # Ordinary permanent destroy starts a new conversation on reuse and
         # therefore clears the old threshold. History deletion can race a
         # same-key transcript claim in another process, so its explicit
@@ -769,6 +776,7 @@ async def discard_conversation(
     replay: bool = True,
     skip_if_busy: bool = False,
     refuse_only_on_active_turn: bool = False,
+    refuse_if: Callable[[], bool] | None = None,
 ) -> bool:
     """Drop only the native conversation while preserving channel linkage.
 
@@ -788,6 +796,18 @@ async def discard_conversation(
     invisible to ``has_active_turn`` and is exactly the case a caller-side
     pre-check cannot close.
 
+    ``refuse_if`` extends that same contract to busy-ness this layer cannot
+    see. ``skip_if_busy`` reads the session; a caller whose own idea of busy
+    lives elsewhere — a dashboard slot holding an admission reservation that
+    has not yet reached a semaphore — has nothing here to read it from, and a
+    pre-call check of its own leaves the window above: acquiring
+    ``owner._lock`` can wait arbitrarily long, because another key's teardown
+    holds it across ``record_session_ended``. So the predicate is evaluated
+    HERE, in the same lock hold as the busy check and the pop, and a true
+    answer refuses exactly as ``skip_if_busy`` does, changing nothing. It
+    must be synchronous: an await inside the lock hold would reopen the very
+    window it closes.
+
     The sid clear runs in the SAME event-loop tick as the pop, with no await
     between them, so a cold start racing this teardown cannot have mapped a
     replacement sid for the key by the time it runs — the clear can never
@@ -799,6 +819,8 @@ async def discard_conversation(
     requested_key = key
     key = owner._fold_key(key)
     async with owner._lock:
+        if refuse_if is not None and refuse_if():
+            return False
         current = owner._sessions.get(key)
         if skip_if_busy and _turn_in_flight(
             current, refuse_only_on_active_turn=refuse_only_on_active_turn
@@ -821,6 +843,8 @@ async def discard_conversation(
         else:
             self._suppress_replay.add(key)
         if session is not None:
+            # Before the await below, in the same lock hold as the pop: see reset.
+            self.retire_turn_permit(key, session)
             # Same lock hold as the pop, exactly like the clear_sid below.
             await record_session_ended(key, end_reason=END_REASON_DISCARDED)
     # The registry lock, not an absence of suspension points, is what keeps a

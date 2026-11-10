@@ -10,10 +10,11 @@ and a patch of the method on the class or on an instance reaches every caller.
 Instance fields written: ``_claude_inline_settings``,
 ``_claude_local_settings_excluded``, ``_claude_settings_authored``,
 ``_claude_settings_claim_unrevoked``, ``_claude_settings_shared``,
-``_claude_settings_written``, ``_permission_surface_share_validated``.
+``_claude_settings_written``, ``_permission_surface_share_validated``,
+``claude_mode_pinned_notice``.
 
 Instance fields read: ``_agent``, ``_model``, ``_permission_mode``, ``_seed_owner``,
-``_work_dir``.
+``_session_key``, ``_work_dir``.
 """
 
 from __future__ import annotations
@@ -33,6 +34,8 @@ from kiro_crew.acp import seed_provenance
 from kiro_crew.acp.claude_settings_sources import other_sources_define_available_models
 from kiro_crew.acp.runtime_models import DEFAULT_MODEL
 from kiro_crew.acp.session_mcp import session_mcp_deny_rules
+from kiro_crew.acp.spec_tools_allowlists import claude_ask_rules, session_allowlist_spec
+from kiro_crew.agent_sdk.backends import ACP_BACKENDS_CREW_ENFORCES_SPEC_TOOLS_SETTINGS
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.security import is_sensitive_path
 
@@ -274,10 +277,27 @@ def _render_claude_settings_payload(self: AcpClient) -> str:
     if self._permission_mode:
         perms["defaultMode"] = self._permission_mode
     # Same resolution as the wire array: a project-only agent's disabledTools
-    # are a restriction, and resolving only the user level would drop them.
-    deny_rules = session_mcp_deny_rules(self._agent, work_dir=self._work_dir)
+    # are a restriction, and resolving only the user level would drop them. A
+    # crewmate's worker reads its own per-session spec, keyed by the session.
+    from kiro_crew.acp.session_mcp_crewmate import crewmate_worker_deny_rules
+
+    deny_rules = crewmate_worker_deny_rules(
+        self._agent,
+        work_dir=self._work_dir,
+        session_key=self._session_key or "",
+        backend=self.backend,
+    )
+    if deny_rules is None:
+        deny_rules = session_mcp_deny_rules(self._agent, work_dir=self._work_dir)
     if deny_rules:
         perms["deny"] = list(deny_rules)
+    # The spec's `toolsSettings` shell and write allowlists are refused at Crew's
+    # gate, which sees only a call claude asks about; these rules make the shell and
+    # the file-write tools ask while either is set (`spec_tools_allowlists`).
+    if self.backend in ACP_BACKENDS_CREW_ENFORCES_SPEC_TOOLS_SETTINGS and self._agent:
+        ask_rules = claude_ask_rules(session_allowlist_spec(self._agent, self._work_dir))
+        if ask_rules:
+            perms["ask"] = ask_rules
     if perms:
         data["permissions"] = perms
     # Namespace-keyed (claude_code here), the registry index this backend's ids
@@ -353,8 +373,11 @@ def _write_claude_local_settings(self: AcpClient) -> None:
        ``bypassPermissions``; every other mode keeps forwarding tool
        decisions to the host as ``session/request_permission``, which is what
        puts a claude session under the same gate kiro-cli sessions run under.
-       Omitted when no mode was requested, leaving the adapter's own default
-       (ask) rather than asserting one.
+       Omitted when no mode was requested: the user's own settings then name
+       the starting mode. With ``KIROCREW_CC_PIN_INHERITED_MODE`` on,
+       :meth:`_pin_claude_starting_mode` moves an ``auto`` or
+       ``bypassPermissions`` start of a session that carries Crew's tools to
+       ``default``.
     2. ``permissions.deny``, from
        :func:`~kiro_crew.acp.session_mcp.session_mcp_deny_rules`: the agent
        spec's ``disabledTools`` cannot ride along in the ``mcpServers`` array,
@@ -419,6 +442,7 @@ def _write_claude_local_settings(self: AcpClient) -> None:
     # Re-decided on every run; only the foreign-file branch below sets it.
     self._claude_local_settings_excluded = False
     self._claude_inline_settings = None
+    self.claude_mode_pinned_notice = ""
     if not _claude_settings_usable(local_settings):
         # A symlink, or a sensitive resolved target: creating the file would
         # follow the link and write Crew's settings through it. Left entirely
@@ -775,7 +799,9 @@ def _write_claude_local_settings(self: AcpClient) -> None:
                         break
                     time.sleep(0.05)
                 self._invalidate_session_mcp_projection()
-                self._log_declined_share(local_settings)
+                # The same guarded exclusion as a file that was there before.
+                if not self._exclude_foreign_local_settings(local_settings, payload):
+                    self._log_declined_share(local_settings)
                 return
             with os.fdopen(fd, "wb") as handle:
                 handle.write(payload.encode("utf-8"))

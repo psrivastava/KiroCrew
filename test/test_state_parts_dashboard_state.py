@@ -49,7 +49,7 @@ _BASE_STATE_MEMBERS: dict[str, tuple[str, bool, bool, str]] = {
         False,
         False,
         "(self, session_key: 'str', approval_id: 'str', approved: "
-        "'bool', decision: 'str' = '') -> 'None'",
+        "'bool', decision: 'str' = '', *, instance: 'str' = '') -> 'None'",
     ),
     "_audit_approval": (
         "function",
@@ -59,6 +59,12 @@ _BASE_STATE_MEMBERS: dict[str, tuple[str, bool, bool, str]] = {
         "decision: 'str' = '') -> 'None'",
     ),
     "_background_turn_sema": ("function", False, False, "(self) -> 'asyncio.Semaphore'"),
+    "_bridge_note": (
+        "function",
+        False,
+        False,
+        "(self, note: 'dict[str, Any]', publisher: 'str' = '') -> 'None'",
+    ),
     "_broadcast": ("function", False, False, "(self, note: 'dict[str, Any]') -> 'None'"),
     "_broadcast_chat_message": (
         "function",
@@ -101,6 +107,13 @@ _BASE_STATE_MEMBERS: dict[str, tuple[str, bool, bool, str]] = {
     "_fan_out_web_push": ("function", False, False, "(self, note: 'dict[str, Any]') -> 'None'"),
     "_flush_dirty_slots": ("function", False, False, "(self) -> 'None'"),
     "_flush_loop": ("function", True, False, "(self) -> 'None'"),
+    "_has_generic_slots_audience": ("function", False, False, "(self) -> 'bool'"),
+    "answer_slots_resync": (
+        "function",
+        False,
+        False,
+        "(self, ws: 'web.WebSocketResponse') -> 'None'",
+    ),
     "_has_legacy_slots_audience": ("function", False, False, "(self) -> 'bool'"),
     "_has_slot_patch_clients": ("function", False, False, "(self) -> 'bool'"),
     "_lineage_rows": ("function", False, False, "(self) -> 'list[dict[str, Any]]'"),
@@ -165,6 +178,8 @@ _BASE_STATE_MEMBERS: dict[str, tuple[str, bool, bool, str]] = {
         False,
         "(self, questions: 'list[dict]') -> 'list[dict]'",
     ),
+    "_reload_cron_folders_if_unknown": ("function", False, False, "(self) -> 'None'"),
+    "_reload_folders_if_unknown": ("function", False, False, "(self) -> 'None'"),
     "_remove_ws": ("function", False, False, "(self, ws: 'web.WebSocketResponse') -> 'None'"),
     "_reproject_slots": (
         "function",
@@ -173,7 +188,7 @@ _BASE_STATE_MEMBERS: dict[str, tuple[str, bool, bool, str]] = {
         "(self, slots_data: 'list[dict]', *, include_check_status: 'bool' = "
         "False, dashboard_user: 'bool' = False) -> 'list[dict]'",
     ),
-    "_rewrite_notifications_async": ("function", True, False, "(self) -> 'None'"),
+    "_rewrite_notifications_async": ("function", True, False, "(self) -> 'bool'"),
     "_running_loop": ("staticmethod", False, False, "() -> 'asyncio.AbstractEventLoop | None'"),
     "_schedule_trailing_flush": ("function", False, False, "(self, delay: 'float') -> 'None'"),
     "_send_slot_patch": ("function", False, False, "(self, data: 'dict[str, Any]') -> 'None'"),
@@ -184,11 +199,20 @@ _BASE_STATE_MEMBERS: dict[str, tuple[str, bool, bool, str]] = {
         False,
         "(self, msg_type: 'str', data: 'object', msg: 'str') -> 'None'",
     ),
+    "_broadcast_slots_note": (
+        "function",
+        False,
+        False,
+        "(self, slots_data: 'list[dict]', slots_data_ws: 'list[dict]', slots_json: 'str', "
+        "legacy_only: 'bool', envelope_args: 'dict[str, Any]', envelope: 'dict[str, Any]', "
+        "user_frame: 'str | None' = None) -> 'None'",
+    ),
     "_send_ws_owners": (
         "function",
         False,
         False,
-        "(self, msg: 'str', *, skip_slot_patch_clients: 'bool' = False) -> " "'None'",
+        "(self, msg: 'str', *, skip_slot_patch_clients: 'bool' = False, "
+        "skip_slot_diff_clients: 'bool' = False) -> 'None'",
     ),
     "_serialize_for_client": (
         "function",
@@ -236,7 +260,8 @@ _BASE_STATE_MEMBERS: dict[str, tuple[str, bool, bool, str]] = {
         "function",
         False,
         False,
-        "(self, ws: 'web.WebSocketResponse', msg_type: 'str', data: 'object') " "-> 'bool'",
+        "(self, ws: 'web.WebSocketResponse', msg_type: 'str', data: 'object', "
+        "audit_type: 'str | None' = None) -> 'bool'",
     ),
     "_yolo": ("property", False, False, "(self) -> 'bool'"),
     "ack_notification": ("function", True, False, "(self, ts: 'str') -> 'bool'"),
@@ -262,12 +287,6 @@ _BASE_STATE_MEMBERS: dict[str, tuple[str, bool, bool, str]] = {
         False,
         False,
         "(self, loop: 'asyncio.AbstractEventLoop') -> 'None'",
-    ),
-    "broadcast_browser_event": (
-        "function",
-        False,
-        False,
-        "(self, event_type: 'str', data: 'dict') -> 'None'",
     ),
     "broadcast_context_usage": (
         "function",
@@ -331,14 +350,31 @@ _BASE_STATE_MEMBERS: dict[str, tuple[str, bool, bool, str]] = {
         False,
         "(self, msg_type: 'str', data: 'WsPayload') -> 'int'",
     ),
+    "deliver_ws_owners_bytes": (
+        "function",
+        True,
+        False,
+        "(self, payload: 'bytes') -> 'int'",
+    ),
     "disable_yolo": ("function", False, False, "(self) -> 'None'"),
+    "dismiss_notification": (
+        "function",
+        True,
+        False,
+        "(self, *, source: 'str', key: 'str') -> 'tuple[bool, bool]'",
+    ),
     "effective_max_background_turns": ("function", False, False, "(self) -> 'int'"),
     "enable_yolo": ("function", False, False, "(self, *, from_config: 'bool' = False) -> 'None'"),
     "end_slot_construction": ("function", False, False, "(self, key: 'str') -> 'None'"),
     "ensure_context_snapshots_loaded": ("function", False, False, "(self) -> 'bool'"),
     "ensure_dynamic_card_store": ("function", False, False, "(self) -> 'Any'"),
     "finish_slot_list_rebuild": ("function", False, False, "(self) -> 'None'"),
-    "flush_slot_now": ("function", False, False, "(self, slot: '_ChatSlot') -> 'None'"),
+    "flush_slot_now": (
+        "function",
+        False,
+        False,
+        "(self, slot: '_ChatSlot', takeover_basis: 'TakeoverBasis | None' = None) -> 'None'",
+    ),
     "fold_apply_watch": ("function", False, False, "(self) -> 'frozenset[str]'"),
     "fold_watch_routing": (
         "function",
@@ -378,6 +414,12 @@ _BASE_STATE_MEMBERS: dict[str, tuple[str, bool, bool, str]] = {
     ),
     "get_slot": ("function", False, False, "(self, name: 'str') -> '_ChatSlot | None'"),
     "has_slot": ("function", False, False, "(self, name: 'str') -> 'bool'"),
+    "hold_turn_heartbeat": (
+        "function",
+        False,
+        False,
+        "(self, holder: 'object', slot_key: 'str') -> 'None'",
+    ),
     "hold_folders": (
         "function",
         True,
@@ -437,7 +479,7 @@ _BASE_STATE_MEMBERS: dict[str, tuple[str, bool, bool, str]] = {
         "(self, kind: 'str', title: 'str', body: 'str', *, meta: 'dict | None' = None, "
         "url: 'str | None' = None, actions: 'list[dict[str, Any]] | None' = None, channel: "
         "'str | None' = None, member: 'dict[str, str] | None' = None, publisher_session: "
-        "'str | None' = None) -> 'None'",
+        "'str | None' = None, i18n: 'dict[str, Any] | None' = None) -> 'None'",
     ),
     "notify_dashboard_card": (
         "function",
@@ -473,6 +515,7 @@ _BASE_STATE_MEMBERS: dict[str, tuple[str, bool, bool, str]] = {
         "(self, slug: 'str', version: 'int', *, deleted: 'bool' = False) -> " "'None'",
     ),
     "push_lineage_patch": ("function", False, False, "(self) -> 'None'"),
+    "push_listing_refresh": ("function", False, False, "(self) -> 'None'"),
     "push_refresh": ("function", False, False, "(self, *kinds: 'str') -> 'None'"),
     "push_session_summary": ("function", False, False, "(self, key: 'str') -> 'None'"),
     "push_slot_patch": (
@@ -522,6 +565,12 @@ _BASE_STATE_MEMBERS: dict[str, tuple[str, bool, bool, str]] = {
     ),
     "recent_question_resolutions": ("function", False, False, "(self) -> 'dict[str, str]'"),
     "refresh_slot_source_status": ("function", False, False, "(self, key: 'str') -> 'None'"),
+    "refresh_source_status_now": (
+        "function",
+        False,
+        False,
+        "(self, urls: 'list[str]') -> 'list[str]'",
+    ),
     "register_channel_transport": (
         "function",
         False,
@@ -535,6 +584,7 @@ _BASE_STATE_MEMBERS: dict[str, tuple[str, bool, bool, str]] = {
         False,
         "(self, ws: 'web.WebSocketResponse', *, owner: 'bool' = False) -> 'None'",
     ),
+    "release_turn_heartbeat": ("function", False, False, "(self, holder: 'object') -> 'None'"),
     "release_deleted_slot_keys": (
         "function",
         False,
@@ -647,7 +697,8 @@ _BASE_STATE_MEMBERS: dict[str, tuple[str, bool, bool, str]] = {
         "function",
         False,
         False,
-        "(self, *, owner: 'bool') -> 'tuple[list[dict], list[dict], " "list[dict] | None]'",
+        "(self, *, owner: 'bool', user: 'bool' = True) -> 'tuple[list[dict], list[dict], "
+        "list[dict] | None]'",
     ),
     "serialize_slots": (
         "function",
@@ -658,6 +709,18 @@ _BASE_STATE_MEMBERS: dict[str, tuple[str, bool, bool, str]] = {
     ),
     "served_bundle_id": ("staticmethod", False, False, "(index: 'Path | None' = None) -> 'str'"),
     "serving_loop": ("property", False, False, "(self) -> \"'asyncio.AbstractEventLoop | None'\""),
+    "set_chunk_scope_capable": (
+        "function",
+        False,
+        False,
+        "(self, ws: 'web.WebSocketResponse', capable: 'bool') -> 'bool'",
+    ),
+    "set_chunk_watch": (
+        "function",
+        False,
+        False,
+        "(self, ws: 'web.WebSocketResponse', slots: 'object') -> 'dict | None'",
+    ),
     "set_dynamic_cards_enabled": ("function", False, False, "(self, enabled: 'bool') -> 'None'"),
     "set_fold_apply_capable": (
         "function",
@@ -693,11 +756,13 @@ _BASE_STATE_MEMBERS: dict[str, tuple[str, bool, bool, str]] = {
         "False, update_check_status: 'str' = 'unchecked', update_command: 'str' = "
         "'', update_latest_version: 'str' = '', update_latest_version_display: "
         "'str' = '', update_channel: 'str' = '', update_channel_move_pending: "
-        "'bool' = False, update_managed_by: 'str' = '', update_commits_ahead: "
-        "'int' = 0, update_commits_behind: 'int' = 0, update_last_checked_at: "
+        "'bool' = False, update_managed_by: 'str' = '', update_policy_file: 'str' "
+        "= '', update_commits_ahead: 'int' = 0, update_commits_behind: 'int' = 0, "
+        "update_last_checked_at: "
         "'float | None' = None, update_check_interval_secs: 'int' = 43200, "
         "update_required: 'bool' = False, update_min_version: 'str' = '', "
         "update_can_arm: 'bool' = False, update_auto_effect: 'str' = 'unknown', "
+        "update_auto_manual_only: 'bool' = False, "
         "update_bundled_by_app: 'bool' = False, version_display: 'str' = '', "
         "bundle_id: 'str' = '') -> 'dict[str, Any]'",
     ),
@@ -748,6 +813,12 @@ _BASE_STATE_MEMBERS: dict[str, tuple[str, bool, bool, str]] = {
         "(self, ask_id: 'str', session_key: 'str') -> 'bool'",
     ),
     "ws_client_count": ("function", False, False, "(self) -> 'int'"),
+    "yolo_reaches": (
+        "function",
+        False,
+        False,
+        "(self, slot: 'Any', *, channel_origin: 'bool' = False) -> 'bool'",
+    ),
 }
 
 #: ``typing.get_type_hints`` raised on these members of the one-module class too.

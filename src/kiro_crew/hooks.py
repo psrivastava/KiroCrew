@@ -48,6 +48,8 @@ from kiro_crew.atomic_write import (  # noqa: F401 - read by the pinned_writes o
     _XATTR_UNSUPPORTED_ERRNOS,
     _is_access_control_xattr,
     _should_carry_xattr,
+    read_bytes_with_retry,
+    replace_with_retry_checked,
 )
 from kiro_crew.config import paths as _config_paths
 
@@ -97,13 +99,20 @@ from kiro_crew.hook_runtime.descriptor_identity import (  # noqa: F401
 # bound here, not only in gate_tiers.
 from kiro_crew.hook_runtime.gate_tiers import (  # noqa: F401
     GateFacts,
+    _command_is_read_only,
+    _command_matches_any,
+    _is_spec_write_call,
     _operator_confirms,
     _rule_exfil,
     _rule_sensitive_bash,
     _rule_sensitive_path,
     _spec_builtin_names,
+    _spec_command_composed,
     _spec_command_granted,
+    _spec_read_granted,
+    _spec_write_granted,
     _tier_app_own_server,
+    _tier_batch_guard_grant,
     _tier_deny_rules,
     _tier_governance,
     _tier_mcp_auto_deny,
@@ -112,9 +121,13 @@ from kiro_crew.hook_runtime.gate_tiers import (  # noqa: F401
     _tier_read_only,
     _tier_search_target,
     _tier_spec_builtin_grant,
+    _tier_spec_denies,
+    _tier_spec_shell_allowlist,
+    _tier_spec_write_allowlist,
     _tier_targets,
     _tier_unverifiable_shell,
     _tier_write_protected,
+    _write_target_uncovered,
     gate_tier_problems,
     grant_spec_builtin,
     shell_rules,
@@ -127,6 +140,11 @@ from kiro_crew.hook_runtime.governance_gate import (  # noqa: F401
     _spawn_policy_denial,
 )
 from kiro_crew.hook_runtime.hook_dispatch import (  # noqa: F401
+    _lane_dispatch_is_permitted,
+    _run_one_lane_hook,
+    _session_lane_matcher_context,
+    _status_tag_ids,
+    dispatch_session_lane_changed_bulk,
     fire_tool_hooks,
     get_global_hook_store,
     permission_pre_tool_block,
@@ -192,8 +210,10 @@ from kiro_crew.hook_runtime.stream_caps import (  # noqa: F401
 )
 from kiro_crew.hook_runtime.tool_identity import (  # noqa: F401
     ToolCall,
+    _allowlist_patterns,
     _app_owns_mcp_server,
     _builtin_app_for_agent,
+    _builtin_paths_proven,
     _context_matches,
     _glob_pattern_leaves_root,
     _granted_names,
@@ -205,10 +225,12 @@ from kiro_crew.hook_runtime.tool_identity import (  # noqa: F401
     _is_first_party_app,
     _is_first_party_read_only_mcp_tool,
     _is_harness_read_only_builtin,
+    _is_host_file_read_builtin_call,
     _is_host_read_only_builtin,
     _is_host_search_builtin_call,
     _normalize_tool_name,
     _note_title_only_grant_pattern,
+    _plain_str,
     _search_root_anchored,
     _tool_matches,
     event_is_spawn_run,
@@ -235,10 +257,12 @@ from kiro_crew.hook_runtime.windows_paths import (  # noqa: F401
 # simulate a host where a descriptor's path cannot be read.
 from kiro_crew.pinned_fs import fd_real_path as _fd_real_path  # noqa: F401
 from kiro_crew.platform import current_context, redact_via_context
-from kiro_crew.platform.governance import (
+from kiro_crew.platform.governance import (  # noqa: F401  (read by hook_runtime owners)
     CU_CLASS_OBSERVE,
+    _every_operation_names_a_path,
     computer_use_action_classes,
     computer_use_action_from_title,
+    mcp_title_to_ref,
 )
 
 # The bounded, depth-aware target-path walk lives one layer below both this
@@ -246,6 +270,10 @@ from kiro_crew.platform.governance import (
 # are defined). Imported here so ``hooks.TARGET_PATH_KEYS`` / ``hooks.TargetPaths``
 # / ``hooks.target_paths`` (and the work caps) stay importable at their historic
 # names; hooks keeps its HARD-DENY reading of ``TargetPaths.truncated``.
+from kiro_crew.platform.spec_denied_grant import (  # noqa: F401  (read by tool_identity)
+    SpecDeniedGrant,
+    as_spec_denied_grant,
+)
 from kiro_crew.platform.tool_names import (  # noqa: F401  (read by hook_runtime owners)
     DEEPSEEK_READ_ONLY_TOOLS,
     KIRO_TOOL_ALIASES,
@@ -264,7 +292,9 @@ from kiro_crew.platform.tool_paths import (  # noqa: F401  (re-exported for call
 )
 from kiro_crew.security import (  # noqa: F401 - the path owners read these
     audit_bash_exfiltration,
+    canonical_path_refusal,
     is_sensitive_bash_command,
+    is_sensitive_canonical_path,
     is_sensitive_path,
     is_sensitive_write_path,
     is_unverifiable_path_refusal,
@@ -280,6 +310,12 @@ from kiro_crew.session_directive import CORE_MCP_SERVER  # noqa: F401
 from kiro_crew.validation import _bounded_pattern_search  # noqa: F401
 
 logger = logging.getLogger(__name__)
+
+#: Strong references to in-flight ``SessionLaneChanged`` dispatches. Without them
+#: asyncio may collect a task mid-run, which would drop a hook silently rather than
+#: noisily. Lives on the facade because owner functions run on these globals, so a
+#: set defined in the owner would be written to a namespace nothing else reads.
+_lane_dispatch_tasks: set[asyncio.Task] = set()
 
 
 # ── Hook Results ──
@@ -302,6 +338,8 @@ HOOK_EVENT_PRE_TOOL_USE = "PreToolUse"
 HOOK_EVENT_POST_TOOL_USE = "PostToolUse"
 HOOK_EVENT_STOP = "Stop"
 
+HOOK_EVENT_SESSION_LANE_CHANGED = "SessionLaneChanged"
+
 #: The events the gateway itself fires. ``ScriptHookStore.fire`` has a call site
 #: for each one, and ``steering-and-hooks.md`` documents their exit-code
 #: contract. Membership here is what makes an event a *lifecycle* event.
@@ -311,6 +349,7 @@ HOOK_EVENTS = (
     HOOK_EVENT_PRE_TOOL_USE,
     HOOK_EVENT_POST_TOOL_USE,
     HOOK_EVENT_STOP,
+    HOOK_EVENT_SESSION_LANE_CHANGED,
 )
 
 # Triggers a Kiro Agent session owns that the gateway has no lifecycle call site
@@ -322,7 +361,7 @@ HOOK_EVENTS = (
 #
 # "No event fires them" is not "the command cannot run": the dashboard's Test
 # endpoint runs a STORED hook's command on demand and never consults this tuple
-# (``handlers/hooks.py`` ``api_hook_test`` -> ``run_script_hook``), so Test works on
+# (``handlers/hooks_scripts.py`` ``api_hook_test`` -> ``run_script_hook``), so Test works on
 # one of these exactly as it does on a fired event.
 #
 # They are not equidistant from running, and a reader planning the delivery side
@@ -354,6 +393,11 @@ HOOK_EVENT_FILE_EDITED = "FileEdited"
 HOOK_EVENT_FILE_DELETED = "FileDeleted"
 HOOK_EVENT_USER_TRIGGERED = "UserTriggered"
 
+#: Every event nothing fires today, whatever the reason. The store reads this one
+#: for the activation contract -- a hook created on any of these is stored switched
+#: off -- because an armed-looking row that cannot run is the same defect either
+#: way. The six honour a caller's explicit ``enabled: true``, because a Kiro Agent
+#: can already ask for them, so that consent names a moment that exists.
 HOOK_EVENTS_KAS_ONLY = (
     HOOK_EVENT_PRE_TASK_EXECUTION,
     HOOK_EVENT_POST_TASK_EXECUTION,
@@ -377,8 +421,23 @@ HOOK_EVENTS_AGENT_REQUESTED = (
 #: Every event a hook may be authored against and persisted under. This is the
 #: authoring vocabulary -- the dashboard form's options, the create/update
 #: schemas, and the store's own load and save gates all read this set, so an
-#: event absent from it is refused at authoring time and dropped on reload.
+#: event absent from it is refused at authoring time and not loaded on reload.
+#: Not ERASED, though: ``_load`` keeps such a row in ``_unparsed_hook_entries``
+#: and ``_save`` writes it back, so a row stored under a name that later leaves
+#: this set survives in ``hooks.json`` and runs again if the name returns.
 HOOK_EVENTS_ALL = HOOK_EVENTS + HOOK_EVENTS_KAS_ONLY
+
+
+#: A tag id reaches the matcher grammar only if it matches this. An allowlist rather
+#: than a separator screen: refusing ``:`` and ``;`` alone would still admit
+#: ``fnmatch`` metacharacters, and the grammar is consumed by ``fnmatch`` -- an id of
+#: ``*`` would make the selector written for it match EVERY lane change and run that
+#: tag's hook on sessions it was never registered for. ``.`` is admitted because
+#: ``fnmatch`` treats it as a literal, so a hand-named ``in.review`` still reaches a
+#: matcher. Lower-case only, because ``_context_matches`` folds case and an upper-case
+#: id would otherwise admit two spellings of one token.
+_TOKEN_ALLOWED = re.compile(r"\A[a-z0-9_.-]+\Z")
+
 
 #: Every ``matcher_mode`` a script hook may be authored with; ``glob`` is the
 #: default. ``validate_hook_fields`` refuses any other value at create and update,
@@ -409,6 +468,37 @@ def uncounted_gate():
         yield
     finally:
         _GATE_UNCOUNTED.reset(token)
+
+
+#: Set by :func:`unattended_turn`; read by ``_governance_denial``.
+_UNATTENDED_TURN: ContextVar[bool] = ContextVar("kirocrew_unattended_turn", default=False)
+
+
+@contextmanager
+def unattended_turn(active: bool = True):
+    """Judge the gate calls made inside this block as an UNATTENDED turn's.
+
+    For a turn no person is watching: a cron job, a heartbeat task, a monitor
+    wake. The one thing it changes is what the governance tier does when its own
+    evaluation raises: an unattended call is refused, because nobody is there to
+    notice that policy went unchecked, while an attended call keeps "no
+    governance opinion" so a transient fault never refuses an ordinary user
+    action. Every other tier judges the call exactly as before.
+
+    The marker is a ContextVar, so it reaches the tool-gate pool thread (which
+    runs the call in a copy of the caller's context) and nothing outside this
+    block. Wrap the single gate consultation, not a whole turn, so a task the
+    turn spawns does not inherit it. ``active=False`` is a no-op, for a call site
+    that only sometimes runs unattended.
+    """
+    if not active:
+        yield
+        return
+    token = _UNATTENDED_TURN.set(True)
+    try:
+        yield
+    finally:
+        _UNATTENDED_TURN.reset(token)
 
 
 #: The reason a call is refused when the gate itself raised while judging it.
@@ -667,6 +757,7 @@ class HookManager:
         app: str = "",
         classifier_only: bool = False,
         trust_reads: bool = False,
+        deny_waivers: frozenset[str] = frozenset(),
     ) -> ToolHookResult:
         """Whether *call* is auto-approved, denied, or handled normally.
 
@@ -719,6 +810,14 @@ class HookManager:
         ``read_only`` auto-approve for one of those tools, never the reverse, and
         an operator ``confirm_tools`` match still asks first. Default ``False``:
         every other mode and surface judges an MCP call as before.
+
+        ``deny_waivers`` are the refusal keys a person overrode on the dashboard
+        approval card (``docs/request-for-change/rfc-deny-session-override.md``).
+        Only the ``deny-rules`` tier reads them, after dropping every
+        governance-pinned key, and each one it uses is audited or refuses; every
+        other tier judges the call exactly as without them. Default empty: only
+        the dashboard's override path and the transport floor it approves through
+        pass any.
         """
         if _GATE_TABLE_PROBLEMS:
             return ToolHookResult.deny(GATE_TABLE_UNSOUND_REASON)
@@ -730,6 +829,7 @@ class HookManager:
             app=app,
             classifier_only=classifier_only,
             trust_reads=trust_reads,
+            deny_waivers=frozenset(deny_waivers),
         )
         for tier in GATE_TIERS:
             verdict = tier.judge(facts, tier)
@@ -737,7 +837,7 @@ class HookManager:
                 if not verdict.tier:
                     verdict.tier = tier.name
                 return verdict
-        return ToolHookResult.allow()
+        return ToolHookResult.allow(facts.ask_note)
 
     @_fail_closed_on_gate_crash
     def on_tool_call(
@@ -759,12 +859,20 @@ class HookManager:
         kas_builtin_ids: bool = False,
         spec_granted_builtins: frozenset[str] = frozenset(),
         spec_granted_commands: tuple[str, ...] = (),
+        spec_shell_allowlist: tuple[str, ...] | None = None,
+        spec_write_allowlist: tuple[str, ...] | None = None,
+        spec_write_cwd: str = "",
+        spec_denied_grant: Any = None,
+        spec_shell_readonly: bool = False,
+        spec_granted_paths: tuple[str, ...] = (),
+        spec_granted_read_paths: tuple[str, ...] = (),
         harness_builtin_tool: str = "",
         deepseek_tool_name: str = "",
         spawn_target: str = "",
         resolved_agent: str = "",
         classifier_only: bool = False,
         trust_reads: bool = False,
+        deny_waivers: frozenset[str] = frozenset(),
     ) -> ToolHookResult:
         """:meth:`judge`, for a caller that holds the call as keywords.
 
@@ -796,6 +904,17 @@ class HookManager:
                 kas_builtin_ids=kas_builtin_ids,
                 spec_granted_builtins=frozenset(spec_granted_builtins),
                 spec_granted_commands=tuple(spec_granted_commands),
+                spec_shell_allowlist=(
+                    None if spec_shell_allowlist is None else tuple(spec_shell_allowlist)
+                ),
+                spec_write_allowlist=(
+                    None if spec_write_allowlist is None else tuple(spec_write_allowlist)
+                ),
+                spec_write_cwd=spec_write_cwd,
+                spec_denied_grant=as_spec_denied_grant(spec_denied_grant),
+                spec_shell_readonly=spec_shell_readonly is True,
+                spec_granted_paths=tuple(spec_granted_paths),
+                spec_granted_read_paths=tuple(spec_granted_read_paths),
                 harness_builtin_tool=harness_builtin_tool,
                 deepseek_tool_name=deepseek_tool_name,
                 spawn_target=spawn_target,
@@ -806,6 +925,7 @@ class HookManager:
             app=app,
             classifier_only=classifier_only,
             trust_reads=trust_reads,
+            deny_waivers=deny_waivers,
         )
 
     def _effective_denied(self, ctx: object) -> list[str]:
@@ -957,7 +1077,8 @@ _WRITE_TOOL_KINDS: frozenset[str] = frozenset(
 )
 
 
-# Canonical ``<app>:<server>`` names DECLARED in shipped builtin manifests,
+# Canonical ``<app>:<server>`` names DECLARED in shipped builtin manifests (a
+# former builtin's adopted record included, ``apps/builtin_adoption_gate.py``),
 # populated ONCE at gateway boot via ``set_builtin_app_mcp_servers`` (see the
 # dashboard startup). Parallel to ``_BUILTIN_APP_NAMES`` and kept as a plain
 # module global for the same reason — the PreToolUse gate does ZERO filesystem
@@ -1134,21 +1255,7 @@ _unc_data_home_root_cache: tuple[tuple[object, ...], Path | None] | None = None
 def _unc_data_home_root() -> Path | None:
     """The data home as a UNC-gate trusted root, memoized per configuration.
 
-    The twin of :func:`_unc_agents_root`, and it exists for the same reason.
-    ``data_home()`` is cheap only on its *default-home* branch: with
-    ``KIROCREW_HOME`` set it calls ``_valid_override_home()`` FIRST, on every
-    call, and that does ``Path(override).expanduser().resolve()`` --
-    filesystem I/O, and on a UNC-shaped override an SMB touch. ``config_dir()``
-    memoizes, but that memo sits BEHIND the predicate, so it never covers this.
-    Measured at this PR's head: three ``protected_ref_spans()`` calls produced
-    three resolves of the override.
-
-    That is the one configuration this gate has to be fast in. A roaming
-    profile is exactly when ``KIROCREW_HOME`` points at a share, so the
-    per-call resolve lands on the host whose latency the gate promises never to
-    depend on -- and :func:`unc_probe_allowed` is reached from
-    ``iter_local_refs``, which ``telegram.renderer._rotate_on_length`` runs
-    INLINE on the event loop against a documented 7-15 us/KB budget.
+    The twin of :func:`_unc_agents_root`.
 
     Resolves through :func:`peek_data_home`, NOT :func:`data_home`: this module
     primes the memo at import time, and ``data_home()`` on a first resolution
@@ -1164,10 +1271,11 @@ def _unc_data_home_root() -> Path | None:
     monkeypatched accessor or a reset of the resolution cache all invalidate
     naturally.
 
-    A computation failure memoizes ``None`` (root absent, gate stays total),
-    for the reason :func:`_unc_agents_root` gives: the failure being avoided is
-    a per-call resolve that can block on an SMB timeout, and the degraded state
-    -- UNC attachment paths refused -- is the safe one.
+    A computation failure memoizes ``None``: root absent, so UNC attachment
+    paths are refused and the gate stays total. ``config.paths`` pins only a
+    resolve that returned (``_override_home_pin``), so without this a raising
+    one -- filesystem I/O, an SMB touch on a UNC-shaped override -- would
+    re-run on every gate check, some of them inline on the event loop.
     """
     global _unc_data_home_root_cache
     key: tuple[object, ...] = (
@@ -1423,6 +1531,12 @@ _AUDIT_ONLY_READ_IDS: dict[str, str] = {
     # no value is returned. The audit is owed regardless, because the file holds
     # live credential material whatever this reader touches.
     "kiro_cli.idc_identity_probe": ".local/share/kiro-cli/data.sqlite3",
+    # Same store, read by ``kiro_crew.lts_sign_in`` (the shared sign-in
+    # resolver) when Crew's vault holds no sign-in: the token rows and the
+    # ``api.codewhisperer.profile`` row, for the LTS rules fetch and account
+    # lock and for the oss KAS spawn owner. Read-only, never logged; a token is
+    # handed back only once its ``success`` audit is recorded.
+    "lts_sign_in.kiro_cli_store": ".local/share/kiro-cli/data.sqlite3",
     # Same store, read by ``kiro_crew.kiro_prerequisite.identity_fingerprint`` to
     # answer one question on the turn path: does the account signed in NOW differ
     # from the one the running kiro-cli children loaded? Only stable account
@@ -1498,6 +1612,19 @@ _AUDIT_ONLY_READ_IDS: dict[str, str] = {
     # as the two entries above (stats only, no bytes returned); see
     # ``api_connections_premint`` for why refusing would be the worse failure.
     "connections_premint.oauth_grant_presence": ".aws/sso/cache/<sha256(mcp_url)>.token.json",
+    # Class 2, the KAS counterpart of the mint entry above. On the KAS backend the
+    # engine's MCP sign-in lands in Crew's dedicated grant vault, not in kiro-cli's
+    # cache, so ``mcp_discovery``'s remote probe also asks
+    # ``kiro_crew.mcp_grant_kas.kas_grant_presence`` whether that vault holds a
+    # ``kiro.mcp.<engine hash>.tokens`` entry for the url. It parses the envelope
+    # for entry NAMES only: the key file is never opened and nothing is decrypted,
+    # so only a boolean leaves the function. The name is a sha256 the caller
+    # derives from the url it already holds, so it cannot ask about another
+    # server's entry by any other route. Audited on every answer, like the probe's
+    # kiro-cli lookup, because "missing" is what renders "Sign-in required";
+    # best-effort for the same reason (no bytes returned). The url is never
+    # logged, only the hash.
+    "mcp_discovery.kas_grant_presence": "<data_home>/kas/mcp-grants/.vault/secrets.enc",
 }
 
 
@@ -1603,6 +1730,10 @@ class ScriptHook:
       ``ScriptHookResult.error``, then stderr, then "exited with code N").
       Every other event stays warn-only (stderr shown to user). There is no
       per-hook advisory/fail-open opt-out.
+    - Exception: an agent spec's own hook (``spec_origin`` set, see
+      :mod:`kiro_crew.agent_sdk.spec_hooks`) follows kiro-cli, which runs it on
+      the kiro-cli backend. Only a delivered exit 2 blocks; a refused, failed,
+      killed or timed-out spec hook warns and the tool runs.
     """
 
     id: str = ""
@@ -1622,9 +1753,22 @@ class ScriptHook:
     last_status: str = ""  # "ok", "error", "timeout", "blocked"
     last_error: str = ""  # human-readable reason for the most recent non-ok status
     run_count: int = 0
+    #: Where an agent spec's own hook came from: ``"user"`` (the user-level agents
+    #: tree, read-only to every sandboxed process), ``"project"`` (a trusted
+    #: checkout's spec), or ``""`` for a Hooks-page hook. Set only in memory by
+    #: :mod:`kiro_crew.agent_sdk.spec_hooks`; never saved, and ``from_dict`` never
+    #: reads it, so a hand-written ``hooks.json`` cannot claim a spec origin.
+    spec_origin: str = ""
+    #: An agent spec hook's ``max_output_size``: the most UTF-8 bytes of its
+    #: stdout ``run_script_hook`` returns, cut after redaction and marked. ``0``
+    #: leaves only the stream cap. In memory only, like ``spec_origin``.
+    max_output_size: int = 0
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        data = asdict(self)
+        data.pop("spec_origin", None)
+        data.pop("max_output_size", None)
+        return data
 
     @classmethod
     def from_dict(cls, data: dict) -> "ScriptHook":
@@ -1711,6 +1855,8 @@ class ScriptHook:
 # the retained prefix is always enough to decode and truncate for display, yet
 # small enough that a runaway hook cannot exhaust memory.
 _HOOK_STREAM_CAP_BYTES = 64 * 1024
+# How long a timed-out hook's killed tree may take to close its pipes and exit.
+_HOOK_REAP_SECS = 5.0
 # Marker appended to a decoded stream when its raw bytes exceeded the cap, so
 # truncation is visible rather than silent.
 _HOOK_TRUNCATION_MARKER = "\n…[output truncated]"
@@ -1792,9 +1938,13 @@ GATE_TIERS: tuple[GateTier, ...] = (
     GateTier("mcp-auto-deny", "deny", _tier_mcp_auto_deny),
     GateTier("search-target", "deny", _tier_search_target),
     GateTier("governance", "deny_policy", _tier_governance),
+    GateTier("spec-shell-allowlist", "deny_policy", _tier_spec_shell_allowlist),
+    GateTier("spec-write-allowlist", "deny_policy", _tier_spec_write_allowlist),
+    GateTier("spec-denies", "deny_policy", _tier_spec_denies),
     GateTier("app-own-server", "grant", _tier_app_own_server),
     GateTier("operator-grants", "grant", _tier_operator_grants),
     GateTier("spec-builtin-grant", "grant", _tier_spec_builtin_grant),
+    GateTier("batch-guard-grant", "grant", _tier_batch_guard_grant),
     GateTier("read-only", "classify", _tier_read_only),
 )
 

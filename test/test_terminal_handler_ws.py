@@ -26,6 +26,7 @@ from terminal_handler_helpers import (  # noqa: F401 -- the autouse fixture regi
 )
 
 from kiro_crew.dashboard.handlers import terminal
+from kiro_crew.testing.wait import await_until
 
 # ── api_terminal_ws ──
 
@@ -140,7 +141,7 @@ class TestApiTerminalWs:
             mock_sel.return_value.log_api_access = MagicMock()
             resp = await terminal.api_terminal_ws(req)
         assert isinstance(resp, web.Response)
-        assert resp.status == 429
+        assert resp.status == 409
 
     @pytest.mark.asyncio
     async def test_at_the_cap_the_slot_changes_hands_before_any_await(self):
@@ -278,6 +279,19 @@ class TestApiTerminalWs:
         assert end_evicted.await_args.args[1][:2] == ("old", old)
         assert end_evicted.await_args.args[2] == 2
         assert registry == {"old": fresh, "busy": busy}
+
+    @pytest.mark.asyncio
+    async def test_a_refused_open_ends_the_displaced_shell_once_the_panel_is_off(self):
+        # The panel was switched off while the probe waited, and the switch-off
+        # could not see the shell this open had displaced: it ends, not goes back.
+        old, busy, registry, req, patches = self._at_the_cap(OSError("no such directory"))
+        off = patch.object(terminal, "_read_terminal_config", return_value={"enabled": False})
+        with patches[0], patches[1], patches[2], patches[3], patches[4], off:
+            with patches[5] as end_evicted:
+                await terminal.api_terminal_ws(req)
+        end_evicted.assert_awaited_once()
+        assert end_evicted.await_args.args[1][:2] == ("old", old)
+        assert registry == {"busy": busy}
 
     @pytest.mark.asyncio
     async def test_an_open_that_goes_ahead_ends_the_displaced_shell_before_spawning(self):
@@ -1014,18 +1028,36 @@ class TestEvictionAtTheCap:
 
 
 class TestReapOrphanedTerminals:
+    @staticmethod
+    async def _run_one_sweep(monkeypatch, app) -> None:
+        """Run the reaper until its first real sweep has finished, then cancel it.
+
+        The reaper's sleep interval is zeroed on the module that owns it, so the
+        loop reaches its sweep without waiting a real minute. The test waits on the
+        sweep's own signal, not on a count of loop turns.
+        """
+        monkeypatch.setattr(terminal, "_ORPHAN_SWEEP_INTERVAL_S", 0)
+        real_sweep = terminal._sweep_terminals
+        swept = asyncio.Event()
+
+        async def _sweep_once(app, now) -> None:
+            await real_sweep(app, now)
+            swept.set()
+
+        monkeypatch.setattr(terminal, "_sweep_terminals", _sweep_once)
+        reaper = asyncio.ensure_future(terminal.reap_orphaned_terminals(app))
+        await await_until(swept, what="the reaper finished its first sweep")
+        reaper.cancel()
+        await await_until(reaper, what="the reaper stopped after cancel")
+
     @pytest.mark.asyncio
-    async def test_handles_missing_state(self):
+    async def test_handles_missing_state(self, monkeypatch):
         app = {"state": None}
-        # flake-ok: pre-existing patch of asyncio.sleep that ends the reaper loop with CancelledError on its second tick, moved verbatim; tracked for a de-flake pass
-        with patch("asyncio.sleep", side_effect=[None, asyncio.CancelledError]):
-            await terminal.reap_orphaned_terminals(app)
+        await self._run_one_sweep(monkeypatch, app)
         # Should not raise
 
     @pytest.mark.asyncio
-    async def test_handles_no_terminal_sessions_attr(self):
+    async def test_handles_no_terminal_sessions_attr(self, monkeypatch):
         state = MagicMock(spec=[])  # no attributes
         app = {"state": state}
-        # flake-ok: pre-existing patch of asyncio.sleep that ends the reaper loop with CancelledError on its second tick, moved verbatim; tracked for a de-flake pass
-        with patch("asyncio.sleep", side_effect=[None, asyncio.CancelledError]):
-            await terminal.reap_orphaned_terminals(app)
+        await self._run_one_sweep(monkeypatch, app)

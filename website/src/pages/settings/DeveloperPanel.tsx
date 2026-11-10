@@ -1,13 +1,18 @@
-import { lazy, Suspense, type ReactNode } from 'react'
-import { ExternalLink, FlaskConical, ScrollText, Monitor, Brain, Archive, Database, Network, Activity, FileCode2, Bug } from 'lucide-react'
+import { lazy, Suspense, useEffect, type ReactNode } from 'react'
+import { matchPath, useLocation, useNavigate } from 'react-router-dom'
+import { ExternalLink, FlaskConical, ScrollText, Monitor, Brain, Archive, Database, Activity, FileCode2, Bug } from 'lucide-react'
 import { SettingsSection, SettingsCard, SettingsToggle } from '../../components/settings'
 import { SettingsSubNav, type SubNavItem } from '../../components/SettingsSubNav'
 import { ContentSkeleton } from '../../components/ui'
 import { useLocalGateway } from '../../hooks/useLocalGateway'
 import { FeaturePreviewsSection } from './FeaturePreviewsSection'
 import { CrewmatesSection } from './CrewmatesSection'
+import { DefaultMcpGrantsSection } from './DefaultMcpGrantsSection'
 import AutomaticCardSetting from '../chat/command-center/AutomaticCardSetting'
 import { i18nT } from '../../i18n/t'
+import { MCP_MANAGEMENT_PATH } from '../overview/McpShareRefusedNotice'
+import { DEVELOPER_DEBUG_TOOLS_SUB, LEGACY_DEVELOPER_MCP_POOL_SUB } from './developerSubs'
+import { LOCKED_DEBUG_TOOLS, useControlLocked } from '../../utils/editionLocks'
 
 /**
  * Lazy: every internals page loads its chunk when it is first opened. They sit
@@ -20,7 +25,6 @@ const SystemPage = lazy(() => import('../SystemPage'))
 const TelemetryPanel = lazy(() => import('../TelemetryPanel'))
 const SessionArchive = lazy(() => import('../SessionArchive'))
 const LocalStorageDebug = lazy(() => import('../LocalStorageDebug'))
-const McpManagement = lazy(() => import('./McpManagement').then(m => ({ default: m.McpManagement })))
 const ConfigPage = lazy(() => import('../overview').then(m => ({
   default: () => <><m.KiroCrewCfgTab /><m.AgentCfgTab /></>,
 })))
@@ -38,7 +42,7 @@ const LOCAL_GATEWAY_TUNNEL_GUIDE = 'https://github.com/kirodotdev/KiroCrew/blob/
 
 /** Settings > Developer tab: a SettingsSubNav whose first page, Feature
  *  Previews, holds the per-device opt-in switches, and whose other pages are
- *  the internals views (logs, system metrics, telemetry, storage, MCP pool,
+ *  the internals views (logs, system metrics, telemetry, storage,
  *  memory graph, config, debug tools, session archive). Every page is always
  *  listed: there is no consent gate in front of the internals views.
  *
@@ -46,6 +50,21 @@ const LOCAL_GATEWAY_TUNNEL_GUIDE = 'https://github.com/kirodotdev/KiroCrew/blob/
  *  bridge is present: a browser tab has no local gateway to start or stop. */
 export function DeveloperPanel({ basePath }: { basePath?: string } = {}) {
   const { localGatewayEnabled, localGatewaySupported, setLocalGatewayEnabled } = useLocalGateway()
+  const navigate = useNavigate()
+  const { pathname } = useLocation()
+  // An LTS build hides Debug tools (RFC D12); a link to it self-heals to the first page.
+  const debugToolsLocked = useControlLocked(LOCKED_DEBUG_TOOLS)
+
+  // MCP Management lives in Customize → Connections → MCP Servers. Its old
+  // page key here survives in bookmarks and older links; without this the
+  // SubNav would quietly show Feature Previews instead. REPLACE, so back
+  // does not return to the redirecting URL; passive effect because
+  // react-router 7 drops navigations fired from useLayoutEffect on mount.
+  useEffect(() => {
+    if (matchPath({ path: `/settings/developer/${LEGACY_DEVELOPER_MCP_POOL_SUB}`, end: true }, pathname)) {
+      navigate(MCP_MANAGEMENT_PATH, { replace: true })
+    }
+  }, [pathname, navigate])
 
   const railItems: SubNavItem[] = [
     { key: 'feature-previews', label: i18nT('pages.settings.developerPanel.feature_previews'), icon: <FlaskConical size={16} /> },
@@ -53,16 +72,16 @@ export function DeveloperPanel({ basePath }: { basePath?: string } = {}) {
     { key: 'system', label: i18nT('pages.developerPage.tabs.system.label'), icon: <Monitor size={16} /> },
     { key: 'telemetry', label: i18nT('pages.developerPage.tabs.telemetry.label'), icon: <Activity size={16} /> },
     { key: 'storage', label: i18nT('pages.developerPage.tabs.storage.label'), icon: <Database size={16} /> },
-    { key: 'mcp-pool', label: i18nT('pages.developerPage.tabs.mcpPool.label'), icon: <Network size={16} /> },
     { key: 'memory', label: i18nT('pages.developerPage.tabs.memory.label'), icon: <Brain size={16} /> },
     { key: 'config', label: i18nT('pages.developerPage.tabs.config.label'), icon: <FileCode2 size={16} /> },
     { key: 'debug-tools', label: i18nT('pages.developerPage.tabs.debugTools.label'), icon: <Bug size={16} /> },
     { key: 'archive', label: i18nT('pages.developerPage.tabs.archive.label'), icon: <Archive size={16} /> },
   ]
+  const shownRailItems = debugToolsLocked ? railItems.filter(item => item.key !== DEVELOPER_DEBUG_TOOLS_SUB) : railItems
 
   return (
     <SettingsSubNav
-      items={railItems}
+      items={shownRailItems}
       basePath={basePath}
       guideTargetPrefix="settings.sub.developer."
       railWidth={220}
@@ -87,12 +106,14 @@ export function DeveloperPanel({ basePath }: { basePath?: string } = {}) {
               <FeaturePreviewsSection />
               {/* The crewmate feature switches (`CrewmatesSection.tsx`). */}
               <CrewmatesSection />
+              {/* The default agent's opt-in MCP sets (`DefaultMcpGrantsSection.tsx`). */}
+              <DefaultMcpGrantsSection />
               {localGatewaySupported && (
                 <SettingsSection title={i18nT('pages.settings.developerPanel.gateway')}>
                   <SettingsCard>
                     <SettingsToggle
                       label={i18nT('pages.settings.developerPanel.run_a_local_gateway')}
-                      description={i18nT('pages.settings.developerPanel.turn_it_off_only_when_a_gateway_already_answers')}
+                      description={i18nT('pages.settings.developerPanel.turn_it_off_only_when_a_gateway_already_answers_summary')} hint={i18nT('pages.settings.developerPanel.turn_it_off_only_when_a_gateway_already_answers')}
                       checked={localGatewayEnabled}
                       onChange={setLocalGatewayEnabled}
                     />
@@ -128,9 +149,6 @@ export function DeveloperPanel({ basePath }: { basePath?: string } = {}) {
         case 'storage':
           return loading(<LocalStorageDebug />)
 
-        case 'mcp-pool':
-          return loading(<McpManagement />)
-
         case 'memory':
           // The memory GRAPH visualizer is an internals view. The user-facing
           // memory browser lives in Settings > Overview > Memory.
@@ -140,7 +158,7 @@ export function DeveloperPanel({ basePath }: { basePath?: string } = {}) {
           return loading(<ConfigPage />)
 
         case 'debug-tools':
-          return loading(<DebugToolsTab />)
+          return debugToolsLocked ? null : loading(<DebugToolsTab />)
 
         case 'archive':
           return loading(<SessionArchive />)

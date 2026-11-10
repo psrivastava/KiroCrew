@@ -25,6 +25,7 @@ import pytest
 from cli_commands_coverage_helpers import _FakeResponse, _http_error, _ns
 
 from kiro_crew import cli_commands as cc
+from kiro_crew.beacon import PRIVACY_NOTICE_VERSION
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.eval.scenario import AssertionType
 from kiro_crew.vector_memory import LessonWriteOutcome, LessonWriteResult
@@ -67,13 +68,10 @@ class TestLearnCli:
     def test_add_does_not_write_jsonl_when_the_store_declines(
         self, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        """This replaces a test that PINNED the defect.
+        """A declining vector store never routes the lesson to the JSONL fallback.
 
-        It asserted the JSONL fallback fires whenever the vector store returns a
-        falsy value -- which is most often "the lesson is already stored exactly as
-        submitted". So the old contract was: write a duplicate record for a lesson
-        that was fine, and print "Saved:" when nothing needed saving. The declining
-        outcomes are now distinguished, and none of them routes to the other store.
+        A falsy answer most often means the lesson is already stored as submitted, so a
+        fallback write would duplicate it and print "Saved:" for nothing.
         """
         with _LearnHarness() as h:
             h.vs.write_lesson.return_value = LessonWriteResult(LessonWriteOutcome.UNCHANGED)
@@ -566,6 +564,29 @@ class TestArtifactCli:
             cc._artifact(_ns(artifact_action="list", tag="ops", kind=None, q="One"))
         out = capsys.readouterr().out
         assert "s1" in out and "[a]" in out and "s2" in out
+
+    def test_list_prints_each_row_on_one_line(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """A newline or control character in a stored field stays inside its row."""
+        payload = {
+            "artifacts": [
+                {
+                    "slug": "s1\nx",
+                    "version": 3,
+                    "kind": "wid\nget",
+                    "tags": ["a\nb"],
+                    "name": "One\x07\nTwo",
+                },
+            ]
+        }
+        with _ArtifactHarness([_FakeResponse(payload)]):
+            cc._artifact(_ns(artifact_action="list", tag=None, kind=None, q=None))
+        lines = capsys.readouterr().out.splitlines()
+        # One line for the artifact: the newlines did not split the row.
+        assert len(lines) == 1
+        assert lines[0].startswith("s1\\x0ax ")
+        assert "wid\\x0aget" in lines[0]
+        assert "[a\\x0ab]" in lines[0]
+        assert lines[0].endswith("One\\x0aTwo")
 
     def test_list_empty(self, capsys: pytest.CaptureFixture[str]) -> None:
         with _ArtifactHarness([_FakeResponse({"artifacts": []})]):
@@ -1079,7 +1100,10 @@ class TestTelemetryCli:
             cc._telemetry(_ns(telemetry_action="disable"))
         data = json.loads(path.read_text())
         assert data["telemetry"]["beacon_enabled"] is False
+        # Both switches: "disable" turns usage data off, not only the heartbeat.
+        assert data["telemetry"]["enabled"] is False
         assert data["dashboard"]["privacy_acked"] is True
+        assert "privacy_ack_version" not in data["dashboard"]
         # Unrelated sections survive the rewrite.
         assert data["agent"] == {"model": "auto"}
         assert "DISABLED" in capsys.readouterr().out
@@ -1088,6 +1112,7 @@ class TestTelemetryCli:
         path = tmp_path / "nested" / "config.json"
         effective = KiroCrewConfig()
         effective.telemetry.beacon_enabled = True
+        effective.telemetry.enabled = True
         with (
             patch.object(KiroCrewConfig, "load", return_value=effective),
             patch("kiro_crew.cli_commands.config_path", return_value=path),
@@ -1095,7 +1120,10 @@ class TestTelemetryCli:
         ):
             beacon.is_governance_pinned_off.return_value = False
             cc._telemetry(_ns(telemetry_action="enable"))
-        assert json.loads(path.read_text())["telemetry"]["beacon_enabled"] is True
+        written = json.loads(path.read_text())
+        assert written["telemetry"]["beacon_enabled"] is True
+        assert written["telemetry"]["enabled"] is True
+        assert written["dashboard"]["privacy_ack_version"] == PRIVACY_NOTICE_VERSION
 
     def test_enable_refused_when_governance_pins_off(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -1306,13 +1334,63 @@ class TestRunEval:
         with (
             _EvalHarness([_scenario_result(True), _scenario_result(False)]) as h,
             patch("kiro_crew.cli_commands.load_scenarios", return_value=scenarios) as loader,
+            pytest.raises(SystemExit) as exc,
         ):
             await cc._run_eval(_ns(all_scenarios=True, scenarios=None, judge=False))
+        # One of the two failed, so the command fails.
+        assert exc.value.code == 1
         assert loader.call_args[0][0].name == "scenarios"
         h.runner.run_scenarios.assert_awaited_once_with(scenarios)
         out = capsys.readouterr().out
         assert "Running: a, b (4 turns)" in out
         assert "Overall: 1/2 scenarios passed" in out
+
+    @pytest.mark.asyncio
+    async def test_a_failed_scenario_exits_1_after_writing_the_report(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        with (
+            _EvalHarness([_scenario_result(False)]),
+            patch("kiro_crew.cli_commands.load_scenario", return_value=_scenario()),
+            pytest.raises(SystemExit) as exc,
+        ):
+            await cc._run_eval(_ns(all_scenarios=False, scenarios=None, judge=False))
+        # `kirocrew eval && next` must stop on a failed scenario ...
+        assert exc.value.code == 1
+        # ... and the exit comes after the report, so the evidence is kept.
+        results_dir = tmp_path / "eval_results"
+        dump = next(p for p in results_dir.iterdir() if p.suffix == ".json")
+        payload = json.loads(dump.read_text())
+        assert payload["overall_passed"] == 0 and payload["overall_total"] == 1
+        assert any(p.suffix == ".md" for p in results_dir.iterdir())
+        out = capsys.readouterr().out
+        assert "Overall: 0/1 scenarios passed" in out
+        assert "Results saved to:" in out
+
+    @pytest.mark.asyncio
+    async def test_a_judge_verdict_that_fails_a_turn_exits_1(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The judge rewrites a turn's verdict after the run, and the exit code
+        reads the rewritten one: real result types, not a frozen ``passed``."""
+        from kiro_crew.eval.runner import ScenarioResult, SessionResult, TurnResult
+
+        monkeypatch.chdir(tmp_path)
+        assertion = SimpleNamespace(type=AssertionType.JUDGE, value="was it helpful")
+        turn = TurnResult(
+            user_message="hi", agent_response="hello", assertion_results=[(assertion, True)]
+        )
+        result = ScenarioResult(name="smoke", sessions=[SessionResult(name="s1", turns=[turn])])
+        with (
+            _EvalHarness([result]) as h,
+            patch("kiro_crew.cli_commands.load_scenario", return_value=_scenario()),
+            pytest.raises(SystemExit) as exc,
+        ):
+            h.judge.judge_turn.return_value = SimpleNamespace(score=1, reason="unhelpful")
+            await cc._run_eval(_ns(all_scenarios=False, scenarios=None, judge=True))
+        assert turn.assertion_results[0][1] is False
+        assert exc.value.code == 1
 
     @pytest.mark.asyncio
     async def test_named_scenario_is_resolved_by_extension(
@@ -1363,14 +1441,9 @@ print("wrote=" + report_path.name + "," + json_path.name)
     def test_the_artifacts_survive_a_non_utf8_default_codec(self, tmp_path: Path) -> None:
         """The report is written as UTF-8, not the host's locale codec.
 
-        Run in a CHILD PROCESS on purpose, against this file's usual convention:
-        the default codec ``open()`` picks is fixed when the interpreter starts,
-        so it cannot be substituted in-process — patching ``locale`` does not
-        reach the C-level lookup ``io`` actually performs.
-
-        Without ``encoding="utf-8"`` the write raises ``UnicodeEncodeError`` under
-        cp1252/cp950/cp932, and it raises after the eval has already run, so both
-        artifacts are lost.
+        Run in a CHILD PROCESS: ``open()``'s default codec is fixed at interpreter start,
+        and patching ``locale`` does not reach it. Under cp1252/cp950/cp932 the write
+        would raise after the eval ran, losing both artifacts.
         """
         env = dict(os.environ)
         # PEP 540 off, PEP 538 coercion off, C locale: a non-UTF-8 default on

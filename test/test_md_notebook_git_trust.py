@@ -75,10 +75,11 @@ async def test_failed_clone_preserves_existing_pat(fixtures) -> None:
     server_mod, _remote, _seed = fixtures
     async with signed_client(server_mod) as client:
         assert (await client.put("/api/pat", {"pat": "ghp_good_existing"}))[0] == 200
-        # Clone a bogus URL with a different token; the clone fails.
-        # flake-ok: pre-existing clone of a reserved .invalid host, which never resolves, so the clone fails without traffic; moved verbatim
+        # Clone a repository that does not exist beside the fixture remote, with a different
+        # token; the clone fails on the local filesystem, with no network involved.
         status, _ = await client.post(
-            "/api/vaults", {"url": "https://example.invalid/nope.git", "pat": "ghp_bad_new"}
+            "/api/vaults",
+            {"url": str(_remote.parent / "missing-repo.git"), "pat": "ghp_bad_new"},
         )
         assert status != 200
         # The good token must still be there (a boolean is all the API exposes,
@@ -385,6 +386,17 @@ def test_safe_join_allows_a_nested_note(fixtures, tmp_path: Path) -> None:
     assert server_mod.safe_join(tmp_path, "sub/dir/note.md") == tmp_path / "sub/dir/note.md"
 
 
+def test_safe_join_admits_a_note_below_a_drive_root_vault(fixtures, tmp_path: Path) -> None:
+    """A vault at a drive root (``D:\\``, or ``/``) keeps its trailing separator
+    through realpath, so ``root + os.sep`` would put every note outside it."""
+    server_mod, _remote, _seed = fixtures
+    note = tmp_path / "sub" / "note.md"
+    real = os.path.realpath(str(note))
+    drive_root = os.path.splitdrive(real)[0] + os.sep
+    rel = os.path.relpath(real, drive_root).replace(os.sep, "/")
+    assert server_mod.safe_join(Path(drive_root), rel) == Path(real)
+
+
 @pytest.mark.parametrize(
     "url",
     [
@@ -625,7 +637,6 @@ def test_pack_program_flags_pin_every_remote_subcommand() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.skipif(os.name == "nt", reason="the hostile pack program is a POSIX shell script")
 async def test_pack_program_flags_beat_a_vault_set_uploadpack_and_receivepack(fixtures) -> None:
     """Against real git: a vault's own `remote.origin.uploadpack`/`.receivepack`
     in `.git/config` is read before the GIT_CONFIG_* pins and wins over them, so
@@ -636,7 +647,7 @@ async def test_pack_program_flags_beat_a_vault_set_uploadpack_and_receivepack(fi
         root = Path(vault["localPath"])
         marker = root.parent / "pack-program-ran"
         hostile = root.parent / "hostile-pack.sh"
-        hostile.write_text(f'#!/bin/sh\ntouch "{marker}"\nexit 1\n')
+        hostile.write_text(f'#!/bin/sh\ntouch "{marker}"\nexit 1\n', newline="\n")
         hostile.chmod(0o755)
         _git("config", "--local", "remote.origin.uploadpack", str(hostile), cwd=root)
         _git("config", "--local", "remote.origin.receivepack", str(hostile), cwd=root)

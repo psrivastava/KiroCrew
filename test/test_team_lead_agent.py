@@ -133,11 +133,13 @@ class TestTheLeadReportsToItsParent:
         assert "unless a conductor" in prompt
 
     def test_the_spec_can_reach_both_worker_verbs(self, installed):
-        """The server is mounted whole, so ``work_report`` is served; ``work_brief`` is
-        also auto-approved, ``work_report`` prompts like a nested conductor's."""
+        """The server is mounted whole, so ``work_report`` is served; ``work_brief`` and
+        ``work_report`` are both auto-approved, as for a nested conductor
+        (rfc-conductor-own-child-verbs.md, section 5.5)."""
         assert _reachable(installed, "kirocrew-work", "work_report")
         assert _reachable(installed, "kirocrew-work", "work_brief")
         assert "@kirocrew-work/work_brief" in installed["allowedTools"]
+        assert "@kirocrew-work/work_report" in installed["allowedTools"]
 
 
 class TestTheLeadCanDispatch:
@@ -227,6 +229,36 @@ class TestTheLeadCanDispatch:
         assert {"srv", "kirocrew-dashboard", "kirocrew-work"} <= set(seen[-1])
         assert "autoApprove" not in spec["mcpServers"]["srv"]
 
+    def test_the_tool_search_loader_is_auto_approved(self, installed):
+        """The dispatch verbs are deferred under MCP Tool Search, so the load that
+        reaches them must not prompt first -- the conductor's rule."""
+        assert "tool_search" in installed["tools"]
+        assert "tool_search" in installed["allowedTools"]
+
+    def test_the_loader_grant_passes_through_the_governance_ceiling(self, tmp_path, monkeypatch):
+        """A ceiling that withholds ``tool_search`` keeps it off ``allowedTools`` while
+        it stays mounted, so the load prompts instead of vanishing."""
+        from kiro_crew.agent_materialization import auto_approve
+
+        monkeypatch.setattr(agent, "kiro_agents_dir_path", lambda: tmp_path)
+        monkeypatch.setattr(auto_approve, "_may_auto_approve", lambda ref: ref != "tool_search")
+        service_agents._install_team_lead_agent()
+        spec = json.loads((tmp_path / TEAM_LEAD_AGENT_FILENAME).read_text(encoding="utf-8"))
+        assert "tool_search" in spec["tools"]
+        assert "tool_search" not in spec["allowedTools"]
+        assert "@kirocrew-dashboard/session_create" in spec["allowedTools"]
+
+    def test_no_loader_grant_when_the_inherited_tools_drop_it(self, tmp_path, monkeypatch):
+        """An operator whose tools leave out the loader gets no dead grant for it."""
+        base = agent.build_agent_config()
+        base["tools"] = [t for t in base["tools"] if t != "tool_search"]
+        monkeypatch.setattr(agent, "build_agent_config", lambda: json.loads(json.dumps(base)))
+        monkeypatch.setattr(agent, "kiro_agents_dir_path", lambda: tmp_path)
+        service_agents._install_team_lead_agent()
+        spec = json.loads((tmp_path / TEAM_LEAD_AGENT_FILENAME).read_text(encoding="utf-8"))
+        assert "tool_search" not in spec["tools"]
+        assert "tool_search" not in spec["allowedTools"]
+
     def test_it_does_not_mount_the_panel_server(self, installed):
         assert "kirocrew-panel" not in installed["mcpServers"]
         assert not any("kirocrew-panel" in t for t in installed["tools"])
@@ -236,10 +268,13 @@ class TestTheLeadCanDispatch:
         assert "`team-lead` skill" in prompt
         assert "`goal-conductor`" in prompt
         assert "session_create" in prompt
-        assert len(prompt.splitlines()) < 40
-        # Nothing copied from the conductor charter.
+        from kiro_crew.agent_parts.spec_prompts import _ASK_ONLY_WHEN_NEEDED_RULE
+
+        shared = _ASK_ONLY_WHEN_NEEDED_RULE.splitlines()
+        assert len(prompt.splitlines()) - len(shared) < 40
+        # Nothing copied from the conductor charter; the one shared rule is named, not copied.
         for line in agent._CONDUCTOR_SYSTEM_PROMPT.splitlines():
-            if len(line) > 60:
+            if len(line) > 60 and line not in shared:
                 assert line not in prompt, line
 
 
@@ -388,3 +423,15 @@ def test_a_failed_research_install_holds_the_ceiling_instead_of_syncing(
         "a failed research rewrite must mark the ceiling held so a tightened ceiling "
         "is retried, not recorded as synced over the stale grant list"
     )
+
+
+def test_both_conductor_charters_carry_the_ask_only_when_needed_rule() -> None:
+    """Ultra Mode runs on the team lead, a goal on the conductor: both agent prompts
+    (not session context, which ranks below the skill) say when to stop and ask."""
+    from kiro_crew.agent_parts.spec_prompts import _ASK_ONLY_WHEN_NEEDED_RULE
+
+    rule = _ASK_ONLY_WHEN_NEEDED_RULE.strip()
+    assert rule.startswith("**Ask only when you must.**")
+    assert "A milestone report is a statement" in rule
+    for prompt in (agent._CONDUCTOR_SYSTEM_PROMPT, agent._TEAM_LEAD_SYSTEM_PROMPT):
+        assert rule in prompt

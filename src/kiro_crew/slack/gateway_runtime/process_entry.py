@@ -261,7 +261,12 @@ def _start_kas_cli_floor(cfg: KiroCrewConfig) -> "asyncio.Task[None]":
     member = not bundle and getattr(agent, "member_acp_backend", None) == ACP_BACKEND_KAS
     task = asyncio.create_task(_run(), name="kas-cli-floor")
     _KAS_CLI_FLOOR_TASK = task
-    kas_floor_wait.arm_kas_floor_wait(task, main=kas_main or kiro_main, member=member)
+    # A Bot can land on KAS with neither field naming it (an inherited member harness
+    # its worker spec cannot use, or a pin that runs on KAS). Judging that scans the
+    # roster, which stays off the boot path: the member wait is armed on every
+    # non-bundle route here, and ``_kas_floor_gates_spawns`` (off the loop) releases
+    # it at once unless a Bot may land on KAS.
+    kas_floor_wait.arm_kas_floor_wait(task, main=kas_main or kiro_main, member=not bundle)
     return _KAS_CLI_FLOOR_TASK
 
 
@@ -280,7 +285,11 @@ def _kas_floor_gates_spawns(cfg: KiroCrewConfig) -> tuple[bool, bool]:
     kas_main = getattr(agent, "acp_backend", None) == ACP_BACKEND_KAS
     kiro_main = getattr(agent, "acp_backend", None) == ACP_BACKEND_KIRO
     kas_member = getattr(agent, "member_acp_backend", None) == ACP_BACKEND_KAS
-    if not (kas_main or kiro_main or kas_member):
+    # A Bot's KAS fallback is nobody's stored choice, so it waits for the verdict.
+    from kiro_crew.crewmate_harness import bots_may_run_on_kas
+
+    bot_kas = bots_may_run_on_kas(cfg)
+    if not (kas_main or kiro_main or kas_member or bot_kas):
         return False, False
     try:
         from kiro_crew.config.loader import acp_backend_declared, member_acp_backend_declared
@@ -292,7 +301,7 @@ def _kas_floor_gates_spawns(cfg: KiroCrewConfig) -> tuple[bool, bool]:
         return (
             (kas_main and not acp_backend_declared())
             or (kiro_main and acp_backend_stored_as_kiro()),
-            kas_member and not member_acp_backend_declared(),
+            (kas_member and not member_acp_backend_declared()) or bot_kas,
         )
     except Exception:
         logging.getLogger(__name__).debug("backend declared-check failed", exc_info=True)
@@ -442,6 +451,13 @@ async def run_gateway(
     # to this gateway.  Must run BEFORE any to_thread offload.
     configure_default_executor()
 
+    # ── Inherited agent scratch temp ──
+    # Started from inside an agent session, the gateway inherits that session's
+    # scratch exports: a directory another pid owns, which the hourly sweep
+    # reclaims while this gateway still names it as its temp. Off the loop: it
+    # resolves paths and probes the temp directory.
+    await asyncio.to_thread(agent_scratch.drop_own_inherited_scratch_env)
+
     # ── Publish surface, pinned for the process ──
     # Recorded BEFORE any service spins up, because both doors out are opened by
     # services started below: the dashboard's boot-time ``setup_tunnel`` and the
@@ -459,8 +475,8 @@ async def run_gateway(
     try:
         boot_platform(cfg)
     except Exception as exc:
-        # Enterprise build: failed governance rules exit with the fix named.
-        from kiro_crew.enterprise_boot import refuse_policy_boot
+        # LTS build: failed governance rules exit with the fix named.
+        from kiro_crew.lts_boot import refuse_policy_boot
 
         refuse_policy_boot(exc)
         raise
@@ -609,6 +625,17 @@ async def run_gateway(
                     await asyncio.to_thread(work_root.sweep_work_root)
                 except Exception:
                     logging.getLogger(__name__).debug("work-root sweep failed", exc_info=True)
+                # The large-transfer staging root rides the SAME hourly wake, same
+                # posture: a snapshot/restore/import removes its own per-call subtree on
+                # success and failure, so this reclaims only a tree orphaned by a hard
+                # crash. Idle-keyed with a short grace (see kiro_crew.staging); its own
+                # try/except so one root's failure never skips another's sweep.
+                try:
+                    from kiro_crew import staging
+
+                    await asyncio.to_thread(staging.sweep_staging)
+                except Exception:
+                    logging.getLogger(__name__).debug("staging sweep failed", exc_info=True)
                 # The per-run work directories of subagent and stateless cron
                 # sessions ride the same wake. The ordinary end of a run reclaims
                 # its own (AcpProvider.shutdown); the boot sweep took what a dead

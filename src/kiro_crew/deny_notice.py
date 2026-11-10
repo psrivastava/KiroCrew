@@ -28,13 +28,15 @@ from kiro_crew.constants import (
     DENY_CAUSE_APPROVAL_UNDELIVERABLE,
     DENY_CAUSE_AUDIT_UNAVAILABLE,
     DENY_CAUSE_BATCH_CASCADE,
+    DENY_CAUSE_BATCH_READ_WRITE,
     DENY_CAUSE_HOOK_ERROR,
     DENY_CAUSE_INVALID_NAME,
     DENY_CAUSE_POLICY,
     DENY_CAUSE_SURFACE_POLICY,
+    DENY_CAUSE_UNREADABLE_IDENTITY,
     STEER_NOTICE_BOUND_SECS,
 )
-from kiro_crew.deny_guidance import remediation_for
+from kiro_crew.deny_guidance import remediation_for, rule_id_for
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 
 logger = logging.getLogger(__name__)
@@ -53,7 +55,8 @@ logger = logging.getLogger(__name__)
 #: cause → (clause completing "The tool call you just made …", what to do next).
 _DENY_CAUSE_TEXT: dict[str, tuple[str, str]] = {
     DENY_CAUSE_POLICY: (
-        "was blocked by a Kiro Crew safety policy",
+        "was blocked by a Kiro Crew safety policy before any of it ran: if it "
+        "chained several shell commands, none of them ran, the earlier ones included",
         "use an allowed alternative (for a shell command, a read-only variant), use "
         "a different tool, or — if the block is correct and you genuinely cannot "
         "proceed — say so and stop with the reason.",
@@ -86,6 +89,14 @@ _DENY_CAUSE_TEXT: dict[str, tuple[str, str]] = {
         "whole. Address what declined that earlier tool (the reason above), then "
         "re-issue the calls you still need; if you genuinely cannot proceed "
         "without them, say so and stop with the reason.",
+    ),
+    DENY_CAUSE_BATCH_READ_WRITE: (
+        "was declined by the Kiro Crew batch guard, because it is a write sent in "
+        "the same parallel batch as a read whose result it may depend on",
+        "the action itself was not judged and nothing ran. Wait for the reads in "
+        "that batch to return and check their output, then re-issue this call by "
+        "itself in your next step, with values copied from that output. Do not "
+        "send it again in a batch that also holds a read.",
     ),
     DENY_CAUSE_APPROVAL_TIMEOUT: (
         "was auto-declined because its approval prompt expired unanswered",
@@ -127,6 +138,15 @@ _DENY_CAUSE_TEXT: dict[str, tuple[str, str]] = {
         "approved, and the surface refused to run it unrecorded. Retrying the "
         "identical call is reasonable once; if it is refused again, say what "
         "happened rather than working around it silently.",
+    ),
+    DENY_CAUSE_UNREADABLE_IDENTITY: (
+        "was refused by the Kiro Crew gateway because the MCP tool identity the "
+        "backend reported for it could not be read, so the per-tool rules it is "
+        "under could not be checked",
+        "nothing judged the action itself, and the identity is the backend's "
+        "report, not part of the call you wrote, so the identical call would be "
+        "refused the same way. Do not retry it unchanged: reach the same result "
+        "with a different tool, or if none fits, say so and stop with the reason.",
     ),
 }
 
@@ -174,6 +194,12 @@ def build_refusal_steer_notice(
         return ""
     clause, guidance = _DENY_CAUSE_TEXT.get(cause, _DENY_CAUSE_TEXT[DENY_CAUSE_POLICY])
     what = f"{title}: {reason}" if reason else title
+    # A catalog rule is named by its id first: the pattern alone is a regex the
+    # model has to decode, beside a tool result that says the user refused. The
+    # reason follows unchanged as the detail.
+    rule_id = rule_id_for(reason) if cause == DENY_CAUSE_POLICY else None
+    if rule_id:
+        what = f"{title}: blocked by rule {rule_id}. Detail: {reason}"
     # Class-specific remediation, for the policy cause only. The non-policy
     # causes judged nothing about the action — an invalid tool name is the
     # model's own malformed output, a hook fault is a host fault, a cascaded

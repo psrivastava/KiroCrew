@@ -5,6 +5,7 @@ import type { KiroCrewAgent } from '../components/AgentSelector'
 import { withMarkdownBlocks } from '../lib/markdownAgents'
 import { jsonEqual } from '../utils/structuralEqual'
 import { setCrewModeCatalog, withoutConductors } from '../lib/crewMode'
+import { useCrewMode } from './usePreviewFlag'
 
 /**
  * Reads the execution-choice catalog (`GET /api/agents/catalog`): configured
@@ -30,10 +31,12 @@ import { setCrewModeCatalog, withoutConductors } from '../lib/crewMode'
  *   `dashboard.crewmates_in_agent_picker` config is `true` (read from the shared
  *   `['kirocrewConfig']` query, like `useCrewmateThreadsFlag`), a member row is
  *   withheld when a listed template reaches the same binding (see
- *   `withoutCoveredCrewmates`); a crewmate no template covers stays pickable, and
- *   so does the member named as the default agent unless a listed template
- *   shares its name. Conductor templates (the catalog's `conductor_agents`) are
- *   always left out: a chat reaches a conductor through Crew Mode.
+ *   `withoutCoveredCrewmates`: the member has no memory of its own and runs a
+ *   listed template); a crewmate no template covers stays pickable. Being the
+ *   default agent earns a member no exemption: a covered default member is
+ *   withheld like any other. Conductor templates (the catalog's
+ *   `conductor_agents`) are always left out: a chat reaches a conductor
+ *   through Crew Mode.
  *   With the key on, every member is listed, a member and a template of one name
  *   are two rows here, and picking one sends its kind.
  * @returns `agents` — the same catalog folded to ONE row per name for the
@@ -106,6 +109,8 @@ export function useAgents(refreshTrigger: number, sessionKey?: string, projectDi
   // unchanged, so without this a new `agent.crew_mode_agent` left the picker
   // hiding the old conductor and offering the new one.
   const [crewCatalogKey, setCrewCatalogKey] = useState('')
+  // The Crew Mode preview decides whether a conductor is hidden from the picker.
+  const crewMode = useCrewMode()
   const reload = useCallback(() => {
     setReloading(true)
     setReloadTick(t => t + 1)
@@ -141,7 +146,7 @@ export function useAgents(refreshTrigger: number, sessionKey?: string, projectDi
       // Recorded before the state update below re-renders, so every reader of
       // lib/crewMode (the Crew Mode switch, the picker filter) sees this catalog's
       // conductor on the same render as its rows.
-      setCrewModeCatalog(d.crew_mode_agent, d.conductor_agents)
+      setCrewModeCatalog(d.crew_mode_agent, d.conductor_agents, d.default_agent)
       setCrewCatalogKey(crewCatalogIdentity(d.crew_mode_agent, d.conductor_agents))
       // Every `refresh` frame and every session switch refetches the catalog,
       // and the reply is almost always the roster already held. Keeping the
@@ -174,14 +179,14 @@ export function useAgents(refreshTrigger: number, sessionKey?: string, projectDi
   const pickerChoices = useMemo(
     () => withoutConductors(memberChoices ? choices : withoutCoveredCrewmates(choices)),
     // eslint-disable-next-line react-hooks/exhaustive-deps -- crewCatalogKey stands for the conductor set withoutConductors reads from lib/crewMode
-    [choices, memberChoices, crewCatalogKey],
+    [choices, memberChoices, crewCatalogKey, crewMode],
   )
   // The picker's rows as of the last successful load, for display-only labels
   // that must agree with the picker on when a same-name pair exists (#19472).
   const displayPickerChoices = useMemo(
     () => withoutConductors(memberChoices ? displayChoices : withoutCoveredCrewmates(displayChoices)),
     // eslint-disable-next-line react-hooks/exhaustive-deps -- same conductor-set dependency as pickerChoices
-    [displayChoices, memberChoices, crewCatalogKey],
+    [displayChoices, memberChoices, crewCatalogKey, crewMode],
   )
 
   return { agents, displayAgents, choices: pickerChoices, displayChoices: displayPickerChoices, defaultAgent, error, reload, reloading }
@@ -218,7 +223,7 @@ export function withoutCoveredCrewmates(choices: KiroCrewAgent[]): KiroCrewAgent
 }
 
 /** One row per name, member first — see `agents` in the hook's docs. */
-function foldByName(choices: KiroCrewAgent[]): KiroCrewAgent[] {
+export function foldByName(choices: KiroCrewAgent[]): KiroCrewAgent[] {
   const byName = new Map<string, KiroCrewAgent>()
   for (const row of choices) {
     const held = byName.get(row.name)

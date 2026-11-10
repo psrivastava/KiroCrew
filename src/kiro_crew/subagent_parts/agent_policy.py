@@ -394,6 +394,12 @@ def spawn_allowlist(spec: Mapping[str, Any]) -> tuple[str, ...] | None:
     settings = spec.get("toolsSettings")
     if not isinstance(settings, Mapping):
         return None
+    # The one key of the sub-agent alias group kiro-cli reads (``crew``,
+    # ``agentCrew``, ``subagent``, ...), the same one the KAS projection reads.
+    from kiro_crew.platform.tools_settings_aliases import canonical_tools_settings
+
+    settings, _ = canonical_tools_settings(dict(settings))
+    # The fold files every sub-agent spelling under `subagent`.
     subagent = settings.get("subagent")
     if not isinstance(subagent, Mapping) or "availableAgents" not in subagent:
         return None
@@ -561,10 +567,17 @@ def _scope_spawn_allowlists(
         logger.warning("agents directory %s is not scannable (%s); refusing spawn", agents_dir, exc)
         return None, False
     try:
+        from kiro_crew.agent_spec_pins import pinned_memo_key, spec_pins
+
+        # A pin change is a miss: the pin chooses which claimant's list applies.
+        # One snapshot keys and scans, so a concurrent pin write cannot cross them.
+        pins = spec_pins()
         return memo.get(
             agents_dir,
-            parent_template,
-            lambda: _scan_parent_spawn_allowlists(agents_dir, parent_template, operation),
+            pinned_memo_key(parent_template, pins),
+            lambda: _scan_parent_spawn_allowlists(
+                agents_dir, parent_template, operation, pins=pins
+            ),
         )
     except OSError as exc:  # the directory walk itself failed: an unknown answer
         logger.warning("agents directory %s is not scannable (%s); refusing spawn", agents_dir, exc)
@@ -669,7 +682,11 @@ _PARENT_PROJECT_ALLOWLIST_MEMO: AgentsDirMemo[_ScopeAllowlists] = AgentsDirMemo(
 
 
 def _scan_parent_spawn_allowlists(
-    agents_dir: Path, parent_template: str, operation: str = "spawn_available_agents"
+    agents_dir: Path,
+    parent_template: str,
+    operation: str = "spawn_available_agents",
+    *,
+    pins: Mapping[str, str] | None = None,
 ) -> _ScopeAllowlists:
     """One fresh walk of *agents_dir* for :func:`parent_spawn_allowlists`.
 
@@ -708,7 +725,31 @@ def _scan_parent_spawn_allowlists(
             unreadable.append(path)
         else:
             rows.append((data, path))
-    declared = [data for data, _path in rows if data.get("name") == parent_template]
+    from kiro_crew import agent_spec_pins
+
+    declared_rows = [(data, path) for data, path in rows if data.get("name") == parent_template]
+    if operation == "spawn_available_agents_project":
+        # ``agent.spec_pins`` chooses among the USER-level agents directory only;
+        # every project claimant's allowlist stays in the intersection.
+        decision, pin = "none", None
+    else:
+        decision, pin = agent_spec_pins.pin_decision(
+            parent_template, [path.name for _data, path in declared_rows], pins
+        )
+    if decision == "broken":
+        # The resolver refuses this parent's spec, so its allowlist is UNKNOWN: no
+        # other claimant's list, and no filename fallback, stands in for it.
+        logger.warning(
+            "parent agent %r is pinned to %r, which no spec declaring it is; "
+            "refusing spawn (fail-closed)",
+            parent_template,
+            pin,
+        )
+        return None, False
+    # The parent session runs the pinned claimant when ``agent.spec_pins`` chooses
+    # one, so its allowlist is the one that applies. Any other case keeps every
+    # claimant, the strictest reading.
+    declared = [data for data, path in declared_rows if decision != "use" or path.name == pin]
     if not declared:
         # No readable spec declares the name. kiro-cli resolves a name by the
         # DECLARED ``name`` first, so the declaration may sit in a spec file the
@@ -828,11 +869,48 @@ def parent_template_allowlists(
             (*parent_project_dirs(parent_session_key), *_accepted_project_dirs(accepted_dirs))
         )
     )
-    return parent_spawn_allowlists(
+    lists = parent_spawn_allowlists(
         template,
         dirs,
         parent_session_key=parent_session_key,
     )
+    if lists is None:
+        return None
+    worker = _bot_worker_allowlist(template, parent_session_key)
+    if worker is None:
+        return None
+    return lists + worker
+
+
+def _bot_worker_allowlist(
+    template: str, parent_session_key: str
+) -> tuple[tuple[str, ...], ...] | None:
+    """The ``availableAgents`` list a Bot's worker session carries, as one more list.
+
+    A Bot's worker runs its session's merged spec, which lives in the Bot's folder
+    rather than ``~/.kiro/agents``, so the directory scan above never sees the
+    list a template brought onto it (``mate_spec_policy``). ``()`` for any other
+    template or a worker that declares nothing; ``None`` (refuse) when the merged
+    spec cannot be read, since the list it may hold is then unknown.
+    """
+    from kiro_crew.mate_worker import MATE_WORKER_AGENT, mate_service_scope_spec
+
+    if template != MATE_WORKER_AGENT:
+        return ()
+    try:
+        scoped = mate_service_scope_spec(template, parent_session_key)
+    except Exception:  # noqa: BLE001 - any failure leaves the list unknown
+        logger.warning(
+            "Bot worker %s: merged spec unreadable; refusing its spawns",
+            parent_session_key,
+            exc_info=True,
+        )
+        return None
+    spec = scoped[0] if scoped is not None else None
+    if spec is None:
+        return None
+    declared = spawn_allowlist(spec)
+    return () if declared is None else (declared,)
 
 
 def conductor_spawn_refusal(parent_template: str) -> str | None:
@@ -851,7 +929,7 @@ def conductor_spawn_refusal(parent_template: str) -> str | None:
     if parent_template != MATE_CONDUCTOR_AGENT:
         return None
     return (
-        "a crewmate's own chat starts no sub-agents: hand the work to a worker session "
+        "a Bot's own chat starts no sub-agents: hand the work to a worker session "
         "with session_create, give it the brief with session_send, and read its answer "
         "with session_read_message"
     )

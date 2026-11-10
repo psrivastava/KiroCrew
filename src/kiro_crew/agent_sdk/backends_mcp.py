@@ -27,6 +27,7 @@ from kiro_crew.agent_sdk.backends import (
     ACP_BACKEND_KIRO,
     ACP_BACKEND_OPENCODE,
     ACP_BACKEND_PI,
+    ACP_BACKEND_STRANDS,
 )
 
 # ── Capability: where a harness gets its MCP servers ──
@@ -84,7 +85,7 @@ from kiro_crew.agent_sdk.backends import (
 # entry with pi's built-in MCP support (``pi.registerMcpServer``; the release that
 # carries it is ``PI_MIN_VERSION``). The array still travels on the wire because
 # the session report reads its roster from it. Captured as a ROUND TRIP against
-# pi-acp 0.0.34 over pi 1.3.0: ``test/fixtures/acp_frames/pi/mcp-stdio-mount-live.jsonl``
+# pi-acp 0.0.34 over pi 1.4.0: ``test/fixtures/acp_frames/pi/mcp-stdio-mount-live.jsonl``
 # -- the server is asked ``initialize``, ``tools/list`` and ``tools/call``, the call
 # raises ``session/request_permission`` through the gate first, and the tool's own
 # result reaches the turn. A same-named server in pi's own ``mcp.json`` (user-level,
@@ -139,6 +140,14 @@ from kiro_crew.agent_sdk.backends import (
 # The array still carries the stdio elements on the wire because the session report
 # and the mount check read their roster from it, and each transport has exactly one
 # channel that mounts it, so nothing is mounted twice.
+#
+# strands is a member on pi's terms, one step further: the array is composed like
+# every member's, and none of it goes on the wire. The Strands CLI refuses a
+# non-empty ``session/new`` array in its Python-project mode, so the strands launch
+# writes the whole composition to an owner-only ``--mcp-config`` file
+# (``acp.harness.strands``) and the CLI mounts it at start, with its own discovery of
+# other tools' MCP files switched off. Captured as a round trip:
+# ``test/fixtures/acp_frames/strands/mcp-stdio-mount-live.jsonl``.
 ACP_BACKENDS_SESSION_MCP_ARRAY: FrozenSet[str] = frozenset(
     {
         ACP_BACKEND_CLAUDE,
@@ -148,6 +157,7 @@ ACP_BACKENDS_SESSION_MCP_ARRAY: FrozenSet[str] = frozenset(
         ACP_BACKEND_DEEPSEEK,
         ACP_BACKEND_PI,
         ACP_BACKEND_COPILOT,
+        ACP_BACKEND_STRANDS,
     }
 )
 
@@ -350,15 +360,26 @@ ACP_BACKENDS_SPEC_SERVERS_OFF_WIRE = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KA
 # spec's ``tools`` is read beside the member mounts and ``_deny_zero_tools`` answers
 # every request with the reject option. Measured end to end on a zero-tool spec:
 # ``test/fixtures/acp_frames/pi/zero-tools-refused-live.jsonl`` (pi-acp 0.0.34 over
-# pi 1.3.0, driven through ``AcpClient``) holds a ``write``, a ``bash``, an MCP call
+# pi 1.4.0, driven through ``AcpClient``) holds a ``write``, a ``bash``, an MCP call
 # and a tool pi does not have, each ended ``failed`` with nothing on disk, and a
 # session with no gate extension is refused before its first prompt by the routing.
 #
-# claude is NOT a member: its routing, ``Routing.SEEDED_SETTINGS``, is declared but
-# not enforced by this core (see ``Routing``'s docstring and
-# ``tool_gate.ENFORCED_ROUTINGS``) -- an operator's own ``~/.claude`` settings can
-# pre-approve a tool, which skips ``session/request_permission`` entirely, so
-# ``_deny_zero_tools`` never runs to close the mirror's allowlist-only translation.
+# claude is a member on a ground of its own: a zero-tool session MOUNTS NO TOOL, so
+# no call is made for a refusal to judge. Its routing, ``Routing.SEEDED_SETTINGS``,
+# is still not enforced by this core (see ``Routing``'s docstring and
+# ``tool_gate.ENFORCED_ROUTINGS``), and an operator's own ``~/.claude`` settings can
+# pre-approve a tool, skipping ``session/request_permission``. So the ban is not
+# left to ``_deny_zero_tools``: ``AcpClient._claude_session_meta`` sends
+# ``_meta.claudeCode.options.tools`` empty (no built-in exists) with
+# ``strictMcpConfig`` (no user, project or plugin server), the wire array must be
+# empty (``refuse_claude_zero_tool_mounts``), and an adapter below
+# ``CLAUDE_ACP_SETTING_SOURCES_MIN_VERSION`` is stopped before its first prompt.
+# Membership also binds ``_deny_zero_tools``, for any request that still arrives.
+# Measured on claude-agent-acp 0.94.0, and the same on 0.93.0 (the installers' pin):
+# ``test/fixtures/acp_frames/claude/zero-tools-refused-live.jsonl``. With a project
+# allow rule for Bash, Write and WebFetch in force, a prompt asking for all three
+# raised no ``tool_call`` and no permission request and nothing reached the disk;
+# the same session without the options ran all three unasked.
 #
 # codex is NOT a member: its sessions are served by ``AcpRuntime`` /
 # ``AcpSessionHandle`` (``acp/runtime_class.py``, ``acp/session_handle_class.py``), which carry
@@ -371,14 +392,82 @@ ACP_BACKENDS_SPEC_SERVERS_OFF_WIRE = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KA
 # session's own directory WITHOUT a permission request (measured -- its ``view``
 # ran unasked), so ``_deny_zero_tools`` never sees that call and a total ban cannot
 # be honoured.
+#
+# strands is a member on pi's grounds: Crew's gate module raises an interrupt for
+# EVERY tool call of every Strands ``Agent`` in the process -- built-in, the
+# project's own, vended or MCP -- which the CLI forwards as
+# ``session/request_permission``, so ``_deny_zero_tools`` sees each one; it is
+# mirrored, enforced (``Routing.VERIFIED_GATE_EXTENSION``) and ``AcpClient``-served.
 ACP_BACKENDS_HONOR_ZERO_TOOL_BAN = frozenset(
     {
         ACP_BACKEND_KIRO,
         ACP_BACKEND_KAS,
+        ACP_BACKEND_CLAUDE,
         ACP_BACKEND_OPENCODE,
         ACP_BACKEND_GOOSE,
         ACP_BACKEND_DEEPSEEK,
         ACP_BACKEND_PI,
+        ACP_BACKEND_STRANDS,
+    }
+)
+
+# Backends that honour a remote MCP entry's ``oauth`` block (the pre-registered
+# client id, redirect URI and scopes a Connections provider writes). Only kiro-cli
+# reads it: it loads the entry from the agent file it was launched with. KAS takes
+# its agents over ``_meta.kiro.customAgents``, whose remote-server schema has no
+# ``oauth`` slot, so the block is dropped and the engine falls back to dynamic
+# client registration, which a pre-registered provider does not offer.
+# The kiro-cli relay route of KAS projects through the same schema, so it is not a
+# member either. A backend joins only once its own path carries the block to the
+# engine; until then the Connections page marks those providers kiro-cli only.
+ACP_BACKENDS_REMOTE_MCP_OAUTH = frozenset({ACP_BACKEND_KIRO})
+
+# Backends whose sessions reach a Crew-owned Connection (``crew_oauth`` preview)
+# through the gateway bridge instead of the vendor's own sign-in. A member must
+# raise a permission request for every bridged call that names the server with a
+# trusted identity and the tool's arguments as the MCP server receives them, since
+# the gateway proxy forwards a ``tools/call`` only against the approval minted from
+# that request. KAS (forced ``ask`` rule, ``_meta.kiro`` identity) and claude (placed
+# server adopted from ``_meta.claudeCode``, ``rawInput`` is the tool input) meet that.
+# The bridge's stdio child reads its snapshot from ``crew-oauth-bridge``, the one
+# snapshot leaf an enforced harness's child may read (``kas-mcp-launch`` stays
+# withheld). kiro-cli never joins: it runs the vendor's OAuth itself.
+# goose names the server in ``_meta.goose.toolCall`` and its ``rawInput`` is the
+# ``arguments`` it sends (``confirmation_request`` and ``McpClient::call_tool``).
+# dsh names the tool only by the name it registers and dispatches by, the
+# ``tool_call`` title, split for a bridged server alone
+# (``permission_requests.bridged_title_identity``); its ``rawInput`` is the args
+# object its MCP client sends. opencode stays out: its ask carries ``rawInput`` ``{}``
+# and the arguments arrive only after the answer
+# (``acp_frames/opencode/crew-oauth-bridge-args-live.jsonl``), so no approval binds them.
+# Captured live: kas ``acp_frames/kas/mcp-live-apply-live.jsonl`` (``_meta.kiro.mcpTool``
+# on the request), claude ``acp_frames/claude/mcp-stdio-mount-live.jsonl`` (the placed
+# server on ``_meta.claudeCode.mcpServer``), goose
+# ``acp_frames/goose/crew-oauth-bridge-args-live.jsonl``, deepseek
+# ``acp_frames/deepseek/crew-oauth-bridge-args-live.jsonl``; replayed into an approval by
+# ``test/test_crew_oauth_bridge_harnesses.py``.
+# codex: ``rawInput`` is ``{server, tool, arguments}`` and ``arguments`` is what the
+# server's ``tools/call`` carried, ``acp_frames/codex/crew-oauth-bridge-args-live.jsonl``;
+# a tool marked ``readOnlyHint`` runs unasked, so the proxy strips ``annotations``.
+# copilot: the bridge's stdio element rides the launch file, as the probe server of
+# ``acp_frames/copilot/mcp-stdio-mount-live.jsonl`` did, and allow-always is answered once.
+# pi: the gate envelope's ``input`` is the call's arguments,
+# ``acp_frames/pi/mcp-stdio-mount-live.jsonl``; a Crew-owned Connection is the one spec
+# server its broker-only composition carries (RFC row 3f). The server and tool come
+# from the envelope's ``mcp`` owner, which the extension reads off its own registration
+# table and Crew trusts for the Connection approval only.
+# strands: the gate module's ``owner: mcp:<server>`` names the server and ``input`` the
+# arguments, ``acp_frames/strands/mcp-stdio-mount-live.jsonl``.
+ACP_BACKENDS_CREW_OAUTH_BRIDGE = frozenset(
+    {
+        ACP_BACKEND_KAS,
+        ACP_BACKEND_CLAUDE,
+        ACP_BACKEND_CODEX,
+        ACP_BACKEND_COPILOT,
+        ACP_BACKEND_PI,
+        ACP_BACKEND_STRANDS,
+        ACP_BACKEND_GOOSE,
+        ACP_BACKEND_DEEPSEEK,
     }
 )
 
@@ -405,8 +494,8 @@ ACP_BACKENDS_PRUNE_UNSTARTABLE_MCP = frozenset(
 # shares one entry per model: on kiro-cli that sharing is the engine's own, and Crew
 # reads the file back at construction so its map names the level the engine will
 # run. KAS never opens it -- its level travels as the ``effortLevel`` config option
-# -- so reading it back there ran a new chat at whatever level another chat in the
-# same work dir picked last. A non-member's level comes from the provider factory
+# -- so reading it back there would run a new chat at whatever level another chat in
+# the same work dir picked last. A non-member's level comes from the provider factory
 # (the slot's own pick, persisted per slot, else the crew, role or global default),
 # and the file is neither written, read back, nor cleared for it.
 ACP_BACKENDS_EFFORT_OVERLAY = frozenset({ACP_BACKEND_KIRO})
@@ -422,19 +511,16 @@ ACP_BACKENDS_TOOL_SEARCH_OVERLAY = frozenset({ACP_BACKEND_KIRO})
 # Backends that take feature settings from the ACP ``initialize`` request, under
 # ``clientCapabilities._meta.kiro.settings``. KAS is the only member: it opened
 # that channel (``KAS_CLIENT_CAPABILITIES``), and the runtime fills it at spawn
-# with the settings the harness declares it reads -- today Tool Search, gated on
-# the spawn agent's spec granting the ``tool_search`` loader, because KAS defers
-# every MCP tool not on ``toolSearch.neverDefer`` whatever ``enabled`` says, so a
-# spec without the loader is sent its MCP tools on that list. kiro-cli
-# is not a member: it has no such channel and reads the overlay file instead.
-# Captured live on KAS 0.66.70 (kiro-cli 2.35.1):
-# ``test/fixtures/acp_frames/kas/client-meta-settings-live.jsonl``. The client's
-# initialize carried ``settings.toolSearch.neverDefer=["probe::probe_codeword"]``,
-# and the probe tool's tool_call came back with ``_meta.kiro.toolOrigin: "client"``
-# -- KAS kept it direct because the client's settings named it, not by its own
-# default deferral (a control run with an empty settings object showed the same
-# tool with toolOrigin ``default``). kiro-cli has no capture here because it reads
-# no such channel.
+# with the settings the harness declares it reads: Tool Search, gated on the spawn
+# agent's spec granting the ``tool_search`` loader, because KAS defers every MCP tool
+# not on ``toolSearch.neverDefer`` whatever ``enabled`` says, so a spec without the
+# loader is sent its MCP tools on that list. kiro-cli is not a member: it has no such
+# channel and reads the overlay file instead.
+# LIVE on KAS 0.66.70 (kiro-cli 2.35.1),
+# ``test/fixtures/acp_frames/kas/client-meta-settings-live.jsonl``: an initialize
+# carrying ``settings.toolSearch.neverDefer=["probe::probe_codeword"]`` made the
+# probe tool's tool_call come back with ``_meta.kiro.toolOrigin: "client"``, where a
+# control run with empty settings showed ``default``.
 ACP_BACKENDS_CLIENT_META_SETTINGS = frozenset({ACP_BACKEND_KAS})
 
 # Backends that reconcile an edited agent config into their RUNNING sessions: a
@@ -501,6 +587,35 @@ ACP_BACKENDS_MCP_CONFIG_HOT_RELOAD = frozenset({ACP_BACKEND_KIRO})
 # and load of a resident session with a changed array, so none inherits a skip
 # whose wrong grant leaves a server unmounted with nothing red to say why.
 ACP_BACKENDS_MCP_WIRE_REINJECT = frozenset({ACP_BACKEND_KAS})
+
+# Backends whose RUNNING session takes a changed MCP server set by Crew RELAUNCHING
+# its process with the new launch-time MCP config and ``session/load``-ing the same
+# session id, with the conversation kept. The third way a live session applies a
+# config change without a reset, beside the file watcher
+# (``ACP_BACKENDS_MCP_CONFIG_HOT_RELOAD``) and the re-sent projection
+# (``ACP_BACKENDS_MCP_WIRE_REINJECT``); the dashboard's MCP writers skip their
+# all-sessions reset when every live provider answers one of the three.
+#
+# Membership is a MEASURED relaunch, not a reading of the CLI's flags. The Strands
+# CLI reads its MCP servers once, from ``--mcp-config`` at launch, and refuses a
+# non-empty ``session/new`` array in project mode, so nothing reaches a running
+# process. A SECOND process launched with a changed ``--mcp-config`` and sent
+# ``session/load`` of the same id (empty array) replays the saved conversation,
+# answers ``{}``, and its next turn sees the new set with the earlier turns kept.
+# Captured live on Strands CLI 0.2.3:
+# ``test/fixtures/acp_frames/strands/mcp-relaunch-add-live.jsonl`` (a server
+# added: its tool is offered and completes) and ``mcp-relaunch-remove-live.jsonl``
+# (a server withdrawn: its tool is absent from the offer). Crew performs the relaunch
+# on a client marked by a dashboard MCP write, at that session's next turn
+# boundary and never mid-turn (``acp/relaunch_reload.py``): the stalled-child
+# replacement ``ensure_ready`` already runs for a disposed session
+# (``ACP_BACKENDS_RELOAD_DISPOSED_SESSION``), and the replacement's spawn re-reads
+# the agent spec into a fresh ``--mcp-config`` file.
+#
+# Disjoint from both sets above: the process does not watch a file and takes no
+# projection on a live session; the relaunch is the mechanism, with its own
+# failure mode (a load that falls back to a fresh session).
+ACP_BACKENDS_MCP_RELAUNCH_RELOAD = frozenset({ACP_BACKEND_STRANDS})
 
 # Backends on which a per-template MCP addition reaches a session of a template
 # Crew does NOT own (a third-party or other custom agent) without Crew writing into

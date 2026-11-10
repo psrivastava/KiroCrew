@@ -52,6 +52,7 @@ from typing import TYPE_CHECKING
 from kiro_crew.messaging.attachments import (
     Attachment,
     IngestLimits,
+    image_location_note,
     ingest_attachments,
     safe_suffix,
 )
@@ -392,7 +393,25 @@ async def _upload_one(
     Every filesystem step runs off the event loop: this is the gateway's only
     thread, and a 10 MiB write on it stalls every other session.
     """
-    staging = await asyncio.to_thread(tempfile.mkdtemp, prefix="kirocrew-slack-upload-")
+    # A cancel can land while the thread is still making the directory, before
+    # ``staging`` is bound and the ``finally`` below can remove it. Shield the hop
+    # and, on a cancel, wait for the thread -- through any further cancel too --
+    # and remove what it made before the cancel propagates.
+    mkdtemp_task = asyncio.ensure_future(
+        asyncio.to_thread(tempfile.mkdtemp, prefix="kirocrew-slack-upload-")
+    )
+    try:
+        staging = await asyncio.shield(mkdtemp_task)
+    except asyncio.CancelledError:
+        while not mkdtemp_task.done():
+            try:
+                await asyncio.wait({mkdtemp_task})
+            except asyncio.CancelledError:
+                pass
+        # A failed mkdtemp made no dir; the cancel is what propagates either way.
+        if not mkdtemp_task.cancelled() and mkdtemp_task.exception() is None:
+            await asyncio.to_thread(shutil.rmtree, mkdtemp_task.result(), True)
+        raise
     try:
         # mkdtemp is already 0700 on POSIX; this adds the Windows DACL (where a
         # mode is inert) and is fail-loud, so a directory that could not be
@@ -464,20 +483,3 @@ async def process_slack_files(
     paths = [*result.image_paths, *result.file_paths]
     locations = [image_location_note(p) for p in result.image_paths]
     return paths, [*result.text_blocks, *locations, *result.rejections]
-
-
-def image_location_note(path: str) -> str:
-    """Tell the agent where an inlined Slack image is saved.
-
-    ``build_prompt_blocks`` replaces an inlined image's path with
-    ``[image: <name>]``, so the model sees the picture but not where the file
-    is, and its file tools cannot open the original. This note names the folder
-    and the file SEPARATELY: a whole path ending in an image suffix would be
-    rewritten to the marker again, while a folder alone matches no image path.
-    Slack only; other channels and the dashboard keep their prompt unchanged.
-    """
-    folder, name = os.path.split(path)
-    return (
-        f"[Image {name} is saved in the folder {folder}{os.sep} until this turn ends; "
-        "join the two to open the original file]"
-    )

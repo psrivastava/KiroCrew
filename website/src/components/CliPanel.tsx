@@ -2,6 +2,7 @@ import { useEffect, useLayoutEffect, useCallback, useRef, useState } from 'react
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import { WebLinksAddon } from '@xterm/addon-web-links'
+import { SearchAddon } from '@xterm/addon-search'
 import '@xterm/xterm/css/xterm.css'
 import { useMutation } from '@tanstack/react-query'
 import { MessageSquarePlus, Copy, Check, PlugZap, AppWindow } from 'lucide-react'
@@ -12,9 +13,11 @@ import { useIsTouchDevice } from '../hooks/useIsTouchDevice'
 import { useTerminalTouchSelection, type TouchSelectStatus } from '../hooks/useTerminalTouchSelection'
 import TerminalCompletion from './TerminalCompletion'
 import TerminalKeyBar from './TerminalKeyBar'
+import TerminalFindBar from './TerminalFindBar'
 import ErrorNotice from './ErrorNotice'
 import { Btn } from './ui'
 import { setTerminalCloseFailed } from '../hooks/useBottomTerminal'
+import { useTerminalSearch } from '../hooks/useTerminalSearch'
 import { copyToClipboard } from '../utils/clipboard'
 
 import { i18nT } from '../i18n/t'
@@ -22,7 +25,7 @@ import { i18nT } from '../i18n/t'
  * Keyed by PTY session id. Instances persist across tab switches / chat
  * switches (so scrollback + cursor survive), and are only torn down when the
  * owning terminal TAB is closed (disposeTerminalSession). */
-const termCache = new Map<string, { term: Terminal; fit: FitAddon }>()
+const termCache = new Map<string, { term: Terminal; fit: FitAddon; search: SearchAddon }>()
 
 /* ── Terminal theme from CSS custom properties ── */
 function getTermTheme() {
@@ -187,7 +190,7 @@ function openTerminalLink(_event: MouseEvent, uri: string): void {
   window.open(uri, '_blank', 'noopener,noreferrer')
 }
 
-function getOrCreateTerm(id: string): { term: Terminal; fit: FitAddon } {
+function getOrCreateTerm(id: string): { term: Terminal; fit: FitAddon; search: SearchAddon } {
   let entry = termCache.get(id)
   if (!entry) {
     const font = getTerminalFont()
@@ -197,11 +200,16 @@ function getOrCreateTerm(id: string): { term: Terminal; fit: FitAddon } {
       fontSize: font.fontSize,
       fontFamily: resolveTerminalFontFamily(font.fontFamily),
       theme: getTermTheme(),
+      // Required for the search addon's match-highlight decorations (#10176):
+      // xterm 5.5's registerDecoration throws without it.
+      allowProposedApi: true,
     })
     const fit = new FitAddon()
+    const search = new SearchAddon()
     term.loadAddon(fit)
     term.loadAddon(new WebLinksAddon(openTerminalLink))
-    entry = { term, fit }
+    term.loadAddon(search)
+    entry = { term, fit, search }
     termCache.set(id, entry)
   }
   return entry
@@ -213,6 +221,38 @@ function destroyTerm(id: string) {
     entry.term.dispose()
     termCache.delete(id)
   }
+  prewarmHosts.get(id)?.remove()
+  prewarmHosts.delete(id)
+}
+
+/** Off-screen hosts of terminals opened ahead of their first showing. */
+const prewarmHosts = new Map<string, HTMLDivElement>()
+
+/**
+ * Build a cached tab's xterm off screen, ahead of its first showing, so the
+ * tap that opens the dock only re-attaches it: xterm's first open (DOM,
+ * cell measuring, glyph cache) is the single largest block of work in a
+ * first open. No-op for a terminal that is already open. The host is sized
+ * like the panel so the later fit changes little.
+ */
+export function prewarmTerminal(id: string, width: number, height: number): void {
+  // The terminal can sit here before any pane mounts, so follow theme and
+  // font changes from now on, as a mounted pane would.
+  ensureThemeObserver()
+  ensureTerminalFontSync()
+  const { term, fit } = getOrCreateTerm(id)
+  if (term.element || typeof document === 'undefined') return
+  const host = document.createElement('div')
+  host.setAttribute('aria-hidden', 'true')
+  Object.assign(host.style, {
+    position: 'absolute', left: '-10000px', top: '0', width: `${width}px`, height: `${height}px`,
+    visibility: 'hidden', pointerEvents: 'none', overflow: 'hidden',
+  })
+  document.body.appendChild(host)
+  prewarmHosts.set(id, host)
+  term.open(host)
+  measuredWith.set(term, cellKey(term))
+  fit.fit()
 }
 
 /**
@@ -224,6 +264,18 @@ function destroyTerm(id: string) {
 export function disposeTerminalSession(sessionId: string): void {
   disposeTerminalConnection(sessionId)
   destroyTerm(sessionId)
+}
+
+/** Each mounted terminal pane's "open the find bar" action, by session id. */
+const searchOpeners = new Map<string, () => void>()
+
+/** Open the scrollback find bar on a mounted terminal pane (the overflow
+ *  menu's Find item). Returns false when no pane for that id is mounted. */
+export function openTerminalSearch(sessionId: string): boolean {
+  const open = searchOpeners.get(sessionId)
+  if (!open) return false
+  open()
+  return true
 }
 
 /**
@@ -319,10 +371,10 @@ function touchSelectHint(status: TouchSelectStatus): string {
   }
 }
 
-function TerminalView({ sessionId, cwd, remoteSlot, chatSlot, visible, onSendToChat, deferOpen }: { sessionId: string; cwd?: string; remoteSlot?: string; chatSlot?: string; visible: boolean; onSendToChat?: (text: string) => void; deferOpen?: boolean }) {
+function TerminalView({ sessionId, cwd, remoteSlot, chatSlot, visible, onSendToChat, deferOpen, onToggleFullscreen }: { sessionId: string; cwd?: string; remoteSlot?: string; chatSlot?: string; visible: boolean; onSendToChat?: (text: string) => void; deferOpen?: boolean; onToggleFullscreen?: () => void }) {
   const containerRef = useRef<HTMLDivElement>(null)
   const wrapperRef = useRef<HTMLDivElement>(null)
-  const entryRef = useRef<{ term: Terminal; fit: FitAddon } | null>(null)
+  const entryRef = useRef<{ term: Terminal; fit: FitAddon; search: SearchAddon } | null>(null)
   // Floating selection toolbar: anchored to where the drag ended (wrapper-
   // relative px), carrying the captured text so the actions stay valid even
   // after xterm clears its own selection.
@@ -359,7 +411,21 @@ function TerminalView({ sessionId, cwd, remoteSlot, chatSlot, visible, onSendToC
   if (!entryRef.current) {
     entryRef.current = getOrCreateTerm(sessionId)
   }
-  const { term, fit } = entryRef.current
+  const { term, fit, search } = entryRef.current
+
+  // Scrollback find (#10176): Cmd+F (macOS) / Ctrl+Shift+F (elsewhere) or the dock menu opens the bar, the SearchAddon walks
+  // the full buffer (not just the rendered viewport the browser's find sees).
+  // The addon is cached with the term, so the bar's state is the only per-pane
+  // piece here.
+  const termSearch = useTerminalSearch(term, search, visible)
+  // The dock's overflow menu opens this pane's find bar by session id
+  // (openTerminalSearch): on Linux/Windows the shell keeps Ctrl+F, so the menu
+  // is the discoverable way in beside Ctrl+Shift+F.
+  const openSearchFn = termSearch.openSearch
+  useEffect(() => {
+    searchOpeners.set(sessionId, openSearchFn)
+    return () => { if (searchOpeners.get(sessionId) === openSearchFn) searchOpeners.delete(sessionId) }
+  }, [sessionId, openSearchFn])
 
   // Touch range-selection (#6834): long-press a line to set the first endpoint,
   // then tap/long-press another to select the inclusive span. xterm's own
@@ -409,6 +475,8 @@ function TerminalView({ sessionId, cwd, remoteSlot, chatSlot, visible, onSendToC
     const el = term.element
     if (el) {
       containerRef.current.appendChild(el)
+      prewarmHosts.get(sessionId)?.remove()
+      prewarmHosts.delete(sessionId)
     } else {
       term.open(containerRef.current)
       // open() has just measured the cell with the font as it is now, so the
@@ -420,7 +488,7 @@ function TerminalView({ sessionId, cwd, remoteSlot, chatSlot, visible, onSendToC
     const pending = proxyText.current
     proxyText.current = ''
     if (pending) term.paste(pending)
-  }, [term, fit, holding])
+  }, [term, fit, holding, sessionId])
 
   // Focus + refit when becoming visible. Re-measure here too so a pane that
   // gained the web font while it was hidden (display:none) picks up the correct
@@ -500,7 +568,17 @@ function TerminalView({ sessionId, cwd, remoteSlot, chatSlot, visible, onSendToC
   useEffect(() => {
     const wrap = wrapperRef.current
     if (!wrap) return
+    // Copy on select acts on a left press that began on the terminal screen,
+    // never on a right-click or a find-bar click over an older selection. The
+    // press is read document-wide so a press anywhere else clears it.
+    const doc = wrap.ownerDocument
+    let leftPressOnScreen = false
+    const onMouseDown = (e: MouseEvent) => {
+      leftPressOnScreen = e.button === 0 && !!term.element?.contains(e.target as Node)
+    }
     const onMouseUp = (e: MouseEvent) => {
+      const fromScreen = leftPressOnScreen
+      leftPressOnScreen = false
       // Defer one frame: xterm finalises the selection on its own mouseup
       // handler, which may run after ours depending on listener order.
       requestAnimationFrame(() => {
@@ -510,12 +588,18 @@ function TerminalView({ sessionId, cwd, remoteSlot, chatSlot, visible, onSendToC
         setCopied('idle')
         setSending('idle')
         setSel({ x: e.clientX - rect.left, y: e.clientY - rect.top, text })
+        // The toolbar Copy's own write and status; the toolbar stays up.
+        if (fromScreen && getTerminalFont().copyOnSelect) {
+          void copyToClipboard(text).then(ok => setCopied(ok ? 'done' : 'failed'))
+        }
       })
     }
+    doc.addEventListener('mousedown', onMouseDown, true)
     wrap.addEventListener('mouseup', onMouseUp)
     const selDisp = term.onSelectionChange(() => { if (!term.hasSelection()) setSel(null) })
     const scrollDisp = term.onScroll(() => setSel(null))
     return () => {
+      doc.removeEventListener('mousedown', onMouseDown, true)
       wrap.removeEventListener('mouseup', onMouseUp)
       selDisp.dispose()
       scrollDisp.dispose()
@@ -645,8 +729,21 @@ function TerminalView({ sessionId, cwd, remoteSlot, chatSlot, visible, onSendToC
             (it reserves Tab/arrows/Escape while its menu is open, and Enter only once
             a row has been arrowed onto). A later
             feature that attaches its own handler here would silently replace it —
-            extend the handler inside TerminalCompletion instead. */}
-        <TerminalCompletion term={term} sessionId={sessionId} active={visible} />
+            extend the handler inside TerminalCompletion instead. The find and
+            fullscreen chords (#10176) are intercepted through that same handler,
+            which is why they are passed down rather than bound on a new one.
+            It is inactive while displaced: an open menu with a highlighted row
+            would claim the Enter that takes the terminal back (registry onData). */}
+        <TerminalCompletion
+          term={term}
+          sessionId={sessionId}
+          active={visible && !displaced}
+          onOpenSearch={termSearch.openSearch}
+          onToggleFullscreen={onToggleFullscreen}
+        />
+        {/* Scrollback find bar (#10176): over the grid, top-right, only while
+            open. Focus-scoped — the chord opens it only from a focused shell. */}
+        <TerminalFindBar search={termSearch} bannerShowing={showBanner} onToggleFullscreen={onToggleFullscreen} />
         {/* Touch range-selection discoverability (#6834). The gesture is
             invisible on a canvas — nothing tells the user an endpoint is set —
             so surface it two ways: a small transient hint chip anchored top-left
@@ -690,6 +787,14 @@ function TerminalView({ sessionId, cwd, remoteSlot, chatSlot, visible, onSendToC
                     ? i18nT('components.cliPanel.reconnecting')
                     : i18nT('components.cliPanel.displaced_message')}
                 </span>
+                {/* Enter in the focused pane takes the terminal back (the
+                    registry's onData). The hint names a hardware key, so it
+                    is shown on keyboard devices only. */}
+                {displaced && !touchDevice && (
+                  <span className="shrink-0 text-muted" data-testid="cli-panel-displaced-enter-hint">
+                    {i18nT('components.cliPanel.displaced_enter_hint')}
+                  </span>
+                )}
               </>
             ) : (
               /* Rejected opens and exhausted retries use the shared error
@@ -715,6 +820,7 @@ function TerminalView({ sessionId, cwd, remoteSlot, chatSlot, visible, onSendToC
                 type="button"
                 onClick={() => retryTerminalConnection(sessionId)}
                 disabled={reconnecting}
+                aria-keyshortcuts={displaced && !touchDevice ? 'Enter' : undefined}
                 className="px-2 py-0.5 text-[12px]"
               >
                 {displaced
@@ -817,7 +923,7 @@ function TerminalView({ sessionId, cwd, remoteSlot, chatSlot, visible, onSendToC
  * Sessions are chat-specific by virtue of living in usePanelTabs' per-slot
  * bucket; the module-level termCache keeps them warm across tab/chat switches.
  */
-export default function CliPanel({ sessionId, cwd, remoteSlot, chatSlot, visible = true, onSendToChat, deferOpen }: {
+export default function CliPanel({ sessionId, cwd, remoteSlot, chatSlot, visible = true, onSendToChat, deferOpen, onToggleFullscreen }: {
   sessionId: string
   cwd?: string
   /** Open the shell in this chat's REMOTE session workspace instead of locally. */
@@ -828,6 +934,10 @@ export default function CliPanel({ sessionId, cwd, remoteSlot, chatSlot, visible
   onSendToChat?: (text: string) => void
   /** Hold a never-opened terminal behind a focus stand-in until this turns false. */
   deferOpen?: boolean
+  /** Toggle the app-wide dock panel fullscreen (Cmd+Shift+F on macOS; the menu item elsewhere). Passed ONLY
+   *  by the dock's TerminalTabsView — a chat side-panel terminal leaves it
+   *  undefined so its chord does not maximize the unrelated dock panel. */
+  onToggleFullscreen?: () => void
 }) {
   useEffect(() => { ensureThemeObserver(); ensureTerminalFontSync() }, [])
   return (
@@ -838,7 +948,7 @@ export default function CliPanel({ sessionId, cwd, remoteSlot, chatSlot, visible
       className="flex flex-col w-full h-full overflow-hidden px-3 pt-2"
       style={{ background: 'var(--term-bg, var(--bg))' }}
     >
-      <TerminalView sessionId={sessionId} cwd={cwd} remoteSlot={remoteSlot} chatSlot={chatSlot} visible={visible} onSendToChat={onSendToChat} deferOpen={deferOpen} />
+      <TerminalView sessionId={sessionId} cwd={cwd} remoteSlot={remoteSlot} chatSlot={chatSlot} visible={visible} onSendToChat={onSendToChat} deferOpen={deferOpen} onToggleFullscreen={onToggleFullscreen} />
     </div>
   )
 }

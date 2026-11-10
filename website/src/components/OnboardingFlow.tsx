@@ -19,6 +19,7 @@ import { safeGetItem, safeRemoveItem, safeSetItem } from '../utils/safeStorage'
 
 import { i18nT } from '../i18n/t'
 import { useDocumentImeLatch, useImeGuard } from '../hooks/useImeGuard'
+import { RadioChipGroup, radioChip } from './RadioChipGroup'
 /**
  * First-run onboarding flow (5 steps) — the Customize chapter plus the feature
  * tour. It is the LAST of the three first-run chapters: Import setup runs first,
@@ -88,6 +89,13 @@ const POP_BODY_KEY: Record<string, string> = {
   schedule: 'components.onboardingFlow.pop_schedule_body',
   apps: 'components.onboardingFlow.pop_apps_body',
   chat: 'components.onboardingFlow.pop_chat_body',
+}
+
+/** Catalog key for each button of the look step's mode switch. */
+const MODE_LABEL_KEYS: Record<ModePreference, string> = {
+  system: 'components.onboardingFlow.mode_system',
+  light: 'components.onboardingFlow.mode_light',
+  dark: 'components.onboardingFlow.mode_dark',
 }
 
 // Steps 1-2 are the centered Customize modals; 3-5 are the anchored tour
@@ -517,7 +525,10 @@ export default function OnboardingFlow({
         node.querySelectorAll<HTMLElement>(
           'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
         ),
-      ).filter(el => !el.hasAttribute('disabled'))
+      // `tabIndex >= 0` drops the unchecked options of a RadioChipGroup: they
+      // are buttons, but Tab never reaches them, so the trap's first/last
+      // comparisons must not land on one.
+      ).filter(el => !el.hasAttribute('disabled') && el.tabIndex >= 0)
     // Focus the first control on ENTERING the dialog step — not on every
     // re-run. This effect re-runs whenever `finish` / `savingProfile` change
     // identity, which now includes every keystroke in the "Other" role field
@@ -610,7 +621,7 @@ export default function OnboardingFlow({
         }
         onSkipAll={skipAll}
         dialogRef={dialogRef}
-        footer={<SendBtn type="button" onClick={next}>{i18nT('components.onboardingFlow.continue')}</SendBtn>}
+        footer={<SendBtn type="button" className="focus-ring-accent" onClick={next}>{i18nT('components.onboardingFlow.continue')}</SendBtn>}
       >
         {/* The product itself, scaled down, as the live preview of every pick
             (mode, Translucent panels, color theme), beside the two switches it
@@ -619,21 +630,23 @@ export default function OnboardingFlow({
         <div className="flex flex-col gap-4 sm:flex-row sm:items-center">
         <LookPreview className="w-full shrink-0 sm:w-[52%]" />
         <div className="min-w-0 flex-1">
-        <div className="flex gap-1 border border-border rounded-[10px] p-1" style={{ background: 'var(--panel-strong)' }}>
+        <RadioChipGroup className="flex gap-1 border border-border rounded-[10px] p-1" style={{ background: 'var(--panel-strong)' }} ariaLabel={i18nT('components.onboardingFlow.mode_switch_label')}>
           {(['system', 'light', 'dark'] as ModePreference[]).map(m => (
             <button
               key={m}
+              type="button"
+              {...radioChip(modePref === m)}
               onClick={() => setModePref(m)}
-              className={`flex-1 flex items-center justify-center gap-1.5 py-1.5 rounded-[7px] text-[13px] cursor-pointer border-none transition-colors ${
+              className={`focus-ring-accent flex-1 flex items-center justify-center gap-1.5 py-1.5 rounded-[7px] text-[13px] cursor-pointer border-none transition-colors ${
                 modePref === m ? 'font-medium' : 'bg-transparent text-muted hover:text-text'
               }`}
               style={modePref === m ? { background: ACCENT_20, color: 'var(--accent)' } : undefined}
             >
               {m === 'system' ? <Monitor size={14} /> : m === 'light' ? <Sun size={14} /> : <Moon size={14} />}
-              {m[0].toUpperCase() + m.slice(1)}
+              {i18nT(MODE_LABEL_KEYS[m])}
             </button>
           ))}
-        </div>
+        </RadioChipGroup>
 
         {/* The same Translucent panels switch as Settings -> Display -> View
             (`useLiquidGlass`, browser-local `mc-liquid-glass`): the glass/solid
@@ -648,13 +661,14 @@ export default function OnboardingFlow({
         <div className="mt-3 text-[11px] uppercase tracking-wide text-muted mb-1.5">
           {i18nT('components.onboardingFlow.color_theme')}
         </div>
-        <div className="grid grid-cols-3 gap-1.5 sm:grid-cols-4" role="group" aria-label={i18nT('components.onboardingFlow.color_theme')}>
+        <RadioChipGroup className="grid grid-cols-3 gap-1.5 sm:grid-cols-4" ariaLabel={i18nT('components.onboardingFlow.color_theme')}>
           {allThemes.map(t => (
             <button
               key={t.value}
+              type="button"
               onClick={() => setColorTheme(t.value as ColorTheme)}
-              aria-pressed={colorTheme === t.value}
-              className={`flex min-w-0 items-center justify-center gap-1.5 truncate rounded-lg border px-2 py-1.5 text-[13px] cursor-pointer transition-colors ${
+              {...radioChip(colorTheme === t.value)}
+              className={`focus-ring-accent flex min-w-0 items-center justify-center gap-1.5 truncate rounded-lg border px-2 py-1.5 text-[13px] cursor-pointer transition-colors ${
                 colorTheme === t.value
                   ? 'border-accent font-medium'
                   : 'border-border bg-transparent text-text hover:text-text-strong'
@@ -664,7 +678,7 @@ export default function OnboardingFlow({
               {t.label}
             </button>
           ))}
-        </div>
+        </RadioChipGroup>
       </OnboardingChapterShell>
     )
   }
@@ -713,7 +727,7 @@ export default function OnboardingFlow({
             <Btn type="button" className="h-9 rounded-lg px-4" disabled={savingProfile} onClick={() => setStep(1)}>
               {i18nT('components.onboardingFlow.back')}
             </Btn>
-            <SendBtn type="button" disabled={savingProfile} onClick={next}>
+            <SendBtn type="button" className="focus-ring-accent" disabled={savingProfile} onClick={next}>
               {savingProfile ? i18nT('components.onboardingFlow.saving') : i18nT('components.onboardingFlow.continue')}
             </SendBtn>
           </>
@@ -725,14 +739,15 @@ export default function OnboardingFlow({
         >
           {i18nT('components.onboardingFlow.your_role')}
         </div>
-        <div className="flex flex-wrap gap-1.5" role="group" aria-labelledby="onboarding-role-label">
+        <RadioChipGroup className="flex flex-wrap gap-1.5" ariaLabelledBy="onboarding-role-label">
           {ROLE_OPTIONS.map(o => (
             <button
               key={o.value}
+              type="button"
               onClick={() => pickRole(o.value)}
               disabled={savingProfile}
-              aria-pressed={role === o.value}
-              className={`flex items-center gap-1 rounded-full px-3 py-1.5 text-[13px] cursor-pointer transition-colors border ${
+              {...radioChip(role === o.value)}
+              className={`focus-ring-accent flex items-center gap-1 rounded-full px-3 py-1.5 text-[13px] cursor-pointer transition-colors border ${
                 role === o.value
                   ? 'border-accent font-medium'
                   : 'border-border bg-transparent text-text hover:text-text-strong'
@@ -743,7 +758,7 @@ export default function OnboardingFlow({
               {i18nT(ROLE_LABEL_KEY[o.value])}
             </button>
           ))}
-        </div>
+        </RadioChipGroup>
 
         {/* "Other" is the only answer the six chips cannot express, so it
             reveals a free-text field instead of being a dead end. Optional:
@@ -777,18 +792,18 @@ export default function OnboardingFlow({
         >
           {i18nT('components.onboardingFlow.how_technical_are_you')}
         </div>
-        <div
+        <RadioChipGroup
           className="flex flex-col gap-1.5"
-          role="group"
-          aria-labelledby="onboarding-tech-label"
+          ariaLabelledBy="onboarding-tech-label"
         >
           {TECH_OPTIONS.map(o => (
             <button
               key={o.value}
+              type="button"
               onClick={() => pickTech(o.value)}
               disabled={savingProfile}
-              aria-pressed={techLevel === o.value}
-              className={`flex items-center gap-2 rounded-lg border px-3 py-2.5 text-[13px] cursor-pointer transition-colors ${
+              {...radioChip(techLevel === o.value)}
+              className={`focus-ring-accent flex items-center gap-2 rounded-lg border px-3 py-2.5 text-[13px] cursor-pointer transition-colors ${
                 techLevel === o.value
                   ? 'border-accent font-medium'
                   : 'border-border bg-transparent text-text hover:text-text-strong'
@@ -799,7 +814,7 @@ export default function OnboardingFlow({
               {i18nT(TECH_LABEL_KEY[o.value])}
             </button>
           ))}
-        </div>
+        </RadioChipGroup>
 
         {/* No hand-off: the onboarding answers (techLevel and the other
             chapter picks) are unsaved wizard state — this notice exists

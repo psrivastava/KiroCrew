@@ -22,6 +22,7 @@ from unittest.mock import MagicMock
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
+from named_cases_helpers import named_cases
 
 import kiro_crew.dashboard.handlers.steering as steering_mod
 from kiro_crew.dashboard.handlers._shared import active_project_dir, active_project_state
@@ -43,6 +44,7 @@ from kiro_crew.dashboard.handlers.steering import (
     resolve_steering_file,
     steering_roots,
 )
+from kiro_crew.slugs import slug_hash_fallback
 
 # ── Fixtures / helpers ──
 
@@ -319,6 +321,16 @@ class TestInclusionMetadata:
         assert entry["inclusion"] == STEERING_INCLUSION_DEFAULT
         assert entry["inclusion_declared"] == "manaul"
 
+    def test_a_byte_order_mark_does_not_hide_the_declared_mode(self, fake_home):
+        """A document saved as "UTF-8 with BOM" lists with its declared mode."""
+        path = fake_home / ".kiro" / "steering" / "doc.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"\xef\xbb\xbf---\ninclusion: manual\n---\n# Payroll rules\n")
+        entry = list_steering_blocking(None)["files"][0]
+        assert entry["inclusion"] == "manual"
+        assert entry["inclusion_declared"] == "manual"
+        assert entry["description"] == "Payroll rules"
+
     def test_mode_spelling_is_canonicalized(self, fake_home):
         entry = self._entry(fake_home, "---\ninclusion: FILEMATCH\n---\n# Doc\n")
         assert entry["inclusion"] == "fileMatch"
@@ -389,16 +401,39 @@ class TestKeyParsing:
         assert _split_key("workspace/team/style.md") == ("workspace", "team/style.md")
 
     @pytest.mark.parametrize("raw,expected", [
-        ("api standards", "api standards.md"),
-        ("API_Standards.md", "API_Standards.md"),
-        ("../../etc/passwd", "etc/passwd.md"),
-        ("nested/../thing", "nested/thing.md"),
-        ("bad;chars|here", "bad-chars-here.md"),
-        ("   ", ""),
-        ("/", ""),
+        *named_cases("test_safe_rel_name", "raw,expected", [
+            ("api standards", "api standards.md"),
+            ("API_Standards.md", "API_Standards.md"),
+            ("../../etc/passwd", "etc/passwd.md"),
+            ("nested/../thing", "nested/thing.md"),
+            ("bad;chars|here", "bad-chars-here.md"),
+            ("   ", ""),
+            ("/", ""),
+        ]),
+        *named_cases("test_segment_keeping_ascii_is_rewritten_as_before", "raw,expected", [
+            ("规范v2", "--v2.md"),
+            ("a.md.md", "a.md.md"),
+            ("x/.md", "x/.md"),
+            ("---", "---.md"),
+        ]),
     ])
     def test_safe_rel_name(self, raw, expected):
         assert _safe_rel_name(raw) == expected
+
+    def test_distinct_cjk_names_derive_distinct_hashed_keys(self):
+        first, second = _safe_rel_name("编码规范"), _safe_rel_name("测试规则")
+        assert first == f"{slug_hash_fallback('编码规范', 'steering')}.md"
+        assert second == f"{slug_hash_fallback('测试规则', 'steering')}.md"
+        assert first != second
+
+    def test_cjk_name_derives_the_same_key_every_time(self):
+        assert _safe_rel_name("编码规范") == _safe_rel_name("编码规范")
+        assert _safe_rel_name("编码规范.md") == _safe_rel_name("编码规范")
+
+    def test_nested_path_hashes_only_the_erased_segment(self):
+        hashed = slug_hash_fallback("编码规范", "steering")
+        assert _safe_rel_name("team/编码规范") == f"team/{hashed}.md"
+        assert _safe_rel_name("编码规范/style") == f"{hashed}/style.md"
 
 
 class TestResolution:
@@ -1001,6 +1036,17 @@ class TestReadEndpoint:
         assert err is not None
         assert "aws_secret_access_key" not in content
 
+    def test_the_editor_read_drops_a_byte_order_mark(self, fake_home):
+        """The editor gets text without the mark, so a mode edit finds the fence."""
+        from kiro_crew.dashboard.handlers import steering as mod
+
+        path = fake_home / ".kiro" / "steering" / "a.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"\xef\xbb\xbf---\ninclusion: manual\n---\n# Doc\n")
+        content, _display, err = mod._resolve_and_read_blocking("user/a.md", None)
+        assert err is None
+        assert content == "---\ninclusion: manual\n---\n# Doc\n"
+
     @pytest.mark.asyncio
     async def test_growth_past_cap_mid_read_is_413_not_500(self, fake_home, monkeypatch):
         """The helper raises FileTooLargeError if the file grows after the lstat."""
@@ -1043,7 +1089,7 @@ class TestReadEndpoint:
             assert resp.status == 404
             body = await resp.json()
         # Same body an unknown key answers.
-        assert body == {"error": "not found"}
+        assert body == {"error": "not found", "code": "steering_not_found"}
         reads = [
             c
             for c in sel_mock.log_tool_invocation.call_args_list
@@ -1100,6 +1146,22 @@ class TestCreateEndpoint:
         async with TestClient(TestServer(_make_app(_state()))) as client:
             resp = await client.post("/api/steering", json={"name": "dup.md", "content": "x"})
             assert resp.status == 409
+
+    @pytest.mark.asyncio
+    async def test_two_cjk_names_both_create(self, fake_home):
+        async with TestClient(TestServer(_make_app(_state()))) as client:
+            first = await client.post(
+                "/api/steering", json={"name": "编码规范", "content": "# a", "source": "user"}
+            )
+            second = await client.post(
+                "/api/steering", json={"name": "测试规则", "content": "# b", "source": "user"}
+            )
+            assert (first.status, second.status) == (200, 200)
+            keys = [(await first.json())["key"], (await second.json())["key"]]
+        assert keys[0] != keys[1]
+        root = fake_home / ".kiro" / "steering"
+        assert (root / keys[0].removeprefix("user/")).read_text() == "# a"
+        assert (root / keys[1].removeprefix("user/")).read_text() == "# b"
 
     @pytest.mark.asyncio
     async def test_traversal_name_is_confined_to_root(self, fake_home):
@@ -1321,6 +1383,7 @@ class TestUpdateDeleteEndpoints:
             assert captured["source_bytes"] == b"original\n"
         else:  # pragma: no cover - exercised on Windows CI only
             assert kwargs["preserve_access_control_from"] is None
+        assert kwargs["preserve_windows_dacl"] is True
         # Additive to the permission-bit carry, not a replacement.
         assert kwargs["newline"] == ""
         assert kwargs["fsync"] is True

@@ -48,19 +48,27 @@ def test_every_animation_names_a_keyframes_this_page_defines() -> None:
     assert used == defined
 
 
-def test_a_needs_you_button_fills_the_chat_box_and_never_sends() -> None:
-    """The host bridge office and project-report use: the page posts ``act`` and the
-    host only fills the composer. Any other message type would be a new channel."""
+def test_a_needs_you_option_asks_to_send_and_reply_fills_the_chat_box() -> None:
+    """An offered option is a finished answer, so it posts ``send``: the host sends it
+    only when the person turned one-click sends on, and otherwise fills the composer
+    exactly as ``act`` does. Reply posts a starter ("About ...: ") the person finishes,
+    so it stays ``act``. No other channel exists."""
     script = _script()
     assert sorted(re.findall(r"type:\s*'([\w:-]+)'", script)) == [
         "kirocrew-dashboard:act",
         "kirocrew-dashboard:open",
+        "kirocrew-dashboard:send",
     ]
-    assert script.count("postMessage(") == 2
+    assert script.count("postMessage(") == 3
     assert "postMessage(" in _function("act")
-    assert "act(say)" in _function("button")
-    for banned in ("send", "submit"):
-        assert not re.search(rf"type:\s*'[^']*{banned}", script)
+    assert "postMessage(" in _function("send")
+    actions = _function("actions")
+    # Fails if an option goes back to filling the chat box with the switch on.
+    assert "ref + clip(opts[i], 200), send)" in actions
+    # Reply passes no `post`, so `button` falls back to `act`.
+    assert "button(i18n('reply'), 'reply', ref)" in actions
+    assert "var to = post || act;" in _function("button")
+    assert not re.search(r"type:\s*'[^']*submit", script)
 
 
 def test_a_row_without_an_asks_entry_still_gets_its_reply_button() -> None:
@@ -131,10 +139,12 @@ def test_live_keys_off_the_workers_status_not_a_masked_field() -> None:
     reaches a page, so a ``live`` test on it would never be true."""
     from kiro_crew.dashboard.handlers.member_dashboard import _MASKED_VALUE_KEYS
 
-    body = _function("live")
+    body = _function("view")
     for masked in _MASKED_VALUE_KEYS:
         assert masked not in _script(), masked
+    assert "it.worker === 'running'" in body
     assert "it.status === 'progress'" in body
+    assert "view(it) === 'working'" in _function("live")
 
 
 def test_no_animation_runs_forever_except_the_live_markers() -> None:
@@ -164,7 +174,14 @@ def test_every_needs_you_button_says_it_drafts_rather_than_sends() -> None:
 def test_items_that_need_the_reader_get_their_own_segment() -> None:
     """The bar's "open" must not swallow a task that waits on the reader."""
     assert "['needs_you', 'needs you', 'var(--warn, #ffd230)']" in _script()
-    assert "needsYou(list[i]) ? 'needs_you'" in _function("drawStates")
+    assert "var s = view(list[i]);" in _function("drawStates")
+
+
+def test_only_needs_you_is_warm_a_stall_is_muted() -> None:
+    """Stuck and quiet are the conductor's to pick up, so neither takes a warm colour."""
+    script = _script()
+    assert "['stuck', 'stuck', 'var(--muted-strong, #778)']" in script
+    assert "['quiet', 'quiet', 'var(--muted-strong, #778)']" in script
 
 
 def test_a_worker_status_reads_in_the_readers_language() -> None:

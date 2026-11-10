@@ -47,7 +47,7 @@ reads the name. New work goes to the owner of its responsibility:
 | `src/kiro_crew/session_pid_provider_kill.py` | the synchronous teardown of a leaked provider (`_sync_kill_provider`: the gate, the commit, the identity-pinned group and descendant signals), the orphaned spawn-group signalling (`signal_orphaned_spawn_group`, `_signal_orphaned_runtime_group`), and `_tracked_child_has_runtime_identity`, the argv check that the vouched members of the ACP runtime's group signalling must pass, and so must a tracked `kiro_pids.txt` child reparented to a `systemd` subreaper in the facade's `_cleanup_orphaned_mcp_servers` |
 | `src/kiro_crew/session_pid_orphan_kill.py` | the unreachable-gatewayd, browser-daemon and MCP-subtree orphan kills, and their security event log records |
 | `src/kiro_crew/session_pid_mappings.py` | pruning stale `session_pid_<pid>` and `session_token_*` identity mappings |
-| `src/kiro_crew/session_pid_rss.py` | a session tree's resident memory |
+| `src/kiro_crew/session_pid_rss.py` | a session tree's resident memory, and the leftovers of a runtime's session: processes in it that its live tree does not reach (`find_session_leftovers`), ended only through `platform_compat.terminate_pids_pinned` (`end_session_leftovers`). They are not runtimes, so no lease or tenancy covers them and the runtime gate is not asked; `session_cleanup_leftovers` decides when (after a recycle once the root is gone, or mid-turn behind `session.watchdog_end_leftovers_mid_turn`) |
 
 ### What the model is made of
 
@@ -476,7 +476,7 @@ merely counted (`RuntimeReconciler._why_not_yet`, `_reconcile_unowned`):
    equal to that default so the setting can only lower the budget and never raise
    it; the budget is re-read on every cleanup tick. At `0` the arm evaluates the
    local conditions (two-pass confirmation, argv, spawn marker, age, unclaimed,
-   unchanged identity), counts each full candidate in `would_kill`, and signals
+   no live owned spawn instance, unchanged identity), counts each full candidate in `would_kill`, and signals
    nothing. The ownership gate and the teardown barrier are deliberately not
    consulted there, so no kill authorization is logged. A reconciler that is wrong about a whole population is wrong slowly
    enough to be noticed;
@@ -501,13 +501,28 @@ merely counted (`RuntimeReconciler._why_not_yet`, `_reconcile_unowned`):
 5. it is older than `runtime_reconcile.DEFAULT_MIN_AGE_SECS` — the same
    registration window seen from the other side;
 6. neither table claims the pid, and an unreadable table counts as claimed;
-7. its process identity has not changed since classification, re-read in the
+7. no live owned pid outside its own tree carries its `KIROCREW_SPAWN_INSTANCE`
+   (`RuntimeReconciler._instance_held_by_live_owner`, refusal reason "its spawn
+   instance belongs to a live recorded runtime"). The stamp is inherited, so a
+   `kiro-cli` an agent's shell tool starts carries its parent runtime's instance
+   while appearing in no record of its own, and would otherwise be killed while the
+   session that started it waits on it. An agent an MCP server starts is the same
+   case: the session's `kiro-cli` starts each server with its own environment, so a
+   workflow runner the server detaches, and each agent that runner starts, carry the
+   runtime's instance even after the server exits and the runner reparents to the
+   user manager (`test_runtime_reconcile_mcp_descendants.py`). Only a holder this pass found recorded and
+   alive, leased or claimed can shelter a candidate, so a leaked tree cannot shelter
+   itself and a tree whose recorded runtime died is still reclaimed. The anchor set
+   is rebuilt each pass; until it is, the condition withholds. An unreadable instance
+   on the candidate adds no refusal (the confirmed reclaim already refuses such a
+   runtime); an unreadable process table, once a holder matches, withholds;
+8. its process identity has not changed since classification, re-read in the
    instant before the signal;
-8. the gate allows it — asked LAST among the authorities, because the allow path
+9. the gate allows it — asked LAST among the authorities, because the allow path
    writes the kill attribution, so asking earlier would record a kill that never
    happened;
-9. the teardown barrier commits, so a tenancy claimed after the verdict abandons
-   the kill.
+10. the teardown barrier commits, so a tenancy claimed after the verdict abandons
+    the kill.
 
 What the kill line records is the seam's own COUNT over the tree it walked, not a
 verdict about the root: the seam signals every managed descendant it discovered and

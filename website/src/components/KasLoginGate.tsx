@@ -18,7 +18,7 @@ import {
   type KasLoginLoopbackSession,
   type KasLoginStatus,
 } from '../api/client'
-import { ApiError } from '../api/apiError'
+import { ApiError, apiErrorCode } from '../api/apiError'
 import {
   PANEL_CLASS,
   SCRIM_CLASS,
@@ -31,6 +31,7 @@ import { Btn } from './ui'
 import { readCompanySignIn, rememberCompanySignIn } from '../utils/companySignIn'
 import ErrorNotice from './ErrorNotice'
 import { copyToClipboard } from '../utils/clipboard'
+import { safeHref } from '../utils/safeHref'
 import { clearCachedModels } from '../providers/adapters/acp'
 import { providerLabel, type KasLoginProvider } from './kasProviderLabel'
 
@@ -47,6 +48,8 @@ const LOOPBACK_POLL_INTERVAL_MS = 2_000
 // After this long on the loopback wait screen the "use a code" hint is promoted:
 // a redirect that has not landed by now is usually one that cannot land.
 const LOOPBACK_SLOW_HINT_MS = 30_000
+// The begin error's DOM id, so the SSO field it names can point at it.
+const SSO_ERROR_ID = 'kas-sso-begin-error'
 
 type ActiveSession =
   | ({ kind: 'device'; provider: KasLoginProvider } & KasLoginDeviceSession)
@@ -99,6 +102,9 @@ export type KasLoginExtra = { start_url?: string; region?: string }
  */
 type Chrome = 'gate' | 'card'
 const ChromeContext = createContext<Chrome>('gate')
+// True when only an organisation sign-in can work (an LTS gateway with
+// nobody signed in): the chooser offers Company SSO alone, already open.
+const OrganisationOnlyContext = createContext(false)
 
 /** Per-chrome class choices for the recurring text roles. Gate values are the
  *  strings the full-screen views always rendered; card values scale them down
@@ -160,11 +166,11 @@ function ViewShell({ aside, children }: { aside: ShellAsideCopy; children: React
 }
 
 /**
- * A value rendered as a click-to-copy block — the device flow's verification
- * link has to be retyped on ANOTHER device, so the whole block is the copy
- * target and the glyph stays faintly visible rather than hover-only.
+ * The device flow's verification link: the URL itself opens the issuer's page
+ * in a new tab (a click is a user gesture, so a popup blocker lets it through),
+ * and a separate always-visible button copies it for approval on ANOTHER device.
  */
-function CopyField({ value }: { value: string }) {
+function LinkField({ value }: { value: string }) {
   const [copied, setCopied] = useState(false)
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null)
   useEffect(
@@ -183,23 +189,40 @@ function CopyField({ value }: { value: string }) {
   const label = copied
     ? i18nT('components.kasLogin.copied')
     : i18nT('components.kasLogin.copy_link')
+  // The URL comes from the issuer's response: only an http(s) URL becomes a
+  // link, so no other scheme (javascript:, data:) can run on a click.
+  const href = safeHref(value)
   return (
-    <button
-      type="button"
-      onClick={onCopy}
-      aria-label={label}
-      title={label}
-      className="group/copy mt-1.5 flex w-full cursor-pointer items-center justify-between gap-2 rounded-lg border border-border bg-bg-elevated px-3 py-2 text-left hover:bg-bg-hover focus-ring"
-    >
-      <code className="min-w-0 overflow-x-auto font-mono text-[13px] text-text-strong">
-        {value}
-      </code>
-      {copied ? (
-        <Check className="lucide-inline shrink-0 text-ok" />
+    <div className="mt-1.5 flex w-full items-center gap-2 rounded-lg border border-border bg-bg-elevated py-1.5 pl-3 pr-1.5">
+      {href ? (
+        <a
+          href={href}
+          target="_blank"
+          rel="noopener noreferrer"
+          data-testid="kas-login-verification-link"
+          className="min-w-0 flex-1 overflow-x-auto font-mono text-[13px] text-accent underline underline-offset-2 hover:text-accent-hover focus-ring"
+        >
+          {value}
+        </a>
       ) : (
-        <Copy className="lucide-inline shrink-0 text-muted transition-opacity group-hover/copy:opacity-100" />
+        <code className="min-w-0 flex-1 overflow-x-auto font-mono text-[13px] text-text-strong">
+          {value}
+        </code>
       )}
-    </button>
+      <button
+        type="button"
+        onClick={onCopy}
+        aria-label={label}
+        title={label}
+        className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-border bg-bg text-muted hover:bg-bg-hover hover:text-text focus-ring"
+      >
+        {copied ? (
+          <Check className="lucide-inline text-ok" />
+        ) : (
+          <Copy className="lucide-inline" />
+        )}
+      </button>
+    </div>
   )
 }
 
@@ -242,21 +265,31 @@ function ProviderButton({
 function Chooser({
   busy,
   beginError,
+  beginErrorCode,
   onPick,
 }: {
   busy: boolean
   beginError: string
+  /** The begin refusal's `code`, or '' (see apiErrorCode). */
+  beginErrorCode: string
   onPick: (provider: KasLoginProvider, extra?: KasLoginExtra) => void
 }) {
   // The company-SSO choice expands an inline form (start URL + region) instead of
   // beginning immediately: the portal URL is per-company, so there is nothing to
   // start until the user supplies it.
-  const [ssoOpen, setSsoOpen] = useState(false)
+  const organisationOnly = useContext(OrganisationOnlyContext)
+  const [ssoOpen, setSsoOpen] = useState(organisationOnly)
   // Seeded from the last company sign-in submitted on this browser, so a reload
   // or gateway restart does not hand back an empty field.
   const [startUrl, setStartUrl] = useState(() => readCompanySignIn().startUrl)
   const [region, setRegion] = useState(() => readCompanySignIn().region)
   const startUrlReady = startUrl.trim().length > 0
+  // The 400s the user fixes in this form: the error names the field (both, when
+  // AWS's answer names neither) and is tied to it, instead of sending them to
+  // check their connection.
+  const eitherBad = beginErrorCode === 'start_url_or_region_rejected'
+  const startUrlBad = eitherBad || beginErrorCode === 'invalid_start_url'
+  const regionBad = eitherBad || beginErrorCode === 'invalid_region'
   const chrome = useChrome()
   return (
     <ViewShell
@@ -288,25 +321,29 @@ function Chooser({
             : 'mt-7 flex w-full max-w-md flex-col gap-3'
         }
       >
-        <ProviderButton
-          icon={<Globe className="lucide-inline" />}
-          label={i18nT('components.kasLogin.continue_with_google')}
-          primary
-          disabled={busy}
-          onClick={() => onPick('google')}
-        />
-        <ProviderButton
-          icon={<GithubLogo size={15} />}
-          label={i18nT('components.kasLogin.continue_with_github')}
-          disabled={busy}
-          onClick={() => onPick('github')}
-        />
-        <ProviderButton
-          icon={<IdCard className="lucide-inline" />}
-          label={i18nT('components.kasLogin.continue_with_builder_id')}
-          disabled={busy}
-          onClick={() => onPick('builder_id')}
-        />
+        {!organisationOnly && (
+          <>
+            <ProviderButton
+              icon={<Globe className="lucide-inline" />}
+              label={i18nT('components.kasLogin.continue_with_google')}
+              primary
+              disabled={busy}
+              onClick={() => onPick('google')}
+            />
+            <ProviderButton
+              icon={<GithubLogo size={15} />}
+              label={i18nT('components.kasLogin.continue_with_github')}
+              disabled={busy}
+              onClick={() => onPick('github')}
+            />
+            <ProviderButton
+              icon={<IdCard className="lucide-inline" />}
+              label={i18nT('components.kasLogin.continue_with_builder_id')}
+              disabled={busy}
+              onClick={() => onPick('builder_id')}
+            />
+          </>
+        )}
         {ssoOpen ? (
           <form
             className="rounded-lg border border-border bg-bg-elevated p-3 sm:col-span-full"
@@ -326,15 +363,24 @@ function Chooser({
               htmlFor="kas-sso-start-url"
             >
               {i18nT('components.kasLogin.sso_start_url_label')}
+              {/* type="text", not "url": the browser's URL check refuses a paste
+                  without "https://" before the gateway can add it. inputMode
+                  keeps the URL keyboard on touch devices. */}
               <input
                 id="kas-sso-start-url"
-                type="url"
+                type="text"
+                inputMode="url"
+                autoCapitalize="none"
+                autoCorrect="off"
+                spellCheck={false}
                 aria-label={i18nT('components.kasLogin.sso_start_url_label')}
+                aria-invalid={startUrlBad || undefined}
+                aria-describedby={startUrlBad ? SSO_ERROR_ID : undefined}
                 autoFocus
                 value={startUrl}
                 onChange={(e) => setStartUrl(e.target.value)}
                 placeholder={i18nT('components.kasLogin.sso_start_url_placeholder')}
-                className="focus-ring mt-1 w-full rounded-lg border border-border bg-bg px-3 py-2 font-mono text-[13px] font-normal text-text-strong placeholder:text-muted"
+                className="focus-ring mt-1 w-full rounded-lg border border-border bg-bg px-3 py-2 font-mono text-[13px] font-normal text-text-strong placeholder:text-muted aria-invalid:border-danger"
               />
             </label>
             <p className="mt-1 text-[12px] leading-relaxed text-muted">
@@ -349,19 +395,23 @@ function Chooser({
                 id="kas-sso-region"
                 type="text"
                 aria-label={i18nT('components.kasLogin.sso_region_label')}
+                aria-invalid={regionBad || undefined}
+                aria-describedby={regionBad ? SSO_ERROR_ID : undefined}
                 value={region}
                 onChange={(e) => setRegion(e.target.value)}
                 placeholder="us-east-1"
-                className="focus-ring mt-1 w-full rounded-lg border border-border bg-bg px-3 py-2 font-mono text-[13px] font-normal text-text-strong placeholder:text-muted"
+                className="focus-ring mt-1 w-full rounded-lg border border-border bg-bg px-3 py-2 font-mono text-[13px] font-normal text-text-strong placeholder:text-muted aria-invalid:border-danger"
               />
             </label>
             <div className="mt-3 flex items-center gap-2">
               <Btn type="submit" primary disabled={!startUrlReady || busy}>
                 {i18nT('components.kasLogin.sso_continue')}
               </Btn>
-              <Btn type="button" disabled={busy} onClick={() => setSsoOpen(false)}>
-                {i18nT('components.kasLogin.sso_cancel')}
-              </Btn>
+              {!organisationOnly && (
+                <Btn type="button" disabled={busy} onClick={() => setSsoOpen(false)}>
+                  {i18nT('components.kasLogin.sso_cancel')}
+                </Btn>
+              )}
             </div>
           </form>
         ) : (
@@ -376,7 +426,7 @@ function Chooser({
       {/* The failure appears in place after the click (ErrorNotice is
           role="alert"), with no route change a screen reader would announce.
           The raw backend detail is the `message` (kept verbatim for bug
-          reports) under the fixed title — never suffixed onto the connection
+          reports) under the title — never suffixed onto the connection
           advice, where "Unknown provider: x" reads as a contradiction. */}
       {/* Hand-off decision per chrome. Gate: none -- the Company SSO start-URL
           field (the form above) is unsaved, and the gate stands between the
@@ -384,21 +434,33 @@ function Chooser({
           one click away and there is no draft unless the SSO form is open, so
           the agent is offered exactly when nothing would be lost. */}
       <ErrorNotice
+        id={SSO_ERROR_ID}
         className={chrome.card ? 'mt-3 max-w-lg' : 'mt-4 max-w-md'}
         askAgent={chrome.card && !ssoOpen}
-        title={i18nT('components.kasLogin.could_not_start_sign_in')}
+        title={
+          eitherBad
+            ? i18nT('components.kasLogin.sso_start_url_or_region_invalid')
+            : regionBad
+              ? i18nT('components.kasLogin.sso_region_invalid')
+              : startUrlBad
+                ? i18nT('components.kasLogin.sso_start_url_invalid')
+                : i18nT('components.kasLogin.could_not_start_sign_in')
+        }
         message={beginError || null}
         testId="kas-login-begin-error"
       />
-      <p
-        className={
-          chrome.card
-            ? 'mt-3 max-w-lg text-[12px] leading-relaxed text-muted'
-            : 'mt-5 max-w-md text-[13px] leading-relaxed text-muted'
-        }
-      >
-        {i18nT('components.kasLogin.browser_note')}
-      </p>
+      {/* "Each option starts…" reads wrong over a single option. */}
+      {!organisationOnly && (
+        <p
+          className={
+            chrome.card
+              ? 'mt-3 max-w-lg text-[12px] leading-relaxed text-muted'
+              : 'mt-5 max-w-md text-[13px] leading-relaxed text-muted'
+          }
+        >
+          {i18nT('components.kasLogin.browser_note')}
+        </p>
+      )}
     </ViewShell>
   )
 }
@@ -550,10 +612,7 @@ function DeviceWaiting({
             </span>
             {i18nT('components.kasLogin.open_this_link')}
           </p>
-          <CopyField value={session.verification_uri_complete} />
-          <p className="mt-1 text-[11px] text-muted">
-            {i18nT('components.kasLogin.click_to_copy')}
-          </p>
+          <LinkField value={session.verification_uri_complete} />
         </li>
         <li>
           <p className="flex items-center gap-2 text-[13px] font-medium text-text">
@@ -602,17 +661,32 @@ function DeviceWaiting({
 
 // Terminal poll outcomes (code expired / poll failed) share one recovery shape:
 // name what happened, then offer exactly one action — back to the chooser for a
-// fresh code. Detail text is shown verbatim when the backend sent one.
+// fresh code. Detail text is shown verbatim when the backend sent one. An
+// Identity Center sign-in whose Kiro profile could not be found gets its own
+// plain sentence per `code`: "no profile" only when the lookup answered with
+// none, never when the lookup itself failed.
 function SignInProblem({
   expired,
+  code,
   detail,
   onStartOver,
 }: {
   expired: boolean
+  code?: string
   detail: string
   onStartOver: () => void
 }) {
   const chrome = useChrome()
+  // The coded sentence goes through ErrorNotice (alert role, hand-off), under a
+  // plain "Sign-in failed" headline; expired and uncoded failures keep the
+  // eyebrow-plus-headline shape.
+  const coded = expired
+    ? ''
+    : code === 'no_kiro_profile'
+      ? i18nT('components.kasLogin.no_kiro_profile_body')
+      : code === 'profile_lookup_failed'
+        ? i18nT('components.kasLogin.profile_lookup_failed_body')
+        : ''
   return (
     <ViewShell
       aside={{
@@ -625,16 +699,24 @@ function SignInProblem({
       <div className={`${chrome.tile} bg-danger/10 text-danger-text`}>
         <AlertTriangle className="lucide-inline" />
       </div>
-      <p className={`${chrome.afterTile} ${chrome.eyebrow.replace('text-accent', 'text-danger')}`}>
-        {expired
-          ? i18nT('components.kasLogin.the_code_expired')
-          : i18nT('components.kasLogin.sign_in_failed')}
-      </p>
-      <h1 className={chrome.h1}>
-        {expired
-          ? i18nT('components.kasLogin.the_code_expired_body')
-          : i18nT('components.kasLogin.sign_in_failed_body')}
-      </h1>
+      {coded ? (
+        <h1 className={`${chrome.afterTile} ${chrome.headline}`}>
+          {i18nT('components.kasLogin.sign_in_failed')}
+        </h1>
+      ) : (
+        <>
+          <p className={`${chrome.afterTile} ${chrome.eyebrow.replace('text-accent', 'text-danger')}`}>
+            {expired
+              ? i18nT('components.kasLogin.the_code_expired')
+              : i18nT('components.kasLogin.sign_in_failed')}
+          </p>
+          <h1 className={chrome.h1}>
+            {expired
+              ? i18nT('components.kasLogin.the_code_expired_body')
+              : i18nT('components.kasLogin.sign_in_failed_body')}
+          </h1>
+        </>
+      )}
       {/* Hand-off per chrome. Gate: none -- the chat the hand-off would open
           sits behind it, and without a signed-in account there is no agent to
           hand the failure to; Start over is the remedy. Card: the dashboard
@@ -643,7 +725,7 @@ function SignInProblem({
       <ErrorNotice
         className="mt-3 max-w-lg"
         askAgent={chrome.card}
-        message={detail || null}
+        message={coded || detail || null}
         testId="kas-login-problem-detail"
       />
       <div className="mt-6">
@@ -693,10 +775,19 @@ export interface KasLoginFlowSlots {
  * rendered by `KiroSignInCard` under the harness switch); this full-screen form stays
  * available for a future app-root mount as a sibling of KiroPrerequisiteGate.
  */
-export default function KasLoginGate({ children }: { children?: ReactNode }) {
+export default function KasLoginGate({
+  children,
+  organisationOnly = false,
+}: {
+  children?: ReactNode
+  /** Offer only Company SSO: an enterprise gateway accepts no other sign-in. */
+  organisationOnly?: boolean
+}) {
   return (
     <ChromeContext.Provider value="gate">
-      <KasLoginFlow>{children}</KasLoginFlow>
+      <OrganisationOnlyContext.Provider value={organisationOnly}>
+        <KasLoginFlow>{children}</KasLoginFlow>
+      </OrganisationOnlyContext.Provider>
     </ChromeContext.Provider>
   )
 }
@@ -1020,7 +1111,14 @@ function KasLoginFlow({
       (pollQuery.error != null || pollQuery.data?.code === 'token_store_failed')
     if ((session.kind === 'device' && terminal) || loopbackDeadEnd) {
       const detail = pollQuery.error?.message || pollQuery.data?.error || ''
-      return <SignInProblem expired={effective === 'expired'} detail={detail} onStartOver={reset} />
+      return (
+        <SignInProblem
+          expired={effective === 'expired'}
+          code={pollQuery.error ? undefined : pollQuery.data?.code}
+          detail={detail}
+          onStartOver={reset}
+        />
+      )
     }
     if (session.kind === 'loopback') {
       return (
@@ -1063,6 +1161,7 @@ function KasLoginFlow({
             ? beginLoopback.error.message
             : '')
         }
+        beginErrorCode={apiErrorCode(beginDevice.error)}
         onPick={(provider, extra) => {
           beginDevice.reset()
           beginLoopback.reset()

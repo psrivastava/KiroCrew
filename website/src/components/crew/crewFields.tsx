@@ -263,7 +263,7 @@ function withCurrent(opts: string[], cur: string): string[] {
  * composes them in its Advanced settings; the editor mounts them individually,
  * one per rail pane.
  */
-export function WorkspaceField({ options, value, onChange, onNewWorkspace, subject, hint, ownOption = false }: {
+export function WorkspaceField({ options, value, onChange, onNewWorkspace, subject, hint, ownOption = false, disabled }: {
   options: string[]; value: string; onChange: (v: string) => void; onNewWorkspace: () => void; subject: FormSubject
   /** Replaces the subject's default hint. The defaults are EDIT-time copy
    *  ("new chats start fresh in the new folder"); a create form has no old
@@ -273,6 +273,9 @@ export function WorkspaceField({ options, value, onChange, onNewWorkspace, subje
    *  forms only: the API allocates on create and never on update, so the
    *  editor must not show a choice it cannot save. */
   ownOption?: boolean
+  /** Locks the select while a form submit is in flight. A select never
+   *  implicitly submits a form, so a native lock here cannot drop focus. */
+  disabled?: boolean
 }) {
   const choices = ownOption
     ? [OWN_WORKSPACE, ...withCurrent(options, value).filter(o => o !== OWN_WORKSPACE)]
@@ -289,6 +292,7 @@ export function WorkspaceField({ options, value, onChange, onNewWorkspace, subje
         value={value}
         onChange={onChange}
         action={{ label: i18nT('pages.kiroCrewAgentsPage.new_workspace_action'), onSelect: onNewWorkspace }}
+        disabled={disabled}
         aria-label={i18nT('pages.kiroCrewAgentsPage.workspace_2')}
       />
     </Field>
@@ -311,20 +315,39 @@ export function memberMemoryState(member: string, store: string, stores: Record<
   return 'unavailable'
 }
 
-export function ModelField({ options, value, onChange, hint }: {
-  options: string[]; value: string; onChange: (v: string) => void; hint?: string
+export function ModelField({ options, value, onChange, hint, servedAs, harness = '', disabled }: {
+  options: string[]; value: string; onChange: (v: string) => void; hint?: string; disabled?: boolean
+  /** The id the crew's harness serves a stored pin `options` lacks as, `''` for none
+   *  (`resolved-model`'s `pin_served_as`). Omitted while no live session has said. */
+  servedAs?: string
+  /** That harness's name, for a pin it does not offer. */
+  harness?: string
 }) {
+  // A stored pin spelled as another harness spells it is the row it runs as, not a second row for
+  // the same model: two rows read as two models, and the readout below still names the stored id.
+  const folded = servedAs !== undefined && servedAs !== value && options.includes(servedAs)
+  const shown = folded ? options : withCurrent(options, value)
+  // Otherwise the off-list pin says what this harness does with it.
+  const offList = !folded && servedAs !== undefined && servedAs !== value && !options.includes(value)
+  const label = (m: string) => {
+    if (m === INHERIT_MODEL) return i18nT('pages.kiroCrewAgentsPage.inherited')
+    if (m !== value || !offList) return m
+    return servedAs
+      ? i18nT('pages.kiroCrewAgentsPage.pin_runs_as', { model: m, served: servedAs })
+      : i18nT('pages.kiroCrewAgentsPage.pin_not_offered', { model: m, harness })
+  }
   return (
     <Field label={i18nT('pages.kiroCrewAgentsPage.model')} hint={hint}>
       <SimpleSelect
-        options={withCurrent(options, value)}
+        options={shown}
         // The inherit option must NOT read as "auto": in the chat picker "auto"
         // promises task-based routing, whereas here it means "pin nothing,
         // inherit the next tier" — which can resolve to a concrete model. Label
         // it as the card does so the round trip stays honest.
-        optionLabels={withCurrent(options, value).map(m => (m === INHERIT_MODEL ? i18nT('pages.kiroCrewAgentsPage.inherited') : m))}
-        value={value}
+        optionLabels={shown.map(label)}
+        value={folded ? servedAs : value}
         onChange={onChange}
+        disabled={disabled}
         aria-label={i18nT('pages.kiroCrewAgentsPage.edit_model')}
         {...uiLocation('agents.model')}
       />
@@ -335,16 +358,19 @@ export function ModelField({ options, value, onChange, hint }: {
 /** The crew's reasoning-effort pin. Rendered only when the model the crew will
  *  actually run on supports effort — the same gate the chat picker uses, so a
  *  crew on Haiku is not offered a control the backend would drop. */
-export function EffortField({ value, onChange }: {
+export function EffortField({ value, onChange, levels }: {
   value: string; onChange: (v: string) => void
+  /** The levels the crew's harness takes; the shared vocabulary when it reported none. */
+  levels?: readonly string[]
 }) {
+  const options = levels ? ['', ...levels.filter(l => l && l !== 'default')] : [...EFFORT_LEVELS]
   return (
     <Field label={i18nT('pages.kiroCrewAgentsPage.reasoning_effort')} hint={i18nT('pages.kiroCrewAgentsPage.reasoning_effort_hint')}>
       <SimpleSelect
-        options={[...EFFORT_LEVELS]}
+        options={options}
         // '' is the inherit sentinel, labelled as such rather than as a level:
         // it means "take the global default", which may itself be a level.
-        optionLabels={EFFORT_LEVELS.map(l => (l === '' ? i18nT('pages.kiroCrewAgentsPage.inherited') : effortLabel(l)))}
+        optionLabels={options.map(l => (l === '' ? i18nT('pages.kiroCrewAgentsPage.inherited') : effortLabel(l)))}
         value={value}
         onChange={onChange}
         aria-label={i18nT('pages.kiroCrewAgentsPage.edit_reasoning_effort')}
@@ -388,7 +414,9 @@ export function displayNameFallback(agent: KiroCrewAgent | null | undefined, key
 
 /** The routing-keyword input. Rendered by the create form and by the editor's
  *  routing pane, so it is a component rather than two copies. */
-export function TriggersField({ value, onChange, subject }: { value: string; onChange: (v: string) => void; subject: FormSubject }) {
+export function TriggersField({ value, onChange, subject, busy }: { value: string; onChange: (v: string) => void; subject: FormSubject; /** Held, not disabled, while a form submit is out: Enter in this text
+   *  field implicitly submits, so a native disable would blur it to <body>. */
+  busy?: boolean }) {
   const hint = subject === 'member'
     ? i18nT('pages.kiroCrewAgentsPage.triggers_hint_member')
     : i18nT('pages.kiroCrewAgentsPage.triggers_hint')
@@ -401,6 +429,8 @@ export function TriggersField({ value, onChange, subject }: { value: string; onC
         placeholder={i18nT('pages.kiroCrewAgentsPage.triggers_placeholder')}
         value={value}
         onChange={e => onChange(e.target.value)}
+        readOnly={busy}
+        aria-disabled={busy || undefined}
         aria-label={i18nT('pages.kiroCrewAgentsPage.triggers')}
       />
     </Field>
@@ -409,7 +439,10 @@ export function TriggersField({ value, onChange, subject }: { value: string; onC
 
 /** Session color picker for agent configuration. Sets the default session
  *  tint color for new sessions created with this agent. */
-export function SessionColorField({ value, onChange, subject }: { value: string; onChange: (v: string) => void; subject: FormSubject }) {
+export function SessionColorField({ value, onChange, subject, busy }: { value: string; onChange: (v: string) => void; subject: FormSubject; /** Locks the field while a form submit is out: the hex text input is
+   *  held (Enter in it implicitly submits), the swatches / picker / Clear
+   *  are natively disabled -- none of those can submit a form. */
+  busy?: boolean }) {
   const HEX_RE = /^#[0-9a-f]{6}$/i
   const [draft, setDraft] = useState(value || '')
   // Re-sync the draft when the committed value changes from outside (e.g. the
@@ -466,6 +499,7 @@ export function SessionColorField({ value, onChange, subject }: { value: string;
               // SessionColorSwatches uses, and it separates from every hue here.
               className={`h-5 w-5 p-0 cursor-pointer rounded-full border-2 transition-transform hover:brightness-125 swatch-cue ${active ? 'border-text-strong scale-110' : 'border-border'}`}
               style={{ background: c }}
+              disabled={busy}
               onClick={() => onChange(c)}
             />
           )
@@ -477,6 +511,7 @@ export function SessionColorField({ value, onChange, subject }: { value: string;
           value={value || HEX_COLOR_EXAMPLE}
           onChange={e => onChange(e.target.value.toLowerCase())}
           className="h-8 w-8 flex-none cursor-pointer p-0.5"
+          disabled={busy}
           aria-label={i18nT('pages.kiroCrewAgentsPage.session_color')}
         />
         <Input
@@ -491,6 +526,10 @@ export function SessionColorField({ value, onChange, subject }: { value: string;
           }}
           onBlur={e => commit(e.target.value)}
           className="flex-1 font-mono text-[13px]"
+          // Held, not disabled: Enter in this hex field implicitly submits the
+          // create form, so a native disable would blur it to <body>.
+          readOnly={busy}
+          aria-disabled={busy || undefined}
           aria-label={i18nT('pages.kiroCrewAgentsPage.session_color_hex')}
         />
         {value && (
@@ -498,6 +537,7 @@ export function SessionColorField({ value, onChange, subject }: { value: string;
             type="button"
             onClick={() => onChange('')}
             className="text-[11px]"
+            disabled={busy}
             aria-label={i18nT('pages.kiroCrewAgentsPage.session_color_clear')}
           >
             {i18nT('pages.kiroCrewAgentsPage.session_color_clear')}

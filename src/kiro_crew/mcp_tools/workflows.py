@@ -31,6 +31,7 @@ from kiro_crew.validation import (
     WORKFLOW_RUN_SCHEMA,
     validate_tool_args,
 )
+from kiro_crew.workflows.library import command_ref
 
 
 def schemas() -> list[dict[str, Any]]:
@@ -104,6 +105,27 @@ def schemas() -> list[dict[str, Any]]:
                     "budget_total": {
                         "type": "integer",
                         "description": "Optional token budget ceiling for the run",
+                    },
+                    "title": {
+                        "type": "string",
+                        "description": (
+                            "Optional title for the fallback `workflow-<run_id>` session this "
+                            "run gets when its originating chat is gone (e.g. a webhook-driven "
+                            "run). Lets many runs of one workflow be told apart in the sidebar. "
+                            "Ignored when the originating chat is still live. Omit to keep the "
+                            "default `Workflow: <name>`."
+                        ),
+                    },
+                    "folder": {
+                        "type": "string",
+                        "description": (
+                            "Optional EXISTING sidebar folder (id or '/'-separated path, "
+                            "like session_create's `folder`) for the fallback "
+                            "`workflow-<run_id>` session. Must already exist — nothing is "
+                            "created; a missing or ambiguous folder rejects the run. "
+                            "Ignored when the originating chat is still live. Omit to leave "
+                            "the fallback unfiled."
+                        ),
                     },
                 },
             },
@@ -265,6 +287,18 @@ def workflow_run(name: str, args: dict[str, Any]) -> str:
         wf_body["args"] = args["args"]
     if isinstance(args.get("budget_total"), int):
         wf_body["budget_total"] = args["budget_total"]
+    # Opt-in title/folder for the fallback ``workflow-<run_id>`` slot. Both are
+    # forwarded as-is: the title is cleaned where every run path converges on
+    # applying it (the result injector), and the folder (id or '/'-path) is
+    # resolved to an EXISTING folder id server-side by the run handler — nothing
+    # is created, and a missing/ambiguous folder rejects the run. This tool
+    # builds no dashboard client.
+    fallback_title = (args.get("title") or "").strip()
+    if fallback_title:
+        wf_body["title"] = fallback_title
+    fallback_folder = (args.get("folder") or "").strip()
+    if fallback_folder:
+        wf_body["folder"] = fallback_folder
     if workflow_ref:
         if args.get("input"):
             wf_body["input"] = args["input"]
@@ -330,15 +364,25 @@ def workflow_library_list(name: str, args: dict[str, Any]) -> str:
         return _wf_return(
             "workflow_library_list", f"workflow_library_list: {d['error']}", outcome="error"
         )
-    definitions = d.get("definitions", [])
+    # A workflow neither of whose refs reaches it has no command that runs
+    # it, so agents are never offered it.
+    definitions = [item for item in d.get("definitions", []) if command_ref(item)]
     if not definitions:
         return _wf_return("workflow_library_list", "No saved workflows yet.")
     lines = [
-        f"- `/workflow {item.get('slug')}` — {item.get('name') or item.get('slug')} "
-        f"(revision {item.get('revision')}, id `{item.get('id')}`)"
+        f"- `/workflow {command_ref(item)}` — {item.get('name') or item.get('slug')} "
+        f"(revision {item.get('revision')}{_listed_id(item)})"
         for item in definitions
     ]
     return _wf_return("workflow_library_list", "Saved workflows:\n" + "\n".join(lines))
+
+
+def _listed_id(item: dict[str, Any]) -> str:
+    """The id clause of a listed workflow, or none when its id does not reach
+    it: an agent that ran by it would get not found."""
+    if item.get("id") in (item.get("shadowed_refs") or []):
+        return ""
+    return f", id `{item.get('id')}`"
 
 
 def workflow_status(name: str, args: dict[str, Any]) -> str:

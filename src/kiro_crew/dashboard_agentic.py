@@ -42,6 +42,8 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Final, Mapping, Sequence, cast
 
@@ -151,11 +153,11 @@ PACKAGE_REFUSALS: Final[dict[str, str]] = {
 #: create one, tell a human, stop reaching for it.
 _PACKAGE_REMEDIES: Final[dict[str, str]] = {
     "empty": (
-        "this crewmate has no dashboard package yet, so it has no field to write: "
+        "this Bot has no dashboard package yet, so it has no field to write: "
         "create one with a Model that declares this field, then write it"
     ),
     "error": (
-        "this crewmate's dashboard package has a Model that does not load, so there is "
+        "this Bot's dashboard package has a Model that does not load, so there is "
         "nothing to check a write against -- ask the human to repair or replace the "
         "package"
     ),
@@ -197,7 +199,7 @@ def type_holds(declared: str, value: Any) -> bool:
     THE SAME RULE as ``projection._dashboard_type_holds``, deliberately duplicated:
     the fold cannot import this module and this module cannot live in
     ``projection`` (the manifest imports the fold names, so the cycle closes the
-    other way). ``test_dashboard_agentic`` pins the two against one table of cases.
+    other way). ``test_dynamic_dashboard`` pins the two against one table of cases.
 
     A bool is NOT a number. Python says ``isinstance(True, int)``, so without the
     exclusion a crewmate writing ``true`` into a ``number`` field would pass and the
@@ -411,7 +413,7 @@ def check_write(
         raise WriteRefused(
             "no_instance",
             field,
-            "this crewmate has no dashboard yet, so it has no field to write: adopt a "
+            "this Bot has no dashboard yet, so it has no field to write: adopt a "
             "template first, then write its agentic fields",
         )
     writable = agentic_fields(instance.manifest)
@@ -745,6 +747,16 @@ def fields_for_agent(
     current = values if isinstance(values, Mapping) else None
     stamps = written_at if isinstance(written_at, Mapping) else {}
     upkeep = dashboard_upkeep.upkeep_rows(instance.manifest, slug)
+    # Preview on, and only with a read in hand: each agentic row then says how long
+    # its value stays current and whether it is out of date now (``stale_line``'s rule).
+    aging = current is not None and stale_fields_enabled()
+    stale_after: dict[str, str] = {}
+    out_of_date: set[str] = set()
+    if aging:
+        import time
+
+        stale_after = stale_after_map(instance.manifest, stamps)
+        out_of_date = {n for n, _a, _l in stale_fields(instance.manifest, stamps, time.time())}
     for name, spec in sorted(instance.manifest.fields.items()):
         row: dict[str, Any] = {"field": name, "type": spec.type}
         # The WHOLE shape, so the first write can be the right one: a type alone
@@ -762,6 +774,11 @@ def fields_for_agent(
                     row["value"] = current[name]
                     if stamps.get(name):
                         row["written_at"] = str(stamps[name])
+            if aging:
+                row["stale_after_s"] = stale_after_seconds(spec)
+                if name in stale_after:
+                    row["stale_after"] = stale_after[name]
+                row["stale"] = name in out_of_date
         else:
             row["source"] = "fold"
             row["fold"] = spec.fold
@@ -1040,9 +1057,11 @@ SUGGESTIONS_STATE: str = (
     "sees."
 )
 SUGGESTIONS_LINE: str = (
-    SUGGESTIONS_STATE + " Your progress belongs on a page of your own, not in chat: when "
-    "you have work to report, build your page with the dashboard skill "
-    "(dashboard_save, then dashboard_apply) instead of posting it here."
+    SUGGESTIONS_STATE + " Your progress belongs on a page of your own, not in chat: "
+    "when you have work to report, build your page with the dashboard skill "
+    "(dashboard_save, then dashboard_apply) instead of posting it here. Other "
+    "pictures (a comparison, a flow, a before/after, a cause chain) still get drawn "
+    "as widgets, per Inline Widgets."
 )
 
 
@@ -1061,6 +1080,91 @@ def _crew_panel_on() -> bool:
 #: How many unresolved field names the turn block spells out before it counts the rest.
 UNRESOLVED_NAMES_SHOWN: Final[int] = 3
 
+#: A fold field whose fold has had no value for long enough that the page is past
+#: fresh: ``fold_unseen`` promoted, so :func:`unresolved_line` names it.
+NEVER_RESOLVED: Final[str] = "never_resolved"
+#: A ``custom`` field still unseen after a script cron bound to the crewmate has run:
+#: the feed exists and has landed nothing, so the wait is already over.
+NEVER_RESOLVED_CRON: Final[str] = "never_resolved_cron"
+#: How long a ``custom`` field may stay ``fold_unseen`` before it is reported even with
+#: no bound script cron that has run. ``custom`` only: it fills from nothing but a
+#: script cron, so a day empty means no bound job is feeding it (the job is bound to no
+#: crewmate, or none exists). Other folds have an empty state that is normal -- a panel
+#: never published, no goal yet, nothing waiting -- and are never promoted. A day
+#: covers a daily job's first run. Measured
+#: on this process's clock from the first turn that saw it unseen; a restart starts it
+#: again, which can only delay a report, never invent one.
+NEVER_RESOLVED_AFTER_S: Final[float] = 24 * 3600.0
+#: How long a ``custom`` field must stay unseen, once a bound script cron has run,
+#: before it is reported. Not zero: the turn block reads with no prime wait, so the
+#: first read after a restart sees a cold fold as unseen even when it holds records.
+#: Five minutes outlasts any prime, so only a fold that is really empty is named.
+NEVER_RESOLVED_CRON_AFTER_S: Final[float] = 300.0
+
+#: When each fold field was first seen unseen, by slot: process memory, bounded.
+_UNSEEN_SINCE: "OrderedDict[str, dict[str, float]]" = OrderedDict()
+_UNSEEN_SLOTS_MAX: Final[int] = 256
+_UNSEEN_LOCK = threading.Lock()
+
+
+def _unseen_for(slot: str, names: list[str], now: float) -> dict[str, float]:
+    """How long each of *names* has been unseen on *slot*, recording the new ones.
+
+    Names that are not unseen on this read are forgotten, so a field that resolves and goes cold
+    again (a unit rollover) starts its wait afresh.
+    """
+    with _UNSEEN_LOCK:
+        known = _UNSEEN_SINCE.pop(slot, {})
+        kept = {name: known.get(name, now) for name in names}
+        if kept:
+            _UNSEEN_SINCE[slot] = kept
+            while len(_UNSEEN_SINCE) > _UNSEEN_SLOTS_MAX:
+                _UNSEEN_SINCE.popitem(last=False)
+    return {name: now - since for name, since in kept.items()}
+
+
+def _bound_cron_has_run(member: str) -> bool:
+    """Whether a script cron bound to crewmate *member* has finished a run. TOTAL."""
+    try:
+        from kiro_crew.config.loader import KiroCrewConfig
+        from kiro_crew.cron import bound_script_runs_from_disk
+
+        record = KiroCrewConfig.load().agents.get(member)
+        member_id = str(getattr(record, "member_id", "") or "")
+        return bool(member_id) and bool(bound_script_runs_from_disk(member_id))
+    except Exception:
+        logger.debug("dashboard: %r's bound crons could not be read", member, exc_info=True)
+        return False
+
+
+def _promote_unseen(
+    slot: str, member: str, manifest: TemplateManifest, unresolved: dict[str, str]
+) -> None:
+    """Promote ``fold_unseen`` fields that have stayed unseen past their bound, in place.
+
+    A fresh crewmate's page is all ``fold_unseen`` and stays quiet. A ``custom`` field
+    is promoted to :data:`NEVER_RESOLVED_CRON` once a script cron bound to the crewmate
+    has run (the cron failed before it could land, or writes another type) and the
+    field has been unseen for :data:`NEVER_RESOLVED_CRON_AFTER_S`, else to
+    :data:`NEVER_RESOLVED` after :data:`NEVER_RESOLVED_AFTER_S` unseen. No other fold is
+    promoted: an empty panel, goal or waiting fold is a normal state, not a bad binding.
+    """
+    import time
+
+    from kiro_crew.crew_log.entry_types import CUSTOM_FOLD_NAME
+    from kiro_crew.dashboard_feed import FOLD_UNSEEN
+
+    unseen = sorted(name for name, reason in unresolved.items() if reason == FOLD_UNSEEN)
+    waited = _unseen_for(slot, unseen, time.monotonic())
+    custom = [name for name in unseen if manifest.fields[name].fold == CUSTOM_FOLD_NAME]
+    due = [name for name in custom if waited.get(name, 0.0) >= NEVER_RESOLVED_CRON_AFTER_S]
+    if due and _bound_cron_has_run(member):
+        for name in due:
+            unresolved[name] = NEVER_RESOLVED_CRON
+    for name in custom:
+        if unresolved[name] == FOLD_UNSEEN and waited.get(name, 0.0) >= NEVER_RESOLVED_AFTER_S:
+            unresolved[name] = NEVER_RESOLVED
+
 
 def _unresolved_reason(reason: str, fold: str, path: str) -> str:
     """One reason, in the crewmate prompt file's words."""
@@ -1069,6 +1173,10 @@ def _unresolved_reason(reason: str, fold: str, path: str) -> str:
 
     if reason == OLDER_VALUE:
         return crewmate_prompts.text("dashboard.reason_older_value")
+    if reason == NEVER_RESOLVED:
+        return crewmate_prompts.text("dashboard.reason_never_resolved")
+    if reason == NEVER_RESOLVED_CRON:
+        return crewmate_prompts.text("dashboard.reason_never_resolved_cron")
     return crewmate_prompts.fill("dashboard.reason_path_missing", fold=fold, path=path)
 
 
@@ -1127,6 +1235,7 @@ def _unresolved_fold_fields(slug: str, member: str, manifest: TemplateManifest) 
                     continue
                 unresolved.pop(name)
                 remember_resolved(slot, [name])
+        _promote_unseen(_dashboard_slot(member, slug), member, manifest, unresolved)
         return unresolved
     except Exception:
         logger.debug("dashboard: %r's fields could not be read for its turn", slug, exc_info=True)
@@ -1137,10 +1246,12 @@ def unresolved_line(manifest: TemplateManifest, unresolved: Mapping[str, str]) -
     """The turn block's line naming each fold field that did not resolve, or ``""``.
 
     Only the causes the crewmate can fix are named: a path not found in a fold that
-    HAS a value, and a field that resolved before and stopped. A fold that has produced
-    no value yet (``fold_unseen``, which includes a panel never published) is no broken
-    binding -- a fresh crewmate on its shipped page is in exactly that state -- so it
-    is left out, and once the fold has a value a wrong path shows as ``path_missing``.
+    HAS a value, a field that resolved before and stopped, and a field that has NEVER
+    resolved past its bound (:func:`_promote_unseen`). A fold that has produced no value
+    yet (``fold_unseen``, which includes a panel never published) is no broken binding
+    while the page is fresh -- a new crewmate on its shipped page is in exactly that
+    state -- so it is left out until the bound promotes it, and once the fold has a
+    value a wrong path shows as ``path_missing``.
 
     Capped at :data:`UNRESOLVED_NAMES_SHOWN` names with the rest counted, so a page
     whose every binding broke still costs the turn one line.
@@ -1167,7 +1278,281 @@ def unresolved_line(manifest: TemplateManifest, unresolved: Mapping[str, str]) -
     return crewmate_prompts.fill("dashboard.unresolved", fields=listed)
 
 
-def turn_block(slug: str, member: str = "") -> str:
+#: The feature preview (``dashboard.feature_previews``) that marks out-of-date agentic
+#: fields on the page and names them in the turn block. Off: nothing here runs.
+STALE_FIELDS_PREVIEW: Final[str] = "dashboard_stale_fields"
+#: How long an agentic value stays current when its field declares no
+#: ``stale_after_s``: a day, the daily review's cadence, so a field the crewmate
+#: keeps on that cadence is never marked.
+AGENTIC_STALE_AFTER_DEFAULT_S: Final[int] = 24 * 3600
+
+
+def stale_fields_enabled() -> bool:
+    """Whether the :data:`STALE_FIELDS_PREVIEW` preview is on. ``False`` on any read
+    failure, so a config that cannot be read changes nothing. TOTAL."""
+    try:
+        from kiro_crew.config import KiroCrewConfig
+        from kiro_crew.edition_locks import feature_previews
+
+        previews = feature_previews(KiroCrewConfig.load().dashboard.feature_previews)
+    except Exception:  # noqa: BLE001 -- an unreadable config reads as off
+        return False
+    return isinstance(previews, dict) and previews.get(STALE_FIELDS_PREVIEW) is True
+
+
+def stale_after_seconds(spec: FieldSpec) -> int:
+    """How long *spec*'s written value stays current; ``0`` means never stale."""
+    declared = spec.stale_after_s
+    return AGENTIC_STALE_AFTER_DEFAULT_S if declared is None else int(declared)
+
+
+def _stamp_epoch(stamp: Any) -> float | None:
+    """An ISO stamp with an offset (the fold's ``at``) as epoch seconds, or ``None``."""
+    from datetime import datetime
+
+    if not isinstance(stamp, str) or not stamp:
+        return None
+    try:
+        when = datetime.fromisoformat(stamp)
+    except ValueError:
+        return None
+    if when.tzinfo is None:
+        # The fold always writes an offset; a stamp without one is not the fold's.
+        return None
+    return when.timestamp()
+
+
+def stale_after_map(manifest: TemplateManifest, written_at: Mapping[str, str]) -> dict[str, str]:
+    """When each WRITTEN agentic field of *manifest* goes stale, as an ISO stamp.
+
+    The same spelling as a ``custom.latest`` row's ``stale_after``: the log's own write
+    time plus the field's limit, so no writer can claim its value is fresh. A field set
+    to never go stale, or never written (the page already marks it ``missing``), is
+    left out.
+    """
+    from datetime import datetime, timezone
+
+    out: dict[str, str] = {}
+    for name, spec in manifest.fields.items():
+        if not spec.agentic:
+            continue
+        limit = stale_after_seconds(spec)
+        at = _stamp_epoch(written_at.get(name))
+        if limit <= 0 or at is None:
+            continue
+        try:
+            out[name] = datetime.fromtimestamp(at + limit, tz=timezone.utc).isoformat(
+                timespec="seconds"
+            )
+        except (OverflowError, OSError, ValueError):
+            continue
+    return out
+
+
+def page_stale_after(manifest: Any, written_at: Mapping[str, str]) -> dict[str, str] | None:
+    """``read_payload``'s ``stale_after`` for a page: :func:`stale_after_map` with the
+    preview on, ``None`` (the key left out) with it off. TOTAL: a failure is ``None``."""
+    if not stale_fields_enabled():
+        return None
+    try:
+        return stale_after_map(manifest, written_at)
+    except Exception:
+        logger.debug("dashboard: stale_after could not be derived", exc_info=True)
+        return None
+
+
+def stale_fields(
+    manifest: TemplateManifest, written_at: Mapping[str, str], now: float
+) -> list[tuple[str, float | None, int]]:
+    """The agentic fields of *manifest* that are out of date at *now* (epoch seconds).
+
+    Each is ``(name, age in seconds or None when never written, limit)``: a written
+    field past its limit, and a field never written at all. A field set to never go
+    stale (``stale_after_s: 0``) is never listed, written or not. Sorted by name.
+    """
+    out: list[tuple[str, float | None, int]] = []
+    for name, spec in sorted(manifest.fields.items()):
+        if not spec.agentic:
+            continue
+        limit = stale_after_seconds(spec)
+        if limit <= 0:
+            continue
+        at = _stamp_epoch(written_at.get(name))
+        if at is None:
+            out.append((name, None, limit))
+        elif now - at >= limit:
+            out.append((name, now - at, limit))
+    return out
+
+
+def _span(seconds: float) -> str:
+    """A whole span, rounded down, in the largest unit that fits: ``5m``, ``3h``, ``2d``."""
+    whole = max(0, int(seconds))
+    if whole >= 86400:
+        return f"{whole // 86400}d"
+    if whole >= 3600:
+        return f"{whole // 3600}h"
+    return f"{max(1, whole // 60)}m"
+
+
+def stale_line(
+    manifest: TemplateManifest,
+    written_at: Mapping[str, str],
+    now: float,
+    *,
+    shown: int = UNRESOLVED_NAMES_SHOWN,
+) -> str:
+    """The turn block's line naming the out-of-date agentic fields, or ``""``.
+
+    One line, and only when a field IS out of date, because the block rides every
+    turn: a per-field age would change the block every hour, where this list changes
+    only when a field crosses its limit. Capped at *shown* names (default
+    :data:`UNRESOLVED_NAMES_SHOWN`) with the rest counted, as :func:`unresolved_line`
+    is.
+    """
+    from kiro_crew import crewmate_prompts
+
+    stale = stale_fields(manifest, written_at, now)
+    if not stale:
+        return ""
+    named = []
+    for name, age, limit in stale[:shown]:
+        if age is None:
+            named.append(f"{name} ({crewmate_prompts.text('dashboard.stale_never')})")
+        else:
+            why = crewmate_prompts.fill("dashboard.stale_age", age=_span(age), limit=_span(limit))
+            named.append(f"{name} ({why})")
+    listed = ", ".join(named)
+    rest = len(stale) - shown
+    if rest > 0:
+        listed += " " + crewmate_prompts.fill("dashboard.unresolved_more", n=str(rest))
+    return crewmate_prompts.fill("dashboard.stale", fields=listed)
+
+
+def _agentic_written_at(slot: str) -> dict[str, str] | None:
+    """When each agentic field on *slot* was last written, or ``None`` when unknown.
+
+    Read warm only (``cold=False``): a prompt build never folds a slot from scratch,
+    and a slot with no warm cell yet answers ``None`` rather than "never written", so
+    a restart cannot make the turn claim every field is missing. TOTAL.
+    """
+    try:
+        from kiro_crew.crew_log import projection
+
+        value = projection.read_slot_projection(slot, "agentic", cold=False).value
+    except Exception:
+        logger.debug("dashboard: %r's agentic fold is not readable warm", slot, exc_info=True)
+        return None
+    fields = value.get("fields") if isinstance(value, Mapping) else None
+    if not isinstance(fields, Mapping):
+        return {}
+    return {
+        str(name): str(row["at"])
+        for name, row in fields.items()
+        if isinstance(row, Mapping) and isinstance(row.get("at"), str) and row["at"]
+    }
+
+
+def stale_notice(manifest: TemplateManifest, slot: str) -> str:
+    """:func:`stale_line` for the page on *slot*, or ``""``. The caller checks the
+    preview (:func:`stale_fields_enabled`) first. TOTAL."""
+    import time
+
+    if not agentic_fields(manifest):
+        return ""
+    written_at = _agentic_written_at(slot)
+    if written_at is None:
+        return ""
+    try:
+        return stale_line(manifest, written_at, time.time())
+    except Exception:
+        logger.debug("dashboard: the stale line for %r failed", slot, exc_info=True)
+        return ""
+
+
+def _member_page_manifest(slug: str) -> TemplateManifest | None:
+    """The manifest of crewmate *slug*'s page in force, or ``None`` when it has none.
+
+    `turn_block`'s rule for which page is on screen: a lock keeps the template.
+    Blocking IO; raises what the page read raises.
+    """
+    record, manifest, locked_line = _read_page(slug)
+    if record is None:
+        return None
+    if manifest is None and not locked_line and package_on_screen(slug):
+        manifest = _package_manifest(slug)
+    return manifest
+
+
+def member_stale_line(slug: str, member: str) -> str:
+    """:func:`stale_line` for crewmate *member*'s page in force, for a check-in wake, or
+    ``""``: preview off, crew panel off (no dashboard_write), no page, or nothing out of
+    date. Blocking IO. TOTAL."""
+    if not slug or not member or not stale_fields_enabled() or not _crew_panel_on():
+        return ""
+    try:
+        manifest = _member_page_manifest(slug)
+        if manifest is None:
+            return ""
+        return stale_notice(manifest, _member_slot(member, slug))
+    except Exception:
+        logger.debug("dashboard: no stale line for %r's wake", slug, exc_info=True)
+        return ""
+
+
+def member_stale_state(slug: str, member: str) -> tuple[list[tuple[str, str]], str]:
+    """Crewmate *member*'s out-of-date agentic fields and the line naming them.
+
+    ``([(name, written_at), ...], line)``: each field :func:`stale_fields` lists, with
+    the write stamp it went stale from (``""`` for a field never written), so a caller
+    can tell a new stale period (a later stamp) from the one it already acted on. Under
+    :func:`member_stale_line`'s gates; anything they refuse, or a slot with no warm
+    fold yet, is ``([], "")``. Blocking IO. TOTAL.
+    """
+    import time
+
+    if not slug or not member or not stale_fields_enabled() or not _crew_panel_on():
+        return [], ""
+    try:
+        manifest = _member_page_manifest(slug)
+        if manifest is None or not agentic_fields(manifest):
+            return [], ""
+        slot = _member_slot(member, slug)
+        written_at = _agentic_written_at(slot) if slot else None
+        if written_at is None:
+            if slot:
+                # No warm fold (a Bot nobody opened since a restart): fold it in the
+                # background so a later stale-wake tick can read it.
+                from kiro_crew.crew_log import slot_prime
+
+                slot_prime.schedule(slot, "agentic")
+            return [], ""
+        now = time.time()
+        stale = [
+            (name, written_at.get(name, ""))
+            for name, _age, _limit in stale_fields(manifest, written_at, now)
+        ]
+        if not stale:
+            return stale, ""
+        # The wake books every stale field, so its line names every one of them.
+        return stale, stale_line(manifest, written_at, now, shown=len(stale))
+    except Exception:
+        logger.debug("dashboard: no stale state for %r", slug, exc_info=True)
+        return [], ""
+
+
+def _member_slot(member: str, slug: str) -> str:
+    """The DM slot crewmate *member*'s page reads from, or ``""`` when unknown. TOTAL."""
+    try:
+        from kiro_crew.dashboard.handlers.member_dashboard import _dashboard_slot
+
+        return _dashboard_slot(member, slug)
+    except Exception:
+        logger.debug("dashboard: no slot for %r", slug, exc_info=True)
+        return ""
+
+
+def turn_block(slug: str, member: str = "", *, slot: str = "") -> str:
     """The ``[DASHBOARD]`` lines for a crewmate's turn, or ``""`` when it has none.
 
     A few lines on purpose: which page is in force, which fields are the crewmate's
@@ -1185,6 +1570,10 @@ def turn_block(slug: str, member: str = "") -> str:
     field resolves. No read is made without *member* (the apply reply), on a locked
     page, or with the crew panel off, because the fix is a tool call none of those
     can make.
+
+    With the ``dashboard_stale_fields`` preview on, the block also names each agentic
+    field that is out of date (:func:`stale_line`), read from the crewmate's DM slot,
+    or from *slot* for a root session's page, which has no crewmate.
     TOTAL: a dashboard that cannot be read costs the turn this block, nothing else.
     """
     record, manifest, locked_line = _read_page(slug)
@@ -1233,6 +1622,14 @@ def turn_block(slug: str, member: str = "") -> str:
         unresolved = unresolved_line(manifest, _unresolved_fold_fields(slug, member, manifest))
         if unresolved:
             block += "\n" + unresolved
+    # The out-of-date line, preview on only. A locked page still takes field writes,
+    # so the lock does not silence it; with the crew panel off a crewmate has no
+    # dashboard_write to call, so that does.
+    if names and stale_fields_enabled():
+        page_slot = slot or (_member_slot(member, slug) if member and _crew_panel_on() else "")
+        stale = stale_notice(manifest, page_slot) if page_slot else ""
+        if stale:
+            block += "\n" + stale
     dashboard_upkeep.sync(slug, page=(record, manifest))
     return block + ("\n" + dashboard_upkeep.pointer() if names else "")
 
@@ -1245,25 +1642,34 @@ def unresolved_notice(slug: str, member: str) -> str:
     session starts, resumes or is re-injected, so a binding that breaks between warm
     turns would go unreported. This is the same line under the same gates -- the page
     in force, not locked, the crew panel on -- without the rest of the block, which
-    the section already carried. No upkeep sync: that is the section's job. TOTAL.
+    the section already carried. No upkeep sync: that is the section's job. With the
+    ``dashboard_stale_fields`` preview on it also carries :func:`stale_line`, which a
+    field crosses between warm turns just as a binding breaks. TOTAL.
     """
     if not member:
         return ""
     try:
         record, manifest, locked_line = _read_page(slug)
-        if locked_line or record is None or not _crew_panel_on():
+        if record is None or not _crew_panel_on():
             return ""
         if manifest is None:
-            if not package_on_screen(slug):
+            if locked_line or not package_on_screen(slug):
                 return ""
             manifest = _package_manifest(slug)
             if manifest is None:
                 return ""
-        line = unresolved_line(manifest, _unresolved_fold_fields(slug, member, manifest))
+        lines = []
+        if not locked_line:
+            lines.append(unresolved_line(manifest, _unresolved_fold_fields(slug, member, manifest)))
+        # The out-of-date line rides here too (preview on), and on a locked page,
+        # which still takes field writes -- the same gates as in `turn_block`.
+        if agentic_fields(manifest) and stale_fields_enabled():
+            lines.append(stale_notice(manifest, _member_slot(member, slug)))
+        text = "\n".join(line for line in lines if line)
     except Exception:
         logger.debug("dashboard: %r's warm-turn notice is unreadable", slug, exc_info=True)
         return ""
-    return f"[DASHBOARD]\n{line}" if line else ""
+    return f"[DASHBOARD]\n{text}" if text else ""
 
 
 def session_turn_block(slot_key: str) -> str:
@@ -1291,22 +1697,40 @@ def session_turn_block(slot_key: str) -> str:
     except Exception:
         logger.debug("no session dashboard block for %r", slot_key, exc_info=True)
         return ""
-    block = turn_block(key)
+    block = turn_block(key, slot=slot_key)
     if block and _shows_board(key):
         # Said beside the page name, every turn: the prompt's rule alone was not
-        # kept (a conductor still wrote its "Task board" into the reply).
-        block += "\n" + BOARD_IN_PANEL_LINE
+        # kept (a conductor still wrote its "Task board" into the reply). The goal
+        # line rides with it from the turn Ultra Mode turns on (a new chat or a
+        # mid-chat switch), so the Overview it feeds is never empty or stale.
+        block += "\n" + BOARD_IN_PANEL_LINE + "\n" + BOARD_GOAL_LINE
     return block
 
+
+#: The rule that keeps the board's Overview (the work-ledger goal) current. The same
+#: words are in the team-lead prompt and the team-lead / goal-conductor skills.
+GOAL_FIRST_RULE: Final[str] = (
+    "When the person gives a new goal or changes the scope, call `work_ledger_record` "
+    "`action=goal` FIRST, before you dispatch or reply: `new_goal=true` for a new goal, "
+    "a plain rewrite for a scope change. Write one plain sentence for the outcome, then "
+    'one "Done when ..." sentence.'
+)
+
+#: The [DASHBOARD] line that puts the first goal write in front of the lead.
+BOARD_GOAL_LINE: Final[str] = (
+    "The page's Overview is your work-ledger goal. If your ledger has no goal yet, "
+    "record it now. " + GOAL_FIRST_RULE
+)
 
 #: The pages that draw every task from the work ledger and keep themselves current.
 BOARD_TEMPLATES: Final[frozenset[str]] = frozenset({"goal-board", "work-kanban"})
 
 #: The [DASHBOARD] line a root session on one of :data:`BOARD_TEMPLATES` gets.
 BOARD_IN_PANEL_LINE: Final[str] = (
-    "That page IS the task board, in the side panel. Do not write a task board, "
-    "a task table or a task-dashboard artifact in your reply: give only what needs "
-    "the person, then one line on what changed and what is next."
+    "That page IS the task board, in the side panel. Do not redraw the board or a "
+    "per-task status list in your reply. Other pictures (a comparison, a flow, a "
+    "before/after, a cause chain) still get drawn as widgets, per Inline Widgets. "
+    "Give what needs the person, then one line on what changed and what is next."
 )
 
 

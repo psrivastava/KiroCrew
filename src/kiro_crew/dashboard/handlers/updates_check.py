@@ -37,6 +37,7 @@ from kiro_crew.dashboard.handlers.updates_verdict import (
     _refresh_auto_update_effect_once,
     _set_update_info,
     _status_auto_update_effect,
+    _status_auto_update_manual_only,
     _update_info,
     remediation_command,
 )
@@ -62,8 +63,8 @@ from kiro_crew.platform.update_capability import (
     bundled_by_desktop_app,
     derive_capability,
 )
+from kiro_crew.platform.update_fetch import fetch_and_pin_upstream
 from kiro_crew.platform.update_governance import (
-    fetch_and_pin_upstream,
     git_command_env,
     min_version,
     repo_exec_config_reason,
@@ -102,12 +103,37 @@ _CLI_MANIFEST_SCHEMA = "kirocrew-cli-artifact-manifest-v1"
 _FEED_MAX_BYTES = 65536
 _FEED_TIMEOUT_SECS = 15
 
+#: Total deadline for a source checkout's update fetch. A killed fetch keeps none
+#: of what it downloaded, so a deadline shorter than the transfer fails the same
+#: way on every later check and a far-behind checkout never recovers. 300s is the
+#: largest bound ``git_tmp_packs`` vouches for, so its reaper still cannot take a
+#: pack this fetch is writing.
+#: shortcut: a total-time bound; a fetch still slower than this still fails every
+#: time, upgrade to a no-progress bound if that is reported.
+_GIT_FETCH_TIMEOUT_S = 300.0
+
 _VERSION_RE = re.compile(r"^[A-Za-z0-9._+!-]{1,64}$")
 _PUB_DATE_RE = re.compile(r"^[0-9TZ:.\-]{1,32}$")
 #: The feed's forced-update floor must be a bare release (``0.6.0``) — the
 #: publisher enforces the same shape, so anything else here is tampering or
 #: hand-editing and is dropped rather than compared.
 _MIN_VERSION_RE = re.compile(r"^[0-9]+(?:\.[0-9]+)*$")
+
+
+def _update_policy_file() -> str:
+    """The home policy file when its update commands manage this install, else ``""``.
+
+    Only the home tier is named. The commands are the top tier's alone, so under a
+    central, env-pointed or bundled policy, editing the home file changes nothing.
+    """
+    if _update_info.get("managed_by") != MANAGED_BY_COMMAND:
+        return ""
+    from kiro_crew.platform.context import current_context
+    from kiro_crew.platform.governance import TIER_HOME, _policy_home_path
+
+    if getattr(current_context().governance, "tier", "") != TIER_HOME:
+        return ""
+    return str(_policy_home_path())
 
 
 def status_update_fields() -> dict[str, object]:
@@ -164,6 +190,9 @@ def status_update_fields() -> dict[str, object]:
         # command-managed host must not render the self-managed installer
         # instructions its policy exists to bypass.
         "update_managed_by": str(_update_info.get("managed_by") or ""),
+        # The file the policy notice tells the user to edit, so it can say where
+        # it is. Empty unless that file is the one owning updates.
+        "update_policy_file": _update_policy_file(),
         # Commit distance for a git checkout, both directions, so the About
         # panel's badge can tell DIVERGED (ahead and behind at once — reported
         # as ``update_available: False`` because the apply path must never be
@@ -191,6 +220,11 @@ def status_update_fields() -> dict[str, object]:
         # gateway's update loop acts on, so the switch's label cannot promise
         # what the loop will not do.
         "update_auto_effect": _status_auto_update_effect(),
+        # ``notify`` only because the security policy turns unattended installs
+        # off: a person's Update still installs here. The switch's note reads it,
+        # since ``update_can_apply`` is false on a managed venv whose Update is
+        # the arm and approve flow.
+        "update_auto_manual_only": _status_auto_update_manual_only(),
         # Whether the desktop app bundles and launches this gateway, from the
         # baked packaging stamp. Independent of who owns the update: a policy
         # ``updates`` provider makes ``update_managed_by`` read ``command`` on
@@ -516,11 +550,11 @@ async def _check_git_checkout(proj: str, capability: UpdateCapability) -> None:
 
     # The fetch runs through the shared isolated helper: a repo-defined hook
     # cannot fire on the fetch's ref write (it happens in a git dir the gateway
-    # owns), while the fetched objects land in this checkout and the tip is
-    # pinned into its tracking ref, so the reads below resolve against it with no
-    # ref transaction. The same helper fetches for the unattended apply.
+    # owns), while the fetched objects land in this checkout's object store. The
+    # tip comes back as a commit id the reads below use directly; no ref in this
+    # checkout is written. The same helper fetches for the unattended apply.
     remote_sha = await fetch_and_pin_upstream(
-        proj, remote_name, remote_branch, git=git, env=env, timeout=30
+        proj, remote_name, remote_branch, git=git, env=env, timeout=_GIT_FETCH_TIMEOUT_S
     )
     if remote_sha is None:
         _set_update_info(**base, check_status=CHECK_FAILED, error_code=ERR_GIT_FETCH_FAILED)

@@ -41,6 +41,7 @@ from kiro_crew.agent_files import (
     SECURITY_CONDUCTOR_AGENT_FILENAME,
     WORKER_AGENT_FILENAME,
 )
+from kiro_crew.agent_materialization.worker_agent import worker_prompt
 from kiro_crew.agent_sdk.drivers.acp import derived_agent_permissions
 
 _INHERITED_PERMISSIONS = {"rules": [{"capability": "web_fetch", "effect": "deny"}]}
@@ -227,7 +228,9 @@ def test_the_worker_install_runs_on_the_rebuild_path():
     from kiro_crew.agent_files import REQUIRED_KIRO_AGENT_FILES
 
     src = inspect.getsource(agent.rebuild_agent_config)
-    assert "_install_worker_agent()" in src
+    assert "_install_sibling_specs(refresh_forks, gated_off, clean=clean)" in src
+    siblings = inspect.getsource(agent._install_sibling_specs)
+    assert "_install_worker_agent()" in siblings
     assert WORKER_AGENT_FILENAME not in REQUIRED_KIRO_AGENT_FILES
 
 
@@ -299,11 +302,11 @@ def test_a_ledger_conductor_mounts_the_server_and_grants_only_its_own_half(specs
     allowed = spec["allowedTools"]
     assert "@kirocrew-work/work_ledger_read" in allowed
     assert "@kirocrew-work/work_ledger_record" in allowed
-    # The one worker verb a conductor may hold: a read of its OWN bound item, and a
-    # nested conductor's mandated first call. The write stays gated.
+    # The worker pair a nested conductor needs, both scoped to its OWN bound item:
+    # the brief is its mandated first call, the report wakes its parent.
     assert "@kirocrew-work/work_brief" in allowed
-    assert "@kirocrew-work/work_report" not in allowed
-    # Whole-server auto-approve would grant the write by the back door.
+    assert "@kirocrew-work/work_report" in allowed
+    # Whole-server auto-approve would grant more than the named verbs.
     assert "@kirocrew-work" not in allowed
 
 
@@ -338,20 +341,23 @@ def test_a_conductor_still_has_no_file_writing_tool(specs, filename):
     assert "code" not in tools
 
 
-def test_the_grant_tuples_cover_the_server_and_share_only_the_read():
+def test_the_grant_tuples_cover_the_server_and_share_the_worker_pair():
     assert agent._LEDGER_CONDUCTOR_WORK_GRANTS == (
         "@kirocrew-work/work_ledger_read",
         "@kirocrew-work/work_ledger_record",
         "@kirocrew-work/work_ledger_rebuild",
         "@kirocrew-work/work_brief",
+        "@kirocrew-work/work_report",
+        "@kirocrew-work/accept_eval",
     )
     assert agent._WORKER_WORK_GRANTS == (
         "@kirocrew-work/work_brief",
         "@kirocrew-work/work_report",
     )
-    # Together they cover the server's whole surface. The one overlap is the
-    # read-only ``work_brief``: a nested conductor is also a worker, and its first
-    # mandated call must not be an approval stall. The write is never shared.
+    # Together they cover the server's whole surface. The overlap is the whole
+    # worker pair: a nested conductor is also a worker, so its first call and its
+    # round-boundary reports must not be approval stalls.
+    assert set(agent._WORKER_WORK_GRANTS) <= set(agent._LEDGER_CONDUCTOR_WORK_GRANTS)
     from kiro_crew import mcp_work
 
     granted = {
@@ -359,9 +365,6 @@ def test_the_grant_tuples_cover_the_server_and_share_only_the_read():
         for ref in agent._LEDGER_CONDUCTOR_WORK_GRANTS + agent._WORKER_WORK_GRANTS
     }
     assert granted == set(mcp_work.WORK_TOOLS)
-    assert set(agent._LEDGER_CONDUCTOR_WORK_GRANTS) & set(agent._WORKER_WORK_GRANTS) == {
-        "@kirocrew-work/work_brief"
-    }
 
 
 def test_the_hand_built_entry_carries_the_registry_and_home_pins(monkeypatch):
@@ -744,7 +747,7 @@ def test_a_refresh_restores_the_worker_prompt_and_description(
         json.dumps(_stale_worker_spec()), encoding="utf-8"
     )
     healed = worker_from_installed_default()
-    assert healed["prompt"] == agent._WORKER_SYSTEM_PROMPT
+    assert healed["prompt"] == worker_prompt()
     assert "reports status against that item" in healed["description"]
     assert healed["name"] == "kirocrew-worker"
 
@@ -1678,3 +1681,16 @@ def test_a_withheld_pattern_says_which_verbs_it_reached(tmp_path, monkeypatch):
     assert hits, f"no record names the withheld pattern: {records}"
     assert "reaches" in str(hits[0]["resources"])
     assert "cron_add" in str(hits[0]["resources"])
+
+
+def test_both_workers_carry_the_same_coding_rules() -> None:
+    """kirocrew-worker and a crewmate's worker read one text, so they cannot drift."""
+    from kiro_crew import crewmate_prompts
+    from kiro_crew.mate_worker import MATE_WORKER_PROMPT
+
+    rules = crewmate_prompts.text("worker.coding_rules")
+    assert "smallest complete change" in rules
+    assert "`shortcut: <the limit>, <when to upgrade>`" in rules
+    assert worker_prompt().startswith(agent._WORKER_SYSTEM_PROMPT.rstrip())
+    assert worker_prompt().rstrip().endswith(rules)
+    assert MATE_WORKER_PROMPT.endswith(rules)

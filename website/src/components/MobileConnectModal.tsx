@@ -13,6 +13,9 @@ import { findReport, parseErrorCode } from '../utils/errorReport'
 import ErrorBoundary from './ErrorBoundary'
 import ErrorNotice from './ErrorNotice'
 import { getMobileConnectRenderers } from './mobileConnectRenderers'
+import { TailnetDirectLink, tailnetDirectActive } from './TailnetDirectLink'
+import { useSharedCrewCapabilities } from '../hooks/sharedCrew/useSharedCrew'
+import { sharedCrewPreviewOn } from '../api/sharedCrewUi'
 
 /** Machine-readable code from a mint error's JSON body (same shape as the
  *  Settings card's helper): lets the UI blame configuration only when the
@@ -44,6 +47,14 @@ const LINK_ERROR_KEYS = {
   governance_denied: 'components.mobileConnect.phone_connection_is_disabled_by_policy_on_this_dep',
   restricted_session: 'pages.settings.mobileLoginCard.restricted_sessions_cannot_create_a_sign_in_link',
   caller_session_expired: 'pages.settings.mobileLoginCard.session_expired_sign_in_again_to_create_a_link',
+} as const
+
+/** Handler error code → catalog key for the phone-access QR mint. A code
+ *  missing here gets the generic "try again" line, so only codes a retry can
+ *  never clear are listed. */
+const QR_ERROR_KEYS = {
+  governance_denied: 'components.mobileConnect.phone_connection_is_disabled_by_policy_on_this_dep',
+  caller_device_bound: 'components.mobileConnect.this_session_is_tied_to_this_device_so_a_code_made',
 } as const
 
 /**
@@ -99,6 +110,40 @@ export default function MobileConnectModal({
   // already filtered every id through `capabilities.mobile_connect`, so a
   // registered renderer for a denied or absent method draws nothing.
   const editionSections = getMobileConnectRenderers().filter(r => kinds.includes(r.kind))
+  // A plain tailnet link needs no token, so when the gateway serves one it
+  // leads, and the token-carrying methods move under an Advanced fold for
+  // devices that are not on the tailnet.
+  const caps = useSharedCrewCapabilities()
+  const direct = caps.capabilities.tailnet_direct
+  // The direct link is a sharing surface: it shows only under the Shared Crew preview.
+  const directActive = sharedCrewPreviewOn(caps.capabilities) && tailnetDirectActive(direct)
+
+  const tokenSections = (
+    <>
+      {hasQr && (
+        <p className="text-[12.5px] text-muted leading-relaxed mb-4">
+          {t('components.mobileConnect.scan_with_your_phone_camera_to_continue_with_the_s')}
+        </p>
+      )}
+      {/* Edition sections, each in its own ErrorBoundary so a throwing
+          renderer disables only itself. Deliberately WITHOUT `fallback={null}`,
+          unlike the Overview stat-card slot: a card that vanishes leaves a grid
+          of siblings, but a registered section here can be the dialog's ONLY
+          content, and silently emptying it would strand a user who reached it
+          from a nav row that promised a way in. The default boundary keeps the
+          section occupied, which is also what makes counting these sections a
+          sound input to `standalone` below. */}
+      {editionSections.map(r => (
+        <ErrorBoundary key={r.kind} scope={`mobile-connect:${r.kind}`}>
+          <r.component onClose={onClose} />
+        </ErrorBoundary>
+      ))}
+      {hasQr && <TailnetQrSection onClose={onClose} />}
+      {kinds.includes('login_link') && (
+        <LoginLinkSection standalone={!hasQr && editionSections.length === 0} onClose={onClose} />
+      )}
+    </>
+  )
 
   // Two sibling layers, the same split Modal.tsx uses for its backdrop and
   // dialog wrapper. The BACKDROP stays on the chat-pane ceiling (z-50): the
@@ -124,7 +169,7 @@ export default function MobileConnectModal({
         className="fixed inset-0 z-50 bg-bg/80 backdrop-blur-xs animate-rise"
         role="presentation"
       />
-      <div className="fixed inset-0 z-[65] flex items-center justify-center pointer-events-none animate-rise">
+      <div className="fixed inset-0 z-[65] flex items-center justify-center p-safe pointer-events-none animate-rise">
         <div
           ref={dialogRef}
           tabIndex={-1}
@@ -144,28 +189,28 @@ export default function MobileConnectModal({
             <Smartphone size={16} className="shrink-0" />
             {t('components.mobileConnect.use_kiro_crew_on_your_phone')}
           </div>
-          {hasQr && (
-            <p className="text-[12.5px] text-muted leading-relaxed mb-4">
-              {t('components.mobileConnect.scan_with_your_phone_camera_to_continue_with_the_s')}
-            </p>
+          {caps.isError && (
+            <div className="mb-4">
+              <ErrorNotice
+                message={caps.error instanceof Error ? caps.error.message : t('sharedCrew.session_state_failed')}
+                askAgent
+                onHandoff={onClose}
+                testId="mobile-connect-capabilities-error"
+              />
+              <Btn onClick={() => { void caps.refetch() }}>{t('components.mobileConnect.try_again')}</Btn>
+            </div>
           )}
-          {/* Edition sections, each in its own ErrorBoundary so a throwing
-              renderer disables only itself. Deliberately WITHOUT `fallback={null}`,
-              unlike the Overview stat-card slot: a card that vanishes leaves a grid
-              of siblings, but a registered section here can be the dialog's ONLY
-              content, and silently emptying it would strand a user who reached it
-              from a nav row that promised a way in. The default boundary keeps the
-              section occupied, which is also what makes counting these sections a
-              sound input to `standalone` below. */}
-          {editionSections.map(r => (
-            <ErrorBoundary key={r.kind} scope={`mobile-connect:${r.kind}`}>
-              <r.component onClose={onClose} />
-            </ErrorBoundary>
-          ))}
-          {hasQr && <TailnetQrSection onClose={onClose} />}
-          {kinds.includes('login_link') && (
-            <LoginLinkSection standalone={!hasQr && editionSections.length === 0} onClose={onClose} />
+          {directActive && (
+            <div className="mb-4">
+              <TailnetDirectLink direct={direct} />
+            </div>
           )}
+          {directActive ? (
+            <details className="border-t border-border pt-3" data-testid="mobile-connect-advanced">
+              <summary className="cursor-pointer text-[12.5px] text-muted mb-2">{t('sharedCrew.direct_link_advanced')}</summary>
+              {tokenSections}
+            </details>
+          ) : tokenSections}
         </div>
       </div>
     </>
@@ -216,6 +261,8 @@ function TailnetQrSection({ onClose }: { onClose: () => void }) {
   const [qrCopyFailed, setQrCopyFailed] = useState(false)
 
   const ready = status?.step === 'ready'
+  // Settings cannot lift a policy block, so the card must not route there.
+  const blockedByPolicy = status?.step === 'pinned' || status?.step === 'policy_off'
   return (
     <div className="mb-4">
       {probing && (
@@ -291,16 +338,24 @@ function TailnetQrSection({ onClose }: { onClose: () => void }) {
         <ErrorNotice
           variant="inline"
           className="text-[11.5px] mb-2"
-          message={linkErrorCode(mintQr.error) === 'governance_denied'
-            ? t('components.mobileConnect.phone_connection_is_disabled_by_policy_on_this_dep')
-            : t('components.mobileConnect.could_not_generate_a_code_try_again')}
+          message={t(
+            QR_ERROR_KEYS[linkErrorCode(mintQr.error) as keyof typeof QR_ERROR_KEYS] ||
+              'components.mobileConnect.could_not_generate_a_code_try_again',
+          )}
           askAgent
           report={findReport(mintQr.error?.message)}
           onHandoff={onClose}
           testId="mobile-connect-qr-error"
         />
       )}
-      {status && !ready && (
+      {status && blockedByPolicy && (
+        <p className="w-full bg-bg-elevated border border-border rounded-lg px-3 py-2.5 mb-2 text-[12px] text-muted">
+          {status.step === 'pinned'
+            ? t('components.tailnetMobile.pinned_body')
+            : t('components.tailnetMobile.policy_off_body')}
+        </p>
+      )}
+      {status && !ready && !blockedByPolicy && (
         <button
           onClick={() => { onClose(); navigate(settingsPath({ tab: 'overview' })) }}
           className="w-full flex items-center justify-between gap-2 bg-bg-elevated border border-border rounded-lg px-3 py-2.5 mb-2 text-left cursor-pointer hover:bg-bg-hover transition-colors"

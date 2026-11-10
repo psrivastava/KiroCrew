@@ -56,6 +56,7 @@ from kiro_crew.shared_crew.contracts import (
     ActorContext,
     Principal,
     PrincipalKind,
+    Provenance,
 )
 from kiro_crew.shared_crew.crew_mode import WORKLOAD_UNAVAILABLE
 from kiro_crew.shared_crew.trigger import trigger_of
@@ -79,11 +80,14 @@ def audit_principal(principal: Principal | None) -> dict[str, Any] | None:
     """The reduced principal an audit record stores."""
     if principal is None:
         return None
+    # A relayed principal's email and name are display only and never logged, so
+    # its audit record names it by id alone.
+    relayed = principal.provenance is Provenance.KIRO_RELAY
     return {
         "id": principal.id,
         "kind": principal.kind.value,
         "provenance": principal.provenance.value,
-        "login": principal.display.login,
+        "login": "" if relayed else principal.display.login,
     }
 
 
@@ -91,6 +95,7 @@ def audit_principal(principal: Principal | None) -> dict[str, Any] | None:
 EXTRA_WORKLOAD_REF = "workload_identity_ref"
 EXTRA_TRIGGER = "trigger"
 EXTRA_MEMORY_CHANGE = "memory_change"
+EXTRA_DISPLAY_CHANGE = "display_change"
 
 
 def _unattended_trigger(initiator: Principal, session_key: str) -> dict[str, Any] | None:
@@ -171,6 +176,11 @@ def security_event(record: ActionRecord) -> Any:
             **(
                 {EXTRA_MEMORY_CHANGE: record.extra[EXTRA_MEMORY_CHANGE]}
                 if EXTRA_MEMORY_CHANGE in record.extra
+                else {}
+            ),
+            **(
+                {EXTRA_DISPLAY_CHANGE: record.extra[EXTRA_DISPLAY_CHANGE]}
+                if EXTRA_DISPLAY_CHANGE in record.extra
                 else {}
             ),
         },

@@ -512,3 +512,19 @@ def test_authorize_without_origin_and_without_remove_exits_2(tmp_path, monkeypat
     assert exc_info.value.code == 2
     # Nothing was published: no policy file exists.
     assert not (policy_path(tmp_path)).exists()
+
+
+def test_authorize_remove_clears_an_entry(tmp_path, monkeypatch):
+    """``--remove`` clears an entry by name alone; origin=None mirrors the omitted
+    optional positional."""
+    from kiro_crew import cli_commands
+
+    _run_authorize(monkeypatch, tmp_path, secret_name="GONE", origin="https://api.example.com")
+    load_authorization(tmp_path, "GONE")  # present before removal
+
+    args = argparse.Namespace(name="GONE", origin=None, header=None, remove=True, reset=False)
+    cli_commands._handle_secrets_authorize(args)  # must NOT raise SystemExit
+
+    with pytest.raises(Exception) as exc_info:
+        load_authorization(tmp_path, "GONE")
+    assert "authoriz" in str(exc_info.value).lower()

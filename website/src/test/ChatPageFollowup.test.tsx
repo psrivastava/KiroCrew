@@ -28,6 +28,15 @@ vi.mock('react-virtuoso', () => ({
 }))
 vi.mock('../api/client', () => ({
   api: {
+    // A gateway without the Shared Crew routes: every read answers "not here".
+    sharedCrewCapabilities: vi.fn().mockResolvedValue(null),
+    sharedCrewMode: vi.fn().mockResolvedValue(null),
+    sharedCrewPeople: vi.fn().mockResolvedValue(null),
+    sharedCrewViewer: vi.fn().mockResolvedValue(null),
+    sharedCrewSendState: vi.fn().mockResolvedValue(null),
+    sharedCrewTypingLease: vi.fn().mockResolvedValue(null),
+    sharedCrewPresence: vi.fn().mockResolvedValue(null),
+    sharedCrewDecisions: vi.fn().mockResolvedValue(null),
     // The composer's project pill reads the project's AWS profile binding.
     projectAwsProfile: vi.fn().mockResolvedValue({ path: '/repo', profile: null, boundDir: null, profiles: [], status: null }),
     // Both slots: the created one must be listed or `switchSlot` cannot activate it.
@@ -236,7 +245,7 @@ describe('ChatPage follow-up worktree orchestration', () => {
     const store = makeStore()
     await renderPage(store)
     fireEvent.click(screen.getByRole('button', { name: /start in new worktree/i }))
-    await waitFor(() => expect(api.deleteChatSlot).toHaveBeenCalledWith('chat-2'))
+    await waitFor(() => expect(api.deleteChatSlot).toHaveBeenCalledWith('chat-2', undefined))
     // The failed session was never published, so no unscoped slot is left behind.
     expect(store.getState().dashboard.slots.map(s => s.key)).not.toContain('chat-2')
     // No prefill into the wrong composer, and the suggestion survives for a retry.
@@ -279,7 +288,7 @@ describe('ChatPage follow-up worktree orchestration', () => {
     await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent(/the new chat could not be opened/i))
     // createSlot removed the session it could not scope, so nothing is left
     // behind, the origin composer is untouched and the suggestion survives.
-    expect(api.deleteChatSlot).toHaveBeenCalledWith('chat-2')
+    expect(api.deleteChatSlot).toHaveBeenCalledWith('chat-2', undefined)
     expect(store.getState().dashboard.slots.map(s => s.key)).not.toContain('chat-2')
     expect(store.getState().chat.activeSlot).toBe('chat-1')
     expect(composer().value).toBe('')

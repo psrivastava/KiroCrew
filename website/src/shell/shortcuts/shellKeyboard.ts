@@ -1,13 +1,13 @@
 import { useCallback, useEffect, useState } from 'react'
 import { agentCycleTarget } from '../../lib/crewMode'
-import { useMutation, useQueryClient } from '@tanstack/react-query'
+import { useMutation, useQueryClient, type QueryClient } from '@tanstack/react-query'
 import { useAppSelector, useAppDispatch, useAppStore, store } from '../../store'
 import { changeApprovalMode, updateSlot } from '../../store/dashboardSlice'
 import { requestSlotFolderOpen, setAgentSwitchNotice } from '../../store/chatSlice'
 import { isStaleProjectDirError } from '../../utils/folderAgent'
 import type { ChatFolder } from '../../types'
 import { newChatShortcutArgs } from './newChatArgs'
-import { createChatForView, showCreatedChat } from '../../lib/createdChatView'
+import { createChatForView, reportCreateFailure, showCreatedChat } from '../../lib/createdChatView'
 import { useAskingNavigate } from '../../components/NavigationLeaveGuard'
 import { pendingSlotSwitch, pendingSlotSwitchTarget, performSlotSwitch } from '../../lib/slotSwitch'
 import { performAgentSlotSwitch } from '../../lib/agentSwitch'
@@ -15,17 +15,32 @@ import { focusComposerElement, queryComposerOrExpand } from '../../pages/chat/co
 import { agentSwitchErrorNotice, agentSwitchFailureNotice, modelSwitchDeferredMessage } from '../../utils/agentSwitchFeedback'
 import { api } from '../../api/client'
 import { newTerminalByChord, toggleTerminalByChord } from '../../lib/terminalChordFocus'
+import { TERMINAL_TAB_COMMAND_EVENT, TOGGLE_SIDE_TERMINAL_EVENT, type TerminalTabCommand } from '../../lib/panelToggleShortcuts'
 import { focusPopout as focusTerminalPopout } from '../../utils/terminalPopout'
+import { focusPopout as focusChatPopout, getSnapshot as getChatPopouts, openPopout as openChatPopout } from '../../utils/chatPopout'
 import { useKeyboardShortcuts } from '../../hooks/useKeyboardShortcuts'
 import { useInstanceShortcuts } from '../../hooks/useInstanceShortcuts'
 import { useAutoConnectInstances } from '../../hooks/useAutoConnectInstances'
 import { useCommandPalette } from '../../hooks/useCommandPalette'
 import { useProvider } from '../../providers/context'
-import { useAgents } from '../../hooks/useAgents'
+import { modelsQueryKey } from '../../hooks/useAvailableModels'
 import { i18nT } from '../../i18n/t'
+import { modelSupportsEffort } from '../../lib/effort'
+import { useAgents } from '../../hooks/useAgents'
 import { SESSION_FOLDER_UNAVAILABLE_EVENT } from '../../lib/sessionFolderNotice'
 
 const REASONING_EFFORT_LEVELS = ['', 'low', 'medium', 'high', 'xhigh', 'max']
+
+/** What an effort cycle steps over on *slot*, which runs *model*: its harness's levels, '' (default)
+ *  first, or the notice saying there are none (see the composer's effort control). */
+function sessionEffortLevels(queryClient: QueryClient, slot: string, model: string): string[] | string {
+  const caps = queryClient.getQueryData<{ effort_supported?: boolean | null; effort_levels?: string[] }>(['slot-selection-capabilities', slot])
+  // An unknown effort verdict leaves the selected model to answer.
+  const supported = caps?.effort_supported ?? (!model || modelSupportsEffort(model))
+  if (!supported) return i18nT('pages.chatPage.effort_cycle_unavailable')
+  const levels = caps?.effort_levels?.filter(l => l && l !== 'default')
+  return levels?.length ? ['', ...levels] : REASONING_EFFORT_LEVELS
+}
 // Approval-mode DISCRIMINANTS in escalating order, cycled by keyboard shortcut.
 // Sent to the backend and compared, never rendered — the picker has its own copy.
 const APPROVAL_MODE_LEVELS = ['normal', 'trust_reads', 'trust', 'yolo']
@@ -63,9 +78,12 @@ export function useShellKeyboard({ toggleFocusMode, toggleNav, terminalEnabled, 
     onError: (err, args) => {
       // The one failure a folder create adds: the folder's project directory
       // is gone. The folder "+" says so under the folder header; the shortcut
-      // has no header, so it uses the shell's transient notice.
+      // has no header, so it uses the shell's transient notice, as an error
+      // like the folder's own. Any other failure goes there too.
       if ('project' in args && args.project && isStaleProjectDirError(err)) {
-        dispatch(setAgentSwitchNotice(i18nT('pages.chatSidebar.folder_project_dir_missing', { path: args.project })))
+        dispatch(setAgentSwitchNotice({ message: i18nT('pages.chatSidebar.folder_project_dir_missing', { path: args.project }), error: true }))
+      } else {
+        reportCreateFailure(dispatch, err)
       }
     },
     onSuccess: (view) => {
@@ -93,6 +111,10 @@ export function useShellKeyboard({ toggleFocusMode, toggleNav, terminalEnabled, 
   const refreshTrigger = useAppSelector(s => s.dashboard.refreshTrigger)
   const { agents: installedAgents, defaultAgent } = useAgents(refreshTrigger)
   const provider = useProvider()
+  // The model a slot runs before it reports: its own pick, else what the composer resolved its crew
+  // to -- the composer's own key (composerChips), app included, so the cache entry it wrote is read.
+  const slotModel = (slot: { model?: string; agent?: string; app?: string | null } | undefined) => slot?.model
+    || queryClient.getQueryData<string>(['resolved-model', slot?.agent || defaultAgent || 'default', provider.id, slot?.app || '']) || ''
   const agentSwitchNotice = useAppSelector(s => s.chat.agentSwitchNotice)
   useEffect(() => {
     // A notice that offers a new chat stays until the user dismisses it or uses
@@ -104,9 +126,10 @@ export function useShellKeyboard({ toggleFocusMode, toggleNav, terminalEnabled, 
   }, [agentSwitchNotice, dispatch])
   // A new chat that could not get its own session folder opened on the default
   // project; the API client announces it for every create path (see
-  // lib/sessionFolderNotice), and it shares this transient notice.
+  // lib/sessionFolderNotice), and it shares this transient notice. The folder
+  // create failed on the gateway, so it is an error, not status.
   useEffect(() => {
-    const onFolderUnavailable = () => dispatch(setAgentSwitchNotice(i18nT('store.chatSlice.session_folder_unavailable')))
+    const onFolderUnavailable = () => dispatch(setAgentSwitchNotice({ message: i18nT('store.chatSlice.session_folder_unavailable'), error: true }))
     window.addEventListener(SESSION_FOLDER_UNAVAILABLE_EVENT, onFolderUnavailable)
     return () => window.removeEventListener(SESSION_FOLDER_UNAVAILABLE_EVENT, onFolderUnavailable)
   }, [dispatch])
@@ -119,10 +142,20 @@ export function useShellKeyboard({ toggleFocusMode, toggleNav, terminalEnabled, 
       // names ({agent, workspace} as one adjudicated pair; project is left
       // to the rebroadcast).
       await performAgentSlotSwitch(slot, agent, store.dispatch)
+      void queryClient.invalidateQueries({ queryKey: ['slot-selection-capabilities', slot] })
     } catch (error) {
       dispatch(setAgentSwitchNotice(agentSwitchFailureNotice(error, agent)))
     }
-  }, [dispatch])
+  }, [dispatch, queryClient])
+  // Close / previous / next terminal tab: the docked panel's tab strip answers
+  // while it is showing. Same gating as new-terminal below, and a popped-out
+  // panel is focused instead.
+  const terminalTabChord = (command: TerminalTabCommand) => terminalEnabled && !isPopout && !isEmbed
+    ? () => {
+      if (terminalPoppedOut) focusTerminalPopout()
+      else window.dispatchEvent(new CustomEvent<TerminalTabCommand>(TERMINAL_TAB_COMMAND_EVENT, { detail: command }))
+    }
+    : undefined
   useKeyboardShortcuts({ onToggleShortcutsModal: toggleShortcutsModal, onNewChat: () => {
     const s = appStore.getState()
     newChatMutation.mutate(newChatShortcutArgs(s.dashboard.slots, s.chat.activeSlot, queryClient.getQueryData<ChatFolder[]>(['chat-folders'])))
@@ -139,7 +172,7 @@ export function useShellKeyboard({ toggleFocusMode, toggleNav, terminalEnabled, 
       const currentAgent = pendingSlotSwitch('agent', activeSlot) || currentSlot?.agent || defaultAgent
       // The picker's own conductor-free list (lib/crewMode): a chord never moves a
       // normal chat onto a conductor, and a conductor chat does not cycle at all.
-      const target = agentCycleTarget(installedAgents, currentAgent, currentSlot?.agent_kind, 1, currentSlot?.crew_mode_agent)
+      const target = agentCycleTarget(installedAgents, currentAgent, currentSlot?.agent_kind, 1, currentSlot?.crew_mode_agent, !!currentSlot?.crew_mode_root)
       if (target) void switchActiveSlotAgent(activeSlot, target)
     },
     onCyclePrevAgent: () => {
@@ -149,7 +182,7 @@ export function useShellKeyboard({ toggleFocusMode, toggleNav, terminalEnabled, 
       const currentSlot = slots.find((s: { key: string }) => s.key === activeSlot)
       // See onCycleAgent above.
       const currentAgent = pendingSlotSwitch('agent', activeSlot) || currentSlot?.agent || defaultAgent
-      const target = agentCycleTarget(installedAgents, currentAgent, currentSlot?.agent_kind, -1, currentSlot?.crew_mode_agent)
+      const target = agentCycleTarget(installedAgents, currentAgent, currentSlot?.agent_kind, -1, currentSlot?.crew_mode_agent, !!currentSlot?.crew_mode_root)
       if (target) void switchActiveSlotAgent(activeSlot, target)
     },
     onCycleReasoningEffort: async () => {
@@ -161,11 +194,14 @@ export function useShellKeyboard({ toggleFocusMode, toggleNav, terminalEnabled, 
       // is a REAL effort target (provider default), so this base uses the
       // null-aware accessor — the ''-falsy one would misread an in-flight
       // "back to default" as "nothing pending" and mis-step the burst.
+      const levels = sessionEffortLevels(queryClient, activeSlot, slotModel(currentSlot))
+      // A shortcut that silently does nothing reads as broken, so say why instead.
+      if (typeof levels === 'string') { store.dispatch(setAgentSwitchNotice(levels)); return }
       const base = pendingSlotSwitchTarget('reasoning_effort', activeSlot)
         ?? (currentSlot?.reasoning_effort || '')
-      const idx = REASONING_EFFORT_LEVELS.indexOf(base)
-      const nextIdx = (idx + 1) % REASONING_EFFORT_LEVELS.length
-      const level = REASONING_EFFORT_LEVELS[nextIdx]
+      const idx = levels.indexOf(base)
+      const nextIdx = (idx + 1) % levels.length
+      const level = levels[nextIdx]
       try {
         await performSlotSwitch('reasoning_effort', activeSlot, level,
           async () => {
@@ -185,11 +221,14 @@ export function useShellKeyboard({ toggleFocusMode, toggleNav, terminalEnabled, 
       const slots = store.getState().dashboard.slots
       const currentSlot = slots.find((s: { key: string }) => s.key === activeSlot)
       // See onCycleReasoningEffort above.
+      const levels = sessionEffortLevels(queryClient, activeSlot, slotModel(currentSlot))
+      // A shortcut that silently does nothing reads as broken, so say why instead.
+      if (typeof levels === 'string') { store.dispatch(setAgentSwitchNotice(levels)); return }
       const base = pendingSlotSwitchTarget('reasoning_effort', activeSlot)
         ?? (currentSlot?.reasoning_effort || '')
-      const idx = REASONING_EFFORT_LEVELS.indexOf(base)
-      const prevIdx = (idx - 1 + REASONING_EFFORT_LEVELS.length) % REASONING_EFFORT_LEVELS.length
-      const level = REASONING_EFFORT_LEVELS[prevIdx]
+      const idx = levels.indexOf(base)
+      const prevIdx = (idx - 1 + levels.length) % levels.length
+      const level = levels[prevIdx]
       try {
         await performSlotSwitch('reasoning_effort', activeSlot, level,
           async () => {
@@ -224,7 +263,9 @@ export function useShellKeyboard({ toggleFocusMode, toggleNav, terminalEnabled, 
     onCycleModel: async () => {
       const activeSlot = store.getState().chat.activeSlot
       if (!activeSlot) return
-      const models = queryClient.getQueryData<{ name: string }[]>(['available-models', provider.id])
+      // The active session's own list when its harness is not the configured one (see ChatPage).
+      const caps = queryClient.getQueryData<{ models_backend?: string }>(['slot-selection-capabilities', activeSlot])
+      const models = queryClient.getQueryData<{ name: string }[]>(modelsQueryKey(provider.id, caps?.models_backend))
       if (!models || models.length === 0) return
       const slots = store.getState().dashboard.slots
       const currentSlot = slots.find((s: { key: string }) => s.key === activeSlot)
@@ -249,6 +290,8 @@ export function useShellKeyboard({ toggleFocusMode, toggleNav, terminalEnabled, 
             return r?.model ?? name
           },
           (value) => store.dispatch(updateSlot({ key: activeSlot, model: value })))
+        // A cold slot's effort answer was judged on its old model; ask again, as the picker does.
+        void queryClient.invalidateQueries({ queryKey: ['slot-selection-capabilities', activeSlot] })
       } catch (e) {
         store.dispatch(setAgentSwitchNotice(agentSwitchErrorNotice(e)))
         // eslint-disable-next-line no-console -- failure diagnostic; the notice above already told the user
@@ -258,7 +301,9 @@ export function useShellKeyboard({ toggleFocusMode, toggleNav, terminalEnabled, 
     onCyclePrevModel: async () => {
       const activeSlot = store.getState().chat.activeSlot
       if (!activeSlot) return
-      const models = queryClient.getQueryData<{ name: string }[]>(['available-models', provider.id])
+      // The active session's own list when its harness is not the configured one (see ChatPage).
+      const caps = queryClient.getQueryData<{ models_backend?: string }>(['slot-selection-capabilities', activeSlot])
+      const models = queryClient.getQueryData<{ name: string }[]>(modelsQueryKey(provider.id, caps?.models_backend))
       if (!models || models.length === 0) return
       const slots = store.getState().dashboard.slots
       const currentSlot = slots.find((s: { key: string }) => s.key === activeSlot)
@@ -276,6 +321,7 @@ export function useShellKeyboard({ toggleFocusMode, toggleNav, terminalEnabled, 
             return r?.model ?? name
           },
           (value) => store.dispatch(updateSlot({ key: activeSlot, model: value })))
+        void queryClient.invalidateQueries({ queryKey: ['slot-selection-capabilities', activeSlot] })
       } catch (e) {
         store.dispatch(setAgentSwitchNotice(agentSwitchErrorNotice(e)))
         // eslint-disable-next-line no-console -- failure diagnostic; the notice above already told the user
@@ -308,6 +354,26 @@ export function useShellKeyboard({ toggleFocusMode, toggleNav, terminalEnabled, 
     // a popped-out panel is focused rather than grown from out of sight.
     onNewTerminal: terminalEnabled && !isPopout && !isEmbed
       ? () => { if (terminalPoppedOut) focusTerminalPopout(); else newTerminalByChord(activeSlotProject) }
+      : undefined,
+    onCloseTerminalTab: terminalTabChord('close'),
+    onPrevTerminalTab: terminalTabChord('prev'),
+    onNextTerminalTab: terminalTabChord('next'),
+    // Same command as the chat header's pop-out button: focus the session's
+    // window when it is already out, otherwise open one. A popout or embedded
+    // pane shows no such button, so the chord is unbound there.
+    onPopOutSession: !isPopout && !isEmbed
+      ? () => {
+        const s = appStore.getState()
+        const slot = s.chat.activeSlot
+        if (!slot) return
+        if (getChatPopouts().has(slot)) focusChatPopout(slot)
+        else openChatPopout(slot, s.dashboard.slots.find(x => x.key === slot)?.title)
+      }
+      : undefined,
+    // The side panel's terminal for this session: the chat page answers. Same
+    // gating as the dock toggle: a popout or embed hosts no side panel.
+    onToggleSideTerminal: terminalEnabled && !isPopout && !isEmbed
+      ? () => window.dispatchEvent(new Event(TOGGLE_SIDE_TERMINAL_EVENT))
       : undefined,
   })
   // Cmd+1..9 (⌘ mac / Ctrl win-linux) switches instance panes: 1=Local,

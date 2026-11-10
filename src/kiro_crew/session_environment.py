@@ -273,6 +273,7 @@ LOCAL_ONLY_CORE_TOOLS: frozenset[str] = frozenset(
         "file_send",  # reads a file off this machine's disk
         "browser",  # drives this machine's browser panel
         "pod_up",  # boots a gateway from a worktree on this machine
+        "pod_restart",  # and boots it again in place
         "pod_down",  # and deletes that pod's data directory here
         "task_run",  # reads its spec off this machine's disk and runs with local tools
         # Each ctx.agent() step is a fresh session here, not the caller's environment.
@@ -335,7 +336,7 @@ DEVELOPER_FLAG = "KIROCREW_DEV_MODE"
 def session_environments_enabled() -> bool:
     """Whether remote placement is reachable at all; off unless ``KIROCREW_DEV_MODE``.
 
-    An enterprise build ignores the flag (RFC D3, ``kiro_crew.edition_locks``).
+    An LTS build ignores the flag (RFC D3, ``kiro_crew.edition_locks``).
     """
     from kiro_crew.constants import env_flag_enabled
     from kiro_crew.edition_locks import local_enable_locked

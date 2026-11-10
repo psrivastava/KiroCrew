@@ -172,6 +172,7 @@ class _SessionEntry(Protocol):
     first_turn: object
     provider_switch_replay: bool
     retire_on_identity_change: bool
+    cwd_retracted: bool
     prev_turn_cancelled: bool
 
 
@@ -269,6 +270,8 @@ class SessionLifecycleOwner(Protocol):
     ) -> bool: ...
 
     async def _retire_kiro_warm_pool(self) -> bool: ...
+
+    def warm_providers(self) -> list[Any]: ...
 
     def _mark_identity_epoch(self) -> None: ...
 
@@ -671,6 +674,9 @@ class SessionLifecycleService:
     destroy_if = _teardown.destroy_if
     discard_conversation = _teardown.discard_conversation
     # ── Account-identity retirement (identity_retirement) ──
+    holds_kiro_process_of_unknown_account = (
+        _identity_retirement.holds_kiro_process_of_unknown_account
+    )
     flag_identity_stamp_mismatches = _identity_retirement.flag_identity_stamp_mismatches
     retire_kiro_identity_sessions = _identity_retirement.retire_kiro_identity_sessions
     _retire_kiro_subagent_runtimes = _identity_retirement._retire_kiro_subagent_runtimes
@@ -687,6 +693,7 @@ class SessionLifecycleService:
     absorb_orphaned_release = _turn_stop.absorb_orphaned_release
     adopt_turn = _turn_stop.adopt_turn
     _wake_turn_waiters = staticmethod(_turn_stop._wake_turn_waiters)
+    retire_turn_permit = _turn_stop.retire_turn_permit
     await_replay_gap = _turn_stop.await_replay_gap
     cancel_current = _turn_stop.cancel_current
     cancel_owned_turn = _turn_stop.cancel_owned_turn

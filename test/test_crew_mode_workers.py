@@ -16,6 +16,10 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import make_mocked_request
 
+# Loaded here, before any test patches chat_delivery / chat_runner: chat_handlers
+# copies those names in at import, so a first import under a patch would keep the
+# fake for every later test on this worker.
+import kiro_crew.dashboard.chat_handlers  # noqa: F401
 from kiro_crew import crew_mode
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -34,10 +38,10 @@ def _reset_crew_mode_agent(_floor_monkeypatch):
 # ── the config key ─────────────────────────────────────────────────────────────
 
 
-def test_crew_mode_agent_defaults_to_the_shipped_conductor():
+def test_crew_mode_agent_defaults_to_the_team_lead():
     from kiro_crew.config.loader_builders import _build_agent_config
 
-    assert _build_agent_config({}).crew_mode_agent == "kirocrew-conductor"
+    assert _build_agent_config({}).crew_mode_agent == "kirocrew-team-lead"
 
 
 def test_crew_mode_agent_is_read_from_its_one_key():
@@ -50,7 +54,7 @@ def test_crew_mode_agent_is_read_from_its_one_key():
 def test_an_unusable_crew_mode_agent_falls_back_to_the_conductor(value):
     from kiro_crew.config.loader_builders import _build_agent_config
 
-    assert _build_agent_config({"crew_mode_agent": value}).crew_mode_agent == "kirocrew-conductor"
+    assert _build_agent_config({"crew_mode_agent": value}).crew_mode_agent == "kirocrew-team-lead"
 
 
 def test_swapping_the_key_swaps_the_conductor_and_joins_the_family():
@@ -444,37 +448,6 @@ def _routes(slots: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def test_file_self_leaves_a_crew_mode_root_where_it_is():
-    out, dash = _call("chat_folder_file_self", {"folder": "Travel"}, _routes(_crew_slots()))
-    assert _writes(dash) == []
-    assert "folder ignored" in out
-
-
-def test_file_self_leaves_a_crew_mode_worker_where_it_is():
-    root = _crew_slots(key="chat-0-1")[0]
-    slots = [
-        root,
-        *_crew_slots(
-            **{
-                crew_mode.ROOT_FIELD: False,
-                crew_mode.STAMP_FIELD: "",
-                crew_mode.WORKER_FIELD: "chat-0-1",
-            }
-        ),
-    ]
-    out, dash = _call("chat_folder_file_self", {"folder": "Goal/agent"}, _routes(slots))
-    assert _writes(dash) == []
-    assert "folder ignored" in out
-
-
-def test_file_self_still_files_a_plain_session():
-    slots = _crew_slots(**{crew_mode.ROOT_FIELD: False})
-    _, dash = _call("chat_folder_file_self", {"folder": "Travel"}, _routes(slots))
-    assert [w.route for w in _writes(dash)] == [
-        "PATCH /api/chat/slots/{slot}/folder".replace("{slot}", "chat-1-100")
-    ]
-
-
 def test_session_create_from_a_crew_mode_root_files_nothing_and_says_so():
     out, dash = _call(
         "session_create", {"title": "haiku", "folder": "Goal/worker"}, _routes(_crew_slots())
@@ -596,6 +569,95 @@ async def test_the_worker_list_is_the_roots_tree_with_status_and_item(_open_gate
     # Who dispatched whom: w2 was dispatched by the sub-conductor w1.
     assert by_key["w1"]["dispatched_by"] == "root"
     assert by_key["w2"]["dispatched_by"] == "w1"
+
+
+@pytest.mark.asyncio
+async def test_each_row_says_where_its_worker_runs(_open_gate, monkeypatch):
+    """A local worker carries no ``remote_crew`` (the page says "This machine"); a
+    worker remote dispatch placed on a crew is listed, named by the registry,
+    keyed by its item (never the peer's slot key), with the stored liveness. A
+    stored pending approval outranks running, and a closed item is closed even
+    when the last stored pull said running."""
+    from kiro_crew import work_ledger
+
+    crew_workers = _open_gate
+
+    def key(item_id: str) -> str:
+        return crew_workers.REMOTE_KEY_PREFIX + item_id
+
+    def remote(item_id: str, crew: str, title: str, terminal: bool = False) -> Any:
+        item = SimpleNamespace(
+            item_id=item_id, worker_instance_id=crew, is_terminal=terminal, retired_bindings=[]
+        )
+        progress = crew_workers.GROUP_DONE if terminal else ""
+        return crew_workers.LedgerFacts(
+            item_id, title, progress, crew=crew, board="root", title=title, work_item=item
+        )
+
+    monkeypatch.setattr(
+        crew_workers,
+        "_ledger_items",
+        lambda root: {
+            "w1": crew_workers.LedgerFacts("it_1", "Writing the haiku"),
+            key("it_r"): remote("it_r", "inst-1", "Fix CI"),
+            key("it_g"): remote("it_g", "inst-gone", "Old"),
+            key("it_a"): remote("it_a", "inst-1", "Needs a yes"),
+            key("it_x"): remote("it_x", "inst-1", "Cancelled", terminal=True),
+        },
+    )
+    stored = {
+        "it_r": work_ledger.RemoteState(running=True),
+        "it_a": work_ledger.RemoteState(running=True, pending_approval=True),
+        "it_x": work_ledger.RemoteState(running=True),
+    }
+    monkeypatch.setattr(
+        work_ledger, "read_remote_state", lambda board, item_id: stored.get(item_id)
+    )
+    state = _state(_TREE)
+    state.instances_registry = SimpleNamespace(
+        list=lambda: [SimpleNamespace(id="inst-1", name="Build box")]
+    )
+    resp = await crew_workers.api_crew_workers(_req("GET", "/x", state, {"slot": "root"}))
+    by_key = {w["key"]: w for w in json.loads(resp.text)["workers"]}
+    assert "remote_crew" not in by_key["w1"]
+    row = by_key[key("it_r")]
+    assert row["remote_crew"] == "Build box"
+    assert (row["title"], row["summary"], row["ledger_item"]) == ("Fix CI", "Fix CI", "it_r")
+    assert (row["status"], row["group"]) == ("working", "working")
+    # A crew missing from the registry is named by its instance id.
+    assert by_key[key("it_g")]["remote_crew"] == "inst-gone"
+    assert by_key[key("it_g")]["status"] == "idle"
+    assert (by_key[key("it_a")]["status"], by_key[key("it_a")]["group"]) == (
+        "needs_approval",
+        "approval",
+    )
+    assert (by_key[key("it_x")]["status"], by_key[key("it_x")]["group"]) == ("closed", "done")
+
+
+def test_a_remote_item_is_keyed_by_its_item_not_the_peer_slot(monkeypatch):
+    from kiro_crew.dashboard.handlers import crew_workers, work_ledger_board
+
+    items = [
+        SimpleNamespace(
+            item_id="it_r",
+            worker_session_key="dashboard:w1",
+            worker_instance_id="inst-1",
+            title="Fix CI",
+            summary="",
+            status="question",
+            is_terminal=False,
+        ),
+    ]
+    monkeypatch.setattr(work_ledger_board, "task_records", lambda key: (None, items))
+    out = crew_workers._ledger_items("root")
+    # The peer's slot key can equal a local one: it never becomes a local row.
+    assert list(out) == [crew_workers.REMOTE_KEY_PREFIX + "it_r"]
+    facts = out[crew_workers.REMOTE_KEY_PREFIX + "it_r"]
+    assert (facts.crew, facts.title, facts.progress) == (
+        "inst-1",
+        "Fix CI",
+        crew_workers.GROUP_WITH_CONDUCTOR,
+    )
 
 
 @pytest.mark.asyncio
@@ -788,7 +850,7 @@ async def test_a_held_steer_is_reported_queued_persisted_and_shown(_open_gate, m
     monkeypatch.setattr(
         chat_delivery, "start_queue_persist", lambda st, sl: persisted.append(sl.key)
     )
-    monkeypatch.setattr(chat_delivery, "warn_if_not_durable", lambda *a: None)
+    monkeypatch.setattr(chat_delivery, "warn_if_not_durable", lambda *a: True)
     monkeypatch.setattr(crew_log_emit, "on_message_queued", lambda *a, **k: None)
     monkeypatch.setattr("kiro_crew.dashboard.relay_archive.is_relay_archive", lambda s: False)
     queue: list[dict[str, Any]] = []
@@ -837,6 +899,11 @@ def test_the_routes_are_registered_under_the_slot():
         "/api/chat/slots/{slot}/crew-workers/{worker}/steer": ["POST"],
         # The conductor's approval card (owner decision B).
         "/api/chat/slots/{slot}/crew-workers/{worker}/approve": ["POST"],
+        # A session's in-place recap on the crewmate Sessions tab.
+        "/api/chat/slots/{slot}/crew-workers/{worker}/recap": ["GET"],
+        # Ultra Mode Pause all / Resume all.
+        "/api/chat/slots/{slot}/crew-workers/pause": ["POST"],
+        "/api/chat/slots/{slot}/crew-workers/resume": ["POST"],
     }
 
 
@@ -870,6 +937,26 @@ def test_a_worker_line_is_one_plain_line_cut_to_the_card():
     assert crew_workers._worker_line({"last_message": 3}, "") == ""
 
 
+def test_a_relayed_seed_is_not_a_worker_line_its_last_reply_is():
+    from kiro_crew.dashboard.handlers import crew_workers
+
+    slot = SimpleNamespace(
+        messages=[
+            {"role": "assistant", "content": "**Menu drafted**\nnext"},
+            {"role": "user", "content": "[sent by session chat-1 via session_send]\n\nRetry"},
+        ]
+    )
+    for seed in (
+        "[sent by session chat-1 via session_send] Retry",
+        "[quoted: sent by session chat-1 via session_send] Retry",
+    ):
+        assert crew_workers._worker_line({"last_message": seed}, "", slot) == "Menu drafted"
+    assert (
+        crew_workers._worker_line({"last_message": "[sent by session x via session_send]"}, "")
+        == ""
+    )
+
+
 # ── the board and the per-turn block follow the family ───────────────────────
 
 
@@ -894,6 +981,27 @@ async def test_the_board_is_adopted_for_a_swapped_in_conductor(monkeypatch):
 _FAKE_KEY = "AKIA" + "ABCDEFGHIJKLMNOP"
 
 
+def test_a_long_last_reply_is_redacted_before_it_is_cut():
+    from kiro_crew.dashboard.handlers import crew_workers
+
+    secret = "AKIA" + "Q" * 16
+    text = "x" * 140 + " **AKIA**" + secret[4:] + " done"
+    slot = SimpleNamespace(messages=[{"role": "assistant", "content": text}])
+    seed = "[sent by session c via session_send] go"
+    line = crew_workers._worker_line({"last_message": seed}, "", slot)
+    assert "Q" * 8 not in line
+
+
+def test_a_last_reply_standing_in_for_a_seed_is_redacted():
+    from kiro_crew.dashboard.handlers import crew_workers
+
+    secret = "AKIA" + "Z" * 16
+    slot = SimpleNamespace(messages=[{"role": "assistant", "content": f"key {secret} saved"}])
+    seed = "[sent by session c via session_send] go"
+    line = crew_workers._worker_line({"last_message": seed}, "", slot)
+    assert line and secret not in line
+
+
 def test_a_workers_item_comes_from_the_roots_own_ledger_through_the_board_seam(monkeypatch):
     from kiro_crew.dashboard.handlers import crew_workers, work_ledger_board
 
@@ -915,7 +1023,7 @@ def test_a_workers_item_comes_from_the_roots_own_ledger_through_the_board_seam(m
     monkeypatch.setattr(work_ledger_board, "task_records", _records)
     out = crew_workers._ledger_items("root")
     assert list(out) == ["w1"]
-    item, line, _progress = out["w1"]
+    item, line = out["w1"].item, out["w1"].line
     assert item == "it_1"
     # The latest report's line, through the board's egress redactor.
     assert line.startswith("Draft done") and _FAKE_KEY not in line
@@ -942,6 +1050,36 @@ def test_the_side_panel_group_of_a_worker(status, progress, group):
     from kiro_crew.dashboard.handlers import crew_workers
 
     assert crew_workers._group(status, progress) == group
+
+
+@pytest.mark.parametrize(
+    ("progress", "group"),
+    [
+        # Idle between checks of its own loop (waiting on CI): the flow still runs.
+        ("", "working"),
+        # A report it owes its conductor, or a finish, outranks the loop.
+        ("with_conductor", "with_conductor"),
+        ("done", "done"),
+    ],
+)
+def test_an_idle_worker_whose_loop_will_wake_it_is_working(progress, group):
+    from kiro_crew.dashboard.handlers import crew_workers
+
+    assert crew_workers._group("idle", progress, looping=True) == group
+    assert crew_workers._group("needs_approval", progress, looping=True) == "approval"
+
+
+@pytest.mark.asyncio
+async def test_the_worker_list_reads_a_looping_idle_worker_as_working(_open_gate, monkeypatch):
+    rows = [*_TREE, _row("w3", created_by="root", title="Waits on CI")]
+    monkeypatch.setattr(_open_gate, "_looping", lambda key: key in {"w3", "w2"})
+    resp = await _open_gate.api_crew_workers(
+        _req("GET", "/api/chat/slots/root/crew-workers", _state(rows), {"slot": "root"})
+    )
+    by_key = {w["key"]: w for w in json.loads(resp.text)["workers"]}
+    assert by_key["w3"]["group"] == "working"
+    # A worker waiting on a tool approval still reads as the approval, loop or not.
+    assert by_key["w2"]["group"] == "approval"
 
 
 @pytest.mark.parametrize(

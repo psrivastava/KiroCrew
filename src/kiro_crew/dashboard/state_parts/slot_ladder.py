@@ -12,7 +12,8 @@ Writes: ``_acp_pipe_death_retries``, ``_active_fallback_model``, ``_batch_reject
 ``_compaction_failed_retries``, ``_empty_episode_productive``,
 ``_empty_response_retries``, ``_end_wait_by``, ``_end_wait_request``,
 ``_fallback_candidate_idx``, ``_fallback_client_pick_epoch``, ``_fallback_pick_gen``,
-``_fallback_primary_model``, ``_fallback_slot_model``, ``_fallback_walked``,
+``_fallback_primary_model``, ``_fallback_slot_model``, ``_fallback_walk_refused``,
+``_fallback_walked``,
 ``_infra_retries``, ``_last_turn_model_refused_loop_gen``,
 ``_last_turn_model_refused_loop_id``, ``_last_turn_structural_terminal``,
 ``_last_turn_structural_terminal_loop_gen``, ``_last_turn_structural_terminal_loop_id``,
@@ -28,15 +29,17 @@ Writes: ``_acp_pipe_death_retries``, ``_active_fallback_model``, ``_batch_reject
 ``_steer_attachment_meta``, ``_steer_audience_fence_holders``,
 ``_steer_audience_fences``, ``_steer_automation``, ``_steer_channel_origin``,
 ``_steer_clear``, ``_steer_confirmed``,
-``_steer_decision_strips``, ``_steer_delivery_ids``, ``_steer_possibly_delivered``,
+``_steer_decision_strips``, ``_steer_delivery_ids``, ``_steer_owner_origin``,
+``_steer_possibly_delivered``,
 ``_steer_retract``, ``_steer_rpc_in_flight``, ``_steer_segment_cut``, ``_steer_send_ids``,
 ``_steer_user_origin``, ``_subagent_deliveries_inflight``,
 ``_subagents_inline_collected``, ``_synthesis_armers``,
-``_synthesis_completion_turns``, ``_synthesis_inflight``, ``_synthesis_recheck``,
-``_synthesis_rechecks``,
+``_synthesis_completion_turns``, ``_synthesis_final_turn_ran``, ``_synthesis_inflight``,
+``_synthesis_recheck``, ``_synthesis_rechecks``,
 ``_tool_stall_exhausted_emitted``, ``_tool_stall_retries``, ``_transient_5xx_retries``,
-``_transient_ladder_started``, ``_turn_channel_narrowed``, ``_turn_channel_origin``,
-``_turn_retries``, ``_turn_user_sent``, ``_wait_contested``, ``_wait_last_ping``,
+``_transient_ladder_started``, ``_turn_agent_started``, ``_turn_channel_narrowed``,
+``_turn_channel_origin``, ``_turn_owner_sent``, ``_turn_retries``, ``_turn_user_sent``,
+``_wait_contested``, ``_wait_last_ping``,
 ``_wait_state``, ``_wait_steer_baseline``, ``replays``.
 """
 
@@ -80,6 +83,9 @@ def init_ladder_fields(self: _ChatSlot) -> None:
     # result, so the turn-end fire gate drops the arm instead of running a
     # synthesis that restates it.
     self._synthesis_completion_turns = 0
+    # The newest turn took the batch's last result and ended on visible reply
+    # text (set by `_turn_record_outcome`, read by the same fire gate).
+    self._synthesis_final_turn_ran = False
     # Race guard: number of sub-agent completion deliveries
     # currently in flight for this slot (incremented in gateway._subagent_done
     # from entry until the completion is queued/launched). The synthesis
@@ -146,6 +152,13 @@ def init_ladder_fields(self: _ChatSlot) -> None:
     # the primary (deliberately NOT reset on turn completion).
     self._fallback_candidate_idx = 0
     self._fallback_walked = []
+    # Whether the SELECTED model's own ladder, the one that started the current
+    # walk, ended on a capacity/rollout refusal (``AcpError.model_unavailable``).
+    # Written at the walk's first swap and read only while ``_fallback_walked``
+    # is non-empty, so the terminal card is judged by the model a Resume would
+    # go back to (the restore probe re-selects the primary), not by whichever
+    # candidate failed last.
+    self._fallback_walk_refused = False
     self._active_fallback_model = ""
     self._fallback_primary_model = ""
     # Snapshot of slot.model taken when the fallback activated; it heals
@@ -372,6 +385,13 @@ def init_ladder_fields(self: _ChatSlot) -> None:
     # provenance, narrowed by the flag below. Absent means "not through a
     # channel", the composer's case.
     self._steer_channel_origin = {}
+    # Whether an in-flight steer was sent by the OWNER's own dashboard request
+    # (`is_owner_dashboard_request`), keyed and kept in the same LOCKSTEP as the
+    # two maps above. The requeue reads it for `directive_owner_origin`: a
+    # requeued steer runs as its own turn, and the owner mark decides whether
+    # that turn may read a peer crew's sessions (`_turn_owner_sent` below).
+    # Absent means NOT the owner, which fails closed.
+    self._steer_owner_origin = {}
     # Whether a CHANNEL steer has been admitted into the turn this slot is
     # running. Set by `steer_into_running_turn(channel_origin=True)` at
     # admission -- before its RPC, since the client can inject the text and the
@@ -400,6 +420,25 @@ def init_ladder_fields(self: _ChatSlot) -> None:
     # that is not the user's clears it (`chat_delivery`), so the guide routes
     # that act for the user refuse them.
     self._turn_user_sent = False
+    # Whether the RUNNING turn's words are the OWNER's: the person whose dashboard
+    # claim `is_owner_dashboard_request` accepts, not any holder of a dashboard
+    # token (a channel user allow-listed for `/kirocrew dashboard` holds one too,
+    # and `_turn_user_sent` counts their turn as a person's). Set at the turn's
+    # outermost entry from that turn's own `_run_chat(_directive_owner_origin=)`
+    # -- passed by the dashboard send, regenerate and rewind handlers and by the
+    # queue drain from the consumed entries' marks -- and only when the opener is
+    # also `_turn_user_sent`, so a dispatch that does not declare (`openai_compat`,
+    # the spec-builder runtime, a loop wake, a cron) starts from False and a
+    # dispatch that never started leaves nothing behind. A steer that is not the owner's clears it
+    # (`chat_delivery`), and EVERY turn exit clears it (`queue_cycle`), the
+    # handed-off depth-1 exit included -- unlike the two flags above, which the
+    # outermost exit alone resets, because a stale value here is authority and
+    # the only cost of clearing early is a refusal. Read by the crew-scoped
+    # session reads (`handlers_instances_crew_reads`), whose peer transcripts
+    # only the owner may see.
+    self._turn_owner_sent = False
+    # Set by every outermost turn's open, so it describes the turn running now.
+    self._turn_agent_started = False
     # The containment that held when an in-flight steer was AUTHORIZED, keyed by
     # the same message text and kept in the same LOCKSTEP. The requeue stamps it
     # on the queue entry instead of reading the slot again: its own moment is the
@@ -485,7 +524,7 @@ def init_ladder_fields(self: _ChatSlot) -> None:
     # steer has stamped its own row.
     self._steer_attachment_meta = {}
     # Pending steers the composer's own human sent, held with the lists above
-    # and released the same ways. Requeue stamps ``STEER_INTENT_META`` on the
+    # and released the same ways. Requeue stamps ``COMPOSER_SEND_META`` on the
     # entry, so the sub-agent hold lets it drain instead of parking it.
     self._steer_act_now = set()
     # Pending AUTOMATION steers (a work-ledger wake), each with the

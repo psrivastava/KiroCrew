@@ -13,6 +13,7 @@ import { buildCommandCenter, crewWaitingApprovals, type CommandCenterSources } f
 import AttentionCard from '../pages/chat/command-center/AttentionCard'
 import type { ChatSlot } from '../types'
 import { createTestStore } from './helpers'
+import { crewModePreviewOn } from './crewModePreview'
 
 const slot = (key: string, extra: Partial<ChatSlot> = {}): ChatSlot => ({ key, messages: 0, running: false, ...extra })
 const waiting = {
@@ -32,7 +33,7 @@ const sources = (extra: Partial<CommandCenterSources>): CommandCenterSources => 
 describe('the one rule: a worker approval is decided only on the conductor card', () => {
   it('lists every surface and only the conductor card may decide a worker approval', () => {
     expect([...CREW_APPROVAL_SURFACES]).toEqual([
-      'conductor_card', 'worker_main_pane', 'worker_split_pane', 'conductor_side_panel', 'session_dashboards',
+      'conductor_card', 'worker_main_pane', 'worker_split_pane', 'conductor_side_panel', 'session_dashboards', 'sidebar_hover_card',
     ])
     const worker = { crew_root: 'root' }
     for (const surface of CREW_APPROVAL_SURFACES) {
@@ -87,3 +88,6 @@ describe('the one rule: a worker approval is decided only on the conductor card'
     expect(screen.getByRole('link', { name: /Open the approval card/ })).toHaveAttribute('href', '/chat?sid=root')
   })
 })
+
+// Last, after the file's own hooks that clear localStorage: Crew Mode is a feature preview.
+crewModePreviewOn()

@@ -1,12 +1,13 @@
 // The reactive token re-mint budget, the mc-switch-instance gate, the load-timeout
 // verdict, the iframe-mounted journal and mc-embedded-boot attribution are tested in
 // InstancesViewport.paneLoad.test.tsx; both suites share InstancesViewportTestUtils.tsx.
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { describe, it, expect, vi, beforeEach, afterEach, onTestFinished } from 'vitest'
 import { act, fireEvent, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { renderWithProviders, createTestStore } from './helpers'
 import InstancesViewport from '../components/InstancesViewport'
 import { removeWarm, setActiveId, setWarm } from '../store/instancesSlice'
+import { connectInstanceInto } from '../lib/connectInstance'
 import {
   consumeChatHandoff,
   installSoftNavigate,
@@ -15,6 +16,8 @@ import {
 } from '../utils/errorReport'
 import { __resetInstanceFailuresForTests } from '../utils/instanceFailureReport'
 import { mockConnectedCd1 } from './InstancesViewportTestUtils'
+import { CHAT_COMPLETE_NOTIFY_KEY, saveChatCompleteNotify } from '../hooks/chatCompleteNotify'
+import { namedCeiling } from './namedCeiling'
 
 // The postinstall patch (scripts/patch-happy-dom-iframe.mjs) makes happy-dom's
 // disabled-iframe path dispatch 'load' instead of throwing DOMException when
@@ -60,12 +63,17 @@ vi.mock('../api/client', () => ({
     updateInstance: vi.fn().mockResolvedValue({}),
     addInstance: vi.fn().mockResolvedValue({ id: 'added-1' }),
     refreshInstanceToken: vi.fn().mockResolvedValue({ state: 'connected', local_port: 7778, token: 'tok' }),
+    themes: vi.fn().mockResolvedValue({ themes: [] }), // unmocked, the theme catalog read retries forever
   },
 }))
 import { api } from '../api/client'
 
+const defaultConnectInstance = vi.mocked(api.connectInstance).getMockImplementation()!
+
 beforeEach(() => {
   vi.clearAllMocks()
+  // clearAllMocks keeps implementations, so restore the connect default between tests.
+  vi.mocked(api.connectInstance).mockReset().mockImplementation(defaultConnectInstance)
   vi.mocked(isEmbeddedPane).mockReturnValue(false)
   // Module-level state in the failure recorder: without this the de-dup from an
   // earlier test would suppress the report a later one asserts on.
@@ -653,6 +661,24 @@ describe('InstancesViewport', () => {
     __resetFocusMode()
   })
 
+  it('relays the chat-complete toast opt-in and re-sends it when Settings flips it (#20191)', async () => {
+    onTestFinished(() => { localStorage.removeItem(CHAT_COMPLETE_NOTIFY_KEY) })
+    mockConnectedCd1()
+    const store = createTestStore({
+      instances: { warm: { 'cd-1': { port: 7778, token: 'tok' } }, activeId: 'cd-1', mru: ['cd-1'], unread: {}, ready: { 'cd-1': true } },
+    })
+    renderWithProviders(<InstancesViewport />, { store })
+    await waitFor(() => expect(document.querySelector('iframe')).toBeTruthy())
+    const post = vi.fn()
+    Object.defineProperty(document.querySelector('iframe'), 'contentWindow', { get: () => ({ postMessage: post }) })
+    const lastModel = () => post.mock.calls.at(-1)?.[0]
+
+    act(() => { saveChatCompleteNotify(true) })
+    await waitFor(() => expect(lastModel()).toMatchObject({ type: 'mc-host-model', chatCompleteNotify: true }))
+    act(() => { saveChatCompleteNotify(false) })
+    await waitFor(() => expect(lastModel()).toMatchObject({ type: 'mc-host-model', chatCompleteNotify: false }))
+  })
+
   it('takes chrome visibility from the ACTIVE pane only', async () => {
     // A pane's peeked header is the only thing on screen when that pane fills the
     // window, so the host has to act on its report — the traffic lights are AppKit
@@ -678,7 +704,7 @@ describe('InstancesViewport', () => {
     await waitFor(() => expect(focusChromeVisible()).toBe(true))
 
     // A report from a pane that is NOT active is ignored.
-    setFocusChromeVisible(false)
+    act(() => { setFocusChromeVisible(false) })
     // Separate act: the component tracks the active id in a ref written during
     // render, so the switch has to COMMIT before the message is delivered —
     // otherwise the listener still sees cd-1 as active and the test would pass
@@ -1100,9 +1126,9 @@ describe('InstancesViewport', () => {
 
       // Focus mode OFF: a switch must NOT touch chrome state (it is
       // unconditionally visible and owned by the surfaces themselves).
-      setFocusModeEnabled(false)
+      act(() => { setFocusModeEnabled(false) })
       expect(focusModeEnabled()).toBe(false)
-      setFocusChromeVisible(true)
+      act(() => { setFocusChromeVisible(true) })
       await act(async () => { store.dispatch(setActiveId('cd-2')) })
       expect(focusChromeVisible()).toBe(true)
     } finally {
@@ -1119,12 +1145,9 @@ describe('InstancesViewport', () => {
     expect(await screen.findByText(/Loading pane/i)).toBeInTheDocument()
 
     // The embedded SPA announces readiness from its validated loopback origin.
-    window.dispatchEvent(
-      new MessageEvent('message', {
-        data: { type: 'mc-embedded-ready', v: 1 },
-        origin: 'http://127.0.0.1:7778',
-      }),
-    )
+    await act(async () => {
+      window.dispatchEvent(new MessageEvent('message', { data: { type: 'mc-embedded-ready', v: 1 }, origin: 'http://127.0.0.1:7778' }))
+    })
     await waitFor(() => expect(store.getState().instances.ready['cd-1']).toBe(true))
     await waitFor(() => expect(screen.queryByText(/Loading pane/i)).toBeNull())
   })
@@ -1260,6 +1283,28 @@ describe('InstancesViewport', () => {
     expect(screen.queryByText(/ssh unreachable/i)).toBeNull()
   })
 
+  it('an auto-connect refusal for the active crew shows its reason on the panel (#29777)', async () => {
+    // The tunnel is up but the remote gateway is not: the poll says connected
+    // with no error, and every connect is refused. The refusal comes from the
+    // auto-connect fan-out, not this viewport's Retry.
+    mockConnectedCd1()
+    vi.mocked(api.connectInstance).mockRejectedValue(new Error('check that its remote gateway is running'))
+    const store = createTestStore({
+      instances: { warm: {}, activeId: 'cd-1', mru: ['cd-1'], unread: {}, ready: {} },
+    })
+    renderWithProviders(<InstancesViewport />, { store })
+    await act(async () => {
+      await connectInstanceInto(store.dispatch, 'cd-1', 'auto-connect').catch(() => {})
+    })
+    expect(await screen.findByTestId('instances-viewport-panel-error')).toHaveTextContent(
+      'check that its remote gateway is running',
+    )
+    // The reason the panel shows is the one the agent hand-off carries.
+    installSoftNavigate(() => {})
+    await userEvent.click(await screen.findByRole('button', { name: /agent/i }))
+    expect(consumeChatHandoff() ?? '').toContain('check that its remote gateway is running')
+  })
+
 
   describe('script-error heal (poisoned HTTP cache)', () => {
     // The pane's index.html shell posts this when its entry <script type=module>
@@ -1269,12 +1314,14 @@ describe('InstancesViewport', () => {
     // reloads -- exactly once per Retry, so a 404 the gateway is really serving
     // cannot spin clear/reload forever.
     const scriptError = (origin = 'http://127.0.0.1:7778') =>
-      window.dispatchEvent(
-        new MessageEvent('message', {
-          data: { type: 'mc-embedded-boot', v: 1, stage: 'script-error', src: `${origin}/assets/main-krfrL6rl.js?token=x` },
-          origin,
-        }),
-      )
+      act(() => {
+        window.dispatchEvent(
+          new MessageEvent('message', {
+            data: { type: 'mc-embedded-boot', v: 1, stage: 'script-error', src: `${origin}/assets/main-krfrL6rl.js?token=x` },
+            origin,
+          }),
+        )
+      })
     const withBridge = (impl: (origin: string) => Promise<boolean>) => {
       const clear = vi.fn(impl)
       ;(window as unknown as { electronAPI: unknown }).electronAPI = { clearPaneHttpCache: clear }
@@ -1343,9 +1390,9 @@ describe('InstancesViewport', () => {
       expect(await screen.findByText(/Loading pane/i)).toBeInTheDocument()
       // The retraction is not gated on the heal budget: a second script-error
       // (budget spent, no reload) still leaves the pane un-ready.
-      window.dispatchEvent(
-        new MessageEvent('message', { data: { type: 'mc-embedded-ready', v: 1 }, origin: 'http://127.0.0.1:7778' }),
-      )
+      act(() => {
+        window.dispatchEvent(new MessageEvent('message', { data: { type: 'mc-embedded-ready', v: 1 }, origin: 'http://127.0.0.1:7778' }))
+      })
       await waitFor(() => expect(store.getState().instances.ready['cd-1']).toBe(true))
       scriptError()
       await waitFor(() => expect(store.getState().instances.ready['cd-1']).toBeUndefined())
@@ -1396,7 +1443,8 @@ describe('InstancesViewport', () => {
       const store = createTestStore({
         instances: { warm: { 'cd-1': { port: 7778, token: 'tok' } }, activeId: 'cd-1', mru: ['cd-1'], unread: {}, ready: {} },
       })
-      renderWithProviders(<InstancesViewport />, { store })
+      const { queryClient } = renderWithProviders(<InstancesViewport />, { store })
+      await waitFor(() => expect(queryClient.isFetching()).toBe(0), namedCeiling('PANE_READS_SETTLED', 5000))
       expect(await screen.findByText(/Loading pane/i)).toBeInTheDocument()
       const before = document.querySelector('iframe') as HTMLIFrameElement
       scriptError('http://127.0.0.1:9999')

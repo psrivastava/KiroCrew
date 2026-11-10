@@ -167,13 +167,14 @@ _BASE_SERVICE_MEMBERS: dict[str, tuple[str, str]] = {
     "__init__": ("method", "38ac57f125dd"),
     "_acquire_mutation_lock": ("method+async", "34bd8c98b4d6"),
     "_add_locked": ("method+async", "71d798975d9e"),
-    "_add_monitor_locked": ("method+async", "6b137fb5f8ae"),
+    "_add_monitor_locked": ("method+async", "243682becc96"),
     "_add_unserialized": ("method+async", "71d798975d9e"),
     "_admit_mutation": ("method", "f52a8c13366d"),
     "_append_judge_labels": ("method", "05f9e694d3d7"),
     "_apply_monitor_budget_stop": ("method", "c05b26fec956"),
     "_apply_monitor_user_stop": ("method", "0d02c6c3b88e"),
     "_apply_staged_monitor": ("method", "1eecbc416bc8"),
+    "_arm_and_announce_deadline": ("method", "fa9fb3019298"),
     "_arm_from_deadline": ("method", "fa9fb3019298"),
     "_arm_timer": ("method", "e290ef84f151"),
     "_begin_maintenance_quiesce": ("method", "f7956b1e6531"),
@@ -257,7 +258,7 @@ _BASE_SERVICE_MEMBERS: dict[str, tuple[str, str]] = {
     "_write_quarantine_sidecar_locked": ("method", "35d06f40fb45"),
     "_write_state": ("method", "b02c548f23ec"),
     "add": ("method+async", "85b1ff9d88ec"),
-    "add_monitor": ("method+async", "b07c1299b741"),
+    "add_monitor": ("method+async", "2593800210c1"),
     "apply_monitor_probe": ("method+async", "7e318e77ec64"),
     "clear_terminal_monitor": ("method+async", "82db71923663"),
     "commit_monitor_replacement": ("method", "f7956b1e6531"),
@@ -1149,6 +1150,7 @@ _BINDINGS = {
     "_cancel_timer": "timers",
     "_arm_timer": "timers",
     "_arm_from_deadline": "timers",
+    "_arm_and_announce_deadline": "timers",
     "_reconcile_forever": "timers",
     "_reconcile_once": "timers",
     "_commit_judge_pr_seen": "gate",
@@ -1234,6 +1236,7 @@ _OWNER_ORDER = (
     "maintenance",
     "timers",
     "gate",
+    "subject_reads",
     "judge_tick",
     "firing",
     "mutations",
@@ -1504,6 +1507,9 @@ _FACADE_PATCHES_FOR_CONSUMERS = {
     # dashboard/session_directive_apply_monitor.py imports is_structured_monitor_loop per call;
     # these tests hand it a SimpleNamespace service, so no owner code runs.
     ("test/test_autonudge_member_self_arm.py", "is_structured_monitor_loop"): "directive consumer",
+    # session_directive_apply_monitor._default_cycle_cap imports infer_monitor per call;
+    # the test stubs the service and authorizer, so no owner code runs.
+    ("test/test_permanent_patrol.py", "infer_monitor"): "directive consumer",
 }
 
 

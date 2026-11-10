@@ -15,6 +15,9 @@ import { revealComposer } from '../composerFocus'
 import type { ChatMessage } from '../../../types'
 import type { ErrorReport } from '../../../utils/errorReport'
 import { i18nT } from '../../../i18n/t'
+import { clearSendRaceNotice, isSendRaceConflict, sendIdempotencyKey, setSendRaceNotice } from '../../../api/sendRace'
+import { isComposerLocked, noteComposerLocked } from '../../../api/typingLease'
+import { baseRevisionForPress } from '../../../hooks/sharedCrew/sendRevisionSeed'
 
 // Per-action titles for the refused-press notice above the composer. A press
 // added later gets its refusal surfaced by adding one entry here and calling
@@ -30,6 +33,7 @@ export const REFUSED_PRESS_TITLE_KEYS = {
   side_open: 'pages.chatPage.could_not_open_side_chat',
   side_turn: 'pages.chatPage.could_not_send_to_side_chat',
   agent_switch: 'pages.chatPage.could_not_switch_agent',
+  fork: 'pages.chatPage.could_not_fork_session',
   fresh_session: 'pages.chatPage.could_not_start_fresh_session',
   repair_images: 'pages.chatPage.could_not_repair_images',
 } as const
@@ -39,14 +43,30 @@ export type RefusedPressAction = keyof typeof REFUSED_PRESS_TITLE_KEYS
 /** The refused-press notice for an intercepted slash command that failed. The
  *  title names the command that was refused; the message is the gateway's
  *  reason, or a fallback saying the draft is still in the composer. */
-export function slashRefusal(res: { stage?: 'open' | 'turn' | 'agent'; error?: string }): { action: RefusedPressAction; message: string } {
+export function slashRefusal(res: { stage?: 'open' | 'turn' | 'agent' | 'fork'; error?: string }): { action: RefusedPressAction; message: string } {
   if (res.stage === 'agent') {
     return { action: 'agent_switch', message: res.error || i18nT('pages.chatPage.agent_command_not_run') }
+  }
+  if (res.stage === 'fork') {
+    return { action: 'fork', message: res.error ?? '' }
   }
   return {
     action: res.stage === 'turn' ? 'side_turn' : 'side_open',
     message: res.error || i18nT('pages.chatPage.side_command_not_run'),
   }
+}
+
+/** One steer press. `baseAtPress` is the send revision this tab had seen when
+ *  the person pressed (`baseRevisionFor` read synchronously at the press). */
+export interface SteerVars {
+  text: string
+  sendId?: string
+  slot: string
+  auto?: boolean
+  quote?: MessageQuote | null
+  askId?: string | null
+  files?: string[]
+  baseAtPress?: number
 }
 
 interface SteerDeliveryOptions {
@@ -100,8 +120,18 @@ export function useSteerDelivery({
     // (`decisions/points/message_steer.py`). The receipt policy below is unchanged,
     // because the answer arrives as the `dispatched` of a steer or the `queued` of
     // a queue -- both rulings `applySteerReceipt` already owns.
-    mutationFn: ({ text, sendId, slot, auto, quote, files }: { text: string; sendId?: string; slot: string; auto?: boolean; quote?: MessageQuote | null; askId?: string | null; files?: string[] }) =>
-      sendTurn({ message: text, slot, steer: auto ? 'auto' : true, ...(sendId ? { meta: { sendId, ...(files?.length ? { files } : {}), ...(quote ? { quote } : {}) } } : {}) }),
+    // A steer is a send too (first submit wins): it carries the revision this
+    // tab had seen at the press (`baseAtPress`), or, when it had seen none, the
+    // one the session's read answers, and the host refuses it with `send_race`
+    // when a collaborator's send was accepted after that.
+    mutationFn: async ({ text, sendId, slot, auto, quote, files, baseAtPress }: SteerVars) =>
+      sendTurn({
+        message: text,
+        slot,
+        steer: auto ? 'auto' : true,
+        ...(sendId ? { meta: { sendId, ...(files?.length ? { files } : {}), ...(quote ? { quote } : {}) } } : {}),
+        race: { baseRevision: await baseRevisionForPress(slot, baseAtPress), ...(sendId ? { idempotencyKey: sendIdempotencyKey(sendId) } : {}) },
+      }),
     onSuccess: (receipt, { text, sendId, slot, quote, askId }) => {
       // Receipt policy for a steer, owned once in chat-core (issue #9457):
       // applySteerReceipt decides WHICH ruling applies; the adapter below is
@@ -135,6 +165,24 @@ export function useSteerDelivery({
         if (onScreenNow) setInput(back)
       }
       const row = (message: ChatMessage) => dispatch(appendSlotMessage({ slot, message }))
+      if (receipt.status === 'refused' && isSendRaceConflict(receipt.body)) {
+        // A collaborator's send was accepted first: nothing of this one was,
+        // so its bubble goes, the text comes back, and the notice above the
+        // composer names who sent first. Not an error row: nothing failed.
+        setSendRaceNotice(slot, receipt.body)
+        if (sendId) dispatch(resolveOptimisticSteer({ slot, sendId, outcome: 'queued' }))
+        handBack()
+        return
+      }
+      if (receipt.status === 'refused' && isComposerLocked(receipt.body)) {
+        // Someone else holds the typing lease: the text comes back and the
+        // composer locks with their name. Not an error row: nothing failed.
+        noteComposerLocked(receipt.body)
+        if (sendId) dispatch(resolveOptimisticSteer({ slot, sendId, outcome: 'queued' }))
+        handBack()
+        return
+      }
+      if (receipt.status !== 'refused') clearSendRaceNotice(slot)
       applySteerReceipt(receipt, {
         // A confirmed echo is stronger evidence than a missing HTTP response,
         // including when a steer raced onto a new turn and lost its steer flag.

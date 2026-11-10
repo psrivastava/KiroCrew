@@ -110,10 +110,10 @@ describe('the facade composition', () => {
   // before the owners were extracted, which is what keeps React's effect order.
   const CALL_ORDER = [
     'useSessionSources', 'useDebouncedSessionSearch', 'useSessionRename', 'useSessionAutoTitle', 'useSessionSort', 'useSidebarLane',
-    'useSessionFilterState', 'useSessionStatusFilters', 'useHistoryPane', 'useSessionCleanup', 'useBulkModelSwitch', 'usePinnedSessionOrder',
+    'useSessionFilterState', 'useSessionStatusFilters', 'useSharedCrewListView', 'useHistoryPane', 'useSessionCleanup', 'useBulkModelSwitch', 'useResumeAll', 'usePinnedSessionOrder',
     'useManualSessionOrder',
     'useStaleCollapse', 'useFolderSort', 'useFolderRename', 'useSidebarTags',
-    'useSidebarModels', 'useBoardColumns', 'useSidebarResize', 'useFullTitlesOnScrollSetting', 'usePinnedOrderAuthority', 'useColumnPopover', 'useBoardColumnMutations',
+    'useSidebarModels', 'useBoardColumns', 'useSidebarResize', 'useFullTitlesOnScrollSetting', 'useNeedsMeHoverCardSetting', 'usePinnedOrderAuthority', 'useColumnPopover', 'useBoardColumnMutations',
     'useColumnMatches', 'useFolderVisibility', 'useStaleMoveWatcher', 'useSearchMatches',
     'useCollapsedCrews', 'useCollapsedCrewSpaces', 'useCrewEnable', 'useHoverHold', 'useLineageAvailable', 'useHoverPinLiveness', 'useStaleNarrowBridge',
     'useFolderFilterReveal', 'useConductorLane', 'useLaneCycle', 'useSidebarScrollPeek', 'useShortcutOrder',

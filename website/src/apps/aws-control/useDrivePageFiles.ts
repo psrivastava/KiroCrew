@@ -218,6 +218,15 @@ export function useDrivePageFiles(account: string) {
     menuLayer.openLayer(() => setMoveTarget(key))
   }
   const returnFocusToOpener = menuLayer.returnFocus
+  /** The rename field took focus from its menu, so closing it would leave
+   *  focus on `body`. Hand it back to the menu's opener once the field has
+   *  unmounted, unless the reader has already moved focus somewhere else. */
+  const returnFocusIfDropped = () => {
+    requestAnimationFrame(() => {
+      const active = document.activeElement
+      if (!active || active === document.body) returnFocusToOpener()
+    })
+  }
   /** Whether the Move picker is on screen, readable from a mutation callback
    *  that may fire after the reader has already dismissed it. */
   const moveDialogOpenRef = useRef(false)
@@ -510,6 +519,7 @@ export function useDrivePageFiles(account: string) {
       if (renamingRef.current === fromKey) {
         setRenaming(null)
         setRenameError('')
+        returnFocusIfDropped()
       }
       qc.invalidateQueries({ queryKey: appKey(['drive-list', account]) })
       // A rename from a search hit must re-run the search so the new name
@@ -545,10 +555,15 @@ export function useDrivePageFiles(account: string) {
     },
   })
 
+  // Opened from a row menu's Rename item: the inline field mounts after the
+  // menu's close, so the closing menu neither traps its autofocus nor hands
+  // focus back to the ⋯ trigger (`useMenuOpensDialog`).
   const openRename = (key: string) => {
-    setRenaming(key)
-    setRenameValue(key.split('/').pop() ?? key)
-    setRenameError('')
+    menuLayer.openLayer(() => {
+      setRenaming(key)
+      setRenameValue(key.split('/').pop() ?? key)
+      setRenameError('')
+    })
   }
 
   const closeRename = () => {
@@ -559,6 +574,7 @@ export function useDrivePageFiles(account: string) {
     if (renameMut.isPending && renameMut.variables?.fromKey === renaming) return
     setRenaming(null)
     setRenameError('')
+    returnFocusIfDropped()
     // Another row's rename may still be flying; resetting the observer would
     // drop its pending state while the request runs on.
     if (!renameMut.isPending) renameMut.reset()
@@ -589,6 +605,14 @@ export function useDrivePageFiles(account: string) {
   }, [debouncedQuery])
 
   const commitRename = (fromKey: string) => {
+    // The save buttons keep focus with `aria-disabled` rather than native
+    // `disabled` while a move is out, so they all stay clickable. Only one
+    // rename may fly at a time: the mutation is a single observer, so a second
+    // commit -- a re-press of the same row, OR a press on a DIFFERENT row the
+    // reader opened meanwhile -- would overwrite the in-flight row's variables
+    // and state. Native `disabled` used to block that for every button; the
+    // guard must now do it for any row while one is pending.
+    if (renameMut.isPending) return
     // The name is committed AS TYPED. Trimming it would silently move a file
     // whose name legitimately ends in a space (the key grammar allows one) the
     // moment its owner opens Rename and saves without touching anything — a

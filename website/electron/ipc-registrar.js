@@ -11,6 +11,7 @@ const {
   bindGlobalHotkey: bindStoredGlobalHotkey,
   unregisterGlobalHotkey,
   currentGlobalHotkey,
+  requestedGlobalHotkey,
   setGlobalHotkeyLogger,
 } = require("./global-hotkey");
 const { initAutoUpdate } = require("./auto-update");
@@ -20,6 +21,11 @@ const { detectWsl2 } = require("./wsl-detection");
 const { crashNoticeSummary } = require("./crash-collector");
 const { PREFIX: PANE_ASSETS_PREFIX, purgeableOrigin } = require("./pane-asset-journal");
 const { safeFilename } = require("./download-handler");
+const { saveThemeSplash } = require("./theme-splash");
+const { createRelayCrewOpener, isEndpointId } = require("./relay-crew-open");
+const { requestRelayCrewToken } = require("./relay-crew-client");
+const { openRelayCrewWindow, createTokenHolder } = require("./relay-crew-window");
+const { createRelayCrewRenewal } = require("./relay-crew-renewal");
 
 /**
  * Register the Electron shell's renderer bridges without taking ownership of
@@ -56,6 +62,10 @@ function createIpcRegistrar({
   // The update channel this build must follow, "" when Settings decides (an oss
   // build). See runtime/update/policy-channel.js.
   getRequiredChannel = requiredUpdateChannelFor(),
+  clipboardImageTimeoutMs = 1000,
+  // The relay Crew opener behind `relay-crew:open`. Built on first use from the
+  // injected Electron when absent; tests pass a fake.
+  relayCrewOpenerOverride = null,
 } = {}) {
   if (!electron) throw new Error("createIpcRegistrar: electron is required");
   if (!store) throw new Error("createIpcRegistrar: store is required");
@@ -74,8 +84,46 @@ function createIpcRegistrar({
     ipcMain,
     shell,
     webContents,
+    clipboard,
   } = electron;
   const log = typeof glog === "function" ? glog : (() => {});
+
+  const RESTORABLE_TEXT_FORMATS = new Set(["text/plain", "text/html", "text/rtf"]);
+  const RESTORABLE_IMAGE_FORMATS = new Set(["image/png", "image/jpeg", "image/tiff", "image/bmp"]);
+  // An image format counts only when readImage() can capture it as a raster.
+  const isRestorableFormat = (f, hasRasterImage) =>
+    RESTORABLE_TEXT_FORMATS.has(f) || (hasRasterImage && RESTORABLE_IMAGE_FORMATS.has(f));
+
+  function snapshotClipboard() {
+    const image = clipboard.readImage();
+    const saved = {
+      text: clipboard.readText(),
+      html: clipboard.readHTML(),
+      rtf: clipboard.readRTF(),
+    };
+    if (!image.isEmpty()) saved.image = image;
+    return saved;
+  }
+
+  function restoreClipboardIfEmpty(saved) {
+    if (clipboard.availableFormats().length > 0) return;
+    const data = {};
+    for (const [key, value] of Object.entries(saved)) if (value) data[key] = value;
+    if (Object.keys(data).length > 0) clipboard.write(data);
+  }
+
+  // `replaced` lists formats only a successful copy can remove, so an image
+  // counts once they are gone and the answer never reflects the prior contents.
+  async function clipboardHoldsImage(replaced = []) {
+    const deadline = Date.now() + clipboardImageTimeoutMs;
+    for (;;) {
+      const formats = clipboard.availableFormats();
+      if (formats.some((f) => f.startsWith("image/"))
+          && !replaced.some((f) => formats.includes(f))) return true;
+      if (Date.now() >= deadline) return false;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+  }
 
   let shellRegistered = false;
   let updaterRegistered = false;
@@ -125,6 +173,24 @@ function createIpcRegistrar({
       );
       throw new Error(`${channel} is restricted to the local dashboard`);
     }
+  };
+
+  let relayOpener = relayCrewOpenerOverride;
+  const relayCrewOpener = () => {
+    if (!relayOpener) {
+      const { BaseWindow, WebContentsView, session } = electron;
+      const windowDeps = { BaseWindow, WebContentsView, session, shell, log };
+      relayOpener = createRelayCrewOpener({
+        requestToken: (endpointId, signInMarker) => requestRelayCrewToken({
+          backendUrl, endpointId, signInMarker, getSecret: readInternalSecret, fetchFn,
+        }),
+        openWindow: (opts) => openRelayCrewWindow(opts, windowDeps),
+        createRenewal: createRelayCrewRenewal,
+        createTokenHolder,
+        log,
+      });
+    }
+    return relayOpener;
   };
 
   setGlobalHotkeyLogger(log);
@@ -196,15 +262,19 @@ function createIpcRegistrar({
       });
     }
 
-    // The shortcuts UI reports what is ACTUALLY bound. Registration may have
-    // fallen back to the default or degraded to no shortcut at all.
+    // The shortcuts UI reports what is ACTUALLY bound beside what was asked
+    // for. Registration may have fallen back to the default or degraded to no
+    // shortcut at all.
     ipcMain.handle("global-hotkey:get", () => ({
       accelerator: currentGlobalHotkey(),
+      requested: requestedGlobalHotkey(),
       default: DEFAULT_GLOBAL_HOTKEY,
     }));
 
     ipcMain.on("theme-accent-changed", (_event, hex) =>
       windows.chrome.setThemeAccent(hex));
+    ipcMain.on("theme-splash-changed", (_event, image) =>
+      saveThemeSplash(app.getPath("userData"), image));
     ipcMain.on("focus-mode-chrome", (event, visible) =>
       windows.chrome.focusMode(event.sender, visible));
     // Arm/disarm the off-window cursor poll that dismisses a focus-mode reveal.
@@ -214,6 +284,40 @@ function createIpcRegistrar({
       windows.chrome.watchFocusCursor(event.sender, watching));
     ipcMain.on("window-control", (event, action) =>
       windows.chrome.windowControl(event.sender, action, event.senderFrame));
+    // The chat bubble's Copy image for an image the page cannot fetch (another
+    // origin, or no async Clipboard API over plain HTTP). The renderer passes
+    // CSS pixels in its own main frame; copyImageAt takes zoomed ones.
+    // copyImageAt reports nothing, so success means an image reached the
+    // clipboard after it was cleared. A clipboard holding formats the snapshot
+    // cannot restore, such as copied files, is never cleared.
+    ipcMain.handle("image:copy-at", async (event, x, y) => {
+      const sender = event.sender;
+      if (!sender || event.senderFrame !== sender.mainFrame) return false;
+      if (!Number.isFinite(x) || !Number.isFinite(y) || x < 0 || y < 0) return false;
+      const zoom = typeof sender.getZoomFactor === "function" ? sender.getZoomFactor() : 1;
+      const hasRasterImage = !clipboard.readImage().isEmpty();
+      const unrestorable = clipboard.availableFormats()
+        .filter((f) => !isRestorableFormat(f, hasRasterImage));
+      if (unrestorable.length > 0) {
+        try {
+          sender.copyImageAt(Math.round(x * zoom), Math.round(y * zoom));
+        } catch {
+          return false;
+        }
+        return clipboardHoldsImage(unrestorable);
+      }
+      const saved = snapshotClipboard();
+      try {
+        clipboard.clear();
+        sender.copyImageAt(Math.round(x * zoom), Math.round(y * zoom));
+      } catch {
+        restoreClipboardIfEmpty(saved);
+        return false;
+      }
+      if (await clipboardHoldsImage()) return true;
+      restoreClipboardIfEmpty(saved);
+      return false;
+    });
     ipcMain.on("theme-mode-changed", (_event, pref) =>
       windows.chrome.setThemeMode(pref));
     ipcMain.on("titlebar-overlay-theme", (_event, mode) =>
@@ -336,12 +440,13 @@ function createIpcRegistrar({
       return detectWsl();
     });
 
-    // What the main window's close button does. Deliberately narrower than
-    // `assertLocalDashboard`, which would hide the row from a main window on a
-    // configured remote host and leave that user no way to change it. The
-    // sender must be the main window's top frame, still on its assigned
-    // dashboard origin. That trusts the main window's dashboard, local or
-    // remote, with a visible, reversible two-valued preference.
+    // What the main window's close button does, and whether the tray icon
+    // shows. Deliberately narrower than `assertLocalDashboard`, which would
+    // hide the rows from a main window on a configured remote host and leave
+    // that user no way to change them. The sender must be the main window's
+    // top frame, still on its assigned dashboard origin. That trusts the main
+    // window's dashboard, local or remote, with visible, reversible two-valued
+    // preferences.
     const assertMainWindowDashboard = (event, channel) => {
       const refuse = (why) => {
         log(`${channel} rejected: ${why}`);
@@ -373,6 +478,14 @@ function createIpcRegistrar({
     ipcMain.handle("close-action:set", async (event, value) => {
       assertMainWindowDashboard(event, "close-action:set");
       return windows.closeAction.set(value);
+    });
+    ipcMain.handle("tray-icon:get", async (event) => {
+      assertMainWindowDashboard(event, "tray-icon:get");
+      return windows.trayIcon.get();
+    });
+    ipcMain.handle("tray-icon:set", async (event, show) => {
+      assertMainWindowDashboard(event, "tray-icon:set");
+      return windows.trayIcon.set(show);
     });
 
     // Open a file the chat referenced in the user's own editor, by handing its
@@ -586,6 +699,23 @@ function createIpcRegistrar({
       });
     });
 
+    // Open a remote Crew reached through the Kiro relay, in its own window
+    // (relay-crew-open.js). The renderer sends only the endpoint ID; main asks
+    // this shell's own gateway for the access token with the local secret, so
+    // neither the token nor the Crew URL crosses the bridge. Gated like
+    // `external-terminal:open`, because a connection window pointed at a
+    // remote gateway shares this preload. Never rejects: the dashboard gets
+    // `{ ok }` or `{ ok: false, error }`.
+    ipcMain.handle("relay-crew:open", async (event, endpointId) => {
+      if (!isEndpointId(endpointId)) return { ok: false, error: "INVALID_ENDPOINT" };
+      try {
+        await assertLocalDashboard(event, "relay-crew:open");
+      } catch {
+        return { ok: false, error: "UNAVAILABLE" };
+      }
+      return relayCrewOpener().open(endpointId);
+    });
+
     ipcMain.handle("zoom:get", (event) =>
       windows.chrome.getZoom(event.sender));
     ipcMain.handle("zoom:set", (event, factor) =>
@@ -594,7 +724,7 @@ function createIpcRegistrar({
       windows.chrome.stepZoom(event.sender, direction));
 
     // The window façade resolves every request from event.sender and keeps the
-    // native panel/control-plane internals private to that owning window.
+    // native panel internals private to that owning window.
     ipcMain.handle("browser:open", (event, panelId, url) =>
       windows.browser.open(event.sender, panelId, url));
     ipcMain.handle("browser:navigate", (event, panelId, url) =>
@@ -609,20 +739,7 @@ function createIpcRegistrar({
       windows.browser.close(event.sender, panelId));
     ipcMain.handle("browser:get-state", (event, panelId) =>
       windows.browser.getState(event.sender, panelId));
-    ipcMain.handle("browser:track-session", (event, panelId, tracked) =>
-      windows.browser.trackSession(event.sender, panelId, tracked));
-    ipcMain.handle("browser:set-agent-act", (event, panelId, enabled) =>
-      windows.browser.setAgentAct(event.sender, panelId, enabled));
-    ipcMain.handle("browser:set-control-owner", (event, panelId, requested) =>
-      windows.browser.setControlOwner(event.sender, panelId, requested));
-    ipcMain.handle("browser:get-control", (event, panelId) =>
-      windows.browser.getControl(event.sender, panelId));
-    // Deliberately remains a closed verb dispatcher inside window-lifecycle;
-    // this bridge never exposes a raw CDP method to the renderer.
-    ipcMain.handle("browser:control", (event, panelId, op, args) =>
-      windows.browser.control(event.sender, panelId, op, args));
-    // Element annotation on the native page (human-initiated; closed op set,
-    // not a control op -- it takes no agent ownership of the view).
+    // Element annotation on the native page (human-initiated; closed op set).
     ipcMain.handle("browser:annotate", (event, panelId, op, args) =>
       windows.browser.annotate(event.sender, panelId, op, args));
 
@@ -836,8 +953,9 @@ function createIpcRegistrar({
               // On other platforms the app exits when the last window closes,
               // so clearing is safe. Only clear when another window is open
               // or we're not on macOS.
-              const { BrowserWindow } = electron;
-              const anyOpen = BrowserWindow && BrowserWindow.getAllWindows().length > 0;
+              // Dashboard windows are BaseWindows; BrowserWindow.getAllWindows() lists none of them.
+              const { BaseWindow } = electron;
+              const anyOpen = BaseWindow && BaseWindow.getAllWindows().length > 0;
               if (anyOpen || process.platform !== "darwin") {
                 const wasGoverned = policyGoverned;
                 policyGoverned = governanceSenders.size > 0;

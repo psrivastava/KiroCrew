@@ -73,12 +73,13 @@ name: PR Policy
 # a hardcoded `bash`, a `/tmp` literal, an os-specific signal that only fails on a
 # real user's Windows box, on code paths tests do not reach. Deterministic,
 # ADDED-LINES ONLY, no model; every rule is a pattern the repo has been burned by.
-# Scope: `src/kiro_crew/**/*.py`, excluding the vendored tree (not ours to fix),
-# tests (they may legitimately assert POSIX behaviour behind a skip marker; ~120
-# test modules ship INSIDE the package under `src/kiro_crew/apps/builtins/*/tests/`,
-# so the exclusion is a pathspec, not assumed from `test/`), and `platform_compat.py`
-# itself, whose whole job is to name the os-specific primitives everything else
-# routes through. Its siblings `platform_owner_compat.py` and `platform_lock_compat.py`
+# Scope: every `.py` under `src/kiro_crew/`, top-level modules included, excluding
+# the vendored tree (not ours to fix), tests (they may legitimately assert POSIX
+# behaviour behind a skip marker; ~120 test modules ship INSIDE the package under
+# `src/kiro_crew/apps/builtins/*/tests/`, so the exclusion is a pathspec, not
+# assumed from `test/`), and `platform_compat.py` with its `platform_compat_*.py`
+# owners, whose whole job is to name the os-specific primitives everything else
+# routes through. The siblings `platform_owner_compat.py` and `platform_lock_compat.py`
 # ARE scanned, so a line matching a rule there needs the `posix-only-approved` label.
 #
 # -- Screenshot Evidence (BLOCKING) -------------------------------------------
@@ -119,7 +120,7 @@ concurrency:
 jobs:
   pr-policy:
     name: PR Policy
-    runs-on: ${{ github.repository == 'kirodotdev/KiroCrew' && contains(fromJSON(vars.CODEBUILD_ACTOR_IDS || '[]'), github.actor_id) && (github.event_name == 'push' || (github.event_name == 'pull_request' && (github.event.action == 'opened' || github.event.action == 'synchronize') && github.event.pull_request.head.repo.full_name == github.repository)) && format('codebuild-kirocrew-gha-linux-{0}-{1}', github.run_id, github.run_attempt) || 'ubuntu-latest' }}
+    runs-on: ${{ github.repository == 'kirodotdev/KiroCrew' && contains(fromJSON(vars.CODEBUILD_ACTOR_IDS || '[]'), github.actor_id) && (github.event_name == 'push' || (github.event_name == 'pull_request' && (github.event.action == 'opened' || github.event.action == 'synchronize') && github.event.pull_request.head.repo.full_name == github.repository)) && format('codebuild-kirocrew-gha-linux-{0}-{1}', github.run_id, github.run_attempt) || github.repository == 'kirodotdev/KiroCrew' && 'kirocrew-linux-4-core' || 'ubuntu-latest' }}
     # Two depth-2 checkouts, one `GET pulls/<n>` and a few seconds of grep each.
     timeout-minutes: 5
     steps:
@@ -270,8 +271,12 @@ jobs:
           # ADDED lines only ('^+', excluding the '+++' file header). A
           # pre-existing violation elsewhere in a touched file is not this PR's
           # problem and must not block it.
+          #
+          # The include carries `:(glob)` magic: under git's default magic `**/`
+          # needs at least one directory, so no module directly under
+          # src/kiro_crew/ would match.
           added="$(git diff --unified=0 HEAD^1 HEAD -- \
-            'src/kiro_crew/**/*.py' \
+            ':(glob)src/kiro_crew/**/*.py' \
             ':(exclude)src/kiro_crew/_vendor/**' \
             ':(exclude)src/kiro_crew/platform_compat.py' \
             ':(exclude)src/kiro_crew/platform_compat_*.py' \
@@ -368,11 +373,15 @@ jobs:
           # required check reporting green having examined nothing. That
           # polarity is worse than a false red, so an uncomputable diff fails
           # loudly and is re-runnable instead.
+          #
+          # The stylesheet include carries `:(glob)` magic: under git's default
+          # magic `**/` needs at least one directory, so a stylesheet directly
+          # under website/src/ (index.css, tailwind-theme.css) would not match.
           if ! changed="$(git diff --name-only HEAD^1 HEAD -- \
             'website/src/components/**' \
             'website/src/pages/**' \
             'website/src/apps/**' \
-            'website/src/**/*.css' \
+            ':(glob)website/src/**/*.css' \
             'website/index.html' \
             ':(exclude)website/src/**/*.test.ts' \
             ':(exclude)website/src/**/*.test.tsx' \

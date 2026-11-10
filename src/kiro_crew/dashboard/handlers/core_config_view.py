@@ -113,6 +113,17 @@ def _mask_agent_free_text(value: object) -> object:
     return value
 
 
+def _mask_strings(value: object) -> object:
+    """*value* with every non-empty string inside it masked; structure kept."""
+    if isinstance(value, dict):
+        return {key: _mask_strings(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_mask_strings(item) for item in value]
+    if isinstance(value, str) and value:
+        return _SENSITIVE_MASK
+    return value
+
+
 def _masked_config_dict(cfg: KiroCrewConfig) -> dict:
     """Return ``cfg.to_dict()`` with sensitive string values masked.
 
@@ -181,9 +192,16 @@ def _masked_config_dict(cfg: KiroCrewConfig) -> dict:
                     sub = entries
                 if not isinstance(sub, dict):
                     continue
+                sensitive = sub.get("x-meta", {}).get("sensitive", False)
                 if isinstance(val, (dict, list)):
-                    _walk(val, sub)
-                elif isinstance(val, str) and val and sub.get("x-meta", {}).get("sensitive", False):
+                    # A container marked sensitive (``telemetry.otlp_endpoints``)
+                    # masks every string under it: its items have no schema of
+                    # their own to mark which value is the secret.
+                    if sensitive:
+                        node[key] = _mask_strings(val)
+                    else:
+                        _walk(val, sub)
+                elif isinstance(val, str) and val and sensitive:
                     node[key] = _SENSITIVE_MASK
         elif isinstance(node, list):
             items = schema.get("items")
@@ -428,6 +446,9 @@ async def api_kirocrew_config(request: web.Request) -> web.Response:
             )
             _result["applied"] = applied
             _result["restart_required"] = restart_required
+            # This raw write bypasses save(), which is what drops retired keys;
+            # do it here so the load-time "dropped on the next save" holds.
+            _resolution.drop_retired_section_keys(data)
             return data
 
         try:
@@ -453,7 +474,7 @@ async def api_kirocrew_config(request: web.Request) -> web.Response:
                     # or keeps while changing that mapping). The message names
                     # env-var keys only, never the value, and is the same
                     # instruction the CLI prints; nothing reached disk.
-                    return _deny(str(exc), 400, code="config_write_refused")
+                    return _deny(str(exc), 400, code=exc.code)
 
                 if _validation_error:
                     msg, status = _validation_error[0]
@@ -483,4 +504,31 @@ async def api_kirocrew_config(request: web.Request) -> web.Response:
         return web.json_response({"ok": True, "restart_required": restart_required})
 
     cfg = KiroCrewConfig.load()
-    return web.json_response(_masked_config_dict(cfg))
+    return web.json_response(_config_body(cfg))
+
+
+def _config_body(cfg: KiroCrewConfig) -> dict:
+    """The ``/api/config/kirocrew`` body: GET's, and every PATCH reply's.
+
+    Both must carry the same edition view, because the dashboard caches a PATCH
+    reply in place of the GET one. An LTS build (RFC D12) reports every Feature
+    Preview off, and lists in ``locked_controls`` the one browser-only control the
+    dashboard drops, ``debug_tools``. The preview lock itself reaches the dashboard
+    as ``lockedByPolicy`` on each preview path in ``GET /api/config/schema``. On
+    ``oss`` the field is absent and the body is the masked config as before.
+    """
+    from kiro_crew.edition_locks import feature_previews, locked_controls
+
+    body = _masked_config_dict(cfg)
+    dashboard = body.get("dashboard")
+    if isinstance(dashboard, dict) and "feature_previews" in dashboard:
+        # Unchanged on oss; {} in LTS, whatever the Debug tools lock does.
+        dashboard["feature_previews"] = feature_previews(dashboard["feature_previews"])
+    locked = [c for c in locked_controls() if c in _DASHBOARD_LOCKS]
+    if locked:
+        body["locked_controls"] = locked
+    return body
+
+
+#: The locked controls the dashboard enforces in the browser and has no config path for.
+_DASHBOARD_LOCKS = ("debug_tools",)

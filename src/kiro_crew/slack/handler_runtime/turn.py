@@ -30,6 +30,7 @@ if TYPE_CHECKING:
         _STATUS_WORKING,
         _TIMEOUT_REPLY,
         _UNFINISHED_STOP_REASONS,
+        _WORKING,
         CONTEXT_EVENT_COMPACTION,
         EVENT_COMPLETE,
         EVENT_PERMISSION_REQUEST,
@@ -42,6 +43,7 @@ if TYPE_CHECKING:
         STOP_REASON_CANCELLED,
         STOP_REASON_COMPACTION_FAILED,
         STOP_REASON_END_TURN,
+        TURN_BUILD_ADMISSION_TIMEOUT_SECS,
         AcpError,
         AcpProcessDied,
         AcpPromptBusy,
@@ -50,6 +52,7 @@ if TYPE_CHECKING:
         ConversationLog,
         CronService,
         DashboardState,
+        EmbedAdmissionTimeout,
         HistoryConsolidator,
         KiroCrewConfig,
         LLMProvider,
@@ -84,6 +87,7 @@ if TYPE_CHECKING:
         build_working_blocks,
         canonical_key,
         consume_reinjection,
+        context_template,
         credential_give_up_text,
         enter_turn,
         exit_turn,
@@ -94,6 +98,7 @@ if TYPE_CHECKING:
         is_thread_temporary,
         logger,
         note_turn,
+        note_turn_landed,
         publish_turn_identity,
         rearm_reinjection,
         record_interaction_event,
@@ -105,6 +110,8 @@ if TYPE_CHECKING:
         runtime_death,
         session_stop_generation,
         session_store_for_turn,
+        settle_turn,
+        slack_script_hooks,
         stop_reason_landed,
         turn_ceiling,
         window_for_provider_client,
@@ -144,6 +151,8 @@ class _SlackTurn:
     spool_attachments: "int"
     _compaction_replay: "_CompactionReplay | None"
     start_priority: "StartPriority"
+    user_meta: "dict[str, Any] | None"
+    interpret_commands: "bool"
 
     # Bound by ``handle_message`` before the first phase.
     _t0: "float"
@@ -160,11 +169,15 @@ class _SlackTurn:
     answer: "_AnswerStream"
     client: "LLMProvider | None"
     _had_error: "bool"
+    # The busy memory pool refused the build, so no prompt went out and the turn
+    # leaves no transcript row (the retry reads the conversation as it was).
+    _unsent: "bool"
     _replayed: "bool"
     routed_link_key: "str | None"
     _stop_reason: "str"
     task: "Task"
     _turn_completed_ok: "bool"
+    _hook_turn: "Any"
     _working_ts: "str | None"
     status_ctrl: "StatusReactionController"
     # Set by ``_deliver_answer`` once it has taken down the working indicators, so
@@ -209,6 +222,8 @@ class _SlackTurn:
         spool_attachments: "int",
         _compaction_replay: "_CompactionReplay | None",
         start_priority: "StartPriority",
+        user_meta: "dict[str, Any] | None" = None,
+        interpret_commands: "bool",
         _t0: "float",
         reply_ts: "str",
         session_key: "str",
@@ -240,7 +255,11 @@ class _SlackTurn:
         self.spool_text = spool_text
         self.spool_attachments = spool_attachments
         self._compaction_replay = _compaction_replay
+        # Set by ``_run_turn``; none until a turn has run its hooks.
+        self._hook_turn = None
         self.start_priority = start_priority
+        self.user_meta = user_meta
+        self.interpret_commands = interpret_commands
         self._turn_scope = None
         self._t0 = _t0
         self.reply_ts = reply_ts
@@ -260,6 +279,22 @@ class _SlackTurn:
                     f"cannot access local variable {name!r} where it is not associated with a value"
                 )
             raise AttributeError(name)
+
+    async def fire_stop_hooks(self) -> None:
+        """The Hooks page's ``Stop`` for a completed turn, once its answer is out.
+
+        ``handle_message`` calls it after ``_deliver_answer``, so a slow hook holds
+        neither the reply nor the session permit (``slack/script_hooks.py``).
+
+        The answer is redacted whole (exfiltration URLs and credentials, the two
+        passes the dashboard's Stop hook applies) before the hook sees it. The
+        stream redacts per chunk, so a credential split across two chunks is
+        still intact in ``answer.accumulated``.
+        """
+        if self._hook_turn is not None and self._turn_completed_ok:
+            await slack_script_hooks.stop_hooks_after(
+                self._hook_turn, self._stop_reason, redact(self.answer.accumulated)
+            )
 
     # Release the retained permit once delivery and accounting have run. Called
     # explicitly right after accounting so a queued turn can proceed while the
@@ -390,6 +425,7 @@ async def _run_turn(turn: _SlackTurn) -> bool:
         enabled=KiroCrewConfig.load().slack.reactions_enabled,
     )
     _had_error = False
+    _unsent = False
     _stop_reason = ""
     # Whether the stream delivered an EVENT_COMPLETE; ``_stop_reason`` alone
     # cannot say (it is "" both before any completion and for one that carries
@@ -424,8 +460,8 @@ async def _run_turn(turn: _SlackTurn) -> bool:
         # Dashboard" control exists for the whole turn rather than appearing
         # only once the turn completes — on a long turn the footer arrives far
         # too late to be the first chance to link. A click imports and links the
-        # thread via the existing command path; the next turn then mirrors
-        # through the normal pre-committed-link mirror in ``_deliver_answer``.
+        # thread via the existing command path; ``_deliver_answer`` then gives the
+        # slot this turn's final answer, and the next turn mirrors normally.
         _early_link = (
             not sessions.get_session_for_thread(reply_ts) and get_dashboard_state() is not None
         )
@@ -434,7 +470,7 @@ async def _run_turn(turn: _SlackTurn) -> bool:
             _working_ts = await slack.post_blocks(
                 channel,
                 build_working_blocks(session_key, include_dashboard_link=_early_link),
-                "Working…",
+                _WORKING,
                 reply_ts,
             )
         except Exception:
@@ -501,7 +537,12 @@ async def _run_turn(turn: _SlackTurn) -> bool:
     # whether the backend reported that it compacted the session.
     _needs_reinjection = False
     _turn_landed = False
+    # Whether this turn took the session's soft-cancel flag, to give it back if
+    # the turn's prompt never goes out.
+    _took_cancel_flag = False
     _turn_compacted = False
+    # The settle call for the tab notices THIS turn's build read, settled in the finally.
+    _tab_notices: list[Any] = []
     # This turn's thread-replies read; its watermark moves in the finally.
     _thread_replies: ThreadReplies | None = None
 
@@ -588,6 +629,8 @@ async def _run_turn(turn: _SlackTurn) -> bool:
                 spool_attachments=turn.spool_attachments,
                 _compaction_replay=replay,
                 start_priority=start_priority,
+                user_meta=turn.user_meta,
+                interpret_commands=turn.interpret_commands,
             )
         finally:
             # The replay has settled and released its permit (or never got
@@ -642,6 +685,9 @@ async def _run_turn(turn: _SlackTurn) -> bool:
             if channel_agent and _agent == channel_agent and is_slack_born(session_key)
             else None
         )
+        # The context builder takes the TEMPLATE the turn runs, never a record's
+        # name, including on a dashboard-linked session (``context_template``).
+        _context_agent = await asyncio.to_thread(context_template, _agent, _channel_crew)
         _alloc: dict[str, Any] = (
             _channel_crew.allocation_kwargs() if _channel_crew else {"agent": _agent}
         )
@@ -661,6 +707,19 @@ async def _run_turn(turn: _SlackTurn) -> bool:
             # issued anywhere in between -- on any surface -- keeps the
             # abandoned message dropped.
             _stop_gen_at_entry = session_stop_generation(sessions, session_key)
+        # The Hooks page's hooks, once per inbound message: a replay carries the
+        # first attempt's turn, with the context its UserPromptSubmit recorded.
+        _hook_turn = (
+            _compaction_replay.hook_turn
+            if _compaction_replay is not None
+            else slack_script_hooks.native_hook_turn(
+                channel,
+                user_id,
+                session_key,
+                text,
+                lambda: session_stop_generation(sessions, session_key) != _stop_gen_at_entry,
+            )
+        )
         # Expire AGAIN now the turn is serialized — see the same call in
         # transport_dispatch. The pass in ``_dispatch_before_turn`` runs before
         # `get_or_create` waits its turn, so two messages arriving together both
@@ -738,6 +797,7 @@ async def _run_turn(turn: _SlackTurn) -> bool:
             and context_builder.conversation_log
         ):
             _session.prev_turn_cancelled = False
+            _took_cancel_flag = True
             _preamble = await asyncio.to_thread(
                 build_cancelled_turn_preamble, context_builder.conversation_log, session_key
             )
@@ -799,7 +859,7 @@ async def _run_turn(turn: _SlackTurn) -> bool:
                 session_key,
                 channel_id=channel,
                 thread_ts=thread_ts or msg_ts,
-                agent=_agent,
+                agent=_context_agent,
                 memory_store=_memory_store,
                 resumed=resumed,
                 needs_reinjection=_needs_reinjection,
@@ -814,6 +874,8 @@ async def _run_turn(turn: _SlackTurn) -> bool:
                 runtime_source="slack",
                 user_text_range=_user_text_range,
                 context_provider=client,
+                tab_notices=_tab_notices,
+                _admission_timeout=TURN_BUILD_ADMISSION_TIMEOUT_SECS,
             )
         else:
             full_message = text
@@ -833,6 +895,18 @@ async def _run_turn(turn: _SlackTurn) -> bool:
             logger.info("Message %s stopped before its compaction replay — skipping", msg_ts)
             await turn.clear_working_indicators()
             return False
+        if _hook_turn is not None:
+            # The sender's own text, without the cancelled-turn preamble.
+            full_message = await slack_script_hooks.prompt_with_hooks(
+                _hook_turn, _user_text, full_message
+            )
+            # A Stop while the hook ran has no provider turn to cancel yet.
+            if (
+                _hook_turn.cancelled is not None and _hook_turn.cancelled()
+            ) or sessions.is_cancelled(session_key, msg_ts):
+                logger.info("Message %s stopped during its UserPromptSubmit hook", msg_ts)
+                await turn.clear_working_indicators()
+                return False
 
         # The permission ladder reads the routed conversation, its agent and this
         # turn's presentation off the turn (``_answer_permission_request``); none of
@@ -966,6 +1040,8 @@ async def _run_turn(turn: _SlackTurn) -> bool:
             _turn_landed = stop_reason_landed(
                 (_stop_reason or "") if _completion_observed else None
             )
+            if _turn_landed:
+                note_turn_landed(sessions, session_key)
 
         if _stop_reason == STOP_REASON_COMPACTION_FAILED:
             # The completion was synthetic — the backend abandoned the turn
@@ -985,6 +1061,9 @@ async def _run_turn(turn: _SlackTurn) -> bool:
             # ``finally`` around the nested call), or right below when no
             # replay is attempted.
             sessions.open_replay_gap(session_key)
+            # The abandoned turn did not land: end its attempt now, so what it
+            # received inline is revoked and a replay runs as a new attempt.
+            settle_turn(sessions, session_key)
             _reset_ok = True
             try:
                 await sessions.reset(session_key)
@@ -1033,6 +1112,7 @@ async def _run_turn(turn: _SlackTurn) -> bool:
                         session_reloaded=(
                             _compaction_replay is not None and _compaction_replay.session_reloaded
                         ),
+                        hook_turn=_hook_turn,
                     ),
                 )
             else:
@@ -1165,6 +1245,9 @@ async def _run_turn(turn: _SlackTurn) -> bool:
             # session/loads the SAME id. The gap is opened first for the same
             # reason as the compaction replay above.
             sessions.open_replay_gap(session_key)
+            # The abandoned turn did not land: end its attempt now, so what it
+            # received inline is revoked and a replay runs as a new attempt.
+            settle_turn(sessions, session_key)
             _reset_ok = True
             try:
                 await sessions.reset(session_key)
@@ -1197,6 +1280,7 @@ async def _run_turn(turn: _SlackTurn) -> bool:
                     attempt=_compaction_replay.attempt if _compaction_replay is not None else 0,
                     stop_gen_at_entry=_stop_gen_at_entry,
                     session_reloaded=True,
+                    hook_turn=_hook_turn,
                 ),
             )
         else:
@@ -1220,8 +1304,22 @@ async def _run_turn(turn: _SlackTurn) -> bool:
             task.fail(str(e))
             await sessions.record_failure(session_key)
             Stats().inc_message_failed()
-    except UnknownMemoryStore as exc:
+    except (UnknownMemoryStore, EmbedAdmissionTimeout) as exc:
         _had_error = True
+        if _acquired and isinstance(exc, EmbedAdmissionTimeout):
+            # Probed: the session manager's own hand-back (`turn_bracket.rearm_first_turn`).
+            _rearm = getattr(sessions, "rearm_first_turn", None)
+            if is_new and callable(_rearm):
+                _rearm(session_key, client, resumed=resumed)
+            # Nothing reached the model, so the stopped turn is still the one to
+            # recall, on the session this turn took the flag from.
+            if (
+                _took_cancel_flag
+                and _session is not None
+                and getattr(sessions, "_sessions", {}).get(session_key) is _session
+            ):
+                _session.prev_turn_cancelled = True
+            _unsent = True
         answer.accumulated = redact_local_paths(redact(str(exc)))[0][:1000]
         task.fail("memory_unavailable")
         Stats().inc_message_failed()
@@ -1248,7 +1346,9 @@ async def _run_turn(turn: _SlackTurn) -> bool:
         # read; a cancelled or failed turn discarded the prompt that carried them.
         if _turn_landed and _thread_replies is not None and _thread_replies.read_ok:
             note_turn(session_key, thread_ts or msg_ts, msg_ts)
-        rollback_skill_bodies(context_builder, session_key, landed=_turn_landed)
+        rollback_skill_bodies(
+            context_builder, session_key, landed=_turn_landed, tab_notices=_tab_notices
+        )
         # The permit is held past this ``finally`` when the turn reached a clean
         # model completion, because success/failure accounting is booked only
         # after ``_deliver_answer``'s answer-carrying delivery and mutates per-session breaker
@@ -1285,6 +1385,7 @@ async def _run_turn(turn: _SlackTurn) -> bool:
     turn.answer = answer
     turn.client = client
     turn._had_error = _had_error
+    turn._unsent = _unsent
     turn.routed_link_key = linked_session_key
     turn._replayed = _replayed
     turn.session_key = session_key
@@ -1292,4 +1393,7 @@ async def _run_turn(turn: _SlackTurn) -> bool:
     turn.text = text
     turn._turn_completed_ok = _turn_completed_ok
     turn._working_ts = _working_ts
+    # The Stop hook runs once the answer is out (``handle_message``), so a slow hook
+    # never holds the reply or the session permit. Only a turn that completed.
+    turn._hook_turn = _hook_turn if _completion_observed else None
     return True

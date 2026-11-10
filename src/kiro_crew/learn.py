@@ -163,6 +163,29 @@ class Lesson:
 # ── Storage ──
 
 
+def _lesson_lines(path: Path) -> list[str | None]:
+    """The lines of *path*, with ``None`` for a line that does not decode.
+
+    Read exactly as before (the platform's default text decoding), so a file that
+    loads today reads the same. Only when that whole-file decode fails is the file
+    split into lines and each decoded on its own, so one bad byte costs its own
+    line instead of every lesson in the file.
+    """
+    try:
+        return list(path.read_text().splitlines())
+    except UnicodeDecodeError:
+        import locale  # in-function: only reached for a damaged file
+
+        encoding = locale.getpreferredencoding(False)
+    lines: list[str | None] = []
+    for raw in path.read_bytes().splitlines():
+        try:
+            lines.append(raw.decode(encoding))
+        except UnicodeDecodeError:
+            lines.append(None)
+    return lines
+
+
 def _written_by_of(raw: object) -> dict[str, str] | None:
     """A stored ``written_by`` read back; ``None`` when absent or damaged."""
     from kiro_crew.shared_crew.memory_changes import stamp_of
@@ -646,7 +669,14 @@ class LessonStore:
         Holds the lock. An unlocked read-modify-write here would lose a concurrent
         ``save`` outright -- and without that lock the atomicity
         :meth:`save_or_enrich` claims would not actually hold.
+
+        A blank (empty or whitespace-only) *rule_substring* is refused with
+        :class:`ValueError` on the plain substring path: every rule contains the
+        empty string, so it would remove every lesson. *exact* and *keep_one*
+        cannot remove every lesson and stay open.
         """
+        if not exact and not keep_one and not rule_substring.strip():
+            raise ValueError("rule substring is blank: it would match every lesson")
         if repo_scope is not None and scope_selector_is_inadmissible(repo_scope):
             raise ValueError(f"repo_scope does not name a usable scope: {repo_scope!r}")
         with self._lock:
@@ -728,7 +758,11 @@ class LessonStore:
         # Non-blank lines that do not read as a lesson, with their line numbers.
         # Each one costs only itself; the warning below counts them.
         unreadable: list[tuple[int, str]] = []
-        for lineno, line in enumerate(self._path.read_text().splitlines(), start=1):
+        for lineno, line in enumerate(_lesson_lines(self._path), start=1):
+            if line is None:
+                # A line that does not decode costs only itself, like any bad row.
+                unreadable.append((lineno, ""))
+                continue
             line = line.strip()
             if not line:
                 continue
@@ -771,7 +805,9 @@ class LessonStore:
                         written_by=_written_by_of(data.get("written_by")),
                     )
                 )
-            except (json.JSONDecodeError, KeyError):
+            except (json.JSONDecodeError, KeyError, RecursionError):
+                # RecursionError: a line nested past the interpreter's limit is
+                # not a JSONDecodeError, and would otherwise fail the whole read.
                 unreadable.append((lineno, line))
                 continue
         if unreadable:

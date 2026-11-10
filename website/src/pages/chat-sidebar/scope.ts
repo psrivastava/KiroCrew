@@ -29,6 +29,7 @@ import type { useSidebarModels } from './models'
 import type { usePinnedKeyboardReorder, usePinnedSessionOrder } from './pinnedOrder'
 import type { useFolderRename, useSessionAutoTitle, useSessionRename } from './rename'
 import type { useSidebarResize } from './resize'
+import type { useResumeAll } from './resumeAll'
 import type { useSidebarReveal } from './reveal'
 import type { SidebarRows } from './rows'
 import type { useSearchMatches } from './search'
@@ -178,6 +179,8 @@ export interface SidebarScope {
   setFolderOfflineNotice: SetState<string>
   newChatError: string
   setNewChatError: SetState<string>
+  prStatusRefreshError: string
+  setPrStatusRefreshError: SetState<string>
   remoteCrewErrorId: string
   remoteCrewError: string
   setRemoteCrewError: SetState<string>
@@ -208,11 +211,14 @@ export interface SidebarScope {
   setCleanupOpen: SetState<boolean>
   folderCleanupOpen: boolean
   setFolderCleanupOpen: SetState<boolean>
+  /** Opens the folder cleanup on one folder's tree (folder ⋮ → "Close sessions and delete…"). */
+  setFolderCleanupRoot: SetState<ChatFolder | null>
   setManageTagsOpen: SetState<boolean>
   broadcastOpen: boolean
   setBroadcastOpen: SetState<boolean>
-  filterSortOpen: boolean
-  setFilterSortOpen: SetState<boolean>
+  /** `'folders'`: opened by the board notice's Show, for the menu's folder list. */
+  filterSortOpen: boolean | 'folders'
+  setFilterSortOpen: SetState<boolean | 'folders'>
   folders: ChatFolder[]
   foldersFailed: boolean
   foldersError: Error | null
@@ -265,6 +271,8 @@ export interface SidebarScope {
 
   // From `useSessionSources`
   historySearchResults: ReturnType<typeof useSessionSources>['historySearchResults']
+  historySearchFailed: ReturnType<typeof useSessionSources>['historySearchFailed']
+  historySearchScan: ReturnType<typeof useSessionSources>['historySearchScan']
   instanceSessions: ReturnType<typeof useSessionSources>['instanceSessions']
   remoteSessionsError: ReturnType<typeof useSessionSources>['remoteSessionsError']
   selectInstance: ReturnType<typeof useSessionSources>['selectInstance']
@@ -335,6 +343,9 @@ export interface SidebarScope {
   // From `useBulkModelSwitch`
   bulkModel: ReturnType<typeof useBulkModelSwitch>
 
+  // From `useResumeAll`
+  resumeAll: ReturnType<typeof useResumeAll>
+
   // From `usePinnedSessionOrder`
   pinned: ReturnType<typeof usePinnedSessionOrder>['pinned']
   pinnedOrderError: ReturnType<typeof usePinnedSessionOrder>['pinnedOrderError']
@@ -389,6 +400,7 @@ export interface SidebarScope {
   refetchColumns: ReturnType<typeof useBoardColumns>['refetchColumns']
   tagColumnsEnabled: ReturnType<typeof useBoardColumns>['tagColumnsEnabled']
   hideEmptyFolderBody: ReturnType<typeof useBoardColumns>['hideEmptyFolderBody']
+  countSubfolderContents: ReturnType<typeof useBoardColumns>['countSubfolderContents']
   orderedColumns: ReturnType<typeof useBoardColumns>['orderedColumns']
 
   // From `useSidebarResize`
@@ -422,6 +434,8 @@ export interface SidebarScope {
   slotFolders: ReturnType<typeof useFolderVisibility>['slotFolders']
   foldersWithActiveSubtree: ReturnType<typeof useFolderVisibility>['foldersWithActiveSubtree']
   isFolderHidden: ReturnType<typeof useFolderVisibility>['isFolderHidden']
+  pinnedFolderSubtree: ReturnType<typeof useFolderVisibility>['pinnedFolderSubtree']
+  pinnedFolderAncestors: ReturnType<typeof useFolderVisibility>['pinnedFolderAncestors']
 
   // From `useSearchMatches`
   searchRanked: ReturnType<typeof useSearchMatches>['searchRanked']
@@ -480,6 +494,7 @@ export interface SidebarScope {
   createFolderMutation: ReturnType<typeof useFolderMutations>['createFolderMutation']
   updateFolderMutation: ReturnType<typeof useFolderMutations>['updateFolderMutation']
   toggleCollapse: ReturnType<typeof useFolderMutations>['toggleCollapse']
+  collapseAllFolders: ReturnType<typeof useFolderMutations>['collapseAllFolders']
 
   // From `useHoldPinnedHeaderOnCollapse`
   armHold: ReturnType<typeof useHoldPinnedHeaderOnCollapse>['armHold']

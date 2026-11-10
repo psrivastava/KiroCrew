@@ -2,7 +2,9 @@
 
 These two servers' schemas live in several owners, so their registries live here;
 a server whose schemas share one owner keeps its registry beside them. A tool absent
-from its server's registry has its arguments passed through raw.
+from its server's registry has its arguments passed through raw, except a tool an
+installed app declares, which ``mcp_core._validate_args`` checks against its declared
+schema (``mcp_tools.app_tools.tool_schema``).
 
 Callers import these names from :mod:`kiro_crew.validation`, which serves them; this
 module never imports that facade.
@@ -10,17 +12,6 @@ module never imports that facade.
 
 from __future__ import annotations
 
-from kiro_crew.validation_parts.app_schemas import (
-    DESIGN_TWEAK_UPDATE_THREAD_SCHEMA,
-    ISSUE_RADAR_CREW_READ_SCHEMA,
-    ISSUE_RADAR_CREW_RECORD_SCHEMA,
-    ISSUE_RADAR_RECORD_INVESTIGATION_SCHEMA,
-    OPS_MISSION_CONTROL_API_SCHEMA,
-    POD_DOWN_SCHEMA,
-    POD_LS_SCHEMA,
-    POD_STATUS_SCHEMA,
-    POD_UP_SCHEMA,
-)
 from kiro_crew.validation_parts.artifact_schemas import (
     ARTIFACT_DELETE_COMMENT_SCHEMA,
     ARTIFACT_DELETE_SCHEMA,
@@ -42,7 +33,6 @@ from kiro_crew.validation_parts.artifact_schemas import (
     ARTIFACT_VERSIONS_SCHEMA,
     CHAT_FOLDER_CREATE_SCHEMA,
     CHAT_FOLDER_DELETE_SCHEMA,
-    CHAT_FOLDER_FILE_SELF_SCHEMA,
     CHAT_FOLDER_MOVE_SCHEMA,
     CHAT_FOLDER_MOVE_SESSION_SCHEMA,
     CHAT_FOLDER_TREE_SCHEMA,
@@ -66,6 +56,7 @@ from kiro_crew.validation_parts.core_agent_schemas import (
     LEARN_ADD_SCHEMA,
     LEARN_LIST_SCHEMA,
     LEARN_REMOVE_SCHEMA,
+    LEARN_UPDATE_SCHEMA,
     MONITOR_INSPECT_SCHEMA,
     MONITOR_START_SCHEMA,
     MONITOR_STOP_SCHEMA,
@@ -84,6 +75,7 @@ from kiro_crew.validation_parts.core_turn_schemas import (
     CHAT_TAG_SCHEMA,
     DELETE_MESSAGE_SCHEMA,
     NOTHING_TO_DO_SCHEMA,
+    REQUEST_SERVER_SCHEMA,
     RESET_CONVERSATION_SCHEMA,
     SET_PROJECT_SCHEMA,
     SKILL_DISCOVER_SCHEMA,
@@ -99,12 +91,14 @@ from kiro_crew.validation_parts.core_turn_schemas import (
 )
 from kiro_crew.validation_parts.field_engine import ToolSchema
 from kiro_crew.validation_parts.messaging_session_schemas import (
+    DISMISS_NOTIFICATION_SCHEMA,
     GET_CHAT_SESSION_SCHEMA,
     KNOWLEDGE_ADD_DOCUMENT_SCHEMA,
     KNOWLEDGE_DEDUP_SCHEMA,
     KNOWLEDGE_LIST_SOURCES_SCHEMA,
     LIST_SESSIONS_SCHEMA,
     LOCAL_KNOWLEDGE_SEARCH_SCHEMA,
+    READ_SLACK_HISTORY_SCHEMA,
     READ_SLACK_PROFILE_SCHEMA,
     REGISTER_HOOK_SCHEMA,
     ROUTE_CREW_SCHEMA,
@@ -149,6 +143,7 @@ MCP_CORE_SCHEMAS: dict[str, ToolSchema] = {
     "learn_add": LEARN_ADD_SCHEMA,
     "learn_list": LEARN_LIST_SCHEMA,
     "learn_remove": LEARN_REMOVE_SCHEMA,
+    "learn_update": LEARN_UPDATE_SCHEMA,
     "session_ledger_read": SESSION_LEDGER_READ_SCHEMA,
     "session_ledger_record": SESSION_LEDGER_RECORD_SCHEMA,
     "skill_search": SKILL_SEARCH_SCHEMA,
@@ -157,7 +152,9 @@ MCP_CORE_SCHEMAS: dict[str, ToolSchema] = {
     "task_run": TASK_RUN_SCHEMA,
     "send_message": SEND_MESSAGE_SCHEMA,
     "send_notification": SEND_NOTIFICATION_SCHEMA,
+    "dismiss_notification": DISMISS_NOTIFICATION_SCHEMA,
     "read_slack_profile": READ_SLACK_PROFILE_SCHEMA,
+    "read_slack_history": READ_SLACK_HISTORY_SCHEMA,
     "wait": WAIT_SCHEMA,
     "register_hook": REGISTER_HOOK_SCHEMA,
     "file_send": FILE_SEND_SCHEMA,
@@ -181,6 +178,7 @@ MCP_CORE_SCHEMAS: dict[str, ToolSchema] = {
     "set_project": SET_PROJECT_SCHEMA,
     "reset_conversation": RESET_CONVERSATION_SCHEMA,
     "chat_tag": CHAT_TAG_SCHEMA,
+    "request_server": REQUEST_SERVER_SCHEMA,
     "suggest_followup": SUGGEST_FOLLOWUP_SCHEMA,
     "artifact_save": ARTIFACT_SAVE_SCHEMA,
     "artifact_get": ARTIFACT_GET_SCHEMA,
@@ -214,19 +212,6 @@ MCP_CORE_SCHEMAS: dict[str, ToolSchema] = {
     "workflow_rerun_subtree": WORKFLOW_RERUN_SCHEMA,
     "workflow_library_list": WORKFLOW_LIBRARY_LIST_SCHEMA,
     "deploy_artifact": DEPLOY_ARTIFACT_SCHEMA,
-    "issue_radar_record_investigation": ISSUE_RADAR_RECORD_INVESTIGATION_SCHEMA,
-    "ops_mission_control_api": OPS_MISSION_CONTROL_API_SCHEMA,
-    "design_tweak_update_thread": DESIGN_TWEAK_UPDATE_THREAD_SCHEMA,
-    "pod_up": POD_UP_SCHEMA,
-    "pod_down": POD_DOWN_SCHEMA,
-    "pod_status": POD_STATUS_SCHEMA,
-    "pod_ls": POD_LS_SCHEMA,
-    # Registered even though ``issue_radar_crew_read`` takes no arguments: an
-    # unregistered tool's args pass through raw, and the empty-field schema is
-    # also what makes an unknown arg an "Error:" string instead of a stdio-loop
-    # crash that takes the whole kirocrew-core server down for the session.
-    "issue_radar_crew_read": ISSUE_RADAR_CREW_READ_SCHEMA,
-    "issue_radar_crew_record": ISSUE_RADAR_CREW_RECORD_SCHEMA,
 }
 
 
@@ -268,7 +253,6 @@ MCP_DASHBOARD_SCHEMAS: dict[str, ToolSchema] = {
     "chat_folder_update": CHAT_FOLDER_UPDATE_SCHEMA,
     "chat_folder_move_session": CHAT_FOLDER_MOVE_SESSION_SCHEMA,
     "chat_folder_delete": CHAT_FOLDER_DELETE_SCHEMA,
-    "chat_folder_file_self": CHAT_FOLDER_FILE_SELF_SCHEMA,
     "chat_session_pin_move": CHAT_SESSION_PIN_MOVE_SCHEMA,
     "chat_tag_list": CHAT_TAG_LIST_SCHEMA,
     "chat_tag_create": CHAT_TAG_CREATE_SCHEMA,

@@ -1,4 +1,10 @@
 import { useRef, useEffect, useCallback, type MutableRefObject, type Dispatch, type SetStateAction, type RefObject } from 'react'
+import { refusalMessage } from '../shared-crew/overloadCopy'
+import { baseRevisionFor, clearSendRaceNotice, isSendRaceConflict, noteSendRevision, sendIdempotencyKey, setSendRaceNotice } from '../../../api/sendRace'
+import { baseRevisionForPress } from '../../../hooks/sharedCrew/sendRevisionSeed'
+import { noteComposerSent } from '../shared-crew/typingSignal'
+import { isComposerLocked, noteComposerLocked } from '../../../api/typingLease'
+import type { CapacityResponse } from '../../../api/sharedCrew'
 import type { UseMessageQuote } from '../../../chat-core/composer/useMessageQuote'
 import { store, type AppDispatch } from '../../../store'
 import type { ChatMessage, ChatSlot } from '../../../types'
@@ -6,7 +12,7 @@ import { expandAll as expandPasteTokens, carryPastes, mergeCarriedDraft, type Pa
 import { mergeSessionRefs, type SessionRef } from '../../../utils/sessionRefs'
 import type { PickedFileTokens } from './composerFileMentions'
 import { queuedSendStash } from '../../../hooks/useQueuedMessageActions'
-import { syncSlotRunningFromServer, capturePendingAskId, createSlot, appendMessage, selectComposerBusy, startLocalTurn, endLocalTurn, appendSlotMessage, setSlotRunning, selectSendConfirmed, selectSlotRunEpoch, markSendUnconfirmed, confirmOptimisticSend, ageFolderSuggestion } from '../../../store/chatSlice'
+import { syncSlotRunningFromServer, capturePendingAskId, createSlot, appendMessage, selectComposerBusy, startLocalTurn, endLocalTurn, appendSlotMessage, setSlotRunning, selectSendConfirmed, selectSlotRunEpoch, markSendUnconfirmed, confirmOptimisticSend, resolveOptimisticSteer, recordSendAttempt, ageFolderSuggestion } from '../../../store/chatSlice'
 import { confirmedDelivered } from '../../../utils/sendDelivery'
 import { warnDeliveryUnconfirmed } from '../../../utils/deliveryWarning'
 import { announceIfRemovedSendDelivered } from '../../../components/useDeliveryWarningStrip'
@@ -23,7 +29,7 @@ import { uniqueNotificationTs } from './notificationTs'
 import { PREFILL_STORAGE_KEY } from '../../../utils/navIntent'
 import { isComposerSendHeld } from '../../../utils/composerSendHolds'
 import type { ComposerHandle } from '../../../chat-core/composer/Composer'
-import { mergeRecoveredDraft, setDraft } from '../../../utils/chatDrafts'
+import { loadDrafts, mergeRecoveredDraft, setDraft } from '../../../utils/chatDrafts'
 import { setFileDraft } from '../../../utils/chatFileDrafts'
 import { NO_SLOT_TOKEN_KEY } from '../../../utils/chatFileTokenDrafts'
 import { setPasteDraft } from '../../../utils/chatPasteDrafts'
@@ -52,6 +58,8 @@ interface ComposerSendOptions {
   activeSlotRef: MutableRefObject<string | null>
   composerSlotRef: MutableRefObject<string | null>
   composerMountedRef: MutableRefObject<boolean>
+  /** An embedded page (not a popout) refuses `/fork`, as its transcript hides Fork. */
+  forkUnavailable: boolean
   setInput: (next: string | ((prev: string) => string)) => void
   inputRef: MutableRefObject<string>
   sendingRef: MutableRefObject<boolean>
@@ -129,7 +137,7 @@ export function mergeSentTurns(earlier: SentTurnRestore, later: SentTurnRestore)
  * Called from ChatPage at the position its statements held, so React registers its effects in the same order.
  */
 export function useComposerSend({
-  mode, dispatch, slots, connected, activeSlot, knowledgeFetchRef, slotRunning, drafts, fileDrafts, pasteDrafts, saveDrafts, sessionRefDrafts, activeSlotRef, composerSlotRef, composerMountedRef,
+  mode, dispatch, slots, connected, activeSlot, knowledgeFetchRef, slotRunning, drafts, fileDrafts, pasteDrafts, saveDrafts, sessionRefDrafts, activeSlotRef, composerSlotRef, composerMountedRef, forkUnavailable,
   setInput, inputRef, sendingRef, pendingAgentRef, pendingAgentKindRef, setPendingAgent, pendingModelRef, setPendingModel, pendingProjectRef, setPendingProject, setActionError, showActionError,
   messageQuote, setPrefillHint, autoSendRef, setAutoSendTick, newSessionRef, widgetPrefillRef, mergeSlotTokens, pasteBlocksRef, pendingFilesRef, pendingSessionsRef, pickedFileTokens, setPasteBlocks, readPasteBlocks, installPasteBlocks,
   setPendingFiles, setPendingSessions, composerRef, currentProjectRef, colorThemeRef, autoFollowAllowed, scrollBottom, setRefusedPress, createFailReason,
@@ -253,7 +261,9 @@ export function useComposerSend({
   // intercepted locally, transport error, refused). UI reactions all stay
   // inside send(); the verdict exists for callers that persist state only on
   // delivery (ArtifactPanel's submit-to-chat batch marks comments sent on it).
-  const send = useCallback(async (optionText?: string, targetSlot?: string, steerNow?: boolean | 'auto', isolated = false): Promise<boolean> => {
+  // `sendNow`: the deliberate Send now after this tab lost a send race. It is
+  // a new submission at the current revision and never steers.
+  const send = useCallback(async (optionText?: string, targetSlot?: string, steerNow?: boolean | 'auto', isolated = false, sendNow = false): Promise<boolean> => {
     // Defense-in-depth: ChatInput already gates Send/Optimize buttons and
     // the keyboard Enter shortcut on `connected`, but a future caller (a
     // programmatic dispatch from a hotkey, a follow-up option click, an
@@ -332,6 +342,10 @@ export function useComposerSend({
     // capture: the server retires it when this send's user row lands and
     // announces it with `question_card_resolved`.
     const entrySendSlot = targetSlot ?? uiSlot
+    // The send revision this press is based on (first submit wins): what this
+    // tab had seen when the person pressed, read before any await below, so a
+    // collaborator's send accepted while this one is on its way is still unseen.
+    const baseAtPress = baseRevisionFor(entrySendSlot)
     // An app's supplied text is not the human's answer to a pending card.
     // Null captures keep all composer-owned completion effects inert.
     const askAtSend = isolated ? null : capturePendingAskId(store.getState().chat.pendingQuestions, entrySendSlot)
@@ -365,8 +379,13 @@ export function useComposerSend({
         // No slot yet: the same pending pick the agent picker makes, and like
         // it, drop a model chosen for the previous agent (#2035).
         onPendingAgent: (name) => { setPendingAgent(name, 'template'); setPendingModel('') },
+        // A page left meanwhile sends nothing: its staging is not the fork's.
+        sendToFork: (key, prompt) => { if (!connected || !composerMountedRef.current) return false; void send(prompt, key); return true },
+        forkUnavailable,
       })
       if (slashResult.intercepted) {
+        // A page left meanwhile re-reads the store, which may hold a `/fork` prompt.
+        if (!composerMountedRef.current) drafts.current = loadDrafts()
         // Not a send either way: the staged quote stays staged for the real one
         // -- while this slot's composer is still the live one. The await above
         // can span a slot switch, and the stage is not per slot, so restaging
@@ -429,7 +448,7 @@ export function useComposerSend({
     // the knowledge block, and the quoted message opening both texts. An app
     // launch (`isolated`) sends its own text verbatim, folder tokens included.
     const turn = isolated
-      ? { wire: raw, bubble: raw, inlined: raw, meta: {}, storedPaste: undefined, typedOnly: true }
+      ? { wire: raw, bubble: raw, inlined: raw, meta: {}, pastes: [], storedPaste: undefined, typedOnly: true }
       : buildOutgoingTurn({ text: raw, files: sentFiles, pastes: activePastes, sessionRefs: sentSessionRefs, knowledge: knowledgeBlock, quote: sentQuote, project: currentProjectRef.current || '' }, 'send')
     if (!isolated) knowledgeFetchRef.current.clearPending()
     storeSentPastes(turn.storedPaste)
@@ -467,6 +486,8 @@ export function useComposerSend({
       // (#14571). The text/file/paste drafts stay slot-gated: they are never
       // written without a slot.
       setInput(''); setPendingFiles([]); delete pickedFileTokens.current[uiSlot ?? NO_SLOT_TOKEN_KEY]; setPasteBlocks([]); setPendingSessions([]); if (uiSlot) { delete drafts.current[uiSlot]; delete fileDrafts.current[uiSlot]; delete pasteDrafts.current[uiSlot]; delete sessionRefDrafts.current[uiSlot]; saveDrafts() }
+      // Only the consumed draft ends typing, before a create can switch sessions.
+      noteComposerSent(composerSendSlot)
       // The challenge-handoff prompt is seeded into PREFILL_STORAGE_KEY and the
       // slot-restore effect re-applies it on slot changes. Once that prompt is
       // sent, clear the seed so a later slot-restore can't re-fill the (now
@@ -695,6 +716,8 @@ export function useComposerSend({
       }
       const result = created
       slot = result.key;
+      // A session this send just created has accepted nothing yet.
+      noteSendRevision(slot, 0)
       if (pendingProjectRef.current) {
         await api.chatSlotProject(result.key, pendingProjectRef.current).catch(e => {
           // eslint-disable-next-line no-console -- surface project-assign failures for debugging
@@ -728,6 +751,9 @@ export function useComposerSend({
       // the bubble goes to the slot this send targets, not the active mirror.
       if (slot && slot !== store.getState().chat.activeSlot) dispatch(appendSlotMessage({ slot, message: bubble }))
       else dispatch(appendMessage(bubble))
+      // The composer is already empty, so this record is the prompt's only
+      // copy if the bubble later leaves the transcript; ↑ reads it.
+      if (slot && !isolated) dispatch(recordSendAttempt({ slot, text: turn.bubble, sendId, pastes: turn.pastes }))
     }
     if (!isolated) window.dispatchEvent(new Event('voice-stop'))
     sendingRef.current = false
@@ -741,6 +767,9 @@ export function useComposerSend({
       if (!slot || isolated) return
       restoreSentTurn(slot, { inlined: turn.inlined, pastes: activePastes, sessionRefs: sentSessionRefs, quote: sentQuote, slotTokens: sentSlotTokens })
     }
+    // A send carries the revision it is based on (first submit wins); one
+    // pressed before this tab learned it waits for the session's read, bounded.
+    const baseRevision = await baseRevisionForPress(slot, slot === entrySendSlot ? baseAtPress : baseRevisionFor(slot))
     // The POST, its 10 s deadline, the resolves-not-rejects trap and the body
     // classification all live in the chat-core transport now; this surface
     // only decides how to REACT to the receipt. `sendTurn` never rejects.
@@ -748,8 +777,9 @@ export function useComposerSend({
       message: turn.wire,
       slot: slot ?? undefined,
       meta: metaPayload,
-      steer: steerNow,
+      steer: sendNow ? undefined : steerNow,
       colorTheme: colorThemeRef.current,
+      race: { baseRevision, sendNow, idempotencyKey: sendIdempotencyKey(sendId) },
     })
     const { body } = receipt
     // - `transport-error`: the fetch rejected. Restore and report only when
@@ -855,15 +885,46 @@ export function useComposerSend({
         queuedSendStash.set(body.queue_id, { raw, files: stagedFilesAtSend, sent: turn.wire, aliases: sentSlotTokens, ...(sentQuote ? { quote: sentQuote } : {}) })
       }
     }
+    if (receipt.status === 'refused' && slot && !isolated && isSendRaceConflict(receipt.body)) {
+      // A collaborator's send was accepted first. Nothing of this one was
+      // accepted, so its bubble goes and the draft returns to the composer;
+      // the notice above the composer names who sent first and offers Send
+      // now. Not an error row: nothing failed, and an overload refusal (below)
+      // reads differently on purpose.
+      setSendRaceNotice(slot, receipt.body)
+      dispatch(resolveOptimisticSteer({ slot, sendId, outcome: 'queued' }))
+      // Only this unconfirmed send owns the optimistic running flag.
+      const state = store.getState()
+      if (state.chat.pendingTurnSlot === slot && selectSlotRunEpoch(state, slot) === sendEpoch) dispatch(endLocalTurn(slot))
+      restoreComposerAfterFailedSend()
+      return false
+    }
+    if (receipt.status === 'refused' && slot && !isolated && isComposerLocked(receipt.body)) {
+      // Someone else started typing first and holds the session's typing lease.
+      // Nothing was accepted: the bubble goes, the draft returns, and the
+      // composer locks with their name until the lease ends. Not an error row.
+      noteComposerLocked(receipt.body)
+      dispatch(resolveOptimisticSteer({ slot, sendId, outcome: 'queued' }))
+      // Only this unconfirmed send owns the optimistic running flag.
+      const state = store.getState()
+      if (state.chat.pendingTurnSlot === slot && selectSlotRunEpoch(state, slot) === sendEpoch) dispatch(endLocalTurn(slot))
+      restoreComposerAfterFailedSend()
+      return false
+    }
+    if (receipt.status !== 'refused' && slot) clearSendRaceNotice(slot)
     if (receipt.status === 'refused') {
       // FRAMED like the steer's refusal (and ChatEmbed's): a raw backend reason
       // ("slot agent mismatch") reads as the agent erroring mid-work, not as
       // "your request never went out".
+      // A Shared Crew limit names whose limit it is and what to do next; the
+      // draft is restored below either way.
+      const limitCopy = refusalMessage(receipt.body as { code?: unknown; capacity?: CapacityResponse })
       failLocalTurn({
         role: 'error',
-        content: receipt.reason
-          ? i18nT('pages.chatPage.send_failed_with_error', { error: receipt.reason })
-          : i18nT('pages.chatPage.send_failed'),
+        content: limitCopy
+          ?? (receipt.reason
+            ? i18nT('pages.chatPage.send_failed_with_error', { error: receipt.reason })
+            : i18nT('pages.chatPage.send_failed')),
         cls: '',
       })
       // The server explicitly accepted neither (`ok` nor `queued`), so nothing
@@ -920,7 +981,7 @@ export function useComposerSend({
     // activeSlot is left in deps as a harmless no-op: dropping it churns the
     // array for no behavior change (the ref is always current regardless).
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeSlot, dispatch, connected, messageQuote.consume, messageQuote.restage, setPendingAgent, setPendingModel])
+  }, [activeSlot, dispatch, connected, forkUnavailable, messageQuote.consume, messageQuote.restage, setPendingAgent, setPendingModel])
   return {
     send, restoreSentTurn,
   }

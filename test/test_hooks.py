@@ -540,6 +540,14 @@ class TestAnUnreadableMcpIdentityIsDeniedByTheGate:
             assert decision.action != TOOL_DENY, kwargs
 
 
+def _denied_grant():
+    """Built at use time from the gate's own binding, so a module reload in the
+    suite cannot hand the gate a class it does not recognise."""
+    from kiro_crew.hooks import SpecDeniedGrant
+
+    return SpecDeniedGrant(denied_commands=("make clean",))
+
+
 class TestHookGateKwargs:
     """``hook_gate_kwargs`` is the ONE extraction of the event-derived
     ``on_tool_call`` arguments. A dispatcher that hand-copies the fields it
@@ -557,8 +565,18 @@ class TestHookGateKwargs:
     # asking, on whose behalf, in which mode) rather than the tool call. Every
     # other keyword parameter is derived from the event, and the completeness
     # test below demands the helper emit exactly those.
+    # ``deny_waivers`` is the surface's too: the deny-rule keys a person overrode on
+    # the dashboard card for this call or session, never read off the event.
     SURFACE_KWARGS = frozenset(
-        {"session_key", "agent", "app", "resolved_agent", "classifier_only", "trust_reads"}
+        {
+            "session_key",
+            "agent",
+            "app",
+            "resolved_agent",
+            "classifier_only",
+            "trust_reads",
+            "deny_waivers",
+        }
     )
 
     # The gate's event-derived parameters and the event attribute each reads.
@@ -577,6 +595,13 @@ class TestHookGateKwargs:
         "kas_builtin_ids": "kas_builtin_ids",
         "spec_granted_builtins": "spec_granted_builtins",
         "spec_granted_commands": "spec_granted_commands",
+        "spec_shell_allowlist": "spec_shell_allowlist",
+        "spec_write_allowlist": "spec_write_allowlist",
+        "spec_write_cwd": "spec_write_cwd",
+        "spec_denied_grant": "spec_denied_grant",
+        "spec_shell_readonly": "spec_shell_readonly",
+        "spec_granted_paths": "spec_granted_paths",
+        "spec_granted_read_paths": "spec_granted_read_paths",
         "harness_builtin_tool": "harness_builtin_tool",
         "deepseek_tool_name": "deepseek_tool_name",
         "spawn_target": "spawn_target",
@@ -604,6 +629,13 @@ class TestHookGateKwargs:
             kas_builtin_ids=True,
             spec_granted_builtins=frozenset({"execute_bash"}),
             spec_granted_commands=("git status",),
+            spec_shell_allowlist=("git log",),
+            spec_write_allowlist=("/w/out",),
+            spec_write_cwd="/w",
+            spec_denied_grant=_denied_grant(),
+            spec_shell_readonly=True,
+            spec_granted_paths=("/w/out/**",),
+            spec_granted_read_paths=("/w/docs/**",),
             harness_builtin_tool="web_fetch",
             deepseek_tool_name="read",
             spawn_target="helper",
@@ -622,6 +654,13 @@ class TestHookGateKwargs:
             "kas_builtin_ids": True,
             "spec_granted_builtins": frozenset({"execute_bash"}),
             "spec_granted_commands": ("git status",),
+            "spec_shell_allowlist": ("git log",),
+            "spec_write_allowlist": ("/w/out",),
+            "spec_write_cwd": "/w",
+            "spec_denied_grant": _denied_grant(),
+            "spec_shell_readonly": True,
+            "spec_granted_paths": ("/w/out/**",),
+            "spec_granted_read_paths": ("/w/docs/**",),
             "harness_builtin_tool": "web_fetch",
             "deepseek_tool_name": "read",
             "spawn_target": "helper",
@@ -653,6 +692,13 @@ class TestHookGateKwargs:
             "kas_builtin_ids": False,
             "spec_granted_builtins": frozenset(),
             "spec_granted_commands": (),
+            "spec_shell_allowlist": None,
+            "spec_write_allowlist": None,
+            "spec_write_cwd": "",
+            "spec_denied_grant": None,
+            "spec_shell_readonly": False,
+            "spec_granted_paths": (),
+            "spec_granted_read_paths": (),
             "harness_builtin_tool": "",
             "deepseek_tool_name": "",
             "spawn_target": "",
@@ -751,6 +797,13 @@ class TestHookGateKwargs:
         probe.kas_builtin_ids = True
         probe.spec_granted_builtins = frozenset({"<spec_granted_builtins>"})
         probe.spec_granted_commands = ("<spec_granted_commands>",)
+        probe.spec_shell_allowlist = ("<spec_shell_allowlist>",)
+        probe.spec_write_allowlist = ("<spec_write_allowlist>",)
+        probe.spec_write_cwd = "<spec_write_cwd>"
+        probe.spec_denied_grant = _denied_grant()
+        probe.spec_shell_readonly = True
+        probe.spec_granted_paths = ("<spec_granted_paths>",)
+        probe.spec_granted_read_paths = ("<spec_granted_read_paths>",)
         call = ToolCall.from_event(probe)
         blank = ToolCall(title="")
         unfilled = [
@@ -776,12 +829,21 @@ class TestHookGateKwargs:
                 "mcp_identity_trusted",
                 "mcp_identity_unreadable",
                 "kas_builtin_ids",
+                "spec_shell_readonly",
             ):
                 assert got[kwarg] is True
             elif kwarg == "spec_granted_builtins":
                 assert got[kwarg] == frozenset({f"<{attr}>"})
-            elif kwarg == "spec_granted_commands":
+            elif kwarg in (
+                "spec_granted_commands",
+                "spec_shell_allowlist",
+                "spec_write_allowlist",
+                "spec_granted_paths",
+                "spec_granted_read_paths",
+            ):
                 assert got[kwarg] == (f"<{attr}>",)
+            elif kwarg == "spec_denied_grant":
+                assert got[kwarg] == _denied_grant()
             else:
                 assert got[kwarg] == f"<{attr}>", kwarg
 
@@ -817,6 +879,7 @@ class TestHookGateKwargs:
             "app": "p",
             "classifier_only": True,
             "trust_reads": True,
+            "deny_waivers": frozenset({"<key>"}),
         }
         HookManager().on_tool_call(
             probe.title, resolved_agent="kirocrew", **surface, **hook_gate_kwargs(probe)

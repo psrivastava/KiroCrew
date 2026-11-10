@@ -202,6 +202,10 @@ from kiro_crew.subagent_cost import (
     read_cap_costs,
     read_learned_costs_checked,
 )
+from kiro_crew.subagent_ending import (  # noqa: F401
+    SubagentEnding,
+    classify_ending,
+)
 from kiro_crew.subagent_manager import (
     CancellationCoordinator,
     ClaimPoint,
@@ -223,6 +227,7 @@ from kiro_crew.subagent_manager.monitoring import (  # noqa: F401 - resolved by 
     tombstone_recovery_action,
 )
 from kiro_crew.subagent_manager.run import _PendingDepthEmit, _PendingDepthRetry
+from kiro_crew.subagent_mcp_roster import session_mcp_roster_gb
 from kiro_crew.subagent_parts import admission_surface as _admission_surface
 from kiro_crew.subagent_parts import agent_policy as _agent_policy
 from kiro_crew.subagent_parts import cancellation_surface as _cancellation_surface
@@ -257,6 +262,7 @@ from kiro_crew.subagent_parts.agent_policy import (  # noqa: F401
     ParentSpawnPolicy,
     _accepted_project_dirs,
     _available_agents_hint,
+    _bot_worker_allowlist,
     _inherited_member_agent,
     _internal_agent_refusal,
     _parent_project_resolver,
@@ -287,6 +293,7 @@ from kiro_crew.subagent_parts.delivery import (  # noqa: F401
     NOT_DELIVERY_STATE,
     PARKS_WHEN_SET,
     PARKS_WHEN_UNSET,
+    HostSpawnDecision,
     SpawnApprovalCallback,
     SpawnApprovalUnreachable,
     SubagentEventCallback,
@@ -353,9 +360,11 @@ from kiro_crew.subagent_parts.run_limits import (  # noqa: F401
     _HOST_READ_OFF_LOOP_SECS,
     _LOW_FIDELITY_DENY_REASON,
     _MAX_CONCURRENT,
+    _MAX_SPAWN_DEPTH,
     _ON_DONE_TIMEOUT,
     _PRESSURE_EPISODE_MAX_GAP_SECS,
     _PRESSURE_HOLD_PRUNE_FACTOR,
+    _QUEUED_SPAWN_ATTEMPT_LIMIT,
     _REAPER_INTERVAL,
     _RECOVERY_SLOT_WAIT_SECS,
     _RELEASE_REPUMP_SECS,
@@ -432,6 +441,10 @@ from kiro_crew.subagent_parts.start_pricing import (  # noqa: F401
     _SharingPlan,
     _spawn_memory_floor_and_cost,
     _startup_memory_reserve_gb,
+)
+from kiro_crew.subagent_parts.terminal_surface import (  # noqa: F401
+    write_queued_stop_tombstone,
+    write_refusal_tombstone,
 )
 from kiro_crew.subagent_persistence import (  # noqa: F401 - read_tombstone resolved by run_lifecycle.py via bind_component_globals
     DISMISSAL_FAILED,
@@ -616,6 +629,7 @@ _COMPONENT_GLOBAL_BINDINGS = (
     cap_buckets,
     learned_settled_for,
     read_learned_costs_checked,
+    session_mcp_roster_gb,
     Any,
     CONTEXT_GROUP_LESSONS,
     CONTEXT_GROUP_MEMORY,

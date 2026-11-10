@@ -18,7 +18,7 @@ _PATH = "/api/spawn/mark-collected"
 
 
 def _settle(monkeypatch: pytest.MonkeyPatch, answers: list[dict]) -> list[tuple[dict, float]]:
-    """Collect one finished child and commit; return each mark-collected POST."""
+    """Collect one finished child, commit and write; return each mark-collected POST."""
     calls: list[tuple[dict, float]] = []
     replies = iter(answers)
 
@@ -32,7 +32,6 @@ def _settle(monkeypatch: pytest.MonkeyPatch, answers: list[dict]) -> list[tuple[
     monkeypatch.setattr(mcp_core, "sel", MagicMock())
     step = _SubAgentsStep(
         sa_ids=["a1"],
-        sa_deferred=set(),
         sa_errors=[],
         parent_session="dashboard:owner",
         max_wait=60,
@@ -42,6 +41,7 @@ def _settle(monkeypatch: pytest.MonkeyPatch, answers: list[dict]) -> list[tuple[
     text = step.step()
     assert text is not None and '"completed"' in text
     step.on_settled(text)
+    step.on_answered(True)
     return calls
 
 
@@ -50,7 +50,7 @@ def test_transport_failure_is_sent_again(monkeypatch: pytest.MonkeyPatch) -> Non
         monkeypatch,
         [{"error": "timed out", "transport_error": True}, {"status": "ok", "marked": 1}],
     )
-    body = {"ids": ["a1"], "parent_session": "dashboard:owner"}
+    body = {"ids": ["a1"], "parent_session": "dashboard:owner", "written": True}
     assert calls == [(body, 5), (body, 10)]
 
 

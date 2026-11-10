@@ -1,8 +1,12 @@
 import { memo, useState, useRef, useEffect, useCallback, useContext, useSyncExternalStore, type ReactNode } from 'react'
 import { ReactReduxContext } from 'react-redux'
 import { parseSessionSeed, seedSender, type SeedRow, type SeedSender } from '../../lib/crewSeed'
+import { MessageByline } from './shared-crew/MessageByline'
+import { QueuedSendLabel } from './shared-crew/QueuedSendLabel'
+import { readRelay, withoutRelayEnvelope } from './sessionRelay'
+import SenderAvatar from './SenderAvatar'
 import { motion } from 'framer-motion'
-import { Pencil, Send, Copy, Check, Link2, MessageSquare, Target, Pin, PinOff, X, Clock, Quote, MoreHorizontal, Undo2, ArrowUpFromLine, type LucideIcon } from 'lucide-react'
+import { Pencil, Send, Copy, Check, Link2, MessageSquare, Target, Pin, PinOff, X, Clock, Quote, MoreHorizontal, Undo2, ArrowUpFromLine, ChevronRight, type LucideIcon } from 'lucide-react'
 import { copyToClipboard } from '../../utils/clipboard'
 import { copySessionLink } from '../../utils/shareUrl'
 import { ICON_ACTION_ROW_CLS } from '../../utils/touchActions'
@@ -20,11 +24,14 @@ import InfoTip from '../../components/InfoTip'
 import ErrorNotice from '../../components/ErrorNotice'
 import { Btn } from '../../components/ui'
 import SteerDecisionLine from './SteerDecisionLine'
+import EditSkillPicker, { type EditFieldBinding, type EditSkillPickerTarget } from './EditSkillPicker'
 import QuoteCard from './QuoteCard'
 import MessageContextMenu, { type MessageMenuItem } from './MessageContextMenu'
+import MessageActionMenuItems, { NO_ACTIONS, useMessageActionsFor } from '../../messageActions/MessageActionMenuItems'
 import { prependQuote, quoteBlock, readMessageQuote, stripQuoteBlock, type MessageQuote } from '../../chat-core/composer/messageQuote'
 import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem } from '../../components/ui/dropdown-menu'
 import { readSteerRecord } from './decisionRecord'
+import { useRowDisclosure } from './rowDisclosure'
 import { revealComposer } from './composerFocus'
 import type { SteerRetractAction, SteerRetractRefusalNotice } from '../../hooks/useSteerRetract'
 // Steer bubbles play a one-shot entrance (slide-in + ring pulse) when they land.
@@ -32,6 +39,11 @@ import type { SteerRetractAction, SteerRetractRefusalNotice } from '../../hooks/
 // back; without this guard the entrance would replay every time. Module-level set
 // persists for the app session — each steered message animates exactly once.
 const animatedSteers = new Set<string>()
+// The same guard for the flash a requeued steer's own row plays when it lands
+// (`meta.landedFromSteer`): each such row flashes at most once per app session.
+const landedSteerFlashes = new Set<string>()
+// The flash's length, `--animate-steer-landed` in `tailwind-theme.css`.
+const LANDED_FLASH_MS = 1200
 
 /* Each take-back notice names the action that was picked. The keys stay full
  * literals so the dead-key and dynamic-key checks can see every one of them. */
@@ -93,6 +105,15 @@ interface UserMessageProps {
   doubleClickToEdit?: boolean
   slotKey?: string
   slotTitle?: string
+  /** Opt-in: typing `$` in the Edit & Resend field opens the composer's skill
+   *  menu for this chat, agent and project. A host that cannot name them (a
+   *  remote crew's window, an embed) leaves it out and the field stays plain. */
+  editSkillPicker?: EditSkillPickerTarget
+  /** Session titles by key, and the opener for one. Both given, a message
+   *  another session delivered (`meta.relay`) names its sender's title as a
+   *  link beside the "From …" label; either absent, the label alone. */
+  sessions?: ReadonlyMap<string, string>
+  onSessionOpen?: (key: string) => void
   mode?: string
   pinned?: boolean
   onTogglePin?: () => void
@@ -105,6 +126,11 @@ interface UserMessageProps {
    *  work that ended (#9037 UX review). Fail-closed: no claim without a
    *  running turn. */
   slotRunning?: boolean
+  /** Shared Crew: this is the session's newest user message, so it carries the
+   *  "Queued" line and its Cancel while the host holds a chat turn for capacity.
+   *  The host passes it only while the session has no queue-stack rows: a busy
+   *  session's queued sends are those rows instead. */
+  showQueuedSend?: boolean
   /** Draw a steer as an ORDINARY user message in every lifecycle state: no
    *  "Steered into the running turn" badge, no accent tint, no entrance ring,
    *  no "Steering…" pulse, no requeued note. For a surface that
@@ -154,7 +180,7 @@ interface UserMessageProps {
   steerActionRequestFailed?: boolean
 }
 
-const UserMessage = memo(function UserMessage({ content, meta, timestamp, timestampTitle, renderContent, canEdit, messageIndex, messageTs, onEditResend, doubleClickToEdit = false, slotKey, slotTitle, mode, pinned, onTogglePin, onReplyInThread, slotRunning, hideSteerBadge, tone = 'default', editRequest, onEditConsumed, onQuoteMessage, onJumpToQuote, onSteerAction, steerActionPending, steerActionRefusal, steerActionRequestFailed }: UserMessageProps) {
+const UserMessage = memo(function UserMessage({ content, meta, timestamp, timestampTitle, renderContent, canEdit, messageIndex, messageTs, onEditResend, doubleClickToEdit = false, slotKey, slotTitle, editSkillPicker, sessions, onSessionOpen, mode, pinned, onTogglePin, onReplyInThread, slotRunning, showQueuedSend, hideSteerBadge, tone = 'default', editRequest, onEditConsumed, onQuoteMessage, onJumpToQuote, onSteerAction, steerActionPending, steerActionRefusal, steerActionRequestFailed }: UserMessageProps) {
   useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const [editing, setEditing] = useState(false)
   const ime = useImeGuard()
@@ -180,6 +206,14 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
   // instead, read off the DOM when the menu opens (fork Opus review).
   const [standIn, setStandIn] = useState(false)
   const readStandIn = (open: boolean) => setStandIn(open && !!userRef.current?.closest('[data-pinned-standin]'))
+  // A scripted send's short label (`meta.banner`): the bubble shows it, and the
+  // full message the agent received opens behind a disclosure. Copy and Quote
+  // still act on the full text.
+  const rowBanner = typeof meta?.banner === 'string' && meta.banner.trim() ? meta.banner : ''
+  const [bannerExpanded, setBannerExpanded] = useRowDisclosure(
+    rowBanner && messageTs ? `user-banner:${messageTs}` : undefined,
+    false,
+  )
   const copyOutcomeIcon = (state: CopyOutcome, idle: ReactNode) =>
     state === 'ok' ? <Check size={14} className="text-ok" />
       : state === 'failed' ? <X size={14} className="text-danger" />
@@ -189,6 +223,8 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
       : state === 'failed' ? i18nT('pages.chat.userMessage.copy_failed')
         : idle
   const taRef = useRef<HTMLTextAreaElement>(null)
+  // The edit bubble: the `$` skill menu anchors to it, as the composer's does.
+  const editBubbleRef = useRef<HTMLDivElement>(null)
   // Track the copy-reset timer so it can be cleared on unmount.  Without this,
   // the 1.5 s setTimeout below survives test teardown and fires after jsdom
   // has been disposed, throwing "ReferenceError: window is not defined" from
@@ -241,6 +277,18 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
   // steer/queue vocabulary the steer-only surface exists to hide.
   const pendingSteer = !hideSteerBadge && steerMeta && !!slotRunning && (steerState === 'written' || (steerOptimistic && !steerState))
   const requeuedSteer = !hideSteerBadge && steerMeta && steerState === 'requeued'
+  // These rows run as their own message, not as a steer into a running turn: a
+  // steer the turn ended before confirming (`requeued`, then `superseded` once
+  // its new row lands), or a row with no `meta.steer` that carries the receipt
+  // (the row the drain writes for a requeued steer, or the queued row of a steer
+  // that was unavailable). Where the requeued line already says the text runs as
+  // its own message, the receipt only says who chose (`short`), so the row does
+  // not say the same thing twice.
+  const steerOwnMessage: 'short' | 'full' | undefined = !steerMeta
+    ? 'full'
+    : steerState === 'requeued' || steerState === 'superseded'
+      ? (requeuedSteer ? 'short' : 'full')
+      : undefined
   // Taken back before the turn read it: the row keeps its place in the transcript
   // and says what became of the text, but draws no bubble -- the agent never saw it.
   const retractedAction = steerMeta && steerState === 'retracted'
@@ -307,9 +355,16 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
   const carriedQuote = readMessageQuote(meta)
   // A message another session delivered: its `[sent by session <key> ...]` line
   // is for the agent, so the bubble shows the text under who sent it, by role.
+  // The gateway-set `meta.relay` (only the delivery path writes it) names the
+  // sender structurally, so it wins over the key the line spells, and says where
+  // each provenance line sits (one per send on a merged drain), so the bubble
+  // drops them by position. A row with no such positions shows as it always did.
   const seed = parseSessionSeed(content, meta as Record<string, unknown> | undefined)
-  const seedFrom = useSeedSender(seed?.sender, slotKey)
-  const unseeded = seed ? seed.body : content
+  const relay = readRelay(meta)
+  const senderKey = relay?.senderKey ?? seed?.sender
+  const seedFrom = useSeedSender(senderKey, slotKey)
+  const senderTitle = relay && sessions && onSessionOpen ? sessions.get(relay.senderKey) : undefined
+  const unseeded = (!(meta as { human?: unknown } | undefined)?.human ? withoutRelayEnvelope(content, relay) : null) ?? (seed ? seed.body : content)
   const startEdit = useCallback(() => {
     // Expand any collapsed paste tokens into their original content so the
     // user can actually edit the pasted text. Once edited, the message is
@@ -355,9 +410,15 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
   const { term, caseSensitive } = useSearchHighlight()
   const currentOcc = useCurrentOcc()
 
+  // Search matches the full message, so a banner row opens its body for the
+  // active match; the label and toggle are skipped when counting occurrences.
   useEffect(() => {
-    if (!userRef.current) return
+    if (rowBanner && currentOcc >= 0 && !bannerExpanded) setBannerExpanded(true)
+  }, [rowBanner, currentOcc, bannerExpanded, setBannerExpanded])
+
+  useEffect(() => {
     const el = userRef.current
+    if (!el) return
     applySearchHighlights(el, term, caseSensitive, currentOcc)
     // Converge-center the exact occurrence (see scrollCurrentMatchIntoView).
     // Cancel on re-run/unmount so rapid navigation doesn't accumulate loops.
@@ -366,7 +427,7 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
     // withdraw this bubble's on unmount so a virtualized row that scrolls away
     // is not kept alive through them.
     return () => { cancelScroll?.(); clearSearchHighlights(el) }
-  }, [term, caseSensitive, currentOcc, content])
+  }, [term, caseSensitive, currentOcc, content, rowBanner, bannerExpanded])
 
   /** Native select+copy from a sent bubble gives the literal chip label
    *  ("Paste #1 · 5 lines") — worthless on the other end. Intercept the
@@ -426,6 +487,41 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
   // Only a row that was mounted pending plays it; a row read back already
   // retracted (history, reload) is drawn as the note from the start.
   const reducedMotion = useReducedMotion()
+  // A requeued steer's text that now runs as its own row: the queue_pop reducer
+  // stamps the client-only `meta.landedFromSteer`, and the bubble flashes the
+  // accent ring once so the row reads as the steer above it moving rather than
+  // as a new send. One-shot by the module guard above, keyed on the identity
+  // the steer entrance uses, so a virtualized remount finds the key and draws
+  // nothing. The class drops on its own `animationend`, so a re-render that
+  // rebuilds the bubble does not run it again. Under reduced motion the row
+  // still claims its key and draws nothing. A surface that hides the steer
+  // mechanics (`hideSteerBadge`) draws nothing either.
+  // The mark is the drained card's `queue_id` (or `true` when the pop had none),
+  // and that id is the one-shot key: two steers requeued in the same clock tick
+  // get cards with one shared `ts`.
+  const landedMark = hideSteerBadge ? undefined : (meta as { landedFromSteer?: unknown } | undefined)?.landedFromSteer
+  const landedFromSteer = landedMark === true || (typeof landedMark === 'string' && landedMark !== '')
+  const [playLanded, setPlayLanded] = useState(false)
+  useEffect(() => {
+    if (!landedFromSteer) return
+    const key = typeof landedMark === 'string' ? `queue:${landedMark}` : ((meta as { clientTs?: string })?.clientTs) || messageTs || content
+    if (landedSteerFlashes.has(key)) return
+    landedSteerFlashes.add(key)
+    if (!reducedMotion) setPlayLanded(true)
+  }, [landedFromSteer, landedMark, meta, messageTs, content, reducedMotion])
+  const landedFlash = playLanded && !reducedMotion
+  const endLandedFlash = useCallback((e: React.AnimationEvent<HTMLDivElement>) => {
+    if (e.target === e.currentTarget) setPlayLanded(false)
+  }, [])
+  // A cancelled animation fires no `animationend`: hiding the pane
+  // (`display: none` when another instance is selected) cancels it, and the
+  // flag would then replay the flash when the pane shows again. A timer the
+  // length of the flash clears it whether or not the pane is drawn.
+  useEffect(() => {
+    if (!playLanded) return
+    const timer = setTimeout(() => setPlayLanded(false), LANDED_FLASH_MS)
+    return () => clearTimeout(timer)
+  }, [playLanded])
   const [mountedRetracted] = useState(() => !!retractedAction)
   const [collapseDone, setCollapseDone] = useState(false)
   const lastBubbleBodyRef = useRef(carriedQuote ? stripQuoteBlock(content, carriedQuote) : content)
@@ -433,6 +529,8 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
     if (!retractedAction) lastBubbleBodyRef.current = carriedQuote ? stripQuoteBlock(content, carriedQuote) : content
   }, [retractedAction, content, carriedQuote])
 
+  // Read before any early return: a hook.
+  const userRoleActions = useMessageActionsFor('user')
   if (retractedAction) {
     const settleAnimated = !mountedRetracted && !reducedMotion
     // The meta field is free text from the transcript; anything unknown reads as
@@ -495,6 +593,31 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
   }
 
   if (editing) {
+    // One field for both paths: with `editSkillPicker` the `$` menu supplies
+    // its change and focus handlers, without it the draft is all there is.
+    const renderEditField = (bind: EditFieldBinding) => (
+      <textarea
+        ref={taRef}
+        rows={1}
+        aria-label={i18nT('pages.chat.userMessage.edit_message')}
+        // focus-cue-ok: the cue is the wrapping .edit-grow frame above, which
+        // paints a 2px accent outline for the whole edit session; a second
+        // ring on the textarea would double-paint the one control.
+        className="bg-transparent text-card-fg resize-none overflow-hidden focus:outline-hidden leading-relaxed"
+        style={{ fontSize: 'var(--mc-message-font-size, 14px)' }}
+        value={draft}
+        onChange={bind.onChange}
+        {...ime.bindComposition<HTMLTextAreaElement>({ onFocus: bind.onFocus, onBlur: bind.onBlur })}
+        onKeyDown={e => {
+          // Rule 1: textarea — claim the key, so a declined (IME) Enter is
+          // still consumed instead of inserting a newline into the draft.
+          // An open `$` menu takes Enter and Escape first (its document
+          // capture listener), so a pick never sends and never cancels.
+          if (e.key === 'Enter' && !e.shiftKey) { if (ime.claimEnter(e)) submit() }
+          if (e.key === 'Escape') { ime.reset(); cancel() }
+        }}
+      />
+    )
     return (
       // `data-message-editing`: usePinnedPrompt reads this off the row it is about
       // to hide and refuses to pin it. The stand-in state hides the whole row and
@@ -508,29 +631,14 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
             bubble it replaces, capped at the content column (Settings → Chat →
             Content Width, via the row's --mc-content-width). No JS measurement. */}
         <div
+          ref={editBubbleRef}
           className="edit-grow user-bubble px-4 py-2 leading-relaxed rounded-xl bg-card text-card-fg overflow-hidden min-w-0 w-fit max-w-full outline-solid outline-2 -outline-offset-2 outline-accent/60 focus-within:outline-accent"
           data-replicated-value={draft}
           style={{ overflowWrap: 'anywhere', wordBreak: 'break-word', fontSize: 'var(--mc-message-font-size, 14px)' }}
         >
-          <textarea
-            ref={taRef}
-            rows={1}
-            aria-label={i18nT('pages.chat.userMessage.edit_message')}
-            // focus-cue-ok: the cue is the wrapping .edit-grow frame above, which
-            // paints a 2px accent outline for the whole edit session; a second
-            // ring on the textarea would double-paint the one control.
-            className="bg-transparent text-card-fg resize-none overflow-hidden focus:outline-hidden leading-relaxed"
-            style={{ fontSize: 'var(--mc-message-font-size, 14px)' }}
-            value={draft}
-            onChange={e => setDraft(e.target.value)}
-            {...ime.bindComposition()}
-            onKeyDown={e => {
-              // Rule 1: textarea — claim the key, so a declined (IME) Enter is
-              // still consumed instead of inserting a newline into the draft.
-              if (e.key === 'Enter' && !e.shiftKey) { if (ime.claimEnter(e)) submit() }
-              if (e.key === 'Escape') { ime.reset(); cancel() }
-            }}
-          />
+          {editSkillPicker
+            ? <EditSkillPicker target={editSkillPicker} value={draft} onValueChange={setDraft} textareaRef={taRef} anchorRef={editBubbleRef} renderField={renderEditField} />
+            : renderEditField({ onChange: e => setDraft(e.target.value) })}
         </div>
         {/* Actions sit BELOW the bubble (like the read-only action row) so they
             never impose a min-width floor on the auto-sized bubble. */}
@@ -597,7 +705,10 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
   const compactRow = !!onQuoteMessage
   // Copy is a row button, so a message with nothing else to offer (a bare
   // carried quote on a surface without link, pin or edit) shows no empty More.
-  const moreHasItems = quoteOffered || canCopyLink || canPin || (canEditResend && !standIn)
+  // App message actions the owner approved for the user's own messages (their
+  // own `user` role grant): rows at the end of More, on the rows that have one.
+  const appActions = compactRow && !standIn && quotableContent.trim().length > 0 ? userRoleActions : NO_ACTIONS
+  const moreHasItems = quoteOffered || canCopyLink || canPin || (canEditResend && !standIn) || appActions.length > 0
   const menuItems: MessageMenuItem[] = onQuoteMessage ? [
     ...(quoteOffered ? [{ id: 'quote', label: i18nT('pages.chat.userMessage.quote_message'), icon: <Quote size={14} />, onSelect: quoteShown }] : []),
     // "Copy text", the words the reply's menus use, so the same action reads
@@ -623,7 +734,7 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
     // Disable is safe: the keyboard-accessible edit path is the aria-labelled
     // pencil button in the action row below, not this bubble.
     // eslint-disable-next-line jsx-a11y/no-static-element-interactions
-    <div ref={userRef} onCopy={handleCopy} onDoubleClick={dblClickEdits ? handleDoubleClick : undefined} className={`message-bubble mc-message-font-scope msg-content px-4 py-2 leading-relaxed rounded-xl overflow-hidden min-w-0 w-fit max-w-full ${carriedQuote ? 'min-w-64' : ''} ${isSteer ? 'bg-accent-subtle text-text' : tone === 'accent' ? 'user-bubble user-bubble-accent bg-accent text-accent-fg' : 'user-bubble bg-card text-card-fg'}`} style={{ overflowWrap: 'anywhere', wordBreak: 'break-word', fontSize: 'var(--mc-message-font-size, 14px)' }}>
+    <div ref={userRef} onCopy={handleCopy} onDoubleClick={dblClickEdits ? handleDoubleClick : undefined} onAnimationEnd={landedFlash ? endLandedFlash : undefined} data-landed-from-steer={landedFlash ? '' : undefined} className={`message-bubble mc-message-font-scope msg-content px-4 py-2 leading-relaxed rounded-xl overflow-hidden min-w-0 w-fit max-w-full ${carriedQuote ? 'min-w-64' : ''} ${landedFlash ? 'animate-steer-landed' : ''} ${isSteer ? 'bg-accent-subtle text-text' : tone === 'accent' ? 'user-bubble user-bubble-accent bg-accent text-accent-fg' : 'user-bubble bg-card text-card-fg'}`} style={{ overflowWrap: 'anywhere', wordBreak: 'break-word', fontSize: 'var(--mc-message-font-size, 14px)' }}>
       {/* `messageTs` FIRST, `clientTs` only as a fallback. The opposite order is
           correct for the audio key above, which wants the optimistic bubble's own
           identity, but this value is COMPARED against server-clock slot mint
@@ -631,9 +742,55 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
           an ahead-skewed one would let a reused slot pass the mint check and open
           the wrong conversation, silently. The fallback still covers a bubble that
           has no server ts yet. */}
-      {seed && <p className="mb-1 text-[11px] font-semibold uppercase tracking-wide opacity-70" data-testid="session-seed-from">{seedFrom}</p>}
+      {(seed || relay) && (
+        <p className="mb-1 text-[11px] font-semibold uppercase tracking-wide" data-testid="session-seed-from">
+          <span className="opacity-70">{seedFrom}</span>
+          {senderTitle && onSessionOpen && relay ? (
+            <>
+              <span className="opacity-70" aria-hidden="true"> · </span>
+              {/* In the colour the person gave the sender session, never a
+                  second per-session colour. */}
+              <SenderAvatar senderKey={relay.senderKey} title={senderTitle} />
+              <button
+                type="button"
+                // A link at rest, not only on hover: underlined, and in the accent
+                // colour except on the accent-filled bubble, where it keeps the
+                // bubble's own text colour so it stays readable.
+                className={`inline max-w-full break-all text-left normal-case tracking-normal bg-transparent border-none p-0 font-semibold cursor-pointer underline underline-offset-2 hover:decoration-2 focus-visible:decoration-2 ${tone === 'accent' && !isSteer ? '' : 'text-accent'}`}
+                onClick={() => onSessionOpen(relay.senderKey)}
+                title={i18nT('pages.chat.sessionMessageCard.open_session', { name: senderTitle })}
+                aria-label={i18nT('pages.chat.sessionMessageCard.open_session', { name: senderTitle })}
+                data-testid="session-seed-sender-link"
+              >
+                {senderTitle}
+              </button>
+            </>
+          ) : null}
+        </p>
+      )}
+      {rowBanner && <p className="mb-1 text-[11px] font-semibold uppercase tracking-wide opacity-70" data-testid="user-message-banner-from" data-message-search-skip>{i18nT('pages.chat.userMessage.sent_by_script')}</p>}
       {carriedQuote && <QuoteCard quote={carriedQuote} variant="sent" onJump={carriedQuote.ts ? onJumpToQuote : undefined} />}
-      {renderContent(renderedBody, meta, messageTs || ((meta as { clientTs?: string })?.clientTs))}
+      {rowBanner ? (
+        <>
+          <p className="whitespace-pre-wrap" data-testid="user-message-banner" data-message-search-skip>{rowBanner}</p>
+          <button
+            type="button"
+            onClick={() => setBannerExpanded(v => !v)}
+            aria-expanded={bannerExpanded}
+            className="mt-1 inline-flex items-center gap-0.5 text-[12px] leading-5 opacity-70 hover:opacity-100 hover:underline underline-offset-2"
+            data-testid="user-message-banner-toggle"
+            data-message-search-skip
+          >
+            {bannerExpanded ? i18nT('pages.chat.userMessage.hide_full_message') : i18nT('pages.chat.userMessage.show_full_message')}
+            <ChevronRight size={11} className={`lucide-inline shrink-0 transition-transform ${bannerExpanded ? 'rotate-90' : ''}`} aria-hidden="true" />
+          </button>
+          {bannerExpanded && (
+            <div className="mt-1" data-testid="user-message-banner-full">
+              {renderContent(renderedBody, meta, messageTs || ((meta as { clientTs?: string })?.clientTs))}
+            </div>
+          )}
+        </>
+      ) : renderContent(renderedBody, meta, messageTs || ((meta as { clientTs?: string })?.clientTs))}
     </div>
   )
   // The right-click menu wraps the bubble only when Quote is offered (the
@@ -664,7 +821,7 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
           {/* WHO chose this, when the sender did not. Below the badge that says
               what happened, because the badge is the outcome and this is the
               decision behind it. */}
-          {steerDecision && <SteerDecisionLine record={steerDecision} />}
+          {steerDecision && <SteerDecisionLine record={steerDecision} ownMessage={steerOwnMessage} />}
           <motion.div
             /* Same width cap as the bubble (the column, `max-w-full`): this
                wrapper sits between the content column and the bubble, and a
@@ -703,6 +860,10 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
               exclusive to backend-confirmed injection (#7997). Rendering in the
               badge's slot keeps the pending -> consumed / requeued hand-off a
               content change in one place rather than a layout jump. */}
+          {/* Shared Crew: who sent this, when it was someone other than the viewer. */}
+          <MessageByline meta={meta} slotKey={slotKey} />
+          {/* Shared Crew: the host is holding this send for capacity. */}
+          {showQueuedSend && slotKey && <QueuedSendLabel slotKey={slotKey} />}
           {pendingSend && (
             /* The plain send's counterpart to the steer line below: same slot,
                same muted weight, same pulse for a wait still open (a late echo
@@ -742,7 +903,7 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
                      races the agent, so the most used one is the one-click one. The
                      divider makes these actions a separate region from status/help. */
                   <span className="inline-flex items-center gap-0.5 border-l border-border pl-1 ml-0.5" data-testid="steer-take-back">
-                    <Btn type="button" onClick={() => onSteerAction?.(steerMid, 'queue')} className="px-1 py-0 border-none bg-transparent text-[12px] font-medium text-muted hover:text-text hover:bg-bg-hover rounded transition-colors" data-testid="steer-queue-instead">
+                    <Btn type="button" onClick={() => onSteerAction?.(steerMid, 'queue')} className="px-1 py-0 border-none bg-transparent text-[12px] font-medium text-muted hover:text-text hover:bg-bg-hover rounded transition-colors" title={i18nT('pages.chat.userMessage.steer_queue_instead_hint')} data-testid="steer-queue-instead">
                       {i18nT('pages.chat.userMessage.steer_queue_instead')}
                     </Btn>
                     <DropdownMenu>
@@ -802,7 +963,7 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
               chosen. Drawn in both arms rather than above them: the confirmed-steer
               arm wraps its bubble in an animated box, and a line inside that box
               would slide in with it as though it were part of the message. */}
-          {steerDecision && <SteerDecisionLine record={steerDecision} />}
+          {steerDecision && <SteerDecisionLine record={steerDecision} ownMessage={steerOwnMessage} />}
           {bubbleWithMenu}
         </>
       )}
@@ -898,6 +1059,7 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
                   </span>
                 </DropdownMenuItem>
               )}
+              <MessageActionMenuItems actions={appActions} messageRole="user" markdown={quotableContent} anchor={() => userRef.current} />
             </DropdownMenuContent>
           </DropdownMenu>
         )}

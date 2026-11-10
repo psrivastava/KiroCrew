@@ -33,6 +33,7 @@ if TYPE_CHECKING:
         dep_sync,
         format_node_version,
         intent_probe,
+        is_aws_cli_v1,
         node_too_old_message,
         node_version_meets_floor,
         parse_node_version,
@@ -155,13 +156,18 @@ def _gateway_rss_bytes(pid: int) -> int | None:
     """Resident set size of *pid* in bytes, or None when no route can read it.
 
     ``platform_compat.proc_rss_bytes_for_pid`` serves Linux (``/proc``) and
-    Windows (``GetProcessMemoryInfo``) but has no ctypes-only path on macOS and
-    answers None there, so this falls through to ``ps -o rss=`` resolved via
-    ``trusted_system_bin`` (ps reports KiB). Without the fallback the doctor
-    line reads "RSS unreadable" on every Mac.
+    Windows (``GetProcessMemoryInfo``); macOS reads ``pti_resident_size``
+    through ``platform_compat.darwin_resident_bytes_for_pid`` (``proc_pidinfo``).
+    None of these spawns a subprocess. Only when they all answer None off
+    Windows does this fall back to ``ps -o rss=`` resolved via
+    ``trusted_system_bin`` (ps reports KiB). On macOS ``ps`` is setuid and
+    fails under a sandbox that strips the elevation, so it is the last resort.
     """
     rss = platform_compat.proc_rss_bytes_for_pid(pid)
     if rss is not None or platform_compat.IS_WINDOWS:
+        return rss
+    rss = platform_compat.darwin_resident_bytes_for_pid(pid)
+    if rss is not None:
         return rss
     ps_bin = platform_compat.trusted_system_bin("ps")
     if ps_bin is None:
@@ -237,6 +243,29 @@ def _aws_profile_names() -> list[str] | None:
         if name and name not in names:
             names.append(name)
     return names
+
+
+def _aws_cli_is_v1() -> bool:
+    """Whether the trusted ``aws`` is AWS CLI v1, which has no ``configure list-profiles``.
+
+    Asked once :func:`_aws_profile_names` could not answer, so the report names
+    the version instead of reading like a CLI that may answer next time.
+    """
+    aws_bin = platform_compat.trusted_aws_bin()
+    if not aws_bin:
+        return False
+    try:
+        proc = subprocess.run(
+            [aws_bin, "--version"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=_AWS_PROBE_TIMEOUT_SECS,
+            env=_aws_probe_env(),
+        )
+    except Exception:
+        return False
+    return proc.returncode == 0 and is_aws_cli_v1((proc.stdout or "") + (proc.stderr or ""))
 
 
 def _aws_auto_refreshes() -> bool | None:
@@ -352,19 +381,27 @@ def _venv_deps_ok(venv_py: Path) -> bool:
     return proc.returncode == 0
 
 
-def _report_node(issues: list[str]) -> None:
+def _report_node(
+    issues: list[str], *, bundle_route: bool = False, bundle_node_version: str | None = None
+) -> None:
     """Print the ``node:`` line, judging the full version against ``MIN_NODE_VERSION``.
 
     A Node below the floor is a failure recorded in *issues*: it lacks APIs the
     code needs. The same constant drives the startup warning in ``cli.py``. An
     unreadable version is shown as present rather than guessed at.
+
+    On the KAS bundle route (*bundle_route*) the engine runs the Node its bundle
+    ships, so a missing ``node`` on PATH is not a gap for the selected backend and
+    the install advice is not printed. A Node that IS on PATH is still judged
+    against the floor: other tools run on it.
     """
     node = shutil.which("node")
     if node:
         try:
-            node_ver_result = subprocess.run(
+            node_ver_result = platform_compat.run_killing_tree_on_timeout(
                 # The RESOLVED path, as ``cli._node_ok`` does: on Windows ``which``
-                # can answer ``node.CMD``, which a bare ``node`` cannot spawn.
+                # can answer ``node.CMD``, which a bare ``node`` cannot spawn, and
+                # the timeout then also ends the .CMD's child.
                 [node, "-v"],
                 capture_output=True,
                 text=True,
@@ -386,6 +423,9 @@ def _report_node(issues: list[str]) -> None:
                 issues.append("node")
         except Exception:
             print(f"  node:        ✅ {node}")
+    elif bundle_route:
+        own = f"Node {bundle_node_version}" if bundle_node_version else "Node"
+        print(f"  node:        ⏭  not on PATH; not needed (KAS runs its engine bundle's own {own})")
     else:
         floor = format_node_version(MIN_NODE_VERSION)
         print(f"  node:        ⚠️  not found (Kiro Crew needs Node v{floor}+)")

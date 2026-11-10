@@ -17,6 +17,7 @@ root), are pinned in ``test_skill_browser_containment.py``; the shared helpers l
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -34,6 +35,8 @@ from kiro_crew.dashboard.handlers._shared import (
     SKILL_FILE_MAX_BYTES,
     SKILL_TREE_MAX_ENTRIES,
     _agent_loads_skill,
+    _agents_loading_skill_indexed,
+    _build_agent_match_index,
     _expand_agent_globs,
     _expand_resource_uri,
     _load_parsed_agents,
@@ -143,6 +146,19 @@ class TestListKiroSkills:
     def test_returns_empty_when_no_kiro_dir(self, fake_home):
         # ~/.kiro/skills/ does not exist at all
         assert list_kiro_skills(None) == []
+
+    def test_bom_skill_keeps_its_description_and_always(self, fake_home, tmp_path):
+        """A SKILL.md saved as UTF-8 with a byte-order mark lists the same
+        description and always flag as the same file saved without one."""
+        proj = tmp_path / "proj"
+        skill = proj / ".kiro" / "skills" / "demo" / "SKILL.md"
+        skill.parent.mkdir(parents=True)
+        skill.write_bytes(
+            b"\xef\xbb\xbf---\nname: demo\ndescription: routes demo questions\n"
+            b"always: true\n---\nbody\n"
+        )
+        rows = [r for r in list_kiro_skills(proj) if r["source"] == "kiro-workspace"]
+        assert [(r["description"], r["always"]) for r in rows] == [("routes demo questions", True)]
 
 
 # ── _expand_resource_uri / _agent_loads_skill / _resolve_loaded_by_agents ──
@@ -675,6 +691,160 @@ class TestExpandAgentGlobs:
         for p, s in zip(paths, skills):
             assert s["loaded_by_agents"] == _resolve_loaded_by_agents(p)
 
+    def test_shared_cache_resolves_a_repeated_glob_once(self, fake_home, monkeypatch):
+        """A skill path named by many agents is canonicalised once, not per agent."""
+        from kiro_crew.skill_runtime import catalog
+
+        skills_root = fake_home / ".kiro" / "skills"
+        shared = _write_skill(skills_root, "shared") / "SKILL.md"
+        agents_dir = fake_home / ".kiro" / "agents"
+        agents_dir.mkdir(parents=True)
+        parsed = [
+            (f"a{j}", {"name": f"a{j}", "resources": [f"skill://{shared}"]}, agents_dir / f"a{j}.json")
+            for j in range(5)
+        ]
+        decided: list[str] = []
+        real_spelling = catalog._canonical_spelling
+
+        def recording_spelling(pattern, project_dir):
+            decided.append(pattern)
+            return real_spelling(pattern, project_dir)
+
+        monkeypatch.setattr(catalog, "_canonical_spelling", recording_spelling)
+        expanded = _expand_agent_globs(parsed)
+
+        # Five agents name the one path; its spelling is worked out exactly once.
+        assert decided.count(str(shared)) == 1
+        assert [globs for _name, globs in expanded] == [[str(shared)]] * 5
+
+
+# ── _build_agent_match_index / _agents_loading_skill_indexed ──
+
+
+class TestAgentMatchIndex:
+    """The indexed matcher keeps the fnmatch semantics it replaces, in order."""
+
+    def test_exact_path_glob_lands_in_the_exact_set(self, fake_home):
+        skills_root = fake_home / ".kiro" / "skills"
+        demo = _write_skill(skills_root, "demo") / "SKILL.md"
+        agents_dir = fake_home / ".kiro" / "agents"
+        agents_dir.mkdir(parents=True)
+        expanded = _expand_agent_globs(
+            [("a", {"resources": [f"skill://{demo}"]}, agents_dir / "a.json")]
+        )
+
+        index = _build_agent_match_index(expanded)
+
+        [agent] = index.agents
+        assert agent.name == "a"
+        # Stored normcase-folded, the same fold fnmatch applies.
+        assert os.path.normcase(str(demo)) in agent.exact
+        assert agent.wildcard == ()
+        assert _agents_loading_skill_indexed(demo, index) == ["a"]
+
+    def test_exact_match_is_case_insensitive_where_fnmatch_is(self, fake_home, monkeypatch):
+        """On a case-insensitive filesystem an exact glob still matches a re-cased path.
+
+        ``fnmatch`` folds both sides through ``os.path.normcase``; the exact-set
+        lookup must fold too, or a mapped ``skill.md`` listed by the catalog as
+        ``SKILL.md`` would drop its loading agents from ``/api/skills``.
+        """
+        import ntpath
+
+        # Simulate a case-insensitive filesystem by folding to lowercase, as
+        # Windows' os.path.normcase does, without needing that OS.
+        monkeypatch.setattr(os.path, "normcase", ntpath.normcase)
+        agents_dir = fake_home / ".kiro" / "agents"
+        agents_dir.mkdir(parents=True)
+        mapped = fake_home / ".kiro" / "skills" / "demo" / "skill.md"
+        listed = fake_home / ".kiro" / "skills" / "demo" / "SKILL.md"
+        index = _build_agent_match_index(
+            _expand_agent_globs([("a", {"resources": [f"skill://{mapped}"]}, agents_dir / "a.json")])
+        )
+
+        assert _agents_loading_skill_indexed(listed, index) == ["a"]
+
+    def test_wildcard_glob_stays_on_fnmatch(self, fake_home):
+        skills_root = fake_home / ".kiro" / "skills"
+        demo = _write_skill(skills_root, "demo") / "SKILL.md"
+        agents_dir = fake_home / ".kiro" / "agents"
+        agents_dir.mkdir(parents=True)
+        expanded = _expand_agent_globs(
+            [("a", {"resources": ["skill://~/.kiro/skills/*/SKILL.md"]}, agents_dir / "a.json")]
+        )
+
+        index = _build_agent_match_index(expanded)
+
+        [agent] = index.agents
+        assert agent.exact == frozenset()
+        assert any("*" in g for g in agent.wildcard)
+        assert _agents_loading_skill_indexed(demo, index) == ["a"]
+
+    def test_index_matches_expected_names_across_a_mixed_set(self, fake_home):
+        skills_root = fake_home / ".kiro" / "skills"
+        names = ["alpha", "beta", "gamma"]
+        paths = [_write_skill(skills_root, n) / "SKILL.md" for n in names]
+        agents_dir = fake_home / ".kiro" / "agents"
+        agents_dir.mkdir(parents=True)
+        parsed = [
+            # one agent uses a wildcard (loads all three),
+            ("wild", {"resources": ["skill://~/.kiro/skills/*/SKILL.md"]}, agents_dir / "w.json"),
+            # one names two exact paths (alpha and gamma),
+            (
+                "exact",
+                {"resources": [f"skill://{paths[0]}", f"skill://{paths[2]}"]},
+                agents_dir / "e.json",
+            ),
+            # one loads nothing here.
+            ("none", {"resources": ["skill://~/.kiro/skills/missing/SKILL.md"]}, agents_dir / "n.json"),
+        ]
+        index = _build_agent_match_index(_expand_agent_globs(parsed))
+
+        assert _agents_loading_skill_indexed(paths[0], index) == ["wild", "exact"]
+        assert _agents_loading_skill_indexed(paths[1], index) == ["wild"]
+        assert _agents_loading_skill_indexed(paths[2], index) == ["wild", "exact"]
+
+    def test_matched_order_follows_agent_order(self, fake_home):
+        skills_root = fake_home / ".kiro" / "skills"
+        demo = _write_skill(skills_root, "demo") / "SKILL.md"
+        agents_dir = fake_home / ".kiro" / "agents"
+        agents_dir.mkdir(parents=True)
+        parsed = [
+            (name, {"resources": [f"skill://{demo}"]}, agents_dir / f"{name}.json")
+            for name in ("zeta", "alpha", "mu")
+        ]
+        index = _build_agent_match_index(_expand_agent_globs(parsed))
+
+        assert _agents_loading_skill_indexed(demo, index) == ["zeta", "alpha", "mu"]
+
+    def test_skills_root_is_resolved_once_per_index_not_per_row(self, fake_home, monkeypatch):
+        """The alias rule's skills-root check runs once per index, however many rows miss."""
+        import kiro_crew.skills as skills_module
+
+        root = skills_module.skills_dir()
+        rows = [_write_skill(root, f"row{i}") / "SKILL.md" for i in range(3)]
+        agents_dir = fake_home / ".kiro" / "agents"
+        agents_dir.mkdir(parents=True)
+        pattern = f"skill://{root}/some-app/*/SKILL.md"
+        parsed = [
+            (f"a{j}", {"resources": [pattern]}, agents_dir / f"a{j}.json") for j in range(5)
+        ]
+        expanded = _expand_agent_globs(parsed)
+        seen: list[str] = []
+        real_validate = skills_module.validate_file_path
+
+        def recording_validate(raw: str) -> str | None:
+            seen.append(raw)
+            return real_validate(raw)
+
+        monkeypatch.setattr(skills_module, "validate_file_path", recording_validate)
+        index = _build_agent_match_index(expanded)
+        # Every agent carries an alias mapping, so each row reaches the alias rule.
+        assert all(agent.aliases for agent in index.agents)
+
+        assert [_agents_loading_skill_indexed(row, index) for row in rows] == [[], [], []]
+        assert seen.count(str(root)) == 1
+
 
 class TestProjectRelativeGlobAnchorsOnProjectDir:
     """The picker's agent filter must resolve a workspace-relative
@@ -1086,6 +1256,15 @@ class TestEndpoints:
         async with TestClient(TestServer(_make_app(state))) as client:
             resp = await client.get("/api/skills/kiro-user/nope/-/tree")
             assert resp.status == 404
+            assert (await resp.json())["code"] == "skill_not_found"
+
+    @pytest.mark.asyncio
+    async def test_file_endpoint_404_for_unknown(self, fake_home):
+        state = MagicMock(_slots={}, context_builder=None)
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.get("/api/skills/kiro-user/nope/-/file?path=SKILL.md")
+            assert resp.status == 404
+            assert (await resp.json())["code"] == "skill_not_found"
 
     @pytest.mark.asyncio
     async def test_file_endpoint_returns_content(self, fake_home):
@@ -1489,7 +1668,13 @@ class TestSessionScopedSkillResolution:
     async def test_app_projectless_slot_cannot_fall_back_to_foreign_project(
         self, fake_home, tmp_path, monkeypatch
     ):
-        """An owned slot without a project must not inherit another slot's project."""
+        """An owned slot without a project must not inherit another slot's project.
+
+        The catalog answers it with no project at all, which is how an app chat
+        (always projectless) reaches its own skills. The ``kiro-workspace/``
+        browse routes resolve through the shared-project fallback, so they keep
+        the uniform 404.
+        """
         from kiro_crew.dashboard.handlers import api_skill_detail, prompts
         from kiro_crew.skills import SkillsLoader
 
@@ -1507,6 +1692,13 @@ class TestSessionScopedSkillResolution:
         state._standalone_skills = SkillsLoader(install_builtins=False)
         audit = MagicMock()
         monkeypatch.setattr(prompts, "_sel", lambda: audit)
+        catalog_projects = []
+
+        def collect(_skills, _package, project_dir):
+            catalog_projects.append(project_dir)
+            return []
+
+        monkeypatch.setattr(prompts, "collect_skills_blocking", collect)
         app = _make_app(state)
         app.router.add_get("/api/skills/{name:.+}", api_skill_detail)
 
@@ -1517,14 +1709,17 @@ class TestSessionScopedSkillResolution:
 
         app.middlewares.insert(0, inject_app)
         headers = {"X-Session-Key": "owned-projectless"}
-        paths = (
-            "/api/skills",
+        browse_paths = (
             "/api/skills/kiro-workspace/foreign-skill/-/tree",
             "/api/skills/kiro-workspace/foreign-skill/-/file?path=SKILL.md",
             "/api/skills/kiro-workspace/foreign-skill",
         )
         async with TestClient(TestServer(app)) as client:
-            for path in paths:
+            response = await client.get("/api/skills", headers=headers)
+            assert response.status == 200
+            assert await response.json() == []
+            assert catalog_projects == [None]
+            for path in browse_paths:
                 response = await client.get(path, headers=headers)
                 assert response.status == 404, path
                 assert (await response.json())["code"] == "slot_not_found"
@@ -1534,5 +1729,20 @@ class TestSessionScopedSkillResolution:
             for call in audit.log_api_access.call_args_list
             if call.kwargs.get("outcome") == "denied"
         ]
-        assert len(denied) == len(paths)
+        assert len(denied) == len(browse_paths)
         assert all(call.kwargs["source"] == "app_isolation" for call in denied)
+        assert all(call.kwargs["error"] == "owned slot has no project" for call in denied)
+        allowed = [
+            call.kwargs
+            for call in audit.log_api_access.call_args_list
+            if call.kwargs.get("outcome") == "allowed"
+        ]
+        assert allowed == [
+            {
+                "caller": "app-A",
+                "operation": "skills_list",
+                "outcome": "allowed",
+                "source": "app_isolation",
+                "resources": "slot=owned-projectless",
+            }
+        ]

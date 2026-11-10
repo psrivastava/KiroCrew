@@ -9,6 +9,7 @@ import { createArtifactsProvider } from '../../components/commandPalette/provide
 import type { ArtifactsResponse } from '../../components/commandPalette/providers/artifactsProvider'
 import { createFoldersProvider, FOLDERS_STALE_MS } from './foldersProvider'
 import { createMatesProvider, mateRoute } from './matesProvider'
+import { busySlotKeys } from '../../lib/crewMode'
 import type { KiroCrewAgent } from '../../components/AgentSelector'
 import { useFolderSortRead, type FolderSortConfigBody } from '../../hooks/useFolderSortMode'
 import { useRecentsProvider } from '../../components/commandPalette/providers/recentsProvider'
@@ -35,7 +36,7 @@ export function useCommandBarOverlayEngines({
   /** Accepted-but-unstarted sub-agents per slot key (`chat.subagentQueued`). */
   subagentQueued?: Record<string, number>
   dispatch: AppDispatch
-  navigate: (route: string) => void
+  navigate: (route: string) => boolean | void
 }) {
   // Constructing the sessions engine is just memoized closures — it issues no
   // request until `search()` is called, and only the sessions VIEW calls it. That
@@ -43,11 +44,10 @@ export function useCommandBarOverlayEngines({
   // Constructed here but INERT until the sessions view is entered: the hook's own
   // ['instances'] query would otherwise fire on a warm install the moment the root
   // opened, which is exactly the request this surface promises not to make.
-  // The sessions open right now; the search ranks their hits above history (#21290).
-  const openSessionKeys = useMemo(() => new Set(liveSlots.map(slot => slot.key)), [liveSlots])
-  // The same set as a stable string, so the cached search rows re-rank when it changes.
-  const openSessionsKey = useMemo(() => [...openSessionKeys].sort().join('\u0000'), [openSessionKeys])
-  const sessions = useSessionsProvider({ active: scope === 'sessions', openSessionKeys })
+  // The sessions open right now, as a stable string. The server marks which hits
+  // they own (#21290); a change here re-runs the search so the rows re-rank.
+  const openSessionsKey = useMemo(() => liveSlots.map(slot => slot.key).sort().join('\u0000'), [liveSlots])
+  const sessions = useSessionsProvider({ active: scope === 'sessions', openSessionsKey })
   // The sessions view's LISTING engine. Constructed here and inert: the hook reads
   // live slots out of the store and reads a localStorage preference, but issues no
   // request until `search()` is called, and the only call site is gated on the
@@ -207,10 +207,11 @@ export function useCommandBarOverlayEngines({
    * question the reader is asking: whether interrupting would land on a busy agent.
    */
   const runningMates = useMemo(() => {
+    // A session the mate dispatched counts toward its mate thread (`busySlotKeys`).
+    const busy = busySlotKeys(liveSlots, subagentQueued)
     const byName = new Set<string>()
     for (const slot of liveSlots) {
-      if (slot.mode !== 'member') continue
-      if (!(slot.running || slot.subagents_running || (subagentQueued?.[slot.key] ?? 0) > 0)) continue
+      if (slot.mode !== 'member' || !busy.has(slot.key)) continue
       if (slot.agent) byName.add(slot.agent)
     }
     return byName

@@ -44,7 +44,9 @@ import { ErrorCard, SESSION_START_REPEAT_REFUSAL_AT, capabilityRefusal, isAppAge
 import { isFeatureRequestRow } from '../../prompts/featureRequest'
 import { feedbackTracker } from '../../feedbackTracker'
 import NoticeCard from './NoticeCard'
-import { resolveTransientNotice } from './transientNotice'
+import { kasSignedOutBesideButton, resolveGatewayNotice } from './gatewayNotice'
+import CrewDispatchNoticeCard from './CrewDispatchNoticeCard'
+import CrewPausedNoticeCard from './CrewPausedNoticeCard'
 import WorkflowRunCard, { extractWorkflowRunId, isWorkflowRunTool } from './WorkflowRunCard'
 import SubagentRunCard, { extractSpawnRunLaunch, isSpawnRunTool } from './SubagentRunCard'
 import WorkflowCompletionCard, { isWorkflowCompletionMessage } from './WorkflowCompletionCard'
@@ -53,7 +55,11 @@ import { isSubagentCompletionMessage, type ParsedSubagentCompletion } from './su
 import { REASONING_ROLES, hasReasoningContent } from './groupDisplayItems'
 import { FileCard } from '../../components/FileCard'
 import { parseFileRecord } from '../../lib/fileRecord'
+import { isModelUnavailable } from '../../lib/modelUnavailable'
 import UserMessage from './UserMessage'
+import SessionMessageCard from './SessionMessageCard'
+import { isSessionSendTool, parseSessionSend } from './sessionRelay'
+import { i18nT } from '../../i18n/t'
 import CrewmateMessage, { type CrewmateIdentity } from './CrewmateMessage'
 import { crewmateBubbleClass, crewmateCornerClass, crewmateRunPosition } from '../../components/chat/crewmateBubbles'
 import { CardCornersContext } from '../../cards/cardCorners'
@@ -87,6 +93,10 @@ export interface TranscriptRendererOptions {
   /** Slot these rows belong to. The tool line keys its per-slot log off it;
    *  omitted (the single-chat surface) it reads the active slot's. */
   slot?: string
+  /** The LOCAL slot whose replies may draw lock tags with the owner's reveal.
+   *  A host showing this gateway's own session passes its key; the crew
+   *  window (another gateway's rows) never does. */
+  revealSlot?: string
   /** Whether a tool row animates as "running". Default: the transcript's
    *  running flag. ChatPage narrows it to the trailing group -- rows after the
    *  last assistant text while the slot is in `tool_running`. */
@@ -116,6 +126,13 @@ export interface TranscriptRendererOptions {
   onFileOpen?: (path: string, opts?: { line?: number; endLine?: number }) => void
   /** Open a directory in the host's side panel. Same #3300 blocker. */
   onFolderOpen?: (path: string) => void
+  /** Reveal the Crew (Workers) tab from the Crew Mode dispatch-notice button.
+   *  Host-owned because it must close the find pane (which keeps the dock
+   *  unmounted while open) and rebind a background pane's slot to the active one
+   *  before opening — neither reachable from the card. Absent (a side/embedded
+   *  chat, a crew window) leaves the card's button inert, the same opt-in shape
+   *  as the other host reveals above. */
+  onOpenCrewTab?: (slot: string) => void
   /** "Show in side panel" on a sub-agent completion card. Same #3300 blocker. */
   onOpenSubagentPanel?: (parsed: ParsedSubagentCompletion) => void
   /** Expanded-state map for tool rows, held ABOVE the row: a virtualised or
@@ -198,6 +215,13 @@ export interface TranscriptRendererOptions {
    *  `crewmate`. A getter, called on every row render, so the host can keep
    *  this renderer set's identity while the transcript streams. */
   crewmateTranscript?: () => ChatMessage[] | undefined
+  /** Read a crewmate's reply aloud from its More menu, the same action the
+   *  Sessions chat offers (`speakReply`). Read only with `crewmate`. */
+  onSpeak?: (content: string) => void
+  /** The browser blocked playback for this crewmate's slot: its replies show
+   *  their action rows without hover (the Sessions chat's `revealActions`).
+   *  Read only with `crewmate`. */
+  revealActions?: boolean
 }
 
 /** True when the error row at `index` is the seeded feature-request turn's own
@@ -388,6 +412,31 @@ export function createTranscriptRenderers(
       match: m => m.meta?.kind === 'warm_task_brief_claim',
       render: () => null,
     },
+    {
+      // The gateway's one-per-turn Crew Mode dispatch notice: a dispatched crew
+      // member is in the Crew (Workers) tab, not the session list, so this row
+      // names that tab and opens it. The gateway decides when it appears; the
+      // card only renders localized copy and the button.
+      id: 'crew_dispatch_notice',
+      roles: ['notice'],
+      match: m => m.meta?.kind === 'crew_dispatch_notice',
+      render: (_m, ctx) => ctx.row(
+        <CrewDispatchNoticeCard
+          key={ctx.key}
+          slot={o.slot}
+          onOpenCrewTab={o.onOpenCrewTab}
+        />,
+      ),
+    },
+    {
+      // The main chat's one "You paused the crew" row (Ultra Mode Pause all).
+      id: 'crew_paused_notice',
+      roles: ['notice'],
+      match: m => m.meta?.kind === 'crew_paused_notice',
+      render: (m, ctx) => ctx.row(
+        <CrewPausedNoticeCard key={ctx.key} stopped={Number(m.meta?.stopped) || 0} />,
+      ),
+    },
     // ── Shape-matched rows, ahead of anything keyed only by role ──
     {
       // A dollar-picked skill is gateway-authored context, not a conversational
@@ -447,6 +496,39 @@ export function createTranscriptRenderers(
         const launch = extractSpawnRunLaunch(m)
         if (!launch) return toolLine(m, ctx)
         return ctx.row(<SubagentRunCard key={ctx.key} launch={launch} slot={o.slot ?? ''} />, true)
+      },
+    },
+    {
+      // This session's OWN `session_send` tool call, once it DELIVERED: the
+      // OUTGOING session-message card, its `@tag` naming the slot the gateway
+      // resolved (so a send addressed by title links to the real key). Refines
+      // the generic tool line and must precede it. A call still running, refused,
+      // rejected or denied has no success result and stays that line, which shows
+      // its state; so does one whose args will not parse. `session_broadcast`
+      // (many targets) is left to the generic line — one `@tag` cannot name a
+      // fan-out.
+      id: 'session_send_tool',
+      roles: ['tool'],
+      match: m => !!m.content?.startsWith('🔧') && isSessionSendTool(m),
+      render: (m, ctx) => {
+        const call = parseSessionSend(m)
+        if (!call) return toolLine(m, ctx)
+        const selfKey = o.slot ?? o.activeSession ?? ''
+        const selfTitle = (selfKey && o.sessions?.get(selfKey)) || i18nT('pages.chat.sessionMessageCard.this_session')
+        const recipientTitle = o.sessions?.get(call.delivered) || o.sessions?.get(call.target) || call.target
+        return ctx.row(
+          <SessionMessageCard
+            key={ctx.key}
+            sender={{ key: selfKey || 'self', title: selfTitle }}
+            recipient={{ key: call.delivered, title: recipientTitle }}
+            body={call.message}
+            time={formatTs(m.ts)}
+            // The same gate as the body's session chips: a host that withholds
+            // the roster (offline) cannot navigate, so the @tag stays plain text.
+            onOpenSession={o.sessions ? o.onSessionOpen : undefined}
+          />,
+          true,
+        )
       },
     },
     {
@@ -640,10 +722,13 @@ export function createTranscriptRenderers(
             // DM with one named peer every send while it works is a steer, so
             // the ack kiro-cli emits would close nearly every reply with the
             // mechanics this surface hides (#17838). The marker is still
-            // stripped from the prose.
+            // stripped from the prose. No file-change chips either: the
+            // mate's writes (notes, scripts, its page) are not what the user
+            // reviews here (#30233).
             const bubble = renderAssistantBubble(m, ctx, crewmateBubbleClass(pos), {
               forceFooter: pos === 'single' || pos === 'end',
               suppressSteerAck: true,
+              hideFileChanges: true,
               // A crewmate's reply is prose about the crew's own work, so it
               // names sessions constantly. Same triple the single-chat page
               // hands its bubble, and `m.ts` with it so the SHORT form resolves
@@ -652,6 +737,9 @@ export function createTranscriptRenderers(
               sessions: o.sessions,
               activeSession: o.activeSession,
               messageTs: m.ts,
+              redactionSlot: o.revealSlot,
+              onSpeak: o.onSpeak,
+              revealActions: o.revealActions,
             })
             if (bubble === null) return null
             return ctx.row(
@@ -667,15 +755,20 @@ export function createTranscriptRenderers(
       id: 'error',
       roles: ['error'],
       render: (m, ctx) => {
-        // A transient-5xx notice the gateway is already retrying against is
-        // routine status, not a failure: localized copy on a soft NoticeCard.
-        // Only its terminal shape ("please try again") stays a red ErrorCard,
-        // with the same localized text.
-        const transient = resolveTransientNotice(m, ctx.messages, ctx.index)
+        // A gateway status row draws localized copy keyed on its notice token.
+        // A transient-5xx retry the gateway is already running is routine
+        // status, not a failure: a soft NoticeCard. Every other family keeps the
+        // red ErrorCard, with the localized text.
+        const transient = resolveGatewayNotice(m, ctx.messages, ctx.index)
         if (transient?.card === 'notice') {
           return ctx.row(<NoticeCard content={transient.text} tone={transient.tone} />)
         }
         const unentitled = isModelUnentitled(m)
+        // A model the backend refused for capacity or a rollout, after the
+        // retry ladder and the fallback chain were spent: the same fix as an
+        // unentitled model (pick another one, and change the default if new
+        // chats start on it), and never a Resume that re-sends to it.
+        const pickModelFix = unentitled || isModelUnavailable(m)
         const authRequired = isAuthRequired(m)
         const refusal = capabilityRefusal(m)
         const capabilitiesMember = refusal ? String((m.meta as { member?: unknown } | undefined)?.member ?? '') : ''
@@ -710,27 +803,30 @@ export function createTranscriptRenderers(
         // already answered past, is settled and its session may already be new.
         const overflow = isContextOverflow(m)
         const imageRepair = isImageRepair(m)
+        // The sign-in button sits under the row, so its copy points at it.
+        const besideSignIn = authRequired && o.onOpenSignIn ? kasSignedOutBesideButton(m) : null
         return ctx.row(
           <ErrorCard
-            content={transient ? transient.text : m.content}
+            content={besideSignIn ?? (transient ? transient.text : m.content)}
+            resumeContent={transient?.card === 'error' ? transient.resumeText : undefined}
             meta={m.meta}
             // A rejection the backend says no retry can fix never offers Continue,
             // even when this row is the newest and the turn was interrupted:
             // resuming would replay the identical rejection (or the same
             // signed-out wall, or the same spent allowance, or the same start
-            // that already failed twice).
+            // that already failed twice, or the same model the backend refused).
             onContinue={
-              !unentitled && !authRequired && !overflow && !featureRequestFormUrl && !sessionStartRepeat && !refusal && !isAppAgentRefused(m) && o.onContinue && o.continuable && o.interrupted && newest
+              !pickModelFix && !authRequired && !overflow && !featureRequestFormUrl && !sessionStartRepeat && !refusal && !isAppAgentRefused(m) && o.onContinue && o.continuable && o.interrupted && newest
                 ? o.onContinue
                 : undefined
             }
             sessionStartRepeat={sessionStartRepeat}
             onRestartGateway={sessionStartRepeat ? o.onRestartGateway : undefined}
             continuing={o.continuing}
-            onPickModel={unentitled ? o.onPickModel : undefined}
-            onOpenDefaultModel={unentitled ? o.onOpenDefaultModel : undefined}
+            onPickModel={pickModelFix ? o.onPickModel : undefined}
+            onOpenDefaultModel={pickModelFix ? o.onOpenDefaultModel : undefined}
             onOpenSignIn={authRequired ? o.onOpenSignIn : undefined}
-            unentitledElsewhere={unentitled}
+            unentitledElsewhere={pickModelFix}
             featureRequestFormUrl={featureRequestFormUrl}
             kiroCliMissing={featureRequestFormUrl ? isKiroCliMissing(m) : undefined}
             onOpenCapabilities={openCapabilities}
@@ -769,6 +865,10 @@ export function createTranscriptRenderers(
                 meta={m.meta}
                 timestamp={formatTs(m.ts)}
                 timestampTitle={fmtMessageTimeFull(m.ts)}
+                // A message another session delivered names its sender as a
+                // link; the same gate the body's session chips use.
+                sessions={o.onSessionOpen ? o.sessions : undefined}
+                onSessionOpen={o.sessions ? o.onSessionOpen : undefined}
                 // The session triple mirrors the crewmate bubble above, so a
                 // `/chat?sid=…` the USER pasted resolves exactly as the same
                 // link does in the reply quoting it back.
@@ -794,6 +894,18 @@ export function createTranscriptRenderers(
             </>,
             true,
           ),
+        } satisfies MessageRenderer]
+      : []),
+    // A host showing this gateway's own session (not a crewmate's chat, which
+    // has its own entry above) draws the reply with its lock tags and reveal.
+    ...(!crewmate && o.revealSlot
+      ? [{
+          id: 'assistant',
+          roles: ['assistant', 'streaming'],
+          render: (m: ChatMessage, ctx: MessageRenderContext) => {
+            const bubble = renderAssistantBubble(m, ctx, undefined, { redactionSlot: o.revealSlot })
+            return bubble === null ? null : ctx.wrapper(bubble)
+          },
         } satisfies MessageRenderer]
       : []),
   ]

@@ -1,7 +1,7 @@
 import { api } from '../../api/client'
 import { apiErrorCode } from '../../api/apiError'
 import modelTokensRaw from '../../model_tokens.json'
-import { markModelsDegraded, markModelsAuthRequired } from '../modelListHealth'
+import { markModelsDegraded, markModelsAuthRequired, modelHealthKey } from '../modelListHealth'
 import { isPricedMultiplier } from '../modelList'
 import { i18nT } from '../../i18n/t'
 import type {
@@ -226,11 +226,13 @@ export class AcpAdapter implements ProviderAdapter {
   }
 
   readonly labels: ProviderLabels = {
-    sessionProcess: 'ACP subprocess',
+    // Getters, not literals: these are shown inside translated copy, and the
+    // adapter is built once, so they must read the language at use time.
+    get sessionProcess() { return i18nT('providers.adapters.acp.session_process') },
     processCountLabel: 'acp_cli',
     configFile: 'kirocrew.json',
-    pluginRegistryName: 'Packages',
-    hooksSection: 'ACP Agent Hooks',
+    get pluginRegistryName() { return i18nT('providers.adapters.acp.plugin_registry_name') },
+    get hooksSection() { return i18nT('providers.adapters.acp.hooks_section') },
   }
 
   resolveAgentTemplate(agent: AgentBinding): string {
@@ -318,6 +320,7 @@ export class AcpAdapter implements ProviderAdapter {
         thisMonth: { sessions: s.this_month.sessions, messages: s.this_month.messages, toolCalls: s.this_month.tool_calls },
         avgMsgsPerSession: s.avg_msgs_per_session,
         refusedTranscripts: s.refused_transcripts ?? 0,
+        unreadableSessionDirs: s.unreadable_session_dirs ?? 0,
         dailyHistory: (s.daily_history || []).map((d: RawDailyHistory) => ({
           date: d.date,
           sessions: d.sessions,
@@ -366,6 +369,11 @@ export class AcpAdapter implements ProviderAdapter {
     }))
   }
 
+  async rescanProviderHooks(): Promise<boolean> {
+    const data = await api.rescanKiroHooks()
+    return data.agent_spec_rewritten !== false
+  }
+
   async listPlugins(): Promise<NormalizedPlugin[]> {
     const [agents, skills, mcp] = await Promise.all([
       api.capabilityAgentsList().catch(() => []),
@@ -406,14 +414,18 @@ export class AcpAdapter implements ProviderAdapter {
     return { ok: false as const, error: 'plugin update is not supported' }
   }
 
-  async fetchAvailableModels(): Promise<ModelInfo[]> {
+  async fetchAvailableModels(backend?: string): Promise<ModelInfo[]> {
+    // The last-good cache holds the configured backend's list: another backend's
+    // list neither reads it (wrong ids) nor writes it (every other picker reads it).
+    const configured = backend === undefined
+    const health = modelHealthKey(this.id, backend)
     try {
-      const models = await api.models()
+      const models = await api.models(backend)
       if (!Array.isArray(models) || models.length === 0) {
         // Empty/non-array success: NOT a live list — keep polling, serve the
         // last-good live list if we have one, else auto-only.
-        markModelsDegraded(this.id, true)
-        return readCachedModels() ?? this._defaultModels()
+        markModelsDegraded(health, true)
+        return (configured ? readCachedModels() : null) ?? this._defaultModels()
       }
       const result = models.map((m: RawModel) => {
         // Prefer the backend's resolved window over the bundled snapshot: the
@@ -438,8 +450,8 @@ export class AcpAdapter implements ProviderAdapter {
           rateMultiplier: rowMultiplier(m),
         }
       })
-      writeCachedModels(result) // remember this good live list for next hiccup
-      markModelsDegraded(this.id, false) // live success → self-heal can stop polling
+      if (configured) writeCachedModels(result) // remember this good live list for next hiccup
+      markModelsDegraded(health, false) // live success → self-heal can stop polling
       return result
     } catch (err) {
       // Transient backend failure (503 / network): NOT live — keep polling.
@@ -449,10 +461,11 @@ export class AcpAdapter implements ProviderAdapter {
       // signed-out kiro-cli login (503 `kiro_prerequisite_required`) can raise
       // the one actionable sign-in banner instead of the generic config-load
       // failure. Any other cause clears the auth flag — only this code means a
-      // sign-in wall.
-      markModelsDegraded(this.id, true)
-      markModelsAuthRequired(this.id, apiErrorCode(err) === 'kiro_prerequisite_required')
-      return readCachedModels() ?? this._defaultModels()
+      // sign-in wall. Another backend's list does not speak for the configured
+      // backend's sign-in, so only the configured list sets the flag.
+      markModelsDegraded(health, true, err instanceof Error ? err.message : '')
+      if (configured) markModelsAuthRequired(this.id, apiErrorCode(err) === 'kiro_prerequisite_required')
+      return (configured ? readCachedModels() : null) ?? this._defaultModels()
     }
   }
 

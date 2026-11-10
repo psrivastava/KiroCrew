@@ -48,6 +48,7 @@ const launchLog = createLaunchLog({
 });
 
 const { findConfiguredDashboardPort } = require("./data-home");
+const { onQuitForUpdate } = require("./close-action");
 const { defaultedPort } = require("./gateway-auth-hint");
 const {
   classifyBundleLocation,
@@ -56,6 +57,7 @@ const {
   describeLocation,
 } = require("./bundle-location");
 const { DEFAULT_REMOTE_BIN } = require("./remote-token");
+const { themeSplashUrl } = require("./theme-splash");
 const {
   fallbackLocalPort,
   isSelectablePort,
@@ -69,7 +71,10 @@ const { resolveHome } = require("./home-dir");
 const { internalSecretFor } = require("./local-token");
 const { identityFamily } = require("./instance-guard");
 const { isCCrew, ccrewAppName, CCREW_DEFAULT_PORT } = require("./ccrew-identity");
+const { EDITION_LTS, readBakedEdition } = require("./edition");
 const { describeSingletonLock } = require("./singleton-lock");
+const { startLinuxDesktopIntegration } = require("./linux-desktop-integration");
+const { resolveLinuxInstall } = require("./auto-update");
 const { initNativeLogging } = require("./native-logging");
 const { armCrashCollector, collectCrashReports } = require("./crash-collector");
 const { initGpuPolicy } = require("./disable-gpu");
@@ -79,7 +84,8 @@ const { cancelPendingTrayHide } = require("./hide-to-tray");
 const { exitImmersiveModes } = require("./blocking-prompt");
 const { createMetricsRecorder } = require("./perf-metrics");
 const { initMochi, shutdownMochi } = require("./mochi/index");
-const { borrowSessionToken } = require("./mochi-session-token");
+const { borrowSessionToken, sessionCookieHeader } = require("./mochi-session-token");
+const { createAppWindowHost } = require("./app-window-host");
 const { clearCacheOnUpgrade } = require("./upgrade-cache");
 const {
   initCrewCompanion,
@@ -96,12 +102,17 @@ const { createDeepLinkHandler, installDeepLinks, installNavigateReady } = requir
 // gateway is restored. suspend/resume keep the companion's loop and IPC handlers
 // intact, so the failure path needs no re-init. Both are best-effort — a
 // companion teardown must never block an update or its recovery.
+// The same holds for the windows apps declare through the desktop window host.
 function closeCrewCompanionForUpdate() {
   try { suspendCrewCompanion(); } catch { /* best effort */ }
+  try { appWindowHost?.suspend(); } catch { /* best effort */ }
 }
 function reopenCrewCompanionAfterUpdate() {
   try { resumeCrewCompanion(); } catch { /* best effort */ }
+  try { appWindowHost?.resume(); } catch { /* best effort */ }
 }
+/** The desktop windows and shortcuts apps declare in their manifest; see app-window-host.js. */
+let appWindowHost = null;
 const { createGatewaySupervisor } = require("./gateway-supervisor");
 const {
   createShellBundleWatch,
@@ -157,6 +168,8 @@ const store = new Store({
     runLocalGateway: true,
     // "background" or "quit". See close-action.js.
     closeAction: "background",
+    // Only false hides it, and only while the close button quits. See tray-icon.js.
+    showTrayIcon: true,
     linuxFrameless: null,
     // Written by gpu-crash-fallback.js when the GPU process dies at startup;
     // read before Chromium initializes on the next launch.
@@ -239,20 +252,28 @@ const BACKEND_URL = "http://localhost:" + PORT;
 // requestSingleInstanceLock() and userData independent of an installed KiroCrew,
 // so double-clicking CCrew.app never loses the lock to a running KiroCrew and
 // gets fronted instead of launching (see ccrew-identity.js).
+// The LTS edition is a side-by-side app like nightly (packaging/build-desktop.sh
+// "KiroCrew LTS"), so its own name and app ID keep it apart from production. // brand-ok
+const IS_LTS_BUILD = readBakedEdition() === EDITION_LTS;
 app.name = ccrewAppName()
   ?? (identityFamily(app.getVersion()) === "nightly"
     ? "Kiro Crew Nightly"
-    : "Kiro Crew");
+    : IS_LTS_BUILD ? "Kiro Crew LTS" : "Kiro Crew");
 
-// Windows groups and pins the live window by this ID. Nightly must remain
-// side-by-side with stable, matching the packaged app IDs.
+// Windows groups and pins the live window by this ID. Nightly and LTS must
+// remain side-by-side with stable, matching the packaged app IDs.
 if (process.platform === "win32") {
-  const appUserModelId = isCCrew()
-    ? "com.ccrew.app"
-    : identityFamily(app.getVersion()) === "nightly"
-      ? "com.amazon.kiro.crew.nightly"
-      : "com.amazon.kiro.crew";
-  app.setAppUserModelId(appUserModelId);
+  const appUserModelId = identityFamily(app.getVersion()) === "nightly"
+    ? "com.amazon.kiro.crew.nightly"
+    : "com.amazon.kiro.crew";
+  // LTS: the production ID plus ".lts", the packaged win.appId build-desktop.sh
+  // derives from package.json build.appId (electron-builder strips `build` from
+  // the packaged package.json, so it cannot be read here).
+  app.setAppUserModelId(
+    isCCrew()
+      ? "com.ccrew.app"
+      : IS_LTS_BUILD ? `${appUserModelId}.lts` : appUserModelId,
+  );
 }
 
 function gatewayLogPath() {
@@ -403,6 +424,14 @@ const requestQuit = () => {
   app.quit();
 };
 
+// An update install closes every window BEFORE it emits before-quit, so the
+// flag has to be set here as well or the main window hides to tray instead of
+// closing and the install never reaches ShipIt (#29449, see close-action.js).
+onQuitForUpdate(electron.autoUpdater, () => {
+  if (!isQuitting) glog("update: installer is quitting the app; window closes no longer hide to tray");
+  isQuitting = true;
+});
+
 // Only the lock winner may arm native logging. A rejected second instance must
 // not rotate chromium.log out from under the primary process.
 if (!app.requestSingleInstanceLock()) {
@@ -451,7 +480,9 @@ if (!app.requestSingleInstanceLock()) {
     log: glog,
   });
 
-  // Chromium reads GPU switches during initialization, so the opt-in policy
+  // Chromium reads GPU switches during initialization, so the GPU policy (opt-in
+  // via KIROCREW_DISABLE_GPU / --disable-gpu, auto on a Windows RDP session,
+  // forced on by KIROCREW_DISABLE_GPU=0 / --enable-gpu)
   // must run inside the lock-winner branch and before app ready. Reading the
   // winning process's env/argv also avoids pretending a second-instance argv
   // handoff can repair the renderer that already launched.
@@ -470,7 +501,7 @@ if (!app.requestSingleInstanceLock()) {
     log: glog,
   });
 
-  // Same timing constraint as the opt-in above: a persisted software-rendering
+  // Same timing constraint as the GPU policy above: a persisted software-rendering
   // decision has to reach Chromium before it initializes. Also arms the
   // `child-process-gone` listener that makes that decision, so a GPU process
   // that dies before the dashboard loads relaunches the app once in software
@@ -564,6 +595,7 @@ const gateway = createGatewaySupervisor({
   predictLocalPort: () => fallbackLocalPort(store, glog),
   // The respawned backend can be healthy while this app's own bundle is gone.
   onStaleBundleRespawn: () => shellBundleWatch.checkNow(),
+  currentThemeSplash: () => themeSplashUrl(app.getPath("userData")),
 });
 
 // Shared single-use registry of downloads the renderer explicitly asked for.
@@ -772,8 +804,34 @@ app.whenReady().then(async () => {
   // Security and every non-update bridge are installed before the first
   // dashboard or untrusted browser WebContents can be created.
   ipcRegistrar.registerShell();
-  windows.createTray();
+  windows.syncTray();
   const mainWindow = windows.createMainWindow();
+
+  // Linux AppImage desktop integration. It creates the first launcher and then
+  // reconciles only files whose hashes still match bytes Kiro Crew wrote. The
+  // reconciliation itself (synchronous filesystem work plus one packaged
+  // helper process per fingerprint, publish, and cleanup step) runs on a worker
+  // thread; the main thread only evaluates the plan and receives the result,
+  // and no thread is started on a non-AppImage install. The promise never
+  // rejects by contract; the catch below is the last fence for a defect in it.
+  try {
+    startLinuxDesktopIntegration({
+      env: process.env,
+      installKind: resolveLinuxInstall({
+        env: process.env,
+        resourcesPath: process.resourcesPath,
+      }).kind,
+      version: app.getVersion(),
+      stateDir: app.getPath("userData"),
+      uid: typeof process.geteuid === "function" ? process.geteuid() : null,
+      resourcesPath: process.resourcesPath,
+      log: (m) => { try { glog(`desktop-integration: ${m}`); } catch { /* ignore */ } },
+    }).catch((e) => {
+      try { glog(`desktop-integration: failed: ${e && e.message}`); } catch { /* ignore */ }
+    });
+  } catch (e) {
+    try { glog(`desktop-integration: skipped: ${e && e.message}`); } catch { /* ignore */ }
+  }
 
   // The global accelerator needs an existing main window. The updater needs
   // that same window for notifications, but MUST be fully registered before
@@ -821,6 +879,19 @@ app.whenReady().then(async () => {
   } catch (error) {
     glog("crew-companion: init failed — " + (error && error.message));
   }
+  try {
+    appWindowHost = createAppWindowHost({
+      electron,
+      backendUrl: BACKEND_URL,
+      fetchGatewayAuth: () => fetchMochiGatewayAuth(BACKEND_URL),
+      cookieHeader: sessionCookieHeader,
+      preloadPath: path.join(__dirname, "app-window-preload.js"),
+      log: glog,
+    });
+    appWindowHost.start();
+  } catch (error) {
+    glog("app-window-host: init failed — " + (error && error.message));
+  }
 
   // Preserve the historical registration point: activation starts being
   // handled only after boot and optional companion initialization finish.
@@ -844,6 +915,11 @@ app.on("before-quit", () => {
   shutdownMochi();
   try {
     shutdownCrewCompanion();
+  } catch {
+    // Best effort during quit.
+  }
+  try {
+    appWindowHost?.stop();
   } catch {
     // Best effort during quit.
   }

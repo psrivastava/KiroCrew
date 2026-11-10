@@ -48,12 +48,42 @@ it passes the same ceiling the derived rules do, or it does not travel.
 from __future__ import annotations
 
 import logging
-import re
 from collections.abc import Callable, Iterable
 from typing import Any
 
+from kiro_crew.acp.kas_hook_mcp import (  # noqa: F401 - cached_mcp_tool_names is re-exported
+    APPROVED_MCP_SERVER_PREFIX,
+    auto_approved_mcp_servers,
+    cached_mcp_tool_names,
+)
+from kiro_crew.acp.kas_settings_mcp import CREW_SETTINGS_MCP_KEY
+from kiro_crew.acp.kas_spec_grants import (
+    CREW_ANSWERED_PATHS_KEY,
+    CREW_ANSWERED_READ_PATHS_KEY,
+    CREW_SHELL_READONLY_KEY,
+    READ_SETTINGS_KEYS,
+    SHELL_SETTINGS_KEYS,
+    WRITE_SETTINGS_KEYS,
+)
+from kiro_crew.acp.kas_subagent_rules import (  # noqa: F401 - trusted_agents_withheld re-exported
+    _agent_glob,
+    _available_agents_rules,
+    trusted_agents_withheld,
+)
+from kiro_crew.acp.kas_tool_rows import (  # noqa: F401 - re-exported
+    _HOOK_ONLY_ROWS,
+    KAS_TOOL_IDS_BY_KIRO_TOOL,
+    KAS_TOOL_MATCH_VOCABULARY,
+    kas_tool_match_names,
+)
+from kiro_crew.acp.kas_unread_commands import unreadable_allowlist_entries
 from kiro_crew.platform import allowed_commands as allowed_commands_mod
-from kiro_crew.platform.tool_names import KIRO_CLI_NAME_BY_KAS_TOOL, KIRO_TOOL_ALIASES
+from kiro_crew.platform import allowed_paths as allowed_paths_mod
+from kiro_crew.platform.tool_names import KIRO_TOOL_ALIASES, canonical_kiro_cli_tool_name
+from kiro_crew.platform.tools_settings_aliases import (
+    _TOOLS_SETTINGS_FAMILY,
+    canonical_tools_settings,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -133,6 +163,7 @@ WITHHELD_FROM_AUTO_APPROVE: frozenset[str] = frozenset(
         "execute_bash",
         "execute_pwsh",
         "control_bash_process",
+        "control_pwsh_process",
     }
 )
 
@@ -147,13 +178,89 @@ CREW_ANSWERED_BUILTINS_KEY = "_crewAnsweredBuiltins"
 #: the session's own record, like :data:`CREW_ANSWERED_BUILTINS_KEY`.
 CREW_ANSWERED_COMMANDS_KEY = "_crewAnsweredCommands"
 
+#: The key a projected entry carries its :func:`spec_shell_allowlist` under, for
+#: the session's own record, like :data:`CREW_ANSWERED_COMMANDS_KEY`. Present only
+#: when the spec sets ``denyByDefault``; the gate then refuses every shell call no
+#: entry of the list matches.
+CREW_SHELL_ALLOWLIST_KEY = "_crewShellAllowlist"
+
+#: The key a projected entry carries its :func:`spec_write_allowlist` under, like
+#: :data:`CREW_SHELL_ALLOWLIST_KEY`. Present only when the spec sets the write
+#: tool's ``fallbackAction: "deny"``; the gate then refuses every file write no
+#: entry of the list covers.
+CREW_WRITE_ALLOWLIST_KEY = "_crewWriteAllowlist"
+
+#: The key a projected entry carries the ``@server/tool`` refs of the write-class
+#: MCP tools the batch write guard kept at ``ask`` under
+#: (``batch_guard.withhold_write_auto_approval``). The session record reads them
+#: with :data:`CREW_ANSWERED_BUILTINS_KEY`, and the gate's ``batch-guard-grant``
+#: row answers them.
+CREW_ANSWERED_WRITES_KEY = "_crewAnsweredWrites"
+
+#: The key of the grants Crew honours once its gate checks the spec's denies
+#: (:mod:`kiro_crew.acp.kas_spec_denies`).
+CREW_SPEC_DENIES_KEY = "_crewSpecDenies"
+
 #: Keys of a projected ``customAgents`` entry that never reach the engine.
 CREW_ONLY_ENTRY_KEYS: frozenset[str] = frozenset(
-    {CREW_ANSWERED_BUILTINS_KEY, CREW_ANSWERED_COMMANDS_KEY}
+    {
+        CREW_ANSWERED_BUILTINS_KEY,
+        CREW_ANSWERED_COMMANDS_KEY,
+        CREW_ANSWERED_WRITES_KEY,
+        CREW_SPEC_DENIES_KEY,
+        CREW_SHELL_ALLOWLIST_KEY,
+        CREW_WRITE_ALLOWLIST_KEY,
+        CREW_ANSWERED_PATHS_KEY,
+        CREW_ANSWERED_READ_PATHS_KEY,
+        CREW_SHELL_READONLY_KEY,
+        CREW_SETTINGS_MCP_KEY,
+    }
 )
 
-#: The ``toolsSettings`` keys kiro-cli reads its shell settings under.
-_SHELL_SETTINGS_KEYS = ("execute_bash", "shell")
+
+def _entry_crew_answered(entry: Any) -> frozenset[str]:
+    """The :data:`CREW_ANSWERED_BUILTINS_KEY` list of one projected entry.
+
+    Anything that is not a list of strings answers empty: a grant Crew answers
+    without a prompt must come from the projection, never from a guess. The
+    :data:`CREW_ANSWERED_WRITES_KEY` refs join it, read the same way: the
+    ``@server/tool`` writes the batch write guard kept at ``ask``.
+    """
+    names: set[str] = set()
+    for key in (CREW_ANSWERED_BUILTINS_KEY, CREW_ANSWERED_WRITES_KEY):
+        raw = entry.get(key) if isinstance(entry, dict) else None
+        if isinstance(raw, list):
+            names.update(n for n in raw if isinstance(n, str) and n)
+    return frozenset(names)
+
+
+def _entry_crew_answered_commands(entry: Any) -> tuple[str, ...]:
+    """The :data:`CREW_ANSWERED_COMMANDS_KEY` patterns of one projected entry, read
+    like :func:`_entry_crew_answered`: anything malformed answers empty."""
+    raw = entry.get(CREW_ANSWERED_COMMANDS_KEY) if isinstance(entry, dict) else None
+    if not isinstance(raw, list):
+        return ()
+    return tuple(p for p in raw if isinstance(p, str) and p)
+
+
+def _entry_shell_allowlist(entry: Any) -> tuple[str, ...] | None:
+    """The :data:`CREW_SHELL_ALLOWLIST_KEY` patterns of one projected entry.
+
+    ``None`` when the entry has no such key (no ``denyByDefault``). A value that is
+    present but not a list of strings reads as ``()``, which allows no command: a
+    restriction is never lifted by a malformed record.
+    """
+    if not isinstance(entry, dict) or CREW_SHELL_ALLOWLIST_KEY not in entry:
+        return None
+    raw = entry[CREW_SHELL_ALLOWLIST_KEY]
+    if not isinstance(raw, list):
+        return ()
+    return tuple(p for p in raw if isinstance(p, str) and p)
+
+
+#: The ``toolsSettings`` keys kiro-cli reads its shell settings under. After
+#: :func:`canonical_tools_settings` at most one of them is present.
+_SHELL_SETTINGS_KEYS = SHELL_SETTINGS_KEYS
 
 #: Bounds on what :func:`crew_answered_commands` keeps, so the record the session
 #: carries and the work the gate does per shell call stay small.
@@ -163,36 +270,14 @@ _MAX_ALLOWED_COMMANDS = 64
 def allowed_command_pattern(raw: Any) -> str | None:
     """One kiro-cli ``allowedCommands`` entry as Crew records it, or ``None``.
 
-    Only the subset :mod:`kiro_crew.platform.allowed_commands` reads the same way
-    kiro-cli does, and matches in linear time, is kept (stripped); any other entry
+    Only the syntax :mod:`kiro_crew.platform.allowed_commands` reads the same way
+    kiro-cli does, and matches in linear time, is kept; any other entry
     is ``None`` and its commands keep prompting. Kept verbatim, as kiro-cli reads it.
     """
     if allowed_commands_mod.parse(raw) is None:
         return None
     assert isinstance(raw, str)
     return raw
-
-
-def without_allowed_commands(tools_settings: Any) -> Any:
-    """*tools_settings* with each shell entry's ``allowedCommands`` key left out.
-
-    For :func:`withhold_answered_under_authored_rules`, which reads ANY entry for a
-    built-in as a restriction: the grant itself is not one. A shell entry that held
-    only that key goes too; every other key, and any malformed value, is kept, so
-    it still withholds.
-    """
-    if not isinstance(tools_settings, dict):
-        return tools_settings
-    out = dict(tools_settings)
-    for key in _SHELL_SETTINGS_KEYS:
-        entry = out.get(key)
-        if isinstance(entry, dict) and "allowedCommands" in entry:
-            rest = {k: v for k, v in entry.items() if k != "allowedCommands"}
-            if rest:
-                out[key] = rest
-            else:
-                del out[key]
-    return out
 
 
 def _usable_allowed_commands(tools_settings: Any) -> list[str]:
@@ -210,8 +295,43 @@ def _usable_allowed_commands(tools_settings: Any) -> list[str]:
     return list(dict.fromkeys(out))
 
 
-def crew_answered_commands(tools_settings: Any) -> list[str]:
-    """The ``shell.allowedCommands`` patterns Crew answers a KAS shell request for.
+def _authored_answered_allows(authored_permissions: Any) -> list[tuple[str, list[str]]]:
+    """``(capability, match)`` of each ``shell``/``fs_read``/``fs_write`` ``allow``
+    in the spec's own ``permissions`` block that has no ``exclude``.
+
+    Read as the merge reads the block (:func:`parse_user_permissions`, silently), so a
+    block it refuses grants nothing here. An ``exclude`` narrows the grant in a way the
+    gate cannot repeat, so such an allow keeps prompting.
+    """
+    rules = parse_user_permissions(authored_permissions, audit_decision=_asking_only) or []
+    return [
+        (rule["capability"], rule.get("match") or [])
+        for rule in rules
+        if rule["effect"] == "allow"
+        and rule["capability"] in WITHHELD_CAPABILITIES
+        and not rule.get("exclude")
+    ]
+
+
+def _shell_glob_pattern(glob: str) -> str | None:
+    """A KAS shell ``match`` glob as an ``allowedCommands`` entry, or ``None``.
+
+    ``*`` becomes ``.*`` (the reading :func:`_regex_to_glob` gives a deny the other
+    way) and every other character is a literal. A glob holding any other glob syntax
+    or a backslash is ``None``, so its commands keep prompting.
+    """
+    if "\\" in glob or set(glob) & (_GLOB_METACHARACTERS - {"*"}):
+        return None
+    body = "".join(
+        ".*" if ch == "*" else f"\\{ch}" if ch in _REGEX_METACHARACTERS else ch for ch in glob
+    )
+    return allowed_command_pattern(body)
+
+
+def crew_answered_commands(tools_settings: Any, authored_permissions: Any = None) -> list[str]:
+    """The ``shell.allowedCommands`` patterns Crew answers a KAS shell request for,
+    then the ``match`` globs of a ``shell`` ``allow`` in *authored_permissions*
+    (:func:`_shell_glob_pattern`).
 
     A shell allow never reaches the KAS policy (:data:`WITHHELD_CAPABILITIES`),
     so each command raises a permission request; the gate's ``spec-builtin-grant``
@@ -219,11 +339,237 @@ def crew_answered_commands(tools_settings: Any) -> list[str]:
     every deny tier and governance (``gate_tiers._tier_spec_builtin_grant``).
     Pure: the caller asks the governance ceiling about the shell tool.
     """
-    return _usable_allowed_commands(tools_settings)[:_MAX_ALLOWED_COMMANDS]
+    authored = [
+        pattern
+        for capability, match in _authored_answered_allows(authored_permissions)
+        if capability == "shell"
+        for glob in match
+        if (pattern := _shell_glob_pattern(glob))
+    ]
+    patterns = [*_usable_allowed_commands(tools_settings), *authored]
+    return list(dict.fromkeys(patterns))[:_MAX_ALLOWED_COMMANDS]
 
 
-def crew_answered_builtins(allowed_tools: Any) -> frozenset[str]:
-    """The :data:`WITHHELD_FROM_AUTO_APPROVE` built-ins *allowed_tools* grants.
+def shell_denies_by_default(tools_settings: Any) -> bool:
+    """Whether *tools_settings* sets ``denyByDefault`` on either shell key.
+
+    Any value other than ``False``/``None``/absent counts, so a malformed value
+    restricts rather than lifts the restriction.
+    """
+    if not isinstance(tools_settings, dict):
+        return False
+    for key in _SHELL_SETTINGS_KEYS:
+        settings = tools_settings.get(key)
+        if isinstance(settings, dict) and settings.get("denyByDefault") not in (None, False):
+            return True
+    return False
+
+
+#: The names :func:`allowed_tools_grant_shell` compares a folded ``allowedTools``
+#: entry against: the shell tool's own name and its short spelling
+#: (:data:`KIRO_TOOL_ALIASES`).
+_SHELL_TOOL_NAMES = frozenset({"execute_bash", "shell"})
+
+#: Prefix whose exact forms ``@builtin``, ``@builtin/`` and ``@builtin/*`` mean
+#: "every built-in"; ``@builtin/<name>`` names one built-in by its exact name.
+_BUILTIN_PREFIX = "@builtin"
+
+
+def allowed_tools_grant_shell(allowed_tools: Any) -> bool:
+    """Whether *allowed_tools* names the shell by name.
+
+    True when an entry is ``@builtin`` / ``@builtin/`` / ``@builtin/*``, or when
+    :func:`canonical_kiro_cli_tool_name` folds the whole entry to ``execute_bash``
+    or ``shell``: bare ``executeCmd`` and ``execute_cmd`` count, and after
+    ``@builtin/`` only the names kiro-cli accepts there (``execute_bash``,
+    ``execute_cmd``, ``shell``). Any other entry, one holding ``*`` or ``?``
+    included, grants nothing here, so the ``denyByDefault`` restriction stays
+    (fail closed).
+    """
+    if not isinstance(allowed_tools, list):
+        return False
+    for raw in allowed_tools:
+        if not isinstance(raw, str):
+            continue
+        entry = raw.strip()
+        if entry in (_BUILTIN_PREFIX, f"{_BUILTIN_PREFIX}/", f"{_BUILTIN_PREFIX}/*"):
+            return True
+        if canonical_kiro_cli_tool_name(entry) in _SHELL_TOOL_NAMES:
+            return True
+    return False
+
+
+def shell_denies_carried(tools_settings: Any, policy: Any) -> bool:
+    """Whether every ``deniedCommands`` entry of both shell keys reaches *policy*
+    as a KAS shell ``deny`` rule.
+
+    False when an entry has no glob spelling (:func:`_regex_to_glob`), holds a
+    redirect character KAS never sees (:data:`_REDIRECT_CHARACTERS`), is not a
+    string, when the value is not a list, or when the translated glob is not among
+    *policy*'s shell deny matches (a merge dropped it). Then the deny lives only in
+    the spec, and lifting ``denyByDefault`` would let the command it names run.
+    """
+    if not isinstance(tools_settings, dict):
+        return tools_settings is None
+    carried: set[str] = set()
+    rules = policy.get("rules") if isinstance(policy, dict) else None
+    for rule in rules if isinstance(rules, list) else ():
+        # Only a plain whole deny counts: a rule with any other key (an
+        # `exclude` carving commands out of it) does not prove the deny holds.
+        if (
+            isinstance(rule, dict)
+            and set(rule) == {"capability", "match", "effect"}
+            and rule["capability"] == "shell"
+            and rule["effect"] == "deny"
+            and isinstance(rule["match"], list)
+        ):
+            carried.update(m for m in rule["match"] if isinstance(m, str))
+    for key in _SHELL_SETTINGS_KEYS:
+        settings = tools_settings.get(key)
+        denied = settings.get("deniedCommands") if isinstance(settings, dict) else None
+        if denied is None or (isinstance(denied, list) and not denied):
+            continue
+        if not isinstance(denied, list):
+            return False
+        for raw in denied:
+            if not isinstance(raw, str):
+                return False
+            if not raw.strip():
+                continue
+            glob = _regex_to_glob(raw.strip())
+            if glob is None or set(glob) & _REDIRECT_CHARACTERS or glob not in carried:
+                return False
+    return True
+
+
+def spec_shell_allowlist(
+    tools_settings: Any, allowed_tools: Any = None, policy: Any = None
+) -> list[str] | None:
+    """The only shell commands a ``denyByDefault`` spec lets run, or ``None``.
+
+    ``None`` when neither shell key sets ``denyByDefault``, and when the spec's
+    *allowed_tools* names the shell (:func:`allowed_tools_grant_shell`) and every
+    ``deniedCommands`` entry rides the projected *policy* as a KAS deny rule
+    (:func:`shell_denies_carried`). kiro-cli allows
+    every command of an agent that lists the shell unless ``deniedCommands``
+    denies it, and applies ``denyByDefault`` only to an agent that does not list
+    the shell. Its commands then go through the gate's usual path and prompt or
+    are answered there. Otherwise the usable
+    ``allowedCommands`` patterns of both keys (:func:`crew_answered_commands`'s
+    subset and bound), possibly empty, then each entry outside the subset
+    (:func:`unreadable_allowlist_entries`), which matches nothing. The gate's
+    ``spec-shell-allowlist`` tier REFUSES a shell call of the session's own agent
+    that no pattern here matches, the way kiro-cli refuses it, on every approval
+    policy. An entry outside the subset, or past the bound, allows nothing: its
+    commands are refused, never let through (fail closed), and the session-start
+    notice and the refusal name it.
+
+    Read whatever the governance ceiling says: it is a restriction, not a grant.
+    A command it keeps still prompts unless :func:`crew_answered_commands` answers it.
+    """
+    if not shell_denies_by_default(tools_settings):
+        return None
+    if allowed_tools_grant_shell(allowed_tools) and shell_denies_carried(tools_settings, policy):
+        return None
+    return crew_answered_commands(tools_settings) + unreadable_allowlist_entries(tools_settings)
+
+
+#: The ``toolsSettings`` keys kiro-cli reads its file-write settings under.
+_WRITE_SETTINGS_KEYS = WRITE_SETTINGS_KEYS
+
+#: Bound on what :func:`spec_write_allowlist` keeps, like :data:`_MAX_ALLOWED_COMMANDS`.
+_MAX_ALLOWED_PATHS = 64
+
+
+def _write_falls_back_to_deny(settings: Any) -> bool:
+    """Whether one write entry sets ``fallbackAction`` to ``"deny"``.
+
+    Read case-insensitively, and a value that is not a string at all counts too, so
+    a malformed value restricts rather than lifts the restriction. Any other string
+    (``"interactive"``, the default) leaves the write prompting, as before.
+    """
+    if not isinstance(settings, dict) or "fallbackAction" not in settings:
+        return False
+    value = settings["fallbackAction"]
+    if value is None:
+        return False
+    if not isinstance(value, str):
+        return True
+    return value.strip().casefold() == "deny"
+
+
+def write_denies_by_default(tools_settings: Any) -> bool:
+    """Whether *tools_settings* sets ``fallbackAction: "deny"`` on either write key."""
+    if not isinstance(tools_settings, dict):
+        return False
+    return any(_write_falls_back_to_deny(tools_settings.get(k)) for k in _WRITE_SETTINGS_KEYS)
+
+
+def _usable_allowed_paths(
+    tools_settings: Any, keys: tuple[str, ...] = WRITE_SETTINGS_KEYS
+) -> list[str]:
+    """Every distinct usable ``allowedPaths`` entry of the *keys* entries (both write
+    keys by default), in order."""
+    if not isinstance(tools_settings, dict):
+        return []
+    out: list[str] = []
+    for key in keys:
+        settings = tools_settings.get(key)
+        entries = settings.get("allowedPaths") if isinstance(settings, dict) else None
+        for raw in entries if isinstance(entries, list) else ():
+            pattern = allowed_paths_mod.parse(raw)
+            if pattern is not None:
+                out.append(pattern)
+    return list(dict.fromkeys(out))
+
+
+def spec_write_allowlist(tools_settings: Any) -> list[str] | None:
+    """The only paths a ``fallbackAction: "deny"`` spec lets its write tool touch.
+
+    ``None`` when neither write key sets it. Otherwise the usable ``allowedPaths``
+    entries of both keys (the subset :mod:`kiro_crew.platform.allowed_paths` reads
+    the way kiro-cli does, at most :data:`_MAX_ALLOWED_PATHS`), possibly empty, as
+    the spec wrote them: the session handle anchors a relative entry at the
+    session's directory. The gate's ``spec-write-allowlist`` tier REFUSES a file
+    write of the session's own agent whose target none covers, the way kiro-cli
+    refuses it, on every approval policy. An entry outside the subset, or past the
+    bound, covers nothing: its writes are refused, never let through (fail
+    closed), and the session-start notice names it.
+
+    Read whatever the governance ceiling says: it is a restriction, not a grant. A
+    write it covers still prompts, as every KAS write does.
+    """
+    if not write_denies_by_default(tools_settings):
+        return None
+    return _usable_allowed_paths(tools_settings)[:_MAX_ALLOWED_PATHS]
+
+
+def crew_answered_paths(tools_settings: Any) -> list[str]:
+    """The write ``allowedPaths`` Crew answers a KAS write for (``kas_spec_grants``),
+    usable and bounded like :func:`spec_write_allowlist`. The caller asks the ceiling."""
+    return _usable_allowed_paths(tools_settings)[:_MAX_ALLOWED_PATHS]
+
+
+def _paths_not_all_carried(paths: Any, tools_settings: Any, tool: str) -> bool:
+    """Whether some of *tool*'s ``allowedPaths`` cannot be answered: an entry is
+    unusable, or the bound cuts the list. Those paths keep prompting."""
+    keys = READ_SETTINGS_KEYS if tool in READ_SETTINGS_KEYS else WRITE_SETTINGS_KEYS
+    return bool(paths) and (
+        not isinstance(paths, list)
+        or any(allowed_paths_mod.parse(p) is None for p in paths)
+        or len(_usable_allowed_paths(tools_settings, keys)) > _MAX_ALLOWED_PATHS
+    )
+
+
+def crew_answered_read_paths(tools_settings: Any) -> list[str]:
+    """The same for the read tool's ``allowedPaths`` (``fs_read`` / ``read``)."""
+    return _usable_allowed_paths(tools_settings, READ_SETTINGS_KEYS)[:_MAX_ALLOWED_PATHS]
+
+
+def crew_answered_builtins(allowed_tools: Any, authored_permissions: Any = None) -> frozenset[str]:
+    """The :data:`WITHHELD_FROM_AUTO_APPROVE` built-ins *allowed_tools* grants, and
+    each one whose capabilities an unscoped ``allow`` in *authored_permissions*
+    covers (no ``match``, or an empty one: every resource, as KAS reads it).
 
     Withholding a built-in from the KAS policy keeps its calls at ``ask``, so
     each one raises ``session/request_permission`` and reaches Crew's gate. The
@@ -239,16 +585,20 @@ def crew_answered_builtins(allowed_tools: Any) -> frozenset[str]:
     kiro-cli's short spellings (``shell``, ``read``, ``write``)
     are folded to the name a rule is written in, the way the gate reads a stamp.
     """
-    if not isinstance(allowed_tools, list):
-        return frozenset()
     out: set[str] = set()
-    for raw in allowed_tools:
+    for raw in allowed_tools if isinstance(allowed_tools, list) else ():
         if not isinstance(raw, str):
             continue
         entry = raw.strip()
         name = KIRO_TOOL_ALIASES.get(entry, entry)
         if entry in WITHHELD_FROM_AUTO_APPROVE or name in WITHHELD_FROM_AUTO_APPROVE:
             out.add(name)
+    granted = {cap for cap, match in _authored_answered_allows(authored_permissions) if not match}
+    out.update(
+        KIRO_TOOL_ALIASES.get(name, name)
+        for name, capabilities in _ANSWERED_CAPABILITIES.items()
+        if capabilities <= granted
+    )
     return frozenset(out)
 
 
@@ -258,7 +608,10 @@ def crew_answered_builtins(allowed_tools: Any) -> frozenset[str]:
 _ANSWERED_CAPABILITIES: dict[str, frozenset[str]] = {
     **dict.fromkeys(("fs_read", "read", "read_file", "grep", "glob"), frozenset({"fs_read"})),
     **dict.fromkeys(("fs_write", "fs_append", "str_replace", "write"), frozenset({"fs_write"})),
-    **dict.fromkeys(("execute_bash", "execute_pwsh", "control_bash_process"), frozenset({"shell"})),
+    **dict.fromkeys(
+        ("execute_bash", "execute_pwsh", "control_bash_process", "control_pwsh_process"),
+        frozenset({"shell"}),
+    ),
     "code": frozenset({"fs_read", "fs_write", "shell"}),
 }
 
@@ -297,9 +650,12 @@ def authored_restricted_capabilities(
       capability (meta capabilities expanded), whatever its ``match`` scope. A block
       that is not exactly ``{"rules": [...]}`` with no ``policies`` bundle, or any
       rule that cannot be read, restricts all three.
-    * ``toolsSettings``: any entry for one of these built-ins (in either spelling)
-      restricts its capabilities; ``@server`` entries are MCP and say nothing here.
-      A ``toolsSettings`` that is not an object restricts all three.
+    * ``toolsSettings``: any entry for one of these built-ins (in any kiro-cli
+      spelling, :func:`canonical_tools_settings`) restricts its capabilities;
+      ``@server`` entries are MCP and a known tool outside these three
+      (``web_fetch``, ``subagent``, ``use_aws``) says nothing here. A key Crew
+      cannot place, and a ``toolsSettings`` that is not an object, restrict all
+      three (fail closed).
     """
     restricted: set[str] = set()
     if authored_permissions is not None:
@@ -314,11 +670,17 @@ def authored_restricted_capabilities(
     if tools_settings not in (None, {}):
         if not isinstance(tools_settings, dict):
             return _ALL_ANSWERED_CAPABILITIES
+        tools_settings, _ = canonical_tools_settings(tools_settings)
         for key in tools_settings:
             if not isinstance(key, str):
                 return _ALL_ANSWERED_CAPABILITIES
+            if key.startswith(_MCP_PREFIX):
+                continue
             name = KIRO_TOOL_ALIASES.get(key, key)
-            restricted |= _ANSWERED_CAPABILITIES.get(name, frozenset())
+            if name in _ANSWERED_CAPABILITIES:
+                restricted |= _ANSWERED_CAPABILITIES[name]
+            elif key not in _TOOLS_SETTINGS_FAMILY and key != "use_aws":
+                return _ALL_ANSWERED_CAPABILITIES
     return frozenset(restricted & _ALL_ANSWERED_CAPABILITIES)
 
 
@@ -349,85 +711,19 @@ def withhold_answered_under_authored_rules(
     )
 
 
-#: kiro-cli tool name -> the KAS tool ids that do the same job.
-#:
-#: DERIVED, not hand-kept: the kiro-cli <-> KAS relationship has ONE table,
-#: :data:`kiro_crew.platform.tool_names.KIRO_CLI_NAME_BY_KAS_TOOL` (the policy
-#: direction: each KAS built-in id -> the kiro-cli name a rule about it is
-#: written under, pinned to the recorded engine registry). This mapping is its
-#: inverse, grouped per kiro-cli name, plus the rows only the hook vocabulary
-#: needs: ``fs_write`` is a KAS id as well as the kiro-cli name (a file create
-#: states it on a permission request), and ``web_fetch`` / ``web_search`` /
-#: ``use_subagent`` reach KAS tools no gate policy names. A matcher in an agent
-#: spec's ``hooks`` names tools in kiro-cli's vocabulary (``execute_bash``,
-#: ``fs_write``). KAS names its own tools differently, and the name it states for
-#: a call is the ``toolId`` of the permission request's ``_meta.kiro``
-#: (``AcpEvent.harness_tool_id``): a shell command is ``run_command``, a partial
-#: edit is ``str_replace``. Every id here is one a live KAS session (kiro-cli
-#: 2.24, ``--agent-engine v3``) stated on a permission request for that kind of
-#: call, and each row stays inside the KAS capability its kiro-cli name belongs
-#: to in KAS's tool table (``policy/capabilities.ts``), so a row never reaches a
-#: tool of a different kind.
-#:
-#: Coverage is per id, not per capability: a row lists the ids seen for that
-#: kind of call, and a KAS id outside every row (a process-control tool) is met
-#: only by a matcher that names it as written. A kiro-cli tool with no row
-#: (``use_aws``) meets no KAS call. Read it through
-#: :func:`kas_tool_match_names` and :data:`KAS_TOOL_MATCH_VOCABULARY`; the rows
-#: themselves are for a caller that must go from a kiro-cli name to KAS ids.
-_HOOK_ONLY_ROWS: dict[str, tuple[str, ...]] = {
-    "web_fetch": ("web_fetch",),
-    "web_search": ("remote_web_search",),
-    "use_subagent": ("invoke_sub_agent",),
-}
+#: Glob syntax kiro-cli's ``allowedTools`` matcher and KAS's ``mcp`` rule both
+#: read as "any run of characters" in the TOOL part of an ``@server/tool`` entry
+#: (``@server/read_*``). kiro-cli matches with ``globset``; KAS compiles the rule
+#: to a Cedar ``like`` (``cedar-compiler.ts`` ``globToCedarLike``), where ``*`` is
+#: the only wildcard. Only this one travels; see :data:`_UNSHARED_GLOB_SYNTAX`.
+_SHARED_GLOB_SYNTAX = frozenset("*")
 
-
-def _rows_from_policy_table() -> dict[str, tuple[str, ...]]:
-    grouped: dict[str, list[str]] = {"fs_write": ["fs_write"]}
-    for kas_id, kiro_cli_name in KIRO_CLI_NAME_BY_KAS_TOOL.items():
-        grouped.setdefault(kiro_cli_name, []).append(kas_id)
-    rows = {name: tuple(ids) for name, ids in grouped.items()}
-    rows.update(_HOOK_ONLY_ROWS)
-    return rows
-
-
-KAS_TOOL_IDS_BY_KIRO_TOOL: dict[str, tuple[str, ...]] = _rows_from_policy_table()
-
-#: Every name a tool matcher can mean on KAS: the kiro-cli names and their
-#: aliases, and the KAS ids they reach.
-KAS_TOOL_MATCH_VOCABULARY: frozenset[str] = (
-    frozenset(KAS_TOOL_IDS_BY_KIRO_TOOL)
-    | frozenset(KIRO_TOOL_ALIASES)
-    | frozenset(tool_id for ids in KAS_TOOL_IDS_BY_KIRO_TOOL.values() for tool_id in ids)
-)
-
-
-def kas_tool_match_names(tool_id: str) -> tuple[str, ...]:
-    """The names a tool matcher is compared with for a KAS call to ``tool_id``.
-
-    First the kiro-cli name whose row reaches the id (the id itself when no row
-    does), then the KAS id, then the aliases, with no repeats. So a matcher written
-    as ``execute_bash``, ``run_command`` or ``shell`` meets a KAS shell call, and the
-    first name is the one a kiro-cli hook would be told the tool is called. Empty
-    for an empty id: a call KAS did not name matches no tool matcher.
-    """
-    if not tool_id:
-        return ()
-    kiro_names = sorted(name for name, ids in KAS_TOOL_IDS_BY_KIRO_TOOL.items() if tool_id in ids)
-    aliases = sorted(alias for alias, name in KIRO_TOOL_ALIASES.items() if name in kiro_names)
-    return tuple(dict.fromkeys([*kiro_names, tool_id, *aliases]))
-
-
-#: Glob syntax kiro-cli's ``allowedTools`` matcher documents for the TOOL part
-#: of an ``@server/tool`` entry (``@server/read_*``), and KAS's resource matcher
-#: reads the same way. Only these two travel; see :data:`_UNSHARED_GLOB_SYNTAX`.
-_SHARED_GLOB_SYNTAX = frozenset("*?")
-
-#: Glob syntax KAS's resource matcher honours and kiro-cli's does not document.
-#: An entry carrying any of these means one thing to the list it was written on
-#: and possibly something wider here, so it is never translated (see
-#: :func:`_mcp_pattern`).
-_UNSHARED_GLOB_SYNTAX = frozenset("[]{}!")
+#: Glob syntax the two matchers read differently. ``?`` is one character to
+#: ``globset`` and a literal ``?`` to Cedar ``like``; brackets and braces are
+#: ``globset`` syntax, and ``!`` is left out with them. An entry carrying any of these
+#: means one thing to the list it was written on and something else here, so it
+#: is never translated (see :func:`_mcp_pattern`).
+_UNSHARED_GLOB_SYNTAX = frozenset("?[]{}!")
 
 #: Every character either matcher treats as a glob. A SERVER name carrying any of
 #: these is refused outright (see :func:`_mcp_pattern`).
@@ -438,24 +734,27 @@ def _mcp_pattern(entry: str) -> str | None:
     """Resource glob for an ``@server`` / ``@server/tool`` entry.
 
     KAS addresses an MCP tool as ``<server>/<tool>``, so a bare server becomes a
-    one-level glob, a named action becomes an exact match, and a tool-part glob
-    (``@srv/query_*``) travels as written: kiro-cli documents ``*`` and ``?`` in
-    the tool part of an ``allowedTools`` entry with exactly the meaning KAS gives
-    the same text, so dropping it would make one line of text a grant on one
-    backend and a prompt on the other — the asymmetry this module exists to
-    avoid.
+    one-level glob, a named action becomes an exact match, and a tool-part ``*``
+    glob (``@srv/query_*``) travels as written: ``*`` is "any run of characters"
+    to both kiro-cli and KAS, so dropping it would make one line of text a grant
+    on one backend and a prompt on the other — the asymmetry this module exists
+    to avoid.
 
     ``None`` when the SERVER part is not one literal name. ``@*`` would become
     the pattern ``*/*``, which KAS resolves as every tool on every server, and a
     server-part glob is the one shape kiro-cli's own reading is not pinned down
     for. Translation must not be the step that widens a grant, so an entry we
     cannot read as one literal server is left to prompt instead of being guessed
-    at. The tool part may carry only the shared syntax (``*``, ``?``); bracket,
-    brace and negation forms are refused for the same reason.
+    at. The tool part may carry only the shared ``*``; ``?``, bracket, brace and
+    negation forms are refused for the same reason (:data:`_UNSHARED_GLOB_SYNTAX`).
+
+    A backslash is refused anywhere: ``globset`` reads it as an escape, while KAS
+    sends it to Cedar as a literal backslash, so ``a\\*b`` is one tool named
+    ``a*b`` on kiro-cli and every ``a\\…b`` on KAS.
     """
     ref = entry[len(_MCP_PREFIX) :]
     server, slash, tool = ref.partition("/")
-    if _GLOB_METACHARACTERS.intersection(server):
+    if "\\" in ref or _GLOB_METACHARACTERS.intersection(server):
         return None
     if _UNSHARED_GLOB_SYNTAX.intersection(tool):
         return None
@@ -505,6 +804,9 @@ def allowed_tools_to_permissions(
         if not isinstance(raw, str) or not raw.strip():
             continue
         entry = raw.strip()
+        if entry == _BUILTIN_PREFIX or entry.startswith(f"{_BUILTIN_PREFIX}/"):
+            unclassified.append(entry)  # a built-in ref, never an MCP server `builtin`
+            continue
         if entry.startswith(_MCP_PREFIX):
             pattern = _mcp_pattern(entry)
             # `None` for a glob; `@` alone or `@/tool` names no server. Neither
@@ -628,7 +930,8 @@ META_CAPABILITY_EXPANSION: dict[str, tuple[str, ...]] = {
 #: absence of a permission request, and Crew's deny floor and sensitive-path check
 #: run ON that request -- and it does not weaken when the grant arrives as a
 #: capability instead of a tool name. A user ``allow`` naming one of these is
-#: dropped, which leaves the capability with no rule, and no rule is ``ask``.
+#: dropped, which leaves the capability with no rule, and no rule is ``ask``; Crew's
+#: gate then answers what it can read of it (:func:`_authored_answered_allows`).
 #: This is the one place the merge is deliberately not symmetric with kiro-cli,
 #: and it is the direction that keeps Crew's gate in the path.
 WITHHELD_CAPABILITIES: frozenset[str] = frozenset({"shell", "fs_read", "fs_write"})
@@ -666,7 +969,8 @@ _EFFECTS = frozenset({"allow", "deny", "ask"})
 #: call shapes cannot drift apart.
 _AuditDecision = Callable[[str, str, str], None]
 
-#: Size bounds on an authored block, over which it is refused whole.
+#: Size bounds on an authored block, over which it is refused whole -- except a
+#: ``match`` list, which is split instead (:func:`_split_authored_rule`).
 #:
 #: Not tidiness. KAS compiles each rule into Cedar statements and its own compiler
 #: records that a condition tree past roughly 114 patterns overflows cedar-wasm's
@@ -690,10 +994,24 @@ def _asking_only(refs: str, outcome: str, reason: str) -> None:
 def projection_accepts(raw: Any) -> bool:
     """Whether :func:`parse_user_permissions` would relay *raw* rather than refuse it whole.
 
-    For a writer checking a block before it lands, so a block it then declines to
-    write is reported nowhere: the refusal it is avoiding never happens.
+    For a caller that must ask without the refusal being reported: a writer checking
+    a block before it lands (one it then declines to write is reported nowhere, as
+    the refusal it avoids never happens), and the session-start notice.
     """
     return parse_user_permissions(raw, audit_decision=_asking_only) is not None
+
+
+def projection_dropped_rules(raw: Any) -> list[int]:
+    """The indices of the ``allow`` rules a relayed *raw* leaves out for an ``exclude``
+    too long to send, asked as quietly as :func:`projection_accepts`.
+
+    For the session-start notice, so a grant that keeps prompting is named. Empty
+    for a block refused whole, which that notice names as ``permissions`` instead.
+    """
+    dropped: list[int] = []
+    if parse_user_permissions(raw, audit_decision=_asking_only, dropped=dropped) is None:
+        return []
+    return dropped
 
 
 def _refuse_block(
@@ -717,6 +1035,46 @@ def _refuse_block(
     )
 
 
+#: What :func:`_parse_rule` returns for a rule left out on its own, the block kept.
+_DROPPED: dict[str, Any] = {}
+
+
+def _drop_rule(agent_id: str, where: str, count: int, audit_decision: _AuditDecision) -> None:
+    """Report one authored ``allow`` left out for an ``exclude`` list too long to send."""
+    if audit_decision is _asking_only:
+        return
+    audit_decision(
+        f"the authored `permissions` {where}",
+        "withheld",
+        f"an allow whose `exclude` carries {count} patterns, over {_MAX_PATTERNS_PER_RULE}",
+    )
+    logger.warning(
+        "agent %r: not relaying %s of its `permissions` block -- an allow whose "
+        "`exclude` carries %d patterns, over the %d KAS's policy compiler stays "
+        "shallow for. An exclude list cannot be split, so what that allow covered "
+        "keeps prompting; the rest of the block still travels",
+        agent_id,
+        where,
+        count,
+        _MAX_PATTERNS_PER_RULE,
+    )
+
+
+def _split_authored_rule(rule: dict[str, Any]) -> list[dict[str, Any]]:
+    """*rule* as rules of at most :data:`_MAX_PATTERNS_PER_RULE` ``match`` patterns each.
+
+    The same grant. KAS already compiles each ``match`` pattern into a statement of
+    its own, with the rule's ``exclude`` ANDed onto every one, and decides on the
+    most restrictive match whatever the order. So each part keeps the capability,
+    the effect and the whole ``exclude``, and together the parts cover exactly the
+    patterns the author listed. The parts stay next to each other, in order.
+    """
+    match = rule.get("match")
+    if not isinstance(match, list) or len(match) <= _MAX_PATTERNS_PER_RULE:
+        return [rule]
+    return _chunked_rules(rule["capability"], rule["effect"], match, exclude=rule.get("exclude"))
+
+
 def _parse_rule(
     entry: Any,
     index: int,
@@ -725,7 +1083,12 @@ def _parse_rule(
 ) -> dict[str, Any] | None:
     """One rule of a user block, or ``None`` when the whole block must be refused.
 
-    Every failure here is fatal to the BLOCK, not to the rule: a block that is
+    A ``match`` over :data:`_MAX_PATTERNS_PER_RULE` patterns is accepted here and
+    split on the way out (:func:`_split_authored_rule`). An ``allow`` whose
+    ``exclude`` is over that bound returns :data:`_DROPPED`: it cannot be split, and
+    leaving one allow out only narrows the block.
+
+    Every other failure here is fatal to the BLOCK, not to the rule: a block that is
     half relayed is a policy nobody wrote, and the half that survives is the half
     with no ``deny`` in it. KAS itself is stricter still in the same direction --
     an agent-profile policy it cannot parse fail-closes its engine to deny-all
@@ -788,11 +1151,20 @@ def _parse_rule(
                 audit_decision=audit_decision,
             )
             return None
-        if len(patterns) > _MAX_PATTERNS_PER_RULE:
+        if key == "exclude" and len(patterns) > _MAX_PATTERNS_PER_RULE:
+            # A long `match` is split later; a long `exclude` cannot be. Each
+            # exclude is ANDed onto its rule, so two rules sharing a `match` with
+            # halves of the list each let through what the other half excludes.
+            # Dropping one rule only narrows when it is an `allow`: a dropped
+            # `deny` or `ask` would let the block's allows cover what it guarded.
+            if effect == "allow":
+                _drop_rule(agent_id, where, len(patterns), audit_decision)
+                return _DROPPED
             _refuse_block(
                 agent_id,
-                f"{where} `{key}` carries {len(patterns)} patterns, over the "
-                f"{_MAX_PATTERNS_PER_RULE} KAS's policy compiler stays shallow for",
+                f"{where} `exclude` carries {len(patterns)} patterns, over the "
+                f"{_MAX_PATTERNS_PER_RULE} KAS's policy compiler stays shallow for, "
+                "and an exclude list cannot be split without changing what it means",
                 audit_decision=audit_decision,
             )
             return None
@@ -813,11 +1185,13 @@ def parse_user_permissions(
     *,
     agent_id: str = "",
     audit_decision: _AuditDecision = lambda refs, outcome, reason: None,
+    dropped: list[int] | None = None,
 ) -> list[dict[str, Any]] | None:
     """Rule 1: the author's ``permissions`` block, read against KAS's own shape.
 
     ``None`` for an absent block and for a refused one alike -- the caller's
     behaviour is the same either way, and the log line is what separates them.
+    *dropped*, when given, collects the index of each rule left out alone.
 
     A ``policies`` reference refuses the block. It is well formed, and that is the
     problem: KAS expands a named bundle inline into ``allow`` rules held on the
@@ -875,7 +1249,21 @@ def parse_user_permissions(
         rule = _parse_rule(entry, index, agent_id, audit_decision)
         if rule is None:
             return None
-        parsed.append(rule)
+        if rule is not _DROPPED:
+            parsed.append(rule)
+        elif dropped is not None:
+            dropped.append(index)
+    # The bound is on what travels, and a long `match` travels as several rules.
+    sent = sum(len(_split_authored_rule(rule)) for rule in parsed)
+    if sent > _MAX_RULES:
+        _refuse_block(
+            agent_id,
+            f"it comes to {sent} rules once each `match` is split to "
+            f"{_MAX_PATTERNS_PER_RULE} patterns, over the {_MAX_RULES} this projection "
+            "relays -- the policy travels on every session",
+            audit_decision=audit_decision,
+        )
+        return None
     return parsed
 
 
@@ -954,7 +1342,8 @@ def _user_allow_travels(
             "agent %r: not relaying its `permissions` allow for %r -- %s cannot be "
             "auto-approved on this backend, because an auto-approved call raises no "
             "permission request and Crew's deny floor and sensitive-path check run on "
-            "that request. It keeps prompting",
+            "that request. It keeps prompting unless it is an unscoped shell/fs_read/"
+            "fs_write allow, or a shell allow whose plain globs Crew's gate answers",
             agent_id,
             rule["capability"],
             ", ".join(withheld),
@@ -1034,7 +1423,9 @@ def merge_user_permissions(
 
     1. The block is parsed against KAS's shape and refused whole when it does not
        fit (:func:`parse_user_permissions`). No salvage: a partially accepted
-       block is a policy nobody wrote.
+       block is a policy nobody wrote. Two size cases are not misfits: a
+       ``match`` too long for one rule is sent as several, and an ``allow`` whose
+       ``exclude`` is too long is left out alone, which only narrows.
     2. A user ``deny`` or ``ask`` travels unconditionally. Narrowing is always
        safe, and an author who writes ``deny`` is entitled to be obeyed even where
        the ceiling would have allowed.
@@ -1045,7 +1436,7 @@ def merge_user_permissions(
        builtin capability the ref is the tool name the ceiling knows.
     4. The shell and filesystem families do not travel as an ``allow`` at all
        (:data:`WITHHELD_CAPABILITIES`), which leaves them with no rule, and no
-       rule is ``ask``.
+       rule is ``ask``; Crew's gate answers what it can read of them instead.
 
     ``allowlist_present`` says whether the spec carries an ``allowedTools`` list, and
     it decides which channel owns a grant that BOTH could express. A rule the
@@ -1113,130 +1504,88 @@ def merge_user_permissions(
         f"{source}, ceiling cleared",
     )
     base = list(derived["rules"]) if derived else []
-    return {"rules": kept + base}
+    # Split only now: each decision above is about the rule the author wrote, so
+    # an allow travels or stays home whole rather than in permitted parts.
+    sent = [part for rule in kept for part in _split_authored_rule(rule)]
+    return {"rules": sent + base}
 
 
 #: Every capability an ``allow`` can reach KAS for from this module: the ones
 #: :data:`CAPABILITY_BY_TOOL` carries, and MCP. The shell and filesystem families
-#: never travel as an allow (:data:`WITHHELD_CAPABILITIES`), so they already raise
-#: a permission request and need nothing here.
+#: never travel as an allow (:data:`WITHHELD_CAPABILITIES`); a hook on them still
+#: needs an ``ask`` (:data:`HOOK_GATEABLE_CAPABILITIES`).
 AUTO_APPROVABLE_CAPABILITIES: tuple[str, ...] = tuple(
     sorted(set(CAPABILITY_BY_TOOL.values()) | {_MCP_CAPABILITY})
 )
 
-
-def hook_gated_capabilities(matchers: Iterable[str]) -> set[str]:
-    """The auto-approvable capabilities a PreToolUse hook matcher could cover.
-
-    Read with the hook store's own tool matcher, so a matcher covers here exactly
-    what it covers at the gate. The reading errs toward covering, because the cost
-    of a wrong answer is lopsided: covering too much turns an auto-approval into a
-    permission request, covering too little lets a call past a hook the author
-    wrote to gate it.
-
-    * An empty matcher, or ``*``, covers every tool.
-    * A literal tool name covers its own capability, or nothing when that tool
-      is never auto-approved here (``execute_bash``, ``fs_write``). The name is
-      read in every spelling :data:`KAS_TOOL_IDS_BY_KIRO_TOOL` and
-      :data:`KIRO_TOOL_ALIASES` give it, so ``remote_web_search`` covers what
-      ``web_search`` covers and ``run_command`` what ``execute_bash`` covers.
-    * A literal MCP tool name (``@server/tool``, ``mcp__server__tool``) covers MCP.
-    * Any other literal covers everything: it names no tool this table knows, so
-      it may be a harness's own name for a built-in one.
-    * A glob covers each built-in capability it matches by tool or capability
-      name, and MCP, whose tool names at the gate this table does not spell.
-      A glob that matches no name this module spells (``Fetch*``) covers
-      everything, as an unknown literal does: it may match a harness's own
-      name for a built-in tool.
-    """
-    # Deferred: this module imports nothing of Crew's, and the hook store's is heavy.
-    from kiro_crew.hooks import _tool_matches
-
-    covered: set[str] = set()
-    for raw in matchers:
-        matcher = raw.strip() if isinstance(raw, str) else ""
-        if not matcher or matcher == "*":
-            return set(AUTO_APPROVABLE_CAPABILITIES)
-        if not _GLOB_METACHARACTERS.intersection(matcher):
-            name = matcher.lower()
-            capabilities = _capabilities_named(name)
-            if capabilities:
-                covered.update(capabilities)
-            elif name.startswith((_MCP_PREFIX, _MCP_TITLE_PREFIX)):
-                covered.add(_MCP_CAPABILITY)
-            elif name not in _SPELLED_TOOL_NAMES:
-                return set(AUTO_APPROVABLE_CAPABILITIES)
-            continue
-        matched = [name for name in _SPELLED_TOOL_NAMES if _tool_matches(matcher, name)]
-        if not matched:
-            return set(AUTO_APPROVABLE_CAPABILITIES)
-        for name in matched:
-            covered.update(_capabilities_named(name))
-        covered.add(_MCP_CAPABILITY)
-    return covered
-
-
-#: Every tool or capability name this module spells: a matcher naming one of
-#: them names a tool Crew knows, whether or not it is ever auto-approved.
-_SPELLED_TOOL_NAMES: frozenset[str] = (
-    frozenset(CAPABILITY_BY_TOOL)
-    | frozenset(CAPABILITY_BY_TOOL.values())
-    | KAS_TOOL_MATCH_VOCABULARY
-    | WITHHELD_FROM_AUTO_APPROVE
+#: Every capability a PreToolUse hook can need an ``ask`` on: the auto-approvable
+#: ones and the shell and filesystem families. Those never travel as an allow,
+#: but KAS still decides their calls without a permission request when a saved
+#: session answer, a KAS default or a user-scope rule allows them. An explicit
+#: ``ask`` outranks all three, so the call reaches Crew's gate, where the hook runs.
+HOOK_GATEABLE_CAPABILITIES: tuple[str, ...] = tuple(
+    sorted(set(AUTO_APPROVABLE_CAPABILITIES) | WITHHELD_CAPABILITIES)
 )
 
+#: :data:`HOOK_GATEABLE_CAPABILITIES` without MCP: what ``@builtin`` covers.
+_BUILTIN_GATEABLE_CAPABILITIES: tuple[str, ...] = tuple(
+    c for c in HOOK_GATEABLE_CAPABILITIES if c != _MCP_CAPABILITY
+)
 
-def _capabilities_named(name: str) -> set[str]:
-    """The auto-approvable capabilities *name* stands for, in any spelling.
+#: kiro-cli's ``@builtin`` matcher: every built-in tool, never an MCP one.
+HOOK_BUILTIN_MATCHER = "@builtin"
 
-    *name* as a capability or a Crew tool, and every kiro-cli tool it spells
-    through :data:`KIRO_TOOL_ALIASES` or a :data:`KAS_TOOL_IDS_BY_KIRO_TOOL` row.
-    """
-    tools = {name, KIRO_TOOL_ALIASES.get(name, name)}
-    tools.update(kiro for kiro, ids in KAS_TOOL_IDS_BY_KIRO_TOOL.items() if name in ids)
-    capabilities = {CAPABILITY_BY_TOOL[tool] for tool in tools if tool in CAPABILITY_BY_TOOL}
-    if name in CAPABILITY_BY_TOOL.values():
-        capabilities.add(name)
-    return capabilities
+#: kiro-cli's ``@mcp`` tag: every MCP tool.
+HOOK_MCP_TAG = "@mcp"
+
+#: kiro-cli tool -> the KAS capability its calls are evaluated under, for the
+#: tools :data:`CAPABILITY_BY_TOOL` leaves out because they are never auto-approved
+#: (:data:`WITHHELD_FROM_AUTO_APPROVE`). A hook on one of them still needs an
+#: ``ask``. Read by the hook coverage only. ``code`` is under all three.
+_HOOK_CAPABILITIES_BY_TOOL: dict[str, frozenset[str]] = _ANSWERED_CAPABILITIES
+
+#: kiro-cli's tool tags a spec hook matcher may name, as kiro-cli's agent reads
+#: them (``agent/src/agent/mod.rs`` ``hook_matcher_tag_groups_and_names``): each tag
+#: -> the kiro-cli tools it selects. For spec hooks only; the shared alias table
+#: (:data:`KIRO_TOOL_ALIASES`) is not changed by it.
+SPEC_HOOK_TOOL_TAGS: dict[str, tuple[str, ...]] = {
+    "read": ("fs_read", "grep", "glob", "code"),
+    "write": ("fs_write", "code"),
+    "shell": ("execute_bash",),
+    "web": ("web_fetch", "web_search"),
+    "subagent": ("use_subagent",),
+}
+
+#: Shell command a KAS ``deny`` rule names alongside a hook's unscoped shell
+#: ``ask``. KAS denies a shell command its parser cannot read only when no rule
+#: asks for every command, or when any shell ``deny`` rule exists
+#: (``policy-engine.ts`` ``unparseable``). The hook's ask would turn that deny into
+#: a permission request for a command no gate can read; this rule keeps it a deny.
+#: It names a command nobody runs, so it denies nothing else.
+UNPARSEABLE_SHELL_GUARD = "kirocrew-unparseable-shell-guard"
 
 
-def withhold_hook_gated_auto_approval(
-    policy: dict[str, Any] | None,
-    pre_tool_matchers: Iterable[str],
-    *,
-    audit_decision: _AuditDecision = lambda refs, outcome, reason: None,
-    agent_id: str = "",
-) -> dict[str, Any] | None:
-    """*policy* with an ``ask`` for every capability a PreToolUse hook covers.
+def is_unparseable_shell_guard(rule: Any) -> bool:
+    """Whether *rule* is the :data:`UNPARSEABLE_SHELL_GUARD` ``deny`` the hook asks
+    carry: Crew's own rule, never one the agent's author wrote, so a reader asking
+    what the author restricted skips it."""
+    return isinstance(rule, dict) and rule == {
+        "capability": "shell",
+        "match": [UNPARSEABLE_SHELL_GUARD],
+        "effect": "deny",
+    }
 
-    A PreToolUse hook runs on Crew's permission path, and an auto-approved call
-    never takes that path, so the hook would not see it. KAS resolves the most
-    restrictive matching rule (``deny`` over ``ask`` over ``allow``, not first
-    match), so one unscoped ``ask`` outranks every ``allow`` on that capability:
-    the derived ones and any the author's own block relayed. The call then comes
-    back as a permission request, where the hook runs and Crew's own approval
-    decides as it does for any other request. A ``deny`` still outranks it.
 
-    ``None`` stays ``None``: with no policy every request already asks.
+#: Prefix of a :func:`hook_gated_capabilities` entry naming the MCP resource
+#: pattern a hook covers, as KAS's ``<server>/<tool>`` resource
+#: (``mcp:srv/get_creds``, or ``mcp:srv/*`` for a whole server), rather than the
+#: whole ``mcp`` capability.
+HOOK_GATED_MCP_PREFIX = "mcp:"
 
-    Each withheld capability is reported through ``audit_decision``, the same
-    permission trail the ceiling's withholds use.
-    """
-    if not policy:
-        return policy
-    covered = hook_gated_capabilities(pre_tool_matchers)
-    if not covered:
-        return policy
-    logger.info(
-        "agent %r: not auto-approving %s on this backend -- a PreToolUse hook covers "
-        "it, and an auto-approved call raises no permission request for it to run on",
-        agent_id,
-        ", ".join(sorted(covered)),
-    )
-    for capability in sorted(covered):
-        audit_decision(capability, "withheld", "a PreToolUse hook covers it")
-    asks = [{"capability": capability, "effect": "ask"} for capability in sorted(covered)]
-    return {"rules": [*policy["rules"], *asks]}
+#: Prefix of an :func:`auto_approved_capabilities` entry naming an MCP resource
+#: pattern a scoped ``ask`` or ``deny`` holds back from the ``mcp`` grant
+#: (``mcp-held:srv/tool``).
+HELD_MCP_PREFIX = "mcp-held:"
 
 
 def auto_approved_capabilities(policy: Any) -> frozenset[str]:
@@ -1248,23 +1597,54 @@ def auto_approved_capabilities(policy: Any) -> frozenset[str]:
     leaves the rest of the capability approved, so it cancels nothing here: the
     answer errs toward "still auto-approved", which is the side that makes the
     caller re-project.
+
+    While ``mcp`` is approved, each pattern a scoped ``mcp`` ``ask`` or ``deny``
+    names is also listed, as a :data:`HELD_MCP_PREFIX` entry, so
+    :func:`hook_gated_auto_approved` can tell a per-tool withhold already in
+    place from one still missing, and each server the grant is confined to, as a
+    :data:`APPROVED_MCP_SERVER_PREFIX` entry, so coverage can be re-read against
+    the same servers (:func:`approved_mcp_servers`).
     """
+    return _approved_under(policy, ())
+
+
+def unprompted_capabilities(policy: Any) -> frozenset[str]:
+    """The capabilities whose calls *policy* lets KAS decide without asking Crew.
+
+    :func:`auto_approved_capabilities`, plus every
+    :data:`HOOK_GATEABLE_CAPABILITIES` entry no unscoped ``ask`` or ``deny``
+    holds: with no rule of its own, a capability's call can still be decided by a
+    session answer Crew saved, a KAS default or a user-scope rule, none of which
+    the projection sees. This is what a live session is checked against when the
+    PreToolUse hooks change (:func:`hook_gated_auto_approved`), so a hook on the
+    shell, or on a session with no ``permissions`` at all, re-projects it.
+    """
+    return _approved_under(policy, HOOK_GATEABLE_CAPABILITIES)
+
+
+def _approved_under(policy: Any, unprompted: Iterable[str]) -> frozenset[str]:
+    """:func:`auto_approved_capabilities` with *unprompted* granted before any rule."""
     rules = policy.get("rules") if isinstance(policy, dict) else None
-    allowed: set[str] = set()
+    allowed: set[str] = set(unprompted)
     cancelled: set[str] = set()
+    held: set[str] = set()
     for rule in rules if isinstance(rules, list) else ():
         if not isinstance(rule, dict) or not isinstance(rule.get("capability"), str):
             continue
         capabilities = META_CAPABILITY_EXPANSION.get(rule["capability"], (rule["capability"],))
         if rule.get("effect") == "allow":
             allowed.update(capabilities)
-        elif (
-            rule.get("effect") in ("ask", "deny")
-            and not rule.get("match")
-            and not rule.get("exclude")
-        ):
-            cancelled.update(capabilities)
-    return frozenset(allowed - cancelled)
+        elif rule.get("effect") in ("ask", "deny") and not rule.get("exclude"):
+            if not rule.get("match"):
+                cancelled.update(capabilities)
+            elif rule["capability"] == _MCP_CAPABILITY:
+                held.update(_patterns(rule["match"]))
+    approved = allowed - cancelled
+    if _MCP_CAPABILITY in approved:
+        approved.update(HELD_MCP_PREFIX + pattern for pattern in held)
+        servers = auto_approved_mcp_servers(policy)
+        approved.update(APPROVED_MCP_SERVER_PREFIX + server for server in servers or ())
+    return frozenset(approved)
 
 
 # --- kiro-cli ``toolsSettings`` -> KAS ``permissions`` -------------------------
@@ -1284,24 +1664,14 @@ def auto_approved_capabilities(policy: Any) -> frozenset[str]:
 # The block this produces is fed to :func:`merge_user_permissions` like an
 # authored one, so its denies travel as written.
 
-#: ``toolsSettings`` tool key -> the kiro-cli family it configures.
-_TOOLS_SETTINGS_FAMILY: dict[str, str] = {
-    "execute_bash": "shell",
-    "shell": "shell",
-    "fs_read": "read",
-    "read": "read",
-    "glob": "read",
-    "grep": "read",
-    "fs_write": "write",
-    "write": "write",
-    "web_fetch": "web_fetch",
-    "subagent": "subagent",
-    "use_subagent": "subagent",
-}
-
 #: Characters that keep a regex from being read as a literal. ``*`` is here too:
 #: outside ``.*`` it is a quantifier on the character before it.
 _REGEX_METACHARACTERS = frozenset(".^$*+?()[]{}|\\")
+
+#: Shell redirect operators. KAS matches a shell rule against the command's
+#: words, and a redirect and its target are not among them, so a deny written
+#: to match one never sees it.
+_REDIRECT_CHARACTERS = frozenset("<>")
 
 
 def _regex_to_glob(pattern: str) -> str | None:
@@ -1346,58 +1716,23 @@ def _patterns(value: Any) -> list[str]:
     )
 
 
-def _chunked_rules(capability: str, effect: str, patterns: list[str]) -> list[dict[str, Any]]:
-    """One rule per :data:`_MAX_PATTERNS_PER_RULE` patterns, so no rule is refused for size."""
+def _chunked_rules(
+    capability: str,
+    effect: str,
+    patterns: list[str],
+    *,
+    exclude: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    """One rule per :data:`_MAX_PATTERNS_PER_RULE` patterns, so no rule is refused for size.
+
+    *exclude*, when given, is carried whole on every part.
+    """
     step = _MAX_PATTERNS_PER_RULE
+    narrowing = {} if exclude is None else {"exclude": list(exclude)}
     return [
-        {"capability": capability, "match": patterns[i : i + step], "effect": effect}
+        {"capability": capability, "match": patterns[i : i + step], **narrowing, "effect": effect}
         for i in range(0, len(patterns), step)
     ]
-
-
-#: A sub-agent name pattern this module carries to KAS: an agent id, with ``*``
-#: as the only wildcard. ``*`` is the one glob character kiro-cli's ``fnmatch``
-#: and KAS's matcher read alike; ``?``, ``[...]``, braces and ``!`` are left out,
-#: so a pattern using them is reported rather than read two ways.
-_AGENT_GLOB_RE = re.compile(r"[A-Za-z0-9_.\-*]+")
-
-
-def _agent_glob(raw: str) -> str | None:
-    """A ``subagent`` name pattern as KAS reads it, or ``None`` when it differs."""
-    return raw if _AGENT_GLOB_RE.fullmatch(raw) else None
-
-
-def _available_agents_rules(where: str, value: Any, lost: list[str]) -> list[dict[str, Any]]:
-    """``subagent.availableAgents`` as a deny on every sub-agent it does not name.
-
-    Every failure narrows. A value that is not a list, a pattern that does not
-    translate, and a list over one rule's pattern bound are each named in *lost*,
-    and the rule denies what it cannot express, so the session spawns no more than
-    kiro-cli would let it. A list holding ``"*"`` restricts nothing and emits nothing.
-    """
-    if not isinstance(value, list):
-        lost.append(where)
-        return [{"capability": "subagent", "effect": "deny"}]
-    patterns: list[str] = []
-    for raw in value:
-        glob = _agent_glob(raw.strip()) if isinstance(raw, str) else None
-        if glob is None or len(glob) > _MAX_PATTERN_LENGTH:
-            lost.append(where)
-        else:
-            patterns.append(glob)
-    patterns = list(dict.fromkeys(patterns))
-    if "*" in patterns:
-        return []
-    if not patterns:
-        # `[]` is kiro-cli's "spawn nothing". KAS takes an unconditional deny off
-        # the agent's tool surface, which refuses the same spawns.
-        return [{"capability": "subagent", "effect": "deny"}]
-    if len(patterns) > _MAX_PATTERNS_PER_RULE:
-        # Two deny-all-but rules with different excludes deny everything between
-        # them, so the list cannot be split; it is refused whole instead.
-        lost.append(where)
-        return [{"capability": "subagent", "effect": "deny"}]
-    return [{"capability": "subagent", "match": ["*"], "exclude": patterns, "effect": "deny"}]
 
 
 def tools_settings_to_permissions(
@@ -1413,6 +1748,9 @@ def tools_settings_to_permissions(
         return None, []
     rules: list[dict[str, Any]] = []
     lost: list[str] = []
+    star_subtrees: list[tuple[str, str, list[str]]] = []
+    # Allows go in last (below), so an over-long list can never sink the denies.
+    allow_groups: list[tuple[str, list[dict[str, Any]]]] = []
 
     def converted(where: str, values: Any, convert: Callable[[str], str | None]) -> list[str]:
         out: list[str] = []
@@ -1444,9 +1782,10 @@ def tools_settings_to_permissions(
             continue
         # Only shapes run live on KAS are carried: the plain deny lists, and the
         # `subagent` rules below (a deny with an `exclude`, and a name-scoped
-        # allow). The other deny-all-but shapes (`denyByDefault`,
-        # `fallbackAction: "deny"`) match a command or a path, where `exclude`
-        # has not been run, so they are named in the notice instead of guessed at.
+        # allow). The deny-all-but shapes on a command or a path, where
+        # `exclude` has not been run, are enforced by Crew's gate instead: the
+        # shell's `denyByDefault` and the write tool's `fallbackAction: "deny"`
+        # (below).
         handled: set[str] = set()
 
         if family == "shell":
@@ -1455,6 +1794,15 @@ def tools_settings_to_permissions(
                 f"{tool}.deniedCommands", settings.get("deniedCommands"), _regex_to_glob
             )
             rules.extend(_chunked_rules("shell", "deny", denied))
+            # kiro-cli matches the regex over the whole command line; KAS matches
+            # the glob over the command's words, which do not include a redirect
+            # or its target. The deny still travels, since it does stop
+            # the character inside a word, but the entry is named as not carried.
+            if any(set(glob) & _REDIRECT_CHARACTERS for glob in denied):
+                lost.append(f"{tool}.deniedCommands")
+            # No rule either: Crew's gate refuses every shell call the spec's
+            # usable `allowedCommands` do not match (`spec_shell_allowlist`).
+            handled.add("denyByDefault")
             # No rule: Crew answers the shell requests these match itself, at
             # the gate (`crew_answered_commands`). Only an entry it cannot use
             # is named.
@@ -1468,6 +1816,10 @@ def tools_settings_to_permissions(
                 or len(_usable_allowed_commands(tools_settings)) > _MAX_ALLOWED_COMMANDS
             ):
                 lost.append(f"{tool}.allowedCommands")
+            # No rule: Crew's read-only row answers a read-only command, also
+            # under `denyByDefault` (`kas_spec_grants`). A non-boolean is named.
+            if isinstance(settings.get("autoAllowReadonly"), bool):
+                handled.add("autoAllowReadonly")
         elif family in ("read", "write"):
             capability = "fs_read" if family == "read" else "fs_write"
             handled.add("deniedPaths")
@@ -1475,21 +1827,52 @@ def tools_settings_to_permissions(
             # not already ending in a wildcard also gets a `/**` twin, so a bare
             # directory denies what is inside it, not just the directory entry.
             # Denying a file's non-existent subtree is harmless: wider, never looser.
+            # A path ending in one `*` gets the twin too: kiro-cli's globset `*`
+            # crosses `/` and KAS's minimatch `*` stops at it, so `/etc/*` alone
+            # would leave `/etc/a/b` open on KAS. `/etc/*/**` closes it.
             denied_paths = converted(f"{tool}.deniedPaths", settings.get("deniedPaths"), str)
-            subtrees = [
-                f"{p.rstrip('/')}/**"
-                for p in denied_paths
-                if not p.endswith("*") and len(p) + 3 <= _MAX_PATTERN_LENGTH
-            ]
+            fits = [p for p in denied_paths if len(p) + 3 <= _MAX_PATTERN_LENGTH]
+            subtrees = [f"{p.rstrip('/')}/**" for p in fits if not p.endswith("*")]
             denied_paths = list(dict.fromkeys(denied_paths + subtrees))
             rules.extend(_chunked_rules(capability, "deny", denied_paths))
+            if tool in READ_SETTINGS_KEYS:
+                # No rule: Crew's gate answers a covered read (`crew_answered_read_paths`).
+                handled.add("allowedPaths")
+                if _paths_not_all_carried(settings.get("allowedPaths"), tools_settings, tool):
+                    lost.append(f"{tool}.allowedPaths")
+            # Kept apart so they never cost the denies above their place: they
+            # travel only when the whole block still fits (below).
+            star_twins = [
+                f"{p}/**"
+                for p in fits
+                if p.endswith("*")
+                and not p.endswith(("**", "\\*"))
+                and f"{p}/**" not in denied_paths
+            ]
+            if star_twins:
+                star_subtrees.append((f"{tool}.deniedPaths", capability, star_twins))
             if family == "write":
                 # `interactive` is the default: nothing is lost by leaving it out.
+                # `deny` travels as no rule: Crew's gate refuses every write the
+                # usable `allowedPaths` do not cover (`spec_write_allowlist`).
                 handled.add("fallbackAction")
-                if settings.get("fallbackAction") not in (None, "", "interactive"):
+                # No rule: Crew's gate answers a covered write (`crew_answered_paths`).
+                # Named when an entry is unusable or the bound cuts the list.
+                handled.add("allowedPaths")
+                if _paths_not_all_carried(settings.get("allowedPaths"), tools_settings, tool):
+                    lost.append(f"{tool}.allowedPaths")
+                if settings.get("fallbackAction") not in (
+                    None,
+                    "",
+                    "interactive",
+                ) and not _write_falls_back_to_deny(settings):
                     lost.append(f"{tool}.fallbackAction")
         elif family == "web_fetch":
-            # `trusted` is an allow: not carried, so those fetches keep prompting.
+            # KAS matches a host only, so a `blocked` regex is carried here as a host
+            # deny or named, and `trusted` (an allow) is named. Crew's gate grants a
+            # plain-URL `trusted` entry itself (`kas_spec_denies.web_fetch_gate`); the
+            # session notice drops it then, and a crewmate's policy check reads only
+            # this KAS side.
             handled.add("blocked")
             rules.extend(
                 _chunked_rules(
@@ -1516,7 +1899,8 @@ def tools_settings_to_permissions(
             # An allow, so the merge puts it to the governance ceiling (the refs
             # that name the sub-agent tool) and drops it when the ceiling refuses.
             trusted = converted(f"{tool}.trustedAgents", settings.get("trustedAgents"), _agent_glob)
-            rules.extend(_chunked_rules("subagent", "allow", trusted))
+            allows = _chunked_rules("subagent", "allow", trusted)
+            allow_groups.append((f"{tool}.trustedAgents", allows))
 
         lost.extend(
             f"{tool}.{key}"
@@ -1526,4 +1910,29 @@ def tools_settings_to_permissions(
 
     if len(rules) > _MAX_RULES:
         return None, sorted(set(lost) | {"(all: too many rules)"})
+    # The trailing-`*` subtree twins widen denies that already travel. Over the
+    # rule bound they would sink the WHOLE block, so they are left out and the
+    # key is named instead: the originals still deny what KAS's `*` reaches.
+    for where, capability, twins in star_subtrees:
+        extra = _chunked_rules(capability, "deny", twins)
+        if len(rules) + len(extra) > _MAX_RULES:
+            lost.append(where)
+        else:
+            rules.extend(extra)
+    # Each key's allows whole, or named and left prompting: every deny still travels.
+    for where, allows in allow_groups:
+        if len(rules) + len(allows) > _MAX_RULES:
+            lost.append(where)
+        else:
+            rules.extend(allows)
     return ({"rules": rules} if rules else None), sorted(set(lost))
+
+
+# The PreToolUse hook coverage lives in its own module by size; these names stay
+# importable from here, where every caller has always read them. Imported last:
+# that module reads this one's tables.
+from kiro_crew.acp.kas_hook_coverage import (  # noqa: E402,F401
+    hook_gated_auto_approved,
+    hook_gated_capabilities,
+    withhold_hook_gated_auto_approval,
+)

@@ -15,7 +15,7 @@ import asyncio
 import pytest
 from overload_fakes import settle_dependency_park, settle_store_writes
 
-from kiro_crew.testing.wait import async_wait_until
+from kiro_crew.testing.wait import async_wait_until, await_until, default_timeout
 from kiro_crew.workflows.agent_pool import _WorkflowSessionWorker, build_pooled_agent_fn
 
 
@@ -38,6 +38,10 @@ class _FakeProvider:
 
     def is_process_alive(self) -> bool:
         return self.alive
+
+    def set_delete_delay(self, seconds: float) -> None:
+        # ``LLMProvider``'s default: a provider that ends its sessions as before.
+        return None
 
 
 class _FakeSessions:
@@ -86,6 +90,14 @@ class _FakeSessions:
         self.children_ended.append(key)
         self.order = getattr(self, "order", [])
         self.order.append("end_children")
+
+    async def run_identity_check(self):
+        # A reused worker's Kiro account check. ``retiring`` holds the keys the
+        # check would flag, the way a sweep flags a session its worker holds.
+        self.identity_checks = getattr(self, "identity_checks", 0) + 1
+
+    def is_retiring(self, key):
+        return key in getattr(self, "retiring", set())
 
     async def destroy(self, key):
         self.destroys = getattr(self, "destroys", 0) + 1
@@ -461,6 +473,29 @@ async def test_a_refused_effort_push_falls_back_to_a_cold_start_with_the_overrid
 
 
 @pytest.mark.asyncio
+async def test_backend_step_skips_the_warm_pool():
+    """Every warm worker runs the default harness, so a backend= step runs on a
+    one-shot session started with its backend_override, and nothing is pooled."""
+    created: list = []
+
+    class _BackendSessions(_FakeSessions):
+        async def get_or_create(self, key, *, backend_override=None, **kwargs):
+            created.append((key, backend_override))
+            return await super().get_or_create(key, **kwargs)
+
+    sessions = _BackendSessions()
+    agent_fn, pool = build_pooled_agent_fn(sessions, run_id="be1")
+    try:
+        await agent_fn("x", {"backend": "claude"})
+        await agent_fn("y", {"session": "chain", "backend": "kas"})
+    finally:
+        await pool.shutdown()
+        await sessions.destroy("chain@kas")
+    assert created == [("wf-unpooled:be1:0", "claude"), ("chain@kas", "kas")]
+    assert sessions.live == {}
+
+
+@pytest.mark.asyncio
 async def test_pooled_invalid_effort_fails_before_allocating():
     from kiro_crew.workflows.agent_exec import WorkflowEffortInvalid
 
@@ -573,6 +608,12 @@ class _ClockSessions:
     async def reset(self, key):
         self.live.pop(key, None)
 
+    async def run_identity_check(self):
+        return None
+
+    def is_retiring(self, key):
+        return False
+
 
 class _ClockProvider:
     def __init__(self, sessions: _ClockSessions, tag: str) -> None:
@@ -584,6 +625,9 @@ class _ClockProvider:
 
     def is_process_alive(self) -> bool:
         return True
+
+    def set_delete_delay(self, seconds: float) -> None:
+        return None
 
 
 @pytest.mark.asyncio
@@ -1051,6 +1095,52 @@ async def test_a_cancelled_call_waiting_for_a_lane_slot_leaves_no_queued_row(tmp
 
 
 @pytest.mark.asyncio
+async def test_a_call_cancelled_during_its_running_mark_frees_its_slot(tmp_path, monkeypatch):
+    """The cancel can also land after ``admit`` handed the call its slot and
+    before the call's own cancel arm: while the ``running`` mark is written. The
+    handle holds the lane slot and the row's lease there too, so the call ends
+    the row and gives the slot back instead of leaving the lane one slot short
+    for the life of the gateway."""
+    from kiro_crew.taskq import model as m
+    from kiro_crew.taskq.adapters.runner_handle import Admitted
+    from kiro_crew.taskq.store import TaskStore
+    from kiro_crew.workflows.agent_pool import admitted_agent_fn
+
+    store = TaskStore(tmp_path / "tasks.db", network_fs=False).open()
+    try:
+        ran: list[str] = []
+
+        async def _agent(prompt, opts):
+            ran.append(prompt)
+            return prompt
+
+        real_running = Admitted.running_async
+        marked, hold = asyncio.Event(), asyncio.Event()
+
+        async def _mark_then_hold(self, progress=None):
+            ok = await real_running(self, progress)
+            marked.set()
+            await hold.wait()  # the cancel lands here
+            return ok
+
+        monkeypatch.setattr(Admitted, "running_async", _mark_then_hold)
+        adm = _admission(1, store=store)
+        fn = admitted_agent_fn(_agent, adm, run_id="rm", session_key="chat:r")
+        call = asyncio.create_task(fn("p", {}))
+        await await_until(marked)
+        call.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await call
+
+        row = store.get("workflow:rm:agent1")
+        assert row.state == m.CANCELLED and row.lease_owner is None
+        assert ran == []
+        assert adm.lane.running == 0 and adm.lane.waiting == 0
+    finally:
+        store.close()
+
+
+@pytest.mark.asyncio
 async def test_a_cancelled_call_parked_on_a_dependency_leaves_no_orphan_wait(tmp_path):
     """Same for a call parked in ``waiting_dependency``: the coroutine that was
     waiting for the scope's wake is the only thing that could have resumed it."""
@@ -1347,3 +1437,176 @@ async def test_the_cheap_reuse_path_still_ends_the_previous_conversations_childr
         "the reused worker kept the previous conversation's children, so one of them can "
         "inject into the next task's conversation"
     )
+
+
+class _DelayRecordingProvider(_FakeProvider):
+    def __init__(self, tag: str) -> None:
+        super().__init__(tag)
+        self.delete_delays: list[float] = []
+
+    def set_delete_delay(self, seconds: float) -> None:
+        self.delete_delays.append(seconds)
+        sink = getattr(self, "order_sink", None)
+        if sink is not None:
+            sink.append(("delete_delay", seconds))
+
+
+def _configured_delete_delay(monkeypatch, delay):
+    """``session.kas_delete_delay_secs`` as the worker reads it, from the loader."""
+    from types import SimpleNamespace
+
+    from kiro_crew.config.loader import KiroCrewConfig
+
+    cfg = SimpleNamespace(session=SimpleNamespace(kas_delete_delay_secs=delay))
+    monkeypatch.setattr(KiroCrewConfig, "load", classmethod(lambda cls: cfg))
+    return cfg
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("delay", [0, 1800])
+async def test_a_worker_passes_the_configured_delete_delay_to_its_session(monkeypatch, delay):
+    """Each reuse ends the previous step's conversation, so the worker's provider is
+    told how long that conversation's record waits before it is deleted."""
+    _configured_delete_delay(monkeypatch, delay)
+    sessions = _FakeSessions()
+    provider = _DelayRecordingProvider(tag="wf-pool:d1:0")
+    sessions.live["wf-pool:d1:0"] = provider
+    worker = _WorkflowSessionWorker(sessions, key="wf-pool:d1:0", agent=None, model=None, cwd=None)
+
+    await worker.start()
+
+    assert provider.delete_delays == [float(delay)]
+
+
+@pytest.mark.asyncio
+async def test_a_start_cancelled_while_reading_the_delete_delay_holds_no_session(monkeypatch):
+    """The setting is read before the session is acquired, so a start cancelled in that
+    read leaves no session held with no worker to release it."""
+    import threading
+    from types import SimpleNamespace
+
+    from kiro_crew.config.loader import KiroCrewConfig
+
+    entered, go_on = threading.Event(), threading.Event()
+
+    def slow_load(cls):
+        entered.set()
+        go_on.wait(default_timeout())
+        return SimpleNamespace(session=SimpleNamespace(kas_delete_delay_secs=0))
+
+    monkeypatch.setattr(KiroCrewConfig, "load", classmethod(slow_load))
+    sessions = _FakeSessions()
+    worker = _WorkflowSessionWorker(sessions, key="wf-pool:d3:0", agent=None, model=None, cwd=None)
+
+    starting = asyncio.create_task(worker.start())
+    try:
+        await async_wait_until(entered.is_set, describe=lambda: "config load not entered")
+        starting.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await await_until(starting, what="the cancelled start")
+    finally:
+        go_on.set()
+        if not starting.done():
+            starting.cancel()
+        await await_until(
+            asyncio.gather(starting, return_exceptions=True), what="the start settling"
+        )
+
+    assert sessions.cold_starts == 0
+
+
+@pytest.mark.asyncio
+async def test_a_reuse_reads_the_delete_delay_again_before_the_conversation_ends(monkeypatch):
+    """A changed setting applies to the conversation the next reuse ends: the worker
+    reads it again at reuse, not only when it starts."""
+    cfg = _configured_delete_delay(monkeypatch, 0)
+    sessions = _FakeSessions()
+    provider = _DelayRecordingProvider(tag="wf-pool:d2:0")
+    sessions.live["wf-pool:d2:0"] = provider
+    worker = _WorkflowSessionWorker(sessions, key="wf-pool:d2:0", agent=None, model=None, cwd=None)
+    await worker.start()
+
+    cfg.session.kas_delete_delay_secs = 1800
+    provider.order_sink = []
+    await worker.reset()
+
+    assert provider.order_sink == [("delete_delay", 1800.0), "new_conversation"]
+
+
+@pytest.mark.asyncio
+async def test_a_worker_with_no_cheap_reset_cold_starts_on_reuse_and_says_so(caplog):
+    """A worker whose backend has no cheap reset cold-starts on reuse, visibly.
+
+    ``AcpProvider.new_conversation`` on a backend served by its own ``AcpClient`` and
+    outside ``ACP_BACKENDS_CLIENT_NEW_CONVERSATION`` raises ``NotImplementedError``
+    naming the backend. The pool must still take the hard reset, so no prior-task
+    context survives, and must say at INFO that the reuse paid a cold start, because
+    that is the cost an operator sees and would otherwise find no reason for in the
+    default log.
+    """
+    from kiro_crew.acp.client import AcpClient
+    from kiro_crew.agent_sdk.backends import ACP_BACKEND_OPENCODE
+    from kiro_crew.providers.acp import AcpProvider
+
+    opencode = AcpProvider.__new__(AcpProvider)
+    opencode._client = AcpClient(acp_backend=ACP_BACKEND_OPENCODE)
+    sessions = _FakeSessions()
+    key = "wf-pool:run-oc:0"
+    sessions.live[key] = opencode
+    worker = _WorkflowSessionWorker(sessions, key=key, agent="kirocrew", model=None, cwd=None)
+    await worker.start()
+    assert worker._provider is opencode
+
+    with caplog.at_level("INFO", logger="kiro_crew.workflows.agent_pool"):
+        await worker.reset()
+
+    assert sessions.resets == 1, "the worker kept its conversation across reuse"
+    assert sessions.reset_intents == [True]
+    assert sessions.cold_starts == 1, "the hard reset did not re-acquire a fresh session"
+    assert worker._provider is not opencode
+    cold = [
+        r for r in caplog.records if r.levelname == "INFO" and "cold-starts for reuse" in r.message
+    ]
+    assert len(cold) == 1, [r.getMessage() for r in caplog.records]
+    assert "'opencode'" in cold[0].getMessage()
+
+
+@pytest.mark.asyncio
+async def test_a_reused_worker_whose_session_the_account_check_flagged_takes_the_hard_reset():
+    """A worker holds its lease from its first task to its last, so it never acquires again.
+
+    Its reuse therefore runs the Kiro account check itself, and a session the check
+    flagged must not be handed the next task: the cheap path would keep the process,
+    and with it the previous account's credential. The hard reset ends that
+    conversation and re-acquires, which starts a session on the current account.
+    """
+    sessions = _FakeSessions()
+    worker = _WorkflowSessionWorker(
+        sessions, key="wf-pool:run-1:0", agent="kirocrew", model=None, cwd=None
+    )
+    await worker.start()
+    stale = sessions.live["wf-pool:run-1:0"]
+    sessions.retiring = {"wf-pool:run-1:0"}
+
+    await worker.reset()
+
+    assert sessions.identity_checks == 1
+    assert stale.new_conversation_calls == 0, "a flagged session took the cheap reuse path"
+    assert sessions.reset_intents == [True]
+    assert sessions.cold_starts == 2
+    assert worker._provider is sessions.live["wf-pool:run-1:0"]
+    assert worker._provider is not stale
+
+
+@pytest.mark.asyncio
+async def test_every_reuse_runs_the_account_check_and_a_healthy_session_stays_warm():
+    """Eight sequential calls: seven reuses, each with its own check, none of them a hard reset."""
+    sessions = _FakeSessions()
+    agent_fn, pool = build_pooled_agent_fn(sessions, run_id="r-check", max_workers=1)
+    for i in range(8):
+        await agent_fn(f"task-{i}", {})
+    await pool.shutdown()
+
+    assert sessions.identity_checks == 7
+    assert sessions.cold_starts == 1
+    assert sessions.resets == 0

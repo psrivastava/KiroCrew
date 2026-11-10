@@ -80,6 +80,7 @@ import stat
 import subprocess
 import tarfile
 import tempfile
+import time
 import urllib.parse
 import zipfile
 from collections.abc import Callable, Iterator, Mapping
@@ -102,6 +103,7 @@ __all__ = [
     "InstalledKasBundle",
     "KasBundleError",
     "KasBundleManifest",
+    "KasHostUnsupported",
     "fetch_manifest",
     "host_node_key",
     "host_platform_key",
@@ -114,6 +116,7 @@ __all__ = [
     "make_universal_node",
     "manifest_url_for",
     "parse_manifest",
+    "sweep_stale_staging",
     "trim_for_shipping",
 ]
 
@@ -156,10 +159,26 @@ _FILE_NAME_RE = re.compile(r"^[0-9A-Za-z][0-9A-Za-z._+-]{0,127}$")
 #: (the engine's ACP server and the Node binary) are; ``kirocrew doctor`` prints its path.
 KAS_BUNDLE_INSTALL_RECORD_NAME = "install.json"
 _STAGING_PREFIX = ".staging-"
+#: Staging trees that are not an install's, so the stale sweep never takes them: a
+#: retired tree can hold the only copy of the working engine, and lipo's is the
+#: universal-Node merge's work tree.
+_RETIRED_STAGING_PREFIX = f"{_STAGING_PREFIX}retired-"
+_LIPO_STAGING_PREFIX = f"{_STAGING_PREFIX}lipo-"
+#: An install's staging tree with nothing written for this long is taken as no live
+#: install's: above ``release_apply.ENGINE_INSTALL_TIMEOUT_SECS`` (the update's kill)
+#: and ``asset_downloader.DEFAULT_TIMEOUT_SECS`` (a download's socket timeout).
+_STALE_STAGING_SECS = 3600.0
 
 
 class KasBundleError(Exception):
     """A manifest, transfer, extraction or layout problem. ``str(exc)`` is the remedy."""
+
+
+class KasHostUnsupported(KasBundleError):
+    """This host cannot run the engine at all (OS, architecture, glibc, no build).
+
+    Retrying the download cannot help, so callers must not suggest it.
+    """
 
 
 @dataclass(frozen=True)
@@ -185,7 +204,7 @@ class KasBundleManifest:
         try:
             return self.platforms[platform_key]
         except KeyError:
-            raise KasBundleError(
+            raise KasHostUnsupported(
                 f"KAS {self.version} publishes no engine build for {platform_key} "
                 f"(has: {', '.join(sorted(self.platforms)) or 'none'})"
             ) from None
@@ -194,7 +213,7 @@ class KasBundleManifest:
         try:
             return self.node_builds[node_key]
         except KeyError:
-            raise KasBundleError(
+            raise KasHostUnsupported(
                 f"KAS {self.version} publishes no Node runtime for {node_key} "
                 f"(has: {', '.join(sorted(self.node_builds)) or 'none'})"
             ) from None
@@ -225,7 +244,7 @@ def _host_os(system: str) -> str:
         return "darwin"
     if system == "windows":
         return "win32"
-    raise KasBundleError(f"KAS bundles are not published for this operating system ({system})")
+    raise KasHostUnsupported(f"KAS bundles are not published for this operating system ({system})")
 
 
 def _host_arch(machine: str) -> str:
@@ -234,7 +253,7 @@ def _host_arch(machine: str) -> str:
         return "x64"
     if machine in ("arm64", "aarch64"):
         return "arm64"
-    raise KasBundleError(f"KAS bundles are not published for this architecture ({machine})")
+    raise KasHostUnsupported(f"KAS bundles are not published for this architecture ({machine})")
 
 
 def host_node_key(system: str | None = None, machine: str | None = None) -> str:
@@ -267,7 +286,7 @@ def _require_loadable_glibc(system: str | None, machine: str | None) -> None:
     floor = constants._OFFICIAL_NODE_GLIBC_FLOOR
     if glibc is None or glibc >= floor:
         return
-    raise KasBundleError(
+    raise KasHostUnsupported(
         f"this host's glibc ({glibc[0]}.{glibc[1]}) is older than KAS requires "
         f"(glibc {floor[0]}.{floor[1]}+): the bundled Node build needs glibc "
         f"{floor[0]}.{floor[1]}, and Amazon Linux 2-era hosts (glibc below 2.27) "
@@ -646,6 +665,46 @@ def _write_json(path: Path, data: Mapping[str, Any]) -> None:
     os.replace(tmp, path)
 
 
+def sweep_stale_staging(root: Path) -> None:
+    """Remove the ``.staging-<version>-*`` trees installs ended from outside left.
+
+    An install removes its own staging tree in its ``except``, but the refresh's
+    hard stop (``os._exit``) and the update's kill run no handler. A tree with an
+    entry newer than :data:`_STALE_STAGING_SECS` may be a running install's and
+    stays; a link or junction at a listed name is never followed or removed.
+    Never raises.
+    """
+    cutoff = time.time() - _STALE_STAGING_SECS
+    try:
+        candidates = [
+            p
+            for p in root.iterdir()
+            if p.name.startswith(_STAGING_PREFIX)
+            and not p.name.startswith((_RETIRED_STAGING_PREFIX, _LIPO_STAGING_PREFIX))
+        ]
+    except OSError as exc:
+        logger.warning("could not list %s for stale KAS staging trees: %s", root, exc)
+        return
+    for tree in candidates:
+        try:
+            if platform_compat.is_link_or_junction(tree):
+                continue
+            newest, size = tree.lstat().st_mtime, 0
+            for dirpath, dirnames, filenames in os.walk(tree):
+                for name in dirnames + filenames:
+                    st = os.lstat(os.path.join(dirpath, name))
+                    newest = max(newest, st.st_mtime)
+                    if stat.S_ISREG(st.st_mode):
+                        size += st.st_size
+            if newest > cutoff:
+                continue
+            shutil.rmtree(tree)
+        except OSError as exc:
+            logger.warning("could not sweep the KAS staging tree %s: %s", tree, exc)
+            continue
+        logger.info("removed the stale KAS staging tree %s (%d bytes)", tree, size)
+
+
 def install_bundle(
     manifest: KasBundleManifest,
     *,
@@ -678,6 +737,7 @@ def install_bundle(
         )
 
     root.mkdir(parents=True, exist_ok=True)
+    sweep_stale_staging(root)
     staging = Path(tempfile.mkdtemp(prefix=f"{_STAGING_PREFIX}{manifest.version}-", dir=root))
     try:
         downloads = staging / "downloads"
@@ -732,9 +792,19 @@ def install_bundle(
         # and the no-replace publish turns that into a refusal, never a swap.
         retired: Path | None = None
         if force and final.exists():
-            retired = Path(tempfile.mkdtemp(prefix=f"{_STAGING_PREFIX}retired-", dir=root))
+            retired = Path(tempfile.mkdtemp(prefix=_RETIRED_STAGING_PREFIX, dir=root))
             retired.rmdir()
-            os.rename(final, retired)
+            try:
+                os.rename(final, retired)
+            except OSError as exc:
+                # Windows refuses to rename a directory while a process holds a file
+                # in it open, as a running session's node.exe does; the installed
+                # engine stays where it is.
+                raise KasBundleError(
+                    f"KAS {manifest.version} at {final} could not be replaced "
+                    f"({exc.strerror or exc}); if a KAS session is running it, "
+                    "stop that session and retry"
+                ) from exc
         try:
             platform_compat.publish_dir_noreplace(staging, final)
         except FileExistsError as exc:
@@ -875,7 +945,7 @@ def make_universal_node(
     other_ref = manifest.node_for(other)
     node_bin = installed.node_bin
 
-    work = Path(tempfile.mkdtemp(prefix=f"{_STAGING_PREFIX}lipo-", dir=home.parent))
+    work = Path(tempfile.mkdtemp(prefix=_LIPO_STAGING_PREFIX, dir=home.parent))
     try:
         archive = work / other_ref.file
         _fetch_artifact(

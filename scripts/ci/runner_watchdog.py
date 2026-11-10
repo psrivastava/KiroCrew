@@ -64,13 +64,12 @@ Every other
 status -- 401, 404, 5xx -- and every malformed payload still raises exactly as
 before.
 
-The re-run is a FULL re-run, not ``rerun-failed-jobs``, because of how the
-label is computed: ``ci.yml`` computes it ONCE, in its ``changes`` job, and the
-routed jobs read it from that job's outputs. A failed-jobs re-run does not run
-``changes`` again, so the re-queued jobs would carry a label whose attempt
-suffix is stale, and CodeBuild's documentation does not say whether it honours
-that. A full re-run recomputes the label. The cost is one CI round; the
-alternative was a ten-hour hold.
+The re-run is a FULL re-run, not ``rerun-failed-jobs``, so ``ci.yml``'s
+``changes`` job re-runs as well and the new attempt decides its surface and
+fleet admission afresh instead of reusing the cancelled attempt's outputs.
+Either form asks for a current label: every routed job spells it from its own
+``github.run_attempt``. The cost is one CI round; the alternative was a
+ten-hour hold.
 
 Slow is not dead
 ----------------
@@ -239,15 +238,23 @@ WATCHED_WORKFLOWS: tuple[str, ...] = (
     "build.yml",
     "ci.yml",
     "code-review.yml",
+    "codeql.yml",
     "dependency-review.yml",
     "dependency-vulnerability.yml",
     "fast-gate.yml",
+    # The caller is listed as well as the callee: a job called by a local
+    # `uses:` belongs to the CALLER's run, so the run's `path` is the gate's and
+    # the callee's fleet job is invisible unless the gate is watched.
+    "internal-content-scan-gate.yml",
+    "internal-content-scan.yml",
     "macos-on-demand.yml",
     "main-ratchet-audit.yml",
     "pages.yml",
+    "pr-hygiene.yml",
     "pr-merge-conflict-label.yml",
     "pr-policy.yml",
     "pr-readiness.yml",
+    "release-lts.yml",
     "release.yml",
     "sensitive-change-review.yml",
 )
@@ -322,6 +329,7 @@ HEAL_SAFE_PULL_REQUEST_WORKFLOWS: frozenset[str] = frozenset(
     {
         "code-review.yml",
         "dependency-review.yml",
+        "pr-hygiene.yml",
         "pr-policy.yml",
     }
 )

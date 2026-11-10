@@ -82,9 +82,7 @@ class TestRefusalLineVerb:
         assert f"refusing to {verb} an app under an identity" in result["error"]
 
 
-# ---------------------------------------------------------------------------
 # Post-rejection un-poison
-# ---------------------------------------------------------------------------
 
 
 class TestUnpoisonRejectedCheckout:
@@ -228,9 +226,7 @@ class TestUnpoisonRejectedCheckout:
         assert (pkg / "sub" / "app.json").read_bytes() == b"{}"
 
 
-# ---------------------------------------------------------------------------
 # Pre-clone checkout probe
-# ---------------------------------------------------------------------------
 
 
 class TestPreexistingCheckoutProbe:
@@ -279,15 +275,12 @@ class TestPreexistingCheckoutProbe:
         assert commit_probes == ([pkg] if preexisting else [])
 
 
-# ---------------------------------------------------------------------------
 # install_from_registry — pre-clone refusals
-# ---------------------------------------------------------------------------
 
 
 class TestInstallFromRegistryRefusals:
     @pytest.fixture(autouse=True)
-    # nosemgrep: kirocrew.test-autouse-shared-monkeypatch -- the class's own no-side-effect guard, moved verbatim; no test in the class calls monkeypatch.undo()
-    def _no_side_effects(self, monkeypatch, tmp_path):
+    def _no_side_effects(self, _floor_monkeypatch, tmp_path):
         """Every test here must return before any clone/build/registration.
 
         ``app-sources`` is redirected at *tmp_path* as a belt-and-braces guard:
@@ -295,13 +288,13 @@ class TestInstallFromRegistryRefusals:
         a future regression fail loudly in the sandbox instead of quietly
         touching the real Kiro Crew home.
         """
-        monkeypatch.setattr(registry, "sel", lambda: MagicMock())
-        monkeypatch.setattr(registry, "_app_sources_dir", lambda: tmp_path / "app-sources")
+        _floor_monkeypatch.setattr(registry, "sel", lambda: MagicMock())
+        _floor_monkeypatch.setattr(registry, "_app_sources_dir", lambda: tmp_path / "app-sources")
 
         async def _never_clone(*a, **k):
             raise AssertionError("install must refuse before cloning")
 
-        monkeypatch.setattr(registry, "_clone_build_app", _never_clone)
+        _floor_monkeypatch.setattr(registry, "_clone_build_app", _never_clone)
 
     @pytest.mark.asyncio
     async def test_provenance_mismatch_is_refused_and_audited(self, monkeypatch):
@@ -468,11 +461,20 @@ class TestInstallFromRegistryRefusals:
         assert secret not in str(audit.log_api_access.call_args)
 
     @pytest.mark.asyncio
-    async def test_local_grant_over_local_install_names_the_reinstall_route(
-        self, tmp_path, monkeypatch
+    @pytest.mark.parametrize(
+        "resolved",
+        [
+            "https://example.test/owner/demo.git",
+            "https://deploy:s3cret-token@example.test/owner/demo.git",
+        ],
+    )
+    async def test_local_grant_over_local_install_carries_the_repository_to_trust(
+        self, tmp_path, monkeypatch, resolved
     ):
         """A re-grant here would record the local source again, so the refusal
-        must not carry the code that reopens the consent dialog."""
+        must not carry the code that reopens the consent dialog. It carries the
+        repository the update installs instead, normalized and credential-free,
+        as the consent proof the update route takes to switch the grant."""
         from kiro_crew.config.loader import _invalidate_config_cache
 
         home = tmp_path / "home"
@@ -491,7 +493,6 @@ class TestInstallFromRegistryRefusals:
             encoding="utf-8",
         )
         _invalidate_config_cache()
-        resolved = "https://example.test/owner/demo.git"
         monkeypatch.setattr(
             registry,
             "_resolve_install_entry",
@@ -514,9 +515,12 @@ class TestInstallFromRegistryRefusals:
 
         assert result["ok"] is False
         assert result["code"] == "app_trust_local_only"
-        assert "uninstall the app (its data is kept)" in result["error"]
-        assert "App Store" in result["error"]
-        assert resolved not in result["error"]
+        assert "Trust the repository to update the app from it" in result["error"]
+        assert result["trustRepository"] == "https://example.test/owner/demo"
+        # The coordinate travels in its own field, never in the audited prose,
+        # and clone credentials reach neither.
+        assert "example.test" not in result["error"]
+        assert "s3cret-token" not in json.dumps(result)
         audit.log_api_access.assert_called_once_with(
             caller="app_install_from_registry",
             operation="trust_repository_binding_required",
@@ -554,6 +558,9 @@ class TestInstallFromRegistryRefusals:
         monkeypatch.setattr(registry, "app_admission_denied", lambda *a, **k: None)
         # A host no default names, so the client-install answer is the one under test.
         monkeypatch.setattr(sys, "platform", "haiku")
+        # Off ``win32``, ``shutil.which`` ignores ``PATHEXT``, so a Windows host's
+        # ``git.exe`` would read as missing and the git preflight would answer first.
+        monkeypatch.setattr(registry, "git_unavailable_refusal", lambda name: None)
         try:
             result = await registry.install_from_registry("demo")
         except TypeError as exc:

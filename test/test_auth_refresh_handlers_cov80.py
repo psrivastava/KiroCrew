@@ -28,6 +28,7 @@ from __future__ import annotations
 import collections
 import json
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -957,11 +958,24 @@ async def test_refresh_revokes_the_chain_when_the_cached_replacement_is_corrupt(
 # --- _rebind_rotated_token_to_peer -------------------------------------------
 
 
+def _rebind_spy(monkeypatch: pytest.MonkeyPatch) -> tuple[MagicMock, str]:
+    """A spy over the real ``bind_token_peer`` and a token no other test has bound.
+
+    The pin lands in the process-wide token state, so the check reads the real
+    binding rather than only the call that was made.
+    """
+    bind = MagicMock(wraps=h.bind_token_peer)
+    monkeypatch.setattr(h, "bind_token_peer", bind)
+    return bind, f"tok-{uuid.uuid4().hex}"
+
+
 @pytest.mark.asyncio
 async def test_rebind_is_a_noop_without_tailnet_trust(monkeypatch: pytest.MonkeyPatch) -> None:
-    bind = MagicMock()
-    monkeypatch.setattr(h, "bind_token_peer", bind)
-    await h._rebind_rotated_token_to_peer(_mk(), "tok", time.time() + 60)
+    from kiro_crew.dashboard.token_auth import _state as _token_state
+
+    bind, tok = _rebind_spy(monkeypatch)
+    await h._rebind_rotated_token_to_peer(_mk(), tok, time.time() + 60)
+    assert not _token_state.has_binding(tok)
     bind.assert_not_called()
 
 
@@ -969,24 +983,28 @@ async def test_rebind_is_a_noop_without_tailnet_trust(monkeypatch: pytest.Monkey
 async def test_rebind_is_a_noop_when_no_login_is_allowlisted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    bind = MagicMock()
-    monkeypatch.setattr(h, "bind_token_peer", bind)
+    from kiro_crew.dashboard.token_auth import _state as _token_state
+
+    bind, tok = _rebind_spy(monkeypatch)
     trust = TailnetTrust(trust_identity=True, allowed_logins=())
     await h._rebind_rotated_token_to_peer(
-        _mk(app_keys={"tailnet_trust": trust}), "tok", time.time() + 60
+        _mk(app_keys={"tailnet_trust": trust}), tok, time.time() + 60
     )
+    assert not _token_state.has_binding(tok)
     bind.assert_not_called()
 
 
 @pytest.mark.asyncio
 async def test_rebind_is_a_noop_when_no_peer_resolves(monkeypatch: pytest.MonkeyPatch) -> None:
-    bind = MagicMock()
-    monkeypatch.setattr(h, "bind_token_peer", bind)
+    from kiro_crew.dashboard.token_auth import _state as _token_state
+
+    bind, tok = _rebind_spy(monkeypatch)
     monkeypatch.setattr(h, "resolve_forwarded_peer", AsyncMock(return_value=None))
     trust = TailnetTrust(trust_identity=True, allowed_logins=("alice@example.com",))
     await h._rebind_rotated_token_to_peer(
-        _mk(app_keys={"tailnet_trust": trust}), "tok", time.time() + 60
+        _mk(app_keys={"tailnet_trust": trust}), tok, time.time() + 60
     )
+    assert not _token_state.has_binding(tok)
     bind.assert_not_called()
 
 
@@ -994,14 +1012,18 @@ async def test_rebind_is_a_noop_when_no_peer_resolves(monkeypatch: pytest.Monkey
 async def test_rebind_pins_the_rotated_token_to_the_resolved_peer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    bind = MagicMock()
-    monkeypatch.setattr(h, "bind_token_peer", bind)
+    from kiro_crew.dashboard.token_auth import check_token_peer
+
+    bind, tok = _rebind_spy(monkeypatch)
     monkeypatch.setattr(h, "resolve_forwarded_peer", AsyncMock(return_value=("alice", "node")))
     monkeypatch.setattr(h, "peer_pin_key", lambda peer, scope: f"pin:{peer[0]}:{scope}")
     trust = TailnetTrust(trust_identity=True, allowed_logins=("alice",))
     exp = time.time() + 60
-    await h._rebind_rotated_token_to_peer(_mk(app_keys={"tailnet_trust": trust}), "tok", exp)
-    bind.assert_called_once_with("tok", f"pin:alice:{trust.pin_scope}", exp)
+    await h._rebind_rotated_token_to_peer(_mk(app_keys={"tailnet_trust": trust}), tok, exp)
+    # The stored pin admits the resolved peer and refuses any other one.
+    assert check_token_peer(tok, f"pin:alice:{trust.pin_scope}") == (True, "")
+    assert check_token_peer(tok, f"pin:mallory:{trust.pin_scope}")[0] is False
+    bind.assert_called_once_with(tok, f"pin:alice:{trust.pin_scope}", exp)
 
 
 # --- POST /api/auth/logout ---------------------------------------------------
@@ -1074,6 +1096,35 @@ async def test_logout_records_a_noop_when_the_access_cookie_was_not_revocable(
     request = _mk("POST", "/api/auth/logout", cookies={f"mc_token_{PORT}": "junk"})
     await h.api_auth_logout(request)
     assert ("", "access_cookie_revoked", "noop", "") in audit
+
+
+@pytest.mark.asyncio
+async def test_logout_revokes_on_unavailable_state_even_if_the_store_reads_again(
+    audit: list, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The revoke follows the validation's own answer, not a second look at the store."""
+    unavailable = (False, "alice", "refresh state unavailable (x)", "chain-1", "j", 1.0)
+    monkeypatch.setattr(h, "validate_refresh_token", lambda _t: unavailable)
+    fake = MagicMock()
+    fake.degraded_reason.return_value = ""  # the file read again in between
+    fake.revoke_chain.return_value = True
+    monkeypatch.setattr(h, "_get_state", lambda: fake)
+    request = _mk("POST", "/api/auth/logout", cookies={refresh_cookie_name(str(PORT)): "tok"})
+    await h.api_auth_logout(request)
+    assert fake.revoke_chain.call_args.args[0] == "chain-1"
+
+
+@pytest.mark.asyncio
+async def test_logout_reports_an_unstored_access_cookie_revocation(
+    audit: list, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A logout the denylist could not store answers 503, not 200, and clears the cookies."""
+    monkeypatch.setattr(h, "revoke_access_cookie", MagicMock(side_effect=OSError("unreadable")))
+    request = _mk("POST", "/api/auth/logout", cookies={f"mc_token_{PORT}": "tok"})
+    response = await h.api_auth_logout(request)
+    assert response.status == 503
+    assert ("", "access_cookie_revoked", "not_persisted", "") in audit
+    assert f"mc_token_{PORT}" in _set_cookie_names(response)
 
 
 @pytest.mark.asyncio

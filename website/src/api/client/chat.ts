@@ -5,7 +5,7 @@
  * links, the send wire, and the composer autocomplete read.
  */
 
-import type { ChatSlot, ChatSlotDetailResponse, CrewTimeline, CrewWorker, SideSnapshot } from '../../types'
+import type { ChatSlot, ChatSlotDetailResponse, CrewPause, CrewTimeline, CrewWorker, CrewWorkerRecap, SideSnapshot } from '../../types'
 import type { SessionSummary } from '../../types/sessionSummary'
 import type { DynamicDashboardCard } from '../../types/dynamicDashboard'
 import { getStoredConsent } from '../../utils/themeConsent'
@@ -18,6 +18,13 @@ import { takeSessionFolderNotice } from '../../lib/sessionFolderNotice'
 import { noteCrewSteerReceipt } from '../../lib/crewSteerNotice'
 import { activeLocale } from '../../i18n/format'
 import type { ClientTransport } from './transport'
+
+/** Shared Crew first-submit-wins fields of one send (see `api/sendRace.ts`). */
+export interface SendRaceFields {
+  baseRevision?: number
+  sendNow?: boolean
+  idempotencyKey?: string
+}
 
 /**
  * Resolve the theme-consent token to transmit for an installed pack's chat.
@@ -78,8 +85,19 @@ export function createChatEndpoints({ post, put, del, patch, j, jAccepted, jfetc
      *  through another worker (`GET /api/chat/slots/{root}/crew-workers`). */
     /** A closed root (its tab gone) still answers, from saved data:
      *  `root_closed: true` and its saved `root_title`. */
-    crewWorkers: (root: string): Promise<{ root: string; workers: CrewWorker[]; root_closed?: boolean; root_title?: string }> =>
+    crewWorkers: (root: string): Promise<{ root: string; workers: CrewWorker[]; root_closed?: boolean; root_title?: string; root_kind?: 'mate'; paused?: CrewPause }> =>
       fetch('/api/chat/slots/' + encodeURIComponent(root) + '/crew-workers').then(j),
+    /** One session's recap under its root, from the ledger and its crew log only
+     *  (`GET .../crew-workers/{worker}/recap`). No model call. */
+    crewWorkerRecap: (root: string, worker: string): Promise<CrewWorkerRecap> =>
+      fetch('/api/chat/slots/' + encodeURIComponent(root) + '/crew-workers/' + encodeURIComponent(worker) + '/recap').then(j),
+    /** Pause all: stop the root's turn and every running crew member's, hold the
+     *  crew until Resume all (`POST .../crew-workers/pause`). */
+    crewPause: (root: string): Promise<{ ok: boolean; paused: boolean; stopped: string[] }> =>
+      post('/api/chat/slots/' + encodeURIComponent(root) + '/crew-workers/pause').then(j),
+    /** Resume all: continue exactly what the pause stopped (`POST .../crew-workers/resume`). */
+    crewResume: (root: string): Promise<{ ok: boolean; paused: boolean; resumed: Record<string, string>; failed?: string[] }> =>
+      post('/api/chat/slots/' + encodeURIComponent(root) + '/crew-workers/resume').then(j),
     /** One Crew Mode root's timeline: a lane per session, bars from recorded
      *  transcript rows only (`GET /api/chat/slots/{root}/crew-timeline`). */
     crewTimeline: (root: string): Promise<CrewTimeline> =>
@@ -192,12 +210,22 @@ export function createChatEndpoints({ post, put, del, patch, j, jAccepted, jfetc
      * message. Used by the artifact companion chat to name the bound artifact so
      * the user's first message needs no slug boilerplate. */
     chatSlotContext: (slot: string, content: string, opts?: { source?: string; ephemeral?: boolean; maxAge?: number }) => post('/api/chat/slots/' + encodeURIComponent(slot) + '/context', { content, ...(opts?.source ? { source: opts.source } : {}), ...(opts?.ephemeral !== undefined ? { ephemeral: opts.ephemeral } : {}), ...(opts?.maxAge !== undefined ? { maxAge: opts.maxAge } : {}) }).then(j),
-    deleteChatSlot: (slot: string) => del('/api/chat/slots/' + encodeURIComponent(slot)).then(j),
+    /** Close a slot. `incarnation` NAMES the instance the caller meant: a key is
+     * reusable, so a key-only close cannot tell the row the user dismissed from a
+     * replacement that took the key before the request arrived. Optional on the
+     * wire — the server revalidates whichever naming it is given, and answers 409
+     * `target_replaced` when the named instance no longer holds the key. */
+    deleteChatSlot: (slot: string, incarnation?: string) => del('/api/chat/slots/' + encodeURIComponent(slot) + (incarnation ? '?incarnation=' + encodeURIComponent(incarnation) : '')).then(j),
+    /** Close a session nothing was written in and delete its history row; 409 when it is not empty. */
+    discardChatSlot: (slot: string) => post('/api/chat/slots/' + encodeURIComponent(slot) + '/discard').then(j),
     cleanupSessions: (maxInactiveDays: number, activeSlot?: string, dryRun?: boolean) => post('/api/chat/slots/cleanup', { max_inactive_days: maxInactiveDays, active_slot: activeSlot || '', dry_run: !!dryRun }).then(j) as Promise<{ ok: boolean; archived: number; keys: string[]; failed: string[]; dry_run?: boolean; count?: number; active_is_stale?: boolean }>,
     stopChatSlot: (slot: string) => post('/api/chat/slots/' + encodeURIComponent(slot) + '/stop').then(j),
     stopChatSlotForce: (slot: string) => post('/api/chat/slots/' + encodeURIComponent(slot) + '/stop?force=true').then(j),
     cancelQueuedMessage: (slot: string, queueId: string) => del('/api/chat/slots/' + encodeURIComponent(slot) + '/queue/' + encodeURIComponent(queueId)).then(j),
     editQueuedMessage: (slot: string, queueId: string, content: string) => patch('/api/chat/slots/' + encodeURIComponent(slot) + '/queue/' + encodeURIComponent(queueId), { content }).then(j),
+    /** Hold a queued message while its card's editor is open (`editing: true`), or
+     *  release it unsaved (`false`), so the drain never sends the words being edited. */
+    holdQueuedMessageEdit: (slot: string, queueId: string, editing: boolean) => post('/api/chat/slots/' + encodeURIComponent(slot) + '/queue/' + encodeURIComponent(queueId) + '/editing', { editing }).then(j),
     reorderQueuedMessages: (slot: string, order: string[]) => put('/api/chat/slots/' + encodeURIComponent(slot) + '/queue/order', { order }).then(j),
     /** Take back a steer the running turn has not read yet (the row's `meta.mid`).
      *  Resolves once the take-back is armed; what became of the steer lands on its
@@ -214,6 +242,9 @@ export function createChatEndpoints({ post, put, del, patch, j, jAccepted, jfetc
     forkChatSlot: (slot: string, atIndex?: number, prompt?: string, mode?: string, direction?: string, messageId?: string) => post('/api/chat/slots/' + encodeURIComponent(slot) + '/fork', { ...(atIndex !== undefined ? { at_message_index: atIndex } : {}), ...(messageId ? { at_message_id: messageId } : {}), ...(prompt ? { prompt } : {}), ...(mode ? { mode } : {}), ...(direction ? { direction } : {}) }).then(j),
     sideTools: () => fetch('/api/chat/side/tools').then(j) as Promise<{ read_only_tools: boolean; claude_adapter_outdated: boolean; claude_adapter_min_version: string; claude_adapter_update_command: string; config_unavailable: boolean }>,
     sideState: (slot: string) => fetch('/api/chat/slots/' + encodeURIComponent(slot) + '/side').then(j) as Promise<SideSnapshot>,
+    // No body: promotion always copies the WHOLE transcript with no prompt/mode
+    // override (see chat_fork.api_chat_slot_promote), so there is nothing to narrow.
+    promoteChatSlot: (slot: string) => post('/api/chat/slots/' + encodeURIComponent(slot) + '/promote', {}).then(j),
     sideOpen: async (slot: string) => {
       await waitForSideClose(slot)
       return post('/api/chat/slots/' + encodeURIComponent(slot) + '/side/open', {}).then(j) as Promise<{ ok: boolean; open: boolean; messages: number; last_run_id: string; created_at: string }>
@@ -232,6 +263,11 @@ export function createChatEndpoints({ post, put, del, patch, j, jAccepted, jfetc
     regenerateSlot: (slot: string) => post('/api/chat/slots/' + encodeURIComponent(slot) + '/regenerate').then(j),
     /** Pick an interrupted turn back up. NOT `/resume` — that path opens a history session into a tab. */
     continueSlot: (slot: string) => post('/api/chat/slots/' + encodeURIComponent(slot) + '/continue').then(j),
+    /** The bulk form of `continueSlot`: Resume every idle session whose last turn ended without a reply (only those among `slots` when given). Owner-only. Starts a background run and answers at once (409 `resume_all_running` with that run's id and total while one is in flight); the outcome arrives as a `resume_all_done` frame. */
+    /** `crewMode`: this tab's Crew Mode preview is on, so its count left out the workers of listed roots and the run leaves them out too. */
+    chatSlotsResumeAll: (crewMode = false, slots?: string[]) => post('/api/chat/slots/resume-all', {
+      ...(crewMode ? { crew_mode: true } : {}), ...(slots ? { slots } : {}),
+    }).then(j) as Promise<{ ok: boolean; total: number; run_id: string }>,
     /** Drop the slot's native conversation; the next turn starts a fresh one seeded from a text replay of the transcript (`replay: true`). The transcript stays. */
     resetConversation: (slot: string) => post('/api/chat/slots/' + encodeURIComponent(slot) + '/reset-conversation', { replay: true }).then(j) as Promise<{ slot: string; reset: boolean; replay: boolean }>,
     /** Downscale the oversized images in the slot's transcript in place, then re-issue the interrupted turn (recovery from the provider's many-image 2000px cap). No turns are lost, unlike `resetConversation`. */
@@ -265,7 +301,9 @@ export function createChatEndpoints({ post, put, del, patch, j, jAccepted, jfetc
   }
 
   const send = {
-    sendChat: (message: string, slot?: string, colorTheme?: string, signal?: AbortSignal, meta?: Record<string, unknown>, steer?: boolean | 'auto', responsive?: boolean) => {
+    sendChat: (message: string, slot?: string, colorTheme?: string, signal?: AbortSignal, meta?: Record<string, unknown>, steer?: boolean | 'auto', responsive?: boolean, race?: SendRaceFields, origin?: 'dashboard_card') => {
+      // `origin: 'dashboard_card'` is sent only by a Dashboard-tab button's one-click reply
+      // (`pages/members/sendCardReply`); the gateway re-checks it and refuses what a card may not do.
       // theme_consent_sha is the WIRE TOKEN (two-tier consent). The client just
       // TRANSMITS the raw stored grant (see themeConsentSha) — the server verifies
       // content-binding, injecting the persona only when this token equals sha256
@@ -304,7 +342,12 @@ export function createChatEndpoints({ post, put, del, patch, j, jAccepted, jfetc
       // guide observation before Start asks this tab and no other. `X-UI-Lang`
       // is the language this tab renders, so the agent quotes dashboard labels
       // as this screen spells them (the gateway keeps only a shipped tag).
-      return fetch('/api/chat?ws=1', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Guide-Tab': TAB_ID, 'X-UI-Lang': activeLocale(), ..._sk }, body: JSON.stringify({ message, slot, ...(colorTheme ? { color_theme: colorTheme } : {}), ...(themeConsent ? { theme_consent_sha: themeConsent } : {}), ...(meta ? { meta } : {}), ...(steer ? { steer: steer === 'auto' ? 'auto' : true } : {}), ...(responsive ? { responsive: true } : {}) }), signal }).then(sendResponseAuthRecovery)
+      // `race` (Shared Crew first submit wins): the session revision this tab
+      // last saw, whether this is a deliberate Send now after a lost race (the
+      // gateway never steers it), and the per-send Idempotency-Key a retry
+      // reuses so the host answers it once.
+      const raceHeaders: Record<string, string> = race?.idempotencyKey ? { 'Idempotency-Key': race.idempotencyKey } : {}
+      return fetch('/api/chat?ws=1', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Guide-Tab': TAB_ID, 'X-UI-Lang': activeLocale(), ..._sk, ...raceHeaders }, body: JSON.stringify({ message, slot, ...(colorTheme ? { color_theme: colorTheme } : {}), ...(themeConsent ? { theme_consent_sha: themeConsent } : {}), ...(meta ? { meta } : {}), ...(steer && !race?.sendNow ? { steer: steer === 'auto' ? 'auto' : true } : {}), ...(responsive ? { responsive: true } : {}), ...(race?.baseRevision !== undefined ? { base_revision: race.baseRevision } : {}), ...(race?.sendNow ? { send_now: true } : {}), ...(origin ? { origin } : {}) }), signal }).then(sendResponseAuthRecovery)
     },
   }
 

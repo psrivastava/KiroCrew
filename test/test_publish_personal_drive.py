@@ -46,7 +46,7 @@ def test_provider_implements_the_whole_abc():
 
 
 def test_no_per_account_provider_key_is_registered(monkeypatch):
-    """A provider id is validated at the HTTP boundary against ^[a-z0-9-]{1,32}$, so a
+    """A provider id is validated at the HTTP boundary against ^[a-z0-9_-]{1,32}$, so a
     colon-qualified per-account key would be listed in the picker and rejected on
     submit. A row that 400s when clicked is worse than no row."""
     import re as _re
@@ -484,7 +484,38 @@ def test_upload_declares_the_content_type(monkeypatch, payload):
     spy = _EngineSpy()
     spy.install(monkeypatch)
     _publish(pd.PersonalDriveProvider(), payload)
-    assert spy.arg("put-object", "--content-type") == "text/html"
+    assert spy.arg("put-object", "--content-type") == "text/html; charset=utf-8"
+
+
+@pytest.mark.parametrize(
+    ("given", "sent"),
+    [
+        ("text/plain", "text/plain; charset=utf-8"),
+        ("text/markdown", "text/markdown; charset=utf-8"),
+        ("text/plain; charset=utf-8", "text/plain; charset=utf-8"),
+        ("text/plain; Charset=ISO-8859-1", "text/plain; Charset=ISO-8859-1"),
+        ("image/svg+xml", "image/svg+xml"),
+        ("", "application/octet-stream"),
+    ],
+)
+def test_upload_names_utf8_for_a_text_type_without_a_charset(monkeypatch, payload, given, sent):
+    """The staged body is UTF-8, and S3 serves the header as stored: a text page with no
+    charset is read in the browser's locale encoding, so non-ASCII text arrives garbled."""
+    _stub_profiles(monkeypatch, ["alpha"])
+    spy = _EngineSpy()
+    spy.install(monkeypatch)
+    asyncio.run(
+        pd.PersonalDriveProvider().publish(
+            file_path=payload,
+            content_type=given,
+            title="t",
+            summary="",
+            tags=[],
+            visibility="public",
+            shared_with=[],
+        )
+    )
+    assert spy.arg("put-object", "--content-type") == sent
 
 
 def test_upload_stores_the_content_digest_as_metadata(monkeypatch, payload):
@@ -690,26 +721,14 @@ def test_serving_notice_returns_no_code_when_the_link_will_resolve(monkeypatch):
     assert code == ""
 
 
-def _notice_code(res) -> str:
-    """The notice_code carried on a PublishResult.
-
-    The field is added to PublishResult by the seam half of this change (contract);
-    reading it defensively lets Section A's own gate run whether or not that half has
-    landed yet, while still asserting the value once it exists.
-    """
-    return getattr(res, "notice_code", "__ABSENT__")
-
-
 def test_a_rolling_out_publish_carries_the_rolling_out_code(monkeypatch, payload):
     """A2 -- the code must ride back on the result the module returns, not just the text,
     so the frontend can select its per-case string."""
     _stub_profiles(monkeypatch, ["alpha"])
     _EngineSpy(status="InProgress").install(monkeypatch)
     res = _publish(pd.PersonalDriveProvider(), payload)
-    code = _notice_code(res)
-    if code != "__ABSENT__":
-        assert code == "rolling_out"
-    # Regardless of the seam field's landing order, the human text still reflects it.
+    assert res.notice_code == "rolling_out"
+    # The human text names the state too, not only the code.
     assert "rolling out" in res.notice.lower()
 
 
@@ -719,9 +738,7 @@ def test_a_disabled_publish_carries_the_disabled_code(monkeypatch, payload):
     _stub_profiles(monkeypatch, ["alpha"])
     _EngineSpy(enabled=False).install(monkeypatch)
     res = _publish(pd.PersonalDriveProvider(), payload)
-    code = _notice_code(res)
-    if code != "__ABSENT__":
-        assert code == "distribution_disabled"
+    assert res.notice_code == "distribution_disabled"
     assert "DISABLED" in res.notice
 
 
@@ -742,9 +759,7 @@ def test_an_unreadable_rollout_state_carries_the_unknown_code(monkeypatch, paylo
     monkeypatch.setattr(pd.engine, "distribution_status", _status)
     res = _publish(pd.PersonalDriveProvider(), payload)
     assert res.external_id, "the handle for the uploaded object must come back"
-    code = _notice_code(res)
-    if code != "__ABSENT__":
-        assert code == "unknown"
+    assert res.notice_code == "unknown"
     assert "did not report" in res.notice
 
 
@@ -755,9 +770,7 @@ def test_a_healthy_publish_carries_no_notice_code(monkeypatch, payload):
     _EngineSpy(status="Deployed", enabled=True).install(monkeypatch)
     res = _publish(pd.PersonalDriveProvider(), payload)
     assert res.notice == ""
-    code = _notice_code(res)
-    if code != "__ABSENT__":
-        assert code == ""
+    assert res.notice_code == ""
 
 
 def test_an_unreadable_rollout_state_still_returns_the_handle(monkeypatch, payload):
@@ -1367,7 +1380,7 @@ def test_push_version_types_the_bytes_it_was_handed_not_the_stale_remote_header(
         )
     )
     assert not out.error
-    assert spy.arg("put-object", "--content-type") == "text/html"
+    assert spy.arg("put-object", "--content-type") == "text/html; charset=utf-8"
 
 
 def test_push_version_keeps_the_stored_type_for_a_suffix_it_cannot_read(monkeypatch, tmp_path):

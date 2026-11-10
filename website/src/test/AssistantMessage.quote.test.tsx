@@ -13,10 +13,14 @@ vi.mock('../components/MarkdownRenderer', () => ({
 vi.mock('../hooks/useSmoothStream', () => ({ useSmoothStream: (content: string) => content }))
 vi.mock('../utils/shareUrl', () => ({ copySessionLink: vi.fn().mockResolvedValue(true) }))
 import { copySessionLink } from '../utils/shareUrl'
-vi.mock('../utils/clipboard', () => ({ copyToClipboard: vi.fn().mockResolvedValue(true) }))
-import { copyToClipboard } from '../utils/clipboard'
+vi.mock('../utils/clipboard', () => ({ copyToClipboard: vi.fn().mockResolvedValue(true), copyRichToClipboard: vi.fn().mockResolvedValue(true) }))
+import { copyRichToClipboard, copyToClipboard } from '../utils/clipboard'
 
-beforeEach(() => { vi.useFakeTimers(); vi.mocked(copyToClipboard).mockReset().mockResolvedValue(true) })
+beforeEach(() => {
+  vi.useFakeTimers()
+  vi.mocked(copyToClipboard).mockReset().mockResolvedValue(true)
+  vi.mocked(copyRichToClipboard).mockReset().mockResolvedValue(true)
+})
 afterEach(() => { act(() => { vi.runAllTimers() }); vi.useRealTimers() })
 
 const LONG = 'A completed reply that is comfortably longer than twenty characters.'
@@ -47,12 +51,12 @@ describe('AssistantMessage row with Quote offered', () => {
     expect(screen.queryByTestId('copy-message-menu-item')).not.toBeInTheDocument()
   })
 
-  it('on the newest reply Regenerate takes the seat and Copy is still a visible row button right after it', () => {
+  it('on the newest reply Regenerate takes the seat and Copy is still a visible row button right after it', async () => {
     const onQuote = vi.fn()
     render(<AssistantMessage content="Reply text long enough for the raw toggle." isStreaming={false} slotRunning={false} messageTs="t1" slotKey="chat-1" onTogglePin={() => {}} onSpeak={() => {}} onRegenerate={() => {}} onQuoteMessage={onQuote} />)
     expect(rowLabels()).toEqual(['Regenerate response', 'Copy', 'More actions'])
     expect(screen.queryByTestId('quote-message')).not.toBeInTheDocument()
-    fireEvent.click(screen.getByLabelText('Copy'))
+    await act(async () => { fireEvent.click(screen.getByLabelText('Copy')) })
     expect(copyToClipboard).toHaveBeenCalledWith('Reply text long enough for the raw toggle.')
     openMore()
     expect(screen.getAllByRole('menuitem').map(i => i.textContent)).toEqual(['Quote message', 'Copy as rich textKeeps formatting in email and documents', 'Copy link to message', 'Pin message', 'Show raw markdown', 'Read aloud'])
@@ -153,12 +157,12 @@ describe('AssistantMessage context menu', () => {
     expect(screen.queryByTestId('message-context-menu')).not.toBeInTheDocument()
   })
 
-  it('opens on right-click: Quote first, then both copy formats, Copy link, Pin', () => {
+  it('opens on right-click: Quote first, then both copy formats, Copy link, Pin', async () => {
     const onQuote = vi.fn()
     render(<AssistantMessage content={LONG} isStreaming={false} slotRunning={false} messageTs="t1" slotKey="chat-1" onTogglePin={() => {}} onQuoteMessage={onQuote} />)
     fireEvent.contextMenu(screen.getByTestId('message-bubble'))
     expect(screen.getAllByRole('menuitem').map(i => i.textContent)).toEqual(['Quote message', 'Copy as MarkdownKeeps ** and # symbols, for Markdown editors and chat apps', 'Copy as rich textKeeps formatting in email and documents', 'Copy link to message', 'Pin message', 'Show raw markdown'])
-    fireEvent.click(screen.getByTestId('message-context-copy'))
+    await act(async () => { fireEvent.click(screen.getByTestId('message-context-copy')) })
     expect(copyToClipboard).toHaveBeenCalledWith(LONG)
   })
 })
@@ -233,26 +237,30 @@ describe('AssistantMessage copy on select', () => {
   })
   afterEach(() => { window.getSelection()?.removeAllRanges() })
 
-  const dragOverReply = () => {
+  const dragOverReply = async () => {
     const range = document.createRange()
     range.selectNodeContents(screen.getByTestId('md'))
     window.getSelection()!.removeAllRanges()
     window.getSelection()!.addRange(range)
-    act(() => { document.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, clientX: 40, clientY: 20 })) })
-    act(() => { vi.advanceTimersByTime(60) })
+    await act(async () => {
+      document.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, clientX: 40, clientY: 20 }))
+      await vi.advanceTimersByTimeAsync(60)
+    })
   }
 
-  it('copies a mouse selection when the setting is on', () => {
+  it('copies a mouse selection when the setting is on', async () => {
     render(<AssistantMessage content={LONG} isStreaming={false} slotRunning={false} onQuote={() => {}} onAsk={() => {}} copyOnSelect />)
-    dragOverReply()
-    expect(copyToClipboard).toHaveBeenCalledWith(LONG)
+    await dragOverReply()
+    // The selection row's Copy over a reply: the same plain text, with the part as rich text.
+    expect(copyRichToClipboard).toHaveBeenCalledWith(LONG, LONG)
     expect(screen.getByRole('button', { name: 'Quote' })).toBeInTheDocument()
   })
 
-  it('only opens the row when the setting is off', () => {
+  it('only opens the row when the setting is off', async () => {
     render(<AssistantMessage content={LONG} isStreaming={false} slotRunning={false} onQuote={() => {}} onAsk={() => {}} />)
-    dragOverReply()
+    await dragOverReply()
     expect(screen.getByRole('button', { name: 'Quote' })).toBeInTheDocument()
     expect(copyToClipboard).not.toHaveBeenCalled()
+    expect(copyRichToClipboard).not.toHaveBeenCalled()
   })
 })

@@ -113,7 +113,7 @@ def test_lower_creator_never_raises_a_worker(state):
 
 
 def test_card_scoped_creator_hands_down_nothing(state):
-    """A "Trust this crew member" card on the creator covers its own tools only."""
+    """A "Trust this crew member" card reaches the creator's subagents, not its sessions."""
     conductor = _slot(state, "chat-root")
     worker = _create(state, conductor)
     conductor._trust = True
@@ -226,6 +226,8 @@ def test_a_restored_worker_follows_its_conductor_on_a_recorded_edge(state, monke
 
     conductor = _slot(state, "chat-root")
     restored = _slot(state, "chat-restored")
+    # Confirm the claim so the restore keeps it; the raise reads its own record.
+    monkeypatch.setattr(sc, "_creation_parent", lambda key: conductor.key)
     _read_created_by(SimpleNamespace(meta={"created_by": conductor.key}, slot=restored))
     assert restored._created_by == conductor.key and restored._posture_inherited is True
     assert restored._lineage_minted is False

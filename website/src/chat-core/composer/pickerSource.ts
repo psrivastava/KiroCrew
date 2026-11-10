@@ -32,6 +32,16 @@ export interface SlashCommand {
   description?: string
 }
 
+/** A saved workflow as the `/workflow ` picker lists it. */
+export interface PickerWorkflow {
+  slug: string
+  id?: string
+  /** Refs this read found reaching another record (or none); never offered. */
+  shadowed_refs?: string[]
+  name?: string
+  description?: string
+}
+
 export type FileKind = 'file' | 'dir'
 
 /** One row of the `@` / `./` menus. */
@@ -76,6 +86,8 @@ export interface ComposerPickerSource {
   pathComplete?: (project: string, dir: string, q: string, signal?: AbortSignal) => Promise<FileSearchResponse>
   /** The raw `/api/skills` payload (a bare array or the agent-scoped envelope). */
   skills?: (slotKey: string | undefined, agent: string | undefined, signal?: AbortSignal) => Promise<unknown>
+  /** The saved workflows (`/api/workflows/definitions`) the `/workflow ` menu lists. */
+  workflows?: () => Promise<{ definitions?: PickerWorkflow[] }>
 }
 
 const ComposerPickerSourceContext = createContext<ComposerPickerSource | null>(null)

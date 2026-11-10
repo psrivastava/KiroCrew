@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from typing import Any
 
     from ...subagent import (
+        _MAX_SPAWN_DEPTH,
         AGENT_NOT_AVAILABLE_CODE,
         MEMORY_CAUSE_CGROUP_USAGE_UNREADABLE,
         MEMORY_CAUSE_READ_UNANSWERED,
@@ -68,6 +69,8 @@ class _GateMixin(ManagerComponent):
         MEMORY_WAIT_UNTIL_KEY: str
         MEMORY_CAUSE_LANE_SHARE: str
 
+        def track_store_task(self, task: "asyncio.Task[Any]") -> "asyncio.Task[Any]": ...
+
     # Each name below IS its owner module's function, whose first parameter is ``self``:
     # ``_hoist_impls`` and ``bind_component_globals`` see a bound ``*_impl`` exactly as
     # one defined in this class body, and a member without the suffix runs on its
@@ -115,6 +118,7 @@ class _GateMixin(ManagerComponent):
         target_member: str | None = None,
         delegation: dict[str, str] | None = None,
         backend: str | None = None,
+        failover_from: str | None = None,
         label: str = "",
         _execution_context: dict | None = None,
         _parent_spawn_policy: "ParentSpawnPolicy | None" = None,
@@ -123,6 +127,9 @@ class _GateMixin(ManagerComponent):
         _recovering_row: bool = False,
         _stop_before_memory_read: bool = False,
         _memory_reading: "tuple[float, str] | None" = None,
+        _depth: int | None = None,
+        _root_session_key: str | None = None,
+        _card_turn: bool = False,
     ) -> "SubagentInfo | PreparedSpawn | ClaimPoint | MemoryReadPoint | None":
         """Spawn a subagent for *task*.
 
@@ -183,6 +190,54 @@ class _GateMixin(ManagerComponent):
         # concurrency gate keeps its identity across the round-trip instead of
         # being announced under one id and starting under another.
         agent_id: str = _preassigned_id or self._manager._mint_agent_id()
+        # A Dashboard card's turn starts no sub-agent. Its words are a page's, and a child
+        # would take the approval path of its own (the gateway's sub-agent approver reads
+        # the parent thread's trust), a queued start could read a later turn's policy, and
+        # its completion would run as a new turn nobody marked as a card's. Refusing here
+        # closes all three, and the refusal costs the card reply one delegation.
+        #
+        # Decided BEFORE the batch accounting, and answered as a NON-batch rejection (no
+        # ``batch_id``): a batch member's rejection is announced to the gateway, whose wave
+        # digest starts a turn on the parent that nobody marked as a card's. The caller
+        # still gets the error synchronously in the returned info, one per task.
+        #
+        # Only on the FIRST entry: a row a typed turn queued earlier and the pump drains
+        # later (``_from_queue``), or one ``spawn_async`` already accepted, was admitted
+        # before the card turn and is not failed by it.
+        from kiro_crew.dashboard import card_send
+
+        if (
+            parent_session_key
+            and not _from_queue
+            and _claimed is None
+            and not _store_accepted
+            and _memory_reading is None
+            # ``_card_turn``: the caller saw a card turn when its request arrived
+            # (card_send.card_turn_seen), so a Stop during the handler's awaits does
+            # not let the request through unmarked.
+            and (_card_turn or card_send.card_turn_running(parent_session_key))
+        ):
+            try:
+                sel().log_tool_invocation(
+                    session_key=parent_session_key,
+                    source="subagent",
+                    tool_name="spawn_run",
+                    outcome="rejected_card_origin_turn",
+                    metadata={"agent": agent},
+                )
+            except Exception:
+                logger.debug("SEL audit failed for card-turn spawn rejection", exc_info=True)
+            return self._manager._announce_rejection(
+                SubagentInfo(
+                    id=agent_id,
+                    task=redact_credentials(redact_exfiltration_urls(task or "")[0])[0],
+                    agent=agent,
+                    parent_session_key=parent_session_key,
+                    done=True,
+                    error="spawn refused: a turn started by a Dashboard card cannot start a sub-agent",
+                )
+            )
+
         # Submission accounting: count this member as
         # submitted BEFORE any rejection or queue/registration branching. A
         # member refused below (empty task, low memory, bad cwd, governance)
@@ -262,7 +317,9 @@ class _GateMixin(ManagerComponent):
                 # admission closed during one of them. The caller is told it
                 # was refused, so the store is told the same: a row left
                 # queued would run once admission reopens.
-                self._manager._admission.taskq_fail(agent_id, closed.error)
+                self._manager._admission.taskq_fail(
+                    agent_id, closed.error, memory_mode=_memory_mode or ""
+                )
             return self._manager._announce_rejection(closed)
 
         def _refuse_row(info: SubagentInfo) -> SubagentInfo:
@@ -276,12 +333,16 @@ class _GateMixin(ManagerComponent):
             A drained run is registered as a terminal record too: its caller
             was told it was accepted, and its next ``GET /api/spawn/{id}``
             must read this failure, not a 404 for an id that is neither
-            queued nor started any more. ``spawn_async``'s caller has not been
-            answered yet, and receives this refusal as its answer."""
+            queued nor started any more -- registered once the row's settle
+            has landed (``register_refused``), since that record is the
+            refusal PUBLISHED to a status poll. ``spawn_async``'s caller has
+            not been answered yet, and receives this refusal as its answer."""
             if info.error and (_from_queue or (_store_accepted and _claimed is None)):
-                self._manager._admission.taskq_fail(agent_id, info.error)
+                self._manager._admission.taskq_fail(
+                    agent_id, info.error, memory_mode=info.memory_mode
+                )
                 if _from_queue:
-                    self._manager._agents.setdefault(info.id, info)
+                    self._manager._admission.register_refused(info)
             return self._manager._announce_rejection(info)
 
         # The mutable policy gates (cwd allowlist, governance, the parent
@@ -309,7 +370,97 @@ class _GateMixin(ManagerComponent):
         # A nested spawn (its parent is a subagent): the child reserve below lets
         # it take the reserved slots, and the kernel memory-pressure hold never
         # applies to it.
-        _is_child = bool(self._manager._admission.taskq_parent_id_for(parent_session_key))
+        _parent_run_id = self._manager._admission.taskq_parent_id_for(parent_session_key)
+        _is_child = bool(_parent_run_id)
+        # Lineage depth: the deeper of the depth carried in (the queued params
+        # of a drained row, a retry's or a continuation's recorded depth) and
+        # the depth the spawning parent proves now (its live record's depth + 1,
+        # or the one sub-agent level its key proves when the record is gone).
+        # Carrying it keeps a drain, retry or continuation at its real depth
+        # after the parent's record was dismissed, cancelled or lost to a
+        # restart; taking the deeper means a carried value can only raise it.
+        # The parent is the run the key names plus every running continuation
+        # of it, which has its own id but runs on the original run's
+        # ``conversation_key``; after a restart the continuation is the only
+        # one live. A finished continuation is left out: its record lingers
+        # until eviction and would charge a later, shallower turn its depth.
+        _parent_depths = [
+            int(getattr(a, "depth", 1) or 1)
+            for a in (self._manager._agents.values() if _parent_run_id else ())
+            if a.id == _parent_run_id
+            or (
+                not a.done
+                and (getattr(a, "conversation_key", "") or f"subagent:{a.id}") == parent_session_key
+            )
+        ]
+        if _parent_depths:
+            _proven_depth = max(_parent_depths) + 1
+        elif _is_child:
+            _proven_depth = 2
+        else:
+            _proven_depth = 1
+        _carried_depth = _depth if type(_depth) is int else 0
+        _depth = max(_carried_depth, _proven_depth)
+        # The root carried by a retry, continuation or drained row, else the parent's root or key.
+        if not (isinstance(_root_session_key, str) and _root_session_key):
+            _parent_record = (
+                next(
+                    (
+                        a
+                        for a in self._manager._agents.values()
+                        if not a.done
+                        and (getattr(a, "conversation_key", "") or f"subagent:{a.id}")
+                        == parent_session_key
+                    ),
+                    self._manager._agents.get(_parent_run_id),
+                )
+                if _parent_run_id
+                else None
+            )
+            _root_session_key = parent_session_key
+            if _parent_record is not None:
+                _root_session_key = (
+                    getattr(_parent_record, "root_session_key", "")
+                    or _parent_record.parent_session_key
+                )
+        # The second half of a claimed dispatch is never refused for depth: its
+        # first half already was checked, and a refusal here would return the
+        # claimed row to the store as claimable work the caller was told was
+        # refused.
+        if _depth > _MAX_SPAWN_DEPTH and not _dispatch_now:
+            logger.warning(
+                "Subagent spawn refused: depth %d exceeds the cap of %d (parent=%s)",
+                _depth,
+                _MAX_SPAWN_DEPTH,
+                parent_session_key,
+            )
+            try:
+                sel().log_tool_invocation(
+                    session_key=parent_session_key or "",
+                    source="subagent",
+                    tool_name="spawn_run",
+                    outcome="rejected_depth_cap",
+                    metadata={"agent": agent, "depth": _depth, "cap": _MAX_SPAWN_DEPTH},
+                )
+            except Exception:
+                logger.debug("SEL audit failed for depth-cap rejection", exc_info=True)
+            return _refuse_row(
+                SubagentInfo(
+                    id=agent_id,
+                    task=_redacted_task,
+                    agent=agent,
+                    parent_session_key=parent_session_key,
+                    done=True,
+                    error=(
+                        f"spawn refused: a sub-agent at depth {_depth} would exceed the "
+                        f"nesting cap of {_MAX_SPAWN_DEPTH}; do this work in the current "
+                        "run instead of delegating it further"
+                    ),
+                    batch_id=batch_id,
+                    batch_total=max(0, int(batch_total)),
+                    depth=_depth,
+                )
+            )
 
         # Freeze before queueing or awaiting approval; a replacement parent must
         # not change the mode of work already admitted under its predecessor. A
@@ -538,6 +689,8 @@ class _GateMixin(ManagerComponent):
             # The drain re-enters ``spawn`` from this dict alone: a run that hit
             # the concurrency gate would otherwise start on the default backend.
             "backend": backend,
+            # Same reason: a queued row would otherwise lose the hop it reports.
+            "failover_from": failover_from,
             # Same reason: a queued row would otherwise start under its task text.
             "label": label,
             "allowed_tools": allowed_tools,
@@ -576,6 +729,8 @@ class _GateMixin(ManagerComponent):
             "_parent_project_dirs": _parent_project_dirs,
             "crew": crew,
             "_memory_mode": _memory_mode,
+            "_depth": _depth,
+            "_root_session_key": _root_session_key,
             # Same rule for the asking turn: `spawn_async` re-enters from this
             # dict (prepare -> write -> re-enter), so a follow-up whose asking
             # ordinal was pinned by its watcher would otherwise be re-read from
@@ -771,7 +926,7 @@ class _GateMixin(ManagerComponent):
                 _checked[3] if _checked is not None else _validate_app_agent_ownership(agent, app)
             )
             if owner_err:
-                self._manager._admission.taskq_fail(agent_id, owner_err)
+                self._manager._admission.taskq_fail(agent_id, owner_err, memory_mode=_memory_mode)
                 info = SubagentInfo(
                     id=agent_id,
                     task=_redacted_task,
@@ -805,7 +960,7 @@ class _GateMixin(ManagerComponent):
             if err:
                 # The row was accepted; an agent name that does not resolve at
                 # dispatch is a terminal failure of THAT row, never a silent drop.
-                self._manager._admission.taskq_fail(agent_id, err)
+                self._manager._admission.taskq_fail(agent_id, err, memory_mode=_memory_mode)
                 info = SubagentInfo(
                     id=agent_id,
                     task=_redacted_task,
@@ -869,6 +1024,7 @@ class _GateMixin(ManagerComponent):
             "model": model or "",
             "reasoning_effort": reasoning_effort or "",
             "backend": backend,
+            "failover_from": failover_from,
             "allowed_tools": list(allowed_tools) if allowed_tools else [],
             "bare": bare,
             "keep": keep,
@@ -1216,8 +1372,9 @@ class _GateMixin(ManagerComponent):
         if verdict == "expired":
             # Never proceeds into the pressure it waited on: ended, never
             # started, its row failed so the depth stops counting it, and
-            # registered as a terminal record so a caller that was told it was
-            # queued reads this outcome by id rather than a 404.
+            # registered as a terminal record -- once that failure has landed
+            # -- so a caller that was told it was queued reads this outcome by
+            # id rather than a 404.
             ended = SubagentInfo(
                 id=agent_id,
                 task=_redacted_task,
@@ -1229,8 +1386,10 @@ class _GateMixin(ManagerComponent):
                 batch_id=batch_id,
                 batch_total=max(0, int(batch_total)),
             )
-            self._manager._admission.taskq_fail(agent_id, MEMORY_PRESSURE_NEVER_STARTED)
-            self._manager._agents.setdefault(agent_id, ended)
+            self._manager._admission.taskq_fail(
+                agent_id, MEMORY_PRESSURE_NEVER_STARTED, memory_mode=_memory_mode
+            )
+            self._manager._admission.register_refused(ended)
             self._manager._emit_queue_depth(parent_session_key, batch_id)
             return self._manager._announce_rejection(ended)
         if verdict == "held":
@@ -1462,6 +1621,8 @@ class _GateMixin(ManagerComponent):
             memory_store=memory_store or "",
             crew=crew,
             memory_mode=_memory_mode,
+            depth=_depth,
+            root_session_key=_root_session_key,
             **run_fields,
         )
         info._start_price_gb = candidate_price
@@ -1469,7 +1630,15 @@ class _GateMixin(ManagerComponent):
         info._raw_task = task  # unredacted prompt for kiro-cli execution
         info._memory_mode_ready = not bool(conversation_key)
         info._taskq_generation = taskq_generation
+        info._taskq_attempt = taskq_generation
         self._manager._agents[agent_id] = info
+        # A member that waited in the queue gets the parent turn attempt its
+        # ``POST /api/spawn`` named (``carry_spawn_attempt``), before the pending
+        # start is forgotten with it.
+        take_attempt = getattr(self._manager, "_take_spawn_attempt", None)
+        carried = take_attempt(agent_id) if callable(take_attempt) else None
+        if carried is not None:
+            info._spawned_under = carried
         self._manager._forget_pending_start(agent_id)
         self._record_crew_log_dispatch(info, from_queue=_from_queue, asked=_crew_log_asked)
         if not _dispatch_now:  # a ClaimPoint re-entry already holds its reservation
@@ -1491,20 +1660,28 @@ class _GateMixin(ManagerComponent):
             self._manager._seen_batches.add(batch_id)
             try:
                 loop = asyncio.get_event_loop()
-                loop.create_task(
-                    self._manager._fire_event(
-                        "spawn_batch_started",
-                        info,
-                        {"batch_id": batch_id, "count": info.batch_total},
+                self.track_store_task(
+                    loop.create_task(
+                        self._manager._fire_event(
+                            "spawn_batch_started",
+                            info,
+                            {"batch_id": batch_id, "count": info.batch_total},
+                        )
                     )
                 )
             except RuntimeError:
                 pass  # no running loop (sync/test context)
 
+        # A spawn's own ``approval_mode="auto"`` is a session Trust: a ``permission_mode``
+        # deny of ``trust`` refuses it, and the spawn takes the approval path below.
+        from kiro_crew.approval_mode_policy import session_mode_permitted
+
+        spawn_auto = approval_mode == "auto" and session_mode_permitted("trust")
         # Check parent session trust (approval_policy="auto") set by dashboard trust toggle.
+        from kiro_crew.subagent_manager.turn_session import approval_policy_of
+
         parent_trusted = (
-            parent_session_key
-            and self._manager._sessions.get_approval_policy(parent_session_key) == "auto"
+            parent_session_key and approval_policy_of(self._manager, parent_session_key) == "auto"
         )
 
         # Shared Crew: each run's runtime starts in its initiator's containment slice.
@@ -1513,7 +1690,7 @@ class _GateMixin(ManagerComponent):
         if self._manager._is_yolo and self._manager._is_yolo():
             self._manager._tasks[agent_id] = _start_run_task(self._manager._run(info), info)
             self._manager._log_spawned(info)
-        elif approval_mode == "auto":
+        elif spawn_auto:
             self._manager._tasks[agent_id] = _start_run_task(self._manager._run(info), info)
             self._manager._log_spawned(info)
             sel().log_tool_invocation(

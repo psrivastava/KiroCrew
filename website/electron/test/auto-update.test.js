@@ -37,6 +37,19 @@ test("channelForVersion: bare semver -> stable, unstamped/missing -> null", () =
   assert.strictEqual(channelForVersion(undefined), null);
 });
 
+test("channelForVersion: an edition's -N build of a stable release -> stable", () => {
+  // build-desktop.sh carries an edition's 0.13.0.11 into the shell as
+  // 0.13.0-11, and the backend reads that build's BUILD_VERSION as stable.
+  assert.strictEqual(channelForVersion("0.13.0-11"), "stable");
+  assert.strictEqual(channelForVersion("0.13.0-1"), "stable");
+  // Only that shape: a label, a second segment or a non-numeric build is
+  // still a prerelease.
+  assert.strictEqual(channelForVersion("0.13.0-rc.11"), "insider");
+  assert.strictEqual(channelForVersion("0.13.0-11.2"), "insider");
+  assert.strictEqual(channelForVersion("0.13.0-1a"), "insider");
+  assert.strictEqual(channelForVersion("0.13.0-nightly.20261107t060000"), "nightly");
+});
+
 test("channelForFlavor maps beta -> insider", () => {
   assert.strictEqual(channelForFlavor("beta"), "insider");
 });
@@ -306,6 +319,24 @@ test("isNewerVersion understands the prerelease stamps this app ships", () => {
   assert.strictEqual(isNewerVersion("0.3.0-insider.13", "0.3.0"), false);
   assert.strictEqual(isNewerVersion("0.3.0", "0.3.0-insider.13"), true);
   assert.strictEqual(isNewerVersion("0.5.0-nightly.20260801t000000", "0.3.0"), true);
+});
+
+test("isNewerVersion ranks a fourth build-number part when the first three tie", () => {
+  assert.strictEqual(isNewerVersion("0.12.0.4", "0.12.0.3"), true);
+  assert.strictEqual(isNewerVersion("0.12.0.3", "0.12.0.4"), false);
+  assert.strictEqual(isNewerVersion("0.12.0.4", "0.12.0.4"), false);
+  assert.strictEqual(isNewerVersion("0.12.0.10", "0.12.0.9"), true, "numeric, not text");
+  assert.strictEqual(isNewerVersion("0.12.0.4", "0.12.0"), true, "a missing fourth part counts as .0");
+  assert.strictEqual(isNewerVersion("0.12.0", "0.12.0.4"), false);
+  assert.strictEqual(isNewerVersion("0.12.0.0", "0.12.0"), false);
+  // The first three parts still decide whenever they differ.
+  assert.strictEqual(isNewerVersion("0.11.0.3", "0.10.0.3"), true);
+  assert.strictEqual(isNewerVersion("0.12.1", "0.12.0.9"), true);
+  assert.strictEqual(isNewerVersion("0.12.0.9", "0.12.1"), false);
+  // A prerelease of the same core is unchanged: the release core is newer.
+  assert.strictEqual(isNewerVersion("0.12.0.4", "0.12.0-rc.5"), true);
+  assert.strictEqual(isNewerVersion("0.12.0-rc.5", "0.12.0.3"), false);
+  assert.strictEqual(isNewerVersion("0.12.0-rc.6", "0.12.0-rc.5"), true);
 });
 
 test("isNewerVersion: unrankable input is null (fail-open, never a false 'not newer')", () => {

@@ -35,6 +35,16 @@ STATUS_CANCELLED = "cancelled"
 ACTIVE_STATUSES = frozenset({STATUS_RUNNING, STATUS_PAUSED})
 _TERMINAL_EVENT_TYPES = frozenset({"run_finished", "run_failed", "run_cancelled"})
 
+# Hard caps on the retained fallback-slot fields, applied where they are stored:
+# a direct POST /api/workflows/run can bypass the MCP tool's bound, and the value
+# would otherwise live in memory, every checkpoint and every run-list poll. The
+# folder-id cap holds a 12-hex sidebar folder id with margin. FALLBACK_TITLE_MAX
+# is the one source of the title cap: the injector's cleaner and the
+# WORKFLOW_RUN_SCHEMA ``title`` field import it
+# (the ``a-bound-bounds-every-field-it-retains`` rule).
+FALLBACK_TITLE_MAX = 200
+_FALLBACK_FOLDER_ID_MAX = 64
+
 # Max concurrently-tracked runs kept in memory (oldest finished evicted first).
 DEFAULT_MAX_RUNS = 200
 
@@ -102,6 +112,14 @@ class RunHandle:
     execution_context: Any = None
     memory_mode: str = "persistent"
     args: dict = field(default_factory=dict)
+    # Opt-in titling/filing for the fallback ``workflow-<run_id>`` slot a run
+    # falls back to when its originating session is gone. Both are empty by
+    # default, which keeps the ``Workflow: <name>`` title and the unfiled
+    # default. ``fallback_folder_id`` is an ALREADY-RESOLVED folder id (the
+    # workflow_run tool resolves a path to an id up front); the injector files
+    # the fallback slot under it only when that folder still exists.
+    fallback_title: str = ""
+    fallback_folder_id: str = ""
     agent_results: dict = field(default_factory=dict)  # call_index → result (resume cache)
     # call_index → bounded reason that call failed. Kept next to agent_results so a
     # missing payload always comes with an explanation instead of a bare ok=False.
@@ -130,6 +148,32 @@ class RunHandle:
     _persist_generation: int = field(default=0, init=False, repr=False, compare=False)
     # Live durability health, separate from the workflow function's outcome.
     _persistence_error: Optional[str] = field(default=None, init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        # Bound the retained fallback-slot fields at the one point every
+        # construction path passes through (start, restore, rerun, tests), so a
+        # body value that skipped the MCP schema cannot be stored, checkpointed
+        # or polled back unbounded. Non-strings are coerced to "" rather than
+        # trusted. REDACT the full title BEFORE the length cap: cutting first
+        # could slice a credential below the redactor's matching threshold, so a
+        # partial token would then survive checkpoint and snapshot redaction and
+        # reach disk/the dashboard. Redacting the whole string first closes that.
+        if isinstance(self.fallback_title, str) and self.fallback_title:
+            from kiro_crew.security import redact_credentials, redact_exfiltration_urls
+
+            try:
+                cleaned, _ = redact_exfiltration_urls(self.fallback_title)
+                cleaned, _ = redact_credentials(cleaned)
+            except Exception:
+                cleaned = ""
+            self.fallback_title = cleaned[:FALLBACK_TITLE_MAX]
+        else:
+            self.fallback_title = ""
+        self.fallback_folder_id = (
+            self.fallback_folder_id[:_FALLBACK_FOLDER_ID_MAX]
+            if isinstance(self.fallback_folder_id, str)
+            else ""
+        )
 
     @property
     def allows_persistence(self) -> bool:
@@ -167,6 +211,8 @@ class RunHandle:
             "task_id": self.task_id,
             "capabilities": list(self.capabilities),
             "completion_injection": self.completion_injection,
+            "fallback_title": self.fallback_title,
+            "fallback_folder_id": self.fallback_folder_id,
             "workflow_id": self.workflow_id,
             "workflow_slug": self.workflow_slug,
             "workflow_revision": self.workflow_revision,
@@ -184,34 +230,32 @@ class RunHandle:
             # the event stream so no extra plumbing is needed.
             "phase": self._current_phase(),
             "last_log": self._last_log(),
+            # When the run reached its terminal state, so a reader can tell a
+            # failure from minutes ago from one weeks old. None while active.
+            "ended_at": self._ended_at(),
         }
         if self._persistence_error and not self.error:
             snap["error_code"] = "workflow_checkpoint_failed"
         if include_result:
             snap["result"] = self.result
-        # Work that outlived a run which ENDED WITHOUT a usable return value
-        # (ceiling / cancel / crash). Keyed on STATUS, not on ``result is None``:
-        # a run can finish and legitimately return None (a script with no return,
-        # or whose last statement is a failed agent call), and a still-running run
-        # has no result yet — neither lost anything, so reporting partials for them
-        # would both mislead the reader and re-send every payload on every poll.
-        # The COUNTS ride in the compact view so a completion message can say the
-        # work survived; the payloads themselves ride only in the detail view.
+        # Partials are work that outlived a run which ENDED WITHOUT a usable return
+        # value (ceiling / cancel / crash). Keyed on STATUS, not ``result is None``:
+        # a finished run may legitimately return None, and an active run has no
+        # result yet. Counts ride in the compact view, payloads only in detail.
         ended_without_result = self.status not in ACTIVE_STATUSES | {STATUS_FINISHED}
-        partials = self.agent_results if ended_without_result else {}
+        # A failed call keeps its agent_results slot (the resume cache) but its
+        # reason is under agent_errors, so partials cover only calls with no
+        # recorded failure and never double-count one.
+        preserved = {k: v for k, v in self.agent_results.items() if k not in self.agent_errors}
+        partials = preserved if ended_without_result else {}
         if partials:
             snap["partial_result_count"] = len(partials)
         if self.agent_errors:
             snap["agent_error_count"] = len(self.agent_errors)
-        # Settled per-call outputs of a FINISHED run. ``partial_results`` above is
-        # the channel for runs that ended WITHOUT a usable result
-        # (failed/cancelled); a finished run exposes its per-call outputs here
-        # instead — the COUNT in the compact view, the payloads only in the FULL
-        # detail view (mirroring result/events/partial_results). An active run
-        # omits both (still accumulating, so reporting would re-send churning
-        # state every poll), and a failed/cancelled run keeps partial_results (no
-        # double report). This is a factual record of the calls that settled, NOT
-        # a claim the run produced a validated business artifact.
+        # Settled per-call outputs of a FINISHED run: the count in the compact
+        # view, payloads only in detail. An active run omits them (still churning)
+        # and a failed/cancelled run reports partial_results instead. A record of
+        # settled calls, not a claim the run produced a validated artifact.
         finished_results = self.agent_results if self.status == STATUS_FINISHED else {}
         if finished_results:
             snap["agent_result_count"] = len(finished_results)
@@ -239,6 +283,17 @@ class RunHandle:
     def _current_phase(self) -> str:
         """Title of the most recent ``phase_started`` event (live progress)."""
         return self._latest("phase_started", "title")
+
+    def _ended_at(self) -> str | None:
+        """Terminal-event timestamp, or last activity for an ended run without one."""
+        for e in reversed(self.events):
+            if e.type in _TERMINAL_EVENT_TYPES:
+                return e.ts
+        # Restored interruptions and driver exceptions can lack a terminal event;
+        # their last recorded activity stays stable across gateway restarts.
+        if self.status not in ACTIVE_STATUSES and self.events:
+            return self.events[-1].ts
+        return None
 
     def _last_log(self) -> str:
         """Most recent narrator ``log`` message (live progress)."""
@@ -269,6 +324,8 @@ class RunHandle:
             "task_id": self.task_id,
             "capabilities": list(self.capabilities),
             "completion_injection": self.completion_injection,
+            "fallback_title": self.fallback_title,
+            "fallback_folder_id": self.fallback_folder_id,
             "workflow_id": self.workflow_id,
             "workflow_slug": self.workflow_slug,
             "workflow_revision": self.workflow_revision,
@@ -323,6 +380,8 @@ class RunHandle:
             task_id=obj.get("task_id", ""),
             capabilities=tuple(obj.get("capabilities") or ()),
             completion_injection=obj.get("completion_injection", True) is True,
+            fallback_title=obj.get("fallback_title", ""),
+            fallback_folder_id=obj.get("fallback_folder_id", ""),
             workflow_id=obj.get("workflow_id", ""),
             workflow_slug=obj.get("workflow_slug", ""),
             workflow_revision=int(obj.get("workflow_revision") or 0),
@@ -693,15 +752,10 @@ class RunRegistry:
             if handle is None:
                 continue
             loaded += 1
-            # Idempotent restart writeback: a record stored as "running" is
-            # demoted to failed by from_store_json (it cannot resume in a new
-            # process). Persist the corrected state so the durable record
-            # matches memory and an external reader does not keep seeing
-            # "running". Only running->failed writes; an already-terminal
-            # record is left untouched, so repeated restarts converge.
-            # to_store_json carries the full record, so payloads
-            # (agent_results / agent_errors), source, provenance and args
-            # survive the writeback.
+            # from_store_json demoted a stored "running" record to failed; persist
+            # that so the durable record matches memory. Only running->failed
+            # writes, so repeated restarts converge, and to_store_json carries the
+            # full record so nothing is lost in the writeback.
             if obj.get("status") == STATUS_RUNNING:
                 self._persist(handle)
                 self._ended_by_restart.append(handle)
@@ -820,6 +874,10 @@ async def start_background_run(
     workflow_id: str = "",
     workflow_slug: str = "",
     workflow_revision: int = 0,
+    derived_from_workflow_id: str = "",
+    derived_from_revision: int = 0,
+    fallback_title: str = "",
+    fallback_folder_id: str = "",
     admission_closed: Optional[Callable[[], bool]] = None,
 ) -> str:
     """Schedule a workflow run on the loop, register a handle, return its run_id.
@@ -845,6 +903,10 @@ async def start_background_run(
         workflow_id=workflow_id,
         workflow_slug=workflow_slug,
         workflow_revision=workflow_revision,
+        derived_from_workflow_id=derived_from_workflow_id,
+        derived_from_revision=derived_from_revision,
+        fallback_title=fallback_title,
+        fallback_folder_id=fallback_folder_id,
     )
     await registry.register_async(handle)
     if admission_closed is not None and admission_closed():

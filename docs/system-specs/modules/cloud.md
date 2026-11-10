@@ -69,11 +69,11 @@ claim that a hostile in-process agent is fully contained.
 
 | Module | Role |
 |--------|------|
-| `aws.py` | The `run_aws` chokepoint for captured AWS CLI calls — fixed argv, no shell, sandbox-wrapped, `--profile` only (never boto3, never a raw key). `checked`/`checked_json`; `AccessDenied → exact IAM action` mapping; `env_credentials_hint()`. |
-| `ec2.py` | `deploy`/`status`/`stop`/`start`/`destroy` via `aws cloudformation` + `ec2`; AZ- **and egress-**aware `discover_network` + `resolve_explicit_subnet` (`--subnet` pin, same guarantees); tag-based stateless discovery; `_validate_cidr`. `find_stack` verifies BOTH `kirocrew:managed=true` AND `kirocrew:instance==<tag>` before status/stop/start/destroy touch a stack — so a same-prefix managed stack with a different instance tag can't be acted on by the wrong `--tag`. |
+| `aws.py` | The `run_aws` chokepoint for captured AWS CLI calls — fixed argv, no shell, sandbox-wrapped, `--profile` only (never boto3, never a raw key), and a child environment without the gateway's Python interpreter settings (`sandbox.without_python_env`), because aws-cli v1 is a Python program. `checked`/`checked_json`; `AccessDenied → exact IAM action` mapping; `env_credentials_hint()`; `warn_if_started_from_agent_session()`, the gateway's log-only post-READY WARNING when its own process reads as an agent session (`_in_agent_session`, the check `assert_human_action` refuses on), e.g. restarted from an agent's shell. |
+| `ec2.py` | `deploy`/`status`/`stop`/`start`/`destroy` via `aws cloudformation` + `ec2`; AZ- **and egress-**aware `discover_network` + `resolve_explicit_subnet` (`--subnet` pin, same guarantees); tag-based stateless discovery (`list_instances` drops an instance EC2 reports terminated, shutting down, or no longer has, so a crew whose stack was deleted leaves `list` as `status`/`destroy` already report it absent); `_validate_cidr`. `find_stack` verifies BOTH `kirocrew:managed=true` AND `kirocrew:instance==<tag>` before status/stop/start/destroy touch a stack — so a same-prefix managed stack with a different instance tag can't be acted on by the wrong `--tag`. |
 | `iam.py` | Least-privilege launcher policy generator (applied by the user, never by KiroCrew) + read-only reachability check + the **content-fixed instance permissions-boundary document** (`boundary_policy_document`/`boundary_arn`) and its constants (`BOUNDARY_NAME`). |
 | `host_policy.py` | Reads and validates the edition's `cloud_instance_policy` seam (managed policies for the EC2 instance role, plus the boundary statements they need). The one reader for the boundary document, the second launcher policy (`iam.host_policy_document`) and the template's `ExtraManagedPolicyArns`; see Security model. |
-| `ssm.py` | SSM `send-command` run-and-poll (base64-wrapped remote scripts) + `start-session` port-forward; `open_port_forward()` directly spawns the streaming `aws ssm start-session` child because `run_aws` captures output, and calls `aws.assert_human_action()` before doing so; `port_is_free` / `wait_for_local_port`. |
+| `ssm.py` | SSM `send-command` run-and-poll (base64-wrapped remote scripts) + `start-session` port-forward; `open_port_forward()` directly spawns the streaming `aws ssm start-session` child because `run_aws` captures output, and calls `aws.assert_human_action()` before doing so; `port_is_free` / `wait_for_local_port`. The local plugin installer (`install_session_manager_plugin()`) and the copy-paste command the dashboard shows (`session_manager_plugin_install_command()`, except its Homebrew line, which Homebrew checks against its own cask) fetch the plugin release pinned in `_SSM_PLUGIN_VERSION` and check the package's sha256 before any `sudo` step; the pins are a copy of `packaging/pins/aws-tools.env`, which the wheel does not ship, kept equal by `test/test_installer_tool_pins.py`. |
 | `login.py` | Device-code / social sign-in on the box over SSM -- `kiro-cli`'s, or Crew's own vault's on the KAS bundle route (every remote script asks the box which, see `login_vault.py`) -- plus `cancel_device_login` — which stops a login this crew started and removes the files holding its code, WITHOUT dropping the box's session, because a cancelled attempt must not sign the crew in later and must not take an older valid session with it — and `logout` — the account switch. `login` short-circuits on an existing session, so `logout` is what makes a different Kiro account reachable without a hand-run SSM command. It kills any still-polling background `kiro-cli login` **and** any live `kiro-cli acp` runtime **before** signing out (otherwise the login re-authenticates the old account, and an ACP runtime keeps serving the old account's in-memory credential until its next 401), removes the login log/PID/FIFO (they hold the previous device-code URL + code, which must never be re-shown as a fresh prompt), and confirms the result with `is_logged_in` rather than the exit code — `kiro-cli logout` exits non-zero when there was no session to drop, which is still the requested state. That confirmation fails CLOSED: it requires a positive signed-out sentinel (`__NOAUTH__`), so an SSM timeout or transport error — where the session may still be active — reports failure rather than a false "signed out". The same fail-closed applies to the cleanup command itself: if that SSM invocation doesn't return `Success`, the kills it was meant to do can't be trusted and logout reports failure without probing. The CLI warns the operator that in-flight chats/cron sessions are stopped (their runtimes are killed). |
 | `login_vault.py` | The on-box half of the sign-in when Crew's own vault owns the credential. The local `kirocrew cloud` command cannot read the instance's `config.json`, so **the box decides**: every remote script (`login.py`'s check / whoami / login / logout / callback / cancel) splices in `route_prelude()`, which resolves the box's `kirocrew` and runs its `kirocrew kas route`; only the exact answer `kas-bundle` (`agent.acp_backend == "kas"` AND `agent.kas_bundle` on, the positive shape `kiro_prerequisite_service._kas_bundle_route` uses) takes the vault branch -- an empty answer (a box whose Kiro Crew predates the verb, or no `kirocrew` at all) and every other answer take the kiro-cli branch, whose `kiro-cli` invocations are the ones the scripts always ran. Before either branch, `require_sign_in_program()` refuses readably in two cases. First, when the probe RAN and could not decide -- `kas route` exited `ROUTE_UNKNOWN_EXIT` (1: unreadable config, or a crash) -- it echoes `__KIROCREW_ROUTE_UNKNOWN__`, the probe's output and the remedy, and touches NEITHER program whether or not kiro-cli is installed: a box whose config just broke may be on the bundle route, and `kiro-cli logout` there would report a sign-out while the vault credential stays usable. Argparse's 2 (a `kirocrew` too old for the verb) and the shell's 127 (no `kirocrew`) are NOT that case: they are "no route answer" and keep the kiro-cli branch. Second, when the box has NEITHER program: the route was not `kas-bundle` (the probe's exit code, its stdout and its stderr are kept apart in `$KC_ROUTE_RC` / `$KC_ROUTE_OUT` / `$KC_ROUTE_ERR`; only stdout is compared, since the config loader warns on stderr while the verb still answers `kas-bundle`) and `kiro-cli` did not resolve. It echoes `__KIROCREW_NO_SIGNIN_PROGRAM__`, the probe's output (the `kas route` error for an unreadable config, or the shell's "not found" for a missing `kirocrew`) and the remedy, so the operator never reads `kiro-cli: command not found` for what is a bundle-route box whose config broke; the local side reads either sentinel as UNKNOWN (`_auth_probe` None, `remote_identity` None, `logout` False) and as the prompt's error, never as signed out and never as a reason to start a flow. On the vault branch the scripts drive `kirocrew kas whoami [--format json]`, `kirocrew kas login [--provider idc --start-url U --region R]` (one background launch for every target: the verb prompts for nothing, so the kiro-cli IdC pty driver has no counterpart) and `kirocrew kas logout` ([kas-auth.md](kas-auth.md) § Sign-in from a shell); their output is read by the SAME capture loop, `parse_login_output` and `parse_whoami_output`, because the verbs print kiro-cli's vocabulary (`https://…user_code=…`, `code: XXXX-XXXX`, the `accountType`/`startUrl` document) and use its exit codes. The device-login script echoes `__KIROCREW_VAULT_ROUTE__` on that branch so `start_device_login` never degrades a failed vault sign-in into the kiro-cli social-callback flow (there is no kiro-cli on that box); the callback script itself refuses with `__KIROCREW_VAULT_NO_CALLBACK__`. Cancel and replace `pkill` both command-line patterns (`kiro-cli login`, `kirocrew kas login`) and confirm the stop only when both are gone. The vault logout kills no engine process: the vault is part of the gateway's identity fingerprint and its pre-turn identity-change check retires the agent processes on the next turn. Nothing crosses SSM but the prompt the user must open; the device code and the token stay between the box's `kirocrew` and the issuer. |
 | `login_target.py` | `KiroLoginTarget`, the durable identity a managed launch signs in as (Builder ID default, or an Identity Center start URL + region), the `whoami` parser both routes share, `identity_matches_target`, and `discover_local_identity` -- the launching machine's own sign-in, inherited by `cloud launch` / `setup`. On a local KAS bundle route that reading comes from Crew's own vault (`local_vault_identity`, rendered through `auth/whoami.whoami_document` and read back through the same parser), with the same three answers as the kiro-cli reading: an identity, `{}` for none to inherit, `None` for unknown. An explicitly supplied `kiro_bin` still asks kiro-cli. |
@@ -85,7 +85,7 @@ claim that a hostile in-process agent is fully contained.
 | `fargate/` | A crew's Fargate task definition and `RunTask` request produced as **data**, by pure functions that call nothing. `identity.py` recovers which crew an ARN belongs to and refuses a document naming more than one; `taskdef.py` holds the revision key and the `RegisterTaskDefinition` document; `runtask.py` holds the launch request and the closed set of overrides it may carry. See "Fargate task definitions as data" below. |
 | `fargate_engine.py` | The `LaunchEngine` for Fargate, reachable through `engine_for("aws_fargate")` when -- and only when -- `cloud.json` carries a complete `fargate` block (see the `config.py` row and "The Fargate lane's configuration home" below). The lane is registered by `DefaultRemoteProvisionerProvider`, which appends the descriptor to `provisioners()` on the same condition; an absent or incomplete block leaves the lane unregistered rather than registered and refusing, and `engine_for` then raises the same `KeyError` an unknown id raises. Registration makes the lane reachable through the API and does **not** put a row in the Set-up picker: `kind` names a frontend form and no renderer claims this kind yet, so the dashboard skips it. Its teardown decides ownership from a task's tags: the `kirocrew:managed` marker is checked as a boolean gate **before** the identifier, so a task whose marker holds anything other than `true` is `UNMARKED` and is never stopped, and identity is then read under the imported `LAUNCH_TAG_KEY`. A running task this launch started but whose launch tag is absent or names another launch is `MISLABELLED`; both it and a running `UNMARKED` task carrying this launch's `startedBy` are REFUSED rather than deleted, and the plan returns `confirmed=False` naming the ARNs, because deleting on a `startedBy` match alone is a guess and reporting `True` would tell the operator their billing stopped when a task may still be running. Neither the marker's key nor its value nor the launch-tag key is spelled here; all three are imported from the modules that own them. |
 | `microvm/` | The Lambda MicroVM lane (see "The MicroVM lane" below). `config.py` holds `MicroVmConfig`, the typed `microvm` block, judged complete-or-absent like the Fargate block. `api.py` is every `lambda-microvms` call, through `aws.run_aws` / `checked_json` only (no boto3), with `endpoint_url` for the local harness. `image.py` resolves a crew's image: reuse a built one by digest, or build it once. `recipe.py` zips the SAME crew recipe the Fargate lane builds (the headless runtime base plus that crew's signed bundle) so `CreateMicrovmImage` runs the build on Lambda. `payload.py` builds the run-hook payload, the one channel into the VM at boot: the SSM activation, references (never values) to the control secret and the model credential, and the crew generation. `record.py` is the crew store (below). `states.py` holds where a crew can be and the only function that moves it. `engine.py` is `MicroVmLaunchEngine`, the five-method `LaunchEngine`, reachable through `engine_for("microvm")` only when the block is complete. |
-| `ui.py` / `wizard.py` | Terminal UI + the interactive launch flow. `_deploy_with_progress` runs the blocking deploy on a daemon thread and captures the `aws cloudformation deploy` child via a `proc_sink`, so a Ctrl+C on the main (poll) thread terminates it instead of orphaning it (~1800s). An unknown `--size`/`size_key` on the public `launch()` entrypoint yields a clean rc=1 + message, not an uncaught `KeyError`. Resuming a saved stack (`launch` after `stop`) first calls `_ensure_running_and_ssm_ready` — starts a `stopped` instance and waits for SSM `Online` before sign-in/tunnel (which are SSM-only and would otherwise fail); a `terminated` instance fails clean pointing at `--new`. `last_tag` is persisted (to the launch record, via `_record_launch`) **only after** a deploy confirms healthy, and a write that fails there WARNS rather than aborting -- the instance is already billing and sign-in still has to happen — a failed first launch leaves no saved pointer, so the next `launch` retries clean instead of resuming a rolled-back/instance-less stack; `_saved_launch_is_usable` additionally ignores a stale saved tag (from an older build) whose stack is in a `_FAILED_STATES` status or has no instance. |
+| `ui.py` / `wizard.py` | Terminal UI + the interactive launch flow. `_deploy_with_progress` runs the blocking deploy on a daemon thread and captures the `aws cloudformation deploy` child via a `proc_sink`, so a Ctrl+C on the main (poll) thread terminates it instead of orphaning it (~1800s). While it waits, `_stream_progress` prints each new stack event and, from the `Instance` event's physical id (the stack's `InstanceId` output exists only once the WaitCondition completes), the tail of `/var/log/kirocrew-setup.log` over SSM as `[box]` lines; 30 s with no new line prints the elapsed time. Every `ui` line helper flushes, so piped or `tee`d output streams too. An unknown `--size`/`size_key` on the public `launch()` entrypoint yields a clean rc=1 + message, not an uncaught `KeyError`. Resuming a saved stack (`launch` after `stop`) first calls `_ensure_running_and_ssm_ready` — starts a `stopped` instance and waits for SSM `Online` before sign-in/tunnel (which are SSM-only and would otherwise fail); a `terminated` instance fails clean pointing at `--new`. `last_tag` is persisted (to the launch record, via `_record_launch`) **only after** a deploy confirms healthy, and a write that fails there WARNS rather than aborting -- the instance is already billing and sign-in still has to happen — a failed first launch leaves no saved pointer, so the next `launch` retries clean instead of resuming a rolled-back/instance-less stack; `_saved_launch_is_usable` additionally ignores a stale saved tag (from an older build) whose stack is in a `_FAILED_STATES` status or has no instance. |
 | `templates/kirocrew-ec2.yaml` | The CloudFormation stack. |
 | `templates/kirocrew-microvm-base.yaml` | The account-and-region MicroVM stack, deployed by hand once, like the Fargate base: the launcher never creates a bucket or a key. It holds no networking, because a MicroVM launched with the egress connector has no security group or route table to place. Its resources: a KMS key and alias for the per-crew secrets, the recipe bucket, the image-build role Lambda assumes, the hybrid-activation role the guest's SSM agent registers under, and the execution role the crew runs as. Its outputs are the identifiers the `microvm` block names. |
 | `templates/kirocrew-fargate-base.yaml` | The account-and-region Fargate stack: the ECS cluster and an egress-only security group with no ingress. One per account and region, shared by every crew's tasks, so deleting one crew's stack cannot delete the cluster its siblings run on. |
@@ -128,6 +128,9 @@ The instance bootstrap runs `install.sh --voice` on both its initial attempt and
 retry. This installs the existing `voice` extra (`boto3` and
 `amazon-transcribe`) before the gateway first imports its Transcribe provider;
 installing those SDKs after startup would otherwise require a gateway restart.
+Like every `install.sh` run it also downloads the pinned KAS engine into the
+instance's data home (`kirocrew kas install`); a failed download only warns, and
+`agent.kas_bundle` stays off.
 
 When the installed module belongs to a valid source checkout, the launcher
 packages that checkout and uploads it to a launcher-owned bucket
@@ -195,6 +198,8 @@ the root cause), and drops the generic noise entirely once a specific reason
 exists.
 
 Teardown removes the uploaded source object as part of the contract: after a **confirmed** `delete-stack`, `source.delete_source` returns `{removed, uri, error}`. If the stack delete itself did not confirm, the source object and `last_tag` pointer are preserved and the CLI exits non-zero.
+
+`NoSuchBucket` counts as removed: only a source upload creates the bucket, so a launch from an installed package (no checkout to ship) left nothing behind and destroy says nothing about it. When the object really could not be removed, destroy warns and its last line names only the stack, never "all AWS resources deleted". A stack with no `InstanceId` output (one still being created, or a create that failed) prints `(id unknown)` in `destroy` and `status` where the id would go. `status` then shows the stack status where the instance state would go, and `gone` for an instance EC2 no longer has. `destroy --dry-run` makes the same stack lookup as the real run before it prints the delete command, so a stack that is gone reads `nothing to remove` in both.
 
 The automatic delete is owner-pinned: `source.delete_source()` issues `s3api delete-object` with `--expected-bucket-owner`, which `test_cloud_source.py::test_delete_source` pins. The pin is load-bearing because a bucket name freed by teardown can be re-registered by another account, and only the `s3api` form accepts it -- `aws s3 rm` has no equivalent flag.
 
@@ -360,6 +365,22 @@ when the platform will take the VM. Because teardown acts on the stored
 process choose which VM the next delete destroys, so the file is a write-protected
 target in `security/paths_lists.py`.
 
+**What the lane borrows from an app.** Two things the lane needs ship with the
+aws-control app, and `cloud/` reaches both through seams in `kiro_crew.apps.seams`
+(see `app-kit-platform.md`, "A core feature that needs an app's code asks a seam"),
+never by importing the app. The crew runtime (`crew_runtime` seam) is the Docker build context the recipe zips, and the bundle
+digest is computed by the bundle builder that ships beside it. `recipe.runtime_path(name)`
+answers `RUNTIME_DIR`, `BASE_DOCKERFILE`, `CREW_DOCKERFILE`, `MICROVM_DOCKERFILE`,
+`SSM_AGENT_CONFIG` and `CONTAINER_DIR` through that seam on each call; none is a module
+attribute, so `recipe` holds no module `__getattr__` and mirrors no surface. With no
+provider, `runtime_path` and `bundle_digest_of` raise
+`RecipeRefused`, and `check_layout` still answers because it reads only the bundle.
+The sandbox-masked staging root that `api.staging_dir` cuts a secret's file under
+(`transfer_staging` seam) is the other one. With no provider it raises
+`RuntimeError` rather than falling back to the shared temp directory, which a
+same-UID agent could read. `test_cloud_microvm_recipe.py::TestTheRuntimeComesFromTheCrewRuntimeSeam`
+and `test_app_seams.py::TestCoreCallersWithNoProvider` pin both.
+
 ## Where launch state lives
 
 Two files, two owners. `cloud.json` is the OPERATOR's: they hand-write the `fargate` block
@@ -379,6 +400,16 @@ They were one file, and every collision followed from that. A post-deploy write 
 person may have left mid-edit has to choose between overwriting their bytes and refusing.
 Refusing lands after the deploy is billed and before sign-in, so the command aborts over a
 pointer; overwriting loses the block. Splitting the owners removes the choice.
+
+**A stack the record does not name is offered, never chosen.** With no usable saved launch,
+`cloud launch` lists the `kirocrew-<tag>` stacks (`ec2.list_stacks`) and offers one only
+when it is neither failed nor in progress and a live instance carries `kirocrew:managed=true`
+and `kirocrew:instance=<tag>` (`ec2.live_instance_tags`, one `describe-instances` call
+however many stacks there are). Every other stack is named as not offered, with the
+`cloud status --tag` for the Region and profile searched, since it may still bill or be this
+machine's own interrupted launch. The menu's default is "Create a new installation", and
+`--yes` keeps none: nothing yet tells this machine's stack whose record was lost from another
+person's, and keeping one writes it into the record `destroy` acts on.
 
 **`cloud launch` still re-attaches on an existing install.** Its pointer is in `cloud.json`,
 so `LaunchState.load()` falls back to those fields when the record holds none. The fallback is
@@ -517,8 +548,8 @@ pointer -- which `kirocrew cloud list` can rediscover from the real stacks anywa
   chezmoi and `rsync --link-dest` leave behind. The strict refusal for `cloud.json`
   lives where a launch consumes the file instead
   (`require_unaliased_cloud_config`, called from the provisioner seam), so the alias
-  costs one lane's launch rather than the box. `playwright-cli` keeps main's own
-  strict DIRECTORY rule, which this change does not touch.
+  costs one lane's launch rather than the box. The sealed directory leaves keep
+  main's own strict DIRECTORY rule, which this change does not touch.
 - **An aliased `cloud.json` is refused where a launch CONSUMES it**, in
   `DefaultRemoteProvisionerProvider.engine_for`, and only warned about on the
   universal spawn path (`sandbox._warn_aliased_strict_leaves`). Refusing on the spawn
@@ -540,9 +571,14 @@ pointer -- which `kirocrew cloud list` can rediscover from the real stacks anywa
   AppStream `dnf` repo (the reliable primary path, validated live). The
   NodeSource fallback does NOT `curl … | bash` a remote installer; it imports
   NodeSource's GPG key over pinned TLS and writes a `gpgcheck=1` dnf repo, so RPM
-  signatures are verified before install. kiro-cli is fetched over
-  `--proto '=https' --tlsv1.2` and the binary presence is asserted afterward
-  (fail-closed WaitCondition on a broken install).
+  signatures are verified before install. kiro-cli is the musl zip of the
+  `packaging/kiro-cli-version` release, fetched from `prod.download.cli.kiro.dev`
+  over `--proto '=https' --tlsv1.2` and checked against its
+  `packaging/kiro-cli-sha256` SHA-256 before it is unzipped; the binary presence
+  is asserted afterward (fail-closed WaitCondition on a broken install). That
+  host sits outside every `*.amazonaws.com` service namespace, so no AWS service
+  endpoint's private DNS zone (Amazon Q's owns `q.<region>.amazonaws.com`) can
+  answer NXDOMAIN for it.
 - **Least-privilege, tag-/prefix-scoped IAM.** The RCE-adjacent SSM verbs
   (`ssm:StartSession` / `ssm:SendCommand` on instances) and the EC2 destructive
   verbs (`DeleteSecurityGroup` / `RevokeSecurityGroup{Ingress,Egress}` / `DeleteTags`)
@@ -714,8 +750,12 @@ pointer -- which `kirocrew cloud list` can rediscover from the real stacks anywa
     create-once for the launcher: it still has no `iam:CreatePolicyVersion`. A
     launch that finds the exact document this launcher created before the
     edition statements existed (`iam.previous_boundary_documents`,
-    `previous_kms_boundary_documents`) is refused with
-    `kirocrew cloud iam-boundary --upgrade` named (`--upgrade --ssm-kms` for
+    `previous_kms_boundary_documents`) runs `source.upgrade_boundary` itself and,
+    when it succeeds, prints one line saying the boundary was upgraded and
+    continues. That succeeds only from a terminal whose credentials hold
+    `iam:CreatePolicyVersion`; a launcher-only credential, an agent session or a
+    policy at its five-version limit gets the refusal naming
+    `kirocrew cloud iam-boundary --upgrade` (`--upgrade --ssm-kms` for
     the KMS boundary, whose upgrade needs that flag). That admin step
     (`source.upgrade_boundary`, refused in an agent session) re-versions the
     boundary only when it holds that earlier document, sets the new version as
@@ -842,7 +882,17 @@ pointer -- which `kirocrew cloud list` can rediscover from the real stacks anywa
   not reap; signal numbers come from `platform_compat` (**never** `signal.SIGKILL`,
   which is undefined on Windows — naming it inside the escalation's own
   `except Exception` swallows the `AttributeError` and skips `proc.kill()`
-  entirely, on the very platform that reaches that path). Every
+  entirely, on the very platform that reaches that path). The plugin can
+  **outlive the wrapper** — exiting on its own first, or dying on SIGTERM while
+  the plugin ignores it — and `os.getpgid` of the reaped wrapper names nothing.
+  So on POSIX `open_port_forward` records the group the wrapper leads
+  (`proc.ssm_pgid`, read while it is un-reaped) and `kill_port_forward` signals
+  that recorded group through `platform_compat.kill_process_group`: whenever
+  members remain after the wrapper is gone, already-exited wrapper included, they
+  get SIGTERM (unless the teardown already sent one), then SIGKILL, each followed
+  by a bounded wait for the group to empty (`platform_compat.pgroup_exists`). Only
+  that one group is signalled, so another forward's plugin is never touched; a
+  Popen-like object without the record keeps the pid-resolved group signal. Every
   no-URL exit reaps its tunnel too: `connect()` folds a mint failure — whether
   `mint_token` returns `""` **or raises** — into a `ready=False` Connection after
   `_terminate`; and the **social-login** paths close their callback tunnel on the

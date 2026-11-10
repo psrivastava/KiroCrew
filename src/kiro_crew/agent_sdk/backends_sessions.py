@@ -24,6 +24,7 @@ from kiro_crew.agent_sdk.backends import (
     ACP_BACKEND_KIRO,
     ACP_BACKEND_OPENCODE,
     ACP_BACKEND_PI,
+    ACP_BACKEND_STRANDS,
 )
 
 # Backends whose single process can host N concurrent ACP sessions (AcpRuntime
@@ -157,6 +158,7 @@ ACP_BACKENDS_ACP_CLIENT_SPAWNABLE = frozenset(
         ACP_BACKEND_PI,
         ACP_BACKEND_DEEPSEEK,
         ACP_BACKEND_COPILOT,
+        ACP_BACKEND_STRANDS,
     }
 )
 
@@ -212,6 +214,21 @@ ACP_BACKENDS_ACP_CLIENT_SPAWNABLE = frozenset(
 # captures are the replayed record.
 ACP_BACKENDS_SESSION_EVICTION = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS, ACP_BACKEND_CODEX})
 
+# Backends on their own ``AcpClient`` whose process starts a fresh conversation in
+# place: ``AcpClient.new_conversation`` closes the old session and opens a new one
+# on the same process, instead of a kill and respawn. Read only by that method; a
+# reused workflow-pool worker and a consolidation pass reach it through
+# ``AcpProvider.new_conversation``, and a non-member raises there so both callers take
+# their kill-and-respawn fallback. The method runs claude's own session setup, so a
+# second member brings its harness's setup steps into it with its capture.
+#
+# claude is a member on a live capture: claude-agent-acp 0.94.0
+# ``test/fixtures/acp_frames/claude/new-conversation-live.jsonl`` answered two
+# ``session/new`` on one process, then ``session/close`` for the first with {}; the
+# first id then answered set_mode with -32603 Session not found while the second
+# still answered, and the first session's Claude Code process had exited.
+ACP_BACKENDS_CLIENT_NEW_CONVERSATION = frozenset({ACP_BACKEND_CLAUDE})
+
 # Backends whose process answers ``session/new``, ``session/load`` and
 # ``session/set_mode`` one at a time, so a session start sent while one of those is
 # unanswered spends its budget waiting for it. Membership decides only whether a
@@ -263,6 +280,10 @@ ACP_BACKENDS_HARNESS_OWNED_SESSIONS = frozenset(
         ACP_BACKEND_GOOSE,
         ACP_BACKEND_DEEPSEEK,
         ACP_BACKEND_COPILOT,
+        # strands persists each session under the directory Crew names (its gate
+        # module's ``session`` option) and restores it on ``session/load`` by id:
+        # ``test/fixtures/acp_frames/strands/session-load-live.jsonl``.
+        ACP_BACKEND_STRANDS,
     }
 )
 
@@ -285,7 +306,13 @@ ACP_BACKENDS_HARNESS_OWNED_SESSIONS = frozenset(
 # rejects modes across its whole surface, so it can never return one. Membership is
 # what keeps a restored conversation from being discarded by a check for a block this
 # harness has nothing to put in.
-ACP_BACKENDS_LOAD_WITHOUT_MODES = frozenset({ACP_BACKEND_OPENCODE, ACP_BACKEND_DEEPSEEK})
+#
+# strands is a member on a capture: its project-mode ``session/load`` answers ``{}``
+# after replaying the restored history
+# (``test/fixtures/acp_frames/strands/session-load-live.jsonl``).
+ACP_BACKENDS_LOAD_WITHOUT_MODES = frozenset(
+    {ACP_BACKEND_OPENCODE, ACP_BACKEND_DEEPSEEK, ACP_BACKEND_STRANDS}
+)
 
 # Backends that restore a session with ``session/resume`` instead of
 # ``session/load``, and advertise it under ``sessionCapabilities.resume`` instead of
@@ -331,3 +358,24 @@ ACP_BACKENDS_RESUME_WITHOUT_LOAD = frozenset({ACP_BACKEND_DEEPSEEK})
 # ``_meta.jetbrains.air.fork.messageId`` (from 0.71.0; see
 # ``CLAUDE_ACP_FORK_POINT_MIN_VERSION``).
 ACP_BACKENDS_FORK_AT_MESSAGE = frozenset({ACP_BACKEND_CLAUDE})
+
+# Harnesses that can dispose ONE session's backend inside a process that stays up,
+# after which every ``session/prompt`` on that id answers the same error. The
+# process is no use to that session any more, but its saved session is: a fresh
+# process ``session/load``s it. For a member, :mod:`kiro_crew.acp.disposed_session`
+# names the error text the harness writes when it disposes a backend, and
+# ``AcpClient`` answers it: a cancelled turn ends as cancelled, any other turn
+# surfaces the error once, and the next ``ensure_ready`` replaces the process and
+# loads the same id before the next prompt goes out. A request for approval that
+# arrives after Crew sent ``session/cancel`` is answered ``cancelled`` at once,
+# because the harness holds its turn open on that answer and the cancel cannot
+# finish while it waits.
+#
+# strands is a member: the Strands CLI kills its Python worker when a cancel does
+# not stop it within 3s, then answers that prompt, and every later one on the same
+# id, with ``-32603`` and ``data.details`` "The Python agent did not stop after
+# cancellation. Reload it to continue." A second process loaded the same id, replayed
+# the conversation and answered the next prompt
+# (``test/fixtures/acp_frames/strands/cancel-dispose-live.jsonl``, then
+# ``test/fixtures/acp_frames/strands/cancel-dispose-reload-live.jsonl``).
+ACP_BACKENDS_RELOAD_DISPOSED_SESSION = frozenset({ACP_BACKEND_STRANDS})

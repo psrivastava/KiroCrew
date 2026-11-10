@@ -122,6 +122,13 @@ MAX_SUBAGENTS_FIXED_FLOOR = 3
 AUTOCOMPACT_PCT_MIN = 5.0
 AUTOCOMPACT_PCT_MAX = 90.0
 
+# session.idle_compaction_min_context_pct: the context use below which an idle
+# chat is never compacted. The floor is kiro's first-request break-even: below
+# about 40% the cold request a compaction saves is cheaper than the compaction
+# itself, so a hand-edited lower value loads as 40.
+IDLE_COMPACTION_MIN_CONTEXT_PCT_MIN = 40.0
+IDLE_COMPACTION_MIN_CONTEXT_PCT_MAX = 90.0
+
 
 class AutocompactPctError(ValueError):
     """A per-session threshold refused by :func:`parse_autocompact_pct`.
@@ -203,6 +210,9 @@ MCP_PROBE_TIMEOUT_MAX = 120
 # value is at least MIN, so a typo of 1 cannot spend an LLM call on every turn.
 TITLE_REFRESH_EVERY_TURNS_MIN = 4
 TITLE_REFRESH_EVERY_TURNS_MAX = 1000
+# ``dashboard.privacy_ack_version``: the privacy notice version a user last
+# acknowledged. A small integer that only ever moves up by one per notice change.
+PRIVACY_ACK_VERSION_MAX = 1000
 RECENT_TINT_COUNT_MIN = 0
 RECENT_TINT_COUNT_MAX = 10
 # The sidebar's folder sort modes, spelled once for the same reason as the bounds
@@ -250,11 +260,25 @@ EMPTY_RESPONSE_MAX_CONTINUES_MAX = 10
 # Also load-only, and a floor only: 0 keeps every turn's copies, so a negative
 # value reads as 0, and any larger count is a real choice.
 FILE_CHANGES_KEEP_TURNS_MIN = 0
+# ``session.kas_delete_delay_secs``: 0 deletes at once, and a hand-edited delay is
+# capped at one day. The cap bounds the delay asked for, not when the delete runs.
+KAS_DELETE_DELAY_SECS_MIN = 0
+KAS_DELETE_DELAY_SECS_MAX = 86400
+# Also load-only. ``session.search_scan_window`` (default
+# ``DEFAULT_SEARCH_SCAN_WINDOW``): the ceiling keeps a hand-edited value from making
+# every search read a whole very large store.
+SEARCH_SCAN_WINDOW_MIN = 100
+SEARCH_SCAN_WINDOW_MAX = 100_000
 # A hand-edited ``session.idle_exempt_keys`` can be any size, and every idle sweep copies it.
 # Each listed key can also keep a whole kiro-cli process and its MCP servers running, the
 # per-entry cost ``POOL_SIZE_MAX`` bounds for the warm pool, so the count shares that ceiling.
 IDLE_EXEMPT_KEYS_MAX = POOL_SIZE_MAX
 IDLE_EXEMPT_KEY_MAX_CHARS = 512
+# Load-only bounds on ``session.harness_background_hold_secs``. The floor keeps a
+# hand-edited 0 from turning the hold off; the ceiling of one day bounds how long one
+# launch can keep a session past its idle timeout. The RSS hard ceiling still applies.
+HARNESS_BACKGROUND_HOLD_SECS_MIN = 300
+HARNESS_BACKGROUND_HOLD_SECS_MAX = 86400
 # Ceiling on ``session.reconcile_max_kills``, equal to the arm's own shipped budget
 # (``runtime_reconcile.DEFAULT_MAX_KILLS``, pinned equal by
 # ``test_the_configured_ceiling_cannot_exceed_the_shipped_budget``). Equal rather
@@ -418,12 +442,24 @@ class ResourceLimitsConfig:
         default=None,
         metadata=_meta(
             "Max memory (MB)",
-            "READ BY TWO MECHANISMS with different meanings for 0. As RLIMIT_AS "
-            "it caps virtual address space, and 0 leaves the inherited limit "
-            "unchanged (the default -- Node/V8 reserve huge VSZ, see the caveat "
-            "in security._RLIMIT_DEFAULTS). As the cgroup MemoryMax it is the "
-            "per-scope resident ceiling, where 0 is rejected by systemd, so 0 "
-            "or unset means the host-proportional module default.",
+            "Per-scope RESIDENT memory ceiling: the cgroup MemoryMax on Linux "
+            "and the Job object JobMemoryLimit on Windows. 0 is rejected by "
+            "systemd, so 0 or unset means the host-proportional module "
+            "default. It sets no POSIX rlimit; the virtual address-space cap "
+            "is the separate max_address_space_mb.",
+            nullable=True,
+        ),
+    )
+    max_address_space_mb: int | None = field(
+        default=None,
+        metadata=_meta(
+            "Max address space (MB)",
+            "RLIMIT_AS: VIRTUAL address space per spawned process, opt-in. 0 "
+            "or unset leaves the inherited limit unchanged (the default). "
+            "Node/V8 (kiro-cli, npx MCP servers) and GraalVM native binaries "
+            "reserve far more address space than they touch and can fail to "
+            "start below about 64 GiB, so use max_memory_mb to cap resident "
+            "memory. Not used by the cgroup path.",
             nullable=True,
         ),
     )
@@ -541,6 +577,9 @@ class ResourceLimitsConfig:
             max_open_files=_limit_int(section.get("max_open_files"), "max_open_files", lo=0),
             max_processes=_limit_int(section.get("max_processes"), "max_processes", lo=0),
             max_memory_mb=_limit_int(section.get("max_memory_mb"), "max_memory_mb", lo=0),
+            max_address_space_mb=_limit_int(
+                section.get("max_address_space_mb"), "max_address_space_mb", lo=0
+            ),
             max_cpu_seconds=_limit_int(section.get("max_cpu_seconds"), "max_cpu_seconds", lo=0),
             cpu_weight=_limit_int(section.get("cpu_weight"), "cpu_weight", lo=1, hi=10000),
             max_cpu_percent=_limit_int(section.get("max_cpu_percent"), "max_cpu_percent", lo=0),

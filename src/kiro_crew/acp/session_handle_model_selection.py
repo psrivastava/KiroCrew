@@ -12,11 +12,11 @@ Instance fields written: ``_advertised_models_changed``, ``_available_models``,
 ``_available_models_captured_at``,
 ``_available_models_probe_confirmed``, ``_available_models_read_probe_at``,
 ``_config_options``, ``_kas_auto_fallback``, ``_mode_model_unjudged``, ``_model``,
-``_read_refresh_task``, ``_resolved_model_id``, ``active_agent``, ``model_pin_partial``,
-``model_pin_refused``.
+``_read_refresh_task``, ``_resolved_model_id``, ``active_agent``, ``inherited_model``,
+``model_pin_partial``, ``model_pin_refused``.
 
-Instance fields read: ``_runtime``, ``_session_id``, ``last_prompt_stats``,
-``request_vault_identity``.
+Instance fields read: ``_engine_fallback``, ``_runtime``, ``_session_id``,
+``last_prompt_stats``, ``request_vault_identity``.
 """
 
 from __future__ import annotations
@@ -308,8 +308,14 @@ def _kas_model_spelling(model_id: str, advertised: list[str]) -> str:
     return model_registry.acp_id_correction(model_id) or model_id
 
 
-async def set_model(self: AcpSessionHandle, model_id: str) -> None:
+async def set_model(self: AcpSessionHandle, model_id: str, *, inherit: bool = False) -> None:
     """Switch model via session/set_model.
+
+    ``inherit=True`` applies a model the session inherits rather than pins
+    (kiro-cli's ``chat.defaultModel`` on an unpinned KAS start): the switch
+    lands in ``_resolved_model_id`` and ``inherited_model`` only, and ``_model``
+    keeps its unpinned value, so every reader that asks "is this session
+    pinned?" still answers no. Any other call clears ``inherited_model``.
 
     This is the shared-runtime SUBSTITUTE path (background one-liners, tips,
     contradiction sweep, and any caller that did not pre-guard an explicit
@@ -333,6 +339,7 @@ async def set_model(self: AcpSessionHandle, model_id: str) -> None:
     # must not survive a later one, or a read-after-call reports a pick that
     # landed (or inherited the default) as refused.
     self.model_pin_refused = ""
+    self.inherited_model = ""
     if self._runtime.acp_backend == ACP_BACKEND_KAS:
         model_id = _kas_model_spelling(model_id, self._advertised_model_ids())
     # Backend-aware: on a ``<model>[<effort>]`` pair-id harness the advertised
@@ -408,7 +415,11 @@ async def set_model(self: AcpSessionHandle, model_id: str) -> None:
             )
             self.model_pin_refused = resolved
             return
-    self._model = resolved
+    if inherit:
+        # The applied spelling (after the KAS fold), never the raw setting.
+        self.inherited_model = resolved
+    else:
+        self._model = resolved
     self.model_pin_refused = ""
     if getattr(self, "_mode_model_unjudged", False):
         # The session runs this model now, not the one an earlier set_mode
@@ -422,6 +433,9 @@ async def set_model(self: AcpSessionHandle, model_id: str) -> None:
     # (otherwise the context meter converts pct against the stale session/new
     # model until the next session refresh).
     self._resolved_model_id = resolved
+    # The switch is what the session runs next, so the next prompt must
+    # not restore the model the last turn's engine hop moved off.
+    self._engine_fallback.note_model_set()
     # Also rebase the meter stats themselves — the old model's window and
     # its authoritative usage_update do not describe this session
     # (mirrors AcpClient.set_model).
@@ -640,6 +654,13 @@ def store_session_config(self: AcpSessionHandle, resp: dict[str, Any]) -> None:
         self._kas_auto_fallback = (
             pick_served_default("auto", ids) if select.get("currentModelId") == "auto" else ""
         )
+        # KAS sends no ``models`` object, so the select's ``currentValue`` is
+        # the only place it says which model the session runs (``auto`` on a
+        # new session). Without it ``served_model`` stays ``""`` and every turn
+        # is recorded unattributed. A ``models`` block below still wins.
+        select_current = select.get("currentModelId")
+        if self._runtime.acp_backend == ACP_BACKEND_KAS and isinstance(select_current, str):
+            self._resolved_model_id = select_current
     # The same select is the KAS engine's CATALOG (its served models with their
     # credit multipliers), kept for the bundle-route picker, which has no
     # ``--list-models`` to read. A catalog, not this session's advertised list:
@@ -731,7 +752,7 @@ def _feed_advertised_model_cache(self: AcpSessionHandle) -> None:
     if not ids:
         return
     if model_registry.refresh_advertised_models(
-        model_registry_namespace(backend), ids, rows=self._available_models
+        model_registry_namespace(backend), ids, rows=self._available_models, confirm_shrink=True
     ):
         self._advertised_models_changed = True
 

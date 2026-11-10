@@ -43,6 +43,13 @@ def _redact(text: object, redact_url: _Redactor, redact_secret: _Redactor) -> st
     return value
 
 
+def _instance_of(state: Any, approval_id: str) -> str:
+    """The ``instance`` of the coordinator record currently held under *approval_id*."""
+    record = state._pending_approvals.get(approval_id)
+    instance = record.get("instance") if isinstance(record, dict) else ""
+    return instance if isinstance(instance, str) else ""
+
+
 def _push_slots(state: Any) -> None:
     """Recompute the slot lane flags; a failed push never breaks the approval."""
     try:
@@ -169,7 +176,13 @@ class ApprovalCoordinator:
         decision = _EXPIRED_DECISION
         session_key = slot_key if slot_key else "state"
         try:
-            state._audit_and_broadcast_approval(session_key, approval_id, False, decision)
+            state._audit_and_broadcast_approval(
+                session_key,
+                approval_id,
+                False,
+                decision,
+                instance=_instance_of(state, approval_id),
+            )
         except Exception:
             state._log.warning(
                 "audit/broadcast failed for expired approval %s", approval_id, exc_info=True
@@ -206,6 +219,7 @@ class ApprovalCoordinator:
         decision: str,
         *,
         audit_provider: Callable[[], Any],
+        instance: str = "",
     ) -> None:
         ApprovalCoordinator.audit(
             state, session_key, approval_id, approved, decision, audit_provider=audit_provider
@@ -214,6 +228,11 @@ class ApprovalCoordinator:
             payload: dict = {"id": approval_id, "approved": approved}
             if session_key and session_key != "state":
                 payload["slot"] = session_key
+            # Names WHICH request under this recurring id was resolved, so a
+            # client holding an earlier request's retired row under the same id
+            # retires the live one and not that row.
+            if instance:
+                payload["instance"] = instance
             # A decided approval's payload stays as it is: approved/rejected
             # is derivable from ``approved``, and the client renders it so.
             if decision == _EXPIRED_DECISION:
@@ -227,7 +246,9 @@ class ApprovalCoordinator:
         future = state._approval_futures.get(approval_id)
         if future and not future.done():
             future.set_result(approved)
-            state._audit_and_broadcast_approval("state", approval_id, approved)
+            state._audit_and_broadcast_approval(
+                "state", approval_id, approved, instance=_instance_of(state, approval_id)
+            )
             return True
         return False
 
@@ -282,6 +303,15 @@ class ApprovalCoordinator:
             return False
         if expected_future is not None and future is not expected_future:
             return False
+        if approved:
+            from kiro_crew.dashboard.deny_override import is_deny_override_card
+
+            if is_deny_override_card(slot.messages, approval_id):
+                # Only the owner's own override click on the slot route answers
+                # a security-rule override card; a plain approve from any other
+                # route would be recorded as approved and then refused, so it
+                # settles nothing and the card stays open.
+                return False
         decision = _slot_decision(approved, rejected_once)
         future.set_result(decision)
         if permission_marker(slot.messages, approval_id, decision):
@@ -304,6 +334,21 @@ _AGENT_ASK_RETENTION_LIMIT = 500
 
 #: The coordinator's own clock, so a test can freeze it without patching ``time``.
 _monotonic = time.monotonic
+
+#: An app embed is sent no ``question_card`` frame; it polls instead, at its slowest
+#: every ``EMBED_QUESTION_POLL_IDLE_MS`` (10 s, ``app-sdk/EmbedQuestionCard.tsx``).
+#: A poll this recent counts as a receiver; the margin covers one missed poll.
+_EMBED_POLL_LIVE_SECS = 20.0
+
+
+def note_embed_poll(slot: Any) -> None:
+    """Record that *slot*'s cards were just read through its poll route (``slot_question.py``)."""
+    slot._embed_question_polled_at = _monotonic()
+
+
+def _embed_is_polling(state: Any, slot_key: str) -> bool:
+    polled = getattr(state._slots.get(slot_key), "_embed_question_polled_at", None)
+    return polled is not None and _monotonic() - polled <= _EMBED_POLL_LIVE_SECS
 
 
 class QuestionCoordinator:
@@ -701,7 +746,8 @@ class QuestionCoordinator:
         The window is the fixed ``state._AGENT_ASK_WINDOW_DEFAULT``; no caller sets it.
         Zero clients means nobody can answer. The ask is then torn down at once so
         the caller can fall back instead of blocking on a card no one sees, unless it
-        was already settled during the send, whose outcome is kept for collection.
+        was already settled during the send, whose outcome is kept for collection, or
+        an app embed is polling the slot's cards (counted as one client).
         An ask withdrawn while the send was still awaiting its sockets also yields 0.
         ``None``
         means only live asks occupy the retention cap, so this ask was not registered.
@@ -743,7 +789,7 @@ class QuestionCoordinator:
             # The tool gave up while this send was awaiting a slow socket, and its
             # withdrawal already retired the card: nothing is left to watch.
             return 0
-        if clients == 0 and not future.done():
+        if clients == 0 and not future.done() and not _embed_is_polling(state, slot_key):
             QuestionCoordinator.resolve(state, ask_id, None, reason="no_client")
             state._agent_asks.pop(ask_id, None)
             return 0

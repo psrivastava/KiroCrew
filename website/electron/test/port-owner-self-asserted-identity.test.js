@@ -84,7 +84,7 @@ const OCCUPANCY_SITES = [
     times: 1,
   },
   {
-    what: "stuck-gateway stop: the port emptied on its own, so spawn instead of adopting nothing",
+    what: "stuck-gateway and orphan stops: the port emptied on its own, so spawn instead of adopting nothing",
     code: 'const portNowFree = async () => (await probeGatewayPortBinding(PORT)) === "free";',
     times: 1,
   },
@@ -130,8 +130,8 @@ const IDENTITY_SITES = [
     times: 1,
   },
   {
-    what: "boot: probe the holder, unless a configured remote host makes it a tunnel",
-    code: 'const localOwner = remoteHost ? "foreign" : await probeGatewayPortOwner(PORT);',
+    what: "boot: probe the holder, unless a configured remote host makes it a tunnel; a refusal names what it found",
+    code: 'const localOwner = remoteHost ? "foreign" : await probeGatewayPortOwner(PORT, { holders });',
     times: 1,
   },
   {

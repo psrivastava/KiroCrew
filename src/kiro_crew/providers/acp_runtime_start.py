@@ -9,12 +9,13 @@ Each function here whose first parameter is ``self`` is an ``AcpProvider`` metho
 class binds it by name, so it reads and writes the session's own state on the instance,
 and a patch of the method on the class or on an instance reaches every caller.
 
-Instance fields written: ``_client``, ``_defer_replay_sid_promotion``,
-``_history_replay_needed``, ``_shared_scratch``.
+Instance fields written: ``_client``, ``_cloud_governance_scope``,
+``_defer_replay_sid_promotion``, ``_history_replay_needed``, ``_shared_scratch``,
+``startup_notice``.
 
 Instance fields read: ``_accepts_elicitation``, ``_child_fidelity_aware``, ``_crew_agent``,
-``_on_gate_acquired``, ``_on_gate_queued``, ``_tool_search``, ``member_context``,
-``memory_mode``, ``owning_app``, ``start_priority``.
+``_harness_pin``, ``_on_gate_acquired``, ``_on_gate_queued``, ``_tool_search``,
+``member_context``, ``memory_mode``, ``owning_app``, ``start_priority``.
 """
 
 from __future__ import annotations
@@ -27,9 +28,9 @@ import os
 import re
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
-from kiro_crew import model_scope
+from kiro_crew import model_scope, turn_timing
 from kiro_crew.acp.client import (
     DEFAULT_MODEL,
     AcpAuthRequired,
@@ -38,6 +39,7 @@ from kiro_crew.acp.client import (
     resolve_pin_spelling_on,
     sandbox_init_failure_for_runtime,
 )
+from kiro_crew.acp.kas_cli_settings import default_model_notice, kiro_cli_default_model
 from kiro_crew.acp.mcp_session_report import (
     McpSessionReport,
     sanitize_sink_text,
@@ -48,7 +50,7 @@ from kiro_crew.acp.session_handle import AcpSessionHandle
 from kiro_crew.acp.session_mcp import agent_spec_snapshot
 from kiro_crew.acp.session_provider import AcpSessionProvider
 from kiro_crew.acp.transport_errors import AcpDelegateLaunchFailed
-from kiro_crew.acp.types import ACP_BACKENDS_HARNESS_OWNED_SESSIONS
+from kiro_crew.acp.types import ACP_BACKEND_KAS, ACP_BACKENDS_HARNESS_OWNED_SESSIONS
 from kiro_crew.agent_sdk import host_auth
 from kiro_crew.agent_sdk.backends import model_registry_namespace
 from kiro_crew.agent_sdk.tool_gate import (
@@ -65,16 +67,14 @@ from kiro_crew.providers.cleanup import _is_safe_path
 if TYPE_CHECKING:
     from kiro_crew.providers.acp import AcpProvider
 
-#: The provider's own logger: this code logged under that name before the split.
+#: The provider's own logger, so these records carry the provider's name.
 logger = logging.getLogger("kiro_crew.providers.acp")
 
 
-# ── F2 load-recovery: session/load retry past a stale native session lock ──
-# A kiro-cli holder killed uncleanly (SIGKILL, crash, OOM, or a gateway-restart
-# drain timeout) can leave its per-session lock held briefly. Re-issuing
-# session/load a few times with exponential backoff lets the stale lock release
-# so the new gateway resumes LOSSLESSLY. If the lock never clears we fall back
-# to a fresh session + Kiro Crew history replay (see _start_kiro_runtime_impl).
+# session/load retry past a stale native session lock: a kiro-cli holder killed
+# uncleanly can leave its per-session lock held briefly, so retrying with backoff
+# resumes LOSSLESSLY. If the lock never clears, fall back to a fresh session +
+# history replay (see _start_kiro_runtime_impl).
 _RESUME_MAX_ATTEMPTS = 4  # total session/load attempts before fresh fallback
 # Bound on the setup failure's own text in the failed-setup warning: enough for
 # an RPC error's message, short enough that one line stays one line.
@@ -84,22 +84,16 @@ _SETUP_FAILURE_LOG_CAP = 300
 # bound only stops a silent backend from holding the start.
 _ZERO_TOOL_CHECK_TIMEOUT_SECS = 5.0
 _RESUME_BACKOFF_BASE_S = 1.0  # backoff = base * 2**attempt → 1s, 2s, 4s between attempts
-# Substrings (matched case-insensitively) of a session/load error that name a
-# TRANSIENT native-lock condition — one that clears once the previous holder
-# finishes dying — as opposed to a genuine load failure. Two shapes are known:
+# Case-insensitive substrings of a session/load error that name a TRANSIENT lock
+# condition, one that clears once the previous holder finishes dying:
 #
 # * "active in another process": the dead holder's lock is still held.
-# * "re-read lock file": kiro-cli creates its per-session lock, then re-reads
-#   it to confirm it won; when the previous holder's exit handler unlinks the
-#   SAME path in that window the load fails with "failed to re-read lock file
-#   ...: No such file or directory". Observed on the dashboard's hard-stop
-#   path, whose eager respawn issues session/load while the killed holder is
-#   still tearing down. Left un-retried this demoted a lossless resume to the
-#   lossy conversation-log replay for the rest of the tab's life.
+# * "re-read lock file": kiro-cli re-reads its new lock to confirm it won, and the
+#   previous holder's exit handler unlinked the same path in that window (seen on
+#   the dashboard hard-stop path's eager respawn).
 #
-# Deliberately the re-read phrase and not a bare "lock file": a permanent lock
-# failure ("failed to open lock file: Permission denied") must still fail fast
-# to the fresh-session fallback rather than spend the backoff budget first.
+# Not a bare "lock file": a permanent failure ("failed to open lock file:
+# Permission denied") must fail fast to the fresh-session fallback.
 _RESUME_TRANSIENT_LOCK_MARKERS: tuple[str, ...] = (
     "active in another process",
     "re-read lock file",
@@ -143,21 +137,37 @@ def _is_transient_resume_lock_error(exc: BaseException) -> bool:
 # codex signed out of a non-AWS provider gives too, so it alone names no AWS cause.
 _MASKED_CREDENTIAL_AUTH_RE = re.compile(r"failed to load aws credentials", re.IGNORECASE)
 
-#: Names the mask in a startup auth failure, so the deliberate layout is not taken
-#: for a broken one. Fixed text: it never echoes a path's contents or a secret.
-CREDENTIAL_MASK_AUTH_NOTE = (
-    "Kiro Crew hides ~/.aws/credentials and ~/.aws/sso/cache from {label} on "
-    "purpose; only ~/.aws/config is readable, so Bedrock via {label} needs a "
-    "self-contained credential_process in that file, not SSO or static keys. Keep "
-    "static keys in ~/.aws/credentials, not ~/.aws/config, and do not make "
-    "~/.aws/config a symlink."
-)
+
+def credential_mask_auth_note(backend: str, hidden: tuple) -> str:
+    """The note naming the credential mask in an AWS auth failure of *backend*.
+
+    Built from *hidden*, the mask this spawn actually ran under, so the stores it
+    names are the ones the child could not read. It names every entry the mask
+    hides directly under the home (``~/.aws``, ``~/.ssh``, a sign-in cookie
+    directory, ...): a ``credential_process`` runs under the same mask, so one
+    that reads a key or cookie kept in any of them fails here. Deeper entries
+    (another tool's token file, Kiro Crew's own data home) are left out to keep
+    the note short, which is why it says "including". Path names only: it never
+    echoes a path's contents or a secret.
+    """
+    home = os.path.expanduser("~")
+    stores = sorted({os.path.basename(p) for p in hidden if os.path.dirname(p) == home})
+    label = label_for(backend)
+    return (
+        f"Kiro Crew hides credential stores from {label} on purpose, including "
+        f"{', '.join(f'~/{name}' for name in stores)}; of ~/.aws only ~/.aws/config "
+        f"is readable. Bedrock via {label} needs a credential_process in that file "
+        "that reads nothing under these paths, so SSO, static keys, and a "
+        "credential_process that needs a sign-in cookie or key kept in one of them "
+        "cannot work. Keep static keys in ~/.aws/credentials, not ~/.aws/config, "
+        "and do not make ~/.aws/config a symlink."
+    )
 
 
 def _with_credential_mask_note(
     runtime: object, message: str, cause: BaseException, *, read_stderr: bool = True
 ) -> str:
-    """*message*, plus :data:`CREDENTIAL_MASK_AUTH_NOTE` when the mask explains *cause*.
+    """*message*, plus :func:`credential_mask_auth_note` when the mask explains *cause*.
 
     Added only when all three hold: this spawn ran under a credential mask, that
     mask re-exposes ``~/.aws/config`` (so ``~/.aws`` itself is hidden), and the
@@ -177,7 +187,7 @@ def _with_credential_mask_note(
     haystack = f"{cause}\n{tail if isinstance(tail, str) else ''}"
     if not _MASKED_CREDENTIAL_AUTH_RE.search(haystack):
         return message
-    note = CREDENTIAL_MASK_AUTH_NOTE.format(label=label_for(backend))
+    note = credential_mask_auth_note(backend, hidden)
     return message if note in message else f"{message} {note}"
 
 
@@ -200,6 +210,30 @@ def _launch_agent(provider: AcpProvider) -> str:
     """
     launch = getattr(provider, "app_launch_agent", "")
     return launch if isinstance(launch, str) and launch and provider.is_kiro_backend else ""
+
+
+#: Strong references to the end-watchers of cloud runtimes: asyncio keeps weak ones.
+_CLOUD_END_WATCHERS: set[asyncio.Future[Any]] = set()
+
+
+def _forget_cloud_placement_when_ended(session_key: str, runtime: Any) -> None:
+    """Forget a cloud runtime's placement entry once it ends.
+
+    A Coder runtime's entry goes with its workspace relay
+    (``close_relay_when_ended``); a cloud session has no relay, so this is the
+    same end-watch without one, keeping the bounded table to live runtimes.
+    """
+    from kiro_crew.coder.remote_worker import _RUNTIME_END_POLL_SECONDS
+    from kiro_crew.session_environment import forget_remote_workspace
+
+    async def watch() -> None:
+        while runtime.is_alive():
+            await asyncio.sleep(_RUNTIME_END_POLL_SECONDS)
+        forget_remote_workspace(session_key, owner=runtime)
+
+    task = asyncio.ensure_future(watch())
+    _CLOUD_END_WATCHERS.add(task)
+    task.add_done_callback(_CLOUD_END_WATCHERS.discard)
 
 
 def _choices_file_may_exist(session_key: str | None = None) -> bool:
@@ -225,22 +259,16 @@ def _choices_file_may_exist(session_key: str | None = None) -> bool:
 async def _start_kiro_runtime(self: AcpProvider) -> None:
     """Spawn an AcpRuntime + session; time the kiro cold-start split.
 
-    Thin telemetry wrapper over ``_start_kiro_runtime_impl`` so the DEFAULT
-    (kiro) backend's cold start is finally measured. ``AcpClient.ensure_ready``
-    already emits ``kirocrew.session.startup.duration`` for the *claude* path
-    only; the kiro path went through here with no duration metric. We reuse the
-    same histogram, tagged ``backend=<host id>`` + ``phase=<...>`` so the phase split
-    (spawn+initialize vs session/new-the-MCP-toolset-load vs set_model) is
-    visible. Best-effort — a telemetry failure never affects startup.
+    Telemetry wrapper over ``_start_kiro_runtime_impl``: emits the
+    ``kirocrew.session.startup.duration`` histogram ``AcpClient.ensure_ready`` emits
+    for claude, tagged ``backend=<host id>`` + ``phase=<...>`` (spawn+initialize,
+    session/new, set_model). Best-effort: a telemetry failure never affects startup.
     """
     t0 = time.monotonic()
     phases: dict[str, float] = {}
-    # Capture the session key BEFORE the impl runs: on the success path it
-    # replaces self._client with an AcpSessionProvider whose _session_key
-    # starts empty, so reading it at emit time would file every successful
-    # cold start under channel=unknown — exactly the case being measured.
-    # Same reason for the backend id: this path serves every runtime host, and
-    # the metric is filed under the one that actually started.
+    # Capture the session key and backend BEFORE the impl runs: on success it
+    # replaces self._client with an AcpSessionProvider whose _session_key starts
+    # empty, which would file every successful cold start under channel=unknown.
     meta: dict[str, object] = {
         "session_key": getattr(self._client, "_session_key", None),
         "backend": getattr(self._client, "backend", None),
@@ -281,11 +309,7 @@ def _emit_kiro_startup_metric(
     surface or a path, which is the whole diagnostic question for TTFT.
     """
     try:
-        # circular import: importing get_recorder at module top would form a
-        # config.loader -> ... -> metrics.provider -> config.loader cycle
-        # (same reason as the lazy import in acp/client_start.py's ensure_ready).
-        # Keep it lazy so provider is never loaded during config.loader's
-        # import chain.
+        # circular import: config.loader -> ... -> metrics.provider -> config.loader.
         from kiro_crew.metrics.provider import get_recorder
 
         # The key comes from meta, captured before startup replaced
@@ -422,17 +446,15 @@ async def _load_session_with_retry(
     empty one that looks resumed, so only its replayed turns prove history came
     back. A refused load takes the fresh-session-plus-replay path.
 
-    F2 load-recovery (Phase 1). A kiro-cli holder killed uncleanly can leave
-    its per-session lock held for a short window; re-issuing session/load a
-    few times with exponential backoff lets the stale lock release so we
-    resume LOSSLESSLY (full native history). Outcomes:
+    Retrying with backoff past a stale lock resumes LOSSLESSLY (full native
+    history). Outcomes:
 
     * load succeeds            → return the handle (fast path: no sleep).
     * transient lock error     → retry up to ``_RESUME_MAX_ATTEMPTS`` with
       (see _RESUME_TRANSIENT_     backoff; return the handle if it clears.
       LOCK_MARKERS)
     * lock never clears        → return ``None`` (caller falls back to a
-                                   fresh session + history replay — Phase 2).
+                                   fresh session + history replay).
     * any OTHER load error     → return ``None`` immediately (retrying a
                                    genuine failure only wastes time).
     * runtime dies mid-retry   → return ``None`` (caller's respawn handles it).
@@ -532,16 +554,10 @@ async def _start_kiro_runtime_impl(
     mcp_gateway_overlay = getattr(self._client, "_mcp_gateway_overlay", None)
     mcp_gateway_socket = getattr(self._client, "_mcp_gateway_socket", None)
 
-    # Check for session resume. A direct dashboard turn (dashboard session
-    # key with no channel identity) can restore the transcript without
-    # restoring Tool Search's activated schemas: the loader still runs, but
-    # a tool it reports as loaded remains absent on the next inference. A
-    # fresh native session rebuilds that registry, while
-    # ``_history_replay_needed`` preserves the Kiro Crew conversation. Linked
-    # Slack and other channel dispatchers keep native resume until they own
-    # the same replay-lease contract end to end. The decision itself is
-    # ``agent_sdk.tool_search.resume_takes_tool_search_replay``, shared with
-    # the resume prefetch (the dashboard may not import this layer).
+    # A native resume restores the transcript but not Tool Search's activated
+    # schemas, so a tool reported as loaded stays absent. Where
+    # ``agent_sdk.tool_search.resume_takes_tool_search_replay`` says so (shared with
+    # the resume prefetch), start a fresh session and replay the conversation.
     resume_sid = (
         getattr(self._client, "_resume_session_id", "") if self.memory_mode == "persistent" else ""
     )
@@ -596,12 +612,13 @@ async def _start_kiro_runtime_impl(
         # subagent runs in, so the second window has to be mounted HERE.
         shared_scratch=self._shared_scratch,
         launch_agent=_launch_agent(self),
+        harness_pin=self._harness_pin,
     )
     # One priority for both start queues this path enters, set by the session
     # layer for this start (rule: ``kiro_crew.start_priority``).
     start_priority = self.start_priority
     # Persisted choices, including inherited subagent choices, outlive configuration.
-    from kiro_crew.coder.session_launch import prepare_for_session
+    from kiro_crew.coder.session_launch import PreparedCloudSession, prepare_for_session
     from kiro_crew.config import live
     from kiro_crew.config.loader import KiroCrewConfig
     from kiro_crew.session_environment import report_start_stage, session_environments_enabled
@@ -615,7 +632,10 @@ async def _start_kiro_runtime_impl(
     governed_agent = self._crew_agent or agent or "kirocrew"
     remote = (
         await prepare_for_session(
-            session_key, before_compute=runtime.check_remote_workspace_supported
+            session_key,
+            agent=governed_agent,
+            app=getattr(self, "owning_app", "") or "",
+            before_compute=runtime.check_remote_workspace_supported,
         )
         if session_environments_enabled()
         and (
@@ -624,13 +644,27 @@ async def _start_kiro_runtime_impl(
                 or section.profiles
                 or getattr(section, "sprites_profiles", None)
                 or getattr(section, "boxd_profiles", None)
+                or getattr(section, "kiro_cloud_profiles", None)
             )
             or await asyncio.to_thread(_choices_file_may_exist, session_key)
         )
         else None
     )
+    if isinstance(remote, PreparedCloudSession) and self.memory_mode != "persistent":
+        # Before any sandbox exists: a private chat never reopens its session, so
+        # each start would mint a new sandbox and strand the last one's files.
+        from kiro_crew.coder.session_launch import PRIVATE_CHAT_CLOUD_REFUSAL
+        from kiro_crew.session_environment import SessionEnvironmentUnavailable
+
+        raise SessionEnvironmentUnavailable(PRIVATE_CHAT_CLOUD_REFUSAL)
 
     async def attach_remote_workspace(target: AcpRuntime) -> None:
+        if isinstance(remote, PreparedCloudSession):
+            # Kiro Cloud Sessions: KAS places the session in a cloud sandbox at
+            # session/new. No workspace server and no git proxy.
+            target.set_cloud_sandbox(remote.repositories)
+            report_start_stage(session_key, "starting_agent")
+            return
         # A fresh guest worker per runtime: the bridge spends its one-use secret.
         assert remote is not None
         target.check_remote_workspace_supported()
@@ -666,8 +700,18 @@ async def _start_kiro_runtime_impl(
     if remote is not None:
         await attach_remote_workspace(runtime)
         # Per-message context names the guest directory, not the gateway project.
-        remember_remote_workspace(session_key, remote.profile_name, remote.workdir, owner=runtime)
-        if remote.created and getattr(self._client, "_resume_session_id", None):
+        remember_remote_workspace(
+            session_key,
+            remote.profile_name,
+            # Empty for a cloud sandbox: Kiro Crew never sees its directory.
+            "" if isinstance(remote, PreparedCloudSession) else remote.workdir,
+            owner=runtime,
+        )
+        if (
+            not isinstance(remote, PreparedCloudSession)
+            and remote.created
+            and getattr(self._client, "_resume_session_id", None)
+        ):
             # A conversation that already ran got a new, empty workspace.
             from kiro_crew.session_environment import mark_workspace_recreated
 
@@ -720,21 +764,21 @@ async def _start_kiro_runtime_impl(
     finally:
         # subprocess launch + ACP `initialize` handshake
         phases["spawn_init"] = (time.monotonic() - _t_spawn) * 1000.0
-        if remote is not None:
+        turn_timing.phase("spawn_init", phases["spawn_init"])
+        if remote is not None and not isinstance(remote, PreparedCloudSession):
             # Closed once this runtime ends (at once if the spawn failed); its
             # placement entry goes with it, so the bounded table holds live ones.
+            # A cloud session has no workspace relay.
             remote.launch.close_relay_when_ended(
                 runtime.is_alive,
                 functools.partial(forget_remote_workspace, session_key, owner=runtime),
             )
+        elif isinstance(remote, PreparedCloudSession) and session_key:
+            _forget_cloud_placement_when_ended(session_key, runtime)
 
-    # Everything AFTER a successful spawn() must be guarded: until the
-    # AcpSessionProvider is constructed and assigned to self._client, NOTHING
-    # owns the spawned kiro-cli process, so any failure here would orphan it
-    # until the gateway restarts. Kill the runtime on any failure path before
-    # re-raising. BaseException (not Exception) so CancelledError/KeyboardInterrupt
-    # also clean up. Once self._client = provider runs, the session lifecycle
-    # owns the runtime and this guard has already returned.
+    # Until the AcpSessionProvider is assigned to self._client, NOTHING owns the
+    # spawned process, so every failure below kills the runtime before re-raising
+    # (BaseException, so cancellation cleans up too).
     try:
         # Resume via session/load when a prior transcript exists, otherwise a
         # fresh session/new. Resume issues session/load DIRECTLY (no
@@ -768,7 +812,7 @@ async def _start_kiro_runtime_impl(
                 should_load = True
             else:
                 session_file = kiro_sessions_dir() / f"{resume_sid}.json"
-                should_load = session_file.exists()
+                should_load = await asyncio.to_thread(session_file.exists)
             if should_load:
                 # F2 load-recovery: retry past a stale "active in another
                 # process" lock (Phase 1); on persistent failure fall through
@@ -778,6 +822,14 @@ async def _start_kiro_runtime_impl(
                 # crash, OOM, drain timeout) — it never depends on the dead
                 # holder cooperating.
                 _t_load = time.monotonic()
+                # A cloud reopen holds the approvals KAS replays during the load
+                # until the handle is registered. Only the cloud start takes this
+                # step; every other resume calls the unchanged load (H13).
+                cloud_hold = (
+                    runtime.hold_cloud_resume(resume_sid)
+                    if isinstance(remote, PreparedCloudSession)
+                    else None
+                )
                 try:
                     handle = await self._load_session_with_retry(
                         runtime,
@@ -791,7 +843,10 @@ async def _start_kiro_runtime_impl(
                         require_replay=self.is_kas_backend,
                     )
                 finally:
+                    if cloud_hold is not None:
+                        cloud_hold.settle(handle)
                     phases["session_load"] = (time.monotonic() - _t_load) * 1000.0
+                    turn_timing.phase("session_load", phases["session_load"])
                 resumed = handle is not None
                 meta["resume_outcome"] = "loaded" if resumed else "fallback_replay"
                 if handle is None:
@@ -840,11 +895,15 @@ async def _start_kiro_runtime_impl(
                     # joins it (above): its sessions' work is there.
                     shared_scratch=self._shared_scratch or runtime.work_scratch_dir,
                     launch_agent=_launch_agent(self),
+                    harness_pin=self._harness_pin,
                 )
                 if remote is not None:
                     await attach_remote_workspace(runtime)
                     remember_remote_workspace(
-                        session_key, remote.profile_name, remote.workdir, owner=runtime
+                        session_key,
+                        remote.profile_name,
+                        "" if isinstance(remote, PreparedCloudSession) else remote.workdir,
+                        owner=runtime,
                     )
                 try:
                     await runtime.spawn(
@@ -868,11 +927,13 @@ async def _start_kiro_runtime_impl(
                         _name_credential_mask(runtime, exc)
                     raise
                 finally:
-                    if remote is not None:
+                    if remote is not None and not isinstance(remote, PreparedCloudSession):
                         remote.launch.close_relay_when_ended(
                             runtime.is_alive,
                             functools.partial(forget_remote_workspace, session_key, owner=runtime),
                         )
+                    elif isinstance(remote, PreparedCloudSession) and session_key:
+                        _forget_cloud_placement_when_ended(session_key, runtime)
             try:
                 handle = await runtime.create_session(
                     cwd=session_cwd,
@@ -908,7 +969,62 @@ async def _start_kiro_runtime_impl(
                 # so a successful resume never reports a near-zero session_new
                 # that would understate the phase's real distribution.
                 phases["session_new"] = (time.monotonic() - _t_sess) * 1000.0
+                turn_timing.phase("session_new", phases["session_new"])
 
+        # The cloud session id this chat's row held before this start, when this
+        # start replaced it with a new one (a new sandbox, without its files).
+        replaced_cloud_session = ""
+        if isinstance(remote, PreparedCloudSession) and session_key:
+            # Kiro's cloud now holds this session, so its environment is
+            # fixed from here on (the dashboard's choice lock reads this).
+            from kiro_crew.coder.session_launch import record_cloud_session
+
+            try:
+                previous = await record_cloud_session(
+                    session_key, handle.session_id, profile_id=remote.profile_id
+                )
+                if previous and previous != handle.session_id:
+                    # Edit & Resend, a reset and compaction drop the resume id,
+                    # and a failed reopen falls back: each starts a new sandbox.
+                    replaced_cloud_session = previous
+            except BaseException:
+                if not resumed:
+                    # A sandbox this start created and could not record would be
+                    # left in Kiro's cloud with nothing pointing at it. It holds
+                    # no conversation yet, so it is deleted (bounded, best
+                    # effort) before the start fails. A reopened session is kept.
+                    # Shielded so a second cancel cannot skip the delete, and
+                    # waited for, so the failed start does not stop the runtime
+                    # under it.
+                    cleanup = asyncio.ensure_future(
+                        runtime.terminate_session(handle.session_id, delete_cloud_session=True)
+                    )
+                    try:
+                        await asyncio.shield(cleanup)
+                    except asyncio.CancelledError:
+                        await asyncio.wait({cleanup})
+                        raise
+                raise
+
+        # kiro-cli starts an unpinned chat on its cli.json chat.defaultModel,
+        # which KAS never reads, so Crew applies it here as an INHERITED model:
+        # the session serves it, but stays unpinned (see set_model's inherit).
+        # Read off the loop. A model that does not land is named once, in the
+        # session-start notice, so the user can pick it.
+        _default_model_notice = ""
+        if self._client.backend == ACP_BACKEND_KAS and configured_model in ("", DEFAULT_MODEL):
+            _cli_default = await asyncio.to_thread(kiro_cli_default_model, session_cwd)
+            if _cli_default:
+                try:
+                    await handle.set_model(_cli_default, inherit=True)
+                except Exception:
+                    logger.warning(
+                        "Failed to apply kiro-cli's chat.defaultModel %s to the KAS session",
+                        _cli_default,
+                        exc_info=True,
+                    )
+                if not handle.inherited_model:
+                    _default_model_notice = default_model_notice(_cli_default)
         # Apply the configured model override (mirrors AcpClient handshake).
         # DEFAULT_MODEL ("auto") means "let kiro-cli pick per agent config".
         if configured_model and configured_model != DEFAULT_MODEL:
@@ -1006,6 +1122,7 @@ async def _start_kiro_runtime_impl(
                     )
                 finally:
                     phases["set_model"] = (time.monotonic() - _t_model) * 1000.0
+                    turn_timing.phase("set_model", phases["set_model"])
 
         # Replace the placeholder AcpClient with the real AcpSessionProvider
         provider = AcpSessionProvider(
@@ -1018,6 +1135,7 @@ async def _start_kiro_runtime_impl(
             session_key=self._owning_session_key(),
             channel_id=self._owning_channel_id(),
         )
+        provider.kas_default_model_notice = _default_model_notice
         provider.memory_mode = self.memory_mode
         if resumed:
             provider.resumed = True
@@ -1032,6 +1150,35 @@ async def _start_kiro_runtime_impl(
         if self._accepts_elicitation:
             provider.accepts_elicitation = True
         self._client = provider  # type: ignore[assignment]
+        # What each later turn re-checks Kiro Cloud governance against (acp_turns.
+        # _readmit_cloud_session): the same session, agent and app as this start.
+        self._cloud_governance_scope = (
+            (session_key, governed_agent, getattr(self, "owning_app", "") or "")
+            if isinstance(remote, PreparedCloudSession) and session_key
+            else None
+        )
+        if (
+            isinstance(remote, PreparedCloudSession)
+            and meta.get("resume_outcome") == "fallback_replay"
+        ):
+            self.startup_notice = (
+                "cloud_session_replayed",
+                "Couldn't reopen the cloud session, so a new cloud session started "
+                "with this conversation carried over. Files and changes from the "
+                "earlier session aren't in it. The earlier session wasn't deleted "
+                "and is still listed in Kiro Web (app.kiro.dev).",
+            )
+            logger.warning(self.startup_notice[1])
+        elif replaced_cloud_session:
+            # No reopen was attempted (the resume id was dropped), but the chat
+            # still had a sandbox: say it moved, and that nothing was deleted.
+            self.startup_notice = (
+                "cloud_session_replaced",
+                "This chat now runs on a new Kiro Cloud Sessions sandbox. Files and changes "
+                "from the earlier sandbox aren't in it. The earlier sandbox wasn't "
+                "deleted and is still listed in Kiro Web (app.kiro.dev).",
+            )
+            logger.warning(self.startup_notice[1])
         # The tree this session ACTUALLY has, read off the live process:
         # the runtime drops an inherited window that was swept and falls
         # back to its own directory, so the value handed in at

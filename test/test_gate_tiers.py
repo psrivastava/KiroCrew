@@ -47,6 +47,7 @@ from kiro_crew.platform import context as ctx_mod
 from kiro_crew.platform import governance_profiles as gp
 from kiro_crew.platform.bootstrap import build_default_context
 from kiro_crew.platform.governance import parse_policy
+from kiro_crew.platform.spec_denied_grant import SpecDeniedGrant
 
 _HOME = Path.home()
 
@@ -148,6 +149,45 @@ TIER_SCENARIOS: tuple[Scenario, ...] = (
         },
     ),
     Scenario(
+        "spec-shell-allowlist",
+        TOOL_DENY,
+        ToolCall(
+            title="Run Command",
+            is_shell=True,
+            command="mkfifo /tmp/fifo",
+            mcp_tool="run_command",
+            identity_trusted=True,
+            kas_builtin_ids=True,
+            spec_shell_allowlist=("touch /tmp/allowed",),
+        ),
+    ),
+    Scenario(
+        "spec-write-allowlist",
+        TOOL_DENY,
+        ToolCall(
+            title="Write",
+            kind="edit",
+            raw_params={"path": "/tmp/elsewhere.txt"},
+            mcp_tool="fs_write",
+            identity_trusted=True,
+            kas_builtin_ids=True,
+            spec_write_allowlist=("/tmp/allowed",),
+        ),
+    ),
+    Scenario(
+        "spec-denies",
+        TOOL_DENY,
+        ToolCall(
+            title="Run Command",
+            is_shell=True,
+            command="make clean",
+            mcp_tool="run_command",
+            identity_trusted=True,
+            kas_builtin_ids=True,
+            spec_denied_grant=SpecDeniedGrant(denied_commands=("make clean",)),
+        ),
+    ),
+    Scenario(
         "app-own-server",
         TOOL_AUTO_APPROVE,
         ToolCall(
@@ -177,6 +217,17 @@ TIER_SCENARIOS: tuple[Scenario, ...] = (
             identity_trusted=True,
             kas_builtin_ids=True,
             spec_granted_builtins=frozenset({"execute_bash"}),
+        ),
+    ),
+    Scenario(
+        "batch-guard-grant",
+        TOOL_AUTO_APPROVE,
+        ToolCall(
+            title="Running: @kirocrew-dashboard/session_send",
+            mcp_server="kirocrew-dashboard",
+            mcp_tool="session_send",
+            identity_trusted=True,
+            spec_granted_builtins=frozenset({"@kirocrew-dashboard/session_send"}),
         ),
     ),
     Scenario(
@@ -362,9 +413,13 @@ def test_the_table_is_the_gate_order() -> None:
         ("mcp-auto-deny", "deny"),
         ("search-target", "deny"),
         ("governance", "deny_policy"),
+        ("spec-shell-allowlist", "deny_policy"),
+        ("spec-write-allowlist", "deny_policy"),
+        ("spec-denies", "deny_policy"),
         ("app-own-server", "grant"),
         ("operator-grants", "grant"),
         ("spec-builtin-grant", "grant"),
+        ("batch-guard-grant", "grant"),
         ("read-only", "classify"),
     ]
     targets = next(t for t in GATE_TIERS if t.name == "targets")
@@ -540,7 +595,15 @@ _DENY_UNDER_GRANT = (
         pytest.param(scenario, grant, id=f"{grant}-{scenario.tier}")
         for scenario in _DENY_SCENARIOS
         for grant in ("operator", "app-own-server")
-        if not (grant == "app-own-server" and scenario.call.mcp_server)
+        # The spec's shell and write allowlists bind the agent's own built-ins, never
+        # a call addressed to an MCP server, so the app-own-server re-address skips them.
+        if not (
+            grant == "app-own-server"
+            and (
+                scenario.call.mcp_server
+                or scenario.tier in ("spec-shell-allowlist", "spec-write-allowlist", "spec-denies")
+            )
+        )
     ]
     + [
         # A command/cmd argument deny under the operator grant. The app-own-server grant
@@ -576,7 +639,9 @@ def test_every_deny_beats_every_grant(scenario: Scenario, grant: str) -> None:
             kas_builtin_ids=True,
             spec_granted_builtins=frozenset({"execute_bash"}),
         )
-        granted = dataclasses.replace(call, title="Run Command", command="make build")
+        granted = dataclasses.replace(
+            call, title="Run Command", command="make build", spec_shell_allowlist=None
+        )
         assert (
             HookManager().judge(granted).tier == "spec-builtin-grant"
         ), "the grant must approve the same call shape without the deny trigger"
@@ -600,7 +665,7 @@ def test_classifier_only_drops_every_grant_tier() -> None:
     to the classifier (not read-only, so allow) and the app's own server is not
     auto-approved -- while a provable read still is."""
     by_tier = {s.tier: s for s in TIER_SCENARIOS}
-    grant_tiers = ("operator-grants", "app-own-server", "spec-builtin-grant")
+    grant_tiers = ("operator-grants", "app-own-server", "spec-builtin-grant", "batch-guard-grant")
     for tier in grant_tiers:
         verdict = judge_scenario(by_tier[tier], classifier_only=True)
         assert verdict.action == TOOL_ALLOW, tier

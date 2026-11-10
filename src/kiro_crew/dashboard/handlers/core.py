@@ -27,7 +27,7 @@ from aiohttp.client_exceptions import ClientConnectionResetError
 import kiro_crew
 import kiro_crew._facade_mirror as _facade_mirror
 import kiro_crew.config.resolution as _resolution
-from kiro_crew import aws_consent, beacon, platform_compat, stt
+from kiro_crew import aws_consent, beacon, edition, platform_compat, stt
 from kiro_crew.acp_backends import selectable_backend_values, selectable_stored_backend_values
 from kiro_crew.apps.manifest import KEBAB_RE
 from kiro_crew.computer_use.types import MAX_SCREENSHOT_MAX_PX as _CU_MAX_SCREENSHOT_MAX_PX
@@ -77,6 +77,9 @@ from kiro_crew.config.sections import (
     EXTERNAL_TERMINAL_APPS,
     FOLDER_SORT_MODES,
     JUDGE_PROVIDERS,
+    PRIVACY_ACK_VERSION_MAX,
+    REMOTE_EDITOR_HOST_PATTERN,
+    REMOTE_EDITOR_IDS,
     SESSION_SORT_MODES,
     STT_LANGUAGE_AUTO,
     TITLE_REFRESH_EVERY_TURNS_MAX,
@@ -90,6 +93,7 @@ from kiro_crew.config.sections import (
 from kiro_crew.config.superseded_defaults import ack_explicit_write
 from kiro_crew.context_management import RESULT_FILE_MAX_BYTES
 from kiro_crew.dashboard.chat_utils import drained_to_thread, run_config_write
+from kiro_crew.dashboard.dist_file_response import DistFileResponse
 from kiro_crew.dashboard.handlers._shared import (
     _owner_denial_response,
     _pip_install_channel_available,
@@ -162,6 +166,8 @@ _DIST_INDEX = _DIST_DIR / "index.html"
 # test_served_shell_is_auth_independent.
 _INDEX_HTML_CACHE: tuple[int, str] | None = None
 _SSE_INTERVAL_SECS = 5
+# The most unsent text the sub-agent output stream holds for the next poll.
+_AGENT_STREAM_HOLD_MAX = 1 << 16
 
 
 # Static, secret-free fallback served when the dashboard's static bundle cannot
@@ -262,8 +268,11 @@ async def logo(request: web.Request) -> web.StreamResponse:
         if _h.is_sensitive_path(cfg.dashboard.avatar):
             return web.Response(status=404)
         validated = validate_file_path(cfg.dashboard.avatar)
-        if validated and Path(validated).is_file():
-            return web.FileResponse(validated)
+        # Two ifs, not `validated and await ...`: mypy infers the right operand of
+        # `and` in the left operand's type (str | None), which rejects is_file's bool.
+        if validated:
+            if await asyncio.to_thread(Path(validated).is_file):
+                return DistFileResponse(Path(validated))
     # The DEFAULT logo is channel-aware: nightly builds serve the night-sky
     # variant so the whole in-app surface -- sidebar logo, browser favicon,
     # and native-notification avatar all resolve through /logo.png -- matches
@@ -277,25 +286,63 @@ async def logo(request: web.Request) -> web.StreamResponse:
         names.insert(0, "kirocrew-logo-nightly.png")
     for name in names:
         path = _h._STATIC_DIR / name
-        if path.is_file():
-            return web.FileResponse(path)
+        if await asyncio.to_thread(path.is_file):
+            return DistFileResponse(path)
     return web.Response(status=404)
 
 
 async def api_branding(request: web.Request) -> web.Response:
-    """GET /api/dashboard/branding — bot name and avatar config."""
-    cfg = KiroCrewConfig.load()
+    """GET /api/dashboard/branding — bot name and avatar config.
+
+    Reads the config the live watcher has already adopted. Every dashboard tab
+    asks for branding, and ``KiroCrewConfig.load()`` rebuilds every config
+    section on each call, so a load per request would hold the event loop. The
+    watcher reloads when either config file's fingerprint moves, and a
+    dashboard config write runs its cycle before answering, so a new bot name
+    reaches this route without a load of its own. Before the watcher is primed
+    (early boot, a CLI host, most tests) the load runs off the loop.
+    """
+    from kiro_crew.config import live
+
+    cfg = live.snapshot()
+    if cfg is None:
+        cfg = await asyncio.to_thread(KiroCrewConfig.load)
     # `direct_local` is the canonical client-side origin signal: true only for a
     # direct-local (loopback, no proxy) caller. The dashboard reads it to gate
     # OS-desktop file actions (open/reveal); any future consumer of origin
     # posture should reuse this flag rather than invent a second home.
+    #
+    # `desktop_launcher` is the other half of that gate: whether this host can
+    # open a file manager right now (the launcher those actions start, and on
+    # Linux a desktop session for it). Without that, `/api/reveal` can only
+    # answer a clipboard copy, so the dashboard does not offer them. It is a
+    # fact about this gateway process, read in a worker thread (a stat of a
+    # fixed system path), and no part of the request decides it.
     return web.json_response(
         {
             "bot_name": cfg.dashboard.bot_name or "Kiro Crew",
             "avatar": "/logo.png",
             "direct_local": is_direct_local_request(request),
+            "desktop_launcher": await asyncio.to_thread(platform_compat.desktop_launcher_available),
+            "remote_editor": _remote_editor_branding(cfg.dashboard.remote_editor),
         }
     )
+
+
+def _remote_editor_branding(raw: dict) -> dict[str, str]:
+    """``dashboard.remote_editor`` with each value the schema refuses read as ``""``.
+
+    Both values become part of the side panel's ⋯ menu link, and a key three
+    segments deep keeps an invalid hand-edited value on load, so an unknown editor
+    or a host outside the pattern is dropped here rather than forwarded.
+    """
+    editor, host = raw.get("editor"), raw.get("host")
+    return {
+        "editor": editor if editor in REMOTE_EDITOR_IDS else "",
+        "host": (
+            host if isinstance(host, str) and re.fullmatch(REMOTE_EDITOR_HOST_PATTERN, host) else ""
+        ),
+    }
 
 
 async def _liveness_payload(request: web.Request) -> dict[str, object]:
@@ -327,11 +374,13 @@ async def _liveness_payload(request: web.Request) -> dict[str, object]:
         # The desktop production/nightly cross-app guard calls over loopback and
         # needs exact identity to decide whether it can reuse the shared port.
         # Anonymous non-loopback probes get only the liveness bit, avoiding an
-        # exact-version fingerprint on the public probe boundary.
+        # exact-version fingerprint on the public probe boundary. `edition`
+        # lets an LTS shell tell its own gateway from an oss one on the port.
         payload.update(
             {
                 "app": "kirocrew",
                 "version": kiro_crew.__version__,
+                "edition": edition.EDITION,
                 "gateway_id": await asyncio.to_thread(gateway_id),
             }
         )
@@ -466,7 +515,17 @@ def _theme_payload(cfg: KiroCrewConfig) -> dict[str, object]:
 
     One builder for all four response sites so a newly-added preference cannot
     be surfaced by some of them and silently omitted by the rest.
+
+    An LTS build reports ``privacy_acked`` as true and the notice version as
+    current, so the SPA never opens the first-run Privacy chapter there, nor the
+    once-more showing of a changed notice: the admin, not the user, decides where
+    usage data goes. Only the response says so; the stored values are unchanged.
     """
+    from kiro_crew.beacon import PRIVACY_NOTICE_VERSION
+    from kiro_crew.edition import is_lts
+
+    lts = is_lts()
+
     return {
         "mode": cfg.dashboard.theme_mode or "",
         "color": cfg.dashboard.theme_color or "",
@@ -474,7 +533,12 @@ def _theme_payload(cfg: KiroCrewConfig) -> dict[str, object]:
         "translucent_panels": cfg.dashboard.translucent_panels or "",
         "onboarded": cfg.dashboard.onboarded,
         "import_onboarded": cfg.dashboard.import_onboarded,
-        "privacy_acked": cfg.dashboard.privacy_acked,
+        "privacy_acked": cfg.dashboard.privacy_acked or lts,
+        "privacy_ack_version": (
+            max(cfg.dashboard.privacy_ack_version, PRIVACY_NOTICE_VERSION)
+            if lts
+            else cfg.dashboard.privacy_ack_version
+        ),
         "crewmates_onboarded": cfg.dashboard.crewmates_onboarded,
     }
 
@@ -495,8 +559,8 @@ async def api_theme_config(request: web.Request) -> web.Response:
 
     GET returns the current config. PUT accepts
     {mode?, color?, language?, translucent_panels?, onboarded?, import_onboarded?,
-    privacy_acked?, crewmates_onboarded?} and persists ONLY those ``dashboard.*``
-    keys.
+    privacy_acked?, privacy_ack_version?, crewmates_onboarded?} and persists ONLY
+    those ``dashboard.*`` keys.
 
     The PUT is a locked delta read-modify-write, never a whole-document
     ``KiroCrewConfig.save()``. A momentarily unreadable ``config.json`` (a torn
@@ -564,6 +628,19 @@ async def api_theme_config(request: web.Request) -> web.Response:
             if not isinstance(body[flag], bool):
                 raise web.HTTPBadRequest(text=f"{flag} must be a boolean")
             updates[flag] = body[flag]
+    # A real int only, for the same reason: ``True`` is an int in Python and
+    # would store as 1.
+    if "privacy_ack_version" in body:
+        version = body["privacy_ack_version"]
+        if (
+            not isinstance(version, int)
+            or isinstance(version, bool)
+            or not 0 <= version <= PRIVACY_ACK_VERSION_MAX
+        ):
+            raise web.HTTPBadRequest(
+                text=f"privacy_ack_version must be an integer from 0 to {PRIVACY_ACK_VERSION_MAX}"
+            )
+        updates["privacy_ack_version"] = version
 
     if updates:
 
@@ -588,9 +665,7 @@ async def api_theme_config(request: web.Request) -> web.Response:
                 {"error": "failed to read config file", "code": "config_unreadable"}, status=500
             )
         except ConfigWriteRefused as exc:
-            return web.json_response(
-                {"error": str(exc), "code": "config_write_refused"}, status=400
-            )
+            return web.json_response({"error": str(exc), "code": exc.code}, status=400)
         except OSError:
             logger.warning("theme config PUT: config.json write failed", exc_info=True)
             return web.json_response(
@@ -608,8 +683,12 @@ async def pwa_file(request: web.Request) -> web.StreamResponse:
     path = _DIST_DIR / name
     # Resolve both sides so a symlinked _DIST_DIR (dev-backend.sh points it
     # at KiroCrewWebsite/dist) still passes the traversal guard.
-    if path.is_file() and _DIST_DIR.resolve() in path.resolve().parents:
-        return web.FileResponse(path)
+    if (
+        await asyncio.to_thread(path.is_file)
+        and await asyncio.to_thread(_DIST_DIR.resolve)
+        in (await asyncio.to_thread(path.resolve)).parents
+    ):
+        return DistFileResponse(path)
     raise web.HTTPNotFound()
 
 
@@ -664,8 +743,9 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _beacon_governance_pinned_off,
         _check_default_profile_is_saved,
         _ConfigKeyAlreadySet,
+        _drop_dangling_default_profile,
         _keep_omitted_session_environment_keys,
-        _keep_vm_profiles,
+        _keep_saved_profiles,
         _profile_ids,
         _session_environment_key_validators,
         _tailnet_governance_pinned_off,
@@ -674,20 +754,25 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
     )
     from kiro_crew.dashboard.handlers.core_config_schema import (
         _APP_MODEL_SPEC,
+        _APP_MUTE_SESSIONS_SPEC,
         _EDITABLE_CONFIG,
         _MODEL_PIN_PATTERN,
         _acp_backend_patch_values,
         _agent_values,
         _editable_config_spec,
+        _preview,
         _selectable_acp_backends,
         _tier,
     )
     from kiro_crew.dashboard.handlers.core_config_view import (
         _AGENT_UNTRUSTED_TEXT_FIELDS,
+        _DASHBOARD_LOCKS,
         _SENSITIVE_MASK,
         _changed_paths_need_restart,
+        _config_body,
         _hot_apply_after_write,
         _mask_agent_free_text,
+        _mask_strings,
         _masked_config_dict,
         api_kirocrew_config,
     )
@@ -736,18 +821,21 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         api_stt_config,
     )
     from kiro_crew.dashboard.handlers.core_stt_speech import (
+        _CLIENT_GONE_POLL_SECS,
         _POLISH_MAX_CHARS,
         _POLISH_MAX_RATIO,
         _POLISH_MIN_RATIO,
         _POLISH_PROMPT,
         _POLISH_TIMEOUT_SECS,
         _POLISH_UNSPACED_SCRIPTS,
+        _ClientGone,
         _polish_is_content,
         _polish_is_ignorable,
         _polish_only_marks_differ,
         _polish_preserves_words,
         _polish_spaces_its_words,
         _polish_split,
+        _transcribe_while_connected,
         api_stt_polish,
         api_stt_transcribe,
     )
@@ -873,29 +961,71 @@ async def api_session_agent_stream(request: web.Request) -> web.StreamResponse:
     resp.headers["Cache-Control"] = "no-cache"
     await resp.prepare(request)
 
-    last_pos = 0
-    from kiro_crew.security import redact_credentials, redact_exfiltration_urls  # noqa: F811
+    from kiro_crew.security import (  # noqa: F811
+        iter_credential_matches,
+        redact_credentials,
+        redact_exfiltration_urls,
+    )
+    from kiro_crew.session_workspace_tail import ResultTail  # noqa: F811
 
-    for _ in range(1200):  # 20 min max
-        try:
-            if path.exists():
-                content = path.read_text(encoding="utf-8")
-                if len(content) > last_pos:
-                    chunk = content[last_pos:]
-                    last_pos = len(content)
-                    chunk, _ = redact_exfiltration_urls(chunk)
-                    chunk, _ = redact_credentials(chunk)
-                    await resp.write(f"data: {json.dumps(chunk)}\n\n".encode())
+    # Each poll reads only the bytes appended since the last one, in a thread:
+    # re-reading the whole file every second on the loop grows with its square.
+    tail = ResultTail(path)
+    # A poll is sent up to the start of its last line and the rest waits for the
+    # next one, so a link, or a credential with its label, is redacted whole:
+    # never a placeholder and then the rest of the link's query.
+    held = ""
+    stopped = False
+
+    def _redacted(text: str) -> str:
+        text, _ = redact_exfiltration_urls(text)
+        return redact_credentials(text)[0]
+
+    async def _send(chunk: str, *, last: bool) -> None:
+        nonlocal held, stopped
+        if stopped or not (chunk or last):
+            return
+        text = held + chunk
+        # A value can start on a line after its label (`Bearer`, a line end,
+        # the token), so the last line with text in it waits, and all of it
+        # does while the two parts redact differently apart than together, or
+        # a credential spans the cut (a kept label redacts the same either way).
+        cut = len(text) if last else text.rfind("\n", 0, len(text.rstrip())) + 1
+        whole = _redacted(text)
+        sent = _redacted(text[:cut])
+        if sent + _redacted(text[cut:]) != whole or (
+            whole != text  # text redaction left unchanged holds no match
+            and any(m.start() < cut < m.end() for m in iter_credential_matches(text))
+        ):
+            cut, sent = 0, ""
+        held = text[cut:]
+        if len(held) > _AGENT_STREAM_HOLD_MAX:
+            # Too long to hold: send it as one read and nothing after it, since
+            # the next read could carry the rest of a value it cuts.
+            sent, held, stopped = whole, "", True
+        if sent:
+            await resp.write(f"data: {json.dumps(sent)}\n\n".encode())
+
+    polls = 1200  # 20 min max
+    try:
+        for poll in range(polls):
+            chunk = await asyncio.to_thread(tail.read_new)
             # Check if the subagent is done.
             state: DashboardState = request.app["state"]
-            if state.subagents:
-                info = state.subagents.get(agent_id)
-                if info and info.done:
-                    await resp.write(b"event: done\ndata: {}\n\n")
-                    break
-        except (ConnectionResetError, ClientConnectionResetError):
-            break
-        await asyncio.sleep(1)
+            info = state.subagents.get(agent_id) if state.subagents else None
+            done = bool(info and info.done)
+            last = done or poll == polls - 1
+            if last:
+                # The decoder may still hold a final "\r"; it belongs to this
+                # last chunk, as the whole-file read gave it.
+                chunk += tail.finish()
+            await _send(chunk, last=last)
+            if done:
+                await resp.write(b"event: done\ndata: {}\n\n")
+                break
+            await asyncio.sleep(1)
+    except (ConnectionResetError, ClientConnectionResetError):
+        pass
     return resp
 
 

@@ -296,7 +296,9 @@ def test_member_capabilities_are_opt_in() -> None:
     for provider in (providers_acp.AcpProvider, AcpSessionProvider):
         source = inspect.getsource(provider.member_tool_limits_supported.fget)
         assert "in ACP_BACKENDS_MEMBER_TOOL_LIMITS" in source
-    assert ACP_BACKENDS_MEMBER_TOOL_LIMITS == frozenset({ACP_BACKEND_KIRO})
+    assert ACP_BACKENDS_MEMBER_TOOL_LIMITS == frozenset(
+        {ACP_BACKEND_KIRO, ACP_BACKEND_KAS, ACP_BACKEND_CLAUDE}
+    )
 
 
 def test_the_mate_worker_takes_the_member_rule() -> None:
@@ -316,7 +318,9 @@ def test_the_mate_worker_takes_the_member_rule() -> None:
     for provider in (providers_acp.AcpProvider, AcpSessionProvider):
         source = inspect.getsource(provider.mate_worker_kit_supported.fget)
         assert "in ACP_BACKENDS_MATE_WORKER_KIT" in source
-    assert ACP_BACKENDS_MATE_WORKER_KIT == frozenset({ACP_BACKEND_KAS, ACP_BACKEND_CLAUDE})
+    assert ACP_BACKENDS_MATE_WORKER_KIT == frozenset(
+        {ACP_BACKEND_KAS, ACP_BACKEND_CLAUDE, ACP_BACKEND_CODEX}
+    )
     assert ACP_BACKENDS_MATE_WORKER_KIT <= ACP_BACKENDS_MEMBER_CAPABILITIES
     assert ACP_BACKEND_KIRO not in ACP_BACKENDS_MATE_WORKER_KIT
     # The worker's prompt rides the context block exactly where the host's mirror
@@ -390,6 +394,31 @@ def test_mcp_wire_reinject_is_opt_in() -> None:
     assert "provider_reinjects_mcp" in gate
     marker = inspect.getsource(mcp_hot_reload.mark_reinjecting_providers)
     assert "provider_reinjects_mcp" in marker
+
+
+def test_mcp_relaunch_reload_is_opt_in() -> None:
+    """H6: the THIRD way a dashboard MCP write skips the reset is its own membership.
+
+    Strands reads its MCP servers once, at launch, so Crew relaunches the process and
+    loads the same session. The declaration and the mark read the set, and the
+    writer's gate and marker both consult the relaunch declaration.
+    """
+    from kiro_crew import mcp_hot_reload
+    from kiro_crew.acp import relaunch_reload
+    from kiro_crew.agent_sdk.backends import ACP_BACKEND_STRANDS, ACP_BACKENDS_MCP_RELAUNCH_RELOAD
+
+    assert ACP_BACKENDS_MCP_RELAUNCH_RELOAD == frozenset({ACP_BACKEND_STRANDS})
+    assert not (ACP_BACKENDS_MCP_RELAUNCH_RELOAD & ACP_BACKENDS_MCP_CONFIG_HOT_RELOAD)
+    assert not (ACP_BACKENDS_MCP_RELAUNCH_RELOAD & ACP_BACKENDS_MCP_WIRE_REINJECT)
+    declaration = inspect.getsource(relaunch_reload.mcp_config_relaunch_reload)
+    assert "in ACP_BACKENDS_MCP_RELAUNCH_RELOAD" in declaration
+    assert "mcp_config_relaunch_reload(client)" in inspect.getsource(
+        relaunch_reload.mark_mcp_config_changed
+    )
+    gate = inspect.getsource(mcp_hot_reload.live_sessions_apply_mcp_live)
+    assert "provider_relaunches_for_mcp" in gate
+    marker = inspect.getsource(mcp_hot_reload.mark_reinjecting_providers)
+    assert "provider_relaunches_for_mcp" in marker
 
 
 def test_steer_capability_declares_its_stamp() -> None:
@@ -1103,9 +1132,10 @@ def test_added_line_gate_self_test_passes() -> None:
     test makes a local ``pytest`` run catch a broken rule too.
     """
     result = subprocess.run(
-        [sys.executable, _GATE_PATH, "--test"],
+        [sys.executable, "-X", "utf8", _GATE_PATH, "--test"],
         capture_output=True,
         text=True,
+        encoding="utf-8",
         cwd=_REPO_ROOT,
     )
     assert result.returncode == 0, result.stdout + result.stderr
@@ -1120,9 +1150,10 @@ def test_added_line_gate_reports_without_enforcing() -> None:
     """
     env = {k: v for k, v in os.environ.items() if k != "HARNESS_BASE_REF"}
     result = subprocess.run(
-        [sys.executable, _GATE_PATH],
+        [sys.executable, "-X", "utf8", _GATE_PATH],
         capture_output=True,
         text=True,
+        encoding="utf-8",
         cwd=_REPO_ROOT,
         env=env,
     )
@@ -1312,10 +1343,22 @@ _DECLARED_IDENTITY_TESTS: dict[tuple[str, str], str] = {
     "the agent's local tools on the gateway machine.",
     (
         "src/kiro_crew/acp/session_handle_permissions.py",
+        "reject_tool",
+    ): "``_meta.kiro.rejectionReason`` on a one-time Deny is a key only the KAS engine "
+    "reads (it hands the text to the model); every other harness must be sent the bare "
+    "reject, so a positive identity test keeps the key off their wire.",
+    (
+        "src/kiro_crew/acp/session_handle_permissions.py",
         "_build_permission_event",
     ): "``_meta.kiro.consent`` on a permission request is KAS's own vocabulary (toolId "
     "plus consent capability). No other harness sends it, and reading it elsewhere would "
     "mint a non-shell verdict from a shape that backend never promised.",
+    (
+        "src/kiro_crew/acp/runtime_spawn_launch.py",
+        "_switch_off_mcp_for_toolless_spawn",
+    ): "``_kiro/mcp/toggle`` is a KAS engine extension notification, and only KAS starts "
+    "the user's mcp.json servers for an agent that sets includeMcpJson false. "
+    "Sending it to any other harness would put an unknown method on its wire.",
     (
         "src/kiro_crew/acp/runtime_spawn_launch.py",
         "_spawn_admitted",
@@ -1336,6 +1379,25 @@ _DECLARED_IDENTITY_TESTS: dict[tuple[str, str], str] = {
     "Its unpooled managed stdio declarations need a per-session token override; "
     "other harnesses already carry identity through their own projections.",
     (
+        "src/kiro_crew/acp/runtime_session_setup.py",
+        "_session_label_elements",
+    ): "The session label rides a per-session element for the same reason the token "
+    "does in ``_unpooled_control_planes``: only native Kiro launches spec servers from "
+    "a shared process with no session-valued environment. KAS carries the label on its "
+    "per-session wire agent, and mirrored hosts project their own arrays.",
+    (
+        "src/kiro_crew/acp/runtime_session_setup.py",
+        "_pooled_session_servers_and_ref_spec",
+    ): "Only KAS subtracts a crewmate worker's stubbed servers from its own custom-agent "
+    "projection, so only there must the pooled lookup be keyed by the worker session "
+    "(mcp_gateway.mate_overlays). Every other host keeps the by-name lookup it had.",
+    (
+        "src/kiro_crew/acp/runtime_session_setup.py",
+        "_kas_worker_stub_names",
+    ): "The subtraction set is consumed only by the KAS harness's projection "
+    "(kas_custom_agents worker_stub_names); no harness property means 'this host "
+    "projects the worker's servers itself and must withhold the stubbed ones'.",
+    (
         "src/kiro_crew/acp/runtime_session_load.py",
         "load_session",
     ): "KAS alone must have its custom agents re-attached on resume, and no harness "
@@ -1343,7 +1405,7 @@ _DECLARED_IDENTITY_TESTS: dict[tuple[str, str], str] = {
     "kiro path an awaited step it does not need (H13).",
     (
         "src/kiro_crew/acp/session_handle_turn.py",
-        "stream_command",
+        "command_is_native",
     ): "``_kiro.dev/commands/execute`` is kiro-cli's own RPC. The positive test is what "
     "makes every other harness fail CLOSED onto the prompt transport instead of "
     "inheriting a kiro-only verb (H5/H6).",
@@ -1362,11 +1424,30 @@ _DECLARED_IDENTITY_TESTS: dict[tuple[str, str], str] = {
     "not author. KAS has its own narrower arm: it moves only an ``auto`` default its "
     "own ``model`` select does not list, onto an id that select does list.",
     (
+        "src/kiro_crew/acp/session_handle_model_selection.py",
+        "store_session_config",
+    ): "KAS sends no ``models`` object, so its ``model`` select's ``currentValue`` is "
+    "the only place it names the model a session runs. It stays out of "
+    "``ACP_BACKENDS_ADVERTISED_MODEL_SELECTION`` because that select is its catalog, "
+    "not its advertised list, so only the current value is adopted, and only here.",
+    (
         "src/kiro_crew/acp/session_handle_compaction.py",
         "_kas_compact_request",
     ): "``_kiro/session/compact`` is KAS's own extension verb, advertised in its "
     "``initialize`` extensionMethods. Every other ``ACP_BACKENDS_COMPACT`` member "
     "compacts on the ``/compact`` prompt, so the positive test keeps them on it.",
+    (
+        "src/kiro_crew/acp/session_handle_kas.py",
+        "kas_command_call",
+    ): "``_kiro/session/context``, ``_kiro/knowledge`` and ``_kiro/codeIntelligence`` are "
+    "KAS's own extension verbs behind a person's ``/context``, ``/knowledge`` and "
+    "``/code``. The positive test keeps them off every other harness's wire.",
+    (
+        "src/kiro_crew/acp/session_handle_dispatch.py",
+        "_dispatch_events",
+    ): "Only kiro-cli answers a cancelled prompt ahead of the ``_kiro.dev/metadata`` frame "
+    "that bills it (live probe, 3.1.0), so only there does the stopped turn read one more "
+    "frame. No other harness sends that frame, and the read would spend its grace on every Stop.",
     (
         "src/kiro_crew/acp/session_handle_updates.py",
         "_handle_update",
@@ -1742,3 +1823,34 @@ def test_the_identity_test_declarations_are_all_still_live():
 
     stale = sorted(set(_DECLARED_IDENTITY_TESTS) - seen)
     assert not stale, f"prune these dead _DECLARED_IDENTITY_TESTS entries: {stale}"
+
+
+@pytest.mark.parametrize("backend", sorted(ACP_BACKENDS_KNOWN))
+def test_merge_card_kept_prompt_rule_is_kiro_only(backend: str) -> None:
+    """H5: only the Kiro "kept the prompt" contract consumes an unlanded merge card.
+
+    The turn below left before landing after a real ``end_turn``: on kiro-cli
+    and on KAS (the default, which also runs the Kiro CLI pick) the live
+    session kept the prompt, so its card is consumed. No other harness has been
+    checked against that contract, so its card stays queued and a wrong guess
+    sends it twice instead of losing it.
+    """
+    from types import SimpleNamespace
+
+    from kiro_crew.dashboard.chat_runner import STOP_REASON_END_TURN
+    from kiro_crew.dashboard.chat_turn.turn_stats import _merge_cards_reached_the_model
+
+    turn = SimpleNamespace(
+        client=providers_acp.AcpProvider(acp_backend=backend),
+        _turn_lands=False,
+        _empty_verdict_left_prompt_unanswered=False,
+        _compaction_completed=False,
+        _had_empty_response_verdict=False,
+        _recovering_compaction=False,
+        _stop_reason=STOP_REASON_END_TURN,
+        _terminal_synthetic=False,
+        _turn_emitted=True,
+        needs_conversation_discard=False,
+        needs_session_reset=False,
+    )
+    assert _merge_cards_reached_the_model(turn) is (backend in ACP_BACKENDS_KIRO_FAMILY)

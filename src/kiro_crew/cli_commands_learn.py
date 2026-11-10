@@ -91,28 +91,78 @@ def _learn(args: argparse.Namespace) -> None:
     jsonl_store = LessonStore()
     cfg = KiroCrewConfig.load()
     action = getattr(args, "learn_action", None)
+    # A blank argument (an unset "$VAR") is refused before the vector store is
+    # opened and before any lesson is read or written, with the same words as
+    # POST/DELETE /api/lessons. Every rule contains the empty string, so a blank
+    # `remove` selector would delete every lesson, and a blank `add` would save
+    # a lesson with no rule.
+    if action == "add" and not str(args.rule).strip():
+        print("rule is required", file=sys.stderr)
+        sys.exit(2)
+    if action == "remove" and not str(args.query).strip():
+        print("rule substring required", file=sys.stderr)
+        sys.exit(2)
+    # Validate add's fields through the same LEARN_ADD_SCHEMA that POST
+    # /api/lessons and the learn_add MCP tool run, so the three surfaces share
+    # one rule/negative cap (MAX_SHORT_STRING) and one refusal message. Checked
+    # before the vector store is opened so a rejected write creates nothing;
+    # scoped to add because only add carries a rule. The refusal goes to stderr
+    # with a non-zero exit, like the blank-argument refusal above, so a script
+    # driving this command sees the failure.
+    #
+    # The cleaned dict is kept and used for the write below: validate_tool_args
+    # runs sanitize_string and caps the SANITIZED length, so the stored rule has
+    # to be that cleaned value too -- otherwise a rule whose cleaned form fits
+    # (e.g. one that collapses under NFC) passes the check but is stored raw,
+    # over the cap, which is the one place the CLI could still diverge from the
+    # length and text POST /api/lessons persists.
+    cleaned_add: dict[str, str] = {}
+    if action == "add":
+        from kiro_crew.validation import (
+            LEARN_ADD_SCHEMA,
+            ValidationError,
+            validate_tool_args,
+        )
+
+        _to_check = {"rule": args.rule, "category": args.category}
+        _negative = getattr(args, "negative", None)
+        if _negative is not None:
+            _to_check["negative"] = _negative
+        try:
+            cleaned_add = validate_tool_args(_to_check, LEARN_ADD_SCHEMA)
+        except ValidationError as exc:
+            print(str(exc), file=sys.stderr)
+            sys.exit(2)
     # Global persistence switch (memory.persistence_enabled): the CLI writes to
     # the store directly (no HTTP), so it carries its own check mirroring the
     # POST /api/lessons refusal. Refused ahead of the vector store because
     # constructing and init-ing it creates or migrates memory.db, which a
     # refused write must not do; list and remove still need that store, so the
     # check is scoped to the add action. memory.writes_enabled is refused the
-    # same way.
+    # same way. Nothing was saved, so it goes to stderr with a non-zero exit,
+    # like the store's own refusal below: a script driving this command sees
+    # the failure instead of a success.
     writes_off = memory_writes_off_key(cfg.memory)
     if action == "add" and writes_off is not None:
         print(
             "Lesson NOT saved: persistent memory writes are disabled "
             f"({writes_off} is false). Re-enable with: "
-            f"kirocrew config set {writes_off} true"
+            f"kirocrew config set {writes_off} true",
+            file=sys.stderr,
         )
-        return
+        sys.exit(1)
     vs = VectorMemoryStore(embedding_dim=cfg.memory.embedding_dim, config=cfg)
     vs.init()
     try:
         if action == "add":
-            rule = args.rule
+            # The sanitized values the schema validated and capped, not the raw
+            # args: the store must hold the same cleaned text POST /api/lessons
+            # persists, so a rule whose cleaned form fits is not saved over the
+            # cap in its raw form. ``negative`` is in the cleaned dict only when
+            # it was given; absent leaves it None.
+            rule = cleaned_add["rule"]
             category = args.category
-            negative = getattr(args, "negative", None)
+            negative = cleaned_add.get("negative")
             # The reporting form, not the bool. Most falsy returns mean the lesson
             # is already stored exactly as submitted, so reading one as "the vector
             # store did not take it" and writing a second record into lessons.jsonl

@@ -1,22 +1,21 @@
-"""Warm session pool for workflow ``ctx.agent()`` calls — kills per-call cold-start.
+"""Warm session pool for workflow ``ctx.agent()`` calls.
 
-Background: the default ``agent_fn`` (``agent_exec.build_agent_fn``) gives every
-``ctx.agent()`` call its own fresh ``SessionManager`` session keyed
-``wf:{run_id}:{i}`` and tears it down (``release(cleanup=True)``) afterwards. Each
-call therefore pays a FULL cold start — subprocess spawn + ACP ``initialize`` +
-``session/new`` (the MCP-toolset + system-prompt load, the dominant cost per
-cold-start profiling). An 8-agent run = 8 cold starts.
+The cold path (``agent_exec.build_agent_fn``) gives every call a fresh session
+keyed ``wf:{run_id}:{i}``, so each pays a full cold start: subprocess spawn, ACP
+``initialize`` and ``session/new`` (the MCP-toolset + system-prompt load, the
+dominant cost).
 
-This module reuses the generic, already-tested :class:`kiro_crew.acp.worker_pool.WorkerPool`
-engine to keep a small set of WARM workflow sessions alive and reuse them across
-calls. Semantics that make this correct:
+This module uses :class:`kiro_crew.acp.worker_pool.WorkerPool` to keep a small set
+of WARM workflow sessions alive and reuse them across calls:
 
   * **Isolation preserved** — the engine hands each *concurrent* task a DISTINCT
     worker (its own live session), so parallel ``ctx.agent()`` calls never share
-    conversational state, exactly like the per-call-session model they replace.
+    conversational state.
   * **Warm reuse** — a *sequential* task reuses an idle worker after a cheap
     clean-slate reset (``provider.new_conversation()`` — fresh ``session/new`` on
-    the same live process, skipping spawn + ``initialize``). No cold start.
+    the same live process, skipping spawn + ``initialize``). No cold start on a
+    backend on the shared runtime or in ``ACP_BACKENDS_CLIENT_NEW_CONVERSATION``
+    (claude); any other backend on its own ``AcpClient`` is reset by kill and respawn.
   * **Self-healing** — a worker whose process died is retired and replaced.
   * **Bounded** — at most ``max_workers`` live sessions; startup throttled to
     ``max_starting`` concurrent spawns (matches the workflow concurrency cap).
@@ -33,9 +32,12 @@ from __future__ import annotations
 import asyncio
 import itertools
 import logging
+import time
 from typing import Any, Callable, Optional
 
 from kiro_crew.acp.worker_pool import WorkerPool
+from kiro_crew.agent_sdk.mcp_problems import UNATTENDED_MCP_WAIT_SECS, wait_for_declared_mcp
+from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.llm_helpers import ToolApprovalPolicy, stream_and_collect
 from kiro_crew.messaging.identity import publish_turn_identity
 from kiro_crew.security import redact
@@ -49,14 +51,17 @@ from kiro_crew.taskq.dependency import DEFAULT_MAX_ATTEMPTS as DEPENDENCY_MAX_AT
 from kiro_crew.taskq.dependency import classify_exception
 from kiro_crew.taskq.model import KIND_WORKFLOW_AGENT, SIDE_EFFECT_UNKNOWN
 
-# Per-step tool-call ceiling — shared with the per-call path (agent_exec) so a
-# single edit retunes both; a hand-duplicated copy here would silently diverge the
-# pooled vs fallback ceilings. ``test_workflows_agent_pool.py`` pins them equal.
+# Per-step tool-call ceiling is imported from agent_exec so the pooled and cold
+# paths cannot diverge; ``test_workflows_agent_pool.py`` pins them equal.
 from kiro_crew.workflows.agent_exec import (
     _MAX_TURNS_PER_STEP,
+    StepStopWatch,
     WorkflowEffortInvalid,
     WorkflowSpawnRefused,
+    persist_step_usage_row,
+    step_backend_kwargs,
     step_effort_kwargs,
+    step_session_name,
     vet_step_spawn,
 )
 
@@ -80,7 +85,13 @@ def _log_unpooled_teardown_failure(action: str, exc: BaseException) -> None:
     )
 
 
-async def _run_step(provider: Any, prompt: str, *, timeout: Optional[float] = None) -> str:
+async def _run_step(
+    provider: Any,
+    prompt: str,
+    *,
+    timeout: Optional[float] = None,
+    stop: Optional[StepStopWatch] = None,
+) -> str:
     """Stream one workflow agent step through ``provider`` and redact its output.
 
     Single source of truth for the per-step contract shared by the pooled worker
@@ -91,14 +102,22 @@ async def _run_step(provider: Any, prompt: str, *, timeout: Optional[float] = No
     and canonical output redaction (parity with ``agent_exec`` — prevents
     credential or exfiltration-URL leakage into workflow results stored in
     history / injected into parent chat).
+
+    A caller that writes the turn's usage row passes its own ``stop`` and calls
+    ``stop.raise_if_interrupted()`` after that write, so a turn cut off from outside
+    is still billed; without one, a cut-off turn raises here.
     """
+    watch = stop if stop is not None else StepStopWatch()
     coro = stream_and_collect(
         provider,
         prompt,
         approval_policy=ToolApprovalPolicy.AUTO_APPROVE,
         max_turns=_MAX_TURNS_PER_STEP,
+        on_complete=watch.on_complete,
     )
     text = await (asyncio.wait_for(coro, timeout) if timeout is not None else coro)
+    if stop is None:
+        watch.raise_if_interrupted()
     return redact(text)
 
 
@@ -142,6 +161,9 @@ class _WorkflowSessionWorker:
         """Cold-start THIS worker's session once (the only cold start it pays)."""
         if self._memory_scope is not None:
             await self._memory_scope.prepare(self._context_builder, self._key)
+        # Read before the session is acquired: a start cancelled in an await after
+        # the acquisition would leave the session held with no worker to release it.
+        delete_delay = await self._configured_delete_delay()
         provider, self._is_new, self._resumed = await self._sessions.get_or_create(
             self._key,
             agent=self._agent,
@@ -151,6 +173,26 @@ class _WorkflowSessionWorker:
             **self._effort_kwargs,
         )
         self._provider = provider
+        provider.set_delete_delay(delete_delay)
+
+    async def _configured_delete_delay(self) -> int:
+        """``session.kas_delete_delay_secs``, for the conversation the next reset ends.
+
+        Each reuse ends the previous step's conversation (``reset`` below). Where the
+        host can keep the record, it waits this long before Crew deletes it, so a
+        finished step can still be read. Read again before each reuse rather than
+        once at start, so a changed setting applies to the next conversation a
+        reuse ends.
+        """
+
+        def _configured() -> int:
+            try:
+                return KiroCrewConfig.load().session.kas_delete_delay_secs
+            except Exception:
+                # An unreadable config ends the conversation as before.
+                return 0
+
+        return await asyncio.to_thread(_configured)
 
     async def send_message(self, prompt: str, timeout: float = 1800.0) -> str:
         if self._provider is None:
@@ -164,6 +206,10 @@ class _WorkflowSessionWorker:
         # process (new pid). One shared writer lives in messaging.identity; it
         # is fail-safe by contract, so it can never break the turn.
         await publish_turn_identity(self._sessions, self._key)
+        if self._is_new:
+            # A cold start or a reset's fresh conversation: the first prompt waits
+            # (bounded) for the agent spec's MCP servers, as the cold path does.
+            await wait_for_declared_mcp(self._provider, UNATTENDED_MCP_WAIT_SECS)
         # Honor the pool's per-task timeout: a wedged turn is terminated here
         # instead of holding a _task_sema permit until the run-level ceiling.
         if self._memory_scope is not None:
@@ -177,7 +223,21 @@ class _WorkflowSessionWorker:
                 agent=self._agent,
                 cwd=self._cwd,
             )
-        result = await _run_step(self._provider, prompt, timeout=timeout)
+        # Wall clock for THIS turn only (acp leaves TurnUsage.duration_ms at 0),
+        # started right before the turn so session reuse is not charged to it.
+        _turn_t0 = time.monotonic()
+        stop = StepStopWatch()
+        result = await _run_step(self._provider, prompt, timeout=timeout, stop=stop)
+        # Per-turn usage row on the warm pool's REAL key (wf-pool:…), through the
+        # same shared writer the cold path uses — surface/trigger "workflow".
+        await persist_step_usage_row(
+            slot_key=self._key,
+            model=self._model or "",
+            provider=self._provider,
+            agent=self._agent or "",
+            elapsed_ms=int((time.monotonic() - _turn_t0) * 1000),
+        )
+        stop.raise_if_interrupted()
         if self._memory_scope is not None:
             await self._memory_scope.validate()
         self._is_new = False
@@ -187,34 +247,36 @@ class _WorkflowSessionWorker:
     async def reset(self) -> None:
         """Cheap clean slate before REUSE — fresh conversation on the warm process.
 
-        Uses ``provider.new_conversation()`` when the backend exposes it (kiro +
-        claude ACP both do), which skips the expensive spawn+initialize. If it is
-        unavailable or fails, fall back to a hard ``SessionManager.reset`` so a
+        Uses ``provider.new_conversation()``, which skips the expensive
+        spawn+initialize on a backend served through the shared runtime (kiro, KAS,
+        Codex) and on claude's own ``AcpClient``. Any other backend on its own
+        ``AcpClient`` has no such reset and raises ``NotImplementedError``. On that, or
+        any other failure, fall back to a hard ``SessionManager.reset`` so a
         reused worker can NEVER carry prior-task context into the next task
-        (correctness over speed on the fallback path)."""
+        (correctness over speed on the fallback path).
+
+        The Kiro account check runs first. The worker holds its session's lease
+        from ``start()`` to ``shutdown()``, so it never acquires again and a sweep
+        only flags that session. A session the check flagged (``is_retiring``)
+        takes the hard reset, whose re-acquire starts one on the current account."""
         if self._memory_scope is not None:
             await self._memory_scope.prepare(self._context_builder, self._key)
+        delete_delay = await self._configured_delete_delay()
         # Lifecycle only; EssentialDelivery owns successful delivery evidence.
         self._is_new = True
         self._resumed = False
+        await self._sessions.run_identity_check()
         prov = self._provider
+        if prov is not None:
+            prov.set_delete_delay(delete_delay)
         new_conv = getattr(prov, "new_conversation", None) if prov is not None else None
-        if new_conv is not None:
-            # BEFORE ``new_conv()``, not after. The cheap path replaces the CONVERSATION and
-            # keeps the process, so the previous conversation's sub-agent runs still have to
-            # end -- the process surviving does not give them anywhere to report, and
-            # without this they inject into whatever this warm worker is handed next.
-            #
-            # The ordering is the whole point. ``new_conv()`` swaps the provider's
-            # conversation handle, and a child that finishes during that await lands in the
-            # handle that exists when it reports. Arming the suppression afterwards leaves a
-            # window in which the previous task's result is delivered into the NEXT task's
-            # conversation -- the exact confusion this verb exists to prevent, and worse
-            # than no teardown because it is silent.
-            #
-            # Outside the try below, so a failure here is not read as ``new_conversation``
-            # having failed: that would send a healthy warm worker down a hard reset it does
-            # not need.
+        if new_conv is not None and not self._sessions.is_retiring(self._key):
+            # End the previous conversation's sub-agent runs BEFORE ``new_conv()``: the
+            # cheap path keeps the process, and a child that finishes during the swap
+            # lands in whichever conversation handle exists when it reports, so ending
+            # them afterwards would silently deliver the old task's result into the
+            # next one. Outside the try below, so a failure here does not send a
+            # healthy warm worker down a hard reset.
             try:
                 await self._sessions.end_children_for(self._key)
             except Exception:
@@ -227,6 +289,8 @@ class _WorkflowSessionWorker:
                 await new_conv()
                 await self._reapply_effort()
                 return
+            except NotImplementedError as exc:
+                logger.info("workflow pool: %s cold-starts for reuse: %s", self._key, exc)
             except Exception:
                 logger.debug(
                     "workflow pool: new_conversation reset failed for %s, "
@@ -247,10 +311,10 @@ class _WorkflowSessionWorker:
     async def _reapply_effort(self) -> None:
         """Push this worker's effort onto the fresh conversation a cheap reset made.
 
-        ``new_conversation`` re-applies the model but not the effort, and a harness
-        that takes effort as a per-session config option (KAS, Codex) pushes it only
-        at cold start, so without this every reuse after the first would run at the
-        backend default. ``change_effort`` answering False means the model takes no
+        ``new_conversation`` re-applies the model but, except on claude, not the
+        effort, and a harness that takes effort as a per-session config option (KAS,
+        Codex) pushes it only at cold start, so without this every reuse after the
+        first would run at the backend default. ``change_effort`` answering False means the model takes no
         effort, which a cold start drops the same way; a raise sends the caller down
         the hard reset, which cold-starts with the override.
         """
@@ -328,8 +392,9 @@ def build_pooled_agent_fn(
     distinct ``(agent, model, cwd, effort)`` identity gets its OWN warm sub-pool (so a
     multi-specialist fan-out still gets warm reuse per specialist, and a worker
     built for one identity never serves a call that asked for another). Calls
-    with no override share the default sub-pool. ``pool.shutdown()`` tears down
-    every sub-pool.
+    with no override share the default sub-pool. A ``backend=`` call skips the pool
+    and runs on a one-shot session of its own. ``pool.shutdown()`` tears down every
+    sub-pool.
     """
     worker_ids = itertools.count()
 
@@ -382,14 +447,10 @@ def build_pooled_agent_fn(
         sp = subpools.get(key)
         if sp is not None:
             return sp
-        # Aggregate bound: each identity sub-pool holds up to ``max_workers``
-        # live kiro-cli processes, so an unbounded number of distinct identities
-        # (a run can make up to 1000 calls, each with a unique model string)
-        # would blow past the run-wide worker cap and exhaust memory / fds.
-        # Once ``max_identities`` distinct sub-pools exist, a new identity gets
-        # NO pool (returns None) and the caller runs it on the unpooled
-        # create-run-destroy path — so total live workers stay bounded at
-        # ``(max_identities + 1) * max_workers``.
+        # Aggregate bound: each sub-pool holds up to ``max_workers`` live kiro-cli
+        # processes and a run can make up to 1000 calls with distinct identities.
+        # Past ``max_identities`` sub-pools a new identity gets NO pool and runs
+        # unpooled, so live workers stay at most ``(max_identities + 1) * max_workers``.
         if len(subpools) >= max(1, max_identities):
             return None
         sp = _make_pool(*key)
@@ -398,8 +459,8 @@ def build_pooled_agent_fn(
 
     _unpooled = itertools.count()
 
-    async def _run_unpooled(prompt: str, opts: dict) -> Any:
-        named = opts.get("session")
+    async def _run_unpooled(prompt: str, opts: dict, backend_kwargs: dict) -> Any:
+        named = step_session_name(opts)
         key = named if named is not None else f"wf-unpooled:{run_id}:{next(_unpooled)}"
         if memory_scope is not None:
             if named is not None:
@@ -412,6 +473,7 @@ def build_pooled_agent_fn(
             cwd=opts.get("cwd") or cwd,
             extra_env=extra_env,
             **step_effort_kwargs(opts),
+            **backend_kwargs,
         )
         try:
             # Same identity publication as the pooled worker (see
@@ -419,6 +481,8 @@ def build_pooled_agent_fn(
             # and the identity-cap overflow session both run on their own
             # kiro-cli process with no ambient session key.
             await publish_turn_identity(sessions, key)
+            if is_new:
+                await wait_for_declared_mcp(provider, UNATTENDED_MCP_WAIT_SECS)
             if memory_scope is not None:
                 prompt = await memory_scope.prompt(
                     context_builder,
@@ -430,7 +494,21 @@ def build_pooled_agent_fn(
                     agent=opts.get("agent") or default_agent,
                     cwd=opts.get("cwd") or cwd,
                 )
-            result = await _run_step(provider, prompt)
+            # Wall clock for this turn only (acp leaves TurnUsage.duration_ms at 0).
+            _turn_t0 = time.monotonic()
+            stop = StepStopWatch()
+            result = await _run_step(provider, prompt, stop=stop)
+            # Per-turn usage row on this overflow session's REAL key
+            # (wf-unpooled:… or the named session= key), through the same shared
+            # writer the cold and pooled paths use — surface/trigger "workflow".
+            await persist_step_usage_row(
+                slot_key=key,
+                model=opts.get("model") or default_model or "",
+                provider=provider,
+                agent=opts.get("agent") or default_agent or "",
+                elapsed_ms=int((time.monotonic() - _turn_t0) * 1000),
+            )
+            stop.raise_if_interrupted()
             if memory_scope is not None:
                 await memory_scope.validate()
             return result
@@ -463,6 +541,7 @@ def build_pooled_agent_fn(
         # The same gates the cold path runs, at the single entry: the pooled
         # leg and the unpooled leg both allocate a child session.
         step_effort_kwargs(opts)
+        backend_kwargs = step_backend_kwargs(opts)
         step_cwd = await vet_step_spawn(
             session_key=session_key,
             agent=opts.get("agent") or default_agent,
@@ -473,13 +552,14 @@ def build_pooled_agent_fn(
             # Launch in the RESOLVED directory and key the warm sub-pool on it, so
             # a worker is never built for an unresolved spelling of a path.
             opts = {**opts, "cwd": step_cwd}
-        if opts.get("session") is not None:
-            return await _run_unpooled(prompt, opts)
+        # Warm workers run the default harness.
+        if opts.get("session") is not None or backend_kwargs:
+            return await _run_unpooled(prompt, opts, backend_kwargs)
         target = _pool_for(
             opts.get("agent"), opts.get("model"), opts.get("cwd"), opts.get("effort")
         )
         if target is None:
-            return await _run_unpooled(prompt, opts)
+            return await _run_unpooled(prompt, opts, backend_kwargs)
         return await target.send(prompt)
 
     pool = _AggregatePool(default_pool, subpools)
@@ -558,7 +638,15 @@ def admitted_agent_fn(
             lane=lane,
             session_key=session_key,
         )
-        if not await handle.running_async({"call": n, "prompt_chars": len(prompt)}):
+        try:
+            marked = await handle.running_async({"call": n, "prompt_chars": len(prompt)})
+        except asyncio.CancelledError:
+            # Synchronous, like the call's own cancel arm below, which is not
+            # reached yet: the handle already holds the lane slot and the row's
+            # lease, and nothing else would give them back.
+            handle.cancel("workflow run cancelled")
+            raise
+        if not marked:
             # PERSIST BEFORE PUBLISH: ``admit`` committed ``starting`` under this
             # generation one statement ago, so a refused ``starting -> running``
             # is a newer owner or a store outage, never a forbidden edge. The

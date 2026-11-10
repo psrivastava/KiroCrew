@@ -8,6 +8,8 @@
 import { useSyncExternalStore } from 'react'
 import { safeGetSessionItem, safeSetSessionItem } from '../../../utils/safeStorage'
 import { createSlotDraftStore } from '../../../utils/slotDraftStore'
+import { i18nT } from '../../../i18n/t'
+import type { RemoteCrewCapabilities } from '../../../types'
 
 export interface CrewWindowTarget {
   instanceId: string
@@ -136,30 +138,6 @@ export function subscribeCrewDraft(target: CrewWindowTarget, onChange: (text: st
   return () => { draftListeners.delete(l) }
 }
 
-/** Make everything the window covers `inert`, so Tab/Enter or a scripted
- *  `.focus()` cannot reach the hidden local composer (an approval behind the
- *  window must not be approvable unseen). Siblings mounted later are covered
- *  too; only the `inert` this call added is removed on cleanup. */
-export function coverSiblings(cover: Element): () => void {
-  const pane = cover.parentElement
-  if (!pane) return () => {}
-  const mine = new Set<Element>()
-  const apply = () => {
-    for (const el of Array.from(pane.children)) {
-      if (el === cover || el.hasAttribute('inert')) continue
-      el.setAttribute('inert', '')
-      mine.add(el)
-    }
-  }
-  apply()
-  const mo = new MutationObserver(apply)
-  mo.observe(pane, { childList: true })
-  return () => {
-    mo.disconnect()
-    mine.forEach(el => el.removeAttribute('inert'))
-  }
-}
-
 /** Test seam: re-read storage, as a page reload would. */
 export function reloadCrewWindowForTest() {
   current = read()
@@ -175,4 +153,16 @@ const TRANSIENT_CAPS = new Set(['capability_unreachable', 'capability_peer_reval
 export function capsRetryInterval(caps: { version_match?: boolean; unavailable?: Record<string, string> } | undefined, retryMs: number): number | false {
   if (caps?.version_match !== true) return retryMs
   return Object.values(caps.unavailable ?? {}).some(c => TRANSIENT_CAPS.has(c)) ? retryMs : false
+}
+
+/** The notice for a crew whose version does not match this machine's: why the
+ *  version is unknown when it could not be read, and which side is newer when
+ *  the gateway could order the two. */
+export function crewVersionMismatchText(caps: Pick<RemoteCrewCapabilities, 'version' | 'local_version' | 'behind' | 'ahead' | 'unavailable'>): string {
+  const local = caps.local_version
+  if (!caps.version) return i18nT('pages.chat.crewWindow.version_unknown', { local, code: caps.unavailable?.version ?? '' })
+  const vars = { peer: caps.version, local }
+  if (caps.behind) return i18nT('pages.chat.crewWindow.version_mismatch_older', vars)
+  if (caps.ahead) return i18nT('pages.chat.crewWindow.version_mismatch_newer', vars)
+  return i18nT('pages.chat.crewWindow.version_mismatch', vars)
 }

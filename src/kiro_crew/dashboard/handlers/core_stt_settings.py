@@ -20,6 +20,7 @@ import shutil
 from aiohttp import web
 
 from kiro_crew import platform_compat, stt
+from kiro_crew.config.fields import _coerce_bool
 from kiro_crew.config.loader import _VALID_STT_PROVIDERS, KiroCrewConfig, config_path
 from kiro_crew.config.sections import (
     STT_LANGUAGE_AUTO,
@@ -258,7 +259,10 @@ async def api_stt_config(request: web.Request) -> web.Response:
                 stt_section = {}
                 fresh["stt"] = stt_section
             if "enabled" in body:
-                stt_section["enabled"] = bool(body["enabled"])
+                # A spelled "false"/"0"/"no"/"off" means False; any other
+                # value keeps the truthiness it has always been saved with.
+                raw_enabled = body["enabled"]
+                stt_section["enabled"] = _coerce_bool(raw_enabled, bool(raw_enabled))
             # Guard the type before either membership lookup.  The model catalog
             # is a dict, so a JSON object or array would otherwise raise
             # ``TypeError: unhashable type`` and turn this partial update into a
@@ -330,6 +334,8 @@ async def api_stt_config(request: web.Request) -> web.Response:
                 stt_section["endpointing"] = body["endpointing"]
             if "submit_on_release" in body and isinstance(body["submit_on_release"], bool):
                 stt_section["submit_on_release"] = body["submit_on_release"]
+            if "slide_to_send" in body and isinstance(body["slide_to_send"], bool):
+                stt_section["slide_to_send"] = body["slide_to_send"]
             # `polish` is the one CONSENT setting on this surface -- it sends the
             # finished transcript to a model -- so its round trip is load-bearing in a
             # way an ordinary toggle's is not. Omitting it here is what made the
@@ -471,6 +477,7 @@ async def api_stt_config(request: web.Request) -> web.Response:
             "streaming": cfg.stt.streaming,
             "endpointing": cfg.stt.endpointing,
             "submit_on_release": cfg.stt.submit_on_release,
+            "slide_to_send": cfg.stt.slide_to_send,
             "dictation_panel": cfg.stt.dictation_panel,
             "polish": cfg.stt.polish,
             "transcribe_region": cfg.stt.transcribe_region,
@@ -620,6 +627,15 @@ def _stt_prereq_commands(provider: str = "local") -> list[str]:
     elif provider == "transcribe":
         needs_extra = not _transcribe_extra_importable()
         extra = "voice-aws"
+    elif provider == "codex":
+        from kiro_crew.stt import codex
+
+        # Not `availability().code`: that reports a missing `codex` binary
+        # first, which would hide the extra until the binary is installed.
+        # A host whose sandbox refuses Codex gets no install command at all:
+        # no package makes Codex runnable there.
+        needs_extra = not codex.sandbox_refuses() and not codex.extra_importable()
+        extra = "voice-codex"
     else:
         needs_extra = False
     # Suppressed where no pip channel into this interpreter exists — frozen build,

@@ -37,6 +37,14 @@ name: Build Desktop (reusable)
 on:
   workflow_call:
     inputs:
+      edition:
+        description: >-
+          Edition to stamp into the build: oss (the default) or lts. Only
+          release-lts.yml passes lts; every other caller leaves it unset, so
+          their builds are oss exactly as before.
+        required: false
+        default: oss
+        type: string
       version:
         description: "Semver version to stamp (electron package.json + __init__.py)"
         required: true
@@ -100,6 +108,12 @@ on:
   # validate packaging changes (e.g. a new platform lane) before merge.
   workflow_dispatch:
     inputs:
+      edition:
+        description: "Edition to build: oss or lts (a build-only LTS probe; nothing publishes)"
+        required: false
+        default: oss
+        type: choice
+        options: [oss, lts]
       version:
         description: >-
           Semver version to stamp. Use a REALISTIC channel-shaped stamp
@@ -165,6 +179,9 @@ permissions:
 # packaging/build-desktop.sh): empty warns on a stale find_ui index, 1 fails.
 env:
   KC_UI_INDEX_STRICT: ${{ inputs.ui_index_strict && '1' || '' }}
+  # The edition stamp (setup.py build_py, packaging/build-desktop.sh). Empty for
+  # every caller but release-lts.yml, which both readers take as oss.
+  KIROCREW_BUILD_EDITION: ${{ inputs.edition == 'lts' && 'lts' || '' }}
 
 jobs:
   build-desktop:
@@ -516,7 +533,15 @@ jobs:
   smoke-linux-packages:
     name: Smoke-install Linux packages (deb + rpm)
     needs: build-desktop
-    runs-on: ubuntu-latest
+    # The `kirocrew-runners` group in THIS repository, rather than the standard
+    # pool whose concurrency is shared enterprise-wide. The install checks run
+    # in distro containers, so the runner's own image is not what they measure;
+    # `build-desktop` above keeps its pinned ubuntu-22.04 legs, which ARE a
+    # glibc-floor decision. Named by its runner LABEL, not by `group:`: the
+    # group belongs to the kirodotdev organization, so a fork running its own
+    # copy cannot reach it and would wait forever for a runner. The `||` leg
+    # keeps a fork on the hosted image.
+    runs-on: ${{ github.repository == 'kirodotdev/KiroCrew' && 'kirocrew-linux-4-core' || 'ubuntu-latest' }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

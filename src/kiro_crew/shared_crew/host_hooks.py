@@ -25,6 +25,7 @@ from kiro_crew.shared_crew import admission_gate as _gate
 from kiro_crew.shared_crew.admission import AcceptedWork, OperationKind, OperationState
 from kiro_crew.shared_crew.admission_entry import (
     CHAT_AUTHOR_PAYLOAD_KEY,
+    CHAT_CARD_ORIGIN_PAYLOAD_KEY,
     CHAT_PROMPT_PAYLOAD_KEY,
     CHAT_SEND_ID_PAYLOAD_KEY,
     QUEUED_WORK_META_KEY,
@@ -84,6 +85,7 @@ class _Note:
     prompt: str
     author: Mapping[str, Any] | None
     send_id: str = ""
+    card_origin: bool = False
 
 
 def _restored_event(state: Any) -> asyncio.Event:
@@ -133,6 +135,7 @@ def reconcile_note(state: Any) -> Callable[[AcceptedWork, "Mapping[str, Any] | N
         prompt = ""
         send_id = ""
         author: Mapping[str, Any] | None = None
+        card_origin = False
         if isinstance(payload, Mapping):
             raw = payload.get(CHAT_PROMPT_PAYLOAD_KEY)
             prompt = raw if isinstance(raw, str) else ""
@@ -140,6 +143,7 @@ def reconcile_note(state: Any) -> Callable[[AcceptedWork, "Mapping[str, Any] | N
             author = raw_author if isinstance(raw_author, Mapping) else None
             raw_id = payload.get(CHAT_SEND_ID_PAYLOAD_KEY)
             send_id = raw_id if isinstance(raw_id, str) else ""
+            card_origin = payload.get(CHAT_CARD_ORIGIN_PAYLOAD_KEY) is True
         owed = getattr(state, _OWED_ATTR, None)
         if not isinstance(owed, list):
             owed = []
@@ -147,7 +151,7 @@ def reconcile_note(state: Any) -> Callable[[AcceptedWork, "Mapping[str, Any] | N
         if len(owed) >= _OWED_MAX:
             logger.warning("shared crew: restart note for %s dropped (bound)", work.session_key)
             return
-        owed.append(_Note(work.session_key, text, prompt, author, send_id))
+        owed.append(_Note(work.session_key, text, prompt, author, send_id, card_origin))
         task = getattr(state, _DELIVERY_ATTR, None)
         if task is None or task.done():
             setattr(state, _DELIVERY_ATTR, asyncio.ensure_future(deliver_owed_notes(state)))
@@ -191,6 +195,14 @@ async def _deliver(state: Any, item: _Note) -> bool:
             meta[CHAT_SEND_ID_PAYLOAD_KEY] = item.send_id
         if item.author is not None:
             meta[MESSAGE_AUTHOR_META_KEY] = dict(item.author)
+        if item.card_origin:
+            # The accepted send was a Dashboard card's: stamp the marker back so
+            # ``latest_user_row_is_card`` sees it and a Continue on this recovered
+            # row stays untrusted, as the live path would have (lazy import: this
+            # module is on the gateway boot path, card_send pulls the dashboard in).
+            from kiro_crew.dashboard.card_send import CARD_ORIGIN_META_KEY
+
+            meta[CARD_ORIGIN_META_KEY] = True
         slot.append("user", item.prompt, _USER_CLS, meta=meta or None)
     slot.append("error", item.text, _ERROR_CLS)
     return True
@@ -213,14 +225,15 @@ def _holds_user_row(slot: Any, prompt: str, send_id: str = "") -> bool:
     return False
 
 
-async def ensure_slot_recorded(state: Any, slot: Any) -> bool:
+async def ensure_slot_recorded(state: Any, slot: Any, extra: dict | None = None) -> bool:
     """Write a never-saved session's metadata line before its work is accepted.
 
     Accepted work is durable at once while a new session's first save is
     deferred; writing the line first means a crash in between cannot leave a
     work record naming a session that is gone. A session that already has a
-    line is left as it is.
-    Off-loop write; True when the session has a line afterwards.
+    line is left as it is, so *extra* fields land only on a line this call writes;
+    with *extra* the disk is asked even for a key seen recorded, which a delete since
+    may have made new. Off-loop write; True when the session has a line afterwards.
     """
     log = getattr(state, "conversation_log", None)
     if log is None:
@@ -230,7 +243,7 @@ async def ensure_slot_recorded(state: Any, slot: Any) -> bool:
 
     try:
         history_key = slot_history_key(slot)
-        if history_key in _RECORDED:
+        if history_key in _RECORDED and not extra:
             return True
         line = {
             "_type": "metadata",
@@ -242,6 +255,7 @@ async def ensure_slot_recorded(state: Any, slot: Any) -> bool:
                     tab_id=getattr(slot, "_tab_id", None),
                 ),
             ),
+            **(extra or {}),
         }
         written = await drained_to_thread(
             log.update_metadata_if, history_key, line, lambda meta: not meta
@@ -288,6 +302,23 @@ def child_hooks(state: Any) -> tuple[Any, Any]:
     return probe, cancel
 
 
+def taskrunner_hook(state: Any) -> Callable[[str], Any]:
+    """The task runner's run probe, resolving ``state.task_runner`` per call.
+
+    Installed before reconciliation, so a task run held across a restart is
+    settled by its run's state. Until the runner exists it answers "still running".
+    """
+    from kiro_crew.shared_crew import admission_entry
+
+    def probe(task_id: str) -> Any:
+        runner = getattr(state, "task_runner", None)
+        if runner is None:
+            return None
+        return admission_entry.taskrunner_probe(runner)(task_id)
+
+    return probe
+
+
 def install(state: Any) -> None:
     """Install the gateway's hooks on every admission service it builds."""
     probe, cancel = child_hooks(state)
@@ -298,6 +329,7 @@ def install(state: Any) -> None:
             reconciled=reconcile_note(state),
             child_probe=probe,
             child_cancel=cancel,
+            run_probes={OperationKind.TASK: taskrunner_hook(state)},
         )
     )
 
@@ -317,5 +349,6 @@ __all__ = [
     "parked_probe",
     "reconcile_note",
     "shutdown_probe",
+    "taskrunner_hook",
     "uninstall",
 ]

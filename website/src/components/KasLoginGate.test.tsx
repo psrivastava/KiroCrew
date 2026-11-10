@@ -1,4 +1,4 @@
-import { fireEvent, screen, waitFor } from '@testing-library/react'
+import { fireEvent, screen, waitFor, within } from '@testing-library/react'
 import { renderWithProviders } from '../test/helpers'
 import KasLoginGate from './KasLoginGate'
 import { api } from '../api/client'
@@ -99,7 +99,7 @@ describe('KasLoginGate', () => {
     expect(await screen.findByTestId('kas-login-user-code')).toHaveTextContent('ABCD-EFGH')
     expect(kasLoginBeginDevice).toHaveBeenCalledWith('google', undefined)
     expect(
-      screen.getByRole('heading', { name: 'Finish signing in on your phone or another computer' }),
+      screen.getByRole('heading', { name: 'Finish signing in with your browser' }),
     ).toBeInTheDocument()
     // Step 1's link is rendered as a copyable block, verbatim.
     expect(
@@ -181,6 +181,33 @@ describe('KasLoginGate', () => {
     expect(await screen.findByRole('button', { name: 'Copied' })).toBeInTheDocument()
   })
 
+  it('renders the verification URL as a link that opens in a new tab', async () => {
+    renderWithProviders(<KasLoginGate />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Continue with Google' }))
+    const url = 'https://app.kiro.dev/account/device?user_code=ABCD-EFGH'
+    const link = await screen.findByRole('link', { name: url })
+    expect(link).toHaveAttribute('href', url)
+    expect(link).toHaveAttribute('target', '_blank')
+    expect(link).toHaveAttribute('rel', 'noopener noreferrer')
+    // Copying stays available for approving on another device.
+    expect(screen.getByRole('button', { name: 'Copy link' })).toBeInTheDocument()
+  })
+
+  it('shows a verification URL with a non-http scheme as text, never as a link', async () => {
+    kasLoginBeginDevice.mockResolvedValueOnce({
+      login_id: 'login-1',
+      user_code: 'ABCD-EFGH',
+      verification_uri_complete: 'javascript:alert(1)',
+      expires_at: '2099-01-01T00:00:00Z',
+    })
+    renderWithProviders(<KasLoginGate />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Continue with Google' }))
+    expect(await screen.findByText('javascript:alert(1)')).toBeInTheDocument()
+    expect(screen.queryByTestId('kas-login-verification-link')).not.toBeInTheDocument()
+  })
+
   it('renders its children when a token lands mid-wait', async () => {
     kasLoginStatus.mockResolvedValue({
       authenticated: true,
@@ -222,6 +249,22 @@ describe('KasLoginGate', () => {
     // Trimmed URL travels; the blank region field is omitted, not sent empty.
     expect(kasLoginBeginDevice).toHaveBeenCalledWith('idc', {
       start_url: 'https://acme.awsapps.com/start',
+    })
+  })
+
+  it('company SSO sends a start URL pasted without https:// for the gateway to complete', async () => {
+    renderWithProviders(<KasLoginGate />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Continue with company SSO' }))
+    await screen.findByTestId('kas-login-sso-form')
+    const field = screen.getByLabelText('Company sign-in URL') as HTMLInputElement
+    fireEvent.change(field, { target: { value: 'acme.awsapps.com/start' } })
+    // The browser's own URL check must not refuse the paste before the gateway
+    // can add the scheme.
+    expect(field.checkValidity()).toBe(true)
+    fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
+    expect(await screen.findByTestId('kas-login-user-code')).toHaveTextContent('ABCD-EFGH')
+    expect(kasLoginBeginDevice).toHaveBeenCalledWith('idc', {
+      start_url: 'acme.awsapps.com/start',
     })
   })
 
@@ -309,6 +352,44 @@ describe('KasLoginGate', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'Continue with company SSO' }))
     await screen.findByTestId('kas-login-sso-form')
     expect(screen.getByLabelText('Company sign-in URL')).toHaveValue('')
+  })
+
+  it.each([
+    [400, 'invalid_region', 'Check the AWS Region. A Region name looks like us-east-1.', ['AWS Region (optional)']],
+    [400, 'invalid_start_url', 'Check the company sign-in URL.', ['Company sign-in URL']],
+    [
+      400,
+      'start_url_or_region_rejected',
+      'Check the company sign-in URL and the AWS Region.',
+      ['Company sign-in URL', 'AWS Region (optional)'],
+    ],
+    [502, 'auth_service_unreachable', 'Check your connection', []],
+  ])('company SSO: a %i %s begin error names the field to fix, not the connection', async (status, code, headline, fields) => {
+    kasLoginBeginDevice.mockRejectedValueOnce(
+      new ApiError(status, 'gateway detail', JSON.stringify({ error: 'gateway detail', code })),
+    )
+    renderWithProviders(<KasLoginGate />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Continue with company SSO' }))
+    await screen.findByTestId('kas-login-sso-form')
+    fireEvent.change(screen.getByLabelText('Company sign-in URL'), {
+      target: { value: 'https://acme.awsapps.com/strat' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent(headline)
+    expect(alert).toHaveTextContent('gateway detail')
+    if (fields.length) expect(alert).not.toHaveTextContent('Check your connection')
+    // Only the named fields are invalid, and they point at the error that says why.
+    for (const label of ['Company sign-in URL', 'AWS Region (optional)']) {
+      const input = screen.getByLabelText(label)
+      if (fields.includes(label)) {
+        expect(input).toHaveAttribute('aria-invalid', 'true')
+        expect(input).toHaveAttribute('aria-describedby', alert.id)
+      } else {
+        expect(input).not.toHaveAttribute('aria-invalid')
+        expect(input).not.toHaveAttribute('aria-describedby')
+      }
+    }
   })
 
   // ---- loopback transport ---------------------------------------------------
@@ -459,6 +540,48 @@ describe('KasLoginGate', () => {
     ).toBeInTheDocument()
     expect(screen.getByText('Sign-in failed')).toBeInTheDocument()
     expect(kasLoginBeginDevice).not.toHaveBeenCalled()
+  })
+
+  async function companySsoPollAnswers(code: string) {
+    kasLoginPoll.mockResolvedValue({ status: 'error', code })
+    renderWithProviders(<KasLoginGate />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Continue with company SSO' }))
+    fireEvent.change(await screen.findByLabelText('Company sign-in URL'), {
+      target: { value: 'https://acme.awsapps.com/start' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
+  }
+
+  // A coded failure: one "Sign-in failed" headline, and the sentence announced
+  // once, inside the shared error notice.
+  async function expectCodedProblem(sentence: string) {
+    expect(await screen.findByRole('heading', { level: 1, name: 'Sign-in failed' })).toBeInTheDocument()
+    const notice = screen.getByTestId('kas-login-problem-detail')
+    expect(notice).toHaveAttribute('role', 'alert')
+    expect(within(notice).getByText(sentence)).toBeInTheDocument()
+    expect(screen.getAllByText('Sign-in failed')).toHaveLength(1)
+    expect(screen.getAllByText(sentence)).toHaveLength(1)
+  }
+
+  it('says plainly that an account with no Kiro profile cannot run chats', async () => {
+    await companySsoPollAnswers('no_kiro_profile')
+    await expectCodedProblem(
+      "This account has no Kiro profile, so it can't run chats. Sign in with an account that has a Kiro subscription.",
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Start over' }))
+    expect(
+      await screen.findByRole('button', { name: 'Continue with company SSO' }),
+    ).toBeInTheDocument()
+  })
+
+  it('a failed profile lookup offers Start over and never says there is no profile', async () => {
+    await companySsoPollAnswers('profile_lookup_failed')
+    await expectCodedProblem("We couldn't look up your Kiro profile. Start over to try again.")
+    expect(screen.queryByText(/no Kiro profile/)).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Start over' }))
+    expect(
+      await screen.findByRole('button', { name: 'Continue with company SSO' }),
+    ).toBeInTheDocument()
   })
 
   it('a dashboard not served from loopback uses the device flow even on a loopback shape', async () => {

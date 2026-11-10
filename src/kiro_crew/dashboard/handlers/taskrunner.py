@@ -166,6 +166,15 @@ async def _require_taskrunner_owner(request: web.Request, operation: str) -> web
     return await require_owner_dashboard_request(request, operation)
 
 
+async def _task_runner_disabled() -> web.Response | None:
+    """409 while Task Runner is off in Library: a run would have no page to watch or stop it."""
+    if not await asyncio.to_thread(app_disabled, TASK_RUNNER_APP):
+        return None
+    return web.json_response(
+        {"error": TASK_RUNNER_DISABLED_MESSAGE, "code": "app_disabled"}, status=409
+    )
+
+
 async def _gate_auto_approve(
     request: web.Request, requested: bool, claimed_source, endpoint: str
 ) -> bool:
@@ -417,6 +426,26 @@ async def _claim_plan_dir(work_dir: Path) -> tuple[str, Path]:
         raise cancelled
 
 
+class _RunNotLinked(Exception):
+    """The admitted record could not take the run's id, so the run must not start."""
+
+
+def _not_linked_response() -> web.Response:
+    from kiro_crew.shared_crew.admission_gate import Admission
+
+    return Admission(None, "rejected", store_unavailable=True).refusal_response()
+
+
+async def _link_existing_run(run_admission: Any, task_id: str) -> web.Response | None:
+    """Link a resumed run's id before the runner sets it running; a refusal if it cannot."""
+    from kiro_crew.shared_crew.admission_run_link import link_run
+
+    if await link_run(run_admission, task_id):
+        return None
+    await run_admission.abandon()
+    return _not_linked_response()
+
+
 async def api_taskrunner_start(request: web.Request) -> web.Response:
     """POST /api/taskrunner — start a task from a spec file path or inline content.
 
@@ -442,6 +471,10 @@ async def api_taskrunner_start(request: web.Request) -> web.Response:
     spec_path = body.get("spec", "")
     if not spec_path:
         return web.json_response({"error": "spec path required"}, status=400)
+    if not isinstance(spec_path, str):
+        return web.json_response(
+            {"error": "spec must be a string", "code": "invalid_field_type"}, status=400
+        )
 
     # Validate non-inline paths against traversal, then forward the *validated*
     # resolved path (not the raw input) to the sink below so the guard and the
@@ -460,17 +493,14 @@ async def api_taskrunner_start(request: web.Request) -> web.Response:
         spec_path = validated
 
     # Checked before the inline spec is written, so a refusal leaves nothing behind.
-    # Disabled in Library means no new runs: the run would have no page to
-    # watch or stop it from.
-    if await asyncio.to_thread(app_disabled, TASK_RUNNER_APP):
-        return web.json_response(
-            {"error": TASK_RUNNER_DISABLED_MESSAGE, "code": "app_disabled"}, status=409
-        )
+    if (disabled := await _task_runner_disabled()) is not None:
+        return disabled
 
     # Fair admission (Shared Crew): a background run starts now or is refused,
     # before the inline spec is written so a refusal leaves nothing behind.
     from kiro_crew.shared_crew.admission import OperationKind
     from kiro_crew.shared_crew.admission_entry import admit_background_run, taskrunner_probe
+    from kiro_crew.shared_crew.admission_run_link import link_run
     from kiro_crew.shared_crew.containment import principal_scope
 
     runner = state.task_runner
@@ -529,6 +559,11 @@ async def api_taskrunner_start(request: web.Request) -> web.Response:
         auto_approve = await _gate_auto_approve(
             request, body.get("auto_approve") is True, claimed_source, endpoint="start"
         )
+        # The runner persists the run before ``attach_child``, and resumes a run
+        # it finds running after a restart: the record names the id first.
+        run_id = "" if run_principal is None else str(runner.mint_task_id(spec_path))
+        if run_id and not await link_run(run_admission, run_id):
+            raise _RunNotLinked
         with principal_scope(run_principal):
             task_id = await state.task_runner.start_background(
                 spec_path,
@@ -540,6 +575,7 @@ async def api_taskrunner_start(request: web.Request) -> web.Response:
                 session_key=origin,
                 execution_context=execution,
                 **({"input_content": inline_content} if inline_content is not None else {}),
+                **({"task_id": run_id} if run_id else {}),
             )
     except BaseException as exc:
         await run_admission.abandon()
@@ -571,6 +607,8 @@ async def api_taskrunner_start(request: web.Request) -> web.Response:
                 )
         if not isinstance(exc, Exception):
             raise  # CancelledError and friends: propagate after cleanup.
+        if isinstance(exc, _RunNotLinked):
+            return _not_linked_response()
         if isinstance(exc, WorkflowInitializing):
             return web.json_response({"error": str(exc), "code": exc.code}, status=503)
         return web.json_response({"error": str(exc)}, status=400)
@@ -685,6 +723,16 @@ async def api_taskrunner_delete(request: web.Request) -> web.Response:
     return web.json_response({"ok": True})
 
 
+def parse_run_name(value: object) -> tuple[str | None, str | None]:
+    """Return ``(value.strip(), None)`` for a string run name, else ``(None, error)``.
+
+    The trimmed name may be empty; each caller keeps its own rule for that.
+    """
+    if not isinstance(value, str):
+        return None, "name must be a string"
+    return value.strip(), None
+
+
 async def api_taskrunner_rename(request: web.Request) -> web.Response:
     """PATCH /api/taskrunner/{task_id}/name — rename a task run."""
     owner_denied = await _require_taskrunner_owner(request, "taskrunner.rename")
@@ -701,7 +749,9 @@ async def api_taskrunner_rename(request: web.Request) -> web.Response:
     if data_err is not None:
         return data_err
     assert data is not None  # read_bounded_json returns (dict, None) on success
-    name = data.get("name", "").strip()
+    name, name_err = parse_run_name(data.get("name", ""))
+    if name is None:
+        return web.json_response({"error": name_err, "code": "invalid_name"}, status=400)
     if not name:
         return web.json_response({"error": "name required"}, status=400)
     run.name = name
@@ -785,6 +835,8 @@ async def api_taskrunner_retry(request: web.Request) -> web.Response:
     state: DashboardState = request.app["state"]
     if not state.task_runner:
         return web.json_response({"error": "task runner not available"}, status=400)
+    if (disabled := await _task_runner_disabled()) is not None:
+        return disabled
     task_id = _canonical_task_reference(state.task_runner, request.match_info["task_id"])
     body, body_err = await read_bounded_json(request, allow_absent=True)
     if body_err is not None:
@@ -803,11 +855,11 @@ async def api_taskrunner_retry(request: web.Request) -> web.Response:
     from kiro_crew.shared_crew.containment import principal_scope
 
     run_principal = None if run_admission.work is None else run_admission.work.budget_key
+    if (refused := await _link_existing_run(run_admission, str(task_id))) is not None:
+        return refused
     try:
         with principal_scope(run_principal):
-            await state.task_runner.retry_from_task(
-                task_id, from_step, agent=state.task_runner._agent or ""
-            )
+            await state.task_runner.retry_from_task(task_id, from_step)
     except WorkflowInitializing as exc:
         await run_admission.abandon()
         return web.json_response({"error": str(exc), "code": exc.code}, status=503)
@@ -1026,6 +1078,8 @@ async def api_taskrunner_plan(request: web.Request) -> web.Response:
                 {"error": "invalid spec path", "code": "invalid_spec_path"}, status=400
             )
         spec_path = validated
+    if (disabled := await _task_runner_disabled()) is not None:
+        return disabled
     try:
         plan_coro = state.task_runner.plan(
             input_text=input_text,
@@ -1163,6 +1217,8 @@ async def api_taskrunner_execute_plan(request: web.Request) -> web.Response:
     state: DashboardState = request.app["state"]
     if not state.task_runner:
         return web.json_response({"error": "task runner not available"}, status=400)
+    if (disabled := await _task_runner_disabled()) is not None:
+        return disabled
     task_id = request.match_info["task_id"]
     body, body_err = await read_bounded_json(request, allow_absent=True)
     if body_err is not None:
@@ -1196,6 +1252,10 @@ async def api_taskrunner_execute_plan(request: web.Request) -> web.Response:
     from kiro_crew.shared_crew.containment import principal_scope
 
     run_principal = None if run_admission.work is None else run_admission.work.budget_key
+    # The run's canonical id: the probe looks a run up by it, not by its name.
+    run_id = _canonical_task_reference(state.task_runner, task_id)
+    if (refused := await _link_existing_run(run_admission, run_id)) is not None:
+        return refused
     try:
         with principal_scope(run_principal):
             await state.task_runner.execute_plan(
@@ -1214,7 +1274,7 @@ async def api_taskrunner_execute_plan(request: web.Request) -> web.Response:
     except BaseException:
         await run_admission.abandon()
         raise
-    await run_admission.attach_child(str(task_id), session_key=f"taskrunner:{task_id}")
+    await run_admission.attach_child(run_id, session_key=f"taskrunner:{run_id}")
     return web.json_response({"ok": True, "task_id": task_id})
 
 
@@ -1242,6 +1302,8 @@ async def api_taskrunner_from_chat(request: web.Request) -> web.Response:
     task_id = body.get("task_id", "")
     if not steps or not isinstance(steps, list):
         return web.json_response({"error": "steps array required"}, status=400)
+    if (disabled := await _task_runner_disabled()) is not None:
+        return disabled
     try:
         # This path allocates its own placeholder before calling update_plan.
         state.task_runner._require_workflow_ready()
@@ -1459,9 +1521,16 @@ async def api_taskrunner_refine(request: web.Request) -> web.Response:
     if body_err is not None:
         return body_err
     assert body is not None  # read_bounded_json returns (dict, None) on success
-    user_input = body.get("input", "").strip()
+    from kiro_crew.dashboard.handlers._shared import string_field_error
+
+    user_input = body.get("input", "")
+    if (not_string := string_field_error("input", user_input)) is not None:
+        return not_string
+    user_input = user_input.strip()
     if not user_input:
         return web.json_response({"error": "input is required"}, status=400)
+    if (disabled := await _task_runner_disabled()) is not None:
+        return disabled
 
     # Cancel any existing refine
     if state._refine_task and not state._refine_task.done():
@@ -1516,7 +1585,12 @@ async def api_taskrunner_refine_answer(request: web.Request) -> web.Response:
     if body_err is not None:
         return body_err
     assert body is not None  # read_bounded_json returns (dict, None) on success
-    answer = body.get("answer", "").strip()
+    from kiro_crew.dashboard.handlers._shared import string_field_error
+
+    answer = body.get("answer", "")
+    if (not_string := string_field_error("answer", answer)) is not None:
+        return not_string
+    answer = answer.strip()
     if not answer:
         return web.json_response({"error": "answer required"}, status=400)
     future = getattr(state, "_refine_answer_future", None)

@@ -6,7 +6,7 @@
 > approach — so a reviewer can understand the delta at a glance, and so the fork
 > can be re-based on future upstream pulls without re-deriving intent.
 >
-> **Branch:** `main` · **Fork base:** upstream commit `bde5de12e` (synced 2026-10-30;
+> **Branch:** `main` · **Fork base:** upstream commit `73e3275d9` (synced 2026-11-09;
 > originally forked at `64f3b5811`). Every upstream sync is recorded in §9.
 
 ---
@@ -393,6 +393,47 @@ parity and logo-glyph tests, and record the entry below.
 - **Other fallout:** <behavior changes, renamed APIs, new specs to read>.
 - **Verified:** <tests/builds run and results>. **Not run:** <what and why>.
 ```
+
+### 2026-11-09 — `73e3275d9` (branch `sync/upstream-2026-11-09`)
+- **Range:** `bde5de12e..73e3275d9`, 4309 upstream commits; CCrew side had 2
+  commits since the previous sync (`e5fc90e5e` managed-mode auto-update, and
+  local `.gitignore` / `CLAUDE.md` entries).
+- **Conflicts:** 4 files, no relocations:
+  - `agent_sdk/backends.py`: kept the `ACP_BACKENDS_SKIP_CREW_SEATBELT_MACOS`
+    re-export beside upstream's new `CODEX_CLI_*` re-exports.
+  - `website/electron/main.js`: upstream added an LTS edition with its own
+    app name and Windows app ID. `ccrewAppName()` and `com.ccrew.app` still
+    win under the CCrew identity; LTS applies only to upstream builds.
+  - `website/src/pages/ChatSidebar.tsx`: both imports kept
+    (`ClaudeCliSessions`, `askAppConfirm`).
+  - `website/electron/test/auto-update.managed.test.js`: both sides appended
+    tests at the end; kept CCrew's three managed-mode tests and upstream's
+    `relaunchPath` / session-end tests.
+- **Other fallout:** `packaging/build-desktop.sh` reached 2021 lines, past
+  the 2000-line cap; the CCrew blocks were folded into one-line `if`s to land
+  at exactly 2000 (no baseline row). `auto-update.js` merged cleanly with the
+  `isCCrewBuild()` guard intact; `package.json` still has no
+  `build.protocols`. Every CCrew-added line from the previous base was
+  checked against the merged tree (74 files); only the `main.js` lines
+  rewritten above differ.
+- **Verified:** black, isort, flake8, comment-history, brand and line-cap
+  gates clean; `mypy --platform linux --python-version 3.12` clean (4406
+  files; the local 3.14 venv adds one `PidfdChildWatcher` error that is
+  environmental). Harness parity 101 passed; managed auto-update 69/69.
+  Backend: only the 6 `test_harness.py` cases that need `ps` fail (the agent
+  sandbox blocks it; file is byte-identical to upstream). Frontend `npm ci`,
+  `tsc -b` and build clean; suite 67373 passed, 18 failed, none from the
+  merge: 10 `ChatPage.reasoningEffort` (BackendChip `useNavigate()` outside a
+  Router, fails on fork main) and 8 upstream ratchets tripping on CCrew's
+  `ClaudeCliSessions` / nav avatar (api-key order, i18n key reference,
+  render scan x2, context sidecar, switchSlot classification, narrow-first
+  avatar, and the new `statusTextContrast` danger tint). The first 7 fail
+  identically on `ad1d3cbaf`; follow-up is to bring `ClaudeCliSessions` up
+  to those ratchets. Electron: the 3 known upstream failures plus 2 new
+  upstream `packaging.test.js` cases that pin `productName` `KiroCrew` and
+  the LTS `nsis.guid` from `build.appId`; both fail by design under the
+  CCrew identity (`CCrew`, `com.ccrew.app`).
+- **Not run:** full CI suite, a live Claude turn.
 
 ### 2026-10-30 — `bde5de12e` (branch `sync/upstream-2026-10-30`)
 - **Range:** `150605b8e..bde5de12e`, 3397 upstream commits; no new CCrew commits

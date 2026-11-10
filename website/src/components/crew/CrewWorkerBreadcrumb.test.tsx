@@ -1,13 +1,14 @@
 /**
  * The worker breadcrumb on a phone: the root's name keeps a readable minimum and
- * a tooltip, the worker's name stays, the status is a dot with its word for
- * readers, and Back keeps its 44x44 target. jsdom has no layout, so the rules are
+ * a tooltip, the worker's name stays, and the status is a dot with its word for
+ * readers. The root and sub-conductor crumbs are links; the current member is text. jsdom has no layout, so the rules are
  * pinned on the classes that carry them; the pod check measures the pixels.
  */
 import { afterEach, describe, it, expect, vi } from 'vitest'
-import { act, render, screen } from '@testing-library/react'
+import { act, fireEvent, render, screen } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { Provider } from 'react-redux'
+import { MemoryRouter } from 'react-router-dom'
 import { createTestStore } from '../../test/helpers'
 
 const mobile = vi.hoisted(() => ({ value: true }))
@@ -16,31 +17,57 @@ const fail = vi.hoisted(() => ({ on: false, workers: [] as unknown[] }))
 vi.mock('../../api/client', () => ({ api: { crewWorkers: () => (fail.on ? Promise.reject(new Error('down')) : Promise.resolve({ root: 'root', workers: fail.workers })) } }))
 
 import { CrewWorkerBreadcrumb } from './CrewWorkerBreadcrumb'
+import { CREW_WORKERS_FALLBACK_POLL_MS } from '../../pages/chat/command-center/CrewWorkerList'
 
 function renderCrumb() {
   const store = createTestStore({ dashboard: { slots: [{ key: 'root', title: 'New Teammate Welcome Kit', crew_mode_root: true }] } } as never)
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
   render(
-    <QueryClientProvider client={qc}><Provider store={store}>
+    <MemoryRouter><QueryClientProvider client={qc}><Provider store={store}>
       <CrewWorkerBreadcrumb root="root" worker={{ key: 'w1', title: 'First-week checklist', running: false }} />
-    </Provider></QueryClientProvider>,
+    </Provider></QueryClientProvider></MemoryRouter>,
   )
 }
 
 describe('CrewWorkerBreadcrumb on a phone', () => {
   afterEach(() => { vi.useRealTimers() })
 
-  it('clips the gradient to the title, never the crumb containing the ghost', () => {
+  it('reads as text: no ghost, no accent, a link only on hover or focus', () => {
     renderCrumb()
     const root = screen.getByTestId('crew-breadcrumb-root')
-    expect(root).not.toHaveClass('crew-grad-text', 'crew-eyebrow-text')
-    expect(screen.getByText('New Teammate Welcome Kit')).toHaveClass('crew-grad-text')
-    const badge = screen.getByTestId('crew-ghost-badge')
-    expect(badge.closest('.crew-grad-text, .crew-eyebrow-text')).toBeNull()
-    expect(screen.getByTestId('kiro-ghost-mark').closest('.crew-grad-text, .crew-eyebrow-text')).toBeNull()
+    expect(root).toHaveTextContent('New Teammate Welcome Kit')
+    expect(root).not.toHaveClass('crew-grad-text')
+    expect(root).toHaveClass('hover:underline', 'focus-visible:underline', 'cursor-pointer')
+    expect(root).not.toHaveClass('underline')
+    expect(screen.queryByTestId('crew-ghost-badge')).toBeNull()
+    expect(screen.getByRole('navigation', { name: 'Breadcrumb' })).toBe(screen.getByTestId('crew-worker-breadcrumb'))
   })
 
-  it('keeps the root readable, names both, and keeps Back a 44px target', () => {
+  it('goes back to the main chat from the root crumb', () => {
+    const store = createTestStore({ dashboard: { slots: [{ key: 'root', title: 'New Teammate Welcome Kit', crew_mode_root: true }, { key: 'w1', title: 'First-week checklist', crew_root: 'root' }] } } as never)
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    render(
+      <MemoryRouter><QueryClientProvider client={qc}><Provider store={store}>
+        <CrewWorkerBreadcrumb root="root" worker={{ key: 'w1', title: 'First-week checklist', running: false }} />
+      </Provider></QueryClientProvider></MemoryRouter>,
+    )
+    const back = screen.getByRole('button', { name: 'Back to New Teammate Welcome Kit' })
+    expect(back).toBe(screen.getByTestId('crew-breadcrumb-root'))
+    expect(store.getState().chat.activeSlot).not.toBe('root')
+    fireEvent.click(back)
+    expect(store.getState().chat.activeSlot).toBe('root')
+  })
+
+  it('keeps the current member and its status as plain text', () => {
+    renderCrumb()
+    const worker = screen.getByTestId('crew-breadcrumb-worker')
+    expect(worker.tagName).toBe('SPAN')
+    expect(worker).toHaveAttribute('aria-current', 'page')
+    expect(screen.getByTestId('crew-status').closest('button')).toBeNull()
+    expect(screen.getAllByRole('button')).toHaveLength(1)
+  })
+
+  it('keeps the root readable and names both', () => {
     renderCrumb()
     const rootCrumb = screen.getByTestId('crew-breadcrumb-root')
     expect(rootCrumb).toHaveClass('min-w-0', '@[18rem]/crumb:min-w-[5.5rem]')
@@ -48,8 +75,6 @@ describe('CrewWorkerBreadcrumb on a phone', () => {
     const worker = screen.getByTestId('crew-breadcrumb-worker')
     expect(worker).toHaveTextContent('First-week checklist')
     expect(worker).toHaveAttribute('title', 'First-week checklist')
-    const back = screen.getByTestId('crew-back-to-conductor')
-    expect(back).toHaveClass('min-h-11', 'min-w-11', 'md:min-h-8', 'md:min-w-0')
     // The status word is for readers only on a phone; the dot carries it.
     expect(screen.getByTestId('crew-status').querySelector('.sr-only')).not.toBeNull()
   })
@@ -62,7 +87,6 @@ describe('CrewWorkerBreadcrumb on a phone', () => {
       expect(label).toHaveTextContent('Waiting')
       expect(screen.getByTestId('crew-status')).toHaveClass('[&>span:last-child]:sr-only', '@[40rem]/crumb:[&>span:last-child]:not-sr-only')
       expect(screen.getByTestId('crew-breadcrumb-worker')).not.toHaveClass('@[30rem]/crumb:shrink-0')
-      expect(screen.getByTestId('crew-back-to-conductor').querySelector('span')).toHaveClass('hidden', '@[40rem]/crumb:inline')
     } finally {
       mobile.value = true
     }
@@ -84,9 +108,9 @@ describe('CrewWorkerBreadcrumb on a phone', () => {
     const store = createTestStore({ dashboard: { slots: [{ key: 'root', title: 'Sample goal', crew_mode_root: true }] } } as never)
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
     const view = (worker: { key: string; title: string; running: boolean }) => (
-      <QueryClientProvider client={qc}><Provider store={store}>
+      <MemoryRouter><QueryClientProvider client={qc}><Provider store={store}>
         <CrewWorkerBreadcrumb root="root" worker={worker} />
-      </Provider></QueryClientProvider>
+      </Provider></QueryClientProvider></MemoryRouter>
     )
     const { rerender, unmount } = render(view({ key: 'w1', title: 'Finished worker', running: false }))
     try {
@@ -119,9 +143,9 @@ describe('CrewWorkerBreadcrumb on a phone', () => {
     ] } } as never)
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
     const { unmount } = render(
-      <QueryClientProvider client={qc}><Provider store={store}>
+      <MemoryRouter><QueryClientProvider client={qc}><Provider store={store}>
         <CrewWorkerBreadcrumb root="root" worker={{ key: 'w1', title: 'Finished worker', running: false }} />
-      </Provider></QueryClientProvider>,
+      </Provider></QueryClientProvider></MemoryRouter>,
     )
     try {
       expect(await screen.findByText('Done')).toBeInTheDocument()
@@ -149,7 +173,7 @@ describe('CrewWorkerBreadcrumb on a phone', () => {
       renderCrumb()
       expect(await screen.findByText('Done')).toBeInTheDocument()
       fail.on = true
-      await act(async () => { vi.advanceTimersByTime(16_000) })
+      await act(async () => { vi.advanceTimersByTime(CREW_WORKERS_FALLBACK_POLL_MS + 1_000) })
       expect(await screen.findByText('Could not load the crew.')).toBeInTheDocument()
       expect(screen.getByTestId('crew-status')).toHaveAttribute('data-group', 'done')
     } finally {
@@ -161,7 +185,20 @@ describe('CrewWorkerBreadcrumb on a phone', () => {
 })
 
 describe('CrewWorkerBreadcrumb for a sub-conductor\'s crew (C)', () => {
-  it('reads main chat > sub-conductor > member, with Back its one control', async () => {
+  it('keeps a dispatcher the list does not hold yet as a label', async () => {
+    fail.on = false
+    fail.workers = [{ key: 'w1', title: 'First-week checklist', agent: 'kirocrew-worker', status: 'idle', group: 'done', last_activity: '', ledger_item: '', created_by: 'gone', dispatched_by: 'gone' }]
+    try {
+      renderCrumb()
+      const via = await screen.findByTestId('crew-breadcrumb-via')
+      expect(via.tagName).toBe('SPAN')
+      expect(screen.getAllByRole('button')).toHaveLength(1)
+    } finally {
+      fail.workers = []
+    }
+  })
+
+  it('reads main chat > sub-conductor > member; the sub-conductor crumb opens it', async () => {
     mobile.value = false
     fail.on = false
     fail.workers = [
@@ -171,23 +208,48 @@ describe('CrewWorkerBreadcrumb for a sub-conductor\'s crew (C)', () => {
     const store = createTestStore({ dashboard: { slots: [{ key: 'root', title: 'New Teammate Welcome Kit', crew_mode_root: true }, { key: 'sub', title: 'Sub conductor', crew_root: 'root' }] } } as never)
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
     render(
-      <QueryClientProvider client={qc}><Provider store={store}>
+      <MemoryRouter><QueryClientProvider client={qc}><Provider store={store}>
         <CrewWorkerBreadcrumb root="root" worker={{ key: 'w1', title: 'First-week checklist', running: false }} />
-      </Provider></QueryClientProvider>,
+      </Provider></QueryClientProvider></MemoryRouter>,
     )
     const via = await screen.findByTestId('crew-breadcrumb-via')
     const crumbs = [screen.getByTestId('crew-breadcrumb-root'), via, screen.getByTestId('crew-breadcrumb-worker')]
     expect(crumbs.map(c => c.textContent)).toEqual(['New Teammate Welcome Kit', 'Sub conductor', 'First-week checklist'])
     // The middle crumb gives way first on a narrow header.
     expect(via.className).toContain('shrink-[3]')
-    // The crumbs are labels; Back is the breadcrumb's one control, so the header
-    // row (with the title row's side panel button) holds at most two actions.
-    expect(via.tagName).toBe('SPAN')
-    expect(screen.getByTestId('crew-breadcrumb-root').tagName).toBe('SPAN')
-    expect(screen.getByTestId('crew-worker-breadcrumb').querySelectorAll('button')).toHaveLength(1)
-    act(() => { screen.getByTestId('crew-back-to-conductor').click() })
-    expect(store.getState().chat.activeSlot).toBe('root')
+    // The root and the sub-conductor are links; the member on screen is not.
+    expect(via.tagName).toBe('BUTTON')
+    expect(screen.getByTestId('crew-breadcrumb-root').tagName).toBe('BUTTON')
+    expect(screen.getByTestId('crew-breadcrumb-worker').tagName).toBe('SPAN')
+    expect(store.getState().chat.activeSlot).not.toBe('root')
+    fireEvent.click(via)
+    expect(store.getState().chat.activeSlot).toBe('sub')
     fail.workers = []
     mobile.value = true
+  })
+})
+
+describe('CrewWorkerBreadcrumb for a crewmate session (mate sessions preview)', () => {
+  it("names the crewmate and goes to its Profile on Sessions, not the main chat", async () => {
+    fail.on = false
+    const { Routes, Route, useLocation } = await import('react-router-dom')
+    function Where() { const l = useLocation(); return <span data-testid="where" data-state={JSON.stringify(l.state)}>{l.pathname + l.search}</span> }
+    const store = createTestStore({ dashboard: { slots: [
+      { key: 'mate', title: 'Generated topic', mode: 'member', agent: 'ada' },
+      { key: 'w1', title: 'Fix the flaky test', mate_root: 'mate' },
+    ] } } as never)
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    render(
+      <MemoryRouter initialEntries={['/chat']}><QueryClientProvider client={qc}><Provider store={store}>
+        <Routes><Route path="*" element={<><Where /><CrewWorkerBreadcrumb root="mate" worker={{ key: 'w1', title: 'Fix the flaky test', running: false }} mate /></>} /></Routes>
+      </Provider></QueryClientProvider></MemoryRouter>,
+    )
+    const back = screen.getByTestId('crew-breadcrumb-root')
+    expect(back).toHaveTextContent('ada')
+    fireEvent.click(back)
+    expect(screen.getByTestId('where')).toHaveTextContent('/members?member=ada')
+    // The Mates page reads this to open the crewmate's Profile on Sessions.
+    expect(screen.getByTestId('where')).toHaveAttribute('data-state', JSON.stringify({ openMateSessions: true }))
+    expect(store.getState().chat.activeSlot).not.toBe('mate')
   })
 })

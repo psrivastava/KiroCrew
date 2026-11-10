@@ -62,6 +62,7 @@ from kiro_crew.dashboard.token_auth import (
     generate_token,
 )
 from kiro_crew.qr import render_qr_data_uri
+from kiro_crew.shared_crew.preview import preview_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -125,7 +126,7 @@ def _derive_step(
     Ordered by what blocks what, so the operator is never sent to a switch that
     cannot help yet. Each branch is a different remedy:
 
-    0. ``policy_off`` — an enterprise build whose policy does not turn tailnet
+    0. ``policy_off`` — an LTS build whose policy does not turn tailnet
        access on (``tailnet.policy_off``). Dead end, ahead of every daemon step.
     1. ``pinned`` — an administrator's ceiling forbids tailnet access. Dead end;
        nothing below is actionable, and offering a toggle would be a lie.
@@ -151,8 +152,8 @@ def _derive_step(
        only by the formal gateway restart path.
     6. ``occupied`` — serve holds this port/mount for something that is not this
        dashboard, or its state could not be determined. Publishing would REPLACE
-       it, so this refuses and the card renders the manual command
-       (``kirocrew tailnet up``) for the operator to run deliberately. Decided
+       it, so this refuses and the card renders the manual ``tailscale serve``
+       publish (``serve_command``) for the operator to run deliberately. Decided
        on ``port_free``, not on ``published`` alone: a stranger's handler at the
        mount reads ``published=False`` exactly as a free port does, and offering
        the publish button for it walked the operator into ``publish()``'s own
@@ -212,7 +213,8 @@ def _dashboard_port(request: web.Request) -> int:
     ``tailscale serve`` whatever else holds it — the hazard ``kirocrew tailnet
     up`` refuses over, and the reason it prefers evidence to configuration.
     """
-    port = request.app.get("port")
+    # served_port is the bound port; port is the requested one, 0 under --port auto.
+    port = request.app.get("served_port") or request.app.get("port")
     try:
         return int(port or 0)
     except (TypeError, ValueError):
@@ -316,11 +318,20 @@ async def api_tailnet_mobile_status(request: web.Request) -> web.Response:
             # line; ``detail`` already says why in a sentence the card's body
             # copy repeats, so the card renders only the path.
             "refused_cli": probe.refused_cli,
-            # The publish the gateway cannot run for a refused binary, spelled
-            # for the operator to run by hand. Built here because only the
-            # server knows the port it actually listens on.
+            # The publish the gateway cannot or will not run here, spelled for
+            # the operator to run by hand. Built server-side because only this
+            # process knows the port it actually listens on. Two steps need it:
+            # ``untrusted_cli`` (the gateway refuses the planted binary) and
+            # ``occupied`` (serve already holds this mount for something else, so
+            # publishing would REPLACE it — the gateway refuses to, and the
+            # operator runs the publish deliberately if the existing mapping is
+            # safe to overwrite). ``kirocrew tailnet up`` was shown on
+            # ``occupied`` before and could not resolve it: it runs the very
+            # publish path that just refused.
             "serve_command": (
-                tailnet_serve.manual_publish_command(port) if probe.refused_cli and port else ""
+                tailnet_serve.manual_publish_command(port)
+                if port and (probe.refused_cli or live.step == "occupied")
+                else ""
             ),
             "download_url": TAILSCALE_DOWNLOAD_URL,
         }
@@ -879,7 +890,8 @@ async def api_tailnet_mobile_qr(request: web.Request) -> web.Response:
     forbids. On top of the machine state, the CALLER's own session bounds are
     enforced via ``_shared._caller_bounds`` (the same helper the mobile-link
     mint uses): the minted token never out-scopes the session authorizing it,
-    and a caller with no lifetime left to lend is refused.
+    and a caller with no lifetime left to lend is refused. So is a caller pinned
+    to one device, whose code could sign in only that device.
     """
     refusal = _guard(request)
     if refusal is not None:
@@ -1057,6 +1069,24 @@ async def api_tailnet_mobile_qr(request: web.Request) -> web.Response:
             "to use the persistent shape."
         )
         _persist = False
+    # The kernel proof runs only under the Shared Crew preview
+    # (``tailnet.resolve_forwarded_peer``), so only there can it strand a session.
+    if _persist and _identity_trusted and preview_enabled():
+        from kiro_crew.dashboard.tailnet_proxy_proof import proof_support
+
+        _proof_gap = await asyncio.to_thread(proof_support)
+        if _proof_gap:
+            # A ``require_peer`` session rotates only once the daemon-verified
+            # peer is proven, and this host cannot prove the proxy is
+            # ``tailscaled``. Minting one would hand out a link that can never
+            # be redeemed, so the phone gets the boot-bound shape instead.
+            logger.warning(
+                "dashboard.qr_session_persist_across_restart is on but this host "
+                "cannot prove a tailscale serve connection comes from tailscaled "
+                "(%s), so the phone session stays bound to this gateway process.",
+                _proof_gap,
+            )
+            _persist = False
     if _persist and not _identity_trusted:
         logger.warning(
             "dashboard.qr_session_persist_across_restart is on but tailnet "
@@ -1112,6 +1142,24 @@ async def api_tailnet_mobile_qr(request: web.Request) -> web.Response:
                     "link can be issued. Sign in again, then scan."
                 ),
                 "code": "caller_session_expired",
+            },
+            status=403,
+        )
+    # The child carries this pin. Only a login-scoped one can be redeemed by another
+    # device (``peer_pin_key_for_claim``), so any other pin would mint a dead code.
+    caller_pin = carried.get("peer_key", "")
+    if caller_pin and not caller_pin.startswith("ts:login:"):
+        await _audit_async(request, "tailnet.mobile.qr", "denied", "caller-device-bound")
+        return web.json_response(
+            {
+                "error": (
+                    "This session is tied to this device, so a code made here could "
+                    "only sign in this same device. To sign in another device, open "
+                    "Phone access on the computer the dashboard runs on, through its "
+                    "local address rather than its tailnet name, and scan the code "
+                    "it shows there."
+                ),
+                "code": "caller_device_bound",
             },
             status=403,
         )

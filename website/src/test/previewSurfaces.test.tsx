@@ -50,6 +50,8 @@ import {
   PREVIEW_INSTANCE_SESSIONS,
   PREVIEW_REMOTE_CREW_CHAT,
   PREVIEW_WEBHOOKS,
+  PREVIEW_DASHBOARD_STALE_FIELDS,
+  PREVIEW_DASHBOARD_STALE_WAKE,
   readPreviewFlag,
   setPreviewFlag,
 } from '../utils/previewFlags'
@@ -57,6 +59,7 @@ import { usePreviewFlag, usePreviewFlagRevision } from '../hooks/usePreviewFlag'
 import { createPagesProvider } from '../components/commandPalette/providers/pagesProvider'
 import { api } from '../api/client'
 import { FeaturePreviewsSection, FEATURE_PREVIEWS_HIGHLIGHT_ANCHOR } from '../pages/settings/FeaturePreviewsSection'
+import { __resetPreviewFlagServerSyncForTests, usePreviewFlagServerSync } from '../hooks/usePreviewFlagServerSync'
 import DeveloperPage from '../pages/DeveloperPage'
 
 const TEST_ICON: ReactElement = <span />
@@ -342,6 +345,8 @@ describe('Settings > Developer > Feature Previews', () => {
   beforeEach(() => {
     vi.spyOn(api, 'dashboardConfig').mockResolvedValue({ decisions_enabled: true } as never)
     vi.spyOn(api, 'kirocrewConfig').mockResolvedValue({} as never)
+    // The Shared Crew card draws only for the owner; a 404 leaves it out of the census.
+    vi.spyOn(api, 'sharedCrewPreview').mockResolvedValue(null)
     vi.spyOn(api, 'getDecisionsConsent').mockResolvedValue({
       enabled: false, endpoint: '', configured_endpoint: 'https://api.typesafe.ai/v1/systemone', permits: false,
     })
@@ -381,6 +386,27 @@ describe('Settings > Developer > Feature Previews', () => {
     localStorage.setItem(PREVIEW_WEBHOOKS, '1')
     renderTab()
     expect(toggleState()).toBe('true')
+  })
+
+  it('says why a switch went back when the gateway refuses the write', async () => {
+    __resetPreviewFlagServerSyncForTests()
+    vi.spyOn(api, 'patchConfig').mockRejectedValue(Object.assign(new Error('owner only'), { status: 403 }))
+    function WithSync() {
+      usePreviewFlagServerSync()
+      return <FeaturePreviewsSection />
+    }
+    render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <MemoryRouter><WithSync /></MemoryRouter>
+      </QueryClientProvider>,
+    )
+    expect(screen.queryByTestId('feature-previews-save-error')).toBeNull()
+    await act(async () => {
+      screen.getByRole('switch', { name: /webhooks/i }).click()
+    })
+    await waitFor(() => expect(screen.getByTestId('feature-previews-save-error').textContent)
+      .toMatch(/only the owner of this Kiro Crew can change feature previews, so “Webhooks” was switched back/i))
+    act(() => { __resetPreviewFlagServerSyncForTests() })
   })
 
   it('offers no ingress button besides the webhooks link', async () => {
@@ -466,7 +492,7 @@ describe('Settings > Developer > Feature Previews', () => {
     // an unexpected button lands in `ingress`, an extra or missing tip
     // changes `tips` -- while saying what each half protects.
     const INFO_TIP = 'More information'
-    const INFO_TIP_COUNT = 1 // one per Feature Previews row carrying a `hint`
+    const INFO_TIP_COUNT = 12 // one per Feature Previews row carrying a `hint`
     const partition = () => {
       const all = ingressButtons()
       return { tips: all.filter(n => n === INFO_TIP).length, ingress: all.filter(n => n !== INFO_TIP) }
@@ -479,7 +505,7 @@ describe('Settings > Developer > Feature Previews', () => {
     // the hand-off on the read-failure notice after, so a bare expect reads whichever
     // moment it hit. A button this set does not name never converges, so it fails here.
     await waitFor(() => {
-      expect(decisionsButtons()).toEqual(['Ask the agent', 'Show'])
+      expect(decisionsButtons()).toEqual(['Ask the agent', 'More information', 'More information', 'Show'])
     })
     await waitFor(() => {
       expect(kasButtons()).toEqual(['Ask the agent', 'Retry'])
@@ -491,7 +517,7 @@ describe('Settings > Developer > Feature Previews', () => {
     })
     expect(partition()).toEqual({ tips: INFO_TIP_COUNT, ingress: ['Open Webhooks'] })
     // And the card beside it still draws only its own two.
-    expect(decisionsButtons()).toEqual(['Ask the agent', 'Show'])
+    expect(decisionsButtons()).toEqual(['Ask the agent', 'More information', 'More information', 'Show'])
   })
 
   it('renders the section header and the section-wide caveat once, above the cards', () => {
@@ -513,7 +539,7 @@ describe('Settings > Developer > Feature Previews', () => {
     // Awaited: the Decisions card is not drawn until the governance read
     // (`decisions_enabled`) lands, so the last switch arrives a tick late.
     await waitFor(() => {
-      expect(screen.getAllByRole('switch')).toHaveLength(7)
+      expect(screen.getAllByRole('switch')).toHaveLength(12)
     })
     const anchors = container.querySelectorAll(`[data-setting-key="${FEATURE_PREVIEWS_HIGHLIGHT_ANCHOR}"]`)
     expect(anchors).toHaveLength(1)
@@ -529,7 +555,7 @@ describe('Settings > Developer > Feature Previews', () => {
     // The Dynamic Dashboard is on for every reader, so it has no preview card.
     // Automatic cards is a server setting with its own card on the Developer tab.
     renderTab()
-    await waitFor(() => { expect(screen.getAllByRole('switch')).toHaveLength(7) })
+    await waitFor(() => { expect(screen.getAllByRole('switch')).toHaveLength(12) })
     expect(screen.queryByRole('switch', { name: /^dynamic dashboard$/i })).toBeNull()
     expect(screen.queryByRole('switch', { name: /automatic cards for all sessions/i })).toBeNull()
   })
@@ -549,6 +575,21 @@ describe('Settings > Developer > Feature Previews', () => {
     for (const other of [PREVIEW_WEBHOOKS, PREVIEW_INSTANCE_SESSIONS]) {
       expect(localStorage.getItem(other)).not.toBe('1')
     }
+  })
+
+  it('shows the stale-wake switch only while out-of-date fields are marked', async () => {
+    // Waking a Bot for its out-of-date fields needs the mark: with it off the
+    // switch is not drawn, and turning the mark on brings it, off by default.
+    renderTab()
+    const wake = () => screen.queryByRole('switch', { name: /^wake bots to update out-of-date fields$/i })
+    expect(wake()).toBeNull()
+    await act(async () => {
+      screen.getByRole('switch', { name: /^mark out-of-date dashboard fields$/i }).click()
+    })
+    expect(wake()?.getAttribute('aria-checked')).toBe('false')
+    await act(async () => { wake()?.click() })
+    expect(localStorage.getItem(PREVIEW_DASHBOARD_STALE_WAKE)).toBe('1')
+    expect(localStorage.getItem(PREVIEW_DASHBOARD_STALE_FIELDS)).toBe('1')
   })
 
   it('reads the retired instance-sessions key as on, and clears it when turned off', async () => {

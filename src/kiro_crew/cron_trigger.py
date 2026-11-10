@@ -9,7 +9,7 @@ import urllib.request
 from pathlib import Path
 
 from kiro_crew.instances import run_marker
-from kiro_crew.loopback_http import deadline_expired, loopback_urlopen
+from kiro_crew.loopback_http import deadline_expired, http_error_reason, loopback_urlopen
 
 _JOB_ID_RE = re.compile(r"[a-f0-9]{6,12}")
 _TIMEOUT_SECS = 10  # endpoint returns immediately after starting execution
@@ -76,6 +76,9 @@ def trigger_cron_job(job_id: str, port: int, secret_path: Path) -> tuple[bool, s
     except urllib.error.HTTPError as e:
         if e.code == 404:
             return False, f"Job not found: {job_id}"
+        reason = http_error_reason(e)
+        if reason:
+            return False, f"Error: HTTP {e.code}: {reason}"
         return False, f"Error: HTTP {e.code}"
     except (urllib.error.URLError, OSError) as e:
         # A timeout means the gateway took the trigger and is still working, so

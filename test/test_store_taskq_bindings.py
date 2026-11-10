@@ -34,7 +34,6 @@ import hashlib
 import importlib
 import inspect
 import re
-import sys
 import traceback
 from pathlib import Path
 from types import ModuleType
@@ -48,6 +47,16 @@ from kiro_crew.taskq import store as store_module
 from kiro_crew.taskq.store import TaskStore, TaskStoreUnavailable
 
 pytestmark = pytest.mark.xdist_group(name="tree_scan_store_taskq_bindings")
+
+SHARED_BINDINGS_CHECKS = (
+    "the_member_set_is_the_frozen_inventory",
+    "the_kind_reader_tells_a_coroutine_from_a_function",
+    "each_owner_imports_only_owners_listed_before_it",
+    "the_class_only_scan_sees_each_shape",
+    "each_class_an_owner_defines_carries_its_frozen_module",
+    "the_test_tree_walk_reaches_every_collected_tree",
+    "leaf_test_scope_derives_this_file_as_a_corpus_gate",
+)
 
 _FACADE = "kiro_crew.taskq.store"
 _PACKAGE = "kiro_crew.taskq"
@@ -71,6 +80,7 @@ _MEMBERS: dict[str, tuple[str, str | None, str]] = {
     "_open_connection": ("function", "55cc4a2df3bc", "store"),
     "_quarantine_corrupt_file": ("function", "06c325f39971", "store"),
     "_record_incarnation": ("function", "488187349949", "store"),
+    "_release_settled_holds": ("function", "6806e867af4e", "store"),
     "_rollback": ("staticmethod", "9dd8201bdc07", "store"),
     "_writer_executor": ("function", "9d39d0b32056", "store"),
     "accept": ("function", "9271fcba0045", "store"),
@@ -87,17 +97,21 @@ _MEMBERS: dict[str, tuple[str, str | None, str]] = {
     "count_by_state": ("function", "d18b0d78226c", "store_reads"),
     "count_pending": ("function", "fccf5b871169", "store_reads"),
     "default_path": ("classmethod", "13e9c8d66d64", "store"),
+    "dispatch_open": ("function", "3d60a8cc0b0b", "store"),
     "defer": ("function", "47ec57e9ee6a", "store"),
     "deferred_longer_than": ("function", "766523931bac", "store"),
     "doctor_lines": ("function", "6806e867af4e", "store"),
     "enter_wait": ("function", "233981a63998", "store_waits"),
     "events": ("function", "dcbc79f76625", "store_events"),
     "expedite": ("function", "ee48a96a86fb", "store"),
+    "fence_dispatch": ("function", "6107f8cd3661", "store"),
     "fetch_dispatchable": ("function", "7e6bf916bc42", "store_reads"),
     "fetch_dispatchable_fair": ("function", "49927490a5d6", "store_reads"),
     "fetch_pending_by_batch": ("function", "7a679d452d1e", "store_reads"),
     "finish": ("function", "8a4938b244d9", "store"),
     "get": ("function", "c698159610c8", "store_reads"),
+    "held_until_settled": ("function", "6806e867af4e", "store"),
+    "hold_until_settled": ("function", "c8c5ef45db8d", "store"),
     "incarnation": ("property", "bb418bb7ece8", "store"),
     "insert_if_absent": ("function", "b306bf988231", "store"),
     "is_open": ("property", "a6632a57e602", "store"),
@@ -121,6 +135,7 @@ _MEMBERS: dict[str, tuple[str, str | None, str]] = {
     "post": ("function", "b31cc9bb4ff4", "store"),
     "previous_incarnation": ("property", "f21e39ec5ffb", "store"),
     "quarantined_to": ("data", None, "store"),
+    "queued_rows": ("function", "234e88b93896", "store_reads"),
     "record_progress": ("function", "d84afe8169cd", "store"),
     "release_lease": ("function", "ae22938dd735", "store"),
     "renew_lease": ("function", "159082685ec1", "store"),
@@ -222,17 +237,6 @@ def _members() -> dict[str, object]:
 # --------------------------------------------------------------------------- #
 # The member inventory and the binding.
 # --------------------------------------------------------------------------- #
-
-
-def test_the_kind_reader_tells_a_coroutine_from_a_function() -> None:
-    async def stand_in(self: object) -> None:
-        return None
-
-    assert (_kind(stand_in), _kind(lambda self: None)) == ("coroutine", "function")
-
-
-def test_the_member_set_is_the_frozen_inventory() -> None:
-    assert sorted(_members()) == sorted(_MEMBERS)
 
 
 @pytest.mark.parametrize("name", sorted(_MEMBERS))
@@ -343,21 +347,6 @@ def _class_only_constructs(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> list[s
     return found
 
 
-@pytest.mark.parametrize(
-    ("source", "flagged"),
-    [
-        ("def f(self):\n    return super().g()\n", True),
-        ("def f(self):\n    return __class__\n", True),
-        ("def f(self):\n    return self.__secret\n", True),
-        ("def f(self):\n    return super(type(self), self).g()\n", False),
-        ("def f(self):\n    return self.__dict__, self._private\n", False),
-    ],
-)
-def test_the_class_only_scan_sees_each_shape(source: str, flagged: bool) -> None:
-    (fn,) = _self_functions(ast.parse(source))
-    assert bool(_class_only_constructs(fn)) is flagged
-
-
 @pytest.mark.parametrize("owner", store_module._STORE_OWNERS)
 def test_no_bound_function_needs_its_class_body(owner: str) -> None:
     tree = _tree(importlib.import_module(owner))
@@ -448,19 +437,6 @@ def test_the_runtime_import_scan_can_fail() -> None:
 def test_no_owner_imports_the_facade_at_run_time(owner: str) -> None:
     found = _runtime_imports(_tree(importlib.import_module(owner)))
     assert sorted(name for name in found if name == _FACADE or name.startswith(_FACADE + ".")) == []
-
-
-def test_each_owner_imports_only_owners_listed_before_it() -> None:
-    owners = store_module._STORE_OWNERS
-    later = {
-        owner: sorted(
-            name
-            for name in _runtime_imports(_tree(sys.modules[owner]))
-            if name in owners and name not in owners[:i]
-        )
-        for i, owner in enumerate(owners)
-    }
-    assert later == {owner: [] for owner in owners}
 
 
 def _module_and_package(src: Path, path: Path) -> tuple[str, str]:
@@ -652,16 +628,6 @@ def test_an_owner_that_logs_uses_the_store_logger(owner: str) -> None:
 _CLASS_MODULES = {"TaskStoreUnavailable": _FACADE, "WorkRow": "kiro_crew.taskq.store_work"}
 
 
-def test_each_class_an_owner_defines_carries_its_frozen_module() -> None:
-    found = {
-        node.name: vars(module)[node.name].__module__
-        for module in _owners()
-        for node in _tree(module).body
-        if isinstance(node, ast.ClassDef)
-    }
-    assert found == _CLASS_MODULES
-
-
 def test_a_store_failure_renders_under_the_facade_path() -> None:
     text = "".join(traceback.format_exception_only(TaskStoreUnavailable("locked")))
     assert text == "kiro_crew.taskq.store.TaskStoreUnavailable: locked\n"
@@ -813,14 +779,6 @@ def _reach_gaps(patched: set[str], reads: dict[str, set[str]]) -> list[str]:
     return sorted(f"{owner}.{name}" for owner, names in reads.items() for name in patched & names)
 
 
-def test_the_test_tree_walk_reaches_every_collected_tree() -> None:
-    files = _test_tree_files()
-    assert Path(__file__).resolve() in files
-    assert _REPO_ROOT / "conftest.py" in files
-    assert any("/apps/builtins/" in path.as_posix() for path in files)
-    assert len(files) > 1000
-
-
 def test_the_patch_scan_sees_the_facade_patches_it_must() -> None:
     # test_taskq_store.py's network-filesystem detector patches, both read by kept code.
     assert {"_linux_mount_type", "detect_network_filesystem"} <= _corpus_patched_names()
@@ -847,13 +805,3 @@ def test_the_reach_scan_can_fail(tmp_path: Path) -> None:
     gaps = _reach_gaps(patched, _owner_reads())
     assert f"{_PACKAGE}.store_reads._SQL_CLAIMABLE" in gaps
     assert f"{_PACKAGE}.store_waits.TaskStoreUnavailable" in gaps
-
-
-def test_leaf_test_scope_derives_this_file_as_a_corpus_gate(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """It reads the whole test tree, so a leaf-only diff must still run it."""
-    monkeypatch.syspath_prepend(str(_REPO_ROOT / "scripts"))
-    leaf_test_scope = importlib.import_module("leaf_test_scope")
-    rel = Path(__file__).resolve().relative_to(_REPO_ROOT).as_posix()
-    assert rel in leaf_test_scope.corpus_gates(_REPO_ROOT)

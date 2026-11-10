@@ -129,6 +129,7 @@ class KiroPrerequisiteService:
     _maybe_latch_interim_identity = _identity_tracking._maybe_latch_interim_identity
     identity_changed_since_probe = _identity_tracking.identity_changed_since_probe
     identity_changed_since_sessions = _identity_tracking.identity_changed_since_sessions
+    identity_read_other_than = _identity_tracking.identity_read_other_than
     note_sessions_reconciled = _identity_tracking.note_sessions_reconciled
     seed_sessions_baseline = _identity_tracking.seed_sessions_baseline
     read_spawn_identity = _identity_tracking.read_spawn_identity
@@ -213,12 +214,12 @@ class KiroPrerequisiteService:
         # dir — otherwise spawn-count assertions vary by machine.
         self._spec_lister = spec_lister or _default_spec_lister
         self._clock = clock or time.monotonic
-        # An enterprise build never assumes readiness: its login gate reads this
+        # An LTS build never assumes readiness: its login gate reads this
         # service's verdict, and an assumed one (`--test-mode`) would open the
         # gate with no kiro login at all.
-        from kiro_crew.edition import is_enterprise
+        from kiro_crew.edition import is_lts
 
-        self._assume_ready = assume_ready and not is_enterprise()
+        self._assume_ready = assume_ready and not is_lts()
         assume_ready = self._assume_ready
         # `assume_ready` must hold from CONSTRUCTION, not from the first probe:
         # readiness is now a latch that `session_ready()` reads without probing,
@@ -304,6 +305,16 @@ class KiroPrerequisiteService:
         # erase the only record that the account existed (a child spawned
         # under it may be unstamped and otherwise invisible).
         self._interim_identity_gen = 0
+        # Every fresh store read is numbered, and the latest run of identical
+        # reads is kept: the fingerprint they returned and the number of the read
+        # that began the run. A shared acquire check reads them to learn whether
+        # any read after its own named another account (identity_read_other_than).
+        # The interim latch cannot answer that: it ignores reads equal to the
+        # baseline, and those are exactly the reads of the account a pending sweep
+        # switched away from.
+        self._identity_read_gen = 0
+        self._identity_read_run_fingerprint = ""
+        self._identity_read_run_start = 0
 
     @property
     def initial_setup_complete(self) -> bool:
@@ -325,8 +336,9 @@ class KiroPrerequisiteService:
 
         Its one caller already requires ``backend == kas``, and both callers of that
         method pass the CONFIGURED backend, so the predicate's backend half is
-        settled here and the answer equals ``agent.kas_bundle``. Unreadable config
-        answers False, as before.
+        settled here and the answer is the route: ``agent.kas_bundle`` on, or the
+        automatic switch when kiro-cli's relay cannot run (``acp/kas_route.py``).
+        Unreadable config answers False, as before.
         """
         from kiro_crew.agent_sdk import kas_bundle
 
@@ -350,9 +362,9 @@ class KiroPrerequisiteService:
 
         On the BUNDLE route (``agent.kas_bundle`` on) KAS runs Crew's own installed
         engine and never kiro-cli, so none of the kiro-cli checks apply: the
-        prerequisite is the installed engine (``installed_bundle()``), and a host
-        with no kiro-cli at all completes here once ``kirocrew kas install`` has
-        run. The install probe below answers from the same reader on that route.
+        prerequisite is the installed engine (``installed_bundle()``) or a host
+        able to run it, since the first spawn installs it, and a host with no
+        kiro-cli at all completes here. The install probe below answers from the same reader on that route.
         """
         from kiro_crew.acp_backends import selectable_backend_values
         from kiro_crew.agent_sdk.backend_install import INSTALLED, probe_backend
@@ -361,10 +373,15 @@ class KiroPrerequisiteService:
             ACP_BACKENDS_INDEPENDENT_SETUP,
         )
 
-        if backend == ACP_BACKEND_KAS and self._kas_bundle_route():
-            from kiro_crew.agent_sdk import kas_bundle
+        # Off the loop: the route reads the vault and kiro-cli's sign-in store.
+        if backend == ACP_BACKEND_KAS and await asyncio.to_thread(self._kas_bundle_route):
+            from kiro_crew.agent_sdk import backend_install, kas_bundle
 
-            if await asyncio.to_thread(kas_bundle.installed_bundle) is None:
+            # An engine not installed yet is laid down by the first spawn
+            # (``acp/kas_engine_install.py``); only a host that cannot run it blocks.
+            if await asyncio.to_thread(
+                kas_bundle.installed_bundle
+            ) is None and not await asyncio.to_thread(backend_install._engine_installable_here):
                 return False
         elif backend == ACP_BACKEND_KAS:
             # KAS runs ON kiro-cli, so it is deliberately absent from
@@ -706,6 +723,12 @@ class KiroPrerequisiteService:
 
         return self._interim_identity_gen
 
+    @property
+    def identity_read_generation(self) -> int:
+        """Count of fresh store reads so far, captured by a check right after its read."""
+
+        return self._identity_read_gen
+
     async def verified_ready(self, *, max_age_secs: float) -> bool:
         """Return readiness backed by a probe no older than *max_age_secs*.
 
@@ -739,18 +762,24 @@ class KiroPrerequisiteService:
     def authenticated(self) -> bool:
         """The latched sign-in verdict. Never probes.
 
-        The enterprise login gate reads this on every request, so it must stay a
+        The LTS login gate reads this on every request, so it must stay a
         field read. False before the first probe answers, which is what keeps an
-        enterprise gateway closed until a probe has seen a login.
+        LTS gateway closed until a probe has seen a login.
         """
 
         return bool(self._status.authenticated)
 
+    @property
+    def probe_timed_out(self) -> bool:
+        """Whether the latest probe timed out instead of answering. Never probes."""
+
+        return bool(self._status.probe_timed_out)
+
     async def login_verified(self, *, max_age_secs: float) -> bool:
         """Return the sign-in verdict, re-probing when it may be stale.
 
-        For the enterprise login gate's background check (docs/request-for-change/
-        rfc-crew-enterprise-edition.md, "Enterprise gate"), which must notice an
+        For the LTS login gate's background check (docs/request-for-change/
+        rfc-crew-lts-edition.md, "LTS gate"), which must notice an
         expired or lost login with no chat turn to surface it. The probe re-runs
         when the last one is older than *max_age_secs*, or when the identity store
         now names a different account (or none) than the latch: that read is
@@ -775,7 +804,7 @@ class KiroPrerequisiteService:
     async def boot_login_status(self) -> PrerequisiteStatus:
         """Probe ``--version`` and ``whoami`` only, and return the latched status.
 
-        For the enterprise boot check, which runs before the gateway binds: the
+        For the LTS boot check, which runs before the gateway binds: the
         spec and ``acp`` checks of a full probe run after the bind instead (a
         probe that reached ``whoami`` is left not done, so the next read runs the
         full one). ``authenticated`` is the verdict; it fails closed.

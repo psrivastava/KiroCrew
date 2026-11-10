@@ -375,7 +375,7 @@ class TestSpawnShimArgv:
 
     def test_extractor_profile_is_a_fixed_memory_and_cpu_ceiling(self):
         # The document-parser child: RLIMIT_AS on by DEFAULT (the tool profile
-        # leaves it to ``max_memory_mb``, default 0), a CPU cap, the OOM bias --
+        # leaves it to ``max_address_space_mb``, default 0), a CPU cap, the OOM bias --
         # and no dependence on the operator's ``resource_limits`` block.
         prefix = spawn_shim_argv(RLIMIT_PROFILE_EXTRACTOR)
         [spec] = [a for a in prefix if a.startswith("--rlimits=")]
@@ -394,10 +394,6 @@ class TestSpawnShimArgv:
         preexec = sandbox._preexec_for_profile(RLIMIT_PROFILE_EXTRACTOR)
         assert preexec is not None
         assert preexec is sandbox.extractor_resource_limit_preexec()
-
-    def test_policy_free_profile_skips_the_interpreter_hop(self):
-        # Nothing to do post-exec: no reason to pay an exec + startup.
-        assert spawn_shim_argv(RLIMIT_PROFILE_NONE) == ()
 
 
 # --------------------------------------------------------------------------
@@ -1146,7 +1142,7 @@ class TestSyncReportedArgv:
         return len(strip_spawn_shim(spawned)) < len(spawned)
 
     def test_completed_process_reports_the_command_not_the_shim(self):
-        result = run_limited(["/bin/echo", "hi"], capture_output=True, text=True)
+        result = run_limited(["/bin/echo", "hi"], capture_output=True, text=True, encoding="utf-8")
         assert result.args == ["/bin/echo", "hi"]
         assert not any("--rlimits=" in a for a in result.args)
 
@@ -1240,10 +1236,16 @@ class TestSyncRealChild:
         try:
             probe = "import resource;print(resource.getrlimit(resource.RLIMIT_NOFILE)[0])"
             wrapped = run_limited(
-                [sys.executable, "-c", probe], capture_output=True, text=True
+                [sys.executable, "-X", "utf8", "-c", probe],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
             ).stdout.strip()
             bare = subprocess.run(
-                [sys.executable, "-c", probe], capture_output=True, text=True
+                [sys.executable, "-X", "utf8", "-c", probe],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
             ).stdout.strip()
             inherited = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
             assert int(bare) == inherited

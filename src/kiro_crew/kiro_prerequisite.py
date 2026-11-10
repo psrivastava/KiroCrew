@@ -25,6 +25,9 @@ change.
 
 What remains is detection, and detection alone: every subprocess this module
 spawns is one of the two read-only probes above, sandboxed, with a fixed argv.
+An LTS build's sign-in check may re-run those two probes through the
+sandbox's first-party carve-out on a host with no sandbox backend, for the
+sign-in verdict only.
 No command, argument, URL, or filesystem target is accepted from an HTTP
 request, and the dashboard exposes only a ``status`` read plus the agent-spec
 repair write (which touches Kiro Crew's own files, never the CLI).
@@ -161,6 +164,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         current_identity_fingerprint,
         identity_changed_since_probe,
         identity_changed_since_sessions,
+        identity_read_other_than,
         note_absence_swept,
         note_sessions_reconciled,
         read_spawn_identity,

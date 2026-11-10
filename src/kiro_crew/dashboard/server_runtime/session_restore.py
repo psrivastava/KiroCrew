@@ -54,6 +54,11 @@ async def _restore_dashboard_sessions(state: DashboardState, cfg: KiroCrewConfig
 
     await prepare_gateway(state)
     try:
+        from kiro_crew.dashboard import chat_trust_restart
+
+        # The chats that held an approval mode when the previous process stopped,
+        # read before the restore rebuilds them without it (``chat_trust_restart``).
+        held_modes = await asyncio.to_thread(chat_trust_restart.arm, state)
         # Session restores spawn a kiro-cli process per restored tab — the last
         # large group of the startup battery, so it too gets a cautious-boot window.
         await cautious_boot.pause_before("session restore")
@@ -80,8 +85,14 @@ async def _restore_dashboard_sessions(state: DashboardState, cfg: KiroCrewConfig
             # the restore builds exist (``shared_crew.host_hooks``).
             mark_sessions_restored(state)
 
+        # Tell the owner which of them came back without it.
+        await chat_trust_restart.report(state, held_modes)
+
+        from kiro_crew.dashboard.member_slot_retry import schedule_member_slot_retry
         from kiro_crew.dashboard.slot_queue_repository import drain_restored_parked_sends
 
+        # A crewmate thread the restore deferred is built once more after boot.
+        schedule_member_slot_retry(state)
         await drain_restored_parked_sends(state)
 
         if state._dynamic_cards is not None:

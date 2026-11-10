@@ -27,7 +27,7 @@ import time
 from typing import Any, Callable, Optional
 
 from kiro_crew import platform_compat
-from kiro_crew.install_liveness import install_pruned, respawned_by_pool
+from kiro_crew.install_liveness import install_pruned, is_pooled_backend, respawned_by_pool
 from kiro_crew.mcp_caller import (
     INFLIGHT_CAPABILITY_KEY,
     INFLIGHT_NOTIFICATION,
@@ -52,13 +52,14 @@ from kiro_crew.mcp_shared_calls import (
     _StepPool,
 )
 from kiro_crew.mcp_shared_policy import (
-    _NEGATIVE_CACHE_TTL,
+    _NEGATIVE_CACHE_PROBE_INTERVAL,
     _POLICY_DETAIL_MAX_CHARS,
     _UNRESOLVED_REFUSES_CALL,
     ToolPolicy,
     _ambient_audit_session,
     _resolve_tool_policy,
     external_client_identity_note,
+    registry_identity_note,
     serves_managed_tools,
     spawned_without_gateway_identity,
 )
@@ -761,10 +762,15 @@ def _run_stdio_dispatch_loop(
                 # one would be unrecoverable. A tool that is listed but refuses
                 # is not a hole; a tool that is unlisted but runs is.
                 logger.warning(
-                    "Refusing tool call %r: session %s tool policy unresolved (%s)",
+                    "Refusing tool call %r: session %s tool policy unresolved (%s)%s",
                     tool_name,
                     _policy_session,
                     _policy.unresolved,
+                    (
+                        registry_identity_note(server_name)
+                        if _policy.unresolved == "identity_unattestable"
+                        else ""
+                    ),
                 )
                 sel().log_tool_invocation(
                     session_key=_policy_session,
@@ -836,6 +842,7 @@ def _run_stdio_dispatch_loop(
                         f"list; it succeeds once this server is started by a Kiro "
                         f"Crew session that gives it a signed session token."
                     )
+                    _refusal += registry_identity_note(server_name)
                     if _caller_ctx is None and spawned_without_gateway_identity():
                         _refusal += external_client_identity_note(server_name)
                 elif _policy.unresolved == "gateway_locked":
@@ -864,7 +871,7 @@ def _run_stdio_dispatch_loop(
                         f"broken{_cause}. No agent spec is implicated and nothing needs "
                         f"editing. Refusing the call rather than ignoring an "
                         f"operator's exclusion list; the call succeeds on retry "
-                        f"within {_NEGATIVE_CACHE_TTL:.0f}s of the gateway "
+                        f"within {_NEGATIVE_CACHE_PROBE_INTERVAL:.0f}s of the gateway "
                         f"answering again."
                     )
                 else:
@@ -1127,7 +1134,9 @@ def _run_stdio_dispatch_loop(
             refuse()
 
     def _commit_settled(entry: _DeferredEntry, text: str) -> None:
-        """Commit with the call's identity installed, then answer with ``text``."""
+        """Commit with the call's identity installed, answer with ``text``, then
+        tell the call whether that answer reached the client (``on_answered``).
+        """
         set_current_caller(entry.caller_ctx)
         set_current_tenant_nonce(entry.tenant_nonce)
         try:
@@ -1141,7 +1150,26 @@ def _run_stdio_dispatch_loop(
         finally:
             set_current_caller(None)
             set_current_tenant_nonce("")
-        respond(entry.req_id, _tool_response(text))
+        # A write that raises propagates before the hook below: unanswered, the
+        # call is told nothing, which claims nothing delivered.
+        written = respond(entry.req_id, _tool_response(text)) is True
+        # A pooled backend writes into the MCP gateway's broker, whose relay to
+        # the client confirms nothing back, so none of its answers counts.
+        _tell_answered(entry, written and not is_pooled_backend())
+
+    def _tell_answered(entry: _DeferredEntry, written: bool) -> None:
+        """Run the call's ``on_answered`` with its identity installed."""
+        set_current_caller(entry.caller_ctx)
+        set_current_tenant_nonce(entry.tenant_nonce)
+        try:
+            entry.deferred.on_answered(written)
+        except Exception:  # noqa: BLE001 - one call's hook must not end the server
+            logger.warning(
+                "%s: on_answered failed for request %s", server_name, entry.req_id, exc_info=True
+            )
+        finally:
+            set_current_caller(None)
+            set_current_tenant_nonce("")
 
     def _harvest_step(key: str, entry: _DeferredEntry) -> bool:
         """Consume a FINISHED step: answer or drop the call as its outcome and

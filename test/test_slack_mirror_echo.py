@@ -1,6 +1,6 @@
 """The dashboard -> Slack mirror: its prompt echo and its "Thinking…" placeholder.
 
-Three defects a linked thread showed on mirrored turns:
+Defects a linked thread showed on mirrored turns:
 
 * the prompt echo escaped every ``<…>`` entity and wrapped the prompt in ``_…_``,
   so a pasted ``<https://…|label>`` link or ``<#C…>`` channel reference arrived as
@@ -19,7 +19,9 @@ Three defects a linked thread showed on mirrored turns:
   app, recovery, a channel-typed message) is not, and a new producer is not
   until it stamps itself as the person;
 * a tool step with no purpose line showed its raw ``@server/tool`` id; it now
-  reads the dashboard row's derived title ("Wait", "Git status").
+  reads the dashboard row's derived title ("Wait", "Git status");
+* the task stream named no recipient user, which an org-wide install refuses,
+  so every mirrored turn fell back to ``chat.update``; it now names the owner.
 """
 
 from __future__ import annotations
@@ -109,12 +111,14 @@ async def _linked_turn(
     message: str = "hello",
     slack: _SlackRecorder | None = None,
     user_row: bool = True,
+    owner_id: str = "",
     **run_kwargs: Any,
 ) -> _SlackRecorder:
     slack = slack or _SlackRecorder()
 
     def _linked(ctx: TurnContext) -> None:
         ctx.state.slack_client = slack
+        ctx.state.owner_id = owner_id
         ctx.state.sessions.set_slack_link("dashboard:chat-1", "thread-1", "C-1")
 
     await run_turn(
@@ -300,6 +304,15 @@ async def test_the_stream_opens_once_and_the_line_goes_once_over_many_tools() ->
 
 
 @pytest.mark.asyncio
+async def test_the_stream_names_the_owner_as_its_recipient() -> None:
+    # An org-wide install refuses a stream with no recipient user, and the
+    # owner is the only person the gateway answers on Slack.
+    slack = await _linked_turn([_TOOL, _ANSWER, _DONE], owner_id="U0OWNER")
+    [stream] = [args for name, args in slack.calls if name == "start_stream"]
+    assert stream["user_id"] == "U0OWNER"
+
+
+@pytest.mark.asyncio
 async def test_a_refused_stream_leaves_the_line_up_until_the_answer() -> None:
     slack = _StreamRefusingSlack()
     marks: list[int] = []
@@ -406,7 +419,6 @@ def test_the_source_scan_finds_every_known_system_producer() -> None:
     files = {site.split(":", 1)[0] for site, _ in _SYSTEM_SITES}
     for expected in (
         "slack/gateway_runtime/nudge_dashboard_fire.py",  # monitor / work-ledger wake
-        "slack/gateway_runtime/subagent_injection.py",
         "dashboard/handlers/taskrunner.py",
         "slack/handler_runtime/inbound.py",  # typed in the linked Slack thread
     ):
@@ -687,13 +699,37 @@ class TestTheDrainCarriesOrigin:
         # mixed batch is not quoted back (it would quote the Slack words too).
         from kiro_crew.dashboard import chat_delivery as cd
 
+        # A channel entry with no stamped source channel (another channel's
+        # hand-off) still merges with the dashboard's words.
         state, busy, run = self._drain(tmp_path, monkeypatch, merge=True)
         slot = busy("chat-1")
-        await self._route_busy(state, slot, monkeypatch)
+        cd.queue_for_next_turn(
+            state, slot, "from a channel", directive_user_origin=True, directive_channel_origin=True
+        )
         cd.queue_for_next_turn(state, slot, "typed in the dashboard", directive_user_origin=True)
         kwargs = await run(slot)
         assert slot._queue == []
         assert kwargs["_directive_channel_origin"] is True
+
+    @pytest.mark.asyncio
+    async def test_a_routed_slack_reply_runs_apart_from_a_dashboard_message(
+        self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The router stamps its reply's source channel, and a merge run stops
+        # where those change: the reply runs channel-origin on its own, and the
+        # dashboard message after it still runs as the person.
+        from kiro_crew.dashboard import chat_delivery as cd
+
+        state, busy, run = self._drain(tmp_path, monkeypatch, merge=True)
+        slot = busy("chat-1")
+        await self._route_busy(state, slot, monkeypatch)
+        cd.queue_for_next_turn(state, slot, "typed in the dashboard", directive_user_origin=True)
+        first = await run(slot)
+        assert first["_directive_channel_origin"] is True
+        assert [item["content"] for item in slot._queue] == ["typed in the dashboard"]
+        second = await run(slot)
+        assert slot._queue == []
+        assert second["_directive_channel_origin"] is False
 
 
 # ── Tool steps read like the dashboard's rows, never as a raw tool id ────────
@@ -826,6 +862,11 @@ class TestAScriptCronSendIsTheCrons:
         async with _client(state, "") as client:
             resp = await client.post("/api/chat?ws=1", json={"slot": "s1", "message": "tick"})
             assert resp.status == 200, await resp.text()
+        if not creator:
+            # The session's own composer send is never held behind sub-agents.
+            await async_wait_until(lambda: chat_run.await_count or chat_run.call_count)
+            assert not slot._queue
+            return
         chat_run.assert_not_called()
         [entry] = slot._queue
         assert (entry.get("meta") or {}).get(TURN_ACTOR_META_KEY) == actor

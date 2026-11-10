@@ -39,6 +39,7 @@ from kiro_crew.acp_backends import (
     ACP_BACKEND_KIRO,
     ACP_BACKEND_OPENCODE,
     ACP_BACKEND_PI,
+    ACP_BACKEND_STRANDS,
 )
 from kiro_crew.providers.mirrors.base import AgentConfigMirror
 from kiro_crew.providers.mirrors.claude_code import ClaudeCodeMirror
@@ -47,6 +48,7 @@ from kiro_crew.providers.mirrors.copilot import CopilotMirror
 from kiro_crew.providers.mirrors.deepseek import DeepSeekMirror
 from kiro_crew.providers.mirrors.goose import GooseMirror
 from kiro_crew.providers.mirrors.opencode import OpenCodeMirror
+from kiro_crew.providers.mirrors.strands import StrandsMirror
 
 
 class ProjectionKind(str, Enum):
@@ -225,6 +227,7 @@ MIRRORS: dict[str, type[AgentConfigMirror]] = {
     ACP_BACKEND_GOOSE: GooseMirror,
     ACP_BACKEND_DEEPSEEK: DeepSeekMirror,
     ACP_BACKEND_COPILOT: CopilotMirror,
+    ACP_BACKEND_STRANDS: StrandsMirror,
 }
 
 #: Every backend this build can spell, and how its MCP surface is reached.
@@ -311,9 +314,11 @@ PROJECTIONS: dict[str, McpProjection] = {
         reason=(
             "pi-acp accepts the session/new mcpServers array, stores it on its session "
             "state, and never hands it to the pi process, so the array is not the "
-            "channel. Crew's own gate extension is: the launch writes the same "
-            "composition deepseek is sent -- the member mounts and the pooled broker "
-            "stubs _pooled_mcp_servers appends for a backend outside MIRRORS -- to an "
+            "channel. Crew's own gate extension is: the launch writes the session's "
+            "composition -- the member mounts, the pooled broker stubs "
+            "_pooled_mcp_servers appends for a backend outside MIRRORS, and, for a "
+            "crewmate DM session, the servers the agent spec declares "
+            "(_broker_only_spec_mounts) -- to an "
             "owner-only handoff file bound to the session nonce and sealed with a key only "
             "that spawn's environment carries "
             "(acp.harness.pi.pi_mcp_handoff_payload), and the extension registers each "
@@ -322,11 +327,12 @@ PROJECTIONS: dict[str, McpProjection] = {
             "test/fixtures/acp_frames/pi/mcp-stdio-mount-live.jsonl shows the server "
             "asked initialize/tools/list/tools/call, the call gated by "
             "session/request_permission first, and the result reaching the turn. So a pi "
-            "session holds Crew's pooled tools, reachably. What it does not hold is the "
-            "servers its own agent spec declares, or the spec's per-tool deny set, "
-            "because no mirror translates them. A same-named server in pi's own mcp.json "
-            "outranks an extension's registration; the extension refuses that name's "
-            "tools"
+            "crewmate session holds Crew's pooled tools and the spec's own servers, "
+            "reachably, held to the spec's tools allowlist. What it does not hold is a "
+            "server with a switched-off tool: pi has no per-call deny channel, so such a "
+            "server is withheld whole rather than narrowed. A same-named server in pi's "
+            "own mcp.json outranks an extension's registration; the extension refuses "
+            "that name's tools"
         ),
         tracking="docs/request-for-change/rfc-agent-config-mirror.md#5-migration",
     ),
@@ -389,6 +395,19 @@ PROJECTIONS: dict[str, McpProjection] = {
         "end to end in test/fixtures/acp_frames/copilot/mcp-stdio-mount-live.jsonl "
         "(initialize, tools/list and tools/call asked by the harness itself, the call "
         "gated by session/request_permission first)",
+        # No per-call deny path is verified for this harness, so a narrowed server is
+        # withheld whole, the direction that cannot leave a switched-off tool reachable.
+        per_tool_deny=PerToolDeny.WHOLE_SERVER,
+    ),
+    ACP_BACKEND_STRANDS: McpProjection(
+        kind=ProjectionKind.MIRROR,
+        reason="strands.py -- the session's projected mcpServers array, mounted from the "
+        "launch instead of the wire: the Strands CLI refuses a non-empty session/new array "
+        "in its Python-project mode and mounts the servers its --mcp-config file names, so "
+        "the spawn writes the whole array to an owner-only launch file "
+        "(acp/harness/strands.py) with the CLI's own MCP discovery off. Measured end to end "
+        "in test/fixtures/acp_frames/strands/mcp-stdio-mount-live.jsonl (the call gated by "
+        "session/request_permission first)",
         # No per-call deny path is verified for this harness, so a narrowed server is
         # withheld whole, the direction that cannot leave a switched-off tool reachable.
         per_tool_deny=PerToolDeny.WHOLE_SERVER,

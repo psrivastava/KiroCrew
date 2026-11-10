@@ -14,7 +14,7 @@ from collections.abc import Callable
 from typing import Any
 
 from kiro_crew._facade_bindings import own_methods
-from kiro_crew.acp import kas_wire
+from kiro_crew.acp import batch_guard, kas_wire
 from kiro_crew.acp import session_handle_compaction as _sh_compaction
 from kiro_crew.acp import session_handle_dispatch as _sh_dispatch
 from kiro_crew.acp import session_handle_elicitation as _sh_elicitation
@@ -28,8 +28,9 @@ from kiro_crew.acp import session_handle_steering as _sh_steering
 from kiro_crew.acp import session_handle_turn as _sh_turn
 from kiro_crew.acp import session_handle_updates as _sh_updates
 from kiro_crew.acp import session_handle_watchdog as _sh_watchdog
-from kiro_crew.acp._dispatch import MAX_ACTIVE_TOOL_CALLS
+from kiro_crew.acp._dispatch import MAX_ACTIVE_TOOL_CALLS, NativeCompactionStates
 from kiro_crew.acp.elicitation import ElicitationRequest
+from kiro_crew.acp.engine_fallback import EngineFallbackTracker
 from kiro_crew.acp.liveness import (
     InFlightToolTracker,
     InteractiveClassification,
@@ -55,6 +56,7 @@ from kiro_crew.acp.types import (
     steering_advertised,
 )
 from kiro_crew.recovery.ladder import InfraError
+from kiro_crew.security import StreamRedactor
 
 #: The owner modules whose functions ``AcpSessionHandle`` binds as its members, this
 #: shell included.
@@ -110,6 +112,7 @@ class AcpSessionHandle:
     _input_wait_status = _sh_watchdog._input_wait_status
     # The session's MCP servers: ``kiro_crew.acp.session_handle_mcp``.
     _remote_flat_launches = _sh_mcp._remote_flat_launches
+    _mcp_attribution_launches = _sh_mcp._mcp_attribution_launches
     record_mcp_launches = _sh_mcp.record_mcp_launches
     queued_frame_count = _sh_mcp.queued_frame_count
     _owns_mcp_frame = _sh_mcp._owns_mcp_frame
@@ -118,8 +121,11 @@ class AcpSessionHandle:
     mcp_session_report = _sh_mcp.mcp_session_report
     wait_mcp_ready = _sh_mcp.wait_mcp_ready
     wait_for_declared_mcp = _sh_mcp.wait_for_declared_mcp
+    wait_mounted_mcp = _sh_mcp.wait_mounted_mcp
     _note_mcp_sign_in_status = _sh_mcp._note_mcp_sign_in_status
     _offer_mcp_sign_in = _sh_mcp._offer_mcp_sign_in
+    want_mcp_sign_in_named = _sh_mcp.want_mcp_sign_in_named
+    _match_mcp_sign_in_ask = _sh_mcp._match_mcp_sign_in_ask
     _sync_mcp_reattempting = _sh_mcp._sync_mcp_reattempting
     _runtime_reattempts_mcp = _sh_mcp._runtime_reattempts_mcp
     _reattempt_failed_mcp_servers = _sh_mcp._reattempt_failed_mcp_servers
@@ -127,6 +133,7 @@ class AcpSessionHandle:
     drain_init = _sh_mcp.drain_init
     # What KAS speaks beyond ACP on a session: ``kiro_crew.acp.session_handle_kas``.
     discard_unanswered_prompt = _sh_kas.discard_unanswered_prompt
+    kas_command_call = _sh_kas.kas_command_call
     _is_kas_hooks_request = _sh_kas._is_kas_hooks_request
     _answer_kas_hooks_request = _sh_kas._answer_kas_hooks_request
     _answer_kas_hook_execute = _sh_kas._answer_kas_hook_execute
@@ -140,6 +147,13 @@ class AcpSessionHandle:
     _handle_kas_subagent = _sh_children._handle_kas_subagent
     _handle_kas_subagent_chunk = _sh_children._handle_kas_subagent_chunk
     _build_child_tool_activity_prefix = _sh_children._build_child_tool_activity_prefix
+    _handle_announced_subagent = _sh_children._handle_announced_subagent
+    _handle_legacy_codex_subagent = _sh_children._handle_legacy_codex_subagent
+    _announced_row = _sh_children._announced_row
+    _roster_event = _sh_children._roster_event
+    _child_text_activity = _sh_children._child_text_activity
+    _flush_announced_child_text = _sh_children._flush_announced_child_text
+    flush_native_child_text = _sh_children.flush_native_child_text
     _note_native_child = _sh_children._note_native_child
     _note_native_roster = _sh_children._note_native_roster
     native_child_resume_refusal = _sh_children.native_child_resume_refusal
@@ -179,6 +193,8 @@ class AcpSessionHandle:
     _send_awaited = _sh_lifecycle._send_awaited
     bind_session_key = _sh_lifecycle.bind_session_key
     destroy = _sh_lifecycle.destroy
+    _release_ending = _sh_lifecycle._release_ending
+    _release_for_later_delete = _sh_lifecycle._release_for_later_delete
     _cleanup_transcript = _sh_lifecycle._cleanup_transcript
     cleanup_transcript_files = staticmethod(_sh_lifecycle.cleanup_transcript_files)
     _wait_for_response = _sh_lifecycle._wait_for_response
@@ -198,6 +214,11 @@ class AcpSessionHandle:
     _codex_compaction_event = _sh_compaction._codex_compaction_event
     # Permission requests and in-band refusals: ``kiro_crew.acp.session_handle_permissions``.
     approve_tool = _sh_permissions.approve_tool
+
+    def take_batch_refusal(self, request_id: str | int) -> str | None:
+        """The batch write guard's reason for refusing *request_id*, taken once."""
+        return batch_guard.take_refusal(self, request_id)
+
     _restore_withdrawn = _sh_permissions._restore_withdrawn
     reject_tool = _sh_permissions.reject_tool
     _deny_spec_disabled_tool = _sh_permissions._deny_spec_disabled_tool
@@ -227,6 +248,7 @@ class AcpSessionHandle:
     wait_turn_done = _sh_turn.wait_turn_done
     prompt = _sh_turn.prompt
     stream_command = _sh_turn.stream_command
+    command_is_native = _sh_turn.command_is_native
     _run_turn = _sh_turn._run_turn
     _close_abandoned_turn = _sh_turn._close_abandoned_turn
     # The per-turn event loop: ``kiro_crew.acp.session_handle_dispatch``.
@@ -288,6 +310,11 @@ class AcpSessionHandle:
         # answered ``startedNewTurn``, whose untargeted cancel could then land on
         # the prompt about to go out, so no steer is sent until it is set.
         self._prompt_written: bool = False
+        # Prompts this handle has written to the adapter, over its whole life.
+        # Never reset, so a caller that snapshots it before a turn can tell,
+        # after that turn timed out or was cancelled, whether the prompt reached
+        # the backend.
+        self.prompts_written: int = 0
         self.native_context_documents: dict[str, str] = {}
         self.native_context_documents_fit: Callable[[], bool] | None = None
         # Whether THIS session's array carries the member session-control entry.
@@ -304,6 +331,16 @@ class AcpSessionHandle:
         # continuability: the transcript is spawn_continue's resume material).
         self.keep_transcript = False
         self.memory_mode = "persistent"
+        # Seconds the host keeps this session's record after destroy() before Crew
+        # deletes it, on a host that can free a session and keep its record
+        # (``AcpRuntime.can_release``). Set by the opener of a task-runner session
+        # or a workflow worker from ``session.kas_delete_delay_secs``; 0 ends the
+        # session with the teardown, which on KAS deletes the record at once.
+        self.delete_delay_secs = 0.0
+        # The release ``destroy()`` started, kept so a second ``destroy()`` waits for
+        # it instead of releasing again (``_release_ending``).
+        self._release_task: asyncio.Future[None] | None = None
+        self._cloud_replayed_permissions: set[str | int | None] = set()
         # Token carried by THIS session's injected broker-stub entries
         # (``mcp_gateway.claim.mint_stub_session_token``), set by the runtime
         # that created the session. It is what a later claim-push names so
@@ -327,13 +364,17 @@ class AcpSessionHandle:
         self._watchdog = watchdog if watchdog is not None else _load_watchdog_settings(crew_agent)
         # How this session launched its stdio MCP servers, recorded by the
         # runtime once the session's array is final (``record_mcp_launches``).
-        # The oracle's remote_flat scan reads it to find the in-flight tool's
-        # own server process; empty means no server can be found, which keeps
-        # the full window.
+        # The oracle reads it to find the in-flight tool's own server process:
+        # the movement sample covers that server alone, and the remote_flat
+        # scan looks at its sockets. Empty means no server can be found, which
+        # keeps the whole-tree sample and the full window.
         self._mcp_launches: dict[str, tuple[tuple[str, ...], ...]] = {}
         self._oracle = LivenessOracle(
             sample_min_secs=self._watchdog.wellness_sample_secs,
+            cleanup_tenancy=lambda: self._runtime.session_tenancy(self._session_id),
+            sandbox_wrapped_by_crew=lambda: self._runtime.sandbox_wrapped_by_crew,
             server_launches=self._remote_flat_launches,
+            attribution_launches=self._mcp_attribution_launches,
         )
         # Keep the executor future, not an await-scoped flag: wait_for can time
         # out while the underlying thread continues its /proc walk. A pending
@@ -356,6 +397,9 @@ class AcpSessionHandle:
         # kept, so the oracle keeps reporting the tool actually in flight rather
         # than failing permissive on stall detection.
         self._tool_tracker = InFlightToolTracker(max_calls=MAX_ACTIVE_TOOL_CALLS)
+        # The current parallel tool batch, for the opt-in batch write guard
+        # that ``approve_tool`` consults (``acp.batch_guard``).
+        self._batch_window = batch_guard.BatchWindow(gated=True)
         # toolCallIds that streamed output (a non-final tool_call_update with
         # content) this turn. A command that already produced output may have
         # already acted, so a non-interactive retry of it is never ``safe_retry``.
@@ -396,6 +440,9 @@ class AcpSessionHandle:
         # never resolves, so the ``session/prompt`` request goes unanswered, which
         # leaves this armed for ``_settle_codex_compaction`` at the turn's terminal.
         self._codex_compaction_pending: bool | str = False
+        # Native ``compaction_update`` lifecycle per id: duplicate terminals and
+        # late starts are dropped against it. Lives as long as the handle.
+        self._native_compaction_states = NativeCompactionStates()
         self._cancelled = False
         # Unresponsive-cancel tracking (mirrors AcpClient._cancel_ts /
         # _cancel_grace_secs). Set by cancel(); the dispatch loop uses them to
@@ -581,10 +628,18 @@ class AcpSessionHandle:
         self._pending_oauth_requests: list[dict[str, str]] = []
         # Servers whose last ``_kiro/mcp/status`` entry for this session was an
         # authorization failure and that have not connected since. Kept across a
-        # timed-out sign-in, whose entry reports ``failedAuthorization`` false,
-        # so the next turn offers the sign-in again.
+        # timed-out sign-in, whose entry reports ``failedAuthorization`` false.
         self._mcp_sign_in_needed: set[str] = set()
-        self._mcp_sign_in_last_offered = ""
+        # Needed servers a user message named and whose sign-in the runtime
+        # has not started yet. Being needed alone never starts a sign-in; see
+        # ``want_mcp_sign_in_named``.
+        self._mcp_sign_in_wanted: set[str] = set()
+        # The user message that asked for this turn's sign-ins, matched again
+        # once the pre-turn drain or a mid-turn status tracks a server it
+        # names, and the servers it already marked wanted. One turn's only:
+        # ``_run_turn`` clears both when the turn ends.
+        self._mcp_sign_in_ask = ""
+        self._mcp_sign_in_asked: set[str] = set()
         # Tracked servers whose status reported ``connected`` and whose
         # completion the dispatch loop has not yet yielded. KAS sends no
         # server-initialized frame for a completed sign-in, so the loop yields
@@ -638,6 +693,25 @@ class AcpSessionHandle:
         # The agent's `toolsSettings.shell.allowedCommands` as the gate matches
         # them (``kas_permissions.crew_answered_commands``), answered the same way.
         self.kas_crew_answered_commands: tuple[str, ...] = ()
+        # The only shell commands the agent's spec lets run when it sets
+        # `toolsSettings.shell.denyByDefault` (``kas_permissions.spec_shell_allowlist``);
+        # None when it does not. The gate refuses every other shell call.
+        self.kas_spec_shell_allowlist: tuple[str, ...] | None = None
+        # The only paths the agent's write tool may touch when its spec sets
+        # `toolsSettings.fs_write.fallbackAction: "deny"`, anchored at this
+        # session's directory (``kas_agents.projected_write_allowlist``); None when
+        # it does not. The gate refuses every other file write.
+        self.kas_spec_write_allowlist: tuple[str, ...] | None = None
+        self.kas_spec_denies: Any = None
+        # Whether that shell allowlist lets a read-only command past, as kiro-cli
+        # does for `autoAllowReadonly: true` (``kas_agents.projected_shell_readonly``).
+        self.kas_spec_shell_readonly: bool = False
+        # The agent's write `allowedPaths`, anchored at this session's directory
+        # (``kas_write_allowlist.projected_answered_paths``): the gate answers a
+        # write every target of which one covers, after its checks.
+        self.kas_crew_answered_paths: tuple[str, ...] = ()
+        # The same for the read tool's `allowedPaths` (a covered read).
+        self.kas_crew_answered_read_paths: tuple[str, ...] = ()
         # The agent this session runs: the one the batch was registered for, then
         # whichever a KAS mode switch moves it to ("" with no batch). A turn that
         # names no agent runs this one, so its spec hooks are this agent's.
@@ -645,9 +719,23 @@ class AcpSessionHandle:
         # The agent batch this session registered, so a mode switch can answer
         # what the agent it moves to auto-approves.
         self.kas_registered_agents: list[dict[str, Any]] = []
+        # The KAS MCP launch snapshot names every projection of this session wrote
+        # (``acp.kas_env_launch``), read before ``session/load`` hoists servers out
+        # of the batch and carried across a handle swap, so shutdown removes them.
+        self.kas_launch_snapshots: list[str] = []
         # The upgrade notice when that batch's prompt is dropped by the KAS this
         # process runs (``harness.kas.kas_agent_prompt_issue``); "" otherwise.
         self.kas_agent_prompt_notice: str = ""
+        # Whether that KAS is known to apply the batch's prompts
+        # (``KasHarness.agent_prompt_applied``); False without that evidence.
+        self.kas_agent_prompt_applied: bool = False
+        # The notice naming the MCP servers this session's projection sent without
+        # part of their env or headers, by key name only
+        # (``kas_agents.withheld_credentials_notice``); "" otherwise.
+        self.kas_withheld_credentials_notice: str = ""
+        # The telemetry notice for this session (``kas_cli_settings.session_telemetry_notice``);
+        # "" otherwise.
+        self.kas_telemetry_notice: str = ""
         # JSON-RPC request id -> {"once","always","reject"} optionId map, so
         # approve_tool / reject_tool echo the exact ids the agent advertised
         # (kiro "allow_once"/"allow_always"; claude-agent-acp "allow"/"reject").
@@ -678,6 +766,9 @@ class AcpSessionHandle:
         # (mirrors AcpClient._resolved_model_id; avoids the profile-id
         # pinning trap where a resolved profile id poisons slot.model).
         self._resolved_model_id: str = ""
+        # Keeps the two fields above in step with a fallback the ENGINE made
+        # mid-turn (acp/engine_fallback.py).
+        self._engine_fallback = EngineFallbackTracker()
         # True after set_mode switched a live session's agent, until the model
         # kiro-cli reported for that activation has been judged against the
         # served list (see _served_default_after_set_mode).
@@ -691,6 +782,11 @@ class AcpSessionHandle:
         # The bare model a pair pin landed as when its effort was refused
         # (mirrors AcpClient.model_pin_partial).
         self.model_pin_partial: str = ""
+        # The model ``set_model(..., inherit=True)`` applied from kiro-cli's
+        # ``chat.defaultModel``, or ``""``. Not a pin: ``_model`` stays unpinned,
+        # so effort binding and fallback promotion read the session as unpinned,
+        # and a handle swap re-applies it the same way. Any other set_model clears it.
+        self.inherited_model: str = ""
         self._config_options: list[dict[str, Any]] = []
         self._available_models: list[dict[str, str]] = []
         # Set by ``_feed_advertised_model_cache`` when the capture changed the
@@ -737,10 +833,24 @@ class AcpSessionHandle:
         # KAS sub-agent roster keyed by agentSubtaskId. Each entry is shaped for
         # EVENT_SUBAGENT_LIST consumption by _native_subagent_sync in chat_runner.
         self._kas_subagent_roster: dict[str, dict[str, Any]] = {}
+        # Native children announced by lifecycle session/updates (codex-acp),
+        # keyed by the child's session id, same row shape as the KAS roster.
+        self._announced_subagent_roster: dict[str, dict[str, Any]] = {}
+        # toolCallIds of codex's legacy "Start/Complete subagent" rows this turn,
+        # so their trailing tool_call_update is dropped with the row it updates.
+        self._legacy_subagent_tool_ids: set[str] = set()
+        # One StreamRedactor per announced child whose text is streaming, keyed
+        # by the child's session id (_child_text_activity).
+        self._native_child_redactors: dict[str, StreamRedactor] = {}
 
     @property
     def session_id(self) -> str:
         return self._session_id
+
+    @property
+    def session_activity_at(self) -> float | None:
+        """Monotonic time the runtime last routed a frame for this session."""
+        return self._runtime.session_activity_at(self._session_id)
 
     @property
     def prompt_or_tool_seen(self) -> bool:

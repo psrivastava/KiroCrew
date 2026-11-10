@@ -10,12 +10,15 @@ defined here, so each one reads, imports and patches as ``kiro_crew.work_ledger.
 
 from __future__ import annotations
 
+import itertools
 import json
 import re
 import secrets
+import threading
+from collections import OrderedDict
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 from kiro_crew.atomic_write import atomic_write, read_bytes_with_retry
 from kiro_crew.config.paths import data_home
@@ -39,9 +42,7 @@ from kiro_crew.work_ledger_records import (
 )
 from kiro_crew.work_vocab import work_event_id
 
-# --------------------------------------------------------------------------- #
 # Paths
-# --------------------------------------------------------------------------- #
 
 #: Directory naming is :func:`kiro_crew.session_ledger._store_name` -- readable
 #: fold plus ``sha256[:8]`` -- imported rather than copied. ``session_ledger``
@@ -68,7 +69,10 @@ _BINDINGS_DIR = "bindings"
 _UNDELIVERED_DIR = "undelivered"
 #: The directories under the work-ledger root that are NOT a conductor's store, so a
 #: sweep or a purge walking the root must step over them.
-RESERVED_ROOT_DIRS: frozenset[str] = frozenset({_BINDINGS_DIR, _UNDELIVERED_DIR})
+#: Per-item records of what the hub last learnt about a REMOTE worker's slot
+#: (:mod:`kiro_crew.work_ledger_remote`). A gateway observation, like the above.
+_REMOTE_DIR = "remote"
+RESERVED_ROOT_DIRS: frozenset[str] = frozenset({_BINDINGS_DIR, _UNDELIVERED_DIR, _REMOTE_DIR})
 
 
 def mint_item_id() -> str:
@@ -187,9 +191,7 @@ def undelivered_path(worker_slot_key: str) -> Path:
     return resolved
 
 
-# --------------------------------------------------------------------------- #
 # Locks
-# --------------------------------------------------------------------------- #
 
 
 @contextmanager
@@ -222,6 +224,52 @@ def _open_lock(path: Path, *, create: bool = True) -> Iterator[None]:
             yield
 
 
+#: Change marks for readers in THIS process: the end of every hold of a store's
+#: conductor or item lock gives the store's exact slot key a fresh mark, because every
+#: write, rebuild and purge of a store happens under one of those two locks. A reader
+#: that keeps what it read beside the mark it saw BEFORE reading may serve it again
+#: while :func:`change_mark` still returns that mark. ``itertools.count`` hands out
+#: each value once even across threads, so a mark never repeats.
+#:
+#: At most :data:`CHANGE_MARKS_KEPT` stores keep their own mark, least recently
+#: written dropped first. A dropped store answers the newest mark ever dropped
+#: (``_last_mark[1]``), which is at least its own last one and so never equals a mark
+#: a reader kept from before that write.
+CHANGE_MARKS_KEPT = 4096
+_change_counter = itertools.count(1)
+_change_marks: "OrderedDict[str, int]" = OrderedDict()
+_change_lock = threading.Lock()
+#: ``[newest mark handed out, newest mark dropped]``, in a list so the facade's
+#: binding of it stays live.
+_last_mark = [0, 0]
+
+
+def _mark_changed(slot_key: str) -> None:
+    with _change_lock:
+        mark = next(_change_counter)
+        _change_marks[slot_key] = mark
+        _change_marks.move_to_end(slot_key)
+        while len(_change_marks) > CHANGE_MARKS_KEPT:
+            _last_mark[1] = _change_marks.popitem(last=False)[1]
+        _last_mark[0] = mark
+
+
+def change_mark(slot_key: str) -> int:
+    """The mark of the last lock hold on *slot_key*'s store here (``0`` for none, or
+    the newest dropped mark for a store whose own mark was dropped).
+
+    shortcut: a store written by another process (a CLI sweep) moves no mark here;
+    readers bound how long they trust an unmoved mark (``crew_workers``).
+    """
+    with _change_lock:
+        return _change_marks.get(slot_key, _last_mark[1])
+
+
+def last_change_mark() -> int:
+    """The newest mark of any store: unchanged means no store was written here since."""
+    return _last_mark[0]
+
+
 @contextmanager
 def conductor_lock(slot_key: str, *, create: bool = True) -> Iterator[None]:
     """Hold the conductor lock. FIRST in the lock order; see the module docstring.
@@ -230,7 +278,10 @@ def conductor_lock(slot_key: str, *, create: bool = True) -> Iterator[None]:
     store; it is the form a deleter takes.
     """
     with _open_lock(conductor_dir(slot_key) / _LOCK_FILE, create=create):
-        yield
+        try:
+            yield
+        finally:
+            _mark_changed(slot_key)
 
 
 @contextmanager
@@ -256,7 +307,10 @@ def item_lock(slot_key: str, item_id: str, *, create: bool = True) -> Iterator[N
     path = _item_lock_path(slot_key, item_id)
     if create:
         with _open_lock(path):
-            yield
+            try:
+                yield
+            finally:
+                _mark_changed(slot_key)
         return
     try:
         lock_cm = _open_lock(path, create=False)
@@ -281,6 +335,7 @@ def item_lock(slot_key: str, item_id: str, *, create: bool = True) -> Iterator[N
     try:
         yield
     finally:
+        _mark_changed(slot_key)
         lock_cm.__exit__(None, None, None)
 
 
@@ -365,12 +420,51 @@ def forget_undelivered_for_item(
         logger.debug("could not drop an undelivered-call record", exc_info=True)
 
 
-# --------------------------------------------------------------------------- #
 # Whole-file reads. A corrupt record reads as absent.
-# --------------------------------------------------------------------------- #
+
+#: The bytes of each item record and event log a NON-strict read last read, by path,
+#: with the stat they were read under. The Crew board re-reads every item and event
+#: log of a board on each poll, and most of that time is opening files that have not
+#: changed. Other records (header, bindings, undelivered) are one file each per read
+#: and are read from disk every time.
+#:
+#: An equal ``(st_ino, st_mtime_ns, st_size)`` means equal bytes because every writer
+#: here replaces a file whole through ``atomic_write`` (a rename): on POSIX the new
+#: file has a new inode, and on Windows ``os.replace`` gives the target the new
+#: file's id, which ``os.stat`` reports as ``st_ino``. Where the filesystem reports
+#: no file id (``st_ino == 0``: FAT, some network shares) nothing is kept. A hit only
+#: skips the open and read: the bytes are parsed again, so callers never share an
+#: object. Strict reads are the writers' own and never use this.
+#:
+#: shortcut: a hand edit made in place, inside one mtime tick, keeping the same size,
+#: is served stale until the file next changes; no writer here edits in place.
+_READ_MEMO: OrderedDict[str, tuple[tuple[int, int, int], bytes]] = OrderedDict()
+_READ_MEMO_MAX = 4096
+_READ_MEMO_LOCK = threading.Lock()
 
 
-def _read_json_record(path: Path, *, strict: bool = False) -> Any | None:
+def _memo_read_bytes(path: Path, st: Any, read: Callable[[Path], bytes]) -> bytes:
+    """*path*'s bytes through :data:`_READ_MEMO`, reading with *read* on a miss."""
+    if not st.st_ino:
+        return read(path)
+    key, stamp = str(path), (st.st_ino, st.st_mtime_ns, st.st_size)
+    with _READ_MEMO_LOCK:
+        hit = _READ_MEMO.get(key)
+        if hit is not None and hit[0] == stamp:
+            _READ_MEMO.move_to_end(key)
+            return hit[1]
+    data = read(path)
+    # A file replaced between the stat and the read is not kept under the old stamp.
+    if len(data) == st.st_size:
+        with _READ_MEMO_LOCK:
+            _READ_MEMO[key] = (stamp, data)
+            _READ_MEMO.move_to_end(key)
+            while len(_READ_MEMO) > _READ_MEMO_MAX:
+                _READ_MEMO.popitem(last=False)
+    return data
+
+
+def _read_json_record(path: Path, *, strict: bool = False, memo: bool = False) -> Any | None:
     """Parse a whole-file JSON record, or ``None`` when it cannot be trusted.
 
     ``strict=True`` keeps the corruption-reads-as-absent contract for CONTENT
@@ -384,25 +478,29 @@ def _read_json_record(path: Path, *, strict: bool = False) -> Any | None:
     the other writer was interrupted mid-write. The ceiling is checked before the
     read so a hand-grown file cannot be pulled into memory first.
 
-    The bytes come from ``read_bytes_with_retry`` because a strict read here is
-    LOCK-FREE across writers: :func:`_refuse_if_worker_holds_open_item` reads the
-    prior item's file under the WORKER's binding lock, while that item's own
-    conductor may be replacing it under a different item lock. On Windows a read of
-    a file another handle holds open for write raises ``PermissionError``, so one
-    correct concurrent writer is enough to turn a strict read into a bare
-    ``OSError`` — which the dashboard route maps to a transient 503 "try again"
-    instead of the permanent already-bound refusal the guard exists to raise. The
-    retry closes that window. POSIX permits the read, and there a
-    ``PermissionError`` is a genuine access fault the helper re-raises at once.
+    The bytes come from ``read_bytes_with_retry`` because a strict read is LOCK-FREE
+    across writers: :func:`_refuse_if_worker_holds_open_item` reads the prior item
+    under the WORKER's binding lock while its conductor may replace it under an item
+    lock. On Windows that read raises ``PermissionError``, which would surface as a
+    transient 503 instead of the already-bound refusal; the retry closes the window.
+    On POSIX a ``PermissionError`` is a real access fault and is re-raised at once.
+
+    ``memo=True`` (item records) serves an unchanged file's bytes from
+    :data:`_READ_MEMO` on a non-strict read; a strict read ignores it.
     """
     try:
-        if path.stat().st_size > MAX_RECORD_BYTES:
+        st = path.stat()
+        if st.st_size > MAX_RECORD_BYTES:
             logger.warning(
                 "work ledger record over the size ceiling; treating as absent: %s",
                 path.name,
             )
             return None
-        return json.loads(read_bytes_with_retry(path).decode("utf-8"))
+        if memo and not strict:
+            data = _memo_read_bytes(path, st, read_bytes_with_retry)
+        else:
+            data = read_bytes_with_retry(path)
+        return json.loads(data.decode("utf-8"))
     except FileNotFoundError:
         return None
     except OSError:
@@ -466,7 +564,7 @@ def read_work_item(slot_key: str, item_id: str, *, strict: bool = False) -> Work
     misnamed or hand-moved file, and honouring its stored id would let a write
     taken under THIS item's lock land on THAT item's path.
     """
-    raw = _read_json_record(item_path(slot_key, item_id), strict=strict)
+    raw = _read_json_record(item_path(slot_key, item_id), strict=strict, memo=True)
     if raw is None:
         return None
     item = WorkItem.from_dict(raw)
@@ -527,9 +625,7 @@ def _stored_item_ids(slot_key: str) -> list[str]:
     )
 
 
-# --------------------------------------------------------------------------- #
 # Events
-# --------------------------------------------------------------------------- #
 
 
 def event_id(ts: str, item_id: str, kind: str, text: str, *, status: str | None = None) -> str:
@@ -554,10 +650,15 @@ def _read_events_unlocked(path: Path, *, strict: bool = False) -> list[WorkEvent
     "empty" would replace the entire history with one line.
     """
     try:
-        if path.stat().st_size > MAX_RECORD_BYTES:
+        st = path.stat()
+        if st.st_size > MAX_RECORD_BYTES:
             logger.warning("work ledger event log over the size ceiling: %s", path.name)
             return []
-        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        if strict:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        else:
+            data = _memo_read_bytes(path, st, Path.read_bytes)
+            lines = data.decode("utf-8", errors="replace").splitlines()
     except FileNotFoundError:
         return []
     except OSError:
@@ -618,7 +719,13 @@ def _coalesce_progress(events: list[WorkEvent], incoming: WorkEvent) -> list[Wor
 
 
 def _append_event_locked(
-    slot_key: str, item_id: str, kind: str, text: str, *, status: str | None = None
+    slot_key: str,
+    item_id: str,
+    kind: str,
+    text: str,
+    *,
+    status: str | None = None,
+    id_salt: str = "",
 ) -> WorkEvent:
     """Append one event to *item_id*'s log. THE CALLER MUST HOLD THE ITEM LOCK.
 
@@ -639,7 +746,9 @@ def _append_event_locked(
     ts = _now_iso()
     trimmed = text[:MAX_EVENT_TEXT_CHARS]
     incoming = WorkEvent(
-        id=event_id(ts, item_id, kind, trimmed, status=status),
+        # *id_salt* tells apart two events the same second with the same text: an
+        # ingested remote report passes the peer's own event identity.
+        id=event_id(ts, item_id, kind, trimmed + id_salt, status=status),
         ts=ts,
         item_id=item_id,
         kind=kind,
@@ -698,7 +807,13 @@ def _require_record_fits(payload: dict[str, Any]) -> None:
 
 
 def _commit_item_locked(
-    slot_key: str, item: WorkItem, kind: str, text: str, *, status: str | None = None
+    slot_key: str,
+    item: WorkItem,
+    kind: str,
+    text: str,
+    *,
+    status: str | None = None,
+    id_salt: str = "",
 ) -> WorkEvent:
     """Persist one item change AND the event that explains it. HOLD THE ITEM LOCK.
 
@@ -715,7 +830,7 @@ def _commit_item_locked(
     _require_record_fits(payload)
     events_path = item_events_path(slot_key, item.item_id)
     log_before = _read_text_or_none(events_path)
-    event = _append_event_locked(slot_key, item.item_id, kind, text, status=status)
+    event = _append_event_locked(slot_key, item.item_id, kind, text, status=status, id_salt=id_salt)
     try:
         _write_record(item_path(slot_key, item.item_id), payload)
     except BaseException:

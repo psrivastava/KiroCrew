@@ -83,6 +83,7 @@ from kiro_crew.publish.personal_drive_parts import (  # noqa: F401
     _sandbox_policy_config,
     _serialized,
     _unknown_profile_message,
+    _with_utf8_charset,
     bound_account,
     make_external_id,
     split_external_id,
@@ -123,7 +124,7 @@ logger = logging.getLogger(__name__)
 #: the default path. Flipping this key to ``DEFAULT_PROVIDER`` is the last step of that
 #: work, not a step of this change.
 #:
-#: The value satisfies the ``^[a-z0-9-]{1,32}$`` shape the one HTTP boundary that
+#: The value satisfies the ``^[a-z0-9_-]{1,32}$`` shape the one HTTP boundary that
 #: accepts a provider id validates against, so the picker row it renders can actually
 #: be submitted.
 PERSONAL_DRIVE_PROVIDER = "personal-drive"
@@ -208,7 +209,7 @@ class PersonalDriveProvider(PublishProvider):
         """One destination, one registry key.
 
         There is deliberately no per-account variant: a provider id is validated at the
-        HTTP boundary against ``^[a-z0-9-]{1,32}$``, so an account-qualified key could be
+        HTTP boundary against ``^[a-z0-9_-]{1,32}$``, so an account-qualified key could be
         listed in the picker but never submitted -- a row that 400s on click is worse
         than no row. Which account a NEW publish uses is the profile registry's default;
         an EXISTING publication pins the ACCOUNT ID that holds it into its ``external_id``,
@@ -232,20 +233,19 @@ class PersonalDriveProvider(PublishProvider):
     def _resolve_profile(self, requested: str = "") -> tuple[str, str]:
         """The (profile name, region) to run under, or raise with the fixing action.
 
-        ``requested`` wins over this instance's pinning: it carries the account an
-        EXISTING publication was bound to and must be honoured; empty means a NEW
-        publish, which follows the registry default.
+        ``requested`` is the profile an EXISTING publication was bound to and must be
+        honoured. Empty -- a NEW publish, or a handle that names no profile -- follows
+        the registry default.
 
         ``profiles.resolve_profile`` is the registry's own contract: an empty request
         resolves to the registry default and an unregistered name resolves to ``None``,
         so a publish can only ever run under a registered account.
         """
-        wanted = requested
-        resolved = profiles.resolve_profile(wanted)
+        resolved = profiles.resolve_profile(requested)
         if resolved is None:
-            if wanted:
+            if requested:
                 raise PublishUnavailableError(
-                    _unknown_profile_message(wanted, self._registered_names())
+                    _unknown_profile_message(requested, self._registered_names())
                 )
             raise PublishUnavailableError(_no_profile_message())
         name, region = resolved
@@ -284,9 +284,10 @@ class PersonalDriveProvider(PublishProvider):
         all -- refusing is recoverable by retrying, and acting on an unproven account is
         not. That is the same rule the withdrawal outcomes follow.
 
-        A handle with NO account predates binding and cannot be verified, so it keeps the
-        old behaviour rather than being refused. None exist outside this branch; refusing
-        them would strand every publication made before this change for no gain.
+        A handle with NO account predates binding and cannot be verified, so it is acted
+        on through the profile it names (or the registry default when it names none)
+        rather than refused: refusing it would strand every publication minted before
+        binding for no gain.
         """
         _key, pinned, bound = _parse_external_id(external_id)
         profile, region = self._resolve_profile(bound)
@@ -712,6 +713,33 @@ class PersonalDriveProvider(PublishProvider):
         except PublishError:
             return False
         return True
+
+    async def source_problem(self, *, external_id: str) -> tuple[str, str] | None:
+        """Why this publication's drive copy cannot be read, or ``None``.
+
+        The one cause known without an AWS call: the profile the publication is bound
+        to is not in the registry, so every call for it refuses (see
+        :meth:`reachable_for`). Reads the local profile registry only, because
+        ``upstream_status`` asks on every artifact page open.
+
+        shortcut: does not check whether the object itself still exists; that needs
+        AWS calls on each page open, so add it only behind a cache.
+        """
+        _key, _account, bound = _parse_external_id(external_id)
+        if not bound:
+            return None
+        try:
+            if profiles.resolve_profile(bound) is not None:
+                return None
+        except Exception as exc:  # an unreadable registry proves nothing either way
+            logger.info("source_problem: could not read the profile registry: %s", exc)
+            return None
+        return (
+            f"This artifact's drive copy is in AWS profile {bound!r}, which is no "
+            "longer registered here, so Kiro Crew can't read or change it. Your local "
+            "copy is unchanged; register the profile again on the Artifact Deploy page.",
+            "personal_drive_profile_not_registered",
+        )
 
     async def serving_notice(self, *, external_id: str) -> tuple[str, str] | None:
         """Re-derive this drive's CURRENT serving notice, or ``None`` if it cannot look.
@@ -1329,7 +1357,7 @@ class PersonalDriveProvider(PublishProvider):
             "--body",
             body,
             "--content-type",
-            content_type or "application/octet-stream",
+            _with_utf8_charset(content_type or "application/octet-stream"),
             "--cache-control",
             f"max-age={_EDGE_MAX_AGE_SECONDS}",
             "--metadata",
@@ -1513,23 +1541,15 @@ class PersonalDriveProvider(PublishProvider):
 
         if domain:
             self._domains[profile] = domain
-        result = PublishResult(
+        return PublishResult(
             external_id=external_id,
             view_url=self.view_url_for(external_id) if public else "",
             version_number=1,
             concurrency_token=digest,
             owner="",
             notice=notice,
+            notice_code=notice_code,
         )
-        # notice_code is the shared discriminator the frontend selects its per-case
-        # string from (contract: "rolling_out" / "distribution_disabled" / "unknown" /
-        # ""). It is added to PublishResult by the seam half of this change; setting it
-        # here is guarded so this module's own gate does not hard-depend on that half's
-        # landing order -- the field is additive and defaulted, so once it exists this
-        # simply populates it, and until it does the notice text still carries the state.
-        if hasattr(result, "notice_code"):
-            result.notice_code = notice_code
-        return result
 
     async def push_version(
         self, *, external_id: str, file_path: str, expected_token: str
@@ -1853,7 +1873,7 @@ def register_public_edition_providers() -> None:
     back and what has to land before the key moves.
 
     There is deliberately no per-account key. A provider id is validated at the one HTTP
-    boundary that accepts one against ``^[a-z0-9-]{1,32}$``, so an account-qualified key
+    boundary that accepts one against ``^[a-z0-9_-]{1,32}$``, so an account-qualified key
     would be listed by ``list_providers`` and rejected on submit -- a picker row that
     400s when clicked is worse than no row at all. Choosing an account per publish needs
     a real publish argument on the shared seam, which is its own change. Until then a

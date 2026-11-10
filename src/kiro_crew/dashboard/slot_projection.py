@@ -7,7 +7,8 @@ from collections import deque
 from collections.abc import Callable, Sequence
 from typing import Any
 
-from kiro_crew.dashboard.slot_preparing import is_preparing
+from kiro_crew.dashboard.slot_preparing import is_preparing, preparing_caption
+from kiro_crew.history_schema import transcript_sort_key
 from kiro_crew.safety_override import safety_override, yolo_policy_permits
 from kiro_crew.session_lifecycle import STOP_DECLINED_ESCALATION_SECS
 from kiro_crew.shared_crew.attribution import public_attribution_of_slot
@@ -32,6 +33,27 @@ def summary_rows(slot: Any) -> list[Any]:
     return slot.messages
 
 
+CLEAR_COMMAND = "/clear"
+
+
+def is_clear_command_row(msg: Any) -> bool:
+    """Whether *msg* is a user row that typed ``/clear``.
+
+    Matches the runner's own test (``chat_turn/slash_commands.py``): the first
+    word of the message, case-insensitive. The user row is the boundary because
+    it is durable and every harness writes it, while the confirmation row's text
+    differs per harness and a native clear empties only the in-memory window, so
+    a restore brings the earlier rows back.
+    """
+    if not isinstance(msg, dict) or msg.get("role") != "user":
+        return False
+    content = msg.get("content")
+    if not isinstance(content, str):
+        return False
+    words = content.split(maxsplit=1)
+    return bool(words) and words[0].lower() == CLEAR_COMMAND
+
+
 def stop_declined_armed(slot: Any, now: float | None = None) -> bool:
     """Whether a recent declined Stop makes the next press a force stop.
 
@@ -45,6 +67,42 @@ def stop_declined_armed(slot: Any, now: float | None = None) -> bool:
         return False
     current = time.monotonic() if now is None else now
     return current - at < STOP_DECLINED_ESCALATION_SECS
+
+
+OPTIONS_WAITING_MAX_AGE_SECS = 7 * 24 * 3600
+"""How long a reply ending in ``[OPTIONS:]`` keeps its session in Waiting."""
+
+
+def options_ending_is_stale(options_ts: str, now: float) -> bool:
+    """Whether an ``[OPTIONS:]`` reply stamped *options_ts* is too old to count as waiting.
+
+    An unreadable stamp is never stale: the session stays in Waiting, as before.
+    """
+    bucket, at = transcript_sort_key(options_ts)
+    if bucket != 0:
+        return False
+    return now - at > OPTIONS_WAITING_MAX_AGE_SECS
+
+
+def _history_key(slot: Any) -> str:
+    """The transcript key for *slot*, unfolded, as resume accepts it.
+
+    ``slot_history_key`` is the one rule for which transcript a slot writes.
+    It is passed through as the session key, NOT folded to a filename stem:
+    ``ConversationLog._path`` only finds a pre-migration Slack thread's bare
+    ``<ts>.jsonl`` from the ``slack:<ts>`` spelling, so the folded
+    ``slack_<ts>`` would resume an empty transcript. ``""`` for a duck-typed
+    slot the rule cannot read.
+    """
+    # Local import: chat_utils_slots imports state, which imports this module.
+    # From the owner, not the chat_utils facade: a facade read here would run
+    # once per slot on every slots flush (test_facade_read_budget).
+    from kiro_crew.dashboard.chat_utils_slots import slot_history_key
+
+    try:
+        return str(slot_history_key(slot) or "")
+    except (AttributeError, TypeError):
+        return ""
 
 
 def resolved_row_identity(slot: Any) -> str:
@@ -151,6 +209,14 @@ class SlotProjection:
         for msg in reversed(summary_rows(slot)):
             if len(found) >= max_links or parse_budget <= 0:
                 break
+            # A ``/clear`` starts the session over: a change or issue named
+            # before it belongs to the dropped conversation, so its chip goes
+            # with it. The rows stay in the transcript; only the derivation
+            # stops at the boundary. Unlike the plan pill, which resets only on
+            # a clear that ran, the boundary is the typed ``/clear`` row, so a
+            # clear that was queued or refused also drops the earlier chips.
+            if is_clear_command_row(msg):
+                break
             if not isinstance(msg, dict) or msg.get("role") in non_durable_roles:
                 continue
             content = msg.get("content")
@@ -243,9 +309,11 @@ class SlotProjection:
         Oldest first; the projection reads only the first one for the card.
         """
         # Local import avoids the state -> slot_projection -> chat_utils -> state
-        # cycle at module import time. The value is process-local and cheap to
-        # read; it pairs the slot's restarting turn counter with its gateway.
-        from kiro_crew.dashboard.chat_utils import chunk_generation
+        # cycle at module import time. Module import (not from-import) avoids
+        # the _handle_fromlist __path__ probe on the facade per slot.
+        import kiro_crew.dashboard.chat_utils as _cu
+
+        chunk_generation = _cu.chunk_generation
 
         # The newest DURABLE row: a transient row (the turn-end ``done`` row
         # among them) is never persisted, so a slot rebuilt from disk after a
@@ -277,10 +345,16 @@ class SlotProjection:
         # must not answer (the artifact freshness nudge).
         last_agent_ts = ""
         found_conv = False
+        # A goal-loop cycle's prompt is a ``nudge`` row, and a cycle that ends with
+        # ``nothing_to_do`` writes no reply after it. The loop has run past an
+        # ``[OPTIONS:]`` ask older than that row, so that ask does not hold it.
+        cycle_after_reply = False
         for message in reversed(rows):
             role = message.get("role")
             msg_meta = message.get("meta") or {}
             notice = is_system_notice(role, msg_meta)
+            if role == "nudge" and not found_conv and not notice:
+                cycle_after_reply = True
             if not last_activity_ts and role not in transient_roles and not notice:
                 last_activity_ts = message.get("ts") or ""
             if (
@@ -295,7 +369,7 @@ class SlotProjection:
                     if not found_conv:
                         found_conv = True
                         last_conv_role = role
-                        if role == "assistant":
+                        if role == "assistant" and not cycle_after_reply:
                             options = parse_options(text)
                             has_options = bool(options)
                             if has_options:
@@ -313,6 +387,13 @@ class SlotProjection:
             # is set `last_activity_ts` is too.
             if found_conv and last_msg and last_agent_ts:
                 break
+
+        # An options ending older than the cutoff does not count as waiting.
+        # `has_options` feeds the Waiting lane and the Needs-you list, and
+        # nothing else lets a finished session leave them. `options` and
+        # `options_ts` stay, so the reply itself is unchanged.
+        if has_options and options_ending_is_stale(options_ts, time.time()):
+            has_options = False
 
         # A send queued behind a busy turn is user input with no transcript row
         # yet. The dashboard bumps `last_activity_ts` on `queue_push`, so the
@@ -475,7 +556,8 @@ class SlotProjection:
             "instance_id": slot.instance_id,
             "row_identity": resolved_row_identity(slot),
             "artifact": slot._artifact,
-            "messages": len(rows),
+            # Durable rows only, like ``last_ts``: the save path keeps no other row.
+            "messages": sum(1 for message in rows if message.get("role") not in transient_roles),
             # A turn waiting in fair admission is still in flight, so Stop
             # stays available; ``admission_queued`` says it has not started.
             "running": turn_in_flight,
@@ -499,6 +581,11 @@ class SlotProjection:
             # reason as `compacting`: it must not make the slot look busy to
             # sends or queueing, only show the chat's working indicator.
             "preparing": is_preparing(slot),
+            # What is being prepared, built by the gateway, and the language
+            # it is written in. A client whose UI language differs, or a ""
+            # caption, shows its own generic caption.
+            "preparing_text": preparing_caption(slot)[0],
+            "preparing_lang": preparing_caption(slot)[1],
             # A cooperative Stop was declined moments ago (the session was
             # compacting) and the next press escalates to a force stop. Read
             # with the same window the stop route uses, so the button's hint and
@@ -516,6 +603,9 @@ class SlotProjection:
             "stop_state": slot._stop_state,
             "wait_state": slot._wait_state,
             "created": slot.created_at,
+            # The slot object's never-persisted id: a failed close's restore keeps
+            # it, a reopen under the same key builds a new object with a new one.
+            "incarnation": slot._dashboard_card_identity,
             "last_ts": last_ts,
             "last_turn_ts": last_turn_ts,
             "last_message": last_msg,
@@ -555,6 +645,13 @@ class SlotProjection:
             "memory_mode": slot.memory_mode,
             "forked_from": slot.forked_from,
             "linked_session_key": slot.linked_session_key,
+            # The transcript's session key, the one ``/api/chat/resume`` reads.
+            # Derived here, by the one rule (``slot_history_key``), because the
+            # client cannot rebuild it: an unbound channel-born slot has no
+            # ``linked_session_key`` and no origin link, yet its transcript is
+            # the channel's, not ``dashboard:<key>``. Reopen-closed-session
+            # resumes by this key.
+            "history_key": _history_key(slot),
             "app": slot._app,
             "origin": slot._origin,
             # Creator attribution: the slot key of the session that asked for

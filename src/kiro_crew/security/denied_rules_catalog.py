@@ -376,10 +376,13 @@ BUILTIN_DENIED_RULES: list[DeniedCommandRule] = [
             # string, but only as the argument of a call that EXECUTES it.  The
             # sink prefix is what makes this safe -- it is precisely what a regex
             # literal (``re.search(...)``), a commit message and prose lack, so
-            # they stay allowed while ``os.system(\"... token\")`` does not.
+            # they stay allowed while ``os.system(\"... token\")`` does not.  The
+            # call names stand bare: a search finds ``subprocess.run(`` from ``run(``
+            # anyway, and an optional ``\w+\.`` before them rescans one long word from
+            # every start, quadratic in its length.
             "|"
             "(?:os\\.system|os\\.popen|os\\.exec\\w*|(?:asyncio\\.)?create_subprocess_\\w*"
-            "|(?:\\w+\\.)?(?:run|call|check_call|check_output|popen|Popen|getoutput|getstatusoutput)"
+            "|(?:run|call|check_call|check_output|popen|Popen|getoutput|getstatusoutput)"
             "|commands\\.getoutput|popen\\d?|system|shell_exec|passthru|proc_open"
             "|child_process\\.exec\\w*|exec\\w*sync|spawn\\w*"
             "|kernel\\.system|io\\.popen)"
@@ -415,7 +418,7 @@ BUILTIN_DENIED_RULES: list[DeniedCommandRule] = [
             "(?:"
             # --- sink-qualified: a shell command handed to a call that EXECUTES it ---
             "(?:os\\.system|os\\.popen|os\\.exec\\w*|(?:asyncio\\.)?create_subprocess_\\w*"
-            "|(?:\\w+\\.)?(?:run|call|check_call|check_output|popen|Popen|getoutput|getstatusoutput)"
+            "|(?:run|call|check_call|check_output|popen|Popen|getoutput|getstatusoutput)"
             "|commands\\.getoutput|popen\\d?|system|shell_exec|passthru|proc_open"
             "|child_process\\.exec\\w*|exec\\w*sync|spawn\\w*"
             "|kernel\\.system|io\\.popen)"
@@ -540,15 +543,6 @@ BUILTIN_DENIED_RULES: list[DeniedCommandRule] = [
         description=(
             "Blocks a `curl` multipart upload that attaches a local file (`-F field=@file`), "
             "for any field name."
-        ),
-    ),
-    DeniedCommandRule(
-        id="data-exfil-curl-upload",
-        pattern=".*curl.*(--upload-file|(^|\\s)-T\\s*\\S).*",
-        category="credential-exfil",
-        description=(
-            "Blocks a `curl` file upload (`--upload-file` / `-T file`), which sends a local file "
-            "to a remote endpoint."
         ),
     ),
     DeniedCommandRule(
@@ -1148,6 +1142,15 @@ BUILTIN_DENIED_RULES: list[DeniedCommandRule] = [
         description=(
             "Blocks dd invocations with an input file, which can overwrite raw disks/partitions "
             "and cause irreversible data loss."
+        ),
+    ),
+    DeniedCommandRule(
+        id="local-destructive-dd-of-device",
+        pattern="dd of=/dev/<raw disk>",
+        category="local-destructive",
+        description=(
+            "Blocks dd writing to a raw disk or partition device, which destroys its data even "
+            "with no input file, because dd then copies standard input."
         ),
     ),
     DeniedCommandRule(

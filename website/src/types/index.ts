@@ -67,6 +67,8 @@ export type {
   TodoTask,
   TodoList,
   McpSessionReport,
+  CodeChannelInfo,
+  WorkAggregate,
   SessionLink,
   ConfiguredChannelTarget,
   TurnIdentityFields,
@@ -92,6 +94,10 @@ export type {
   SubagentInfo,
   SessionInfo,
   CrewWorker,
+  CrewWorkerRecap,
+  CrewPause,
+  CrewWorkFacts,
+  CrewWorkItemFacts,
   CrewTimeline,
   CrewTimelineHandoff,
   CrewTimelineLane,
@@ -133,3 +139,12 @@ export type {
   WebAppTeardown,
   WebAppMetadata,
 } from './index.artifacts'
+export type {
+  PrincipalKind,
+  DisplaySnapshot,
+  PublicPrincipal,
+  AttributionAvailability,
+  SessionTriggerKind,
+  SessionTrigger,
+  SessionAttribution,
+} from './index.sharedCrew'
