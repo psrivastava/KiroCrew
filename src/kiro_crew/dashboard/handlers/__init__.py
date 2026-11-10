@@ -431,14 +431,6 @@ from kiro_crew.dashboard.handlers.prompts import (  # noqa: E402, F401
     api_skills_trust_revoke,
 )
 
-# ── Claude CLI native sessions (handlers/claude_sessions.py, CCrew) ──
-from kiro_crew.dashboard.handlers.claude_sessions import (  # noqa: E402, F401
-    api_claude_session_delete,
-    api_claude_session_open,
-    api_claude_session_overlay,
-    api_claude_sessions,
-)
-
 # ── Session work ledger (handlers/session_ledger.py) ──
 from kiro_crew.dashboard.handlers.session_ledger import (  # noqa: E402, F401
     api_session_ledger_get,

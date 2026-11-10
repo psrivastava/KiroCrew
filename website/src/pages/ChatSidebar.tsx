@@ -110,7 +110,6 @@ const NO_CREW_GROUPS: CrewGroup[] = []
 const NO_MEMORY_ROWS: MemorySourceRow[] = []
 
 import { SIDEBAR_MIN } from './chat/sidebarWidth'
-import ClaudeCliSessions from '../components/ClaudeCliSessions'
 import { askAppConfirm } from '../lib/appConfirm'
 export { SIDEBAR_MIN, SIDEBAR_MAX } from './chat/sidebarWidth'
 
@@ -1150,10 +1149,6 @@ function ChatSidebar({
             paused={manualSortBar.paused} />
         )}
       </AnimatePresence>
-
-      {/* CCrew: native Claude CLI sessions, grouped by working dir, below
-          CCrew's own sessions. Read-only listing from ~/.claude/projects. */}
-      <ClaudeCliSessions />
 
       {/* When expanded: doubles as the resize handle (accent on hover, drag to resize, dbl-click to collapse).
           When collapsed: just a static 1px divider between sessions and the Older Sessions footer. */}

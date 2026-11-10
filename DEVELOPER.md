@@ -17,9 +17,8 @@
    provider module, endpoints) over edits to shared upstream code, so
    `git pull upstream` stays conflict-free. Where an edit to a shared file is
    unavoidable, keep it minimal and localized.
-2. **Never touch upstream's own data stores.** CCrew reads `~/.claude` but never
-   writes into it. CCrew-side concepts (titles, pins, tags, colors) live in a
-   **separate sidecar** under CCrew's own data home.
+2. **Never touch upstream's own data stores.** CCrew never writes into
+   `~/.claude`; any CCrew-side state lives under CCrew's own data home.
 3. **Run alongside an installed KiroCrew, not on top of it.** Distinct profile,
    data home, and port so the two never collide.
 4. **Honor the upstream contracts.** i18n catalog parity (all 12 locales +
@@ -146,8 +145,6 @@ by a token. A `.ccrew-logo-tint` CSS class hue-rotates it to lime on both glyph
 `<img>` sites. Reversible, no new asset.
 - `website/src/index.css` (`.ccrew-logo-tint`), applied in `website/src/App.tsx`
   (`MobileNavGlyph`) and `website/src/shell/nav/railChrome.tsx` (`RailHeaderGlyph`).
-- Claude-session API methods live in `website/src/api/client/sessions.ts`
-  (upstream split `api/client.ts` into per-domain modules).
 
 ### 3.2 Active-backend chip
 The chat only ever showed the **agent-spec name** ("default") — never the ACP
@@ -158,88 +155,22 @@ composer shelf, names the live backend, turns green (`--ok`) when a CLI backend 
 driving, and click-navigates to `/developer?tab=agent-backend`.
 - `website/src/components/BackendChip.tsx`; wired in `ChatInput` (in `App.tsx`).
 
-### 3.3 Claude CLI sessions in the sidebar (first-class)
-A dedicated, self-contained sidebar section listing the claude CLI's **own**
-native sessions (started from a bare terminal), grouped by working directory,
-below CCrew's own sessions. Rows are clickable, scrollable, and carry CCrew
-overlay metadata + a context menu.
-- Frontend: `website/src/components/ClaudeCliSessions.tsx` (rendered by
-  `ChatSidebar`).
-- **Not** merged into CCrew's own history/"Older Sessions" list — that is a
-  CCrew-history-only data source (Redux `s.chat.history`, `closed=true` tabs) and
-  has no knowledge of native `.jsonl` files.
-
 ---
 
-## 4. Backend added (all additive modules + endpoints)
+## 4. Backend added
 
-### 4.1 Native session reader
-`src/kiro_crew/providers/claude_sessions.py` — enumerates
-`~/.claude/projects/<slug>/<uuid>.jsonl` (honoring `CLAUDE_CONFIG_DIR`), projects
-each into a sidebar row shaped like the native `/api/sessions` rows, redacts
-titles/cwd through the same scrubbers the native list uses. **Read-only** for
-listing. Codex is deliberately excluded (its Amazon build keeps sessions in
-SQLite, unsafe to mirror as a sidebar source).
-
-### 4.2 Metadata overlay (CCrew sidecar)
-`src/kiro_crew/providers/claude_session_overlay.py` —
-`<config_dir>/claude_session_overlay.json`, keyed by native UUID, holding
-`title` / `pinned` / `tags` / `color`. Atomic tmp+rename write; tolerant reads
-(corrupt file → empty overlay). `apply_overlay` merges onto rows (custom title
-overrides, original kept as `cli_title`; pinned sorts first). `forget_entry`
-drops an entry when the native session is deleted. **Never written into
-`~/.claude`.** There is deliberately NO `archived` flag (see §4.4).
-
-### 4.3 Resume-open (the round-trip that makes rows first-class)
-`POST /api/claude-sessions/{uuid}/open` seeds a freshly-created CCrew slot's
-resume sid = the native UUID (+ cwd + claude provider label) via
-`SessionPool.remember_resume_sid`. The next `get_or_create` for that slot issues
-ACP `session/load`, attaching to the **same** claude conversation — the native
-`.jsonl` and the CCrew slot then share one transcript (true bidirectionality).
-- Seam chain: `client.set_resume_session_id` → `session/load` (when
-  `_can_load_session`); `session_allocation.py` pulls the resume sid from
-  `session_map`; `SessionPool.remember_resume_sid` wraps `session_map.set`.
-
-### 4.4 Close = confirm-gated delete (no archive)
-Regular CCrew sessions distinguish close (archive to history) from delete
-(permanent). A native claude session has NO CCrew history lane to be archived
-into, so that distinction collapses: **for a CLI session, "close" IS a
-confirm-gated permanent delete.** There is deliberately no intermediate archive
-state (decided after weighing it — an "Archived" subsection would have duplicated
-the concept of the existing CCrew-only "Older Sessions" section without being
-able to share it).
-- **Delete** = **permanent** unlink of the native `.jsonl`
-  (`claude_sessions.delete_claude_session` + `overlay.forget_entry`), via
-  `DELETE /api/claude-sessions/{uuid}`, path re-resolved server-side from the UUID
-  and containment-checked against the projects root (no traversal). UI-gated
-  behind an inline confirm because it destroys the user's own claude data.
-- The regular-session `_close_slot` (archive to CCrew history) and
-  `_delete_history_session` (permanent CCrew-transcript unlink) do **not** apply
-  to a native claude session, which has no CCrew transcript/history record.
-
-### 4.5 Endpoints & routes
-Handlers in `src/kiro_crew/dashboard/handlers/claude_sessions.py` (CCrew-owned
-module, imported by `handlers/__init__.py`), registered in
-`src/kiro_crew/dashboard/routes/system.py`. `SessionManager.remember_resume_sid`
-lives in `session_parts/links.py`, bound in `session.py`:
-- `GET  /api/claude-sessions` — list (reader + overlay merge)
-- `PATCH  /api/claude-sessions/{uuid}` — set overlay (title/pin/tags/color)
-- `POST /api/claude-sessions/{uuid}/open` — seed resume sid onto a slot
-- `DELETE /api/claude-sessions/{uuid}` — permanent native delete + overlay forget
+None at present. The Claude CLI sessions sidebar (native `~/.claude/projects`
+reader, metadata overlay, resume-open, confirm-gated delete and the
+`/api/claude-sessions` routes) was removed on 2026-11-09 as unused.
 
 ---
 
 ## 5. Tests
 
-- `test/test_claude_session_overlay.py` — overlay validation/coercion, clear-on-
-  empty, atomic round-trip, `apply_overlay` merge/sort.
-- `test/test_claude_session_delete.py` — permanent native delete against a
-  **temp** `CLAUDE_CONFIG_DIR`, path-traversal rejection, containment,
-  `forget_entry`.
-- `test/test_claude_sessions.py` — reader.
-
-Frontend verification: `tsc`, `eslint`, `vite build`, and the i18n catalog-parity
-suite (must stay all-locales-green).
+CCrew-specific tests live with the feature they cover: managed-mode
+auto-update in `website/electron/test/auto-update.managed.test.js`, the
+seatbelt skip in the harness-parity and sandbox suites, and the CCrew identity
+in the Electron packaging tests.
 
 ---
 
@@ -254,10 +185,6 @@ suite (must stay all-locales-green).
 - **Icons:** `lucide-react` + `className="lucide-inline"`, never `size={N}` in
   new code (a couple of shelf siblings use `size` as a local exception).
 - **Colors:** design tokens only (`--ok`, `--danger`, `--accent`, …).
-- **Big files:** `ClaudeCliSessions.tsx` is self-contained on purpose — keep CLI-
-  session logic there rather than surgically editing the ~9600-line `ChatSidebar`.
-- **Never delete native `~/.claude` files except through the confirm-gated
-  delete endpoint**, which re-resolves the path server-side.
 - **Never wrap a harness that carries its own OS sandbox in Crew's seatbelt on
   macOS** — nesting `sandbox-exec` fails EPERM (§2.2). "Carries its own OS
   sandbox" is a distinct capability (`ACP_BACKENDS_SKIP_CREW_SEATBELT_MACOS`),
@@ -275,9 +202,6 @@ suite (must stay all-locales-green).
 
 ## 7. Open / pending
 
-- **Live round-trip verification:** the resume-open wiring is unit-safe but the
-  end-to-end "click a CLI row → attaches to the same claude conversation" needs a
-  live `./ccrew.sh` turn to confirm.
 - **Phase 2 permission mapping:** Normal/Reads/Trust/YOLO → CLI, needs a live turn.
 - **Icon/favicon recolor:** the sidebar glyph is tinted in the DOM via CSS
   `hue-rotate` (§3.1); the browser favicon (`/logo.png`) and desktop `.app`/Dock
@@ -314,8 +238,6 @@ PATH="$HOME/.local/share/mise/installs/node/22.23.2/bin:$PATH" \
   UNIVERSAL=0 CCREW=1 CCREW_ALLOW_UNAUTH_VOICE=1 bash packaging/build-desktop.sh
 # → website/electron/dist/mac-arm64/
 
-# Backend tests for the CLI-session feature
-.venv/bin/python -m pytest test/test_claude_session*.py -q
 ```
 
 ### 8.1 Build & share the desktop app package

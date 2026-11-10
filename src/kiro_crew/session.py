@@ -730,7 +730,6 @@ class SessionManager:
     _reset_still_critical = _turn_context._reset_still_critical
     _fire_compact_callback = _turn_context._fire_compact_callback
     # -- Channel links, mirrors and origins (session_parts.links).
-    remember_resume_sid = _links.remember_resume_sid
     set_slack_link = _links.set_slack_link
     get_slack_link = _links.get_slack_link
     clear_slack_link = _links.clear_slack_link

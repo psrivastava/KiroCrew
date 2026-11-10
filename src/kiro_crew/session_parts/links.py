@@ -24,20 +24,6 @@ if TYPE_CHECKING:
     from kiro_crew.session import SessionManager
 
 
-def remember_resume_sid(
-    self: SessionManager, key: str, sid: str, *, provider: str = "", cwd: str = ""
-) -> None:
-    """Pre-seed a session key's resume sid (+ provider/cwd) in the map.
-
-    Used to open a session that already exists in a backend's OWN store
-    (e.g. a native claude CLI session under ~/.claude) inside a fresh CCrew
-    slot: the next get_or_create for *key* reads this sid and issues
-    session/load, attaching to that same conversation. Thin wrapper over
-    SessionMap.set so callers do not reach into the private map.
-    """
-    self._session_map.set(key, sid, provider=provider, cwd=cwd)
-
-
 # ── Slack thread linking (persisted via SessionMap) ──
 
 
