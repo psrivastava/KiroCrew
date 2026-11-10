@@ -199,3 +199,13 @@ src/kiro_crew/apps/builtins/aws_control/crew/runtime/vendor/*.whl
 # every session spawn, so they are local session state, not project config.
 /.kiro/settings/cli.json
 /.kiro/settings/.kirocrew-cli-settings.lock
+# Playwright CLI output (may contain credentials)
+.playwright-cli/
+
+.claude-flow/
+.claude/
+.cursor/
+.github/hooks/
+.swarm/
+excalidraw-diagram-skill/
+excalidraw-diagram-skill
